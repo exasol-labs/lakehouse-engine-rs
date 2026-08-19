@@ -17,6 +17,7 @@ set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 INSTALLER="$HERE/../install.sh"
+REPO_ROOT="$(cd "$HERE/../../.." && pwd)"
 ORIG_PATH="$PATH"
 BASH_BIN="$(command -v bash)"
 
@@ -50,11 +51,20 @@ trap 'rm -rf "$SANDBOX"' EXIT
 STUBDIR="$SANDBOX/stubs"
 MISSING_CURL_DIR="$SANDBOX/missing-curl"
 MISSING_EXAPUMP_DIR="$SANDBOX/missing-exapump"
-mkdir -p "$STUBDIR" "$MISSING_CURL_DIR" "$MISSING_EXAPUMP_DIR"
+MISSING_SSH_DIR="$SANDBOX/missing-ssh"
+MISSING_SCP_DIR="$SANDBOX/missing-scp"
+mkdir -p "$STUBDIR" "$MISSING_CURL_DIR" "$MISSING_EXAPUMP_DIR" "$MISSING_SSH_DIR" "$MISSING_SCP_DIR"
 
 STUB_LOG="$SANDBOX/stub.log"
 export STUB_LOG
 : > "$STUB_LOG"
+
+for _prereq in jq make; do
+  command -v "$_prereq" >/dev/null 2>&1 || {
+    printf 'FATAL: %s is required to run the --deployment tests; install it and re-run.\n' "$_prereq" >&2
+    exit 1
+  }
+done
 
 write_exapump_stub() {
   cat > "$1/exapump" <<'STUB'
@@ -273,12 +283,61 @@ STUB
   chmod +x "$1/curl"
 }
 
+write_ssh_stub() {
+  cat > "$1/ssh" <<'STUB'
+#!/usr/bin/env bash
+printf 'ssh %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+if [[ "${SSH_FAIL:-0}" == "1" ]]; then
+  echo "ssh: connect to host 127.0.0.1 port 52341: Connection refused" >&2
+  exit 255
+fi
+_cmd="${!#}"
+case "$_cmd" in
+  "test -e "*)
+    if [[ "${SSH_PATH_NEVER:-0}" == "1" ]]; then exit 1; fi
+    _delay="${SSH_PATH_DELAY:-0}"
+    if [[ "$_delay" -gt 0 ]]; then
+      _cf="${STUB_SSH_STATE:-/dev/null}.delay"
+      _n=0; [[ -f "$_cf" ]] && _n="$(cat "$_cf")"
+      _n=$((_n + 1)); printf '%s' "$_n" > "$_cf"
+      if [[ "$_n" -le "$_delay" ]]; then exit 1; fi
+    fi
+    exit 0 ;;
+esac
+exit 0
+STUB
+  chmod +x "$1/ssh"
+}
+
+write_scp_stub() {
+  cat > "$1/scp" <<'STUB'
+#!/usr/bin/env bash
+printf 'scp %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+if [[ "${SCP_FAIL:-0}" == "1" ]]; then
+  echo "scp: transfer to the deployment VM failed: Permission denied" >&2
+  exit 1
+fi
+exit 0
+STUB
+  chmod +x "$1/scp"
+}
+
 write_exapump_stub "$STUBDIR"
 write_curl_stub "$STUBDIR"
+write_ssh_stub "$STUBDIR"
+write_scp_stub "$STUBDIR"
 # missing-curl dir: exapump only (no curl)
 write_exapump_stub "$MISSING_CURL_DIR"
 # missing-exapump dir: curl only (no exapump)
 write_curl_stub "$MISSING_EXAPUMP_DIR"
+for _d in "$MISSING_SSH_DIR" "$MISSING_SCP_DIR"; do
+  write_exapump_stub "$_d"
+  write_curl_stub "$_d"
+  _p="$(command -v tar 2>/dev/null)" && ln -sf "$_p" "$_d/tar"
+done
+write_scp_stub "$MISSING_SSH_DIR"
+write_ssh_stub "$MISSING_SCP_DIR"
+unset _d _p
 
 RUN_PATH="$STUBDIR:$ORIG_PATH"
 
@@ -315,6 +374,53 @@ ENGINE_TARBALL_BAD="$SANDBOX/engine-bad.tar.gz"
 tar -czf "$ENGINE_TARBALL_GOOD" -C "$SANDBOX/fixture-good" udf
 tar -czf "$ENGINE_TARBALL_BAD" -C "$SANDBOX/fixture-bad" other
 
+write_local_deployment_fixture() {
+  local dir="$1"
+  mkdir -p "$dir/local"
+  printf '{"backend":"local","connection":{"host":"127.0.0.1","sshPort":52341,"dbPort":8563,"username":"sys"}}\n' \
+    > "$dir/deployment.json"
+  printf '{"dbPassword":"fixture-secret"}\n' > "$dir/secrets.json"
+  printf 'fake-node-key\n' > "$dir/local/node_access.pem"
+  chmod 600 "$dir/local/node_access.pem"
+}
+
+write_local_deployment_fixture_custom_connection() {
+  local dir="$1"
+  mkdir -p "$dir/local"
+  printf '{"backend":"local","connection":{"host":"descriptor.example","sshPort":52341,"dbPort":52164,"username":"dbadmin"}}\n' \
+    > "$dir/deployment.json"
+  printf '{"dbPassword":"fixture-secret"}\n' > "$dir/secrets.json"
+  printf 'fake-node-key\n' > "$dir/local/node_access.pem"
+  chmod 600 "$dir/local/node_access.pem"
+}
+
+write_cloud_deployment_fixture() {
+  local dir="$1" backend="$2"
+  mkdir -p "$dir"
+  printf '{"backend":"%s","connection":{"host":"cloud.example","dbPort":8563,"username":"sys"}}\n' \
+    "$backend" > "$dir/deployment.json"
+  printf '{"dbPassword":"fixture-secret"}\n' > "$dir/secrets.json"
+}
+
+UNAME_ARM64_DIR="$SANDBOX/uname-arm64"
+mkdir -p "$UNAME_ARM64_DIR"
+cat > "$UNAME_ARM64_DIR/uname" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-m" ]]; then printf 'arm64\n'; else printf '\n'; fi
+STUB
+chmod +x "$UNAME_ARM64_DIR/uname"
+
+UNAME_PPC64LE_DIR="$SANDBOX/uname-ppc64le"
+mkdir -p "$UNAME_PPC64LE_DIR"
+cat > "$UNAME_PPC64LE_DIR/uname" <<'STUB'
+#!/usr/bin/env bash
+if [[ "${1:-}" == "-m" ]]; then printf 'ppc64le\n'; else printf '\n'; fi
+STUB
+chmod +x "$UNAME_PPC64LE_DIR/uname"
+
+NO_JQ_DIR="$SANDBOX/no-jq"
+mkdir -p "$NO_JQ_DIR"
+
 # --- a PATH with no `tar` -----------------------------------------------------
 # A symlink farm holding exactly the external commands install.sh needs, minus tar. Used as the
 # WHOLE PATH so `command -v tar` genuinely fails while everything else still works.
@@ -331,20 +437,26 @@ unset _c _p
 STUB_BFS_STATE="$SANDBOX/bfs-state.txt"
 export STUB_BFS_STATE
 
+STUB_SSH_STATE="$SANDBOX/ssh-state.txt"
+export STUB_SSH_STATE
+
+DEPLOYMENT_NODE_KEY="$SANDBOX/node_access.pem"
+printf 'fake-node-key\n' > "$DEPLOYMENT_NODE_KEY"
+chmod 600 "$DEPLOYMENT_NODE_KEY"
+
 reset_env() {
   unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING GH_ASSET_TARBALL 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
   unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY 2>/dev/null || true
+  unset SSH_FAIL SCP_FAIL SSH_PATH_NEVER SSH_PATH_DELAY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
-  # Stub non-empty token so happy-path runs don't each have to set it individually.
-  export GITHUB_TOKEN="STUBGHTOKEN123"
   # Sandboxed exapump config so profile-mode runs never touch the real ~/.exapump/config.toml.
   export EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
   RUN_PATH="$STUBDIR:$ORIG_PATH"
   : > "$STUB_LOG"
   : > "$STUB_BFS_STATE"
-  rm -f "$STUB_BFS_STATE.delay"
+  rm -f "$STUB_BFS_STATE.delay" "$STUB_SSH_STATE.delay"
 }
 
 run_file() {
@@ -404,30 +516,6 @@ test_missing_prereq_fails_fast() {
   assert_rc_nonzero "missing exapump: nonzero exit" "$LAST_RC"
   assert_contains "missing exapump: names exapump" "$LAST_OUT" "exapump"
   assert_eq "missing exapump: no network/SQL call made" "" "$(log_content)"
-}
-
-test_github_token_is_optional() {
-  echo "== test_github_token_is_optional =="
-
-  # Both source repos are public: a run with no token at all must still succeed, and must never
-  # send a malformed empty Authorization header to GitHub (GitHub 401s on that, worse than
-  # sending none). SaaS mode also sends its OWN unrelated "Authorization: Bearer <PAT>" to the
-  # SaaS REST API, so scope the check to lines that actually hit api.github.com.
-  reset_env
-  unset GITHUB_TOKEN
-  run_file --account-id ACC1 --database-id DB1 --profile staging
-  assert_eq "no token: succeeds" "0" "$LAST_RC"
-  local gh_lines
-  gh_lines="$(printf '%s\n' "$(log_content)" | grep 'api.github.com' || true)"
-  assert_not_contains "no token: no Authorization header sent to GitHub" "$gh_lines" "Authorization"
-
-  # An explicit token IS still honored, e.g. to raise the unauthenticated rate limit.
-  reset_env
-  unset GITHUB_TOKEN
-  run_file --account-id ACC1 --database-id DB1 --profile staging --github-token EXPLICITGHTOKEN789
-  assert_eq "explicit token: succeeds" "0" "$LAST_RC"
-  gh_lines="$(printf '%s\n' "$(log_content)" | grep 'api.github.com' || true)"
-  assert_contains "explicit token: sent on the GitHub calls" "$gh_lines" "Authorization: Bearer EXPLICITGHTOKEN789"
 }
 
 test_connectivity_mode_either_or() {
@@ -663,7 +751,6 @@ test_version_resolution_default_and_override() {
   out="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_ENGINE_SDK_VERSION="4.5.6"
     source "$INSTALLER"
-    ARG_GITHUB_TOKEN="STUBGHTOKEN123"
     ARG_LAKEHOUSE_VERSION=""; ARG_SLC_VERSION=""
     resolve_versions
   )"
@@ -675,7 +762,6 @@ test_version_resolution_default_and_override() {
   assert_contains "default: curl hits the engine releases/latest endpoint" "$log" "releases/latest"
   assert_contains "default: curl fetches the engine's Cargo.toml at the resolved tag" \
     "$log" "contents/Cargo.toml?ref=v1.2.3"
-  assert_contains "default: curl sends the Bearer token header" "$log" "Authorization: Bearer STUBGHTOKEN123"
   assert_not_contains "default: never queries language-container-rs's own latest release" \
     "$log" "language-container-rs/releases/latest"
 
@@ -683,7 +769,6 @@ test_version_resolution_default_and_override() {
   out="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ENGINE_TAG="v1.2.3" GH_ENGINE_SDK_VERSION="4.5.6"
     source "$INSTALLER"
-    ARG_GITHUB_TOKEN="STUBGHTOKEN123"
     ARG_LAKEHOUSE_VERSION="9.9.9"; ARG_SLC_VERSION="8.8.8"
     resolve_versions
   )"
@@ -859,7 +944,6 @@ test_release_asset_download_via_rest() {
   out="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG GH_ASSET_MISSING
     source "$INSTALLER"
-    ARG_GITHUB_TOKEN="STUBGHTOKEN123"
     download_release_asset "$ENGINE_REPO" "v1.2.3" "$ENGINE_ASSET" "$SANDBOX/does-not-matter" 2>&1
   )"
   rc=$?
@@ -1690,10 +1774,778 @@ test_usage_is_mode_aware() {
   assert_eq "usage: --help makes no network/SQL call" "" "$(log_content)"
 }
 
+arch_default_is_x86_64() {
+  echo "== arch_default_is_x86_64 =="
+  local result
+  result="$(
+    source "$INSTALLER"
+    parse_args
+    printf 'arch=%s set=%s\n' "$ARG_ARCH" "$ARG_ARCH_SET"
+  )"
+  assert_eq "arch: no --arch flag defaults to x86_64" "arch=x86_64 set=0" "$result"
+}
+
+arch_explicit_flag_is_stored_and_marks_set() {
+  echo "== arch_explicit_flag_is_stored_and_marks_set =="
+  local result
+  result="$(
+    source "$INSTALLER"
+    parse_args --arch aarch64
+    printf 'arch=%s set=%s\n' "$ARG_ARCH" "$ARG_ARCH_SET"
+  )"
+  assert_eq "arch: explicit --arch aarch64 is accepted and stored" "arch=aarch64 set=1" "$result"
+
+  result="$(
+    source "$INSTALLER"
+    parse_args --arch x86_64
+    printf 'arch=%s set=%s\n' "$ARG_ARCH" "$ARG_ARCH_SET"
+  )"
+  assert_eq "arch: explicit --arch x86_64 is accepted and stored" "arch=x86_64 set=1" "$result"
+}
+
+arch_invalid_value_rejected() {
+  echo "== arch_invalid_value_rejected =="
+  local out rc
+  out="$( source "$INSTALLER"; parse_args --arch mips 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "arch: --arch mips is rejected" "$rc"
+  assert_contains "arch: error names x86_64 as a valid value" "$out" "x86_64"
+  assert_contains "arch: error names aarch64 as a valid value" "$out" "aarch64"
+
+  reset_env
+  run_file --arch sparc64 --profile staging
+  assert_rc_nonzero "arch: full run with an invalid --arch value exits nonzero" "$LAST_RC"
+  assert_contains "arch: full-run error names the rejected value" "$LAST_OUT" "sparc64"
+  assert_contains "arch: full-run error names x86_64 as a valid value" "$LAST_OUT" "x86_64"
+  assert_contains "arch: full-run error names aarch64 as a valid value" "$LAST_OUT" "aarch64"
+  assert_eq "arch: invalid --arch fails before any network/SQL call" "" "$(log_content)"
+}
+
+resolve_arch_suffix_returns_expected_values() {
+  echo "== resolve_arch_suffix_returns_expected_values =="
+  local suffix
+  suffix="$( source "$INSTALLER"; resolve_arch_suffix "x86_64" )"
+  assert_eq "resolve_arch_suffix: x86_64 has no suffix" "" "$suffix"
+
+  suffix="$( source "$INSTALLER"; resolve_arch_suffix "aarch64" )"
+  assert_eq "resolve_arch_suffix: aarch64 suffix is -aarch64" "-aarch64" "$suffix"
+}
+
+arch_aarch64_selects_suffixed_assets() {
+  echo "== arch_aarch64_selects_suffixed_assets =="
+  local out
+
+  out="$(
+    source "$INSTALLER"
+    # shellcheck disable=SC2329
+    download_release_asset() { printf 'asset=%s\n' "$3"; : > "$4"; return 0; }
+    ARG_ARCH="x86_64"
+    RESOLVED_SLC_VERSION="0.21.0"
+    WORKDIR="$(mktemp -d "$SANDBOX/arch-workdir.XXXXXX")"
+    download_slc
+    download_engine
+  )"
+  assert_contains "x86_64: SLC asset name is unsuffixed" "$out" "asset=lc-rust-0.21.0.tar.gz"
+  assert_contains "x86_64: engine asset name is unsuffixed" "$out" "asset=lakehouse-engine.tar.gz"
+
+  out="$(
+    source "$INSTALLER"
+    # shellcheck disable=SC2329
+    download_release_asset() { printf 'asset=%s\n' "$3"; : > "$4"; return 0; }
+    ARG_ARCH="aarch64"
+    RESOLVED_SLC_VERSION="0.21.0"
+    WORKDIR="$(mktemp -d "$SANDBOX/arch-workdir.XXXXXX")"
+    download_slc
+    download_engine
+  )"
+  assert_contains "aarch64: SLC asset name carries the -aarch64 suffix" "$out" "asset=lc-rust-0.21.0-aarch64.tar.gz"
+  assert_contains "aarch64: engine asset name carries the -aarch64 suffix" "$out" "asset=lakehouse-engine-aarch64.tar.gz"
+}
+
+deployment_ssh_port_resolution() {
+  echo "== deployment_ssh_port_resolution =="
+  local dir port out rc
+  dir="$(mktemp -d "$SANDBOX/dep-ssh-port.XXXXXX")"
+
+  printf '{"connection":{"host":"127.0.0.1","sshPort":52341,"dbPort":8563}}\n' > "$dir/deployment.json"
+  port="$( source "$INSTALLER"; deployment_ssh_port "$dir" )"
+  assert_eq "deployment_ssh_port: reads connection.sshPort" "52341" "$port"
+
+  printf '{"connection":{"host":"127.0.0.1","sshPort":52999,"dbPort":8563}}\n' > "$dir/deployment.json"
+  port="$( source "$INSTALLER"; deployment_ssh_port "$dir" )"
+  assert_eq "deployment_ssh_port: a reassigned port is read fresh, never cached" "52999" "$port"
+
+  printf '{"connection":{"host":"127.0.0.1"}}\n' > "$dir/deployment.json"
+  out="$( source "$INSTALLER"; deployment_ssh_port "$dir" 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "deployment_ssh_port: no sshPort field fails" "$rc"
+  assert_contains "deployment_ssh_port: error names sshPort" "$out" "sshPort"
+
+  rm -f "$dir/deployment.json"
+  out="$( source "$INSTALLER"; deployment_ssh_port "$dir" 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "deployment_ssh_port: a missing descriptor fails" "$rc"
+}
+
+deployment_key_path_resolution() {
+  echo "== deployment_key_path_resolution =="
+  local path
+  path="$( source "$INSTALLER"; deployment_key_path "/some/dep/dir" )"
+  assert_eq "deployment_key_path: the node key sits under <dir>/local/node_access.pem" \
+    "/some/dep/dir/local/node_access.pem" "$path"
+}
+
+read_descriptor_field_reports_jq_stderr() {
+  echo "== read_descriptor_field_reports_jq_stderr =="
+  local dir out rc
+  dir="$(mktemp -d "$SANDBOX/dep-badjson.XXXXXX")"
+  printf 'not valid json{' > "$dir/deployment.json"
+
+  out="$( source "$INSTALLER"; read_descriptor_field "$dir/deployment.json" '.backend' 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "read_descriptor_field: malformed JSON fails" "$rc"
+  assert_contains "read_descriptor_field: error names jq" "$out" "jq said:"
+  assert_contains "read_descriptor_field: error carries jq's own diagnostic" "$out" "parse error"
+}
+
+deployment_backend_discrimination() {
+  echo "== deployment_backend_discrimination =="
+  local dir backend out rc
+  dir="$(mktemp -d "$SANDBOX/dep-backend.XXXXXX")"
+
+  printf '{"backend":"local","connection":{"host":"127.0.0.1"}}\n' > "$dir/deployment.json"
+  backend="$( source "$INSTALLER"; deployment_backend "$dir" )"
+  assert_eq "deployment_backend: a local descriptor reports the local backend" "local" "$backend"
+
+  printf '{"backend":"aws","connection":{"host":"h.example"}}\n' > "$dir/deployment.json"
+  backend="$( source "$INSTALLER"; deployment_backend "$dir" )"
+  assert_eq "deployment_backend: a cloud descriptor reports its own backend name" "aws" "$backend"
+
+  printf '{"connection":{"host":"h.example"}}\n' > "$dir/deployment.json"
+  out="$( source "$INSTALLER"; deployment_backend "$dir" 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "deployment_backend: a descriptor with no .backend field fails" "$rc"
+  assert_contains "deployment_backend: error names the missing .backend field" "$out" "backend"
+
+  printf '{"backend":"","connection":{"host":"h.example"}}\n' > "$dir/deployment.json"
+  out="$( source "$INSTALLER"; deployment_backend "$dir" 2>&1 )"
+  rc=$?
+  assert_rc_nonzero "deployment_backend: a descriptor with an empty .backend field fails" "$rc"
+}
+
+deployment_connection_resolves_from_fixture() {
+  echo "== deployment_connection_resolves_from_fixture =="
+  local dir out
+  dir="$(mktemp -d "$SANDBOX/dep-conn.XXXXXX")"
+  write_local_deployment_fixture_custom_connection "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    ARG_HOST=""; ARG_USER=""; ARG_PASSWORD=""
+    resolve_deployment_connection "$dir" "$PERSONAL_DB_HOST_DEFAULT"
+    printf 'host=%s user=%s password=%s\n' "$ARG_HOST" "$ARG_USER" "$ARG_PASSWORD"
+  )"
+  assert_eq "resolve_deployment_connection: host:port, user and password all resolve from the fixture descriptor" \
+    "host=descriptor.example:52164 user=dbadmin password=fixture-secret" "$out"
+}
+
+deployment_cli_overrides_descriptor() {
+  echo "== deployment_cli_overrides_descriptor =="
+  local dir out
+  dir="$(mktemp -d "$SANDBOX/dep-override.XXXXXX")"
+  write_local_deployment_fixture_custom_connection "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    ARG_HOST="override.example"; ARG_USER=""; ARG_PASSWORD="override"
+    resolve_deployment_connection "$dir" "$PERSONAL_DB_HOST_DEFAULT"
+    printf 'host=%s user=%s password=%s\n' "$ARG_HOST" "$ARG_USER" "$ARG_PASSWORD"
+  )"
+  assert_eq "override: explicit --host and --password win, unoverridden port and user still resolve from the descriptor" \
+    "host=override.example:52164 user=dbadmin password=override" "$out"
+}
+
+deployment_missing_dir_fails() {
+  echo "== deployment_missing_dir_fails =="
+  local nonexistent_root out rc
+  nonexistent_root="$SANDBOX/no-deployments-here"
+
+  out="$(
+    source "$INSTALLER"
+    DEPLOYMENT_ROOT="$nonexistent_root"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_DEPLOYMENT="nonexistent"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "missing deployment dir: nonzero exit" "$rc"
+  assert_contains "missing deployment dir: error names the expected path" "$out" \
+    "$nonexistent_root/nonexistent"
+}
+
+deployment_requires_jq() {
+  echo "== deployment_requires_jq =="
+  local out rc
+  out="$(
+    source "$INSTALLER"
+    PATH="$NO_JQ_DIR"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_DEPLOYMENT="my-db"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "deployment requires jq: nonzero exit when jq is absent from PATH" "$rc"
+  assert_contains "deployment requires jq: error names jq" "$out" "jq"
+}
+
+deployment_rejects_saas_target() {
+  echo "== deployment_rejects_saas_target =="
+  local out rc
+  out="$(
+    source "$INSTALLER"
+    TARGET_MODE="saas"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_DEPLOYMENT="my-db"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "deployment rejects saas target: nonzero exit" "$rc"
+  assert_contains "deployment rejects saas target: error names --account-id" "$out" "--account-id"
+}
+
+deployment_rejects_profile_and_dsn() {
+  echo "== deployment_rejects_profile_and_dsn =="
+  local out rc
+  out="$(
+    source "$INSTALLER"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE="staging"; ARG_DSN=""
+    ARG_DEPLOYMENT="my-db"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "deployment rejects --profile: nonzero exit" "$rc"
+  assert_contains "deployment rejects --profile: error names --profile" "$out" "--profile"
+
+  out="$(
+    source "$INSTALLER"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN="exasol://sys:pw@127.0.0.1:8563"
+    ARG_DEPLOYMENT="my-db"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "deployment rejects --dsn: nonzero exit" "$rc"
+  assert_contains "deployment rejects --dsn: error names --dsn" "$out" "--dsn"
+}
+
+deployment_rejects_empty_bfs_bucket() {
+  echo "== deployment_rejects_empty_bfs_bucket =="
+  local dir out rc
+  dir="$(mktemp -d "$SANDBOX/dep-emptybucket.XXXXXX")"
+  write_local_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    ARG_BFS_BUCKET=""
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "deployment rejects empty --bfs-bucket: nonzero exit" "$rc"
+  assert_contains "deployment rejects empty --bfs-bucket: error names --bfs-bucket" "$out" "--bfs-bucket"
+}
+
+deployment_cloud_requires_bfs_password() {
+  echo "== deployment_cloud_requires_bfs_password =="
+  local dir out rc
+  dir="$(mktemp -d "$SANDBOX/dep-cloud-nopw.XXXXXX")"
+  write_cloud_deployment_fixture "$dir" aws
+
+  out="$(
+    source "$INSTALLER"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    ARG_BFS_WRITE_PASSWORD=""
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "cloud deployment without --bfs-write-password: nonzero exit" "$rc"
+  assert_contains "cloud deployment without --bfs-write-password: error names the flag" \
+    "$out" "--bfs-write-password"
+  assert_contains "cloud deployment without --bfs-write-password: error says it is required for a cloud deployment" \
+    "$out" "cloud"
+}
+
+deployment_cloud_bfs_transport() {
+  echo "== deployment_cloud_bfs_transport =="
+  local dir out
+  dir="$(mktemp -d "$SANDBOX/dep-cloud.XXXXXX")"
+  write_cloud_deployment_fixture "$dir" aws
+
+  out="$(
+    source "$INSTALLER"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    ARG_BFS_WRITE_PASSWORD="secret"
+    resolve_deployment_transport 2>&1
+    printf 'rc=%s transport=%s host=%s bfs_host=%s\n' "$?" "$DEPLOYMENT_TRANSPORT" "$ARG_HOST" "$ARG_BFS_HOST"
+  )"
+  assert_contains "cloud deployment: resolves successfully" "$out" "rc=0"
+  assert_contains "cloud deployment: selects the bucketfs (HTTP) transport" "$out" "transport=bucketfs"
+  assert_contains "cloud deployment: connection host:port resolves from the descriptor" "$out" "host=cloud.example:8563"
+  assert_contains "cloud deployment: the BucketFS host derives from the resolved connection host" "$out" "bfs_host=cloud.example"
+}
+
+deployment_rejects_bfs_bucket_with_invalid_characters() {
+  echo "== deployment_rejects_bfs_bucket_with_invalid_characters =="
+  local dir out rc
+  dir="$(mktemp -d "$SANDBOX/dep-badbucket.XXXXXX")"
+  write_local_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    ARG_BFS_BUCKET="mal'icious"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "bfs-bucket with a single quote: nonzero exit" "$rc"
+  assert_contains "bfs-bucket with a single quote: error names the rejected value" "$out" "mal'icious"
+  assert_contains "bfs-bucket with a single quote: error names the allowed character set" "$out" "A-Za-z0-9._-"
+}
+
+deployment_local_ssh_transport() {
+  echo "== deployment_local_ssh_transport =="
+  local dir out
+  dir="$(mktemp -d "$SANDBOX/dep-local.XXXXXX")"
+  write_local_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    resolve_deployment_transport 2>&1
+    printf 'rc=%s transport=%s ssh_port=%s key=%s\n' \
+      "$?" "$DEPLOYMENT_TRANSPORT" "$DEPLOYMENT_SSH_PORT" "$DEPLOYMENT_KEY_PATH"
+  )"
+  assert_contains "local deployment: resolves successfully" "$out" "rc=0"
+  assert_contains "local deployment: selects the ssh transport" "$out" "transport=ssh"
+  assert_contains "local deployment: the ssh port comes from the descriptor" "$out" "ssh_port=52341"
+  assert_contains "local deployment: the node key path sits under the deployment's local/ dir" \
+    "$out" "key=$dir/local/node_access.pem"
+}
+
+deployment_local_autodetects_arch() {
+  echo "== deployment_local_autodetects_arch =="
+  local dir out
+  dir="$(mktemp -d "$SANDBOX/dep-local-arch.XXXXXX")"
+  write_local_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    PATH="$UNAME_ARM64_DIR:$ORIG_PATH"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=0
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    resolve_deployment_transport >/dev/null 2>&1
+    printf 'arch=%s\n' "$ARG_ARCH"
+  )"
+  assert_eq "local deployment: an aarch64 host is auto-detected via uname -m" "arch=aarch64" "$out"
+}
+
+deployment_local_unsupported_uname_fails_detection() {
+  echo "== deployment_local_unsupported_uname_fails_detection =="
+  local dir out rc
+  dir="$(mktemp -d "$SANDBOX/dep-local-badarch.XXXXXX")"
+  write_local_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    PATH="$UNAME_PPC64LE_DIR:$ORIG_PATH"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=0
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "unsupported uname -m: resolve_deployment_transport fails" "$rc"
+  assert_contains "unsupported uname -m: error names the detected value" "$out" "ppc64le"
+  assert_contains "unsupported uname -m: error instructs --arch" "$out" "--arch"
+}
+
+arch_override_beats_autodetect() {
+  echo "== arch_override_beats_autodetect =="
+  local dir out
+  dir="$(mktemp -d "$SANDBOX/dep-local-override.XXXXXX")"
+  write_local_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    PATH="$UNAME_ARM64_DIR:$ORIG_PATH"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    resolve_deployment_transport >/dev/null 2>&1
+    printf 'arch=%s\n' "$ARG_ARCH"
+  )"
+  assert_eq "an explicit --arch x86_64 overrides auto-detection on an aarch64 host" "arch=x86_64" "$out"
+}
+
+run_make_install_slc_dry() {
+  local arch="$1"
+  if [[ -n "$arch" ]]; then
+    MAKE_OUT="$( cd "$REPO_ROOT" && BUCKETFS_WRITE_PASS=stub make -n install-slc "ARCH=$arch" 2>&1 )"
+  else
+    MAKE_OUT="$( cd "$REPO_ROOT" && BUCKETFS_WRITE_PASS=stub make -n install-slc 2>&1 )"
+  fi
+  MAKE_RC=$?
+}
+
+slc_url_from_make_output() {
+  printf '%s\n' "$1" | grep -o 'https://github.com/[^"]*lc-rust[^"]*\.tar\.gz' | head -1
+}
+
+makefile_slc_url_arch_aware() {
+  echo "== makefile_slc_url_arch_aware =="
+  local default_url x86_url aarch64_url arm64_url
+
+  run_make_install_slc_dry ""
+  assert_rc_zero "makefile arch: an unset ARCH is accepted" "$MAKE_RC"
+  default_url="$(slc_url_from_make_output "$MAKE_OUT")"
+  assert_contains "makefile arch: an unset ARCH composes an lc-rust release URL" "$default_url" "lc-rust-"
+  assert_not_contains "makefile arch: an unset ARCH composes the unsuffixed URL" "$default_url" "-aarch64"
+
+  run_make_install_slc_dry "x86_64"
+  assert_rc_zero "makefile arch: ARCH=x86_64 is accepted" "$MAKE_RC"
+  x86_url="$(slc_url_from_make_output "$MAKE_OUT")"
+  assert_eq "makefile arch: ARCH=x86_64 composes the same URL as an unset ARCH" "$default_url" "$x86_url"
+
+  run_make_install_slc_dry "aarch64"
+  assert_rc_zero "makefile arch: ARCH=aarch64 is accepted" "$MAKE_RC"
+  aarch64_url="$(slc_url_from_make_output "$MAKE_OUT")"
+  assert_contains "makefile arch: ARCH=aarch64 composes the -aarch64-suffixed URL" \
+    "$aarch64_url" "-aarch64.tar.gz"
+
+  run_make_install_slc_dry "arm64"
+  assert_rc_zero "makefile arch: ARCH=arm64 (what uname -m prints on Apple Silicon) is accepted" "$MAKE_RC"
+  arm64_url="$(slc_url_from_make_output "$MAKE_OUT")"
+  assert_eq "makefile arch: ARCH=arm64 normalizes to the ARCH=aarch64 URL, as install.sh does" \
+    "$aarch64_url" "$arm64_url"
+
+  run_make_install_slc_dry "totally-bogus"
+  assert_rc_nonzero "makefile arch: an unsupported ARCH exits nonzero" "$MAKE_RC"
+  assert_contains "makefile arch: the rejection names the rejected value" "$MAKE_OUT" "totally-bogus"
+  assert_contains "makefile arch: the rejection names x86_64 as an accepted value" "$MAKE_OUT" "x86_64"
+  assert_contains "makefile arch: the rejection names aarch64 as an accepted value" "$MAKE_OUT" "aarch64"
+  assert_not_contains "makefile arch: an unsupported ARCH composes no download URL at all" \
+    "$MAKE_OUT" "releases/download"
+}
+
+run_deploy_personal_local() {
+  local skip_slc="$1" workdir
+  workdir="$(mktemp -d "$SANDBOX/dep-push.XXXXXX")"
+  LAST_OUT="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_SSH_STATE
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs
+    CONNECTIVITY_MODE=dsn; ARG_DSN="exasol://sys:pw@127.0.0.1:8563"
+    ARG_BFS_BUCKET=default
+    ARG_SKIP_SLC="$skip_slc"
+    DEPLOYMENT_TRANSPORT=ssh
+    DEPLOYMENT_KEY_PATH="$DEPLOYMENT_NODE_KEY"
+    DEPLOYMENT_SSH_PORT=52341
+    RESOLVED_SLC_VERSION="0.21.0"
+    RESOLVED_ENGINE_VERSION="1.2.3"
+    VM_RECONCILE_TRIES=3
+    VM_RECONCILE_POLL_SECONDS=0
+    resolve_target_layout
+    WORKDIR="$workdir"
+    mkdir -p "$WORKDIR/extracted/udf"
+    # shellcheck disable=SC2329
+    download_slc() { printf 'slc-bytes\n' > "$WORKDIR/rustslc.tar.gz"; }
+    # shellcheck disable=SC2329
+    download_engine() { printf 'engine-bytes\n' > "$WORKDIR/$ENGINE_ASSET"; }
+    # shellcheck disable=SC2329
+    extract_engine_so() {
+      printf 'so-bytes\n' > "$WORKDIR/extracted/udf/liblakehouse_engine.so"
+      printf '%s\n' "$WORKDIR/extracted/udf/liblakehouse_engine.so"
+    }
+    deploy_personal_local 2>&1
+  )"
+  LAST_RC=$?
+}
+
+deployment_local_pushes_artifacts_over_ssh() {
+  echo "== deployment_local_pushes_artifacts_over_ssh =="
+  reset_env
+  run_deploy_personal_local 0
+  assert_rc_zero "local ssh push: deploy_personal_local succeeds" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_contains "local ssh push: scp carries the node key and the descriptor's ssh port" \
+    "$log" "-i $DEPLOYMENT_NODE_KEY -P 52341"
+  assert_contains "local ssh push: ssh carries the node key and the descriptor's ssh port" \
+    "$log" "-i $DEPLOYMENT_NODE_KEY -p 52341"
+  assert_contains "local ssh push: the SLC tarball is staged on the VM under /tmp" \
+    "$log" "root@127.0.0.1:/tmp/lakehouse-rustslc.tar.gz"
+  assert_contains "local ssh push: the SLC is extracted into the VM bucket's slc tree" \
+    "$log" "tar -xzf '/tmp/lakehouse-rustslc.tar.gz' -C '/var/lib/exa/bucketfs/bfsdefault/default/slc/lakehouse-rustslc'"
+  assert_contains "local ssh push: the extracted SLC tree is checked for its exaudfclient" \
+    "$log" "test -x '/var/lib/exa/bucketfs/bfsdefault/default/slc/lakehouse-rustslc/exaudf/exaudfclient'"
+  assert_contains "local ssh push: the engine .so is staged on the VM under /tmp" \
+    "$log" "root@127.0.0.1:/tmp/liblakehouse_engine.so"
+  assert_contains "local ssh push: the engine .so lands at the VM bucket's udf path" \
+    "$log" "mv -f '/tmp/liblakehouse_engine.so' '/var/lib/exa/bucketfs/bfsdefault/default/udf/liblakehouse_engine.so'"
+  assert_contains "local ssh push: the DDL points at the bucket path the .so was installed to" \
+    "$log" "$BFS_SO_UDF_OBJECT"
+  assert_not_contains "local ssh push: never uploads over the BucketFS HTTP endpoint" "$log" "exapump bucketfs"
+  assert_not_contains "local ssh push: never contacts the SaaS control plane" "$log" "cloud.exasol.com"
+}
+
+deployment_local_registers_script_languages_with_alter_system() {
+  echo "== deployment_local_registers_script_languages_with_alter_system =="
+  reset_env
+  export EXAPUMP_SCRIPT_LANGUAGES="PYTHON3=builtin_python3 JAVA=builtin_java"
+  run_deploy_personal_local 0
+  assert_rc_zero "local ssh register: deploy_personal_local succeeds" "$LAST_RC"
+  local log alter_line
+  log="$(log_content)"
+  alter_line="$(printf '%s\n' "$log" | grep 'ALTER SYSTEM SET SCRIPT_LANGUAGES' || true)"
+  assert_contains "local ssh register: registers with ALTER SYSTEM" "$log" "ALTER SYSTEM SET SCRIPT_LANGUAGES"
+  assert_not_contains "local ssh register: never uses ALTER SESSION" "$log" "ALTER SESSION"
+  assert_contains "local ssh register: the pre-existing PYTHON3 entry survives the merge" \
+    "$alter_line" "PYTHON3=builtin_python3"
+  assert_contains "local ssh register: the pre-existing JAVA entry survives the merge" \
+    "$alter_line" "JAVA=builtin_java"
+  assert_contains "local ssh register: the VM bucket's RUST alias is registered" \
+    "$alter_line" "$BFS_RUST_SEGMENT"
+  assert_eq "local ssh register: exactly one RUST entry" "1" "$(count_occurrences 'RUST=' "$alter_line")"
+}
+
+deployment_local_skip_slc_skips_push_and_registration() {
+  echo "== deployment_local_skip_slc_skips_push_and_registration =="
+  reset_env
+  run_deploy_personal_local 1
+  assert_rc_zero "local ssh skip-slc: deploy_personal_local succeeds" "$LAST_RC"
+  assert_contains "local ssh skip-slc: says why the SLC step was skipped" \
+    "$LAST_OUT" "Skipping SLC upload and registration (--skip-slc)"
+  local log; log="$(log_content)"
+  assert_not_contains "local ssh skip-slc: the SLC is never pushed to the VM" "$log" "lakehouse-rustslc.tar.gz"
+  assert_not_contains "local ssh skip-slc: SCRIPT_LANGUAGES is never read" \
+    "$log" "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS"
+  assert_not_contains "local ssh skip-slc: ALTER SYSTEM is never issued" "$log" "ALTER SYSTEM SET SCRIPT_LANGUAGES"
+  assert_contains "local ssh skip-slc: the engine .so is still pushed to the VM" \
+    "$log" "root@127.0.0.1:/tmp/liblakehouse_engine.so"
+  assert_contains "local ssh skip-slc: the three scripts are still created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
+}
+
+deployment_local_ssh_failures_are_actionable() {
+  echo "== deployment_local_ssh_failures_are_actionable =="
+  local out rc
+
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG SCP_FAIL=1
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; ARG_BFS_BUCKET=default
+    DEPLOYMENT_KEY_PATH="$DEPLOYMENT_NODE_KEY"; DEPLOYMENT_SSH_PORT=52341
+    resolve_target_layout
+    push_slc_to_vm "$SANDBOX/whatever-slc.tar.gz" 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "scp fail: push_slc_to_vm exits nonzero" "$rc"
+  assert_contains "scp fail: names the staged destination on the VM" "$out" "/tmp/lakehouse-rustslc.tar.gz"
+  assert_contains "scp fail: surfaces scp's own stderr" "$out" "Permission denied"
+
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG SCP_FAIL=1
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; ARG_BFS_BUCKET=default
+    DEPLOYMENT_KEY_PATH="$DEPLOYMENT_NODE_KEY"; DEPLOYMENT_SSH_PORT=52341
+    resolve_target_layout
+    push_engine_so_to_vm "$SANDBOX/whatever.so" 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "scp fail: push_engine_so_to_vm exits nonzero" "$rc"
+  assert_contains "scp fail: names the staged .so destination on the VM" "$out" "/tmp/liblakehouse_engine.so"
+  assert_contains "scp fail: engine push surfaces scp's own stderr" "$out" "Permission denied"
+
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG SSH_FAIL=1
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; ARG_BFS_BUCKET=default
+    DEPLOYMENT_KEY_PATH="$DEPLOYMENT_NODE_KEY"; DEPLOYMENT_SSH_PORT=52341
+    resolve_target_layout
+    push_slc_to_vm "$SANDBOX/whatever-slc.tar.gz" 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "ssh fail: the SLC extraction step exits nonzero" "$rc"
+  assert_contains "ssh fail: names the SLC destination directory on the VM" \
+    "$out" "/var/lib/exa/bucketfs/bfsdefault/default/slc/lakehouse-rustslc"
+  assert_contains "ssh fail: surfaces ssh's own stderr" "$out" "Connection refused"
+
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG SSH_FAIL=1
+    source "$INSTALLER"
+    TARGET_MODE=bucketfs; ARG_BFS_BUCKET=default
+    DEPLOYMENT_KEY_PATH="$DEPLOYMENT_NODE_KEY"; DEPLOYMENT_SSH_PORT=52341
+    resolve_target_layout
+    push_engine_so_to_vm "$SANDBOX/whatever.so" 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "ssh fail: the .so install step exits nonzero" "$rc"
+  assert_contains "ssh fail: names the .so destination on the VM" \
+    "$out" "/var/lib/exa/bucketfs/bfsdefault/default/udf/liblakehouse_engine.so"
+  assert_contains "ssh fail: .so install surfaces ssh's own stderr" "$out" "Connection refused"
+
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG SSH_FAIL=1
+    source "$INSTALLER"
+    DEPLOYMENT_KEY_PATH="$DEPLOYMENT_NODE_KEY"; DEPLOYMENT_SSH_PORT=52341
+    ssh_vm_reachable 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "ssh fail: the reachability preflight exits nonzero" "$rc"
+  assert_contains "ssh fail: preflight names the ssh endpoint" "$out" "127.0.0.1:52341"
+  assert_contains "ssh fail: preflight names the node key it used" "$out" "$DEPLOYMENT_NODE_KEY"
+  assert_contains "ssh fail: preflight points at the port being reassigned on restart" "$out" "exasol status"
+  assert_contains "ssh fail: preflight surfaces ssh's own stderr" "$out" "Connection refused"
+}
+
+deployment_local_waits_for_reconciled_paths() {
+  echo "== deployment_local_waits_for_reconciled_paths =="
+  local engine_path slc_path out rc log
+  engine_path="/var/lib/exa/bucketfs/bfsdefault/default/udf/liblakehouse_engine.so"
+  slc_path="/var/lib/exa/bucketfs/bfsdefault/default/slc/lakehouse-rustslc"
+
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_SSH_STATE SSH_PATH_DELAY=2
+    source "$INSTALLER"
+    DEPLOYMENT_KEY_PATH="$DEPLOYMENT_NODE_KEY"; DEPLOYMENT_SSH_PORT=52341
+    vm_wait_for_reconciled_path "$engine_path" 5 0 2>&1
+  )"
+  rc=$?
+  assert_rc_zero "vm wait: retries past a path the VM has not exposed yet, then succeeds" "$rc"
+  assert_contains "vm wait: reports the verified path" "$out" "$engine_path"
+  assert_eq "vm wait: took exactly 3 probes (2 misses + 1 hit)" "3" \
+    "$(count_occurrences "test -e '$engine_path'" "$(log_content)")"
+
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_SSH_STATE SSH_PATH_NEVER=1
+    source "$INSTALLER"
+    DEPLOYMENT_KEY_PATH="$DEPLOYMENT_NODE_KEY"; DEPLOYMENT_SSH_PORT=52341
+    ARG_BFS_BUCKET=default
+    vm_wait_for_reconciled_path "$slc_path" 3 0 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "vm wait: gives up nonzero once the deadline passes, never hangs" "$rc"
+  assert_contains "vm wait: the failure names the polled path" "$out" "$slc_path"
+  assert_contains "vm wait: the failure names the deadline it waited out" "$out" "3 checks"
+  assert_eq "vm wait: capped at exactly 3 probes" "3" \
+    "$(count_occurrences "test -e '$slc_path'" "$(log_content)")"
+
+  reset_env
+  run_deploy_personal_local 0
+  assert_rc_zero "vm wait: the happy path still succeeds" "$LAST_RC"
+  log="$(log_content)"
+  assert_contains "vm wait: the extracted SLC tree is verified on the VM" "$log" "test -e '$slc_path'"
+  assert_contains "vm wait: the engine .so is verified on the VM" "$log" "test -e '$engine_path'"
+  assert_not_contains "vm wait: no fixed-duration sleep stands in for the verification" \
+    "$log" "Waiting 3s"
+
+  reset_env
+  run_deploy_personal_local 1
+  assert_rc_zero "vm wait --skip-slc: still succeeds" "$LAST_RC"
+  log="$(log_content)"
+  assert_not_contains "vm wait --skip-slc: never waits for an SLC tree it did not push" "$log" "test -e '$slc_path'"
+  assert_contains "vm wait --skip-slc: still verifies the engine .so" "$log" "test -e '$engine_path'"
+
+  reset_env
+  export SSH_PATH_NEVER=1
+  run_deploy_personal_local 0
+  assert_rc_nonzero "vm wait: deploy_personal_local fails when the VM never exposes a copied path" "$LAST_RC"
+  assert_contains "vm wait: that failure names the path the VM never exposed" \
+    "$LAST_OUT" "did not expose '$slc_path'"
+  log="$(log_content)"
+  assert_not_contains "vm wait: SCRIPT_LANGUAGES is never registered against unverified artifacts" \
+    "$log" "ALTER SYSTEM SET SCRIPT_LANGUAGES"
+  assert_not_contains "vm wait: no scripts are created against unverified artifacts" \
+    "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
+}
+
+deployment_local_requires_ssh_and_scp() {
+  echo "== deployment_local_requires_ssh_and_scp =="
+  local out rc
+
+  out="$(
+    source "$INSTALLER"
+    PATH="$MISSING_SSH_DIR"
+    TARGET_MODE=bucketfs
+    DEPLOYMENT_TRANSPORT=ssh
+    check_prereqs 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "missing ssh: check_prereqs exits nonzero" "$rc"
+  assert_contains "missing ssh: names ssh as the missing tool" "$out" "required tool 'ssh' not found"
+  assert_not_contains "missing ssh: does not also blame scp, which is present" \
+    "$out" "required tool 'scp' not found"
+
+  out="$(
+    source "$INSTALLER"
+    PATH="$MISSING_SCP_DIR"
+    TARGET_MODE=bucketfs
+    DEPLOYMENT_TRANSPORT=ssh
+    check_prereqs 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "missing scp: check_prereqs exits nonzero" "$rc"
+  assert_contains "missing scp: names scp as the missing tool" "$out" "required tool 'scp' not found"
+  assert_not_contains "missing scp: does not also blame ssh, which is present" \
+    "$out" "required tool 'ssh' not found"
+
+  out="$(
+    source "$INSTALLER"
+    PATH="$MISSING_SSH_DIR"
+    TARGET_MODE=bucketfs
+    DEPLOYMENT_TRANSPORT=""
+    check_prereqs 2>&1
+  )"
+  rc=$?
+  assert_rc_zero "no ssh transport: a missing ssh is not required at all" "$rc"
+}
+
 # ============================================================================
 main() {
   test_missing_prereq_fails_fast
-  test_github_token_is_optional
   test_connectivity_mode_either_or
   test_host_mode_requires_port
   test_host_dsn_percent_encodes_credentials
@@ -1738,6 +2590,36 @@ main() {
   test_tar_required_only_in_bucketfs_mode
   test_skip_slc_gating
   test_usage_is_mode_aware
+  arch_default_is_x86_64
+  arch_explicit_flag_is_stored_and_marks_set
+  arch_invalid_value_rejected
+  resolve_arch_suffix_returns_expected_values
+  arch_aarch64_selects_suffixed_assets
+  makefile_slc_url_arch_aware
+  deployment_ssh_port_resolution
+  deployment_key_path_resolution
+  read_descriptor_field_reports_jq_stderr
+  deployment_backend_discrimination
+  deployment_connection_resolves_from_fixture
+  deployment_cli_overrides_descriptor
+  deployment_missing_dir_fails
+  deployment_requires_jq
+  deployment_rejects_saas_target
+  deployment_rejects_profile_and_dsn
+  deployment_rejects_empty_bfs_bucket
+  deployment_cloud_requires_bfs_password
+  deployment_cloud_bfs_transport
+  deployment_rejects_bfs_bucket_with_invalid_characters
+  deployment_local_ssh_transport
+  deployment_local_autodetects_arch
+  deployment_local_unsupported_uname_fails_detection
+  arch_override_beats_autodetect
+  deployment_local_pushes_artifacts_over_ssh
+  deployment_local_registers_script_languages_with_alter_system
+  deployment_local_skip_slc_skips_push_and_registration
+  deployment_local_ssh_failures_are_actionable
+  deployment_local_waits_for_reconciled_paths
+  deployment_local_requires_ssh_and_scp
 
   echo ""
   echo "=================================================="
