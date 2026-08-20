@@ -40,6 +40,24 @@ fn parse_table_ident_handles_multilevel_namespace() {
     assert_eq!(tbl3, "orders");
 }
 
+/// Scenario: an empty configured namespace is rejected by `NamespaceIdent::from_vec`
+/// before any catalog request is issued — the error names the (empty) configured
+/// namespace, not the underlying iceberg wording alone.
+#[tokio::test]
+async fn list_namespace_tables_rejects_empty_namespace() {
+    let storage = static_backend();
+    let creds = base_creds();
+
+    let err = list_namespace_tables("http://unused.invalid", &[], &storage, &creds)
+        .await
+        .unwrap_err();
+
+    assert!(
+        err.to_string().contains("invalid namespace ''"),
+        "error must name the empty configured namespace: {err}"
+    );
+}
+
 /// Scenario: end-to-end — `list_namespace_tables`'s SigV4 enumeration path
 /// (`list_in_namespace_signed` / `build_list_tables_url`) signs its
 /// `list_tables` request against the derived `catalogs/{account-id}` prefix,
