@@ -19,7 +19,7 @@ cd "$(dirname "$0")/.."
 [ -f bench/.env ] || { echo "ERROR: bench/.env required"; exit 1; }
 set -a; . bench/.env; set +a
 DSN="exasol://sys:${EXASOL_SYS_PASSWORD}@${EXASOL_HOST}:${LH_EXASOL_PORT:-8563}?validateservercertificate=0"
-NS="${ICEBERG_NAMESPACE:-tpch}"; CORES="${BENCH_NR_OF_CORES:-8}"; PF="${BENCH_PARALLELISM_FACTOR:-8}"
+NS="${NAMESPACE:-tpch}"; CORES="${BENCH_NR_OF_CORES:-8}"; PF="${BENCH_PARALLELISM_FACTOR:-8}"
 KEY=33007128; NATIVE_RPS=2073703
 BS="${1:-65536}"
 CONNS="${2:-AUTO 8 32 64 128}"
@@ -37,7 +37,7 @@ recreate_vs() {  # s3conn ("AUTO" => omit property, let it AUTO-derive)
   printf '%s' "CREATE VIRTUAL SCHEMA ${VS}
 USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION    = '${CONN}'
-  ICEBERG_NAMESPACE     = '${NS}'
+  NAMESPACE             = '${NS}'
   NR_OF_CORES           = '${CORES}'
   PARALLELISM_FACTOR    = '${PF}'
   DATAFUSION_BATCH_SIZE = '${BS}'${s3line}" | exapump sql -d "$DSN" >/dev/null 2>&1

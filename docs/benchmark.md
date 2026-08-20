@@ -43,7 +43,7 @@ The configuration comes from a gitignored `bench/.env` file. Copy `bench/.env.ex
 
   ```
   AWS_REGION, AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY,
-  GLUE_CATALOG_URI, GLUE_WAREHOUSE, ICEBERG_NAMESPACE,
+  GLUE_CATALOG_URI, GLUE_WAREHOUSE, NAMESPACE,
   EXASOL_HOST, EXASOL_SYS_PASSWORD, BUCKETFS_WRITE_PASS
   ```
 
@@ -266,7 +266,7 @@ AWS_SECRET_ACCESS_KEY=<your-secret-access-key>
 # AWS_SESSION_TOKEN=<optional-sts-token>
 GLUE_CATALOG_URI=https://glue.us-east-1.amazonaws.com/iceberg
 GLUE_WAREHOUSE=123456789012          # Glue catalog id (AWS account id), NOT an s3:// path
-ICEBERG_NAMESPACE=tpch               # namespace holding the TPC-H tables
+NAMESPACE=tpch                       # namespace holding the TPC-H tables
 # AWS_S3_ENDPOINT=                   # default https://s3.$AWS_REGION.amazonaws.com
 
 # External Exasol cluster

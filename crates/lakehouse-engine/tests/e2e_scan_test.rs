@@ -444,7 +444,7 @@ fn create_vs_unreachable_catalog_errors_no_secret() {
         r#"CREATE VIRTUAL SCHEMA BAD_CATALOG_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = 'BAD_CATALOG_CREDS'
-  ICEBERG_NAMESPACE   = 'ns'
+  NAMESPACE   = 'ns'
   ALLOW_HTTP          = 'true'"#
     ));
     assert_eq!(
@@ -494,7 +494,7 @@ fn create_vs_ambiguous_catalog_auth_errors_no_secret() {
         r#"CREATE VIRTUAL SCHEMA AMBIGUOUS_CATALOG_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = 'AMBIGUOUS_CATALOG_CREDS'
-  ICEBERG_NAMESPACE   = 'ns'
+  NAMESPACE   = 'ns'
   ALLOW_HTTP          = 'true'"#
     ));
     assert_eq!(
@@ -577,7 +577,7 @@ fn e2e_renamed_column_resolves_by_field_id() {
         r#"CREATE VIRTUAL SCHEMA EVO_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{DEFAULT_CATALOG_CONN_NAME}'
-  ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
+  NAMESPACE   = '{E2E_NAMESPACE}'
   PARALLELISM_FACTOR  = '1'
   ALLOW_HTTP          = 'true'"#
     ));
@@ -656,7 +656,7 @@ fn e2e_added_columns_initial_default_fill_all_types() {
         r#"CREATE VIRTUAL SCHEMA INITDEF_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{DEFAULT_CATALOG_CONN_NAME}'
-  ICEBERG_NAMESPACE   = '{E2E_NAMESPACE}'
+  NAMESPACE   = '{E2E_NAMESPACE}'
   SCAN_SCHEMA         = '{SCHEMA_NAME}'
   PARALLELISM_FACTOR  = '1'
   ALLOW_HTTP          = 'true'"#
@@ -2972,7 +2972,7 @@ fn test_group_by_shared_inner_aggregate_dedup() {
 // Task 2.14 — multi-table VS tests
 // ---------------------------------------------------------------------------
 
-/// Create VS with ICEBERG_NAMESPACE enumerates all tables in the namespace.
+/// Create VS with NAMESPACE enumerates all tables in the namespace.
 ///
 /// Asserts that both `EVENTS` and `LABELS` appear in `SYS.EXA_ALL_TABLES` for
 /// the virtual schema — one Exasol virtual table per Iceberg table in the namespace.

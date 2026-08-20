@@ -80,7 +80,7 @@ fn setup_e2e() {
 }
 
 /// Create (or replace) the dedicated `REFRESH_CATALOG_CREDS` catalog
-/// CONNECTION and issue `CREATE VIRTUAL SCHEMA <vs_name> ... ICEBERG_NAMESPACE
+/// CONNECTION and issue `CREATE VIRTUAL SCHEMA <vs_name> ... NAMESPACE
 /// = '<namespace>'`. Thin wrapper over the shared harness helper: this file's
 /// tests each pass their own `vs_name`/`namespace` pair rather than sharing
 /// one file-local VS.
@@ -373,7 +373,7 @@ fn refresh_reflects_added_table_and_column_change() {
     );
 }
 
-/// `setProperties` (`ALTER VIRTUAL SCHEMA ... SET ICEBERG_NAMESPACE=...`)
+/// `setProperties` (`ALTER VIRTUAL SCHEMA ... SET NAMESPACE=...`)
 /// re-targets the virtual schema at a different namespace and rebuilds
 /// TABLE_MAP from scratch: the newly targeted namespace's table becomes
 /// queryable and the old namespace's table is no longer registered.
@@ -428,7 +428,7 @@ fn set_properties_retargets_namespace() {
     );
 
     conn.execute(&format!(
-        "ALTER VIRTUAL SCHEMA REFRESH_SETPROPS_VS SET ICEBERG_NAMESPACE='{NS_SETPROPS_B}'"
+        "ALTER VIRTUAL SCHEMA REFRESH_SETPROPS_VS SET NAMESPACE='{NS_SETPROPS_B}'"
     ));
 
     let id = conn.query_scalar_i64(&format!(
@@ -715,7 +715,7 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
         r#"CREATE VIRTUAL SCHEMA REFRESH_COLLISION_CREATE_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{CATALOG_CONN_NAME}'
-  ICEBERG_NAMESPACE   = '{NS_COLLISION}'
+  NAMESPACE   = '{NS_COLLISION}'
   ALLOW_HTTP          = 'true'"#
     ));
     assert_eq!(

@@ -1,6 +1,6 @@
 # Feature: Work-Unit File Sharding
 
-Partitions the once-resolved Iceberg data-file list into G oversubscribed work-units
+Partitions the once-resolved data-file list into G oversubscribed work-units
 ("shards") and drives them across the cluster. Rather than sharding one-per-node, the
 adapter sizes G to oversubscribe the cluster (G = node_count × parallelism_factor,
 capped so the group set stays in Exasol's round-robin distribution regime) and emits a
@@ -9,8 +9,8 @@ LUA SET script re-emits each shard's per-file list once per `shard_key` group so
 `GROUP BY shard_key` distributes the assignments round-robin across nodes, and the
 `LAKEHOUSE_SCAN` scalar EMIT UDF then scans each distributed file list node-locally
 and STREAMS its rows. Because the scan is scalar (no top-level `GROUP BY`), Exasol does
-not materialize the scan output. The shard-invariant common spec (including the Iceberg
-table root) is serialized ONCE as the scalar scan's first-argument literal; only each
+not materialize the scan output. The shard-invariant common spec (including the table
+root) is serialized ONCE as the scalar scan's first-argument literal; only each
 shard's per-file subset flows through the distributor. Work assignment is computed
 entirely in the planning layer; each scan invocation reads only its own shard of files
 and no file is scanned twice.
@@ -31,7 +31,7 @@ and no file is scanned twice.
   `≥ 1` and `≤ file_count` so no shard is empty.
 * Files are assigned to the G shards by a byte-balanced split
   (`partition_files_by_bytes`), called with G instead of node_count. Each file
-  carries its `file_size_in_bytes` from the Iceberg `FileScanTask`; the split
+  carries the byte size the format reader resolved into its file entry; the split
   balances cumulative bytes per shard, not file count, so per-shard scan work is
   even. A file whose reported size is 0 is weighted as 1 byte so it is still
   assigned and never skipped.

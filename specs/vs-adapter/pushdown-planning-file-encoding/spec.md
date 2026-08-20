@@ -1,15 +1,16 @@
 # Feature: Pushdown Planning — File-List Encoding (Table Root + Relative Paths)
 
 Extends pushdown planning (`vs-adapter/pushdown-planning`) with the per-shard file-list wire
-encoding: the Iceberg table root is carried once in the shard-invariant common spec, and each
+encoding: the table root is carried once in the shard-invariant common spec, and each
 per-shard file entry (data file and its associated delete files) is emitted relative to that
 root when the root is an actual prefix of the file's path, or as an absolute URI otherwise.
 
 ## Background
 
-* The Iceberg table root (`table.metadata().location()`, already resolved at the resolve-once
-  seam as the vended-credential anchor) is a shard-invariant value, so it is carried ONCE in the
-  common scan-spec argument — never repeated per shard.
+* The table root is the neutral value the format reader resolves at the resolve-once seam — the
+  Iceberg reader's own source is `table.metadata().location()`, which doubles as its
+  vended-credential anchor. The root is shard-invariant, so it is carried ONCE in the common
+  scan-spec argument — never repeated per shard.
 * A file path is emitted RELATIVE to the table root only when the root is an actual prefix of
   the path; any path not under the root is emitted unchanged as an absolute URI.
 * Iceberg data-file paths are NOT guaranteed to live under `metadata.location()` —

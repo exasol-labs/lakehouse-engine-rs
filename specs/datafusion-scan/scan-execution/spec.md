@@ -1,14 +1,14 @@
 # Feature: DataFusion Scan Execution
 
 A disposable Rust SCALAR EMIT UDF that, for one query, builds a DataFusion session,
-registers exactly the Iceberg/Parquet data files assigned to its shard, sizes its
+registers exactly the Parquet data files assigned to its shard, sizes its
 DataFusion `RuntimeEnv` memory pool from the per-instance memory limit reported in UDF
 metadata, applies the pushed-down projection, filter, and LIMIT, and streams the matching
 rows back as Arrow IPC batches. It holds no state and discovers no files of its own. As a
 SCALAR EMIT UDF under SDK 0.21.0, the framework invokes `run()` ONCE per input row, so the
 UDF scans exactly one row's assigned file list per call and never iterates the input with
 `ctx.next()`. The UDF receives its scan spec as TWO VARCHAR arguments — a shard-invariant
-common spec serialized once for the whole fan-out (including the Iceberg table root), and a
+common spec serialized once for the whole fan-out (including the table root), and a
 per-shard `(path, size)` file list — which it merges back into one `ScanSpec` per call.
 Arrow-column-to-SDK-`Value` conversion at the emit boundary — type mapping, incompatible-
 column JSON rendering, and EMITS-type coercion — is owned by
@@ -17,13 +17,13 @@ column JSON rendering, and EMITS-type coercion — is owned by
 ## Background
 
 * Only serialized bytes cross the `.so` boundary — VARCHAR JSON arguments in, Arrow IPC bytes out; no typed Arrow value ever crosses it.
-* The scan UDF receives two VARCHAR JSON arguments per input row: `common` (shard-invariant: projection, filter, limit, aggregates, group keys, logical schema, EMITS types, storage credentials, the Iceberg table root, and tuning knobs) and `files` (this shard's assigned `(path, size)` entries). It merges them into one `ScanSpec` before running; see `datafusion-scan/scan-execution-spec-reconstitution` for the reconstitution and malformed-input scenarios.
+* The scan UDF receives two VARCHAR JSON arguments per input row: `common` (shard-invariant: projection, filter, limit, aggregates, group keys, logical schema, EMITS types, storage credentials, the table root, and tuning knobs) and `files` (this shard's assigned `(path, size)` entries). It merges them into one `ScanSpec` before running; see `datafusion-scan/scan-execution-spec-reconstitution` for the reconstitution and malformed-input scenarios.
 * The UDF MUST register only its assigned files and MUST NOT discover additional files.
 * Per-file metadata construction (no per-file `HEAD`) and relative/absolute path resolution
   against the table root are covered by `datafusion-scan/scan-execution-file-metadata`.
 * `ScanSpec` carries no catalog identifier block — the scan UDF never contacts the catalog.
 * Only `Value::String` types cross the `.so` boundary; both arguments are VARCHAR JSON.
-* When the scan spec carries a logical Iceberg schema, column projection binds by Iceberg field-id (with a physical-name fallback) so results are correct across schema evolution; when it does not, the UDF falls back to first-file schema inference and physical-name binding.
+* When the scan spec carries a logical schema, column projection binds each logical field by the binding key its format reader populated — by field-id, matched against the physical field's `PARQUET:field_id`, for Iceberg (always) and Delta `id` column mapping, with a physical-name fallback; by physical name, matched against the Parquet column's own name, for Delta `name` column mapping; by identity, matched against the logical name itself, for Delta `none` column mapping — so results are correct across schema evolution. When the scan spec carries no logical schema, the UDF falls back to first-file schema inference and physical-name binding.
 * On the raw-row path the UDF emits each Arrow `RecordBatch` via the SDK's Arrow-IPC
   emit path (`EmitBatch`, behind the `emit-arrow` feature), which serializes the batch
   to Arrow IPC bytes internally — only IPC bytes cross the `.so` boundary, never typed

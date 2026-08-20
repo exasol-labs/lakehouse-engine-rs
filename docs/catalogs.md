@@ -54,7 +54,7 @@ Only `warehouse` is always required. If you turn `use_sigv4` on, `region`, `acce
 
 Credential values never appear in error messages, logs, or debug output. They travel to the scan UDF inside the per-query scan spec. The adapter never stores them in Virtual Schema properties.
 
-The Virtual Schema then names the CONNECTION. [Install: Point the VS at your data](install.md#point-the-vs-at-your-data) and [Tuning](tuning.md) document its properties: `ICEBERG_NAMESPACE`, `ALLOW_HTTP`, and the tuning properties. This page repeats only the two properties that every recipe needs.
+The Virtual Schema then names the CONNECTION. [Install: Point the VS at your data](install.md#point-the-vs-at-your-data) and [Tuning](tuning.md) document its properties: `NAMESPACE`, `ALLOW_HTTP`, and the tuning properties. This page repeats only the two properties that every recipe needs.
 
 ## Local / generic Iceberg REST (no auth)
 
@@ -76,7 +76,7 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
 USING LHVS.LAKEHOUSE_ADAPTER WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
-  ICEBERG_NAMESPACE  = 'default'
+  NAMESPACE          = 'default'
   ALLOW_HTTP         = 'true';
 ```
 
@@ -103,7 +103,7 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
 USING LHVS.LAKEHOUSE_ADAPTER WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
-  ICEBERG_NAMESPACE  = 'default';
+  NAMESPACE          = 'default';
 ```
 
 `session_token` is optional. For a long-lived key pair, remove it. To let the catalog vend short-lived S3 credentials for data access instead of the static pair, add `"use_vended_credentials": true`. The static `access_key`, `secret_key`, and `region` are still required to sign the first `load_table` call. `ALLOW_HTTP` is absent because Glue and AWS S3 use HTTPS.
@@ -143,7 +143,7 @@ For both modes, create the Virtual Schema the same way:
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
 USING LHVS.LAKEHOUSE_ADAPTER WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
-  ICEBERG_NAMESPACE  = 'default';
+  NAMESPACE          = 'default';
 ```
 
 If the catalog or its storage uses plain HTTP, add `ALLOW_HTTP = 'true'`. If not, omit this property.
@@ -178,7 +178,7 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
 CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
 USING LHVS.LAKEHOUSE_ADAPTER WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
-  ICEBERG_NAMESPACE  = 'default'
+  NAMESPACE          = 'default'
   ALLOW_HTTP         = 'true';
 ```
 
@@ -203,7 +203,7 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
   }';
 ```
 
-Create the Virtual Schema exactly as in the static example above. Use the same `ICEBERG_NAMESPACE` and `ALLOW_HTTP`, and name the vended CONNECTION.
+Create the Virtual Schema exactly as in the static example above. Use the same `NAMESPACE` and `ALLOW_HTTP`, and name the vended CONNECTION.
 
 ## Addressing
 

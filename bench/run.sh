@@ -197,7 +197,7 @@ case "$TARGET" in
     HOST=localhost
     SYS_PASS="${EXASOL_SYS_PASSWORD:-exasol}"
     export EXASOL_SYS_PASSWORD="$SYS_PASS"
-    NAMESPACE="${ICEBERG_NAMESPACE:-tpch}"
+    NAMESPACE="${NAMESPACE:-tpch}"
     CATALOG_URI="http://iceberg-rest:8181"          # internal: reachable from the UDF
     CONN_PW="$(build_conn_password_local)"
     # http catalog/S3 + parallelism knobs. NR_OF_CORES (new VS property) drives the
@@ -210,11 +210,10 @@ case "$TARGET" in
     ;;
   remote)
     require AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY GLUE_CATALOG_URI GLUE_WAREHOUSE \
-            ICEBERG_NAMESPACE EXASOL_HOST EXASOL_SYS_PASSWORD BUCKETFS_WRITE_PASS
+            NAMESPACE EXASOL_HOST EXASOL_SYS_PASSWORD BUCKETFS_WRITE_PASS
     HOST="$EXASOL_HOST"
     SYS_PASS="$EXASOL_SYS_PASSWORD"
     export BUCKETFS_WRITE_PASS                      # make's $(shell) reads it from the environment
-    NAMESPACE="$ICEBERG_NAMESPACE"
     CATALOG_URI="$GLUE_CATALOG_URI"
     CONN_PW="$(build_conn_password_cloud)"
     VS_EXTRA_PROPS="$(build_vs_extra_props false "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
@@ -289,7 +288,7 @@ if [ "$TARGET" = "docker" ]; then
   wait_http "http://localhost:${LH_REST_PORT:-18181}/v1/config" "Iceberg REST"
   wait_exasol
   echo "== loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}' =="
-  TPCH_SCALE="$TPCH_SCALE" ICEBERG_NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
+  TPCH_SCALE="$TPCH_SCALE" NAMESPACE="$NAMESPACE" TPCH_FILES="${TPCH_FILES:-4}" \
     cargo test --features exasol-e2e --test tpch_loader -- --nocapture
   if [ "$WITH_DELETES" = "1" ]; then
     echo "== authoring delete-bearing namespace '${DELETE_NS}' from baseline '${BASELINE_NS}' (docker, idempotent) =="
@@ -353,7 +352,7 @@ build_vs() {  # vs_name namespace
   sql "CREATE VIRTUAL SCHEMA $1
 USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION  = '${CONN}'
-  ICEBERG_NAMESPACE   = '$2'${VS_EXTRA_PROPS}"
+  NAMESPACE           = '$2'${VS_EXTRA_PROPS}"
 }
 build_vs "${VS}" "${NAMESPACE}"
 if [ "$WITH_DELETES" = "1" ]; then

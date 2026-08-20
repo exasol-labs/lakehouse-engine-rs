@@ -30,8 +30,10 @@ Exasol SQL at cluster scale, with no copy, no caching, and no separate query sta
 1. **Stateless Virtual Schema** — translates a user query, analyzes pushdowns, plans
    parallelization, and maps result schemas. Thin: most execution logic lives in DataFusion.
 2. **DataFusion-in-UDF execution** — a disposable Rust UDF creates a DataFusion session, registers
-   Iceberg tables, applies pushdowns, scans its assigned files, and produces partial results.
-3. **File-level cluster parallelism** — resolve the Iceberg file list once per query and partition
+   Iceberg or Delta tables, applies pushdowns, scans its assigned files, and produces partial
+   results.
+3. **File-level cluster parallelism** — resolve the file list once per query, format-neutral
+   across Iceberg and Delta, and partition
    files into G oversubscribed work-unit shards (G = node_count × parallelism_factor, capped at 300),
    driven via `GROUP BY shard_key` so Exasol distributes shard groups across nodes and multiplexes
    them onto each node's core pool; no node scans another node's files.
@@ -45,12 +47,14 @@ Exasol SQL at cluster scale, with no copy, no caching, and no separate query sta
 5. **SQL expression translation** — scalar functions, date functions, and operators are translated
    into the pushed-down predicate/projection/select-list shapes above, so pushdown reaches
    real-world SQL expressions rather than only bare column references.
-6. **Correct read path** — applies Iceberg positional/row-level deletes at scan time, so results
-   reflect current table state rather than raw Parquet file content.
-7. **Iceberg + Databricks access** — query both Apache Iceberg tables and Databricks-managed
-   Iceberg through the same path; there is no separate Databricks-specific code path — Databricks
-   tables are reached via their Databricks-managed Iceberg REST catalog through the same Iceberg
-   access capability above.
+6. **Correct read path** — applies Iceberg positional/row-level deletes and Delta deletion vectors
+   (`datafusion-scan/scan-execution-delta-deletion-vectors`) at scan time, so results reflect
+   current table state rather than raw Parquet file content.
+7. **Iceberg and Unity Catalog access** — query Apache Iceberg tables through an Iceberg REST
+   catalog and Delta tables through a Unity Catalog, Databricks-managed or self-hosted OSS, through
+   the same engine. A Databricks-managed table is reached by one of two routes, chosen by the
+   configured `CATALOG_KIND`: Iceberg REST via `iceberg-rust`, or native Unity Catalog via
+   `delta-kernel-rs`.
 8. **Bounded, self-throttling execution** — the scan UDF sizes its DataFusion memory pool from the per-instance memory limit reported in UDF metadata (a fraction of it, leaving headroom below the engine's 80% concurrency-stall threshold) and adds a spill backstop: when `/tmp` is real disk it spills (queries complete at any group cardinality); when it is not, a bounded pool returns a clean `ResourcesExhausted` error instead of OOM-crashing. Oversubscribed work-unit sharding (`GROUP BY shard_key`, G = node_count × parallelism_factor capped at 300) shrinks each instance's footprint and lets the engine multiplex shard groups onto each node's core pool. Bounding is not only UDF-side: the scan entry point emits as a SCALAR (not SET) script, so Exasol streams each shard's output rather than materializing the raw-row result into growing temp-DB RAM — keeping engine-side scan-output memory constant regardless of scanned data volume.
 
 ## Out of Scope
@@ -86,7 +90,7 @@ Every query is executed independently, starts from source metadata, and leaves n
 |-------|------------|---------|
 | Language | Rust (edition 2024) | UDF + VS adapter implementation |
 | Query engine | DataFusion + Arrow/Parquet 58 | Node-local vectorized scan & pushdown execution |
-| Lakehouse | iceberg-rust (Iceberg + Databricks Iceberg catalogs) | Snapshot discovery, file resolution, table registration |
+| Lakehouse | `iceberg-rust` (Iceberg REST catalog, incl. Databricks-managed Iceberg) + `delta-kernel-rs` 0.26 (Delta tables via native Unity Catalog) | Snapshot discovery, file resolution, table registration |
 | UDF runtime | `exasol-udf-sdk` 0.13.1 (connect-back), `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit`, connect-back SQL session |
 | Build | `rust:1.94-bookworm` (glibc 2.36) in Docker | Builds `.so` matching the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
@@ -95,7 +99,7 @@ Every query is executed independently, starts from source metadata, and leaves n
 > SLC and UDF runtime). This engine shares their UDF programming model and build/E2E workflow. The
 > standalone `crates/vs-expression` expression-translation crate is designed to be shared with
 > the sibling project and will migrate to a monorepo layout when the projects converge. `crates/lakehouse-catalog`
-> (Iceberg REST catalog access) is a workspace-internal split from `crates/lakehouse-engine`, not a
+> (Iceberg REST + Unity Catalog access) is a workspace-internal split from `crates/lakehouse-engine`, not a
 > sibling-shared crate — both still build into the one `.so` that carries both UDF entry points.
 
 ## Commands
@@ -120,8 +124,8 @@ cargo clippy --all-targets && cargo fmt
 lakehouse-engine/
 ├── specs/                  # mission.md and spec library (speq)
 ├── crates/
-│   ├── lakehouse-engine/   # Iceberg file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
-│   ├── lakehouse-catalog/  # Iceberg REST catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
+│   ├── lakehouse-engine/   # Iceberg + Delta file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
+│   ├── lakehouse-catalog/  # Iceberg REST + Unity Catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
 │   └── vs-expression/      # expression-translation crate, shared with the sibling project
 ├── Cargo.toml      # workspace manifest
 └── Makefile        # cross-musl-udf-build, test-e2e
@@ -138,10 +142,10 @@ Layered, stateless, two-level parallelism. Data flow:
 ```
 User Query
   → Virtual Schema (translate, pushdown analysis, parallelization plan, result schema mapping)
-  → resolve Iceberg snapshot + file list ONCE per query
+  → resolve snapshot + file list ONCE per query (format-neutral: Iceberg or Delta)
   → partition files into G oversubscribed work-unit shards (GROUP BY shard_key, G = node_count × parallelism_factor capped 300)
   → parallel UDF execution: one DataFusion runtime per shard invocation, multiplexed onto each node's core pool
-  → Iceberg / Databricks Parquet files
+  → Iceberg / Delta Parquet files
   → partial results (raw rows or node-local aggregate)
   → Exasol final processing / merge
   → Result
@@ -165,8 +169,9 @@ simultaneously. No state survives query completion.
 
 | Service | Purpose | Failure Impact |
 |---------|---------|----------------|
-| Iceberg catalog | Snapshot discovery, file list resolution | No query can be planned or executed |
-| Databricks (Iceberg) | Databricks-managed table access | Databricks queries fail; Iceberg path unaffected |
+| Iceberg REST catalog | Snapshot discovery, file list resolution for Iceberg tables | No Iceberg query can be planned or executed |
+| Unity Catalog | Table version / log replay, file list resolution for Delta tables | No Delta/Unity query can be planned or executed |
+| Databricks (Iceberg REST or Unity Catalog) | Databricks-managed table access via either catalog kind | Databricks queries fail on both catalog-kind routes; the non-Databricks Iceberg REST catalog and Unity Catalog dependencies above are unaffected |
 | Object storage (S3-compatible) | Parquet file data | Scans fail / stall; this is a measured bottleneck risk |
 | Exasol cluster + Rust SLC (BucketFS) | UDF execution substrate | No execution; the substrate under test |
 

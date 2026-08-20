@@ -1,6 +1,6 @@
 # Feature: Pushdown Planning — Empty Result When All Files Are Pruned
 
-When Iceberg-level file pruning (driven by the pushed-down filter) eliminates
+When plan-time file pruning (driven by the pushed-down filter) eliminates
 every data file for a query, the adapter still returns a `pushdown` response
 whose output column shape matches what the same query would have produced with
 matching data. The short-circuit is shape-aware: it emits the correct empty
@@ -12,8 +12,9 @@ instead of rejecting it for a column-count/type mismatch.
 ## Background
 
 * File pruning happens at the resolve-once seam (`vs-adapter/pushdown-planning`):
-  the adapter resolves the Iceberg data-file list exactly once, and the pushed
-  filter MAY reduce that list to zero files.
+  the adapter resolves the data-file list exactly once (from whichever format
+  reader, Iceberg or Delta, the table uses), and the pushed filter MAY reduce
+  that list to zero files.
 * Exasol validates every `pushdown` response's projected columns positionally
   against the request's `selectListDataTypes` at pushdown-validation time; a
   response whose column count or declared types disagree is rejected (SQL code

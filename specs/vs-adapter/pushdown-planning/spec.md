@@ -9,7 +9,7 @@ scan: a nested `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET distributor subquery (`GROUP
 shard_key`) spreads each shard's per-file list across nodes, and an outer ungrouped
 `LAKEHOUSE_SCAN` SCALAR EMIT UDF scans each distributed file list node-locally and streams
 the rows. The scan-driving SQL splices the shard-invariant parts (projection, filter,
-LIMIT, logical schema, credentials, and the Iceberg table root) once as the scalar scan
+LIMIT, logical schema, credentials, and the table root) once as the scalar scan
 UDF's first-argument common literal and flows each shard's per-file subset through the
 distributor as the second argument. A single-shard plan short-circuits the distributor and
 calls the scalar scan directly on the file-list literal. See
@@ -23,7 +23,7 @@ SQL, and AVG sum/count decomposition) is covered separately in
 
 ## Background
 
-* The scan-driving SQL invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF over a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the shard-invariant common spec (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the Iceberg table root) is spliced once as the scalar scan's first argument and each shard's file subset flows through the distributor as the second argument.
+* The scan-driving SQL invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF over a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the shard-invariant common spec (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the table root) is spliced once as the scalar scan's first argument and each shard's file subset flows through the distributor as the second argument.
 * The outer scalar scan select is never wrapped in a `SELECT * FROM (...)` materialization boundary.
 * Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
 * The `LAKEHOUSE_SCAN` and `LAKEHOUSE_DISTRIBUTE_FILES` UDF names in the scan-driving SQL are schema-qualified from the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`; there is no VS property that supplies this schema. The scan and distributor scripts are co-deployed in the adapter script's schema, so this single source qualifies both.
@@ -37,6 +37,7 @@ SQL, and AVG sum/count decomposition) is covered separately in
 * The wrapper-free outer scalar scan select remains the shape for every request whose filter renders. The `SELECT * FROM (…)` boundary the wrapper introduces exists only on the decline path.
 * See `vs-adapter/pushdown-planning-like-type-coercion` for the type-aware LIKE/REGEXP_LIKE rule that dispatches on the subject column's Exasol type before rendering the filter.
 * When a query aliases a table in its `FROM` clause (`FROM customer c`), Exasol stamps a `tableAlias` on every `column` node in the pushdown request — including nodes the user wrote unqualified. The single scan relation exposes only bare column names, so an alias-qualified reference does not resolve; the single-table push therefore strips the alias before rendering (see `vs-adapter/pushdown-planning-alias-stripping`). The `crates/vs-expression` translator itself always honors a present `tableAlias` (`sql-comprehension/vs-expression-translator`); stripping is the single-table caller's responsibility.
+* The plan-time file-pruning predicate this feature dispatches to has a per-format owner: for the Iceberg reader it is `iceberg::expr::Predicate`, owned by `vs-adapter/pushdown-file-pruning`; for the Delta reader it is the Delta stats predicate, owned by `vs-adapter/delta-file-pruning`. A reader of this feature's `## Scenarios` clauses naming `iceberg::expr::Predicate` should read those clauses as describing the Iceberg arm of the rule, not the whole rule.
 
 ## Scenarios
 
