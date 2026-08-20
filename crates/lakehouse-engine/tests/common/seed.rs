@@ -3452,6 +3452,107 @@ fn make_complex_join_probe_batch() -> RecordBatch {
     .expect("complex_join_probe RecordBatch construction is infallible")
 }
 
+/// Namespace and table for the timestamp-precision E2E probe
+/// (`add-timestamp-precision-versioning` task 6). Its OWN namespace, so this
+/// table never enters any other suite's `createVirtualSchema` table
+/// enumeration — every other E2E virtual schema is created over
+/// [`E2E_NAMESPACE`]. Column names and the seeded microsecond values mirror
+/// task 1's live-verification capture exactly (see decision-log.md's "Task 1
+/// Live Captures" section) so tasks 7/9 can rely on this fixture
+/// deterministically.
+pub const E2E_TSPRECISION_NAMESPACE: &str = "e2e_tsprecision";
+pub const E2E_TSPRECISION_TABLE: &str = "ts_precision_probe";
+pub const TSPRECISION_COL_TS: &str = "ts";
+pub const TSPRECISION_COL_TSTZ: &str = "tstz";
+
+/// Microseconds since UNIX_EPOCH for `2024-01-01 00:00:00.000001`,
+/// `.000002`, `.123456`, `.123457` — two pairs that collapse to the same
+/// millisecond prefix under `TIMESTAMP(3)` truncation but stay four distinct
+/// values at `TIMESTAMP(6)`.
+pub const TSPRECISION_MICROS: [i64; 4] = [
+    BASE_TS_MICROS + 1,
+    BASE_TS_MICROS + 2,
+    BASE_TS_MICROS + 123_456,
+    BASE_TS_MICROS + 123_457,
+];
+
+/// Seed the timestamp-precision probe (`id`, `ts`, `tstz`) into its own
+/// `e2e_tsprecision` namespace. Idempotent.
+pub async fn seed_timestamp_precision_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-tsprecision").await?;
+    let ns = NamespaceIdent::new(E2E_TSPRECISION_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for timestamp precision probe table")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(
+                2,
+                TSPRECISION_COL_TS,
+                Type::Primitive(PrimitiveType::Timestamp),
+            )
+            .into(),
+            NestedField::required(
+                3,
+                TSPRECISION_COL_TSTZ,
+                Type::Primitive(PrimitiveType::Timestamptz),
+            )
+            .into(),
+        ])
+        .build()
+        .context("build timestamp precision probe Iceberg schema")?;
+
+    create_and_append(
+        &catalog,
+        E2E_TSPRECISION_NAMESPACE,
+        E2E_TSPRECISION_TABLE,
+        iceberg_schema,
+        vec![make_timestamp_precision_probe_batch()],
+    )
+    .await
+    .context("seed timestamp precision probe table")?;
+    Ok(())
+}
+
+fn make_timestamp_precision_probe_batch() -> RecordBatch {
+    let ids: Vec<i64> = (1..=TSPRECISION_MICROS.len() as i64).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new(
+            TSPRECISION_COL_TS,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            false,
+        ),
+        Field::new(
+            TSPRECISION_COL_TSTZ,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+            false,
+        ),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids)),
+            Arc::new(TimestampMicrosecondArray::from(TSPRECISION_MICROS.to_vec())),
+            Arc::new(
+                TimestampMicrosecondArray::from(TSPRECISION_MICROS.to_vec())
+                    .with_timezone("+00:00"),
+            ),
+        ],
+    )
+    .expect("timestamp precision probe RecordBatch construction is infallible")
+}
+
 #[cfg(test)]
 mod seed_catalog_props_tests {
     use super::*;

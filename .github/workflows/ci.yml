@@ -32,8 +32,8 @@ jobs:
   # 2.36), matching the SLC. Never `cargo build --release` on the runner
   # directly — Ubuntu's glibc is newer and the .so fails to dlopen in Exasol.
   build-so:
-    name: Build release .so (Docker)
-    runs-on: ubuntu-latest
+    name: Build release .so (Docker, ${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
     # Skip draft PRs; still run on push/merge_group (where pull_request is null).
     # e2e / e2e-lakekeeper / e2e-unity / e2e-azure cascade-skip via `needs: [build-so]`.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
@@ -41,6 +41,14 @@ jobs:
     # release build). 60 min is a safety backstop against a genuine hang, not
     # a tight budget.
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
     steps:
       # A cold release build of the full DataFusion/Arrow/Iceberg tree plus a
       # cached target/ restore can exhaust the ~21 GB default runner disk — the
@@ -67,8 +75,8 @@ jobs:
       #
       # restore-keys is what keeps a Cargo.lock bump from triggering a full
       # ~33-min cold build: on a lockfile change the exact key misses, but the
-      # `docker-cargo-` prefix restores the most recent prior cache, so cargo
-      # recompiles only the changed crates instead of the whole dep graph.
+      # `docker-cargo-<arch>-` prefix restores the most recent prior cache, so
+      # cargo recompiles only the changed crates instead of the whole dep graph.
       #
       # Split restore/save so only main writes. Caches are branch-scoped, so PR
       # branches were each minting an exact-key copy — 12 of them, 7.5 GB
@@ -87,9 +95,9 @@ jobs:
           # exact hit, save skipped, permanently poisoned. The prefix fallback
           # keeps unrelated (e.g. dev-profile) edits warm; cost is one
           # redundant re-save on main per config edit.
-          key: docker-cargo-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
+          key: docker-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
-            docker-cargo-
+            docker-cargo-${{ matrix.arch }}-
 
       - name: Build liblakehouse_engine.so
         run: make cross-musl-udf-build UDF_CARGO_VOL="$HOME/.cargo-docker-registry"
@@ -111,12 +119,12 @@ jobs:
           path: |
             ~/.cargo-docker-registry
             target/
-          key: docker-cargo-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
+          key: docker-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
 
       - name: Upload liblakehouse_engine.so
         uses: actions/upload-artifact@v7
         with:
-          name: lakehouse-engine-so
+          name: lakehouse-engine-so-${{ matrix.arch }}
           path: target/release/liblakehouse_engine.so
 
   # ── fan-out: build-host / lint / unit-tests / licenses, all at t=0 ───────
@@ -336,6 +344,34 @@ jobs:
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
 
+  arm64:
+    name: Unit Tests (arm64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 45
+    steps:
+      - name: Free disk space
+        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
+
+      - uses: actions/checkout@v7
+
+      - name: Install Rust 1.94
+        uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
+
+      - name: Drop the runner's preinstalled Rust (stabilize cache key)
+        run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
+
+      # No arch input needed: rust-cache embeds the platform (Linux-arm64) and
+      # the toolchain hash in the key on its own, and it ignores `key:` whenever
+      # `shared-key` is set — don't add one back.
+      - name: Cache cargo & build artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          shared-key: workspace-arm64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run unit tests
+        run: cargo test --workspace
+
   licenses:
     name: License Check
     runs-on: ubuntu-latest
@@ -433,13 +469,7 @@ jobs:
             --bfs-write-password "$BFSPASS" \
             --default
 
-      # No --lakehouse-version/--slc-version pin: fetches each repo's latest
-      # release, same as a real user's default invocation. GITHUB_TOKEN is the
-      # standard Actions-provided token — it already has read access to this
-      # (private) repo's own releases, and language-container-rs is public.
       - name: Run install.sh (BucketFS target)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash deploy/scripts/install.sh --profile ci-bucketfs
 
       - name: Dump Exasol logs on failure
@@ -453,8 +483,15 @@ jobs:
         run: docker compose down -v
 
   # ── viability gate: full local Exasol + MinIO + Iceberg-REST stack ───────
+  # Matrixed over both supported Exasol major versions. The 2025.x leg keeps
+  # the exact check name `E2E` — it's a required check in main's branch
+  # protection ruleset, and GitHub auto-suffixes an unmatrixed job name with
+  # the matrix values unless the name itself is templated from the matrix, so
+  # `name:` is driven from `matrix.check_name` rather than left as a bare
+  # string. The 8.29.x leg's check name is new and NOT yet in the ruleset
+  # (separate manual ops step) — tracked in #364.
   e2e:
-    name: E2E
+    name: ${{ matrix.check_name }}
     runs-on: ubuntu-latest
     # build-so only — its .so artifact is all this job consumes. NOT also
     # depending on lint/unit-tests/licenses trades away ~18 min of fail-fast
@@ -465,6 +502,18 @@ jobs:
     # re-adding to `needs`. `release` lists them explicitly so main still can't
     # ship broken.
     needs: [build-so]
+    strategy:
+      # Independent legs (different Exasol major versions) — one failing
+      # shouldn't cancel the other before it reports.
+      fail-fast: false
+      matrix:
+        include:
+          - image: exasol/docker-db:2025.2.1
+            check_name: E2E
+            log_artifact: exa-logs
+          - image: exasol/docker-db:8.29.13
+            check_name: E2E (8.29.x)
+            log_artifact: exa-logs-8x
     # Observed 16-20 min end-to-end historically, but pre-test setup (disk
     # cleanup + image loads) has grown slower as the hosted runner image
     # bundles more pre-installed content to prune through — one run burned
@@ -477,6 +526,9 @@ jobs:
       # exasol service default (4) exceeds what Docker will accept ("range of
       # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
       LH_EXASOL_CPUS: "2"
+      # Selects the matrix leg's Exasol image; docker-compose.yml's exasol
+      # service reads this with a 2025.2.1 fallback.
+      EXASOL_IMAGE: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -552,7 +604,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: exa-logs
+          # Per-leg name: upload-artifact@v7 rejects a name reused within one
+          # run, and both matrix legs execute this step in the same run.
+          name: ${{ matrix.log_artifact }}
           path: exa-logs/
           if-no-files-found: ignore
 
@@ -884,7 +938,14 @@ jobs:
     # pinned image. `e2e-azure` is deliberately absent instead: a live
     # third-party account there would let an outage or a rotated secret block
     # every release.
-    needs: [e2e, e2e-lakekeeper, e2e-unity, lint, unit-tests, licenses, install-script, install-script-e2e]
+    #
+    # `arm64` DOES gate releases, unlike `e2e-azure`: it is a GitHub-hosted
+    # runner with no third-party dependency, so it carries none of that
+    # availability risk — and it is the ONLY architecture-specific test signal
+    # covering the `lakehouse-engine-aarch64.tar.gz` asset this job publishes
+    # (aarch64 E2E is a deliberate non-goal). Without it the second
+    # architecture would ship on strictly weaker gating than the first.
+    needs: [e2e, e2e-lakekeeper, e2e-unity, lint, unit-tests, arm64, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:
       contents: write
@@ -952,24 +1013,48 @@ jobs:
             fi
           fi
 
-      - name: Download liblakehouse_engine.so
+      - name: Download x86_64 liblakehouse_engine.so
         if: steps.gate.outputs.release == 'true'
         uses: actions/download-artifact@v8
         with:
-          name: lakehouse-engine-so
+          name: lakehouse-engine-so-x86_64
+          path: artifacts/x86_64
+
+      - name: Download aarch64 liblakehouse_engine.so
+        if: steps.gate.outputs.release == 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: lakehouse-engine-so-aarch64
+          path: artifacts/aarch64
 
       # Manual-install users (e.g. Exasol SaaS, no BucketFS network access)
       # download this straight off the release page and PUT/UI-upload it
       # as-is — no local build, no repackaging. The `udf/` layout is what
       # BucketFS extracts the tarball into; chmod before archiving so the
       # extracted .so is already executable.
-      - name: Package release tarball
+      - name: Package release tarballs
         if: steps.gate.outputs.release == 'true'
         run: |
-          mkdir -p pkg/udf
-          cp liblakehouse_engine.so pkg/udf/
-          chmod 755 pkg/udf/liblakehouse_engine.so
-          tar -czf lakehouse-engine.tar.gz -C pkg udf
+          set -euo pipefail
+
+          verify_arch() {
+            so="$1"; expected="$2"
+            actual=$(file -b "$so")
+            case "$actual" in
+              *"$expected"*) ;;
+              *) echo "::error::$so should be $expected but is: $actual"; exit 1 ;;
+            esac
+          }
+
+          verify_arch artifacts/x86_64/liblakehouse_engine.so x86-64
+          verify_arch artifacts/aarch64/liblakehouse_engine.so aarch64
+
+          mkdir -p pkg/x86_64/udf pkg/aarch64/udf
+          cp artifacts/x86_64/liblakehouse_engine.so pkg/x86_64/udf/
+          cp artifacts/aarch64/liblakehouse_engine.so pkg/aarch64/udf/
+          chmod 755 pkg/x86_64/udf/liblakehouse_engine.so pkg/aarch64/udf/liblakehouse_engine.so
+          tar -czf lakehouse-engine.tar.gz -C pkg/x86_64 udf
+          tar -czf lakehouse-engine-aarch64.tar.gz -C pkg/aarch64 udf
 
       - name: Install Rust 1.94
         if: steps.gate.outputs.release == 'true'
@@ -1014,4 +1099,5 @@ jobs:
           # forever. Don't "fix" this by adding it back.
           files: |
             lakehouse-engine.tar.gz
+            lakehouse-engine-aarch64.tar.gz
             THIRD-PARTY-LICENSES.md

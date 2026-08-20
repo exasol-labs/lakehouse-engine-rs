@@ -17,6 +17,25 @@ The configured namespace is the `catalog.schema` supplied as the `NAMESPACE` vir
 * **This delta SUPERSEDES the recorded Background clause naming `type_text` as a source of a Unity column's precision and scale.** The recorded sentence — "which the neutral column carries as a source-tagged type descriptor holding the FULL parameterized type — the type name plus precision and scale from the wire `type_precision`/`type_scale`, or `type_text` — so a `DECIMAL` column carries its `p` and `s` rather than a bare `DECIMAL`" — is replaced by the same sentence with the phrase "or `type_text`" DELETED. The descriptor's precision and scale come from `type_precision`/`type_scale` alone. `ColumnInfo` (`crates/lakehouse-catalog/src/unity/client.rs`) declares no `type_text` field and never deserializes one, so naming it advertised a recovery path that does not exist and would mislead a reader debugging a null-precision column into looking for a fallback the code cannot take.
 * **An absent `type_precision` is exactly the `p = 0` case the widened guard now absorbs.** `neutral_column` resolves both `Option<u32>` fields through `.unwrap_or(0)`, so a `DECIMAL` column whose `type_precision` is null on the wire reaches the type mapping as `p = 0` and, before this delta, produced the invalid Exasol type `DECIMAL(0,0)` rather than the VARCHAR fallback. Deleting the phantom `type_text` recovery path and widening the guard are therefore two halves of one fix, not two unrelated edits.
 * **The guard's predicate, its single-owner requirement, and the Exasol target-type trade-off are owned by `datafusion-scan/type-mapping` and are consumed here, NOT restated.** This feature records only that the Unity arm reads its answer from that one owner, so the two catalog kinds cannot drift.
+* **This delta is issue #359.** It AMENDS ONE clause of ONE scenario and adds no scenario. The amended
+  clause is the declared Exasol type for the Spark type name `TIMESTAMP`, which becomes version-gated.
+  Every other declared type in that scenario, the exhaustive-match requirement, the parameterized-
+  descriptor requirement, the case-fold clause, the Delta-base filter, the exclusion warnings, and the
+  incompatible-type VARCHAR fallback stay byte-identical.
+* **The Delta declaration path IS this Unity path, which is why the amendment lands here.** A Delta
+  table reaches `createVirtualSchema` only through the Unity Catalog kind, so
+  `unity_type_name_to_exasol` is the one production function that declares a Delta timestamp column's
+  Exasol type. Widening issue #359 from its Iceberg-only wording to cover Delta means amending this
+  clause, not the Arrow-input resolver its scope text names.
+* **This delta closes the timestamp-precision half of this feature's own recorded #322 deferral.** The
+  feature description defers *"deeper Delta schema fidelity — reader-feature gating, timestamp
+  precision, type widening, and variant types"* to #322. The DECLARATION half of "timestamp precision"
+  is settled here; reader-feature gating, type widening, and variant types are unaffected and stay
+  where they are recorded.
+* **The version rule and both declaration strings have ONE owner outside this feature.**
+  `datafusion-scan/type-mapping` owns them, and `vs-adapter/create-virtual-schema` owns the single
+  `ctx.database_version()` read. This feature only records which string a Unity `TIMESTAMP` and
+  `TIMESTAMP_NTZ` column receives, and MUST NOT restate the rule or either literal.
 
 ## Scenarios
 
@@ -66,7 +85,8 @@ The configured namespace is the `catalog.schema` supplied as the `NAMESPACE` vir
 
 * *GIVEN* a Unity Catalog table whose columns declare the Spark type names `BOOLEAN`, `INT`, `LONG`, `DOUBLE`, `STRING`, `DATE`, `TIMESTAMP`, and `DECIMAL(p,s)` whose `p` and `s` fall inside Exasol's `DECIMAL` domain — `1 ≤ p ≤ 36` and `s ≤ p`
 * *WHEN* the adapter builds the virtual table's column list
-* *THEN* the adapter SHALL declare `BOOLEAN` as `BOOLEAN`, `INT` as `DECIMAL(10,0)`, `LONG` as `DECIMAL(20,0)`, `DOUBLE` as `DOUBLE PRECISION`, `STRING` as `VARCHAR(2000000)`, `DATE` as `DATE`, `TIMESTAMP` as `TIMESTAMP`, and `DECIMAL(p,s)` as `DECIMAL(p,s)`, reusing the project's Arrow-to-Exasol convention
+* *THEN* the adapter SHALL declare `BOOLEAN` as `BOOLEAN`, `INT` as `DECIMAL(10,0)`, `LONG` as `DECIMAL(20,0)`, `DOUBLE` as `DOUBLE PRECISION`, `STRING` as `VARCHAR(2000000)`, `DATE` as `DATE`, and `DECIMAL(p,s)` as `DECIMAL(p,s)`, reusing the project's Arrow-to-Exasol convention
+* *AND* the adapter SHALL declare `TIMESTAMP` and `TIMESTAMP_NTZ` as `TIMESTAMP(6)` on an Exasol version of 2025.x or later and as the bare string `TIMESTAMP` on 8.x, reading BOTH the version rule and both declaration strings from the single owner `datafusion-scan/type-mapping` specifies — so a Delta timestamp column and an Iceberg timestamp column are declared at the same precision by construction, and this feature carries no copy of either literal
 * *AND* the source-tagged type descriptor the mapping reads SHALL carry the FULL parameterized Spark type — the type name plus precision and scale from the wire `type_precision`/`type_scale` — so the `DECIMAL` case resolves to `DECIMAL(p,s)` from the descriptor's own `p` and `s` rather than from a bare `DECIMAL` type name that carries neither; and the descriptor MUST NOT be described as reading `type_text`, because `ColumnInfo` declares no such field and deserializes no such value, so no `type_text` recovery path exists for a column whose `type_precision` or `type_scale` is absent
 * *AND* the adapter SHALL reach that mapping through the SAME exhaustive match over the neutral column's source-tagged type descriptor that maps an Iceberg column, so the two catalog kinds have ONE Exasol type-mapping home and a third source type is a build failure there
 * *AND* the adapter SHALL declare each column name uppercased through the shared case-fold site, so an unquoted column reference in user SQL resolves against the declared name

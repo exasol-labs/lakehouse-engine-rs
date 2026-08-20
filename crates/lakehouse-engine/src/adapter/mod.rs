@@ -21,7 +21,9 @@ use crate::adapter::pushdown::handle_pushdown;
 use crate::adapter::tables::{catalog_identifier_string, flatten_table_name};
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageBackend;
-use crate::types::mapping::{column_source_type_to_exasol, exasol_type_to_json};
+use crate::types::mapping::{
+    TimestampPrecision, column_source_type_to_exasol, exasol_type_to_json,
+};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
@@ -278,8 +280,11 @@ fn handle_create_virtual_schema(
         .block_on(async { client.list_tables(&configured_ns).await })
         .map_err(|e| redact_error(&config.storage, e))?;
 
-    let (tables_json, table_map, skipped) = build_listing_virtual_tables(&configured_ns, &listing)
-        .map_err(|e| redact_error(&config.storage, e))?;
+    let timestamp_precision = TimestampPrecision::from_database_version(&ctx.database_version());
+
+    let (tables_json, table_map, skipped) =
+        build_listing_virtual_tables(&configured_ns, &listing, timestamp_precision)
+            .map_err(|e| redact_error(&config.storage, e))?;
 
     for entry in &skipped {
         udf_log!(ctx, warn, "{}", skip_warning(entry));
@@ -576,7 +581,8 @@ fn construct_catalog_client(
 /// it. For each listed table it flattens the identifier to an Exasol name, folds
 /// every column name into Exasol's canonical (uppercase) identifier casing through
 /// the one shared fold home, and maps each column's source-tagged type to an Exasol
-/// type via [`column_source_type_to_exasol`]. `TABLE_MAP` and the `__`-collision
+/// type via [`column_source_type_to_exasol`] at the caller-resolved
+/// `timestamp_precision`. `TABLE_MAP` and the `__`-collision
 /// check are built from the listed identifiers via [`build_table_map`], and the
 /// catalog's skipped entries pass through, each with its neutral skip reason,
 /// for the handler to warn on.
@@ -587,6 +593,7 @@ fn construct_catalog_client(
 fn build_listing_virtual_tables(
     configured_ns: &[String],
     listing: &CatalogListing,
+    timestamp_precision: TimestampPrecision,
 ) -> Result<VirtualTables, UdfError> {
     let mut tables_json: Vec<Json> = Vec::with_capacity(listing.tables.len());
     let mut survivors: Vec<CatalogTableIdent> = Vec::with_capacity(listing.tables.len());
@@ -599,7 +606,10 @@ fn build_listing_virtual_tables(
             .map(|col| {
                 json!({
                     "name": col.name.to_uppercase(),
-                    "dataType": exasol_type_to_json(&column_source_type_to_exasol(&col.source_type)),
+                    "dataType": exasol_type_to_json(&column_source_type_to_exasol(
+                        &col.source_type,
+                        timestamp_precision,
+                    )),
                 })
             })
             .collect();

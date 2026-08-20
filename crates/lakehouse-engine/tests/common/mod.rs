@@ -47,5 +47,7 @@ pub mod pos_delete_fixtures;
 ))]
 pub mod seed;
 pub mod stack;
+#[cfg(any(feature = "exasol-e2e", feature = "unity-e2e"))]
+pub mod timestamp_precision;
 #[cfg(feature = "exasol-e2e")]
 pub mod type_promotion_fixtures;

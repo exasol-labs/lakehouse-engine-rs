@@ -54,6 +54,14 @@ The catalog endpoint and storage credentials are supplied through the Exasol CON
 * This delta SUPERSEDES the `*AND* that fold SHALL be owned by exactly ONE site, resolve_table_schema (adapter/pushdown/file_resolution.rs)…` clause of the scenario "Create virtual schema enumerates every table in the configured namespace". The one fold owner becomes the shared `CatalogClient` listing pipeline — the one home that folds every declared name for BOTH the Iceberg REST and native Unity Catalog kinds — replacing the `resolve_table_schema` naming. The supersession keeps "owned by exactly ONE site" and "no other code path SHALL declare a differently-cased name" intact, and preserves byte-identical the full-Unicode `to_uppercase` expansion (`ß`→`SS`, so `straße`→`STRASSE`) and the no-collision-check column trade-off. The fold rule, its Exasol identifier-resolution reason, and its trade-off are unchanged; only the owning site moves.
 * Recorded Background prose citing `resolve_table_schema` at `file_resolution.rs:610-644` and `adapter/mod.rs:255/551/576` as the sole fold and column-declaration site is superseded by the same move. The `(name, Exasol type)` production relocates into the shared pipeline, and `IcebergRestCatalogClient::load_table` supplies the ordered original-cased columns the pipeline folds.
 * No other scenario of this feature changes under this delta. Enumeration, the 404-skip and all-Hive-empty behavior, the non-404 abort, the unreachable-catalog error, `TABLE_MAP`/`adapterNotes` recording, the multi-level flatten collision, and the non-ASCII end-to-end round-trip all stay as recorded.
+* **Split, issue #359: the multi-level/non-ASCII naming scenarios and the timestamp-precision
+  version-read/serialization scenarios moved to `vs-adapter/create-virtual-schema-declaration-details`.**
+  This feature's scenario count crossed this library's per-spec organization threshold once issue
+  #359 landed; that sibling feature now owns the multi-level namespace flatten/collision scenario,
+  the non-ASCII round-trip scenario, the single `ctx.database_version()` read and threading, and the
+  `TIMESTAMP(p)` `fractionalSecondsPrecision` serialization. This feature keeps capability
+  reporting, namespace enumeration, the 404-skip/abort/unreachable-catalog failure contracts, and
+  the `TABLE_MAP`/`adapterNotes` recording.
 
 ## Scenarios
 
@@ -117,22 +125,7 @@ The catalog endpoint and storage credentials are supplied through the Exasol CON
 * *AND* the recorded map SHALL round-trip back to the adapter at pushdown time so a pushdown can recover the exact Iceberg identifier from the Exasol table name without re-listing the catalog
 * *AND* the adapter MUST NOT persist the map anywhere other than the returned `adapterNotes`
 
-### Scenario: Multi-level Iceberg namespaces flatten deterministically into Exasol table names
-
-* *GIVEN* a configured namespace `prod.finance` containing an Iceberg table `orders` and a child namespace `prod.finance.eu` containing a table `orders`
-* *WHEN* Exasol sends the `createVirtualSchema` request naming namespace `prod.finance`
-* *THEN* the adapter SHALL name the first virtual table `ORDERS` and the second `EU__ORDERS`, flattening only the namespace segments below the configured namespace using `__` and uppercasing the result
-* *AND* the adapter SHALL apply the same flatten function when building the `TABLE_MAP` so the Exasol name maps back to the correct original-cased Iceberg identifier
-* *AND* when two distinct Iceberg identifiers flatten to the same Exasol name (a `__` collision) the adapter SHALL return an error naming the colliding Exasol table name rather than silently dropping or overwriting a table
-
-### Scenario: A non-ASCII Iceberg table and column name stay queryable end to end
-
-* *GIVEN* a live Exasol instance, an Iceberg REST catalog, and an Iceberg table whose TABLE name and one of whose COLUMN names are both the non-ASCII identifier `straße` — that column an Iceberg `string` column whose seeded values carry distinguishable prefixes, alongside an `id` column — seeded into its own namespace so no existing E2E virtual schema enumerates it
-* *AND* a virtual schema created over that namespace through a real `createVirtualSchema`
-* *WHEN* an Exasol user queries that table and that column through the virtual schema
-* *THEN* `SYS.EXA_ALL_COLUMNS` and `SYS.EXA_ALL_TABLES` SHALL report both identifiers as `STRASSE`, pinning the full-Unicode `ß`-to-`SS` expansion as observed behavior rather than as documentation
-* *AND* an unquoted `SELECT COUNT(*)` over the table SHALL return the seeded row count, so the uppercased table name still resolves through `TABLE_MAP` back to the original-cased Iceberg identifier `straße` and the scan reaches the real table
-* *AND* an unquoted projection of the column SHALL return the seeded values in full, so the uppercased column name still maps back to the Iceberg field's own casing at scan time
-* *AND* a `LIKE` predicate over that column SHALL return the correct subset of rows
-* *AND* the adapter-GENERATED pushdown SQL for that same `LIKE` query SHALL carry the predicate over `"STRASSE"`, so the type-rewrite guards resolved the column's Exasol type from a `col_types` entry whose name came through this fold — the one pushdown path whose `col_types` lookup issue #265 consolidates. A declined filter returns the identical row set, so this generated-SQL assertion, not the row subset, is what discriminates a resolved lookup from a fail-safe decline
-* *AND* the scenario SHALL FAIL, not skip, when no live Exasol instance is available, per this repo's E2E contract
+> Multi-level namespace flattening and its `__`-collision guard, the non-ASCII round trip, the
+> single `ctx.database_version()` read that resolves the declared timestamp precision, and the
+> `TIMESTAMP(p)` `fractionalSecondsPrecision` serialization live in
+> `vs-adapter/create-virtual-schema-declaration-details`.

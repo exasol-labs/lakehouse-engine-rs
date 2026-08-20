@@ -13,8 +13,11 @@ use super::*;
 /// this listing pipeline.
 #[test]
 fn catalog_kind_is_matched_only_at_the_construction_site() {
-    let _pipeline: fn(&[String], &CatalogListing) -> Result<VirtualTables, UdfError> =
-        build_listing_virtual_tables;
+    let _pipeline: fn(
+        &[String],
+        &CatalogListing,
+        TimestampPrecision,
+    ) -> Result<VirtualTables, UdfError> = build_listing_virtual_tables;
     let _constructor: fn(
         CatalogKind,
         String,
@@ -69,10 +72,18 @@ fn both_kinds_share_one_listing_pipeline() {
         },
     );
 
-    let (ib_tables, ib_map, _) =
-        build_listing_virtual_tables(&configured_ns, &iceberg_listing).unwrap();
-    let (uc_tables, uc_map, _) =
-        build_listing_virtual_tables(&configured_ns, &unity_listing).unwrap();
+    let (ib_tables, ib_map, _) = build_listing_virtual_tables(
+        &configured_ns,
+        &iceberg_listing,
+        TimestampPrecision::Millisecond,
+    )
+    .unwrap();
+    let (uc_tables, uc_map, _) = build_listing_virtual_tables(
+        &configured_ns,
+        &unity_listing,
+        TimestampPrecision::Millisecond,
+    )
+    .unwrap();
 
     // One pipeline: identical flatten, case-fold, and TABLE_MAP for both kinds.
     assert_eq!(ib_tables[0]["name"], "ORDERS");
@@ -93,4 +104,65 @@ fn both_kinds_share_one_listing_pipeline() {
         ib_tables[0]["columns"][0]["dataType"],
         uc_tables[0]["columns"][0]["dataType"]
     );
+}
+
+/// Scenario (datafusion-scan/type-mapping): the resolved precision reaches the
+/// declared column type. The listing pipeline declares a timestamp column at the
+/// precision it is handed — the threading half of the createVirtualSchema
+/// response, with no live engine involved.
+#[test]
+fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
+    use iceberg::spec::{PrimitiveType, Type};
+    use lakehouse_catalog::{
+        CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
+    };
+
+    let configured_ns = vec!["cat".to_string(), "sch".to_string()];
+    let listing = CatalogListing {
+        tables: vec![CatalogTable {
+            ident: CatalogTableIdent {
+                namespace: vec!["cat".to_string(), "sch".to_string()],
+                name: "events".to_string(),
+            },
+            table_type: CatalogTableType::Table,
+            storage_location: None,
+            format: TableFormat::Iceberg,
+            vended_credential_key: None,
+            columns: vec![
+                CatalogColumn {
+                    name: "ts".to_string(),
+                    source_type: ColumnSourceType::Iceberg(Type::Primitive(
+                        PrimitiveType::Timestamp,
+                    )),
+                },
+                CatalogColumn {
+                    name: "delta_ts".to_string(),
+                    source_type: ColumnSourceType::Unity {
+                        type_name: "TIMESTAMP".to_string(),
+                        precision: 0,
+                        scale: 0,
+                    },
+                },
+            ],
+        }],
+        skipped: Vec::new(),
+    };
+
+    let cases = [
+        (
+            TimestampPrecision::Microsecond,
+            json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
+        ),
+        (
+            TimestampPrecision::Millisecond,
+            json!({"type": "timestamp"}),
+        ),
+    ];
+    for (precision, expected) in cases {
+        let (tables, _, _) =
+            build_listing_virtual_tables(&configured_ns, &listing, precision).unwrap();
+        let columns = tables[0]["columns"].as_array().unwrap();
+        assert_eq!(columns[0]["dataType"], expected, "iceberg at {precision:?}");
+        assert_eq!(columns[1]["dataType"], expected, "delta at {precision:?}");
+    }
 }

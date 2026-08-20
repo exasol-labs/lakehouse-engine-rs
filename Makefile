@@ -77,7 +77,7 @@ export LH_REST_PORT
 # They FAIL (not skip) when the stack is unavailable. All tests share one VS,
 # so the binary runs serially (--test-threads=1).
 test-e2e: cross-musl-udf-build
-	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test -- --test-threads=1
+	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test -- --test-threads=1
 
 # Lakekeeper E2E tests require a live Exasol + MinIO + Lakekeeper + Keycloak
 # stack — bring it up first with the `docker-compose.lakekeeper.yml` overlay:
@@ -125,7 +125,16 @@ test-e2e-azure: cross-musl-udf-build
 # Set BUCKETFS_WRITE_PASS env var to skip the docker-exec extraction.
 # Derived from the workspace `exasol-udf-sdk` pin; override on the command line.
 SLC_VERSION ?= $(shell sed -n 's/^exasol-udf-sdk[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml)
-SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION).tar.gz
+ARCH ?= x86_64
+ARCH_NORMALIZED := $(if $(filter arm64,$(ARCH)),aarch64,$(ARCH))
+ifeq ($(ARCH_NORMALIZED),x86_64)
+SLC_ARCH_SUFFIX :=
+else ifeq ($(ARCH_NORMALIZED),aarch64)
+SLC_ARCH_SUFFIX := -aarch64
+else
+$(error ARCH must be 'x86_64' or 'aarch64'; got '$(ARCH)')
+endif
+SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION)$(SLC_ARCH_SUFFIX).tar.gz
 EXASOL_CONTAINER ?= lakehouse-engine-rs-exasol-1
 
 install-slc:
