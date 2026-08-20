@@ -242,7 +242,7 @@ conversion):
 | Float32/Float64 | DOUBLE PRECISION |
 | Utf8/LargeUtf8 | VARCHAR(2000000) |
 | Date32 | DATE |
-| Timestamp(_, _) | TIMESTAMP |
+| Timestamp(_, _) | Arrow→Value/EMITS: bare `TIMESTAMP` at every engine version. Catalog-declared (Iceberg/Delta): `TIMESTAMP(6)` on Exasol 2025.x+ (or an unrecognized version), bare `TIMESTAMP` (millisecond) on 8.x — see `specs/datafusion-scan/type-mapping/spec.md` |
 | Decimal128(p,s) where p≤36 and s≤36 | DECIMAL(p, s) |
 | Decimal128(p,s) where p>36 or s>36 | VARCHAR(2000000) via JSON |
 

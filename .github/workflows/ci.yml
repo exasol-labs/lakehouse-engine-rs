@@ -483,8 +483,15 @@ jobs:
         run: docker compose down -v
 
   # ── viability gate: full local Exasol + MinIO + Iceberg-REST stack ───────
+  # Matrixed over both supported Exasol major versions. The 2025.x leg keeps
+  # the exact check name `E2E` — it's a required check in main's branch
+  # protection ruleset, and GitHub auto-suffixes an unmatrixed job name with
+  # the matrix values unless the name itself is templated from the matrix, so
+  # `name:` is driven from `matrix.check_name` rather than left as a bare
+  # string. The 8.29.x leg's check name is new and NOT yet in the ruleset
+  # (separate manual ops step) — tracked in #364.
   e2e:
-    name: E2E
+    name: ${{ matrix.check_name }}
     runs-on: ubuntu-latest
     # build-so only — its .so artifact is all this job consumes. NOT also
     # depending on lint/unit-tests/licenses trades away ~18 min of fail-fast
@@ -495,6 +502,18 @@ jobs:
     # re-adding to `needs`. `release` lists them explicitly so main still can't
     # ship broken.
     needs: [build-so]
+    strategy:
+      # Independent legs (different Exasol major versions) — one failing
+      # shouldn't cancel the other before it reports.
+      fail-fast: false
+      matrix:
+        include:
+          - image: exasol/docker-db:2025.2.1
+            check_name: E2E
+            log_artifact: exa-logs
+          - image: exasol/docker-db:8.29.13
+            check_name: E2E (8.29.x)
+            log_artifact: exa-logs-8x
     # Observed 16-20 min end-to-end historically, but pre-test setup (disk
     # cleanup + image loads) has grown slower as the hosted runner image
     # bundles more pre-installed content to prune through — one run burned
@@ -507,6 +526,9 @@ jobs:
       # exasol service default (4) exceeds what Docker will accept ("range of
       # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
       LH_EXASOL_CPUS: "2"
+      # Selects the matrix leg's Exasol image; docker-compose.yml's exasol
+      # service reads this with a 2025.2.1 fallback.
+      EXASOL_IMAGE: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -582,7 +604,9 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: exa-logs
+          # Per-leg name: upload-artifact@v7 rejects a name reused within one
+          # run, and both matrix legs execute this step in the same run.
+          name: ${{ matrix.log_artifact }}
           path: exa-logs/
           if-no-files-found: ignore
 

@@ -38,6 +38,7 @@ use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
     local_stack_connection_password, wait_for_exasol, wait_for_minio, wait_for_url,
 };
+use common::timestamp_precision::expected_timestamp_precision;
 
 use lakehouse_catalog::{
     CatalogClient, CatalogTableIdent, ConnectionCreds, StorageBackend, UnityCatalogSession,
@@ -1444,6 +1445,52 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
         "NESTED_STRUCT must render each populated row keyed by the LOGICAL inner \
          names, a NULL member as SQL NULL's JSON counterpart, and a NULL struct \
          cell as SQL NULL: {nested_struct:?}"
+    );
+}
+
+/// Scenario: A Delta timestamp column's declared Exasol type is asserted
+/// exactly at the engine's precision.
+///
+/// The prefix-tolerant `assert_col_type` checks above only confirm each
+/// column starts with `TIMESTAMP`; they pass identically whether the engine
+/// declares `TIMESTAMP(3)` or `TIMESTAMP(6)`. This test asserts the exact
+/// declared `COLUMN_TYPE` — read from the same `expected_timestamp_precision`
+/// oracle task 5 and task 8 use — for the same three Delta timestamp columns:
+/// `STATS_ALL_TYPES.TIMESTAMP_COL`, `STATS_ALL_TYPES.TIMESTAMP_NTZ_COL`, and
+/// `TYPE_WIDENING.DATE_TIMESTAMP_NTZ`. The declared value is whitespace-stripped
+/// before comparison, matching `e2e_timestamp_precision_test::declared_type`.
+#[test]
+fn unity_delta_timestamp_columns_declare_the_exact_gated_precision() {
+    setup();
+    let mut conn = exa_conn();
+
+    let declared_column_type = expected_timestamp_precision(&mut conn).declared_column_type;
+
+    let stats_cols = column_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
+    for column in ["TIMESTAMP_COL", "TIMESTAMP_NTZ_COL"] {
+        let raw = &stats_cols
+            .iter()
+            .find(|(name, _)| name == column)
+            .unwrap_or_else(|| panic!("column {column} not declared; got {stats_cols:?}"))
+            .1;
+        let actual: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+        assert_eq!(
+            actual, declared_column_type,
+            "{column} must declare exactly {declared_column_type}, got {actual}"
+        );
+    }
+
+    let widening_cols = column_types(&mut conn, VS_NAME, "TYPE_WIDENING");
+    let column = "DATE_TIMESTAMP_NTZ";
+    let raw = &widening_cols
+        .iter()
+        .find(|(name, _)| name == column)
+        .unwrap_or_else(|| panic!("column {column} not declared; got {widening_cols:?}"))
+        .1;
+    let actual: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
+    assert_eq!(
+        actual, declared_column_type,
+        "{column} must declare exactly {declared_column_type}, got {actual}"
     );
 }
 

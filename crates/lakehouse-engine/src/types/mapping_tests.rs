@@ -320,82 +320,95 @@ fn varchar_type_string_alone_does_not_decide_the_json_fallback() {
 /// Each Iceberg primitive → correct Exasol type; complex types → VARCHAR(2000000).
 #[test]
 fn iceberg_types_map_to_exasol_type() {
+    let ts_precision = TimestampPrecision::Millisecond;
     // primitives
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Boolean)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Boolean), ts_precision),
         "BOOLEAN"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Int)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Int), ts_precision),
         "DECIMAL(10,0)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Long)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Long), ts_precision),
         "DECIMAL(20,0)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Float)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Float), ts_precision),
         "DOUBLE PRECISION"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Double)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Double), ts_precision),
         "DOUBLE PRECISION"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::String)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::String), ts_precision),
         "VARCHAR(2000000)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Date)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Date), ts_precision),
         "DATE"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamp)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamp), ts_precision),
         "TIMESTAMP"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamptz)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Timestamptz), ts_precision),
         "TIMESTAMP"
     );
     // in-range decimal
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Decimal {
-            precision: 18,
-            scale: 4,
-        })),
+        iceberg_type_to_exasol(
+            &Type::Primitive(PrimitiveType::Decimal {
+                precision: 18,
+                scale: 4,
+            }),
+            ts_precision
+        ),
         "DECIMAL(18,4)"
     );
     // out-of-range decimal → VARCHAR
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Decimal {
-            precision: 38,
-            scale: 10,
-        })),
+        iceberg_type_to_exasol(
+            &Type::Primitive(PrimitiveType::Decimal {
+                precision: 38,
+                scale: 10,
+            }),
+            ts_precision
+        ),
         "VARCHAR(2000000)"
     );
     // precision = 0 → VARCHAR
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Decimal {
-            precision: 0,
-            scale: 0,
-        })),
+        iceberg_type_to_exasol(
+            &Type::Primitive(PrimitiveType::Decimal {
+                precision: 0,
+                scale: 0,
+            }),
+            ts_precision
+        ),
         "VARCHAR(2000000)"
     );
     // scale > precision → VARCHAR
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Decimal {
-            precision: 5,
-            scale: 10,
-        })),
+        iceberg_type_to_exasol(
+            &Type::Primitive(PrimitiveType::Decimal {
+                precision: 5,
+                scale: 10,
+            }),
+            ts_precision
+        ),
         "VARCHAR(2000000)"
     );
     // incompatible primitive → VARCHAR
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Binary)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Binary), ts_precision),
         "VARCHAR(2000000)"
     );
     assert_eq!(
-        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Time)),
+        iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Time), ts_precision),
         "VARCHAR(2000000)"
     );
 }
@@ -964,17 +977,21 @@ fn classify_exa_type_matches_pushdown_guard_predicates() {
 #[test]
 fn column_source_type_maps_to_exasol_in_one_home() {
     assert_eq!(
-        column_source_type_to_exasol(&ColumnSourceType::Iceberg(Type::Primitive(
-            PrimitiveType::Long
-        ))),
+        column_source_type_to_exasol(
+            &ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+            TimestampPrecision::Millisecond,
+        ),
         "DECIMAL(20,0)"
     );
     assert_eq!(
-        column_source_type_to_exasol(&ColumnSourceType::Unity {
-            type_name: "LONG".to_string(),
-            precision: 0,
-            scale: 0,
-        }),
+        column_source_type_to_exasol(
+            &ColumnSourceType::Unity {
+                type_name: "LONG".to_string(),
+                precision: 0,
+                scale: 0,
+            },
+            TimestampPrecision::Millisecond,
+        ),
         "DECIMAL(20,0)"
     );
 }
@@ -1004,7 +1021,7 @@ fn unity_spark_types_map_to_exasol() {
             scale,
         };
         assert_eq!(
-            column_source_type_to_exasol(&source),
+            column_source_type_to_exasol(&source, TimestampPrecision::Millisecond),
             expected,
             "type_name={type_name} precision={precision} scale={scale}"
         );
@@ -1015,6 +1032,7 @@ fn unity_spark_types_map_to_exasol() {
 /// DECIMAL both fall back to VARCHAR
 #[test]
 fn incompatible_unity_types_declared_varchar() {
+    let ts_precision = TimestampPrecision::Millisecond;
     for type_name in ["ARRAY", "MAP", "STRUCT", "BINARY", "INTERVAL", "VARIANT"] {
         let source = ColumnSourceType::Unity {
             type_name: type_name.to_string(),
@@ -1022,7 +1040,7 @@ fn incompatible_unity_types_declared_varchar() {
             scale: 0,
         };
         assert_eq!(
-            column_source_type_to_exasol(&source),
+            column_source_type_to_exasol(&source, ts_precision),
             "VARCHAR(2000000)",
             "type_name={type_name}"
         );
@@ -1030,38 +1048,50 @@ fn incompatible_unity_types_declared_varchar() {
 
     // precision > 36
     assert_eq!(
-        column_source_type_to_exasol(&ColumnSourceType::Unity {
-            type_name: "DECIMAL".to_string(),
-            precision: 38,
-            scale: 10,
-        }),
+        column_source_type_to_exasol(
+            &ColumnSourceType::Unity {
+                type_name: "DECIMAL".to_string(),
+                precision: 38,
+                scale: 10,
+            },
+            ts_precision
+        ),
         "VARCHAR(2000000)"
     );
     // scale > 36
     assert_eq!(
-        column_source_type_to_exasol(&ColumnSourceType::Unity {
-            type_name: "DECIMAL".to_string(),
-            precision: 18,
-            scale: 37,
-        }),
+        column_source_type_to_exasol(
+            &ColumnSourceType::Unity {
+                type_name: "DECIMAL".to_string(),
+                precision: 18,
+                scale: 37,
+            },
+            ts_precision
+        ),
         "VARCHAR(2000000)"
     );
     // precision = 0
     assert_eq!(
-        column_source_type_to_exasol(&ColumnSourceType::Unity {
-            type_name: "DECIMAL".to_string(),
-            precision: 0,
-            scale: 0,
-        }),
+        column_source_type_to_exasol(
+            &ColumnSourceType::Unity {
+                type_name: "DECIMAL".to_string(),
+                precision: 0,
+                scale: 0,
+            },
+            ts_precision
+        ),
         "VARCHAR(2000000)"
     );
     // scale > precision
     assert_eq!(
-        column_source_type_to_exasol(&ColumnSourceType::Unity {
-            type_name: "DECIMAL".to_string(),
-            precision: 5,
-            scale: 10,
-        }),
+        column_source_type_to_exasol(
+            &ColumnSourceType::Unity {
+                type_name: "DECIMAL".to_string(),
+                precision: 5,
+                scale: 10,
+            },
+            ts_precision
+        ),
         "VARCHAR(2000000)"
     );
 }
@@ -1084,14 +1114,21 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
         (18, 37, "VARCHAR(2000000)"),
     ];
     for (precision, scale, expected) in cases {
-        let iceberg_result = column_source_type_to_exasol(&ColumnSourceType::Iceberg(
-            Type::Primitive(PrimitiveType::Decimal { precision, scale }),
-        ));
-        let unity_result = column_source_type_to_exasol(&ColumnSourceType::Unity {
-            type_name: "DECIMAL".to_string(),
-            precision,
-            scale,
-        });
+        let iceberg_result = column_source_type_to_exasol(
+            &ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Decimal {
+                precision,
+                scale,
+            })),
+            TimestampPrecision::Millisecond,
+        );
+        let unity_result = column_source_type_to_exasol(
+            &ColumnSourceType::Unity {
+                type_name: "DECIMAL".to_string(),
+                precision,
+                scale,
+            },
+            TimestampPrecision::Millisecond,
+        );
         assert_eq!(
             iceberg_result, expected,
             "iceberg precision={precision} scale={scale}"
@@ -1143,7 +1180,7 @@ fn iceberg_primitive_mappings_are_exhaustive_so_a_new_variant_breaks_the_build()
     for variant in &every_variant {
         let (expected_exasol, expected_arrow) = expected_mapping(variant);
         assert_eq!(
-            iceberg_primitive_to_exasol(variant),
+            iceberg_primitive_to_exasol(variant, TimestampPrecision::Millisecond),
             expected_exasol,
             "iceberg_primitive_to_exasol mapped {variant:?} to an unexpected Exasol type"
         );
@@ -1191,5 +1228,186 @@ fn expected_mapping(pt: &PrimitiveType) -> (&'static str, DataType) {
         PrimitiveType::Uuid => ("VARCHAR(2000000)", DataType::Utf8),
         PrimitiveType::Fixed(_) => ("VARCHAR(2000000)", DataType::Utf8),
         PrimitiveType::Binary => ("VARCHAR(2000000)", DataType::Utf8),
+    }
+}
+
+/// Scenario (datafusion-scan/type-mapping): A catalog timestamp column is declared
+/// TIMESTAMP(6) on Exasol 2025.x and later — the version rule and both declaration
+/// strings at their single owner. `8.29.13` and `2025.2.1` are the real Docker image
+/// tags `ctx.database_version()` reports on the two engine lines.
+#[test]
+fn database_version_leading_component_selects_the_declared_timestamp_precision() {
+    let cases = [
+        ("2025.2.1", TimestampPrecision::Microsecond, "TIMESTAMP(6)"),
+        ("2026.1.0", TimestampPrecision::Microsecond, "TIMESTAMP(6)"),
+        ("2025", TimestampPrecision::Microsecond, "TIMESTAMP(6)"),
+        ("2024.12.31", TimestampPrecision::Millisecond, "TIMESTAMP"),
+        ("8.29.13", TimestampPrecision::Millisecond, "TIMESTAMP"),
+        ("7.1.20", TimestampPrecision::Millisecond, "TIMESTAMP"),
+    ];
+    for (version, expected, expected_declaration) in cases {
+        let resolved = TimestampPrecision::from_database_version(version);
+        assert_eq!(resolved, expected, "version={version}");
+        assert_eq!(
+            resolved.declaration(),
+            expected_declaration,
+            "version={version}"
+        );
+    }
+}
+
+/// Scenario (datafusion-scan/type-mapping): An empty or unparseable database version
+/// declares the microsecond precision — the SAME arm a recognised 2025.x version takes,
+/// deliberately not the bare-TIMESTAMP default.
+#[test]
+fn unreadable_database_version_declares_microsecond_precision() {
+    for version in ["", "v2025.2.1", "unknown", ".2.1", "8x.1.0", " "] {
+        let resolved = TimestampPrecision::from_database_version(version);
+        assert_eq!(
+            resolved,
+            TimestampPrecision::Microsecond,
+            "version={version:?}"
+        );
+        assert_eq!(
+            resolved.declaration(),
+            "TIMESTAMP(6)",
+            "version={version:?}"
+        );
+    }
+}
+
+/// Scenario (datafusion-scan/type-mapping): An Iceberg `timestamp` and a Delta
+/// `TIMESTAMP` are declared at the SAME resolved precision — the two catalog
+/// declaration producers read one owner, so neither line can drift from the other.
+#[test]
+fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
+    let cases = [
+        (TimestampPrecision::Microsecond, "TIMESTAMP(6)"),
+        (TimestampPrecision::Millisecond, "TIMESTAMP"),
+    ];
+    for (precision, expected) in cases {
+        assert_eq!(
+            iceberg_primitive_to_exasol(&PrimitiveType::Timestamp, precision),
+            expected,
+            "iceberg timestamp at {precision:?}"
+        );
+        assert_eq!(
+            column_source_type_to_exasol(
+                &ColumnSourceType::Unity {
+                    type_name: "TIMESTAMP".to_string(),
+                    precision: 0,
+                    scale: 0,
+                },
+                precision,
+            ),
+            expected,
+            "delta TIMESTAMP at {precision:?}"
+        );
+        assert_eq!(
+            column_source_type_to_exasol(
+                &ColumnSourceType::Unity {
+                    type_name: "TIMESTAMP_NTZ".to_string(),
+                    precision: 0,
+                    scale: 0,
+                },
+                precision,
+            ),
+            expected,
+            "delta TIMESTAMP_NTZ at {precision:?}"
+        );
+    }
+}
+
+/// Scenario (datafusion-scan/type-mapping): The Arrow-input resolver stays outside
+/// the version gate — it resolves the UDF's declared EMITS type, not a catalog
+/// declaration, so it takes no `TimestampPrecision` at all. The function-pointer
+/// binding is the assertion: a threaded precision parameter would not compile.
+#[test]
+fn arrow_input_resolver_stays_outside_the_timestamp_version_gate() {
+    let _ungated: fn(&DataType) -> String = arrow_to_exasol_type;
+
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Timestamp(TimeUnit::Microsecond, None)),
+        "TIMESTAMP"
+    );
+    assert_eq!(
+        arrow_to_exasol_type(&DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into())
+        )),
+        "TIMESTAMP"
+    );
+}
+
+/// Scenario (datafusion-scan/type-mapping): `timestamptz` keeps collapsing to the
+/// plain (now precision-gated) Exasol TIMESTAMP declaration rather than TIMESTAMP
+/// WITH LOCAL TIME ZONE, which Exasol rejects as a UDF EMITS output type.
+#[test]
+fn iceberg_timestamptz_declares_timestamp_at_the_gated_precision() {
+    let zoned = [PrimitiveType::Timestamptz, PrimitiveType::TimestamptzNs];
+    for variant in &zoned {
+        assert_eq!(
+            iceberg_primitive_to_exasol(variant, TimestampPrecision::Microsecond),
+            "TIMESTAMP(6)",
+            "{variant:?}"
+        );
+        assert_eq!(
+            iceberg_primitive_to_exasol(variant, TimestampPrecision::Millisecond),
+            "TIMESTAMP",
+            "{variant:?}"
+        );
+    }
+}
+
+/// Scenario (datafusion-scan/type-mapping): A parameterized `TIMESTAMP(p)` renders
+/// as a timestamp dataType carrying `fractionalSecondsPrecision` — completing the
+/// pair `exasol_type_from_json` already reads — instead of silently falling through
+/// to the VARCHAR catch-all. The two unparameterized timestamp spellings keep their
+/// recorded objects. A malformed `p` (empty, non-numeric, negative) is the recorded
+/// exception: it still falls through to the VARCHAR catch-all, because
+/// `TimestampPrecision::declaration()` is the only producer of a `TIMESTAMP(p)`
+/// string and emits only `TIMESTAMP` and `TIMESTAMP(6)`.
+#[test]
+fn exasol_type_to_json_renders_timestamp_fractional_seconds_precision() {
+    assert_eq!(
+        exasol_type_to_json("TIMESTAMP(6)"),
+        json!({"type": "timestamp", "fractionalSecondsPrecision": 6})
+    );
+    assert_eq!(
+        exasol_type_to_json("TIMESTAMP(9)"),
+        json!({"type": "timestamp", "fractionalSecondsPrecision": 9})
+    );
+    assert_eq!(
+        exasol_type_to_json("TIMESTAMP(0)"),
+        json!({"type": "timestamp", "fractionalSecondsPrecision": 0})
+    );
+
+    assert_eq!(
+        exasol_type_to_json("TIMESTAMP"),
+        json!({"type": "timestamp"})
+    );
+    assert_eq!(
+        exasol_type_to_json("TIMESTAMP WITH LOCAL TIME ZONE"),
+        json!({"type": "timestamp", "withLocalTimeZone": true})
+    );
+
+    for malformed in ["TIMESTAMP()", "TIMESTAMP(abc)", "TIMESTAMP(-1)"] {
+        assert_eq!(
+            exasol_type_to_json(malformed),
+            json!({"type": "varchar", "size": 2_000_000}),
+            "malformed={malformed}"
+        );
+    }
+
+    for declared in [
+        "TIMESTAMP",
+        "TIMESTAMP(6)",
+        "TIMESTAMP WITH LOCAL TIME ZONE",
+    ] {
+        assert_eq!(
+            exasol_type_from_json(&exasol_type_to_json(declared)),
+            declared,
+            "declared={declared}"
+        );
     }
 }
