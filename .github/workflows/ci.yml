@@ -467,13 +467,7 @@ jobs:
             --bfs-write-password "$BFSPASS" \
             --default
 
-      # No --lakehouse-version/--slc-version pin: fetches each repo's latest
-      # release, same as a real user's default invocation. GITHUB_TOKEN is the
-      # standard Actions-provided token — it already has read access to this
-      # (private) repo's own releases, and language-container-rs is public.
       - name: Run install.sh (BucketFS target)
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash deploy/scripts/install.sh --profile ci-bucketfs
 
       - name: Dump Exasol logs on failure

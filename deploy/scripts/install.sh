@@ -215,69 +215,6 @@ extract_json_string_field() {
   return 1
 }
 
-# Given a GitHub release JSON blob (as returned by GET /releases/latest or /releases/tags/<tag>)
-# and an asset file name, prints that asset's numeric id. Returns 1 if the asset is absent.
-#
-# No jq: GitHub's REST API stably pretty-prints its JSON with a fixed 2-space indent, so each
-# element of the "assets" array is delimited by a line that is exactly a 4-space-indented "{" /
-# "}," pair, and the asset's OWN fields sit at 6-space indent -- one level shallower than a
-# nested object's fields (e.g. "uploader", 8-space indent). Scanning strictly at the 6-space
-# depth means a nested object's own "id" (every asset carries an "uploader" with its own numeric
-# "id") is never mistaken for the asset's id. The scan is bounded to the "assets": [ ... ] block
-# -- entered on the 2-space "assets": [ line and exited on its matching 2-space "]" close --
-# rather than scanning the whole response, so it can't misfire on some other, unrelated
-# array-of-objects field the release schema might grow in the future. Because both
-# "id" and "name" are captured independently per asset block, field order within the block and
-# the order of assets within the array are both irrelevant to correctness.
-extract_asset_id_by_name() {
-  local json="$1" target="$2"
-  local in_assets=0 in_asset=0 id="" name="" line
-  local assets_start_re='^  "assets": \[[[:space:]]*$'
-  local assets_end_re='^  \],?[[:space:]]*$'
-  local asset_open_re='^    \{[[:space:]]*$'
-  local asset_close_re='^    \},?[[:space:]]*$'
-  local id_field_re='^      "id"[[:space:]]*:[[:space:]]*([0-9]+),?[[:space:]]*$'
-  local name_field_re='^      "name"[[:space:]]*:[[:space:]]*"([^"]*)",?[[:space:]]*$'
-
-  while IFS= read -r line; do
-    if [[ "$in_assets" -eq 0 ]]; then
-      [[ "$line" =~ $assets_start_re ]] && in_assets=1
-      continue
-    fi
-    if [[ "$in_asset" -eq 0 ]]; then
-      if [[ "$line" =~ $assets_end_re ]]; then
-        in_assets=0
-        continue
-      fi
-      if [[ "$line" =~ $asset_open_re ]]; then
-        in_asset=1
-        id=""
-        name=""
-      fi
-      continue
-    fi
-    if [[ "$line" =~ $asset_close_re ]]; then
-      if [[ -n "$name" && "$name" == "$target" && -n "$id" ]]; then
-        printf '%s\n' "$id"
-        return 0
-      fi
-      in_asset=0
-      continue
-    fi
-    if [[ "$line" =~ $id_field_re ]]; then
-      id="${BASH_REMATCH[1]}"
-      continue
-    fi
-    if [[ "$line" =~ $name_field_re ]]; then
-      name="${BASH_REMATCH[1]}"
-      continue
-    fi
-  done <<EOF_ASSETS
-$json
-EOF_ASSETS
-  return 1
-}
-
 # --- Credential resolution ---------------------------------------------------
 # Prints the exapump config.toml path this installer must read to mirror what
 # `exapump sql --profile <name>` itself would resolve (confirmed via `strings $(command -v
@@ -287,7 +224,7 @@ exapump_config_path() {
 }
 
 # Reads the named `$key` out of the named `[profile]` TOML section in $config_path. Bounded
-# scan (same discipline as extract_asset_id_by_name's bounded JSON block): only lines between the
+# scan: only lines between the
 # named section's own header and the next `[`-headed header (or EOF) are considered, so a
 # same-named key in a different section is never matched. Returns 1 with no output if the file,
 # section, or key is absent.
@@ -890,9 +827,8 @@ resolve_engine_pinned_slc_version() {
   local tag="$1"
   local toml line sdk_version=""
   if ! toml="$(curl -fsS \
-      -H "Accept: application/vnd.github.raw" \
-      "https://api.github.com/repos/$ENGINE_REPO/contents/Cargo.toml?ref=$tag" </dev/null 2>&1)"; then
-    err "could not fetch Cargo.toml for $ENGINE_REPO release '$tag' via the GitHub REST API. Pass --slc-version to skip this lookup."
+      "https://raw.githubusercontent.com/$ENGINE_REPO/$tag/Cargo.toml" </dev/null 2>&1)"; then
+    err "could not fetch Cargo.toml for $ENGINE_REPO at '$tag'. Pass --slc-version to skip this lookup."
     return 1
   fi
   while IFS= read -r line; do
@@ -1326,35 +1262,12 @@ smoke_test_sql() {
 }
 
 # --- Install steps -----------------------------------------------------------
-# Downloads a named release asset for $repo at $tag into $dest_path via the authenticated
-# GitHub REST API: resolve the release-by-tag JSON, look up the asset id by name (no jq --
-# see extract_asset_id_by_name), then GET the asset binary by id.
-#
-# Uses plain -L, never --location-trusted: the assets endpoint authenticates the API call with
-# our Authorization header, then 302s to a signed, host-authenticated storage URL that rejects a
-# second auth mechanism. curl's default behavior since 7.58 is to strip Authorization across a
-# cross-host redirect -- exactly what's needed here. --location-trusted would force the header
-# through the redirect and break the signed URL.
 download_release_asset() {
   local repo="$1" tag="$2" asset_name="$3" dest_path="$4"
-  local release_json asset_id dl_err
-
-  if ! release_json="$(curl -fsS \
-      "https://api.github.com/repos/$repo/releases/tags/$tag" </dev/null 2>&1)"; then
-    err "could not fetch release '$tag' from $repo via the GitHub REST API."
-    return 1
-  fi
-
-  if ! asset_id="$(extract_asset_id_by_name "$release_json" "$asset_name")"; then
-    err "asset '$asset_name' not found in $repo release '$tag'."
-    return 1
-  fi
-
-  if ! dl_err="$(curl -fsSL \
-      -H "Accept: application/octet-stream" \
-      -o "$dest_path" \
-      "https://api.github.com/repos/$repo/releases/assets/$asset_id" </dev/null 2>&1)"; then
-    err "failed to download asset '$asset_name' (id $asset_id) from $repo release '$tag': $dl_err"
+  local dl_err
+  if ! dl_err="$(curl -fsSL -o "$dest_path" \
+      "https://github.com/$repo/releases/download/$tag/$asset_name" </dev/null 2>&1)"; then
+    err "failed to download asset '$asset_name' from $repo release '$tag': $dl_err"
     return 1
   fi
   return 0

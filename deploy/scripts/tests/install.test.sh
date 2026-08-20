@@ -224,24 +224,7 @@ else
         *)                       printf '{\n  "tag_name": "%s",\n  "name": "engine"\n}\n' "${GH_ENGINE_TAG:-v0.26.3}" ;;
       esac
       exit 0 ;;
-    */releases/tags/*)
-      # GET /repos/<repo>/releases/tags/<tag> -> release JSON with an "assets" array, indented
-      # exactly as extract_asset_id_by_name expects (2-space "assets", 4-space object braces,
-      # 6-space "id"/"name" fields).
-      asset_name="lakehouse-engine.tar.gz"
-      case "$url" in
-        *language-container-rs*)
-          ver="${GH_SLC_TAG:-v0.21.0}"; ver="${ver#v}"
-          asset_name="lc-rust-$ver.tar.gz"
-          ;;
-      esac
-      if [[ "${GH_ASSET_MISSING:-0}" == "1" ]]; then
-        asset_name="does-not-match-any-asset.tar.gz"
-      fi
-      printf '{\n  "assets": [\n    {\n      "id": 555,\n      "name": "%s"\n    }\n  ]\n}\n' "$asset_name"
-      exit 0 ;;
-    */contents/Cargo.toml*)
-      # GET /repos/<repo>/contents/Cargo.toml?ref=<tag> (Accept: vnd.github.raw) -> raw file text.
+    */Cargo.toml)
       if [[ "${CURL_CARGO_TOML_FAIL:-0}" == "1" ]]; then
         echo "curl: (22) The requested URL returned error: 404" >&2
         exit 22
@@ -261,10 +244,11 @@ iceberg = "0.10.0"
 exasol-udf-sdk = { version = "${GH_ENGINE_SDK_VERSION:-0.21.0}", features = ["emit-arrow"] }
 TOML
       exit 0 ;;
-    */releases/assets/*)
-      # GET /repos/<repo>/releases/assets/<id> (Accept: octet-stream) -> writes bytes to -o path.
-      # GH_ASSET_TARBALL delivers a REAL fixture archive instead, which the BucketFS target needs
-      # because it extracts the engine asset locally.
+    */releases/download/*)
+      if [[ "${GH_ASSET_MISSING:-0}" == "1" ]]; then
+        echo "curl: (22) The requested URL returned error: 404" >&2
+        exit 22
+      fi
       if [[ -n "$outfile" ]]; then
         if [[ -n "${GH_ASSET_TARBALL:-}" ]]; then
           cat "$GH_ASSET_TARBALL" > "$outfile"
@@ -761,7 +745,7 @@ test_version_resolution_default_and_override() {
   local log; log="$(log_content)"
   assert_contains "default: curl hits the engine releases/latest endpoint" "$log" "releases/latest"
   assert_contains "default: curl fetches the engine's Cargo.toml at the resolved tag" \
-    "$log" "contents/Cargo.toml?ref=v1.2.3"
+    "$log" "v1.2.3/Cargo.toml"
   assert_not_contains "default: never queries language-container-rs's own latest release" \
     "$log" "language-container-rs/releases/latest"
 
@@ -881,8 +865,7 @@ test_presigned_upload_dance() {
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "upload: install succeeds" "$LAST_RC"
   local log; log="$(log_content)"
-  assert_contains "upload: resolves release-by-tag JSON for the asset id lookup" "$log" "releases/tags/"
-  assert_contains "upload: downloads the asset via the authenticated octet-stream GET" "$log" "releases/assets/"
+  assert_contains "upload: downloads assets via direct github.com URL" "$log" "releases/download/"
   assert_contains "upload: SLC renamed to rustslc.tar.gz (POST key)" "$log" "/files/rustslc.tar.gz"
   assert_contains "upload: engine POST key" "$log" "/files/lakehouse-engine.tar.gz"
   assert_contains "upload: POST to obtain presigned url" "$log" "-X POST"
@@ -929,14 +912,10 @@ test_release_asset_download_via_rest() {
   echo "== test_release_asset_download_via_rest =="
   reset_env
   run_file "${HAPPY_ARGS[@]}"
-  assert_rc_zero "asset rest: install succeeds" "$LAST_RC"
+  assert_rc_zero "asset download: install succeeds" "$LAST_RC"
   local log; log="$(log_content)"
-  assert_contains "asset rest: id-lookup step (release-by-tag GET) happens" "$log" "releases/tags/"
-  local dl_lines
-  dl_lines="$(printf '%s\n' "$log" | grep -- 'releases/assets/' || true)"
-  assert_contains "asset rest: final download follows redirects (-L within the -fsSL cluster)" "$dl_lines" "-fsSL"
-  assert_contains "asset rest: final download sends the octet-stream accept header" "$dl_lines" "Accept: application/octet-stream"
-  assert_not_contains "asset rest: final download never escalates to --location-trusted" "$dl_lines" "--location-trusted"
+  assert_contains "asset download: uses direct github.com/releases/download URL" "$log" "releases/download/"
+  assert_not_contains "asset download: no API-based asset lookup" "$log" "releases/assets/"
 
   reset_env
   export GH_ASSET_MISSING=1
@@ -947,75 +926,12 @@ test_release_asset_download_via_rest() {
     download_release_asset "$ENGINE_REPO" "v1.2.3" "$ENGINE_ASSET" "$SANDBOX/does-not-matter" 2>&1
   )"
   rc=$?
-  assert_rc_nonzero "asset rest: missing/non-matching asset name fails non-zero" "$rc"
-  assert_contains "asset rest: error names the repo" "$out" "exasol-labs/lakehouse-engine-rs"
-  assert_contains "asset rest: error names the tag" "$out" "v1.2.3"
-  assert_contains "asset rest: error names the asset" "$out" "lakehouse-engine.tar.gz"
+  assert_rc_nonzero "asset download: missing asset fails non-zero" "$rc"
+  assert_contains "asset download: error names the repo" "$out" "exasol-labs/lakehouse-engine-rs"
+  assert_contains "asset download: error names the tag" "$out" "v1.2.3"
+  assert_contains "asset download: error names the asset" "$out" "lakehouse-engine.tar.gz"
 }
 
-test_extract_asset_id_by_name_realistic() {
-  echo "== test_extract_asset_id_by_name_realistic =="
-  # Direct unit test of the no-jq asset-id lookup against a realistic GitHub release JSON
-  # (2-space pretty-print). Harder than the stub fixtures: two assets with the TARGET NOT first,
-  # each asset's "name" ordered BEFORE its "id", and each carrying a nested "uploader" object with
-  # its OWN numeric "id" at deeper (8-space) indent. A trailing "mentions" array AFTER the assets
-  # block carries a name absent from assets, to prove the scan is bounded to the assets block and
-  # cannot misfire on a later array-of-objects field.
-  local fixture id rc first_id mentions_only rc2 none rc3
-  fixture="$(cat <<'JSON'
-{
-  "tag_name": "v1.2.3",
-  "assets": [
-    {
-      "url": "https://api.github.com/repos/x/y/releases/assets/111",
-      "name": "other-asset.tar.gz",
-      "id": 111,
-      "uploader": {
-        "login": "octocat",
-        "id": 9001
-      }
-    },
-    {
-      "url": "https://api.github.com/repos/x/y/releases/assets/222",
-      "name": "lakehouse-engine.tar.gz",
-      "id": 222,
-      "uploader": {
-        "login": "hubot",
-        "id": 9002
-      }
-    }
-  ],
-  "mentions": [
-    {
-      "name": "only-in-mentions.tar.gz",
-      "id": 7777
-    }
-  ]
-}
-JSON
-)"
-
-  id="$( source "$INSTALLER"; extract_asset_id_by_name "$fixture" "lakehouse-engine.tar.gz" )"
-  rc=$?
-  assert_rc_zero "extract: target present (not first) resolves" "$rc"
-  assert_eq "extract: resolves the target asset's own id (222), not its uploader id (9002) or the wrong asset" "222" "$id"
-
-  first_id="$( source "$INSTALLER"; extract_asset_id_by_name "$fixture" "other-asset.tar.gz" )"
-  assert_eq "extract: first asset resolves to its own id (111), uploader id (9001) ignored" "111" "$first_id"
-
-  # Bounded to the assets block: a name present ONLY in the trailing "mentions" array must NOT
-  # resolve to that later array's id (the pre-fix scan-to-EOF false positive).
-  mentions_only="$( source "$INSTALLER"; extract_asset_id_by_name "$fixture" "only-in-mentions.tar.gz" )"
-  rc2=$?
-  assert_rc_nonzero "extract: name found only outside the assets block never matches" "$rc2"
-  assert_eq "extract: no id printed for a name outside the assets block" "" "$mentions_only"
-
-  # Non-matching name against the rich fixture still fails cleanly.
-  none="$( source "$INSTALLER"; extract_asset_id_by_name "$fixture" "no-such-asset.tar.gz" )"
-  rc3=$?
-  assert_rc_nonzero "extract: non-matching name returns failure" "$rc3"
-  assert_eq "extract: no id printed for a non-matching name" "" "$none"
-}
 
 test_saas_verify_listed_quoted_match() {
   echo "== test_saas_verify_listed_quoted_match =="
@@ -1203,8 +1119,7 @@ test_stdin_piped_invocation_no_body_consumption() {
   local log; log="$(log_content)"
   # If any subprocess had consumed the piped body, execution would truncate before these.
   assert_contains "stdin-piped: GitHub release resolved (releases/latest reached)" "$log" "releases/latest"
-  assert_contains "stdin-piped: release-by-tag asset id lookup reached (releases/tags)" "$log" "releases/tags/"
-  assert_contains "stdin-piped: release asset downloaded (releases/assets)" "$log" "releases/assets/"
+  assert_contains "stdin-piped: release asset downloaded (releases/download)" "$log" "releases/download/"
   assert_contains "stdin-piped: SLC uploaded (body not truncated early)" "$log" "/files/rustslc.tar.gz"
   assert_contains "stdin-piped: three scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "stdin-piped: smoke-test SQL executed (reached end)" "$log" "LAKEHOUSE_SCAN('x', 'y')"
@@ -1837,7 +1752,7 @@ arch_aarch64_selects_suffixed_assets() {
 
   out="$(
     source "$INSTALLER"
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     download_release_asset() { printf 'asset=%s\n' "$3"; : > "$4"; return 0; }
     ARG_ARCH="x86_64"
     RESOLVED_SLC_VERSION="0.21.0"
@@ -1850,7 +1765,7 @@ arch_aarch64_selects_suffixed_assets() {
 
   out="$(
     source "$INSTALLER"
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     download_release_asset() { printf 'asset=%s\n' "$3"; : > "$4"; return 0; }
     ARG_ARCH="aarch64"
     RESOLVED_SLC_VERSION="0.21.0"
@@ -2285,11 +2200,11 @@ run_deploy_personal_local() {
     resolve_target_layout
     WORKDIR="$workdir"
     mkdir -p "$WORKDIR/extracted/udf"
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     download_slc() { printf 'slc-bytes\n' > "$WORKDIR/rustslc.tar.gz"; }
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     download_engine() { printf 'engine-bytes\n' > "$WORKDIR/$ENGINE_ASSET"; }
-    # shellcheck disable=SC2329
+    # shellcheck disable=SC2317,SC2329
     extract_engine_so() {
       printf 'so-bytes\n' > "$WORKDIR/extracted/udf/liblakehouse_engine.so"
       printf '%s\n' "$WORKDIR/extracted/udf/liblakehouse_engine.so"
@@ -2566,7 +2481,6 @@ main() {
   test_presigned_upload_dance
   test_presigned_url_json_unescaping
   test_release_asset_download_via_rest
-  test_extract_asset_id_by_name_realistic
   test_saas_verify_listed_quoted_match
   test_three_scripts_ddl_saas_path_types
   test_fingerprint_smoke_pass_and_fail
