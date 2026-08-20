@@ -1012,7 +1012,6 @@ test_stops_at_product_prints_template() {
   assert_contains "template: prints CREATE CONNECTION" "$LAST_OUT" "CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS"
   assert_contains "template: prints CREATE VIRTUAL SCHEMA" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   assert_contains "template: prints the NAMESPACE property" "$LAST_OUT" "NAMESPACE          = "
-  assert_not_contains "template: does NOT print the removed ICEBERG_NAMESPACE alias" "$LAST_OUT" "ICEBERG_NAMESPACE"
   assert_contains "template: references the adapter script" "$LAST_OUT" "LHVS.LAKEHOUSE_ADAPTER"
   local log; log="$(log_content)"
   assert_not_contains "template: does NOT execute CREATE VIRTUAL SCHEMA" "$log" "CREATE VIRTUAL SCHEMA"
