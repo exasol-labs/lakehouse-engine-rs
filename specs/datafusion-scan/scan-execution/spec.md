@@ -86,12 +86,13 @@ column JSON rendering, and EMITS-type coercion — is owned by
 
 ### Scenario: Scan registers only its assigned files and returns matching rows
 
-* *GIVEN* a scan input row carrying TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical Iceberg schema, projection, filter, limit, storage credentials, the Iceberg table root, and tuning knobs) and a per-shard files argument listing specific Iceberg Parquet files in MinIO, each optionally carrying its associated positional-delete file references
+* *GIVEN* a scan input row carrying TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical schema, projection, filter, limit, storage credentials, the table root, and tuning knobs) and a per-shard files argument listing specific Parquet data files in MinIO, each optionally carrying its associated positional-delete file references
 * *AND* a projection naming a subset of columns
 * *WHEN* the scan UDF processes that input row
 * *THEN* the UDF SHALL read the common spec from the first input argument and the file list from the second, and reconstitute a single scan spec whose files (and their delete references) come from the second argument and whose every other field comes from the first (only serialized bytes crossing the `.so` boundary — both arguments are VARCHAR JSON)
-* *AND* the UDF SHALL resolve each file entry to an absolute URI and register ONLY those files through the custom table provider whose declared schema is the logical Iceberg schema, and MUST NOT resolve or discover any additional files from the catalog
+* *AND* the UDF SHALL resolve each file entry to an absolute URI and register ONLY those files through the custom table provider whose declared schema is the logical schema, and MUST NOT resolve or discover any additional files from the catalog
 * *AND* the UDF SHALL emit one output row per surviving source row containing only the projected columns
+* *AND* the UDF SHALL run this same registration path for a spec produced by EITHER format reader, because the table root and the logical schema are neutral fields both populate
 
 ### Scenario: Filter predicate restricts the emitted rows
 

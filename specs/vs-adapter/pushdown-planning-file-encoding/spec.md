@@ -24,7 +24,7 @@ root when the root is an actual prefix of the file's path, or as an absolute URI
 
 ### Scenario: Table root is carried once and paths under it are emitted relative
 
-* *GIVEN* a resolved data-file list in which every data-file URI lies under the Iceberg table root (`table.metadata().location()`)
+* *GIVEN* a resolved data-file list in which every data-file URI lies under the table root the format reader resolved for that table
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL carry the table root exactly once in the shard-invariant common spec argument
 * *AND* for each file whose URI begins with the table root, the adapter SHALL strip that root prefix and emit only the remaining relative path in the per-shard argument, so the repeated table-location prefix is shipped once rather than once per file
@@ -32,11 +32,12 @@ root when the root is an actual prefix of the file's path, or as an absolute URI
 
 ### Scenario: A data-file path not under the table root is carried as an absolute path
 
-* *GIVEN* a resolved data-file list containing at least one data-file URI that does NOT lie under the Iceberg table root (for example a `write.data.path` / `write.object-storage.enabled` hash-injected, migrated, or Databricks layout)
+* *GIVEN* a resolved data-file list containing at least one data-file URI that does NOT lie under the table root (on the Iceberg side, for example a `write.data.path` / `write.object-storage.enabled` hash-injected, migrated, or Databricks layout)
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the adapter SHALL emit that file's full absolute URI unchanged in the per-shard argument, stripping the table root ONLY from paths for which the root is an actual prefix
 * *AND* the adapter MUST NOT strip a partial or non-prefix match, so no absolute path is ever corrupted into an unresolvable relative path
 * *AND* a per-shard payload MAY mix relative entries (paths under the root) and absolute entries (paths not under the root) within the same query
+* *AND* the strip decision SHALL be made from the path and the root ALONE, so one path and root produce one encoding whichever format reader resolved them
 
 ### Scenario: Delete-file paths use the same relative/absolute encoding as data files
 

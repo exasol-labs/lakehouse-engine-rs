@@ -22,12 +22,13 @@ The configured namespace is the `catalog.schema` supplied as the `NAMESPACE` vir
 
 ### Scenario: Create virtual schema enumerates every table in the configured Unity Catalog namespace
 
-* *GIVEN* a Unity Catalog reachable through the CONNECTION named by `CATALOG_CONNECTION` and a createVirtualSchema request whose `CATALOG_KIND` is `UNITY_CATALOG` and whose `ICEBERG_NAMESPACE` property names a `catalog.schema`
+* *GIVEN* a Unity Catalog reachable through the CONNECTION named by `CATALOG_CONNECTION` and a createVirtualSchema request whose `CATALOG_KIND` is `UNITY_CATALOG` and whose `NAMESPACE` property names a `catalog.schema`
 * *WHEN* Exasol sends the createVirtualSchema request
 * *THEN* the adapter SHALL list every table in that schema by calling the shared `CatalogClient` list operation on the constructed Unity Catalog client, and SHALL return one virtual table per listed DELTA BASE table — an entry whose `table_type` is `MANAGED` or `EXTERNAL` AND whose `data_source_format` is `DELTA`
 * *AND* the adapter SHALL exclude from the returned virtual tables every other listed entry — a view, a base table whose `data_source_format` is not `DELTA`, or an entry of any other `table_type` — and MUST NOT record an excluded entry in `TABLE_MAP`, so no non-Delta or non-base entry becomes a queryable virtual table
 * *AND* the adapter SHALL name each returned virtual table by flattening the segments below the configured namespace plus the table name with `__` and uppercasing the result through the shared case-fold site
 * *AND* the adapter SHALL source every listed entry's columns, `table_type`, and `data_source_format` from the single paginated `GET /tables` list sweep — issuing no per-table `GET /tables/{full_name}`, reading no Delta transaction log, and resolving no snapshot — because this path stops at catalog metadata
+* *AND* the namespace property SHALL be the SAME `NAMESPACE` property the Iceberg REST kind reads, so neither kind carries a namespace property of its own
 
 ### Scenario: Create virtual schema includes managed and external Delta base tables, including a shallow clone
 

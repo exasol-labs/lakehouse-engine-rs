@@ -40,10 +40,11 @@ Extends `datafusion-scan/scan-execution` with node-local broadcast inner equi-jo
 
 * *GIVEN* a reconstituted join scan spec
 * *WHEN* the scan UDF runs for that invocation
-* *THEN* the UDF SHALL register the fact side's assigned files and the dimension side's full file list as two separate tables in ONE DataFusion session, each with its declared logical Iceberg schema and each exposing its columns under the Exasol-facing (uppercased) names the pushed condition and projection reference
+* *THEN* the UDF SHALL register the fact side's assigned files and the dimension side's full file list as two separate tables in ONE DataFusion session, each with its declared logical schema and each exposing its columns under the Exasol-facing (uppercased) names the pushed condition and projection reference
 * *AND* the UDF SHALL register each side's table against that side's OWN storage backend, so the redaction set guarding that side's read errors holds that side's credential values rather than the other side's
 * *AND* the UDF SHALL execute an inner equi-join of the two registered tables on the rendered join condition
 * *AND* the UDF MUST NOT resolve or discover any file beyond the two file lists carried in the spec
+* *AND* the UDF SHALL register a side whose spec a Delta reader produced by the SAME path it registers an Iceberg-produced one, reading only the neutral logical schema and file list carried in the spec
 
 ### Scenario: Each join side reads its files through its own storage credential
 

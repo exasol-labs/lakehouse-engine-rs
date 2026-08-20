@@ -73,15 +73,16 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 
 * *GIVEN* a virtual schema over a namespace whose tables are backed by MinIO
 * *AND* a `pushdown` request whose `from` clause is a `join` node over exactly two involved tables joined by an equi-condition
-* *AND* the smaller side's Iceberg-metadata byte size is at or below the broadcast threshold
+* *AND* the smaller side's table-metadata byte size is at or below the broadcast threshold
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL resolve BOTH tables' Iceberg snapshot, data-file list, per-file byte size, logical schema, and effective storage exactly once, recovering each table's original-cased Iceberg identifier from the schema-metadata mapping by its involved-table name
+* *THEN* the adapter SHALL resolve BOTH sides through the SAME format-reader seam the single-table scan uses (`vs-adapter/pushdown-format-neutral-resolution`) — obtaining each side's data-file list, per-file byte size, logical schema, table root, and effective storage exactly once — recovering each table's original-cased catalog identifier from the schema-metadata mapping by its involved-table name
 * *AND* the adapter SHALL designate the larger side as the sharded fact side (its file list partitioned into G byte-balanced work-unit shards and driven through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor exactly as the single-table path does) and the smaller side as the replicated dimension side
 * *AND* the adapter SHALL carry the dimension side's FULL file list, table root, logical schema, and its OWN effective storage backend in the shard-invariant common spec's join block (spliced once as the `LAKEHOUSE_SCAN` scalar UDF's first argument), and the fact side's per-shard file subset flowed through the distributor as the second argument
 * *AND* the whole-spec `storage` value SHALL be the FACT side's own effective storage, so each side of the emitted spec names the storage backend resolved for that side's own table location and neither side's backend is dropped
 * *AND* the generated scan-driving SQL SHALL drive the `LAKEHOUSE_SCAN` SCALAR EMIT UDF so that each shard invocation joins its fact-file subset against the full replicated dimension side node-locally, with no cross-shard exchange, and with NO `SELECT * FROM (...)` wrapper for an UNORDERED request; an ORDERED request carries the outer wrapper this feature's ordering scenario specifies (issue #307)
 * *AND* the adapter MUST NOT read either side's Parquet row data in the planning layer — only file-level metadata and per-side storage credentials cross into the scan spec
 * *AND* the dimension side's backend SHALL be serialized ONCE inside the shard-invariant common blob and MUST NOT be repeated per shard, exactly as the fact side's already is
+* *AND* a join whose two sides are DELTA tables reached through Unity Catalog SHALL take this same broadcast path with no Iceberg-specific step, because the resolution seam and the broadcast decision read only neutral resolved values
 
 ### Scenario: A bare LIMIT over a broadcast-eligible join is served by the broadcast path with a per-shard post-join cap
 
@@ -124,15 +125,16 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 * *AND* the bare-`LIMIT`-with-non-zero-offset arm SHALL be a structural guard rather than a reachable branch, because a non-zero `limit.offset` never arrives without a non-empty `orderBy` (`vs-adapter/pushdown-planning-order-by-capability`)
 * *AND* an aggregate select item, a non-empty `groupBy`, `aggregationType == "group_by"`, and a non-null `having` SHALL each continue to force the unified unaccelerated fallback unconditionally, unchanged by this delta
 
-### Scenario: Small-side selection uses Iceberg metadata and the broadcast threshold
+### Scenario: Small-side selection uses table-format metadata and the broadcast threshold
 
 * *GIVEN* an inner equi-join `pushdown` request over two involved tables
 * *WHEN* the adapter evaluates broadcast eligibility
-* *THEN* the adapter SHALL compute each side's byte size from its Iceberg manifest `file_size_in_bytes` sum for the resolved snapshot, without opening any Parquet file
+* *THEN* the adapter SHALL compute each side's byte size as the sum of that side's resolved per-file byte sizes, read from the table's own format metadata — an Iceberg manifest's `file_size_in_bytes` for the resolved snapshot, a Delta `add` action's `size` for the resolved version — without opening any Parquet file
 * *AND* the adapter SHALL choose the side with the smaller metadata byte size as the broadcast (dimension) side and the other as the sharded (fact) side
 * *AND* when the smaller side's byte size is at or below `JOIN_BROADCAST_MAX_BYTES` the adapter SHALL plan the broadcast fan-out
 * *AND* when the smaller side's byte size exceeds `JOIN_BROADCAST_MAX_BYTES` the adapter SHALL take the unified unaccelerated fallback instead
 * *AND* the threshold SHALL be read from the persisted adapter note `JOIN_BROADCAST_MAX_BYTES`, defaulting to 134217728 when absent or unparseable
+* *AND* the sum SHALL saturate, so a side whose byte total overflows `u64` is clamped to `u64::MAX` and is therefore never chosen as the broadcast side
 
 ### Scenario: Broadcast join projection and filter are rendered per involved table
 
