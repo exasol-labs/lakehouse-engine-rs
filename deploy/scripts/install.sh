@@ -1265,7 +1265,7 @@ smoke_test_sql() {
 download_release_asset() {
   local repo="$1" tag="$2" asset_name="$3" dest_path="$4"
   local dl_err
-  if ! dl_err="$(curl -fsSL -o "$dest_path" \
+  if ! dl_err="$(curl -fsSL --proto =https -o "$dest_path" \
       "https://github.com/$repo/releases/download/$tag/$asset_name" </dev/null 2>&1)"; then
     err "failed to download asset '$asset_name' from $repo release '$tag': $dl_err"
     return 1

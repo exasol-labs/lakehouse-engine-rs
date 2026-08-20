@@ -124,6 +124,7 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--profile <name>` | An `exapump` named profile. One of three connectivity flags. Give exactly one. |
 | `--dsn <dsn>` | A direct `exapump` DSN. You can set `EXAPUMP_DSN` instead. |
 | `--host <host:port> --user <u> --password <p>` | A direct connection. `--host` must include the port. There is no separate `--port` flag. |
+| `--deployment <name>` | Target an Exasol Personal deployment by name. Resolves connection from `~/.exasol/personal/deployments/<name>/`. Cannot be combined with `--profile`, `--dsn`, `--host`, or `--account-id`/`--database-id`. Requires `jq`. |
 | `--account-id <id>` | SaaS target only. SaaS account ID, from the SaaS web console. |
 | `--database-id <id>` | SaaS target only. SaaS database ID, from the SaaS web console. |
 | `--staging` | SaaS target only. Targets `cloud-staging.exasol.com` instead of `cloud.exasol.com`. |
