@@ -193,9 +193,9 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
 /// Every field is resolved ONCE per query in the VS planning layer, through the
 /// same `TableScanResolver` seam the single-table scan uses — never per shard
 /// and never per node (mission.md "resolve metadata once per query"). `total_bytes`
-/// is the sum of every file's `file_size_in_bytes` (the catalog-manifest byte
-/// size, NO Parquet read), the quantity the broadcast threshold is evaluated
-/// against.
+/// is the sum of every file's resolved size (`FileEntry::size` — the Iceberg
+/// manifest's `file_size_in_bytes` or the Delta `add` action's `size`, NO
+/// Parquet read), the quantity the broadcast threshold is evaluated against.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedJoinSide {
     /// The Exasol virtual table name (a detected join leaf).
@@ -205,7 +205,7 @@ pub(crate) struct ResolvedJoinSide {
     /// The table's storage root; empty ⇒ every `files` path is absolute.
     pub table_root: String,
     /// This side's FULL file list as [`FileEntry`] values (path,
-    /// `file_size_in_bytes`, and any associated positional-delete files). Deletes
+    /// `FileEntry::size`, and any associated positional-delete files). Deletes
     /// are resolved once here — the same resolver seam the single-table scan
     /// uses — and travel with the side so the scan applies them per side.
     pub files: Vec<FileEntry>,
@@ -221,7 +221,7 @@ pub(crate) struct ResolvedJoinSide {
     /// [`crate::scan::spec::CommonScanSpec::partition_columns`]. Empty on every
     /// Iceberg side.
     pub partition_columns: Vec<String>,
-    /// Sum of every file's `file_size_in_bytes` — the broadcast-threshold metric.
+    /// Sum of every file's `FileEntry::size` — the broadcast-threshold metric.
     pub total_bytes: u64,
     /// The columns THIS side's format reader declined to map, each with its reason.
     /// Empty on every Iceberg side. Carried per side rather than merged across the
@@ -266,7 +266,7 @@ impl ResolvedJoinSide {
 }
 
 /// The outcome of resolving BOTH sides of an eligible inner equi-join once and
-/// deciding broadcast eligibility from Iceberg-manifest byte sizes.
+/// deciding broadcast eligibility from each side's total `FileEntry::size`.
 ///
 /// Both sides are always carried fully resolved: the broadcast path shards `fact`
 /// and replicates `dimension`; the unaccelerated fallback scans BOTH sides through
@@ -277,7 +277,7 @@ impl ResolvedJoinSide {
 ///
 /// # Edge cases
 ///
-/// - **Self-join** (both sides the same Iceberg table): resolved and sized like
+/// - **Self-join** (both sides the same table): resolved and sized like
 ///   any other pair — both sides carry identical file lists and equal byte totals,
 ///   so the tie-break makes the LEFT side the dimension. Broadcasting a table
 ///   against itself is a *correct* inner join (every fact-shard row is matched
@@ -306,14 +306,14 @@ pub(crate) struct JoinSides {
 /// Choose the fact (sharded) and dimension (broadcast) roles from two resolved
 /// sides and gate broadcast eligibility on the dimension's byte size.
 ///
-/// The SMALLER side by total Iceberg-manifest bytes is the dimension; the larger
+/// The SMALLER side by total resolved file bytes is the dimension; the larger
 /// is the fact. On an exact byte-size tie the first argument (`a`) becomes the
 /// dimension — deterministic and arbitrary, since equal-sized candidates are
 /// interchangeable. The join is broadcast-eligible iff the chosen dimension's
 /// total bytes are at or below `join_broadcast_max_bytes`.
 ///
 /// This is the pure, catalog-free core of side selection so it is unit-testable
-/// without a live Iceberg catalog; [`plan_join`] resolves each side and delegates
+/// without a live catalog; [`plan_join`] resolves each side and delegates
 /// here for the two-table broadcast role/threshold decision.
 pub(super) fn select_broadcast_sides(
     a: ResolvedJoinSide,

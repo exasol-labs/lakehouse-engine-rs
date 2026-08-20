@@ -1,11 +1,11 @@
 # Feature: DataFusion Scan Execution — Broadcast Join
 
-Extends `datafusion-scan/scan-execution` with node-local broadcast inner equi-join execution. A join scan invocation receives, in addition to its per-shard fact-file subset, the FULL dimension-side file list carried once in the shard-invariant common spec. The UDF registers both sides as Iceberg tables in ONE DataFusion session, executes the inner equi-join with the pushed projection, filter, and LIMIT, and streams the joined rows back as Arrow IPC batches. It holds no state and discovers no files of its own.
+Extends `datafusion-scan/scan-execution` with node-local broadcast inner equi-join execution. A join scan invocation receives, in addition to its per-shard fact-file subset, the FULL dimension-side file list carried once in the shard-invariant common spec. The UDF registers both sides as tables in ONE DataFusion session, executes the inner equi-join with the pushed projection, filter, and LIMIT, and streams the joined rows back as Arrow IPC batches. It holds no state and discovers no files of its own.
 
 ## Background
 
 * Only SDK `Value` types and Arrow IPC byte buffers cross the `.so` boundary; no typed Arrow value does.
-* Both sides register from the file lists carried in the scan spec — the fact side from the per-shard argument, the dimension side from the common-spec join block — each declared against its own logical Iceberg schema.
+* Both sides register from the file lists carried in the scan spec — the fact side from the per-shard argument, the dimension side from the common-spec join block — each declared against its own logical schema.
 * The DataFusion memory pool is sized from the per-instance memory limit exactly as the raw-scan path does; the bounded dimension side is the hash-join build side.
 * Storage access keys and secret keys MUST NOT appear in any error message.
 * **This delta fixes issue #294: a pushed-down broadcast join read BOTH tables through the FACT side's storage credential.** `join_fan_out_scan_spec` set the whole spec's single `storage` value from the fact side and `JoinSpec` carried no storage at all, so the dimension side's own credential — already resolved per side, per table location, by `resolve_vended_storage` — was discarded. Against a catalog that downscopes a vended credential to the table it loaded, the fact side's credential is DENIED on the dimension side's prefix, so the join fails to read. `JoinSpec`'s recorded claim that "credentials never appear here" and the object-store layer's "same credentials, same size index" comment are both superseded by this delta.
@@ -40,10 +40,11 @@ Extends `datafusion-scan/scan-execution` with node-local broadcast inner equi-jo
 
 * *GIVEN* a reconstituted join scan spec
 * *WHEN* the scan UDF runs for that invocation
-* *THEN* the UDF SHALL register the fact side's assigned files and the dimension side's full file list as two separate tables in ONE DataFusion session, each with its declared logical Iceberg schema and each exposing its columns under the Exasol-facing (uppercased) names the pushed condition and projection reference
+* *THEN* the UDF SHALL register the fact side's assigned files and the dimension side's full file list as two separate tables in ONE DataFusion session, each with its declared logical schema and each exposing its columns under the Exasol-facing (uppercased) names the pushed condition and projection reference
 * *AND* the UDF SHALL register each side's table against that side's OWN storage backend, so the redaction set guarding that side's read errors holds that side's credential values rather than the other side's
 * *AND* the UDF SHALL execute an inner equi-join of the two registered tables on the rendered join condition
 * *AND* the UDF MUST NOT resolve or discover any file beyond the two file lists carried in the spec
+* *AND* the UDF SHALL register a side whose spec a Delta reader produced by the SAME path it registers an Iceberg-produced one, reading only the neutral logical schema and file list carried in the spec
 
 ### Scenario: Each join side reads its files through its own storage credential
 

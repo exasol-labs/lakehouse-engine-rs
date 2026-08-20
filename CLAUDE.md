@@ -63,7 +63,7 @@ or "spec" prefix, even though only spec deltas are committed so far.
 lakehouse query engine: technically an Exasol Virtual Schema, but it runs the DataFusion engine on
 the node, in place, for querying Iceberg / Databricks from Exasol SQL.
 
-## Iceberg specification compliance
+## Iceberg and Delta Lake specification compliance
 
 Any feature planned via `/speq:plan` that touches scanning, pushdown, or schema/type handling MUST
 be checked against the Apache Iceberg table spec (https://iceberg.apache.org/spec/) during
@@ -72,7 +72,18 @@ spec must either be fixed in the same plan or recorded as an explicit, accuratel
 exception — a GitHub issue cited inline in the spec (see the `(#27)` pattern in
 `specs/datafusion-scan/scan-execution-field-id-projection/spec.md`); it must never be a silent gap.
 A deviation driven by an Exasol target-type limitation (e.g. no struct/list/map types) is not a
-gap — but it must still be named as a deliberate trade-off in the spec, not left unstated.
+gap for either the Iceberg or the Delta spec — but it must still be named as a deliberate
+trade-off in the spec, not left unstated.
+
+The same obligation applies to Delta: any feature planned via `/speq:plan` that touches Delta
+scanning, pushdown, or schema/type handling MUST be checked against the Delta Lake protocol
+(https://github.com/delta-io/delta/blob/master/PROTOCOL.md) during planning — quote the relevant normative section
+(e.g. `§ Reader Requirements for Type Widening`), don't rely on memory. A known deviation from the
+protocol must either be fixed in the same plan or recorded as an explicit, accurately-scoped
+tracked exception — a GitHub issue cited inline in the spec, same convention as the Iceberg rule
+above (see `specs/datafusion-scan/type-relaxation/spec.md` and
+`specs/vs-adapter/delta-reader-feature-gating/spec.md` for the citation format); it must never be
+a silent gap.
 
 ## Exasol / tooling
 
@@ -267,9 +278,9 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
 - Build the UDF `.so` only inside `rust:1.94-bookworm` (glibc 2.36, matches the SLC) via
   `make cross-musl-udf-build`. **Never `cargo build --release` on the host** — it writes a
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
-- Two library crates, one `.so`: `crates/lakehouse-engine` (Iceberg file planning, scan-spec wire
-  format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan) depends on
-  `crates/lakehouse-catalog` (Iceberg REST catalog access — `CatalogSession`, auth, namespace
+- Two library crates, one `.so`: `crates/lakehouse-engine` (Iceberg + Delta file planning, scan-spec
+  wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan) depends on
+  `crates/lakehouse-catalog` (Iceberg REST + Unity Catalog access — `CatalogSession`, auth, namespace
   enumeration, vended-storage resolution, SigV4 signing). The catalog crate compiles into the
   engine's cdylib, so one `.so` still exports **both** entry points (VS adapter + DataFusion scan
   SET UDF) — `language-container-rs` 0.14.0 supports multiple entry points per `.so`.

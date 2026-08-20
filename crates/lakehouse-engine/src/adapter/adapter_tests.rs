@@ -92,12 +92,12 @@ fn merge_set_properties_new_wins_and_null_unsets() {
     let req = serde_json::json!({
         "type": "setProperties",
         "properties": {
-            "ICEBERG_NAMESPACE": "new_ns",
+            "NAMESPACE": "new_ns",
             "ALLOW_HTTP": null,
         },
         "schemaMetadataInfo": {
             "properties": {
-                "ICEBERG_NAMESPACE": "old_ns",
+                "NAMESPACE": "old_ns",
                 "ALLOW_HTTP": "true",
                 "CATALOG_CONNECTION": "keep_me",
             }
@@ -106,7 +106,7 @@ fn merge_set_properties_new_wins_and_null_unsets() {
     let merged = merge_set_properties(&req);
 
     // Request value wins over the persisted value.
-    assert_eq!(nonempty_str(&merged, "ICEBERG_NAMESPACE"), Some("new_ns"));
+    assert_eq!(nonempty_str(&merged, "NAMESPACE"), Some("new_ns"));
     // A null request value removes the persisted property entirely.
     assert!(
         merged.get("ALLOW_HTTP").is_none(),
@@ -156,7 +156,7 @@ impl UdfContext for ConnResolvingCtx {
 
 /// [human-requested, PR #153 review, adversarial-review finding A2] A
 /// `setProperties` request that null-unsets a required property
-/// (`ICEBERG_NAMESPACE`) must fail with the normal required-property
+/// (`NAMESPACE`) must fail with the normal required-property
 /// error — never a panic, and never a silent fallback to the stale
 /// persisted value. `merge_set_properties` on its own only proves the key
 /// is removed from the merged map; this drives the null-unset through the
@@ -167,11 +167,11 @@ fn set_properties_null_unset_required_property_errors_not_panic() {
     let req = serde_json::json!({
         "type": "setProperties",
         "properties": {
-            "ICEBERG_NAMESPACE": null,
+            "NAMESPACE": null,
         },
         "schemaMetadataInfo": {
             "properties": {
-                "ICEBERG_NAMESPACE": "old_ns",
+                "NAMESPACE": "old_ns",
                 "CATALOG_CONNECTION": "MY_CONN",
             }
         },
@@ -180,13 +180,37 @@ fn set_properties_null_unset_required_property_errors_not_panic() {
     let err = dispatch(&mut ConnResolvingCtx, &req)
         .expect_err("null-unsetting a required property must error, not succeed");
 
+    let expected = format!("property '{PROP_NAMESPACE}' is required");
     assert!(
-        err.to_string().contains(PROP_ICEBERG_NAMESPACE),
-        "expected the required-property error to name '{PROP_ICEBERG_NAMESPACE}', got: {err}"
+        err.to_string().contains(&expected),
+        "expected the required-property error '{expected}', got: {err}"
     );
+}
+
+/// A `createVirtualSchema` request supplying only the old, now-removed
+/// `ICEBERG_NAMESPACE` alias — and no `NAMESPACE` — must fail with the
+/// normal required-property error naming `NAMESPACE`. Pins the no-alias
+/// contract: if an alias for the renamed property is ever reintroduced,
+/// this request would satisfy the `NAMESPACE` requirement and `dispatch`
+/// would succeed, which trips `expect_err` below and fails this test.
+#[test]
+fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
+    let req = serde_json::json!({
+        "type": "createVirtualSchema",
+        "properties": {
+            "CATALOG_CONNECTION": "MY_CONN",
+            "ICEBERG_NAMESPACE": "old_ns",
+        },
+    });
+
+    let err = dispatch(&mut ConnResolvingCtx, &req).expect_err(
+        "supplying only the old ICEBERG_NAMESPACE alias must not satisfy the NAMESPACE requirement",
+    );
+
+    let expected = format!("property '{PROP_NAMESPACE}' is required");
     assert!(
-        err.to_string().contains("is required"),
-        "expected handle_create_virtual_schema's normal required-property error, got: {err}"
+        err.to_string().contains(&expected),
+        "expected the required-property error '{expected}', got: {err}"
     );
 }
 

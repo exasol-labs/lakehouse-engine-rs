@@ -15,7 +15,7 @@
 //! the columns by hand keeps the whole dev graph on a single arrow-58 tree.
 //!
 //! Idempotent: a table that already has data files is skipped. Scale factor via
-//! `TPCH_SCALE` (default 0.3, ~300MB); target namespace via `ICEBERG_NAMESPACE`
+//! `TPCH_SCALE` (default 0.3, ~300MB); target namespace via `NAMESPACE`
 //! (default `tpch`). Catalog/MinIO host-side URLs come from `common::stack`.
 #![cfg(feature = "exasol-e2e")]
 
@@ -432,7 +432,7 @@ async fn load_tpch() -> Result<()> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.3);
-    let namespace = std::env::var("ICEBERG_NAMESPACE").unwrap_or_else(|_| "tpch".to_string());
+    let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "tpch".to_string());
     // Number of Parquet files for the big tables (lineitem, orders). >1 makes the
     // adapter's GROUP BY shard_key fan-out (one shard per file) observable. Small
     // tables stay single-file. tpchgen's (scale, part, N) yields N disjoint parts.

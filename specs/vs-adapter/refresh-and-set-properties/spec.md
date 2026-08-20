@@ -46,11 +46,11 @@ The Exasol virtual-schema JSON protocol sends a `refresh` request for `ALTER VIR
 
 ### Scenario: Set properties overrides persisted properties and re-enumerates
 
-* *GIVEN* a virtual schema created with property `ICEBERG_NAMESPACE` set to one namespace, whose persisted properties arrive in `schemaMetadataInfo.properties`
-* *WHEN* Exasol sends a request of type `setProperties` (the literal protocol string for `ALTER VIRTUAL SCHEMA ... SET`) whose `properties` object sets `ICEBERG_NAMESPACE` to a different namespace
+* *GIVEN* a virtual schema created with property `NAMESPACE` set to one namespace, whose persisted properties arrive in `schemaMetadataInfo.properties`
+* *WHEN* Exasol sends a request of type `setProperties` (the literal protocol string for `ALTER VIRTUAL SCHEMA ... SET`) whose `properties` object sets `NAMESPACE` to a different namespace
 * *THEN* the adapter SHALL treat the request's `properties` as overriding the persisted `schemaMetadataInfo.properties` on conflict — the newly set value wins — and a `null` value in the request's `properties` SHALL unset that property
 * *AND* the adapter SHALL re-enumerate using the effective merged properties and return a JSON response of type `setProperties` whose `schemaMetadata` describes the tables of the newly targeted namespace
-* *AND* a `setProperties` request that leaves a required property (`ICEBERG_NAMESPACE` or `CATALOG_CONNECTION`) unset SHALL return a clear error naming the missing property
+* *AND* a `setProperties` request that leaves a required property (`NAMESPACE` or `CATALOG_CONNECTION`) unset SHALL return a clear error naming the missing property
 
 ### Scenario: Refresh and set properties redact credentials on catalog failure
 

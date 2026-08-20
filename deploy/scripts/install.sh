@@ -1441,7 +1441,7 @@ print_next_step_template() {
   emit "CREATE VIRTUAL SCHEMA <MY_LAKEHOUSE>"
   emit "USING $schema.LAKEHOUSE_ADAPTER WITH"
   emit "  CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'"
-  emit "  ICEBERG_NAMESPACE  = '<namespace>'"
+  emit "  NAMESPACE          = '<namespace>'"
   emit "  ALLOW_HTTP         = 'false';"
 }
 

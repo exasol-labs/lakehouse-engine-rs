@@ -343,7 +343,7 @@ fn vs_table(glue_table: &str) -> String {
 }
 
 /// The Iceberg namespace of a `namespace.table` identifier (everything before the
-/// trailing table segment), used as the `ICEBERG_NAMESPACE` VS property.
+/// trailing table segment), used as the `NAMESPACE` VS property.
 fn glue_namespace(glue_table: &str) -> &str {
     glue_table.rsplit_once('.').map_or(glue_table, |(ns, _)| ns)
 }
@@ -360,7 +360,7 @@ fn setup_cloud_vs(conn: &mut ExaConn, env: &CloudEnv, conn_name: &str, vs_name: 
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
   CATALOG_CONNECTION = '{conn_name}'
-  ICEBERG_NAMESPACE  = '{}'"#,
+  NAMESPACE  = '{}'"#,
         glue_namespace(&env.glue_table)
     ));
 }
@@ -380,7 +380,7 @@ fn setup_cloud_vs_vended(conn: &mut ExaConn, env: &CloudEnv) {
         r#"CREATE VIRTUAL SCHEMA {CLOUD_VS_NAME}_VENDED
 USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
   CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_VENDED}'
-  ICEBERG_NAMESPACE  = '{}'"#,
+  NAMESPACE  = '{}'"#,
         glue_namespace(&env.glue_table)
     ));
 }
@@ -838,7 +838,7 @@ fn catalog_token_oauth_auth_resolves_files_e2e() {
         r#"CREATE VIRTUAL SCHEMA {auth_vs_name}
 USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
   CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_AUTH}'
-  ICEBERG_NAMESPACE  = '{namespace}'"#
+  NAMESPACE  = '{namespace}'"#
     ));
 
     let table_part = env

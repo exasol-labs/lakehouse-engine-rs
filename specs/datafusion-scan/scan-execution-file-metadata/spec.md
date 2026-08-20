@@ -81,11 +81,12 @@ the same no-HEAD guarantee to the associated positional-delete files.
 
 ### Scenario: Relative paths resolve against the table root and absolute paths pass through
 
-* *GIVEN* a scan invocation whose common spec carries a non-empty Iceberg table root and whose per-shard files argument mixes relative entries (paths under that root) with at least one absolute entry (a path not under the root, carrying its own `://` scheme)
+* *GIVEN* a scan invocation whose common spec carries a non-empty table root and whose per-shard files argument mixes relative entries (paths under that root) with at least one absolute entry (a path not under the root, carrying its own `://` scheme)
 * *WHEN* the scan UDF resolves its assigned files for registration
 * *THEN* the UDF SHALL join each relative entry onto the table root (normalizing the boundary `/`) to form the absolute URI, and SHALL pass each already-absolute entry through unchanged
 * *AND* the set of registered absolute file URIs SHALL equal the original resolved data-file URIs the adapter partitioned into this shard
 * *AND* when the common spec carries an empty table root, the UDF SHALL treat every entry as absolute and join none of them
+* *AND* this rule SHALL apply to a spec produced by EITHER format reader, because the table root is a neutral field both populate
 
 ### Scenario: Delete files also carry their size and incur no per-file HEAD
 
@@ -108,7 +109,7 @@ the same no-HEAD guarantee to the associated positional-delete files.
 
 ### Scenario: Delete-file relative and absolute paths resolve like data-file paths
 
-* *GIVEN* a scan invocation whose common spec carries a non-empty Iceberg table root and whose per-shard files argument mixes relative delete-file entries (paths under that root) with at least one absolute delete-file entry (a path not under the root)
+* *GIVEN* a scan invocation whose common spec carries a non-empty table root and whose per-shard files argument mixes relative delete-file entries (paths under that root) with at least one absolute delete-file entry (a path not under the root)
 * *WHEN* the scan UDF resolves a data file's associated delete files for reading
 * *THEN* the UDF SHALL join each relative delete-file entry onto the table root to form its absolute URI and SHALL pass each already-absolute delete-file entry through unchanged, exactly as it does for data-file paths
 * *AND* when the common spec carries an empty table root, the UDF SHALL treat every delete-file entry as absolute and join none of them

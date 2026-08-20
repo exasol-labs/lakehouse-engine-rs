@@ -56,7 +56,7 @@ pub(crate) async fn list_namespace_tables(
 ) -> Result<Vec<TableIdent>, UdfError> {
     let ns_ident = NamespaceIdent::from_vec(configured_ns.to_vec()).map_err(|e| {
         UdfError::User(format!(
-            "invalid ICEBERG_NAMESPACE '{}': {}",
+            "invalid namespace '{}': {}",
             configured_ns.join("."),
             e
         ))

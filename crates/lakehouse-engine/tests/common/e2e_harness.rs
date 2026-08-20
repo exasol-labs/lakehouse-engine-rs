@@ -285,7 +285,7 @@ pub fn create_virtual_schema_with_password(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
-  ICEBERG_NAMESPACE   = '{namespace}'
+  NAMESPACE   = '{namespace}'
   ALLOW_HTTP          = 'true'{parallelism_clause}{join_clause}"#,
         vs_name = props.vs_name,
         catalog_conn_name = props.catalog_conn_name,

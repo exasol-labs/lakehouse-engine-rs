@@ -23,7 +23,7 @@ cd "$(dirname "$0")/.."
 [ -f bench/.env ] || { echo "ERROR: bench/.env required"; exit 1; }
 set -a; . bench/.env; set +a
 DSN="exasol://sys:${EXASOL_SYS_PASSWORD}@${EXASOL_HOST}:${LH_EXASOL_PORT:-8563}?validateservercertificate=0"
-NS="${ICEBERG_NAMESPACE:-tpch}"
+NS="${NAMESPACE:-tpch}"
 CORES="${BENCH_NR_OF_CORES:-8}"
 PF="${BENCH_PARALLELISM_FACTOR:-8}"
 KEY=33007128                 # L_ORDERKEY < KEY -> 33,006,459 rows (matches the re-gate VS side)
@@ -44,7 +44,7 @@ recreate_vs() {  # batch_size
   printf '%s' "CREATE VIRTUAL SCHEMA ${VS}
 USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION    = '${CONN}'
-  ICEBERG_NAMESPACE     = '${NS}'
+  NAMESPACE             = '${NS}'
   NR_OF_CORES           = '${CORES}'
   PARALLELISM_FACTOR    = '${PF}'
   DATAFUSION_BATCH_SIZE = '${bs}'" | exapump sql -d "$DSN" >/dev/null 2>&1

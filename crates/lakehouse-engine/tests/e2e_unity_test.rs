@@ -142,7 +142,7 @@ fn create_unity_virtual_schema(conn: &mut ExaConn) {
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION = '{CONN_NAME}'
   CATALOG_KIND       = 'UNITY_CATALOG'
-  ICEBERG_NAMESPACE  = '{UNITY_NAMESPACE}'
+  NAMESPACE  = '{UNITY_NAMESPACE}'
   ALLOW_HTTP         = 'true'"#
     ));
 }
