@@ -360,11 +360,13 @@ jobs:
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
+      # No arch input needed: rust-cache embeds the platform (Linux-arm64) and
+      # the toolchain hash in the key on its own, and it ignores `key:` whenever
+      # `shared-key` is set — don't add one back.
       - name: Cache cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           shared-key: workspace-arm64
-          key: ${{ runner.arch }}
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Run unit tests
