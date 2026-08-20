@@ -193,7 +193,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 `NAMESPACE` exposes **every table in that namespace** as a virtual table. `ALLOW_HTTP =
 'true'` permits plain-HTTP catalog and S3 access. Local MinIO needs this property.
 
-- **AWS Glue, Lakekeeper, and the full credential-JSON reference** are in [Catalogs](catalogs.md).
+- **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
   and more) are in [Tuning](tuning.md).
 
