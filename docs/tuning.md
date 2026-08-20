@@ -24,7 +24,7 @@ All properties belong to `CREATE VIRTUAL SCHEMA` unless the table says otherwise
 | `MEMORY_POOL_FRACTION` | no | `0.6` | Fraction of the per-instance memory limit given to the DataFusion pool. Kept < the engine's 80 % stall threshold. |
 | `INSTANCE_OVERHEAD_MB` | no | `200` | Per-instance overhead subtracted from the reported limit before the pool fraction applies. |
 | `S3_MAX_CONNECTIONS` | no | `AUTO` | Object-store HTTP connection-pool budget per scan instance. `AUTO` derives the value from the cores and the threading mode. See below. |
-| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Byte-size threshold from Iceberg manifest sizes, with no Parquet read. Below this threshold, the engine broadcasts the smaller side of a two-table inner equi-join into every shard. Above it, the engine falls back to an unaccelerated two-scan join. |
+| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Byte-size threshold from each side's total resolved file size (the Iceberg manifest's `file_size_in_bytes` or the Delta `add` action's `size`), with no Parquet read. Below this threshold, the engine broadcasts the smaller side of a two-table inner equi-join into every shard. Above it, the engine falls back to an unaccelerated two-scan join. |
 | `LAKEHOUSE_UDF_DEBUG_LEVEL` | no (env var) | `info` | `debug` emits per-scan phase telemetry. `info` is silent. See below. |
 
 Create these three scripts in the same schema as `LAKEHOUSE_ADAPTER`:
