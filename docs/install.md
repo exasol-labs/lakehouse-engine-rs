@@ -26,10 +26,9 @@ example is a network with no path to GitHub.
   or `exapump profile init`). This is true for BucketFS targets even when you connect with
   `--dsn` or `--host`. The reason: `exapump bucketfs cp` always reads its connection from a
   profile, plus any `--bfs-*` overrides you give.
-- A GitHub token is optional. Both this repo and
-  [`language-container-rs`](https://github.com/exasol-labs/language-container-rs) are public;
-  pass `--github-token`/`GITHUB_TOKEN` only to raise the unauthenticated GitHub API rate limit
-  (60 requests/hour per IP) if you hit it.
+- `jq`, but only if you use `--deployment` to target an Exasol Personal deployment. It parses the
+  deployment descriptor (`deployment.json`) to resolve connection details and backend. SaaS and
+  BucketFS targets don't need it.
 
 ## Install with one command
 
@@ -73,6 +72,33 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
 You still need a configured `exapump` profile for this second form. See
 [Prerequisites](#prerequisites).
 
+### Exasol Personal
+
+Give `--deployment <name>` to target an Exasol Personal deployment by name. Connection details
+and backend (`local` or a cloud provider name) resolve automatically from
+`$HOME/.exasol/personal/deployments/<name>/deployment.json` — no `--profile`, `--dsn`, or `--host`
+needed, and `--deployment` cannot be combined with those flags or with `--account-id`/
+`--database-id`. This path needs `jq` on PATH; see [Prerequisites](#prerequisites).
+
+```bash
+curl -fsSL -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh \
+| bash -s -- --deployment my-local-db
+```
+
+- A **local** deployment (running on this machine) has no BucketFS HTTP endpoint, so the script
+  installs over SSH instead, using the deployment's own node key. Architecture auto-detects from
+  the host's `uname -m` unless you pass `--arch` explicitly — Personal-local on Apple Silicon
+  auto-detects as `aarch64`.
+- A **cloud** deployment (backend other than `local`) uses the existing BucketFS HTTP upload path
+  and needs `--bfs-write-password`, since Exasol Personal provisions no BucketFS password for you:
+
+```bash
+curl -fsSL -H "Accept: application/vnd.github.raw" \
+  https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh \
+| bash -s -- --deployment my-cloud-db --bfs-write-password "$BFSPASS"
+```
+
 ## What the command does
 
 1. It reads your flags and picks the SaaS target or the BucketFS target.
@@ -98,7 +124,7 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--profile <name>` | An `exapump` named profile. One of three connectivity flags. Give exactly one. |
 | `--dsn <dsn>` | A direct `exapump` DSN. You can set `EXAPUMP_DSN` instead. |
 | `--host <host:port> --user <u> --password <p>` | A direct connection. `--host` must include the port. There is no separate `--port` flag. |
-| `--github-token <token>` | Optional, both targets. Raises the unauthenticated GitHub API rate limit. You can set `GITHUB_TOKEN` instead. |
+| `--deployment <name>` | Target an Exasol Personal deployment by name. Resolves connection from `~/.exasol/personal/deployments/<name>/`. Cannot be combined with `--profile`, `--dsn`, `--host`, or `--account-id`/`--database-id`. Requires `jq`. |
 | `--account-id <id>` | SaaS target only. SaaS account ID, from the SaaS web console. |
 | `--database-id <id>` | SaaS target only. SaaS database ID, from the SaaS web console. |
 | `--staging` | SaaS target only. Targets `cloud-staging.exasol.com` instead of `cloud.exasol.com`. |
@@ -111,6 +137,7 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--lakehouse-version <v>` | Both targets. Pins the engine version. Default: latest release. |
 | `--slc-version <v>` | Both targets. Pins the SLC version. Default: latest release. |
 | `--skip-slc` | Both targets. Skips the SLC download and registration. Every other step still runs. |
+| `--arch <x86_64\|aarch64>` | Both targets. Default: `x86_64`. Selects unsuffixed vs `-aarch64`-suffixed release assets. |
 | `--help` | Prints this reference. Needs no network access and no credentials. |
 
 `--account-id` and `--database-id` together select the SaaS target. Neither flag selects the
@@ -255,16 +282,25 @@ This path needs no Docker, no Rust toolchain, and no local build.
 ### 1. Download the release tarball
 
 Every [GitHub Release](https://github.com/exasol-labs/lakehouse-engine-rs/releases) includes a
-prebuilt `lakehouse-engine.tar.gz`. The repo is public, so the plain release-download URL works,
-with no GitHub API call and no token:
+prebuilt tarball for each architecture: `lakehouse-engine.tar.gz` (x86_64) and
+`lakehouse-engine-aarch64.tar.gz` (aarch64). The repo is public, so the plain release-download URL
+works, with no GitHub API call and no token:
 
 ```bash
+# x86_64
 curl -fsSL -o lakehouse-engine.tar.gz \
   "https://github.com/exasol-labs/lakehouse-engine-rs/releases/download/v<VERSION>/lakehouse-engine.tar.gz"
+
+# aarch64
+curl -fsSL -o lakehouse-engine-aarch64.tar.gz \
+  "https://github.com/exasol-labs/lakehouse-engine-rs/releases/download/v<VERSION>/lakehouse-engine-aarch64.tar.gz"
 ```
 
-Pin `<VERSION>` to the release you install. The archive contains the file at
-`udf/liblakehouse_engine.so`.
+Pin `<VERSION>` to the release you install, and download the tarball that matches your Exasol
+host's CPU architecture. The archive contains the file at `udf/liblakehouse_engine.so`. If you
+downloaded the aarch64 tarball, rename it to `lakehouse-engine.tar.gz` before continuing: BucketFS
+names the extracted directory after the archive, so every later step and the `%udf_object` path
+below depend on that exact filename.
 
 ### 2. Upload the tarball to BucketFS
 

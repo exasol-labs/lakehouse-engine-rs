@@ -6,8 +6,7 @@
 # NOT create catalog objects.
 #
 # Distributed one-liner (piped into bash over stdin). Both source repos are public, so no
-# token is required; pass --github-token/GITHUB_TOKEN only to raise the unauthenticated
-# 60-requests/hour GitHub API rate limit:
+# token is required:
 #   curl -fsSL -H "Accept: application/vnd.github.raw" \
 #     https://api.github.com/repos/exasol-labs/lakehouse-engine-rs/contents/deploy/scripts/install.sh \
 #   | bash -s -- --account-id $ACC --database-id $DB --profile staging
@@ -37,13 +36,29 @@ RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///uploads/default/rustslc?lang=rust#b
 # fails with "Path not found".) The bucket DOES appear in the %udf_object / RUST alias strings
 # below, because those are read by the Exasol engine, not by exapump.
 DEFAULT_BFS_BUCKET="default"
+BFS_SERVICE="bfsdefault"
 BFS_SLC_PATH="slc/lakehouse-rustslc.tar.gz"
 BFS_ENGINE_SO_PATH="udf/liblakehouse_engine.so"
+
+DEPLOYMENT_ROOT="$HOME/.exasol/personal/deployments"
+DEPLOYMENT_DESCRIPTOR="deployment.json"
+SECRETS_DESCRIPTOR="secrets.json"
+NODE_KEY_RELATIVE_PATH="local/node_access.pem"
+LOCAL_BACKEND="local"
+PERSONAL_DB_HOST_DEFAULT="127.0.0.1"
+PERSONAL_DB_PORT_DEFAULT="8563"
+PERSONAL_DB_USER_DEFAULT="sys"
+PERSONAL_SSH_USER="root"
+PERSONAL_SSH_HOST="127.0.0.1"
+VM_BUCKETFS_ROOT="/var/lib/exa/bucketfs"
+VM_RECONCILE_TRIES=30
+VM_RECONCILE_POLL_SECONDS=2
+SSH_OPTIONS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+  -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 
 # --- Global state (defaults; parse_args re-seeds arg-derived ones) -----------
 ARG_ACCOUNT_ID=""
 ARG_DATABASE_ID=""
-ARG_GITHUB_TOKEN=""
 ARG_PROFILE=""
 ARG_DSN=""
 ARG_HOST=""
@@ -60,8 +75,15 @@ ARG_BFS_BUCKET="$DEFAULT_BFS_BUCKET"
 ARG_BFS_BUCKET_SET=0
 ARG_BFS_WRITE_PASSWORD=""
 ARG_SKIP_SLC=0
+ARG_ARCH="x86_64"
+ARG_ARCH_SET=0
+ARG_DEPLOYMENT=""
 ARG_HELP=0
 
+DEPLOYMENT_TRANSPORT=""
+DEPLOYMENT_DIR=""
+DEPLOYMENT_SSH_PORT=""
+DEPLOYMENT_KEY_PATH=""
 CONNECTIVITY_MODE=""
 TARGET_MODE=""
 TARGET_SO_UDF_OBJECT=""
@@ -193,69 +215,6 @@ extract_json_string_field() {
   return 1
 }
 
-# Given a GitHub release JSON blob (as returned by GET /releases/latest or /releases/tags/<tag>)
-# and an asset file name, prints that asset's numeric id. Returns 1 if the asset is absent.
-#
-# No jq: GitHub's REST API stably pretty-prints its JSON with a fixed 2-space indent, so each
-# element of the "assets" array is delimited by a line that is exactly a 4-space-indented "{" /
-# "}," pair, and the asset's OWN fields sit at 6-space indent -- one level shallower than a
-# nested object's fields (e.g. "uploader", 8-space indent). Scanning strictly at the 6-space
-# depth means a nested object's own "id" (every asset carries an "uploader" with its own numeric
-# "id") is never mistaken for the asset's id. The scan is bounded to the "assets": [ ... ] block
-# -- entered on the 2-space "assets": [ line and exited on its matching 2-space "]" close --
-# rather than scanning the whole response, so it can't misfire on some other, unrelated
-# array-of-objects field the release schema might grow in the future. Because both
-# "id" and "name" are captured independently per asset block, field order within the block and
-# the order of assets within the array are both irrelevant to correctness.
-extract_asset_id_by_name() {
-  local json="$1" target="$2"
-  local in_assets=0 in_asset=0 id="" name="" line
-  local assets_start_re='^  "assets": \[[[:space:]]*$'
-  local assets_end_re='^  \],?[[:space:]]*$'
-  local asset_open_re='^    \{[[:space:]]*$'
-  local asset_close_re='^    \},?[[:space:]]*$'
-  local id_field_re='^      "id"[[:space:]]*:[[:space:]]*([0-9]+),?[[:space:]]*$'
-  local name_field_re='^      "name"[[:space:]]*:[[:space:]]*"([^"]*)",?[[:space:]]*$'
-
-  while IFS= read -r line; do
-    if [[ "$in_assets" -eq 0 ]]; then
-      [[ "$line" =~ $assets_start_re ]] && in_assets=1
-      continue
-    fi
-    if [[ "$in_asset" -eq 0 ]]; then
-      if [[ "$line" =~ $assets_end_re ]]; then
-        in_assets=0
-        continue
-      fi
-      if [[ "$line" =~ $asset_open_re ]]; then
-        in_asset=1
-        id=""
-        name=""
-      fi
-      continue
-    fi
-    if [[ "$line" =~ $asset_close_re ]]; then
-      if [[ -n "$name" && "$name" == "$target" && -n "$id" ]]; then
-        printf '%s\n' "$id"
-        return 0
-      fi
-      in_asset=0
-      continue
-    fi
-    if [[ "$line" =~ $id_field_re ]]; then
-      id="${BASH_REMATCH[1]}"
-      continue
-    fi
-    if [[ "$line" =~ $name_field_re ]]; then
-      name="${BASH_REMATCH[1]}"
-      continue
-    fi
-  done <<EOF_ASSETS
-$json
-EOF_ASSETS
-  return 1
-}
-
 # --- Credential resolution ---------------------------------------------------
 # Prints the exapump config.toml path this installer must read to mirror what
 # `exapump sql --profile <name>` itself would resolve (confirmed via `strings $(command -v
@@ -265,7 +224,7 @@ exapump_config_path() {
 }
 
 # Reads the named `$key` out of the named `[profile]` TOML section in $config_path. Bounded
-# scan (same discipline as extract_asset_id_by_name's bounded JSON block): only lines between the
+# scan: only lines between the
 # named section's own header and the next `[`-headed header (or EOF) are considered, so a
 # same-named key in a different section is never matched. Returns 1 with no output if the file,
 # section, or key is absent.
@@ -326,6 +285,124 @@ resolve_saas_pat() {
   return 0
 }
 
+read_descriptor_field() {
+  local descriptor="$1" jq_path="$2" value jq_err
+  if [[ ! -r "$descriptor" ]]; then
+    err "no readable Exasol Personal deployment file at '$descriptor'."
+    return 1
+  fi
+  if ! jq_err="$(jq -r "$jq_path // empty" "$descriptor" </dev/null 2>&1)"; then
+    err "could not parse '$descriptor' as JSON while reading '$jq_path'. Re-run once the deployment has finished starting. jq said: $jq_err"
+    return 1
+  fi
+  value="$jq_err"
+  printf '%s\n' "$value"
+  return 0
+}
+
+deployment_backend() {
+  local dir="$1" backend
+  if ! backend="$(read_descriptor_field "$dir/$DEPLOYMENT_DESCRIPTOR" '.backend')"; then
+    return 1
+  fi
+  if [[ -z "$backend" ]]; then
+    err "'$dir/$DEPLOYMENT_DESCRIPTOR' carries no '.backend' field, so the install transport (local SSH copy vs cloud BucketFS HTTP upload) cannot be determined."
+    return 1
+  fi
+  printf '%s\n' "$backend"
+  return 0
+}
+
+deployment_field() {
+  local dir="$1" jq_path="$2" default="$3" value
+  if ! value="$(read_descriptor_field "$dir/$DEPLOYMENT_DESCRIPTOR" "$jq_path")"; then
+    return 1
+  fi
+  if [[ -z "$value" ]]; then
+    value="$default"
+  fi
+  printf '%s\n' "$value"
+  return 0
+}
+
+deployment_ssh_port() {
+  local dir="$1" port
+  if ! port="$(read_descriptor_field "$dir/$DEPLOYMENT_DESCRIPTOR" '.connection.sshPort')"; then
+    return 1
+  fi
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    err "'$dir/$DEPLOYMENT_DESCRIPTOR' carries no numeric '.connection.sshPort' (got '$port'). Exasol Personal writes it when the deployment starts; start the deployment and re-run."
+    return 1
+  fi
+  printf '%s\n' "$port"
+  return 0
+}
+
+deployment_key_path() {
+  printf '%s\n' "$1/$NODE_KEY_RELATIVE_PATH"
+}
+
+deployment_db_password() {
+  read_descriptor_field "$1/$SECRETS_DESCRIPTOR" '.dbPassword'
+}
+
+resolve_deployment_connection() {
+  local dir="$1" default_host="$2"
+  local descriptor_host descriptor_port descriptor_user host_part port_part
+
+  if ! descriptor_host="$(deployment_field "$dir" '.connection.host' "$default_host")"; then
+    return 1
+  fi
+  if ! descriptor_port="$(deployment_field "$dir" '.connection.dbPort' "$PERSONAL_DB_PORT_DEFAULT")"; then
+    return 1
+  fi
+  if ! descriptor_user="$(deployment_field "$dir" '.connection.username' "$PERSONAL_DB_USER_DEFAULT")"; then
+    return 1
+  fi
+
+  host_part="$descriptor_host"
+  port_part="$descriptor_port"
+  if [[ -n "$ARG_HOST" ]]; then
+    if [[ "$ARG_HOST" == *:* ]]; then
+      host_part="${ARG_HOST%:*}"
+      port_part="${ARG_HOST##*:}"
+    else
+      host_part="$ARG_HOST"
+    fi
+  fi
+  if [[ -z "$host_part" ]]; then
+    err "no database host for the deployment: '$dir/$DEPLOYMENT_DESCRIPTOR' carries no '.connection.host'. Pass --host <host:port>."
+    return 1
+  fi
+  if [[ -z "$port_part" ]]; then
+    err "no database port for the deployment: '$dir/$DEPLOYMENT_DESCRIPTOR' carries no '.connection.dbPort' and --host named none. Pass --host <host:port>."
+    return 1
+  fi
+  ARG_HOST="$host_part:$port_part"
+
+  if [[ -z "$ARG_USER" ]]; then
+    ARG_USER="$descriptor_user"
+  fi
+  if [[ -z "$ARG_PASSWORD" ]]; then
+    if ! ARG_PASSWORD="$(deployment_db_password "$dir")"; then
+      return 1
+    fi
+  fi
+  if [[ -z "$ARG_PASSWORD" ]]; then
+    err "no database password for the deployment: '$dir/$SECRETS_DESCRIPTOR' carries no '.dbPassword'. Pass --password."
+    return 1
+  fi
+  return 0
+}
+
+require_cloud_bfs_password() {
+  if [[ -z "$ARG_BFS_WRITE_PASSWORD" ]]; then
+    err "Exasol Personal provisions no BucketFS password: --bfs-write-password is required for a cloud deployment (any backend other than '$LOCAL_BACKEND')."
+    return 1
+  fi
+  return 0
+}
+
 usage() {
   cat <<'USAGE'
 install.sh - install lakehouse-engine onto an Exasol database.
@@ -340,10 +417,6 @@ Connectivity (both modes; exactly one of the three):
   --host <host:port> --user <u> --password <p>
                             direct connection assembled into a DSN; --host MUST include the port
                             (e.g. myhost:8563) - there is no --port flag
-
-Optional in both modes (both repos are public; a token only raises the unauthenticated
-60-requests/hour GitHub API rate limit):
-  --github-token <token>    GitHub token (or set GITHUB_TOKEN)
 
 SaaS target only:
   --account-id <id>         SaaS account id (from the SaaS web console)
@@ -372,11 +445,20 @@ Both modes:
                             language-container-rs's own latest release)
   --skip-slc                do not download, upload or register the Rust SLC; install the engine
                             against the SLC already registered on the database
+  --arch <x86_64|aarch64>   target CPU architecture (default: x86_64); selects unsuffixed vs
+                            -aarch64-suffixed release assets
+  --deployment <name>       target an Exasol Personal deployment by name, resolving connection and
+                            backend from $HOME/.exasol/personal/deployments/<name>/deployment.json;
+                            local backend installs over SSH, cloud backend falls through to the
+                            BucketFS HTTP path above (--bfs-write-password required for cloud)
   --help                    show this help
 
 Examples:
   install.sh --account-id ACC --database-id DB --profile saas-prod
   install.sh --profile my-exasol --bfs-write-password "$BFSPASS"
+  install.sh --profile my-exasol --arch aarch64
+  install.sh --deployment my-local-db
+  install.sh --deployment my-cloud-db --bfs-write-password "$BFSPASS"
 
 The script stops at a query-ready product install and prints a CONNECTION / VIRTUAL SCHEMA
 template as the next step; it does not create catalog objects.
@@ -387,7 +469,6 @@ USAGE
 parse_args() {
   ARG_ACCOUNT_ID=""
   ARG_DATABASE_ID=""
-  ARG_GITHUB_TOKEN="${GITHUB_TOKEN:-}"
   ARG_PROFILE=""
   ARG_DSN="${EXAPUMP_DSN:-}"
   ARG_HOST=""
@@ -404,6 +485,9 @@ parse_args() {
   ARG_BFS_BUCKET_SET=0
   ARG_BFS_WRITE_PASSWORD=""
   ARG_SKIP_SLC=0
+  ARG_ARCH="x86_64"
+  ARG_ARCH_SET=0
+  ARG_DEPLOYMENT=""
   ARG_HELP=0
 
   while [[ $# -gt 0 ]]; do
@@ -412,8 +496,8 @@ parse_args() {
       --staging)  ARG_STAGING=1; shift; continue ;;
       --skip-slc) ARG_SKIP_SLC=1; shift; continue ;;
       --help|-h)  ARG_HELP=1; shift; continue ;;
-      --account-id|--database-id|--github-token|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
-      --target|--bfs-host|--bfs-port|--bfs-bucket|--bfs-write-password) ;;
+      --account-id|--database-id|--profile|--dsn|--host|--user|--password|--schema|--lakehouse-version|--slc-version) ;;
+      --target|--bfs-host|--bfs-port|--bfs-bucket|--bfs-write-password|--arch|--deployment) ;;
       *) err "unknown argument: $flag"; return 1 ;;
     esac
     if [[ $# -lt 2 ]]; then
@@ -424,7 +508,6 @@ parse_args() {
     case "$flag" in
       --account-id)        ARG_ACCOUNT_ID="$value" ;;
       --database-id)       ARG_DATABASE_ID="$value" ;;
-      --github-token)      ARG_GITHUB_TOKEN="$value" ;;
       --profile)           ARG_PROFILE="$value" ;;
       --dsn)               ARG_DSN="$value" ;;
       --host)              ARG_HOST="$value" ;;
@@ -438,6 +521,15 @@ parse_args() {
       --bfs-port)          ARG_BFS_PORT="$value" ;;
       --bfs-bucket)        ARG_BFS_BUCKET="$value"; ARG_BFS_BUCKET_SET=1 ;;
       --bfs-write-password) ARG_BFS_WRITE_PASSWORD="$value" ;;
+      --deployment)        ARG_DEPLOYMENT="$value" ;;
+      --arch)
+        case "$value" in
+          x86_64|aarch64) ;;
+          *) err "--arch must be 'x86_64' or 'aarch64'; got '$value'."; return 1 ;;
+        esac
+        ARG_ARCH="$value"
+        ARG_ARCH_SET=1
+        ;;
     esac
     shift 2
   done
@@ -531,6 +623,63 @@ resolve_target_mode() {
   return 0
 }
 
+resolve_deployment_transport() {
+  if [[ "$TARGET_MODE" == "saas" ]]; then
+    err "--deployment installs into an Exasol Personal deployment, which is never an Exasol SaaS database (it has no SaaS account/database id and no SaaS files API). Drop --account-id/--database-id, or drop --deployment."
+    return 1
+  fi
+  if [[ -n "$ARG_PROFILE" || -n "$ARG_DSN" ]]; then
+    err "--deployment resolves host, user and password from the deployment's own descriptor, so it cannot be combined with --profile or --dsn. Note EXAPUMP_DSN seeds --dsn too: unset it to install into a deployment."
+    return 1
+  fi
+  have_cmd jq || {
+    err "required tool 'jq' not found on PATH. --deployment reads the Exasol Personal deployment descriptor with it. Install it via your OS package manager: https://jqlang.github.io/jq/"
+    return 1
+  }
+
+  DEPLOYMENT_DIR="$DEPLOYMENT_ROOT/$ARG_DEPLOYMENT"
+  if [[ ! -d "$DEPLOYMENT_DIR" ]]; then
+    err "no Exasol Personal deployment directory at '$DEPLOYMENT_DIR'. List the deployments on this machine with 'exasol deployment list'."
+    return 1
+  fi
+
+  local backend
+  if ! backend="$(deployment_backend "$DEPLOYMENT_DIR")"; then
+    return 1
+  fi
+
+  if [[ "$backend" != "$LOCAL_BACKEND" ]]; then
+    DEPLOYMENT_TRANSPORT="bucketfs"
+    resolve_deployment_connection "$DEPLOYMENT_DIR" "" || return 1
+    require_cloud_bfs_password || return 1
+    if [[ -z "$ARG_BFS_HOST" ]]; then
+      ARG_BFS_HOST="${ARG_HOST%:*}"
+    fi
+    log "Deployment '$ARG_DEPLOYMENT' has backend '$backend': installing over its BucketFS HTTP endpoint at $ARG_BFS_HOST."
+    return 0
+  fi
+
+  DEPLOYMENT_TRANSPORT="ssh"
+  if [[ ! "$ARG_BFS_BUCKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    err "--bfs-bucket '$ARG_BFS_BUCKET' is not a valid bucket name: it names the directory inside the deployment VM's BucketFS that the SSH transport replaces, and is interpolated into a remote command, so it must match [A-Za-z0-9._-]+."
+    return 1
+  fi
+  resolve_deployment_connection "$DEPLOYMENT_DIR" "$PERSONAL_DB_HOST_DEFAULT" || return 1
+  if ! DEPLOYMENT_SSH_PORT="$(deployment_ssh_port "$DEPLOYMENT_DIR")"; then
+    return 1
+  fi
+  DEPLOYMENT_KEY_PATH="$(deployment_key_path "$DEPLOYMENT_DIR")"
+  if [[ ! -r "$DEPLOYMENT_KEY_PATH" ]]; then
+    err "no readable node key at '$DEPLOYMENT_KEY_PATH'. Exasol Personal writes it when the deployment is created; check that '$ARG_DEPLOYMENT' is a local deployment created by this user."
+    return 1
+  fi
+  if [[ "$ARG_ARCH_SET" -eq 0 ]]; then
+    ARG_ARCH="$(detect_host_arch)" || return 1
+  fi
+  log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND': installing $ARG_ARCH artifacts over SSH into the deployment VM (ssh port $DEPLOYMENT_SSH_PORT)."
+  return 0
+}
+
 # If bucketfs mode + profile connectivity + no explicit --bfs-bucket, resolves ARG_BFS_BUCKET
 # from the profile's own bfs_bucket field. Must run before resolve_target_layout, and before
 # exapump_bfs_flags is ever consulted. Without this, ARG_BFS_BUCKET stays at its "default" default
@@ -558,8 +707,8 @@ resolve_bfs_bucket_from_profile() {
 resolve_target_layout() {
   case "$TARGET_MODE" in
     bucketfs)
-      TARGET_SO_UDF_OBJECT="buckets/bfsdefault/$ARG_BFS_BUCKET/udf/liblakehouse_engine.so"
-      TARGET_RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///bfsdefault/$ARG_BFS_BUCKET/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/$ARG_BFS_BUCKET/slc/lakehouse-rustslc/exaudf/exaudfclient"
+      TARGET_SO_UDF_OBJECT="buckets/$BFS_SERVICE/$ARG_BFS_BUCKET/udf/liblakehouse_engine.so"
+      TARGET_RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///$BFS_SERVICE/$ARG_BFS_BUCKET/slc/lakehouse-rustslc?lang=rust#buckets/$BFS_SERVICE/$ARG_BFS_BUCKET/slc/lakehouse-rustslc/exaudf/exaudfclient"
       TARGET_SLC_BFS_PATH="$BFS_SLC_PATH"
       TARGET_ENGINE_BFS_PATH="$BFS_ENGINE_SO_PATH"
       ;;
@@ -615,6 +764,10 @@ check_prereqs() {
   if [[ "$TARGET_MODE" == "bucketfs" ]]; then
     have_cmd tar   || { err "required tool 'tar' not found on PATH. The BucketFS install target extracts liblakehouse_engine.so out of the engine archive locally before uploading it. Install it via your OS package manager."; ok=0; }
   fi
+  if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
+    have_cmd ssh || { err "required tool 'ssh' not found on PATH. An Exasol Personal deployment with the '$LOCAL_BACKEND' backend exposes no BucketFS HTTP endpoint, so artifacts travel to its VM over SSH."; ok=0; }
+    have_cmd scp || { err "required tool 'scp' not found on PATH. An Exasol Personal deployment with the '$LOCAL_BACKEND' backend exposes no BucketFS HTTP endpoint, so artifacts travel to its VM over SSH."; ok=0; }
+  fi
   [[ "$ok" -eq 1 ]]
 }
 
@@ -625,21 +778,6 @@ resolve_saas_base() {
   else
     printf '%s\n' "$SAAS_PROD_BASE"
   fi
-}
-
-# --- GitHub auth --------------------------------------------------------------
-# Populates GITHUB_AUTH_ARGS with the -H Authorization header args for a GitHub REST call, or
-# leaves it empty. Both lakehouse-engine-rs and language-container-rs are public repos, so a
-# token is optional -- it only raises the unauthenticated 60-requests/hour rate limit. An empty
-# token must never be sent: GitHub rejects a malformed `Authorization: Bearer` (no value) with
-# 401, which is worse than sending no Authorization header at all.
-GITHUB_AUTH_ARGS=()
-set_github_auth_args() {
-  GITHUB_AUTH_ARGS=()
-  if [[ -n "$ARG_GITHUB_TOKEN" ]]; then
-    GITHUB_AUTH_ARGS=(-H "Authorization: Bearer $ARG_GITHUB_TOKEN")
-  fi
-  return 0
 }
 
 # --- Version resolution ------------------------------------------------------
@@ -656,6 +794,27 @@ version_to_tag() {
   esac
 }
 
+resolve_arch_suffix() {
+  local arch="$1"
+  case "$arch" in
+    aarch64) printf '%s\n' "-aarch64" ;;
+    *)       printf '%s\n' "" ;;
+  esac
+}
+
+detect_host_arch() {
+  local machine
+  machine="$(uname -m 2>/dev/null)"
+  case "$machine" in
+    arm64|aarch64) printf '%s\n' "aarch64" ;;
+    x86_64|amd64)  printf '%s\n' "x86_64" ;;
+    *)
+      err "could not map the detected host architecture '$machine' (from 'uname -m') to a supported value. Pass --arch x86_64|aarch64 explicitly."
+      return 1
+      ;;
+  esac
+}
+
 # Fetches the engine's root Cargo.toml AT the resolved engine release tag and extracts the
 # exasol-udf-sdk version it pins there -- the SLC version that release actually requires. This
 # repo keeps the SLC and its exasol-udf-sdk dependency in exact lockstep (same version number both
@@ -667,10 +826,9 @@ version_to_tag() {
 resolve_engine_pinned_slc_version() {
   local tag="$1"
   local toml line sdk_version=""
-  if ! toml="$(curl -fsS "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" \
-      -H "Accept: application/vnd.github.raw" \
-      "https://api.github.com/repos/$ENGINE_REPO/contents/Cargo.toml?ref=$tag" </dev/null 2>&1)"; then
-    err "could not fetch Cargo.toml for $ENGINE_REPO release '$tag' via the GitHub REST API. Pass --slc-version to skip this lookup."
+  if ! toml="$(curl -fsS \
+      "https://raw.githubusercontent.com/$ENGINE_REPO/$tag/Cargo.toml" </dev/null 2>&1)"; then
+    err "could not fetch Cargo.toml for $ENGINE_REPO at '$tag'. Pass --slc-version to skip this lookup."
     return 1
   fi
   while IFS= read -r line; do
@@ -691,13 +849,12 @@ resolve_engine_pinned_slc_version() {
 }
 
 resolve_versions() {
-  set_github_auth_args
   if [[ -n "$ARG_LAKEHOUSE_VERSION" ]]; then
     RESOLVED_ENGINE_TAG="$(version_to_tag "$ARG_LAKEHOUSE_VERSION")"
   else
     local ej
-    if ! ej="$(curl -fsS "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" "https://api.github.com/repos/$ENGINE_REPO/releases/latest" </dev/null 2>&1)"; then
-      err "could not resolve the latest $ENGINE_REPO release via the GitHub REST API. If this is a rate limit, pass --github-token/GITHUB_TOKEN."
+    if ! ej="$(curl -fsS "https://api.github.com/repos/$ENGINE_REPO/releases/latest" </dev/null 2>&1)"; then
+      err "could not resolve the latest $ENGINE_REPO release via the GitHub REST API."
       return 1
     fi
     if ! RESOLVED_ENGINE_TAG="$(extract_json_string_field "$ej" "tag_name")"; then
@@ -913,6 +1070,84 @@ extract_engine_so() {
   return 0
 }
 
+vm_bucket_dir() {
+  printf '%s\n' "$VM_BUCKETFS_ROOT/$BFS_SERVICE/$ARG_BFS_BUCKET"
+}
+
+vm_slc_dir() {
+  printf '%s\n' "$(vm_bucket_dir)/${TARGET_SLC_BFS_PATH%.tar.gz}"
+}
+
+vm_engine_so_path() {
+  printf '%s\n' "$(vm_bucket_dir)/$TARGET_ENGINE_BFS_PATH"
+}
+
+ssh_vm() {
+  ssh "${SSH_OPTIONS[@]}" -i "$DEPLOYMENT_KEY_PATH" -p "$DEPLOYMENT_SSH_PORT" \
+    "$PERSONAL_SSH_USER@$PERSONAL_SSH_HOST" "$1" </dev/null
+}
+
+scp_to_vm() {
+  scp "${SSH_OPTIONS[@]}" -i "$DEPLOYMENT_KEY_PATH" -P "$DEPLOYMENT_SSH_PORT" \
+    "$1" "$PERSONAL_SSH_USER@$PERSONAL_SSH_HOST:$2" </dev/null
+}
+
+ssh_vm_reachable() {
+  local out
+  if ! out="$(ssh_vm true 2>&1)"; then
+    err "the deployment VM is not reachable over SSH at $PERSONAL_SSH_HOST:$DEPLOYMENT_SSH_PORT with key '$DEPLOYMENT_KEY_PATH'. Check that the deployment is running ('exasol status'); the SSH port is reassigned on every start, so a stopped or restarted deployment invalidates it. ssh said: $out"
+    return 1
+  fi
+  return 0
+}
+
+push_slc_to_vm() {
+  local tarball="$1" staged="/tmp/lakehouse-rustslc.tar.gz" dest out
+  dest="$(vm_slc_dir)"
+  if ! out="$(scp_to_vm "$tarball" "$staged" 2>&1)"; then
+    err "failed to copy the Rust SLC to '$staged' on the deployment VM. scp said: $out"
+    return 1
+  fi
+  if ! out="$(ssh_vm "set -e; rm -rf '$dest'; mkdir -p '$dest'; tar -xzf '$staged' -C '$dest'; rm -f '$staged'; test -x '$dest/exaudf/exaudfclient'" 2>&1)"; then
+    err "failed to extract the Rust SLC into '$dest' on the deployment VM; the extracted tree must contain an executable exaudf/exaudfclient. ssh said: $out"
+    return 1
+  fi
+  log "Extracted the Rust SLC into $dest on the deployment VM."
+  return 0
+}
+
+push_engine_so_to_vm() {
+  local so_path="$1" staged="/tmp/liblakehouse_engine.so" dest dest_dir out
+  dest="$(vm_engine_so_path)"
+  dest_dir="${dest%/*}"
+  if ! out="$(scp_to_vm "$so_path" "$staged" 2>&1)"; then
+    err "failed to copy the engine .so to '$staged' on the deployment VM. scp said: $out"
+    return 1
+  fi
+  if ! out="$(ssh_vm "set -e; mkdir -p '$dest_dir'; mv -f '$staged' '$dest'; chmod 0644 '$dest'; test -s '$dest'" 2>&1)"; then
+    err "failed to install the engine .so at '$dest' on the deployment VM. ssh said: $out"
+    return 1
+  fi
+  log "Installed the engine .so at $dest on the deployment VM."
+  return 0
+}
+
+vm_wait_for_reconciled_path() {
+  local vm_path="$1" tries="${2:-$VM_RECONCILE_TRIES}" sleep_seconds="${3:-$VM_RECONCILE_POLL_SECONDS}" i=1
+  while [[ "$i" -le "$tries" ]]; do
+    if ssh_vm "test -e '$vm_path'" >/dev/null 2>&1; then
+      log "Verified $vm_path on the deployment VM."
+      return 0
+    fi
+    if [[ "$i" -lt "$tries" ]]; then
+      sleep "$sleep_seconds"
+    fi
+    i=$((i + 1))
+  done
+  err "the deployment VM did not expose '$vm_path' after $tries checks over $((tries * sleep_seconds))s. The copy itself reported success, so check that '$ARG_BFS_BUCKET' is the BucketFS bucket this deployment's database actually reads."
+  return 1
+}
+
 # --- Upload dispatch ---------------------------------------------------------
 # The ONE seam between the two target modes: SaaS addresses an upload by its files-API key,
 # BucketFS by its bucket-relative path. Each mode ignores the other's argument.
@@ -1027,43 +1262,21 @@ smoke_test_sql() {
 }
 
 # --- Install steps -----------------------------------------------------------
-# Downloads a named release asset for $repo at $tag into $dest_path via the authenticated
-# GitHub REST API: resolve the release-by-tag JSON, look up the asset id by name (no jq --
-# see extract_asset_id_by_name), then GET the asset binary by id.
-#
-# Uses plain -L, never --location-trusted: the assets endpoint authenticates the API call with
-# our Authorization header, then 302s to a signed, host-authenticated storage URL that rejects a
-# second auth mechanism. curl's default behavior since 7.58 is to strip Authorization across a
-# cross-host redirect -- exactly what's needed here. --location-trusted would force the header
-# through the redirect and break the signed URL.
 download_release_asset() {
   local repo="$1" tag="$2" asset_name="$3" dest_path="$4"
-  local release_json asset_id dl_err
-  set_github_auth_args
-
-  if ! release_json="$(curl -fsS "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" \
-      "https://api.github.com/repos/$repo/releases/tags/$tag" </dev/null 2>&1)"; then
-    err "could not fetch release '$tag' from $repo via the GitHub REST API."
-    return 1
-  fi
-
-  if ! asset_id="$(extract_asset_id_by_name "$release_json" "$asset_name")"; then
-    err "asset '$asset_name' not found in $repo release '$tag'."
-    return 1
-  fi
-
-  if ! dl_err="$(curl -fsSL "${GITHUB_AUTH_ARGS[@]+"${GITHUB_AUTH_ARGS[@]}"}" \
-      -H "Accept: application/octet-stream" \
-      -o "$dest_path" \
-      "https://api.github.com/repos/$repo/releases/assets/$asset_id" </dev/null 2>&1)"; then
-    err "failed to download asset '$asset_name' (id $asset_id) from $repo release '$tag': $dl_err"
+  local dl_err
+  if ! dl_err="$(curl -fsSL --proto =https -o "$dest_path" \
+      "https://github.com/$repo/releases/download/$tag/$asset_name" </dev/null 2>&1)"; then
+    err "failed to download asset '$asset_name' from $repo release '$tag': $dl_err"
     return 1
   fi
   return 0
 }
 
 download_slc() {
-  local asset="lc-rust-$RESOLVED_SLC_VERSION.tar.gz"
+  local suffix asset
+  suffix="$(resolve_arch_suffix "$ARG_ARCH")"
+  asset="lc-rust-$RESOLVED_SLC_VERSION$suffix.tar.gz"
   download_release_asset "$SLC_REPO" "$RESOLVED_SLC_TAG" "$asset" "$WORKDIR/$asset" || return 1
   if ! mv -f "$WORKDIR/$asset" "$WORKDIR/rustslc.tar.gz"; then
     err "failed to rename $asset to rustslc.tar.gz."
@@ -1072,7 +1285,28 @@ download_slc() {
 }
 
 download_engine() {
-  download_release_asset "$ENGINE_REPO" "$RESOLVED_ENGINE_TAG" "$ENGINE_ASSET" "$WORKDIR/$ENGINE_ASSET" || return 1
+  local suffix asset
+  suffix="$(resolve_arch_suffix "$ARG_ARCH")"
+  asset="${ENGINE_ASSET%.tar.gz}$suffix.tar.gz"
+  download_release_asset "$ENGINE_REPO" "$RESOLVED_ENGINE_TAG" "$asset" "$WORKDIR/$asset" || return 1
+  if [[ "$asset" != "$ENGINE_ASSET" ]] && ! mv -f "$WORKDIR/$asset" "$WORKDIR/$ENGINE_ASSET"; then
+    err "failed to rename $asset to $ENGINE_ASSET."
+    return 1
+  fi
+}
+
+register_script_languages() {
+  local current new
+  if ! current="$(read_script_languages)"; then
+    return 1
+  fi
+  new="$(compute_script_languages "$current" "$TARGET_RUST_LANG_SEGMENT")"
+  log "Setting SCRIPT_LANGUAGES (RUST segment append/replace)."
+  if ! run_sql "ALTER SYSTEM SET SCRIPT_LANGUAGES='$new'" >/dev/null 2>&1; then
+    err "ALTER SYSTEM SET SCRIPT_LANGUAGES failed. The connecting account likely lacks the SYSTEM (admin) privilege required to register a script language."
+    return 1
+  fi
+  return 0
 }
 
 register_slc() {
@@ -1085,16 +1319,7 @@ register_slc() {
     # SaaS verifies synchronously inside saas_upload_file; BucketFS needs the bounded wait.
     bucketfs_wait_for_path "$TARGET_SLC_BFS_PATH" || return 1
   fi
-  local current new
-  if ! current="$(read_script_languages)"; then
-    return 1
-  fi
-  new="$(compute_script_languages "$current" "$TARGET_RUST_LANG_SEGMENT")"
-  log "Setting SCRIPT_LANGUAGES (RUST segment append/replace)."
-  if ! run_sql "ALTER SYSTEM SET SCRIPT_LANGUAGES='$new'" >/dev/null 2>&1; then
-    err "ALTER SYSTEM SET SCRIPT_LANGUAGES failed. The connecting account likely lacks the SYSTEM (admin) privilege required to register a script language."
-    return 1
-  fi
+  register_script_languages || return 1
   return 0
 }
 
@@ -1134,6 +1359,32 @@ install_engine() {
   else
     upload_artifact "$WORKDIR/$ENGINE_ASSET" "$ENGINE_ASSET" "" || return 1
   fi
+  create_engine_scripts || return 1
+  return 0
+}
+
+deploy_personal_local() {
+  local so_path
+  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
+    log "Skipping SLC upload and registration (--skip-slc)."
+  else
+    log "Installing Rust SLC $RESOLVED_SLC_VERSION over SSH ..."
+    download_slc || return 1
+    push_slc_to_vm "$WORKDIR/rustslc.tar.gz" || return 1
+  fi
+
+  log "Installing lakehouse-engine $RESOLVED_ENGINE_VERSION over SSH ..."
+  download_engine || return 1
+  if ! so_path="$(extract_engine_so "$WORKDIR/$ENGINE_ASSET" "$WORKDIR/extracted")"; then
+    return 1
+  fi
+  push_engine_so_to_vm "$so_path" || return 1
+
+  if [[ "$ARG_SKIP_SLC" -eq 0 ]]; then
+    vm_wait_for_reconciled_path "$(vm_slc_dir)" || return 1
+    register_script_languages || return 1
+  fi
+  vm_wait_for_reconciled_path "$(vm_engine_so_path)" || return 1
   create_engine_scripts || return 1
   return 0
 }
@@ -1210,6 +1461,9 @@ main() {
   if ! TARGET_MODE="$(resolve_target_mode)"; then
     exit 1
   fi
+  if [[ -n "$ARG_DEPLOYMENT" ]]; then
+    resolve_deployment_transport || exit 1
+  fi
   if ! CONNECTIVITY_MODE="$(validate_connectivity)"; then
     exit 1
   fi
@@ -1231,8 +1485,12 @@ main() {
       saas_db_reachable || exit 1
       ;;
     bucketfs)
-      validate_bucketfs_required || exit 1
-      bucketfs_reachable || exit 1
+      if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
+        ssh_vm_reachable || exit 1
+      else
+        validate_bucketfs_required || exit 1
+        bucketfs_reachable || exit 1
+      fi
       ;;
   esac
 
@@ -1243,12 +1501,16 @@ main() {
   trap 'rm -rf "$WORKDIR"' EXIT
 
   resolve_versions || exit 1
-  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
-    log "Skipping SLC registration (--skip-slc)."
+  if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
+    deploy_personal_local || exit 1
   else
-    register_slc || exit 1
+    if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
+      log "Skipping SLC registration (--skip-slc)."
+    else
+      register_slc || exit 1
+    fi
+    install_engine || exit 1
   fi
-  install_engine || exit 1
   run_smoke_test || exit 1
 
   print_next_step_template "$ARG_SCHEMA"

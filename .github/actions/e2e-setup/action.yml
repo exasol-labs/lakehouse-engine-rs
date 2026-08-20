@@ -42,7 +42,7 @@ runs:
     - name: Download liblakehouse_engine.so
       uses: actions/download-artifact@v8
       with:
-        name: lakehouse-engine-so
+        name: lakehouse-engine-so-x86_64
         path: target/release/
 
     # ROOT CAUSE of "VM crashed" (SQL state 22002) for every UDF on GitHub's

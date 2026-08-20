@@ -125,7 +125,16 @@ test-e2e-azure: cross-musl-udf-build
 # Set BUCKETFS_WRITE_PASS env var to skip the docker-exec extraction.
 # Derived from the workspace `exasol-udf-sdk` pin; override on the command line.
 SLC_VERSION ?= $(shell sed -n 's/^exasol-udf-sdk[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml)
-SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION).tar.gz
+ARCH ?= x86_64
+ARCH_NORMALIZED := $(if $(filter arm64,$(ARCH)),aarch64,$(ARCH))
+ifeq ($(ARCH_NORMALIZED),x86_64)
+SLC_ARCH_SUFFIX :=
+else ifeq ($(ARCH_NORMALIZED),aarch64)
+SLC_ARCH_SUFFIX := -aarch64
+else
+$(error ARCH must be 'x86_64' or 'aarch64'; got '$(ARCH)')
+endif
+SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION)$(SLC_ARCH_SUFFIX).tar.gz
 EXASOL_CONTAINER ?= lakehouse-engine-rs-exasol-1
 
 install-slc:
