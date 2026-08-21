@@ -2191,9 +2191,9 @@ dependencies = [
 
 [[package]]
 name = "exasol-udf-macros"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ce946fe8d0224345d7cca254952a2d0bdfa01ca99d8d843b9e0df66ed7928f8b"
+checksum = "a97b7218a60d733de8eb55cb1edf692734815f06ea7d19220d08f23646148b94"
 dependencies = [
  "exasol-udf-sdk",
  "proc-macro2",
@@ -2203,9 +2203,9 @@ dependencies = [
 
 [[package]]
 name = "exasol-udf-sdk"
-version = "0.22.1"
+version = "0.23.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dbc946614a95e343fabcfa5f9d16be4e9ad4d1c419321d0e4341fc7cd79f535"
+checksum = "71a5665007e59c24293f30bf37589dc2f427393957393dc2a7096fcafc9f576e"
 dependencies = [
  "arrow",
  "chrono",

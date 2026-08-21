@@ -11,9 +11,9 @@ script references it.
 ## Background
 
 * Both Rust entry points (adapter, scan) are exported from the single uploaded `.so`; the `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL and is not part of the `.so`.
-* The crate is a `cdylib` depending on `exasol-udf-sdk` 0.14.0 (connect-back feature)
-  and `exasol-udf-macros` 0.14.0.
-* The `.so` is built only inside the `rust:1.94-bookworm` builder image; it is never
+* The crate is a `cdylib` depending on `exasol-udf-sdk` 0.23.0 (connect-back feature)
+  and `exasol-udf-macros` 0.23.0.
+* The `.so` is built only inside the `rust:1.94-trixie` builder image; it is never
   built with host `cargo build --release`.
 * Each entry point is declared with the `exasol_udf` macro; Exasol's `CREATE SCRIPT`
   statements reference each by its registered name against the same `%udf_object`.

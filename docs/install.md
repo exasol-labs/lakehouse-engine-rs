@@ -258,11 +258,11 @@ Port overrides (host side). The defaults match `docker-compose.yml`:
 If you develop the engine, or if the one-line command does not cover your build, use this path.
 
 ```sh
-make cross-musl-udf-build      # → target/release/liblakehouse_engine.so
+make cross-udf-build           # → target/release/liblakehouse_engine.so
 make bucketfs-upload-so        # → BucketFS udf/liblakehouse_engine.so
 ```
 
-The build runs inside `rust:1.94-bookworm` (glibc 2.36, which matches the SLC). It rebuilds only
+The build runs inside `rust:1.94-trixie` (glibc 2.41, which matches the SLC). It rebuilds only
 when crate sources, manifests, or the lockfile change. One `.so` exports **both** RUST entry
 points (VS adapter + scan SCALAR UDF). This path needs Docker and
 [`exapump`](https://github.com/exasol-labs/exapump). It also needs the Rust SLC already

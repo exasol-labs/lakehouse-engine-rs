@@ -24,7 +24,7 @@ if [ $# -ne 1 ]; then
   exit 1
 fi
 
-make cross-musl-udf-build
+make cross-udf-build
 
 docker compose up -d minio-init
 init_exit=$(docker wait "$(docker compose ps -q minio-init)")

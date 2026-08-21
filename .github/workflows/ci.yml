@@ -28,9 +28,10 @@ env:
 
 jobs:
   # ── the real release artifact ─────────────────────────────────────────────
-  # Built the same way a developer does: inside rust:1.94-bookworm (glibc
-  # 2.36), matching the SLC. Never `cargo build --release` on the runner
-  # directly — Ubuntu's glibc is newer and the .so fails to dlopen in Exasol.
+  # Built the same way a developer does: inside rust:1.94-trixie (glibc
+  # 2.41), matching the SLC. Never `cargo build --release` on the runner
+  # directly — the SDK fingerprint embeds the rustc hash, so a host-built
+  # .so is rejected by the SLC at load time.
   build-so:
     name: Build release .so (Docker, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
@@ -60,7 +61,7 @@ jobs:
 
       - uses: actions/checkout@v7
 
-      # This build runs INSIDE rust:1.94-bookworm with its cargo home at
+      # This build runs INSIDE rust:1.94-trixie with its cargo home at
       # /usr/local/cargo, so Swatinem/rust-cache (host-side, prunes via the host
       # cargo) can't manage it — we stay on actions/cache.
       #
@@ -100,7 +101,7 @@ jobs:
             docker-cargo-${{ matrix.arch }}-
 
       - name: Build liblakehouse_engine.so
-        run: make cross-musl-udf-build UDF_CARGO_VOL="$HOME/.cargo-docker-registry"
+        run: make cross-udf-build UDF_CARGO_VOL="$HOME/.cargo-docker-registry"
 
       # `docker run` writes into both the bind-mounted registry and target/ as
       # root (the container's default user), so actions/cache's post-job tar
@@ -129,7 +130,7 @@ jobs:
 
   # ── fan-out: build-host / lint / unit-tests / licenses, all at t=0 ───────
   # Nothing here waits on build-so (different toolchain: host vs the
-  # rust:1.94-bookworm container). `build-host` writes the `workspace-rlib`
+  # rust:1.94-trixie container). `build-host` writes the `workspace-rlib`
   # cache that `lint` and the three e2e jobs read; `unit-tests` writes the
   # separate `llvm-cov` namespace (see both jobs' cache steps).
   #

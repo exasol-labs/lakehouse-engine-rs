@@ -11,10 +11,10 @@ export EXASOL_DB_MEM_SIZE
 # Absolute path of this repository root.
 LAKEHOUSE_ENGINE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
-# Rust builder image — MUST match the SLC glibc (Bookworm = 2.36).
-# Never run `cargo build --release` on the host: Ubuntu 24.04 has glibc 2.39
-# and the resulting .so fails to dlopen inside Exasol.
-UDF_BUILDER_IMAGE ?= rust:1.94-bookworm
+# Rust builder image — MUST match the SLC toolchain and glibc (Trixie = 2.41).
+# Never run `cargo build --release` on the host — the SDK fingerprint embeds
+# the rustc hash, so a host-built .so is rejected by the SLC at load time.
+UDF_BUILDER_IMAGE ?= rust:1.94-trixie
 
 # --- UDF .so artifact --------------------------------------------------------
 # Real-file target: `make` rebuilds ONLY when crate sources, manifest, or the
@@ -50,9 +50,11 @@ $(VS_SO): $(VS_SRCS)
 	  -e HOME=/tmp \
 	  $(UDF_BUILDER_IMAGE) \
 	  cargo build --release -p lakehouse-engine
+	cargo install cargo-exasol-udf --version $(SLC_VERSION) --quiet
+	cargo exasol-udf validate $@
 
 # Alias: build the .so if out of date.
-cross-musl-udf-build: $(VS_SO)
+cross-udf-build: $(VS_SO)
 
 test:
 	cargo test
@@ -76,7 +78,7 @@ export LH_REST_PORT
 # E2E tests require a live Exasol + MinIO + Iceberg REST catalog stack.
 # They FAIL (not skip) when the stack is unavailable. All tests share one VS,
 # so the binary runs serially (--test-threads=1).
-test-e2e: cross-musl-udf-build
+test-e2e: cross-udf-build
 	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test -- --test-threads=1
 
 # Lakekeeper E2E tests require a live Exasol + MinIO + Lakekeeper + Keycloak
@@ -86,7 +88,7 @@ test-e2e: cross-musl-udf-build
 # They FAIL (not skip) when the stack is unavailable — same contract as
 # test-e2e. All tests share one VS, so the binary runs serially
 # (--test-threads=1).
-test-e2e-lakekeeper: cross-musl-udf-build
+test-e2e-lakekeeper: cross-udf-build
 	cargo test --features lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
 # Azure E2E tests require a live Exasol + Lakekeeper + Keycloak stack — bring
@@ -105,7 +107,7 @@ test-e2e-lakekeeper: cross-musl-udf-build
 # invocation MUST stay on a single recipe line: make runs each recipe line in
 # its own shell, so splitting them would discard every sourced variable before
 # cargo starts, making a missing-credential failure look like a recipe bug.
-test-e2e-azure: cross-musl-udf-build
+test-e2e-azure: cross-udf-build
 	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --features azure-e2e --test e2e_azure_test -- --test-threads=1
 
 # Install and register the Rust SLC (SLC_VERSION) into Exasol under the RUST alias.
@@ -229,7 +231,7 @@ lint-install:
 # (real AWS S3 + Glue Iceberg TPC-H + external Exasol cluster). Builds the
 # working-tree .so, then runs bench/run.sh, which reads config from a gitignored
 # bench/.env (see bench/.env.example). NOT part of CI — test-e2e stays the path.
-bench: cross-musl-udf-build
+bench: cross-udf-build
 	./bench/run.sh
 
 # Native Unity Catalog + Delta fixture harness (spike #325 — gates #318-#322).
@@ -258,8 +260,8 @@ unity-down:
 # The cargo line MUST stay flag-identical to the `Run Unity Catalog E2E
 # suite` step in ci.yml's e2e-unity job, which is the authority — a target
 # that drifts runs a command the CI gate does not.
-test-e2e-unity: cross-musl-udf-build
+test-e2e-unity: cross-udf-build
 	$(MAKE) unity-up
 	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
 
-.PHONY: cross-musl-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity
+.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity

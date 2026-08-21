@@ -91,8 +91,8 @@ Every query is executed independently, starts from source metadata, and leaves n
 | Language | Rust (edition 2024) | UDF + VS adapter implementation |
 | Query engine | DataFusion + Arrow/Parquet 58 | Node-local vectorized scan & pushdown execution |
 | Lakehouse | `iceberg-rust` (Iceberg REST catalog, incl. Databricks-managed Iceberg) + `delta-kernel-rs` 0.26 (Delta tables via native Unity Catalog) | Snapshot discovery, file resolution, table registration |
-| UDF runtime | `exasol-udf-sdk` 0.13.1 (connect-back), `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit`, connect-back SQL session |
-| Build | `rust:1.94-bookworm` (glibc 2.36) in Docker | Builds `.so` matching the SLC; never built on host |
+| UDF runtime | `exasol-udf-sdk` 0.23.0 (connect-back), `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit`, connect-back SQL session |
+| Build | `rust:1.94-trixie` (glibc 2.41) in Docker | Builds `.so` matching the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
 
 > Sibling projects: the sibling project (VS adapter + UDF conventions) and `language-container-rs` (the Rust
@@ -105,8 +105,8 @@ Every query is executed independently, starts from source metadata, and leaves n
 ## Commands
 
 ```bash
-# Build (UDF .so — inside the rust:1.94-bookworm container, never host `cargo build --release`)
-make cross-musl-udf-build
+# Build (UDF .so — inside the rust:1.94-trixie container, never host `cargo build --release`)
+make cross-udf-build
 
 # Test (host unit tests)
 cargo test
@@ -128,7 +128,7 @@ lakehouse-engine/
 │   ├── lakehouse-catalog/  # Iceberg REST + Unity Catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
 │   └── vs-expression/      # expression-translation crate, shared with the sibling project
 ├── Cargo.toml      # workspace manifest
-└── Makefile        # cross-musl-udf-build, test-e2e
+└── Makefile        # cross-udf-build, test-e2e
 ```
 
 One `.so` still carries both entry points (VS adapter + DataFusion scan SET UDF): `lakehouse-catalog`
@@ -157,7 +157,7 @@ simultaneously. No state survives query completion.
 ## Constraints
 
 - **Technical**: UDFs are stateless and disposable — no caching, no metadata persistence, no
-  cross-call state. The `.so` is built in glibc 2.36 to match the SLC; only SDK `Value` types cross
+  cross-call state. The `.so` is built in glibc 2.41 to match the SLC; only SDK `Value` types cross
   the UDF boundary (never Arrow types). Read DataFusion result batches and `ctx.emit` them
   incrementally; never materialize the whole result set. Metadata must be resolved once per query,
   not once per node. All DSN/connection strings include `validateservercertificate=0`.

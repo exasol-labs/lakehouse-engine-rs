@@ -1,9 +1,9 @@
 [workspace]
 members = ["crates/lakehouse-engine", "crates/lakehouse-catalog", "crates/vs-expression"]
-# The UDF crate is a cdylib that MUST be compiled inside rust:1.94-bookworm
-# (glibc 2.36) via `make cross-musl-udf-build`. A bare host `cargo build
-# --release` must never emit the .so — it would write a host-glibc binary that
-# fails to dlopen inside Exasol. default-members enforces that invariant.
+# The UDF crate is a cdylib that MUST be compiled inside rust:1.94-trixie
+# (glibc 2.41) via `make cross-udf-build`. A bare host `cargo build
+# --release` must never emit the .so — the SDK fingerprint embeds the rustc
+# hash, so a host-built .so is rejected by the SLC at load time.
 #
 # There is no root package here (greenfield PoC, UDF-only); default-members is
 # left unset so `cargo build` at the workspace root is a no-op by default and
@@ -70,8 +70,8 @@ tokio = { version = "1", features = ["rt", "macros"] }
 
 # Also the SLC version (fingerprint must match). `make install-slc` and
 # deploy/scripts/install.sh both scrape this line, so keep `version` inline.
-exasol-udf-sdk    = { version = "0.22.1", features = ["emit-arrow"] }
-exasol-udf-macros = { version = "0.22.1" }
+exasol-udf-sdk    = { version = "0.23.0", features = ["emit-arrow"] }
+exasol-udf-macros = { version = "0.23.0" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = { version = "1" }

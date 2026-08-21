@@ -741,8 +741,8 @@ fn azure_make_target_rebuilds_so_and_runs_serially() {
     let target_line_end = after_target.find('\n').unwrap_or(after_target.len());
     let target_line = &after_target[..target_line_end];
     assert!(
-        target_line.contains("cross-musl-udf-build"),
-        "test-e2e-azure must prerequisite cross-musl-udf-build, so a stale .so never gates the \
+        target_line.contains("cross-udf-build"),
+        "test-e2e-azure must prerequisite cross-udf-build, so a stale .so never gates the \
          suite: {target_line}"
     );
 
