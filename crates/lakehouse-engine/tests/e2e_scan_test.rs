@@ -25,10 +25,10 @@ use common::seed::{
     DIM_CUSTOMER_ROWS, E2E_DIM_TABLE, E2E_EVO_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE,
     E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS,
     EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
-    EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, LINEITEM_ROWS, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
-    PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
-    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, initdef_columns, seed_added_columns_initial_default,
-    seed_events, seed_renamed_column,
+    EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL,
+    PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH,
+    SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, initdef_columns,
+    seed_added_columns_initial_default, seed_events, seed_renamed_column,
 };
 use common::stack::{
     build_create_connection_sql, iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog,
@@ -3958,5 +3958,176 @@ fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection
         !pushed.contains(r#""expr""#),
         "no select-list expression may reach the scan spec: an aggregate \
          evaluated per shard is exactly the #194/#188 bug, got:\n{pushed}"
+    );
+}
+
+/// `L_ORDERKEY/L_LINENUMBER` at `L_ORDERKEY=7, L_LINENUMBER=2` (both mapped to
+/// `DECIMAL(20,0)`) against a native oracle over the same two data points.
+/// Native Exasol's `/` is `FN_FLOAT_DIV`, always true float division:
+/// `7/2` = `3.5`. Pre-fix, the DataFusion dialect rendered `FLOAT_DIV` as a
+/// bare `/`, which DataFusion type-coerces to truncating `Int64/Int64`
+/// division, so the pushed-down value comes back `3.0` instead (#186).
+#[test]
+fn e2e_float_div_int_over_int_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle_cols = conn.query_columns(
+        "SELECT L_ORDERKEY / L_LINENUMBER FROM \
+         (SELECT 7 AS L_ORDERKEY, 1 AS L_LINENUMBER UNION ALL SELECT 7, 2) \
+         WHERE L_LINENUMBER = 2",
+    );
+    let oracle_value = parse_numeric(&oracle_cols[0][0]);
+    assert_eq!(
+        oracle_value, 3.5,
+        "native oracle 7/2 must be 3.5, got {oracle_value}"
+    );
+
+    let vs_sql = format!(
+        "SELECT L_ORDERKEY / L_LINENUMBER FROM {} WHERE L_ORDERKEY = 7 AND L_LINENUMBER = 2",
+        vs_lineitem_table()
+    );
+    let vs_cols = conn.query_columns(&vs_sql);
+    let vs_value = parse_numeric(&vs_cols[0][0]);
+    assert_eq!(
+        vs_value, oracle_value,
+        "pushed-down L_ORDERKEY/L_LINENUMBER at L_ORDERKEY=7, L_LINENUMBER=2 \
+         must match the native oracle {oracle_value} (int/int FLOAT_DIV must \
+         not truncate), got {vs_value}"
+    );
+}
+
+/// The translator's own output, not planning's user-side-CAST proxy: a bare
+/// `L_ORDERKEY / L_LINENUMBER` select-list item pushes down as
+/// `(CAST("L_ORDERKEY" AS DOUBLE) / "L_LINENUMBER")` with a DOUBLE PRECISION
+/// emit type (#186 fix, `vs-expression`'s DataFusion-dialect `FLOAT_DIV` arm).
+#[test]
+fn e2e_float_div_pushes_double_cast_projection() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT L_ORDERKEY / L_LINENUMBER FROM {}",
+        vs_lineitem_table()
+    );
+    let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+
+    assert!(
+        pushed.contains(
+            r#""projection":[{"expr":"(CAST(\"L_ORDERKEY\" AS DOUBLE) / \"L_LINENUMBER\")"}]"#
+        ),
+        "expected the pushed projection to be a DOUBLE-cast FLOAT_DIV \
+         expression, got:\n{pushed}"
+    );
+    assert!(
+        pushed.contains(r#""emit_exa_types":["DOUBLE PRECISION"]"#),
+        "expected the pushed scan spec to emit DOUBLE PRECISION for the \
+         FLOAT_DIV projection, got:\n{pushed}"
+    );
+}
+
+/// Pins a known, deliberate divergence: a projected `x/0` fails at `22002`
+/// ("numeric value out of range: value inf"), not native Exasol's `22012`
+/// ("division by zero").
+#[test]
+fn e2e_float_div_by_zero_projected_fails_with_inf_out_of_range() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT L_ORDERKEY / (L_LINENUMBER - L_LINENUMBER) FROM {} WHERE L_ORDERKEY = 7",
+        vs_lineitem_table()
+    );
+    let resp = conn.try_execute(&sql);
+
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "a projected x/0 must fail rather than silently return a wrong value, \
+         got: {resp}"
+    );
+
+    let sql_code = resp["exception"]["sqlCode"].as_str().unwrap_or_default();
+    let message = resp["exception"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        sql_code.contains("22002") && message.contains("numeric value out of range: value inf"),
+        "expected sqlCode 22002 with a \"numeric value out of range: value \
+         inf\" message, got sqlCode={sql_code:?} message={message:?}: {resp}"
+    );
+}
+
+/// Pins a known, deliberate divergence: a projected `0/0` succeeds with a
+/// silent NULL, owned by #246's raw-scan NaN-at-emit gap. The partial-
+/// aggregate path errors on the same input via `arrow_value_at` instead — this
+/// silent-NULL behavior is specific to the raw-scan/projection path.
+#[test]
+fn e2e_zero_div_zero_projected_returns_silent_null() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT CAST(L_LINENUMBER - L_LINENUMBER AS DOUBLE) / (L_LINENUMBER - L_LINENUMBER) \
+         FROM {} WHERE L_ORDERKEY = 7",
+        vs_lineitem_table()
+    );
+    let cols = conn.query_columns(&sql);
+
+    assert!(
+        !cols[0].is_empty(),
+        "expected at least one row for L_ORDERKEY = 7, got: {cols:?}"
+    );
+    assert!(
+        cols[0].iter().all(|v| v.is_null()),
+        "a projected 0/0 must succeed and return a silent NULL (#246), got: {cols:?}"
+    );
+}
+
+#[test]
+fn e2e_float_div_filter_row_count_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle_count = conn.query_scalar_i64(
+        "SELECT COUNT(*) FROM \
+         (SELECT 7 AS L_ORDERKEY, 1 AS L_LINENUMBER UNION ALL SELECT 7, 2) \
+         WHERE L_ORDERKEY / L_LINENUMBER > 3",
+    );
+    assert_eq!(
+        oracle_count, 2,
+        "native oracle row count must be 2, got {oracle_count}"
+    );
+
+    let fixture_orderkey_7_count = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM {} WHERE L_ORDERKEY = 7",
+        vs_lineitem_table()
+    ));
+    assert_eq!(
+        fixture_orderkey_7_count, LINES_PER_ORDER as i64,
+        "the synthetic oracle table must describe the same fixture rows the \
+         pushed-down filter runs over: L_ORDERKEY = 7 must hold {} rows in the \
+         seeded fixture, got {fixture_orderkey_7_count}",
+        LINES_PER_ORDER
+    );
+    assert_eq!(
+        fixture_orderkey_7_count, oracle_count,
+        "the synthetic oracle table must describe the same fixture rows the \
+         pushed-down filter runs over: fixture row count for L_ORDERKEY = 7 \
+         ({fixture_orderkey_7_count}) must match the oracle row count \
+         ({oracle_count})"
+    );
+
+    let vs_sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE L_ORDERKEY / L_LINENUMBER > 3 AND L_ORDERKEY = 7",
+        vs_lineitem_table()
+    );
+    let vs_count = conn.query_scalar_i64(&vs_sql);
+    assert_eq!(
+        vs_count, oracle_count,
+        "pushed-down filter L_ORDERKEY/L_LINENUMBER > 3 AND L_ORDERKEY = 7 \
+         must match the native oracle count {oracle_count} (truncated integer \
+         division silently drops a matching row), got {vs_count}"
     );
 }

@@ -42,6 +42,12 @@ use std::sync::OnceLock;
 
 const VS_NAME: &str = "MY_LAKEHOUSE";
 
+/// Relative tolerance for the FLOAT_DIV native-oracle comparisons. Basis:
+/// decision-log [7] measured the fix's worst-case divergence from native
+/// Exasol at ~1 ULP (max relative difference `3.17e-16`), so `1e-15` holds
+/// with ~3x headroom.
+const FLOAT_DIV_ORACLE_REL_TOLERANCE: f64 = 1e-15;
+
 // ---------------------------------------------------------------------------
 // One-time setup (idempotent; identical to e2e_scan_test.rs)
 // ponytail: duplicate of e2e_scan_test setup — both test binaries link the
@@ -4675,5 +4681,69 @@ fn over_length_char_projection_fails_cleanly() {
         sql_code.contains("22002"),
         "expected Exasol's UDF-emit truncation error (sqlCode 22002, \"string \
          data, right truncation\"), got sqlCode={sql_code:?} message={message:?}: {resp}"
+    );
+}
+
+/// `C_DECIMAL_A/7` at `id=6` (`c_decimal_a=40.99`, `DECIMAL(9,2)`) against a
+/// native oracle over the same literal value. Native Exasol's `/` is
+/// `FN_FLOAT_DIV`, always true float division: `40.99/7` =
+/// `5.855714285714286`. Pre-fix, the DataFusion dialect rendered `FLOAT_DIV`
+/// as a bare `/`, which DataFusion coerces `Decimal128/Int64` division to
+/// scale 6, truncating the pushed-down value to `5.855714` (#186).
+#[test]
+fn e2e_float_div_decimal_over_int_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle_cols = conn.query_columns("SELECT CAST(40.99 AS DECIMAL(9,2)) / 7");
+    let oracle_value = parse_numeric(&oracle_cols[0][0]);
+    let expected = 5.855714285714286;
+    assert!(
+        (oracle_value - expected).abs() <= FLOAT_DIV_ORACLE_REL_TOLERANCE * expected.abs(),
+        "native oracle 40.99/7 must be ~5.855714285714286, got {oracle_value}"
+    );
+
+    let vs_sql = format!("SELECT C_DECIMAL_A/7 FROM {} WHERE ID=6", vs_typed_table());
+    let vs_cols = conn.query_columns(&vs_sql);
+    let vs_value = parse_numeric(&vs_cols[0][0]);
+    assert!(
+        (vs_value - oracle_value).abs() <= FLOAT_DIV_ORACLE_REL_TOLERANCE * oracle_value.abs(),
+        "pushed-down C_DECIMAL_A/7 at id=6 must match the native oracle \
+         {oracle_value} (decimal/int FLOAT_DIV must not truncate to scale 6), \
+         got {vs_value}"
+    );
+}
+
+/// `C_DECIMAL_A/C_DECIMAL_B` at `id=6` (`c_decimal_a=40.99` `DECIMAL(9,2)`,
+/// `c_decimal_b=400000.0004` `DECIMAL(20,4)`) against a native oracle over
+/// the same literal values: `40.99/400000.0004` = `0.000102474999897525`.
+/// Pre-fix, the DataFusion dialect's bare `/` coerces `Decimal128/Decimal128`
+/// division to scale 6, truncating the pushed-down value to `0.000102`
+/// (#186).
+#[test]
+fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle_cols = conn
+        .query_columns("SELECT CAST(40.99 AS DECIMAL(9,2)) / CAST(400000.0004 AS DECIMAL(20,4))");
+    let oracle_value = parse_numeric(&oracle_cols[0][0]);
+    let expected = 0.000102474999897525;
+    assert!(
+        (oracle_value - expected).abs() <= FLOAT_DIV_ORACLE_REL_TOLERANCE * expected.abs(),
+        "native oracle 40.99/400000.0004 must be ~0.000102474999897525, got {oracle_value}"
+    );
+
+    let vs_sql = format!(
+        "SELECT C_DECIMAL_A/C_DECIMAL_B FROM {} WHERE ID=6",
+        vs_typed_table()
+    );
+    let vs_cols = conn.query_columns(&vs_sql);
+    let vs_value = parse_numeric(&vs_cols[0][0]);
+    assert!(
+        (vs_value - oracle_value).abs() <= FLOAT_DIV_ORACLE_REL_TOLERANCE * oracle_value.abs(),
+        "pushed-down C_DECIMAL_A/C_DECIMAL_B at id=6 must match the native \
+         oracle {oracle_value} (decimal/decimal FLOAT_DIV must not truncate \
+         to scale 6), got {vs_value}"
     );
 }

@@ -39,7 +39,9 @@ use serde_json::Value as Json;
 /// cannot derive — either because it is not a call at all, or because the
 /// DataFusion side is not — and are `Shaped`. They fall into six groups:
 /// - the five operator wire names `ADD`, `SUB`, `MULT`, `FLOAT_DIV`, `NEG` —
-///   SQL operators, not calls;
+///   SQL operators, not calls (`FLOAT_DIV` alone diverges by dialect: a
+///   DataFusion-only `CAST(... AS DOUBLE)` on its left operand forces true
+///   float division; `ADD`/`SUB`/`MULT`/`NEG` render identically in both);
 /// - `MOD` — Exasol requires the `MOD(a, b)` form, DataFusion the `%`
 ///   operator;
 /// - `CONCAT` — the wire encoding of Exasol's `||` operator, so it renders as
@@ -432,6 +434,8 @@ fn snap_timestamp_precision(p: u64) -> u64 {
     }
 }
 
+const DOUBLE_TYPE: &str = "DOUBLE";
+
 /// Map a VS `dataType` JSON object to a DataFusion SQL type name.
 fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfError> {
     let type_name = data_type.get("type").and_then(|t| t.as_str()).unwrap_or("");
@@ -490,7 +494,7 @@ fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfE
             let s = data_type.get("scale").and_then(|v| v.as_u64()).unwrap_or(0);
             Ok(format!("DECIMAL({p},{s})"))
         }
-        "DOUBLE" | "DOUBLE PRECISION" => Ok("DOUBLE".to_string()),
+        "DOUBLE" | "DOUBLE PRECISION" => Ok(DOUBLE_TYPE.to_string()),
         "BOOLEAN" => Ok("BOOLEAN".to_string()),
         "DATE" => Ok("DATE".to_string()),
         "TIMESTAMP" => {
@@ -548,6 +552,10 @@ fn format_decimal_exasol_style(expr_sql: &str) -> String {
     format!(
         "regexp_replace(regexp_replace(CAST({expr_sql} AS VARCHAR), '(\\.[0-9]*[1-9])0+$', '\\1'), '\\.0+$', '')"
     )
+}
+
+fn cast_to_double(expr_sql: &str) -> String {
+    format!("CAST({expr_sql} AS {DOUBLE_TYPE})")
 }
 
 /// Render a CAST node body to `CAST(<expr> AS <target>)`.
@@ -992,7 +1000,8 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 // must stay in lockstep with capabilities.rs's FN_ADD / FN_SUB /
                 // FN_MULT / FN_FLOAT_DIV — in particular multiplication is `MULT`
                 // (from FN_MULT), NOT `MUL`. CAST (below) is still translated but not
-                // advertised as a capability.
+                // advertised as a capability. FLOAT_DIV alone renders a DataFusion-only
+                // CAST-to-DOUBLE below; ADD/SUB/MULT render identically in both dialects.
                 "ADD" | "SUB" | "MULT" | "FLOAT_DIV" => {
                     let op = match fn_name.as_str() {
                         "ADD" => "+",
@@ -1015,6 +1024,10 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let right = render_expression_inner(&args[1], dialect)?.ok_or_else(|| {
                         UdfError::User(format!("{fn_name} right operand is null"))
                     })?;
+                    let left = match (fn_name.as_str(), dialect) {
+                        ("FLOAT_DIV", Dialect::DataFusion) => cast_to_double(&left),
+                        _ => left,
+                    };
                     Ok(Some(format!("({left} {op} {right})")))
                 }
                 // Unary negation
