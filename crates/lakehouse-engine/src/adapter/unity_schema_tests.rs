@@ -178,7 +178,7 @@ fn create_vs_request() -> Json {
         "properties": {
             "CATALOG_CONNECTION": "uc_conn",
             "CATALOG_KIND": "UNITY_CATALOG",
-            "ICEBERG_NAMESPACE": NAMESPACE,
+            "NAMESPACE": NAMESPACE,
         },
     })
 }

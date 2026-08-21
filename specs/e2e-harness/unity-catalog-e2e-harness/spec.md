@@ -58,7 +58,7 @@ The suite runs against the #325 fixture harness: the `docker-compose.unity.yml` 
 
 ### Scenario: Create virtual schema over a Unity Catalog namespace lists the fixture tables and columns
 
-* *GIVEN* a running Unity Catalog stack seeded with the fixtures and an Exasol CONNECTION whose address is `http://unitycatalog:8080`, whose password supplies no auth field, and a createVirtualSchema request whose `CATALOG_KIND` is `UNITY_CATALOG` and whose `ICEBERG_NAMESPACE` property is `unity.delta_e2e`
+* *GIVEN* a running Unity Catalog stack seeded with the fixtures and an Exasol CONNECTION whose address is `http://unitycatalog:8080`, whose password supplies no auth field, and a createVirtualSchema request whose `CATALOG_KIND` is `UNITY_CATALOG` and whose `NAMESPACE` property is `unity.delta_e2e`
 * *WHEN* the suite issues createVirtualSchema against that CONNECTION
 * *THEN* the created virtual schema SHALL expose one virtual table per seeded fixture table, each named by the shared flatten-and-uppercase rule
 * *AND* each virtual table SHALL declare its columns with Exasol types mapped from the Unity Catalog column types, so a seeded fixture's columns appear with the expected Exasol types

@@ -40,6 +40,13 @@ fn entry_with_delete(path: &str, delete: &str) -> FileEntry {
     )
 }
 
+/// The owned-path set a side is expected to hold, built from LITERAL object-store
+/// paths rather than through `store_path`, so an expectation cannot agree with a
+/// broken resolution rule by sharing it.
+fn owned_paths(paths: &[&str]) -> HashSet<ObjectStorePath> {
+    paths.iter().map(|p| ObjectStorePath::from(*p)).collect()
+}
+
 /// An in-memory store holding `label` as the payload of every path in `paths`,
 /// so a value read back through the router names the side that served it.
 async fn store_labelled(label: &str, paths: &[&str]) -> Arc<dyn ObjectStore> {
@@ -235,6 +242,54 @@ async fn a_deletion_vector_contributes_no_owned_path() {
     assert_eq!(
         side.owned, expected,
         "a deletion vector must contribute no owned path, only the data file's own"
+    );
+}
+
+/// "Delete-file relative and absolute paths resolve like data-file paths"
+/// (`datafusion-scan/scan-execution-file-metadata`): the ownership construction
+/// resolves each delete FILE path through the same table-root rule as the data
+/// file it hangs off — a relative path joins onto the root, an already-absolute
+/// path passes through unchanged, and an empty root joins nothing.
+#[test]
+fn delete_file_paths_resolve_against_the_table_root_like_data_file_paths() {
+    let rooted = [
+        entry_with_delete("data/f1.parquet", "deletes/f1-deletes.parquet"),
+        entry_with_delete(
+            "data/f2.parquet",
+            "s3://bucket/out-of-tree/f2-deletes.parquet",
+        ),
+    ];
+    let rooted_side = RoutedSide::new(
+        &scan_side(FACT_LABEL, &rooted, FACT_ROOT),
+        Arc::new(InMemory::new()),
+    )
+    .expect("rooted fact side");
+
+    assert_eq!(
+        rooted_side.owned,
+        owned_paths(&[
+            "wh/fact/data/f1.parquet",
+            "wh/fact/deletes/f1-deletes.parquet",
+            "wh/fact/data/f2.parquet",
+            "out-of-tree/f2-deletes.parquet",
+        ]),
+        "a relative delete path joins onto the table root; an absolute one passes through"
+    );
+
+    let rootless = [entry_with_delete(
+        "s3://bucket/wh/fact/data/f3.parquet",
+        "s3://bucket/out-of-tree/f3-deletes.parquet",
+    )];
+    let rootless_side = RoutedSide::new(
+        &scan_side(FACT_LABEL, &rootless, ""),
+        Arc::new(InMemory::new()),
+    )
+    .expect("rootless fact side");
+
+    assert_eq!(
+        rootless_side.owned,
+        owned_paths(&["wh/fact/data/f3.parquet", "out-of-tree/f3-deletes.parquet"]),
+        "an empty table root joins no delete path"
     );
 }
 

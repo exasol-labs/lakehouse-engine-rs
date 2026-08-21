@@ -34,9 +34,8 @@ use lakehouse_catalog::{
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 
-// The Iceberg namespace to expose. Replaces the old TABLE_NAME property.
-// (TABLE is an Exasol reserved keyword; ICEBERG_NAMESPACE is not.)
-const PROP_ICEBERG_NAMESPACE: &str = "ICEBERG_NAMESPACE";
+// The namespace to expose, for either catalog kind.
+const PROP_NAMESPACE: &str = "NAMESPACE";
 // Required: name of the Exasol CONNECTION object that holds the catalog URI
 // (as its address) and the credential JSON (as its password).
 const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
@@ -93,7 +92,7 @@ const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
 const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
 // VS property and adapterNotes key names for the join-broadcast byte-size threshold: the
 // smaller side of a two-table inner equi-join is broadcast (replicated into every shard's
-// common spec) when its Iceberg-manifest byte size is at or below this threshold; larger
+// common spec) when its total resolved file byte size is at or below this threshold; larger
 // joins fall back to an unaccelerated two-scan join. See backlog BL-001 / plan
 // `add-join-pushdown-broadcast`.
 const PROP_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
@@ -115,7 +114,7 @@ const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
 /// an OS thread, the connection budget can be a small multiple of the thread budget rather than
 /// a 1:1 mirror. `4` keeps enough requests in flight to hide S3 latency while staying bounded.
 const S3_CONNECTIONS_PER_THREAD: usize = 4;
-// adapterNotes key for the Exasol-name → Iceberg-identifier map persisted at create time.
+// adapterNotes key for the Exasol-name → catalog identifier map persisted at create time.
 const NOTE_TABLE_MAP: &str = "TABLE_MAP";
 
 /// Main adapter dispatch function.
@@ -237,14 +236,11 @@ fn handle_create_virtual_schema(
     // single `CATALOG_KIND` parse, reused below for `construct_catalog_client`.
     let config = resolve_connection_config(ctx, &props)?;
 
-    let iceberg_namespace = nonempty_str(&props, PROP_ICEBERG_NAMESPACE)
-        .ok_or_else(|| UdfError::User(format!("property '{PROP_ICEBERG_NAMESPACE}' is required")))?
+    let namespace = nonempty_str(&props, PROP_NAMESPACE)
+        .ok_or_else(|| UdfError::User(format!("property '{PROP_NAMESPACE}' is required")))?
         .to_string();
 
-    let configured_ns: Vec<String> = iceberg_namespace
-        .split('.')
-        .map(|s| s.to_string())
-        .collect();
+    let configured_ns: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
 
     let nr_of_cores = resolve_nr_of_cores(&props);
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
@@ -404,7 +400,7 @@ async fn handle_pushdown_request(
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES);
 
-    // Derive the scanned Iceberg table from involvedTables[0].name via TABLE_MAP.
+    // Derive the scanned table from involvedTables[0].name via TABLE_MAP.
     let iceberg_identifier = resolve_pushdown_identifier(request)?;
     let catalog = catalog_block(&config.creds, &iceberg_identifier);
 
@@ -519,7 +515,7 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
 /// Read the TABLE_MAP nested object from adapterNotes.
 ///
 /// Returns a `HashMap<String, String>` mapping Exasol table name → original-cased
-/// Iceberg identifier. Returns an empty map when TABLE_MAP is absent or malformed.
+/// catalog identifier. Returns an empty map when TABLE_MAP is absent or malformed.
 fn read_table_map(request: &Json) -> HashMap<String, String> {
     parse_adapter_notes(request)
         .get(NOTE_TABLE_MAP)
@@ -628,10 +624,10 @@ fn build_listing_virtual_tables(
     Ok((tables_json, table_map, listing.skipped.clone()))
 }
 
-/// Resolve the Iceberg identifier for the pushdown's involved virtual table.
+/// Resolve the catalog identifier for the pushdown's involved virtual table.
 ///
 /// Reads `involvedTables[0].name`, looks it up in the persisted `TABLE_MAP`, and
-/// returns the original-cased Iceberg identifier. Errors when the request carries
+/// returns the original-cased catalog identifier. Errors when the request carries
 /// no involved table, or the name is absent from `TABLE_MAP` (never silently
 /// scans a different or stale table).
 fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
@@ -659,7 +655,7 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 /// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
 /// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS,
 /// JOIN_BROADCAST_MAX_BYTES, and TABLE_MAP (a nested JSON object mapping Exasol
-/// table names to original-cased Iceberg identifiers). Any pre-existing notes on
+/// table names to original-cased catalog identifiers). Any pre-existing notes on
 /// the request are preserved (merge, not clobber).
 // ponytail: args mirror the resolved notes fields one-to-one; a params struct is
 // pure boilerplate for a single private callee.

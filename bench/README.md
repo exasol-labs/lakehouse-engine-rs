@@ -45,7 +45,7 @@ the live row set by applying Parquet position-delete files during a scan.
   first delete-bench (it submits `deploy/scripts/make_deletes_remote.py` as an EMR
   Serverless job). If skipped, `run.sh` hard-errors pointing at that script.
 - `BENCH_DELETE_NAMESPACE` overrides which namespace is used (default
-  `${ICEBERG_NAMESPACE}_deletes` docker / `tpch_deletes` remote); see
+  `${NAMESPACE}_deletes` docker / `tpch_deletes` remote); see
   `bench/.env.example` for the exact knobs.
 - A flag-gated sanity check confirms deletes are actually applied on read (not
   ignored, not over-applied): `OK  delete-count LINEITEM: <n> (~95% of baseline

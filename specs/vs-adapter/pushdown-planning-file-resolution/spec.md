@@ -1,23 +1,34 @@
 # Feature: Pushdown File Resolution
 
-Resolves an Iceberg table's identity and current file state exactly once per pushdown,
-before any SQL is built. Recovers the target Iceberg table from the Exasol involved-table
-name via the persisted `TABLE_MAP`, builds a multi-level `TableIdent` when the identifier
-spans more than one namespace segment, and resolves that table's Iceberg snapshot,
-data-file list, each file's byte size, and — for merge-on-read tables — each file's
-associated positional-delete files, all at one resolve-once seam so the scan UDF never
-discovers files, delete files, or sizes itself. The same seam extracts the table's current
-Iceberg schema (field-id, current name, Arrow type, nullability) for field-id-based
-projection. A `loadTable` response that carries no table `location` is rejected here,
-before the vended/static storage split, so every path depending on a table root —
-including each join side — fails identically rather than resolving an empty root. See
+Resolves a table's identity and current file state exactly once per pushdown, before any
+SQL is built. Recovers the target table from the Exasol involved-table name via the
+persisted `TABLE_MAP` and hands it to the format reader that owns its table format, which
+returns the active data-file list, each file's byte size, the logical schema, the table
+root, and — where the format has them — each file's associated delete references, all at one
+resolve-once seam so the scan UDF never discovers files, delete files, or sizes itself. That
+orchestration has no Delta counterpart feature because it never needed one: a Delta table
+reaches it by the same route an Iceberg one does
+(`vs-adapter/pushdown-format-neutral-resolution`). This feature owns the ICEBERG reader's
+half of the seam — the multi-level `TableIdent` build, the Iceberg snapshot and
+`current_schema()` read that produce the field-id-carrying logical schema, and the
+merge-on-read positional-delete resolution; the Delta reader's half is owned by
+`vs-adapter/delta-table-planning`. A `loadTable` response that carries no table `location`
+is rejected here, before the vended/static storage split, so every path depending on a table
+root — including each join side — fails identically rather than resolving an empty root. See
 `vs-adapter/pushdown-planning` for how the resolved table identity, file list, byte sizes,
 delete-file references, and logical schema feed the scan-driving SQL.
 
 ## Background
 
-* The data-file list, each file's byte size (from the Iceberg manifest), and the current Iceberg schema are resolved exactly once per pushdown, in the planning layer; the scan UDF never discovers files itself.
-* The logical schema carried into the common scan-spec argument identifies each column by its Iceberg field-id, current name, Arrow type, and nullability.
+* The resolve-once ORCHESTRATION — the `TABLE_MAP` lookup, one resolve per pushdown, and one
+  `ScanSpec` build — is format-neutral: every table format reaches it by the same route
+  (`vs-adapter/pushdown-format-neutral-resolution`), and the scan UDF never discovers files,
+  delete files, or sizes itself. Only the READER behind that seam is format-specific. This
+  feature owns the ICEBERG reader's half — the multi-level `TableIdent` build, the snapshot and
+  `current_schema()` read, each file's byte size from the Iceberg manifest, and merge-on-read
+  positional-delete resolution; the Delta reader's half is owned by
+  `vs-adapter/delta-table-planning`.
+* The logical schema this feature's Iceberg reader produces identifies each column by its Iceberg field-id, current name, Arrow type, and nullability.
 * Each per-shard file entry carries both the file path and its byte size, so the scan UDF never re-discovers a size the adapter already resolved.
 * The data-file list, each file's byte size, and each file's associated positional-delete files are resolved exactly once, at the same seam; the scan UDF never discovers files or delete files.
 * Delete support keeps the wire surface minimal — per-file delete references only, with no serialized Iceberg schema and no bound predicate added to the spec.
@@ -106,9 +117,10 @@ delete-file references, and logical schema feed the scan-driving SQL.
 * *AND* a query that projects a subset of columns from one of those tables
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
-* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF, carrying the logical schema AND the Iceberg table root in the shard-invariant common spec spliced ONCE as the scalar scan's first-argument literal, and the resolved data-file list flowed through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
+* *AND* the adapter SHALL return a JSON response of type `pushdown` containing SQL that invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF, carrying the logical schema AND the table root in the shard-invariant common spec spliced ONCE as the scalar scan's first-argument literal, and the resolved data-file list flowed through the nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor as the per-shard argument, where each per-shard entry carries the file path together with its resolved byte size
 * *AND* the outer scalar scan select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary
 * *AND* the adapter MUST NOT require the scan UDF to discover files itself, and MUST NOT require the scan UDF to re-fetch any file's size
+* *AND* the resolve-once orchestration this scenario describes — `TABLE_MAP` lookup, one resolve, one `ScanSpec` build — SHALL be reached identically by every table format, with the format reader supplying the file list, byte sizes, logical schema, and table root (`vs-adapter/pushdown-format-neutral-resolution`); only the reader behind the seam is format-specific
 
 ### Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent
 

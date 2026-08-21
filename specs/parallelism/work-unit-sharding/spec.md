@@ -1,6 +1,6 @@
 # Feature: Work-Unit File Sharding
 
-Partitions the once-resolved Iceberg data-file list into G oversubscribed work-units
+Partitions the once-resolved data-file list into G oversubscribed work-units
 ("shards") and drives them across the cluster. Rather than sharding one-per-node, the
 adapter sizes G to oversubscribe the cluster (G = node_count × parallelism_factor,
 capped so the group set stays in Exasol's round-robin distribution regime) and emits a
@@ -9,8 +9,8 @@ LUA SET script re-emits each shard's per-file list once per `shard_key` group so
 `GROUP BY shard_key` distributes the assignments round-robin across nodes, and the
 `LAKEHOUSE_SCAN` scalar EMIT UDF then scans each distributed file list node-locally
 and STREAMS its rows. Because the scan is scalar (no top-level `GROUP BY`), Exasol does
-not materialize the scan output. The shard-invariant common spec (including the Iceberg
-table root) is serialized ONCE as the scalar scan's first-argument literal; only each
+not materialize the scan output. The shard-invariant common spec (including the table
+root) is serialized ONCE as the scalar scan's first-argument literal; only each
 shard's per-file subset flows through the distributor. Work assignment is computed
 entirely in the planning layer; each scan invocation reads only its own shard of files
 and no file is scanned twice.
@@ -31,7 +31,7 @@ and no file is scanned twice.
   `≥ 1` and `≤ file_count` so no shard is empty.
 * Files are assigned to the G shards by a byte-balanced split
   (`partition_files_by_bytes`), called with G instead of node_count. Each file
-  carries its `file_size_in_bytes` from the Iceberg `FileScanTask`; the split
+  carries the byte size the format reader resolved into its file entry; the split
   balances cumulative bytes per shard, not file count, so per-shard scan work is
   even. A file whose reported size is 0 is weighted as 1 byte so it is still
   assigned and never skipped.
@@ -66,13 +66,14 @@ and no file is scanned twice.
 
 ### Scenario: File list is partitioned into G byte-balanced disjoint shards covering every file
 
-* *GIVEN* a resolved data-file list in which each file carries its `file_size_in_bytes` (from the Iceberg `FileScanTask`) and a computed shard count G
+* *GIVEN* a resolved data-file list in which each file carries its byte size as resolved by its table's format reader and a computed shard count G
 * *WHEN* the adapter partitions the file list
 * *THEN* the adapter SHALL partition the file list into exactly G shards by cumulative file size, assigning each file in descending-size order to the shard whose running byte total is currently smallest
-* *AND* the adapter SHALL treat any file whose reported `file_size_in_bytes` is 0 as weighing 1 byte, so the file is still assigned to a shard and never skipped
+* *AND* the adapter SHALL treat any file whose reported byte size is 0 as weighing 1 byte, so the file is still assigned to a shard and never skipped
 * *AND* every resolved file SHALL appear in exactly one shard and no file SHALL appear in more than one shard
 * *AND* when G is at least the file count the adapter SHALL produce exactly one file per shard with no empty shards
 * *AND* each shard SHALL carry, for every file it holds, both the file path and its byte size, so the resolved size is propagated into the per-shard payload rather than discarded
+* *AND* the split SHALL be computed without reference to the table format that resolved the list, so an Iceberg file list and a Delta file list of the same shape produce the same shards
 
 ### Scenario: Fewer files than G produces one shard per file with no empty shards
 
@@ -87,7 +88,7 @@ and no file is scanned twice.
 * *GIVEN* a file list partitioned into more than one shard
 * *WHEN* the adapter builds the scan-driving SQL
 * *THEN* the generated SQL SHALL nest a `GROUP BY shard_key` distributor subquery — a `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET UDF invoked over a `VALUES` relation of `(shard_key, files)` rows grouped on `shard_key` (NOT on `IPROC()`) — inside an outer ungrouped select that invokes the `LAKEHOUSE_SCAN` scalar EMIT UDF once per distributed row
-* *AND* the shard-invariant common spec (including the Iceberg table root) SHALL be serialized EXACTLY ONCE as a single SQL string literal spliced as the scalar scan UDF's first argument, shared by every shard invocation, rather than repeated per shard and rather than flowed through the distributor
+* *AND* the shard-invariant common spec (including the table root) SHALL be serialized EXACTLY ONCE as a single SQL string literal spliced as the scalar scan UDF's first argument, shared by every shard invocation, rather than repeated per shard and rather than flowed through the distributor
 * *AND* only each shard's per-file `files` subset SHALL flow through the distributor's `VALUES` rows as the scalar scan UDF's second argument, and the table root SHALL NOT appear in any per-shard argument
 * *AND* the outer scalar select MUST NOT be wrapped in a `SELECT * FROM (...)` materialization boundary, so the scalar scan streams its rows rather than Exasol buffering them into a temp table
 * *AND* the union of all shard outputs SHALL be identical as an order-independent multiset to the equivalent single-shard scan

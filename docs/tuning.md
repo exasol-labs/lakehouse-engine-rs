@@ -13,7 +13,8 @@ All properties belong to `CREATE VIRTUAL SCHEMA` unless the table says otherwise
 | Property | Required | Default | Effect |
 |---|---|---|---|
 | `CATALOG_CONNECTION` | yes | — | Name of the Exasol CONNECTION that holds the catalog URI + credentials JSON. See [Install](install.md). |
-| `ICEBERG_NAMESPACE` | yes | — | Iceberg namespace. Every table in the namespace becomes a virtual table. |
+| `CATALOG_KIND` | no | absent (Iceberg REST) | Which catalog backend to resolve against: leave it absent for an Iceberg REST catalog, or set `'UNITY_CATALOG'` for a native Unity Catalog. Any other value, including the literal `'ICEBERG_REST'`, is rejected — Iceberg REST is selected only by leaving the property unset. See [Catalogs](catalogs.md). |
+| `NAMESPACE` | yes | — | Catalog namespace: dot-delimited Iceberg namespace segments under `ICEBERG_REST`, or `catalog.schema` under `UNITY_CATALOG`. Every table in the namespace becomes a virtual table. |
 | `ALLOW_HTTP` | no | `false` | `'true'` permits plain-HTTP catalog/S3 (for example, local MinIO). |
 | `NR_OF_CORES` | no | auto-detected (else 0) | Per-node core count. It drives the parallelism factor and the thread budget. Set it only if auto-detection gives a wrong value. |
 | `PARALLELISM_FACTOR` | no | `max(NR_OF_CORES × 2, 8)` | Shard oversubscription multiplier. `G = node_count × factor`, capped 300. |
@@ -24,7 +25,7 @@ All properties belong to `CREATE VIRTUAL SCHEMA` unless the table says otherwise
 | `MEMORY_POOL_FRACTION` | no | `0.6` | Fraction of the per-instance memory limit given to the DataFusion pool. Kept < the engine's 80 % stall threshold. |
 | `INSTANCE_OVERHEAD_MB` | no | `200` | Per-instance overhead subtracted from the reported limit before the pool fraction applies. |
 | `S3_MAX_CONNECTIONS` | no | `AUTO` | Object-store HTTP connection-pool budget per scan instance. `AUTO` derives the value from the cores and the threading mode. See below. |
-| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Byte-size threshold from Iceberg manifest sizes, with no Parquet read. Below this threshold, the engine broadcasts the smaller side of a two-table inner equi-join into every shard. Above it, the engine falls back to an unaccelerated two-scan join. |
+| `JOIN_BROADCAST_MAX_BYTES` | no | `134217728` (128 MiB) | Byte-size threshold from each side's total resolved file size (the Iceberg manifest's `file_size_in_bytes` or the Delta `add` action's `size`), with no Parquet read. Below this threshold, the engine broadcasts the smaller side of a two-table inner equi-join into every shard. Above it, the engine falls back to an unaccelerated two-scan join. |
 | `LAKEHOUSE_UDF_DEBUG_LEVEL` | no (env var) | `info` | `debug` emits per-scan phase telemetry. `info` is silent. See below. |
 
 Create these three scripts in the same schema as `LAKEHOUSE_ADAPTER`:

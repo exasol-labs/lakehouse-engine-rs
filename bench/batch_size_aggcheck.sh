@@ -8,13 +8,13 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 set -a; . bench/.env; set +a
 DSN="exasol://sys:${EXASOL_SYS_PASSWORD}@${EXASOL_HOST}:${LH_EXASOL_PORT:-8563}?validateservercertificate=0"
-NS="${ICEBERG_NAMESPACE:-tpch}"; CORES="${BENCH_NR_OF_CORES:-8}"; PF="${BENCH_PARALLELISM_FACTOR:-8}"
+NS="${NAMESPACE:-tpch}"; CORES="${BENCH_NR_OF_CORES:-8}"; PF="${BENCH_PARALLELISM_FACTOR:-8}"
 SIZES="${*:-8192 131072}"
 REPORT="bench/reports/batch-size-aggcheck-$(date +%Y%m%d-%H%M%S).txt"; : > "$REPORT"
 qout(){ printf '%s' "$1" | exapump sql -d "$DSN" -f csv 2>&1; }
 recreate_vs(){ printf '%s' "DROP VIRTUAL SCHEMA IF EXISTS TPCH CASCADE" | exapump sql -d "$DSN" >/dev/null 2>&1
   printf '%s' "CREATE VIRTUAL SCHEMA TPCH USING LHVS.LAKEHOUSE_ADAPTER WITH
-    CATALOG_CONNECTION='LAKEHOUSE_CATALOG_CREDS' ICEBERG_NAMESPACE='${NS}'
+    CATALOG_CONNECTION='LAKEHOUSE_CATALOG_CREDS' NAMESPACE='${NS}'
     NR_OF_CORES='${CORES}' PARALLELISM_FACTOR='${PF}' DATAFUSION_BATCH_SIZE='${1}'" | exapump sql -d "$DSN" >/dev/null 2>&1; }
 timed(){ local lbl="$1" q="$2" t0 t1; t0=$(date +%s.%N); printf '%s' "$q" | exapump sql -d "$DSN" -f csv >/dev/null 2>&1; t1=$(date +%s.%N)
   printf '  %-4s %ss\n' "$lbl" "$(awk "BEGIN{printf \"%.2f\", $t1-$t0}")" | tee -a "$REPORT"; }
