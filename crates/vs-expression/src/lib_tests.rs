@@ -389,14 +389,30 @@ fn renders_two_column_arithmetic_product() {
 /// This table is the translator-side half kept in sync by construction.
 #[test]
 fn arithmetic_operator_set_matches_advertised_capabilities() {
-    // (capability name, node name = capability minus FN_, rendered operator)
+    // (capability name, node name = capability minus FN_, expected rendering)
     let arithmetic = [
-        ("FN_ADD", "ADD", "+"),
-        ("FN_SUB", "SUB", "-"),
-        ("FN_MULT", "MULT", "*"),
-        ("FN_FLOAT_DIV", "FLOAT_DIV", "/"),
+        (
+            "FN_ADD",
+            "ADD",
+            r#"("L_EXTENDEDPRICE" + "L_DISCOUNT")"#.to_string(),
+        ),
+        (
+            "FN_SUB",
+            "SUB",
+            r#"("L_EXTENDEDPRICE" - "L_DISCOUNT")"#.to_string(),
+        ),
+        (
+            "FN_MULT",
+            "MULT",
+            r#"("L_EXTENDEDPRICE" * "L_DISCOUNT")"#.to_string(),
+        ),
+        (
+            "FN_FLOAT_DIV",
+            "FLOAT_DIV",
+            r#"(CAST("L_EXTENDEDPRICE" AS DOUBLE) / "L_DISCOUNT")"#.to_string(),
+        ),
     ];
-    for (cap, node, op) in arithmetic {
+    for (cap, node, expected) in arithmetic {
         // node name must be the capability with the FN_ prefix removed
         assert_eq!(
             node,
@@ -413,7 +429,7 @@ fn arithmetic_operator_set_matches_advertised_capabilities() {
         });
         assert_eq!(
             render_expression(&expr).unwrap(),
-            format!(r#"("L_EXTENDEDPRICE" {op} "L_DISCOUNT")"#),
+            expected,
             "translator must render advertised capability {cap} (node {node})"
         );
     }
@@ -429,7 +445,194 @@ fn renders_arithmetic_div() {
             {"type": "literal_exactnumeric", "value": 2}
         ]
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"("A" / 2)"#);
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST("A" AS DOUBLE) / 2)"#
+    );
+}
+
+#[test]
+fn float_div_casts_column_left_operand_against_column_right_operand() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {"type": "column", "name": "a"},
+            {"type": "column", "name": "b"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST("A" AS DOUBLE) / "B")"#
+    );
+}
+
+#[test]
+fn float_div_casts_literal_left_operand_against_column_right_operand() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {"type": "literal_exactnumeric", "value": 10},
+            {"type": "column", "name": "b"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST(10 AS DOUBLE) / "B")"#
+    );
+}
+
+#[test]
+fn float_div_casts_literal_left_operand_against_literal_right_operand() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {"type": "literal_exactnumeric", "value": 10},
+            {"type": "literal_exactnumeric", "value": 4}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST(10 AS DOUBLE) / 4)"#
+    );
+}
+
+#[test]
+fn float_div_casts_nested_expression_left_operand_against_column_right_operand() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {
+                "type": "function_scalar",
+                "name": "ADD",
+                "arguments": [
+                    {"type": "column", "name": "a"},
+                    {"type": "column", "name": "b"}
+                ]
+            },
+            {"type": "column", "name": "c"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST(("A" + "B") AS DOUBLE) / "C")"#
+    );
+}
+
+#[test]
+fn float_div_casts_nested_expression_left_operand_against_literal_right_operand() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {
+                "type": "function_scalar",
+                "name": "ADD",
+                "arguments": [
+                    {"type": "column", "name": "a"},
+                    {"type": "column", "name": "b"}
+                ]
+            },
+            {"type": "literal_exactnumeric", "value": 2}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST(("A" + "B") AS DOUBLE) / 2)"#
+    );
+}
+
+#[test]
+fn float_div_casts_aggregate_left_operand_against_column_right_operand() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {
+                "type": "function_aggregate",
+                "name": "SUM",
+                "arguments": [{"type": "column", "name": "amount"}],
+                "distinct": false
+            },
+            {"type": "column", "name": "c"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST(SUM("AMOUNT") AS DOUBLE) / "C")"#
+    );
+}
+
+#[test]
+fn float_div_casts_aggregate_left_operand_against_literal_right_operand() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {
+                "type": "function_aggregate",
+                "name": "SUM",
+                "arguments": [{"type": "column", "name": "amount"}],
+                "distinct": false
+            },
+            {"type": "literal_exactnumeric", "value": 2}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST(SUM("AMOUNT") AS DOUBLE) / 2)"#
+    );
+}
+
+#[test]
+fn float_div_with_null_left_operand_casts_the_null_literal() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {"type": "literal_null"},
+            {"type": "column", "name": "b"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST(NULL AS DOUBLE) / "B")"#
+    );
+}
+
+#[test]
+fn float_div_with_null_right_operand_divides_by_null() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {"type": "column", "name": "a"},
+            {"type": "literal_null"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST("A" AS DOUBLE) / NULL)"#
+    );
+}
+
+#[test]
+fn float_div_null_over_zero_casts_the_null_literal_over_a_zero_literal() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {"type": "literal_null"},
+            {"type": "literal_exactnumeric", "value": 0}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"(CAST(NULL AS DOUBLE) / 0)"#
+    );
 }
 
 #[test]
@@ -3405,17 +3608,12 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
 
 #[test]
 fn arithmetic_operators_render_identically_in_both_dialects() {
-    // The five operator wire names never inspect `dialect` in their own
-    // arm — `render_expression_inner` renders the same `(<left> <op>
+    // The `ADD`/`SUB`/`MULT`/`NEG` wire names never inspect `dialect` in their
+    // own arm — `render_expression_inner` renders the same `(<left> <op>
     // <right>)` / `(-<operand>)` shape regardless of which dialect is
-    // requested. Pins that invariance directly, on the same node, for
-    // both dialects at once.
-    let binary = [
-        ("ADD", "+"),
-        ("SUB", "-"),
-        ("MULT", "*"),
-        ("FLOAT_DIV", "/"),
-    ];
+    // requested. Pins that invariance directly, on the same node, for both
+    // dialects at once.
+    let binary = [("ADD", "+"), ("SUB", "-"), ("MULT", "*")];
     for (name, op) in binary {
         let expr = json!({
             "type": "function_scalar",
@@ -3453,6 +3651,30 @@ fn arithmetic_operators_render_identically_in_both_dialects() {
         render_expression_exasol(&neg).unwrap(),
         expected_neg,
         "NEG Exasol dialect"
+    );
+}
+
+/// Divergence guard: FLOAT_DIV casts its left operand to DOUBLE only in the
+/// DataFusion dialect; the Exasol dialect renders the bare operator.
+#[test]
+fn float_div_casts_to_double_only_in_the_datafusion_dialect() {
+    let float_div = json!({
+        "type": "function_scalar",
+        "name": "FLOAT_DIV",
+        "arguments": [
+            {"type": "column", "name": "a"},
+            {"type": "literal_exactnumeric", "value": 1}
+        ]
+    });
+    assert_eq!(
+        render_expression(&float_div).unwrap(),
+        r#"(CAST("A" AS DOUBLE) / 1)"#,
+        "FLOAT_DIV DataFusion dialect"
+    );
+    assert_eq!(
+        render_expression_exasol(&float_div).unwrap(),
+        r#"("A" / 1)"#,
+        "FLOAT_DIV Exasol dialect"
     );
 }
 
