@@ -2,8 +2,11 @@
 
 Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with
 named scalar function translation: math functions, the modulo operator, string functions,
-CASE expressions, GREATEST/LEAST, and the NULLIF/COALESCE shorthands. These are distinct
-from the arithmetic operators and CAST scenarios in `vs-expression-translator-scalar-ops`.
+CASE expressions, and the NULLIF/COALESCE shorthands. These are distinct from the arithmetic
+operators and CAST scenarios in `vs-expression-translator-scalar-ops`. `GREATEST`/`LEAST` are
+specified in the sibling feature `sql-comprehension/vs-expression-translator-greatest-least`,
+split out to keep this feature's scenario count under the library threshold — the same treatment
+`FLOAT_DIV` already received into `vs-expression-translator-float-div`.
 
 ## Background
 
@@ -29,6 +32,9 @@ joining the declaration is therefore not translated at all, rather than silently
 SQL on the Exasol path. Verified on live Exasol 2025.2.1 (the image pinned in `docker-compose.yml`),
 the aliases are hard compilation errors there: `SIGNUM` and `STRPOS` both return `function or script
 <NAME> not found` (SQL code 42000), and `%` is rejected by Exasol's parser (issue #197).
+`GREATEST`/`LEAST` also follow this verbatim rule on the Exasol dialect — both names keep the
+`ExasolForm::VerbatimCall` declaration — but their DataFusion-dialect NULL-guard rendering and its
+full evidence live in `sql-comprehension/vs-expression-translator-greatest-least`.
 
 Five constructs are deliberately EXCLUDED from the verbatim rule and keep a dedicated rendering in
 both dialects, because verbatim is either impossible or wrong for them:
@@ -106,13 +112,6 @@ predicate, which stays advertised and whose per-dialect rendering is specified i
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return a `CASE WHEN <cond1> THEN <res1> [WHEN <condN> THEN <resN>]... [ELSE <else>] END` expression with each condition and result rendered recursively
 * *AND* a `function_scalar_case` node with no WHEN branch SHALL return an error in raising mode and `None` in the safe variants
-
-### Scenario: GREATEST and LEAST translate to DataFusion greatest/least
-
-* *GIVEN* a VS expression node of type `function_scalar` named `GREATEST` or `LEAST` with one or more arguments
-* *WHEN* `render_expression` processes the node
-* *THEN* `GREATEST` SHALL render as `greatest(<a1>, <a2>, ...)` and `LEAST` SHALL render as `least(<a1>, <a2>, ...)` over the recursively rendered arguments
-* *AND* `render_expression_exasol` SHALL render `GREATEST(<a1>, <a2>, ...)` / `LEAST(<a1>, <a2>, ...)` under the same verbatim rule as the other Exasol scalar functions
 
 ### Scenario: NULLIFZERO and ZEROIFNULL translate to NULLIF and COALESCE
 
