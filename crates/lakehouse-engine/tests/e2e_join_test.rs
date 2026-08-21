@@ -884,19 +884,11 @@ const GROUND_TRUTH_LINEITEM_TABLE: &str = "GROUND_TRUTH_LINEITEM";
 /// NATIVE Exasol table (in the same schema as the adapter scripts), via a
 /// plain projection over the VS.
 ///
-/// This sidesteps a separate, pre-existing single-table limitation that is
-/// explicitly out of scope for this join-focused plan (see its Non-Goals):
-/// the single-table grouped-aggregate pushdown (`detect_group_by_aggregates`)
-/// declines any select list containing a non-`function_aggregate` item — such
-/// as the `ROUND(100.0*SUM(CASE..)/COUNT(*),2)` scalar-over-aggregate used
-/// here — and falls back to a raw full-row scan with the wrong column count,
-/// hard-failing with "Expected number of columns is 5 but pushdown query has
-/// 6" if the scalar-over-aggregate select list were run directly against the
-/// virtual `fact_lineitem` table. Projection pushdown (a plain column list,
-/// no aggregates) over the VS works fine, so once the base columns are
-/// materialized natively, Exasol computes the scalar-over-aggregate itself —
-/// correct, and formatted identically to the join wrapper's Exasol-side
-/// aggregation, so plain string comparison stays valid.
+/// The ground truth must be computed by Exasol over native data so it is an
+/// oracle independent of the pushdown path under test: once the base columns
+/// are materialized natively, Exasol computes the scalar-over-aggregate
+/// itself — correct, and formatted identically to the join wrapper's
+/// Exasol-side aggregation, so plain string comparison stays valid.
 ///
 /// `CREATE OR REPLACE TABLE` is idempotent and always rebuilds from the same
 /// source VS data, so both scalar-over-aggregate tests can safely share and
@@ -1882,5 +1874,63 @@ fn e2e_self_join_with_one_sided_filter_matches_single_node() {
          leaving `b` free to match any row sharing O_CUSTKEY — including \
          rows the filter excludes for `a`.\nactual:   {actual:?}\n\
          expected: {expected:?}"
+    );
+}
+
+/// The floor for a nested aggregate on the broadcast-join path: an UNGROUPED
+/// scalar function wrapping an aggregate is the shape `carries_aggregation_clause`
+/// does not recognise — its select item is a `function_scalar`, not a
+/// `function_aggregate`, and there is no GROUP BY, HAVING, or `group_by`
+/// aggregation type to catch it either.
+///
+/// The broadcast in-UDF join renders projection, filter, and join condition only,
+/// so an aggregate riding along with it would be evaluated per shard. The
+/// projection-widening guard must therefore push the request to the N-scan
+/// wrapper, where Exasol aggregates over the materialized join: exactly ONE row
+/// equal to the single-node result, never one partial row per shard.
+#[test]
+fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = format!(
+        "SELECT ROUND(SUM(l.L_QUANTITY), 2) FROM {} o \
+         JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY",
+        vs_fact_table(VS_NAME),
+        vs_lineitem_table(VS_NAME)
+    );
+
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_two_scan_wrapper(&pushed),
+        "an ungrouped scalar-over-aggregate join must be served by the N-scan \
+         wrapper (N=2, LHS_T0/LHS_T1) so Exasol aggregates over the join:\n{pushed}"
+    );
+    assert!(
+        !has_broadcast_join_block(&pushed),
+        "an aggregate — even one hidden inside a scalar function — cannot ride \
+         the broadcast in-UDF join, which renders projection only:\n{pushed}"
+    );
+
+    ensure_ground_truth_lineitem_table(&mut conn);
+    let actual = conn.query_columns(&query);
+    assert_eq!(actual.len(), 1, "expected 1 column: {actual:?}");
+    assert_eq!(
+        actual[0].len(),
+        1,
+        "an ungrouped aggregate over a join must return exactly ONE row, not one \
+         partial row per shard: {actual:?}"
+    );
+
+    // Every `fact_lineitem` row joins exactly one `fact_orders` row, so the sum
+    // over the join equals the sum over `fact_lineitem` alone.
+    let expected = conn.query_columns(&format!(
+        "SELECT ROUND(SUM(L_QUANTITY), 2) FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE}"
+    ));
+    let (got, want) = (parse_numeric(&actual[0][0]), parse_numeric(&expected[0][0]));
+    assert!(
+        (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+        "ROUND(SUM(L_QUANTITY), 2) over the join must equal the native oracle \
+         {want}, got {got}"
     );
 }

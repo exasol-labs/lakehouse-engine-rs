@@ -5,7 +5,7 @@
 //! sees items at their declared visibility, not the elevated visibility that
 //! `pushdown`'s own `mod tests` enjoys as a descendant module.
 //!
-//! The 26-item `use` list below IS the façade's frozen baseline. There is no
+//! The 27-item `use` list below IS the façade's frozen baseline. There is no
 //! separate baseline file to consult, so there is nothing for the surface
 //! contract to drift from. Narrowing any of those items below `pub(crate)`
 //! fails this file's compilation, turning an effective visibility regression
@@ -17,9 +17,9 @@
 #![allow(unused_imports)]
 
 use crate::adapter::pushdown::{
-    ConnectionStorage, DetectedJoin, FormatReader, GroupedAggregateDetection, GroupedSelectItem,
-    IneligibleJoinReason, JoinLeaf, JoinShape, JoinSides, RefusedColumn, RenderedJoinPushdown,
-    ResolvedJoinSide, ResolvedScan, ScanSource, build_fan_out_inner,
+    AggregateMergeInputs, ConnectionStorage, DetectedJoin, FormatReader, GroupedAggregateDetection,
+    GroupedSelectItem, IneligibleJoinReason, JoinLeaf, JoinShape, JoinSides, RefusedColumn,
+    RenderedJoinPushdown, ResolvedJoinSide, ResolvedScan, ScanSource, build_fan_out_inner,
     build_grouped_aggregate_scan_sql, build_logical_schema, build_scan_driving_sql,
     detect_aggregates, detect_group_by_aggregates, detect_join, format_reader, handle_pushdown,
     render_broadcast_join, shard_count, validate_agg_col_types,

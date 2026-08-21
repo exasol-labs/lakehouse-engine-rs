@@ -814,3 +814,72 @@ fn grouped_aggregate_all_files_pruned_returns_no_rows() {
         "grouped aggregate over an all-files-pruned predicate must return zero rows, got {cols:?}"
     );
 }
+
+/// Native (non-virtual) copy of the `distinct_probe` columns the scalar-wrapped
+/// `COUNT(DISTINCT)` oracle reads.
+const GROUND_TRUTH_DISTINCT_TABLE: &str = "GT_DISTINCT_PROBE";
+
+/// The floor for a nested aggregate the single-group merge cannot decompose: a
+/// scalar function wrapping a `COUNT(DISTINCT)` widens the projection instead of
+/// being evaluated per shard, routing to the qualified single-table wrapper so
+/// Exasol computes the DISTINCT itself over the materialized scan.
+///
+/// The result must be the single-node one — exactly ONE row equal to the native
+/// oracle — not one partial row per shard, and no partial-aggregate column may
+/// appear in the pushed SQL: `COUNT(DISTINCT)` has no partial/merge
+/// decomposition, so pushing it as one would silently over-count.
+#[test]
+fn e2e_scalar_wrapped_count_distinct_routes_to_wrapper_and_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let select_list = format!("ROUND(COUNT(DISTINCT {DISTINCT_REGION_COL}), 2)");
+    let sql = format!("SELECT {select_list} FROM {}", distinct_table());
+
+    let pushed = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains(r#"AS "LHS_T0""#),
+        "a scalar-wrapped COUNT(DISTINCT) must route to the qualified \
+         single-table wrapper (one aliased raw fan-out subquery), got:\n{pushed}"
+    );
+    assert!(
+        pushed.to_uppercase().contains("COUNT(DISTINCT"),
+        "the wrapper must render the COUNT(DISTINCT) verbatim over the \
+         materialized scan, got:\n{pushed}"
+    );
+    assert!(
+        !pushed.contains("PARTIAL_"),
+        "COUNT(DISTINCT) has no partial/merge decomposition, so no partial \
+         aggregate column may be pushed for it, got:\n{pushed}"
+    );
+
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_DISTINCT_TABLE} AS \
+         SELECT {DISTINCT_CATEGORY_COL}, {DISTINCT_REGION_COL} FROM {}",
+        distinct_table()
+    ));
+
+    let actual = conn.query_columns(&sql);
+    assert_eq!(actual.len(), 1, "expected 1 column: {actual:?}");
+    assert_eq!(
+        actual[0].len(),
+        1,
+        "a scalar-wrapped COUNT(DISTINCT) must return the single-node result — \
+         exactly ONE row, not one per shard: {actual:?}"
+    );
+
+    let expected = conn.query_columns(&format!(
+        "SELECT {select_list} FROM {SCHEMA_NAME}.{GROUND_TRUTH_DISTINCT_TABLE}"
+    ));
+    let (got, want) = (parse_int(&actual[0][0]), parse_int(&expected[0][0]));
+    assert_eq!(
+        got, want,
+        "scalar-wrapped COUNT(DISTINCT {DISTINCT_REGION_COL}) must equal the \
+         native oracle {want}, got {got}"
+    );
+    assert_eq!(
+        got, DISTINCT_REGION_COUNT,
+        "the seeded fixture has {DISTINCT_REGION_COUNT} distinct \
+         {DISTINCT_REGION_COL} values, got {got}"
+    );
+}

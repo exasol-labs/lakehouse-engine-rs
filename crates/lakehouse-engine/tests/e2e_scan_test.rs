@@ -3737,3 +3737,226 @@ fn unrenderable_ordering_with_offset_matches_single_node() {
          20 ids (no VS involved), got VS={ids:?} native={native_ids:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Single-group scalar-over-aggregate decomposition (#194, #188)
+// ---------------------------------------------------------------------------
+
+/// Native (non-virtual) copy of the `fact_lineitem` columns the single-group
+/// scalar-over-aggregate oracles read. Carries `L_ORDERKEY` as well, so the
+/// all-files-pruned predicate is expressible against both surfaces.
+const GROUND_TRUTH_SINGLE_GROUP_TABLE: &str = "GT_SINGLE_GROUP_LINEITEM";
+
+fn single_group_ground_truth_table() -> String {
+    format!("{SCHEMA_NAME}.{GROUND_TRUTH_SINGLE_GROUP_TABLE}")
+}
+
+/// `CREATE OR REPLACE TABLE` is idempotent, so every test below can safely
+/// re-run this under the suite's serial (`--test-threads=1`) execution.
+fn ensure_single_group_ground_truth_table(conn: &mut ExaConn) {
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {} AS \
+         SELECT L_ORDERKEY, L_RETURNFLAG, L_QUANTITY, L_EXTENDEDPRICE FROM {}",
+        single_group_ground_truth_table(),
+        vs_lineitem_table()
+    ));
+}
+
+/// The generated scan-driving SQL alone (`EXPLAIN VIRTUAL`'s `PUSHDOWN_SQL`
+/// column), without Exasol's echoed request JSON — the only surface on which a
+/// scan-spec field assertion is meaningful, since the echoed request repeats the
+/// user's own select list and would satisfy a naive substring probe.
+fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
+    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let cols = conn.fetch_result_columns(result_set);
+    cols[1]
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Run `select_list` (plus any trailing clause) over the virtual `fact_lineitem`
+/// AND over its native oracle copy, then assert the virtual result is exactly
+/// ONE row — the merged single-group row, never one row per shard, which is the
+/// #194 symptom — whose every column equals the oracle's.
+fn assert_single_group_matches_native_oracle(conn: &mut ExaConn, select_list: &str, tail: &str) {
+    ensure_single_group_ground_truth_table(conn);
+
+    let vs_sql = format!("SELECT {select_list} FROM {} {tail}", vs_lineitem_table());
+    let oracle_sql = format!(
+        "SELECT {select_list} FROM {} {tail}",
+        single_group_ground_truth_table()
+    );
+    let actual = conn.query_columns(&vs_sql);
+    let expected = conn.query_columns(&oracle_sql);
+
+    assert_eq!(
+        actual.len(),
+        expected.len(),
+        "column count must match the native oracle: {vs_sql}\n\
+         actual: {actual:?}\nexpected: {expected:?}"
+    );
+    for (i, col) in actual.iter().enumerate() {
+        assert_eq!(
+            col.len(),
+            1,
+            "a single-group aggregate query must return exactly ONE merged row, \
+             not one partial row per shard (#194): column {i} returned {} rows \
+             for {vs_sql}\nactual: {actual:?}",
+            col.len()
+        );
+    }
+    for (i, (got_col, want_col)) in actual.iter().zip(expected.iter()).enumerate() {
+        let (got, want) = (&got_col[0], &want_col[0]);
+        if want.is_null() {
+            assert!(
+                got.is_null(),
+                "column {i} must be NULL like the native oracle, got {got:?} for {vs_sql}"
+            );
+            continue;
+        }
+        let (got_num, want_num) = (parse_numeric(got), parse_numeric(want));
+        assert!(
+            (got_num - want_num).abs() <= 1e-9 * want_num.abs().max(1.0),
+            "column {i} must equal the native oracle {want_num}, got {got_num} for {vs_sql}"
+        );
+    }
+}
+
+/// Issue #194: `SELECT ROUND(SUM(<col>), 2)` over a sharded virtual table
+/// returned one unmerged partial row PER SHARD, because the scalar-wrapped
+/// aggregate was not a top-level `function_aggregate` and so was pushed as a
+/// per-shard projection expression instead of being decomposed. It now pushes
+/// down as a single-group partial aggregate and merges to exactly one row equal
+/// to the native-schema oracle.
+#[test]
+fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let select_list = "ROUND(SUM(L_QUANTITY), 2)";
+    let sql = format!("SELECT {select_list} FROM {}", vs_lineitem_table());
+    assert_single_group_aggregate_pushed_down(&mut conn, &sql);
+    assert_single_group_matches_native_oracle(&mut conn, select_list, "");
+}
+
+/// Issue #188: `SELECT ROUND(VARIANCE(<col>), 4)` hard-failed with
+/// `Invalid function 'variance'` — the aggregate name reached DataFusion inside
+/// a per-shard projection expression. Resolving it through the shared `AggKind`
+/// tables means only sufficient statistics cross the scan boundary, so the query
+/// now succeeds and matches the native oracle.
+///
+/// The bare `VARIANCE` and the `VAR_SAMP` spelling are asserted alongside it:
+/// both already matched the oracle before this change and must keep doing so.
+#[test]
+fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let select_list = "ROUND(VARIANCE(L_EXTENDEDPRICE), 4)";
+    let sql = format!("SELECT {select_list} FROM {}", vs_lineitem_table());
+    assert_single_group_aggregate_pushed_down(&mut conn, &sql);
+    assert_single_group_matches_native_oracle(&mut conn, select_list, "");
+
+    assert_single_group_matches_native_oracle(&mut conn, "VARIANCE(L_EXTENDEDPRICE)", "");
+    assert_single_group_matches_native_oracle(&mut conn, "ROUND(VAR_SAMP(L_EXTENDEDPRICE), 4)", "");
+}
+
+/// A `COUNT(*)` shared between a top-level aggregate item and the inner
+/// aggregates of a scalar-over-aggregate item collapses into ONE partial column:
+/// the scan spec carries the count plan once and both merge items read the same
+/// `PARTIAL_count_0`.
+#[test]
+fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let select_list = "COUNT(*), ROUND(SUM(L_QUANTITY) / COUNT(*), 2)";
+    let sql = format!("SELECT {select_list} FROM {}", vs_lineitem_table());
+
+    let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains(r#""aggregates":[{"kind":"count"},{"kind":"sum","column":"L_QUANTITY"}]"#),
+        "the shared COUNT(*) must be folded into ONE partial aggregate plan \
+         alongside the SUM, got:\n{pushed}"
+    );
+    assert!(
+        !pushed.contains("PARTIAL_count_1"),
+        "a second partial count column means the shared inner aggregate was not \
+         deduplicated, got:\n{pushed}"
+    );
+
+    assert_single_group_matches_native_oracle(&mut conn, select_list, "");
+}
+
+/// Plain aggregates and scalar-over-aggregate items interleave in `selectList`
+/// order, each cast to its OWN declared type — so no column is transposed and no
+/// item inherits a neighbour's type.
+#[test]
+fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let select_list = "SUM(L_QUANTITY), ROUND(AVG(L_EXTENDEDPRICE), 3), MIN(L_QUANTITY), \
+                       ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END) \
+                       / COUNT(*), 2)";
+    let sql = format!("SELECT {select_list} FROM {}", vs_lineitem_table());
+    assert_single_group_aggregate_pushed_down(&mut conn, &sql);
+    assert_single_group_matches_native_oracle(&mut conn, select_list, "");
+}
+
+/// A predicate that prunes every data file still yields the one-row single-group
+/// shape for a scalar-over-aggregate select list: the count item is `0` and the
+/// scalar-wrapped SUM is NULL, matching single-node semantics over zero rows.
+#[test]
+fn e2e_single_group_scalar_over_aggregate_all_files_pruned_returns_one_row() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let select_list = "COUNT(*), ROUND(SUM(L_EXTENDEDPRICE), 2)";
+    let tail = "WHERE L_ORDERKEY > 1000";
+    let sql = format!("SELECT {select_list} FROM {} {tail}", vs_lineitem_table());
+
+    let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains("FROM DUAL") && !pushed.contains("LAKEHOUSE_SCAN"),
+        "an all-files-pruned single-group request must take the empty-result \
+         path (a literal row, no scan UDF), got:\n{pushed}"
+    );
+
+    assert_single_group_matches_native_oracle(&mut conn, select_list, tail);
+}
+
+/// Plan-shape proof for #194: the decomposed request pushes the aggregates into
+/// the scan spec's `aggregates` field, leaves `projection` empty, and carries no
+/// per-shard projection expression at all — an aggregate must never reach
+/// DataFusion as an expression.
+#[test]
+fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT ROUND(SUM(L_QUANTITY), 2) FROM {}",
+        vs_lineitem_table()
+    );
+    let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+
+    assert!(
+        pushed.contains(r#""aggregates":[{"kind":"sum","column":"L_QUANTITY"}]"#),
+        "the scalar-wrapped SUM must be decomposed into a non-empty scan-spec \
+         'aggregates' field, got:\n{pushed}"
+    );
+    assert!(
+        pushed.contains(r#""projection":[]"#),
+        "the decomposed request reads 'aggregates', so 'projection' must stay \
+         empty rather than splicing the full base row (#145/#194), got:\n{pushed}"
+    );
+    assert!(
+        !pushed.contains(r#""expr""#),
+        "no select-list expression may reach the scan spec: an aggregate \
+         evaluated per shard is exactly the #194/#188 bug, got:\n{pushed}"
+    );
+}

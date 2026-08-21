@@ -1,3 +1,4 @@
+use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{AggKind, DeleteMechanism, SortKey};
@@ -295,9 +296,8 @@ fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
         &[ProjectionItem::Column("ID".into())],
         &["DECIMAL(20,0)".to_string()],
         None,
+        &[],
         None,
-        &[],
-        &[],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );
@@ -878,23 +878,27 @@ fn extract_projection_fallback_is_duplicate_free() {
 /// the aggregate plan (kind+column) plus any pushed-down filter.
 #[test]
 fn aggregate_query_builds_partial_agg_spec() {
-    // Build a spec_template as handle_pushdown would.
+    // Build a spec_template and its paired merge inputs as handle_pushdown would.
+    let agg_plans = vec![
+        AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+            arg_expr: None,
+        },
+        AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        },
+    ];
+    let merge_inputs =
+        AggregateMergeInputs::new(Vec::new(), cast_merge_items(&agg_plans, &[]), None)
+            .expect("a two-aggregate merge SELECT is never empty");
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["AMOUNT".into()],
             filter: Some("(\"REGION\" = 'EU')".into()),
-            aggregates: Some(vec![
-                AggregatePlan {
-                    kind: AggKind::Sum,
-                    column: Some("AMOUNT".into()),
-                    arg_expr: None,
-                },
-                AggregatePlan {
-                    kind: AggKind::Count,
-                    column: None,
-                    arg_expr: None,
-                },
-            ]),
+            aggregates: Some(agg_plans),
             storage: sample_storage(),
             ..Default::default()
         },
@@ -910,9 +914,8 @@ fn aggregate_query_builds_partial_agg_spec() {
         &["AMOUNT".into()],
         &["DOUBLE PRECISION".to_string()],
         None,
-        None,
         &col_types,
-        &[],
+        Some(&merge_inputs),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );
@@ -1077,9 +1080,8 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
         &["ID".into()],
         &["DECIMAL(20,0)".to_string()],
         None,
+        &[],
         None,
-        &[],
-        &[],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );
@@ -1100,11 +1102,16 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
 /// Helper: build aggregate scan SQL from a set of aggregate plans.
 /// Uses an empty col_types map — aggregate columns default to DOUBLE PRECISION
 /// (correct for existing tests that use SCORE/AMOUNT as DOUBLE).
+///
+/// The outer merge SELECT is now the CALLER's, so this helper assembles the
+/// bare-aggregate merge items the single-group dispatch assembles for a select
+/// list of bare aggregates — uncast, since no declared types are supplied.
 fn build_agg_sql(
     agg_plans: Vec<AggregatePlan>,
     files: Vec<String>,
     cluster_nodes: usize,
 ) -> String {
+    let merge_select = cast_merge_items(&agg_plans, &[]);
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(agg_plans),
@@ -1117,15 +1124,16 @@ fn build_agg_sql(
         files.into_iter().map(|p| FileEntry::new(p, 1)).collect();
     let shards =
         crate::adapter::sharding::partition_files_by_bytes(files_with_sizes, cluster_nodes);
+    let merge_inputs = AggregateMergeInputs::new(Vec::new(), merge_select, None)
+        .expect("a bare-aggregate merge SELECT is never empty");
     build_scan_driving_sql(
         &spec_template,
         &shards,
         &[],
         &[],
         None,
-        None,
         &[],
-        &[],
+        Some(&merge_inputs),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )
@@ -1134,8 +1142,8 @@ fn build_agg_sql(
 /// The aggregate merge SELECT renders `LIMIT n` on the outer wrapper when
 /// `request_limit` is `Some(n)` — the render site issue #198 needs so a pushed
 /// `LIMIT 0` over a one-row aggregate merge returns zero rows instead of being
-/// silently dropped (no limit value reachable inside the aggregate sub-path
-/// carried the request's raw limit before this parameter existed).
+/// silently dropped.
+
 #[test]
 fn aggregate_merge_renders_request_limit_when_some() {
     let plans = vec![AggregatePlan {
@@ -1143,6 +1151,7 @@ fn aggregate_merge_renders_request_limit_when_some() {
         column: None,
         arg_expr: None,
     }];
+    let merge_select = cast_merge_items(&plans, &[]);
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(plans),
@@ -1152,15 +1161,16 @@ fn aggregate_merge_renders_request_limit_when_some() {
         files: vec![],
     };
     let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
+    let merge_inputs = AggregateMergeInputs::new(Vec::new(), merge_select, Some(0))
+        .expect("a bare-aggregate merge SELECT is never empty");
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &[],
         &[],
         None,
-        Some(0),
         &[],
-        &[],
+        Some(&merge_inputs),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );
@@ -1331,78 +1341,50 @@ fn aggregate_single_shard_merge_over_fromless_scalar_scan() {
     );
 }
 
-/// Single-group merge casts each aggregate to its Exasol-declared result type.
-/// `SELECT COUNT(score)` merges as `SUM("PARTIAL_count_0")` (DECIMAL(31,0)); Exasol
-/// declared DECIMAL(18,0) for the column and strictly validates the adapter's output
-/// type, so the merge item must be `CAST(SUM("PARTIAL_count_0") AS DECIMAL(18,0))`.
+/// The outer merge SELECT belongs to the CALLER and is spliced verbatim: what a
+/// merge item says depends on select-list classification (a scalar-over-aggregate
+/// item wraps the merged partials in its own scalar structure), which this builder
+/// cannot see. `aggregate_types` keeps only its other meaning — the per-PLAN
+/// declared type the `EMITS` clause is derived from, which is the sole type source
+/// for an aggregate over an expression (no source column to look up).
 #[test]
-fn single_group_merge_casts_to_declared_type() {
+fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
     let plans = vec![AggregatePlan {
-        kind: AggKind::CountCol,
-        column: Some("SCORE".into()),
-        arg_expr: None,
+        kind: AggKind::Sum,
+        column: None,
+        arg_expr: Some(r#"("A" * "B")"#.to_string()),
     }];
     let spec_template = ScanSpec {
         common: CommonScanSpec {
-            aggregates: Some(plans.clone()),
+            aggregates: Some(plans),
             storage: sample_storage(),
             ..Default::default()
         },
         files: vec![],
     };
     let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
-    let col_types = vec![("SCORE".to_string(), "DECIMAL(18,0)".to_string())];
-    let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
+    let merge_select = vec![r#"CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(30,4))"#.to_string()];
+    let merge_inputs =
+        AggregateMergeInputs::new(vec!["DECIMAL(30,4)".to_string()], merge_select, None)
+            .expect("the fixture's merge SELECT is not empty");
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &[],
         &[],
         None,
-        None,
-        &col_types,
-        &aggregate_types,
+        &[],
+        Some(&merge_inputs),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );
     assert!(
-        sql.contains(r#"CAST(SUM("PARTIAL_count_0") AS DECIMAL(18,0))"#),
-        "single-group merge must cast COUNT to declared DECIMAL(18,0): {sql}"
-    );
-}
-
-/// Single-group merge with no declared types emits the bare uncast merge expression.
-#[test]
-fn single_group_merge_uncast_without_declared_types() {
-    let plans = vec![AggregatePlan {
-        kind: AggKind::CountCol,
-        column: Some("SCORE".into()),
-        arg_expr: None,
-    }];
-    let spec_template = ScanSpec {
-        common: CommonScanSpec {
-            aggregates: Some(plans.clone()),
-            storage: sample_storage(),
-            ..Default::default()
-        },
-        files: vec![],
-    };
-    let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
-    let sql = build_scan_driving_sql(
-        &spec_template,
-        &shards,
-        &[],
-        &[],
-        None,
-        None,
-        &[],
-        &[],
-        SCAN_UDF_NAME,
-        DISTRIBUTE_FILES_UDF_NAME,
+        sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(30,4)) FROM ("#),
+        "the caller's merge item must be spliced verbatim: {sql}"
     );
     assert!(
-        sql.contains(r#"SUM("PARTIAL_count_0")"#) && !sql.contains("CAST(SUM"),
-        "single-group merge without declared types must be uncast: {sql}"
+        sql.contains(r#"EMITS ("PARTIAL_sum_0" DECIMAL(36,4))"#),
+        "the declared plan type must still widen the SUM partial's EMITS type: {sql}"
     );
 }
 
@@ -2026,9 +2008,8 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
         &["ID".into()],
         &["DECIMAL(20,0)".to_string()],
         None,
+        &[],
         None,
-        &[],
-        &[],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );
@@ -2066,9 +2047,8 @@ fn single_shard_collapses_to_single_invocation() {
         &["ID".into()],
         &["DECIMAL(20,0)".to_string()],
         None,
+        &[],
         None,
-        &[],
-        &[],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );
@@ -5045,4 +5025,184 @@ fn cast_to_declared_type_skips_the_varchar_default_and_absent_type() {
         "SUM(x)"
     );
     assert_eq!(cast_to_declared_type("SUM(x)", None), "SUM(x)");
+}
+
+/// Assert that `select_item` (with its own `selectListDataTypes` entry
+/// `declared_type`) widens `project_columns` to the full base row: the widening
+/// signal fires, the projection is one bare column reference per base column, and
+/// the EMITS types are the base row's own types. Shared by every "an aggregate
+/// nested under node family X widens" test below, which differ only in the node
+/// under test.
+fn assert_widens_to_full_base_row(select_item: Json, declared_type: Json, why: &str) {
+    let col_types = decimal_rewrite_col_types();
+    let pushdown_req = serde_json::json!({
+        "selectList": [select_item],
+        "selectListDataTypes": [declared_type],
+    });
+
+    let (items, types, widened) =
+        project_columns(&pushdown_req, col_types.clone()).expect("must project (Ok)");
+
+    assert!(widened, "{why}: {items:?}");
+    let expected_names: Vec<ProjectionItem> = col_types
+        .iter()
+        .map(|(n, _)| ProjectionItem::Column(n.clone()))
+        .collect();
+    assert_eq!(
+        items, expected_names,
+        "the widened projection must be the full base row, not a per-item projection"
+    );
+    let expected_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
+    assert_eq!(types, expected_types, "EMITS types must be the base row's");
+}
+
+/// An aggregate nested under a pushable select-list node widens the derived
+/// projection to the full base row instead of rendering into the per-shard EMITS
+/// clause. `ROUND(SUM(c_decimal_a), 2)` renders successfully as a scalar
+/// expression, so only a depth-insensitive probe ahead of the node-type match
+/// stops it reaching a shard, where each shard would aggregate its own files into
+/// an unmerged partial row (#194).
+#[test]
+fn project_columns_widens_on_aggregate_nested_in_scalar_item() {
+    let select_item = serde_json::json!({
+        "type": "function_scalar",
+        "name": "ROUND",
+        "arguments": [
+            agg_item("SUM", Some("c_decimal_a"), false),
+            {"type": "literal_exactnumeric", "value": 2}
+        ]
+    });
+    let declared_type = serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 2});
+    assert_widens_to_full_base_row(
+        select_item,
+        declared_type,
+        "an aggregate nested under a scalar item must widen the derived projection",
+    );
+}
+
+/// A TOP-LEVEL aggregate select item widened through the unknown-node arm before
+/// the subtree probe existed and must widen byte-identically now: same signal,
+/// same full-base-row projection, same EMITS types.
+#[test]
+fn project_columns_top_level_aggregate_widening_is_unchanged_by_the_subtree_probe() {
+    let select_item = agg_item("SUM", Some("c_decimal_a"), false);
+    let declared_type = serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 2});
+    assert_widens_to_full_base_row(
+        select_item,
+        declared_type,
+        "a top-level aggregate must still widen",
+    );
+}
+
+/// A `function_scalar_cast` item wrapping a nested aggregate widens — CAST is its
+/// own pushable node family, distinct from the generic `function_scalar` arm the
+/// `ROUND` case above exercises.
+#[test]
+fn project_columns_widens_on_aggregate_nested_in_function_scalar_cast_item() {
+    let select_item = serde_json::json!({
+        "type": "function_scalar_cast",
+        "name": "CAST",
+        "arguments": [ agg_item("SUM", Some("id"), false) ],
+        "dataType": {"type": "VARCHAR", "size": 100}
+    });
+    let declared_type = serde_json::json!({"type": "VARCHAR", "size": 100});
+    assert_widens_to_full_base_row(
+        select_item,
+        declared_type,
+        "an aggregate nested under a function_scalar_cast item must widen",
+    );
+}
+
+/// A `function_scalar_case` item wrapping a nested aggregate in a `THEN` branch
+/// widens, exercising CASE as its own pushable node family.
+#[test]
+fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
+    let select_item = serde_json::json!({
+        "type": "function_scalar_case",
+        "name": "CASE",
+        "arguments": [ {
+            "type": "predicate_less",
+            "left": {"type": "column", "name": "ID"},
+            "right": {"type": "literal_exactnumeric", "value": 10}
+        } ],
+        "results": [
+            agg_item("COUNT", None, false),
+            {"type": "literal_exactnumeric", "value": 0}
+        ]
+    });
+    let declared_type = serde_json::json!({"type": "DECIMAL", "precision": 20, "scale": 0});
+    assert_widens_to_full_base_row(
+        select_item,
+        declared_type,
+        "an aggregate nested in a CASE result branch must widen",
+    );
+}
+
+/// A nested aggregate under an arithmetic `function_scalar` node (`ADD`, distinct
+/// in intent from a named scalar call like `ROUND`) widens.
+#[test]
+fn project_columns_widens_on_aggregate_nested_in_arithmetic_node() {
+    let select_item = serde_json::json!({
+        "type": "function_scalar",
+        "name": "ADD",
+        "arguments": [
+            agg_item("SUM", Some("c_decimal_a"), false),
+            {"type": "literal_exactnumeric", "value": 1}
+        ]
+    });
+    let declared_type = serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 2});
+    assert_widens_to_full_base_row(
+        select_item,
+        declared_type,
+        "an aggregate nested under an arithmetic node must widen",
+    );
+}
+
+/// A nested aggregate under a predicate node widens, exercising a predicate as its
+/// own pushable node family.
+#[test]
+fn project_columns_widens_on_aggregate_nested_in_predicate_node() {
+    let select_item = serde_json::json!({
+        "type": "predicate_less",
+        "left": agg_item("SUM", Some("id"), false),
+        "right": {"type": "literal_exactnumeric", "value": 10}
+    });
+    let declared_type = serde_json::json!({"type": "boolean"});
+    assert_widens_to_full_base_row(
+        select_item,
+        declared_type,
+        "an aggregate nested under a predicate node must widen",
+    );
+}
+
+/// A scalar item with no nested aggregate anywhere in its subtree must NOT widen
+/// — the probe is a floor for aggregates, not a general full-row fallback.
+#[test]
+fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
+    let col_types = decimal_rewrite_col_types();
+    let pushdown_req = serde_json::json!({
+        "selectList": [ {
+            "type": "function_scalar",
+            "name": "ROUND",
+            "arguments": [
+                {"type": "column", "name": "C_DECIMAL_A"},
+                {"type": "literal_exactnumeric", "value": 2}
+            ]
+        } ],
+        "selectListDataTypes": [ {"type": "DECIMAL", "precision": 18, "scale": 2} ],
+    });
+
+    let (items, _types, widened) =
+        project_columns(&pushdown_req, col_types).expect("must project (Ok)");
+
+    assert!(
+        !widened,
+        "a scalar item with no nested aggregate must not widen: {items:?}"
+    );
+    assert_eq!(
+        items.len(),
+        1,
+        "must project the single rendered expression, not the full base row: {items:?}"
+    );
+    assert!(matches!(items[0], ProjectionItem::Expr { .. }));
 }

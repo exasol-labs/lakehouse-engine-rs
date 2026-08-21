@@ -20,7 +20,7 @@ use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::adapter::pushdown::{
-    build_scan_driving_sql, detect_aggregates, ordinary_plans,
+    AggregateMergeInputs, build_scan_driving_sql, detect_aggregates, ordinary_plans,
 };
 use lakehouse_engine::scan::spec::{
     AggKind, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, ProjectionItem,
@@ -395,9 +395,9 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
 /// Plan-shape (host-runnable): the NQ1 shape `SUM(L_EXTENDEDPRICE * L_DISCOUNT)`
 /// pushes down as a decomposed partial/merge aggregate — the driving SQL carries
 /// the `aggregates` plan with the product in `arg_expr` and a `PARTIAL_sum_0`
-/// partial column, NOT a raw two-column row-scan fallback. The partial column and
-/// the merge CAST are both sized from Exasol's declared DECIMAL(36,4) result type
-/// (decision-log entry [7]), verifying the DECIMAL-with-nonzero-scale path.
+/// partial column, NOT a raw two-column row-scan fallback. The partial column is
+/// sized from Exasol's declared DECIMAL(36,4) result type (decision-log entry [7]),
+/// verifying the DECIMAL-with-nonzero-scale path.
 #[test]
 fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     // The pushdown request Exasol sends once FN_MULT is advertised: SUM over a
@@ -440,15 +440,22 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     // Exasol's declared DECIMAL(36,4) result type for the SUM ordinal.
     let spec = aggregate_spec(plans);
     let shards = vec![vec![("lineitem/data/f0.parquet".to_string(), 4096u64)]];
+    // The merge SELECT is the caller's; the adapter assembles it from the
+    // classified select list (`single_group_merge_select`, crate-internal).
+    let merge_inputs = AggregateMergeInputs::new(
+        vec!["DECIMAL(36,4)".to_string()], // Exasol's declared SUM result type
+        vec![r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#.to_string()],
+        None, // request_limit
+    )
+    .expect("one merge item for one select-list item");
     let sql = build_scan_driving_sql(
         &spec,
         &shards,
-        &[],                            // proj cols — unused on the aggregate path
-        &[],                            // proj types — unused on the aggregate path
-        None,                           // limit
-        None,                           // request_limit
-        &[],                            // col_types — a product has no source column
-        &["DECIMAL(36,4)".to_string()], // Exasol's declared SUM result type
+        &[],  // proj cols — unused on the aggregate path
+        &[],  // proj types — unused on the aggregate path
+        None, // limit
+        &[],  // col_types — a product has no source column
+        Some(&merge_inputs),
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
@@ -457,11 +464,6 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     assert!(
         sql.contains(r#""PARTIAL_sum_0" DECIMAL(36,4)"#),
         "partial SUM column must be the declared DECIMAL(36,4):\n{sql}"
-    );
-    // Merge casts the summed partial back to the declared DECIMAL(36,4).
-    assert!(
-        sql.contains(r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#),
-        "merge must cast to the declared DECIMAL(36,4):\n{sql}"
     );
     // The rendered product travels in the scan spec's serialized aggregate plan.
     assert!(
@@ -510,9 +512,8 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
         &proj,
         &types,
         None,
+        &[],
         None,
-        &[],
-        &[],
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
@@ -571,9 +572,8 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
         &proj,
         &types,
         Some(20),
+        &[],
         None,
-        &[],
-        &[],
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
@@ -664,9 +664,8 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         &proj,
         &types,
         None,
+        &[],
         None,
-        &[],
-        &[],
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );

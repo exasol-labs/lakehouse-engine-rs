@@ -3,8 +3,7 @@ use super::super::joins::{
     build_qualified_single_table_fallback_sql, referenced_column_projection,
 };
 use super::super::support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, extract_all_column_types,
-    shard_count,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, extract_all_column_types, shard_count,
 };
 use super::super::test_support::*;
 use super::*;
@@ -113,7 +112,7 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
         "arguments": [sum_node],
         "dataType": {"type": "CHAR", "size": 20, "characterSet": "ASCII"}
     });
-    let sql = render_scalar_over_merge(&node, &plans)
+    let sql = render_scalar_over_merge(&node, &plans, &merge_select_items(&plans))
         .expect("CAST over a mergeable aggregate must render");
     assert!(
         sql.contains("CHAR(20) ASCII"),
@@ -153,7 +152,7 @@ fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
         "arguments": [inner],
         "dataType": char_type,
     });
-    let sql = render_scalar_over_merge(&node, &plans)
+    let sql = render_scalar_over_merge(&node, &plans, &merge_select_items(&plans))
         .expect("a nested CAST over a mergeable aggregate must render");
     assert_eq!(
         sql.matches("CHAR(20) ASCII").count(),
@@ -2141,7 +2140,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
     let group_key_types =
         group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
-    let aggregate_types = aggregate_exasol_types(&req);
+    let aggregate_types = detection.plan_types.clone();
 
     let having_node = serde_json::json!({
         "type": "predicate_greater",
@@ -2232,7 +2231,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
     let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
     let group_key_types =
         group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
-    let aggregate_types = aggregate_exasol_types(&req);
+    let aggregate_types = detection.plan_types.clone();
 
     let col_types: Vec<(String, String)> =
         vec![("SCORE".to_string(), "DOUBLE PRECISION".to_string())];
@@ -2302,7 +2301,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     assert_eq!(detection.group_keys.len(), 2, "two group keys");
     let group_key_types =
         group_key_exasol_types(&req, &detection.group_keys, &detection.select_items);
-    let aggregate_types = aggregate_exasol_types(&req);
+    let aggregate_types = detection.plan_types.clone();
 
     let having_node = serde_json::json!({
         "type": "predicate_greater",

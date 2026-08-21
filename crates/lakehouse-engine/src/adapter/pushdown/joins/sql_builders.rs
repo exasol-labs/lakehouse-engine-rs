@@ -670,9 +670,8 @@ pub(super) fn build_side_fan_out_sql(
         &proj_cols,
         &proj_types,
         None,
+        &[],
         None,
-        &[],
-        &[],
         udf_name,
         distribute_udf_name,
     )
@@ -778,9 +777,8 @@ pub(in super::super) fn build_broadcast_join_sql(
         &rendered.projection,
         &rendered.projection_types,
         shard_cap,
+        &[],
         None,
-        &[],
-        &[],
         udf_name,
         distribute_udf_name,
     );
@@ -1033,9 +1031,8 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         &proj_cols,
         &proj_types,
         None,
+        &[],
         None,
-        &[],
-        &[],
         udf_name,
         distribute_udf_name,
     );
