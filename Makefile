@@ -11,9 +11,9 @@ export EXASOL_DB_MEM_SIZE
 # Absolute path of this repository root.
 LAKEHOUSE_ENGINE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
-# Rust builder image — MUST match the SLC glibc (Trixie = 2.41).
-# Never run `cargo build --release` on the host: Ubuntu 24.04 has glibc 2.39
-# and the resulting .so fails to dlopen inside Exasol.
+# Rust builder image — MUST match the SLC toolchain and glibc (Trixie = 2.41).
+# Never run `cargo build --release` on the host — the SDK fingerprint embeds
+# the rustc hash, so a host-built .so is rejected by the SLC at load time.
 UDF_BUILDER_IMAGE ?= rust:1.94-trixie
 
 # --- UDF .so artifact --------------------------------------------------------

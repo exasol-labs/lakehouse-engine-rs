@@ -30,7 +30,8 @@ jobs:
   # ── the real release artifact ─────────────────────────────────────────────
   # Built the same way a developer does: inside rust:1.94-trixie (glibc
   # 2.41), matching the SLC. Never `cargo build --release` on the runner
-  # directly — Ubuntu's glibc is newer and the .so fails to dlopen in Exasol.
+  # directly — the SDK fingerprint embeds the rustc hash, so a host-built
+  # .so is rejected by the SLC at load time.
   build-so:
     name: Build release .so (Docker, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}

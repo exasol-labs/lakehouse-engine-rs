@@ -11,7 +11,7 @@
 //!
 //! Gated under `exasol-e2e` because it inspects the containerized release
 //! artifact, which `make test-e2e` guarantees is freshly built (it depends on
-//! `cross-musl-udf-build`). When run, it FAILS loudly if the `.so` is missing —
+//! `cross-udf-build`). When run, it FAILS loudly if the `.so` is missing —
 //! it never silently skips.
 #![cfg(feature = "exasol-e2e")]
 
@@ -33,7 +33,7 @@ fn so_exports_scan_symbol_and_no_distributor_symbol() {
     let so = so_path();
     assert!(
         so.exists(),
-        "built artifact not found at {} — run `make cross-musl-udf-build` first",
+        "built artifact not found at {} — run `make cross-udf-build` first",
         so.display()
     );
 
