@@ -4131,3 +4131,72 @@ fn e2e_float_div_filter_row_count_matches_native_oracle() {
          division silently drops a matching row), got {vs_count}"
     );
 }
+
+/// Regression test for #202. Exasol's `GREATEST`/`LEAST` return NULL if ANY
+/// argument is NULL; the unfixed DataFusion-dialect rendering skipped NULLs
+/// instead. NULL is derived via `NULLIF(MOD(id, 5), 0)` (as
+/// `test_group_by_null_key_grouping` does — the seed fixture has no nullable
+/// column): NULL for `id` in {5, 10, 15, 20}, `id % 5` otherwise.
+///
+/// Pre-fix values: the predicate query returned `0` rows (not `4`); the value
+/// query returned each row's own `id` (never NULL) at the four multiples of 5.
+#[test]
+fn test_greatest_least_propagate_null_argument() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let predicate_sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE LEAST(id, NULLIF(MOD(id, 5), 0)) IS NULL",
+        vs_table()
+    );
+    let null_row_count = conn.query_scalar_i64(&predicate_sql);
+    assert_eq!(
+        null_row_count, 4,
+        "LEAST(id, NULLIF(MOD(id, 5), 0)) IS NULL must match the 4 rows where \
+         id is a multiple of 5, got {null_row_count}"
+    );
+
+    let predicate_pushed = explain_virtual_pushdown_sql(&mut conn, &predicate_sql);
+    assert!(
+        predicate_pushed.contains("CASE WHEN") && predicate_pushed.contains("least("),
+        "the pushed scan spec must carry the NULL-guarded CASE rendering of \
+         LEAST, not an unguarded call, got:\n{predicate_pushed}"
+    );
+
+    let value_sql = format!(
+        "SELECT id, GREATEST(id, NULLIF(MOD(id, 5), 0)) FROM {} ORDER BY id",
+        vs_table()
+    );
+    let cols = conn.query_columns(&value_sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, greatest): {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        SEED_TOTAL_ROWS,
+        "expected {SEED_TOTAL_ROWS} rows: {cols:?}"
+    );
+
+    for (id_val, greatest_val) in cols[0].iter().zip(cols[1].iter()) {
+        let id = parse_int(id_val);
+        if id % 5 == 0 {
+            assert!(
+                greatest_val.is_null(),
+                "GREATEST(id, NULLIF(MOD(id, 5), 0)) must be NULL at id={id} \
+                 (a multiple of 5), got {greatest_val:?}"
+            );
+        } else {
+            let greatest = parse_int(greatest_val);
+            assert_eq!(
+                greatest, id,
+                "GREATEST(id, NULLIF(MOD(id, 5), 0)) must equal id={id} for a \
+                 non-multiple-of-5 row, got {greatest}"
+            );
+        }
+    }
+
+    let value_pushed = explain_virtual_pushdown_sql(&mut conn, &value_sql);
+    assert!(
+        value_pushed.contains("CASE WHEN") && value_pushed.contains("greatest("),
+        "the pushed scan spec must carry the NULL-guarded CASE rendering of \
+         GREATEST, not an unguarded call, got:\n{value_pushed}"
+    );
+}
