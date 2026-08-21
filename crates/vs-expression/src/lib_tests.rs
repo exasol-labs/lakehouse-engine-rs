@@ -1519,12 +1519,14 @@ fn renders_string_scalar_functions() {
     assert_eq!(render_expression(&expr).unwrap(), "strpos('hello', 'll')");
 }
 
-// --- CONCAT → chained `||` (NULL-propagating, unlike DataFusion's concat()) ---
+// --- CONCAT → `nullif(concat(...), '')` (DataFusion) / chained `||` (Exasol) ---
 
 #[test]
-fn renders_concat_as_chained_pipe_operator() {
-    // Two args: joined with `||`, not concat() — concat() silently turns a
-    // NULL operand into empty string (#200's GROUP BY repro shape).
+fn renders_concat_as_nullif_wrapped_concat_call() {
+    // DataFusion's own concat() treats a NULL operand as empty string but
+    // never re-collapses an all-empty result back to NULL, so the
+    // DataFusion dialect wraps it as `nullif(concat(...), '')` to reproduce
+    // Exasol's `||` NULL contract (#374).
     let expr = json!({
         "type": "function_scalar",
         "name": "CONCAT",
@@ -1533,9 +1535,11 @@ fn renders_concat_as_chained_pipe_operator() {
             {"type": "literal_string", "value": ""}
         ]
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"("S" || '')"#);
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"nullif(concat("S", ''), '')"#
+    );
 
-    // Three args: chained, still no concat() call.
     let expr = json!({
         "type": "function_scalar",
         "name": "CONCAT",
@@ -1545,15 +1549,18 @@ fn renders_concat_as_chained_pipe_operator() {
             {"type": "column", "name": "c"}
         ]
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"("A" || "B" || "C")"#);
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"nullif(concat("A", "B", "C"), '')"#
+    );
 }
 
 #[test]
 fn renders_concat_bool_operand_as_exasol_case() {
     // A boolean-producing argument (here `predicate_equal`) is rewritten to
-    // the Exasol-cased CASE form before joining — DataFusion's `||` falls
-    // back to its lowercase boolean->Utf8 cast for a raw boolean operand
-    // otherwise (#200).
+    // the Exasol-cased CASE form before joining — DataFusion's concat()
+    // falls back to its lowercase boolean->Utf8 cast for a raw boolean
+    // operand otherwise (#200).
     let expr = json!({
         "type": "function_scalar",
         "name": "CONCAT",
@@ -1566,8 +1573,145 @@ fn renders_concat_bool_operand_as_exasol_case() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
+        r#"nullif(concat((CASE ("ACTIVE" = TRUE) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END), ''), '')"#
+    );
+}
+
+#[test]
+fn renders_concat_as_chained_pipe_operator_in_exasol_dialect() {
+    // The Exasol dialect keeps the pre-delta chained `||` rendering
+    // byte-for-byte: Exasol's own `||` already has the NULL contract that
+    // the DataFusion dialect's `nullif(concat(...), '')` wrapper exists to
+    // reproduce.
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "CONCAT",
+        "arguments": [
+            {"type": "column", "name": "s"},
+            {"type": "literal_string", "value": ""}
+        ]
+    });
+    assert_eq!(render_expression_exasol(&expr).unwrap(), r#"("S" || '')"#);
+
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "CONCAT",
+        "arguments": [
+            {"type": "column", "name": "a"},
+            {"type": "column", "name": "b"},
+            {"type": "column", "name": "c"}
+        ]
+    });
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap(),
+        r#"("A" || "B" || "C")"#
+    );
+
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "CONCAT",
+        "arguments": [
+            {"type": "predicate_equal",
+             "left": {"type": "column", "name": "active"},
+             "right": {"type": "literal_bool", "value": true}},
+            {"type": "literal_string", "value": ""}
+        ]
+    });
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap(),
         r#"((CASE ("ACTIVE" = TRUE) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END) || '')"#
     );
+}
+
+#[test]
+fn renders_nested_concat_wrapper_per_level() {
+    // A nested CONCAT argument renders its own dialect-specific wrapper
+    // rather than being flattened into the outer call.
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "CONCAT",
+        "arguments": [
+            {"type": "function_scalar",
+             "name": "CONCAT",
+             "arguments": [
+                 {"type": "column", "name": "a"},
+                 {"type": "column", "name": "b"}
+             ]},
+            {"type": "column", "name": "c"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"nullif(concat(nullif(concat("A", "B"), ''), "C"), '')"#
+    );
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap(),
+        r#"(("A" || "B") || "C")"#
+    );
+}
+
+#[test]
+fn renders_concat_single_argument() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "CONCAT",
+        "arguments": [{"type": "column", "name": "s"}]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"nullif(concat("S"), '')"#
+    );
+    assert_eq!(render_expression_exasol(&expr).unwrap(), r#"("S")"#);
+}
+
+#[test]
+fn concat_empty_argument_list_errors_in_both_dialects() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "CONCAT",
+        "arguments": []
+    });
+    let expected = "function_scalar CONCAT requires at least 1 argument, got 0";
+    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap_err().to_string(),
+        expected
+    );
+    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_expression_exasol_safe(&expr).is_none());
+}
+
+#[test]
+fn concat_missing_arguments_or_null_argument_errors_in_both_dialects() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "CONCAT"
+    });
+    let expected = "function_scalar CONCAT missing 'arguments'";
+    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap_err().to_string(),
+        expected
+    );
+    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_expression_exasol_safe(&expr).is_none());
+
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "CONCAT",
+        "arguments": [
+            {"type": "column", "name": "a"},
+            null
+        ]
+    });
+    let expected = "CONCAT argument rendered to null";
+    assert_eq!(render_expression(&expr).unwrap_err().to_string(), expected);
+    assert_eq!(
+        render_expression_exasol(&expr).unwrap_err().to_string(),
+        expected
+    );
+    assert!(render_expression_safe(&expr).is_none());
+    assert!(render_expression_exasol_safe(&expr).is_none());
 }
 
 // --- CASE WHEN ... THEN ... ELSE ... END ---

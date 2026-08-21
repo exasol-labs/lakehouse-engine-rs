@@ -4200,3 +4200,88 @@ fn test_greatest_least_propagate_null_argument() {
          GREATEST, not an unguarded call, got:\n{value_pushed}"
     );
 }
+
+/// Regression test for #374. Exasol's `||`/`CONCAT` treat a NULL operand as
+/// an empty string rather than propagating NULL (an all-NULL/all-empty
+/// result is still NULL, since Exasol's VARCHAR domain has no empty-string
+/// value) — verified live against a real Exasol instance. The unfixed
+/// DataFusion-dialect rendering emitted chained `||` instead, which
+/// propagates NULL. NULL is derived via `NULLIF(name, name)` over the seed
+/// fixture's non-nullable `name` column (`event-01`..`event-20`) — the shape
+/// issue #374 reproduced against TPC-H, and the technique
+/// `test_greatest_least_propagate_null_argument` already uses for the same
+/// reason.
+///
+/// Pre-fix values: the VALUE query returned NULL for every row (not
+/// `event-01-suffix`..`event-03-suffix`); the FILTER query counted `0` rows
+/// (not `20`). The all-NULL FILTER query counts `20` under both the pre-fix
+/// chained `||` and the fixed `nullif(concat(...), '')` rendering — it does
+/// not discriminate pre-fix from post-fix, but instead discriminates the
+/// `nullif`-wrapped rendering from a bare `concat(...)` (which would render
+/// the empty string for two NULL operands and count `0`, not `20`).
+#[test]
+fn test_concat_null_operand_concatenates_non_null_parts() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let value_sql = format!(
+        "SELECT id, name || NULLIF(name, name) || '-suffix' FROM {} WHERE id <= 3 ORDER BY id",
+        vs_table()
+    );
+    let cols = conn.query_columns(&value_sql);
+    assert_eq!(cols.len(), 2, "expected 2 columns (id, concat): {cols:?}");
+    assert_eq!(cols[0].len(), 3, "expected 3 rows (id <= 3): {cols:?}");
+    let expected = ["event-01-suffix", "event-02-suffix", "event-03-suffix"];
+    for (concat_val, expected_val) in cols[1].iter().zip(expected.iter()) {
+        assert_eq!(
+            concat_val.as_str(),
+            Some(*expected_val),
+            "name || NULLIF(name, name) || '-suffix' must concatenate the \
+             non-NULL parts, got {concat_val:?}"
+        );
+    }
+
+    let value_pushed = explain_virtual_pushdown_sql(&mut conn, &value_sql);
+    assert!(
+        value_pushed.contains("nullif(concat("),
+        "the pushed scan spec must carry the nullif(concat(...), '') \
+         rendering of CONCAT, not a bare concat or chained ||, got:\n{value_pushed}"
+    );
+
+    let filter_sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE (name || NULLIF(name, name)) = name",
+        vs_table()
+    );
+    let filter_count = conn.query_scalar_i64(&filter_sql);
+    assert_eq!(
+        filter_count, SEED_TOTAL_ROWS as i64,
+        "(name || NULLIF(name, name)) = name must match all {SEED_TOTAL_ROWS} \
+         rows since the NULL operand contributes nothing, got {filter_count}"
+    );
+
+    let filter_pushed = explain_virtual_pushdown_sql(&mut conn, &filter_sql);
+    assert!(
+        filter_pushed.contains("nullif(concat("),
+        "the pushed scan spec must carry the nullif(concat(...), '') \
+         rendering of CONCAT, not a bare concat or chained ||, got:\n{filter_pushed}"
+    );
+
+    let all_null_filter_sql = format!(
+        "SELECT COUNT(*) FROM {} WHERE (NULLIF(name, name) || NULLIF(name, name)) IS NULL",
+        vs_table()
+    );
+    let all_null_count = conn.query_scalar_i64(&all_null_filter_sql);
+    assert_eq!(
+        all_null_count, SEED_TOTAL_ROWS as i64,
+        "an all-NULL-operand CONCAT must itself be NULL for all \
+         {SEED_TOTAL_ROWS} rows, not the empty string a bare concat(...) \
+         would render, got {all_null_count}"
+    );
+
+    let all_null_pushed = explain_virtual_pushdown_sql(&mut conn, &all_null_filter_sql);
+    assert!(
+        all_null_pushed.contains("nullif(concat("),
+        "the pushed scan spec must carry the nullif(concat(...), '') \
+         rendering of CONCAT, not a bare concat or chained ||, got:\n{all_null_pushed}"
+    );
+}
