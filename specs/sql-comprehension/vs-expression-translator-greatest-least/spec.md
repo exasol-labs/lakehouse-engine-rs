@@ -38,7 +38,11 @@ dialect carries the guard.
 audited against DataFusion's documented NULL semantics for issue #202. DataFusion documents
 NULL-skipping for exactly five functions — `coalesce`, `concat`, `concat_ws`, `greatest`, and
 `least` — and of the names this translator maps, only `CONCAT` and `GREATEST`/`LEAST` reach that
-set. `CONCAT` was already fixed for this very reason (chained `||`, issue #200). `NULLIF` matches
+set. `CONCAT` is fixed in its own right, and in the OPPOSITE direction to this pair: Exasol's `||`
+treats a NULL operand as the empty string, so `concat`'s NULL-skipping is what `CONCAT` NEEDS —
+`sql-comprehension/vs-expression-translator-scalar-fns` records its `nullif(concat(...), '')`
+rendering and the live evidence for it (issue #374, superseding the chained-`||` rendering issue
+\#200 had introduced on a since-refuted reading of Exasol's `||`). `NULLIF` matches
 Exasol's own documented `CASE WHEN expr1 = expr2 THEN NULL ELSE expr1 END` definition under
 identical three-valued logic, so no divergence exists. `NULLIFZERO`→`nullif(x, 0)` and
 `ZEROIFNULL`→`coalesce(x, 0)` pass a single argument plus a literal, so `coalesce`'s NULL-skipping is
