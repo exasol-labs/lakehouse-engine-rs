@@ -1634,7 +1634,7 @@ fn renders_greatest_least() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"greatest("A", "B", "C")"#
+        r#"CASE WHEN "A" IS NULL OR "B" IS NULL OR "C" IS NULL THEN NULL ELSE greatest("A", "B", "C") END"#
     );
 
     let expr2 = json!({
@@ -1645,7 +1645,132 @@ fn renders_greatest_least() {
             {"type": "literal_exactnumeric", "value": 0}
         ]
     });
-    assert_eq!(render_expression(&expr2).unwrap(), r#"least("X", 0)"#);
+    assert_eq!(
+        render_expression(&expr2).unwrap(),
+        r#"CASE WHEN "X" IS NULL OR 0 IS NULL THEN NULL ELSE least("X", 0) END"#
+    );
+}
+
+#[test]
+fn renders_greatest_least_single_argument_guard() {
+    let greatest = json!({
+        "type": "function_scalar",
+        "name": "GREATEST",
+        "arguments": [{"type": "column", "name": "a"}]
+    });
+    assert_eq!(
+        render_expression(&greatest).unwrap(),
+        r#"CASE WHEN "A" IS NULL THEN NULL ELSE greatest("A") END"#
+    );
+
+    let least = json!({
+        "type": "function_scalar",
+        "name": "LEAST",
+        "arguments": [{"type": "column", "name": "a"}]
+    });
+    assert_eq!(
+        render_expression(&least).unwrap(),
+        r#"CASE WHEN "A" IS NULL THEN NULL ELSE least("A") END"#
+    );
+}
+
+#[test]
+fn renders_greatest_least_with_literal_null_argument() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "LEAST",
+        "arguments": [
+            {"type": "column", "name": "x"},
+            {"type": "column", "name": "y"},
+            {"type": "literal_null"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"CASE WHEN "X" IS NULL OR "Y" IS NULL OR NULL IS NULL THEN NULL ELSE least("X", "Y", NULL) END"#
+    );
+}
+
+#[test]
+fn renders_greatest_least_nested_argument_once_referenced_twice() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "GREATEST",
+        "arguments": [
+            {
+                "type": "function_scalar",
+                "name": "ABS",
+                "arguments": [{"type": "column", "name": "y"}]
+            },
+            {"type": "column", "name": "z"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"CASE WHEN abs("Y") IS NULL OR "Z" IS NULL THEN NULL ELSE greatest(abs("Y"), "Z") END"#
+    );
+}
+
+#[test]
+fn renders_nested_greatest_guard_referencing_the_inner_case_twice() {
+    let expr = json!({
+        "type": "function_scalar",
+        "name": "GREATEST",
+        "arguments": [
+            {
+                "type": "function_scalar",
+                "name": "GREATEST",
+                "arguments": [
+                    {"type": "column", "name": "a"},
+                    {"type": "column", "name": "b"}
+                ]
+            },
+            {"type": "column", "name": "c"}
+        ]
+    });
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"CASE WHEN CASE WHEN "A" IS NULL OR "B" IS NULL THEN NULL ELSE greatest("A", "B") END IS NULL OR "C" IS NULL THEN NULL ELSE greatest(CASE WHEN "A" IS NULL OR "B" IS NULL THEN NULL ELSE greatest("A", "B") END, "C") END"#
+    );
+}
+
+#[test]
+fn renders_greatest_least_empty_argument_list_errors() {
+    for name in ["GREATEST", "LEAST"] {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": name,
+            "arguments": []
+        });
+        assert!(
+            render_expression(&expr).is_err(),
+            "{name} empty args must raise"
+        );
+        assert!(
+            render_expression_safe(&expr).is_none(),
+            "{name} empty args must be None in safe mode"
+        );
+    }
+}
+
+#[test]
+fn greatest_least_without_arguments_key_errors() {
+    for name in ["GREATEST", "LEAST"] {
+        let expr = json!({
+            "type": "function_scalar",
+            "name": name
+        });
+        let err = render_expression(&expr)
+            .expect_err(&format!("{name} without arguments key must raise"));
+        assert!(
+            err.to_string().contains("missing 'arguments'"),
+            "{name} error should mention missing 'arguments', got: {err}"
+        );
+        assert!(
+            render_expression_safe(&expr).is_none(),
+            "{name} without arguments key must be None in safe mode"
+        );
+    }
 }
 
 // --- NULLIFZERO / ZEROIFNULL ---
@@ -2970,7 +3095,7 @@ fn renders_greatest_least_verbatim_in_exasol_dialect() {
     );
     assert_eq!(
         render_expression(&greatest).unwrap(),
-        r#"greatest("A", "B", "C")"#
+        r#"CASE WHEN "A" IS NULL OR "B" IS NULL OR "C" IS NULL THEN NULL ELSE greatest("A", "B", "C") END"#
     );
 
     let least = json!({
@@ -2985,7 +3110,10 @@ fn renders_greatest_least_verbatim_in_exasol_dialect() {
         render_expression_exasol(&least).unwrap(),
         r#"LEAST("X", 0)"#
     );
-    assert_eq!(render_expression(&least).unwrap(), r#"least("X", 0)"#);
+    assert_eq!(
+        render_expression(&least).unwrap(),
+        r#"CASE WHEN "X" IS NULL OR 0 IS NULL THEN NULL ELSE least("X", 0) END"#
+    );
 }
 
 #[test]

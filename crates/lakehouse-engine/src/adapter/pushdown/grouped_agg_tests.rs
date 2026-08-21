@@ -2932,8 +2932,10 @@ fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
 
 /// StddevPop merge SQL passes NULL through (N=0 → var_pop is NULL → stddev_pop NULL).
 ///
-/// Exasol `GREATEST(0.0, NULL) = 0.0` — a bare SQRT(GREATEST(...)) returns 0.0
-/// when cnt=0, not NULL. The correct form wraps in CASE WHEN IS NULL THEN NULL.
+/// Exasol's GREATEST returns NULL if any argument is NULL, so a bare
+/// SQRT(GREATEST(...)) already yields NULL when cnt=0. The CASE WHEN IS NULL
+/// THEN NULL guard is redundant under that contract but retained for
+/// pinned golden-fixture SQL and explicitness at the merge site.
 #[test]
 fn stddev_pop_merge_null_passthrough_for_n_zero() {
     let plans = vec![AggregatePlan {
@@ -2956,8 +2958,10 @@ fn stddev_pop_merge_null_passthrough_for_n_zero() {
 
 /// StddevSamp merge SQL passes NULL through for N=0 and N=1.
 ///
-/// var_samp is NULL when cnt<=1 (CASE guard). Wrapping in CASE WHEN IS NULL
-/// ensures SQRT does not receive 0.0 via GREATEST(0.0, NULL) = 0.0.
+/// var_samp is NULL when cnt<=1 (CASE guard). Exasol's GREATEST returns NULL
+/// if any argument is NULL, so SQRT already receives NULL there; the CASE
+/// WHEN IS NULL wrapper is redundant under that contract but retained for
+/// pinned golden-fixture SQL and explicitness at the merge site.
 #[test]
 fn stddev_samp_merge_null_passthrough_for_n_zero_and_n_one() {
     let plans = vec![AggregatePlan {

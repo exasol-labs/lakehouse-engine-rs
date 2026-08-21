@@ -367,8 +367,14 @@ impl StatMergeFragments {
 ///
 /// Adds exactly one parenthesis pair — around the `IS NULL` subject — and none
 /// around the `GREATEST` argument; that is the nesting the merge SQL is pinned
-/// to. See [`merge_select_items`] for why the `IS NULL` test cannot be folded
-/// into `GREATEST`.
+/// to. Exasol's `GREATEST`/`LEAST` already return NULL if any argument is NULL
+/// (verified live: `GREATEST(0.0, NULL)` is NULL on Exasol 2025.2.1), so this
+/// `CASE WHEN … IS NULL` guard is redundant with `GREATEST`'s own NULL
+/// contract. It is kept anyway: dropping it would change SQL that golden
+/// fixtures pin byte-for-byte for no correctness gain, and it states the NULL
+/// path explicitly at the merge site rather than making a reader derive it
+/// from `GREATEST`'s NULL contract. See [`merge_select_items`] for the same
+/// rationale at the call site.
 fn stddev_of(var: &str) -> String {
     format!("CASE WHEN ({var}) IS NULL THEN NULL ELSE SQRT(GREATEST(0.0, {var})) END")
 }
@@ -390,12 +396,18 @@ fn stddev_of(var: &str) -> String {
 ///   stddev_pop/samp = CASE WHEN var IS NULL THEN NULL
 ///                          ELSE SQRT(GREATEST(0.0, var)) END
 ///
-///   The CASE guard is required because Exasol's `GREATEST(0.0, NULL) = 0.0`
-///   (returns the max of non-NULL inputs; only returns NULL if ALL inputs are NULL),
-///   so a bare `SQRT(GREATEST(0.0, NULL))` would yield `0.0` instead of NULL for
-///   empty tables (N=0, pop) and single-row groups (N=1, samp).
-///   The GREATEST(0.0, …) inside the ELSE branch guards against tiny-negative
-///   float rounding artifacts that would otherwise cause SQRT to error.
+///   The CASE guard is not required by GREATEST's own semantics — Exasol's
+///   `GREATEST`/`LEAST` return NULL if ANY argument is NULL (verified live:
+///   `GREATEST(0.0, NULL)` is NULL on Exasol 2025.2.1), so a bare
+///   `SQRT(GREATEST(0.0, var))` already yields NULL for empty tables (N=0,
+///   pop) and single-row groups (N=1, samp). The guard is kept anyway:
+///   dropping it would change SQL that golden fixtures pin byte-for-byte for
+///   no correctness gain, and it states the NULL path explicitly at the merge
+///   site rather than making a reader derive it from `GREATEST`'s NULL
+///   contract.
+///   The GREATEST(0.0, …) inside the ELSE branch keeps its own, unrelated
+///   purpose: guarding against tiny-negative float rounding artifacts that
+///   would otherwise cause SQRT to error.
 pub(super) fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
     aggregates
         .iter()

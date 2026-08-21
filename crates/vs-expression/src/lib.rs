@@ -1297,7 +1297,15 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     }
                     let df_name = fn_name.to_lowercase();
                     let rendered = render_args(args, dialect)?;
-                    Ok(Some(format!("{df_name}({})", rendered.join(", "))))
+                    let guard = rendered
+                        .iter()
+                        .map(|a| format!("{a} IS NULL"))
+                        .collect::<Vec<_>>()
+                        .join(" OR ");
+                    Ok(Some(format!(
+                        "CASE WHEN {guard} THEN NULL ELSE {df_name}({}) END",
+                        rendered.join(", ")
+                    )))
                 }
                 // NULLIFZERO / ZEROIFNULL
                 "NULLIFZERO" => {
