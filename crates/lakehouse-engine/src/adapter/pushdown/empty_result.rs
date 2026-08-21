@@ -1,4 +1,4 @@
-use crate::scan::spec::{AggKind, ProjectionItem};
+use crate::scan::spec::{AggKind, AggregatePlan, ProjectionItem};
 use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -6,8 +6,9 @@ use serde_json::Value as Json;
 use super::GroupedSelectItem;
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::request_shape::{RequestShape, classify_request_shape};
+use super::scalar_over_agg::{classify_scalar_over_aggregate, render_scalar_over_merge};
 use super::single_group_agg::SingleGroupItem;
-use super::support::{aggregate_exasol_types, cast_to_declared_type, emits_ident};
+use super::support::{cast_to_declared_type, declared_select_type, emits_ident};
 
 /// Build the shape-correct empty-result response for a fully-pruned file list.
 ///
@@ -67,7 +68,7 @@ pub(super) fn empty_result_sql(
         RequestShape::GroupByWrapper => Ok(empty_select_list_typed_sql(pushdown_req)
             .unwrap_or_else(|| empty_pushdown_sql(proj_cols, proj_types))),
         RequestShape::SingleGroupAgg { items } => {
-            Ok(empty_agg_sql(&items, &aggregate_exasol_types(pushdown_req)))
+            Ok(empty_agg_sql(&items, pushdown_req, col_types))
         }
         // A widened derived projection is the full base row, so the non-empty path
         // routes it to the qualified single-table wrapper whose output columns ARE
@@ -119,27 +120,88 @@ fn empty_agg_literal(kind: &AggKind) -> &'static str {
     }
 }
 
+/// The Exasol type an absent nested aggregate's `NULL` carries: its argument
+/// column's own type, or `DOUBLE PRECISION` when the argument is an expression
+/// (or `COUNT(*)`). The value is NULL either way — the type exists only to make
+/// the enclosing scalar's argument well-typed, and Exasol converts implicitly
+/// between the numeric and character domains.
+fn nested_absent_agg_type(plan: &AggregatePlan, col_types: &[(String, String)]) -> String {
+    plan.column
+        .as_deref()
+        .and_then(|column| {
+            col_types
+                .iter()
+                .find(|(name, _)| name == column)
+                .map(|(_, ty)| ty.clone())
+        })
+        .unwrap_or_else(|| "DOUBLE PRECISION".to_string())
+}
+
+/// The empty-result literal for a scalar/arithmetic node wrapping one or more
+/// aggregates, evaluated over zero input rows: each nested aggregate's own
+/// `empty_agg_literal` is substituted into the scalar structure through the same
+/// `render_scalar_over_merge` mechanism the non-empty merge uses, so e.g.
+/// `ROUND(COUNT(*), 2)` yields `ROUND(0, 2)` rather than a bare `NULL`.
+///
+/// An absent value is substituted as a TYPED null: Exasol rejects an untyped
+/// `NULL` as a scalar-function argument outright — `ROUND(NULL, 2)` fails with
+/// `Feature not supported: Round with wrong type` (SQL state `0A000`,
+/// live-captured), as does `FLOOR(NULL)` — while any cast makes the argument
+/// well-typed, and the result is NULL either way.
+fn empty_scalar_over_aggregate_literal(node: &Json, col_types: &[(String, String)]) -> String {
+    let plans = classify_scalar_over_aggregate(node)
+        .expect("a SingleGroupItem::ScalarOverAggregate node was already classified at detection");
+    let zeros: Vec<String> = plans
+        .iter()
+        .map(|plan| match empty_agg_literal(&plan.kind) {
+            "NULL" => format!("CAST(NULL AS {})", nested_absent_agg_type(plan, col_types)),
+            zero => zero.to_string(),
+        })
+        .collect();
+    render_scalar_over_merge(node, &plans, &zeros)
+        .expect("a classified scalar-over-aggregate node must render over its own zero values")
+}
+
 /// Build the single-group aggregate empty-result response: exactly one row whose
-/// columns are each select-list item's zero-row literal cast to its declared
-/// result type (from `aggregate_exasol_types`/`selectListDataTypes`), in
-/// select-list order. A `COUNT(DISTINCT ...)` item yields `0` (no merge UDF and
-/// no fan-out: with zero files there is nothing to scan or deduplicate); every
-/// ordinary aggregate yields its per-`AggKind` empty literal. `FROM DUAL` alone
-/// already yields one row, so no `WHERE` is emitted.
+/// columns are each select-list item's zero-row literal cast to its OWN declared
+/// result type — looked up at the item's own `selectList` index, never through a
+/// filtered/compacted type list, since a `ScalarOverAggregate` item shifts every
+/// later index in such a list. A `COUNT(DISTINCT ...)` item yields `0` (no merge
+/// UDF and no fan-out: with zero files there is nothing to scan or deduplicate);
+/// an ordinary aggregate yields its per-`AggKind` empty literal; a scalar node
+/// wrapping aggregates yields that structure rendered over each nested
+/// aggregate's own empty literal (`empty_scalar_over_aggregate_literal`, which
+/// reads `col_types` to type each absent nested value), cast to its own
+/// `declared_type` field. `FROM DUAL` alone already yields one row, so no `WHERE`
+/// is emitted.
 ///
 /// The cast decision mirrors `cast_merge_items` (cast when a declared type is
 /// present and not the `VARCHAR(2000000)` default) so the empty column types can
 /// never drift from the non-empty single-group shape.
-fn empty_agg_sql(items: &[SingleGroupItem], aggregate_types: &[String]) -> Json {
+fn empty_agg_sql(
+    items: &[SingleGroupItem],
+    pushdown_req: &Json,
+    col_types: &[(String, String)],
+) -> Json {
     let literals: Vec<String> = items
         .iter()
         .enumerate()
-        .map(|(i, item)| {
-            let literal = match item {
-                SingleGroupItem::Distinct(_) => "0",
-                SingleGroupItem::Aggregate(plan) => empty_agg_literal(&plan.kind),
-            };
-            cast_to_declared_type(literal, aggregate_types.get(i).map(String::as_str))
+        .map(|(i, item)| match item {
+            SingleGroupItem::Distinct(_) => {
+                cast_to_declared_type("0", Some(declared_select_type(pushdown_req, i).as_str()))
+            }
+            SingleGroupItem::Aggregate(plan) => cast_to_declared_type(
+                empty_agg_literal(&plan.kind),
+                Some(declared_select_type(pushdown_req, i).as_str()),
+            ),
+            SingleGroupItem::ScalarOverAggregate {
+                node,
+                declared_type,
+                ..
+            } => cast_to_declared_type(
+                &empty_scalar_over_aggregate_literal(node, col_types),
+                Some(declared_type.as_str()),
+            ),
         })
         .collect();
     let sql = format!("SELECT {} FROM DUAL", literals.join(", "));
@@ -153,7 +215,7 @@ fn empty_agg_sql(items: &[SingleGroupItem], aggregate_types: &[String]) -> Json 
 /// merge assembles its outer SELECT.
 ///
 /// Group-key and aggregate columns are `CAST(NULL AS <declared-type>)` (types from
-/// `group_key_exasol_types` / `aggregate_exasol_types`); a constant projection
+/// `group_key_exasol_types` / `GroupedAggregateDetection::plan_types`); a constant projection
 /// reuses its already-rendered, type-cast expression. A zero-row result satisfies
 /// any HAVING / ORDER BY / LIMIT, so none of those need rendering.
 fn empty_grouped_sql(

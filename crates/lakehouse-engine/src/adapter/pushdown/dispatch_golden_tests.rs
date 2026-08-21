@@ -159,6 +159,119 @@ fn single_group_agg_request() -> Json {
     }))
 }
 
+/// Scalar-over-aggregate select list with an inner `DISTINCT`
+/// (`ROUND(SUM(DISTINCT AMOUNT), 2)`) — the decomposition declines on the
+/// inner `DISTINCT`, so the depth-insensitive floor widens the projection and
+/// routes to the qualified single-table wrapper rather than evaluating the
+/// aggregate per shard.
+fn nested_aggregate_decline_request() -> Json {
+    events_request(serde_json::json!({
+        "selectList": [ {
+            "type": "function_scalar",
+            "name": "ROUND",
+            "arguments": [
+                agg_item("SUM", Some("AMOUNT"), true),
+                {"type": "literal_exactnumeric", "value": 2}
+            ]
+        } ],
+        "selectListDataTypes": [ {"type": "decimal", "precision": 36, "scale": 2} ],
+    }))
+}
+
+/// Single-group select list that is a lone scalar function wrapping an
+/// aggregate (`ROUND(SUM(AMOUNT), 2)`, issue #194's shape) — decomposes into
+/// one partial column and one merged row.
+fn single_group_scalar_over_aggregate_request() -> Json {
+    events_request(serde_json::json!({
+        "selectList": [ {
+            "type": "function_scalar",
+            "name": "ROUND",
+            "arguments": [
+                agg_item("SUM", Some("AMOUNT"), false),
+                {"type": "literal_exactnumeric", "value": 2}
+            ]
+        } ],
+        "selectListDataTypes": [ {"type": "decimal", "precision": 36, "scale": 2} ],
+    }))
+}
+
+/// A bare `COUNT(*)` alongside a scalar-over-aggregate item that nests the
+/// SAME `COUNT(*)` (`ROUND(SUM(AMOUNT) / COUNT(*), 2)`) — the nested
+/// occurrence must dedup against the bare item's partial column.
+fn single_group_scalar_over_aggregate_dedup_request() -> Json {
+    events_request(serde_json::json!({
+        "selectList": [
+            agg_item("COUNT", None, false),
+            {
+                "type": "function_scalar",
+                "name": "ROUND",
+                "arguments": [
+                    {
+                        "type": "function_scalar",
+                        "name": "FLOAT_DIV",
+                        "arguments": [
+                            agg_item("SUM", Some("AMOUNT"), false),
+                            agg_item("COUNT", None, false),
+                        ]
+                    },
+                    {"type": "literal_exactnumeric", "value": 2}
+                ]
+            }
+        ],
+        "selectListDataTypes": [
+            {"type": "decimal", "precision": 18, "scale": 0},
+            {"type": "decimal", "precision": 36, "scale": 2}
+        ],
+    }))
+}
+
+/// A bare aggregate, a scalar-over-aggregate item, and another bare aggregate
+/// interleaved in `selectList` order, each carrying its own declared type.
+fn single_group_scalar_over_aggregate_interleaved_request() -> Json {
+    events_request(serde_json::json!({
+        "selectList": [
+            agg_item("SUM", Some("AMOUNT"), false),
+            {
+                "type": "function_scalar",
+                "name": "ROUND",
+                "arguments": [
+                    {
+                        "type": "function_scalar",
+                        "name": "FLOAT_DIV",
+                        "arguments": [
+                            agg_item("SUM", Some("AMOUNT"), false),
+                            agg_item("COUNT", None, false),
+                        ]
+                    },
+                    {"type": "literal_exactnumeric", "value": 2}
+                ]
+            },
+            agg_item("COUNT", None, false),
+        ],
+        "selectListDataTypes": [
+            {"type": "decimal", "precision": 36, "scale": 2},
+            {"type": "decimal", "precision": 9, "scale": 4},
+            {"type": "decimal", "precision": 18, "scale": 0}
+        ],
+    }))
+}
+
+/// A scalar-wrapped statistical aggregate (`ROUND(VARIANCE(AMOUNT), 4)`,
+/// issue #188's shape) resolves through the shared `AggKind` tables.
+fn single_group_scalar_over_variance_request() -> Json {
+    events_request(serde_json::json!({
+        "selectList": [ {
+            "type": "function_scalar",
+            "name": "ROUND",
+            "arguments": [
+                agg_item("VARIANCE", Some("AMOUNT"), false),
+                {"type": "literal_exactnumeric", "value": 4}
+            ]
+        } ],
+        "selectListDataTypes": [ {"type": "decimal", "precision": 36, "scale": 4} ],
+    }))
+}
+
 /// Render a non-empty dispatch SQL for `request` through the production
 /// [`build_dispatch_sql`] seam, over the fixed three-shard fixture and a fixed
 /// tuning/storage/schema common blob. `has_order_by` is always `false`: none
@@ -183,6 +296,53 @@ fn dispatch_sql(
         filter,
         limit,
     )
+}
+
+/// Like [`dispatch_sql`], but derives its projection inputs (and widening flag)
+/// through the production [`project_columns`](super::support::project_columns)
+/// helper instead of hardcoding them, so the golden proves the fixture ITSELF
+/// widens rather than only that `build_dispatch_sql` honours a widening signal
+/// it was handed.
+fn dispatch_sql_widened(request: &Json) -> String {
+    let pushdown_req = pd(request);
+    let (proj_cols, proj_types, widened) =
+        super::support::project_columns(&pushdown_req, base_col_types())
+            .expect("the fixture must project");
+    assert!(
+        widened,
+        "this fixture must exercise the widening guard, not a per-item projection"
+    );
+    let result = build_dispatch_sql(
+        request,
+        &pushdown_req,
+        proj_cols,
+        proj_types,
+        widened,
+        base_col_types(),
+        None,
+        None,
+        None,
+        false,
+        &fixed_shards(),
+        "s3://warehouse/db/events".to_string(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &sample_storage(),
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+        4,
+        8192,
+        2,
+        0.6,
+        200,
+        8,
+    )
+    .expect("build_dispatch_sql must succeed for this fixture");
+    result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field")
+        .to_string()
 }
 
 /// Like [`dispatch_sql`], but takes the `pushdownRequest` body explicitly
@@ -327,6 +487,80 @@ fn single_group_row_scan_matches_golden() {
     assert_eq!(actual, expected);
 }
 
+/// A nested aggregate the merge decomposition declines widens the projection
+/// and routes to the qualified single-table wrapper, not a per-shard
+/// projection — the floor's dispatch-level assertion (#194).
+#[test]
+fn nested_aggregate_decline_matches_qualified_wrapper_golden() {
+    let actual = dispatch_sql_widened(&nested_aggregate_decline_request());
+    let expected = include_str!("testdata/dispatch_golden/nested_aggregate_decline.sql");
+    assert_eq!(actual, expected);
+}
+
+/// A lone scalar-over-aggregate select item (`ROUND(SUM(AMOUNT), 2)`)
+/// decomposes into one deduplicated partial column and one merged row.
+#[test]
+fn single_group_scalar_over_aggregate_matches_golden() {
+    let actual = dispatch_sql(
+        &single_group_scalar_over_aggregate_request(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let expected = include_str!("testdata/dispatch_golden/single_group_scalar_over_aggregate.sql");
+    assert_eq!(actual, expected);
+}
+
+/// A bare `COUNT(*)` and a `ROUND(SUM(AMOUNT) / COUNT(*), 2)` item share the
+/// same nested `COUNT(*)`, which must dedup into ONE partial column.
+#[test]
+fn single_group_scalar_over_aggregate_dedup_matches_golden() {
+    let actual = dispatch_sql(
+        &single_group_scalar_over_aggregate_dedup_request(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let expected =
+        include_str!("testdata/dispatch_golden/single_group_scalar_over_aggregate_dedup.sql");
+    assert_eq!(actual, expected);
+}
+
+/// A bare aggregate, a scalar-over-aggregate item, and another bare
+/// aggregate interleave in `selectList` order, each cast to its own
+/// declared type.
+#[test]
+fn single_group_scalar_over_aggregate_interleaved_matches_golden() {
+    let actual = dispatch_sql(
+        &single_group_scalar_over_aggregate_interleaved_request(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let expected =
+        include_str!("testdata/dispatch_golden/single_group_scalar_over_aggregate_interleaved.sql");
+    assert_eq!(actual, expected);
+}
+
+/// A scalar-wrapped statistical aggregate (`ROUND(VARIANCE(AMOUNT), 4)`)
+/// resolves through the shared `AggKind` tables, so no aggregate name
+/// reaches DataFusion.
+#[test]
+fn single_group_scalar_over_variance_matches_golden() {
+    let actual = dispatch_sql(
+        &single_group_scalar_over_variance_request(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        None,
+    );
+    let expected = include_str!("testdata/dispatch_golden/single_group_scalar_over_variance.sql");
+    assert_eq!(actual, expected);
+}
+
 /// Empty-grouped result SQL stays byte-identical to the captured pre-dedup
 /// golden.
 #[test]
@@ -387,6 +621,17 @@ fn empty_row_scan_matches_golden() {
     let (proj_cols, proj_types) = row_scan_projection();
     let actual = empty_sql(&row_scan_request(), &proj_cols, &proj_types);
     let expected = include_str!("testdata/dispatch_golden/empty_row_scan.sql");
+    assert_eq!(actual, expected);
+}
+
+/// A fully-pruned file list over a scalar-over-aggregate select list yields
+/// one shape-correct empty row, its `NULL` cast to the item's own declared
+/// type.
+#[test]
+fn empty_single_group_scalar_over_aggregate_matches_golden() {
+    let actual = empty_sql(&single_group_scalar_over_aggregate_request(), &[], &[]);
+    let expected =
+        include_str!("testdata/dispatch_golden/empty_single_group_scalar_over_aggregate.sql");
     assert_eq!(actual, expected);
 }
 

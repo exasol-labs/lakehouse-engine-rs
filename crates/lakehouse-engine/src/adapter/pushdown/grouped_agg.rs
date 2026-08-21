@@ -8,11 +8,14 @@ use crate::scan::spec::{
 };
 use crate::types::mapping::{exasol_type_from_json, parse_decimal_args};
 use serde_json::Value as Json;
-use vs_expression::{render_expression, render_expression_exasol};
+use vs_expression::render_expression;
 
-use super::single_group_agg::parse_agg_item;
+use super::scalar_over_agg::{
+    cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items,
+    parse_agg_item, render_scalar_over_merge,
+};
 use super::support::{
-    build_fan_out_inner, cast_to_declared_type, quote_ident, render_limit_offset,
+    build_fan_out_inner, cast_to_declared_type, declared_select_type, render_limit_offset,
 };
 use super::topn::parse_sort_flags;
 
@@ -101,9 +104,7 @@ pub struct GroupedAggregateDetection {
     /// own `selectListDataTypes` type; a plan seen only nested inside a scalar has
     /// no `selectList` ordinal of its own and defaults to `DOUBLE PRECISION` (its
     /// merged form is rendered UNCAST inside the scalar wrapper anyway — the wrapper
-    /// item is cast to its OWN declared type). Replaces `aggregate_exasol_types` on
-    /// the grouped path, which keyed off top-level select items only and would
-    /// misalign once nested aggregates join `plans`.
+    /// item is cast to its OWN declared type).
     pub plan_types: Vec<String>,
     /// One entry per `selectList` item, in `selectList` order.
     pub select_items: Vec<GroupedSelectItem>,
@@ -197,15 +198,6 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
         return None;
     }
 
-    let declared_type_at = |select_index: usize| -> String {
-        pushdown_req
-            .get("selectListDataTypes")
-            .and_then(|v| v.as_array())
-            .and_then(|d| d.get(select_index))
-            .map(exasol_type_from_json)
-            .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
-    };
-
     let mut plans = Vec::new();
     let mut plan_types = Vec::new();
     let mut select_items = Vec::with_capacity(list.len());
@@ -219,7 +211,7 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
                     &mut plans,
                     &mut plan_types,
                     plan,
-                    Some(declared_type_at(select_index)),
+                    Some(declared_select_type(pushdown_req, select_index)),
                 );
                 select_items.push(GroupedSelectItem::Aggregate {
                     plan_slot,
@@ -268,7 +260,7 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
                 select_items.push(GroupedSelectItem::ScalarOverAggregate {
                     select_index,
                     node: item.clone(),
-                    declared_type: declared_type_at(select_index),
+                    declared_type: declared_select_type(pushdown_req, select_index),
                 });
             }
         }
@@ -280,158 +272,6 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
         plan_types,
         select_items,
     })
-}
-
-/// Fold an aggregate plan into the shared `plans`/`plan_types` lists, deduplicating
-/// by `AggregatePlan` equality (kind + argument) so an aggregate used more than once
-/// across the select list — bare AND nested inside a scalar — collapses to ONE
-/// `PARTIAL_*` column (decision-log [4]). Returns the plan's slot.
-///
-/// `declared` is `Some` for a top-level `function_aggregate` select item (its
-/// authoritative `selectListDataTypes` type) and `None` for an aggregate seen only
-/// nested inside a scalar. A `Some` declared type always wins: it overwrites a slot
-/// that a nested occurrence created with the default, so a bare aggregate's output
-/// CAST uses the type Exasol declared for it regardless of select-list order.
-fn fold_aggregate_plan(
-    plans: &mut Vec<AggregatePlan>,
-    plan_types: &mut Vec<String>,
-    plan: AggregatePlan,
-    declared: Option<String>,
-) -> usize {
-    match plans.iter().position(|p| *p == plan) {
-        Some(slot) => {
-            if let Some(ty) = declared {
-                plan_types[slot] = ty;
-            }
-            slot
-        }
-        None => {
-            let slot = plans.len();
-            plans.push(plan);
-            plan_types.push(declared.unwrap_or_else(|| "DOUBLE PRECISION".to_string()));
-            slot
-        }
-    }
-}
-
-/// Sentinel `column` name substituted for the i-th nested aggregate while rendering
-/// a scalar-over-aggregate node through the `vs-expression` translator. Distinctive
-/// and already uppercase so it survives the translator's `column` uppercasing and
-/// cannot collide with a real column; the rendered token is later string-replaced
-/// with the aggregate's merged `PARTIAL_*` expression.
-fn agg_sentinel_name(i: usize) -> String {
-    format!("__LH_AGG_MERGE_{i}__")
-}
-
-/// The exact SQL token `vs-expression` emits for the i-th aggregate sentinel column
-/// (a quoted identifier), used as the string-replacement target.
-fn agg_sentinel_token(i: usize) -> String {
-    quote_ident(&agg_sentinel_name(i))
-}
-
-/// Build the sentinel `column` node for the i-th nested aggregate.
-fn sentinel_column_node(i: usize) -> Json {
-    serde_json::json!({ "type": "column", "name": agg_sentinel_name(i) })
-}
-
-/// Deep-clone `node`, replacing every nested `function_aggregate` subtree with a
-/// sentinel `column` node (`__LH_AGG_MERGE_{i}__`) and collecting the original
-/// aggregate nodes in sentinel order. Recursion STOPS at a `function_aggregate`
-/// (its arguments are subsumed into the aggregate and rewritten wholesale), so a
-/// `column` inside an aggregate (e.g. inside `SUM(CASE … col …)`) is never treated
-/// as a residual. `residual_column` is set when a bare `column` appears OUTSIDE any
-/// aggregate — the outer merge wrapper exposes only `GK_*`/`PARTIAL_*` columns, so
-/// such a node cannot be rendered there and disqualifies the scalar-over-aggregate
-/// classification (the request routes to the qualified fallback instead).
-fn sentinelize_aggregates(
-    node: &Json,
-    aggregates: &mut Vec<Json>,
-    residual_column: &mut bool,
-) -> Json {
-    match node {
-        Json::Object(map) => match map.get("type").and_then(|t| t.as_str()) {
-            Some("function_aggregate") => {
-                let i = aggregates.len();
-                aggregates.push(node.clone());
-                sentinel_column_node(i)
-            }
-            kind => {
-                if kind == Some("column") {
-                    *residual_column = true;
-                }
-                let mut out = serde_json::Map::with_capacity(map.len());
-                for (key, value) in map {
-                    out.insert(
-                        key.clone(),
-                        sentinelize_aggregates(value, aggregates, residual_column),
-                    );
-                }
-                Json::Object(out)
-            }
-        },
-        Json::Array(items) => Json::Array(
-            items
-                .iter()
-                .map(|v| sentinelize_aggregates(v, aggregates, residual_column))
-                .collect(),
-        ),
-        other => other.clone(),
-    }
-}
-
-/// Classify a `selectList` item as a scalar-over-aggregate: a scalar/arithmetic node
-/// wrapping one or more nested `function_aggregate` nodes, every one decomposable via
-/// `parse_agg_item` (so `DISTINCT`, an unsupported function, or an untranslatable
-/// argument declines), with no bare source `column` outside those aggregates and a
-/// residual structure the `vs-expression` translator can render. Returns the nested
-/// plans in encounter order, or `None` to decline (→ qualified fallback).
-fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<AggregatePlan>> {
-    let mut aggregates = Vec::new();
-    let mut residual_column = false;
-    let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
-    // Not a scalar-over-aggregate: no aggregate to decompose, or a source column the
-    // outer merge wrapper cannot reference.
-    if aggregates.is_empty() || residual_column {
-        return None;
-    }
-    // The residual scalar/arithmetic structure (with aggregates sentinelized) must be
-    // renderable by the translator — otherwise the outer wrapper cannot be built.
-    render_expression(&sentinel_tree).ok()?;
-    aggregates.iter().map(parse_agg_item).collect()
-}
-
-/// Render a scalar/arithmetic node over the OUTER merge wrapper: every nested
-/// `function_aggregate` is rewritten to its merged `PARTIAL_*` expression (matched to
-/// `plans` by `AggregatePlan` equality), and the surrounding scalar/arithmetic
-/// structure is rendered verbatim by the `vs-expression` translator. This is the one
-/// merge-rewrite path shared by the grouped select list AND a scalar-over-aggregate
-/// inside a HAVING (decision-log [2]).
-///
-/// It reuses the translator by SUBSTITUTION rather than re-implementing its scalar
-/// arms: each aggregate subtree is replaced with a distinctive sentinel `column`,
-/// the tree is rendered once, then each sentinel token is string-replaced with the
-/// aggregate's merged expression. This inherits every scalar/arithmetic node type,
-/// operator string, and parenthesization the translator supports with zero risk of
-/// drifting from it. Returns `None` if the structure cannot be rendered or a nested
-/// aggregate is not among `plans` (cannot be merged).
-fn render_scalar_over_merge(node: &Json, plans: &[AggregatePlan]) -> Option<String> {
-    let mut aggregates = Vec::new();
-    let mut residual_column = false;
-    let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
-    let merged = merge_select_items(plans);
-    // Exasol dialect: this SQL is spliced verbatim into the OUTER merge wrapper,
-    // which Exasol's own core engine parses — so a character CAST target is
-    // rendered length-qualified: `VARCHAR(n)` for a VARCHAR target, `CHAR(n)`/
-    // `CHAR(n) ASCII` for a CHAR target — unlike the DataFusion-side
-    // renderability check in `classify_scalar_over_aggregate`, which
-    // deliberately keeps bare `VARCHAR`.
-    let mut sql = render_expression_exasol(&sentinel_tree).ok()?;
-    for (i, agg) in aggregates.iter().enumerate() {
-        let plan = parse_agg_item(agg)?;
-        let slot = plans.iter().position(|p| *p == plan)?;
-        sql = sql.replace(&agg_sentinel_token(i), merged.get(slot)?);
-    }
-    Some(sql)
 }
 
 /// Resolve the Exasol-declared type of each group key, from `selectListDataTypes`
@@ -732,6 +572,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
         })
         .collect();
     let merge_items = cast_merge_items(aggregates, aggregate_types);
+    let merged_partials = merge_select_items(aggregates);
 
     // Assemble the outer SELECT in the user's selectList order: each classified
     // item is placed at its original ordinal, interleaving group-key casts and
@@ -761,7 +602,7 @@ pub fn build_grouped_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
                 node,
                 declared_type,
                 ..
-            } => render_scalar_over_merge(node, aggregates)
+            } => render_scalar_over_merge(node, aggregates, &merged_partials)
                 .map(|expr| cast_to_declared_type(&expr, Some(declared_type))),
         })
         .collect();
@@ -835,9 +676,10 @@ pub(super) fn partial_emits_items(
         .iter()
         .enumerate()
         .flat_map(|(i, plan)| {
-            // Declared aggregate result type at this ordinal (from
-            // `aggregate_exasol_types`/`selectListDataTypes`); the sole type source
-            // for an expression-argument aggregate, which has no source column.
+            // Declared aggregate result type at this ordinal — the caller's
+            // per-plan `aggregate_types` list, resolved from `selectListDataTypes`;
+            // the sole type source for an expression-argument aggregate, which has
+            // no source column.
             let declared = aggregate_types.get(i).map(String::as_str);
             plan.kind.partial_columns().iter().map(move |col| {
                 let ty = match col {
@@ -874,9 +716,9 @@ pub(super) fn partial_emits_items(
 /// (from `col_types`), falling back to `DOUBLE PRECISION` when the column is
 /// absent from the map. For an expression-argument aggregate (`arg_expr` set,
 /// no source `column`) there is no source column to look up, so the type is the
-/// aggregate item's declared result type (`declared`, from
-/// `aggregate_exasol_types`/`selectListDataTypes`); when the declared type is
-/// unavailable it falls back to the column-map lookup (then `DOUBLE PRECISION`).
+/// aggregate item's declared result type (`declared`, the caller's per-plan
+/// `aggregate_types` list, resolved from `selectListDataTypes`); when the declared
+/// type is unavailable it falls back to the column-map lookup (then `DOUBLE PRECISION`).
 pub(super) fn col_type_for(
     column: Option<&str>,
     arg_expr: Option<&str>,
@@ -963,120 +805,6 @@ pub fn validate_agg_col_types(
 /// Return `true` for Exasol types that support SUM (DOUBLE PRECISION, DECIMAL).
 fn is_numeric_exasol_type(ty: &str) -> bool {
     ty == "DOUBLE PRECISION" || ty.starts_with("DECIMAL(")
-}
-
-/// The three König–Huygens SQL fragments shared by all four statistical merge
-/// formulas, rendered over the partial columns of the aggregate at ordinal `i`.
-///
-/// Held as one value so [`merge_select_items`]' four statistical arms compose
-/// them by name instead of re-inlining the text: a variance is
-/// `numer / pop_denom` or `numer / samp_denom`, and a standard deviation is
-/// [`stddev_of`] applied to either. `numer` carries its own outer parentheses,
-/// so no composition adds any.
-struct StatMergeFragments {
-    numer: String,
-    pop_denom: String,
-    samp_denom: String,
-}
-
-impl StatMergeFragments {
-    fn for_ordinal(i: usize) -> Self {
-        let cnt = partial_column_name(PartialAggColumn::StatCnt, i);
-        let sum = partial_column_name(PartialAggColumn::StatSum, i);
-        let sumsq = partial_column_name(PartialAggColumn::StatSumSq, i);
-        let pop_denom = format!(r#"NULLIF(SUM("{cnt}"), 0)"#);
-        let samp_denom =
-            format!(r#"CASE WHEN SUM("{cnt}") <= 1 THEN NULL ELSE SUM("{cnt}") - 1 END"#);
-        let numer = format!(r#"(SUM("{sumsq}") - SUM("{sum}") * SUM("{sum}") / {pop_denom})"#);
-        Self {
-            numer,
-            pop_denom,
-            samp_denom,
-        }
-    }
-}
-
-/// Render the NULL-preserving square root of a variance expression.
-///
-/// Adds exactly one parenthesis pair — around the `IS NULL` subject — and none
-/// around the `GREATEST` argument; that is the nesting the merge SQL is pinned
-/// to. See [`merge_select_items`] for why the `IS NULL` test cannot be folded
-/// into `GREATEST`.
-fn stddev_of(var: &str) -> String {
-    format!("CASE WHEN ({var}) IS NULL THEN NULL ELSE SQRT(GREATEST(0.0, {var})) END")
-}
-
-/// Build the outer merge SELECT items following the COLUMN CONTRACT.
-///
-/// Every partial column name comes from [`partial_column_name`], so a rename can
-/// never land here without also landing in the scan's aliases and the `EMITS`
-/// clause; this function owns only the re-aggregation formula per [`AggKind`].
-///
-/// AVG uses `SUM(sum) / NULLIF(SUM(cnt), 0)` — the NULLIF guard ensures division
-/// by zero yields NULL rather than an error (Exasol: `x / NULL = NULL`).
-///
-/// STDDEV/VARIANCE sufficient-statistics reconstruction (König–Huygens identity):
-///   numer    = SUM(sumsq) - SUM(sum)² / NULLIF(SUM(cnt), 0)
-///   var_pop  = numer / NULLIF(SUM(cnt), 0)          [NULL when cnt = 0]
-///   var_samp = numer / (SUM(cnt) - 1)               [NULL when cnt ≤ 1, via CASE]
-///
-///   stddev_pop/samp = CASE WHEN var IS NULL THEN NULL
-///                          ELSE SQRT(GREATEST(0.0, var)) END
-///
-///   The CASE guard is required because Exasol's `GREATEST(0.0, NULL) = 0.0`
-///   (returns the max of non-NULL inputs; only returns NULL if ALL inputs are NULL),
-///   so a bare `SQRT(GREATEST(0.0, NULL))` would yield `0.0` instead of NULL for
-///   empty tables (N=0, pop) and single-row groups (N=1, samp).
-///   The GREATEST(0.0, …) inside the ELSE branch guards against tiny-negative
-///   float rounding artifacts that would otherwise cause SQRT to error.
-fn merge_select_items(aggregates: &[AggregatePlan]) -> Vec<String> {
-    aggregates
-        .iter()
-        .enumerate()
-        .map(|(i, plan)| match plan.kind {
-            AggKind::Count => {
-                let count = partial_column_name(PartialAggColumn::CountStar, i);
-                format!(r#"SUM("{count}")"#)
-            }
-            AggKind::CountCol => {
-                let count = partial_column_name(PartialAggColumn::CountArg, i);
-                format!(r#"SUM("{count}")"#)
-            }
-            AggKind::Sum => {
-                let sum = partial_column_name(PartialAggColumn::Sum, i);
-                format!(r#"SUM("{sum}")"#)
-            }
-            AggKind::Min => {
-                let min = partial_column_name(PartialAggColumn::Min, i);
-                format!(r#"MIN("{min}")"#)
-            }
-            AggKind::Max => {
-                let max = partial_column_name(PartialAggColumn::Max, i);
-                format!(r#"MAX("{max}")"#)
-            }
-            AggKind::Avg => {
-                let sum = partial_column_name(PartialAggColumn::AvgSum, i);
-                let cnt = partial_column_name(PartialAggColumn::AvgCnt, i);
-                format!(r#"SUM("{sum}") / NULLIF(SUM("{cnt}"), 0)"#)
-            }
-            AggKind::VarPop => {
-                let stat = StatMergeFragments::for_ordinal(i);
-                format!("{} / {}", stat.numer, stat.pop_denom)
-            }
-            AggKind::VarSamp => {
-                let stat = StatMergeFragments::for_ordinal(i);
-                format!("{} / {}", stat.numer, stat.samp_denom)
-            }
-            AggKind::StddevPop => {
-                let stat = StatMergeFragments::for_ordinal(i);
-                stddev_of(&format!("{} / {}", stat.numer, stat.pop_denom))
-            }
-            AggKind::StddevSamp => {
-                let stat = StatMergeFragments::for_ordinal(i);
-                stddev_of(&format!("{} / {}", stat.numer, stat.samp_denom))
-            }
-        })
-        .collect()
 }
 
 /// Render a HAVING predicate for the OUTER merge wrapper.
@@ -1183,7 +911,7 @@ fn render_having_operand(node: Option<&Json>, plans: &[AggregatePlan]) -> Option
         // rendered verbatim over absent source columns — the fix that closes issue
         // #82's gap, which also covers a scalar-over-aggregate inside a HAVING. A
         // node with no nested aggregate renders exactly as `vs-expression` would.
-        _ => render_scalar_over_merge(node, plans),
+        _ => render_scalar_over_merge(node, plans, &merge_select_items(plans)),
     }
 }
 
@@ -1205,24 +933,6 @@ fn render_having_junction(
         1 => parts.into_iter().next(),
         _ => Some(format!("({})", parts.join(op))),
     }
-}
-
-/// Build the outer merge SELECT items, each cast to its Exasol-declared result type.
-///
-/// The merge expression (e.g. `SUM("PARTIAL_count_0")` over DECIMAL(20,0) partials →
-/// DECIMAL(31,0)) must match the type Exasol declared for that select-list column
-/// (COUNT(score) → DECIMAL(18,0)); Exasol strictly validates the pushdown output
-/// column types. When no declared type is available (or it is VARCHAR(2000000)),
-/// the merge expression is emitted uncast.
-pub(super) fn cast_merge_items(
-    aggregates: &[AggregatePlan],
-    aggregate_types: &[String],
-) -> Vec<String> {
-    merge_select_items(aggregates)
-        .into_iter()
-        .enumerate()
-        .map(|(i, expr)| cast_to_declared_type(&expr, aggregate_types.get(i).map(String::as_str)))
-        .collect()
 }
 
 #[cfg(test)]

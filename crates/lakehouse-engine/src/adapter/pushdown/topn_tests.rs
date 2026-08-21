@@ -1,5 +1,6 @@
+use super::super::single_group_agg::{single_group_merge_select, single_group_plan_types};
 use super::super::support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, build_scan_driving_sql,
+    AggregateMergeInputs, DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, build_scan_driving_sql,
     classify_where_filter, extract_all_column_types, extract_projection, order_by_present,
     shard_count,
 };
@@ -42,6 +43,16 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
 
     let items = detect_aggregates(&pushdown_req)
         .filter(|it| validate_agg_col_types(&ordinary_plans(it), &col_types));
+    // Mirrors the dispatcher's single-group aggregate inputs: the folded plans, their
+    // per-plan declared `EMITS` types, and the caller-owned merge SELECT.
+    let merge_inputs = items.as_deref().map(|it| {
+        let plans = ordinary_plans(it);
+        let plan_types = single_group_plan_types(&pushdown_req, it);
+        let merge_select = single_group_merge_select(it, &plans, &plan_types)
+            .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
+        AggregateMergeInputs::new(plan_types, merge_select, limit)
+            .expect("one merge item per select-list item is never empty")
+    });
     let aggregates = items.map(|it| ordinary_plans(&it));
     // Production routes a widened projection to the qualified single-table
     // wrapper ONLY from the `RequestShape::RowScan` arm (`mod.rs`'s
@@ -104,16 +115,14 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let files: Vec<FileEntry> = files.into_iter().map(FileEntry::from).collect();
     let g = shard_count(cluster_nodes, 1, files.len());
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
-    let aggregate_types = aggregate_exasol_types(&pushdown_req);
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
         &proj_cols,
         &proj_types,
         effective_limit,
-        limit,
         &col_types,
-        &aggregate_types,
+        merge_inputs.as_ref(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );

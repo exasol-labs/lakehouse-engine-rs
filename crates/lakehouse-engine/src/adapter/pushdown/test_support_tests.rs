@@ -430,9 +430,8 @@ pub(super) fn build_sql_for_fixture_n(
         &proj_items,
         &proj_types,
         limit,
-        None,
         &col_types,
-        &[],
+        None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )
@@ -571,9 +570,8 @@ pub(super) fn build_row_sql_with_root(
         &proj_items,
         &proj_types,
         None,
-        None,
         &col_types,
-        &[],
+        None,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )

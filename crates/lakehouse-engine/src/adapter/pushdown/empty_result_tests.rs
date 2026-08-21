@@ -75,8 +75,13 @@ fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
             arg_expr: None,
         }),
     ];
-    let types = vec!["DECIMAL(18,0)".to_string(), "DECIMAL(36,2)".to_string()];
-    let resp = empty_agg_sql(&items, &types);
+    let pushdown_req = serde_json::json!({
+        "selectListDataTypes": [
+            {"type": "decimal", "precision": 18, "scale": 0},
+            {"type": "decimal", "precision": 36, "scale": 2},
+        ],
+    });
+    let resp = empty_agg_sql(&items, &pushdown_req, &[]);
     let sql = resp["sql"].as_str().unwrap();
     assert!(sql.contains("FROM DUAL"), "must select from DUAL: {sql}");
     assert!(
@@ -93,6 +98,41 @@ fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
     );
 }
 
+/// A `ScalarOverAggregate` item followed by a bare `Aggregate` item must not
+/// shift the bare item's declared-type lookup: each item's cast type comes from
+/// its OWN `selectList` index, never from a list compacted down to only the
+/// `function_aggregate`-typed items (which the `ScalarOverAggregate` item, typed
+/// `function_scalar`, is absent from — a type list compacted that way shifts
+/// every index after a `ScalarOverAggregate` item, so each item's cast type must
+/// be looked up at its own `selectList` index).
+#[test]
+fn empty_agg_sql_scalar_over_aggregate_item_does_not_shift_a_later_bare_aggregate_type() {
+    let items = vec![
+        SingleGroupItem::ScalarOverAggregate {
+            node: round_of(count_star(), 2),
+            declared_type: "DECIMAL(18,2)".to_string(),
+        },
+        SingleGroupItem::Aggregate(AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+            arg_expr: None,
+        }),
+    ];
+    let pushdown_req = serde_json::json!({
+        "selectListDataTypes": [
+            {"type": "decimal", "precision": 18, "scale": 2},
+            {"type": "decimal", "precision": 36, "scale": 4},
+        ],
+    });
+    let resp = empty_agg_sql(&items, &pushdown_req, &[]);
+    let sql = resp["sql"].as_str().unwrap();
+    assert!(
+        sql.contains("CAST(NULL AS DECIMAL(36,4))"),
+        "the bare SUM at select-list index 1 must be cast to ITS OWN declared \
+         type, not left uncast by a compacted-index lookup: {sql}"
+    );
+}
+
 /// COUNT(DISTINCT) over zero files yields a plain `0` literal row — no distinct
 /// fan-out, no scan, and no merge step (with zero files there is nothing to scan
 /// or deduplicate).
@@ -102,14 +142,107 @@ fn empty_agg_sql_count_distinct_emits_zero_no_merge_udf() {
         column: Some("ID".into()),
         arg_expr: None,
     })];
-    let types = vec!["DECIMAL(18,0)".to_string()];
-    let resp = empty_agg_sql(&items, &types);
+    let pushdown_req = serde_json::json!({
+        "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
+    });
+    let resp = empty_agg_sql(&items, &pushdown_req, &[]);
     let sql = resp["sql"].as_str().unwrap();
     assert_eq!(
         sql, "SELECT CAST(0 AS DECIMAL(18,0)) FROM DUAL",
         "COUNT(DISTINCT) over zero files must be a plain 0 literal row with no fan-out \
          or merge step: {sql}"
     );
+}
+
+fn count_star() -> Json {
+    serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": []})
+}
+
+fn sum_of(col: &str) -> Json {
+    serde_json::json!({
+        "type": "function_aggregate", "name": "SUM", "distinct": false,
+        "arguments": [{"type": "column", "name": col}]
+    })
+}
+
+fn round_of(inner: Json, digits: i64) -> Json {
+    serde_json::json!({
+        "type": "function_scalar", "name": "ROUND",
+        "arguments": [inner, {"type": "literal_exactnumeric", "value": digits}]
+    })
+}
+
+/// A fully-pruned file list yields one shape-correct empty row for a
+/// scalar-over-aggregate select list: each nested aggregate contributes its OWN
+/// zero-row literal (COUNT -> `0`, SUM -> a NULL typed from its argument column)
+/// substituted into the scalar structure, not a bare `NULL` for the whole item —
+/// and the result is cast to the item's own declared type, independent of
+/// `selectListDataTypes` (here absent from `pushdown_req` entirely).
+///
+/// The absent value MUST carry a type: Exasol rejects `ROUND(NULL, 2)` outright
+/// with `Feature not supported: Round with wrong type` (SQL state `0A000`).
+#[test]
+fn empty_single_group_scalar_over_aggregate_emits_one_typed_row() {
+    let items = vec![
+        SingleGroupItem::ScalarOverAggregate {
+            node: round_of(count_star(), 2),
+            declared_type: "DECIMAL(18,2)".to_string(),
+        },
+        SingleGroupItem::ScalarOverAggregate {
+            node: round_of(sum_of("AMOUNT"), 2),
+            declared_type: "DECIMAL(36,2)".to_string(),
+        },
+    ];
+    let pushdown_req = serde_json::json!({});
+    let col_types = [("AMOUNT".to_string(), "DECIMAL(18,2)".to_string())];
+    let resp = empty_agg_sql(&items, &pushdown_req, &col_types);
+    let sql = resp["sql"].as_str().unwrap();
+
+    assert!(sql.contains("FROM DUAL"), "must select from DUAL: {sql}");
+    assert!(
+        !sql.contains("WHERE 1=0"),
+        "single-group empty is one row, not zero rows: {sql}"
+    );
+    assert!(
+        sql.contains("CAST(ROUND(0, 2) AS DECIMAL(18,2))"),
+        "ROUND(COUNT(*), 2) zero-row value must substitute COUNT's own zero \
+         literal, not a bare NULL: {sql}"
+    );
+    assert!(
+        sql.contains("CAST(ROUND(CAST(NULL AS DECIMAL(18,2)), 2) AS DECIMAL(36,2))"),
+        "ROUND(SUM(x), 2) zero-row value must substitute SUM's absent value typed \
+         from its own argument column — Exasol rejects a bare ROUND(NULL, 2) with \
+         SQL state 0A000: {sql}"
+    );
+}
+
+/// An absent nested aggregate with no argument column to type it from — here a
+/// `SUM` over a scalar expression — falls back to `DOUBLE PRECISION`, so the
+/// rendered scalar still receives a well-typed argument.
+#[test]
+fn empty_single_group_scalar_over_expression_aggregate_types_its_null() {
+    let items = vec![SingleGroupItem::ScalarOverAggregate {
+        node: round_of(sum_of_length("COMMENT"), 2),
+        declared_type: "DECIMAL(36,2)".to_string(),
+    }];
+    let resp = empty_agg_sql(&items, &serde_json::json!({}), &[]);
+    let sql = resp["sql"].as_str().unwrap();
+
+    assert!(
+        sql.contains("CAST(ROUND(CAST(NULL AS DOUBLE PRECISION), 2) AS DECIMAL(36,2))"),
+        "an expression-argument aggregate has no column to read a type from, so \
+         its absent value must still be typed: {sql}"
+    );
+}
+
+fn sum_of_length(col: &str) -> Json {
+    serde_json::json!({
+        "type": "function_aggregate", "name": "SUM", "distinct": false,
+        "arguments": [{
+            "type": "function_scalar", "name": "LENGTH",
+            "arguments": [{"type": "column", "name": col}]
+        }]
+    })
 }
 
 /// Issue #57 shape-consistency (task 6.7): when EVERY file is pruned, a Case 2/3
@@ -184,7 +317,7 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
     let empty_sql = empty["sql"].as_str().unwrap();
 
     // Routes to the N-aggregate-column shape (empty_agg_sql), NOT the full-row shape.
-    let direct = empty_agg_sql(&items, &aggregate_exasol_types(&pushdown_req));
+    let direct = empty_agg_sql(&items, &pushdown_req, &[]);
     assert_eq!(
         empty_sql,
         direct["sql"].as_str().unwrap(),

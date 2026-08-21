@@ -7,9 +7,7 @@
 //! (or by `handle_pushdown` plus a cluster), so they live here rather than in
 //! any single capability module.
 
-use super::grouped_agg::{
-    cast_merge_items, col_type_for, is_literal_selectlist_item, partial_emits_items,
-};
+use super::grouped_agg::{col_type_for, is_literal_selectlist_item, partial_emits_items};
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
 use crate::scan::spec::{
     AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, render_order_by_clause,
@@ -61,32 +59,72 @@ pub(super) fn shard_files_json<E: Clone + Into<FileEntry>>(files: &[E]) -> Strin
     ScanSpec::files_json(&entries)
 }
 
+/// Everything the aggregate merge wrapper needs that the row scan has no use for.
+///
+/// Bundled into one value so the row-scan path cannot be handed aggregate inputs and
+/// the aggregate path cannot be handed none: `build_scan_driving_sql` takes this as an
+/// `Option`, which replaces three separately-passed parameters whose "row scans read
+/// neither" contract used to live only in prose.
+///
+/// `plan_types` is the declared type of each aggregate PLAN, aligned 1:1 with the
+/// spec's `aggregates`, and types the `EMITS` clause. `merge_select` is the outer
+/// merge SELECT, ready to emit, one item per select-list item — the caller owns what
+/// each item says. `request_limit` is the RAW request limit, rendered as a trailing
+/// `LIMIT n` on the one-row merge (a no-op for `n >= 1`, correct for `n = 0`).
+pub struct AggregateMergeInputs {
+    plan_types: Vec<String>,
+    merge_select: Vec<String>,
+    request_limit: Option<u64>,
+}
+
+impl AggregateMergeInputs {
+    /// The merge inputs for an aggregate scan, or `None` when `merge_select` is empty.
+    ///
+    /// An empty merge SELECT would render `SELECT  FROM (...)`, so it is refused here
+    /// rather than emitted: a caller that cannot assemble every select-list item must
+    /// route the whole request to its fallback, never emit a select list narrower than
+    /// the one Exasol validates positionally against.
+    pub fn new(
+        plan_types: Vec<String>,
+        merge_select: Vec<String>,
+        request_limit: Option<u64>,
+    ) -> Option<Self> {
+        if merge_select.is_empty() {
+            return None;
+        }
+        Some(Self {
+            plan_types,
+            merge_select,
+            request_limit,
+        })
+    }
+}
+
 /// Build the scan-driving SQL from a resolved file list partitioned into shards.
 ///
-/// **Row queries** (no aggregates in spec) — the outer ungrouped scalar scan is the
+/// **Row queries** (`merge_inputs` is `None`) — the outer ungrouped scalar scan is the
 /// top-level query; no `SELECT * FROM (...)` materialization wrapper (decision [5]):
 /// - Single shard: `SELECT {udf}('{common}', '{files}') EMITS ({emits}) [ORDER BY …] [LIMIT n]`
 /// - Multi-shard: `SELECT {udf}('{common}', files) EMITS ({emits}) FROM (distributor with GROUP BY shard_key) [ORDER BY …] [LIMIT n]`
 ///
-/// **Aggregate queries** (spec carries `aggregates`, no `group_keys`):
+/// **Aggregate queries** (spec carries `aggregates` and `merge_inputs` is `Some`, no
+/// `group_keys`):
 /// - The outer merge SELECT sits directly over the scalar scan (never SELECT *).
-/// - The EMITS clause and the outer merge follow the COLUMN CONTRACT from
-///   `crate::scan::build_partial_agg_sql`.
+/// - The EMITS clause follows the COLUMN CONTRACT from
+///   `crate::scan::build_partial_agg_sql`; the merge SELECT arrives from the caller.
 ///
 /// For grouped aggregate queries (spec carries both `aggregates` and `group_keys`),
 /// use `build_grouped_aggregate_scan_sql` directly.
 ///
 /// `spec_template` carries the shared fields; only `files` is replaced per shard.
 /// `col_types` is the full table column type map `(uppercase_name, exasol_type)` used
-/// to assign the correct EMITS type per aggregate partial column.
-/// `aggregate_types` holds the Exasol-declared result type of each aggregate (from
-/// `aggregate_exasol_types`); the single-group merge casts each item to its declared
-/// type. Pass `&[]` to emit uncast merge items (row scans never read it).
+/// to assign the correct EMITS type per aggregate partial column. `limit` is rendered
+/// unchanged by the row-scan sub-path and ignored by the aggregate one, which reads
+/// [`AggregateMergeInputs::request_limit`] instead.
 ///
-/// `request_limit` is the RAW request limit, distinct from `limit` (which the
-/// row-scan sub-path renders unchanged). It is consumed ONLY by the aggregate
-/// sub-path: `LIMIT n` on a guaranteed one-row merge is a no-op for `n >= 1` and
-/// correct for `n = 0`. The row-scan sub-path ignores it entirely.
+/// The spec's `aggregates` and `merge_inputs` are two halves of one decision and must
+/// be present or absent together; the caller that classified the select list owns
+/// that pairing.
 #[allow(clippy::too_many_arguments)]
 pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
@@ -94,20 +132,25 @@ pub fn build_scan_driving_sql<E: Clone + Into<FileEntry>>(
     proj_cols: &[ProjectionItem],
     proj_types: &[String],
     limit: Option<u64>,
-    request_limit: Option<u64>,
     col_types: &[(String, String)],
-    aggregate_types: &[String],
+    merge_inputs: Option<&AggregateMergeInputs>,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
-    if let Some(aggregates) = spec_template.common.aggregates.as_deref() {
+    debug_assert_eq!(
+        spec_template.common.aggregates.is_some(),
+        merge_inputs.is_some(),
+        "an aggregate spec must arrive with its merge inputs and a row-scan spec with none"
+    );
+    if let (Some(aggregates), Some(inputs)) =
+        (spec_template.common.aggregates.as_deref(), merge_inputs)
+    {
         build_aggregate_scan_sql(
             spec_template,
             shards,
             aggregates,
             col_types,
-            aggregate_types,
-            request_limit,
+            inputs,
             udf_name,
             distribute_udf_name,
         )
@@ -201,28 +244,31 @@ fn build_row_scan_sql<E: Clone + Into<FileEntry>>(
 /// partial columns DIRECTLY over the scalar scan (no `SELECT * FROM (...)` wrapper).
 ///
 /// The EMITS clause names and types follow the COLUMN CONTRACT defined in
-/// `crate::scan::build_partial_agg_sql`.  The outer merge SELECT consumes those
-/// exact column names.
+/// `crate::scan::build_partial_agg_sql`, typed from [`AggregateMergeInputs::plan_types`].
+///
+/// The merge SELECT arrives ready to emit. The caller owns it: what a merge item says
+/// depends on select-list classification (a bare aggregate merges its own partial
+/// columns, a scalar-over-aggregate item renders its scalar structure over them),
+/// which this builder cannot see. It keeps owning the fan-out and the `EMITS`
+/// assembly — the same split `build_grouped_aggregate_scan_sql` already has.
 ///
 /// `request_limit` renders as a trailing `LIMIT n` on the outer merge SELECT when
 /// `Some(n)` — a no-op over the guaranteed one-row merge for `n >= 1`, correct for
 /// `n = 0` (issue #198: a pushed `LIMIT 0` must return zero rows, not be silently
 /// dropped because the aggregate sub-path had no limit value to render before this
 /// parameter existed).
-#[allow(clippy::too_many_arguments)]
 fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     spec_template: &ScanSpec,
     shards: &[Vec<E>],
     aggregates: &[AggregatePlan],
     col_types: &[(String, String)],
-    aggregate_types: &[String],
-    request_limit: Option<u64>,
+    inputs: &AggregateMergeInputs,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> String {
-    let emits_items = partial_emits_items(aggregates, col_types, aggregate_types);
+    let emits_items = partial_emits_items(aggregates, col_types, &inputs.plan_types);
     let emits = emits_items.join(", ");
-    let merge_select = cast_merge_items(aggregates, aggregate_types).join(", ");
+    let merge_select = inputs.merge_select.join(", ");
 
     // The outer merge SELECT sits DIRECTLY over the scalar scan — no
     // `SELECT * FROM (...)` between them (decision [5]). The primitive short-circuits
@@ -233,7 +279,7 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
     let fan_out = build_fan_out_inner(spec_template, shards, &emits, udf_name, distribute_udf_name);
 
     let mut sql = format!("SELECT {merge_select} FROM ({fan_out})");
-    if let Some(n) = request_limit {
+    if let Some(n) = inputs.request_limit {
         sql.push_str(&format!(" LIMIT {n}"));
     }
     sql
@@ -1082,6 +1128,23 @@ pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -
     Some(rewrite_decimal_stringifications(&expr, col_types))
 }
 
+/// Whether a `function_aggregate` node appears anywhere in `node`'s subtree,
+/// `node` itself included.
+///
+/// Depth-insensitive on purpose: a nested aggregate is renderable SQL, so nothing
+/// downstream of [`render_expression_safe`] can tell it apart from an ordinary
+/// scalar expression — only this probe keeps it off the per-shard scan.
+fn contains_aggregate_node(node: &Json) -> bool {
+    match node {
+        Json::Object(map) => {
+            map.get("type").and_then(|t| t.as_str()) == Some("function_aggregate")
+                || map.values().any(contains_aggregate_node)
+        }
+        Json::Array(items) => items.iter().any(contains_aggregate_node),
+        _ => false,
+    }
+}
+
 /// The SOLE owner of "a tree the DataFusion scan may be handed": one
 /// [`apply_type_rewrites`] pass AND renderability established on the tree that pass
 /// produced. `Some(tree)` is that pushable tree; `None` means either half rejected it
@@ -1167,7 +1230,7 @@ fn is_valid_emits_output_type(ty: &str) -> bool {
 /// The third element is the widening signal: `true` means the derived projection is
 /// the full base row, NOT one item per select-list item — a select-list item was
 /// untranslatable, EMITS-rejected, or a node type this function deliberately keeps
-/// off the projection (an aggregate), so the whole select list widened. It is the
+/// off the projection (an aggregate at any depth), so the whole select list widened. It is the
 /// producer's own decision, piped out verbatim rather than re-derived downstream by
 /// comparing the projection's arity against the select list's: the two coincide
 /// whenever the base table happens to have as many columns as the query selects
@@ -1224,25 +1287,25 @@ pub(super) fn project_columns(
             (vec![ProjectionItem::Column(name)], vec![ty])
         }
         Some(Json::Array(list)) => {
-            // Exasol declares the result type of each selectList item in a parallel
-            // `selectListDataTypes` array; the EMITS column type must equal it.
-            let declared_types = pushdown_req
-                .get("selectListDataTypes")
-                .and_then(|v| v.as_array());
             let mut names = Vec::with_capacity(list.len());
             let mut types = Vec::with_capacity(list.len());
             for (i, e) in list.iter().enumerate() {
-                let declared_type = declared_types
-                    .and_then(|d| d.get(i))
-                    .map(exasol_type_from_json);
-                // On `None` the item can't be
-                // safely pushed down at all; fall back to the full base row for the
-                // whole select list, like every other "untranslatable item" arm below.
+                // Exasol declares the result type of each selectList item in a parallel
+                // `selectListDataTypes` array; the EMITS column type must equal it.
+                let declared_type = declared_select_type(pushdown_req, i);
                 // `project_columns` has THREE callers — `extract_projection`
                 // (single-table), `extract_join_projection` (`joins/rendering.rs`,
                 // whose `col_types` is the UNION of both joined tables' columns), and
                 // `joins/mod.rs`'s empty-side path — so this decline reaches the
                 // broadcast-join SELECT list too, not just the single-table path.
+                // Depth-insensitive floor: an aggregate at ANY depth must never be
+                // evaluated per shard — a shard sees only its own files, so its value
+                // is an unmerged partial (#194). Probing here rather than per arm means
+                // arms added later inherit the rule.
+                if contains_aggregate_node(e) {
+                    needs_full_fallback = true;
+                    continue;
+                }
                 let Some(e) = apply_type_rewrites(e, &all_cols) else {
                     needs_full_fallback = true;
                     continue;
@@ -1268,9 +1331,7 @@ pub(super) fn project_columns(
                         // emitted arity equals the select-list arity (issue #190).
                         match render_expression_safe(e) {
                             Some(sql_frag) => {
-                                let ty = declared_type
-                                    .clone()
-                                    .unwrap_or_else(|| "VARCHAR(2000000)".to_string());
+                                let ty = declared_type.clone();
                                 if is_valid_emits_output_type(&ty) {
                                     names.push(ProjectionItem::Expr { expr: sql_frag });
                                     types.push(ty);
@@ -1290,8 +1351,8 @@ pub(super) fn project_columns(
                     }
                     // This arm must list every remaining node type `render_expression_safe`
                     // renders that isn't already handled by an earlier arm in this match,
-                    // EXCEPT `function_aggregate` — an aggregate must reach the aggregate
-                    // planner, not be evaluated per shard as a projection item — and
+                    // EXCEPT `function_aggregate` — the subtree probe above already widened
+                    // for any item carrying one, at any depth — and
                     // `predicate_greater` / `predicate_greaterequal`, which are unreachable
                     // here: Exasol normalises `a > b` to `b < a` (`capabilities.rs:29-30`),
                     // so a select-list `>` already arrives as `predicate_less` (#196).
@@ -1320,9 +1381,7 @@ pub(super) fn project_columns(
                         // Scalar expression node — try to render it.
                         match render_expression_safe(e) {
                             Some(sql_frag) => {
-                                let ty = declared_type
-                                    .clone()
-                                    .unwrap_or_else(|| "VARCHAR(2000000)".to_string());
+                                let ty = declared_type.clone();
                                 if is_valid_emits_output_type(&ty) {
                                     names.push(ProjectionItem::Expr { expr: sql_frag });
                                     types.push(ty);
@@ -1339,7 +1398,7 @@ pub(super) fn project_columns(
                         }
                     }
                     _ => {
-                        // Unknown / aggregate node — fall back to projecting the full row.
+                        // Unknown node — fall back to projecting the full row.
                         needs_full_fallback = true;
                     }
                 }
@@ -1471,32 +1530,6 @@ pub(super) fn order_by_present(pushdown_req: &Json) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
-/// Resolve the Exasol-declared type of each aggregate select-list item, in order.
-///
-/// Aggregates appear as `function_aggregate` items in `selectList`; the parallel
-/// `selectListDataTypes` array gives each one's declared result type (e.g. COUNT(*)
-/// → DECIMAL(18,0)). Falls back to `VARCHAR(2000000)` when not locatable.
-pub(super) fn aggregate_exasol_types(pushdown_req: &Json) -> Vec<String> {
-    let select_list = match pushdown_req.get("selectList").and_then(|v| v.as_array()) {
-        Some(l) => l,
-        None => return Vec::new(),
-    };
-    let declared_types = pushdown_req
-        .get("selectListDataTypes")
-        .and_then(|v| v.as_array());
-    select_list
-        .iter()
-        .enumerate()
-        .filter(|(_, item)| item.get("type").and_then(|t| t.as_str()) == Some("function_aggregate"))
-        .map(|(idx, _)| {
-            declared_types
-                .and_then(|d| d.get(idx))
-                .map(exasol_type_from_json)
-                .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
-        })
-        .collect()
-}
-
 /// Double-quote an identifier.
 pub(super) fn quote_ident(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -1505,6 +1538,25 @@ pub(super) fn quote_ident(name: &str) -> String {
 /// Produce a SQL string literal with single-quote escaping.
 pub(super) fn sql_string_literal(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
+}
+
+/// The Exasol type declared for the `selectList` item at `select_index`, read from
+/// the parallel `selectListDataTypes` array.
+///
+/// The single owner of that lookup and of its `"VARCHAR(2000000)"` answer when the
+/// array is absent, shorter than the select list, or holds a `dataType` shape
+/// `exasol_type_from_json` does not recognise. That answer is not a type Exasol
+/// declared — it is the catch-all [`cast_to_declared_type`] reads as "no usable
+/// declared type, emit no cast", so both halves of the decision have to stay
+/// together. A slot no `selectList` item names at all is a different question with a
+/// different answer: see `scalar_over_agg::NESTED_AGGREGATE_PLAN_TYPE`.
+pub(super) fn declared_select_type(pushdown_req: &Json, select_index: usize) -> String {
+    pushdown_req
+        .get("selectListDataTypes")
+        .and_then(|v| v.as_array())
+        .and_then(|types| types.get(select_index))
+        .map(exasol_type_from_json)
+        .unwrap_or_else(|| "VARCHAR(2000000)".to_string())
 }
 
 /// Wrap `expr` in `CAST(... AS <declared>)` unless `declared` is absent or the

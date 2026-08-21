@@ -26,12 +26,11 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 mod support;
+pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_sql, shard_count};
 use support::{
-    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, aggregate_exasol_types, classify_where_filter,
-    extract_all_column_types, extract_limit, extract_projection, order_by_present,
-    strip_table_alias,
+    DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, classify_where_filter, extract_all_column_types,
+    extract_limit, extract_projection, order_by_present, strip_table_alias,
 };
-pub use support::{build_fan_out_inner, build_scan_driving_sql, shard_count};
 
 mod empty_result;
 use empty_result::empty_result_sql;
@@ -55,7 +54,9 @@ use topn::{detect_topn, parse_order_by_keys};
 
 mod single_group_agg;
 pub use single_group_agg::{detect_aggregates, ordinary_plans};
-use single_group_agg::{has_distinct, is_lone_count_distinct};
+use single_group_agg::{
+    has_distinct, is_lone_count_distinct, single_group_merge_select, single_group_plan_types,
+};
 
 mod grouped_agg;
 pub use grouped_agg::{
@@ -63,6 +64,8 @@ pub use grouped_agg::{
     detect_group_by_aggregates, validate_agg_col_types,
 };
 use grouped_agg::{blank_pad_char_group_keys, group_key_exasol_types};
+
+mod scalar_over_agg;
 
 mod request_shape;
 use request_shape::{RequestShape, classify_request_shape};
@@ -405,10 +408,12 @@ pub(crate) fn build_dispatch_sql(
     // gates, and the grouped HAVING merge-render — whose failure is a route to
     // `GroupByWrapper`, not an error — all live in the classifier; each arm below
     // renders ONLY its own SQL. The fall-through arms
-    // (ordinary single-group aggregate, row scan) yield the shared `aggregates`
-    // input the row-scan/partial-aggregate rendering below consumes (`Some` ordinary
-    // plans for the aggregate sub-path, `None` for a row scan).
-    let aggregates = match classify_request_shape(pushdown_req, &col_types) {
+    // (ordinary single-group aggregate, row scan) yield the shared aggregate inputs
+    // the row-scan/partial-aggregate rendering below consumes: the ordinary plans
+    // (`Some` for the aggregate sub-path, `None` for a row scan), their per-plan
+    // declared `EMITS` types, and the ready-to-emit outer merge SELECT — all three
+    // empty on the row-scan sub-path, which reads none of them.
+    let single_group_merge = match classify_request_shape(pushdown_req, &col_types) {
         RequestShape::Grouped {
             detection,
             having,
@@ -468,8 +473,9 @@ pub(crate) fn build_dispatch_sql(
             };
             // Per-plan declared types, aligned 1:1 with `grouped_agg_plans` (which
             // now includes aggregates nested inside a scalar-over-aggregate item).
-            // `aggregate_exasol_types` keyed off top-level select items only and
-            // would misalign; the detection-built `plan_types` is the aligned source.
+            // These must come from the detection-built `plan_types`, never from a
+            // `selectList`-keyed lookup — that would misalign once nested aggregates
+            // join the plan list.
             let aggregate_types = grouped_agg_types;
             let sql = build_grouped_aggregate_scan_sql(
                 &spec_template,
@@ -591,8 +597,41 @@ pub(crate) fn build_dispatch_sql(
                 );
             }
             // No distinct item: the ordinary single-group aggregate plans drive the
-            // shared per-shard partial/merge scan below.
-            Some(ordinary_plans(&items))
+            // shared per-shard partial/merge scan below. The plans fold in every
+            // aggregate nested inside a scalar-over-aggregate item, so the per-plan
+            // declared types come from `single_group_plan_types` (aligned 1:1 with
+            // the folded list), never from a select-list-keyed lookup.
+            let plans = ordinary_plans(&items);
+            let plan_types = single_group_plan_types(pushdown_req, &items);
+            // The merge SELECT is assembled HERE because what each item says depends
+            // on select-list classification, which the SQL builder cannot see.
+            let merge_inputs =
+                single_group_merge_select(&items, &plans, &plan_types).and_then(|merge_select| {
+                    AggregateMergeInputs::new(plan_types, merge_select, limit)
+                });
+            let Some(merge_inputs) = merge_inputs else {
+                // An unassemblable item would silently shorten the returned select
+                // list, which Exasol validates positionally — route the whole request
+                // to the wrapper, exactly as the multi-distinct decline above does.
+                // Defensive: no `selectList` shape currently reaches this arm through
+                // `detect_aggregates`, since `classify_scalar_over_aggregate` already
+                // validates the same scalar structure's renderability before a
+                // `ScalarOverAggregate` item is produced — see
+                // `merge_select_declines_when_the_scalar_structure_fails_to_render`
+                // (`single_group_agg_tests.rs`) for the boundary this guards.
+                return qualified_single_table_fallback_pushdown(
+                    request,
+                    pushdown_req,
+                    &base,
+                    filter.clone(),
+                    shards,
+                    &col_types,
+                    udf_name,
+                    distribute_udf_name,
+                    None,
+                );
+            };
+            Some((plans, merge_inputs))
         }
         // No decomposable aggregate (or the numeric gate demoted it) → row scan.
         RequestShape::RowScan => {
@@ -637,6 +676,12 @@ pub(crate) fn build_dispatch_sql(
             None
         }
     };
+
+    // Both halves come from ONE Option, so an aggregate spec can never be paired with
+    // absent merge inputs (or vice versa) further down.
+    let (aggregates, merge_inputs) = single_group_merge
+        .map(|(plans, inputs)| (Some(plans), Some(inputs)))
+        .unwrap_or((None, None));
 
     // Ordered top-N applies ONLY to the pure row-scan path (no aggregates). On a
     // match the sort keys are carried into the common blob (per-shard bounded sort)
@@ -763,7 +808,6 @@ pub(crate) fn build_dispatch_sql(
         files: vec![],
     };
 
-    let aggregate_types = aggregate_exasol_types(pushdown_req);
     // Fact 6 (issue #191): when this call drives the ordinary single-group
     // aggregate merge (`has_aggregates`, i.e. `build_aggregate_scan_sql`), no
     // offset can ever reach it — Exasol rejects an OFFSET in ANY ungrouped
@@ -785,9 +829,8 @@ pub(crate) fn build_dispatch_sql(
         &proj_cols,
         &proj_types,
         effective_limit,
-        limit,
         &col_types,
-        &aggregate_types,
+        merge_inputs.as_ref(),
         udf_name,
         distribute_udf_name,
     );

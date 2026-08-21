@@ -995,14 +995,14 @@ fn declined_like_on_decimal() -> Json {
     })
 }
 
-/// Drive the real `build_dispatch_sql` over the fixed `EVENTS` fixture for a
+/// Drive the real `build_dispatch_sql` over the fixed `EVENTS` fixture for any
 /// `pushdownRequest` body, deriving EVERY dispatch input through the same
 /// production helpers `handle_pushdown` uses — `extract_projection`,
 /// `classify_where_filter`, `extract_limit`, `order_by_present` — so this harness
 /// cannot drift from the pipeline it exercises. The logical schema is empty, which
 /// declines the bounded top-N unconditionally: the decline route is asserted to win
 /// over the shapes the classifier would otherwise pick, not to depend on them.
-fn declined_dispatch_sql(pushdown_req_body: Json) -> String {
+fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
     let request = guard_events_request(pushdown_req_body);
     let pushdown_req = pd(&request);
     let col_types = guard_col_types();
@@ -1100,7 +1100,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
     ];
 
     for (shape, body) in shapes {
-        let sql = declined_dispatch_sql(body);
+        let sql = dispatch_sql_for_body(body);
         let where_at = sql.find(r#"AS "LHS_T0" WHERE "#).unwrap_or_else(|| {
             panic!("the {shape} shape must route to the qualified wrapper: {sql}")
         });
@@ -1131,7 +1131,7 @@ fn trivially_true_filter_omitted_without_wrapper() {
         "a trivially-true filter is neither pushed nor declined: {filter:?} {declined:?}"
     );
 
-    let sql = declined_dispatch_sql(serde_json::json!({
+    let sql = dispatch_sql_for_body(serde_json::json!({
         "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
         "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
         "filter": trivially_true,
@@ -1162,7 +1162,7 @@ fn trivially_true_filter_omitted_without_wrapper() {
 /// arm.
 #[test]
 fn declined_filter_with_absent_select_list_projects_full_row() {
-    let sql = declined_dispatch_sql(serde_json::json!({
+    let sql = dispatch_sql_for_body(serde_json::json!({
         "filter": declined_like_on_decimal(),
     }));
 
@@ -1189,7 +1189,7 @@ fn declined_filter_with_absent_select_list_projects_full_row() {
 /// UDF boundary and column width is the only remaining lever.
 #[test]
 fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
-    let sql = declined_dispatch_sql(serde_json::json!({
+    let sql = dispatch_sql_for_body(serde_json::json!({
         "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
         "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
         "filter": declined_like_on_decimal(),
@@ -1211,6 +1211,36 @@ fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
         sql[where_at..].contains(r#""LHS_T0"."AMOUNT""#),
         "the declined predicate's column must be projected AND qualified in the \
              wrapper's WHERE: {sql}"
+    );
+}
+
+/// Scenario (`pushdown-planning-single-group-agg-scalar-over-aggregate`): issue
+/// #194's shape, end to end through the real dispatcher. The scalar wrapper is
+/// rendered ONCE over the merged partial column in the outer merge SELECT — the
+/// per-shard scan carries the bare inner aggregate and nothing else — so the
+/// query answers one merged row instead of one partial per shard.
+#[test]
+fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
+    let sql = dispatch_sql_for_body(serde_json::json!({
+        "selectList": [{
+            "type": "function_scalar",
+            "name": "ROUND",
+            "arguments": [
+                agg_item("SUM", Some("AMOUNT"), false),
+                {"type": "literal_exactnumeric", "value": 2},
+            ],
+        }],
+        "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
+    }));
+
+    assert!(
+        sql.starts_with(r#"SELECT CAST(ROUND(SUM("PARTIAL_sum_0"), 2) AS DECIMAL(36,2)) FROM ("#),
+        "the merge SELECT must wrap the merged partial in the scalar structure, \
+         not emit a bare unwrapped SUM: {sql}"
+    );
+    assert!(
+        sql.contains(r#""aggregates":[{"kind":"sum","column":"AMOUNT""#),
+        "the per-shard scan must carry the inner aggregate as a partial plan: {sql}"
     );
 }
 
