@@ -4,7 +4,8 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
 named scalar function translation: math functions, the modulo operator, string functions,
 CASE expressions, and the NULLIF/COALESCE shorthands. These are distinct from the arithmetic
 operators and CAST scenarios in `vs-expression-translator-scalar-ops`. `GREATEST`/`LEAST` are
-specified in the sibling feature `sql-comprehension/vs-expression-translator-greatest-least`,
+specified in the sibling feature `sql-comprehension/vs-expression-translator-greatest-least`, and
+`CONCAT`'s NULL-semantics rendering in `sql-comprehension/vs-expression-translator-concat`, both
 split out to keep this feature's scenario count under the library threshold — the same treatment
 `FLOAT_DIV` already received into `vs-expression-translator-float-div`.
 
@@ -34,7 +35,10 @@ the aliases are hard compilation errors there: `SIGNUM` and `STRPOS` both return
 <NAME> not found` (SQL code 42000), and `%` is rejected by Exasol's parser (issue #197).
 `GREATEST`/`LEAST` also follow this verbatim rule on the Exasol dialect — both names keep the
 `ExasolForm::VerbatimCall` declaration — but their DataFusion-dialect NULL-guard rendering and its
-full evidence live in `sql-comprehension/vs-expression-translator-greatest-least`.
+full evidence live in `sql-comprehension/vs-expression-translator-greatest-least`. `CONCAT` keeps
+its `ExasolForm::Shaped` declaration and follows the verbatim rule on the Exasol dialect too — its
+DataFusion-dialect NULL-guard rendering and its full evidence live in
+`sql-comprehension/vs-expression-translator-concat`.
 
 Five constructs are deliberately EXCLUDED from the verbatim rule and keep a dedicated rendering in
 both dialects, because verbatim is either impossible or wrong for them:
@@ -42,9 +46,9 @@ both dialects, because verbatim is either impossible or wrong for them:
 | Construct | Why it is not rendered verbatim |
 |---|---|
 | `ADD`, `SUB`, `MULT`, `NEG` | Wire names for operators, not Exasol function names — Exasol has no function called `ADD`. Both dialects render `(<l> + <r>)` and the rest. |
-| `FLOAT_DIV` | Also an operator wire name, and the ONLY one of the five whose rendering DIVERGES by dialect: `(CAST(<l> AS DOUBLE) / <r>)` in the DataFusion dialect, a bare `(<l> / <r>)` in the Exasol dialect. Exasol's `/` IS `FN_FLOAT_DIV` — always true float division, whatever the operand types — while DataFusion's `/` is operand-typed and truncates integer and decimal operands (issue #186). The cast is what makes DataFusion reproduce Exasol; Exasol needs no help. Specified in `sql-comprehension/vs-expression-translator-float-div`, including the sweep-test scenario that keeps `FLOAT_DIV` out of this table's verbatim rule. |
+| `FLOAT_DIV` | Also an operator wire name, and one of the TWO whose rendering DIVERGES by dialect: `(CAST(<l> AS DOUBLE) / <r>)` in the DataFusion dialect, a bare `(<l> / <r>)` in the Exasol dialect. Exasol's `/` IS `FN_FLOAT_DIV` — always true float division, whatever the operand types — while DataFusion's `/` is operand-typed and truncates integer and decimal operands (issue #186). The cast is what makes DataFusion reproduce Exasol; Exasol needs no help. Specified in `sql-comprehension/vs-expression-translator-float-div`, including the sweep-test scenario that keeps `FLOAT_DIV` out of this table's verbatim rule. |
 | `MOD` | Exasol requires `MOD(a, b)`, DataFusion offers only the `%` operator (issue #197). Its arm branches on dialect and validates arity, which the verbatim rule does not. |
-| `CONCAT` | Both dialects render chained `\|\|`, never `concat()`: `concat()` silently drops NULL arguments while `\|\|` propagates NULL, and a boolean operand needs Exasol's `TRUE`/`FALSE` casing (issue #200). |
+| `CONCAT` | Also the wire encoding of Exasol's `\|\|` operator, and the SECOND of the five whose rendering diverges by dialect: `nullif(concat(<a1>, <a2>, ...), '')` in the DataFusion dialect, chained `(<a1> \|\| <a2> ...)` in the Exasol dialect, because Exasol's `\|\|` treats a NULL operand as the empty string while DataFusion's `\|\|` propagates NULL (issue #374). Specified in `sql-comprehension/vs-expression-translator-concat`, including the sweep-test scenario that keeps `CONCAT` out of this table's verbatim rule. |
 | `CAST` | The target type, not the name, is what differs: an Exasol character target needs an explicit length and an Exasol `TIMESTAMP` target needs an explicit precision. Its per-dialect rendering is specified in `sql-comprehension/vs-expression-translator-cast` and is unchanged by this feature. |
 | `function_scalar` named `CASE` | Exasol's interleaved-argument CASE encoding; both dialects render `CASE WHEN … THEN … END`, so there is no call form to render verbatim. This is the `function_scalar`+`name=CASE` alternate encoding, distinct from the `function_scalar_case` node type scenario below. |
 
@@ -95,7 +99,7 @@ predicate, which stays advertised and whose per-dialect rendering is specified i
 * *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `SUBSTR`→`substr`, `LENGTH`→`character_length`, `OCTET_LENGTH`→`octet_length`, `INSTR`/`LOCATE`→`strpos` (with operands ordered string-then-substring per DataFusion `strpos(string, substring)`), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, and all other listed names lower-cased to their identically-named DataFusion function
 * *AND* each argument SHALL be rendered recursively by the translator
 * *AND* `LOCATE`/`INSTR` argument reordering MUST preserve the Exasol semantics of "position of substring within string"
-* *AND* `CONCAT` SHALL be rendered by the dedicated chained-`||` rule (see Background) in both dialects, not by this name-mapping table
+* *AND* `CONCAT` SHALL be rendered by its own dedicated per-dialect rule, specified in `sql-comprehension/vs-expression-translator-concat`, not by this name-mapping table
 
 ### Scenario: String scalar functions render verbatim in the Exasol dialect
 

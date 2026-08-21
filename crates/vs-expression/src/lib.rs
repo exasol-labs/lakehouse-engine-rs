@@ -39,13 +39,16 @@ use serde_json::Value as Json;
 /// cannot derive — either because it is not a call at all, or because the
 /// DataFusion side is not — and are `Shaped`. They fall into six groups:
 /// - the five operator wire names `ADD`, `SUB`, `MULT`, `FLOAT_DIV`, `NEG` —
-///   SQL operators, not calls (`FLOAT_DIV` alone diverges by dialect: a
+///   SQL operators, not calls (`FLOAT_DIV` diverges by dialect: a
 ///   DataFusion-only `CAST(... AS DOUBLE)` on its left operand forces true
 ///   float division; `ADD`/`SUB`/`MULT`/`NEG` render identically in both);
 /// - `MOD` — Exasol requires the `MOD(a, b)` form, DataFusion the `%`
 ///   operator;
-/// - `CONCAT` — the wire encoding of Exasol's `||` operator, so it renders as
-///   chained `||` in both dialects rather than a `CONCAT(...)` call;
+/// - `CONCAT` — the wire encoding of Exasol's `||` operator, which also
+///   diverges by dialect: Exasol's `||` treats a NULL operand as the empty
+///   string and yields NULL only when the whole result is empty, so the
+///   DataFusion side renders `nullif(concat(...), '')` to reproduce that
+///   contract, while the Exasol side keeps chained `||` (#374);
 /// - `CAST` — dispatches to `render_cast_target`, which branches on dialect
 ///   in its own right: the two dialects have OPPOSITE requirements for
 ///   character-type CAST targets. datafusion-sql rejects a length-qualified
@@ -131,8 +134,9 @@ const TRANSLATED_SCALAR_FNS: &[(&str, ExasolForm)] = &[
     // Exasol side happens to be a call, but the DataFusion side is not, so the arm
     // owns both dialects rather than the gate owning one of them (#197).
     ("MOD", ExasolForm::Shaped),
-    // CONCAT: the wire encoding of Exasol's `||` operator, so it renders as
-    // chained `||` in both dialects rather than as a CONCAT(...) call.
+    // CONCAT: Shaped because Exasol's own form is the `||` operator, not a call.
+    // The dialects diverge on NULL too: Exasol's `||` treats NULL as '' and
+    // yields NULL only when all-empty, reproduced as `nullif(concat(...), '')` (#374).
     ("CONCAT", ExasolForm::Shaped),
     // CASE: `CASE WHEN ... THEN ... [ELSE ...] END`, not a call.
     ("CASE", ExasolForm::Shaped),
@@ -1152,20 +1156,29 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                         Dialect::DataFusion => format!("({left} % {right})"),
                     }))
                 }
-                // CONCAT → the wire encoding of Exasol's `||` operator, so it
-                // is rendered as chained `||`, not DataFusion's concat()
-                // function: concat() silently ignores NULL arguments
-                // (`concat(NULL, 'x')` = `'x'`), while both Exasol's `||` and
-                // DataFusion's `||` operator propagate NULL (`NULL || 'x'` =
-                // `NULL`) — using concat() would drop the NULL-preservation
-                // this rewrite depends on. A boolean operand is rewritten to
-                // the Exasol-cased form before joining, since DataFusion's
-                // boolean->Utf8 cast (which `||` falls back to for a raw
-                // boolean operand) renders lowercase `true`/`false` (#200).
+                // CONCAT → the wire encoding of Exasol's `||` operator.
+                // Exasol's `||` does NOT propagate NULL: a NULL operand is
+                // treated as the empty string, and the result is NULL only
+                // when the whole concatenation is empty (verified live,
+                // #374). DataFusion's own concat() also treats NULL as the
+                // empty string but never re-collapses an all-empty result to
+                // NULL, so the DataFusion dialect wraps it as
+                // `nullif(concat(...), '')` to reproduce Exasol's contract;
+                // the Exasol dialect keeps chained `||`, which already has
+                // the real behavior. A boolean operand is rewritten to the
+                // Exasol-cased form before joining, since DataFusion's
+                // boolean->Utf8 cast (which `||`/`concat()` fall back to for
+                // a raw boolean operand) renders lowercase `true`/`false`
+                // (#200).
                 "CONCAT" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar CONCAT missing 'arguments'".into())
                     })?;
+                    if args.is_empty() {
+                        return Err(UdfError::User(
+                            "function_scalar CONCAT requires at least 1 argument, got 0".into(),
+                        ));
+                    }
                     let rendered = args
                         .iter()
                         .map(|arg| {
@@ -1183,7 +1196,12 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                             })
                         })
                         .collect::<Result<Vec<String>, UdfError>>()?;
-                    Ok(Some(format!("({})", rendered.join(" || "))))
+                    Ok(Some(match dialect {
+                        Dialect::Exasol => format!("({})", rendered.join(" || ")),
+                        Dialect::DataFusion => {
+                            format!("nullif(concat({}), '')", rendered.join(", "))
+                        }
+                    }))
                 }
                 // String functions: name-mapping table (DataFusion dialect). The
                 // Exasol dialect never reaches this arm — those names are declared
