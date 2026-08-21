@@ -280,7 +280,7 @@ wait_exasol() {
 
 # ---- build .so ---------------------------------------------------------------
 echo "== building working-tree .so (no-op if fresh) =="
-make cross-musl-udf-build
+make cross-udf-build
 
 # ---- wait for services + load data (docker only) -----------------------------
 if [ "$TARGET" = "docker" ]; then

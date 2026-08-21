@@ -4,7 +4,7 @@ CI builds the UDF `.so` for both x86_64 and aarch64 on native runners, runs arm6
 
 ## Background
 
-- The UDF `.so` is built inside `rust:1.94-bookworm` via `make cross-musl-udf-build`, never on the host directly
+- The UDF `.so` is built inside `rust:1.94-trixie` via `make cross-udf-build`, never on the host directly
 - `about.toml` controls which targets `cargo-about` checks for license compliance
 - E2E tests stay x86_64-only because `exasol/docker-db` publishes amd64-only images
 - The lc-rs project already ships the same dual-architecture pattern: `lc-rust-<ver>.tar.gz` (x86_64) and `lc-rust-<ver>-aarch64.tar.gz` (aarch64)
@@ -16,7 +16,7 @@ CI builds the UDF `.so` for both x86_64 and aarch64 on native runners, runs arm6
 * *GIVEN* the CI workflow is triggered on a non-draft PR, push to main, or merge_group event
 * *WHEN* the `build-so` job runs
 * *THEN* it MUST execute two matrix legs: `{runner: ubuntu-latest, arch: x86_64}` and `{runner: ubuntu-24.04-arm, arch: aarch64}`
-* *AND* each leg MUST build the `.so` inside the `rust:1.94-bookworm` builder image on its native runner architecture
+* *AND* each leg MUST build the `.so` inside the `rust:1.94-trixie` builder image on its native runner architecture
 * *AND* each leg MUST upload the build artifact with a distinct name including the architecture (`lakehouse-engine-so-x86_64`, `lakehouse-engine-so-aarch64`)
 
 ### Scenario: Release publishes architecture-distinguished tarballs

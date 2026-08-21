@@ -195,7 +195,7 @@ before changing the shard count or fan-out shape.
 - **SLC/`.so` fingerprint must match exactly.** The SDK fingerprint (`{exasol-udf-sdk
   version}:{rustc_hash}`) is checked at UDF load; e.g. a 0.19.1 SLC rejects a 0.19.0-SDK `.so` with
   a fingerprint-mismatch error. Keep the SLC and the consumer crate's `exasol-udf-sdk` version in
-  lockstep, built with the same rustc (the `rust:1.94-bookworm` SLC builder).
+  lockstep, built with the same rustc (the `rust:1.94-trixie` SLC builder).
 
 ## Live debugging (lc-rs 0.19.0 debug surface)
 
@@ -275,8 +275,8 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
 
 ## Build
 
-- Build the UDF `.so` only inside `rust:1.94-bookworm` (glibc 2.36, matches the SLC) via
-  `make cross-musl-udf-build`. **Never `cargo build --release` on the host** — it writes a
+- Build the UDF `.so` only inside `rust:1.94-trixie` (glibc 2.41, matches the SLC) via
+  `make cross-udf-build`. **Never `cargo build --release` on the host** — it writes a
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
 - Two library crates, one `.so`: `crates/lakehouse-engine` (Iceberg + Delta file planning, scan-spec
   wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan) depends on

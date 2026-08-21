@@ -59,7 +59,7 @@ fi
 if have docker; then
   log "Docker present: $(docker --version)"
 else
-  log "Docker NOT found. Needed for 'make cross-musl-udf-build' (.so) and bench docker mode."
+  log "Docker NOT found. Needed for 'make cross-udf-build' (.so) and bench docker mode."
   log "  Install via https://docs.docker.com/engine/install/ and add '$REAL_USER' to the docker group."
 fi
 

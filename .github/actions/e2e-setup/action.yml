@@ -37,7 +37,7 @@ runs:
         save-if: "false"
 
     # After checkout, so its mtime is newer than the checked-out sources — the
-    # Makefile's mtime-based test-e2e → cross-musl-udf-build dependency then
+    # Makefile's mtime-based test-e2e → cross-udf-build dependency then
     # skips rebuilding.
     - name: Download liblakehouse_engine.so
       uses: actions/download-artifact@v8
