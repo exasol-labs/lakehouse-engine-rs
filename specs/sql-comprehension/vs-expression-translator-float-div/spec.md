@@ -1,22 +1,13 @@
-# Feature: VS Expression Translator — Scalar Operations
+# Feature: VS Expression Translator — Floating-Point Division
 
-Extends the VS expression translator (`sql-comprehension/vs-expression-translator`) with arithmetic
-operators and the safe/fallback entry points. CAST target-type rendering is covered in
-`sql-comprehension/vs-expression-translator-cast`. Named math/string/conditional scalar functions
-are covered in `sql-comprehension/vs-expression-translator-scalar-fns`; date/time functions in
-`sql-comprehension/vs-expression-translator-date-fns`. This delta splits floating-point division out
-of the shared arithmetic-operator shape, because Exasol's `FN_FLOAT_DIV` is always true `DOUBLE`
-division while DataFusion's `/` is operand-typed and truncated integer and decimal operands
-(issue #186).
+Splits floating-point division (`FLOAT_DIV`, Exasol's `/`) out of the shared arithmetic-operator
+shape in `sql-comprehension/vs-expression-translator-scalar-ops`, because Exasol's `FN_FLOAT_DIV` is
+always true `DOUBLE` division while DataFusion's `/` is operand-typed and truncated integer and
+decimal operands (issue #186). The verbatim-exclusion table in
+`sql-comprehension/vs-expression-translator-scalar-fns` also references this feature: `FLOAT_DIV` is
+an operator wire name, not an Exasol function name, so it never joins that table's verbatim rule.
 
 ## Background
-
-<!-- DELTA:CHANGED -->
-The arithmetic operator nodes and every decline in this feature behave identically in both dialects
-with ONE exception: `+`, `-`, `*` and unary `-` are the same syntax in both parsers, and a declined
-function is declined in both because the adapter advertises one capability set for both dialects —
-but `/` (`FLOAT_DIV`) DIVERGES, rendering `(CAST(<l> AS DOUBLE) / <r>)` for DataFusion and a bare
-`(<l> / <r>)` for Exasol (issue #186).
 
 A conversion or operator node is translated only when its DataFusion 54 result matches Exasol's to
 the precision of the target type, and only when a mismatch cannot produce a silently wrong value.
@@ -24,15 +15,12 @@ the precision of the target type, and only when a mismatch cannot produce a sile
 stated: its cast rendering is bit-exact against Exasol for a scale-0 numerator and within ~1 ULP
 (max relative difference `3.17e-16`) for a non-zero-scale decimal numerator, which is at the
 resolution limit of the `DOUBLE` column the value lands in; and its one behavioural divergence,
-division by zero, fails the query rather than returning a wrong value. Exasol `DIV` returns the
-integer quotient by truncating toward zero — verified live: `DIV(-7,2) = -3` and `DIV(15.7,6.2) = 2`
-— and raises a division-by-zero error (SQL state 22012). DataFusion 54 has no `div` builtin; its `/`
-truncates only integer operands and divides non-integer operands fractionally. No single rendering
-reproduces `DIV` across every operand type, so `DIV` stays unsupported — the per-row problem, not
-the zero-divisor one, is what disqualifies it.
-<!-- /DELTA:CHANGED -->
+division by zero, fails the query rather than returning a wrong value. This is the opposite outcome
+from Exasol integer division (`DIV`, specified in `sql-comprehension/vs-expression-translator-scalar-ops`):
+`DIV` needs truncation, which DataFusion's `/` delivers only for integer operands, so no single
+type-blind rendering reproduces it — the per-row problem, not the zero-divisor one, is what
+disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
 
-<!-- DELTA:NEW -->
 * **`FLOAT_DIV` shared the bare-operator arm with `ADD`/`SUB`/`MULT` and inherited DataFusion's
   operand-typed `/`, which is not Exasol's `/` (issue #186).** Exasol's `FN_FLOAT_DIV` is *always*
   true float division and *always* results in `DOUBLE`, whatever the operand types — verified live
@@ -52,15 +40,16 @@ the zero-divisor one, is what disqualifies it.
   `C_DECIMAL_A / C_DECIMAL_B` (`DECIMAL(9,2)/DECIMAL(20,4)`) returned `0.000102` against
   `0.000102474999897525`. Decimal/decimal is only accidentally correct when both operands carry so
   few significant digits that `Decimal128(_,6)` loses none.
-* **The translator cannot fix this by inspecting operand types — it has none.** This feature's
-  Background already records that `crates/vs-expression` "stays a pure, stateless, sibling-shared
-  JSON-to-SQL translator with no column-type context", and decision `016-add-fn-div-pushdown`
-  records that "the arithmetic operator arm renders operands via recursive calls into opaque SQL
-  strings without inspecting their types". An UNCONDITIONAL cast of the left operand to `DOUBLE` is
-  therefore the only type-blind rendering that reproduces Exasol's always-`DOUBLE` `FN_FLOAT_DIV`,
-  and it is exactly what the type-blindness makes IMPOSSIBLE for `DIV` — `DIV` needs truncation,
-  which is correct for integer operands and wrong for every other kind, so no single `DIV`
-  rendering exists. The same limitation unblocks one operator and blocks the other.
+* **The translator cannot fix this by inspecting operand types — it has none.**
+  `crates/vs-expression` stays "a pure, stateless, sibling-shared JSON-to-SQL translator with no
+  column-type context" (see `sql-comprehension/vs-expression-translator-scalar-ops`), and decision
+  `016-add-fn-div-pushdown` records that "the arithmetic operator arm renders operands via recursive
+  calls into opaque SQL strings without inspecting their types". An UNCONDITIONAL cast of the left
+  operand to `DOUBLE` is therefore the only type-blind rendering that reproduces Exasol's
+  always-`DOUBLE` `FN_FLOAT_DIV`, and it is exactly what the type-blindness makes IMPOSSIBLE for
+  `DIV` — `DIV` needs truncation, which is correct for integer operands and wrong for every other
+  kind, so no single `DIV` rendering exists. The same limitation unblocks one operator and blocks
+  the other.
 * **Casting only the LEFT operand is sufficient, and it is enough for every operand pairing.**
   Measured on DataFusion 54.1 / arrow 58.3: `CAST(<int64> AS DOUBLE) / <int64>`,
   `CAST(<dec(18,2)> AS DOUBLE) / <int64>`, `CAST(<int64> AS DOUBLE) / <dec(18,2)>`,
@@ -75,9 +64,10 @@ the zero-divisor one, is what disqualifies it.
   too would change Exasol-facing SQL — including two byte-exact `dispatch_golden` fixtures and two
   native-oracle E2E comparisons of the just-shipped scalar-over-aggregate feature — for no
   correctness gain. This makes `FLOAT_DIV` the first arithmetic operator whose rendering diverges
-  by dialect, so the "byte-identically in BOTH dialects" claim narrows to the four operators it
-  still holds for, and the divergence guard that pinned the old claim is RETARGETED rather than
-  removed (the same treatment the CHAR CAST divergence received in
+  by dialect, so the "byte-identically in BOTH dialects" claim in
+  `sql-comprehension/vs-expression-translator-scalar-ops` narrows to the four operators it still
+  holds for, and the divergence guard that pinned the old claim is RETARGETED rather than removed
+  (the same treatment the CHAR CAST divergence received in
   `sql-comprehension/vs-expression-translator-cast`).
 * **`DOUBLE` has one owner.** `render_cast_target` already maps both `DOUBLE` and
   `DOUBLE PRECISION` to the string `DOUBLE`, dialect-invariantly, and that spelling is the one
@@ -143,24 +133,9 @@ the zero-divisor one, is what disqualifies it.
   unconditional, type-blind cast over any type-conditional rendering. There is no format-spec
   deviation to fix or track here; how a query engine computes and types a division is outside both
   specifications.
-<!-- /DELTA:NEW -->
 
 ## Scenarios
 
-<!-- DELTA:CHANGED -->
-### Scenario: Arithmetic operators translate to binary SQL expressions
-
-* *GIVEN* a VS expression node of type `function_scalar` whose `name` is the Exasol scalar-function name for addition, subtraction, or multiplication, or for unary negation
-* *AND* the exact `name` strings Exasol emits for these operators have been verified against live `EXPLAIN VIRTUAL` output for an arithmetic pushdown (so the translator matches what Exasol actually sends, e.g. `MULT` for `*`, not an assumed `MUL`)
-* *WHEN* `render_expression` or `render_expression_exasol` processes the node
-* *THEN* the `ADD`, `SUB`, and `MULT` nodes SHALL return `(<left> <op> <right>)` where the operators are `+`, `-`, `*` respectively, for operands that are themselves any renderable expression (including two bare column references, e.g. `(L_EXTENDEDPRICE * L_DISCOUNT)`), byte-identically in BOTH dialects — the operator syntax is shared by both parsers, and these wire names are NOT Exasol function names (Exasol has no function called `ADD`), so the Exasol dialect's verbatim rule for named functions MUST NOT be applied to them
-* *AND* unary negation SHALL return `(-<operand>)` and SHALL compose inside an aggregate argument (e.g. `SUM(-<operand>)`) so it flows through the arithmetic-aggregate decomposition path
-* *AND* floating-point division (`FLOAT_DIV`) SHALL NOT be rendered by this shape — it is the one arithmetic operator whose rendering diverges by dialect, specified in the two FLOAT_DIV scenarios below (issue #186); this scenario's "byte-identically in BOTH dialects" claim covers `ADD`, `SUB`, `MULT`, and `NEG` only
-* *AND* the set of arithmetic `name` strings the translator matches SHALL correspond exactly to the arithmetic operator capabilities the adapter advertises (`vs-adapter/pushdown-planning-capability-extensions`) — `FN_ADD`, `FN_SUB`, `FN_MULT`, `FN_FLOAT_DIV`, and `FN_NEG` — so no advertised operator is left unrenderable and no rendered operator is left unadvertised
-* *AND* Exasol integer division (`DIV`) SHALL NOT be matched here and `FN_DIV` SHALL NOT be advertised
-<!-- /DELTA:CHANGED -->
-
-<!-- DELTA:NEW -->
 ### Scenario: FLOAT_DIV renders true float division in the DataFusion dialect
 
 * *GIVEN* a VS expression node of type `function_scalar` named `FLOAT_DIV` — the wire name for Exasol's `/`, advertised as `FN_FLOAT_DIV`
@@ -205,15 +180,12 @@ the zero-divisor one, is what disqualifies it.
 * *AND* this feature MUST NOT close the gap by rendering `NULLIF(<right>, 0)` either: NULL is exactly the wrong answer already being observed, it makes a genuine zero divisor indistinguishable from a NULL divisor, and it would additionally suppress the `x/0` case that currently fails loudly
 * *AND* a division by zero in a PREDICATE position SHALL be treated as a distinct, VERIFIED-DIVERGENT case, measured live in both the single-table predicate position and the broadcast-join leg: an infinity compared against a bound never reaches the emit boundary, so `WHERE <a> / <b> > <k>` SILENTLY admits or rejects rows (observed 20 of 20, or 0 of 20) where native Exasol raises `22012` — the fix converts a loud `22002` failure into a silent wrong row count, and the join path adds no divergence of its own
 * *AND* this SHALL be recorded as a WIDENING of an already-reachable predicate-position gap, NOT a newly introduced defect: the same silent divergence is reachable TODAY with no cast involved whenever the numerator column is already `DOUBLE`-typed. It is tracked as issue `#370`, DISTINCT from `#246` — `#246` covers a projected-value NaN-to-NULL divergence at the emit boundary, whereas `#370` covers a predicate row-count divergence that never reaches emit
-<!-- /DELTA:NEW -->
 
-<!-- DELTA:CHANGED -->
-### Scenario: Integer division DIV is deliberately not translated
+### Scenario: FLOAT_DIV stays outside the verbatim rule in both dialects
 
-* *GIVEN* a VS expression node of type `function_scalar` named `DIV` — Exasol integer-quotient division, which truncates toward zero (`DIV(-7,2) = -3`, verified live) and raises a division-by-zero error
-* *WHEN* `render_expression` processes the node in raising mode
-* *THEN* the translator SHALL return an error naming `DIV` as unsupported
-* *AND* `render_expression_safe` SHALL return `None` for the same node without panicking
-* *AND* the adapter SHALL omit the expression and let Exasol evaluate `DIV`, because DataFusion 54 has no `div` builtin and, unlike `FLOAT_DIV`, no single type-blind rendering reproduces it: `DIV` needs TRUNCATION, which DataFusion's `/` delivers for integer operands and not for any other kind, and unlike CAST's explicit `dataType` field, DIV's operand types are not carried in the expression node, so the translator cannot identify and selectively render only the safe integer-operand case
-* *AND* this decline SHALL NOT be read as resting on the division-by-zero divergence, which the FLOAT_DIV scenarios above now measure and record: for `x/0` the query fails either way, and for `0/0` the divergence belongs to the tracked NaN-at-emit gap `(#246)` rather than to the rendering. `DIV`'s disqualifying defect is that a wrong rendering would be wrong on EVERY row for non-integer operands, not only when a divisor is zero — that is the difference between the two operators, and a future `TRUNC(m/n)` emulation would have to answer the per-row problem, not the zero-divisor one
-<!-- /DELTA:CHANGED -->
+* *GIVEN* the crate's single per-function declaration of each translated `function_scalar` name, which both gates the dispatch and drives the enforcing Exasol-dialect sweep test
+* *AND* `FLOAT_DIV` declared with the dialect-shaped form rather than the verbatim form, alongside `ADD`, `SUB`, `MULT`, and `NEG`
+* *WHEN* the sweep test renders every declared name through `render_expression_exasol` and compares it against that name's declared expectation
+* *THEN* `FLOAT_DIV` SHALL keep its shaped declaration and MUST NOT be moved to the verbatim form, because Exasol has no function called `FLOAT_DIV` — a verbatim rendering would emit `FLOAT_DIV(<l>, <r>)`, which Exasol rejects the same way it rejects `SIGNUM` and `STRPOS` (`function or script <NAME> not found`, SQL code 42000)
+* *AND* the sweep's Exasol-dialect expectation for `FLOAT_DIV` SHALL remain the bare `(<l> / <r>)` — unchanged by issue #186's fix, which adds the `CAST(... AS DOUBLE)` wrapper on the DataFusion side only
+* *AND* the sweep's banned-token list SHALL continue to catch a DataFusion-only spelling leaking into an Exasol-parsed fragment, and `CAST` MUST NOT be added to that list, since `CAST` is valid Exasol SQL that the CAST scenarios legitimately emit in the Exasol dialect
