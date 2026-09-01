@@ -25,7 +25,13 @@ reach a Delta table by the same route they reach an Iceberg one.
 * *THEN* the generated SQL and the serialized per-shard scan specs MUST be byte-identical to their
   pre-feature output for every request EXCEPT for the `storage` value, which carries the tagged
   wrapper of `vs-adapter/scan-spec-credential-reference`
-* *AND* every existing test MUST pass with no change to any assertion or expected value
+* *AND* every existing test MUST pass with no change to any assertion or expected value, EXCEPT for
+  the two edits this delta's `storage` carve-out forces and no others: the eighteen credential-bearing
+  golden dispatch fixtures are REGENERATED so their `storage` value carries the wrapper, and
+  `common_blob_wire_is_byte_stable`'s pinned bytes gain the wrapper around the same backend encoding
+* *AND* those two edits MUST change the `storage` value and nothing else — the six `empty_*` fixtures
+  carry no `storage` value and SHALL stay byte-identical, and no assertion MUST be weakened, disabled,
+  or deleted to accommodate the change
 * *AND* the Iceberg-level file pruning the resolver applies from the request's filter SHALL still be
   applied, because the filter is forwarded to the reader unchanged
 <!-- /DELTA:CHANGED -->
