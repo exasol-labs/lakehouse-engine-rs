@@ -6,8 +6,9 @@ per-instance limit minus a configurable container/binary overhead — scaled by 
 configurable fraction, to bound the per-batch Parquet decode working set via a
 configured `batch_size`, to enable Parquet row-group and page pruning so the scan
 reads only the byte ranges its predicate needs, and to obtain storage credentials
-from the scan spec — resolved from the referenced Exasol CONNECTION, or carried
-inline when the planning layer vended them — without re-authenticating to the
+from the scan spec — resolved from the referenced Exasol CONNECTION, or unsealed
+from the AES-GCM envelope in which the planning layer carried the credentials it
+vended, keyed from that same CONNECTION — without re-authenticating to the
 catalog. The credentials or their reference and the tuning knobs travel in the
 shard-invariant common spec argument, serialized once for the whole fan-out.
 
@@ -18,7 +19,7 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
 * **The resolution is ONE step at the top of the invocation, not a lookup at each store-construction site.** A join spec carries a storage block per side, so the resolved value is a PAIR. Resolving lazily per store would read the same CONNECTION twice in one invocation and would leave the redaction secret set undefined for the window between the two reads.
 * **The redaction secret set moves off the spec and onto the resolved pair, and this is the delta's one correctness trap.** SEVEN sites under `crates/lakehouse-engine/src/scan/` build such a set. Two read the union off the spec: `object_store.rs:66` and `join_scan.rs:48`, both `spec.common.all_secret_values()`. Three read the fact side off the spec directly: `partial_agg.rs:70`, `partial_agg.rs:125`, and `raw_scan.rs:54`, each `spec.common.storage.secret_values()`. Two already take a `&StorageBackend` parameter and are fed by their callers: `raw_scan.rs:224` in `register_file_list`, and `positional_deletes.rs:629` in `PositionalDeleteScanTable::new`. A spec carrying a connection NAME has no secret to yield, so leaving the set on the spec would silently disarm value-based redaction at the five spec-reading sites — a fix that reduced protection on the error path while fixing the SQL path. The set is therefore computed from the resolved backends, and the wire wrapper exposes no secret accessor so a missed site fails to compile.
 * **The raw-scan and partial-aggregate paths are where a disarmed set would go unnoticed**, because they read the fact-side set directly and no recorded scenario asserts redaction on either. This delta adds that assertion.
-* **`vs-adapter/scan-spec-credential-reference` owns the wire contract, the storage-only projection the UDF deserializes, the required grant, and the mid-query rotation consequence.** This feature CITES it and restates none of it, so the two do not drift.
+* **`vs-adapter/scan-spec-credential-reference` owns the wire contract, the storage-only projection the UDF deserializes, the sealed vended envelope, the required grant, and the mid-query rotation consequence.** This feature CITES it and restates none of it, so the two do not drift.
 * **Nothing about the store the UDF builds changes.** The resolved value is a `StorageBackend`, the same type the spec carried inline before, so the backend-dispatching registration function of `vs-adapter/storage-backend-enum`, the per-side size index, the routing decorator, and the one-store-per-side rule are all reached with a field-for-field identical input.
 
 ## Scenarios
@@ -26,7 +27,7 @@ shard-invariant common spec argument, serialized once for the whole fan-out.
 <!-- DELTA:CHANGED -->
 ### Scenario: Scan reads data files with credentials referenced or carried in the scan spec
 
-* *GIVEN* a scan invocation whose shard-invariant common spec argument carries, per side, EITHER a reference to the Exasol CONNECTION that supplies that side's storage credentials OR a storage backend holding vended credentials resolved once by the planning layer
+* *GIVEN* a scan invocation whose shard-invariant common spec argument carries, per side, EITHER a reference to the Exasol CONNECTION that supplies that side's storage credentials OR a sealed envelope carrying the storage backend the planning layer vended, resolved once by the planning layer
 * *WHEN* the scan UDF builds its object store and reads the files listed in its per-shard argument
 * *THEN* the UDF SHALL resolve every reference to a storage backend EXACTLY ONCE per invocation, before it builds any object store, under `vs-adapter/scan-spec-credential-reference`
 * *AND* the UDF SHALL register the object store the RESOLVED storage backend names, configured from the credentials that backend holds

@@ -17,14 +17,14 @@ column JSON rendering, and EMITS-type coercion — is owned by
 ## Background
 
 * **This delta is issue #135. It amends ONE scenario and one Background enumeration, and changes no scan rule.** File registration, projection, filter, LIMIT, incremental Arrow IPC emission, the unreadable-file error, the memory-exhaustion error, and INT96 decoding are all UNCHANGED.
-* **SUPERSEDES the recorded Background enumeration listing "storage credentials" among the shard-invariant common argument's contents.** The common argument now carries, per side, EITHER a reference to the Exasol CONNECTION that supplies that side's storage credentials OR an inline storage backend the planning layer vended — specified by `vs-adapter/scan-spec-credential-reference`, which this feature CITES.
+* **SUPERSEDES the recorded Background enumeration listing "storage credentials" among the shard-invariant common argument's contents.** The common argument now carries, per side, EITHER a reference to the Exasol CONNECTION that supplies that side's storage credentials OR the sealed envelope carrying the storage backend the planning layer vended — specified by `vs-adapter/scan-spec-credential-reference`, which this feature CITES.
 
 ## Scenarios
 
 <!-- DELTA:CHANGED -->
 ### Scenario: Scan registers only its assigned files and returns matching rows
 
-* *GIVEN* a scan input row carrying TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical schema, projection, filter, limit, a storage credential reference or an inline storage backend, the table root, and tuning knobs) and a per-shard files argument listing specific Parquet data files in MinIO, each optionally carrying its associated positional-delete file references
+* *GIVEN* a scan input row carrying TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical schema, projection, filter, limit, a storage credential reference or a sealed vended storage envelope, the table root, and tuning knobs) and a per-shard files argument listing specific Parquet data files in MinIO, each optionally carrying its associated positional-delete file references
 * *AND* a projection naming a subset of columns
 * *WHEN* the scan UDF processes that input row
 * *THEN* the UDF SHALL read the common spec from the first input argument and the file list from the second, and reconstitute a single scan spec whose files (and their delete references) come from the second argument and whose every other field comes from the first (only serialized bytes crossing the `.so` boundary — both arguments are VARCHAR JSON)

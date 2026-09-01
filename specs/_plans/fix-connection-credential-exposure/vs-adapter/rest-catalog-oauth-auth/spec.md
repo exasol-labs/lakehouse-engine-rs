@@ -15,7 +15,7 @@ after the `catalog` field is dropped, `ScanSpec` carries no catalog block at all
 ## Background
 
 * **This delta is issue #135. It amends ONE scenario and changes no authentication rule.** The static bearer token path, the OAuth2 client-credentials grant, the no-auth path, the multi-warehouse base-path resolution, and the prohibition on catalog-auth props in any scan spec are all UNCHANGED.
-* **SUPERSEDES the recorded clause "each `ScanSpec` storage block SHALL carry only the S3 storage credentials".** A storage block now carries EITHER a reference to the CONNECTION that supplies the static credentials, or the vended credentials inline — specified by `vs-adapter/scan-spec-credential-reference`, which this feature CITES.
+* **SUPERSEDES the recorded clause "each `ScanSpec` storage block SHALL carry only the S3 storage credentials".** A storage block now carries EITHER a reference to the CONNECTION that supplies the static credentials, or the vended credentials inside a sealed AES-GCM envelope — specified by `vs-adapter/scan-spec-credential-reference`, which this feature CITES.
 * **The catalog-auth guarantee this feature owns is STRENGTHENED rather than weakened.** `token`, `client_id`, `client_secret`, `oauth2_server_uri`, and `scope` still reach no `ScanSpec` field, and the scan UDF now reads the same CONNECTION password on the vending-disabled path yet cannot construct any of them, because it deserializes a storage-only nine-field projection — see `vs-adapter/connection-credentials-catalog-auth`.
 
 ## Scenarios
@@ -27,5 +27,5 @@ after the `catalog` field is dropped, `ScanSpec` carries no catalog block at all
 * *WHEN* the adapter builds the per-shard scan specs after resolving the file list
 * *THEN* the adapter MUST NOT place `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope` into any `ScanSpec` field
 * *AND* the `ScanSpec` SHALL carry no catalog identifier block at all — the scan UDF never contacts the catalog, so `ScanSpec` MUST NOT include catalog `uri`, `warehouse`, or `table` fields
-* *AND* each `ScanSpec` storage block SHALL carry only storage material — the vended STS credentials INLINE when `use_vended_credentials` is enabled and they were resolved, otherwise a REFERENCE to the CONNECTION that supplies the static credentials — exactly as in `vs-adapter/pushdown-planning-cloud-credentials` and `vs-adapter/scan-spec-credential-reference`, SUPERSEDING the recorded clause that required the static credentials themselves
+* *AND* each `ScanSpec` storage block SHALL carry only storage material — the vended STS credentials inside the SEALED envelope when `use_vended_credentials` is enabled and they were resolved, otherwise a REFERENCE to the CONNECTION that supplies the static credentials — exactly as in `vs-adapter/pushdown-planning-cloud-credentials` and `vs-adapter/scan-spec-credential-reference`, SUPERSEDING the recorded clause that required the static credentials themselves
 <!-- /DELTA:CHANGED -->

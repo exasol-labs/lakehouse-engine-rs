@@ -5,7 +5,7 @@ Extends `datafusion-scan/scan-execution` with node-local broadcast inner equi-jo
 ## Background
 
 * **This delta is issue #135. It amends TWO scenarios and changes no join rule.** The two-file-list reconstitution, the two-store registration, the per-side size index, the inner equi-join, the build-side choice, the LIMIT handling, and the early-termination diagnostic are all UNCHANGED.
-* **Each side's storage value becomes a REFERENCE or an INLINE backend**, specified by `vs-adapter/scan-spec-credential-reference`, which this feature CITES. Both sides of one join are planned under ONE virtual schema and therefore ONE CONNECTION, so both sides carry the same variant while their inline payloads may still differ under vending.
+* **Each side's storage value becomes a REFERENCE or a SEALED envelope**, specified by `vs-adapter/scan-spec-credential-reference`, which this feature CITES. Both sides of one join are planned under ONE virtual schema and therefore ONE CONNECTION, so both sides carry the same variant while their sealed payloads may still differ under vending — each side's backend is sealed independently.
 * **SUPERSEDES the recorded per-side redaction clause "so the redaction set guarding that side's read errors holds that side's credential values rather than the other side's".** The redaction set is now built from the RESOLVED backends and, on a join spec, is the UNION of both sides' resolved secrets — because resolution happens once per invocation before any store exists, and a per-side set would be undefined between the two reads. Registering each side against its OWN backend is UNCHANGED; only where the secret set comes from changes.
 
 ## Scenarios
@@ -17,7 +17,7 @@ Extends `datafusion-scan/scan-execution` with node-local broadcast inner equi-jo
 * *WHEN* the scan UDF parses its two input arguments
 * *THEN* the UDF SHALL reconstitute one join `ScanSpec` whose fact files come from the per-shard argument and whose dimension side and every other field come from the common spec
 * *AND* the join block's storage value SHALL be a REQUIRED field with no deserialization default, so a join block that carries none fails to deserialize rather than silently reusing the whole-spec storage value
-* *AND* the reconstituted spec SHALL carry TWO storage values — the fact side's as the whole-spec `storage` value and the dimension side's inside the join block, each either a connection REFERENCE or an INLINE backend under `vs-adapter/scan-spec-credential-reference` — and the UDF MUST NOT read either side's files through the other's resolved backend
+* *AND* the reconstituted spec SHALL carry TWO storage values — the fact side's as the whole-spec `storage` value and the dimension side's inside the join block, each either a connection REFERENCE or a SEALED envelope under `vs-adapter/scan-spec-credential-reference` — and the UDF MUST NOT read either side's files through the other's resolved backend
 * *AND* a parse failure on either argument SHALL surface an error identifying scan-spec deserialization failure and MUST NOT contain any storage access key, secret key, or session token from EITHER side's backend
 * *AND* the reconstituted spec MUST NOT carry any catalog identifier, because the scan UDF never contacts the catalog
 <!-- /DELTA:CHANGED -->

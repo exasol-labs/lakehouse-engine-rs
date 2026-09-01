@@ -7,7 +7,7 @@ path exactly as they already are for Iceberg.
 ## Background
 
 * **This delta is issue #135. It amends ONE scenario and changes no Delta planning rule.** Version resolution, active-file selection, partition values, deletion-vector references, column-mapping binding keys, the empty-location rejection, the format-reader selection, the Iceberg byte-identity gate, and the production reachability of the Delta reader are all UNCHANGED.
-* **SUPERSEDES the recorded clause requiring that the shard-invariant common spec "carries the same backend the log was read through".** With vending disabled the reader still resolves and uses the CONNECTION's static backend for its own log read, while the emitted common spec carries a REFERENCE to that CONNECTION instead of the backend — resolved by the scan UDF to a field-for-field equal backend under `vs-adapter/scan-spec-credential-reference`, which this feature CITES. With vending enabled the effective backend still travels inline, under issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378).
+* **SUPERSEDES the recorded clause requiring that the shard-invariant common spec "carries the same backend the log was read through".** With vending disabled the reader still resolves and uses the CONNECTION's static backend for its own log read, while the emitted common spec carries a REFERENCE to that CONNECTION instead of the backend — resolved by the scan UDF to a field-for-field equal backend under `vs-adapter/scan-spec-credential-reference`, which this feature CITES. With vending enabled the effective backend still travels in that spec, but ONLY inside the AES-GCM-sealed envelope of `vs-adapter/scan-spec-credential-reference` (issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan), never in plaintext.
 * **The reader's own vended/static split is UNCHANGED and MUST NOT return the wrapper**, because the reader uses the concrete backend immediately to read the Delta log.
 
 ## Scenarios
@@ -28,9 +28,7 @@ path exactly as they already are for Iceberg.
   fallback would read object storage with a credential the operator did not select for this table
 * *AND* with vending disabled the reader SHALL use the CONNECTION's static storage backend unchanged
 * *AND* the reader SHALL return the EFFECTIVE storage backend alongside the file list, and the
-  shard-invariant common spec SHALL carry that backend INLINE under vending and a REFERENCE to the
-  CONNECTION that supplied it with vending disabled, which the scan UDF resolves to a field-for-field
-  equal backend under `vs-adapter/scan-spec-credential-reference`
+  shard-invariant common spec SHALL carry that backend SEALED (the AES-GCM envelope of `vs-adapter/scan-spec-credential-reference`) under vending and a REFERENCE to the CONNECTION that supplied it with vending disabled, both of which the scan UDF resolves to a field-for-field equal backend under that same feature
 * *AND* every error the reader surfaces from this point on SHALL be redacted against the effective
   storage's secret values, and MUST NOT contain any vended or static credential value
 <!-- /DELTA:CHANGED -->

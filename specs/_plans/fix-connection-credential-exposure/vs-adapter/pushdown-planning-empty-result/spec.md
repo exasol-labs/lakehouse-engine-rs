@@ -12,8 +12,8 @@ instead of rejecting it for a column-count/type mismatch.
 ## Background
 
 * **This delta is issue #135 and it changes no rule of this feature.** Every capability, translation, request-shape, and SQL-shape rule here is UNCHANGED. What changes is the credential claim.
-* **SUPERSEDES this feature's recorded Background bullet "Credentials MUST NOT appear in any returned SQL string or error message."** That sentence is unscoped and is FALSE for a vended storage credential, both before and after this plan. The scoped replacement: a CONNECTION-supplied storage credential is carried as a connection REFERENCE and does not appear in the returned SQL; a VENDED storage credential still appears there under the tracked exception issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378); no credential of either kind appears in an error message.
-* **`vs-adapter/scan-spec-credential-reference` owns the reference contract, the resolution, the required grant, and the #378 residual.** This feature CITES it and restates none of it, so the two do not drift.
+* **This feature's recorded Background bullet "Credentials MUST NOT appear in any returned SQL string or error message." stays TRUE on this path.** An empty-result plan emits no scan-spec storage value of any kind — neither a credential, nor a connection reference, nor the sealed envelope of issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378) — so the recorded claim holds here trivially; the scoped claim for storage-carrying paths lives in `vs-adapter/scan-spec-credential-reference`, which this feature CITES.
+* **`vs-adapter/scan-spec-credential-reference` owns the reference contract, the resolution, the sealed vended envelope that closes #378, and the required grant.** This feature CITES it and restates none of it, so the two do not drift.
 
 ## Scenarios
 

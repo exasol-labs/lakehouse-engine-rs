@@ -18,9 +18,9 @@ and no file is scanned twice.
 ## Background
 
 * **This delta is issue #135. It adds ONE scenario, amends one Background bullet, and changes no sharding rule.** The shard count formula, the 300 cap, the byte-balanced disjoint partitioning, the one-shard-per-file floor, the distributor fan-out shape, the passthrough distributor, and the single-shard short circuit are all UNCHANGED.
-* **SUPERSEDES the recorded Background sentence "Credentials MUST NOT appear repeated per shard; they live once in the common spec literal."** The once-per-fan-out half is UNCHANGED and is the point of this feature. The "they live once in the common spec literal" half is now wrong for a CONNECTION-supplied credential: what lives once in that literal is a REFERENCE to the Exasol CONNECTION, and the credential itself lives in the CONNECTION. A VENDED credential does still live once in the literal, under the tracked exception issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378).
+* **SUPERSEDES the recorded Background sentence "Credentials MUST NOT appear repeated per shard; they live once in the common spec literal."** The once-per-fan-out half is UNCHANGED and is the point of this feature. The "they live once in the common spec literal" half is now wrong for a CONNECTION-supplied credential: what lives once in that literal is a REFERENCE to the Exasol CONNECTION, and the credential itself lives in the CONNECTION. A VENDED credential does still live once in the literal — ONLY inside the AES-GCM-sealed envelope of `vs-adapter/scan-spec-credential-reference` — issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), CLOSED by this plan — never in plaintext.
 * **The shard cap is why the deferral is affordable and why it is stated here.** The scan UDF now performs one engine-local `ctx.connection()` lookup per shard invocation, and G is capped at 300, so the added cost is bounded by this feature's own cap rather than by the file count.
-* **`vs-adapter/scan-spec-credential-reference` owns the reference contract, the resolution, and the #378 residual.** This feature CITES it and restates none of it.
+* **`vs-adapter/scan-spec-credential-reference` owns the reference contract, the resolution, and the sealed vended envelope that closes #378.** This feature CITES it and restates none of it.
 
 ## Scenarios
 
@@ -30,6 +30,6 @@ and no file is scanned twice.
 * *GIVEN* a pushdown plan whose file list is partitioned into G work-unit shards, over a virtual schema whose CONNECTION supplies static storage credentials and does not enable `use_vended_credentials`
 * *WHEN* the adapter serializes the shard-invariant common spec once as the scalar scan's first-argument literal and flows each shard's per-file subset through the distributor
 * *THEN* the common literal SHALL carry exactly ONE storage reference for the whole fan-out, and the per-shard file subsets MUST NOT carry any storage value, so the reference is not repeated per shard
-* *AND* the credential itself SHALL NOT appear in that literal, superseding the recorded claim that credentials "live once in the common spec literal" — a VENDED credential still does, under issue #378
+* *AND* the credential itself SHALL NOT appear in that literal, superseding the recorded claim that credentials "live once in the common spec literal" — a VENDED credential still does, sealed and never in plaintext, under issue #378 (closed by this plan)
 * *AND* each shard invocation SHALL resolve that one reference ITSELF through `ctx.connection()`, so the resolution count is bounded by G and therefore by this feature's cap of 300 rather than by the file count
 <!-- /DELTA:NEW -->

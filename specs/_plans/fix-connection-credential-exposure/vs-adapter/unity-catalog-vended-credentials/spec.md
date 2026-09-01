@@ -5,8 +5,8 @@ Requests per-table, short-lived, scoped storage credentials from the Unity Catal
 ## Background
 
 * **This delta is issue #135. It amends TWO scenarios and changes no vended selection rule.** The credential-family-per-backend mapping, the scheme-to-variant decision, the shared store-address rule, the missing-credential error, the unsupported-scheme error, and both plaintext-consent gates are all UNCHANGED.
-* **SUPERSEDES the recorded claim that every vended secret "MUST NEVER appear in any error message, returned SQL, or log line."** The error-message and log-line halves hold. The returned-SQL half is FALSE and stays false: a vended credential travels INLINE in the scan-spec storage block, because no CONNECTION name identifies a credential the catalog vended for one table. That residual is the tracked exception issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378).
-* **The residual is narrower than what issue #135 closes.** A vended credential expires and is scoped to the prefix the catalog vended it for; a CONNECTION `secret_key` is long-lived and account-wide. `vs-adapter/scan-spec-credential-reference` owns the reference contract this feature's path does NOT take, and this feature CITES it.
+* **SUPERSEDES the recorded claim that every vended secret "MUST NEVER appear in any error message, returned SQL, or log line."** The error-message and log-line halves hold. The returned-SQL half was FALSE before this plan and is now made true in the PLAINTEXT sense: a vended credential still travels in the scan-spec storage block, because no CONNECTION name identifies a credential the catalog vended for one table, but ONLY inside the AES-GCM-sealed envelope of `vs-adapter/scan-spec-credential-reference` — issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan.
+* **The envelope's guarantee is bounded, and this feature cites rather than restates the bound.** `vs-adapter/scan-spec-credential-reference` owns the reference contract this feature's path does NOT take, the sealed envelope this feature's output travels in, the bounded threat model, and the no-auth + vending refusal; this feature CITES it. `resolve_uc_vended_storage` itself is UNEDITED — sealing happens downstream, at the one wire-variant selection site.
 
 ## Scenarios
 
@@ -19,7 +19,7 @@ Requests per-table, short-lived, scoped storage credentials from the Unity Catal
 * *AND* the selector MUST NOT read an access key, a secret key, or a session token from the CONNECTION, so a credential the response does not carry is an error and never a static fallback
 * *AND* the selector SHALL resolve the store `endpoint` and `region` through the ONE shared store-address rule both vended selectors call, taking each independently from the CONNECTION when the CONNECTION's value is non-empty and from the vended response otherwise
 * *AND* the selector SHALL leave a field empty when NEITHER source states it, and an S3 backend whose `endpoint` and `region` are BOTH empty SHALL be returned successfully rather than refused, because Databricks AWS vends no endpoint and no region and the AWS default chain places that store
-* *AND* the vended access key, secret key, and session token MUST NOT appear in any error message or log line, and DO appear in the returned SQL string under the tracked exception issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378) — SUPERSEDING the recorded clause that forbade both
+* *AND* the vended access key, secret key, and session token MUST NOT appear in any error message or log line, and MUST NOT appear in PLAINTEXT in the returned SQL string — they appear there only as the sealed envelope's ciphertext under issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan — SUPERSEDING the recorded clause whose returned-SQL half was FALSE before this plan
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
@@ -29,5 +29,5 @@ Requests per-table, short-lived, scoped storage credentials from the Unity Catal
 * *WHEN* `resolve_uc_vended_storage` resolves the storage backend from that response and location
 * *THEN* the selector SHALL return the ADLS variant of `StorageBackend` carrying the SAS credential and the account name recovered from the storage location's host
 * *AND* the selector MUST NOT read `account_name`, `account_key`, or `sas_token` from the CONNECTION
-* *AND* the vended SAS token MUST NOT appear in any error message or log line, and DOES appear in the returned SQL string under the tracked exception issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378) — SUPERSEDING the recorded clause that forbade both
+* *AND* the vended SAS token MUST NOT appear in any error message or log line, and MUST NOT appear in PLAINTEXT in the returned SQL string — it appears there only as the sealed envelope's ciphertext under issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan — SUPERSEDING the recorded clause whose returned-SQL half was FALSE before this plan
 <!-- /DELTA:CHANGED -->

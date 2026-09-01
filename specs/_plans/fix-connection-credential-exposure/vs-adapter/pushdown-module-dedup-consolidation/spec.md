@@ -26,5 +26,5 @@ internal-duplication extractions that module made room for.
 * *WHEN* the dispatcher constructs the scan spec for the grouped-aggregate, group-by fallback, lone-`COUNT(DISTINCT)`, multi/mixed-`COUNT(DISTINCT)` decline, and single-group/row-scan dispatch shapes
 * *THEN* every site SHALL derive its shard-invariant fields from one shared base value and set only the fields that differ at that site
 * *AND* the shared-base rule SHALL hold for `storage` as the scan-spec storage WRAPPER exactly as it held for a bare `StorageBackend` and before that a bare `StorageProps`: the base still carries the one storage value, no construction site re-derives it or chooses its variant, and the wrapper adds NO per-site field
-* *AND* the scan-driving SQL generated for each dispatch shape MUST be byte-identical to the pre-refactor output EXCEPT for the `storage` value, which `vs-adapter/scan-spec-credential-reference` re-encodes as a reference carrying no credential or as an inline variant over a byte-identical backend payload
+* *AND* the scan-driving SQL generated for each dispatch shape MUST be byte-identical to the pre-refactor output EXCEPT for the `storage` value, which `vs-adapter/scan-spec-credential-reference` re-encodes as a reference carrying no credential or as a sealed envelope over that backend's byte-identical (pre-encryption) encoding
 <!-- /DELTA:CHANGED -->
