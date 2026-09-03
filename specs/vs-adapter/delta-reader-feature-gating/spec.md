@@ -191,7 +191,7 @@ normative obligations this feature enforces:
   every scenario already recorded for it in
   `datafusion-scan/scan-execution-delta-deletion-vectors`,
   `datafusion-scan/scan-execution-partition-values`, and
-  `e2e-harness/unity-catalog-e2e-harness-delta-queries` — namely `table_with_dv` and
+  `unity-e2e/unity-catalog-e2e-harness-delta-queries` — namely `table_with_dv` and
   `multi_part_stats` (`deletionVectors`) and `stats_all_types` (`timestampNtz` + `columnMapping`) —
   and the `type_widening` fixture SHALL join that set rather than staying refused
 
