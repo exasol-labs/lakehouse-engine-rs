@@ -462,11 +462,20 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
 * *AND* it SHALL treat an already-registered table as success rather than an error, and SHALL send the
   register request's `overwrite` flag EXPLICITLY as `false` rather than omitting it or sending JSON
   `null`, so a re-run never replaces a table's recorded metadata pointer
-* *AND* it SHALL report a location-already-taken rejection as a DISTINCT named failure and MUST NOT
-  fold it into already-registered success. Lakekeeper 0.13.1 does NOT reject the TPC-H
-  `part`/`partsupp` shape — that was verified live, and no mitigation for it exists in this feature —
-  so if the rejection ever appears it signals a real registration gap, a changed Lakekeeper version, or
-  a genuinely overlapping location, never a repeat run
+* *AND* it SHALL confirm every non-definitively-failed register outcome (a fresh `2xx`, or a `409` not
+  otherwise identified) with a `loadTable` read-back of the just-registered table, comparing the
+  returned `metadata-location` against the value this run submitted, and SHALL treat a mismatch as a
+  DISTINCT, always-failing outcome rather than folding it into already-registered success. This
+  read-back — not response-text sniffing — is the mechanism the exit code rests on: verified live
+  against Lakekeeper 0.13.1, a genuine location conflict with a different table and an ordinary
+  already-registered re-run answer with a byte-identical `409 AlreadyExistsException` body, so text
+  matching alone cannot tell them apart (decision [29]). Response-text matching for a
+  distinguishing "location already taken" message MAY still be logged when Lakekeeper does emit one,
+  as a documentation aid, but MUST NOT be the sole basis for the success/failure classification.
+  Lakekeeper 0.13.1 does NOT reject the TPC-H `part`/`partsupp` shape — that was verified live, and no
+  mitigation for it exists in this feature — so a read-back mismatch, if it ever occurs, signals a
+  real registration gap, a changed Lakekeeper version, or a genuinely overlapping location, never a
+  repeat run
 * *AND* it SHALL print a per-table summary distinguishing registered, already-present, and failed
   tables, and SHALL exit non-zero when any table failed, so a partial registration cannot be mistaken
   for a complete one

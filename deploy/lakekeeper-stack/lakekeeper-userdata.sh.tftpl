@@ -1,0 +1,215 @@
+#!/usr/bin/env bash
+# Lakekeeper appliance bootstrap.
+#
+# Section 1 (task 1.4 — boot-and-fetch): installs Docker Engine + the compose plugin, discovers
+# this instance's own private and public IPv4 addresses via IMDSv2, and fetches the Keycloak
+# realm export via the instance profile's S3 read.
+# Section 2 (task 1.5 — compose-and-wait): renders the four-service compose stack from the
+# addresses and files section 1 produces, then waits for the imported "iceberg" realm to come up.
+set -uo pipefail
+exec > >(tee /var/log/lakekeeper-userdata.log) 2>&1
+
+REGION="${region}"
+BUCKET="${bucket}"
+REALM_S3_KEY="${realm_s3_key}"
+SSM_ROOT="${ssm_root}"
+
+# Consumed by section 2 (task 1.5): the pinned image tags and the OIDC realm/audience names the
+# compose file's Lakekeeper and Keycloak services are configured with.
+POSTGRES_IMAGE="${postgres_image}"
+KEYCLOAK_IMAGE="${keycloak_image}"
+LAKEKEEPER_IMAGE="${lakekeeper_image}"
+OIDC_REALM="${oidc_realm}"
+OIDC_AUDIENCE="${oidc_audience}"
+
+WORKDIR=/opt/lakekeeper
+mkdir -p "$WORKDIR"
+
+# ==============================================================================================
+# Section 1: boot-and-fetch (task 1.4)
+# ==============================================================================================
+
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq \
+  || { echo "FATAL: apt-get update failed" >&2; exit 1; }
+apt-get install -y -qq docker.io docker-compose-v2 curl unzip \
+  || { echo "FATAL: apt-get install of docker.io/docker-compose-v2/curl/unzip failed" >&2; exit 1; }
+
+systemctl enable --now docker \
+  || { echo "FATAL: systemctl enable --now docker failed" >&2; exit 1; }
+
+# AWS CLI v2 (Ubuntu 24.04 has no reliable awscli apt package) — needed for the realm-export fetch
+# below and for section 2's SSM reads. Matches data-stack/datagen-userdata.sh.tftpl's install.
+if ! command -v aws >/dev/null 2>&1; then
+  arch="$(uname -m)"; url="https://awscli.amazonaws.com/awscli-exe-linux-$${arch}.zip"
+  curl -fsSL "$url" -o /tmp/awscliv2.zip && (cd /tmp && unzip -q -o awscliv2.zip && ./aws/install)
+fi
+
+# IMDSv2 (token required): no `aws_eip` is attached to this instance (main.tf), so neither its
+# public nor its private IPv4 is known at apply time. Both are discovered here, at boot, and
+# handed to section 2 as the two OIDC issuer hosts — Keycloak stamps `iss` from the request host,
+# so both the private-IP (same-VPC UDF) and public-IP (operator) issuers must be declared.
+IMDS_TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 21600")
+PRIVATE_IPV4=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  "http://169.254.169.254/latest/meta-data/local-ipv4")
+PUBLIC_IPV4=$(curl -sf -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  "http://169.254.169.254/latest/meta-data/public-ipv4")
+
+if [ -z "$PRIVATE_IPV4" ] || [ -z "$PUBLIC_IPV4" ]; then
+  echo "FATAL: IMDSv2 address discovery failed (private='$PRIVATE_IPV4' public='$PUBLIC_IPV4')" >&2
+  exit 1
+fi
+
+echo "==> discovered private_ipv4=$PRIVATE_IPV4 public_ipv4=$PUBLIC_IPV4"
+
+# Instance-profile-authenticated S3 GET — the sole credential source on this box (main.tf's
+# RealmExportRead policy statement scopes it to exactly this object). The realm export is 21 KB,
+# above EC2 user-data's 16 KB cap, which is why it is delivered through S3 rather than inlined.
+aws s3 cp "s3://$BUCKET/$REALM_S3_KEY" "$WORKDIR/keycloak-realm-iceberg.json" --region "$REGION" \
+  || { echo "FATAL: aws s3 cp s3://$BUCKET/$REALM_S3_KEY failed" >&2; exit 1; }
+
+if [ ! -s "$WORKDIR/keycloak-realm-iceberg.json" ]; then
+  echo "FATAL: realm export fetched from s3://$BUCKET/$REALM_S3_KEY is empty" >&2
+  exit 1
+fi
+
+echo "==> realm export fetched to $WORKDIR/keycloak-realm-iceberg.json"
+
+# ==============================================================================================
+# Section 2: compose-and-wait (task 1.5)
+# ==============================================================================================
+# Consumes: $PRIVATE_IPV4, $PUBLIC_IPV4, $WORKDIR/keycloak-realm-iceberg.json, $SSM_ROOT, and the
+# $POSTGRES_IMAGE / $KEYCLOAK_IMAGE / $LAKEKEEPER_IMAGE / $OIDC_REALM / $OIDC_AUDIENCE variables
+# section 1 already resolved above. Renders the four-service compose file with the realm-import-
+# gated ordering the local stack (docker-compose.lakekeeper.yml) proves, sets
+# LAKEKEEPER__OPENID_PROVIDER_URI on the private-IP issuer and
+# LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS on the public-IP one, reads the Keycloak bootstrap admin
+# password and the Postgres/metadata-encryption secrets from SSM rather than any literal, and
+# waits on a health probe that tests the imported "iceberg" realm specifically (a `/dev/tcp`
+# probe, since the Keycloak image ships no curl).
+
+# SecureString reads — the sole use of this box's own OwnSecretsRead/OwnSecretsDecrypt IAM
+# statements (main.tf). MUST NOT be the local compose file's literal `postgres` / `admin` /
+# `This-is-NOT-Secure!` (docker-compose.lakekeeper.yml:44-45,76,96,111): this box carries a
+# public IP.
+DB_PASSWORD=$(aws ssm get-parameter --with-decryption --region "$REGION" \
+  --name "$SSM_ROOT/db_password" --query 'Parameter.Value' --output text) \
+  || { echo "FATAL: could not read $SSM_ROOT/db_password from SSM" >&2; exit 1; }
+METADATA_ENCRYPTION_KEY=$(aws ssm get-parameter --with-decryption --region "$REGION" \
+  --name "$SSM_ROOT/metadata_encryption_key" --query 'Parameter.Value' --output text) \
+  || { echo "FATAL: could not read $SSM_ROOT/metadata_encryption_key from SSM" >&2; exit 1; }
+KEYCLOAK_ADMIN_PASSWORD=$(aws ssm get-parameter --with-decryption --region "$REGION" \
+  --name "$SSM_ROOT/keycloak_admin_password" --query 'Parameter.Value' --output text) \
+  || { echo "FATAL: could not read $SSM_ROOT/keycloak_admin_password from SSM" >&2; exit 1; }
+
+if [ -z "$DB_PASSWORD" ] || [ -z "$METADATA_ENCRYPTION_KEY" ] || [ -z "$KEYCLOAK_ADMIN_PASSWORD" ]; then
+  echo "FATAL: one or more secrets read empty from SSM root $SSM_ROOT" >&2
+  exit 1
+fi
+
+PG_URL="postgresql://postgres:$DB_PASSWORD@lakekeeper-db:5432/postgres"
+
+# Two OIDC issuer vantages (main.tf's catalog_uri_public/private, token_uri_public/private):
+# the primary provider URI is the PRIVATE IP, because the same-VPC Exasol UDF is the steady-state
+# caller; the PUBLIC IP is accepted as an additional issuer for the operator's own laptop-run
+# provisioning and demo traffic. Keycloak stamps `iss` from the request host, so both must be
+# declared or one vantage's tokens are rejected.
+cat >"$WORKDIR/docker-compose.yml" <<COMPOSE
+services:
+  lakekeeper-db:
+    image: "$POSTGRES_IMAGE"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=$DB_PASSWORD
+      - POSTGRES_DB=postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -p 5432 -d postgres"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+
+  keycloak:
+    image: "$KEYCLOAK_IMAGE"
+    environment:
+      - KC_BOOTSTRAP_ADMIN_USERNAME=admin
+      - KC_BOOTSTRAP_ADMIN_PASSWORD=$KEYCLOAK_ADMIN_PASSWORD
+    volumes:
+      - $WORKDIR/keycloak-realm-iceberg.json:/opt/keycloak/data/import/realm.json:ro
+    command:
+      - start-dev
+      - --health-enabled=true
+      - --metrics-enabled=true
+      - --import-realm
+      - --log-level=INFO
+    ports:
+      - "8080:8080"
+    # /dev/tcp probe against the IMPORTED realm (not "master"): gates dependents on realm-import
+    # completion, not just on Keycloak booting. No curl in the Keycloak image; the bundled shell
+    # supports /dev/tcp. This is the documented realm-import probe the local compose file needed
+    # to get the ordering right (task 1.5's requirement).
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'exec 3<>/dev/tcp/127.0.0.1/8080;echo -e "GET /realms/$OIDC_REALM/.well-known/openid-configuration HTTP/1.1\r\nhost: 127.0.0.1:8080\r\nConnection: close\r\n\r\n" >&3;grep "jwks_uri" <&3',
+        ]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+
+  # Run-once schema migration. Not a long-running service: dependents gate on
+  # service_completed_successfully.
+  lakekeeper-migrate:
+    image: "$LAKEKEEPER_IMAGE"
+    entrypoint: ["/home/nonroot/lakekeeper", "migrate"]
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=$METADATA_ENCRYPTION_KEY
+      - LAKEKEEPER__PG_DATABASE_URL_READ=$PG_URL
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=$PG_URL
+      - RUST_LOG=info
+    restart: "no"
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+
+  lakekeeper:
+    image: "$LAKEKEEPER_IMAGE"
+    command: ["serve"]
+    environment:
+      - LAKEKEEPER__PG_ENCRYPTION_KEY=$METADATA_ENCRYPTION_KEY
+      - LAKEKEEPER__PG_DATABASE_URL_READ=$PG_URL
+      - LAKEKEEPER__PG_DATABASE_URL_WRITE=$PG_URL
+      - LAKEKEEPER__OPENID_PROVIDER_URI=http://$PRIVATE_IPV4:8080/realms/$OIDC_REALM
+      - LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS=http://$PUBLIC_IPV4:8080/realms/$OIDC_REALM
+      - LAKEKEEPER__OPENID_AUDIENCE=$OIDC_AUDIENCE
+      - RUST_LOG=info,lakekeeper=info
+    # Built-in healthcheck subcommand — the image is distroless (no curl/wget).
+    healthcheck:
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+      lakekeeper-db:
+        condition: service_healthy
+      keycloak:
+        condition: service_healthy
+    ports:
+      - "8181:8181"
+COMPOSE
+
+echo "==> rendered $WORKDIR/docker-compose.yml"
+
+cd "$WORKDIR"
+if ! docker compose up -d --wait; then
+  echo "FATAL: docker compose up --wait did not reach healthy (docker compose ps for detail)" >&2
+  exit 1
+fi
+
+echo "==> lakekeeper stack up and healthy (keycloak realm '$OIDC_REALM' imported, lakekeeper serving)"

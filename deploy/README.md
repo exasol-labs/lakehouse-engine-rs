@@ -88,8 +88,9 @@ make bench       # builds .so, installs SLC + .so to BucketFS, runs Q1–Q4, wri
 Athena benchmark (same catalog): `bench/athena_compare.sh` runs the Q1-Q4 set against the
 `spot-strata-<env>-athena` workgroup automatically (see `bench/README.md`); no infra to stand up.
 
-> **Quick path (recommended):** `deploy/scripts/bench-remote.sh <env>` chains steps 2-3-5
-> (`cluster-up.sh` → `secrets.sh` → `make bench` → `cluster-down.sh`) into one command that
+> **Quick path (recommended):** `deploy/scripts/bench-remote.sh <env>` chains the `cluster-stack`
+> `tofu apply` and steps 2-3-5 (`cluster-up.sh` → `secrets.sh` → `make bench` → `cluster-down.sh`)
+> into one command that
 > **always** tears the cluster down — on success, failure, or interrupt — because it installs its
 > teardown trap *before* bringing anything up. Any `BENCH_*`/`LAKEHOUSE_*` env you export (e.g.
 > `BENCH_WITH_DELETES=1`) flows through untouched to `make bench`:
@@ -182,6 +183,110 @@ cd ../.. && bench/spark_compare.sh
 > **One-time prerequisite:** the `spot-strata-deployer` policy needs an added `emr-serverless:*`
 > statement (already in `deploy/iam/deployer-policy.json` as of this PR) — bump the live policy
 > version once per account: see "Updating the policy" in `deploy/iam/SETUP.md`.
+
+## Lakekeeper (ephemeral, opt-in)
+
+A second, opt-in Iceberg REST catalog for the `remote` bench target and for live demos, selected by
+`BENCH_CATALOG=lakekeeper` (default `glue`). `deploy/lakekeeper-stack/` is a separate OpenTofu stack,
+layered on the persistent `data-stack`, that stands up one EC2 box running PostgreSQL + Keycloak +
+Lakekeeper migrate + Lakekeeper — the same four-service set as `docker-compose.lakekeeper.yml`.
+`deploy/scripts/lakekeeper-provision.sh` then registers every already-cataloged TPC-H Iceberg table into it BY
+REFERENCE — no data rewrite, no second physical copy of the data. Glue is unaffected: with
+`BENCH_CATALOG` unset, every existing required variable, catalog URI, CONNECTION password, virtual-schema property, query set, and row count stays exactly as it is today.
+
+`secrets.sh` and `make bench` additionally require an applied `cluster-stack` plus a completed
+`cluster-up.sh <env>` (§ "2. Test cluster" above) — see the Demo runbook below for the full
+ordered sequence.
+
+```bash
+cd deploy/lakekeeper-stack && tofu init && cd ../..   # one-time
+AWS_PROFILE=spot-strata-deployer deploy/scripts/lakekeeper-up.sh myenv   # apply + provision
+deploy/scripts/secrets.sh myenv                                         # adds the Lakekeeper block to bench/.env
+BENCH_CATALOG=lakekeeper make bench
+deploy/scripts/lakekeeper-down.sh myenv                                 # destroy it — see cost note below
+```
+
+> **Cost / teardown: this EC2 box bills while it exists.** It is created ONLY by an explicit
+> `lakekeeper-up.sh` run — nothing else applies this stack — and MUST be torn down immediately after
+> the benchmark run or demo with `lakekeeper-down.sh <env>`. There is no auto-stop. Verify via
+> `aws ec2 describe-instances` that the instance actually terminated before considering a run done.
+
+### `bench-remote.sh`'s teardown trap cuts both ways
+
+`deploy/scripts/bench-remote.sh` installs `trap teardown EXIT`, and that trap's relationship to the
+Lakekeeper stack runs in two directions — both matter, and neither is the other:
+
+- **It does NOT cover the Lakekeeper stack.** The trap only knows about the Exasol `cluster-stack` —
+  the same relationship `deploy/trino-stack` already has to this wrapper. `lakekeeper-down.sh <env>`
+  is always a separate, mandatory step, regardless of which sequence below stood the demo up.
+- **It DOES cover the Exasol cluster, and this is the direction that ends a demo by surprise.**
+  Unless `KEEP_ALIVE=1` was exported, the trap runs `cluster-down.sh <env>` on **every** exit path —
+  success, failure, or interrupt — which destroys the Exasol cluster carrying the CONNECTION and the
+  virtual schema a Lakekeeper run just built. **A default `bench-remote.sh <env>` run therefore ENDS
+  the demo it just set up.** The runbook below gives the two sequences that survive it.
+
+### Demo runbook
+
+See `DEMO.md` for the presenter-facing companion to this operational reference — a standalone,
+copy-pasteable script for running the demo live.
+
+A live customer demo and the automated benchmark share one stack, one provisioning path, one
+warehouse, one namespace, and one virtual schema — the difference is entirely in who issues the
+commands afterwards, not in what the tooling does. Two sequences survive the trap above; the bare
+wrapper (`bench-remote.sh <env>` with no `KEEP_ALIVE`) is neither of them and ends the demo.
+
+Both sequences below MUST carry `BENCH_CATALOG=lakekeeper` **explicitly**: `bench/run.sh` defaults to
+`glue`, and the wrapper passes every caller-exported `BENCH_*`/`LAKEHOUSE_*` variable through
+untouched, so omitting it silently demonstrates Glue at a live customer session. Both sequences MUST
+also run `lakekeeper-up.sh <env>` **before** `secrets.sh <env>` runs — including the `secrets.sh` call
+the wrapper makes internally at its step `[3/4]` — because `secrets.sh` emits the Lakekeeper block
+into `bench/.env` only while a Lakekeeper stack workspace exists for that environment.
+
+**Wrapper form** (default path). `bench-remote.sh` performs the `cluster-stack` `tofu apply`,
+`cluster-up.sh`, `secrets.sh`, and `make bench` itself, at its steps `[1/4]`–`[4/4]`:
+
+```bash
+AWS_PROFILE=spot-strata-deployer deploy/scripts/lakekeeper-up.sh myenv
+AWS_PROFILE=spot-strata-deployer BENCH_CATALOG=lakekeeper KEEP_ALIVE=1 deploy/scripts/bench-remote.sh myenv
+```
+
+**Unwrapped form** (fine-grained control). `cluster-up.sh` runs c4 against nodes an apply already
+created, so the sequence cannot start there — it starts with the `cluster-stack` apply from § "2.
+Test cluster" above:
+
+```bash
+cd deploy/cluster-stack
+tofu workspace new myenv   # or: tofu workspace select myenv
+tofu apply -var env_name=myenv -var key_pair_name=spot-strata-key
+cd ../..
+
+AWS_PROFILE=spot-strata-deployer deploy/scripts/lakekeeper-up.sh myenv
+AWS_PROFILE=spot-strata-deployer deploy/scripts/cluster-up.sh myenv
+AWS_PROFILE=spot-strata-deployer deploy/scripts/secrets.sh myenv
+BENCH_CATALOG=lakekeeper make bench
+```
+
+Either sequence leaves the CONNECTION and the `TPCH` virtual schema in place and queryable
+afterwards: `bench/run.sh` drops and recreates the virtual schema as one pair at the START of a run
+and never at the end, so the schema a benchmark run leaves behind IS the demo's query surface.
+Continue straight into the interactive tail from a SQL client connected to `EXASOL_HOST`/
+`LH_EXASOL_PORT` (from the just-written `bench/.env`):
+
+```sql
+SELECT COUNT(*) FROM TPCH.LINEITEM;
+-- ... any ad-hoc TPC-H query against TPCH.* ...
+```
+
+`./bench/run.sh selftest`'s `vs_teardown_is_recreate_only` check guards this invariant, but only as a
+source-text check over `bench/run.sh` itself — it cannot see `bench-remote.sh`'s EXIT trap, so a
+green result is evidence the harness's OWN teardown timing is correct, and MUST NOT be read as
+evidence that an operator-level run left the demo surface behind. Close every demo with both teardown
+commands, regardless of which form stood it up:
+
+```bash
+AWS_PROFILE=spot-strata-deployer deploy/scripts/cluster-down.sh myenv
+AWS_PROFILE=spot-strata-deployer deploy/scripts/lakekeeper-down.sh myenv
+```
 
 ## 5. Tear down
 
@@ -276,22 +381,59 @@ Two paths, by what the teammate actually needs:
   --application-id <id>` (poll `get-application` for `STOPPED`) before re-applying. Found
   live-verifying — the app costs nothing while `STARTED`-but-idle, so this only blocks the
   Terraform operation, not billing.
+- **Lakekeeper's storage credential uses static keys, not vended/STS credentials.** The warehouse's
+  write-capable AWS access key id and secret access key are a static pair (`deploy/lakekeeper-stack`),
+  matching the same upgrade seam the Glue path's `engine-reader` key pair already has above. Upgrade
+  path: teach the storage credential the default credential chain or Lakekeeper's vended-credentials
+  support.
+- **The Lakekeeper OAuth2 client secret is committed to this repository.** `scripts/keycloak-realm-iceberg.json`'s client secret ships as-is to the AWS box; the stack does not overwrite it, because
+  the CONNECTION contract `e2e-harness/lakekeeper-e2e-harness` already proves is defined by that exact
+  file. Its only control is the security group's `/32` allowlist.
+- **The catalog's storage credential grants object put/get/delete plus bucket list across the WHOLE
+  `data-stack` bucket**, not scoped to the warehouse's own key prefix — that prefix only exists after
+  `lakekeeper-provision.sh` reads the source catalog at provisioning time, after the stack has already
+  applied its IAM policy. Compensating controls, from strongest to weakest: `lakekeeper-provision.sh`
+  contains no destructive verb of any kind (`deploy/scripts/tests/lakekeeper.test.sh` scans its source
+  text for one); the warehouse's `delete-profile` is the SOFT profile, a one-week delay window rather
+  than a guarantee — a `force` drop or a purge-drop still removes files; the credential is created and
+  destroyed with the ephemeral stack; and the Exasol CONNECTION itself keeps the read-only
+  `engine-reader` key pair, so the query path never holds write access.
+- **Lakekeeper and Keycloak are reached over plain HTTP, from both vantages — provisioning traffic is
+  cleartext.** A public-vantage `lakekeeper-up.sh` / `lakekeeper-provision.sh` run sends the OAuth2
+  client secret, the resulting bearer token, and the warehouse's write-capable S3 access key id and
+  secret access key over the public internet in the clear, to the box's public IP. EVERY deployment
+  carries at least one such run: `lakekeeper-up.sh` is an operator-machine script in both the
+  benchmark and demo contexts and always provisions, so the in-VPC vantage avoids this hop only for
+  the optional re-provision case, never for the first, mandatory one. The security-group `/32`
+  allowlist (`allowed_cidrs`, defaulting to the apply machine's own resolved public IP) is the
+  practical control here, and it is a REACHABILITY control only — it bounds WHO CAN REACH the
+  plaintext port, but it neither encrypts the traffic nor stops an observer on the network path
+  between an already-allowlisted client and the box.
 
 ## Files
 
 ```
 deploy/
+  DEMO.md   # presenter-facing live-demo script (task 6.3)
   iam/{deployer-policy.json, SETUP.md}
   data-stack/{providers,variables,main,outputs}.tf  datagen-userdata.sh.tftpl
     # + EMR Serverless application (enable_emr_serverless, opt-in) for the Spark comparison
   cluster-stack/{providers,variables,main,outputs}.tf
   trino-stack/{providers,variables,main,outputs}.tf  trino-userdata.sh.tftpl
     # ephemeral Trino cluster (coordinator + workers) for the competitive comparison (opt-in)
+  lakekeeper-stack/{providers,variables,locals,main,outputs}.tf  lakekeeper-userdata.sh.tftpl
+    # ephemeral Lakekeeper catalog (postgres + keycloak + lakekeeper) for BENCH_CATALOG=lakekeeper (opt-in)
   scripts/{install-prereqs.sh, gen_load.py, cluster-up.sh, cluster-down.sh, secrets.sh,
            trino-up.sh, trino-down.sh, spark_queries.py,
+           lakekeeper-up.sh, lakekeeper-down.sh, lakekeeper-provision.sh,
+             # apply+register / destroy the Lakekeeper stack; the provisioning script also runs
+             # standalone, unchanged, from an operator's laptop or from an in-VPC EC2 box
            bench-remote.sh,             # cluster-up -> secrets -> make bench -> cluster-down, one command
            make_deletes_remote.py, make-deletes-remote.sh,  # one-time remote delete-prep (BENCH_WITH_DELETES)
-           rotate-cluster-key.sh}       # seed/rotate the shared cluster SSH key in SSM (issue #89)
+           rotate-cluster-key.sh,       # seed/rotate the shared cluster SSH key in SSM (issue #89)
+           tests/lakekeeper.test.sh, tests/lakekeeper-local.test.sh}
+             # offline stubbed-PATH harness + local Docker integration verification (make
+             # test-lakekeeper-scripts / test-lakekeeper-local)
 ```
 
 Related, outside `deploy/` (documented in `bench/README.md`'s "Delete-bearing benchmark" section):
