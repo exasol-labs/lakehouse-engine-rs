@@ -15,6 +15,7 @@ use futures::StreamExt;
 use crate::scan::convert::arrow_value_at;
 use crate::scan::emit::classify_scan_error;
 use crate::scan::spec::{AggregatePlan, PartialAggColumn, ScanSpec, partial_column_name};
+use crate::scan::storage_ref::ResolvedScanStorage;
 
 use super::raw_scan::register_files;
 use super::sql_support::{build_alias_items, quote_ident};
@@ -30,10 +31,11 @@ use super::sql_support::{build_alias_items, quote_ident};
 async fn register_aliased_scan_target(
     session_ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<String, UdfError> {
     // Register the assigned files so we can query them.
     let table_name = "scan_target";
-    register_files(session_ctx, table_name, spec).await?;
+    register_files(session_ctx, table_name, spec, storage).await?;
 
     // Build the alias inner SELECT (uppercase column names).
     let table = session_ctx
@@ -55,26 +57,31 @@ async fn register_aliased_scan_target(
 ///
 /// The column layout follows the COLUMN CONTRACT (see `build_partial_agg_sql`
 /// and `build_grouped_partial_agg_sql`).
+///
+/// The redaction secret set comes from `storage` — the RESOLVED backends — never
+/// from the spec, whose `storage` field names a CONNECTION rather than carrying a
+/// credential.
 pub(super) async fn run_partial_aggregate(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<(), UdfError> {
     // Dispatch: grouped path when group_keys is Some and non-empty.
     if let Some(group_keys) = &spec.common.group_keys
         && !group_keys.is_empty()
     {
-        return run_grouped_partial_aggregate(ctx, session_ctx, spec).await;
+        return run_grouped_partial_aggregate(ctx, session_ctx, spec, storage).await;
     }
 
-    let secrets = spec.common.storage.secret_values();
+    let secrets = storage.all_secret_values();
     let aggregates = spec
         .common
         .aggregates
         .as_deref()
         .expect("run_partial_aggregate called without aggregates");
 
-    let aliased_table = register_aliased_scan_target(session_ctx, spec).await?;
+    let aliased_table = register_aliased_scan_target(session_ctx, spec, storage).await?;
 
     let sql =
         build_partial_agg_sql_filtered(aggregates, &aliased_table, spec.common.filter.as_deref());
@@ -121,8 +128,9 @@ async fn run_grouped_partial_aggregate(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<(), UdfError> {
-    let secrets = spec.common.storage.secret_values();
+    let secrets = storage.all_secret_values();
     let group_keys = spec
         .common
         .group_keys
@@ -134,7 +142,7 @@ async fn run_grouped_partial_aggregate(
         .as_deref()
         .expect("run_grouped_partial_aggregate called without aggregates");
 
-    let aliased_table = register_aliased_scan_target(session_ctx, spec).await?;
+    let aliased_table = register_aliased_scan_target(session_ctx, spec, storage).await?;
 
     let sql = build_grouped_partial_agg_sql(
         group_keys,

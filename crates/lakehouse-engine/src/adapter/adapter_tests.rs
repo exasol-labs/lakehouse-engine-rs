@@ -1883,3 +1883,176 @@ fn resolve_s3_max_connections_auto_zero_cores_defaults() {
         "0-cores fallback ignores the instance share"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The sealing key `resolve_connection_config` derives, and the predicate gating it
+// ---------------------------------------------------------------------------
+
+/// Stub `UdfContext` resolving ONE CONNECTION whose password each case supplies,
+/// so `resolve_connection_config` can be driven over an arbitrary password shape.
+struct PasswordCtx(String);
+
+impl UdfContext for PasswordCtx {
+    fn num_columns(&self) -> usize {
+        0
+    }
+    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
+        Err(UdfError::Type("none".into()))
+    }
+    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
+        Ok(())
+    }
+    fn next(&mut self) -> Result<bool, UdfError> {
+        Ok(false)
+    }
+    fn connection(
+        &self,
+        _name: &str,
+    ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
+        Ok(exasol_udf_sdk::connect_back::ConnectionObject {
+            kind: "PASSWORD".into(),
+            address: "http://catalog.example.com".into(),
+            user: String::new(),
+            password: self.0.clone(),
+        })
+    }
+}
+
+/// Resolve a configuration from a CONNECTION carrying `password`. The properties
+/// are the minimum `resolve_connection_config` reads: the CONNECTION's name.
+fn resolved_for(password: Json) -> ResolvedConnectionConfig {
+    resolve_connection_config(
+        &PasswordCtx(password.to_string()),
+        &serde_json::json!({"CATALOG_CONNECTION": "MY_CONN"}),
+    )
+    .expect("the fixture password must be an acceptable CONNECTION")
+}
+
+/// The resolved configuration carries the CONNECTION's own NAME, which is what
+/// the scan spec references in place of the credential it used to carry.
+#[test]
+fn resolved_config_carries_the_catalog_connection_name() {
+    let config = resolved_for(serde_json::json!({
+        "warehouse": "wh",
+        "region": "us-east-1",
+        "access_key": "AK",
+        "secret_key": "SK",
+    }));
+    assert_eq!(
+        config.connection_name, "MY_CONN",
+        "the resolved configuration must carry the CATALOG_CONNECTION name verbatim"
+    );
+}
+
+/// A CONNECTION password carrying none of the six secret-bearing fields yields NO
+/// sealing key, so the vended envelope's guarantee cannot be claimed for it.
+///
+/// The `connection_name` assertion is the positive control: without it, an
+/// absent key would also be satisfied by a configuration that failed to resolve.
+#[test]
+fn sealing_key_is_absent_for_a_password_carrying_no_secret_field() {
+    let config = resolved_for(serde_json::json!({"warehouse": "wh"}));
+    assert_eq!(
+        config.connection_name, "MY_CONN",
+        "positive control: the configuration must actually have resolved"
+    );
+    assert!(
+        config.sealed_storage_key.is_none(),
+        "a password holding only a warehouse carries no key material"
+    );
+}
+
+/// Each of the six secret-bearing fields, carried non-empty in its own smallest
+/// ACCEPTABLE CONNECTION shape, yields a sealing key.
+///
+/// The shapes are minimal but not arbitrary: `validate_creds` rejects a
+/// `client_secret` without its `client_id`, an Azure credential without its
+/// `account_name`, and `use_sigv4` without `access_key`/`secret_key`/`region`, so
+/// each case supplies exactly the fields its own field requires and no more.
+#[test]
+fn sealing_key_is_present_for_each_non_empty_secret_field() {
+    let cases = [
+        (
+            "token",
+            serde_json::json!({"warehouse": "wh", "token": "T"}),
+        ),
+        (
+            "client_secret",
+            serde_json::json!({"warehouse": "wh", "client_id": "CID", "client_secret": "CS"}),
+        ),
+        (
+            "secret_key under use_sigv4",
+            serde_json::json!({
+                "warehouse": "wh", "region": "us-east-1",
+                "access_key": "AK", "secret_key": "SK", "use_sigv4": true,
+            }),
+        ),
+        (
+            // The installer's own default template shape: a static storage
+            // secret under a no-auth catalog.
+            "static secret_key with no use_sigv4",
+            serde_json::json!({
+                "warehouse": "wh", "region": "us-east-1",
+                "access_key": "AK", "secret_key": "SK",
+            }),
+        ),
+        (
+            "account_key",
+            serde_json::json!({"warehouse": "wh", "account_name": "acct", "account_key": "AKEY"}),
+        ),
+        (
+            "sas_token",
+            serde_json::json!({"warehouse": "wh", "account_name": "acct", "sas_token": "SAS"}),
+        ),
+    ];
+    for (field, password) in cases {
+        let config = resolved_for(password);
+        assert!(
+            config.sealed_storage_key.is_some(),
+            "a non-empty {field} must derive a sealing key"
+        );
+    }
+}
+
+/// All six secret-bearing fields PRESENT but EMPTY yield no sealing key: the gate
+/// tests non-emptiness, so an empty field is an absent one.
+#[test]
+fn sealing_key_is_absent_when_every_secret_field_is_present_but_empty() {
+    let config = resolved_for(serde_json::json!({
+        "warehouse": "wh",
+        "token": "",
+        "client_secret": "",
+        "secret_key": "",
+        "session_token": "",
+        "account_key": "",
+        "sas_token": "",
+    }));
+    assert_eq!(
+        config.connection_name, "MY_CONN",
+        "positive control: the configuration must actually have resolved"
+    );
+    assert!(
+        config.sealed_storage_key.is_none(),
+        "six present-but-empty secret fields carry no key material"
+    );
+}
+
+/// A non-empty `access_key` with no `secret_key` yields no sealing key: an AWS
+/// access key id is an IDENTIFIER, not a secret, so it cannot carry the
+/// envelope's guarantee on its own.
+#[test]
+fn sealing_key_is_absent_for_an_access_key_without_a_secret_key() {
+    let config = resolved_for(serde_json::json!({
+        "warehouse": "wh",
+        "region": "us-east-1",
+        "access_key": "AKIAEXAMPLE",
+    }));
+    assert_eq!(
+        config.connection_name, "MY_CONN",
+        "positive control: the configuration must actually have resolved"
+    );
+    assert!(
+        config.sealed_storage_key.is_none(),
+        "an access key id alone is an identifier, not key material"
+    );
+}

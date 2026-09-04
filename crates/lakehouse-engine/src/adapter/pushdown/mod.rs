@@ -9,9 +9,12 @@
 //!   the spec. There is no Exasol-side fallback to defer to — see CLAUDE.md
 //!   § "Virtual Schema pushdown delegation" and `specs/_decision/045`.
 //! - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
-//! - Catalog/connection auth credentials (OAuth token, bearer, etc.) NEVER appear
-//!   in any returned SQL string or error message. Storage (S3) credentials are a
-//!   documented exception — see `handle_pushdown`'s doc comment.
+//! - Neither catalog/connection auth credentials (OAuth token, bearer, etc.) nor
+//!   storage credential VALUES appear in any returned SQL string or error message.
+//!   A static storage credential travels as a `ScanStorage::Connection` name; a
+//!   vended one travels only as an AES-GCM `ScanStorage::Sealed` envelope. See
+//!   `vs-adapter/scan-spec-credential-reference` and `handle_pushdown`'s own doc
+//!   comment.
 
 use crate::adapter::ResolvedConnectionConfig;
 #[cfg(test)]
@@ -20,7 +23,7 @@ use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::spec::{
     CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem,
-    ScanSpec, StorageBackend,
+    ScanSpec, ScanStorage,
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -29,7 +32,7 @@ mod support;
 pub use support::{AggregateMergeInputs, build_fan_out_inner, build_scan_driving_sql, shard_count};
 use support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, classify_where_filter, extract_all_column_types,
-    extract_limit, extract_projection, order_by_present, strip_table_alias,
+    extract_limit, extract_projection, order_by_present, scan_storage_for, strip_table_alias,
 };
 
 mod empty_result;
@@ -85,7 +88,7 @@ use joins::{
 };
 
 #[cfg(test)]
-use crate::scan::spec::{AggKind, AggregatePlan};
+use crate::scan::spec::{AggKind, AggregatePlan, StorageBackend};
 // The filter pipeline's two halves, imported for the test mirrors that pin their
 // composition; production reaches them through `classify_where_filter`.
 #[cfg(test)]
@@ -125,12 +128,22 @@ mod dispatch_golden;
 ///
 /// Returns JSON `{"type":"pushdown","sql":"..."}`.
 ///
-/// ponytail: The S3 access/secret/session-token keys are embedded verbatim in the
-/// scan-driving SQL literal (inside the `ScanSpec` JSON), which Exasol may log or
-/// surface in its query profile / audit trail. PoC-accepted tradeoff. The upgrade
-/// path is to pass credentials via a CONNECTION object (referenced by name, never
-/// inlined) or to fetch them over connect-back at scan time so they never appear
-/// in any SQL text. Error paths already redact these values.
+/// No storage credential VALUE appears in that SQL, under either credential
+/// shape (#135 and #378, both closed):
+///
+/// * A STATIC credential is referenced, never carried: the scan-driving spec's
+///   `storage` value is `{"connection":{"name":…}}`, and the scan UDF resolves
+///   that name through its own grant-gated `ctx.connection()` read.
+/// * A VENDED credential has no name to reference — the catalog mints it per
+///   query — so it travels only inside an AES-256-GCM envelope whose key is
+///   derived (HKDF-SHA256) from the same CONNECTION's password. The wire value
+///   is `{"sealed":{"name":…,"payload":…}}`; the scan derives the key from the
+///   password it reads for `name` and opens it.
+///
+/// Both contracts are specified in `vs-adapter/scan-spec-credential-reference`.
+/// `scan_storage_for` is the one function that selects between them, and it can
+/// never emit an inline backend; vending without derivable key material is
+/// REFUSED at plan time rather than shipped under a weakened envelope.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_pushdown(
     request: &Json,
@@ -169,11 +182,7 @@ pub async fn handle_pushdown(
                 request,
                 &pushdown_req,
                 &join,
-                &conn.catalog_uri,
-                conn.catalog_kind,
-                &conn.storage,
-                &conn.creds,
-                conn.allow_http,
+                conn,
                 scan_schema,
                 cluster_nodes,
                 parallelism_factor,
@@ -246,7 +255,19 @@ pub async fn handle_pushdown(
         partition_columns,
         refused_columns,
     } = resolver.resolve(&catalog.table, filter_json_raw).await?;
-    let storage = &effective_storage;
+    // The wire storage, chosen ONCE per request by the single variant-selection
+    // function: a CONNECTION reference for a static credential, a sealed
+    // envelope for a vended one, and a named refusal for a vended one whose
+    // CONNECTION password carries no key material. `effective_storage` itself
+    // stays the plan-time value the format readers already used for their own
+    // manifest and log reads; only what crosses the wire changes.
+    let scan_storage = scan_storage_for(
+        &conn.creds,
+        &conn.connection_name,
+        conn.allow_http,
+        &effective_storage,
+        conn.sealed_storage_key.as_ref(),
+    )?;
 
     // BEFORE the zero-active-files early return: a table with no active file must
     // still refuse a request naming a column it cannot render, never answer that
@@ -299,7 +320,7 @@ pub async fn handle_pushdown(
         logical_schema,
         name_mapping,
         partition_columns,
-        storage,
+        &scan_storage,
         &udf_name,
         &distribute_udf_name,
         df_target_partitions,
@@ -346,7 +367,7 @@ pub(crate) fn build_dispatch_sql(
     logical_schema: Vec<LogicalField>,
     name_mapping: Vec<NameMappingEntry>,
     partition_columns: Vec<String>,
-    storage: &StorageBackend,
+    scan_storage: &ScanStorage,
     udf_name: &str,
     distribute_udf_name: &str,
     df_target_partitions: usize,
@@ -376,7 +397,7 @@ pub(crate) fn build_dispatch_sql(
         name_mapping: name_mapping.clone(),
         join: None,
         partition_columns,
-        storage: storage.clone(),
+        storage: scan_storage.clone(),
         df_target_partitions,
         df_batch_size,
         df_threads_per_udf,

@@ -17,7 +17,7 @@ column JSON rendering, and EMITS-type coercion — is owned by
 ## Background
 
 * Only serialized bytes cross the `.so` boundary — VARCHAR JSON arguments in, Arrow IPC bytes out; no typed Arrow value ever crosses it.
-* The scan UDF receives two VARCHAR JSON arguments per input row: `common` (shard-invariant: projection, filter, limit, aggregates, group keys, logical schema, EMITS types, storage credentials, the table root, and tuning knobs) and `files` (this shard's assigned `(path, size)` entries). It merges them into one `ScanSpec` before running; see `datafusion-scan/scan-execution-spec-reconstitution` for the reconstitution and malformed-input scenarios.
+* The scan UDF receives two VARCHAR JSON arguments per input row: `common` (shard-invariant: projection, filter, limit, aggregates, group keys, logical schema, EMITS types, a storage reference the UDF resolves itself, the table root, and tuning knobs) and `files` (this shard's assigned `(path, size)` entries). It merges them into one `ScanSpec` before running; see `datafusion-scan/scan-execution-spec-reconstitution` for the reconstitution and malformed-input scenarios.
 * The UDF MUST register only its assigned files and MUST NOT discover additional files.
 * Per-file metadata construction (no per-file `HEAD`) and relative/absolute path resolution
   against the table root are covered by `datafusion-scan/scan-execution-file-metadata`.
@@ -86,7 +86,7 @@ column JSON rendering, and EMITS-type coercion — is owned by
 
 ### Scenario: Scan registers only its assigned files and returns matching rows
 
-* *GIVEN* a scan input row carrying TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical schema, projection, filter, limit, storage credentials, the table root, and tuning knobs) and a per-shard files argument listing specific Parquet data files in MinIO, each optionally carrying its associated positional-delete file references
+* *GIVEN* a scan input row carrying TWO VARCHAR arguments — a shard-invariant common spec argument (carrying the logical schema, projection, filter, limit, a storage credential reference or a sealed vended storage envelope, the table root, and tuning knobs) and a per-shard files argument listing specific Parquet data files in MinIO, each optionally carrying its associated positional-delete file references
 * *AND* a projection naming a subset of columns
 * *WHEN* the scan UDF processes that input row
 * *THEN* the UDF SHALL read the common spec from the first input argument and the file list from the second, and reconstitute a single scan spec whose files (and their delete references) come from the second argument and whose every other field comes from the first (only serialized bytes crossing the `.so` boundary — both arguments are VARCHAR JSON)

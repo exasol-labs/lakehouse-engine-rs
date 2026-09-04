@@ -9,6 +9,8 @@
 //! Host-runnable: writes a local Parquet file and inspects the displayable
 //! physical plan the production raw-scan path builds.
 
+mod scan_fixture;
+
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray, StringViewArray};
@@ -24,11 +26,12 @@ use lakehouse_engine::adapter::pushdown::{
 };
 use lakehouse_engine::scan::spec::{
     AggKind, CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, ProjectionItem,
-    ScanSpec, SortKey, StorageBackend, StorageProps,
+    ScanSpec, ScanStorage, SortKey, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, session_config_for_spec,
 };
+
 use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
@@ -66,14 +69,14 @@ fn single_partition_spec(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some(r#""ID" >= 10"#.into()),
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         },
         files: vec![FileEntry::new(file_url, size)],
@@ -378,14 +381,14 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
                 r#""L_SHIPDATE" >= DATE '1994-01-01' AND "L_SHIPDATE" < DATE '1995-01-01'"#.into(),
             ),
             aggregates: Some(aggregates),
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         },
         files: Vec::new(),
@@ -483,7 +486,7 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
 fn row_scan_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            storage: test_storage(),
+            storage: ScanStorage::Inline(test_storage()),
             ..Default::default()
         },
         files: Vec::new(),
@@ -633,7 +636,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         condition: r#"("C_CUSTKEY" = "O_CUSTKEY")"#.to_string(),
         post_join_limit: None,
         partition_columns: Vec::new(),
-        storage: test_storage(),
+        storage: ScanStorage::Inline(test_storage()),
     };
 
     let spec = ScanSpec {
@@ -645,7 +648,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
             ],
             emit_exa_types: vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
             join: Some(join),
-            storage: test_storage(),
+            storage: ScanStorage::Inline(test_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -867,7 +870,8 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
     // Register the REAL production provider (attaches the access plan), then ask
     // for the exact committed raw-scan pipeline.
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec)
+    let storage = scan_fixture::resolved_storage(&spec);
+    register_files(&ctx, "scan_target", &spec, &storage)
         .await
         .expect("register production positional-delete provider");
     let plan = build_raw_scan_physical_plan(&ctx, &spec)

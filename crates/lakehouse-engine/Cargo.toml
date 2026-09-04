@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.42.0"
+version = "0.43.0"
 edition = "2024"
 license.workspace = true
 
@@ -83,6 +83,21 @@ url     = { workspace = true }
 # subscriber machinery crosses into the .so.
 tracing = { version = "0.1", default-features = false }
 
+# The sealed vended-credential envelope (`scan::sealed`): this crate's only direct
+# use of cryptographic primitives. A vended storage credential has no CONNECTION
+# name to reference, so it crosses the one pushdown `sql` field as AES-256-GCM
+# ciphertext under a key HKDF-SHA256-derived from the same CONNECTION's password.
+# `aes-gcm` and `sha2` were already in the lock file transitively (via `iceberg`);
+# `hkdf` is the one crate new to the tree.
+aes-gcm = "0.10"
+hkdf    = "0.12"
+sha2    = "0.10"
+# Promoted out of [dev-dependencies]: `base64` encodes the envelope's wire form and
+# `rand::rngs::OsRng` draws its fresh per-encryption 96-bit nonce (it implements the
+# `rand_core` 0.6 traits `aes-gcm` 0.10 consumes).
+base64  = "0.22"
+rand    = "0.8"
+
 [dev-dependencies]
 # time: forces deterministic overlap in concurrency-bound tests. net + io-util: the
 # loopback catalog fake in file_resolution.rs's unit tests. Declared directly rather
@@ -110,7 +125,5 @@ azure_core          = "1.1"
 tungstenite         = { version = "0.29.0", features = ["native-tls"] }
 native-tls          = "0.2"
 rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }
-base64              = "0.22"
-rand                = "0.8"
 futures             = { workspace = true }
 anyhow              = { workspace = true }

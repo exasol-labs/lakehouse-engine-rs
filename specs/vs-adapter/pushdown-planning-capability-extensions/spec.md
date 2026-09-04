@@ -11,7 +11,9 @@ records why no faithful translation exists. Ordered-sort-key capability advertis
 `vs-adapter/pushdown-planning-order-by-capability`. Related capability-driven extensions —
 scalar select-list expression pushdown, HAVING pushdown, statistical aggregates, and literal
 projection — live in their own sibling features too (see the "See also" note at the end of
-the Background).
+the Background). The credential-exposure guarantee for a request exercising one of this
+feature's extended capabilities is specified by the sibling feature
+`vs-adapter/pushdown-planning-capability-extensions-credential-reference`.
 
 ## Background
 
@@ -19,7 +21,6 @@ the Background).
   the DataFusion 54 result matches Exasol. `FN_CAST`, `FN_NEG`, and `FN_WEEK` meet this bar;
   `FN_DIV`, `FN_TO_CHAR`, `FN_TO_NUMBER`, the regexp scalar functions, the divergent date
   functions, and the bitwise operator functions do not and stay unadvertised.
-* Credentials MUST NOT appear in any returned SQL or error message.
 * Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
   spec (https://iceberg.apache.org/spec/) rather than from memory: the normative sections
   that could bear on this change are the ones governing what a reader must resolve —

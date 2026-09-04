@@ -91,7 +91,7 @@ decline paths narrow identically.
   routes to; it reads no manifest, resolves no snapshot or field id, applies no delete, and
   maps no type. No normative requirement applies, so there is no deviation to fix and none
   to track.
-* Credentials MUST NOT appear in any returned SQL or error message.
+* A CONNECTION-supplied storage credential is carried as a connection REFERENCE and MUST NOT appear in any returned SQL. A VENDED storage credential appears in a returned SQL string ONLY inside the AES-GCM-sealed envelope of `vs-adapter/scan-spec-credential-reference` — issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), CLOSED by that feature — never in plaintext. No credential of either kind appears in an error message.
 
 ## Scenarios
 
@@ -132,3 +132,11 @@ decline paths narrow identically.
 * *AND* because the shape decision is owned by that one classifier, the fully-pruned zero-row path SHALL return the wrapper-shaped typed empty result for the same request, never an error
 * *AND* the returned result SHALL equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
 * *AND* this route SHALL be recorded as a deliberate, named trade rather than an unstated gap: the request loses partial/merge decomposition and materializes its referenced columns through Exasol, which is why an aggregate the select list ALREADY carries keeps the partial/merge path per the scenario above; a bounded partial/merge variant for the not-selected case is tracked as future work, `(#249)`
+
+### Scenario: The grouped-aggregate wrapper fallback's generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a GROUP BY request served by the qualified wrapper fallback rather than by partial/merge decomposition, over a virtual schema whose CONNECTION supplies static storage credentials and does not enable `use_vended_credentials`
+* *WHEN* the adapter renders the scan-driving SQL for that request
+* *THEN* the returned SQL string MUST NOT contain the CONNECTION's `access_key`, `secret_key`, `session_token`, `account_key`, or `sas_token` value in any encoding, because the shard-invariant common scan-spec argument carries a connection REFERENCE under `vs-adapter/scan-spec-credential-reference`
+* *AND* the same request with `use_vended_credentials` enabled SHALL carry the vended credential ONLY inside the sealed envelope `vs-adapter/scan-spec-credential-reference` specifies — issue #378, closed by this plan — so no credential value appears in PLAINTEXT in that SQL under either setting
+* *AND* no credential value of either kind SHALL appear in any error message this feature's path raises

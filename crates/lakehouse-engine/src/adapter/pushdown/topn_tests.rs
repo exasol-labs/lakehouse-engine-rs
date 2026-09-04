@@ -7,7 +7,7 @@ use super::super::support::{
 use super::super::test_support::*;
 use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
 use super::*;
-use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec};
+use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, ScanStorage};
 
 // -----------------------------------------------------------------------
 // Ordered top-N pushdown (B3)
@@ -107,7 +107,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
             order_by,
             aggregates,
             emit_exa_types: proj_types.clone(),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],

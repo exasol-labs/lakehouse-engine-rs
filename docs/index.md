@@ -27,6 +27,7 @@ GROUP BY l_returnflag;
 |-------|----------------|
 | [Install](install.md) | One command installs the engine on any Exasol deployment: SaaS, Exasol AsApp, Docker, or on-premise. It uploads the `.so`, registers the Rust SLC, and creates the scripts. Build-from-source and fully manual paths are covered too, as appendices. |
 | [Catalogs](catalogs.md) | Connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs: CONNECTION objects, credentials, and object-storage access. |
+| [Security](security.md) | The CONNECTION-access privilege model (the grant belongs to the Virtual Schema's OWNER, once per deployment — not to each reader), the recommended role-based pattern, what a `SELECT`-only Virtual Schema user can and cannot read, the sealed vended-credential envelope, and rotation. |
 | [Benchmark](benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
 | [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
@@ -35,7 +36,7 @@ GROUP BY l_returnflag;
 
 ## Start here
 
-- **Deploying for the first time?** Read [Install](install.md). Then read [Catalogs](catalogs.md) to point the VS at your data.
+- **Deploying for the first time?** Read [Install](install.md). Then read [Catalogs](catalogs.md) to point the VS at your data, and [Security](security.md) to grant the adapter and scan scripts access to the CONNECTION safely (on the Virtual Schema's owner, before creating it).
 - **Evaluating the approach?** Read [Architecture](architecture.md) and [Benchmark](benchmark.md).
 - **Tuning a running deployment?** Read [Capabilities](capabilities.md) and [Tuning](tuning.md).
 - **A query does not push down the way you expect?** Read [Debugging pushdown](debugging-pushdown.md).

@@ -11,6 +11,8 @@
 //!
 //! Host-runnable: no S3 / MinIO stack — the scan registers a `file://` Parquet.
 
+mod scan_fixture;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::array::{Int64Array, StringArray};
@@ -23,7 +25,7 @@ use lakehouse_engine::scan::diagnostics::{PhaseTimers, telemetry_file_path};
 use lakehouse_engine::scan::run_raw_scan_with_session;
 use lakehouse_engine::scan::session_config_for_spec;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -135,14 +137,14 @@ fn scan_spec(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -157,9 +159,15 @@ async fn run_scan(spec: &ScanSpec, level: tracing::Level) -> FakeCtx {
     let mut ctx = FakeCtx::new(spec.to_json(), level);
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers)
-        .await
-        .expect("raw scan must succeed");
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        spec,
+        &scan_fixture::resolved_storage(spec),
+        &mut timers,
+    )
+    .await
+    .expect("raw scan must succeed");
     ctx
 }
 
@@ -323,6 +331,7 @@ fn telemetry_failure_never_fails_scan() {
         &mut ctx,
         &session,
         &spec,
+        &scan_fixture::resolved_storage(&spec),
         &mut timers,
     ));
 

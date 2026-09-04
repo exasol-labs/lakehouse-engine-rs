@@ -51,8 +51,11 @@ and no file is scanned twice.
   scans another node's files.
 * The shard-invariant common spec is serialized once as the scalar scan's
   first-argument literal; only each shard's per-file subset flows through the
-  distributor. Credentials MUST NOT appear repeated per shard; they live once in
-  the common spec literal.
+  distributor. The storage-credential REFERENCE — or, under vending, the sealed
+  envelope — MUST NOT appear repeated per shard; it lives once in the common spec
+  literal, and no credential VALUE appears in that literal at all.
+* **The shard cap is why the deferral is affordable and why it is stated here.** The scan UDF now performs one engine-local `ctx.connection()` lookup per shard invocation, and G is capped at 300, so the added cost is bounded by this feature's own cap rather than by the file count.
+* **`vs-adapter/scan-spec-credential-reference` owns the reference contract, the resolution, and the sealed vended envelope that closes #378.** This feature CITES it and restates none of it.
 
 ## Scenarios
 
@@ -109,3 +112,11 @@ and no file is scanned twice.
 * *AND* a scalar EMIT UDF over constant-literal arguments SHALL fire exactly once, so no driving relation is required
 * *AND* the common spec literal SHALL appear exactly once and the file-list literal exactly once
 * *AND* the generated SQL SHALL be behaviourally identical (as an order-independent multiset) to the multi-shard fan-out collapsed to one shard
+
+### Scenario: The shard-invariant literal carries one credential reference for the whole fan-out
+
+* *GIVEN* a pushdown plan whose file list is partitioned into G work-unit shards, over a virtual schema whose CONNECTION supplies static storage credentials and does not enable `use_vended_credentials`
+* *WHEN* the adapter serializes the shard-invariant common spec once as the scalar scan's first-argument literal and flows each shard's per-file subset through the distributor
+* *THEN* the common literal SHALL carry exactly ONE storage reference for the whole fan-out, and the per-shard file subsets MUST NOT carry any storage value, so the reference is not repeated per shard
+* *AND* the credential itself SHALL NOT appear in that literal, superseding the recorded claim that credentials "live once in the common spec literal" — a VENDED credential still does, sealed and never in plaintext, under issue #378 (closed by this plan)
+* *AND* each shard invocation SHALL resolve that one reference ITSELF through `ctx.connection()`, so the resolution count is bounded by G and therefore by this feature's cap of 300 rather than by the file count

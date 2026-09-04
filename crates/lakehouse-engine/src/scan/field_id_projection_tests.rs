@@ -1,6 +1,6 @@
 use super::*;
 use crate::scan::spec::{FileEntry, NameMappingEntry, ScanSpec};
-use crate::scan::test_support::{local_file_size, minimal_spec};
+use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
@@ -975,7 +975,7 @@ async fn field_id_adapter_reads_renamed_column_rows() {
     // Drive the EXACT production path: register_files + build_scan_sql, then
     // collect the resulting rows.
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec)
+    register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed with logical schema");
     let sql = build_scan_sql(&ctx, "scan_target", &spec)
@@ -1104,7 +1104,7 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
     spec.common.projection = vec!["ID".into(), "RATING".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec)
+    register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed");
     let sql = build_scan_sql(&ctx, "scan_target", &spec)

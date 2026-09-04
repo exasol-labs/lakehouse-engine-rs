@@ -15,6 +15,8 @@
 //! - `join_build_side_is_dimension`
 //! - `join_unreadable_file_errors_without_secrets`
 
+mod scan_fixture;
+
 use std::any::Any;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
@@ -30,12 +32,13 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, StorageBackend,
-    StorageProps,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage,
+    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, run_join_scan_with_session, session_config_for_spec,
 };
+
 use parquet::arrow::ArrowWriter;
 
 struct FakeCtx {
@@ -258,9 +261,9 @@ fn join_spec(
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: limit,
                 partition_columns: Vec::new(),
-                storage: dim_storage(),
+                storage: ScanStorage::Inline(dim_storage()),
             }),
-            storage: storage(),
+            storage: ScanStorage::Inline(storage()),
             ..Default::default()
         },
         files: fact_files.into_iter().map(FileEntry::from).collect(),
@@ -274,9 +277,15 @@ fn run_join(spec: &ScanSpec) -> Vec<RecordBatch> {
         let mut ctx = FakeCtx::new();
         let session = SessionContext::new_with_config(session_config_for_spec(spec));
         let mut timers = PhaseTimers::start();
-        run_join_scan_with_session(&mut ctx, &session, spec, &mut timers)
-            .await
-            .expect("join scan must succeed");
+        run_join_scan_with_session(
+            &mut ctx,
+            &session,
+            spec,
+            &scan_fixture::resolved_storage(spec),
+            &mut timers,
+        )
+        .await
+        .expect("join scan must succeed");
         ctx.emitted
     })
 }
@@ -516,9 +525,9 @@ fn each_join_side_materializes_its_own_partition_columns() {
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: None,
                 partition_columns: vec!["c_country".to_string()],
-                storage: dim_storage(),
+                storage: ScanStorage::Inline(dim_storage()),
             }),
-            storage: storage(),
+            storage: ScanStorage::Inline(storage()),
             ..Default::default()
         },
         files: vec![fact_file],
@@ -596,7 +605,7 @@ fn join_limit_bounds_joined_output_not_scanned_input() {
 
     let plan = block_on(async {
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
-        build_join_physical_plan(&session, &spec)
+        build_join_physical_plan(&session, &spec, &scan_fixture::resolved_storage(&spec))
             .await
             .expect("physical plan must build")
     });
@@ -641,7 +650,7 @@ fn join_build_side_is_dimension() {
 
     let plan = block_on(async {
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
-        build_join_physical_plan(&session, &spec)
+        build_join_physical_plan(&session, &spec, &scan_fixture::resolved_storage(&spec))
             .await
             .expect("physical plan must build")
     });
@@ -732,9 +741,15 @@ fn unreadable_join_file_error_redacts_both_sides_credentials() {
         let mut ctx = FakeCtx::new();
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
         let mut timers = PhaseTimers::start();
-        run_join_scan_with_session(&mut ctx, &session, &spec, &mut timers)
-            .await
-            .expect_err("an unreadable dimension file must error")
+        run_join_scan_with_session(
+            &mut ctx,
+            &session,
+            &spec,
+            &scan_fixture::resolved_storage(&spec),
+            &mut timers,
+        )
+        .await
+        .expect_err("an unreadable dimension file must error")
     });
 
     let text = err.to_string();
@@ -849,9 +864,9 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: None,
                 partition_columns: Vec::new(),
-                storage: s3_backend(&dim_endpoint, "DIMSECRETVALUE"),
+                storage: ScanStorage::Inline(s3_backend(&dim_endpoint, "DIMSECRETVALUE")),
             }),
-            storage: s3_backend(&fact_endpoint, "TOPSECRETVALUE"),
+            storage: ScanStorage::Inline(s3_backend(&fact_endpoint, "TOPSECRETVALUE")),
             ..Default::default()
         },
         files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],

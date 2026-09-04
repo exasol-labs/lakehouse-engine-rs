@@ -1,7 +1,7 @@
 use crate::scan::raw_scan::{build_scan_sql, register_files};
 use crate::scan::session_config_for_spec;
 use crate::scan::spec::{FileEntry, LogicalField, ScanSpec};
-use crate::scan::test_support::{local_file_size, minimal_spec};
+use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
     Int16Array, Int32Array, Int64Array, TimestampMicrosecondArray,
@@ -295,7 +295,7 @@ fn parquet_column_types(path: &Path) -> Vec<DataType> {
 /// test is the one `FieldIdExprAdapterFactory` delegates to, not one the test performs.
 async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
     let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
-    register_files(&ctx, "scan_target", spec)
+    register_files(&ctx, "scan_target", spec, &inline_resolved(spec))
         .await
         .expect("register_files must succeed with a logical schema");
     let sql = build_scan_sql(&ctx, "scan_target", spec)

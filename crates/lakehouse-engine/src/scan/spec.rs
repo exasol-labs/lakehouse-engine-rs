@@ -526,6 +526,61 @@ pub struct NameMappingEntry {
     pub field_id: i32,
 }
 
+/// How a scan spec carries the object storage its files are read through: as a
+/// REFERENCE to the Exasol CONNECTION that supplies the credentials, as a SEALED
+/// envelope keyed from that same CONNECTION, or inline.
+///
+/// The pushdown contract leaves the adapter exactly one channel to Exasol — the
+/// single `sql` string of the pushdown response — and `EXPLAIN VIRTUAL` echoes
+/// that string verbatim to any principal that may run the query. So a static
+/// credential travels as `Connection`, a NAME the scan UDF resolves through its
+/// own grant-gated `ctx.connection()` read, and a vended credential — which has
+/// no name to reference — travels as `Sealed`, unreadable without the same
+/// CONNECTION's password.
+///
+/// Externally tagged (serde's default) with lowercase variant keys, never
+/// `untagged`: untagged selects a variant by trial deserialization, which
+/// resolves a malformed or ambiguous payload to whichever variant happens to
+/// parse instead of rejecting it — the wrong failure mode on a credentials path,
+/// and one that would make an unwrapped raw backend indistinguishable from a
+/// deliberate `Inline`.
+///
+/// This type exposes NO secret accessor and NO payload accessor, deliberately.
+/// Every error-redaction feed site in the scan must build its secret set from
+/// the RESOLVED credentials; a `secret_values()` here would compile at each of
+/// those sites while returning nothing for a referenced or sealed credential,
+/// silently disarming redaction instead of failing the build.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanStorage {
+    /// The Exasol CONNECTION the scan resolves its storage credentials from,
+    /// plus the `allow_http` consent gate the backend selection needs. Carries
+    /// no credential and no addressing: re-deriving both from the one CONNECTION
+    /// read keeps a single source for the backend.
+    Connection {
+        /// The CONNECTION's name, as `CATALOG_CONNECTION` named it.
+        name: String,
+        /// The adapter's `ALLOW_HTTP` property value, which the backend
+        /// selection needs and the CONNECTION password does not carry.
+        allow_http: bool,
+    },
+    /// A vended credential, sealed under a key both sides derive from the named
+    /// CONNECTION's password: `payload` is `base64(nonce ‖ AES-256-GCM
+    /// ciphertext)` of the serialized [`StorageBackend`].
+    Sealed {
+        /// The CONNECTION whose password derives the envelope key.
+        name: String,
+        /// `base64(nonce ‖ ciphertext)`. Never plaintext, never a credential.
+        payload: String,
+    },
+    /// A backend carried verbatim.
+    ///
+    /// Host-test spec construction ONLY. The adapter never emits it: the one
+    /// variant-selection function (`adapter::pushdown::support::scan_storage_for`)
+    /// cannot return this variant, so no production path can reach it.
+    Inline(StorageBackend),
+}
+
 /// The kind of join to execute node-locally in the scan UDF.
 ///
 /// This phase supports only `Inner` (inner equi-join); the adapter declines and
@@ -613,9 +668,10 @@ pub struct JoinSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_columns: Vec<String>,
 
-    /// The dimension side's own resolved [`StorageBackend`], distinct from
-    /// `common.storage` (the fact side's). Required — see the struct doc.
-    pub storage: StorageBackend,
+    /// The dimension side's own storage, distinct from `common.storage` (the
+    /// fact side's). Required — see the struct doc. A vended join seals each
+    /// side independently, so the two sides carry two envelopes under one key.
+    pub storage: ScanStorage,
 }
 
 /// Where a Delta deletion vector's bytes live — the closed set of the Delta
@@ -1164,7 +1220,9 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_columns: Vec<String>,
 
-    pub storage: StorageBackend,
+    /// The fact side's storage: a CONNECTION reference, a sealed envelope, or an
+    /// inline backend (host-test construction only). See [`ScanStorage`].
+    pub storage: ScanStorage,
 
     /// DataFusion `target_partitions` for this scan instance.
     #[serde(default = "default_one_usize")]
@@ -1217,25 +1275,6 @@ impl CommonScanSpec {
             )
         })
     }
-
-    /// EVERY secret value that must be stripped from an error this scan surfaces:
-    /// the fact side's credentials unioned with the join's dimension-side
-    /// credentials.
-    ///
-    /// The SINGLE owner of that union rule. Each side is read through its own
-    /// [`StorageBackend`], but an error can be raised by code holding one side's
-    /// store — or a router over both — which structurally cannot assemble a set
-    /// covering a side it never sees. So the union lives here, beside the only two
-    /// fields that carry a credential, and every redaction site reads it from here
-    /// rather than rebuilding it. A second, independently maintained copy is how a
-    /// dimension-side credential leaks through a fact-side-only redaction set.
-    pub fn all_secret_values(&self) -> Vec<&str> {
-        let mut secrets = self.storage.secret_values();
-        if let Some(join) = &self.join {
-            secrets.extend(join.storage.secret_values());
-        }
-        secrets
-    }
 }
 
 impl Default for CommonScanSpec {
@@ -1266,7 +1305,7 @@ impl Default for CommonScanSpec {
             name_mapping: Vec::new(),
             join: None,
             partition_columns: Vec::new(),
-            storage: StorageBackend::S3(StorageProps::default()),
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps::default())),
             df_target_partitions: default_one_usize(),
             df_batch_size: default_batch_size(),
             df_threads_per_udf: default_one_usize(),

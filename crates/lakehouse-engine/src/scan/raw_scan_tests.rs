@@ -1,6 +1,6 @@
 use super::*;
 use crate::scan::session_config_for_spec;
-use crate::scan::test_support::{local_file_size, minimal_spec};
+use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
 
 /// Both INT96 call sites (`positional_deletes.rs`'s decode path and this
 /// module's legacy schema-inference branch) build their `ParquetFormat` via
@@ -206,7 +206,7 @@ async fn register_files_falls_back_without_logical_schema() {
     spec.common.logical_schema = Vec::new();
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec)
+    register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed on first-file inference path");
 
@@ -295,7 +295,7 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
     spec.common.projection = vec!["ID".into(), "VAL".into(), "ADDED".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec)
+    register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed for an all-identity logical schema");
 
@@ -419,7 +419,7 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         spec.common.limit = Some(limit);
 
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-        register_files(&ctx, "scan_target", &spec)
+        register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
             .await
             .expect("register local parquet");
         let sql = build_scan_sql(&ctx, "scan_target", &spec)
@@ -693,7 +693,7 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
     spec.common.projection = vec!["ID".into(), "ARR_COL".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec)
+    register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed for a utf8-tagged list column");
     let sql = build_scan_sql(&ctx, "scan_target", &spec)
@@ -872,7 +872,7 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     spec.common.projection = vec!["ID".into(), "ADDR".into(), "ATTRS".into()];
 
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-    register_files(&ctx, "scan_target", &spec)
+    register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
         .expect("register_files must succeed for utf8-tagged struct and map columns");
     let sql = build_scan_sql(&ctx, "scan_target", &spec)
@@ -1127,9 +1127,14 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     logical_spec.common.projection = vec!["ID".into(), "TAGS".into()];
 
     let logical_ctx = SessionContext::new_with_config(session_config_for_spec(&logical_spec));
-    register_files(&logical_ctx, "scan_target", &logical_spec)
-        .await
-        .expect("register_files must succeed for the logical-schema path");
+    register_files(
+        &logical_ctx,
+        "scan_target",
+        &logical_spec,
+        &inline_resolved(&logical_spec),
+    )
+    .await
+    .expect("register_files must succeed for the logical-schema path");
     let logical_sql = build_scan_sql(&logical_ctx, "scan_target", &logical_spec)
         .await
         .expect("build_scan_sql");
@@ -1149,9 +1154,14 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     legacy_spec.common.projection = vec!["ID".into(), "TAGS".into()];
 
     let legacy_ctx = SessionContext::new_with_config(session_config_for_spec(&legacy_spec));
-    register_files(&legacy_ctx, "scan_target", &legacy_spec)
-        .await
-        .expect("register_files must succeed for the legacy no-logical-schema path");
+    register_files(
+        &legacy_ctx,
+        "scan_target",
+        &legacy_spec,
+        &inline_resolved(&legacy_spec),
+    )
+    .await
+    .expect("register_files must succeed for the legacy no-logical-schema path");
     register_nested_json_render_udf(&legacy_ctx);
     let legacy_sql = build_scan_sql(&legacy_ctx, "scan_target", &legacy_spec)
         .await
@@ -1174,4 +1184,75 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// Error redaction reads its secret set from the RESOLVED credential
+// ---------------------------------------------------------------------------
+
+/// A raw-scan error is redacted against the credential the RESOLVED pair carries,
+/// not against anything on the wire spec.
+///
+/// The spec here references a CONNECTION and carries no credential at all, so a
+/// feed site left reading the wire value would build an EMPTY secret set — and
+/// the sentinel below would survive into the surfaced message. The endpoint's
+/// refusal body quotes that sentinel beside a plain marker, and the marker
+/// assertion runs FIRST: it proves the refusal genuinely reached the message,
+/// which is what makes the absence assertion falsifiable rather than vacuous.
+///
+/// A `logical_schema` is supplied so registration infers nothing and reads
+/// nothing; the failure therefore lands on the streaming path
+/// `run_raw_scan_with_session` redacts itself.
+#[tokio::test]
+async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
+    use crate::scan::ResolvedScanStorage;
+    use crate::scan::object_store::build_session_context;
+    use crate::scan::spec::{CommonScanSpec, ProjectionItem, ScanStorage};
+    use crate::scan::test_support::{
+        SinkCtx, TEST_CONNECTION, refusing_backend, refusing_endpoint,
+    };
+
+    const MARKER: &str = "raw-scan-refusal";
+    const SENTINEL: &str = "RAWSCANSECRETVALUE";
+
+    let endpoint = refusing_endpoint(&format!("{MARKER} {SENTINEL}"));
+    let spec = ScanSpec {
+        common: CommonScanSpec {
+            projection: vec![ProjectionItem::Column("ID".into())],
+            logical_schema: vec![crate::scan::spec::LogicalField {
+                field_id: Some(1),
+                name: "id".into(),
+                arrow_type: "int64".into(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            }],
+            storage: ScanStorage::Connection {
+                name: TEST_CONNECTION.into(),
+                allow_http: true,
+            },
+            ..Default::default()
+        },
+        files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],
+    };
+    let storage = ResolvedScanStorage::from_backends(refusing_backend(&endpoint, SENTINEL), None);
+
+    let session = build_session_context(&spec, &storage, 0).expect("the session must build");
+    let mut ctx = SinkCtx;
+    let mut timers = diagnostics::PhaseTimers::start();
+    let error = run_raw_scan_with_session(&mut ctx, &session, &spec, &storage, &mut timers)
+        .await
+        .expect_err("the endpoint refuses every read, so the scan must fail");
+
+    let text = error.to_string();
+    assert!(
+        text.contains(MARKER),
+        "the endpoint's refusal body must have reached the error, or the assertion \
+         below is vacuous: {text}"
+    );
+    assert!(
+        !text.contains(SENTINEL),
+        "the resolved credential must be stripped from a raw-scan error: {text}"
+    );
 }

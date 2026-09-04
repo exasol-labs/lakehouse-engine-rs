@@ -9,7 +9,7 @@ scan: a nested `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET distributor subquery (`GROUP
 shard_key`) spreads each shard's per-file list across nodes, and an outer ungrouped
 `LAKEHOUSE_SCAN` SCALAR EMIT UDF scans each distributed file list node-locally and streams
 the rows. The scan-driving SQL splices the shard-invariant parts (projection, filter,
-LIMIT, logical schema, credentials, and the table root) once as the scalar scan
+LIMIT, logical schema, a storage-credential REFERENCE, and the table root) once as the scalar scan
 UDF's first-argument common literal and flows each shard's per-file subset through the
 distributor as the second argument. A single-shard plan short-circuits the distributor and
 calls the scalar scan directly on the file-list literal. See
@@ -23,9 +23,9 @@ SQL, and AVG sum/count decomposition) is covered separately in
 
 ## Background
 
-* The scan-driving SQL invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF over a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the shard-invariant common spec (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the table root) is spliced once as the scalar scan's first argument and each shard's file subset flows through the distributor as the second argument.
+* The scan-driving SQL invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF over a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the shard-invariant common spec (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, a storage-credential reference (or, under vending, a sealed envelope), tuning knobs, and the table root) is spliced once as the scalar scan's first argument and each shard's file subset flows through the distributor as the second argument.
 * The outer scalar scan select is never wrapped in a `SELECT * FROM (...)` materialization boundary.
-* Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
+* A CONNECTION-supplied storage credential is carried as a connection REFERENCE and MUST NOT appear in any returned SQL string. A VENDED storage credential appears in a returned SQL string ONLY inside the AES-GCM-sealed envelope of `vs-adapter/scan-spec-credential-reference` — issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378) — never in plaintext. No credential of either kind appears in an error message. The reference or sealed envelope is carried ONCE in the shard-invariant common literal and MUST NOT be repeated per shard.
 * The `LAKEHOUSE_SCAN` and `LAKEHOUSE_DISTRIBUTE_FILES` UDF names in the scan-driving SQL are schema-qualified from the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`; there is no VS property that supplies this schema. The scan and distributor scripts are co-deployed in the adapter script's schema, so this single source qualifies both.
 * The cluster node count that sizes the shard fan-out is read per pushdown from the adapter script's own UDF handshake via `UdfContext::node_count()`. It is NOT read from `schemaMetadataInfo.adapterNotes`. Every VS request type reaches the adapter through the same single-call script invocation, so the handshake carries the node count on a `pushdown` request exactly as it does on a `createVirtualSchema` request; the request type lives in the JSON payload, not in the handshake.
 * `node_count()` is a synchronous handshake read and MUST be captured in `dispatch` before the tokio runtime is entered, alongside `ctx.script_schema()` and the resolved CONNECTION credentials. The value is then threaded into the pushdown planning path as a plain integer, so the async planning code performs no ambient context read of its own.
@@ -111,3 +111,12 @@ SQL, and AVG sum/count decomposition) is covered separately in
 * *THEN* the adapter SHALL use a node count of `1`
 * *AND* the resulting shard count `G` SHALL be `min(1 × PARALLELISM_FACTOR, 300, file_count)` per `parallelism/work-unit-sharding`
 * *AND* the adapter SHALL still return a successful `pushdown` response
+
+### Scenario: The common scan-spec literal carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request of any shape over a virtual schema whose CONNECTION supplies static storage credentials and does not enable `use_vended_credentials`
+* *WHEN* the adapter splices the shard-invariant common spec into the scan-driving SQL as the scalar scan UDF's first argument
+* *THEN* that literal SHALL carry the value of the `CATALOG_CONNECTION` virtual-schema property plus the resolved `ALLOW_HTTP` value as its storage reference, and the returned SQL string MUST NOT contain the CONNECTION's `access_key`, `secret_key`, `session_token`, `account_key`, or `sas_token` value in any encoding
+* *AND* the reference SHALL be spliced ONCE for the whole fan-out and MUST NOT be repeated per shard, exactly as the credential was, because it is shard-invariant
+* *AND* the same request with `use_vended_credentials` enabled SHALL carry the vended credential ONLY inside the sealed envelope `vs-adapter/scan-spec-credential-reference` specifies, in that literal — issue #378, closed by this plan — so no credential value appears in PLAINTEXT in the returned SQL under either setting
+* *AND* no credential value of either kind SHALL appear in any error message the pushdown path raises

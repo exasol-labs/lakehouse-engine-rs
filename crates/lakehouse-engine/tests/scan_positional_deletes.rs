@@ -10,6 +10,8 @@
 //!
 //! Host-runnable: everything lives under `file://`.
 
+mod scan_fixture;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -32,7 +34,7 @@ use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec,
-    StorageBackend, StorageProps,
+    ScanStorage, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_join_physical_plan, build_raw_scan_physical_plan, register_files,
@@ -218,7 +220,7 @@ fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) 
             projection: vec!["ID".into(), "NAME".into()],
             filter,
             limit,
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -275,7 +277,7 @@ fn scan_spec_with_logical_schema(
             projection: vec!["ID".into(), "NAME".into()],
             filter,
             limit,
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             logical_schema: logical_fields(&[("id", "int64"), ("name", "utf8")]),
             ..Default::default()
@@ -306,7 +308,14 @@ async fn try_run_scan_with_store(
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
     let mut ctx = FakeCtx::new();
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers).await?;
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        spec,
+        &scan_fixture::resolved_storage(spec),
+        &mut timers,
+    )
+    .await?;
     Ok(ctx.emitted)
 }
 
@@ -1291,7 +1300,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
         condition: "\"C_KEY\" = \"O_KEY\"".into(),
         post_join_limit: None,
         partition_columns: Vec::new(),
-        storage: dummy_storage(),
+        storage: ScanStorage::Inline(dummy_storage()),
     });
 
     let (store, peak) = tracking_store_with_probe(needles);
@@ -1309,7 +1318,13 @@ fn scan_delete_reads_bounded_across_join_sides() {
         let mut timers = PhaseTimers::start();
         tokio::time::timeout(
             DELETE_READ_TIMEOUT,
-            run_join_scan_with_session(&mut ctx, &session, &spec, &mut timers),
+            run_join_scan_with_session(
+                &mut ctx,
+                &session,
+                &spec,
+                &scan_fixture::resolved_storage(&spec),
+                &mut timers,
+            ),
         )
         .await
         .expect("join delete-read fan-out must finish within the timeout, not hang")
@@ -1845,9 +1860,14 @@ fn scan_footer_fetches_bounded_by_connection_budget() {
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
         ctx.runtime_env()
             .register_object_store(&Url::parse(&data_urls[0]).expect("register url"), store);
-        register_files(&ctx, "scan_target", &spec)
-            .await
-            .expect("register_files must succeed");
+        register_files(
+            &ctx,
+            "scan_target",
+            &spec,
+            &scan_fixture::resolved_storage(&spec),
+        )
+        .await
+        .expect("register_files must succeed");
         tokio::time::timeout(
             DELETE_READ_TIMEOUT,
             build_raw_scan_physical_plan(&ctx, &spec),
@@ -1951,9 +1971,14 @@ fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
         ctx.runtime_env()
             .register_object_store(&Url::parse(&free_a).expect("register url"), store);
-        register_files(&ctx, "scan_target", &spec)
-            .await
-            .expect("register_files must succeed");
+        register_files(
+            &ctx,
+            "scan_target",
+            &spec,
+            &scan_fixture::resolved_storage(&spec),
+        )
+        .await
+        .expect("register_files must succeed");
         build_raw_scan_physical_plan(&ctx, &spec)
             .await
             .expect("physical plan must build")
@@ -2118,7 +2143,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
         condition: "\"C_KEY\" = \"O_KEY\"".into(),
         post_join_limit: None,
         partition_columns: Vec::new(),
-        storage: dummy_storage(),
+        storage: ScanStorage::Inline(dummy_storage()),
     });
 
     let (store, peak) = tracking_store_with_probe(needles);
@@ -2136,7 +2161,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
             .register_object_store(&Url::parse(&register_url).expect("register url"), store);
         tokio::time::timeout(
             DELETE_READ_TIMEOUT,
-            build_join_physical_plan(&session, &spec),
+            build_join_physical_plan(&session, &spec, &scan_fixture::resolved_storage(&spec)),
         )
         .await
         .expect("join plan construction must finish within the timeout, not hang")

@@ -1,5 +1,7 @@
+use crate::adapter::ResolvedConnectionConfig;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, render_ordered,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage,
+    StorageBackend, render_ordered,
 };
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -8,7 +10,8 @@ use vs_expression::{render_df_filter_safe, render_expression_safe};
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
-    extract_offset, quote_ident, render_limit_offset, shard_count, strip_table_alias,
+    extract_offset, quote_ident, render_limit_offset, scan_storage_for, shard_count,
+    strip_table_alias,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
@@ -203,10 +206,10 @@ fn n_full_row_qualified_items(
 /// Takes `&ResolvedJoinSide` rather than separate `files`/`table_root` arguments:
 /// both call sites already hold one, so the tighter signature cannot be called
 /// with a mismatched files/root pair.
-fn shard_side(side: &ResolvedJoinSide, tuning: &JoinScanTuning) -> Vec<Vec<FileEntry>> {
+fn shard_side(side: &ResolvedJoinSide, inputs: &JoinScanRequestConfig<'_>) -> Vec<Vec<FileEntry>> {
     let g = shard_count(
-        tuning.cluster_nodes,
-        tuning.parallelism_factor,
+        inputs.cluster_nodes,
+        inputs.parallelism_factor,
         side.files.len(),
     );
     let shards = crate::adapter::sharding::partition_files_by_bytes(side.files.clone(), g);
@@ -410,7 +413,7 @@ pub(in super::super) fn build_n_scan_join_sql(
     pushdown_req: &Json,
     join: &DetectedJoin,
     sides: &[ResolvedJoinSide],
-    tuning: &JoinScanTuning,
+    inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<String, UdfError> {
@@ -490,10 +493,10 @@ pub(in super::super) fn build_n_scan_join_sql(
             side,
             &narrowed,
             side_filter.as_ref(),
-            tuning,
+            inputs,
             udf_name,
             distribute_udf_name,
-        ));
+        )?);
     }
 
     // The residual is the AND of three DISJOINT sets, and together with the per-side
@@ -539,12 +542,17 @@ pub(in super::super) fn build_n_scan_join_sql(
     Ok(sql)
 }
 
-/// The DataFusion execution + sharding knobs threaded into join SQL building.
+/// Everything ONE pushdown request fixes for every join scan spec it emits,
+/// independently of which side or which leg is being built: the DataFusion
+/// execution and sharding knobs, plus the resolved `CATALOG_CONNECTION` both
+/// sides select their wire storage from.
 ///
-/// Bundled so the two join SQL builders take one config parameter instead of eight
-/// positional numbers whose order is easy to transpose (guardrails: few arguments,
-/// config at high levels).
-pub(in super::super) struct JoinScanTuning {
+/// Bundled so the join SQL builders take one parameter instead of eight
+/// positional numbers whose order is easy to transpose (guardrails: few
+/// arguments, config at high levels). `connection` belongs with them because it
+/// is the same kind of value: per-request, side-independent, and read but never
+/// modified by any builder below.
+pub(in super::super) struct JoinScanRequestConfig<'a> {
     pub(in super::super) cluster_nodes: usize,
     pub(in super::super) parallelism_factor: usize,
     pub(in super::super) df_target_partitions: usize,
@@ -553,6 +561,10 @@ pub(in super::super) struct JoinScanTuning {
     pub(in super::super) memory_pool_fraction: f64,
     pub(in super::super) instance_overhead_mb: u64,
     pub(in super::super) s3_max_connections: usize,
+    /// The one resolved CONNECTION both join sides reference or seal against, so
+    /// a vended join seals each side independently — two envelopes, two nonces,
+    /// ONE key — rather than sharing one envelope neither side owns.
+    pub(in super::super) connection: &'a ResolvedConnectionConfig,
 }
 
 /// Relativize one file list against its table root (single-list convenience over
@@ -565,7 +577,7 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
 
 /// Assemble the shard-invariant [`ScanSpec`] both join fan-out builders emit: an
 /// empty `files` (the shards travel separately), no limit / order / aggregate /
-/// group, and the six DataFusion + S3 tuning knobs copied from `tuning`. `primary`
+/// group, and the six DataFusion + S3 tuning knobs copied from `inputs`. `primary`
 /// is the side the spec scans, and `common.storage` carries ONLY that scanned
 /// side's own effective `storage` (`table_root`, `logical_schema`, `name_mapping`
 /// likewise come from `primary`); `projection`, `filter`, `emit_exa_types`, and
@@ -583,9 +595,10 @@ fn join_fan_out_scan_spec(
     filter: Option<String>,
     emit_exa_types: Vec<String>,
     join: Option<JoinSpec>,
-    tuning: &JoinScanTuning,
-) -> ScanSpec {
-    ScanSpec {
+    inputs: &JoinScanRequestConfig<'_>,
+) -> Result<ScanSpec, UdfError> {
+    let storage = scan_storage_for_side(&primary.effective_storage, inputs)?;
+    Ok(ScanSpec {
         common: CommonScanSpec {
             table_root: primary.table_root.clone(),
             projection,
@@ -600,16 +613,38 @@ fn join_fan_out_scan_spec(
             name_mapping: primary.name_mapping.clone(),
             join,
             partition_columns: primary.partition_columns.clone(),
-            storage: primary.effective_storage.clone(),
-            df_target_partitions: tuning.df_target_partitions,
-            df_batch_size: tuning.df_batch_size,
-            df_threads_per_udf: tuning.df_threads_per_udf,
-            memory_pool_fraction: tuning.memory_pool_fraction,
-            instance_overhead_mb: tuning.instance_overhead_mb,
-            s3_max_connections: tuning.s3_max_connections,
+            storage,
+            df_target_partitions: inputs.df_target_partitions,
+            df_batch_size: inputs.df_batch_size,
+            df_threads_per_udf: inputs.df_threads_per_udf,
+            memory_pool_fraction: inputs.memory_pool_fraction,
+            instance_overhead_mb: inputs.instance_overhead_mb,
+            s3_max_connections: inputs.s3_max_connections,
         },
         files: vec![],
-    }
+    })
+}
+
+/// Select ONE side's wire storage from that side's OWN resolved backend and the
+/// request's shared CONNECTION — the join path's only call into
+/// [`scan_storage_for`], applied per side.
+///
+/// Per side rather than once per request: a vended credential is scoped to the
+/// table it was resolved for, so the two sides' backends genuinely differ and
+/// each must be sealed on its own. Sealing per side also means two envelopes
+/// under two fresh nonces, never one envelope shared by both.
+fn scan_storage_for_side(
+    effective: &StorageBackend,
+    inputs: &JoinScanRequestConfig<'_>,
+) -> Result<ScanStorage, UdfError> {
+    let conn = inputs.connection;
+    scan_storage_for(
+        &conn.creds,
+        &conn.connection_name,
+        conn.allow_http,
+        effective,
+        conn.sealed_storage_key.as_ref(),
+    )
 }
 
 /// Build one side's single-table sharded fan-out SQL (an outer ungrouped scalar
@@ -637,17 +672,17 @@ pub(super) fn build_side_fan_out_sql(
     side: &ResolvedJoinSide,
     columns: &[(String, String)],
     side_filter: Option<&Json>,
-    tuning: &JoinScanTuning,
+    inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> String {
+) -> Result<String, UdfError> {
     let proj_cols: Vec<ProjectionItem> = columns
         .iter()
         .map(|(name, _)| ProjectionItem::Column(name.clone()))
         .collect();
     let proj_types: Vec<String> = columns.iter().map(|(_, ty)| ty.clone()).collect();
 
-    let shards = shard_side(side, tuning);
+    let shards = shard_side(side, inputs);
 
     // Render BARE (strip Exasol's `tableAlias`): the fan-out is a single-table
     // scan whose relation exposes bare uppercase column names, so an
@@ -662,9 +697,9 @@ pub(super) fn build_side_fan_out_sql(
         filter,
         proj_types.clone(),
         None,
-        tuning,
-    );
-    build_scan_driving_sql(
+        inputs,
+    )?;
+    Ok(build_scan_driving_sql(
         &spec,
         &shards,
         &proj_cols,
@@ -674,7 +709,7 @@ pub(super) fn build_side_fan_out_sql(
         None,
         udf_name,
         distribute_udf_name,
-    )
+    ))
 }
 
 fn binds_to_projection(key: &ParsedSortKey, projection: &[ProjectionItem]) -> bool {
@@ -717,10 +752,10 @@ pub(in super::super) fn build_broadcast_join_sql(
     sides: &JoinSides,
     rendered: &RenderedJoinPushdown,
     window: JoinWindowPlan,
-    tuning: &JoinScanTuning,
+    inputs: &JoinScanRequestConfig<'_>,
     udf_name: &str,
     distribute_udf_name: &str,
-) -> Option<String> {
+) -> Result<Option<String>, UdfError> {
     let (shard_cap, ordering) = match window {
         JoinWindowPlan::Unbounded => (None, None),
         JoinWindowPlan::BareLimit(n) => (Some(n), None),
@@ -738,17 +773,17 @@ pub(in super::super) fn build_broadcast_join_sql(
                 .iter()
                 .all(|key| binds_to_projection(key, &rendered.projection))
             {
-                return None;
+                return Ok(None);
             }
             (None, Some((keys, limit, offset)))
         }
-        JoinWindowPlan::ExasolPostProcessed => return None,
+        JoinWindowPlan::ExasolPostProcessed => return Ok(None),
     };
 
     let fact = &sides.fact;
     let dimension = &sides.dimension;
 
-    let shards = shard_side(fact, tuning);
+    let shards = shard_side(fact, inputs);
 
     let join = JoinSpec {
         table_root: dimension.table_root.clone(),
@@ -759,7 +794,11 @@ pub(in super::super) fn build_broadcast_join_sql(
         condition: rendered.condition.clone(),
         post_join_limit: shard_cap,
         partition_columns: dimension.partition_columns.clone(),
-        storage: dimension.effective_storage.clone(),
+        // The DIMENSION side's own storage, selected from ITS own resolved
+        // backend — never the fact side's. Under vending this is a SECOND
+        // envelope under a second nonce, because a vended credential is scoped
+        // to the table it was resolved for.
+        storage: scan_storage_for_side(&dimension.effective_storage, inputs)?,
     };
 
     let spec = join_fan_out_scan_spec(
@@ -768,8 +807,8 @@ pub(in super::super) fn build_broadcast_join_sql(
         rendered.filter.clone(),
         rendered.projection_types.clone(),
         Some(join),
-        tuning,
-    );
+        inputs,
+    )?;
 
     let fan_out = build_scan_driving_sql(
         &spec,
@@ -784,7 +823,7 @@ pub(in super::super) fn build_broadcast_join_sql(
     );
 
     let Some((keys, limit, offset)) = ordering else {
-        return Some(fan_out);
+        return Ok(Some(fan_out));
     };
     let wrapped = wrap_declined_order_by(
         &fan_out,
@@ -803,7 +842,7 @@ pub(in super::super) fn build_broadcast_join_sql(
         wrapped, fan_out,
         "an Ordered window must render an ORDER BY"
     );
-    (wrapped != fan_out).then_some(wrapped)
+    Ok((wrapped != fan_out).then_some(wrapped))
 }
 
 /// The N-scan wrapper's `GROUP BY` clause (without the keyword), table-qualified.

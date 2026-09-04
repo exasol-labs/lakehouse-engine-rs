@@ -29,9 +29,11 @@ use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
-    ProjectionItem, ScanSpec, StorageBackend, StorageProps,
+    ProjectionItem, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
-use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
+use lakehouse_engine::scan::{
+    ResolvedScanStorage, run_raw_scan_with_session, session_config_for_spec,
+};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 
@@ -162,7 +164,7 @@ fn raw_scan_spec(
                 .collect(),
             logical_schema,
             name_mapping,
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -190,7 +192,8 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch
     );
     let mut ctx = FakeCtx::new();
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers).await?;
+    let storage = ResolvedScanStorage::from_backends(dummy_storage(), None);
+    run_raw_scan_with_session(&mut ctx, &session, spec, &storage, &mut timers).await?;
     Ok(ctx.emitted)
 }
 

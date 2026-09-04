@@ -5,10 +5,12 @@ Extends the scan UDF to read the real per-instance memory limit from
 per-instance limit minus a configurable container/binary overhead — scaled by a
 configurable fraction, to bound the per-batch Parquet decode working set via a
 configured `batch_size`, to enable Parquet row-group and page pruning so the scan
-reads only the byte ranges its predicate needs, and to consume storage credentials
-carried in the scan spec (including vended STS tokens) without re-authenticating to
-the catalog. The credentials and tuning knobs travel in the shard-invariant common
-spec argument, serialized once for the whole fan-out.
+reads only the byte ranges its predicate needs, and to obtain storage credentials
+from the scan spec — resolved from the referenced Exasol CONNECTION, or unsealed
+from the AES-GCM envelope in which the planning layer carried the credentials it
+vended, keyed from that same CONNECTION — without re-authenticating to the
+catalog. The credentials or their reference and the tuning knobs travel in the
+shard-invariant common spec argument, serialized once for the whole fan-out.
 
 ## Background
 
@@ -33,13 +35,6 @@ spec argument, serialized once for the whole fan-out.
   Iceberg file-level pruning (`vs-adapter/pushdown-file-pruning`), which prunes whole
   files before the reader opens them. The two compose: Iceberg drops files, the
   Parquet reader then drops row groups and pages within the surviving files.
-* Storage credentials (including vended S3 keys) reach the UDF only inside the
-  shard-invariant common spec argument, serialized once for the whole fan-out rather
-  than repeated per shard; the UDF never contacts the catalog or re-requests credentials.
-  This single S3 object store built from those credentials is reused for both data files
-  and their associated positional-delete files.
-* Credentials MUST NOT appear in any error message, including one raised while reading a
-  delete file.
 * Delete-carrying data files need their Parquet footer both for access-plan construction
   and by the opener; a shared reader factory / cached metadata reader avoids parsing the
   footer twice.
@@ -76,6 +71,13 @@ spec argument, serialized once for the whole fan-out.
   requires BOTH halves of issue #165's item 3: reuse measured at a shard scale whose cached
   footers approach the limit, and an eviction that does happen anyway made observable rather
   than silent.
+* **This delta is issue #135. It amends the two credential-passthrough scenarios, adds one, and changes nothing else.** The memory pool, the batch size, the Parquet pruning flags, the shared metadata reader, and the metadata-cache observable are all UNCHANGED. What changes is only WHERE a credential comes from before the object store is built.
+* **The prohibition this feature owns is UNCHANGED.** "The UDF MUST NOT re-authenticate to the catalog or re-request vended credentials" still binds. `ctx.connection()` contacts neither the catalog nor object storage: it is one engine-local metadata request over the script-language-container protocol, answered by the database from its own catalog. No file is discovered, no snapshot is read, and no token is minted, so `specs/mission.md`'s "resolve metadata once per query, in the VS layer" is untouched — the file list, the snapshot, and any vended credential are still resolved exactly once, by the adapter.
+* **The resolution is ONE step at the top of the invocation, not a lookup at each store-construction site.** A join spec carries a storage block per side, so the resolved value is a PAIR. Resolving lazily per store would read the same CONNECTION twice in one invocation and would leave the redaction secret set undefined for the window between the two reads.
+* **The redaction secret set moves off the spec and onto the resolved pair, and this is the delta's one correctness trap.** SEVEN sites under `crates/lakehouse-engine/src/scan/` build such a set. Two read the union off the spec: `object_store.rs:66` and `join_scan.rs:48`, both `spec.common.all_secret_values()`. Three read the fact side off the spec directly: `partial_agg.rs:70`, `partial_agg.rs:125`, and `raw_scan.rs:54`, each `spec.common.storage.secret_values()`. Two already take a `&StorageBackend` parameter and are fed by their callers: `raw_scan.rs:224` in `register_file_list`, and `positional_deletes.rs:629` in `PositionalDeleteScanTable::new`. A spec carrying a connection NAME has no secret to yield, so leaving the set on the spec would silently disarm value-based redaction at the five spec-reading sites — a fix that reduced protection on the error path while fixing the SQL path. The set is therefore computed from the resolved backends, and the wire wrapper exposes no secret accessor so a missed site fails to compile.
+* **The raw-scan and partial-aggregate paths are where a disarmed set would go unnoticed**, because they read the fact-side set directly and no recorded scenario asserts redaction on either. This delta adds that assertion.
+* **`vs-adapter/scan-spec-credential-reference` owns the wire contract, the storage-only projection the UDF deserializes, the sealed vended envelope, the required grant, and the mid-query rotation consequence.** This feature CITES it and restates none of it, so the two do not drift.
+* **Nothing about the store the UDF builds changes.** The resolved value is a `StorageBackend`, the same type the spec carried inline before, so the backend-dispatching registration function of `vs-adapter/storage-backend-enum`, the per-side size index, the routing decorator, and the one-store-per-side rule are all reached with a field-for-field identical input.
 
 ## Scenarios
 
@@ -103,17 +105,27 @@ spec argument, serialized once for the whole fan-out.
 * *THEN* the UDF SHALL clamp the DataFusion memory pool budget to a minimum non-zero floor rather than producing a zero or negative budget
 * *AND* the scan SHALL still build a usable session context that can execute a scan
 
-### Scenario: Scan reads data files with vended credentials carried in the scan spec
+### Scenario: Scan reads data files with credentials referenced or carried in the scan spec
 
-* *GIVEN* a scan invocation whose shard-invariant common spec argument carries a storage backend holding vended S3 credentials (access key, secret key, session token) resolved once by the planning layer
+* *GIVEN* a scan invocation whose shard-invariant common spec argument carries, per side, EITHER a reference to the Exasol CONNECTION that supplies that side's storage credentials OR a sealed envelope carrying the storage backend the planning layer vended, resolved once by the planning layer
 * *WHEN* the scan UDF builds its object store and reads the files listed in its per-shard argument
-* *THEN* the UDF SHALL register the object store the carried storage backend names, configured from the credentials that backend holds
+* *THEN* the UDF SHALL resolve every reference to a storage backend EXACTLY ONCE per invocation, before it builds any object store, under `vs-adapter/scan-spec-credential-reference`
+* *AND* the UDF SHALL register the object store the RESOLVED storage backend names, configured from the credentials that backend holds
 * *AND* the UDF MUST NOT decide the storage backend itself, derive it from a file URI scheme, or read the backend's payload outside the single backend-dispatching registration function specified by `vs-adapter/storage-backend-enum`
-* *AND* when the spec also carries a join block, the UDF SHALL build a SECOND store from the join block's OWN storage backend and read the dimension side's files through it, so the whole-spec backend serves only the side whose files the whole-spec `table_root` and per-shard `files` describe
+* *AND* when the spec also carries a join block, the UDF SHALL build a SECOND store from the join block's OWN resolved storage backend and read the dimension side's files through it, so the whole-spec backend serves only the side whose files the whole-spec `table_root` and per-shard `files` describe
 * *AND* the store the UDF builds for a side SHALL answer that side's per-file metadata lookups from a size index over THAT side's files only, so one side's `head` can never be satisfied by the other side's store
-* *AND* the storage credentials SHALL travel in the shard-invariant common spec argument (serialized once for the whole fan-out), NOT be repeated per shard — the dimension side's backend included, since the join block is itself shard-invariant
-* *AND* the UDF MUST NOT re-authenticate to the catalog or re-request vended credentials
-* *AND* a credential value from ANY carried backend MUST NOT appear in any error message the UDF returns
+* *AND* the credentials or their reference SHALL travel in the shard-invariant common spec argument, serialized once for the whole fan-out, NOT be repeated per shard — the dimension side's included, since the join block is itself shard-invariant
+* *AND* the UDF MUST NOT re-authenticate to the catalog or re-request vended credentials; resolving a CONNECTION by name through `ctx.connection()` is NOT such a request, because it reaches the database's own catalog rather than the table catalog and discovers no file, mints no token, and reads no snapshot
+* *AND* a credential value from ANY resolved backend MUST NOT appear in any error message the UDF returns
+
+### Scenario: Every redaction secret set in the scan path is built from the resolved backends
+
+* *GIVEN* the sites under the scan path that build a value-based redaction secret set — the two that read the whole-spec union, the three that read the fact side off the spec, and the two that already receive a storage backend as a parameter
+* *WHEN* the scan spec's storage block carries a connection reference rather than a credential
+* *THEN* EVERY one of those sites SHALL take its secret set from the RESOLVED storage backend or backends, and NONE SHALL read it from the scan spec's own storage block
+* *AND* the wire wrapper MUST NOT expose a secret-value accessor, so a site left reading the unresolved value fails to COMPILE rather than returning an empty set and silently disarming redaction
+* *AND* an error raised on the RAW-SCAN path and an error raised on the PARTIAL-AGGREGATE path SHALL each be asserted to carry no resolved credential value, because those two paths read the fact-side set directly and no recorded scenario covered either
+* *AND* a spec whose storage block carries a reference MUST NOT yield an empty secret set once resolution has run, and a test SHALL assert the set is NON-empty for a resolved reference
 
 ### Scenario: Scan bounds the Parquet decode working set via a configured batch size
 
@@ -132,13 +144,13 @@ spec argument, serialized once for the whole fan-out.
 * *AND* this Parquet-level pruning SHALL compose with the Iceberg file-level pruning of `vs-adapter/pushdown-file-pruning` — files dropped by Iceberg are never opened, and within the surviving files non-matching row groups and pages are skipped
 * *AND* the emitted rows SHALL be identical to a scan with pruning disabled (pruning narrows what is read, never the result set)
 
-### Scenario: Positional-delete files are read with the same vended credentials
+### Scenario: Positional-delete files are read with the same resolved credentials
 
-* *GIVEN* a scan invocation whose shard-invariant common spec carries a storage backend holding vended S3 credentials (access key, secret key, session token) resolved once by the planning layer
+* *GIVEN* a scan invocation whose shard-invariant common spec references or carries, per side, the storage credentials for that side
 * *WHEN* the scan UDF reads a data file's associated positional-delete files from object storage
-* *THEN* the UDF SHALL read the delete files through the SAME registered object store used for the data files OF THAT SIDE, configured from that side's backend credentials
+* *THEN* the UDF SHALL read the delete files through the SAME registered object store used for the data files OF THAT SIDE, configured from that side's RESOLVED backend credentials
 * *AND* on a join spec, the dimension side's delete files SHALL be read with the DIMENSION side's credentials and the fact side's with the FACT side's, never one side's delete files with the other side's credentials
-* *AND* the UDF MUST NOT re-authenticate to the catalog or re-request vended credentials to read a delete file
+* *AND* the UDF MUST NOT re-authenticate to the catalog, re-request vended credentials, or resolve the referenced CONNECTION a second time to read a delete file, because the one per-invocation resolution already supplied it
 * *AND* a credential value MUST NOT appear in any error message the UDF returns while reading a delete file, for whichever side's delete file failed
 
 ### Scenario: A shared Parquet metadata reader avoids a duplicate footer parse

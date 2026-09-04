@@ -26,6 +26,7 @@ use crate::scan::spec::{
     FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, reconstruct_abs_uri,
     render_order_by_clause,
 };
+use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
 use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
@@ -45,14 +46,19 @@ use super::sql_support::{build_alias_items, quote_ident};
 /// single gated per-VM phase-telemetry record. Exposed so a host integration
 /// test can drive the exact production streaming + telemetry path against a
 /// local Parquet file (no S3 store), feeding its own `SessionContext`.
+///
+/// The redaction secret set is read from `storage` — the RESOLVED backends —
+/// never from the spec, which carries a reference rather than a credential. A
+/// host test builds the argument with [`ResolvedScanStorage::from_backends`].
 pub async fn run_raw_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let secrets = spec.common.storage.secret_values();
-    let df = build_dataframe(session_ctx, spec).await?;
+    let secrets = storage.all_secret_values();
+    let df = build_dataframe(session_ctx, spec, storage).await?;
     let stream = df
         .execute_stream()
         .await
@@ -84,9 +90,10 @@ pub(super) fn delete_path_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
 async fn build_dataframe(
     ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<datafusion::dataframe::DataFrame, UdfError> {
     let table_name = "scan_target";
-    register_files(ctx, table_name, spec).await?;
+    register_files(ctx, table_name, spec, storage).await?;
 
     // Build the SELECT SQL applying projection, filter, and limit.
     let sql = build_scan_sql(ctx, table_name, spec).await?;
@@ -123,10 +130,15 @@ async fn build_dataframe(
 /// `scan_target` before asking [`build_raw_scan_physical_plan`] for the committed
 /// pipeline — the built-in `SessionContext::register_parquet` shortcut never
 /// attaches an access plan and so cannot exercise the delete-carrying path.
+///
+/// Registers the FACT side, so it reads `storage.primary()`: the spec's own
+/// `storage` field names a CONNECTION rather than carrying a credential, and only
+/// the resolved pair holds the backend this registration reads through.
 pub async fn register_files(
     ctx: &SessionContext,
     table_name: &str,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<(), UdfError> {
     let delete_path_read_limiter = delete_path_read_limiter(spec);
     register_file_list(
@@ -137,7 +149,7 @@ pub async fn register_files(
         &spec.common.logical_schema,
         &spec.common.name_mapping,
         &spec.common.partition_columns,
-        &spec.common.storage,
+        storage.primary(),
         delete_path_read_limiter,
     )
     .await

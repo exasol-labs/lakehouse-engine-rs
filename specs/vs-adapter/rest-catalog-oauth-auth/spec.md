@@ -94,7 +94,7 @@ after the `catalog` field is dropped, `ScanSpec` carries no catalog block at all
 * *WHEN* the adapter builds the per-shard scan specs after resolving the file list
 * *THEN* the adapter MUST NOT place `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope` into any `ScanSpec` field
 * *AND* the `ScanSpec` SHALL carry no catalog identifier block at all — the scan UDF never contacts the catalog, so `ScanSpec` MUST NOT include catalog `uri`, `warehouse`, or `table` fields
-* *AND* each `ScanSpec` storage block SHALL carry only the S3 storage credentials — the vended STS credentials when `use_vended_credentials` is enabled and they were resolved, otherwise the static credentials — exactly as in `vs-adapter/pushdown-planning-cloud-credentials`
+* *AND* each `ScanSpec` storage block SHALL carry only storage material — the vended STS credentials inside the SEALED envelope when `use_vended_credentials` is enabled and they were resolved, otherwise a REFERENCE to the CONNECTION that supplies the static credentials — exactly as in `vs-adapter/pushdown-planning-cloud-credentials` and `vs-adapter/scan-spec-credential-reference`, SUPERSEDING the recorded clause that required the static credentials themselves
 
 ### Scenario: OAuth2 client-credentials path resolves tables from a multi-warehouse catalog served under a base path
 
