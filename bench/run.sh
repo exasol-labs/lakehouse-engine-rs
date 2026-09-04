@@ -75,10 +75,32 @@ build_conn_password_cloud() {
   printf '%s' "${json//\'/\'\'}"  # SQL string-literal escaping: ' -> ''
 }
 
+# Remote (AWS Lakekeeper) catalog-connection password JSON: OAuth2 client-credentials (docs/
+# catalogs.md "Lakekeeper (OIDC via Keycloak + MinIO)", static-credentials recipe) rather than
+# SigV4 — the adapter rejects a CONNECTION combining use_sigv4 with client_id/client_secret, so
+# this is a genuinely separate payload, not a flag on build_conn_password_cloud (decision [9]).
+# The query path keeps the SAME read-only engine-reader S3 key pair the Glue arm already uses
+# (decision [6]); only the catalog auth differs.
+build_conn_password_lakekeeper() {
+  local s3_endpoint
+  s3_endpoint="${AWS_S3_ENDPOINT:-https://s3.${AWS_REGION}.amazonaws.com}"
+  local json="{\"warehouse\":\"${LAKEKEEPER_WAREHOUSE}\",\"client_id\":\"${LAKEKEEPER_CLIENT_ID}\",\"client_secret\":\"${LAKEKEEPER_CLIENT_SECRET}\",\"oauth2_server_uri\":\"${LAKEKEEPER_TOKEN_URI}\",\"endpoint\":\"${s3_endpoint}\",\"region\":\"${AWS_REGION}\",\"access_key\":\"${AWS_ACCESS_KEY_ID}\",\"secret_key\":\"${AWS_SECRET_ACCESS_KEY}\",\"path_style\":false,\"use_vended_credentials\":false}"
+  printf '%s' "${json//\'/\'\'}"  # SQL string-literal escaping: ' -> ''
+}
+
 # Docker (local MinIO) catalog-connection password JSON: path-style, no SigV4,
 # internal MinIO endpoint. Mirrors stack.rs::local_stack_connection_password.
 build_conn_password_local() {
   printf '%s' '{"warehouse":"s3://warehouse/","endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","path_style":true,"use_sigv4":false,"use_vended_credentials":false}'
+}
+
+# Report-header catalog field: "catalog=<name>\n" on the REMOTE target only, empty otherwise.
+# BENCH_CATALOG defaults to 'glue' and the docker target's catalog is neither Glue nor the AWS
+# Lakekeeper box, so an unconditional field would mislabel a local MinIO run "catalog=glue" and
+# poison bench/import_ceiling.sh:29's `s3://[^"]*/lineitem` grep over the whole report file
+# (decision [10] / plan.md § Impact).
+catalog_header_field() {  # target catalog_name -> "" | "catalog=<name>\n"
+  [ "$1" = "remote" ] && printf 'catalog=%s\n' "$2" || printf ''
 }
 
 # ---- delete-bearing benchmark (BENCH_WITH_DELETES) pure helpers --------------
@@ -159,17 +181,153 @@ if [ "${1:-}" = "selftest" ]; then
     *) echo "FAIL: resolve_delete_ns remote default: $(resolve_delete_ns remote tpch "")"; exit 1;; esac
   case "$(resolve_delete_ns docker tpch mycustomns)" in mycustomns) ;; \
     *) echo "FAIL: resolve_delete_ns override: $(resolve_delete_ns docker tpch mycustomns)"; exit 1;; esac
+
+  # selftest: bench_catalog_selection — BENCH_CATALOG picks the require() list its own catalog
+  # branch declares, proving that branch actually ran. Task 4.1's dispatch lives inline in the
+  # remote) case arm, not a standalone function, so this runs the real script as a subprocess
+  # rather than duplicating its logic. Each invocation supplies only the require list's common
+  # AWS_* prefix, so it fails on the catalog-specific var before any real AWS/Exasol call.
+  #
+  # Isolation is what makes that last sentence true, and it must come from ONE place: a child that
+  # inherits an operator's real bench/.env (deploy/scripts/secrets.sh writes exactly one) satisfies
+  # require() instead of failing it, and the "offline self-check" then runs make cross-udf-build,
+  # the BucketFS uploads, and DROP/CREATE VIRTUAL SCHEMA against the live cluster that .env names.
+  # BENCH_ENV_FILE=/dev/null blocks the file (it is not a regular file, so run.sh's -f gate skips
+  # it) and env -u blocks the same variables arriving already-exported in this selftest's own
+  # environment. Both halves are needed; neither closes the other's route in.
+  run_sh_isolated() {  # env_file NAME=VALUE... -> the child's combined output
+    local env_file="$1"; shift
+    env -u GLUE_CATALOG_URI -u LAKEKEEPER_CATALOG_URI -u NAMESPACE -u EXASOL_HOST \
+        -u EXASOL_SYS_PASSWORD -u BUCKETFS_WRITE_PASS \
+        BENCH_ENV_FILE="$env_file" "$@" bash "$SCRIPT_DIR/run.sh" 2>&1
+  }
+  if out="$(run_sh_isolated /dev/null BENCH_TARGET=remote \
+    AWS_REGION=r AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s)"; then
+    echo "FAIL: bench_catalog_selection: default-catalog run with missing vars should exit non-zero"; exit 1
+  fi
+  case "$out" in *"GLUE_CATALOG_URI"*) ;; \
+    *) echo "FAIL: bench_catalog_selection: default BENCH_CATALOG did not require GLUE_CATALOG_URI: $out"; exit 1;; esac
+  if out="$(run_sh_isolated /dev/null BENCH_TARGET=remote BENCH_CATALOG=lakekeeper \
+    AWS_REGION=r AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s)"; then
+    echo "FAIL: bench_catalog_selection: lakekeeper run with missing vars should exit non-zero"; exit 1
+  fi
+  case "$out" in *"LAKEKEEPER_CATALOG_URI"*) ;; \
+    *) echo "FAIL: bench_catalog_selection: BENCH_CATALOG=lakekeeper did not require LAKEKEEPER_CATALOG_URI: $out"; exit 1;; esac
+  if out="$(run_sh_isolated /dev/null BENCH_TARGET=remote BENCH_CATALOG=bogus)"; then
+    echo "FAIL: bench_catalog_selection: unknown BENCH_CATALOG should exit non-zero"; exit 1
+  fi
+  case "$out" in *"BENCH_CATALOG must be 'glue' or 'lakekeeper'"*) ;; \
+    *) echo "FAIL: bench_catalog_selection: unknown value did not hard-error: $out"; exit 1;; esac
+
+  # selftest: bench_env_file_is_the_only_config_source — covers the BENCH_ENV_FILE knob itself, in
+  # both directions. A file the knob names IS read: every Glue require-list variable up to the last
+  # one comes from it, so the child fails on BUCKETFS_WRITE_PASS and names none of the earlier ones.
+  # Stopping one variable short is deliberate: a child that cleared require() entirely would carry
+  # straight on into make cross-udf-build and the live-cluster DDL, which is the very failure mode
+  # the isolation above exists to prevent — so this asserts the gate was reached and satisfied for
+  # every variable the file supplies, rather than cleared outright.
+  env_file_probe="$(mktemp)"
+  trap 'rm -f "$env_file_probe"' EXIT
+  cat >"$env_file_probe" <<'PROBEEOF'
+GLUE_CATALOG_URI=https://glue.probe.invalid/iceberg
+GLUE_WAREHOUSE=000000000000
+NAMESPACE=probe_ns
+EXASOL_HOST=probe.invalid
+EXASOL_SYS_PASSWORD=probe-pw
+PROBEEOF
+  if out="$(run_sh_isolated "$env_file_probe" BENCH_TARGET=remote \
+    AWS_REGION=r AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s)"; then
+    echo "FAIL: bench_env_file_is_the_only_config_source: probe run must still stop at the last unset var"; exit 1
+  fi
+  case "$out" in *"BUCKETFS_WRITE_PASS"*) ;; \
+    *) echo "FAIL: bench_env_file_is_the_only_config_source: BENCH_ENV_FILE was not sourced: $out"; exit 1;; esac
+  for probed in GLUE_CATALOG_URI GLUE_WAREHOUSE NAMESPACE EXASOL_HOST EXASOL_SYS_PASSWORD; do
+    case "$out" in *"'$probed'"*) \
+      echo "FAIL: bench_env_file_is_the_only_config_source: '$probed' should have come from BENCH_ENV_FILE: $out"; exit 1;; esac
+  done
+  rm -f "$env_file_probe"
+  trap - EXIT
+
+  # selftest: lakekeeper_conn_password_shape — OAuth2 client-credentials fields present, use_sigv4
+  # never present (docs/catalogs.md: the adapter rejects a CONNECTION combining use_sigv4 with
+  # client_id/client_secret — decision [9]); single-quote escaping applies same as the cloud path.
+  lk_out="$(LAKEKEEPER_WAREHOUSE=w LAKEKEEPER_CLIENT_ID=cid LAKEKEEPER_CLIENT_SECRET="se'cret" \
+    LAKEKEEPER_TOKEN_URI=http://token AWS_REGION=r AWS_ACCESS_KEY_ID=k AWS_SECRET_ACCESS_KEY=s \
+    build_conn_password_lakekeeper)"
+  case "$lk_out" in *"se''cret"*) ;; *) echo "FAIL: lakekeeper single-quote not escaped: $lk_out"; exit 1;; esac
+  case "$lk_out" in *'"client_id":"cid"'*'"oauth2_server_uri":"http://token"'*) ;; \
+    *) echo "FAIL: lakekeeper_conn_password_shape missing OAuth2 fields: $lk_out"; exit 1;; esac
+  case "$lk_out" in *'"use_sigv4"'*) echo "FAIL: lakekeeper_conn_password_shape must never carry use_sigv4: $lk_out"; exit 1;; esac
+
+  # selftest: remote catalog header never carries an s3:// value — bench/import_ceiling.sh:29
+  # greps the whole report file for s3://[^"]*/lineitem, so an s3://-shaped catalog= value would
+  # poison that downstream script.
+  for cat in glue lakekeeper; do
+    hdr="$(catalog_header_field remote "$cat")"
+    case "$hdr" in *"s3://"*) echo "FAIL: catalog header field must never contain s3://: $hdr"; exit 1;; esac
+    case "$hdr" in "catalog=$cat") ;; *) echo "FAIL: catalog header field shape for '$cat': $hdr"; exit 1;; esac
+  done
+
+  # selftest: the DOCKER target's header carries no catalog= field at all, under every
+  # BENCH_CATALOG value — BENCH_CATALOG defaults to 'glue' and the docker target's catalog is
+  # neither Glue nor the AWS Lakekeeper box, so labelling a local MinIO run catalog=glue would
+  # write a false value into bench/reports/*.txt (plan.md § Impact).
+  for cat in glue lakekeeper ""; do
+    hdr="$(catalog_header_field docker "$cat")"
+    case "$hdr" in "") ;; *) echo "FAIL: docker target header must carry no catalog= field (BENCH_CATALOG='$cat'): $hdr"; exit 1;; esac
+  done
+
+  # selftest: report_header_blank_separator_line — the report header block must keep a blank
+  # line between the namespace/catalog lines and "== tables exposed by ...", on every target.
+  # catalog_header_field ends its own output in a newline; capturing it through a bare $(...)
+  # before printing strips that newline and swallows the separator (only on the remote target,
+  # since the docker target's field is empty either way) — this renders the same five-line block
+  # bench/run.sh's report header builds and checks the blank line survives for both targets.
+  for target in remote docker; do
+    hdr_block="$( { printf 'namespace=%s\n' ns; catalog_header_field "$target" glue; echo; echo "== tables exposed by X =="; } )"
+    case "$hdr_block" in *$'\n\n== tables exposed by'*) ;; \
+      *) echo "FAIL: report header block for target '$target' is missing the blank line before '== tables exposed by': $(printf '%s' "$hdr_block" | cat -A)"; exit 1;; esac
+  done
+
+  # selftest: vs_teardown_is_recreate_only — a source-text guard over bench/run.sh's own
+  # PRODUCTION text (everything from the "---- config ----" heading onward, so this check's own
+  # assertion text can never self-match). Every schema drop the harness issues must be immediately
+  # followed by its recreate, and the harness must never drop the CONNECTION at all — the
+  # invariant the live demo rests on, since a completed remote run must leave the CONNECTION and
+  # the virtual schema in place for the demo's interactive tail. This can only see this file's own
+  # text, not deploy/scripts/bench-remote.sh's teardown trap (covered by the README runbook
+  # instead, task 6.1).
+  config_line="$(grep -n '^# ---- config ' "$SCRIPT_DIR/run.sh" | head -1 | cut -d: -f1)"
+  if [ -z "$config_line" ]; then
+    echo "FAIL: vs_teardown_is_recreate_only: could not locate the config-section heading"; exit 1
+  fi
+  prod_src="$(tail -n "+$config_line" "$SCRIPT_DIR/run.sh")"
+  drop_vs_count="$(printf '%s\n' "$prod_src" | grep -c 'DROP VIRTUAL SCHEMA')"
+  [ "$drop_vs_count" -eq 1 ] || \
+    { echo "FAIL: vs_teardown_is_recreate_only: expected exactly one DROP VIRTUAL SCHEMA, found $drop_vs_count"; exit 1; }
+  drop_offset="$(printf '%s\n' "$prod_src" | grep -n 'DROP VIRTUAL SCHEMA' | head -1 | cut -d: -f1)"
+  next_line="$(printf '%s\n' "$prod_src" | sed -n "$((drop_offset + 1))p")"
+  case "$next_line" in *"CREATE VIRTUAL SCHEMA"*) ;; \
+    *) echo "FAIL: vs_teardown_is_recreate_only: DROP VIRTUAL SCHEMA not immediately followed by CREATE VIRTUAL SCHEMA: $next_line"; exit 1;; esac
+  case "$prod_src" in *"DROP CONNECTION"*) echo "FAIL: vs_teardown_is_recreate_only: DROP CONNECTION must not appear in bench/run.sh"; exit 1;; esac
+
   echo "selftest OK"; exit 0
 fi
 
 # ---- config ------------------------------------------------------------------
-# .env is optional (required vars validated per mode). It supplies DEFAULTS: a
-# caller-exported BENCH_*/LAKEHOUSE_* value must WIN over .env, otherwise sweep.sh
-# cannot override a knob that .env also sets (e.g. BENCH_PARALLELISM_FACTOR). So
-# snapshot the caller's sweep overrides, source .env, then re-apply the snapshot.
-if [ -f "$SCRIPT_DIR/.env" ]; then
+# The config file is optional (required vars validated per mode) and its path is
+# overridable via BENCH_ENV_FILE, so a caller can point the run at a different
+# environment — or at a non-file such as /dev/null to guarantee NO ambient config
+# is read at all, which is what keeps the selftest above from silently inheriting
+# an operator's remote bench/.env and running a real benchmark.
+# It supplies DEFAULTS: a caller-exported BENCH_*/LAKEHOUSE_* value must WIN over
+# it, otherwise sweep.sh cannot override a knob the file also sets (e.g.
+# BENCH_PARALLELISM_FACTOR). So snapshot the caller's sweep overrides, source the
+# file, then re-apply the snapshot.
+BENCH_ENV_FILE="${BENCH_ENV_FILE:-$SCRIPT_DIR/.env}"
+if [ -f "$BENCH_ENV_FILE" ]; then
   _env_overrides="$(export -p | grep -E ' (BENCH_|LAKEHOUSE_)[A-Za-z0-9_]+=' || true)"
-  set -a; . "$SCRIPT_DIR/.env"; set +a
+  set -a; . "$BENCH_ENV_FILE"; set +a
   [ -n "$_env_overrides" ] && eval "$_env_overrides"
 fi
 
@@ -209,14 +367,35 @@ case "$TARGET" in
     docker compose up -d
     ;;
   remote)
-    require AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY GLUE_CATALOG_URI GLUE_WAREHOUSE \
-            NAMESPACE EXASOL_HOST EXASOL_SYS_PASSWORD BUCKETFS_WRITE_PASS
+    # BENCH_CATALOG selects the catalog behind the remote CONNECTION: unset/'glue' keeps today's
+    # SigV4 payload byte-for-byte; 'lakekeeper' switches to the OAuth2 payload plus ALLOW_HTTP
+    # (Lakekeeper/Keycloak are reached over plain HTTP — decision [28]); anything else is a hard
+    # error, because bench/.env carries both catalogs' variables at once so presence alone cannot
+    # select (decision [10]).
+    BENCH_CATALOG="${BENCH_CATALOG:-glue}"
+    case "$BENCH_CATALOG" in
+      glue)
+        require AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY GLUE_CATALOG_URI GLUE_WAREHOUSE \
+                NAMESPACE EXASOL_HOST EXASOL_SYS_PASSWORD BUCKETFS_WRITE_PASS
+        CATALOG_URI="$GLUE_CATALOG_URI"
+        CONN_PW="$(build_conn_password_cloud)"
+        CATALOG_ALLOW_HTTP=false
+        ;;
+      lakekeeper)
+        require AWS_REGION AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY \
+                LAKEKEEPER_CATALOG_URI LAKEKEEPER_WAREHOUSE LAKEKEEPER_CLIENT_ID \
+                LAKEKEEPER_CLIENT_SECRET LAKEKEEPER_TOKEN_URI \
+                NAMESPACE EXASOL_HOST EXASOL_SYS_PASSWORD BUCKETFS_WRITE_PASS
+        CATALOG_URI="$LAKEKEEPER_CATALOG_URI"
+        CONN_PW="$(build_conn_password_lakekeeper)"
+        CATALOG_ALLOW_HTTP=true
+        ;;
+      *) echo "ERROR: BENCH_CATALOG must be 'glue' or 'lakekeeper' (got '$BENCH_CATALOG')"; exit 1;;
+    esac
     HOST="$EXASOL_HOST"
     SYS_PASS="$EXASOL_SYS_PASSWORD"
     export BUCKETFS_WRITE_PASS                      # make's $(shell) reads it from the environment
-    CATALOG_URI="$GLUE_CATALOG_URI"
-    CONN_PW="$(build_conn_password_cloud)"
-    VS_EXTRA_PROPS="$(build_vs_extra_props false "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
+    VS_EXTRA_PROPS="$(build_vs_extra_props "$CATALOG_ALLOW_HTTP" "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
     PROFILE_ON="${BENCH_PROFILE:-1}"
     ;;
   *) echo "ERROR: BENCH_TARGET must be 'docker' or 'remote' (got '$TARGET')"; exit 1;;
@@ -378,6 +557,7 @@ fi
 {
   echo "lakehouse-engine benchmark — ${TARGET} @ ${HOST}:${EXA_PORT} — $(date)"
   printf 'namespace=%s%s\n' "${NAMESPACE}" "$(delete_header_suffix "$WITH_DELETES" "${DELETE_NS:-}")"
+  catalog_header_field "$TARGET" "${BENCH_CATALOG:-glue}"
   echo
   echo "== tables exposed by ${VS} =="
 } | tee "$REPORT"

@@ -169,7 +169,7 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
   IDENTIFIED BY '{
     "warehouse":         "lakehouse_static",
     "client_id":         "lakehouse",
-    "client_secret":     "lakehouse-engine-secret",
+    "client_secret":     "<secret>",
     "oauth2_server_uri": "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token",
     "endpoint":          "http://minio:9000",
     "region":            "us-east-1",
@@ -200,7 +200,7 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
   IDENTIFIED BY '{
     "warehouse":               "lakehouse_vended",
     "client_id":               "lakehouse",
-    "client_secret":           "lakehouse-engine-secret",
+    "client_secret":           "<secret>",
     "oauth2_server_uri":       "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token",
     "use_vended_credentials": true
   }';

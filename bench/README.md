@@ -17,14 +17,36 @@ Config comes from a gitignored `bench/.env` (copy `bench/.env.example`).
 - **`docker` (default)** — self-contained. Brings up the local stack (MinIO +
   Iceberg REST + Exasol via `docker-compose.yml`), loads TPC-H into the local
   catalog, runs the query set + pushdown checks. No AWS; `.env` optional.
-- **`remote`** — runs against a real AWS Glue catalog + an external Exasol
-  cluster, with a best-effort `PROFILE` dump. Requires `AWS_*` / `GLUE_*` /
-  `EXASOL_*` / `BUCKETFS_WRITE_PASS` in `.env`. **You must pre-load TPC-H into
-  the Glue namespace yourself** — remote mode does not load data.
+- **`remote`** — runs against a real AWS catalog (Glue by default, or
+  Lakekeeper — see `BENCH_CATALOG` below) + an external Exasol cluster, with a
+  best-effort `PROFILE` dump. Requires `AWS_*` / `EXASOL_*` /
+  `BUCKETFS_WRITE_PASS` in `.env`, plus `GLUE_*` for the Glue arm. **You must
+  pre-load TPC-H into the catalog yourself** — remote mode does not load data.
 
 To stand up a remote AWS cluster + catalog (and to enable co-workers), see
 [`../deploy/README.md`](../deploy/README.md); `deploy/scripts/secrets.sh <env>`
 generates the `bench/.env` for a deployed cluster.
+
+### `BENCH_CATALOG` (remote mode only)
+
+`remote` mode reads two catalogs from `bench/.env` at once and picks between them with
+`BENCH_CATALOG`, unset or `glue` (default) vs. `lakekeeper`:
+
+- **`glue`** (default) — today's behavior, byte-for-byte: SigV4 + the `AWS_*` / `GLUE_*`
+  variables above.
+- **`lakekeeper`** — an opt-in, ephemeral Lakekeeper catalog stood up by `deploy/scripts/lakekeeper-up.sh` (see [`../deploy/README.md`](../deploy/README.md)'s "Lakekeeper (ephemeral,
+  opt-in)" section for the full setup and the live-demo runbook). Requires `AWS_REGION`,
+  `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` (the same read-only `engine-reader` S3 key pair
+  the Glue arm uses — the query path stays read-only either way), plus `LAKEKEEPER_CATALOG_URI`,
+  `LAKEKEEPER_WAREHOUSE`, `LAKEKEEPER_CLIENT_ID`, `LAKEKEEPER_CLIENT_SECRET`,
+  `LAKEKEEPER_TOKEN_URI` — all written into `bench/.env` by `deploy/scripts/secrets.sh <env>` once
+  a Lakekeeper stack workspace exists for that environment. Authenticates via OAuth2
+  client-credentials (Keycloak) rather than SigV4; the adapter rejects a CONNECTION combining
+  `use_sigv4` with `client_id`/`client_secret`, so this is a distinct payload, not a Glue-arm flag.
+  Any other `BENCH_CATALOG` value is a hard error naming the two accepted ones.
+
+`BENCH_CATALOG` does not select data, namespace, warehouse naming, or query set — those stay
+identical between the two catalogs. It selects the CONNECTION's catalog auth only.
 
 ## Delete-bearing benchmark (`BENCH_WITH_DELETES`)
 
@@ -164,7 +186,7 @@ auto-provision both, consistent with never auto-double-provisioning Trino/EMR.
   machine, reaching Trino over the public internet — that made native Trino look slower than it is,
   which is why IMPORT FROM JDBC appeared to beat it on every query, purely from measurement bias.
   Requires the Trino EC2 key pair's private key locally to SSH into the worker (`KEY_FILE`,
-  default `~/.ssh/spot-strata-rsa` — apply the stack with a `key_pair_name` you actually hold);
+  default `~/.ssh/<project>-rsa` — apply the stack with a `key_pair_name` you actually hold);
   resolves the coordinator's private ip itself via the AWS CLI (connecting from the worker to the
   coordinator's *public* ip does not reliably pass the security group's internode rule).
 - **`spark_compare.sh`** — requires `deploy/data-stack` applied with `-var
@@ -244,9 +266,14 @@ and repoint `BENCH_SO_UDF_OBJECT`. Overwriting the same BucketFS path can leave 
 UDF node serving a stale cache (`cannot open shared object file`) for many minutes;
 a fresh path forces a clean fetch.
 
-## Remote Glue (AWS) gotchas
+## Remote catalog (AWS) gotchas
 
 - `GLUE_WAREHOUSE` is the bare account id (matches `.env.example` and `install.md`), NOT
   an `s3://` path. The adapter derives the `catalogs/<account-id>` REST prefix internally.
+- `LAKEKEEPER_WAREHOUSE` is likewise a NAME, not an endpoint or an `s3://` path — it is the
+  warehouse identifier `deploy/scripts/lakekeeper-up.sh` provisioned, and the adapter resolves the
+  actual storage location from Lakekeeper's own `GET /v1/config?warehouse=` response, not from
+  anything you configure here.
 - The S3 data endpoint defaults to `https://s3.$AWS_REGION.amazonaws.com`; the scan
-  derives the virtual-hosted bucket URL from the region (no explicit endpoint).
+  derives the virtual-hosted bucket URL from the region (no explicit endpoint). This applies to
+  both catalogs — `AWS_S3_ENDPOINT` overrides it for either.

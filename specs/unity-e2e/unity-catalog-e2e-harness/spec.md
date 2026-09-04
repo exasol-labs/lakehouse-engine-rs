@@ -42,7 +42,7 @@ The suite runs against the #325 fixture harness: the `docker-compose.unity.yml` 
 * Exasol stays a precondition of the suite even though the added test needs no database, because the
   `unity-e2e` feature gates one stack and splitting it would fork the fail-not-skip contract.
 * **Split, issue #320: the Delta query-result scenarios moved to
-  `e2e-harness/unity-catalog-e2e-harness-delta-queries`.** This feature's scenario count crossed this
+  `unity-e2e/unity-catalog-e2e-harness-delta-queries`.** This feature's scenario count crossed this
   library's per-spec organization threshold once those scenarios landed; they now live in the sibling
   feature, which shares this suite's stack, binary, and the virtual schema the storage-credential
   scenario below creates.
@@ -111,4 +111,4 @@ The suite runs against the #325 fixture harness: the `docker-compose.unity.yml` 
 
 > The scenarios asserting the ROWS a query returns over these fixtures — delete-free, deletion-vector,
 > column-mapped, partitioned, join/aggregate, and unplannable-type — live in
-> `e2e-harness/unity-catalog-e2e-harness-delta-queries`.
+> `unity-e2e/unity-catalog-e2e-harness-delta-queries`.

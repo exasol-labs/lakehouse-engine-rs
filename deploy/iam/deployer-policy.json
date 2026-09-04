@@ -60,6 +60,7 @@
         "iam:CreateUser",
         "iam:DeleteUser",
         "iam:GetUser",
+        "iam:ListGroupsForUser",
         "iam:TagUser",
         "iam:UntagUser",
         "iam:CreateAccessKey",
