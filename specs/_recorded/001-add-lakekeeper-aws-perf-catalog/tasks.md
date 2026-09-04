@@ -38,7 +38,7 @@
 
 ## Phase 4: Review Fixes (Expert)
 <!-- Indices are 4.e1.. rather than 4.1.. because Phase 2 already owns task ids 4.1-4.3. -->
-- [x] 4.e1 `deploy/lakekeeper-stack/outputs.tf` + `deploy/scripts/lakekeeper-up.sh` — publish `data_ssm_root` from the already-declared `data.terraform_remote_state.data`, read `DATA_SSM` from that stack output instead of composing `/spot-strata/$ENV`, delete the now-wrong comment, and add `test_up_reads_the_data_stack_ssm_root_from_the_stack_output` to `deploy/scripts/tests/lakekeeper.test.sh` [expert]
+- [x] 4.e1 `deploy/lakekeeper-stack/outputs.tf` + `deploy/scripts/lakekeeper-up.sh` — publish `data_ssm_root` from the already-declared `data.terraform_remote_state.data`, read `DATA_SSM` from that stack output instead of composing `/<project>/$ENV`, delete the now-wrong comment, and add `test_up_reads_the_data_stack_ssm_root_from_the_stack_output` to `deploy/scripts/tests/lakekeeper.test.sh` [expert]
 - [x] 4.e2 `bench/run.sh` — make the config file overridable via `BENCH_ENV_FILE`, gate the sourcing block on its existence, isolate the three `bench_catalog_selection` subprocesses with `BENCH_ENV_FILE=/dev/null` plus `env -u` of every remote variable, add a fourth assertion covering the new knob, and document it in `bench/.env.example` [expert]
 - [x] 4.e3 `deploy/scripts/tests/lakekeeper.test.sh` — extend the `tofu` stub for `apply`/`destroy` recording and `output -raw`, add `test_up_applies_only_this_stack_and_waits_for_health` and `test_down_destroys_only_the_lakekeeper_workspace`, rename the five diverging test functions to the plan's § Scenario Coverage names, and split the AWS-credential-chain assertions into `test_provision_uses_only_the_aws_credential_chain_and_an_explicit_region` [expert]
 
@@ -58,7 +58,7 @@
 - [x] 4.s12 `deploy/README.md` — [OUTDATED_COMMENT] add the missing one-time `tofu init` to the quick-start block plus the cluster-stack prerequisite sentence
 - [x] 4.s13 `deploy/README.md` — [OUTDATED_COMMENT] add the missing `tofu workspace new/select` step to the unwrapped runbook's `cluster-stack` apply
 - [x] 4.s14 `deploy/README.md` — [OUTDATED_COMMENT] fix the "four-service" service count/name mismatch and add the cluster-stack `tofu apply` to the bench-remote.sh chain description
-- [x] 4.s15 `deploy/README.md` + `deploy/DEMO.md` — [OUTDATED_COMMENT] prefix the teardown and unwrapped setup lines with `AWS_PROFILE=spot-strata-deployer`
+- [x] 4.s15 `deploy/README.md` + `deploy/DEMO.md` — [OUTDATED_COMMENT] prefix the teardown and unwrapped setup lines with `AWS_PROFILE=<project>-deployer`
 - [x] 4.s16 `deploy/README.md` — [OUTDATED_COMMENT] add `DEMO.md` to the Files list and link to it from the Demo-runbook heading
 - [x] 4.s17 `deploy/README.md` + `bench/README.md` — [OUTDATED_COMMENT] rejoin the line-wrapped inline code spans and hyphenated word so no backticked path renders with an embedded space
 - [x] 4.s18 `bench/README.md` — [OUTDATED_COMMENT] fix the `remote` mode bullet to describe Glue-or-Lakekeeper instead of Glue-only, and reword the malformed `BENCH_CATALOG` lead-in sentence

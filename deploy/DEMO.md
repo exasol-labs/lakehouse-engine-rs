@@ -16,8 +16,8 @@ Run these in order, from the repo root. This is the WRAPPER form from `deploy/RE
 runbook — the default path:
 
 ```bash
-AWS_PROFILE=spot-strata-deployer deploy/scripts/lakekeeper-up.sh myenv
-AWS_PROFILE=spot-strata-deployer BENCH_CATALOG=lakekeeper KEEP_ALIVE=1 deploy/scripts/bench-remote.sh myenv
+AWS_PROFILE=<project>-deployer deploy/scripts/lakekeeper-up.sh myenv
+AWS_PROFILE=<project>-deployer BENCH_CATALOG=lakekeeper KEEP_ALIVE=1 deploy/scripts/bench-remote.sh myenv
 ```
 
 The first command stands up the ephemeral Lakekeeper box and registers the eight TPC-H tables into
@@ -85,8 +85,8 @@ Close every demo with both of these, in either order — don't leave the session
 them:
 
 ```bash
-AWS_PROFILE=spot-strata-deployer deploy/scripts/cluster-down.sh myenv
-AWS_PROFILE=spot-strata-deployer deploy/scripts/lakekeeper-down.sh myenv
+AWS_PROFILE=<project>-deployer deploy/scripts/cluster-down.sh myenv
+AWS_PROFILE=<project>-deployer deploy/scripts/lakekeeper-down.sh myenv
 ```
 
 Both boxes bill for as long as they exist. Verify via `aws ec2 describe-instances` that nothing is

@@ -62,7 +62,7 @@ Lakekeeper validates a warehouse's storage access at creation by writing, readin
 
 ### Decision
 
-The stack creates an IAM user named with the `spot-strata-<env>-lakekeeper` prefix, granting object read, write, and delete on the `data-stack` bucket, and stores its key pair in SSM `SecureString`. That key pair becomes the warehouse's storage credential; the Exasol CONNECTION keeps the existing read-only `engine-reader` key pair.
+The stack creates an IAM user named with the `<project>-<env>-lakekeeper` prefix, granting object read, write, and delete on the `data-stack` bucket, and stores its key pair in SSM `SecureString`. That key pair becomes the warehouse's storage credential; the Exasol CONNECTION keeps the existing read-only `engine-reader` key pair.
 
 ### Options Considered
 
@@ -74,7 +74,7 @@ The stack creates an IAM user named with the `spot-strata-<env>-lakekeeper` pref
 
 ### Consequences
 
-No `deploy/iam/deployer-policy.json` change is required, since the deployer's IAM statement already covers `spot-strata-*`-named users, policies, and access keys. The write-capable grant's blast radius (bucket-wide, not prefix-scoped) is separately named as an accepted risk in `lakekeeper-bucket-wide-write-accepted-risk`.
+No `deploy/iam/deployer-policy.json` change is required, since the deployer's IAM statement already covers `<project>-*`-named users, policies, and access keys. The write-capable grant's blast radius (bucket-wide, not prefix-scoped) is separately named as an accepted risk in `lakekeeper-bucket-wide-write-accepted-risk`.
 
 ## ADR: Two URI vantages, keyed on where the caller runs
 

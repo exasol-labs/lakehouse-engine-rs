@@ -128,7 +128,7 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
   form run `lakekeeper-up.sh <env>` before `bench-remote.sh` applies the cluster
 * *WHEN* the operator runs `deploy/scripts/lakekeeper-up.sh <env>`
 * *THEN* the stack SHALL create exactly one EC2 instance in the `data-stack` subnet, named with the
-  `spot-strata-<env>-lakekeeper` prefix and carrying the same `exa:*` default-tag block every other
+  `<project>-<env>-lakekeeper` prefix and carrying the same `exa:*` default-tag block every other
   stack in `deploy/` applies
 * *AND* the instance SHALL run four containers from its user-data — PostgreSQL, Keycloak, a run-once
   Lakekeeper `migrate`, and Lakekeeper `serve` — reading the `data-stack` S3 bucket rather than MinIO
@@ -143,7 +143,7 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
   SHALL print the connection details plus an explicit cost-and-teardown reminder naming
   `lakekeeper-down.sh <env>`
 * *AND* the stack SHALL require no change to `deploy/iam/deployer-policy.json`, because every
-  resource it creates is either already wildcard-permitted or named with the `spot-strata-*` prefix
+  resource it creates is either already wildcard-permitted or named with the `<project>-*` prefix
   that policy's IAM statement already covers
 * *AND* the stack SHALL ALSO publish every non-secret connection value under its own SSM root as a
   plain `String` parameter — the warehouse name, the OAuth2 client id, and the catalog and token URIs
@@ -202,7 +202,7 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
   deleting a probe object under a random path inside the warehouse's own prefix, then asserting that
   the probe's own random path is empty — so warehouse creation fails outright on a read-only credential
 * *WHEN* the Lakekeeper stack is applied
-* *THEN* the stack SHALL create its own IAM user named with the `spot-strata-<env>-lakekeeper` prefix,
+* *THEN* the stack SHALL create its own IAM user named with the `<project>-<env>-lakekeeper` prefix,
   whose policy grants exactly the actions that probe needs — object put, get, and delete, plus bucket
   list for the recursive cleanup — scoped to the `data-stack` bucket and its objects and to no other
   resource
@@ -423,7 +423,7 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
 
 * *GIVEN* the TPC-H Iceberg tables already loaded on S3 and cataloged in the source namespace the
   bench environment names — the Glue database `data-stack` publishes at SSM
-  `/spot-strata/<env>/namespace/tpch` in the AWS deployment
+  `/<project>/<env>/namespace/tpch` in the AWS deployment
 * *WHEN* the provisioning script runs
 * *THEN* it SHALL enumerate that namespace rather than carry a hardcoded table list, so a different
   namespace needs no code change and a table added to the source is picked up automatically
