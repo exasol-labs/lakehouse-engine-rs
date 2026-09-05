@@ -56,6 +56,19 @@ pub fn redact_credentials(s: &str) -> String {
         "azure_storage_access_key",
         "azure_storage_sas_key",
         "sig=",
+        // `AdlsCred::Sas`'s serialized wire tag. The trailing quote is part of
+        // the label, not just the colon: the value that follows is itself
+        // quote-delimited, and a label of `"sas":` alone would stop the
+        // end-of-value scan below at the value's own opening quote and redact
+        // nothing. Consuming that opening quote as part of the label is what
+        // lets the scan reach INTO the value at all. From there, the scan
+        // still stops at the first of `['"', '\'', ' ', '\n', ',', '&', '\r']`
+        // — so for an `&`-separated serialized SAS token, only the first
+        // parameter is removed by this label; the signature itself is removed
+        // separately by the earlier `sig=` label. A bare `sas` pattern is
+        // deliberately not used: it would redact from any occurrence of those
+        // three letters in unrelated prose.
+        "\"sas\":\"",
     ];
     const REDACTED: &str = "[REDACTED]";
     let mut result = s.to_string();

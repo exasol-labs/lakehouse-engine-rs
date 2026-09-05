@@ -17,6 +17,8 @@
 //! temp-directory copy of the vendored bytes, so nothing here mutates the checked-in
 //! fixture.
 
+mod scan_fixture;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -33,7 +35,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
@@ -179,7 +181,7 @@ fn basic_partitioned_spec(
             partition_columns: vec!["letter".to_string()],
             filter,
             limit,
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -262,7 +264,14 @@ async fn try_run_scan_with_store(
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
     let mut ctx = FakeCtx::new();
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers).await?;
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        spec,
+        &scan_fixture::resolved_storage(spec),
+        &mut timers,
+    )
+    .await?;
     Ok(ctx.emitted)
 }
 
@@ -402,7 +411,7 @@ fn spec_with_flag(files: Vec<FileEntry>, table_root: &str) -> ScanSpec {
             table_root: table_root.to_string(),
             logical_schema: logical_schema_with_flag(),
             partition_columns: vec!["letter".to_string(), "flag".to_string()],
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -535,7 +544,7 @@ fn logged_partition_value_wins_over_a_physical_partition_column() {
             table_root: table_root.clone(),
             logical_schema: one_off_logical_schema(),
             partition_columns: vec!["letter".to_string()],
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -607,9 +616,14 @@ fn materialized_partition_column_serves_projection_filter_and_group_by() {
             &Url::parse(&table_root).expect("register url"),
             Arc::new(LocalFileSystem::new()),
         );
-        register_files(&session, "scan_target", &group_spec)
-            .await
-            .expect("register_files must succeed");
+        register_files(
+            &session,
+            "scan_target",
+            &group_spec,
+            &scan_fixture::resolved_storage(&group_spec),
+        )
+        .await
+        .expect("register_files must succeed");
         let df = session
             .sql(r#"SELECT "letter", COUNT(*) AS c FROM scan_target GROUP BY "letter" ORDER BY "letter""#)
             .await
@@ -700,7 +714,7 @@ fn scan_without_partition_columns_is_byte_identical() {
         common: CommonScanSpec {
             table_root: table_root.clone(),
             logical_schema: unpartitioned_logical_schema(),
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -717,9 +731,14 @@ fn scan_without_partition_columns_is_byte_identical() {
             &Url::parse(&table_root).expect("register url"),
             Arc::new(LocalFileSystem::new()),
         );
-        register_files(&ctx, "scan_target", &spec)
-            .await
-            .expect("register_files must succeed");
+        register_files(
+            &ctx,
+            "scan_target",
+            &spec,
+            &scan_fixture::resolved_storage(&spec),
+        )
+        .await
+        .expect("register_files must succeed");
         let plan = build_raw_scan_physical_plan(&ctx, &spec)
             .await
             .expect("build physical plan");

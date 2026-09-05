@@ -3,9 +3,13 @@
 /// The CONNECTION's `address` is the Iceberg REST catalog URI; the `password`
 /// is a JSON object carrying credential and behavioural fields. Credential
 /// values NEVER appear in any error message produced by this module.
-use crate::scan::spec::{AdlsCred, CatalogProps, StorageBackend, StorageProps};
+use crate::scan::sealed::{
+    SealedStorageKey, connection_password_carries_key_material, derive_sealed_storage_key,
+};
+use crate::scan::spec::{CatalogProps, StorageBackend};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
+use lakehouse_catalog::StorageCreds;
 
 use super::catalog_kind::CatalogKind;
 use super::nonempty_str;
@@ -31,16 +35,38 @@ pub const REQUIRED_KEY: &str = "warehouse";
 /// mechanism.
 pub use lakehouse_catalog::ConnectionCreds;
 
-/// Resolved CONNECTION: catalog URI plus parsed credentials.
+/// Resolved CONNECTION: catalog URI, parsed credentials, and the sealing key the
+/// password is entitled to.
 #[derive(Debug)]
 pub struct Resolved {
     pub uri: String,
     pub creds: ConnectionCreds,
+    /// The sealing key HKDF-derived from this CONNECTION's RAW password bytes,
+    /// present IFF that password carries secret material.
+    ///
+    /// Both the derivation AND the decision, taken here where the password
+    /// already lives: the plaintext never travels further than
+    /// [`read_connection`]'s own body, and no reader of a `Resolved` can obtain a
+    /// key for a password holding no secret, because for such a password no key
+    /// was ever constructed. `Option` rather than a caller-side test is what makes
+    /// that structural — see [`read_connection`] for the predicate that decides
+    /// it.
+    pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 
-/// Resolve a named Exasol CONNECTION into a catalog URI and credentials.
+/// Resolve a named Exasol CONNECTION into a catalog URI, credentials, and the
+/// sealing key that password is entitled to.
 ///
 /// Credential-safe: the password value is never embedded in any returned error.
+///
+/// This is the SINGLE site that calls
+/// [`connection_password_carries_key_material`]. The condition is not inlined
+/// anywhere else, because the refusal `scan_storage_for` raises is written from a
+/// fact only that predicate knows, and a second copy of the test is how the
+/// refusal's stated reason and the outcome start to disagree. Gating HERE rather
+/// than at a consumer is what makes the guarantee structural: a password carrying
+/// no secret produces no [`SealedStorageKey`] at all, so no later reader of the
+/// returned [`Resolved`] can seal under one.
 pub fn read_connection(
     ctx: &dyn UdfContext,
     name: Option<&str>,
@@ -79,7 +105,13 @@ pub fn read_connection(
 
     let creds = parse_creds(&json);
     validate_creds(name, &creds, kind)?;
-    Ok(Resolved { uri, creds })
+    let sealed_storage_key = connection_password_carries_key_material(&creds)
+        .then(|| derive_sealed_storage_key(&conn.password));
+    Ok(Resolved {
+        uri,
+        creds,
+        sealed_storage_key,
+    })
 }
 
 /// Validate parsed credentials against the mode-aware credential contract,
@@ -292,8 +324,8 @@ fn supplied_azure_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
 /// The static S3 storage-credential field names this CONNECTION supplies.
 ///
 /// The four string fields use the empty string as "absent", the convention
-/// `parse_creds` applies to every field it reads through `nonempty_str`;
-/// `session_token` uses `None`.
+/// [`StorageCreds::from_json`] applies to every storage field `parse_creds`
+/// reads through it; `session_token` uses `None`.
 fn supplied_s3_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
     [
         ("endpoint", !creds.endpoint.is_empty()),
@@ -308,17 +340,25 @@ fn supplied_s3_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
 }
 
 fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
+    let StorageCreds {
+        endpoint,
+        region,
+        access_key,
+        secret_key,
+        session_token,
+        path_style,
+        account_name,
+        account_key,
+        sas_token,
+    } = StorageCreds::from_json(json);
     ConnectionCreds {
         warehouse: nonempty_str(json, "warehouse").unwrap_or("").to_string(),
-        endpoint: nonempty_str(json, "endpoint").unwrap_or("").to_string(),
-        region: nonempty_str(json, "region").unwrap_or("").to_string(),
-        access_key: nonempty_str(json, "access_key").unwrap_or("").to_string(),
-        secret_key: nonempty_str(json, "secret_key").unwrap_or("").to_string(),
-        session_token: nonempty_str(json, "session_token").map(|s| s.to_string()),
-        path_style: json
-            .get("path_style")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true),
+        endpoint,
+        region,
+        access_key,
+        secret_key,
+        session_token,
+        path_style,
         use_sigv4: json
             .get("use_sigv4")
             .and_then(|v| v.as_bool())
@@ -332,53 +372,29 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
         client_secret: nonempty_str(json, "client_secret").map(|s| s.to_string()),
         oauth2_server_uri: nonempty_str(json, "oauth2_server_uri").map(|s| s.to_string()),
         scope: nonempty_str(json, "scope").map(|s| s.to_string()),
-        account_name: nonempty_str(json, "account_name").map(|s| s.to_string()),
-        account_key: nonempty_str(json, "account_key").map(|s| s.to_string()),
-        sas_token: nonempty_str(json, "sas_token").map(|s| s.to_string()),
+        account_name,
+        account_key,
+        sas_token,
     }
 }
 
-/// Build a `StorageBackend` from resolved credentials. `allow_http` arrives as
-/// a parameter rather than a `ConnectionCreds` field because it originates
-/// from the adapter's `PROP_ALLOW_HTTP` property, read in
-/// `resolve_connection_config`, not from the connection creds themselves;
-/// taking it here lets this function finish building the `StorageBackend`
-/// payload in one step, so no caller has to mutate the constructed payload
-/// afterwards to apply it. It is an S3-only knob: the Azure backend carries no
-/// HTTP-scheme field, so an Azure CONNECTION ignores it.
+/// Build a `StorageBackend` from resolved credentials, by projecting them onto
+/// their storage half and asking that projection which backend it describes.
 ///
-/// This is the ONE site that selects a storage backend from input, and it is
-/// TOTAL by construction. The Azure branch needs an account name AND a
-/// resolvable [`AdlsCred`] — exactly one of `account_key` and `sas_token` —
-/// and falls through to S3 when either is absent. `read_connection` always runs
-/// `validate_creds` first, so that fall-through is unreachable in production;
-/// it is a deterministic answer rather than a panic because a panic inside a
-/// UDF is an abnormal VM exit, and the engine responds by SIGKILLing every
-/// sibling VM of the statement part — turning a defensive assertion into a
-/// cluster-wide failure. Returning `Result` instead would push a new error path
-/// through the caller for a state that cannot occur.
+/// The selection rule itself lives on [`StorageCreds::backend`], not here, so
+/// the adapter's plan-time derivation and the scan UDF's own read of the same
+/// CONNECTION cannot select two different backends from one password. What
+/// stays here is the Exasol-CONNECTION-facing entry point: `catalog-crate-structure`
+/// records that every function interpreting that delivery mechanism belongs to
+/// this module, because the catalog crate must not name it. So this is a
+/// deliberate projection-and-delegate rather than a layer to inline away.
+///
+/// `allow_http` arrives as a parameter rather than a `ConnectionCreds` field
+/// because it originates from the adapter's `PROP_ALLOW_HTTP` property, read in
+/// `resolve_connection_config`, not from the connection creds themselves; it is
+/// an S3-only knob, so an Azure CONNECTION ignores it.
 pub fn storage_block(creds: &ConnectionCreds, allow_http: bool) -> StorageBackend {
-    let azure_cred = match (creds.account_key.as_deref(), creds.sas_token.as_deref()) {
-        (Some(account_key), None) => Some(AdlsCred::AccountKey(account_key.to_string())),
-        (None, Some(sas_token)) => Some(AdlsCred::Sas(sas_token.to_string())),
-        (Some(_), Some(_)) | (None, None) => None,
-    };
-    if let (Some(account_name), Some(cred)) = (creds.account_name.as_deref(), azure_cred) {
-        return StorageBackend::Adls {
-            account_name: account_name.to_string(),
-            cred,
-        };
-    }
-
-    StorageBackend::S3(StorageProps {
-        endpoint: creds.endpoint.clone(),
-        region: creds.region.clone(),
-        access_key: creds.access_key.clone(),
-        secret_key: creds.secret_key.clone(),
-        session_token: creds.session_token.clone(),
-        allow_http,
-        path_style: creds.path_style,
-    })
+    StorageCreds::from(creds).backend(allow_http)
 }
 
 /// Build `CatalogProps` from resolved credentials and table name.

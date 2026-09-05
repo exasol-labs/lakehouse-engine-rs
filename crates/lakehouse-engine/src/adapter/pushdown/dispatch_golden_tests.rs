@@ -1,15 +1,21 @@
 //! Golden dispatch-SQL baseline (issue #175 / plan
 //! `refactor-scan-spec-dispatch-dedup`, task 1.2).
 //!
-//! Ten committed fixtures under `testdata/dispatch_golden/` — five non-empty
-//! dispatch shapes rendered through the production [`build_dispatch_sql`] seam,
-//! and five empty shapes rendered through [`empty_result_sql`] — captured from
-//! the pre-dedup code. Every subsequent dedup task (2-5) MUST leave these ten
-//! fixtures byte-identical; a diff here is a regression, never an expected
-//! update. Every assertion is a full-string `assert_eq!` against the committed
-//! file — never `.contains(...)` or `.matches(...).count()`.
+//! Twenty-four committed fixtures under `testdata/dispatch_golden/` —
+//! eighteen non-empty dispatch shapes rendered through the production
+//! [`build_dispatch_sql`] seam (or the broadcast-join / N-scan-join sites for
+//! the two cross-site fixtures), and six empty shapes rendered through
+//! [`empty_result_sql`]. The eighteen non-empty fixtures each carry a
+//! credential-bearing `storage` value and are regenerated whenever that
+//! rendering changes (plan `fix-connection-credential-exposure`, task 3.4,
+//! moved them from an inline credential to the REFERENCE `ScanStorage::
+//! Connection` variant); the six `empty_*` fixtures carry no `storage` value
+//! at all and MUST stay byte-identical across every such change — a diff in
+//! one of them is always a regression, never an expected update. Every
+//! assertion is a full-string `assert_eq!` against the committed file — never
+//! `.contains(...)` or `.matches(...).count()`.
 
-use super::test_support::{agg_item, pd, sample_storage};
+use super::test_support::{agg_item, pd, sample_scan_storage, sample_storage};
 use super::*;
 
 /// The fixed three-shard file list every non-empty golden dispatches over.
@@ -328,7 +334,7 @@ fn dispatch_sql_widened(request: &Json) -> String {
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        &sample_storage(),
+        &sample_scan_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -375,7 +381,7 @@ fn dispatch_sql_with_pushdown_req(
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        &sample_storage(),
+        &sample_scan_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -948,7 +954,7 @@ fn grouped_all_agg_kinds_matches_golden() {
 // only two cases the fix is required to leave unchanged.
 
 use super::joins::{
-    JoinScanTuning, JoinWindowPlan, build_broadcast_join_sql, build_n_scan_join_sql,
+    JoinScanRequestConfig, JoinWindowPlan, build_broadcast_join_sql, build_n_scan_join_sql,
 };
 
 /// A minimal CUSTOMER ⋈ ORDERS inner equi-join pushdown request (disjoint
@@ -1055,8 +1061,8 @@ fn resolved_orders_side() -> ResolvedJoinSide {
 }
 
 /// The fixed join tuning knobs both join-site goldens dispatch over.
-fn join_scan_tuning() -> JoinScanTuning {
-    JoinScanTuning {
+fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
+    JoinScanRequestConfig {
         cluster_nodes: 1,
         parallelism_factor: 1,
         df_target_partitions: 1,
@@ -1065,6 +1071,7 @@ fn join_scan_tuning() -> JoinScanTuning {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 0,
         s3_max_connections: 1,
+        connection: &super::test_support::TEST_CONNECTION,
     }
 }
 
@@ -1105,6 +1112,7 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )
+    .expect("selecting the wire storage must succeed")
     .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,
@@ -1177,6 +1185,7 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )
+    .expect("selecting the wire storage must succeed")
     .expect("an unbounded broadcast join must build");
     assert_eq!(
         broadcast_sql,

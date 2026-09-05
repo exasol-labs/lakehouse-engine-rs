@@ -35,6 +35,18 @@ assert_not_contains(){ if [[ "$2" != *"$3"* ]]; then pass "$1"; else fail "$1" "
 assert_rc_zero()     { if [[ "$2" -eq 0 ]]; then pass "$1"; else fail "$1" "expected rc 0 got $2"; fi; }
 assert_rc_nonzero()  { if [[ "$2" -ne 0 ]]; then pass "$1"; else fail "$1" "expected nonzero rc got $2"; fi; }
 
+# assert_precedes label haystack first second -- both must be present, and the
+# FIRST occurrence of `first` must come before the first occurrence of `second`.
+# Statement ORDER is load-bearing in the next-step template: the adapter's
+# connection grant has to exist before CREATE VIRTUAL SCHEMA runs.
+assert_precedes() {
+  local hay="$2" a="$3" b="$4"
+  if [[ "$hay" != *"$a"* ]]; then fail "$1" "missing [$a]"; return; fi
+  if [[ "$hay" != *"$b"* ]]; then fail "$1" "missing [$b]"; return; fi
+  local pre_a="${hay%%"$a"*}" pre_b="${hay%%"$b"*}"
+  if (( ${#pre_a} < ${#pre_b} )); then pass "$1"; else fail "$1" "[$a] does not precede [$b]"; fi
+}
+
 count_occurrences() { # needle haystack -> count
   local n="$1" rest="$2" c=0
   while [[ "$rest" == *"$n"* ]]; do
@@ -1016,6 +1028,87 @@ test_stops_at_product_prints_template() {
   local log; log="$(log_content)"
   assert_not_contains "template: does NOT execute CREATE VIRTUAL SCHEMA" "$log" "CREATE VIRTUAL SCHEMA"
   assert_not_contains "template: does NOT execute CREATE CONNECTION" "$log" "CREATE OR REPLACE CONNECTION"
+}
+
+test_next_step_template_emits_the_scan_script_grant_and_the_replace_warning() {
+  echo "== test_next_step_template_emits_the_scan_script_grant_and_the_replace_warning =="
+  reset_env
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "grant template: install succeeds" "$LAST_RC"
+  assert_contains "grant template: creates the deployment-scoped role" "$LAST_OUT" "CREATE ROLE LAKEHOUSE_ENGINE_ROLE_LHVS;"
+
+  # BOTH scripts resolve the CONNECTION and BOTH therefore need the grant. The adapter's was
+  # missing until task 1.3b's live probe showed a non-DBA owner cannot even create the virtual
+  # schema without it.
+  assert_contains "grant template: grants script-scoped connection access to the ADAPTER" "$LAST_OUT" \
+    "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.LAKEHOUSE_ADAPTER TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
+  assert_contains "grant template: grants script-scoped connection access to the SCAN script" "$LAST_OUT" \
+    "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT LHVS.LAKEHOUSE_SCAN TO LAKEHOUSE_ENGINE_ROLE_LHVS;"
+
+  # The adapter resolves the CONNECTION while CREATE VIRTUAL SCHEMA runs, so an operator copying
+  # the template top-to-bottom must reach the grant first.
+  assert_precedes "grant template: the adapter grant precedes CREATE VIRTUAL SCHEMA" "$LAST_OUT" \
+    "FOR SCRIPT LHVS.LAKEHOUSE_ADAPTER TO LAKEHOUSE_ENGINE_ROLE_LHVS;" "CREATE VIRTUAL SCHEMA <MY_LAKEHOUSE>"
+  assert_precedes "grant template: the scan grant precedes CREATE VIRTUAL SCHEMA" "$LAST_OUT" \
+    "FOR SCRIPT LHVS.LAKEHOUSE_SCAN TO LAKEHOUSE_ENGINE_ROLE_LHVS;" "CREATE VIRTUAL SCHEMA <MY_LAKEHOUSE>"
+
+  # The grantee is the VIRTUAL SCHEMA OWNER, not each querying user (task 1.3b, verified live in
+  # both directions). Adding a reader is plain RBAC and involves no connection grant at all.
+  assert_contains "grant template: names the virtual schema OWNER as the grantee" "$LAST_OUT" \
+    "against the VIRTUAL SCHEMA OWNER,"
+  assert_contains "grant template: says the check is NOT per querying user" "$LAST_OUT" \
+    "not against each querying user"
+  assert_contains "grant template: holds the role on the eventual VS owner" "$LAST_OUT" \
+    "will OWN the virtual schema"
+  assert_contains "grant template: adding a reader is a plain SELECT grant" "$LAST_OUT" \
+    "GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <new-user>;"
+  assert_contains "grant template: the role goes to a further VS owner, not a reader" "$LAST_OUT" \
+    "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO <other-vs-owner>;"
+  assert_not_contains "grant template: does NOT frame the role as a per-reader grant" "$LAST_OUT" \
+    "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO <new-user>;"
+
+  # A DBA owner needs none of this, and Exasol refuses both GRANT forms to SYS outright
+  # (SQL state 42500, verified live) -- so the template must say so rather than printing a
+  # block that fails when the installer runs as SYS.
+  assert_contains "grant template: warns that both GRANT forms are refused for SYS" "$LAST_OUT" \
+    "cannot grant connections to SYS"
+  assert_contains "grant template: names the non-DBA owner's CREATE VIRTUAL SCHEMA privilege" "$LAST_OUT" \
+    "CREATE VIRTUAL SCHEMA system privilege"
+
+  assert_contains "grant template: CREATE ROLE has no IF NOT EXISTS warning" "$LAST_OUT" "NO 'IF NOT EXISTS' form"
+  assert_contains "grant template: names the EXA_ALL_ROLES pre-check" "$LAST_OUT" "EXA_ALL_ROLES"
+  assert_contains "grant template: CREATE OR REPLACE CONNECTION drops the grant warning" "$LAST_OUT" \
+    "CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS"
+  assert_contains "grant template: CREATE OR REPLACE SCRIPT also drops the grant" "$LAST_OUT" \
+    "CREATE OR REPLACE SCRIPT LHVS.LAKEHOUSE_SCAN"
+  local log; log="$(log_content)"
+  assert_not_contains "grant template: does NOT execute CREATE ROLE" "$log" "CREATE ROLE"
+  assert_not_contains "grant template: does NOT execute the connection grant" "$log" "GRANT ACCESS ON CONNECTION"
+
+  # Profile connectivity mode carries no known ARG_USER: the template falls back to a placeholder
+  # rather than printing an empty grantee.
+  assert_contains "grant template: falls back to a placeholder installing-user under profile mode" "$LAST_OUT" \
+    "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO <installing-user>;"
+
+  # Host connectivity mode DOES know the installing user: it names it, not the placeholder.
+  reset_env
+  run_file --account-id ACC1 --database-id DB1 --host myhost:8563 --user grantee_user --password p
+  assert_rc_zero "grant template (host mode): install succeeds" "$LAST_RC"
+  assert_contains "grant template (host mode): grants the role to the actual installing user" "$LAST_OUT" \
+    "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO grantee_user;"
+}
+
+test_next_step_template_skips_the_grant_block_for_a_sys_installer() {
+  echo "== test_next_step_template_skips_the_grant_block_for_a_sys_installer =="
+  reset_env
+  run_file --account-id ACC1 --database-id DB1 --host myhost:8563 --user sys --password p
+  assert_rc_zero "sys installer: install succeeds" "$LAST_RC"
+  assert_not_contains "sys installer: does not print CREATE ROLE" "$LAST_OUT" \
+    "CREATE ROLE LAKEHOUSE_ENGINE_ROLE_LHVS;"
+  assert_not_contains "sys installer: does not print the GRANT to sys" "$LAST_OUT" \
+    "GRANT LAKEHOUSE_ENGINE_ROLE_LHVS TO sys;"
+  assert_contains "sys installer: still names the refusal note" "$LAST_OUT" \
+    "cannot grant roles to SYS"
 }
 
 test_target_base_default_and_override() {
@@ -2486,6 +2579,8 @@ main() {
   test_three_scripts_ddl_saas_path_types
   test_fingerprint_smoke_pass_and_fail
   test_stops_at_product_prints_template
+  test_next_step_template_emits_the_scan_script_grant_and_the_replace_warning
+  test_next_step_template_skips_the_grant_block_for_a_sys_installer
   test_target_base_default_and_override
   test_external_failure_actionable
   test_stdin_piped_invocation_no_body_consumption

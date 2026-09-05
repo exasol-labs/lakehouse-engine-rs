@@ -1,7 +1,7 @@
 use super::super::super::support::collect_all_column_names;
 use super::super::planning::{JoinLeaf, JoinSides, JoinWindowPlan, disjoint_schema_guard};
 use super::super::sql_builders::{
-    JoinScanTuning, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
+    JoinScanRequestConfig, RenderedJoinPushdown, build_broadcast_join_sql, build_n_scan_join_sql,
     build_side_fan_out_sql, render_broadcast_join,
 };
 use super::super::tests::{
@@ -1116,7 +1116,8 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
         &two_scan_tuning(),
         "SCAN",
         "DISTRIBUTE",
-    );
+    )
+    .expect("selecting the wire storage must succeed");
     let common = common_arg_literal(&sql_with);
     assert!(
         common.contains("\"filter\"") && common.contains("O_ORDERDATE"),
@@ -1128,7 +1129,8 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
     );
 
     let sql_without =
-        build_side_fan_out_sql(&side, &cols, None, &two_scan_tuning(), "SCAN", "DISTRIBUTE");
+        build_side_fan_out_sql(&side, &cols, None, &two_scan_tuning(), "SCAN", "DISTRIBUTE")
+            .expect("selecting the wire storage must succeed");
     let common_none = common_arg_literal(&sql_without);
     assert!(
         !common_none.contains("\"filter\""),
@@ -1148,12 +1150,13 @@ fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
     );
     let cols = vec![("O_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string())];
     // Force two shards: two nodes × factor 1 over two files.
-    let tuning = JoinScanTuning {
+    let tuning = JoinScanRequestConfig {
         cluster_nodes: 2,
         parallelism_factor: 1,
         ..two_scan_tuning()
     };
-    let sql = build_side_fan_out_sql(&side, &cols, None, &tuning, "SCAN", "DISTRIBUTE");
+    let sql = build_side_fan_out_sql(&side, &cols, None, &tuning, "SCAN", "DISTRIBUTE")
+        .expect("selecting the wire storage must succeed");
 
     assert!(
         !sql.contains("SELECT * FROM ("),
@@ -1192,7 +1195,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
     };
-    let tuning = JoinScanTuning {
+    let tuning = JoinScanRequestConfig {
         cluster_nodes: 2,
         parallelism_factor: 1,
         ..two_scan_tuning()
@@ -1205,6 +1208,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         "SCAN",
         "DISTRIBUTE",
     )
+    .expect("selecting the wire storage must succeed")
     .expect("an unbounded broadcast join must build");
 
     assert!(

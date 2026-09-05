@@ -24,6 +24,8 @@
 //! `LIMIT 1` over four delete-carrying files so the opener provably leaves
 //! footers unopened.
 
+mod scan_fixture;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -43,10 +45,12 @@ use lakehouse_engine::scan::diagnostics::{
     OpenerCoverage, PhaseTimers, footer_refetch_count, reset_access_plan_cached_footers,
 };
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, StorageBackend,
-    StorageProps,
+    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
+    StorageBackend, StorageProps,
 };
-use lakehouse_engine::scan::{run_raw_scan_with_session, run_scan_one, session_config_for_spec};
+use lakehouse_engine::scan::{
+    ResolvedScanStorage, run_raw_scan_with_session, run_scan_one, session_config_for_spec,
+};
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{
@@ -248,7 +252,7 @@ fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
         common: CommonScanSpec {
             table_root,
             projection: vec!["ID".into(), "NAME".into()],
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             logical_schema: vec![
                 LogicalField {
@@ -471,6 +475,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         &mut evict_ctx,
         &evict_session,
         &spec,
+        &scan_fixture::resolved_storage(&spec),
         &mut evict_timers,
     ))
     .expect("delete-carrying scan must succeed even when the metadata cache evicts");
@@ -522,6 +527,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         &mut default_ctx,
         &default_session,
         &spec,
+        &scan_fixture::resolved_storage(&spec),
         &mut default_timers,
     ))
     .expect("delete-carrying scan must succeed under the default cache limit");
@@ -604,6 +610,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         &mut limit_ctx,
         &limit_session,
         &limit_spec,
+        &scan_fixture::resolved_storage(&limit_spec),
         &mut limit_timers,
     ))
     .expect("delete-carrying scan with a pushed LIMIT must succeed");
@@ -685,19 +692,20 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
     let captured: std::sync::Mutex<Vec<SessionContext>> = std::sync::Mutex::new(Vec::new());
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let store_url = Url::parse(&data_a).expect("register url");
-    let build_session = |spec: &ScanSpec, _memory_limit_bytes: u64| {
-        let session = SessionContext::new_with_config(session_config_for_spec(spec));
-        session.runtime_env().register_object_store(
-            &store_url,
-            Arc::new(RequestLoggingStore {
-                inner: Arc::new(LocalFileSystem::new()),
-                sizes: sizes.clone(),
-                log: Arc::clone(&log),
-            }),
-        );
-        captured.lock().unwrap().push(session.clone());
-        Ok(session)
-    };
+    let build_session =
+        |spec: &ScanSpec, _storage: &ResolvedScanStorage, _memory_limit_bytes: u64| {
+            let session = SessionContext::new_with_config(session_config_for_spec(spec));
+            session.runtime_env().register_object_store(
+                &store_url,
+                Arc::new(RequestLoggingStore {
+                    inner: Arc::new(LocalFileSystem::new()),
+                    sizes: sizes.clone(),
+                    log: Arc::clone(&log),
+                }),
+            );
+            captured.lock().unwrap().push(session.clone());
+            Ok(session)
+        };
 
     let spec_for = |data_url: &str, delete_url: &str| {
         let mut spec = raw_spec_with_logical_schema(String::new());
@@ -716,6 +724,7 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
     block_on(run_scan_one(
         &mut ctx_a,
         spec_for(&data_a, &delete_a),
+        &scan_fixture::resolved_storage(&spec_for(&data_a, &delete_a)),
         &build_session,
     ))
     .expect("invocation 1 over file A must succeed");
@@ -729,6 +738,7 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
     block_on(run_scan_one(
         &mut ctx_b,
         spec_for(&data_b, &delete_b),
+        &scan_fixture::resolved_storage(&spec_for(&data_b, &delete_b)),
         &build_session,
     ))
     .expect("invocation 2 over file B must succeed");

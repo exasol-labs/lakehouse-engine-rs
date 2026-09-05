@@ -8,7 +8,7 @@
 
 use crate::ConnectionCreds;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
-use crate::redaction::{redact_credentials, redact_secret_values};
+use crate::redaction::redact_error_text;
 use exasol_udf_sdk::error::UdfError;
 use std::collections::HashMap;
 
@@ -69,6 +69,12 @@ pub(crate) fn inject_catalog_auth_props(
 /// generic label/pattern redaction AND strips the literal `token`, `client_secret`,
 /// `client_id`, `oauth2_server_uri`, and `scope` values so any auth field echoed
 /// without a recognizable label can never leak.
+///
+/// Routes through [`redact_error_text`], NOT the inverted
+/// `redact_secret_values(redact_credentials(msg), ...)` composition this site
+/// used before: `redaction.rs` documents that ordering as broken for a SAS
+/// token, whose own `sig=` label gets mangled by a label-first pass, leaving
+/// the value pass unable to match the literal it was given.
 pub(crate) fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> String {
     let mut secrets: Vec<String> = Vec::new();
     if let Some(token) = non_empty(&creds.token) {
@@ -90,7 +96,7 @@ pub(crate) fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> S
         secrets.push(scope.to_string());
     }
     let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    redact_secret_values(&redact_credentials(msg), &secret_refs)
+    redact_error_text(msg, &secret_refs)
 }
 
 /// The catalog-auth strategy resolved once for a query, used to authenticate
@@ -156,8 +162,12 @@ async fn oauth2_client_credentials_grant(
     // Strip the client secret AND the obtained token from every error. The token
     // is not yet known at the point a transport/parse error is built, so it is
     // added to the redaction set after a successful parse before being returned.
-    let redact_secret =
-        |msg: &str| redact_secret_values(&redact_credentials(msg), &[client_secret]);
+    //
+    // Routes through `redact_error_text`, not the inverted
+    // `redact_secret_values(redact_credentials(msg), ...)` composition this site
+    // used before — see `redact_catalog_auth_error`'s doc comment for why the
+    // order is load-bearing.
+    let redact_secret = |msg: &str| redact_error_text(msg, &[client_secret]);
 
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", OAUTH2_GRANT_TYPE),

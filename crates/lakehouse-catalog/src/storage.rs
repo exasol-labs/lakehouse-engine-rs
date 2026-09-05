@@ -77,7 +77,11 @@ impl std::fmt::Debug for AdlsCred {
 /// S3 credential type, so an added backend is a new variant beside it rather than
 /// an edit to it. `Adls` has no equivalent pre-existing struct to protect, so it
 /// carries its two fields inline instead of wrapping a symmetry-only type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is a manual impl below, not derived: it delegates to each variant's
+/// own redacting `Debug` (`StorageProps`'s and `AdlsCred`'s), so this enum
+/// never needs to know which of its fields are secret itself.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
     /// S3-compatible object storage (AWS S3, MinIO).
@@ -96,6 +100,19 @@ pub enum StorageBackend {
         /// Exactly one Azure credential for that account.
         cred: AdlsCred,
     },
+}
+
+impl std::fmt::Debug for StorageBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::S3(props) => f.debug_tuple("S3").field(props).finish(),
+            Self::Adls { account_name, cred } => f
+                .debug_struct("Adls")
+                .field("account_name", account_name)
+                .field("cred", cred)
+                .finish(),
+        }
+    }
 }
 
 impl StorageBackend {

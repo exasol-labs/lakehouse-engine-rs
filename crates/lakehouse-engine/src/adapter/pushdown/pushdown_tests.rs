@@ -1,7 +1,7 @@
 use super::test_support::*;
 use super::*;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage, StorageProps,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
-            storage: vended_storage,
+            storage: ScanStorage::Inline(vended_storage),
             ..Default::default()
         },
         files: vec![FileEntry::new(
@@ -100,7 +100,7 @@ fn grouped_scan_spec_carries_group_keys() {
                 arg_expr: None,
             }]),
             group_keys: Some(group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![FileEntry::new("s3://w/f0.parquet", 1)],
@@ -421,7 +421,7 @@ fn scan_spec_carries_no_catalog_block() {
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![FileEntry::new(
@@ -567,7 +567,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     let spec = ScanSpec {
         common: CommonScanSpec {
             logical_schema: logical.clone(),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -855,7 +855,7 @@ fn build_logical_schema_default_less_spec_round_trips_unchanged() {
     let spec = ScanSpec {
         common: CommonScanSpec {
             logical_schema: logical.clone(),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -968,7 +968,7 @@ fn guard_dispatch_result(
         logical_schema,
         Vec::new(),
         Vec::new(),
-        &sample_storage(),
+        &sample_scan_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -1028,7 +1028,7 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        &sample_storage(),
+        &sample_scan_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -2076,6 +2076,8 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         creds,
         allow_http: false,
         catalog_kind: CatalogKind::IcebergRest,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
     };
     let result = handle_pushdown(
         &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -2111,6 +2113,8 @@ async fn seam_handle_pushdown(
         creds: creds.clone(),
         allow_http: true,
         catalog_kind,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
     };
     handle_pushdown(
         request, &conn, catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -2774,7 +2778,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         Vec::new(),
         Vec::new(),
         vec!["LETTER".to_string()],
-        &sample_storage(),
+        &sample_scan_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -2829,7 +2833,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         projection: vec![ProjectionItem::Column("CUSTOMER_KEY".to_string())],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
     };
-    let tuning = super::joins::JoinScanTuning {
+    let tuning = super::joins::JoinScanRequestConfig {
         cluster_nodes: 1,
         parallelism_factor: 1,
         df_target_partitions: 1,
@@ -2838,6 +2842,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 200,
         s3_max_connections: 8,
+        connection: &super::test_support::TEST_CONNECTION,
     };
     let join_sql = super::joins::build_broadcast_join_sql(
         &sides,
@@ -2847,6 +2852,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )
+    .expect("selecting the wire storage must succeed")
     .expect("a broadcast-eligible plan with an unbounded window must render");
     assert!(
         join_sql.contains(r#""partition_columns":["REGION"]"#),
@@ -3313,4 +3319,652 @@ async fn a_unity_catalog_pushdown_prunes_the_delta_file_list_by_its_filter() {
          exactly the one matching partition through production pushdown: \
          filtered={filtered_sql}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Task 6.1 — no CONNECTION-supplied credential reaches the generated SQL, on
+// any builder path
+// ---------------------------------------------------------------------------
+
+use crate::scan::sealed::{
+    SealedStorageKey, connection_password_carries_key_material, derive_sealed_storage_key,
+    unseal_storage,
+};
+use joins::{
+    JoinScanRequestConfig, JoinWindowPlan, build_broadcast_join_sql, build_n_scan_join_sql,
+};
+
+const SENTINEL_CONNECTION_NAME: &str = "SENTINEL_SCAN_STORAGE_CONNECTION";
+const SENTINEL_ACCESS_KEY: &str = "SENTINEL_ACCESS_KEY_VALUE";
+const SENTINEL_SECRET_KEY: &str = "SENTINEL_SECRET_KEY_VALUE";
+const SENTINEL_SESSION_TOKEN: &str = "SENTINEL_SESSION_TOKEN_VALUE";
+const SENTINEL_PASSWORD: &str = r#"{"warehouse":"wh","secret_key":"SENTINEL_SECRET_KEY_VALUE"}"#;
+
+/// Every sentinel value that must never appear literally in a rendered SQL
+/// string, in either the static or the vended case.
+fn sentinel_secret_values() -> [&'static str; 3] {
+    [
+        SENTINEL_ACCESS_KEY,
+        SENTINEL_SECRET_KEY,
+        SENTINEL_SESSION_TOKEN,
+    ]
+}
+
+/// A CONNECTION carrying sentinel storage credentials, `use_vended_credentials`
+/// as requested. Its password (`SENTINEL_PASSWORD`) carries a non-empty
+/// `secret_key`, so [`connection_password_carries_key_material`] reports true
+/// for it — the vended half of a case built from these creds always seals
+/// rather than being refused.
+fn sentinel_creds(use_vended_credentials: bool) -> ConnectionCreds {
+    ConnectionCreds {
+        warehouse: "wh".into(),
+        endpoint: "http://sentinel-minio:9000".into(),
+        region: "sentinel-region-1".into(),
+        access_key: SENTINEL_ACCESS_KEY.into(),
+        secret_key: SENTINEL_SECRET_KEY.into(),
+        session_token: Some(SENTINEL_SESSION_TOKEN.into()),
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials,
+        token: None,
+        client_id: None,
+        client_secret: None,
+        oauth2_server_uri: None,
+        scope: None,
+        account_name: None,
+        account_key: None,
+        sas_token: None,
+    }
+}
+
+/// A vending CONNECTION whose password carries NO secret-bearing field — the
+/// canonical shape `scan_storage_for` must refuse rather than seal under a
+/// guessable key. `access_key` alone is present, and per
+/// `connection_password_carries_key_material`'s own contract an access-key id
+/// is an identifier, not a secret, so this must still report false.
+fn sentinel_creds_without_key_material() -> ConnectionCreds {
+    ConnectionCreds {
+        access_key: SENTINEL_ACCESS_KEY.into(),
+        secret_key: String::new(),
+        session_token: None,
+        use_vended_credentials: true,
+        ..sentinel_creds(true)
+    }
+}
+
+/// The sealing key a sentinel CONNECTION carrying secret material derives —
+/// `None` when it does not, mirroring `resolve_connection_config`'s own
+/// `connection_password_carries_key_material` gate exactly, so a case built
+/// from these creds observes the same key presence production would compute.
+fn sentinel_sealing_key(creds: &ConnectionCreds) -> Option<SealedStorageKey> {
+    connection_password_carries_key_material(creds)
+        .then(|| derive_sealed_storage_key(SENTINEL_PASSWORD))
+}
+
+/// The effective backend a sentinel CONNECTION's creds resolve to — the same
+/// projection `resolve_connection_config` runs in production
+/// (`crate::adapter::connection::storage_block`).
+fn sentinel_effective_backend(creds: &ConnectionCreds) -> StorageBackend {
+    crate::adapter::connection::storage_block(creds, true)
+}
+
+/// Assert that none of the sentinel secret VALUES appear anywhere in `text` —
+/// applied to a rendered SQL string or an error message alike.
+fn assert_no_sentinel_secret_leaked(text: &str) {
+    for secret in sentinel_secret_values() {
+        assert!(
+            !text.contains(secret),
+            "no CONNECTION-supplied credential value may reach generated SQL or error \
+             text, but found sentinel secret {secret:?} in: {text}"
+        );
+    }
+}
+
+/// Drive the real `build_dispatch_sql` for an arbitrary `pushdownRequest` body
+/// and a caller-supplied resolved `ScanStorage` — generalizing
+/// `dispatch_sql_for_body` (which always uses `sample_scan_storage()` and an
+/// empty logical schema) so a case can also exercise the bounded top-N path,
+/// and can observe the SELECTED storage rather than a fixed fixture value.
+fn dispatch_result_for_body(
+    pushdown_req_body: Json,
+    logical_schema: Vec<LogicalField>,
+    scan_storage: &ScanStorage,
+) -> Result<String, UdfError> {
+    let request = guard_events_request(pushdown_req_body);
+    let pushdown_req = pd(&request);
+    let col_types = guard_col_types();
+    let (proj_cols, proj_types, projection_widened) =
+        extract_projection(&request, &pushdown_req).expect("the fixture must project");
+    let (filter, declined_filter) = classify_where_filter(
+        pushdown_req.get("filter").filter(|f| !f.is_null()),
+        &col_types,
+    );
+    let result = build_dispatch_sql(
+        &request,
+        &pushdown_req,
+        proj_cols,
+        proj_types,
+        projection_widened,
+        col_types,
+        filter,
+        declined_filter,
+        extract_limit(&pushdown_req),
+        order_by_present(&pushdown_req),
+        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
+        "s3://warehouse/db/events".to_string(),
+        logical_schema,
+        Vec::new(),
+        Vec::new(),
+        scan_storage,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+        4,
+        8192,
+        2,
+        0.6,
+        200,
+        8,
+    )?;
+    Ok(result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field")
+        .to_string())
+}
+
+/// One single-table `pushdownRequest` body per distinct `RequestShape`
+/// arm/sub-path this dispatcher can route to. Every arm shares ONE storage
+/// site — `build_dispatch_sql`'s `base.storage`, assigned once from the
+/// caller's `ScanStorage` before the shape classifier ever runs — so one
+/// representative request per shape/sub-path proves the guarantee for the
+/// whole arm.
+///
+/// Cross-checked against the 18 credential-bearing golden fixtures
+/// (`testdata/dispatch_golden/`): this table's `row_scan` subsumes
+/// `filterless_single_table` / `rendering_single_table` /
+/// `single_group_row_scan`; `row_scan_top_n` is the bounded top-N sub-path of
+/// `RowScan` (no dedicated golden, since top-N changes only ordering/limit
+/// rendering, not the storage site); `grouped` subsumes `grouped_aggregate` /
+/// `grouped_all_agg_kinds`; `group_by_fallback` is `group_by_fallback`;
+/// `single_group_agg_ordinary` subsumes `single_group_all_agg_kinds` and every
+/// `single_group_scalar_over_aggregate*` / `single_group_scalar_over_variance`
+/// fixture (all `SingleGroupAgg` ordinary sub-paths sharing this same
+/// `base.storage` site); `lone_count_distinct` is `lone_count_distinct`;
+/// `multi_count_distinct_decline` is `multi_count_distinct_decline`;
+/// `nested_aggregate_decline` is `nested_aggregate_decline`. The remaining six
+/// fixtures (`filterless_broadcast_join`, `filterless_n_scan_join`,
+/// `rendering_broadcast_join`, `rendering_n_scan_join`) are covered by the
+/// join cases below, which exercise the join path's own, independent
+/// `scan_storage_for` call site.
+fn single_table_builder_paths() -> Vec<(&'static str, Json, Vec<LogicalField>)> {
+    let region_logical_schema = vec![LogicalField {
+        field_id: Some(1),
+        name: "REGION".to_string(),
+        arrow_type: "utf8".to_string(),
+        nullable: true,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    }];
+    vec![
+        (
+            "row_scan",
+            serde_json::json!({
+                "selectList": [
+                    {"type": "column", "name": "REGION"},
+                    {"type": "column", "name": "AMOUNT"},
+                ],
+                "selectListDataTypes": [
+                    {"type": "varchar", "size": 2000000},
+                    {"type": "decimal", "precision": 18, "scale": 2},
+                ],
+            }),
+            Vec::new(),
+        ),
+        (
+            "row_scan_top_n",
+            serde_json::json!({
+                "selectList": [{"type": "column", "name": "REGION"}],
+                "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
+                "orderBy": [{
+                    "type": "order_by_element",
+                    "expression": {"type": "column", "name": "REGION"},
+                    "isAscending": true,
+                    "nullsLast": true,
+                }],
+                "limit": {"numElements": 5},
+            }),
+            region_logical_schema,
+        ),
+        (
+            "grouped",
+            serde_json::json!({
+                "aggregationType": "group_by",
+                "groupBy": [{"type": "column", "name": "REGION"}],
+                "selectList": [
+                    {"type": "column", "name": "REGION"},
+                    agg_item("SUM", Some("AMOUNT"), false),
+                ],
+                "selectListDataTypes": [
+                    {"type": "varchar", "size": 2000000},
+                    {"type": "decimal", "precision": 36, "scale": 2},
+                ],
+            }),
+            Vec::new(),
+        ),
+        (
+            "group_by_fallback",
+            serde_json::json!({
+                "aggregationType": "group_by",
+                "groupBy": [{"type": "column", "name": "REGION"}],
+                "selectList": [
+                    {"type": "column", "name": "REGION"},
+                    agg_item("SUM", Some("NAME"), false),
+                ],
+                "selectListDataTypes": [
+                    {"type": "varchar", "size": 2000000},
+                    {"type": "decimal", "precision": 30, "scale": 4},
+                ],
+            }),
+            Vec::new(),
+        ),
+        (
+            "single_group_agg_ordinary",
+            serde_json::json!({
+                "selectList": [agg_item("SUM", Some("AMOUNT"), false)],
+                "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
+            }),
+            Vec::new(),
+        ),
+        (
+            "lone_count_distinct",
+            serde_json::json!({
+                "selectList": [agg_item("COUNT", Some("ID"), true)],
+                "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
+            }),
+            Vec::new(),
+        ),
+        (
+            "multi_count_distinct_decline",
+            serde_json::json!({
+                "selectList": [
+                    agg_item("COUNT", Some("ID"), true),
+                    agg_item("COUNT", Some("NAME"), true),
+                ],
+                "selectListDataTypes": [
+                    {"type": "decimal", "precision": 18, "scale": 0},
+                    {"type": "decimal", "precision": 18, "scale": 0},
+                ],
+            }),
+            Vec::new(),
+        ),
+        (
+            "nested_aggregate_decline",
+            serde_json::json!({
+                "selectList": [ {
+                    "type": "function_scalar",
+                    "name": "ROUND",
+                    "arguments": [
+                        agg_item("SUM", Some("AMOUNT"), true),
+                        {"type": "literal_exactnumeric", "value": 2}
+                    ]
+                } ],
+                "selectListDataTypes": [ {"type": "decimal", "precision": 36, "scale": 2} ],
+            }),
+            Vec::new(),
+        ),
+    ]
+}
+
+/// Scenario (guarantee): no CONNECTION-supplied storage credential reaches the
+/// generated pushdown SQL, on any builder path — whether the credential is
+/// referenced by CONNECTION name (static) or sealed under a key derived from
+/// that CONNECTION (vended) — and a vending CONNECTION whose password carries
+/// no secret material is refused at plan time rather than shipped with a
+/// weakened guarantee.
+///
+/// Every case is driven through its own production entry point with the wire
+/// `ScanStorage` produced by `scan_storage_for` from sentinel-valued
+/// `ConnectionCreds` — never a hand-built `ScanStorage` — so the assertion
+/// observes the real selection, not a fixture standing in for it. Every
+/// absence assertion is preceded by a positive control proving the surface it
+/// checks was actually populated.
+#[test]
+fn no_connection_credential_reaches_the_generated_sql() {
+    // --- Case group 1: every single-table `RequestShape` arm and sub-path ---
+    for (name, body, logical_schema) in single_table_builder_paths() {
+        // Static (reference) half: the connection NAME must appear (positive
+        // control), and no sentinel secret value may appear anywhere.
+        let static_creds = sentinel_creds(false);
+        let static_effective = sentinel_effective_backend(&static_creds);
+        let static_storage = scan_storage_for(
+            &static_creds,
+            SENTINEL_CONNECTION_NAME,
+            true,
+            &static_effective,
+            None,
+        )
+        .unwrap_or_else(|e| panic!("{name}: static selection must succeed: {e}"));
+        let static_sql =
+            dispatch_result_for_body(body.clone(), logical_schema.clone(), &static_storage)
+                .unwrap_or_else(|e| panic!("{name}: static dispatch must succeed: {e}"));
+        assert!(
+            static_sql.contains(SENTINEL_CONNECTION_NAME),
+            "{name}: the static case must reference the CONNECTION by name: {static_sql}"
+        );
+        assert_no_sentinel_secret_leaked(&static_sql);
+
+        // Vended (sealed) half: the wire must carry a sealed envelope
+        // (positive control), and unsealing the payload the SQL actually
+        // carries — under the key the sentinel password derives — must
+        // recover the sentinel backend, proving the ciphertext is the real
+        // value rather than an empty blob. Only THEN is absence checked.
+        let vended_creds = sentinel_creds(true);
+        let vended_effective = sentinel_effective_backend(&vended_creds);
+        let key = sentinel_sealing_key(&vended_creds)
+            .unwrap_or_else(|| panic!("{name}: sentinel creds must carry key material"));
+        let vended_storage = scan_storage_for(
+            &vended_creds,
+            SENTINEL_CONNECTION_NAME,
+            true,
+            &vended_effective,
+            Some(&key),
+        )
+        .unwrap_or_else(|e| panic!("{name}: vended selection must succeed: {e}"));
+        let vended_sql = dispatch_result_for_body(body, logical_schema, &vended_storage)
+            .unwrap_or_else(|e| panic!("{name}: vended dispatch must succeed: {e}"));
+        assert!(
+            vended_sql.contains("\"sealed\":{\"name\":"),
+            "{name}: the vended case must carry a sealed envelope: {vended_sql}"
+        );
+        let common: Json = serde_json::from_str(common_arg_literal(&vended_sql))
+            .unwrap_or_else(|e| panic!("{name}: common blob must be valid JSON: {e}"));
+        let selected: ScanStorage = serde_json::from_value(common["storage"].clone())
+            .unwrap_or_else(|e| panic!("{name}: storage value must be a ScanStorage: {e}"));
+        let ScanStorage::Sealed { payload, .. } = &selected else {
+            panic!("{name}: a vended case must select ScanStorage::Sealed, got {selected:?}");
+        };
+        assert_eq!(
+            &unseal_storage(payload, &key).unwrap_or_else(|e| panic!(
+                "{name}: the envelope must open under the fixture key: {e}"
+            )),
+            &vended_effective,
+            "{name}: unsealing the carried payload must recover the sentinel backend"
+        );
+        assert_no_sentinel_secret_leaked(&vended_sql);
+    }
+
+    // --- Case group 2: the refusal — vending on, no sealing key material ---
+    // One evaluation suffices for every single-table shape: `handle_pushdown`
+    // calls `scan_storage_for` exactly ONCE, before the shape classifier ever
+    // runs, so every arm shares this same refusal outcome.
+    let no_key_creds = sentinel_creds_without_key_material();
+    let no_key_effective = sentinel_effective_backend(&no_key_creds);
+    let refusal = scan_storage_for(
+        &no_key_creds,
+        SENTINEL_CONNECTION_NAME,
+        true,
+        &no_key_effective,
+        None,
+    )
+    .expect_err("vending without key material must be refused, not silently sealed or inlined");
+    let UdfError::User(refusal_text) = &refusal else {
+        panic!("the refusal must be a named User error, got {refusal:?}");
+    };
+    assert!(
+        refusal_text.contains(SENTINEL_CONNECTION_NAME),
+        "the refusal must name the CONNECTION: {refusal_text}"
+    );
+    assert_no_sentinel_secret_leaked(refusal_text);
+
+    // --- Case group 3: the join path's OWN, independent `scan_storage_for`
+    // call site (`join_fan_out_scan_spec`/`scan_storage_for_side`), exercised
+    // through both the broadcast-join and N-scan-join renderers. ---
+    let join_request = sentinel_join_request();
+    let join_pushdown_req = pd(&join_request);
+    let detected = sentinel_detected_join(&join_request);
+    let rendered = render_broadcast_join(&join_request, &join_pushdown_req, &detected)
+        .expect("render_broadcast_join must not error for a well-formed request")
+        .expect("a disjoint-column, filterless equi-join must stay broadcast-eligible");
+
+    let static_conn = sentinel_connection(sentinel_creds(false), None);
+    let static_inputs = sentinel_join_inputs(&static_conn);
+    let static_fact = sentinel_join_side("FACT_T", sentinel_effective_backend(&static_conn.creds));
+    let static_dimension =
+        sentinel_join_side("DIM_T", sentinel_effective_backend(&static_conn.creds));
+    let static_sides = JoinSides {
+        fact: static_fact.clone(),
+        dimension: static_dimension.clone(),
+        broadcast_eligible: true,
+    };
+    let broadcast_static_sql = build_broadcast_join_sql(
+        &static_sides,
+        &rendered,
+        JoinWindowPlan::Unbounded,
+        &static_inputs,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    )
+    .expect("selecting the wire storage must succeed")
+    .expect("an unbounded broadcast join must build");
+    assert!(
+        broadcast_static_sql.contains(SENTINEL_CONNECTION_NAME),
+        "broadcast join (static): must reference the CONNECTION by name: {broadcast_static_sql}"
+    );
+    assert_no_sentinel_secret_leaked(&broadcast_static_sql);
+
+    let n_scan_static_sql = build_n_scan_join_sql(
+        &join_request,
+        &join_pushdown_req,
+        &detected,
+        &[static_fact, static_dimension],
+        &static_inputs,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    )
+    .expect("build_n_scan_join_sql must succeed for this fixture");
+    assert!(
+        n_scan_static_sql.contains(SENTINEL_CONNECTION_NAME),
+        "N-scan join (static): must reference the CONNECTION by name: {n_scan_static_sql}"
+    );
+    assert_no_sentinel_secret_leaked(&n_scan_static_sql);
+
+    let vended_creds = sentinel_creds(true);
+    let vended_key =
+        sentinel_sealing_key(&vended_creds).expect("sentinel vended creds must carry key material");
+    let vended_conn = sentinel_connection(
+        vended_creds,
+        Some(
+            sentinel_sealing_key(&sentinel_creds(true))
+                .expect("sentinel vended creds must carry key material"),
+        ),
+    );
+    let vended_inputs = sentinel_join_inputs(&vended_conn);
+    let vended_effective = sentinel_effective_backend(&vended_conn.creds);
+    let vended_fact = sentinel_join_side("FACT_T", vended_effective.clone());
+    let vended_dimension = sentinel_join_side("DIM_T", vended_effective.clone());
+    let vended_sides = JoinSides {
+        fact: vended_fact.clone(),
+        dimension: vended_dimension.clone(),
+        broadcast_eligible: true,
+    };
+    let broadcast_vended_sql = build_broadcast_join_sql(
+        &vended_sides,
+        &rendered,
+        JoinWindowPlan::Unbounded,
+        &vended_inputs,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    )
+    .expect("selecting the wire storage must succeed")
+    .expect("an unbounded broadcast join must build");
+    assert!(
+        broadcast_vended_sql.contains("\"sealed\":{\"name\":"),
+        "broadcast join (vended): must carry a sealed envelope: {broadcast_vended_sql}"
+    );
+    let common: Json = serde_json::from_str(common_arg_literal(&broadcast_vended_sql))
+        .expect("common blob must be valid JSON");
+    for (label, wire) in [
+        ("common.storage (fact)", &common["storage"]),
+        ("join.storage (dimension)", &common["join"]["storage"]),
+    ] {
+        let selected: ScanStorage =
+            serde_json::from_value(wire.clone()).expect("the wire value is a ScanStorage");
+        let ScanStorage::Sealed { payload, .. } = &selected else {
+            panic!("{label} must be sealed, got {selected:?}");
+        };
+        assert_eq!(
+            &unseal_storage(payload, &vended_key)
+                .expect("the envelope must open under the fixture key"),
+            &vended_effective,
+            "{label} must seal the sentinel backend"
+        );
+    }
+    assert_no_sentinel_secret_leaked(&broadcast_vended_sql);
+
+    let n_scan_vended_sql = build_n_scan_join_sql(
+        &join_request,
+        &join_pushdown_req,
+        &detected,
+        &[vended_fact, vended_dimension],
+        &vended_inputs,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    )
+    .expect("build_n_scan_join_sql must succeed for this fixture");
+    assert!(
+        n_scan_vended_sql.contains("\"sealed\":{\"name\":"),
+        "N-scan join (vended): must carry a sealed envelope: {n_scan_vended_sql}"
+    );
+    assert_no_sentinel_secret_leaked(&n_scan_vended_sql);
+
+    // The join path's own refusal: its `scan_storage_for` call site
+    // (`join_fan_out_scan_spec`/`scan_storage_for_side`) is independent of the
+    // single-table site above, so it must enforce the same refusal on its own.
+    let no_key_conn = sentinel_connection(sentinel_creds_without_key_material(), None);
+    let no_key_inputs = sentinel_join_inputs(&no_key_conn);
+    let no_key_sides = JoinSides {
+        fact: sentinel_join_side("FACT_T", sentinel_effective_backend(&no_key_conn.creds)),
+        dimension: sentinel_join_side("DIM_T", sentinel_effective_backend(&no_key_conn.creds)),
+        broadcast_eligible: true,
+    };
+    let join_refusal = build_broadcast_join_sql(
+        &no_key_sides,
+        &rendered,
+        JoinWindowPlan::Unbounded,
+        &no_key_inputs,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+    )
+    .expect_err("the join path must refuse vending without key material too");
+    let UdfError::User(join_refusal_text) = &join_refusal else {
+        panic!("the join refusal must be a named User error, got {join_refusal:?}");
+    };
+    assert_no_sentinel_secret_leaked(join_refusal_text);
+}
+
+/// A minimal FACT_T ⋈ DIM_T inner equi-join pushdown request — disjoint
+/// column names, a broadcast-eligible shape — the join-side counterpart of
+/// `single_table_builder_paths`' row-scan case.
+fn sentinel_join_request() -> Json {
+    serde_json::json!({
+        "involvedTables": [
+            {"name": "FACT_T", "columns": [
+                {"name": "FACT_KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            ]},
+            {"name": "DIM_T", "columns": [
+                {"name": "DIM_KEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            ]},
+        ],
+        "pushdownRequest": {
+            "type": "select",
+            "from": {
+                "type": "join",
+                "join_type": "inner",
+                "left": {"name": "FACT_T", "type": "table"},
+                "right": {"name": "DIM_T", "type": "table"},
+                "condition": {
+                    "type": "predicate_equal",
+                    "left": {"type": "column", "name": "FACT_KEY", "tableName": "FACT_T"},
+                    "right": {"type": "column", "name": "DIM_KEY", "tableName": "DIM_T"},
+                },
+            },
+            "selectList": [
+                {"type": "column", "name": "FACT_KEY", "tableName": "FACT_T"},
+            ],
+        },
+        "schemaMetadataInfo": {
+            "properties": {},
+            "adapterNotes": serde_json::json!({
+                "TABLE_MAP": {"FACT_T": "lh.fact_t", "DIM_T": "lh.dim_t"}
+            }).to_string(),
+        },
+    })
+}
+
+/// The detected join shape for [`sentinel_join_request`], resolved through the
+/// production `detect_join` seam rather than hand-built.
+fn sentinel_detected_join(request: &Json) -> DetectedJoin {
+    match detect_join(request, &pd(request)).expect("the join must be detected") {
+        JoinShape::Join(join) => join,
+        other => panic!("expected a detected join, got {other:?}"),
+    }
+}
+
+/// A resolved join side named `name`, carrying `effective_storage` as its own
+/// resolved backend — everything else is an inert, minimally-valid fixture
+/// value, since this case's guarantee concerns only the storage site.
+fn sentinel_join_side(name: &str, effective_storage: StorageBackend) -> ResolvedJoinSide {
+    let lower = name.to_lowercase();
+    ResolvedJoinSide {
+        table_name: name.to_string(),
+        table_identifier: format!("lh.{lower}"),
+        table_root: format!("s3://warehouse/lh/{lower}"),
+        files: vec![FileEntry::new(format!("s3://w/{lower}-0.parquet"), 10)],
+        logical_schema: vec![LogicalField {
+            field_id: Some(1),
+            name: format!("{name}_KEY"),
+            arrow_type: "int64".to_string(),
+            nullable: false,
+            initial_default: None,
+            nested: None,
+            physical_name: None,
+        }],
+        name_mapping: Vec::new(),
+        effective_storage,
+        partition_columns: Vec::new(),
+        total_bytes: 10,
+        refused_columns: Vec::new(),
+    }
+}
+
+/// A `ResolvedConnectionConfig` carrying sentinel `creds` and `sealed_storage_key`.
+fn sentinel_connection(
+    creds: ConnectionCreds,
+    sealed_storage_key: Option<SealedStorageKey>,
+) -> ResolvedConnectionConfig {
+    ResolvedConnectionConfig {
+        catalog_uri: "http://sentinel-catalog.example.com".to_string(),
+        storage: sentinel_effective_backend(&creds),
+        creds,
+        allow_http: true,
+        catalog_kind: CatalogKind::IcebergRest,
+        connection_name: SENTINEL_CONNECTION_NAME.to_string(),
+        sealed_storage_key,
+    }
+}
+
+/// The join tuning knobs both join-site cases dispatch over, referencing
+/// `conn`.
+fn sentinel_join_inputs(conn: &ResolvedConnectionConfig) -> JoinScanRequestConfig<'_> {
+    JoinScanRequestConfig {
+        cluster_nodes: 1,
+        parallelism_factor: 1,
+        df_target_partitions: 1,
+        df_batch_size: 8192,
+        df_threads_per_udf: 1,
+        memory_pool_fraction: 0.6,
+        instance_overhead_mb: 0,
+        s3_max_connections: 1,
+        connection: conn,
+    }
 }

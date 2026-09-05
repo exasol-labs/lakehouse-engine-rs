@@ -19,6 +19,7 @@ use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::pushdown::handle_pushdown;
 use crate::adapter::tables::{catalog_identifier_string, flatten_table_name};
+use crate::scan::sealed::SealedStorageKey;
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageBackend;
 use crate::types::mapping::{
@@ -185,6 +186,15 @@ pub struct ResolvedConnectionConfig {
     pub(crate) creds: ConnectionCreds,
     pub(crate) allow_http: bool,
     pub(crate) catalog_kind: CatalogKind,
+    /// The `CATALOG_CONNECTION` name, which every scan spec references in place
+    /// of the credential it used to carry.
+    pub(crate) connection_name: String,
+    /// The key a vended storage backend is sealed under, present iff this
+    /// CONNECTION's password carries secret material — the decision
+    /// [`read_connection`] takes at the boundary where that password lives, and
+    /// carried here unchanged. `None` is what makes a vended request a plan-time
+    /// refusal rather than a weakened envelope.
+    pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 
 /// Resolve the catalog/storage configuration from the `CATALOG_CONNECTION` object.
@@ -200,12 +210,18 @@ pub struct ResolvedConnectionConfig {
 /// resolving `CATALOG_KIND` a second time for client construction, ride on the
 /// returned [`ResolvedConnectionConfig`] alongside the rest of the resolved
 /// configuration.
+///
+/// `sealed_storage_key` is a straight passthrough of what [`read_connection`]
+/// returned: the key-material gate runs THERE, at the boundary that holds the
+/// password, and no second test of it exists here or anywhere else.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
 ) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = catalog_kind::resolve_catalog_kind(props)?;
-    let resolved = read_connection(ctx, nonempty_str(props, PROP_CATALOG_CONNECTION), kind)?;
+    let connection_name = nonempty_str(props, PROP_CATALOG_CONNECTION)
+        .ok_or_else(|| UdfError::User("CATALOG_CONNECTION is required".into()))?;
+    let resolved = read_connection(ctx, Some(connection_name), kind)?;
     let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -216,6 +232,8 @@ fn resolve_connection_config(
         creds: resolved.creds,
         allow_http,
         catalog_kind: kind,
+        connection_name: connection_name.to_string(),
+        sealed_storage_key: resolved.sealed_storage_key,
     })
 }
 

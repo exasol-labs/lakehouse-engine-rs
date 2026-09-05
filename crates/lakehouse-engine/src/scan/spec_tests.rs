@@ -51,14 +51,14 @@ fn sample_spec() -> ScanSpec {
             projection: vec!["id".into(), "name".into()],
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://minio:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "minioadmin".into(),
                 secret_key: "minioadmin".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         },
         files: vec![
@@ -68,11 +68,11 @@ fn sample_spec() -> ScanSpec {
     }
 }
 
-/// Unwraps the S3 payload from a [`StorageBackend`] for field-level assertions
-/// in tests that predate the backend wrapper and only ever exercised S3.
-fn s3_props(storage: &StorageBackend) -> &StorageProps {
-    let StorageBackend::S3(props) = storage else {
-        panic!("s3_props is S3-only")
+/// Unwraps the S3 payload from an inline [`ScanStorage`] for field-level
+/// assertions in tests that predate the wrapper and only ever exercised S3.
+fn s3_props(storage: &ScanStorage) -> &StorageProps {
+    let ScanStorage::Inline(StorageBackend::S3(props)) = storage else {
+        panic!("s3_props is inline-S3-only")
     };
     props
 }
@@ -88,7 +88,7 @@ fn s3_props(storage: &StorageBackend) -> &StorageProps {
 fn default_matches_serde_absent_except_s3_max_connections() {
     // A common blob whose every optional/tuning field is absent from JSON
     // (only the two non-defaulted fields, `projection` and `storage`, present).
-    let minimal = r#"{"projection":[],"storage":{"s3":{"endpoint":"","region":"","access_key":"","secret_key":""}}}"#;
+    let minimal = r#"{"projection":[],"storage":{"inline":{"s3":{"endpoint":"","region":"","access_key":"","secret_key":""}}}}"#;
     let from_absent = CommonScanSpec::from_json(minimal).unwrap();
     let d = CommonScanSpec::default();
 
@@ -159,8 +159,8 @@ fn optional_fields_omitted_when_none() {
     let mut spec = sample_spec();
     spec.common.filter = None;
     spec.common.limit = None;
-    let StorageBackend::S3(props) = &mut spec.common.storage else {
-        panic!("fixture is S3-only")
+    let ScanStorage::Inline(StorageBackend::S3(props)) = &mut spec.common.storage else {
+        panic!("fixture is inline-S3-only")
     };
     props.session_token = None;
     spec.common.aggregates = None;
@@ -218,7 +218,7 @@ fn emit_exa_types_round_trips_and_defaults_to_empty() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert!(
@@ -353,7 +353,7 @@ fn arg_expr_round_trips_and_omitted_when_none() {
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
         "aggregates": [{"kind": "sum", "column": "AMOUNT"}],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     let legacy_plans = legacy
@@ -599,7 +599,7 @@ fn order_by_round_trips_and_defaults_to_empty() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert!(
@@ -610,7 +610,7 @@ fn order_by_round_trips_and_defaults_to_empty() {
     // Same for the common blob in isolation.
     let legacy_common_json = r#"{
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
     assert!(
@@ -754,7 +754,7 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert!(
@@ -809,7 +809,7 @@ fn name_mapping_round_trips_and_defaults_to_empty() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert!(
@@ -856,7 +856,7 @@ fn scan_spec_threading_fields_round_trip_and_default_to_one() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
@@ -896,7 +896,7 @@ fn df_batch_size_round_trips_and_defaults() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
@@ -931,7 +931,7 @@ fn scan_spec_memory_fields_round_trip_and_default() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
@@ -974,7 +974,7 @@ fn s3_max_connections_round_trips_and_defaults() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 123]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
@@ -990,7 +990,7 @@ fn s3_max_connections_round_trips_and_defaults() {
     // 4. The default also applies to CommonScanSpec (shard-invariant blob).
     let legacy_common_json = r#"{
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
     assert_eq!(
@@ -1140,7 +1140,7 @@ fn legacy_empty_root_treats_paths_as_absolute() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(
@@ -1152,7 +1152,7 @@ fn legacy_empty_root_treats_paths_as_absolute() {
     // Same for the common blob in isolation.
     let legacy_common_json = r#"{
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
     assert_eq!(
@@ -1208,7 +1208,7 @@ fn absent_join_block_round_trips_unchanged() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert!(
@@ -1219,7 +1219,7 @@ fn absent_join_block_round_trips_unchanged() {
     // Same for the common blob in isolation.
     let legacy_common_json = r#"{
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy_common = CommonScanSpec::from_json(legacy_common_json).unwrap();
     assert!(
@@ -1240,7 +1240,7 @@ fn legacy_file_entry_reconstitutes_empty_deletes() {
     let legacy_json = r#"{
         "files": [["s3://w/f0.parquet", 100], ["s3://w/f1.parquet", 200]],
         "projection": [],
-        "storage": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}
+        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
     }"#;
     let legacy = ScanSpec::from_json(legacy_json).unwrap();
     assert_eq!(legacy.files.len(), 2);
@@ -1351,7 +1351,7 @@ fn join_block_round_trips_through_split_and_merge() {
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
         post_join_limit: None,
         partition_columns: Vec::new(),
-        storage: dim_storage.clone(),
+        storage: ScanStorage::Inline(dim_storage.clone()),
     });
 
     // The serialized JSON carries the join block; join_type is a lowercase tag.
@@ -1409,7 +1409,7 @@ fn join_block_round_trips_through_split_and_merge() {
     // The dimension side's own backend survives the round-trip intact, and
     // remains distinct from the fact side's `common.storage` — the wire-format
     // guarantee this whole plan depends on.
-    assert_eq!(jb.storage, dim_storage);
+    assert_eq!(jb.storage, ScanStorage::Inline(dim_storage));
     assert_ne!(jb.storage, reconstituted.common.storage);
 
     // The struct-level split/merge is equivalent to the JSON round-trip.
@@ -1478,18 +1478,42 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
         post_join_limit: None,
         partition_columns: Vec::new(),
-        storage,
+        storage: ScanStorage::Inline(storage),
     };
 
     let json = serde_json::to_string(&join).unwrap();
     assert_eq!(
         json,
-        r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\"","storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"dimkey","secret_key":"dimsecret","allow_http":true,"path_style":true}}}"#,
+        r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\"","storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"dimkey","secret_key":"dimsecret","allow_http":true,"path_style":true}}}}"#,
         "an Iceberg join spec must serialize byte-identically with partition_columns defaulted and skipped"
     );
 
     let back: JoinSpec = serde_json::from_str(&json).unwrap();
     assert_eq!(back, join);
+}
+
+/// `storage` carries no `#[serde(default)]` on either `JoinSpec` or
+/// `CommonScanSpec`, so a payload omitting it must be REJECTED rather than
+/// silently defaulting a dimension (or the fact side) to no storage at all.
+#[test]
+fn join_storage_is_a_required_key() {
+    let without_storage = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\""}"#;
+    assert!(
+        serde_json::from_str::<JoinSpec>(without_storage).is_err(),
+        "a join payload omitting storage must not deserialize"
+    );
+
+    let with_storage = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\"","storage":{"connection":{"name":"C","allow_http":false}}}"#;
+    assert!(
+        serde_json::from_str::<JoinSpec>(with_storage).is_ok(),
+        "a join payload carrying storage must deserialize"
+    );
+
+    let common_without_storage = r#"{"table_root":"s3://warehouse/db/table","projection":[]}"#;
+    assert!(
+        CommonScanSpec::from_json(common_without_storage).is_err(),
+        "a common spec payload omitting storage must not deserialize"
+    );
 }
 
 /// The two-argument UDF wire (shard-invariant common blob + per-shard files
@@ -1505,7 +1529,7 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
 fn common_blob_wire_is_byte_stable() {
     let spec = sample_spec();
 
-    let common_wire = r#"{"table_root":"s3://warehouse/db/table","projection":["id","name"],"filter":"(\"ID\" > 10)","limit":100,"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}"#;
+    let common_wire = r#"{"table_root":"s3://warehouse/db/table","projection":["id","name"],"filter":"(\"ID\" > 10)","limit":100,"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}"#;
     assert_eq!(spec.to_common_json(), common_wire);
 
     let files_wire = r#"[["data/part-00000.parquet",1024],["data/part-00001.parquet",2048]]"#;
@@ -1515,6 +1539,78 @@ fn common_blob_wire_is_byte_stable() {
     // adapter-only `catalog` key (the flatten preserves this guarantee).
     assert!(!common_wire.contains("\"files\""));
     assert!(!common_wire.contains("catalog"));
+}
+
+/// A populated S3 backend for the wrapper-encoding assertions below.
+fn wrapper_test_backend() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "AK".into(),
+        secret_key: "SK".into(),
+        allow_http: true,
+        ..Default::default()
+    })
+}
+
+/// [`ScanStorage`] is EXTERNALLY tagged, never `untagged`: each of its three
+/// variants encodes under its own lowercase key, and a payload naming a variant
+/// whose shape it does not match is REJECTED rather than resolved to whichever
+/// variant happens to parse.
+///
+/// The untagged pin is the bare-backend case: under `#[serde(untagged)]` an
+/// unwrapped `{"s3":{…}}` would silently deserialize as `Inline`, so the wire
+/// could not distinguish a credential carried inline from a raw backend
+/// arriving where a credential reference was expected.
+#[test]
+fn scan_storage_is_externally_tagged_and_rejects_a_mismatched_payload() {
+    let cases = [
+        (
+            ScanStorage::Connection {
+                name: "LAKEHOUSE_CATALOG_CREDS".into(),
+                allow_http: false,
+            },
+            r#"{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":false}}"#,
+        ),
+        (
+            ScanStorage::Sealed {
+                name: "LAKEHOUSE_CATALOG_CREDS".into(),
+                payload: "AAAAAAAAAAAAAAAA".into(),
+            },
+            r#"{"sealed":{"name":"LAKEHOUSE_CATALOG_CREDS","payload":"AAAAAAAAAAAAAAAA"}}"#,
+        ),
+        (
+            ScanStorage::Inline(wrapper_test_backend()),
+            r#"{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"AK","secret_key":"SK","allow_http":true,"path_style":true}}}"#,
+        ),
+    ];
+    for (value, wire) in cases {
+        assert_eq!(
+            serde_json::to_string(&value).expect("ScanStorage serialization is infallible"),
+            wire,
+            "{value:?} must encode under its own lowercase variant key"
+        );
+        assert_eq!(
+            serde_json::from_str::<ScanStorage>(wire).expect("its own encoding must decode"),
+            value
+        );
+    }
+
+    for mismatched in [
+        // `connection` carrying `sealed`'s fields.
+        r#"{"connection":{"name":"C","payload":"AAAA"}}"#,
+        // `sealed` carrying `connection`'s fields.
+        r#"{"sealed":{"name":"C","allow_http":false}}"#,
+        // A bare backend with no wrapper tag at all — the untagged pin.
+        r#"{"s3":{"endpoint":"","region":"","access_key":"AK","secret_key":"SK"}}"#,
+        // A variant key that does not exist.
+        r#"{"reference":{"name":"C"}}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<ScanStorage>(mismatched).is_err(),
+            "{mismatched} must be rejected, not resolved to a variant that happens to parse"
+        );
+    }
 }
 
 /// The Delta deletion-vector delete mechanism built from the `table-with-dv-small`

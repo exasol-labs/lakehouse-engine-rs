@@ -93,7 +93,7 @@ single-table and N-scan join wrapper), `vs-adapter/pushdown-planning-single-grou
   items (`selectListDataTypes`); it declares NO type for a sort-key expression. Every rule
   below therefore renders an expression sort key over columns whose declared types are already
   known, and never derives a type for an expression.
-* Credentials MUST NOT appear in any returned SQL or error message.
+* A CONNECTION-supplied storage credential is carried as a connection REFERENCE and MUST NOT appear in any returned SQL. A VENDED storage credential appears in a returned SQL string ONLY inside the AES-GCM-sealed envelope of `vs-adapter/scan-spec-credential-reference` — issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), CLOSED by that feature — never in plaintext. No credential of either kind appears in an error message.
 * Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
   spec (https://iceberg.apache.org/spec/) rather than from memory: the normative sections
   that could bear on this change are the ones governing what a reader must resolve —
@@ -226,3 +226,11 @@ single-table and N-scan join wrapper), `vs-adapter/pushdown-planning-single-grou
 * *AND* the shared seam SHALL render byte-identical SQL to the pre-change output when the offset is zero or absent, so advertising the capability changes no already-correct plan
 * *AND* NO offset value SHALL be carried into any per-shard scan spec, because a per-shard OFFSET would skip a different row set on every shard and cannot compose into a global window; the scan-spec wire shape and the scan UDF SHALL be unchanged by this advertisement
 * *AND* the returned result SHALL equal the same `ORDER BY … LIMIT n OFFSET m` evaluated over all matching rows on a single node, for a plain row scan, a declined-sort-key row scan, a grouped aggregate, and a qualified-wrapper shape
+
+### Scenario: An ordered request's generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request carrying a pushed ordering under this feature's advertised ORDER BY capabilities, over a virtual schema whose CONNECTION supplies static storage credentials and does not enable `use_vended_credentials`
+* *WHEN* the adapter renders the scan-driving SQL for that request
+* *THEN* the returned SQL string MUST NOT contain the CONNECTION's `access_key`, `secret_key`, `session_token`, `account_key`, or `sas_token` value in any encoding, because the shard-invariant common scan-spec argument carries a connection REFERENCE under `vs-adapter/scan-spec-credential-reference`
+* *AND* the same request with `use_vended_credentials` enabled SHALL carry the vended credential ONLY inside the sealed envelope `vs-adapter/scan-spec-credential-reference` specifies — issue #378, closed by this plan — so no credential value appears in PLAINTEXT in that SQL under either setting
+* *AND* no credential value of either kind SHALL appear in any error message this feature's path raises

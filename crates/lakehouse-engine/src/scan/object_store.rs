@@ -28,6 +28,7 @@ use super::raw_scan::register_nested_json_render_udf;
 use super::session_config_for_spec;
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
 use crate::scan::spec::{AdlsCred, FileEntry, ScanSpec, StorageBackend, reconstruct_abs_uri};
+use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::store_router::{PrefixRoutingObjectStore, RoutedSide, ScanSide};
 
 /// Build a DataFusion `SessionContext` with an object store registered per scan side.
@@ -35,8 +36,13 @@ use crate::scan::store_router::{PrefixRoutingObjectStore, RoutedSide, ScanSide};
 /// Sizes the DataFusion memory pool from `memory_limit_bytes` (UDF per-instance
 /// limit in bytes; `0` = unknown sentinel → conservative 1024 MB default) and
 /// probes `/tmp` for disk-spill eligibility.
+///
+/// Every store is built from `storage` — the backends `resolve_scan_storage`
+/// produced for this invocation — never from the spec, which carries only a
+/// reference to the CONNECTION that supplies them.
 pub(super) fn build_session_context(
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
     memory_limit_bytes: u64,
 ) -> Result<SessionContext, UdfError> {
     validate_sides_share_one_store(spec)?;
@@ -56,14 +62,14 @@ pub(super) fn build_session_context(
     let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime_env));
     register_nested_json_render_udf(&ctx);
 
-    let sides = present_sides(spec);
+    let sides = present_sides(spec, storage);
 
     // The redaction set is EVERY side's secrets, not those of the side whose store
     // is being built: each store ends up behind a router that can raise an error
     // while either side's credential is in scope. `build_side_store` sees one side
     // and structurally cannot assemble the union, so it is read from its single
-    // owner on the spec and passed down.
-    let all_secrets = spec.common.all_secret_values();
+    // owner — the RESOLVED pair — and passed down.
+    let all_secrets = storage.all_secret_values();
 
     // Each side gets its OWN inner store: built from its OWN backend, and sized
     // from its OWN files, so neither one side's credential nor its size index can
@@ -101,21 +107,29 @@ pub(super) fn build_session_context(
 ///
 /// A join block with an EMPTY file list contributes no side: it names no path to
 /// route, no file to size, and no URI to derive a store key from.
-fn present_sides(spec: &ScanSpec) -> Vec<ScanSide<'_>> {
+///
+/// Each side's backend comes from `storage`, paired with the spec block that
+/// names its files. A join block present with files but no resolved dimension
+/// backend is unreachable through `resolve_scan_storage`, which derives the pair
+/// from this same spec; such a pair can only come from
+/// [`ResolvedScanStorage::from_backends`], and it registers no dimension store —
+/// so no dimension credential is in scope for the union either.
+fn present_sides<'a>(spec: &'a ScanSpec, storage: &'a ResolvedScanStorage) -> Vec<ScanSide<'a>> {
     let mut sides = vec![ScanSide {
         label: "fact",
         files: &spec.files,
         table_root: &spec.common.table_root,
-        backend: &spec.common.storage,
+        backend: storage.primary(),
     }];
     if let Some(join) = &spec.common.join
         && !join.files.is_empty()
+        && let Some(backend) = storage.join()
     {
         sides.push(ScanSide {
             label: "dimension",
             files: &join.files,
             table_root: &join.table_root,
-            backend: &join.storage,
+            backend,
         });
     }
     sides

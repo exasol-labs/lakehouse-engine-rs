@@ -592,3 +592,71 @@ fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
         "non-OOM error must NOT look like a memory error: {text_storage}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Error redaction reads its secret set from the RESOLVED credential
+// ---------------------------------------------------------------------------
+
+/// A partial-aggregate error is redacted against the credential the RESOLVED pair
+/// carries, not against anything on the wire spec.
+///
+/// The counterpart of the raw-scan case, on the other path that reads the secret
+/// set for itself. The spec references a CONNECTION and carries no credential, so
+/// a feed site left reading the wire value would redact against an EMPTY set; the
+/// marker assertion runs first so the absence assertion cannot pass vacuously.
+#[tokio::test]
+async fn partial_agg_error_is_redacted_against_the_resolved_credential() {
+    use crate::scan::ResolvedScanStorage;
+    use crate::scan::object_store::build_session_context;
+    use crate::scan::spec::{CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage};
+    use crate::scan::test_support::{
+        SinkCtx, TEST_CONNECTION, refusing_backend, refusing_endpoint,
+    };
+
+    const MARKER: &str = "partial-agg-refusal";
+    const SENTINEL: &str = "PARTIALAGGSECRETVALUE";
+
+    let endpoint = refusing_endpoint(&format!("{MARKER} {SENTINEL}"));
+    let spec = ScanSpec {
+        common: CommonScanSpec {
+            aggregates: Some(vec![AggregatePlan {
+                kind: AggKind::Count,
+                column: None,
+                arg_expr: None,
+            }]),
+            logical_schema: vec![LogicalField {
+                field_id: Some(1),
+                name: "id".into(),
+                arrow_type: "int64".into(),
+                nullable: false,
+                initial_default: None,
+                nested: None,
+                physical_name: None,
+            }],
+            storage: ScanStorage::Connection {
+                name: TEST_CONNECTION.into(),
+                allow_http: true,
+            },
+            ..Default::default()
+        },
+        files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],
+    };
+    let storage = ResolvedScanStorage::from_backends(refusing_backend(&endpoint, SENTINEL), None);
+
+    let session = build_session_context(&spec, &storage, 0).expect("the session must build");
+    let mut ctx = SinkCtx;
+    let error = run_partial_aggregate(&mut ctx, &session, &spec, &storage)
+        .await
+        .expect_err("the endpoint refuses every read, so the aggregate must fail");
+
+    let text = error.to_string();
+    assert!(
+        text.contains(MARKER),
+        "the endpoint's refusal body must have reached the error, or the assertion \
+         below is vacuous: {text}"
+    );
+    assert!(
+        !text.contains(SENTINEL),
+        "the resolved credential must be stripped from a partial-aggregate error: {text}"
+    );
+}

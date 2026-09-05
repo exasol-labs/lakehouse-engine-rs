@@ -1,7 +1,7 @@
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{AggKind, DeleteMechanism, SortKey};
+use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey};
 use vs_expression::render_df_filter_safe;
 
 /// `walk_column_nodes` fires its callback exactly once per `column` node
@@ -210,7 +210,7 @@ fn delete_spec_template() -> ScanSpec {
             table_root: "s3://warehouse/db/table".into(),
             projection: vec![ProjectionItem::Column("ID".into())],
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -899,7 +899,7 @@ fn aggregate_query_builds_partial_agg_spec() {
             projection: vec!["AMOUNT".into()],
             filter: Some("(\"REGION\" = 'EU')".into()),
             aggregates: Some(agg_plans),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1052,7 +1052,7 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             s3_max_connections: distinctive_s3_max_connections,
             ..Default::default()
         },
@@ -1115,7 +1115,7 @@ fn build_agg_sql(
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(agg_plans),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1155,7 +1155,7 @@ fn aggregate_merge_renders_request_limit_when_some() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(plans),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1357,7 +1357,7 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(plans),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1492,7 +1492,7 @@ fn single_shard_aggregate_still_uses_merge_wrapper() {
 fn count_distinct_base_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1996,7 +1996,7 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2035,7 +2035,7 @@ fn single_shard_collapses_to_single_invocation() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2944,7 +2944,7 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) ->
                 .map(|(name, _)| ProjectionItem::Column(name.clone()))
                 .collect(),
             emit_exa_types: col_types.iter().map(|(_, ty)| ty.clone()).collect(),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -5205,4 +5205,155 @@ fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
         "must project the single rendered expression, not the full base row: {items:?}"
     );
     assert!(matches!(items[0], ProjectionItem::Expr { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// scan_storage_for — the one variant-selection function
+// ---------------------------------------------------------------------------
+
+/// The four inputs `scan_storage_for` chooses from, as a name plus its
+/// (vending, key-present) coordinates — the complete input space, enumerated
+/// here so `scan_storage_for_never_returns_inline` is exhaustive by
+/// construction.
+fn selection_inputs() -> Vec<(&'static str, bool, bool)> {
+    vec![
+        ("vending off, key present", false, true),
+        ("vending off, key absent", false, false),
+        ("vending on, key present", true, true),
+        ("vending on, key absent", true, false),
+    ]
+}
+
+fn creds_with_vending(use_vended_credentials: bool) -> ConnectionCreds {
+    ConnectionCreds {
+        use_vended_credentials,
+        ..unauthenticated_creds()
+    }
+}
+
+/// Vending DISABLED selects the CONNECTION reference — the name and the
+/// `allow_http` gate, and nothing else. Vending ENABLED with a sealing key
+/// selects the sealed envelope, whose payload opens under that same key to
+/// exactly the effective backend.
+///
+/// The unseal is the positive control: `"sealed"` with an empty or wrong payload
+/// would satisfy a variant-shape assertion on its own.
+#[test]
+fn scan_storage_for_selects_reference_when_vending_is_disabled_and_sealed_when_enabled() {
+    let effective = sample_storage();
+    let key = test_sealing_key();
+
+    let reference = scan_storage_for(
+        &creds_with_vending(false),
+        TEST_CONNECTION_NAME,
+        true,
+        &effective,
+        Some(&key),
+    )
+    .expect("a static credential must select the reference variant");
+    assert_eq!(
+        reference,
+        ScanStorage::Connection {
+            name: TEST_CONNECTION_NAME.to_string(),
+            allow_http: true,
+        },
+        "vending disabled must carry the CONNECTION name and the allow_http gate alone"
+    );
+
+    let sealed = scan_storage_for(
+        &creds_with_vending(true),
+        TEST_CONNECTION_NAME,
+        false,
+        &effective,
+        Some(&key),
+    )
+    .expect("a vended credential with key material must select the sealed variant");
+    let ScanStorage::Sealed { name, payload } = &sealed else {
+        panic!("vending enabled with a sealing key must select Sealed, got {sealed:?}");
+    };
+    assert_eq!(name, TEST_CONNECTION_NAME);
+    assert_eq!(
+        crate::scan::sealed::unseal_storage(payload, &key)
+            .expect("the payload must open under the key it was sealed with"),
+        effective,
+        "the envelope must carry the effective backend, not an empty blob"
+    );
+}
+
+/// `scan_storage_for` can NEVER return `Inline`, over its whole input space.
+/// `Inline` exists for host-test spec construction, and this is the assertion
+/// that keeps the adapter unable to emit a plaintext credential by accident.
+#[test]
+fn scan_storage_for_never_returns_inline() {
+    let effective = sample_storage();
+    let key = test_sealing_key();
+
+    for (label, vending, key_present) in selection_inputs() {
+        let selected = scan_storage_for(
+            &creds_with_vending(vending),
+            TEST_CONNECTION_NAME,
+            false,
+            &effective,
+            key_present.then_some(&key),
+        );
+        match selected {
+            Ok(ScanStorage::Inline(_)) => panic!("{label} must never select Inline"),
+            Ok(ScanStorage::Connection { .. }) => assert!(
+                !vending,
+                "{label} selected the reference variant, which is the static path"
+            ),
+            Ok(ScanStorage::Sealed { .. }) => assert!(
+                vending && key_present,
+                "{label} selected the sealed variant, which needs vending and a key"
+            ),
+            Err(_) => assert!(
+                vending && !key_present,
+                "{label} was refused, which is only correct for vending without key material"
+            ),
+        }
+    }
+}
+
+/// Vending enabled on a CONNECTION whose password carries no secret material is
+/// REFUSED at plan time, with an error naming the configuration, BOTH remedies,
+/// and the predicate that decided it — and carrying no credential value.
+///
+/// The refusal is the whole point: a key derived from a password holding no
+/// secret would ship a false guarantee, and a silent fall back to plaintext is
+/// the defect this plan exists to remove.
+#[test]
+fn scan_storage_for_refuses_vending_without_key_material() {
+    let effective = sample_storage();
+    let err = scan_storage_for(
+        &creds_with_vending(true),
+        TEST_CONNECTION_NAME,
+        false,
+        &effective,
+        None,
+    )
+    .expect_err("vending without key material must be refused")
+    .to_string();
+
+    assert!(
+        err.contains("use_vended_credentials"),
+        "the error must name the configuration: {err}"
+    );
+    assert!(
+        err.contains(TEST_CONNECTION_NAME),
+        "the error must name the CONNECTION: {err}"
+    );
+    assert!(
+        err.contains("connection_password_carries_key_material"),
+        "the error must cite the criterion that was not met: {err}"
+    );
+    assert!(
+        err.contains("catalog authentication") && err.contains("disable"),
+        "the error must state BOTH remedies: {err}"
+    );
+    for value in ["minioadmin", "FIXTURESECRET"] {
+        assert!(
+            !err.contains(value),
+            "the refusal must carry no credential value, found {value}: {err}"
+        );
+    }
 }

@@ -20,7 +20,7 @@ column to Exasol.
   aggregate item's declared result type in the parallel top-level `selectListDataTypes`
   array, because there is no single source column whose Exasol type could be looked up.
 * The merged result MUST equal the same aggregate evaluated over all rows on a single node.
-* Credentials MUST NOT appear in any returned SQL or error message.
+* A CONNECTION-supplied storage credential is carried as a connection REFERENCE and MUST NOT appear in any returned SQL. A VENDED storage credential appears in a returned SQL string ONLY inside the AES-GCM-sealed envelope of `vs-adapter/scan-spec-credential-reference` — issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), CLOSED by that feature — never in plaintext. No credential of either kind appears in an error message.
 
 ## Scenarios
 
@@ -72,3 +72,11 @@ column to Exasol.
 * *THEN* the adapter SHALL derive the partial column's Exasol type from the SUM item's declared result type in `selectListDataTypes` at that select-list ordinal — never from either source column's type
 * *AND* when that declared result type is a DECIMAL the adapter SHALL widen the partial column to `DECIMAL(36,s)` (preserving scale `s`, capping precision at Exasol's maximum 36) so per-shard partial sums of the product do not overflow mid-merge
 * *AND* the derived partial and merge types SHALL remain within Exasol's `DECIMAL(p<=36, s<=36)` limits
+
+### Scenario: An aggregate-over-expression request's generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request aggregating over a translated expression rather than a bare column, over a virtual schema whose CONNECTION supplies static storage credentials and does not enable `use_vended_credentials`
+* *WHEN* the adapter renders the scan-driving SQL for that request
+* *THEN* the returned SQL string MUST NOT contain the CONNECTION's `access_key`, `secret_key`, `session_token`, `account_key`, or `sas_token` value in any encoding, because the shard-invariant common scan-spec argument carries a connection REFERENCE under `vs-adapter/scan-spec-credential-reference`
+* *AND* the same request with `use_vended_credentials` enabled SHALL carry the vended credential ONLY inside the sealed envelope `vs-adapter/scan-spec-credential-reference` specifies — issue #378, closed by this plan — so no credential value appears in PLAINTEXT in that SQL under either setting
+* *AND* no credential value of either kind SHALL appear in any error message this feature's path raises

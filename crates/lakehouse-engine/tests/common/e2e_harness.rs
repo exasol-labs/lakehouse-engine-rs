@@ -267,6 +267,8 @@ pub fn create_virtual_schema_with_password(
         build_create_connection_sql(props.catalog_conn_name, catalog_uri, password);
     conn.execute(&create_conn_sql);
 
+    grant_connection_access_to_vs_owner(conn, props.catalog_conn_name);
+
     let _ = conn.try_execute(&format!(
         "DROP VIRTUAL SCHEMA IF EXISTS {} CASCADE",
         props.vs_name
@@ -291,6 +293,61 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
         catalog_conn_name = props.catalog_conn_name,
         namespace = props.namespace,
     ));
+}
+
+/// The user this session is authenticated as — the principal that owns every
+/// object it creates, the Virtual Schema included.
+pub fn current_user(conn: &mut ExaConn) -> String {
+    let cols = conn.query_columns("SELECT CURRENT_USER");
+    cols.first()
+        .and_then(|col| col.first())
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| panic!("SELECT CURRENT_USER returned no value: {cols:?}"))
+}
+
+/// Issue the two script-scoped connection grants a Virtual Schema OWNER needs
+/// on `conn_name`, to the principal this session is authenticated as.
+///
+/// **Why the owner and not the querying user.** Exasol evaluates
+/// `ACCESS ON CONNECTION ... FOR SCRIPT` against the VIRTUAL SCHEMA OWNER when
+/// the script is reached through VS-rewritten pushdown SQL — verified live in
+/// both directions on 2025.2.1: a `SELECT`-only user with no connection
+/// privilege queries the VS fine, revoking the OWNER's grant breaks that same
+/// user's query, and granting it to the querying user instead does not restore
+/// it. So the grantee is the session that runs `CREATE VIRTUAL SCHEMA`, which in
+/// this harness is whatever `current_user` reports.
+///
+/// **Why BOTH scripts.** `LAKEHOUSE_ADAPTER` resolves the CONNECTION at plan
+/// time (a pre-existing requirement this plan did not introduce) and
+/// `LAKEHOUSE_SCAN` resolves it per shard. A non-DBA owner missing the adapter
+/// grant cannot even create the Virtual Schema.
+///
+/// **Why it must be called from here.** Both `CREATE OR REPLACE CONNECTION` and
+/// `CREATE OR REPLACE SCRIPT` DROP the grant (both verified live). Every binary
+/// calls `create_schema_and_scripts` before `create_virtual_schema*`, so the end
+/// of the connection-replacement step is after the last `CREATE OR REPLACE` of
+/// either object. A future binary that re-creates the scripts AFTER creating its
+/// VS must re-issue these grants, or the failure will look like a
+/// credential-resolution bug rather than a missing grant.
+///
+/// **Why `SYS` is skipped.** Exasol refuses `GRANT ACCESS ON CONNECTION ... TO
+/// SYS` outright (`cannot grant connections to SYS`, SQL state `42500`, verified
+/// live), and a DBA holds every CONNECTION implicitly, so the grant would be a
+/// no-op even if it were accepted. Every `exasol-e2e` binary provisions as
+/// `sys`, so for them this call is a documented no-op; it becomes load-bearing
+/// the moment a binary provisions as a non-DBA owner — which
+/// `e2e_credential_exposure_test.rs` does deliberately.
+pub fn grant_connection_access_to_vs_owner(conn: &mut ExaConn, conn_name: &str) {
+    let owner = current_user(conn);
+    if owner.eq_ignore_ascii_case("SYS") {
+        return;
+    }
+    for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
+        conn.execute(&format!(
+            "GRANT ACCESS ON CONNECTION {conn_name} FOR SCRIPT {SCHEMA_NAME}.{script} TO {owner}"
+        ));
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -27,9 +27,9 @@ use lakehouse_catalog::{
     AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogProps, CatalogSession,
     CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
     IcebergRestCatalogClient, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend,
-    StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth,
-    parse_table_ident, redact_credentials, redact_secret_values, resolve_uc_vended_storage,
-    resolve_vended_storage,
+    StorageCreds, StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
+    load_table_any_auth, parse_table_ident, redact_credentials, redact_secret_values,
+    resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 /// Every production `.rs` source file under `crates/lakehouse-catalog/src/`
@@ -672,4 +672,110 @@ fn static_store_address_fields_are_not_public() {
              reviewed `From<&ConnectionCreds>` conversion"
         );
     }
+}
+
+/// Every field declaration `creds.rs`'s own `struct StorageCreds` declaration
+/// carries, comment lines dropped and trailing commas removed — mirrors
+/// `static_store_address_field_declarations`, applied to the projection that
+/// crosses the SAME crate boundary in the opposite direction: `parse_creds`
+/// reads these nine fields out of it rather than the vended selectors reading
+/// a store address into it.
+fn storage_creds_field_declarations() -> Vec<&'static str> {
+    let body = declaration_body(source("creds.rs"), "struct StorageCreds");
+    let fields: Vec<&str> = body
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with("//"))
+        .map(|line| line.trim_end_matches(','))
+        .collect();
+
+    assert!(
+        !fields.is_empty(),
+        "extracted no fields from `struct StorageCreds`'s body — the probe's own \
+         parsing is broken, not just failing to find a match"
+    );
+    fields
+}
+
+/// `StorageCreds` is the storage-only projection `parse_creds` reads across the
+/// crate boundary: it must declare exactly the nine storage fields, each `pub`
+/// (mirroring `StorageProps`, because `parse_creds` constructs it from outside
+/// this crate), and none of the eight catalog-auth fields `ConnectionCreds`
+/// also carries — a catalog-auth field added here is the one edit that would
+/// let a secret meant to stay adapter-side reach the scan UDF through this
+/// projection instead.
+#[test]
+fn storage_creds_declares_exactly_the_nine_pub_storage_fields() {
+    let declarations = storage_creds_field_declarations();
+
+    let names: BTreeSet<&str> = declarations
+        .iter()
+        .map(|declaration| {
+            let visibility = declaration.split_whitespace().next().unwrap_or("");
+            assert_eq!(
+                visibility, "pub",
+                "`struct StorageCreds` must declare every storage field `pub`, but `{declaration}` \
+                 is not — `parse_creds` constructs this type across the crate boundary"
+            );
+            declaration
+                .split(':')
+                .next()
+                .unwrap_or(declaration)
+                .split_whitespace()
+                .next_back()
+                .unwrap_or("")
+        })
+        .collect();
+
+    let expected: BTreeSet<&str> = [
+        "endpoint",
+        "region",
+        "access_key",
+        "secret_key",
+        "session_token",
+        "path_style",
+        "account_name",
+        "account_key",
+        "sas_token",
+    ]
+    .into_iter()
+    .collect();
+    assert_eq!(
+        names, expected,
+        "`struct StorageCreds` must declare exactly the nine storage fields, no more and no fewer"
+    );
+
+    for credential in [
+        "token",
+        "client_id",
+        "client_secret",
+        "oauth2_server_uri",
+        "scope",
+        "warehouse",
+        "use_sigv4",
+        "use_vended_credentials",
+    ] {
+        assert!(
+            !names.contains(credential),
+            "`struct StorageCreds` must declare no catalog-auth field, but it names \
+             `{credential}` — this projection crosses into the scan UDF and must carry no \
+             catalog secret"
+        );
+    }
+}
+
+/// `StorageCreds::from_json` and `StorageCreds::backend` are called directly
+/// here — not just the `StorageCreds` type named in the `use` list above — so
+/// narrowing either method below `pub` is a compile failure in this
+/// external-crate probe, rather than a silent gap the type-only import would
+/// miss.
+#[test]
+fn storage_creds_from_json_and_backend_are_reachable() {
+    let creds = StorageCreds::from_json(&serde_json::json!({
+        "endpoint": "http://minio:9000",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+    }));
+    let _: StorageBackend = creds.backend(true);
 }

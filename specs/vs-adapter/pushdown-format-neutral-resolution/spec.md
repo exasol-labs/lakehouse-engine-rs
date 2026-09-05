@@ -24,6 +24,9 @@ Pushdown SQL shape is format-agnostic in this engine: projection, filter, LIMIT,
 decomposition, and join eligibility are decided from the request's SQL alone and are unchanged by
 this feature. Only file resolution differs per format.
 
+* **This delta is issue #135. It amends ONE scenario and changes no resolution rule.** The one format-reader seam, the one catalog session per request, the single catalog-kind match site, the Unity identity round trip, the resolver collapse, the partition-column propagation, the loud plan-time failure, and the kind-blind capability advertisement are all UNCHANGED.
+* **SUPERSEDES this feature's byte-identity gate for the `storage` value alone.** The generated SQL and the serialized per-shard scan specs stay byte-identical EXCEPT for the `storage` value, which becomes the tagged wrapper of `vs-adapter/scan-spec-credential-reference`. Every other byte of every request's output is unchanged, which is what keeps this gate meaningful rather than waived.
+
 ## Scenarios
 
 ### Scenario: Every pushdown request shape resolves through the one format-reader seam
@@ -93,8 +96,15 @@ this feature. Only file resolution differs per format.
   broadcast-join requests, and the Iceberg E2E suites
 * *WHEN* those requests are planned through the format-reader seam instead of the direct file resolver
 * *THEN* the generated SQL and the serialized per-shard scan specs MUST be byte-identical to their
-  pre-feature output for every request
-* *AND* every existing test MUST pass with no change to any assertion or expected value
+  pre-feature output for every request EXCEPT for the `storage` value, which carries the tagged
+  wrapper of `vs-adapter/scan-spec-credential-reference`
+* *AND* every existing test MUST pass with no change to any assertion or expected value, EXCEPT for
+  the two edits this delta's `storage` carve-out forces and no others: the eighteen credential-bearing
+  golden dispatch fixtures are REGENERATED so their `storage` value carries the wrapper, and
+  `common_blob_wire_is_byte_stable`'s pinned bytes gain the wrapper around the same backend encoding
+* *AND* those two edits MUST change the `storage` value and nothing else — the six `empty_*` fixtures
+  carry no `storage` value and SHALL stay byte-identical, and no assertion MUST be weakened, disabled,
+  or deleted to accommodate the change
 * *AND* the Iceberg-level file pruning the resolver applies from the request's filter SHALL still be
   applied, because the filter is forwarded to the reader unchanged
 

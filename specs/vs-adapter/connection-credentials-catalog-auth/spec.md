@@ -78,3 +78,13 @@ appear in any error message, returned SQL, or log line.
 * *AND* that function SHALL treat an empty-string field as absent, matching the parsing rule `vs-adapter/connection-credentials` already applies to every field
 * *AND* every combination the validation rules reject SHALL classify as the NO-AUTH mode, and the function's doc comment SHALL name those rules as its enforcer — so a credential set that reached a consumer without passing validation surfaces as the catalog's own authentication failure rather than as a silently chosen credential the operator never unambiguously supplied
 * *AND* no `token`, `client_secret`, or minted bearer value SHALL appear in any error message, returned SQL, or log line on any mode
+
+### Scenario: The scan UDF reads the same CONNECTION and cannot construct a catalog-auth field
+
+* *GIVEN* a CONNECTION whose JSON password carries a `token` or `client_id` plus `client_secret`, and optionally `oauth2_server_uri` and `scope`, alongside its storage fields
+* *AND* a scan UDF invocation that resolves that same CONNECTION by name under `vs-adapter/scan-spec-credential-reference` because `use_vended_credentials` is false
+* *WHEN* the UDF deserializes the returned password to derive its storage backend
+* *THEN* the UDF SHALL deserialize ONLY the nine-field storage-credential projection, and MUST NOT construct any value declaring a field spelled `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope`
+* *AND* a source-level probe SHALL assert from that projection's own declaration that it names no field with any of those five spellings, so widening it into a second catalog-auth path is a test failure rather than a silent regression
+* *AND* the recorded guarantee that the catalog-auth fields never cross the UDF boundary SHALL therefore continue to hold, now because of what the UDF's deserialization target CAN declare rather than because the UDF reads no CONNECTION
+* *AND* no `token`, `client_secret`, or bearer value minted from either SHALL appear in any returned SQL string or in any error message the UDF returns

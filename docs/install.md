@@ -168,7 +168,11 @@ creation, and the smoke test.
 ## Point the VS at your data
 
 Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. The
-following example is a complete local setup with MinIO and an Iceberg REST catalog:
+following example is a complete local setup with MinIO and an Iceberg REST catalog, run as a DBA
+(`sys`). **A non-DBA needs two `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` statements between the
+two — the adapter resolves the CONNECTION while creating the Virtual Schema.** See
+[Security](security.md#recommended-pattern-a-deployment-scoped-role-held-by-the-vs-owner) for the
+exact statements and their order.
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
@@ -196,6 +200,11 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 - **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
   and more) are in [Tuning](tuning.md).
+- **Before granting other users access to this schema**, read [Security](security.md). The
+  `LAKEHOUSE_ADAPTER` and `LAKEHOUSE_SCAN` scripts each need a grant on the CONNECTION, held by the
+  Virtual Schema's **owner** — one deployment-time statement each, not one per reader. Adding a
+  reader is then just `GRANT SELECT ON SCHEMA MY_LAKEHOUSE`, but that `SELECT` grant is what hands
+  the reader the owner's storage credential, so scope the CONNECTION's credential accordingly.
 
 ## Query
 

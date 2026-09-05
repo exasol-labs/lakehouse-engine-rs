@@ -9,8 +9,11 @@
 
 use super::grouped_agg::{col_type_for, is_literal_selectlist_item, partial_emits_items};
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
+use crate::adapter::connection::ConnectionCreds;
+use crate::scan::sealed::{SealedStorageKey, seal_storage};
 use crate::scan::spec::{
-    AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, render_order_by_clause,
+    AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, ScanStorage,
+    StorageBackend, render_order_by_clause,
 };
 use crate::types::mapping::{ExaTypeClass, classify_exa_type, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
@@ -1571,6 +1574,64 @@ pub(super) fn cast_to_declared_type(expr: &str, declared: Option<&str>) -> Strin
         Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({expr} AS {ty})"),
         _ => expr.to_string(),
     }
+}
+
+/// Select the [`ScanStorage`] variant every scan spec of one pushdown request
+/// carries — the ONE place that choice is made, for every builder path.
+///
+/// - A STATIC credential becomes [`ScanStorage::Connection`]: the scan UDF reads
+///   the same CONNECTION for itself, so the wire needs the name and the
+///   `allow_http` gate and nothing else. Carrying addressing here too would give
+///   the backend two sources, which is how a "field-for-field equal" guarantee
+///   breaks.
+/// - A VENDED credential has no name to reference, so it becomes
+///   [`ScanStorage::Sealed`]: `effective` sealed under `sealing_key`, which the
+///   scan UDF re-derives from the same CONNECTION password.
+/// - A VENDED credential with NO sealing key is REFUSED, here, at plan time. A
+///   password carrying no secret material would derive a guessable key, and an
+///   envelope under it would be a false guarantee — so the configuration is
+///   named rather than shipped, and never falls back to plaintext.
+///
+/// It can never return [`ScanStorage::Inline`]. That variant exists for host-test
+/// spec construction; making it unreachable from the one selection function is
+/// what keeps the adapter structurally unable to emit a plaintext credential.
+///
+/// The choice lives in one function rather than at each of the three
+/// spec-storage population sites because a choice made at three sites is a
+/// choice three sites can get wrong, and a test driving a hand-built template
+/// asserts on its own fixture instead of on the selection.
+pub(super) fn scan_storage_for(
+    creds: &ConnectionCreds,
+    connection_name: &str,
+    allow_http: bool,
+    effective: &StorageBackend,
+    sealing_key: Option<&SealedStorageKey>,
+) -> Result<ScanStorage, UdfError> {
+    if !creds.use_vended_credentials {
+        return Ok(ScanStorage::Connection {
+            name: connection_name.to_string(),
+            allow_http,
+        });
+    }
+    let Some(key) = sealing_key else {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{connection_name}' enables use_vended_credentials, but its \
+             password carries no secret material to derive a sealing key from, so the \
+             vended storage credential can be neither referenced by name nor sealed, and \
+             this engine will not place it in the generated SQL in plaintext. The \
+             criterion is connection_password_carries_key_material: at least one of \
+             token, client_secret, secret_key, session_token, account_key, or sas_token \
+             must be non-empty (an access_key id alone is an identifier, not a secret). \
+             Remedy either by configuring catalog authentication or supplying that \
+             CONNECTION's own storage secret, or by setting use_vended_credentials to \
+             false so the credential travels as a CONNECTION reference instead; to \
+             disable it, edit the CONNECTION's password"
+        )));
+    };
+    Ok(ScanStorage::Sealed {
+        name: connection_name.to_string(),
+        payload: seal_storage(effective, key)?,
+    })
 }
 
 #[cfg(test)]

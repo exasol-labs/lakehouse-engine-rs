@@ -50,7 +50,14 @@ $(VS_SO): $(VS_SRCS)
 	  -e HOME=/tmp \
 	  $(UDF_BUILDER_IMAGE) \
 	  cargo build --release -p lakehouse-engine
-	cargo install cargo-exasol-udf --version $(SLC_VERSION) --quiet
+	# "=$(SLC_VERSION)" (exact) + --locked: cargo-exasol-udf doesn't exact-pin its
+	# OWN exasol-udf-sdk dependency, so a caret-range install re-resolves to
+	# whatever's newest on crates.io at install time and validates against THAT
+	# SDK's fingerprint instead of the one this SLC release actually shipped —
+	# broke CI when exasol-udf-sdk 0.23.1 published before any matching SLC
+	# release existed. --locked forces cargo-exasol-udf's own published
+	# Cargo.lock, pinning it back to the SDK version it was actually built with.
+	cargo install cargo-exasol-udf --version "=$(SLC_VERSION)" --locked --quiet
 	cargo exasol-udf validate $@
 
 # Alias: build the .so if out of date.
@@ -79,7 +86,7 @@ export LH_REST_PORT
 # They FAIL (not skip) when the stack is unavailable. All tests share one VS,
 # so the binary runs serially (--test-threads=1).
 test-e2e: cross-udf-build
-	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test -- --test-threads=1
+	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test --test e2e_credential_exposure_test -- --test-threads=1
 
 # Lakekeeper E2E tests require a live Exasol + MinIO + Lakekeeper + Keycloak
 # stack — bring it up first with the `docker-compose.lakekeeper.yml` overlay:

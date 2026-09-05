@@ -1,5 +1,6 @@
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
+use crate::scan::spec::{AdlsCred, StorageProps};
 use exasol_udf_sdk::connect_back::ConnectionObject;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
@@ -1279,4 +1280,94 @@ fn unity_connection_reuses_existing_auth_fields() {
     assert_eq!(resolved.creds.token, None);
     assert_eq!(resolved.creds.client_id, None);
     assert_eq!(resolved.creds.client_secret, None);
+}
+
+/// `StorageCreds::from_json(json).backend(allow_http)` must equal
+/// `storage_block(&parse_creds(json), allow_http)` field-for-field: task 2.2
+/// repointed `storage_block` to delegate to `StorageCreds::from(creds).backend`,
+/// but `parse_creds` still reads the same nine key spellings independently
+/// through `StorageCreds::from_json`, and the two readers must never disagree
+/// about the backend a given password selects. This is a NEW test alongside
+/// the existing `storage_block`/`validate_creds` assertions above, which are
+/// the characterization gate for 2.2 and stay unedited.
+#[test]
+fn storage_creds_from_json_backend_equals_storage_block_for_every_storage_field_shape() {
+    let every_field_present = serde_json::json!({
+        "endpoint": "http://s3.example.com",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": S3_SECRET,
+        "session_token": "STS_TOKEN",
+        "path_style": false,
+        "account_name": "myaccount",
+        "account_key": AZURE_ACCOUNT_KEY,
+        "sas_token": AZURE_SAS,
+    });
+    let every_field_empty = serde_json::json!({
+        "endpoint": "",
+        "region": "",
+        "access_key": "",
+        "secret_key": "",
+        "session_token": "",
+        "path_style": false,
+        "account_name": "",
+        "account_key": "",
+        "sas_token": "",
+    });
+    let every_field_omitted = serde_json::json!({});
+
+    for (shape, json) in [
+        ("every field present", &every_field_present),
+        ("every field empty", &every_field_empty),
+        ("every field omitted", &every_field_omitted),
+    ] {
+        for allow_http in [false, true] {
+            assert_eq!(
+                StorageCreds::from_json(json).backend(allow_http),
+                storage_block(&parse_creds(json), allow_http),
+                "{shape}, allow_http={allow_http}"
+            );
+        }
+    }
+}
+
+/// The sealing key is absent AT THE `read_connection` BOUNDARY for a password
+/// carrying no secret material, and present for one that carries a secret.
+///
+/// `adapter_tests.rs`'s gate cases prove the same property of
+/// `resolve_connection_config`'s output. This one pins it one layer down, at the
+/// boundary that now owns the decision — so a crate-internal reader that takes a
+/// [`Resolved`] straight from `read_connection`, bypassing
+/// `resolve_connection_config` entirely, still cannot obtain a key derived from
+/// `{"warehouse":"wh"}`.
+#[test]
+fn sealing_key_is_absent_for_a_password_carrying_no_secret_field_at_the_read_connection_boundary() {
+    let keyless = serde_json::json!({"warehouse": "wh"}).to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &keyless);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("a warehouse-only password is an acceptable CONNECTION");
+    assert_eq!(
+        resolved.creds.warehouse, "wh",
+        "positive control: the CONNECTION must actually have resolved"
+    );
+    assert!(
+        resolved.sealed_storage_key.is_none(),
+        "a password holding only a warehouse carries no key material, so no key \
+         may exist on the Resolved value at all"
+    );
+
+    let with_secret = serde_json::json!({
+        "warehouse": "wh",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+    })
+    .to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &with_secret);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("the installer's own default template shape must be accepted");
+    assert!(
+        resolved.sealed_storage_key.is_some(),
+        "a non-empty secret_key is key material, so the boundary must derive a key"
+    );
 }

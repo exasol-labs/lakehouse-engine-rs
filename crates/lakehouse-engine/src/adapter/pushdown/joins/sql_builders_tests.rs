@@ -2057,19 +2057,26 @@ fn golden_broadcast_join_sql_unchanged() {
         "SCAN",
         "DISTRIBUTE",
     )
+    .expect("selecting the wire storage must succeed")
     .expect("an unbounded broadcast join must build");
     assert_eq!(
         actual,
-        r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":["L_ORDERKEY","O_ORDERDATE"],"filter":"(\"L_QUANTITY\" > 5)","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")","storage":{"s3":{"endpoint":"http://minio-dim:9000","region":"us-east-2","access_key":"dimadmin","secret_key":"dimadmin","allow_http":true,"path_style":true}}},"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("L_ORDERKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)"#
+        r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":["L_ORDERKEY","O_ORDERDATE"],"filter":"(\"L_QUANTITY\" > 5)","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")","storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}}},"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("L_ORDERKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)"#
     );
 }
 
-/// `build_broadcast_join_sql` must carry the FACT side's own backend in
-/// `common.storage` and the DIMENSION side's own backend in `join.storage` —
-/// never the other way around. Swapping `fact.effective_storage.clone()` and
-/// `dimension.effective_storage.clone()` at the two assignment sites in
-/// `build_broadcast_join_sql` would fail this test (wrong side's credential in
-/// each slot), not merely re-baseline a golden string.
+/// `build_broadcast_join_sql` must carry the FACT side's own storage in
+/// `common.storage` and the DIMENSION side's own storage in `join.storage` —
+/// never the other way around. Swapping the two selection sites in
+/// `build_broadcast_join_sql` fails this test (wrong side's credential in each
+/// slot), rather than merely re-baselining a golden string.
+///
+/// Driven over a VENDED CONNECTION deliberately. Under the static reference
+/// form both sides name the SAME CONNECTION, so their wire values coincide by
+/// design and a swap is unobservable — and harmless, because both sides then
+/// resolve one backend from one CONNECTION read. Vending is the case where the
+/// two sides' backends genuinely differ: each is sealed on its own, so the swap
+/// this test guards against is observable exactly where it would matter.
 #[test]
 fn broadcast_carries_each_sides_own_storage() {
     let mut fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
@@ -2105,23 +2112,48 @@ fn broadcast_carries_each_sides_own_storage() {
         &sides,
         &rendered,
         JoinWindowPlan::Unbounded,
-        &two_scan_tuning(),
+        &JoinScanRequestConfig {
+            connection: &crate::adapter::pushdown::test_support::TEST_VENDED_CONNECTION,
+            ..two_scan_tuning()
+        },
         "SCAN",
         "DISTRIBUTE",
     )
+    .expect("selecting the wire storage must succeed")
     .expect("an unbounded broadcast join must build");
     let common: serde_json::Value =
         serde_json::from_str(common_arg_literal(&sql)).expect("common blob is valid JSON");
 
-    assert_eq!(
-        common["storage"],
-        serde_json::to_value(&fact.effective_storage).unwrap(),
-        "common.storage must be the FACT side's own backend"
-    );
-    assert_eq!(
-        common["join"]["storage"],
-        serde_json::to_value(&dimension.effective_storage).unwrap(),
-        "join.storage must be the DIMENSION side's own backend"
+    let key = test_sealing_key();
+    for (label, wire, expected) in [
+        (
+            "common.storage",
+            &common["storage"],
+            &fact.effective_storage,
+        ),
+        (
+            "join.storage",
+            &common["join"]["storage"],
+            &dimension.effective_storage,
+        ),
+    ] {
+        let selected: ScanStorage =
+            serde_json::from_value(wire.clone()).expect("the wire value is a ScanStorage");
+        let ScanStorage::Sealed { payload, .. } = &selected else {
+            panic!("a vended side must be sealed, got {selected:?} for {label}");
+        };
+        assert_eq!(
+            &crate::scan::sealed::unseal_storage(payload, &key)
+                .expect("the envelope must open under the fixture key"),
+            expected,
+            "{label} must seal that side's OWN backend"
+        );
+    }
+    // Positive control on the guard itself: the two sides' envelopes differ, so
+    // an equality assertion could not pass by the two sides coinciding.
+    assert_ne!(
+        common["storage"], common["join"]["storage"],
+        "the two sides must carry two distinct envelopes"
     );
 }
 
@@ -2149,6 +2181,7 @@ fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
         "SCAN",
         "DISTRIBUTE",
     )
+    .expect("selecting the wire storage must succeed")
 }
 
 fn broadcast_common_blob(sql: &str) -> Json {
@@ -2395,7 +2428,7 @@ fn golden_n_scan_join_sql_unchanged() {
     .expect("the two-table unified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM (SELECT SCAN('{"table_root":"s3://warehouse/lh/customer","projection":["C_CUSTKEY","C_NAME"],"filter":"(\"C_NAME\" = ''ACME'')","emit_exa_types":["DECIMAL(20,0)","VARCHAR(100)"],"logical_schema":[{"field_id":1,"name":"CUSTOMER_KEY","arrow_type":"int64","nullable":false}],"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" INNER JOIN (SELECT SCAN('{"table_root":"s3://warehouse/lh/orders","projection":["O_CUSTKEY","O_ORDERDATE"],"filter":"(\"O_ORDERDATE\" > ''1995-01-01'')","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/o-0.parquet",100]]') EMITS ("O_CUSTKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)) AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")) WHERE (("LHS_T0"."C_CUSTKEY" > "LHS_T1"."O_CUSTKEY"))"#
+        r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM (SELECT SCAN('{"table_root":"s3://warehouse/lh/customer","projection":["C_CUSTKEY","C_NAME"],"filter":"(\"C_NAME\" = ''ACME'')","emit_exa_types":["DECIMAL(20,0)","VARCHAR(100)"],"logical_schema":[{"field_id":1,"name":"CUSTOMER_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" INNER JOIN (SELECT SCAN('{"table_root":"s3://warehouse/lh/orders","projection":["O_CUSTKEY","O_ORDERDATE"],"filter":"(\"O_ORDERDATE\" > ''1995-01-01'')","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/o-0.parquet",100]]') EMITS ("O_CUSTKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)) AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")) WHERE (("LHS_T0"."C_CUSTKEY" > "LHS_T1"."O_CUSTKEY"))"#
     );
 }
 
@@ -2422,7 +2455,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
                 ProjectionItem::Column("C_NAME".to_string()),
             ],
             emit_exa_types: vec!["DECIMAL(20,0)".to_string(), "VARCHAR(100)".to_string()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2439,7 +2472,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     .expect("the grouped qualified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"emit_exa_types":["DECIMAL(20,0)","VARCHAR(100)"],"storage":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
+        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"emit_exa_types":["DECIMAL(20,0)","VARCHAR(100)"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
     );
 }
 
@@ -2594,7 +2627,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
             common: CommonScanSpec {
                 projection,
                 emit_exa_types,
-                storage: sample_storage(),
+                storage: ScanStorage::Inline(sample_storage()),
                 ..Default::default()
             },
             files: vec![],
@@ -2956,7 +2989,7 @@ fn qualified_single_table_untranslatable_select_item_is_hard_error() {
     });
     let col_types = vec![("ID".to_string(), "DECIMAL(20,0)".to_string())];
     let base = CommonScanSpec {
-        storage: sample_storage(),
+        storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
     let shards = vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]];
@@ -3003,7 +3036,7 @@ fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zon
     });
     let col_types = vec![("ID".to_string(), "DECIMAL(20,0)".to_string())];
     let base = CommonScanSpec {
-        storage: sample_storage(),
+        storage: ScanStorage::Inline(sample_storage()),
         ..Default::default()
     };
     let shards = vec![vec![FileEntry::new("s3://w/f-0.parquet", 10)]];
@@ -3053,7 +3086,7 @@ fn declined_filter_fan_out_spec() -> ScanSpec {
                 ProjectionItem::Column("C_TS".to_string()),
             ],
             emit_exa_types: vec!["DECIMAL(20,0)".to_string(), "TIMESTAMP".to_string()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
