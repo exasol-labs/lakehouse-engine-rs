@@ -50,7 +50,14 @@ $(VS_SO): $(VS_SRCS)
 	  -e HOME=/tmp \
 	  $(UDF_BUILDER_IMAGE) \
 	  cargo build --release -p lakehouse-engine
-	cargo install cargo-exasol-udf --version $(SLC_VERSION) --quiet
+	# "=$(SLC_VERSION)" (exact) + --locked: cargo-exasol-udf doesn't exact-pin its
+	# OWN exasol-udf-sdk dependency, so a caret-range install re-resolves to
+	# whatever's newest on crates.io at install time and validates against THAT
+	# SDK's fingerprint instead of the one this SLC release actually shipped —
+	# broke CI when exasol-udf-sdk 0.23.1 published before any matching SLC
+	# release existed. --locked forces cargo-exasol-udf's own published
+	# Cargo.lock, pinning it back to the SDK version it was actually built with.
+	cargo install cargo-exasol-udf --version "=$(SLC_VERSION)" --locked --quiet
 	cargo exasol-udf validate $@
 
 # Alias: build the .so if out of date.
