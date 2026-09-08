@@ -1186,11 +1186,6 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-// ---------------------------------------------------------------------------
-// Error redaction reads its secret set from the RESOLVED credential
-// ---------------------------------------------------------------------------
-
-
 #[tokio::test]
 async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     use crate::scan::ResolvedScanStorage;

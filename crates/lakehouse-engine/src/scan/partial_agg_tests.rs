@@ -593,8 +593,3 @@ fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Error redaction reads its secret set from the RESOLVED credential
-// ---------------------------------------------------------------------------
-
-

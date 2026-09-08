@@ -3346,23 +3346,14 @@ fn sentinel_creds(use_vended_credentials: bool) -> ConnectionCreds {
         secret_key: SENTINEL_SECRET_KEY.into(),
         session_token: Some(SENTINEL_SESSION_TOKEN.into()),
         path_style: true,
-        use_sigv4: false,
         use_vended_credentials,
-        token: None,
-        client_id: None,
-        client_secret: None,
-        oauth2_server_uri: None,
-        scope: None,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
+        ..Default::default()
     }
 }
 
 fn sentinel_effective_backend(creds: &ConnectionCreds) -> StorageBackend {
     crate::adapter::connection::storage_block(creds, true)
 }
-
 
 fn dispatch_result_for_body(
     pushdown_req_body: Json,

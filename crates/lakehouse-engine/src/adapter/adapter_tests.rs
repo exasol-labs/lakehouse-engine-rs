@@ -1884,8 +1884,6 @@ fn resolve_s3_max_connections_auto_zero_cores_defaults() {
     );
 }
 
-// --- Sealing key derivation ---
-
 struct PasswordCtx(String);
 
 impl UdfContext for PasswordCtx {

@@ -59,7 +59,7 @@ fn debug_redacts_every_secret_bearing_field() {
             endpoint: props.endpoint.clone(), region: props.region.clone(),
             access_key: props.access_key.clone(), secret_key: props.secret_key.clone(),
             session_token: props.session_token.clone(), path_style: true,
-            account_name: None, account_key: None, sas_token: None,
+            ..Default::default()
         })),
     ] {
         for s in ["AK2", "SK2", "TOK2"] {
@@ -132,15 +132,10 @@ const OAUTH2_SCOPE: &str = "catalog-scope";
 
 fn s3_storage_creds() -> StorageCreds {
     StorageCreds {
-        endpoint: STORAGE_ENDPOINT.into(),
-        region: STORAGE_REGION.into(),
-        access_key: STORAGE_AK.into(),
-        secret_key: STORAGE_SK.into(),
-        session_token: Some(STORAGE_SESSION_TOKEN.into()),
-        path_style: true,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
+        endpoint: STORAGE_ENDPOINT.into(), region: STORAGE_REGION.into(),
+        access_key: STORAGE_AK.into(), secret_key: STORAGE_SK.into(),
+        session_token: Some(STORAGE_SESSION_TOKEN.into()), path_style: true,
+        ..Default::default()
     }
 }
 

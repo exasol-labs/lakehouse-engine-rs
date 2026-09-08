@@ -1440,9 +1440,7 @@ print_next_step_template() {
   emit "    \"secret_key\": \"<secret_key>\""
   emit "  }';"
   emit ""
-  emit "-- Grant the VS OWNER's scripts access to the CONNECTION (run BEFORE CREATE VIRTUAL SCHEMA)."
-  emit "-- Exasol checks ACCESS ON CONNECTION against the VS OWNER, not the querying user."
-  emit "-- See docs/security.md for the grant model."
+  emit "-- Grant the VS OWNER's scripts CONNECTION access (BEFORE CREATE VIRTUAL SCHEMA). See docs/security.md."
   emit ""
   if [[ "${installing_user,,}" == "sys" ]]; then
     emit "-- SYS holds every CONNECTION implicitly; skip the grants."
@@ -1459,8 +1457,7 @@ print_next_step_template() {
   emit "  NAMESPACE          = '<namespace>'"
   emit "  ALLOW_HTTP         = 'false';"
   emit ""
-  emit "-- Readers need only: GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <user>;"
-  emit "-- Re-running CREATE OR REPLACE CONNECTION/SCRIPT drops ACCESS grants; re-issue them."
+  emit "-- Readers: GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <user>; CREATE OR REPLACE drops ACCESS grants."
 }
 
 # --- Entry point -------------------------------------------------------------

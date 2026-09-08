@@ -304,10 +304,6 @@ pub fn current_user(conn: &mut ExaConn) -> String {
         .unwrap_or_else(|| panic!("SELECT CURRENT_USER returned no value: {cols:?}"))
 }
 
-// Grants the VS OWNER (not the querying user) ACCESS ON CONNECTION for both
-// scripts. Exasol evaluates the grant against the VS owner on pushdown SQL.
-// Skipped for SYS (DBA holds all CONNECTIONs implicitly; GRANT TO SYS is
-// rejected with sqlCode 42500).
 pub fn grant_connection_access_to_vs_owner(conn: &mut ExaConn, conn_name: &str) {
     let owner = current_user(conn);
     if owner.eq_ignore_ascii_case("SYS") {

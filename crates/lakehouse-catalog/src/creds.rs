@@ -1,7 +1,7 @@
 use crate::{AdlsCred, StorageBackend};
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct ConnectionCreds {
     pub warehouse: String,
     pub endpoint: String,
@@ -163,6 +163,7 @@ impl StorageProps {
     }
 }
 
+#[derive(Default)]
 pub struct StorageCreds {
     pub endpoint: String,
     pub region: String,

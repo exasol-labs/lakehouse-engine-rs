@@ -674,4 +674,3 @@ fn static_store_address_fields_are_not_public() {
     }
 }
 
-

@@ -36,6 +36,10 @@ fn vs_table() -> String {
     format!("{VS_NAME}.{}", E2E_TABLE.to_uppercase())
 }
 
+fn scan_grant_sql(verb: &str, preposition: &str) -> String {
+    format!("{verb} ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME} {preposition} {OWNER_USER}")
+}
+
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
@@ -103,18 +107,9 @@ fn a_least_privilege_reader_gets_the_owners_rows_without_a_connection_grant() {
     assert_eq!(reader.query_scalar_i64(&filtered_sql), owner_filtered);
 
     let mut sys = exa_conn();
-    assert_eq!(
-        sys.query_row_count(&format!(
-            "SELECT GRANTEE FROM EXA_DBA_CONNECTION_PRIVS WHERE GRANTEE = '{READER_USER}'"
-        )),
-        0
-    );
-    assert_eq!(
-        sys.query_row_count(&format!(
-            "SELECT GRANTED_ROLE FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = '{READER_USER}'"
-        )),
-        0
-    );
+    for view in ["EXA_DBA_CONNECTION_PRIVS", "EXA_DBA_ROLE_PRIVS"] {
+        assert_eq!(sys.query_row_count(&format!("SELECT * FROM {view} WHERE GRANTEE = '{READER_USER}'")), 0);
+    }
 }
 
 #[test]
@@ -154,25 +149,15 @@ fn revoking_the_owners_scan_grant_denies_the_reader_without_leaking_the_credenti
     assert_eq!(reader_conn().query_row_count(&query), SEED_ROWS_SCORE_GT_15 as i64);
 
     let mut owner = owner_conn();
-    owner.execute(&format!(
-        "REVOKE ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME} \
-         FROM {OWNER_USER}"
-    ));
+    owner.execute(&scan_grant_sql("REVOKE", "FROM"));
     let denied = reader_conn().try_execute(&query);
-    owner.execute(&format!(
-        "GRANT ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME} \
-         TO {OWNER_USER}"
-    ));
+    owner.execute(&scan_grant_sql("GRANT", "TO"));
 
     assert_eq!(denied["status"].as_str(), Some("error"), "revoke must deny: {denied}");
     let msg = denied["exception"]["text"].as_str().unwrap_or("");
-    assert!(msg.contains(CONN_NAME), "must name CONNECTION: {msg}");
-    assert!(
-        msg.contains("GRANT ACCESS ON CONNECTION")
-            && msg.contains(&format!("FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}")),
-        "must name missing grant: {msg}"
-    );
-    assert!(msg.contains("OWNER of the virtual schema"), "must name VS OWNER: {msg}");
+    for needle in [CONN_NAME, "GRANT ACCESS ON CONNECTION", &format!("FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}"), "OWNER of the virtual schema"] {
+        assert!(msg.contains(needle), "denial must contain {needle:?}: {msg}");
+    }
     for value in [&password.access_key, &password.secret_key] {
         assert!(!msg.contains(value.as_str()), "credential leaked: {msg}");
     }

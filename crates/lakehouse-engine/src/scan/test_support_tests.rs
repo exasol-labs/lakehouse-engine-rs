@@ -48,28 +48,15 @@ fn inline_backend(storage: &ScanStorage) -> StorageBackend {
 pub(super) const TEST_CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
 
 pub(super) fn refusing_endpoint(message: &str) -> String {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback endpoint");
-    let url = format!(
-        "http://{}",
-        listener
-            .local_addr()
-            .expect("bound endpoint has an address")
-    );
-    let body = format!(
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
-         <Error><Code>SignatureDoesNotMatch</Code><Message>{message}</Message></Error>"
-    );
-    let response = format!(
-        "HTTP/1.1 403 Forbidden\r\nContent-Type: application/xml\r\n\
-         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let body = format!("<Error><Code>SignatureDoesNotMatch</Code><Message>{message}</Message></Error>");
+    let resp = format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
     std::thread::spawn(move || {
         for stream in listener.incoming() {
-            let Ok(mut stream) = stream else { break };
-            let mut request_head = [0u8; 4096];
-            let _ = std::io::Read::read(&mut stream, &mut request_head);
-            let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            let Ok(mut s) = stream else { break };
+            let _ = std::io::Read::read(&mut s, &mut [0u8; 4096]);
+            let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
         }
     });
     url
@@ -89,30 +76,11 @@ pub(super) fn refusing_backend(endpoint: &str, secret: &str) -> StorageBackend {
 pub(super) struct SinkCtx;
 
 impl exasol_udf_sdk::context::UdfContext for SinkCtx {
-    fn num_columns(&self) -> usize {
-        0
+    fn num_columns(&self) -> usize { 0 }
+    fn get(&self, _: usize) -> Result<&exasol_udf_sdk::value::Value, exasol_udf_sdk::error::UdfError> {
+        unimplemented!()
     }
-    fn get(
-        &self,
-        _col: usize,
-    ) -> Result<&exasol_udf_sdk::value::Value, exasol_udf_sdk::error::UdfError> {
-        Err(exasol_udf_sdk::error::UdfError::User(
-            "this sink reads no input column".into(),
-        ))
-    }
-    fn emit(
-        &mut self,
-        _values: &[exasol_udf_sdk::value::Value],
-    ) -> Result<(), exasol_udf_sdk::error::UdfError> {
-        Ok(())
-    }
-    fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> {
-        Ok(false)
-    }
-    fn emit_record_batch_ipc(
-        &mut self,
-        _ipc: &[u8],
-    ) -> Result<(), exasol_udf_sdk::error::UdfError> {
-        Ok(())
-    }
+    fn emit(&mut self, _: &[exasol_udf_sdk::value::Value]) -> Result<(), exasol_udf_sdk::error::UdfError> { Ok(()) }
+    fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> { Ok(false) }
+    fn emit_record_batch_ipc(&mut self, _: &[u8]) -> Result<(), exasol_udf_sdk::error::UdfError> { Ok(()) }
 }

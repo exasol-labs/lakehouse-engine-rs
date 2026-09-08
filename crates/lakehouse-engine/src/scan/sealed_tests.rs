@@ -8,25 +8,7 @@ type SecretFieldSetter = fn(&mut ConnectionCreds, &str);
 const SEALING_PASSWORD: &str = r#"{"warehouse":"wh","secret_key":"S3CR3TV4LU3"}"#;
 
 fn creds_without_key_material() -> ConnectionCreds {
-    ConnectionCreds {
-        warehouse: "wh".into(),
-        endpoint: String::new(),
-        region: String::new(),
-        access_key: String::new(),
-        secret_key: String::new(),
-        session_token: None,
-        path_style: true,
-        use_sigv4: false,
-        use_vended_credentials: false,
-        token: None,
-        client_id: None,
-        client_secret: None,
-        oauth2_server_uri: None,
-        scope: None,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
-    }
+    ConnectionCreds { warehouse: "wh".into(), path_style: true, ..Default::default() }
 }
 
 fn secret_bearing_fields() -> Vec<(&'static str, SecretFieldSetter)> {
@@ -42,13 +24,9 @@ fn secret_bearing_fields() -> Vec<(&'static str, SecretFieldSetter)> {
 
 fn s3_backend() -> StorageBackend {
     StorageBackend::S3(StorageProps {
-        endpoint: "http://minio:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "VENDEDAK".into(),
-        secret_key: "VENDEDSK".into(),
-        session_token: Some("VENDEDTOK".into()),
-        allow_http: true,
-        path_style: true,
+        endpoint: "http://minio:9000".into(), region: "us-east-1".into(),
+        access_key: "VENDEDAK".into(), secret_key: "VENDEDSK".into(),
+        session_token: Some("VENDEDTOK".into()), allow_http: true, ..Default::default()
     })
 }
 

@@ -93,128 +93,80 @@ fn common_with(storage: ScanStorage) -> CommonScanSpec {
 fn scan_storage_variants_resolve_or_fail_correctly() {
     let backend = s3_backend("INLINESECRET");
 
-    // Inline: resolves to its own backend, no CONNECTION needed.
     let inline = resolve_scan_storage(
         &common_with(ScanStorage::Inline(backend.clone())),
         &StubConnections::none(),
     )
-    .expect("inline needs no CONNECTION");
+    .expect("inline");
     assert_eq!(inline.primary(), &backend);
     assert!(inline.join().is_none());
 
-    // Connection: resolves through ctx.connection().
     let conn = resolve_scan_storage(
-        &common_with(ScanStorage::Connection {
-            name: CONNECTION.into(),
-            allow_http: true,
-        }),
+        &common_with(ScanStorage::Connection { name: CONNECTION.into(), allow_http: true }),
         &StubConnections::one(CONNECTION, password("RESOLVEDSECRET")),
     )
-    .expect("CONNECTION resolves");
-    let StorageBackend::S3(props) = conn.primary() else {
-        panic!("expected S3")
-    };
+    .expect("connection");
+    let StorageBackend::S3(props) = conn.primary() else { panic!("expected S3") };
     assert_eq!(props.secret_key, "RESOLVEDSECRET");
     assert!(props.allow_http);
 
-    // Unresolvable CONNECTION: errors naming the connection and the missing grant.
-    let err = resolve_scan_storage(
-        &common_with(ScanStorage::Connection {
-            name: CONNECTION.into(),
-            allow_http: false,
-        }),
-        &StubConnections::none(),
-    )
-    .expect_err("unreadable CONNECTION must fail");
-    let text = err.to_string();
-    assert!(text.contains(CONNECTION), "{text}");
-    assert!(text.contains("ACCESS ON CONNECTION"), "{text}");
-
     let conn_spec = common_with(ScanStorage::Connection { name: CONNECTION.into(), allow_http: false });
+    let err = resolve_scan_storage(&conn_spec, &StubConnections::none()).expect_err("unreadable");
+    let text = err.to_string();
+    assert!(text.contains(CONNECTION) && text.contains("ACCESS ON CONNECTION"), "{text}");
+
     let deployed = resolve_scan_storage(
         &conn_spec, &StubConnections::none().with_script("LAKEHOUSE_OPS", "LH_SCAN_V2"),
-    ).expect_err("unreadable CONNECTION must fail");
+    ).expect_err("unreadable");
     assert!(deployed.to_string().contains("FOR SCRIPT LAKEHOUSE_OPS.LH_SCAN_V2"), "{deployed}");
-    let fallback = resolve_scan_storage(&conn_spec, &StubConnections::none())
-        .expect_err("unreadable CONNECTION must fail");
+    let fallback = resolve_scan_storage(&conn_spec, &StubConnections::none()).expect_err("unreadable");
     assert!(fallback.to_string().contains("FOR SCRIPT <schema>.LAKEHOUSE_SCAN"), "{fallback}");
 
-    // Non-object password: refused without falling back.
     for bad in ["not json at all", "[]"] {
         let err = resolve_scan_storage(
-            &common_with(ScanStorage::Connection {
-                name: CONNECTION.into(),
-                allow_http: false,
-            }),
+            &common_with(ScanStorage::Connection { name: CONNECTION.into(), allow_http: false }),
             &StubConnections::one(CONNECTION, bad.into()),
         )
-        .expect_err("non-object password must not resolve");
+        .expect_err("non-object");
         let text = err.to_string();
-        assert!(text.contains(CONNECTION), "{text}");
-        assert!(text.contains("not a JSON object"), "{text}");
-        assert!(!text.contains(bad), "{text}");
+        assert!(text.contains(CONNECTION) && text.contains("not a JSON object") && !text.contains(bad), "{text}");
     }
+
+    let vended = s3_backend("VENDEDSECRET");
+    let raw = password("STANDINGSECRET");
+    let payload = seal_storage(&vended, &derive_sealed_storage_key(&raw)).expect("seal");
+    let sealed = resolve_scan_storage(
+        &common_with(ScanStorage::Sealed { name: CONNECTION.into(), payload }),
+        &StubConnections::one(CONNECTION, raw),
+    )
+    .expect("sealed");
+    assert_eq!(sealed.primary(), &vended);
+    let secrets = sealed.all_secret_values();
+    assert!(secrets.contains(&"VENDEDSECRET") && !secrets.contains(&"STANDINGSECRET"), "{secrets:?}");
 }
 
 #[test]
 fn join_spec_resolves_two_sides_independently() {
     let dim_conn = "LAKEHOUSE_DIM_CREDS";
     let ctx = StubConnections {
-        connections: vec![
-            (CONNECTION, password("FACTSIDESECRET")),
-            (dim_conn, password("DIMSIDESECRET")),
-        ],
-        script_schema: None,
-        script_name: None,
+        connections: vec![(CONNECTION, password("FACTSECRET")), (dim_conn, password("DIMSECRET"))],
+        script_schema: None, script_name: None,
     };
-    let mut common = common_with(ScanStorage::Connection {
-        name: CONNECTION.into(),
-        allow_http: false,
-    });
+    let mut common = common_with(ScanStorage::Connection { name: CONNECTION.into(), allow_http: false });
     common.join = Some(JoinSpec {
-        storage: ScanStorage::Connection {
-            name: dim_conn.into(),
-            allow_http: false,
-        },
-        table_root: "s3://dim-bucket/db/dim".into(),
-        condition: "\"F_KEY\" = \"D_KEY\"".into(),
+        storage: ScanStorage::Connection { name: dim_conn.into(), allow_http: false },
+        table_root: "s3://dim/db/dim".into(),
+        condition: "\"F\" = \"D\"".into(),
         join_type: JoinType::Inner,
-        files: Vec::new(),
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        post_join_limit: None,
-        partition_columns: Vec::new(),
+        files: Vec::new(), logical_schema: Vec::new(), name_mapping: Vec::new(),
+        post_join_limit: None, partition_columns: Vec::new(),
     });
 
-    let resolved = resolve_scan_storage(&common, &ctx).expect("both references resolve");
-    assert_eq!(secret_key_of(resolved.primary()), "FACTSIDESECRET");
-    assert_eq!(
-        secret_key_of(resolved.join().expect("dimension side must resolve")),
-        "DIMSIDESECRET",
-    );
+    let resolved = resolve_scan_storage(&common, &ctx).expect("both resolve");
+    assert_eq!(secret_key_of(resolved.primary()), "FACTSECRET");
+    assert_eq!(secret_key_of(resolved.join().expect("dim")), "DIMSECRET");
     let secrets = resolved.all_secret_values();
-    assert!(secrets.contains(&"FACTSIDESECRET"), "{secrets:?}");
-    assert!(secrets.contains(&"DIMSIDESECRET"), "{secrets:?}");
-}
-
-#[test]
-fn sealed_variant_resolves_and_redacts_the_standing_password() {
-    let vended = s3_backend("VENDEDSECRET");
-    let raw = password("STANDINGSECRET");
-    let payload =
-        seal_storage(&vended, &derive_sealed_storage_key(&raw)).expect("sealing must succeed");
-    let resolved = resolve_scan_storage(
-        &common_with(ScanStorage::Sealed {
-            name: CONNECTION.into(),
-            payload,
-        }),
-        &StubConnections::one(CONNECTION, raw),
-    )
-    .expect("the sealing password must open the envelope");
-    assert_eq!(resolved.primary(), &vended);
-    let secrets = resolved.all_secret_values();
-    assert!(secrets.contains(&"VENDEDSECRET"), "{secrets:?}");
-    assert!(!secrets.contains(&"STANDINGSECRET"), "{secrets:?}");
+    assert!(secrets.contains(&"FACTSECRET") && secrets.contains(&"DIMSECRET"), "{secrets:?}");
 }
 
 fn secret_key_of(backend: &StorageBackend) -> &str {
