@@ -317,12 +317,6 @@ fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
     );
 }
 
-/// `redact_catalog_auth_error` routes through `redact_error_text`, which runs
-/// the value pass BEFORE the label pass — not the inverted composition this
-/// site used before. A token shaped like a SAS value (carrying its own `sig=`
-/// label) proves the ordering: the inverted composition would let the label
-/// pass mangle the token's `sig=` portion first, leaving the value pass unable
-/// to match the (now-broken) literal and leaking the signature tail.
 #[test]
 fn auth_error_sites_apply_the_value_pass_first() {
     const SAS_SHAPED_TOKEN: &str = "sv=2023-11-03&sp=rwdlacx&sig=SIG_VALUE";

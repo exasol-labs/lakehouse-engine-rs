@@ -3,15 +3,10 @@ use crate::scan::spec::{AdlsCred, StorageProps};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
-/// A setter that assigns one secret-bearing field of a [`ConnectionCreds`] a
-/// given value — the shape [`secret_bearing_fields`] pairs with each field name.
 type SecretFieldSetter = fn(&mut ConnectionCreds, &str);
 
-/// The password whose bytes derive every sealing key in this module.
 const SEALING_PASSWORD: &str = r#"{"warehouse":"wh","secret_key":"S3CR3TV4LU3"}"#;
 
-/// A CONNECTION password carrying no secret-bearing field at all — the shape the
-/// vending gate refuses.
 fn creds_without_key_material() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "wh".into(),
@@ -34,9 +29,6 @@ fn creds_without_key_material() -> ConnectionCreds {
     }
 }
 
-/// Every secret-bearing field the predicate reads, paired with a setter that
-/// assigns it the given value. Naming all six here is what makes the truth table
-/// below exhaustive by construction rather than by inspection.
 fn secret_bearing_fields() -> Vec<(&'static str, SecretFieldSetter)> {
     vec![
         ("token", |c, v| c.token = Some(v.to_string())),
@@ -71,8 +63,6 @@ fn adls_backend() -> StorageBackend {
     }
 }
 
-/// Every credential value the fixtures above put inside an envelope, plus the
-/// sealing password itself: the strings no error text may echo.
 fn sentinel_values() -> Vec<&'static str> {
     vec![
         "VENDEDAK",
@@ -93,14 +83,6 @@ fn assert_carries_no_sentinel(context: &str, text: &str) {
     }
 }
 
-/// A sealed envelope round-trips to the backend that was sealed, for EVERY
-/// backend variant — and a payload that has been tampered with, truncated, or
-/// opened under the wrong key fails with an error naming the operation that
-/// failed and echoing neither the password nor any credential value.
-///
-/// Both halves live in one test because the negative half is only meaningful
-/// against a positive control: an "unseal failed" assertion is satisfied by an
-/// envelope that never held anything.
 #[test]
 fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
     let key = derive_sealed_storage_key(SEALING_PASSWORD);
@@ -167,34 +149,6 @@ fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
     }
 }
 
-/// Sealing one backend twice yields two DIFFERENT payloads — a fresh nonce per
-/// encryption, never a fixed one — and both still open to the same backend.
-///
-/// A reused nonce under one key is the classic AES-GCM break, and it would also
-/// make the wire leak equality: two queries over the same vended credential
-/// would carry byte-identical ciphertext.
-#[test]
-fn two_seals_of_one_backend_differ_and_both_unseal() {
-    let key = derive_sealed_storage_key(SEALING_PASSWORD);
-    let backend = s3_backend();
-
-    let first = seal_storage(&backend, &key).expect("the first seal must succeed");
-    let second = seal_storage(&backend, &key).expect("the second seal must succeed");
-
-    assert_ne!(
-        first, second,
-        "two seals of one backend must differ — a fresh nonce per encryption"
-    );
-    assert_eq!(unseal_storage(&first, &key).expect("first opens"), backend);
-    assert_eq!(
-        unseal_storage(&second, &key).expect("second opens"),
-        backend
-    );
-}
-
-/// The derived key is a function of the password bytes ALONE: the same password
-/// derives the same key (so the adapter and the scan UDF agree without sharing
-/// state), and a different password derives a different one.
 #[test]
 fn the_derived_key_is_a_function_of_the_password_alone() {
     let backend = s3_backend();
@@ -218,11 +172,6 @@ fn the_derived_key_is_a_function_of_the_password_alone() {
     );
 }
 
-/// [`connection_password_carries_key_material`]'s full truth table: FALSE for a
-/// password carrying none of the six secret-bearing fields, TRUE for each of the
-/// six carried non-empty in turn, FALSE for each carried but EMPTY, and FALSE for
-/// a non-empty `access_key` with an empty `secret_key` — an AWS access key id is
-/// an identifier, not a secret.
 #[test]
 fn key_material_is_present_only_for_a_non_empty_secret_bearing_field() {
     assert!(

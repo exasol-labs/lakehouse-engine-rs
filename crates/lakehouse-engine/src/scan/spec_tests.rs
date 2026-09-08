@@ -68,8 +68,6 @@ fn sample_spec() -> ScanSpec {
     }
 }
 
-/// Unwraps the S3 payload from an inline [`ScanStorage`] for field-level
-/// assertions in tests that predate the wrapper and only ever exercised S3.
 fn s3_props(storage: &ScanStorage) -> &StorageProps {
     let ScanStorage::Inline(StorageBackend::S3(props)) = storage else {
         panic!("s3_props is inline-S3-only")
@@ -1492,9 +1490,6 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
     assert_eq!(back, join);
 }
 
-/// `storage` carries no `#[serde(default)]` on either `JoinSpec` or
-/// `CommonScanSpec`, so a payload omitting it must be REJECTED rather than
-/// silently defaulting a dimension (or the fact side) to no storage at all.
 #[test]
 fn join_storage_is_a_required_key() {
     let without_storage = r#"{"table_root":"s3://warehouse/db/dim","files":[["data/dim-00000.parquet",512]],"join_type":"inner","condition":"\"F_KEY\" = \"D_KEY\""}"#;
@@ -1541,7 +1536,6 @@ fn common_blob_wire_is_byte_stable() {
     assert!(!common_wire.contains("catalog"));
 }
 
-/// A populated S3 backend for the wrapper-encoding assertions below.
 fn wrapper_test_backend() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://minio:9000".into(),
@@ -1553,15 +1547,6 @@ fn wrapper_test_backend() -> StorageBackend {
     })
 }
 
-/// [`ScanStorage`] is EXTERNALLY tagged, never `untagged`: each of its three
-/// variants encodes under its own lowercase key, and a payload naming a variant
-/// whose shape it does not match is REJECTED rather than resolved to whichever
-/// variant happens to parse.
-///
-/// The untagged pin is the bare-backend case: under `#[serde(untagged)]` an
-/// unwrapped `{"s3":{…}}` would silently deserialize as `Inline`, so the wire
-/// could not distinguish a credential carried inline from a raw backend
-/// arriving where a credential reference was expected.
 #[test]
 fn scan_storage_is_externally_tagged_and_rejects_a_mismatched_payload() {
     let cases = [

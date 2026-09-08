@@ -2065,18 +2065,7 @@ fn golden_broadcast_join_sql_unchanged() {
     );
 }
 
-/// `build_broadcast_join_sql` must carry the FACT side's own storage in
-/// `common.storage` and the DIMENSION side's own storage in `join.storage` —
-/// never the other way around. Swapping the two selection sites in
-/// `build_broadcast_join_sql` fails this test (wrong side's credential in each
-/// slot), rather than merely re-baselining a golden string.
-///
-/// Driven over a VENDED CONNECTION deliberately. Under the static reference
-/// form both sides name the SAME CONNECTION, so their wire values coincide by
-/// design and a swap is unobservable — and harmless, because both sides then
-/// resolve one backend from one CONNECTION read. Vending is the case where the
-/// two sides' backends genuinely differ: each is sealed on its own, so the swap
-/// this test guards against is observable exactly where it would matter.
+// Driven over a vended CONNECTION so each side seals its own backend.
 #[test]
 fn broadcast_carries_each_sides_own_storage() {
     let mut fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);

@@ -35,38 +35,15 @@ pub const REQUIRED_KEY: &str = "warehouse";
 /// mechanism.
 pub use lakehouse_catalog::ConnectionCreds;
 
-/// Resolved CONNECTION: catalog URI, parsed credentials, and the sealing key the
-/// password is entitled to.
 #[derive(Debug)]
 pub struct Resolved {
     pub uri: String,
     pub creds: ConnectionCreds,
-    /// The sealing key HKDF-derived from this CONNECTION's RAW password bytes,
-    /// present IFF that password carries secret material.
-    ///
-    /// Both the derivation AND the decision, taken here where the password
-    /// already lives: the plaintext never travels further than
-    /// [`read_connection`]'s own body, and no reader of a `Resolved` can obtain a
-    /// key for a password holding no secret, because for such a password no key
-    /// was ever constructed. `Option` rather than a caller-side test is what makes
-    /// that structural — see [`read_connection`] for the predicate that decides
-    /// it.
+    /// Present iff the password carries secret material — `Option` makes the gate structural.
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 
-/// Resolve a named Exasol CONNECTION into a catalog URI, credentials, and the
-/// sealing key that password is entitled to.
-///
-/// Credential-safe: the password value is never embedded in any returned error.
-///
-/// This is the SINGLE site that calls
-/// [`connection_password_carries_key_material`]. The condition is not inlined
-/// anywhere else, because the refusal `scan_storage_for` raises is written from a
-/// fact only that predicate knows, and a second copy of the test is how the
-/// refusal's stated reason and the outcome start to disagree. Gating HERE rather
-/// than at a consumer is what makes the guarantee structural: a password carrying
-/// no secret produces no [`SealedStorageKey`] at all, so no later reader of the
-/// returned [`Resolved`] can seal under one.
+/// Single site that gates `SealedStorageKey` creation via `connection_password_carries_key_material`.
 pub fn read_connection(
     ctx: &dyn UdfContext,
     name: Option<&str>,
@@ -90,7 +67,6 @@ pub fn read_connection(
         )));
     }
 
-    // Never embed the password in the error message.
     let json: serde_json::Value = serde_json::from_str(&conn.password).map_err(|_| {
         UdfError::User(format!(
             "CONNECTION '{name}' password is not a valid JSON object"
@@ -114,55 +90,7 @@ pub fn read_connection(
     })
 }
 
-/// Validate parsed credentials against the mode-aware credential contract,
-/// parameterized by the resolved [`CatalogKind`].
-///
-/// Credential-safe: only field names — never values — appear in any error.
-///
-/// Under `CatalogKind::UnityCatalogNative` the kind first rejects `use_sigv4`
-/// (the native Unity Catalog API authenticates with a bearer token or Databricks
-/// OAuth, not a signed AWS request) and then applies rules 2-7 below; rule 1's
-/// `warehouse` requirement does not apply. Rejecting `use_sigv4` ahead of rules
-/// 4-5 keeps the operator from seeing a generic missing-SigV4-field error for a
-/// signing mode that does not apply to Unity Catalog.
-///
-/// Rules, in precedence order:
-/// 1. `warehouse` is required under `CatalogKind::IcebergRest` — the only
-///    unconditionally-required field under that kind; a native Unity Catalog is
-///    addressed by `catalog.schema.table` and carries no warehouse identifier.
-/// 2. Azure and static S3 storage credentials cannot both be supplied. An
-///    undeclared precedence between two credential sets would resolve an
-///    ambiguous credentials input silently, which is the misconfiguration the
-///    rest of these rules exist to prevent.
-/// 3. A CONNECTION supplying ANY Azure field is an Azure CONNECTION, and an
-///    Azure CONNECTION requires `account_name` plus EXACTLY ONE of `account_key`
-///    and `sas_token`. Keying on any-of-three rather than on `account_name`
-///    alone is what turns a CONNECTION that supplies a credential and forgets
-///    the account name into a named-field error instead of a silent fall back to
-///    S3 with the credential ignored.
-/// 4. SigV4 and catalog token/OAuth authentication are mutually exclusive.
-/// 5. When `use_sigv4` is enabled, `access_key`, `secret_key`, and `region` are
-///    required (they sign the catalog `load_table` request ahead of any vended
-///    credentials); this holds regardless of `use_vended_credentials`. `endpoint`
-///    stays optional.
-/// 6. A `token` together with a complete `client_id`/`client_secret` pair is
-///    rejected. This rule sits after the SigV4 rules so every SigV4 error stays
-///    byte-identical, and ahead of rule 7 for readability only — the two are
-///    disjoint (rule 6 requires all three fields; rule 7 requires exactly one of
-///    the pair), so their relative order has no behavioural consequence.
-/// 7. OAuth2 client credentials require both `client_id` and `client_secret`.
-///
-/// Rules 2 and 3 sit ahead of 4-7 because they decide WHICH storage backend the
-/// credential set describes; reporting a catalog-authentication defect first
-/// would leave a malformed storage-credential set unreported until the operator
-/// fixed an unrelated field. Rule 2 sits ahead of rule 3 because a CONNECTION
-/// carrying both credential sets has no single well-formed shape for rule 3 to
-/// check it against. `use_sigv4` together with Azure fields needs no rule of its
-/// own: rule 2 rejects it when the SigV4 fields are supplied, and rule 5 rejects
-/// it when they are not.
-///
-/// Each rule-group is delegated to a focused helper; this function fixes only
-/// their precedence order (`?` short-circuits on the first defect).
+/// Validates in precedence order: kind preconditions, Azure exclusivity, SigV4, catalog-auth, OAuth2.
 fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Result<(), UdfError> {
     validate_kind_preconditions(name, creds, kind)?;
     validate_azure_storage_creds(name, creds)?;
@@ -172,8 +100,6 @@ fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Res
     Ok(())
 }
 
-/// Rule 1 (`IcebergRest`) and the native Unity Catalog SigV4 rejection: the
-/// per-kind preconditions that run ahead of the kind-agnostic rules 2-6.
 fn validate_kind_preconditions(
     name: &str,
     creds: &ConnectionCreds,
@@ -200,9 +126,6 @@ fn validate_kind_preconditions(
     Ok(())
 }
 
-/// Rules 2 and 3: Azure and S3 storage credentials are mutually exclusive, and a
-/// CONNECTION supplying any Azure field must supply `account_name` plus exactly
-/// one of `account_key` and `sas_token`.
 fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     let azure_fields = supplied_azure_fields(creds);
     if azure_fields.is_empty() {
@@ -240,9 +163,6 @@ fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(
     Ok(())
 }
 
-/// Rules 4 and 5: SigV4 signing is mutually exclusive with catalog token/OAuth
-/// authentication, and when enabled requires `access_key`, `secret_key`, and
-/// `region`.
 fn validate_sigv4_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     if creds.use_sigv4 && creds.has_catalog_auth() {
         return Err(UdfError::User(format!(
@@ -273,10 +193,6 @@ fn validate_sigv4_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfEr
     Ok(())
 }
 
-/// Rule 6: a `token` together with a complete `client_id`/`client_secret`
-/// pair is rejected. Fires only when all three fields are present — a
-/// `token` beside HALF a pair is already rejected by rule 7 (OAuth2
-/// completeness), so the two rules are disjoint and share no error text.
 fn validate_exclusive_catalog_auth_creds(
     name: &str,
     creds: &ConnectionCreds,
@@ -291,8 +207,6 @@ fn validate_exclusive_catalog_auth_creds(
     Ok(())
 }
 
-/// Rule 7: OAuth2 client credentials require both `client_id` and
-/// `client_secret`, or neither.
 fn validate_oauth2_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     match (creds.client_id.is_some(), creds.client_secret.is_some()) {
         (true, false) => Err(UdfError::User(format!(
@@ -307,9 +221,6 @@ fn validate_oauth2_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfE
     }
 }
 
-/// The Azure storage-credential field names this CONNECTION supplies. An empty
-/// result is what makes a CONNECTION an S3 one: naming no Azure field describes
-/// no Azure backend.
 fn supplied_azure_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
     [
         ("account_name", creds.account_name.is_some()),
@@ -321,11 +232,6 @@ fn supplied_azure_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
     .collect()
 }
 
-/// The static S3 storage-credential field names this CONNECTION supplies.
-///
-/// The four string fields use the empty string as "absent", the convention
-/// [`StorageCreds::from_json`] applies to every storage field `parse_creds`
-/// reads through it; `session_token` uses `None`.
 fn supplied_s3_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
     [
         ("endpoint", !creds.endpoint.is_empty()),
@@ -378,29 +284,10 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
     }
 }
 
-/// Build a `StorageBackend` from resolved credentials, by projecting them onto
-/// their storage half and asking that projection which backend it describes.
-///
-/// The selection rule itself lives on [`StorageCreds::backend`], not here, so
-/// the adapter's plan-time derivation and the scan UDF's own read of the same
-/// CONNECTION cannot select two different backends from one password. What
-/// stays here is the Exasol-CONNECTION-facing entry point: `catalog-crate-structure`
-/// records that every function interpreting that delivery mechanism belongs to
-/// this module, because the catalog crate must not name it. So this is a
-/// deliberate projection-and-delegate rather than a layer to inline away.
-///
-/// `allow_http` arrives as a parameter rather than a `ConnectionCreds` field
-/// because it originates from the adapter's `PROP_ALLOW_HTTP` property, read in
-/// `resolve_connection_config`, not from the connection creds themselves; it is
-/// an S3-only knob, so an Azure CONNECTION ignores it.
 pub fn storage_block(creds: &ConnectionCreds, allow_http: bool) -> StorageBackend {
     StorageCreds::from(creds).backend(allow_http)
 }
 
-/// Build `CatalogProps` from resolved credentials and table name.
-///
-/// Takes no catalog URI: `CatalogProps` does not carry one, because every consumer
-/// of it already receives the URI as its own explicit parameter.
 pub fn catalog_block(creds: &ConnectionCreds, table: &str) -> CatalogProps {
     CatalogProps {
         warehouse: creds.warehouse.clone(),

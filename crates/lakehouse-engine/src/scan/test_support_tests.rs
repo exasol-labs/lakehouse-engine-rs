@@ -40,17 +40,6 @@ pub(super) fn minimal_spec() -> ScanSpec {
     }
 }
 
-/// The [`ResolvedScanStorage`] an already-inline host-test spec stands for.
-///
-/// A fixture spec constructs its backends directly and wraps them in
-/// [`ScanStorage::Inline`], so no CONNECTION is involved and the resolved pair is
-/// just those same backends lifted out. Shared here rather than duplicated per
-/// sibling test module: the pair every scan path now takes must agree with the
-/// spec each test hands alongside it, and one derivation is what keeps them
-/// agreeing.
-///
-/// Panics on a non-inline fixture — a spec referencing a CONNECTION belongs with
-/// a stub context and `resolve_scan_storage`, not with this shortcut.
 pub(super) fn inline_resolved(spec: &ScanSpec) -> ResolvedScanStorage {
     ResolvedScanStorage::from_backends(
         inline_backend(&spec.common.storage),
@@ -68,22 +57,9 @@ fn inline_backend(storage: &ScanStorage) -> StorageBackend {
     }
 }
 
-/// The CONNECTION name a fixture spec references when the point of the test is
-/// that the spec carries NO credential of its own.
 pub(super) const TEST_CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
 
-/// A loopback endpoint refusing every request with a 403 whose XML body QUOTES
-/// `message`, and the URL to reach it at.
-///
-/// The refusal BODY is the whole point: `object_store` folds a non-2xx response
-/// body into the error it surfaces, so an endpoint quoting a credential in its
-/// refusal — the real shape of an S3 `SignatureDoesNotMatch` — is what makes
-/// value-based redaction OBSERVABLE rather than vacuous. Without it, a test
-/// asserting a secret's absence would pass on a build whose redaction set was
-/// empty.
-///
-/// A 4xx is never retried, so each read reaches the endpoint exactly once and
-/// fails fast.
+// Returns a 403 with `message` in its XML body so redaction is observable.
 pub(super) fn refusing_endpoint(message: &str) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback endpoint");
     let url = format!(
@@ -112,8 +88,6 @@ pub(super) fn refusing_endpoint(message: &str) -> String {
     url
 }
 
-/// An S3 backend reaching `endpoint` and carrying `secret` as its secret key —
-/// the resolved credential an error must be redacted against.
 pub(super) fn refusing_backend(endpoint: &str, secret: &str) -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: endpoint.into(),
@@ -125,9 +99,6 @@ pub(super) fn refusing_backend(endpoint: &str, secret: &str) -> StorageBackend {
     })
 }
 
-/// A no-op `UdfContext` sink: it accepts every emitted row and batch and reads no
-/// input, for a test driving a scan path whose emitted output is not what is
-/// under assertion.
 pub(super) struct SinkCtx;
 
 impl exasol_udf_sdk::context::UdfContext for SinkCtx {

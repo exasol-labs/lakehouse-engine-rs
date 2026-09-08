@@ -1576,30 +1576,7 @@ pub(super) fn cast_to_declared_type(expr: &str, declared: Option<&str>) -> Strin
     }
 }
 
-/// Select the [`ScanStorage`] variant every scan spec of one pushdown request
-/// carries — the ONE place that choice is made, for every builder path.
-///
-/// - A STATIC credential becomes [`ScanStorage::Connection`]: the scan UDF reads
-///   the same CONNECTION for itself, so the wire needs the name and the
-///   `allow_http` gate and nothing else. Carrying addressing here too would give
-///   the backend two sources, which is how a "field-for-field equal" guarantee
-///   breaks.
-/// - A VENDED credential has no name to reference, so it becomes
-///   [`ScanStorage::Sealed`]: `effective` sealed under `sealing_key`, which the
-///   scan UDF re-derives from the same CONNECTION password.
-/// - A VENDED credential with NO sealing key is REFUSED, here, at plan time. A
-///   password carrying no secret material would derive a guessable key, and an
-///   envelope under it would be a false guarantee — so the configuration is
-///   named rather than shipped, and never falls back to plaintext.
-///
-/// It can never return [`ScanStorage::Inline`]. That variant exists for host-test
-/// spec construction; making it unreachable from the one selection function is
-/// what keeps the adapter structurally unable to emit a plaintext credential.
-///
-/// The choice lives in one function rather than at each of the three
-/// spec-storage population sites because a choice made at three sites is a
-/// choice three sites can get wrong, and a test driving a hand-built template
-/// asserts on its own fixture instead of on the selection.
+/// Single variant-selection site — can never return `Inline`.
 pub(super) fn scan_storage_for(
     creds: &ConnectionCreds,
     connection_name: &str,

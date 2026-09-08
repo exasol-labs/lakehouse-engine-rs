@@ -526,58 +526,23 @@ pub struct NameMappingEntry {
     pub field_id: i32,
 }
 
-/// How a scan spec carries the object storage its files are read through: as a
-/// REFERENCE to the Exasol CONNECTION that supplies the credentials, as a SEALED
-/// envelope keyed from that same CONNECTION, or inline.
+/// How a scan spec carries its object-store credentials: as a CONNECTION
+/// reference, a sealed envelope, or inline (host-test only).
 ///
-/// The pushdown contract leaves the adapter exactly one channel to Exasol — the
-/// single `sql` string of the pushdown response — and `EXPLAIN VIRTUAL` echoes
-/// that string verbatim to any principal that may run the query. So a static
-/// credential travels as `Connection`, a NAME the scan UDF resolves through its
-/// own grant-gated `ctx.connection()` read, and a vended credential — which has
-/// no name to reference — travels as `Sealed`, unreadable without the same
-/// CONNECTION's password.
-///
-/// Externally tagged (serde's default) with lowercase variant keys, never
-/// `untagged`: untagged selects a variant by trial deserialization, which
-/// resolves a malformed or ambiguous payload to whichever variant happens to
-/// parse instead of rejecting it — the wrong failure mode on a credentials path,
-/// and one that would make an unwrapped raw backend indistinguishable from a
-/// deliberate `Inline`.
-///
-/// This type exposes NO secret accessor and NO payload accessor, deliberately.
-/// Every error-redaction feed site in the scan must build its secret set from
-/// the RESOLVED credentials; a `secret_values()` here would compile at each of
-/// those sites while returning nothing for a referenced or sealed credential,
-/// silently disarming redaction instead of failing the build.
+/// Exposes no secret accessor — redaction must use the resolved credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScanStorage {
-    /// The Exasol CONNECTION the scan resolves its storage credentials from,
-    /// plus the `allow_http` consent gate the backend selection needs. Carries
-    /// no credential and no addressing: re-deriving both from the one CONNECTION
-    /// read keeps a single source for the backend.
     Connection {
-        /// The CONNECTION's name, as `CATALOG_CONNECTION` named it.
         name: String,
-        /// The adapter's `ALLOW_HTTP` property value, which the backend
-        /// selection needs and the CONNECTION password does not carry.
         allow_http: bool,
     },
-    /// A vended credential, sealed under a key both sides derive from the named
-    /// CONNECTION's password: `payload` is `base64(nonce ‖ AES-256-GCM
-    /// ciphertext)` of the serialized [`StorageBackend`].
+    /// `payload` is `base64(nonce || AES-256-GCM ciphertext)`.
     Sealed {
-        /// The CONNECTION whose password derives the envelope key.
         name: String,
-        /// `base64(nonce ‖ ciphertext)`. Never plaintext, never a credential.
         payload: String,
     },
-    /// A backend carried verbatim.
-    ///
-    /// Host-test spec construction ONLY. The adapter never emits it: the one
-    /// variant-selection function (`adapter::pushdown::support::scan_storage_for`)
-    /// cannot return this variant, so no production path can reach it.
+    /// Host-test only — the adapter never emits this variant.
     Inline(StorageBackend),
 }
 

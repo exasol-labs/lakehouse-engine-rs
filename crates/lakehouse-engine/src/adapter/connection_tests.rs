@@ -1282,14 +1282,6 @@ fn unity_connection_reuses_existing_auth_fields() {
     assert_eq!(resolved.creds.client_secret, None);
 }
 
-/// `StorageCreds::from_json(json).backend(allow_http)` must equal
-/// `storage_block(&parse_creds(json), allow_http)` field-for-field: task 2.2
-/// repointed `storage_block` to delegate to `StorageCreds::from(creds).backend`,
-/// but `parse_creds` still reads the same nine key spellings independently
-/// through `StorageCreds::from_json`, and the two readers must never disagree
-/// about the backend a given password selects. This is a NEW test alongside
-/// the existing `storage_block`/`validate_creds` assertions above, which are
-/// the characterization gate for 2.2 and stay unedited.
 #[test]
 fn storage_creds_from_json_backend_equals_storage_block_for_every_storage_field_shape() {
     let every_field_present = serde_json::json!({
@@ -1331,15 +1323,6 @@ fn storage_creds_from_json_backend_equals_storage_block_for_every_storage_field_
     }
 }
 
-/// The sealing key is absent AT THE `read_connection` BOUNDARY for a password
-/// carrying no secret material, and present for one that carries a secret.
-///
-/// `adapter_tests.rs`'s gate cases prove the same property of
-/// `resolve_connection_config`'s output. This one pins it one layer down, at the
-/// boundary that now owns the decision — so a crate-internal reader that takes a
-/// [`Resolved`] straight from `read_connection`, bypassing
-/// `resolve_connection_config` entirely, still cannot obtain a key derived from
-/// `{"warehouse":"wh"}`.
 #[test]
 fn sealing_key_is_absent_for_a_password_carrying_no_secret_field_at_the_read_connection_boundary() {
     let keyless = serde_json::json!({"warehouse": "wh"}).to_string();

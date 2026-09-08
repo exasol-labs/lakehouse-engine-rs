@@ -597,13 +597,7 @@ fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
 // Error redaction reads its secret set from the RESOLVED credential
 // ---------------------------------------------------------------------------
 
-/// A partial-aggregate error is redacted against the credential the RESOLVED pair
-/// carries, not against anything on the wire spec.
-///
-/// The counterpart of the raw-scan case, on the other path that reads the secret
-/// set for itself. The spec references a CONNECTION and carries no credential, so
-/// a feed site left reading the wire value would redact against an EMPTY set; the
-/// marker assertion runs first so the absence assertion cannot pass vacuously.
+
 #[tokio::test]
 async fn partial_agg_error_is_redacted_against_the_resolved_credential() {
     use crate::scan::ResolvedScanStorage;

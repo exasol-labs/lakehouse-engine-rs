@@ -369,26 +369,15 @@ pub(super) async fn iceberg_catalog() -> RecordingCatalog {
     .await
 }
 
-/// The CONNECTION name every offline pushdown fixture references — the value a
-/// reference-variant scan spec carries in place of a credential.
 pub(super) const TEST_CONNECTION_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 
-/// The CONNECTION password every offline pushdown fixture derives its sealing key
-/// from. It carries a non-empty `secret_key`, so
-/// `connection_password_carries_key_material` admits it — the installer's own
-/// default template shape.
 pub(super) const TEST_CONNECTION_PASSWORD: &str =
     r#"{"warehouse":"wh","secret_key":"FIXTURESECRET"}"#;
 
-/// The sealing key [`TEST_CONNECTION_PASSWORD`] derives, so a test that unseals a
-/// payload derives the same key the fixture sealed it under.
 pub(super) fn test_sealing_key() -> SealedStorageKey {
     derive_sealed_storage_key(TEST_CONNECTION_PASSWORD)
 }
 
-/// The shared field values every offline join and dispatch fixture's resolved
-/// CONNECTION carries, parameterized only by its credentials — the one thing
-/// [`TEST_CONNECTION`] and [`TEST_VENDED_CONNECTION`] differ on.
 fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
     ResolvedConnectionConfig {
         catalog_uri: "http://catalog.example.com".to_string(),
@@ -401,19 +390,10 @@ fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
     }
 }
 
-/// The one resolved CONNECTION every offline join and dispatch fixture selects
-/// its wire storage from.
-///
-/// A `static` rather than a constructor because `JoinScanRequestConfig` BORROWS
-/// its connection, so a fixture builder returning one needs a value that
-/// outlives the call. Its password carries a non-empty `secret_key`, so a
-/// vended fixture seals rather than being refused.
+// `static` because `JoinScanRequestConfig` borrows its connection.
 pub(super) static TEST_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
     std::sync::LazyLock::new(|| test_connection(unauthenticated_creds()));
 
-/// The same CONNECTION with `use_vended_credentials` ENABLED, for the fixtures
-/// that need each join side's storage to be observably its own: under vending
-/// each side seals its own backend, so the two sides' wire values differ.
 pub(super) static TEST_VENDED_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
     std::sync::LazyLock::new(|| {
         test_connection(ConnectionCreds {
@@ -422,12 +402,6 @@ pub(super) static TEST_VENDED_CONNECTION: std::sync::LazyLock<ResolvedConnection
         })
     });
 
-/// The wire storage the dispatcher fixtures hand `build_dispatch_sql`: the
-/// REFERENCE variant, naming [`TEST_CONNECTION_NAME`] rather than carrying
-/// [`sample_storage`]'s credential inline — the shape the production adapter
-/// actually emits for a static (non-vended) CONNECTION, so a fixture's
-/// rendered SQL stays comparable to what `scan_storage_for` selects, not to a
-/// host-test-only construction path the adapter itself never returns.
 pub(super) fn sample_scan_storage() -> ScanStorage {
     ScanStorage::Connection {
         name: TEST_CONNECTION_NAME.to_string(),

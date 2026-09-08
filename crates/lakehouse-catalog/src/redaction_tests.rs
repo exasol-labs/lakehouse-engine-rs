@@ -132,10 +132,6 @@ fn redact_credentials_strips_azure_account_key_and_sas_labels() {
     }
 }
 
-/// Scenario: `AdlsCred::Sas`'s serialized wire tag (`{"sas":"…"}`) is redacted
-/// whole. Distinct from `sas_token` above — that label matches the CONNECTION
-/// field name, but the serde tag for the `Sas` variant is the bare word `sas`,
-/// which carries no `_token` suffix for the existing label to catch.
 #[test]
 fn redact_credentials_covers_the_serialized_sas_wire_key() {
     let msg = r#"failed to build store from config {"sas":"STATIC_SAS_WIRE_VALUE"}"#;
@@ -150,11 +146,6 @@ fn redact_credentials_covers_the_serialized_sas_wire_key() {
     );
 }
 
-/// Scenario: a realistic `&`-separated serialized SAS token has its signature
-/// removed by the `"sas":"` label, even though the label's own end-of-value
-/// scan stops at the first `&` and so leaves the non-secret middle parameters
-/// (`ss=`, `srt=`, `sp=`, `se=`) untouched — the signature itself is removed
-/// separately by the earlier `sig=` label.
 #[test]
 fn redact_credentials_removes_the_signature_of_a_realistic_serialized_sas() {
     let msg = r#"failed to build store from config {"sas":"sv=2023-11-03&ss=b&srt=sco&sp=rwdlacx&se=2026-01-01T00:00:00Z&sig=REALSIGNATURE"}"#;
@@ -173,10 +164,6 @@ fn redact_credentials_removes_the_signature_of_a_realistic_serialized_sas() {
     );
 }
 
-/// Scenario: the bare word `sas` in unrelated prose is left untouched. The
-/// label list carries the exact literal `"sas":"` — quotes and colon included
-/// — never a bare `sas` substring, which would destroy any prose merely
-/// containing those three letters.
 #[test]
 fn redact_credentials_leaves_the_bare_word_sas_intact() {
     let msg = "the SAS token approach was assessed and found sas-isfactory overall";

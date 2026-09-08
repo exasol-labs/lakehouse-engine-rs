@@ -1190,19 +1190,7 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
 // Error redaction reads its secret set from the RESOLVED credential
 // ---------------------------------------------------------------------------
 
-/// A raw-scan error is redacted against the credential the RESOLVED pair carries,
-/// not against anything on the wire spec.
-///
-/// The spec here references a CONNECTION and carries no credential at all, so a
-/// feed site left reading the wire value would build an EMPTY secret set — and
-/// the sentinel below would survive into the surfaced message. The endpoint's
-/// refusal body quotes that sentinel beside a plain marker, and the marker
-/// assertion runs FIRST: it proves the refusal genuinely reached the message,
-/// which is what makes the absence assertion falsifiable rather than vacuous.
-///
-/// A `logical_schema` is supplied so registration infers nothing and reads
-/// nothing; the failure therefore lands on the streaming path
-/// `run_raw_scan_with_session` redacts itself.
+
 #[tokio::test]
 async fn raw_scan_error_is_redacted_against_the_resolved_credential() {
     use crate::scan::ResolvedScanStorage;

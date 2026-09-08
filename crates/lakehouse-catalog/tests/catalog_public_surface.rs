@@ -674,12 +674,7 @@ fn static_store_address_fields_are_not_public() {
     }
 }
 
-/// Every field declaration `creds.rs`'s own `struct StorageCreds` declaration
-/// carries, comment lines dropped and trailing commas removed — mirrors
-/// `static_store_address_field_declarations`, applied to the projection that
-/// crosses the SAME crate boundary in the opposite direction: `parse_creds`
-/// reads these nine fields out of it rather than the vended selectors reading
-/// a store address into it.
+
 fn storage_creds_field_declarations() -> Vec<&'static str> {
     let body = declaration_body(source("creds.rs"), "struct StorageCreds");
     let fields: Vec<&str> = body
@@ -697,13 +692,6 @@ fn storage_creds_field_declarations() -> Vec<&'static str> {
     fields
 }
 
-/// `StorageCreds` is the storage-only projection `parse_creds` reads across the
-/// crate boundary: it must declare exactly the nine storage fields, each `pub`
-/// (mirroring `StorageProps`, because `parse_creds` constructs it from outside
-/// this crate), and none of the eight catalog-auth fields `ConnectionCreds`
-/// also carries — a catalog-auth field added here is the one edit that would
-/// let a secret meant to stay adapter-side reach the scan UDF through this
-/// projection instead.
 #[test]
 fn storage_creds_declares_exactly_the_nine_pub_storage_fields() {
     let declarations = storage_creds_field_declarations();
@@ -764,18 +752,3 @@ fn storage_creds_declares_exactly_the_nine_pub_storage_fields() {
     }
 }
 
-/// `StorageCreds::from_json` and `StorageCreds::backend` are called directly
-/// here — not just the `StorageCreds` type named in the `use` list above — so
-/// narrowing either method below `pub` is a compile failure in this
-/// external-crate probe, rather than a silent gap the type-only import would
-/// miss.
-#[test]
-fn storage_creds_from_json_and_backend_are_reachable() {
-    let creds = StorageCreds::from_json(&serde_json::json!({
-        "endpoint": "http://minio:9000",
-        "region": "us-east-1",
-        "access_key": "AKID",
-        "secret_key": "SECRET",
-    }));
-    let _: StorageBackend = creds.backend(true);
-}

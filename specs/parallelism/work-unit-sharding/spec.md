@@ -54,8 +54,7 @@ and no file is scanned twice.
   distributor. The storage-credential REFERENCE — or, under vending, the sealed
   envelope — MUST NOT appear repeated per shard; it lives once in the common spec
   literal, and no credential VALUE appears in that literal at all.
-* **The shard cap is why the deferral is affordable and why it is stated here.** The scan UDF now performs one engine-local `ctx.connection()` lookup per shard invocation, and G is capped at 300, so the added cost is bounded by this feature's own cap rather than by the file count.
-* **`vs-adapter/scan-spec-credential-reference` owns the reference contract, the resolution, and the sealed vended envelope that closes #378.** This feature CITES it and restates none of it.
+* The per-shard `ctx.connection()` cost is bounded by G ≤ 300. See `vs-adapter/scan-spec-credential-reference` for the reference contract and sealed envelope.
 
 ## Scenarios
 
