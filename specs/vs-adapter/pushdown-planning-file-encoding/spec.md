@@ -53,4 +53,7 @@ root when the root is an actual prefix of the file's path, or as an absolute URI
 * *THEN* the adapter SHALL carry, per delete-file entry, its delete content type (e.g. positional) alongside its path and byte size, so the scan UDF's read-time backstop can reject any non-positional delete file
 * *AND* the per-delete-file surface SHALL be limited to path, byte size, and content type — no additional Iceberg metadata is carried per delete file
 
-*Credential-reference invariant:* this feature's pushdown path inherits the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` — no credential value in generated SQL or error messages.
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages

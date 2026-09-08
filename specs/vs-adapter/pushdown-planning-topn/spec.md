@@ -162,4 +162,7 @@ renders the retained ordering AND the retained final window itself.
 * *AND* an ABSENT or EMPTY `orderBy` SHALL remain outside this scenario entirely: no ordering was pushed, so the adapter emits no wrapper and no `ORDER BY`
 * *AND* the decline SHALL be the ONLY alternative to a faithfully rendered ordering, so no reachable ordered shape can return a result that is both successful and silently unordered
 
-*Credential-reference invariant:* this feature's pushdown path inherits the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` — no credential value in generated SQL or error messages.
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages

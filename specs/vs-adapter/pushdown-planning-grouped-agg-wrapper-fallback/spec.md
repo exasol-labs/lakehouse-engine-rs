@@ -132,4 +132,7 @@ decline paths narrow identically.
 * *AND* the returned result SHALL equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
 * *AND* this route SHALL be recorded as a deliberate, named trade rather than an unstated gap: the request loses partial/merge decomposition and materializes its referenced columns through Exasol, which is why an aggregate the select list ALREADY carries keeps the partial/merge path per the scenario above; a bounded partial/merge variant for the not-selected case is tracked as future work, `(#249)`
 
-*Credential-reference invariant:* this feature's pushdown path inherits the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` — no credential value in generated SQL or error messages.
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages

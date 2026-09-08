@@ -226,4 +226,7 @@ single-table and N-scan join wrapper), `vs-adapter/pushdown-planning-single-grou
 * *AND* NO offset value SHALL be carried into any per-shard scan spec, because a per-shard OFFSET would skip a different row set on every shard and cannot compose into a global window; the scan-spec wire shape and the scan UDF SHALL be unchanged by this advertisement
 * *AND* the returned result SHALL equal the same `ORDER BY … LIMIT n OFFSET m` evaluated over all matching rows on a single node, for a plain row scan, a declined-sort-key row scan, a grouped aggregate, and a qualified-wrapper shape
 
-*Credential-reference invariant:* this feature's pushdown path inherits the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` — no credential value in generated SQL or error messages.
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages
