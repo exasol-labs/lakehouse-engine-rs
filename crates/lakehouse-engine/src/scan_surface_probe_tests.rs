@@ -44,5 +44,4 @@ const _FROM_BACKENDS: fn(
 
 use crate::scan::build_partial_agg_sql;
 
-const SCAN_SPEC_SOURCE: &str = include_str!("scan/spec.rs");
 
