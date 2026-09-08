@@ -116,10 +116,4 @@ instead of rejecting it for a column-count/type mismatch.
 * *AND* the empty grouped-fallback (`GroupByWrapper`) shape SHALL type its columns from `selectListDataTypes` when present — a positional shape Exasol accepts against it, not a raw row projection — and when `selectListDataTypes` is absent or empty SHALL fall back to the full-row-projection empty shape, matching the pre-refactor empty-result behavior byte-for-byte (this refactor changes routing structure, not column-shape selection)
 * *AND* the short-circuit SHALL be reached from the RESOLVED FILE LIST alone, so an Iceberg table whose manifests pruned to zero files and a Delta table whose `add` statistics pruned to zero files take the identical path and return the identical shape
 
-### Scenario: An empty-result plan emits no storage block at all
-
-* *GIVEN* a pushdown request this feature short-circuits to an empty result, over a virtual schema whose CONNECTION supplies static storage credentials
-* *WHEN* the adapter renders the empty-result SQL
-* *THEN* the returned SQL string SHALL carry NO scan-spec storage value of any kind, so it contains neither a credential nor a connection reference, and this feature's credential claim holds unconditionally on its own path
-* *AND* the six committed `empty_*` golden pushdown-SQL fixtures SHALL therefore stay BYTE-IDENTICAL across this change and SHALL be asserted unchanged, unlike the eighteen credential-bearing fixtures which are regenerated
-* *AND* no credential value SHALL appear in any error message this feature's path raises
+*Credential-reference invariant:* the empty-result path carries no scan-spec storage value at all — neither a credential nor a connection reference — so the credential-reference guarantee holds unconditionally. The six `empty_*` golden fixtures stay byte-identical across this change.

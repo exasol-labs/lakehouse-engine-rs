@@ -1,6 +1,3 @@
-//! Resolves a scan spec's [`ScanStorage`] wire value into the concrete
-//! [`StorageBackend`] the scan reads through. Both sides are resolved together
-//! so `all_secret_values` covers the union for error redaction.
 
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
@@ -9,7 +6,6 @@ use lakehouse_catalog::StorageCreds;
 use crate::scan::sealed::{derive_sealed_storage_key, unseal_storage};
 use crate::scan::spec::{CommonScanSpec, ScanStorage, StorageBackend};
 
-/// `pub` because host tests drive the `pub` scan facade entries directly.
 #[derive(Debug)]
 pub struct ResolvedScanStorage {
     primary: StorageBackend,
@@ -17,7 +13,6 @@ pub struct ResolvedScanStorage {
 }
 
 impl ResolvedScanStorage {
-    /// Host-test constructor — no CONNECTION resolution.
     pub fn from_backends(primary: StorageBackend, join: Option<StorageBackend>) -> Self {
         Self { primary, join }
     }
@@ -30,7 +25,6 @@ impl ResolvedScanStorage {
         self.join.as_ref()
     }
 
-    /// Union of both sides' secrets — the single redaction-set owner.
     pub(crate) fn all_secret_values(&self) -> Vec<&str> {
         let mut secrets = self.primary.secret_values();
         if let Some(join) = &self.join {

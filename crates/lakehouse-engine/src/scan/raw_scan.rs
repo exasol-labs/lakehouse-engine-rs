@@ -46,10 +46,6 @@ use super::sql_support::{build_alias_items, quote_ident};
 /// single gated per-VM phase-telemetry record. Exposed so a host integration
 /// test can drive the exact production streaming + telemetry path against a
 /// local Parquet file (no S3 store), feeding its own `SessionContext`.
-///
-/// The redaction secret set is read from `storage` — the RESOLVED backends —
-/// never from the spec, which carries a reference rather than a credential. A
-/// host test builds the argument with [`ResolvedScanStorage::from_backends`].
 pub async fn run_raw_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
@@ -130,10 +126,6 @@ async fn build_dataframe(
 /// `scan_target` before asking [`build_raw_scan_physical_plan`] for the committed
 /// pipeline — the built-in `SessionContext::register_parquet` shortcut never
 /// attaches an access plan and so cannot exercise the delete-carrying path.
-///
-/// Registers the FACT side, so it reads `storage.primary()`: the spec's own
-/// `storage` field names a CONNECTION rather than carrying a credential, and only
-/// the resolved pair holds the backend this registration reads through.
 pub async fn register_files(
     ctx: &SessionContext,
     table_name: &str,

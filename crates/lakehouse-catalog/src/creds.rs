@@ -1,10 +1,6 @@
-//! Credential types crossing the `lakehouse-engine` / `lakehouse-catalog` edge.
-//! [`StorageProps`] is a wire type — its field names and serde attributes are a
-//! compatibility contract.
 use crate::{AdlsCred, StorageBackend};
 use serde::{Deserialize, Serialize};
 
-/// All CONNECTION password fields. Manual `Debug` redacts secret-bearing fields.
 #[derive(Clone)]
 pub struct ConnectionCreds {
     pub warehouse: String,
@@ -13,7 +9,6 @@ pub struct ConnectionCreds {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
-    /// Defaults to `true` to preserve MinIO behaviour.
     pub path_style: bool,
     pub use_sigv4: bool,
     pub use_vended_credentials: bool,
@@ -74,7 +69,6 @@ impl ConnectionCreds {
         self.token.is_some() || self.client_id.is_some() || self.client_secret.is_some()
     }
 
-    /// Sole owner of the catalog-auth mode decision — consumers match on this.
     pub(crate) fn supplied_catalog_auth(&self) -> SuppliedCatalogAuth<'_> {
         match (
             non_empty(&self.token),
@@ -103,8 +97,6 @@ pub(crate) fn non_empty(field: &Option<String>) -> Option<&str> {
     field.as_deref().filter(|value| !value.is_empty())
 }
 
-/// Wire type — field names and serde attributes are a compatibility contract.
-/// Manual `Debug` redacts secret fields.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageProps {
     pub endpoint: String,
@@ -171,8 +163,6 @@ impl StorageProps {
     }
 }
 
-/// Storage-only projection of a CONNECTION password — excludes catalog-auth fields
-/// so the scan UDF structurally cannot carry them onto shard invocations.
 pub struct StorageCreds {
     pub endpoint: String,
     pub region: String,
@@ -208,7 +198,6 @@ impl std::fmt::Debug for StorageCreds {
 }
 
 impl StorageCreds {
-    /// Hand-reads rather than serde: rejects wrong-typed fields and normalizes empties.
     pub fn from_json(json: &serde_json::Value) -> Self {
         Self {
             endpoint: non_empty_json_str(json, "endpoint")
@@ -232,8 +221,7 @@ impl StorageCreds {
         }
     }
 
-    /// Falls through to S3 when Azure fields are incomplete — not a panic,
-    /// because a UDF panic triggers engine-wide SIGKILL fan-out.
+    /// Falls through to S3 when Azure fields are incomplete (panic → SIGKILL fan-out).
     pub fn backend(&self, allow_http: bool) -> StorageBackend {
         let azure_cred = match (self.account_key.as_deref(), self.sas_token.as_deref()) {
             (Some(account_key), None) => Some(AdlsCred::AccountKey(account_key.to_string())),
@@ -275,19 +263,12 @@ impl From<&ConnectionCreds> for StorageCreds {
     }
 }
 
-/// Borrow a JSON object's field only when it is a non-empty JSON string.
-///
-/// The same reading the adapter's own `nonempty_str` applies to the eight
-/// non-storage CONNECTION fields. Duplicated rather than shared because the
-/// dependency edge points engine → catalog, so the adapter's helper cannot be
-/// named from here.
 fn non_empty_json_str<'a>(json: &'a serde_json::Value, key: &str) -> Option<&'a str> {
     json.get(key)
         .and_then(|value| value.as_str())
         .filter(|value| !value.is_empty())
 }
 
-/// Catalog URI is NOT carried here — it arrives as an explicit parameter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogProps {
     pub warehouse: String,

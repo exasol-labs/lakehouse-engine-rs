@@ -1,9 +1,5 @@
-//! AES-256-GCM envelope for vended credentials that have no CONNECTION name to
-//! reference. Key is HKDF-SHA256 over the CONNECTION password bytes (no parsing,
-//! so no catalog-auth field is ever constructed on the scan side). Defeats
-//! plaintext reads of pushdown SQL; does not claim offline cryptanalysis
-//! resistance — vended values are short-lived and the key material requires
-//! `ACCESS ON CONNECTION`.
+//! AES-256-GCM sealed envelope for vended credentials. Key: HKDF-SHA256 over
+//! the CONNECTION password bytes.
 
 use aes_gcm::aead::{Aead, KeyInit};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
@@ -22,7 +18,6 @@ const SEALED_STORAGE_INFO: &[u8] = b"lakehouse-engine scan-storage sealed v1";
 
 const NONCE_BYTES: usize = 12;
 
-/// `Debug` prints a placeholder — never key material.
 pub(crate) struct SealedStorageKey([u8; 32]);
 
 impl std::fmt::Debug for SealedStorageKey {
@@ -42,7 +37,6 @@ pub(crate) fn derive_sealed_storage_key(password: &str) -> SealedStorageKey {
     SealedStorageKey(key)
 }
 
-/// Seal into `base64(nonce || AES-256-GCM ciphertext)`. Fresh 96-bit nonce per call.
 pub(crate) fn seal_storage(
     backend: &StorageBackend,
     key: &SealedStorageKey,
@@ -101,7 +95,6 @@ pub(crate) fn unseal_storage(
     })
 }
 
-/// True when the password carries at least one secret field (not just an access_key id).
 pub(crate) fn connection_password_carries_key_material(creds: &ConnectionCreds) -> bool {
     let optional = [
         creds.token.as_deref(),

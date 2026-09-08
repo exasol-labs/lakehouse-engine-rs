@@ -9,12 +9,8 @@
 //!   the spec. There is no Exasol-side fallback to defer to — see CLAUDE.md
 //!   § "Virtual Schema pushdown delegation" and `specs/_decision/045`.
 //! - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
-//! - Neither catalog/connection auth credentials (OAuth token, bearer, etc.) nor
-//!   storage credential VALUES appear in any returned SQL string or error message.
-//!   A static storage credential travels as a `ScanStorage::Connection` name; a
-//!   vended one travels only as an AES-GCM `ScanStorage::Sealed` envelope. See
-//!   `vs-adapter/scan-spec-credential-reference` and `handle_pushdown`'s own doc
-//!   comment.
+//! - No credential value (catalog-auth or storage) appears in any returned SQL
+//!   string or error message.
 
 use crate::adapter::ResolvedConnectionConfig;
 #[cfg(test)]
@@ -128,22 +124,8 @@ mod dispatch_golden;
 ///
 /// Returns JSON `{"type":"pushdown","sql":"..."}`.
 ///
-/// No storage credential VALUE appears in that SQL, under either credential
-/// shape (#135 and #378, both closed):
-///
-/// * A STATIC credential is referenced, never carried: the scan-driving spec's
-///   `storage` value is `{"connection":{"name":…}}`, and the scan UDF resolves
-///   that name through its own grant-gated `ctx.connection()` read.
-/// * A VENDED credential has no name to reference — the catalog mints it per
-///   query — so it travels only inside an AES-256-GCM envelope whose key is
-///   derived (HKDF-SHA256) from the same CONNECTION's password. The wire value
-///   is `{"sealed":{"name":…,"payload":…}}`; the scan derives the key from the
-///   password it reads for `name` and opens it.
-///
-/// Both contracts are specified in `vs-adapter/scan-spec-credential-reference`.
-/// `scan_storage_for` is the one function that selects between them, and it can
-/// never emit an inline backend; vending without derivable key material is
-/// REFUSED at plan time rather than shipped under a weakened envelope.
+/// No storage credential value appears in the returned SQL: static credentials
+/// travel as a CONNECTION reference, vended ones as an AES-256-GCM sealed envelope.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_pushdown(
     request: &Json,
@@ -255,12 +237,6 @@ pub async fn handle_pushdown(
         partition_columns,
         refused_columns,
     } = resolver.resolve(&catalog.table, filter_json_raw).await?;
-    // The wire storage, chosen ONCE per request by the single variant-selection
-    // function: a CONNECTION reference for a static credential, a sealed
-    // envelope for a vended one, and a named refusal for a vended one whose
-    // CONNECTION password carries no key material. `effective_storage` itself
-    // stays the plan-time value the format readers already used for their own
-    // manifest and log reads; only what crosses the wire changes.
     let scan_storage = scan_storage_for(
         &conn.creds,
         &conn.connection_name,

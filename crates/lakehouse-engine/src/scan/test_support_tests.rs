@@ -1,19 +1,8 @@
-//! Test-only fixtures shared across the `scan` submodule test modules.
-//!
-//! Extracted verbatim from the former flat `mod tests` helpers block. Each
-//! functional submodule's `#[cfg(test)] mod tests` reaches these through
-//! `super::test_support` (or `crate::scan::test_support` from a nested module).
-
 use crate::scan::ResolvedScanStorage;
 use crate::scan::spec::{
     CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 
-/// The byte size of the local file behind a `file://` URL.
-///
-/// The custom `ParquetSource`-backed provider builds each file's `ObjectMeta`
-/// from the spec-supplied size (the no-HEAD design), so tests that register a
-/// local Parquet file must supply its real size instead of a `0` placeholder.
 pub(super) fn local_file_size(file_url: &str) -> u64 {
     let path = url::Url::parse(file_url)
         .expect("valid file URL")
@@ -22,7 +11,6 @@ pub(super) fn local_file_size(file_url: &str) -> u64 {
     std::fs::metadata(path).expect("stat local parquet").len()
 }
 
-/// Minimal ScanSpec with a valid-looking S3 URI for build_session_context tests.
 pub(super) fn minimal_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -59,7 +47,6 @@ fn inline_backend(storage: &ScanStorage) -> StorageBackend {
 
 pub(super) const TEST_CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
 
-// Returns a 403 with `message` in its XML body so redaction is observable.
 pub(super) fn refusing_endpoint(message: &str) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback endpoint");
     let url = format!(

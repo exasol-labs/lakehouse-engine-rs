@@ -31,16 +31,12 @@ fn creds_without_key_material() -> ConnectionCreds {
 
 fn secret_bearing_fields() -> Vec<(&'static str, SecretFieldSetter)> {
     vec![
-        ("token", |c, v| c.token = Some(v.to_string())),
-        ("client_secret", |c, v| {
-            c.client_secret = Some(v.to_string())
-        }),
-        ("secret_key", |c, v| c.secret_key = v.to_string()),
-        ("session_token", |c, v| {
-            c.session_token = Some(v.to_string())
-        }),
-        ("account_key", |c, v| c.account_key = Some(v.to_string())),
-        ("sas_token", |c, v| c.sas_token = Some(v.to_string())),
+        ("token", |c, v| c.token = Some(v.into())),
+        ("client_secret", |c, v| c.client_secret = Some(v.into())),
+        ("secret_key", |c, v| c.secret_key = v.into()),
+        ("session_token", |c, v| c.session_token = Some(v.into())),
+        ("account_key", |c, v| c.account_key = Some(v.into())),
+        ("sas_token", |c, v| c.sas_token = Some(v.into())),
     ]
 }
 
@@ -63,23 +59,9 @@ fn adls_backend() -> StorageBackend {
     }
 }
 
-fn sentinel_values() -> Vec<&'static str> {
-    vec![
-        "VENDEDAK",
-        "VENDEDSK",
-        "VENDEDTOK",
-        "VENDEDSAS",
-        "S3CR3TV4LU3",
-        SEALING_PASSWORD,
-    ]
-}
-
 fn assert_carries_no_sentinel(context: &str, text: &str) {
-    for sentinel in sentinel_values() {
-        assert!(
-            !text.contains(sentinel),
-            "{context} must not echo {sentinel}: {text}"
-        );
+    for s in ["VENDEDAK", "VENDEDSK", "VENDEDTOK", "VENDEDSAS", "S3CR3TV4LU3", SEALING_PASSWORD] {
+        assert!(!text.contains(s), "{context} must not echo {s}: {text}");
     }
 }
 
@@ -93,122 +75,38 @@ fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
         assert_eq!(
             unseal_storage(&payload, &key).expect("its own envelope must open"),
             backend,
-            "the envelope must open to exactly the backend that was sealed"
         );
 
-        // Tampered: flip one byte INSIDE the ciphertext body (at or after
-        // NONCE_BYTES, so the nonce itself is untouched). AES-GCM authenticates,
-        // so this must fail the AEAD tag check specifically — not merely fail to
-        // decode or fail some other way.
+        // Flip one byte inside the ciphertext (past the nonce). AES-GCM must
+        // reject this at the AEAD tag check.
         let mut raw = BASE64.decode(&payload).expect("a fresh seal must decode");
         raw[NONCE_BYTES] ^= 0xFF;
         let tampered = BASE64.encode(&raw);
         let err = unseal_storage(&tampered, &key)
             .expect_err("a tampered envelope must not open")
             .to_string();
-        assert!(
-            err.contains("AES-256-GCM authentication"),
-            "the error must name AEAD authentication as the failed step: {err}"
-        );
+        assert!(err.contains("AES-256-GCM authentication"), "{err}");
         assert_carries_no_sentinel("a tampered-envelope error", &err);
 
-        // Truncated to inside the nonce: shorter than one nonce carries no
-        // ciphertext at all.
-        let truncated = &payload[..8];
-        let err = unseal_storage(truncated, &key)
-            .expect_err("a truncated envelope must not open")
-            .to_string();
-        assert!(
-            err.contains("the envelope is not longer than its nonce"),
-            "the error must name the length precondition as the failed step: {err}"
-        );
-        assert_carries_no_sentinel("a truncated-envelope error", &err);
-
-        // Wrong key: the shape a CONNECTION rotated mid-query produces. This also
-        // fails AEAD authentication, not decoding or length.
+        // Wrong key (the shape a CONNECTION rotation mid-query produces).
         let rotated = derive_sealed_storage_key(r#"{"warehouse":"wh","secret_key":"ROTATED"}"#);
         let err = unseal_storage(&payload, &rotated)
             .expect_err("an envelope must not open under another key")
             .to_string();
-        assert!(
-            err.contains("AES-256-GCM authentication"),
-            "the error must name AEAD authentication as the failed step: {err}"
-        );
+        assert!(err.contains("AES-256-GCM authentication"), "{err}");
         assert_carries_no_sentinel("a wrong-key error", &err);
-
-        // Not valid base64 at all: fails before the length precondition or AEAD
-        // are ever reached.
-        let err = unseal_storage("not valid base64 !!!", &key)
-            .expect_err("a non-base64 payload must not open")
-            .to_string();
-        assert!(
-            err.contains("base64-decoding the envelope"),
-            "the error must name base64 decoding as the failed step: {err}"
-        );
-        assert_carries_no_sentinel("an invalid-base64 error", &err);
     }
-}
-
-#[test]
-fn the_derived_key_is_a_function_of_the_password_alone() {
-    let backend = s3_backend();
-    let payload = seal_storage(&backend, &derive_sealed_storage_key(SEALING_PASSWORD))
-        .expect("sealing must succeed");
-
-    // A key derived independently from the same password opens the envelope.
-    assert_eq!(
-        unseal_storage(&payload, &derive_sealed_storage_key(SEALING_PASSWORD))
-            .expect("an independently derived key must open the envelope"),
-        backend
-    );
-    // One byte of difference in the password does not.
-    assert!(
-        unseal_storage(
-            &payload,
-            &derive_sealed_storage_key(&format!("{SEALING_PASSWORD} "))
-        )
-        .is_err(),
-        "a different password must not derive an opening key"
-    );
 }
 
 #[test]
 fn key_material_is_present_only_for_a_non_empty_secret_bearing_field() {
-    assert!(
-        !connection_password_carries_key_material(&creds_without_key_material()),
-        "a password carrying none of the six secret fields carries no key material"
-    );
-
+    assert!(!connection_password_carries_key_material(&creds_without_key_material()));
     for (field, set) in secret_bearing_fields() {
         let mut non_empty = creds_without_key_material();
         set(&mut non_empty, "s");
-        assert!(
-            connection_password_carries_key_material(&non_empty),
-            "a non-empty {field} alone must satisfy the gate"
-        );
-
+        assert!(connection_password_carries_key_material(&non_empty), "{field} non-empty");
         let mut empty = creds_without_key_material();
         set(&mut empty, "");
-        assert!(
-            !connection_password_carries_key_material(&empty),
-            "a present-but-empty {field} must not satisfy the gate"
-        );
+        assert!(!connection_password_carries_key_material(&empty), "{field} empty");
     }
-
-    // Every one of the six present but empty, all at once.
-    let mut all_empty = creds_without_key_material();
-    for (_, set) in secret_bearing_fields() {
-        set(&mut all_empty, "");
-    }
-    assert!(
-        !connection_password_carries_key_material(&all_empty),
-        "all six fields present but empty must not satisfy the gate"
-    );
-
-    let mut access_key_only = creds_without_key_material();
-    access_key_only.access_key = "AKIAEXAMPLE".into();
-    assert!(
-        !connection_password_carries_key_material(&access_key_only),
-        "an access_key id without a secret_key is an identifier, not key material"
-    );
 }

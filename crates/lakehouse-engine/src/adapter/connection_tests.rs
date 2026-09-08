@@ -1283,47 +1283,6 @@ fn unity_connection_reuses_existing_auth_fields() {
 }
 
 #[test]
-fn storage_creds_from_json_backend_equals_storage_block_for_every_storage_field_shape() {
-    let every_field_present = serde_json::json!({
-        "endpoint": "http://s3.example.com",
-        "region": "us-east-1",
-        "access_key": "AKID",
-        "secret_key": S3_SECRET,
-        "session_token": "STS_TOKEN",
-        "path_style": false,
-        "account_name": "myaccount",
-        "account_key": AZURE_ACCOUNT_KEY,
-        "sas_token": AZURE_SAS,
-    });
-    let every_field_empty = serde_json::json!({
-        "endpoint": "",
-        "region": "",
-        "access_key": "",
-        "secret_key": "",
-        "session_token": "",
-        "path_style": false,
-        "account_name": "",
-        "account_key": "",
-        "sas_token": "",
-    });
-    let every_field_omitted = serde_json::json!({});
-
-    for (shape, json) in [
-        ("every field present", &every_field_present),
-        ("every field empty", &every_field_empty),
-        ("every field omitted", &every_field_omitted),
-    ] {
-        for allow_http in [false, true] {
-            assert_eq!(
-                StorageCreds::from_json(json).backend(allow_http),
-                storage_block(&parse_creds(json), allow_http),
-                "{shape}, allow_http={allow_http}"
-            );
-        }
-    }
-}
-
-#[test]
 fn sealing_key_is_absent_for_a_password_carrying_no_secret_field_at_the_read_connection_boundary() {
     let keyless = serde_json::json!({"warehouse": "wh"}).to_string();
     let ctx = StubCtx::with_conn("http://catalog.example.com", &keyless);

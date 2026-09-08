@@ -526,10 +526,6 @@ pub struct NameMappingEntry {
     pub field_id: i32,
 }
 
-/// How a scan spec carries its object-store credentials: as a CONNECTION
-/// reference, a sealed envelope, or inline (host-test only).
-///
-/// Exposes no secret accessor — redaction must use the resolved credentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ScanStorage {
@@ -537,7 +533,6 @@ pub enum ScanStorage {
         name: String,
         allow_http: bool,
     },
-    /// `payload` is `base64(nonce || AES-256-GCM ciphertext)`.
     Sealed {
         name: String,
         payload: String,
@@ -633,9 +628,6 @@ pub struct JoinSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_columns: Vec<String>,
 
-    /// The dimension side's own storage, distinct from `common.storage` (the
-    /// fact side's). Required — see the struct doc. A vended join seals each
-    /// side independently, so the two sides carry two envelopes under one key.
     pub storage: ScanStorage,
 }
 
@@ -1185,8 +1177,6 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_columns: Vec<String>,
 
-    /// The fact side's storage: a CONNECTION reference, a sealed envelope, or an
-    /// inline backend (host-test construction only). See [`ScanStorage`].
     pub storage: ScanStorage,
 
     /// DataFusion `target_partitions` for this scan instance.

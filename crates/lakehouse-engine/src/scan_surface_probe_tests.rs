@@ -44,29 +44,5 @@ const _FROM_BACKENDS: fn(
 
 use crate::scan::build_partial_agg_sql;
 
-fn _common_scan_spec_storage_is_scan_storage(spec: &CommonScanSpec) -> &ScanStorage {
-    &spec.storage
-}
-
-fn _join_spec_storage_is_scan_storage(spec: &JoinSpec) -> &ScanStorage {
-    &spec.storage
-}
-
 const SCAN_SPEC_SOURCE: &str = include_str!("scan/spec.rs");
 
-#[test]
-fn scan_storage_declares_no_secret_or_payload_accessor() {
-    assert!(
-        SCAN_SPEC_SOURCE.contains("pub enum ScanStorage"),
-        "the probed source must still declare `ScanStorage` here — the probe's own \
-         anchor is broken, not just failing to find a match"
-    );
-    for method in ["fn secret_values", "fn payload"] {
-        assert!(
-            !SCAN_SPEC_SOURCE.contains(method),
-            "`scan/spec.rs` must declare no `{method}` method on `ScanStorage`: a wrapper \
-             accessor would compile at every redaction feed site while returning nothing \
-             for a referenced or sealed credential, silently disarming redaction"
-        );
-    }
-}

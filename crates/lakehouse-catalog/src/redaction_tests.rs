@@ -44,8 +44,6 @@ fn redact_secret_values_strips_literal_credential_values() {
 // ---------------------------------------------------------------------------
 // Task 4.4 — Extended redaction: bearer token + SigV4 Authorization + vended STS
 // ---------------------------------------------------------------------------
-
-/// Scenario: Authorization header value (SigV4) is redacted from error messages.
 #[test]
 fn redact_credentials_strips_authorization_header() {
     let auth_value = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231201/us-east-1/glue/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123";
@@ -60,8 +58,6 @@ fn redact_credentials_strips_authorization_header() {
         "Authorization label must be preserved: {safe}"
     );
 }
-
-/// Scenario: Bearer token is redacted from error messages.
 #[test]
 fn redact_credentials_strips_bearer_token() {
     let msg = "catalog error: Bearer my-secret-oauth-token-value";
@@ -71,8 +67,6 @@ fn redact_credentials_strips_bearer_token() {
         "Bearer token must be redacted: {safe}"
     );
 }
-
-/// Scenario: Vended STS keys (Iceberg config map keys) are redacted.
 #[test]
 fn redact_credentials_strips_vended_sts_keys() {
     let msg = r#"s3.access-key-id=VENDED_AKID s3.secret-access-key=VENDED_SK s3.session-token=VENDED_TOK"#;
@@ -95,10 +89,6 @@ fn redact_credentials_strips_vended_sts_keys() {
         "label must be preserved: {safe}"
     );
 }
-
-/// Scenario: Azure ADLS static-credential labels (field names, iceberg
-/// storage config keys, and the SAS-URL signature query parameter) are
-/// redacted, mirroring the AWS-label coverage above.
 #[test]
 fn redact_credentials_strips_azure_account_key_and_sas_labels() {
     let msg = concat!(
@@ -133,53 +123,23 @@ fn redact_credentials_strips_azure_account_key_and_sas_labels() {
 }
 
 #[test]
-fn redact_credentials_covers_the_serialized_sas_wire_key() {
-    let msg = r#"failed to build store from config {"sas":"STATIC_SAS_WIRE_VALUE"}"#;
-    let safe = redact_credentials(msg);
-    assert!(
-        !safe.contains("STATIC_SAS_WIRE_VALUE"),
-        "the serialized SAS value must be redacted whole: {safe}"
-    );
-    assert!(
-        safe.contains("\"sas\":"),
-        "the JSON key itself must be preserved: {safe}"
-    );
-}
+fn redact_credentials_handles_serialized_sas_correctly() {
+    // Wire key: whole value redacted.
+    let wire = r#"failed to build store from config {"sas":"STATIC_SAS_WIRE_VALUE"}"#;
+    let safe = redact_credentials(wire);
+    assert!(!safe.contains("STATIC_SAS_WIRE_VALUE"), "{safe}");
+    assert!(safe.contains("\"sas\":"), "{safe}");
 
-#[test]
-fn redact_credentials_removes_the_signature_of_a_realistic_serialized_sas() {
-    let msg = r#"failed to build store from config {"sas":"sv=2023-11-03&ss=b&srt=sco&sp=rwdlacx&se=2026-01-01T00:00:00Z&sig=REALSIGNATURE"}"#;
-    let safe = redact_credentials(msg);
-    assert!(
-        !safe.contains("REALSIGNATURE"),
-        "the signature value must be redacted: {safe}"
-    );
-    assert!(
-        !safe.contains("sv=2023-11-03"),
-        "the first parameter (consumed by the \"sas\":\" label's own scan) must be redacted: {safe}"
-    );
-    assert!(
-        safe.contains("\"sas\":"),
-        "the JSON key itself must be preserved: {safe}"
-    );
-}
+    // Realistic SAS: signature and parameters redacted.
+    let realistic = r#"failed to build store from config {"sas":"sv=2023-11-03&ss=b&srt=sco&sp=rwdlacx&se=2026-01-01T00:00:00Z&sig=REALSIGNATURE"}"#;
+    let safe = redact_credentials(realistic);
+    assert!(!safe.contains("REALSIGNATURE"), "{safe}");
+    assert!(!safe.contains("sv=2023-11-03"), "{safe}");
 
-#[test]
-fn redact_credentials_leaves_the_bare_word_sas_intact() {
-    let msg = "the SAS token approach was assessed and found sas-isfactory overall";
-    let safe = redact_credentials(msg);
-    assert_eq!(
-        safe, msg,
-        "unrelated prose containing \"sas\" must be untouched: {safe}"
-    );
+    // Bare word "sas" in prose: untouched.
+    let prose = "the SAS token approach was assessed and found sas-isfactory overall";
+    assert_eq!(redact_credentials(prose), prose);
 }
-
-/// Scenario: `redact_error_text` runs the value pass BEFORE the label pass, so a
-/// SAS token — which carries its own `sig=` label — is removed whole.
-///
-/// Pins the ORDER, not just the outcome: the inverted composition is asserted to
-/// still leak the token's `sp=` permission field, so swapping the two calls inside
-/// `redact_error_text` fails here instead of silently passing.
 #[test]
 fn redact_error_text_removes_a_sas_token_whole_unlike_the_inverted_order() {
     let sas = "sv=2023-11-03&ss=b&srt=sco&sp=rwdlacx&se=2026-01-01T00:00:00Z&sig=SIG_VALUE";
@@ -202,11 +162,6 @@ fn redact_error_text_removes_a_sas_token_whole_unlike_the_inverted_order() {
         "inverted order is expected to leak the permission field: {inverted}"
     );
 }
-
-/// Scenario: A label that appears MORE than once in the same error string is
-/// fully redacted on every occurrence — not just the first.
-///
-/// Without the `while let` loop the second `access_key` would remain visible.
 #[test]
 fn redact_credentials_redacts_all_occurrences_of_repeated_label() {
     // Two occurrences of "access_key" with distinct values — both must vanish.
@@ -226,8 +181,6 @@ fn redact_credentials_redacts_all_occurrences_of_repeated_label() {
         "label must be preserved: {safe}"
     );
 }
-
-/// Scenario: X-Amz-Security-Token (vended session token header) is redacted.
 #[test]
 fn redact_credentials_strips_x_amz_security_token() {
     let msg = "X-Amz-Security-Token=AQoDYXdzEJr_STS_TOKEN_VALUE (403)";
@@ -241,8 +194,6 @@ fn redact_credentials_strips_x_amz_security_token() {
 // ---------------------------------------------------------------------------
 // Task 4.3 — No credential in error text
 // ---------------------------------------------------------------------------
-
-/// Scenario: a catalog error message has its credential-shaped values removed.
 #[test]
 fn catalog_error_message_strips_credentials() {
     let msg = "GET failed: access_key=AKID_SECRET_VALUE region=us-east-1";
@@ -256,12 +207,6 @@ fn catalog_error_message_strips_credentials() {
         "label must be preserved: {safe}"
     );
 }
-
-/// A Unicode character whose full case-folding grows its byte length (e.g.
-/// Turkish dotted İ → "i̇") must not desync the byte offsets computed from
-/// the lowercased search string against the original — `to_lowercase()`
-/// once did, and `result[..idx]` panicked on a non-ASCII multi-byte
-/// continuation byte. `to_ascii_lowercase()` preserves length exactly.
 #[test]
 fn redact_credentials_does_not_panic_on_length_changing_unicode_casefold() {
     let msg = "İİİİİsig=ütoken";
@@ -271,9 +216,6 @@ fn redact_credentials_does_not_panic_on_length_changing_unicode_casefold() {
         "sig= value must be redacted: {safe}"
     );
 }
-
-/// Scenario: Unity Catalog vended-credential field names and the OAuth M2M
-/// client secret are redacted the same way the Iceberg vended labels are.
 #[test]
 fn redact_credentials_strips_unity_vended_and_oauth_secrets() {
     let msg = concat!(

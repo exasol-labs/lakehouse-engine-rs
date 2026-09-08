@@ -36,10 +36,6 @@ use crate::scan::store_router::{PrefixRoutingObjectStore, RoutedSide, ScanSide};
 /// Sizes the DataFusion memory pool from `memory_limit_bytes` (UDF per-instance
 /// limit in bytes; `0` = unknown sentinel → conservative 1024 MB default) and
 /// probes `/tmp` for disk-spill eligibility.
-///
-/// Every store is built from `storage` — the backends `resolve_scan_storage`
-/// produced for this invocation — never from the spec, which carries only a
-/// reference to the CONNECTION that supplies them.
 pub(super) fn build_session_context(
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
@@ -68,7 +64,6 @@ pub(super) fn build_session_context(
     // is being built: each store ends up behind a router that can raise an error
     // while either side's credential is in scope. `build_side_store` sees one side
     // and structurally cannot assemble the union, so it is read from its single
-    // owner — the RESOLVED pair — and passed down.
     let all_secrets = storage.all_secret_values();
 
     // Each side gets its OWN inner store: built from its OWN backend, and sized
@@ -107,13 +102,6 @@ pub(super) fn build_session_context(
 ///
 /// A join block with an EMPTY file list contributes no side: it names no path to
 /// route, no file to size, and no URI to derive a store key from.
-///
-/// Each side's backend comes from `storage`, paired with the spec block that
-/// names its files. A join block present with files but no resolved dimension
-/// backend is unreachable through `resolve_scan_storage`, which derives the pair
-/// from this same spec; such a pair can only come from
-/// [`ResolvedScanStorage::from_backends`], and it registers no dimension store —
-/// so no dimension credential is in scope for the union either.
 fn present_sides<'a>(spec: &'a ScanSpec, storage: &'a ResolvedScanStorage) -> Vec<ScanSide<'a>> {
     let mut sides = vec![ScanSide {
         label: "fact",

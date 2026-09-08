@@ -84,7 +84,6 @@ renders the retained ordering AND the retained final window itself.
   sort, declined wrapper, grouped merge, join wrapper — render through ONE shared seam, so
   they cannot drift. An expression sort key reuses that seam with the rendered expression in
   place of a quoted column identifier.
-* A CONNECTION-supplied storage credential is carried as a connection REFERENCE and MUST NOT appear in any returned SQL. A VENDED storage credential appears in a returned SQL string ONLY inside the AES-GCM-sealed envelope of `vs-adapter/scan-spec-credential-reference` — issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), CLOSED by that feature — never in plaintext. No credential of either kind appears in an error message.
 * A declined ordered shape may cause the adapter to emit extra hidden sort-key columns
   from the per-shard scan (see `vs-adapter/pushdown-planning-order-by-capability`).
   Those columns exist only to make the declined wrapper's outer `ORDER BY` resolvable;
@@ -163,10 +162,4 @@ renders the retained ordering AND the retained final window itself.
 * *AND* an ABSENT or EMPTY `orderBy` SHALL remain outside this scenario entirely: no ordering was pushed, so the adapter emits no wrapper and no `ORDER BY`
 * *AND* the decline SHALL be the ONLY alternative to a faithfully rendered ordering, so no reachable ordered shape can return a result that is both successful and silently unordered
 
-### Scenario: An ordered top-N request's generated SQL carries a credential reference, not a credential
-
-* *GIVEN* an ORDER BY + LIMIT pushdown request over a virtual schema whose CONNECTION supplies static storage credentials and does not enable `use_vended_credentials`
-* *WHEN* the adapter renders the scan-driving SQL for that request
-* *THEN* the returned SQL string MUST NOT contain the CONNECTION's `access_key`, `secret_key`, `session_token`, `account_key`, or `sas_token` value in any encoding, because the shard-invariant common scan-spec argument carries a connection REFERENCE under `vs-adapter/scan-spec-credential-reference`
-* *AND* the same request with `use_vended_credentials` enabled SHALL carry the vended credential ONLY inside the sealed envelope `vs-adapter/scan-spec-credential-reference` specifies — issue #378, closed by this plan — so no credential value appears in PLAINTEXT in that SQL under either setting
-* *AND* no credential value of either kind SHALL appear in any error message this feature's path raises
+*Credential-reference invariant:* this feature's pushdown path inherits the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` — no credential value in generated SQL or error messages.

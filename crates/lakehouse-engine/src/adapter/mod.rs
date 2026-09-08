@@ -186,14 +186,9 @@ pub struct ResolvedConnectionConfig {
     pub(crate) creds: ConnectionCreds,
     pub(crate) allow_http: bool,
     pub(crate) catalog_kind: CatalogKind,
-    /// The `CATALOG_CONNECTION` name, which every scan spec references in place
-    /// of the credential it used to carry.
     pub(crate) connection_name: String,
-    /// The key a vended storage backend is sealed under, present iff this
-    /// CONNECTION's password carries secret material — the decision
-    /// [`read_connection`] takes at the boundary where that password lives, and
-    /// carried here unchanged. `None` is what makes a vended request a plan-time
-    /// refusal rather than a weakened envelope.
+    /// Present iff the CONNECTION password carries secret material; `None` refuses
+    /// vended requests at plan time rather than shipping a weakened envelope.
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 
@@ -210,10 +205,6 @@ pub struct ResolvedConnectionConfig {
 /// resolving `CATALOG_KIND` a second time for client construction, ride on the
 /// returned [`ResolvedConnectionConfig`] alongside the rest of the resolved
 /// configuration.
-///
-/// `sealed_storage_key` is a straight passthrough of what [`read_connection`]
-/// returned: the key-material gate runs THERE, at the boundary that holds the
-/// password, and no second test of it exists here or anywhere else.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,

@@ -69,12 +69,6 @@ pub(crate) fn inject_catalog_auth_props(
 /// generic label/pattern redaction AND strips the literal `token`, `client_secret`,
 /// `client_id`, `oauth2_server_uri`, and `scope` values so any auth field echoed
 /// without a recognizable label can never leak.
-///
-/// Routes through [`redact_error_text`], NOT the inverted
-/// `redact_secret_values(redact_credentials(msg), ...)` composition this site
-/// used before: `redaction.rs` documents that ordering as broken for a SAS
-/// token, whose own `sig=` label gets mangled by a label-first pass, leaving
-/// the value pass unable to match the literal it was given.
 pub(crate) fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> String {
     let mut secrets: Vec<String> = Vec::new();
     if let Some(token) = non_empty(&creds.token) {
@@ -162,11 +156,6 @@ async fn oauth2_client_credentials_grant(
     // Strip the client secret AND the obtained token from every error. The token
     // is not yet known at the point a transport/parse error is built, so it is
     // added to the redaction set after a successful parse before being returned.
-    //
-    // Routes through `redact_error_text`, not the inverted
-    // `redact_secret_values(redact_credentials(msg), ...)` composition this site
-    // used before — see `redact_catalog_auth_error`'s doc comment for why the
-    // order is load-bearing.
     let redact_secret = |msg: &str| redact_error_text(msg, &[client_secret]);
 
     let mut form: Vec<(&str, &str)> = vec![

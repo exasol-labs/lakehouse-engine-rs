@@ -36,12 +36,7 @@ const JOIN_DIM_TABLE: &str = "dim_scan";
 /// is disabled (see [`session_config_for_spec`]), so the dimension is deterministically
 /// the hash-join build side regardless of table statistics. Read/deserialization
 /// errors for EITHER side route through [`classify_scan_error`] against the UNION of
-/// both sides' RESOLVED secret values
-/// ([`ResolvedScanStorage::all_secret_values`]) — a fact-side-only set would leak
-/// the dimension side's own credential, since each side resolves a genuinely
-/// different one. Exposed so a host integration test can drive this exact path
-/// over local Parquet (no S3 store), building `storage` with
-/// [`ResolvedScanStorage::from_backends`].
+/// both sides' resolved secret values.
 pub async fn run_join_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
@@ -65,17 +60,6 @@ pub async fn run_join_scan_with_session(
     Ok(())
 }
 
-/// Register both sides of a broadcast join into one session: the sharded fact file
-/// list and the full dimension file list, each via [`register_file_list`].
-///
-/// Aggregates or GROUP BY alongside a join are out of scope for this phase (the VS
-/// never emits that combination); such a spec is rejected with a clear error rather
-/// than silently producing a wrong-shaped result.
-///
-/// A resolved pair carrying no dimension backend for a join spec is likewise
-/// rejected rather than registered against the fact side's credential: serving
-/// the dimension side's files with a credential that was never granted access to
-/// them is the failure the per-side backend exists to prevent.
 async fn register_join_tables(
     ctx: &SessionContext,
     spec: &ScanSpec,

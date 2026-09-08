@@ -542,16 +542,7 @@ pub(in super::super) fn build_n_scan_join_sql(
     Ok(sql)
 }
 
-/// Everything ONE pushdown request fixes for every join scan spec it emits,
-/// independently of which side or which leg is being built: the DataFusion
-/// execution and sharding knobs, plus the resolved `CATALOG_CONNECTION` both
-/// sides select their wire storage from.
-///
-/// Bundled so the join SQL builders take one parameter instead of eight
-/// positional numbers whose order is easy to transpose (guardrails: few
-/// arguments, config at high levels). `connection` belongs with them because it
-/// is the same kind of value: per-request, side-independent, and read but never
-/// modified by any builder below.
+/// Per-request, side-independent configuration shared across all join scan specs.
 pub(in super::super) struct JoinScanRequestConfig<'a> {
     pub(in super::super) cluster_nodes: usize,
     pub(in super::super) parallelism_factor: usize,
@@ -561,9 +552,6 @@ pub(in super::super) struct JoinScanRequestConfig<'a> {
     pub(in super::super) memory_pool_fraction: f64,
     pub(in super::super) instance_overhead_mb: u64,
     pub(in super::super) s3_max_connections: usize,
-    /// The one resolved CONNECTION both join sides reference or seal against, so
-    /// a vended join seals each side independently — two envelopes, two nonces,
-    /// ONE key — rather than sharing one envelope neither side owns.
     pub(in super::super) connection: &'a ResolvedConnectionConfig,
 }
 
@@ -625,14 +613,8 @@ fn join_fan_out_scan_spec(
     })
 }
 
-/// Select ONE side's wire storage from that side's OWN resolved backend and the
-/// request's shared CONNECTION — the join path's only call into
-/// [`scan_storage_for`], applied per side.
-///
-/// Per side rather than once per request: a vended credential is scoped to the
-/// table it was resolved for, so the two sides' backends genuinely differ and
-/// each must be sealed on its own. Sealing per side also means two envelopes
-/// under two fresh nonces, never one envelope shared by both.
+/// Select one side's wire storage via `scan_storage_for`, applied per side
+/// because vended credentials are table-scoped.
 fn scan_storage_for_side(
     effective: &StorageBackend,
     inputs: &JoinScanRequestConfig<'_>,
@@ -794,10 +776,6 @@ pub(in super::super) fn build_broadcast_join_sql(
         condition: rendered.condition.clone(),
         post_join_limit: shard_cap,
         partition_columns: dimension.partition_columns.clone(),
-        // The DIMENSION side's own storage, selected from ITS own resolved
-        // backend — never the fact side's. Under vending this is a SECOND
-        // envelope under a second nonce, because a vended credential is scoped
-        // to the table it was resolved for.
         storage: scan_storage_for_side(&dimension.effective_storage, inputs)?,
     };
 

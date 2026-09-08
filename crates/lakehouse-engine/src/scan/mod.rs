@@ -8,9 +8,6 @@ pub mod diagnostics;
 pub mod emit;
 pub mod positional_deletes;
 pub mod runtime;
-/// The sealed vended-credential envelope. Crate-visible rather than private to
-/// `scan` because both of its callers live in this crate on OPPOSITE sides of the
-/// wire: the adapter seals at plan time, the scan UDF unseals per invocation.
 pub(crate) mod sealed;
 pub mod spec;
 
@@ -228,21 +225,12 @@ pub fn read_scan_spec(ctx: &dyn UdfContext) -> Result<ScanSpec, UdfError> {
 /// whose abort-free contract holds because [`run_scan_one`]'s future drops its
 /// `SessionContext` and every stream before it resolves, owning no async resource
 /// at return. Production builds the session via `build_session_context`.
-///
-/// The storage REFERENCE the spec carries is resolved here, immediately after
-/// reconstitution and before any store, runtime, or session exists: both join
-/// sides in one step, so the error-redaction set is defined before anything can
-/// raise an error, and the referenced CONNECTION is read exactly once per
-/// invocation rather than once per side or once per file.
 pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // One run() call = one row (SDK 0.21.0 scalar dispatch — no ctx.next()).
     // Reconstitute this row's spec BEFORE building the runtime: the runtime kind
     // depends on spec.common.df_threads_per_udf. NULL in either argument is a user error.
     let spec = read_scan_spec(ctx)?;
 
-    // Resolve the storage reference before the runtime: this is a synchronous
-    // `ctx.connection()` read, it must precede every store, and a missing grant
-    // has to fail here rather than after a runtime has been built and torn down.
     let storage = resolve_scan_storage(&spec.common, ctx)?;
 
     let rt = build_scan_runtime(spec.common.df_threads_per_udf).map_err(UdfError::User)?;
@@ -269,11 +257,6 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 /// `build_session` is injected so a host test can supply a local-file session
 /// (no S3), exactly as [`run_raw_scan_with_session`] is exposed for host tests;
 /// production passes [`build_session_context`].
-///
-/// `storage` is the pair [`resolve_scan_storage`] produced for this spec — every
-/// side's real backend, and the sole owner of the error-redaction secret set. A
-/// host test that already holds its backends builds it with
-/// [`ResolvedScanStorage::from_backends`].
 pub async fn run_scan_one(
     ctx: &mut dyn UdfContext,
     spec: ScanSpec,
