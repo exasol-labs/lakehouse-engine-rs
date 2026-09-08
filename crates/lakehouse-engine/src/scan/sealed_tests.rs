@@ -55,8 +55,6 @@ fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
             backend,
         );
 
-        // Flip one byte inside the ciphertext (past the nonce). AES-GCM must
-        // reject this at the AEAD tag check.
         let mut raw = BASE64.decode(&payload).expect("a fresh seal must decode");
         raw[NONCE_BYTES] ^= 0xFF;
         let tampered = BASE64.encode(&raw);
@@ -66,7 +64,6 @@ fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
         assert!(err.contains("AES-256-GCM authentication"), "{err}");
         assert_carries_no_sentinel("a tampered-envelope error", &err);
 
-        // Wrong key (the shape a CONNECTION rotation mid-query produces).
         let rotated = derive_sealed_storage_key(r#"{"warehouse":"wh","secret_key":"ROTATED"}"#);
         let err = unseal_storage(&payload, &rotated)
             .expect_err("an envelope must not open under another key")

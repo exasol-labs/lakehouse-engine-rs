@@ -43,7 +43,6 @@ pub struct Resolved {
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 
-/// Single site that gates `SealedStorageKey` creation via `connection_password_carries_key_material`.
 pub fn read_connection(
     ctx: &dyn UdfContext,
     name: Option<&str>,
@@ -90,7 +89,6 @@ pub fn read_connection(
     })
 }
 
-/// Validates in precedence order: kind preconditions, Azure exclusivity, SigV4, catalog-auth, OAuth2.
 fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Result<(), UdfError> {
     validate_kind_preconditions(name, creds, kind)?;
     validate_azure_storage_creds(name, creds)?;

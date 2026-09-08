@@ -1582,13 +1582,9 @@ fn scan_storage_is_externally_tagged_and_rejects_a_mismatched_payload() {
     }
 
     for mismatched in [
-        // `connection` carrying `sealed`'s fields.
         r#"{"connection":{"name":"C","payload":"AAAA"}}"#,
-        // `sealed` carrying `connection`'s fields.
         r#"{"sealed":{"name":"C","allow_http":false}}"#,
-        // A bare backend with no wrapper tag at all — the untagged pin.
         r#"{"s3":{"endpoint":"","region":"","access_key":"AK","secret_key":"SK"}}"#,
-        // A variant key that does not exist.
         r#"{"reference":{"name":"C"}}"#,
     ] {
         assert!(

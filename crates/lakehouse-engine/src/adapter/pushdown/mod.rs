@@ -124,8 +124,6 @@ mod dispatch_golden;
 ///
 /// Returns JSON `{"type":"pushdown","sql":"..."}`.
 ///
-/// No storage credential value appears in the returned SQL: static credentials
-/// travel as a CONNECTION reference, vended ones as an AES-256-GCM sealed envelope.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_pushdown(
     request: &Json,

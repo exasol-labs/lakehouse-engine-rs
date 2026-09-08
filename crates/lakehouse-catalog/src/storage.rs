@@ -77,10 +77,6 @@ impl std::fmt::Debug for AdlsCred {
 /// S3 credential type, so an added backend is a new variant beside it rather than
 /// an edit to it. `Adls` has no equivalent pre-existing struct to protect, so it
 /// carries its two fields inline instead of wrapping a symmetry-only type.
-///
-/// `Debug` is a manual impl below, not derived: it delegates to each variant's
-/// own redacting `Debug` (`StorageProps`'s and `AdlsCred`'s), so this enum
-/// never needs to know which of its fields are secret itself.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {

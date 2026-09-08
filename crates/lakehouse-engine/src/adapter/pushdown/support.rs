@@ -1576,7 +1576,6 @@ pub(super) fn cast_to_declared_type(expr: &str, declared: Option<&str>) -> Strin
     }
 }
 
-/// Single variant-selection site — can never return `Inline`.
 pub(super) fn scan_storage_for(
     creds: &ConnectionCreds,
     connection_name: &str,

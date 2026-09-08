@@ -390,7 +390,6 @@ fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
     }
 }
 
-// `static` because `JoinScanRequestConfig` borrows its connection.
 pub(super) static TEST_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
     std::sync::LazyLock::new(|| test_connection(unauthenticated_creds()));
 

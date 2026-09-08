@@ -57,10 +57,6 @@ async fn register_aliased_scan_target(
 ///
 /// The column layout follows the COLUMN CONTRACT (see `build_partial_agg_sql`
 /// and `build_grouped_partial_agg_sql`).
-///
-/// The redaction secret set comes from `storage` — the RESOLVED backends — never
-/// from the spec, whose `storage` field names a CONNECTION rather than carrying a
-/// credential.
 pub(super) async fn run_partial_aggregate(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,

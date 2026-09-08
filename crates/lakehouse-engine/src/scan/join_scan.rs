@@ -36,7 +36,6 @@ const JOIN_DIM_TABLE: &str = "dim_scan";
 /// is disabled (see [`session_config_for_spec`]), so the dimension is deterministically
 /// the hash-join build side regardless of table statistics. Read/deserialization
 /// errors for EITHER side route through [`classify_scan_error`] against the UNION of
-/// both sides' resolved secret values.
 pub async fn run_join_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,

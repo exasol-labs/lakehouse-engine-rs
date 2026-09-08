@@ -2065,7 +2065,6 @@ fn golden_broadcast_join_sql_unchanged() {
     );
 }
 
-// Driven over a vended CONNECTION so each side seals its own backend.
 #[test]
 fn broadcast_carries_each_sides_own_storage() {
     let mut fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
@@ -2138,8 +2137,6 @@ fn broadcast_carries_each_sides_own_storage() {
             "{label} must seal that side's OWN backend"
         );
     }
-    // Positive control on the guard itself: the two sides' envelopes differ, so
-    // an equality assertion could not pass by the two sides coinciding.
     assert_ne!(
         common["storage"], common["join"]["storage"],
         "the two sides must carry two distinct envelopes"

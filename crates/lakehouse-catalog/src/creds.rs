@@ -82,7 +82,6 @@ impl ConnectionCreds {
                 }
             }
             (Some(token), None, None) => SuppliedCatalogAuth::StaticToken(token),
-            // Every remaining shape is rejected by validate_creds before a session exists.
             (None, None, None)
             | (None, Some(_), None)
             | (None, None, Some(_))
@@ -222,7 +221,6 @@ impl StorageCreds {
         }
     }
 
-    /// Falls through to S3 when Azure fields are incomplete (panic → SIGKILL fan-out).
     pub fn backend(&self, allow_http: bool) -> StorageBackend {
         let azure_cred = match (self.account_key.as_deref(), self.sas_token.as_deref()) {
             (Some(account_key), None) => Some(AdlsCred::AccountKey(account_key.to_string())),

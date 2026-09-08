@@ -124,19 +124,16 @@ fn redact_credentials_strips_azure_account_key_and_sas_labels() {
 
 #[test]
 fn redact_credentials_handles_serialized_sas_correctly() {
-    // Wire key: whole value redacted.
     let wire = r#"failed to build store from config {"sas":"STATIC_SAS_WIRE_VALUE"}"#;
     let safe = redact_credentials(wire);
     assert!(!safe.contains("STATIC_SAS_WIRE_VALUE"), "{safe}");
     assert!(safe.contains("\"sas\":"), "{safe}");
 
-    // Realistic SAS: signature and parameters redacted.
     let realistic = r#"failed to build store from config {"sas":"sv=2023-11-03&ss=b&srt=sco&sp=rwdlacx&se=2026-01-01T00:00:00Z&sig=REALSIGNATURE"}"#;
     let safe = redact_credentials(realistic);
     assert!(!safe.contains("REALSIGNATURE"), "{safe}");
     assert!(!safe.contains("sv=2023-11-03"), "{safe}");
 
-    // Bare word "sas" in prose: untouched.
     let prose = "the SAS token approach was assessed and found sas-isfactory overall";
     assert_eq!(redact_credentials(prose), prose);
 }

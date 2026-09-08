@@ -187,8 +187,6 @@ pub struct ResolvedConnectionConfig {
     pub(crate) allow_http: bool,
     pub(crate) catalog_kind: CatalogKind,
     pub(crate) connection_name: String,
-    /// Present iff the CONNECTION password carries secret material; `None` refuses
-    /// vended requests at plan time rather than shipping a weakened envelope.
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 

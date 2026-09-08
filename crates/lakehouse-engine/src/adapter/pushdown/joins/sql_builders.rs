@@ -542,7 +542,6 @@ pub(in super::super) fn build_n_scan_join_sql(
     Ok(sql)
 }
 
-/// Per-request, side-independent configuration shared across all join scan specs.
 pub(in super::super) struct JoinScanRequestConfig<'a> {
     pub(in super::super) cluster_nodes: usize,
     pub(in super::super) parallelism_factor: usize,
@@ -565,7 +564,6 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
 
 /// Assemble the shard-invariant [`ScanSpec`] both join fan-out builders emit: an
 /// empty `files` (the shards travel separately), no limit / order / aggregate /
-/// group, and the six DataFusion + S3 tuning knobs copied from `inputs`. `primary`
 /// is the side the spec scans, and `common.storage` carries ONLY that scanned
 /// side's own effective `storage` (`table_root`, `logical_schema`, `name_mapping`
 /// likewise come from `primary`); `projection`, `filter`, `emit_exa_types`, and
@@ -613,8 +611,6 @@ fn join_fan_out_scan_spec(
     })
 }
 
-/// Select one side's wire storage via `scan_storage_for`, applied per side
-/// because vended credentials are table-scoped.
 fn scan_storage_for_side(
     effective: &StorageBackend,
     inputs: &JoinScanRequestConfig<'_>,
