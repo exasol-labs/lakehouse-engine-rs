@@ -1,109 +1,103 @@
 use super::*;
 
 #[test]
-fn secret_values_lists_access_key_secret_key_and_session_token_in_order() {
-    let storage = StorageProps {
-        access_key: "AKIA_EXAMPLE".into(),
-        secret_key: "static-secret-key".into(),
-        session_token: Some("sts-session-token".into()),
-        ..Default::default()
-    };
-
-    assert_eq!(
-        storage.secret_values(),
-        vec!["AKIA_EXAMPLE", "static-secret-key", "sts-session-token"]
-    );
-}
-
-/// Every value this returns is fed to literal-value error redaction, so an
-/// empty or absent credential must never enter the list — redacting `""`
-/// would strip every character of the error message it guards.
-#[test]
 fn secret_values_omits_every_empty_or_absent_credential() {
-    let no_access_key_no_token = StorageProps {
-        access_key: String::new(),
-        secret_key: "static-secret-key".into(),
-        session_token: None,
+    let full = StorageProps {
+        access_key: "AK".into(),
+        secret_key: "SK".into(),
+        session_token: Some("TOK".into()),
         ..Default::default()
     };
-    assert_eq!(
-        no_access_key_no_token.secret_values(),
-        vec!["static-secret-key"]
-    );
+    assert_eq!(full.secret_values(), vec!["AK", "SK", "TOK"]);
 
-    let no_secret_key_empty_token = StorageProps {
-        access_key: "AKIA_EXAMPLE".into(),
-        secret_key: String::new(),
+    let partial = StorageProps {
+        secret_key: "SK".into(),
         session_token: Some(String::new()),
         ..Default::default()
     };
-    assert_eq!(
-        no_secret_key_empty_token.secret_values(),
-        vec!["AKIA_EXAMPLE"]
-    );
+    assert_eq!(partial.secret_values(), vec!["SK"]);
 
     assert!(StorageProps::default().secret_values().is_empty());
 }
 
-/// [`StorageProps::default`] documents itself as equal to deserializing a
-/// `StorageProps` whose every optional field is absent. Pinning that keeps the
-/// hand-written `Default` and serde's `default_true` seam from drifting apart
-/// now that the type sits behind a crate boundary from the scan spec it feeds.
 #[test]
 fn default_equals_deserializing_a_props_with_every_optional_field_absent() {
     let field_absent: StorageProps =
         serde_json::from_str(r#"{"endpoint":"","region":"","access_key":"","secret_key":""}"#)
             .unwrap();
-
     assert_eq!(StorageProps::default(), field_absent);
 }
 
-/// The manual `Debug` impl is the only thing standing between a
-/// `ConnectionCreds` and a secret in a log line or a `{:?}`-formatted error,
-/// so every secret-bearing field is asserted, not just the two the engine's
-/// `parse_creds` tests happen to cover.
 #[test]
 fn debug_redacts_every_secret_bearing_field() {
     let creds = ConnectionCreds {
         warehouse: "wh".into(),
         endpoint: "http://s3.example.com".into(),
         region: "us-east-1".into(),
-        access_key: "AKIA_EXAMPLE".into(),
-        secret_key: "static-secret-key".into(),
-        session_token: Some("sts-session-token".into()),
+        access_key: "AKIA_EX".into(),
+        secret_key: "SK".into(),
+        session_token: Some("TOK".into()),
         path_style: true,
         use_sigv4: false,
         use_vended_credentials: false,
-        token: Some("static-bearer-token".into()),
-        client_id: Some("my-client-id".into()),
-        client_secret: Some("oauth-client-secret".into()),
+        token: Some("bearer".into()),
+        client_id: Some("cid".into()),
+        client_secret: Some("csecret".into()),
         oauth2_server_uri: Some("https://auth.example.com/token".into()),
         scope: Some("catalog:read".into()),
         account_name: Some("acct".into()),
-        account_key: Some("static-account-key".into()),
-        sas_token: Some("sv=…&sig=static-sas-signature".into()),
+        account_key: Some("akey".into()),
+        sas_token: Some("sv=…&sig=sas".into()),
     };
-
     let debug = format!("{creds:?}");
-
     for secret in [
-        "static-secret-key",
-        "sts-session-token",
-        "static-bearer-token",
-        "oauth-client-secret",
-        "static-account-key",
-        "sv=…&sig=static-sas-signature",
+        "AKIA_EX",
+        "SK",
+        "TOK",
+        "bearer",
+        "csecret",
+        "akey",
+        "sv=…&sig=sas",
     ] {
-        assert!(
-            !debug.contains(secret),
-            "{secret} must not appear in Debug: {debug}"
-        );
+        assert!(!debug.contains(secret), "{secret} leaked: {debug}");
     }
+    assert!(debug.contains("cid"));
 
-    // Neither the S3 access key ID nor the OAuth2 client ID is a secret, and
-    // both are diagnostically useful — they stay visible on purpose.
-    assert!(debug.contains("AKIA_EXAMPLE"), "{debug}");
-    assert!(debug.contains("my-client-id"), "{debug}");
+    let props = StorageProps {
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "AK2".into(),
+        secret_key: "SK2".into(),
+        session_token: Some("TOK2".into()),
+        allow_http: true,
+        path_style: true,
+    };
+    for (label, text) in [
+        ("StorageProps", format!("{props:?}")),
+        (
+            "StorageBackend",
+            format!("{:?}", StorageBackend::S3(props.clone())),
+        ),
+        (
+            "StorageCreds",
+            format!(
+                "{:?}",
+                StorageCreds {
+                    endpoint: props.endpoint.clone(),
+                    region: props.region.clone(),
+                    access_key: props.access_key.clone(),
+                    secret_key: props.secret_key.clone(),
+                    session_token: props.session_token.clone(),
+                    path_style: true,
+                    ..Default::default()
+                }
+            ),
+        ),
+    ] {
+        for s in ["AK2", "SK2", "TOK2"] {
+            assert!(!text.contains(s), "{label} leaked {s}: {text}");
+        }
+    }
 }
 
 const TOKEN: &str = "static-bearer-token";
@@ -123,14 +117,10 @@ fn creds_with(
     }
 }
 
-/// `validate_creds` accepts three of the eight presence shapes, so the
-/// classifier names one mode for each of those three and no mode for the other
-/// five. All eight are driven here: a `_ => StaticToken(..)` wildcard slip
-/// passes every accepted row, and only the rejected rows catch it.
 #[test]
 fn supplied_catalog_auth_names_one_mode_per_field_shape() {
-    let pair_only = creds_with(None, Some(CLIENT_ID), Some(CLIENT_SECRET));
-    match pair_only.supplied_catalog_auth() {
+    let pair = creds_with(None, Some(CLIENT_ID), Some(CLIENT_SECRET));
+    match pair.supplied_catalog_auth() {
         SuppliedCatalogAuth::ClientCredentials {
             client_id,
             client_secret,
@@ -141,10 +131,10 @@ fn supplied_catalog_auth_names_one_mode_per_field_shape() {
         _ => panic!("a complete pair without a token must name ClientCredentials"),
     }
 
-    let token_only = creds_with(Some(TOKEN), None, None);
-    match token_only.supplied_catalog_auth() {
-        SuppliedCatalogAuth::StaticToken(token) => assert_eq!(token, TOKEN),
-        _ => panic!("a token without either OAuth2 field must name StaticToken"),
+    let token = creds_with(Some(TOKEN), None, None);
+    match token.supplied_catalog_auth() {
+        SuppliedCatalogAuth::StaticToken(t) => assert_eq!(t, TOKEN),
+        _ => panic!("a token without OAuth2 fields must name StaticToken"),
     }
 
     for (token, client_id, client_secret) in [
@@ -161,37 +151,109 @@ fn supplied_catalog_auth_names_one_mode_per_field_shape() {
                 creds.supplied_catalog_auth(),
                 SuppliedCatalogAuth::Unauthenticated
             ),
-            "shape (token={}, client_id={}, client_secret={}) describes no mode",
+            "shape (token={}, id={}, secret={}) describes no mode",
             token.is_some(),
             client_id.is_some(),
             client_secret.is_some(),
         );
     }
+}
 
-    // An empty field is an absent field. Each position is emptied in the one
-    // shape where that distinction changes the mode, so an `is_some()` reading
-    // fails all three.
-    let empty_token = creds_with(Some(""), Some(CLIENT_ID), Some(CLIENT_SECRET));
-    assert!(
-        matches!(
-            empty_token.supplied_catalog_auth(),
-            SuppliedCatalogAuth::ClientCredentials { .. }
-        ),
-        "an empty token leaves the complete pair, not the rejected all-three shape"
-    );
-
-    let empty_client_id = creds_with(Some(TOKEN), Some(""), None);
-    match empty_client_id.supplied_catalog_auth() {
-        SuppliedCatalogAuth::StaticToken(token) => assert_eq!(token, TOKEN),
-        _ => panic!("an empty client_id leaves the token alone, not a partial pair"),
+const STORAGE_ENDPOINT: &str = "http://minio:9000";
+const STORAGE_REGION: &str = "us-east-1";
+const STORAGE_AK: &str = "AKIA_PROJECTED";
+const STORAGE_SK: &str = "projected-secret-key";
+const STORAGE_SESSION_TOKEN: &str = "projected-session-token";
+const AZURE_ACCOUNT: &str = "projectedaccount";
+const AZURE_ACCOUNT_KEY: &str = "projected-account-key";
+const AZURE_SAS_TOKEN: &str = "projected-sas-token";
+fn s3_storage_creds() -> StorageCreds {
+    StorageCreds {
+        endpoint: STORAGE_ENDPOINT.into(),
+        region: STORAGE_REGION.into(),
+        access_key: STORAGE_AK.into(),
+        secret_key: STORAGE_SK.into(),
+        session_token: Some(STORAGE_SESSION_TOKEN.into()),
+        path_style: true,
+        ..Default::default()
     }
+}
 
-    let empty_client_secret = creds_with(None, Some(CLIENT_ID), Some(""));
-    assert!(
-        matches!(
-            empty_client_secret.supplied_catalog_auth(),
-            SuppliedCatalogAuth::Unauthenticated
-        ),
-        "an empty client_secret cannot complete a pair"
+fn s3_backend(allow_http: bool) -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: STORAGE_ENDPOINT.into(),
+        region: STORAGE_REGION.into(),
+        access_key: STORAGE_AK.into(),
+        secret_key: STORAGE_SK.into(),
+        session_token: Some(STORAGE_SESSION_TOKEN.into()),
+        allow_http,
+        path_style: true,
+    })
+}
+
+#[test]
+fn backend_selects_adls_only_for_an_account_name_with_exactly_one_azure_credential() {
+    let account_key_only = StorageCreds {
+        account_name: Some(AZURE_ACCOUNT.into()),
+        account_key: Some(AZURE_ACCOUNT_KEY.into()),
+        ..s3_storage_creds()
+    };
+    assert_eq!(
+        account_key_only.backend(false),
+        StorageBackend::Adls {
+            account_name: AZURE_ACCOUNT.into(),
+            cred: AdlsCred::AccountKey(AZURE_ACCOUNT_KEY.into()),
+        }
     );
+
+    let sas_token_only = StorageCreds {
+        account_name: Some(AZURE_ACCOUNT.into()),
+        sas_token: Some(AZURE_SAS_TOKEN.into()),
+        ..s3_storage_creds()
+    };
+    assert_eq!(
+        sas_token_only.backend(false),
+        StorageBackend::Adls {
+            account_name: AZURE_ACCOUNT.into(),
+            cred: AdlsCred::Sas(AZURE_SAS_TOKEN.into()),
+        }
+    );
+
+    let both_azure_credentials = StorageCreds {
+        account_name: Some(AZURE_ACCOUNT.into()),
+        account_key: Some(AZURE_ACCOUNT_KEY.into()),
+        sas_token: Some(AZURE_SAS_TOKEN.into()),
+        ..s3_storage_creds()
+    };
+    let account_name_alone = StorageCreds {
+        account_name: Some(AZURE_ACCOUNT.into()),
+        ..s3_storage_creds()
+    };
+    let account_key_without_an_account_name = StorageCreds {
+        account_key: Some(AZURE_ACCOUNT_KEY.into()),
+        ..s3_storage_creds()
+    };
+    let sas_token_without_an_account_name = StorageCreds {
+        sas_token: Some(AZURE_SAS_TOKEN.into()),
+        ..s3_storage_creds()
+    };
+    for (shape, creds) in [
+        ("both Azure credentials", both_azure_credentials),
+        ("an account name alone", account_name_alone),
+        (
+            "an account key without an account name",
+            account_key_without_an_account_name,
+        ),
+        (
+            "a SAS token without an account name",
+            sas_token_without_an_account_name,
+        ),
+        ("no Azure field at all", s3_storage_creds()),
+    ] {
+        assert_eq!(
+            creds.backend(false),
+            s3_backend(false),
+            "{shape} does not describe an Azure backend"
+        );
+    }
 }

@@ -16,6 +16,8 @@
 //!
 //! Host-runnable: no S3 / MinIO stack — the scan registers a `file://` Parquet.
 
+mod scan_fixture;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -28,7 +30,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, FileEntry, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, DeleteMechanism, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{read_scan_spec, run_raw_scan_with_session, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
@@ -138,14 +140,14 @@ fn scan_spec(file_url: String) -> ScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some("\"ID\" >= 10".into()),
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -161,9 +163,15 @@ async fn run_with_spec(spec: &ScanSpec) -> Vec<RecordBatch> {
     let mut ctx = FakeCtx::new(vec![Some(spec.to_json())]);
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers)
-        .await
-        .expect("raw scan must succeed");
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        spec,
+        &scan_fixture::resolved_storage(spec),
+        &mut timers,
+    )
+    .await
+    .expect("raw scan must succeed");
     ctx.emitted
 }
 
@@ -180,9 +188,15 @@ async fn run_two_arg(common_json: &str, files_json: &str) -> Vec<RecordBatch> {
     let spec = read_scan_spec(&ctx).expect("reconstitute spec from two args");
     let session = SessionContext::new_with_config(session_config_for_spec(&spec));
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, &spec, &mut timers)
-        .await
-        .expect("raw scan must succeed");
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        &spec,
+        &scan_fixture::resolved_storage(&spec),
+        &mut timers,
+    )
+    .await
+    .expect("raw scan must succeed");
     ctx.emitted
 }
 
@@ -264,14 +278,14 @@ fn spec_for_files(files: Vec<FileEntry>) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             df_batch_size: 64,
             ..Default::default()
         },

@@ -1,9 +1,9 @@
 use super::*;
 use crate::scan::runtime::{DEFAULT_BUDGET_BYTES, MIN_POOL_FLOOR_BYTES};
 use crate::scan::spec::{
-    DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, JoinType, StorageProps,
+    DeleteMechanism, DeltaDeletionVectorStorage, JoinSpec, JoinType, ScanStorage, StorageProps,
 };
-use crate::scan::test_support::minimal_spec;
+use crate::scan::test_support::{inline_resolved, minimal_spec};
 use ::object_store::ClientConfigKey;
 use datafusion::execution::memory_pool::MemoryLimit;
 
@@ -24,11 +24,12 @@ fn store_registered(ctx: &SessionContext, bucket: &str) -> bool {
 /// whole-spec connection budget and union redaction set `build_session_context`
 /// passes to every side.
 fn build_fact_side(spec: &ScanSpec) -> Result<Arc<dyn ObjectStore>, UdfError> {
-    let sides = present_sides(spec);
+    let resolved = inline_resolved(spec);
+    let sides = present_sides(spec, &resolved);
     build_side_store(
         &sides[0],
         spec.common.s3_max_connections,
-        &spec.common.all_secret_values(),
+        &resolved.all_secret_values(),
     )
 }
 
@@ -136,7 +137,8 @@ fn session_context_sizes_pool_from_ctx_limit() {
     let overhead_bytes = spec.common.instance_overhead_mb * 1024 * 1024;
     let net = limit - overhead_bytes;
     let expected_budget = (net as f64 * spec.common.memory_pool_fraction) as usize;
-    let ctx = build_session_context(&spec, limit).expect("build must succeed");
+    let ctx =
+        build_session_context(&spec, &inline_resolved(&spec), limit).expect("build must succeed");
     match ctx.runtime_env().memory_pool.memory_limit() {
         MemoryLimit::Finite(actual) => assert_eq!(
             actual, expected_budget,
@@ -149,7 +151,8 @@ fn session_context_sizes_pool_from_ctx_limit() {
 /// A zero memory limit causes the DataFusion pool to use the conservative default budget.
 #[test]
 fn session_context_uses_default_budget_on_zero_limit() {
-    let ctx = build_session_context(&minimal_spec(), 0).expect("build must succeed");
+    let spec = minimal_spec();
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
     match ctx.runtime_env().memory_pool.memory_limit() {
         MemoryLimit::Finite(actual) => assert_eq!(
             actual, DEFAULT_BUDGET_BYTES as usize,
@@ -173,7 +176,8 @@ fn memory_budget_round_trips_into_scan_spec() {
     let overhead_bytes = 256_u64 * 1024 * 1024;
     let net = limit - overhead_bytes;
     let expected = (net as f64 * 0.5_f64) as usize;
-    let ctx = build_session_context(&spec, limit).expect("build must succeed");
+    let ctx =
+        build_session_context(&spec, &inline_resolved(&spec), limit).expect("build must succeed");
     match ctx.runtime_env().memory_pool.memory_limit() {
         MemoryLimit::Finite(actual) => assert_eq!(
             actual, expected,
@@ -230,9 +234,10 @@ fn each_side_store_gets_the_full_connection_budget() {
     );
     spec.common.s3_max_connections = BUDGET;
 
-    let sides = present_sides(&spec);
+    let resolved = inline_resolved(&spec);
+    let sides = present_sides(&spec, &resolved);
     assert_eq!(sides.len(), 2, "a join spec must present both sides");
-    let all_secrets = spec.common.all_secret_values();
+    let all_secrets = resolved.all_secret_values();
 
     for side in &sides {
         let budget = spec.common.s3_max_connections;
@@ -267,8 +272,9 @@ fn each_side_store_gets_the_full_connection_budget() {
 #[test]
 fn the_table_root_store_is_the_unwrapped_store_a_scan_side_wraps() {
     let spec = minimal_spec();
-    let sides = present_sides(&spec);
-    let all_secrets = spec.common.all_secret_values();
+    let resolved = inline_resolved(&spec);
+    let sides = present_sides(&spec, &resolved);
+    let all_secrets = resolved.all_secret_values();
     let budget = spec.common.s3_max_connections;
     // Same bucket as the fixture's one file, so both builders resolve one store.
     let table_root = "s3://test-bucket/data";
@@ -299,7 +305,7 @@ fn join_sides_in_two_buckets_register_two_stores() {
         vec![FileEntry::new("data/dim-0.parquet", 64)],
     );
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     for bucket in ["test-bucket", "dim-bucket"] {
         assert!(
@@ -321,7 +327,7 @@ fn an_s3a_scheme_side_registers_a_store_under_its_own_key() {
     )];
     let expected = Url::parse("s3a://test-bucket").expect("URL must parse");
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     assert!(
         ctx.runtime_env()
@@ -348,7 +354,7 @@ fn adls_backend(cred: AdlsCred) -> StorageBackend {
 /// A one-sided Adls spec rooted at `table_root`, under the given credential.
 fn adls_spec(table_root: &str, cred: AdlsCred) -> ScanSpec {
     let mut spec = minimal_spec();
-    spec.common.storage = adls_backend(cred);
+    spec.common.storage = ScanStorage::Inline(adls_backend(cred));
     spec.common.table_root = table_root.into();
     spec.files = vec![FileEntry::new("data/part-0.parquet", 1)];
     spec
@@ -393,7 +399,7 @@ fn an_azure_side_registers_under_a_container_qualified_url_the_registry_key_drop
         "the URL a side is registered under must keep its container"
     );
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     assert!(
         ctx.runtime_env()
@@ -426,7 +432,7 @@ fn azure_sides_in_one_container_share_one_routing_store() {
         "abfss://container@acct.dfs.core.windows.net/db/dim",
         AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()),
     );
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     let described = ctx
         .runtime_env()
@@ -459,7 +465,7 @@ fn azure_sides_in_different_accounts_register_two_stores() {
         AdlsCred::Sas("sv=2021&sig=static-sas-signature".into()),
     );
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     for account in [
         "abfss://facts@acct1.dfs.core.windows.net",
@@ -491,9 +497,11 @@ fn sides_on_different_backends_each_register_their_own_store() {
         .join
         .as_mut()
         .expect("spec_with_join sets a join block")
-        .storage = adls_backend(AdlsCred::Sas("sv=2021&sig=static-sas-signature".into()));
+        .storage = ScanStorage::Inline(adls_backend(AdlsCred::Sas(
+        "sv=2021&sig=static-sas-signature".into(),
+    )));
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     assert!(
         store_registered(&ctx, "test-bucket"),
@@ -523,7 +531,7 @@ fn an_abfs_scheme_side_registers_a_store_under_its_own_key() {
     let expected =
         Url::parse("abfs://container@acct.dfs.core.windows.net").expect("URL must parse");
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     assert!(
         ctx.runtime_env()
@@ -567,7 +575,7 @@ fn an_unrecognised_azure_host_is_rejected_redacted() {
 fn join_with_empty_dimension_file_list_registers_only_the_fact_side() {
     let spec = spec_with_join("s3://dim-bucket/db/dim", Vec::new());
 
-    let ctx = build_session_context(&spec, 0)
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0)
         .expect("an empty dimension file list must not fail the session build");
 
     assert!(
@@ -590,7 +598,7 @@ fn a_shared_bucket_join_registers_one_routing_store_over_both_sides() {
         "s3://test-bucket/db/dim",
         vec![FileEntry::new("data/dim-0.parquet", 64)],
     );
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     let described = ctx
         .runtime_env()
@@ -626,7 +634,7 @@ async fn shared_bucket_join_answers_each_sides_head_from_that_sides_index() {
         "s3://test-bucket/db/dim",
         vec![FileEntry::new("data/dim-0.parquet", DIM_SIZE)],
     );
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
     let store = ctx
         .runtime_env()
         .object_store_registry
@@ -675,7 +683,8 @@ fn each_side_size_index_holds_only_its_own_files() {
         FileEntry::new("data/fact-1.parquet", 44),
     ];
 
-    let sides = present_sides(&spec);
+    let resolved = inline_resolved(&spec);
+    let sides = present_sides(&spec, &resolved);
     assert_eq!(sides.len(), 2, "a join spec must present both sides");
 
     for (side, expected) in sides.iter().zip([
@@ -711,7 +720,7 @@ async fn a_spec_without_a_join_registers_one_sized_store_over_its_own_files() {
         FileEntry::new("s3://test-bucket/data/part-1.parquet", 2048),
     ];
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
     let store = ctx
         .runtime_env()
         .object_store_registry
@@ -761,14 +770,14 @@ async fn an_unroutable_path_is_refused_naming_no_credential() {
         "s3://test-bucket/db/dim",
         vec![FileEntry::new("data/dim-0.parquet", 64)],
     );
-    spec.common.storage = s3_backend("http://localhost:9000", FACT_SECRET);
+    spec.common.storage = ScanStorage::Inline(s3_backend("http://localhost:9000", FACT_SECRET));
     spec.common
         .join
         .as_mut()
         .expect("the spec carries a join block")
-        .storage = s3_backend("http://localhost:9000", DIM_SECRET);
+        .storage = ScanStorage::Inline(s3_backend("http://localhost:9000", DIM_SECRET));
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
     let store = ctx
         .runtime_env()
         .object_store_registry
@@ -859,14 +868,15 @@ async fn each_side_inner_store_is_built_from_its_own_backend() {
         "s3://test-bucket/db/dim",
         vec![FileEntry::new("data/dim-0.parquet", 64)],
     );
-    spec.common.storage = s3_backend(&fact_endpoint.url, "FACTSIDESECRETVALUE");
+    spec.common.storage =
+        ScanStorage::Inline(s3_backend(&fact_endpoint.url, "FACTSIDESECRETVALUE"));
     spec.common
         .join
         .as_mut()
         .expect("the spec carries a join block")
-        .storage = s3_backend(&dimension_endpoint.url, "DIMSIDESECRETVALUE");
+        .storage = ScanStorage::Inline(s3_backend(&dimension_endpoint.url, "DIMSIDESECRETVALUE"));
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
     let store = ctx
         .runtime_env()
         .object_store_registry

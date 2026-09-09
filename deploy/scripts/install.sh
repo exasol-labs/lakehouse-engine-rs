@@ -1424,6 +1424,8 @@ run_smoke_test() {
 
 print_next_step_template() {
   local schema="$1"
+  local role="LAKEHOUSE_ENGINE_ROLE_${schema}"
+  local installing_user="${ARG_USER:-<installing-user>}"
   emit ""
   emit "=== Next step: create the catalog CONNECTION and VIRTUAL SCHEMA (NOT created by this installer) ==="
   emit "-- These objects are dataset-specific. Edit the placeholders below and run the SQL yourself:"
@@ -1438,11 +1440,24 @@ print_next_step_template() {
   emit "    \"secret_key\": \"<secret_key>\""
   emit "  }';"
   emit ""
+  emit "-- Grant the VS OWNER's scripts CONNECTION access (BEFORE CREATE VIRTUAL SCHEMA). See docs/security.md."
+  emit ""
+  if [[ "${installing_user,,}" == "sys" ]]; then
+    emit "-- SYS holds every CONNECTION implicitly; skip the grants."
+  else
+    emit "CREATE ROLE $role;"
+    emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
+    emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
+    emit "GRANT $role TO $installing_user;"
+  fi
+  emit ""
   emit "CREATE VIRTUAL SCHEMA <MY_LAKEHOUSE>"
   emit "USING $schema.LAKEHOUSE_ADAPTER WITH"
   emit "  CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'"
   emit "  NAMESPACE          = '<namespace>'"
   emit "  ALLOW_HTTP         = 'false';"
+  emit ""
+  emit "-- Readers: GRANT SELECT ON SCHEMA <MY_LAKEHOUSE> TO <user>; CREATE OR REPLACE drops ACCESS grants."
 }
 
 # --- Entry point -------------------------------------------------------------

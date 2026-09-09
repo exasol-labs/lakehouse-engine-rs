@@ -48,6 +48,7 @@ scenarios.
 * **PR #358 already proved the whole suite passes on `8.29.13`** across the E2E, Lakekeeper, Unity, and
   Azure gates, so the 8.x leg is expected green from the start; the version gate is what keeps it green
   once the 2025.x declaration changes.
+* **This delta is issue #135.** Adds a least-privilege credential-absence scenario; amends provisioning to issue script-scoped grants to `CURRENT_USER` after the last `CREATE OR REPLACE` (both drop the grant), skipping `SYS` (Exasol refuses it). The credential-exposure scenario provisions a non-DBA owner; assertions target `EXPLAIN VIRTUAL` and errors only (profiling/audit `SQL_TEXT` never carry pushdown SQL, verified live).
 
 ## Scenarios
 
@@ -73,8 +74,18 @@ scenarios.
 * *AND* a single shared `common/e2e_harness` module defining the SLC install, the `.so` upload, the script creation, and the Virtual Schema creation
 * *WHEN* any binary's setup provisions the lakehouse VS scan path
 * *THEN* the binary SHALL install `LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and the adapter script from that shared definition, so the script DDL is byte-identical across every binary
+* *AND* the shared definition SHALL issue `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts to `CURRENT_USER` after the last `CREATE OR REPLACE` of either object (both drop the grant), skipping `SYS` (Exasol refuses it; DBA holds all CONNECTIONs implicitly)
 * *AND* the per-binary Virtual Schema properties that vary (VS name, Iceberg namespace, catalog CONNECTION name, `PARALLELISM_FACTOR`, `JOIN_BROADCAST_MAX_BYTES`) SHALL be supplied as explicit parameters rather than by re-declaring the provisioning logic
 * *AND* an end-to-end query through any binary's Virtual Schema SHALL return results identical to the single-node DataFusion equivalent, and the affected tests MUST fail (not skip) when the Exasol Docker container or MinIO is unavailable
+
+### Scenario: A least-privilege user queries the VS and recovers no credential from the plan
+
+* *GIVEN* a virtual schema OWNED by a non-DBA with both script-scoped grants, and a separate user with only `CREATE SESSION` and `SELECT` on the VS (no connection privilege, asserted absent)
+* *WHEN* the reader runs a query and `EXPLAIN VIRTUAL`
+* *THEN* the query returns the owner's rows; `EXPLAIN VIRTUAL` names the CONNECTION positively but contains neither `access_key` nor `secret_key` VALUES (asserted on values, not field-name spellings)
+* *AND* revoking the owner's scan grant denies the reader with a named error carrying no credential; granting only the READER (not the owner) also denies — the check reads the owner's grant
+* *AND* profiling/audit are NOT asserted (they never carry pushdown SQL, verified live)
+* *AND* the test MUST fail (not skip) when the stack is unavailable
 
 ### Scenario: Harness statements carry no row cap the test did not declare
 

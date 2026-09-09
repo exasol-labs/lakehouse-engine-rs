@@ -8,6 +8,7 @@ pub mod diagnostics;
 pub mod emit;
 pub mod positional_deletes;
 pub mod runtime;
+pub(crate) mod sealed;
 pub mod spec;
 
 use crate::scan::spec::ScanSpec;
@@ -32,6 +33,10 @@ mod object_store;
 pub(crate) use self::object_store::build_table_root_store;
 use object_store::build_session_context;
 pub(crate) use spec::reconstruct_abs_uri;
+
+mod storage_ref;
+pub use storage_ref::ResolvedScanStorage;
+use storage_ref::resolve_scan_storage;
 
 mod store_router;
 
@@ -226,6 +231,8 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // depends on spec.common.df_threads_per_udf. NULL in either argument is a user error.
     let spec = read_scan_spec(ctx)?;
 
+    let storage = resolve_scan_storage(&spec.common, ctx)?;
+
     let rt = build_scan_runtime(spec.common.df_threads_per_udf).map_err(UdfError::User)?;
 
     // Run this row's scan on the runtime and tear it down deterministically. The
@@ -234,7 +241,7 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
     // text); `run_on_runtime` drives shutdown via `shutdown_timeout` from this
     // synchronous context instead. Production builds the session via
     // `build_session_context`.
-    run_on_runtime(rt, run_scan_one(ctx, spec, build_session_context))
+    run_on_runtime(rt, run_scan_one(ctx, spec, &storage, build_session_context))
 }
 
 /// Scan exactly ONE reconstituted spec: build its session, dispatch, drop it.
@@ -253,11 +260,12 @@ pub fn run_scan(ctx: &mut dyn UdfContext) -> Result<(), UdfError> {
 pub async fn run_scan_one(
     ctx: &mut dyn UdfContext,
     spec: ScanSpec,
-    build_session: impl Fn(&ScanSpec, u64) -> Result<SessionContext, UdfError>,
+    storage: &ResolvedScanStorage,
+    build_session: impl Fn(&ScanSpec, &ResolvedScanStorage, u64) -> Result<SessionContext, UdfError>,
 ) -> Result<(), UdfError> {
     let memory_limit_bytes = ctx.memory_limit();
-    let session_ctx = build_session(&spec, memory_limit_bytes)?;
-    run_scan_dispatch(ctx, &session_ctx, &spec).await?;
+    let session_ctx = build_session(&spec, storage, memory_limit_bytes)?;
+    run_scan_dispatch(ctx, &session_ctx, &spec, storage).await?;
     // Drop this row's session (and its object store / any residual handles)
     // before returning — no async resource may outlive run_on_runtime's future.
     drop(session_ctx);
@@ -271,6 +279,7 @@ async fn run_scan_dispatch(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<(), UdfError> {
     // Phase telemetry: the startup clock starts at scan-body entry and is sealed
     // at the first batch fetch inside emit_stream. Always measured (monotonic-clock
@@ -290,14 +299,14 @@ async fn run_scan_dispatch(
         // the sharded fact side and the full dimension side in one session, join
         // node-locally, and stream joined batches. Takes precedence over the
         // aggregate/raw dispatch (the VS never combines a join with aggregates).
-        run_join_scan_with_session(ctx, session_ctx, spec, &mut timers).await
+        run_join_scan_with_session(ctx, session_ctx, spec, storage, &mut timers).await
     } else if spec.common.aggregates.is_some() {
         // Partial-aggregate paths emit a single summary row; phase telemetry
         // targets the raw-row streaming path where startup / import / send-back
         // are the throughput question. Leave the aggregate path unchanged.
-        run_partial_aggregate(ctx, session_ctx, spec).await
+        run_partial_aggregate(ctx, session_ctx, spec, storage).await
     } else {
-        run_raw_scan_with_session(ctx, session_ctx, spec, &mut timers).await
+        run_raw_scan_with_session(ctx, session_ctx, spec, storage, &mut timers).await
     };
 
     if result.is_ok() {

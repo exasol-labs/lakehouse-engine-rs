@@ -1,4 +1,5 @@
 use super::*;
+use crate::redaction::{redact_credentials, redact_secret_values};
 use crate::test_support::*;
 
 /// The four REST-catalog auth prop keys, for negative assertions.
@@ -313,6 +314,34 @@ fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
     assert!(
         !redacted.contains(SCOPE_SENTINEL),
         "scope must be redacted: {redacted}"
+    );
+}
+
+#[test]
+fn auth_error_sites_apply_the_value_pass_first() {
+    const SAS_SHAPED_TOKEN: &str = "sv=2023-11-03&sp=rwdlacx&sig=SIG_VALUE";
+
+    let mut creds = creds_no_auth();
+    creds.token = Some(SAS_SHAPED_TOKEN.into());
+
+    let raw = format!("upstream error echoed {SAS_SHAPED_TOKEN}");
+    let redacted = redact_catalog_auth_error(&raw, &creds);
+
+    assert!(
+        !redacted.contains(SAS_SHAPED_TOKEN),
+        "the whole token literal must be gone: {redacted}"
+    );
+    assert!(
+        !redacted.contains("sp=rwdlacx"),
+        "the permission field preceding `sig=` must not survive a label-first mangling: \
+         {redacted}"
+    );
+
+    let inverted = redact_secret_values(&redact_credentials(&raw), &[SAS_SHAPED_TOKEN]);
+    assert!(
+        inverted.contains("sp=rwdlacx"),
+        "the inverted composition is expected to leak the permission field, pinning that \
+         `redact_catalog_auth_error` no longer uses it: {inverted}"
     );
 }
 

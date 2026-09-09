@@ -29,6 +29,8 @@
 //!   per-row seam is byte-for-byte identical to the unchanged downstream
 //!   [`run_raw_scan_with_session`] path over the same spec.
 
+mod scan_fixture;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -43,11 +45,12 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ScanSpec, ScanStorage, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{
-    build_scan_runtime, read_scan_spec, run_raw_scan_with_session, run_scan_one,
-    session_config_for_spec,
+    ResolvedScanStorage, build_scan_runtime, read_scan_spec, run_raw_scan_with_session,
+    run_scan_one, session_config_for_spec,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -153,14 +156,14 @@ fn spec_for_file(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -246,14 +249,14 @@ fn nested_spec_for_file(file_url: String, emit_exa_types: Vec<String>) -> ScanSp
                 },
             ],
             emit_exa_types,
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -273,14 +276,14 @@ fn distinct_spec_for_file(file_url: String) -> ScanSpec {
             projection: vec!["CATEGORY".into()],
             distinct: true,
             emit_exa_types: vec!["VARCHAR(2000000)".into()],
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -300,7 +303,11 @@ fn row_for_spec(spec: &ScanSpec) -> Vec<Option<String>> {
 /// A local-file `SessionContext` builder injected in place of the production
 /// `build_session_context` (which requires an S3 bucket host). `file://` URLs
 /// resolve through DataFusion's default LocalFileSystem store — no S3 needed.
-fn local_session(spec: &ScanSpec, _memory_limit_bytes: u64) -> Result<SessionContext, UdfError> {
+fn local_session(
+    spec: &ScanSpec,
+    _storage: &ResolvedScanStorage,
+    _memory_limit_bytes: u64,
+) -> Result<SessionContext, UdfError> {
     Ok(SessionContext::new_with_config(session_config_for_spec(
         spec,
     )))
@@ -393,7 +400,13 @@ fn run_one_row(spec: &ScanSpec, built: &AtomicUsize) -> Vec<RecordBatch> {
     // production does — reading only columns 0 and 1, never calling ctx.next().
     let reconstituted = read_scan_spec(&ctx).expect("reconstitute row spec");
     let rt = counting_build_runtime(reconstituted.common.df_threads_per_udf, built);
-    let result = rt.block_on(run_scan_one(&mut ctx, reconstituted, local_session));
+    let storage = scan_fixture::resolved_storage(&reconstituted);
+    let result = rt.block_on(run_scan_one(
+        &mut ctx,
+        reconstituted,
+        &storage,
+        local_session,
+    ));
     result.expect("per-row scan");
     // Explicit, deterministic teardown of THIS call's runtime — the runtime is a
     // call-local value consumed here, never hoisted out of the per-row loop.
@@ -495,11 +508,18 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
     // with an equivalent local session.
     let reference = block_on(async {
         let mut ctx = RowCtx::new(row_for_spec(&spec));
-        let session = local_session(&spec, 0).expect("session");
+        let session =
+            local_session(&spec, &scan_fixture::resolved_storage(&spec), 0).expect("session");
         let mut timers = PhaseTimers::start();
-        run_raw_scan_with_session(&mut ctx, &session, &spec, &mut timers)
-            .await
-            .expect("reference raw scan");
+        run_raw_scan_with_session(
+            &mut ctx,
+            &session,
+            &spec,
+            &scan_fixture::resolved_storage(&spec),
+            &mut timers,
+        )
+        .await
+        .expect("reference raw scan");
         ctx.emitted
     });
 

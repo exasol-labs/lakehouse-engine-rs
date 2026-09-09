@@ -84,7 +84,6 @@ renders the retained ordering AND the retained final window itself.
   sort, declined wrapper, grouped merge, join wrapper — render through ONE shared seam, so
   they cannot drift. An expression sort key reuses that seam with the rendered expression in
   place of a quoted column identifier.
-* Credentials MUST NOT appear in any returned SQL string or error message.
 * A declined ordered shape may cause the adapter to emit extra hidden sort-key columns
   from the per-shard scan (see `vs-adapter/pushdown-planning-order-by-capability`).
   Those columns exist only to make the declined wrapper's outer `ORDER BY` resolvable;
@@ -162,3 +161,8 @@ renders the retained ordering AND the retained final window itself.
 * *AND* a non-empty `orderBy` whose elements ALL fail to render SHALL take that SAME decline, and MUST NOT be treated as "no ordering was pushed" and returned as unwrapped scan-driving SQL — the two cases are one rule, not two, because dropping every key is the same silent-wrong-order outcome as dropping one (see the reconciled zero-parsed-keys clause in `vs-adapter/pushdown-planning-order-by-capability`)
 * *AND* an ABSENT or EMPTY `orderBy` SHALL remain outside this scenario entirely: no ordering was pushed, so the adapter emits no wrapper and no `ORDER BY`
 * *AND* the decline SHALL be the ONLY alternative to a faithfully rendered ordering, so no reachable ordered shape can return a result that is both successful and silently unordered
+
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages

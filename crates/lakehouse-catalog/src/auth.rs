@@ -8,7 +8,7 @@
 
 use crate::ConnectionCreds;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
-use crate::redaction::{redact_credentials, redact_secret_values};
+use crate::redaction::redact_error_text;
 use exasol_udf_sdk::error::UdfError;
 use std::collections::HashMap;
 
@@ -90,7 +90,7 @@ pub(crate) fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> S
         secrets.push(scope.to_string());
     }
     let secret_refs: Vec<&str> = secrets.iter().map(String::as_str).collect();
-    redact_secret_values(&redact_credentials(msg), &secret_refs)
+    redact_error_text(msg, &secret_refs)
 }
 
 /// The catalog-auth strategy resolved once for a query, used to authenticate
@@ -156,8 +156,7 @@ async fn oauth2_client_credentials_grant(
     // Strip the client secret AND the obtained token from every error. The token
     // is not yet known at the point a transport/parse error is built, so it is
     // added to the redaction set after a successful parse before being returned.
-    let redact_secret =
-        |msg: &str| redact_secret_values(&redact_credentials(msg), &[client_secret]);
+    let redact_secret = |msg: &str| redact_error_text(msg, &[client_secret]);
 
     let mut form: Vec<(&str, &str)> = vec![
         ("grant_type", OAUTH2_GRANT_TYPE),

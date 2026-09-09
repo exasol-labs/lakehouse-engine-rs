@@ -22,6 +22,8 @@
 //! The no-network-HEAD behaviour of the production S3 wrapper is additionally
 //! unit-covered in `scan/mod.rs` (`SpecSizedObjectStore::get_opts`).
 
+mod scan_fixture;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -40,8 +42,8 @@ use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, StorageBackend,
-    StorageProps,
+    CommonScanSpec, DeleteMechanism, FileEntry, LogicalField, ScanSpec, ScanStorage,
+    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
     build_raw_scan_physical_plan, register_files, run_raw_scan_with_session,
@@ -266,7 +268,7 @@ fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
         common: CommonScanSpec {
             table_root,
             projection: vec!["ID".into(), "NAME".into()],
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -301,7 +303,7 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
         common: CommonScanSpec {
             table_root,
             projection: vec!["ID".into(), "NAME".into()],
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             logical_schema: vec![
                 LogicalField {
@@ -374,7 +376,7 @@ fn raw_spec_with_wide_logical_schema(
         common: CommonScanSpec {
             table_root,
             projection: vec!["ID".into(), "NAME".into()],
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             logical_schema: wide_logical_fields(columns),
             ..Default::default()
@@ -662,9 +664,15 @@ async fn run_scan_capturing_session(
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
     let mut ctx = FakeCtx::new();
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers)
-        .await
-        .expect("raw scan must succeed");
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        spec,
+        &scan_fixture::resolved_storage(spec),
+        &mut timers,
+    )
+    .await
+    .expect("raw scan must succeed");
     (ctx.emitted, session)
 }
 
@@ -1039,9 +1047,14 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
         .register_object_store(&Url::parse(&data_url).expect("register url"), store);
 
     block_on(async {
-        register_files(&session, "scan_target", &spec)
-            .await
-            .expect("register_files must succeed on the delete-carrying data file");
+        register_files(
+            &session,
+            "scan_target",
+            &spec,
+            &scan_fixture::resolved_storage(&spec),
+        )
+        .await
+        .expect("register_files must succeed on the delete-carrying data file");
         // STOP HERE: build the physical plan and go no further. Executing it
         // would add the opener's execute-time column reads to the same log,
         // which is the exact contamination this test exists to avoid.

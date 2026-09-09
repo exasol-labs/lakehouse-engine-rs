@@ -14,6 +14,8 @@
 //! `crate::scan::deletion_vectors`) against a temp-directory copy of the vendored
 //! bytes, so nothing here mutates the checked-in fixture.
 
+mod scan_fixture;
+
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -31,7 +33,7 @@ use exasol_udf_sdk::value::Value;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, DeleteMechanism, DeltaDeletionVectorStorage, FileEntry, ScanSpec,
+    CommonScanSpec, DeleteMechanism, DeltaDeletionVectorStorage, FileEntry, ScanSpec, ScanStorage,
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{register_files, run_raw_scan_with_session, session_config_for_spec};
@@ -181,7 +183,7 @@ fn scan_spec(
             projection: vec!["VALUE".into()],
             filter,
             limit,
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -264,7 +266,14 @@ async fn try_run_scan_with_store(
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
     let mut ctx = FakeCtx::new();
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers).await?;
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        spec,
+        &scan_fixture::resolved_storage(spec),
+        &mut timers,
+    )
+    .await?;
     Ok(ctx.emitted)
 }
 
@@ -569,9 +578,14 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
             &Url::parse(&file_url(&data_path)).expect("register url"),
             Arc::new(LocalFileSystem::new()),
         );
-        register_files(&session, "scan_target", &agg_spec)
-            .await
-            .expect("register_files must succeed");
+        register_files(
+            &session,
+            "scan_target",
+            &agg_spec,
+            &scan_fixture::resolved_storage(&agg_spec),
+        )
+        .await
+        .expect("register_files must succeed");
         let df = session
             .sql("SELECT COUNT(*) AS c FROM scan_target")
             .await
@@ -799,6 +813,7 @@ fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
             &mut ctx,
             &session,
             &spec,
+            &scan_fixture::resolved_storage(&spec),
             &mut timers,
         ))
         .expect_err(&format!("{label} must be refused, not applied"));

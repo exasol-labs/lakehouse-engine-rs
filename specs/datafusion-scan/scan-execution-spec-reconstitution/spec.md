@@ -7,9 +7,9 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 ## Background
 
 * The scan UDF's first argument is the shard-invariant common spec (projection, filter,
-  limit, aggregates, group keys, logical schema, EMITS types, storage credentials, the
-  table root, and tuning knobs), serialized once per fan-out; the second argument is
-  this shard's file list. See `datafusion-scan/scan-execution` for the scan behavior once the
+  limit, aggregates, group keys, logical schema, EMITS types, a storage reference the
+  UDF resolves itself, the table root, and tuning knobs), serialized once per fan-out;
+  the second argument is this shard's file list. See `datafusion-scan/scan-execution` for the scan behavior once the
   spec is merged.
 * The per-shard file list is a JSON array of compact `[path, size]` 2-tuples, where `path` is
   either relative to the common spec's table root or an absolute URI, and `size` is the file's
@@ -80,6 +80,10 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * **There is still no cross-version wire-compatibility requirement** — one `.so` produces and consumes
   the spec within one deploy. The neutral wire shape is chosen for Iceberg-side byte identity, not for
   reading a spec written by an older build.
+* **This delta is issue #135. It amends ONE scenario and changes no reconstitution rule.** The two-argument contract, the per-shard `[path, size]` encoding, the positional-delete 3-tuple encoding, the legacy-entry defaulting, the neutral partition values, and the no-catalog-block rule are all UNCHANGED. What changes is what the `storage` value holds.
+* **The `storage` value now carries a further enclosing wrapper whose reference variant holds no backend at all**, specified by `vs-adapter/scan-spec-credential-reference`, which this feature CITES.
+* **A common blob carrying no join block is NO LONGER byte-identical to its pre-change encoding: its `storage` value gains the wrapper.** Every committed golden common-blob fixture for a non-join spec that carries a `storage` value is regenerated; the six `empty_*` fixtures carry no `storage` value at all and stay byte-identical.
+* **The per-shard files-list argument is still byte-identical**, because `storage` is shard-invariant and appears only in the common blob.
 
 ## Scenarios
 
@@ -107,9 +111,9 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 * *GIVEN* a `ScanSpec` whose shard-invariant fields are held in one embedded `CommonScanSpec` value and whose only own field beside it is the per-shard `files` list
 * *WHEN* the adapter serializes the shard-invariant common blob (UDF argument 0) and the per-shard files list (UDF argument 1)
 * *THEN* the common-blob JSON SHALL carry every shard-invariant field at the top level, byte-identical to the pre-consolidation encoding EXCEPT for the `storage` value and, when a join block is present, that block's own `storage` value, and MUST NOT contain a `files` key or a `catalog` key
-* *AND* the `storage` value SHALL be the externally-tagged storage-backend encoding specified by `vs-adapter/storage-backend-enum`, whose tagged payload is itself byte-identical to the pre-consolidation `storage` object, so the variant tag is the ONLY difference from the pre-consolidation common blob
-* *AND* the join block's `storage` value SHALL use that SAME externally-tagged encoding and SHALL be a REQUIRED key of the join block, so a join block serialized without it fails to deserialize instead of defaulting to the whole-spec value
-* *AND* a common blob carrying NO join block SHALL be byte-identical to its pre-change encoding, so every committed golden common-blob fixture for a non-join spec passes unedited
+* *AND* the `storage` value SHALL be the externally-tagged scan-spec storage WRAPPER specified by `vs-adapter/scan-spec-credential-reference` — a `connection` reference variant carrying a name and `allow_http` and no credential; a `sealed` variant carrying a connection name and the base64 nonce-plus-AES-GCM-ciphertext of the externally-tagged storage-backend encoding of `vs-adapter/storage-backend-enum`, which is byte-identical to the pre-consolidation `storage` object once unsealed; or an `inline` variant whose payload is that same backend encoding in plaintext, emitted by no adapter path and accepted for host-test spec construction
+* *AND* the join block's `storage` value SHALL use that SAME wrapper encoding and SHALL be a REQUIRED key of the join block, so a join block serialized without it fails to deserialize instead of defaulting to the whole-spec value
+* *AND* a common blob carrying NO join block SHALL be byte-identical to its pre-change encoding EXCEPT for the `storage` value's wrapper, so a committed golden common-blob fixture for a non-join spec passes unedited only when it carries no `storage` value and is REGENERATED when it does
 * *AND* the per-shard files-list JSON SHALL be byte-identical to the pre-consolidation encoding, because `storage` is shard-invariant and appears only in the common blob
 * *AND* `from_parts_json` over the two arguments SHALL reconstitute a `ScanSpec` value equal to the one the pre-consolidation two-argument contract produced for the same shard, with the storage backend in place of the bare storage props
 * *AND* `files` SHALL remain the sole per-shard field, now guaranteed structurally by the single embedded common value rather than by a field-by-field copy

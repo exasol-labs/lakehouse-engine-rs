@@ -55,7 +55,7 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 
 With `CATALOG_KIND` absent (Iceberg REST, the default), `warehouse` is always required. If you turn `use_sigv4` on, `region`, `access_key`, and `secret_key` become required instead. These three fields sign the catalog request, and `endpoint` stays optional. If you turn `use_vended_credentials` on without SigV4, you can omit all static S3 fields. The catalog then vends short-lived credentials from `load_table`. Under `CATALOG_KIND = 'UNITY_CATALOG'`, the same static-vs-vended S3 field choice applies, but `warehouse` is never required.
 
-Credential values never appear in error messages, logs, or debug output. They travel to the scan UDF inside the per-query scan spec. The adapter never stores them in Virtual Schema properties.
+Credential values never appear in error messages, logs, or debug output. The per-query scan spec carries a REFERENCE to the CONNECTION (its name) for a static credential, and an AES-GCM-sealed envelope for a vended one — no credential value travels in the scan spec itself. The adapter never stores them in Virtual Schema properties. See [Security](security.md) for the CONNECTION-access privilege model this relies on, and for exactly what a `SELECT`-only Virtual Schema user can and cannot read back.
 
 The Virtual Schema then names the CONNECTION. [Install: Point the VS at your data](install.md#point-the-vs-at-your-data) and [Tuning](tuning.md) document its properties: `CATALOG_KIND`, `NAMESPACE`, `ALLOW_HTTP`, and the tuning properties. This page repeats only the properties that every recipe needs.
 

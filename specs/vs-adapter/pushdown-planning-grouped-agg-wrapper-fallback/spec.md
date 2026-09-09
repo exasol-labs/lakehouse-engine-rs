@@ -91,7 +91,6 @@ decline paths narrow identically.
   routes to; it reads no manifest, resolves no snapshot or field id, applies no delete, and
   maps no type. No normative requirement applies, so there is no deviation to fix and none
   to track.
-* Credentials MUST NOT appear in any returned SQL or error message.
 
 ## Scenarios
 
@@ -132,3 +131,8 @@ decline paths narrow identically.
 * *AND* because the shape decision is owned by that one classifier, the fully-pruned zero-row path SHALL return the wrapper-shaped typed empty result for the same request, never an error
 * *AND* the returned result SHALL equal the same grouped query with the same `ORDER BY` evaluated over all rows on a single node
 * *AND* this route SHALL be recorded as a deliberate, named trade rather than an unstated gap: the request loses partial/merge decomposition and materializes its referenced columns through Exasol, which is why an aggregate the select list ALREADY carries keeps the partial/merge path per the scenario above; a bounded partial/merge variant for the not-selected case is tracked as future work, `(#249)`
+
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages

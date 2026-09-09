@@ -95,5 +95,5 @@ This is the type-mapping layer's structural feature, the sibling of `vs-adapter/
 * *WHEN* the suites run against the refactored code
 * *THEN* every test MUST pass with no change to any test assertion or expected value, and the only permitted test edits are the module a relocated test lives in and the import path it names
 * *AND* the Exasol type string returned by `arrow_to_exasol_type`, `iceberg_type_to_exasol`, `exasol_type_from_json`, and `sum_emit_type` MUST be byte-identical to the pre-refactor output for every input any producer in this repo emits
-* *AND* the `createVirtualSchema` column `dataType` JSON and the scan-driving SQL generated for a given pushdown request MUST each be byte-identical to the pre-refactor output
+* *AND* the `createVirtualSchema` column `dataType` JSON MUST be byte-identical to the pre-refactor output, and the scan-driving SQL generated for a given pushdown request MUST be byte-identical to it EXCEPT for the scan-spec `storage` value, which this refactor does not touch and which `vs-adapter/storage-backend-enum` re-encodes as a tagged backend variant and `vs-adapter/scan-spec-credential-reference` then replaces with a connection reference or a sealed envelope
 * *AND* the public API of the crate SHALL gain exactly two items — `ExaTypeClass` and `classify_exa_type` — and SHALL lose none

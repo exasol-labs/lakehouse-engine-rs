@@ -1883,3 +1883,48 @@ fn resolve_s3_max_connections_auto_zero_cores_defaults() {
         "0-cores fallback ignores the instance share"
     );
 }
+
+struct PasswordCtx(String);
+
+impl UdfContext for PasswordCtx {
+    fn num_columns(&self) -> usize {
+        0
+    }
+    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
+        Err(UdfError::Type("none".into()))
+    }
+    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
+        Ok(())
+    }
+    fn next(&mut self) -> Result<bool, UdfError> {
+        Ok(false)
+    }
+    fn connection(
+        &self,
+        _name: &str,
+    ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
+        Ok(exasol_udf_sdk::connect_back::ConnectionObject {
+            kind: "PASSWORD".into(),
+            address: "http://catalog.example.com".into(),
+            user: String::new(),
+            password: self.0.clone(),
+        })
+    }
+}
+
+fn resolved_for(password: Json) -> ResolvedConnectionConfig {
+    resolve_connection_config(
+        &PasswordCtx(password.to_string()),
+        &serde_json::json!({"CATALOG_CONNECTION": "MY_CONN"}),
+    )
+    .expect("the fixture password must be an acceptable CONNECTION")
+}
+
+#[test]
+fn resolved_config_carries_the_catalog_connection_name() {
+    let config = resolved_for(serde_json::json!({
+        "warehouse": "wh", "region": "us-east-1",
+        "access_key": "AK", "secret_key": "SK",
+    }));
+    assert_eq!(config.connection_name, "MY_CONN");
+}

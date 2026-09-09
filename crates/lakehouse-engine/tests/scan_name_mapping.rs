@@ -21,6 +21,8 @@
 //!    `name_mapping` is empty and the physical name already equals the current
 //!    logical name.
 
+mod scan_fixture;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -32,8 +34,8 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, StorageBackend,
-    StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage,
+    StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
 use object_store::local::LocalFileSystem;
@@ -161,7 +163,7 @@ fn name_mapping_spec(
             projection: vec!["ID".into(), "NEW_COL".into()],
             logical_schema,
             name_mapping,
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -218,9 +220,15 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
     );
     let mut ctx = FakeCtx::new();
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers)
-        .await
-        .expect("raw scan must succeed");
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        spec,
+        &scan_fixture::resolved_storage(spec),
+        &mut timers,
+    )
+    .await
+    .expect("raw scan must succeed");
     ctx.emitted
 }
 

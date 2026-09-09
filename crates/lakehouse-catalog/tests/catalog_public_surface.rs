@@ -27,9 +27,9 @@ use lakehouse_catalog::{
     AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogProps, CatalogSession,
     CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
     IcebergRestCatalogClient, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend,
-    StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth,
-    parse_table_ident, redact_credentials, redact_secret_values, resolve_uc_vended_storage,
-    resolve_vended_storage,
+    StorageCreds, StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
+    load_table_any_auth, parse_table_ident, redact_credentials, redact_secret_values,
+    resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 /// Every production `.rs` source file under `crates/lakehouse-catalog/src/`

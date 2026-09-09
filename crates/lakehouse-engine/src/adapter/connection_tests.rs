@@ -1,5 +1,6 @@
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
+use crate::scan::spec::{AdlsCred, StorageProps};
 use exasol_udf_sdk::connect_back::ConnectionObject;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::Value;
@@ -1279,4 +1280,36 @@ fn unity_connection_reuses_existing_auth_fields() {
     assert_eq!(resolved.creds.token, None);
     assert_eq!(resolved.creds.client_id, None);
     assert_eq!(resolved.creds.client_secret, None);
+}
+
+#[test]
+fn sealing_key_is_absent_for_a_password_carrying_no_secret_field_at_the_read_connection_boundary() {
+    let keyless = serde_json::json!({"warehouse": "wh"}).to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &keyless);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("a warehouse-only password is an acceptable CONNECTION");
+    assert_eq!(
+        resolved.creds.warehouse, "wh",
+        "positive control: the CONNECTION must actually have resolved"
+    );
+    assert!(
+        resolved.sealed_storage_key.is_none(),
+        "a password holding only a warehouse carries no key material, so no key \
+         may exist on the Resolved value at all"
+    );
+
+    let with_secret = serde_json::json!({
+        "warehouse": "wh",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+    })
+    .to_string();
+    let ctx = StubCtx::with_conn("http://catalog.example.com", &with_secret);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("the installer's own default template shape must be accepted");
+    assert!(
+        resolved.sealed_storage_key.is_some(),
+        "a non-empty secret_key is key material, so the boundary must derive a key"
+    );
 }

@@ -986,7 +986,11 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
 
     let batches = block_on(async {
         let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
-        register_files(&ctx, "scan_target", &spec)
+        let storage = crate::scan::ResolvedScanStorage::from_backends(
+            crate::scan::spec::StorageBackend::S3(Default::default()),
+            None,
+        );
+        register_files(&ctx, "scan_target", &spec, &storage)
             .await
             .expect("the void table registers");
         let plan = build_raw_scan_physical_plan(&ctx, &spec)

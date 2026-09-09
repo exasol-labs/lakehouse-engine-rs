@@ -56,6 +56,10 @@ pub fn redact_credentials(s: &str) -> String {
         "azure_storage_access_key",
         "azure_storage_sas_key",
         "sig=",
+        // Include the trailing quote in the label so the end-of-value scan
+        // reaches into the quote-delimited value. A bare `sas` pattern would
+        // over-match unrelated prose.
+        "\"sas\":\"",
     ];
     const REDACTED: &str = "[REDACTED]";
     let mut result = s.to_string();
