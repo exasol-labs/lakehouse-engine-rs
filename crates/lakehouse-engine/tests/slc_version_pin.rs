@@ -65,20 +65,25 @@ fn workspace_manifest_pins_the_sdk_version_scrapers_can_read() {
 
 #[test]
 fn engine_manifest_inherits_the_sdk_pin_instead_of_restating_it() {
-    for dep_name in ["exasol-udf-sdk", "exasol-udf-macros"] {
+    // exasol-udf-sdk is declared twice by design: once in [dependencies] and
+    // once in [dev-dependencies] (to add the `test-support` feature for unit
+    // and integration tests). exasol-udf-macros stays [dependencies]-only.
+    for (dep_name, expected_count) in [("exasol-udf-sdk", 2), ("exasol-udf-macros", 1)] {
         let declarations = declaration_lines(ENGINE_MANIFEST, dep_name);
 
         assert_eq!(
             declarations.len(),
-            1,
-            "the engine manifest must declare `{dep_name}` exactly once. Found: {declarations:?}"
+            expected_count,
+            "the engine manifest must declare `{dep_name}` exactly {expected_count} time(s). Found: {declarations:?}"
         );
-        assert!(
-            declarations[0].contains("workspace = true"),
-            "inherit `{dep_name}` with `{{ workspace = true }}`, never restate a literal version: \
-             Cargo silently unifies to the higher requirement within a minor line, and resolves \
-             two SDK copies into one cdylib across minor lines. Found: {:?}",
-            declarations[0]
-        );
+        for declaration in &declarations {
+            assert!(
+                declaration.contains("workspace = true"),
+                "inherit `{dep_name}` with `{{ workspace = true }}`, never restate a literal version: \
+                 Cargo silently unifies to the higher requirement within a minor line, and resolves \
+                 two SDK copies into one cdylib across minor lines. Found: {:?}",
+                declaration
+            );
+        }
     }
 }

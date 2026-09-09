@@ -1,9 +1,10 @@
 use super::*;
+use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 
 #[test]
 fn dispatch_get_capabilities() {
     let req = serde_json::json!({"type": "getCapabilities"});
-    let resp = dispatch(&mut NoopCtx, &req).unwrap();
+    let resp = dispatch(&mut DefaultsCtx, &req).unwrap();
     assert_eq!(resp["type"].as_str().unwrap(), "getCapabilities");
     let caps = resp["capabilities"].as_array().unwrap();
     assert!(!caps.is_empty());
@@ -12,14 +13,14 @@ fn dispatch_get_capabilities() {
 #[test]
 fn dispatch_drop_returns_correct_type() {
     let req = serde_json::json!({"type": "dropVirtualSchema"});
-    let resp = dispatch(&mut NoopCtx, &req).unwrap();
+    let resp = dispatch(&mut DefaultsCtx, &req).unwrap();
     assert_eq!(resp["type"].as_str().unwrap(), "dropVirtualSchema");
 }
 
 #[test]
 fn dispatch_unknown_type_errors() {
     let req = serde_json::json!({"type": "unsupported"});
-    let err = dispatch(&mut NoopCtx, &req).unwrap_err();
+    let err = dispatch(&mut DefaultsCtx, &req).unwrap_err();
     assert!(err.to_string().contains("unsupported"));
 }
 
@@ -34,8 +35,8 @@ fn refresh_and_set_properties_dispatched_not_unsupported() {
             "type": req_type,
             "properties": { PROP_CATALOG_CONNECTION: "no_such_conn" },
         });
-        let err =
-            dispatch(&mut NoopCtx, &req).expect_err("no live catalog is available in a unit test");
+        let err = dispatch(&mut DefaultsCtx, &req)
+            .expect_err("no live catalog is available in a unit test");
         assert!(
             !err.to_string().contains("unsupported"),
             "{req_type} must not be rejected as an unsupported request type, got: {err}"
@@ -116,42 +117,33 @@ fn merge_set_properties_new_wins_and_null_unsets() {
     assert_eq!(nonempty_str(&merged, "CATALOG_CONNECTION"), Some("keep_me"));
 }
 
-// Stub UdfContext whose `connection()` resolves successfully, so a
-// `setProperties` dispatch can pass connection resolution and reach the
-// downstream required-property check instead of failing earlier on a
-// missing/unresolvable CONNECTION.
-struct ConnResolvingCtx;
-impl UdfContext for ConnResolvingCtx {
-    fn num_columns(&self) -> usize {
-        0
+// A `PASSWORD`-kind CONNECTION carrying the given address and password, for
+// registering under `MY_CONN` on a `TestContext` so `connection()` resolves
+// successfully instead of failing on a missing/unresolvable CONNECTION.
+fn password_connection(
+    address: &str,
+    password: impl Into<String>,
+) -> exasol_udf_sdk::connect_back::ConnectionObject {
+    exasol_udf_sdk::connect_back::ConnectionObject {
+        kind: "PASSWORD".into(),
+        address: address.into(),
+        user: String::new(),
+        password: password.into(),
     }
-    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
-        Err(UdfError::Type("none".into()))
-    }
-    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
-        Ok(())
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        Ok(false)
-    }
-    fn connection(
-        &self,
-        _name: &str,
-    ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
-        Ok(exasol_udf_sdk::connect_back::ConnectionObject {
-            kind: "PASSWORD".into(),
-            address: "http://catalog.example.com".into(),
-            user: String::new(),
-            password: serde_json::json!({
-                "warehouse": "wh",
-                "endpoint": "http://s3.example.com",
-                "region": "us-east-1",
-                "access_key": "AKID",
-                "secret_key": "SECRET",
-            })
-            .to_string(),
-        })
-    }
+}
+
+// A static-token-free S3-style credential payload valid under EITHER catalog
+// kind (see `validate_creds`: `warehouse` is required only under
+// `IcebergRest`).
+fn s3_style_password() -> String {
+    serde_json::json!({
+        "warehouse": "wh",
+        "endpoint": "http://s3.example.com",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+    })
+    .to_string()
 }
 
 /// [human-requested, PR #153 review, adversarial-review finding A2] A
@@ -177,8 +169,14 @@ fn set_properties_null_unset_required_property_errors_not_panic() {
         },
     });
 
-    let err = dispatch(&mut ConnResolvingCtx, &req)
-        .expect_err("null-unsetting a required property must error, not succeed");
+    let err = dispatch(
+        &mut TestContext::scalar(vec![]).with_connection(
+            "MY_CONN",
+            password_connection("http://catalog.example.com", s3_style_password()),
+        ),
+        &req,
+    )
+    .expect_err("null-unsetting a required property must error, not succeed");
 
     let expected = format!("property '{PROP_NAMESPACE}' is required");
     assert!(
@@ -203,7 +201,14 @@ fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
         },
     });
 
-    let err = dispatch(&mut ConnResolvingCtx, &req).expect_err(
+    let err = dispatch(
+        &mut TestContext::scalar(vec![]).with_connection(
+            "MY_CONN",
+            password_connection("http://catalog.example.com", s3_style_password()),
+        ),
+        &req,
+    )
+    .expect_err(
         "supplying only the old ICEBERG_NAMESPACE alias must not satisfy the NAMESPACE requirement",
     );
 
@@ -214,63 +219,10 @@ fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
     );
 }
 
-// Minimal UdfContext for dispatch tests that need no I/O. Its `node_count()`
-// uses the trait default (0), exercising the `0 → 1` topology fallback.
-struct NoopCtx;
-impl UdfContext for NoopCtx {
-    fn num_columns(&self) -> usize {
-        0
-    }
-    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
-        Err(UdfError::Type("none".into()))
-    }
-    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
-        Ok(())
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        Ok(false)
-    }
-}
-
-// A CONNECTION that resolves successfully, carrying a static-token-free S3-style
-// credential payload valid under EITHER catalog kind (see `validate_creds`:
-// `warehouse` is required only under `IcebergRest`), and an address that is a
-// closed local port — a connection refused, no DNS, no hang — so a request that
-// reaches catalog resolution fails fast, deterministically, on the FIRST call
-// the resolved kind's client makes.
-struct ClosedPortConnCtx;
-impl UdfContext for ClosedPortConnCtx {
-    fn num_columns(&self) -> usize {
-        0
-    }
-    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
-        Err(UdfError::Type("none".into()))
-    }
-    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
-        Ok(())
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        Ok(false)
-    }
-    fn connection(
-        &self,
-        _name: &str,
-    ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
-        Ok(exasol_udf_sdk::connect_back::ConnectionObject {
-            kind: "PASSWORD".into(),
-            address: "http://127.0.0.1:1".into(),
-            user: String::new(),
-            password: serde_json::json!({
-                "warehouse": "wh",
-                "endpoint": "http://s3.example.com",
-                "region": "us-east-1",
-                "access_key": "AKID",
-                "secret_key": "SECRET",
-            })
-            .to_string(),
-        })
-    }
-}
+// An address that is a closed local port — a connection refused, no DNS, no
+// hang — so a request that reaches catalog resolution fails fast,
+// deterministically, on the FIRST call the resolved kind's client makes.
+const CLOSED_PORT_ADDRESS: &str = "http://127.0.0.1:1";
 
 /// A pushdown request under `CATALOG_KIND: UNITY_CATALOG` is planned as a Delta
 /// scan: it reaches the SAME resolver the Iceberg path reaches — no early
@@ -299,8 +251,14 @@ fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
         },
     });
 
-    let err = dispatch(&mut ClosedPortConnCtx, &req)
-        .expect_err("no live Unity Catalog is reachable in a unit test");
+    let err = dispatch(
+        &mut TestContext::scalar(vec![]).with_connection(
+            "MY_CONN",
+            password_connection(CLOSED_PORT_ADDRESS, s3_style_password()),
+        ),
+        &req,
+    )
+    .expect_err("no live Unity Catalog is reachable in a unit test");
 
     let message = err.to_string();
     assert!(
@@ -317,36 +275,13 @@ fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
     );
 }
 
-// Like `NoopCtx` but with a configurable `node_count()`, so tests can drive
-// both the `0 → default 1` fallback and a `> 1` real-cluster pass-through.
-struct StubCtx {
-    node_count: u32,
-}
-impl UdfContext for StubCtx {
-    fn num_columns(&self) -> usize {
-        0
-    }
-    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
-        Err(UdfError::Type("none".into()))
-    }
-    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
-        Ok(())
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        Ok(false)
-    }
-    fn node_count(&self) -> u32 {
-        self.node_count
-    }
-}
-
 #[test]
 fn cluster_nodes_from_context_defaults_to_one_when_node_count_zero() {
     // A context reporting node_count() == 0 (no live handshake — the trait
-    // default, as on NoopCtx) maps to 1.
-    assert_eq!(cluster_nodes_from_context(&NoopCtx), 1usize);
+    // default, as on DefaultsCtx) maps to 1.
+    assert_eq!(cluster_nodes_from_context(&DefaultsCtx), 1usize);
     assert_eq!(
-        cluster_nodes_from_context(&StubCtx { node_count: 0 }),
+        cluster_nodes_from_context(&TestContext::scalar(vec![]).with_node_count(0)),
         1usize
     );
 }
@@ -356,7 +291,7 @@ fn cluster_nodes_from_context_passes_through_reported_node_count() {
     // A live cluster reporting node_count() == N (> 1) is passed through
     // verbatim, widened to usize.
     assert_eq!(
-        cluster_nodes_from_context(&StubCtx { node_count: 4 }),
+        cluster_nodes_from_context(&TestContext::scalar(vec![]).with_node_count(4)),
         4usize
     );
 }
@@ -1884,40 +1819,13 @@ fn resolve_s3_max_connections_auto_zero_cores_defaults() {
     );
 }
 
-struct PasswordCtx(String);
-
-impl UdfContext for PasswordCtx {
-    fn num_columns(&self) -> usize {
-        0
-    }
-    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
-        Err(UdfError::Type("none".into()))
-    }
-    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
-        Ok(())
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        Ok(false)
-    }
-    fn connection(
-        &self,
-        _name: &str,
-    ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
-        Ok(exasol_udf_sdk::connect_back::ConnectionObject {
-            kind: "PASSWORD".into(),
-            address: "http://catalog.example.com".into(),
-            user: String::new(),
-            password: self.0.clone(),
-        })
-    }
-}
-
 fn resolved_for(password: Json) -> ResolvedConnectionConfig {
-    resolve_connection_config(
-        &PasswordCtx(password.to_string()),
-        &serde_json::json!({"CATALOG_CONNECTION": "MY_CONN"}),
-    )
-    .expect("the fixture password must be an acceptable CONNECTION")
+    let ctx = TestContext::scalar(vec![]).with_connection(
+        "MY_CONN",
+        password_connection("http://catalog.example.com", password.to_string()),
+    );
+    resolve_connection_config(&ctx, &serde_json::json!({"CATALOG_CONNECTION": "MY_CONN"}))
+        .expect("the fixture password must be an acceptable CONNECTION")
 }
 
 #[test]
@@ -1927,4 +1835,50 @@ fn resolved_config_carries_the_catalog_connection_name() {
         "access_key": "AK", "secret_key": "SK",
     }));
     assert_eq!(config.connection_name, "MY_CONN");
+}
+
+/// Regression gate for the SDK 0.24.0 test-double migration: no file under
+/// `src/adapter/` (recursively) may hand-roll a `UdfContext` trait
+/// implementation, spelled either bare (`UdfContext`) or fully qualified
+/// (`exasol_udf_sdk::context::UdfContext`). Every adapter test double must
+/// come from `exasol_udf_sdk::test_support` instead.
+///
+/// The needles are assembled at runtime, not written as one contiguous
+/// literal, so this gate's own source does not trip its own assertion when it
+/// scans the file it lives in.
+#[test]
+fn no_hand_rolled_udf_context_in_adapter_tests() {
+    fn collect_rust_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut out = Vec::new();
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{dir:?} must be readable: {e}"))
+        {
+            let path = entry.expect("directory entry must be readable").path();
+            if path.is_dir() {
+                out.extend(collect_rust_files(&path));
+            } else if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+                out.push(path);
+            }
+        }
+        out
+    }
+
+    let adapter_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/adapter");
+    let files = collect_rust_files(&adapter_dir);
+    assert!(
+        !files.is_empty(),
+        "expected to find .rs files under {adapter_dir:?}"
+    );
+
+    let bare_needle = format!("impl{}", " UdfContext for");
+    let qualified_needle = format!("impl{}", " exasol_udf_sdk::context::UdfContext for");
+
+    for path in files {
+        let contents = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{path:?} must be readable: {e}"));
+        assert!(
+            !contents.contains(&bare_needle) && !contents.contains(&qualified_needle),
+            "{path:?} hand-rolls a UdfContext impl; use exasol_udf_sdk::test_support doubles instead"
+        );
+    }
 }

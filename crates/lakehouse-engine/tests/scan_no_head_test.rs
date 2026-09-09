@@ -35,9 +35,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::context::SessionContext;
-use exasol_udf_sdk::context::UdfContext;
-use exasol_udf_sdk::error::UdfError;
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::test_support::TestContext;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
@@ -65,59 +63,6 @@ use url::Url;
 /// here since this integration test cannot import a `pub(crate)` item).
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
-
-/// A fake `UdfContext` serving one input row and decoding every emitted Arrow IPC
-/// batch — the same capture pattern the sibling two-arg integration test uses.
-struct FakeCtx {
-    served: bool,
-    emitted: Vec<RecordBatch>,
-}
-
-impl FakeCtx {
-    fn new() -> Self {
-        Self {
-            served: false,
-            emitted: Vec::new(),
-        }
-    }
-}
-
-impl UdfContext for FakeCtx {
-    fn num_columns(&self) -> usize {
-        0
-    }
-    fn get(&self, _col: usize) -> Result<&Value, UdfError> {
-        Err(UdfError::User("FakeCtx has no input columns".into()))
-    }
-    fn get_string(&self, _col: usize) -> Result<Option<&str>, UdfError> {
-        Ok(None)
-    }
-    fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
-        Err(UdfError::User("raw path must use emit_batch".into()))
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        if self.served {
-            Ok(false)
-        } else {
-            self.served = true;
-            Ok(true)
-        }
-    }
-    fn debug_level(&self) -> tracing::Level {
-        tracing::Level::INFO
-    }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), UdfError> {
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-        let reader = StreamReader::try_new(Cursor::new(ipc), None)
-            .map_err(|e| UdfError::User(format!("ipc decode: {e}")))?;
-        for batch in reader {
-            let batch = batch.map_err(|e| UdfError::User(format!("ipc batch: {e}")))?;
-            self.emitted.push(batch);
-        }
-        Ok(())
-    }
-}
 
 /// Shared HEAD-lookup counters observed from outside a registered store.
 #[derive(Clone, Debug, Default)]
@@ -662,7 +607,7 @@ async fn run_scan_capturing_session(
     session
         .runtime_env()
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
-    let mut ctx = FakeCtx::new();
+    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(
         &mut ctx,
@@ -673,7 +618,7 @@ async fn run_scan_capturing_session(
     )
     .await
     .expect("raw scan must succeed");
-    (ctx.emitted, session)
+    (ctx.into_batches(), session)
 }
 
 fn rows_of(batches: &[RecordBatch]) -> Vec<(i64, String)> {
