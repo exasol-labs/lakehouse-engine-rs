@@ -167,9 +167,6 @@ const STORAGE_SESSION_TOKEN: &str = "projected-session-token";
 const AZURE_ACCOUNT: &str = "projectedaccount";
 const AZURE_ACCOUNT_KEY: &str = "projected-account-key";
 const AZURE_SAS_TOKEN: &str = "projected-sas-token";
-const OAUTH2_SERVER_URI: &str = "https://idp.example.com/token";
-const OAUTH2_SCOPE: &str = "catalog-scope";
-
 fn s3_storage_creds() -> StorageCreds {
     StorageCreds {
         endpoint: STORAGE_ENDPOINT.into(),
@@ -191,28 +188,6 @@ fn s3_backend(allow_http: bool) -> StorageBackend {
         session_token: Some(STORAGE_SESSION_TOKEN.into()),
         allow_http,
         path_style: true,
-    })
-}
-
-fn password_carrying_every_field() -> serde_json::Value {
-    serde_json::json!({
-        "endpoint": STORAGE_ENDPOINT,
-        "region": STORAGE_REGION,
-        "access_key": STORAGE_AK,
-        "secret_key": STORAGE_SK,
-        "session_token": STORAGE_SESSION_TOKEN,
-        "path_style": false,
-        "account_name": AZURE_ACCOUNT,
-        "account_key": AZURE_ACCOUNT_KEY,
-        "sas_token": AZURE_SAS_TOKEN,
-        "warehouse": "warehouse",
-        "use_sigv4": true,
-        "use_vended_credentials": true,
-        "token": TOKEN,
-        "client_id": CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "oauth2_server_uri": OAUTH2_SERVER_URI,
-        "scope": OAUTH2_SCOPE,
     })
 }
 
