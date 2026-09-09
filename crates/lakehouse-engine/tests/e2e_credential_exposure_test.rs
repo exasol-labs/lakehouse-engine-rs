@@ -25,11 +25,21 @@ fn serial() -> MutexGuard<'static, ()> {
 }
 
 fn owner_conn() -> ExaConn {
-    ExaConn::connect(&exasol_host(), exasol_sql_port(), OWNER_USER, OWNER_PASSWORD)
+    ExaConn::connect(
+        &exasol_host(),
+        exasol_sql_port(),
+        OWNER_USER,
+        OWNER_PASSWORD,
+    )
 }
 
 fn reader_conn() -> ExaConn {
-    ExaConn::connect(&exasol_host(), exasol_sql_port(), READER_USER, READER_PASSWORD)
+    ExaConn::connect(
+        &exasol_host(),
+        exasol_sql_port(),
+        READER_USER,
+        READER_PASSWORD,
+    )
 }
 
 fn vs_table() -> String {
@@ -37,7 +47,9 @@ fn vs_table() -> String {
 }
 
 fn scan_grant_sql(verb: &str, preposition: &str) -> String {
-    format!("{verb} ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME} {preposition} {OWNER_USER}")
+    format!(
+        "{verb} ACCESS ON CONNECTION {CONN_NAME} FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME} {preposition} {OWNER_USER}"
+    )
 }
 
 fn setup_e2e() {
@@ -67,15 +79,29 @@ fn setup_e2e() {
         sys.execute(&format!("DROP USER IF EXISTS {OWNER_USER} CASCADE"));
         sys.execute(&format!("DROP CONNECTION IF EXISTS {CONN_NAME}"));
 
-        sys.execute(&format!("CREATE USER {OWNER_USER} IDENTIFIED BY \"{OWNER_PASSWORD}\""));
-        for priv_name in ["CREATE SESSION", "CREATE CONNECTION", "CREATE VIRTUAL SCHEMA"] {
+        sys.execute(&format!(
+            "CREATE USER {OWNER_USER} IDENTIFIED BY \"{OWNER_PASSWORD}\""
+        ));
+        for priv_name in [
+            "CREATE SESSION",
+            "CREATE CONNECTION",
+            "CREATE VIRTUAL SCHEMA",
+        ] {
             sys.execute(&format!("GRANT {priv_name} TO {OWNER_USER}"));
         }
-        for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, DISTRIBUTOR_SCRIPT_NAME] {
-            sys.execute(&format!("GRANT EXECUTE ON SCRIPT {SCHEMA_NAME}.{script} TO {OWNER_USER}"));
+        for script in [
+            ADAPTER_SCRIPT_NAME,
+            SCAN_SCRIPT_NAME,
+            DISTRIBUTOR_SCRIPT_NAME,
+        ] {
+            sys.execute(&format!(
+                "GRANT EXECUTE ON SCRIPT {SCHEMA_NAME}.{script} TO {OWNER_USER}"
+            ));
         }
 
-        sys.execute(&format!("CREATE USER {READER_USER} IDENTIFIED BY \"{READER_PASSWORD}\""));
+        sys.execute(&format!(
+            "CREATE USER {READER_USER} IDENTIFIED BY \"{READER_PASSWORD}\""
+        ));
         sys.execute(&format!("GRANT CREATE SESSION TO {READER_USER}"));
 
         let mut owner = owner_conn();
@@ -85,7 +111,9 @@ fn setup_e2e() {
             &iceberg_catalog_url_internal(),
             &local_stack_connection_password(),
         );
-        owner.execute(&format!("GRANT SELECT ON SCHEMA {VS_NAME} TO {READER_USER}"));
+        owner.execute(&format!(
+            "GRANT SELECT ON SCHEMA {VS_NAME} TO {READER_USER}"
+        ));
     });
 }
 
@@ -108,7 +136,12 @@ fn a_least_privilege_reader_gets_the_owners_rows_without_a_connection_grant() {
 
     let mut sys = exa_conn();
     for view in ["EXA_DBA_CONNECTION_PRIVS", "EXA_DBA_ROLE_PRIVS"] {
-        assert_eq!(sys.query_row_count(&format!("SELECT * FROM {view} WHERE GRANTEE = '{READER_USER}'")), 0);
+        assert_eq!(
+            sys.query_row_count(&format!(
+                "SELECT * FROM {view} WHERE GRANTEE = '{READER_USER}'"
+            )),
+            0
+        );
     }
 }
 
@@ -120,7 +153,10 @@ fn the_readers_pushdown_plan_names_the_connection_and_carries_no_credential() {
 
     let plan = explain_virtual_sql(
         &mut reader_conn(),
-        &format!("SELECT ID, NAME, SCORE FROM {} WHERE SCORE > 15.0", vs_table()),
+        &format!(
+            "SELECT ID, NAME, SCORE FROM {} WHERE SCORE > 15.0",
+            vs_table()
+        ),
     );
 
     assert!(!plan.trim().is_empty(), "EXPLAIN VIRTUAL returned empty");
@@ -134,7 +170,13 @@ fn the_readers_pushdown_plan_names_the_connection_and_carries_no_credential() {
         assert!(!value.is_empty());
         assert!(!plan.contains(value.as_str()), "credential leaked: {plan}");
     }
-    for key in [r#""access_key""#, r#""secret_key""#, r#""session_token""#, r#""s3":{"#, r#""inline":"#] {
+    for key in [
+        r#""access_key""#,
+        r#""secret_key""#,
+        r#""session_token""#,
+        r#""s3":{"#,
+        r#""inline":"#,
+    ] {
         assert!(!plan.contains(key), "inline token {key} in: {plan}");
     }
 }
@@ -144,23 +186,44 @@ fn revoking_the_owners_scan_grant_denies_the_reader_without_leaking_the_credenti
     let _serial = serial();
     setup_e2e();
     let password = local_stack_connection_password();
-    let query = format!("SELECT ID, NAME, SCORE FROM {} WHERE SCORE > 15.0", vs_table());
+    let query = format!(
+        "SELECT ID, NAME, SCORE FROM {} WHERE SCORE > 15.0",
+        vs_table()
+    );
 
-    assert_eq!(reader_conn().query_row_count(&query), SEED_ROWS_SCORE_GT_15 as i64);
+    assert_eq!(
+        reader_conn().query_row_count(&query),
+        SEED_ROWS_SCORE_GT_15 as i64
+    );
 
     let mut owner = owner_conn();
     owner.execute(&scan_grant_sql("REVOKE", "FROM"));
     let denied = reader_conn().try_execute(&query);
     owner.execute(&scan_grant_sql("GRANT", "TO"));
 
-    assert_eq!(denied["status"].as_str(), Some("error"), "revoke must deny: {denied}");
+    assert_eq!(
+        denied["status"].as_str(),
+        Some("error"),
+        "revoke must deny: {denied}"
+    );
     let msg = denied["exception"]["text"].as_str().unwrap_or("");
-    for needle in [CONN_NAME, "GRANT ACCESS ON CONNECTION", &format!("FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}"), "OWNER of the virtual schema"] {
-        assert!(msg.contains(needle), "denial must contain {needle:?}: {msg}");
+    for needle in [
+        CONN_NAME,
+        "GRANT ACCESS ON CONNECTION",
+        &format!("FOR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}"),
+        "OWNER of the virtual schema",
+    ] {
+        assert!(
+            msg.contains(needle),
+            "denial must contain {needle:?}: {msg}"
+        );
     }
     for value in [&password.access_key, &password.secret_key] {
         assert!(!msg.contains(value.as_str()), "credential leaked: {msg}");
     }
 
-    assert_eq!(reader_conn().query_row_count(&query), SEED_ROWS_SCORE_GT_15 as i64);
+    assert_eq!(
+        reader_conn().query_row_count(&query),
+        SEED_ROWS_SCORE_GT_15 as i64
+    );
 }

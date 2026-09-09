@@ -1,4 +1,3 @@
-
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::StorageCreds;

@@ -3332,8 +3332,15 @@ const SENTINEL_SESSION_TOKEN: &str = "SENTINEL_SESSION_TOKEN_VALUE";
 const SENTINEL_PASSWORD: &str = r#"{"warehouse":"wh","secret_key":"SENTINEL_SECRET_KEY_VALUE"}"#;
 
 fn assert_no_sentinel_secret_leaked(text: &str) {
-    for secret in [SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SENTINEL_SESSION_TOKEN] {
-        assert!(!text.contains(secret), "sentinel secret {secret:?} leaked in: {text}");
+    for secret in [
+        SENTINEL_ACCESS_KEY,
+        SENTINEL_SECRET_KEY,
+        SENTINEL_SESSION_TOKEN,
+    ] {
+        assert!(
+            !text.contains(secret),
+            "sentinel secret {secret:?} leaked in: {text}"
+        );
     }
 }
 
@@ -3420,13 +3427,19 @@ fn no_connection_credential_reaches_the_generated_sql() {
 
     let static_creds = sentinel_creds(false);
     let static_storage = scan_storage_for(
-        &static_creds, SENTINEL_CONNECTION_NAME, true,
-        &sentinel_effective_backend(&static_creds), None,
+        &static_creds,
+        SENTINEL_CONNECTION_NAME,
+        true,
+        &sentinel_effective_backend(&static_creds),
+        None,
     )
     .expect("static selection");
     let static_sql = dispatch_result_for_body(body.clone(), Vec::new(), &static_storage)
         .expect("static dispatch");
-    assert!(static_sql.contains(SENTINEL_CONNECTION_NAME), "{static_sql}");
+    assert!(
+        static_sql.contains(SENTINEL_CONNECTION_NAME),
+        "{static_sql}"
+    );
     assert_no_sentinel_secret_leaked(&static_sql);
 
     let vended_creds = sentinel_creds(true);
@@ -3435,11 +3448,15 @@ fn no_connection_credential_reaches_the_generated_sql() {
         .then(|| derive_sealed_storage_key(SENTINEL_PASSWORD))
         .expect("must carry key material");
     let vended_storage = scan_storage_for(
-        &vended_creds, SENTINEL_CONNECTION_NAME, true, &vended_effective, Some(&key),
+        &vended_creds,
+        SENTINEL_CONNECTION_NAME,
+        true,
+        &vended_effective,
+        Some(&key),
     )
     .expect("vended selection");
-    let vended_sql = dispatch_result_for_body(body, Vec::new(), &vended_storage)
-        .expect("vended dispatch");
+    let vended_sql =
+        dispatch_result_for_body(body, Vec::new(), &vended_storage).expect("vended dispatch");
     assert!(vended_sql.contains("\"sealed\":{\"name\":"), "{vended_sql}");
     let common: Json = serde_json::from_str(common_arg_literal(&vended_sql)).unwrap();
     let selected: ScanStorage = serde_json::from_value(common["storage"].clone()).unwrap();

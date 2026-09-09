@@ -5206,4 +5206,3 @@ fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
     );
     assert!(matches!(items[0], ProjectionItem::Expr { .. }));
 }
-

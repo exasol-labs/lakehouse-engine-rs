@@ -50,26 +50,40 @@ impl StubConnections {
 }
 
 impl UdfContext for StubConnections {
-    fn num_columns(&self) -> usize { 0 }
+    fn num_columns(&self) -> usize {
+        0
+    }
     fn get(&self, _: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
         Err(UdfError::User("stub".into()))
     }
     fn emit(&mut self, _: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
         Err(UdfError::User("stub".into()))
     }
-    fn next(&mut self) -> Result<bool, UdfError> { Ok(false) }
-    fn connection(&self, name: &str) -> Result<ConnectionObject, UdfError> {
-        self.connections.iter().find(|(h, _)| *h == name)
-            .map(|(_, pw)| ConnectionObject {
-                kind: "PASSWORD".into(), address: "http://catalog.example.com".into(),
-                user: String::new(), password: pw.clone(),
-            })
-            .ok_or_else(|| UdfError::ConnectBack(format!(
-                "insufficient privileges for using connection {name} in script LAKEHOUSE_SCAN"
-            )))
+    fn next(&mut self) -> Result<bool, UdfError> {
+        Ok(false)
     }
-    fn script_schema(&self) -> String { self.script_schema.unwrap_or_default().to_string() }
-    fn script_name(&self) -> String { self.script_name.unwrap_or_default().to_string() }
+    fn connection(&self, name: &str) -> Result<ConnectionObject, UdfError> {
+        self.connections
+            .iter()
+            .find(|(h, _)| *h == name)
+            .map(|(_, pw)| ConnectionObject {
+                kind: "PASSWORD".into(),
+                address: "http://catalog.example.com".into(),
+                user: String::new(),
+                password: pw.clone(),
+            })
+            .ok_or_else(|| {
+                UdfError::ConnectBack(format!(
+                    "insufficient privileges for using connection {name} in script LAKEHOUSE_SCAN"
+                ))
+            })
+    }
+    fn script_schema(&self) -> String {
+        self.script_schema.unwrap_or_default().to_string()
+    }
+    fn script_name(&self) -> String {
+        self.script_name.unwrap_or_default().to_string()
+    }
 }
 
 fn s3_backend(secret: &str) -> StorageBackend {
@@ -102,71 +116,123 @@ fn scan_storage_variants_resolve_or_fail_correctly() {
     assert!(inline.join().is_none());
 
     let conn = resolve_scan_storage(
-        &common_with(ScanStorage::Connection { name: CONNECTION.into(), allow_http: true }),
+        &common_with(ScanStorage::Connection {
+            name: CONNECTION.into(),
+            allow_http: true,
+        }),
         &StubConnections::one(CONNECTION, password("RESOLVEDSECRET")),
     )
     .expect("connection");
-    let StorageBackend::S3(props) = conn.primary() else { panic!("expected S3") };
+    let StorageBackend::S3(props) = conn.primary() else {
+        panic!("expected S3")
+    };
     assert_eq!(props.secret_key, "RESOLVEDSECRET");
     assert!(props.allow_http);
 
-    let conn_spec = common_with(ScanStorage::Connection { name: CONNECTION.into(), allow_http: false });
+    let conn_spec = common_with(ScanStorage::Connection {
+        name: CONNECTION.into(),
+        allow_http: false,
+    });
     let err = resolve_scan_storage(&conn_spec, &StubConnections::none()).expect_err("unreadable");
     let text = err.to_string();
-    assert!(text.contains(CONNECTION) && text.contains("ACCESS ON CONNECTION"), "{text}");
+    assert!(
+        text.contains(CONNECTION) && text.contains("ACCESS ON CONNECTION"),
+        "{text}"
+    );
 
     let deployed = resolve_scan_storage(
-        &conn_spec, &StubConnections::none().with_script("LAKEHOUSE_OPS", "LH_SCAN_V2"),
-    ).expect_err("unreadable");
-    assert!(deployed.to_string().contains("FOR SCRIPT LAKEHOUSE_OPS.LH_SCAN_V2"), "{deployed}");
-    let fallback = resolve_scan_storage(&conn_spec, &StubConnections::none()).expect_err("unreadable");
-    assert!(fallback.to_string().contains("FOR SCRIPT <schema>.LAKEHOUSE_SCAN"), "{fallback}");
+        &conn_spec,
+        &StubConnections::none().with_script("LAKEHOUSE_OPS", "LH_SCAN_V2"),
+    )
+    .expect_err("unreadable");
+    assert!(
+        deployed
+            .to_string()
+            .contains("FOR SCRIPT LAKEHOUSE_OPS.LH_SCAN_V2"),
+        "{deployed}"
+    );
+    let fallback =
+        resolve_scan_storage(&conn_spec, &StubConnections::none()).expect_err("unreadable");
+    assert!(
+        fallback
+            .to_string()
+            .contains("FOR SCRIPT <schema>.LAKEHOUSE_SCAN"),
+        "{fallback}"
+    );
 
     for bad in ["not json at all", "[]"] {
         let err = resolve_scan_storage(
-            &common_with(ScanStorage::Connection { name: CONNECTION.into(), allow_http: false }),
+            &common_with(ScanStorage::Connection {
+                name: CONNECTION.into(),
+                allow_http: false,
+            }),
             &StubConnections::one(CONNECTION, bad.into()),
         )
         .expect_err("non-object");
         let text = err.to_string();
-        assert!(text.contains(CONNECTION) && text.contains("not a JSON object") && !text.contains(bad), "{text}");
+        assert!(
+            text.contains(CONNECTION) && text.contains("not a JSON object") && !text.contains(bad),
+            "{text}"
+        );
     }
 
     let vended = s3_backend("VENDEDSECRET");
     let raw = password("STANDINGSECRET");
     let payload = seal_storage(&vended, &derive_sealed_storage_key(&raw)).expect("seal");
     let sealed = resolve_scan_storage(
-        &common_with(ScanStorage::Sealed { name: CONNECTION.into(), payload }),
+        &common_with(ScanStorage::Sealed {
+            name: CONNECTION.into(),
+            payload,
+        }),
         &StubConnections::one(CONNECTION, raw),
     )
     .expect("sealed");
     assert_eq!(sealed.primary(), &vended);
     let secrets = sealed.all_secret_values();
-    assert!(secrets.contains(&"VENDEDSECRET") && !secrets.contains(&"STANDINGSECRET"), "{secrets:?}");
+    assert!(
+        secrets.contains(&"VENDEDSECRET") && !secrets.contains(&"STANDINGSECRET"),
+        "{secrets:?}"
+    );
 }
 
 #[test]
 fn join_spec_resolves_two_sides_independently() {
     let dim_conn = "LAKEHOUSE_DIM_CREDS";
     let ctx = StubConnections {
-        connections: vec![(CONNECTION, password("FACTSECRET")), (dim_conn, password("DIMSECRET"))],
-        script_schema: None, script_name: None,
+        connections: vec![
+            (CONNECTION, password("FACTSECRET")),
+            (dim_conn, password("DIMSECRET")),
+        ],
+        script_schema: None,
+        script_name: None,
     };
-    let mut common = common_with(ScanStorage::Connection { name: CONNECTION.into(), allow_http: false });
+    let mut common = common_with(ScanStorage::Connection {
+        name: CONNECTION.into(),
+        allow_http: false,
+    });
     common.join = Some(JoinSpec {
-        storage: ScanStorage::Connection { name: dim_conn.into(), allow_http: false },
+        storage: ScanStorage::Connection {
+            name: dim_conn.into(),
+            allow_http: false,
+        },
         table_root: "s3://dim/db/dim".into(),
         condition: "\"F\" = \"D\"".into(),
         join_type: JoinType::Inner,
-        files: Vec::new(), logical_schema: Vec::new(), name_mapping: Vec::new(),
-        post_join_limit: None, partition_columns: Vec::new(),
+        files: Vec::new(),
+        logical_schema: Vec::new(),
+        name_mapping: Vec::new(),
+        post_join_limit: None,
+        partition_columns: Vec::new(),
     });
 
     let resolved = resolve_scan_storage(&common, &ctx).expect("both resolve");
     assert_eq!(secret_key_of(resolved.primary()), "FACTSECRET");
     assert_eq!(secret_key_of(resolved.join().expect("dim")), "DIMSECRET");
     let secrets = resolved.all_secret_values();
-    assert!(secrets.contains(&"FACTSECRET") && secrets.contains(&"DIMSECRET"), "{secrets:?}");
+    assert!(
+        secrets.contains(&"FACTSECRET") && secrets.contains(&"DIMSECRET"),
+        "{secrets:?}"
+    );
 }
 
 fn secret_key_of(backend: &StorageBackend) -> &str {

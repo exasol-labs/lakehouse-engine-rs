@@ -8,7 +8,11 @@ type SecretFieldSetter = fn(&mut ConnectionCreds, &str);
 const SEALING_PASSWORD: &str = r#"{"warehouse":"wh","secret_key":"S3CR3TV4LU3"}"#;
 
 fn creds_without_key_material() -> ConnectionCreds {
-    ConnectionCreds { warehouse: "wh".into(), path_style: true, ..Default::default() }
+    ConnectionCreds {
+        warehouse: "wh".into(),
+        path_style: true,
+        ..Default::default()
+    }
 }
 
 fn secret_bearing_fields() -> Vec<(&'static str, SecretFieldSetter)> {
@@ -24,9 +28,13 @@ fn secret_bearing_fields() -> Vec<(&'static str, SecretFieldSetter)> {
 
 fn s3_backend() -> StorageBackend {
     StorageBackend::S3(StorageProps {
-        endpoint: "http://minio:9000".into(), region: "us-east-1".into(),
-        access_key: "VENDEDAK".into(), secret_key: "VENDEDSK".into(),
-        session_token: Some("VENDEDTOK".into()), allow_http: true, ..Default::default()
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "VENDEDAK".into(),
+        secret_key: "VENDEDSK".into(),
+        session_token: Some("VENDEDTOK".into()),
+        allow_http: true,
+        ..Default::default()
     })
 }
 
@@ -38,7 +46,14 @@ fn adls_backend() -> StorageBackend {
 }
 
 fn assert_carries_no_sentinel(context: &str, text: &str) {
-    for s in ["VENDEDAK", "VENDEDSK", "VENDEDTOK", "VENDEDSAS", "S3CR3TV4LU3", SEALING_PASSWORD] {
+    for s in [
+        "VENDEDAK",
+        "VENDEDSK",
+        "VENDEDTOK",
+        "VENDEDSAS",
+        "S3CR3TV4LU3",
+        SEALING_PASSWORD,
+    ] {
         assert!(!text.contains(s), "{context} must not echo {s}: {text}");
     }
 }
@@ -75,13 +90,21 @@ fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
 
 #[test]
 fn key_material_is_present_only_for_a_non_empty_secret_bearing_field() {
-    assert!(!connection_password_carries_key_material(&creds_without_key_material()));
+    assert!(!connection_password_carries_key_material(
+        &creds_without_key_material()
+    ));
     for (field, set) in secret_bearing_fields() {
         let mut non_empty = creds_without_key_material();
         set(&mut non_empty, "s");
-        assert!(connection_password_carries_key_material(&non_empty), "{field} non-empty");
+        assert!(
+            connection_password_carries_key_material(&non_empty),
+            "{field} non-empty"
+        );
         let mut empty = creds_without_key_material();
         set(&mut empty, "");
-        assert!(!connection_password_carries_key_material(&empty), "{field} empty");
+        assert!(
+            !connection_password_carries_key_material(&empty),
+            "{field} empty"
+        );
     }
 }

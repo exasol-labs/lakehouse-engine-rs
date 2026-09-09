@@ -15,4 +15,3 @@ const _FROM_BACKENDS: fn(
 ) -> ResolvedScanStorage = ResolvedScanStorage::from_backends;
 
 use crate::scan::build_partial_agg_sql;
-

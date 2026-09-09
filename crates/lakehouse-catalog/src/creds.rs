@@ -132,7 +132,7 @@ fn default_true() -> bool {
 }
 
 impl Default for StorageProps {
-        fn default() -> Self {
+    fn default() -> Self {
         Self {
             endpoint: String::new(),
             region: String::new(),
@@ -146,7 +146,7 @@ impl Default for StorageProps {
 }
 
 impl StorageProps {
-        pub fn secret_values(&self) -> Vec<&str> {
+    pub fn secret_values(&self) -> Vec<&str> {
         let mut secrets = Vec::new();
         for candidate in [self.access_key.as_str(), self.secret_key.as_str()] {
             if !candidate.is_empty() {
@@ -247,7 +247,7 @@ impl StorageCreds {
 }
 
 impl From<&ConnectionCreds> for StorageCreds {
-        fn from(creds: &ConnectionCreds) -> Self {
+    fn from(creds: &ConnectionCreds) -> Self {
         Self {
             endpoint: creds.endpoint.clone(),
             region: creds.region.clone(),

@@ -31,36 +31,68 @@ fn default_equals_deserializing_a_props_with_every_optional_field_absent() {
 #[test]
 fn debug_redacts_every_secret_bearing_field() {
     let creds = ConnectionCreds {
-        warehouse: "wh".into(), endpoint: "http://s3.example.com".into(),
-        region: "us-east-1".into(), access_key: "AKIA_EX".into(),
-        secret_key: "SK".into(), session_token: Some("TOK".into()), path_style: true,
-        use_sigv4: false, use_vended_credentials: false,
-        token: Some("bearer".into()), client_id: Some("cid".into()),
+        warehouse: "wh".into(),
+        endpoint: "http://s3.example.com".into(),
+        region: "us-east-1".into(),
+        access_key: "AKIA_EX".into(),
+        secret_key: "SK".into(),
+        session_token: Some("TOK".into()),
+        path_style: true,
+        use_sigv4: false,
+        use_vended_credentials: false,
+        token: Some("bearer".into()),
+        client_id: Some("cid".into()),
         client_secret: Some("csecret".into()),
         oauth2_server_uri: Some("https://auth.example.com/token".into()),
-        scope: Some("catalog:read".into()), account_name: Some("acct".into()),
-        account_key: Some("akey".into()), sas_token: Some("sv=…&sig=sas".into()),
+        scope: Some("catalog:read".into()),
+        account_name: Some("acct".into()),
+        account_key: Some("akey".into()),
+        sas_token: Some("sv=…&sig=sas".into()),
     };
     let debug = format!("{creds:?}");
-    for secret in ["AKIA_EX", "SK", "TOK", "bearer", "csecret", "akey", "sv=…&sig=sas"] {
+    for secret in [
+        "AKIA_EX",
+        "SK",
+        "TOK",
+        "bearer",
+        "csecret",
+        "akey",
+        "sv=…&sig=sas",
+    ] {
         assert!(!debug.contains(secret), "{secret} leaked: {debug}");
     }
     assert!(debug.contains("cid"));
 
     let props = StorageProps {
-        endpoint: "http://minio:9000".into(), region: "us-east-1".into(),
-        access_key: "AK2".into(), secret_key: "SK2".into(),
-        session_token: Some("TOK2".into()), allow_http: true, path_style: true,
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "AK2".into(),
+        secret_key: "SK2".into(),
+        session_token: Some("TOK2".into()),
+        allow_http: true,
+        path_style: true,
     };
     for (label, text) in [
         ("StorageProps", format!("{props:?}")),
-        ("StorageBackend", format!("{:?}", StorageBackend::S3(props.clone()))),
-        ("StorageCreds", format!("{:?}", StorageCreds {
-            endpoint: props.endpoint.clone(), region: props.region.clone(),
-            access_key: props.access_key.clone(), secret_key: props.secret_key.clone(),
-            session_token: props.session_token.clone(), path_style: true,
-            ..Default::default()
-        })),
+        (
+            "StorageBackend",
+            format!("{:?}", StorageBackend::S3(props.clone())),
+        ),
+        (
+            "StorageCreds",
+            format!(
+                "{:?}",
+                StorageCreds {
+                    endpoint: props.endpoint.clone(),
+                    region: props.region.clone(),
+                    access_key: props.access_key.clone(),
+                    secret_key: props.secret_key.clone(),
+                    session_token: props.session_token.clone(),
+                    path_style: true,
+                    ..Default::default()
+                }
+            ),
+        ),
     ] {
         for s in ["AK2", "SK2", "TOK2"] {
             assert!(!text.contains(s), "{label} leaked {s}: {text}");
@@ -89,7 +121,10 @@ fn creds_with(
 fn supplied_catalog_auth_names_one_mode_per_field_shape() {
     let pair = creds_with(None, Some(CLIENT_ID), Some(CLIENT_SECRET));
     match pair.supplied_catalog_auth() {
-        SuppliedCatalogAuth::ClientCredentials { client_id, client_secret } => {
+        SuppliedCatalogAuth::ClientCredentials {
+            client_id,
+            client_secret,
+        } => {
             assert_eq!(client_id, CLIENT_ID);
             assert_eq!(client_secret, CLIENT_SECRET);
         }
@@ -112,9 +147,14 @@ fn supplied_catalog_auth_names_one_mode_per_field_shape() {
     ] {
         let creds = creds_with(token, client_id, client_secret);
         assert!(
-            matches!(creds.supplied_catalog_auth(), SuppliedCatalogAuth::Unauthenticated),
+            matches!(
+                creds.supplied_catalog_auth(),
+                SuppliedCatalogAuth::Unauthenticated
+            ),
             "shape (token={}, id={}, secret={}) describes no mode",
-            token.is_some(), client_id.is_some(), client_secret.is_some(),
+            token.is_some(),
+            client_id.is_some(),
+            client_secret.is_some(),
         );
     }
 }
@@ -132,9 +172,12 @@ const OAUTH2_SCOPE: &str = "catalog-scope";
 
 fn s3_storage_creds() -> StorageCreds {
     StorageCreds {
-        endpoint: STORAGE_ENDPOINT.into(), region: STORAGE_REGION.into(),
-        access_key: STORAGE_AK.into(), secret_key: STORAGE_SK.into(),
-        session_token: Some(STORAGE_SESSION_TOKEN.into()), path_style: true,
+        endpoint: STORAGE_ENDPOINT.into(),
+        region: STORAGE_REGION.into(),
+        access_key: STORAGE_AK.into(),
+        secret_key: STORAGE_SK.into(),
+        session_token: Some(STORAGE_SESSION_TOKEN.into()),
+        path_style: true,
         ..Default::default()
     }
 }
@@ -239,4 +282,3 @@ fn backend_selects_adls_only_for_an_account_name_with_exactly_one_azure_credenti
         );
     }
 }
-

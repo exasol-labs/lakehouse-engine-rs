@@ -50,8 +50,12 @@ pub(super) const TEST_CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
 pub(super) fn refusing_endpoint(message: &str) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let url = format!("http://{}", listener.local_addr().expect("addr"));
-    let body = format!("<Error><Code>SignatureDoesNotMatch</Code><Message>{message}</Message></Error>");
-    let resp = format!("HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+    let body =
+        format!("<Error><Code>SignatureDoesNotMatch</Code><Message>{message}</Message></Error>");
+    let resp = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut s) = stream else { break };
@@ -76,11 +80,25 @@ pub(super) fn refusing_backend(endpoint: &str, secret: &str) -> StorageBackend {
 pub(super) struct SinkCtx;
 
 impl exasol_udf_sdk::context::UdfContext for SinkCtx {
-    fn num_columns(&self) -> usize { 0 }
-    fn get(&self, _: usize) -> Result<&exasol_udf_sdk::value::Value, exasol_udf_sdk::error::UdfError> {
+    fn num_columns(&self) -> usize {
+        0
+    }
+    fn get(
+        &self,
+        _: usize,
+    ) -> Result<&exasol_udf_sdk::value::Value, exasol_udf_sdk::error::UdfError> {
         unimplemented!()
     }
-    fn emit(&mut self, _: &[exasol_udf_sdk::value::Value]) -> Result<(), exasol_udf_sdk::error::UdfError> { Ok(()) }
-    fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> { Ok(false) }
-    fn emit_record_batch_ipc(&mut self, _: &[u8]) -> Result<(), exasol_udf_sdk::error::UdfError> { Ok(()) }
+    fn emit(
+        &mut self,
+        _: &[exasol_udf_sdk::value::Value],
+    ) -> Result<(), exasol_udf_sdk::error::UdfError> {
+        Ok(())
+    }
+    fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> {
+        Ok(false)
+    }
+    fn emit_record_batch_ipc(&mut self, _: &[u8]) -> Result<(), exasol_udf_sdk::error::UdfError> {
+        Ok(())
+    }
 }
