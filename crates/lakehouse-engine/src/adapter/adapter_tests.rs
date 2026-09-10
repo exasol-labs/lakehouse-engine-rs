@@ -1836,4 +1836,3 @@ fn resolved_config_carries_the_catalog_connection_name() {
     }));
     assert_eq!(config.connection_name, "MY_CONN");
 }
-
