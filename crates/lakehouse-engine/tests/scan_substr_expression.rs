@@ -141,9 +141,14 @@ fn string_value(batch: &RecordBatch, index: usize, row: usize) -> String {
 fn rows_for_test(dir: &std::path::Path, relative: &str) -> (String, u64) {
     let rows = [(0i64, "event-01"), (1i64, "event-02"), (2i64, "other-03")];
     let file_url = write_local_parquet(dir, relative, &rows);
-    let file_size = std::fs::metadata(file_url.strip_prefix("file://").unwrap())
-        .expect("stat parquet")
-        .len();
+    let file_size = std::fs::metadata(
+        url::Url::parse(&file_url)
+            .expect("parse file url")
+            .to_file_path()
+            .expect("file url to path"),
+    )
+    .expect("stat parquet")
+    .len();
     (file_url, file_size)
 }
 
