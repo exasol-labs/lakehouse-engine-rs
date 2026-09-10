@@ -78,6 +78,11 @@ resource "aws_glue_catalog_database" "perf" {
   location_uri = "s3://${aws_s3_bucket.warehouse.bucket}/${var.perf_db_name}.db"
 }
 
+resource "aws_glue_catalog_database" "erp" {
+  name         = var.erp_db_name
+  location_uri = "s3://${aws_s3_bucket.warehouse.bucket}/${var.erp_db_name}.db"
+}
+
 # --- Athena (benchmark consumer of the same Glue catalog) -------------------
 resource "aws_athena_workgroup" "perf" {
   name = "${local.prefix}-athena"
@@ -184,6 +189,12 @@ resource "aws_ssm_parameter" "perf_namespace" {
   value = var.perf_db_name
 }
 
+resource "aws_ssm_parameter" "erp_namespace" {
+  name  = "${local.ssm_root}/namespace/erp"
+  type  = "String"
+  value = var.erp_db_name
+}
+
 # --- Temporary data-gen EC2 (count gated; self-terminates) ------------------
 data "aws_ami" "ubuntu" {
   count       = var.run_data_gen ? 1 : 0
@@ -281,12 +292,17 @@ resource "aws_instance" "datagen" {
     script_key     = aws_s3_object.gen_load[0].key
     tpch_db        = var.tpch_db_name
     perf_db        = var.perf_db_name
+    erp_db         = var.erp_db_name
     warehouse      = local.account_id
     glue_uri       = local.glue_uri
     scale          = var.tpch_scale_factor
     lineitem_files = var.lineitem_files
     perf_sizes     = join(",", [for s in var.perf_table_sizes_gb : tostring(s)])
     perf_files     = var.perf_files
+    erp_customers  = var.erp_customers
+    erp_products   = var.erp_products
+    erp_orders     = var.erp_orders
+    erp_invoices   = var.erp_invoices
     done_param     = "${local.ssm_root}/datagen/last_status"
   })
 

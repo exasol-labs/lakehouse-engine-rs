@@ -14,15 +14,16 @@ STACK="$HERE/../cluster-stack"
 
 cd "$STACK"
 tofu workspace select "$ENV" >/dev/null 2>&1 || { echo "no workspace '$ENV'"; exit 1; }
-OUT="$(tofu output -json)"
-jqr() { jq -r "$1" <<<"$OUT"; }
+# Read only the specific outputs needed, not the full state via `-json` — state can carry
+# sensitive values beyond what this script uses, even ones marked `sensitive`.
+raw() { local name="$1"; tofu output -raw "$name"; }
 
-NODE1="$(jqr '.first_node_ip.value')"
-CL_SSM="$(jqr '.ssm_root.value')"
-DATA_SSM="$(jqr '.data_ssm_root.value')"
-DB_PORT="$(jqr '.exasol_db_port.value')"
-BFS_PORT="$(jqr '.bucketfs_port.value')"
-KEY_NAME="$(jqr '.key_pair_name.value')"
+NODE1="$(raw first_node_ip)"
+CL_SSM="$(raw ssm_root)"
+DATA_SSM="$(raw data_ssm_root)"
+DB_PORT="$(raw exasol_db_port)"
+BFS_PORT="$(raw bucketfs_port)"
+KEY_NAME="$(raw key_pair_name)"
 KEY_FILE="${KEY_FILE:-$HOME/.ssh/${KEY_NAME}}"
 SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 
@@ -74,16 +75,17 @@ chmod 600 "$ENVFILE"
 # own machine only in the sense that ITS network calls land in the CONNECTION object executed
 # INSIDE the Exasol cluster (same VPC as the Lakekeeper box), never from this machine itself.
 LK_STACK="$HERE/../lakekeeper-stack"
-if LK_OUT="$(cd "$LK_STACK" && tofu workspace select "$ENV" >/dev/null 2>&1 && tofu output -json)"; then
-  lk_jqr() { jq -r "$1" <<<"$LK_OUT"; }
-  LK_SSM="$(lk_jqr '.ssm_root.value')"
+if (cd "$LK_STACK" && tofu workspace select "$ENV" >/dev/null 2>&1); then
+  # Same reasoning as `raw` above: only the specific outputs needed, not the full state.
+  lk_raw() { local name="$1"; (cd "$LK_STACK" && tofu output -raw "$name"); }
+  LK_SSM="$(lk_raw ssm_root)"
   cat >>"$ENVFILE" <<EOF
 
-LAKEKEEPER_CATALOG_URI=$(lk_jqr '.catalog_uri_private.value')
-LAKEKEEPER_TOKEN_URI=$(lk_jqr '.token_uri_private.value')
-LAKEKEEPER_CLIENT_ID=$(lk_jqr '.oidc_client_id.value')
+LAKEKEEPER_CATALOG_URI=$(lk_raw catalog_uri_private)
+LAKEKEEPER_TOKEN_URI=$(lk_raw token_uri_private)
+LAKEKEEPER_CLIENT_ID=$(lk_raw oidc_client_id)
 LAKEKEEPER_CLIENT_SECRET=$(ssm "$LK_SSM/oauth2/client_secret")
-LAKEKEEPER_WAREHOUSE=$(lk_jqr '.warehouse_name.value')
+LAKEKEEPER_WAREHOUSE=$(lk_raw warehouse_name)
 EOF
   echo "Lakekeeper block added to $ENVFILE (private-IP URIs). Set BENCH_CATALOG=lakekeeper to use it."
 else
