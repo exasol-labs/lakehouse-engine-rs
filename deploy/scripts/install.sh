@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # One-command installer that provisions lakehouse-engine onto an Exasol SaaS or BucketFS
 # database: registers the Rust SLC, uploads and registers the engine .so plus its three
-# scripts, and verifies the load with a fingerprint smoke test. Stops at a query-ready
+# scripts, and verifies the load with a version smoke test. Stops at a query-ready
 # product install and prints the next-step CONNECTION / VIRTUAL SCHEMA template; it does
 # NOT create catalog objects.
 #
