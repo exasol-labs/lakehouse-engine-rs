@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate TPC-H + wide perf tables with DuckDB and write them as Iceberg tables.
+"""Generate TPC-H + wide perf + bronze ERP tables with DuckDB and write them as Iceberg tables.
 
 Runs on the temporary data-gen EC2 (instance role provides AWS creds). Writes to the AWS Glue
 catalog so both the lakehouse engine (via Glue's Iceberg REST endpoint) and Athena can query them.
@@ -7,8 +7,9 @@ catalog so both the lakehouse engine (via Glue's Iceberg REST endpoint) and Athe
   python gen_load.py --region eu-west-1 --warehouse <account_id> \
     --glue-uri https://glue.eu-west-1.amazonaws.com/iceberg \
     --bucket spot-strata-data-lakehouse-<acct> \
-    --tpch-db tpch --perf-db perf \
-    --tpch-scale 30 --lineitem-files 20 --perf-sizes 10,20,30,40,80 --perf-files 8
+    --tpch-db tpch --perf-db perf --erp-db erp \
+    --tpch-scale 30 --lineitem-files 20 --perf-sizes 10,20,30,40,80 --perf-files 8 \
+    --erp-customers 75000 --erp-products 60000 --erp-orders 250000 --erp-invoices 100000
 
   python gen_load.py --self-check        # offline: tiny data into a local sqlite Iceberg catalog
 
@@ -50,6 +51,128 @@ FROM range({start}, {end}) t(i)
 
 TPCH_TABLES = ["region", "nation", "supplier", "customer", "part", "partsupp", "orders", "lineitem"]
 TPCH_BIG = {"lineitem", "orders"}
+
+# Bronze ERP dataset: every "real world messy" column is deliberately a STRING, even the ones that
+# are conceptually a date/number/boolean — same idea as a real dirty ERP extract, cleaned up later
+# in a downstream silver layer. i % 3 cycles through 3 dirty variants per column so no format
+# happens to dominate. FK columns reference the other tables' id format directly (no join needed,
+# same style as PERF_SELECT's pure range()-driven generation).
+
+ERP_CUSTOMERS_SELECT = """
+SELECT
+  'CUST' || lpad(i::VARCHAR, 8, '0')                                             AS customer_id,
+  'Customer ' || i::VARCHAR                                                      AS name,
+  to_json(struct_pack(
+      email   := 'customer' || i::VARCHAR || '@example.com',
+      phone   := '+1-555-' || lpad((i % 10000)::VARCHAR, 4, '0'),
+      address := struct_pack(
+          street := (i % 9999)::VARCHAR || ' Main St',
+          city   := (['Springfield', 'Riverside', 'Franklin', 'Georgetown', 'Clinton'])[(i % 5) + 1],
+          zip    := lpad((10000 + i % 90000)::VARCHAR, 5, '0')
+      )
+  ))                                                                             AS contact_json,
+  (['Retail', 'retail', 'RETAIL', 'Whsle', 'Wholesale'])[(i % 5) + 1]            AS segment,
+  CASE i % 3
+    WHEN 0 THEN strftime(DATE '2019-01-01' + (i % 2200)::INTEGER, '%Y-%m-%d')
+    WHEN 1 THEN strftime(DATE '2019-01-01' + (i % 2200)::INTEGER, '%m/%d/%Y')
+    ELSE (epoch_ms((DATE '2019-01-01' + (i % 2200)::INTEGER)::TIMESTAMP))::VARCHAR
+  END                                                                             AS signup_date,
+  CASE i % 3
+    WHEN 0 THEN '$' || round(500 + (i % 50000) / 10.0, 2)::VARCHAR
+    WHEN 1 THEN round(500 + (i % 50000) / 10.0, 2)::VARCHAR
+    ELSE replace(round(500 + (i % 50000) / 10.0, 2)::VARCHAR, '.', ',')
+  END                                                                             AS credit_limit,
+  CASE i % 3
+    WHEN 0 THEN (CASE WHEN i % 2 = 0 THEN 'Y' ELSE 'N' END)
+    WHEN 1 THEN (CASE WHEN i % 2 = 0 THEN '1' ELSE '0' END)
+    ELSE (CASE WHEN i % 2 = 0 THEN 'true' ELSE 'false' END)
+  END                                                                             AS is_active
+FROM range({start}, {end}) t(i)
+"""
+
+ERP_PRODUCTS_SELECT = """
+SELECT
+  'SKU-' || lpad(i::VARCHAR, 5, '0')                                             AS product_id,
+  'Product ' || i::VARCHAR                                                       AS name,
+  (['Electronics', 'Home', 'Outdoor', 'Apparel', 'Toys'])[(i % 5) + 1]           AS category,
+  CASE i % 3
+    WHEN 0 THEN '$' || round(5 + (i % 20000) / 10.0, 2)::VARCHAR
+    WHEN 1 THEN round(5 + (i % 20000) / 10.0, 2)::VARCHAR
+    ELSE replace(round(5 + (i % 20000) / 10.0, 2)::VARCHAR, '.', ',')
+  END                                                                             AS price,
+  to_json(struct_pack(
+      weight_kg  := round(0.1 + (i % 500) / 10.0, 2),
+      dimensions := struct_pack(l := (i % 50) + 1, w := (i % 40) + 1, h := (i % 30) + 1),
+      tags       := list_value((['electronics', 'clearance', 'new', 'sale', 'featured'])[(i % 5) + 1],
+                                (['bestseller', 'limited', 'imported', 'eco', 'refurbished'])[(i % 5) + 1])
+  ))                                                                             AS attributes_json,
+  (['electronics', 'clearance', 'new'])[(i % 3) + 1] || ',' ||
+    (['sale', 'featured', 'bestseller'])[(i % 3) + 1]                            AS tags_csv,
+  CASE i % 3
+    WHEN 0 THEN strftime(DATE '2018-01-01' + (i % 2800)::INTEGER, '%Y-%m-%d')
+    WHEN 1 THEN strftime(DATE '2018-01-01' + (i % 2800)::INTEGER, '%m/%d/%Y')
+    ELSE (epoch_ms((DATE '2018-01-01' + (i % 2800)::INTEGER)::TIMESTAMP))::VARCHAR
+  END                                                                             AS created_at
+FROM range({start}, {end}) t(i)
+"""
+
+# Two line items per order, deterministic product refs (mod n_products keeps them valid ids).
+ERP_ORDERS_SELECT = """
+SELECT
+  'ORD' || lpad(i::VARCHAR, 8, '0')                                              AS order_id,
+  'CUST' || lpad(((i * 7) % {n_customers})::VARCHAR, 8, '0')                     AS customer_id,
+  CASE i % 3
+    WHEN 0 THEN strftime(DATE '2022-01-01' + (i % 900)::INTEGER, '%Y-%m-%d')
+    WHEN 1 THEN strftime(DATE '2022-01-01' + (i % 900)::INTEGER, '%m/%d/%Y')
+    ELSE (epoch_ms((DATE '2022-01-01' + (i % 900)::INTEGER)::TIMESTAMP))::VARCHAR
+  END                                                                             AS order_date,
+  (['shipped', 'Shipped', 'SHIPPED', 'cancelled', 'Cancelled'])[(i % 5) + 1]     AS status,
+  'SKU-' || lpad(((i * 11) % {n_products})::VARCHAR, 5, '0') || ':' ||
+    ((i % 5) + 1)::VARCHAR || ':' || round(10 + (i % 990) / 10.0, 2)::VARCHAR || ';' ||
+  'SKU-' || lpad(((i * 17 + 3) % {n_products})::VARCHAR, 5, '0') || ':' ||
+    ((i % 3) + 1)::VARCHAR || ':' || round(5 + (i % 490) / 10.0, 2)::VARCHAR      AS line_items_csv,
+  to_json(struct_pack(
+      address := (i % 9999)::VARCHAR || ' Oak Ave',
+      carrier := (['UPS', 'FedEx', 'DHL'])[(i % 3) + 1],
+      tracking := 'TRK' || lpad(i::VARCHAR, 10, '0')
+  ))                                                                             AS shipping_json,
+  CASE i % 3
+    WHEN 0 THEN '$' || round(50 + (i % 100000) / 10.0, 2)::VARCHAR
+    WHEN 1 THEN round(50 + (i % 100000) / 10.0, 2)::VARCHAR
+    ELSE replace(round(50 + (i % 100000) / 10.0, 2)::VARCHAR, '.', ',')
+  END                                                                             AS total_amount
+FROM range({start}, {end}) t(i)
+"""
+
+# order_index = (i*3) % n_orders is a bijection over 0..n_orders-1 (3 and n_orders are coprime for
+# the default 250000), so sampling i in [0, n_invoices) with n_invoices < n_orders picks that many
+# distinct orders with no collisions and leaves the rest uninvoiced (matches a real dirty source).
+ERP_INVOICES_SELECT = """
+SELECT
+  'INV' || lpad(i::VARCHAR, 8, '0')                                              AS invoice_id,
+  'ORD' || lpad(((i * 3) % {n_orders})::VARCHAR, 8, '0')                         AS order_id,
+  CASE i % 3
+    WHEN 0 THEN strftime(DATE '2022-01-05' + (i % 900)::INTEGER, '%Y-%m-%d')
+    WHEN 1 THEN strftime(DATE '2022-01-05' + (i % 900)::INTEGER, '%m/%d/%Y')
+    ELSE (epoch_ms((DATE '2022-01-05' + (i % 900)::INTEGER)::TIMESTAMP))::VARCHAR
+  END                                                                             AS invoice_date,
+  CASE i % 3
+    WHEN 0 THEN '$' || round(50 + (i % 100000) / 10.0, 2)::VARCHAR
+    WHEN 1 THEN round(50 + (i % 100000) / 10.0, 2)::VARCHAR
+    ELSE replace(round(50 + (i % 100000) / 10.0, 2)::VARCHAR, '.', ',')
+  END                                                                             AS amount_due,
+  to_json(struct_pack(
+      net_days     := ([15, 30, 45, 60])[(i % 4) + 1],
+      discount_pct := round((i % 5) / 2.0, 1),
+      method       := (['wire', 'card', 'ach'])[(i % 3) + 1]
+  ))                                                                             AS payment_terms_json,
+  CASE i % 3
+    WHEN 0 THEN (CASE WHEN i % 2 = 0 THEN 'Y' ELSE 'N' END)
+    WHEN 1 THEN (CASE WHEN i % 2 = 0 THEN '1' ELSE '0' END)
+    ELSE (CASE WHEN i % 2 = 0 THEN 'true' ELSE 'false' END)
+  END                                                                             AS paid_flag
+FROM range({start}, {end}) t(i)
+"""
 
 
 def build_catalog(args):
@@ -139,6 +262,23 @@ def gen_perf(con, catalog, db, sizes_gb, n_files):
         print(f"  perf.{ident[1]}: {written} rows (~{gb} GB)", flush=True)
 
 
+def gen_erp(con, catalog, db, n_customers, n_products, n_orders, n_invoices):
+    """Bronze ERP dataset: customers/products/orders/invoices, all dirty string columns."""
+    ensure_namespace(catalog, (db,))
+    tables = [
+        ("customers", ERP_CUSTOMERS_SELECT.format(start=0, end=n_customers)),
+        ("products", ERP_PRODUCTS_SELECT.format(start=0, end=n_products)),
+        ("orders", ERP_ORDERS_SELECT.format(start=0, end=n_orders,
+                                             n_customers=n_customers, n_products=n_products)),
+        ("invoices", ERP_INVOICES_SELECT.format(start=0, end=n_invoices, n_orders=n_orders)),
+    ]
+    for tbl, sql in tables:
+        arrow = con.execute(sql).to_arrow_table()
+        t = recreate_table(catalog, (db, tbl), arrow.schema)
+        t.append(arrow)
+        print(f"  erp.{tbl}: {arrow.num_rows} rows", flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--region")
@@ -151,6 +291,14 @@ def main():
     ap.add_argument("--lineitem-files", type=int, default=20)
     ap.add_argument("--perf-sizes", default="10,20,30,40,80")
     ap.add_argument("--perf-files", type=int, default=8)
+    ap.add_argument("--erp-db", default="erp")
+    ap.add_argument("--erp-customers", type=int, default=75_000)
+    ap.add_argument("--erp-products", type=int, default=60_000)
+    ap.add_argument("--erp-orders", type=int, default=250_000)
+    ap.add_argument("--erp-invoices", type=int, default=100_000)
+    ap.add_argument("--skip-tpch", action="store_true", help="Don't touch the tpch tables (they recreate-in-place).")
+    ap.add_argument("--skip-perf", action="store_true", help="Don't touch the perf tables (they recreate-in-place).")
+    ap.add_argument("--skip-erp", action="store_true", help="Don't touch the erp tables (they recreate-in-place).")
     ap.add_argument("--self-check", action="store_true")
     ap.add_argument("--workdir", default=tempfile.mkdtemp(prefix="genload-"))
     args = ap.parse_args()
@@ -164,16 +312,23 @@ def main():
     if args.self_check:
         return self_check(con, catalog)
 
-    sizes = [float(s) for s in args.perf_sizes.split(",") if s.strip()]
-    print(f"Generating TPC-H sf={args.tpch_scale} -> glue:{args.tpch_db}", flush=True)
-    gen_tpch(con, catalog, args.tpch_db, args.tpch_scale, args.lineitem_files)
-    print(f"Generating perf {sizes} GB -> glue:{args.perf_db}", flush=True)
-    gen_perf(con, catalog, args.perf_db, sizes, args.perf_files)
+    if not args.skip_tpch:
+        print(f"Generating TPC-H sf={args.tpch_scale} -> glue:{args.tpch_db}", flush=True)
+        gen_tpch(con, catalog, args.tpch_db, args.tpch_scale, args.lineitem_files)
+    if not args.skip_perf:
+        sizes = [float(s) for s in args.perf_sizes.split(",") if s.strip()]
+        print(f"Generating perf {sizes} GB -> glue:{args.perf_db}", flush=True)
+        gen_perf(con, catalog, args.perf_db, sizes, args.perf_files)
+    if not args.skip_erp:
+        print(f"Generating erp -> glue:{args.erp_db}", flush=True)
+        gen_erp(con, catalog, args.erp_db, args.erp_customers, args.erp_products,
+                args.erp_orders, args.erp_invoices)
     print("DONE", flush=True)
 
 
 def self_check(con, catalog):
-    """Offline: tiny tpch + a tiny perf table into a local sqlite Iceberg catalog; assert round-trip."""
+    """Offline: tiny tpch + a tiny perf table + a tiny erp dataset into a local sqlite Iceberg
+    catalog; assert round-trip."""
     gen_tpch(con, catalog, "tpch", scale=0.01, n_files=3)
     # tiny perf table (~50k rows), reuse the slicing path
     ensure_namespace(catalog, ("perf",))
@@ -182,15 +337,23 @@ def self_check(con, catalog):
     t = recreate_table(catalog, ("perf", "t_tiny"), arrow.schema)
     write_in_slices(t, arrow, 4)
 
+    # tiny erp dataset (customers=50, products=40, orders=60, invoices=20)
+    gen_erp(con, catalog, "erp", n_customers=50, n_products=40, n_orders=60, n_invoices=20)
+
     # read back via the catalog and assert counts
     n_perf = catalog.load_table(("perf", "t_tiny")).scan().to_arrow().num_rows
     n_region = catalog.load_table(("tpch", "region")).scan().to_arrow().num_rows
+    n_erp_orders = catalog.load_table(("erp", "orders")).scan().to_arrow().num_rows
+    n_erp_invoices = catalog.load_table(("erp", "invoices")).scan().to_arrow().num_rows
     assert n_perf == 50_000, f"perf readback {n_perf} != 50000"
     assert n_region == 5, f"tpch.region readback {n_region} != 5"
+    assert n_erp_orders == 60, f"erp.orders readback {n_erp_orders} != 60"
+    assert n_erp_invoices == 20, f"erp.invoices readback {n_erp_invoices} != 20"
     # >=4 data files were requested for the perf table
     files = list(catalog.load_table(("perf", "t_tiny")).scan().plan_files())
     assert len(files) >= 4, f"expected >=4 perf data files, got {len(files)}"
-    print(f"SELF-CHECK OK: perf={n_perf} rows in {len(files)} files, tpch.region={n_region} rows")
+    print(f"SELF-CHECK OK: perf={n_perf} rows in {len(files)} files, tpch.region={n_region} rows, "
+          f"erp.orders={n_erp_orders} rows, erp.invoices={n_erp_invoices} rows")
 
 
 if __name__ == "__main__":

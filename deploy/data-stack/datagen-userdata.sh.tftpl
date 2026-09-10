@@ -38,10 +38,15 @@ aws s3 cp "s3://$BUCKET/${script_key}" /opt/gen/gen_load.py --region "$REGION"
   --bucket "$BUCKET" \
   --tpch-db "${tpch_db}" \
   --perf-db "${perf_db}" \
+  --erp-db "${erp_db}" \
   --tpch-scale "${scale}" \
   --lineitem-files "${lineitem_files}" \
   --perf-sizes "${perf_sizes}" \
-  --perf-files "${perf_files}"
+  --perf-files "${perf_files}" \
+  --erp-customers "${erp_customers}" \
+  --erp-products "${erp_products}" \
+  --erp-orders "${erp_orders}" \
+  --erp-invoices "${erp_invoices}"
 
 put_status "DONE@$(date -u +%FT%TZ)"
 shutdown -h now

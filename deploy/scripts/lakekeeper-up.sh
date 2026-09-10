@@ -60,27 +60,33 @@ LK_SECRET_ACCESS_KEY="$(ssm "$LK_SSM/storage/secret_access_key")"
 # --- Source: the data-stack's SecureStrings, under the root published above -----------------------
 DATA_REGION="$(ssm "$DATA_SSM/region")"
 DATA_BUCKET="$(ssm "$DATA_SSM/bucket")"
-DATA_NAMESPACE="$(ssm "$DATA_SSM/namespace/tpch")"
 
-echo "==> Provisioning Lakekeeper (warehouse '$LK_WAREHOUSE', namespace '$DATA_NAMESPACE') from Glue database '$DATA_NAMESPACE' in bucket '$DATA_BUCKET'"
+# One Glue database per source namespace, each registered into Lakekeeper under the same name it
+# already has in Glue (so bench/run.sh's NAMESPACE default and this repo's demo tooling resolve
+# unchanged under either catalog). Add a name here once its Glue database + SSM namespace param
+# exist (see deploy/data-stack/main.tf) — lakekeeper-provision.sh itself is namespace-agnostic.
+SOURCE_NAMESPACES=("tpch" "erp")
 
-# Maps this environment onto lakekeeper-provision.sh's LK_SOURCE_*/LK_TARGET_* contract — the
-# operator sets none of these by hand. LK_SOURCE_KIND defaults to 'glue'. The target namespace is
-# the SAME tpch namespace the source database and bench/run.sh's NAMESPACE default already use, so
-# the existing TPC-H query set resolves unchanged under either catalog.
-export LK_SOURCE_REGION="$DATA_REGION"
-export LK_SOURCE_DATABASE="$DATA_NAMESPACE"
-export LK_TARGET_CATALOG_URI="$LK_CATALOG_URI"
-export LK_TARGET_TOKEN_URI="$LK_TOKEN_URI"
-export LK_TARGET_CLIENT_ID="$LK_CLIENT_ID"
-export LK_TARGET_CLIENT_SECRET="$LK_CLIENT_SECRET"
-export LK_TARGET_WAREHOUSE="$LK_WAREHOUSE"
-export LK_TARGET_NAMESPACE="$DATA_NAMESPACE"
-export LK_TARGET_REGION="$DATA_REGION"
-export LK_TARGET_ACCESS_KEY_ID="$LK_ACCESS_KEY_ID"
-export LK_TARGET_SECRET_ACCESS_KEY="$LK_SECRET_ACCESS_KEY"
+for ns in "${SOURCE_NAMESPACES[@]}"; do
+  DATA_NAMESPACE="$(ssm "$DATA_SSM/namespace/$ns")"
+  echo "==> Provisioning Lakekeeper (warehouse '$LK_WAREHOUSE', namespace '$DATA_NAMESPACE') from Glue database '$DATA_NAMESPACE' in bucket '$DATA_BUCKET'"
 
-"$HERE/lakekeeper-provision.sh"
+  # Maps this environment onto lakekeeper-provision.sh's LK_SOURCE_*/LK_TARGET_* contract — the
+  # operator sets none of these by hand. LK_SOURCE_KIND defaults to 'glue'.
+  export LK_SOURCE_REGION="$DATA_REGION"
+  export LK_SOURCE_DATABASE="$DATA_NAMESPACE"
+  export LK_TARGET_CATALOG_URI="$LK_CATALOG_URI"
+  export LK_TARGET_TOKEN_URI="$LK_TOKEN_URI"
+  export LK_TARGET_CLIENT_ID="$LK_CLIENT_ID"
+  export LK_TARGET_CLIENT_SECRET="$LK_CLIENT_SECRET"
+  export LK_TARGET_WAREHOUSE="$LK_WAREHOUSE"
+  export LK_TARGET_NAMESPACE="$DATA_NAMESPACE"
+  export LK_TARGET_REGION="$DATA_REGION"
+  export LK_TARGET_ACCESS_KEY_ID="$LK_ACCESS_KEY_ID"
+  export LK_TARGET_SECRET_ACCESS_KEY="$LK_SECRET_ACCESS_KEY"
+
+  "$HERE/lakekeeper-provision.sh"
+done
 
 cat <<EOF
 
@@ -88,7 +94,7 @@ Lakekeeper '$ENV' is up and provisioned:
   Catalog URI (public): $LK_CATALOG_URI
   Token URI (public):   $LK_TOKEN_URI
   Warehouse:            $LK_WAREHOUSE
-  Namespace:            $DATA_NAMESPACE
+  Namespaces:           ${SOURCE_NAMESPACES[*]}
 
 Next: deploy/scripts/secrets.sh $ENV adds the private-IP Lakekeeper block to bench/.env.
 Then: BENCH_CATALOG=lakekeeper make bench

@@ -80,6 +80,35 @@ variable "perf_db_name" {
   default = "perf"
 }
 
+variable "erp_db_name" {
+  type    = string
+  default = "erp"
+}
+
+variable "erp_customers" {
+  type        = number
+  default     = 75000
+  description = "Row count for the erp.customers bronze table."
+}
+
+variable "erp_products" {
+  type        = number
+  default     = 60000
+  description = "Row count for the erp.products bronze table."
+}
+
+variable "erp_orders" {
+  type        = number
+  default     = 250000
+  description = "Row count for the erp.orders bronze table."
+}
+
+variable "erp_invoices" {
+  type        = number
+  default     = 100000
+  description = "Row count for the erp.invoices bronze table."
+}
+
 # --- Spark benchmark (EMR Serverless, opt-in) ------------------------------
 variable "enable_emr_serverless" {
   type        = bool
