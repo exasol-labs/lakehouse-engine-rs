@@ -17,7 +17,7 @@ variable "key_pair_name" {
 variable "allowed_cidrs" {
   type        = list(string)
   default     = []
-  description = "Ingress allowlist for SSH/Lakekeeper/Keycloak. Empty => lakekeeper-up.sh injects this machine's public IP /32."
+  description = "Ingress allowlist for SSH/Lakekeeper/Keycloak. Empty => main.tf's data.http.my_ip/local.effective_cidrs resolve it to this machine's public IP /32 at apply time."
 }
 
 variable "ttl_days" {
