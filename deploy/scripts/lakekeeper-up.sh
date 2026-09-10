@@ -79,7 +79,7 @@ for ns in "${SOURCE_NAMESPACES[@]}"; do
   # under tpch.db, erp under erp.db — one warehouse's storage profile can't cover both). tpch
   # keeps the plain $LK_WAREHOUSE name so existing bench defaults/secrets.sh output don't change;
   # every other namespace gets its own warehouse, suffixed by name.
-  if [ "$ns" = "tpch" ]; then
+  if [[ "$ns" == "tpch" ]]; then
     NS_WAREHOUSE="$LK_WAREHOUSE"
   else
     NS_WAREHOUSE="${LK_WAREHOUSE}-${ns}"

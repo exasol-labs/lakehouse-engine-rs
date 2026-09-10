@@ -16,7 +16,7 @@ cd "$STACK"
 tofu workspace select "$ENV" >/dev/null 2>&1 || { echo "no workspace '$ENV'"; exit 1; }
 # Read only the specific outputs needed, not the full state via `-json` — state can carry
 # sensitive values beyond what this script uses, even ones marked `sensitive`.
-raw() { tofu output -raw "$1"; }
+raw() { local name="$1"; tofu output -raw "$name"; }
 
 NODE1="$(raw first_node_ip)"
 CL_SSM="$(raw ssm_root)"
@@ -77,7 +77,7 @@ chmod 600 "$ENVFILE"
 LK_STACK="$HERE/../lakekeeper-stack"
 if (cd "$LK_STACK" && tofu workspace select "$ENV" >/dev/null 2>&1); then
   # Same reasoning as `raw` above: only the specific outputs needed, not the full state.
-  lk_raw() { (cd "$LK_STACK" && tofu output -raw "$1"); }
+  lk_raw() { local name="$1"; (cd "$LK_STACK" && tofu output -raw "$name"); }
   LK_SSM="$(lk_raw ssm_root)"
   cat >>"$ENVFILE" <<EOF
 
