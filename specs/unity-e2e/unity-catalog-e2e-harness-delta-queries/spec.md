@@ -3,12 +3,12 @@
 End-to-end coverage of the actual rows a query returns over the seeded Delta fixtures — delete-free,
 deletion-vector, column-mapped, partitioned, join/aggregate, type-widened, and unplannable-type
 tables — run through the same `unity-e2e` stack and virtual schema as
-`e2e-harness/unity-catalog-e2e-harness`. Split out of that feature once its scenario count crossed
+`unity-e2e/unity-catalog-e2e-harness`. Split out of that feature once its scenario count crossed
 this library's per-spec organization threshold.
 
 ## Background
 
-* **Split from `e2e-harness/unity-catalog-e2e-harness`, issue #320.** That feature keeps harness
+* **Split from `unity-e2e/unity-catalog-e2e-harness`, issue #320.** That feature keeps harness
   bring-up, createVirtualSchema enumeration, the virtual schema's storage-credential wiring, the
   stack-unavailable failure contract, and the credential-leak guarantee. This feature owns every
   scenario that asserts the ROWS a query returns over a seeded Delta table.
@@ -22,7 +22,7 @@ this library's per-spec organization threshold.
   `make test-e2e-unity` suite, in the same `e2e_unity_test.rs` binary as the sibling feature's
   scenarios.
 * The virtual schema these scenarios query against is the one
-  `e2e-harness/unity-catalog-e2e-harness` § "The suite's virtual schema carries the storage
+  `unity-e2e/unity-catalog-e2e-harness` § "The suite's virtual schema carries the storage
   credentials a UDF-side scan needs" creates; that scenario's guarantee — a CONNECTION carrying the
   MinIO endpoint and static storage credentials, provisioned through the shared harness scan-UDF
   definition — is a precondition every scenario below relies on.
@@ -55,7 +55,7 @@ this library's per-spec organization threshold.
   allow-list, so the reader-feature refusal scenario below keeps a live fixture and the gate keeps an
   end-to-end assertion.
 * **Split, issue #349/#359: the type-widening, refused-column, varied-types, and timestamp
-  declared-type scenarios moved to `e2e-harness/unity-catalog-e2e-harness-delta-types`.** This
+  declared-type scenarios moved to `unity-e2e/unity-catalog-e2e-harness-delta-types`.** This
   feature's scenario count crossed this library's per-spec organization threshold once those
   scenarios landed; that sibling feature now owns every scenario that asserts the Exasol TYPE a
   Delta column declares rather than the ROWS a query returns. This feature keeps the delete-free,
@@ -139,4 +139,4 @@ this library's per-spec organization threshold.
 * *AND* the suite MUST fail (not skip) when the Unity Catalog server, MinIO, or Exasol is unreachable
 
 > The type-widening, refused-column, varied-types, and timestamp declared-type scenarios live in
-> `e2e-harness/unity-catalog-e2e-harness-delta-types`.
+> `unity-e2e/unity-catalog-e2e-harness-delta-types`.

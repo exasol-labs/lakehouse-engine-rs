@@ -25,7 +25,7 @@ shared-harness provisioning, and DDL-failure output redaction.
   `exasol-e2e`, `lakekeeper-e2e`, and `cloud-e2e`, and MUST fail (never skip) when
   the local stack, the credential variables, or the Azure account is unavailable —
   the same fail-loud discipline as `e2e-harness/e2e-harness` and
-  `e2e-harness/lakekeeper-e2e-harness`, and the opposite of
+  `lakekeeper-e2e/lakekeeper-e2e-harness`, and the opposite of
   `e2e-harness/cloud-e2e-harness`.
 * **Three credential roles, never conflated.** The harness's own container setup
   and teardown authenticates with an **Entra ID service principal**, because the
@@ -78,7 +78,7 @@ shared-harness provisioning, and DDL-failure output redaction.
   Two Lakekeeper warehouses sit over that one container — `<container>-static` with
   `sas-enabled: false` and `<container>-vended` with `sas-enabled: true` — each with
   `key-prefix` equal to its own warehouse name, so neither prefix is a prefix of the
-  other. This is the topology `e2e-harness/lakekeeper-e2e-harness` already runs over
+  other. This is the topology `lakekeeper-e2e/lakekeeper-e2e-harness` already runs over
   its one shared MinIO `warehouse` bucket. One container halves the live-Azure
   provisioning cost of a second credential arm and keeps the orphan surface at one
   resource — and that is all it buys. It does not make the cross-arm row comparison

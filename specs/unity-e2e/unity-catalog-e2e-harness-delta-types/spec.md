@@ -4,7 +4,7 @@ End-to-end coverage of the Exasol TYPES and VALUES a Delta column declares over 
 `stats_all_types` and `type_widening` fixtures — type widening across a narrow/wide file boundary,
 per-column refusal of an unmappable type, the full varied-types matrix, and the version-gated
 timestamp declared-type precision — run through the same `unity-e2e` stack and virtual schema as
-`e2e-harness/unity-catalog-e2e-harness-delta-queries`. Split out of that feature once its scenario
+`unity-e2e/unity-catalog-e2e-harness-delta-queries`. Split out of that feature once its scenario
 count crossed this library's per-spec organization threshold; that sibling feature keeps every
 scenario that asserts the ROWS a query returns rather than the declared TYPE of a column.
 
@@ -31,7 +31,7 @@ scenario that asserts the ROWS a query returns rather than the declared TYPE of 
   scenarios.
 * **This delta is issue #322.** It replaces the single "cannot plan" scenario with three, because the
   engine's answer for the two fixtures that scenario covered has split three ways: `type_widening` and
-  `unshredded_variant` are now refused on their READER FEATURE (`e2e-harness/unity-catalog-e2e-harness-delta-queries`
+  `unshredded_variant` are now refused on their READER FEATURE (`unity-e2e/unity-catalog-e2e-harness-delta-queries`
   owns that refusal scenario), `stats_all_types` is now QUERYABLE on its 13 mappable columns, and
   `stats_all_types` is refused only on the three columns whose type this engine cannot render.
 * **`type_widening` is already seeded and was never asserted.** `scripts/unity/seed.sh` registers it as
