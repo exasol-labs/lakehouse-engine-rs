@@ -1,3 +1,5 @@
+use exasol_udf_sdk::test_support::DefaultsCtx;
+
 use super::ENGINE_VERSION;
 
 #[test]
@@ -18,4 +20,10 @@ fn engine_version_is_a_plain_semver_string() {
             "each ENGINE_VERSION component must be all-digits, got {part:?} in {ENGINE_VERSION:?}"
         );
     }
+}
+
+#[test]
+fn lakehouse_version_returns_the_engine_version() {
+    let result = super::lakehouse_version(&mut DefaultsCtx).unwrap();
+    assert_eq!(result.as_deref(), Some(ENGINE_VERSION));
 }
