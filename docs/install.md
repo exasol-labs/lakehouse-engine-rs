@@ -267,8 +267,8 @@ make bucketfs-upload-so        # → BucketFS udf/liblakehouse_engine.so
 ```
 
 The build runs inside `rust:1.94-trixie` (glibc 2.41, which matches the SLC). It rebuilds only
-when crate sources, manifests, or the lockfile change. One `.so` exports **both** RUST entry
-points (VS adapter + scan SCALAR UDF). This path needs Docker and
+when crate sources, manifests, or the lockfile change. One `.so` exports **all three** RUST entry
+points (VS adapter, scan SCALAR UDF, and version query). This path needs Docker and
 [`exapump`](https://github.com/exasol-labs/exapump). It also needs the Rust SLC already
 registered, because it uploads only the engine file, not the SLC. Before you use this path,
 register the SLC once. Run the [one-line command](#install-with-one-command) without `--skip-slc`,

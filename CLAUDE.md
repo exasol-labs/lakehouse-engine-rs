@@ -282,8 +282,9 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan) depends on
   `crates/lakehouse-catalog` (Iceberg REST + Unity Catalog access — `CatalogSession`, auth, namespace
   enumeration, vended-storage resolution, SigV4 signing). The catalog crate compiles into the
-  engine's cdylib, so one `.so` still exports **both** entry points (VS adapter + DataFusion scan
-  SET UDF) — `language-container-rs` 0.14.0 supports multiple entry points per `.so`.
+  engine's cdylib, so one `.so` still exports **all three** entry points (VS adapter + DataFusion
+  scan UDF + version query UDF) — `language-container-rs` 0.14.0 supports multiple entry points
+  per `.so`.
 - SDK: `exasol-udf-sdk` + `exasol-udf-macros`, pinned **only** in `[workspace.dependencies]` of the
   root `Cargo.toml`. Since 0.18.0, `connect-back` is **always-on** (no longer a feature flag).
   Enable `emit-arrow` to unlock `ctx.emit_batch`.
