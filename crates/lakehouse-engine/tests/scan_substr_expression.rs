@@ -1,14 +1,3 @@
-//! Host integration test (Docker-free) for `substr`/`left` scalar-expression
-//! pushdown, mirroring the harness in `scan_column_binding.rs`: drives the
-//! production raw-scan pipeline (`run_raw_scan_with_session` ->
-//! `build_scan_sql`) against a local `file://` Parquet written via
-//! `ArrowWriter`, with a `ProjectionItem::Expr` carrying a rendered
-//! `substr(...)`/`left(...)` SQL fragment.
-//!
-//! Without `unicode_expressions` enabled on the `datafusion` dependency,
-//! `substr(...)` fails to plan with "Substring could not be planned by
-//! registered expr planner".
-
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, StringArray};
@@ -29,8 +18,6 @@ use parquet::arrow::ArrowWriter;
 
 mod scan_fixture;
 
-/// Storage props are never dialed for a local `file://` scan; a placeholder
-/// keeps the spec well-formed.
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
@@ -42,9 +29,6 @@ fn dummy_storage() -> StorageBackend {
     })
 }
 
-/// Write a local Parquet at `dir/relative` with an `id` (Int64) column and a
-/// `name` (Utf8) column, given the row values. Returns the file's absolute
-/// `file://` URL.
 fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: &[(i64, &str)]) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -115,8 +99,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Run the production raw scan for `spec` against a session whose `file://`
-/// object store is a plain `LocalFileSystem` (no HEAD interception needed).
 async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch>, UdfError> {
     let session = datafusion::execution::context::SessionContext::new_with_config(
         session_config_for_spec(spec),
@@ -140,8 +122,6 @@ fn int64_column(batch: &RecordBatch, index: usize) -> &Int64Array {
         .expect("int64 column")
 }
 
-/// Read a string-typed column regardless of whether DataFusion materialized it
-/// as `Utf8` or `Utf8View` (mirrors `scan_plan_shape.rs`'s dual-downcast).
 fn string_value(batch: &RecordBatch, index: usize, row: usize) -> String {
     let column = batch.column(index);
     if let Some(v) = column
