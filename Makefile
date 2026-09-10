@@ -227,6 +227,36 @@ lint-install:
 	  && shellcheck -s bash deploy/scripts/install.sh deploy/scripts/tests/install.test.sh \
 	  || echo "shellcheck not installed locally — skipping (CI enforces it)"
 
+# Offline stubbed-PATH harness for the AWS Lakekeeper catalog deliverables (deploy/lakekeeper-stack/,
+# lakekeeper-provision.sh, lakekeeper-up.sh, lakekeeper-down.sh). Stubs tofu/aws/ssh/curl/jq on a
+# temp PATH and asserts recorded arguments, rendered template contents, credential hygiene, and
+# every emitted JSON request body — no live AWS, no network. Mirrors test-install's pattern
+# (deploy/scripts/tests/install.test.sh) for the same shell-deliverable regression-coverage reason.
+# NOT wired into CI: unlike install.sh (fetched straight off main by every user's curl|bash
+# one-liner), these scripts have no such exposure and no workflow gates any of the four existing
+# deploy/ stacks — see plan.md task 5.3 (specs/_recorded or specs/_plans/add-lakekeeper-aws-perf-catalog).
+test-lakekeeper-scripts:
+	bash deploy/scripts/tests/lakekeeper.test.sh
+
+# Local Docker integration verification: drives the real lakekeeper-provision.sh twice against the
+# docker-compose.lakekeeper.yml stack (postgres + keycloak + lakekeeper), asserting idempotent
+# bootstrap/warehouse creation and register-by-reference round-trips. FAILS (not skips) when that
+# stack is down — bring it up first:
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
+#     minio keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+test-lakekeeper-local:
+	bash deploy/scripts/tests/lakekeeper-local.test.sh
+
+# Optional: gated on shellcheck being present locally, same as lint-install. Not run by any CI
+# job (see test-lakekeeper-scripts above) — this is a local pre-commit check only.
+lint-lakekeeper-scripts:
+	@if command -v shellcheck >/dev/null 2>&1; then \
+	  shellcheck -s bash deploy/scripts/lakekeeper-provision.sh deploy/scripts/lakekeeper-up.sh \
+	       deploy/scripts/lakekeeper-down.sh; \
+	else \
+	  echo "shellcheck not installed locally — skipping (no CI job runs it for these scripts)"; \
+	fi
+
 # Manually-invoked live benchmark: docker (self-contained local stack) or remote
 # (real AWS S3 + Glue Iceberg TPC-H + external Exasol cluster). Builds the
 # working-tree .so, then runs bench/run.sh, which reads config from a gitignored
@@ -264,4 +294,4 @@ test-e2e-unity: cross-udf-build
 	$(MAKE) unity-up
 	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
 
-.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity
+.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts

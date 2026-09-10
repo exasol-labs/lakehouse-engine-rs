@@ -64,4 +64,30 @@ BUCKETFS_WRITE_PASS=$BFS_PASS
 EOF
 
 chmod 600 "$ENVFILE"
+
+# --- Lakekeeper block (opt-in, ephemeral) -----------------------------------
+# Omitted entirely when this env has no applied lakekeeper-stack workspace — an ephemeral
+# catalog nobody has `tofu apply`'d yet is not an error, just nothing to add. BENCH_CATALOG is
+# NEVER written here, in either branch: it stays the operator's own explicit choice
+# (`BENCH_CATALOG=lakekeeper make bench`), so a stale bench/.env can never silently flip a run
+# off Glue. Private-IP URIs only — this file is read by `make bench` running from the operator's
+# own machine only in the sense that ITS network calls land in the CONNECTION object executed
+# INSIDE the Exasol cluster (same VPC as the Lakekeeper box), never from this machine itself.
+LK_STACK="$HERE/../lakekeeper-stack"
+if LK_OUT="$(cd "$LK_STACK" && tofu workspace select "$ENV" >/dev/null 2>&1 && tofu output -json)"; then
+  lk_jqr() { jq -r "$1" <<<"$LK_OUT"; }
+  LK_SSM="$(lk_jqr '.ssm_root.value')"
+  cat >>"$ENVFILE" <<EOF
+
+LAKEKEEPER_CATALOG_URI=$(lk_jqr '.catalog_uri_private.value')
+LAKEKEEPER_TOKEN_URI=$(lk_jqr '.token_uri_private.value')
+LAKEKEEPER_CLIENT_ID=$(lk_jqr '.oidc_client_id.value')
+LAKEKEEPER_CLIENT_SECRET=$(ssm "$LK_SSM/oauth2/client_secret")
+LAKEKEEPER_WAREHOUSE=$(lk_jqr '.warehouse_name.value')
+EOF
+  echo "Lakekeeper block added to $ENVFILE (private-IP URIs). Set BENCH_CATALOG=lakekeeper to use it."
+else
+  echo "No lakekeeper-stack workspace '$ENV' — omitting the Lakekeeper block from $ENVFILE (run deploy/scripts/lakekeeper-up.sh $ENV first if you need it)."
+fi
+
 echo "Wrote $ENVFILE (EXASOL_HOST=$NODE1, namespace=$NS_TPCH). Run: make bench"
