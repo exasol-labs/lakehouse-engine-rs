@@ -14,9 +14,6 @@ decomposable statistical aggregates (`STDDEV`/`VARIANCE` family).
   sufficient statistics; the outer wrapper reconstructs variance/stddev from these.
 * Only SDK Value types cross the `.so` boundary; no Arrow types.
 * Credentials MUST NOT appear in any error message.
-* `sqlparser` turns `SUBSTR(...)` and `SUBSTRING(...)` into the `Substring` AST node, which resolves only through a registered `ExprPlanner`, not the scalar-function registry.
-* `UnicodeFunctionPlanner` is the sole planner for `Substring`, registered only when `unicode_expressions` is enabled (issue #187).
-* Plain calls (`left(...)`, `right(...)`, `character_length(...)`, `strpos(...)`) resolve through the scalar-function registry and are unaffected.
 
 ## Scenarios
 
@@ -37,11 +34,3 @@ decomposable statistical aggregates (`STDDEV`/`VARIANCE` family).
 * *AND* the partial count SHALL exclude rows where the target column is NULL, so the merged statistic matches single-node semantics
 * *AND* an empty shard (or empty group) SHALL emit a partial count of zero with NULL partial sums that the wrapper's merge ignores
 * *AND* no Arrow type SHALL cross the `.so` boundary
-
-### Scenario: Scan plans a rendered SUBSTR fragment in select-list and filter positions
-
-* *GIVEN* a scan spec whose projection carries `substr("NAME", 1, 5)` and whose filter carries `substr("NAME", 1, 5) = '<literal>'`
-* *WHEN* the scan UDF runs for that spec
-* *THEN* the UDF SHALL plan both fragments and emit the evaluated substring value for matching rows
-* *AND* the UDF SHALL NOT fail with `Substring could not be planned by registered expr planner`
-* *AND* a rendered `left(...)` fragment in the same select list SHALL plan and evaluate, unchanged by this delta
