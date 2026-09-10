@@ -155,11 +155,26 @@ case "$sql" in
       exit 1
     fi
     exit 0 ;;
-  *"LAKEHOUSE_SCAN('x', 'y')"*)
+  *"LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"*)
     case "${EXAPUMP_SMOKE_MODE:-pass}" in
-      mismatch) echo "F-UDF-CL-RUST-9001: Fingerprint mismatch: expected 0.20.3:rustc_1.94, found 0.19.0:rustc_1.90" >&2; exit 1 ;;
-      anomaly)  echo "R"; echo "some-unexpected-row"; exit 0 ;;
-      *)        echo "F-UDF-CL-RUST-9001: error deserializing scan spec: expected value at line 1 column 1" >&2; exit 1 ;;
+      fingerprint-mismatch)
+        echo "F-UDF-CL-RUST-9001: Fingerprint mismatch: expected 0.20.3:rustc_1.94, found 0.19.0:rustc_1.90" >&2
+        exit 1 ;;
+      version-mismatch)
+        echo "[connected to stub]"
+        echo "LAKEHOUSE_ENGINE_VERSION"
+        echo "${EXAPUMP_WRONG_VERSION:-9.9.9}"
+        echo "1 row in set"
+        exit 0 ;;
+      other-error)
+        echo "Error: connection to database lost" >&2
+        exit 1 ;;
+      *)
+        echo "[connected to stub]"
+        echo "LAKEHOUSE_ENGINE_VERSION"
+        echo "${EXAPUMP_LAKEHOUSE_VERSION:-0.26.3}"
+        echo "1 row in set"
+        exit 0 ;;
     esac ;;
   *"CREATE "*)
     if [[ "${EXAPUMP_DDL_FAIL:-0}" == "1" ]]; then echo "Error: object creation failed" >&2; exit 1; fi
@@ -955,10 +970,10 @@ test_saas_verify_listed_quoted_match() {
   assert_eq "exact match: still verifies a real upload" "yes" "$exact_match"
 }
 
-test_three_scripts_ddl_saas_path_types() {
-  echo "== test_three_scripts_ddl_saas_path_types =="
+test_four_scripts_ddl_saas_path_types() {
+  echo "== test_four_scripts_ddl_saas_path_types =="
   # Unit: DDL string shapes.
-  local scan dist adapter schema
+  local scan dist adapter version schema
   scan="$( source "$INSTALLER"; ddl_scan LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
   assert_contains "scan is RUST SCALAR" "$scan" "RUST SCALAR SCRIPT"
   assert_contains "scan uses dynamic EMITS" "$scan" "EMITS (...)"
@@ -967,8 +982,12 @@ test_three_scripts_ddl_saas_path_types() {
   assert_contains "distribute is LUA SET" "$dist" "LUA SET SCRIPT"
   adapter="$( source "$INSTALLER"; ddl_adapter LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
   assert_contains "adapter references SaaS %udf_object path" "$adapter" "/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so"
+  version="$( source "$INSTALLER"; ddl_version LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
+  assert_contains "version is RUST SCALAR" "$version" "RUST SCALAR SCRIPT"
+  assert_contains "version RETURNS VARCHAR(100)" "$version" "RETURNS VARCHAR(100)"
+  assert_not_contains "version is never EMITS" "$version" "EMITS"
 
-  # Integration: the three scripts are actually created + CREATE SCHEMA IF NOT EXISTS.
+  # Integration: all four scripts are actually created + CREATE SCHEMA IF NOT EXISTS.
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "ddl: install succeeds" "$LAST_RC"
@@ -977,31 +996,43 @@ test_three_scripts_ddl_saas_path_types() {
   assert_contains "ddl: LAKEHOUSE_ADAPTER RUST ADAPTER" "$log" "RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER"
   assert_contains "ddl: LAKEHOUSE_SCAN RUST SCALAR" "$log" "RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN"
   assert_contains "ddl: dynamic EMITS on scan" "$log" "EMITS (...)"
+  assert_contains "ddl: LAKEHOUSE_VERSION RUST SCALAR RETURNS" "$log" "RUST SCALAR SCRIPT LHVS.LAKEHOUSE_VERSION"
+  assert_contains "ddl: LAKEHOUSE_VERSION RETURNS VARCHAR(100)" "$log" "RETURNS VARCHAR(100)"
   assert_contains "ddl: DISTRIBUTE_FILES LUA SET" "$log" "LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "ddl: uses CREATE OR REPLACE" "$log" "CREATE OR REPLACE"
+  assert_not_contains "next-step template: no CONNECTION grant for LAKEHOUSE_VERSION" "$LAST_OUT" "FOR SCRIPT LHVS.LAKEHOUSE_VERSION"
 }
 
-test_fingerprint_smoke_pass_and_fail() {
-  echo "== test_fingerprint_smoke_pass_and_fail =="
+test_version_smoke_pass_and_fail() {
+  echo "== test_version_smoke_pass_and_fail =="
   reset_env
   export EXAPUMP_SMOKE_MODE=pass
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "smoke pass: install succeeds" "$LAST_RC"
-  assert_contains "smoke pass: reported passed" "$LAST_OUT" "Fingerprint smoke test passed"
+  assert_contains "smoke pass: reported passed" "$LAST_OUT" "Version smoke test passed"
 
   reset_env
-  export EXAPUMP_SMOKE_MODE=mismatch
+  export EXAPUMP_SMOKE_MODE=version-mismatch
   run_file "${HAPPY_ARGS[@]}"
-  assert_rc_nonzero "smoke mismatch: nonzero exit" "$LAST_RC"
-  assert_contains "smoke mismatch: reports fingerprint failure" "$LAST_OUT" "fingerprint smoke test FAILED"
-  assert_contains "smoke mismatch: remediation mentions SLC alignment" "$LAST_OUT" "SLC"
-  assert_not_contains "smoke mismatch: does not print success" "$LAST_OUT" "query-ready"
+  assert_rc_nonzero "smoke version-mismatch: nonzero exit" "$LAST_RC"
+  assert_contains "smoke version-mismatch: reports version failure" "$LAST_OUT" "version smoke test FAILED"
+  assert_contains "smoke version-mismatch: names the expected version" "$LAST_OUT" "0.26.3"
+  assert_contains "smoke version-mismatch: names the reported version" "$LAST_OUT" "9.9.9"
+  assert_not_contains "smoke version-mismatch: does not print success" "$LAST_OUT" "query-ready"
 
   reset_env
-  export EXAPUMP_SMOKE_MODE=anomaly
+  export EXAPUMP_SMOKE_MODE=fingerprint-mismatch
   run_file "${HAPPY_ARGS[@]}"
-  assert_rc_nonzero "smoke anomaly: nonzero exit" "$LAST_RC"
-  assert_contains "smoke anomaly: surfaces the anomaly" "$LAST_OUT" "anomaly"
+  assert_rc_nonzero "smoke fingerprint-mismatch: nonzero exit" "$LAST_RC"
+  assert_contains "smoke fingerprint-mismatch: reports fingerprint failure" "$LAST_OUT" "fingerprint smoke test FAILED"
+  assert_contains "smoke fingerprint-mismatch: remediation mentions SLC alignment" "$LAST_OUT" "SLC"
+  assert_not_contains "smoke fingerprint-mismatch: does not print success" "$LAST_OUT" "query-ready"
+
+  reset_env
+  export EXAPUMP_SMOKE_MODE=other-error
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_nonzero "smoke other-error: nonzero exit" "$LAST_RC"
+  assert_contains "smoke other-error: surfaces the underlying database error" "$LAST_OUT" "connection to database lost"
 }
 
 test_stops_at_product_prints_template() {
@@ -1115,7 +1146,7 @@ test_stdin_piped_invocation_no_body_consumption() {
   reset_env
   run_stdin "${HAPPY_ARGS[@]}"
   assert_rc_zero "stdin-piped: install succeeds without truncation" "$LAST_RC"
-  assert_contains "stdin-piped: reaches the smoke-test pass" "$LAST_OUT" "Fingerprint smoke test passed"
+  assert_contains "stdin-piped: reaches the smoke-test pass" "$LAST_OUT" "Version smoke test passed"
   assert_contains "stdin-piped: reaches the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   local log; log="$(log_content)"
   # If any subprocess had consumed the piped body, execution would truncate before these.
@@ -1123,7 +1154,7 @@ test_stdin_piped_invocation_no_body_consumption() {
   assert_contains "stdin-piped: release asset downloaded (releases/download)" "$log" "releases/download/"
   assert_contains "stdin-piped: SLC uploaded (body not truncated early)" "$log" "/files/rustslc.tar.gz"
   assert_contains "stdin-piped: three scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
-  assert_contains "stdin-piped: smoke-test SQL executed (reached end)" "$log" "LAKEHOUSE_SCAN('x', 'y')"
+  assert_contains "stdin-piped: smoke-test SQL executed (reached end)" "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
 
   # Per-subprocess proof that stdin is redirected from /dev/null: run in file mode with a sentinel
   # payload on the installer's OWN stdin, and make every stub report if it read any stdin. A
@@ -1566,7 +1597,7 @@ test_bucketfs_full_run_artifact_shapes() {
   reset_env
   run_file_bfs "${BFS_HAPPY_ARGS[@]}"
   assert_rc_zero "bfs run: install succeeds" "$LAST_RC"
-  assert_contains "bfs run: reaches the smoke-test pass" "$LAST_OUT" "Fingerprint smoke test passed"
+  assert_contains "bfs run: reaches the smoke-test pass" "$LAST_OUT" "Version smoke test passed"
   assert_contains "bfs run: reaches the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   local log; log="$(log_content)"
 
@@ -1651,7 +1682,7 @@ test_skip_slc_gating() {
   # ... while everything downstream of the SLC still runs.
   assert_contains "skip-slc bfs: engine .so still uploaded" "$log" "extracted/udf/liblakehouse_engine.so udf/liblakehouse_engine.so"
   assert_contains "skip-slc bfs: DDL still created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
-  assert_contains "skip-slc bfs: smoke test still run" "$log" "LAKEHOUSE_SCAN('x', 'y')"
+  assert_contains "skip-slc bfs: smoke test still run" "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
   assert_contains "skip-slc bfs: still prints the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   # The SLC VERSION is still resolved and reported, so the user can see what the DB must already have.
   assert_contains "skip-slc bfs: SLC version still reported" "$LAST_OUT" "Resolved language-container (SLC) version"
@@ -2483,8 +2514,8 @@ main() {
   test_presigned_url_json_unescaping
   test_release_asset_download_via_rest
   test_saas_verify_listed_quoted_match
-  test_three_scripts_ddl_saas_path_types
-  test_fingerprint_smoke_pass_and_fail
+  test_four_scripts_ddl_saas_path_types
+  test_version_smoke_pass_and_fail
   test_stops_at_product_prints_template
   test_target_base_default_and_override
   test_external_failure_actionable

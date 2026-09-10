@@ -43,6 +43,9 @@ pub const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
 /// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
 /// fan-out. Not a Rust entry point — created by plain DDL, no `.so` involved.
 pub const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
+
+/// RUST SCALAR version-query script name.
+pub const VERSION_SCRIPT_NAME: &str = "LAKEHOUSE_VERSION";
 /// BucketFS path for the `.so` (as PUT target).
 pub const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
 /// BucketFS path for the `.so` as referenced in `%udf_object` (no leading `/`).
@@ -157,8 +160,9 @@ pub fn exa_conn() -> ExaConn {
 }
 
 /// Create the dedicated schema, RUST adapter script, RUST scan SCALAR script,
-/// and the LUA SET passthrough distributor. All idempotent (`CREATE OR
-/// REPLACE`), so concurrent recreation across binaries is harmless.
+/// RUST version-query SCALAR script, and the LUA SET passthrough distributor.
+/// All idempotent (`CREATE OR REPLACE`), so concurrent recreation across
+/// binaries is harmless.
 pub fn create_schema_and_scripts(conn: &mut ExaConn) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"));
     conn.execute(&format!(
@@ -169,6 +173,12 @@ pub fn create_schema_and_scripts(conn: &mut ExaConn) {
     conn.execute(&format!(
         r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{SCAN_SCRIPT_NAME}(common VARCHAR(2000000), files VARCHAR(2000000))
 EMITS (...) AS
+%udf_object {SO_UDF_OBJECT_PATH}
+/"#
+    ));
+    conn.execute(&format!(
+        r#"CREATE OR REPLACE {LANG_ALIAS} SCALAR SCRIPT {SCHEMA_NAME}.{VERSION_SCRIPT_NAME}()
+RETURNS VARCHAR(100) AS
 %udf_object {SO_UDF_OBJECT_PATH}
 /"#
     ));

@@ -1192,6 +1192,31 @@ EOF_QV
   return 0
 }
 
+# Filters exapump tabular output down to the first data line, for a query whose
+# value itself may start with a digit (a version string like "0.45.0"). Unlike
+# extract_query_value, this does NOT skip [0-9]* lines -- it instead skips the
+# known column header literal for the aliased LAKEHOUSE_VERSION() projection
+# and the trailing "N row(s) in set" footer line by its distinctive suffix.
+extract_version_value() {
+  local raw="$1" line
+  while IFS= read -r line; do
+    case "$line" in
+      \[*)                                     continue ;;
+      LAKEHOUSE_ENGINE_VERSION*)               continue ;;
+      "")                                      continue ;;
+      *Error*)                                 continue ;;
+      *' row in set'|*' rows in set')          continue ;;
+    esac
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    printf '%s\n' "$line"
+    return 0
+  done <<EOF_QV
+$raw
+EOF_QV
+  return 0
+}
+
 read_script_languages() {
   local out value
   if ! out="$(run_sql "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS WHERE PARAMETER_NAME='SCRIPT_LANGUAGES'" 2>&1)"; then
@@ -1253,12 +1278,16 @@ ddl_scan() {
   printf 'CREATE OR REPLACE RUST SCALAR SCRIPT %s.LAKEHOUSE_SCAN(common VARCHAR(2000000), files VARCHAR(2000000))\nEMITS (...) AS\n%%udf_object %s' "$1" "$2"
 }
 
+ddl_version() {
+  printf 'CREATE OR REPLACE RUST SCALAR SCRIPT %s.LAKEHOUSE_VERSION()\nRETURNS VARCHAR(100) AS\n%%udf_object %s' "$1" "$2"
+}
+
 ddl_distribute_files() {
   printf 'CREATE OR REPLACE LUA SET SCRIPT %s.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))\nEMITS (files VARCHAR(2000000)) AS\nfunction run(ctx)\n    repeat\n        ctx.emit(ctx.files)\n    until not ctx.next()\nend' "$1"
 }
 
-smoke_test_sql() {
-  printf "SELECT %s.LAKEHOUSE_SCAN('x', 'y') EMITS (r VARCHAR(2000000)) FROM (SELECT 1)" "$1"
+version_smoke_sql() {
+  printf 'SELECT %s.LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION' "$1"
 }
 
 # --- Install steps -----------------------------------------------------------
@@ -1329,6 +1358,7 @@ create_engine_scripts() {
     "$(ddl_create_schema "$schema")"
     "$(ddl_adapter "$schema" "$so")"
     "$(ddl_scan "$schema" "$so")"
+    "$(ddl_version "$schema" "$so")"
     "$(ddl_distribute_files "$schema")"
   )
   for stmt in "${statements[@]}"; do
@@ -1389,15 +1419,21 @@ deploy_personal_local() {
   return 0
 }
 
-# mismatch -> fingerprint failure; anomaly -> unexpected rows; pass -> any other error.
-classify_fingerprint_response() {
-  local rc="$1" output="$2"
+# fingerprint-mismatch -> the .so/SLC fingerprint check itself failed; other-error -> any other
+# failure to run the smoke-test query; version-mismatch -> the query succeeded but reported a
+# version different from the release the installer downloaded; pass -> exact match.
+classify_version_smoke() {
+  local rc="$1" output="$2" reported="$3" expected="$4"
   if [[ "$output" == *"Fingerprint mismatch"* ]]; then
-    printf 'mismatch\n'
+    printf 'fingerprint-mismatch\n'
     return 0
   fi
-  if [[ "$rc" -eq 0 ]]; then
-    printf 'anomaly\n'
+  if [[ "$rc" -ne 0 ]]; then
+    printf 'other-error\n'
+    return 0
+  fi
+  if [[ "$reported" != "$expected" ]]; then
+    printf 'version-mismatch\n'
     return 0
   fi
   printf 'pass\n'
@@ -1405,19 +1441,23 @@ classify_fingerprint_response() {
 }
 
 run_smoke_test() {
-  local sql out rc verdict
-  sql="$(smoke_test_sql "$ARG_SCHEMA")"
+  local sql out rc reported verdict
+  sql="$(version_smoke_sql "$ARG_SCHEMA")"
   if out="$(run_sql "$sql" 2>&1)"; then rc=0; else rc=$?; fi
-  verdict="$(classify_fingerprint_response "$rc" "$out")"
+  reported="$(extract_version_value "$out")"
+  verdict="$(classify_version_smoke "$rc" "$out" "$reported" "$RESOLVED_ENGINE_VERSION")"
   case "$verdict" in
-    mismatch)
+    fingerprint-mismatch)
       err "fingerprint smoke test FAILED: the registered SLC does not match this release's exasol-udf-sdk/exasol-udf-macros pin. Align the SLC version (see --slc-version) with the engine release and re-run."
       return 1 ;;
-    anomaly)
-      err "fingerprint smoke test anomaly: the placeholder scan spec ('x','y') returned rows with no error, which can never happen for a valid install. Aborting."
+    version-mismatch)
+      err "version smoke test FAILED: expected LAKEHOUSE_VERSION() to report $RESOLVED_ENGINE_VERSION, but got '${reported:-<empty>}'."
+      return 1 ;;
+    other-error)
+      err "version smoke test failed: $out"
       return 1 ;;
     pass)
-      log "Fingerprint smoke test passed (a non-fingerprint error is expected for the placeholder args)."
+      log "Version smoke test passed: LAKEHOUSE_VERSION() reports $RESOLVED_ENGINE_VERSION."
       return 0 ;;
   esac
 }
