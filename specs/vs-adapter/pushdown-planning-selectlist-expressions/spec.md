@@ -113,10 +113,16 @@ WIDENED derived projection).
   common ungrouped scalar-over-aggregate shape into the partial/merge plan, so it is
   classified as a single-group aggregate and never consults the widening signal. The guard
   is what the shapes that decomposition declines fall back to.
-* **No existing `dispatch_golden` fixture changes.** None of the eighteen fixtures under
+* **This feature changes no `dispatch_golden` fixture byte.** None of the fixtures under
   `adapter/pushdown/testdata/dispatch_golden/` carries an aggregate inside a row-scan
-  projection, so none encodes the pre-guard behaviour; a diff in any of them is a
-  regression rather than an expected update.
+  projection, so none encodes the pre-guard behaviour. A diff attributable to THIS feature
+  is therefore a regression rather than an expected update. Separately,
+  `vs-adapter/scan-spec-credential-reference` regenerates the eighteen credential-bearing
+  fixtures for their `storage` value alone; a diff outside that value, and any diff in the
+  six `empty_*` fixtures, remains a regression.
+* **This delta is issue #135. It amends ONE clause of ONE scenario and changes no translation, node-type, or routing rule.** The pushable node-type set, the `function_aggregate` exclusion at every depth, the single subtree probe before dispatch, the EMITS-column contract, and the untranslatable-item fallback are all UNCHANGED.
+* **SUPERSEDES this feature's unconditional golden-fixture clause, which the fixture regeneration falsifies.** Recorded `:132` reads "every existing `dispatch_golden` fixture MUST remain byte-identical". Its REASON — that none of the fixtures carries an aggregate inside a row-scan projection, so none encodes the pre-guard behaviour — is still exactly right, and it is what the amended clause keeps: this feature's own change still moves no fixture byte. What it can no longer claim is that NO other change does, because `vs-adapter/scan-spec-credential-reference` regenerates the eighteen credential-bearing fixtures for their `storage` value. The clause therefore states the invariant it actually owns: byte-identical EXCEPT the `storage` value, which is not this feature's to move.
+* The fixture COUNT the recorded text uses ("the eighteen fixtures under `adapter/pushdown/testdata/dispatch_golden/`") is stale independently of this plan — the directory holds twenty-four, eighteen credential-bearing and six `empty_*`. The coincidence of numbers is accidental and is named here so a reader does not read the recorded count as this plan's regeneration set.
 
 ## Scenarios
 
@@ -129,7 +135,7 @@ WIDENED derived projection).
 * *AND* the pushable node-type set SHALL be exactly the set the translator renders MINUS `function_aggregate` — so an aggregate select item reaches the aggregate planner or the wrapper rather than being evaluated per shard as a projection item, and a refused node type is never one that is both renderable and advertised (issue #196)
 * *AND* that `function_aggregate` exclusion SHALL be enforced at EVERY DEPTH of a select-list item, not only at the item's root: a select-list item whose subtree contains a `function_aggregate` ANYWHERE — nested inside a `function_scalar`, a `function_scalar_cast`/`_extract`/`_case`, an arithmetic node, or any pushable predicate node — SHALL widen the derived projection exactly as a top-level `function_aggregate` already does, because the translator renders a nested aggregate verbatim as SQL text and the pushable arm would otherwise accept it and evaluate it PER SHARD (issues #194, #188)
 * *AND* that subtree probe SHALL be a SINGLE decision applied before the node-type dispatch, so the rule has one owner rather than one guard per pushable arm, and the outcome for a TOP-LEVEL `function_aggregate` item MUST be unchanged — it widened through the unknown-node arm before and widens through the probe now
-* *AND* every existing `dispatch_golden` fixture MUST remain byte-identical, because none carries an aggregate inside a row-scan projection and therefore none encodes the pre-guard behaviour
+* *AND* every existing `dispatch_golden` fixture MUST remain byte-identical EXCEPT for its scan-spec `storage` value, which `vs-adapter/scan-spec-credential-reference` re-encodes as a connection reference carrying no credential — because none of the fixtures carries an aggregate inside a row-scan projection and therefore none encodes the pre-guard behaviour, so THIS feature moves no fixture byte at all; the eighteen credential-bearing fixtures change only in that one value, and the six `empty_*` fixtures carry no `storage` value and MUST stay byte-identical with NO exception
 * *AND* the UDF's declared EMITS column list SHALL match the rendered select-list expressions in order and result type, where result types are read from the parallel top-level `selectListDataTypes` array in the pushdown request
 * *AND* a select-list item the adapter cannot translate SHALL cause the adapter to fall back to projecting the underlying columns and let Exasol evaluate the expression, rather than producing an incorrect result
 

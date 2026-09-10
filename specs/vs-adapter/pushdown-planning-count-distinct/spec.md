@@ -78,7 +78,6 @@ engine rather than a fixed per-shard serialization cap.
   merge (`vs-adapter/pushdown-planning-single-group-agg`): no offset parameter, no collapse
   arithmetic, no failure branch, unreachability pinned by an assertion and an end-to-end
   `sqlCode 42000` assertion.
-* Credentials MUST NOT appear in any returned SQL or error message.
 
 ## Scenarios
 
@@ -137,3 +136,8 @@ engine rather than a fixed per-shard serialization cap.
 * *AND* the wrapper SHALL render NO `OFFSET`, because a non-zero request `limit.offset` cannot reach it: Exasol rejects `SELECT COUNT(DISTINCT c) FROM t ORDER BY 1 LIMIT 5 OFFSET 2` with `sqlCode 42000` ("OFFSET not allowed in aggregated selects") before issuing a `pushdown` request — so the adapter adds no offset rendering, no collapse arithmetic, and no failure branch here, pinning the unreachability with an assertion plus an end-to-end `sqlCode 42000` assertion
 * *AND* the merged distinct count SHALL therefore equal `COUNT(DISTINCT col)` evaluated over all rows on a single node, exactly, whenever the request's `LIMIT` admits that row, and SHALL return zero rows for `LIMIT 0`
 * *AND* the Case 2/3 qualified single-table wrapper (see "Multiple distinct columns …") SHALL confine any request-level LIMIT and OFFSET to the OUTER wrapper SELECT, keeping the inner materialized sharded scan LIMIT-free and sort-free, exactly as the grouped-aggregate qualified-wrapper fallback confines LIMIT to its outer SELECT
+
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages

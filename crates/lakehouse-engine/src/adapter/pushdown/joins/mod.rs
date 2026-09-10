@@ -1,5 +1,5 @@
-use crate::adapter::catalog_kind::CatalogKind;
-use crate::adapter::connection::ConnectionCreds;
+use crate::adapter::ResolvedConnectionConfig;
+#[cfg(test)]
 use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -39,7 +39,9 @@ use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_col
 // join SQL builders directly to pin cross-site golden-SQL fixtures — the same
 // reachability pattern already used for `qualified_single_table_fallback_pushdown`
 // above.
-pub(super) use sql_builders::{JoinScanTuning, build_broadcast_join_sql, build_n_scan_join_sql};
+pub(super) use sql_builders::{
+    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
+};
 
 /// Schema-qualify a UDF/script name for a pushdown-driving query.
 ///
@@ -154,11 +156,7 @@ pub(super) async fn plan_join(
     request: &Json,
     pushdown_req: &Json,
     join: &DetectedJoin,
-    catalog_uri: &str,
-    catalog_kind: CatalogKind,
-    storage: &StorageBackend,
-    creds: &ConnectionCreds,
-    allow_http: bool,
+    conn: &ResolvedConnectionConfig,
     scan_schema: Option<&str>,
     cluster_nodes: usize,
     parallelism_factor: usize,
@@ -176,9 +174,9 @@ pub(super) async fn plan_join(
     // LEG, so both a shared-column-name case and a repeated table stay correct.
     let filter = pushdown_req.get("filter").filter(|f| !f.is_null());
     let connection = ConnectionStorage {
-        storage,
-        creds,
-        allow_http,
+        storage: &conn.storage,
+        creds: &conn.creds,
+        allow_http: conn.allow_http,
     };
     // Every leg's identifier is validated inside the resolver's own catalog-kind
     // match, ahead of any catalog HTTP, so a malformed leg costs no catalog
@@ -189,8 +187,13 @@ pub(super) async fn plan_join(
         .iter()
         .map(|leaf| leaf.table_identifier.as_str())
         .collect();
-    let resolver =
-        TableScanResolver::for_request(catalog_kind, catalog_uri, connection, &identifiers).await?;
+    let resolver = TableScanResolver::for_request(
+        conn.catalog_kind,
+        &conn.catalog_uri,
+        connection,
+        &identifiers,
+    )
+    .await?;
     // ONE leg per FROM-tree leaf, so the resolve loop is driven by LEG INDEX: a
     // self-join's two occurrences share a `tableName`, and keying pruning on the name
     // would hand each occurrence the other's predicate too — over-filtered rows with
@@ -225,7 +228,7 @@ pub(super) async fn plan_join(
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
     let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
-    let tuning = JoinScanTuning {
+    let inputs = JoinScanRequestConfig {
         cluster_nodes,
         parallelism_factor,
         df_target_partitions,
@@ -234,6 +237,7 @@ pub(super) async fn plan_join(
         memory_pool_fraction,
         instance_overhead_mb,
         s3_max_connections,
+        connection: conn,
     };
 
     // Broadcast eligibility is a PROPERTY of the request, computed here: exactly two
@@ -256,10 +260,10 @@ pub(super) async fn plan_join(
                 &candidate,
                 &rendered,
                 window,
-                &tuning,
+                &inputs,
                 &udf_name,
                 &distribute_udf_name,
-            )
+            )?
         {
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
@@ -270,7 +274,7 @@ pub(super) async fn plan_join(
         pushdown_req,
         join,
         &sides,
-        &tuning,
+        &inputs,
         &udf_name,
         &distribute_udf_name,
     )?;

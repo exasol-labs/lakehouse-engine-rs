@@ -1,7 +1,7 @@
 use super::test_support::*;
 use super::*;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage, StorageProps,
 };
 
 // ---------------------------------------------------------------------------
@@ -43,7 +43,7 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
-            storage: vended_storage,
+            storage: ScanStorage::Inline(vended_storage),
             ..Default::default()
         },
         files: vec![FileEntry::new(
@@ -100,7 +100,7 @@ fn grouped_scan_spec_carries_group_keys() {
                 arg_expr: None,
             }]),
             group_keys: Some(group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![FileEntry::new("s3://w/f0.parquet", 1)],
@@ -421,7 +421,7 @@ fn scan_spec_carries_no_catalog_block() {
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![FileEntry::new(
@@ -567,7 +567,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     let spec = ScanSpec {
         common: CommonScanSpec {
             logical_schema: logical.clone(),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -855,7 +855,7 @@ fn build_logical_schema_default_less_spec_round_trips_unchanged() {
     let spec = ScanSpec {
         common: CommonScanSpec {
             logical_schema: logical.clone(),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -968,7 +968,7 @@ fn guard_dispatch_result(
         logical_schema,
         Vec::new(),
         Vec::new(),
-        &sample_storage(),
+        &sample_scan_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -1028,7 +1028,7 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
         Vec::new(),
         Vec::new(),
         Vec::new(),
-        &sample_storage(),
+        &sample_scan_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -2076,6 +2076,8 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         creds,
         allow_http: false,
         catalog_kind: CatalogKind::IcebergRest,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
     };
     let result = handle_pushdown(
         &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -2111,6 +2113,8 @@ async fn seam_handle_pushdown(
         creds: creds.clone(),
         allow_http: true,
         catalog_kind,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
     };
     handle_pushdown(
         request, &conn, catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -2774,7 +2778,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         Vec::new(),
         Vec::new(),
         vec!["LETTER".to_string()],
-        &sample_storage(),
+        &sample_scan_storage(),
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         4,
@@ -2829,7 +2833,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         projection: vec![ProjectionItem::Column("CUSTOMER_KEY".to_string())],
         projection_types: vec!["DECIMAL(20,0)".to_string()],
     };
-    let tuning = super::joins::JoinScanTuning {
+    let tuning = super::joins::JoinScanRequestConfig {
         cluster_nodes: 1,
         parallelism_factor: 1,
         df_target_partitions: 1,
@@ -2838,6 +2842,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 200,
         s3_max_connections: 8,
+        connection: &super::test_support::TEST_CONNECTION,
     };
     let join_sql = super::joins::build_broadcast_join_sql(
         &sides,
@@ -2847,6 +2852,7 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     )
+    .expect("selecting the wire storage must succeed")
     .expect("a broadcast-eligible plan with an unbounded window must render");
     assert!(
         join_sql.contains(r#""partition_columns":["REGION"]"#),
@@ -3313,4 +3319,150 @@ async fn a_unity_catalog_pushdown_prunes_the_delta_file_list_by_its_filter() {
          exactly the one matching partition through production pushdown: \
          filtered={filtered_sql}"
     );
+}
+
+use crate::scan::sealed::{
+    connection_password_carries_key_material, derive_sealed_storage_key, unseal_storage,
+};
+
+const SENTINEL_CONNECTION_NAME: &str = "SENTINEL_SCAN_STORAGE_CONNECTION";
+const SENTINEL_ACCESS_KEY: &str = "SENTINEL_ACCESS_KEY_VALUE";
+const SENTINEL_SECRET_KEY: &str = "SENTINEL_SECRET_KEY_VALUE";
+const SENTINEL_SESSION_TOKEN: &str = "SENTINEL_SESSION_TOKEN_VALUE";
+const SENTINEL_PASSWORD: &str = r#"{"warehouse":"wh","secret_key":"SENTINEL_SECRET_KEY_VALUE"}"#;
+
+fn assert_no_sentinel_secret_leaked(text: &str) {
+    for secret in [
+        SENTINEL_ACCESS_KEY,
+        SENTINEL_SECRET_KEY,
+        SENTINEL_SESSION_TOKEN,
+    ] {
+        assert!(
+            !text.contains(secret),
+            "sentinel secret {secret:?} leaked in: {text}"
+        );
+    }
+}
+
+fn sentinel_creds(use_vended_credentials: bool) -> ConnectionCreds {
+    ConnectionCreds {
+        warehouse: "wh".into(),
+        endpoint: "http://sentinel-minio:9000".into(),
+        region: "sentinel-region-1".into(),
+        access_key: SENTINEL_ACCESS_KEY.into(),
+        secret_key: SENTINEL_SECRET_KEY.into(),
+        session_token: Some(SENTINEL_SESSION_TOKEN.into()),
+        path_style: true,
+        use_vended_credentials,
+        ..Default::default()
+    }
+}
+
+fn sentinel_effective_backend(creds: &ConnectionCreds) -> StorageBackend {
+    crate::adapter::connection::storage_block(creds, true)
+}
+
+fn dispatch_result_for_body(
+    pushdown_req_body: Json,
+    logical_schema: Vec<LogicalField>,
+    scan_storage: &ScanStorage,
+) -> Result<String, UdfError> {
+    let request = guard_events_request(pushdown_req_body);
+    let pushdown_req = pd(&request);
+    let col_types = guard_col_types();
+    let (proj_cols, proj_types, projection_widened) =
+        extract_projection(&request, &pushdown_req).expect("the fixture must project");
+    let (filter, declined_filter) = classify_where_filter(
+        pushdown_req.get("filter").filter(|f| !f.is_null()),
+        &col_types,
+    );
+    let result = build_dispatch_sql(
+        &request,
+        &pushdown_req,
+        proj_cols,
+        proj_types,
+        projection_widened,
+        col_types,
+        filter,
+        declined_filter,
+        extract_limit(&pushdown_req),
+        order_by_present(&pushdown_req),
+        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
+        "s3://warehouse/db/events".to_string(),
+        logical_schema,
+        Vec::new(),
+        Vec::new(),
+        scan_storage,
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+        4,
+        8192,
+        2,
+        0.6,
+        200,
+        8,
+    )?;
+    Ok(result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field")
+        .to_string())
+}
+
+fn row_scan_body() -> Json {
+    serde_json::json!({
+        "selectList": [
+            {"type": "column", "name": "REGION"},
+            {"type": "column", "name": "AMOUNT"},
+        ],
+        "selectListDataTypes": [
+            {"type": "varchar", "size": 2000000},
+            {"type": "decimal", "precision": 18, "scale": 2},
+        ],
+    })
+}
+
+#[test]
+fn no_connection_credential_reaches_the_generated_sql() {
+    let body = row_scan_body();
+
+    let static_creds = sentinel_creds(false);
+    let static_storage = scan_storage_for(
+        &static_creds,
+        SENTINEL_CONNECTION_NAME,
+        true,
+        &sentinel_effective_backend(&static_creds),
+        None,
+    )
+    .expect("static selection");
+    let static_sql = dispatch_result_for_body(body.clone(), Vec::new(), &static_storage)
+        .expect("static dispatch");
+    assert!(
+        static_sql.contains(SENTINEL_CONNECTION_NAME),
+        "{static_sql}"
+    );
+    assert_no_sentinel_secret_leaked(&static_sql);
+
+    let vended_creds = sentinel_creds(true);
+    let vended_effective = sentinel_effective_backend(&vended_creds);
+    let key = connection_password_carries_key_material(&vended_creds)
+        .then(|| derive_sealed_storage_key(SENTINEL_PASSWORD))
+        .expect("must carry key material");
+    let vended_storage = scan_storage_for(
+        &vended_creds,
+        SENTINEL_CONNECTION_NAME,
+        true,
+        &vended_effective,
+        Some(&key),
+    )
+    .expect("vended selection");
+    let vended_sql =
+        dispatch_result_for_body(body, Vec::new(), &vended_storage).expect("vended dispatch");
+    assert!(vended_sql.contains("\"sealed\":{\"name\":"), "{vended_sql}");
+    let common: Json = serde_json::from_str(common_arg_literal(&vended_sql)).unwrap();
+    let selected: ScanStorage = serde_json::from_value(common["storage"].clone()).unwrap();
+    let ScanStorage::Sealed { payload, .. } = &selected else {
+        panic!("expected Sealed, got {selected:?}");
+    };
+    assert_eq!(&unseal_storage(payload, &key).unwrap(), &vended_effective);
+    assert_no_sentinel_secret_leaked(&vended_sql);
 }

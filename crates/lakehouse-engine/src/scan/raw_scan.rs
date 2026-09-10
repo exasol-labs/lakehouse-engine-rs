@@ -26,6 +26,7 @@ use crate::scan::spec::{
     FileEntry, NameMappingEntry, ProjectionItem, ScanSpec, reconstruct_abs_uri,
     render_order_by_clause,
 };
+use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
 use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
@@ -49,10 +50,11 @@ pub async fn run_raw_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let secrets = spec.common.storage.secret_values();
-    let df = build_dataframe(session_ctx, spec).await?;
+    let secrets = storage.all_secret_values();
+    let df = build_dataframe(session_ctx, spec, storage).await?;
     let stream = df
         .execute_stream()
         .await
@@ -84,9 +86,10 @@ pub(super) fn delete_path_read_limiter(spec: &ScanSpec) -> Arc<Semaphore> {
 async fn build_dataframe(
     ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<datafusion::dataframe::DataFrame, UdfError> {
     let table_name = "scan_target";
-    register_files(ctx, table_name, spec).await?;
+    register_files(ctx, table_name, spec, storage).await?;
 
     // Build the SELECT SQL applying projection, filter, and limit.
     let sql = build_scan_sql(ctx, table_name, spec).await?;
@@ -127,6 +130,7 @@ pub async fn register_files(
     ctx: &SessionContext,
     table_name: &str,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<(), UdfError> {
     let delete_path_read_limiter = delete_path_read_limiter(spec);
     register_file_list(
@@ -137,7 +141,7 @@ pub async fn register_files(
         &spec.common.logical_schema,
         &spec.common.name_mapping,
         &spec.common.partition_columns,
-        &spec.common.storage,
+        storage.primary(),
         delete_path_read_limiter,
     )
     .await

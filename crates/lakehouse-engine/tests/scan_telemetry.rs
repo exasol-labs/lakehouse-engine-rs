@@ -11,19 +11,21 @@
 //!
 //! Host-runnable: no S3 / MinIO stack — the scan registers a `file://` Parquet.
 
+mod scan_fixture;
+
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
-use exasol_udf_sdk::error::UdfError;
+use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::{PhaseTimers, telemetry_file_path};
 use lakehouse_engine::scan::run_raw_scan_with_session;
 use lakehouse_engine::scan::session_config_for_spec;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
@@ -35,66 +37,6 @@ static TELEMETRY_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock() -> MutexGuard<'static, ()> {
     TELEMETRY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// A fake UdfContext: serves one ScanSpec JSON row, captures emit_batch calls,
-/// and reports a configurable debug level.
-struct FakeCtx {
-    spec_json: String,
-    served: bool,
-    debug_level: tracing::Level,
-    emitted_batches: usize,
-    emitted_rows: u64,
-}
-
-impl FakeCtx {
-    fn new(spec_json: String, level: tracing::Level) -> Self {
-        Self {
-            spec_json,
-            served: false,
-            debug_level: level,
-            emitted_batches: 0,
-            emitted_rows: 0,
-        }
-    }
-}
-
-impl exasol_udf_sdk::context::UdfContext for FakeCtx {
-    fn num_columns(&self) -> usize {
-        1
-    }
-    fn get(&self, _col: usize) -> Result<&Value, UdfError> {
-        Err(UdfError::User("FakeCtx uses get_string only".into()))
-    }
-    fn get_string(&self, _col: usize) -> Result<Option<&str>, UdfError> {
-        Ok(Some(self.spec_json.as_str()))
-    }
-    fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
-        Err(UdfError::User("raw path must use emit_batch".into()))
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        if self.served {
-            Ok(false)
-        } else {
-            self.served = true;
-            Ok(true)
-        }
-    }
-    fn debug_level(&self) -> tracing::Level {
-        self.debug_level
-    }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), UdfError> {
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-        let reader = StreamReader::try_new(Cursor::new(ipc), None)
-            .map_err(|e| UdfError::User(format!("ipc decode: {e}")))?;
-        for batch in reader {
-            let batch = batch.map_err(|e| UdfError::User(format!("ipc batch: {e}")))?;
-            self.emitted_rows += batch.num_rows() as u64;
-        }
-        self.emitted_batches += 1;
-        Ok(())
-    }
 }
 
 /// Write a local Parquet file with `rows` rows across small row groups (so the
@@ -135,14 +77,14 @@ fn scan_spec(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -153,13 +95,21 @@ fn scan_spec(file_url: String) -> ScanSpec {
 /// Run one raw scan to completion with the given debug level; returns the fake
 /// context (carrying the captured emit counts). Registers a fresh session per
 /// run so the local Parquet path is exercised exactly as production would.
-async fn run_scan(spec: &ScanSpec, level: tracing::Level) -> FakeCtx {
-    let mut ctx = FakeCtx::new(spec.to_json(), level);
+async fn run_scan(spec: &ScanSpec, level: tracing::Level) -> scan_fixture::BatchCapturingCtx {
+    let mut ctx = scan_fixture::BatchCapturingCtx::new(
+        TestContext::scalar(vec![Value::String(spec.to_json())]).with_debug_level(level),
+    );
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers)
-        .await
-        .expect("raw scan must succeed");
+    run_raw_scan_with_session(
+        &mut ctx,
+        &session,
+        spec,
+        &scan_fixture::resolved_storage(spec),
+        &mut timers,
+    )
+    .await
+    .expect("raw scan must succeed");
     ctx
 }
 
@@ -213,7 +163,7 @@ fn telemetry_silent_at_default_level() {
     let ctx = block_on(run_scan(&spec, tracing::Level::INFO));
 
     // Scan still produced output...
-    assert_eq!(ctx.emitted_rows, 200, "all rows must be emitted");
+    assert_eq!(ctx.total_rows(), 200, "all rows must be emitted");
     // ...but no telemetry line was written at the default level.
     assert!(
         telemetry_lines().is_empty(),
@@ -232,7 +182,7 @@ fn telemetry_reports_three_phases_when_enabled() {
 
     clear_telemetry_file();
     let ctx = block_on(run_scan(&spec, tracing::Level::DEBUG));
-    assert_eq!(ctx.emitted_rows, 200, "all rows must be emitted");
+    assert_eq!(ctx.total_rows(), 200, "all rows must be emitted");
 
     let lines = telemetry_lines();
     assert_eq!(
@@ -277,7 +227,7 @@ fn telemetry_attributes_import_separately_from_emit() {
 
     clear_telemetry_file();
     let ctx = block_on(run_scan(&spec, tracing::Level::DEBUG));
-    assert!(ctx.emitted_batches > 1, "scan must span multiple batches");
+    assert!(ctx.call_count() > 1, "scan must span multiple batches");
 
     let lines = telemetry_lines();
     assert_eq!(lines.len(), 1, "one telemetry record, got {lines:?}");
@@ -316,13 +266,17 @@ fn telemetry_failure_never_fails_scan() {
     let sink_path = telemetry_file_path();
     std::fs::create_dir_all(&sink_path).expect("occupy telemetry path with a directory");
 
-    let mut ctx = FakeCtx::new(spec.to_json(), tracing::Level::DEBUG);
+    let mut ctx = scan_fixture::BatchCapturingCtx::new(
+        TestContext::scalar(vec![Value::String(spec.to_json())])
+            .with_debug_level(tracing::Level::DEBUG),
+    );
     let session = SessionContext::new_with_config(session_config_for_spec(&spec));
     let mut timers = PhaseTimers::start();
     let result = block_on(run_raw_scan_with_session(
         &mut ctx,
         &session,
         &spec,
+        &scan_fixture::resolved_storage(&spec),
         &mut timers,
     ));
 
@@ -330,7 +284,7 @@ fn telemetry_failure_never_fails_scan() {
         result.is_ok(),
         "a telemetry-sink failure must NOT fail the scan: {result:?}"
     );
-    assert_eq!(ctx.emitted_rows, 200, "all rows must still be emitted");
+    assert_eq!(ctx.total_rows(), 200, "all rows must still be emitted");
 
     // No LHTELEM line could have been appended (the sink is a directory), and
     // the scan was unaffected.

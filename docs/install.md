@@ -168,7 +168,9 @@ creation, and the smoke test.
 ## Point the VS at your data
 
 Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. The
-following example is a complete local setup with MinIO and an Iceberg REST catalog:
+following example is a complete local setup with MinIO and an Iceberg REST catalog, run as a DBA.
+A non-DBA needs `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts before
+`CREATE VIRTUAL SCHEMA` — see [Security](security.md).
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
@@ -196,6 +198,8 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 - **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
   and more) are in [Tuning](tuning.md).
+- **Before granting other users access**, read [Security](security.md) — both scripts need a
+  CONNECTION grant held by the VS owner, and `GRANT SELECT ON SCHEMA` is the real auth boundary.
 
 ## Query
 

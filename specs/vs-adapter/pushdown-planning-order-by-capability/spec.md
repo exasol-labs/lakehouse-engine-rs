@@ -93,7 +93,6 @@ single-table and N-scan join wrapper), `vs-adapter/pushdown-planning-single-grou
   items (`selectListDataTypes`); it declares NO type for a sort-key expression. Every rule
   below therefore renders an expression sort key over columns whose declared types are already
   known, and never derives a type for an expression.
-* Credentials MUST NOT appear in any returned SQL or error message.
 * Iceberg spec compliance: checked, not engaged. Verified against the Apache Iceberg table
   spec (https://iceberg.apache.org/spec/) rather than from memory: the normative sections
   that could bear on this change are the ones governing what a reader must resolve —
@@ -226,3 +225,8 @@ single-table and N-scan join wrapper), `vs-adapter/pushdown-planning-single-grou
 * *AND* the shared seam SHALL render byte-identical SQL to the pre-change output when the offset is zero or absent, so advertising the capability changes no already-correct plan
 * *AND* NO offset value SHALL be carried into any per-shard scan spec, because a per-shard OFFSET would skip a different row set on every shard and cannot compose into a global window; the scan-spec wire shape and the scan UDF SHALL be unchanged by this advertisement
 * *AND* the returned result SHALL equal the same `ORDER BY … LIMIT n OFFSET m` evaluated over all matching rows on a single node, for a plain row scan, a declined-sort-key row scan, a grouped aggregate, and a qualified-wrapper shape
+
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages

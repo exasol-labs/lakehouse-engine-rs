@@ -23,71 +23,20 @@ use std::sync::Arc;
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
-use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::test_support::TestContext;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
-    ProjectionItem, ScanSpec, StorageBackend, StorageProps,
+    ProjectionItem, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
-use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec};
+use lakehouse_engine::scan::{
+    ResolvedScanStorage, run_raw_scan_with_session, session_config_for_spec,
+};
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 
-/// A fake `UdfContext` serving one input row and decoding every emitted Arrow
-/// IPC batch — copied from `scan_no_head_test.rs` (private to that file, so
-/// this integration test binary needs its own copy).
-struct FakeCtx {
-    served: bool,
-    emitted: Vec<RecordBatch>,
-}
-
-impl FakeCtx {
-    fn new() -> Self {
-        Self {
-            served: false,
-            emitted: Vec::new(),
-        }
-    }
-}
-
-impl UdfContext for FakeCtx {
-    fn num_columns(&self) -> usize {
-        0
-    }
-    fn get(&self, _col: usize) -> Result<&Value, UdfError> {
-        Err(UdfError::User("FakeCtx has no input columns".into()))
-    }
-    fn get_string(&self, _col: usize) -> Result<Option<&str>, UdfError> {
-        Ok(None)
-    }
-    fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
-        Err(UdfError::User("raw path must use emit_batch".into()))
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        if self.served {
-            Ok(false)
-        } else {
-            self.served = true;
-            Ok(true)
-        }
-    }
-    fn debug_level(&self) -> tracing::Level {
-        tracing::Level::INFO
-    }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), UdfError> {
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-        let reader = StreamReader::try_new(Cursor::new(ipc), None)
-            .map_err(|e| UdfError::User(format!("ipc decode: {e}")))?;
-        for batch in reader {
-            let batch = batch.map_err(|e| UdfError::User(format!("ipc batch: {e}")))?;
-            self.emitted.push(batch);
-        }
-        Ok(())
-    }
-}
+mod scan_fixture;
 
 /// Storage props are never dialed for a local `file://` scan; a placeholder
 /// keeps the spec well-formed (copied from `scan_no_head_test.rs`).
@@ -162,7 +111,7 @@ fn raw_scan_spec(
                 .collect(),
             logical_schema,
             name_mapping,
-            storage: dummy_storage(),
+            storage: ScanStorage::Inline(dummy_storage()),
             df_batch_size: 64,
             ..Default::default()
         },
@@ -188,10 +137,11 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch
         &url::Url::parse(register_url).expect("register url"),
         Arc::new(LocalFileSystem::new()),
     );
-    let mut ctx = FakeCtx::new();
+    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
     let mut timers = PhaseTimers::start();
-    run_raw_scan_with_session(&mut ctx, &session, spec, &mut timers).await?;
-    Ok(ctx.emitted)
+    let storage = ResolvedScanStorage::from_backends(dummy_storage(), None);
+    run_raw_scan_with_session(&mut ctx, &session, spec, &storage, &mut timers).await?;
+    Ok(ctx.into_batches())
 }
 
 fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {

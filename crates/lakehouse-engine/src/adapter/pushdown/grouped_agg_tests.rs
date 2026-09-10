@@ -7,7 +7,7 @@ use super::super::support::{
 };
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::CommonScanSpec;
+use crate::scan::spec::{CommonScanSpec, ScanStorage};
 
 // NOTE on the `sum_emit_type` tests below: routing `sum_emit_type` through the
 // canonical `parse_decimal_args` makes it GAIN a whitespace-trimming step it did
@@ -456,7 +456,7 @@ fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(result.plans.clone()),
             group_keys: Some(result.group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -705,7 +705,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
             common: CommonScanSpec {
                 aggregates: Some(result.plans.clone()),
                 group_keys: Some(result.group_keys.clone()),
-                storage: sample_storage(),
+                storage: ScanStorage::Inline(sample_storage()),
                 ..Default::default()
             },
             files: vec![],
@@ -972,7 +972,7 @@ fn detect_group_by_all_expression_multi_key() {
         common: CommonScanSpec {
             aggregates: Some(result.plans.clone()),
             group_keys: Some(result.group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1055,7 +1055,7 @@ fn build_grouped_agg_sql(
         common: CommonScanSpec {
             aggregates: Some(agg_plans.clone()),
             group_keys: Some(group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1228,7 +1228,7 @@ fn grouped_common_blob_has_no_limit() {
                 arg_expr: None,
             }]),
             group_keys: Some(vec!["\"REGION\"".into()]),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1288,7 +1288,7 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
                 arg_expr: None,
             }]),
             group_keys: Some(vec!["\"REGION\"".into()]),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1343,7 +1343,7 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
                 arg_expr: None,
             }]),
             group_keys: Some(vec!["\"REGION\"".into()]),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1546,7 +1546,7 @@ fn build_grouped_agg_sql_with_select_items(
         common: CommonScanSpec {
             aggregates: Some(agg_plans.clone()),
             group_keys: Some(group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1807,7 +1807,7 @@ fn build_grouped_from_detection(req: &serde_json::Value) -> String {
         common: CommonScanSpec {
             aggregates: Some(d.plans.clone()),
             group_keys: Some(d.group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2052,7 +2052,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         common: CommonScanSpec {
             projection: proj_cols,
             emit_exa_types: proj_types,
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2156,7 +2156,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
         common: CommonScanSpec {
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2239,7 +2239,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
         common: CommonScanSpec {
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2317,7 +2317,7 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         common: CommonScanSpec {
             aggregates: Some(detection.plans.clone()),
             group_keys: Some(detection.group_keys.clone()),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2996,7 +2996,7 @@ fn having_clause_appears_in_outer_wrapper_only() {
                 arg_expr: None,
             }]),
             group_keys: Some(vec![r#""REGION""#.to_string()]),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],

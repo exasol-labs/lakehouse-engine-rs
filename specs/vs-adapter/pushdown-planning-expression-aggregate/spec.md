@@ -20,7 +20,6 @@ column to Exasol.
   aggregate item's declared result type in the parallel top-level `selectListDataTypes`
   array, because there is no single source column whose Exasol type could be looked up.
 * The merged result MUST equal the same aggregate evaluated over all rows on a single node.
-* Credentials MUST NOT appear in any returned SQL or error message.
 
 ## Scenarios
 
@@ -72,3 +71,8 @@ column to Exasol.
 * *THEN* the adapter SHALL derive the partial column's Exasol type from the SUM item's declared result type in `selectListDataTypes` at that select-list ordinal — never from either source column's type
 * *AND* when that declared result type is a DECIMAL the adapter SHALL widen the partial column to `DECIMAL(36,s)` (preserving scale `s`, capping precision at Exasol's maximum 36) so per-shard partial sums of the product do not overflow mid-merge
 * *AND* the derived partial and merge types SHALL remain within Exasol's `DECIMAL(p<=36, s<=36)` limits
+
+### Scenario: Generated SQL carries a credential reference, not a credential
+
+* *GIVEN* a pushdown request through this feature's path
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages

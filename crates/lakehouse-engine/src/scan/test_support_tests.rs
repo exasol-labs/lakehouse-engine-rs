@@ -1,16 +1,8 @@
-//! Test-only fixtures shared across the `scan` submodule test modules.
-//!
-//! Extracted verbatim from the former flat `mod tests` helpers block. Each
-//! functional submodule's `#[cfg(test)] mod tests` reaches these through
-//! `super::test_support` (or `crate::scan::test_support` from a nested module).
+use crate::scan::ResolvedScanStorage;
+use crate::scan::spec::{
+    CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+};
 
-use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps};
-
-/// The byte size of the local file behind a `file://` URL.
-///
-/// The custom `ParquetSource`-backed provider builds each file's `ObjectMeta`
-/// from the spec-supplied size (the no-HEAD design), so tests that register a
-/// local Parquet file must supply its real size instead of a `0` placeholder.
 pub(super) fn local_file_size(file_url: &str) -> u64 {
     let path = url::Url::parse(file_url)
         .expect("valid file URL")
@@ -19,20 +11,94 @@ pub(super) fn local_file_size(file_url: &str) -> u64 {
     std::fs::metadata(path).expect("stat local parquet").len()
 }
 
-/// Minimal ScanSpec with a valid-looking S3 URI for build_session_context tests.
 pub(super) fn minimal_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "testkey".into(),
                 secret_key: "testsecret".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         },
         files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 1024)],
+    }
+}
+
+pub(super) fn inline_resolved(spec: &ScanSpec) -> ResolvedScanStorage {
+    ResolvedScanStorage::from_backends(
+        inline_backend(&spec.common.storage),
+        spec.common
+            .join
+            .as_ref()
+            .map(|join| inline_backend(&join.storage)),
+    )
+}
+
+fn inline_backend(storage: &ScanStorage) -> StorageBackend {
+    match storage {
+        ScanStorage::Inline(backend) => backend.clone(),
+        other => panic!("this fixture shortcut needs an inline storage value, not {other:?}"),
+    }
+}
+
+pub(super) const TEST_CONNECTION: &str = "LAKEHOUSE_CATALOG_CREDS";
+
+pub(super) fn refusing_endpoint(message: &str) -> String {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let url = format!("http://{}", listener.local_addr().expect("addr"));
+    let body =
+        format!("<Error><Code>SignatureDoesNotMatch</Code><Message>{message}</Message></Error>");
+    let resp = format!(
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { break };
+            let _ = std::io::Read::read(&mut s, &mut [0u8; 4096]);
+            let _ = std::io::Write::write_all(&mut s, resp.as_bytes());
+        }
+    });
+    url
+}
+
+pub(super) fn refusing_backend(endpoint: &str, secret: &str) -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: endpoint.into(),
+        region: "us-east-1".into(),
+        access_key: "testkey".into(),
+        secret_key: secret.into(),
+        allow_http: true,
+        ..Default::default()
+    })
+}
+
+pub(super) struct SinkCtx;
+
+impl exasol_udf_sdk::context::UdfContext for SinkCtx {
+    fn num_columns(&self) -> usize {
+        0
+    }
+    fn get(
+        &self,
+        _: usize,
+    ) -> Result<&exasol_udf_sdk::value::Value, exasol_udf_sdk::error::UdfError> {
+        unimplemented!()
+    }
+    fn emit(
+        &mut self,
+        _: &[exasol_udf_sdk::value::Value],
+    ) -> Result<(), exasol_udf_sdk::error::UdfError> {
+        Ok(())
+    }
+    fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> {
+        Ok(false)
+    }
+    fn emit_record_batch_ipc(&mut self, _: &[u8]) -> Result<(), exasol_udf_sdk::error::UdfError> {
+        Ok(())
     }
 }

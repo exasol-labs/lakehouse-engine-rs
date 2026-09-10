@@ -5,7 +5,8 @@
 //! these through `super::test_support`.
 
 use super::*;
-use crate::scan::spec::{DeleteMechanism, StorageProps};
+use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
+use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -337,6 +338,8 @@ pub(super) async fn delta_pushdown(
         creds: unauthenticated_creds(),
         allow_http: true,
         catalog_kind: CatalogKind::UnityCatalogNative,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),
@@ -364,6 +367,45 @@ pub(super) async fn iceberg_catalog() -> RecordingCatalog {
         }
     })
     .await
+}
+
+pub(super) const TEST_CONNECTION_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
+
+pub(super) const TEST_CONNECTION_PASSWORD: &str =
+    r#"{"warehouse":"wh","secret_key":"FIXTURESECRET"}"#;
+
+pub(super) fn test_sealing_key() -> SealedStorageKey {
+    derive_sealed_storage_key(TEST_CONNECTION_PASSWORD)
+}
+
+fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
+    ResolvedConnectionConfig {
+        catalog_uri: "http://catalog.example.com".to_string(),
+        storage: sample_storage(),
+        creds,
+        allow_http: true,
+        catalog_kind: CatalogKind::IcebergRest,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
+    }
+}
+
+pub(super) static TEST_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
+    std::sync::LazyLock::new(|| test_connection(unauthenticated_creds()));
+
+pub(super) static TEST_VENDED_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
+    std::sync::LazyLock::new(|| {
+        test_connection(ConnectionCreds {
+            use_vended_credentials: true,
+            ..unauthenticated_creds()
+        })
+    });
+
+pub(super) fn sample_scan_storage() -> ScanStorage {
+    ScanStorage::Connection {
+        name: TEST_CONNECTION_NAME.to_string(),
+        allow_http: true,
+    }
 }
 
 pub(super) fn sample_storage() -> StorageBackend {
@@ -415,7 +457,7 @@ pub(super) fn build_sql_for_fixture_n(
             projection: proj_items.clone(),
             filter,
             limit,
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -555,7 +597,7 @@ pub(super) fn build_row_sql_with_root(
             table_root: table_root.to_string(),
             projection: proj_items.clone(),
             emit_exa_types: proj_types.clone(),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],

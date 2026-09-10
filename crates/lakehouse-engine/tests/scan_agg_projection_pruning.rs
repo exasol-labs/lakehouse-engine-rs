@@ -26,6 +26,8 @@
 //! Host-runnable: writes a local Parquet file and inspects the physical plan; no
 //! S3 / MinIO / Exasol stack required.
 
+mod scan_fixture;
+
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -35,12 +37,14 @@ use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use lakehouse_engine::scan::spec::{
-    AggKind, AggregatePlan, CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps,
+    AggKind, AggregatePlan, CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend,
+    StorageProps,
 };
 use lakehouse_engine::scan::{
     build_alias_items, build_grouped_partial_agg_sql, build_partial_agg_sql_filtered,
     register_files, session_config_for_spec,
 };
+
 use parquet::arrow::ArrowWriter;
 
 /// Physical (Iceberg-style lowercase) column names of the test table. The adapter
@@ -94,14 +98,14 @@ fn agg_spec(file_url: String) -> ScanSpec {
         .len();
     ScanSpec {
         common: CommonScanSpec {
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         },
         files: vec![FileEntry::new(file_url, size)],
@@ -119,7 +123,8 @@ async fn build_agg_physical_plan(
     build_sql: impl FnOnce(&str) -> String,
 ) -> Arc<dyn ExecutionPlan> {
     let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
-    register_files(&ctx, "scan_target", spec)
+    let storage = scan_fixture::resolved_storage(spec);
+    register_files(&ctx, "scan_target", spec, &storage)
         .await
         .expect("register_files must succeed on the local file");
 

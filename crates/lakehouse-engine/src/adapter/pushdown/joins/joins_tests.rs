@@ -264,8 +264,8 @@ pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> Resolv
     )
 }
 
-pub(super) fn two_scan_tuning() -> JoinScanTuning {
-    JoinScanTuning {
+pub(super) fn two_scan_tuning() -> JoinScanRequestConfig<'static> {
+    JoinScanRequestConfig {
         cluster_nodes: 1,
         parallelism_factor: 1,
         df_target_partitions: 1,
@@ -274,6 +274,7 @@ pub(super) fn two_scan_tuning() -> JoinScanTuning {
         memory_pool_fraction: 0.6,
         instance_overhead_mb: 0,
         s3_max_connections: 1,
+        connection: &crate::adapter::pushdown::test_support::TEST_CONNECTION,
     }
 }
 

@@ -119,10 +119,7 @@ the scalar-wrapper shape.
   `function_aggregate` — `ROUND(price, 2)`, `UPPER(name)` — yields no aggregate to
   decompose, declines the classification, and reaches the row-scan projection exactly as
   today.
-* **Every existing `dispatch_golden` fixture stays byte-identical.** None of the eighteen
-  fixtures under `adapter/pushdown/testdata/dispatch_golden/` carries an aggregate inside a
-  row-scan projection, so no fixture encodes the pre-fix behaviour and a diff in any of
-  them is a regression rather than an expected update. New shapes get new fixtures.
+* `dispatch_golden` fixtures: `vs-adapter/scan-spec-credential-reference` regenerates credential-bearing fixtures for their `storage` value; a diff outside that value is a regression. The relocation gate's full-string golden assertion holds against the fixtures as regenerated.
 * Iceberg spec compliance: checked, not engaged; quotes retrieved from the published spec,
   not recalled. This feature changes how the adapter classifies an Exasol `selectList` item
   and which SQL it assembles for the outer merge. It reads no manifest, resolves no
@@ -213,5 +210,5 @@ the scalar-wrapper shape.
 * *WHEN* the single-group planner gains the same classification and the same merge rewrite
 * *THEN* those four primitives SHALL have exactly ONE owner reachable by BOTH planners, and the single-group planner MUST NOT carry a second copy of the tree walk, the sentinel token format, the classifier's decline rules, or the substitution rewrite
 * *AND* the owning module SHALL be a submodule of `adapter::pushdown` exposing the primitives at the narrowest visibility that compiles, never widened to a broader public than they have today, and its tests SHALL live in its own sibling test file per `vs-adapter/pushdown-module-structure`
-* *AND* the grouped planner's rendered SQL MUST remain byte-identical after the relocation, asserted by full-string equality against the existing committed `dispatch_golden` fixtures, so the move is a change of owner and not of output
+* *AND* the grouped planner's rendered SQL MUST remain byte-identical after the relocation EXCEPT for the scan-spec `storage` value (re-encoded by `vs-adapter/scan-spec-credential-reference`), asserted by full-string equality against the committed `dispatch_golden` fixtures as regenerated for that value alone
 * *AND* a top-level bare aggregate, a grouped scalar-over-aggregate item, and a single-group scalar-over-aggregate item SHALL be rewritten by the SAME merge-rewriting path, so the three produce consistent merged SQL for the same inner aggregate

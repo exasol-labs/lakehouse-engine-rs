@@ -9,7 +9,7 @@ scan: a nested `LAKEHOUSE_DISTRIBUTE_FILES` LUA SET distributor subquery (`GROUP
 shard_key`) spreads each shard's per-file list across nodes, and an outer ungrouped
 `LAKEHOUSE_SCAN` SCALAR EMIT UDF scans each distributed file list node-locally and streams
 the rows. The scan-driving SQL splices the shard-invariant parts (projection, filter,
-LIMIT, logical schema, credentials, and the table root) once as the scalar scan
+LIMIT, logical schema, a storage-credential REFERENCE, and the table root) once as the scalar scan
 UDF's first-argument common literal and flows each shard's per-file subset through the
 distributor as the second argument. A single-shard plan short-circuits the distributor and
 calls the scalar scan directly on the file-list literal. See
@@ -23,9 +23,9 @@ SQL, and AVG sum/count decomposition) is covered separately in
 
 ## Background
 
-* The scan-driving SQL invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF over a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the shard-invariant common spec (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, credentials, tuning knobs, and the table root) is spliced once as the scalar scan's first argument and each shard's file subset flows through the distributor as the second argument.
+* The scan-driving SQL invokes the `LAKEHOUSE_SCAN` SCALAR EMIT UDF over a nested `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the shard-invariant common spec (projection, filter, LIMIT, aggregates, group keys, logical schema, EMITS types, a storage-credential reference (or, under vending, a sealed envelope), tuning knobs, and the table root) is spliced once as the scalar scan's first argument and each shard's file subset flows through the distributor as the second argument.
 * The outer scalar scan select is never wrapped in a `SELECT * FROM (...)` materialization boundary.
-* Credentials MUST NOT appear in any returned SQL string or error message, and MUST NOT be repeated per shard.
+* Credential reference: the common spec carries a CONNECTION name or sealed envelope, never a plaintext credential — see `vs-adapter/scan-spec-credential-reference`.
 * The `LAKEHOUSE_SCAN` and `LAKEHOUSE_DISTRIBUTE_FILES` UDF names in the scan-driving SQL are schema-qualified from the schema of the running adapter script, read from the UDF handshake via `ctx.script_schema()`; there is no VS property that supplies this schema. The scan and distributor scripts are co-deployed in the adapter script's schema, so this single source qualifies both.
 * The cluster node count that sizes the shard fan-out is read per pushdown from the adapter script's own UDF handshake via `UdfContext::node_count()`. It is NOT read from `schemaMetadataInfo.adapterNotes`. Every VS request type reaches the adapter through the same single-call script invocation, so the handshake carries the node count on a `pushdown` request exactly as it does on a `createVirtualSchema` request; the request type lives in the JSON payload, not in the handshake.
 * `node_count()` is a synchronous handshake read and MUST be captured in `dispatch` before the tokio runtime is entered, alongside `ctx.script_schema()` and the resolved CONNECTION credentials. The value is then threaded into the pushdown planning path as a plain integer, so the async planning code performs no ambient context read of its own.
@@ -111,3 +111,5 @@ SQL, and AVG sum/count decomposition) is covered separately in
 * *THEN* the adapter SHALL use a node count of `1`
 * *AND* the resulting shard count `G` SHALL be `min(1 × PARALLELISM_FACTOR, 300, file_count)` per `parallelism/work-unit-sharding`
 * *AND* the adapter SHALL still return a successful `pushdown` response
+
+*Credential-reference invariant:* the common scan-spec literal carries a connection REFERENCE or sealed envelope, never a plaintext credential. See `vs-adapter/scan-spec-credential-reference` for the full contract.
