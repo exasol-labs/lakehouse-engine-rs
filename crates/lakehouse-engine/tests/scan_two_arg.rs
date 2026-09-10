@@ -25,8 +25,8 @@ use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
-use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
+use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
@@ -42,64 +42,6 @@ use parquet::file::properties::WriterProperties;
 /// here since this integration test cannot import a `pub(crate)` item).
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
-
-/// A fake `UdfContext` serving up to two string columns for one input row and
-/// capturing every `emit_batch` as a decoded `RecordBatch`.
-///
-/// A column value of `None` models a SQL NULL argument, exercising the
-/// NULL-handling contract of [`read_scan_spec`].
-struct FakeCtx {
-    columns: Vec<Option<String>>,
-    served: bool,
-    emitted: Vec<RecordBatch>,
-}
-
-impl FakeCtx {
-    fn new(columns: Vec<Option<String>>) -> Self {
-        Self {
-            columns,
-            served: false,
-            emitted: Vec::new(),
-        }
-    }
-}
-
-impl UdfContext for FakeCtx {
-    fn num_columns(&self) -> usize {
-        self.columns.len()
-    }
-    fn get(&self, _col: usize) -> Result<&Value, UdfError> {
-        Err(UdfError::User("FakeCtx uses get_string only".into()))
-    }
-    fn get_string(&self, col: usize) -> Result<Option<&str>, UdfError> {
-        Ok(self.columns.get(col).and_then(|c| c.as_deref()))
-    }
-    fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
-        Err(UdfError::User("raw path must use emit_batch".into()))
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        if self.served {
-            Ok(false)
-        } else {
-            self.served = true;
-            Ok(true)
-        }
-    }
-    fn debug_level(&self) -> tracing::Level {
-        tracing::Level::INFO
-    }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), UdfError> {
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-        let reader = StreamReader::try_new(Cursor::new(ipc), None)
-            .map_err(|e| UdfError::User(format!("ipc decode: {e}")))?;
-        for batch in reader {
-            let batch = batch.map_err(|e| UdfError::User(format!("ipc batch: {e}")))?;
-            self.emitted.push(batch);
-        }
-        Ok(())
-    }
-}
 
 /// Write a local Parquet file with `rows` rows across small row groups (so the
 /// scan produces several batches) and return its `file://` URL.
@@ -160,7 +102,9 @@ fn scan_spec(file_url: String) -> ScanSpec {
 /// return the decoded emitted batches. Models the PRE-SPLIT single-argument
 /// path: the whole spec parsed up front, then the unchanged downstream scan.
 async fn run_with_spec(spec: &ScanSpec) -> Vec<RecordBatch> {
-    let mut ctx = FakeCtx::new(vec![Some(spec.to_json())]);
+    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![Value::String(
+        spec.to_json(),
+    )]));
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(
@@ -172,7 +116,7 @@ async fn run_with_spec(spec: &ScanSpec) -> Vec<RecordBatch> {
     )
     .await
     .expect("raw scan must succeed");
-    ctx.emitted
+    ctx.into_batches()
 }
 
 /// Run the raw scan driving the TWO-ARGUMENT reconstitution: feed the common
@@ -180,10 +124,10 @@ async fn run_with_spec(spec: &ScanSpec) -> Vec<RecordBatch> {
 /// [`read_scan_spec`], then run the unchanged downstream scan over the
 /// reconstituted spec. Returns the decoded emitted batches.
 async fn run_two_arg(common_json: &str, files_json: &str) -> Vec<RecordBatch> {
-    let mut ctx = FakeCtx::new(vec![
-        Some(common_json.to_string()),
-        Some(files_json.to_string()),
-    ]);
+    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![
+        Value::String(common_json.to_string()),
+        Value::String(files_json.to_string()),
+    ]));
     // Production two-argument reconstitution (the code under test).
     let spec = read_scan_spec(&ctx).expect("reconstitute spec from two args");
     let session = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -197,7 +141,7 @@ async fn run_two_arg(common_json: &str, files_json: &str) -> Vec<RecordBatch> {
     )
     .await
     .expect("raw scan must succeed");
-    ctx.emitted
+    ctx.into_batches()
 }
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -354,7 +298,7 @@ fn two_arg_null_in_either_argument_is_user_error() {
     let common_json = scan_spec("s3://w/f0.parquet".into()).to_common_json();
 
     // NULL common blob (col 0).
-    let ctx = FakeCtx::new(vec![None, Some(files_json.clone())]);
+    let ctx = TestContext::scalar(vec![Value::Null, Value::String(files_json.clone())]);
     let err = read_scan_spec(&ctx).expect_err("NULL common must error");
     assert!(
         matches!(err, UdfError::User(ref m) if m.contains("common") && m.contains("NULL")),
@@ -362,7 +306,7 @@ fn two_arg_null_in_either_argument_is_user_error() {
     );
 
     // NULL files blob (col 1).
-    let ctx = FakeCtx::new(vec![Some(common_json), None]);
+    let ctx = TestContext::scalar(vec![Value::String(common_json), Value::Null]);
     let err = read_scan_spec(&ctx).expect_err("NULL files must error");
     assert!(
         matches!(err, UdfError::User(ref m) if m.contains("files") && m.contains("NULL")),

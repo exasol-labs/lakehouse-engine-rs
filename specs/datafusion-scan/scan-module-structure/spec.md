@@ -12,6 +12,8 @@ Decomposes the DataFusion scan-execution code in `scan/mod.rs` into single-respo
 * The CI/lint file-size guardrail (the second half of issue #129) is out of scope for this feature and remains open under issue #129. This feature is partial progress on issue #129 and does not close it.
 * **This delta is issue #135. It amends ONE scenario and changes no module boundary.** The public scan façade, the import-free consumer compilation, the consolidated SQL-builder helpers, and the per-submodule test layout are all UNCHANGED.
 * **This feature's byte-identity gate is now carved out for the `storage` value alone.** The scan-driving SQL stays byte-identical for every spec shape EXCEPT for the `storage` value, which becomes the tagged wrapper of `vs-adapter/scan-spec-credential-reference`.
+* `exasol-udf-sdk` 0.24.0 adds test doubles behind a `test-support` feature. The SDK double does NOT override `emit_record_batch_ipc` (trait default returns `Unimplemented`), so scan doubles that capture Arrow IPC emissions need a local wrapper.
+* The `test-support` feature MUST be enabled only as a dev-dependency so it stays out of the production `.so`.
 
 ## Scenarios
 
@@ -53,3 +55,18 @@ Decomposes the DataFusion scan-execution code in `scan/mod.rs` into single-respo
 * *THEN* each functional submodule MUST contain a `#[cfg(test)] mod tests` covering only that submodule's own items
 * *AND* no single central scan test module SHALL remain in `scan/mod.rs` beyond the entry-and-dispatch tests for the items `mod.rs` retains
 * *AND* a test helper shared across submodules MUST live in one shared `scan/test_support_tests.rs` module rather than being duplicated
+
+### Scenario: One shared double owns every scan test's Arrow IPC capture
+
+* *GIVEN* the scan integration tests under `crates/lakehouse-engine/tests/` that each hand-roll a `UdfContext` double with an identical `emit_record_batch_ipc` decode loop
+* *WHEN* the scan integration-test suite compiles and runs
+* *THEN* exactly one double in `tests/scan_fixture/` SHALL own the decode and delegate every other `UdfContext` method to the SDK double
+* *AND* the shared double SHALL retain per-call capture grouping so payload count stays distinguishable from batch count
+* *AND* no file under `crates/lakehouse-engine/tests/` SHALL declare its own `impl UdfContext` (bare or fully-qualified form)
+* *AND* every existing scan integration test MUST pass with no change to any assertion or expected value
+
+### Scenario: Two in-crate doubles are retained for reachability
+
+* *GIVEN* `src/scan/emit_tests.rs` `CapturingCtx` and `src/scan/test_support_tests.rs` `SinkCtx`
+* *WHEN* the shared double lands in `tests/scan_fixture/`
+* *THEN* both SHALL be retained: `tests/` modules are not nameable from `src/`, and neither duplicates the decode this delta consolidates

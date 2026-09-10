@@ -40,8 +40,8 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
-use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
+use exasol_udf_sdk::test_support::{NextPolicy, TestContext};
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
@@ -54,62 +54,6 @@ use lakehouse_engine::scan::{
 };
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
-
-/// A fake `UdfContext` serving exactly ONE input row (its two column values) and
-/// capturing every `emit_batch` as a decoded `RecordBatch`.
-///
-/// Models SDK 0.21.0 scalar dispatch: one `run()` call sees one row, so
-/// `get_string(col)` reads that row's column directly with no cursor. `next()` is
-/// a hard error — a scalar `run()` iterating with `ctx.next()` is exactly the
-/// illegal batch-loop behavior these tests guard against, so any call to it fails
-/// the test loudly rather than silently masking a regression.
-struct RowCtx {
-    row: Vec<Option<String>>,
-    emitted: Vec<RecordBatch>,
-}
-
-impl RowCtx {
-    fn new(row: Vec<Option<String>>) -> Self {
-        Self {
-            row,
-            emitted: Vec::new(),
-        }
-    }
-}
-
-impl UdfContext for RowCtx {
-    fn num_columns(&self) -> usize {
-        self.row.len()
-    }
-    fn get(&self, _col: usize) -> Result<&Value, UdfError> {
-        Err(UdfError::User("RowCtx uses get_string only".into()))
-    }
-    fn get_string(&self, col: usize) -> Result<Option<&str>, UdfError> {
-        Ok(self.row.get(col).and_then(|c| c.as_deref()))
-    }
-    fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
-        Err(UdfError::User("raw path must use emit_batch".into()))
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        Err(UdfError::User(
-            "scalar run() handles exactly one row; ctx.next() must never be called".into(),
-        ))
-    }
-    fn debug_level(&self) -> tracing::Level {
-        tracing::Level::INFO
-    }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), UdfError> {
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-        let reader = StreamReader::try_new(Cursor::new(ipc), None)
-            .map_err(|e| UdfError::User(format!("ipc decode: {e}")))?;
-        for batch in reader {
-            let batch = batch.map_err(|e| UdfError::User(format!("ipc batch: {e}")))?;
-            self.emitted.push(batch);
-        }
-        Ok(())
-    }
-}
 
 /// Write a local Parquet at `dir/name` with `count` rows whose ids run
 /// `start..start+count` (so files carry disjoint id ranges), and return its
@@ -293,10 +237,10 @@ fn distinct_spec_for_file(file_url: String) -> ScanSpec {
 
 /// Build one scalar-input row for `spec`: `[common blob, files JSON]`, exactly as
 /// the adapter splices the scalar scan's two arguments for a single fan-out row.
-fn row_for_spec(spec: &ScanSpec) -> Vec<Option<String>> {
+fn row_for_spec(spec: &ScanSpec) -> Vec<Value> {
     vec![
-        Some(spec.to_common_json()),
-        Some(ScanSpec::files_json(&spec.files)),
+        Value::String(spec.to_common_json()),
+        Value::String(ScanSpec::files_json(&spec.files)),
     ]
 }
 
@@ -395,7 +339,13 @@ fn counting_build_runtime(threads: usize, built: &AtomicUsize) -> tokio::runtime
 /// [`run_scan_one`] to completion on it, then tear that runtime down explicitly —
 /// mirroring production `run_scan` for a single row. Returns the emitted batches.
 fn run_one_row(spec: &ScanSpec, built: &AtomicUsize) -> Vec<RecordBatch> {
-    let mut ctx = RowCtx::new(row_for_spec(spec));
+    let mut ctx = scan_fixture::BatchCapturingCtx::new(
+        TestContext::scalar(row_for_spec(spec)).with_next_policy(NextPolicy::Reject(
+            UdfError::User(
+                "scalar run() handles exactly one row; ctx.next() must never be called".into(),
+            ),
+        )),
+    );
     // Reconstitute this row's spec from the two scalar arguments, exactly as
     // production does — reading only columns 0 and 1, never calling ctx.next().
     let reconstituted = read_scan_spec(&ctx).expect("reconstitute row spec");
@@ -411,7 +361,7 @@ fn run_one_row(spec: &ScanSpec, built: &AtomicUsize) -> Vec<RecordBatch> {
     // Explicit, deterministic teardown of THIS call's runtime — the runtime is a
     // call-local value consumed here, never hoisted out of the per-row loop.
     rt.shutdown_timeout(std::time::Duration::from_secs(5));
-    ctx.emitted
+    ctx.into_batches()
 }
 
 /// Drive one independent scalar `run()` call per shard spec and concatenate the
@@ -507,7 +457,13 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
     // Reference: drive the unchanged downstream raw-scan path over the same spec,
     // with an equivalent local session.
     let reference = block_on(async {
-        let mut ctx = RowCtx::new(row_for_spec(&spec));
+        let mut ctx = scan_fixture::BatchCapturingCtx::new(
+            TestContext::scalar(row_for_spec(&spec)).with_next_policy(NextPolicy::Reject(
+                UdfError::User(
+                    "scalar run() handles exactly one row; ctx.next() must never be called".into(),
+                ),
+            )),
+        );
         let session =
             local_session(&spec, &scan_fixture::resolved_storage(&spec), 0).expect("session");
         let mut timers = PhaseTimers::start();
@@ -520,7 +476,7 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
         )
         .await
         .expect("reference raw scan");
-        ctx.emitted
+        ctx.into_batches()
     });
 
     assert_eq!(total_rows(&per_row), 200, "single-row call scans all rows");

@@ -15,6 +15,7 @@
 
 use super::*;
 
+use exasol_udf_sdk::test_support::TestContext;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
@@ -138,38 +139,20 @@ fn parse_request(raw: &str) -> RecordedRequest {
     }
 }
 
-/// A `UdfContext` whose `connection()` resolves to a caller-chosen address and
-/// credential JSON. The listing tests use an empty-object (no-auth) password;
-/// the unreachable test uses a PAT so there is a real secret to prove absent.
-struct UnityConnCtx {
-    address: String,
-    password: String,
-}
-
-impl UdfContext for UnityConnCtx {
-    fn num_columns(&self) -> usize {
-        0
-    }
-    fn get(&self, _col: usize) -> Result<&exasol_udf_sdk::value::Value, UdfError> {
-        Err(UdfError::Type("none".into()))
-    }
-    fn emit(&mut self, _values: &[exasol_udf_sdk::value::Value]) -> Result<(), UdfError> {
-        Ok(())
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        Ok(false)
-    }
-    fn connection(
-        &self,
-        _name: &str,
-    ) -> Result<exasol_udf_sdk::connect_back::ConnectionObject, UdfError> {
-        Ok(exasol_udf_sdk::connect_back::ConnectionObject {
+/// A `TestContext` whose registered `uc_conn` CONNECTION resolves to a
+/// caller-chosen address and credential JSON. The listing tests use an
+/// empty-object (no-auth) password; the unreachable test uses a PAT so there
+/// is a real secret to prove absent.
+fn unity_conn_ctx(address: impl Into<String>, password: impl Into<String>) -> TestContext {
+    TestContext::scalar(vec![]).with_connection(
+        "uc_conn",
+        exasol_udf_sdk::connect_back::ConnectionObject {
             kind: "PASSWORD".into(),
-            address: self.address.clone(),
+            address: address.into(),
             user: String::new(),
-            password: self.password.clone(),
-        })
-    }
+            password: password.into(),
+        },
+    )
 }
 
 fn create_vs_request() -> Json {
@@ -184,11 +167,8 @@ fn create_vs_request() -> Json {
 }
 
 fn create_vs_over(mock: &MockUnityCatalog) -> Result<Json, UdfError> {
-    let mut ctx = UnityConnCtx {
-        address: mock.base_url.clone(),
-        // Empty-object password: a valid no-auth Unity Catalog CONNECTION.
-        password: "{}".into(),
-    };
+    // Empty-object password: a valid no-auth Unity Catalog CONNECTION.
+    let mut ctx = unity_conn_ctx(mock.base_url.clone(), "{}");
     dispatch(&mut ctx, &create_vs_request())
 }
 
@@ -555,11 +535,11 @@ fn unreachable_unity_catalog_is_credential_safe_error() {
     drop(probe);
 
     const SENTINEL: &str = "SENTINEL_SECRET_TOKEN";
-    let mut ctx = UnityConnCtx {
-        address: format!("http://127.0.0.1:{port}"),
-        // PAT auth so a real bearer secret rides the request and must never surface.
-        password: json!({ "token": SENTINEL }).to_string(),
-    };
+    // PAT auth so a real bearer secret rides the request and must never surface.
+    let mut ctx = unity_conn_ctx(
+        format!("http://127.0.0.1:{port}"),
+        json!({ "token": SENTINEL }).to_string(),
+    );
 
     let error = dispatch(&mut ctx, &create_vs_request())
         .expect_err("an unreachable Unity Catalog must fail createVirtualSchema");

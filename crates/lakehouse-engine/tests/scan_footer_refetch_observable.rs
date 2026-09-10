@@ -36,9 +36,7 @@ use async_trait::async_trait;
 use chrono::{TimeZone, Utc};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-use exasol_udf_sdk::context::UdfContext;
-use exasol_udf_sdk::error::UdfError;
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::test_support::TestContext;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::{
@@ -73,59 +71,6 @@ const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 /// well under any real Parquet footer's `memory_size()` — deterministic, no
 /// reliance on LRU eviction ordering.
 const TINY_CACHE_LIMIT_BYTES: usize = 100;
-
-/// A fake `UdfContext` serving one input row and decoding every emitted Arrow
-/// IPC batch — the same capture pattern `scan_no_head_test.rs`'s `FakeCtx` uses.
-struct FakeCtx {
-    served: bool,
-    emitted: Vec<RecordBatch>,
-}
-
-impl FakeCtx {
-    fn new() -> Self {
-        Self {
-            served: false,
-            emitted: Vec::new(),
-        }
-    }
-}
-
-impl UdfContext for FakeCtx {
-    fn num_columns(&self) -> usize {
-        0
-    }
-    fn get(&self, _col: usize) -> Result<&Value, UdfError> {
-        Err(UdfError::User("FakeCtx has no input columns".into()))
-    }
-    fn get_string(&self, _col: usize) -> Result<Option<&str>, UdfError> {
-        Ok(None)
-    }
-    fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
-        Err(UdfError::User("raw path must use emit_batch".into()))
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        if self.served {
-            Ok(false)
-        } else {
-            self.served = true;
-            Ok(true)
-        }
-    }
-    fn debug_level(&self) -> tracing::Level {
-        tracing::Level::INFO
-    }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), UdfError> {
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-        let reader = StreamReader::try_new(Cursor::new(ipc), None)
-            .map_err(|e| UdfError::User(format!("ipc decode: {e}")))?;
-        for batch in reader {
-            let batch = batch.map_err(|e| UdfError::User(format!("ipc batch: {e}")))?;
-            self.emitted.push(batch);
-        }
-        Ok(())
-    }
-}
 
 /// One logged request: the location, whether it was a HEAD, and the byte
 /// range requested (if any).
@@ -469,7 +414,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     evict_session
         .runtime_env()
         .register_object_store(&Url::parse(&data_url).expect("register url"), evict_store);
-    let mut evict_ctx = FakeCtx::new();
+    let mut evict_ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
     let mut evict_timers = PhaseTimers::start();
     block_on(run_raw_scan_with_session(
         &mut evict_ctx,
@@ -481,7 +426,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     .expect("delete-carrying scan must succeed even when the metadata cache evicts");
     assert_eq!(
         evict_ctx
-            .emitted
+            .batches()
             .iter()
             .map(|b| b.num_rows())
             .sum::<usize>(),
@@ -521,7 +466,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     default_session
         .runtime_env()
         .register_object_store(&Url::parse(&data_url).expect("register url"), default_store);
-    let mut default_ctx = FakeCtx::new();
+    let mut default_ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
     let mut default_timers = PhaseTimers::start();
     block_on(run_raw_scan_with_session(
         &mut default_ctx,
@@ -533,7 +478,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     .expect("delete-carrying scan must succeed under the default cache limit");
     assert_eq!(
         default_ctx
-            .emitted
+            .batches()
             .iter()
             .map(|b| b.num_rows())
             .sum::<usize>(),
@@ -604,7 +549,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         })
         .collect();
     let limit_session = SessionContext::new_with_config(session_config_for_spec(&limit_spec));
-    let mut limit_ctx = FakeCtx::new();
+    let mut limit_ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
     let mut limit_timers = PhaseTimers::start();
     block_on(run_raw_scan_with_session(
         &mut limit_ctx,
@@ -616,7 +561,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     .expect("delete-carrying scan with a pushed LIMIT must succeed");
     assert_eq!(
         limit_ctx
-            .emitted
+            .batches()
             .iter()
             .map(|b| b.num_rows())
             .sum::<usize>(),
@@ -720,7 +665,7 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
         spec
     };
 
-    let mut ctx_a = FakeCtx::new();
+    let mut ctx_a = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
     block_on(run_scan_one(
         &mut ctx_a,
         spec_for(&data_a, &delete_a),
@@ -729,12 +674,12 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
     ))
     .expect("invocation 1 over file A must succeed");
     assert_eq!(
-        ctx_a.emitted.iter().map(|b| b.num_rows()).sum::<usize>(),
+        ctx_a.batches().iter().map(|b| b.num_rows()).sum::<usize>(),
         39,
         "1 row deleted out of 40 in file A"
     );
 
-    let mut ctx_b = FakeCtx::new();
+    let mut ctx_b = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
     block_on(run_scan_one(
         &mut ctx_b,
         spec_for(&data_b, &delete_b),
@@ -743,7 +688,7 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
     ))
     .expect("invocation 2 over file B must succeed");
     assert_eq!(
-        ctx_b.emitted.iter().map(|b| b.num_rows()).sum::<usize>(),
+        ctx_b.batches().iter().map(|b| b.num_rows()).sum::<usize>(),
         39,
         "1 row deleted out of 40 in file B"
     );

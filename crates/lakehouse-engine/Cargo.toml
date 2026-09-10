@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.43.0"
+version = "0.44.0"
 edition = "2024"
 license.workspace = true
 
@@ -94,6 +94,9 @@ rand    = "0.8"
 # loopback catalog fake in file_resolution.rs's unit tests. Declared directly rather
 # than left to transitive feature unification.
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
+# Serves both src/**/*_tests.rs unit tests and the tests/ integration targets — cargo
+# unifies dev-dependency features into the crate under test.
+exasol-udf-sdk      = { workspace = true, features = ["test-support"] }
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
 # TPC-H row generator for tpch_loader.rs; core has no arrow dep, so tpchgen-arrow

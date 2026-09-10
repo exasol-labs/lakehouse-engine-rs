@@ -27,8 +27,8 @@ use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
-use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
+use exasol_udf_sdk::test_support::{EmitPolicy, TestContext};
 use exasol_udf_sdk::value::Value;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
@@ -40,72 +40,6 @@ use lakehouse_engine::scan::{
 };
 
 use parquet::arrow::ArrowWriter;
-
-struct FakeCtx {
-    served: bool,
-    args: Vec<Value>,
-    emitted: Vec<RecordBatch>,
-}
-
-impl FakeCtx {
-    fn new() -> Self {
-        Self {
-            served: false,
-            args: Vec::new(),
-            emitted: Vec::new(),
-        }
-    }
-
-    /// A context serving the TWO production scan-UDF input arguments for `spec` —
-    /// the shard-invariant common blob and this shard's files JSON — so a test can
-    /// drive `run_scan`, the entry point that builds the real object stores.
-    fn with_spec_args(spec: &ScanSpec) -> Self {
-        Self {
-            served: false,
-            args: vec![
-                Value::String(spec.to_common_json()),
-                Value::String(ScanSpec::files_json(&spec.files)),
-            ],
-            emitted: Vec::new(),
-        }
-    }
-}
-
-impl UdfContext for FakeCtx {
-    fn num_columns(&self) -> usize {
-        self.args.len()
-    }
-    fn get(&self, col: usize) -> Result<&Value, UdfError> {
-        self.args
-            .get(col)
-            .ok_or_else(|| UdfError::User(format!("FakeCtx has no input column {col}")))
-    }
-    fn emit(&mut self, _values: &[Value]) -> Result<(), UdfError> {
-        Err(UdfError::User("join path must use emit_batch".into()))
-    }
-    fn next(&mut self) -> Result<bool, UdfError> {
-        if self.served {
-            Ok(false)
-        } else {
-            self.served = true;
-            Ok(true)
-        }
-    }
-    fn debug_level(&self) -> tracing::Level {
-        tracing::Level::INFO
-    }
-    fn emit_record_batch_ipc(&mut self, ipc: &[u8]) -> Result<(), UdfError> {
-        use arrow::ipc::reader::StreamReader;
-        use std::io::Cursor;
-        let reader = StreamReader::try_new(Cursor::new(ipc), None)
-            .map_err(|e| UdfError::User(format!("ipc decode: {e}")))?;
-        for batch in reader {
-            let batch = batch.map_err(|e| UdfError::User(format!("ipc batch: {e}")))?;
-            self.emitted.push(batch);
-        }
-        Ok(())
-    }
-}
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
@@ -274,7 +208,10 @@ fn join_spec(
 /// the decoded emitted batches.
 fn run_join(spec: &ScanSpec) -> Vec<RecordBatch> {
     block_on(async {
-        let mut ctx = FakeCtx::new();
+        let mut ctx =
+            scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]).with_emit_policy(
+                EmitPolicy::Reject(UdfError::User("join path must use emit_batch".into())),
+            ));
         let session = SessionContext::new_with_config(session_config_for_spec(spec));
         let mut timers = PhaseTimers::start();
         run_join_scan_with_session(
@@ -286,7 +223,7 @@ fn run_join(spec: &ScanSpec) -> Vec<RecordBatch> {
         )
         .await
         .expect("join scan must succeed");
-        ctx.emitted
+        ctx.into_batches()
     })
 }
 
@@ -738,7 +675,10 @@ fn unreadable_join_file_error_redacts_both_sides_credentials() {
     );
 
     let err = block_on(async {
-        let mut ctx = FakeCtx::new();
+        let mut ctx =
+            scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]).with_emit_policy(
+                EmitPolicy::Reject(UdfError::User("join path must use emit_batch".into())),
+            ));
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
         let mut timers = PhaseTimers::start();
         run_join_scan_with_session(
@@ -872,7 +812,15 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
         files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],
     };
 
-    let mut ctx = FakeCtx::with_spec_args(&spec);
+    let mut ctx = scan_fixture::BatchCapturingCtx::new(
+        TestContext::scalar(vec![
+            Value::String(spec.to_common_json()),
+            Value::String(ScanSpec::files_json(&spec.files)),
+        ])
+        .with_emit_policy(EmitPolicy::Reject(UdfError::User(
+            "join path must use emit_batch".into(),
+        ))),
+    );
     let err = lakehouse_engine::scan::run_scan(&mut ctx)
         .expect_err("both sides' endpoints refuse every read, so the scan must fail");
     let text = err.to_string();
