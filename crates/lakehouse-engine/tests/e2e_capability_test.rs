@@ -2816,6 +2816,78 @@ fn e2e_upper_boolean_declines_to_native_oracle() {
 }
 
 // ---------------------------------------------------------------------------
+// 8.16b  SUBSTR/LEFT pushdown parity (#187)
+// ---------------------------------------------------------------------------
+//
+// `crates/lakehouse-engine/Cargo.toml`'s `datafusion` dependency previously
+// built without the `unicode_expressions` feature, so DataFusion's
+// `UnicodeFunctionPlanner` (which owns the `Substring` AST node) was never
+// registered and `substr(...)` failed to plan with "Substring could not be
+// planned by registered expr planner" — see decision-log.md [3]/[5]. Exasol
+// itself normalizes `LEFT(col, n)` to a `SUBSTR` `function_scalar` node
+// (`name: "SUBSTR"`, `arguments: [col, 1, n]`) BEFORE the pushdown request
+// ever reaches the adapter (confirmed by a live capture against
+// `typed_distinct_probe`, decision-log.md [5]) — so `LEFT(...)` and
+// `SUBSTR(...)` share the exact same translation and evaluation path, and
+// this one test covers both.
+//
+// Seed: `events.name` for id=N is `"event-NN"` (see this file's header
+// comment and `common/seed.rs`'s `seed_events_table_with_auth`).
+
+/// `SUBSTR(name, 1, 5)` and `LEFT(name, 5)` both push down and evaluate to
+/// `"event"`, and `SUBSTR(name, 7, 2)` returns the row's two-digit id — a
+/// live-stack regression guard for #187 (missing `unicode_expressions`).
+#[test]
+fn e2e_substr_left_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT SUBSTR(name, 1, 5), LEFT(name, 5), SUBSTR(name, 7, 2) FROM {} WHERE id = 1",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 columns (SUBSTR, LEFT, SUBSTR): {cols:?}"
+    );
+    assert_eq!(cols[0].len(), 1, "expected 1 row (id=1): {cols:?}");
+
+    let substr_prefix = cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("SUBSTR(name, 1, 5) not a string: {:?}", cols[0][0]));
+    let left_prefix = cols[1][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("LEFT(name, 5) not a string: {:?}", cols[1][0]));
+    let substr_id = cols[2][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("SUBSTR(name, 7, 2) not a string: {:?}", cols[2][0]));
+
+    assert_eq!(
+        substr_prefix, "event",
+        "SUBSTR(name, 1, 5) for id=1 (\"event-01\") must be \"event\", got {substr_prefix:?}"
+    );
+    assert_eq!(
+        left_prefix, "event",
+        "LEFT(name, 5) for id=1 (\"event-01\") must be \"event\", got {left_prefix:?}"
+    );
+    assert_eq!(
+        substr_id, "01",
+        "SUBSTR(name, 7, 2) for id=1 (\"event-01\") must be the two-digit id \"01\", got {substr_id:?}"
+    );
+
+    // Without this assertion the test above would pass even if Exasol
+    // silently evaluated SUBSTR/LEFT itself post-scan instead of the adapter
+    // pushing it into the scan SQL.
+    let pushdown_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushdown_sql.contains("substr("),
+        "pushdown SQL must contain a rendered substr( expression: {pushdown_sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 8.17  INSTR/LOCATE arity decline (#228)
 // ---------------------------------------------------------------------------
 //

@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.44.0"
+version = "0.44.1"
 edition = "2024"
 license.workspace = true
 
@@ -29,7 +29,7 @@ lakehouse-catalog = { path = "../lakehouse-catalog" }
 
 arrow      = { workspace = true, features = ["json"] }
 parquet    = { workspace = true }
-datafusion = { workspace = true }
+datafusion = { workspace = true, features = ["unicode_expressions"] }
 
 # `azure`: ADLS Gen2 (`abfss://`) object store; unions with the workspace `aws`.
 object_store = { workspace = true, features = ["azure"] }
