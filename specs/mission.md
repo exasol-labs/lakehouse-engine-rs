@@ -131,7 +131,7 @@ lakehouse-engine/
 └── Makefile        # cross-udf-build, test-e2e
 ```
 
-One `.so` still carries both entry points (VS adapter + DataFusion scan SET UDF): `lakehouse-catalog`
+One `.so` still carries all three entry points (VS adapter + DataFusion scan UDF + version query UDF): `lakehouse-catalog`
 compiles into `lakehouse-engine`'s cdylib as a workspace dependency, so the crate split changes only
 the source layout, not the UDF packaging model.
 

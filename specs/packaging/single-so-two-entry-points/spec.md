@@ -1,16 +1,16 @@
-# Feature: Single Shared Object, Two Entry Points
+# Feature: Single Shared Object, Three Entry Points
 
-Packages the VS adapter and the DataFusion scan UDF as named entry points in one Rust
-crate that builds to a single `.so`, exploiting language-container-rs's
-multiple-entry-points-per-`.so` capability. The scan entry point is a single `.so`
-symbol driven by a SCALAR EMIT script. The cluster fan-out distributor
-(`LAKEHOUSE_DISTRIBUTE_FILES`) is a separate LUA SET script created by its own DDL — NOT
-a Rust entry point in the `.so`. One artifact is uploaded to BucketFS and each Exasol
-script references it.
+Packages the VS adapter, the DataFusion scan UDF, and the version query UDF as named
+entry points in one Rust crate that builds to a single `.so`, exploiting
+language-container-rs's multiple-entry-points-per-`.so` capability. The scan entry point
+is a SCALAR EMIT script. The version entry point is a SCALAR RETURNS script. The cluster
+fan-out distributor (`LAKEHOUSE_DISTRIBUTE_FILES`) is a separate LUA SET script created
+by its own DDL — NOT a Rust entry point in the `.so`. One artifact is uploaded to
+BucketFS and each Exasol script references it.
 
 ## Background
 
-* Both Rust entry points (adapter, scan) are exported from the single uploaded `.so`; the `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL and is not part of the `.so`.
+* All three Rust entry points (adapter, scan, version) are exported from the single uploaded `.so`; the `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor is a separate LUA SET script created by its own DDL and is not part of the `.so`.
 * The crate is a `cdylib` depending on `exasol-udf-sdk` 0.23.0 (connect-back feature)
   and `exasol-udf-macros` 0.23.0.
 * The `.so` is built only inside the `rust:1.94-trixie` builder image; it is never
@@ -20,22 +20,23 @@ script references it.
 
 ## Scenarios
 
-### Scenario: One crate exports the adapter and the scan entry points
+### Scenario: One crate exports the adapter, scan, and version entry points
 
-* *GIVEN* the UDF crate source declaring a VS adapter entry point and a scan entry point (driven as a SCALAR EMIT script)
+* *GIVEN* the UDF crate source declaring a VS adapter entry point, a scan entry point (driven as a SCALAR EMIT script), and a version entry point (driven as a SCALAR RETURNS script)
 * *WHEN* the crate is built in the builder image
 * *THEN* the build SHALL produce exactly one `.so` artifact
-* *AND* that `.so` SHALL export the adapter entry-point symbol and the scan entry-point symbol (`__exa_udf_entry_LAKEHOUSE_SCAN`, unchanged by the SET→SCALAR script-type change)
+* *AND* that `.so` SHALL export the adapter entry-point symbol, the scan entry-point symbol (`__exa_udf_entry_LAKEHOUSE_SCAN`), and the version entry-point symbol (`__exa_udf_entry_LAKEHOUSE_VERSION`)
 * *AND* the `LAKEHOUSE_DISTRIBUTE_FILES` fan-out distributor SHALL NOT be one of the crate's Rust entry points and SHALL NOT be exported from the `.so`
 
-### Scenario: Both scripts resolve from the same uploaded artifact
+### Scenario: All scripts resolve from the same uploaded artifact
 
 * *GIVEN* the single `.so` has been uploaded to BucketFS
-* *AND* an ADAPTER SCRIPT and a SCALAR SCRIPT have each been created referencing that `.so`
+* *AND* an ADAPTER SCRIPT, a scan SCALAR SCRIPT, and a version SCALAR SCRIPT have each been created referencing that `.so`
 * *WHEN* each script is invoked
 * *THEN* the adapter invocation SHALL run the adapter entry point
-* *AND* the SCALAR-script invocation SHALL run the scan entry point
-* *AND* neither invocation SHALL require a second uploaded artifact
+* *AND* the scan SCALAR-script invocation SHALL run the scan entry point
+* *AND* the version SCALAR-script invocation SHALL run the version entry point
+* *AND* no invocation SHALL require a second uploaded artifact
 
 ### Scenario: The file distributor is a separate LUA SET script created by its own DDL
 
