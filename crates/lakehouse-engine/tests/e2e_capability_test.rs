@@ -2815,6 +2815,55 @@ fn e2e_upper_boolean_declines_to_native_oracle() {
     );
 }
 
+// 8.16b  SUBSTR/LEFT pushdown parity (#187)
+
+#[test]
+fn e2e_substr_left_pushdown() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT SUBSTR(name, 1, 5), LEFT(name, 5), SUBSTR(name, 7, 2) FROM {} WHERE id = 1",
+        vs_table()
+    );
+    let cols = conn.query_columns(&sql);
+    assert_eq!(
+        cols.len(),
+        3,
+        "expected 3 columns (SUBSTR, LEFT, SUBSTR): {cols:?}"
+    );
+    assert_eq!(cols[0].len(), 1, "expected 1 row (id=1): {cols:?}");
+
+    let substr_prefix = cols[0][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("SUBSTR(name, 1, 5) not a string: {:?}", cols[0][0]));
+    let left_prefix = cols[1][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("LEFT(name, 5) not a string: {:?}", cols[1][0]));
+    let substr_id = cols[2][0]
+        .as_str()
+        .unwrap_or_else(|| panic!("SUBSTR(name, 7, 2) not a string: {:?}", cols[2][0]));
+
+    assert_eq!(
+        substr_prefix, "event",
+        "SUBSTR(name, 1, 5) for id=1 (\"event-01\") must be \"event\", got {substr_prefix:?}"
+    );
+    assert_eq!(
+        left_prefix, "event",
+        "LEFT(name, 5) for id=1 (\"event-01\") must be \"event\", got {left_prefix:?}"
+    );
+    assert_eq!(
+        substr_id, "01",
+        "SUBSTR(name, 7, 2) for id=1 (\"event-01\") must be the two-digit id \"01\", got {substr_id:?}"
+    );
+
+    let pushdown_sql = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushdown_sql.contains("substr("),
+        "pushdown SQL must contain a rendered substr( expression: {pushdown_sql}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 8.17  INSTR/LOCATE arity decline (#228)
 // ---------------------------------------------------------------------------
