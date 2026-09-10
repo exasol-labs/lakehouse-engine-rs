@@ -526,6 +526,21 @@ pub struct NameMappingEntry {
     pub field_id: i32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScanStorage {
+    Connection {
+        name: String,
+        allow_http: bool,
+    },
+    Sealed {
+        name: String,
+        payload: String,
+    },
+    /// Host-test only — the adapter never emits this variant.
+    Inline(StorageBackend),
+}
+
 /// The kind of join to execute node-locally in the scan UDF.
 ///
 /// This phase supports only `Inner` (inner equi-join); the adapter declines and
@@ -613,9 +628,7 @@ pub struct JoinSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_columns: Vec<String>,
 
-    /// The dimension side's own resolved [`StorageBackend`], distinct from
-    /// `common.storage` (the fact side's). Required — see the struct doc.
-    pub storage: StorageBackend,
+    pub storage: ScanStorage,
 }
 
 /// Where a Delta deletion vector's bytes live — the closed set of the Delta
@@ -1164,7 +1177,7 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partition_columns: Vec<String>,
 
-    pub storage: StorageBackend,
+    pub storage: ScanStorage,
 
     /// DataFusion `target_partitions` for this scan instance.
     #[serde(default = "default_one_usize")]
@@ -1217,25 +1230,6 @@ impl CommonScanSpec {
             )
         })
     }
-
-    /// EVERY secret value that must be stripped from an error this scan surfaces:
-    /// the fact side's credentials unioned with the join's dimension-side
-    /// credentials.
-    ///
-    /// The SINGLE owner of that union rule. Each side is read through its own
-    /// [`StorageBackend`], but an error can be raised by code holding one side's
-    /// store — or a router over both — which structurally cannot assemble a set
-    /// covering a side it never sees. So the union lives here, beside the only two
-    /// fields that carry a credential, and every redaction site reads it from here
-    /// rather than rebuilding it. A second, independently maintained copy is how a
-    /// dimension-side credential leaks through a fact-side-only redaction set.
-    pub fn all_secret_values(&self) -> Vec<&str> {
-        let mut secrets = self.storage.secret_values();
-        if let Some(join) = &self.join {
-            secrets.extend(join.storage.secret_values());
-        }
-        secrets
-    }
 }
 
 impl Default for CommonScanSpec {
@@ -1266,7 +1260,7 @@ impl Default for CommonScanSpec {
             name_mapping: Vec::new(),
             join: None,
             partition_columns: Vec::new(),
-            storage: StorageBackend::S3(StorageProps::default()),
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps::default())),
             df_target_partitions: default_one_usize(),
             df_batch_size: default_batch_size(),
             df_threads_per_udf: default_one_usize(),

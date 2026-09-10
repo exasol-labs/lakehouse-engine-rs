@@ -1,8 +1,8 @@
 //! Iceberg REST catalog access: session resolution, authentication, namespace
 //! enumeration, vended-storage-credential resolution, SigV4 request signing,
-//! credential redaction, the three shared credential types (`CatalogProps`,
-//! `ConnectionCreds`, `StorageProps`), and the `StorageBackend` that selects which
-//! object storage a scan reads through.
+//! credential redaction, the four shared credential types (`CatalogProps`,
+//! `ConnectionCreds`, `StorageCreds`, `StorageProps`), and the `StorageBackend`
+//! that selects which object storage a scan reads through.
 
 mod auth;
 mod client;
@@ -25,7 +25,7 @@ pub use client::{
     CatalogTableType, ColumnSourceType, IcebergRestCatalogClient, SkipReason, SkippedTable,
     TableFormat,
 };
-pub use creds::{CatalogProps, ConnectionCreds, StorageProps};
+pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
 pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{CatalogSession, load_table_any_auth};

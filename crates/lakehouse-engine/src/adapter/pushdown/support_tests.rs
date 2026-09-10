@@ -1,7 +1,7 @@
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{AggKind, DeleteMechanism, SortKey};
+use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey};
 use vs_expression::render_df_filter_safe;
 
 /// `walk_column_nodes` fires its callback exactly once per `column` node
@@ -210,7 +210,7 @@ fn delete_spec_template() -> ScanSpec {
             table_root: "s3://warehouse/db/table".into(),
             projection: vec![ProjectionItem::Column("ID".into())],
             emit_exa_types: vec!["DECIMAL(20,0)".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -899,7 +899,7 @@ fn aggregate_query_builds_partial_agg_spec() {
             projection: vec!["AMOUNT".into()],
             filter: Some("(\"REGION\" = 'EU')".into()),
             aggregates: Some(agg_plans),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1052,7 +1052,7 @@ fn common_spec_carries_s3_max_connections_exactly_once() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             s3_max_connections: distinctive_s3_max_connections,
             ..Default::default()
         },
@@ -1115,7 +1115,7 @@ fn build_agg_sql(
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(agg_plans),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1155,7 +1155,7 @@ fn aggregate_merge_renders_request_limit_when_some() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(plans),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1357,7 +1357,7 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             aggregates: Some(plans),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1492,7 +1492,7 @@ fn single_shard_aggregate_still_uses_merge_wrapper() {
 fn count_distinct_base_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -1996,7 +1996,7 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2035,7 +2035,7 @@ fn single_shard_collapses_to_single_invocation() {
     let spec_template = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
@@ -2944,7 +2944,7 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) ->
                 .map(|(name, _)| ProjectionItem::Column(name.clone()))
                 .collect(),
             emit_exa_types: col_types.iter().map(|(_, ty)| ty.clone()).collect(),
-            storage: sample_storage(),
+            storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],

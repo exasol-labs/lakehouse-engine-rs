@@ -115,3 +115,8 @@ instead of rejecting it for a column-count/type mismatch.
 * *AND* that shared classifier SHALL raise NO grouped-tier hard error, so a grouped request that does not decompose — for any reason, including a non-numeric aggregate column type or a HAVING the adapter cannot merge, whether or not a HAVING is present — SHALL yield the qualified single-table wrapper (`GroupByWrapper`) shape identically on the empty and non-empty paths, rather than the hard-error decline both paths previously surfaced (issue #195)
 * *AND* the empty grouped-fallback (`GroupByWrapper`) shape SHALL type its columns from `selectListDataTypes` when present — a positional shape Exasol accepts against it, not a raw row projection — and when `selectListDataTypes` is absent or empty SHALL fall back to the full-row-projection empty shape, matching the pre-refactor empty-result behavior byte-for-byte (this refactor changes routing structure, not column-shape selection)
 * *AND* the short-circuit SHALL be reached from the RESOLVED FILE LIST alone, so an Iceberg table whose manifests pruned to zero files and a Delta table whose `add` statistics pruned to zero files take the identical path and return the identical shape
+
+### Scenario: An empty-result plan carries no storage block at all
+
+* *GIVEN* a pushdown request this feature short-circuits to an empty result
+* *THEN* the returned SQL carries no scan-spec storage value — neither a credential nor a connection reference — so the credential-reference guarantee holds unconditionally; the six `empty_*` golden fixtures stay byte-identical

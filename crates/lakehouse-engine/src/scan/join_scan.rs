@@ -11,6 +11,7 @@ use exasol_udf_sdk::error::UdfError;
 
 use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::spec::{ProjectionItem, ScanSpec};
+use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
 use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
@@ -35,18 +36,15 @@ const JOIN_DIM_TABLE: &str = "dim_scan";
 /// is disabled (see [`session_config_for_spec`]), so the dimension is deterministically
 /// the hash-join build side regardless of table statistics. Read/deserialization
 /// errors for EITHER side route through [`classify_scan_error`] against the UNION of
-/// both sides' secret values ([`crate::scan::spec::CommonScanSpec::all_secret_values`]) — a fact-side-only
-/// set would leak the dimension side's own credential, since `join.storage` holds a
-/// genuinely different one. Exposed so a host integration test can drive this exact
-/// path over local Parquet (no S3 store).
 pub async fn run_join_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
     timers: &mut diagnostics::PhaseTimers,
 ) -> Result<(), UdfError> {
-    let secrets = spec.common.all_secret_values();
-    register_join_tables(session_ctx, spec).await?;
+    let secrets = storage.all_secret_values();
+    register_join_tables(session_ctx, spec, storage).await?;
     let sql = build_join_sql(session_ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
     let df = session_ctx
         .sql(&sql)
@@ -61,13 +59,11 @@ pub async fn run_join_scan_with_session(
     Ok(())
 }
 
-/// Register both sides of a broadcast join into one session: the sharded fact file
-/// list and the full dimension file list, each via [`register_file_list`].
-///
-/// Aggregates or GROUP BY alongside a join are out of scope for this phase (the VS
-/// never emits that combination); such a spec is rejected with a clear error rather
-/// than silently producing a wrong-shaped result.
-async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(), UdfError> {
+async fn register_join_tables(
+    ctx: &SessionContext,
+    spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
+) -> Result<(), UdfError> {
     let join = spec
         .common
         .join
@@ -79,6 +75,12 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
             "join pushdown does not support aggregate or GROUP BY in the same scan spec".into(),
         ));
     }
+
+    let dimension_backend = storage.join().ok_or_else(|| {
+        UdfError::User(
+            "the resolved scan storage carries no dimension-side backend for this join spec".into(),
+        )
+    })?;
 
     // Each side carries its OWN storage backend (StorageBackend) alongside its own
     // table_root, file list, logical schema, and per-file positional deletes, all
@@ -106,7 +108,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &spec.common.logical_schema,
         &spec.common.name_mapping,
         &spec.common.partition_columns,
-        &spec.common.storage,
+        storage.primary(),
         Arc::clone(&delete_path_read_limiter),
     )
     .await?;
@@ -118,7 +120,7 @@ async fn register_join_tables(ctx: &SessionContext, spec: &ScanSpec) -> Result<(
         &join.logical_schema,
         &join.name_mapping,
         &join.partition_columns,
-        &join.storage,
+        dimension_backend,
         delete_path_read_limiter,
     )
     .await?;
@@ -269,8 +271,9 @@ fn render_join_select_item(
 pub async fn build_join_physical_plan(
     ctx: &SessionContext,
     spec: &ScanSpec,
+    storage: &ResolvedScanStorage,
 ) -> Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>, UdfError> {
-    register_join_tables(ctx, spec).await?;
+    register_join_tables(ctx, spec, storage).await?;
     let sql = build_join_sql(ctx, JOIN_FACT_TABLE, JOIN_DIM_TABLE, spec).await?;
     let df = ctx
         .sql(&sql)

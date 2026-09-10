@@ -9,8 +9,11 @@
 
 use super::grouped_agg::{col_type_for, is_literal_selectlist_item, partial_emits_items};
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
+use crate::adapter::connection::ConnectionCreds;
+use crate::scan::sealed::{SealedStorageKey, seal_storage};
 use crate::scan::spec::{
-    AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, render_order_by_clause,
+    AggregatePlan, CommonScanSpec, FileEntry, ProjectionItem, ScanSpec, ScanStorage,
+    StorageBackend, render_order_by_clause,
 };
 use crate::types::mapping::{ExaTypeClass, classify_exa_type, exasol_type_from_json};
 use exasol_udf_sdk::error::UdfError;
@@ -1571,6 +1574,40 @@ pub(super) fn cast_to_declared_type(expr: &str, declared: Option<&str>) -> Strin
         Some(ty) if ty != "VARCHAR(2000000)" => format!("CAST({expr} AS {ty})"),
         _ => expr.to_string(),
     }
+}
+
+pub(super) fn scan_storage_for(
+    creds: &ConnectionCreds,
+    connection_name: &str,
+    allow_http: bool,
+    effective: &StorageBackend,
+    sealing_key: Option<&SealedStorageKey>,
+) -> Result<ScanStorage, UdfError> {
+    if !creds.use_vended_credentials {
+        return Ok(ScanStorage::Connection {
+            name: connection_name.to_string(),
+            allow_http,
+        });
+    }
+    let Some(key) = sealing_key else {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{connection_name}' enables use_vended_credentials, but its \
+             password carries no secret material to derive a sealing key from, so the \
+             vended storage credential can be neither referenced by name nor sealed, and \
+             this engine will not place it in the generated SQL in plaintext. The \
+             criterion is connection_password_carries_key_material: at least one of \
+             token, client_secret, secret_key, session_token, account_key, or sas_token \
+             must be non-empty (an access_key id alone is an identifier, not a secret). \
+             Remedy either by configuring catalog authentication or supplying that \
+             CONNECTION's own storage secret, or by setting use_vended_credentials to \
+             false so the credential travels as a CONNECTION reference instead; to \
+             disable it, edit the CONNECTION's password"
+        )));
+    };
+    Ok(ScanStorage::Sealed {
+        name: connection_name.to_string(),
+        payload: seal_storage(effective, key)?,
+    })
 }
 
 #[cfg(test)]

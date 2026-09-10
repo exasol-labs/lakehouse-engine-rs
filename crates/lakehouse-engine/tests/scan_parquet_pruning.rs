@@ -23,6 +23,8 @@
 //! pruning is actually exercisable) and registers it through DataFusion's local
 //! object store — no S3 / MinIO stack required.
 
+mod scan_fixture;
+
 use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder, StringViewArray};
@@ -33,7 +35,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::metrics::MetricValue;
 use datafusion::prelude::SessionConfig;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ProjectionItem, ScanSpec,
+    CommonScanSpec, FileEntry, LogicalField, NestedMembers, ProjectionItem, ScanSpec, ScanStorage,
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
@@ -91,14 +93,14 @@ fn pruning_spec(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some(r#""ID" >= 200 AND "ID" < 400"#.into()),
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         },
         files: vec![FileEntry::new(file_url, size)],
@@ -274,14 +276,14 @@ fn nested_spec(file_url: String, filter: &str) -> ScanSpec {
                 field("id", "int64", None),
                 field("tags", "utf8", Some(NestedMembers::List { element: None })),
             ],
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         },
         files: vec![FileEntry::new(file_url, size)],
@@ -296,9 +298,14 @@ async fn run_nested_scan(spec: &ScanSpec) -> (Vec<(i64, String)>, Arc<dyn Execut
         &url::Url::parse("file://").expect("file scheme"),
         Arc::new(LocalFileSystem::new()),
     );
-    register_files(&ctx, "scan_target", spec)
-        .await
-        .expect("register production nested-column provider");
+    register_files(
+        &ctx,
+        "scan_target",
+        spec,
+        &scan_fixture::resolved_storage(spec),
+    )
+    .await
+    .expect("register production nested-column provider");
     let plan = build_raw_scan_physical_plan(&ctx, spec)
         .await
         .expect("build physical plan");

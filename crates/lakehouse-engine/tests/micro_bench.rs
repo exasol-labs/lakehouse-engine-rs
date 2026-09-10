@@ -42,7 +42,7 @@ use datafusion::execution::context::SessionContext;
 use futures::StreamExt;
 use lakehouse_engine::scan::emit::coerce_batch_to_exa_types;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, ScanSpec, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
@@ -299,14 +299,14 @@ fn scan_spec(file_url: String) -> ScanSpec {
         .unwrap_or(0);
     ScanSpec {
         common: CommonScanSpec {
-            storage: StorageBackend::S3(StorageProps {
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
                 access_key: "k".into(),
                 secret_key: "s".into(),
                 allow_http: true,
                 ..Default::default()
-            }),
+            })),
             ..Default::default()
         },
         files: vec![FileEntry::new(file_url, size)],

@@ -10,9 +10,11 @@ Cluster fan-out (`GROUP BY shard_key`) lives inside the nested
 `LAKEHOUSE_DISTRIBUTE_FILES` distributor subquery; the outer wrapper re-groups the
 scalar scan's emitted partial rows on the user group keys. See
 `vs-adapter/pushdown-planning-grouped-agg-scalar-over-aggregate` for
-scalar-function-wrapping-aggregates select items on this same path, and
+scalar-function-wrapping-aggregates select items on this same path,
 `vs-adapter/pushdown-planning-grouped-agg-wrapper-fallback` for what happens when a
-grouped request cannot be decomposed into this partial/merge shape at all.
+grouped request cannot be decomposed into this partial/merge shape at all, and
+`vs-adapter/pushdown-planning-grouped-agg-credential-reference` for the
+credential-exposure guarantee on this path's generated SQL.
 
 ## Background
 
@@ -76,7 +78,7 @@ grouped request cannot be decomposed into this partial/merge shape at all.
   This feature alters only which Exasol-side SQL shape a grouped request routes to; it reads
   no manifest, resolves no snapshot or field id, applies no delete, and maps no type. No
   normative requirement applies, so there is no deviation to fix and none to track.
-* Credentials MUST NOT appear in any returned SQL or error message.
+* The credential-exposure guarantee for this path's generated SQL is specified by the sibling feature `vs-adapter/pushdown-planning-grouped-agg-credential-reference`.
 
 ## Scenarios
 

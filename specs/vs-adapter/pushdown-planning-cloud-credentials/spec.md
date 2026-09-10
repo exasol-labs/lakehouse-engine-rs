@@ -118,20 +118,21 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL resolve the file list with unsigned catalog requests exactly as before
 * *AND* the adapter MUST NOT read any vended credentials from the `loadTable` response
-* *AND* each per-shard scan-spec storage block SHALL carry the static `access_key`, `secret_key`, and optional `session_token` from the CONNECTION
-* *AND* the generated scan-driving SQL SHALL be identical in shape to the pre-feature behaviour
+* *AND* the shard-invariant common scan-spec argument SHALL carry a REFERENCE to the CONNECTION that supplies the static `access_key`, `secret_key`, and optional `session_token`, rather than those values — SUPERSEDING the recorded clause that required each per-shard scan-spec storage block to carry them, which described the exposure of issue #135
+* *AND* the referenced credentials SHALL be resolved by the scan UDF under `vs-adapter/scan-spec-credential-reference`, so the credential set reaching object storage is field-for-field what the CONNECTION supplies
+* *AND* the generated scan-driving SQL SHALL be identical in shape to the pre-feature behaviour, changing only the content of the `storage` block of the common argument
 
 ### Scenario: Vended S3 credentials are the sole storage source regardless of catalog auth mode
 
-* *GIVEN* a virtual schema whose CONNECTION credentials set `use_vended_credentials` to true under ANY catalog-auth mode (no-auth, static bearer token, OAuth2 client-credentials, or SigV4)
+* *GIVEN* a virtual schema whose CONNECTION credentials set `use_vended_credentials` to true under any catalog-auth mode (no-auth, static bearer token, OAuth2 client-credentials, or SigV4)
 * *AND* a `loadTable` response for an `s3://` table that carries short-lived vended S3 credentials (access key, secret key, and session token) in either its `storage-credentials` block or its flat `config` map
 * *WHEN* Exasol sends the `pushdown` request and the adapter loads the table once to resolve files
-* *THEN* the adapter SHALL derive the effective storage from that `loadTable` response exactly once per query in the planning layer, gated solely on `use_vended_credentials` and never depending on which catalog-auth mode authenticated the request
-* *AND* the adapter SHALL place the vended access key, secret key, and session token into the storage block of every per-shard scan spec
+* *THEN* the adapter SHALL derive the effective storage from that `loadTable` response exactly once per query in the planning layer, gated solely on `use_vended_credentials` and never depending on which catalog-auth mode authenticated the request — while the PLANNING outcome for the no-auth mode is the refusal `vs-adapter/scan-spec-credential-reference` specifies, raised downstream of this derivation by the one variant-selection function
+* *AND* on the three auth modes carrying secret material the adapter SHALL place the resolved backend — vended access key, secret key, and session token included — into the storage block of every per-shard scan spec ONLY inside the sealed envelope of `vs-adapter/scan-spec-credential-reference`, and MUST NOT emit a bare connection reference there (no CONNECTION name identifies a credential the catalog vended for one table) and MUST NOT emit a plaintext inline backend
 * *AND* the adapter MUST NOT read `access_key`, `secret_key`, or `session_token` from the CONNECTION for this storage block, so a CREDENTIAL the response does not advertise is ABSENT rather than backfilled and its absence is an error rather than a silent static read
-* *AND* the adapter SHALL resolve the store `endpoint` and `region` for this storage block from the CONNECTION when the CONNECTION states a non-empty value and from the response otherwise, taking each of the two independently — SUPERSEDING the recorded clause that forbade reading `endpoint`, `region`, and `path_style` from the CONNECTION, which is now correct for credentials alone
+* *AND* the adapter SHALL resolve the store `endpoint` and `region` for this storage block from the CONNECTION when the CONNECTION states a non-empty value and from the response otherwise, taking each of the two independently
 * *AND* the adapter SHALL set `allow_http` from the `ALLOW_HTTP` virtual-schema property, so a resolved plain-`http://` endpoint is honoured only with the operator's consent and a catalog cannot downgrade the transport on its own authority
-* *AND* the vended credentials MUST NOT appear in any returned SQL string or error message
+* *AND* the vended credentials MUST NOT appear in any error message, and MUST NOT appear in PLAINTEXT in the returned SQL string — they appear there only as the sealed envelope's ciphertext, issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan — SUPERSEDING the recorded clause whose SQL half was FALSE before this plan
 
 ### Scenario: Vended credentials are extracted on the static bearer-token catalog path
 
@@ -139,16 +140,18 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 * *AND* a `loadTable` response whose flat `config` map carries vended S3 credentials (the Databricks Unity Catalog shape, where `storage-credentials` is empty)
 * *WHEN* the adapter resolves the file list
 * *THEN* the adapter SHALL authenticate the self-issued `loadTable` GET with an `Authorization: Bearer <token>` header
-* *AND* the adapter SHALL extract the vended S3 access key, secret key, and session token from the response `config` map and place them into every per-shard scan spec storage block
-* *AND* the `token` value and the vended credentials MUST NOT appear in any returned SQL string or error message
+* *AND* the adapter SHALL extract the vended S3 access key, secret key, and session token from the response `config` map and place them into every per-shard scan spec storage block, sealed under `vs-adapter/scan-spec-credential-reference`'s envelope
+* *AND* the `token` value MUST NOT appear in any returned SQL string or error message, because a catalog-auth secret never crosses the UDF boundary as a parsed value — it contributes to the envelope key only as unparsed HKDF input
+* *AND* the vended credentials MUST NOT appear in any error message, and MUST NOT appear in PLAINTEXT in the returned SQL string — sealed-envelope ciphertext only, issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan — SUPERSEDING the recorded clause that grouped the `token` and the vended credentials under one prohibition, which now holds in the plaintext sense for both
 
 ### Scenario: Vended credentials are extracted on the OAuth2 client-credentials catalog path
 
 * *GIVEN* a virtual schema whose CONNECTION credentials supply `client_id` and `client_secret`, do not enable `use_sigv4`, and set `use_vended_credentials` to true
 * *WHEN* the adapter resolves the file list
 * *THEN* the adapter SHALL perform the OAuth2 client-credentials grant to obtain a bearer token and authenticate the self-issued `loadTable` GET with that token
-* *AND* the adapter SHALL extract the vended S3 credentials from the `loadTable` response and place them into every per-shard scan spec storage block
-* *AND* the `client_secret` value, the obtained bearer token, and the vended credentials MUST NOT appear in any returned SQL string or error message
+* *AND* the adapter SHALL extract the vended S3 credentials from the `loadTable` response and place them into every per-shard scan spec storage block, sealed under `vs-adapter/scan-spec-credential-reference`'s envelope
+* *AND* the `client_secret` value and the obtained bearer token MUST NOT appear in any returned SQL string or error message, because neither crosses the UDF boundary as a parsed value — the `client_secret` contributes to the envelope key only as unparsed HKDF input
+* *AND* the vended credentials MUST NOT appear in any error message, and MUST NOT appear in PLAINTEXT in the returned SQL string — sealed-envelope ciphertext only, issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan — SUPERSEDING the recorded clause that grouped all three under one prohibition, which now holds in the plaintext sense for all three
 
 ### Scenario: Vended-credentials request advertises access delegation and resolves the store address with the CONNECTION winning when set
 
@@ -205,7 +208,7 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 * *AND* the adapter MUST NOT read `account_name`, `account_key`, or `sas_token` from the CONNECTION for this storage block, so a vended-only Azure CONNECTION that supplies none of them resolves successfully and a CONNECTION that supplies a static account key has that key ignored
 * *AND* the adapter SHALL place the selected SAS into the ADLS backend's SAS credential state, so the flat `adls.sas-token` config key the iceberg ADLS reader accepts is emitted by the existing `catalog_storage_props` mapping without a second key spelling
 * *AND* when the recovered host carries no dot-separated label from which an account name can be read, the adapter SHALL return a `UdfError::User` naming the host and MUST NOT emit an empty `account_name`, because `adls.account-name` is the wrong-account guard and an empty value disarms it
-* *AND* the selected SAS MUST NOT appear in any returned SQL string or error message
+* *AND* the selected SAS MUST NOT appear in any error message, and MUST NOT appear in PLAINTEXT in the returned SQL string — sealed-envelope ciphertext only, issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan — SUPERSEDING the recorded clause that forbade both
 
 ### Scenario: A join whose sides resolve to different storage backends is planned, not rejected
 
@@ -223,8 +226,9 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 
 * *GIVEN* a virtual schema whose CONNECTION credentials omit `use_vended_credentials` or set it to false
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL place the static `access_key`, `secret_key`, and optional `session_token` from the CONNECTION into each scan spec storage block
+* *THEN* the adapter SHALL place a REFERENCE to the CONNECTION into each scan spec storage block, and MUST NOT place the static `access_key`, `secret_key`, or `session_token` value there — SUPERSEDING the recorded clause that required those values in the block
 * *AND* the adapter MUST NOT attempt to read vended credentials from the `loadTable` response on any catalog-auth mode
+* *AND* the credentials the scan reads SHALL be the CONNECTION's own, so this scenario's observable storage behaviour is unchanged and only the transport of the credential changes
 
 ### Scenario: SigV4/Glue derives the catalogs/{account-id} REST prefix on every catalog request
 
@@ -249,4 +253,6 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 * *AND* a matched `storage_credentials` entry SHALL remain authoritative for the whole credential set: a key that entry omits MUST NOT fall back to the flat `config` map, because the Iceberg REST rule is read per credential SET rather than per key
 * *AND* `anchor` SHALL be the table's own location — that is what `storage_credentials[*].prefix` matches against AND what the backend variant is selected from — so an HTTPS catalog URI passed as the anchor is rejected as an unsupported scheme rather than silently selecting the flat `config` map
 * *AND* the `use_vended_credentials` gate SHALL stay at the call site rather than becoming a parameter of `resolve_vended_storage`, because a boolean that switches a function between "do the work" and "return the input" is a decision the function declined to make
-* *AND* the vended STS keys, the vended session token, the vended SAS, the catalog-auth secrets, and any static Azure account key or SAS token MUST NOT appear in any returned SQL string or error message
+* *AND* that same gate SHALL also select the scan-spec storage wire variant — the SEALED envelope under vending when the sealing key exists, the named plan-time refusal under vending when it does not (no-auth), a connection reference otherwise — through the ONE pure selection function `vs-adapter/scan-spec-credential-reference` specifies, so the variant can never disagree with the resolver that produced its payload and no site chooses it independently
+* *AND* the format readers' own vended/static split SHALL be UNCHANGED and MUST NOT return that wrapper, because each reader uses the concrete backend immediately for its own plan-time manifest or log read
+* *AND* the catalog-auth secrets and any minted bearer value MUST NOT appear in any returned SQL string or error message; the vended STS keys, the vended session token, the vended SAS, and any static Azure account key or SAS token MUST NOT appear in any error message, and the VENDED values among them appear in the returned SQL string ONLY as the sealed envelope's ciphertext — issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan, never plaintext — SUPERSEDING the recorded clause that forbade all of them in both places, which now holds in the plaintext sense throughout

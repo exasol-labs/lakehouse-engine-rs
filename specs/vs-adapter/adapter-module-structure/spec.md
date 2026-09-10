@@ -11,6 +11,7 @@ This is the adapter root's structural feature, the sibling of `vs-adapter/pushdo
 * A helper whose whole body is a call to another helper with the same arguments is a pass-through, the shallow-module red flag from `/speq:design-philosophy`. Both scenarios below delete the single-purpose names rather than keep them as pass-throughs, so the deduplication actually removes indirection instead of adding a layer.
 * `Json` in `adapter/mod.rs` is an alias for `serde_json::Value`; the two duplicated accessors differ only in which spelling they use.
 * The adapter has eleven `resolve_*` property readers. Only ONE pair has byte-identical bodies, and only that pair is folded. A generic property-parsing framework over all eleven was considered and rejected in issue #177 — the readers are individually documented one-liners whose per-property defaults and validation differ, so a generic plus a config table would relocate them into indirection without removing complexity.
+* Seven `UdfContext` doubles across `adapter_tests.rs`, `connection_tests.rs`, and `unity_schema_tests.rs` repeat the same four required trait methods. `exasol-udf-sdk` 0.24.0 provides SDK-maintained test doubles as replacements.
 
 ## Scenarios
 
@@ -35,3 +36,16 @@ This is the adapter root's structural feature, the sibling of `vs-adapter/pushdo
 * *AND* the AUTO-mode path MUST stay untouched: `auto_threads_per_udf` keeps deriving both counts from the core count and the per-node instance share, because AUTO ignores both properties and so shares no body with the FIXED path
 * *AND* the `S3_MAX_CONNECTIONS` resolver SHALL NOT be folded in, because its fallback derives an AUTO value from `auto_threads_per_udf` rather than returning `max(nr_of_cores, 1)` — the two bodies differ, so folding them would require a second parameter that re-splits the function at every call
 * *AND* no generic property-parsing framework SHALL be introduced: the fold SHALL stay one concrete function over the one identical pair
+
+### Scenario: No hand-rolled UdfContext doubles in adapter tests
+
+* *GIVEN* the seven `UdfContext` doubles in the adapter test modules
+* *WHEN* the adapter unit-test suite compiles and runs
+* *THEN* no file under `crates/lakehouse-engine/src/adapter/` SHALL declare an `impl UdfContext` (bare or fully-qualified form)
+* *AND* every existing adapter test MUST pass with no change to any assertion or expected value
+
+### Scenario: The node-count fallback test asserts the trait default
+
+* *GIVEN* `cluster_nodes_from_context_defaults_to_one_when_node_count_zero`, which drives the `0 → 1` fallback through the `UdfContext` trait default `node_count` of 0
+* *WHEN* the hand-rolled double is replaced
+* *THEN* the replacement MUST NOT override `node_count`, so the test keeps asserting the trait behavior rather than a double's return value

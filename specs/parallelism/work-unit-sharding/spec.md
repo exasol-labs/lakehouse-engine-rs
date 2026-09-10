@@ -51,8 +51,7 @@ and no file is scanned twice.
   scans another node's files.
 * The shard-invariant common spec is serialized once as the scalar scan's
   first-argument literal; only each shard's per-file subset flows through the
-  distributor. Credentials MUST NOT appear repeated per shard; they live once in
-  the common spec literal.
+  distributor. The credential reference or sealed envelope lives once in the common spec literal, never repeated per shard — see `vs-adapter/scan-spec-credential-reference`.
 
 ## Scenarios
 
@@ -109,3 +108,5 @@ and no file is scanned twice.
 * *AND* a scalar EMIT UDF over constant-literal arguments SHALL fire exactly once, so no driving relation is required
 * *AND* the common spec literal SHALL appear exactly once and the file-list literal exactly once
 * *AND* the generated SQL SHALL be behaviourally identical (as an order-independent multiset) to the multi-shard fan-out collapsed to one shard
+
+*Credential-reference invariant:* the shard-invariant common literal carries one credential reference for the whole fan-out, never repeated per shard — see `vs-adapter/scan-spec-credential-reference`.
