@@ -264,6 +264,12 @@ def gen_perf(con, catalog, db, sizes_gb, n_files):
 
 def gen_erp(con, catalog, db, n_customers, n_products, n_orders, n_invoices):
     """Bronze ERP dataset: customers/products/orders/invoices, all dirty string columns."""
+    if n_orders % 3 == 0:
+        raise ValueError(
+            f"--erp-orders={n_orders} is divisible by 3: invoices.order_id is derived as "
+            "(i*3) % n_orders, which is only a collision-free permutation over 0..n_orders-1 "
+            "when gcd(3, n_orders) == 1. Pick an --erp-orders not divisible by 3."
+        )
     ensure_namespace(catalog, (db,))
     tables = [
         ("customers", ERP_CUSTOMERS_SELECT.format(start=0, end=n_customers)),
@@ -338,7 +344,7 @@ def self_check(con, catalog):
     write_in_slices(t, arrow, 4)
 
     # tiny erp dataset (customers=50, products=40, orders=60, invoices=20)
-    gen_erp(con, catalog, "erp", n_customers=50, n_products=40, n_orders=60, n_invoices=20)
+    gen_erp(con, catalog, "erp", n_customers=50, n_products=40, n_orders=61, n_invoices=20)
 
     # read back via the catalog and assert counts
     n_perf = catalog.load_table(("perf", "t_tiny")).scan().to_arrow().num_rows
@@ -347,7 +353,7 @@ def self_check(con, catalog):
     n_erp_invoices = catalog.load_table(("erp", "invoices")).scan().to_arrow().num_rows
     assert n_perf == 50_000, f"perf readback {n_perf} != 50000"
     assert n_region == 5, f"tpch.region readback {n_region} != 5"
-    assert n_erp_orders == 60, f"erp.orders readback {n_erp_orders} != 60"
+    assert n_erp_orders == 61, f"erp.orders readback {n_erp_orders} != 61"
     assert n_erp_invoices == 20, f"erp.invoices readback {n_erp_invoices} != 20"
     # >=4 data files were requested for the perf table
     files = list(catalog.load_table(("perf", "t_tiny")).scan().plan_files())

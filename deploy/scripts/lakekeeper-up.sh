@@ -15,16 +15,20 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 STACK="$HERE/../lakekeeper-stack"
 
 cd "$STACK"
-tofu workspace select "$ENV" >/dev/null 2>&1 || tofu workspace new "$ENV"
-tofu apply -var "env_name=$ENV" -var "key_pair_name=${KEY_PAIR_NAME:-spot-strata-key}" \
-  -var "created_date=$(date -u +%F)" -auto-approve
 
+# Armed before `tofu apply` runs: a failure partway through apply (timeouts, quota errors) can
+# still have created billable resources, so the warning must cover that case too, not just a
+# later failure once the box is known to exist.
 warn_still_billing_on_nonzero_exit() {
   local rc=$?
-  [ "$rc" -eq 0 ] || echo "NOTE: the Lakekeeper EC2 box for $ENV was created and is BILLING. Destroy it: $HERE/lakekeeper-down.sh $ENV" >&2
+  [ "$rc" -eq 0 ] || echo "NOTE: the Lakekeeper EC2 box for $ENV may exist and be BILLING. Destroy it: $HERE/lakekeeper-down.sh $ENV" >&2
   exit "$rc"
 }
 trap warn_still_billing_on_nonzero_exit EXIT
+
+tofu workspace select "$ENV" >/dev/null 2>&1 || tofu workspace new "$ENV"
+tofu apply -var "env_name=$ENV" -var "key_pair_name=${KEY_PAIR_NAME:-spot-strata-key}" \
+  -var "created_date=$(date -u +%F)" -auto-approve
 
 PUBLIC_HOST="$(tofu output -raw public_host)"
 LAKEKEEPER_PORT="$(tofu output -raw lakekeeper_port)"
@@ -69,7 +73,18 @@ SOURCE_NAMESPACES=("tpch" "erp")
 
 for ns in "${SOURCE_NAMESPACES[@]}"; do
   DATA_NAMESPACE="$(ssm "$DATA_SSM/namespace/$ns")"
-  echo "==> Provisioning Lakekeeper (warehouse '$LK_WAREHOUSE', namespace '$DATA_NAMESPACE') from Glue database '$DATA_NAMESPACE' in bucket '$DATA_BUCKET'"
+
+  # lakekeeper-provision.sh enforces that a warehouse's storage profile matches the derived S3
+  # key prefix of the tables being registered into it (a real constraint, hit live: tpch lives
+  # under tpch.db, erp under erp.db — one warehouse's storage profile can't cover both). tpch
+  # keeps the plain $LK_WAREHOUSE name so existing bench defaults/secrets.sh output don't change;
+  # every other namespace gets its own warehouse, suffixed by name.
+  if [ "$ns" = "tpch" ]; then
+    NS_WAREHOUSE="$LK_WAREHOUSE"
+  else
+    NS_WAREHOUSE="${LK_WAREHOUSE}-${ns}"
+  fi
+  echo "==> Provisioning Lakekeeper (warehouse '$NS_WAREHOUSE', namespace '$DATA_NAMESPACE') from Glue database '$DATA_NAMESPACE' in bucket '$DATA_BUCKET'"
 
   # Maps this environment onto lakekeeper-provision.sh's LK_SOURCE_*/LK_TARGET_* contract — the
   # operator sets none of these by hand. LK_SOURCE_KIND defaults to 'glue'.
@@ -79,7 +94,7 @@ for ns in "${SOURCE_NAMESPACES[@]}"; do
   export LK_TARGET_TOKEN_URI="$LK_TOKEN_URI"
   export LK_TARGET_CLIENT_ID="$LK_CLIENT_ID"
   export LK_TARGET_CLIENT_SECRET="$LK_CLIENT_SECRET"
-  export LK_TARGET_WAREHOUSE="$LK_WAREHOUSE"
+  export LK_TARGET_WAREHOUSE="$NS_WAREHOUSE"
   export LK_TARGET_NAMESPACE="$DATA_NAMESPACE"
   export LK_TARGET_REGION="$DATA_REGION"
   export LK_TARGET_ACCESS_KEY_ID="$LK_ACCESS_KEY_ID"
@@ -93,7 +108,7 @@ cat <<EOF
 Lakekeeper '$ENV' is up and provisioned:
   Catalog URI (public): $LK_CATALOG_URI
   Token URI (public):   $LK_TOKEN_URI
-  Warehouse:            $LK_WAREHOUSE
+  Base warehouse:       $LK_WAREHOUSE (tpch; other namespaces get their own, suffixed by name)
   Namespaces:           ${SOURCE_NAMESPACES[*]}
 
 Next: deploy/scripts/secrets.sh $ENV adds the private-IP Lakekeeper block to bench/.env.

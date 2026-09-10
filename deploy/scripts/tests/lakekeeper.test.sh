@@ -1017,8 +1017,15 @@ setup_up_env() {
   local warehouse
   warehouse="$("$REAL_JQ" -r '.warehouse_name.value' "$LK_OUTPUT_JSON_FILE")"
   export STUB_LIST_WAREHOUSE_BODY
-  STUB_LIST_WAREHOUSE_BODY="$("$REAL_JQ" -n -c --arg name "$warehouse" \
-    '{warehouses:[{name: $name, "storage-profile": {bucket: "stub-bucket", "key-prefix": "tpch.db"}}]}')"
+  # lakekeeper-up.sh registers both "tpch" (the base warehouse) and "erp" (its own,
+  # namespace-suffixed warehouse — a warehouse's storage profile is 1:1 with a source prefix, so
+  # erp can't share tpch's). Both are pre-registered here already, sharing the same key-prefix,
+  # because the offline Glue-tables stub always derives "tpch.db" regardless of
+  # LK_SOURCE_DATABASE; a real create-vs-mismatch check for a namespace's OWN warehouse is covered
+  # by the provision-level tests below, not these outer up-orchestration ones.
+  STUB_LIST_WAREHOUSE_BODY="$("$REAL_JQ" -n -c --arg name "$warehouse" --arg erp_name "${warehouse}-erp" \
+    '{warehouses:[{name: $name, "storage-profile": {bucket: "stub-bucket", "key-prefix": "tpch.db"}},
+                   {name: $erp_name, "storage-profile": {bucket: "stub-bucket", "key-prefix": "tpch.db"}}]}')"
 }
 
 run_up() {
