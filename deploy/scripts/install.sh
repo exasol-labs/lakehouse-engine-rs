@@ -128,7 +128,7 @@ ensure_exapump() {
   else
     log "exapump not found on PATH; installing it automatically from $EXAPUMP_INSTALL_URL"
   fi
-  if ! curl -fsSL "$EXAPUMP_INSTALL_URL" </dev/null | sh; then
+  if ! curl -fsSL --proto =https "$EXAPUMP_INSTALL_URL" </dev/null | sh; then
     err "exapump auto-install failed. Install it manually: https://github.com/exasol-labs/exapump"
     return 1
   fi

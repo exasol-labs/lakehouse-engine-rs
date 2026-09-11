@@ -584,6 +584,7 @@ test_exapump_auto_install() {
   assert_rc_zero "auto-install succeeds: check_prereqs passes once EXAPUMP_INSTALL_DIR is found" "$rc"
   assert_contains "auto-install succeeds: says it is installing" "$out" "installing it automatically"
   unset EXAPUMP_INSTALL_DIR
+  return 0
 }
 
 test_connectivity_mode_either_or() {
