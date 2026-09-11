@@ -157,10 +157,8 @@ guarded shape is not in #370 and is measured for the first time by task 1.2.
   Exasol fails may succeed. Direction two, OVER-RAISE: DataFusion may evaluate the division for a
   row an adjacent guard conjunct already excluded, so a query that succeeds today may fail after
   this change. Native Exasol's behaviour is not measured for either direction. Both are recorded in
-  the spec and tracked as ONE NEW GitHub issue that **the orchestrator MUST file before this plan
-  ships**, cited inline in the spec the way `(#27)` is cited in
-  `specs/datafusion-scan/scan-execution-field-id-projection/spec.md`. The spec deltas carry the
-  greppable placeholder `(#TODO-suppression)` at each citation site until then.
+  the spec and tracked as ONE GitHub issue, #392, cited inline in both spec deltas the way `(#27)`
+  is cited in `specs/datafusion-scan/scan-execution-field-id-projection/spec.md`.
   - Proposed title: `FLOAT_DIV divide-by-zero error follows DataFusion's evaluation set, not the query's logical row set`
   - Proposed scope: after #370's fix, a zero divisor raises exactly where the scan evaluates the
     division, which is neither a subset nor a superset of the rows the query logically selects.
@@ -201,9 +199,8 @@ guarded shape is not in #370 and is measured for the first time by task 1.2.
 - **Decision:** Issue #370's second observation, that `NaN < -1E300` matched all 20 rows and
   `NaN > 1E300` matched none, is out of scope for this fix. After the change a pushed `FLOAT_DIV`
   cannot produce a `NaN`, so #370's own reproducer no longer reaches it. Comparison semantics for a
-  `NaN` READ FROM a column stay unmeasured and unspecified, and are tracked as a NEW GitHub issue
-  that **the orchestrator MUST file before this plan ships**. The spec deltas carry the greppable
-  placeholder `(#TODO-stored-nan)` at each citation site until then.
+  `NaN` READ FROM a column stay unmeasured and unspecified, and are tracked as GitHub issue #393,
+  cited inline in both spec deltas.
   - Proposed title: `Pushed comparison against a stored IEEE-754 NaN does not follow IEEE semantics`
   - Proposed scope: verify live, against a Delta or Iceberg table storing a `NaN` in a `double`
     column, what a pushed comparison returns for that row, and specify the result. Issue #370
@@ -286,9 +283,7 @@ guarded shape is not in #370 and is measured for the first time by task 1.2.
 - **Decision:** This plan fixes one producer of a non-finite value in predicate position. Every
   other advertised scalar function that can produce one keeps the exact gap issue #370 reports, and
   that residual is recorded as a third accurately scoped tracked exception rather than left
-  unstated. It is tracked as a NEW GitHub issue that **the orchestrator MUST file before this plan
-  ships**, cited inline in both spec deltas. The deltas carry the greppable placeholder
-  `(#TODO-scalar-fns)` at each citation site until then.
+  unstated. It is tracked as GitHub issue #394, cited inline in both spec deltas.
   - Proposed title: `Non-finite value from a pushed scalar function other than FLOAT_DIV changes the row count in predicate position`
   - Proposed scope: `crates/lakehouse-engine/src/adapter/capabilities.rs` advertises `FN_SQRT`,
     `FN_LN`, `FN_LOG`, `FN_ACOS`, `FN_ASIN`, `FN_EXP`, `FN_POWER`, and `FN_MOD`. Each is translated
@@ -316,6 +311,62 @@ guarded shape is not in #370 and is measured for the first time by task 1.2.
   reject a single blanket divide-by-zero issue. The mechanism here really is one mechanism: a
   non-finite value consumed by a comparison inside the scan. What differs from `FLOAT_DIV` is only
   which function produced it.
+- **Promotes to ADR:** yes
+
+### [13] The checked division records its first failure on the session because the Parquet row filter destroys the error type
+
+- **Decision:** The checked division records its first failure as a typed `CheckedFloatDivError` in
+  a `OnceLock` on the registered UDF instance. `session_checked_float_div_failure` reads it back
+  through the session's own function registry, by downcasting the resolved `ScalarUDFImpl`.
+  `run_scan_dispatch`, the one dispatcher all three run paths funnel through, calls
+  `emit::reframe_checked_division` once on a failed scan. That reframing REPLACES the surfaced
+  failure with the division, except when the surfaced failure is a memory exhaustion, where it
+  COMPOSES: division first, then the memory exhaustion, both redacted through
+  `redact_credentials(&redact_secret_values(..))`. `ResourcesExhausted` is the one case
+  `classify_scan_error` recognises on the typed error root before any text exists, so it is the one
+  case separable from the flattened division without matching DataFusion's wording; the dispatcher
+  reads it back from `MEMORY_EXHAUSTED_LABEL`, a single constant this module owns for the writer and
+  the reader alike.
+- **Alternatives:**
+  - Rely on the DataFusion error chain alone, as entry [6] specified. Rejected. The chain does not
+    survive a predicate pushed into the Parquet row filter, which is issue #370's own route, so the
+    one case the checked division exists to fix is the one case the chain loses.
+  - Recover the value from the flattened `Error evaluating filter predicate` text. Rejected. That is
+    the message-text coupling entry [6] rules out, and it breaks on any DataFusion wording change.
+  - Hold the value in a process-global `static` or `LazyLock`. Rejected against CLAUDE.md's
+    stateless-UDF rule. One query's division would leak into the next scan on a pooled UDF VM and
+    reframe an unrelated failure as a division by zero.
+  - Thread an `Arc<OnceLock<CheckedFloatDivError>>` from `run_scan_one` through
+    `build_session_context`. Rejected for the cost. `build_session` is an injected test seam. Every
+    test that substitutes it would change signature to carry one error path.
+  - Compose with EVERY incoming classification, not only memory exhaustion. Tried, shipped, and
+    reverted on live evidence. `make test-e2e` failed
+    `e2e_float_div_by_zero_in_filter_fails_like_native_exasol` and
+    `e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome` with
+    `data exception - division by zero: ...; the scan also surfaced: scan failed: assigned data
+    could not be read: ... External(ZeroDivisor { numerator: 6.0, divisor: 0.0 })`. On the flattened
+    row-filter route the appended failure IS the same division under the storage-read framing, so
+    unconditional composition republished that framing on 100% of the plan's primary route, against
+    the scenario clause and the two tests that forbid it.
+  - Match DataFusion's `Error evaluating filter predicate` wording to suppress the duplicate instead.
+    Rejected, same reason the alternative above it is rejected: it breaks on any wording change with
+    no compile error.
+- **Rationale:** `datafusion-datasource-parquet` 54.1 flattens ANY predicate error at
+  `row_filter.rs:150-170` into
+  `ArrowError::ComputeError(format!("Error evaluating filter predicate: {e:?}"))`. The type is gone
+  before `classify_scan_error` sees it, so the value needs a second carrier that is not the error
+  chain. The session is the narrowest scope that carrier can have, because it lives exactly one scan
+  invocation and no failure survives into another. Replacing is what keeps the storage-read framing
+  out of the message entirely, which is the primary acceptance criterion and the only one with live
+  evidence behind it. Composing for memory exhaustion alone keeps the signal the mission's
+  bounded-execution guarantee rests on without paying that price, because that classification is
+  reached BY TYPE rather than by text.
+- **Accepted limitation:** an unrelated storage failure raised in another partition of a scan that
+  also divided by zero is MASKED. The collision is real, because DataFusion surfaces exactly one
+  partition's error, but it is rarer than issue #370's own route and has never been observed live,
+  whereas the storage framing on a user's own division is measured. Recovering it would need a
+  structural channel that survives `UdfError`, which carries only a `String`; revisit if a live case
+  appears.
 - **Promotes to ADR:** yes
 
 ## Review Findings
@@ -413,9 +464,8 @@ guarded shape is not in #370 and is measured for the first time by task 1.2.
   in plan.md prose the recorded spec never sees. CLAUDE.md requires a GitHub issue cited inline in
   the spec, the form every existing tracked exception in this library follows (`(#246)`, `(#219)`,
   `(#216)`, `(#309)`, `(#27)`).
-- **Direction change:** Inserted greppable placeholder tokens at every citation site:
-  `(#TODO-suppression)`, `(#TODO-stored-nan)`, and `(#TODO-scalar-fns)`, in both spec deltas and in
-  plan.md § Impact. Added plan.md task 4.10, which files the three issues and replaces every token
+- **Direction change:** Inserted the tracked-exception citations `(#392)`, `(#393)`, and `(#394)`
+  at every citation site, in both spec deltas and in plan.md § Impact. Added plan.md task 4.10, which files the three issues and replaces every token
   with the filed number in the `(#NNN)` form, failing if
   `grep -rn '(#TODO-' specs/_plans/fix-float-div-predicate-divzero/` returns any line. Added the
   same grep as a § Verification § Checklist step. Named the placeholder in decision-log entries [7],
@@ -440,7 +490,7 @@ guarded shape is not in #370 and is measured for the first time by task 1.2.
   fix". Added a `DELTA:NEW` Background bullet to
   `datafusion-scan/scan-execution-expression-pushdown/spec.md` and a matching one to
   `sql-comprehension/vs-expression-translator-float-div/spec.md`, both stating that the checked
-  division covers `FLOAT_DIV` alone and citing `(#TODO-scalar-fns)` inline. Replaced the `MOD`
+  division covers `FLOAT_DIV` alone and citing `(#394)` inline. Replaced the `MOD`
   clause in plan.md § Non-Goals with a pointer to the new exception.
 - **Promotes to ADR:** yes
 </content>

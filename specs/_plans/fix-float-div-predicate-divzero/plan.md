@@ -1,6 +1,6 @@
 # Plan: fix-float-div-predicate-divzero
 
-> **Status:** blocked — see open-questions.md
+> **Status:** ready for implementation — round-2 open questions resolved
 
 ## Summary
 
@@ -55,6 +55,16 @@ crates/lakehouse-engine  scan/checked_div.rs   ── ScalarUDF impl
                          scan/emit.rs          ── classify_scan_error surfaces it by type
                                                         │
                         raw scan · join scan · partial agg (all share one session)
+                                                        │
+                                        (row filter flattens the type on the predicate route)
+                                                        ▼
+crates/lakehouse-engine  scan/checked_div.rs   ── RaisedFailure records it on the UDF instance
+                         scan/mod.rs           ── run_scan_dispatch
+                                                        │
+                                                        ▼
+                         scan/emit.rs          ── reframe_checked_division
+                                                  (names the division first, appends the
+                                                   surfaced error, redacted)
 ```
 
 #### Patterns
@@ -64,6 +74,8 @@ crates/lakehouse-engine  scan/checked_div.rs   ── ScalarUDF impl
 | Session-registered scalar function named by an exported constant | `crates/vs-expression` constant, `scan/checked_div.rs` implementation | The name has one owner, so the crate that emits it and the crate that registers it cannot drift |
 | Registration at the single session builder | `scan/object_store.rs` `build_session_context` | All three run paths take their session from it, so one call reaches every pushed expression |
 | Error recognised by type, not by message text | `scan/emit.rs` `classify_scan_error` | A string match on an error message is a silent coupling that breaks on any wording change |
+| First failure recorded on the registered UDF instance | `scan/checked_div.rs` `RaisedFailure`, `scan/emit.rs` `reframe_checked_division` | The Parquet row filter flattens a predicate error to text, so the type must reach the classifier by another route |
+| Replaced error message, composed only with a memory exhaustion | `scan/emit.rs` `reframe_checked_division` | The flattened row-filter division lands in the same classification branch as an unrelated storage failure, so appending that branch republishes the storage framing on the primary route; `ResourcesExhausted` is the one branch reached by type, so it is the one that can be kept |
 
 ### Consequences
 
@@ -99,11 +111,11 @@ This is not a breaking API change. It is a correctness change that converts sile
 
 ### Tracked exceptions this plan does not fix
 
-Three named gaps remain. Per CLAUDE.md, each is recorded as an accurately scoped tracked exception rather than a silent gap. **All three GitHub issues MUST be filed before this plan ships**, and their numbers cited inline in the spec deltas the way `(#27)` is cited in `specs/datafusion-scan/scan-execution-field-id-projection/spec.md`. Each delta carries a greppable placeholder token that task 4.10 replaces with the filed number. Decision-log entries [7], [8], and [12] carry the proposed titles and scopes.
+Three named gaps remain. Per CLAUDE.md, each is recorded as an accurately scoped tracked exception rather than a silent gap. The three GitHub issues are filed as #392, #393, and #394, and both spec deltas cite them inline the way `(#27)` is cited in `specs/datafusion-scan/scan-execution-field-id-projection/spec.md`. Decision-log entries [7], [8], and [12] carry the titles and scopes.
 
-1. `(#TODO-suppression)` The division-by-zero error is a per-row side effect of an expression DataFusion evaluates over a row set of its own choosing, so it diverges from native Exasol in BOTH directions. It may be SUPPRESSED, because predicate evaluation order, file pruning, row-group pruning, and an applied LIMIT may skip the division for a row. It may also be RAISED for a row an adjacent guard conjunct already excluded, which is the guarded-division regression named above. The rows a successful query returns are unaffected in either direction.
-2. `(#TODO-stored-nan)` Comparison semantics for a `NaN` read from a source column stay unmeasured. Issue #370 observed non-IEEE ordering and states the mechanism was not investigated. After this fix a pushed `FLOAT_DIV` cannot produce a `NaN`, so #370's own reproducer no longer reaches it.
-3. `(#TODO-scalar-fns)` A non-finite value produced in predicate position by a pushed scalar function OTHER than `FLOAT_DIV` keeps the exact gap this plan closes. `crates/lakehouse-engine/src/adapter/capabilities.rs` advertises `FN_SQRT`, `FN_LN`, `FN_LOG`, `FN_ACOS`, `FN_ASIN`, `FN_EXP`, `FN_POWER`, and `FN_MOD`, each translated into a pushed predicate and each able to yield `NaN` or `±Inf`. `WHERE SQRT(<negative_col>) > 0` reproduces #370's mechanism with no division involved.
+1. `(#392)` The division-by-zero error is a per-row side effect of an expression DataFusion evaluates over a row set of its own choosing, so it diverges from native Exasol in BOTH directions. It may be SUPPRESSED, because predicate evaluation order, file pruning, row-group pruning, and an applied LIMIT may skip the division for a row. It may also be RAISED for a row an adjacent guard conjunct already excluded, which is the guarded-division regression named above. The rows a successful query returns are unaffected in either direction.
+2. `(#393)` Comparison semantics for a `NaN` read from a source column stay unmeasured. Issue #370 observed non-IEEE ordering and states the mechanism was not investigated. After this fix a pushed `FLOAT_DIV` cannot produce a `NaN`, so #370's own reproducer no longer reaches it.
+3. `(#394)` A non-finite value produced in predicate position by a pushed scalar function OTHER than `FLOAT_DIV` keeps the exact gap this plan closes. `crates/lakehouse-engine/src/adapter/capabilities.rs` advertises `FN_SQRT`, `FN_LN`, `FN_LOG`, `FN_ACOS`, `FN_ASIN`, `FN_EXP`, `FN_POWER`, and `FN_MOD`, each translated into a pushed predicate and each able to yield `NaN` or `±Inf`. `WHERE SQRT(<negative_col>) > 0` reproduces #370's mechanism with no division involved.
 
 ## Requirements
 
@@ -114,7 +126,7 @@ Three named gaps remain. Per CLAUDE.md, each is recorded as an accurately scoped
 | Pruning | A conjunct containing a checked division derives no min/max pruning bound, exactly as the `/` operator's conjunct derived none: neither shape is a column-against-literal comparison. `iceberg_predicate.rs` and `delta_predicate.rs` read the pushdown JSON tree, not the rendered SQL, and drop a node they cannot translate soundly, so plan-time file pruning is unchanged. |
 | Security | The new error passes through the same redaction the other scan errors use. A credential value MUST NOT appear in the surfaced message. |
 | Migration | None. No `ScanSpec` field changes, so an in-flight spec from an older adapter still parses. |
-| Concurrency | None. The function is stateless and `Immutable`. |
+| Concurrency | The function's arithmetic is stateless and `Immutable`. It additionally records its first failure in a `OnceLock` scoped to one session, written from `invoke_with_args` on DataFusion's partition threads and read once on the dispatcher thread after the scan returns. `OnceLock::set` keeps the first writer's value, and every checked-division failure of one query names the same defect in the same query. |
 
 ## Dependencies
 
@@ -183,11 +195,11 @@ The three groups run in sequence, not in parallel. Group A is the live pre-fix m
 
 | Scenario | Test Type | Test Location | Test Name |
 |----------|-----------|---------------|-----------|
-| FLOAT_DIV renders true float division in the DataFusion dialect | Unit | `crates/vs-expression/src/lib_tests.rs` | `float_div_renders_a_checked_call_against_column_right_operand` (plus the eight sibling `float_div_*` operand-shape tests) |
-| FLOAT_DIV renders true float division in the DataFusion dialect (name has one owner) | Unit | `crates/vs-expression/src/lib_tests.rs` | `float_div_rendering_reads_the_exported_function_name_constant` |
-| FLOAT_DIV renders true float division in the DataFusion dialect (pushed text, live) | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `e2e_float_div_pushes_checked_division_projection` |
-| The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator | Unit | `crates/vs-expression/src/lib_tests.rs` | `float_div_renders_a_checked_call_only_in_the_datafusion_dialect` |
-| The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator (consumer SQL frozen) | Unit | `crates/lakehouse-engine/src/adapter/pushdown/dispatch_golden_tests.rs` | `single_group_scalar_over_aggregate_dedup` and `single_group_scalar_over_aggregate_interleaved` golden comparisons |
+| FLOAT_DIV renders true float division in the DataFusion dialect | Unit | `crates/vs-expression/src/lib_tests.rs` | The eight `float_div_calls_checked_division_for_*` operand-shape tests, plus `float_div_with_null_left_operand_passes_the_null_literal_to_checked_division`, `float_div_with_null_right_operand_passes_null_to_checked_division`, and `float_div_null_over_zero_passes_both_literals_to_checked_division` |
+| FLOAT_DIV renders true float division in the DataFusion dialect (name has one owner) | Unit | `crates/vs-expression/src/lib_tests.rs` | Covered structurally rather than by a dedicated test: every `float_div_*` test builds its expected string from `CHECKED_FLOAT_DIV_FN`, so a renamed constant fails all eleven |
+| FLOAT_DIV renders true float division in the DataFusion dialect (pushed text, live) | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `e2e_float_div_pushes_checked_division_call_projection` |
+| The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator | Unit | `crates/vs-expression/src/lib_tests.rs` | `float_div_renders_checked_division_call_only_in_the_datafusion_dialect` |
+| The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator (consumer SQL frozen) | Unit | `crates/lakehouse-engine/src/adapter/pushdown/dispatch_golden_tests.rs` | `single_group_scalar_over_aggregate_dedup_matches_golden` and `single_group_scalar_over_aggregate_interleaved_matches_golden` |
 | A pushed-down division by zero fails the query rather than returning a wrong value | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `e2e_float_div_by_zero_projected_fails_with_division_by_zero` |
 | A division by zero inside a filter predicate fails the query rather than changing the row count | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `e2e_float_div_by_zero_in_filter_fails_like_native_exasol` |
 | A division by zero inside a filter predicate fails the query rather than changing the row count (NULL divisor) | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `e2e_float_div_null_divisor_in_filter_returns_no_rows` |
@@ -200,7 +212,13 @@ The three groups run in sequence, not in parallel. Group A is the live pre-fix m
 | A checked float division raises rather than producing a non-finite value (aggregate argument) | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `e2e_float_div_by_zero_in_aggregate_argument_fails` |
 | A checked float division raises rather than producing a non-finite value (plan-time fold route) | Unit | `crates/lakehouse-engine/src/scan/checked_div_tests.rs` | `checked_float_div_over_two_literals_surfaces_a_division_by_zero_message` |
 | A checked float division raises rather than producing a non-finite value | Unit | `crates/lakehouse-engine/src/scan/checked_div_tests.rs` | `checked_float_div_divides_every_operand_pairing_as_double`, `checked_float_div_propagates_null_in_either_operand`, `checked_float_div_raises_on_a_zero_divisor`, `checked_float_div_raises_on_zero_over_zero`, `checked_float_div_treats_negative_zero_as_zero`, `checked_float_div_raises_on_an_overflow_to_infinity`, `checked_float_div_raises_on_a_stored_non_finite_operand` |
-| A checked float division raises rather than producing a non-finite value (error framing) | Unit | `crates/lakehouse-engine/src/scan/emit_tests.rs` | `classify_scan_error_names_a_checked_division_failure_without_the_storage_prefix`, `classify_scan_error_redacts_secrets_from_a_checked_division_failure` |
+| A checked float division raises rather than producing a non-finite value (zero-divisor / out-of-range boundary) | Unit | `crates/lakehouse-engine/src/scan/checked_div_tests.rs` | `checked_float_div_reports_a_stored_non_finite_numerator_over_a_zero_divisor_as_a_zero_divisor` |
+| A checked float division raises rather than producing a non-finite value (empty batch) | Unit | `crates/lakehouse-engine/src/scan/checked_div_tests.rs` | `checked_float_div_returns_no_rows_for_an_empty_batch` |
+| A checked float division raises rather than producing a non-finite value (argument count) | Unit | `crates/lakehouse-engine/src/scan/checked_div_tests.rs` | `checked_float_div_refuses_an_argument_count_other_than_two` |
+| A checked float division raises rather than producing a non-finite value (error framing) | Unit | `crates/lakehouse-engine/src/scan/emit_tests.rs` | `classify_scan_error_names_a_checked_division_failure_without_the_storage_prefix`, `classify_scan_error_redacts_secrets_from_a_checked_division_failure`, `classify_scan_error_keeps_an_out_of_range_division_distinct_from_a_zero_divisor` |
+| The function records its first failure on the session, and the dispatcher reframes a failed scan from it | Unit | `crates/lakehouse-engine/src/scan/checked_div_tests.rs` | `checked_float_div_records_its_failure_on_the_session`, `a_successful_checked_division_records_no_session_failure`, `a_second_session_records_no_failure_from_the_first` |
+| The recorded division replaces the message on the route that lost the error type, leaving no storage framing | Unit | `crates/lakehouse-engine/src/scan/emit_tests.rs` | `reframe_checked_division_names_a_failure_the_error_chain_lost`, `reframe_checked_division_replaces_a_generic_storage_failure_with_the_division`, `reframe_checked_division_leaves_an_unrelated_failure_untouched` |
+| A concurrent memory exhaustion is the one surfaced failure the reframing composes with rather than replaces | Unit | `crates/lakehouse-engine/src/scan/emit_tests.rs` | `reframe_checked_division_keeps_a_concurrent_memory_exhaustion_failure_visible`, `reframe_checked_division_redacts_secrets_from_the_appended_failure` |
 
 ### Manual Testing
 

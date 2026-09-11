@@ -409,7 +409,7 @@ fn arithmetic_operator_set_matches_advertised_capabilities() {
         (
             "FN_FLOAT_DIV",
             "FLOAT_DIV",
-            r#"(CAST("L_EXTENDEDPRICE" AS DOUBLE) / "L_DISCOUNT")"#.to_string(),
+            format!(r#"{CHECKED_FLOAT_DIV_FN}("L_EXTENDEDPRICE", "L_DISCOUNT")"#),
         ),
     ];
     for (cap, node, expected) in arithmetic {
@@ -436,7 +436,7 @@ fn arithmetic_operator_set_matches_advertised_capabilities() {
 }
 
 #[test]
-fn renders_arithmetic_div() {
+fn float_div_calls_checked_division_for_column_left_operand_and_literal_right_operand() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -447,12 +447,12 @@ fn renders_arithmetic_div() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST("A" AS DOUBLE) / 2)"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}("A", 2)"#)
     );
 }
 
 #[test]
-fn float_div_casts_column_left_operand_against_column_right_operand() {
+fn float_div_calls_checked_division_for_column_left_operand_and_column_right_operand() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -463,12 +463,12 @@ fn float_div_casts_column_left_operand_against_column_right_operand() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST("A" AS DOUBLE) / "B")"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}("A", "B")"#)
     );
 }
 
 #[test]
-fn float_div_casts_literal_left_operand_against_column_right_operand() {
+fn float_div_calls_checked_division_for_literal_left_operand_and_column_right_operand() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -479,12 +479,12 @@ fn float_div_casts_literal_left_operand_against_column_right_operand() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST(10 AS DOUBLE) / "B")"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}(10, "B")"#)
     );
 }
 
 #[test]
-fn float_div_casts_literal_left_operand_against_literal_right_operand() {
+fn float_div_calls_checked_division_for_literal_left_operand_and_literal_right_operand() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -495,12 +495,12 @@ fn float_div_casts_literal_left_operand_against_literal_right_operand() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST(10 AS DOUBLE) / 4)"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}(10, 4)"#)
     );
 }
 
 #[test]
-fn float_div_casts_nested_expression_left_operand_against_column_right_operand() {
+fn float_div_calls_checked_division_for_nested_expression_left_and_column_right() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -518,12 +518,12 @@ fn float_div_casts_nested_expression_left_operand_against_column_right_operand()
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST(("A" + "B") AS DOUBLE) / "C")"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}(("A" + "B"), "C")"#)
     );
 }
 
 #[test]
-fn float_div_casts_nested_expression_left_operand_against_literal_right_operand() {
+fn float_div_calls_checked_division_for_nested_expression_left_and_literal_right() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -541,12 +541,12 @@ fn float_div_casts_nested_expression_left_operand_against_literal_right_operand(
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST(("A" + "B") AS DOUBLE) / 2)"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}(("A" + "B"), 2)"#)
     );
 }
 
 #[test]
-fn float_div_casts_aggregate_left_operand_against_column_right_operand() {
+fn float_div_calls_checked_division_for_aggregate_left_operand_and_column_right_operand() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -562,12 +562,12 @@ fn float_div_casts_aggregate_left_operand_against_column_right_operand() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST(SUM("AMOUNT") AS DOUBLE) / "C")"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}(SUM("AMOUNT"), "C")"#)
     );
 }
 
 #[test]
-fn float_div_casts_aggregate_left_operand_against_literal_right_operand() {
+fn float_div_calls_checked_division_for_aggregate_left_operand_and_literal_right_operand() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -583,12 +583,12 @@ fn float_div_casts_aggregate_left_operand_against_literal_right_operand() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST(SUM("AMOUNT") AS DOUBLE) / 2)"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}(SUM("AMOUNT"), 2)"#)
     );
 }
 
 #[test]
-fn float_div_with_null_left_operand_casts_the_null_literal() {
+fn float_div_with_null_left_operand_passes_the_null_literal_to_checked_division() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -599,12 +599,12 @@ fn float_div_with_null_left_operand_casts_the_null_literal() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST(NULL AS DOUBLE) / "B")"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}(NULL, "B")"#)
     );
 }
 
 #[test]
-fn float_div_with_null_right_operand_divides_by_null() {
+fn float_div_with_null_right_operand_passes_null_to_checked_division() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -615,12 +615,12 @@ fn float_div_with_null_right_operand_divides_by_null() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST("A" AS DOUBLE) / NULL)"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}("A", NULL)"#)
     );
 }
 
 #[test]
-fn float_div_null_over_zero_casts_the_null_literal_over_a_zero_literal() {
+fn float_div_null_over_zero_passes_both_literals_to_checked_division() {
     let expr = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -631,7 +631,7 @@ fn float_div_null_over_zero_casts_the_null_literal_over_a_zero_literal() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"(CAST(NULL AS DOUBLE) / 0)"#
+        format!(r#"{CHECKED_FLOAT_DIV_FN}(NULL, 0)"#)
     );
 }
 
@@ -3859,6 +3859,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             "now()",
             "nullif(",
             "coalesce(",
+            CHECKED_FLOAT_DIV_FN,
         ] {
             assert!(
                 !rendered.contains(token),
@@ -3926,10 +3927,11 @@ fn arithmetic_operators_render_identically_in_both_dialects() {
     );
 }
 
-/// Divergence guard: FLOAT_DIV casts its left operand to DOUBLE only in the
-/// DataFusion dialect; the Exasol dialect renders the bare operator.
+/// Divergence guard: FLOAT_DIV renders as a checked-division function call
+/// only in the DataFusion dialect; the Exasol dialect renders the bare
+/// operator (Exasol's own `/` is already `FN_FLOAT_DIV`, true float division).
 #[test]
-fn float_div_casts_to_double_only_in_the_datafusion_dialect() {
+fn float_div_renders_checked_division_call_only_in_the_datafusion_dialect() {
     let float_div = json!({
         "type": "function_scalar",
         "name": "FLOAT_DIV",
@@ -3940,7 +3942,7 @@ fn float_div_casts_to_double_only_in_the_datafusion_dialect() {
     });
     assert_eq!(
         render_expression(&float_div).unwrap(),
-        r#"(CAST("A" AS DOUBLE) / 1)"#,
+        format!(r#"{CHECKED_FLOAT_DIV_FN}("A", 1)"#),
         "FLOAT_DIV DataFusion dialect"
     );
     assert_eq!(
