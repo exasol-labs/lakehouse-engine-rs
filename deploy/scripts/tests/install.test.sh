@@ -497,6 +497,7 @@ reset_env() {
   unset SSH_FAIL SCP_FAIL SSH_PATH_NEVER SSH_PATH_DELAY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
+  unset BUCKETFS_REACHABLE_TRIES BUCKETFS_REACHABLE_POLL_SECONDS 2>/dev/null || true
   # Sandboxed exapump config so profile-mode runs never touch the real ~/.exapump/config.toml.
   export EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
   RUN_PATH="$STUBDIR:$ORIG_PATH"
@@ -1706,10 +1707,14 @@ test_bucketfs_reachable_preflight() {
   echo "== test_bucketfs_reachable_preflight =="
   reset_env
   export EXAPUMP_BFS_LS_FAIL=1
+  # Overrides the real ~60s (30 tries x 2s) production budget down to 3 tries x 0s: this exercises
+  # the actual full-script code path (not a direct function call), so it needs the real thing to
+  # stay fast rather than a shortcut.
+  export BUCKETFS_REACHABLE_TRIES=3 BUCKETFS_REACHABLE_POLL_SECONDS=0
   run_file_bfs "${BFS_HAPPY_ARGS[@]}"
   assert_rc_nonzero "bfs preflight: unreachable bucket exits nonzero" "$LAST_RC"
   assert_contains "bfs preflight: names the bucket" "$LAST_OUT" "bucket 'default'"
-  assert_contains "bfs preflight: names the try count" "$LAST_OUT" "5 tries"
+  assert_contains "bfs preflight: names the try count" "$LAST_OUT" "3 tries"
   assert_contains "bfs preflight: points at the likely cause" "$LAST_OUT" "--bfs-host"
   assert_contains "bfs preflight: surfaces exapump's own diagnostic" "$LAST_OUT" "not reachable at stub-bfs-host"
   local log; log="$(log_content)"

@@ -54,6 +54,11 @@ PERSONAL_SSH_HOST="127.0.0.1"
 VM_BUCKETFS_ROOT="/var/lib/exa/bucketfs"
 VM_RECONCILE_TRIES=30
 VM_RECONCILE_POLL_SECONDS=2
+# Env-overridable (unlike VM_RECONCILE_*) so the test suite can drive the full script through a
+# real run_file invocation without a real ~30s wait -- BUCKETFS_REACHABLE_TRIES=3
+# BUCKETFS_REACHABLE_POLL_SECONDS=0 exercises the exact same production code path fast.
+BUCKETFS_REACHABLE_TRIES="${BUCKETFS_REACHABLE_TRIES:-30}"
+BUCKETFS_REACHABLE_POLL_SECONDS="${BUCKETFS_REACHABLE_POLL_SECONDS:-2}"
 SSH_OPTIONS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 
@@ -1031,11 +1036,14 @@ exapump_bucketfs() {
 # bucketfs_wait_for_path: a freshly started Exasol container's SQL port (what this script's own
 # reachability checks and Docker healthchecks key off) can go up before BucketFS's HTTP endpoint
 # is actually listening, so a single-shot check races that startup ordering instead of waiting it
-# out. tries/sleep_seconds are only ever overridden by the test suite (to run the retry loop
-# with sleep_seconds=0); the one production call site always takes the defaults.
+# out. Same 30-tries/2s budget as VM_RECONCILE_TRIES/POLL_SECONDS: BucketFS coming up is exactly
+# the same kind of "engine subsystem starts asynchronously after the SQL port does" wait, and 5
+# tries/1s (10s) measurably wasn't enough headroom on a live container in CI. tries/sleep_seconds
+# are only ever overridden by the test suite (to run the retry loop with sleep_seconds=0); the one
+# production call site always takes the defaults.
 # shellcheck disable=SC2120  # $1/$2 are overridden only from install.test.sh
 bucketfs_reachable() {
-  local tries="${1:-5}" sleep_seconds="${2:-1}" i=1 out
+  local tries="${1:-$BUCKETFS_REACHABLE_TRIES}" sleep_seconds="${2:-$BUCKETFS_REACHABLE_POLL_SECONDS}" i=1 out
   while [[ "$i" -le "$tries" ]]; do
     if out="$(exapump_bucketfs ls 2>&1)"; then
       return 0
