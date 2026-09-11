@@ -1,0 +1,2 @@
+# Copy to terraform.tfvars (gitignored) and fill in real values.
+tofu_state_bucket = "REPLACE_WITH_YOUR_STATE_BUCKET" # must match backend.hcl

@@ -5,6 +5,10 @@ terraform {
     random = { source = "hashicorp/random", version = "~> 3.6" }
     http   = { source = "hashicorp/http", version = "~> 3.4" }
   }
+
+  # Shared S3 state (was local backend, see data-stack/providers.tf for why). Bucket/key/region come
+  # from `tofu init -backend-config=backend.hcl` (gitignored), not hardcoded here.
+  backend "s3" {}
 }
 
 locals {
@@ -37,9 +41,12 @@ provider "aws" {
 }
 
 # Read the persistent data-stack outputs (same VPC/subnet so cluster sits next to S3/Glue).
+# var.tofu_state_bucket comes from terraform.tfvars (gitignored) — not hardcoded (see backend above).
 data "terraform_remote_state" "data" {
-  backend = "local"
+  backend = "s3"
   config = {
-    path = "${path.module}/../data-stack/terraform.tfstate"
+    bucket = var.tofu_state_bucket
+    key    = "tofu-state/data-stack/terraform.tfstate"
+    region = var.region
   }
 }

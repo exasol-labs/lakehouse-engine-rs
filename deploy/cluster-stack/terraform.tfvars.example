@@ -1,0 +1,4 @@
+# Copy to terraform.tfvars (gitignored) and fill in real values.
+tofu_state_bucket = "REPLACE_WITH_YOUR_STATE_BUCKET" # must match backend.hcl
+env_name          = "REPLACE_WITH_ENV_NAME"          # e.g. "demo"; also used as the tofu workspace name
+key_pair_name     = "REPLACE_WITH_YOUR_KEY_PAIR"
