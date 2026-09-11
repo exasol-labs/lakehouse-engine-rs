@@ -53,7 +53,10 @@ MISSING_CURL_DIR="$SANDBOX/missing-curl"
 MISSING_EXAPUMP_DIR="$SANDBOX/missing-exapump"
 MISSING_SSH_DIR="$SANDBOX/missing-ssh"
 MISSING_SCP_DIR="$SANDBOX/missing-scp"
-mkdir -p "$STUBDIR" "$MISSING_CURL_DIR" "$MISSING_EXAPUMP_DIR" "$MISSING_SSH_DIR" "$MISSING_SCP_DIR"
+AUTOINSTALL_DIR="$SANDBOX/autoinstall-exapump"
+AUTOINSTALL_TARGET_DIR="$SANDBOX/autoinstall-exapump-target"
+mkdir -p "$STUBDIR" "$MISSING_CURL_DIR" "$MISSING_EXAPUMP_DIR" "$MISSING_SSH_DIR" "$MISSING_SCP_DIR" \
+  "$AUTOINSTALL_DIR" "$AUTOINSTALL_TARGET_DIR"
 
 STUB_LOG="$SANDBOX/stub.log"
 export STUB_LOG
@@ -282,6 +285,13 @@ TOML
         fi
       fi
       exit 0 ;;
+    */exapump/main/install.sh)
+      if [[ "${EXAPUMP_AUTOINSTALL_FAIL:-0}" == "1" ]]; then
+        echo "curl: (22) The requested URL returned error: 404" >&2
+        exit 22
+      fi
+      printf '#!/bin/sh\nexit 0\n'
+      exit 0 ;;
     *)
       if [[ "${CURL_DB_UNREACHABLE:-0}" == "1" ]]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi
       printf '{"id":"stub-db","name":"stub"}\n'
@@ -347,6 +357,18 @@ done
 write_scp_stub "$MISSING_SSH_DIR"
 write_ssh_stub "$MISSING_SCP_DIR"
 unset _d _p
+
+# autoinstall-exapump dir: curl only (no exapump), plus real bash+sh so the fetched exapump
+# "installer" (env+bash-shebang curl stub piped into a real sh) actually runs, unlike the
+# maximally-bare MISSING_* dirs above whose whole point is that NOTHING beyond the probed tool
+# works. AUTOINSTALL_TARGET_DIR simulates exapump's own install.sh already having dropped a
+# working binary at $EXAPUMP_INSTALL_DIR in a prior process -- ensure_exapump's job here is only
+# to notice it and prepend it to PATH.
+write_curl_stub "$AUTOINSTALL_DIR"
+ln -sf "$BASH_BIN" "$AUTOINSTALL_DIR/bash"
+_p="$(command -v sh 2>/dev/null)" && ln -sf "$_p" "$AUTOINSTALL_DIR/sh"
+write_exapump_stub "$AUTOINSTALL_TARGET_DIR"
+unset _p
 
 RUN_PATH="$STUBDIR:$ORIG_PATH"
 
@@ -463,7 +485,7 @@ reset_env() {
   unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY 2>/dev/null || true
   unset SSH_FAIL SCP_FAIL SSH_PATH_NEVER SSH_PATH_DELAY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
-  unset EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
+  unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
   # Sandboxed exapump config so profile-mode runs never touch the real ~/.exapump/config.toml.
   export EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
   RUN_PATH="$STUBDIR:$ORIG_PATH"
@@ -529,6 +551,39 @@ test_missing_prereq_fails_fast() {
   assert_rc_nonzero "missing exapump: nonzero exit" "$LAST_RC"
   assert_contains "missing exapump: names exapump" "$LAST_OUT" "exapump"
   assert_eq "missing exapump: no network/SQL call made" "" "$(log_content)"
+}
+
+test_exapump_auto_install() {
+  echo "== test_exapump_auto_install =="
+  local out rc
+
+  reset_env
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "exapump already present: install still succeeds" "$LAST_RC"
+  assert_not_contains "exapump already present: no auto-install attempted" "$LAST_OUT" "exapump/main/install.sh"
+
+  reset_env
+  RUN_PATH="$MISSING_EXAPUMP_DIR"
+  export EXAPUMP_AUTOINSTALL_FAIL=1
+  run_file --account-id ACC1 --database-id DB1 --profile staging
+  assert_rc_nonzero "auto-install fetch fails: check_prereqs still exits nonzero" "$LAST_RC"
+  assert_contains "auto-install fetch fails: names exapump" "$LAST_OUT" "exapump"
+  unset EXAPUMP_AUTOINSTALL_FAIL
+
+  reset_env
+  RUN_PATH="$AUTOINSTALL_DIR"
+  export EXAPUMP_INSTALL_DIR="$AUTOINSTALL_TARGET_DIR"
+  out="$(
+    export PATH="$RUN_PATH"
+    source "$INSTALLER"
+    TARGET_MODE=saas
+    DEPLOYMENT_TRANSPORT=""
+    check_prereqs 2>&1
+  )"
+  rc=$?
+  assert_rc_zero "auto-install succeeds: check_prereqs passes once EXAPUMP_INSTALL_DIR is found" "$rc"
+  assert_contains "auto-install succeeds: says it is installing" "$out" "installing it automatically"
+  unset EXAPUMP_INSTALL_DIR
 }
 
 test_connectivity_mode_either_or() {
@@ -2612,6 +2667,7 @@ deployment_local_requires_ssh_and_scp() {
 # ============================================================================
 main() {
   test_missing_prereq_fails_fast
+  test_exapump_auto_install
   test_connectivity_mode_either_or
   test_host_mode_requires_port
   test_host_dsn_percent_encodes_credentials
