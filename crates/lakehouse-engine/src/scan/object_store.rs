@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use url::{Position, Url};
 
+use super::checked_div::register_checked_float_div_udf;
 use super::raw_scan::register_nested_json_render_udf;
 use super::session_config_for_spec;
 use crate::scan::runtime::{build_runtime_env, probe_tmp_spill};
@@ -55,6 +56,7 @@ pub(super) fn build_session_context(
 
     let ctx = SessionContext::new_with_config_rt(config, Arc::new(runtime_env));
     register_nested_json_render_udf(&ctx);
+    register_checked_float_div_udf(&ctx);
 
     let sides = present_sides(spec);
 

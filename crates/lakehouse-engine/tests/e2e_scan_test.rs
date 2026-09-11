@@ -3998,11 +3998,11 @@ fn e2e_float_div_int_over_int_matches_native_oracle() {
 }
 
 /// The translator's own output, not planning's user-side-CAST proxy: a bare
-/// `L_ORDERKEY / L_LINENUMBER` select-list item pushes down as
-/// `(CAST("L_ORDERKEY" AS DOUBLE) / "L_LINENUMBER")` with a DOUBLE PRECISION
-/// emit type (#186 fix, `vs-expression`'s DataFusion-dialect `FLOAT_DIV` arm).
+/// `L_ORDERKEY / L_LINENUMBER` select-list item pushes down as a checked
+/// division call with a DOUBLE PRECISION emit type (#186 / #370 fix,
+/// `vs-expression`'s DataFusion-dialect `FLOAT_DIV` arm).
 #[test]
-fn e2e_float_div_pushes_double_cast_projection() {
+fn e2e_float_div_pushes_checked_division_call_projection() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -4012,11 +4012,13 @@ fn e2e_float_div_pushes_double_cast_projection() {
     );
     let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
 
+    let expected_projection = format!(
+        r#""projection":[{{"expr":"{}(\"L_ORDERKEY\", \"L_LINENUMBER\")"}}]"#,
+        vs_expression::CHECKED_FLOAT_DIV_FN
+    );
     assert!(
-        pushed.contains(
-            r#""projection":[{"expr":"(CAST(\"L_ORDERKEY\" AS DOUBLE) / \"L_LINENUMBER\")"}]"#
-        ),
-        "expected the pushed projection to be a DOUBLE-cast FLOAT_DIV \
+        pushed.contains(&expected_projection),
+        "expected the pushed projection to be a checked-division FLOAT_DIV \
          expression, got:\n{pushed}"
     );
     assert!(
@@ -4026,11 +4028,55 @@ fn e2e_float_div_pushes_double_cast_projection() {
     );
 }
 
-/// Pins a known, deliberate divergence: a projected `x/0` fails at `22002`
-/// ("numeric value out of range: value inf"), not native Exasol's `22012`
-/// ("division by zero").
+/// The SQL state Exasol surfaced for a query that MUST fail with the checked
+/// division's own division-by-zero message.
+///
+/// Recorded live (#370 fix): a `UdfError::User` from the scan UDF reaches the
+/// client as [`UDF_ERROR_SQL_CODE`], carrying the UDF's message text. Asserting
+/// the message rather than the state is what makes the assertion meaningful —
+/// the state is the same for every UDF-raised error, the message is not.
+fn division_by_zero_failure_sql_code(conn: &mut ExaConn, sql: &str) -> String {
+    let resp = conn.try_execute(sql);
+
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "a division by zero must fail the query rather than silently returning \
+         a value or a row count native Exasol disagrees with:\n{sql}\n{resp}"
+    );
+    let message = resp["exception"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        message.contains("division by zero"),
+        "the surfaced message must name a division by zero:\n{sql}\n{resp}"
+    );
+    assert!(
+        !message.contains("assigned data could not be read"),
+        "a user's own division by zero must NOT carry the storage-read framing, \
+         which would send a support case looking at object storage:\n{sql}\n{resp}"
+    );
+    resp["exception"]["sqlCode"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// SQL state a scan-UDF `UdfError::User` reaches the client under. Recorded
+/// from a live run, not assumed: Exasol reports every UDF-raised error under
+/// its own generic state rather than forwarding native Exasol's `22012`
+/// ("division by zero"), which no UDF can produce.
+const UDF_ERROR_SQL_CODE: &str = "22002";
+
+/// A projected `x/0` fails the query with the checked division's own
+/// division-by-zero message. Pre-fix it failed too, but for the wrong reason
+/// and only here: DataFusion produced `+Inf` and Exasol's emit boundary
+/// rejected it at `22002` ("numeric value out of range: value inf"), which is
+/// why the identical division inside a filter predicate silently changed the
+/// row count instead of failing (#370).
 #[test]
-fn e2e_float_div_by_zero_projected_fails_with_inf_out_of_range() {
+fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -4038,33 +4084,22 @@ fn e2e_float_div_by_zero_projected_fails_with_inf_out_of_range() {
         "SELECT L_ORDERKEY / (L_LINENUMBER - L_LINENUMBER) FROM {} WHERE L_ORDERKEY = 7",
         vs_lineitem_table()
     );
-    let resp = conn.try_execute(&sql);
+
+    let sql_code = division_by_zero_failure_sql_code(&mut conn, &sql);
 
     assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "a projected x/0 must fail rather than silently return a wrong value, \
-         got: {resp}"
-    );
-
-    let sql_code = resp["exception"]["sqlCode"].as_str().unwrap_or_default();
-    let message = resp["exception"]["text"]
-        .as_str()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    assert!(
-        sql_code.contains("22002") && message.contains("numeric value out of range: value inf"),
-        "expected sqlCode 22002 with a \"numeric value out of range: value \
-         inf\" message, got sqlCode={sql_code:?} message={message:?}: {resp}"
+        sql_code, UDF_ERROR_SQL_CODE,
+        "the recorded SQL state for a scan-UDF-raised division by zero"
     );
 }
 
-/// Pins a known, deliberate divergence: a projected `0/0` succeeds with a
-/// silent NULL, owned by #246's raw-scan NaN-at-emit gap. The partial-
-/// aggregate path errors on the same input via `arrow_value_at` instead — this
-/// silent-NULL behavior is specific to the raw-scan/projection path.
+/// A projected `0/0` now fails with the SAME division-by-zero message a
+/// non-zero numerator gets, instead of succeeding with the silent NULL #246's
+/// raw-scan NaN-at-emit gap returned. The checked division sees the zero
+/// divisor and raises before any value can reach the emit boundary, so the
+/// projection path and the predicate path no longer disagree.
 #[test]
-fn e2e_zero_div_zero_projected_returns_silent_null() {
+fn e2e_zero_div_zero_projected_fails_with_division_by_zero() {
     setup_e2e();
     let mut conn = exa_conn();
 
@@ -4073,15 +4108,13 @@ fn e2e_zero_div_zero_projected_returns_silent_null() {
          FROM {} WHERE L_ORDERKEY = 7",
         vs_lineitem_table()
     );
-    let cols = conn.query_columns(&sql);
 
-    assert!(
-        !cols[0].is_empty(),
-        "expected at least one row for L_ORDERKEY = 7, got: {cols:?}"
-    );
-    assert!(
-        cols[0].iter().all(|v| v.is_null()),
-        "a projected 0/0 must succeed and return a silent NULL (#246), got: {cols:?}"
+    let sql_code = division_by_zero_failure_sql_code(&mut conn, &sql);
+
+    assert_eq!(
+        sql_code, UDF_ERROR_SQL_CODE,
+        "0/0 must fail under the same SQL state as x/0, so the two shapes are \
+         indistinguishable to a client"
     );
 }
 
@@ -4129,6 +4162,285 @@ fn e2e_float_div_filter_row_count_matches_native_oracle() {
         "pushed-down filter L_ORDERKEY/L_LINENUMBER > 3 AND L_ORDERKEY = 7 \
          must match the native oracle count {oracle_count} (truncated integer \
          division silently drops a matching row), got {vs_count}"
+    );
+}
+
+/// The 20-row `L_ORDERKEY` (1..=10) × `L_LINENUMBER` (1..=2) cross product the
+/// `fact_lineitem` fixture seeds, as an inline-literal subquery Exasol
+/// evaluates natively.
+///
+/// `LHVS.GT_LINEITEM_SCAN` does not exist in this harness, so the native oracle
+/// is built the way every other `float_div` oracle in this file builds one:
+/// from literals describing exactly the rows the pushed filter runs over. An
+/// oracle over a different row set would prove nothing about a row count.
+fn native_lineitem_oracle() -> String {
+    let rows: Vec<String> = (1..=FACT_ORDERS_ROWS)
+        .flat_map(|orderkey| {
+            (1..=LINES_PER_ORDER).map(move |linenumber| {
+                format!("SELECT {orderkey} AS L_ORDERKEY, {linenumber} AS L_LINENUMBER")
+            })
+        })
+        .collect();
+    format!("({})", rows.join(" UNION ALL "))
+}
+
+/// The ScanSpec's rendered `filter` value, with its JSON escaping undone.
+///
+/// Reading the filter FIELD rather than the whole pushed text is what makes a
+/// predicate-position assertion meaningful: the function name also appears in
+/// Exasol's echoed pushdown request, so a bare substring probe would pass while
+/// the predicate stayed Exasol-side and never reached the scan.
+fn pushed_scan_filter(pushed: &str) -> String {
+    const KEY: &str = r#""filter":""#;
+    let start = pushed
+        .find(KEY)
+        .unwrap_or_else(|| panic!("the pushed scan spec must carry a filter:\n{pushed}"))
+        + KEY.len();
+    let body = &pushed[start..];
+    // The value is a JSON string inside a single-quoted SQL literal, so every
+    // identifier quote inside it is escaped; it ends at the first unescaped one.
+    let bytes = body.as_bytes();
+    let mut end = 0;
+    while end < bytes.len() && !(bytes[end] == b'"' && (end == 0 || bytes[end - 1] != b'\\')) {
+        end += 1;
+    }
+    body[..end].replace("\\\"", "\"")
+}
+
+/// Assert the checked division reached the scan in PREDICATE position.
+///
+/// Two facts are needed, not one: the ScanSpec's own `filter` must hold the
+/// call, and its `projection` must be the bare column the query selects — so
+/// the call cannot be a select-list expression that merely looks like a pushed
+/// predicate. The comparison's own rendering is deliberately not asserted here:
+/// Exasol normalises `0 > <expr>` to `<expr> < 0`, and the test's subject is
+/// the position, not Exasol's canonicalisation.
+fn assert_checked_division_reached_the_pushed_filter(pushed: &str) {
+    let filter = pushed_scan_filter(pushed);
+    assert!(
+        filter.contains(&format!("{}(", vs_expression::CHECKED_FLOAT_DIV_FN)),
+        "the pushed scan FILTER must carry the checked-division call, got \
+         `{filter}`:\n{pushed}"
+    );
+    assert!(
+        pushed.contains(r#""projection":["L_ORDERKEY"]"#),
+        "the projection must be the bare selected column, so the division can \
+         only have reached the scan as a predicate:\n{pushed}"
+    );
+}
+
+/// Issue #370's own defect: a division by zero inside a pushed FILTER predicate
+/// must fail the query, not change the row count.
+///
+/// Covers all four shapes #370 measured, because each failed differently
+/// pre-fix: `x/0` matched all 20 rows for `> 0` and none for `< 0` (DataFusion's
+/// `+Inf` compares greater than every finite value), and `0/0` matched none for
+/// `> 0` and all 20 for `< 0` (a `NaN` comparison is false, so the negated
+/// predicate kept every row). Two opposite wrong answers from one bug, neither
+/// of them an error.
+#[test]
+fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let x_over_zero = "L_ORDERKEY / (L_LINENUMBER - L_LINENUMBER)";
+    let zero_over_zero = "(L_LINENUMBER - L_LINENUMBER) / (L_LINENUMBER - L_LINENUMBER)";
+
+    for divisor_shape in [x_over_zero, zero_over_zero] {
+        for comparison in ["<", ">"] {
+            let sql = format!(
+                "SELECT L_ORDERKEY FROM {} WHERE 0 {comparison} {divisor_shape}",
+                vs_lineitem_table()
+            );
+
+            let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+            assert_checked_division_reached_the_pushed_filter(&pushed);
+
+            let sql_code = division_by_zero_failure_sql_code(&mut conn, &sql);
+            assert_eq!(
+                sql_code, UDF_ERROR_SQL_CODE,
+                "every zero-divisor shape in predicate position must fail under \
+                 one SQL state:\n{sql}"
+            );
+        }
+    }
+}
+
+/// A NULL divisor in a pushed predicate is NOT a division by zero: the row
+/// carries no value to divide, the comparison over a NULL quotient is unknown,
+/// and the query returns no rows without failing.
+///
+/// This is the case a naive zero-divisor guard gets wrong. NULL is derived with
+/// `NULLIF(L_LINENUMBER - L_LINENUMBER, 0)`, which is NULL for every fixture
+/// row — so if the checked division raised on a NULL operand, this query would
+/// fail rather than return nothing, and every NULL-divisor query in production
+/// would start failing too.
+#[test]
+fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT L_ORDERKEY FROM {} \
+         WHERE 0 < L_ORDERKEY / NULLIF(L_LINENUMBER - L_LINENUMBER, 0)",
+        vs_lineitem_table()
+    );
+
+    let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+    assert_checked_division_reached_the_pushed_filter(&pushed);
+
+    // `query_row_count` asserts the statement succeeded, so reaching a row
+    // count at all is what proves a NULL divisor does not raise.
+    let rows = conn.query_row_count(&sql);
+    assert_eq!(
+        rows, 0,
+        "a NULL divisor must return no rows and must NOT raise"
+    );
+}
+
+/// The GUARDED shape task 1.2 measured live, in BOTH conjunct orders, against
+/// the native oracle — the one shape where a query that succeeds today can
+/// start failing, so its outcome is measured rather than assumed.
+///
+/// Divisor `(L_LINENUMBER - 1)` is zero on exactly half the 20-row fixture
+/// (`L_LINENUMBER = 1`), unlike the identically-zero `(L_LINENUMBER -
+/// L_LINENUMBER)` divisor the tests above use, so the guard
+/// `(L_LINENUMBER - 1) <> 0` really removes rows rather than being a no-op.
+///
+/// Native Exasol returns 10 rows WITHOUT raising in BOTH conjunct orders: its
+/// own guard protects its division regardless of textual order. The pushed
+/// scan does NOT match that in both orders, and the divergence is
+/// order-dependent exactly as the spec predicts:
+///
+/// * GUARD FIRST — 10 rows, no error. Parity with native Exasol. The
+///   protection comes from the Parquet ROW FILTER, which evaluates the pushed
+///   conjuncts in textual order and narrows the row selection as it goes, so
+///   the division never sees a zero divisor. It does NOT come from
+///   `check_short_circuit`, which at this fixture's 0.5 true ratio (above
+///   `PRE_SELECTION_THRESHOLD = 0.2`) would evaluate the division over the full
+///   batch and raise. The textual conjunct order itself holds because
+///   `datafusion.execution.parquet.reorder_filters` defaults to `false` and
+///   `session_config_for_spec` leaves the key unset. Enabling it sorts the
+///   split conjuncts by referenced-column size, which puts the one-column guard
+///   ahead of the two-column division in BOTH orders and flips the
+///   `DIVISION FIRST` raise assertion below.
+/// * DIVISION FIRST — raises. The division is the first row-filter conjunct, so
+///   it evaluates over every row including the ten with a zero divisor, and
+///   nothing has excluded them yet. This is the OVER-RAISE direction of tracked
+///   exception #392: a query native Exasol answers can fail here. The scan
+///   never returns rows that disagree with Exasol, which is the invariant the
+///   fix protects; only the error-raising diverges.
+#[test]
+fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let guard = "(L_LINENUMBER - 1) <> 0";
+    let division = "0 < L_ORDERKEY / (L_LINENUMBER - 1)";
+    let oracle = native_lineitem_oracle();
+    let guarded_rows = (LINEITEM_ROWS / 2) as i64;
+
+    let unguarded_oracle =
+        conn.try_execute(&format!("SELECT L_ORDERKEY FROM {oracle} WHERE {division}"));
+    assert_eq!(
+        unguarded_oracle["status"].as_str(),
+        Some("error"),
+        "the oracle must really hold zero-divisor rows: native Exasol has to \
+         raise for the UNGUARDED shape, else the guard below guards \
+         nothing: {unguarded_oracle}"
+    );
+
+    let guard_first = format!("{guard} AND {division}");
+    let division_first = format!("{division} AND {guard}");
+
+    for predicate in [&guard_first, &division_first] {
+        let oracle_rows = conn.query_row_count(&format!(
+            "SELECT L_ORDERKEY FROM {oracle} WHERE {predicate}"
+        ));
+        assert_eq!(
+            oracle_rows, guarded_rows,
+            "native Exasol must return {guarded_rows} guarded rows WITHOUT \
+             raising for `{predicate}` — the outcome task 1.2 recorded"
+        );
+
+        let vs_sql = format!(
+            "SELECT L_ORDERKEY FROM {} WHERE {predicate}",
+            vs_lineitem_table()
+        );
+        let filter = pushed_scan_filter(&explain_virtual_pushdown_sql(&mut conn, &vs_sql));
+        assert!(
+            filter.contains(r#"("L_LINENUMBER" - 1) <> 0"#)
+                && filter.contains(&format!(
+                    r#"{}("L_ORDERKEY", ("L_LINENUMBER" - 1))"#,
+                    vs_expression::CHECKED_FLOAT_DIV_FN
+                )),
+            "both conjuncts must reach the scan in ONE pushed filter for \
+             `{predicate}`, got `{filter}`"
+        );
+    }
+
+    let guard_first_rows = conn.query_row_count(&format!(
+        "SELECT L_ORDERKEY FROM {} WHERE {guard_first}",
+        vs_lineitem_table()
+    ));
+    assert_eq!(
+        guard_first_rows, guarded_rows,
+        "GUARD FIRST must match native Exasol — {guarded_rows} rows, no error \
+         — because the Parquet row filter applies the guard's row selection \
+         before the division is evaluated"
+    );
+
+    let division_first_code = division_by_zero_failure_sql_code(
+        &mut conn,
+        &format!(
+            "SELECT L_ORDERKEY FROM {} WHERE {division_first}",
+            vs_lineitem_table()
+        ),
+    );
+    assert_eq!(
+        division_first_code, UDF_ERROR_SQL_CODE,
+        "DIVISION FIRST raises where native Exasol returns {guarded_rows} rows: \
+         the over-raise direction of tracked exception #392. If this ever stops \
+         raising, the guard has started protecting the division in this order \
+         too and #392 can narrow."
+    );
+}
+
+/// A division by zero inside a pushed AGGREGATE argument fails the query with
+/// the same division-by-zero message, rather than reaching `arrow_value_at`'s
+/// separate `is_nan()` check at the partial-aggregate emit boundary.
+///
+/// The aggregate paths splice the rendered argument into their own SQL
+/// (`build_partial_agg_sql_filtered` / `build_grouped_partial_agg_sql`), so
+/// registering the function on the one session builder is what makes them raise
+/// identically to the raw-row path.
+#[test]
+fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT SUM(L_ORDERKEY / (L_LINENUMBER - L_LINENUMBER)) FROM {}",
+        vs_lineitem_table()
+    );
+
+    let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
+    let expected_aggregate = format!(
+        r#""aggregates":[{{"kind":"sum","arg_expr":"{}("#,
+        vs_expression::CHECKED_FLOAT_DIV_FN
+    );
+    assert!(
+        pushed.contains(&expected_aggregate),
+        "the aggregate must be PUSHED with the checked division as its \
+         argument, expected {expected_aggregate} — an Exasol-side aggregate \
+         would never reach the scan:\n{pushed}"
+    );
+
+    let sql_code = division_by_zero_failure_sql_code(&mut conn, &sql);
+    assert_eq!(
+        sql_code, UDF_ERROR_SQL_CODE,
+        "a zero divisor inside a pushed aggregate argument must fail under the \
+         same SQL state as one in a projection or a filter"
     );
 }
 

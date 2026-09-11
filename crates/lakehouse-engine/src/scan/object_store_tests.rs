@@ -5,6 +5,8 @@ use crate::scan::spec::{
 };
 use crate::scan::test_support::minimal_spec;
 use ::object_store::ClientConfigKey;
+use arrow::datatypes::DataType;
+use datafusion::execution::FunctionRegistry;
 use datafusion::execution::memory_pool::MemoryLimit;
 
 /// The store key an S3 bucket is registered under.
@@ -286,6 +288,41 @@ fn the_table_root_store_is_the_unwrapped_store_a_scan_side_wraps() {
         decorated.to_string(),
         format!("SpecSizedObjectStore({raw})"),
         "build_side_store must wrap the undecorated store unchanged"
+    );
+}
+
+/// `build_session_context` is the ONE production session builder `run_scan_one`
+/// hands to all three run paths, so registering the checked division there is
+/// what reaches every pushed expression the scan can evaluate — a projection
+/// item, a `WHERE` filter, an `ORDER BY` key, a `GROUP BY` key, a
+/// broadcast-join fact-leg filter, and an aggregate argument.
+///
+/// The name is read from `crates/vs-expression`'s exported constant, not
+/// restated here: that constant is the only thing tying the renderer to the
+/// registration, so a test that hardcoded the string would pass while the two
+/// crates disagreed.
+#[test]
+fn build_session_context_registers_the_checked_float_div_function() {
+    let spec = minimal_spec();
+
+    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+
+    let registered = ctx
+        .state()
+        .udf(vs_expression::CHECKED_FLOAT_DIV_FN)
+        .unwrap_or_else(|e| {
+            panic!(
+                "a session built for a spec must resolve {}: {e}",
+                vs_expression::CHECKED_FLOAT_DIV_FN
+            )
+        });
+    assert_eq!(
+        registered
+            .return_type(&[DataType::Float64, DataType::Float64])
+            .expect("the checked division must declare a return type"),
+        DataType::Float64,
+        "the registered function must return DOUBLE, so the renderer needs no \
+         CAST of its own around the call"
     );
 }
 

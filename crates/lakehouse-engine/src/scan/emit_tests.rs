@@ -1,4 +1,5 @@
 use super::*;
+use crate::scan::checked_div::{CheckedFloatDivError, register_checked_float_div_udf};
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -277,6 +278,114 @@ async fn resources_exhausted_surfaces_as_memory_error_not_storage_error() {
     assert!(
         !text_storage.contains("memory exhausted"),
         "non-OOM error must NOT look like memory error: {text_storage}"
+    );
+}
+
+/// Scenario: a checked-division failure reaches the user as the arithmetic
+/// error it is, WITHOUT the storage-read framing. `scan failed: assigned data
+/// could not be read` misnames a user's own division by zero, and it would send
+/// a support case looking at object storage.
+///
+/// Verifies every nesting form the error can arrive in, because recognition is
+/// BY TYPE on the source chain rather than by matching message text: bare
+/// `External`, `Context`-wrapped, and wrapped through
+/// `ArrowError::ExternalError` the way a stream adapter produces.
+#[test]
+fn classify_scan_error_names_a_checked_division_failure_without_the_storage_prefix() {
+    let zero_divisor = || CheckedFloatDivError::ZeroDivisor {
+        numerator: 7.0,
+        divisor: 0.0,
+    };
+    let nestings: Vec<(&str, DataFusionError)> = vec![
+        (
+            "bare External",
+            DataFusionError::External(Box::new(zero_divisor())),
+        ),
+        (
+            "Context-wrapped",
+            DataFusionError::External(Box::new(zero_divisor()))
+                .context("ProjectionExec: evaluating expression"),
+        ),
+        (
+            "through ArrowError::ExternalError",
+            DataFusionError::from(ArrowError::ExternalError(Box::new(
+                DataFusionError::External(Box::new(zero_divisor())),
+            ))),
+        ),
+    ];
+
+    for (nesting, error) in nestings {
+        let text = classify_scan_error(error, &[]).to_string();
+        assert!(
+            text.contains("division by zero"),
+            "{nesting}: must name the division by zero: {text}"
+        );
+        assert!(
+            !text.contains("assigned data could not be read"),
+            "{nesting}: must NOT carry the storage-read framing: {text}"
+        );
+        assert!(
+            !text.contains("memory exhausted"),
+            "{nesting}: must NOT look like a memory error: {text}"
+        );
+    }
+}
+
+/// Scenario: an overflow keeps its own wording through the classifier, so the
+/// two causes a checked division can fail for stay distinguishable in a support
+/// case after the error has been framed.
+#[test]
+fn classify_scan_error_keeps_an_out_of_range_division_distinct_from_a_zero_divisor() {
+    let overflow = DataFusionError::External(Box::new(CheckedFloatDivError::NonFiniteResult {
+        numerator: 1e300,
+        divisor: 1e-300,
+        quotient: f64::INFINITY,
+    }));
+
+    let text = classify_scan_error(overflow, &[]).to_string();
+
+    assert!(
+        text.contains("numeric value out of range"),
+        "an overflow must name an out-of-range value: {text}"
+    );
+    assert!(
+        !text.contains("division by zero"),
+        "an overflow must not be reported as a division by zero: {text}"
+    );
+    assert!(
+        !text.contains("assigned data could not be read"),
+        "an overflow is arithmetic, not a storage failure: {text}"
+    );
+}
+
+/// Scenario: a credential value in `secrets` never reaches a checked-division
+/// message. The surfaced text is built from the two operands alone, so the
+/// wrapping chain's own text — which can carry a credential-bearing fragment
+/// from an outer error layer — is dropped rather than redacted into.
+#[test]
+fn classify_scan_error_redacts_secrets_from_a_checked_division_failure() {
+    let secret = "AKIAIOSFODNN7EXAMPLE";
+    let wrapped = DataFusionError::External(Box::new(CheckedFloatDivError::ZeroDivisor {
+        numerator: 7.0,
+        divisor: 0.0,
+    }))
+    .context(format!("reading s3://bucket/f.parquet?key={secret}"));
+
+    let text = classify_scan_error(wrapped, &[secret]).to_string();
+
+    assert!(
+        !text.contains(secret),
+        "the surfaced message must not contain the literal secret: {text}"
+    );
+    assert!(
+        !text.contains("s3://bucket/f.parquet"),
+        "the wrapping chain's text must not be surfaced at all, so a \
+         credential-bearing fragment cannot reach the user even unredacted: \
+         {text}"
+    );
+    assert!(
+        text.contains("division by zero"),
+        "the message must still name the division by zero: {text}"
     );
 }
 
@@ -783,5 +892,233 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
         timestamp_out.value(0),
         timestamp_boundary,
         "timestamp value at the date boundary must round-trip unchanged"
+    );
+}
+
+/// Scenario: a checked-division failure whose TYPE the error chain lost
+/// REPLACES the flattened storage-read framing, leaving no trace of it.
+///
+/// This is issue #370's own route. DataFusion's Parquet row filter flattens a
+/// predicate error into `ArrowError::ComputeError(format!("...{e:?}"))`, so
+/// `classify_scan_error` sees no recognisable type and applies the storage-read
+/// framing. The session holds the same division as a typed value, so reframing
+/// names the arithmetic error without anyone matching text in that flattened
+/// message.
+///
+/// On this route the surfaced error IS the recorded division wearing the
+/// storage-read framing, so appending it would republish the one framing this
+/// fix exists to remove. `e2e_float_div_by_zero_in_filter_fails_like_native_exasol`
+/// asserts live that it never reaches the user, and this test pins the same
+/// guarantee at the unit boundary.
+#[tokio::test]
+async fn reframe_checked_division_names_a_failure_the_error_chain_lost() {
+    let session = session_with_a_raised_division().await;
+
+    // Exactly what the row-filter route produces: the type is gone, only the
+    // Debug rendering of it survives inside an opaque compute-error string.
+    let flattened = classify_scan_error(
+        DataFusionError::External(Box::new(ArrowError::ComputeError(
+            "Error evaluating filter predicate: External(ZeroDivisor { numerator: 7.0, \
+             divisor: 0.0 })"
+                .to_string(),
+        ))),
+        &[],
+    );
+    assert!(
+        flattened
+            .to_string()
+            .contains("assigned data could not be read"),
+        "precondition: a flattened predicate error is indistinguishable from a \
+         storage failure to the classifier, else this test proves nothing: {flattened}"
+    );
+
+    let reframed = reframe_checked_division(&session, flattened, &[]).to_string();
+
+    assert!(
+        reframed.starts_with("data exception - division by zero"),
+        "the reframed error must LEAD with the division by zero: {reframed}"
+    );
+    assert!(
+        !reframed.contains("assigned data could not be read"),
+        "the storage-read framing must not survive ANYWHERE in the message: a \
+         support case reading it goes looking at object storage for a failure \
+         the user's own SQL caused: {reframed}"
+    );
+    assert!(
+        !reframed.contains(CONCURRENT_FAILURE_PREAMBLE),
+        "nothing must be appended on this route: the surfaced error IS the \
+         recorded division, so a second failure would be a duplicate of the \
+         first under the framing this fix removes: {reframed}"
+    );
+}
+
+/// Scenario: a generic storage failure surfaced alongside a recorded division is
+/// REPLACED by the division, and the masking of that storage failure is the
+/// accepted trade-off rather than an oversight.
+///
+/// `classify_scan_error`'s fallback branch frames anything it cannot recognise
+/// by type as a storage read failure, and the flattened row-filter division
+/// lands in exactly that branch. Nothing separates the two without matching
+/// DataFusion's `Error evaluating filter predicate` wording, the coupling this
+/// module refuses everywhere. So the branch replaces, and an unrelated storage
+/// failure that happens to share the scan is lost. `ResourcesExhausted`, which
+/// `classify_scan_error` recognises on the typed error before any text exists,
+/// is the one surfaced failure that still survives alongside the division.
+#[tokio::test]
+async fn reframe_checked_division_replaces_a_generic_storage_failure_with_the_division() {
+    let session = session_with_a_raised_division().await;
+    let storage = classify_scan_error(
+        DataFusionError::Execution("S3 read failed: 403".into()),
+        &[],
+    );
+
+    let reframed = reframe_checked_division(&session, storage, &[]).to_string();
+
+    assert!(
+        reframed.contains("division by zero"),
+        "the division the user's own SQL caused must be the reported failure: \
+         {reframed}"
+    );
+    assert!(
+        !reframed.contains("assigned data could not be read"),
+        "the storage-read framing must not survive: it is indistinguishable \
+         from the flattened division's own framing, so keeping it here keeps it \
+         on issue #370's route too: {reframed}"
+    );
+    assert!(
+        !reframed.contains("403"),
+        "the trade-off this rule accepts, recorded here so it cannot be lost: \
+         an unrelated storage failure concurrent with a division IS masked: \
+         {reframed}"
+    );
+}
+
+/// Scenario: a session whose checked division never raised leaves an unrelated
+/// scan failure exactly as `classify_scan_error` framed it. The reframing is
+/// inert for every scan whose SQL contains no division.
+#[test]
+fn reframe_checked_division_leaves_an_unrelated_failure_untouched() {
+    let session = SessionContext::new();
+    register_checked_float_div_udf(&session);
+    let storage = classify_scan_error(
+        DataFusionError::Execution("S3 read failed: 403".into()),
+        &[],
+    );
+
+    let reframed = reframe_checked_division(&session, storage, &[]).to_string();
+
+    assert!(
+        reframed.contains("assigned data could not be read"),
+        "an unrelated failure must keep its storage-read framing: {reframed}"
+    );
+    assert!(
+        !reframed.contains("division by zero"),
+        "an unrelated failure must NOT be renamed a division by zero: {reframed}"
+    );
+}
+
+/// A session whose registered checked division has already raised a zero
+/// divisor. That is the only state in which `reframe_checked_division` does
+/// anything at all, so every test of the recording arm starts here.
+async fn session_with_a_raised_division() -> SessionContext {
+    let session = SessionContext::new();
+    register_checked_float_div_udf(&session);
+    session
+        .sql(&format!(
+            "SELECT {}(7, 0)",
+            vs_expression::CHECKED_FLOAT_DIV_FN
+        ))
+        .await
+        .expect("the statement must plan")
+        .collect()
+        .await
+        .expect_err("a zero divisor must raise");
+    session
+}
+
+/// Scenario: a scan that both divided by zero and exhausted its memory pool
+/// reports BOTH failures, with the division named first.
+///
+/// DataFusion evaluates partitions concurrently and surfaces exactly one of
+/// their errors to the caller, so the recorded division and the surfaced error
+/// can come from different partitions. Replacing the surfaced error erases the
+/// `ResourcesExhausted` signal the mission's bounded-execution guarantee rests
+/// on: the operator fixes the division, re-runs, and meets the same pool limit
+/// with no record that it was ever reported.
+#[tokio::test]
+async fn reframe_checked_division_keeps_a_concurrent_memory_exhaustion_failure_visible() {
+    let session = session_with_a_raised_division().await;
+    let exhausted = classify_scan_error(
+        DataFusionError::ResourcesExhausted("pool of 100 bytes".into()),
+        &[],
+    );
+
+    let reframed = reframe_checked_division(&session, exhausted, &[]).to_string();
+
+    assert!(
+        reframed.starts_with("data exception - division by zero"),
+        "the division must be named first: it is the failure the user's own SQL \
+         caused and can act on, got: {reframed}"
+    );
+    assert!(
+        reframed.contains("memory exhausted"),
+        "the concurrent memory exhaustion must stay visible: {reframed}"
+    );
+    assert!(
+        reframed.contains("pool of 100 bytes"),
+        "the memory-exhaustion detail must survive the composition, or the \
+         operator loses the pool-sizing signal: {reframed}"
+    );
+    assert!(
+        reframed.contains(CONCURRENT_FAILURE_PREAMBLE),
+        "the appended failure must be introduced as a SECOND failure, not read \
+         as a continuation of the division's own message: {reframed}"
+    );
+}
+
+/// Scenario: the appended memory-exhaustion failure is redacted here, because
+/// the classification upstream did not necessarily see every secret.
+///
+/// `raw_scan` and `partial_agg` classify with the fact side's credentials alone
+/// (`spec.common.storage.secret_values()`), while the dispatcher redacts with
+/// the union `all_secret_values()` that also covers a join's dimension side. A
+/// dimension-side credential inside a memory-exhaustion message therefore
+/// reaches this function still in place, and composing without redacting would
+/// publish it. The guarantee is a property of this function, not of what its
+/// callers happened to pass upstream.
+#[tokio::test]
+async fn reframe_checked_division_redacts_secrets_from_the_appended_failure() {
+    const DIMENSION_SIDE_TOKEN: &str = "tw1l1ght-vended-token";
+    let session = session_with_a_raised_division().await;
+    // Classified WITHOUT the token, exactly as a fact-side-only secret set
+    // upstream leaves it.
+    let exhausted = classify_scan_error(
+        DataFusionError::ResourcesExhausted(format!(
+            "pool of 100 bytes reading s3://dim/f.parquet?t={DIMENSION_SIDE_TOKEN}"
+        )),
+        &[],
+    );
+    assert!(
+        exhausted.to_string().contains(DIMENSION_SIDE_TOKEN),
+        "precondition: the upstream classification must leave the token in \
+         place, else this test proves nothing: {exhausted}"
+    );
+
+    let reframed =
+        reframe_checked_division(&session, exhausted, &[DIMENSION_SIDE_TOKEN]).to_string();
+
+    assert!(
+        !reframed.contains(DIMENSION_SIDE_TOKEN),
+        "the appended failure must carry no credential value: {reframed}"
+    );
+    assert!(
+        reframed.contains("division by zero"),
+        "redacting the appended failure must not cost the division's own \
+         message: {reframed}"
+    );
+    assert!(
+        reframed.contains("s3://dim/f.parquet"),
+        "redaction must strip the credential only, leaving the path that names \
+         what failed: {reframed}"
     );
 }
