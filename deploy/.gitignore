@@ -4,6 +4,10 @@
 *.tfstate.*
 *.tfvars
 !*.tfvars.example
+# Backend config (bucket/key/region) is env-specific and identifies the AWS account — never commit
+# the real values, only the .example placeholder.
+backend.hcl
+!backend.hcl.example
 crash.log
 
 # python
