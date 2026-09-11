@@ -1027,14 +1027,24 @@ exapump_bucketfs() {
 
 # Preflight, analogous to saas_db_reachable: an empty-path listing of the target bucket. exapump
 # resolves the bucket itself (--bfs-bucket / profile), so no path argument is passed -- a bucket
-# name IS NOT a valid path component for `exapump bucketfs ls`.
+# name IS NOT a valid path component for `exapump bucketfs ls`. Retried, same shape as
+# bucketfs_wait_for_path: a freshly started Exasol container's SQL port (what this script's own
+# reachability checks and Docker healthchecks key off) can go up before BucketFS's HTTP endpoint
+# is actually listening, so a single-shot check races that startup ordering instead of waiting it
+# out.
 bucketfs_reachable() {
-  local out
-  if ! out="$(exapump_bucketfs ls 2>&1)"; then
-    err "BucketFS bucket '$ARG_BFS_BUCKET' is not reachable: 'exapump bucketfs ls' failed. Verify --bfs-host, --bfs-port and the BucketFS write password (or the profile's bfs_* keys). exapump said: $out"
-    return 1
-  fi
-  return 0
+  local tries="${1:-5}" sleep_seconds="${2:-1}" i=1 out
+  while [[ "$i" -le "$tries" ]]; do
+    if out="$(exapump_bucketfs ls 2>&1)"; then
+      return 0
+    fi
+    if [[ "$i" -lt "$tries" ]]; then
+      sleep "$sleep_seconds"
+    fi
+    i=$((i + 1))
+  done
+  err "BucketFS bucket '$ARG_BFS_BUCKET' is not reachable after $tries tries: 'exapump bucketfs ls' failed. Verify --bfs-host, --bfs-port and the BucketFS write password (or the profile's bfs_* keys). exapump said: $out"
+  return 1
 }
 
 # Uploads one local file to a bucket-relative BucketFS path. Always via `exapump bucketfs cp`,

@@ -109,7 +109,18 @@ if [[ "${1:-}" == "bucketfs" ]]; then
       fi
       _prefix="${_pos[0]:-}"
       if [[ -z "$_prefix" ]]; then
-        # Top-level probe: always succeeds, even against an empty bucket.
+        # Top-level probe: succeeds once past EXAPUMP_BFS_TOPLEVEL_LS_DELAY misses -- simulates
+        # BucketFS's HTTP endpoint not being up yet right after the DB's SQL port opens (a
+        # separate counter file from the path-listing delay below, so both can be exercised
+        # independently in the same test).
+        _tdelay="${EXAPUMP_BFS_TOPLEVEL_LS_DELAY:-0}"
+        if [[ "$_tdelay" -gt 0 ]]; then
+          _tcf="$_state.toplevel_delay"
+          _tn=0; [[ -f "$_tcf" ]] && _tn="$(cat "$_tcf")"
+          _tn=$((_tn + 1)); printf '%s' "$_tn" > "$_tcf"
+          if [[ "$_tn" -le "$_tdelay" ]]; then exit 1; fi
+        fi
+        # Top-level probe: always succeeds past the delay, even against an empty bucket.
         if [[ -f "$_state" ]]; then
           while IFS= read -r _e; do [[ -n "$_e" ]] && printf '%s\n' "${_e%%/*}"; done < "$_state"
         fi
@@ -482,7 +493,7 @@ chmod 600 "$DEPLOYMENT_NODE_KEY"
 reset_env() {
   unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING GH_ASSET_TARBALL 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
-  unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY 2>/dev/null || true
+  unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY EXAPUMP_BFS_TOPLEVEL_LS_DELAY 2>/dev/null || true
   unset SSH_FAIL SCP_FAIL SSH_PATH_NEVER SSH_PATH_DELAY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
@@ -491,7 +502,7 @@ reset_env() {
   RUN_PATH="$STUBDIR:$ORIG_PATH"
   : > "$STUB_LOG"
   : > "$STUB_BFS_STATE"
-  rm -f "$STUB_BFS_STATE.delay" "$STUB_SSH_STATE.delay"
+  rm -f "$STUB_BFS_STATE.delay" "$STUB_BFS_STATE.toplevel_delay" "$STUB_SSH_STATE.delay"
 }
 
 run_file() {
@@ -1698,10 +1709,41 @@ test_bucketfs_reachable_preflight() {
   run_file_bfs "${BFS_HAPPY_ARGS[@]}"
   assert_rc_nonzero "bfs preflight: unreachable bucket exits nonzero" "$LAST_RC"
   assert_contains "bfs preflight: names the bucket" "$LAST_OUT" "bucket 'default'"
+  assert_contains "bfs preflight: names the try count" "$LAST_OUT" "5 tries"
   assert_contains "bfs preflight: points at the likely cause" "$LAST_OUT" "--bfs-host"
   assert_contains "bfs preflight: surfaces exapump's own diagnostic" "$LAST_OUT" "not reachable at stub-bfs-host"
   local log; log="$(log_content)"
   assert_not_contains "bfs preflight: fails before any release download" "$log" "releases/"
+
+  # Retry-then-hit: BucketFS's HTTP endpoint isn't up on the first two probes (a startup-ordering
+  # race against the DB's own SQL-port readiness check), the third succeeds. Direct call with
+  # sleep_seconds=0, same as the bucketfs_wait_for_path tests above, so this stays fast.
+  local out rc
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_TOPLEVEL_LS_DELAY=2
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile; ARG_BFS_BUCKET=default
+    bucketfs_reachable 5 0 2>&1
+  )"
+  rc=$?
+  assert_rc_zero "bfs preflight: retries past a not-yet-up BucketFS and then succeeds" "$rc"
+  assert_eq "bfs preflight: took exactly 3 ls attempts (2 misses + 1 hit)" \
+    "3" "$(count_occurrences 'exapump bucketfs ls' "$(log_content)")"
+
+  # Retry-then-fail: names the try count, never hangs.
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_LS_FAIL=1
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile; ARG_BFS_BUCKET=default
+    bucketfs_reachable 3 0 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "bfs preflight: gives up nonzero after the cap" "$rc"
+  assert_contains "bfs preflight: failure names the try count" "$out" "3 tries"
+  assert_eq "bfs preflight: capped at exactly 3 ls attempts" \
+    "3" "$(count_occurrences 'exapump bucketfs ls' "$(log_content)")"
 }
 
 test_validate_bucketfs_required_before_any_call() {
