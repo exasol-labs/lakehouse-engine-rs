@@ -1031,7 +1031,9 @@ exapump_bucketfs() {
 # bucketfs_wait_for_path: a freshly started Exasol container's SQL port (what this script's own
 # reachability checks and Docker healthchecks key off) can go up before BucketFS's HTTP endpoint
 # is actually listening, so a single-shot check races that startup ordering instead of waiting it
-# out.
+# out. tries/sleep_seconds are only ever overridden by the test suite (to run the retry loop
+# with sleep_seconds=0); the one production call site always takes the defaults.
+# shellcheck disable=SC2120  # $1/$2 are overridden only from install.test.sh
 bucketfs_reachable() {
   local tries="${1:-5}" sleep_seconds="${2:-1}" i=1 out
   while [[ "$i" -le "$tries" ]]; do
@@ -1595,6 +1597,7 @@ main() {
         ssh_vm_reachable || exit 1
       else
         validate_bucketfs_required || exit 1
+        # shellcheck disable=SC2119  # tries/sleep_seconds default; see bucketfs_reachable
         bucketfs_reachable || exit 1
       fi
       ;;
