@@ -36,8 +36,11 @@ downloaded.
   version are therefore the same bare `X.Y.Z` string, which is what makes an exact string
   comparison the correct check.
 * Two install-script functions read a value out of exapump tabular output, one per query, each
-  keyed to its own column header. That duplication stays bounded at two callers by decision. A
-  third caller consolidates them into one extractor that takes the header literal.
+  keyed to its own column header (`extract_query_value` for `SYSTEM_VALUE`,
+  `extract_version_value` for `LAKEHOUSE_ENGINE_VERSION`). That duplication stays bounded at two
+  callers by decision: a version value begins with a digit, so `extract_query_value`'s digit-skip
+  arm (which drops the row-count footer) cannot be reused, and each extractor stays simple enough
+  that the duplication is cheaper than a parameterized abstraction.
 
 ## Scenarios
 
