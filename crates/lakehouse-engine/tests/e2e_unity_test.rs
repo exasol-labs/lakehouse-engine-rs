@@ -338,7 +338,7 @@ fn delta_creds(use_vended_credentials: bool) -> ConnectionCreds {
         access_key: "minioadmin".to_string(),
         secret_key: "minioadmin".to_string(),
         session_token: None,
-        path_style: true,
+        path_style: Some(true),
         use_sigv4: false,
         use_vended_credentials,
         token: None,

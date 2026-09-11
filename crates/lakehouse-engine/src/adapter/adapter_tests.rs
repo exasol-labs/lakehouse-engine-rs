@@ -132,9 +132,6 @@ fn password_connection(
     }
 }
 
-// A static-token-free S3-style credential payload valid under EITHER catalog
-// kind (see `validate_creds`: `warehouse` is required only under
-// `IcebergRest`).
 fn s3_style_password() -> String {
     serde_json::json!({
         "warehouse": "wh",
@@ -142,6 +139,7 @@ fn s3_style_password() -> String {
         "region": "us-east-1",
         "access_key": "AKID",
         "secret_key": "SECRET",
+        "path_style": true,
     })
     .to_string()
 }

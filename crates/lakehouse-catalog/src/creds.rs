@@ -9,7 +9,7 @@ pub struct ConnectionCreds {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
-    pub path_style: bool,
+    pub path_style: Option<bool>,
     pub use_sigv4: bool,
     pub use_vended_credentials: bool,
     pub token: Option<String>,
@@ -169,7 +169,7 @@ pub struct StorageCreds {
     pub access_key: String,
     pub secret_key: String,
     pub session_token: Option<String>,
-    pub path_style: bool,
+    pub path_style: Option<bool>,
     pub account_name: Option<String>,
     pub account_key: Option<String>,
     pub sas_token: Option<String>,
@@ -211,16 +211,22 @@ impl StorageCreds {
                 .unwrap_or("")
                 .to_string(),
             session_token: non_empty_json_str(json, "session_token").map(str::to_string),
-            path_style: json
-                .get("path_style")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(true),
+            path_style: json.get("path_style").and_then(|value| value.as_bool()),
             account_name: non_empty_json_str(json, "account_name").map(str::to_string),
             account_key: non_empty_json_str(json, "account_key").map(str::to_string),
             sas_token: non_empty_json_str(json, "sas_token").map(str::to_string),
         }
     }
 
+    /// Resolves an unstated `path_style` to `false`.
+    ///
+    /// This is the one selector both the adapter-side (`ConnectionCreds`-derived)
+    /// and scan-side (`from_json`-derived) readers call, so resolving here — not in
+    /// `from_json` — guarantees they can never disagree. A parse-time default would
+    /// also destroy the tri-state the vended-credentials path needs to distinguish
+    /// "the operator said nothing" from "the operator said false", since the vended
+    /// resolution must not silently override a response's `s3.path-style-access`
+    /// on a CONNECTION that stated no preference at all.
     pub fn backend(&self, allow_http: bool) -> StorageBackend {
         let azure_cred = match (self.account_key.as_deref(), self.sas_token.as_deref()) {
             (Some(account_key), None) => Some(AdlsCred::AccountKey(account_key.to_string())),
@@ -241,7 +247,7 @@ impl StorageCreds {
             secret_key: self.secret_key.clone(),
             session_token: self.session_token.clone(),
             allow_http,
-            path_style: self.path_style,
+            path_style: self.path_style.unwrap_or(false),
         })
     }
 }

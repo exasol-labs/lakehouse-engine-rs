@@ -2045,7 +2045,7 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         access_key: "minioadmin".into(),
         secret_key: "minioadmin".into(),
         session_token: None,
-        path_style: true,
+        path_style: Some(true),
         use_sigv4: false,
         use_vended_credentials: false,
         token: None,
@@ -3352,7 +3352,7 @@ fn sentinel_creds(use_vended_credentials: bool) -> ConnectionCreds {
         access_key: SENTINEL_ACCESS_KEY.into(),
         secret_key: SENTINEL_SECRET_KEY.into(),
         session_token: Some(SENTINEL_SESSION_TOKEN.into()),
-        path_style: true,
+        path_style: Some(true),
         use_vended_credentials,
         ..Default::default()
     }

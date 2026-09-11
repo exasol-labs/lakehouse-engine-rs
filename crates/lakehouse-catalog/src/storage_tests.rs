@@ -438,12 +438,23 @@ const S3_LOCATION: &str = "s3://bucket/db/t";
 const VENDED_AK: &str = "VENDED_ACCESS_KEY";
 const VENDED_SK: &str = "VENDED_SECRET_KEY_SENTINEL";
 
-/// The address a CONNECTION contributes. Reachable field-by-field only from
-/// inside this module, which is the point of the type's private fields.
 fn address(endpoint: &str, region: &str) -> StaticStoreAddress {
     StaticStoreAddress {
         endpoint: endpoint.to_string(),
         region: region.to_string(),
+        path_style: None,
+    }
+}
+
+fn address_with_path_style(
+    endpoint: &str,
+    region: &str,
+    path_style: Option<bool>,
+) -> StaticStoreAddress {
+    StaticStoreAddress {
+        endpoint: endpoint.to_string(),
+        region: region.to_string(),
+        path_style,
     }
 }
 
@@ -648,4 +659,150 @@ fn path_style_composes_the_vended_override_with_the_resolved_endpoint() {
             );
         }
     }
+}
+
+#[test]
+fn a_stated_connection_path_style_wins_over_the_vended_value() {
+    let endpoint = "https://minio.invalid";
+
+    let false_wins = s3_payload(
+        s3_backend(
+            vended_s3(Some(endpoint), None, Some(true)),
+            S3_LOCATION,
+            false,
+            &address_with_path_style(endpoint, "", Some(false)),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        !false_wins.path_style,
+        "a CONNECTION-stated false must beat a vended true"
+    );
+
+    let true_wins = s3_payload(
+        s3_backend(
+            vended_s3(Some(endpoint), None, Some(false)),
+            S3_LOCATION,
+            false,
+            &address_with_path_style(endpoint, "", Some(true)),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        true_wins.path_style,
+        "a CONNECTION-stated true must beat a vended false"
+    );
+}
+
+#[test]
+fn path_style_resolves_the_connection_then_the_vended_value_then_the_endpoint_derivation() {
+    let endpoint = "https://minio.invalid";
+
+    let stated_wins = s3_payload(
+        s3_backend(
+            vended_s3(Some(endpoint), None, Some(true)),
+            S3_LOCATION,
+            false,
+            &address_with_path_style(endpoint, "", Some(false)),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        !stated_wins.path_style,
+        "step 1: the CONNECTION-stated value wins"
+    );
+
+    let vended_wins = s3_payload(
+        s3_backend(
+            vended_s3(Some(endpoint), None, Some(true)),
+            S3_LOCATION,
+            false,
+            &address_with_path_style("", "", None),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        vended_wins.path_style,
+        "step 2: when the CONNECTION states nothing, the vended value wins"
+    );
+
+    let derivation = s3_payload(
+        s3_backend(
+            vended_s3(Some(endpoint), None, None),
+            S3_LOCATION,
+            false,
+            &address_with_path_style("", "", None),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        derivation.path_style,
+        "step 3: when neither states a value, endpoint-presence derivation runs (endpoint \
+         resolved, so true)"
+    );
+
+    let derivation_no_endpoint = s3_payload(
+        s3_backend(
+            vended_s3(None, None, None),
+            S3_LOCATION,
+            false,
+            &address_with_path_style("", "", None),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        !derivation_no_endpoint.path_style,
+        "step 3: when neither states a value and no endpoint resolved, derivation yields false"
+    );
+}
+
+#[test]
+fn a_stated_path_style_resolves_independently_of_the_resolved_endpoint() {
+    let stated_true_no_endpoint = s3_payload(
+        s3_backend(
+            vended_s3(None, None, None),
+            S3_LOCATION,
+            false,
+            &address_with_path_style("", "", Some(true)),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        stated_true_no_endpoint.path_style,
+        "a stated true must resolve true even when no endpoint resolved"
+    );
+
+    let stated_false_no_endpoint = s3_payload(
+        s3_backend(
+            vended_s3(None, None, None),
+            S3_LOCATION,
+            false,
+            &address_with_path_style("", "", Some(false)),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        !stated_false_no_endpoint.path_style,
+        "a stated false must resolve false even when no endpoint resolved"
+    );
+}
+
+#[test]
+fn a_stated_false_path_style_beside_a_resolved_endpoint_is_honoured() {
+    let endpoint = "https://minio.invalid";
+
+    let props = s3_payload(
+        s3_backend(
+            vended_s3(Some(endpoint), None, None),
+            S3_LOCATION,
+            false,
+            &address_with_path_style(endpoint, "", Some(false)),
+        )
+        .expect("resolves"),
+    );
+    assert!(
+        !props.path_style,
+        "a CONNECTION-stated false must be honoured even when an endpoint resolved (the \
+         derivation would have yielded true)"
+    );
 }
