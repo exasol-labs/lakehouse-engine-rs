@@ -107,10 +107,10 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
 3. It downloads the `lakehouse-engine.tar.gz` release, pinned or latest, and uploads the engine
    file. On a BucketFS target it uses `exapump bucketfs cp`. On a SaaS target it uses a
    presigned-URL exchange.
-4. It creates the schema (`LHVS` by default) and its three scripts: `LAKEHOUSE_ADAPTER`,
-   `LAKEHOUSE_SCAN`, and `LAKEHOUSE_DISTRIBUTE_FILES`.
-5. It runs a fingerprint smoke test. The test checks that the uploaded file matches the
-   registered SLC.
+4. It creates the schema (`LHVS` by default) and its four scripts: `LAKEHOUSE_ADAPTER`,
+   `LAKEHOUSE_SCAN`, `LAKEHOUSE_VERSION`, and `LAKEHOUSE_DISTRIBUTE_FILES`.
+5. It runs a version smoke test. The test calls `LAKEHOUSE_VERSION()` and checks that the
+   returned value exactly matches the release it downloaded.
 6. It stops there and prints a `CONNECTION` and `CREATE VIRTUAL SCHEMA` template for you to edit.
    It creates no dataset-specific object itself.
 
@@ -390,6 +390,11 @@ EMITS (...) AS
 %udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
 /
 
+CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_VERSION()
+RETURNS VARCHAR(100) AS
+%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so
+/
+
 CREATE OR REPLACE LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES(files VARCHAR(2000000))
 EMITS (files VARCHAR(2000000)) AS
 function run(ctx)
@@ -406,26 +411,44 @@ end
 - `files` is the per-shard file list.
 
 `EMITS (...)` is a placeholder. The adapter supplies concrete output columns per query.
-`LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough. It does the cross-node `GROUP BY shard_key`
-fan-out before the scalar scan.
+`LAKEHOUSE_VERSION` takes no arguments and returns the compiled engine version as a plain
+`X.Y.Z` string. It reads no CONNECTION, no catalog, and no object storage, and it can be called
+standalone with no Virtual Schema. `LAKEHOUSE_DISTRIBUTE_FILES` is a pure passthrough. It does
+the cross-node `GROUP BY shard_key` fan-out before the scalar scan.
 
-All three scripts MUST be in the same schema as `LAKEHOUSE_ADAPTER`, here `LHVS`. The adapter
-qualifies its calls with its own running-script schema, not with a configured property.
+The adapter, scan, and distributor scripts MUST be in the same schema as `LAKEHOUSE_ADAPTER`,
+here `LHVS`: the adapter calls them schema-qualified, using its own running-script schema, not a
+configured property. `LAKEHOUSE_VERSION` carries no such constraint — it needs no adapter and no
+Virtual Schema — but this installer still creates it alongside the other three for convenience.
 
-## Appendix: fingerprint smoke test by hand
+## Appendix: version smoke test by hand
 
-The [one-line command](#install-with-one-command) already runs this test for you. Run it
-yourself only after [create the scripts by hand](#appendix-create-the-scripts-by-hand).
+The [one-line command](#install-with-one-command) already runs this test for you: it compares the
+returned value against the release it downloaded and aborts on any mismatch. Run it yourself only
+after [create the scripts by hand](#appendix-create-the-scripts-by-hand).
 
-This test needs no catalog credentials. It checks that the `.so` loaded and that its build
-matches the SLC. After a manual upload, run this test:
+This test needs no catalog credentials, no CONNECTION, and no Virtual Schema. After a manual
+upload, run:
 
 ```sql
-SELECT LHVS.LAKEHOUSE_SCAN('x', 'y') EMITS (r VARCHAR(2000000)) FROM (SELECT 1);
+SELECT LHVS.LAKEHOUSE_VERSION();
 ```
 
+- A plain `X.Y.Z` string, for example `0.45.0`, means the `.so` loaded and its build matches the
+  SLC. Compare it against the release you installed; a value that does not match means the wrong
+  artifact was uploaded.
 - `F-UDF-CL-RUST-9001: Fingerprint mismatch: expected <sdk>:rustc_<ver>, found <sdk>:rustc_<ver>`
-  means that the registered SLC and this project's `exasol-udf-sdk` / `exasol-udf-macros` version
-  do not match. Check the installed SLC again.
-- Any other error, for example a scan-spec deserialization error, means that the versions match.
-  The placeholder arguments are not a valid scan spec. This error is expected.
+  means the registered SLC and this project's `exasol-udf-sdk` / `exasol-udf-macros` version do
+  not match. Check the installed SLC again.
+- Any other error means the call itself failed — for example the schema, the script, or the `.so`
+  object does not exist yet. Check the error text for the underlying cause.
+
+## Appendix: query the deployed version
+
+`LAKEHOUSE_VERSION()` is not only a smoke test. It is a standalone diagnostic query an operator
+can run at any time, against any schema hosting the scripts, to confirm which engine build is
+live — independent of any Virtual Schema, dataset, or catalog:
+
+```sql
+SELECT LHVS.LAKEHOUSE_VERSION();
+```

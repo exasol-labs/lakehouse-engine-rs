@@ -155,11 +155,36 @@ case "$sql" in
       exit 1
     fi
     exit 0 ;;
-  *"LAKEHOUSE_SCAN('x', 'y')"*)
+  # Matched on the ALIAS, not on a bare LAKEHOUSE_VERSION(): the bare form also appears inside the
+  # version DDL, which must keep falling through to the CREATE branch below.
+  *"LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"*)
     case "${EXAPUMP_SMOKE_MODE:-pass}" in
-      mismatch) echo "F-UDF-CL-RUST-9001: Fingerprint mismatch: expected 0.20.3:rustc_1.94, found 0.19.0:rustc_1.90" >&2; exit 1 ;;
-      anomaly)  echo "R"; echo "some-unexpected-row"; exit 0 ;;
-      *)        echo "F-UDF-CL-RUST-9001: error deserializing scan spec: expected value at line 1 column 1" >&2; exit 1 ;;
+      fingerprint-mismatch)
+        echo "F-UDF-CL-RUST-9001: Fingerprint mismatch: expected 0.20.3:rustc_1.94, found 0.19.0:rustc_1.90" >&2
+        exit 1 ;;
+      version-mismatch)
+        echo "[connected to stub]"
+        echo "LAKEHOUSE_ENGINE_VERSION"
+        echo "9.9.9"
+        echo "1 row in set"
+        exit 0 ;;
+      empty-version)
+        echo "[connected to stub]"
+        echo "LAKEHOUSE_ENGINE_VERSION"
+        echo "1 row in set"
+        exit 0 ;;
+      other-error)
+        echo "Error: connection to database lost" >&2
+        exit 1 ;;
+      # Derived from the release tag the curl stub serves, so a GH_ENGINE_TAG override stays
+      # consistent with the version the installer resolves and expects.
+      *)
+        echo "[connected to stub]"
+        echo "LAKEHOUSE_ENGINE_VERSION"
+        tag="${GH_ENGINE_TAG:-$STUB_DEFAULT_ENGINE_TAG}"
+        echo "${tag#v}"
+        echo "1 row in set"
+        exit 0 ;;
     esac ;;
   *"CREATE "*)
     if [[ "${EXAPUMP_DDL_FAIL:-0}" == "1" ]]; then echo "Error: object creation failed" >&2; exit 1; fi
@@ -221,7 +246,7 @@ else
       # GET /repos/<repo>/releases/latest -> {"tag_name": "...", ...}
       case "$url" in
         *language-container-rs*) printf '{\n  "tag_name": "%s",\n  "name": "slc"\n}\n' "${GH_SLC_TAG:-v0.21.0}" ;;
-        *)                       printf '{\n  "tag_name": "%s",\n  "name": "engine"\n}\n' "${GH_ENGINE_TAG:-v0.26.3}" ;;
+        *)                       printf '{\n  "tag_name": "%s",\n  "name": "engine"\n}\n' "${GH_ENGINE_TAG:-$STUB_DEFAULT_ENGINE_TAG}" ;;
       esac
       exit 0 ;;
     */Cargo.toml)
@@ -357,6 +382,10 @@ ENGINE_TARBALL_GOOD="$SANDBOX/engine-good.tar.gz"
 ENGINE_TARBALL_BAD="$SANDBOX/engine-bad.tar.gz"
 tar -czf "$ENGINE_TARBALL_GOOD" -C "$SANDBOX/fixture-good" udf
 tar -czf "$ENGINE_TARBALL_BAD" -C "$SANDBOX/fixture-bad" other
+
+# The release tag the curl stub serves as `releases/latest`, and the tag the exapump stub derives
+# its reported version from. Exported, not plain: both stubs run as separate processes on RUN_PATH.
+export STUB_DEFAULT_ENGINE_TAG="v0.26.3"
 
 write_local_deployment_fixture() {
   local dir="$1"
@@ -955,10 +984,10 @@ test_saas_verify_listed_quoted_match() {
   assert_eq "exact match: still verifies a real upload" "yes" "$exact_match"
 }
 
-test_three_scripts_ddl_saas_path_types() {
-  echo "== test_three_scripts_ddl_saas_path_types =="
+test_four_scripts_ddl_saas_path_types() {
+  echo "== test_four_scripts_ddl_saas_path_types =="
   # Unit: DDL string shapes.
-  local scan dist adapter schema
+  local scan dist adapter version schema
   scan="$( source "$INSTALLER"; ddl_scan LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
   assert_contains "scan is RUST SCALAR" "$scan" "RUST SCALAR SCRIPT"
   assert_contains "scan uses dynamic EMITS" "$scan" "EMITS (...)"
@@ -967,8 +996,13 @@ test_three_scripts_ddl_saas_path_types() {
   assert_contains "distribute is LUA SET" "$dist" "LUA SET SCRIPT"
   adapter="$( source "$INSTALLER"; ddl_adapter LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
   assert_contains "adapter references SaaS %udf_object path" "$adapter" "/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so"
+  version="$( source "$INSTALLER"; ddl_version LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
+  assert_contains "version is RUST SCALAR" "$version" "RUST SCALAR SCRIPT"
+  assert_contains "version RETURNS VARCHAR(100)" "$version" "RETURNS VARCHAR(100)"
+  assert_not_contains "version is never EMITS" "$version" "EMITS"
+  assert_contains "version references the same %udf_object path" "$version" "/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so"
 
-  # Integration: the three scripts are actually created + CREATE SCHEMA IF NOT EXISTS.
+  # Integration: all four scripts are actually created + CREATE SCHEMA IF NOT EXISTS.
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "ddl: install succeeds" "$LAST_RC"
@@ -977,31 +1011,147 @@ test_three_scripts_ddl_saas_path_types() {
   assert_contains "ddl: LAKEHOUSE_ADAPTER RUST ADAPTER" "$log" "RUST ADAPTER SCRIPT LHVS.LAKEHOUSE_ADAPTER"
   assert_contains "ddl: LAKEHOUSE_SCAN RUST SCALAR" "$log" "RUST SCALAR SCRIPT LHVS.LAKEHOUSE_SCAN"
   assert_contains "ddl: dynamic EMITS on scan" "$log" "EMITS (...)"
+  assert_contains "ddl: LAKEHOUSE_VERSION RUST SCALAR" "$log" "RUST SCALAR SCRIPT LHVS.LAKEHOUSE_VERSION"
+  assert_contains "ddl: LAKEHOUSE_VERSION RETURNS VARCHAR(100)" "$log" "RETURNS VARCHAR(100)"
   assert_contains "ddl: DISTRIBUTE_FILES LUA SET" "$log" "LUA SET SCRIPT LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "ddl: uses CREATE OR REPLACE" "$log" "CREATE OR REPLACE"
+  assert_not_contains "next-step template: no CONNECTION grant for LAKEHOUSE_VERSION" "$LAST_OUT" "FOR SCRIPT LHVS.LAKEHOUSE_VERSION"
 }
 
-test_fingerprint_smoke_pass_and_fail() {
-  echo "== test_fingerprint_smoke_pass_and_fail =="
+test_version_smoke_pass_and_fail() {
+  echo "== test_version_smoke_pass_and_fail =="
   reset_env
   export EXAPUMP_SMOKE_MODE=pass
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "smoke pass: install succeeds" "$LAST_RC"
-  assert_contains "smoke pass: reported passed" "$LAST_OUT" "Fingerprint smoke test passed"
+  assert_contains "smoke pass: reported passed" "$LAST_OUT" "Version smoke test passed"
+  # Also proves STUB_DEFAULT_ENGINE_TAG reaches the stub processes: without the export both the
+  # served tag and the reported version go empty, and the two would still agree.
+  assert_contains "smoke pass: names the version the served release tag resolves to" \
+    "$LAST_OUT" "LAKEHOUSE_VERSION() reports ${STUB_DEFAULT_ENGINE_TAG#v}"
 
   reset_env
-  export EXAPUMP_SMOKE_MODE=mismatch
+  export EXAPUMP_SMOKE_MODE=version-mismatch
   run_file "${HAPPY_ARGS[@]}"
-  assert_rc_nonzero "smoke mismatch: nonzero exit" "$LAST_RC"
-  assert_contains "smoke mismatch: reports fingerprint failure" "$LAST_OUT" "fingerprint smoke test FAILED"
-  assert_contains "smoke mismatch: remediation mentions SLC alignment" "$LAST_OUT" "SLC"
-  assert_not_contains "smoke mismatch: does not print success" "$LAST_OUT" "query-ready"
+  assert_rc_nonzero "smoke version-mismatch: nonzero exit" "$LAST_RC"
+  assert_contains "smoke version-mismatch: reports version failure" "$LAST_OUT" "version smoke test FAILED"
+  assert_contains "smoke version-mismatch: names the expected version" "$LAST_OUT" "${STUB_DEFAULT_ENGINE_TAG#v}"
+  assert_contains "smoke version-mismatch: names the reported version" "$LAST_OUT" "9.9.9"
+  assert_not_contains "smoke version-mismatch: does not print success" "$LAST_OUT" "query-ready"
 
   reset_env
-  export EXAPUMP_SMOKE_MODE=anomaly
+  export EXAPUMP_SMOKE_MODE=fingerprint-mismatch
   run_file "${HAPPY_ARGS[@]}"
-  assert_rc_nonzero "smoke anomaly: nonzero exit" "$LAST_RC"
-  assert_contains "smoke anomaly: surfaces the anomaly" "$LAST_OUT" "anomaly"
+  assert_rc_nonzero "smoke fingerprint-mismatch: nonzero exit" "$LAST_RC"
+  assert_contains "smoke fingerprint-mismatch: reports fingerprint failure" "$LAST_OUT" "fingerprint smoke test FAILED"
+  assert_contains "smoke fingerprint-mismatch: remediation mentions SLC alignment" "$LAST_OUT" "SLC"
+  assert_not_contains "smoke fingerprint-mismatch: does not print success" "$LAST_OUT" "query-ready"
+
+  reset_env
+  export EXAPUMP_SMOKE_MODE=other-error
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_nonzero "smoke other-error: nonzero exit" "$LAST_RC"
+  assert_contains "smoke other-error: surfaces the underlying database error" "$LAST_OUT" "connection to database lost"
+
+  # A query that succeeds but yields no data line: the reported value is empty and must still be
+  # rendered visibly in the failure message.
+  reset_env
+  export EXAPUMP_SMOKE_MODE=empty-version
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_nonzero "smoke empty-version: nonzero exit" "$LAST_RC"
+  assert_contains "smoke empty-version: renders the empty reported value as a placeholder" "$LAST_OUT" "<empty>"
+
+  # A verdict matching no arm must abort: an unmatched `case` evaluates to 0, and the `esac` is
+  # run_smoke_test's last statement, so falling through would report an unverified install as good.
+  reset_env
+  local out rc
+  # shellcheck disable=SC2317  # both overrides are reached indirectly, from the sourced run_smoke_test
+  out="$(
+    source "$INSTALLER"
+    run_sql() { printf 'LAKEHOUSE_ENGINE_VERSION\n0.45.0\n'; }
+    classify_version_smoke() { :; }
+    run_smoke_test 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "smoke unclassifiable verdict: run_smoke_test fails" "$rc"
+  assert_contains "smoke unclassifiable verdict: reports an internal error" "$out" "internal error"
+}
+
+test_version_smoke_query_and_extraction() {
+  echo "== test_version_smoke_query_and_extraction =="
+  local sql value
+
+  sql="$( source "$INSTALLER"; version_smoke_sql LHVS )"
+  assert_eq "version_smoke_sql: aliased single-column projection over the schema's version script" \
+    "SELECT LHVS.LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION" "$sql"
+
+  # A version value begins with a digit, so the extractor must NOT drop digit-leading lines the way
+  # extract_query_value does -- it drops the row-count footer by its own suffix instead.
+  value="$( source "$INSTALLER"; extract_version_value "0.45.0" )"
+  assert_eq "extract_version_value: a bare version value survives" "0.45.0" "$value"
+
+  value="$( source "$INSTALLER"; extract_version_value "$(printf 'LAKEHOUSE_ENGINE_VERSION   \n0.45.0\n')" )"
+  assert_eq "extract_version_value: a header carrying trailing whitespace is still skipped" "0.45.0" "$value"
+
+  value="$( source "$INSTALLER"; extract_version_value "$(printf '[connected to stub]\nLAKEHOUSE_ENGINE_VERSION\n\n  0.45.0  \n1 row in set\n')" )"
+  assert_eq "extract_version_value: banner, blank line and footer are skipped, value is trimmed" "0.45.0" "$value"
+
+  value="$( source "$INSTALLER"; extract_version_value "$(printf '[connected to stub]\nLAKEHOUSE_ENGINE_VERSION\n0 rows in set\n')" )"
+  assert_eq "extract_version_value: a plural row-count footer yields no value" "" "$value"
+
+  value="$( source "$INSTALLER"; extract_version_value "$(printf 'Error: connection to database lost\n')" )"
+  assert_eq "extract_version_value: an error line yields no value" "" "$value"
+
+  # Integration: the verification issues the aliased version query and no scan call.
+  reset_env
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "version query: install succeeds" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_contains "version query: the executed verification SQL is the aliased version query" \
+    "$log" "SELECT LHVS.LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
+  # The scan DDL declares LAKEHOUSE_SCAN(common ...), so only a literal argument marks a CALL.
+  assert_not_contains "version query: no scan script is called" "$log" "LAKEHOUSE_SCAN('"
+}
+
+# The only test that drives --deployment through main(): run_smoke_test is called from main() after
+# the Exasol Personal ssh branch, which every other Personal test bypasses by calling
+# deploy_personal_local / resolve_deployment_transport directly.
+test_version_smoke_runs_on_the_deployment_path() {
+  echo "== test_version_smoke_runs_on_the_deployment_path =="
+  reset_env
+  local fake_home dep_name saved_home
+  fake_home="$(mktemp -d "$SANDBOX/dep-home.XXXXXX")"
+  dep_name="personal-db"
+  # DEPLOYMENT_ROOT derives from $HOME and takes no environment override, so the fixture has to
+  # land under a sandboxed HOME.
+  write_local_deployment_fixture "$fake_home/.exasol/personal/deployments/$dep_name"
+  export GH_ASSET_TARBALL="$ENGINE_TARBALL_GOOD"
+  saved_home="$HOME"
+  export HOME="$fake_home"
+  run_file --deployment "$dep_name" --arch x86_64
+  export HOME="$saved_home"
+
+  assert_rc_zero "deployment path: the install succeeds end to end" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_contains "deployment path: the version smoke test still runs" \
+    "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
+}
+
+test_docs_describe_version_verification() {
+  echo "== test_docs_describe_version_verification =="
+  local doc ci
+  doc="$(<"$REPO_ROOT/docs/install.md")"
+  assert_contains "docs: by-hand appendix carries the version script DDL" \
+    "$doc" "CREATE OR REPLACE RUST SCALAR SCRIPT LHVS.LAKEHOUSE_VERSION()"
+  assert_contains "docs: the version script DDL declares RETURNS VARCHAR(100)" "$doc" "RETURNS VARCHAR(100)"
+  assert_contains "docs: the by-hand check is the version query" "$doc" "SELECT LHVS.LAKEHOUSE_VERSION();"
+  assert_not_contains "docs: no placeholder scan call is presented as a check" "$doc" "LAKEHOUSE_SCAN('x', 'y')"
+
+  # ci.yml uses the bare word "fingerprint" for the unrelated SDK and build-cache fingerprints, so
+  # only the exact phrase names the removed verification.
+  ci="$(<"$REPO_ROOT/.github/workflows/ci.yml")"
+  assert_not_contains "ci.yml: no job comment still names a fingerprint smoke test" "$ci" "fingerprint smoke test"
+  assert_contains "ci.yml: the install-script-e2e job names the version entry point" "$ci" "LAKEHOUSE_VERSION"
 }
 
 test_stops_at_product_prints_template() {
@@ -1115,7 +1265,7 @@ test_stdin_piped_invocation_no_body_consumption() {
   reset_env
   run_stdin "${HAPPY_ARGS[@]}"
   assert_rc_zero "stdin-piped: install succeeds without truncation" "$LAST_RC"
-  assert_contains "stdin-piped: reaches the smoke-test pass" "$LAST_OUT" "Fingerprint smoke test passed"
+  assert_contains "stdin-piped: reaches the smoke-test pass" "$LAST_OUT" "Version smoke test passed"
   assert_contains "stdin-piped: reaches the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   local log; log="$(log_content)"
   # If any subprocess had consumed the piped body, execution would truncate before these.
@@ -1123,7 +1273,7 @@ test_stdin_piped_invocation_no_body_consumption() {
   assert_contains "stdin-piped: release asset downloaded (releases/download)" "$log" "releases/download/"
   assert_contains "stdin-piped: SLC uploaded (body not truncated early)" "$log" "/files/rustslc.tar.gz"
   assert_contains "stdin-piped: three scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
-  assert_contains "stdin-piped: smoke-test SQL executed (reached end)" "$log" "LAKEHOUSE_SCAN('x', 'y')"
+  assert_contains "stdin-piped: smoke-test SQL executed (reached end)" "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
 
   # Per-subprocess proof that stdin is redirected from /dev/null: run in file mode with a sentinel
   # payload on the installer's OWN stdin, and make every stub report if it read any stdin. A
@@ -1566,7 +1716,7 @@ test_bucketfs_full_run_artifact_shapes() {
   reset_env
   run_file_bfs "${BFS_HAPPY_ARGS[@]}"
   assert_rc_zero "bfs run: install succeeds" "$LAST_RC"
-  assert_contains "bfs run: reaches the smoke-test pass" "$LAST_OUT" "Fingerprint smoke test passed"
+  assert_contains "bfs run: reaches the smoke-test pass" "$LAST_OUT" "Version smoke test passed"
   assert_contains "bfs run: reaches the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   local log; log="$(log_content)"
 
@@ -1651,7 +1801,7 @@ test_skip_slc_gating() {
   # ... while everything downstream of the SLC still runs.
   assert_contains "skip-slc bfs: engine .so still uploaded" "$log" "extracted/udf/liblakehouse_engine.so udf/liblakehouse_engine.so"
   assert_contains "skip-slc bfs: DDL still created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
-  assert_contains "skip-slc bfs: smoke test still run" "$log" "LAKEHOUSE_SCAN('x', 'y')"
+  assert_contains "skip-slc bfs: smoke test still run" "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
   assert_contains "skip-slc bfs: still prints the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   # The SLC VERSION is still resolved and reported, so the user can see what the DB must already have.
   assert_contains "skip-slc bfs: SLC version still reported" "$LAST_OUT" "Resolved language-container (SLC) version"
@@ -2483,8 +2633,11 @@ main() {
   test_presigned_url_json_unescaping
   test_release_asset_download_via_rest
   test_saas_verify_listed_quoted_match
-  test_three_scripts_ddl_saas_path_types
-  test_fingerprint_smoke_pass_and_fail
+  test_four_scripts_ddl_saas_path_types
+  test_version_smoke_pass_and_fail
+  test_version_smoke_query_and_extraction
+  test_version_smoke_runs_on_the_deployment_path
+  test_docs_describe_version_verification
   test_stops_at_product_prints_template
   test_target_base_default_and_override
   test_external_failure_actionable
