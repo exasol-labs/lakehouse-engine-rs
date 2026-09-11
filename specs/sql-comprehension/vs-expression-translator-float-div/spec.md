@@ -7,6 +7,13 @@ decimal operands (issue #186). The verbatim-exclusion table in
 `sql-comprehension/vs-expression-translator-scalar-fns` also references this feature: `FLOAT_DIV` is
 an operator wire name, not an Exasol function name, so it never joins that table's verbatim rule.
 
+The DataFusion-dialect rendering now also owns the divide-by-zero outcome. Issue #370 measured a
+pushed `FLOAT_DIV` by zero inside a `WHERE` predicate returning a silently wrong row count, because
+the infinity `x/0` produces is consumed inside DataFusion's comparison and never reaches the emit
+boundary that rejects it in projection position. The dialect therefore renders a checked division
+call instead of the `/` operator, so the zero divisor raises at the point of division in every
+position rather than only where the value happens to reach an emit-time check.
+
 ## Background
 
 A conversion or operator node is translated only when its DataFusion 54 result matches Exasol's to
@@ -95,44 +102,110 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   `SELECT 9007199254740993/2` returns `4503599627370496.5`, because Exasol constant-folds the literal
   in exact arithmetic. Over a `DECIMAL(18,0)` COLUMN — the only path pushdown can reach — Exasol
   returns `4503599627370496.0`, identical to the cast form. There is no reachable divergence here.
-* **Division by zero: `x/0` still fails the query, `0/0` reaches the pre-existing NaN-at-emit gap.**
-  Measured live end-to-end. Native Exasol raises `data exception - division by zero` (SQL state
-  `22012`) for every operand pairing including `DOUBLE/DOUBLE`, and never returns NULL or infinity.
-  Post-fix the scan produces `±Inf`, which the Exasol ENGINE rejects at the emit boundary
-  (`numeric value out of range: value inf ... is not in [ -1.7976e+308 .. 1.7976e+308 ]`, SQL state
-  `22002`) — so the query fails either way and no wrong value is returned; pre-fix it failed too,
-  with `Arrow error: Divide by zero error` (also `22002`). `0/0` is different: it yields `NaN`, and
-  the raw-scan `emit_batch` path carries no per-value check, so Exasol receives a silent NULL where
-  it would natively have errored. That is the already-tracked NaN-at-emit gap (`#246`), reachable
-  today without any cast for a `DOUBLE`-typed numerator (verified live) — the fix widens its
-  reachability to integer and decimal numerators rather than creating a new class of defect. The
-  partial-aggregate path errors correctly on the same `NaN` through `arrow_value_at`'s check, which
-  is exactly the inconsistency `#246` records.
-* **The emit boundary is the wrong place to close the remaining gap.** `arrow_value_at` tests only
-  `is_nan()`, and widening it to `!is_finite()` would not help: the boundary cannot distinguish a
-  COMPUTED non-finite value from one legitimately STORED in the source table — Iceberg types these
-  columns "64-bit IEEE 754 floating point", Delta "8-byte double-precision floating-point numbers",
-  and Parquet `DOUBLE` admits `±Inf` and `NaN` — so such a check would break reading a table that
-  legitimately contains them. A predicate-position division by zero never reaches that boundary at
-  all.
-* **Neither table-format specification constrains this.** Checked per CLAUDE.md against the Apache
-  Iceberg table spec and the Delta Lake protocol: the words "division", "divisor" and "arithmetic"
-  appear nowhere normatively in either document, and neither defines expression result types. They
-  fix only the STORED operand domain and the widening relation over it — Iceberg
-  `#### Primitive Types` gives `int` "32-bit signed integers", `long` "64-bit signed integers",
-  `double` "64-bit IEEE 754 floating point", `decimal(P,S)` "Fixed-point decimal; precision P,
-  scale S" / "Scale is fixed, precision must be 38 or less", and its `#### Schema Evolution` permits
-  only `int`→`long`, `float`→`double` and `decimal(P, S)`→`decimal(P', S)` "if `P' > P`" / "Widen
-  precision only"; Delta's `§ Schema Serialization Format` gives `integer` "4-byte signed integer",
-  `long` "8-byte signed integer", `double` "8-byte double-precision floating-point numbers",
-  `decimal` "signed decimal number with fixed precision ... The precision and scale can be up to
-  38.", and its `§ Type Widening` additionally permits "`Byte`, `Short` or `Int` -> `Double`" and
-  "`Byte`, `Short` or `Int` -> `Decimal(10 + k1, k2)` where `k1 >= k2 >= 0`". So the operand Arrow
-  type reaching this operator is legitimately any of `Int32`/`Int64`/`Decimal128`/`Float32`/
-  `Float64`, and on Delta it can CHANGE between table versions — a further argument for an
-  unconditional, type-blind cast over any type-conditional rendering. There is no format-spec
-  deviation to fix or track here; how a query engine computes and types a division is outside both
-  specifications.
+* **Division by zero is a rendering-layer problem, not an emit-layer one (issue #370).** The
+  measured behaviour before this change had three different outcomes for the same user error.
+  A projected `x/0` produced `±Inf` and failed at the emit boundary with `numeric value out of
+  range: value inf ... is not in [ -1.7976e+308 .. 1.7976e+308 ]` (SQL state `22002`). A projected
+  `0/0` produced `NaN` and the raw-scan `emit_batch` path returned a silent `NULL`. A `x/0` inside a
+  `WHERE` predicate never reached any emit-time check at all, so the comparison consumed the
+  infinity and the query succeeded with a wrong row count. Issue #370 measured every row of that
+  table live on `exasol/docker-db:2025.2.1`, with each pushed filter confirmed from the `filter`
+  field of the `EXPLAIN VIRTUAL` `PUSHDOWN_SQL` ScanSpec: over the 20-row `FACT_LINEITEM` fixture,
+  `(0 < (CAST("L_ORDERKEY" AS DOUBLE) / ("L_LINENUMBER" - "L_LINENUMBER")))` returned 20 of 20 rows,
+  the same shape with `< 0` returned 0 of 20, and the `0/0` shape returned 0 of 20 for `> 0` and 20
+  of 20 for `< 0`. Native Exasol raises `data exception - division by zero` (SQL state `22012`) for
+  every one of these shapes, in predicate position exactly as in projection position. The single
+  common cause is that the operator `/` decides what to do about a zero divisor, and the operator
+  has no way to fail.
+* **The fix moves the decision into a function the crate names, so one rendering owns all three
+  outcomes.** The DataFusion dialect renders `vs_checked_float_div(<left>, <right>)`. The function
+  coerces both operands to `Float64`, divides, propagates NULL, and RAISES when its own result is
+  not finite. Every position gets the same outcome from the same check, because the check sits where
+  the division happens rather than where a value happens to be consumed. This also removes the
+  `CAST(<left> AS DOUBLE)` wrapper: the function owns the always-`DOUBLE` coercion for BOTH operands,
+  so keeping a SQL-level cast for one of them would state the same decision in two places.
+* **Rejecting a computed non-finite result carries none of the risk that ruled out the emit-boundary
+  fix.** `arrow_value_at`'s check cannot distinguish a COMPUTED non-finite value from one
+  legitimately STORED in the source table, which is why widening it from `is_nan()` to
+  `!is_finite()` was rejected and remains rejected. `vs_checked_float_div` has no such ambiguity: it
+  sees only the two operands of a division the pushdown itself synthesised, and it raises on the
+  result of that division, never on a value read straight out of a column. A plain
+  `SELECT <double_col>` over a table that stores `NaN` or `±Inf` reaches no checked division and is
+  untouched by this feature.
+* **The one named trade-off is a stored non-finite operand.** When a source column legitimately
+  stores `±Inf` or `NaN` and the user divides it, the result is not finite and the checked division
+  raises. This is deliberate and it is consistent with what already happens: the same value in a
+  projection already fails at the emit boundary with `22002`, because Exasol admits no non-finite
+  `DOUBLE` at all (`CAST('inf' AS DOUBLE)` and `CAST('nan' AS DOUBLE)` are rejected at `22018`,
+  `1E400` at `22003`). A value Exasol cannot represent must not become a silent comparison result
+  either. See the format-specification bullet below for why this is an Exasol target-type limit
+  rather than an Iceberg or Delta deviation.
+* **The error is raised only for a row whose division the scan evaluates.** DataFusion may not
+  evaluate the division for a row that another conjunct, file pruning, row-group pruning, or a
+  LIMIT already removed. Whether native Exasol raises for such a row is NOT measured. What follows
+  from the design, and is the point of the fix, is that the returned rows never disagree with
+  Exasol: a row reaches the result only when its division was evaluated and finite. The residual is
+  therefore scoped to error-raising alone, never to row content, and is tracked as a separate
+  issue rather than left unstated `(#392)`. The divergence runs in both directions.
+  DataFusion 54.1 may also evaluate the division for a row an adjacent conjunct already excluded,
+  so a query that succeeds today can raise after this change. That direction is part of the same
+  tracked exception, and the next bullet states its mechanism.
+* **A guarded division is not protected by its guard, and the protection that does exist is
+  batch-selectivity dependent.** `datafusion-physical-expr` 54.1 defines
+  `PRE_SELECTION_THRESHOLD: f32 = 0.2` in `src/expressions/binary.rs` and applies it in
+  `check_short_circuit`. For an `AND`, that function returns `ReturnLeft` when the left conjunct is
+  all-false over the batch, `ReturnRight` when it is all-true, and a pre-selection filter only when
+  the left conjunct's true ratio is at or below 0.2. Above that ratio it returns no strategy and
+  `BinaryExpr::evaluate` evaluates the right conjunct over the FULL batch, including rows the left
+  conjunct excluded. A null in the left conjunct disables the strategy entirely. Nothing protects a
+  division that sits in the LEFT conjunct at all. So `WHERE <d> <> 0 AND <n> / <d> > 0` can raise
+  after this change even though every surviving row has a non-zero divisor, and whether it raises
+  depends on per-batch selectivity and on conjunct order. Task 1.2 measures native Exasol's own
+  behaviour for the guarded shape, in both conjunct orders, because CLAUDE.md forbids assuming it.
+  This over-raise direction is part of the same tracked exception `(#392)`.
+* **The `0/0` NaN route into `#246` closes; `#246` itself stays open.** A `0/0` now raises at the
+  checked division and never reaches `emit_batch`, so the widening this feature previously recorded
+  against `#246` is withdrawn. `#246` continues to cover every other way a `NaN` reaches the
+  raw-scan emit boundary, including an out-of-domain math kernel and a stored `NaN`, and this
+  feature MUST NOT be read as closing it.
+* **The NaN ordering issue #370 reported is out of scope here, and is tracked separately.** Issue
+  #370 also observed that `NaN < -1E300` matched all 20 rows while `NaN > 1E300` matched none, and
+  states that the mechanism was not investigated. After this change a pushed `FLOAT_DIV` can no
+  longer produce a `NaN`, so #370's own reproducer no longer reaches that behaviour. Comparison
+  semantics for a `NaN` READ FROM a column remain unmeasured and unspecified, and are recorded as a
+  tracked exception rather than a silent gap `(#393)`.
+* **The checked division covers `FLOAT_DIV` alone, and every other pushed function that can produce
+  a non-finite value keeps the gap this fix closes.** `crates/lakehouse-engine/src/adapter/capabilities.rs`
+  advertises `FN_SQRT`, `FN_LN`, `FN_LOG`, `FN_ACOS`, `FN_ASIN`, `FN_EXP`, `FN_POWER`, and `FN_MOD`,
+  each of which the translator renders into a pushed predicate and each of which can yield `NaN` or
+  `±Inf`. `WHERE SQRT(<negative_col>) > 0` reproduces issue #370's mechanism exactly, because the
+  comparison consumes the non-finite value inside the scan and no emit-boundary check ever sees it.
+  This plan fixes the `FLOAT_DIV` producer only. The remaining producers are recorded as a tracked
+  exception rather than a silent gap `(#394)`.
+* **Neither table-format specification constrains this, and the trade-off above is a target-type
+  limit rather than a deviation.** Re-checked per CLAUDE.md against the Apache Iceberg table spec
+  (https://iceberg.apache.org/spec/) and the Delta Lake protocol
+  (https://github.com/delta-io/delta/blob/master/PROTOCOL.md). Both fix only the STORED operand
+  domain. Iceberg `#### Primitive Types` gives `float` "32-bit IEEE 754 floating point" and `double`
+  "64-bit IEEE 754 floating point"; Delta `## Primitive Types` gives `float` "Single precision
+  (32-bit) IEEE 754 floating point number" and `double` "Double precision (64-bit) IEEE 754
+  floating point number". Neither document defines expression result types, and the words
+  "division", "divisor" and "arithmetic" appear nowhere normatively in either. Iceberg does
+  anticipate a stored `NaN`: its field-level statistics rules state "NaNs are not permitted as lower
+  or upper bounds" and its manifest `field_summary` carries a `nan_value_counts` entry. That is the
+  reason the trade-off above is named. Exasol has no non-finite `DOUBLE`, so a stored `±Inf` or `NaN`
+  is unreadable through this engine whether or not it passes through a division. Per CLAUDE.md, a
+  deviation driven by an Exasol target-type limitation is not a gap for either specification, and it
+  is named here as a deliberate trade-off. Nothing in this feature changes how a stored `float` or
+  `double` value is decoded, pruned, or projected, so no reader requirement of either specification
+  is touched. The earlier widening relations remain accurate and unaffected: Iceberg
+  `#### Schema Evolution` permits `int`→`long`, `float`→`double` and `decimal(P, S)`→`decimal(P', S)`
+  "if `P' > P`", and Delta `§ Type Widening` additionally permits "`Byte`, `Short` or `Int` ->
+  `Double`" and "`Byte`, `Short` or `Int` -> `Decimal(10 + k1, k2)` where `k1 >= k2 >= 0`", so the
+  operand Arrow type reaching this operator is legitimately any of
+  `Int32`/`Int64`/`Decimal128`/`Float32`/`Float64` and on Delta it can CHANGE between table versions.
+  That is a further argument for one type-blind checked-division function over any type-conditional
+  rendering.
 
 ## Scenarios
 
@@ -142,21 +215,23 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
 * *AND* Exasol's `FN_FLOAT_DIV` always performs true float division and always results in `DOUBLE`, for every operand-type combination — verified live against the Docker Exasol container: `7/2 = 3.5` (NOT `3`), `CAST(711.56 AS DECIMAL(18,2))/CAST(7 AS DECIMAL(18,0)) = 101.65142857142857` at full double precision (NOT scale-capped), and a CTAS over each operand pairing types the result column `DOUBLE` in `EXA_ALL_COLUMNS`
 * *AND* the translator carries no operand-type context of its own, so it cannot render one shape for integer operands and another for decimal or double operands
 * *WHEN* the node is rendered through the DataFusion-dialect entry points (`render_expression`, `render_expression_safe`, `render_df_filter_safe`) — the ones whose output DataFusion's SQL frontend parses inside the scan UDF
-* *THEN* the translator SHALL return `(CAST(<left> AS DOUBLE) / <right>)`, casting the LEFT operand unconditionally and leaving the right operand as rendered
+* *THEN* the translator SHALL return `vs_checked_float_div(<left>, <right>)`, a call to the single checked-division function the crate declares, with both operands rendered recursively and neither wrapped in a CAST
+* *AND* the function name SHALL be exported from `crates/vs-expression` as one public constant that the rendering itself reads, so the name has ONE owner and the scan crate that registers the function cannot drift from the crate that emits it
+* *AND* that constant's documentation SHALL state the full contract the registered implementation MUST satisfy: two arguments, both coerced to `Float64`, a `Float64` result, NULL propagated, and an error raised when the result is not finite
 * *AND* it MUST NOT return the bare `(<left> / <right>)`, which DataFusion evaluates by operand type and which returned silently wrong values on every row for all three operand classes, each reproduced live through the local virtual schema against a native-table oracle: `L_ORDERKEY / L_LINENUMBER` at `(7, 2)` gave `3.0` against `3.5`; `C_DECIMAL_A / 7` at `40.99` gave `5.855714` against `5.855714285714286`; `C_DECIMAL_A / C_DECIMAL_B` (`DECIMAL(9,2)/DECIMAL(20,4)`) gave `0.000102` against `0.000102474999897525`; and `COUNT(*) WHERE L_ORDERKEY / L_LINENUMBER > 3 AND L_ORDERKEY = 7` gave `1` against `2` — a truncated quotient changes row counts as well as values (issue #186)
+* *AND* it MUST NOT return `(CAST(<left> AS DOUBLE) / <right>)` either, the shape this feature previously specified: it fixes the truncation but leaves the `/` operator deciding the zero-divisor outcome, which is issue #370
 * *AND* decimal/decimal division SHALL NOT be treated as an already-correct control case: DataFusion's `Decimal128(24,6)` quotient is correct only when both operands carry few enough significant digits that scale 6 loses none
-* *AND* casting only the LEFT operand SHALL suffice for every operand-type combination the two lakehouse formats can present, verified on DataFusion 54.1 / arrow 58.3 for `Int64÷Int64`, `Decimal128÷Int64`, `Int64÷Decimal128`, `Decimal128÷Decimal128` and `Float64÷Float64` — each plans, executes, and yields `Float64`, `Float64 ÷ Decimal128` included, and the cast is a semantic no-op when the left operand is already `DOUBLE`, so no operand type needs excluding; the translator MUST NOT cast both operands, which would add a redundant no-op cast to every rendering
-* *AND* the target type SHALL be spelled `DOUBLE`, reusing the single mapping `render_cast_target` already applies to a `DOUBLE`/`DOUBLE PRECISION` CAST node, so the spelling has ONE owner in the crate rather than a second independently-maintained copy; Exasol's own parser accepts that bare spelling too
+* *AND* the rendering SHALL stay type-blind and unconditional, correct for every operand-type combination the two lakehouse formats can present — `Int64`, `Decimal128`, `Float32` and `Float64` on either side, in any pairing — because the called function, not the SQL text, performs the coercion
 * *AND* NULL SHALL propagate unchanged — a NULL left operand, a NULL right operand, and a NULL left operand over a zero right operand each yield NULL, not an error and not `NaN`
-* *AND* the resulting `Float64` column SHALL match the `DOUBLE PRECISION` EMITS type the adapter declares for the item from Exasol's own `selectListDataTypes` — live-confirmed as `{"type":"DOUBLE"}` with `"emit_exa_types":["DOUBLE PRECISION"]` — so the emit-boundary type coercion keeps the column on its zero-copy fast path instead of casting a truncated `Int64`/`Decimal128` column up into a `DOUBLE` column, the mechanism that made the pre-fix integer quotient surface as `3.0` rather than as `3`
+* *AND* the resulting `Float64` column SHALL match the `DOUBLE PRECISION` EMITS type the adapter declares for the item from Exasol's own `selectListDataTypes` — live-confirmed as `{"type":"DOUBLE"}` with `"emit_exa_types":["DOUBLE PRECISION"]` — so the emit-boundary type coercion keeps the column on its zero-copy fast path
 * *AND* parity against native Exasol SHALL be asserted as bit-exact for an integer (scale-0) numerator and as equal within ~1 ULP for a non-zero-scale decimal numerator, because Exasol's own decimal division is not bit-identical to converting the numerator to `DOUBLE` first — over a `DECIMAL(18,2)` column, 3335 rows × divisors `{2,3,7,11,13}`, 1027 results (31%) differed by exactly one ULP, max relative difference `3.17e-16`, while the same sweep over `DECIMAL(p,0)/DECIMAL(p,0)` was bit-exact at 0 of 3335 — so an oracle comparison for a decimal-numerator shape MUST use a relative tolerance, never string equality
 
 ### Scenario: The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator
 
 * *GIVEN* the same `function_scalar` node named `FLOAT_DIV`
 * *WHEN* the node is rendered through the Exasol-dialect entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) — the ones whose output Exasol's own core engine parses
-* *THEN* the translator SHALL return the bare `(<left> / <right>)`, UNCHANGED from the pre-fix rendering, because Exasol's `/` IS `FN_FLOAT_DIV` and already divides as `DOUBLE` for every operand type, so the cast would add Exasol-facing SQL that changes nothing
-* *AND* the two dialects SHALL therefore DIVERGE on the same `FLOAT_DIV` node — `(CAST(<l> AS DOUBLE) / <r>)` in the DataFusion dialect, `(<l> / <r>)` in the Exasol dialect — and the existing both-dialects identity guard for arithmetic operators SHALL be RETARGETED to assert this divergence rather than deleted, so the divergence stays pinned by a test (the same treatment the CHAR CAST divergence received in `sql-comprehension/vs-expression-translator-cast`)
+* *THEN* the translator SHALL return the bare `(<left> / <right>)`, UNCHANGED from every earlier revision of this feature, because Exasol's `/` IS `FN_FLOAT_DIV`: it already divides as `DOUBLE` for every operand type AND it already raises `22012` on a zero divisor, so it needs neither the cast nor the checked call
+* *AND* the two dialects SHALL therefore DIVERGE on the same `FLOAT_DIV` node — `vs_checked_float_div(<l>, <r>)` in the DataFusion dialect, `(<l> / <r>)` in the Exasol dialect — and the existing divergence guard SHALL be RETARGETED to assert this pair rather than deleted, so the divergence stays pinned by a test (the same treatment the CHAR CAST divergence received in `sql-comprehension/vs-expression-translator-cast`)
 * *AND* every Exasol-dialect consumer's SQL SHALL stay byte-identical — the qualified single-table wrapper, the N-scan join wrapper, the grouped merge, the single-group scalar-over-aggregate merge (`render_scalar_over_merge`, which calls `render_expression_exasol`), and the self-applied WHERE path — so both `dispatch_golden` fixtures carrying a translated `FLOAT_DIV` (`single_group_scalar_over_aggregate_dedup.sql`, `single_group_scalar_over_aggregate_interleaved.sql`) MUST remain unchanged, and a diff in either is a regression rather than an expected update
 * *AND* the `/` characters in the AVG and statistical merge fragments (`scalar_over_agg.rs`'s `SUM(<partial>) / NULLIF(SUM(<partial>), 0)` and the König–Huygens numerator) SHALL be unaffected in both dialects, because they are adapter-authored merge SQL that never passes through the translator's `FLOAT_DIV` arm
 
@@ -164,22 +239,42 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
 
 * *GIVEN* a pushed-down `FLOAT_DIV` whose right operand evaluates to zero for at least one scanned row, the numerator being non-zero
 * *AND* native Exasol raises `data exception - division by zero` (SQL state `22012`) for every operand pairing including `DOUBLE/DOUBLE`, verified live and column-driven so nothing is constant-folded, and never returns NULL and never returns infinity
-* *WHEN* the DataFusion-dialect rendering `(CAST(<left> AS DOUBLE) / <right>)` is evaluated in the scan and the result is projected
-* *THEN* the scan SHALL produce `±Infinity`, and the Exasol ENGINE SHALL reject it at the emit boundary with `numeric value out of range: value inf ... is not in [ -1.7976e+308 .. 1.7976e+308 ]` (SQL state `22002`), so the query FAILS and MUST NOT return a wrong value
-* *AND* this SHALL be recorded as an accepted message-and-SQL-state divergence, NOT a correctness regression: the pre-fix rendering also failed the same query at `22002`, with `Arrow error: Divide by zero error`, so the query-fails-either-way outcome is unchanged by this feature; only the text and the raising layer differ from Exasol's `22012`
-* *AND* Exasol SHALL be understood to admit no non-finite `DOUBLE` at all — `CAST('inf' AS DOUBLE)`, `CAST('Infinity' AS DOUBLE)` and `CAST('nan' AS DOUBLE)` are each rejected at `22018`, and `1E400` at `22003` — which is why an infinity cannot silently reach a result set through the projection path
+* *WHEN* the DataFusion-dialect rendering `vs_checked_float_div(<left>, <right>)` is evaluated in the scan and the result is projected
+* *THEN* the checked division SHALL raise, the scan SHALL fail, and the surfaced message SHALL name the cause as a division by zero
+* *AND* the query SHALL NOT return a wrong value and SHALL NOT return NULL for the affected row
+* *AND* this SHALL be recorded as a NARROWED, still-accepted divergence rather than parity: the query failed before this change too, at `22002` with `numeric value out of range: value inf ...`, so the outcome (a failed query) is unchanged and only the message and the raising layer move — the raising layer moves from the Exasol engine's emit-boundary range check to the scan's own division, and the message moves from an infinity complaint to Exasol's own vocabulary
+* *AND* the SQL state the Exasol engine attaches to the scan UDF's error SHALL be RECORDED from the live run rather than assumed, because the raising layer changed
+* *AND* Exasol SHALL be understood to admit no non-finite `DOUBLE` at all — `CAST('inf' AS DOUBLE)`, `CAST('Infinity' AS DOUBLE)` and `CAST('nan' AS DOUBLE)` are each rejected at `22018`, and `1E400` at `22003` — which is why raising at the division is the only outcome consistent with what Exasol can represent
 
-### Scenario: Zero divided by zero reaches the tracked NaN-at-emit gap
+### Scenario: A division by zero inside a filter predicate fails the query rather than changing the row count
+
+* *GIVEN* a pushed-down `FLOAT_DIV` by zero inside a `WHERE` filter predicate, the shape issue #370 measured live over the 20-row `FACT_LINEITEM` fixture with each pushed filter read out of the `EXPLAIN VIRTUAL` `PUSHDOWN_SQL` ScanSpec
+* *AND* native Exasol raises `data exception - division by zero` (SQL state `22012`) for this shape in predicate position exactly as in projection position, verified live against the inline-literal-subquery native oracle `native_lineitem_oracle` builds in `e2e_scan_test.rs`
+* *WHEN* the pushed filter is evaluated in the scan
+* *THEN* the checked division SHALL raise and the query SHALL FAIL, in both comparison directions and for both the `x/0` and the `0/0` shape
+* *AND* it MUST NOT succeed with a row count that disagrees with native Exasol, the pre-fix behaviour: `(0 < (CAST("L_ORDERKEY" AS DOUBLE) / ("L_LINENUMBER" - "L_LINENUMBER")))` returned 20 of 20 rows, the same shape with `< 0` returned 0 of 20, the `0/0` shape returned 0 of 20 for `> 0` and 20 of 20 for `< 0`, and a `DOUBLE`-typed numerator reached the same wrong counts with no cast involved at all
+* *AND* the same outcome SHALL hold for a broadcast-join fact-leg filter, the second position issue #370 measured: with the conjunct landing in the fact leg as `((DATE '2024-01-05' <= "O_ORDERDATE") AND (0 < (CAST("O_ORDERKEY" AS DOUBLE) / ("O_CUSTKEY" - "O_CUSTKEY"))))` and `EXPLAIN VIRTUAL` confirming broadcast is retained (a `"join":{` common blob, no `LHS_T0` two-scan wrapper), the join path SHALL add no divergence of its own, exactly as it added none before the fix
+* *AND* the raising SHALL come from the same single checked-division function the projection path uses, so the two positions cannot drift apart again
+* *AND* a NULL divisor SHALL still yield NULL and SHALL NOT raise, so `WHERE <a> / NULL > 0` returns no rows rather than failing
+* *AND* the error SHALL be raised only for a row whose division the scan actually evaluates: DataFusion MAY skip the division for a row that another conjunct, file pruning, row-group pruning, or a LIMIT already removed, and whether native Exasol raises for such a row is NOT measured, so the residual is scoped to error-raising alone and recorded as a tracked exception `(#392)`
+* *AND* the rows a successful query returns SHALL NOT be affected by that residual: a row reaches the result only when its division was evaluated and finite, so a query that does not raise returns exactly the rows native Exasol returns
+* *AND* a GUARDED division, the concrete shape `WHERE (L_LINENUMBER - 1) <> 0 AND 0 < L_ORDERKEY / (L_LINENUMBER - 1)` and its reversed conjunct order — a divisor that is zero on only half the 20-row fixture, so the guard actually excludes rows rather than the identically-zero `(L_LINENUMBER - L_LINENUMBER)` shape task 1.1 measures — was MEASURED live against a native Exasol oracle by task 1.2, rather than assumed, because a guard does NOT prevent the checked division from raising and this is the one shape where a query that succeeds today can start failing. `LHVS.GT_LINEITEM_SCAN` does not exist in the test harness, so the oracle used the same inline-literal-subquery pattern the other `float_div` oracles in `e2e_scan_test.rs` already use: the 20-row `L_ORDERKEY` (1 to 10) × `L_LINENUMBER` (1, 2) cross product the fixture seeds. `EXPLAIN VIRTUAL` `PUSHDOWN_SQL` confirmed both conjuncts reach the scan in ONE pushed filter for each conjunct order — guard-first: `(((\"L_LINENUMBER\" - 1) <> 0) AND (0 < (CAST(\"L_ORDERKEY\" AS DOUBLE) / (\"L_LINENUMBER\" - 1))))`; guard-second: `((0 < (CAST(\"L_ORDERKEY\" AS DOUBLE) / (\"L_LINENUMBER\" - 1))) AND ((\"L_LINENUMBER\" - 1) <> 0))`. Pre-fix, the pushed-down GUARDED query returned `10` rows in BOTH conjunct orders, against `20` for the identical divisor with the guard removed (the UNGUARDED shape) — the guard is shown to actually remove the ten zero-divisor rows. Native Exasol raised `data exception - division by zero` (SQL state `22012`) for the UNGUARDED shape (a genuine division by zero, unlike DataFusion's pre-fix `x/0 = +Inf` rendering), and returned `10`, WITHOUT raising, for the GUARDED shape in BOTH conjunct orders — so pre-fix, native Exasol's own guard already protects the division regardless of textual conjunct order, and `10` is therefore the row count the post-fix checked division must also return for the GUARDED shape whenever it does not raise
+* *AND* the mechanism SHALL be recorded as batch-selectivity dependence rather than as a stable property: `datafusion-physical-expr` 54.1 defines `PRE_SELECTION_THRESHOLD: f32 = 0.2` in `src/expressions/binary.rs`, and `check_short_circuit` returns a pre-selection filter for an `AND` only when the left conjunct's true ratio over the batch is at or below that threshold, returns `ReturnLeft` when the left conjunct is all-false, returns `ReturnRight` when it is all-true, and otherwise lets `BinaryExpr::evaluate` evaluate the right conjunct over the FULL batch including the rows the left conjunct excluded
+* *AND* a division sitting in the LEFT conjunct SHALL be understood to have NO protection at all from this mechanism, and a null in the left conjunct SHALL be understood to disable it entirely, so conjunct order and per-batch data both change the outcome
+* *AND* this over-raise direction SHALL be covered by the SAME tracked exception as the suppression direction `(#392)`, because both are the same underlying fact: the error is a per-row side effect of an expression DataFusion is free to evaluate over a row set of its own choosing
+* *AND* the POST-FIX outcome for that same guarded shape SHALL be recorded from a live run rather than inferred from native Exasol's, because the two differ: with divisor `(L_LINENUMBER - 1)` over the 20-row fixture, GUARD FIRST (`(L_LINENUMBER - 1) <> 0 AND 0 < L_ORDERKEY / (L_LINENUMBER - 1)`) returns 10 rows WITHOUT raising, matching native Exasol, while DIVISION FIRST (the reversed conjunct order) RAISES `data exception - division by zero` where native Exasol returns 10 rows. The over-raise is therefore real, conjunct-order dependent, and covered by `(#392)`
+* *AND* the protection the guard-first order does get SHALL be attributed to the mechanism that actually provides it, which was MEASURED: the Parquet ROW FILTER evaluates the pushed conjuncts in the textual order `split_conjunction` produces, and narrows the row selection as it goes, so the division never sees a zero divisor. That textual order is a consequence of one config default, not a DataFusion guarantee: `datafusion.execution.parquet.reorder_filters` defaults to `false` (`datafusion-common` 54.1 `src/config.rs`) and `session_config_for_spec` leaves the key unset. Enabling the key makes `datafusion-datasource-parquet` 54.1 `row_filter.rs` sort the split conjuncts by `required_bytes` instead, which puts the one-column guard ahead of the two-column division in BOTH conjunct orders and removes the DIVISION FIRST raise the clause above records. It is NOT `check_short_circuit`, which at this fixture's 0.5 true ratio — above `PRE_SELECTION_THRESHOLD = 0.2` — would evaluate the division over the full batch and raise in BOTH orders. This is why the checked division MUST stay `Immutable`: a `Volatile` declaration would keep it out of the row filter and lose the only protection a guarded division has
+
+### Scenario: Zero divided by zero fails the query instead of reaching the NaN-at-emit gap
 
 * *GIVEN* a pushed-down `FLOAT_DIV` whose numerator AND denominator both evaluate to zero for a scanned row
-* *WHEN* the DataFusion-dialect rendering is evaluated and the result is projected through the raw-scan path
-* *THEN* DataFusion SHALL produce `NaN`, and because the raw-scan path emits Arrow IPC bytes through `ctx.emit_batch` with no per-value check, Exasol SHALL receive a silent `NULL` where it would natively have raised `22012` — verified live, the query succeeded and returned NULL for every such row
-* *AND* this SHALL be recorded as a WIDENING of the already-tracked NaN-at-emit gap `(#246)`, not as a new class of defect: the same silent NULL is reachable TODAY with no cast involved whenever the numerator column is already `DOUBLE`-typed (verified live for `(L_EXTENDEDPRICE - L_EXTENDEDPRICE) / (L_LINENUMBER - L_LINENUMBER)`), and this feature only extends that reachability to integer and decimal numerators
-* *AND* the partial-aggregate path SHALL keep erroring correctly on the same `NaN` through `arrow_value_at`'s `is_nan()` check (`numeric value out of range: NaN result from an out-of-domain math operation`), so the two emit paths disagree on identical input — which is precisely the inconsistency `#246` records and MUST NOT be re-tracked as a second issue by this feature
-* *AND* this feature MUST NOT close the gap by widening `arrow_value_at`'s check from `is_nan()` to `!is_finite()`, because that boundary cannot distinguish a COMPUTED non-finite value from one legitimately STORED in the source table — Iceberg and Delta both type these columns IEEE-754 `double` and Parquet `DOUBLE` admits `±Inf` and `NaN` — so such a check would break reading a table that legitimately contains them
-* *AND* this feature MUST NOT close the gap by rendering `NULLIF(<right>, 0)` either: NULL is exactly the wrong answer already being observed, it makes a genuine zero divisor indistinguishable from a NULL divisor, and it would additionally suppress the `x/0` case that currently fails loudly
-* *AND* a division by zero in a PREDICATE position SHALL be treated as a distinct, VERIFIED-DIVERGENT case, measured live in both the single-table predicate position and the broadcast-join leg: an infinity compared against a bound never reaches the emit boundary, so `WHERE <a> / <b> > <k>` SILENTLY admits or rejects rows (observed 20 of 20, or 0 of 20) where native Exasol raises `22012` — the fix converts a loud `22002` failure into a silent wrong row count, and the join path adds no divergence of its own
-* *AND* this SHALL be recorded as a WIDENING of an already-reachable predicate-position gap, NOT a newly introduced defect: the same silent divergence is reachable TODAY with no cast involved whenever the numerator column is already `DOUBLE`-typed. It is tracked as issue `#370`, DISTINCT from `#246` — `#246` covers a projected-value NaN-to-NULL divergence at the emit boundary, whereas `#370` covers a predicate row-count divergence that never reaches emit
+* *WHEN* the DataFusion-dialect rendering is evaluated, in projection position or in predicate position
+* *THEN* the checked division SHALL raise, because `0.0 / 0.0` is `NaN` and `NaN` is not finite, and the query SHALL fail with the same division-by-zero message as any other zero divisor — matching native Exasol, which raises `22012` for this shape too
+* *AND* the projected `0/0` SHALL NO LONGER return a silent NULL: the pre-fix raw-scan path emitted Arrow IPC bytes through `ctx.emit_batch` with no per-value check, and Exasol received NULL for every such row (verified live), which this feature now prevents by raising before the value is ever emitted
+* *AND* the WIDENING of `#246` that this feature previously recorded SHALL be WITHDRAWN: a pushed `FLOAT_DIV` can no longer produce a `NaN` at all, so it is no longer a route into that gap for any numerator type
+* *AND* `#246` SHALL remain OPEN and MUST NOT be treated as closed by this feature: it continues to cover every other `NaN` that reaches the raw-scan emit boundary, including an out-of-domain math kernel and a `NaN` stored in the source table, and it continues to record that `arrow_value_at` errors on the partial-aggregate path where `emit_batch` does not
+* *AND* this feature MUST NOT close the remaining `#246` surface by widening `arrow_value_at`'s check from `is_nan()` to `!is_finite()`, because that boundary still cannot distinguish a COMPUTED non-finite value from one legitimately STORED in the source table — Iceberg types the column "64-bit IEEE 754 floating point", Delta "Double precision (64-bit) IEEE 754 floating point number", and Parquet `DOUBLE` admits `±Inf` and `NaN` — so such a check would break reading a table that legitimately contains them
+* *AND* this feature MUST NOT close the gap by rendering `NULLIF(<right>, 0)` either: NULL is exactly the wrong answer already observed, it makes a genuine zero divisor indistinguishable from a NULL divisor, and it would suppress the loud failure the `x/0` case already produces
 
 ### Scenario: FLOAT_DIV stays outside the verbatim rule in both dialects
 
@@ -187,5 +282,6 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
 * *AND* `FLOAT_DIV` declared with the dialect-shaped form rather than the verbatim form, alongside `ADD`, `SUB`, `MULT`, and `NEG`
 * *WHEN* the sweep test renders every declared name through `render_expression_exasol` and compares it against that name's declared expectation
 * *THEN* `FLOAT_DIV` SHALL keep its shaped declaration and MUST NOT be moved to the verbatim form, because Exasol has no function called `FLOAT_DIV` — a verbatim rendering would emit `FLOAT_DIV(<l>, <r>)`, which Exasol rejects the same way it rejects `SIGNUM` and `STRPOS` (`function or script <NAME> not found`, SQL code 42000)
-* *AND* the sweep's Exasol-dialect expectation for `FLOAT_DIV` SHALL remain the bare `(<l> / <r>)` — unchanged by issue #186's fix, which adds the `CAST(... AS DOUBLE)` wrapper on the DataFusion side only
-* *AND* the sweep's banned-token list SHALL continue to catch a DataFusion-only spelling leaking into an Exasol-parsed fragment, and `CAST` MUST NOT be added to that list, since `CAST` is valid Exasol SQL that the CAST scenarios legitimately emit in the Exasol dialect
+* *AND* the sweep's Exasol-dialect expectation for `FLOAT_DIV` SHALL remain the bare `(<l> / <r>)` — unchanged by issue #186's fix and unchanged by issue #370's, both of which act on the DataFusion side only
+* *AND* the sweep's banned-token list SHALL GAIN the checked-division function name, because Exasol has no such function and a leak of that name into an Exasol-parsed fragment would fail at 42000 exactly as `SIGNUM` and `STRPOS` do — this is the first `FLOAT_DIV`-related token that belongs on the list
+* *AND* `CAST` MUST still NOT be added to that list, since `CAST` is valid Exasol SQL that the CAST scenarios legitimately emit in the Exasol dialect
