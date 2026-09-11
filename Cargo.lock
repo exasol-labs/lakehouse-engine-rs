@@ -3167,7 +3167,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-catalog"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.45.0"
+version = "0.46.0"
 dependencies = [
  "aes-gcm",
  "anyhow",

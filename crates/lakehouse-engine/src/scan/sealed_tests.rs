@@ -10,7 +10,7 @@ const SEALING_PASSWORD: &str = r#"{"warehouse":"wh","secret_key":"S3CR3TV4LU3"}"
 fn creds_without_key_material() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "wh".into(),
-        path_style: true,
+        path_style: Some(true),
         ..Default::default()
     }
 }

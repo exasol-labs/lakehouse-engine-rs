@@ -95,6 +95,7 @@ fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Res
     validate_sigv4_creds(name, creds)?;
     validate_exclusive_catalog_auth_creds(name, creds)?;
     validate_oauth2_creds(name, creds)?;
+    validate_path_style_with_endpoint(name, creds)?;
     Ok(())
 }
 
@@ -217,6 +218,25 @@ fn validate_oauth2_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfE
         ))),
         _ => Ok(()),
     }
+}
+
+/// A non-vended CONNECTION that names a store `endpoint` but states no
+/// `path_style` is rejected rather than defaulted.
+///
+/// `path_style` gates whether [`StorageCreds::backend`] uses the endpoint at
+/// all, not only how it addresses a bucket: an absent value resolves to
+/// `false`, and `false` discards `endpoint` in favor of a derived AWS host.
+/// Silently defaulting a CONNECTION that already names a working endpoint
+/// would turn it into a wrong-host read instead of a clear, named error.
+fn validate_path_style_with_endpoint(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    if !creds.endpoint.is_empty() && creds.path_style.is_none() && !creds.use_vended_credentials {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies a storage endpoint but states no path_style; \
+             an absent path_style resolves to false, which discards the endpoint and \
+             derives an AWS host from region instead — set path_style to true or false"
+        )));
+    }
+    Ok(())
 }
 
 fn supplied_azure_fields(creds: &ConnectionCreds) -> Vec<&'static str> {

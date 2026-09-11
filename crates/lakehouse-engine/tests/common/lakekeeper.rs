@@ -509,7 +509,7 @@ pub fn lakekeeper_host_connection_creds(warehouse_name: &str, vended: bool) -> C
         access_key: password.access_key,
         secret_key: password.secret_key,
         session_token: password.session_token,
-        path_style: password.path_style,
+        path_style: Some(password.path_style),
         use_sigv4: password.use_sigv4,
         use_vended_credentials: password.use_vended_credentials,
         token: password.token,

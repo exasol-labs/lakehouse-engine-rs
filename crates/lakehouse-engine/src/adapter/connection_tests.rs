@@ -30,7 +30,8 @@ fn minimal_password() -> String {
         "endpoint": "http://s3.example.com",
         "region": "us-east-1",
         "access_key": "AKID",
-        "secret_key": "SECRET"
+        "secret_key": "SECRET",
+        "path_style": true
     })
     .to_string()
 }
@@ -53,8 +54,7 @@ fn read_connection_parses_uri_and_creds() {
     assert_eq!(resolved.creds.session_token, None);
     assert!(!resolved.creds.use_sigv4);
     assert!(!resolved.creds.use_vended_credentials);
-    // path_style defaults to true (MinIO behaviour preserved)
-    assert!(resolved.creds.path_style);
+    assert_eq!(resolved.creds.path_style, Some(true));
 }
 
 // ---------------------------------------------------------------------------
@@ -216,6 +216,11 @@ fn optional_fields_default() {
         !creds.use_vended_credentials,
         "use_vended_credentials must default to false"
     );
+
+    assert_eq!(
+        creds.path_style, None,
+        "path_style must default to unstated, not a resolved value"
+    );
 }
 
 #[test]
@@ -237,7 +242,7 @@ fn optional_fields_set_when_supplied() {
     let creds = &resolved.creds;
 
     assert_eq!(creds.session_token.as_deref(), Some("STS_TOKEN"));
-    assert!(!creds.path_style);
+    assert_eq!(creds.path_style, Some(false));
     assert!(creds.use_sigv4);
     assert!(creds.use_vended_credentials);
 }
@@ -416,9 +421,137 @@ fn absent_optional_fields_default_and_still_select_s3() {
         assert_eq!(resolved.creds.sas_token, None);
         assert_eq!(
             storage_block(&resolved.creds, false),
-            StorageBackend::S3(StorageProps::default())
+            StorageBackend::S3(StorageProps {
+                path_style: false,
+                ..Default::default()
+            }),
+            "a CONNECTION stating no storage field at all leaves path_style unstated, \
+             which resolves to false"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: path_style tri-state — one selector serves both readers, and a
+// non-vended endpoint without a stated preference is rejected rather than
+// silently defaulted.
+// ---------------------------------------------------------------------------
+
+/// The adapter-side reader (`ConnectionCreds` -> `StorageCreds::from` ->
+/// `backend`) and the scan-side reader (`StorageCreds::from_json` ->
+/// `backend`) must derive a field-for-field equal backend from the SAME
+/// password, including when it omits `path_style` entirely.
+#[test]
+fn both_readers_derive_an_equal_backend_from_a_password_omitting_path_style() {
+    let password = serde_json::json!({
+        "warehouse": "wh",
+        "endpoint": "http://s3.example.com",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "use_vended_credentials": true,
+    });
+
+    let adapter_side = storage_block(&parse_creds(&password), false);
+    let scan_side = lakehouse_catalog::StorageCreds::from_json(&password).backend(false);
+
+    assert_eq!(adapter_side, scan_side);
+    assert_eq!(
+        adapter_side,
+        StorageBackend::S3(StorageProps {
+            endpoint: "http://s3.example.com".into(),
+            region: "us-east-1".into(),
+            access_key: "AKID".into(),
+            secret_key: "SECRET".into(),
+            path_style: false,
+            ..Default::default()
+        })
+    );
+}
+
+/// A non-vended CONNECTION that names a storage endpoint but states no
+/// `path_style` is rejected, naming the field, rather than silently resolved.
+#[test]
+fn endpoint_without_a_stated_path_style_is_rejected_naming_the_field() {
+    let password = serde_json::json!({
+        "warehouse": "wh",
+        "endpoint": "http://s3.example.com",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+    })
+    .to_string();
+    let ctx = with_conn("http://catalog.example.com", &password);
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect_err("an endpoint without a stated path_style must be rejected");
+    assert!(err.to_string().contains("path_style"), "{err}");
+}
+
+/// Either explicit value beside an endpoint is accepted — the guard fires
+/// only on an unstated preference, never on a stated one.
+#[test]
+fn an_explicit_path_style_beside_an_endpoint_is_accepted_under_either_value() {
+    for path_style in [true, false] {
+        let password = serde_json::json!({
+            "warehouse": "wh",
+            "endpoint": "http://s3.example.com",
+            "region": "us-east-1",
+            "access_key": "AKID",
+            "secret_key": "SECRET",
+            "path_style": path_style,
+        })
+        .to_string();
+        let ctx = with_conn("http://catalog.example.com", &password);
+
+        read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap_or_else(|err| {
+            panic!("an explicit path_style={path_style} beside an endpoint must be accepted: {err}")
+        });
+    }
+}
+
+/// The guard is scoped to "endpoint present, path_style absent, vending off":
+/// it must not fire when there is no endpoint at all, nor when vending is
+/// enabled even though the endpoint would otherwise trigger it.
+#[test]
+fn the_path_style_guard_does_not_fire_without_an_endpoint_or_under_vending() {
+    let no_endpoint = serde_json::json!({ "warehouse": "wh" }).to_string();
+    let ctx = with_conn("http://catalog.example.com", &no_endpoint);
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("no endpoint at all must not trigger the path_style guard");
+
+    let endpoint_with_vending = serde_json::json!({
+        "warehouse": "wh",
+        "endpoint": "http://s3.example.com",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "use_vended_credentials": true,
+    })
+    .to_string();
+    let ctx = with_conn("http://catalog.example.com", &endpoint_with_vending);
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("an endpoint under vending must not trigger the path_style guard");
+}
+
+/// The rejection message names no credential value.
+#[test]
+fn the_path_style_rejection_names_no_credential_value() {
+    let password = serde_json::json!({
+        "warehouse": "wh",
+        "endpoint": "http://s3.example.com",
+        "region": "us-east-1",
+        "access_key": "AKID_SENTINEL",
+        "secret_key": "SECRET_SENTINEL",
+    })
+    .to_string();
+    let ctx = with_conn("http://catalog.example.com", &password);
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect_err("an endpoint without a stated path_style must be rejected")
+        .to_string();
+    assert!(!err.contains("AKID_SENTINEL"), "{err}");
+    assert!(!err.contains("SECRET_SENTINEL"), "{err}");
 }
 
 /// A single well-formed credential set (S3 XOR Azure) together with
@@ -524,7 +657,11 @@ fn storage_block_falls_through_to_s3_for_an_unvalidated_azure_shape() {
     for creds in [both_credentials, no_account_name] {
         assert_eq!(
             storage_block(&creds, false),
-            StorageBackend::S3(StorageProps::default())
+            StorageBackend::S3(StorageProps {
+                path_style: false,
+                ..Default::default()
+            }),
+            "neither fixture states path_style, which resolves to false"
         );
     }
 }
