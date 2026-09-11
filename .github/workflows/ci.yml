@@ -418,11 +418,12 @@ jobs:
   # ── install script: real end-to-end run against a live BucketFS Exasol ──
   # Proves the BucketFS target (Exasol AsApp/Docker/on-premise all speak the same
   # BucketFS HTTP interface) against a REAL Exasol, using a REAL prior
-  # release fetched through the authenticated GitHub API — exactly what a
+  # release fetched through the authenticated GitHub API, on a runner with NO
+  # install.sh prereq preinstalled (not even exapump) — exactly what a
   # user's one-liner does. Does not depend on build-so / this PR's own .so:
-  # this job tests the INSTALLER's mechanics (exapump bucketfs upload, DDL,
-  # SCRIPT_LANGUAGES registration, version smoke test), not query
-  # correctness — that's already covered by `e2e` / `e2e-lakekeeper`.
+  # this job tests the INSTALLER's mechanics (exapump auto-install, bucketfs
+  # upload, DDL, SCRIPT_LANGUAGES registration, version smoke test), not
+  # query correctness — that's already covered by `e2e` / `e2e-lakekeeper`.
   # ponytail: only the `exasol` compose service is started (no MinIO/Iceberg
   # REST/Spark fixtures) — this job never queries a Virtual Schema, so it
   # doesn't need catalog/object-storage services. SaaS mode has no CI job:
@@ -451,28 +452,50 @@ jobs:
       - name: Start stack (Exasol only)
         run: docker compose up -d --wait exasol
 
-      - name: Install exapump
-        run: curl -fsSL https://raw.githubusercontent.com/exasol-labs/exapump/main/install.sh | sh
-
-      # Fresh container, so no exapump profile exists yet. Same BucketFS
-      # write-password extraction the Makefile's install-slc/bucketfs-upload-so
-      # targets already use — read straight out of EXAConf, no manual secret.
-      - name: Create exapump profile for the compose stack
+      # Deliberately NO "install exapump" step here: this runner starts with none of
+      # install.sh's prereqs beyond curl (already on ubuntu-latest), so this is the one job that
+      # actually proves the curl|bash one-liner's auto-install of exapump (see ensure_exapump in
+      # install.sh) rather than assuming it. Direct --host/--user/--password + --bfs-* flags are
+      # used instead of --profile since creating an exapump profile would itself require exapump
+      # already installed. Same BucketFS write-password extraction the Makefile's
+      # install-slc/bucketfs-upload-so targets already use — read straight out of EXAConf, no
+      # manual secret.
+      #
+      # `exapump bucketfs` itself has no fully profile-less mode: even with every --bfs-* field
+      # given explicitly, it still resolves a base profile first and bails with "No profiles
+      # found in config" if none exists (exasol-labs/exapump#46). install.sh's --host/--dsn
+      # connectivity mode never passes --profile to `exapump bucketfs`, so it hits that gap on a
+      # machine with no ~/.exapump/config.toml at all. Work around it here by seeding a single
+      # throwaway profile (auto-selected as the default since it's the only one) with dummy
+      # host/user/password -- exapump bucketfs never uses those fields, only the --bfs-*
+      # overrides given on the command line below. Drop this once #46 is fixed upstream.
+      #
+      # validate_certificate = false is NOT optional here: exapump has no --bfs-validate-certificate
+      # CLI override (install.sh's exapump_bfs_flags only ever passes --bfs-host/--bfs-port/
+      # --bfs-bucket/--bfs-write-password), so it can only come from the profile. Omitting it left
+      # this at exapump's own default (validate_certificate defaults to true when unset, same as
+      # tls) -- since the container's BucketFS endpoint serves a self-signed cert, that made every
+      # single request fail the TLS handshake, forever, not a timing race bucketfs_reachable's
+      # retries could ever get past.
+      - name: Seed a throwaway exapump profile (exasol-labs/exapump#46 workaround)
         run: |
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
+          mkdir -p "$HOME/.exapump"
+          cat > "$HOME/.exapump/config.toml" <<'TOML'
+          [ci]
+          host = "unused"
+          user = "unused"
+          password = "unused"
+          validate_certificate = false
+          TOML
+
+      - name: Run install.sh (BucketFS target, exapump not preinstalled)
+        run: |
           BFSPASS=$(docker exec lakehouse-engine-rs-exasol-1 bash -c \
             "awk '/\[\[Bucket.*default\]\]/{f=1} f&&/WritePasswd/{print \$3;exit}' /exa/etc/EXAConf | base64 -d")
-          exapump profile add ci-bucketfs \
-            --host localhost --port "${LH_EXASOL_PORT:-28563}" \
-            --user sys --password "${EXASOL_SYS_PASSWORD:-exasol}" \
-            --validate-certificate false \
+          bash deploy/scripts/install.sh \
+            --host "localhost:${LH_EXASOL_PORT:-28563}" --user sys --password "${EXASOL_SYS_PASSWORD:-exasol}" \
             --bfs-host localhost --bfs-port "${LH_BUCKETFS_PORT:-22581}" \
-            --bfs-write-password "$BFSPASS" \
-            --default
-
-      - name: Run install.sh (BucketFS target)
-        run: bash deploy/scripts/install.sh --profile ci-bucketfs
+            --bfs-write-password "$BFSPASS"
 
       - name: Dump Exasol logs on failure
         if: failure()

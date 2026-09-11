@@ -53,7 +53,10 @@ MISSING_CURL_DIR="$SANDBOX/missing-curl"
 MISSING_EXAPUMP_DIR="$SANDBOX/missing-exapump"
 MISSING_SSH_DIR="$SANDBOX/missing-ssh"
 MISSING_SCP_DIR="$SANDBOX/missing-scp"
-mkdir -p "$STUBDIR" "$MISSING_CURL_DIR" "$MISSING_EXAPUMP_DIR" "$MISSING_SSH_DIR" "$MISSING_SCP_DIR"
+AUTOINSTALL_DIR="$SANDBOX/autoinstall-exapump"
+AUTOINSTALL_TARGET_DIR="$SANDBOX/autoinstall-exapump-target"
+mkdir -p "$STUBDIR" "$MISSING_CURL_DIR" "$MISSING_EXAPUMP_DIR" "$MISSING_SSH_DIR" "$MISSING_SCP_DIR" \
+  "$AUTOINSTALL_DIR" "$AUTOINSTALL_TARGET_DIR"
 
 STUB_LOG="$SANDBOX/stub.log"
 export STUB_LOG
@@ -106,7 +109,18 @@ if [[ "${1:-}" == "bucketfs" ]]; then
       fi
       _prefix="${_pos[0]:-}"
       if [[ -z "$_prefix" ]]; then
-        # Top-level probe: always succeeds, even against an empty bucket.
+        # Top-level probe: succeeds once past EXAPUMP_BFS_TOPLEVEL_LS_DELAY misses -- simulates
+        # BucketFS's HTTP endpoint not being up yet right after the DB's SQL port opens (a
+        # separate counter file from the path-listing delay below, so both can be exercised
+        # independently in the same test).
+        _tdelay="${EXAPUMP_BFS_TOPLEVEL_LS_DELAY:-0}"
+        if [[ "$_tdelay" -gt 0 ]]; then
+          _tcf="$_state.toplevel_delay"
+          _tn=0; [[ -f "$_tcf" ]] && _tn="$(cat "$_tcf")"
+          _tn=$((_tn + 1)); printf '%s' "$_tn" > "$_tcf"
+          if [[ "$_tn" -le "$_tdelay" ]]; then exit 1; fi
+        fi
+        # Top-level probe: always succeeds past the delay, even against an empty bucket.
         if [[ -f "$_state" ]]; then
           while IFS= read -r _e; do [[ -n "$_e" ]] && printf '%s\n' "${_e%%/*}"; done < "$_state"
         fi
@@ -282,6 +296,13 @@ TOML
         fi
       fi
       exit 0 ;;
+    */exapump/main/install.sh)
+      if [[ "${EXAPUMP_AUTOINSTALL_FAIL:-0}" == "1" ]]; then
+        echo "curl: (22) The requested URL returned error: 404" >&2
+        exit 22
+      fi
+      printf '#!/bin/sh\nexit 0\n'
+      exit 0 ;;
     *)
       if [[ "${CURL_DB_UNREACHABLE:-0}" == "1" ]]; then echo "curl: (22) The requested URL returned error: 404" >&2; exit 22; fi
       printf '{"id":"stub-db","name":"stub"}\n'
@@ -347,6 +368,18 @@ done
 write_scp_stub "$MISSING_SSH_DIR"
 write_ssh_stub "$MISSING_SCP_DIR"
 unset _d _p
+
+# autoinstall-exapump dir: curl only (no exapump), plus real bash+sh so the fetched exapump
+# "installer" (env+bash-shebang curl stub piped into a real sh) actually runs, unlike the
+# maximally-bare MISSING_* dirs above whose whole point is that NOTHING beyond the probed tool
+# works. AUTOINSTALL_TARGET_DIR simulates exapump's own install.sh already having dropped a
+# working binary at $EXAPUMP_INSTALL_DIR in a prior process -- ensure_exapump's job here is only
+# to notice it and prepend it to PATH.
+write_curl_stub "$AUTOINSTALL_DIR"
+ln -sf "$BASH_BIN" "$AUTOINSTALL_DIR/bash"
+_p="$(command -v sh 2>/dev/null)" && ln -sf "$_p" "$AUTOINSTALL_DIR/sh"
+write_exapump_stub "$AUTOINSTALL_TARGET_DIR"
+unset _p
 
 RUN_PATH="$STUBDIR:$ORIG_PATH"
 
@@ -460,16 +493,17 @@ chmod 600 "$DEPLOYMENT_NODE_KEY"
 reset_env() {
   unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING GH_ASSET_TARBALL 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
-  unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY 2>/dev/null || true
+  unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY EXAPUMP_BFS_TOPLEVEL_LS_DELAY 2>/dev/null || true
   unset SSH_FAIL SCP_FAIL SSH_PATH_NEVER SSH_PATH_DELAY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
-  unset EXAPUMP_DSN STUB_REPORT_STDIN 2>/dev/null || true
+  unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
+  unset BUCKETFS_REACHABLE_TRIES BUCKETFS_REACHABLE_POLL_SECONDS 2>/dev/null || true
   # Sandboxed exapump config so profile-mode runs never touch the real ~/.exapump/config.toml.
   export EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
   RUN_PATH="$STUBDIR:$ORIG_PATH"
   : > "$STUB_LOG"
   : > "$STUB_BFS_STATE"
-  rm -f "$STUB_BFS_STATE.delay" "$STUB_SSH_STATE.delay"
+  rm -f "$STUB_BFS_STATE.delay" "$STUB_BFS_STATE.toplevel_delay" "$STUB_SSH_STATE.delay"
 }
 
 run_file() {
@@ -529,6 +563,40 @@ test_missing_prereq_fails_fast() {
   assert_rc_nonzero "missing exapump: nonzero exit" "$LAST_RC"
   assert_contains "missing exapump: names exapump" "$LAST_OUT" "exapump"
   assert_eq "missing exapump: no network/SQL call made" "" "$(log_content)"
+}
+
+test_exapump_auto_install() {
+  echo "== test_exapump_auto_install =="
+  local out rc
+
+  reset_env
+  run_file "${HAPPY_ARGS[@]}"
+  assert_rc_zero "exapump already present: install still succeeds" "$LAST_RC"
+  assert_not_contains "exapump already present: no auto-install attempted" "$LAST_OUT" "exapump/main/install.sh"
+
+  reset_env
+  RUN_PATH="$MISSING_EXAPUMP_DIR"
+  export EXAPUMP_AUTOINSTALL_FAIL=1
+  run_file --account-id ACC1 --database-id DB1 --profile staging
+  assert_rc_nonzero "auto-install fetch fails: check_prereqs still exits nonzero" "$LAST_RC"
+  assert_contains "auto-install fetch fails: names exapump" "$LAST_OUT" "exapump"
+  unset EXAPUMP_AUTOINSTALL_FAIL
+
+  reset_env
+  RUN_PATH="$AUTOINSTALL_DIR"
+  export EXAPUMP_INSTALL_DIR="$AUTOINSTALL_TARGET_DIR"
+  out="$(
+    export PATH="$RUN_PATH"
+    source "$INSTALLER"
+    TARGET_MODE=saas
+    DEPLOYMENT_TRANSPORT=""
+    check_prereqs 2>&1
+  )"
+  rc=$?
+  assert_rc_zero "auto-install succeeds: check_prereqs passes once EXAPUMP_INSTALL_DIR is found" "$rc"
+  assert_contains "auto-install succeeds: says it is installing" "$out" "installing it automatically"
+  unset EXAPUMP_INSTALL_DIR
+  return 0
 }
 
 test_connectivity_mode_either_or() {
@@ -1639,13 +1707,48 @@ test_bucketfs_reachable_preflight() {
   echo "== test_bucketfs_reachable_preflight =="
   reset_env
   export EXAPUMP_BFS_LS_FAIL=1
+  # Overrides the real ~60s (30 tries x 2s) production budget down to 3 tries x 0s: this exercises
+  # the actual full-script code path (not a direct function call), so it needs the real thing to
+  # stay fast rather than a shortcut.
+  export BUCKETFS_REACHABLE_TRIES=3 BUCKETFS_REACHABLE_POLL_SECONDS=0
   run_file_bfs "${BFS_HAPPY_ARGS[@]}"
   assert_rc_nonzero "bfs preflight: unreachable bucket exits nonzero" "$LAST_RC"
   assert_contains "bfs preflight: names the bucket" "$LAST_OUT" "bucket 'default'"
+  assert_contains "bfs preflight: names the try count" "$LAST_OUT" "3 tries"
   assert_contains "bfs preflight: points at the likely cause" "$LAST_OUT" "--bfs-host"
   assert_contains "bfs preflight: surfaces exapump's own diagnostic" "$LAST_OUT" "not reachable at stub-bfs-host"
   local log; log="$(log_content)"
   assert_not_contains "bfs preflight: fails before any release download" "$log" "releases/"
+
+  # Retry-then-hit: BucketFS's HTTP endpoint isn't up on the first two probes (a startup-ordering
+  # race against the DB's own SQL-port readiness check), the third succeeds. Direct call with
+  # sleep_seconds=0, same as the bucketfs_wait_for_path tests above, so this stays fast.
+  local out rc
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_TOPLEVEL_LS_DELAY=2
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile; ARG_BFS_BUCKET=default
+    bucketfs_reachable 5 0 2>&1
+  )"
+  rc=$?
+  assert_rc_zero "bfs preflight: retries past a not-yet-up BucketFS and then succeeds" "$rc"
+  assert_eq "bfs preflight: took exactly 3 ls attempts (2 misses + 1 hit)" \
+    "3" "$(count_occurrences 'exapump bucketfs ls' "$(log_content)")"
+
+  # Retry-then-fail: names the try count, never hangs.
+  reset_env
+  out="$(
+    export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_LS_FAIL=1
+    source "$INSTALLER"
+    CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile; ARG_BFS_BUCKET=default
+    bucketfs_reachable 3 0 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "bfs preflight: gives up nonzero after the cap" "$rc"
+  assert_contains "bfs preflight: failure names the try count" "$out" "3 tries"
+  assert_eq "bfs preflight: capped at exactly 3 ls attempts" \
+    "3" "$(count_occurrences 'exapump bucketfs ls' "$(log_content)")"
 }
 
 test_validate_bucketfs_required_before_any_call() {
@@ -2612,6 +2715,7 @@ deployment_local_requires_ssh_and_scp() {
 # ============================================================================
 main() {
   test_missing_prereq_fails_fast
+  test_exapump_auto_install
   test_connectivity_mode_either_or
   test_host_mode_requires_port
   test_host_dsn_percent_encodes_credentials

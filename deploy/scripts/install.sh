@@ -22,6 +22,7 @@ SAAS_PROD_BASE="https://cloud.exasol.com"
 SAAS_STAGING_BASE="https://cloud-staging.exasol.com"
 ENGINE_REPO="exasol-labs/lakehouse-engine-rs"
 SLC_REPO="exasol-labs/language-container-rs"
+EXAPUMP_INSTALL_URL="https://raw.githubusercontent.com/exasol-labs/exapump/main/install.sh"
 ENGINE_ASSET="lakehouse-engine.tar.gz"
 ENGINE_SO_PATH="/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so"
 DEFAULT_SCHEMA="LHVS"
@@ -53,6 +54,11 @@ PERSONAL_SSH_HOST="127.0.0.1"
 VM_BUCKETFS_ROOT="/var/lib/exa/bucketfs"
 VM_RECONCILE_TRIES=30
 VM_RECONCILE_POLL_SECONDS=2
+# Env-overridable (unlike VM_RECONCILE_*) so the test suite can drive the full script through a
+# real run_file invocation without a real ~30s wait -- BUCKETFS_REACHABLE_TRIES=3
+# BUCKETFS_REACHABLE_POLL_SECONDS=0 exercises the exact same production code path fast.
+BUCKETFS_REACHABLE_TRIES="${BUCKETFS_REACHABLE_TRIES:-30}"
+BUCKETFS_REACHABLE_POLL_SECONDS="${BUCKETFS_REACHABLE_POLL_SECONDS:-2}"
 SSH_OPTIONS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 
@@ -105,6 +111,40 @@ log()  { printf '%s\n' "$*" >&2; }
 err()  { printf 'ERROR: %s\n' "$*" >&2; }
 
 have_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Auto-installs exapump via its own public one-liner when missing from PATH -- this is what makes
+# `curl .../install.sh | bash` a true one-line install rather than one that dead-ends on a missing
+# prereq. Prompts for confirmation only on a real interactive terminal (stdin AND stdout both
+# ttys; default: yes on Enter) -- anywhere else, e.g. the curl|bash one-liner itself (stdin is the
+# piped script, not a tty) or a captured/redirected run, it proceeds without asking, since asking
+# would either hang or silently no-op. exapump's own installer drops the binary into
+# $HOME/.local/bin (or $EXAPUMP_INSTALL_DIR) without updating this process's already-resolved
+# PATH, so that directory is checked and prepended directly rather than trusting a bare re-check.
+ensure_exapump() {
+  have_cmd exapump && return 0
+  if [[ -t 0 && -t 1 ]]; then
+    local reply
+    printf 'exapump not found on PATH. Install it now via %s? [Y/n] ' "$EXAPUMP_INSTALL_URL" >&2
+    read -r reply
+    case "$reply" in
+      ''|y|Y|yes|YES|Yes) ;;
+      *) err "exapump not installed. Install it yourself: https://github.com/exasol-labs/exapump"; return 1 ;;
+    esac
+  else
+    log "exapump not found on PATH; installing it automatically from $EXAPUMP_INSTALL_URL"
+  fi
+  if ! curl -fsSL --proto =https "$EXAPUMP_INSTALL_URL" </dev/null | sh; then
+    err "exapump auto-install failed. Install it manually: https://github.com/exasol-labs/exapump"
+    return 1
+  fi
+  local install_dir="${EXAPUMP_INSTALL_DIR:-$HOME/.local/bin}"
+  have_cmd exapump || PATH="$install_dir:$PATH"
+  have_cmd exapump || {
+    err "exapump installed to $install_dir but is still not runnable. Add $install_dir to PATH and re-run."
+    return 1
+  }
+  log "exapump installed: $(exapump --version 2>&1 | head -1)"
+}
 
 # Percent-encodes a string for safe inclusion in a DSN's userinfo component (RFC 3986 unreserved
 # set only: A-Za-z0-9-_.~). --user/--password may contain reserved URI characters (@, :, /, ?, #)
@@ -462,6 +502,10 @@ Examples:
 
 The script stops at a query-ready product install and prints a CONNECTION / VIRTUAL SCHEMA
 template as the next step; it does not create catalog objects.
+
+If exapump is missing, it is auto-installed via its own public installer (prompting for
+confirmation on an interactive terminal; proceeding automatically otherwise, e.g. the curl|bash
+one-liner). Set EXAPUMP_INSTALL_DIR to change where it lands (default: $HOME/.local/bin).
 USAGE
 }
 
@@ -759,7 +803,7 @@ validate_bucketfs_required() {
 
 check_prereqs() {
   local ok=1
-  have_cmd exapump || { err "required tool 'exapump' not found on PATH. Install it: https://github.com/exasol-labs/exapump"; ok=0; }
+  ensure_exapump || ok=0
   have_cmd curl    || { err "required tool 'curl' not found on PATH. Install it via your OS package manager: https://curl.se/"; ok=0; }
   if [[ "$TARGET_MODE" == "bucketfs" ]]; then
     have_cmd tar   || { err "required tool 'tar' not found on PATH. The BucketFS install target extracts liblakehouse_engine.so out of the engine archive locally before uploading it. Install it via your OS package manager."; ok=0; }
@@ -988,14 +1032,29 @@ exapump_bucketfs() {
 
 # Preflight, analogous to saas_db_reachable: an empty-path listing of the target bucket. exapump
 # resolves the bucket itself (--bfs-bucket / profile), so no path argument is passed -- a bucket
-# name IS NOT a valid path component for `exapump bucketfs ls`.
+# name IS NOT a valid path component for `exapump bucketfs ls`. Retried, same shape as
+# bucketfs_wait_for_path: a freshly started Exasol container's SQL port (what this script's own
+# reachability checks and Docker healthchecks key off) can go up before BucketFS's HTTP endpoint
+# is actually listening, so a single-shot check races that startup ordering instead of waiting it
+# out. Same 30-tries/2s budget as VM_RECONCILE_TRIES/POLL_SECONDS: BucketFS coming up is exactly
+# the same kind of "engine subsystem starts asynchronously after the SQL port does" wait, and 5
+# tries/1s (10s) measurably wasn't enough headroom on a live container in CI. tries/sleep_seconds
+# are only ever overridden by the test suite (to run the retry loop with sleep_seconds=0); the one
+# production call site always takes the defaults.
+# shellcheck disable=SC2120  # $1/$2 are overridden only from install.test.sh
 bucketfs_reachable() {
-  local out
-  if ! out="$(exapump_bucketfs ls 2>&1)"; then
-    err "BucketFS bucket '$ARG_BFS_BUCKET' is not reachable: 'exapump bucketfs ls' failed. Verify --bfs-host, --bfs-port and the BucketFS write password (or the profile's bfs_* keys). exapump said: $out"
-    return 1
-  fi
-  return 0
+  local tries="${1:-$BUCKETFS_REACHABLE_TRIES}" sleep_seconds="${2:-$BUCKETFS_REACHABLE_POLL_SECONDS}" i=1 out
+  while [[ "$i" -le "$tries" ]]; do
+    if out="$(exapump_bucketfs ls 2>&1)"; then
+      return 0
+    fi
+    if [[ "$i" -lt "$tries" ]]; then
+      sleep "$sleep_seconds"
+    fi
+    i=$((i + 1))
+  done
+  err "BucketFS bucket '$ARG_BFS_BUCKET' is not reachable after $tries tries: 'exapump bucketfs ls' failed. Verify --bfs-host, --bfs-port and the BucketFS write password (or the profile's bfs_* keys). exapump said: $out"
+  return 1
 }
 
 # Uploads one local file to a bucket-relative BucketFS path. Always via `exapump bucketfs cp`,
@@ -1546,6 +1605,7 @@ main() {
         ssh_vm_reachable || exit 1
       else
         validate_bucketfs_required || exit 1
+        # shellcheck disable=SC2119  # tries/sleep_seconds default; see bucketfs_reachable
         bucketfs_reachable || exit 1
       fi
       ;;
