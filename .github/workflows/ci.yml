@@ -421,7 +421,7 @@ jobs:
   # release fetched through the authenticated GitHub API — exactly what a
   # user's one-liner does. Does not depend on build-so / this PR's own .so:
   # this job tests the INSTALLER's mechanics (exapump bucketfs upload, DDL,
-  # SCRIPT_LANGUAGES registration, fingerprint smoke test), not query
+  # SCRIPT_LANGUAGES registration, version smoke test), not query
   # correctness — that's already covered by `e2e` / `e2e-lakekeeper`.
   # ponytail: only the `exasol` compose service is started (no MinIO/Iceberg
   # REST/Spark fixtures) — this job never queries a Virtual Schema, so it
@@ -440,8 +440,9 @@ jobs:
       - name: Pull Exasol image
         run: docker compose pull --quiet exasol
 
-      # Same root cause and fix as the `e2e` job: register_slc/create_engine_scripts
-      # spawn real Exasol UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN).
+      # Same root cause and fix as the `e2e` job: register_slc/create_engine_scripts and the
+      # version smoke test spawn real Exasol UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN /
+      # LAKEHOUSE_VERSION).
       - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
