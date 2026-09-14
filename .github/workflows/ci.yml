@@ -461,33 +461,17 @@ jobs:
       # install-slc/bucketfs-upload-so targets already use — read straight out of EXAConf, no
       # manual secret.
       #
-      # `exapump bucketfs` itself has no fully profile-less mode: even with every --bfs-* field
-      # given explicitly, it still resolves a base profile first and bails with "No profiles
-      # found in config" if none exists (exasol-labs/exapump#46). install.sh's --host/--dsn
-      # connectivity mode never passes --profile to `exapump bucketfs`, so it hits that gap on a
-      # machine with no ~/.exapump/config.toml at all. Work around it here by seeding a single
-      # throwaway profile (auto-selected as the default since it's the only one) with dummy
-      # host/user/password -- exapump bucketfs never uses those fields, only the --bfs-*
-      # overrides given on the command line below. Drop this once #46 is fixed upstream.
-      #
-      # validate_certificate = false is NOT optional here: exapump has no --bfs-validate-certificate
-      # CLI override (install.sh's exapump_bfs_flags only ever passes --bfs-host/--bfs-port/
-      # --bfs-bucket/--bfs-write-password), so it can only come from the profile. Omitting it left
-      # this at exapump's own default (validate_certificate defaults to true when unset, same as
-      # tls) -- since the container's BucketFS endpoint serves a self-signed cert, that made every
-      # single request fail the TLS handshake, forever, not a timing race bucketfs_reachable's
-      # retries could ever get past.
-      - name: Seed a throwaway exapump profile (exasol-labs/exapump#46 workaround)
-        run: |
-          mkdir -p "$HOME/.exapump"
-          cat > "$HOME/.exapump/config.toml" <<'TOML'
-          [ci]
-          host = "unused"
-          user = "unused"
-          password = "unused"
-          validate_certificate = false
-          TOML
-
+      # No exapump profile is seeded here (there used to be a throwaway-profile workaround for
+      # exasol-labs/exapump#46 -- `exapump bucketfs` had no fully profile-less mode, so a
+      # --host/--dsn run with no --profile and zero ~/.exapump/config.toml bailed with "No
+      # profiles found in config"). Fixed upstream in exapump 0.13.0
+      # (exasol-labs/exapump@cf3fe92, exasol-labs/exapump#47): override-only invocations now
+      # build the connection from BfsConnection::with_defaults instead of requiring a profile.
+      # ensure_exapump's `curl .../install.sh | sh` always installs whatever is currently
+      # tagged latest, so this job (and every real one-liner user) gets 0.13.0+ automatically.
+      # exapump_bfs_flags now carries --bfs-validate-certificate false itself for non-profile
+      # connectivity modes (the new defaults-only path has certificate validation ON, and this
+      # container's BucketFS endpoint is self-signed) -- see install.sh.
       - name: Run install.sh (BucketFS target, exapump not preinstalled)
         run: |
           BFSPASS=$(docker exec lakehouse-engine-rs-exasol-1 bash -c \

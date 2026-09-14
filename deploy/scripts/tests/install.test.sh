@@ -1505,26 +1505,40 @@ test_exapump_bfs_flags() {
   # The bucket is ALWAYS emitted, even at its "default" default -- never left to exapump's own
   # bucket resolution, so a stray default profile in ~/.exapump/config.toml can't diverge from the
   # bucket path this script assumes when building TARGET_SO_UDF_OBJECT/TARGET_RUST_LANG_SEGMENT.
-  flags="$( source "$INSTALLER"; exapump_bfs_flags )"
+  # Profile mode: --bfs-validate-certificate is never added here (see the dsn/host block below) --
+  # the profile's own bfs_validate_certificate/validate_certificate field governs instead.
+  flags="$( source "$INSTALLER"; CONNECTIVITY_MODE=profile; exapump_bfs_flags )"
   assert_eq "bfs flags: nothing given -> only the resolved default bucket is emitted" "--bfs-bucket default" "$flags"
 
-  flags="$( source "$INSTALLER"; ARG_BFS_BUCKET=default; ARG_BFS_BUCKET_SET=0; exapump_bfs_flags )"
+  flags="$( source "$INSTALLER"; CONNECTIVITY_MODE=profile; ARG_BFS_BUCKET=default; ARG_BFS_BUCKET_SET=0; exapump_bfs_flags )"
   assert_eq "bfs flags: an unsupplied --bfs-bucket default is still echoed back" "--bfs-bucket default" "$flags"
 
-  flags="$( source "$INSTALLER"; ARG_BFS_BUCKET=other; ARG_BFS_BUCKET_SET=1; exapump_bfs_flags )"
+  flags="$( source "$INSTALLER"; CONNECTIVITY_MODE=profile; ARG_BFS_BUCKET=other; ARG_BFS_BUCKET_SET=1; exapump_bfs_flags )"
   assert_eq "bfs flags: an explicit --bfs-bucket is echoed back" "--bfs-bucket other" "$flags"
 
+  # dsn/host connectivity mode passes no --profile to `exapump bucketfs` (see exapump_bucketfs),
+  # so exapump >=0.13.0 builds the connection purely from these overrides plus its own BucketFS
+  # defaults -- certificate validation ON. --bfs-validate-certificate false is added here,
+  # unconditionally, for the same self-signed-cert reason the SQL DSN always carries
+  # validateservercertificate=0 in host mode (exasol-labs/exapump#46).
   flags="$(
     source "$INSTALLER"
+    CONNECTIVITY_MODE=host
     ARG_BFS_HOST=bfshost; ARG_BFS_PORT=2581; ARG_BFS_BUCKET=other; ARG_BFS_BUCKET_SET=1
     ARG_BFS_WRITE_PASSWORD=BFSWRITEPW789
     exapump_bfs_flags
   )"
-  assert_eq "bfs flags: everything given is echoed back exactly, in flag order" \
-    "--bfs-host bfshost --bfs-port 2581 --bfs-bucket other --bfs-write-password BFSWRITEPW789" "$flags"
+  assert_eq "bfs flags: host mode, everything given, is echoed back exactly, in flag order, plus the cert-validation override" \
+    "--bfs-host bfshost --bfs-port 2581 --bfs-bucket other --bfs-write-password BFSWRITEPW789 --bfs-validate-certificate false" \
+    "$flags"
 
-  flags="$( source "$INSTALLER"; ARG_BFS_HOST=bfshost; exapump_bfs_flags )"
-  assert_eq "bfs flags: the resolved bucket accompanies any other supplied subset" "--bfs-host bfshost --bfs-bucket default" "$flags"
+  flags="$( source "$INSTALLER"; CONNECTIVITY_MODE=host; ARG_BFS_HOST=bfshost; exapump_bfs_flags )"
+  assert_eq "bfs flags: host mode, the resolved bucket accompanies any other supplied subset, plus the cert-validation override" \
+    "--bfs-host bfshost --bfs-bucket default --bfs-validate-certificate false" "$flags"
+
+  flags="$( source "$INSTALLER"; CONNECTIVITY_MODE=dsn; ARG_BFS_HOST=bfshost; exapump_bfs_flags )"
+  assert_eq "bfs flags: dsn mode gets the same cert-validation override as host mode" \
+    "--bfs-host bfshost --bfs-bucket default --bfs-validate-certificate false" "$flags"
 }
 
 test_resolve_bfs_bucket_from_profile() {

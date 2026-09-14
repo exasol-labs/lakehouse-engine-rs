@@ -1008,6 +1008,14 @@ exapump_bfs_flags() {
   if [[ -n "$ARG_BFS_PORT" ]]; then out="$out --bfs-port $ARG_BFS_PORT"; fi
   out="$out --bfs-bucket $ARG_BFS_BUCKET"
   if [[ -n "$ARG_BFS_WRITE_PASSWORD" ]]; then out="$out --bfs-write-password $ARG_BFS_WRITE_PASSWORD"; fi
+  # dsn/host connectivity mode passes no --profile (see exapump_bucketfs), so exapump >=0.13.0
+  # builds the connection purely from these overrides plus its own BucketFS defaults --
+  # certificate validation ON. Same self-signed-cert story as the SQL DSN's
+  # validateservercertificate=0 a few lines up in host mode: disable it here too, unconditionally,
+  # rather than exposing yet another user-facing flag for a target class (Exasol AsApp/Docker/
+  # on-premise) that is self-signed by default. Profile mode is unaffected -- the profile's own
+  # bfs_validate_certificate/validate_certificate field still governs, exactly as before.
+  if [[ "$CONNECTIVITY_MODE" != "profile" ]]; then out="$out --bfs-validate-certificate false"; fi
   printf '%s\n' "${out# }"
   return 0
 }
