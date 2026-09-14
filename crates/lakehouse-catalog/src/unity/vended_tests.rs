@@ -4,7 +4,7 @@
 //! asserted credential-safe.
 
 use super::*;
-use crate::{AdlsCred, StaticStoreAddress, StorageBackend};
+use crate::{AdlsCred, ConnectionCreds, StaticStoreAddress, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 
 const SECRET_KEY_SENTINEL: &str = "SECRET_ACCESS_KEY_SENTINEL_VALUE";
@@ -318,6 +318,32 @@ fn s3_vended_response_with_no_store_address_resolves_successfully() {
             assert!(props.region.is_empty(), "no region from either source");
             assert_eq!(props.access_key, "AK");
             assert_eq!(props.secret_key, SECRET_KEY_SENTINEL);
+        }
+        StorageBackend::Adls { .. } => panic!("expected the S3 backend"),
+    }
+}
+
+#[test]
+fn a_stated_connection_path_style_wins_on_the_unity_vended_arm() {
+    let endpoint = "https://minio.invalid";
+    let response = aws_response("AK", SECRET_KEY_SENTINEL, None, Some(endpoint));
+
+    let creds = ConnectionCreds {
+        path_style: Some(false),
+        ..ConnectionCreds::default()
+    };
+    let address = StaticStoreAddress::from(&creds);
+
+    let backend =
+        resolve_uc_vended_storage(&response, "s3://bucket/tbl", true, &address).expect("resolves");
+
+    match backend {
+        StorageBackend::S3(props) => {
+            assert!(
+                !props.path_style,
+                "the CONNECTION-stated false must win over the endpoint-presence derivation \
+                 (which would yield true) on the Unity arm, through the same shared s3_backend"
+            );
         }
         StorageBackend::Adls { .. } => panic!("expected the S3 backend"),
     }

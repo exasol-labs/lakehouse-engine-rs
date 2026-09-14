@@ -41,6 +41,7 @@ explicit reviewed edit to the crate's reachability probe at
   selector.
 * **`resolve_uc_vended_storage` gains its first production caller** and stops being latent. Its
   signature, its shared policy home, and its crate-private construction steps are unchanged.
+* **This delta widens `StaticStoreAddress` by one field and one accessor (#130).** The type gains `path_style` beside `endpoint` and `region`. The enumerated public surface grows by one method on an existing item, not by an item. The no-credential probe is unchanged: `path_style` names none of the forbidden spellings.
 
 ## Scenarios
 
@@ -83,9 +84,9 @@ explicit reviewed edit to the crate's reachability probe at
 
 * *GIVEN* the enumerated public surface of `lakehouse-catalog` and its external-vantage reachability probe at `crates/lakehouse-catalog/tests/catalog_public_surface.rs`, which fails to compile if any enumerated item is narrowed below `pub`
 * *WHEN* the credentials/addressing split gives both vended selectors a CONNECTION-configured store-address parameter
-* *THEN* the crate SHALL add to its public surface exactly ONE type — a store-address value declaring EXACTLY the CONNECTION's `endpoint` and `region` — plus its `Default` and exactly ONE conversion from `ConnectionCreds`, re-exported at the crate root, and the recorded `pub` enumeration SHALL be SUPERSEDED to admit them
-* *AND* the type SHALL declare NO credential field, and the reachability probe SHALL assert from that type's own source that its declaration names no field spelled `access_key`, `secret_key`, `session_token`, `token`, `account_key`, `sas_token`, or `password` — so widening it into a second credential path is a test failure rather than a silent regression of the vended-only credential guarantee
-* *AND* the conversion from `ConnectionCreds` SHALL be the ONE place that decides which CONNECTION fields are permitted to cross into vended resolution, so no call site builds that value field-by-field and the decision cannot be re-litigated per caller — enforced by the type's own field privacy rather than by prose, per `vs-adapter/storage-backend-enum` § "The vended selectors take a store address that cannot carry a credential": the added type exposes its two fields through accessors only, so outside the crate the `Default` and that conversion are the only constructions reachable at all
+* *THEN* the crate SHALL add to its public surface exactly ONE type — a store-address value declaring EXACTLY the CONNECTION's `endpoint`, `region`, and `path_style` — plus its `Default`, one reading accessor per field, and exactly ONE conversion from `ConnectionCreds`, re-exported at the crate root — SUPERSEDING the recorded clause naming EXACTLY `endpoint` and `region` (#130)
+* *AND* the type SHALL declare NO credential field, and the reachability probe SHALL assert from that type's own source that its declaration names no field spelled `access_key`, `secret_key`, `session_token`, `token`, `account_key`, `sas_token`, or `password`
+* *AND* the conversion from `ConnectionCreds` SHALL be the ONE place that decides which CONNECTION fields are permitted to cross into vended resolution — enforced by the type's own field privacy per `vs-adapter/storage-backend-enum`
 * *AND* every shared vended policy and construction step SHALL stay crate-private and MUST NOT be re-exported: the neutral vended S3 value shape, the URI-scheme and storage-host derivations, the ADLS account-name derivation, the two plaintext-transport consent gates, and the per-variant construction functions
 * *AND* the reachability probe SHALL be edited — an explicit reviewed change to the probe file — to name the added items, and its existing demotion assertions that the crate declares no `pub fn` for the demoted vended-mechanism functions SHALL remain intact and unweakened
 

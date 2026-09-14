@@ -42,7 +42,7 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 | `access_key` | yes, unless `use_sigv4` or vended credentials | S3 access key |
 | `secret_key` | yes, unless `use_sigv4` or vended credentials | S3 secret key |
 | `session_token` | no | STS session token |
-| `path_style` | no, default `true` | Path-style S3 addressing: `true` for MinIO, `false` for real AWS S3 |
+| `path_style` | required if `endpoint` is set and vending is off; otherwise no, default `false` | Path-style S3 addressing: `true` for MinIO or Ceph, `false` for real AWS S3 (virtual-hosted, the default) |
 | `use_sigv4` | no, default `false` | SigV4-sign the catalog REST requests (AWS Glue) |
 | `use_vended_credentials` | no, default `false` | Request short-lived S3 credentials from the `load_table` call of the catalog (Glue, Lakekeeper) |
 | `token` | no | Static bearer token for generic REST catalog auth |
@@ -54,6 +54,8 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 **Mutual exclusivity:** you cannot combine `use_sigv4` with `token`, `client_id`, or `client_secret`. The adapter rejects a CONNECTION that sets both. SigV4 signs the catalog requests itself. A separate catalog token or OAuth2 flow conflicts with it. `use_sigv4` is rejected outright under `CATALOG_KIND = 'UNITY_CATALOG'` — a native Unity Catalog authenticates with a bearer token or Databricks OAuth, never AWS SigV4.
 
 With `CATALOG_KIND` absent (Iceberg REST, the default), `warehouse` is always required. If you turn `use_sigv4` on, `region`, `access_key`, and `secret_key` become required instead. These three fields sign the catalog request, and `endpoint` stays optional. If you turn `use_vended_credentials` on without SigV4, you can omit all static S3 fields. The catalog then vends short-lived credentials from `load_table`. Under `CATALOG_KIND = 'UNITY_CATALOG'`, the same static-vs-vended S3 field choice applies, but `warehouse` is never required.
+
+An unstated `path_style` resolves to `false` on a non-vended CONNECTION, which discards `endpoint` and derives a virtual-hosted AWS host from `region` instead. If you configure a non-vended `endpoint` (MinIO, Ceph, or any other self-hosted S3-compatible store), you must state `path_style` explicitly — the adapter rejects a CONNECTION that sets `endpoint` without it. On a vended CONNECTION (`use_vended_credentials` on, or a catalog that vends storage credentials automatically), a stated `path_style` wins over the value the catalog response vends; omit the field there to keep the vended value.
 
 Credential values never appear in error messages, logs, or debug output. The per-query scan spec carries a REFERENCE to the CONNECTION (its name) for a static credential, and an AES-GCM-sealed envelope for a vended one — no credential value travels in the scan spec itself. The adapter never stores them in Virtual Schema properties. See [Security](security.md) for the CONNECTION-access privilege model this relies on, and for exactly what a `SELECT`-only Virtual Schema user can and cannot read back.
 

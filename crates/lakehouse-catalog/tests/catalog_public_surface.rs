@@ -69,7 +69,7 @@ fn connection_creds() -> ConnectionCreds {
         access_key: "minioadmin".into(),
         secret_key: "minioadmin".into(),
         session_token: None,
-        path_style: true,
+        path_style: Some(true),
         use_sigv4: false,
         use_vended_credentials: false,
         token: None,
@@ -332,7 +332,9 @@ fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {
 /// -> Result<StorageBackend, UdfError>`. The store address is the ONLY
 /// CONNECTION-derived parameter, and it is a type that cannot carry a credential —
 /// asserted here as part of the arity pin, because the arity is only worth pinning
-/// while the added parameter stays credential-free. Reintroducing a
+/// while the added parameter stays credential-free. Its three addressing fields
+/// — `endpoint`, `region`, and `path_style` — are the full set of CONNECTION
+/// values that may cross into a vended resolution. Reintroducing a
 /// `base: &StorageBackend`, or widening the address to `&ConnectionCreds`, would
 /// fail here rather than only in the crate's own `#[cfg(test)]`-private unit tests.
 /// Called with an UNSET address, so the assertions below still read the vended
@@ -368,7 +370,9 @@ fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() 
 /// address: &StaticStoreAddress) -> Result<StorageBackend, UdfError>`. It carries
 /// no `warehouse`, no static credential, and no existing `StorageBackend` — the
 /// three vended selectors' input disjointness is enforced by this signature. The
-/// one CONNECTION-derived value it does take is a store ADDRESS whose type cannot
+/// one CONNECTION-derived value it does take is a store ADDRESS whose three
+/// addressing fields — `endpoint`, `region`, and `path_style` — are the full set
+/// of CONNECTION values that may cross into a vended resolution. Its type cannot
 /// carry a credential, asserted here as part of the arity pin so the added
 /// parameter cannot widen back into a credential-bearing one. A response with no
 /// usable S3 credential for an `s3://` location is a clear error, not a fabricated
@@ -604,11 +608,13 @@ fn static_store_address_is_reachable_and_declares_no_credential_field() {
     let unset = StaticStoreAddress::default();
     assert_eq!(unset.endpoint(), "");
     assert_eq!(unset.region(), "");
+    assert_eq!(unset.path_style(), None);
 
     let creds = connection_creds();
     let configured = StaticStoreAddress::from(&creds);
     assert_eq!(configured.endpoint(), creds.endpoint);
     assert_eq!(configured.region(), creds.region);
+    assert_eq!(configured.path_style(), creds.path_style);
 
     assert_static_store_address_declares_no_credential_field();
 }

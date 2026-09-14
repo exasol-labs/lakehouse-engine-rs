@@ -37,7 +37,7 @@ fn debug_redacts_every_secret_bearing_field() {
         access_key: "AKIA_EX".into(),
         secret_key: "SK".into(),
         session_token: Some("TOK".into()),
-        path_style: true,
+        path_style: Some(true),
         use_sigv4: false,
         use_vended_credentials: false,
         token: Some("bearer".into()),
@@ -88,7 +88,7 @@ fn debug_redacts_every_secret_bearing_field() {
                     access_key: props.access_key.clone(),
                     secret_key: props.secret_key.clone(),
                     session_token: props.session_token.clone(),
-                    path_style: true,
+                    path_style: Some(true),
                     ..Default::default()
                 }
             ),
@@ -174,7 +174,7 @@ fn s3_storage_creds() -> StorageCreds {
         access_key: STORAGE_AK.into(),
         secret_key: STORAGE_SK.into(),
         session_token: Some(STORAGE_SESSION_TOKEN.into()),
-        path_style: true,
+        path_style: Some(true),
         ..Default::default()
     }
 }
@@ -254,6 +254,58 @@ fn backend_selects_adls_only_for_an_account_name_with_exactly_one_azure_credenti
             creds.backend(false),
             s3_backend(false),
             "{shape} does not describe an Azure backend"
+        );
+    }
+}
+
+#[test]
+fn from_json_preserves_an_absent_path_style_as_unstated() {
+    let json = serde_json::json!({});
+    assert_eq!(StorageCreds::from_json(&json).path_style, None);
+}
+
+#[test]
+fn from_json_reads_an_explicit_boolean_and_ignores_a_non_boolean_path_style() {
+    assert_eq!(
+        StorageCreds::from_json(&serde_json::json!({ "path_style": true })).path_style,
+        Some(true)
+    );
+    assert_eq!(
+        StorageCreds::from_json(&serde_json::json!({ "path_style": false })).path_style,
+        Some(false)
+    );
+    assert_eq!(
+        StorageCreds::from_json(&serde_json::json!({ "path_style": "yes" })).path_style,
+        None,
+        "a non-boolean value must not be mistaken for a stated preference"
+    );
+}
+
+#[test]
+fn backend_resolves_an_absent_path_style_to_false_and_an_explicit_value_to_itself() {
+    let StorageBackend::S3(none_props) = (StorageCreds {
+        path_style: None,
+        ..s3_storage_creds()
+    })
+    .backend(false) else {
+        panic!("S3 creds must select the S3 backend")
+    };
+    assert!(
+        !none_props.path_style,
+        "an absent path_style must resolve to false"
+    );
+
+    for style in [true, false] {
+        let StorageBackend::S3(explicit_props) = (StorageCreds {
+            path_style: Some(style),
+            ..s3_storage_creds()
+        })
+        .backend(false) else {
+            panic!("S3 creds must select the S3 backend")
+        };
+        assert_eq!(
+            explicit_props.path_style, style,
+            "an explicit value must resolve to itself"
         );
     }
 }

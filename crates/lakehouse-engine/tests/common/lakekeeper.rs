@@ -462,9 +462,11 @@ fn post_warehouse(
 ///
 /// Shared by both the MinIO/STS arm and the ADLS/SAS arm: when `vended` is true,
 /// no static storage field is populated for either backend (the UDF requests
-/// short-lived credentials at scan time instead). When `vended` is false, the
-/// static S3 fields (endpoint, region, keys, path-style) carry the static
-/// warehouse's credentials.
+/// short-lived credentials at scan time instead). `path_style` is stated
+/// explicitly as `true` regardless of `vended`: MinIO always needs path-style
+/// addressing, and a vended STS credential can state (or default to)
+/// virtual-hosted-style, which MinIO cannot serve. The CONNECTION's stated value
+/// wins over whatever the vended response says, so stating it here is load-bearing.
 pub fn lakekeeper_connection_password(
     warehouse_name: &str,
     vended: bool,
@@ -472,6 +474,12 @@ pub fn lakekeeper_connection_password(
     let base = CatalogConnectionPassword {
         warehouse: warehouse_name.to_string(),
         use_vended_credentials: vended,
+        // MinIO always needs path-style addressing, whether the CONNECTION carries
+        // static keys or the UDF requests vended STS credentials at scan time — an
+        // unstated path_style here would resolve from whatever the vended response
+        // states, and this suite has hit vended STS credentials that state (or
+        // default to) virtual-hosted-style, which MinIO cannot serve.
+        path_style: true,
         client_id: Some(OAUTH_CLIENT_ID.to_string()),
         client_secret: Some(OAUTH_CLIENT_SECRET.to_string()),
         oauth2_server_uri: Some(keycloak_token_endpoint_internal()),
@@ -509,7 +517,7 @@ pub fn lakekeeper_host_connection_creds(warehouse_name: &str, vended: bool) -> C
         access_key: password.access_key,
         secret_key: password.secret_key,
         session_token: password.session_token,
-        path_style: password.path_style,
+        path_style: Some(password.path_style),
         use_sigv4: password.use_sigv4,
         use_vended_credentials: password.use_vended_credentials,
         token: password.token,
@@ -655,7 +663,10 @@ mod tests {
         assert_eq!(pw.account_name, None);
         assert_eq!(pw.account_key, None);
         assert_eq!(pw.session_token, None);
-        assert!(!pw.path_style);
+        // MinIO always needs path-style addressing, vended or not: a vended STS
+        // credential can state (or default to) virtual-hosted-style, which MinIO
+        // cannot serve, so the CONNECTION states it explicitly to win that resolution.
+        assert!(pw.path_style);
 
         let json_str = pw.to_sql_password_json();
         let parsed: serde_json::Value =

@@ -57,7 +57,7 @@ fn reexported_paths_resolve_to_the_catalog_crate_types() {
         access_key: "minioadmin".into(),
         secret_key: "minioadmin".into(),
         session_token: None,
-        path_style: true,
+        path_style: Some(true),
         use_sigv4: false,
         use_vended_credentials: false,
         token: None,

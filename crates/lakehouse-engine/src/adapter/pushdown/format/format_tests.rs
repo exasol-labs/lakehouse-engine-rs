@@ -12,7 +12,7 @@ fn offline_sigv4_creds() -> ConnectionCreds {
         access_key: "signing-access-key".into(),
         secret_key: "signing-secret-key".into(),
         session_token: None,
-        path_style: true,
+        path_style: Some(true),
         use_sigv4: true,
         use_vended_credentials: false,
         token: None,

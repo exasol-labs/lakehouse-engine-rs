@@ -270,13 +270,13 @@ fn adls_account_name(location: &str) -> Result<&str, UdfError> {
 }
 
 /// The store address a vended resolution may take from the CONNECTION: an S3
-/// endpoint and a region, and nothing else.
+/// endpoint, a region, and an optional path-style addressing preference.
 ///
 /// Under vending the catalog's response is the sole source of CREDENTIALS, while
 /// ADDRESSING may still come from the CONNECTION. Handing the selectors
 /// `&ConnectionCreds` to express that would put every static credential back
 /// within their reach, so the parameter is narrowed to a type that CANNOT carry
-/// one. Both fields are private, which leaves [`Default`] and the single
+/// one. Its fields are private, which leaves [`Default`] and the single
 /// [`From<&ConnectionCreds>`] conversion below as the only constructions
 /// reachable outside this module — widening what crosses over is then an edit to
 /// that one conversion rather than a field a distant call site can set.
@@ -284,6 +284,7 @@ fn adls_account_name(location: &str) -> Result<&str, UdfError> {
 pub struct StaticStoreAddress {
     endpoint: String,
     region: String,
+    path_style: Option<bool>,
 }
 
 impl StaticStoreAddress {
@@ -296,6 +297,12 @@ impl StaticStoreAddress {
     pub fn region(&self) -> &str {
         &self.region
     }
+
+    /// The CONNECTION's stated path-style preference, `None` when it configured
+    /// none.
+    pub fn path_style(&self) -> Option<bool> {
+        self.path_style
+    }
 }
 
 impl From<&ConnectionCreds> for StaticStoreAddress {
@@ -303,6 +310,7 @@ impl From<&ConnectionCreds> for StaticStoreAddress {
         Self {
             endpoint: creds.endpoint.clone(),
             region: creds.region.clone(),
+            path_style: creds.path_style,
         }
     }
 }
@@ -342,11 +350,13 @@ pub(crate) struct VendedS3 {
 /// with no endpoint and no region at all — rejecting it at plan time would refuse
 /// a legal table.
 ///
-/// `path_style` falls back to whether an endpoint resolved at all, because
-/// `register_side_store` treats it as the gate on whether `endpoint` reaches
-/// `AmazonS3Builder` — an endpoint beside `path_style: false` would be silently
-/// dropped for a virtual-hosted host derived from the region, which is the wrong
-/// store rather than a plan-time error. A value the response states still wins.
+/// `path_style` resolves a three-step chain: the CONNECTION's stated value wins
+/// when set, else the value the vended response states, else a last-resort
+/// derivation from whether an endpoint resolved at all. The derivation exists
+/// because `register_side_store` treats `path_style` as the gate on whether
+/// `endpoint` reaches `AmazonS3Builder` — an endpoint beside `path_style: false`
+/// would be silently dropped for a virtual-hosted host derived from the region,
+/// which is the wrong store rather than a plan-time error.
 pub(crate) fn s3_backend(
     vended: VendedS3,
     location: &str,
@@ -369,7 +379,10 @@ pub(crate) fn s3_backend(
         )));
     }
 
-    let path_style = vended.path_style.unwrap_or(!endpoint.is_empty());
+    let path_style = address
+        .path_style()
+        .or(vended.path_style)
+        .unwrap_or(!endpoint.is_empty());
 
     Ok(StorageBackend::S3(StorageProps {
         endpoint,

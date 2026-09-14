@@ -22,7 +22,7 @@ fn creds(use_vended_credentials: bool) -> ConnectionCreds {
         access_key: STATIC_SECRET.into(),
         secret_key: STATIC_SECRET.into(),
         session_token: None,
-        path_style: true,
+        path_style: Some(true),
         use_sigv4: true,
         use_vended_credentials,
         token: None,

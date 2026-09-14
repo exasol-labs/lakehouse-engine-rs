@@ -374,7 +374,7 @@ pub fn local_stack_creds() -> ConnectionCreds {
         access_key: "minioadmin".to_string(),
         secret_key: "minioadmin".to_string(),
         session_token: None,
-        path_style: true,
+        path_style: Some(true),
         use_sigv4: false,
         use_vended_credentials: false,
         token: None,
