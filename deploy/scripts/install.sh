@@ -143,7 +143,7 @@ ensure_exapump() {
     err "exapump installed to $install_dir but is still not runnable. Add $install_dir to PATH and re-run."
     return 1
   }
-  log "exapump installed: $(exapump --version 2>&1 | head -1)"
+  log "exapump installed: $(exapump --version </dev/null 2>&1 | head -1)"
 }
 
 # Percent-encodes a string for safe inclusion in a DSN's userinfo component (RFC 3986 unreserved
@@ -1049,12 +1049,23 @@ exapump_bucketfs() {
 # tries/1s (10s) measurably wasn't enough headroom on a live container in CI. tries/sleep_seconds
 # are only ever overridden by the test suite (to run the retry loop with sleep_seconds=0); the one
 # production call site always takes the defaults.
+#
+# Only a connection-level failure ("not reachable", the wording exapump's own connect_error()
+# uses for a network-level failure) is retried -- that's the one shape a not-yet-up BucketFS
+# endpoint can produce. Anything else (a bad write password: "Authentication failed"; a non-2xx
+# HTTP status) is a configuration problem retrying can never fix, so it fails on the first attempt
+# instead of burying the actionable error behind up to tries*sleep_seconds seconds of identical
+# failures.
 # shellcheck disable=SC2120  # $1/$2 are overridden only from install.test.sh
 bucketfs_reachable() {
   local tries="${1:-$BUCKETFS_REACHABLE_TRIES}" sleep_seconds="${2:-$BUCKETFS_REACHABLE_POLL_SECONDS}" i=1 out
   while [[ "$i" -le "$tries" ]]; do
     if out="$(exapump_bucketfs ls 2>&1)"; then
       return 0
+    fi
+    if [[ "$out" != *"not reachable"* ]]; then
+      err "BucketFS bucket '$ARG_BFS_BUCKET' is not usable: 'exapump bucketfs ls' failed. Verify --bfs-host, --bfs-port and the BucketFS write password (or the profile's bfs_* keys). exapump said: $out"
+      return 1
     fi
     if [[ "$i" -lt "$tries" ]]; then
       sleep "$sleep_seconds"

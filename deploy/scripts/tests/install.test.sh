@@ -68,6 +68,83 @@ for _prereq in jq make; do
     exit 1
   }
 done
+command -v python3 >/dev/null 2>&1 || {
+  printf 'FATAL: python3 is required to run the interactive-prompt tests (real pty via the stdlib pty module -- bash has no other way to allocate one); install it and re-run.\n' >&2
+  exit 1
+}
+
+# Runs install.sh under a real pseudo-terminal (both stdin and stdout), so ensure_exapump's
+# `[[ -t 0 && -t 1 ]]` interactive-prompt branch actually triggers -- every other invocation style
+# in this file (run_file, direct sourcing, command substitution) makes stdout a pipe, which is
+# exactly why that branch would otherwise go completely untested. Waits for the "[Y/n]" prompt
+# text to appear before writing $2, so this can't race a slow prompt. Sets LAST_OUT/LAST_RC like
+# the other run_* helpers.
+run_with_pty() {
+  local reply="$1"; shift
+  local py_out
+  py_out="$(python3 - "$RUN_PATH" "$reply" "$BASH_BIN" "$INSTALLER" "$@" <<'PYEOF'
+import os, pty, select, subprocess, sys, time
+
+path, reply, bash_bin, installer = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+args = sys.argv[5:]
+
+env = dict(os.environ)
+env["PATH"] = path
+
+master_fd, slave_fd = pty.openpty()
+proc = subprocess.Popen(
+    [bash_bin, installer, *args],
+    stdin=slave_fd, stdout=slave_fd, stderr=slave_fd,
+    env=env, close_fds=True,
+)
+os.close(slave_fd)
+
+output = b""
+wrote = False
+deadline = time.time() + 15
+while time.time() < deadline:
+    if proc.poll() is not None:
+        break
+    r, _, _ = select.select([master_fd], [], [], 0.5)
+    if master_fd in r:
+        try:
+            chunk = os.read(master_fd, 4096)
+        except OSError:
+            break
+        if not chunk:
+            break
+        output += chunk
+        if not wrote and b"[Y/n]" in output:
+            os.write(master_fd, reply.encode())
+            wrote = True
+
+try:
+    rc = proc.wait(timeout=5)
+except subprocess.TimeoutExpired:
+    proc.kill()
+    rc = proc.wait()
+
+# Drain whatever's left in the pty buffer after exit.
+try:
+    while True:
+        r, _, _ = select.select([master_fd], [], [], 0.2)
+        if master_fd not in r:
+            break
+        chunk = os.read(master_fd, 4096)
+        if not chunk:
+            break
+        output += chunk
+except OSError:
+    pass
+os.close(master_fd)
+
+sys.stdout.buffer.write(f"{rc}\n".encode())
+sys.stdout.buffer.write(output)
+PYEOF
+)"
+  LAST_RC="$(printf '%s' "$py_out" | head -1)"
+  LAST_OUT="$(printf '%s' "$py_out" | tail -n +2)"
+}
 
 write_exapump_stub() {
   cat > "$1/exapump" <<'STUB'
@@ -107,6 +184,10 @@ if [[ "${1:-}" == "bucketfs" ]]; then
         echo "Error: BucketFS is not reachable at stub-bfs-host:2581" >&2
         exit 1
       fi
+      if [[ "${EXAPUMP_BFS_LS_AUTH_FAIL:-0}" == "1" ]]; then
+        echo "Error: Authentication failed. Set bfs_read_password or bfs_write_password in your profile." >&2
+        exit 1
+      fi
       _prefix="${_pos[0]:-}"
       if [[ -z "$_prefix" ]]; then
         # Top-level probe: succeeds once past EXAPUMP_BFS_TOPLEVEL_LS_DELAY misses -- simulates
@@ -118,7 +199,10 @@ if [[ "${1:-}" == "bucketfs" ]]; then
           _tcf="$_state.toplevel_delay"
           _tn=0; [[ -f "$_tcf" ]] && _tn="$(cat "$_tcf")"
           _tn=$((_tn + 1)); printf '%s' "$_tn" > "$_tcf"
-          if [[ "$_tn" -le "$_tdelay" ]]; then exit 1; fi
+          if [[ "$_tn" -le "$_tdelay" ]]; then
+            echo "Error: BucketFS is not reachable at stub-bfs-host:2581" >&2
+            exit 1
+          fi
         fi
         # Top-level probe: always succeeds past the delay, even against an empty bucket.
         if [[ -f "$_state" ]]; then
@@ -493,7 +577,7 @@ chmod 600 "$DEPLOYMENT_NODE_KEY"
 reset_env() {
   unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING GH_ASSET_TARBALL 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
-  unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY EXAPUMP_BFS_TOPLEVEL_LS_DELAY 2>/dev/null || true
+  unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_LS_AUTH_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY EXAPUMP_BFS_TOPLEVEL_LS_DELAY 2>/dev/null || true
   unset SSH_FAIL SCP_FAIL SSH_PATH_NEVER SSH_PATH_DELAY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
@@ -557,12 +641,9 @@ test_missing_prereq_fails_fast() {
   assert_contains "missing curl: gives install URL" "$LAST_OUT" "https://curl.se"
   assert_eq "missing curl: no network/SQL call made" "" "$(log_content)"
 
-  reset_env
-  RUN_PATH="$MISSING_EXAPUMP_DIR"
-  run_file --account-id ACC1 --database-id DB1 --profile staging
-  assert_rc_nonzero "missing exapump: nonzero exit" "$LAST_RC"
-  assert_contains "missing exapump: names exapump" "$LAST_OUT" "exapump"
-  assert_eq "missing exapump: no network/SQL call made" "" "$(log_content)"
+  # A missing exapump is no longer a fail-fast prereq: ensure_exapump auto-installs it, so a
+  # network call IS made and expected. That full scenario (fetch success/failure, auto-install
+  # success/failure) is covered by test_exapump_auto_install; nothing belongs here for it anymore.
 }
 
 test_exapump_auto_install() {
@@ -597,6 +678,31 @@ test_exapump_auto_install() {
   assert_contains "auto-install succeeds: says it is installing" "$out" "installing it automatically"
   unset EXAPUMP_INSTALL_DIR
   return 0
+}
+
+test_exapump_interactive_prompt() {
+  echo "== test_exapump_interactive_prompt =="
+  reset_env
+  RUN_PATH="$AUTOINSTALL_DIR"
+  run_with_pty $'y\n' "${HAPPY_ARGS[@]}"
+  assert_not_contains "interactive prompt, accept: never refuses" "$LAST_OUT" "exapump not installed. Install it yourself"
+  local log; log="$(log_content)"
+  assert_contains "interactive prompt, accept: proceeds to fetch the installer" "$log" "exapump/main/install.sh"
+
+  reset_env
+  RUN_PATH="$AUTOINSTALL_DIR"
+  run_with_pty $'\n' "${HAPPY_ARGS[@]}"
+  assert_not_contains "interactive prompt, bare Enter: defaults to yes, never refuses" "$LAST_OUT" "exapump not installed. Install it yourself"
+  log="$(log_content)"
+  assert_contains "interactive prompt, bare Enter: proceeds to fetch the installer" "$log" "exapump/main/install.sh"
+
+  reset_env
+  RUN_PATH="$AUTOINSTALL_DIR"
+  run_with_pty $'n\n' "${HAPPY_ARGS[@]}"
+  assert_rc_nonzero "interactive prompt, refuse: exits nonzero" "$LAST_RC"
+  assert_contains "interactive prompt, refuse: names the refusal" "$LAST_OUT" "exapump not installed. Install it yourself"
+  log="$(log_content)"
+  assert_eq "interactive prompt, refuse: never attempts the fetch" "" "$log"
 }
 
 test_connectivity_mode_either_or() {
@@ -1734,6 +1840,19 @@ test_bucketfs_reachable_preflight() {
   local log; log="$(log_content)"
   assert_not_contains "bfs preflight: fails before any release download" "$log" "releases/"
 
+  # Permanent errors (a bad password, here) are NOT retried: one attempt, immediate failure --
+  # unlike a not-yet-up BucketFS, more retries can never fix a wrong credential.
+  reset_env
+  export EXAPUMP_BFS_LS_AUTH_FAIL=1
+  export BUCKETFS_REACHABLE_TRIES=30 BUCKETFS_REACHABLE_POLL_SECONDS=0
+  run_file_bfs "${BFS_HAPPY_ARGS[@]}"
+  assert_rc_nonzero "bfs preflight: permanent auth failure exits nonzero" "$LAST_RC"
+  assert_contains "bfs preflight: surfaces the auth diagnostic" "$LAST_OUT" "Authentication failed"
+  assert_not_contains "bfs preflight: permanent failure is not reported as a retry timeout" "$LAST_OUT" "tries"
+  log="$(log_content)"
+  assert_eq "bfs preflight: exactly one ls attempt, no retries wasted on a permanent error" \
+    "1" "$(count_occurrences 'exapump bucketfs ls' "$log")"
+
   # Retry-then-hit: BucketFS's HTTP endpoint isn't up on the first two probes (a startup-ordering
   # race against the DB's own SQL-port readiness check), the third succeeds. Direct call with
   # sleep_seconds=0, same as the bucketfs_wait_for_path tests above, so this stays fast.
@@ -2730,6 +2849,7 @@ deployment_local_requires_ssh_and_scp() {
 main() {
   test_missing_prereq_fails_fast
   test_exapump_auto_install
+  test_exapump_interactive_prompt
   test_connectivity_mode_either_or
   test_host_mode_requires_port
   test_host_dsn_percent_encodes_credentials
