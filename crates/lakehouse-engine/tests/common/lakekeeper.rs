@@ -467,7 +467,6 @@ fn post_warehouse(
 /// addressing, and a vended STS credential can state (or default to)
 /// virtual-hosted-style, which MinIO cannot serve. The CONNECTION's stated value
 /// wins over whatever the vended response says, so stating it here is load-bearing.
-
 pub fn lakekeeper_connection_password(
     warehouse_name: &str,
     vended: bool,
