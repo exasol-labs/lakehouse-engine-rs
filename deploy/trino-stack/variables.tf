@@ -4,6 +4,11 @@ variable "region" {
   description = "Must match the data-stack region."
 }
 
+variable "tofu_state_bucket" {
+  type        = string
+  description = "S3 bucket holding this repo's tofu state (see deploy/*/backend.hcl, gitignored). Not defaulted so the bucket name never lands in git."
+}
+
 variable "env_name" {
   type        = string
   description = "Test environment name; resources are named spot-strata-<env_name>-trino-*. Pass per benchmark run."

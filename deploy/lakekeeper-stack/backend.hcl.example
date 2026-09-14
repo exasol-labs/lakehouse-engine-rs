@@ -1,0 +1,7 @@
+# Copy to backend.hcl (gitignored) and fill in the real values — ask a teammate or check the
+# team password manager, never commit the real bucket name (it embeds the AWS account id).
+# Then: tofu init -backend-config=backend.hcl
+bucket       = "REPLACE_WITH_YOUR_STATE_BUCKET"
+key          = "tofu-state/lakekeeper-stack/terraform.tfstate"
+region       = "eu-west-1"
+use_lockfile = true
