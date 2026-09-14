@@ -330,9 +330,7 @@ async fn run_scan_dispatch(
     // place every run path funnels through, and the session still holds the
     // failure as a typed value — so the arithmetic error is named here rather
     // than at three call sites that would each have to remember to.
-    result.map_err(|e| {
-        emit::reframe_checked_division(session_ctx, e, &spec.common.all_secret_values())
-    })
+    result.map_err(|e| emit::reframe_checked_division(session_ctx, e, &storage.all_secret_values()))
 }
 
 /// Emit the per-VM phase-telemetry record, gated on the debug level.

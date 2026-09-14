@@ -311,7 +311,7 @@ fn the_table_root_store_is_the_unwrapped_store_a_scan_side_wraps() {
 fn build_session_context_registers_the_checked_float_div_function() {
     let spec = minimal_spec();
 
-    let ctx = build_session_context(&spec, 0).expect("build must succeed");
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
 
     let registered = ctx
         .state()
