@@ -144,6 +144,7 @@ PYEOF
 )"
   LAST_RC="$(printf '%s' "$py_out" | head -1)"
   LAST_OUT="$(printf '%s' "$py_out" | tail -n +2)"
+  return 0
 }
 
 write_exapump_stub() {
@@ -703,6 +704,7 @@ test_exapump_interactive_prompt() {
   assert_contains "interactive prompt, refuse: names the refusal" "$LAST_OUT" "exapump not installed. Install it yourself"
   log="$(log_content)"
   assert_eq "interactive prompt, refuse: never attempts the fetch" "" "$log"
+  return 0
 }
 
 test_connectivity_mode_either_or() {

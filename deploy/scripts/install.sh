@@ -144,6 +144,7 @@ ensure_exapump() {
     return 1
   }
   log "exapump installed: $(exapump --version </dev/null 2>&1 | head -1)"
+  return 0
 }
 
 # Percent-encodes a string for safe inclusion in a DSN's userinfo component (RFC 3986 unreserved
