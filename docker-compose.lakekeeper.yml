@@ -147,7 +147,7 @@ services:
   # `lakekeeper` user below, so returned session creds are capped at the
   # `warehouse` bucket. One-shot; idempotent on re-`up`.
   minio-lakekeeper-init:
-    image: minio/mc:RELEASE.2025-08-13T08-35-41Z
+    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
     depends_on:
       minio:
         condition: service_healthy
