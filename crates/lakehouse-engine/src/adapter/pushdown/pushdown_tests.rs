@@ -42,7 +42,6 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
     let spec = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
-            emit_exa_types: vec!["DECIMAL(20,0)".into()],
             storage: ScanStorage::Inline(vended_storage),
             ..Default::default()
         },
@@ -420,7 +419,6 @@ fn scan_spec_carries_no_catalog_block() {
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
-            emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
@@ -2617,7 +2615,6 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
             "df_batch_size",
             "df_target_partitions",
             "df_threads_per_udf",
-            "emit_exa_types",
             "instance_overhead_mb",
             "logical_schema",
             "memory_pool_fraction",
@@ -2635,7 +2632,6 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
     let expected = CommonScanSpec {
         table_root: "s3://bucket/orders".to_string(),
         projection: vec![ProjectionItem::Column("INT_COL".to_string())],
-        emit_exa_types: vec!["DECIMAL(10,0)".to_string()],
         logical_schema: vec![LogicalField {
             field_id: None,
             name: "int_col".to_string(),

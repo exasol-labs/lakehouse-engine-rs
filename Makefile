@@ -79,7 +79,7 @@ export LH_REST_PORT
 # They FAIL (not skip) when the stack is unavailable. All tests share one VS,
 # so the binary runs serially (--test-threads=1).
 test-e2e: cross-udf-build
-	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test --test e2e_credential_exposure_test --test e2e_version_udf_test -- --test-threads=1
+	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test --test e2e_credential_exposure_test --test e2e_version_udf_test --test e2e_emit_declaration_test -- --test-threads=1
 
 # Lakekeeper E2E tests require a live Exasol + MinIO + Lakekeeper + Keycloak
 # stack — bring it up first with the `docker-compose.lakekeeper.yml` overlay:
@@ -138,6 +138,11 @@ $(error ARCH must be 'x86_64' or 'aarch64'; got '$(ARCH)')
 endif
 SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION)$(SLC_ARCH_SUFFIX).tar.gz
 EXASOL_CONTAINER ?= lakehouse-engine-rs-exasol-1
+
+# The single owner of how the SLC version is read out of the workspace manifest;
+# bench/run.sh consumes this rather than re-encoding the expression.
+print-slc-version:
+	@echo $(SLC_VERSION)
 
 install-slc:
 	@echo "=== install-slc: downloading SLC rootfs lc-rust-$(SLC_VERSION).tar.gz ==="
@@ -294,4 +299,4 @@ test-e2e-unity: cross-udf-build
 	$(MAKE) unity-up
 	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
 
-.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts
+.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc print-slc-version bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts

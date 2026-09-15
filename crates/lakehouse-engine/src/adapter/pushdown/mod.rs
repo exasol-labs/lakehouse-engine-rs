@@ -354,7 +354,7 @@ pub(crate) fn build_dispatch_sql(
     // Shard-invariant fields shared by every fan-out `ScanSpec` this dispatcher
     // builds below. Each site spreads `..base.clone()` and sets only the fields
     // that differ; a field left unset keeps the inert placeholder here
-    // unchanged (empty projection/order_by/emit_exa_types, no filter/limit/
+    // unchanged (empty projection/order_by, no filter/limit/
     // aggregates/group_keys, `distinct: false` — the same neutral defaults
     // every non-aggregate, non-projecting site already needed).
     let base = CommonScanSpec {
@@ -366,7 +366,6 @@ pub(crate) fn build_dispatch_sql(
         aggregates: None,
         group_keys: None,
         distinct: false,
-        emit_exa_types: Vec::new(),
         logical_schema: logical_schema.clone(),
         name_mapping: name_mapping.clone(),
         join: None,
@@ -452,10 +451,8 @@ pub(crate) fn build_dispatch_sql(
             let group_key_types = group_key_exasol_types(pushdown_req, &group_keys, &select_items);
             // This branch is ALWAYS an aggregate dispatch — see `ScanSpec::projection`
             // doc for why an empty `projection` is inert here, not "all columns"
-            // (#145). Aggregate scans also emit via the freely-coercing Value path,
-            // not the strict emit_batch IPC path, so `emit_exa_types` needs no
-            // per-column declared types either — both stay at `base`'s empty
-            // placeholder, so neither is set explicitly below.
+            // (#145): it stays at `base`'s empty placeholder, so it is not set
+            // explicitly below.
             let spec_template = ScanSpec {
                 common: CommonScanSpec {
                     filter,
@@ -740,10 +737,10 @@ pub(crate) fn build_dispatch_sql(
     //
     // Position is load-bearing on BOTH sides. AFTER `detect_topn` (see its comment
     // above), and BEFORE the `spec_template` literal below: that literal derives the
-    // common blob's `projection` and `emit_exa_types` from these same two vectors that
-    // `build_scan_driving_sql` renders the EMITS clause from, so extending afterwards
-    // would declare a hidden column in EMITS that the scan spec never projects — and
-    // the UDF would never emit it.
+    // common blob's `projection` from the same vector that `build_scan_driving_sql`
+    // renders the EMITS clause from, so extending afterwards would declare a hidden
+    // column in EMITS that the scan spec never projects — and the UDF would never
+    // emit it.
     let visible_count = proj_cols.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
@@ -760,8 +757,8 @@ pub(crate) fn build_dispatch_sql(
     };
 
     // Computed once before the struct literal moves `aggregates` into its field:
-    // both `projection` and `emit_exa_types` are emptied on the aggregate sub-path
-    // of this shared `spec_template` (see their field comments below).
+    // `projection` is emptied on the aggregate sub-path of this shared
+    // `spec_template` (see its field comment below).
     let has_aggregates = aggregates.is_some();
 
     let spec_template = ScanSpec {
@@ -783,21 +780,6 @@ pub(crate) fn build_dispatch_sql(
             limit: effective_limit,
             order_by,
             aggregates,
-            // Like `projection` above, this field is SHARED via this `spec_template`
-            // between the single-group aggregate sub-path and the row-scan sub-path.
-            // The aggregate scan emits via the freely-coercing Value path and never
-            // reads `emit_exa_types` (matching the grouped branch, which empties it),
-            // so it is emptied when `aggregates.is_some()` — an inert value that keeps
-            // the EXPLAIN VIRTUAL common blob accurate instead of leaking a full
-            // base-table type list (#145, the sibling symptom to `projection`). The
-            // row-scan sub-path MUST keep `proj_types`: the scan coerces each emitted
-            // Arrow column to the type its declared ExaType accepts before emit_batch,
-            // and it is the same list the EMITS clause is built from.
-            emit_exa_types: if has_aggregates {
-                Vec::new()
-            } else {
-                proj_types.clone()
-            },
             ..base.clone()
         },
         files: vec![],

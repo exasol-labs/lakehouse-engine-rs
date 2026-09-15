@@ -6,14 +6,19 @@
 //! (`register_aliased_scan_target`) and the COLUMN CONTRACT SQL builders
 //! (`build_partial_agg_sql_filtered` / `build_grouped_partial_agg_sql`).
 
+use arrow::array::ArrayRef;
+use arrow::datatypes::DataType;
 use datafusion::execution::context::SessionContext;
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::value::{ColumnInfo, Decimal, Value};
 use futures::StreamExt;
 
 use crate::scan::convert::arrow_value_at;
-use crate::scan::emit::classify_scan_error;
+use crate::scan::emit::{
+    check_declared_arity, classify_scan_error, coerce_column, declared_output_columns,
+    target_arrow_type,
+};
 use crate::scan::spec::{AggregatePlan, PartialAggColumn, ScanSpec, partial_column_name};
 use crate::scan::storage_ref::ResolvedScanStorage;
 
@@ -93,15 +98,21 @@ pub(super) async fn run_partial_aggregate(
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
 
+    // Both arms emit into the same declared EMITS clause, so the declaration is
+    // read once, above the split.
+    let declared = declared_output_columns(ctx)?;
+
     // The aggregate always produces exactly one row (even over an empty table).
     // Emit that row; if the query produced no batches at all (should not happen
     // for a well-formed aggregate), emit a row of NULLs.
     let row = match batches.first() {
-        Some(batch) if batch.num_rows() > 0 => partial_row_from_batch(aggregates, batch)?,
-        _ => emit_null_partial_row(aggregates),
+        Some(batch) if batch.num_rows() > 0 => {
+            partial_row_from_batch(aggregates, batch, &declared)?
+        }
+        _ => emit_null_partial_row(aggregates, &declared)?,
     };
 
-    ctx.emit(&row)?;
+    ctx.emit(row)?;
     Ok(())
 }
 
@@ -159,17 +170,21 @@ async fn run_grouped_partial_aggregate(
         .map_err(|e| classify_scan_error(e, &secrets))?;
 
     let n_group_keys = group_keys.len();
+    let declared = declared_output_columns(ctx)?;
 
     while let Some(result) = stream.next().await {
         let batch = result.map_err(|e| classify_scan_error(e, &secrets))?;
+        // Coerce the partial-aggregate columns once per batch; the group keys
+        // pass through untouched so their merge identity is unchanged.
+        let columns = coerce_partial_agg_columns(&batch, &declared, n_group_keys)?;
 
         for row_idx in 0..batch.num_rows() {
             // Group-key columns come first (columns 0 .. n_group_keys - 1).
             // They are emitted as VARCHAR strings regardless of the DataFusion type.
-            let mut row_values: Vec<Value> = Vec::with_capacity(batch.num_columns());
+            let mut row_values: Vec<Value> = Vec::with_capacity(columns.len());
 
-            for col_idx in 0..n_group_keys {
-                let raw = arrow_value_at(batch.column(col_idx), row_idx)?;
+            for column in columns.iter().take(n_group_keys) {
+                let raw = arrow_value_at(column.as_ref(), row_idx)?;
                 // Stringify for GK_i VARCHAR(2000000) column.
                 // Value has no Display; format each variant explicitly.
                 let gk_str = value_to_gk_string(raw);
@@ -177,13 +192,14 @@ async fn run_grouped_partial_aggregate(
             }
 
             // Partial aggregate columns follow.
-            for col_idx in n_group_keys..batch.num_columns() {
-                row_values.push(arrow_value_at(batch.column(col_idx), row_idx)?);
+            for column in columns.iter().skip(n_group_keys) {
+                row_values.push(arrow_value_at(column.as_ref(), row_idx)?);
             }
 
-            ctx.emit(&row_values)?;
+            ctx.emit(row_values)?;
         }
         // Drop the batch before fetching the next — never hold two batches at once.
+        drop(columns);
         drop(batch);
     }
 
@@ -266,19 +282,59 @@ fn value_to_gk_string(v: Value) -> Value {
 /// [`crate::scan::spec::AggKind::partial_columns`] owns the row's length and order:
 /// that ordering IS the row's whole contract, since the Exasol outer wrapper
 /// addresses these values positionally.
-fn emit_null_partial_row(aggregates: &[AggregatePlan]) -> Vec<exasol_udf_sdk::value::Value> {
-    use exasol_udf_sdk::value::Value;
-    aggregates
+///
+/// `declared` is the same output-column list the populated arm coerces against,
+/// so both arms of the single-group path agree on the `Value` variant every
+/// column carries — an empty shard emits into the identical `EMITS` clause.
+fn emit_null_partial_row(
+    aggregates: &[AggregatePlan],
+    declared: &[ColumnInfo],
+) -> Result<Vec<Value>, UdfError> {
+    let columns: Vec<PartialAggColumn> = aggregates
         .iter()
         .flat_map(|plan| plan.kind.partial_columns())
-        .map(|col| {
+        .copied()
+        .collect();
+    check_declared_arity(declared, columns.len())?;
+    columns
+        .iter()
+        .zip(declared)
+        .map(|(col, declared)| {
             if col.is_counter() {
-                Value::Int64(0)
+                counter_zero(declared)
             } else {
-                Value::Null
+                Ok(Value::Null)
             }
         })
         .collect()
+}
+
+/// The zero an empty shard contributes for a counter column, at the `Value`
+/// variant its declared output column admits.
+///
+/// The variant is read off the same [`target_arrow_type`] resolution the
+/// populated arm coerces to, so a counter's zero and a counter's real count
+/// cannot reach the wire as different variants of one declared column.
+fn counter_zero(declared: &ColumnInfo) -> Result<Value, UdfError> {
+    let target = target_arrow_type(declared)?;
+    match target {
+        DataType::Int32 => Ok(Value::Int32(0)),
+        DataType::Int64 => Ok(Value::Int64(0)),
+        DataType::Float64 => Ok(Value::Double(0.0)),
+        DataType::Decimal128(_, scale) => {
+            let scale = u8::try_from(scale).map_err(|_| {
+                UdfError::User(format!(
+                    "emit failed: counter column {} declares scale {scale}, which is not a decimal scale",
+                    declared.name
+                ))
+            })?;
+            Ok(Value::Numeric(Decimal { unscaled: 0, scale }))
+        }
+        other => Err(UdfError::User(format!(
+            "emit failed: counter column {} is declared {other:?}, which cannot carry a row count",
+            declared.name
+        ))),
+    }
 }
 
 /// Build the partial-aggregate SQL, optionally with a WHERE clause.
@@ -387,21 +443,58 @@ fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
 /// `partial_columns().len()` batch columns per aggregate — the count read from the
 /// one owner rather than re-derived here, because [`partial_select_items`] produced
 /// the batch from that same owner and a divergence would silently shift every later
-/// aggregate's value. Each column converts straight through [`arrow_value_at`].
+/// aggregate's value.
+///
+/// Each column is first coerced to the Arrow type its declared output column
+/// requires, so the `Value` [`arrow_value_at`] then produces is one the SDK's
+/// row validation admits for that column. The single-group path carries no group
+/// keys, so every column of this batch is a partial-aggregate column.
 fn partial_row_from_batch(
     aggregates: &[AggregatePlan],
     batch: &arrow::record_batch::RecordBatch,
+    declared: &[ColumnInfo],
 ) -> Result<Vec<Value>, UdfError> {
-    let mut row: Vec<Value> = Vec::with_capacity(batch.num_columns());
+    let columns = coerce_partial_agg_columns(batch, declared, 0)?;
+    let mut row: Vec<Value> = Vec::with_capacity(columns.len());
     let mut col = 0usize;
     for plan in aggregates {
         let width = plan.kind.partial_columns().len();
-        for c in col..col + width {
-            row.push(arrow_value_at(batch.column(c), 0)?);
+        for column in columns.iter().skip(col).take(width) {
+            row.push(arrow_value_at(column.as_ref(), 0)?);
         }
         col += width;
     }
     Ok(row)
+}
+
+/// Coerce the partial-aggregate columns of a partial result batch to the Arrow
+/// types their declared output columns require, returning every column of the
+/// batch in order.
+///
+/// Columns before `first_agg_column` are the grouped path's group keys and are
+/// returned untouched: they are declared `VARCHAR(2000000)` and stringified by
+/// [`value_to_gk_string`], and an Arrow cast to `Utf8` formats differently, which
+/// would change a group's merge identity across shards.
+fn coerce_partial_agg_columns(
+    batch: &arrow::record_batch::RecordBatch,
+    declared: &[ColumnInfo],
+    first_agg_column: usize,
+) -> Result<Vec<ArrayRef>, UdfError> {
+    check_declared_arity(declared, batch.num_columns())?;
+    batch
+        .columns()
+        .iter()
+        .zip(declared)
+        .enumerate()
+        .map(|(idx, (column, declared))| {
+            if idx < first_agg_column {
+                Ok(column.clone())
+            } else {
+                let target = target_arrow_type(declared)?;
+                coerce_column(column, declared, &target)
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

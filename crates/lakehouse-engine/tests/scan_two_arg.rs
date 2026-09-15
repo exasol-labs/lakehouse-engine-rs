@@ -27,7 +27,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::TestContext;
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, DeleteMechanism, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
@@ -73,6 +73,19 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
         .to_string()
 }
 
+/// The `EMITS` list for the `ID`/`NAME` projection when the adapter declares
+/// `ID` as `DECIMAL(20,0)` — above the engine's integer bins, so `ID` reaches
+/// the emitted batch as a decimal.
+fn id_name_as_decimal() -> Vec<ExaType> {
+    vec![scan_fixture::decimal(20, 0), scan_fixture::varchar()]
+}
+
+/// The same projection when the adapter declares `ID` in the engine's `Int64`
+/// bin, so `ID` reaches the emitted batch as an `Int64`.
+fn id_name_as_int64() -> Vec<ExaType> {
+    vec![ExaType::Int64, scan_fixture::varchar()]
+}
+
 fn scan_spec(file_url: String) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
         .map(|m| m.len())
@@ -81,7 +94,6 @@ fn scan_spec(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some("\"ID\" >= 10".into()),
-            emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
             storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
@@ -101,10 +113,11 @@ fn scan_spec(file_url: String) -> ScanSpec {
 /// columns it carries are irrelevant here — the spec is passed directly), and
 /// return the decoded emitted batches. Models the PRE-SPLIT single-argument
 /// path: the whole spec parsed up front, then the unchanged downstream scan.
-async fn run_with_spec(spec: &ScanSpec) -> Vec<RecordBatch> {
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![Value::String(
-        spec.to_json(),
-    )]));
+async fn run_with_spec(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![Value::String(spec.to_json())]),
+        emits,
+    );
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(
@@ -123,11 +136,14 @@ async fn run_with_spec(spec: &ScanSpec) -> Vec<RecordBatch> {
 /// blob (col 0) and the per-shard files JSON (col 1) through the production
 /// [`read_scan_spec`], then run the unchanged downstream scan over the
 /// reconstituted spec. Returns the decoded emitted batches.
-async fn run_two_arg(common_json: &str, files_json: &str) -> Vec<RecordBatch> {
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![
-        Value::String(common_json.to_string()),
-        Value::String(files_json.to_string()),
-    ]));
+async fn run_two_arg(common_json: &str, files_json: &str, emits: &[ExaType]) -> Vec<RecordBatch> {
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![
+            Value::String(common_json.to_string()),
+            Value::String(files_json.to_string()),
+        ]),
+        emits,
+    );
     // Production two-argument reconstitution (the code under test).
     let spec = read_scan_spec(&ctx).expect("reconstitute spec from two args");
     let session = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -265,8 +281,12 @@ fn scan_registers_only_assigned_files_two_arg() {
     );
 
     // Drive both paths against the same local Parquet.
-    let single = block_on(run_with_spec(&spec));
-    let two_arg = block_on(run_two_arg(&common_json, &files_json));
+    let single = block_on(run_with_spec(&spec, &id_name_as_decimal()));
+    let two_arg = block_on(run_two_arg(
+        &common_json,
+        &files_json,
+        &id_name_as_decimal(),
+    ));
 
     // Filter is "ID >= 10" over ids 0..200 → 190 surviving rows.
     assert_eq!(total_rows(&single), 190, "single-arg row count");
@@ -340,7 +360,7 @@ fn scan_registers_assigned_files_via_parquet_provider() {
     let common_json = spec.to_common_json();
     let files_json = ScanSpec::files_json(&spec.files);
 
-    let rows = block_on(run_two_arg(&common_json, &files_json));
+    let rows = block_on(run_two_arg(&common_json, &files_json, &id_name_as_int64()));
     let ids = ids_of(&rows);
 
     assert_eq!(
@@ -405,7 +425,7 @@ fn spec_reconstitutes_with_delete_entries() {
 
     // Functional reconstitution: driving the two-argument pipeline actually
     // applies the reconstituted deletes.
-    let rows = block_on(run_two_arg(&common_json, &files_json));
+    let rows = block_on(run_two_arg(&common_json, &files_json, &id_name_as_int64()));
     assert_eq!(total_rows(&rows), 18, "2 of 20 rows deleted");
     let ids = ids_of(&rows);
     assert!(!ids.contains(&2), "position 2 must be deleted: {ids:?}");

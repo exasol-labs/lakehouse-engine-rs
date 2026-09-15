@@ -2758,6 +2758,49 @@ pub fn typed_ts_case_distinct() -> i64 {
     )
 }
 
+/// Sample mean and sample standard deviation (SQL `STDDEV`, i.e.
+/// `STDDEV_SAMP`) of the non-`None` cells of an `f64` column — the reference
+/// oracle for `AVG`/`STDDEV` end-to-end assertions, computed independently of
+/// the scan/aggregate pushdown path this seed backs.
+fn avg_and_stddev_samp(values: impl Iterator<Item = Option<f64>>) -> (f64, f64) {
+    let xs: Vec<f64> = values.flatten().collect();
+    let n = xs.len() as f64;
+    let mean = xs.iter().sum::<f64>() / n;
+    let variance = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    (mean, variance.sqrt())
+}
+
+/// `AVG(id)`/`STDDEV(id)` oracle for `typed_distinct_probe`'s bare `BIGINT`
+/// `id` column (issue #399: exercises the `AvgSum`/`StatSum`/`StatSumSq`
+/// partial-aggregate mismatch over a non-`DOUBLE` column for the first time).
+pub fn typed_id_avg_stddev() -> (f64, f64) {
+    avg_and_stddev_samp(typed_probe().ids.into_iter().map(|id| Some(id as f64)))
+}
+
+/// `AVG(c_decimal_a)`/`STDDEV(c_decimal_a)` oracle (`DECIMAL(9,2)`).
+pub fn typed_decimal_a_avg_stddev() -> (f64, f64) {
+    let (_, scale) = TYPED_DECIMAL_A_PS;
+    let divisor = 10f64.powi(scale as i32);
+    avg_and_stddev_samp(
+        typed_probe()
+            .decimal_a
+            .into_iter()
+            .map(|v| v.map(|unscaled| unscaled as f64 / divisor)),
+    )
+}
+
+/// `AVG(c_decimal_b)`/`STDDEV(c_decimal_b)` oracle (`DECIMAL(20,4)`).
+pub fn typed_decimal_b_avg_stddev() -> (f64, f64) {
+    let (_, scale) = TYPED_DECIMAL_B_PS;
+    let divisor = 10f64.powi(scale as i32);
+    avg_and_stddev_samp(
+        typed_probe()
+            .decimal_b
+            .into_iter()
+            .map(|v| v.map(|unscaled| unscaled as f64 / divisor)),
+    )
+}
+
 /// Seed the `typed_distinct_probe` table into the `e2e_lakehouse` namespace across
 /// TWO data files (rows 1..=6, 7..=12). Idempotent.
 pub async fn seed_typed_distinct_probe(catalog_url: &str, warehouse: &str) -> Result<()> {

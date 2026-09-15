@@ -36,6 +36,7 @@ use chrono::{TimeZone, Utc};
 use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::execution::context::SessionContext;
 use exasol_udf_sdk::test_support::TestContext;
+use exasol_udf_sdk::value::ExaType;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
@@ -607,7 +608,10 @@ async fn run_scan_capturing_session(
     session
         .runtime_env()
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![]),
+        &[ExaType::Int64, scan_fixture::varchar()],
+    );
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(
         &mut ctx,

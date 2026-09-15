@@ -209,7 +209,6 @@ fn delete_spec_template() -> ScanSpec {
         common: CommonScanSpec {
             table_root: "s3://warehouse/db/table".into(),
             projection: vec![ProjectionItem::Column("ID".into())],
-            emit_exa_types: vec!["DECIMAL(20,0)".into()],
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
@@ -1580,7 +1579,7 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
 #[test]
 fn multi_count_distinct_declines_to_qualified_wrapper() {
     use super::super::joins::{
-        build_qualified_single_table_fallback_sql, referenced_column_projection,
+        FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
     };
     use super::super::single_group_agg::{has_distinct, is_lone_count_distinct};
 
@@ -1626,16 +1625,16 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     let fan_out_spec = ScanSpec {
         common: CommonScanSpec {
             projection: proj,
-            emit_exa_types: proj_types,
             ..base.common
         },
         files: base.files,
     };
     let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
+    let fan_out = FanOutProjection::new(&fan_out_spec, &proj_types).expect("aligned fan-out");
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
-        &fan_out_spec,
+        &fan_out,
         &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -2943,16 +2942,18 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) ->
                 .iter()
                 .map(|(name, _)| ProjectionItem::Column(name.clone()))
                 .collect(),
-            emit_exa_types: col_types.iter().map(|(_, ty)| ty.clone()).collect(),
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
     };
+    let proj_types: Vec<String> = col_types.iter().map(|(_, ty)| ty.clone()).collect();
+    let fan_out = super::super::joins::FanOutProjection::new(&fan_out_spec, &proj_types)
+        .expect("aligned fan-out");
     super::super::joins::build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
-        &fan_out_spec,
+        &fan_out,
         &[vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

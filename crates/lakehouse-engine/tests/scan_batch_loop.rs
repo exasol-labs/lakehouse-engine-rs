@@ -42,7 +42,7 @@ use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::{NextPolicy, TestContext};
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NestedMembers, ScanSpec, ScanStorage, StorageBackend,
@@ -92,6 +92,12 @@ fn file_size(file_url: &str) -> u64 {
         .unwrap_or(0)
 }
 
+/// The `EMITS` list the adapter generates for the ID/NAME projection: `ID` as a
+/// `DECIMAL(20,0)` the engine bins to NUMERIC, `NAME` as `VARCHAR(2000000)`.
+fn id_name_emits() -> Vec<ExaType> {
+    vec![scan_fixture::decimal(20, 0), scan_fixture::varchar()]
+}
+
 /// A minimal raw-scan `ScanSpec` over one file (absolute `file://` URL, empty
 /// `table_root`, no filter/limit), projecting ID/NAME.
 fn spec_for_file(file_url: String) -> ScanSpec {
@@ -99,7 +105,6 @@ fn spec_for_file(file_url: String) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
-            emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
             storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
@@ -165,9 +170,8 @@ fn write_parquet_tags(dir: &std::path::Path, name: &str) -> String {
 }
 
 /// A raw-scan `ScanSpec` over one file declaring `tags` as a nested `list`
-/// column via the logical schema (field-id path), projecting ID/TAGS with the
-/// given `emit_exa_types`.
-fn nested_spec_for_file(file_url: String, emit_exa_types: Vec<String>) -> ScanSpec {
+/// column via the logical schema (field-id path), projecting ID/TAGS.
+fn nested_spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
     ScanSpec {
         common: CommonScanSpec {
@@ -192,7 +196,6 @@ fn nested_spec_for_file(file_url: String, emit_exa_types: Vec<String>) -> ScanSp
                     physical_name: None,
                 },
             ],
-            emit_exa_types,
             storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
@@ -219,7 +222,6 @@ fn distinct_spec_for_file(file_url: String) -> ScanSpec {
         common: CommonScanSpec {
             projection: vec!["CATEGORY".into()],
             distinct: true,
-            emit_exa_types: vec!["VARCHAR(2000000)".into()],
             storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
@@ -338,13 +340,14 @@ fn counting_build_runtime(threads: usize, built: &AtomicUsize) -> tokio::runtime
 /// (proving the read-one-row-no-`next()` contract), build a fresh runtime, run
 /// [`run_scan_one`] to completion on it, then tear that runtime down explicitly —
 /// mirroring production `run_scan` for a single row. Returns the emitted batches.
-fn run_one_row(spec: &ScanSpec, built: &AtomicUsize) -> Vec<RecordBatch> {
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(
+fn run_one_row(spec: &ScanSpec, emits: &[ExaType], built: &AtomicUsize) -> Vec<RecordBatch> {
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(row_for_spec(spec)).with_next_policy(NextPolicy::Reject(
             UdfError::User(
                 "scalar run() handles exactly one row; ctx.next() must never be called".into(),
             ),
         )),
+        emits,
     );
     // Reconstitute this row's spec from the two scalar arguments, exactly as
     // production does — reading only columns 0 and 1, never calling ctx.next().
@@ -367,8 +370,11 @@ fn run_one_row(spec: &ScanSpec, built: &AtomicUsize) -> Vec<RecordBatch> {
 /// Drive one independent scalar `run()` call per shard spec and concatenate the
 /// emitted batches across all N calls. This concatenation IS the fan-out UNION the
 /// regression guard asserts against.
-fn run_all_rows(specs: &[ScanSpec], built: &AtomicUsize) -> Vec<RecordBatch> {
-    specs.iter().flat_map(|s| run_one_row(s, built)).collect()
+fn run_all_rows(specs: &[ScanSpec], emits: &[ExaType], built: &AtomicUsize) -> Vec<RecordBatch> {
+    specs
+        .iter()
+        .flat_map(|s| run_one_row(s, emits, built))
+        .collect()
 }
 
 /// N independent per-row `run()` calls emit the UNION of every shard: the three
@@ -387,7 +393,7 @@ fn per_row_calls_emit_union_of_all_shards() {
     ];
 
     let built = AtomicUsize::new(0);
-    let emitted = run_all_rows(&specs, &built);
+    let emitted = run_all_rows(&specs, &id_name_emits(), &built);
 
     assert_eq!(
         total_rows(&emitted),
@@ -422,7 +428,7 @@ fn run_scan_one_builds_and_tears_down_runtime_per_call() {
     ];
 
     let built = AtomicUsize::new(0);
-    let emitted = run_all_rows(&specs, &built);
+    let emitted = run_all_rows(&specs, &id_name_emits(), &built);
 
     assert_eq!(
         built.load(Ordering::SeqCst),
@@ -452,17 +458,18 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
 
     // Per-row path: one scalar run() call through the production per-row seam.
     let built = AtomicUsize::new(0);
-    let per_row = run_one_row(&spec, &built);
+    let per_row = run_one_row(&spec, &id_name_emits(), &built);
 
     // Reference: drive the unchanged downstream raw-scan path over the same spec,
     // with an equivalent local session.
     let reference = block_on(async {
-        let mut ctx = scan_fixture::BatchCapturingCtx::new(
+        let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
             TestContext::scalar(row_for_spec(&spec)).with_next_policy(NextPolicy::Reject(
                 UdfError::User(
                     "scalar run() handles exactly one row; ctx.next() must never be called".into(),
                 ),
             )),
+            &id_name_emits(),
         );
         let session =
             local_session(&spec, &scan_fixture::resolved_storage(&spec), 0).expect("session");
@@ -509,7 +516,7 @@ fn distinct_row_scan_streams_one_row_per_distinct_value() {
     let spec = distinct_spec_for_file(file_url);
 
     let built = AtomicUsize::new(0);
-    let emitted = run_one_row(&spec, &built);
+    let emitted = run_one_row(&spec, &[scan_fixture::varchar()], &built);
 
     assert_eq!(
         total_rows(&emitted),
@@ -526,62 +533,89 @@ fn distinct_row_scan_streams_one_row_per_distinct_value() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Scenario (`datafusion-scan/scan-execution-emit-declaration`): every column
+/// the raw scan emits carries the Arrow type its declared `EMITS` `ExaType`
+/// requires, through the real `run_scan_one` path rather than a direct call to
+/// the coercion function.
+///
+/// Both projected columns need a genuine cast: DataFusion's Parquet scan yields
+/// `Int64` for `ID` while the call declares `DECIMAL(20,0)` (which Exasol bins
+/// to NUMERIC, so the target is `Decimal128(20,0)`), and the string column is
+/// declared `VARCHAR(2000000)`, whose target is `Utf8`. The declaration read
+/// back from the context is the sole authority here — no type travels in the
+/// scan spec — so this proves the accessors reach the batch loop and that the
+/// values survive the cast unchanged.
+#[test]
+fn raw_scan_coerces_every_column_to_its_declared_output_type() {
+    let dir = std::env::temp_dir().join(format!("lh_emit_coercion_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let spec = spec_for_file(write_parquet_ids(&dir, "coerce.parquet", 0, 10));
+    let built = AtomicUsize::new(0);
+    let emitted = run_one_row(&spec, &id_name_emits(), &built);
+
+    assert_eq!(total_rows(&emitted), 10, "all 10 rows must be emitted");
+    for batch in &emitted {
+        let schema = batch.schema();
+        assert_eq!(
+            schema
+                .field(schema.index_of("ID").expect("ID present"))
+                .data_type(),
+            &DataType::Decimal128(20, 0),
+            "ID must reach emit_batch as the Decimal128 its DECIMAL(20,0) declaration requires"
+        );
+        assert_eq!(
+            schema
+                .field(schema.index_of("NAME").expect("NAME present"))
+                .data_type(),
+            &DataType::Utf8,
+            "NAME must reach emit_batch as the Utf8 its VARCHAR declaration requires"
+        );
+    }
+
+    assert_eq!(
+        ids_of(&emitted),
+        (0..10).collect::<Vec<i64>>(),
+        "the ID values must round-trip through the cast unchanged"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Scenario (nested-json-rendering): a nested column already rendered to JSON
 /// upstream crosses `coerce_batch_to_exa_types` (the emit-coercion boundary)
-/// UNCHANGED. Compares a declared-VARCHAR run (the cast-to-Utf8 branch) against
-/// an undeclared-type run (the view-type-normalization fallback branch): both
-/// already receive a Utf8 column post-render, so both must emit byte-identical
-/// JSON text — proof neither coercion branch needs a nested-aware special case,
-/// because the rendering already happened upstream of this boundary.
+/// UNCHANGED. The declared `VARCHAR(2000000)` column takes the cast-to-Utf8
+/// branch, and the JSON text arrives byte-identical — proof that branch needs no
+/// nested-aware special case, because the rendering already happened upstream of
+/// this boundary.
 #[test]
 fn rendered_nested_column_passes_the_emit_coercion_unchanged() {
     let dir = std::env::temp_dir().join(format!("lh_emit_nested_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let file_url = write_parquet_tags(&dir, "tags.parquet");
 
-    let declared = nested_spec_for_file(
-        file_url.clone(),
-        vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
-    );
-    let undeclared = nested_spec_for_file(file_url.clone(), vec![]);
+    let spec = nested_spec_for_file(file_url);
 
     let built = AtomicUsize::new(0);
-    let declared_emitted = run_one_row(&declared, &built);
-    let undeclared_emitted = run_one_row(&undeclared, &built);
+    let emitted = run_one_row(&spec, &id_name_emits(), &built);
 
-    let rendered_tags = |batches: &[RecordBatch]| -> Vec<Option<String>> {
-        let mut out = Vec::new();
-        for batch in batches {
-            let index = batch.schema().index_of("TAGS").expect("TAGS present");
-            let col = batch.column(index);
-            if let Some(v) = col.as_any().downcast_ref::<StringViewArray>() {
-                for i in 0..batch.num_rows() {
-                    out.push((!v.is_null(i)).then(|| v.value(i).to_string()));
-                }
-            } else if let Some(s) = col.as_any().downcast_ref::<StringArray>() {
-                for i in 0..batch.num_rows() {
-                    out.push((!s.is_null(i)).then(|| s.value(i).to_string()));
-                }
-            } else {
-                panic!("unexpected TAGS column type: {:?}", col.data_type());
-            }
+    let mut rendered: Vec<Option<String>> = Vec::new();
+    for batch in &emitted {
+        let index = batch.schema().index_of("TAGS").expect("TAGS present");
+        let col = batch.column(index);
+        let text = col
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap_or_else(|| panic!("unexpected TAGS column type: {:?}", col.data_type()));
+        for i in 0..batch.num_rows() {
+            rendered.push((!text.is_null(i)).then(|| text.value(i).to_string()));
         }
-        out
-    };
-
-    let declared_tags = rendered_tags(&declared_emitted);
-    let undeclared_tags = rendered_tags(&undeclared_emitted);
+    }
 
     assert_eq!(
-        declared_tags,
+        rendered,
         vec![Some(r#"["hello","world"]"#.to_string())],
         "the rendered nested column must cross the emit boundary as valid JSON, not display text"
-    );
-    assert_eq!(
-        declared_tags, undeclared_tags,
-        "a declared-VARCHAR emit coercion (cast-to-Utf8 branch) and an undeclared-type \
-         coercion (view-type-normalization branch) must emit the identical rendered JSON — \
-         proof neither branch needs nested-aware special-casing"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

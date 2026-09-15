@@ -54,7 +54,7 @@ pub async fn run_join_scan_with_session(
         .execute_stream()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
-    emit_stream(ctx, stream, &secrets, &spec.common.emit_exa_types, timers).await?;
+    emit_stream(ctx, stream, &secrets, timers).await?;
     emit_phase_telemetry(ctx, timers);
     Ok(())
 }
@@ -137,8 +137,8 @@ async fn register_join_tables(
 ///
 /// The dimension side is placed on the LEFT so it is the hash-join build side (see
 /// [`run_join_scan_with_session`]). Output column order follows `spec.common.projection`
-/// (positionally aligned with `emit_exa_types`); an empty projection expands to
-/// every column, dimension columns first. The row cap comes from
+/// (positionally aligned with the call-site `EMITS (...)` declaration); an empty
+/// projection expands to every column, dimension columns first. The row cap comes from
 /// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit)
 /// and is applied HERE — after the join and its
 /// `WHERE` — never to either side's registered scan; see that field's doc.

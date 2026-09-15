@@ -309,8 +309,8 @@ fn build_aggregate_scan_sql<E: Clone + Into<FileEntry>>(
 /// the type Exasol declares for a `COUNT(DISTINCT)`, so the count needs no output cast.
 ///
 /// `base_spec` carries the shared shard-invariant fields (filter, storage, schema,
-/// tuning) with `aggregates`/`projection`/`emit_exa_types` empty, `distinct` false,
-/// and no LIMIT/ORDER BY.
+/// tuning) with `aggregates`/`projection` empty, `distinct` false, and no
+/// LIMIT/ORDER BY.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_count_distinct_scan_sql<E: Clone + Into<FileEntry>>(
     base_spec: &ScanSpec,
@@ -403,7 +403,6 @@ fn build_distinct_fan_out<E: Clone + Into<FileEntry>>(
             aggregates: None,
             group_keys: None,
             distinct: true,
-            emit_exa_types: vec![value_type.clone()],
             ..base_spec.common.clone()
         },
         files: base_spec.files.clone(),

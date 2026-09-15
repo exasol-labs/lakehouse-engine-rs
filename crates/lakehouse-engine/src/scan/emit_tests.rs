@@ -1,10 +1,11 @@
+use super::declared_columns_test_support::{declared, numeric, varchar};
 use super::*;
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::RecordBatchStream;
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::value::{ColumnInfo, ExaType, Value};
 use futures::stream;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -26,24 +27,33 @@ fn redact_storage_error_redacts_secret_values_end_to_end() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Fake UdfContext that captures Arrow IPC bytes from emit_batch.
-// emit() is intentionally left as a no-op trap — if emit_stream calls it on
-// the raw-row path, emit_was_called == true will fail the assertion.
-// ---------------------------------------------------------------------------
 struct CapturingCtx {
     /// Row-by-row emit calls — must be empty after emit_stream on the raw path.
     rows: Vec<Vec<Value>>,
     /// Accumulated IPC byte payloads, one entry per emit_batch call.
     ipc_batches: Vec<Vec<u8>>,
+    /// Declared output columns, read back through `UdfContext::output_column`.
+    output_columns: Vec<exasol_udf_sdk::value::ColumnInfo>,
+    /// Reported arity when it must exceed what `output_column` can hand out —
+    /// the truncated-declaration shape a well-formed list cannot express.
+    declared_arity_override: Option<usize>,
 }
 
 impl CapturingCtx {
-    fn new() -> Self {
+    /// A context whose declared list is `columns` verbatim, for the drift cases
+    /// a well-formed `EMITS` list cannot express.
+    fn with_columns(columns: Vec<ColumnInfo>) -> Self {
         Self {
             rows: Vec::new(),
             ipc_batches: Vec::new(),
+            output_columns: columns,
+            declared_arity_override: None,
         }
+    }
+
+    /// A context whose call site declared `types` as its `EMITS` list.
+    fn declaring(types: &[(&str, ExaType)]) -> Self {
+        Self::with_columns(declared(types))
     }
 
     /// Decode all captured IPC payloads back to RecordBatches for assertions.
@@ -70,9 +80,29 @@ impl exasol_udf_sdk::context::UdfContext for CapturingCtx {
     fn get(&self, _col: usize) -> Result<&Value, exasol_udf_sdk::error::UdfError> {
         Err(exasol_udf_sdk::error::UdfError::User("no input".into()))
     }
+    fn input_column(
+        &self,
+        idx: usize,
+    ) -> Result<&exasol_udf_sdk::value::ColumnInfo, exasol_udf_sdk::error::UdfError> {
+        Err(exasol_udf_sdk::error::UdfError::Type(format!(
+            "input column {idx} out of range"
+        )))
+    }
+    fn output_column_count(&self) -> usize {
+        self.declared_arity_override
+            .unwrap_or(self.output_columns.len())
+    }
+    fn output_column(
+        &self,
+        idx: usize,
+    ) -> Result<&exasol_udf_sdk::value::ColumnInfo, exasol_udf_sdk::error::UdfError> {
+        self.output_columns.get(idx).ok_or_else(|| {
+            exasol_udf_sdk::error::UdfError::Type(format!("output column {idx} out of range"))
+        })
+    }
     /// Row-by-row emit — must NOT be called on the raw-row emit_stream path.
-    fn emit(&mut self, values: &[Value]) -> Result<(), exasol_udf_sdk::error::UdfError> {
-        self.rows.push(values.to_vec());
+    fn emit(&mut self, values: Vec<Value>) -> Result<(), exasol_udf_sdk::error::UdfError> {
+        self.rows.push(values);
         Ok(())
     }
     fn next(&mut self) -> Result<bool, exasol_udf_sdk::error::UdfError> {
@@ -145,9 +175,9 @@ async fn emits_batch_by_batch_without_materializing() {
     ];
     let stream = Box::pin(VecStream::new(input_batches));
 
-    let mut ctx = CapturingCtx::new();
+    let mut ctx = CapturingCtx::declaring(&[("x", ExaType::Int32)]);
     let mut timers = PhaseTimers::start();
-    let total = emit_stream(&mut ctx, stream, &[], &[], &mut timers)
+    let total = emit_stream(&mut ctx, stream, &[], &mut timers)
         .await
         .unwrap();
 
@@ -281,73 +311,81 @@ async fn resources_exhausted_surfaces_as_memory_error_not_storage_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Task R7 — Utf8View normalization: emit_stream must not crash on view types
-// ---------------------------------------------------------------------------
-
-/// Scenario: with NO declared types (`&[]`), `coerce_batch_to_exa_types`
-/// normalizes Utf8View → Utf8 and leaves non-view columns untouched — the
-/// backward-compatible fallback for specs that predate `emit_exa_types`.
-///
-/// Invariants:
-/// 1. A batch with only non-view types is returned unchanged (fast path).
-/// 2. A batch with Utf8View is rebuilt: column type becomes Utf8, values preserved.
-/// 3. A mixed batch (Int32 + Utf8View) normalizes only the view column.
-#[test]
-fn coerce_batch_empty_types_normalizes_utf8view_to_utf8() {
-    use arrow::array::{StringArray, StringViewArray};
-    use arrow::datatypes::Field;
-
-    // Fast path: no view types — the batch is returned unchanged.
-    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-    let col = Arc::new(Int32Array::from(vec![1i32, 2]));
-    let batch = RecordBatch::try_new(schema, vec![col]).unwrap();
-    let result = coerce_batch_to_exa_types(batch.clone(), &[]).unwrap();
-    assert_eq!(
-        result.schema(),
-        batch.schema(),
-        "fast path: schema unchanged"
-    );
-    assert_eq!(result.num_rows(), 2, "fast path: row count unchanged");
-
-    // Utf8View column → Utf8.
-    let view_arr = StringViewArray::from(vec!["hello", "world"]);
-    let view_schema = Arc::new(Schema::new(vec![Field::new(
-        "s",
-        DataType::Utf8View,
-        false,
-    )]));
-    let view_batch = RecordBatch::try_new(view_schema, vec![Arc::new(view_arr)]).unwrap();
-    let normalized = coerce_batch_to_exa_types(view_batch, &[]).unwrap();
-    assert_eq!(
-        normalized.schema().field(0).data_type(),
-        &DataType::Utf8,
-        "Utf8View must be normalized to Utf8"
-    );
-    let str_col = normalized
-        .column(0)
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .expect("normalized column must be StringArray (Utf8)");
-    assert_eq!(str_col.value(0), "hello");
-    assert_eq!(str_col.value(1), "world");
-
-    // Mixed: Int32 + Utf8View — only the view column changes.
-    let mixed_schema = Arc::new(Schema::new(vec![
-        Field::new("n", DataType::Int32, false),
-        Field::new("s", DataType::Utf8View, false),
-    ]));
-    let int_col = Arc::new(Int32Array::from(vec![42i32]));
-    let view_col = Arc::new(StringViewArray::from(vec!["abc"]));
-    let mixed_batch =
-        RecordBatch::try_new(mixed_schema, vec![int_col, view_col as Arc<_>]).unwrap();
-    let norm = coerce_batch_to_exa_types(mixed_batch, &[]).unwrap();
-    assert_eq!(norm.schema().field(0).data_type(), &DataType::Int32);
-    assert_eq!(norm.schema().field(1).data_type(), &DataType::Utf8);
-}
-
-// ---------------------------------------------------------------------------
 // Coerce-to-declared-ExaType — table-driven over the full mapping
 // ---------------------------------------------------------------------------
+
+/// Scenario: every `ExaType` variant the database can report resolves to the
+/// Arrow type `emit_batch`'s strict IPC feed accepts for it.
+///
+/// The DECIMAL bin is READ, never re-derived: `Int32`, `Int64` and
+/// `Numeric { precision, scale }` are three distinct variants the engine
+/// already chose between, so nothing here parses a precision out of a type
+/// string. Every remaining variant feeds `Utf8`, which subsumes the
+/// `Utf8View`/`BinaryView` normalization and preserves what the removed
+/// type-string path gave an unrecognized declaration.
+#[test]
+fn coerce_maps_every_exa_type_variant_to_its_arrow_target() {
+    use arrow::datatypes::TimeUnit;
+
+    let cases: Vec<(ExaType, DataType)> = vec![
+        (ExaType::Boolean, DataType::Boolean),
+        (ExaType::Double, DataType::Float64),
+        (ExaType::Int32, DataType::Int32),
+        (ExaType::Int64, DataType::Int64),
+        (numeric(20, 0), DataType::Decimal128(20, 0)),
+        (numeric(36, 12), DataType::Decimal128(36, 12)),
+        (ExaType::Date, DataType::Date32),
+        (
+            ExaType::Timestamp,
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+        ),
+        (
+            ExaType::TimestampTz,
+            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        ),
+        (varchar(), DataType::Utf8),
+        (ExaType::Char { size: Some(10) }, DataType::Utf8),
+        (ExaType::Geometry, DataType::Utf8),
+        (ExaType::HashType, DataType::Utf8),
+        (ExaType::IntervalYearToMonth, DataType::Utf8),
+        (ExaType::IntervalDayToSecond, DataType::Utf8),
+        (ExaType::Unsupported, DataType::Utf8),
+    ];
+
+    for (typ, expected) in cases {
+        let column = &declared(&[("C0", typ.clone())])[0];
+        let got = target_arrow_type(column).unwrap_or_else(|e| {
+            panic!("declared {typ:?} must resolve to an Arrow target, got error: {e}")
+        });
+        assert_eq!(got, expected, "declared {typ:?} must map to {expected:?}");
+    }
+}
+
+/// Scenario (`type-mapping-timestamp-precision`): every declared `TIMESTAMP(p)`
+/// reaches the scan as the single variant `ExaType::Timestamp`, and that variant
+/// resolves to the microsecond Arrow timestamp — never the `Utf8` string path,
+/// which would stringify the value and violate the `TIMESTAMP(p)` declaration.
+///
+/// The rule is structural rather than parser-dependent: `ExaType` models no
+/// fractional-second precision at all, so `p` cannot reach this decision.
+#[test]
+fn exa_type_timestamp_maps_to_microsecond_target() {
+    use arrow::datatypes::TimeUnit;
+
+    let plain = &declared(&[("TS", ExaType::Timestamp)])[0];
+    assert_eq!(
+        target_arrow_type(plain).expect("TIMESTAMP must resolve"),
+        DataType::Timestamp(TimeUnit::Microsecond, None),
+        "ExaType::Timestamp must resolve to the microsecond Arrow timestamp"
+    );
+
+    let zoned = &declared(&[("TSTZ", ExaType::TimestampTz)])[0];
+    assert_eq!(
+        target_arrow_type(zoned).expect("TIMESTAMP WITH LOCAL TIME ZONE must resolve"),
+        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        "ExaType::TimestampTz must keep the UTC-zoned microsecond target"
+    );
+}
 
 /// Scenario: `coerce_batch_to_exa_types` casts EVERY output column to the Arrow
 /// type the declared EMITS ExaType accepts, across the full mapping table —
@@ -358,110 +396,120 @@ fn coerce_batch_empty_types_normalizes_utf8view_to_utf8() {
 ///   "Arrow column 0 of type Decimal128(10, 0) cannot feed declared ExaType Int64"
 ///
 /// Each case provides a source Arrow array (the type DataFusion's Parquet scan
-/// or aggregate might actually produce) and the declared Exasol EMITS type
-/// string; the coerced column's Arrow type must equal the canonical target for
-/// that ExaType (`exasol_type_to_arrow`), and must NOT remain the source type.
+/// or aggregate might actually produce) and the `ExaType` the database reports
+/// for that output column; the coerced column's Arrow type must equal the target
+/// for that variant, and must NOT remain the source type.
 #[test]
 fn coerce_batch_casts_every_column_to_declared_exatype() {
-    use crate::types::mapping::exasol_type_to_arrow;
     use arrow::array::{
         Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
         StringViewArray, UInt32Array,
     };
     use arrow::datatypes::Field;
 
-    // (column name, source Arrow array, declared Exasol EMITS type)
-    // First live failure: Iceberg `int` declared DECIMAL(10,0) (ExaType Int64),
-    // but DataFusion produced Arrow Int32 → must cast Int32→Int64.
+    // First live failure: an Iceberg `int` whose DECIMAL(10,0) declaration the
+    // engine binned to Int64, while DataFusion produced Arrow Int32.
     let int32_to_int64: Arc<dyn arrow::array::Array> = Arc::new(Int32Array::from(vec![1, 2, 3]));
-    // Second live failure: COUNT(*) declared DECIMAL(10,0) (ExaType Int64),
-    // produced as Decimal128(10,0) → must cast Decimal128→Int64.
+    // Second live failure: COUNT(*) in the same Int64 bin, produced as
+    // Decimal128(10,0) → must cast Decimal128→Int64.
     let dec10_count_to_int64: Arc<dyn arrow::array::Array> = Arc::new(
         Decimal128Array::from(vec![5i128, 7, 9])
             .with_precision_and_scale(10, 0)
             .unwrap(),
     );
-    // Small scale-0 DECIMAL declared DECIMAL(5,0) → ExaType Int32.
+    // A scale-0 DECIMAL the engine binned to Int32.
     let int64_to_int32: Arc<dyn arrow::array::Array> = Arc::new(Int64Array::from(vec![1i64, 2, 3]));
-    // UInt32 declared DECIMAL(20,0) (p>18 → ExaType Numeric/Decimal128).
+    // UInt32 into a NUMERIC-binned DECIMAL(20,0).
     let uint32_to_dec20: Arc<dyn arrow::array::Array> =
         Arc::new(UInt32Array::from(vec![10u32, 20, 30]));
-    // Float32 declared DOUBLE PRECISION.
     let f32_to_double: Arc<dyn arrow::array::Array> =
         Arc::new(Float32Array::from(vec![1.5f32, 2.5, 3.5]));
-    // Float64 already matches DOUBLE PRECISION (fast path).
+    // Float64 already matches Double (fast path).
     let f64_double: Arc<dyn arrow::array::Array> =
         Arc::new(Float64Array::from(vec![1.0f64, 2.0, 3.0]));
-    // Decimal width divergence (scale>0): DECIMAL(10,2) declared DECIMAL(20,2).
+    // Decimal width divergence (scale>0): Decimal128(10,2) into NUMERIC(20,2).
     let dec_narrow_to_wide: Arc<dyn arrow::array::Array> = Arc::new(
         Decimal128Array::from(vec![100i128, 200, 300])
             .with_precision_and_scale(10, 2)
             .unwrap(),
     );
     let date: Arc<dyn arrow::array::Array> = Arc::new(Date32Array::from(vec![0, 1, 2]));
-    // Utf8View → Utf8 for a VARCHAR(2000000)-declared column; this is also the
-    // exact shape `decimal_to_varchar_exasol`'s `regexp_replace(...)` chain
-    // produces for a projected DECIMAL-column stringification (issue #211).
+    // Utf8View → Utf8 for a String-declared column; this is also the exact shape
+    // `decimal_to_varchar_exasol`'s `regexp_replace(...)` chain produces for a
+    // projected DECIMAL-column stringification (issue #211).
     let utf8view_to_varchar: Arc<dyn arrow::array::Array> =
         Arc::new(StringViewArray::from(vec!["a", "b", "c"]));
+    // A CHAR-declared column takes the same Utf8 path as VARCHAR.
+    let utf8view_to_char: Arc<dyn arrow::array::Array> =
+        Arc::new(StringViewArray::from(vec!["p", "q", "r"]));
 
-    let cases: Vec<(&str, Arc<dyn arrow::array::Array>, &str)> = vec![
-        ("c_int32_to_int64", int32_to_int64, "DECIMAL(10,0)"),
-        ("c_count_to_int64", dec10_count_to_int64, "DECIMAL(10,0)"),
-        ("c_int32_bin", int64_to_int32, "DECIMAL(5,0)"),
-        ("c_uint_dec20", uint32_to_dec20, "DECIMAL(20,0)"),
-        ("c_f32", f32_to_double, "DOUBLE PRECISION"),
-        ("c_f64", f64_double, "DOUBLE PRECISION"),
-        ("c_dec_scaled", dec_narrow_to_wide, "DECIMAL(20,2)"),
-        ("c_date", date, "DATE"),
-        ("c_str", utf8view_to_varchar, "VARCHAR(2000000)"),
+    let cases: Vec<(&str, Arc<dyn arrow::array::Array>, ExaType, DataType)> = vec![
+        (
+            "c_int32_to_int64",
+            int32_to_int64,
+            ExaType::Int64,
+            DataType::Int64,
+        ),
+        (
+            "c_count_to_int64",
+            dec10_count_to_int64,
+            ExaType::Int64,
+            DataType::Int64,
+        ),
+        (
+            "c_int32_bin",
+            int64_to_int32,
+            ExaType::Int32,
+            DataType::Int32,
+        ),
+        (
+            "c_uint_dec20",
+            uint32_to_dec20,
+            numeric(20, 0),
+            DataType::Decimal128(20, 0),
+        ),
+        ("c_f32", f32_to_double, ExaType::Double, DataType::Float64),
+        ("c_f64", f64_double, ExaType::Double, DataType::Float64),
+        (
+            "c_dec_scaled",
+            dec_narrow_to_wide,
+            numeric(20, 2),
+            DataType::Decimal128(20, 2),
+        ),
+        ("c_date", date, ExaType::Date, DataType::Date32),
+        ("c_str", utf8view_to_varchar, varchar(), DataType::Utf8),
+        (
+            "c_char",
+            utf8view_to_char,
+            ExaType::Char { size: Some(4) },
+            DataType::Utf8,
+        ),
     ];
 
     let fields: Vec<Field> = cases
         .iter()
-        .map(|(name, col, _)| Field::new(*name, col.data_type().clone(), true))
+        .map(|(name, col, _, _)| Field::new(*name, col.data_type().clone(), true))
         .collect();
     let columns: Vec<Arc<dyn arrow::array::Array>> =
-        cases.iter().map(|(_, col, _)| col.clone()).collect();
-    let exa_types: Vec<String> = cases.iter().map(|(_, _, t)| t.to_string()).collect();
+        cases.iter().map(|(_, col, _, _)| col.clone()).collect();
+    let types: Vec<(&str, ExaType)> = cases
+        .iter()
+        .map(|(name, _, t, _)| (*name, t.clone()))
+        .collect();
 
     let schema = Arc::new(Schema::new(fields));
     let batch = RecordBatch::try_new(schema, columns).unwrap();
 
-    let coerced = coerce_batch_to_exa_types(batch, &exa_types)
+    let coerced = coerce_batch_to_exa_types(batch, &declared(&types))
         .expect("coercion must succeed for all mapping cases");
 
-    for (idx, (name, _, declared)) in cases.iter().enumerate() {
+    for (idx, (name, _, typ, expected)) in cases.iter().enumerate() {
         let got = coerced.schema().field(idx).data_type().clone();
-        match exasol_type_to_arrow(declared) {
-            Some(expected) => assert_eq!(
-                got, expected,
-                "column {name} (declared {declared}) must coerce to {expected:?}, got {got:?}"
-            ),
-            None => assert_eq!(
-                got,
-                DataType::Utf8,
-                "column {name} (declared {declared}) must coerce to Utf8, got {got:?}"
-            ),
-        }
+        assert_eq!(
+            &got, expected,
+            "column {name} (declared {typ:?}) must coerce to {expected:?}, got {got:?}"
+        );
     }
-
-    // Explicit bin assertions for the two live-failure columns.
-    assert_eq!(
-        coerced.schema().field(0).data_type(),
-        &DataType::Int64,
-        "Int32 declared DECIMAL(10,0) must become Int64 (1st live failure)"
-    );
-    assert_eq!(
-        coerced.schema().field(1).data_type(),
-        &DataType::Int64,
-        "Decimal128(10,0) COUNT(*) declared DECIMAL(10,0) must become Int64 (2nd live failure)"
-    );
-    assert_eq!(
-        coerced.schema().field(2).data_type(),
-        &DataType::Int32,
-        "Int64 declared DECIMAL(5,0) must become Int32 (small-precision bin)"
-    );
 
     // Row count and values must survive the Int32→Int64 cast.
     assert_eq!(coerced.num_rows(), 3);
@@ -482,34 +530,14 @@ fn coerce_batch_casts_every_column_to_declared_exatype() {
     assert_eq!(c1.value(2), 9);
 }
 
-/// Scenario: when `exa_types` is empty (no declared schema carried), the batch
-/// still falls back to view-type normalization so a Utf8View column does not
-/// crash `emit_batch`. Backward-compatible with specs that lack `emit_exa_types`.
-#[test]
-fn coerce_batch_empty_types_falls_back_to_view_normalization() {
-    use arrow::array::StringViewArray;
-    use arrow::datatypes::Field;
-
-    let view = Arc::new(StringViewArray::from(vec!["x", "y"]));
-    let schema = Arc::new(Schema::new(vec![Field::new("s", DataType::Utf8View, true)]));
-    let batch = RecordBatch::try_new(schema, vec![view]).unwrap();
-
-    let coerced = coerce_batch_to_exa_types(batch, &[]).expect("empty types must not error");
-    assert_eq!(
-        coerced.schema().field(0).data_type(),
-        &DataType::Utf8,
-        "empty types must still normalize Utf8View to Utf8"
-    );
-}
-
 /// Scenario (#118): a timezone-aware `Timestamp(Microsecond, Some("UTC"))`
 /// column declared `EMITS "TIMESTAMP"` is coerced to `Timestamp(Microsecond,
 /// None)` with the underlying UTC epoch value preserved bit-for-bit — no shift.
 ///
 /// This is the emit-boundary half of the Iceberg-timestamptz → plain Exasol
-/// TIMESTAMP fix: `iceberg_primitive_to_exasol` now declares timestamptz as
-/// "TIMESTAMP", so `exasol_type_to_arrow("TIMESTAMP")` = `Timestamp(us, None)`
-/// is the coercion target. An Iceberg timestamptz is a UTC instant (stored as
+/// TIMESTAMP fix: `iceberg_primitive_to_exasol` declares timestamptz as
+/// "TIMESTAMP", which the engine reports as `ExaType::Timestamp`, whose target
+/// is `Timestamp(us, None)`. An Iceberg timestamptz is a UTC instant (stored as
 /// UTC, not retaining a source zone), so stripping the timezone must keep the
 /// instant unchanged rather than localizing it.
 #[test]
@@ -537,8 +565,7 @@ fn coerce_timestamptz_column_to_plain_timestamp_preserves_utc() {
     let batch = RecordBatch::try_new(schema, vec![Arc::new(src_arr)]).unwrap();
 
     // Declared EMITS type is plain "TIMESTAMP" (the post-fix timestamptz mapping).
-    let exa_types = vec!["TIMESTAMP".to_string()];
-    let coerced = coerce_batch_to_exa_types(batch, &exa_types)
+    let coerced = coerce_batch_to_exa_types(batch, &declared(&[("ts", ExaType::Timestamp)]))
         .expect("timestamptz→TIMESTAMP coercion must succeed");
 
     // The coerced column must be timezone-naive Timestamp(Microsecond, None).
@@ -595,15 +622,13 @@ async fn emit_stream_coerces_columns_to_declared_exatypes_before_emit_batch() {
     let view_batch = RecordBatch::try_new(schema, vec![id_col, Arc::new(view_arr)]).unwrap();
 
     let stream = Box::pin(VecStream::new(vec![view_batch]));
-    let mut ctx = CapturingCtx::new();
-
-    // Declared EMITS types: DECIMAL(10,0) (Exasol bins p≤18,s=0 → ExaType Int64)
-    // and VARCHAR. This is the exact shape of the live Q1 failure.
-    let exa_types = vec!["DECIMAL(10,0)".to_string(), "VARCHAR(2000000)".to_string()];
+    // The call site declared DECIMAL(10,0), which the engine bins to Int64, and
+    // VARCHAR. This is the exact shape of the live Q1 failure.
+    let mut ctx = CapturingCtx::declaring(&[("id", ExaType::Int64), ("name", varchar())]);
 
     // Must not error — previously crashed with the two "cannot feed" errors.
     let mut timers = PhaseTimers::start();
-    let total = emit_stream(&mut ctx, stream, &[], &exa_types, &mut timers)
+    let total = emit_stream(&mut ctx, stream, &[], &mut timers)
         .await
         .expect("emit_stream must succeed and coerce to declared ExaTypes");
 
@@ -650,8 +675,8 @@ async fn emit_stream_coerces_columns_to_declared_exatypes_before_emit_batch() {
 /// `coerce_batch_to_exa_types` already cast to the table's CURRENT Arrow type
 /// by the scan's column-binding adapter, before this function ever runs — the
 /// feature adds no relaxation-aware branch, pair table, or allow-list to this
-/// path. This test proves the existing generic `safe: true` cast (the same
-/// one `coerce_batch_casts_every_column_to_declared_exatype` exercises for an
+/// path. This test proves the existing generic strict cast (the same one
+/// `coerce_batch_casts_every_column_to_declared_exatype` exercises for an
 /// unevolved column) needs none of that: a value sitting at the narrow source
 /// type's boundary, already stored under the WIDENED Arrow type, round-trips
 /// through the coercion to its declared EMITS type unchanged, with no NULL
@@ -666,9 +691,9 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
 
     // `int` -> `long`: the source file's value sits at the narrow `int32`
     // boundary, but the column already carries Arrow `Int64` (the scan's
-    // column-binding adapter already cast it). Declared "DECIMAL(20,0)" (the
-    // `long` binning) parses to precision 20 — above the Int64 threshold of
-    // 18 — so the target is `Decimal128(20,0)`, a genuine cast.
+    // column-binding adapter already cast it). "DECIMAL(20,0)" (the `long`
+    // binning) is above the engine's Int64 bin, so it is reported as
+    // NUMERIC(20,0) and the target is `Decimal128(20,0)`, a genuine cast.
     let int_boundary = i32::MAX as i64;
     let long_col: Arc<dyn arrow::array::Array> = Arc::new(Int64Array::from(vec![int_boundary]));
 
@@ -681,8 +706,8 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
 
     // `decimal(15,5)` -> `decimal(20,5)`: value at the narrow decimal(15,5)
     // boundary (15 nines), already stored as Arrow `Decimal128(20,5)`.
-    // Declared "DECIMAL(20,5)" has scale > 0, so `exasol_type_to_arrow`
-    // returns `Decimal128(20,5)` — again an identity target.
+    // NUMERIC(20,5) has scale > 0, so the target is `Decimal128(20,5)` —
+    // again an identity target.
     let decimal_boundary: i128 = 999_999_999_999_999;
     let decimal_col: Arc<dyn arrow::array::Array> = Arc::new(
         Decimal128Array::from(vec![decimal_boundary])
@@ -714,14 +739,14 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
     )
     .unwrap();
 
-    let exa_types = vec![
-        "DECIMAL(20,0)".to_string(),
-        "DOUBLE PRECISION".to_string(),
-        "DECIMAL(20,5)".to_string(),
-        "TIMESTAMP".to_string(),
-    ];
+    let types = declared(&[
+        ("c_long", numeric(20, 0)),
+        ("c_double", ExaType::Double),
+        ("c_decimal", numeric(20, 5)),
+        ("c_timestamp", ExaType::Timestamp),
+    ]);
 
-    let coerced = coerce_batch_to_exa_types(batch, &exa_types)
+    let coerced = coerce_batch_to_exa_types(batch, &types)
         .expect("an already-widened value must coerce without error");
 
     assert_eq!(coerced.num_rows(), 1);
@@ -730,7 +755,7 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
         .column(0)
         .as_any()
         .downcast_ref::<Decimal128Array>()
-        .expect("c_long must coerce to Decimal128 (DECIMAL(20,0) precision > 18)");
+        .expect("c_long must coerce to Decimal128 (a NUMERIC-binned DECIMAL(20,0))");
     assert_eq!(long_out.data_type(), &DataType::Decimal128(20, 0));
     assert!(!long_out.is_null(0), "widened long value must not be NULL");
     assert_eq!(
@@ -783,5 +808,198 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
         timestamp_out.value(0),
         timestamp_boundary,
         "timestamp value at the date boundary must round-trip unchanged"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Drift in the declared list is reported, never worked around
+// ---------------------------------------------------------------------------
+
+/// Scenario: the declared output-column list disagreeing with the batch's
+/// column count fails the call, naming both counts, and emits nothing.
+///
+/// There is no fallback to a source-derived type: every scan call carries a
+/// call-site `EMITS` clause, so an absent or wrong-arity declaration is drift.
+/// Both directions are covered, plus the absent list, which after the removal
+/// of the spec-carried types can only mean the accessors reported nothing.
+#[tokio::test]
+async fn emit_stream_fails_when_declared_column_count_disagrees() {
+    let cases: Vec<(&str, Vec<(&str, ExaType)>)> = vec![
+        ("absent", vec![]),
+        (
+            "too many",
+            vec![
+                ("C0", ExaType::Int32),
+                ("C1", ExaType::Int32),
+                ("C2", ExaType::Int32),
+            ],
+        ),
+    ];
+
+    for (label, types) in cases {
+        let stream = Box::pin(VecStream::new(vec![make_batch(&[1, 2])]));
+        let mut ctx = CapturingCtx::declaring(&types);
+        let mut timers = PhaseTimers::start();
+        let err = emit_stream(&mut ctx, stream, &[], &mut timers)
+            .await
+            .expect_err("a mismatched declaration must fail the call");
+        let text = err.to_string();
+        assert!(
+            text.contains(&types.len().to_string()) && text.contains('1'),
+            "{label}: the error must name both counts: {text}"
+        );
+        assert!(
+            ctx.ipc_batches.is_empty(),
+            "{label}: no batch may be emitted when the declaration disagrees"
+        );
+    }
+}
+
+/// Scenario: an `output_column(i)` that errors for a column the batch carries
+/// fails the call, naming `i`, rather than degrading to a source-derived type.
+#[tokio::test]
+async fn emit_stream_fails_when_a_declared_column_cannot_be_read() {
+    // The context reports an arity of 2 but can hand out only column 0, the
+    // shape a truncated declaration produces.
+    let mut ctx = CapturingCtx::with_columns(declared(&[("C0", ExaType::Int32)]));
+    ctx.declared_arity_override = Some(2);
+
+    let stream = Box::pin(VecStream::new(vec![make_batch(&[1, 2])]));
+    let mut timers = PhaseTimers::start();
+    let err = emit_stream(&mut ctx, stream, &[], &mut timers)
+        .await
+        .expect_err("an unreadable declared column must fail the call");
+    let text = err.to_string();
+    assert!(
+        text.contains('1'),
+        "the error must name the column index it could not read: {text}"
+    );
+    assert!(
+        ctx.ipc_batches.is_empty(),
+        "no batch may be emitted when a declared column cannot be read"
+    );
+}
+
+/// Scenario: a `Numeric` column whose precision or scale is absent, or outside
+/// what `Decimal128` represents, fails the call naming that column — and is
+/// never substituted with `Utf8`, which would put a string into a numeric
+/// column. A valid Exasol NUMERIC declaration always carries both, within range.
+#[tokio::test]
+async fn emit_stream_fails_on_numeric_with_absent_or_out_of_range_payload() {
+    let cases: Vec<(&str, ExaType)> = vec![
+        (
+            "absent precision",
+            ExaType::Numeric {
+                precision: None,
+                scale: Some(0),
+            },
+        ),
+        (
+            "absent scale",
+            ExaType::Numeric {
+                precision: Some(20),
+                scale: None,
+            },
+        ),
+        (
+            "both absent",
+            ExaType::Numeric {
+                precision: None,
+                scale: None,
+            },
+        ),
+        ("zero precision", numeric(0, 0)),
+        ("precision above Decimal128", numeric(39, 0)),
+        ("scale above Decimal128", numeric(10, 39)),
+        ("scale above precision", numeric(10, 12)),
+    ];
+
+    for (label, typ) in cases {
+        let stream = Box::pin(VecStream::new(vec![make_batch(&[1, 2])]));
+        let columns = declared(&[("OFFENDING_COL", typ)]);
+        let mut ctx = CapturingCtx::with_columns(columns);
+        let mut timers = PhaseTimers::start();
+
+        let err = emit_stream(&mut ctx, stream, &[], &mut timers)
+            .await
+            .expect_err("a payload-less or out-of-range NUMERIC must fail the call");
+        let text = err.to_string();
+        assert!(
+            text.contains("OFFENDING_COL"),
+            "{label}: the error must name the offending column: {text}"
+        );
+        assert!(
+            ctx.ipc_batches.is_empty(),
+            "{label}: no batch may be emitted, and no Utf8 may be substituted"
+        );
+    }
+}
+
+/// Scenario: the same NUMERIC drift resolved through `target_arrow_type` never
+/// yields `Utf8` — the assertion the emit-boundary tests above can only make
+/// indirectly, since a failed call emits nothing either way.
+#[test]
+fn a_drifted_numeric_never_resolves_to_the_string_target() {
+    let drifted = vec![
+        ExaType::Numeric {
+            precision: None,
+            scale: None,
+        },
+        numeric(39, 0),
+        numeric(10, 12),
+    ];
+    for typ in drifted {
+        let column = &declared(&[("C0", typ.clone())])[0];
+        let resolved = target_arrow_type(column);
+        assert!(
+            resolved.is_err(),
+            "{typ:?} must fail rather than resolve, got {resolved:?}"
+        );
+    }
+}
+
+/// Scenario: a value the declared target cannot represent fails the call naming
+/// that column, and nothing is emitted.
+///
+/// The coercion cast is the last thing between a produced value and the wire, so
+/// a lenient cast has no second chance to complain: it writes NULL, the shard
+/// emits it, and the Exasol outer wrapper merges that NULL as if the shard had
+/// no data for the column. A value that does not fit its declaration is drift,
+/// and drift on this boundary is reported.
+#[tokio::test]
+async fn coerce_fails_when_a_value_does_not_fit_its_declared_target() {
+    use arrow::array::Decimal128Array;
+    use arrow::datatypes::Field;
+
+    // Unscaled 10^36 needs 37 digits: one more than DECIMAL(36,2) holds, and
+    // well inside the Decimal128(38,2) a widening SUM produces.
+    let too_wide: i128 = 10i128.pow(36);
+    let column: Arc<dyn arrow::array::Array> = Arc::new(
+        Decimal128Array::from(vec![too_wide])
+            .with_precision_and_scale(38, 2)
+            .expect("source decimal"),
+    );
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "WIDE_SUM",
+        DataType::Decimal128(38, 2),
+        true,
+    )]));
+    let batch = RecordBatch::try_new(schema, vec![column]).unwrap();
+
+    let mut ctx = CapturingCtx::with_columns(declared(&[("WIDE_SUM", numeric(36, 2))]));
+    let stream = Box::pin(VecStream::new(vec![batch]));
+    let mut timers = PhaseTimers::start();
+
+    let err = emit_stream(&mut ctx, stream, &[], &mut timers)
+        .await
+        .expect_err("a value the declared target cannot hold must fail the call");
+    let text = err.to_string();
+    assert!(
+        text.contains("WIDE_SUM"),
+        "the error must name the column that could not be coerced: {text}"
+    );
+    assert!(
+        ctx.ipc_batches.is_empty(),
+        "no batch may be emitted, and no NULL may be substituted for the value"
     );
 }

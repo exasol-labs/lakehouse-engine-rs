@@ -566,8 +566,8 @@ fn relativize_files_to_root(files: Vec<FileEntry>, table_root: &str) -> Vec<File
 /// empty `files` (the shards travel separately), no limit / order / aggregate /
 /// is the side the spec scans, and `common.storage` carries ONLY that scanned
 /// side's own effective `storage` (`table_root`, `logical_schema`, `name_mapping`
-/// likewise come from `primary`); `projection`, `filter`, `emit_exa_types`, and
-/// `join` are the only per-path differences (the N-scan leg passes `join: None`;
+/// likewise come from `primary`); `projection`, `filter`, and `join` are the only
+/// per-path differences (the N-scan leg passes `join: None`;
 /// the broadcast path passes the dimension-side join block, which carries the
 /// dimension's own effective storage in `join.storage` rather than riding in
 /// `primary`'s).
@@ -579,7 +579,6 @@ fn join_fan_out_scan_spec(
     primary: &ResolvedJoinSide,
     projection: Vec<ProjectionItem>,
     filter: Option<String>,
-    emit_exa_types: Vec<String>,
     join: Option<JoinSpec>,
     inputs: &JoinScanRequestConfig<'_>,
 ) -> Result<ScanSpec, UdfError> {
@@ -594,7 +593,6 @@ fn join_fan_out_scan_spec(
             aggregates: None,
             group_keys: None,
             distinct: false,
-            emit_exa_types,
             logical_schema: primary.logical_schema.clone(),
             name_mapping: primary.name_mapping.clone(),
             join,
@@ -669,14 +667,7 @@ pub(super) fn build_side_fan_out_sql(
     let filter = side_filter
         .map(strip_table_alias)
         .and_then(|f| render_df_filter_safe(&f));
-    let spec = join_fan_out_scan_spec(
-        side,
-        proj_cols.clone(),
-        filter,
-        proj_types.clone(),
-        None,
-        inputs,
-    )?;
+    let spec = join_fan_out_scan_spec(side, proj_cols.clone(), filter, None, inputs)?;
     Ok(build_scan_driving_sql(
         &spec,
         &shards,
@@ -779,7 +770,6 @@ pub(in super::super) fn build_broadcast_join_sql(
         fact,
         rendered.projection.clone(),
         rendered.filter.clone(),
-        rendered.projection_types.clone(),
         Some(join),
         inputs,
     )?;
@@ -966,6 +956,38 @@ pub(in super::super) fn referenced_column_projection(
     (cols, types)
 }
 
+/// A fan-out scan spec together with the Exasol type declared for each of its
+/// projection items.
+///
+/// The two are paired behind one constructed value because their positional
+/// alignment is load-bearing: they are zipped into the wrapper's `(name, type)`
+/// universe AND into the inner scan's `EMITS (...)` clause, so a list shorter
+/// than its partner truncates both. Constructing the pair is the only way to
+/// obtain one, so a misaligned pair cannot reach a builder at all.
+#[derive(Debug)]
+pub(in super::super) struct FanOutProjection<'a> {
+    pub spec: &'a ScanSpec,
+    pub proj_types: &'a [String],
+}
+
+impl<'a> FanOutProjection<'a> {
+    /// Pair `spec` with `proj_types`, rejecting a length mismatch.
+    pub(in super::super) fn new(
+        spec: &'a ScanSpec,
+        proj_types: &'a [String],
+    ) -> Result<Self, UdfError> {
+        if spec.common.projection.len() != proj_types.len() {
+            return Err(UdfError::User(format!(
+                "the fan-out projection carries {} item(s) but {} declared type(s); the two \
+                 must stay positionally aligned",
+                spec.common.projection.len(),
+                proj_types.len()
+            )));
+        }
+        Ok(Self { spec, proj_types })
+    }
+}
+
 /// Build the qualified single-table wrapper for an aggregate request that could not
 /// be decomposed into the partial/merge plan. Serves BOTH decline paths: a GROUP BY
 /// request (an undecomposable scalar-over-aggregate item, a non-numeric aggregate
@@ -1001,15 +1023,24 @@ pub(in super::super) fn referenced_column_projection(
 /// The result column count and per-column types match Exasol's positional
 /// `selectListDataTypes` validation, so this never emits the `04000`-triggering bare
 /// row scan.
+///
+/// `fan_out` carries the fan-out spec together with the caller's declared Exasol
+/// type per projection item. The types are passed in rather than read back off the
+/// spec because the caller derives both from one source and the spec itself no
+/// longer carries declared types — the `EMITS (...)` clause this builder renders
+/// from them is their sole declaration.
 pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Into<FileEntry>>(
     request: &Json,
     pushdown_req: &Json,
-    fan_out_spec: &ScanSpec,
+    fan_out: &FanOutProjection<'_>,
     shards: &[Vec<E>],
     udf_name: &str,
     distribute_udf_name: &str,
     declined_filter: Option<&Json>,
 ) -> Result<String, UdfError> {
+    let fan_out_spec = fan_out.spec;
+    let proj_types = fan_out.proj_types;
+
     // ONE leg, onto which every involved table name collapses, so a column node's
     // `tableName` (or a stale request `tableAlias`) resolves to `"LHS_T0"` and a name
     // no involved table declares stays unqualified.
@@ -1023,7 +1054,7 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
         .common
         .projection
         .iter()
-        .zip(fan_out_spec.common.emit_exa_types.iter())
+        .zip(proj_types.iter())
         .filter_map(|(item, ty)| match item {
             ProjectionItem::Column(name) => Some((name.clone(), ty.clone())),
             ProjectionItem::Expr { .. } => None,
@@ -1037,12 +1068,11 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
     // One aliased raw sharded fan-out. LIMIT-free / sort-free / no aggregates — the
     // fan-out spec already guarantees this.
     let proj_cols = fan_out_spec.common.projection.clone();
-    let proj_types = fan_out_spec.common.emit_exa_types.clone();
     let fan_out = build_scan_driving_sql(
         fan_out_spec,
         shards,
         &proj_cols,
-        &proj_types,
+        proj_types,
         None,
         &[],
         None,
@@ -1072,9 +1102,9 @@ pub(in super::super) fn build_qualified_single_table_fallback_sql<E: Clone + Int
 /// Every `build_dispatch_sql` decline guard — the group-by-not-decomposed guard, the
 /// multi/mixed `COUNT(DISTINCT)` guard, the widened-projection guard, and the
 /// declined-WHERE-filter guard — reaches this same shape: derive the inner-scan
-/// projection, build the fan-out spec from `base` with only the projection/filter/
-/// emit-types set (every other field, including LIMIT/ORDER BY/aggregates/group
-/// keys/distinct, stays at `base`'s neutral placeholder — the fan-out is always
+/// projection and its declared types, build the fan-out spec from `base` with only
+/// the projection/filter set (every other field, including LIMIT/ORDER BY/aggregates/
+/// group keys/distinct, stays at `base`'s neutral placeholder — the fan-out is always
 /// LIMIT-free and sort-free here, see [`build_qualified_single_table_fallback_sql`]'s
 /// doc), render the wrapper SQL, and wrap it in the pushdown response envelope.
 ///
@@ -1110,15 +1140,15 @@ pub(in super::super) fn qualified_single_table_fallback_pushdown(
             aggregates: None,
             group_keys: None,
             distinct: false,
-            emit_exa_types: fb_proj_types,
             ..base.clone()
         },
         files: vec![],
     };
+    let fan_out = FanOutProjection::new(&fan_out_spec, &fb_proj_types)?;
     let sql = build_qualified_single_table_fallback_sql(
         request,
         pushdown_req,
-        &fan_out_spec,
+        &fan_out,
         shards,
         udf_name,
         distribute_udf_name,

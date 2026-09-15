@@ -9,13 +9,18 @@
 /// - Rely on the SDK's 4,000,000-byte auto-flush; always flush at end.
 /// - Only IPC bytes cross the .so boundary — never Arrow types or Value intermediates.
 use crate::scan::diagnostics::PhaseTimers;
-use arrow::datatypes::DataType;
-use arrow::error::ArrowError;
+use arrow::array::ArrayRef;
+use arrow::compute::CastOptions;
+use arrow::compute::kernels::cast::cast_with_options;
+use arrow::datatypes::{
+    DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Field, Schema, TimeUnit,
+};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use exasol_udf_sdk::context::{EmitBatch, UdfContext};
 use exasol_udf_sdk::error::UdfError;
+use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 use futures::StreamExt;
 use std::sync::Arc;
 
@@ -27,11 +32,11 @@ use std::sync::Arc;
 /// with credentials redacted. `secrets` are the literal credential values that
 /// must be stripped from any surfaced error string.
 ///
-/// `exa_types` is the declared Exasol EMITS type string for each output column
-/// (positionally aligned). Every column is coerced to the Arrow type that ExaType
-/// accepts before `emit_batch` — DataFusion's physical Parquet type can diverge
-/// from the Iceberg logical type the VS declared, and `emit_batch` rejects ANY
-/// mismatch. Pass `&[]` to fall back to view-type normalization only.
+/// The call site's generated `EMITS (...)` clause is the sole declaration of
+/// this call's output schema, so the declared columns are read once from `ctx`
+/// before the batch loop and every column is coerced to the Arrow type its
+/// declared `ExaType` accepts. DataFusion's physical Parquet type can diverge
+/// from the logical type the VS declared, and `emit_batch` rejects ANY mismatch.
 ///
 /// `timers` carries the phase accumulators (Task 4): the wait for each
 /// `stream.next()` is attributed to the object-storage import phase, and the
@@ -43,9 +48,9 @@ pub async fn emit_stream(
     ctx: &mut dyn UdfContext,
     mut stream: SendableRecordBatchStream,
     secrets: &[&str],
-    exa_types: &[String],
     timers: &mut PhaseTimers,
 ) -> Result<u64, UdfError> {
+    let declared = declared_output_columns(ctx)?;
     let mut total: u64 = 0;
     // Startup ends at the first batch fetch — seal it as the import loop opens.
     timers.seal_startup();
@@ -59,7 +64,7 @@ pub async fn emit_stream(
 
         // --- send-back/emit phase: coerce + emit this batch ---
         timers.emit_started();
-        let emit_result = emit_one_batch(ctx, result, secrets, exa_types);
+        let emit_result = emit_one_batch(ctx, result, secrets, &declared);
         timers.emit_ended();
         total += emit_result?;
     }
@@ -75,14 +80,10 @@ fn emit_one_batch(
     ctx: &mut dyn UdfContext,
     result: Result<RecordBatch, DataFusionError>,
     secrets: &[&str],
-    exa_types: &[String],
+    declared: &[ColumnInfo],
 ) -> Result<u64, UdfError> {
     let batch = result.map_err(|e| classify_scan_error(e, secrets))?;
-    // Coerce each column to the Arrow type its declared EMITS ExaType accepts,
-    // so emit_batch's strict Arrow→ExaType validation never rejects a column.
-    // Generalizes the old Utf8View→Utf8 normalization across the full mapping.
-    let batch = coerce_batch_to_exa_types(batch, exa_types)
-        .map_err(|e| UdfError::User(format!("emit type coercion failed: {e}")))?;
+    let batch = coerce_batch_to_exa_types(batch, declared)?;
     // Count rows before emitting — batch is borrowed by emit_batch.
     let rows = batch.num_rows() as u64;
     ctx.emit_batch(&batch)?;
@@ -90,44 +91,63 @@ fn emit_one_batch(
     Ok(rows)
 }
 
+/// The output columns this call site declared, read once from the context.
+///
+/// The generated `EMITS (...)` clause is the only declaration of a scan call's
+/// output schema, so both emit paths read it here rather than trusting a second
+/// copy carried in the scan spec. The metadata is cloned because the borrow the
+/// context hands out cannot outlive the `&mut` borrow `emit_batch` then needs.
+/// A column the context cannot hand out is drift, and is reported rather than
+/// worked around.
+pub(crate) fn declared_output_columns(ctx: &dyn UdfContext) -> Result<Vec<ColumnInfo>, UdfError> {
+    (0..ctx.output_column_count())
+        .map(|idx| {
+            ctx.output_column(idx).cloned().map_err(|e| {
+                UdfError::User(format!(
+                    "emit failed: declared output column {idx} could not be read: {e}"
+                ))
+            })
+        })
+        .collect()
+}
+
+/// Reject a produced column count that the declared list does not cover.
+///
+/// Shared by both emit paths so a declaration that does not match what the scan
+/// produced fails identically whichever path is emitting.
+pub(crate) fn check_declared_arity(
+    declared: &[ColumnInfo],
+    produced: usize,
+) -> Result<(), UdfError> {
+    if declared.len() == produced {
+        return Ok(());
+    }
+    Err(UdfError::User(format!(
+        "emit failed: the call declares {} output column(s) but the scan produced {produced}",
+        declared.len()
+    )))
+}
+
 /// Coerce every column of a RecordBatch to the Arrow type the engine's strict
-/// `emit_batch` IPC feed accepts for its declared EMITS ExaType.
+/// `emit_batch` IPC feed accepts for its declared output column.
 ///
-/// `exa_types[i]` is the Exasol EMITS type string the VS declared for output
-/// column `i` (the SAME list the adapter put in the EMITS clause), positionally
-/// aligned with the batch columns. For each column:
-///
-/// - A concrete target ([`exasol_type_to_arrow`] returns `Some`) → cast the
-///   column to that Arrow type (Int32→Decimal128, Float32→Float64, narrow
-///   Decimal→wide Decimal, etc.). DataFusion's Parquet scan can produce a
-///   different physical Arrow type than the Iceberg logical type the VS declared
-///   (e.g. an Iceberg `int` widened to `long`), and `emit_batch` rejects ANY such
-///   mismatch — so the postcondition is that the fed Arrow type maps back to the
-///   declared ExaType.
-/// - The string family ([`exasol_type_to_arrow`] returns `None`, i.e. VARCHAR /
-///   CHAR) → cast to `Utf8`. Incompatible source types were already pre-cast to a
-///   string by the scan SQL (`CAST(col AS VARCHAR)`); this also subsumes the old
-///   `Utf8View`/`BinaryView` normalization.
-///
-/// Fast path: a column already of the target type is kept as-is (shared `Arc`,
-/// zero copy). When `exa_types` is empty or shorter than the column count (a spec
-/// that predates `emit_exa_types`), unmatched columns fall back to view-type
-/// normalization so a `Utf8View` column still does not crash `emit_batch`.
+/// `declared[i]` is the metadata Exasol reports for output column `i` of this
+/// call's `EMITS (...)` clause, positionally aligned with the batch columns.
+/// A column already of its target type is kept as-is (shared `Arc`, zero copy),
+/// and a batch whose every column already matches is returned untouched.
 pub fn coerce_batch_to_exa_types(
     batch: RecordBatch,
-    exa_types: &[String],
-) -> Result<RecordBatch, ArrowError> {
+    declared: &[ColumnInfo],
+) -> Result<RecordBatch, UdfError> {
     let schema = batch.schema();
+    check_declared_arity(declared, schema.fields().len())?;
 
-    // Decide the target Arrow type for each column up front.
-    let targets: Vec<DataType> = schema
-        .fields()
+    // Decide the target Arrow type for each column up front, so a drifted
+    // declaration is reported before any column is rebuilt.
+    let targets: Vec<DataType> = declared
         .iter()
-        .enumerate()
-        .map(|(i, field)| {
-            target_arrow_type(exa_types.get(i).map(String::as_str), field.data_type())
-        })
-        .collect();
+        .map(target_arrow_type)
+        .collect::<Result<_, _>>()?;
 
     // Fast path: every column already matches its target — no allocation.
     if schema
@@ -140,49 +160,124 @@ pub fn coerce_batch_to_exa_types(
     }
 
     let mut new_fields = Vec::with_capacity(schema.fields().len());
-    let mut new_columns: Vec<Arc<dyn arrow::array::Array>> =
-        Vec::with_capacity(batch.num_columns());
+    let mut new_columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
 
-    for ((field, col), target) in schema.fields().iter().zip(batch.columns()).zip(&targets) {
-        if field.data_type() == target {
-            new_fields.push(field.as_ref().clone());
-            new_columns.push(col.clone());
-        } else {
-            let cast_col = arrow::compute::cast(col.as_ref(), target)?;
-            new_fields.push(arrow::datatypes::Field::new(
-                field.name(),
-                target.clone(),
-                field.is_nullable(),
-            ));
-            new_columns.push(cast_col);
-        }
+    for (((field, col), column), target) in schema
+        .fields()
+        .iter()
+        .zip(batch.columns())
+        .zip(declared)
+        .zip(&targets)
+    {
+        let coerced = coerce_column(col, column, target)?;
+        new_fields.push(Field::new(
+            field.name(),
+            coerced.data_type().clone(),
+            field.is_nullable(),
+        ));
+        new_columns.push(coerced);
     }
 
-    let new_schema = Arc::new(arrow::datatypes::Schema::new(new_fields));
-    RecordBatch::try_new(new_schema, new_columns)
+    let new_schema = Arc::new(Schema::new(new_fields));
+    RecordBatch::try_new(new_schema, new_columns).map_err(|e| {
+        UdfError::User(format!(
+            "emit failed: the coerced batch is not well formed: {e}"
+        ))
+    })
 }
 
-/// Resolve the target Arrow type for one output column.
+/// Cast one output column to the Arrow type its declared output column requires.
 ///
-/// `declared` is the Exasol EMITS type string for this column (None when the
-/// spec carries no declared type for this position). `source` is the column's
-/// current Arrow type, used only for the no-declared-type fallback.
-fn target_arrow_type(declared: Option<&str>, source: &DataType) -> DataType {
-    if let Some(exa) = declared {
-        match crate::types::mapping::exasol_type_to_arrow(exa) {
-            // Concrete numeric / temporal / boolean target.
-            Some(t) => t,
-            // String family (VARCHAR / CHAR): feed Utf8.
-            None => DataType::Utf8,
-        }
-    } else {
-        // No declared type for this column: preserve the source type, but still
-        // normalize view types so emit_batch does not reject them.
-        match source {
-            DataType::Utf8View => DataType::Utf8,
-            DataType::BinaryView => DataType::Binary,
-            other => other.clone(),
-        }
+/// `target` is the type [`target_arrow_type`] resolved for `declared`; it is
+/// passed in so the decision is made once per column by the caller that already
+/// needs it for its own fast-path check. A column already at that type is
+/// returned as the same shared `Arc`, so the common case costs no copy.
+///
+/// The cast is deliberately strict (`safe: false`): this boundary is the last
+/// thing between a produced value and the wire, so the lenient cast's NULL for
+/// an unrepresentable value would leave the shard emitting an absent value where
+/// it has a real one — which Exasol's outer wrapper merges as "this shard
+/// contributed nothing" rather than surfacing as the error it is.
+pub(crate) fn coerce_column(
+    column: &ArrayRef,
+    declared: &ColumnInfo,
+    target: &DataType,
+) -> Result<ArrayRef, UdfError> {
+    if column.data_type() == target {
+        return Ok(column.clone());
+    }
+    let options = CastOptions {
+        safe: false,
+        ..Default::default()
+    };
+    cast_with_options(column.as_ref(), target, &options).map_err(|e| {
+        UdfError::User(format!(
+            "emit failed: output column {} could not be coerced from {:?} to {target:?}: {e}",
+            declared.name,
+            column.data_type()
+        ))
+    })
+}
+
+/// The Arrow type the engine's strict `emit_batch` IPC feed accepts for a column
+/// declared with this `ExaType`.
+///
+/// The reported variant IS the bin Exasol chose for the declaration, so nothing
+/// here re-derives that choice from a type string: `Int32`, `Int64` and
+/// `Numeric` arrive already distinguished. Every remaining variant feeds `Utf8`,
+/// which subsumes the `Utf8View`/`BinaryView` normalization and preserves what
+/// an unrecognized declaration used to get.
+pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfError> {
+    Ok(match &declared.typ {
+        ExaType::Boolean => DataType::Boolean,
+        ExaType::Double => DataType::Float64,
+        ExaType::Int32 => DataType::Int32,
+        ExaType::Int64 => DataType::Int64,
+        ExaType::Numeric { precision, scale } => decimal_target(declared, *precision, *scale)?,
+        ExaType::Date => DataType::Date32,
+        // ExaType carries no fractional-second precision: every declared
+        // TIMESTAMP(p) arrives as this one variant, and microseconds are this
+        // project's fixed internal representation for all of them.
+        ExaType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
+        ExaType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+        ExaType::String { .. }
+        | ExaType::Char { .. }
+        | ExaType::Geometry
+        | ExaType::HashType
+        | ExaType::IntervalYearToMonth
+        | ExaType::IntervalDayToSecond
+        | ExaType::Unsupported => DataType::Utf8,
+    })
+}
+
+/// The `Decimal128` a NUMERIC-binned declaration maps to.
+///
+/// The wire carries one optional precision/scale pair for every column type, so
+/// `ExaType::Numeric` can structurally hold `None`. A valid Exasol NUMERIC
+/// declaration always carries both, inside `Decimal128`'s range — so an absent
+/// or out-of-range payload is drift, and the call fails rather than falling back
+/// to a string target that would put text into a numeric column.
+fn decimal_target(
+    declared: &ColumnInfo,
+    precision: Option<u32>,
+    scale: Option<u32>,
+) -> Result<DataType, UdfError> {
+    let representable = precision
+        .zip(scale)
+        .and_then(|(p, s)| Some((u8::try_from(p).ok()?, i8::try_from(s).ok()?)))
+        .filter(|(p, s)| {
+            *p >= 1
+                && *p <= DECIMAL128_MAX_PRECISION
+                && *s <= DECIMAL128_MAX_SCALE
+                && *s <= *p as i8
+        });
+    match representable {
+        Some((p, s)) => Ok(DataType::Decimal128(p, s)),
+        None => Err(UdfError::User(format!(
+            "emit failed: output column {} is declared NUMERIC with precision {precision:?} \
+             and scale {scale:?}, which is not a decimal the emit boundary can represent",
+            declared.name
+        ))),
     }
 }
 
@@ -236,3 +331,7 @@ pub use lakehouse_catalog::{redact_credentials, redact_secret_values};
 #[cfg(test)]
 #[path = "emit_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "declared_columns_test_support_tests.rs"]
+pub(in crate::scan) mod declared_columns_test_support;

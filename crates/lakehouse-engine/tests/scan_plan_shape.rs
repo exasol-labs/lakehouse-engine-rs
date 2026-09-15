@@ -646,7 +646,6 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
                 ProjectionItem::Column("C_NAME".into()),
                 ProjectionItem::Column("O_ORDERDATE".into()),
             ],
-            emit_exa_types: vec!["VARCHAR(100)".to_string(), "DATE".to_string()],
             join: Some(join),
             storage: ScanStorage::Inline(test_storage()),
             ..Default::default()
@@ -660,7 +659,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         vec![("data/ord-1.parquet".to_string(), 8192u64)],
     ];
     let proj = spec.common.projection.clone();
-    let types = spec.common.emit_exa_types.clone();
+    let types = vec!["VARCHAR(100)".to_string(), "DATE".to_string()];
     let sql = build_scan_driving_sql(
         &spec,
         &shards,
