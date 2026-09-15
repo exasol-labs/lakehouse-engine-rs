@@ -112,7 +112,7 @@ services:
       - lakehouse
 
   exasol:
-    image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.2.1}"
+    image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.1.16}"
     privileged: true
     # Give Exasol multiple CPUs so the scan UDF's shard fan-out + DataFusion
     # threading have cores to run on (the live-smoke test exercises this).
@@ -122,9 +122,9 @@ services:
     # suite does (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN), unlike sibling stacks
     # that only run the DB uncapped without exercising the sandbox.
     shm_size: "2g"
-    environment:
-      EXA_DB_MEM_SIZE: "${EXASOL_DB_MEM_SIZE:-4 GiB}"
-      EXA_SYS_PASSWORD: "${EXASOL_SYS_PASSWORD:-exasol}"
+    # No `environment:` block: exadt init-sc reads no EXA_* config vars. The DB
+    # runs at the image defaults (MemSize 2 GiB/node, SYS password `exasol`);
+    # both are only changeable via init-sc flags/--config or a seeded /exa/etc/EXAConf.
     volumes:
       - exa-data:/exa
     ports:

@@ -62,7 +62,7 @@ variable "ttl_days" {
 
 variable "exasol_image_tag" {
   type        = string
-  default     = "exasol-2025.2.1"
+  default     = "exasol-2025.1.16"
   description = "c4 play target (@<tag>)."
 }
 

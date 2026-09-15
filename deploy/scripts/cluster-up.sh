@@ -19,7 +19,7 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 STACK="$HERE/../cluster-stack"
 C4DIR="$HERE/../.c4"
 C4="$C4DIR/c4"
-EXASOL_TAG="${EXASOL_IMAGE_TAG:-exasol-2025.2.1}"
+EXASOL_TAG="${EXASOL_IMAGE_TAG:-exasol-2025.1.16}"
 # DB memory = the MAX ALLOWABLE DB RAM (per DB architect), computed by c4's own formula
 # `c4 _ calculate-memory NODE_MEMORY_MiB` (leaves headroom for host/COS/UDFs), summed over active
 # nodes (CCC_PLAY_DB_MEM_SIZE is the total). We set it explicitly rather than leaving it empty:

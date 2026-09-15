@@ -1,12 +1,12 @@
 SHELL := /bin/bash
 
-EXASOL_IMAGE     ?= exasol/docker-db:2025.2.1
+EXASOL_IMAGE     ?= exasol/docker-db:2025.1.16
+# The docker-db image has no password env var; this is the image's built-in SYS default,
+# used only to build DSNs below.
 EXASOL_SYS_PASSWORD ?= exasol
-EXASOL_DB_MEM_SIZE  ?= 4 GiB
 
 export EXASOL_IMAGE
 export EXASOL_SYS_PASSWORD
-export EXASOL_DB_MEM_SIZE
 
 # Absolute path of this repository root.
 LAKEHOUSE_ENGINE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
