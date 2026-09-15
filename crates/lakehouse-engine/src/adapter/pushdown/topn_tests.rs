@@ -82,8 +82,8 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     // mirror cannot drift from the real wrapping shape. Position is load-bearing on
     // both sides, exactly as in `build_dispatch_sql`: AFTER `detect_topn` (which
     // must see the pre-extension projection) and BEFORE the `spec_template` below
-    // (whose `projection` / `emit_exa_types` must carry the appended hidden column
-    // that the EMITS clause is built from).
+    // (whose `projection` must carry the appended hidden column that the EMITS
+    // clause is built from).
     let visible_count = proj_cols.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
@@ -106,7 +106,6 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
             limit: effective_limit,
             order_by,
             aggregates,
-            emit_exa_types: proj_types.clone(),
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },

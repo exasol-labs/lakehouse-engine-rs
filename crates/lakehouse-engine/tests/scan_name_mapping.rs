@@ -30,6 +30,7 @@ use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use exasol_udf_sdk::test_support::TestContext;
+use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ScanSpec, ScanStorage,
@@ -162,7 +163,11 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
         &url::Url::parse(register_url).expect("register url"),
         Arc::new(LocalFileSystem::new()),
     );
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    // Both scans project two Int64 columns: ID and the renamed NEW_COL.
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![]),
+        &[ExaType::Int64, ExaType::Int64],
+    );
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(
         &mut ctx,

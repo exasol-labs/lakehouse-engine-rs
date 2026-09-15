@@ -26,8 +26,96 @@ use exasol_udf_sdk::connect_back::{ConnectionObject, ExaConnection};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::TestContext;
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::value::{ColumnInfo, ExaType, Value};
 use std::io::Cursor;
+
+/// The declared output columns of a scan call, one per generated `EMITS` item,
+/// in the shape `UdfContext::output_column` reports them.
+///
+/// `typ` is the authority the emit boundary reads; `type_name` carries the
+/// Exasol spelling of that variant purely so a failing assertion is readable.
+/// The two integer bins render at the widest declaration that bins to them,
+/// because `ExaType` does not carry the declared precision.
+pub fn output_columns(types: &[ExaType]) -> Vec<ColumnInfo> {
+    types
+        .iter()
+        .enumerate()
+        .map(|(idx, typ)| ColumnInfo {
+            name: format!("C{idx}"),
+            type_name: declared_type_name(typ),
+            size: declared_size(typ),
+            precision: declared_precision(typ),
+            scale: declared_scale(typ),
+            typ: typ.clone(),
+        })
+        .collect()
+}
+
+/// The `ExaType` Exasol reports for a `VARCHAR(2000000)` declaration.
+pub fn varchar() -> ExaType {
+    ExaType::String {
+        size: Some(2_000_000),
+    }
+}
+
+/// The `ExaType` Exasol reports for a `DECIMAL(precision, scale)` declaration
+/// it binned to NUMERIC rather than to one of the two integer bins.
+pub fn decimal(precision: u32, scale: u32) -> ExaType {
+    ExaType::Numeric {
+        precision: Some(precision),
+        scale: Some(scale),
+    }
+}
+
+fn declared_type_name(typ: &ExaType) -> String {
+    match typ {
+        ExaType::Boolean => "BOOLEAN".to_string(),
+        ExaType::Double => "DOUBLE PRECISION".to_string(),
+        ExaType::Int32 => "DECIMAL(9,0)".to_string(),
+        ExaType::Int64 => "DECIMAL(18,0)".to_string(),
+        ExaType::Numeric { precision, scale } => format!(
+            "DECIMAL({},{})",
+            precision.map_or("?".to_string(), |p| p.to_string()),
+            scale.map_or("?".to_string(), |s| s.to_string())
+        ),
+        ExaType::String { size } => format!(
+            "VARCHAR({})",
+            size.map_or("?".to_string(), |s| s.to_string())
+        ),
+        ExaType::Char { size } => {
+            format!("CHAR({})", size.map_or("?".to_string(), |s| s.to_string()))
+        }
+        ExaType::Date => "DATE".to_string(),
+        ExaType::Timestamp => "TIMESTAMP".to_string(),
+        ExaType::TimestampTz => "TIMESTAMP WITH LOCAL TIME ZONE".to_string(),
+        ExaType::Geometry => "GEOMETRY".to_string(),
+        ExaType::HashType => "HASHTYPE".to_string(),
+        ExaType::IntervalYearToMonth => "INTERVAL YEAR TO MONTH".to_string(),
+        ExaType::IntervalDayToSecond => "INTERVAL DAY TO SECOND".to_string(),
+        ExaType::Unsupported => "UNSUPPORTED".to_string(),
+    }
+}
+
+fn declared_size(typ: &ExaType) -> Option<u32> {
+    match typ {
+        ExaType::String { size } | ExaType::Char { size } => *size,
+        _ => None,
+    }
+}
+
+fn declared_precision(typ: &ExaType) -> Option<u32> {
+    match typ {
+        ExaType::Numeric { precision, .. } => *precision,
+        _ => None,
+    }
+}
+
+fn declared_scale(typ: &ExaType) -> Option<u32> {
+    match typ {
+        ExaType::Numeric { scale, .. } => *scale,
+        _ => None,
+    }
+}
 
 /// Wraps [`TestContext`] and overrides [`UdfContext::emit_record_batch_ipc`] to
 /// decode Arrow IPC bytes into captured `RecordBatch` values.
@@ -50,6 +138,12 @@ impl BatchCapturingCtx {
             inner,
             calls: Vec::new(),
         }
+    }
+
+    /// A capturing context whose call site declared `types` as its `EMITS` list,
+    /// so the emit boundary reads those columns back through `output_column`.
+    pub fn declaring(inner: TestContext, types: &[ExaType]) -> Self {
+        Self::new(inner.with_output_columns(output_columns(types)))
     }
 
     /// All decoded batches across every `emit_record_batch_ipc` call, flattened.
@@ -82,10 +176,19 @@ impl UdfContext for BatchCapturingCtx {
     fn num_columns(&self) -> usize {
         self.inner.num_columns()
     }
+    fn input_column(&self, idx: usize) -> Result<&ColumnInfo, UdfError> {
+        self.inner.input_column(idx)
+    }
+    fn output_column_count(&self) -> usize {
+        self.inner.output_column_count()
+    }
+    fn output_column(&self, idx: usize) -> Result<&ColumnInfo, UdfError> {
+        self.inner.output_column(idx)
+    }
     fn get(&self, col: usize) -> Result<&Value, UdfError> {
         self.inner.get(col)
     }
-    fn emit(&mut self, values: &[Value]) -> Result<(), UdfError> {
+    fn emit(&mut self, values: Vec<Value>) -> Result<(), UdfError> {
         self.inner.emit(values)
     }
     fn next(&mut self) -> Result<bool, UdfError> {

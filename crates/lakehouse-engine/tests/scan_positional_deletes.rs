@@ -29,6 +29,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::TestContext;
+use exasol_udf_sdk::value::ExaType;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
@@ -247,12 +248,13 @@ async fn try_run_scan_with_store(
     spec: &ScanSpec,
     register_url: &str,
     store: Arc<dyn ObjectStore>,
+    emits: &[ExaType],
 ) -> Result<Vec<RecordBatch>, UdfError> {
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     session
         .runtime_env()
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(TestContext::scalar(vec![]), emits);
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(
         &mut ctx,
@@ -273,8 +275,15 @@ fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
         spec,
         register_url,
         Arc::new(LocalFileSystem::new()),
+        &id_name_emits(),
     ))
     .expect("raw scan must succeed")
+}
+
+/// The `EMITS` list for the `ID`/`NAME` projection these fixtures scan: `ID` in
+/// the engine's `Int64` DECIMAL bin, `NAME` as `VARCHAR(2000000)`.
+fn id_name_emits() -> Vec<ExaType> {
+    vec![ExaType::Int64, scan_fixture::varchar()]
 }
 
 fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
@@ -529,6 +538,7 @@ fn scan_rejects_unapplicable_delete_file() {
         &spec,
         &data_url,
         Arc::new(LocalFileSystem::new()),
+        &id_name_emits(),
     ))
     .expect_err("an equality delete must be rejected, not applied");
     let msg = err.to_string();
@@ -569,6 +579,7 @@ fn scan_rejects_puffin_deletion_vector() {
         &spec,
         &data_url,
         Arc::new(LocalFileSystem::new()),
+        &id_name_emits(),
     ))
     .expect_err("a Puffin deletion vector must be rejected, not applied");
     let msg = err.to_string();
@@ -599,6 +610,7 @@ fn scan_rejects_negative_positional_delete() {
         &spec,
         &data_url,
         Arc::new(LocalFileSystem::new()),
+        &id_name_emits(),
     ))
     .expect_err("a negative pos must be rejected, not silently dropped");
     // NB: the `dummy_storage` secret_key is "s", so credential redaction strips
@@ -629,6 +641,7 @@ fn scan_rejects_mixed_object_store_roots() {
         &spec,
         &data_url,
         Arc::new(LocalFileSystem::new()),
+        &id_name_emits(),
     ))
     .expect_err("a spec mixing object-store roots must be rejected");
     assert!(
@@ -844,8 +857,13 @@ fn scan_reads_delete_files_with_vended_credentials() {
         concurrency: None,
     });
 
-    let rows = block_on(try_run_scan_with_store(&spec, &data_url, tracking_store))
-        .expect("raw scan must succeed via the tracking (credentialed) store");
+    let rows = block_on(try_run_scan_with_store(
+        &spec,
+        &data_url,
+        tracking_store,
+        &id_name_emits(),
+    ))
+    .expect("raw scan must succeed via the tracking (credentialed) store");
 
     assert_eq!(total_rows(&rows), 18, "2 deletes applied");
 
@@ -895,8 +913,13 @@ fn run_scan_tracked(
         calls: Arc::new(AtomicUsize::new(0)),
         concurrency: None,
     });
-    let rows = block_on(try_run_scan_with_store(spec, register_url, tracking_store))
-        .expect("raw scan must succeed");
+    let rows = block_on(try_run_scan_with_store(
+        spec,
+        register_url,
+        tracking_store,
+        &id_name_emits(),
+    ))
+    .expect("raw scan must succeed");
     (rows, gets)
 }
 
@@ -1050,7 +1073,7 @@ fn scan_delete_reads_bounded_by_connection_budget() {
     let rows = block_on(async {
         tokio::time::timeout(
             DELETE_READ_TIMEOUT,
-            try_run_scan_with_store(&spec, &data_url, store),
+            try_run_scan_with_store(&spec, &data_url, store, &id_name_emits()),
         )
         .await
         .expect("bounded delete-read fan-out must finish within the timeout, not hang")
@@ -1098,7 +1121,7 @@ fn scan_delete_reads_serial_when_budget_is_one() {
     let rows = block_on(async {
         tokio::time::timeout(
             DELETE_READ_TIMEOUT,
-            try_run_scan_with_store(&spec, &data_url, store),
+            try_run_scan_with_store(&spec, &data_url, store, &id_name_emits()),
         )
         .await
         .expect("serial delete reads must finish within the timeout, not hang")
@@ -1251,7 +1274,11 @@ fn scan_delete_reads_bounded_across_join_sides() {
 
     let (store, peak) = tracking_store_with_probe(needles);
     let rows = block_on(async {
-        let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+        // The join projects O_KEY and C_DATA.
+        let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
+            TestContext::scalar(vec![]),
+            &[ExaType::Int64, scan_fixture::varchar()],
+        );
         let mut config = session_config_for_spec(&spec);
         // Pin concurrent planning of the two scan leaves regardless of core count,
         // so both sides' Phase A runs concurrently against the one shared budget —
@@ -1524,8 +1551,13 @@ fn scan_prunes_delete_row_groups_by_file_path() {
         needle: needle.clone(),
         matched_bytes: Arc::clone(&pruned_bytes),
     });
-    let pruned_rows = block_on(try_run_scan_with_store(&pruned_spec, &f2, pruned_store))
-        .expect("pruned scan must succeed");
+    let pruned_rows = block_on(try_run_scan_with_store(
+        &pruned_spec,
+        &f2,
+        pruned_store,
+        &id_name_emits(),
+    ))
+    .expect("pruned scan must succeed");
 
     // Full shard: all three files are assigned, so every row group's own
     // tight range matches its own assigned entry and none is pruned.
@@ -1549,7 +1581,13 @@ fn scan_prunes_delete_row_groups_by_file_path() {
         needle,
         matched_bytes: Arc::clone(&full_bytes),
     });
-    block_on(try_run_scan_with_store(&full_spec, &f1, full_store)).expect("full scan must succeed");
+    block_on(try_run_scan_with_store(
+        &full_spec,
+        &f1,
+        full_store,
+        &id_name_emits(),
+    ))
+    .expect("full scan must succeed");
 
     let pruned_total = pruned_bytes.load(Ordering::SeqCst);
     let full_total = full_bytes.load(Ordering::SeqCst);
@@ -1705,8 +1743,8 @@ fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
         needle,
         matched_bytes: Arc::clone(&bytes),
     });
-    let rows =
-        block_on(try_run_scan_with_store(&spec, &f2, store)).expect("unpruned scan must succeed");
+    let rows = block_on(try_run_scan_with_store(&spec, &f2, store, &id_name_emits()))
+        .expect("unpruned scan must succeed");
 
     let fetched = bytes.load(Ordering::SeqCst);
     assert!(

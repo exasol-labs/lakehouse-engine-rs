@@ -2061,7 +2061,7 @@ fn golden_broadcast_join_sql_unchanged() {
     .expect("an unbounded broadcast join must build");
     assert_eq!(
         actual,
-        r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":["L_ORDERKEY","O_ORDERDATE"],"filter":"(\"L_QUANTITY\" > 5)","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")","storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}}},"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("L_ORDERKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)"#
+        r#"SELECT SCAN('{"table_root":"s3://warehouse/lh/lineitem","projection":["L_ORDERKEY","O_ORDERDATE"],"filter":"(\"L_QUANTITY\" > 5)","logical_schema":[{"field_id":1,"name":"LINEITEM_KEY","arrow_type":"int64","nullable":false}],"join":{"table_root":"s3://warehouse/lh/orders","files":[["s3://w/o-0.parquet",10]],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"join_type":"inner","condition":"(\"L_ORDERKEY\" = \"O_ORDERKEY\")","storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}}},"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/l-0.parquet",1000]]') EMITS ("L_ORDERKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)"#
     );
 }
 
@@ -2414,7 +2414,7 @@ fn golden_n_scan_join_sql_unchanged() {
     .expect("the two-table unified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM (SELECT SCAN('{"table_root":"s3://warehouse/lh/customer","projection":["C_CUSTKEY","C_NAME"],"filter":"(\"C_NAME\" = ''ACME'')","emit_exa_types":["DECIMAL(20,0)","VARCHAR(100)"],"logical_schema":[{"field_id":1,"name":"CUSTOMER_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" INNER JOIN (SELECT SCAN('{"table_root":"s3://warehouse/lh/orders","projection":["O_CUSTKEY","O_ORDERDATE"],"filter":"(\"O_ORDERDATE\" > ''1995-01-01'')","emit_exa_types":["DECIMAL(20,0)","DATE"],"logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/o-0.parquet",100]]') EMITS ("O_CUSTKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)) AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")) WHERE (("LHS_T0"."C_CUSTKEY" > "LHS_T1"."O_CUSTKEY"))"#
+        r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM (SELECT SCAN('{"table_root":"s3://warehouse/lh/customer","projection":["C_CUSTKEY","C_NAME"],"filter":"(\"C_NAME\" = ''ACME'')","logical_schema":[{"field_id":1,"name":"CUSTOMER_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" INNER JOIN (SELECT SCAN('{"table_root":"s3://warehouse/lh/orders","projection":["O_CUSTKEY","O_ORDERDATE"],"filter":"(\"O_ORDERDATE\" > ''1995-01-01'')","logical_schema":[{"field_id":1,"name":"ORDERS_KEY","arrow_type":"int64","nullable":false}],"storage":{"connection":{"name":"LAKEHOUSE_CATALOG_CREDS","allow_http":true}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":0,"s3_max_connections":1}', '[["s3://w/o-0.parquet",100]]') EMITS ("O_CUSTKEY" DECIMAL(20,0), "O_ORDERDATE" DATE)) AS "LHS_T1" ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY")) WHERE (("LHS_T0"."C_CUSTKEY" > "LHS_T1"."O_CUSTKEY"))"#
     );
 }
 
@@ -2440,16 +2440,17 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
                 ProjectionItem::Column("C_CUSTKEY".to_string()),
                 ProjectionItem::Column("C_NAME".to_string()),
             ],
-            emit_exa_types: vec!["DECIMAL(20,0)".to_string(), "VARCHAR(100)".to_string()],
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
     };
+    let proj_types = vec!["DECIMAL(20,0)".to_string(), "VARCHAR(100)".to_string()];
+    let fan_out = FanOutProjection::new(&fan_out_spec, &proj_types).expect("aligned fan-out");
     let actual = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
-        &fan_out_spec,
+        &fan_out,
         &[vec![("s3://w/c-0.parquet".to_string(), 10u64)]],
         "SCAN",
         "DISTRIBUTE",
@@ -2458,7 +2459,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     .expect("the grouped qualified fallback must build");
     assert_eq!(
         actual,
-        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"emit_exa_types":["DECIMAL(20,0)","VARCHAR(100)"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
+        r#"SELECT "LHS_T0"."C_NAME", COUNT(*) FROM (SELECT SCAN('{"projection":["C_CUSTKEY","C_NAME"],"storage":{"inline":{"s3":{"endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","allow_http":true,"path_style":true}}},"df_target_partitions":1,"df_batch_size":8192,"df_threads_per_udf":1,"memory_pool_fraction":0.6,"instance_overhead_mb":200,"s3_max_connections":8}', '[["s3://w/c-0.parquet",10]]') EMITS ("C_CUSTKEY" DECIMAL(20,0), "C_NAME" VARCHAR(100))) AS "LHS_T0" GROUP BY "LHS_T0"."C_NAME""#
     );
 }
 
@@ -2608,11 +2609,10 @@ fn fallback_projection_narrows_to_referenced_columns() {
     fn col(name: &str, ty: &str) -> (String, String) {
         (name.to_string(), ty.to_string())
     }
-    fn spec_with(projection: Vec<ProjectionItem>, emit_exa_types: Vec<String>) -> ScanSpec {
+    fn spec_with(projection: Vec<ProjectionItem>) -> ScanSpec {
         ScanSpec {
             common: CommonScanSpec {
                 projection,
-                emit_exa_types,
                 storage: ScanStorage::Inline(sample_storage()),
                 ..Default::default()
             },
@@ -2720,10 +2720,12 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "the grouped inner scan narrows to GK + REGION (nested in SUM(CASE ...)), \
          never IRRELEVANT_COL"
     );
+    let gspec = spec_with(gproj);
+    let gfan_out = FanOutProjection::new(&gspec, &gtypes).expect("aligned grouped fan-out");
     let gsql = build_qualified_single_table_fallback_sql(
         &request,
         &grouped_req,
-        &spec_with(gproj, gtypes),
+        &gfan_out,
         &shards,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -2760,10 +2762,12 @@ fn fallback_projection_narrows_to_referenced_columns() {
         vec!["A".to_string(), "B".to_string()],
         "the single-group Case 2/3 inner scan narrows to A + B, never IRRELEVANT_COL"
     );
+    let sspec = spec_with(sproj);
+    let sfan_out = FanOutProjection::new(&sspec, &stypes).expect("aligned single-group fan-out");
     let ssql = build_qualified_single_table_fallback_sql(
         &request,
         &sg_req,
-        &spec_with(sproj, stypes),
+        &sfan_out,
         &shards,
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
@@ -3071,12 +3075,17 @@ fn declined_filter_fan_out_spec() -> ScanSpec {
                 ProjectionItem::Column("ID".to_string()),
                 ProjectionItem::Column("C_TS".to_string()),
             ],
-            emit_exa_types: vec!["DECIMAL(20,0)".to_string(), "TIMESTAMP".to_string()],
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
     }
+}
+
+/// The declared Exasol types of [`declined_filter_fan_out_spec`]'s projection,
+/// positionally aligned with it.
+fn declined_filter_proj_types() -> Vec<String> {
+    vec!["DECIMAL(20,0)".to_string(), "TIMESTAMP".to_string()]
 }
 
 /// Build the single-table wrapper over [`declined_filter_fan_out_spec`] for
@@ -3085,15 +3094,41 @@ fn declined_filter_wrapper_sql(
     pushdown_req: &Json,
     declined: Option<&Json>,
 ) -> Result<String, UdfError> {
+    let spec = declined_filter_fan_out_spec();
+    let proj_types = declined_filter_proj_types();
+    let fan_out = FanOutProjection::new(&spec, &proj_types)?;
     build_qualified_single_table_fallback_sql(
         &declined_filter_request(),
         pushdown_req,
-        &declined_filter_fan_out_spec(),
+        &fan_out,
         &[vec![("s3://w/f-0.parquet".to_string(), 10u64)]],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
         declined,
     )
+}
+
+/// Scenario: a `proj_types` list that is not positionally aligned with the
+/// fan-out projection cannot be paired with it, and the refusal names both
+/// lengths.
+///
+/// The alignment is load-bearing — the two lists are zipped into the wrapper's
+/// type universe and into the inner scan's `EMITS` clause — and the only build
+/// that ever runs inside Exasol is a release build, where a `debug_assert` is
+/// compiled out entirely. Pairing the two behind one constructed value is what
+/// makes a misaligned pair unrepresentable downstream.
+#[test]
+fn fan_out_projection_rejects_misaligned_proj_types() {
+    let spec = declined_filter_fan_out_spec();
+    let types = vec!["DECIMAL(20,0)".to_string()];
+
+    let err = FanOutProjection::new(&spec, &types)
+        .expect_err("a proj_types list shorter than the projection must fail construction");
+    let text = err.to_string();
+    assert!(
+        text.contains('2') && text.contains('1'),
+        "the error must name both lengths: {text}"
+    );
 }
 
 /// `SECOND(C_TS, 3) > 1` — the live-verified shape whose DataFusion render

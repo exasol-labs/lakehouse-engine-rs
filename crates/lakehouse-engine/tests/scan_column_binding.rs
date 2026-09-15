@@ -25,6 +25,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::TestContext;
+use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
@@ -129,7 +130,11 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 
 /// Run the production raw scan for `spec` against a session whose `file://`
 /// object store is a plain `LocalFileSystem` (no HEAD interception needed).
-async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch>, UdfError> {
+async fn run_scan(
+    spec: &ScanSpec,
+    register_url: &str,
+    emits: &[ExaType],
+) -> Result<Vec<RecordBatch>, UdfError> {
     let session = datafusion::execution::context::SessionContext::new_with_config(
         session_config_for_spec(spec),
     );
@@ -137,7 +142,7 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Result<Vec<RecordBatch
         &url::Url::parse(register_url).expect("register url"),
         Arc::new(LocalFileSystem::new()),
     );
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(TestContext::scalar(vec![]), emits);
     let mut timers = PhaseTimers::start();
     let storage = ResolvedScanStorage::from_backends(dummy_storage(), None);
     run_raw_scan_with_session(&mut ctx, &session, spec, &storage, &mut timers).await?;
@@ -218,7 +223,8 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
         name_mapping,
     );
 
-    let batches = block_on(run_scan(&spec, &file_url)).expect("raw scan must succeed");
+    let batches = block_on(run_scan(&spec, &file_url, &vec![ExaType::Int64; 3]))
+        .expect("raw scan must succeed");
     let mut row_count = 0;
     for batch in &batches {
         let id_values = int64_column(batch, "ID");
@@ -302,7 +308,8 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
         logical_schema,
         vec![],
     );
-    let batches = block_on(run_scan(&spec, &file_url)).expect("raw scan must succeed");
+    let batches = block_on(run_scan(&spec, &file_url, &vec![ExaType::Int64; 3]))
+        .expect("raw scan must succeed");
     let mut row_count = 0;
     for batch in &batches {
         let ids = int64_column(batch, "ID");
@@ -349,7 +356,7 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
         required_missing_schema,
         vec![],
     );
-    let err = block_on(run_scan(&error_spec, &file_url))
+    let err = block_on(run_scan(&error_spec, &file_url, &[]))
         .expect_err("an absent required identity-bound field with no default must error");
     let text = err.to_string();
     assert!(
@@ -466,7 +473,17 @@ fn mixed_column_parquet_file_emits_json_for_populated_list_and_struct() {
         vec![],
     );
 
-    let batches = block_on(run_scan(&spec, &file_url)).expect("mixed-column scan must succeed");
+    let batches = block_on(run_scan(
+        &spec,
+        &file_url,
+        &[
+            ExaType::Int64,
+            ExaType::Int64,
+            scan_fixture::varchar(),
+            scan_fixture::varchar(),
+        ],
+    ))
+    .expect("mixed-column scan must succeed");
     assert_eq!(
         1,
         batches.iter().map(|b| b.num_rows()).sum::<usize>(),

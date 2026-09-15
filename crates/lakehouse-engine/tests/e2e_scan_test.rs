@@ -8,7 +8,8 @@
 //!
 //! # Setup (done once via `setup_e2e` called from each test)
 //! 1. Seed the Iceberg table into the REST catalog over MinIO.
-//! 2. Install SLC 0.21.0 (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
+//! 2. Install the Rust SLC pinned by the workspace `exasol-udf-sdk` version
+//!    (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
 //! 3. Create the LAKEHOUSE_ADAPTER script and the LAKEHOUSE_SCAN SCALAR script
 //!    (both from the same .so), and the LAKEHOUSE_DISTRIBUTE_FILES LUA SET
 //!    passthrough distributor.
@@ -23,12 +24,14 @@ use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
     DIM_CUSTOMER_ROWS, E2E_DIM_TABLE, E2E_EVO_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE,
-    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, EVO_INITDEF_POST_ADD_IDS,
-    EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL,
-    EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL,
-    PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH,
-    SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, initdef_columns,
-    seed_added_columns_initial_default, seed_events, seed_renamed_column,
+    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE,
+    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
+    EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, LINEITEM_ROWS, LINES_PER_ORDER,
+    PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS,
+    PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS,
+    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
+    seed_events, seed_renamed_column, seed_typed_distinct_probe, typed_decimal_a_avg_stddev,
+    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use common::stack::{
     build_create_connection_sql, iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog,
@@ -68,10 +71,14 @@ fn setup_e2e() {
         rt.block_on(async {
             seed_events(&iceberg_catalog_url(), "s3://warehouse/")
                 .await
-                .expect("seed Iceberg events table")
+                .expect("seed Iceberg events table");
+            seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
+                .await
+                .expect("seed Iceberg typed_distinct_probe table");
         });
 
-        // 3. Install SLC 0.21.0 (download + upload + ALTER SYSTEM).
+        // 3. Install the Rust SLC pinned by the workspace `exasol-udf-sdk` version
+        //    (download + upload + ALTER SYSTEM).
         install_slc();
 
         // 4. Upload the .so to BucketFS.
@@ -90,6 +97,10 @@ fn setup_e2e() {
 
 fn vs_table() -> String {
     format!("{VS_NAME}.{}", E2E_TABLE.to_uppercase())
+}
+
+fn typed_table() -> String {
+    format!("{VS_NAME}.{}", E2E_TYPED_TABLE.to_uppercase())
 }
 
 fn vs_labels_table() -> String {
@@ -866,6 +877,45 @@ fn partial_avg_emits_sum_count_pair() {
     );
 }
 
+/// `AVG`/`STDDEV` over a non-`DOUBLE` column: `typed_distinct_probe`'s seeded
+/// bare `long` `id` column, plus its `c_decimal_a`/`c_decimal_b`
+/// (`DECIMAL(9,2)`/`DECIMAL(20,4)`) columns.
+///
+/// Unit tests already sweep the `AvgSum`/`StatSum`/`StatSumSq`
+/// partial-aggregate coercion mismatch across every `ExaType` variant; this
+/// is the first place it runs end to end against a real Exasol Docker
+/// container over a non-`DOUBLE` column (issue #399). Expected values come
+/// from `common::seed::typed_*_avg_stddev`, computed from the SAME data the
+/// fixture seeds, never a hand-written constant.
+#[test]
+fn partial_avg_stddev_over_non_double_columns() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let cases: [(&str, (f64, f64)); 3] = [
+        ("id", typed_id_avg_stddev()),
+        (TYPED_COL_DECIMAL_A, typed_decimal_a_avg_stddev()),
+        (TYPED_COL_DECIMAL_B, typed_decimal_b_avg_stddev()),
+    ];
+
+    for (col, (expected_avg, expected_stddev)) in cases {
+        let cols = conn.query_columns(&format!(
+            "SELECT AVG({col}), STDDEV({col}) FROM {}",
+            typed_table()
+        ));
+        let avg = parse_numeric(&cols[0][0]);
+        let stddev = parse_numeric(&cols[1][0]);
+        assert!(
+            (avg - expected_avg).abs() < 0.01,
+            "AVG({col}) must be {expected_avg}, got {avg}"
+        );
+        assert!(
+            (stddev - expected_stddev).abs() < 0.01,
+            "STDDEV({col}) must be {expected_stddev}, got {stddev}"
+        );
+    }
+}
+
 /// Runs `EXPLAIN VIRTUAL` for a single-group (no GROUP BY) aggregate query and
 /// asserts the pushed SQL evidences single-group aggregate pushdown — an
 /// `aggregates` field in the scan spec — rather than a raw row-scan fallback
@@ -940,19 +990,6 @@ fn single_group_aggregate_scan_spec_projection_is_empty() {
              'projection' field (#145: the aggregate-dispatch path reads \
              'aggregates'/'group_keys', not 'projection', so an empty value \
              means \"not applicable\", not \"all columns\"), got:\n{pushed_sql}"
-        );
-        // Sibling of the `projection` leak (#145): the aggregate scan emits via
-        // the Value path and never reads `emit_exa_types`, so the aggregate spec
-        // must not leak a full base-table type list into the common blob. Unlike
-        // `projection`, `CommonScanSpec::emit_exa_types` carries
-        // `skip_serializing_if = "Vec::is_empty"`, so an empty value is OMITTED
-        // entirely — the field name must be absent, not `"emit_exa_types":[]`.
-        assert!(
-            !pushed_sql.contains("emit_exa_types"),
-            "{sql}'s single-group aggregate scan spec must omit \
-             'emit_exa_types' (#145 sibling: the aggregate path emits via the \
-             Value path and never reads it; empty + skip_serializing_if means \
-             the field is absent from the common blob), got:\n{pushed_sql}"
         );
     }
 }
@@ -4020,8 +4057,8 @@ fn e2e_float_div_pushes_double_cast_projection() {
          expression, got:\n{pushed}"
     );
     assert!(
-        pushed.contains(r#""emit_exa_types":["DOUBLE PRECISION"]"#),
-        "expected the pushed scan spec to emit DOUBLE PRECISION for the \
+        pushed.contains(r#"EMITS ("_LH_PROJ_0" DOUBLE PRECISION)"#),
+        "expected the pushed EMITS clause to declare DOUBLE PRECISION for the \
          FLOAT_DIV projection, got:\n{pushed}"
     );
 }

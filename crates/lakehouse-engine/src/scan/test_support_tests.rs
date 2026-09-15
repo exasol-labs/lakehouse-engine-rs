@@ -89,9 +89,28 @@ impl exasol_udf_sdk::context::UdfContext for SinkCtx {
     ) -> Result<&exasol_udf_sdk::value::Value, exasol_udf_sdk::error::UdfError> {
         unimplemented!()
     }
+    fn input_column(
+        &self,
+        idx: usize,
+    ) -> Result<&exasol_udf_sdk::value::ColumnInfo, exasol_udf_sdk::error::UdfError> {
+        Err(exasol_udf_sdk::error::UdfError::Type(format!(
+            "input column {idx} out of range"
+        )))
+    }
+    fn output_column_count(&self) -> usize {
+        0
+    }
+    fn output_column(
+        &self,
+        idx: usize,
+    ) -> Result<&exasol_udf_sdk::value::ColumnInfo, exasol_udf_sdk::error::UdfError> {
+        Err(exasol_udf_sdk::error::UdfError::Type(format!(
+            "output column {idx} out of range"
+        )))
+    }
     fn emit(
         &mut self,
-        _: &[exasol_udf_sdk::value::Value],
+        _: Vec<exasol_udf_sdk::value::Value>,
     ) -> Result<(), exasol_udf_sdk::error::UdfError> {
         Ok(())
     }

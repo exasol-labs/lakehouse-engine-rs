@@ -39,6 +39,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
+use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 use futures::StreamExt;
 use lakehouse_engine::scan::emit::coerce_batch_to_exa_types;
 use lakehouse_engine::scan::spec::{
@@ -46,6 +47,30 @@ use lakehouse_engine::scan::spec::{
 };
 use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
+
+/// The declared output columns for a batch, as `UdfContext::output_column`
+/// reports the call site's `EMITS` list to the emit loop.
+fn declared(names: &[&str], types: &[ExaType]) -> Vec<ColumnInfo> {
+    names
+        .iter()
+        .zip(types)
+        .map(|(name, typ)| ColumnInfo {
+            name: (*name).to_string(),
+            type_name: format!("{typ:?}"),
+            size: None,
+            precision: None,
+            scale: None,
+            typ: typ.clone(),
+        })
+        .collect()
+}
+
+fn numeric(precision: u32, scale: u32) -> ExaType {
+    ExaType::Numeric {
+        precision: Some(precision),
+        scale: Some(scale),
+    }
+}
 
 const GB: f64 = 1_000_000_000.0;
 
@@ -82,19 +107,19 @@ fn record_batch_to_ipc(batch: &RecordBatch) -> Vec<u8> {
 
 /// One emit-path measurement: coerce + IPC-serialize `batch` `iters` times.
 /// Returns (rows/sec, in-memory GB/sec, ipc-out GB/sec, ipc bytes).
-fn bench_emit_path(name: &str, batch: &RecordBatch, exa_types: &[String], iters: usize) {
+fn bench_emit_path(name: &str, batch: &RecordBatch, declared: &[ColumnInfo], iters: usize) {
     let rows = batch.num_rows();
     let in_mem_bytes = batch.get_array_memory_size();
 
     // Warmup (also fills the JIT/branch predictors and validates coercion).
-    let warm = coerce_batch_to_exa_types(batch.clone(), exa_types).expect("coerce");
+    let warm = coerce_batch_to_exa_types(batch.clone(), declared).expect("coerce");
     let ipc_bytes = record_batch_to_ipc(&warm).len();
 
     let rss_before = rss_bytes();
     let start = Instant::now();
     let mut sink: u64 = 0;
     for _ in 0..iters {
-        let coerced = coerce_batch_to_exa_types(batch.clone(), exa_types).expect("coerce");
+        let coerced = coerce_batch_to_exa_types(batch.clone(), declared).expect("coerce");
         let ipc = record_batch_to_ipc(&coerced);
         sink = sink.wrapping_add(ipc.len() as u64);
         std::hint::black_box(&ipc);
@@ -121,26 +146,26 @@ fn bench_emit_path(name: &str, batch: &RecordBatch, exa_types: &[String], iters:
 
 /// Build a single-column batch of `n` rows for the named primitive schema, with
 /// the Exasol EMITS type string the production emit loop would coerce against.
-fn primitive_batch(kind: &str, n: usize) -> (RecordBatch, Vec<String>) {
-    let (field, col, exa): (Field, ArrayRef, &str) = match kind {
+fn primitive_batch(kind: &str, n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
+    let (field, col, exa): (Field, ArrayRef, ExaType) = match kind {
         "BIGINT" => (
             Field::new("c", DataType::Int64, false),
             Arc::new(Int64Array::from_iter_values((0..n).map(|i| i as i64))),
-            "DECIMAL(20,0)",
+            numeric(20, 0),
         ),
         "DOUBLE" => (
             Field::new("c", DataType::Float64, false),
             Arc::new(Float64Array::from_iter_values(
                 (0..n).map(|i| i as f64 * 1.5),
             )),
-            "DOUBLE PRECISION",
+            ExaType::Double,
         ),
         "TIMESTAMP" => (
             Field::new("c", DataType::Timestamp(TimeUnit::Microsecond, None), false),
             Arc::new(TimestampMicrosecondArray::from_iter_values(
                 (0..n).map(|i| 1_700_000_000_000_000 + i as i64),
             )),
-            "TIMESTAMP",
+            ExaType::Timestamp,
         ),
         "DECIMAL" => (
             Field::new("c", DataType::Decimal128(20, 4), false),
@@ -149,25 +174,27 @@ fn primitive_batch(kind: &str, n: usize) -> (RecordBatch, Vec<String>) {
                     .with_precision_and_scale(20, 4)
                     .expect("decimal"),
             ),
-            "DECIMAL(20,4)",
+            numeric(20, 4),
         ),
         "VARCHAR" => (
             Field::new("c", DataType::Utf8, false),
             Arc::new(StringArray::from_iter_values(
                 (0..n).map(|i| format!("string-value-row-{i:08}")),
             )),
-            "VARCHAR(2000000)",
+            ExaType::String {
+                size: Some(2_000_000),
+            },
         ),
         other => panic!("unknown primitive schema {other}"),
     };
     let schema = Arc::new(Schema::new(vec![field]));
     let batch = RecordBatch::try_new(schema, vec![col]).expect("batch");
-    (batch, vec![exa.to_string()])
+    (batch, declared(&["c"], &[exa]))
 }
 
 /// A TPC-H `lineitem`-shaped mixed batch (the "production" schema): the column
 /// types a real lineitem scan emits, so 5.1 measures a realistic mixed row.
-fn lineitem_batch(n: usize) -> (RecordBatch, Vec<String>) {
+fn lineitem_batch(n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
     let fields = vec![
         Field::new("l_orderkey", DataType::Int64, false),
         Field::new("l_partkey", DataType::Int64, false),
@@ -216,19 +243,24 @@ fn lineitem_batch(n: usize) -> (RecordBatch, Vec<String>) {
             (0..n).map(|i| format!("comment text for line item number {i}")),
         )),
     ];
-    let exa = vec![
-        "DECIMAL(20,0)".to_string(),
-        "DECIMAL(20,0)".to_string(),
-        "DECIMAL(15,2)".to_string(),
-        "DECIMAL(15,2)".to_string(),
-        "DOUBLE PRECISION".to_string(),
-        "VARCHAR(2000000)".to_string(),
-        "DATE".to_string(),
-        "TIMESTAMP".to_string(),
-        "VARCHAR(2000000)".to_string(),
-        "VARCHAR(2000000)".to_string(),
+    let varchar = ExaType::String {
+        size: Some(2_000_000),
+    };
+    let types = vec![
+        numeric(20, 0),
+        numeric(20, 0),
+        numeric(15, 2),
+        numeric(15, 2),
+        ExaType::Double,
+        varchar.clone(),
+        ExaType::Date,
+        ExaType::Timestamp,
+        varchar.clone(),
+        varchar,
     ];
-    let schema = Arc::new(Schema::new(fields));
+    let names: Vec<&str> = fields.iter().map(|f| f.name().as_str()).collect();
+    let exa = declared(&names, &types);
+    let schema = Arc::new(Schema::new(fields.clone()));
     (
         RecordBatch::try_new(schema, cols).expect("lineitem batch"),
         exa,

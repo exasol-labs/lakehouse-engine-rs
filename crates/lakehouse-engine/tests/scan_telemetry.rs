@@ -76,7 +76,6 @@ fn scan_spec(file_url: String) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
-            emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
             storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
                 endpoint: "http://localhost:9000".into(),
                 region: "us-east-1".into(),
@@ -96,8 +95,9 @@ fn scan_spec(file_url: String) -> ScanSpec {
 /// context (carrying the captured emit counts). Registers a fresh session per
 /// run so the local Parquet path is exercised exactly as production would.
 async fn run_scan(spec: &ScanSpec, level: tracing::Level) -> scan_fixture::BatchCapturingCtx {
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![Value::String(spec.to_json())]).with_debug_level(level),
+        &[scan_fixture::decimal(20, 0), scan_fixture::varchar()],
     );
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     let mut timers = PhaseTimers::start();
@@ -266,9 +266,10 @@ fn telemetry_failure_never_fails_scan() {
     let sink_path = telemetry_file_path();
     std::fs::create_dir_all(&sink_path).expect("occupy telemetry path with a directory");
 
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![Value::String(spec.to_json())])
             .with_debug_level(tracing::Level::DEBUG),
+        &[scan_fixture::decimal(20, 0), scan_fixture::varchar()],
     );
     let session = SessionContext::new_with_config(session_config_for_spec(&spec));
     let mut timers = PhaseTimers::start();
