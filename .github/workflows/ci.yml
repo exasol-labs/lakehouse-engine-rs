@@ -517,7 +517,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - image: exasol/docker-db:2025.2.1
+          - image: exasol/docker-db:2025.1.16
             check_name: E2E
             log_artifact: exa-logs
           - image: exasol/docker-db:8.29.13
@@ -536,7 +536,7 @@ jobs:
       # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
       LH_EXASOL_CPUS: "2"
       # Selects the matrix leg's Exasol image; docker-compose.yml's exasol
-      # service reads this with a 2025.2.1 fallback.
+      # service reads this with a 2025.1.16 fallback.
       EXASOL_IMAGE: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v7
