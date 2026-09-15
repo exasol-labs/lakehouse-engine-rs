@@ -46,7 +46,7 @@ to `datafusion-scan/type-mapping`.
 * **`CommonScanSpec::emit_exa_types` was a second copy of that clause.** The adapter built both
   from one `proj_types` vector: the clause Exasol parses, and a JSON array the UDF trusted without
   checking. Two transmissions of one decision, with nothing enforcing agreement.
-* **`exasol-udf-sdk` 0.26.0 supplies the authoritative reading.** `UdfContext::output_column(idx)`
+* **`exasol-udf-sdk` 0.26.1 supplies the authoritative reading.** `UdfContext::output_column(idx)`
   returns the `ColumnInfo` the database reported for output column `idx`, carrying the `ExaType`
   the column's values travel in plus `precision` and `scale`; `output_column_count()` reports the
   declared arity. Upstream `language-container-rs` PR #105 wires these from the call-site `EMITS`

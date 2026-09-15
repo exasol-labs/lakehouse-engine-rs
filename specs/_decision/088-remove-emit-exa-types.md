@@ -49,7 +49,7 @@ pre-change fallback that tolerated an empty or short list is gone.
 
 ### Context
 
-`exasol-udf-sdk` 0.26.0 validates every `Value` row against the declared output column before
+`exasol-udf-sdk` 0.26.1 validates every `Value` row against the declared output column before
 buffering it (`column_accepts` in `exa-udf-runtime`'s `rowset.rs`), where the earlier bridge
 silently coerced a mismatched cell instead. `column_accepts` rejects `Value::Int64` and
 `Value::Numeric` in a `Double` column, `Value::Numeric` in an `Int32`/`Int64` column,
@@ -78,7 +78,7 @@ their existing `value_to_gk_string` stringification, because they are already de
 
 | Option | Verdict |
 |--------|---------|
-| Fix the four mismatches now, via the shared emit-boundary coercion | ✓ Chosen — `AVG` over an integer column works today through the old bridge's silent coercion and would start failing under 0.26.0's row validation, a regression this plan would otherwise introduce |
+| Fix the four mismatches now, via the shared emit-boundary coercion | ✓ Chosen — `AVG` over an integer column works today through the old bridge's silent coercion and would start failing under 0.26.1's row validation, a regression this plan would otherwise introduce |
 | Bump the SDK and defer the partial-aggregate fix to a follow-up | ✗ Rejected — ships a known regression between the bump landing and the follow-up landing |
 | Cast per aggregate kind in `partial_select_items` | ✗ Rejected — cannot fix `MIN`/`MAX` over a `decimal(p,0)` or a wide-decimal `SUM`, because the scan does not know those declared types without reading the context |
 | Coerce the whole partial batch uniformly, including group-key columns | ✗ Rejected — an Arrow `cast(Date32 → Utf8)` formats differently from `NaiveDate::to_string()`, so a group's key text, and therefore its merge identity across shards, could change |

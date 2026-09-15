@@ -28,7 +28,7 @@ can merge into the final query result.
   bump. It adds ONE scenario and changes none. The partial-aggregate column contract, the merge
   shapes, and the adapter's declared partial types are all unchanged.
 * **The SDK bump turns four silent mismatches on this path into query failures.**
-  `exasol-udf-sdk` 0.26.0 validates every `Value` row against the declared output column before
+  `exasol-udf-sdk` 0.26.1 validates every `Value` row against the declared output column before
   buffering it (`check_output_row`, `column_accepts` in `exa-udf-runtime`'s `rowset.rs`). The
   earlier bridge coerced a mismatched cell instead. `column_accepts` rejects `Value::Int64` and
   `Value::Numeric` in a `Double` column, `Value::Numeric` in an `Int32`/`Int64` column,
