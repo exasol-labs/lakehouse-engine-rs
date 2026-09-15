@@ -7,99 +7,36 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 ## Background
 
 * The scan UDF's first argument is the shard-invariant common spec (projection, filter,
-  limit, aggregates, group keys, logical schema, EMITS types, a storage reference the
-  UDF resolves itself, the table root, and tuning knobs), serialized once per fan-out;
-  the second argument is this shard's file list. See `datafusion-scan/scan-execution` for the scan behavior once the
-  spec is merged.
+  limit, aggregates, group keys, logical schema, a storage reference the UDF resolves
+  itself, the table root, partition-column names, and tuning knobs), serialized once per
+  fan-out; the second argument is this shard's file list. The scan reads its declared
+  output types from `UdfContext::output_column`, not from the spec. See
+  `datafusion-scan/scan-execution` for the scan behavior once the spec is merged.
 * The per-shard file list is a JSON array of compact `[path, size]` 2-tuples, where `path` is
   either relative to the common spec's table root or an absolute URI, and `size` is the file's
   byte size resolved from the table's own metadata by its format reader — an Iceberg manifest's
   `file_size_in_bytes` for an Iceberg table, a Delta `add` action's `size` for a Delta one.
 * `ScanSpec` carries no catalog identifier block — the scan UDF never contacts the catalog.
+  Every field the spec carries is scan-time data (a path, a partition value, a deletion-vector
+  byte range, a physical column name), never a catalog handle.
 * A parse failure on either argument MUST surface an error identifying scan-spec
   deserialization failure and MUST NOT contain any storage access key, secret key, or
   session token.
-* Per-file positional-delete references travel with their data-file entry in the per-shard
-  argument.
-* This delta amends ONE clause of the two-argument-wire scenario and nothing else. `vs-adapter/storage-backend-enum` (issue #274) wraps the common blob's `storage` value in an externally-tagged backend variant, so the clause requiring the common blob to be byte-identical to the pre-consolidation encoding needs the `storage` value carved out. Every other scenario of this feature is unchanged, and no Background bullet is superseded.
-* The carve-out is safe on this feature's own recorded terms: the legacy-file-list scenario already states that "the same `.so` produces and consumes the spec within one deploy (there is no cross-version wire-compatibility requirement)". The tag is therefore a self-consistent intra-deploy encoding change, not a compatibility break, and that bullet's reasoning is unchanged.
-* The per-shard file-list argument (arg 1) is untouched by the tag: `storage` is shard-invariant and lives only in the common blob.
-* **This delta widens ONE carve-out in the two-argument-wire scenario and nothing else.** Issue #294 adds a REQUIRED `storage` field to the common blob's join block, so the clause requiring the common blob to be byte-identical to the pre-consolidation encoding needs that field carved out alongside the whole-spec `storage` value already carved out for `vs-adapter/storage-backend-enum`. Every other scenario of this feature is unchanged and no Background bullet is superseded.
-* **The carve-out is safe on this feature's own recorded terms.** The legacy-file-list scenario already states that "the same `.so` produces and consumes the spec within one deploy (there is no cross-version wire-compatibility requirement)", so adding a required field inside the join block is a self-consistent intra-deploy encoding change, not a compatibility break.
-* **The field is REQUIRED rather than defaulted, deliberately.** A `#[serde(default)]` on the join block's storage would let a join block that names no dimension backend deserialize into one that silently reuses the whole-spec (fact-side) backend — reinstating exactly the collapse issue #294 removes. Making it required turns "every join block names its own backend" into a property of the type rather than a rule an auditor has to verify at each of the seven `JoinSpec` construction sites.
-* **The per-shard files-list argument (arg 1) is untouched.** The join block, and therefore its storage backend, is shard-invariant and lives only in the common blob.
-* **This delta adds ONE scenario and is issue #319.** It records the wire shape the Delta table
-  format adds to both arguments: a table-level Delta block on the shard-invariant common spec, and a
-  per-file Delta block on each file-list entry.
-* **No recorded clause is superseded.** The Delta blocks are OPTIONAL and absent from JSON when
-  absent in the value, so the recorded byte-identity guarantees hold unedited: the common blob for a
-  non-join Iceberg spec stays byte-identical to its pre-consolidation encoding, and the per-shard
-  files list stays byte-identical for both the legacy 2-tuple and the delete-carrying 3-tuple forms.
-* **The recorded no-catalog-identifier rule governs the new blocks and is satisfied by
-  construction.** Everything the Delta blocks carry is scan-time DATA — a path, a serialized
-  partition value, a deletion-vector byte range, a physical column name — never a catalog handle,
-  because the scan UDF never contacts the catalog. The table's catalog-assigned vending key stays in
-  the planning layer and MUST NOT reach the scan spec.
-* **There is no cross-version wire-compatibility requirement**, as this feature already records: one
-  `.so` produces and consumes the spec within one deploy. The Delta wire shape is chosen for
-  Iceberg-side byte identity, not for reading a spec written by an older build.
-* Producing these blocks is `vs-adapter/delta-table-planning`; consuming them — applying the deletion
-  vector, injecting partition values, and resolving column mapping — is issue #320.
-* **This delta is issue #342.** It replaces the pair of Delta-named blocks the wire gained in #319 —
-  a table block on the common spec and a per-file block on each file entry — with format-neutral
-  fields both table formats populate: a per-file `partition_values` map, a per-file `deletes` list of
-  self-describing delete MECHANISMS, a shard-invariant `partition_columns` list, and one binding key
-  per logical field. No scan behavior changes; the wire carries the same values in neutral fields.
-* **No recorded byte-identity clause needs a carve-out.** The common blob's new `partition_columns`
-  is absent from JSON when empty, and the Iceberg reader leaves it empty, so a non-join Iceberg common
-  blob stays byte-identical to its pre-consolidation encoding and the committed golden common-blob
-  fixture passes unedited. The per-shard files list likewise stays byte-identical: the 2-tuple legacy
-  form and the 3-tuple delete-carrying form keep their exact encodings, INCLUDING each Iceberg
-  positional-delete member's `{"path":…,"size":…,"content_type":"position_deletes"}` object with its
-  key ORDER unchanged.
-* **Key order is why the delete mechanism keeps a private wire form.** A directly tagged enum would
-  emit its discriminant key FIRST and reorder every Iceberg delete member, breaking the pinned
-  encoding above for no behavioral gain. The public `DeleteMechanism` therefore routes
-  (de)serialization through a private wire enum, exactly as `FileEntry` already routes through
-  `FileEntryWire`, so the neutral Rust-level type and the frozen JSON encoding are independent
-  decisions with one owner each.
-* **The object file-entry form is now selected by partition values, not by format.** An entry
-  serializes as the compact 2-tuple when it carries neither deletes nor partition values, as the
-  3-tuple when it carries deletes and no partition values, and as a self-describing JSON OBJECT
-  whenever it carries partition values. A Delta entry whose only extra content is a deletion vector
-  therefore rides in the 3-tuple form — correctly, because the delete member itself names its
-  mechanism.
-* **The mutual-exclusion gate narrows to the real hazard.** #319 refused any entry carrying a Delta
-  block AND a non-empty Iceberg delete list. The neutral gate refuses an entry whose ONE delete list
-  MIXES a deletion vector with an Iceberg delete-file reference. Partition values are no longer part
-  of the test, because an Iceberg table with identity-transform partition values and positional
-  deletes (issue #99) is a legitimate future shape rather than a defect.
-* **The recorded no-catalog-identifier rule governs the neutral fields and is satisfied by
-  construction**, unchanged: a partition value, a partition-column name, a physical column name, a
-  path, and a deletion-vector byte range are all scan-time DATA, never a catalog handle.
-* **There is still no cross-version wire-compatibility requirement** — one `.so` produces and consumes
-  the spec within one deploy. The neutral wire shape is chosen for Iceberg-side byte identity, not for
-  reading a spec written by an older build.
-* **This delta is issue #135. It amends ONE scenario and changes no reconstitution rule.** The two-argument contract, the per-shard `[path, size]` encoding, the positional-delete 3-tuple encoding, the legacy-entry defaulting, the neutral partition values, and the no-catalog-block rule are all UNCHANGED. What changes is what the `storage` value holds.
-* **The `storage` value now carries a further enclosing wrapper whose reference variant holds no backend at all**, specified by `vs-adapter/scan-spec-credential-reference`, which this feature CITES.
-* **A common blob carrying no join block is NO LONGER byte-identical to its pre-change encoding: its `storage` value gains the wrapper.** Every committed golden common-blob fixture for a non-join spec that carries a `storage` value is regenerated; the six `empty_*` fixtures carry no `storage` value at all and stay byte-identical.
-* **The per-shard files-list argument is still byte-identical**, because `storage` is shard-invariant and appears only in the common blob.
-* **This delta is issue #399.** It SUPERSEDES one Background bullet and amends ONE clause of ONE
-  scenario. It changes no other clause, adds no scenario, and changes no merge, delete-encoding, or
-  file-list rule.
-* This delta SUPERSEDES the preceding Background bullet "The scan UDF's first argument is the
-  shard-invariant common spec (projection, filter, limit, aggregates, group keys, logical schema,
-  EMITS types, a storage reference the UDF resolves itself, the table root, and tuning knobs),
-  serialized once per fan-out; the second argument is this shard's file list. See
-  `datafusion-scan/scan-execution` for the scan behavior once the spec is merged." The common spec
-  no longer carries EMITS types. `CommonScanSpec::emit_exa_types` is removed and the scan reads the
-  declared output types from `UdfContext::output_column` instead. The field list is otherwise
-  unchanged and reads: projection, filter, limit, aggregates, group keys, logical schema, a storage
-  reference the UDF resolves itself, the table root, and tuning knobs.
-* **The per-shard files-list argument is untouched**, because `emit_exa_types` was shard-invariant
-  and lived only in the common blob.
-* **Only a row-scan golden fixture changes.** The field carried
-  `skip_serializing_if = "Vec::is_empty"`, so an aggregate spec already omitted it.
+* Per-file positional-delete references and per-file partition values travel with their
+  data-file entry in the per-shard argument.
+* The `storage` value in the common blob is an externally-tagged credential WRAPPER specified
+  by `vs-adapter/scan-spec-credential-reference`. A join block carries its own REQUIRED
+  `storage` value in the same wrapper encoding, so a join block that names no dimension
+  backend fails to deserialize rather than silently reusing the fact-side backend.
+* Delete mechanisms are format-neutral and self-describing. `DeleteMechanism` routes
+  (de)serialization through a private wire enum so the Rust-level type and the frozen JSON
+  encoding are independent decisions. An entry whose delete list mixes a deletion vector
+  with an Iceberg delete-file reference is refused.
+* File-entry serialization form is selected by content: compact 2-tuple when neither
+  deletes nor partition values are present, 3-tuple when deletes but no partition values,
+  self-describing JSON object when partition values are present.
+* There is no cross-version wire-compatibility requirement — the same `.so` produces and
+  consumes the spec within one deploy.
 
 ## Scenarios
 
@@ -126,12 +63,10 @@ which the UDF deserializes and merges into one `ScanSpec` before running the sha
 
 * *GIVEN* a `ScanSpec` whose shard-invariant fields are held in one embedded `CommonScanSpec` value and whose only own field beside it is the per-shard `files` list
 * *WHEN* the adapter serializes the shard-invariant common blob (UDF argument 0) and the per-shard files list (UDF argument 1)
-* *THEN* the common-blob JSON SHALL carry every shard-invariant field at the top level, byte-identical to the pre-consolidation encoding EXCEPT for the `storage` value, for the `emit_exa_types` key issue #399 removed, and, when a join block is present, that block's own `storage` value, and MUST NOT contain a `files` key or a `catalog` key
-* *AND* the common-blob JSON MUST NOT contain an `emit_exa_types` key at all, because the call-site `EMITS (...)` clause is the sole declaration of the scan's output types and the scan reads it through `UdfContext::output_column`
-* *AND* the `storage` value SHALL be the externally-tagged scan-spec storage WRAPPER specified by `vs-adapter/scan-spec-credential-reference` — a `connection` reference variant carrying a name and `allow_http` and no credential; a `sealed` variant carrying a connection name and the base64 nonce-plus-AES-GCM-ciphertext of the externally-tagged storage-backend encoding of `vs-adapter/storage-backend-enum`, which is byte-identical to the pre-consolidation `storage` object once unsealed; or an `inline` variant whose payload is that same backend encoding in plaintext, emitted by no adapter path and accepted for host-test spec construction
+* *THEN* the common-blob JSON SHALL carry every shard-invariant field at the top level, MUST NOT contain a `files` key, a `catalog` key, or an `emit_exa_types` key, and MUST NOT carry any declared output types (the call-site `EMITS (...)` clause is the sole declaration, read through `UdfContext::output_column`)
+* *AND* the `storage` value SHALL be the externally-tagged scan-spec storage WRAPPER specified by `vs-adapter/scan-spec-credential-reference` — a `connection` reference variant carrying a name and `allow_http` and no credential; a `sealed` variant carrying a connection name and the base64 nonce-plus-AES-GCM-ciphertext of the externally-tagged storage-backend encoding of `vs-adapter/storage-backend-enum`; or an `inline` variant whose payload is that same backend encoding in plaintext, accepted for host-test spec construction
 * *AND* the join block's `storage` value SHALL use that SAME wrapper encoding and SHALL be a REQUIRED key of the join block, so a join block serialized without it fails to deserialize instead of defaulting to the whole-spec value
-* *AND* a common blob carrying NO join block SHALL be byte-identical to its pre-change encoding EXCEPT for the `storage` value's wrapper and the removed `emit_exa_types` key, so a committed golden common-blob fixture for a non-join spec passes unedited only when it carries neither, and is REGENERATED when it carries either
-* *AND* the per-shard files-list JSON SHALL be byte-identical to the pre-consolidation encoding, because `storage` and the removed `emit_exa_types` were both shard-invariant and appeared only in the common blob
+* *AND* the per-shard files-list JSON SHALL be unaffected by the common blob's encoding, because `storage` and declared output types are both shard-invariant and appear only in the common blob
 * *AND* `from_parts_json` over the two arguments SHALL reconstitute a `ScanSpec` value equal to the one the pre-consolidation two-argument contract produced for the same shard, with the storage backend in place of the bare storage props
 * *AND* `files` SHALL remain the sole per-shard field, now guaranteed structurally by the single embedded common value rather than by a field-by-field copy
 

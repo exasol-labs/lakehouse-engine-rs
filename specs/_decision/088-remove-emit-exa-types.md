@@ -28,18 +28,16 @@ column list fails the call, naming the mismatch, with no fallback.
 
 | Option | Verdict |
 |--------|---------|
-| Read the declared `ExaType` from `UdfContext::output_column` on both emit paths | ✓ Chosen — single authority; the engine already reports the decision, so the scan reading it removes the possibility of disagreement |
-| Keep `CommonScanSpec::emit_exa_types` as a sanity-check copy | ✗ Rejected — two copies with nothing enforcing agreement is the defect being removed |
-| Keep the copy only for the join path, which round-tripped `proj_types` through the spec | ✗ Rejected — the value is available at every call site as a local |
-| Keep a fallback to a spec-carried or source-derived type when the declared list is absent or short | ✗ Rejected — every scan call has a call-site `EMITS` clause; an absent or wrong-arity declaration is drift, not a legacy spec, and hiding it would also hide the drift acceptance criterion 4 asks to prove |
+| Read the declared `ExaType` from `UdfContext::output_column` on both emit paths | ✓ Chosen — single authority, no possibility of disagreement |
+| Keep `CommonScanSpec::emit_exa_types` as a sanity-check copy | ✗ Rejected — two unenforced copies is the defect being removed |
+| Keep the copy only for the join path | ✗ Rejected — the value is available at every call site as a local |
+| Keep a fallback when the declared list is absent or short | ✗ Rejected — every scan call has a call-site `EMITS` clause; an absent declaration is drift, not a legacy spec |
 
 ### Consequences
 
-The adapter and the scan can no longer independently assume one output-type decision and drift
-apart. `exasol_type_to_arrow`'s string parse and its scale-0 DECIMAL precision binning leave the
-emit path, because the engine already reports the bin it chose. Every one of the roughly twenty
-test `UdfContext` doubles that drive the scan must now declare its output columns, since the
-pre-change fallback that tolerated an empty or short list is gone.
+The adapter and the scan can no longer independently drift on the output-type decision.
+`exasol_type_to_arrow`'s string parse leaves the emit path. Test `UdfContext` doubles must
+now declare output columns, since the fallback that tolerated an empty list is gone.
 
 ## ADR: The SDK bump's row validation forces a partial-aggregate fix into this plan
 
@@ -78,17 +76,13 @@ their existing `value_to_gk_string` stringification, because they are already de
 
 | Option | Verdict |
 |--------|---------|
-| Fix the four mismatches now, via the shared emit-boundary coercion | ✓ Chosen — `AVG` over an integer column works today through the old bridge's silent coercion and would start failing under 0.26.1's row validation, a regression this plan would otherwise introduce |
-| Bump the SDK and defer the partial-aggregate fix to a follow-up | ✗ Rejected — ships a known regression between the bump landing and the follow-up landing |
-| Cast per aggregate kind in `partial_select_items` | ✗ Rejected — cannot fix `MIN`/`MAX` over a `decimal(p,0)` or a wide-decimal `SUM`, because the scan does not know those declared types without reading the context |
-| Coerce the whole partial batch uniformly, including group-key columns | ✗ Rejected — an Arrow `cast(Date32 → Utf8)` formats differently from `NaiveDate::to_string()`, so a group's key text, and therefore its merge identity across shards, could change |
+| Fix the four mismatches now, via the shared emit-boundary coercion | ✓ Chosen — avoids shipping a regression between the bump and a follow-up |
+| Bump the SDK and defer the partial-aggregate fix | ✗ Rejected — ships a known regression window |
+| Cast per aggregate kind in `partial_select_items` | ✗ Rejected — cannot fix `MIN`/`MAX` or wide-decimal `SUM` without declared types from the context |
+| Coerce the whole partial batch, including group-key columns | ✗ Rejected — Arrow cast formats differently from `NaiveDate::to_string()`, changing merge identity |
 
 ### Consequences
 
-`AVG`, `STDDEV`, `STDDEV_POP`, `VARIANCE`, and `VAR_POP` over an integer or decimal column keep
-returning the values they returned before the SDK bump, instead of failing with an
-`output column … is … but the value is …` error. The adapter needs no change, because the declared
-partial types were already the authority; only the scan's conformance to them is new. The fix
-lands under issue #399's own `Closes #399` trailer rather than a separate tracked issue, an
-explicit, informed override of both #399's "Not in scope" text and this repo's usual
-one-feature-one-issue convention.
+`AVG`, `STDDEV`, `STDDEV_POP`, `VARIANCE`, and `VAR_POP` over integer or decimal columns keep
+returning correct values instead of failing with a row-validation error. The adapter needs no
+change; only the scan's conformance to the declared partial types is new.

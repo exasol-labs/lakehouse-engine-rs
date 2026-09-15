@@ -24,90 +24,33 @@ issue #359 added, and the parent feature keeps the general Arrow/Exasol type-com
   `timestamptz` from `timestamp` at the Exasol SQL surface. This is analogous to the
   struct/list/map JSON-`VARCHAR` trade-off — a target-type limitation, not a change to any
   emitted value.
-* **This delta is issue #359.** It adds THREE scenarios and AMENDS ONE. The added scenarios record the
-  version-gated Exasol TIMESTAMP precision, the default taken when the version string cannot be read,
-  and the deliberate exclusion of the ARROW-INPUT resolver from that gate. The amended scenario is
-  "Iceberg timestamptz maps to plain Exasol TIMESTAMP", which gains the precision qualifier and keeps
-  every other clause byte-identical.
-* **The bug this delta fixes is silent, unconditional truncation on every Exasol version.**
-  `iceberg_primitive_to_exasol` maps `Timestamp`, `TimestampNs`, `Timestamptz`, and `TimestamptzNs` to
-  the bare string `TIMESTAMP`, and `unity_type_name_to_exasol` maps `TIMESTAMP` and `TIMESTAMP_NTZ` the
-  same way. Exasol's bare `TIMESTAMP` IS `TIMESTAMP(3)` — millisecond — so Exasol truncates the three
-  sub-millisecond digits of every Iceberg and Delta timestamp value on receipt. Nothing failed and no
-  test noticed, because no recorded scenario asserted a timestamp value below seconds resolution.
-* **Apache Iceberg spec check — microsecond is the spec's own precision for these types, so
-  `TIMESTAMP(3)` is a DEVIATION this plan FIXES, not a recorded trade-off.** The spec's Schemas and
-  Data Types § Primitive Types table states `timestamp` as *"Timestamp, microsecond precision, without
-  timezone"* and `timestamptz` as *"Timestamp, microsecond precision, with timezone"*. Appendix A
-  (Parquet) pins the physical form: `timestamp` is *"`TIMESTAMP_MICROS` with `adjustToUtc=false`"* and
-  *"Stores microseconds from 1970-01-01 00:00:00.000000."*; `timestamptz` is *"`TIMESTAMP_MICROS` with
-  `adjustToUtc=true`"*. `TIMESTAMP(6)` is therefore the spec-correct target precision, and this plan
-  closes the gap rather than filing a tracked exception for it.
-* **`TIMESTAMP(9)` is explicitly NOT the target, and the reason is upstream, not Exasol.** The spec's
-  v3 rows state `timestamp_ns` and `timestamptz_ns` as *"Timestamp, nanosecond precision"*, and Exasol
-  accepts `TIMESTAMP(p)` for every `p` in 0-9. The ceiling is iceberg-rust: its `TimestampNs` handling
-  calls `timestamp_to_micros`, truncating nanoseconds to microseconds before any value reaches
-  DataFusion. So a nanosecond Iceberg column carries no sub-microsecond digit for a `TIMESTAMP(9)`
-  declaration to preserve, and declaring 9 would advertise a precision the read path cannot deliver.
-  Once iceberg-rust preserves nanoseconds, raising the declaration is a one-line change here with no
-  emit-side work, because the UDF output path already carries nine fractional digits.
-* **This delta does NOT touch the `timestamptz`-flattening trade-off, which is a separate, already-
-  recorded Exasol target-type limitation.** The recorded scenario "Iceberg timestamptz maps to plain
-  Exasol TIMESTAMP" stands: `timestamptz` still declares an Exasol type that cannot be distinguished
-  from `timestamp` at the SQL surface, because Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF
-  `EMITS` output type (`sqlCode 22002`). What changes is only the FRACTIONAL-SECOND precision of the
-  declaration. Zone-awareness and precision are two independent decisions and MUST NOT be conflated.
-* **The version gate needs ONE owner, because two producers already state the same declaration
-  independently.** `iceberg_primitive_to_exasol` and `unity_type_name_to_exasol` each hardcode the
-  literal `"TIMESTAMP"`, exactly the shape that let the catalog-decimal guard drift into four copies
-  before issue #329 consolidated it. This delta introduces one `TimestampPrecision` decision in
-  `crates/lakehouse-engine/src/types/mapping.rs` that owns both the version rule and the two
-  declaration strings, and both producers read it.
-* **The gate belongs in the type-mapping module, and the version STRING is its input rather than the
-  UDF context.** `types/mapping.rs` already owns Exasol's own type domain, including the live-captured
-  `DECIMAL` bounds in `exasol_representable_catalog_decimal`. Taking a `&str` keeps the module free of
-  `UdfContext` — it reads no ambient state and performs no I/O — so the dependency still points from
-  the adapter inward, exactly as `cluster_nodes_from_context` keeps `node_count` at the adapter edge.
-  `vs-adapter/create-virtual-schema` owns the single `ctx.database_version()` read and the threading.
-* **Exasol's version string shape is the same one the E2E Docker image tags carry**: `8.29.13` for the
-  8.x line and `2025.2.1` for the calendar-versioned line. A leading-component parse therefore
-  separates the two lines with no version-comparison machinery, and Exasol's move to calendar
-  versioning after 8.x is what makes the single `>= 2025` threshold unambiguous.
-* **The default on an unreadable version is the MODERN declaration, and that is a deliberate
-  reversal of the conservative choice.** `UdfContext::database_version` returns `String::new()` on a
-  context that does not populate handshake metadata, and no call site for it exists anywhere in this
-  repo today. Defaulting to `TIMESTAMP(6)` means the fidelity-preserving declaration is what a new or
-  unrecognised engine gets; the cost is that a hypothetical engine that rejects `TIMESTAMP(6)` fails
-  loudly at `createVirtualSchema` rather than silently truncating. A loud failure on an unknown engine
-  is preferred over silent data loss on every known one.
-* **The pushdown and CAST halves of the precision surface already work and are NOT re-specified here.**
-  `exasol_type_from_json` reads `fractionalSecondsPrecision` and renders `TIMESTAMP(p)`
-  (`vs-adapter/pushdown-planning`), `render_cast_target` does the same for the CAST dialects
-  (`sql-comprehension/vs-expression-translator-cast`), and this feature's recorded scenario "A
-  TIMESTAMP(p) EMITS string maps back to the microsecond Arrow timestamp" already pins
-  `exasol_type_to_arrow` to `Timestamp(Microsecond, None)` for every `p` in 0-9. So once the
-  declaration carries the precision, Exasol echoes it into the pushdown request, the EMITS clause
-  carries `TIMESTAMP(6)`, and the emit-boundary coercion is unchanged. No new code is needed on any of
-  those three paths.
-* **`arrow_to_exasol_type` is NOT threaded, and its exclusion is recorded rather than left silent**
-  because issue #359's own scope text names it. `datafusion-scan/type-mapping-module-structure` already
-  records that it *"has NO call site anywhere in the crate"*; the only production consumer of
-  `compatible_exasol_type` is the `needs_json_fallback` boolean, whose answer for every
-  `Timestamp(_, _)` is `false` at any precision. Threading a precision through a resolver no
-  production declaration reaches would add a parameter that cannot change an observable answer.
-* **This delta is issue #399.** It restates ONE scenario against the new source of the declared emit
-  type. It amends no other scenario, SUPERSEDES no Background bullet, and changes no declared
-  precision, no version gate, and no zone-awareness trade-off.
-* **The scan no longer parses the declared type string at the emit boundary.** Issue #399 removes
-  `CommonScanSpec::emit_exa_types`. `target_arrow_type` now reads the `ExaType` the SDK reports
-  through `UdfContext::output_column`, so `exasol_type_to_arrow` is no longer on the emit path.
-* **`ExaType` carries no timestamp precision, which makes the recorded rule structural.** Every
-  `TIMESTAMP(p)` in the `EMITS` clause reaches the scan as the single variant `ExaType::Timestamp`.
-  The recorded rule that `p` governs only Exasol's own type check, never the Arrow unit, therefore
-  holds by construction rather than by a parser arm that must be kept precision-tolerant.
-* **The adapter side is untouched.** `exasol_type_from_json` still reads `fractionalSecondsPrecision`
-  and still renders `TIMESTAMP(p)` into the `EMITS` clause and the `createVirtualSchema` declaration.
-  Only the scan's reading of that clause changes.
+* Exasol's bare `TIMESTAMP` IS `TIMESTAMP(3)` — millisecond precision. The Iceberg spec
+  defines `timestamp`/`timestamptz` as microsecond precision, so `TIMESTAMP(6)` is the
+  spec-correct target. The version gate declares `TIMESTAMP(6)` on Exasol 2025.x+ and bare
+  `TIMESTAMP` on 8.x, so 8.x silently truncates sub-millisecond digits — a named version
+  limitation, not a defect.
+* `TIMESTAMP(9)` is not the target because iceberg-rust truncates nanoseconds to
+  microseconds (`timestamp_to_micros`) before any value reaches DataFusion. Once iceberg-rust
+  preserves nanoseconds, raising the declaration is a one-line change with no emit-side work.
+* Zone-awareness and precision are independent decisions. The `timestamptz`-to-plain-`TIMESTAMP`
+  trade-off (Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF EMITS type, `sqlCode
+  22002`) is unaffected by the precision gate.
+* One `TimestampPrecision` owner in `types/mapping.rs` holds the version rule and both
+  declaration strings. Both producers (`iceberg_primitive_to_exasol`,
+  `unity_type_name_to_exasol`) read it. The owner takes a version `&str`, not a `UdfContext`,
+  keeping the type-mapping module free of I/O; `vs-adapter/create-virtual-schema` owns the
+  single `ctx.database_version()` read.
+* Exasol version strings: `8.29.13` (8.x line) and `2025.2.1` (calendar-versioned line). A
+  leading-component parse separates the two lines.
+* The default on an unreadable or empty version is `TIMESTAMP(6)` — a deliberate reversal of
+  the conservative choice. A loud failure on an unknown engine is preferred over silent data
+  loss on every known one.
+* `arrow_to_exasol_type` is not threaded through the version gate because no production path
+  declares an Exasol type from an Arrow type. `needs_json_fallback`'s answer for every
+  `Timestamp(_, _)` is `false` at any precision.
+* `ExaType` carries no timestamp precision: every `TIMESTAMP(p)` in the `EMITS` clause
+  reaches the scan as the single variant `ExaType::Timestamp`. The rule that `p` governs
+  only Exasol's own type check, never the Arrow unit, therefore holds structurally.
 
 ## Scenarios
 

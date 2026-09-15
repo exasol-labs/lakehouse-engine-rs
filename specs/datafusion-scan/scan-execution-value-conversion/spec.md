@@ -10,21 +10,10 @@ to `datafusion-scan/type-mapping`.
 
 ## Background
 
-* **This delta is issue #350.** It relocates WHERE the JSON serialization of a nested column happens
-  and names the consequence for the value-conversion boundary. It changes ONE scenario. The emit-time
-  ExaType coercion is untouched.
-* **A nested column is rendered to JSON at the Arrow COLUMN level, upstream of the per-value
-  conversion.** `datafusion-scan/nested-json-rendering` owns the rendering and applies it while the
-  scan is still inside DataFusion, so the batch that reaches the emit boundary already carries `Utf8`.
-  This is not a preference: `arrow::json::writer::make_encoder`'s encoder borrows the array and holds
-  a reusable scratch buffer, so it is built once per column and reused across rows, which a per-cell
-  `fn(&ArrayRef, usize)` signature cannot express.
-* **The consequence is that `arrow_value_at` never receives a nested Arrow column, and its wildcard
-  display-string arm is therefore left exactly as recorded.** That arm stays a wildcard match on
-  `DataType`, unrouted through the Arrow classifier, per
-  `datafusion-scan/type-mapping-module-structure`'s recorded exemptions — this delta adds no arm to it
-  and removes none. Its only remaining reachable inputs are the NON-nested half of the incompatible
-  set, which arrives already `Utf8` through `CAST(col AS VARCHAR)`.
+* A nested column is rendered to JSON at the Arrow COLUMN level, upstream of the per-value
+  conversion. `datafusion-scan/nested-json-rendering` owns the rendering, so the batch that
+  reaches the emit boundary already carries `Utf8`. `arrow_value_at` therefore never receives
+  a nested Arrow column.
 * Only `Value::String` types cross the `.so` boundary on the value-conversion path; the raw-row path
   crosses as Arrow IPC bytes via `emit_batch` per `datafusion-scan/scan-execution`.
 * Logical Iceberg-to-Arrow and Arrow-to-Exasol type mapping RULES are owned by
@@ -36,49 +25,15 @@ to `datafusion-scan/type-mapping`.
   None-vs-UTC difference is reconciled at the EMITS-coercion scenario below — see
   `datafusion-scan/scan-execution`'s INT96 decode scenario for the physical-decode side of this
   reconciliation.
-* **This delta is issue #399.** It changes WHERE the emit boundary reads its declared output type
-  from. It changes ONE scenario. The Arrow-to-`Value` mapping and the JSON-string scenario are
-  untouched.
-* **`LAKEHOUSE_SCAN` is declared `EMITS (...)`, the dynamic-output form.** The script DDL
-  (`deploy/scripts/install.sh`, `crates/lakehouse-engine/tests/common/e2e_harness.rs`) carries no
-  static column list, so the call-site `EMITS (...)` clause the adapter generates is the sole
-  declaration of that call's output schema.
-* **`CommonScanSpec::emit_exa_types` was a second copy of that clause.** The adapter built both
-  from one `proj_types` vector: the clause Exasol parses, and a JSON array the UDF trusted without
-  checking. Two transmissions of one decision, with nothing enforcing agreement.
-* **`exasol-udf-sdk` 0.26.1 supplies the authoritative reading.** `UdfContext::output_column(idx)`
-  returns the `ColumnInfo` the database reported for output column `idx`, carrying the `ExaType`
-  the column's values travel in plus `precision` and `scale`; `output_column_count()` reports the
-  declared arity. Upstream `language-container-rs` PR #105 wires these from the call-site `EMITS`
-  list. Its live `column-meta` integration fixture covers one shape only: the same entry point
-  follows a re-registered STATIC `EMITS` column list carried in the script DDL. `LAKEHOUSE_SCAN`
-  uses the dynamic form, where the DDL carries `EMITS (...)` with no list and the adapter supplies
-  the columns at the call site. That dynamic call-site form is proven separately, against the local
-  Exasol Docker container, before any removal lands.
-* **Reading `ExaType` removes a replicated engine decision.** `exasol_type_to_arrow` parsed a type
-  string and re-derived Exasol's DECIMAL-to-ExaType precision binning (scale-0 precision at most 9
-  to Int32, at most 18 to Int64, otherwise Numeric). The engine reports the bin it chose, so the
-  scan reads the result instead of recomputing it and can no longer disagree with it.
-* **`exasol_type_to_arrow` keeps its `pub` visibility and its tests.** It loses its only production
-  call site. `datafusion-scan/type-mapping-module-structure` already records the same status for
-  its inverse `arrow_to_exasol_type`: it is a CLAUDE.md § Data types compliance surface, and
-  removing a public API item is a scope ADD.
-* **The declared-type list is no longer optional, so the pre-`emit_exa_types` fallback is gone.**
-  Every scan call has a call-site `EMITS` clause. An absent or wrong-arity declaration is drift, not
-  a legacy spec, and is reported rather than worked around.
-* **`ExaType::Numeric`'s optional `precision` and `scale` are a wire artifact, not an expected
-  absence.** The protobuf `column_definition` carries one `optional precision` and `optional scale`
-  pair for every column type, unset outside DECIMAL. `column_from_pb` (`exa-zmq-protocol`'s
-  `meta.rs`) forwards both into `ExaType::Numeric` unchecked. A valid Exasol NUMERIC declaration
-  always carries both. Exasol caps DECIMAL precision at 36, inside what `Decimal128` represents. An
-  absent or out-of-range payload is therefore drift, and both emit paths fail the call on it.
-* **The Iceberg and Delta type contracts are untouched.** Apache Iceberg `#### Schemas and Data
-  Types` states "A table's **schema** is a list of named columns. Data types are primitive, nested,
-  or semi-structured", and Delta `Schema Serialization Format` holds the schema in the `metaData`
-  action's required `schemaString`. Neither governs the Exasol-side output declaration. The
-  Iceberg-to-Exasol and Delta-to-Exasol mapping rules stay in
-  `crates/lakehouse-engine/src/types/mapping.rs`, applied at `createVirtualSchema` and at `EMITS`
-  rendering, and this delta changes none of them. No new deviation and no tracked exception arises.
+* The scan reads its declared output type from `UdfContext::output_column(idx)`, which
+  reports the `ExaType` the engine chose for the call-site `EMITS (...)` clause. The
+  `ExaType` variant IS the bin Exasol chose (e.g. `Int32`, `Int64`, `Numeric`), so the
+  scan reads the result rather than re-deriving it from a type string.
+* The declared-type list is not optional. Every scan call has a call-site `EMITS` clause.
+  An absent or wrong-arity declaration is drift and is reported rather than worked around.
+* `ExaType::Numeric`'s optional `precision` and `scale` are a wire artifact. A valid
+  Exasol NUMERIC declaration always carries both within `Decimal128`'s range. An absent or
+  out-of-range payload is drift, and both emit paths fail the call on it.
 
 ## Scenarios
 
