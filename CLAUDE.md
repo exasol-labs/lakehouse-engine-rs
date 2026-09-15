@@ -288,3 +288,26 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
 - SDK: `exasol-udf-sdk` + `exasol-udf-macros`, pinned **only** in `[workspace.dependencies]` of the
   root `Cargo.toml`. Since 0.18.0, `connect-back` is **always-on** (no longer a feature flag).
   Enable `emit-arrow` to unlock `ctx.emit_batch`.
+
+## Deployment state
+
+- **`deploy/{data,cluster,trino,lakekeeper}-stack`'s OpenTofu state lives in S3, never local, and
+  the bucket name is never committed** (it embeds the AWS account id — this is a public repo).
+  Each stack's `providers.tf` declares an empty `backend "s3" {}`; the real bucket/key/region come
+  from `tofu init -backend-config=backend.hcl`, where `backend.hcl` is gitignored (copy it from
+  that stack's `backend.hcl.example` and fill in the real bucket — ask a teammate or check the
+  team password manager for it, never paste it into a commit, issue, PR description, or chat log
+  that isn't already private). The 3 dependent stacks additionally take the bucket as
+  `var.tofu_state_bucket` (set in `terraform.tfvars`, also gitignored) to read `data-stack`'s
+  outputs via `data.terraform_remote_state.data`.
+  Do not revert to a local backend: local backend + gitignored state means the state lives only on
+  whichever machine/worktree last ran `tofu apply`; dropping that worktree (this workspace's
+  `<repo>-<number>` convention makes worktrees routinely disposable) loses the only copy while the
+  real, billing AWS resources keep running. Hit live 2026-09-11, fixed in PR #398 (issue #397) —
+  see that PR before touching backend config again.
+- `tofu workspace select "$ENV" || tofu workspace new "$ENV"` (per `env_name`, e.g. `demo`) still
+  works exactly as before — the S3 backend supports workspaces the same way local did.
+- Each stack needs a local `terraform.tfvars` (gitignored, copied from that stack's
+  `terraform.tfvars.example`) before `plan`/`apply`. **`data-stack`'s must set
+  `enable_emr_serverless = true`** — the variable defaults to `false`, and a bare `tofu
+  plan`/`apply` without it will offer to destroy the live EMR Serverless application.

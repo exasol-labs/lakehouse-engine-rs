@@ -25,7 +25,10 @@ example is a network with no path to GitHub.
   configured (`exapump profile add <name> --host <host> --user <user> --password <password>`,
   or `exapump profile init`). This is true for BucketFS targets even when you connect with
   `--dsn` or `--host`. The reason: `exapump bucketfs cp` always reads its connection from a
-  profile, plus any `--bfs-*` overrides you give.
+  profile, plus any `--bfs-*` overrides you give. If `exapump` is missing, the install script
+  offers to fetch and install it for you via its own public installer (auto-confirmed when there
+  is no terminal to ask, e.g. the one-liner below) — you still need to configure a profile
+  afterward.
 - `jq`, but only if you use `--deployment` to target an Exasol Personal deployment. It parses the
   deployment descriptor (`deployment.json`) to resolve connection details and backend. SaaS and
   BucketFS targets don't need it.
