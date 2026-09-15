@@ -79,6 +79,31 @@ the Exasol-version CI gate.
   round-to-nearest both produce the same millisecond value on the 8.x arm. Asserting the millisecond
   PREFIX rather than a rounding mode keeps the 8.x expectation honest without pinning behavior the
   scenario has not captured.
+* **This delta is issue #399.** It adds ONE scenario and no seed fixture. No existing scenario
+  changes.
+* **The scenario proves value correctness once the spec carries no type list.** Issue #399 deletes
+  the scan spec's copy of the declared emit types, so the scan reads its declared output type from
+  `UdfContext::output_column` alone. What this scenario asserts is that a query over a wide type
+  mix still returns the seeded values, against a scan spec that carries no `emit_exa_types` key.
+* **No recurring test asserts the declared list against the runtime list, by deliberate choice.**
+  That agreement is the SDK and SLC's own contract: `language-container-rs` populates the
+  output-column accessors from the same call-site `EMITS` clause the engine parsed. A permanent
+  assertion here would re-test that upstream guarantee rather than this repo's logic. It is proven
+  once instead, at implementation time, against the local Exasol Docker container, as a one-time
+  gate on the no-fallback design.
+* **Two seeded tables already span the type mix.** `typed_distinct_probe` (`E2E_TYPED_TABLE`)
+  carries Iceberg `long`, `decimal`, `double`, `string`, `date`, `timestamp`, and `boolean` columns.
+  `complex_probe` (`E2E_COMPLEX_TABLE`) carries `list`, `struct`, and `map` columns, which the
+  adapter declares `VARCHAR(2000000)` and the scan renders as JSON.
+* **A scale-0 narrow-decimal CAST is the only reachable probe for the Int32 bin.** Exasol bins a
+  scale-0 `DECIMAL(p,0)` with `p` ≤ 9 to `ExaType::Int32`. No catalog-declared column in these
+  fixtures produces one: an Iceberg `int` declares `DECIMAL(10,0)`, which bins to `ExaType::Int64`.
+  A projected `CAST(<col> AS DECIMAL(5,0))` declares `DECIMAL(5,0)` through
+  `exasol_type_from_json`, so the scenario reaches the Int32 bin through the select list.
+* **`Binary` needs no separate fixture.** The adapter declares `Binary`, `LargeBinary`, and
+  `FixedSizeBinary` as `VARCHAR(2000000)`, the same declaration the nested types carry. The
+  coercion dispatches on the declared `ExaType`, never on the source Arrow type, so the nested-type
+  columns exercise the identical code path.
 
 ## Scenarios
 
@@ -144,3 +169,13 @@ the Exasol-version CI gate.
 * *AND* the expected declared type SHALL come from the ONE shared helper this delta's round-trip scenario introduces, and MUST NOT be a second copy of the version-to-precision table
 * *AND* every OTHER recorded timestamp assertion SHALL keep passing unchanged on both version arms, and the reason SHALL be that each is precision-insensitive rather than precision-correct: the declared-type checks in `create_vs_maps_iceberg_schema` and the Delta/Unity suites match by PREFIX, the INT96 far-future check prefix-matches at seconds resolution, and every `HOURS_BETWEEN`/`YEAR`/`SECOND(c_ts, 3)`/`COUNT(DISTINCT)` assertion reads a derived value no sub-millisecond digit reaches
 * *AND* no recorded assertion SHALL be loosened to accommodate the new declaration — the one assertion that moves is the oracle's CAST target, and it moves to become MORE specific, not less
+
+### Scenario: The scan returns correct values across the type mix with no spec-carried emit types
+
+* *GIVEN* the seeded `typed_distinct_probe` and `complex_probe` Iceberg tables served through the virtual schema
+* *AND* a query whose select list spans `long`, `decimal`, `double`, `string`, `date`, `timestamp`, and `boolean` columns, a projected `CAST(<col> AS DECIMAL(5,0))`, and the `list`, `struct`, and `map` columns the adapter declares `VARCHAR(2000000)`
+* *WHEN* the query runs end to end against the local Exasol Docker container
+* *THEN* `EXPLAIN VIRTUAL` SHALL show the generated `EMITS (...)` clause declaring one Exasol type per select-list item
+* *AND* the generated scan spec JSON MUST NOT contain the key `emit_exa_types`, because the scan carries no second copy of that declaration
+* *AND* the query SHALL return the seeded values for every column, with the nested columns returned as the JSON documents `datafusion-scan/nested-json-rendering` specifies
+* *AND* the run SHALL exercise the `ExaType` variants `Int64`, `Int32`, `Numeric`, `Double`, `String`, `Date`, `Timestamp`, and `Boolean`, so the context-driven coercion is exercised for every variant the scan can meet on this fixture set rather than for a single column type
