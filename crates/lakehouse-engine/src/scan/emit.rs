@@ -8,11 +8,15 @@
 ///   drop the batch before fetching the next.
 /// - Rely on the SDK's 4,000,000-byte auto-flush; always flush at end.
 /// - Only IPC bytes cross the .so boundary — never Arrow types or Value intermediates.
+use crate::scan::checked_div::{
+    CheckedFloatDivError, find_checked_float_div_error, session_checked_float_div_failure,
+};
 use crate::scan::diagnostics::PhaseTimers;
 use arrow::datatypes::DataType;
 use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
+use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::SendableRecordBatchStream;
 use exasol_udf_sdk::context::{EmitBatch, UdfContext};
 use exasol_udf_sdk::error::UdfError;
@@ -188,19 +192,108 @@ fn target_arrow_type(declared: Option<&str>, source: &DataType) -> DataType {
 
 /// Classify a DataFusion scan error and produce a UdfError without credential leaks.
 ///
-/// Calls `find_root()` on the error chain to detect `ResourcesExhausted` through any
-/// nesting of `Context`, `External`, or `ArrowError` wrappers — which DataFusion 54
-/// uses internally (e.g. sort wraps OOM errors with `.context()`).
+/// A checked-division failure is recognised first, BY TYPE through
+/// [`find_checked_float_div_error`], because a user's own division by zero is
+/// not a storage failure and `scan failed: assigned data could not be read`
+/// would send a support case looking at object storage. Recognition never
+/// matches message text: that would be a silent coupling breaking on any
+/// wording change.
 ///
+/// Otherwise calls `find_root()` on the error chain to detect `ResourcesExhausted`
+/// through any nesting of `Context`, `External`, or `ArrowError` wrappers — which
+/// DataFusion 54 uses internally (e.g. sort wraps OOM errors with `.context()`).
+///
+/// - checked-division failure → the arithmetic error itself, unframed
 /// - `ResourcesExhausted` → clean memory-exhaustion error (distinct from storage errors)
 /// - Everything else → storage-read error via `redact_storage_error`
 ///
-/// Credential redaction is applied in both paths.
+/// Credential redaction is applied in every path.
 pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
+    if let Some(division) = find_checked_float_div_error(&e) {
+        return checked_division_error(division, secrets);
+    }
     match e.find_root() {
         DataFusionError::ResourcesExhausted(msg) => resources_exhausted_error(msg, secrets),
         _ => redact_storage_error(e.to_string(), secrets),
     }
+}
+
+/// Surface a checked-division failure as the arithmetic error it is.
+///
+/// Only the division's own message is surfaced. Every wrapping layer's text is
+/// dropped, exactly as [`resources_exhausted_error`] drops it and for the same
+/// reason: a `.context()` string can carry a credential-bearing fragment from an
+/// outer error layer. Redaction still runs over what remains, so the
+/// no-credential guarantee is a property of this classifier rather than of what
+/// each error variant happens to interpolate.
+fn checked_division_error(division: &CheckedFloatDivError, secrets: &[&str]) -> UdfError {
+    let safe = redact_credentials(&redact_secret_values(&division.to_string(), secrets));
+    UdfError::User(safe)
+}
+
+/// Introduces the memory exhaustion a scan surfaced alongside its checked
+/// division, so a reader sees two failures rather than one run-on message.
+const CONCURRENT_FAILURE_PREAMBLE: &str = "the scan also surfaced:";
+
+/// Labels the memory-exhaustion classification, for both the function that
+/// writes it and [`reframe_checked_division`], which reads it back to tell a
+/// structurally-recognised `ResourcesExhausted` from every other
+/// classification.
+///
+/// This is not the message-text coupling this module refuses elsewhere. That
+/// rule is about DataFusion's wording, which changes under us with no compile
+/// error. This wording is our own, and one constant owns it for the writer and
+/// the reader alike, so rewording it cannot make them disagree.
+const MEMORY_EXHAUSTED_LABEL: &str = "scan failed: memory exhausted (ResourcesExhausted):";
+
+/// Report the checked-division failure `session` recorded as the failure the
+/// scan surfaced.
+///
+/// [`classify_scan_error`] already recognises the division wherever its type
+/// survives to it. The type does not survive a predicate pushed into the Parquet
+/// row filter, which DataFusion flattens into a message string, and that is
+/// issue #370's own route. The session keeps the typed value for exactly that
+/// case, so this runs once per scan, at the one dispatcher all three run paths
+/// funnel through.
+///
+/// A recorded division REPLACES the surfaced failure, except a memory
+/// exhaustion, which it leads instead. Memory exhaustion is the only surfaced
+/// failure separable from the flattened division without matching DataFusion's
+/// wording: [`classify_scan_error`] recognises `ResourcesExhausted` on the typed
+/// root, before any text exists, and labels it with [`MEMORY_EXHAUSTED_LABEL`].
+/// Every other classification lands in the generic storage-read branch, which is
+/// exactly where the flattened division's own text lands, so appending it would
+/// republish `scan failed: assigned data could not be read` on 100% of issue
+/// #370's route, under the one framing this change exists to remove.
+///
+/// Accepted limitation, chosen rather than overlooked: an unrelated storage
+/// failure raised in another partition of a scan that also divided by zero is
+/// MASKED. DataFusion evaluates partitions concurrently and surfaces exactly one
+/// of their errors, so the collision is real; it is also rarer than issue #370's
+/// own route and has never been observed live, whereas the storage framing on a
+/// user's own division is measured and is what
+/// `e2e_float_div_by_zero_in_filter_fails_like_native_exasol` fails on. Memory
+/// exhaustion, the collision the mission's bounded-execution guarantee rests on,
+/// is the one kept visible.
+///
+/// The composed text is redacted here rather than trusted. `raw_scan` and
+/// `partial_agg` classify with the fact side's credentials alone, while this
+/// dispatcher holds the union that also covers a join's dimension side.
+pub fn reframe_checked_division(
+    session: &SessionContext,
+    error: UdfError,
+    secrets: &[&str],
+) -> UdfError {
+    let Some(recorded) = session_checked_float_div_failure(session) else {
+        return error;
+    };
+    let division = checked_division_error(&recorded, secrets);
+    let surfaced = error.to_string();
+    if !surfaced.contains(MEMORY_EXHAUSTED_LABEL) {
+        return division;
+    }
+    let safe = redact_credentials(&redact_secret_values(&surfaced, secrets));
+    UdfError::User(format!("{division}; {CONCURRENT_FAILURE_PREAMBLE} {safe}"))
 }
 
 /// Produce a clean memory-exhaustion UdfError, redacting any credential values.
@@ -209,11 +302,12 @@ pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
 /// `.context()` message (e.g. from DataFusion sort's OOM path) is intentionally
 /// dropped: context strings may carry credential-bearing fragments from outer
 /// error layers, so exposing them defeats the redaction guarantee.
+///
+/// The message opens with [`MEMORY_EXHAUSTED_LABEL`], which is also how
+/// [`reframe_checked_division`] recognises this classification.
 fn resources_exhausted_error(msg: &str, secrets: &[&str]) -> UdfError {
     let safe = redact_credentials(&redact_secret_values(msg, secrets));
-    UdfError::User(format!(
-        "scan failed: memory exhausted (ResourcesExhausted): {safe}"
-    ))
+    UdfError::User(format!("{MEMORY_EXHAUSTED_LABEL} {safe}"))
 }
 
 /// Map a storage/scan error string to a UdfError that does not leak credentials.

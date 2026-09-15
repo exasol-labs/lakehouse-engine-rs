@@ -558,9 +558,25 @@ fn format_decimal_exasol_style(expr_sql: &str) -> String {
     )
 }
 
-fn cast_to_double(expr_sql: &str) -> String {
-    format!("CAST({expr_sql} AS {DOUBLE_TYPE})")
-}
+/// Name of the session-registered scalar UDF the DataFusion dialect calls to
+/// render `FLOAT_DIV` (issue #370). This crate only names the function; the
+/// implementation and its `ScalarUDF` registration live in
+/// `crates/lakehouse-engine`, which depends on DataFusion — this crate does
+/// not and must not (see the module doc comment). The registered
+/// implementation MUST satisfy this contract exactly, because the string
+/// this constant names is the only thing tying the two crates together:
+/// - Exactly two arguments, evaluated left then right in the caller's order.
+/// - Both arguments are coerced to `Float64` before dividing, regardless of
+///   their input type — this is what reproduces Exasol's `FN_FLOAT_DIV`,
+///   which is always true float division typed `DOUBLE`.
+/// - The result type is `Float64`.
+/// - A `NULL` in either argument propagates: the result is `NULL`, not an
+///   error.
+/// - Any other result that is not finite (`±Inf` or `NaN`) is an error, not
+///   a returned value — this is what makes a division by zero fail at the
+///   point of division, in a filter predicate exactly as in a projection,
+///   instead of only where the value happens to reach an emit-time check.
+pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
 
 /// Render a CAST node body to `CAST(<expr> AS <target>)`.
 ///
@@ -1005,15 +1021,9 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                 // FN_MULT / FN_FLOAT_DIV — in particular multiplication is `MULT`
                 // (from FN_MULT), NOT `MUL`. CAST (below) is still translated but not
                 // advertised as a capability. FLOAT_DIV alone renders a DataFusion-only
-                // CAST-to-DOUBLE below; ADD/SUB/MULT render identically in both dialects.
+                // checked-division call (issue #370) below; ADD/SUB/MULT render
+                // identically in both dialects.
                 "ADD" | "SUB" | "MULT" | "FLOAT_DIV" => {
-                    let op = match fn_name.as_str() {
-                        "ADD" => "+",
-                        "SUB" => "-",
-                        "MULT" => "*",
-                        "FLOAT_DIV" => "/",
-                        _ => unreachable!(),
-                    };
                     let args = args.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
                     })?;
@@ -1028,9 +1038,15 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     let right = render_expression_inner(&args[1], dialect)?.ok_or_else(|| {
                         UdfError::User(format!("{fn_name} right operand is null"))
                     })?;
-                    let left = match (fn_name.as_str(), dialect) {
-                        ("FLOAT_DIV", Dialect::DataFusion) => cast_to_double(&left),
-                        _ => left,
+                    if fn_name == "FLOAT_DIV" && dialect == Dialect::DataFusion {
+                        return Ok(Some(format!("{CHECKED_FLOAT_DIV_FN}({left}, {right})")));
+                    }
+                    let op = match fn_name.as_str() {
+                        "ADD" => "+",
+                        "SUB" => "-",
+                        "MULT" => "*",
+                        "FLOAT_DIV" => "/",
+                        _ => unreachable!(),
                     };
                     Ok(Some(format!("({left} {op} {right})")))
                 }
