@@ -1,0 +1,37 @@
+
+[1m== 3.8.6  Healthy — issuer reachable through the proxy[0m
+   catalog came up
+     catalog process running: true   /health: 200
+   exasol~alice  alice_table -> HTTP 200
+   keycloak alice alice_table -> HTTP 200
+
+[1m== 3.8.7  Issuer outage WHILE the catalog is already running[0m
+   proxy stopped; the discovery document and JWKS are now unreachable.
+     catalog process running: true   /health: 200
+   exasol~alice  alice_table -> HTTP 200
+   keycloak alice alice_table -> HTTP 200
+   -> a running catalog keeps serving from its cached key set. The outage is
+      invisible until the next refresh falls due.
+
+[1m== 3.8.8  Issuer outage ACROSS a catalog restart[0m
+     catalog process running: false   /health: 000none
+   startup log, SINCE the restart only (docker logs accumulates across restarts):
+     "message":"Configuring 2 OIDC provider(s)"
+     "message":"Successfully added OIDC authenticator: oidc"
+     Error: Failed to create required OIDC authenticator for exasol (https://exasol.exacluster.local:2581/default/engine-oidc): Failed to fetch openid configuration from https://exasol.exacluster.local:2581/default/engine-oidc/.well-known/openid-configuration: error sending request for url (https://exasol.exacluster.local:2581/default/engine-oidc/.well-known/openid-configuration)
+   engine token  -> 000unreachable
+   -> the catalog refuses to start. This is not degraded mode: the customer's
+      Keycloak path, Spark and Trino included, is down with it.
+
+[1m== 3.8.9  Recovery[0m
+     catalog process running: true   /health: 200
+   exasol~alice  alice_table -> HTTP 200
+   keycloak alice alice_table -> HTTP 200
+   -> recovery needs no intervention beyond the issuer becoming reachable again.
+
+[1m== 3.8.10  Control — is the PRIMARY provider fatal in the same way?[0m
+     catalog process running: false   /health: 000none
+     Error: Failed to create required OIDC authenticator for oidc (http://no-such-idp:8080/realms/iceberg): Failed to fetch openid configuration from http://no-such-idp:8080/realms/iceberg/.well-known/open
+   -> if this also dies, an unreachable issuer was ALREADY fatal and 1a only
+      adds a second host to the list. If it survives, 1a introduces a new
+      single point of failure that the customer did not have before.

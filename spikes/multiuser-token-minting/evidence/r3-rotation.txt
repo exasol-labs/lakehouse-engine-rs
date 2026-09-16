@@ -1,0 +1,41 @@
+
+[1m== 3.5.0  Phase 0 — steady state, one key published[0m
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/jwks.json to engine-oidc/jwks.json
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/openid-configuration to engine-oidc/.well-known/openid-configuration
+   JWKS kids: ["lakehouse-engine-1"]
+     baseline                       kid-1 200   kid-2 401
+   -> kid-2 is 401: an unpublished key is rejected. That is the control for the rest.
+
+[1m== 3.5.1  Phase 1 — publish both keys, catalog NOT yet refreshed[0m
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/jwks.json to engine-oidc/jwks.json
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/openid-configuration to engine-oidc/.well-known/openid-configuration
+   JWKS kids: ["lakehouse-engine-1","lakehouse-engine-2"]
+     published, pre-refresh         kid-1 200   kid-2 200
+   -> whether kid-2 already passes here answers the operationally decisive
+      question: does an unknown kid force a JWKS re-fetch, or must the
+      publisher wait out the full cache interval before signing with it?
+
+[1m== 3.5.2  Phase 2 — SIMULATED refresh (catalog restart), both keys live[0m
+     post-refresh, overlap          kid-1 200   kid-2 200
+   -> this is the overlap window: either key verifies, so the engine can switch
+      signing keys at any moment without a failed query.
+
+[1m== 3.5.3  Phase 3 — retire the old key, catalog NOT yet refreshed[0m
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/jwks.json to engine-oidc/jwks.json
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/openid-configuration to engine-oidc/.well-known/openid-configuration
+   JWKS kids: ["lakehouse-engine-2"]
+     retired, pre-refresh           kid-1 200   kid-2 200
+
+[1m== 3.5.4  Phase 4 — SIMULATED refresh, old key gone[0m
+     post-refresh, retired          kid-1 401   kid-2 200
+   -> kid-1 must be 401 here. If it is not, the catalog is serving a stale key set.
+
+[1m== 3.5.5  Continuity — was there any moment with no working key?[0m
+   read the four probes above: at every phase at least one kid answered 200,
+   and the key the engine was signing with answered 200 throughout, provided
+   the switch happened inside the overlap.
+
+[1m== 3.5.6  Restore phase 0 for the remaining probes[0m
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/jwks.json to engine-oidc/jwks.json
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/openid-configuration to engine-oidc/.well-known/openid-configuration
+     restored                       kid-1 200   kid-2 401

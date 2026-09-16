@@ -1,0 +1,40 @@
+
+[1m== 3.4.0  A dedicated table, and two principals that have never been seen[0m
+   create carol_table -> HTTP 200
+   carol_table 01a0aabd-7cbf-7601-8e5d-a6dabb16fad6
+   user directory before anything: []
+   whoami as exasol~carol:
+     {"code":404,"message":"User with id exasol~carol not found."}
+
+[1m== 3.4.1  Route 1 — grant straight to a principal that does not exist[0m
+   grant select on carol_table to exasol~carol -> HTTP 204
+   the assignment persisted:
+     [{"type":"ownership","who":"oidc~33333333-3333-4333-8333-333333333333"},{"type":"select","who":"exasol~carol"}]
+
+[1m== 3.4.2  Carol's first ever query[0m
+   carol_table -> HTTP 200   alice_table -> HTTP 404
+   listTables -> [{"namespace":["analytics"],"name":"carol_table"}]
+   -> authorization worked on the FIRST query, with no user record anywhere.
+
+[1m== 3.4.3  Did the query create a user record?[0m
+   user directory after the query: []
+   whoami as carol, after querying:
+     {"code":404,"message":"User with id exasol~carol not found."}
+   -> no. Catalog data-plane calls do NOT self-register. The principal is
+      authorized and invisible in the user list at the same time.
+
+[1m== 3.4.4  Route 2 — pre-create the principal[0m
+   POST /management/v1/user id=exasol~dave -> HTTP 201
+   the record:
+     [{"id":"exasol~dave","name":"Dave (Exasol)","last-updated-with":"create-endpoint"}]
+   grant select on carol_table to exasol~dave -> HTTP 204
+   dave: carol_table -> HTTP 200   alice_table -> HTTP 404
+   whoami as dave:
+     {"id":"exasol~dave","name":"Dave (Exasol)","user-type":"human"}
+
+[1m== 3.4.5  The difference the two routes actually make[0m
+   both authorize identically. The only difference is visibility:
+     exasol~carol (grant only)          []
+     exasol~dave  (pre-created)         ["exasol~dave"]
+   a pre-created principal is searchable by display name and answers whoami;
+   a grant-only principal is neither, yet is fully authorized.

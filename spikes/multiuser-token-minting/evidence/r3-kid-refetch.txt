@@ -1,0 +1,24 @@
+
+[1m== 3.5.7  Isolate the re-fetch[0m
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/jwks.json to engine-oidc/jwks.json
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/openid-configuration to engine-oidc/.well-known/openid-configuration
+   published kids: ["lakehouse-engine-1"]  (catalog just fetched them)
+   kid-2, not published          -> HTTP 401
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/jwks.json to engine-oidc/jwks.json
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/openid-configuration to engine-oidc/.well-known/openid-configuration
+   published kids: ["lakehouse-engine-1","lakehouse-engine-2"]  (no catalog restart)
+   kid-2, now published          -> HTTP 200
+   kid-99, never published       -> HTTP 401
+   -> a key published after the last fetch is accepted without a restart, so
+      the catalog re-reads the JWKS when it meets a kid it does not hold.
+
+[1m== 3.5.8  Is the re-fetch attempted on every unknown kid?[0m
+     known kid (cached)         2.31 s for 10 requests
+     unknown kid                1.62 s for 10 requests
+     known kid (cached)         2.58 s for 10 requests
+   the mint cost is identical in both rows, so the difference is the catalog's.
+
+[1m== 3.5.9  Restore[0m
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/jwks.json to engine-oidc/jwks.json
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/rot/openid-configuration to engine-oidc/.well-known/openid-configuration
+   kid-1 -> HTTP 200

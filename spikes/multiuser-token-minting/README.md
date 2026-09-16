@@ -11,10 +11,19 @@ Everything below was run live against the stack in this directory on Lakekeeper 
 
 Reproduce end to end with `scripts/run-all.sh` (tears down first, so no run inherits state).
 
-> **Superseded by round 2.** Sections 1-6 are round 1 and are left intact as the record of how
-> we got here. Round 2 (sections 7-14) put Option A against the operability bar and it did not
-> clear it: the `engine~<sub>` namespace costs one grant change per role *and* per direct grant,
-> per person, not "one role assignment". **Read section 12 for the current recommendation.**
+> **Current answer: round 3, sections 15-27.** Rounds 1 and 2 are left intact as the record of how
+> we got here, and both are superseded.
+>
+> Round 1 (sections 1-6) recommended Option A. Round 2 (sections 7-14) reversed that, because the
+> separate `engine~<sub>` identity namespace cost one grant change per role *and* per direct grant,
+> per person. Round 3 (sections 15-27) reverses the reversal: the design decision changed so that a
+> separate namespace is **wanted** — the admin grants to `exasol~alice` deliberately, granting less
+> through Exasol than through Spark and revoking the Exasol path alone — which withdraws the
+> criterion round 2 scored against. Round 3 then verified the combined design end to end.
+> **Read sections 15-24 for the current recommendation and the day-one sequence.**
+>
+> Round 3 also deletes the subject-resolution requirement of section 10 entirely: the engine mints
+> `sub` = the Exasol user name from `ctx.current_user()` and never looks up an IdP subject.
 
 ---
 
@@ -723,3 +732,414 @@ Trino. Steps marked **(per user)** repeat; everything else is once.
 * **`x-assume-role-id` was not explored.** It is the only path by which `Actor::Role` is ever
   constructed. It assumes a role the principal is already a member of, so it does not solve barrier 2,
   but it was not measured and may matter for a service-account-shaped design later.
+
+---
+
+# Round 3: A+1a as the shipping design, verified
+
+**It survives. Items 1-4 all pass, and none of them needed a workaround.** The customer's Keycloak
+and the engine run as two providers on one catalog; `sub = alice` resolves to exactly
+`exasol~alice`; the admin can grant to that principal on day one, before the person has ever
+queried; vending, rotation and every negative control behave. Round 2's reversal is withdrawn on the
+criterion the brief withdrew, not on new evidence: a separate identity namespace is now wanted, and
+once it is wanted, Option A hosted on BucketFS is the design with the fewest moving parts in the
+whole spike.
+
+The design changed under round 3 in three ways that delete work rather than add it. The engine mints
+`sub` = the Exasol user name from `ctx.current_user()`, so **§10's subject resolution is gone
+entirely**: no IdP lookup, no `view-users` grant, no per-IdP admin API, no fail-closed path for an
+unresolvable name. The provider id is `exasol`, so the principal the admin types is
+`exasol~alice`. And the grant duplication round 2 counted as unbounded is now the feature being
+bought: the admin can grant less through Exasol than through Spark, and revoke the Exasol path
+alone.
+
+Four things cost something, and none of them is a blocker:
+
+* **The principal string is case-sensitive end to end** and a mismatch is a silent 404. The adapter
+  must normalise (§18).
+* **Retiring a signing key is not immediate.** Publishing a new key takes effect in seconds;
+  removing the old one takes up to the catalog's 1 h JWKS cache interval (§20).
+* **An unreachable issuer is fatal to the whole catalog at startup**, not degraded mode. Hosting on
+  BucketFS makes the Exasol cluster a hard startup dependency of the catalog. Measured control: the
+  customer's own IdP is fatal in exactly the same way, so this adds a host to an existing list
+  rather than a new class of failure (§23).
+* **A wrong principal string and a missing grant are indistinguishable** from the response: both are
+  `404 NoSuchTableException` (§22).
+
+Everything below was run live on the stack in this directory: Lakekeeper v0.13.1, Keycloak 26.4.0,
+OpenFGA v1.8.16, MinIO, and the repo's own Exasol 2025.1.16 container for BucketFS. Transcripts are
+in `evidence/r3-*.txt`; reproduce with `scripts/r3-run-all.sh`, which tears down first.
+
+## 15. The configuration under test
+
+One catalog, two providers, no `ADDITIONAL_ISSUERS` anywhere:
+
+```
+LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/iceberg     # the customer's IdP, id `oidc`
+LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
+LAKEKEEPER__OPENID_SUBJECT_CLAIM=sub
+LAKEKEEPER__OPENID_PROVIDERS__EXASOL__URI=https://exasol.exacluster.local:2581/default/engine-oidc
+LAKEKEEPER__OPENID_PROVIDERS__EXASOL__AUDIENCE=lakekeeper
+LAKEKEEPER__OPENID_PROVIDERS__EXASOL__SUBJECT_CLAIMS=sub
+SSL_CERT_FILE=<the root of the BucketFS certificate chain>
+```
+
+The engine's discovery document and JWKS are two objects in a `Public = True` BucketFS bucket,
+published with `exapump bucketfs cp` and served anonymously over BucketFS's HTTPS port with
+`Content-Type: application/json`. Nothing else runs.
+
+## 16. Item 1 — A+1a as one configuration
+
+`evidence/r3-combined.txt`. Rounds 1 and 2 each tested half of this. Run together, the startup log
+is:
+
+```
+Configuring 2 OIDC provider(s)
+Creating OIDC authenticator for oidc (http://keycloak:8080/realms/iceberg)
+Creating OIDC authenticator for exasol (https://exasol.exacluster.local:2581/default/engine-oidc)
+Successfully added OIDC authenticator: oidc
+Successfully added OIDC authenticator: exasol
+```
+
+Both token sources work against that one catalog, interleaved, with no restart between calls:
+
+```
+genuine Keycloak alice   whoami oidc~1111...              alice_table 200   bob_table 404
+genuine Keycloak bob                                       alice_table 404   bob_table 200
+engine-minted alice      catalog id exasol~alice (§17)     alice_table 200   bob_table 404
+engine-minted bob                                          alice_table 404   bob_table 200
+```
+
+The engine-minted token authenticates before any grant exists for it: with no `exasol~` assignment
+anywhere it answers 404 on both tables, never 401. That is the separate namespace doing its job.
+
+## 17. Item 2 — a non-UUID subject
+
+`evidence/r3-combined.txt` 3.2. Every token in rounds 1 and 2 carried
+`sub = 11111111-1111-4111-8111-111111111111`. Minting `sub = alice` instead:
+
+* The catalog names the principal itself, in its own error message:
+  `User with id exasol~alice not found.` The id is `exasol~alice`, byte for byte: the subject is
+  neither encoded nor normalised on the way into the principal id. (`whoami` answers 404 for it
+  until the principal is pre-created; see §19. Authorization does not depend on that.)
+* `POST .../table/<id>/assignments` with `{"type":"select","user":"exasol~alice"}` returns
+  **HTTP 204**, and the assignment list then reads
+  `[{ownership, oidc~3333...}, {select, oidc~1111...}, {select, exasol~alice}]` — the engine grant
+  sitting beside the customer's existing UI grant, untouched.
+* Authorization behaves, including list filtering:
+  `exasol~alice -> [{"namespace":["analytics"],"name":"alice_table"}]`,
+  `exasol~bob -> [{"namespace":["analytics"],"name":"bob_table"}]`.
+
+The load-bearing assumption of the design holds.
+
+## 18. Item 3 — case
+
+`evidence/r3-case.txt`. **Both sides are case-sensitive, and they agree with each other.** With only
+`exasol~alice` granted:
+
+```
+sub=alice  -> alice_table 200   catalog id exasol~alice
+sub=ALICE  -> alice_table 404   catalog id exasol~ALICE
+sub=Alice  -> alice_table 404   catalog id exasol~Alice
+```
+
+The grant API stores the string verbatim too: granting `exasol~ALICE` adds a *second* entry next to
+`exasol~alice`, both then answer 200, and revoking `exasol~ALICE` leaves `exasol~alice` working.
+`POST /management/v1/user` accepts both ids as distinct records; a search returns
+`["exasol~alice","exasol~ALICE"]` with the same display name. There is no folding anywhere in the
+path.
+
+**Recommendation: the adapter lower-cases `ctx.current_user()` before putting it in `sub`, and the
+documentation tells the admin to type `exasol~alice` in lower case.** Lower case rather than upper
+because it is the form the admin already uses for the same person in the IdP, and because round 2
+§10 measured Keycloak's own username lookup as case-insensitive, so the two strings the admin types
+stay identical. Normalising in the adapter rather than asking the admin to type `ALICE` also makes
+Exasol's own quoting irrelevant: `CREATE USER alice` (folded to `ALICE`) and `CREATE USER "alice"`
+both mint `sub = alice`.
+
+Two consequences to write down:
+
+* **If the admin types the other case, nothing says so.** The token authenticates, the principal is
+  simply one nobody granted, and the response is
+  `404 NoSuchTableException / "Error getting tabular from catalog"` — the same answer a genuinely
+  missing table gives. There is no log line for "unknown principal" and no 401 to alert on.
+* **Lower-casing merges Exasol users that Exasol keeps apart.** A deployment with both `ALICE` and a
+  quoted `"alice"` would map both onto `exasol~alice`. That is a pathological account layout, but it
+  is a real collapse of two identities into one and belongs in the documentation rather than in a
+  surprise.
+
+## 19. Item 4 — principal provisioning
+
+`evidence/r3-provisioning.txt`. **The admin can grant to `exasol~alice` before that user has ever
+touched the catalog. No pre-creation is required.** Measured with a fresh principal, `exasol~carol`,
+and a fresh table:
+
+```
+user directory before anything            []
+whoami as exasol~carol                    404 User with id exasol~carol not found.
+grant select on carol_table to exasol~carol   HTTP 204
+assignment persisted                      [{ownership, oidc~3333...}, {select, exasol~carol}]
+carol's FIRST ever query: carol_table 200   alice_table 404
+listTables                                [{"namespace":["analytics"],"name":"carol_table"}]
+```
+
+**Catalog data-plane calls do not self-register.** After that successful query the user directory is
+still `[]` and `whoami` still answers 404. So a principal can be fully authorized and simultaneously
+invisible in the catalog's user list. Round 1's A.2 observation that a user materialises with
+`"last-updated-with": "create-endpoint"` is exactly that: it materialises when something calls the
+*create* endpoint, not when it queries.
+
+Pre-creation works too and changes only visibility:
+
+```
+POST /management/v1/user id=exasol~dave    HTTP 201
+record        {"id":"exasol~dave","name":"Dave (Exasol)","last-updated-with":"create-endpoint"}
+grant + query  carol_table 200   alice_table 404
+whoami         {"id":"exasol~dave","name":"Dave (Exasol)","user-type":"human"}
+searchable by display name     ["exasol~dave"]
+exasol~carol, grant-only, same search    []
+```
+
+**The admin's day-one sequence is therefore: grant, and stop.** Pre-creating is optional and buys
+two things — the principal answers `whoami`, and it is searchable by display name, which is what
+makes it findable in the Lakekeeper UI instead of having to be typed from memory. For an admin
+managing more than a handful of people that is worth doing; it is not a correctness requirement.
+
+## 20. Item 5 — key rotation
+
+`evidence/r3-rotation.txt` and `evidence/r3-kid-refetch.txt`. Untested in rounds 1 and 2; it works,
+asymmetrically.
+
+Lakekeeper caches a provider's key set for 1 h and exposes no refresh API, so the post-refresh state
+was reached by restarting the catalog. **Every restart below is a simulated refresh, not an observed
+one**; the 1 h figure itself is read from round 1's source reading of
+`JWKSWebAuthenticator::new(uri, Some(Duration::from_hours(1)))` and was never watched on the clock.
+Both keys sign for the same granted principal, so the only variable is the key:
+
+| phase | published JWKS | catalog refreshed? | kid-1 | kid-2 |
+|---|---|---|---|---|
+| 0 baseline | `[kid-1]` | yes | **200** | 401 |
+| 1 new key published | `[kid-1, kid-2]` | **no** | **200** | **200** |
+| 2 overlap | `[kid-1, kid-2]` | yes | **200** | **200** |
+| 3 old key retired | `[kid-2]` | **no** | **200** | **200** |
+| 4 retired, refreshed | `[kid-2]` | yes | 401 | **200** |
+
+Phase 1 is the surprise: **a key published after the last fetch is accepted within seconds, with no
+restart.** Phase 3 is the control that makes that conclusive — a key *removed* from the published
+document is still accepted, so the key set genuinely is cached and phase 1 is not "no caching at
+all". Isolated again in `r3-kid-refetch.txt`: kid-2 is 401 before publication, 200 seconds after
+publication with no restart, and a never-published `kid-99` stays 401 throughout. The catalog
+re-reads the JWKS when it meets a `kid` it does not hold.
+
+So the two halves of a rotation have different costs:
+
+* **Introducing a key is effectively instant.** Publish it, then sign with it. No waiting window.
+* **Retiring a key takes up to the full cache interval.** Until the next refresh the catalog keeps
+  honouring a key that is no longer published, which matters when the reason for the rotation is
+  that the old key leaked.
+
+**Recommended overlap: publish the new key alongside the old, switch signing immediately, and keep
+the old key listed for at least the refresh interval plus the maximum token TTL before removing it.
+With the 1 h interval and a 5 minute token lifetime that is a little over an hour; hold two hours
+and it is unambiguous.** Nothing in the measured sequence produced a failed query at any phase.
+A compromised key is not a rotation, it is an incident: removing it from the JWKS does not revoke it
+for up to an hour, so the catalog must be restarted to make the removal take effect at once.
+
+One operational follow-up, measured because the re-fetch is attacker-reachable: ten requests bearing
+distinct never-published kids took 1.62 s against 2.31 s and 2.58 s for ten known-kid requests, so
+an unknown kid is *cheaper* than a successful call rather than more expensive. There is no
+measurable fetch amplification. That is a timing observation, not a read of the caching code, and it
+does not prove a bound on how often the catalog will re-read the document.
+
+## 21. Item 6 — per-user vended credentials in this namespace
+
+`evidence/r3-vending.txt`. Round 1 proved vending for `engine~<uuid>`; it behaves identically for
+`exasol~alice`, on the combined catalog, with `sts-enabled: true` and `flavor: s3-compat`:
+
+```
+alice cred prefix   s3://warehouse/spike/01a0aabd-2119-...        (her table, not the warehouse)
+bob   cred prefix   s3://warehouse/spike/01a0aabd-218b-...
+alice creds -> her own metadata                 exit=0
+alice creds -> bob's metadata                   exit=1  Insufficient permissions to access this path
+alice creds -> list s3://warehouse/spike/       exit=1  Access Denied
+alice creds -> list her own table prefix        exit=0
+loadTable bob_table as exasol~alice             404 NoSuchTableException
+warehouse's own static key -> bob's metadata    exit=0   (control: the stored credential is unscoped)
+```
+
+The principal's IdP prefix has no effect on storage scoping. The catalog refuses first anyway, so
+alice can never obtain a credential for bob's data.
+
+## 22. Item 7 — negative controls
+
+`evidence/r3-negative.txt`. Every one explicit, with the failure mode recorded.
+
+| probe | result | meaning |
+|---|---|---|
+| granted principal `exasol~alice` (positive control) | **200** | |
+| `kid` not in the JWKS | **401** `AuthenticationFailed` | |
+| `kid` in the JWKS, signed with a different private key | **401** `AuthenticationFailed` | signature is really verified |
+| expired 61 s (past the 60 s skew allowance) | **401** `AuthenticationFailed` | |
+| expired 1 h | **401** `AuthenticationFailed` | |
+| wrong audience | **401** `AuthenticationFailed` | |
+| no audience | **401** `AuthenticationFailed` | |
+| wrong issuer (the customer's own Keycloak issuer) | **401** `AuthenticationFailed` | the engine cannot impersonate the IdP |
+| `alg=none`, unsigned | **401** | |
+| expired 30 s (inside the skew allowance) | 200 | boundary, for completeness |
+| `exasol~erin`, catalog user record exists, no grant | **404** `NoSuchTableException` | |
+| `exasol~mallory`, no catalog record at all | **404** `NoSuchTableException` | |
+
+**The two 404s are indistinguishable from the client**: same status, same error type, same message,
+`Error getting tabular from catalog`. An operator cannot tell "the admin typed the wrong user name"
+from "the grant was never made" from the response alone, only by reading the catalog's own
+assignment list.
+
+What the two modes mean, since they are the only two an engine-minted token can produce:
+
+* **401 `AuthenticationFailed`** — rejected before any grant lookup. Causes: the key is not
+  published or not yet refreshed, clock skew past `exp`, wrong audience, wrong issuer. It fails
+  *every* user of the engine at once, so it is a configuration alarm and it is loud.
+* **404 `NoSuchTableException`** — the token was accepted and this principal has no grant on this
+  object. Causes: the admin granted a different string (case, typo, wrong prefix), or never granted.
+  It affects one person or one table, it reads exactly like a missing table, and nothing logs it as
+  an authorization event.
+
+## 23. Item 8 — the BucketFS conditions, in the combined config
+
+`evidence/r3-bucketfs.txt` and `evidence/r3-availability.txt`. Both round-2 conditions reconfirmed
+against the live certificate with the engine as the *secondary* provider, and one new finding that
+matters more than either.
+
+The certificate the Docker image presents is unchanged: a two-certificate chain, both
+`subject=CN=exacluster.local`, the leaf carrying `SAN: *.exacluster.local, exacluster.local`.
+
+```
+SAN-covered host + chain ROOT in SSL_CERT_FILE   -> running: true    both authenticators up
+the LEAF trusted instead of the root             -> running: FALSE
+https://exasol:2581/... (outside the SAN)        -> running: FALSE
+```
+
+**A secondary provider whose discovery document cannot be fetched is fatal to the whole catalog**,
+not to the engine's path alone:
+
+```
+Error: Failed to create required OIDC authenticator for exasol (https://exasol.exacluster.local:2581/default/engine-oidc):
+Failed to fetch openid configuration from .../.well-known/openid-configuration: error sending request for url (...)
+```
+
+The log even shows `Successfully added OIDC authenticator: oidc` immediately before the process
+exits, so the customer's Keycloak path comes up and then dies with it. Split into the two cases that
+an operator actually meets (`r3-availability.txt`, with the issuer reached through a proxy that owns
+the certificate's hostname so the outage can be switched on and off):
+
+* **Outage while the catalog is already running: survivable.** With the issuer unreachable, both
+  `exasol~alice` and the genuine Keycloak token still answer 200 and `/health` stays 200. The
+  catalog serves from its cached key set and the outage is invisible until the next refresh falls
+  due. How it behaves *at* that refresh was not measured.
+* **Outage across a catalog restart: total.** The process exits, `/health` is unreachable, and
+  recovery needs nothing but the issuer coming back.
+
+**Control, so the cost is stated fairly:** pointing `LAKEKEEPER__OPENID_PROVIDER_URI` at a host that
+does not exist kills the catalog in exactly the same way
+(`Failed to create required OIDC authenticator for oidc`). An unreachable issuer was already fatal.
+Hosting on BucketFS adds the Exasol cluster to a list that already had the customer's IdP on it; it
+does not introduce a new class of failure. It is still a real coupling: the catalog can no longer be
+restarted while the Exasol cluster is down.
+
+**A customer using their own PKI needs no step at all.** Running the same combined configuration
+with the Exasol root appended to the image's stock bundle at the default path
+`/etc/ssl/certs/ca-certificates.crt` and **no `SSL_CERT_FILE` set** brings both authenticators up.
+So if the Exasol certificate chains to a CA the catalog host already trusts, there is no certificate
+to copy and no environment variable to set. Only the SAN condition remains, and it is satisfied by
+using the hostname the certificate was issued for. The `SSL_CERT_FILE` dance in this spike is an
+artefact of the Docker image's self-signed certificate, not a property of the design.
+
+## 24. Day one for a customer, for this design
+
+Iceberg on Lakekeeper, the customer's own IdP, existing grants, querying today with Spark or Trino.
+Steps marked **(per user)** repeat; everything else is once.
+
+1. **Generate the engine signing key** and store it in the Exasol CONNECTION the engine already
+   uses. It is the most sensitive value in that object: whoever holds it can assert any identity to
+   the catalog.
+2. **Publish the discovery document and JWKS to a `Public = True` BucketFS bucket** with
+   `exapump bucketfs cp`, as `<bucket>/engine-oidc/.well-known/openid-configuration` and
+   `<bucket>/engine-oidc/jwks.json`. The `issuer` in the document must equal the URL the catalog
+   will use, and that URL must use a hostname inside the Exasol certificate's SAN.
+3. **Add one provider to the catalog and restart it**:
+   `LAKEKEEPER__OPENID_PROVIDERS__EXASOL__{URI,AUDIENCE,SUBJECT_CLAIMS}`. Nothing about the
+   customer's existing provider changes. If the Exasol certificate is not already trusted by the
+   catalog host, put the chain **root** in its trust store at the same time.
+4. **(per user) Grant to `exasol~<lowercase exasol user name>`**, on whatever tables that person
+   should reach through Exasol. The principal does not need to exist first. Grant less here than the
+   person has through Spark if that is the intent; revoking this grant removes the Exasol path
+   without touching their Spark access.
+5. Optional, recommended above a handful of people: **pre-create each principal** with
+   `POST /management/v1/user` so it answers `whoami` and is searchable by display name in the UI.
+6. Nothing else. No IdP configuration, no `view-users` grant, no identity-provider object, no
+   changes to any existing grant, no per-user CONNECTION, no refresher process, no new component.
+
+Rotation, when it comes: publish the new key alongside the old, switch signing, wait out the cache
+interval plus the token TTL, remove the old key. For a compromised key, restart the catalog rather
+than waiting.
+
+## 25. Round-3 open questions
+
+* **The 1 h JWKS refresh was never observed on the clock.** Every "post-refresh" state in §20 was
+  reached by restarting the catalog. The interval itself is a source reading from round 1. Whether
+  the scheduled refresh behaves like a restart, and what a running catalog does when that refresh
+  fails against an unreachable issuer, are both untested.
+* **How often the catalog re-reads the JWKS on an unknown `kid` is not bounded.** The behaviour is
+  measured, the policy behind it is not. Ten unknown-kid requests were cheaper than ten successful
+  ones, which is evidence against amplification but not a bound.
+* **Nothing in round 3 touched adapter code either.** `ctx.current_user()` -> lower-case -> mint ->
+  catalog call inside a real Exasol query is still unproven end to end, and it is now the only
+  moving part left: the subject-resolution step round 2 added has been removed by the design change.
+* **The signing cost in the adapter is still unmeasured**, and so is whether the Exasol node clock
+  stays inside the 60 s `exp` skew allowance. Both are carried over unchanged from round 1.
+* **The `exasol~ALICE` collision was reasoned about, not measured**: no deployment with both a
+  folded `ALICE` and a quoted `"alice"` was constructed.
+* **Only Lakekeeper was tested.** Whether Databricks-managed Unity Catalog accepts an equivalent
+  second issuer is still out of scope and unknown.
+* **BucketFS was tested on the repo's single-node Docker image.** Whether a multi-node cluster
+  serves the same bucket contents from every node, and what the URL looks like there, was not
+  measured.
+
+## 26. PI-6547, round-3 delta (supersedes §13a where they disagree)
+
+* **Delete the subject-resolution work item entirely.** Round 2's "grant the engine's service
+  account `realm-management:view-users`, resolve `ctx.current_user()` at plan time, fail closed" is
+  gone. The engine asserts the Exasol user name directly. No IdP call, no IdP configuration, no
+  failure path for an unresolvable name.
+* **Replace "get the engine's public key trusted under the customer's own provider" with "register
+  the engine as a second OIDC provider `exasol`, documents hosted on BucketFS".** 1d, 2b, 2c and the
+  upstream static-key change are no longer on the critical path. Keep the upstream proposal as a
+  nice-to-have that would remove the hosting step; do not gate delivery on it.
+* **The identity-mapping item becomes a normalisation rule.** Lower-case `ctx.current_user()` before
+  minting `sub`; document that the admin types `exasol~<lowercase name>`; document the silent-404
+  failure mode when they do not.
+* **New work item: key rotation procedure.** Publish-then-switch-then-wait, with the asymmetry in
+  §20 written down, and a catalog restart as the documented response to a compromised key.
+* **New work item: operational note on the startup coupling.** The catalog cannot start while the
+  BucketFS issuer is unreachable. Say so in the install documentation next to the provider
+  configuration, alongside the fact that the customer's own IdP already had this property.
+* **Keep** the key-management item, the `ConnectionCreds` third mode carrying the signing key, the
+  issuer URL and the key id, "work item 4 (storage-layer authorization) is already satisfied", and
+  "drop the Keycloak-upgrade item". Round 3 disturbed none of them.
+
+## 27. Round-3 artifacts
+
+| Path | What it is |
+|---|---|
+| `scripts/r3-lib.sh` | The configuration under test in one place: BucketFS publication, chain-root extraction, the combined two-provider catalog, and the simulated-refresh helper |
+| `scripts/r3-combined.sh` | Items 1 and 2: both providers on one catalog, a genuine Keycloak token and an engine-minted one, and the non-UUID subject |
+| `scripts/r3-case.sh` | Item 3: case sensitivity on the token path, the grant API and the user directory |
+| `scripts/r3-provisioning.sh` | Item 4: granting to a principal that does not exist, and pre-creating one |
+| `scripts/r3-rotation.sh` | Item 5: the four-phase two-key rotation |
+| `scripts/r3-kid-refetch.sh` | Item 5 addendum: the unknown-`kid` re-fetch isolated, plus the amplification timing |
+| `scripts/r3-vending.sh` | Item 6: vended credentials for `exasol~alice` |
+| `scripts/r3-negative.sh` | Item 7: every negative control, with the failure mode recorded |
+| `scripts/r3-bucketfs.sh` | Item 8: the two BucketFS conditions and the customer-PKI case, in the combined config |
+| `scripts/r3-availability.sh` | Item 8 continued: issuer outage at runtime and across a restart, with the primary-provider control |
+| `scripts/r3-cleanup.sh` | Removes the throwaway catalogs, the proxy and the documents published into the repo's main Exasol BucketFS |
+| `scripts/r3-run-all.sh` | Teardown, bring-up, provision, then all of the above into `evidence/r3-*.txt`, then cleanup |

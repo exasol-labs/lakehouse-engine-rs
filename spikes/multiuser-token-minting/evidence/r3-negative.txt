@@ -1,0 +1,36 @@
+
+[1m== 3.7.0  Positive control — the token that must work[0m
+     granted principal (exasol~alice)       HTTP 200                           
+
+[1m== 3.7.1  Authentication failures (must be 401)[0m
+     kid not in the JWKS                    HTTP 401  AuthenticationFailed     Authentication failed
+     kid in JWKS, wrong private key         HTTP 401  AuthenticationFailed     Authentication failed
+     expired 61s (beyond 60s skew)          HTTP 401  AuthenticationFailed     Authentication failed
+     expired 1h                             HTTP 401  AuthenticationFailed     Authentication failed
+     wrong audience                         HTTP 401  AuthenticationFailed     Authentication failed
+     no audience                            HTTP 401  AuthenticationFailed     Authentication failed
+     wrong issuer (the customer IdP)        HTTP 401  AuthenticationFailed     Authentication failed
+     alg=none (unsigned)                    HTTP 401
+   boundary, for completeness — inside the 60s skew allowance:
+     expired 30s (inside skew)              HTTP 200                           
+
+[1m== 3.7.2  Authorization failures (valid token, no grant — must be 404)[0m
+   case A: the principal has a catalog user record but no grant
+     POST /management/v1/user exasol~erin -> HTTP 201
+     exasol~erin (exists, not granted)      HTTP 404  NoSuchTableException     Error getting tabular from catalog
+   case B: the principal does not exist in the catalog at all
+     exasol~mallory (no record at all)      HTTP 404  NoSuchTableException     Error getting tabular from catalog
+   -> the two are INDISTINGUISHABLE from the client: same status, same type,
+      same message. An operator cannot tell 'wrong user name' from 'missing
+      grant' from the response, only from the catalog's own user list.
+
+[1m== 3.7.3  What the two failure modes mean operationally[0m
+     401 AuthenticationFailed -> the token was rejected before any grant lookup.
+        Causes: key not published / not yet refreshed, clock skew past exp,
+        wrong audience, wrong issuer. Every user of the engine fails at once.
+        This is an engine- or catalog-configuration alarm.
+     404 NoSuchTableError    -> the token was accepted and the principal has no
+        grant on that object. Causes: the admin granted a different string
+        (case, typo, wrong idp prefix), or the grant was never made. It affects
+        one user or one table, and it is silent — it reads exactly like a
+        missing table.

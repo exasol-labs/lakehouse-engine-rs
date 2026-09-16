@@ -1,0 +1,38 @@
+
+[1m== 3.8.0  The conditions, restated from the live certificate[0m
+     subject=CN=exacluster.local issuer=CN=exacluster.local X509v3 Subject Alternative Name:      DNS:*.exacluster.local, DNS:exacluster.local 
+     subject=CN=exacluster.local issuer=CN=exacluster.local 
+   issuer URL under test: https://exasol.exacluster.local:2581/default/engine-oidc
+
+[1m== 3.8.1  Correct — SAN-covered host, chain ROOT in SSL_CERT_FILE[0m
+     process running: true
+     "message":"Configuring 2 OIDC provider(s)"
+     "message":"Successfully added OIDC authenticator: exasol"
+     "message":"Successfully added OIDC authenticator: oidc"
+
+[1m== 3.8.2  Negative control — the LEAF trusted instead of the root[0m
+     process running: false
+     "message":"Configuring 2 OIDC provider(s)"
+     "message":"Successfully added OIDC authenticator: oidc"
+     Error: Failed to create required OIDC authenticator for exasol (https://exasol.exacluster.local:2581/default/engine-oidc): Failed to fetch openid configuration from https://exasol.exacluster.local:2581/default/engine-oidc/.well-known/openid-configuration: error sending request for url (https://exasol.exacluster.local:2581/default/engine-oidc/.well-known/openid-configuration)
+
+[1m== 3.8.3  Negative control — a hostname outside the certificate SAN[0m
+     process running: false
+     "message":"Configuring 2 OIDC provider(s)"
+     "message":"Successfully added OIDC authenticator: oidc"
+     Error: Failed to create required OIDC authenticator for exasol (https://exasol:2581/default/engine-oidc): Failed to fetch openid configuration from https://exasol:2581/default/engine-oidc/.well-known/openid-configuration: error sending request for url (https://exasol:2581/default/engine-oidc/.well-known/openid-configuration)
+
+[1m== 3.8.4  Blast radius — does a broken secondary take the primary with it?[0m
+   read 'process running' and the authenticator lines in 3.8.2 and 3.8.3.
+   if the process is not running, the customer's own Keycloak path is down too.
+
+[1m== 3.8.5  The customer's own PKI — is any step needed?[0m
+   stock bundle (151 certs incl. the Exasol root) at the DEFAULT path, no SSL_CERT_FILE:
+     process running: true
+     "message":"Configuring 2 OIDC provider(s)"
+     "message":"Successfully added OIDC authenticator: exasol"
+     "message":"Successfully added OIDC authenticator: oidc"
+   -> if this comes up, a customer whose Exasol certificate is issued by a CA
+      already in the catalog host's trust store needs NO step at all: no
+      SSL_CERT_FILE, no certificate copying. Only the SAN condition remains,
+      and that is satisfied by using the hostname the certificate was issued for.

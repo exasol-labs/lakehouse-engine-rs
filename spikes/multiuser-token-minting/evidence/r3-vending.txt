@@ -1,0 +1,31 @@
+
+[1m== 3.6.0  Warehouse storage profile (sts-enabled is the precondition)[0m
+     {"bucket":"warehouse","key-prefix":"spike","flavor":"s3-compat","sts-enabled":true,"endpoint":"http://minio:9000/"}
+
+[1m== 3.6.1  Vend to exasol~alice and exasol~bob[0m
+   alice_table metadata: s3://warehouse/spike/01a0aabd-2119-7730-91d9-6dbd046e64ef/metadata/00000-01a0aabd-2139-7ca2-932f-e243243ce4fd.gz.metadata.json
+   bob_table   metadata: s3://warehouse/spike/01a0aabd-218b-7c90-945c-4c8b8d4d4b73/metadata/00000-01a0aabd-21ed-7832-a913-710dd35b275c.gz.metadata.json
+     alice cred: {"prefix":"s3://warehouse/spike/01a0aabd-2119-7730-91d9-6dbd046e64ef","expires":"1789574570000"}
+     bob   cred: {"prefix":"s3://warehouse/spike/01a0aabd-218b-7c90-945c-4c8b8d4d4b73","expires":"1789574572000"}
+   -> scoped to the TABLE prefix, same as round 1. The exasol~ namespace
+      changes nothing about the storage scoping.
+
+[1m== 3.6.2  Storage layer, with ALICE's vended credentials[0m
+   alice creds -> alice_table metadata (expect success):
+     exit=0
+   alice creds -> bob_table metadata (MUST fail):
+     exit=1
+     mc: <ERROR> Unable to read from `v/warehouse/spike/01a0aabd-218b-7c90-945c-4c8b8d4d4b73/metadata/00000-01a0aabd-21ed-7832-a913-710dd35b275c.gz.metadata.json`. Insufficient permissions to access this p
+   alice creds -> list the whole warehouse prefix (MUST fail):
+     exit=1
+     mc: <ERROR> Unable to list folder. Access Denied.
+   alice creds -> list her own table prefix (expect success):
+     exit=0
+
+[1m== 3.6.3  The catalog refuses first anyway[0m
+   loadTable bob_table as exasol~alice -> HTTP 404
+     {"error":"NoSuchTableException","message":"Error getting tabular from catalog"}
+
+[1m== 3.6.4  Control — the warehouse's own static key is NOT scoped[0m
+     warehouse static key -> bob_table exit=0
+   -> the scoping comes from the per-request STS session, not the stored credential.

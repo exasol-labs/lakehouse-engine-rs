@@ -1,0 +1,44 @@
+
+[1m== 3.3.0  Starting point — only exasol~alice (lower case) is granted[0m
+     ["oidc~33333333-3333-4333-8333-333333333333","oidc~11111111-1111-4111-8111-111111111111","exasol~alice"]
+
+[1m== 3.3.1  Token path: does the catalog fold the subject claim?[0m
+     sub=alice  -> alice_table HTTP 200   catalog says: User with id exasol~alice not found.
+     sub=ALICE  -> alice_table HTTP 404   catalog says: User with id exasol~ALICE not found.
+     sub=Alice  -> alice_table HTTP 404   catalog says: User with id exasol~Alice not found.
+   -> the subject is taken verbatim. ALICE is a different principal from alice.
+
+[1m== 3.3.2  Grant API: does IT fold?[0m
+   grant select to exasol~ALICE -> HTTP 204
+   assignments now:
+     ["oidc~33333333-3333-4333-8333-333333333333","oidc~11111111-1111-4111-8111-111111111111","exasol~alice","exasol~ALICE"]
+   -> two separate entries. The grant API stores the string verbatim too,
+      so the grant API and the token path agree: both are case-SENSITIVE.
+
+[1m== 3.3.3  With exasol~ALICE granted, the upper-case token works[0m
+     sub=alice  -> alice_table HTTP 200   bob_table HTTP 404
+     sub=ALICE  -> alice_table HTTP 200   bob_table HTTP 404
+
+[1m== 3.3.4  They are genuinely two principals — revoke one, the other survives[0m
+   revoke exasol~ALICE -> HTTP 204
+     sub=alice  -> alice_table HTTP 200
+     sub=ALICE  -> alice_table HTTP 404
+     ["oidc~33333333-3333-4333-8333-333333333333","oidc~11111111-1111-4111-8111-111111111111","exasol~alice"]
+
+[1m== 3.3.5  The user directory does not merge them either[0m
+   POST /management/v1/user id=exasol~alice -> HTTP 201
+   POST /management/v1/user id=exasol~ALICE -> HTTP 201
+   GET /management/v1/user?name=case%20probe:
+     ["exasol~alice","exasol~ALICE"]
+   -> two distinct user records with the same display name.
+
+[1m== 3.3.6  What the admin sees when they type the other case[0m
+   the failure is a 404 on the table, not an authentication error:
+     HTTP 404
+     {
+       "error": {
+         "message": "Error getting tabular from catalog",
+         "type": "NoSuchTableException",
+         "code": 404,
+   -> indistinguishable from 'the table does not exist'. A case mismatch is a
+      silent authorization miss, which is exactly why the adapter must normalise.
