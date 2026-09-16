@@ -1,0 +1,29 @@
+
+[1m== 2c.1  Why the ids fall out this way (source)[0m
+   config.rs:175   a multi-provider entry may NOT be named `oidc` — the id is
+                   reserved ("Invalid OIDC provider '<id>': IdP ID 'oidc' is
+                   reserved"), as is `kubernetes`.
+   So `oidc` is available to exactly one issuer: whichever is configured as the
+   single/primary LAKEKEEPER__OPENID_PROVIDER_URI. 2c takes it for the engine.
+
+[1m== 2c.2  Throwaway Lakekeeper with the roles inverted[0m
+   health -> 200
+
+[1m== 2c.3  Engine-minted token now lands on oidc~<sub>[0m
+   whoami -> {"id":"oidc~11111111-1111-4111-8111-111111111111","name":"alice (via Keycloak)"}
+   alice: alice_table -> HTTP 200   (expect 200)
+   alice: bob_table   -> HTTP 404   (expect 404)
+
+[1m== 2c.4  The cost: the customer's OWN clients move to keycloak~<sub>[0m
+   whoami -> {"id":null,"name":null}
+   genuine Keycloak token, alice_table -> HTTP 404
+   2c does not remove barrier 2 — it MOVES it onto the customer. Every existing
+   grant, every Spark and Trino session, and every user in the Lakekeeper
+   database is keyed on oidc~<sub>; handing that prefix to the engine renames
+   the customer's entire user population to keycloak~<sub> overnight.
+   It also breaks UI login: the UI redirects only to the primary provider, and
+   the engine's issuer has no authorization endpoint (config.rs warns about
+   exactly this when the primary is unset; here it is set to something that
+   cannot serve a login).
+   Verdict for 2c: rejected. It is strictly worse than 2b, which achieves the
+   same identity unification without renaming anyone.

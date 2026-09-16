@@ -1,0 +1,50 @@
+
+[1m== 1c.1  Is there a static-key option in any released Lakekeeper?[0m
+   v0.13.1 with LAKEKEEPER__OPENID_PROVIDER_JWKS set and no provider URI:
+     "message":"Running without Kubernetes authentication."
+     "message":"Running without Kubernetes authentication for legacy service accounts."
+     "message":"Running without OIDC authentication."
+   v0.13.5 with LAKEKEEPER__OPENID_PROVIDER_JWKS set and no provider URI:
+     "message":"Running without Kubernetes authentication."
+     "message":"Running without Kubernetes authentication for legacy service accounts."
+     "message":"Running without OIDC authentication."
+   The setting is simply unknown: the catalog starts with OIDC authentication
+   disabled rather than with a statically-keyed provider. Every OIDC knob
+   Lakekeeper exposes takes a URI (OPENID_PROVIDER_URI,
+   OPENID_PROVIDERS__<id>__URI), and each is fed to
+   limes::jwks::JWKSWebAuthenticator::new(uri, ttl), which performs OIDC
+   discovery over HTTP. There is no _JWKS / _PUBLIC_KEY variant in v0.13.1 or in
+   v0.13.5, the newest release, and no upstream issue requests one.
+
+[1m== 1c.2  Where a static option would have to be added[0m
+   limes 0.6.0 (github.com/vakamo-labs/limes-rs — same org as Lakekeeper) ships
+   exactly three authenticators: JWKSWebAuthenticator, KubernetesAuthenticator,
+   AuthenticatorChain. None verifies against a supplied key. It does expose a
+   public `Authenticator` trait, which is the seam a static one would plug into.
+
+   Lakekeeper side, all in crates/lakekeeper/src:
+     config.rs               add `jwks` / `public_key` to OidcProviderConfig,
+                             make `uri` optional, extend validate_openid_provider_ids
+     service/authn.rs        build_oidc_authenticator() is the ONE construction
+                             site (it already branches on 6 optional settings);
+                             add the static arm and a variant to AuthenticatorEnum
+     docs + tests            the config test module already covers the structured
+                             env parsing, so the new field follows the pattern
+
+[1m== 1c.3  Effort estimate[0m
+   limes:      a StaticJwksAuthenticator implementing the existing Authenticator
+               trait. The JWT decode/validate path is already written; the new
+               type only replaces "fetch and cache the key set" with "hold it".
+               ~150-250 lines plus tests.  1-2 days.
+   Lakekeeper: config field + validation + one match arm + docs + tests.
+               ~100-150 lines.  1 day.
+   Review and release: two repos, one maintainer org, no API break (every new
+               field is optional and the existing URI path is untouched).
+               Realistically 2-6 weeks of calendar time from PR to a released
+               image a customer can pull.
+
+   Engineering cost is low. The risk is not the code, it is that the design
+   would then depend on an unreleased upstream change, and on the maintainers
+   agreeing that a statically configured signing key belongs in a catalog
+   (a reasonable person could argue it weakens the "keys come from an IdP"
+   invariant). Do not plan a delivery around it; propose it in parallel.

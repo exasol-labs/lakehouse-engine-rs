@@ -8,8 +8,8 @@
      {"kid":"lakehouse-engine-1","kty":"RSA","alg":"RS256"}
 
 [1m== C.1  client_credentials with private_key_jwt — no client secret anywhere[0m
-   assertion: {"iss":"lakehouse-jwt","sub":"lakehouse-jwt","aud":"http://localhost:38080/realms/iceberg/protocol/openid-connect/token","jti":"ba0abec2-b748-4faf-a6a8-6e3cd6338c56","exp":1789558178}
-   HTTP 200  {"token_type":"Bearer","scope":"catalog profile email"}
+   assertion: {"iss":"lakehouse-jwt","sub":"lakehouse-jwt","aud":"http://localhost:38080/realms/iceberg/protocol/openid-connect/token","jti":"724ed325-f772-43da-a25a-528a4f4bed7d","exp":1789563151}
+   HTTP 200  {"token_type":"Bearer","scope":"catalog email profile"}
 
 [1m== C.2  Negative control — the same client with a secret instead[0m
    HTTP 400  (client-jwt clients reject client_secret auth)

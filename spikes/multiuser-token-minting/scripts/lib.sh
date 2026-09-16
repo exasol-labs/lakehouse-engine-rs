@@ -75,3 +75,19 @@ req_code() {
   curl -sS -o /dev/null -w '%{http_code}' -X "$method" "$url" \
     -H "Authorization: Bearer $token" -H 'Content-Type: application/json' "$@"
 }
+
+# --- round 2 ---------------------------------------------------------------
+# Keycloak is reachable on two hostnames in this spike: `keycloak:8080` inside
+# the compose network (what Lakekeeper uses for discovery) and `localhost:<port>`
+# from the host (what a ROPC call from here stamps as `iss`). A real deployment
+# has ONE url. Round-2 probes therefore obtain the control token from INSIDE the
+# network, so its `iss` is the same url Lakekeeper discovers and no
+# ADDITIONAL_ISSUERS shim is needed to make the measurement work.
+KC_URI="http://keycloak:8080/realms/$REALM"
+
+user_token_net() {
+  docker run --rm --network spike-multiuser-token-minting curlimages/curl:8.11.1 \
+    -sS -X POST "$KC_URI/protocol/openid-connect/token" \
+    -d grant_type=password -d client_id=user-cli \
+    -d "username=$1" -d "password=$2" -d scope=openid | jq -r '.access_token'
+}

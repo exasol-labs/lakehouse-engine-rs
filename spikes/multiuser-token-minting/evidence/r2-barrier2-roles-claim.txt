@@ -1,0 +1,56 @@
+
+[1m== 2a.1  A Lakekeeper role that holds select on bob_table[0m
+   role id 01a0aa44-e6bf-7b63-a888-2508ec6f0ef4
+   NOTE: a Lakekeeper role id is a bare UUID, not <provider>~<name>.
+   granted select on bob_table to role customer-analysts
+
+[1m== 2a.2  Engine-minted token for ALICE asserting roles: [customer-analysts][0m
+{
+  "header": {
+    "alg": "RS256",
+    "kid": "lakehouse-engine-1",
+    "typ": "JWT"
+  },
+  "claims": {
+    "iss": "http://engine-issuer:8090",
+    "sub": "11111111-1111-4111-8111-111111111111",
+    "aud": "lakekeeper",
+    "exp": 1789564005,
+    "iat": 1789563705,
+    "nbf": 1789563705,
+    "jti": "a25c9612-0518-4c17-94cb-e8cac8d407e0",
+    "azp": "lakehouse-engine",
+    "scope": "catalog",
+    "preferred_username": "11111111-1111-4111-8111-111111111111",
+    "typ": "Bearer",
+    "roles": [
+      "customer-analysts"
+    ]
+  },
+  "signature": "<redacted>"
+}
+   listTables (bob's namespace view) -> HTTP 200
+   loadTable bob_table            -> HTTP 404
+   If the roles claim carried authorization this would be 200.
+
+[1m== 2a.3  Control: a GENUINE Keycloak token carrying the same roles claim[0m
+   genuine-token loadTable bob_table -> HTTP 404
+   The same code. Token roles are not an authorization input for ANY provider,
+   so this is not a quirk of the engine-minted provider.
+
+[1m== 2a.4  Control: direct role MEMBERSHIP does work[0m
+   after assigning engine~alice to the role, loadTable bob_table -> HTTP 200
+   200 — so the grant itself is real; only the TOKEN-asserted path is inert.
+
+[1m== 2a.5  Structural cause (source, v0.13.1 and v0.13.5)[0m
+   authn.rs         extract_and_set_token_roles() parses ROLES_CLAIM and calls
+                    RequestMetadata::set_token_roles().
+   request_metadata RequestMetadata::token_roles() is the only reader — and it
+                    has no caller anywhere outside its own module
+                    (`grep -rn '\.token_roles()' crates/` returns nothing).
+   authn.rs:654     Actor::Role is built ONLY from the x-assume-role-id request
+                    header, never from a token claim.
+   admission.rs     "admission is deliberately a distinct layer from
+                    authorization" — the roles claim feeds admission, not authz.
+   Verdict: ROLES_CLAIM cannot carry authorization. 2a is dead, not merely
+   awkward, and no configuration change revives it.

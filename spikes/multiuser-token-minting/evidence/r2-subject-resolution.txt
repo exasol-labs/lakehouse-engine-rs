@@ -1,0 +1,59 @@
+
+[1m== S.1  Source A — ask the CATALOG (GET /management/v1/user?name=)[0m
+   engine service account (catalog admin): 200
+     [{"id":"oidc~11111111-1111-4111-8111-111111111111","name":"alice (via Keycloak)"},{"id":"engine~11111111-1111-4111-8111-111111111111","name":"alice (via engine issuer)"}]
+   Three defects, all measured:
+     * `name` is Lakekeeper's DISPLAY name (the token's `name` claim), not the
+       login username.
+     * the filter is a case-insensitive SUBSTRING search over that display name,
+       so one query can return several users ("al" returns two above) and there
+       is no exact-match mode. Any collision resolves to the wrong subject —
+       and minting a token for the wrong subject is a silent authorization bug,
+       not an error.
+     * it needs catalog-admin privilege. A non-admin principal gets 403.
+
+[1m== S.1b  Demonstrate both claims with a user who has never used the catalog[0m
+   carol's IdP subject: 130de1db-9788-45f5-8e83-0f5e4d95ad3d
+   whoami before she has ever used the catalog -> oidc~130de1db-9788-45f5-8e83-0f5e4d95ad3d
+   listTables as carol                         -> HTTP 404
+   catalog search ?name=carol                  -> [{"id":"oidc~130de1db-9788-45f5-8e83-0f5e4d95ad3d","name":"Carol Clark"}]
+   non-admin principal listing users           -> HTTP 403
+   now she self-registers (what the UI does on first login):
+     {"id":"oidc~130de1db-9788-45f5-8e83-0f5e4d95ad3d","name":"Carol Clark"}
+   catalog search ?name=carol                  -> [{"id":"oidc~130de1db-9788-45f5-8e83-0f5e4d95ad3d","name":"Carol Clark"}]
+   The stored name is the DISPLAY name ("Carol Clark"), not the login name.
+   The search is a case-insensitive SUBSTRING match, so "carol" happens to hit
+   it here — a coincidence of this particular name, not a lookup key.
+   Verdict: the catalog is not a reliable mapping source: fuzzy and ambiguous,
+   admin-only, and blind to any user who has not logged into the catalog once.
+
+[1m== S.2  Source B — ask the IdP (the engine's EXISTING service account)[0m
+   granted realm-management:view-users to the engine's service account (ONE one-time step)
+
+[1m== S.3  Resolve an Exasol user name to the IdP subject[0m
+   current_user()=ALICE    -> [{"id":"11111111-1111-4111-8111-111111111111","username":"alice"}]
+   current_user()=Alice    -> [{"id":"11111111-1111-4111-8111-111111111111","username":"alice"}]
+   current_user()=alice    -> [{"id":"11111111-1111-4111-8111-111111111111","username":"alice"}]
+   current_user()=BOB      -> [{"id":"22222222-2222-4222-8222-222222222222","username":"bob"}]
+   current_user()=svc_etl  -> []
+   Exasol folds unquoted identifiers to upper case, and Keycloak's username
+   lookup is case-insensitive, so ALICE resolves to alice with no normalisation
+   step. exact=true gives a single deterministic hit or none.
+   A user with no IdP account resolves to [] — the adapter must fail closed with
+   "no catalog identity for Exasol user SVC_ETL", never mint a token and let the
+   catalog answer 404 "table does not exist".
+
+[1m== S.4  Onboarding cost[0m
+   One-time, per deployment:  1 step  (grant the engine's existing service
+                              account the built-in view-users role).
+   Per user:                  0 steps — provided the Exasol user name equals the
+                              IdP user name.
+   Where they differ, the deployment needs an explicit mapping (an Exasol table,
+   or an IdP user attribute holding the Exasol name), and that IS a per-user
+   step. The spike cannot decide this for a customer: it is the one number that
+   depends on how they provision Exasol accounts today.
+   Portability: `GET /admin/realms/{r}/users?username=&exact=true` is the
+   Keycloak admin API. Every IdP has an equivalent (Entra ID Graph
+   /users?$filter=userPrincipalName, Okta /api/v1/users?search=,
+   Auth0 /api/v2/users-by-email), but the call is per-IdP — a small adapter
+   surface, not a portable standard.

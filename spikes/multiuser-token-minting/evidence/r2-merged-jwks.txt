@@ -1,0 +1,74 @@
+
+[1m== 2b.1  Build the merged key set[0m
+   customer IdP publishes 2 keys
+   merged JWKS: 3 keys (1 engine + 2 customer IdP)
+
+[1m== 2b.2  Publish it to object storage (no new component — candidate 1b)[0m
+   published s3://engine-merged
+
+[1m== 2b.3  Throwaway Lakekeeper: ONE provider, two trusted issuers[0m
+   OPENID_PROVIDER_URI=http://minio:9000/engine-merged
+   OPENID_ADDITIONAL_ISSUERS=http://keycloak:8080/realms/iceberg
+   throwaway catalog health -> 200
+
+[1m== 2b.4  Genuine customer token (issuer = Keycloak) [0m
+{
+  "header": {
+    "alg": "RS256",
+    "typ": "JWT",
+    "kid": "ozllfAP9c8Gz5RU3mNPMvJvINhJgWoMNnezqQYRt14g"
+  },
+  "claims": {
+    "exp": 1789566654,
+    "iat": 1789563054,
+    "jti": "onrtro:3ed09a68-730b-1347-2ff6-b87e730e365c",
+    "iss": "http://keycloak:8080/realms/iceberg",
+    "aud": "lakekeeper",
+    "sub": "11111111-1111-4111-8111-111111111111",
+    "typ": "Bearer",
+    "azp": "user-cli",
+    "sid": "77e22c27-e376-dc15-1308-3b7ff5999f1e",
+    "acr": "1",
+    "scope": "openid catalog email profile",
+    "email_verified": true,
+    "name": "Alice Anderson",
+   loadTable alice_table -> HTTP 200   (expect 200)
+   loadTable bob_table   -> HTTP 404   (expect 404)
+
+[1m== 2b.5  Engine-minted token for the SAME human (issuer = merged doc)[0m
+{
+  "header": {
+    "alg": "RS256",
+    "kid": "lakehouse-engine-1",
+    "typ": "JWT"
+  },
+  "claims": {
+    "iss": "http://minio:9000/engine-merged",
+    "sub": "11111111-1111-4111-8111-111111111111",
+    "aud": "lakekeeper",
+    "exp": 1789563355,
+    "iat": 1789563055,
+    "nbf": 1789563055,
+    "jti": "bd65915a-435c-4d5b-96c8-ddc104834fa4",
+    "azp": "lakehouse-engine",
+    "scope": "catalog",
+    "preferred_username": "11111111-1111-4111-8111-111111111111",
+    "typ": "Bearer"
+  },
+  "signature": "<redacted>"
+}
+   loadTable alice_table -> HTTP 200   (expect 200)
+   loadTable bob_table   -> HTTP 404   (expect 404)
+   bob:  alice_table -> HTTP 404   (expect 404)
+   bob:  bob_table   -> HTTP 200   (expect 200)
+   whoami: {"id":"oidc~11111111-1111-4111-8111-111111111111","name":"alice (via Keycloak)"}
+   The engine-minted token resolves to oidc~<sub> — the SAME principal the
+   customer already granted in the UI. Barrier 2 is gone; grants unchanged.
+
+[1m== 2b.6  Failure mode: what a stale merged JWKS costs[0m
+   engine-minted token   -> HTTP 200
+   GENUINE Keycloak token-> HTTP 401
+   This is the real cost of 2b: the merged document becomes a hard dependency of
+   the customer's OWN clients. If it goes stale or unreachable, Spark and Trino
+   stop authenticating (401) — not just the engine. Keeping it fresh is an
+   operational task whose failure blast radius is the whole catalog.

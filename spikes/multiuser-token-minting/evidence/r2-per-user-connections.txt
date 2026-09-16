@@ -1,0 +1,59 @@
+
+[1m== C.1  Exasol: which grant actually lets a UDF read a CONNECTION?[0m
+   grant 1: GRANT CONNECTION LH_CAT_ALICE_EXA TO ALICE_EXA
+     insufficient privileges for using connection LH_CAT_ALICE_EXA in script CONNPROBE 
+   grant 2: ... WITH ADMIN OPTION
+     insufficient privileges for using connection LH_CAT_ALICE_EXA in script CONNPROBE 
+   grant 3: GRANT ACCESS ON CONNECTION ... FOR SCRIPT ... TO ...
+     OK user=ALICE_EXA
+   cross-user: ALICE_EXA reaching for BOB_EXA's connection
+     insufficient privileges for using connection LH_CAT_BOB_EXA in script CONNPROBE 
+   Measured: only the third form works. Plain GRANT CONNECTION and WITH ADMIN
+   OPTION both leave exa.get_connection denied inside the UDF. The cross-user
+   attempt is correctly refused ("insufficient privileges for using connection
+   LH_CAT_BOB_EXA in script CONNPROBE", SQL state 22001).
+   So Exasol DOES isolate per-user credentials properly — the mechanism is sound.
+   The cost is the DDL: per user, 1 CONNECTION + 1 GRANT ACCESS ... FOR SCRIPT
+   per scan script, redone whenever the credential rotates.
+
+[1m== C.2  What identity does a per-user credential present to the catalog?[0m
+   Variant (i): a per-user OAuth CLIENT (client_credentials in the CONNECTION)
+   sub in the token   : 4de53f9b-bd62-4eb8-b361-c9e2dd44d342
+   alice's real sub   : 11111111-1111-4111-8111-111111111111
+   whoami             : {"id":null,"name":null}
+   loadTable alice_table -> HTTP 404
+   The token is valid (same audience as any other catalog client) but its
+   sub is that of the SERVICE ACCOUNT, so the catalog sees a principal it has
+   never heard of: whoami 404s and the table read 404s. Barrier 2 returns in
+   full — the customer must re-grant every table to a new machine identity
+   per user. 0 of the existing grants apply.
+   
+   Variant (ii): the user's OWN credentials (ROPC) in the CONNECTION
+   whoami             : {"id":"oidc~11111111-1111-4111-8111-111111111111","name":"alice (via Keycloak)"}
+   loadTable alice_table -> HTTP 200   (expect 200)
+   loadTable bob_table   -> HTTP 404   (expect 404)
+   Variant (ii) is the only per-user-CONNECTION shape that preserves existing
+   grants: the token carries the human's own sub, so `oidc~<sub>` matches what
+   the customer granted in the UI. But the CONNECTION then stores the user's IdP
+   PASSWORD, and the resource-owner-password grant is deprecated by OAuth 2.1,
+   off by default in Entra ID and Okta, and incompatible with MFA/SSO — which is
+   usually the whole reason the customer runs an IdP.
+
+[1m== C.3  Onboarding steps for per-user CONNECTIONs[0m
+   Per user, variant (i) — per-user OAuth client:
+     1. create an OAuth client / service account in the IdP
+     2. create the Exasol CONNECTION with its client id + secret
+     3. GRANT ACCESS ON CONNECTION ... FOR SCRIPT ... TO <user>
+     4. re-grant, in Lakekeeper, every table the human already has, to the new
+        machine principal
+     (+ repeat 2 on every secret rotation)
+     => 4 steps per user, and it violates criterion 2 (existing grants change).
+   Per user, variant (ii) — the user's own password:
+     1. create the Exasol CONNECTION holding the user's IdP password
+     2. GRANT ACCESS ON CONNECTION ... FOR SCRIPT ... TO <user>
+     (+ redo 1 on every password change)
+     => 2 steps per user, grants unchanged, but it requires a deprecated grant
+        type and defeats SSO/MFA.
+
+[1m== C.4  Cleanup[0m
+   dropped SPIKE schema, ALICE_EXA/BOB_EXA and their CONNECTION objects

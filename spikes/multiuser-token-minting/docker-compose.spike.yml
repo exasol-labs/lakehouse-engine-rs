@@ -284,6 +284,9 @@ services:
       - LAKEKEEPER__OPENID_PROVIDERS__ENGINE__URI=http://engine-issuer:8090
       - LAKEKEEPER__OPENID_PROVIDERS__ENGINE__AUDIENCE=lakekeeper
       - LAKEKEEPER__OPENID_PROVIDERS__ENGINE__SUBJECT_CLAIMS=sub
+      # Round 2 (2a): let the engine assert roles in the minted token.
+      - LAKEKEEPER__OPENID_PROVIDERS__ENGINE__ROLES_CLAIM=roles
+      - LAKEKEEPER__OPENID_ROLES_CLAIM=roles
       - RUST_LOG=info,lakekeeper=debug
     restart: "no"
     depends_on:

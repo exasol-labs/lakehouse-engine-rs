@@ -1,0 +1,61 @@
+
+[1m== 1d.1  Register the engine's public key as a PASSIVE realm key[0m
+   realm internal id dc5745c8-32cd-446f-9eb5-9798fbc688ee
+   create key provider -> HTTP 201
+
+[1m== 1d.2  The customer's OWN JWKS now carries the engine key[0m
+{"kid":"8hQkAJIVYT77egi13xkKWkUdrZXiUtPfQsns-vGq_r0","algorithm":"RS256","status":"PASSIVE","providerId":"5f1a4af4-0fb3-4671-965e-87e31147825c"}
+   engine kid = 8hQkAJIVYT77egi13xkKWkUdrZXiUtPfQsns-vGq_r0   (status PASSIVE: published for verification, never used for signing)
+   present in the public JWKS: 1 entry
+
+[1m== 1d.3  STOCK Lakekeeper — single provider, the customer's issuer, no extra config[0m
+   stock catalog health -> 200
+
+[1m== 1d.4  Engine mints as the customer's issuer, signed with the registered key[0m
+{
+  "header": {
+    "alg": "RS256",
+    "kid": "8hQkAJIVYT77egi13xkKWkUdrZXiUtPfQsns-vGq_r0",
+    "typ": "JWT"
+  },
+  "claims": {
+    "iss": "http://keycloak:8080/realms/iceberg",
+    "sub": "11111111-1111-4111-8111-111111111111",
+    "aud": "lakekeeper",
+    "exp": 1789563361,
+    "iat": 1789563061,
+    "nbf": 1789563061,
+    "jti": "a2a05f3a-30b1-4f0d-83da-e2fa53fa1337",
+    "azp": "lakehouse-engine",
+    "scope": "catalog",
+    "preferred_username": "11111111-1111-4111-8111-111111111111",
+    "typ": "Bearer"
+  },
+  "signature": "<redacted>"
+}
+   alice: alice_table -> HTTP 200   (expect 200)
+   alice: bob_table   -> HTTP 404   (expect 404)
+   bob:   alice_table -> HTTP 404   (expect 404)
+   bob:   bob_table   -> HTTP 200   (expect 200)
+   whoami -> {"id":"oidc~11111111-1111-4111-8111-111111111111","name":"alice (via Keycloak)"}
+
+[1m== 1d.5  Negative: a key the IdP does not publish[0m
+   unregistered kid -> HTTP 401   (expect 401)
+
+[1m== 1d.6  Does the IdP offer a SUPPORTED grant that would avoid holding the key?[0m
+   jwt-bearer grant:
+     {"error":"unsupported_grant_type","error_description":"Unsupported grant_type"}
+   standard token exchange + requested_subject:
+     {"error":"invalid_request","error_description":"Parameter 'requested_subject' is not supported for standard token exchange"}
+
+   Verdict for 1d: it WORKS, and it is the only candidate that removes both
+   barriers with zero Lakekeeper configuration change and zero grant change.
+   Its two costs are not small:
+     * the customer's IdP holds a copy of the engine's PRIVATE key. Keycloak's
+       key-provider API has no public-key-only import; `rsa` requires a private
+       key + certificate. Anyone who can read the realm's key material can mint
+       tokens for any user of this engine.
+     * importing a key is a self-hosted-IdP capability. Auth0, Entra ID and
+       Cognito do not let a tenant add a signing key to the published JWKS, so
+       this design pins the customer to a self-hosted IdP.
+   That second cost is exactly what success criterion 4 rules out.

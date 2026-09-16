@@ -1,0 +1,45 @@
+
+[1m== 1a  BucketFS[0m
+   publishing via exapump --profile docker to the default bucket
+     Uploaded /tmp/tmp.DBGSHsvOsV/bfs/jwks.json to engine-oidc/jwks.json
+     Uploaded /tmp/tmp.DBGSHsvOsV/bfs/openid-configuration to engine-oidc/.well-known/openid-configuration
+   anonymous read back (bucket is Public=True):
+     HTTP/1.1 200 OK
+     Content-Type: application/json
+     X-Content-Type-Options: nosniff
+   the same fetch WITHOUT -k, from inside the compose network:
+     curl: (60) SSL certificate problem: self-signed certificate in certificate chain
+     More details here: https://curl.se/docs/sslcerts.html
+   Lakekeeper against the BucketFS URI:
+     REJECTED
+     Error: Failed to create required OIDC authenticator for oidc (https://exasol:2581/default/engine-oidc): Failed to fetch openid configuration from https://exasol:2581/default/engine-oidc/.well-known/openid-configuration: error sending request for url (https://exasol:2581/default/engine-oidc/.well-known/openid-configuration)
+   Measured failure: BucketFS serves HTTPS only (HttpPort = 0 in EXAConf) with a
+   self-signed certificate, and Lakekeeper has no trust-store or
+   skip-verify knob for the discovery fetch:
+     Failed to fetch openid configuration from
+     https://exasol:2581/default/engine-oidc/.well-known/openid-configuration:
+     error sending request for url (...)
+   BucketFS does serve the right content type (application/json above), and the
+   bucket is readable anonymously when Public = True — the publishing half works.
+   It is the transport that kills it. Verdict for 1a: FAILS. Enabling plain HTTP
+   on BucketFS (HttpPort) would publish the whole bucket unencrypted, which is
+   not an acceptable trade for hosting one public key.
+   removed the published files from BucketFS
+
+[1m== 1b  Object storage (the bucket the lakehouse data already lives in)[0m
+   published to s3://engine-oidc (public read)
+   anonymous read back:
+     HTTP/1.1 200 OK
+     Content-Type: application/json
+     X-Content-Type-Options: nosniff
+   Lakekeeper against the object-storage URI:
+     ACCEPTED
+     "message":"Creating OIDC authenticator for oidc (http://minio:9000/engine-oidc)"
+     "message":"Successfully added OIDC authenticator: oidc"
+   Verdict for 1b: WORKS. Zero new components: the discovery document and JWKS
+   are two static objects in a bucket the deployment already has, served with
+   the right content type, reachable by Lakekeeper over the same network path it
+   already uses for table data.
+   Caveat: the objects must be PUBLICLY readable (a JWKS is public by design,
+   but it is a policy change on that prefix), and the URL must be stable —
+   rotating it invalidates every token in flight.

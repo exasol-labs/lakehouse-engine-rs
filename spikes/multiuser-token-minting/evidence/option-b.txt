@@ -25,7 +25,7 @@
    Both are served here by the engine-issuer stub (see issuer/nginx.conf).
    type=access_token, subject_issuer=engine       HTTP 200  issued_token_type=urn:ietf:params:oauth:token-type:access_token
    returned token claims:
-     {"iss":"http://localhost:38080/realms/iceberg","sub":"11111111-1111-4111-8111-111111111111","aud":"lakekeeper","azp":"lakehouse","scope":"catalog profile email","preferred_username":"alice"}
+     {"iss":"http://localhost:38080/realms/iceberg","sub":"11111111-1111-4111-8111-111111111111","aud":"lakekeeper","azp":"lakehouse","scope":"catalog email profile","preferred_username":"alice"}
    resolved Lakekeeper identity: oidc~11111111-1111-4111-8111-111111111111
    alice_table -> HTTP 200  bob_table -> HTTP 404
    -> unlike Option A, this lands in the oidc~ namespace, so the grants a
@@ -43,7 +43,7 @@
    so the engine's signature on the subject token adds nothing.
 
 [1m== B.5  Query-path cost[0m
-   one exchange (local Docker, warm): 0.023s
+   one exchange (local Docker, warm): 0.024s
    round trips per query: 1 adapter->Keycloak, plus Keycloak->engine introspection
    and Keycloak->engine userinfo, i.e. 3 HTTP calls and a Keycloak user session
    created per query (see 'session_state' in the exchange response).
