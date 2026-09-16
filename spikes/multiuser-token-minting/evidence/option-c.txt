@@ -1,0 +1,33 @@
+
+[1m== C.0  Registration — one key, referenced twice[0m
+   clientAuthenticatorType: client-jwt
+   jwks.url:                http://engine-issuer:8090/jwks.json
+   signing alg:             RS256
+   secret present:          false
+   engine issuer JWKS (Option A) and client JWKS (Option C) are the same document:
+     {"kid":"lakehouse-engine-1","kty":"RSA","alg":"RS256"}
+
+[1m== C.1  client_credentials with private_key_jwt — no client secret anywhere[0m
+   assertion: {"iss":"lakehouse-jwt","sub":"lakehouse-jwt","aud":"http://localhost:38080/realms/iceberg/protocol/openid-connect/token","jti":"ba0abec2-b748-4faf-a6a8-6e3cd6338c56","exp":1789558178}
+   HTTP 200  {"token_type":"Bearer","scope":"catalog profile email"}
+
+[1m== C.2  Negative control — the same client with a secret instead[0m
+   HTTP 400  (client-jwt clients reject client_secret auth)
+
+[1m== C.3  Negative control — assertion signed by a different key[0m
+   HTTP 400  {"error":"invalid_client","error_description":"Client authentication with signed JWT failed: Signature on JWT token failed validation"}
+
+[1m== C.4  The full Option B exchange, secret-free[0m
+   HTTP 200
+   {"sub":"11111111-1111-4111-8111-111111111111","aud":"lakekeeper","azp":"lakehouse-jwt","preferred_username":"alice"}
+   Lakekeeper identity: oidc~11111111-1111-4111-8111-111111111111
+   alice_table -> HTTP 200  bob_table -> HTTP 404
+
+[1m== C.5  Secret count per option, as it would appear in the CONNECTION object[0m
+   Option A (trusted issuer, no exchange)   1 : the RSA signing key. No client id/secret at all.
+   Option B with client_secret              2 : the RSA signing key + the OAuth2 client secret.
+   Option B with private_key_jwt (C)        1 : the RSA signing key, used for BOTH client
+                                                authentication and the subject assertion.
+   Option B-control (requested_subject)     1 : the OAuth2 client secret only (no engine key) —
+                                                but on a deprecated preview feature.
+   Confirmed: Option A needs exactly one secret and no client credentials.

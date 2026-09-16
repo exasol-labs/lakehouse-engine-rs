@@ -1,0 +1,33 @@
+
+[1m== D.0  Warehouse storage profile[0m
+   {"bucket":"warehouse","key-prefix":"spike","flavor":"s3-compat","sts-enabled":true,"endpoint":"http://minio:9000/","path-style-access":true}
+
+[1m== D.1  Vend credentials to alice for alice_table[0m
+   alice_table metadata: s3://warehouse/spike/01a0a9f7-d2c6-7d23-8e1a-6eb6fff2188d/metadata/00000-01a0a9f7-d313-7762-b35f-adecc3c93777.gz.metadata.json
+   bob_table   metadata: s3://warehouse/spike/01a0a9f7-d343-7c43-893d-632108cc4c98/metadata/00000-01a0a9f7-d37d-7aa2-a9d1-17fa7917d999.gz.metadata.json
+   alice cred: {"prefix":"s3://warehouse/spike/01a0a9f7-d2c6-7d23-8e1a-6eb6fff2188d","expires":"1789561587000"}
+   bob   cred: {"prefix":"s3://warehouse/spike/01a0a9f7-d343-7c43-893d-632108cc4c98","expires":"1789561588000"}
+   -> the vended credential is scoped to the TABLE prefix, not to the warehouse.
+
+[1m== D.2  Read objects from MinIO directly with ALICE's vended credentials[0m
+   alice creds -> alice_table metadata (expect success):
+     exit=0
+   alice creds -> bob_table metadata (MUST fail):
+     exit=1
+     mc: <ERROR> Unable to read from `v/warehouse/spike/01a0a9f7-d343-7c43-893d-632108cc4c98/metadata/00000-01a0a9f7-d37d-7aa2-a9d1-17fa7917d999.gz.metadata.json`. Insufficient permissions to access this p
+   alice creds -> list the whole warehouse prefix (MUST fail):
+     exit=1
+     mc: <ERROR> Unable to list folder. Access Denied.
+   alice creds -> list her own table prefix (expect success):
+     exit=0
+
+[1m== D.3  The catalog layer already refuses bob's table to alice[0m
+   loadTable bob_table as alice -> HTTP 404
+   so alice cannot even obtain a credential for it:
+     {"error":"NoSuchTableException","message":"Error getting tabular from catalog"}
+
+[1m== D.4  Control — the warehouse's own static key is NOT scoped[0m
+   minioadmin (root) and the lakekeeper STS user both reach every table:
+     warehouse static key -> bob_table exit=0
+   -> the scoping comes from the STS session Lakekeeper mints per request,
+      not from the warehouse credential itself.

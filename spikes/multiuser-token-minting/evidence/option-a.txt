@@ -1,0 +1,111 @@
+
+[1m== A.0  Issuer registration — how Lakekeeper reached the engine's key[0m
+   config: LAKEKEEPER__OPENID_PROVIDERS__ENGINE__URI=http://engine-issuer:8090 (+ __AUDIENCE, __SUBJECT_CLAIMS)
+   "message":"Configuring 2 OIDC provider(s)"
+   "message":"Creating OIDC authenticator for engine (http://engine-issuer:8090/)"
+   "message":"Creating OIDC authenticator for oidc (http://keycloak:8080/realms/iceberg)"
+   "message":"Successfully added OIDC authenticator: engine"
+   "message":"Successfully added OIDC authenticator: oidc"
+   discovery document fetched from the issuer (this is the ONLY key channel):
+   {"issuer":"http://engine-issuer:8090","jwks_uri":"http://engine-issuer:8090/jwks.json"}
+   {"kty":"RSA","alg":"RS256","kid":"lakehouse-engine-1"}
+
+[1m== A.1  Identity asserted by an engine-minted token[0m
+   {
+     "header": {
+       "alg": "RS256",
+       "kid": "lakehouse-engine-1",
+       "typ": "JWT"
+     },
+     "claims": {
+       "iss": "http://engine-issuer:8090",
+       "sub": "11111111-1111-4111-8111-111111111111",
+       "aud": "lakekeeper",
+       "exp": 1789558286,
+       "iat": 1789557986,
+       "nbf": 1789557986,
+       "jti": "7da38ed0-0a0b-4d68-a5ba-8d1c1baba480",
+       "azp": "lakehouse-engine",
+       "scope": "catalog",
+       "preferred_username": "11111111-1111-4111-8111-111111111111",
+       "typ": "Bearer"
+     },
+     "signature": "<redacted>"
+   }
+   GET http://localhost:38181/management/v1/whoami:
+   HTTP 200
+   {
+     "name": "alice (via engine issuer)",
+     "email": null,
+     "id": "engine~11111111-1111-4111-8111-111111111111",
+     "user-type": "human",
+     "last-updated-with": "create-endpoint",
+     "created-at": "2026-09-16T11:26:26.258507Z",
+     "updated-at": null,
+     "is-instance-admin": false
+   }
+
+[1m== A.2  Grants made against the Keycloak identity do NOT apply[0m
+   provision.sh granted select on alice_table to oidc~11111111-1111-4111-8111-111111111111
+   alice_table -> HTTP 404   (expected 404: identity is engine~, grant is oidc~)
+   bob_table   -> HTTP 404
+
+[1m== A.3  Grant the engine-prefixed identity, then re-run[0m
+   grant select on 01a0a9f7-d2c6-7d23-8e1a-6eb6fff2188d to engine~11111111-1111-4111-8111-111111111111 -> HTTP 204
+   grant select on 01a0a9f7-d343-7c43-893d-632108cc4c98 to engine~22222222-2222-4222-8222-222222222222 -> HTTP 204
+   alice: alice_table -> HTTP 200 | bob_table -> HTTP 404 | listTables -> [{"namespace":["analytics"],"name":"alice_table"}]
+   bob: alice_table -> HTTP 404 | bob_table -> HTTP 200 | listTables -> [{"namespace":["analytics"],"name":"bob_table"}]
+
+[1m== A.4  Which claims are mandatory, and which audience[0m
+   baseline (all claims)              HTTP 200  
+   no aud                             HTTP 401  Authentication failed
+   aud=wrong                          HTTP 401  Authentication failed
+   aud=[lakekeeper,other]             HTTP 200  
+   no azp                             HTTP 200  
+   no scope                           HTTP 200  
+   scope=openid (no catalog)          HTTP 200  
+   no exp                             HTTP 401  Authentication failed
+   expired 30s                        HTTP 200  
+   expired 61s                        HTTP 401  Authentication failed
+   expired 1h                         HTTP 401  Authentication failed
+   no iat/nbf                         HTTP 200  
+   no sub                             HTTP 401  Authentication failed
+   iss=keycloak's issuer              HTTP 401  Authentication failed
+   unknown kid                        HTTP 401  Authentication failed
+   no preferred_username              HTTP 200  
+   no typ                             HTTP 200  
+   no jti                             HTTP 200  
+   forged (other key, same kid)       HTTP 401  Authentication failed
+   alg=none (unsigned)                HTTP 401
+
+[1m== A.5  Subject-claim override — can the engine assert a non-sub claim?[0m
+   LAKEKEEPER__OPENID_PROVIDERS__ENGINE__SUBJECT_CLAIMS=sub is set in the compose file.
+   whoami with sub=alice but preferred_username=bob:
+   resolved user id: engine~11111111-1111-4111-8111-111111111111
+   -> the subject claim decides; other claims are inert.
+
+[1m== A.6  Query-path independence — stop Keycloak entirely, then query as alice[0m
+   keycloak: 
+   engine-minted alice: alice_table -> HTTP 200 | bob_table -> HTTP 404
+   engine service account (client_credentials against Keycloak) -> curl: (7) Failed to connect to localhost port 38080 after 0 
+   keycloak restarted
+
+[1m== A.7  Query-path cost[0m
+   IdP round trips per query: 0 (the token is signed in-process)
+   local mint cost (python+RSA2048, an upper bound on an in-process Rust signer): 0.127s
+   Lakekeeper re-fetches the engine JWKS on a 1 h refresh interval
+     (build_oidc_authenticator: JWKSWebAuthenticator::new(uri, Some(Duration::from_hours(1))))
+
+[1m== A.8  Mitigating the split identity namespace with a Lakekeeper role[0m
+   role analyst-alice = 01a0a9f8-1d60-7721-8036-f95e183f6219
+   assign oidc~11111111-1111-4111-8111-111111111111 -> HTTP 204
+   assign engine~11111111-1111-4111-8111-111111111111 -> HTTP 204
+   grant select on alice_table to the ROLE -> HTTP 204
+   revoke both direct user grants -> HTTP 204
+   only the role grant remains:
+     [{"type":"ownership","user":"oidc~33333333-3333-4333-8333-333333333333"},{"type":"select","role":"01a0a9f8-1d60-7721-8036-f95e183f6219"}]
+   keycloak alice -> HTTP 200
+   engine   alice -> HTTP 200
+   engine   bob   -> HTTP 404  (still denied)
+   -> one grant, two identities. The duplication collapses to a one-off
+      user-to-role assignment per person instead of a second grant per table.

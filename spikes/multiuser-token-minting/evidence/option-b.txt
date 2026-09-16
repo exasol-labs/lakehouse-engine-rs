@@ -1,0 +1,49 @@
+
+[1m== B.0  Which token-exchange features this Keycloak actually has on[0m
+   TOKEN_EXCHANGE  enabled=false  type=PREVIEW
+   TOKEN_EXCHANGE_EXTERNAL_INTERNAL_V2  enabled=true  type=EXPERIMENTAL
+   TOKEN_EXCHANGE_STANDARD_V2  enabled=true  type=DEFAULT
+   Keycloak image: quay.io/keycloak/keycloak:26.4.0
+
+[1m== B.1  The shape the brief proposed: engine-minted JWT as subject_token[0m
+   subject token (engine-signed, asserting alice):
+     {"iss":"http://engine-issuer:8090","sub":"11111111-1111-4111-8111-111111111111","aud":"lakehouse-engine"}
+   subject_token_type=...:jwt, no subject_issuer  HTTP 400  invalid_token: invalid token type
+   subject_token_type=...:jwt, subject_issuer=engine HTTP 400  invalid_token: invalid token type
+   subject_token_type=...:id_token, subject_issuer=engine HTTP 400  invalid_token: invalid token type
+   V2's external path accepts ONLY subject_token_type=access_token; see
+   OIDCIdentityProvider.exchangeExternalTokenV2Impl ->
+     AbstractOAuth2IdentityProvider.exchangeExternalUserInfoValidationOnly(),
+     which throws 'invalid token type' for anything but access_token.
+
+[1m== B.2  Standard Token Exchange V2 (internal->internal) with the same token[0m
+   no subject_issuer, type=access_token           HTTP 400  invalid_request: Invalid token
+   V2 internal->internal only accepts a token THIS realm issued.
+
+[1m== B.3  External->internal V2, correctly shaped[0m
+   Requires on the IdP: tokenIntrospectionUrl AND userInfoUrl.
+   Both are served here by the engine-issuer stub (see issuer/nginx.conf).
+   type=access_token, subject_issuer=engine       HTTP 200  issued_token_type=urn:ietf:params:oauth:token-type:access_token
+   returned token claims:
+     {"iss":"http://localhost:38080/realms/iceberg","sub":"11111111-1111-4111-8111-111111111111","aud":"lakekeeper","azp":"lakehouse","scope":"catalog profile email","preferred_username":"alice"}
+   resolved Lakekeeper identity: oidc~11111111-1111-4111-8111-111111111111
+   alice_table -> HTTP 200  bob_table -> HTTP 404
+   -> unlike Option A, this lands in the oidc~ namespace, so the grants a
+      human made in the Lakekeeper UI apply unchanged.
+
+[1m== B.4  What the exchange actually trusts[0m
+   subject token asserts bob                      HTTP 200  issued_token_type=urn:ietf:params:oauth:token-type:access_token
+     -> identity in returned token: alice
+   subject token literal garbage                  HTTP 200  issued_token_type=urn:ietf:params:oauth:token-type:access_token
+     -> identity in returned token: alice
+   subject token empty-ish                        HTTP 200  issued_token_type=urn:ietf:params:oauth:token-type:access_token
+     -> identity in returned token: alice
+   Keycloak never parses or verifies the subject token on this path. The
+   identity is whatever the engine's own introspection/userinfo endpoints say,
+   so the engine's signature on the subject token adds nothing.
+
+[1m== B.5  Query-path cost[0m
+   one exchange (local Docker, warm): 0.023s
+   round trips per query: 1 adapter->Keycloak, plus Keycloak->engine introspection
+   and Keycloak->engine userinfo, i.e. 3 HTTP calls and a Keycloak user session
+   created per query (see 'session_state' in the exchange response).

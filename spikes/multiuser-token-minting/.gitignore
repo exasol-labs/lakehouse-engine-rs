@@ -1,0 +1,4 @@
+# Generated at run time by scripts/gen-keys.sh — NEVER commit a private key.
+keys/
+issuer/www/
+.spike-state

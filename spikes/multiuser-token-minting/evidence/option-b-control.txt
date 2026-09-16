@@ -1,0 +1,61 @@
+
+[1m== Bringing up the two legacy servers (compose profile 'legacy')[0m
+   26.0.7 v1: http://localhost:38081
+   26.4.0 v1: http://localhost:38083
+
+[1m== 26.4.0, V2 defaults (no legacy flag) — http://localhost:38080[0m
+     ADMIN_FINE_GRAINED_AUTHZ enabled=false type=PREVIEW
+     ADMIN_FINE_GRAINED_AUTHZ_V2 enabled=true type=DEFAULT
+     TOKEN_EXCHANGE enabled=false type=PREVIEW
+     TOKEN_EXCHANGE_EXTERNAL_INTERNAL_V2 enabled=true type=EXPERIMENTAL
+     TOKEN_EXCHANGE_STANDARD_V2 enabled=true type=DEFAULT
+   requested_subject=alice -> HTTP 400
+     {"error":"invalid_request","error_description":"Parameter 'requested_subject' is not supported for standard token exchange"}
+
+[1m== Wiring FGAP v1 policies on the two legacy servers[0m
+   (users-management-permissions -> impersonate; client permissions -> token-exchange;
+    one client policy attached to both — see scripts/kc-fgap-v1-impersonation.sh)
+      realm-management=d550dd42-0c3b-445b-b262-9b2bd7f00966 requester=9f9e6956-179c-4ec2-946d-0d70de48557c target=9f9e6956-179c-4ec2-946d-0d70de48557c
+   == 1. enable fine-grained permissions on users (gives the 'impersonate' permission)
+   {"enabled":true,"scopePermissions":{"view":"867b692c-187d-4347-b4bd-541cc904307f","manage":"2228e9f4-6272-4f8d-8a9e-f152f76736e8","map-roles":"b97022a0-99a1-401f-a5dc-9961cbd61311","manage-group-membership":"8626b8b2-a6d5-4b00-a2b3-97b2ee1da6a1","impersonate":"2b3af34f-c9b7-4d99-b27f-c736a52db32f","user-impersonated":"85f11f3b-f5cb-437e-ad4a-c6f0ee3e8188"}}
+   == 2. enable fine-grained permissions on the target client (gives 'token-exchange')
+   {"enabled":true,"scopePermissions":{"view":"27992fce-ed84-4629-915b-193499e55380","manage":"88b754e8-5163-4802-b50d-d41a2e6e41f6","configure":"04ac5d7b-c8b4-4a6f-9fdc-1aab7c489bc8","map-roles":"afc7b182-fc02-424f-829a-f4139b4f5726","map-roles-client-scope":"0f5aee0c-c6f5-47e0-82c5-e236a0ada722","map-roles-composite":"bc99cc4c-e76d-4fc6-9c17-19d3332cafd0","token-exchange":"18d67d99-c15d-4055-8950-e4d3a38376c7"}}
+   == 3. client policy matching the requesting client
+      policy id 16d48eac-c133-40c1-8501-b3ad887ffb31
+   == 4. attach the policy to the token-exchange and impersonate permissions
+      attached to client token-exchange (18d67d99-c15d-4055-8950-e4d3a38376c7)
+      attached to users impersonate (2b3af34f-c9b7-4d99-b27f-c736a52db32f)
+      realm-management=8f18d86e-c468-4c38-9384-92834b878081 requester=c073acba-e76c-45c0-9f04-8505f90d4947 target=c073acba-e76c-45c0-9f04-8505f90d4947
+   == 1. enable fine-grained permissions on users (gives the 'impersonate' permission)
+   {"enabled":true,"scopePermissions":{"view":"d3b8a12d-cb3c-4ad5-84e6-5f20abf75ed5","manage":"20bcae84-7dfc-462b-b927-c3e69f6340f3","map-roles":"7e149685-2283-48fe-8883-29c56b42db3e","manage-group-membership":"f97e283b-4d86-44c6-a930-a8cb948c9222","impersonate":"7610da40-4ef3-4c85-84bd-9a692025e001","user-impersonated":"94590bd7-da24-466f-be77-ee82b22f53b3"}}
+   == 2. enable fine-grained permissions on the target client (gives 'token-exchange')
+   {"enabled":true,"scopePermissions":{"view":"6861a55a-03b4-4f5e-9e00-d55eb65e3c10","manage":"02271b53-7d76-488c-95a8-b5ae91a1f86f","configure":"24d7612b-fcfc-485e-b171-be88dd85119a","map-roles":"8009b2f5-ef90-4ed3-8d5b-5ba01d2ea5ae","map-roles-client-scope":"d63d7c09-a708-49c0-b418-05e58d349a29","map-roles-composite":"5a9a11d2-134f-42ce-b05d-d8c839094513","token-exchange":"d59b4eb6-752b-40c5-9b2f-8452deede638"}}
+   == 3. client policy matching the requesting client
+      policy id 83309130-d061-4c5f-9788-b523cf529aea
+   == 4. attach the policy to the token-exchange and impersonate permissions
+      attached to client token-exchange (d59b4eb6-752b-40c5-9b2f-8452deede638)
+      attached to users impersonate (7610da40-4ef3-4c85-84bd-9a692025e001)
+
+[1m== 26.0.7, token-exchange:v1 + FGAP v1 — http://localhost:38081[0m
+     ADMIN_FINE_GRAINED_AUTHZ enabled=true type=PREVIEW
+     TOKEN_EXCHANGE enabled=true type=PREVIEW
+   requested_subject=alice -> HTTP 200
+     {"iss":"http://localhost:38081/realms/iceberg","sub":"11111111-1111-4111-8111-111111111111","aud":["lakekeeper","lakehouse"],"azp":"lakehouse","preferred_username":"alice","scope":"profile email catalog"}
+
+[1m== 26.4.0, token-exchange:v1 + FGAP v1 — http://localhost:38083[0m
+     ADMIN_FINE_GRAINED_AUTHZ enabled=true type=PREVIEW
+     ADMIN_FINE_GRAINED_AUTHZ_V2 enabled=false type=DEFAULT
+     TOKEN_EXCHANGE enabled=true type=PREVIEW
+     TOKEN_EXCHANGE_EXTERNAL_INTERNAL_V2 enabled=false type=EXPERIMENTAL
+     TOKEN_EXCHANGE_STANDARD_V2 enabled=true type=DEFAULT
+   requested_subject=alice -> HTTP 200
+     {"iss":"http://localhost:38083/realms/iceberg","sub":"11111111-1111-4111-8111-111111111111","aud":"lakekeeper","azp":"lakehouse","preferred_username":"alice","scope":"profile catalog email"}
+
+[1m== Reading of the control[0m
+   Impersonation works only with the PREVIEW token-exchange:v1 feature plus
+   FGAP v1 policy wiring, on both 26.0.7 and 26.4.0. On a 26.4.0 with V2
+   defaults it is rejected outright:
+     "Parameter 'requested_subject' is not supported for standard token exchange"
+   Turning token-exchange:v1 on also turns TOKEN_EXCHANGE_EXTERNAL_INTERNAL_V2
+   OFF (see the feature listings above), so a deployment cannot run the legacy
+   path and Option B's V2 path on the same server.
