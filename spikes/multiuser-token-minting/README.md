@@ -233,7 +233,7 @@ pins the design to Keycloak.
 | `scripts/option-{a,b,b-control,c,d}.sh` | One script per option, each self-contained against a provisioned stack |
 | `scripts/probe-additional-issuers.sh` | Runs a throwaway second Lakekeeper against the same database with one provider only, to test whether `ADDITIONAL_ISSUERS` can carry the engine key |
 | `scripts/kc-fgap-v1-impersonation.sh` | The full FGAP v1 wiring the control case needs, written out as four admin-API steps |
-| `scripts/r2-hosting.sh` | Barrier 1: publishes the issuer documents to BucketFS and to object storage and boots a throwaway Lakekeeper against each |
+| `scripts/r2-hosting.sh` | Barrier 1: publishes the issuer documents to BucketFS and to object storage, boots a throwaway Lakekeeper against each, authorizes real users through the BucketFS-hosted issuer, and carries the two TLS negative controls |
 | `scripts/r2-barrier2-roles-claim.sh` | Barrier 2 / candidate 2a: token-asserted roles, with the genuine-token control and the membership control |
 | `scripts/r2-merged-jwks.sh` | Candidate 2b: one provider, two issuers, engine key merged with the IdP's, including the stale-JWKS failure mode |
 | `scripts/r2-idp-key-registration.sh` | Candidate 1d: registers the engine key as a PASSIVE Keycloak realm key and proves it against a stock single-provider Lakekeeper |
@@ -332,8 +332,9 @@ by an unbounded margin.
 
 The rest of this section is what replaces it. The short version:
 
-* **Barrier 1 (hosting) is solvable today with zero new components** — publish the two static files
-  to the object storage the lakehouse data already lives in (1b). BucketFS cannot do it (1a).
+* **Barrier 1 (hosting) is solvable today with zero new components, two ways** — BucketFS, which is
+  already running inside the Exasol cluster (1a), or the object storage the lakehouse data already
+  lives in (1b). Both were verified end to end.
 * **Barrier 2 (identity) has exactly one shape that works**: the engine's public key must be trusted
   *under the customer's own provider*, so the minted token resolves to `oidc~<sub>`. Three ways to
   arrange that were measured; each trades a different criterion.
@@ -355,7 +356,7 @@ Steps are counted as discrete actions a customer performs. **One-time** = per de
 | | New components | Changes to existing grants | One-time steps | **Per-user steps** | IdP feature maturity | Portable off Keycloak |
 |---|---|---|---|---|---|---|
 | **Round 1 Option A** (second provider, `engine~`) | 1 (a web server) | **yes — every grant mirrored** | 2 | **1 per role + 1 per direct grant** (unbounded) | GA | yes |
-| **1a** host docs on BucketFS | 0 | n/a | n/a | n/a | n/a | **fails** (HTTPS-only, self-signed) |
+| **1a** host docs on BucketFS | **0** | n/a | 2 (publish 2 objects to a public bucket; trust the Exasol chain root) | n/a | GA | yes |
 | **1b** host docs on object storage | **0** | n/a | 1 (publish 2 objects, public-read) | n/a | GA | yes |
 | **1c** Lakekeeper static key | **0** | n/a | 1 (set one config value) | n/a | **does not exist** | yes |
 | **1d** engine key inside the IdP's JWKS | **0** | **none** | 2 | **0** | GA, but self-hosted IdP only | **no** |
@@ -370,20 +371,35 @@ Steps are counted as discrete actions a customer performs. **One-time** = per de
 
 `evidence/r2-hosting.txt`.
 
-**1a BucketFS: fails.** The publishing half works — `exapump bucketfs cp` puts both files in the
-`default` bucket, a `Public = True` bucket serves them anonymously, and BucketFS even returns
-`Content-Type: application/json`. The transport kills it. BucketFS listens on HTTPS only
-(`HttpPort = 0`) with a self-signed certificate, and Lakekeeper's discovery fetch has no trust-store
-or skip-verify option:
+**1a BucketFS: works, zero new components.** `exapump bucketfs cp` publishes both files, a
+`Public = True` bucket serves them anonymously with `Content-Type: application/json`, and Lakekeeper
+accepts the BucketFS URL as a provider URI. Verified all the way through authorization against a
+single-provider catalog:
 
 ```
-curl (no -k) -> SSL certificate problem: self-signed certificate in certificate chain
-Lakekeeper   -> Error: Failed to create required OIDC authenticator for oidc
-                (https://exasol:2581/default/engine-oidc): Failed to fetch openid configuration ...
+whoami -> oidc~1111...
+alice  alice_table 200  bob_table 404
+bob    alice_table 404  bob_table 200
 ```
 
-Turning on BucketFS's plain-HTTP port would publish the entire bucket unencrypted to host one public
-key. Not an acceptable trade.
+BucketFS serves HTTPS only (`HttpPort = 0`), so two conditions apply — and violating either produces
+the *same* opaque message, `error sending request for url`, with no TLS detail at any `RUST_LOG`
+level:
+
+* **The URL must use a name the certificate covers.** The Docker image's certificate is
+  `CN=exacluster.local` with `SAN: *.exacluster.local, exacluster.local`, so `https://exasol:2581/...`
+  fails however trust is configured. Measured as negative control 2.
+* **Lakekeeper must trust the ROOT of the chain, not the leaf.** BucketFS presents two certificates
+  that share the subject `CN=exacluster.local` and both carry `CA:TRUE`. Trusting the leaf is not
+  enough. Measured as negative control 1.
+
+The trust itself is ordinary, and this corrects an earlier claim in this report: **Lakekeeper does
+honour a CA store** — both `SSL_CERT_FILE` and the system bundle at
+`/etc/ssl/certs/ca-certificates.crt` work, confirmed against a separately-signed HTTPS issuer as well
+as against BucketFS. The first round-2 pass reported 1a as failing; that was operator error (the leaf
+trusted rather than the root, and a hostname outside the SAN), not a Lakekeeper limitation. A
+deployment whose Exasol certificate comes from the customer's own PKI needs no special handling at
+all when that PKI is already in the catalog host's trust store.
 
 **1b object storage: works, zero new components.** The discovery document and JWKS are two static
 objects in the bucket the customer's Iceberg data already lives in, published with
@@ -566,8 +582,8 @@ except one (they need no engine-side key management at all).
 
 | | crit 1 no new components | crit 2 no grant changes | crit 3 per-user steps | crit 4 mature + portable | crit 5 trust model |
 |---|---|---|---|---|---|
-| Round 1 Option A | ✗ (web server; 1b fixes this) | ✗ | ✗ unbounded | ✓ | ✓ |
-| 1b + 2b merged JWKS | ✗ (refresher) | ✓ | ✓ 0 | ✓ | ✓ |
+| Round 1 Option A | ✓ once hosted per 1a or 1b | ✗ | ✗ unbounded | ✓ | ✓ |
+| 2b merged JWKS (hosted per 1a or 1b) | ✗ (the refresher) | ✓ | ✓ 0 | ✓ | ✓ |
 | 1d IdP holds the key | ✓ | ✓ | ✓ 0 | ✗ self-hosted only | ✗ IdP can impersonate the engine |
 | Per-user CONNECTION (i) | ✓ | ✗ | ✗ 4 | ✓ | ✓ |
 | Per-user CONNECTION (ii) | ✓ | ✓ | ~ 2 | ✗ deprecated grant | ✗ engine stores user passwords |
@@ -637,8 +653,10 @@ Trino. Steps marked **(per user)** repeat; everything else is once.
 **Interim, managed IdP (2b), only with the refresher accepted:**
 
 1. Generate the engine signing key; store it in the engine's CONNECTION.
-2. Publish `openid-configuration` + a merged `jwks.json` (engine key + the IdP's current keys) to the
-   existing object-storage bucket, public-read, `Content-Type: application/json`.
+2. Publish `openid-configuration` + a merged `jwks.json` (engine key + the IdP's current keys) to a
+   place the deployment already runs: the object-storage bucket (public-read,
+   `Content-Type: application/json`) or a `Public = True` BucketFS bucket. For BucketFS, use a URL
+   inside the Exasol certificate's SAN and put that chain's root in the catalog's trust store.
 3. Point `LAKEKEEPER__OPENID_PROVIDER_URI` at that document and list the IdP's issuer in
    `LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS`; restart the catalog.
 4. Schedule a refresh of the merged JWKS from the IdP, and alert on it. **If it goes stale, the
@@ -659,8 +677,9 @@ Trino. Steps marked **(per user)** repeat; everything else is once.
 * **Replace** "publish the engine's issuer documents" with **"get the engine's public key trusted
   under the customer's own OIDC provider"**. Hosting a discovery document is no longer the goal, it is
   one of three implementations, and the preferred one (a static key on the existing Lakekeeper
-  provider) needs no hosting at all. If documents are hosted, object storage works and BucketFS does
-  not.
+  provider) needs no hosting at all. If documents are hosted, both BucketFS and object storage work
+  with zero new components; BucketFS needs its certificate chain root in the catalog's trust store and
+  a URL inside the certificate's SAN.
 * **Replace** the identity-mapping item's recommended shape. "A Lakekeeper role per user holding both
   identities" is withdrawn: it is one grant change per role *and* per direct grant, per person, and it
   writes into the customer's existing authorization data. The requirement is now that the minted token
