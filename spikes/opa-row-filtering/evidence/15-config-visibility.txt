@@ -1,0 +1,33 @@
+### Exasol 2025.1.16
+### probe user: OPA_CFG_PROBE -- CREATE SESSION + SELECT ON SCHEMA COMPLEX_TYPE_VS, nothing else
+### (the same privilege shape issue #402 relies on)
+
+### setup: 3 statements executed, 0 failed
+
+-- 1. the probe DOES see the virtual schemas themselves --
+   VISIBLE_VS
+   18
+
+-- 2. but reads NOTHING from EXA_ALL_VIRTUAL_SCHEMA_PROPERTIES --
+   [1/1] SELECT SCHEMA_NAME, PROPERTY_NAME, PROPERTY_VALUE FROM SY... 0 rows
+   SCHEMA_NAME,PROPERTY_NAME,PROPERTY_VALUE
+   (as SYS the same rows are there: 60 rows in EXA_DBA_VIRTUAL_SCHEMA_PROPERTIES)
+
+-- 3. EXA_ALL_CONNECTIONS exposes no address, no user, no password --
+   CONNECTION_NAME,CREATED,CONNECTION_COMMENT
+   LAKEHOUSE_CATALOG_CREDS,2026-09-17T13:08:04,
+   REFRESH_CATALOG_CREDS,2026-09-17T13:05:01,
+   columns are CONNECTION_NAME, CREATED, CONNECTION_COMMENT only.
+   NOTE: the NAMES are visible even without a grant --
+     probe sees 5, SYS sees 5 -- so a connection NAME is not a secret.
+
+-- 4. the probe cannot repoint the schema's configuration --
+   ALTER ... SET -> insufficient privileges for altering virtual schema 
+
+-- conclusion --
+Neither store leaks the value to an ordinary query user: VS property values are
+invisible to a plain SELECT grantee, and EXA_ALL_CONNECTIONS carries no address
+or credential at all. So secrecy of the OPA URL does not decide this. What
+decides it is that a CONNECTION already has a credential slot (its password),
+is a separately grantable object, and is the pattern CATALOG_CONNECTION already
+uses for the catalog endpoint.

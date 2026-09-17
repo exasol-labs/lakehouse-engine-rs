@@ -83,6 +83,7 @@ scripts/98-user-id-namespace.sh        # what the Lakekeeper user id is made of;
 | `evidence/11-per-user-data.txt` | Per-user permissions as an OPA data document, no groups, no HTTP |
 | `evidence/14-table-gate.txt` | One policy, one call: table access AND row filter, three distinct answers |
 | `evidence/12-lakekeeper-table-grants.txt` | *(parked)* Live Lakekeeper+OpenFGA: a per-table grant asked on another user's behalf |
+| `evidence/15-config-visibility.txt` | Live Exasol: what a SELECT-only user can read back of VS properties vs CONNECTIONs |
 | `evidence/13-user-id-namespace.txt` | *(parked)* Live: what Lakekeeper's `<idp-id>~<sub>` user id is made of, and what it rejects |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
@@ -1006,6 +1007,9 @@ in the shared IdP, so groups are available without any per-user credential
    needed ([§13](#13-parked-a-lakekeeper-grant-table-gate) is parked).
 10. **Map the user with `USER_MAPPING`** to the key the policy is keyed on, and refuse when there is
     no entry ([§11](#11-the-user_mapping-property)).
+11. **Put the OPA address in an Exasol CONNECTION** named by an `OPA_CONNECTION` property, mirroring
+    `CATALOG_CONNECTION`; the policy path, the user mapping and the timeout stay plain properties
+    ([§14](#14-where-the-opa-server-address-belongs)).
 
 **Do not build:** anything that accepts a SQL string from a policy. Sections 1 to 6 are the evidence
 for why.
@@ -1324,3 +1328,80 @@ the requirement, two shapes exist:
 **Not tested:** either shape wired up. The halves are each verified — `http.send` under
 `nondeterministicBuiltins` against Keycloak (`evidence/10`) and `batch-check` against Lakekeeper
 (`evidence/12`) — but never composed.
+
+---
+
+## 14. Where the OPA server address belongs
+
+**An Exasol CONNECTION object named by an `OPA_CONNECTION` virtual-schema property** — exactly the
+shape `CATALOG_CONNECTION` already uses for the catalog endpoint.
+
+```sql
+CREATE CONNECTION LAKEHOUSE_OPA
+  TO 'http://opa.internal:8181'                      -- the address
+  USER ''                                            -- unused for OIDC
+  IDENTIFIED BY '{"...": "..."}';                    -- OPA's credential, if any
+
+CREATE VIRTUAL SCHEMA lhvs USING ... WITH
+  CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
+  OPA_CONNECTION     = 'LAKEHOUSE_OPA'
+  OPA_QUERY          = 'data.gate.allow'             -- non-secret, plain property
+  USER_MAPPING       = '...';                        -- non-secret, plain property
+```
+
+The precedent is explicit in the code (`crates/lakehouse-engine/src/adapter/mod.rs:40-42`):
+
+```rust
+// Required: name of the Exasol CONNECTION object that holds the catalog URI
+// (as its address) and the credential JSON (as its password).
+const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
+```
+
+Everything non-secret and tuning-shaped is already a plain property there — `ALLOW_HTTP`,
+`PARALLELISM_FACTOR`, `MEMORY_POOL_FRACTION` and a dozen more. An *endpoint the adapter calls* is a
+CONNECTION. The OPA address is the second such endpoint, so it takes the same slot.
+
+### 14.1 What decided it, and what did not
+
+Not secrecy. Both stores hide their value from an ordinary query user — measured live against Exasol
+2025.1.16 with a throwaway user holding only `CREATE SESSION` plus `SELECT` on a virtual schema, the
+same privilege shape issue #402 relies on (`evidence/15-config-visibility.txt`,
+`scripts/99-config-visibility.sh`):
+
+| Probe as the SELECT-only user | Result |
+|---|---|
+| `SELECT COUNT(*) FROM EXA_ALL_VIRTUAL_SCHEMAS` | **18** — it does see the schemas |
+| `SELECT ... FROM EXA_ALL_VIRTUAL_SCHEMA_PROPERTIES` | **0 rows** (60 rows exist in the DBA view) |
+| `SELECT * FROM EXA_ALL_CONNECTIONS` | 5 rows, columns `CONNECTION_NAME, CREATED, CONNECTION_COMMENT` — **no address, no user, no password** |
+| `ALTER VIRTUAL SCHEMA ... SET ALLOW_HTTP='true'` | `insufficient privileges for altering virtual schema` |
+
+So a property value is not readable by a query user and cannot be repointed by one. A connection
+*name*, on the other hand, **is** world-readable — the probe saw all 5 connections, the same count
+SYS sees — so a name is not a secret and there is no point hiding one in a property.
+
+What decided it:
+
+1. **A credential slot that already exists.** Today OPA can be authenticated with the engine's
+   existing catalog token ([§9.1](#91-the-engine-authenticating-itself-to-opa)), so no new secret is
+   needed. But [§9.7](#97-design-note-worth-flagging) recommends OPA get its own confidential client,
+   and a deployment may gate OPA with a static bearer token instead of OIDC. With a CONNECTION that
+   is a password change; with a property it is a schema change plus a secret in a place that was
+   never meant to hold one.
+2. **Separately grantable.** A CONNECTION is its own object with its own `GRANT`, so the right to
+   point the engine at a policy server can be held apart from the right to own the virtual schema.
+3. **One pattern, not two.** Nobody has to remember which external endpoint is configured which way.
+
+### 14.2 What stays a plain property
+
+| Setting | Where | Why |
+|---|---|---|
+| `OPA_CONNECTION` | property naming a CONNECTION | the address, plus any credential |
+| `OPA_QUERY` | property | the Rego query path, e.g. `data.gate.allow`; not a secret |
+| `USER_MAPPING` | property | the Exasol-user-to-policy-key map ([§11](#11-the-user_mapping-property)) |
+| `OPA_TIMEOUT_MS` | property | tuning, like the existing `S3_MAX_CONNECTIONS` |
+| plaintext transport | reuse `ALLOW_HTTP` | an `http://` OPA call puts the user name and the decision on the wire; it needs the same opt-in the catalog already has |
+
+**Not tested:** none of these properties exist yet; this is a design recommendation grounded in the
+visibility measurements above and in the existing `CATALOG_CONNECTION` code path. Whether the adapter
+should read the CONNECTION once per pushdown request or cache it is a question for implementation —
+the adapter is stateless per request either way.
