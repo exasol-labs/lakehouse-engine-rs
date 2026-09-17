@@ -13,6 +13,12 @@ unknown user, a mistyped policy path and a crashed policy all answer HTTP 200 me
 Sections [1](#1-what-exactly-does-opa-return) to [6](#6-cost) are that pass, and they remain the
 reason not to copy Trino's design.
 
+**Pass 3** ([§9](#9-authentication-sharing-lakekeepers-idp)) answers the authentication question:
+OPA runs against the **same Keycloak realm** the catalog uses, the engine presents the **same
+client-credentials token** to both, and OPA resolves the querying user's **groups from that same
+IdP**. All three verified live. One trap: partial evaluation does not run `http.send` unless asked,
+and the default leaves the IdP calls unresolved *and* leaks the client secret into the output.
+
 **Pass 2** ([§8](#8-the-mechanism-pass-1-missed-opa-partial-evaluation)) tests the mechanism pass 1
 missed, and it is the one to build on. OPA's Compile API (`POST /v1/compile`) partial-evaluates a
 policy with the table row declared *unknown* and returns the residual conditions as a **structured
@@ -44,6 +50,7 @@ scripts/50-translate-probe.sh          # cargo; df-probe/ is NOT a workspace mem
 scripts/60-exasol-identity.sh          # needs: docker compose up -d exasol
 scripts/70-partial-evaluation.sh       # pass 2: the Compile API
 scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
+scripts/90-idp-auth.sh                 # pass 3: shared IdP; needs Keycloak, see header
 ```
 
 | Evidence | What it holds |
@@ -58,6 +65,7 @@ scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
 | `evidence/07-lakekeeper-refutation.txt` | All 18 Lakekeeper `.rego` files searched for the row-filter contract |
 | `evidence/08-opa-partial-evaluation.txt` | Compile API: per-user ASTs, truth-value controls, SQL-target probe |
 | `evidence/09-rego-to-datafusion.txt` | The translation layer's output, planned and executed |
+| `evidence/10-idp-auth.txt` | Live Keycloak: OPA gated on the catalog's own token, groups from the IdP |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
 own feature set, `crates/lakehouse-engine/Cargo.toml:32`), Exasol 2025.1.16, Trino `master` as of
@@ -686,15 +694,203 @@ Stated plainly, because they are the open questions for planning, not the spike'
 - **Not executed end to end.** No adapter code was written, per the brief. The layer was driven from
   captured OPA responses against a DataFusion fixture, not from a live Exasol query.
 
-### 8.6 Revised verdict
+### 8.6 Verdict on the mechanism
+
+See [§9.5](#95-revised-verdict) for the overall verdict, which now also covers authentication.
+
+---
+
+## 9. Authentication: sharing Lakekeeper's IdP
+
+Short answer: **yes to all three parts of the question**, verified against the repo's own Keycloak.
+
+The question contains two halves that are worth keeping apart, because only one of them is about
+credentials:
+
+1. **The engine authenticating itself to OPA.** A credential. Answered in [§9.1](#91-the-engine-authenticating-itself-to-opa).
+2. **Asking OPA about `current_user`.** Not a credential. The user name travels as *data* in the
+   request body, which is exactly what preserves the "no per-user catalog identity" property. The
+   engine never holds a credential for the querying user, and OPA never needs one.
+
+There is also a third thing, which is the interesting one: **OPA can look the user up in the IdP
+itself** ([§9.2](#92-opa-resolving-the-users-groups-from-the-same-idp)), which closes the gap
+[§3](#3-is-the-exasol-user-name-enough-as-the-policy-input) left open.
+
+### 9.1 The engine authenticating itself to OPA
+
+The repo already ships a shared IdP. `docker-compose.lakekeeper.yml` runs Keycloak with realm
+`iceberg`, and Lakekeeper is pointed at it:
+
+```
+LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/iceberg
+LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
+```
+
+The engine authenticates to that realm today with a `client_credentials` grant
+(`crates/lakehouse-catalog/src/auth.rs:113`, `OAUTH2_GRANT_TYPE`) as the confidential client
+`lakehouse`, and sends `Authorization: Bearer <token>`. Live token claims (`evidence/10`):
+
+```json
+{"iss":"http://localhost:28080/realms/iceberg","aud":["lakekeeper","realm-management","account"],
+ "azp":"lakehouse","sub":"fc5dc328-...","preferred_username":"service-account-lakehouse"}
+```
+
+OPA accepts that same token, but not out of the box. Started with
+`--authentication=token --authorization=basic`, OPA places the raw bearer token in `input.identity`
+and **validates nothing itself**. A `system.authz` policy is what turns it into real OIDC
+authentication (`policies-authz/system/authz.rego`, 40 lines):
+
+```rego
+verified := [valid, header, claims] if {
+	[valid, header, claims] := io.jwt.decode_verify(input.identity, {
+		"cert": jwks,          # fetched from the realm JWKS, cached 1 h
+		"iss": issuer,         # same issuer Lakekeeper is configured with
+		"aud": "lakekeeper",
+	})
+}
+allow if { verified[0] == true; verified[2].azp == "lakehouse" }
+```
+
+Executed matrix (`evidence/10`, part 1):
+
+| Request | Result |
+|---|---|
+| valid Keycloak token, `azp=lakehouse` | **HTTP 200**, decision returned |
+| no `Authorization` header | HTTP 401 |
+| garbage bearer token | HTTP 401 |
+| valid token, last signature byte changed | HTTP 401 |
+| `/health`, unauthenticated | HTTP 200 (allowed deliberately, for probes) |
+
+So one credential, two consumers, same realm. The engine's CONNECTION object already carries
+`client_id`, `client_secret`, `oauth2_server_uri` and `scope` (`auth.rs`), so there is existing
+plumbing to reuse rather than a new secret to introduce.
+
+Not tested: `--authentication=tls` (mTLS), which is the other supported mode and avoids JWT handling
+entirely.
+
+### 9.2 OPA resolving the user's groups from the same IdP
+
+This is the part that makes the policies in [§3](#3-is-the-exasol-user-name-enough-as-the-policy-input)
+realistic. Rather than hardcoding a user-to-region map, the policy asks the IdP who the user is.
+
+The pattern is not invented here. **Lakekeeper's own OPA bridge already does it**, holding a
+`client_credentials` grant inside Rego with a cached token
+(`authz/opa-bridge/policies/lakekeeper/authentication.rego`):
+
+```rego
+access_token[lakekeeper_id] := access_token if {
+	value := http.send({
+		"method": "POST", "url": this.openid_token_endpoint,
+		"raw_body": sprintf("grant_type=client_credentials&client_id=%v&client_secret=%v&scope=%v",
+			[this.client_id, this.client_secret, this.scope]),
+		"force_cache": true, "force_cache_duration_seconds": 150,
+	}).body
+	access_token := value.access_token
+}
+```
+
+`policies-idp/idp_filtering.rego` does the same against Keycloak's admin API, resolving the Exasol
+user name to an IdP user and then to groups. Live (`evidence/10`, part 2):
+
+```
+OPA_ALICE    ["analyst","eu_staff"]
+OPA_BOB      ["analyst"]
+```
+
+The row policy then keys on those groups, and partial evaluation removes the lookups entirely:
+
+```
+OPA_ALICE   ->  input.row.region in {"CH", "EU", "UK"}
+OPA_BOB     ->  input.row.region = "US" ;  input.row.classification != "SECRET"
+OPA_NOBODY  ->  undefined            (no IdP account -> compiles to DENY)
+```
+
+Run through the [§8.3](#83-the-translation-layer-written-and-executed) translation layer and executed
+(`evidence/09`):
+
+```
+idp-opa-alice  -> FILTER ("REGION" IN ('CH', 'EU', 'UK'))   6 rows;  sharded 6 = single-node 6
+idp-opa-bob    -> FILTER ("REGION" = 'US' AND "CLASSIFICATION" <> 'SECRET')   0 rows;  0 = 0
+idp-opa-nobody -> DENY ALL
+```
+
+That is the whole loop: Exasol user name in, IdP groups resolved, policy evaluated, DataFusion
+predicate out, correct rows, and an unknown user denied. No per-user catalog credential anywhere.
+
+**The join key.** Matching on username keeps the spike self-contained, but production should join on
+the IdP subject. `SYS.EXA_DBA_USERS.OPENID_SUBJECT` exists for exactly this and was confirmed live
+(`evidence/06`, part 3), alongside `DISTINGUISHED_NAME` and `KERBEROS_PRINCIPAL`. **Caveat:** it was
+**empty** in the test container, because those users authenticate by password. This design therefore
+assumes Exasol users are IdP-backed. On a password-auth cluster you are matching on a name string in
+two systems, which is weaker and should be called out rather than assumed away.
+
+### 9.3 The trap: partial evaluation skips `http.send` by default
+
+`http.send` is a nondeterministic builtin, and partial evaluation does **not** evaluate it unless
+told to. Left at the default, the IdP lookups survive into the residual and the result is
+untranslatable. Counted from the real output (`evidence/10`):
+
+```
+  2 client_secret=%v
+  3 data.partial.idp.groups
+  4 http.send
+```
+
+Two problems, not one. The residual cannot be compiled, **and it contains the client secret**, so
+anything that logs a residual leaks a credential.
+
+Enabling it is more fiddly than it should be, and the spellings are not interchangeable
+(`evidence/10`, verified):
+
+| How | Result |
+|---|---|
+| plain request body | support module, `http.send` **not** evaluated |
+| `?nondeterministic-builtins=true` query string | support module, **not** evaluated |
+| `{"options": {"nondeterministicBuiltins": true}}` in the **body** | resolved, 1 query |
+| CLI: `--nondeterminstic-builtins` (note the missing `i`) | resolved |
+
+Treat "residual still contains `http.send`" as a hard refusal in the compiler, which the layer
+already does by rejecting any operator outside its allowlist.
+
+### 9.4 Cost of the IdP round trips
+
+`evidence/10`, part 3:
+
+| | |
+|---|---|
+| cold, empty cache (token + user lookup + groups) | **18.9 ms** |
+| warm, n=100 | median **1.2 ms**, p95 1.8 ms, max 3.2 ms |
+
+Cache TTLs are policy-controlled (`force_cache_duration_seconds`): 150 s for the token, 60 s for the
+user and group lookups. Compare [§6](#6-cost)'s 0.2 ms for a policy with no IdP calls, so the IdP
+integration costs about 1 ms warm and one 19 ms hit per cache window. Still far below the catalog
+metadata resolution the same plan already does.
+
+The freshness tradeoff is the real decision, not the latency: a 60 s group cache means a revoked
+group membership keeps granting access for up to a minute.
+
+### 9.5 Design note worth flagging
+
+For the spike I reused the single `lakehouse` client for both the catalog and OPA's IdP lookups, and
+granted it `view-users` on `realm-management`. That visibly widened its token audience
+(`aud` gained `realm-management`, see the claims above). It means the catalog client can now enumerate
+every user in the realm, which is more privilege than the catalog needs. A separate confidential
+client for OPA, holding `view-users` alone, is the obvious split. Not tested.
+
+### 9.6 Revised verdict
+
 
 **Can this ship without per-user catalog identity? Yes.** The single service account is untouched:
-the decision is made from the Exasol user name, and the catalog never learns who asked.
+the decision is made from the Exasol user name, and the catalog never learns who asked. Better than
+that, the same service account authenticates the engine to OPA, and OPA itself can look the user up
+in the shared IdP, so groups are available without any per-user credential
+([§9](#9-authentication-sharing-lakekeepers-idp)).
 
 **Build:** a Rego-to-DataFusion compiler over OPA's Compile API output.
 
 1. **Call `POST /v1/compile`**, not the row-filters endpoint, with the table row as the unknown, once
-   per table at plan time. Cost is unchanged from [§6](#6-cost).
+   per table at plan time, passing `{"options": {"nondeterministicBuiltins": true}}` so an
+   IdP-backed policy resolves. Cost is 0.2 ms without IdP lookups, about 1.2 ms warm with them.
 2. **Compile the AST to a predicate** with an operator allowlist. `df-probe/src/opa_compile.rs` is a
    working sketch of the whole thing; production would route through `vs-expression` instead of
    emitting SQL text directly, so dialect rendering stays in one place.
@@ -706,6 +902,9 @@ the decision is made from the Exasol user name, and the catalog never learns who
    authors.
 5. **Two injection points**, single-table and per-leg join.
 6. **Scope masking down or defer it.** It is a separate mechanism from row filtering.
+7. **Point OPA at the catalog's Keycloak realm**, gate its API with a `system.authz` policy that
+   verifies the engine's existing token, and give OPA its own confidential client for IdP lookups
+   rather than widening the catalog client's privileges.
 
 **Do not build:** anything that accepts a SQL string from a policy. Sections 1 to 6 are the evidence
 for why.

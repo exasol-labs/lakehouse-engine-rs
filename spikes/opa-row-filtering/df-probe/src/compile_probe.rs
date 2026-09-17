@@ -100,7 +100,13 @@ async fn main() {
     println!("==============================================================================");
     println!("policy: policies/filtering2.rego   unknown: input.row\n");
 
-    for name in ["alice", "bob", "root", "carol", "unsupported"] {
+    // The last three come from the IdP-driven policy: the user's GROUPS are
+    // fetched from Keycloak inside Rego, then resolved away by partial
+    // evaluation, so only row conditions remain. See evidence/10.
+    for name in [
+        "alice", "bob", "root", "carol", "unsupported",
+        "idp-opa-alice", "idp-opa-bob", "idp-opa-nobody",
+    ] {
         let path = format!("../compiled/{name}.json");
         let body: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();

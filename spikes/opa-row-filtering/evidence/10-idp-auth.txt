@@ -1,0 +1,73 @@
+### Keycloak realm iceberg, from docker-compose.lakekeeper.yml
+### issuer:   http://localhost:28080/realms/iceberg
+### jwks:     http://localhost:28080/realms/iceberg/protocol/openid-connect/certs
+### client:   lakehouse  (confidential, service account, client_credentials)
+### This is the SAME realm/client Lakekeeper is configured against:
+###   #   OIDC audience (aud) ....... lakekeeper                  (= LAKEKEEPER__OPENID_AUDIENCE)
+###         - LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/iceberg
+###         - "LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS=http://localhost:${LH_KEYCLOAK_PORT:-28080}/realms/iceberg"
+###         - LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
+
+==============================================================
+PART 1 -- the engine authenticating ITSELF to OPA.
+The token below is obtained with the same client_credentials grant
+lakehouse-catalog/src/auth.rs already uses for the REST catalog.
+==============================================================
+-- claims of that token:
+{"iss":"http://localhost:28080/realms/iceberg","aud":["lakekeeper","realm-management","account"],"azp":"lakehouse","sub":"fc5dc328-3594-4f46-a940-665929e11567","preferred_username":"service-account-lakehouse"}
+
+-- OPA started with: --authentication=token --authorization=basic
+-- gate policy: policies-authz/system/authz.rego, which verifies the JWT
+   against the realm JWKS with io.jwt.decode_verify (iss + aud + signature)
+
+-- API auth matrix:
+  valid Keycloak token (azp=lakehouse)           HTTP 200  "decision returned"
+  NO Authorization header                        HTTP 401  "request rejected by administrative policy"
+  garbage bearer token                           HTTP 401  "request rejected by administrative policy"
+  valid token, last signature byte changed       HTTP 401  "request rejected by administrative policy"
+  unauthenticated /health (allowed on purpose)   HTTP 200
+
+==============================================================
+PART 2 -- OPA resolving the QUERYING USER's groups from the same IdP.
+policies-idp/idp_filtering.rego holds its own client_credentials grant,
+the pattern Lakekeeper's own OPA bridge uses
+(authz/opa-bridge/policies/lakekeeper/authentication.rego).
+==============================================================
+-- Keycloak group membership, set up by this script's fixtures:
+     OPA_ALICE    ["analyst","eu_staff"]
+     OPA_BOB      ["analyst"]
+
+-- NEGATIVE CONTROL: partial evaluation does NOT run http.send by default.
+   Without the option, the IdP lookups stay UNEVALUATED in the residual,
+   which is untranslatable -- and leaks the client secret into the output:
+
+           2 client_secret=%v
+           3 data.partial.idp.groups
+           4 http.send
+     (counts of unresolved constructs in the residual)
+
+-- WITH the option, the IdP calls are resolved away and only row
+   conditions remain. CLI flag: --nondeterminstic-builtins (sic).
+   Compile API: {"options": {"nondeterministicBuiltins": true}} in the BODY.
+   Query-string forms do NOT work; verified below.
+
+-- which spelling actually enables it:
+     plain body (default)                       "support module: http.send NOT evaluated"
+     ?nondeterministic-builtins=true            "support module: http.send NOT evaluated"
+     body options.nondeterministicBuiltins      "resolved: 1 query(ies)"
+
+-- per-user residuals with the option on (also written to compiled/idp-*.json):
+     OPA_ALICE     Query 1  input.row.region in {"CH", "EU", "UK"} ;
+     OPA_BOB       Query 1  input.row.region = "US" ;  input.row.classification != "SECRET" ;
+     OPA_NOBODY   undefined;
+
+     OPA_NOBODY has no IdP account at all, so the policy is undefined for
+     them, which compiles to DENY. Contrast the row-filters endpoint in
+     evidence/03, where an unknown user meant UNRESTRICTED.
+
+==============================================================
+PART 3 -- what the IdP round trips cost
+==============================================================
+  cold (empty http.send cache: token + user + groups) = 18.9 ms
+  warm, n=100: median = 1.217 ms   p95 = 1.819 ms   max = 3.172 ms
+  (cache TTLs in the policy: 150 s for the token, 60 s for user and groups)
