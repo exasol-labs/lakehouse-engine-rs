@@ -1,0 +1,50 @@
+### Lakekeeper 0.13.1, authz-backend = openfga
+### caller = the engine's own service account (client_credentials, client_id=lakehouse)
+### API under test: POST /management/v1/action/batch-check
+###   the SAME call Lakekeeper's OPA bridge makes in check.rego
+
+-- setup --
+   warehouse opa_spike_wh id=aac6e5ac-b27e-11f1-b62f-1b932997b408
+   tables: ["orders_public","orders_secret"]
+   orders_public id=01a0aecf-daa8-7440-8ec5-21ed0cdb66cd
+   orders_secret id=01a0aecf-dad0-7ca0-8b6f-c40d28fd48c6
+   lakekeeper user id for alice = oidc~opa-spike-alice
+
+-- GRANT alice 'select' on orders_public ONLY (nothing at all on orders_secret) --
+   POST /permissions/warehouse/aac6e5ac-b27e-11f1-b62f-1b932997b408/table/01a0aecf-daa8-7440-8ec5-21ed0cdb66cd/assignments {select -> alice} -> HTTP 204 
+   assignments now on orders_public: [{"type":"ownership","user":"oidc~fc5dc328-3594-4f46-a940-665929e11567"},{"type":"select","user":"oidc~opa-spike-alice"}]
+   assignments now on orders_secret: [{"type":"ownership","user":"oidc~fc5dc328-3594-4f46-a940-665929e11567"}]
+
+-- ASK batch-check ON ALICE'S BEHALF (caller is the service account, subject is alice) --
+  orders_public          get_metadata  oidc~opa-spike-alice         -> {"allowed":true}
+  orders_public          read_data     oidc~opa-spike-alice         -> {"allowed":true}
+  orders_secret          get_metadata  oidc~opa-spike-alice         -> {"allowed":false}
+  orders_secret          read_data     oidc~opa-spike-alice         -> {"allowed":false}
+
+-- NEGATIVE CONTROLS --
+  orders_public          read_data     oidc~no-such-user-at-all     -> {"allowed":false}
+  orders_public          write_data    oidc~opa-spike-alice         -> {"allowed":false}
+  orders_nonexistent     read_data     oidc~opa-spike-alice         -> {"allowed":false}
+
+================================================================================
+CONTRAST: the SAME script against the repo's DEFAULT Lakekeeper stack
+(docker-compose.lakekeeper.yml alone, authz-backend = "allow-all")
+captured earlier in this spike, before the OpenFGA overlay was added:
+
+  GET /management/v1/info -> {"authz-backend":"allow-all"}
+  GET|POST /management/v1/permissions/table/{id}/assignments -> HTTP 404
+      (the whole /permissions/** tree is absent from its OpenAPI: there is no
+       permission model to write grants into)
+
+  orders_public      read_data      oidc~opa-spike-alice       -> {"allowed":true}
+  orders_secret      read_data      oidc~opa-spike-alice       -> {"allowed":true}
+  orders_public      get_metadata   oidc~opa-spike-alice       -> {"allowed":true}
+  orders_public      read_data      oidc~no-such-user-anywhere -> {"allowed":true}
+  orders_nonexistent read_data      oidc~opa-spike-alice       -> {"allowed":false}
+
+i.e. allow-all grants everything to everyone, including a user that does not
+exist. Only the missing TABLE is denied -- that is object resolution, not
+authorization. Same fail-open shape as the Trino row-filters endpoint in
+evidence/03. The grant model is NOT part of Lakekeeper's core: it comes from
+the OpenFGA backend, so "can OPA enforce a Lakekeeper table grant" is only a
+meaningful question on an OpenFGA-backed deployment.

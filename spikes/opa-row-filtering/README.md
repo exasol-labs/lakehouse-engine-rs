@@ -27,6 +27,13 @@ DataFusion predicate, and the compiled output plans, returns the correct rows, a
 answers sharded and single-node. The AST also distinguishes allow-all from deny-all from
 filter, which is exactly the fail-open hole pass 1 found and could not close.
 
+**Pass 4** ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant), [§11](#11-the-user_mapping-join-key))
+answers two follow-ups. A Lakekeeper per-table grant *is* enforceable on another user's behalf --
+verified live, and it fails closed -- but only on an OpenFGA-backed deployment, and its vocabulary
+stops at the table, so it is a **gate in front of** row filtering, not a replacement for it. And the
+Exasol user name is not the Lakekeeper/OPA subject, so a `USER_MAPPING` property is needed;
+`EXA_DBA_USERS.OPENID_SUBJECT` is the natural default for an OIDC-authenticated user.
+
 So: the feature is real, OPA is the right tool, and **Rego is never translated**. It is evaluated;
 what gets translated is the expression tree OPA hands back.
 
@@ -52,6 +59,7 @@ scripts/70-partial-evaluation.sh       # pass 2: the Compile API
 scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
 scripts/90-idp-auth.sh                 # pass 3: shared IdP; needs Keycloak, see header
 scripts/95-per-user-data.sh            # per-user permissions as plain OPA data
+scripts/97-lakekeeper-table-grants.sh  # per-table grants; needs the OpenFGA overlay, see header
 ```
 
 | Evidence | What it holds |
@@ -68,6 +76,7 @@ scripts/95-per-user-data.sh            # per-user permissions as plain OPA data
 | `evidence/09-rego-to-datafusion.txt` | The translation layer's output, planned and executed |
 | `evidence/10-idp-auth.txt` | Live Keycloak: OPA gated on the catalog's own token, groups from the IdP |
 | `evidence/11-per-user-data.txt` | Per-user permissions as an OPA data document, no groups, no HTTP |
+| `evidence/12-lakekeeper-table-grants.txt` | Live Lakekeeper+OpenFGA: a per-table grant asked on another user's behalf |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
 own feature set, `crates/lakehouse-engine/Cargo.toml:32`), Exasol 2025.1.16, Trino `master` as of
@@ -951,7 +960,9 @@ granted it `view-users` on `realm-management`. That visibly widened its token au
 every user in the realm, which is more privilege than the catalog needs. A separate confidential
 client for OPA, holding `view-users` alone, is the obvious split. Not tested.
 
-### 9.8 Revised verdict
+### 9.8 Verdict after passes 1-3
+
+(Passes 1-3 only; [§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant) and [§11](#11-the-user_mapping-join-key) add two steps to the build list below.)
 
 
 **Can this ship without per-user catalog identity? Yes.** The single service account is untouched:
@@ -982,6 +993,13 @@ in the shared IdP, so groups are available without any per-user credential
 8. **Point OPA at the catalog's Keycloak realm**, gate its API with a `system.authz` policy that
    verifies the engine's existing token, and give OPA its own confidential client for IdP lookups
    rather than widening the catalog client's privileges.
+9. **Add a table-level gate before the predicate** if the deployment has an OpenFGA-backed
+   Lakekeeper: one `batch-check` per table on the querying user's behalf, refusing the query on
+   `allowed: false` ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)). It shares one
+   permission model with the catalog but stops at the table, so it does not replace step 3.
+10. **Resolve the subject before either call.** `USER_MAPPING` overrides, with
+    `EXA_DBA_USERS.OPENID_SUBJECT` as the default; prepend `oidc~` for Lakekeeper only; refuse when a
+    mapping is configured and missing ([§11](#11-the-user_mapping-join-key)).
 
 **Do not build:** anything that accepts a SQL string from a policy. Sections 1 to 6 are the evidence
 for why.
@@ -989,3 +1007,119 @@ for why.
 **If the requirement is specifically "reuse Trino's OPA policies unchanged", that is still no.**
 Those policies emit Trino SQL strings; this design needs policies written against the row as
 structured Rego. The policy language is the same, the contract is not.
+
+---
+
+## 10. Can OPA enforce a Lakekeeper per-table grant?
+
+**Yes — verified live.** Grant alice `select` on one table and nothing on the other, then ask on her
+behalf: the two tables answer differently, and everything unknown answers `false`
+(`evidence/12-lakekeeper-table-grants.txt`, `scripts/97-lakekeeper-table-grants.sh`).
+
+```
+-- GRANT alice 'select' on orders_public ONLY --
+   orders_public  assignments: [ownership -> service-account, select -> oidc~opa-spike-alice]
+   orders_secret  assignments: [ownership -> service-account]
+
+-- POST /management/v1/action/batch-check, caller = service account, subject = alice --
+  orders_public   get_metadata  oidc~opa-spike-alice      -> {"allowed":true}
+  orders_public   read_data     oidc~opa-spike-alice      -> {"allowed":true}
+  orders_secret   get_metadata  oidc~opa-spike-alice      -> {"allowed":false}
+  orders_secret   read_data     oidc~opa-spike-alice      -> {"allowed":false}
+
+-- NEGATIVE CONTROLS --
+  orders_public   read_data     oidc~no-such-user-at-all  -> {"allowed":false}
+  orders_public   write_data    oidc~opa-spike-alice      -> {"allowed":false}   (select != modify)
+  orders_nonexistent read_data  oidc~opa-spike-alice      -> {"allowed":false}
+```
+
+Three things this establishes.
+
+**The API takes a third-party subject.** The request carries `"identity": {"user": "oidc~..."}`
+alongside the caller's own bearer token, so the engine's single service account can ask
+*"may alice read this table?"* without holding any credential for alice. This is the same property
+[§9](#9-authentication-sharing-lakekeepers-idp) relies on, now confirmed for the catalog's own
+permission API.
+
+**It is the exact call Lakekeeper's OPA bridge makes**, so the answer OPA would get is the answer
+above. From `authz/opa-bridge/policies/lakekeeper/check.rego`:
+
+```rego
+require_table_access_simple(lakekeeper_id, warehouse_name, namespace_name, table_name, user, action) if {
+	value := authenticated_http_send(lakekeeper_id, "POST", "/management/v1/action/batch-check", {
+		"error-on-not-found": false,
+		"checks": [{"operation": {"table": {"action": {"action": action},
+			"warehouse-id": warehouse_id_for_name(lakekeeper_id, warehouse_name),
+			"namespace": namespace_name, "table": table_name}},
+			"identity": {"user": user}}]}).body
+	value.results[0].allowed == true
+	count(value.results) == 1
+}
+```
+
+**But only on an OpenFGA-backed deployment.** The grant model is not in Lakekeeper's core. The
+repo's default stack runs `authz-backend: allow-all`, where the whole `/permissions/**` tree is
+absent from the OpenAPI (HTTP 404) and `batch-check` returns `allowed: true` for everyone —
+including a user that does not exist. Only the missing *table* is denied, which is object resolution,
+not authorization. The contrast is captured at the bottom of `evidence/12`. Getting real grants
+needed `docker-compose.openfga.yml` (OpenFGA v1.14, `LAKEKEEPER__AUTHZ_BACKEND=openfga`), added by
+this spike.
+
+### 10.1 What this does and does not give the feature
+
+It gives **table-level** enforcement, and it is a genuinely attractive one: a single permission model
+shared with the catalog, administered in Lakekeeper, no second place to keep in sync. It composes
+cleanly with the row-filter design as a gate in front of it — deny the query outright before
+compiling any predicate.
+
+It does **not** give row or column restrictions. Lakekeeper's `TableAction` enum is the whole
+vocabulary, and it stops at the table (live from its OpenAPI):
+
+```
+drop, write_data, read_data, get_metadata, commit, rename, include_in_list,
+undrop, get_tasks, control_tasks, set_protection
+```
+
+There is no row predicate and no column list anywhere in it. So the two mechanisms answer different
+questions and both are needed:
+
+| Question | Source | Shape of answer |
+|---|---|---|
+| may alice read this table at all? | Lakekeeper grants via `batch-check` | boolean |
+| which rows of it may she see? | OPA policy via `/v1/compile` | predicate AST |
+
+**Not tested:** routing the table gate *through* OPA rather than calling Lakekeeper directly. Both
+work; calling Lakekeeper directly from the adapter is one hop instead of two, and OPA adds value only
+if the gate needs policy logic of its own.
+
+## 11. The `USER_MAPPING` join key
+
+The Exasol user name and the Lakekeeper/OPA subject are **not** the same string, and this spike's
+own evidence shows the shape of the gap:
+
+```
+Exasol      current_user -> "ALICE"                    (uppercase, Exasol namespace)
+Lakekeeper  user id      -> "oidc~opa-spike-alice"     (oidc~ + IdP subject; observed live, evidence/12)
+Keycloak    sub          -> "fc5dc328-3594-..."        (opaque UUID; evidence/10)
+```
+
+So a `USER_MAPPING` virtual-schema property is needed, as proposed. Three observations from the
+evidence that bear on its design:
+
+1. **Exasol already stores the IdP identity.** `EXA_DBA_USERS` carries `OPENID_SUBJECT`,
+   `DISTINGUISHED_NAME` and `KERBEROS_PRINCIPAL` (`evidence/06`). For an OIDC-authenticated Exasol
+   user, `OPENID_SUBJECT` *is* the join key and no mapping table is needed — the adapter reads it
+   over connect-back. That makes `USER_MAPPING` the override for the cases that fall outside it
+   (locally-authenticated users, a differently-keyed IdP, test setups), not the primary path.
+2. **`oidc~` is Lakekeeper's own prefix**, not part of the subject. Whatever the property maps to,
+   the Lakekeeper-facing call has to prepend it; the OPA-facing call must not.
+3. **Failing to map must deny.** An unmapped user has no permissions entry, which in the
+   partial-evaluation design is `undefined` → DENY ([§8](#8-the-mechanism-pass-1-missed-opa-partial-evaluation)),
+   and in `batch-check` is `allowed: false` (the `no-such-user-at-all` control above). Both
+   mechanisms already fail closed on an unknown subject — so the mapping layer must not invent a
+   fallback identity, and must refuse rather than pass the raw Exasol name through when a mapping is
+   configured but missing.
+
+**Not tested:** the property itself, or reading `OPENID_SUBJECT` for a live OIDC-authenticated Exasol
+user (the spike's Exasol users are locally authenticated, so the column is NULL for them —
+`evidence/06`).

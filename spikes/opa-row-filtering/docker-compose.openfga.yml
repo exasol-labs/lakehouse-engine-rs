@@ -1,0 +1,47 @@
+# Spike-only overlay: switch Lakekeeper from its default `allow-all` authz
+# backend to OpenFGA, which is what gives it a real per-table permission model.
+#
+# Usage (from the repo root):
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
+#     -f spikes/opa-row-filtering/docker-compose.openfga.yml up -d --wait \
+#     minio minio-init minio-lakekeeper-init keycloak lakekeeper-db openfga \
+#     lakekeeper-migrate lakekeeper
+#
+# NOT part of the shipping stack. The authz backend is chosen at bootstrap, so
+# switching it requires a fresh lakekeeper-db volume.
+services:
+  openfga:
+    # Same image Lakekeeper's own access-control-advanced example uses, but with
+    # the in-memory datastore so the spike needs no extra Postgres and no
+    # openfga-migrate step.
+    image: openfga/openfga:v1.14
+    command: run
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=memory
+      - OPENFGA_PLAYGROUND_ENABLED=false
+      - OPENFGA_LOG_LEVEL=error
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=openfga:8081"]
+      interval: 5s
+      timeout: 30s
+      retries: 20
+    ports:
+      - "${LH_OPENFGA_PORT:-28089}:8080"
+    networks:
+      - lakehouse
+
+  lakekeeper-migrate:
+    environment:
+      - LAKEKEEPER__AUTHZ_BACKEND=openfga
+      - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
+    depends_on:
+      openfga:
+        condition: service_healthy
+
+  lakekeeper:
+    environment:
+      - LAKEKEEPER__AUTHZ_BACKEND=openfga
+      - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
+    depends_on:
+      openfga:
+        condition: service_healthy
