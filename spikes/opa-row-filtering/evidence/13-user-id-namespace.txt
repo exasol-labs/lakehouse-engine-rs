@@ -1,0 +1,55 @@
+### Lakekeeper 0.13.1, authz-backend=openfga
+### question: where does the 'oidc~' prefix come from, and must the adapter build it?
+
+-- 1. Lakekeeper's OWN documentation of the id, from its OpenAPI (CreateUserRequest.id) --
+   Subject id of the user - allows user provisioning.
+   The id must be identical to the subject in JWT tokens, prefixed
+   with `<idp-identifier>~`. For example: `oidc~1234567890` for OIDC users
+   or `kubernetes~1234567890` for Kubernetes users.
+   To create users in self-service manner, do not set the id.
+   The id is then extracted from the passed JWT token.
+
+-- 2. where 'oidc' comes from: the configured provider's NAME, from the startup log --
+   $ docker logs lakekeeper | grep 'OIDC authenticator'
+   Creating OIDC authenticator for oidc (http://keycloak:8080/realms/iceberg)
+   ^^^^ that token is the <idp-identifier>. The compose file sets only
+        LAKEKEEPER__OPENID_PROVIDER_URI, i.e. the legacy single-provider form,
+        which Lakekeeper names 'oidc'. It is deployment config, not a constant.
+
+-- 3. the service account provisioned ITSELF from its token; what id did it get? --
+   token sub  = a2d094e0-cab8-47df-bcad-39e0c71c60d6
+   lakekeeper id = oidc~a2d094e0-cab8-47df-bcad-39e0c71c60d6
+   -> id == <idp-identifier> ~ <JWT sub>. The sub is Keycloak's opaque UUID,
+      NOT the username and NOT the email.
+
+-- 4. can a user be provisioned with an UN-prefixed id? --
+   POST /user id=alice@corp               -> HTTP 422 Failed to deserialize the JSON body into the target type: id: Invalid user id: `alice@corp`. Expected format: `<idp_id>~<user-id>` at line 1 column 18
+   POST /user id=oidc~alice@corp          -> HTTP 200 {"name":"probe oidc~alice@corp","email":null,"id":"oidc~alice@corp","user-type":"human","last-updated-with":"create-endpoint","created-at":"2026-09-17T10:31:47.
+   POST /user id=nosuchidp~alice@corp     -> HTTP 200 {"name":"probe nosuchidp~alice@corp","email":null,"id":"nosuchidp~alice@corp","user-type":"human","last-updated-with":"create-endpoint","created-at":"2026-09-17
+
+-- 5. users now known to Lakekeeper --
+   oidc~a2d094e0-cab8-47df-bcad-39e0c71c60d6   (service-account-lakehouse)
+   oidc~alice@corp   (probe oidc~alice@corp)
+   nosuchidp~alice@corp   (probe nosuchidp~alice@corp)
+
+-- 6. can the adapter LOOK UP the canonical id instead of building it? --
+   POST /search/user {"search":"alice"}
+     id=oidc~alice@corp  name=probe oidc~alice@corp
+     id=nosuchidp~alice@corp  name=probe nosuchidp~alice@corp
+     id=oidc~a2d094e0-cab8-47df-bcad-39e0c71c60d6  name=service-account-lakehouse
+
+-- 7. grant a PROJECT permission to oidc~alice@corp, then check both id forms --
+   BEFORE the grant, identity.user=oidc~alice@corp -> {"results":[{"allowed":false}]}
+   POST /permissions/project/assignments {create -> oidc~alice@corp} -> HTTP 204 
+   batch-check project/create_warehouse  identity.user=oidc~alice@corp            -> HTTP 200 {"results":[{"allowed":true}]}
+   batch-check project/create_warehouse  identity.user=alice@corp                 -> HTTP 422 Failed to deserialize the JSON body into the target type: checks[0].identity.user: Invalid user id: `alice@corp`. Expected format: `<idp_id>~<user-id>
+   batch-check project/create_warehouse  identity.user=oidc~alice@corp            -> HTTP 200 {"results":[{"allowed":true}]}
+   batch-check project/create_warehouse  identity.user=kubernetes~alice@corp      -> HTTP 200 {"results":[{"allowed":false}]}
+   batch-check project/create_warehouse  identity.user=oidc~nobody@corp           -> HTTP 200 {"results":[{"allowed":false}]}
+
+-- conclusion --
+The id is one opaque string in Lakekeeper's own namespace: "<idp-identifier>~<JWT sub>".
+The prefix is NOT derivable from anything the adapter knows -- it is the name of the
+OIDC provider as Lakekeeper was configured with it -- and the suffix must equal the
+IdP subject, which for Keycloak is an opaque UUID rather than a username or email.
+So neither half of it can be guessed from the Exasol user name.

@@ -32,7 +32,9 @@ answers two follow-ups. A Lakekeeper per-table grant *is* enforceable on another
 verified live, and it fails closed -- but only on an OpenFGA-backed deployment, and its vocabulary
 stops at the table, so it is a **gate in front of** row filtering, not a replacement for it. And the
 Exasol user name is not the Lakekeeper/OPA subject, so a `USER_MAPPING` property is needed;
-`EXA_DBA_USERS.OPENID_SUBJECT` is not usable, so the property is the only path.
+`EXA_DBA_USERS.OPENID_SUBJECT` is not usable, so the property is the only path -- and it must map to
+the **IdP subject**, with Lakekeeper's `<idp-id>~` prefix added by the Lakekeeper client, because
+Lakekeeper rejects an unprefixed id (HTTP 422) while OPA must not see the prefix at all.
 [§12](#12-end-to-end-flow) has the end-to-end sequence diagrams for both flows.
 
 So: the feature is real, OPA is the right tool, and **Rego is never translated**. It is evaluated;
@@ -61,6 +63,7 @@ scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
 scripts/90-idp-auth.sh                 # pass 3: shared IdP; needs Keycloak, see header
 scripts/95-per-user-data.sh            # per-user permissions as plain OPA data
 scripts/97-lakekeeper-table-grants.sh  # per-table grants; needs the OpenFGA overlay, see header
+scripts/98-user-id-namespace.sh        # what the Lakekeeper user id is made of; no minio needed
 ```
 
 | Evidence | What it holds |
@@ -78,6 +81,7 @@ scripts/97-lakekeeper-table-grants.sh  # per-table grants; needs the OpenFGA ove
 | `evidence/10-idp-auth.txt` | Live Keycloak: OPA gated on the catalog's own token, groups from the IdP |
 | `evidence/11-per-user-data.txt` | Per-user permissions as an OPA data document, no groups, no HTTP |
 | `evidence/12-lakekeeper-table-grants.txt` | Live Lakekeeper+OpenFGA: a per-table grant asked on another user's behalf |
+| `evidence/13-user-id-namespace.txt` | Live: what Lakekeeper's `<idp-id>~<sub>` user id is made of, and what it rejects |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
 own feature set, `crates/lakehouse-engine/Cargo.toml:32`), Exasol 2025.1.16, Trino `master` as of
@@ -998,9 +1002,10 @@ in the shared IdP, so groups are available without any per-user credential
    Lakekeeper: one `batch-check` per table on the querying user's behalf, refusing the query on
    `allowed: false` ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)). It shares one
    permission model with the catalog but stops at the table, so it does not replace step 3.
-10. **Resolve the subject before either call.** `USER_MAPPING` overrides, with
-    `EXA_DBA_USERS.OPENID_SUBJECT` as the default; prepend `oidc~` for Lakekeeper only; refuse when a
-    mapping is configured and missing ([§11](#11-the-user_mapping-join-key)).
+10. **Resolve the subject before either call.** `USER_MAPPING` maps the Exasol user to the **IdP
+    subject**; the Lakekeeper client prepends `<LAKEKEEPER_IDP_ID>~` (its own separate property) and
+    OPA gets the bare subject; an unmapped user refuses the query
+    ([§11](#11-the-user_mapping-join-key)).
 
 **Do not build:** anything that accepts a SQL string from a policy. Sections 1 to 6 are the evidence
 for why.
@@ -1095,34 +1100,107 @@ if the gate needs policy logic of its own.
 
 ## 11. The `USER_MAPPING` join key
 
-The Exasol user name and the Lakekeeper/OPA subject are **not** the same string, and this spike's
-own evidence shows the shape of the gap:
+You spotted a real problem, and the answer is that **`oidc~` must not go in the mapping** — the two
+consumers want different strings, and neither wants the Exasol user name. Evidence:
+`evidence/13-user-id-namespace.txt`, `scripts/98-user-id-namespace.sh`.
+
+### 11.1 What each side actually requires
+
+**Lakekeeper** requires an id in *its own* namespace. Its OpenAPI says so (`CreateUserRequest.id`):
+
+> The id must be identical to the subject in JWT tokens, prefixed with `` `<idp-identifier>~` ``.
+> For example: `oidc~1234567890` for OIDC users or `kubernetes~1234567890` for Kubernetes users.
+
+Unprefixed is rejected, at both the provisioning and the check endpoint:
 
 ```
-Exasol      current_user -> "ALICE"                    (uppercase, Exasol namespace)
-Lakekeeper  user id      -> "oidc~opa-spike-alice"     (oidc~ + IdP subject; observed live, evidence/12)
-Keycloak    sub          -> "fc5dc328-3594-..."        (opaque UUID; evidence/10)
+POST /user            id=alice@corp        -> HTTP 422 Invalid user id: `alice@corp`.
+                                                       Expected format: `<idp_id>~<user-id>`
+batch-check  identity.user=alice@corp      -> HTTP 422 (same message)
+batch-check  identity.user=oidc~alice@corp -> HTTP 200 {"allowed":true}
+batch-check  identity.user=kubernetes~alice@corp -> HTTP 200 {"allowed":false}
 ```
 
-So a `USER_MAPPING` virtual-schema property is needed, as proposed. Three observations from the
-evidence that bear on its design:
+**OPA** requires nothing in particular. `input.user` is whatever the policy is keyed on, which is our
+choice. So there is no conflict to resolve — there is a mapping that feeds two renderings.
 
-1. **`USER_MAPPING` is the only path — there is no free join key to fall back on.**
-   `EXA_DBA_USERS.OPENID_SUBJECT` is not usable (ruled out by the team), so the property is the
-   primary mechanism and not an override. The adapter has `ctx.current_user()` and nothing else about
-   the querying identity.
-2. **`oidc~` is Lakekeeper's own prefix**, not part of the subject. Whatever the property maps to,
-   the Lakekeeper-facing call has to prepend it; the OPA-facing call must not.
-3. **Failing to map must deny.** An unmapped user has no permissions entry, which in the
-   partial-evaluation design is `undefined` → DENY ([§8](#8-the-mechanism-pass-1-missed-opa-partial-evaluation)),
-   and in `batch-check` is `allowed: false` (the `no-such-user-at-all` control above). Both
-   mechanisms already fail closed on an unknown subject — so the mapping layer must not invent a
-   fallback identity, and must refuse rather than pass the raw Exasol name through when a mapping is
-   configured but missing.
+### 11.2 Where `oidc` comes from
 
-**Not tested:** the property itself.
+It is the **name of the configured OIDC provider**, from Lakekeeper's own startup log:
 
----
+```
+Creating OIDC authenticator for oidc (http://keycloak:8080/realms/iceberg)
+                                ^^^^
+```
+
+`oidc` because `docker-compose.lakekeeper.yml` sets only `LAKEKEEPER__OPENID_PROVIDER_URI`, the legacy
+single-provider form. Lakekeeper 0.13 supports several named providers, so on another deployment the
+prefix is something else. And Lakekeeper does **not** validate it — `nosuchidp~alice@corp` was
+accepted as a user id (HTTP 200) and simply denied on every check. It is an opaque namespace string,
+so the adapter cannot derive it and must not guess it.
+
+The suffix is the **JWT `sub`**, which for Keycloak is an opaque UUID. The service account proves it —
+it self-provisioned from its own token and got:
+
+```
+token sub     = a2d094e0-cab8-47df-bcad-39e0c71c60d6
+lakekeeper id = oidc~a2d094e0-cab8-47df-bcad-39e0c71c60d6
+```
+
+So **neither half** of the Lakekeeper id is derivable from `"ALICE"`.
+
+### 11.3 The design that does not break flow B
+
+Map to the **IdP subject** and let each call site namespace it. One property, two renderings:
+
+```
+USER_MAPPING        ALICE -> "alice@corp"          (the IdP subject)
+LAKEKEEPER_IDP_ID   "oidc"                         (separate property, default "oidc")
+
+  -> OPA        input.user   = "alice@corp"
+  -> Lakekeeper identity.user = "oidc~" + "alice@corp"   = "oidc~alice@corp"
+```
+
+Flow B is untouched because the adapter never hands a Lakekeeper-shaped id to OPA. The `~` prefix is
+Lakekeeper client code, not mapping data. Putting `oidc~alice@corp` in `USER_MAPPING` instead would
+work only if the adapter then *strips* the prefix for OPA, which is the same coupling written
+backwards and breaks the moment a deployment names its provider differently.
+
+Two alternatives, both real:
+
+**Look the id up instead of building it.** `POST /management/v1/search/user` returns the canonical id,
+verified:
+
+```
+POST /search/user {"search":"alice"}
+  id=oidc~alice@corp             name=probe oidc~alice@corp
+  id=nosuchidp~alice@corp        name=probe nosuchidp~alice@corp
+```
+
+This removes the prefix property entirely, at the cost of one extra call per query and of trusting a
+*fuzzy* search — note it returned two different users for one term, so the adapter would have to
+require exactly one exact match and refuse otherwise. Workable, more moving parts.
+
+**Provision Lakekeeper users with human-readable ids.** `oidc~alice@corp` was accepted even though no
+token will ever carry `alice@corp` as its `sub`, because Lakekeeper does not check the suffix against
+the IdP either. That makes `USER_MAPPING` administrable (`ALICE -> alice@corp` rather than
+`ALICE -> a2d094e0-...`) and is sound *in this design*, where the querying user never authenticates
+to Lakekeeper at all. It stops being sound if the same Lakekeeper also serves Spark or Trino sessions
+where alice logs in directly — then her real `sub` would be a *different* user with different grants.
+Worth deciding explicitly rather than by accident.
+
+### 11.4 Rules for the property
+
+1. **Map to the IdP subject, not to a Lakekeeper id.** Prefixing is the Lakekeeper client's job.
+2. **The prefix is configuration** (`LAKEKEEPER_IDP_ID`, default `oidc`), because it is Lakekeeper's
+   provider name and nothing else determines it.
+3. **No mapping entry → refuse the query.** Both back ends already fail closed on an unknown subject
+   (`oidc~nobody@corp` → `allowed:false`; OPA → `undefined` → DENY), but the adapter must not fall
+   back to passing `"ALICE"` through, because an IdP *could* have a user literally named `ALICE`.
+4. **Exasol offers no join key.** `ctx.current_user()` is all the adapter has;
+   `EXA_DBA_USERS.OPENID_SUBJECT` is ruled out. The property is the only path.
+
+**Not tested:** the property itself, and a Lakekeeper with more than one named OIDC provider.
 
 ## 12. End-to-end flow
 
@@ -1158,11 +1236,11 @@ sequenceDiagram
     U->>EX: SELECT ... FROM LHVS.ORDERS
     Note over U,EX: the human authenticates HERE and nowhere else
     EX->>VS: pushdown request (ctx.current_user() = "ALICE")
-    VS->>VS: USER_MAPPING: "ALICE" -> "alice@corp"
+    VS->>VS: USER_MAPPING: "ALICE" -> "alice@corp"  (the IdP subject)
     Note over VS: no mapping configured for ALICE -> refuse the query
     VS->>IDP: POST /token (client_credentials, client "lakehouse")
     IDP-->>VS: service-account access_token
-    VS->>LK: POST /management/v1/action/batch-check<br/>Authorization: Bearer <service token><br/>checks: [ORDERS, read_data]<br/>identity: {user: "oidc~alice@corp"}
+    VS->>LK: POST /management/v1/action/batch-check<br/>Authorization: Bearer <service token><br/>checks: [ORDERS, read_data]<br/>identity: {user: LAKEKEEPER_IDP_ID + "~" + subject}<br/>= "oidc~alice@corp"
     LK->>FGA: check(user, select, table)
     FGA-->>LK: allowed / not allowed
     LK-->>VS: {"results": [{"allowed": true}]}
@@ -1191,7 +1269,7 @@ sequenceDiagram
     Note over OPA: per-user permissions arrive out of band<br/>as a bundle, cached in OPA's `data`
     VS->>LK: Iceberg REST loadTable + plan files (existing behaviour)
     LK-->>VS: snapshot, file list, vended storage credentials
-    VS->>OPA: POST /v1/compile<br/>Authorization: Bearer <same service token><br/>query: data.filtering.allow<br/>input: {user: "alice@corp", table: "ORDERS"}<br/>unknowns: ["input.row"]
+    VS->>OPA: POST /v1/compile<br/>Authorization: Bearer <same service token><br/>query: data.filtering.allow<br/>input: {user: subject, table: "ORDERS"}<br/>= {user: "alice@corp", ...} -- NO oidc~ prefix<br/>unknowns: ["input.row"]
     OPA->>IDP: GET /certs (JWKS, cached 1 h)
     IDP-->>OPA: JWKS
     Note over OPA: system.authz verifies iss / aud / azp<br/>-> 401 otherwise
