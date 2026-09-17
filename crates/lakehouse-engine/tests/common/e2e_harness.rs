@@ -343,6 +343,31 @@ pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
         .join(" ")
 }
 
+/// Returns the `PUSHDOWN_SQL` cell of `EXPLAIN VIRTUAL`'s single 4-cell row — the complete,
+/// directly submittable adapter-generated statement, unlike `explain_virtual_sql`'s joined blob.
+pub fn isolated_pushdown_statement(conn: &mut ExaConn, query_sql: &str) -> String {
+    const PUSHDOWN_SQL_COLUMN: usize = 1;
+    let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let cols = conn.fetch_result_columns(result_set);
+    if cols.len() != 4 || cols[0].len() != 1 {
+        panic!(
+            "EXPLAIN VIRTUAL returned an unexpected layout ({} cols, {} rows) for:\n{query_sql}",
+            cols.len(),
+            cols.first().map(Vec::len).unwrap_or(0)
+        );
+    }
+    cols[PUSHDOWN_SQL_COLUMN][0]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!(
+                "EXPLAIN VIRTUAL PUSHDOWN_SQL cell was not a string for:\n{query_sql}\ngot: {:?}",
+                cols[PUSHDOWN_SQL_COLUMN][0]
+            )
+        })
+        .to_string()
+}
+
 /// Parse a JSON result value as `f64`, accepting both numeric and
 /// string-encoded numbers (Exasol renders large DECIMALs as strings).
 pub fn parse_numeric(v: &serde_json::Value) -> f64 {

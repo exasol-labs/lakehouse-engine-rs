@@ -172,8 +172,12 @@ creation, and the smoke test.
 
 Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. The
 following example is a complete local setup with MinIO and an Iceberg REST catalog, run as a DBA.
-A non-DBA needs `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts before
-`CREATE VIRTUAL SCHEMA` — see [Security](security.md).
+A non-DBA needs `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts, plus
+`EXECUTE ON SCRIPT` on all three of `LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`, and
+`LAKEHOUSE_DISTRIBUTE_FILES`, before `CREATE VIRTUAL SCHEMA` — see [Security](security.md).
+Re-running the installer re-creates all three scripts (`CREATE OR REPLACE SCRIPT`), which drops
+every one of those `EXECUTE ON SCRIPT` grants along with the connection-access grant; re-issue all
+of them afterward.
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
