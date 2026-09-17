@@ -27,12 +27,13 @@ DataFusion predicate, and the compiled output plans, returns the correct rows, a
 answers sharded and single-node. The AST also distinguishes allow-all from deny-all from
 filter, which is exactly the fail-open hole pass 1 found and could not close.
 
-**Pass 4** ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant), [§11](#11-the-user_mapping-join-key))
+**Pass 4** ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)-[§12](#12-end-to-end-flow))
 answers two follow-ups. A Lakekeeper per-table grant *is* enforceable on another user's behalf --
 verified live, and it fails closed -- but only on an OpenFGA-backed deployment, and its vocabulary
 stops at the table, so it is a **gate in front of** row filtering, not a replacement for it. And the
 Exasol user name is not the Lakekeeper/OPA subject, so a `USER_MAPPING` property is needed;
-`EXA_DBA_USERS.OPENID_SUBJECT` is the natural default for an OIDC-authenticated user.
+`EXA_DBA_USERS.OPENID_SUBJECT` is not usable, so the property is the only path.
+[§12](#12-end-to-end-flow) has the end-to-end sequence diagrams for both flows.
 
 So: the feature is real, OPA is the right tool, and **Rego is never translated**. It is evaluated;
 what gets translated is the expression tree OPA hands back.
@@ -1106,11 +1107,10 @@ Keycloak    sub          -> "fc5dc328-3594-..."        (opaque UUID; evidence/10
 So a `USER_MAPPING` virtual-schema property is needed, as proposed. Three observations from the
 evidence that bear on its design:
 
-1. **Exasol already stores the IdP identity.** `EXA_DBA_USERS` carries `OPENID_SUBJECT`,
-   `DISTINGUISHED_NAME` and `KERBEROS_PRINCIPAL` (`evidence/06`). For an OIDC-authenticated Exasol
-   user, `OPENID_SUBJECT` *is* the join key and no mapping table is needed — the adapter reads it
-   over connect-back. That makes `USER_MAPPING` the override for the cases that fall outside it
-   (locally-authenticated users, a differently-keyed IdP, test setups), not the primary path.
+1. **`USER_MAPPING` is the only path — there is no free join key to fall back on.**
+   `EXA_DBA_USERS.OPENID_SUBJECT` is not usable (ruled out by the team), so the property is the
+   primary mechanism and not an override. The adapter has `ctx.current_user()` and nothing else about
+   the querying identity.
 2. **`oidc~` is Lakekeeper's own prefix**, not part of the subject. Whatever the property maps to,
    the Lakekeeper-facing call has to prepend it; the OPA-facing call must not.
 3. **Failing to map must deny.** An unmapped user has no permissions entry, which in the
@@ -1120,6 +1120,135 @@ evidence that bear on its design:
    fallback identity, and must refuse rather than pass the raw Exasol name through when a mapping is
    configured but missing.
 
-**Not tested:** the property itself, or reading `OPENID_SUBJECT` for a live OIDC-authenticated Exasol
-user (the spike's Exasol users are locally authenticated, so the column is NULL for them —
-`evidence/06`).
+**Not tested:** the property itself.
+
+---
+
+## 12. End-to-end flow
+
+Six systems, plus two optional ones. Everything in both flows happens **at plan time, inside the VS
+adapter**. The scan UDF never talks to OPA or Lakekeeper.
+
+| System | Role | Does it ever see a per-user credential? |
+|---|---|---|
+| **Exasol** | authenticates the human; runs the pushed SQL and the scan UDF | yes — and only here |
+| **VS adapter** (in Exasol) | maps the user, asks both gates, injects the filter | no |
+| **Keycloak** (IdP) | issues the engine's *service-account* token | no |
+| **Lakekeeper** | Iceberg REST catalog + table-grant gate | no |
+| **OpenFGA** | Lakekeeper's grant store; never called directly by us | no |
+| **OPA** | row-filter decision via the Compile API | no |
+| **Object storage** | Parquet | no |
+| *Bundle server* (optional) | serves OPA's per-user permissions document | no |
+
+The querying user **never authenticates to the IdP, Lakekeeper or OPA**. Their name travels as *data*
+in a request body signed by the engine's own service account. That is the property that lets this
+ship without per-user catalog identity.
+
+### 12.1 Flow A — table access gate
+
+```mermaid
+sequenceDiagram
+    actor U as Analyst (ALICE)
+    participant EX as Exasol engine
+    participant VS as VS adapter
+    participant IDP as Keycloak (IdP)
+    participant LK as Lakekeeper
+    participant FGA as OpenFGA
+
+    U->>EX: SELECT ... FROM LHVS.ORDERS
+    Note over U,EX: the human authenticates HERE and nowhere else
+    EX->>VS: pushdown request (ctx.current_user() = "ALICE")
+    VS->>VS: USER_MAPPING: "ALICE" -> "alice@corp"
+    Note over VS: no mapping configured for ALICE -> refuse the query
+    VS->>IDP: POST /token (client_credentials, client "lakehouse")
+    IDP-->>VS: service-account access_token
+    VS->>LK: POST /management/v1/action/batch-check<br/>Authorization: Bearer <service token><br/>checks: [ORDERS, read_data]<br/>identity: {user: "oidc~alice@corp"}
+    LK->>FGA: check(user, select, table)
+    FGA-->>LK: allowed / not allowed
+    LK-->>VS: {"results": [{"allowed": true}]}
+    Note over VS: allowed:false -> refuse the query,<br/>NEVER an empty result set
+```
+
+One `batch-check` per table in the query; the request is a batch, so a multi-table query is still one
+round trip. Verified in `evidence/12`. Requires an OpenFGA-backed Lakekeeper
+([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)); on `allow-all` this gate is a no-op that
+answers `true` for everyone, so it must be *configured off* rather than silently trusted.
+
+### 12.2 Flow B — row-level security
+
+Continues from A, same adapter invocation, same token.
+
+```mermaid
+sequenceDiagram
+    participant VS as VS adapter
+    participant LK as Lakekeeper
+    participant OPA as OPA
+    participant IDP as Keycloak (IdP)
+    participant EX as Exasol engine
+    participant UDF as scan UDF (DataFusion)
+    participant S3 as Object storage
+
+    Note over OPA: per-user permissions arrive out of band<br/>as a bundle, cached in OPA's `data`
+    VS->>LK: Iceberg REST loadTable + plan files (existing behaviour)
+    LK-->>VS: snapshot, file list, vended storage credentials
+    VS->>OPA: POST /v1/compile<br/>Authorization: Bearer <same service token><br/>query: data.filtering.allow<br/>input: {user: "alice@corp", table: "ORDERS"}<br/>unknowns: ["input.row"]
+    OPA->>IDP: GET /certs (JWKS, cached 1 h)
+    IDP-->>OPA: JWKS
+    Note over OPA: system.authz verifies iss / aud / azp<br/>-> 401 otherwise
+    OPA-->>VS: residual AST
+    Note over VS: {} -> DENY, refuse the query<br/>{"queries":[[]]} -> allow all, filter = None<br/>otherwise -> compile AST to a predicate<br/>Unsupported -> refuse the query
+    VS->>VS: CommonScanSpec.filter =<br/>"REGION" IN ('EU','UK') AND "CLASSIFICATION" <> 'SECRET'
+    VS-->>EX: pushdown SQL carrying the scan spec, GROUP BY shard_key
+    EX->>UDF: one invocation per shard (assigned files + filter)
+    UDF->>S3: ranged Parquet reads, predicate + projection pushed down
+    S3-->>UDF: row groups
+    UDF-->>EX: emit_batch — permitted rows only
+    Note over EX: aggregates/joins compute over filtered rows<br/>because the filter is INSIDE the scan
+```
+
+One `/v1/compile` per table, 0.2–1.2 ms ([§9.4](#94-cost-of-the-idp-round-trips)). The filter goes in
+at the scan, not on top of it, which is why aggregation stays correct
+([§4](#4-composition-with-pushdown)).
+
+### 12.3 Variant — OPA resolves groups from the IdP
+
+Only if permissions must stay authoritative in an external system instead of being published to OPA
+([§9.5](#95-four-places-the-users-permissions-can-live-and-which-to-pick) option D). Replaces the
+bundle note in B:
+
+```mermaid
+sequenceDiagram
+    participant VS as VS adapter
+    participant OPA as OPA
+    participant IDP as Keycloak (IdP)
+
+    VS->>OPA: POST /v1/compile<br/>options: {nondeterministicBuiltins: true}
+    Note over OPA: WITHOUT that option http.send is skipped,<br/>the residual is untranslatable AND leaks client_secret
+    OPA->>IDP: POST /token (OPA's OWN client, cached 150 s)
+    IDP-->>OPA: token
+    OPA->>IDP: GET /admin/realms/iceberg/users?username=alice@corp
+    IDP-->>OPA: user id
+    OPA->>IDP: GET /admin/realms/iceberg/users/{id}/groups
+    IDP-->>OPA: ["analyst", "eu_staff"]
+    OPA-->>VS: residual AST keyed on those groups
+```
+
+Adds ~1 ms warm / ~19 ms cold ([§9.4](#94-cost-of-the-idp-round-trips)) and needs a second
+confidential client ([§9.7](#97-design-note-worth-flagging)). Verified in `evidence/10`.
+
+### 12.4 Failure handling, both flows
+
+| Condition | Must do |
+|---|---|
+| `USER_MAPPING` has no entry for the Exasol user | refuse |
+| IdP token request fails | refuse |
+| `batch-check` returns `allowed: false` | refuse |
+| `batch-check` unreachable or non-200 | refuse |
+| OPA returns `{}` (unsatisfiable) | refuse |
+| OPA returns an AST the compiler cannot handle | refuse |
+| OPA unreachable, 401, or times out | refuse |
+| OPA returns `{"queries": [[]]}` | allow, `filter = None` |
+
+Every failure is a refused query, never a query without a filter and never a silently empty result.
+[§5](#5-failure-modes) is why this table is stated so bluntly: the Trino-style endpoint made four of
+these rows answer "unrestricted" instead.
