@@ -70,6 +70,22 @@ row NOBODY ORDERS_PUBLIC
 	echo "   an empty result set vs a refused query. Executed in evidence/09 as"
 	echo "   tbl-carol-orders_public (FILTER, 0 rows) vs tbl-alice-orders_secret (DENY ALL)."
 	echo
+	echo "-- what a WRONG query path does (is OPA_QUERY safe to get wrong?) --"
+} >>"$OUT"
+for q in 'data.gate.allow == true' 'data.gate.allow' 'data.gate.alow == true' 'data.typo.allow == true' 'data.gate'; do
+	printf '   %-26s -> ' "$q" >>"$OUT"
+	curl -sS -o /tmp/opa_q.out -w 'HTTP %{http_code} ' -X POST "http://127.0.0.1:$PORT/v1/compile" \
+		-H 'Content-Type: application/json' \
+		-d "$(jq -nc --arg q "$q" '{query:$q, input:{user:"ALICE",table:"ORDERS_PUBLIC"}, unknowns:["input.row"]}')" >>"$OUT"
+	head -c 96 /tmp/opa_q.out >>"$OUT"
+	echo >>"$OUT"
+done
+{
+	echo "   A mistyped RULE (alow) and a wrong PACKAGE (typo) both return {} = DENY:"
+	echo "   every misconfiguration of the path fails CLOSED, never open. A bare"
+	echo "   package name yields a residual with no operator, which the translation"
+	echo "   layer refuses as Unsupported -- also closed."
+	echo
 	echo "-- latency, 100 calls (ALICE / ORDERS_PUBLIC) --"
 } >>"$OUT"
 : >/tmp/opa_gate.txt

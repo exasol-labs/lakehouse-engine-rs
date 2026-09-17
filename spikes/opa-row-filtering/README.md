@@ -1008,8 +1008,8 @@ in the shared IdP, so groups are available without any per-user credential
 10. **Map the user with `USER_MAPPING`** to the key the policy is keyed on, and refuse when there is
     no entry ([§11](#11-the-user_mapping-property)).
 11. **Put the OPA address in an Exasol CONNECTION** named by an `OPA_CONNECTION` property, mirroring
-    `CATALOG_CONNECTION`; the policy path, the user mapping and the timeout stay plain properties
-    ([§14](#14-where-the-opa-server-address-belongs)).
+    `CATALOG_CONNECTION`; the policy path (defaulted, not required), the user mapping and the timeout
+    stay plain properties ([§14](#14-where-the-opa-server-address-belongs)).
 
 **Do not build:** anything that accepts a SQL string from a policy. Sections 1 to 6 are the evidence
 for why.
@@ -1345,7 +1345,7 @@ CREATE CONNECTION LAKEHOUSE_OPA
 CREATE VIRTUAL SCHEMA lhvs USING ... WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
   OPA_CONNECTION     = 'LAKEHOUSE_OPA'
-  OPA_QUERY          = 'data.gate.allow'             -- non-secret, plain property
+  OPA_QUERY          = 'data.gate.allow'             -- optional; defaults to data.lakehouse.allow
   USER_MAPPING       = '...';                        -- non-secret, plain property
 ```
 
@@ -1396,10 +1396,45 @@ What decided it:
 | Setting | Where | Why |
 |---|---|---|
 | `OPA_CONNECTION` | property naming a CONNECTION | the address, plus any credential |
-| `OPA_QUERY` | property | the Rego query path, e.g. `data.gate.allow`; not a secret |
+| `OPA_QUERY` | property, **with a default** | the Rego query path; see [§14.3](#143-do-we-actually-need-opa_query) |
 | `USER_MAPPING` | property | the Exasol-user-to-policy-key map ([§11](#11-the-user_mapping-property)) |
 | `OPA_TIMEOUT_MS` | property | tuning, like the existing `S3_MAX_CONNECTIONS` |
 | plaintext transport | reuse `ALLOW_HTTP` | an `http://` OPA call puts the user name and the decision on the wire; it needs the same opt-in the catalog already has |
+
+### 14.3 Do we actually need `OPA_QUERY`?
+
+**Something has to name a query — OPA cannot tell us the path — but it does not have to be a required
+property.** Give it a default of `data.lakehouse.allow` and most deployments never set it.
+
+Keep it configurable for one reason: one OPA instance can serve several virtual schemas with
+different policies, and a fixed entry point forces either one OPA per policy or a dispatch rule
+inside the policy. Prior art agrees — Trino's plugin configures the path (`opa.policy.uri`), and its
+row-filter and column-mask endpoints are separate settings again.
+
+The alternative is defensible: hardcode one entry point and pass the schema name in `input`, letting
+the policy dispatch. That keeps the engine's contract to exactly one path and puts multi-tenancy
+where the rules already are. Either way the policy author is already bound by a contract far tighter
+than the package name — `input.user`, `input.table`, `input.row` declared unknown, no `default` rule
+on the filtering rule, and an operator allowlist ([§9.8](#98-verdict-and-build-list) step 5).
+
+**Getting the path wrong is safe**, measured (`evidence/14`, bottom):
+
+```
+data.gate.allow == true    -> HTTP 200 {"result":{"queries":[[...]]}}    (correct)
+data.gate.allow            -> HTTP 200 {"result":{"queries":[[...]]}}    (the `== true` is optional)
+data.gate.alow == true     -> HTTP 200 {"result":{}}                     mistyped RULE    -> DENY
+data.typo.allow == true    -> HTTP 200 {"result":{}}                     wrong PACKAGE    -> DENY
+data.gate                  -> HTTP 200 residual with no operator         bare package -> Unsupported
+```
+
+Every misconfiguration fails **closed**. That is the opposite of pass 1, where a mistyped policy path
+answered HTTP 200 meaning *unrestricted* ([§5](#5-failure-modes)).
+
+One ops consequence: a typo denies **every** query with no hint why. So the refusal message must name
+the configured query path. The path is not a secret — connection names are already world-readable
+([§14.1](#141-what-decided-it-and-what-did-not)) — unlike the residual itself, which can carry a
+`client_secret` ([§9.3](#93-the-trap-partial-evaluation-skips-httpsend-by-default)) and must never be
+logged.
 
 **Not tested:** none of these properties exist yet; this is a design recommendation grounded in the
 visibility measurements above and in the existing `CATALOG_CONNECTION` code path. Whether the adapter

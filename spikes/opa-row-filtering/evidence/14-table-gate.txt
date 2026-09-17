@@ -70,5 +70,18 @@ NOBODY   ORDERS_PUBLIC   {}                                 DENY -- no rows may 
    an empty result set vs a refused query. Executed in evidence/09 as
    tbl-carol-orders_public (FILTER, 0 rows) vs tbl-alice-orders_secret (DENY ALL).
 
+-- what a WRONG query path does (is OPA_QUERY safe to get wrong?) --
+   data.gate.allow == true    -> HTTP 200 {"result":{"queries":[[{"index":0,"terms":[{"type":"ref","value":[{"type":"var","value":"interna
+   data.gate.allow            -> HTTP 200 {"result":{"queries":[[{"index":0,"terms":[{"type":"ref","value":[{"type":"var","value":"interna
+   data.gate.alow == true     -> HTTP 200 {"result":{}}
+
+   data.typo.allow == true    -> HTTP 200 {"result":{}}
+
+   data.gate                  -> HTTP 200 {"result":{"queries":[[{"index":0,"terms":{"type":"ref","value":[{"type":"var","value":"data"},{
+   A mistyped RULE (alow) and a wrong PACKAGE (typo) both return {} = DENY:
+   every misconfiguration of the path fails CLOSED, never open. A bare
+   package name yields a residual with no operator, which the translation
+   layer refuses as Unsupported -- also closed.
+
 -- latency, 100 calls (ALICE / ORDERS_PUBLIC) --
-  median = 0.601 ms   p95 = 0.804 ms   max = 3.068 ms
+  median = 0.669 ms   p95 = 0.932 ms   max = 2.479 ms
