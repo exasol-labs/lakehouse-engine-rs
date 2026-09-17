@@ -17,6 +17,13 @@ GRANT ACCESS ON CONNECTION <conn> FOR SCRIPT <schema>.LAKEHOUSE_SCAN   TO <vs-ow
 
 The grantee is the **virtual schema's OWNER**, not the querying user. Run these **before** `CREATE VIRTUAL SCHEMA`. A DBA owner (`SYS`) needs none of this. `CREATE OR REPLACE CONNECTION` and `CREATE OR REPLACE SCRIPT` both drop the grant — re-issue after re-running the installer. `ALTER CONNECTION` preserves grants.
 
+End users of the virtual schema hold none of the above. `GRANT CREATE SESSION` plus `GRANT SELECT
+ON SCHEMA <vs>` is the entire grant set a querying user ever needs — no `EXECUTE ON SCRIPT`, no
+`GRANT ACCESS ON CONNECTION`, no role membership. Re-running the installer never touches a reader's
+grants: `CREATE OR REPLACE SCRIPT` and `CREATE OR REPLACE CONNECTION` only drop privileges held on
+the scripts and the CONNECTION, and a reader holds none of those. The re-grant burden described
+above falls entirely on the VS owner/operator.
+
 `EXPLAIN VIRTUAL` and pushdown-path errors carry the pushdown SQL verbatim — credential VALUES must never appear in it. See [Plan visibility versus plan execution](#plan-visibility-versus-plan-execution) for what else that plan text exposes and why reading it is safe while running it is not.
 
 ## Plan visibility versus plan execution

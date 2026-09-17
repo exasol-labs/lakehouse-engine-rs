@@ -207,6 +207,9 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
   and more) are in [Tuning](tuning.md).
 - **Before granting other users access**, read [Security](security.md) — both scripts need a
   CONNECTION grant held by the VS owner, and `GRANT SELECT ON SCHEMA` is the real auth boundary.
+  An end user needs only `GRANT CREATE SESSION` plus `GRANT SELECT ON SCHEMA <vs>` — nothing else,
+  and re-running this installer never touches that grant. Only the owner-held `EXECUTE ON SCRIPT`
+  and `GRANT ACCESS ON CONNECTION` grants above need re-issuing after a re-install.
 
 ## Query
 
