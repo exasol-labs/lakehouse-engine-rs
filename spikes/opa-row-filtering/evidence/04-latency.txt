@@ -1,0 +1,26 @@
+### host: Linux 6.12.107+deb13-cloud-amd64 x86_64
+### OPA:  Version: 1.20.2  (loopback, --server, policies from disk)
+### N  =  300 sequential POSTs to /v1/data/trino/rowFilters
+
+single-call round trip, ms (includes one fresh curl process per call):
+  n      = 300
+  min    = 0.422
+  median = 0.556
+  p95    = 0.968
+  p99    = 1.845
+  max    = 2.617
+  mean   = 0.632
+
+same N calls in ONE curl process (HTTP keep-alive, no per-call fork):
+  n      = 300
+  min    = 0.141
+  median = 0.203
+  p95    = 0.324
+  p99    = 0.852
+  max    = 1.672
+
+  projected plan-time cost for a  1-table query (1 sequential row-filter calls): 0.20 ms
+  projected plan-time cost for a  2-table query (2 sequential row-filter calls): 0.41 ms
+  projected plan-time cost for a  5-table query (5 sequential row-filter calls): 1.02 ms
+  projected plan-time cost for a 10-table query (10 sequential row-filter calls): 2.03 ms
+  projected plan-time cost for a 20-table query (20 sequential row-filter calls): 4.06 ms

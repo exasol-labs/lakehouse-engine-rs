@@ -1,0 +1,65 @@
+### endpoint A: POST http://127.0.0.1:8181/v1/data/trino/columnMask      (one request per column)
+### endpoint B: POST http://127.0.0.1:8181/v1/data/trino/batchColumnMasks (one request per table)
+
+==============================================================
+CASE (per-column) column=c_phone type=VARCHAR
+-------- REQUEST ---------------------------------------------
+{"operation":"GetColumnMask","resource":{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_phone","columnType":"VARCHAR"}}}
+-------- RESPONSE --------------------------------------------
+{"result":{"expression":"NULL"}}
+
+==============================================================
+CASE (per-column) column=c_name type=VARCHAR
+-------- REQUEST ---------------------------------------------
+{"operation":"GetColumnMask","resource":{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_name","columnType":"VARCHAR"}}}
+-------- RESPONSE --------------------------------------------
+{"result":{"expression":"'****' || substring(c_name, -3)"}}
+
+==============================================================
+CASE (per-column) column=c_acctbal type=DECIMAL(15,2)
+-------- REQUEST ---------------------------------------------
+{"operation":"GetColumnMask","resource":{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_acctbal","columnType":"DECIMAL(15,2)"}}}
+-------- RESPONSE --------------------------------------------
+{"result":{"expression":"CASE WHEN c_nationkey = 3 THEN c_acctbal ELSE NULL END"}}
+
+==============================================================
+CASE (per-column) column=c_address type=VARCHAR
+-------- REQUEST ---------------------------------------------
+{"operation":"GetColumnMask","resource":{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_address","columnType":"VARCHAR"}}}
+-------- RESPONSE --------------------------------------------
+{"result":{"expression":"to_hex(sha256(to_utf8(c_address)))"}}
+
+==============================================================
+CASE (per-column) column=c_custkey type=BIGINT
+-------- REQUEST ---------------------------------------------
+{"operation":"GetColumnMask","resource":{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_custkey","columnType":"BIGINT"}}}
+-------- RESPONSE --------------------------------------------
+{}
+
+==============================================================
+CASE (batch) 4 columns in ONE request
+-------- REQUEST ---------------------------------------------
+{"operation":"GetColumnMask","filterResources":[{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_phone","columnType":"VARCHAR"}},{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_name","columnType":"VARCHAR"}},{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_custkey","columnType":"BIGINT"}},{"column":{"catalogName":"lakehouse","schemaName":"sales","tableName":"customer","columnName":"c_address","columnType":"VARCHAR"}}]}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "index": 0,
+      "viewExpression": {
+        "expression": "NULL"
+      }
+    },
+    {
+      "index": 1,
+      "viewExpression": {
+        "expression": "'****' || substring(c_name, -3)"
+      }
+    },
+    {
+      "index": 3,
+      "viewExpression": {
+        "expression": "to_hex(sha256(to_utf8(c_address)))"
+      }
+    }
+  ]
+}

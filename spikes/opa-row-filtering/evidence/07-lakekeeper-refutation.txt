@@ -1,0 +1,78 @@
+### Lakekeeper OPA bridge: does it produce row filters? -- REFUTED
+### fetched 2026-09-17T07:56:06Z from https://github.com/lakekeeper/lakekeeper @ main
+
+-- every .rego file in the repository:
+authz/opa-bridge/policies/configuration.rego
+authz/opa-bridge/policies/lakekeeper/authentication.rego
+authz/opa-bridge/policies/lakekeeper/check.rego
+authz/opa-bridge/policies/lakekeeper/identifiers.rego
+authz/opa-bridge/policies/trino/allow_catalog.rego
+authz/opa-bridge/policies/trino/allow_default_access.rego
+authz/opa-bridge/policies/trino/allow_schema.rego
+authz/opa-bridge/policies/trino/allow_table.rego
+authz/opa-bridge/policies/trino/allow_view.rego
+authz/opa-bridge/policies/trino/check.rego
+authz/opa-bridge/policies/trino/check_batch.rego
+authz/opa-bridge/policies/trino/main.rego
+authz/opa-bridge/policies/trino/user.rego
+authz/opa-bridge/tests/trino/batch_routing_test.rego
+authz/opa-bridge/tests/trino/check_batch_test.rego
+authz/opa-bridge/tests/trino/fast_path_test.rego
+authz/opa-bridge/tests/trino/helpers_test.rego
+authz/opa-bridge/tests/trino/main_test.rego
+
+-- concatenated body of all 18 of them: 2645 lines
+-- search for the row-filter / column-mask contract:
+   $ grep -inE "rowFilters|columnMask|batchColumnMasks|GetRowFilters|GetColumnMask" all-lk.rego
+   (no matches)
+
+-- the Trino operations the bridge DOES decide on (boolean allow only):
+   "AccessCatalog"
+   "CreateCatalog"
+   "CreateMaterializedView"
+   "CreateSchema"
+   "CreateTable"
+   "CreateView"
+   "CreateViewWithSelectFromColumns"
+   "DropCatalog"
+   "DropSchema"
+   "DropTable"
+   "DropView"
+   "ExecuteQuery"
+   "ExecuteTableProcedure"
+   "FilterCatalogs"
+   "FilterColumns"
+   "FilterSchemas"
+   "FilterTables"
+   "FilterViewQueryOwnedBy"
+   "ReadSystemInformation"
+   "RenameTable"
+   "RenameView"
+   "SelectFromColumns"
+   "SetTableProperties"
+   "SetViewComment"
+   "ShowColumns"
+   "ShowCreateSchema"
+   "ShowCreateTable"
+   "ShowSchemas"
+   "ShowTables"
+   "ViewQueryOwnedBy"
+
+-- from authz/opa-bridge/policies/trino/main.rego:
+   package trino
+   
+   import data.configuration
+   
+   # METADATA
+   # entrypoint: true
+   default allow := false
+   
+   default allow_managed := false
+   
+   default allow_unmanaged := false
+   
+
+CONCLUSION: the Lakekeeper bridge maps Trino operations onto Lakekeeper
+CATALOG permissions via /management/v1/action/batch-check and answers with a
+boolean 'allow'. SelectFromColumns / FilterColumns give column-level ALLOW-DENY,
+which is access, not masking. No row filter, no column mask, anywhere.

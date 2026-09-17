@@ -1,0 +1,216 @@
+### Trino OPA plugin contract, verbatim excerpts
+### fetched 2026-09-17T07:55:52Z from https://github.com/trinodb/trino @ master
+### base: plugin/trino-opa/src/main/java/io/trino/plugin/opa/
+
+==============================================================
+schema/OpaViewExpression.java  -- THE response payload type
+==============================================================
+public record OpaViewExpression(String expression, Optional<String> identity)
+{
+    public OpaViewExpression
+    {
+        requireNonNull(expression, "expression is null");
+        requireNonNull(identity, "identity is null");
+    }
+
+    public ViewExpression toTrinoViewExpression(String catalogName, String schemaName)
+    {
+        ViewExpression.Builder builder = ViewExpression.builder()
+                .catalog(catalogName)
+                .schema(schemaName)
+                .expression(expression);
+        identity.ifPresent(builder::identity);
+        return builder.build();
+    }
+}
+
+==============================================================
+schema/OpaRowFiltersQueryResult.java -- row-filter response envelope
+==============================================================
+public record OpaRowFiltersQueryResult(@JsonProperty("decision_id") String decisionId, List<OpaViewExpression> result)
+{
+    public OpaRowFiltersQueryResult
+    {
+        result = ImmutableList.copyOf(requireNonNullElse(result, ImmutableList.of()));
+    }
+}
+
+==============================================================
+schema/OpaColumnMaskQueryResult.java -- single-column-mask envelope
+==============================================================
+public record OpaColumnMaskQueryResult(@JsonProperty("decision_id") String decisionId, Optional<OpaViewExpression> result)
+{
+    public OpaColumnMaskQueryResult
+    {
+        requireNonNull(result, "result is null");
+    }
+}
+
+==============================================================
+schema/OpaBatchColumnMaskQueryResult.java -- batch mask envelope
+==============================================================
+public record OpaBatchColumnMaskQueryResult(@JsonProperty("decision_id") String decisionId, List<OpaBatchColumnMaskQueryResultItem> result)
+{
+    public OpaBatchColumnMaskQueryResult
+    {
+        requireNonNull(result, "result is null");
+    }
+
+    public record OpaBatchColumnMaskQueryResultItem(int index, OpaViewExpression viewExpression) {}
+}
+
+==============================================================
+OpaHighLevelClient.java -- how the row-filter REQUEST is built
+==============================================================
+    public List<OpaViewExpression> getRowFilterExpressionsFromOpa(OpaQueryContext context, CatalogSchemaTableName table)
+    {
+        OpaQueryInput queryInput = new OpaQueryInput(
+                context,
+                OpaQueryInputAction.builder()
+                        .operation("GetRowFilters")
+                        .resource(OpaQueryInputResource.builder().table(new TrinoTable(table)).build())
+                        .build());
+        return opaRowFiltersUri
+                .map(uri -> opaHttpClient.consumeOpaResponse(opaHttpClient.submitOpaRequest(queryInput, uri, rowFiltersQueryResultCodec)).result())
+                .orElse(ImmutableList.of());
+    }
+
+==============================================================
+schema/TrinoTable.java -- NOTE the (CatalogSchemaTableName) ctor:
+  columns and properties are passed as NULL, and @JsonInclude(NON_NULL)
+  drops them. The GetRowFilters request therefore carries NO SCHEMA.
+==============================================================
+public record TrinoTable(
+        String catalogName,
+        String schemaName,
+        String tableName,
+        Set<String> columns,
+        Map<String, Optional<Object>> properties)
+{
+    public TrinoTable
+    {
+        requireNonNull(catalogName, "catalogName is null");
+        requireNonNull(schemaName, "schemaName is null");
+        requireNonNull(tableName, "tableName is null");
+        if (columns != null) {
+            columns = ImmutableSet.copyOf(columns);
+        }
+        if (properties != null) {
+            properties = ImmutableMap.copyOf(properties);
+        }
+    }
+
+    public TrinoTable(CatalogSchemaTableName table)
+    {
+        this(table.getCatalogName(), table.getSchemaTableName().getSchemaName(), table.getSchemaTableName().getTableName());
+    }
+
+    public TrinoTable(String catalogName, String schemaName, String tableName)
+    {
+        this(catalogName, schemaName, tableName, null, null);
+    }
+
+    public TrinoTable withColumns(Set<String> newColumns)
+    {
+        return new TrinoTable(catalogName, schemaName, tableName, newColumns, properties);
+    }
+
+    public TrinoTable withProperties(Map<String, Optional<Object>> newProperties)
+    {
+        return new TrinoTable(catalogName, schemaName, tableName, columns, newProperties);
+    }
+}
+
+==============================================================
+schema/TrinoColumn.java -- the mask request DOES carry name + type
+==============================================================
+public record TrinoColumn(
+        String catalogName,
+        String schemaName,
+        String tableName,
+        String columnName,
+        String columnType)
+{
+    public TrinoColumn
+    {
+        requireNonNull(catalogName, "catalogName is null");
+        requireNonNull(schemaName, "schemaName is null");
+        requireNonNull(tableName, "tableName is null");
+        requireNonNull(columnName, "columnName is null");
+        requireNonNull(columnType, "columnType is null");
+    }
+
+==============================================================
+schema/TrinoIdentity.java -- the identity a policy receives
+==============================================================
+public record TrinoIdentity(
+        String user,
+        Set<String> groups)
+{
+    public static TrinoIdentity fromTrinoIdentity(Identity identity)
+    {
+        return new TrinoIdentity(
+                identity.getUser(),
+                identity.getGroups());
+    }
+
+    public TrinoIdentity
+    {
+        requireNonNull(user, "user is null");
+        groups = ImmutableSet.copyOf(requireNonNull(groups, "groups is null"));
+    }
+}
+
+==============================================================
+OpaHttpClient.java -- transport/HTTP failure handling
+==============================================================
+    private <T> T parseOpaResponse(FullJsonResponseHandler.JsonResponse<T> response, URI uri)
+    {
+        int statusCode = response.getStatusCode();
+        String uriString = uri.toString();
+        if (HttpStatus.familyForStatusCode(statusCode) != HttpStatus.Family.SUCCESSFUL) {
+            if (statusCode == HttpStatus.NOT_FOUND.code()) {
+                log.warn("OPA responded with not found error for policy with URI \"%s\"", uriString);
+                throw new OpaQueryException.PolicyNotFound(uriString);
+            }
+
+            log.error("Received unknown error from OPA for URI \"%s\" with status code = %d", uriString, statusCode);
+            throw new OpaQueryException.OpaServerError(uriString, statusCode, response.toString());
+        }
+        if (!response.hasValue()) {
+            log.error(response.getException(), "OPA response for URI \"%s\" with status code = %d could not be deserialized", uriString, statusCode);
+            throw new OpaQueryException.DeserializeFailed(response.getException());
+        }
+        if (logResponses) {
+            log.debug(
+                    "OPA response for URI \"%s\" received: status code = %d ; response payload = %s ; response headers = %s",
+                    uriString,
+                    statusCode,
+                    new String(response.getJsonBytes(), UTF_8),
+                    response.getHeaders());
+        }
+        return response.getValue();
+    }
+
+==============================================================
+OpaConfig.java -- the configured endpoints. NOTE: there is a batch URI
+  for generic filtering and for column masking, but NONE for row filters.
+==============================================================
+44:    @Config("opa.policy.uri")
+45-    @ConfigDescription("URI for OPA policies")
+58:    @Config("opa.policy.batched-uri")
+59-    @ConfigDescription("URI for Batch OPA policies - if not set, a single request will be sent for each entry on filtering methods")
+71:    @Config("opa.log-requests")
+72-    @ConfigDescription("Whether to log requests (URI, entire body and headers) prior to sending them to OPA")
+84:    @Config("opa.log-responses")
+85-    @ConfigDescription("Whether to log responses (URI, entire body, status code and headers) received from OPA")
+97:    @Config("opa.allow-permission-management-operations")
+98-    @ConfigDescription("Whether to allow permission management (GRANT, DENY, ...) and role management operations - OPA will not be queried for any such operations, they will be bulk allowed or denied depending on this setting")
+111:    @Config("opa.policy.row-filters-uri")
+112-    @ConfigDescription("URI for fetching row filters - if not set no row filtering will be applied")
+125:    @Config("opa.policy.column-masking-uri")
+126-    @ConfigDescription("URI for fetching column masks - if not set no masking will be applied")
+139:    @Config("opa.policy.batch-column-masking-uri")
+140-    @ConfigDescription("URI for fetching batch column masks - if not set column-masking-uri will be used")
+152:    @Config("opa.context-file")
+153-    @ConfigDescription("Optional properties file, containing user defined properties (e.g. tenant namespace, tier or cluster) to be included in the OPA query context")

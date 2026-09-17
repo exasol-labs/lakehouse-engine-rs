@@ -1,0 +1,156 @@
+### OPA Version: 1.20.2
+### endpoint: POST http://127.0.0.1:8181/v1/data/trino/rowFilters
+### policy:   policies/row_filters.rego
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst","eu_staff"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "region = 'EU'"
+    }
+  ]
+}
+
+==============================================================
+CASE user=bob table=lakehouse.sales.orders
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"bob","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "region = 'US'"
+    }
+  ]
+}
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders_multi
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders_multi"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "o_totalprice < 100000"
+    },
+    {
+      "expression": "region = 'EU'"
+    }
+  ]
+}
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders_in
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders_in"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "region IN ('EU', 'UK', 'CH')"
+    }
+  ]
+}
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders_null
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders_null"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "(classification IS NULL OR classification <> 'SECRET')"
+    }
+  ]
+}
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders_date
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders_date"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "o_orderdate >= DATE '2024-01-01' AND o_orderdate < current_date - INTERVAL '7' DAY"
+    }
+  ]
+}
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders_subquery
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders_subquery"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "region IN (SELECT region FROM security.acl.user_region WHERE user_name = CURRENT_USER)"
+    }
+  ]
+}
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders_func
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders_func"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "regexp_like(o_comment, '^(?i)eu-')"
+    }
+  ]
+}
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders_session
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders_session"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "owner = CURRENT_USER"
+    }
+  ]
+}
+
+==============================================================
+CASE user=alice table=lakehouse.sales.orders_asidentity
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"alice","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders_asidentity"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": [
+    {
+      "expression": "dept = 'FINANCE'",
+      "identity": "audit_svc"
+    }
+  ]
+}
+
+==============================================================
+CASE user=root table=lakehouse.sales.orders
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"root","groups":["admin"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": []
+}
+
+==============================================================
+CASE user=carol table=lakehouse.sales.orders
+-------- REQUEST ---------------------------------------------
+{"context":{"identity":{"user":"carol","groups":["analyst"]},"softwareStack":{"trinoVersion":"476"},"queryId":"20260917_101500_00001_abcde"},"action":{"operation":"GetRowFilters","resource":{"table":{"catalogName":"lakehouse","schemaName":"sales","tableName":"orders"}}}}
+-------- RESPONSE --------------------------------------------
+{
+  "result": []
+}
+

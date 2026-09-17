@@ -1,0 +1,118 @@
+### live Exasol: 2025.1.16
+### dsn: exasol://sys:***@127.0.0.1:28563?validateservercertificate=0
+
+-- setup: a role, a user holding it, and a second role the user does NOT hold
+   created ROLE OPA_EU_STAFF, ROLE OPA_AUDITORS, USER OPA_ALICE (holds only OPA_EU_STAFF)
+
+=== (1) what the ADAPTER's own session sees (it runs as the VS owner) ===
+--------------------------------------------------------------
+Q: SELECT CURRENT_USER, CURRENT_SESSION, CURRENT_SCHEMA
+A:
+   [1/1] SELECT CURRENT_USER, CURRENT_SESSION, CURRENT_SCHEMA 1 rows
+   CURRENT_USER,CURRENT_SESSION,CURRENT_SCHEMA
+   SYS,1876564853127905280,
+   1 statement executed, 0 failed
+
+--------------------------------------------------------------
+Q: SELECT * FROM SYS.EXA_USER_ROLE_PRIVS ORDER BY 2
+A:
+   [1/1] SELECT * FROM SYS.EXA_USER_ROLE_PRIVS ORDER BY 2 1 rows
+   GRANTEE,GRANTED_ROLE,ADMIN_OPTION
+   SYS,DBA,true
+   1 statement executed, 0 failed
+
+=== (2) roles of an ARBITRARY user, which is what a policy input needs ===
+--------------------------------------------------------------
+Q: SELECT GRANTEE, GRANTED_ROLE FROM SYS.EXA_DBA_ROLE_PRIVS WHERE GRANTEE = 'OPA_ALICE' ORDER BY 2
+A:
+   [1/1] SELECT GRANTEE, GRANTED_ROLE FROM SYS.EXA_DBA_ROLE_PRIVS ... 1 rows
+   GRANTEE,GRANTED_ROLE
+   OPA_ALICE,OPA_EU_STAFF
+   1 statement executed, 0 failed
+
+--------------------------------------------------------------
+Q: SELECT GRANTEE, GRANTED_ROLE FROM SYS.EXA_DBA_ROLE_PRIVS WHERE GRANTEE = 'OPA_ALICE' AND GRANTED_ROLE = 'OPA_AUDITORS'
+A:
+   [1/1] SELECT GRANTEE, GRANTED_ROLE FROM SYS.EXA_DBA_ROLE_PRIVS ... 0 rows
+   GRANTEE,GRANTED_ROLE
+   1 statement executed, 0 failed
+
+=== (2b) role-to-role grants, i.e. whether a policy can get the TRANSITIVE closure ===
+--------------------------------------------------------------
+Q: SELECT * FROM SYS.EXA_ROLE_ROLE_PRIVS ORDER BY 1, 2
+A:
+   [1/1] SELECT * FROM SYS.EXA_ROLE_ROLE_PRIVS ORDER BY 1, 2 0 rows
+   GRANTEE,GRANTED_ROLE,ADMIN_OPTION
+   1 statement executed, 0 failed
+
+   ^ EXA_ROLE_ROLE_PRIVS shows only role-to-role grants under roles the CURRENT
+     session holds, so it is empty here. The same grant IS visible in DBA_ROLE_PRIVS:
+
+--------------------------------------------------------------
+Q: SELECT * FROM SYS.EXA_DBA_ROLE_PRIVS WHERE GRANTEE IN ('OPA_ALICE', 'OPA_EU_STAFF') ORDER BY 1, 2
+A:
+   [1/1] SELECT * FROM SYS.EXA_DBA_ROLE_PRIVS WHERE GRANTEE IN ('O... 2 rows
+   GRANTEE,GRANTED_ROLE,ADMIN_OPTION
+   OPA_ALICE,OPA_EU_STAFF,false
+   OPA_EU_STAFF,OPA_AUDITORS,false
+   1 statement executed, 0 failed
+
+   ^ user-to-role AND role-to-role grants come from ONE view, so a policy input
+     builder can compute the transitive role closure from a single query.
+
+=== (3) is there any user ATTRIBUTE store beyond the name and roles? ===
+--------------------------------------------------------------
+Q: SELECT * FROM SYS.EXA_ALL_USERS WHERE USER_NAME = 'OPA_ALICE'
+A:
+   [1/1] SELECT * FROM SYS.EXA_ALL_USERS WHERE USER_NAME = 'OPA_AL... 1 rows
+   USER_NAME,CREATED,USER_CONSUMER_GROUP,USER_COMMENT
+   OPA_ALICE,2026-09-17T09:55:03,,
+   1 statement executed, 0 failed
+
+   ^ the complete EXA_ALL_USERS column list: name, created, consumer group, free-text comment.
+
+--------------------------------------------------------------
+Q: SELECT USER_NAME, DISTINGUISHED_NAME, KERBEROS_PRINCIPAL, OPENID_SUBJECT, USER_CONSUMER_GROUP FROM SYS.EXA_DBA_USERS ORDER BY 1
+A:
+   [1/1] SELECT USER_NAME, DISTINGUISHED_NAME, KERBEROS_PRINCIPAL,... 2 rows
+   USER_NAME,DISTINGUISHED_NAME,KERBEROS_PRINCIPAL,OPENID_SUBJECT,USER_CONSUMER_GROUP
+   OPA_ALICE,,,,
+   SYS,,,,SYS_CONSUMER_GROUP
+   1 statement executed, 0 failed
+
+   ^ EXA_DBA_USERS additionally carries the EXTERNAL identity links (LDAP DN,
+     Kerberos principal, OIDC subject). Empty here because this container's users
+     authenticate by password; on an IdP-backed cluster these are the join key to
+     an external attribute source.
+
+=== (4) NEGATIVE CONTROL: a fabricated view name must ERROR, not return empty ===
+--------------------------------------------------------------
+Q: SELECT * FROM SYS.EXA_USER_ATTRIBUTES
+A:
+      ERROR: [1/1] SELECT * FROM SYS.EXA_USER_ATTRIBUTES
+   Error in statement 1:
+     SELECT * FROM SYS.EXA_USER_ATTRIBUTES
+
+=== (5) what CURRENT_USER is for the END USER's own session ===
+--------------------------------------------------------------
+Q: SELECT CURRENT_USER  (connected AS OPA_ALICE)
+   [1/1] SELECT CURRENT_USER 1 rows
+   CURRENT_USER
+   OPA_ALICE
+   1 statement executed, 0 failed
+
+Q: SELECT ROLE_NAME FROM SYS.EXA_USER_ROLE_PRIVS  (connected AS OPA_ALICE)
+   [1/1] SELECT ROLE_NAME FROM SYS.EXA_USER_ROLE_PRIVS ORDER BY 1
+   Error in statement 1:
+     SELECT ROLE_NAME FROM SYS.EXA_USER_ROLE_PRIVS ORDER BY 1
+   
+     Query execution failed: Protocol error: object ROLE_NAME not found [line 1, column 8] (Session: 1876564854451339264) (SQL state: 42000)
+   
+     Hint: Check that the table exists and the schema is correct.
+   1 statement executed, 1 failed
+   Error: Query execution failed: Protocol error: object ROLE_NAME not found [line 1, column 8] (Session: 1876564854451339264) (SQL state: 42000)
+
+=== (6) cleanup ===
+   DROP USER OPA_ALICE CASCADE -- ok
+   DROP ROLE OPA_EU_STAFF CASCADE -- ok
+   DROP ROLE OPA_AUDITORS CASCADE -- ok

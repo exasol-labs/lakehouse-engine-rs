@@ -1,0 +1,4 @@
+.bin/
+df-probe/target/
+df-probe/Cargo.lock
+evidence/.opa-server.log

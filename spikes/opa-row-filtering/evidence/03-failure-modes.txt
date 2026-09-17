@@ -1,0 +1,74 @@
+==============================================================
+CASE A. healthy call, user with a policy (baseline)
+-- url: http://127.0.0.1:8181/v1/data/trino/rowFilters
+-- http status: 200
+-- body:
+{"result":[{"expression":"region = 'EU'"}]}
+
+
+==============================================================
+CASE B. healthy call, user the policy says NOTHING about (carol)
+-- url: http://127.0.0.1:8181/v1/data/trino/rowFilters
+-- http status: 200
+-- body:
+{"result":[]}
+
+
+==============================================================
+CASE C. MISTYPED policy path (rule does not exist)
+-- url: http://127.0.0.1:8181/v1/data/trino/rowFiltersTypo
+-- http status: 200
+-- body:
+{}
+
+
+==============================================================
+CASE D. MISTYPED package path (package does not exist)
+-- url: http://127.0.0.1:8181/v1/data/no/such/package/rowFilters
+-- http status: 200
+-- body:
+{}
+
+
+==============================================================
+CASE E. rego runtime error (1/0), default builtin-error handling
+-- url: http://127.0.0.1:8181/v1/data/spike/failure/rowFilters
+-- http status: 200
+-- body:
+{"result":[]}
+
+
+==============================================================
+CASE F. rego runtime error (1/0), strict-builtin-errors=true
+-- url: http://127.0.0.1:8181/v1/data/spike/failure/rowFilters?strict-builtin-errors=true
+-- http status: 200
+-- body:
+{"result":[]}
+
+
+==============================================================
+CASE G. policy returns a NON-STRING expression (42)
+-- url: http://127.0.0.1:8181/v1/data/spike/failure/badTypeRowFilters
+-- http status: 200
+-- body:
+{"result":[{"expression":42}]}
+
+
+==============================================================
+CASE H. policy reads resource.table.columns (absent from GetRowFilters)
+-- url: http://127.0.0.1:8181/v1/data/spike/failure/schemaProbe
+-- http status: 200
+-- body:
+{}
+
+
+==============================================================
+CASE I. OPA UNREACHABLE (nothing listening on :18181)
+-- url: http://127.0.0.1:18181/v1/data/trino/rowFilters
+-- http status: 000CURL_FAIL
+-- body:
+{}
+
+-- curl stderr:
+curl: (7) Failed to connect to 127.0.0.1 port 18181 after 0 ms: Could not connect to server
+

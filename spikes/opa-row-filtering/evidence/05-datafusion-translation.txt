@@ -1,0 +1,112 @@
+
+==============================================================================
+PROBE 0 -- the aliased inner SELECT the filter must resolve against
+==============================================================================
+SELECT "region" AS "REGION", "o_totalprice" AS "O_TOTALPRICE", "classification" AS "CLASSIFICATION", "o_orderdate" AS "O_ORDERDATE", "o_comment" AS "O_COMMENT", "owner" AS "OWNER", "dept" AS "DEPT", "c_nationkey" AS "C_NATIONKEY" FROM scan_target
+rows in fixture: Ok(8)
+
+==============================================================================
+PROBE 1 -- OPA's filter string spliced VERBATIM into the row-scan WHERE
+==============================================================================
+shape: SELECT "REGION", ... FROM (<aliased inner>) WHERE <opa expression>
+
+  REJECTED A simple equality                          PLAN: Schema error: No field named region. Column names are case sensitive. You can use double quotes to refer to the "region" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED B multi-filter (ANDed by the consumer)     PLAN: Schema error: No field named o_totalprice. Column names are case sensitive. You can use double quotes to refer to the "o_totalprice" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED C IN list                                  PLAN: Schema error: No field named region. Column names are case sensitive. You can use double quotes to refer to the "region" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED D NULL / three-valued logic                PLAN: Schema error: No field named classification. Column names are case sensitive. You can use double quotes to refer to the "classification" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED E typed DATE literal + INTERVAL            PLAN: Schema error: No field named o_orderdate. Column names are case sensitive. You can use double quotes to refer to the "o_orderdate" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED F subquery against a mapping table         PLAN: Error during planning: table 'security.acl.user_region' not found
+  REJECTED G engine-specific function                 PLAN: Schema error: No field named o_comment. Column names are case sensitive. You can use double quotes to refer to the "o_comment" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED H session function in the expression       PLAN: Schema error: No field named owner. Column names are case sensitive. You can use double quotes to refer to the "owner" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED I filter with an `identity` override       PLAN: Schema error: No field named dept. Column names are case sensitive. You can use double quotes to refer to the "dept" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+
+==============================================================================
+PROBE 2 -- same filters after an adapter-side identifier rewrite
+==============================================================================
+(every bare column reference uppercased and double-quoted)
+
+  PLANNED  A simple equality                          rows=4
+  PLANNED  B multi-filter (ANDed by the consumer)     rows=4
+  PLANNED  C IN list                                  rows=6
+  PLANNED  D NULL / three-valued logic                rows=6
+  PLANNED  E typed DATE literal + INTERVAL            rows=6
+  REJECTED F subquery against a mapping table         PLAN: Error during planning: table 'security.acl.user_region' not found
+  PLANNED  G engine-specific function                 rows=4
+  REJECTED H session function in the expression       PLAN: Schema error: No field named current_user. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  PLANNED  I filter with an `identity` override       rows=5
+
+==============================================================================
+PROBE 3 -- NEGATIVE CONTROLS (each MUST fail / MUST differ)
+==============================================================================
+  REJECTED unknown column must be rejected            PLAN: Schema error: No field named "NO_SUCH_COL". Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED lowercase bare ident vs uppercase alias    PLAN: Schema error: No field named region. Column names are case sensitive. You can use double quotes to refer to the "region" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED mixed case bare ident                      PLAN: Schema error: No field named region. Column names are case sensitive. You can use double quotes to refer to the "region" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED quoted lowercase ident                     PLAN: Schema error: No field named region. Column names are case sensitive. You can use double quotes to refer to the "region" column or set the datafusion.sql_parser.enable_ident_normalization configuration. Valid fields are "REGION", "O_TOTALPRICE", "CLASSIFICATION", "O_ORDERDATE", "O_COMMENT", "OWNER", "DEPT", "C_NATIONKEY".
+  REJECTED non-boolean expression as a filter         PLAN: Error during planning: Cannot create filter with non-boolean predicate 'O_TOTALPRICE' returning Float64
+  REJECTED trailing semicolon (statement injection)   PLAN: This feature is not implemented: The context currently only supports a single SQL statement
+  PLANNED  comment-terminated filter                  rows=4
+  PLANNED  always-true filter must NOT reduce rows    rows=8
+
+==============================================================================
+PROBE 4 -- composition with pushdown shapes (item 4)
+==============================================================================
+-- 4a single-group partial/merge, filter INSIDE each shard (engine's placement)
+   merged partial count    = Ok(4)
+   single-node reference   = Ok(4)
+-- 4b THE BUG: filter applied to the MERGE instead of the shard scan
+   post-aggregate filter   = Ok(0)   <-- wrong number, and it is not even the same question
+-- 4c GROUP BY partial/merge, filter INSIDE each shard (multi-group)
+   merged grouped | GK_0    | c |  | FINANCE | 4 |  | SALES   | 2 |
+   single-node ref | DEPT    | c |  | FINANCE | 4 |  | SALES   | 2 |
+-- 4d COUNT(DISTINCT): per-shard DISTINCT row scan, filter INSIDE, outer COUNT(DISTINCT)
+   sharded distinct count  = Ok(1)
+   single-node reference   = Ok(1)
+-- 4e broadcast join: engine splices the filter AFTER the join (join_scan.rs:206-212)
+   filter AFTER join       = Ok(4)
+   filter BEFORE join      = Ok(4)
+-- 4f TopN: ORDER BY + LIMIT per shard, filter INSIDE (raw_scan.rs:563-592 order)
+   sharded topn    | O_TOTALPRICE |  | 80.0         |  | 50.0         |
+   single-node ref | O_TOTALPRICE |  | 80.0         |  | 50.0         |
+
+==============================================================================
+PROBE 6 -- SILENT DIALECT DIVERGENCE (same SQL, different answer)
+==============================================================================
+-- 6a Trino substring(str, -3) = last 3 chars. DataFusion?
+    | OWNER | MASKED    |  | alice | ****alice |  | bob   | ****bob   |  | carol | ****carol |  | dave  | ****dave  |
+   Trino would render alice -> '****ice'. Anything else is an UNMASKED leak.
+-- 6b regexp_like: SAME NAME, different regex engine
+   Trino evaluates it with java.util.regex; DataFusion with the Rust
+   `regex` crate. Trino was NOT run here, so these are one-sided results:
+   an accepted pattern is only proof that DataFusion answers, not that it
+   answers the same as Trino.
+      ^(?i)eu-     -> ACCEPTED, matched 4 rows
+      \p{Alpha}+   -> ACCEPTED, matched 8 rows
+      (?<g>eu)-    -> ACCEPTED, matched 3 rows
+      (?=eu)       -> EXEC: Optimizer rule 'simplify_expressions' failed
+      (\w)\1       -> EXEC: Optimizer rule 'simplify_expressions' failed
+      Lookahead/backreference fail loudly, which is the SAFE outcome.
+      The unsafe class is a pattern both engines accept and read differently.
+-- 6c clock functions are evaluated INSIDE the shard, once per shard
+   shard 0 | D          |  | 2026-09-17 |
+   capabilities.rs:117-132 withdrew the now-family precisely because of this:
+   "GROUP BY SYSTIMESTAMP over a two-file table returned two distinct timestamps"
+
+==============================================================================
+PROBE 7 -- SQL-COMMENT TRUNCATION of the clauses the engine appends AFTER the filter
+==============================================================================
+   filter without a comment: Ok(2) rows
+   filter ending in `-- x` : Ok(4) rows  <-- ORDER BY and LIMIT swallowed
+
+==============================================================================
+PROBE 5 -- column masks as a projection item
+==============================================================================
+  PLANNED  NULL                                       rows=8
+  PLANNED  '****' || substring(c_name, -3)            rows=8
+  PLANNED  CASE WHEN ... THEN ... ELSE NULL END       rows=8
+  REJECTED to_hex(sha256(to_utf8(x)))                 PLAN: Error during planning: Invalid function 'sha256'.
+  REJECTED sha256(x) alone                            PLAN: Error during planning: Invalid function 'sha256'.
+  PLANNED  to_hex(x) alone                            rows=8
+  REJECTED md5(x) alone                               PLAN: Error during planning: Invalid function 'md5'.
+  REJECTED Trino to_utf8(x) alone                     PLAN: Error during planning: Invalid function 'to_utf8'.
+  PLANNED  Trino try_cast                             rows=8
+  REJECTED Trino cardinality/array                    PLAN: Error during planning: Invalid function 'cardinality'.

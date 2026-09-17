@@ -1,0 +1,20 @@
+# Standalone (NOT a workspace member -- the empty [workspace] table below keeps
+# it out of the repo's workspace so the spike cannot affect the shipping build).
+#
+# Pins the same DataFusion the engine pins (root Cargo.toml:42
+# `datafusion = { version = "54.1", ... }`) with the same extra feature the
+# engine's member manifest adds (crates/lakehouse-engine/Cargo.toml:33
+# `features = ["unicode_expressions"]`), so a planning verdict here is the
+# verdict the scan UDF would reach.
+[workspace]
+
+[package]
+name = "opa-df-probe"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+datafusion = { version = "54.1", default-features = false, features = ["parquet", "sql", "unicode_expressions"] }
+arrow = { version = "58", default-features = false }
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
