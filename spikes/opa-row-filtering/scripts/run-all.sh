@@ -12,6 +12,7 @@ bash "$D/50-translate-probe.sh" >/dev/null
 bash "$D/70-partial-evaluation.sh"
 bash "$D/95-per-user-data.sh"
 bash "$D/96-table-gate.sh"
+bash "$D/85-ucast-target.sh"
 bash "$D/80-compile-probe.sh" >/dev/null   # consumes compiled/ from 70, 90, 95, 96
 echo
 echo "Needs a live Exasol container (docker compose up -d exasol):"

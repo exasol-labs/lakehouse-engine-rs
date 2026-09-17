@@ -1,0 +1,72 @@
+### OPA 1.20.2, open-source build
+
+==============================================================
+1. THE TWO ROUTES
+==============================================================
+  POST /v1/compile            (query in body, Accept: ucast)  -> {"result":{"queries":[[{"index":0,"terms":[{"type":"ref","value":[{"type":"var","value":"internal"},{"type":"string","va  <- raw AST, target IGNORED
+  POST /v1/compile/gate/allow (path in URL,  Accept: ucast)  -> {"result":{"query":{"field":"row.region","operator":"in","type":"field","value":["EU","UK"]}}}  <- UCAST
+
+==============================================================
+2. THE THREE TRUTH VALUES SURVIVE, and are easier to tell apart
+==============================================================
+  ALICE   ORDERS_PUBLIC  -> {"result":{"query":{"field":"row.region","operator":"in","type":"field","value":["EU","UK"]}}}
+  ALICE   CUSTOMERS      -> {"result":{"query":{}}}
+  ALICE   ORDERS_SECRET  -> {}
+  NOBODY  ORDERS_PUBLIC  -> {}
+    FILTER    = {"result":{"query":{...}}}
+    ALLOW ALL = {"result":{"query":{}}}      <- query present but empty
+    DENY      = {}                           <- no `result` key at all
+
+==============================================================
+3. OR-of-AND: the compound shape, from policies/filtering2.rego
+==============================================================
+  alice  UCAST -> {"result":{"query":{"operator":"or","type":"compound","value":[{"operator":"and","type":"compound","value":[{"field":"row.region","operator":"eq","type":"field","value":"EU"},{"field":"row.classification","operator":"ne","type":"field","value":"SECRET"}]},{"operator":"and","type":"compound","value":[{"field":"row.region","operator":"in","type":"field","value":["CH","UK"]},{"field":"row.o_totalprice","operator":"lt","type":"field","value":100000}]}]}}}
+  alice  SQL   -> {"result":{"query":"WHERE ((row.region = E'EU' AND row.classification \u003c\u003e E'SECRET') OR (row.region IN (E'CH', E'UK') AND row.o_totalprice \u003c E'100000'))"}}
+  bob    UCAST -> {"result":{"query":{"operator":"and","type":"compound","value":[{"field":"row.region","operator":"eq","type":"field","value":"US"},{"field":"row.classification","operator":"ne","type":"field","value":"SECRET"}]}}}
+  bob    SQL   -> {"result":{"query":"WHERE (row.region = E'US' AND row.classification \u003c\u003e E'SECRET')"}}
+  root   UCAST -> {"result":{"query":{}}}
+  root   SQL   -> {"result":{"query":""}}
+  carol  UCAST -> {}
+  carol  SQL   -> {}
+
+==============================================================
+4. THE CASES THE HAND-WRITTEN AST COMPILER HAD TO HANDLE
+==============================================================
+  inject       UCAST -> {"result":{"query":{"field":"row.region","operator":"eq","type":"field","value":"EU' OR 1=1 -- "}}}
+  inject       SQL   -> {"result":{"query":"WHERE row.region = E'EU\\' OR 1=1 -- '"}}
+  unsupported  UCAST -> {"result":{"query":{"field":"row.o_comment","operator":"startswith","type":"field","value":"eu"}}}
+  unsupported  SQL   -> {"result":{"query":"WHERE row.o_comment LIKE E'eu%'"}}
+  numeric      UCAST -> {"result":{"query":{"field":"row.o_totalprice","operator":"lt","type":"field","value":100000}}}
+  numeric      SQL   -> {"result":{"query":"WHERE row.o_totalprice \u003c E'100000'"}}
+  crosstable   UCAST -> {}
+  crosstable   SQL   -> {}
+    inject      UCAST carries the literal as a JSON *value*, so there is no SQL
+                text to break out of -- injection is structurally impossible,
+                not merely escaped. The SQL target escapes it correctly.
+    unsupported `startswith` IS inside the UCAST fragment, so the fragment is
+                WIDER than the hand-written allowlist in df-probe. The SQL
+                target renders it as LIKE.
+    numeric     UCAST keeps 100000 a JSON number. The SQL target emits
+                `< E'100000'` -- a NUMBER as a STRING literal. Defect; another
+                reason to take UCAST and render SQL ourselves.
+    crosstable  a reference outside the unknown row -> {} = DENY. Fails closed.
+
+==============================================================
+5. FRAGMENTS AND OPTIONS
+==============================================================
+  Accept ucast.minimal on `in`   -> {  "code": "evaluation_error",  "message": "error(s) occurred while evaluating query",  "errors": [    {      "code": "pe_fragment_error",      "message": "invalid builtin `in`: unsupp
+    -> ucast.minimal is a NARROWER fragment and refuses with a NAMED error
+       (pe_fragment_error), which is a stronger guarantee than our own
+       allowlist: OPA itself rejects an untranslatable policy.
+  unknowns omitted                -> {}   <- required; omitting it DENIES
+  options.nondeterministicBuiltins -> {"result":{"query":{"field":"row.o_totalprice","operator":"lt","type":"field","value":100000}}}  <- accepted on this route too (needed for the IdP variant)
+  Accept: application/json         -> {  "code": "internal_error",  "message": "unknown target/dialect combination: /"}
+
+-- conclusion --
+Use POST /v1/compile/<policy path> with Accept: application/vnd.opa.ucast.all+json.
+The policy path rides in the URL, so ONE URI carries the whole endpoint
+configuration and no separate OPA_QUERY property is needed -- the same shape
+Trino's opa.policy.uri uses. Translate UCAST rather than the raw AST: typed
+values, no injection surface, a wider operator fragment, and OPA names its own
+refusals. Do NOT take the SQL targets: none is a DataFusion dialect and the
+numeric literal above is rendered as a string.

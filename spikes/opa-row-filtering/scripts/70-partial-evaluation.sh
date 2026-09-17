@@ -66,8 +66,7 @@ C '{"query":"startswith(input.row.o_comment, \"eu\")","unknowns":["input.row"]}'
 	jq -c '.result' "$COMPILED/unsupported.json"
 	echo
 	echo "=============================================================="
-	echo "NEGATIVE CONTROL: does this OPA build compile to SQL for us?"
-	echo "The Accept header is the documented way to request a SQL/UCAST target."
+	echo "Does the BODY-QUERY route honour a SQL/UCAST target Accept header?"
 	echo "=============================================================="
 } >>"$OUT"
 
@@ -79,9 +78,13 @@ for mt in application/vnd.opa.sql.postgresql+json application/vnd.opa.ucast.all+
 done
 {
 	echo
-	echo "So this open-source build ignores the target and always returns the AST."
-	echo "That is what we want anyway: the SQL targets on offer are Postgres/MySQL/"
-	echo "SQLServer/Prisma, none of which is DataFusion. We compile the AST ourselves."
+	echo "No: POST /v1/compile with the query in the BODY always returns the AST."
+	echo
+	echo "CORRECTION (see evidence/16): this is NOT because the build lacks targets."
+	echo "There is a SECOND route, POST /v1/compile/<policy path>, where the target"
+	echo "IS honoured and UCAST/SQL come back. This spike first concluded targets"
+	echo "were unavailable by testing only the route above. They are available, and"
+	echo "UCAST is the better input to translate than this AST."
 } >>"$OUT"
 
 echo "wrote $OUT"

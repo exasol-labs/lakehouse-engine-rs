@@ -55,12 +55,15 @@ PER-USER RESPONSES (also written to compiled/<user>.json)
 {"queries":[[{"index":0,"terms":[{"type":"ref","value":[{"type":"var","value":"startswith"}]},{"type":"ref","value":[{"type":"var","value":"input"},{"type":"string","value":"row"},{"type":"string","value":"o_comment"}]},{"type":"string","value":"eu"}]}]]}
 
 ==============================================================
-NEGATIVE CONTROL: does this OPA build compile to SQL for us?
-The Accept header is the documented way to request a SQL/UCAST target.
+Does the BODY-QUERY route honour a SQL/UCAST target Accept header?
 ==============================================================
 application/vnd.opa.sql.postgresql+json        "IGNORED, returned the plain AST"
 application/vnd.opa.ucast.all+json             "IGNORED, returned the plain AST"
 
-So this open-source build ignores the target and always returns the AST.
-That is what we want anyway: the SQL targets on offer are Postgres/MySQL/
-SQLServer/Prisma, none of which is DataFusion. We compile the AST ourselves.
+No: POST /v1/compile with the query in the BODY always returns the AST.
+
+CORRECTION (see evidence/16): this is NOT because the build lacks targets.
+There is a SECOND route, POST /v1/compile/<policy path>, where the target
+IS honoured and UCAST/SQL come back. This spike first concluded targets
+were unavailable by testing only the route above. They are available, and
+UCAST is the better input to translate than this AST.

@@ -3,7 +3,7 @@
 **Verdict: yes.** Build a layer that compiles OPA's partial-evaluation output into a DataFusion
 predicate. Do not use the SQL-string contract Trino's plugin uses.
 
-This README covers four passes.
+This README covers five passes.
 
 **Pass 1** followed the brief's prior art, Trino's `trino-opa` plugin, in which OPA returns a SQL
 expression *string*. That contract fails here: **0 of 9** realistic row filters planned in the
@@ -37,6 +37,16 @@ but it is strictly weaker (no rows, no columns), needs a second identity namespa
 backend, and is not an enforcement point anyway; it is **parked** as a possible separate feature for
 a deployment without OPA.
 
+**Pass 5** ([§15](#15-correction-use-a-uri-and-the-ucast-target)) corrects pass 2 on one point that
+changes the implementation. The Compile API has a second route, `POST /v1/compile/<policy path>`,
+where an `Accept` header selects a **target** — and OPA 1.20.2 open-source returns **UCAST**,
+dialect-neutral structured JSON, on it. Pass 2 tested the target header on the body-query route,
+where it is ignored, and wrongly concluded the build had no targets. Consequences: the endpoint is
+**one URI** (so no separate policy-path property), and the thing to translate is **UCAST**, not the
+raw AST — typed numbers, no injection surface at all, a wider operator fragment, and OPA naming its
+own refusals. The SQL targets are still the wrong choice: no DataFusion dialect, and a numeric
+literal comes out as a string.
+
 So: the feature is real, OPA is the right tool, and **Rego is never translated**. It is evaluated;
 what gets translated is the expression tree OPA hands back.
 
@@ -60,6 +70,7 @@ scripts/50-translate-probe.sh          # cargo; df-probe/ is NOT a workspace mem
 scripts/60-exasol-identity.sh          # needs: docker compose up -d exasol
 scripts/70-partial-evaluation.sh       # pass 2: the Compile API
 scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
+scripts/85-ucast-target.sh             # pass 5: the path route, UCAST vs SQL targets
 scripts/90-idp-auth.sh                 # pass 3: shared IdP; needs Keycloak, see header
 scripts/95-per-user-data.sh            # per-user permissions as plain OPA data
 scripts/97-lakekeeper-table-grants.sh  # per-table grants; needs the OpenFGA overlay, see header
@@ -84,6 +95,7 @@ scripts/98-user-id-namespace.sh        # what the Lakekeeper user id is made of;
 | `evidence/14-table-gate.txt` | One policy, one call: table access AND row filter, three distinct answers |
 | `evidence/12-lakekeeper-table-grants.txt` | *(parked)* Live Lakekeeper+OpenFGA: a per-table grant asked on another user's behalf |
 | `evidence/15-config-visibility.txt` | Live Exasol: what a SELECT-only user can read back of VS properties vs CONNECTIONs |
+| `evidence/16-ucast-target.txt` | The path-form Compile API: UCAST and SQL targets, and what pass 2 got wrong |
 | `evidence/13-user-id-namespace.txt` | *(parked)* Live: what Lakekeeper's `<idp-id>~<sub>` user id is made of, and what it rejects |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
@@ -981,15 +993,18 @@ in the shared IdP, so groups are available without any per-user credential
 
 **Build:** a Rego-to-DataFusion compiler over OPA's Compile API output.
 
-1. **Call `POST /v1/compile`**, not the row-filters endpoint, with the table row as the unknown, once
+1. **Call `POST /v1/compile/<policy path>`** with `Accept: application/vnd.opa.ucast.all+json` — not
+   the row-filters endpoint, and not the body-query route
+   ([§15](#15-correction-use-a-uri-and-the-ucast-target)) — with the table row as the unknown, once
    per table at plan time, passing `{"options": {"nondeterministicBuiltins": true}}` so an
    IdP-backed policy resolves. Cost is 0.2 ms without IdP lookups, about 1.2 ms warm with them.
 2. **Put the permissions in OPA's `data` document as a bundle** ([§9.5](#95-four-places-the-users-permissions-can-live-and-which-to-pick)),
    keyed by Exasol user name. No groups in the request and no IdP call at decision time. Move to a
    live IdP lookup only if an external system must stay authoritative.
-3. **Compile the AST to a predicate** with an operator allowlist. `df-probe/src/opa_compile.rs` is a
-   working sketch of the whole thing; production would route through `vs-expression` instead of
-   emitting SQL text directly, so dialect rendering stays in one place.
+3. **Compile the UCAST tree to a predicate**, rendering through `vs-expression` so dialect rendering
+   stays in one place. `df-probe/src/opa_compile.rs` is a working sketch against the *AST* form; the
+   UCAST rewrite is smaller and needs no quote escaping
+   ([§15.1](#151-translate-ucast-not-the-ast)).
 4. **Honour all three answers.** Allow-all leaves `filter` as `None`. Filter goes into
    `CommonScanSpec.filter`. **Deny-all and every `Unsupported` refuse the query.** Never a missing
    filter.
@@ -1007,9 +1022,10 @@ in the shared IdP, so groups are available without any per-user credential
    needed ([§13](#13-parked-a-lakekeeper-grant-table-gate) is parked).
 10. **Map the user with `USER_MAPPING`** to the key the policy is keyed on, and refuse when there is
     no entry ([§11](#11-the-user_mapping-property)).
-11. **Put the OPA address in an Exasol CONNECTION** named by an `OPA_CONNECTION` property, mirroring
-    `CATALOG_CONNECTION`; the policy path (defaulted, not required), the user mapping and the timeout
-    stay plain properties ([§14](#14-where-the-opa-server-address-belongs)).
+11. **Put the full OPA URI in an Exasol CONNECTION** named by an `OPA_CONNECTION` property,
+    mirroring `CATALOG_CONNECTION`; the URI carries the policy path, so only the user mapping and the
+    timeout stay plain properties ([§14](#14-where-the-opa-server-address-belongs),
+    [§15](#15-correction-use-a-uri-and-the-ucast-target)).
 
 **Do not build:** anything that accepts a SQL string from a policy. Sections 1 to 6 are the evidence
 for why.
@@ -1336,16 +1352,19 @@ the requirement, two shapes exist:
 **An Exasol CONNECTION object named by an `OPA_CONNECTION` virtual-schema property** — exactly the
 shape `CATALOG_CONNECTION` already uses for the catalog endpoint.
 
+> Superseded in one detail by [§15](#15-correction-use-a-uri-and-the-ucast-target): the CONNECTION's
+> address is the **full URI** including the policy path, so the `OPA_QUERY` property below is
+> dropped. Everything else in this section stands.
+
 ```sql
 CREATE CONNECTION LAKEHOUSE_OPA
-  TO 'http://opa.internal:8181'                      -- the address
+  TO 'http://opa.internal:8181/v1/compile/lakehouse/allow'   -- the full URI (§15)
   USER ''                                            -- unused for OIDC
   IDENTIFIED BY '{"...": "..."}';                    -- OPA's credential, if any
 
 CREATE VIRTUAL SCHEMA lhvs USING ... WITH
   CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
   OPA_CONNECTION     = 'LAKEHOUSE_OPA'
-  OPA_QUERY          = 'data.gate.allow'             -- optional; defaults to data.lakehouse.allow
   USER_MAPPING       = '...';                        -- non-secret, plain property
 ```
 
@@ -1396,28 +1415,17 @@ What decided it:
 | Setting | Where | Why |
 |---|---|---|
 | `OPA_CONNECTION` | property naming a CONNECTION | the address, plus any credential |
-| `OPA_QUERY` | property, **with a default** | the Rego query path; see [§14.3](#143-do-we-actually-need-opa_query) |
+| ~~`OPA_QUERY`~~ | *dropped* | the policy path rides in the CONNECTION's URI ([§15](#15-correction-use-a-uri-and-the-ucast-target)) |
 | `USER_MAPPING` | property | the Exasol-user-to-policy-key map ([§11](#11-the-user_mapping-property)) |
 | `OPA_TIMEOUT_MS` | property | tuning, like the existing `S3_MAX_CONNECTIONS` |
 | plaintext transport | reuse `ALLOW_HTTP` | an `http://` OPA call puts the user name and the decision on the wire; it needs the same opt-in the catalog already has |
 
-### 14.3 Do we actually need `OPA_QUERY`?
+### 14.3 Getting the policy path wrong is safe
 
-**Something has to name a query — OPA cannot tell us the path — but it does not have to be a required
-property.** Give it a default of `data.lakehouse.allow` and most deployments never set it.
+The path rides in the URI ([§15](#15-correction-use-a-uri-and-the-ucast-target)) rather than in its own
+property, but either way it can be mistyped. It fails closed on **both** routes.
 
-Keep it configurable for one reason: one OPA instance can serve several virtual schemas with
-different policies, and a fixed entry point forces either one OPA per policy or a dispatch rule
-inside the policy. Prior art agrees — Trino's plugin configures the path (`opa.policy.uri`), and its
-row-filter and column-mask endpoints are separate settings again.
-
-The alternative is defensible: hardcode one entry point and pass the schema name in `input`, letting
-the policy dispatch. That keeps the engine's contract to exactly one path and puts multi-tenancy
-where the rules already are. Either way the policy author is already bound by a contract far tighter
-than the package name — `input.user`, `input.table`, `input.row` declared unknown, no `default` rule
-on the filtering rule, and an operator allowlist ([§9.8](#98-verdict-and-build-list) step 5).
-
-**Getting the path wrong is safe**, measured (`evidence/14`, bottom):
+Body-query route (`evidence/14`, bottom):
 
 ```
 data.gate.allow == true    -> HTTP 200 {"result":{"queries":[[...]]}}    (correct)
@@ -1427,11 +1435,21 @@ data.typo.allow == true    -> HTTP 200 {"result":{}}                     wrong P
 data.gate                  -> HTTP 200 residual with no operator         bare package -> Unsupported
 ```
 
-Every misconfiguration fails **closed**. That is the opposite of pass 1, where a mistyped policy path
+Path route with the UCAST target, same policy:
+
+```
+POST /v1/compile/gate/allow -> HTTP 200 {"result":{"query":{...}}}       (correct)
+POST /v1/compile/gate/alow  -> HTTP 200 {}                              mistyped RULE    -> DENY
+POST /v1/compile/typo/allow -> HTTP 200 {}                              wrong PACKAGE    -> DENY
+POST /v1/compile/gate       -> HTTP 400 pe_fragment_error               bare package -> hard error
+```
+
+Every misconfiguration fails **closed**, and the bare-package case is now a loud 400 rather than a
+residual we have to refuse ourselves. That is the opposite of pass 1, where a mistyped policy path
 answered HTTP 200 meaning *unrestricted* ([§5](#5-failure-modes)).
 
 One ops consequence: a typo denies **every** query with no hint why. So the refusal message must name
-the configured query path. The path is not a secret — connection names are already world-readable
+the configured URI. The path is not a secret — connection names are already world-readable
 ([§14.1](#141-what-decided-it-and-what-did-not)) — unlike the residual itself, which can carry a
 `client_secret` ([§9.3](#93-the-trap-partial-evaluation-skips-httpsend-by-default)) and must never be
 logged.
@@ -1440,3 +1458,108 @@ logged.
 visibility measurements above and in the existing `CATALOG_CONNECTION` code path. Whether the adapter
 should read the CONNECTION once per pushdown request or cache it is a question for implementation —
 the adapter is stateless per request either way.
+
+---
+
+## 15. Correction: use a URI and the UCAST target
+
+**Yes, URIs are simpler — and they work here, which pass 2 got wrong.** The Compile API has *two*
+routes, and pass 2 only tested one:
+
+```
+POST /v1/compile              query in the BODY   -> always the raw Rego AST, Accept IGNORED
+POST /v1/compile/<path>       policy path in URL  -> target chosen by the Accept header
+```
+
+Pass 2 sent `Accept: application/vnd.opa.ucast.all+json` to the first route, got the plain AST back,
+and concluded *"this open-source build ignores the target"*. It does not. The header is honoured on
+the **path** route, and OPA 1.20.2 open-source returns UCAST and SQL there. Evidence:
+`evidence/16-ucast-target.txt`, `scripts/85-ucast-target.sh`. `evidence/08` now carries the
+correction inline.
+
+```
+POST /v1/compile            (query in body, Accept: ucast)  -> {"result":{"queries":[[{"index":0,...  <- AST
+POST /v1/compile/gate/allow (path in URL,  Accept: ucast)   -> {"result":{"query":{"field":"row.region","operator":"in","type":"field","value":["EU","UK"]}}}
+```
+
+So the endpoint is one URI, exactly the shape you pointed at in Trino's config — and for the same
+reason: Trino's `opa.policy.uri` works because the Data API encodes the policy path in the URL
+(`https://opa.example.com/v1/data/trino/allow`). The Compile API's path route does the same.
+
+**`OPA_QUERY` therefore goes away.** [§14](#14-where-the-opa-server-address-belongs) stands, minus
+that property — the CONNECTION address becomes the full URI:
+
+```sql
+CREATE CONNECTION LAKEHOUSE_OPA
+  TO 'http://opa.internal:8181/v1/compile/lakehouse/allow'
+  USER '' IDENTIFIED BY '...';
+```
+
+One string, and it survives OPA behind a reverse proxy at a path prefix, which a base-URL-plus-path
+scheme would not.
+
+### 15.1 Translate UCAST, not the AST
+
+This is the bigger consequence. UCAST is dialect-neutral structured JSON, and it is a better input
+than the raw AST on four counts, all measured (`evidence/16`, section 4):
+
+| | raw AST (pass 2) | UCAST |
+|---|---|---|
+| **Injection** | string literals spliced into SQL text; the spike's compiler escapes `'` by doubling, and a control confirms `EU' OR 1=1 -- ` survives as data | the literal is a JSON **value**; there is no SQL text to break out of. Structurally impossible, not merely escaped |
+| **Numbers** | recovered from the AST by hand | typed: `{"operator":"lt","value":100000}` stays a JSON number |
+| **Operator coverage** | a hand-written allowlist; `startswith` was in the REFUSED set | `startswith` is **inside** the fragment — wider than the allowlist |
+| **Refusals** | we detect what we cannot translate | OPA names them: `ucast.minimal` answers `pe_fragment_error`, *"invalid builtin `in`: unsupported for UCAST"* |
+
+Compound shapes come back as a tree rather than a disjunction of term lists, which is simpler to
+walk. From `policies/filtering2.rego`, user `alice`:
+
+```json
+{"operator":"or","type":"compound","value":[
+  {"operator":"and","type":"compound","value":[
+    {"field":"row.region","operator":"eq","type":"field","value":"EU"},
+    {"field":"row.classification","operator":"ne","type":"field","value":"SECRET"}]},
+  {"operator":"and","type":"compound","value":[
+    {"field":"row.region","operator":"in","type":"field","value":["CH","UK"]},
+    {"field":"row.o_totalprice","operator":"lt","type":"field","value":100000}]}]}
+```
+
+The three truth values survive and are easier to tell apart than in the AST form:
+
+```
+FILTER    {"result":{"query":{...}}}
+ALLOW ALL {"result":{"query":{}}}    <- `query` present but empty
+DENY      {}                         <- no `result` key at all
+```
+
+### 15.2 Do not take the SQL targets
+
+`application/vnd.opa.sql.postgresql+json` returns ready SQL, and it is tempting. Two reasons not to:
+
+1. **No DataFusion dialect.** The offer is Postgres, MySQL, SQL Server, Prisma. Postgres output uses
+   `E'...'` escape-string literals, which is not what the engine's aliased inner SELECT expects.
+2. **A numeric literal is emitted as a string.** Measured:
+
+   ```
+   UCAST -> {"field":"row.o_totalprice","operator":"lt","value":100000}
+   SQL   -> WHERE row.o_totalprice < E'100000'
+   ```
+
+   A number rendered as a string literal. In DataFusion that is a planning error or a silent cast,
+   neither of which belongs in a security filter.
+
+Rendering SQL is the one thing this codebase is already good at — `crates/vs-expression` exists for
+it. Take UCAST and render through that.
+
+### 15.3 What still holds, and what to re-check
+
+Unchanged: the fail-closed behaviour throughout ([§12.3](#123-failure-handling)), the table gate as
+the degenerate filter ([§10](#10-opa-does-both-the-table-gate-and-the-row-filter)) — verified on this
+route too — the shared-IdP authentication ([§9](#9-authentication-sharing-lakekeepers-idp)), and
+`options.nondeterministicBuiltins`, which is accepted on the path route as well, so the IdP variant
+still works. `unknowns` is still required: omitting it returns `{}` = DENY.
+
+**Not tested:** compiling UCAST to a DataFusion predicate and executing it. `df-probe` compiles the
+AST form, which is the shape pass 2 captured; the UCAST rewrite is smaller but it is not written.
+Also untested: the field-name mapping. UCAST says `row.region` while the engine's aliased inner
+SELECT exposes `"REGION"` ([§2](#2-can-we-translate-what-it-returns) is why the case matters), so a
+prefix-strip plus uppercase-quote step replaces `column_of()` in the AST compiler.
