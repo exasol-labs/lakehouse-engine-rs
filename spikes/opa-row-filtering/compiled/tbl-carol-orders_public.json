@@ -1,0 +1,1 @@
+{"result":{"queries":[[{"index":0,"terms":[{"type":"ref","value":[{"type":"var","value":"internal"},{"type":"string","value":"member_2"}]},{"type":"ref","value":[{"type":"var","value":"input"},{"type":"string","value":"row"},{"type":"string","value":"region"}]},{"type":"array","value":[{"type":"string","value":"APAC"}]}]}]]}}

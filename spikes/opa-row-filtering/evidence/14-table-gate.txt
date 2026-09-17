@@ -1,0 +1,74 @@
+### policy: policies-tables/gate.rego    data: policies-tables/data.json
+### the whole permission model -- table grants AND row limits in one document:
+###   {
+###     "permissions": {
+###       "ALICE": {
+###         "tables": {
+###           "ORDERS_PUBLIC": {
+###             "regions": [
+###               "EU",
+###               "UK"
+###             ]
+###           },
+###           "CUSTOMERS": {
+###             "all_rows": true
+###           }
+###         }
+###       },
+###       "BOB": {
+###         "tables": {
+###           "ORDERS_PUBLIC": {
+###             "regions": [
+###               "US"
+###             ]
+###           }
+###         }
+###       },
+###       "CAROL": {
+###         "tables": {
+###           "ORDERS_PUBLIC": {
+###             "regions": [
+###               "APAC"
+###             ]
+###           }
+###         }
+###       }
+###     }
+###   }
+
+### ONE call per (user, table): POST /v1/compile
+###   query   = data.gate.allow == true
+###   input   = {user, table}
+###   unknowns= [input.row]
+
+==============================================================
+USER     TABLE           COMPILE RESULT                     MEANING
+==============================================================
+ALICE    ORDERS_PUBLIC   {"queries":[[{"index":0,"terms":[  FILTER on region in [EU,UK]
+ALICE    CUSTOMERS       {"queries":[[]]}                   ALLOW ALL -- no filter needed
+ALICE    ORDERS_SECRET   {}                                 DENY -- no rows may be read
+BOB      ORDERS_PUBLIC   {"queries":[[{"index":0,"terms":[  FILTER on region in [US]
+CAROL    ORDERS_PUBLIC   {"queries":[[{"index":0,"terms":[  FILTER on region in [APAC]
+BOB      CUSTOMERS       {}                                 DENY -- no rows may be read
+NOBODY   ORDERS_PUBLIC   {}                                 DENY -- no rows may be read
+
+-- the two DENY cases in full, so there is no doubt they are empty --
+  ALICE  / ORDERS_SECRET : {}
+  NOBODY / ORDERS_PUBLIC : {}
+
+-- ALICE / ORDERS_PUBLIC residual, the row conditions that survived --
+  ┌─────────┬──────────────────────────────────┐
+   Query 1  input.row.region in ["EU", "UK"] 
+  └─────────┴──────────────────────────────────┘
+
+-- CONTROL: is DENY really different from a FILTER that matches nothing? --
+   CAROL / ORDERS_PUBLIC is a FILTER on region APAC. The fixture has no APAC
+   rows, so it returns 0 rows -- but the ANSWER is a filter, not a denial.
+   ALICE / ORDERS_SECRET is {}: there is no filter to apply at all, because
+   the table itself is not granted.
+   Both end in no data, and the adapter must still treat them differently:
+   an empty result set vs a refused query. Executed in evidence/09 as
+   tbl-carol-orders_public (FILTER, 0 rows) vs tbl-alice-orders_secret (DENY ALL).
+
+-- latency, 100 calls (ALICE / ORDERS_PUBLIC) --
+  median = 1.308 ms   p95 = 3.336 ms   max = 7.381 ms

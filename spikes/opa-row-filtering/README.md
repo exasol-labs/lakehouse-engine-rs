@@ -27,7 +27,7 @@ DataFusion predicate, and the compiled output plans, returns the correct rows, a
 answers sharded and single-node. The AST also distinguishes allow-all from deny-all from
 filter, which is exactly the fail-open hole pass 1 found and could not close.
 
-**Pass 4** ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)-[§12](#12-end-to-end-flow))
+**Pass 4** ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)-[§13](#13-is-the-lakekeeper-check-complementary-or-can-opa-do-the-table-gate-too))
 answers two follow-ups. A Lakekeeper per-table grant *is* enforceable on another user's behalf --
 verified live, and it fails closed -- but only on an OpenFGA-backed deployment, and its vocabulary
 stops at the table, so it is a **gate in front of** row filtering, not a replacement for it. And the
@@ -35,7 +35,10 @@ Exasol user name is not the Lakekeeper/OPA subject, so a `USER_MAPPING` property
 `EXA_DBA_USERS.OPENID_SUBJECT` is not usable, so the property is the only path -- and it must map to
 the **IdP subject**, with Lakekeeper's `<idp-id>~` prefix added by the Lakekeeper client, because
 Lakekeeper rejects an unprefixed id (HTTP 422) while OPA must not see the prefix at all.
-[§12](#12-end-to-end-flow) has the end-to-end sequence diagrams for both flows.
+[§12](#12-end-to-end-flow) has the end-to-end sequence diagrams for both flows, and
+[§13](#13-is-the-lakekeeper-check-complementary-or-can-opa-do-the-table-gate-too) shows that OPA can
+do the table gate itself -- a denied table is just a residual of `{}` -- so Lakekeeper is a
+permission *source*, not a second enforcement point.
 
 So: the feature is real, OPA is the right tool, and **Rego is never translated**. It is evaluated;
 what gets translated is the expression tree OPA hands back.
@@ -63,6 +66,7 @@ scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
 scripts/90-idp-auth.sh                 # pass 3: shared IdP; needs Keycloak, see header
 scripts/95-per-user-data.sh            # per-user permissions as plain OPA data
 scripts/97-lakekeeper-table-grants.sh  # per-table grants; needs the OpenFGA overlay, see header
+scripts/96-table-gate.sh               # table gate + row filter from ONE policy and ONE call
 scripts/98-user-id-namespace.sh        # what the Lakekeeper user id is made of; no minio needed
 ```
 
@@ -82,6 +86,7 @@ scripts/98-user-id-namespace.sh        # what the Lakekeeper user id is made of;
 | `evidence/11-per-user-data.txt` | Per-user permissions as an OPA data document, no groups, no HTTP |
 | `evidence/12-lakekeeper-table-grants.txt` | Live Lakekeeper+OpenFGA: a per-table grant asked on another user's behalf |
 | `evidence/13-user-id-namespace.txt` | Live: what Lakekeeper's `<idp-id>~<sub>` user id is made of, and what it rejects |
+| `evidence/14-table-gate.txt` | One policy, one call: table access AND row filter, three distinct answers |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
 own feature set, `crates/lakehouse-engine/Cargo.toml:32`), Exasol 2025.1.16, Trino `master` as of
@@ -998,10 +1003,11 @@ in the shared IdP, so groups are available without any per-user credential
 8. **Point OPA at the catalog's Keycloak realm**, gate its API with a `system.authz` policy that
    verifies the engine's existing token, and give OPA its own confidential client for IdP lookups
    rather than widening the catalog client's privileges.
-9. **Add a table-level gate before the predicate** if the deployment has an OpenFGA-backed
-   Lakekeeper: one `batch-check` per table on the querying user's behalf, refusing the query on
-   `allowed: false` ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)). It shares one
-   permission model with the catalog but stops at the table, so it does not replace step 3.
+9. **Put the table gate in the same policy**, not in a second call: an ungranted table makes the
+   residual `{}`, which step 4 already refuses
+   ([§13](#13-is-the-lakekeeper-check-complementary-or-can-opa-do-the-table-gate-too)). Add a
+   Lakekeeper `batch-check` only if table grants must stay authoritative in the catalog for other
+   engines ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)).
 10. **Resolve the subject before either call.** `USER_MAPPING` maps the Exasol user to the **IdP
     subject**; the Lakekeeper client prepends `<LAKEKEEPER_IDP_ID>~` (its own separate property) and
     OPA gets the bare subject; an unmapped user refuses the query
@@ -1330,3 +1336,101 @@ confidential client ([§9.7](#97-design-note-worth-flagging)). Verified in `evid
 Every failure is a refused query, never a query without a filter and never a silently empty result.
 [§5](#5-failure-modes) is why this table is stated so bluntly: the Trino-style endpoint made four of
 these rows answer "unrestricted" instead.
+
+---
+
+## 13. Is the Lakekeeper check complementary, or can OPA do the table gate too?
+
+**OPA can do both.** They are not complementary in *capability* — they overlap. The table gate is the
+degenerate case of a row filter: if no `allow` rule can ever hold, partial evaluation returns no
+queries at all, which is DENY, which is "no rows may be read". One policy, one `/v1/compile` call,
+three answers. Evidence: `evidence/14-table-gate.txt`, `scripts/96-table-gate.sh`,
+`policies-tables/gate.rego`, executed in `evidence/09`.
+
+The whole policy is 12 lines, and the table grant and the row limit sit in the same data document:
+
+```rego
+package gate
+
+# Absent user or absent table -> `grant` is undefined -> every rule below is
+# undefined -> the Compile API returns {} = DENY.
+grant := data.permissions[input.user].tables[input.table]
+
+allow if grant.all_rows            # table granted, no row limit -> ALLOW ALL
+
+allow if {                         # table granted, row limit    -> FILTER
+	not grant.all_rows
+	input.row.region in grant.regions
+}
+```
+
+```json
+{"permissions": {
+  "ALICE": {"tables": {"ORDERS_PUBLIC": {"regions": ["EU","UK"]},
+                       "CUSTOMERS":     {"all_rows": true}}},
+  "BOB":   {"tables": {"ORDERS_PUBLIC": {"regions": ["US"]}}},
+  "CAROL": {"tables": {"ORDERS_PUBLIC": {"regions": ["APAC"]}}}}}
+```
+
+Live, one call per `(user, table)`:
+
+```
+USER     TABLE           COMPILE RESULT                     MEANING
+ALICE    ORDERS_PUBLIC   {"queries":[[{"index":0,...        FILTER on region in [EU,UK]
+ALICE    CUSTOMERS       {"queries":[[]]}                   ALLOW ALL -- no filter needed
+ALICE    ORDERS_SECRET   {}                                 DENY -- no rows may be read
+BOB      ORDERS_PUBLIC   {"queries":[[{"index":0,...        FILTER on region in [US]
+CAROL    ORDERS_PUBLIC   {"queries":[[{"index":0,...        FILTER on region in [APAC]
+BOB      CUSTOMERS       {}                                 DENY -- no rows may be read
+NOBODY   ORDERS_PUBLIC   {}                                 DENY -- no rows may be read
+```
+
+Through the translation layer and executed (`evidence/09`):
+
+```
+tbl-alice-orders_public  -> FILTER ("REGION" IN ('EU','UK'))  5 rows; sharded 5 = single 5
+tbl-alice-customers      -> ALLOW ALL (filter stays None)
+tbl-alice-orders_secret  -> DENY ALL (refuse the query)
+tbl-bob-orders_public    -> FILTER ("REGION" IN ('US'))       2 rows; sharded 2 = single 2
+tbl-carol-orders_public  -> FILTER ("REGION" IN ('APAC'))     0 rows; sharded 0 = single 0
+tbl-nobody-orders_public -> DENY ALL (refuse the query)
+```
+
+0.68 ms median (n=100) — the same call that produces the filter, so the gate is free.
+
+### 13.1 DENY is not "a filter that matches nothing"
+
+CAROL and ALICE/ORDERS_SECRET both end with no data, and the adapter must still treat them
+differently:
+
+| Case | Compile result | Adapter behaviour |
+|---|---|---|
+| `CAROL` / `ORDERS_PUBLIC` | `{"queries":[[...APAC...]]}` | scan with the filter, return **0 rows** |
+| `ALICE` / `ORDERS_SECRET` | `{}` | **refuse the query** — there is no filter to apply |
+
+Collapsing the second into an empty result set would tell a user their query succeeded over a table
+they may not read, which is an information leak about the data rather than about the permission.
+
+### 13.2 So the real choice is where permissions are administered
+
+One point first, because it changes the comparison: **Lakekeeper cannot enforce alice's grants on our
+traffic at all.** The engine reaches the catalog as one service account
+([mission](../../specs/mission.md)), so everything Lakekeeper sees is that service account. Asking
+`batch-check` about alice is us *voluntarily consulting* its model; the enforcement is ours in every
+arrangement. Lakekeeper is a permission *source*, not a second enforcement point.
+
+| Arrangement | Calls per query | Where grants live | Notes |
+|---|---|---|---|
+| **A. OPA does both** | 1 (`/v1/compile`) | OPA's `data`, shipped as a bundle | simplest; table + row in one model; verified end to end here |
+| **B. Lakekeeper gates, OPA filters** | 2 (`batch-check` + `compile`) | table grants in the catalog, row rules in OPA | one model shared with every catalog client; needs the OpenFGA backend ([§10](#10-can-opa-enforce-a-lakekeeper-per-table-grant)); two models to keep coherent |
+| **C. OPA gates *via* Lakekeeper** | 1 from the adapter, 2 behind it | table grants in the catalog, row rules in OPA | Lakekeeper's own bridge pattern ([§9.6](#96-how-lakekeepers-own-opa-integration-differs)); needs `nondeterministicBuiltins: true` or the `http.send` is skipped ([§9.3](#93-the-trap-partial-evaluation-skips-httpsend-by-default)) |
+
+**Recommendation: A**, unless table grants must be administered in the catalog because other engines
+(Spark, Trino) read the same warehouse and have to honour the same grants. In that case **C** keeps
+the adapter to one call and the grants authoritative in Lakekeeper — at the cost of the
+nondeterministic-builtin option, the extra latency ([§9.4](#94-cost-of-the-idp-round-trips)) and the
+credential-in-residual caveat.
+
+**Not tested:** arrangement C wired up. Its two halves are each verified separately — `http.send`
+under `nondeterministicBuiltins` against Keycloak (`evidence/10`) and `batch-check` against
+Lakekeeper (`evidence/12`) — but not composed into one policy.

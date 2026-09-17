@@ -20,6 +20,53 @@ user/case `carol` -> DENY ALL (refuse, or return an empty result)
 ------------------------------------------------------------------
 user/case `unsupported` -> REFUSED: operator `startswith` is not translatable
    (a refusal is a failed query, never a missing filter)
+------------------------------------------------------------------
+user/case `idp-opa-alice` -> FILTER
+   ("REGION" IN ('CH', 'EU', 'UK'))
+   plans and returns: 6 rows
+   sharded partial/merge count = 6, single-node = 6
+------------------------------------------------------------------
+user/case `idp-opa-bob` -> FILTER
+   ("REGION" = 'US' AND "CLASSIFICATION" <> 'SECRET')
+   plans and returns: 0 rows
+   sharded partial/merge count = 0, single-node = 0
+------------------------------------------------------------------
+user/case `idp-opa-nobody` -> DENY ALL (refuse, or return an empty result)
+------------------------------------------------------------------
+user/case `data-alice` -> FILTER
+   ("REGION" IN ('EU', 'UK') AND "CLASSIFICATION" <> 'SECRET')
+   plans and returns: 3 rows
+   sharded partial/merge count = 3, single-node = 3
+------------------------------------------------------------------
+user/case `data-bob` -> FILTER
+   ("REGION" IN ('US') AND "CLASSIFICATION" <> 'SECRET')
+   plans and returns: 0 rows
+   sharded partial/merge count = 0, single-node = 0
+------------------------------------------------------------------
+user/case `data-root` -> ALLOW ALL (no filter; scan spec `filter` stays None)
+------------------------------------------------------------------
+user/case `data-nobody` -> DENY ALL (refuse, or return an empty result)
+------------------------------------------------------------------
+user/case `tbl-alice-orders_public` -> FILTER
+   ("REGION" IN ('EU', 'UK'))
+   plans and returns: 5 rows
+   sharded partial/merge count = 5, single-node = 5
+------------------------------------------------------------------
+user/case `tbl-alice-customers` -> ALLOW ALL (no filter; scan spec `filter` stays None)
+------------------------------------------------------------------
+user/case `tbl-alice-orders_secret` -> DENY ALL (refuse, or return an empty result)
+------------------------------------------------------------------
+user/case `tbl-bob-orders_public` -> FILTER
+   ("REGION" IN ('US'))
+   plans and returns: 2 rows
+   sharded partial/merge count = 2, single-node = 2
+------------------------------------------------------------------
+user/case `tbl-carol-orders_public` -> FILTER
+   ("REGION" IN ('APAC'))
+   plans and returns: 0 rows
+   sharded partial/merge count = 0, single-node = 0
+------------------------------------------------------------------
+user/case `tbl-nobody-orders_public` -> DENY ALL (refuse, or return an empty result)
 
 ==============================================================================
 NEGATIVE CONTROLS on the translation layer itself

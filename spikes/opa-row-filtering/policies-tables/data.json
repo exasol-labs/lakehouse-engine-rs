@@ -1,0 +1,35 @@
+{
+  "permissions": {
+    "ALICE": {
+      "tables": {
+        "ORDERS_PUBLIC": {
+          "regions": [
+            "EU",
+            "UK"
+          ]
+        },
+        "CUSTOMERS": {
+          "all_rows": true
+        }
+      }
+    },
+    "BOB": {
+      "tables": {
+        "ORDERS_PUBLIC": {
+          "regions": [
+            "US"
+          ]
+        }
+      }
+    },
+    "CAROL": {
+      "tables": {
+        "ORDERS_PUBLIC": {
+          "regions": [
+            "APAC"
+          ]
+        }
+      }
+    }
+  }
+}

@@ -107,6 +107,10 @@ async fn main() {
         "alice", "bob", "root", "carol", "unsupported",
         "idp-opa-alice", "idp-opa-bob", "idp-opa-nobody",
         "data-alice", "data-bob", "data-root", "data-nobody",
+        // The table gate and the row filter from ONE policy and ONE call:
+        // see evidence/14. DENY here means "no table access at all".
+        "tbl-alice-orders_public", "tbl-alice-customers", "tbl-alice-orders_secret",
+        "tbl-bob-orders_public", "tbl-carol-orders_public", "tbl-nobody-orders_public",
     ] {
         let path = format!("../compiled/{name}.json");
         let body: serde_json::Value =
