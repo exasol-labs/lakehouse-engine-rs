@@ -47,8 +47,16 @@ own feature set, `crates/lakehouse-engine/Cargo.toml:32`), Exasol 2025.1.16, Tri
 
 ## 1. What exactly does OPA return?
 
-**A SQL expression string in the Trino dialect, and nothing else.** The entire payload type is four
-lines (`evidence/00`, from `schema/OpaViewExpression.java`):
+**Under Trino's contract: a SQL expression string in the Trino dialect, and nothing else.**
+
+Read that as a statement about *Trino's plugin*, not about OPA. OPA has no notion of SQL: it
+evaluates Rego over a JSON input document and returns a JSON document, and it never parses or
+type-checks what a policy emits. Case G in `evidence/03` is the proof, returning an integer where
+the consumer declares a `String`, with HTTP 200 and no complaint. The dialect is imposed entirely by
+the consumer, and the rest of this section describes the consumer Trino ships. What that means for
+our own contract is in [§2.5](#25-what-this-means-for-the-contract) and [§7](#7-verdict).
+
+The entire payload type is four lines (`evidence/00`, from `schema/OpaViewExpression.java`):
 
 ```java
 public record OpaViewExpression(String expression, Optional<String> identity)
