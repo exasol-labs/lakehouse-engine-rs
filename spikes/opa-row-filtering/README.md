@@ -51,6 +51,7 @@ scripts/60-exasol-identity.sh          # needs: docker compose up -d exasol
 scripts/70-partial-evaluation.sh       # pass 2: the Compile API
 scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
 scripts/90-idp-auth.sh                 # pass 3: shared IdP; needs Keycloak, see header
+scripts/95-per-user-data.sh            # per-user permissions as plain OPA data
 ```
 
 | Evidence | What it holds |
@@ -66,6 +67,7 @@ scripts/90-idp-auth.sh                 # pass 3: shared IdP; needs Keycloak, see
 | `evidence/08-opa-partial-evaluation.txt` | Compile API: per-user ASTs, truth-value controls, SQL-target probe |
 | `evidence/09-rego-to-datafusion.txt` | The translation layer's output, planned and executed |
 | `evidence/10-idp-auth.txt` | Live Keycloak: OPA gated on the catalog's own token, groups from the IdP |
+| `evidence/11-per-user-data.txt` | Per-user permissions as an OPA data document, no groups, no HTTP |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
 own feature set, `crates/lakehouse-engine/Cargo.toml:32`), Exasol 2025.1.16, Trino `master` as of
@@ -696,7 +698,7 @@ Stated plainly, because they are the open questions for planning, not the spike'
 
 ### 8.6 Verdict on the mechanism
 
-See [§9.5](#95-revised-verdict) for the overall verdict, which now also covers authentication.
+See [§9.8](#98-revised-verdict) for the overall verdict, which now also covers authentication.
 
 ---
 
@@ -869,7 +871,79 @@ metadata resolution the same plan already does.
 The freshness tradeoff is the real decision, not the latency: a 60 s group cache means a revoked
 group membership keeps granting access for up to a minute.
 
-### 9.5 Design note worth flagging
+### 9.5 Four places the user's permissions can live, and which to pick
+
+The IdP lookup in [§9.2](#92-opa-resolving-the-users-groups-from-the-same-idp) is one option of
+four, and it is not the one to start with.
+
+| Where the data lives | How OPA gets it | Verified |
+|---|---|---|
+| **A. In the policy file** | hardcoded Rego map | `evidence/01` (pass 1) |
+| **B. In OPA's `data` document, shipped as a bundle** | OPA polls a bundle server, caches | `evidence/11` |
+| **C. In the request** | the adapter reads Exasol roles and passes them in | not executed |
+| **D. Fetched live from the IdP** | `http.send` inside the policy | `evidence/10` |
+
+**B is the standard OPA deployment and the simplest thing that works here.** Permissions are just
+JSON, keyed by user, with no groups and no network call at decision time:
+
+```json
+{"permissions": {
+  "ALICE": {"regions": ["EU", "UK"]},
+  "BOB":   {"regions": ["US"]},
+  "ROOT":  {"unrestricted": true}}}
+```
+
+Because `data` is *known*, partial evaluation resolves it completely (`evidence/11`):
+
+```
+ALICE   -> input.row.region in ["EU","UK"] ; input.row.classification != "SECRET"
+BOB     -> input.row.region in ["US"]      ; input.row.classification != "SECRET"
+ROOT    -> empty residual                  = ALLOW ALL
+NOBODY  -> undefined                       = DENY
+```
+
+Through the translation layer and executed (`evidence/09`):
+
+```
+data-alice  -> FILTER ("REGION" IN ('EU','UK') AND "CLASSIFICATION" <> 'SECRET')  3 rows; sharded 3 = single 3
+data-bob    -> FILTER ("REGION" IN ('US') AND "CLASSIFICATION" <> 'SECRET')       0 rows; 0 = 0
+data-root   -> ALLOW ALL
+data-nobody -> DENY ALL
+```
+
+Zero occurrences of `http.send` in the residual, so [§9.3](#93-the-trap-partial-evaluation-skips-httpsend-by-default)'s
+trap does not arise. Latency is 0.71 ms median (n=100), between the 0.2 ms no-data policy and the
+1.2 ms IdP-backed one.
+
+Recommendation: **start at B**, add D only if permissions must be authoritative in an external
+system rather than published to OPA. C is worth keeping in mind because the adapter can already read
+Exasol roles ([§3](#3-is-the-exasol-user-name-enough-as-the-policy-input)) without any IdP at all.
+
+### 9.6 How Lakekeeper's own OPA integration differs
+
+Worth stating explicitly, because it is a *fifth* arrangement and none of the above describes it.
+
+Lakekeeper's bridge does **not** hold a permission model in the policy, and does not fetch groups.
+It asks **Lakekeeper** for the decision. The Rego is a translator from Trino's question shape to
+Lakekeeper's permission API:
+
+```rego
+allow_table_drop if {
+	input.action.operation == "DropTable"
+	require_table_access_simple(catalog, schema, table, "drop")   # -> POST /management/v1/action/batch-check
+}
+```
+
+So the permissions live in Lakekeeper's own model (warehouse, namespace and table grants), the IdP
+grant in `authentication.rego` exists only so OPA may *call* Lakekeeper, and the answer is a boolean
+`allow`. That design has no row filters in it at all, which is what `evidence/07` established by
+searching all 18 of its `.rego` files.
+
+It is a viable fifth option for us, and it has a real attraction: one permission model shared with
+the catalog. But it inherits Lakekeeper's granularity, which stops at the table, so it cannot answer
+a row-level question today. Not investigated.
+
+### 9.7 Design note worth flagging
 
 For the spike I reused the single `lakehouse` client for both the catalog and OPA's IdP lookups, and
 granted it `view-users` on `realm-management`. That visibly widened its token audience
@@ -877,7 +951,7 @@ granted it `view-users` on `realm-management`. That visibly widened its token au
 every user in the realm, which is more privilege than the catalog needs. A separate confidential
 client for OPA, holding `view-users` alone, is the obvious split. Not tested.
 
-### 9.6 Revised verdict
+### 9.8 Revised verdict
 
 
 **Can this ship without per-user catalog identity? Yes.** The single service account is untouched:
@@ -891,18 +965,21 @@ in the shared IdP, so groups are available without any per-user credential
 1. **Call `POST /v1/compile`**, not the row-filters endpoint, with the table row as the unknown, once
    per table at plan time, passing `{"options": {"nondeterministicBuiltins": true}}` so an
    IdP-backed policy resolves. Cost is 0.2 ms without IdP lookups, about 1.2 ms warm with them.
-2. **Compile the AST to a predicate** with an operator allowlist. `df-probe/src/opa_compile.rs` is a
+2. **Put the permissions in OPA's `data` document as a bundle** ([§9.5](#95-four-places-the-users-permissions-can-live-and-which-to-pick)),
+   keyed by Exasol user name. No groups in the request and no IdP call at decision time. Move to a
+   live IdP lookup only if an external system must stay authoritative.
+3. **Compile the AST to a predicate** with an operator allowlist. `df-probe/src/opa_compile.rs` is a
    working sketch of the whole thing; production would route through `vs-expression` instead of
    emitting SQL text directly, so dialect rendering stays in one place.
-3. **Honour all three answers.** Allow-all leaves `filter` as `None`. Filter goes into
+4. **Honour all three answers.** Allow-all leaves `filter` as `None`. Filter goes into
    `CommonScanSpec.filter`. **Deny-all and every `Unsupported` refuse the query.** Never a missing
    filter.
-4. **Constrain the policy style**: no `default` rules on the filtering rule, no builtins outside the
+5. **Constrain the policy style**: no `default` rules on the filtering rule, no builtins outside the
    allowlist, no references outside the unknown row. Enforced by the compiler, documented for
    authors.
-5. **Two injection points**, single-table and per-leg join.
-6. **Scope masking down or defer it.** It is a separate mechanism from row filtering.
-7. **Point OPA at the catalog's Keycloak realm**, gate its API with a `system.authz` policy that
+6. **Two injection points**, single-table and per-leg join.
+7. **Scope masking down or defer it.** It is a separate mechanism from row filtering.
+8. **Point OPA at the catalog's Keycloak realm**, gate its API with a `system.authz` policy that
    verifies the engine's existing token, and give OPA its own confidential client for IdP lookups
    rather than widening the catalog client's privileges.
 

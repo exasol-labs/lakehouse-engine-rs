@@ -1,0 +1,40 @@
+### policy: policies-data/perms.rego      data: policies-data/data.json
+### the whole permission model:
+###   {
+###     "permissions": {
+###       "ALICE": {
+###         "regions": [
+###           "EU",
+###           "UK"
+###         ],
+###         "max_classification": "INTERNAL"
+###       },
+###       "BOB": {
+###         "regions": [
+###           "US"
+###         ],
+###         "max_classification": "PUBLIC"
+###       },
+###       "ROOT": {
+###         "unrestricted": true
+###       }
+###     }
+###   }
+
+==============================================================
+Partial evaluation resolves the data document completely, because data is KNOWN.
+==============================================================
+  ALICE     Query 1 input.row.region in ["EU", "UK"] ; input.row.classification != "SECRET" ; [1 query]
+  BOB       Query 1 input.row.region in ["US"] ; input.row.classification != "SECRET" ; [1 query]
+  ROOT     (empty residual = ALLOW ALL); [1 query]
+  NOBODY   undefined; [no queries = DENY]
+
+  ROOT has unrestricted=true, so its residual is empty = ALLOW ALL.
+  NOBODY is absent from the data, so the policy is undefined = DENY.
+
+-- NEGATIVE CONTROL: no http.send anywhere in the residual --
+  occurrences of http.send in the compiled residual: 0
+0
+
+-- latency, 100 calls --
+  median = 0.707 ms   p95 = 1.104 ms   max = 2.634 ms

@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "ALICE":  {"regions": ["EU", "UK"], "max_classification": "INTERNAL"},
+    "BOB":    {"regions": ["US"],       "max_classification": "PUBLIC"},
+    "ROOT":   {"unrestricted": true}
+  }
+}

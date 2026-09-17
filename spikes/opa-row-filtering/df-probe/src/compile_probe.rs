@@ -106,6 +106,7 @@ async fn main() {
     for name in [
         "alice", "bob", "root", "carol", "unsupported",
         "idp-opa-alice", "idp-opa-bob", "idp-opa-nobody",
+        "data-alice", "data-bob", "data-root", "data-nobody",
     ] {
         let path = format!("../compiled/{name}.json");
         let body: serde_json::Value =
