@@ -1,12 +1,28 @@
 # Spike: can OPA enforce row-level access in lakehouse-engine using only the Exasol user name?
 
-**Verdict up front.** Plan-time enforcement is sound and needs no per-user catalog identity, but
-**Trino's OPA contract cannot be adopted as-is**: it returns a SQL expression *string* in the Trino
-dialect, and **0 of 9** realistic row filters planned in the engine's DataFusion when spliced in
-verbatim (`evidence/05`, PROBE 1). After an adapter-side identifier rewrite, 7 of 9 planned, but 2
-of those 7 are *silently unsound* rather than correct, and the single documented column-mask example
-from Trino's own docs returns the **unmasked value** with no error anywhere. The feature is real;
-the contract is not. Full verdict and costing in [§7](#7-verdict).
+**Verdict: yes.** Build a layer that compiles OPA's partial-evaluation output into a DataFusion
+predicate. Do not use the SQL-string contract Trino's plugin uses.
+
+This README covers two passes.
+
+**Pass 1** followed the brief's prior art, Trino's `trino-opa` plugin, in which OPA returns a SQL
+expression *string*. That contract fails here: **0 of 9** realistic row filters planned in the
+engine's DataFusion verbatim, 5 of 9 after an identifier rewrite, and the residue includes silent
+wrong answers (Trino's own documented column-mask example returns the **unmasked** value). Worse, an
+unknown user, a mistyped policy path and a crashed policy all answer HTTP 200 meaning "unrestricted".
+Sections [1](#1-what-exactly-does-opa-return) to [6](#6-cost) are that pass, and they remain the
+reason not to copy Trino's design.
+
+**Pass 2** ([§8](#8-the-mechanism-pass-1-missed-opa-partial-evaluation)) tests the mechanism pass 1
+missed, and it is the one to build on. OPA's Compile API (`POST /v1/compile`) partial-evaluates a
+policy with the table row declared *unknown* and returns the residual conditions as a **structured
+AST**, not a string. A 230-line translation layer written for this spike compiles that AST into a
+DataFusion predicate, and the compiled output plans, returns the correct rows, and gives identical
+answers sharded and single-node. The AST also distinguishes allow-all from deny-all from
+filter, which is exactly the fail-open hole pass 1 found and could not close.
+
+So: the feature is real, OPA is the right tool, and **Rego is never translated**. It is evaluated;
+what gets translated is the expression tree OPA hands back.
 
 Everything below is backed by a transcript in `evidence/` or a quoted source file. Where something
 was reasoned about rather than executed it says so explicitly.
@@ -26,6 +42,8 @@ scripts/30-failure-modes.sh
 scripts/40-latency.sh
 scripts/50-translate-probe.sh          # cargo; df-probe/ is NOT a workspace member
 scripts/60-exasol-identity.sh          # needs: docker compose up -d exasol
+scripts/70-partial-evaluation.sh       # pass 2: the Compile API
+scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
 ```
 
 | Evidence | What it holds |
@@ -38,6 +56,8 @@ scripts/60-exasol-identity.sh          # needs: docker compose up -d exasol
 | `evidence/05-datafusion-translation.txt` | 7 probes against real DataFusion 54.1, incl. negative controls |
 | `evidence/06-exasol-identity.txt` | Live Exasol 2025.1.16: what identity attributes exist |
 | `evidence/07-lakekeeper-refutation.txt` | All 18 Lakekeeper `.rego` files searched for the row-filter contract |
+| `evidence/08-opa-partial-evaluation.txt` | Compile API: per-user ASTs, truth-value controls, SQL-target probe |
+| `evidence/09-rego-to-datafusion.txt` | The translation layer's output, planned and executed |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
 own feature set, `crates/lakehouse-engine/Cargo.toml:32`), Exasol 2025.1.16, Trino `master` as of
@@ -491,56 +511,205 @@ planning any query, alongside the catalog.
 
 ---
 
-## 7. Verdict
+## 7. Verdict on the string contract (pass 1)
 
-**Can this ship without per-user catalog identity? Yes, and the single service account is genuinely
-untouched. But not by adopting Trino's OPA contract, and the epic as framed should not proceed.**
+Kept because it is the argument for not copying Trino's design. The overall verdict is in
+[§8.6](#86-revised-verdict).
 
-What the evidence supports:
+The enforcement *model* is sound: one plan-time call, answer folded into the shard-invariant spec,
+filter placed pre-aggregation in every shape, verified against single-node answers, unstrippable by
+the user (#402). Identity is adequate and closable ([§3](#3-is-the-exasol-user-name-enough-as-the-policy-input)).
+Cost is 0.2 ms per table.
 
-- The enforcement model is sound. One plan-time call, answer folded into the shard-invariant spec,
-  filter placed pre-aggregation in every pushdown shape, verified equal to the single-node answer in
-  all six shapes (`evidence/05` PROBE 4), and unstrippable by the user (#402). Catalog authentication
-  never enters the picture: the decision is made from the Exasol user name, and the service account
-  keeps doing exactly what it does now.
-- The identity input is adequate and closable. User name from `ctx.current_user()`, groups from
-  `SYS.EXA_DBA_ROLE_PRIVS` including the transitive closure, verified live, and an IdP bridge via
-  `DISTINGUISHED_NAME`/`OPENID_SUBJECT` if attributes beyond roles are ever needed
-  (`evidence/06`).
-- Cost is not a factor: 0.2 ms per table.
+What kills the *string contract*, specifically:
 
-What kills the contract, not the idea:
-
-1. **0 of 9 filters work as delivered; 5 of 9 are sound after a rewrite the adapter must own.**
-2. **Some failures are silent.** Trino's own documented mask example returns the unmasked column
-   (`evidence/05` PROBE 6a). `current_date` in a filter diverges per shard, the exact defect the
-   engine already fixed by withdrawing that capability (`capabilities.rs:117-132`). A filter ending
-   in `--` deletes the engine's `ORDER BY` and `LIMIT` (PROBE 7).
+1. **0 of 9 work as delivered; 5 of 9 are sound after a rewrite the adapter must own.**
+2. **Some failures are silent.** Trino's documented mask example returns the unmasked column.
+   `current_date` diverges per shard, the exact defect `capabilities.rs:117-132` withdrew that
+   function family to prevent. A filter ending in `--` deletes the engine's `ORDER BY` and `LIMIT`.
 3. **The contract cannot express "deny" or "the policy layer is down".** Unknown user, mistyped rule
-   name, mistyped package, and a Rego division by zero all return HTTP 200 and mean "unrestricted"
-   (`evidence/03` B, C, D, E). A policy-path typo is a silent grant of full table access. This is not
-   fixable downstream: the information is not on the wire.
+   name, mistyped package and a Rego division by zero all return HTTP 200 meaning "unrestricted".
+   A policy-path typo silently grants full table access, and the information needed to detect it is
+   not on the wire.
 
-What to build instead, if the epic proceeds. The change is to the *contract*, and it reuses machinery
-that already exists:
+Point 3 is the decisive one, because it is unfixable downstream. [§8](#8-the-mechanism-pass-1-missed-opa-partial-evaluation)
+shows a different OPA endpoint that does not have it.
 
-- **A structured predicate, not a SQL string.** OPA returns JSON; Rego can emit any shape. Route it
-  through `vs-expression`, which already owns dialect rendering and already declines unknown function
-  names by gate rather than by accident (`TRANSLATED_SCALAR_FNS`, `lib.rs:119-251`). Every silent
-  failure in [§2](#2-can-we-translate-what-it-returns) becomes an explicit decline.
-- **An affirmative envelope.** `{"decision": "allow"|"deny"|"filter", ...}`, with anything else,
-  including absence, meaning deny. This is the only way to distinguish silence from permission.
-- **Two injection points**, single-table (`mod.rs:360-380`) and per-leg join (`plan_join`), plus the
-  `declined_filter` route and the `refused_columns` interaction.
-- **Column masking scoped down or dropped.** With `crypto_expressions` off, hashing masks do not
-  plan at all; with them on, the digest still would not match Trino's. `NULL` and `CASE` masks work.
-  Anything richer needs the same structured treatment as filters.
+---
 
-A rough shape of the cost, for planning only and not a committed estimate: the OPA client, identity
-resolution, and the envelope are small and well-bounded. The structured-predicate contract plus its
-`vs-expression` integration is the bulk, and the join-leg injection point is the part most likely to
-be underestimated. Sizing that properly is a `/speq:plan` exercise, not a spike conclusion.
+## 8. The mechanism pass 1 missed: OPA partial evaluation
 
-**If the requirement is specifically "reuse Trino's OPA policies unchanged", the answer is no,
-with evidence.** The dialect does not survive the crossing, the entitlement-table shape cannot
-survive it at all, and the failure semantics are unsafe by construction.
+### 8.1 What it is
+
+Rego is not a query language, so there is nothing in Rego to translate. It is an evaluation
+language. But OPA can evaluate a policy *partially*: declare some of the input unknown, and OPA
+resolves everything it does know and returns what is left over.
+
+Point it at a row and that residue is precisely a row filter. The policy
+(`policies/filtering2.rego`) contains no SQL at all, only conditions on `input.row`:
+
+```rego
+allow if {
+	not "admin" in user_roles[input.user]
+	input.row.region == user_region[input.user]
+	input.row.classification != "SECRET"
+}
+```
+
+Ask OPA to compile it with `input.row` unknown, for `{"user": "alice"}`, and the role lookup and the
+region lookup are gone, resolved against data OPA holds. In readable form
+(`opa eval --partial --format=pretty`, `evidence/08`):
+
+```
+allow if {
+  "EU" = input.row.region
+  input.row.classification != "SECRET"
+}
+allow if {
+  input.row.region in {"CH", "UK"}
+  input.row.o_totalprice < 100000
+}
+```
+
+The machine-readable form from `POST /v1/compile` is a `queries` array: a **disjunction of
+conjunctions**, each expression a typed triple of an operator ref, operands, and literals. Excerpt:
+
+```json
+{"terms":[{"type":"ref","value":[{"type":"var","value":"eq"}]},
+          {"type":"string","value":"EU"},
+          {"type":"ref","value":[{"type":"var","value":"input"},
+                                 {"type":"string","value":"row"},
+                                 {"type":"string","value":"region"}]}]}
+```
+
+No dialect, no string to parse, no trust required. That is the input a translation layer wants.
+
+### 8.2 It answers three ways, not one
+
+This is what closes the fail-open hole in [§5](#5-failure-modes). Verified with explicit controls
+rather than inferred (`evidence/08`):
+
+| Response | Meaning | Control used |
+|---|---|---|
+| `{"queries":[[]]}` | one empty conjunction, unconditionally **TRUE**, allow all | `query: "1 == 1"` |
+| `{}` (no `queries` key) | unsatisfiable, **DENY** all | `query: "1 == 2"` |
+| `{"queries":[[...]]}` | residual conditions, **FILTER** | `query: "input.row.x == 1"` |
+
+Run against the real policy, the four users separate cleanly:
+
+| User | Response | Decision |
+|---|---|---|
+| `alice` (eu_staff) | two conjunctions | filter |
+| `bob` (analyst) | one conjunction | filter |
+| `root` (admin) | `{"queries":[[]]}` | allow all |
+| `carol` (in no role map) | `{}` | **deny all** |
+
+Compare `carol` with pass 1: on the row-filters endpoint the same unknown user produced
+`{"result":[]}`, meaning unrestricted. Here she produces deny. Same OPA, same policy intent,
+opposite default, because the endpoint can express unsatisfiability and the string list cannot.
+
+### 8.3 The translation layer, written and executed
+
+`df-probe/src/opa_compile.rs`, about 230 lines including comments. It walks the AST and returns a
+three-way `Decision`:
+
+```rust
+pub enum Decision { AllowAll, DenyAll, Filter(String) }
+pub struct Unsupported(pub String);   // every variant must become a refusal
+```
+
+Accepted surface, deliberately small: `eq`, `neq`, `lt`, `lte`, `gt`, `gte`,
+`internal.member_2` (Rego's `in`), conjunction, disjunction, negation, and scalar literals.
+Operators are matched **by name against an allowlist**, so anything outside it is refused rather
+than rendered, which is the property the string contract could not offer. Column references must be
+rooted at the declared unknown, and are emitted as quoted UPPERCASE identifiers to match
+`build_alias_items`, which is what made every pass-1 filter fail to resolve.
+
+Fed the captured ASTs and executed against the same two-shard DataFusion fixture
+(`evidence/09`):
+
+```
+alice -> FILTER
+   ("REGION" = 'EU' AND "CLASSIFICATION" <> 'SECRET') OR ("REGION" IN ('CH', 'UK') AND "O_TOTALPRICE" < 100000)
+   plans and returns: 4 rows
+   sharded partial/merge count = 4, single-node = 4
+bob   -> FILTER  ("REGION" = 'US' AND "CLASSIFICATION" <> 'SECRET')   0 rows, sharded 0 = single 0
+root  -> ALLOW ALL (no filter; scan spec `filter` stays None)
+carol -> DENY ALL
+startswith case -> REFUSED: operator `startswith` is not translatable
+```
+
+The compiled predicate is ordinary DataFusion SQL, so it drops into `CommonScanSpec.filter` and
+inherits the placement already verified correct in all six pushdown shapes
+([§4](#4-composition-with-pushdown)).
+
+### 8.4 Negative controls on the layer itself
+
+Each of these must refuse or neutralise, never emit a permissive filter (`evidence/09`):
+
+| Input | Result |
+|---|---|
+| unknown operator `startswith` | REFUSED by name |
+| clock builtin `time.now_ns` | REFUSED by name, so [§2.2](#22-after-an-identifier-rewrite-what-survives)'s per-shard clock defect is unreachable |
+| reference to `data.acl.r`, i.e. another table | REFUSED: references no column of the unknown row |
+| literal `EU' OR 1=1 -- ` | escaped to `'EU'' OR 1=1 -- '`, 0 rows; neither closes the string nor starts a comment |
+| response carries a `support` module | REFUSED: not translatable by this layer |
+| `x in {}` (empty set) | compiled to `FALSE`, not `IN ()` |
+
+The clock and cross-table cases are worth dwelling on: in pass 1 those were a silent correctness bug
+and a planning error respectively. Here both are refusals produced by construction, because the
+allowlist has no entry for them.
+
+### 8.5 What this still does not solve
+
+Stated plainly, because they are the open questions for planning, not the spike's conclusion.
+
+- **The SQL targets are not available.** The Compile API documents SQL and UCAST targets via the
+  `Accept` header. This open-source OPA 1.20.2 build **ignored** every one and returned the plain
+  AST (`evidence/08`, negative control). Since the offered targets are Postgres, MySQL, SQLServer
+  and Prisma, none of which is DataFusion, we would be writing our own compiler regardless. Not
+  investigated: whether the targets require Styra's Enterprise OPA, and whether the UCAST
+  intermediate form would be a better input than the raw AST.
+- **`default` rules produce a support module instead of flat queries.** `filtering.rego`, which has
+  `default allow := false`, returned a `support` module that the layer refuses. `filtering2.rego`
+  without the default returned flat `queries`. So policies must be written in a partial-eval-friendly
+  style, and that constraint needs documenting. Not investigated: whether `--shallow-inlining` or a
+  rule restructure removes the limitation generally.
+- **Rego has no NULL.** SQL three-valued logic does. `bob`'s filter returned 0 rows partly because
+  `"CLASSIFICATION" <> 'SECRET'` excludes NULL rows. That is the fail-safe direction, but it is a
+  real semantic difference between what a policy author writes and what the scan evaluates, and it
+  needs a documented rule.
+- **Column masking is untouched by pass 2.** Partial evaluation filters rows; it does not produce a
+  projection expression. Pass 1's finding stands: only `NULL` and `CASE` masks work in DataFusion.
+- **Joins still need a second injection point** ([§4](#4-composition-with-pushdown)), and per-leg
+  attribution is unchanged by any of this.
+- **Not executed end to end.** No adapter code was written, per the brief. The layer was driven from
+  captured OPA responses against a DataFusion fixture, not from a live Exasol query.
+
+### 8.6 Revised verdict
+
+**Can this ship without per-user catalog identity? Yes.** The single service account is untouched:
+the decision is made from the Exasol user name, and the catalog never learns who asked.
+
+**Build:** a Rego-to-DataFusion compiler over OPA's Compile API output.
+
+1. **Call `POST /v1/compile`**, not the row-filters endpoint, with the table row as the unknown, once
+   per table at plan time. Cost is unchanged from [§6](#6-cost).
+2. **Compile the AST to a predicate** with an operator allowlist. `df-probe/src/opa_compile.rs` is a
+   working sketch of the whole thing; production would route through `vs-expression` instead of
+   emitting SQL text directly, so dialect rendering stays in one place.
+3. **Honour all three answers.** Allow-all leaves `filter` as `None`. Filter goes into
+   `CommonScanSpec.filter`. **Deny-all and every `Unsupported` refuse the query.** Never a missing
+   filter.
+4. **Constrain the policy style**: no `default` rules on the filtering rule, no builtins outside the
+   allowlist, no references outside the unknown row. Enforced by the compiler, documented for
+   authors.
+5. **Two injection points**, single-table and per-leg join.
+6. **Scope masking down or defer it.** It is a separate mechanism from row filtering.
+
+**Do not build:** anything that accepts a SQL string from a policy. Sections 1 to 6 are the evidence
+for why.
+
+**If the requirement is specifically "reuse Trino's OPA policies unchanged", that is still no.**
+Those policies emit Trino SQL strings; this design needs policies written against the row as
+structured Rego. The policy language is the same, the contract is not.

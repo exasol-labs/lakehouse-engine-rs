@@ -1,0 +1,32 @@
+==============================================================================
+Compiling REAL OPA /v1/compile responses into DataFusion predicates
+==============================================================================
+policy: policies/filtering2.rego   unknown: input.row
+
+------------------------------------------------------------------
+user/case `alice` -> FILTER
+   ("REGION" = 'EU' AND "CLASSIFICATION" <> 'SECRET') OR ("REGION" IN ('CH', 'UK') AND "O_TOTALPRICE" < 100000)
+   plans and returns: 4 rows
+   sharded partial/merge count = 4, single-node = 4
+------------------------------------------------------------------
+user/case `bob` -> FILTER
+   ("REGION" = 'US' AND "CLASSIFICATION" <> 'SECRET')
+   plans and returns: 0 rows
+   sharded partial/merge count = 0, single-node = 0
+------------------------------------------------------------------
+user/case `root` -> ALLOW ALL (no filter; scan spec `filter` stays None)
+------------------------------------------------------------------
+user/case `carol` -> DENY ALL (refuse, or return an empty result)
+------------------------------------------------------------------
+user/case `unsupported` -> REFUSED: operator `startswith` is not translatable
+   (a refusal is a failed query, never a missing filter)
+
+==============================================================================
+NEGATIVE CONTROLS on the translation layer itself
+==============================================================================
+  unknown operator (startswith)                  -> REFUSED: operator `startswith` is not translatable
+  clock builtin (time.now_ns)                    -> REFUSED: operator `time.now_ns` is not translatable
+  column from a DIFFERENT table (join attempt)   -> REFUSED: expression `eq` references no column of the unknown row
+  quote-injection in a string literal            -> FILTER ("REGION" = 'EU'' OR 1=1 -- ')   -> 0 rows
+  support module present (default rule)          -> REFUSED: response carries a `support` module (policy uses a default rule or recursion); not translatable by this layer
+  empty set in an `in`                           -> FILTER (FALSE)   -> 0 rows
