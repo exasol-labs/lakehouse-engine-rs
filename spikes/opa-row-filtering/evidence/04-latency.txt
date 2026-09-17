@@ -4,23 +4,23 @@
 
 single-call round trip, ms (includes one fresh curl process per call):
   n      = 300
-  min    = 0.422
-  median = 0.556
-  p95    = 0.968
-  p99    = 1.845
-  max    = 2.617
-  mean   = 0.632
+  min    = 0.429
+  median = 0.574
+  p95    = 1.158
+  p99    = 2.757
+  max    = 6.426
+  mean   = 0.677
 
 same N calls in ONE curl process (HTTP keep-alive, no per-call fork):
   n      = 300
-  min    = 0.141
-  median = 0.203
-  p95    = 0.324
-  p99    = 0.852
-  max    = 1.672
+  min    = 0.109
+  median = 0.167
+  p95    = 0.283
+  p99    = 1.511
+  max    = 1.613
 
-  projected plan-time cost for a  1-table query (1 sequential row-filter calls): 0.20 ms
-  projected plan-time cost for a  2-table query (2 sequential row-filter calls): 0.41 ms
-  projected plan-time cost for a  5-table query (5 sequential row-filter calls): 1.02 ms
-  projected plan-time cost for a 10-table query (10 sequential row-filter calls): 2.03 ms
-  projected plan-time cost for a 20-table query (20 sequential row-filter calls): 4.06 ms
+  projected plan-time cost for a  1-table query (1 sequential row-filter calls): 0.17 ms
+  projected plan-time cost for a  2-table query (2 sequential row-filter calls): 0.33 ms
+  projected plan-time cost for a  5-table query (5 sequential row-filter calls): 0.84 ms
+  projected plan-time cost for a 10-table query (10 sequential row-filter calls): 1.67 ms
+  projected plan-time cost for a 20-table query (20 sequential row-filter calls): 3.35 ms

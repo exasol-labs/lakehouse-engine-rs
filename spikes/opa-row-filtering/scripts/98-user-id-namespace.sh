@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# PARKED -- see README section 13. Only matters if the Lakekeeper table gate is
+# ever built; the OPA-only design needs no Lakekeeper identity at all.
+#
 # Where does the "oidc~" in Lakekeeper's user id come from, is the un-prefixed
 # form usable, and can the adapter look the canonical id up instead of building
 # it? Needs the OpenFGA overlay (see 97-lakekeeper-table-grants.sh header);

@@ -37,4 +37,4 @@ Partial evaluation resolves the data document completely, because data is KNOWN.
 0
 
 -- latency, 100 calls --
-  median = 0.707 ms   p95 = 1.104 ms   max = 2.634 ms
+  median = 0.696 ms   p95 = 1.074 ms   max = 2.412 ms

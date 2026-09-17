@@ -63,12 +63,12 @@ CASE H. policy reads resource.table.columns (absent from GetRowFilters)
 
 
 ==============================================================
-CASE I. OPA UNREACHABLE (nothing listening on :18181)
--- url: http://127.0.0.1:18181/v1/data/trino/rowFilters
+CASE I. OPA UNREACHABLE (nothing listening on :45871)
+-- url: http://127.0.0.1:45871/v1/data/trino/rowFilters
 -- http status: 000CURL_FAIL
 -- body:
 {}
 
 -- curl stderr:
-curl: (7) Failed to connect to 127.0.0.1 port 18181 after 0 ms: Could not connect to server
+curl: (7) Failed to connect to 127.0.0.1 port 45871 after 0 ms: Could not connect to server
 

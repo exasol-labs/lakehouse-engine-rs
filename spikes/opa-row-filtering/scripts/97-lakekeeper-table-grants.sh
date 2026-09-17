@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+# PARKED -- see README section 13. OPA answers the table question itself (an
+# ungranted table makes the residual {} = DENY), so this Lakekeeper path is not
+# part of the feature; it is kept as evidence for a possible separate,
+# table-only alternative for a deployment without OPA.
+#
 # Question: if Lakekeeper grants alice SELECT on one table but not another, can
 # OPA enforce that? This exercises the exact API call Lakekeeper's own OPA bridge
 # makes (authz/opa-bridge/policies/lakekeeper/check.rego

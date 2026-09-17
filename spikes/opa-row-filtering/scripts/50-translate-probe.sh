@@ -5,4 +5,4 @@
 set -euo pipefail
 SPIKE_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$SPIKE_DIR/df-probe"
-cargo run --quiet | tee "$SPIKE_DIR/evidence/05-datafusion-translation.txt"
+cargo run --quiet --bin opa-df-probe | tee "$SPIKE_DIR/evidence/05-datafusion-translation.txt"

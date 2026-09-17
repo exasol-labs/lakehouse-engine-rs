@@ -54,6 +54,8 @@ body orders
 show "H. policy reads resource.table.columns (absent from GetRowFilters)" "$OPA_URL/v1/data/spike/failure/schemaProbe"
 
 body orders
-show "I. OPA UNREACHABLE (nothing listening on :18181)" "http://127.0.0.1:18181/v1/data/trino/rowFilters"
+# Deliberately a high, unlikely port: 18181 is the Iceberg REST catalog's port in
+# this repo's compose file, so using it made this control hit a real server.
+show "I. OPA UNREACHABLE (nothing listening on :45871)" "http://127.0.0.1:45871/v1/data/trino/rowFilters"
 
 echo "wrote $OUT"

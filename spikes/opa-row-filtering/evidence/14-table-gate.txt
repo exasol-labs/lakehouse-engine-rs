@@ -71,4 +71,4 @@ NOBODY   ORDERS_PUBLIC   {}                                 DENY -- no rows may 
    tbl-carol-orders_public (FILTER, 0 rows) vs tbl-alice-orders_secret (DENY ALL).
 
 -- latency, 100 calls (ALICE / ORDERS_PUBLIC) --
-  median = 1.308 ms   p95 = 3.336 ms   max = 7.381 ms
+  median = 0.601 ms   p95 = 0.804 ms   max = 3.068 ms
