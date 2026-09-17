@@ -52,6 +52,25 @@
     crosstable  a reference outside the unknown row -> {} = DENY. Fails closed.
 
 ==============================================================
+4b. EVERY TARGET THIS BUILD ACCEPTS (probed, not documented)
+==============================================================
+  ucast.all        -> {"result":{"query":{"field":"row.o_totalprice","operator":"lt","type":"field","value":100000}}}
+  ucast.minimal    -> {"result":{"query":{"field":"row.o_totalprice","operator":"lt","type":"field","value":100000}}}
+  ucast.prisma     -> {"result":{"query":{"field":"row.o_totalprice","operator":"lt","type":"field","value":100000}}}
+  ucast.linq       -> {"result":{"query":{"field":"row.o_totalprice","operator":"lt","type":"field","value":100000}}}
+  sql.postgresql   -> {"result":{"query":"WHERE row.o_totalprice \u003c E'100000'"}}
+  sql.mysql        -> {"result":{"query":"WHERE row.o_totalprice \u003c '100000'"}}
+  sql.sqlserver    -> {"result":{"query":"WHERE row.o_totalprice \u003c N'100000'"}}
+  sql.sqlite       -> {"result":{"query":"WHERE row.o_totalprice \u003c '100000'"}}
+  sql.duckdb       -> {  "code": "invalid_parameter",  "message": "Accept header: unsupported header: application/vnd.opa.sql.duckdb+json"}
+  sql.datafusion   -> {  "code": "invalid_parameter",  "message": "Accept header: unsupported header: application/vnd.opa.sql.datafusion+json"}
+  sql.generic      -> {  "code": "invalid_parameter",  "message": "Accept header: unsupported header: application/vnd.opa.sql.generic+json"}
+  ir               -> {  "code": "invalid_parameter",  "message": "Accept header: unsupported header: application/vnd.opa.ir+json"}
+    Four UCAST fragments, four SQL dialects. No duckdb, no datafusion, no
+    generic SQL, no IR. sqlite is the closest dialect to DataFusion and still
+    emits the number 100000 as the string literal '100000'.
+
+==============================================================
 5. FRAGMENTS AND OPTIONS
 ==============================================================
   Accept ucast.minimal on `in`   -> {  "code": "evaluation_error",  "message": "error(s) occurred while evaluating query",  "errors": [    {      "code": "pe_fragment_error",      "message": "invalid builtin `in`: unsupp

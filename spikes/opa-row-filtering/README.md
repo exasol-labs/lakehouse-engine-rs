@@ -1535,14 +1535,21 @@ DENY      {}                         <- no `result` key at all
 
 `application/vnd.opa.sql.postgresql+json` returns ready SQL, and it is tempting. Two reasons not to:
 
-1. **No DataFusion dialect.** The offer is Postgres, MySQL, SQL Server, Prisma. Postgres output uses
+1. **No DataFusion dialect.** Probed, not read from docs (`evidence/16`, section 4b) — this build
+   accepts four UCAST fragments (`all`, `minimal`, `prisma`, `linq`) and four SQL dialects
+   (`postgresql`, `mysql`, `sqlserver`, `sqlite`). `duckdb`, `datafusion`, a generic SQL target and
+   `ir` are all rejected with *unsupported header*. `sqlite` is the closest fit and Postgres emits
    `E'...'` escape-string literals, which is not what the engine's aliased inner SELECT expects.
 2. **A numeric literal is emitted as a string.** Measured:
 
    ```
-   UCAST -> {"field":"row.o_totalprice","operator":"lt","value":100000}
-   SQL   -> WHERE row.o_totalprice < E'100000'
+   UCAST            -> {"field":"row.o_totalprice","operator":"lt","value":100000}
+   sql.postgresql   -> WHERE row.o_totalprice < E'100000'
+   sql.sqlite       -> WHERE row.o_totalprice < '100000'
+   sql.sqlserver    -> WHERE row.o_totalprice < N'100000'
    ```
+
+   Every SQL dialect does it, so it is the target's own literal rendering, not one dialect's quirk.
 
    A number rendered as a string literal. In DataFusion that is a planning error or a silent cast,
    neither of which belongs in a security filter.

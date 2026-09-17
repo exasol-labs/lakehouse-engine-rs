@@ -86,6 +86,24 @@ cat <<'NOTE'
 NOTE
 echo
 echo "=============================================================="
+echo "4b. EVERY TARGET THIS BUILD ACCEPTS (probed, not documented)"
+echo "=============================================================="
+for a in ucast.all ucast.minimal ucast.prisma ucast.linq \
+	sql.postgresql sql.mysql sql.sqlserver sql.sqlite \
+	sql.duckdb sql.datafusion sql.generic ir; do
+	printf '  %-16s -> ' "$a"
+	curl -sS -X POST "http://127.0.0.1:$PORT/v1/compile/ucastprobe/numeric" \
+		-H 'Content-Type: application/json' -H "Accept: application/vnd.opa.$a+json" \
+		-d '{"input":{},"unknowns":["input.row"]}' | head -c 130 | tr -d '\n'
+	echo
+done
+cat <<'NOTE'
+    Four UCAST fragments, four SQL dialects. No duckdb, no datafusion, no
+    generic SQL, no IR. sqlite is the closest dialect to DataFusion and still
+    emits the number 100000 as the string literal '100000'.
+NOTE
+echo
+echo "=============================================================="
 echo "5. FRAGMENTS AND OPTIONS"
 echo "=============================================================="
 printf '  Accept ucast.minimal on `in`   -> '
