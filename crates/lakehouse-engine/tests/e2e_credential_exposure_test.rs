@@ -227,3 +227,94 @@ fn revoking_the_owners_scan_grant_denies_the_reader_without_leaking_the_credenti
         SEED_ROWS_SCORE_GT_15 as i64
     );
 }
+
+#[test]
+fn the_reader_cannot_execute_the_pushdown_plan_it_captured() {
+    let _serial = serial();
+    setup_e2e();
+    let password = local_stack_connection_password();
+    let query = format!(
+        "SELECT ID, NAME, SCORE FROM {} WHERE SCORE > 15.0",
+        vs_table()
+    );
+
+    let isolated = isolated_pushdown_statement(&mut reader_conn(), &query);
+
+    assert!(
+        isolated.contains(&format!(r#""{SCHEMA_NAME}".{SCAN_SCRIPT_NAME}"#)),
+        "isolated statement must name the scan script: {isolated}"
+    );
+    assert!(
+        isolated.contains(&format!(r#""{SCHEMA_NAME}".{DISTRIBUTOR_SCRIPT_NAME}"#)),
+        "isolated statement must name the distributor script: {isolated}"
+    );
+    assert!(
+        isolated.contains(&format!("s3://warehouse/{E2E_NAMESPACE}/{E2E_TABLE}")),
+        "isolated statement must carry the table root: {isolated}"
+    );
+    for column in ["ID", "NAME", "SCORE"] {
+        assert!(
+            isolated.contains(&format!(r#""{column}""#)),
+            "isolated statement must carry projection column {column}: {isolated}"
+        );
+    }
+    assert!(
+        isolated.contains(r#""filter":"#),
+        "isolated statement must carry a filter key: {isolated}"
+    );
+    assert!(
+        isolated.contains(r#"\"SCORE\""#),
+        "isolated statement's filter must name the filtered column: {isolated}"
+    );
+    assert!(
+        isolated.contains("VALUES"),
+        "isolated statement must carry a VALUES file list: {isolated}"
+    );
+
+    let mut sys = exa_conn();
+    for script in [
+        ADAPTER_SCRIPT_NAME,
+        SCAN_SCRIPT_NAME,
+        DISTRIBUTOR_SCRIPT_NAME,
+    ] {
+        assert_eq!(
+            sys.query_row_count(&format!(
+                "SELECT * FROM EXA_DBA_OBJ_PRIVS WHERE GRANTEE = '{READER_USER}' AND OBJECT_NAME = '{script}' AND OBJECT_TYPE = 'SCRIPT' AND PRIVILEGE = 'EXECUTE'"
+            )),
+            0
+        );
+    }
+    assert_eq!(
+        sys.query_row_count(&format!(
+            "SELECT * FROM EXA_DBA_SYS_PRIVS WHERE GRANTEE = '{READER_USER}' AND PRIVILEGE = 'EXECUTE ANY SCRIPT'"
+        )),
+        0
+    );
+    assert_eq!(
+        sys.query_row_count(&format!(
+            "SELECT * FROM EXA_DBA_ROLE_PRIVS WHERE GRANTEE = '{READER_USER}'"
+        )),
+        0
+    );
+
+    let denied = reader_conn().try_execute(&isolated);
+    assert_eq!(
+        denied["status"].as_str(),
+        Some("error"),
+        "reader must be denied: {denied}"
+    );
+    let msg = denied["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("insufficient privileges for calling script"),
+        "denial must state insufficient script privilege: {msg}"
+    );
+    for value in [&password.access_key, &password.secret_key] {
+        assert!(!value.is_empty());
+        assert!(!msg.contains(value.as_str()), "credential leaked: {msg}");
+    }
+
+    assert_eq!(
+        reader_conn().query_row_count(&query),
+        SEED_ROWS_SCORE_GT_15 as i64
+    );
+}
