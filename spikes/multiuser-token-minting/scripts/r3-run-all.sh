@@ -27,6 +27,7 @@ run vending       # item 6
 run negative      # item 7
 run bucketfs      # item 8
 run availability  # item 8, blast radius
+run require-connected  # item 8, the REQUIRE_CONNECTED_ON_STARTUP flag
 
 "$HERE/r3-cleanup.sh"
 

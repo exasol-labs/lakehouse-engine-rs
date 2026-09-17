@@ -760,9 +760,10 @@ Four things cost something, and none of them is a blocker:
 * **Retiring a signing key is not immediate.** Publishing a new key takes effect in seconds;
   removing the old one takes up to the catalog's 1 h JWKS cache interval (§20).
 * **An unreachable issuer is fatal to the whole catalog at startup**, not degraded mode. Hosting on
-  BucketFS makes the Exasol cluster a hard startup dependency of the catalog. Measured control: the
-  customer's own IdP is fatal in exactly the same way, so this adds a host to an existing list
-  rather than a new class of failure (§23).
+  BucketFS makes the Exasol cluster a hard startup dependency of the catalog. This is deliberate and
+  it has an off switch, `REQUIRE_CONNECTED_ON_STARTUP=false`, available on the engine's provider but
+  not on the customer's. Measured control: the customer's own IdP is fatal in exactly the same way,
+  so this adds a host to an existing list rather than a new class of failure (§23).
 * **A wrong principal string and a missing grant are indistinguishable** from the response: both are
   `404 NoSuchTableException` (§22).
 
@@ -1046,6 +1047,47 @@ Hosting on BucketFS adds the Exasol cluster to a list that already had the custo
 does not introduce a new class of failure. It is still a real coupling: the catalog can no longer be
 restarted while the Exasol cluster is down.
 
+### The fail-to-start is deliberate, and it is configurable — for our provider only
+
+`evidence/r3-require-connected.txt`, plus a read of
+`crates/lakekeeper/src/service/authn.rs` at tag `v0.13.1`. Every provider carries a
+`require_connected_on_startup` field that defaults to `true` (`#[serde(default = "default_true")]`);
+`build_oidc_authenticators` returns the fatal error only when it is set, and logs
+`Failed to create OIDC authenticator for {idp_id} ... Skipping this provider.` otherwise. It is a
+designed behaviour with its own unit tests, not a bug, and the "required" in the error message is
+that field speaking.
+
+Verified live rather than inferred, all four cases against the same combined configuration:
+
+```
+issuer unreachable, EXASOL__REQUIRE_CONNECTED_ON_STARTUP=false
+    running: true   /health 200   keycloak alice 200   engine-minted 401
+    log: Failed to create OIDC authenticator for exasol (...). Skipping this provider.
+issuer unreachable, flag at its default
+    running: FALSE  Error: Failed to create required OIDC authenticator for exasol (...)
+issuer reachable, flag=false
+    running: true   both authenticators up   keycloak 200   engine-minted 200
+primary IdP unreachable, flag=false on exasol AND an invented primary-level flag set
+    running: FALSE  Error: Failed to create required OIDC authenticator for oidc (...)
+```
+
+The last row is the important asymmetry. `oidc_provider_configs_from_config` builds the primary with
+`require_connected_on_startup: true` hardcoded, and `config.rs:74` refuses to start when
+`OPENID_PROVIDERS` is set without `OPENID_PROVIDER_URI`, so **the customer's own IdP cannot be made
+optional and cannot be omitted**. A guard in `assemble_authenticator_chain` also refuses to boot if
+*every* provider was skipped, so the flag can never silently disable authentication altogether.
+
+The flag is not free. A provider skipped at boot stays skipped for the process's lifetime: with the
+issuer restored and the catalog left running, engine-minted tokens were still 401 thirty seconds
+later, and only a restart brought the provider back. So `false` trades a loud, total failure for a
+quiet, partial one that no longer self-heals and that nothing alarms on except the single
+`Skipping this provider` log line.
+
+**Recommendation: leave the default.** A catalog that refuses to start is unmistakable; a catalog
+that starts with Exasol users silently 401ing is not. Set it to `false` only for a deployment that
+would rather keep Spark and Trino serving through an Exasol outage than learn about the outage
+immediately, and only with an alert on that log line and a restart in the recovery runbook.
+
 **A customer using their own PKI needs no step at all.** Running the same combined configuration
 with the Exasol root appended to the image's stock bundle at the default path
 `/etc/ssl/certs/ca-certificates.crt` and **no `SSL_CERT_FILE` set** brings both authenticators up.
@@ -1069,7 +1111,9 @@ Steps marked **(per user)** repeat; everything else is once.
 3. **Add one provider to the catalog and restart it**:
    `LAKEKEEPER__OPENID_PROVIDERS__EXASOL__{URI,AUDIENCE,SUBJECT_CLAIMS}`. Nothing about the
    customer's existing provider changes. If the Exasol certificate is not already trusted by the
-   catalog host, put the chain **root** in its trust store at the same time.
+   catalog host, put the chain **root** in its trust store at the same time. Leave
+   `REQUIRE_CONNECTED_ON_STARTUP` at its default so a broken issuer fails loudly; see §23 before
+   deciding otherwise.
 4. **(per user) Grant to `exasol~<lowercase exasol user name>`**, on whatever tables that person
    should reach through Exasol. The principal does not need to exist first. Grant less here than the
    person has through Spark if that is the intent; revoking this grant removes the Exasol path
@@ -1122,7 +1166,9 @@ than waiting.
   §20 written down, and a catalog restart as the documented response to a compromised key.
 * **New work item: operational note on the startup coupling.** The catalog cannot start while the
   BucketFS issuer is unreachable. Say so in the install documentation next to the provider
-  configuration, alongside the fact that the customer's own IdP already had this property.
+  configuration, alongside the fact that the customer's own IdP already had this property, and
+  document `LAKEKEEPER__OPENID_PROVIDERS__<id>__REQUIRE_CONNECTED_ON_STARTUP=false` as the opt-out
+  with its cost: a skipped provider never retries, so recovery needs a catalog restart.
 * **Keep** the key-management item, the `ConnectionCreds` third mode carrying the signing key, the
   issuer URL and the key id, "work item 4 (storage-layer authorization) is already satisfied", and
   "drop the Keycloak-upgrade item". Round 3 disturbed none of them.
@@ -1141,5 +1187,6 @@ than waiting.
 | `scripts/r3-negative.sh` | Item 7: every negative control, with the failure mode recorded |
 | `scripts/r3-bucketfs.sh` | Item 8: the two BucketFS conditions and the customer-PKI case, in the combined config |
 | `scripts/r3-availability.sh` | Item 8 continued: issuer outage at runtime and across a restart, with the primary-provider control |
+| `scripts/r3-require-connected.sh` | Item 8 follow-up: `REQUIRE_CONNECTED_ON_STARTUP`, its effect, the primary-provider asymmetry, and whether a skipped provider recovers |
 | `scripts/r3-cleanup.sh` | Removes the throwaway catalogs, the proxy and the documents published into the repo's main Exasol BucketFS |
 | `scripts/r3-run-all.sh` | Teardown, bring-up, provision, then all of the above into `evidence/r3-*.txt`, then cleanup |

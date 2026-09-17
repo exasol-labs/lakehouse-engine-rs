@@ -1,0 +1,51 @@
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/docs/jwks.json to engine-oidc/jwks.json
+Uploaded /home/crusty/code/lakehouse-engine-rs/spikes/multiuser-token-minting/.r3-work/docs/openid-configuration to engine-oidc/.well-known/openid-configuration
+
+[1m== 3.8.11  Engine issuer unreachable, REQUIRE_CONNECTED_ON_STARTUP=false[0m
+     process running: true   /health: 200
+     "message":"Failed to create OIDC authenticator for exasol (https://exasol.exacluster.local:2581/default/engine-oidc): Failed to fetch openid configuration from https://ex
+     "message":"Successfully added OIDC authenticator: oidc"
+     genuine Keycloak alice             alice_table HTTP 200
+     engine-minted exasol~alice         alice_table HTTP 401
+   -> the catalog boots with the engine provider SKIPPED. The customer's own
+      path is unaffected; only engine-minted tokens fail, and they fail 401.
+
+[1m== 3.8.12  Control — the same outage with the flag left at its default[0m
+     process running: false   /health: 000none
+     "message":"Successfully added OIDC authenticator: oidc"
+     Error: Failed to create required OIDC authenticator for exasol (https://exasol.exacluster.local:2581/default/engine-oidc): Failed to fetch openid configuration from https://exasol.
+     catalog unreachable; no token probe possible
+
+[1m== 3.8.13  Control — the flag set to false while the issuer IS reachable[0m
+     process running: true   /health: 200
+     "message":"Successfully added OIDC authenticator: exasol"
+     "message":"Successfully added OIDC authenticator: oidc"
+     genuine Keycloak alice             alice_table HTTP 200
+     engine-minted exasol~alice         alice_table HTTP 200
+   -> no downside when healthy: the provider loads normally.
+
+[1m== 3.8.14  The PRIMARY provider cannot be made optional[0m
+     process running: false   /health: 000none
+     Error: Failed to create required OIDC authenticator for oidc (http://no-such-idp:8080/realms/iceberg): Failed to fetch openid configuration from http://no-such-idp:8080/realms/iceb
+   -> both a per-provider flag on the secondary and an invented primary-level
+      flag are set here, and the catalog still dies on the primary.
+
+[1m== 3.8.15  Does a skipped provider recover without a restart?[0m
+     process running: true   /health: 200
+     "message":"Failed to create OIDC authenticator for exasol (https://exasol.exacluster.local:2581/default/engine-oidc): Failed to fetch openid configuration from https://ex
+     "message":"Successfully added OIDC authenticator: oidc"
+   booted with the issuer down:
+     genuine Keycloak alice             alice_table HTTP 200
+     engine-minted exasol~alice         alice_table HTTP 401
+   issuer brought back up (proxy started), catalog NOT restarted:
+     the issuer answers from inside the network: HTTP 200
+     genuine Keycloak alice             alice_table HTTP 200
+     engine-minted exasol~alice         alice_table HTTP 401
+   and again after 30s total:
+     genuine Keycloak alice             alice_table HTTP 200
+     engine-minted exasol~alice         alice_table HTTP 401
+   -> a provider skipped at boot stays skipped for the process's lifetime;
+      the catalog never retries the discovery fetch. Recovery needs a restart.
+   control — restart the same container with the issuer now up:
+     genuine Keycloak alice             alice_table HTTP 200
+     engine-minted exasol~alice         alice_table HTTP 200
