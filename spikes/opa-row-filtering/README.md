@@ -3,7 +3,7 @@
 **Verdict: yes.** Build a layer that compiles OPA's partial-evaluation output into a DataFusion
 predicate. Do not use the SQL-string contract Trino's plugin uses.
 
-This README covers five passes.
+This README covers six passes.
 
 **Pass 1** followed the brief's prior art, Trino's `trino-opa` plugin, in which OPA returns a SQL
 expression *string*. That contract fails here: **0 of 9** realistic row filters planned in the
@@ -47,6 +47,14 @@ raw AST — typed numbers, no injection surface at all, a wider operator fragmen
 own refusals. The SQL targets are still the wrong choice: no DataFusion dialect, and a numeric
 literal comes out as a string.
 
+**Pass 6** ([§16](#16-the-property-surface-and-what-masking-actually-needs)) settles the
+configuration surface. Column masks arrive in the **same response** as the row filter, so the
+four-URI property shape Trino needs does not transfer: there is nothing to batch, no second
+endpoint, and splitting the URI would reintroduce pass 1's fail-open hole. What masking does need is
+an adapter-side allowlist, because OPA validates none of the mask document -- and one case genuinely
+fails open, a `mask_rule` naming a rule that does not exist returns the filter with no masks and no
+error.
+
 So: the feature is real, OPA is the right tool, and **Rego is never translated**. It is evaluated;
 what gets translated is the expression tree OPA hands back.
 
@@ -71,6 +79,7 @@ scripts/60-exasol-identity.sh          # needs: docker compose up -d exasol
 scripts/70-partial-evaluation.sh       # pass 2: the Compile API
 scripts/80-compile-probe.sh            # pass 2: AST -> DataFusion, executed
 scripts/85-ucast-target.sh             # pass 5: the path route, UCAST vs SQL targets
+scripts/86-column-masks.sh             # pass 6: masks on the same call; the mask contract
 scripts/90-idp-auth.sh                 # pass 3: shared IdP; needs Keycloak, see header
 scripts/95-per-user-data.sh            # per-user permissions as plain OPA data
 scripts/97-lakekeeper-table-grants.sh  # per-table grants; needs the OpenFGA overlay, see header
@@ -96,6 +105,7 @@ scripts/98-user-id-namespace.sh        # what the Lakekeeper user id is made of;
 | `evidence/12-lakekeeper-table-grants.txt` | *(parked)* Live Lakekeeper+OpenFGA: a per-table grant asked on another user's behalf |
 | `evidence/15-config-visibility.txt` | Live Exasol: what a SELECT-only user can read back of VS properties vs CONNECTIONs |
 | `evidence/16-ucast-target.txt` | The path-form Compile API: UCAST and SQL targets, and what pass 2 got wrong |
+| `evidence/17-column-masks.txt` | Masks on the filter call, the unvalidated mask document, and the one fail-open case |
 | `evidence/13-user-id-namespace.txt` | *(parked)* Live: what Lakekeeper's `<idp-id>~<sub>` user id is made of, and what it rejects |
 
 Versions: OPA 1.20.2 (Rego v1), DataFusion 54.1 with `parquet,sql,unicode_expressions` (the engine's
@@ -1444,8 +1454,10 @@ POST /v1/compile/typo/allow -> HTTP 200 {}                              wrong PA
 POST /v1/compile/gate       -> HTTP 400 pe_fragment_error               bare package -> hard error
 ```
 
-Every misconfiguration fails **closed**, and the bare-package case is now a loud 400 rather than a
-residual we have to refuse ourselves. That is the opposite of pass 1, where a mistyped policy path
+Every misconfiguration of the *policy path* fails **closed**, and the bare-package case is now a
+loud 400 rather than a residual we have to refuse ourselves. The one exception found anywhere in this
+spike is the mask rule name, which fails open
+([§16.3](#163-one-thing-that-does-not-fail-closed)). That is the opposite of pass 1, where a mistyped policy path
 answered HTTP 200 meaning *unrestricted* ([§5](#5-failure-modes)).
 
 One ops consequence: a typo denies **every** query with no hint why. So the refusal message must name
@@ -1570,3 +1582,109 @@ AST form, which is the shape pass 2 captured; the UCAST rewrite is smaller but i
 Also untested: the field-name mapping. UCAST says `row.region` while the engine's aliased inner
 SELECT exposes `"REGION"` ([§2](#2-can-we-translate-what-it-returns) is why the case matters), so a
 prefix-strip plus uppercase-quote step replaces `column_of()` in the AST compiler.
+
+---
+
+## 16. The property surface, and what masking actually needs
+
+**Masking needs no configuration surface at all, and the four-URI shape Trino uses does not
+transfer.** `result.masks` rides on the same response as `result.query`, from the same call, so
+there is nothing to batch and no second endpoint to name. Evidence: `evidence/17-column-masks.txt`,
+`scripts/86-column-masks.sh`, `policies-masks/`.
+
+```
+ALICE  -> {"result":{"query":{"field":"row.region","operator":"in","value":["EU","UK"]},
+                     "masks":{"row":{"o_comment":{"replace":{"value":"<redacted>"}}}}}}
+ROOT   -> {"result":{"query":{},"masks":{"row":{"o_comment":{...},"region":{}}}}}
+CAROL  -> {}
+```
+
+The three truth values of [§15](#15-correction-use-a-uri-and-the-ucast-target) are unchanged and the
+masks follow them: DENY returns no masks even though `CAROL`'s mask rule *is* defined, and the
+documented "no mask" form `"region": {}` survives verbatim. Masks are target-independent, so
+`sql.postgresql` and `sql.sqlite` carry the identical `masks` object next to their SQL string.
+
+### 16.1 Why not one URI per concern
+
+Each of Trino's four properties exists for a reason in its own architecture, and none of those
+reasons survives the move to the Compile API path route:
+
+| Trino property | Why Trino needs it | Here |
+|---|---|---|
+| `opa.policy.uri` | the Data API has no compile step, so the boolean gate is its own Rego rule at its own URL | the gate is the **degenerate filter**: `{}` = DENY ([§10](#10-opa-does-both-the-table-gate-and-the-row-filter)), same call, 0.60 ms |
+| `opa.policy.row-filters-uri` | `rowFilters` is a second rule, so a second URL | same response, field `result.query` |
+| `opa.policy.batch-column-masking-uri` | Trino's SPI calls `getColumnMask` **once per column**, so a wide table costs N requests | `mask_rule` returns every column's mask in the filter response. There is no per-column request left to batch |
+| `opa.policy.batched-uri` | serves `filterCatalogs`/`filterSchemas`/`filterTables`/`filterColumns`, the "which of these N objects may this user see" metadata calls | **no consumer.** A virtual schema's table list is captured at `CREATE`/`REFRESH` and is identical for every user; the only per-user callback is pushdown, which is why the gate lives there |
+
+Splitting the URI also costs the fail-closed property [§14.3](#143-getting-the-policy-path-wrong-is-safe)
+measured. With one URI a typo denies every query. With a gate URI plus a filter URI, a correct gate
+and a mistyped filter rule answer HTTP 200 with no filter, which is **unrestricted** -- precisely the
+pass 1 hole.
+
+So the surface stays as [§14.2](#142-what-stays-a-plain-property) has it: `OPA_CONNECTION`,
+`USER_MAPPING`, `OPA_TIMEOUT_MS`, and the existing `ALLOW_HTTP`.
+
+### 16.2 What masking needs instead: an adapter-side allowlist
+
+OPA validates **none** of the mask document. Every one of these answered HTTP 200 and passed the
+value through verbatim:
+
+| Probe | Response |
+|---|---|
+| `{"hash": {"algorithm": "sha256"}}`, not a supported mask function | returned unchanged, no error |
+| a mask on table `orders`, which is not the unknown row | returned unchanged, no error |
+| `replace.value` = `0`, a number, on a string column | returned unchanged, typed as a JSON number |
+| mask rule whose value is not the table/column/function object | **HTTP 500** `convert masks` (the loud case) |
+
+The docs say `replace` is the only supported function today. OPA does not enforce that, so the
+adapter must: accept `replace` only, accept only the table key matching its own unknown row, and
+check the value against the column's Exasol type. Anything else has to be a refusal, not a skipped
+mask. This is the [§2.3](#23-column-masks-the-documented-example-silently-leaks-the-column) hazard
+class again, moved from Trino's dialect to OPA's own document.
+
+### 16.3 One thing that does not fail closed
+
+**A `mask_rule` that names a rule which does not exist returns the filter, no `masks` key, and no
+error.** Measured both ways, by policy METADATA (`policies-masks/maskmissing.rego`) and by request
+option:
+
+```
+metadata  mask_rule: data.maskmissing.does_not_exist -> {"result":{"query":{...}}}       no masks, HTTP 200
+request   options.maskRule: data.maskopt.nope        -> {"result":{"query":{...}}}       no masks, HTTP 200
+request   options.maskRule: data.nosuchpkg.masks     -> {"result":{"query":{...}}}       no masks, HTTP 200
+```
+
+The row filter still applies; the masking silently does not, and the response is
+**indistinguishable** from a policy that masks nothing. Every other misconfiguration in this spike
+fails closed; this one fails open. It is survivable because row filtering is the feature and masking
+is an addition, but it means masking cannot be *relied* on from the response alone. If masking is
+ever a requirement rather than a nicety, the check has to be external: a deployment-time probe that
+a known-masked column comes back masked, not a runtime inference.
+
+### 16.4 A second finding: `unknowns` belongs in the policy
+
+The METADATA annotation carries both the unknowns and the mask rule, so the request body is just
+`{"input": {...}}`:
+
+```rego
+# METADATA
+# scope: document
+# compile:
+#   unknowns: ["input.row"]
+#   mask_rule: data.masks.column_masks
+default include := false
+```
+
+Measured: with the annotation, a body of `{"input":{"user":"ALICE"}}` returns the filter and the
+masks. Without it, and with no `unknowns` in the body, the same query returns `{}` = DENY, so the
+missing-unknowns behaviour `evidence/16` recorded holds either way. Request-side `unknowns` plus
+`options.maskRule` also work, which is the escape hatch if a policy author cannot annotate.
+
+Preferring the annotation removes two strings the adapter would otherwise have to hold and could get
+wrong, and it puts the declaration of what is unknown next to the policy that depends on it.
+
+**Not tested:** applying a mask in the engine. Nothing here renders `{"replace":{"value":...}}` into
+the aliased inner SELECT, and the same field-name mapping gap as
+[§15.3](#153-what-still-holds-and-what-to-re-check) applies -- the mask key is `row.o_comment` while
+the projection exposes `"O_COMMENT"`. Also untested: `options.targetDialects` with the
+`multitarget` Accept header, which answers `{"result":{}}` without it.

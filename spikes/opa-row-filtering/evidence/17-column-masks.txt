@@ -1,0 +1,74 @@
+### OPA 1.20.2, open-source build
+### policies-masks/{masks,maskmissing,maskopt}.rego
+
+==============================================================
+1. ONE CALL, BOTH ANSWERS
+==============================================================
+  ALICE (filter + mask)  -> {"result":{"query":{"field":"row.region","operator":"in","type":"field","value":["EU","UK"]},"masks":{"row":{"o_comment":{"replace":{"value":"\u003credacted\u003e"}}}}}}
+    `result.query` and `result.masks` come back in the SAME response to the
+    SAME call. No second endpoint, so no OPA_..._MASKING_URI property.
+
+==============================================================
+2. MASKS ACROSS THE THREE TRUTH VALUES
+==============================================================
+  ALICE     -> {"result":{"query":{"field":"row.region","operator":"in","type":"field","value":["EU","UK"]},"masks":{"row":{"o_comment":{"replace":{"value":"\u003credacted\u003e"}}}}}}
+  ROOT      -> {"result":{"query":{},"masks":{"row":{"o_comment":{"replace":{"value":"\u003credacted\u003e"}},"region":{}}}}}
+  CAROL     -> {}
+    ALICE  FILTER    -> query + masks
+    ROOT   ALLOW ALL -> query {} + masks; `"region": {}` is the documented
+                        "no mask" form and survives verbatim
+    CAROL  DENY      -> {} : her mask rule IS defined and is NOT returned.
+                        Nothing to apply masks to, so the adapter refuses.
+
+==============================================================
+3. METADATA vs REQUEST BODY
+==============================================================
+  masks/include,  body {input} only, METADATA unknowns+mask_rule -> {"query":{"field":"row.region","operator":"in","type":"field","value":["EU","UK"]},"masks":{"row":{"o_comment":{"replace":{"value":"<redacted>"}}}}}
+  maskopt/include, no METADATA, no unknowns, no maskRule         -> {}
+  maskopt/include, request unknowns + options.maskRule           -> {"result":{"query":{"field":"row.region","operator":"eq","type":"field","value":"EU"},"masks":{"row":{"o_comment":{"replace":{"value":"\u003credacted\u003e"}}}}}}
+    `unknowns` and the mask rule can live EITHER in the policy's METADATA or in
+    the request body. With the annotation the request carries only `input`, so
+    the adapter has no unknowns list and no rule name to get wrong -- and
+    omitting both from an unannotated policy still DENIES (fails closed).
+
+==============================================================
+4. THE MASK CONTRACT ITSELF
+==============================================================
+  TYPED     replace.value = 0 (a number)      -> {"result":{"query":{},"masks":{"row":{"o_totalprice":{"replace":{"value":0}}}}}}
+  WEIRD     {"hash": {...}} (unsupported fn)  -> {"result":{"query":{},"masks":{"row":{"o_comment":{"hash":{"algorithm":"sha256"}}}}}}
+  OTHERTBL  mask on a table not in unknowns   -> {"result":{"query":{},"masks":{"orders":{"o_comment":{"replace":{"value":"x"}}}}}}
+  maskmissing  mask_rule names a missing rule -> {"result":{"query":{"field":"row.region","operator":"eq","type":"field","value":"EU"}}}
+
+==============================================================
+4b. MISCONFIGURING THE MASK RULE
+==============================================================
+  request maskRule -> MISSING rule    -> {"result":{"query":{"field":"row.region","operator":"eq","type":"field","value":"EU"}}}
+  request maskRule -> bogus package   -> {"result":{"query":{"field":"row.region","operator":"eq","type":"field","value":"EU"}}}
+  request maskRule -> NON-OBJECT rule -> {  "code": "internal_error",  "message": "convert masks: json: cannot unmarshal string into Go value of type map[string]interface {}"}
+  request maskRule -> no `data.` ref  -> {"result":{"query":{"field":"row.region","operator":"eq","type":"field","value":"EU"},"masks":{"row":{"o_comment":{"replace":{"value":"\u003credacted\u003e"}}}}}}
+    A mask rule that does not exist -- by METADATA (`maskmissing` above) or by
+    request option -- answers HTTP 200 with the filter and NO `masks` key and NO
+    error. The row filter still applies; the masking silently does not. This is
+    the one half of the contract that does NOT fail closed, and it is
+    indistinguishable from a policy that simply masks nothing.
+    A mask rule whose value is not the table->column->fn object is the loud
+    case: HTTP 500 `convert masks`.
+
+==============================================================
+5. DO THE SQL TARGETS CARRY MASKS TOO?
+==============================================================
+  sql.postgresql   -> {"result":{"query":"WHERE row.region IN (E'EU', E'UK')","masks":{"row":{"o_comment":{"replace":{"value":"\u003credacted\u003e"}}}}}}
+  sql.sqlite       -> {"result":{"query":"WHERE row.region IN ('EU', 'UK')","masks":{"row":{"o_comment":{"replace":{"value":"\u003credacted\u003e"}}}}}}
+  multitarget      -> {"result":{}}
+    Masks ride on the SQL targets too, unchanged -- they are target-independent.
+    `multitarget` answers `{"result":{}}` without `options.targetDialects`.
+
+-- conclusion --
+Masking needs NO configuration surface: `result.masks` rides on the same
+response as `result.query`, so there is no per-column request to batch and no
+second URI to configure. What it needs is an ADAPTER-SIDE allowlist, because
+OPA validates none of it: an unsupported mask function, a mask on a table that
+is not the unknown row, and a mask value of any JSON type all pass through
+verbatim with HTTP 200. And a mask_rule that does not exist returns the filter
+with no masks and no error, so the adapter cannot tell "no masks" from
+"misconfigured masks" -- the masking half fails OPEN.
