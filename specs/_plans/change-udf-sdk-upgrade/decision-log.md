@@ -116,7 +116,7 @@ or a stated, evidence-based spec claim here.
 - **Rationale:** Declining costs the query its per-shard LIMIT and top-N pushdown and makes Exasol
   compute every select-list item, while keeping the sharded fan-out, the referenced-column
   narrowing and the scan-side WHERE predicate. For six exotic precisions, exactness wins. The routing
-  was read out of the code, not assumed: `support.rs:1221` for the select list, `support.rs:564` for
+  was read out of the code, not assumed: `support.rs:1396` for the select list, `support.rs:564` for
   WHERE, `grouped_agg.rs:189` for GROUP BY, and `topn.rs:130` for ORDER BY, which already renders in
   the Exasol dialect and is therefore unreachable for this decline.
 - **Supersedes:** the unverified "Exasol SHALL truncate back to the requested `p`" clause.
@@ -183,12 +183,8 @@ or a stated, evidence-based spec claim here.
 ### [plan-review] The CAST probe could not observe the SLC precision check
 
 - **Finding:** `[INTENT_DRIFT]` on task 3.2 and § Design > Decision. The probe cast to
-  `TIMESTAMP(p)` for `p` in {0, 3, 6, 9}, where `vs_expression::snap_timestamp_precision` is the
-  identity, so DataFusion truncated the value before the emit boundary and the assertion passed
-  regardless of engine behavior.
-- **Direction change:** Task 3.2 becomes a catalog-column probe on an `exasol/docker-db:8.29.13`
-  leg, where the version gate declares a bare `TIMESTAMP` and no CAST intervenes. The CAST-mismatch
-  route the reviewer also offered was not taken; it is out of scope and tracked as issue #411.
+  `TIMESTAMP(p)` for `p` in {0, 3, 6, 9}, where `snap_timestamp_precision` is the identity, so the
+  assertion passed regardless of engine behaviour.
 - **Superseded by [1] and [5]:** the CAST route is now in scope, issue #411 is closed at the user's
   instruction, and the probe is a three-width emit measurement rather than a truncation observation.
 - **Promotes to ADR:** no
@@ -198,10 +194,6 @@ or a stated, evidence-based spec claim here.
 - **Finding:** `[INTENT_DRIFT]` on `type-mapping-timestamp-precision/spec.md` and § Parallelization.
   The live-engine SHALL covered both a below- and an above-microsecond declaration, while group B was
   forbidden from editing any delta, so an unreached claim would have recorded as fact.
-- **Direction change:** Group B's Knowledge cell gains the delta and drops "edits no spec delta", and
-  new task 3.4 (`[expert]`) corrects the live clause to the measurement. The SHALL now names the two
-  arms actually run, `8.29.13` bare `TIMESTAMP` and `2025.1.16` `TIMESTAMP(6)`; the above-microsecond
-  arm moved out into a tracked limitation citing #411.
 - **Superseded by [1]:** the above-microsecond arm is now reached by task 5.2(a) and the tracking
   issue is gone. The rule the finding established stands unchanged: group C owns the live clauses
   and corrects them to the measurement (task 5.5).
@@ -210,11 +202,8 @@ or a stated, evidence-based spec claim here.
 ### [plan-review] "Exasol already owns the truncation" was unscoped
 
 - **Finding:** `[UNSTATED_ASSUMPTION]` on § Design > Decision and entry `[1]` § Alternatives. The
-  sentence is true only on the catalog-column bare-`TIMESTAMP` path; on a projected CAST, DataFusion
+  sentence is true only on the catalog-column bare-`TIMESTAMP` path. On a projected CAST, DataFusion
   owns the truncation.
-- **Direction change:** Both places now scope the claim to the catalog-column path this plan
-  measures and state that the CAST path's DataFusion-side truncation is neither verified nor relied
-  on. The same split is recorded as a Background bullet in the delta.
 - **Superseded by [1]:** no component truncates on the catalog path any more, because declared now
   equals emitted. The Background bullet naming which component acts on which path is kept, corrected
   for the decline.
@@ -226,10 +215,6 @@ or a stated, evidence-based spec claim here.
   `type-mapping-timestamp-precision/spec.md:43`. All four stated `precision` 3 as fact. Every
   assertion task 3.2 lists passes identically whether the SLC reports 3 or 6, so the probe could not
   establish the one premise that makes it non-vacuous.
-- **Direction change:** Task 3.2 observes the reported `precision` once by hand, through
-  `ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS` with `%udf_debug_level debug`, and records it in entry
-  `[1]`. A reported value of 6 or higher stops the plan, in task 3.2 and again in task 3.3's STOP
-  list. The four `precision` 3 statements now name a value the run records rather than assumes.
 - **Carried into task 5.3:** the hand observation stays, but it now selects which
   `from_declared_digits` arm the clamped engine takes rather than deciding whether the probe is
   vacuous.
@@ -241,9 +226,6 @@ or a stated, evidence-based spec claim here.
   `exa-data` named volume (`docker-compose.yml:128-129`) holds the whole Exasol instance, and
   `make test-e2e` runs `cargo test` only (`Makefile:81-82`). An 8.29.13 container started over the
   2025.1.16 data directory does not come up, so the measurement never runs.
-- **Direction change:** Every bring-up now runs `docker compose down -v` first: task 3.1, task 3.2
-  as a labelled CAUTION naming the wiped `minio-data` re-seed, new task 3.5, both § Manual Testing
-  commands and both § Checklist E2E rows.
 - **Carried into tasks 5.1, 5.3 and 5.6** under the renumbering.
 - **Promotes to ADR:** no
 

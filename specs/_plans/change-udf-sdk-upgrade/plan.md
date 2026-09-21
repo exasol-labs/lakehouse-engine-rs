@@ -35,7 +35,7 @@ and one `trybuild` stderr fixture. `Value`, `ColumnInfo`, `UdfContext`, `abi.rs`
 Making `Timestamp` carry its precision exposed a defect that the old type had made structurally
 invisible. `iceberg_primitive_to_exasol` (`types/mapping.rs:354`) collapses all FOUR Iceberg
 timestamp variants onto one `timestamp_precision.declaration()` call, and that value is resolved
-once per `createVirtualSchema` request (`adapter/mod.rs:289`), not per column. Meanwhile
+once per `createVirtualSchema` request (`adapter/mod.rs:290`), not per column. Meanwhile
 `iceberg_primitive_to_arrow` (`types/mapping.rs:399`, `:401`) already distinguishes them, mapping
 `timestamp_ns`/`timestamptz_ns` to Arrow `Timestamp(Nanosecond, _)`, and `ScanSpec`'s logical-schema
 tag vocabulary already round-trips that unit (`types/mapping.rs:436`, `:467`). So DataFusion holds
@@ -62,7 +62,7 @@ A third, independent defect sits in `crates/vs-expression`. For a projected
 `CAST(x AS TIMESTAMP(p))` with `p` outside `{0,3,6,9}`, `snap_timestamp_precision`
 (`vs-expression/src/lib.rs:431`) renders the DataFusion side at the NEAREST member of that set, a
 silent approximation rather than the requested value, while `exasol_type_from_json`
-(`types/mapping.rs:658`) must declare the literal `p` verbatim, because Exasol validates a pushdown
+(`types/mapping.rs:660`) must declare the literal `p` verbatim, because Exasol validates a pushdown
 response positionally against `selectListDataTypes`. The recorded spec papers over the mismatch with
 an unverified `SHALL`: that Exasol truncates an up-snapped value back to the requested `p`. Nothing
 ever measured it, and the snap contradicts that same feature's own recorded rule that the rendered
@@ -128,7 +128,7 @@ was verified in code, not assumed:
 
 | Position | Decline site | Route |
 |----------|--------------|-------|
-| Select list | `project_columns`'s `function_scalar_cast` arm sets `needs_full_fallback` on a `None` from `render_expression_safe` (`adapter/pushdown/support.rs:1221`) | piped out as `projection_widened` (`adapter/pushdown/mod.rs:187`); the `RowScan` arm returns `qualified_single_table_fallback_pushdown` (`adapter/pushdown/mod.rs:655`) |
+| Select list | `project_columns`'s shared scalar-and-predicate arm, one of six conditions that set `needs_full_fallback` on a `None` from `render_expression_safe` (`adapter/pushdown/support.rs:1396-1399`) | piped out as `projection_widened` (`adapter/pushdown/mod.rs:187`); the `RowScan` arm returns `qualified_single_table_fallback_pushdown` (`adapter/pushdown/mod.rs:655`) |
 | WHERE | `datafusion_renderable` (`adapter/pushdown/support.rs:564`) | self-applied in the wrapper's own Exasol-dialect `WHERE` (`vs-adapter/pushdown-declined-filter-self-apply`) |
 | GROUP BY | `render_expression` `Err` collapses grouped-aggregate detection to `None` (`adapter/pushdown/grouped_agg.rs:189`) | falls through to `RequestShape::GroupByWrapper`, same wrapper |
 | ORDER BY | none: `parse_declined_sort_key` renders a non-column sort key in the EXASOL dialect from the start (`adapter/pushdown/topn.rs:130`) | unreachable for a DataFusion-dialect decline |
@@ -137,10 +137,11 @@ The cost is stated rather than implied, because it is not local to the declined 
 select-list item widens the whole select list and routes the whole request to the wrapper, so Exasol
 computes EVERY select-list item. What survives is the sharded parallel fan-out, the
 referenced-column projection narrowing (`referenced_column_projection`,
-`adapter/pushdown/joins/sql_builders.rs:1098`), and the WHERE predicate, which still travels inside
+`adapter/pushdown/joins/sql_builders.rs:920`), and the WHERE predicate, which still travels inside
 the scan spec. What is given up is the per-shard `LIMIT` and the bounded top-N: the fan-out spec is
-built with `limit: None` and `order_by: Vec::new()`, and `build_qualified_single_table_fallback_sql`
-(`adapter/pushdown/joins/sql_builders.rs:990`) renders the select list, GROUP BY, HAVING, ORDER BY
+built with `limit: None` and `order_by: Vec::new()` (`adapter/pushdown/joins/sql_builders.rs:1138-1139`),
+and `build_qualified_single_table_fallback_sql`
+(`adapter/pushdown/joins/sql_builders.rs:1032`) renders the select list, GROUP BY, HAVING, ORDER BY
 and LIMIT in the OUTER wrapper only. For six exotic precisions, exactness is the right side of that
 trade.
 

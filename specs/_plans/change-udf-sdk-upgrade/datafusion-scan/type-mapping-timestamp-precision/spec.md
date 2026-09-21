@@ -32,11 +32,18 @@ issue #359 added, and the parent feature keeps the general Arrow/Exasol type-com
 * `ExaType::Timestamp { precision }` carries the declared fractional-second precision since
   `exasol-udf-sdk` 0.28.1 (issue #405). The precision is now readable at the emit boundary, so the
   Arrow coercion target follows it instead of being fixed at microsecond.
-* A timestamp column's precision has TWO independent axes, and collapsing them into one value is
-  what produced the defect this delta fixes. The SOURCE axis is the width the catalog declares for
-  that COLUMN. The ENGINE axis is the width the running Exasol engine can emit, which is a property
-  of the REQUEST. `TimestampPrecision::from_database_version` is called once per
-  `createVirtualSchema` request (`adapter/mod.rs:289`) and its single value reached every column, so
+* A timestamp column's precision has TWO independent axes, owned by TWO types in
+  `types/mapping.rs`, one each, and no other module carries either rule. The SOURCE axis is the
+  width the catalog declares for that COLUMN. `TimestampPrecision` owns it, its Exasol declaration
+  string (`declaration()`), its Arrow `TimeUnit` (`arrow_unit()`), and the mapping from a declared
+  Exasol precision back to a width. The ENGINE axis is the width the running Exasol engine can emit,
+  a property of the REQUEST. `EngineTimestampSupport` owns the version rule and the clamp, and takes
+  a version `&str` rather than a `UdfContext`, so the type-mapping module performs no I/O and the
+  single `ctx.database_version()` read stays in `vs-adapter/create-virtual-schema`. Both producers
+  (`iceberg_primitive_to_exasol`, `unity_type_name_to_exasol`) name a source width and clamp it
+  through the engine value, and neither carries a declaration literal. Collapsing the two axes into
+  one value is the defect this delta fixes: `TimestampPrecision::from_database_version` ran once per
+  `createVirtualSchema` request (`adapter/mod.rs:290`) and its single value reached every column, so
   an Iceberg `timestamp_ns` column was declared exactly as an Iceberg `timestamp` one
   (`types/mapping.rs:354`) while `iceberg_primitive_to_arrow` already registered it as Arrow
   `Timestamp(Nanosecond, _)` (`types/mapping.rs:399`, `:401`). Every nanosecond digit was then
@@ -103,15 +110,6 @@ issue #359 added, and the parent feature keeps the general Arrow/Exasol type-com
   `TIMESTAMP(NANOS)` column, so a spec-conformant nanosecond column is unaffected; a legacy file
   storing a nanosecond-typed column as INT96 would still arrive at microsecond. Named as a
   deliberate limit of the INT96 setting, not a silent gap.
-* TWO types in `types/mapping.rs` own the two axes, one each, and no other module carries either
-  rule. `TimestampPrecision` owns the source width, its Exasol declaration string, its Arrow
-  `TimeUnit`, and the mapping from a declared Exasol precision back to a width, so the
-  declaration side and the emit side read ONE table rather than two that can drift.
-  `EngineTimestampSupport` owns the version rule and the clamp. Both producers
-  (`iceberg_primitive_to_exasol`, `unity_type_name_to_exasol`) name a source width and clamp it
-  through the engine value; neither carries a literal declaration string. The engine owner takes a
-  version `&str`, not a `UdfContext`, keeping the type-mapping module free of I/O;
-  `vs-adapter/create-virtual-schema` owns the single `ctx.database_version()` read.
 * Which component truncates depends on the declaration path. For a CATALOG timestamp column the
   adapter declares the clamped width, the scan emits at exactly that width, and NO component
   truncates afterwards: the round trip is exact by construction. For a projected

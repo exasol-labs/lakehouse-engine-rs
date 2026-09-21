@@ -23,9 +23,10 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
   DataFusion-dialect renderer returning `Err`/`None` for a node, which routes that node into SQL the
   ADAPTER ITSELF writes in the Exasol dialect and Exasol merely executes.
 * Every position a CAST node can occupy already has such a route, and this delta adds none.
-  SELECT LIST: `project_columns`'s `function_scalar_cast` arm
-  (`crates/lakehouse-engine/src/adapter/pushdown/support.rs:1221`) sets `needs_full_fallback` when
-  `render_expression_safe` returns `None`; that signal is piped out as `projection_widened`
+  SELECT LIST: `render_expression_safe` returning `None` in `project_columns`'s shared
+  scalar-and-predicate arm sets `needs_full_fallback`
+  (`crates/lakehouse-engine/src/adapter/pushdown/support.rs:1396-1399`), one of six conditions that
+  set it. That signal is piped out as `projection_widened`
   (`adapter/pushdown/mod.rs:187`) and the `RowScan` arm returns
   `qualified_single_table_fallback_pushdown` (`adapter/pushdown/mod.rs:655`). WHERE: the
   DataFusion-renderability probe is `datafusion_renderable`
@@ -40,11 +41,12 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
   item widens the WHOLE select list to the base row and routes the WHOLE request to the wrapper;
   Exasol then computes every select-list item, not only the declined one. What survives is the
   sharded parallel fan-out, the referenced-column projection narrowing
-  (`referenced_column_projection`, `adapter/pushdown/joins/sql_builders.rs:1098`), and the WHERE
+  (`referenced_column_projection`, `adapter/pushdown/joins/sql_builders.rs:920`), and the WHERE
   predicate, which still travels inside the scan spec. What is given up is the per-shard `LIMIT` and
-  the bounded top-N: the fan-out spec is built with `limit: None` and `order_by: Vec::new()`, and
+  the bounded top-N: the fan-out spec is built with `limit: None` and `order_by: Vec::new()`
+  (`adapter/pushdown/joins/sql_builders.rs:1138-1139`), and
   `build_qualified_single_table_fallback_sql`
-  (`adapter/pushdown/joins/sql_builders.rs:990`) renders the select list, GROUP BY, HAVING, ORDER BY
+  (`adapter/pushdown/joins/sql_builders.rs:1032`) renders the select list, GROUP BY, HAVING, ORDER BY
   and LIMIT in the OUTER wrapper only, so every matching row ships to Exasol.
 * The Exasol dialect already renders `TIMESTAMP(p)` verbatim for every `p` in 0-9 and needs no
   change, so the declined expression is computed at the LITERAL precision requested, with no
@@ -53,7 +55,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
   direction.
 * The adapter has NO freedom in what it declares for a CAST-projected column. Exasol validates a
   pushdown response positionally against `selectListDataTypes`, so `exasol_type_from_json`
-  (`crates/lakehouse-engine/src/types/mapping.rs:658`) must echo the literal
+  (`crates/lakehouse-engine/src/types/mapping.rs:660`) must echo the literal
   `fractionalSecondsPrecision` Exasol sent. The declared `TIMESTAMP(p)` and the pushed DataFusion
   expression are therefore two independent surfaces, and only the second one is corrected here.
 * A precision outside 0-9 cannot arrive: Exasol's own TIMESTAMP domain is `p` in 0-9 and Exasol
