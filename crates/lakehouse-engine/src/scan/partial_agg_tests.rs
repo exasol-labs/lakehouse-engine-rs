@@ -1,5 +1,5 @@
 use super::*;
-use crate::scan::emit::declared_columns_test_support::{declared, numeric};
+use crate::scan::emit::declared_columns_test_support::{declared, numeric, varchar};
 use crate::scan::spec::AggKind;
 use arrow::array::{ArrayRef, Decimal128Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -884,19 +884,67 @@ fn partial_cells_conform_to_declared_output_columns() {
     );
 }
 
-/// Scenario: a partial-aggregate column declared `Numeric` with an absent or
-/// out-of-range precision or scale fails the call naming that column, matching
-/// the Arrow `emit_batch` path — neither substitutes `Utf8`.
+/// Scenario (`scan-execution-partial-agg`): a `MIN`/`MAX` cell over a nanosecond
+/// timestamp column declared `TIMESTAMP(9)` reaches its `Value::Timestamp` with all
+/// nine fractional digits. This path is a SECOND truncation site, independent of
+/// the Arrow `emit_batch` one, and `validate_agg_col_types` admits `MIN`/`MAX` over
+/// any comparable type, so a nanosecond timestamp is pushed into it.
 #[test]
-fn partial_agg_fails_on_numeric_with_absent_or_out_of_range_payload() {
-    let drifted = vec![
-        (
-            "absent payload",
-            ExaType::Numeric {
-                precision: None,
-                scale: None,
+fn partial_agg_minmax_over_a_nanosecond_timestamp_keeps_every_digit() {
+    use arrow::array::TimestampNanosecondArray;
+
+    let lowest = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+        .unwrap()
+        .and_hms_nano_opt(0, 0, 0, 123_456_789)
+        .unwrap();
+    let highest = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+        .unwrap()
+        .and_hms_nano_opt(23, 59, 59, 987_654_321)
+        .unwrap();
+    let cell = |instant: chrono::NaiveDateTime| -> ArrayRef {
+        Arc::new(TimestampNanosecondArray::from(vec![Some(
+            instant.and_utc().timestamp_nanos_opt().unwrap(),
+        )]))
+    };
+    let batch = one_row_batch(vec![
+        ("PARTIAL_min_0", cell(lowest)),
+        ("PARTIAL_max_0", cell(highest)),
+    ]);
+
+    let row = partial_row_from_batch(
+        &[
+            AggregatePlan {
+                kind: AggKind::Min,
+                column: Some("TS_NS".into()),
+                arg_expr: None,
             },
-        ),
+            AggregatePlan {
+                kind: AggKind::Max,
+                column: Some("TS_NS".into()),
+                arg_expr: None,
+            },
+        ],
+        &batch,
+        &declared(&[
+            ("PARTIAL_min_0", ExaType::Timestamp { precision: 9 }),
+            ("PARTIAL_max_0", ExaType::Timestamp { precision: 9 }),
+        ]),
+    )
+    .expect("MIN/MAX over a nanosecond timestamp must conform to its declared columns");
+
+    assert_eq!(
+        row,
+        vec![Value::Timestamp(lowest), Value::Timestamp(highest)],
+        "a nanosecond extremum must keep all nine digits under a TIMESTAMP(9) declaration"
+    );
+}
+
+/// Scenario: a partial-aggregate column declared `Numeric` with an out-of-range
+/// precision or scale fails the call naming that column, matching the Arrow
+/// `emit_batch` path — neither substitutes `Utf8`.
+#[test]
+fn partial_agg_fails_on_numeric_with_out_of_range_payload() {
+    let drifted = vec![
         ("precision above Decimal128", numeric(39, 0)),
         ("scale above precision", numeric(10, 12)),
     ];
@@ -966,15 +1014,7 @@ fn grouped_coercion_leaves_the_group_key_columns_untouched() {
     ]);
     let columns = coerce_partial_agg_columns(
         &batch,
-        &declared(&[
-            (
-                "GK_0",
-                ExaType::String {
-                    size: Some(2_000_000),
-                },
-            ),
-            ("PARTIAL_sum_0", ExaType::Int64),
-        ]),
+        &declared(&[("GK_0", varchar()), ("PARTIAL_sum_0", ExaType::Int64)]),
         1,
     )
     .expect("the grouped coercion must succeed");

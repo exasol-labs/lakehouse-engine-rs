@@ -2018,6 +2018,77 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
 }
 
 // ---------------------------------------------------------------------------
+// Declined TIMESTAMP(p) CAST target routing (issue #405)
+// ---------------------------------------------------------------------------
+
+/// A single-item select list projecting `CAST(NAME AS TIMESTAMP(p))`, with the
+/// declared result type at its own `selectListDataTypes` ordinal — the wire shape
+/// Exasol sends for `SELECT CAST(name AS TIMESTAMP(p)) FROM …`.
+fn timestamp_cast_select_request(precision: u64) -> Json {
+    serde_json::json!({
+        "selectList": [{
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "TIMESTAMP", "fractionalSecondsPrecision": precision},
+            "arguments": [{"type": "column", "name": "NAME", "tableName": "EVENTS"}]
+        }],
+        "selectListDataTypes": [
+            {"type": "timestamp", "fractionalSecondsPrecision": precision}
+        ],
+    })
+}
+
+/// Scenario (sql-comprehension/vs-expression-translator-cast): a projected
+/// `CAST(x AS TIMESTAMP(2))` names a precision DataFusion's SQL frontend cannot
+/// parse, so the DataFusion-dialect renderer declines it, `project_columns`
+/// widens to the full base row, and the request routes to the qualified
+/// single-table wrapper — which computes the CAST itself, in Exasol's own
+/// dialect, over the scanned rows.
+///
+/// This routing is what makes the decline safe rather than lossy: the scan never
+/// sees `TIMESTAMP(2)` in its `EMITS` clause, so no value is computed at a
+/// precision neither engine agreed on.
+#[test]
+fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
+    let sql = dispatch_sql_for_body(timestamp_cast_select_request(2));
+
+    assert!(
+        sql.starts_with(r#"SELECT CAST("LHS_T0"."NAME" AS TIMESTAMP(2)) FROM ("#),
+        "the declined CAST must be computed in the wrapper's outer select list: {sql}"
+    );
+    assert!(
+        sql.contains(r#"AS "LHS_T0""#),
+        "a declined CAST target must route to the qualified single-table wrapper: {sql}"
+    );
+    let emits = sql
+        .find("EMITS (")
+        .map(|at| &sql[at..])
+        .unwrap_or_else(|| panic!("the wrapper must still drive the scan UDF: {sql}"));
+    assert!(
+        emits.contains(r#""NAME" VARCHAR(2000000)"#) && !emits.contains("TIMESTAMP"),
+        "the scan must emit the raw column, never the declined CAST target: {sql}"
+    );
+}
+
+/// CONTROL for the decline above: `TIMESTAMP(6)` is one of the four precisions
+/// DataFusion parses, so the SAME shape renders per-item and stays on the
+/// ordinary scan path. Without this, the decline test would pass just as well
+/// against a renderer that declined EVERY `TIMESTAMP(p)` CAST.
+#[test]
+fn accepted_timestamp_precision_cast_takes_scan_path() {
+    let sql = dispatch_sql_for_body(timestamp_cast_select_request(6));
+
+    assert!(
+        !sql.contains("LHS_T0"),
+        "an accepted CAST target must NOT route to the qualified wrapper: {sql}"
+    );
+    assert!(
+        sql.contains("TIMESTAMP(6)"),
+        "the accepted CAST must reach the scan at its declared precision: {sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Parse-before-config ordering — regression coverage
 // ---------------------------------------------------------------------------
 

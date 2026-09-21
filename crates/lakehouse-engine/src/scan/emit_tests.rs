@@ -336,19 +336,11 @@ fn coerce_maps_every_exa_type_variant_to_its_arrow_target() {
         (numeric(36, 12), DataType::Decimal128(36, 12)),
         (ExaType::Date, DataType::Date32),
         (
-            ExaType::Timestamp,
+            ExaType::Timestamp { precision: 6 },
             DataType::Timestamp(TimeUnit::Microsecond, None),
         ),
-        (
-            ExaType::TimestampTz,
-            DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        ),
         (varchar(), DataType::Utf8),
-        (ExaType::Char { size: Some(10) }, DataType::Utf8),
-        (ExaType::Geometry, DataType::Utf8),
-        (ExaType::HashType, DataType::Utf8),
-        (ExaType::IntervalYearToMonth, DataType::Utf8),
-        (ExaType::IntervalDayToSecond, DataType::Utf8),
+        (ExaType::Char { size: 10 }, DataType::Utf8),
         (ExaType::Unsupported, DataType::Utf8),
     ];
 
@@ -361,30 +353,66 @@ fn coerce_maps_every_exa_type_variant_to_its_arrow_target() {
     }
 }
 
-/// Scenario (`type-mapping-timestamp-precision`): every declared `TIMESTAMP(p)`
-/// reaches the scan as the single variant `ExaType::Timestamp`, and that variant
-/// resolves to the microsecond Arrow timestamp — never the `Utf8` string path,
-/// which would stringify the value and violate the `TIMESTAMP(p)` declaration.
+/// Scenario (`type-mapping-timestamp-precision`): a declared `TIMESTAMP(p)`
+/// resolves to the Arrow unit of THAT precision — never a fixed one, which under a
+/// `TIMESTAMP(9)` declaration destroys every nanosecond digit through the strict
+/// cast, and never the `Utf8` string path, which would stringify the value and
+/// violate the declaration.
 ///
-/// The rule is structural rather than parser-dependent: `ExaType` models no
-/// fractional-second precision at all, so `p` cannot reach this decision.
+/// The unit is read from the same owner that produces the declaration string, so
+/// the two sides cannot disagree about what `TIMESTAMP(9)` means. A precision
+/// outside `{3, 6, 9}` resolves to the coarsest unit not coarser than it.
 #[test]
-fn exa_type_timestamp_maps_to_microsecond_target() {
+fn exa_type_timestamp_maps_to_the_arrow_unit_of_its_declared_precision() {
     use arrow::datatypes::TimeUnit;
 
-    let plain = &declared(&[("TS", ExaType::Timestamp)])[0];
-    assert_eq!(
-        target_arrow_type(plain).expect("TIMESTAMP must resolve"),
-        DataType::Timestamp(TimeUnit::Microsecond, None),
-        "ExaType::Timestamp must resolve to the microsecond Arrow timestamp"
-    );
+    let cases = [
+        (0, TimeUnit::Millisecond),
+        (1, TimeUnit::Millisecond),
+        (2, TimeUnit::Millisecond),
+        (3, TimeUnit::Millisecond),
+        (4, TimeUnit::Microsecond),
+        (5, TimeUnit::Microsecond),
+        (6, TimeUnit::Microsecond),
+        (7, TimeUnit::Nanosecond),
+        (8, TimeUnit::Nanosecond),
+        (9, TimeUnit::Nanosecond),
+    ];
+    for (precision, expected_unit) in cases {
+        let column = &declared(&[("TS", ExaType::Timestamp { precision })])[0];
+        assert_eq!(
+            target_arrow_type(column).expect("TIMESTAMP must resolve"),
+            DataType::Timestamp(expected_unit, None),
+            "declared TIMESTAMP({precision})"
+        );
+    }
+}
 
-    let zoned = &declared(&[("TSTZ", ExaType::TimestampTz)])[0];
-    assert_eq!(
-        target_arrow_type(zoned).expect("TIMESTAMP WITH LOCAL TIME ZONE must resolve"),
-        DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        "ExaType::TimestampTz must keep the UTC-zoned microsecond target"
-    );
+/// Scenario (`scan-execution-value-conversion`): a nanosecond column declared
+/// `TIMESTAMP(9)` passes through `coerce_column` with all nine digits intact. The
+/// fixed microsecond target this replaces destroyed three of them through the
+/// strict (`safe: false`) cast, unrecorded.
+#[test]
+fn nanosecond_column_declared_timestamp_9_keeps_every_digit() {
+    let instant = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+        .unwrap()
+        .and_hms_nano_opt(0, 0, 0, 123_456_789)
+        .unwrap();
+    let nanos = instant.and_utc().timestamp_nanos_opt().unwrap();
+    let source: ArrayRef = Arc::new(arrow::array::TimestampNanosecondArray::from(vec![Some(
+        nanos,
+    )]));
+
+    let column = &declared(&[("TS", ExaType::Timestamp { precision: 9 })])[0];
+    let target = target_arrow_type(column).expect("TIMESTAMP(9) must resolve");
+    let coerced = coerce_column(&source, column, &target).expect("coercion must succeed");
+
+    assert_eq!(coerced.data_type(), source.data_type());
+    let values = coerced
+        .as_any()
+        .downcast_ref::<arrow::array::TimestampNanosecondArray>()
+        .expect("coerced column stays a nanosecond timestamp");
+    assert_eq!(values.value(0), nanos);
 }
 
 /// Scenario: `coerce_batch_to_exa_types` casts EVERY output column to the Arrow
@@ -481,7 +509,7 @@ fn coerce_batch_casts_every_column_to_declared_exatype() {
         (
             "c_char",
             utf8view_to_char,
-            ExaType::Char { size: Some(4) },
+            ExaType::Char { size: 4 },
             DataType::Utf8,
         ),
     ];
@@ -565,8 +593,11 @@ fn coerce_timestamptz_column_to_plain_timestamp_preserves_utc() {
     let batch = RecordBatch::try_new(schema, vec![Arc::new(src_arr)]).unwrap();
 
     // Declared EMITS type is plain "TIMESTAMP" (the post-fix timestamptz mapping).
-    let coerced = coerce_batch_to_exa_types(batch, &declared(&[("ts", ExaType::Timestamp)]))
-        .expect("timestamptz→TIMESTAMP coercion must succeed");
+    let coerced = coerce_batch_to_exa_types(
+        batch,
+        &declared(&[("ts", ExaType::Timestamp { precision: 6 })]),
+    )
+    .expect("timestamptz→TIMESTAMP coercion must succeed");
 
     // The coerced column must be timezone-naive Timestamp(Microsecond, None).
     assert_eq!(
@@ -743,7 +774,7 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
         ("c_long", numeric(20, 0)),
         ("c_double", ExaType::Double),
         ("c_decimal", numeric(20, 5)),
-        ("c_timestamp", ExaType::Timestamp),
+        ("c_timestamp", ExaType::Timestamp { precision: 6 }),
     ]);
 
     let coerced = coerce_batch_to_exa_types(batch, &types)
@@ -880,34 +911,13 @@ async fn emit_stream_fails_when_a_declared_column_cannot_be_read() {
     );
 }
 
-/// Scenario: a `Numeric` column whose precision or scale is absent, or outside
-/// what `Decimal128` represents, fails the call naming that column — and is
-/// never substituted with `Utf8`, which would put a string into a numeric
-/// column. A valid Exasol NUMERIC declaration always carries both, within range.
+/// Scenario: a `Numeric` column whose precision or scale is outside what
+/// `Decimal128` represents fails the call naming that column — and is never
+/// substituted with `Utf8`, which would put a string into a numeric column. A
+/// valid Exasol NUMERIC declaration always carries both, within range.
 #[tokio::test]
-async fn emit_stream_fails_on_numeric_with_absent_or_out_of_range_payload() {
+async fn emit_stream_fails_on_numeric_with_out_of_range_payload() {
     let cases: Vec<(&str, ExaType)> = vec![
-        (
-            "absent precision",
-            ExaType::Numeric {
-                precision: None,
-                scale: Some(0),
-            },
-        ),
-        (
-            "absent scale",
-            ExaType::Numeric {
-                precision: Some(20),
-                scale: None,
-            },
-        ),
-        (
-            "both absent",
-            ExaType::Numeric {
-                precision: None,
-                scale: None,
-            },
-        ),
         ("zero precision", numeric(0, 0)),
         ("precision above Decimal128", numeric(39, 0)),
         ("scale above Decimal128", numeric(10, 39)),
@@ -922,7 +932,7 @@ async fn emit_stream_fails_on_numeric_with_absent_or_out_of_range_payload() {
 
         let err = emit_stream(&mut ctx, stream, &[], &mut timers)
             .await
-            .expect_err("a payload-less or out-of-range NUMERIC must fail the call");
+            .expect_err("an out-of-range NUMERIC must fail the call");
         let text = err.to_string();
         assert!(
             text.contains("OFFENDING_COL"),
@@ -940,14 +950,7 @@ async fn emit_stream_fails_on_numeric_with_absent_or_out_of_range_payload() {
 /// indirectly, since a failed call emits nothing either way.
 #[test]
 fn a_drifted_numeric_never_resolves_to_the_string_target() {
-    let drifted = vec![
-        ExaType::Numeric {
-            precision: None,
-            scale: None,
-        },
-        numeric(39, 0),
-        numeric(10, 12),
-    ];
+    let drifted = vec![numeric(39, 0), numeric(10, 12)];
     for typ in drifted {
         let column = &declared(&[("C0", typ.clone())])[0];
         let resolved = target_arrow_type(column);

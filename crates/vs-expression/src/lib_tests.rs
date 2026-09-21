@@ -842,8 +842,9 @@ fn renders_cast_timestamp_precision_per_dialect() {
     }
 
     // Exasol dialect renders any precision 0-9 VERBATIM (Exasol's parser
-    // accepts every fractional-seconds precision).
-    for p in [0u64, 6, 9] {
+    // accepts every fractional-seconds precision) — this is where a declined
+    // DataFusion-dialect node is computed instead.
+    for p in 0u64..=9 {
         let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": p}));
         assert_eq!(
             render_expression_exasol(&expr).unwrap(),
@@ -852,22 +853,37 @@ fn renders_cast_timestamp_precision_per_dialect() {
         );
     }
 
-    // DataFusion dialect renders a supported precision VERBATIM (identity
-    // snap for 6).
-    let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": 6}));
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"CAST("X" AS TIMESTAMP(6))"#
-    );
+    // DataFusion dialect renders a supported precision VERBATIM (DataFusion
+    // 54 parses TIMESTAMP(p) only for p in {0,3,6,9}).
+    for p in [0u64, 3, 6, 9] {
+        let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": p}));
+        assert_eq!(
+            render_expression(&expr).unwrap(),
+            format!(r#"CAST("X" AS TIMESTAMP({p}))"#),
+            "DataFusion dialect must render TIMESTAMP({p}) verbatim"
+        );
+        assert_eq!(
+            render_expression_safe(&expr),
+            Some(format!(r#"CAST("X" AS TIMESTAMP({p}))"#)),
+            "DataFusion dialect safe variant must render TIMESTAMP({p}) verbatim"
+        );
+    }
 
-    // DataFusion dialect SNAPS an unsupported precision to the nearest
-    // supported unit: 5 -> 6 (DataFusion 54 parses TIMESTAMP(p) only for
-    // {0,3,6,9}).
-    let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": 5}));
-    assert_eq!(
-        render_expression(&expr).unwrap(),
-        r#"CAST("X" AS TIMESTAMP(6))"#
-    );
+    // DataFusion dialect DECLINES every other precision rather than
+    // approximate it — the adapter renders the Exasol-dialect SQL for the
+    // declined node instead.
+    for p in [1u64, 2, 4, 5, 7, 8, 10, 99] {
+        let expr = cast(json!({"type": "TIMESTAMP", "fractionalSecondsPrecision": p}));
+        assert!(
+            render_expression(&expr).is_err(),
+            "DataFusion dialect must decline TIMESTAMP({p})"
+        );
+        assert_eq!(
+            render_expression_safe(&expr),
+            None,
+            "DataFusion dialect safe variant must decline TIMESTAMP({p})"
+        );
+    }
 
     // Absent precision renders bare TIMESTAMP in BOTH dialects (unchanged),
     // whether the dataType omits withLocalTimeZone entirely or sets it false.

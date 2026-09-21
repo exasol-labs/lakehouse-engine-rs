@@ -2,7 +2,7 @@
 //! (`add-timestamp-precision-versioning` task 5).
 //!
 //! Deliberately duplicates the version-to-precision mapping rather than calling
-//! `TimestampPrecision::from_database_version`: a test that computes its expectation by calling the
+//! `EngineTimestampSupport::from_database_version`: a test that computes its expectation by calling the
 //! rule under test cannot fail when that rule is wrong (decision-log.md `[9]`). Reads the version from
 //! the live session rather than the `EXASOL_IMAGE` env var for the same reason — an absent or stale
 //! variable would silently select the wrong assertion arm.
@@ -17,10 +17,13 @@ use super::exasol_ws::ExaConn;
 pub struct ExpectedTimestampPrecision {
     /// The exact `SYS.EXA_ALL_COLUMNS.COLUMN_TYPE` string this arm declares — `TIMESTAMP(3)` for
     /// the millisecond arm, never bare `TIMESTAMP` — `SYS.EXA_ALL_COLUMNS` never reports a bare
-    /// `TIMESTAMP` on either supported engine (decision-log.md `[C1]`). Also a legal `CAST(... AS
-    /// {declared_column_type})` target on both supported engines, but only within `p in {3, 6}`:
-    /// Exasol 8.29.13 rejects every other parameterized precision as `0A000 Feature not supported`
-    /// (decision-log.md `[C3]`). Any future arm value must stay within that domain.
+    /// `TIMESTAMP` on either supported engine (decision-log.md `[C1]`).
+    ///
+    /// Usable as a `CAST(... AS {declared_column_type})` target only within `p in {3, 6}`: Exasol
+    /// 8.29.13 rejects every other parameterized precision as `0A000 Feature not supported`
+    /// (decision-log.md `[C3]`). [`ExpectedTimestampPrecision::NANOSECOND`] is therefore outside
+    /// the CAST domain on 8.x, and a caller casting to an arm's declared type must select that arm
+    /// through [`live_engine_version`] rather than assume it holds on both engines.
     pub declared_column_type: &'static str,
     /// The number of distinct values `COUNT(DISTINCT)` reports over the seeded
     /// `.000001/.000002/.123456/.123457` fixture at this arm's precision.
@@ -42,6 +45,14 @@ impl ExpectedTimestampPrecision {
         distinct_count: 2,
         retained_fractional_digits: 3,
     };
+    /// The arm an Iceberg `timestamp_ns` column reaches on an engine that emits nine digits. Its
+    /// `distinct_count` still describes the MICROSECOND-seeded four-value fixture, where a ninth
+    /// digit adds no distinction; a genuinely sub-microsecond fixture has its own counts.
+    pub const NANOSECOND: Self = Self {
+        declared_column_type: "TIMESTAMP(9)",
+        distinct_count: 4,
+        retained_fractional_digits: 9,
+    };
 }
 
 /// Read the live engine's version string from `SYS.EXA_METADATA`.
@@ -58,12 +69,18 @@ pub fn live_engine_version(conn: &mut ExaConn) -> String {
         .to_string()
 }
 
+/// Parse a version string's leading dot-separated component as an integer, this oracle's own
+/// parse shared by every rule below — the production rule is a separate implementation of the
+/// same shape.
+fn leading_version_component(version: &str) -> Option<u32> {
+    version.split('.').next().and_then(|s| s.parse().ok())
+}
+
 /// Map a version string to its expected precision arm with this oracle's own logic — parse the
 /// leading dot-separated component, gate on `>= 2025`, same shape as the production rule but a
 /// separate implementation of it.
 pub fn expected_timestamp_precision_for(version: &str) -> ExpectedTimestampPrecision {
-    let leading_component: Option<u32> = version.split('.').next().and_then(|s| s.parse().ok());
-    match leading_component {
+    match leading_version_component(version) {
         Some(year) if year < 2025 => ExpectedTimestampPrecision::MILLISECOND,
         _ => ExpectedTimestampPrecision::MICROSECOND,
     }
@@ -72,4 +89,17 @@ pub fn expected_timestamp_precision_for(version: &str) -> ExpectedTimestampPreci
 /// Read the live engine's version and return the precision arm expected on it.
 pub fn expected_timestamp_precision(conn: &mut ExaConn) -> ExpectedTimestampPrecision {
     expected_timestamp_precision_for(&live_engine_version(conn))
+}
+
+/// True when the live engine's leading version component parses as an integer `>= 2025`, or does
+/// not parse at all.
+///
+/// Both recorded engine differences turn on this one boundary, measured on 2025.2.1 and 8.29.13:
+/// `[C3]`'s CAST-target domain (8.29.13 rejects `TIMESTAMP(p)` for every `p` outside `{3, 6}` as
+/// `0A000 Feature not supported`, before any pushdown happens) and `[C2]`'s pushdown echo
+/// (8.29.13 omits `fractionalSecondsPrecision` entirely). Each caller names which of the two it
+/// depends on.
+pub fn engine_honors_declared_precision(conn: &mut ExaConn) -> bool {
+    let version = live_engine_version(conn);
+    leading_version_component(&version).is_none_or(|year| year >= 2025)
 }

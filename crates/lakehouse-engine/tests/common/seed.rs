@@ -30,7 +30,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::array::{
     BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray,
+    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::json::ReaderBuilder;
@@ -387,6 +387,36 @@ where
     F: IntoIterator<Item = B>,
     B: IntoIterator<Item = RecordBatch>,
 {
+    create_and_append_files_with_properties(
+        catalog,
+        namespace,
+        table_name,
+        iceberg_schema,
+        HashMap::new(),
+        files,
+    )
+    .await
+}
+
+/// [`create_and_append_files`] with table `properties` supplied at creation.
+///
+/// The REST catalog fixes a table's format version when it creates the table, and honours it only
+/// from the `format-version` PROPERTY: `TableCreation::format_version` is a no-op against a REST
+/// catalog. A seed needing an Iceberg v3 type — `timestamp_ns`, `timestamptz_ns`, `variant`,
+/// `geometry`, `geography`, `unknown` (Iceberg table spec, `§ Appendix E: Format version changes`)
+/// — must therefore come through here.
+pub async fn create_and_append_files_with_properties<F, B>(
+    catalog: &impl Catalog,
+    namespace: &str,
+    table_name: &str,
+    iceberg_schema: IcebergSchema,
+    properties: HashMap<String, String>,
+    files: F,
+) -> Result<bool>
+where
+    F: IntoIterator<Item = B>,
+    B: IntoIterator<Item = RecordBatch>,
+{
     let ns = NamespaceIdent::new(namespace.to_string());
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
@@ -428,14 +458,13 @@ where
         .name(table_name.to_string())
         .schema(iceberg_schema)
         .partition_spec(partition_spec)
-        .properties(HashMap::new())
+        .properties(properties)
         .build();
     let mut table = match catalog.create_table(&ns, creation).await {
         Ok(t) => t,
-        Err(_) => catalog
-            .load_table(&ident)
-            .await
-            .context("load existing table after create failed")?,
+        Err(create_error) => catalog.load_table(&ident).await.with_context(|| {
+            format!("create table failed ({create_error}); loading it instead also failed")
+        })?,
     };
 
     // Check again after load (race).
@@ -3495,6 +3524,11 @@ fn make_complex_join_probe_batch() -> RecordBatch {
     .expect("complex_join_probe RecordBatch construction is infallible")
 }
 
+/// The Iceberg table property that fixes a table's format version, and the version that admits
+/// `timestamp_ns` (Iceberg table spec, `§ Appendix E: Format version changes`).
+const ICEBERG_FORMAT_VERSION_PROPERTY: &str = "format-version";
+const ICEBERG_FORMAT_VERSION_3: &str = "3";
+
 /// Namespace and table for the timestamp-precision E2E probe
 /// (`add-timestamp-precision-versioning` task 6). Its OWN namespace, so this
 /// table never enters any other suite's `createVirtualSchema` table
@@ -3507,6 +3541,7 @@ pub const E2E_TSPRECISION_NAMESPACE: &str = "e2e_tsprecision";
 pub const E2E_TSPRECISION_TABLE: &str = "ts_precision_probe";
 pub const TSPRECISION_COL_TS: &str = "ts";
 pub const TSPRECISION_COL_TSTZ: &str = "tstz";
+pub const TSPRECISION_COL_TS_NS: &str = "ts_ns";
 
 /// Microseconds since UNIX_EPOCH for `2024-01-01 00:00:00.000001`,
 /// `.000002`, `.123456`, `.123457` — two pairs that collapse to the same
@@ -3517,6 +3552,20 @@ pub const TSPRECISION_MICROS: [i64; 4] = [
     BASE_TS_MICROS + 2,
     BASE_TS_MICROS + 123_456,
     BASE_TS_MICROS + 123_457,
+];
+
+/// Nanoseconds since UNIX_EPOCH for the `ts_ns` column: TWO values, each on two rows, that differ
+/// ONLY below the microsecond.
+///
+/// They are two distinct instants at `TIMESTAMP(9)` and ONE at every coarser declaration, so
+/// `COUNT(DISTINCT)` alone separates an engine that carries a genuine sub-microsecond digit
+/// through to Exasol from one that clamps it away. [`TSPRECISION_MICROS`] cannot make that
+/// distinction: its finest gap is a whole microsecond.
+pub const TSPRECISION_NANOS: [i64; 4] = [
+    BASE_TS_MICROS * 1_000 + 1,
+    BASE_TS_MICROS * 1_000 + 2,
+    BASE_TS_MICROS * 1_000 + 1,
+    BASE_TS_MICROS * 1_000 + 2,
 ];
 
 /// Seed the timestamp-precision probe (`id`, `ts`, `tstz`) into its own
@@ -3549,16 +3598,26 @@ pub async fn seed_timestamp_precision_probe(catalog_url: &str, warehouse: &str) 
                 Type::Primitive(PrimitiveType::Timestamptz),
             )
             .into(),
+            NestedField::required(
+                4,
+                TSPRECISION_COL_TS_NS,
+                Type::Primitive(PrimitiveType::TimestampNs),
+            )
+            .into(),
         ])
         .build()
         .context("build timestamp precision probe Iceberg schema")?;
 
-    create_and_append(
+    create_and_append_files_with_properties(
         &catalog,
         E2E_TSPRECISION_NAMESPACE,
         E2E_TSPRECISION_TABLE,
         iceberg_schema,
-        vec![make_timestamp_precision_probe_batch()],
+        HashMap::from([(
+            ICEBERG_FORMAT_VERSION_PROPERTY.to_string(),
+            ICEBERG_FORMAT_VERSION_3.to_string(),
+        )]),
+        std::iter::once(vec![make_timestamp_precision_probe_batch()]),
     )
     .await
     .context("seed timestamp precision probe table")?;
@@ -3580,6 +3639,11 @@ fn make_timestamp_precision_probe_batch() -> RecordBatch {
             DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         ),
+        Field::new(
+            TSPRECISION_COL_TS_NS,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
     ]));
 
     RecordBatch::try_new(
@@ -3591,6 +3655,7 @@ fn make_timestamp_precision_probe_batch() -> RecordBatch {
                 TimestampMicrosecondArray::from(TSPRECISION_MICROS.to_vec())
                     .with_timezone("+00:00"),
             ),
+            Arc::new(TimestampNanosecondArray::from(TSPRECISION_NANOS.to_vec())),
         ],
     )
     .expect("timestamp precision probe RecordBatch construction is infallible")

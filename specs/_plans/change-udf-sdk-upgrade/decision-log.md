@@ -70,6 +70,45 @@ or a stated, evidence-based spec claim here.
   a rejected emit at any width stops the plan.
 - **Supersedes:** "The scan keeps a fixed microsecond Arrow emit target at every declared TIMESTAMP
   precision".
+- **Measured:** Group C ran the full E2E suite against `exasol/docker-db:2025.1.16` and
+  `exasol/docker-db:8.29.13`, each from a cleared `exa-data` volume. Both legs: 15 test binaries,
+  0 failures. No SLC fingerprint mismatch at UDF load on either (`exasol-udf-sdk` 0.28.1 against
+  SLC 0.28.1, `rustc_1.94.1`). No width was rejected, so the plan's STOP condition did not fire.
+  - 2025.1.16, declaration: `SYS.EXA_ALL_COLUMNS` reports `TIMESTAMP(6)` for the Iceberg
+    `timestamp` and `timestamptz` columns and `TIMESTAMP(9)` for the `timestamp_ns` one. `[C2]`
+    holds on this build as well as on 2025.2.1: the pushdown echo carries
+    `fractionalSecondsPrecision`, so a projected `CAST(ts AS TIMESTAMP(9))` reaches the scan as
+    `EMITS ("ID" DECIMAL(20,0), "_LH_PROJ_1" TIMESTAMP(9))` and `TIMESTAMP(3)` as the matching
+    `TIMESTAMP(3)`.
+  - 2025.1.16, emit: the SLC accepted `Timestamp(Nanosecond, None)` into `TIMESTAMP(9)` and
+    `Timestamp(Millisecond, None)` into `TIMESTAMP(3)`, neither of which any emit path in this
+    repo had fed it before. At nine digits all four seeded values round-tripped unchanged and
+    `COUNT(DISTINCT)` was 4; at three digits `.123456` became `.123` and the count was 2. The
+    microsecond unit reached `TIMESTAMP(6)` on the catalog path, unchanged from before.
+  - 2025.1.16, declined width: `CAST(ts AS TIMESTAMP(2))` rendered as
+    `SELECT "LHS_T0"."ID", CAST("LHS_T0"."TS" AS TIMESTAMP(2)) FROM (… EMITS ("ID" DECIMAL(20,0),
+    "TS" TIMESTAMP(6))) AS "LHS_T0"`. The scan's `EMITS` carries the raw column and never
+    `TIMESTAMP(2)`, and the returned `.000`/`.120` equal Exasol's own
+    `CAST(TIMESTAMP '…' AS TIMESTAMP(2))` over the same literals in the same session.
+  - 2025.1.16, nanosecond SOURCE: the v3 fixture seeded successfully through the `format-version`
+    table property against `apache/iceberg-rest-fixture:1.10.1` and iceberg-rust 0.10.0, so the
+    nanosecond evidence is end-to-end rather than declaration-only. The `ts_ns` column carries two
+    instants differing only below the microsecond; both survive distinct
+    (`COUNT(DISTINCT ts_ns) = 2`). No narrowing of the delta's nanosecond claims was needed.
+  - 8.29.13, clamp: the adapter declares all three timestamp columns bare `TIMESTAMP` and
+    `SYS.EXA_ALL_COLUMNS` reports each as `TIMESTAMP(3)`. `COUNT(DISTINCT)` is 2 for `ts` and
+    `tstz` and 1 for `ts_ns`, so the nanosecond column loses its six digits exactly as the stated
+    8.x trade-off predicts. `[C3]` held: the `TIMESTAMP(9)` and `TIMESTAMP(2)` widths are not
+    measurable there and their `live_engine_version` guards declined.
+  - 8.29.13, SLC-reported precision for the bare `TIMESTAMP` output column: `3`. The UDF observed
+    `ColumnInfo { name: "TS", typ: Timestamp { precision: 3 }, type_name: "TIMESTAMP(3)", … }`, so
+    `from_declared_digits` takes its `Millisecond` arm and DECLARED equals EMITTED on this arm too.
+    The engine normalises the bare declaration to `TIMESTAMP(3)` in the metadata it hands the UDF,
+    matching what `[C1]` records `SYS.EXA_ALL_COLUMNS` reporting. The SLC's own
+    `%udf_debug_level debug` channel does NOT carry this: it reports `output_cols=2` and per-VM
+    emit/flush and RSS telemetry, but no per-column type. The value came from a throwaway
+    `eprintln!` of `declared_output_columns`, read over `SCRIPT_OUTPUT_ADDRESS` and reverted
+    immediately after.
 - **Promotes to ADR:** yes
 
 ### [2] Two owners for the two precision axes, not one enum with a third variant

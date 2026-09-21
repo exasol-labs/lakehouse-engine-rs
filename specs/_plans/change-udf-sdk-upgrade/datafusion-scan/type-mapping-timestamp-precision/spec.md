@@ -83,18 +83,18 @@ issue #359 added, and the parent feature keeps the general Arrow/Exasol type-com
   `fractionalSecondsPrecision`. `[C2]` on 8.29.13: the request omits the key entirely, so
   `exasol_type_from_json` reads none and declares bare `TIMESTAMP` there. `[C3]` on 8.29.13: that
   build rejects `TIMESTAMP(p)` for every `p` outside `{3, 6}` as `0A000 Feature not supported`.
-* No capture exists on 2025.1.16, the unclamped build this plan measures. That `[C1]` and `[C2]`
-  hold there is an ASSUMPTION, not a stated fact. Two different checks confirm the two halves.
-  Group C confirms `[C2]` ALONE, before it asserts any emitted value, by reading the generated SQL
-  and requiring the expected `TIMESTAMP(p)` literal in the `EMITS` clause. That SQL is built from
-  Exasol's own pushdown echo, so it shows only that the echo carried the precision. It shows nothing
-  about what the engine then does with the declaration. `[C1]`, the engine accepting AND HONORING a
-  declared precision, is confirmed by the VALUE assertion instead, which requires the distinct count
-  the declared width admits. A stripped `fractionalSecondsPrecision` echo on 2025.1.16 therefore
-  reports as its own named failure, distinct from the SLC rejecting an Arrow unit. A failed VALUE
-  assertion under a query that raised no error is an accept-and-clamp. That outcome is an ENGINE
-  LIMIT of the measured build, not an SLC rejection, and `[C1]` and `[C3]` record the same
-  accept-and-clamp on 8.29.13.
+* `[C1]` and `[C2]` were re-confirmed on 2025.1.16, the unclamped build this plan measures, rather
+  than carried over from the 2025.2.1 build they were captured on. Two separate checks confirm the
+  two halves, because they answer different questions. `[C2]`, the echo, is confirmed by reading
+  the generated SQL and requiring the expected `TIMESTAMP(p)` literal in the `EMITS` clause, BEFORE
+  any emitted value is asserted; that SQL is built from Exasol's own pushdown echo, so it shows only
+  that the echo carried the precision and nothing about what the engine then does with the
+  declaration. `[C1]`, the engine accepting AND HONORING a declared precision, is confirmed by the
+  VALUE assertion instead, which requires the distinct count the declared width admits. Both held.
+  A stripped echo on a later build therefore reports as its own named failure, distinct from the
+  SLC rejecting an Arrow unit, and a failed VALUE assertion under a query that raised no error is
+  an accept-and-clamp: an ENGINE LIMIT of the measured build, not an SLC rejection, the same
+  accept-and-clamp `[C1]` and `[C3]` record on 8.29.13.
 * The claim that iceberg-rust truncates nanoseconds before any value reaches DataFusion is FALSE and
   is deleted rather than reworded. `timestamp_to_micros` is this repo's own private function
   (`crates/lakehouse-engine/src/scan/convert.rs:162`) and does not exist in iceberg-rust at all.
@@ -149,6 +149,7 @@ issue #359 added, and the parent feature keeps the general Arrow/Exasol type-com
 * *AND* the clamp MUST NOT be left to the engine's own silent downgrade, which `[C1]` measured on 8.29.13 for both precision 6 and precision 9, because that would make `SYS.EXA_ALL_COLUMNS` claim a precision the adapter never obtains
 * *AND* the Delta/Unity producer SHALL NOT gain a nanosecond arm, because the Delta Lake protocol defines no nanosecond timestamp type: `§ Schema Serialization Format → Primitive Types` types both `timestamp` and `timestamp without time zone` as "Microsecond precision", and Unity Catalog's `ColumnTypeName` domain carries only `TIMESTAMP` and `TIMESTAMP_NTZ`. This SHALL be recorded as a protocol fact rather than omitted, so a later reader does not read the asymmetry between the two producers as an oversight
 * *AND* the nanosecond DIGITS SHALL be present in the data rather than zeroed upstream, because iceberg 0.10.0 maps `TimestampNs`/`TimestamptzNs` to Arrow `Timestamp(Nanosecond, _)` and its INT96 visitor declines to coerce a nanosecond target, and because the scan reads through DataFusion's own `ParquetSource` rather than iceberg-rust's reader at all
+* *AND* that presence SHALL be established end to end rather than by reasoning about the reader: a `timestamp_ns` column seeded through the `format-version` table PROPERTY (`TableCreation::format_version` is a no-op against a REST catalog) carrying two instants that differ ONLY below the microsecond was measured on `exasol/docker-db:2025.1.16` to be declared `TIMESTAMP(9)` with BOTH instants surviving as distinct values, and on 8.29.13 to be declared bare `TIMESTAMP`, reported `TIMESTAMP(3)`, with the two collapsing to ONE
 * *AND* the INT96 exception SHALL be named: `raw_scan.rs`'s `coerce_int96 = "us"` forces an INT96 PHYSICAL column to microseconds whatever its logical type, so a nanosecond-typed column stored as INT96 arrives at microsecond; a spec-conformant Iceberg `timestamp_ns` is written as INT64 `TIMESTAMP(NANOS)` and is unaffected
 <!-- /DELTA:NEW -->
 
@@ -193,11 +194,12 @@ issue #359 added, and the parent feature keeps the general Arrow/Exasol type-com
 * *WHEN* the scan resolves that column's Arrow coercion target at the emit boundary (`target_arrow_type`) from the `ExaType` that `UdfContext::output_column` reports for the column
 * *THEN* the reported variant SHALL be `ExaType::Timestamp { precision }` for every such declaration
 * *AND* `target_arrow_type` SHALL return `DataType::Timestamp(unit, None)` where `unit` is `Millisecond` for a reported `precision` of 3, `Microsecond` for 6, and `Nanosecond` for 9, read from the SAME owner that produces the declaration string so the two sides cannot disagree about what `TIMESTAMP(9)` means, and MUST NOT return a fixed unit at every precision, because a microsecond target under a `TIMESTAMP(9)` declaration destroys every nanosecond digit through the strict (`safe: false`) cast in `coerce_column`
-* *AND* a reported `precision` outside `{3, 6, 9}` SHALL resolve to the SMALLEST of those three units that is NOT COARSER than the declaration (`0`, `1` and `2` to `Millisecond`, `4` and `5` to `Microsecond`, `7` and above to `Nanosecond`), so a mapping error can only ever emit a value Exasol truncates, never one the scan has already destroyed
+* *AND* a reported `precision` outside `{3, 6, 9}` SHALL resolve to the COARSEST of those three units that is NOT COARSER than the declaration (`0`, `1` and `2` to `Millisecond`, `4` and `5` to `Microsecond`, `7` and above to `Nanosecond`), so a mapping error can only ever emit a value Exasol truncates, never one the scan has already destroyed
 * *AND* the `Millisecond` floor for `p` below 3 SHALL be recorded as a deliberate trade-off rather than an oversight: Arrow's `Second` unit would match a `TIMESTAMP(0)` declaration exactly, but no emit path in this repo has ever fed the SLC a second-unit Arrow column, and the only declaration that reaches `p = 0` is the exotic projected `CAST(x AS TIMESTAMP(0))`, whose one Exasol-side truncation is the cheaper risk
 * *AND* on the CATALOG-column path the declared precision SHALL equal the emitted resolution on BOTH engine arms, so the round trip is exact by construction and no component truncates after the scan, replacing the recorded rule that the scan emits microseconds at every declaration and relies on Exasol to truncate
-* *AND* the running engine SHALL accept a `Timestamp(Millisecond, None)`, a `Timestamp(Microsecond, None)` and a `Timestamp(Nanosecond, None)` Arrow column into the matching `TIMESTAMP(3)`, `TIMESTAMP(6)` and `TIMESTAMP(9)` declaration, each measured against the local Exasol Docker container rather than carried over from the SDK's upstream fixture, because the SLC's strict Arrow-IPC block feed is the component that gained the precision, only the microsecond unit has ever been fed to it from this repo, and the upstream fixture exercises the `Value` emit path rather than this Arrow one
+* *AND* the running engine SHALL accept a `Timestamp(Millisecond, None)`, a `Timestamp(Microsecond, None)` and a `Timestamp(Nanosecond, None)` Arrow column into the matching `TIMESTAMP(3)`, `TIMESTAMP(6)` and `TIMESTAMP(9)` declaration, each measured against the local Exasol Docker container rather than carried over from the SDK's upstream fixture, because the SLC's strict Arrow-IPC block feed is the component that gained the precision, only the microsecond unit has ever been fed to it from this repo, and the upstream fixture exercises the `Value` emit path rather than this Arrow one; all three were measured on `exasol/docker-db:2025.1.16` and none was rejected, and the `Millisecond` unit was measured again on 8.29.13, where the clamped declaration is the only one that arm produces
 * *AND* on Exasol 8.29.13, where the engine clamp declares every catalog timestamp column bare `TIMESTAMP`, the scan SHALL emit the `Millisecond` unit and the round trip SHALL be exact at three digits, so the 8.x limitation is a DECLARED narrowing rather than an unmeasured reliance on the engine truncating a finer value
+* *AND* the `Millisecond` arm on that engine SHALL be the one `from_declared_digits` actually takes rather than an inference from the declaration string, which was measured by reading the column metadata the SLC hands the UDF for that bare declaration: `ColumnInfo { typ: Timestamp { precision: 3 }, type_name: "TIMESTAMP(3)", … }`, so the engine normalises a bare `TIMESTAMP` to precision 3 before the scan ever sees it and the two sides agree without the scan inspecting the spelling
 * *AND* `target_arrow_type` MUST NOT route `ExaType::Timestamp` through the `Utf8` string path, which would stringify the value and violate the `TIMESTAMP(p)` EMITS declaration
 * *AND* the removal of the `ExaType::TimestampTz` coercion target MUST NOT change any emitted value, because this feature's "Iceberg timestamptz maps to plain Exasol TIMESTAMP" scenario already requires the emit boundary to cast a zoned column to `Timestamp(_, None)`, and Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF `EMITS` output type (`sqlCode 22002`), so no declaration ever reached that target
 * *AND* `exasol_type_to_arrow` SHALL map a `TIMESTAMP(p)` type STRING to the same unit `target_arrow_type` resolves for the same `p`, rather than keeping its recorded fixed microsecond answer, because it is documented as the single source of truth for the Arrow type the strict `emit_batch` feed accepts and a second, disagreeing answer in the same module is exactly the drift its doc comment forbids

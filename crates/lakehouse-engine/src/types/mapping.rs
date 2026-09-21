@@ -136,11 +136,21 @@ pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
     if upper == "DATE" {
         return Some(DataType::Date32);
     }
-    if upper == "TIMESTAMP" || (upper.starts_with("TIMESTAMP(") && upper.ends_with(')')) {
-        // Every declared TIMESTAMP(p) precision collapses to the same Arrow
-        // microsecond representation; `p` is Exasol's own type-check concern,
-        // never the internal Arrow representation (see decision-log #212).
-        return Some(DataType::Timestamp(TimeUnit::Microsecond, None));
+    if upper == "TIMESTAMP" {
+        return Some(DataType::Timestamp(
+            TimestampPrecision::from_declared_digits(BARE_TIMESTAMP_DECLARED_DIGITS).arrow_unit(),
+            None,
+        ));
+    }
+    if let Some(digits) = upper
+        .strip_prefix("TIMESTAMP(")
+        .and_then(|rest| rest.strip_suffix(')'))
+        .and_then(|digits| digits.trim().parse::<u32>().ok())
+    {
+        return Some(DataType::Timestamp(
+            TimestampPrecision::from_declared_digits(digits).arrow_unit(),
+            None,
+        ));
     }
     if upper == "TIMESTAMP WITH LOCAL TIME ZONE" {
         return Some(DataType::Timestamp(
@@ -163,6 +173,10 @@ pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
     // Arrow target). Returning None signals "route through the Utf8/JSON path".
     None
 }
+
+/// Exasol's bare `TIMESTAMP` IS `TIMESTAMP(3)`, so an unparameterized declaration
+/// resolves through the same precision table as a parameterized one.
+const BARE_TIMESTAMP_DECLARED_DIGITS: u32 = 3;
 
 /// Max precision a scale-0 DECIMAL fits into a 32-bit int (Exasol ExaType Int32).
 pub const DECIMAL_INT32_MAX_PRECISION: u8 = 9;
@@ -275,34 +289,96 @@ fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> String {
 /// Exasol's first calendar-versioned release; every earlier line numbers 8.x or below.
 const FIRST_CALENDAR_VERSIONED_MAJOR: u32 = 2025;
 
-/// The fractional-second precision an Exasol engine can declare for a
-/// catalog-declared timestamp column.
+/// The fractional-second width a catalog declares for ONE timestamp COLUMN.
 ///
-/// Sole owner of both the version rule and the two declaration strings. Both
-/// engine lines accept the parameterized `TIMESTAMP(6)` declaration, but only the
-/// calendar-versioned line honors it: 8.x clamps the declared type to
-/// `TIMESTAMP(3)` and strips `fractionalSecondsPrecision` from the pushdown echo
-/// (decision-log.md `[C1]`/`[C3]`). The gate therefore exists to keep
-/// `SYS.EXA_ALL_COLUMNS` honest about what the adapter asked for, not to avoid a
-/// rejection. Both catalog-declaration producers read their answer here, so an
-/// Iceberg `timestamp` and a Delta `TIMESTAMP` cannot be declared at different
-/// precisions.
+/// Sole owner of that width's vocabulary and of every translation out of it: the
+/// Exasol declaration string, the Arrow `TimeUnit`, and the reverse reading of a
+/// declared Exasol precision. Both the adapter's declaration producers and the
+/// scan's emit boundary resolve through this one table, so a declared
+/// `TIMESTAMP(9)` cannot mean one width where it is declared and another where it
+/// is emitted.
+///
+/// Three values, not the ten Exasol precisions: these are the three sub-second
+/// Parquet timestamp encodings (MILLIS, MICROS, NANOS) and the three sub-second
+/// Arrow `TimeUnit`s, so the vocabulary is format-neutral by construction and a
+/// reader for a format this repo does not yet support names a value without
+/// widening the type. What a running engine can actually emit is a separate
+/// decision, owned by [`EngineTimestampSupport`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimestampPrecision {
-    /// Exasol 8.x and earlier: the bare `TIMESTAMP` declaration, truncating to milliseconds.
     Millisecond,
-    /// Exasol 2025.x and later: `TIMESTAMP(6)`.
     Microsecond,
+    Nanosecond,
 }
 
 impl TimestampPrecision {
-    /// Resolve the precision from an Exasol engine version string, as reported by
+    /// The Exasol type string a timestamp column of this width is declared at.
+    pub fn declaration(self) -> &'static str {
+        match self {
+            Self::Millisecond => "TIMESTAMP",
+            Self::Microsecond => "TIMESTAMP(6)",
+            Self::Nanosecond => "TIMESTAMP(9)",
+        }
+    }
+
+    /// The Arrow `TimeUnit` a column of this width carries, and the target the emit
+    /// boundary coerces it to before `emit_batch`.
+    pub fn arrow_unit(self) -> TimeUnit {
+        match self {
+            Self::Millisecond => TimeUnit::Millisecond,
+            Self::Microsecond => TimeUnit::Microsecond,
+            Self::Nanosecond => TimeUnit::Nanosecond,
+        }
+    }
+
+    /// The width a declared Exasol `TIMESTAMP(p)` names: the COARSEST of the three
+    /// that is not coarser than `p` — the widest unit that still holds every digit
+    /// `p` declares, floored at millisecond — so a mapping error can only ever emit
+    /// a value Exasol truncates, never one the scan has already destroyed.
+    ///
+    /// `p` below 3 floors at millisecond rather than reaching Arrow's `Second`
+    /// unit, which no emit path in this repo has ever fed the SLC; the only
+    /// declaration that reaches `p = 0` is a projected `CAST(x AS TIMESTAMP(0))`,
+    /// whose single Exasol-side truncation is the cheaper risk.
+    pub fn from_declared_digits(digits: u32) -> Self {
+        match digits {
+            0..=3 => Self::Millisecond,
+            4..=6 => Self::Microsecond,
+            _ => Self::Nanosecond,
+        }
+    }
+}
+
+/// The finest fractional-second width the RUNNING Exasol engine can emit — a
+/// property of the REQUEST, resolved once per `createVirtualSchema`.
+///
+/// Sole owner of the version rule and of the clamp it implies. Both engine lines
+/// accept a parameterized declaration, but only the calendar-versioned line honors
+/// it: 8.x silently downgrades the declared type to `TIMESTAMP(3)` and strips
+/// `fractionalSecondsPrecision` from the pushdown echo (decision-log.md
+/// `[C1]`/`[C3]`). Clamping here rather than leaving that downgrade implicit keeps
+/// `SYS.EXA_ALL_COLUMNS` honest about what the adapter actually obtained.
+///
+/// Takes the version as a string rather than a `UdfContext`, so this module reads
+/// no ambient state and performs no I/O; the single `ctx.database_version()` read
+/// belongs to the adapter. What width a COLUMN carries is a separate decision,
+/// owned by [`TimestampPrecision`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineTimestampSupport {
+    /// Exasol 8.x and earlier: every source width narrows to the bare `TIMESTAMP`.
+    MillisecondOnly,
+    /// Exasol 2025.x and later: the source width is declared and emitted as-is.
+    DeclaredPrecision,
+}
+
+impl EngineTimestampSupport {
+    /// Resolve the engine's support from its version string, as reported by
     /// `UdfContext::database_version` — a bare image-tag-shaped string, `8.29.13`
     /// or `2025.2.1`, whose leading dot-separated component is the only part that
     /// separates the two lines.
     ///
     /// Infallible by design, so the enumeration it feeds cannot fail on it. An empty
-    /// or unparseable version takes the microsecond arm — the user's recorded
+    /// or unparseable version takes the fidelity-preserving arm — the user's recorded
     /// deliberate choice (decision-log.md interview Q2). On an 8.x-like engine this
     /// is not loud: the engine accepts and clamps the declaration (`[C1]`), so the
     /// choice trades a silent misdeclaration in `SYS.EXA_ALL_COLUMNS` against
@@ -314,26 +390,26 @@ impl TimestampPrecision {
             .next()
             .and_then(|major| major.parse::<u32>().ok())
         {
-            Some(major) if major < FIRST_CALENDAR_VERSIONED_MAJOR => Self::Millisecond,
-            _ => Self::Microsecond,
+            Some(major) if major < FIRST_CALENDAR_VERSIONED_MAJOR => Self::MillisecondOnly,
+            _ => Self::DeclaredPrecision,
         }
     }
 
-    /// The Exasol type string a catalog-declared timestamp column takes at this precision.
-    pub fn declaration(self) -> &'static str {
+    /// Narrow a source width to what this engine can emit.
+    pub fn clamp(self, source: TimestampPrecision) -> TimestampPrecision {
         match self {
-            Self::Millisecond => "TIMESTAMP",
-            Self::Microsecond => "TIMESTAMP(6)",
+            Self::MillisecondOnly => TimestampPrecision::Millisecond,
+            Self::DeclaredPrecision => source,
         }
     }
 }
 
 /// Map an Iceberg `PrimitiveType` to an Exasol type string, used by
-/// `createVirtualSchema`. `timestamp_precision` is the engine-version-resolved
-/// fractional-second precision every timestamp column is declared at.
+/// `createVirtualSchema`. Each timestamp variant names the source width the Iceberg
+/// spec types it at; `engine` narrows that width to what the running engine emits.
 pub fn iceberg_primitive_to_exasol(
     pt: &iceberg::spec::PrimitiveType,
-    timestamp_precision: TimestampPrecision,
+    engine: EngineTimestampSupport,
 ) -> String {
     use iceberg::spec::PrimitiveType::*;
     match pt {
@@ -351,9 +427,14 @@ pub fn iceberg_primitive_to_exasol(
         // and an Iceberg timestamptz is a UTC instant, so the emitted value is
         // unchanged. The internal tz-aware Arrow representation is kept in
         // iceberg_primitive_to_arrow.
-        Timestamp | TimestampNs | Timestamptz | TimestamptzNs => {
-            timestamp_precision.declaration().to_string()
-        }
+        Timestamp | Timestamptz => engine
+            .clamp(TimestampPrecision::Microsecond)
+            .declaration()
+            .to_string(),
+        TimestampNs | TimestamptzNs => engine
+            .clamp(TimestampPrecision::Nanosecond)
+            .declaration()
+            .to_string(),
         String | Uuid => "VARCHAR(2000000)".to_string(),
         // Fixed-width binary and arbitrary binary → VARCHAR via JSON
         Fixed(_) | Binary => "VARCHAR(2000000)".to_string(),
@@ -487,13 +568,10 @@ pub fn arrow_type_from_tag(tag: &str) -> DataType {
 
 /// Map an Iceberg `Type` to an Exasol type string.
 /// Non-primitive types (List, Struct, Map) → VARCHAR(2000000) via JSON.
-pub fn iceberg_type_to_exasol(
-    ty: &iceberg::spec::Type,
-    timestamp_precision: TimestampPrecision,
-) -> String {
+pub fn iceberg_type_to_exasol(ty: &iceberg::spec::Type, engine: EngineTimestampSupport) -> String {
     use iceberg::spec::Type;
     match ty {
-        Type::Primitive(pt) => iceberg_primitive_to_exasol(pt, timestamp_precision),
+        Type::Primitive(pt) => iceberg_primitive_to_exasol(pt, engine),
         // List, Struct, Map → JSON string fallback
         _ => "VARCHAR(2000000)".to_string(),
     }
@@ -506,10 +584,10 @@ pub fn iceberg_type_to_exasol(
 /// rather than a silently-unmapped type elsewhere.
 pub(crate) fn column_source_type_to_exasol(
     source_type: &ColumnSourceType,
-    timestamp_precision: TimestampPrecision,
+    engine: EngineTimestampSupport,
 ) -> String {
     match source_type {
-        ColumnSourceType::Iceberg(ty) => iceberg_type_to_exasol(ty, timestamp_precision),
+        ColumnSourceType::Iceberg(ty) => iceberg_type_to_exasol(ty, engine),
         ColumnSourceType::Unity {
             type_name,
             precision,
@@ -520,15 +598,15 @@ pub(crate) fn column_source_type_to_exasol(
                 precision: *precision,
                 scale: *scale,
             },
-            timestamp_precision,
+            engine,
         ),
     }
 }
 
 /// Map a Unity Catalog Spark scalar type name to an Exasol type string, per the
 /// project's Arrow-to-Exasol convention. `decimal` only applies to `DECIMAL` and
-/// is ignored otherwise; `timestamp_precision` is the engine-version-resolved
-/// fractional-second precision, and applies only to the timestamp arm. Any type
+/// is ignored otherwise; `engine` narrows the timestamp arm's source width to what
+/// the running engine emits, and applies to no other arm. Any type
 /// without a clean scalar Exasol equivalent falls back to VARCHAR(2000000) via
 /// JSON rather than failing enumeration; for `DECIMAL` that fallback is decided
 /// by the shared [`exasol_representable_catalog_decimal`] domain
@@ -536,7 +614,7 @@ pub(crate) fn column_source_type_to_exasol(
 fn unity_type_name_to_exasol(
     type_name: &str,
     decimal: CatalogDecimal,
-    timestamp_precision: TimestampPrecision,
+    engine: EngineTimestampSupport,
 ) -> String {
     match type_name {
         "BOOLEAN" => "BOOLEAN".to_string(),
@@ -547,7 +625,13 @@ fn unity_type_name_to_exasol(
         "FLOAT" | "DOUBLE" => "DOUBLE PRECISION".to_string(),
         "STRING" => "VARCHAR(2000000)".to_string(),
         "DATE" => "DATE".to_string(),
-        "TIMESTAMP" | "TIMESTAMP_NTZ" => timestamp_precision.declaration().to_string(),
+        // No nanosecond arm: the Delta protocol types both `timestamp` and
+        // `timestamp without time zone` as microsecond precision and defines no
+        // nanosecond timestamp type.
+        "TIMESTAMP" | "TIMESTAMP_NTZ" => engine
+            .clamp(TimestampPrecision::Microsecond)
+            .declaration()
+            .to_string(),
         "DECIMAL" => catalog_decimal_to_exasol(decimal.precision, decimal.scale),
         // Every incompatible Spark type (ARRAY, MAP, STRUCT, BINARY, INTERVAL,
         // VARIANT, ...): VARCHAR via JSON fallback.

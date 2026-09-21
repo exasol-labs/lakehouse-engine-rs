@@ -66,10 +66,7 @@ fn declared(names: &[&str], types: &[ExaType]) -> Vec<ColumnInfo> {
 }
 
 fn numeric(precision: u32, scale: u32) -> ExaType {
-    ExaType::Numeric {
-        precision: Some(precision),
-        scale: Some(scale),
-    }
+    ExaType::Numeric { precision, scale }
 }
 
 const GB: f64 = 1_000_000_000.0;
@@ -165,7 +162,7 @@ fn primitive_batch(kind: &str, n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
             Arc::new(TimestampMicrosecondArray::from_iter_values(
                 (0..n).map(|i| 1_700_000_000_000_000 + i as i64),
             )),
-            ExaType::Timestamp,
+            ExaType::Timestamp { precision: 6 },
         ),
         "DECIMAL" => (
             Field::new("c", DataType::Decimal128(20, 4), false),
@@ -181,9 +178,7 @@ fn primitive_batch(kind: &str, n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
             Arc::new(StringArray::from_iter_values(
                 (0..n).map(|i| format!("string-value-row-{i:08}")),
             )),
-            ExaType::String {
-                size: Some(2_000_000),
-            },
+            ExaType::String { size: 2_000_000 },
         ),
         other => panic!("unknown primitive schema {other}"),
     };
@@ -243,9 +238,7 @@ fn lineitem_batch(n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
             (0..n).map(|i| format!("comment text for line item number {i}")),
         )),
     ];
-    let varchar = ExaType::String {
-        size: Some(2_000_000),
-    };
+    let varchar = ExaType::String { size: 2_000_000 };
     let types = vec![
         numeric(20, 0),
         numeric(20, 0),
@@ -254,7 +247,7 @@ fn lineitem_batch(n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
         ExaType::Double,
         varchar.clone(),
         ExaType::Date,
-        ExaType::Timestamp,
+        ExaType::Timestamp { precision: 6 },
         varchar.clone(),
         varchar,
     ];

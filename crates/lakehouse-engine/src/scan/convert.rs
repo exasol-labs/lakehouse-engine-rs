@@ -130,8 +130,7 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Result<Value, UdfError> {
             // TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS output type). The
             // Arrow value is already the UTC instant as a NaiveDateTime, so
             // tz-aware and tz-naive timestamps emit identically.
-            let raw = timestamp_to_micros(col, row, unit);
-            Value::Timestamp(micros_to_naive_datetime(raw))
+            Value::Timestamp(timestamp_to_naive_datetime(col, row, unit)?)
         }
         DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => {
             let arr = col.as_any().downcast_ref::<Decimal128Array>().unwrap();
@@ -159,42 +158,67 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Result<Value, UdfError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn timestamp_to_micros(col: &dyn Array, row: usize, unit: &TimeUnit) -> i64 {
-    match unit {
-        TimeUnit::Second => {
-            let arr = col.as_any().downcast_ref::<TimestampSecondArray>().unwrap();
-            arr.value(row) * 1_000_000
-        }
-        TimeUnit::Millisecond => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap();
-            arr.value(row) * 1_000
-        }
-        TimeUnit::Microsecond => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap();
-            arr.value(row)
-        }
-        TimeUnit::Nanosecond => {
-            let arr = col
-                .as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .unwrap();
-            arr.value(row) / 1_000
-        }
-    }
-}
+/// Whole nanoseconds in one second, the resolution `chrono::NaiveDateTime` carries.
+const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
-fn micros_to_naive_datetime(micros: i64) -> NaiveDateTime {
-    let secs = micros.div_euclid(1_000_000);
-    let nanos = (micros.rem_euclid(1_000_000) * 1_000) as u32;
-    DateTime::<Utc>::from_timestamp(secs, nanos)
+/// The instant an Arrow timestamp cell holds, at the array's OWN unit and losing
+/// no digit it carries.
+///
+/// Splits the raw value into whole seconds and a sub-second remainder rather than
+/// normalizing it to one integer count: an `i64` count of NANOSECONDS represents
+/// only 1677-2262, a narrower range than the timestamps an Iceberg or Delta source
+/// can legitimately carry, and an `i64` count of MICROSECONDS would drop the three
+/// digits a nanosecond column holds.
+///
+/// Fails rather than substituting a value when the instant falls outside the range
+/// `chrono::NaiveDateTime` represents — a substituted value would silently emit the
+/// wrong row instead of surfacing the loss.
+fn timestamp_to_naive_datetime(
+    col: &dyn Array,
+    row: usize,
+    unit: &TimeUnit,
+) -> Result<NaiveDateTime, UdfError> {
+    let (raw, per_second) = match unit {
+        TimeUnit::Second => (
+            col.as_any()
+                .downcast_ref::<TimestampSecondArray>()
+                .unwrap()
+                .value(row),
+            1,
+        ),
+        TimeUnit::Millisecond => (
+            col.as_any()
+                .downcast_ref::<TimestampMillisecondArray>()
+                .unwrap()
+                .value(row),
+            1_000,
+        ),
+        TimeUnit::Microsecond => (
+            col.as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap()
+                .value(row),
+            1_000_000,
+        ),
+        TimeUnit::Nanosecond => (
+            col.as_any()
+                .downcast_ref::<TimestampNanosecondArray>()
+                .unwrap()
+                .value(row),
+            NANOS_PER_SECOND,
+        ),
+    };
+    let seconds = raw.div_euclid(per_second);
+    let subsecond_nanos = (raw.rem_euclid(per_second) * (NANOS_PER_SECOND / per_second)) as u32;
+    DateTime::<Utc>::from_timestamp(seconds, subsecond_nanos)
         .map(|dt| dt.naive_utc())
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp(0, 0).unwrap().naive_utc())
+        .ok_or_else(|| {
+            UdfError::User(format!(
+                "timestamp out of range: a {unit:?} column value {raw} (derived seconds \
+                 {seconds}, sub-second nanoseconds {subsecond_nanos}) falls outside the instant \
+                 range chrono::NaiveDateTime represents"
+            ))
+        })
 }
 
 /// Render an Arrow value as a display string for incompatible types.
