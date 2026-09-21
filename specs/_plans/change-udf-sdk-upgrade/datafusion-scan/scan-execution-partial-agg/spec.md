@@ -11,6 +11,22 @@ can merge into the final query result.
   and applied identically on both emit paths. Since `exasol-udf-sdk` 0.28.1 that rule covers an
   out-of-range `precision` or `scale` only, because `ExaType::Numeric` no longer holds an absent one
   (issue #405).
+* This path carries a SECOND timestamp truncation site, independent of the Arrow `emit_batch` one.
+  `partial_row_from_batch` coerces each column to the declared Arrow type and then converts the
+  single cell to a `Value` through `arrow_value_at`, whose timestamp arm calls
+  `timestamp_to_micros` (`crates/lakehouse-engine/src/scan/convert.rs:162`). That helper's
+  `TimeUnit::Nanosecond` branch divides by 1,000. Once the declared precision drives the coercion
+  target, a `TIMESTAMP(9)` column reaches this helper as a nanosecond array and loses the three
+  digits the coercion just preserved.
+* The site is reachable rather than theoretical: `validate_agg_col_types`
+  (`crates/lakehouse-engine/src/adapter/pushdown/grouped_agg.rs:777`) requires a numeric column for
+  `SUM` and the statistical family only, and its doc records that "MIN/MAX are valid over any
+  comparable type (DATE, TIMESTAMP, VARCHAR included)", so `MIN`/`MAX` over a nanosecond timestamp
+  column is pushed into this path.
+* `Value::Timestamp` carries a `chrono::NaiveDateTime`, which is nanosecond-resolved, so the loss is
+  this repo's own and not a limit of the SDK type. Whether the SLC's `Value` wire encoding preserves
+  those digits is NOT established by source inspection, because the encoding lives in the language
+  container rather than in the SDK crate, so it is measured on the live engine rather than assumed.
 <!-- /DELTA:NEW -->
 
 ## Scenarios
@@ -25,6 +41,9 @@ can merge into the final query result.
 * *AND* the emitted `Value` variant SHALL be one the SDK's `column_accepts` rule admits for that declared column, so no partial-aggregate query fails with an `output column … is … but the value is …` error
 * *AND* a partial-aggregate column whose declared `Numeric` reports a `precision` or `scale` outside what `Decimal128` represents SHALL fail the call naming that column, under the same rule the Arrow `emit_batch` path applies, so neither path substitutes a string value into a numeric column
 * *AND* the absent-payload half of that rule SHALL be deleted rather than left unreachable, because `ExaType::Numeric` no longer holds an absent `precision` or `scale` (`datafusion-scan/scan-execution-value-conversion`)
+* *AND* a `MIN`/`MAX` cell over a timestamp column SHALL be converted to its `Value::Timestamp` WITHOUT losing a fractional digit the coerced Arrow column carries, so a `Timestamp(Nanosecond, _)` cell under a `TIMESTAMP(9)` declaration keeps all nine digits and a `Timestamp(Millisecond, _)` cell under a bare `TIMESTAMP` declaration keeps its three
+* *AND* the `TimeUnit::Nanosecond` branch of `timestamp_to_micros` MUST NOT divide the value by 1,000, because `Value::Timestamp` carries a nanosecond-resolved `chrono::NaiveDateTime` and the division is this repo's own loss rather than a limit of the SDK type
+* *AND* the replacement conversion MUST NOT represent the instant as an `i64` count of NANOSECONDS, whose range covers only 1677-2262 and would turn a lossy conversion into an out-of-range one for timestamps this repo's Iceberg and Delta sources can legitimately carry
 * *AND* `AVG`, `STDDEV`, `STDDEV_POP`, `VARIANCE` and `VAR_POP` over an integer or decimal column SHALL return the same values they returned before the SDK bump
 * *AND* the UDF MUST NOT add a per-aggregate-kind cast to the partial SELECT SQL, because the declared column is the one authority and reading it covers every kind at once
 * *AND* group-key columns SHALL keep their existing `value_to_gk_string` stringification, unchanged and uncoerced, so the merge identity of a group is unaffected
