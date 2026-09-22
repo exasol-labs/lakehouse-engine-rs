@@ -3,6 +3,7 @@ use super::*;
 use crate::scan::checked_div::{CheckedFloatDivError, register_checked_float_div_udf};
 use arrow::array::Int32Array;
 use arrow::datatypes::{DataType, Field, Schema};
+use arrow::error::ArrowError;
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::RecordBatchStream;
