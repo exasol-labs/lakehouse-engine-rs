@@ -34,9 +34,17 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
 * No VS or connection property configures the core count. The adapter reads
   properties by name and ignores every name it does not know, so an unknown name in a
   `createVirtualSchema` statement is accepted and has no effect. An operator who needs
-  a smaller effective core count constrains the executing node's CPU quota, which
+  a smaller effective core count constrains the executing node's CPU affinity, which
   `std::thread::available_parallelism()` honours. The Docker scenario below verifies
-  that the adapter VM reads that quota.
+  that the adapter VM reads that affinity set.
+* A CPU limit expressed only as a CFS bandwidth quota, such as Docker `cpus:` or a
+  Kubernetes `limits.cpu` without the static CPU manager policy, is not visible to the
+  adapter. The Exasol UDF sandbox mounts no cgroup filesystem, so no UDF reads the
+  quota, and `std::thread::available_parallelism()` reports the affinity count. A node
+  limited that way receives budgets sized for more CPU than it may use. This is a
+  deliberate limitation tracked in (#421), not an unrecorded gap. An affinity-based
+  limit (Docker `cpuset`, the Kubernetes static CPU manager policy, or ordinary bare
+  metal) is detected exactly.
 * No topology value uses a connect-back session, at create time or at pushdown time;
   the adapter opens no read-only SQL session for topology discovery, issues no
   `SELECT NPROC()` or `SELECT PARAM_VALUE(...)`, and honours no `CONNECTION_NAME` VS
@@ -132,12 +140,12 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
-### Scenario: The adapter VM detects the Docker container's CPU quota
+### Scenario: The adapter VM detects the Docker container's CPU affinity set
 
-* *GIVEN* the local Docker Exasol container constrained to a CPU quota, read back from the running container's own cgroup rather than from the environment of the process that launched it
-* *AND* a test host whose `std::thread::available_parallelism()` is strictly greater than that quota, without which the assertion below holds equally for an adapter reading the unconstrained host count and therefore evidences nothing
+* *GIVEN* the local Docker Exasol container constrained to a CPU affinity set, read back from the running container's own `cpuset.cpus.effective` rather than from the environment of the process that launched it
+* *AND* a test host whose `std::thread::available_parallelism()` is strictly greater than the number of CPUs in that set, without which the assertion below holds equally for an adapter reading the unconstrained host count and therefore evidences nothing
 * *AND* a virtual schema created with `PARALLELISM_FACTOR = '1'` and no `DATAFUSION_THREADING_MODE` property, so the AUTO derivation divides the detected core count by a per-node instance share of `1` and records it unchanged as `DF_THREADS_PER_UDF`
 * *WHEN* the test reads the `DF_THREADS_PER_UDF` entry from that schema's `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` row
-* *THEN* the recorded value SHALL equal the CPU quota read back from the container, which evidences that the adapter VM reads the container's quota rather than the unavailable fallback of `1` or the host's unconstrained core count
-* *AND* the test MUST FAIL rather than skip when the value differs, because auto-detection is the only source of the core count and a skipped check would leave that source unevidenced, and MUST FAIL naming the unmet precondition rather than report a pass when the container quota is not strictly less than the test host's core count, so a non-discriminating configuration records no false evidence
+* *THEN* the recorded value SHALL equal the number of CPUs in the affinity set read back from the container, which evidences that the adapter VM reads the container's affinity set rather than the unavailable fallback of `1` or the host's unconstrained core count
+* *AND* the test MUST FAIL rather than skip when the value differs, because auto-detection is the only source of the core count and a skipped check would leave that source unevidenced, and MUST FAIL naming the unmet precondition rather than report a pass when the container's affinity set is not strictly smaller than the test host's core count, so a non-discriminating configuration records no false evidence
 <!-- /DELTA:NEW -->

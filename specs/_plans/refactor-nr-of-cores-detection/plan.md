@@ -49,6 +49,8 @@ The four derivations keep their `nr_of_cores: u32` parameter. Each one stays a p
 
 A small pure seam makes the failure branch testable. `resolve_nr_of_cores()` calls `std::thread::available_parallelism()` and hands the `io::Result` to `core_count_or_default`, which maps `Ok(n)` to `n` and `Err` to `1`. A unit test calls `core_count_or_default` with an `Err` directly.
 
+The resolver carries no cgroup-reading code of its own. On Linux `std::thread::available_parallelism()` already returns `min(sched_getaffinity count, cgroup CPU quota)`, reading `cpu.max` for cgroup v2 and `cpu.cfs_quota_us` with `cpu.cfs_period_us` for v1, and treating any unreadable or unset value as unlimited. The pinned 1.94 toolchain implements this at `library/std/src/sys/thread/unix.rs:177`. A hand-written quota reader in the adapter would duplicate that logic in a narrower form. § CPU-limit detection boundary states which limits this reaches.
+
 #### Patterns
 
 | Pattern | Where | Why |
@@ -63,13 +65,26 @@ A small pure seam makes the failure branch testable. `resolve_nr_of_cores()` cal
 |----------|------------------------|-----------|
 | Keep `nr_of_cores` as a parameter on each derivation | Have each derivation call `available_parallelism()` itself | An internal call makes each derivation read ambient state, which breaks its unit tests. It also reads the host four times per request instead of once. |
 | Uniform fallback of `1`, with no `DEFAULT_S3_MAX_CONNECTIONS` special case | Keep the `0` branch in `resolve_s3_max_connections` only | Keeping one sentinel consumer forces every caller to keep producing the sentinel. The branch fires only when the OS cannot report a core count, which is not a reachable state on Linux, Docker, or the production cluster. |
-| Remove the property from the bench harness rather than keep a bench-only lever | Keep `NR_OF_CORES` as an undocumented bench-only property | A property the adapter reads is a supported property, whatever the docs say. Docker bench keeps an equivalent lever in `LH_EXASOL_CPUS`. |
+| Remove the property from the bench harness rather than keep a bench-only lever | Keep `NR_OF_CORES` as an undocumented bench-only property | A property the adapter reads is a supported property, whatever the docs say. Docker bench keeps an equivalent lever in `LH_EXASOL_CPUSET`. |
 | Leave `DEFAULT_S3_MAX_CONNECTIONS` in `scan::spec` | Move the constant into `adapter` | Deleting the AUTO unknown-core branch removes one of its three consumers. Two survive. `crates/lakehouse-engine/src/adapter/mod.rs:404` falls back to it for an absent or invalid `S3_MAX_CONNECTIONS` adapterNote in `handle_pushdown_request`, and `crates/lakehouse-engine/src/adapter/pushdown/format/delta_format_reader.rs:192` passes it to `build_table_root_store`. Both live in `adapter`, which already depends on `scan::spec`, so moving the constant would create the reverse dependency the current placement avoids. |
 | Verify with a Docker E2E assertion plus a manual multi-node check | Trust the Linux cgroup behavior of `available_parallelism()` | CLAUDE.md requires a live check over documentation or memory. No multi-node cluster runs in CI, so that half stays manual. |
+| Constrain the Docker E2E container by CPU affinity (`cpuset`) | Constrain it by CFS bandwidth quota (`cpus:`) | A quota limit is invisible inside the Exasol UDF sandbox, which mounts no cgroup filesystem, so the assertion could never pass. A cpuset limit reaches the sandbox and was measured doing so. |
+| Leave the resolver reading `std::thread::available_parallelism()` alone | Add a `cgroup_quota_cores()` reader over `/sys/fs/cgroup/cpu.max` and take the minimum | The path does not exist inside the UDF sandbox, so the reader would return `None` on every call and the minimum would collapse to the existing value. It would also duplicate logic the Rust standard library already runs. |
+| Record the CFS-quota blind spot as a tracked exception (#421) | Support cgroup v1 alongside v2 in an adapter-side reader | Neither cgroup version is readable from the sandbox, so version coverage changes nothing. The limitation is the missing mount, not the parsing. |
 
 ### Iceberg and Delta compliance gate
 
 The CLAUDE.md gate does not apply. This change touches per-node core-count detection for CPU, thread, and connection budget sizing, which is a VS-adapter resource-configuration concern. It touches no scanning, no pushdown, and no schema or type handling in either the Iceberg table spec or the Delta protocol sense. No normative citation is required, and the absence of one is not an oversight.
+
+### CPU-limit detection boundary
+
+The adapter detects a CPU limit expressed as affinity. It does not detect a limit expressed only as a CFS bandwidth quota. Issue #421 tracks the gap, and the `vs-adapter/create-virtual-schema-adapter-notes` Background cites it inline.
+
+Three measurements against the running stack establish the boundary. `std::thread::available_parallelism()` already takes the minimum of the affinity count and the cgroup quota, so the detection code is correct. The Exasol UDF sandbox mounts no cgroup filesystem: `/sys` exists, nothing is mounted under it, and `/sys/fs/cgroup/cpu.max` returns `ENOENT`. Under `docker update --cpuset-cpus="0-1"` a probe UDF reported an affinity of 2 rather than the host's 4.
+
+A quota-limited node therefore receives thread, connection, and parallelism budgets sized for its affinity count rather than its CPU allowance. The effect is contention and throttling, not wrong results. The magnitude is unmeasured, and no benchmark has compared a quota-limited node against an equivalent cpuset-limited one.
+
+Docker `cpus:` and a Kubernetes `limits.cpu` without the static CPU manager policy are quota limits. Docker `cpuset`, the Kubernetes static CPU manager policy, bare metal, and ordinary VMs are affinity limits, which the adapter reads exactly. The production target is an Exasol cluster node, which is an affinity case.
 
 ### Terminology left unchanged
 
@@ -89,11 +104,13 @@ Four places name `NR_OF_CORES` as Exasol's own per-node core-count parameter, no
 
 ## Impact
 
-Three user-visible changes ship with this plan. All three are breaking.
+Four user-visible changes ship with this plan. All four are breaking.
 
-**The `NR_OF_CORES` virtual-schema property stops working.** A `CREATE VIRTUAL SCHEMA` statement that supplies it still succeeds, because the adapter reads properties by name and ignores names it does not know. The property has no effect. An operator who relied on it to raise or lower the derived thread and connection budgets loses that lever and must constrain the node's CPU quota instead.
+**The `NR_OF_CORES` virtual-schema property stops working.** A `CREATE VIRTUAL SCHEMA` statement that supplies it still succeeds, because the adapter reads properties by name and ignores names it does not know. The property has no effect. An operator who relied on it to raise or lower the derived thread and connection budgets loses that lever and must constrain the executing node's CPU affinity instead, through a Docker `cpuset` or the Kubernetes static CPU manager policy. A CFS bandwidth quota alone does not change the detected count (§ CPU-limit detection boundary, issue #421).
 
-**The remote bench target loses its core-count override.** `BENCH_NR_OF_CORES` disappears from `bench/run.sh`, the three sweep scripts, `bench/.env.example`, and `deploy/scripts/secrets.sh`. A remote run now sizes its budgets from the cluster node's real detected core count. Docker bench keeps an equivalent lever, because `LH_EXASOL_CPUS` sets the container's CPU quota and `available_parallelism()` honours it. Remote mode has no equivalent lever. A bench comparison across this change is therefore not directly comparable on the remote target unless `BENCH_PARALLELISM_FACTOR` and the `DATAFUSION_*` properties are pinned.
+**The remote bench target loses its core-count override.** `BENCH_NR_OF_CORES` disappears from `bench/run.sh`, the three sweep scripts, `bench/.env.example`, and `deploy/scripts/secrets.sh`. A remote run now sizes its budgets from the cluster node's real detected core count. Docker bench keeps an equivalent lever in `LH_EXASOL_CPUSET`, which pins the container's CPU affinity. Remote mode has no equivalent lever. A bench comparison across this change is therefore not directly comparable on the remote target unless `BENCH_PARALLELISM_FACTOR` and the `DATAFUSION_*` properties are pinned.
+
+**`LH_EXASOL_CPUS` is replaced by `LH_EXASOL_CPUSET`.** The Docker stack constrains the Exasol container by CPU affinity rather than by CFS bandwidth quota, because a quota limit is invisible inside the UDF sandbox (§ CPU-limit detection boundary). The variable now carries a CPU set such as `0-3`, not a core count such as `4`. A stale `LH_EXASOL_CPUS` in a local shell or in `bench/.env` has no effect, and the container falls back to the `0-3` default. A host with fewer than four CPUs must set `LH_EXASOL_CPUSET` explicitly, because Docker rejects a cpuset naming a CPU the host does not have.
 
 **The unknown-core S3 connection budget changes from 16 to 4.** This applies only when `std::thread::available_parallelism()` returns an error, which requires an OS that cannot report a core count. Linux, Docker, and the production cluster all report one. The value moves because the uniform derivation now applies at a core count of `1`, giving `1 × S3_CONNECTIONS_PER_THREAD`, which is 4.
 
@@ -103,8 +120,9 @@ Three user-visible changes ship with this plan. All three are breaking.
 
 | Current | New |
 |---------|-----|
-| `CREATE VIRTUAL SCHEMA ... NR_OF_CORES = '8'` | Drop the property. Constrain the node's CPU quota to set the effective count. |
-| `BENCH_NR_OF_CORES=8` in `bench/.env` | Drop the variable. Docker bench: set `LH_EXASOL_CPUS`. Remote bench: no equivalent. |
+| `CREATE VIRTUAL SCHEMA ... NR_OF_CORES = '8'` | Drop the property. Constrain the node's CPU affinity to set the effective count. A CFS bandwidth quota alone has no effect (#421). |
+| `BENCH_NR_OF_CORES=8` in `bench/.env` | Drop the variable. Docker bench: set `LH_EXASOL_CPUSET`. Remote bench: no equivalent. |
+| `LH_EXASOL_CPUS=2` (a core count) | `LH_EXASOL_CPUSET=0-1` (a CPU set). Name the CPUs, not how many. |
 | A schema created before this change, carrying `NR_OF_CORES` in `adapterNotes` | No migration. The entry survives unread and inert. Drop and recreate the schema to remove it. |
 
 ## Implementation Tasks
@@ -114,6 +132,8 @@ The `vs-adapter/create-virtual-schema` delta carries no task beyond the argument
 The `vs-adapter/refresh-and-set-properties` delta is different. It adds a normative clause that an `adapterNotes` entry the adapter does not itself write survives the rebuild unread and inert. That clause is what keeps an `NR_OF_CORES` entry persisted by an earlier adapter version working after this plan lands. `refresh_rebuilds_table_map_preserves_notes` seeds only `OTHER_KEY` and `TABLE_MAP` today, so nothing exercises the clause. Task 2.8 covers it with a seeded `NR_OF_CORES` entry.
 
 ### 1. Adapter core-count resolution
+
+The detection mechanism is `std::thread::available_parallelism()` and nothing else. No task in this section adds cgroup-reading code, because the standard library already takes the minimum of the affinity count and the cgroup quota, and the quota file is unreachable from inside the UDF sandbox in any case (§ CPU-limit detection boundary).
 
 - [ ] 1.1 Check for an existing GitHub issue covering this refactor. Create one with `gh issue create` when none exists, and reference it in the implementing commit as `Closes #<n>`.
 - [ ] 1.2 In `crates/lakehouse-engine/src/adapter/mod.rs`, delete `const PROP_NR_OF_CORES` (line 57), `const NOTE_NR_OF_CORES` (line 46), `fn parse_nr_of_cores_override` (lines 938-948), and `fn available_parallelism_or_0` (lines 974-980). Replace `fn resolve_nr_of_cores(props: &Json) -> u32` (lines 950-960) with a parameterless `fn resolve_nr_of_cores() -> u32` that calls `std::thread::available_parallelism()` and delegates the `io::Result` to a new pure `fn core_count_or_default(detected: std::io::Result<NonZeroUsize>) -> u32` mapping `Err` to `1`. Update the one call site at line 251 of `handle_create_virtual_schema`.
@@ -134,12 +154,13 @@ The `vs-adapter/refresh-and-set-properties` delta is different. It adds a normat
 - [ ] 2.7 Rewrite `resolve_s3_max_connections_auto_zero_cores_defaults` (line 1805) as `resolve_s3_max_connections_auto_one_core_yields_four`, asserting `resolve_s3_max_connections(&absent, 1, 1) == 4` and `resolve_s3_max_connections(&absent, 1, 8) == 4`, which is the deliberate change from `DEFAULT_S3_MAX_CONNECTIONS`. [expert]
 - [ ] 2.8 Seed `"NR_OF_CORES": "8"` into the `schemaMetadataInfo.adapterNotes` of the request in `refresh_rebuilds_table_map_preserves_notes` (`crates/lakehouse-engine/src/adapter/adapter_tests.rs:396`), beside the existing `OTHER_KEY` and `TABLE_MAP` entries, and assert the key survives the rebuild carrying its original value. This is the only evidence for the `vs-adapter/refresh-and-set-properties` clause that an inherited `NR_OF_CORES` entry survives unread and inert, and it is the only remaining pin on merge-not-clobber for that key once `build_adapter_notes` stops writing it.
 
-### 3. Docker E2E verification
+### 3. Docker E2E verification and its CPU constraint
 
 - [ ] 3.1 In `crates/lakehouse-engine/tests/e2e_scan_test.rs`, flip the `NR_OF_CORES` assertion in `create_vs_omits_cluster_nodes_from_adapter_notes` (lines 1334-1338) from present to absent, mirroring the `CLUSTER_NODES` assertion below it. Update the test's doc comment (lines 1289-1292).
-- [ ] 3.2 Add `adapter_detects_container_cpu_quota` to the same file. Create a probe virtual schema through `VsProps::new(...).with_parallelism_factor(1)`, which sets `udf_instances_per_node` to 1 so the AUTO derivation records the detected core count unchanged as `DF_THREADS_PER_UDF`. Read the effective CPU quota from the running Exasol container rather than from the test process environment: invoke `std::process::Command::new("docker")` with `exec`, the name from `exasol_container()`, and a read of `/sys/fs/cgroup/cpu.max`, mirroring the call at `crates/lakehouse-engine/tests/common/stack.rs:136`, then divide the quota field by the period field. Assert the `DF_THREADS_PER_UDF` entry read from `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` equals that container-read quota. Assert first that the quota is strictly less than the test host's own `std::thread::available_parallelism()`, and fail with a message naming that unmet precondition when it is not, because at an equal quota and host count the main assertion passes whether the adapter reads the container quota or the unconstrained host. [expert]
-- [ ] 3.3 If task 3.2 fails because the adapter VM reports the host core count rather than the container quota, STOP and escalate. Do not weaken the assertion. That outcome means auto-detection cannot replace the property, and the right fix is a different source such as UDF metadata.
-- [ ] 3.4 Make the E2E CI job satisfy task 3.2's precondition. `.github/workflows/ci.yml` sets `LH_EXASOL_CPUS: "2"` at lines 537, 647, 750, and 853, under a comment asserting the runner has 2 vCPUs. If that comment is accurate the quota equals the host count and task 3.2 fails on its precondition. Print the runner's `nproc` in the job that runs `make test-e2e`, and when it does not exceed `LH_EXASOL_CPUS`, lower `LH_EXASOL_CPUS` for that job until the inequality holds. Correct the vCPU comment to the measured count.
+- [ ] 3.2 In `docker-compose.yml`, replace the `exasol` service's `cpus: "${LH_EXASOL_CPUS:-4}"` (line 119) with `cpuset: "${LH_EXASOL_CPUSET:-0-3}"`. Restate the comment above it: the setting pins the container to a CPU set so the adapter VM can observe the limit, which a CFS bandwidth quota does not allow (§ CPU-limit detection boundary). `docker compose config` accepts the `cpuset` key and interpolates the variable, both confirmed. Keep the `0-3` default so a four-CPU host behaves as it does today.
+- [ ] 3.3 In `crates/lakehouse-engine/tests/e2e_scan_test.rs`, rename `adapter_detects_container_cpu_quota` to `adapter_detects_container_cpuset` and `exasol_container_cpu_quota` to `exasol_container_cpuset_cores`. Name the old test in the new test's doc comment, because `decision-log.md` § Review Findings records the finding under the old name. Read `/sys/fs/cgroup/cpuset.cpus.effective` instead of `/sys/fs/cgroup/cpu.max` through the same `docker exec` call, and count the CPUs the set names rather than dividing a quota by a period. Parse both forms the file uses, a comma-separated list and hyphenated ranges, for example `0-1` and `0,2-3`. Keep the precondition assertion's structure, the fail-not-skip rule, and the `PARALLELISM_FACTOR = '1'` probe schema. Restate every assertion message that names `LH_EXASOL_CPUS` or calls the value a quota: the precondition message at `crates/lakehouse-engine/tests/e2e_scan_test.rs:1370-1378` MUST name the container's CPU set, its cardinality, and `LH_EXASOL_CPUSET`, and MUST direct the reader to narrow the set rather than to lower a count. Delete the cgroup-v1 and fractional-quota error branches, which have no cpuset equivalent. [expert]
+- [ ] 3.4 Update the four `LH_EXASOL_CPUS` sites in `.github/workflows/ci.yml`. The `e2e` job's measurement step (lines 515-542) already prints `nproc` and lowers the value to stay strictly below the runner core count. Keep that logic and its intent, and convert its output to a CPU set: write `LH_EXASOL_CPUSET=0-$((n - 1))` to `$GITHUB_ENV` for the chosen count `n`. Replace the static `LH_EXASOL_CPUS: "2"` job-level entries at lines 648, 753, and 858 with `LH_EXASOL_CPUSET: "0-1"`, keeping each one's comment intent that the job carries no container-affinity assertion and only has to fit a hosted runner.
+- [ ] 3.5 If task 3.3 fails because the adapter VM reports the host core count rather than the container's CPU set, STOP and escalate. Do not weaken the assertion. A cpuset limit was measured reaching the UDF sandbox, so that outcome would contradict § CPU-limit detection boundary and mean the core count needs a different source, such as UDF metadata. Reintroducing the `NR_OF_CORES` VS property is prohibited.
 
 ### 4. Bench harness
 
@@ -147,11 +168,12 @@ The `vs-adapter/refresh-and-set-properties` delta is different. It adds a normat
 - [ ] 4.2 Update the five `build_vs_extra_props` calls in the `bench/run.sh selftest` block and the two `case` patterns at lines 148 and 152 that assert the property string. Run `bash bench/run.sh selftest` and confirm it exits 0.
 - [ ] 4.3 Remove the `NR_OF_CORES` property and the `BENCH_NR_OF_CORES` variable from `bench/batch_size_sweep.sh` (lines 27, 48), `bench/emit_s3conn_sweep.sh` (lines 22, 41), and `bench/batch_size_aggcheck.sh` (lines 11, 18).
 - [ ] 4.4 Remove `BENCH_NR_OF_CORES` from `bench/.env.example` (lines 16, 19-22) and from the generated file in `deploy/scripts/secrets.sh` (line 49).
+- [ ] 4.5 Rename `LH_EXASOL_CPUS=4` to `LH_EXASOL_CPUSET=0-3` in `bench/.env.example` (line 15) and restate its trailing comment: the variable pins the container's CPU set, and the adapter detects that set as its core count. Reword the `bench/run.sh` comment at line 368, which names `LH_EXASOL_CPUS` as a quota lever.
 
 ### 5. Operator documentation
 
 - [ ] 5.1 Delete the `NR_OF_CORES` row from the property table in `docs/tuning.md` (line 19). Restate the `PARALLELISM_FACTOR`, `DATAFUSION_THREADS_PER_UDF`, and `DATAFUSION_TARGET_PARTITIONS` defaults (lines 20, 22, 23) against the detected core count rather than the property. Rewrite the quick recommendation (line 41), which tells the operator to substitute `<NR_OF_CORES>`. Rewrite the unknown-core bullet (line 53), which states the removed default of 16.
-- [ ] 5.2 Rewrite the Parallelism section of `bench/README.md` (line 105). State that the core count is auto-detected, that `LH_EXASOL_CPUS` controls it in docker mode, and that remote mode has no equivalent lever.
+- [ ] 5.2 Rewrite the Parallelism section of `bench/README.md` (line 105). State that the core count is auto-detected, that `LH_EXASOL_CPUSET` pins the container's CPU set in docker mode, and that remote mode has no equivalent lever. Do not describe the variable as a CPU quota, which is the mechanism this plan moves away from.
 - [ ] 5.3 Remove `BENCH_NR_OF_CORES` from the variable list in `docs/benchmark.md` (line 54).
 
 The multi-node confirmation is not an implementation task. It is a pre-merge gate no agent can execute, recorded as the last row of § Verification § Manual Testing.
@@ -160,8 +182,8 @@ The multi-node confirmation is not an implementation task. It is a pre-merge gat
 
 | Group | Tasks | Depends on | Knowledge |
 |-------|-------|------------|-----------|
-| A: Adapter core-count resolution and its observations | 1.1-1.7, 2.1-2.8, 3.1-3.4 | — | spec deltas `vs-adapter/create-virtual-schema-adapter-notes`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/create-virtual-schema`, `vs-adapter/refresh-and-set-properties`, `datafusion-scan/scan-execution-threading`, `datafusion-scan/scan-execution-connection-concurrency`; `crates/lakehouse-engine/src/adapter/mod.rs`, `crates/lakehouse-engine/src/adapter/adapter_tests.rs`, `crates/lakehouse-engine/src/scan/spec.rs`, `crates/lakehouse-engine/src/scan/diagnostics.rs`, `crates/lakehouse-engine/src/scan/mod.rs`, `crates/lakehouse-engine/tests/e2e_scan_test.rs`, `crates/lakehouse-engine/tests/common/stack.rs`, `.github/workflows/ci.yml` |
-| B: Bench harness and operator documentation | 4.1-4.4, 5.1-5.3 | A (task 5.1 restates the connection-budget behavior group A lands) | spec delta `e2e-harness/cloud-e2e-harness`; `bench/run.sh`, `bench/batch_size_sweep.sh`, `bench/emit_s3conn_sweep.sh`, `bench/batch_size_aggcheck.sh`, `bench/.env.example`, `bench/README.md`, `deploy/scripts/secrets.sh`, `docs/tuning.md`, `docs/benchmark.md` |
+| A: Adapter core-count resolution and its observations | 1.1-1.7, 2.1-2.8, 3.1-3.5 | — | spec deltas `vs-adapter/create-virtual-schema-adapter-notes`, `vs-adapter/create-virtual-schema-adapter-notes-resources`, `vs-adapter/create-virtual-schema`, `vs-adapter/refresh-and-set-properties`, `datafusion-scan/scan-execution-threading`, `datafusion-scan/scan-execution-connection-concurrency`; `crates/lakehouse-engine/src/adapter/mod.rs`, `crates/lakehouse-engine/src/adapter/adapter_tests.rs`, `crates/lakehouse-engine/src/scan/spec.rs`, `crates/lakehouse-engine/src/scan/diagnostics.rs`, `crates/lakehouse-engine/src/scan/mod.rs`, `crates/lakehouse-engine/tests/e2e_scan_test.rs`, `crates/lakehouse-engine/tests/common/stack.rs`, `docker-compose.yml`, `.github/workflows/ci.yml` |
+| B: Bench harness and operator documentation | 4.1-4.5, 5.1-5.3 | A (task 5.1 restates the connection-budget behavior group A lands, and task 4.5 renames the variable group A redefines in `docker-compose.yml`) | spec delta `e2e-harness/cloud-e2e-harness`; `bench/run.sh`, `bench/batch_size_sweep.sh`, `bench/emit_s3conn_sweep.sh`, `bench/batch_size_aggcheck.sh`, `bench/.env.example`, `bench/README.md`, `deploy/scripts/secrets.sh`, `docs/tuning.md`, `docs/benchmark.md` |
 
 Group A is one cluster, not three. Every adapter-side spec delta in this plan is implemented by the same function set in `adapter/mod.rs`, and the unit tests plus the E2E observation assert that same function set. Splitting them by file would make three agents rebuild one mental model.
 
@@ -193,7 +215,7 @@ Group B shares no file and no owned spec delta with group A. It depends on A bec
 | adapter-notes: createVirtualSchema adapterNotes omit the cluster node count | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `create_vs_omits_cluster_nodes_from_adapter_notes` |
 | adapter-notes: Adapter derives the per-node core count from available_parallelism() on every request | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `core_count_from_available_parallelism_is_not_recorded`, `nr_of_cores_property_is_ignored` |
 | adapter-notes: Adapter uses a core count of 1 when available_parallelism() cannot report one | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `core_count_defaults_to_one_when_detection_fails` |
-| adapter-notes: The adapter VM detects the Docker container's CPU quota | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `adapter_detects_container_cpu_quota` |
+| adapter-notes: The adapter VM detects the Docker container's CPU affinity set | Integration | `crates/lakehouse-engine/tests/e2e_scan_test.rs` | `adapter_detects_container_cpuset` |
 | resources: Adapter records the parallelism factor in the virtual-schema adapterNotes | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `default_parallelism_factor_floors_at_eight` |
 | resources: Adapter records the DataFusion target partition count in the virtual-schema adapterNotes | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `df_target_partitions_one_core_defaults_to_1` |
 | resources: Adapter records the DataFusion threads-per-UDF count in the virtual-schema adapterNotes | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `df_threads_per_udf_one_core_defaults_to_1` |
@@ -205,7 +227,7 @@ Group B shares no file and no owned spec delta with group A. It depends on A bec
 | threading: AUTO mode yields a single thread on a one-core node | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `auto_mode_yields_one_thread_on_one_core` |
 | threading: FIXED mode uses the operator-supplied thread and partition values verbatim | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `fixed_mode_uses_supplied_values` |
 | connection-concurrency: AUTO derivation sizes the per-instance budget from node capacity | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `resolve_s3_max_connections_auto_scales_with_cores` |
-| connection-concurrency: AUTO derivation yields the single-core budget when the core count cannot be detected | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `resolve_s3_max_connections_auto_one_core_yields_four` |
+| connection-concurrency: AUTO derivation yields the single-core budget when the core count cannot be detected | Unit | `crates/lakehouse-engine/src/adapter/adapter_tests.rs` | `resolve_s3_max_connections_auto_one_core_yields_one_threads_share` |
 | cloud-e2e-harness: Remote bench wires PARALLELISM_FACTOR into the virtual schema | Integration | `bench/run.sh` offline self-check | `bash bench/run.sh selftest` |
 | cloud-e2e-harness: Remote bench selects its catalog backend from the bench environment | Integration | `bench/run.sh` offline self-check | `bash bench/run.sh selftest` |
 
@@ -216,12 +238,12 @@ Every derivation named above is a pure function of an injected core count, so it
 | Feature | Command | Expected Output |
 |---------|---------|-----------------|
 | vs-adapter/create-virtual-schema-adapter-notes | `make test-e2e` then `exapump sql -d "$DSN" -q "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'MY_LAKEHOUSE'"` | The JSON carries `PARALLELISM_FACTOR` and `TABLE_MAP`, and carries neither `NR_OF_CORES` nor `CLUSTER_NODES` |
-| vs-adapter/create-virtual-schema-adapter-notes (quota detection) | Bring the stack up with `LH_EXASOL_CPUS=2`, create a VS with `PARALLELISM_FACTOR = '1'`, then read `DF_THREADS_PER_UDF` from `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` | The value is `2` |
+| vs-adapter/create-virtual-schema-adapter-notes (affinity detection) | On a host of three CPUs or more, bring the stack up with `LH_EXASOL_CPUSET=0-1`, create a VS with `PARALLELISM_FACTOR = '1'`, then read `DF_THREADS_PER_UDF` from `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` | The value is `2` |
 | vs-adapter/create-virtual-schema-adapter-notes-resources | Create a VS supplying `NR_OF_CORES = '99'`, then read `ADAPTER_NOTES` | The statement succeeds, and `PARALLELISM_FACTOR`, `DF_THREADS_PER_UDF`, and `S3_MAX_CONNECTIONS` match the values a VS created without the property carries |
 | datafusion-scan/scan-execution-threading | `cargo test -p lakehouse-engine adapter::tests::auto_mode` | 0 failures |
 | datafusion-scan/scan-execution-connection-concurrency | `cargo test -p lakehouse-engine resolve_s3_max_connections` | 0 failures |
 | e2e-harness/cloud-e2e-harness | `bash bench/run.sh selftest` | Exit 0, no `FAIL:` line |
-| e2e-harness/cloud-e2e-harness (docker run) | `BENCH_TARGET=docker LH_EXASOL_CPUS=4 make bench` | The run completes, and the generated `CREATE VIRTUAL SCHEMA` carries `PARALLELISM_FACTOR` but no `NR_OF_CORES` |
+| e2e-harness/cloud-e2e-harness (docker run) | `BENCH_TARGET=docker LH_EXASOL_CPUSET=0-3 make bench` | The run completes, and the generated `CREATE VIRTUAL SCHEMA` carries `PARALLELISM_FACTOR` but no `NR_OF_CORES` |
 | vs-adapter/create-virtual-schema-adapter-notes (multi-node pre-merge gate, MANDATORY) | Against a multi-node Exasol cluster: `CREATE VIRTUAL SCHEMA CORE_PROBE USING ... WITH PARALLELISM_FACTOR = '1'`, then `exapump sql -d "$DSN" -q "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'CORE_PROBE'"`, and read the cluster's own per-node core count from `SELECT PARAM_VALUE('NR_OF_CORES')` | `DF_THREADS_PER_UDF` equals the per-node core count the cluster reports. **MUST NOT ship if the two values differ.** On a mismatch, file a follow-up GitHub issue naming the observed and the expected count, and fix the core-count source, for example by reading it from UDF metadata. Reintroducing the `NR_OF_CORES` VS property is prohibited. CI runs no multi-node cluster, so a human executes this gate and `verification-report.md` records it as not run until one has. |
 
 CAUTION: `make bench` reads `bench/.env` when the file exists. A stale `bench/.env` from a prior `deploy/scripts/secrets.sh` run redirects the run at a remote cluster. Move the file aside before the docker-mode check.
@@ -237,4 +259,5 @@ CAUTION: `make bench` reads `bench/.env` when the file exists. A stale `bench/.e
 | Lint | `cargo clippy --all-targets` | 0 errors, 0 warnings |
 | Format | `cargo fmt` | No changes |
 | Residual reference sweep | `git grep -n "NR_OF_CORES" -- . ':!specs/_plans' ':!specs/_decision'` | Only the four Exasol-parameter mentions listed under "Terminology left unchanged" |
+| Quota-variable sweep | `git grep -n "LH_EXASOL_CPUS\b" -- . ':!specs/_plans' ':!specs/_decision'` | No match. Every caller names `LH_EXASOL_CPUSET` |
 | Manual multi-node gate | The multi-node pre-merge gate row in § Manual Testing | Executed by a human before the PR leaves draft, with the observed and expected counts recorded in the PR description. A mismatch blocks the merge. |

@@ -34,6 +34,7 @@ use lakehouse_catalog::{
 };
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
+use std::num::NonZeroUsize;
 
 // The namespace to expose, for either catalog kind.
 const PROP_NAMESPACE: &str = "NAMESPACE";
@@ -42,19 +43,15 @@ const PROP_NAMESPACE: &str = "NAMESPACE";
 const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
 // Allow HTTP to the catalog/storage endpoint (opt-in; defaults to false).
 const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
-// adapterNotes key for the per-node CPU core count captured at createVirtualSchema time.
-const NOTE_NR_OF_CORES: &str = "NR_OF_CORES";
 // VS property name for the parallelism factor (oversubscription multiplier).
-// Default: max(NR_OF_CORES * 2, 8). Stored in adapterNotes so the pushdown path
-// can read it back.
+// Default: twice the detected per-node core count, floored at
+// DEFAULT_PARALLELISM_FACTOR. Stored in adapterNotes so the pushdown path can
+// read it back.
 const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 const NOTE_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
-/// Minimum parallelism factor (floor applied when NR_OF_CORES is 0 or very small).
+/// Minimum parallelism factor: the floor the hardware-aware default takes on a
+/// node with few cores.
 const DEFAULT_PARALLELISM_FACTOR: usize = 8;
-// VS property name for the per-node CPU core count override. When set to a
-// positive integer it is used directly; absent, empty, zero, or non-numeric
-// values fall through to the `available_parallelism()` auto-detect path.
-const PROP_NR_OF_CORES: &str = "NR_OF_CORES";
 // VS property names for DataFusion per-instance thread configuration.
 const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
 const PROP_DF_THREADS_PER_UDF: &str = "DATAFUSION_THREADS_PER_UDF";
@@ -249,7 +246,7 @@ fn handle_create_virtual_schema(
 
     let configured_ns: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
 
-    let nr_of_cores = resolve_nr_of_cores(&props);
+    let nr_of_cores = resolve_nr_of_cores();
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
     // At createVirtualSchema the file list is not yet known, so the per-node UDF
     // instance share cannot use the file-count clamp. Before that clamp,
@@ -300,7 +297,6 @@ fn handle_create_virtual_schema(
     // Build adapterNotes including TABLE_MAP (merge, not clobber).
     let adapter_notes = build_adapter_notes(
         request,
-        nr_of_cores,
         parallelism_factor,
         df_threading_mode,
         df_target_partitions,
@@ -658,18 +654,21 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 }
 
 /// Build the adapterNotes value for the createVirtualSchema response: a JSON
-/// *string* (Exasol rejects a raw object) carrying NR_OF_CORES,
-/// PARALLELISM_FACTOR, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
+/// *string* (Exasol rejects a raw object) carrying PARALLELISM_FACTOR,
+/// DF_THREADING_MODE, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
 /// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS,
 /// JOIN_BROADCAST_MAX_BYTES, and TABLE_MAP (a nested JSON object mapping Exasol
-/// table names to original-cased catalog identifiers). Any pre-existing notes on
-/// the request are preserved (merge, not clobber).
+/// table names to original-cased catalog identifiers). Every entry except
+/// DF_THREADING_MODE is read back by `handle_pushdown_request`; DF_THREADING_MODE
+/// is recorded purely as an operator-visible record of which derivation ran. The
+/// per-node core count is a derivation input the adapter discards once the
+/// budgets are resolved, not a recorded entry. Any pre-existing notes on the
+/// request are preserved (merge, not clobber).
 // ponytail: args mirror the resolved notes fields one-to-one; a params struct is
 // pure boilerplate for a single private callee.
 #[allow(clippy::too_many_arguments)]
 fn build_adapter_notes(
     request: &Json,
-    nr_of_cores: u32,
     parallelism_factor: usize,
     df_threading_mode: ThreadingMode,
     df_target_partitions: usize,
@@ -682,10 +681,6 @@ fn build_adapter_notes(
     table_map: &[(String, String)],
 ) -> Json {
     let mut notes = parse_adapter_notes(request);
-    notes.insert(
-        NOTE_NR_OF_CORES.to_string(),
-        Json::String(nr_of_cores.to_string()),
-    );
     notes.insert(
         NOTE_PARALLELISM_FACTOR.to_string(),
         Json::String(parallelism_factor.to_string()),
@@ -735,8 +730,8 @@ fn build_adapter_notes(
 ///
 /// When the property is absent, empty, zero, or invalid, the default is
 /// `max(nr_of_cores * 2, DEFAULT_PARALLELISM_FACTOR)` — hardware-aware but
-/// floored at `DEFAULT_PARALLELISM_FACTOR` so a dev VM or failed core-count
-/// lookup (nr_of_cores = 0) never collapses the factor below a useful minimum.
+/// floored at `DEFAULT_PARALLELISM_FACTOR`, so a dev VM or any other node with
+/// few cores keeps a useful minimum shard fan-out.
 fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
     nonempty_str(props, PROP_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
@@ -786,8 +781,9 @@ fn resolve_threading_mode(props: &Json) -> ThreadingMode {
 /// the adapter derives a per-instance thread budget that does not oversubscribe a
 /// node — `threads = max(1, floor(nr_of_cores / udf_instances_per_node))` — and
 /// holds the target partition count in lockstep with it, ignoring any supplied
-/// `DATAFUSION_TARGET_PARTITIONS` / `DATAFUSION_THREADS_PER_UDF` values. When
-/// `nr_of_cores` is `0` (unknown) both fields are `1`.
+/// `DATAFUSION_TARGET_PARTITIONS` / `DATAFUSION_THREADS_PER_UDF` values. Both
+/// fields floor at `1`, so a single-core node runs one thread over one
+/// partition.
 fn resolve_df_threading(
     mode: ThreadingMode,
     props: &Json,
@@ -808,8 +804,8 @@ fn resolve_df_threading(
 
 /// Derive the AUTO-mode per-instance thread budget.
 ///
-/// `max(1, floor(nr_of_cores / udf_instances_per_node))`, with `0` cores (unknown)
-/// yielding `1`. The floor guarantees the non-oversubscription invariant
+/// `max(1, floor(nr_of_cores / udf_instances_per_node))`, which yields `1` on a
+/// single-core node. The floor guarantees the non-oversubscription invariant
 /// `udf_instances_per_node × threads ≤ nr_of_cores` whenever the node has at least
 /// as many cores as instances; when instances exceed cores the `max(1, …)` floor
 /// keeps each instance single-threaded (the engine multiplexes the surplus
@@ -823,9 +819,8 @@ fn auto_threads_per_udf(nr_of_cores: u32, udf_instances_per_node: usize) -> usiz
 /// threads-per-UDF, selected by `key`).
 ///
 /// An explicit positive-integer property wins. When absent, empty, zero, or
-/// invalid the default is `max(nr_of_cores, 1)` so scans auto-parallelize to
-/// the detected or overridden core count; when `nr_of_cores` is `0` (unknown)
-/// the default falls back to `1`, preserving prior single-threaded behavior.
+/// invalid the default is `max(nr_of_cores, 1)`, so scans auto-parallelize to
+/// the detected core count and a single-core node stays single-threaded.
 fn resolve_df_fixed_count(props: &Json, key: &str, nr_of_cores: u32) -> usize {
     nonempty_str(props, key)
         .and_then(|s| s.parse::<usize>().ok())
@@ -843,9 +838,8 @@ fn resolve_df_fixed_count(props: &Json, key: &str, nr_of_cores: u32) -> usize {
 ///   (FIXED-like) — same `nonempty_str → parse → filter(>=1)` shape as
 ///   `resolve_df_fixed_count`.
 /// * Absent/empty/zero/invalid triggers an AUTO derivation from `nr_of_cores` and
-///   the per-node UDF-instance share. When `nr_of_cores == 0` (unknown) it falls
-///   back to `DEFAULT_S3_MAX_CONNECTIONS`, mirroring the `0`-cores handling across
-///   the adapter.
+///   the per-node UDF-instance share, which floors at the single-core budget of
+///   `S3_CONNECTIONS_PER_THREAD` connections however the node is sharded.
 ///
 /// # AUTO formula
 ///
@@ -881,12 +875,8 @@ fn resolve_s3_max_connections(
         return explicit;
     }
 
-    if nr_of_cores == 0 {
-        return DEFAULT_S3_MAX_CONNECTIONS;
-    }
-
     let per_instance_threads = auto_threads_per_udf(nr_of_cores, udf_instances_per_node);
-    (per_instance_threads * S3_CONNECTIONS_PER_THREAD).max(1)
+    per_instance_threads * S3_CONNECTIONS_PER_THREAD
 }
 
 /// Read and validate the DATAFUSION_BATCH_SIZE VS property.
@@ -936,28 +926,19 @@ fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
         .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES)
 }
 
-/// Parse the `NR_OF_CORES` VS property into an override value.
-///
-/// Returns `Some(n)` when the property is present, non-empty, and parses to a
-/// `u32` that is ≥ 1. Returns `None` for absent, empty, zero, negative, or
-/// non-numeric values, signalling that the caller should fall back to
-/// auto-detection via `std::thread::available_parallelism()`.
-fn parse_nr_of_cores_override(props: &Json) -> Option<u32> {
-    nonempty_str(props, PROP_NR_OF_CORES)
-        .and_then(|s| s.parse::<u32>().ok())
-        .filter(|&n| n >= 1)
-}
-
 /// Per-node CPU core count used to derive the AUTO parallelism, DataFusion
 /// threading, and S3 connection budgets.
 ///
-/// Comes from the `NR_OF_CORES` VS property override (via
-/// [`parse_nr_of_cores_override`]) when it resolves to a positive integer;
-/// otherwise it is auto-detected from `std::thread::available_parallelism()`.
-/// A result of `0` signals "unknown" (auto-detect unavailable); callers must
-/// handle the floor case.
-fn resolve_nr_of_cores(props: &Json) -> u32 {
-    parse_nr_of_cores_override(props).unwrap_or_else(available_parallelism_or_0)
+/// Read from the executing node with `std::thread::available_parallelism()`,
+/// which honours the CPU quota of the container the adapter VM runs in. The
+/// detection result is handed to [`core_count_or_default`], keeping the
+/// failure branch testable without an ambient dependency on the host.
+fn resolve_nr_of_cores() -> u32 {
+    core_count_or_default(std::thread::available_parallelism())
+}
+
+fn core_count_or_default(detected: std::io::Result<NonZeroUsize>) -> u32 {
+    detected.map_or(1, |n| n.get() as u32)
 }
 
 /// Cluster node count for pushdown sharding, read directly from the UDF
@@ -970,14 +951,6 @@ fn cluster_nodes_from_context(ctx: &dyn UdfContext) -> usize {
         0 => 1,
         n => n as usize,
     }
-}
-
-/// Per-node CPU core count from `std::thread::available_parallelism()`, or `0`
-/// when the platform cannot report it. `0` signals "unknown" to callers.
-fn available_parallelism_or_0() -> u32 {
-    std::thread::available_parallelism()
-        .map(|n| n.get() as u32)
-        .unwrap_or(0)
 }
 
 /// Redact credential values from a UdfError message.

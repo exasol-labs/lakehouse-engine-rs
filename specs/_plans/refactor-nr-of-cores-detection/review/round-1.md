@@ -1,90 +1,175 @@
 # Plan Review Findings: refactor-nr-of-cores-detection (round 1)
 
+> This document reviews the cpuset revision. It replaces the earlier round-1 file written for the
+> pre-revision plan. That file's findings survive in `decision-log.md` § Review Findings and in git
+> at commit `e0eeb23`.
+
 ## Summary
 - Axes checked: 6/6
-- Total findings: 12 (Blockers: 5, Advisory: 7)
+- Total findings: 8 (Blockers: 2, Advisory: 6)
 - Intent Fidelity blockers: 0
 - Human-escalation blockers: 0
 
+## Premortem
+
+Three failure stories, each routed into the taxonomy below.
+
+**An operator throttles a production node with a CFS quota and the engine oversizes its budgets.**
+plan.md § Impact and § Migration both direct the operator to constrain the node's CPU quota.
+§ CPU-limit detection boundary in the same file states that a quota is invisible to the adapter. The
+operator sets a Kubernetes `limits.cpu`, the adapter reads the affinity count, and the thread,
+connection, and parallelism budgets exceed the node's CPU allowance. Routed to
+`[REQUIREMENT_CONFLICT]` BLOCKER 1.
+
+**The E2E probe ships telling developers to change a variable that no longer exists, and the plan's
+own checklist fails at the end of implementation.** Task 3.3 orders the precondition assertion kept
+exactly as it stands. That assertion's message names `LH_EXASOL_CPUS`. The § Checklist
+quota-variable sweep expects no match for that name. The implementer either fails the sweep or
+relaxes it. Routed to `[REQUIREMENT_CONFLICT]` BLOCKER 2.
+
+**A docker bench comparison across this change attributes a scheduling artefact to the engine.**
+Decision [6] calls `LH_EXASOL_CPUSET` an equivalent lever. A pinned CPU set is not equivalent to a
+floating bandwidth quota for throughput measurement. § Impact warns only about the remote target.
+Routed to `[UNSTATED_ASSUMPTION]` ADVISORY.
+
 ## Intent Fidelity
 
-Verified against the four interview answers and the brief's literal scope claims. A1 (remove the property plus every bench script) maps to tasks 4.1-4.4 and decision [6]. A2 (resolve once, thread the value) maps to decision [2] and task 1.2. A3 (uniform fallback of 1) maps to decision [3] and tasks 1.5, 2.7. A4 (Docker E2E plus manual multi-node) maps to decisions [4] and [5] and tasks 3.2, 6.1. The brief's "~117 references" claim checks out exactly: `git grep -c` over `crates/lakehouse-engine` returns 63 (`adapter_tests.rs`) + 48 (`adapter/mod.rs`) + 3 (`e2e_scan_test.rs`) + 1 each in `scan/spec.rs`, `scan/mod.rs`, `scan/diagnostics.rs` = 117. The brief's `e2e_scan_test.rs:1336` assertion is real and task 3.1 covers it.
+[no objection — axis checked]
 
-#### [SCOPE_REDUCTION] ADVISORY
-- Location: plan.md § Features; decision-log.md § Discovery Notes [D2]
-- Issue: the brief named four target spec deltas, one of them `parallelism`. The plan carries no `parallelism/*` delta and no artifact states why. `[D2]` records the two *added* specs but never records the one named spec that was dropped. I verified the exclusion is correct: `git grep -n "NR_OF_CORES\|nr_of_cores" -- specs/parallelism/` returns nothing, and `specs/parallelism/work-unit-sharding/spec.md` contains no core-count reference at all. No work is actually dropped, only the reasoning.
-- Fix: Add a bullet to `decision-log.md` § Discovery Notes `[D2]` stating that `specs/parallelism/work-unit-sharding/spec.md` carries no `NR_OF_CORES` or core-count reference, so the `parallelism` delta the brief named is not required, and name the `git grep` that establishes it.
+The pivot preserves the original goal. All three removals stay intact and untouched by this
+revision. The `NR_OF_CORES` VS property removal holds in tasks 1.2, 2.2, and 2.5, and in the three
+`DELTA:REMOVED` blocks at `vs-adapter/create-virtual-schema-adapter-notes/spec.md:91-119`. The
+`NOTE_NR_OF_CORES` adapterNotes removal holds in task 1.3 and in that delta's scenario step at line
+87. The `0 = unknown` sentinel removal holds in tasks 1.5, 2.6, and 2.7, and in the `DELTA:REMOVED`
+blocks of `datafusion-scan/scan-execution-threading` and
+`datafusion-scan/scan-execution-connection-concurrency`. `git diff` on plan.md confirms sections 1
+and 2 changed only by the added § 1 preamble, so no adapter-code task moved.
+
+The round-2 interview choice maps cleanly. The user chose "A+B: switch to cpuset, document the
+CFS-quota blind spot". Tasks 3.2 through 3.5 and 4.5 carry the cpuset switch. Issue #421 exists, is
+open, and is cited inline at `vs-adapter/create-virtual-schema-adapter-notes/spec.md:45`, matching
+the `(#27)` convention CLAUDE.md names. Decision [9] states that no adapter source file changes,
+which `git status` confirms for `crates/lakehouse-engine/src/adapter/mod.rs` against the
+pre-revision commit.
+
+The superseded round-1 interview direction is not re-litigated here. Decision [9] records it as
+falsified by live measurement and entry [9] § Alternatives states why the proposed
+`cgroup_quota_cores()` reader would be dead code.
 
 ## Feasibility
 
-#### [UNSTATED_ASSUMPTION] BLOCKER
-- Location: plan.md § Implementation Tasks task 3.2; decision-log.md § Design Decisions [5]; `specs/_plans/refactor-nr-of-cores-detection/vs-adapter/create-virtual-schema-adapter-notes/spec.md` § Scenario "The adapter VM detects the Docker container's CPU quota"
-- Issue: the probe asserts `DF_THREADS_PER_UDF == min(LH_EXASOL_CPUS, host available_parallelism())`, and the scenario claims that value "evidences that the adapter VM reads the container's CPU quota rather than the unavailable fallback of `1` or the host's unconstrained core count". The assertion has no discriminating power in either configuration this repo actually runs. `.github/workflows/ci.yml:537` (and 647, 750, 853) sets `LH_EXASOL_CPUS: "2"` with the comment "Standard GitHub-hosted runners have 2 vCPUs", so in CI the expected value is `min(2, 2) = 2`, which is also exactly what an adapter reading the *unconstrained host* core count would report. The same collapse happens on the compose default: `docker-compose.yml:119` reads `cpus: "${LH_EXASOL_CPUS:-4}"`, so a 4-core developer box yields `min(4, 4) = 4` either way. The test can therefore pass with quota-awareness broken, which is the precise failure task 3.3 exists to catch. A second defect compounds it: the expected value comes from the *test process's* environment, describing how the container was launched, not from the container. The interview answer A4 asked for a comparison against "the Docker container's real core count".
-- Fix: Rewrite task 3.2 in `plan.md` to read the Exasol container's effective CPU quota from the running container rather than from the test process environment, mirroring the existing `std::process::Command::new("docker")` + `docker exec` call at `crates/lakehouse-engine/tests/common/stack.rs:136` (read `/sys/fs/cgroup/cpu.max`), and assert `DF_THREADS_PER_UDF` equals that quota. Add a second assertion to task 3.2 that the read quota is strictly less than the test host's `std::thread::available_parallelism()`, and have the test fail with a message naming the missing precondition when it is not, so a non-discriminating run never records false evidence. Update the corresponding `DELTA:NEW` scenario in `vs-adapter/create-virtual-schema-adapter-notes/spec.md` so the `THEN` step names the container-read quota and the strict-inequality precondition instead of `min(LH_EXASOL_CPUS, host available_parallelism())`. Update decision-log.md `[5]` § Consequences to state that CI's 2-vCPU runner with `LH_EXASOL_CPUS: "2"` does not satisfy that precondition, and name which configuration does.
-- Escalation: MECHANICAL — settled by reading `.github/workflows/ci.yml:537`, `docker-compose.yml:119`, and `crates/lakehouse-engine/tests/common/stack.rs:136`; no judgment call the requester must make.
-
-#### [HIDDEN_DEPENDENCY] ADVISORY
-- Location: plan.md § Implementation Tasks task 3.2
-- Issue: the task says "Create a probe virtual schema through `VsProps::new(...)`" without naming the schema. `crates/lakehouse-engine/tests/common/e2e_harness.rs:287` issues `DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE` before every create, and the whole `e2e_scan_test` binary shares one virtual schema built in `setup_e2e()` (`crates/lakehouse-engine/tests/e2e_scan_test.rs:59`). An implementer who reuses `VS_NAME` recreates the shared schema with `PARALLELISM_FACTOR = '1'` for every later test in the file. The `--test-threads=1` flag in `Makefile:82` prevents a race but not the clobber.
-- Fix: Amend task 3.2 in `plan.md` to name a probe-only schema constant distinct from `VS_NAME` (for example `VS_NAME_CPU_PROBE`), and to drop that schema at the end of the test.
+#### [UNSTATED_ASSUMPTION] ADVISORY
+- Location: plan.md § Impact third bullet (line 113); decision-log.md § Design Decisions [6] § Rationale (line 62); plan.md § Implementation Tasks task 5.2 (line 176)
+- Issue: decision [6] claims "`LH_EXASOL_CPUSET` pins the docker container's CPU set, so docker-mode sweeps keep an equivalent and more honest lever". A pinned CPU set is not equivalent to a bandwidth quota for a throughput measurement. Under `cpus: "4"` the container floated across every host CPU with a four-core-equivalent budget. Under `cpuset: "0-3"` it is pinned to four named CPUs, so cache locality and contention with host processes on those same CPUs both change. `bench/` exists to produce comparable numbers. § Impact names the comparability break on the remote target only, at line 111, and says nothing about the docker target. A regression measured across this change on the docker target could be read as an engine regression when it is a scheduling artefact.
+- Fix: Add one sentence to plan.md § Impact's `LH_EXASOL_CPUSET` bullet (line 113) stating that a docker-mode bench number taken under `cpus:` is not directly comparable to one taken under `cpuset:`, because pinning changes cache locality and host contention. Reword decision-log.md [6] § Rationale (line 62) to say the lever is equivalent in core count and not in scheduling behavior. Extend task 5.2 to require that sentence in the `bench/README.md` Parallelism section.
 
 #### [EFFORT_MISESTIMATION] ADVISORY
-- Location: plan.md § Implementation Tasks task 4.2
-- Issue: the task says "Update the five `build_vs_extra_props` calls in the `bench/run.sh selftest` block". `grep -n "build_vs_extra_props" bench/run.sh` shows four calls inside the selftest block, at lines 147, 150, 156, and 161. The other two call sites (370, 404) belong to task 4.1.
-- Fix: Change "the five `build_vs_extra_props` calls" to "the four `build_vs_extra_props` calls at lines 147, 150, 156, and 161" in task 4.2 of `plan.md`.
+- Location: plan.md § Implementation Tasks task 3.3 (line 161); `crates/lakehouse-engine/tests/e2e_scan_test.rs` fn `exasol_container_cpu_quota`
+- Issue: task 3.3 says "Delete the cgroup-v1 and fractional-quota error branches, which have no cpuset equivalent." The helper carries four branches with no cpuset equivalent, not two. Task 3.3 names the cgroup-v1 `out.status.success()` assertion and the `quota_us % period_us` fractional assertion. It does not name the `assert_ne!(quota, "max", ...)` unconstrained-container assertion at line 1443, whose cpuset analogue is the test-body precondition rather than a helper branch, nor the `cores >= 1` sub-one-core assertion at line 1470, which is quota arithmetic with no cpuset counterpart. It also does not name the `period_us > 0` assertion or the "carries no period" panic, both of which read a field `cpuset.cpus.effective` does not have.
+- Fix: Rewrite task 3.3's deletion clause in plan.md to name every branch the cpuset read drops: the cgroup-v1 `out.status.success()` message, the `assert_ne!(quota, "max", ...)` unconstrained assertion, the missing-period panic, the `period_us > 0` assertion, the fractional `quota_us % period_us` assertion, and the `cores >= 1` assertion. State that the cpuset helper keeps only the `docker exec` invocation, an empty-output panic, and the set parser.
+
+#### [EFFORT_MISESTIMATION] ADVISORY
+- Location: plan.md § Implementation Tasks task 4.2 (line 168)
+- Issue: task 4.2 says "Update the five `build_vs_extra_props` calls in the `bench/run.sh selftest` block". `grep -n "build_vs_extra_props" bench/run.sh` returns four calls inside that block, at lines 147, 150, 156, and 161. The remaining two call sites at lines 371 and 405 belong to task 4.1, and line 41 is the definition. Round 1 of the earlier review raised this and the revision did not action it. An advisory never blocked, so leaving it was legitimate, but the count is still wrong and the revision renumbered nothing around it.
+- Fix: Change "the five `build_vs_extra_props` calls" to "the four `build_vs_extra_props` calls at lines 147, 150, 156, and 161" in task 4.2 of plan.md.
+
+#### [UNSTATED_ASSUMPTION] ADVISORY
+- Location: plan.md § Checklist quota-variable sweep row (line 262); plan.md § Terminology left unchanged (lines 89-91); `specs/_decision/067-add-unity-e2e-ci-job.md:20`
+- Issue: the quota-variable sweep excludes `specs/_decision` by pathspec, and the plan never states why. `specs/_decision/067-add-unity-e2e-ci-job.md:20` records `LH_EXASOL_CPUS: "2"` as part of the `e2e-unity` job shape that ADR describes. Task 3.4 replaces that entry with `LH_EXASOL_CPUSET: "0-1"`, so the ADR will describe a job configuration that no longer exists. The exclusion is a defensible scope boundary, because an ADR is a dated record rather than live configuration, but the boundary lives only inside a grep pathspec. § Terminology left unchanged states the equivalent boundary for the four conceptual `NR_OF_CORES` mentions and states nothing about this one. `/speq:audit`'s ADR pass checks each ADR against the current code, so the next audit reads the mismatch as drift with no recorded answer.
+- Fix: Add a paragraph to plan.md § Terminology left unchanged stating that `specs/_decision/067-add-unity-e2e-ci-job.md:20` records `LH_EXASOL_CPUS: "2"` as a point-in-time record of the job shape added by that decision, that an ADR is not rewritten when a later plan renames a variable it names, and that both § Checklist sweeps therefore exclude `specs/_decision` deliberately.
 
 ## Requirement Quality
 
 #### [REQUIREMENT_CONFLICT] BLOCKER
-- Location: `specs/_plans/refactor-nr-of-cores-detection/datafusion-scan/scan-execution-connection-concurrency/spec.md` § Scenario "AUTO derivation yields the single-core budget when the core count cannot be detected", third `AND` step; plan.md § Consequences row 4; plan.md § Implementation Tasks tasks 1.5 and 1.6
-- Issue: the spec step reads "the scan-side built-in default SHALL remain in place as the serde default for a `ScanSpec` JSON payload that omits `s3_max_connections`, which is now its only role". That is false. `DEFAULT_S3_MAX_CONNECTIONS` has two further live consumers after the `0` branch is deleted: `crates/lakehouse-engine/src/adapter/mod.rs:404`, where `handle_pushdown_request` uses it as the fallback for an absent or invalid `S3_MAX_CONNECTIONS` adapterNote, and `crates/lakehouse-engine/src/adapter/pushdown/format/delta_format_reader.rs:192`, which passes it to `build_table_root_store`. The same false fact propagates into plan.md § Consequences ("The adapter stops reading it once the `0` branch is gone, so the constant's only remaining consumer is the module that defines it"), into task 1.6 ("State that the constant is now the serde default alone"), which would write the falsehood into the doc comment at `crates/lakehouse-engine/src/scan/spec.rs:1318-1324`, and into task 1.5's open question about dropping the import at `adapter/mod.rs:23`, which is already settled: line 404 keeps the import required.
-- Fix: In `datafusion-scan/scan-execution-connection-concurrency/spec.md`, replace "which is now its only role" with a step stating that the constant stays the serde default for an absent `s3_max_connections` field AND the pushdown-side fallback for an absent or invalid `S3_MAX_CONNECTIONS` adapterNote, and that only the create-time AUTO unknown-core branch stops using it. In plan.md § Consequences, replace row 4's rationale with the two surviving consumers named by file and line. Rewrite task 1.6 to instruct deleting only the `when nr_of_cores is 0 (unknown)` clause from the `scan/spec.rs:1318-1324` doc comment while keeping both remaining roles and the reverse-dependency rationale. Rewrite task 1.5's last sentence to state as fact that the `adapter/mod.rs:23` import stays, because `adapter/mod.rs:404` still reads the constant.
-- Escalation: MECHANICAL — settled by `grep -rn "DEFAULT_S3_MAX_CONNECTIONS" crates/lakehouse-engine/src/`.
+- Location: plan.md § Impact first bullet (line 109); plan.md § Migration first row (line 123); against plan.md § CPU-limit detection boundary (line 81) and `specs/_plans/refactor-nr-of-cores-detection/vs-adapter/create-virtual-schema-adapter-notes/spec.md` § Background (lines 34-47)
+- Issue: the plan gives the operator a migration instruction its own detection boundary declares ineffective. § Impact line 109 reads "An operator who relied on it to raise or lower the derived thread and connection budgets loses that lever and must constrain the node's CPU quota instead." § Migration line 123 reads "Drop the property. Constrain the node's CPU quota to set the effective count." § CPU-limit detection boundary line 81 reads "The adapter detects a CPU limit expressed as affinity. It does not detect a limit expressed only as a CFS bandwidth quota." The adapter-notes delta states the correct lever at lines 37-38: "An operator who needs a smaller effective core count constrains the executing node's CPU affinity, which `std::thread::available_parallelism()` honours." The two plan.md lines are the only operator-facing migration guidance this plan ships, and both name the one mechanism the revision established as invisible. An operator who follows them sets a limit the engine cannot see and gets budgets sized for more CPU than the node may use, which is exactly the failure issue #421 records. Both lines predate the revision and the revision rewrote the surrounding text without correcting them.
+- Fix: In plan.md § Impact line 109, replace "must constrain the node's CPU quota instead" with a statement that the operator constrains the executing node's CPU affinity instead, for example a Docker `cpuset` or the Kubernetes static CPU manager policy, and that a CFS bandwidth quota alone does not change the detected count (§ CPU-limit detection boundary, issue #421). In plan.md § Migration line 123, replace "Constrain the node's CPU quota to set the effective count." with "Constrain the node's CPU affinity to set the effective count. A CFS bandwidth quota alone has no effect (#421)."
+- Escalation: MECHANICAL. Three artifacts already in this plan settle which mechanism is correct, so no requester judgment is needed.
 
-#### [COMPLETENESS_GAP] BLOCKER
-- Location: plan.md § Implementation Tasks task 1.4; plan.md § Verification § Checklist, "Residual reference sweep" row
-- Issue: task 1.4 lists four doc comments that frame the `nr_of_cores == 0` sentinel and leaves two out. `crates/lakehouse-engine/src/adapter/mod.rs:52` reads `/// Minimum parallelism factor (floor applied when NR_OF_CORES is 0 or very small).`, naming the sentinel this plan deletes, and `crates/lakehouse-engine/src/adapter/mod.rs:48` reads `// Default: max(NR_OF_CORES * 2, 8). Stored in adapterNotes so the pushdown path`, naming the removed property. No task touches either line. The plan's own Checklist row then asserts the sweep `git grep -n "NR_OF_CORES" -- . ':!specs/_plans' ':!specs/_decision'` returns "Only the four Exasol-parameter mentions listed under 'Terminology left unchanged'". That step fails on lines 48 and 52.
-- Fix: Add `crates/lakehouse-engine/src/adapter/mod.rs:48` (the `PROP_PARALLELISM_FACTOR` comment) and `crates/lakehouse-engine/src/adapter/mod.rs:52` (the `DEFAULT_PARALLELISM_FACTOR` doc comment) to task 1.4 in `plan.md`. Instruct restating line 48 as the hardware-aware default over the detected core count, and line 52 as the floor applied to a small detected core count, with no reference to `NR_OF_CORES` or to `0`.
-- Escalation: MECHANICAL — settled by `grep -n "NR_OF_CORES" crates/lakehouse-engine/src/adapter/mod.rs`.
+#### [REQUIREMENT_CONFLICT] BLOCKER
+- Location: plan.md § Implementation Tasks task 3.3 (line 161); against plan.md § Checklist quota-variable sweep row (line 262); `crates/lakehouse-engine/tests/e2e_scan_test.rs:1377`
+- Issue: task 3.3 orders "Keep the precondition assertion, the fail-not-skip rule, and the `PARALLELISM_FACTOR = '1'` probe schema exactly as they stand". The precondition assertion's message at `e2e_scan_test.rs:1370-1378` reads "PRECONDITION UNMET: the Exasol container's CPU quota ({quota}) must be strictly less than this host's core count ({host_cores}) ... Lower LH_EXASOL_CPUS and recreate the container." Kept exactly as it stands, that message names the removed variable and calls a CPU-set cardinality a quota. § Checklist line 262 then fails: its quota-variable sweep runs `git grep -n "LH_EXASOL_CPUS\b" -- . ':!specs/_plans' ':!specs/_decision'` and expects "No match. Every caller names `LH_EXASOL_CPUSET`". The two instructions cannot both be satisfied. The trailing clause "only the constraint mechanism and the expected-value source change" does not resolve the conflict, because "exactly as they stand" is unconditional and the assertion's message is part of the assertion. An implementer who follows task 3.3 literally either fails the plan's own checklist or weakens the sweep to make it pass.
+- Fix: In plan.md task 3.3, replace "Keep the precondition assertion, the fail-not-skip rule, and the `PARALLELISM_FACTOR = '1'` probe schema exactly as they stand" with "Keep the precondition assertion's structure, the fail-not-skip rule, and the `PARALLELISM_FACTOR = '1'` probe schema. Restate every assertion message that names `LH_EXASOL_CPUS` or calls the value a quota: the precondition message at `crates/lakehouse-engine/tests/e2e_scan_test.rs:1370-1378` MUST name the container's CPU set, its cardinality, and `LH_EXASOL_CPUSET`, and MUST direct the reader to narrow the set rather than to lower a count."
+- Escalation: MECHANICAL. Task 3.3, the § Checklist row, and the test file settle the conflict between them.
 
-#### [COMPLETENESS_GAP] ADVISORY
-- Location: `specs/_plans/refactor-nr-of-cores-detection/vs-adapter/create-virtual-schema-adapter-notes/spec.md` § Scenario "An NR_OF_CORES virtual-schema property no longer changes any resolved budget"; plan.md § Impact
-- Issue: the scenario mandates that a still-supplied `NR_OF_CORES` property is accepted and has no effect, with no operator-visible signal. An operator whose `CREATE VIRTUAL SCHEMA` pinned the count keeps a statement that runs clean and silently sizes every budget differently. The adapter already has a warning channel in this exact code path: `udf_log!(ctx, warn, "{}", skip_warning(entry))` fires inside `handle_create_virtual_schema`. This stays advisory rather than blocking because the repo has a precedent for silent ignore, recorded in `specs/vs-adapter/create-virtual-schema-adapter-notes/spec.md` and in `specs/_decision/001-migrate-legacy-decision-log.md:1329`: "The `CONNECTION_NAME` VS property is no longer read; existing VS instances that set it for this purpose ignore it silently."
-- Fix: Add a task under plan.md § 1 instructing `handle_create_virtual_schema` to emit one `udf_log!(ctx, warn, ...)` line naming `NR_OF_CORES` as removed and ignored when the property is present, and add a matching `AND` step to the "An NR_OF_CORES virtual-schema property no longer changes any resolved budget" scenario. If the silent path is kept instead, add a sentence to plan.md § Impact citing the `CONNECTION_NAME` precedent as the reason.
+### Implementation-leakage check
 
-#### [REQUIREMENT_CONFLICT] ADVISORY
-- Location: decision-log.md § Design Decisions [1]
-- Issue: `specs/_decision/001-migrate-legacy-decision-log.md:1333` records the ADR "Source Per-Node Core Count from `available_parallelism()`, Not the Bogus `PARAM_VALUE('NR_OF_CORES')` Connect-Back Query", whose Consequences state at line 1358 that "The `NR_OF_CORES` override contract and its precedence over auto-detection are unchanged". Decision [1] deletes exactly that contract but declares no supersession, so the recorder writes a new ADR that contradicts a recorded one. The repo's convention marks this in the title: `specs/_decision/046-refactor-pushdown-node-count.md:30` reads "(Supersedes ADR)" and the legacy log uses "(Supersedes ADR-006)" and "(Supersedes the Core-Count Capture in ADR-023)".
-- Fix: Add to decision-log.md `[1]` § Consequences a sentence naming the superseded ADR at `specs/_decision/001-migrate-legacy-decision-log.md:1333` and stating that its unchanged-override-contract consequence no longer holds, so the promoted ADR carries the supersession in its title.
+[no objection — sub-check certified]
+
+The new `(#421)` Background bullet at `vs-adapter/create-virtual-schema-adapter-notes/spec.md:40-47`
+is depended on by the Docker scenario. That scenario's `GIVEN` names a CPU affinity set rather than
+a quota, and its `THEN` at line 149 asserts the recorded value equals the affinity-set cardinality.
+The bullet's closing clause, "An affinity-based limit ... is detected exactly", is the fact that
+`THEN` step rests on, and the quota half is what makes the `GIVEN`'s choice of mechanism a
+requirement rather than an arbitrary test detail. The bullet is a recorded limitation with a tracked
+issue, which is this repo's stated convention for a named deviation, and the user's round-2 answer
+chose that recording explicitly. It is not leakage.
 
 ## Task Breakdown
 
-#### [TRACEABILITY_GAP] BLOCKER
-- Location: plan.md § Implementation Tasks § 6, tasks 6.1 and 6.2; plan.md § Parallelization group B; plan.md § Verification § Manual Testing
-- Issue: tasks 6.1 and 6.2 are a manual multi-node cluster check, and the Parallelization table assigns them to group B alongside the bench and documentation edits. No implementer can execute them: the plan itself states "CI runs no multi-node cluster, so this check stays manual". Placed as ordinary tasks they get a checkbox an agent can tick. They also carry no ship-blocking condition, and plan.md § Manual Testing has no multi-node row at all, only the Checklist's "Result recorded in the PR description". The direct precedent is the #184 plan this one calls its sequel: `specs/_decision/046-refactor-pushdown-node-count.md:20` records its decision as "make a four-node staging check a mandatory pre-merge gate in `plan.md` § Manual Testing, with an explicit 'MUST NOT ship' failure condition", and its Consequences record that `verification-report.md` flags the gate as not run for a human to execute. This plan drops both halves of that shape, and it does so for the one check that carries genuine multi-node evidence, given the Docker probe's defect above.
-- Fix: Delete section `### 6. Manual pre-merge check` and tasks 6.1 and 6.2 from plan.md § Implementation Tasks, and remove `6.1-6.2` from group B in plan.md § Parallelization. Add the multi-node check as a row in plan.md § Verification § Manual Testing, mirroring `specs/_decision/046-refactor-pushdown-node-count.md`: state the command, the expected `DF_THREADS_PER_UDF` value against the cluster's reported per-node core count, and an explicit "MUST NOT ship if the values differ" failure condition that also names the follow-up issue obligation and the prohibition on reintroducing the VS property.
-- Escalation: MECHANICAL — the precedent and the required shape are both recorded in `specs/_decision/046-refactor-pushdown-node-count.md`.
+[no objection — axis checked]
 
-#### [TRACEABILITY_GAP] BLOCKER
-- Location: `specs/_plans/refactor-nr-of-cores-detection/vs-adapter/refresh-and-set-properties/spec.md` § Scenario "Refresh rebuilds the table map and preserves other adapter notes"; plan.md § Implementation Tasks preamble; plan.md § Verification § Scenario Coverage
-- Issue: the delta adds a new normative clause, "including an `NR_OF_CORES` entry left behind by a schema created under an earlier adapter version, which survives unread and inert". No task implements or tests it. The plan's preamble states the opposite: "Both change one clause that lists `NR_OF_CORES` among the preserved `adapterNotes` entries... Their tests, `table_map_merges_with_existing_notes` and `refresh_rebuilds_table_map_preserves_notes`, need only the argument drop of task 2.1." The mapped test does not cover the clause: `crates/lakehouse-engine/src/adapter/adapter_tests.rs:396` seeds the request notes with `"OTHER_KEY": "keep-me"` and `TABLE_MAP`, never an `NR_OF_CORES` key. The clause is the plan's only assertion of its own backward-compatibility claim in plan.md § Impact ("A virtual schema created under an earlier version keeps its persisted entry, which survives unread"), and after this change `build_adapter_notes` no longer writes that key, so nothing else pins the merge-not-clobber behavior for it.
-- Fix: Add a task under plan.md § 2 instructing the implementer to seed `"NR_OF_CORES": "8"` into the `schemaMetadataInfo.adapterNotes` of the request in `refresh_rebuilds_table_map_preserves_notes` (`crates/lakehouse-engine/src/adapter/adapter_tests.rs:396`) and to assert the key survives the rebuild with its original value. Correct the § Implementation Tasks preamble, which currently claims that test needs only the argument drop. Add the refresh scenario to plan.md § Verification § Scenario Coverage mapping it to that test.
-- Escalation: MECHANICAL — settled by reading the delta scenario against `crates/lakehouse-engine/src/adapter/adapter_tests.rs:396`.
+Every delta has an implementing task. `vs-adapter/create-virtual-schema-adapter-notes` maps to tasks
+1.2 through 1.4, 2.3 through 2.5, and 3.1 through 3.3. `-resources` maps to tasks 1.4 and 2.6.
+`vs-adapter/create-virtual-schema` carries no task beyond task 2.1's argument drop, which the
+§ Implementation Tasks preamble states as fact at line 130. `vs-adapter/refresh-and-set-properties`
+maps to task 2.8. `scan-execution-threading` maps to tasks 1.4 and 2.6.
+`scan-execution-connection-concurrency` maps to tasks 1.5, 1.6, and 2.7. `cloud-e2e-harness` maps to
+tasks 4.1 through 4.4. New task 3.2's `docker-compose.yml` change implements the adapter-notes
+Docker scenario's `GIVEN`, so it implements something in scope.
+
+Every line citation the revision introduced matches the current working tree. `docker-compose.yml`
+line 119 carries `cpus: "${LH_EXASOL_CPUS:-4}"`. `.github/workflows/ci.yml` carries the measurement
+step at lines 515-542 and the three static entries at 648, 753, and 858, which are the post-merge
+numbers rather than the stale 537/647/750/853 the earlier review cited. `bench/.env.example` line 15
+carries `LH_EXASOL_CPUS=4`. `bench/run.sh` line 368 carries the quota comment. `bench/README.md`
+line 108 sits inside the Parallelism section task 5.2 rewrites. Both renamed test symbols exist.
+
+Cluster coherence holds. Group A absorbs `docker-compose.yml` beside the E2E test and the CI
+workflow, which is correct because the compose constraint and the assertion that reads it are one
+mental model. Group B's new dependency cell names task 4.5 against the compose change group A lands,
+which is the real ordering constraint: `bench/.env.example` must not name `LH_EXASOL_CPUSET` before
+`docker-compose.yml` reads it.
 
 ## Design Depth
 
-The two-group clustering is sound: group A is one coherent function set in `adapter/mod.rs` plus its tests, and group B shares no file with it. Decision [1]'s `Promotes to ADR: yes` passes the promotion gate (a behavior and architecture change, removing a supported property and a persisted note) and matches the precedent of the #184 plan, which produced `specs/_decision/046-refactor-pushdown-node-count.md`. Decisions [2] through [8] are all correctly marked `no`: [2], [3], [4], [5], [7] are corollaries of [1], and [6] and [8] are scoped to this plan alone. The `core_count_or_default` seam from decision [4] is genuinely exercised, not merely present: task 2.4 adds `core_count_defaults_to_one_when_detection_fails` calling it with an `Err`, and plan.md § Scenario Coverage maps the "core count of 1" scenario to it. The information-leakage framing in § Context is accurate: the `0` encoding is currently reflected in the resolver, four derivations, and `scan/spec.rs`.
+[no objection — axis checked]
 
-#### [TACTICAL_SHORTCUT] ADVISORY
-- Location: plan.md § Design § Decision § Architecture; decision-log.md § Design Decisions [2] and [4]
-- Issue: `core_count_or_default` takes `std::io::Result<NonZeroUsize>` and narrows it to `u32`, and every derivation then widens it back with `nr_of_cores as usize` (`crates/lakehouse-engine/src/adapter/mod.rs:744`, `:819`, `:833`, `:888`). The `u32` existed to carry a parsed property value and a `0` sentinel, both of which this plan deletes. Keeping it means the type still permits `0`, so each derivation's `max(1, ...)` floor stays a defense against a value the plan says is now unreachable, and the "0 is impossible" rule remains a convention rather than an invariant. The plan's own § Context names this encoding decision as the leak it closes. Carrying the resolved count as `NonZeroUsize` would close it in the type system and is compatible with interview answer A2, which settled that the value is threaded as a parameter, not what type it has.
-- Fix: Add a decision-log.md entry recording the type choice explicitly: either change `core_count_or_default` to return `NonZeroUsize` and update the five derivation signatures, or state why `u32` is retained and why the `max(1, ...)` floors remain necessary once the sentinel is gone. Reflect the chosen answer in plan.md § Design § Decision § Architecture.
+The revision adds no module, interface, or boundary, so the quick-diagnostic table does not apply.
+Decision [9] § Alternatives rejects a `cgroup_quota_cores()` reader on the ground that it would
+duplicate logic the standard library already runs and would return `None` on every call inside the
+sandbox. That is the correct call under the deep-module and information-leakage rules: the rejected
+reader would have added a second owner for a decision `std::thread::available_parallelism()` already
+owns, and its dead `Option` would have leaked a cgroup-layout assumption into the adapter.
+
+`[ADR_OVERPROMOTION]` check on the one new `Promotes to ADR: yes` entry: decision [9] passes the
+gate. Its substance is a design and behavior boundary, namely that the adapter detects a CPU limit
+expressed as affinity and not one expressed only as a CFS bandwidth quota, with issue #421 as the
+tracked exception. That is not a procedural or workflow decision, and it is not a corollary of
+decision [1], which promotes the separate claim that the core count is a resolved input rather than
+configuration or state. The harness half of [9] rides along with the boundary rather than carrying
+the promotion on its own.
 
 ## Prose Quality
 
-Scanned all nine artifacts. No em dashes outside the exempt table cell at plan.md:162 and the carried-over recorded Background bullets, no semicolons, no contractions, no superlatives, no process narration. Headings summarize their sections and each finds its conclusion first.
+#### [PROSE_UNCLEAR] ADVISORY
+- Location: plan.md § Impact (line 107)
+- Issue: the section opens "Four user-visible changes ship with this plan. All four are breaking." Five bolded changes follow, at lines 109, 111, 113, 115, and 117. The revision added the `LH_EXASOL_CPUSET` change at line 113 and left the count. The second sentence is also false against the fifth change, whose own text at line 117 reads "No code reads it, so nothing breaks." The pre-revision text carried the same off-by-one, so the revision inherited one error and added another.
+- Fix: In plan.md § Impact line 107, replace "Four user-visible changes ship with this plan. All four are breaking." with "Five user-visible changes ship with this plan. Four are breaking. The `adapterNotes` change is not."
 
 #### [PROSE_UNCLEAR] ADVISORY
-- Location: `specs/_plans/refactor-nr-of-cores-detection/vs-adapter/create-virtual-schema-adapter-notes/spec.md` § Scenario "createVirtualSchema adapterNotes omit the cluster node count"
-- Issue: the delta adds a second omission to the scenario, `*AND* the `adapterNotes` MUST NOT carry an `NR_OF_CORES` entry either`, but leaves the heading naming only the cluster node count. The heading no longer summarizes the scenario, and it is the name a reader matches against the mapped test in plan.md § Scenario Coverage.
-- Fix: Rename the scenario heading in the `vs-adapter/create-virtual-schema-adapter-notes` delta to "createVirtualSchema adapterNotes omit both the cluster node count and the per-node core count", and update the matching row in plan.md § Verification § Scenario Coverage.
+- Location: decision-log.md § Review Findings, first `[plan-review]` entry (lines 110-113); decision-log.md § Interview answer A4 (line 15); decision-log.md § Design Decisions [9] supersession line (line 83)
+- Issue: entry [9]'s supersession line names two superseded records, "the verification mechanism in decision [5], and the mechanism claim in interview answer A1". Two further records carry the falsified quota mechanism and are named nowhere. Interview answer A4 at line 15 specifies an E2E check "under a known `LH_EXASOL_CPUS`-constrained container". The round-1 `[plan-review]` entry at line 113 states "Task 3.2 now reads the effective quota from the running container through `docker exec` on `/sys/fs/cgroup/cpu.max`" and "new task 3.4 measures the runner and lowers `LH_EXASOL_CPUS` for the E2E job when needed". Both sentences are now false against plan.md, where task 3.2 edits `docker-compose.yml`, task 3.3 reads `cpuset.cpus.effective`, and task 3.4 writes `LH_EXASOL_CPUSET`. Preserving the audit trail is the right call, and task 3.3 line 161 already depends on that entry keeping the old test name. The defect is that a reader cannot tell which parts are history without reading entry [9] and diffing plan.md.
+- Fix: Extend entry [9]'s supersession line in decision-log.md (line 83) to name interview answer A4 and the round-1 `[plan-review]` entry "The Docker CPU-quota probe asserted a value with no discriminating power" alongside decision [5] and answer A1. Add one line directly under that entry's heading at line 110 reading "Superseded by decision [9]. The task numbers and the `cpu.max` mechanism below record the pre-revision plan and are kept as the audit trail for the finding task 3.3 cites by its old test name."
+
+### Guardrail sweep on the revised prose
+
+[no objection — sub-check certified]
+
+The text the revision added carries no em dash, no semicolon, and no contraction. The em dashes
+`git grep` returns in the artifacts are pre-existing recorded spec text, namely the feature title and
+the memory-budget Background bullet carried over from
+`specs/vs-adapter/create-virtual-schema-adapter-notes/spec.md`, plus one table cell where `—` means
+"none". Tables and recorded spec text fall outside the governed set. § CPU-limit detection boundary
+states scale with measurements rather than intensifiers, and it names the magnitude as unmeasured
+rather than hedging it.

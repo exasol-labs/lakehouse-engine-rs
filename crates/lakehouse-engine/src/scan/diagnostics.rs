@@ -45,7 +45,7 @@ static INSTALL: Once = Once::new();
 //
 // Concurrency model (must hold under the bench's concurrent config — multiple
 // shard VMs per node AND a multi-thread DataFusion runtime within a VM; do NOT
-// rely on NR_OF_CORES=1):
+// rely on a per-instance thread budget of 1):
 //   * Per-PROCESS file `/tmp/lakehouse_udf_debug.<pid>.log` — one file per VM
 //     process, so concurrent shard VMs (separate processes) never interleave.
 //   * Intra-VM threads (Tokio workers, DataFusion decode threads) share one PID

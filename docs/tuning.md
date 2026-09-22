@@ -16,11 +16,10 @@ All properties belong to `CREATE VIRTUAL SCHEMA` unless the table says otherwise
 | `CATALOG_KIND` | no | absent (Iceberg REST) | Which catalog backend to resolve against: leave it absent for an Iceberg REST catalog, or set `'UNITY_CATALOG'` for a native Unity Catalog. Any other value, including the literal `'ICEBERG_REST'`, is rejected — Iceberg REST is selected only by leaving the property unset. See [Catalogs](catalogs.md). |
 | `NAMESPACE` | yes | — | Catalog namespace: dot-delimited Iceberg namespace segments under `ICEBERG_REST`, or `catalog.schema` under `UNITY_CATALOG`. Every table in the namespace becomes a virtual table. |
 | `ALLOW_HTTP` | no | `false` | `'true'` permits plain-HTTP catalog/S3 (for example, local MinIO). |
-| `NR_OF_CORES` | no | auto-detected (else 0) | Per-node core count. It drives the parallelism factor and the thread budget. Set it only if auto-detection gives a wrong value. |
-| `PARALLELISM_FACTOR` | no | `max(NR_OF_CORES × 2, 8)` | Shard oversubscription multiplier. `G = node_count × factor`, capped 300. |
+| `PARALLELISM_FACTOR` | no | `max(detected core count × 2, 8)` | Shard oversubscription multiplier. `G = node_count × factor`, capped 300. |
 | `DATAFUSION_THREADING_MODE` | no | `AUTO` | `AUTO` derives a non-oversubscribing per-instance thread budget. `FIXED` uses the two properties below verbatim. |
-| `DATAFUSION_THREADS_PER_UDF` | no | `max(NR_OF_CORES, 1)` | Tokio worker threads per UDF instance. `FIXED` mode only. `1` = single-threaded. |
-| `DATAFUSION_TARGET_PARTITIONS` | no | `max(NR_OF_CORES, 1)` | DataFusion `target_partitions` per instance (`FIXED` mode only). |
+| `DATAFUSION_THREADS_PER_UDF` | no | `max(detected core count, 1)` | Tokio worker threads per UDF instance. `FIXED` mode only. `1` = single-threaded. |
+| `DATAFUSION_TARGET_PARTITIONS` | no | `max(detected core count, 1)` | DataFusion `target_partitions` per instance (`FIXED` mode only). |
 | `DATAFUSION_BATCH_SIZE` | no | `8192` | Rows per Arrow `RecordBatch`. It bounds the out-of-pool decode working set. |
 | `MEMORY_POOL_FRACTION` | no | `0.6` | Fraction of the per-instance memory limit given to the DataFusion pool. Kept < the engine's 80 % stall threshold. |
 | `INSTANCE_OVERHEAD_MB` | no | `200` | Per-instance overhead subtracted from the reported limit before the pool fraction applies. |
@@ -38,7 +37,7 @@ The adapter qualifies its calls to these scripts from its own running-script sch
 
 **Pool sizing:** `pool = MEMORY_POOL_FRACTION × (memory_limit − INSTANCE_OVERHEAD_MB)`. When the per-instance limit is reported as 0 (unknown), a conservative default budget applies instead.
 
-**Quick recommendation:** For read-bound remote scans, set `DATAFUSION_THREADING_MODE='FIXED'`, `DATAFUSION_THREADS_PER_UDF='<NR_OF_CORES>'`, and `DATAFUSION_TARGET_PARTITIONS='<NR_OF_CORES>'`. These values are ~39 % faster than the `AUTO` default on a full scan.
+**Quick recommendation:** For read-bound remote scans, set `DATAFUSION_THREADING_MODE='FIXED'`, `DATAFUSION_THREADS_PER_UDF='<detected core count>'`, and `DATAFUSION_TARGET_PARTITIONS='<detected core count>'`. These values are ~39 % faster than the `AUTO` default on a full scan.
 
 ### `S3_MAX_CONNECTIONS`
 
@@ -50,7 +49,7 @@ The property says nothing about how many shards run (`PARALLELISM_FACTOR`). It a
 
 - **Explicit value** — a positive integer applies verbatim (FIXED-like), for example `S3_MAX_CONNECTIONS='64'`.
 - **Absent, invalid, or `0`** — AUTO derives the budget as `per_instance_threads × 4`. The value `per_instance_threads` is the same thread budget that `DATAFUSION_THREADING_MODE=AUTO` computes (cores available per instance, floored to `≥1`). The `×4` multiplier oversubscribes the IO axis relative to the CPU axis on purpose. S3 fetches are latency-bound, so a decode thread waits on a network round-trip for most of a byte-range GET. Several requests in flight per thread hide that latency and keep the NIC busy (Little's law: fill-the-pipe concurrency ≈ bandwidth × latency). Idle pooled TCP connections are cheap relative to OS threads, so this asymmetry is deliberate.
-- **`NR_OF_CORES` unknown (`0`)** — a built-in default of `16` applies.
+- **Core-count detection failure** — the detected core count floors to `1`, so the same AUTO formula yields `4`.
 
 This property applies to the HTTP client of the object store, not to DataFusion. It does **not** change DataFusion's `target_partitions`. That value stays the job of the threading properties.
 
