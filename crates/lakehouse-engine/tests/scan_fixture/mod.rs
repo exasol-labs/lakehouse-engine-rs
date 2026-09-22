@@ -53,18 +53,13 @@ pub fn output_columns(types: &[ExaType]) -> Vec<ColumnInfo> {
 
 /// The `ExaType` Exasol reports for a `VARCHAR(2000000)` declaration.
 pub fn varchar() -> ExaType {
-    ExaType::String {
-        size: Some(2_000_000),
-    }
+    ExaType::String { size: 2_000_000 }
 }
 
 /// The `ExaType` Exasol reports for a `DECIMAL(precision, scale)` declaration
 /// it binned to NUMERIC rather than to one of the two integer bins.
 pub fn decimal(precision: u32, scale: u32) -> ExaType {
-    ExaType::Numeric {
-        precision: Some(precision),
-        scale: Some(scale),
-    }
+    ExaType::Numeric { precision, scale }
 }
 
 fn declared_type_name(typ: &ExaType) -> String {
@@ -73,46 +68,32 @@ fn declared_type_name(typ: &ExaType) -> String {
         ExaType::Double => "DOUBLE PRECISION".to_string(),
         ExaType::Int32 => "DECIMAL(9,0)".to_string(),
         ExaType::Int64 => "DECIMAL(18,0)".to_string(),
-        ExaType::Numeric { precision, scale } => format!(
-            "DECIMAL({},{})",
-            precision.map_or("?".to_string(), |p| p.to_string()),
-            scale.map_or("?".to_string(), |s| s.to_string())
-        ),
-        ExaType::String { size } => format!(
-            "VARCHAR({})",
-            size.map_or("?".to_string(), |s| s.to_string())
-        ),
-        ExaType::Char { size } => {
-            format!("CHAR({})", size.map_or("?".to_string(), |s| s.to_string()))
-        }
+        ExaType::Numeric { precision, scale } => format!("DECIMAL({precision},{scale})"),
+        ExaType::String { size } => format!("VARCHAR({size})"),
+        ExaType::Char { size } => format!("CHAR({size})"),
         ExaType::Date => "DATE".to_string(),
-        ExaType::Timestamp => "TIMESTAMP".to_string(),
-        ExaType::TimestampTz => "TIMESTAMP WITH LOCAL TIME ZONE".to_string(),
-        ExaType::Geometry => "GEOMETRY".to_string(),
-        ExaType::HashType => "HASHTYPE".to_string(),
-        ExaType::IntervalYearToMonth => "INTERVAL YEAR TO MONTH".to_string(),
-        ExaType::IntervalDayToSecond => "INTERVAL DAY TO SECOND".to_string(),
+        ExaType::Timestamp { precision } => format!("TIMESTAMP({precision})"),
         ExaType::Unsupported => "UNSUPPORTED".to_string(),
     }
 }
 
 fn declared_size(typ: &ExaType) -> Option<u32> {
     match typ {
-        ExaType::String { size } | ExaType::Char { size } => *size,
+        ExaType::String { size } | ExaType::Char { size } => Some(*size),
         _ => None,
     }
 }
 
 fn declared_precision(typ: &ExaType) -> Option<u32> {
     match typ {
-        ExaType::Numeric { precision, .. } => *precision,
+        ExaType::Numeric { precision, .. } => Some(*precision),
         _ => None,
     }
 }
 
 fn declared_scale(typ: &ExaType) -> Option<u32> {
     match typ {
-        ExaType::Numeric { scale, .. } => *scale,
+        ExaType::Numeric { scale, .. } => Some(*scale),
         _ => None,
     }
 }
