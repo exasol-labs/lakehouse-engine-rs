@@ -29,7 +29,7 @@ use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
     E2E_TSPRECISION_NAMESPACE, E2E_TSPRECISION_TABLE, TSPRECISION_COL_TS, TSPRECISION_COL_TS_NS,
-    TSPRECISION_COL_TSTZ, TSPRECISION_MICROS, seed_timestamp_precision_probe,
+    TSPRECISION_COL_TSTZ, TSPRECISION_MICROS, TSPRECISION_NANOS, seed_timestamp_precision_probe,
 };
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
@@ -274,42 +274,57 @@ fn qualified_probe() -> String {
     format!("{VS_NAME}.{}", served_table())
 }
 
-/// `SELECT ID, CAST(ts AS <target>) FROM <probe> ORDER BY ID` — the shape every width below
+/// `SELECT ID, CAST(<column> AS <target>) FROM <probe> ORDER BY ID`, the shape every width below
 /// projects. `ID` keeps the ordering deterministic without relying on scan order.
-fn cast_projection_sql(target: &str) -> String {
+fn cast_projection_sql(column: &str, target: &str) -> String {
     format!(
-        "SELECT ID, CAST({} AS {target}) FROM {} ORDER BY ID",
-        TSPRECISION_COL_TS.to_uppercase(),
+        "SELECT ID, CAST({column} AS {target}) FROM {} ORDER BY ID",
         qualified_probe()
     )
 }
 
-/// Scenario (type-mapping-timestamp-precision): a projected `CAST(ts AS TIMESTAMP(9))` declares
+/// The instant `nanos` names, rendered at nine fractional digits.
+fn rendered_nanos(nanos: i64) -> String {
+    chrono::DateTime::from_timestamp_nanos(nanos)
+        .format("%Y-%m-%d %H:%M:%S%.9f")
+        .to_string()
+}
+
+/// Scenario (type-mapping-timestamp-precision): a projected `CAST(ts_ns AS TIMESTAMP(9))` declares
 /// nine digits in the scan's `EMITS` clause and emits an Arrow `Timestamp(Nanosecond, None)`
-/// column the SLC accepts, so every seeded value survives and all four stay distinct.
+/// column the SLC accepts, carrying every seeded nanosecond digit through to Exasol.
+///
+/// Casts the NANOSECOND-seeded column, not `ts`: `TSPRECISION_MICROS` carries no sub-microsecond
+/// digit, so casting it to `TIMESTAMP(9)` widens a value rather than carrying one and the
+/// assertions below would hold just as well against a silently narrowed unit.
 ///
 /// Guarded on the `>= 2025` arm: 8.29.13 rejects `TIMESTAMP(9)` as a CAST target outright
 /// (`0A000`, decision-log.md `[C3]`).
 #[test]
-fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_value() {
+fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     setup();
     let mut conn = exa_conn();
     if !accepts_every_cast_precision(&mut conn) {
         return;
     }
-    let expected = ExpectedTimestampPrecision::NANOSECOND;
-    let target = expected.declared_column_type;
-    let projection_sql = cast_projection_sql(target);
+    let target = ExpectedTimestampPrecision::NANOSECOND.declared_column_type;
+    let ts_ns_column = TSPRECISION_COL_TS_NS.to_uppercase();
+    let projection_sql = cast_projection_sql(&ts_ns_column, target);
 
     assert_emits_declares(&mut conn, &projection_sql, target);
 
     let projected = conn.query_columns(&projection_sql);
     let actual = without_trailing_fraction_zeros(rendered_column(&projected[1], target));
-    let want =
-        without_trailing_fraction_zeros(TSPRECISION_MICROS.iter().copied().map(rendered).collect());
+    let want = without_trailing_fraction_zeros(
+        TSPRECISION_NANOS
+            .iter()
+            .copied()
+            .map(rendered_nanos)
+            .collect(),
+    );
     assert_eq!(
         actual, want,
-        "every seeded value must survive a {target} emit unchanged — a differing value means the \
+        "every seeded value must survive a {target} emit unchanged; a differing value means the \
          nanosecond Arrow unit lost digits at the emit boundary, not that the SLC rejected it"
     );
     assert_pushed_to_scan_udf(
@@ -318,18 +333,19 @@ fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_value() {
         "the TIMESTAMP(9) cast projection",
     );
 
+    // The seeded instants differ ONLY below the microsecond, so this count is 2 at TIMESTAMP(9)
+    // and 1 at every coarser width. TSPRECISION_MICROS cannot make that distinction, which is
+    // why `ExpectedTimestampPrecision::NANOSECOND.distinct_count` is not the oracle here.
     let distinct_sql = format!(
-        "SELECT COUNT(DISTINCT CAST({} AS {target})) FROM {}",
-        TSPRECISION_COL_TS.to_uppercase(),
+        "SELECT COUNT(DISTINCT CAST({ts_ns_column} AS {target})) FROM {}",
         qualified_probe()
     );
     assert_eq!(
         conn.query_scalar_i64(&distinct_sql),
-        expected.distinct_count,
-        "COUNT(DISTINCT) must be {} at {target}; a smaller count under a query that raised no \
-         error is this engine build ACCEPTING the declaration and silently clamping it — an \
-         engine limit of the measured build, not an SLC rejection",
-        expected.distinct_count
+        2,
+        "COUNT(DISTINCT) must be 2 at {target}; a smaller count under a query that raised no \
+         error is this engine build ACCEPTING the declaration and silently clamping it, an \
+         engine limit of the measured build rather than an SLC rejection"
     );
 }
 
@@ -346,7 +362,7 @@ fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     let mut conn = exa_conn();
     let expected = ExpectedTimestampPrecision::MILLISECOND;
     let target = expected.declared_column_type;
-    let projection_sql = cast_projection_sql(target);
+    let projection_sql = cast_projection_sql(&TSPRECISION_COL_TS.to_uppercase(), target);
 
     let honors_declared_precision = engine_honors_declared_precision(&mut conn);
     let echoed_declaration = if honors_declared_precision {
@@ -412,7 +428,7 @@ fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
         return;
     }
     let declined_target = "TIMESTAMP(2)";
-    let projection_sql = cast_projection_sql(declined_target);
+    let projection_sql = cast_projection_sql(&TSPRECISION_COL_TS.to_uppercase(), declined_target);
 
     let pushdown_sql = isolated_pushdown_statement(&mut conn, &projection_sql);
     assert!(

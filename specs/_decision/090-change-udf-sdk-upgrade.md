@@ -49,45 +49,6 @@ On 8.29.13, the adapter declares all three timestamp columns bare `TIMESTAMP`,
 column, so `from_declared_digits` takes its `Millisecond` arm and DECLARED equals EMITTED there
 too. A nanosecond column loses its six digits, exactly as the stated 8.x trade-off predicts.
 
-## ADR: Two owners for the two precision axes, not one enum with a third variant
-
-**ID:** timestamp-precision-two-axis-ownership-split
-**Plan:** change-udf-sdk-upgrade
-**Status:** Accepted
-
-### Context
-
-The recorded defect was a single request-scoped value (`TimestampPrecision::from_database_version`,
-resolved once per `createVirtualSchema` request) standing in for a column-scoped one. An Iceberg
-`timestamp_ns` column was declared identically to a `timestamp` column, even though
-`iceberg_primitive_to_arrow` already registered the two differently as Arrow `Timestamp(Nanosecond,
-_)` versus `Timestamp(Microsecond, _)`. Adding a third variant to the same enum would have kept a
-column-scoped fact and a request-scoped fact on one type, preserving the same confusion under a
-different name.
-
-### Decision
-
-`TimestampPrecision` owns the per-COLUMN source width, its Exasol declaration string, its Arrow
-`TimeUnit`, and the inverse mapping from a declared Exasol precision back to a width.
-`EngineTimestampSupport` owns the per-REQUEST version rule and the clamp. A producer writes
-`engine.clamp(source).declaration()`, and neither type carries the other's rule.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Split into two types, one per axis, each with exactly one owner | ✓ Chosen — makes the agreement between the declaring side and the emitting side structural, not conventional |
-| Add a `Nanosecond` variant to the existing single enum | ✗ Rejected — the defect IS a request-scoped value standing in for a column-scoped one; a third variant on the same type preserves that confusion |
-
-### Consequences
-
-The emit boundary reads the same `TimestampPrecision` table in the reverse direction
-(`from_declared_digits(p).arrow_unit()`), so a declared `TIMESTAMP(9)` cannot mean one width where it
-is declared and another where it is emitted. Both producers (`iceberg_primitive_to_exasol`,
-`unity_type_name_to_exasol`) name a source width and clamp it through the engine value; neither
-carries a declaration literal, so an Iceberg `timestamp` and a Delta `TIMESTAMP` cannot be declared
-at different precisions by construction.
-
 ## ADR: An inexpressible CAST precision is declined, not approximated
 
 **ID:** cast-timestamp-precision-decline-not-approximate
