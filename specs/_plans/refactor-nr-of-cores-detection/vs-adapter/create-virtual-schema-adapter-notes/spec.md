@@ -13,14 +13,14 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
   `vs-adapter/pushdown-planning`). `adapterNotes` is reserved for values derived at
   create time that a pushdown cannot recompute, such as `TABLE_MAP`.
 * The per-node core count is NOT recorded in `adapterNotes` either, and for a stronger
-  reason than the node count: no pushdown ever read it back. The adapter resolves it,
+  reason than the node count: no pushdown reads it back. The adapter resolves it,
   feeds it into the parallelism-factor, DataFusion-threading, and connection-concurrency
   derivations, and discards it. Only those derived entries round-trip.
-* No migration mechanism exists, or is needed, for a schema created before this
-  change: a `CLUSTER_NODES` or `NR_OF_CORES` entry persisted by an earlier adapter
-  version simply survives the merge like any other foreign key, unread and inert. An
-  operator upgrading past this change drops and recreates the virtual schema rather
-  than relying on an in-place migration path.
+* The adapter needs no migration mechanism for an `adapterNotes` entry it does not
+  write itself. An entry persisted by another adapter version, such as `CLUSTER_NODES`
+  or `NR_OF_CORES`, survives the merge like any other foreign key, unread and inert.
+  An operator who wants such an entry gone drops and recreates the virtual schema,
+  because no in-place migration path exists.
 * The per-node core count is read directly on the executing node via
   `std::thread::available_parallelism()`, once per request, at the single call site
   that resolves it. This is the same host-core-count source the scan UDF already
@@ -31,12 +31,12 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
   distinct unknown sentinel: every derivation the core count feeds already floors its
   own result, so the unavailable case and a genuine single-core node produce identical
   budgets.
-* There is no `NR_OF_CORES` VS property. The adapter reads properties by name and
-  ignores every name it does not know, so a `createVirtualSchema` statement carried
-  over from an earlier version keeps working and the property has no effect. An
-  operator who needs a smaller effective core count constrains the executing node's
-  CPU quota instead. The Docker scenario below verifies that the adapter VM honours
-  that quota.
+* No VS or connection property configures the core count. The adapter reads
+  properties by name and ignores every name it does not know, so an unknown name in a
+  `createVirtualSchema` statement is accepted and has no effect. An operator who needs
+  a smaller effective core count constrains the executing node's CPU quota, which
+  `std::thread::available_parallelism()` honours. The Docker scenario below verifies
+  that the adapter VM reads that quota.
 * No topology value uses a connect-back session, at create time or at pushdown time;
   the adapter opens no read-only SQL session for topology discovery, issues no
   `SELECT NPROC()` or `SELECT PARAM_VALUE(...)`, and honours no `CONNECTION_NAME` VS
@@ -118,6 +118,7 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
 * *THEN* the adapter SHALL read the per-node core count from `std::thread::available_parallelism()` on the executing node, WITHOUT opening any connect-back session and WITHOUT reading any VS or connection property
 * *AND* the adapter SHALL read that core count EXACTLY ONCE per request, at one call site, and pass the resolved value as a plain argument into the parallelism-factor, DataFusion-threading, and connection-concurrency derivations
 * *AND* the adapter MUST NOT write the resolved core count into the response `adapterNotes`, and MUST NOT persist it anywhere else
+* *AND* the adapter SHALL accept a property name it does not recognize and SHALL resolve every budget to the same value it resolves without that name, so no property reaches the core count
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
@@ -127,17 +128,7 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
 * *WHEN* the adapter resolves the per-node core count for a `createVirtualSchema` request
 * *THEN* the adapter SHALL use a core count of `1`, and MUST NOT use a distinct unknown sentinel value such as `0`
 * *AND* the adapter SHALL return a successful `createVirtualSchema` response
-* *AND* every budget derived from that core count SHALL equal the budget a genuine single-core node produces, so no derivation carries a separate unknown-core branch
-<!-- /DELTA:NEW -->
-
-<!-- DELTA:NEW -->
-### Scenario: An NR_OF_CORES virtual-schema property no longer changes any resolved budget
-
-* *GIVEN* a `createVirtualSchema` request that supplies an `NR_OF_CORES` connection/VS property set to any value
-* *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
-* *THEN* the adapter SHALL ignore that property and SHALL resolve the per-node core count from `std::thread::available_parallelism()` exactly as it does when the property is absent
-* *AND* the resolved `PARALLELISM_FACTOR`, DataFusion threading, and `S3_MAX_CONNECTIONS` entries SHALL be identical to those the same request produces with the property removed
-* *AND* the adapter MUST NOT reject the request over that property, because the adapter reads properties by name and an operator upgrading from an earlier version MAY still carry it in a `CREATE VIRTUAL SCHEMA` statement
+* *AND* every budget derived from that core count SHALL equal the budget a genuine single-core node produces
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
@@ -148,5 +139,5 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
 * *AND* a virtual schema created with `PARALLELISM_FACTOR = '1'` and no `DATAFUSION_THREADING_MODE` property, so the AUTO derivation divides the detected core count by a per-node instance share of `1` and records it unchanged as `DF_THREADS_PER_UDF`
 * *WHEN* the test reads the `DF_THREADS_PER_UDF` entry from that schema's `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` row
 * *THEN* the recorded value SHALL equal the CPU quota read back from the container, which evidences that the adapter VM reads the container's quota rather than the unavailable fallback of `1` or the host's unconstrained core count
-* *AND* the test MUST FAIL rather than skip when the value differs, because removing the `NR_OF_CORES` override leaves auto-detection as the only source of the core count, and MUST FAIL naming the unmet precondition rather than report a pass when the container quota is not strictly less than the test host's core count, so a non-discriminating configuration records no false evidence
+* *AND* the test MUST FAIL rather than skip when the value differs, because auto-detection is the only source of the core count and a skipped check would leave that source unevidenced, and MUST FAIL naming the unmet precondition rather than report a pass when the container quota is not strictly less than the test host's core count, so a non-discriminating configuration records no false evidence
 <!-- /DELTA:NEW -->

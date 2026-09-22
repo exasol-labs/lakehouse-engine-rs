@@ -26,8 +26,8 @@ Unchanged by this plan, and reproduced here only because the delta validator req
 * *AND* `BENCH_PARALLELISM_FACTOR` set in the bench environment
 * *WHEN* the bench harness builds the `CREATE VIRTUAL SCHEMA` statement for the remote target
 * *THEN* the harness SHALL pass `PARALLELISM_FACTOR` as a virtual-schema property on the remote target, just as the docker target already does, taking the value from `BENCH_PARALLELISM_FACTOR` and applying the same default the docker path uses when that variable is unset, and MUST NOT emit an empty extra-properties block that drops it
-* *AND* the harness MUST NOT pass an `NR_OF_CORES` virtual-schema property on either target, and MUST NOT read a `BENCH_NR_OF_CORES` variable, because the adapter no longer reads that property; the harness's offline self-check SHALL assert the extra-properties block against that shape, so a stale `NR_OF_CORES` expectation fails the check rather than passing silently
-* *AND* the remote run SHALL therefore size its per-instance thread and connection budgets from the cluster node's own detected core count, which is a behavior change from the prior fixed override and has no remote-side equivalent lever
+* *AND* the harness MUST NOT pass an `NR_OF_CORES` virtual-schema property on either target, and MUST NOT read a `BENCH_NR_OF_CORES` variable, because the adapter resolves the per-node core count on its executing node and reads no property for it; the harness's offline self-check SHALL assert the extra-properties block against that exact shape
+* *AND* the remote run SHALL size its per-instance thread and connection budgets from the cluster node's own detected core count
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:CHANGED -->
