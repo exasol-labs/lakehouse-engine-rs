@@ -353,15 +353,9 @@ fn coerce_maps_every_exa_type_variant_to_its_arrow_target() {
     }
 }
 
-/// Scenario (`type-mapping-timestamp-precision`): a declared `TIMESTAMP(p)`
-/// resolves to the Arrow unit of THAT precision — never a fixed one, which under a
-/// `TIMESTAMP(9)` declaration destroys every nanosecond digit through the strict
-/// cast, and never the `Utf8` string path, which would stringify the value and
-/// violate the declaration.
-///
-/// The unit is read from the same owner that produces the declaration string, so
-/// the two sides cannot disagree about what `TIMESTAMP(9)` means. A precision
-/// outside `{3, 6, 9}` resolves to the coarsest unit not coarser than it.
+/// Scenario (`type-mapping-timestamp-precision`): a declared `TIMESTAMP(p)` resolves to the
+/// Arrow unit of THAT precision, never a fixed one and never the `Utf8` string path. A
+/// precision outside `{3, 6, 9}` resolves to the coarsest unit not coarser than it.
 #[test]
 fn exa_type_timestamp_maps_to_the_arrow_unit_of_its_declared_precision() {
     use arrow::datatypes::TimeUnit;
@@ -388,10 +382,8 @@ fn exa_type_timestamp_maps_to_the_arrow_unit_of_its_declared_precision() {
     }
 }
 
-/// Scenario (`scan-execution-value-conversion`): a nanosecond column declared
-/// `TIMESTAMP(9)` passes through `coerce_column` with all nine digits intact. The
-/// fixed microsecond target this replaces destroyed three of them through the
-/// strict (`safe: false`) cast, unrecorded.
+/// Scenario (`scan-execution-value-conversion`): a nanosecond column declared `TIMESTAMP(9)`
+/// passes through `coerce_column` with all nine digits intact.
 #[test]
 fn nanosecond_column_declared_timestamp_9_keeps_every_digit() {
     let instant = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -911,10 +903,8 @@ async fn emit_stream_fails_when_a_declared_column_cannot_be_read() {
     );
 }
 
-/// Scenario: a `Numeric` column whose precision or scale is outside what
-/// `Decimal128` represents fails the call naming that column — and is never
-/// substituted with `Utf8`, which would put a string into a numeric column. A
-/// valid Exasol NUMERIC declaration always carries both, within range.
+/// Scenario: a `Numeric` column outside `Decimal128`'s range fails the call naming that
+/// column, and is never substituted with `Utf8`.
 #[tokio::test]
 async fn emit_stream_fails_on_numeric_with_out_of_range_payload() {
     let cases: Vec<(&str, ExaType)> = vec![

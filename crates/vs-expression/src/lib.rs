@@ -505,10 +505,9 @@ fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfE
                 // Exasol's own parser accepts any precision 0-9 verbatim.
                 Some(p) => match dialect {
                     Dialect::Exasol => Ok(format!("TIMESTAMP({p})")),
-                    // DataFusion 54's SQL frontend parses TIMESTAMP(p) only for
-                    // p in {0,3,6,9}; decline every other precision rather than
-                    // approximate it — the adapter renders the Exasol-dialect
-                    // SQL for the declined node instead.
+                    // DataFusion 54 parses only p in {0,3,6,9}. Decline the rest
+                    // rather than approximate; the adapter renders them in the
+                    // Exasol dialect instead.
                     Dialect::DataFusion => match p {
                         0 | 3 | 6 | 9 => Ok(format!("TIMESTAMP({p})")),
                         _ => Err(UdfError::User(format!(

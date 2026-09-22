@@ -234,8 +234,6 @@ pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfEr
         ExaType::Int64 => DataType::Int64,
         ExaType::Numeric { precision, scale } => decimal_target(declared, *precision, *scale)?,
         ExaType::Date => DataType::Date32,
-        // The unit follows the declared precision, through the one table
-        // `types::mapping::TimestampPrecision` owns.
         ExaType::Timestamp { precision } => DataType::Timestamp(
             TimestampPrecision::from_declared_digits(*precision).arrow_unit(),
             None,
@@ -244,11 +242,8 @@ pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfEr
     })
 }
 
-/// The `Decimal128` a NUMERIC-binned declaration maps to.
-///
-/// A valid Exasol NUMERIC declaration always carries a precision and a scale
-/// inside `Decimal128`'s range, so a wider pair is drift and the call fails rather
-/// than falling back to a string target that would put text into a numeric column.
+/// The `Decimal128` a NUMERIC-binned declaration maps to. A pair outside
+/// `Decimal128`'s range is drift: fail rather than put text into a numeric column.
 fn decimal_target(declared: &ColumnInfo, precision: u32, scale: u32) -> Result<DataType, UdfError> {
     let representable = u8::try_from(precision)
         .ok()

@@ -429,8 +429,7 @@ fn exasol_type_to_arrow_reproduces_decimal_precision_binning() {
         ("BOOLEAN", DataType::Boolean),
         ("DOUBLE PRECISION", DataType::Float64),
         ("DATE", DataType::Date32),
-        // Exasol's bare TIMESTAMP is TIMESTAMP(3); the per-precision table this
-        // resolves through is asserted by `exasol_type_to_arrow_parses_timestamp_precision`.
+        // Exasol's bare TIMESTAMP is TIMESTAMP(3).
         (
             "TIMESTAMP",
             DataType::Timestamp(TimeUnit::Millisecond, None),
@@ -461,11 +460,8 @@ fn exasol_type_to_arrow_reproduces_decimal_precision_binning() {
     }
 }
 
-/// Scenario (type-mapping-timestamp-precision): a `TIMESTAMP(p)` EMITS string maps
-/// back to the Arrow unit of that precision, not to one fixed unit. The type string
-/// and the `ExaType::Timestamp { precision }` the emit boundary reports resolve
-/// through the same owner, so a declared `TIMESTAMP(9)` cannot mean one width where
-/// it is declared and another where it is emitted.
+/// Scenario (type-mapping-timestamp-precision): a `TIMESTAMP(p)` EMITS string maps back to
+/// the Arrow unit of that precision, not to one fixed unit.
 #[test]
 fn exasol_type_to_arrow_parses_timestamp_precision() {
     let cases = [
@@ -1241,10 +1237,8 @@ fn expected_mapping(pt: &PrimitiveType) -> (&'static str, DataType) {
     }
 }
 
-/// Scenario (type-mapping-timestamp-precision): The version rule at its single
-/// owner, and the declaration a microsecond source takes through each resolved arm.
-/// `8.29.13` and `2025.2.1` are the real Docker image tags `ctx.database_version()`
-/// reports on the two engine lines.
+/// Scenario (type-mapping-timestamp-precision): the version rule, and the declaration a
+/// microsecond source takes through each arm. The versions are real Docker image tags.
 #[test]
 fn database_version_leading_component_selects_the_declared_timestamp_precision() {
     use EngineTimestampSupport::{DeclaredPrecision, MillisecondOnly};
@@ -1269,10 +1263,8 @@ fn database_version_leading_component_selects_the_declared_timestamp_precision()
     }
 }
 
-/// Scenario (type-mapping-timestamp-precision): An empty or unparseable database
-/// version takes the SAME arm a recognised 2025.x version takes, so an unrecognised
-/// engine gets the fidelity-preserving declaration rather than the bare one.
-/// Deliberately not the conservative default.
+/// Scenario (type-mapping-timestamp-precision): an empty or unparseable version takes the
+/// same arm as 2025.x, deliberately not the conservative default.
 #[test]
 fn unreadable_database_version_declares_the_source_width_unclamped() {
     for version in ["", "v2025.2.1", "unknown", ".2.1", "8x.1.0", " "] {
@@ -1339,11 +1331,9 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
     }
 }
 
-/// Scenario (type-mapping-timestamp-precision): Each of the four Iceberg timestamp
-/// variants is declared at ITS OWN source width, on both engine arms. On the clamped
-/// arm all four take the bare declaration, a named Exasol 8.x target-type limitation.
-/// A zoned variant collapses to the plain `TIMESTAMP` family rather than `TIMESTAMP
-/// WITH LOCAL TIME ZONE`, independently of the fractional-second width.
+/// Scenario (type-mapping-timestamp-precision): each of the four Iceberg timestamp variants
+/// is declared at its OWN source width, and all four take the bare declaration on the
+/// clamped arm. A zoned variant collapses to the plain `TIMESTAMP` family.
 #[test]
 fn every_iceberg_timestamp_variant_declares_its_own_source_width() {
     let cases = [
@@ -1366,11 +1356,8 @@ fn every_iceberg_timestamp_variant_declares_its_own_source_width() {
     }
 }
 
-/// Scenario (type-mapping-timestamp-precision): a declared Exasol precision resolves
-/// to the COARSEST of the three source widths that is NOT COARSER than it, so a mapping
-/// error can only emit a value Exasol truncates, never one the scan has destroyed.
-/// `p` below 3 floors at millisecond rather than reaching Arrow's Second unit, which
-/// no emit path in this repo has ever fed the SLC.
+/// Scenario (type-mapping-timestamp-precision): a declared precision resolves to the
+/// coarsest width not coarser than it, floored at millisecond.
 #[test]
 fn declared_digits_resolve_to_the_arrow_unit_of_their_source_width() {
     let cases = [

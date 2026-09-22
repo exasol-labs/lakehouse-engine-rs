@@ -160,17 +160,13 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Result<Value, UdfError> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Whole nanoseconds in one second, the resolution `chrono::NaiveDateTime` carries.
 const NANOS_PER_SECOND: i64 = 1_000_000_000;
 
-/// The instant an Arrow timestamp cell holds, at the array's OWN unit and losing
-/// no digit it carries.
+/// The instant an Arrow timestamp cell holds, at the array's own unit.
 ///
-/// Splits the raw value into whole seconds and a sub-second remainder rather than
-/// normalizing it to one integer count: an `i64` of nanoseconds spans only
-/// 1677-2262, and an `i64` of microseconds would drop a nanosecond column's last
-/// three digits. Fails rather than substituting a value out of range, which would
-/// silently emit the wrong row.
+/// Splits into seconds plus a remainder rather than one integer count: an `i64` of
+/// nanoseconds spans only 1677-2262, and one of microseconds drops a nanosecond
+/// column's last three digits.
 fn timestamp_to_naive_datetime(
     col: &dyn Array,
     row: usize,

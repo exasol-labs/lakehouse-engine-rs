@@ -400,9 +400,8 @@ where
 
 /// [`create_and_append_files`] with table `properties` supplied at creation.
 ///
-/// The REST catalog honours a table's format version only from the `format-version` PROPERTY:
-/// `TableCreation::format_version` is a no-op against it. A seed needing an Iceberg v3 type
-/// (`timestamp_ns`, `variant`, `geometry`, ...) must therefore come through here.
+/// The REST catalog honours a format version only from the `format-version` PROPERTY:
+/// `TableCreation::format_version` is a no-op against it. Iceberg v3 types come through here.
 pub async fn create_and_append_files_with_properties<F, B>(
     catalog: &impl Catalog,
     namespace: &str,
@@ -3522,8 +3521,7 @@ fn make_complex_join_probe_batch() -> RecordBatch {
     .expect("complex_join_probe RecordBatch construction is infallible")
 }
 
-/// The Iceberg table property that fixes a table's format version, and the version that admits
-/// `timestamp_ns` (Iceberg table spec, `§ Appendix E: Format version changes`).
+/// The table property that fixes a format version, and the version admitting `timestamp_ns`.
 const ICEBERG_FORMAT_VERSION_PROPERTY: &str = "format-version";
 const ICEBERG_FORMAT_VERSION_3: &str = "3";
 
@@ -3552,12 +3550,9 @@ pub const TSPRECISION_MICROS: [i64; 4] = [
     BASE_TS_MICROS + 123_457,
 ];
 
-/// Nanoseconds since UNIX_EPOCH for the `ts_ns` column: TWO values, each on two rows, that differ
-/// ONLY below the microsecond.
-///
-/// Two distinct instants at `TIMESTAMP(9)` and ONE at every coarser declaration, so
-/// `COUNT(DISTINCT)` alone separates an engine that carries a genuine sub-microsecond digit
-/// from one that clamps it away. [`TSPRECISION_MICROS`]'s finest gap is a whole microsecond.
+/// Nanoseconds for the `ts_ns` column: TWO values, each on two rows, differing ONLY below the
+/// microsecond, so `COUNT(DISTINCT)` is 2 at `TIMESTAMP(9)` and 1 at every coarser width.
+/// [`TSPRECISION_MICROS`]'s finest gap is a whole microsecond and cannot make that distinction.
 pub const TSPRECISION_NANOS: [i64; 4] = [
     BASE_TS_MICROS * 1_000 + 1,
     BASE_TS_MICROS * 1_000 + 2,

@@ -19,10 +19,8 @@ pub struct ExpectedTimestampPrecision {
     /// the millisecond arm, never bare `TIMESTAMP` — `SYS.EXA_ALL_COLUMNS` never reports a bare
     /// `TIMESTAMP` on either supported engine (decision-log.md `[C1]`).
     ///
-    /// Usable as a `CAST(... AS {declared_column_type})` target only within `p in {3, 6}`: Exasol
-    /// 8.29.13 rejects every other parameterized precision as `0A000 Feature not supported`
-    /// (decision-log.md `[C3]`). A caller casting to an arm's declared type must therefore select
-    /// the arm through [`engine_honors_declared_precision`].
+    /// Usable as a CAST target only within `p in {3, 6}` (`[C3]`), so a caller casting to it
+    /// must select the arm through [`engine_honors_declared_precision`].
     pub declared_column_type: &'static str,
     /// The number of distinct values `COUNT(DISTINCT)` reports over the seeded
     /// `.000001/.000002/.123456/.123457` fixture at this arm's precision.
@@ -44,9 +42,8 @@ impl ExpectedTimestampPrecision {
         distinct_count: 2,
         retained_fractional_digits: 3,
     };
-    /// The arm an Iceberg `timestamp_ns` column reaches on an engine that emits nine digits. Its
-    /// `distinct_count` still describes the MICROSECOND-seeded four-value fixture, where a ninth
-    /// digit adds no distinction; a genuinely sub-microsecond fixture has its own counts.
+    /// The arm an Iceberg `timestamp_ns` column reaches on an engine that emits nine digits.
+    /// `distinct_count` still describes the microsecond-seeded fixture.
     pub const NANOSECOND: Self = Self {
         declared_column_type: "TIMESTAMP(9)",
         distinct_count: 4,
@@ -68,15 +65,11 @@ pub fn live_engine_version(conn: &mut ExaConn) -> String {
         .to_string()
 }
 
-/// Parse a version string's leading dot-separated component as an integer, this oracle's own
-/// parse shared by every rule below.
 fn leading_version_component(version: &str) -> Option<u32> {
     version.split('.').next().and_then(|s| s.parse().ok())
 }
 
-/// Map a version string to its expected precision arm with this oracle's own logic — parse the
-/// leading dot-separated component, gate on `>= 2025`, same shape as the production rule but a
-/// separate implementation of it.
+/// This oracle's own `>= 2025` gate: the same shape as the production rule, separately written.
 pub fn expected_timestamp_precision_for(version: &str) -> ExpectedTimestampPrecision {
     match leading_version_component(version) {
         Some(year) if year < 2025 => ExpectedTimestampPrecision::MILLISECOND,
@@ -89,12 +82,8 @@ pub fn expected_timestamp_precision(conn: &mut ExaConn) -> ExpectedTimestampPrec
     expected_timestamp_precision_for(&live_engine_version(conn))
 }
 
-/// True when the live engine's leading version component parses as an integer `>= 2025`, or does
-/// not parse at all.
-///
-/// Both recorded engine differences turn on this one boundary: `[C3]`'s CAST-target domain
-/// (8.29.13 rejects `TIMESTAMP(p)` outside `{3, 6}` as `0A000 Feature not supported`) and
-/// `[C2]`'s pushdown echo (8.29.13 omits `fractionalSecondsPrecision`). Each caller names which.
+/// True on `>= 2025` or an unparseable version. Both recorded engine differences turn on this
+/// boundary: `[C3]`'s CAST-target domain and `[C2]`'s pushdown echo. Each caller names which.
 pub fn engine_honors_declared_precision(conn: &mut ExaConn) -> bool {
     let version = live_engine_version(conn);
     leading_version_component(&version).is_none_or(|year| year >= 2025)

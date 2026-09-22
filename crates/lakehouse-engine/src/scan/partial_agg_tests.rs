@@ -884,11 +884,9 @@ fn partial_cells_conform_to_declared_output_columns() {
     );
 }
 
-/// Scenario (`scan-execution-partial-agg`): a `MIN`/`MAX` cell over a nanosecond
-/// timestamp column declared `TIMESTAMP(9)` reaches its `Value::Timestamp` with all
-/// nine fractional digits. This path is a SECOND truncation site, independent of
-/// the Arrow `emit_batch` one, and `validate_agg_col_types` admits `MIN`/`MAX` over
-/// any comparable type, so a nanosecond timestamp is pushed into it.
+/// Scenario (`scan-execution-partial-agg`): a `MIN`/`MAX` cell over a `TIMESTAMP(9)` column
+/// reaches its `Value::Timestamp` with all nine digits. A second conversion site,
+/// independent of the Arrow `emit_batch` one.
 #[test]
 fn partial_agg_minmax_over_a_nanosecond_timestamp_keeps_every_digit() {
     use arrow::array::TimestampNanosecondArray;
@@ -939,9 +937,8 @@ fn partial_agg_minmax_over_a_nanosecond_timestamp_keeps_every_digit() {
     );
 }
 
-/// Scenario: a partial-aggregate column declared `Numeric` with an out-of-range
-/// precision or scale fails the call naming that column, matching the Arrow
-/// `emit_batch` path — neither substitutes `Utf8`.
+/// Scenario: a partial-aggregate `Numeric` column out of range fails the call naming it,
+/// matching the Arrow `emit_batch` path.
 #[test]
 fn partial_agg_fails_on_numeric_with_out_of_range_payload() {
     let drifted = vec![

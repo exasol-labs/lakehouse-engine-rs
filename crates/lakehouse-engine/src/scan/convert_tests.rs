@@ -280,10 +280,8 @@ fn tz_aware_timestamp_converts_to_utc_instant_value() {
     assert_eq!(rows[0][0], Value::Timestamp(expected));
 }
 
-/// Scenario (scan-execution-partial-agg): a `Timestamp(Nanosecond, _)` cell — what
-/// an Iceberg `timestamp_ns` column reaches this boundary as once the declared
-/// `TIMESTAMP(9)` drives the coercion target — keeps all NINE fractional digits.
-/// Dividing by 1,000 here would destroy the three the coercion just preserved.
+/// Scenario (scan-execution-partial-agg): a `Timestamp(Nanosecond, _)` cell keeps all
+/// nine fractional digits.
 #[test]
 fn nanosecond_timestamp_keeps_every_fractional_digit() {
     let instant = NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -297,9 +295,8 @@ fn nanosecond_timestamp_keeps_every_fractional_digit() {
     assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
 }
 
-/// Scenario (scan-execution-partial-agg): a pre-epoch nanosecond cell keeps its
-/// sub-second digits, so the seconds/remainder split floors rather than truncating
-/// toward zero.
+/// Scenario (scan-execution-partial-agg): a pre-epoch cell keeps its sub-second digits,
+/// so the seconds/remainder split floors rather than truncating toward zero.
 #[test]
 fn pre_epoch_nanosecond_timestamp_keeps_every_fractional_digit() {
     let instant = NaiveDate::from_ymd_opt(1969, 12, 31)
@@ -313,10 +310,8 @@ fn pre_epoch_nanosecond_timestamp_keeps_every_fractional_digit() {
     assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
 }
 
-/// Scenario (scan-execution-partial-agg): an instant outside the range an `i64`
-/// count of NANOSECONDS represents (1677-2262) still converts, because the
-/// conversion splits whole seconds from a sub-second remainder rather than
-/// normalizing the instant to one nanosecond count.
+/// Scenario (scan-execution-partial-agg): an instant outside an `i64` nanosecond count's
+/// 1677-2262 range still converts, because the split avoids that normalization.
 #[test]
 fn timestamp_outside_the_nanosecond_epoch_range_still_converts() {
     let instant = NaiveDate::from_ymd_opt(1500, 3, 17)
@@ -332,9 +327,8 @@ fn timestamp_outside_the_nanosecond_epoch_range_still_converts() {
     assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
 }
 
-/// Scenario: an instant outside the range `chrono::NaiveDateTime` can represent — reachable from
-/// a `TimestampSecondArray` cell at `i64::MAX` seconds — fails the conversion with an error naming
-/// the column's Arrow unit, rather than silently substituting the UNIX epoch.
+/// Scenario: an instant `chrono::NaiveDateTime` cannot represent fails with an error naming
+/// the Arrow unit, rather than silently substituting the epoch.
 #[test]
 fn timestamp_outside_the_representable_range_fails_the_conversion() {
     let arr = TimestampSecondArray::from(vec![Some(i64::MAX)]);

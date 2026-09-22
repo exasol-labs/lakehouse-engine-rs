@@ -2021,9 +2021,7 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
 // Declined TIMESTAMP(p) CAST target routing (issue #405)
 // ---------------------------------------------------------------------------
 
-/// A single-item select list projecting `CAST(NAME AS TIMESTAMP(p))`, with the
-/// declared result type at its own `selectListDataTypes` ordinal — the wire shape
-/// Exasol sends for `SELECT CAST(name AS TIMESTAMP(p)) FROM …`.
+/// The wire shape Exasol sends for `SELECT CAST(name AS TIMESTAMP(p)) FROM …`.
 fn timestamp_cast_select_request(precision: u64) -> Json {
     serde_json::json!({
         "selectList": [{
@@ -2038,11 +2036,9 @@ fn timestamp_cast_select_request(precision: u64) -> Json {
     })
 }
 
-/// Scenario (sql-comprehension/vs-expression-translator-cast): a projected
-/// `CAST(x AS TIMESTAMP(2))` names a precision DataFusion cannot parse, so the
-/// renderer declines it and the request routes to the qualified single-table
-/// wrapper, which computes the CAST in Exasol's own dialect. The scan never sees
-/// `TIMESTAMP(2)` in its `EMITS` clause, which is what makes the decline safe.
+/// Scenario (sql-comprehension/vs-expression-translator-cast): DataFusion cannot parse
+/// `TIMESTAMP(2)`, so the renderer declines and the request routes to the qualified
+/// single-table wrapper. The scan never sees `TIMESTAMP(2)` in its `EMITS` clause.
 #[test]
 fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(2));
@@ -2065,10 +2061,8 @@ fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     );
 }
 
-/// CONTROL for the decline above: `TIMESTAMP(6)` is one of the four precisions
-/// DataFusion parses, so the SAME shape renders per-item and stays on the
-/// ordinary scan path. Without this, the decline test would pass just as well
-/// against a renderer that declined EVERY `TIMESTAMP(p)` CAST.
+/// Control for the decline above: `TIMESTAMP(6)` is one of the four precisions DataFusion
+/// parses, so the same shape stays on the scan path.
 #[test]
 fn accepted_timestamp_precision_cast_takes_scan_path() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(6));
