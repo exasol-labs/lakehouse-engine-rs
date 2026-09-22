@@ -25,36 +25,31 @@ pub(in crate::scan) fn declared(types: &[(&str, ExaType)]) -> Vec<ColumnInfo> {
 
 /// `VARCHAR(2000000)` as the database reports it.
 pub(in crate::scan) fn varchar() -> ExaType {
-    ExaType::String {
-        size: Some(2_000_000),
-    }
+    ExaType::String { size: 2_000_000 }
 }
 
 /// A `DECIMAL(precision, scale)` the database binned to NUMERIC.
 pub(in crate::scan) fn numeric(precision: u32, scale: u32) -> ExaType {
-    ExaType::Numeric {
-        precision: Some(precision),
-        scale: Some(scale),
-    }
+    ExaType::Numeric { precision, scale }
 }
 
 fn declared_size(typ: &ExaType) -> Option<u32> {
     match typ {
-        ExaType::String { size } | ExaType::Char { size } => *size,
+        ExaType::String { size } | ExaType::Char { size } => Some(*size),
         _ => None,
     }
 }
 
 fn declared_precision(typ: &ExaType) -> Option<u32> {
     match typ {
-        ExaType::Numeric { precision, .. } => *precision,
+        ExaType::Numeric { precision, .. } => Some(*precision),
         _ => None,
     }
 }
 
 fn declared_scale(typ: &ExaType) -> Option<u32> {
     match typ {
-        ExaType::Numeric { scale, .. } => *scale,
+        ExaType::Numeric { scale, .. } => Some(*scale),
         _ => None,
     }
 }

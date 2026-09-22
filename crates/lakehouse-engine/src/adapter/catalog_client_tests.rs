@@ -16,7 +16,7 @@ fn catalog_kind_is_matched_only_at_the_construction_site() {
     let _pipeline: fn(
         &[String],
         &CatalogListing,
-        TimestampPrecision,
+        EngineTimestampSupport,
     ) -> Result<VirtualTables, UdfError> = build_listing_virtual_tables;
     let _constructor: fn(
         CatalogKind,
@@ -75,13 +75,13 @@ fn both_kinds_share_one_listing_pipeline() {
     let (ib_tables, ib_map, _) = build_listing_virtual_tables(
         &configured_ns,
         &iceberg_listing,
-        TimestampPrecision::Millisecond,
+        EngineTimestampSupport::MillisecondOnly,
     )
     .unwrap();
     let (uc_tables, uc_map, _) = build_listing_virtual_tables(
         &configured_ns,
         &unity_listing,
-        TimestampPrecision::Millisecond,
+        EngineTimestampSupport::MillisecondOnly,
     )
     .unwrap();
 
@@ -150,19 +150,19 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
 
     let cases = [
         (
-            TimestampPrecision::Microsecond,
+            EngineTimestampSupport::DeclaredPrecision,
             json!({"type": "timestamp", "fractionalSecondsPrecision": 6}),
         ),
         (
-            TimestampPrecision::Millisecond,
+            EngineTimestampSupport::MillisecondOnly,
             json!({"type": "timestamp"}),
         ),
     ];
-    for (precision, expected) in cases {
+    for (engine, expected) in cases {
         let (tables, _, _) =
-            build_listing_virtual_tables(&configured_ns, &listing, precision).unwrap();
+            build_listing_virtual_tables(&configured_ns, &listing, engine).unwrap();
         let columns = tables[0]["columns"].as_array().unwrap();
-        assert_eq!(columns[0]["dataType"], expected, "iceberg at {precision:?}");
-        assert_eq!(columns[1]["dataType"], expected, "delta at {precision:?}");
+        assert_eq!(columns[0]["dataType"], expected, "iceberg on {engine:?}");
+        assert_eq!(columns[1]["dataType"], expected, "delta on {engine:?}");
     }
 }
