@@ -29,7 +29,7 @@ pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
 pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{CatalogSession, load_table_any_auth};
-pub use storage::{AdlsCred, StaticStoreAddress, StorageBackend};
+pub use storage::{AdlsCred, StaticStoreAddress, StorageBackend, scheme_of};
 
 pub use vended::resolve_vended_storage;
 

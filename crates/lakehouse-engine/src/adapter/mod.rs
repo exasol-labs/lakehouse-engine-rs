@@ -248,12 +248,7 @@ fn handle_create_virtual_schema(
     // single `CATALOG_KIND` parse, reused below for `construct_catalog_client`.
     let config = resolve_connection_config(ctx, &props)?;
 
-    // `NAMESPACE` is required for a catalog kind (it selects a catalog namespace the adapter
-    // cannot guess) but OPTIONAL under direct storage, whose CONNECTION address alone already
-    // denotes a complete storage subtree; `vs-adapter/direct-storage-properties` owns the
-    // direct-storage reading of `NAMESPACE`, reached below through `construct_catalog_client`.
-    // A direct-storage table's identifier always carries an empty namespace, so `configured_ns`
-    // is unused for that kind.
+    // `NAMESPACE` is optional under direct storage: its CONNECTION address alone already denotes a complete storage subtree.
     let configured_ns: Vec<String> = match config.catalog_kind {
         CatalogKind::DirectStorage => Vec::new(),
         _ => {
@@ -588,13 +583,7 @@ type VirtualTables = (Vec<Json>, Vec<(String, String)>, Vec<SkippedTable>);
 /// listing operation after it runs one shared pipeline that never re-matches the
 /// kind — a fourth kind is a build failure here, not a silently-missed branch.
 ///
-/// `props` carries the raw `createVirtualSchema` properties so the direct-storage
-/// arm alone can resolve `NAMESPACE`, `MERGE_SCHEMA`, and `HIVE_PARTITIONING`
-/// through `direct_storage_properties::resolve_direct_storage_properties` — the
-/// ONE owner of that kind's property reading, called here so it stays the one
-/// site the base path and merge mode are derived at, per
-/// `vs-adapter/direct-storage-table-discovery`. Fallible because opening the
-/// direct-storage admission-limited object store can fail.
+/// `props` lets the direct-storage arm alone resolve `NAMESPACE`, `MERGE_SCHEMA`, and `HIVE_PARTITIONING`; fallible because opening the object store can fail.
 fn construct_catalog_client(
     kind: CatalogKind,
     catalog_uri: String,

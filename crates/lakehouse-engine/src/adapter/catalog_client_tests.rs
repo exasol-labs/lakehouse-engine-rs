@@ -1,7 +1,5 @@
 use super::*;
 
-/// The construction site's pinned shape, named so the pin reads as one type
-/// rather than an inline five-parameter function pointer.
 type CatalogClientConstruction = fn(
     CatalogKind,
     String,

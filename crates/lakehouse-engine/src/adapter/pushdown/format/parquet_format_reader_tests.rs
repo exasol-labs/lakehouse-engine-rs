@@ -7,12 +7,10 @@ use object_store::memory::InMemory;
 use object_store::{ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 
-/// The CONNECTION address plus the namespace property, joined by the resolver: the
-/// bucket is the store's own scope, so everything below it is a store-relative key.
+/// The CONNECTION address plus the namespace property, joined by the resolver.
 const TABLE_ROOT: &str = "s3://warehouse/direct/events";
 
-/// A Parquet file declaring `fields` and holding one row of nulls, so the footer
-/// carries the declaration without needing a value per Arrow type.
+/// One row of nulls is enough for the footer to declare `fields` without needing a value per Arrow type.
 fn parquet_bytes(fields: Vec<Field>) -> Vec<u8> {
     let schema = Arc::new(ArrowSchema::new(fields));
     let columns: Vec<arrow::array::ArrayRef> = schema
@@ -45,7 +43,6 @@ async fn store_holding(objects: Vec<(&str, Vec<u8>)>) -> Arc<dyn ObjectStore> {
     Arc::new(store)
 }
 
-/// Resolve `TABLE_ROOT` through the reader the third scan source selects.
 async fn resolve(
     store: &Arc<dyn ObjectStore>,
     merge_mode: MergeMode,
@@ -75,9 +72,7 @@ fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
     scan.files.iter().map(|file| file.path.as_str()).collect()
 }
 
-/// Two data files at two depths, declaring different column sets, plus two objects
-/// the listing must never reach: one under a hidden segment, one in a sibling table's
-/// directory.
+/// Two data files at different depths/schemas, plus two objects the listing must skip (a hidden segment, a sibling table's directory).
 async fn two_depth_directory() -> Arc<dyn ObjectStore> {
     store_holding(vec![
         (
@@ -106,14 +101,6 @@ async fn two_depth_directory() -> Arc<dyn ObjectStore> {
     .await
 }
 
-/// Scenario: A direct-storage table resolves its files and schema through the shared
-/// seam.
-///
-/// Every field of the resolved scan is pinned at once, because the scenario states
-/// them as one shape: the file entries carry a path and a LISTED size with no delete
-/// mechanism and no partition value, every logical field binds by IDENTITY, the
-/// partition columns and the name mapping are empty, the storage is the CONNECTION's
-/// own, the table root is the composed directory root, and no column is refused.
 #[tokio::test]
 async fn resolved_scan_carries_identity_bound_fields_and_no_deletes() {
     let store = two_depth_directory().await;
@@ -187,13 +174,7 @@ async fn resolved_scan_carries_identity_bound_fields_and_no_deletes() {
     );
 }
 
-/// Scenario: Every plan-time footer is read and the resulting cost is stated.
-///
-/// The merge mode narrows which FOOTERS are read, never which FILES are scanned, and
-/// a filter narrows neither: this kind has no manifest and no catalog statistics to
-/// prune from. Sampling one footer is what makes the read set observable — the second
-/// file's own column is absent from the declaration exactly when its footer went
-/// unread.
+// merge_mode narrows which footers are read, never which files are scanned or filtered.
 #[tokio::test]
 async fn plan_reads_selected_footers_and_lists_every_file() {
     let store = two_depth_directory().await;
@@ -236,13 +217,6 @@ async fn plan_reads_selected_footers_and_lists_every_file() {
     );
 }
 
-/// Scenario: A nested or unrepresentable Parquet type folds to the JSON string
-/// declaration.
-///
-/// The planning half: a struct, list, or map column is declared with the string
-/// Arrow tag AND carries the nested member descriptor the JSON renderer is selected
-/// by. Without the descriptor such a column would reach the cast path, where no
-/// string kernel exists. Every member binds by identity, matching the top level.
 #[tokio::test]
 async fn a_nested_column_declares_the_string_tag_and_an_identity_bound_descriptor() {
     let inner = Fields::from(vec![
@@ -297,11 +271,7 @@ async fn a_nested_column_declares_the_string_tag_and_an_identity_bound_descripto
     );
 }
 
-/// Scenario: A direct-storage table resolves its files and schema through the shared
-/// seam.
-///
-/// A prefix holding no data file resolves an empty scan rather than an error: whether
-/// that directory is a table at all was decided at create time, not here.
+// An empty prefix resolves an empty scan, not an error — whether it's a table was decided at create time.
 #[tokio::test]
 async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
     let store = store_holding(vec![(
@@ -317,13 +287,7 @@ async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
     assert_eq!(scan.table_root, TABLE_ROOT);
 }
 
-/// Scenario: A timezone-aware column plans at the same normalized tag the enumeration path
-/// declares it at.
-///
-/// The tag vocabulary renders every tz-aware timestamp as `timestamptz_*`, discarding which
-/// timezone the file declared. Both paths must therefore answer `timestamptz_us` for the same
-/// footer: an enumeration that refused this column while planning accepted it would fail
-/// `CREATE VIRTUAL SCHEMA` over a directory every query could otherwise read.
+// Planning must render the same normalized timestamptz_* tag as enumeration, or CREATE VIRTUAL SCHEMA could accept a column that planning then refuses.
 #[tokio::test]
 async fn a_non_utc_timezone_column_plans_at_its_normalized_tag() {
     let store = store_holding(vec![(

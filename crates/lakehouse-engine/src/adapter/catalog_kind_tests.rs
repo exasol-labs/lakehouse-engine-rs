@@ -29,8 +29,6 @@ fn unity_catalog_value_resolves_native_kind() {
     }
 }
 
-/// Scenario: CATALOG_KIND naming direct storage resolves the direct-storage
-/// kind, compared case-insensitively.
 #[test]
 fn direct_storage_value_resolves_direct_storage_kind() {
     for value in ["DIRECT_STORAGE", "direct_storage", "Direct_Storage"] {
@@ -47,9 +45,6 @@ fn direct_storage_value_resolves_direct_storage_kind() {
     }
 }
 
-/// Scenario: An unrecognized CATALOG_KIND value is rejected with a clear error
-/// naming the offending value and all three accepted spellings, and never
-/// silently falls back to a default.
 #[test]
 fn unrecognized_catalog_kind_is_rejected() {
     let props = json!({ "CATALOG_KIND": "SNOWFLAKE" });

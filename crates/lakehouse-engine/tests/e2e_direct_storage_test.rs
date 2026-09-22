@@ -1,17 +1,7 @@
-//! End-to-end coverage for the direct-storage catalog kind
-//! (`e2e-harness/direct-storage-e2e`, `e2e-harness/direct-storage-e2e-properties`):
-//! a plain directory of Parquet files on MinIO, queried through the Virtual
-//! Schema under `CATALOG_KIND = 'DIRECT_STORAGE'`, with no catalog service
-//! involved anywhere in the fixture set.
-//!
-//! Every fixture is written by `common::raw_parquet::write_parquet_fixture`
-//! directly into MinIO — no catalog table, no snapshot, no Iceberg field-id
-//! metadata. `setup()` writes every fixture and provisions every Virtual
-//! Schema this binary reads, once, behind one `OnceLock`.
-//!
-//! Per project rules this suite FAILS (never skips) when the stack is
-//! unreachable: `setup()` calls `wait_for_exasol`/`wait_for_minio`, which
-//! panic rather than return `Err` on an unreachable dependency.
+//! End-to-end coverage for `CATALOG_KIND = 'DIRECT_STORAGE'`: a plain directory of
+//! Parquet files on MinIO, queried through the Virtual Schema with no catalog service
+//! involved. Per project rules this suite FAILS (never skips) when the stack is
+//! unreachable.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -64,9 +54,8 @@ const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
 const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
 
-/// `CatalogConnectionPassword` for a direct-storage CONNECTION over the local
-/// stack: static S3 credentials, no `warehouse` (the direct-storage kind
-/// rejects that field — it reaches no catalog service).
+/// `CatalogConnectionPassword` for a direct-storage CONNECTION: static S3 creds,
+/// no `warehouse` (the direct-storage kind rejects that field).
 fn direct_storage_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         endpoint: minio_url_internal(),
@@ -233,9 +222,8 @@ fn widened_narrow_file() -> RecordBatch {
     .expect("widened narrow-file batch construction is infallible")
 }
 
-/// `QTY` carries a value outside the `i32` range (`5_000_000_000`), which
-/// only errors under a narrow (`MERGE_SCHEMA = 'FALSE'`) declared width — the
-/// wide/default-merge declaration reads it back unchanged.
+/// `QTY` (`5_000_000_000`) exceeds `i32` — errors only under a narrow
+/// (`MERGE_SCHEMA = 'FALSE'`) width; the wide/default-merge declaration reads it unchanged.
 fn widened_wide_file() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("ID", DataType::Int64, false),
@@ -406,9 +394,8 @@ fn complex_batch() -> RecordBatch {
     .expect("complex batch construction is infallible")
 }
 
-/// PUT arbitrary bytes at `uri` through the shared local-stack S3 backend —
-/// used only for the Delta transaction-log JSON files, which are not Parquet
-/// and so fall outside `raw_parquet::write_parquet_fixture`'s contract.
+/// PUTs raw bytes at `uri` — for Delta transaction-log JSON, which isn't Parquet
+/// and so falls outside `write_parquet_fixture`'s contract.
 fn put_raw_bytes(uri: &str, bytes: Vec<u8>) {
     let without_scheme = uri.strip_prefix("s3://").expect("uri must be s3://...");
     let (bucket, key) = without_scheme
@@ -521,8 +508,7 @@ fn write_all_fixtures() {
     // delta_caveat/ — a Delta table directory read as raw Parquet.
     write_delta_caveat_fixture();
 
-    // Loose file and an empty-of-data-files directory under the base path:
-    // neither becomes a table.
+    // Loose file and empty-of-data-files directory under the base path: neither becomes a table.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}loose.parquet"),
         discovery_id_batch(999),
@@ -532,8 +518,8 @@ fn write_all_fixtures() {
         discovery_id_batch(0),
     );
 
-    // direct_incompatible/incompatible/ — an isolated root: this pair fails
-    // enumeration, so it must not share a base path with any passing scenario.
+    // direct_incompatible/incompatible/ — isolated root: this pair fails enumeration,
+    // must not share a base path with any passing scenario.
     write_parquet_fixture(
         &format!("{BASE_INCOMPATIBLE}incompatible/file1.parquet"),
         incompatible_file1(),
@@ -585,10 +571,9 @@ fn declared_type(conn: &mut ExaConn, vs_name: &str, table: &str, column: &str) -
     ty.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Assert `column` is declared with an Exasol type in `expected`'s family,
-/// tolerant of Exasol's `COLUMN_TYPE` rendering (whitespace, a `VARCHAR ... UTF8`
-/// charset suffix, the `DOUBLE PRECISION` -> `DOUBLE` alias, the precision Exasol
-/// substitutes into a bare `TIMESTAMP`) by matching on the space-stripped prefix.
+/// Asserts `column`'s declared type starts with `expected`, tolerant of Exasol's
+/// `COLUMN_TYPE` rendering quirks (whitespace, charset suffix, `DOUBLE PRECISION`
+/// -> `DOUBLE`, substituted `TIMESTAMP` precision).
 fn assert_declared_type(
     conn: &mut ExaConn,
     vs_name: &str,
@@ -612,13 +597,11 @@ fn served_tables(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
 }
 
 // ---------------------------------------------------------------------------
-// Task 6.1 — fixture-shape guard.
+// Fixture-shape guard
 // ---------------------------------------------------------------------------
 
-/// Reads `events/file1.parquet`'s own footer back from MinIO (bypassing
-/// Exasol) and asserts its physical Parquet encoding matches what was
-/// written, so a silently normalized fixture would fail here rather than
-/// letting a later read test pass vacuously.
+/// Reads the fixture's own Parquet footer back from MinIO (bypassing Exasol) to
+/// catch a silently normalized fixture before it lets a later read test pass vacuously.
 #[test]
 fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
     setup();
@@ -671,8 +654,8 @@ fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 6.3 — mixed-type directory, widening, missing column, incompatible
-// pair, MERGE_SCHEMA=FALSE, Delta-directory caveat.
+// Mixed-type directory, widening, missing column, incompatible pair,
+// MERGE_SCHEMA=FALSE, Delta-directory caveat
 // ---------------------------------------------------------------------------
 
 /// `events/` declares the Arrow-to-Exasol mapping for every carried type and
@@ -714,9 +697,8 @@ fn events_directory_declares_and_returns_mixed_types_across_both_files() {
     assert_eq!(parse_int(&non_null_count[0][0]), 5);
 }
 
-/// `nested/A/` and `nested/B/` union into one `NESTED` table with zero
-/// partition columns — an unlimited-depth plain directory contributes files,
-/// not columns.
+/// `nested/A/` and `nested/B/` union into one `NESTED` table with zero partition
+/// columns — an unlimited-depth directory contributes files, not columns.
 #[test]
 fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
     setup();
@@ -807,9 +789,8 @@ fn loose_file_and_empty_directory_serve_no_table() {
     assert!(tables.contains(&"EVENTS".to_string()));
 }
 
-/// `widened/`'s two columns declare the WIDER type folded across both files
-/// and every row reads back unchanged — the narrow file's values widened,
-/// the wide file's out-of-range value read as-is.
+/// `widened/`'s columns declare the WIDER type folded across both files; every row
+/// reads back unchanged — the narrow file's values widened, the wide file's as-is.
 #[test]
 fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
     setup();
@@ -858,9 +839,9 @@ fn missing_column_declares_the_union_and_nulls_the_absent_column() {
     assert_eq!(parse_int(&cols[0][2]), 3);
 }
 
-/// A column pair no supported widening covers fails `CREATE VIRTUAL SCHEMA`
-/// naming the column and both files, over the ISOLATED
-/// `direct_incompatible/` root so no passing scenario shares its enumeration.
+/// A column pair no supported widening covers fails `CREATE VIRTUAL SCHEMA`, naming
+/// the column and both files; uses the isolated `direct_incompatible/` root so no
+/// passing scenario shares its enumeration.
 #[test]
 fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     setup();
@@ -907,9 +888,9 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     );
 }
 
-/// Under `MERGE_SCHEMA = 'FALSE'`, `WIDENED.QTY` declares the NARROW type
-/// sampled from the first-listed file, and a query that never touches the
-/// out-of-range column returns every row of both files unchanged.
+/// Under `MERGE_SCHEMA = 'FALSE'`, `WIDENED.QTY` declares the NARROW type sampled
+/// from the first-listed file; a query never touching the out-of-range column
+/// still returns every row of both files.
 #[test]
 fn merge_schema_false_declares_the_narrow_sampled_type_and_reads_the_fitting_projection() {
     setup();
@@ -936,10 +917,9 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_reads_the_fitting_pro
     }
 }
 
-/// A row of the wide file whose `QTY` value does not fit the narrow declared
-/// type surfaces a clean error rather than a silently wrong or NULL value —
-/// the STALE (narrow) declaration decides the emitted width, proving the
-/// mode reached the scan plan and not only the refresh/declaration path.
+/// A wide-file `QTY` value that doesn't fit the narrow declared type surfaces a
+/// clean error, not a silently wrong/NULL value — proving the stale (narrow)
+/// declaration reaches the scan plan, not just the refresh path.
 #[test]
 fn stale_declaration_decides_the_emitted_width() {
     setup();
@@ -956,9 +936,8 @@ fn stale_declaration_decides_the_emitted_width() {
     );
 }
 
-/// A Delta table directory read as raw Parquet returns every file's rows,
-/// including the tombstoned one its transaction log removes — a deliberate,
-/// documented consequence of `CATALOG_KIND = 'DIRECT_STORAGE'`, not a defect.
+/// A Delta table directory read as raw Parquet returns every file's rows, including
+/// the tombstoned one its transaction log removes — deliberate, not a defect.
 #[test]
 fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
     setup();
@@ -978,7 +957,7 @@ fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
 }
 
 // ---------------------------------------------------------------------------
-// Task 6.4 — discovery, NAMESPACE, CONNECTION rejection, pushdown parity.
+// Discovery, NAMESPACE, CONNECTION rejection, pushdown parity
 // ---------------------------------------------------------------------------
 
 /// Only first-level directories holding a data file become tables; `NAMESPACE`
@@ -1027,9 +1006,8 @@ fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtre
     );
 }
 
-/// A CONNECTION the direct-storage kind cannot accept is rejected at `CREATE
-/// VIRTUAL SCHEMA`, not at query time, naming the offending field or scheme —
-/// and never a credential value.
+/// A CONNECTION the direct-storage kind cannot accept is rejected at `CREATE VIRTUAL
+/// SCHEMA`, naming the offending field or scheme and never a credential value.
 #[test]
 fn malformed_connections_are_rejected_at_create_virtual_schema() {
     setup();
@@ -1160,9 +1138,8 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     );
 }
 
-/// Projection, filter, and `LIMIT` reach the direct-storage scan spec: the
-/// returned rows match, and the pushed scan spec carries the projected
-/// columns, the predicate, and the limit.
+/// Projection, filter, and `LIMIT` reach the scan spec: returned rows match, and the
+/// pushed spec carries the projected columns, the predicate, and the limit.
 #[test]
 fn projection_filter_and_limit_reach_the_scan() {
     setup();
@@ -1237,9 +1214,9 @@ fn group_by_aggregate_matches_the_unpushed_answer() {
     }
 }
 
-/// An INNER equi-join between `EVENTS` and `EVENT_LABELS` on `EVENT_ID`
-/// returns exactly the rows the equivalent unpushed join returns, and
-/// `EXPLAIN VIRTUAL` carries ONE pushdown request naming both tables.
+/// An INNER equi-join between `EVENTS` and `EVENT_LABELS` on `EVENT_ID` returns
+/// exactly the unpushed join's rows, and `EXPLAIN VIRTUAL` carries ONE pushdown
+/// request naming both tables.
 #[test]
 fn two_table_join_matches_the_unpushed_answer_in_one_request() {
     setup();

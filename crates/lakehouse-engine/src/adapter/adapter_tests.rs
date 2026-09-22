@@ -217,11 +217,7 @@ fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
     );
 }
 
-/// `NAMESPACE` stays required for a catalog kind (Iceberg REST here), with the
-/// same error as before, but is OPTIONAL under `DIRECT_STORAGE`: an absent
-/// `NAMESPACE` there must not trip the required-property error, and the request
-/// must instead fail (if at all) deeper in — on the unreachable fixed local port
-/// the direct-storage credentials point the object-store client at.
+/// `NAMESPACE` stays required for a catalog kind but is optional under `DIRECT_STORAGE`.
 #[test]
 fn namespace_is_required_for_catalog_kinds_only() {
     let catalog_req = serde_json::json!({
@@ -1563,11 +1559,7 @@ fn pushdown_known_involved_table_resolves_identifier() {
     );
 }
 
-/// A direct-storage identifier carries an EMPTY namespace, so the shared
-/// flatten helper produces the bare uppercased directory name and `TABLE_MAP`
-/// records it against the ORIGINAL-CASED directory name alone (no dots, since a
-/// direct-storage table carries no namespace to join). The recorded identifier
-/// round-trips through `resolve_pushdown_identifier` unchanged.
+/// A direct-storage identifier carries an empty namespace, so `TABLE_MAP` records the bare directory name with no dots.
 #[test]
 fn table_map_records_the_bare_directory_name_and_round_trips() {
     let idents = vec![

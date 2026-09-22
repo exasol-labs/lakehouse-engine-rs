@@ -1138,16 +1138,7 @@ async fn sized_store_serves_head_from_index_and_delegates_otherwise() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// build_admission_limited_store — the one admission-limited object store a
-// direct-storage adapter call builds
-// ---------------------------------------------------------------------------
-
-/// The returned store is wrapped in [`LimitStore`] capped at
-/// [`DIRECT_STORAGE_ADMISSION_LIMIT`], observable through `LimitStore`'s own
-/// `Display` impl (`LimitStore(<max_requests>, <inner>)`), and is NOT further
-/// wrapped in [`SpecSizedObjectStore`] — a direct-storage call has no
-/// pre-resolved file-size index to build one from.
+/// Not wrapped in `SpecSizedObjectStore` — a direct-storage call has no pre-resolved file-size index to build one from.
 #[test]
 fn build_admission_limited_store_wraps_the_s3_backend_in_a_limit_store() {
     let backend = s3_backend("http://s3.example.com", "secret");

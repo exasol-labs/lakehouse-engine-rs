@@ -2,11 +2,6 @@ use super::*;
 use crate::adapter::parquet_directory::MergeMode;
 use serde_json::json;
 
-// ---------------------------------------------------------------------------
-// Scenario: NAMESPACE is optional under direct storage and scopes the table
-// subtree
-// ---------------------------------------------------------------------------
-
 #[test]
 fn absent_namespace_resolves_base_path_to_the_connection_address_alone() {
     let props = json!({});
@@ -52,11 +47,6 @@ fn namespace_is_treated_as_slash_delimited_and_never_split_on_dot() {
     assert_eq!(resolved.base_path, "s3://bucket/lake/finance.eu/subdir");
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: A NAMESPACE carrying a scheme or a leading slash is rejected at
-// create time
-// ---------------------------------------------------------------------------
-
 #[test]
 fn namespace_carrying_a_uri_scheme_is_rejected() {
     let props = json!({ "NAMESPACE": "s3://other/finance" });
@@ -82,10 +72,6 @@ fn namespace_beginning_with_a_leading_slash_is_rejected() {
     assert!(msg.contains("/finance"), "{msg}");
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: MERGE_SCHEMA selects one footer or every footer
-// ---------------------------------------------------------------------------
-
 #[test]
 fn merge_schema_false_spellings_are_accepted_case_insensitively() {
     for value in ["false", "False", "FALSE"] {
@@ -105,11 +91,6 @@ fn merge_schema_true_spellings_are_accepted_case_insensitively() {
         assert!(resolved.merge_schema, "'{value}' must resolve to TRUE");
     }
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: An unparseable MERGE_SCHEMA or HIVE_PARTITIONING value is
-// rejected, never defaulted
-// ---------------------------------------------------------------------------
 
 #[test]
 fn unparseable_merge_schema_is_rejected_naming_the_value_and_accepted_spellings() {
@@ -148,10 +129,6 @@ fn empty_merge_schema_and_hive_partitioning_resolve_their_defaults() {
     assert!(resolved.hive_partitioning);
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: HIVE_PARTITIONING is parsed and validated but not yet acted on
-// ---------------------------------------------------------------------------
-
 #[test]
 fn hive_partitioning_accepts_all_three_inputs_and_defaults_true() {
     let absent = json!({});
@@ -169,10 +146,6 @@ fn hive_partitioning_accepts_all_three_inputs_and_defaults_true() {
     assert!(!resolved_false.hive_partitioning);
 }
 
-// ---------------------------------------------------------------------------
-// join_storage_path
-// ---------------------------------------------------------------------------
-
 #[test]
 fn join_storage_path_returns_the_base_alone_when_the_segment_is_absent() {
     assert_eq!(
@@ -181,12 +154,8 @@ fn join_storage_path_returns_the_base_alone_when_the_segment_is_absent() {
     );
 }
 
-/// Scenario: One base path composes ONE table root, whichever path composes it.
-///
-/// A CONNECTION address may end in any number of separators. The join strips all
-/// of them before appending one, so the enumeration path's `storage_location` and
-/// the pushdown path's table root cannot answer `…/lake//orders` and
-/// `…/lake/orders` for the same table and list its files from two prefixes.
+/// A CONNECTION address may end in any number of separators; the join strips them all before
+/// appending one, so enumeration and pushdown can't list a table from two different prefixes.
 #[test]
 fn a_base_path_with_repeated_trailing_separators_joins_to_one_separator() {
     for base in [
@@ -202,18 +171,8 @@ fn a_base_path_with_repeated_trailing_separators_joins_to_one_separator() {
     }
 }
 
-/// Scenario: One MERGE_SCHEMA value resolves to ONE `MergeMode` on both paths.
-///
-/// The enumeration path (`construct_catalog_client`) and the pushdown path
-/// (`TableScanResolver::for_request`) both read this module's resolved
-/// `merge_schema` and both hand it to `MergeMode::for_merge_schema`. Pinning that
-/// chain's two answers here means a second mapping inlined at either call site has
-/// to contradict a pinned value rather than drift unnoticed. What each mode then
-/// READS is pinned behaviorally by
-/// `direct_storage_tests::merge_schema_true_and_false_select_every_footer_or_exactly_one`
-/// on the enumeration path and by
-/// `parquet_format_reader_tests::plan_reads_selected_footers_and_lists_every_file`
-/// on the plan path.
+/// Pins one `MergeMode` mapping for a `MERGE_SCHEMA` value, so enumeration and pushdown can't
+/// drift onto two different modes.
 #[test]
 fn merge_schema_resolves_the_same_mode_on_both_paths() {
     for (value, expected) in [

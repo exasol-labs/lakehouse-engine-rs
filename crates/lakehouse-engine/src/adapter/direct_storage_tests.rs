@@ -41,10 +41,8 @@ fn test_client(
         .expect("the fixture base path is a valid storage URI")
 }
 
-/// An [`ObjectStore`] decorator recording the prefix of every `list` and `list_with_delimiter`
-/// call and the location of every `get` it forwards, so a test can observe that every table an
-/// enumeration touches reached the SAME store instance rather than one built per table, and which
-/// files' footers the merge mode actually opened.
+/// An [`ObjectStore`] decorator recording every `list`/`list_with_delimiter` prefix and `get`
+/// location, so a test can confirm every table reached the SAME store and which footers were read.
 #[derive(Debug)]
 struct RecordingStore {
     inner: Arc<dyn ObjectStore>,
@@ -159,11 +157,6 @@ impl ObjectStore for RecordingStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: The direct-storage client is a boxed catalog client declared in
-// the engine crate
-// ---------------------------------------------------------------------------
-
 #[test]
 fn client_is_reachable_as_a_boxed_catalog_client() {
     fn assert_is_catalog_client<T: CatalogClient>() {}
@@ -206,10 +199,6 @@ async fn load_table_returns_a_clear_error_naming_the_direct_storage_kind() {
         "must state a direct-storage table is not loaded through load_table: {message}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: A first-level directory under the base path is a table
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn first_level_directories_are_the_tables() {
@@ -258,11 +247,6 @@ async fn first_level_directories_are_the_tables() {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: A table's columns and data files come from the one shared
-// directory seam
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn columns_and_files_come_from_the_shared_seam() {
@@ -313,11 +297,6 @@ async fn columns_and_files_come_from_the_shared_seam() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: A first-level directory holding no data file is skipped, not
-// failed
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn directory_with_no_data_file_is_skipped_with_a_neutral_reason() {
     let inner = Arc::new(InMemory::new());
@@ -349,11 +328,6 @@ async fn directory_with_no_data_file_is_skipped_with_a_neutral_reason() {
     assert_eq!(listing.skipped[0].ident.name, "empty");
     assert_eq!(listing.skipped[0].reason, SkipReason::NoDataFile);
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: One admission-limited object store serves every table of one
-// adapter call
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn one_admission_limited_store_serves_the_whole_call() {
@@ -392,10 +366,6 @@ async fn one_admission_limited_store_serves_the_whole_call() {
         "events' file listing must reach the SAME recorded store: {prefixes:?}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: The client's listing prefix is derived from its base path
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn new_derives_the_store_prefix_from_the_base_path() {
@@ -437,10 +407,6 @@ async fn new_derives_the_store_prefix_from_the_base_path() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scenario: MERGE_SCHEMA selects every footer or exactly one
-// ---------------------------------------------------------------------------
-
 #[tokio::test]
 async fn merge_schema_true_and_false_select_every_footer_or_exactly_one() {
     let files = [
@@ -477,11 +443,6 @@ async fn merge_schema_true_and_false_select_every_footer_or_exactly_one() {
         );
     }
 }
-
-// ---------------------------------------------------------------------------
-// Scenario: A timezone-aware column is declared at its normalized tag rather
-// than refused
-// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {

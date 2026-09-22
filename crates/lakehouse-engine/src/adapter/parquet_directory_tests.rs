@@ -12,13 +12,8 @@ use parquet::arrow::ArrowWriter;
 /// never listed.
 const TABLE_ROOT: &str = "warehouse/direct/events";
 
-/// An [`ObjectStore`] decorator that hands back the inner store's listing REVERSED and records
-/// every read it forwards.
-///
-/// The reversal is what makes the deterministic-order clause testable: a seam that returned the
-/// store's own order would pass against [`InMemory`], whose listing is already sorted. The read
-/// log is what makes "which footers did the merge mode actually read" observable, and a HEAD is
-/// recorded distinctly because the seam must carry each size from the listing instead.
+/// Hands back the inner store's listing REVERSED (so a test can't pass by luck against
+/// [`InMemory`]'s already-sorted order) and records every read, HEAD vs. GET distinctly.
 #[derive(Debug)]
 struct ReversedListingStore {
     inner: Arc<dyn ObjectStore>,
@@ -146,10 +141,8 @@ fn store_of(probe: &Arc<ReversedListingStore>) -> Arc<dyn ObjectStore> {
     Arc::clone(probe) as Arc<dyn ObjectStore>
 }
 
-/// A Parquet file declaring `fields` and holding `rows` rows of nulls.
-///
-/// Nulls carry the declaration without needing a value per Arrow type, and a field declared
-/// non-nullable is written with zero rows so the declaration survives the batch's own validation.
+/// A Parquet file declaring `fields` and holding `rows` rows of nulls (0 rows for a non-nullable
+/// field, since a null value would fail the batch's own validation).
 fn parquet_bytes(fields: Vec<Field>, rows: usize) -> Vec<u8> {
     let schema = Arc::new(Schema::new(fields));
     let columns: Vec<arrow::array::ArrayRef> = schema
@@ -198,8 +191,6 @@ fn paths(directory: &ParquetDirectory) -> Vec<String> {
         .collect()
 }
 
-// Scenario Coverage (parquet-directory-seam): One seam answers the file list and the schema for
-// both callers
 #[tokio::test]
 async fn one_seam_returns_files_sizes_schema_and_footers() {
     let first = parquet_bytes(vec![nullable("id", DataType::Int32)], 3);
@@ -263,8 +254,6 @@ async fn one_seam_returns_files_sizes_schema_and_footers() {
     );
 }
 
-// Scenario Coverage (parquet-directory-seam): Data files are listed recursively in a
-// deterministic order
 #[tokio::test]
 async fn listing_is_recursive_filtered_and_deterministic() {
     let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
@@ -310,8 +299,6 @@ async fn listing_is_recursive_filtered_and_deterministic() {
     );
 }
 
-// Scenario Coverage (parquet-directory-seam): Data files are listed recursively in a
-// deterministic order
 #[tokio::test]
 async fn key_value_path_segments_are_split_into_a_per_file_map() {
     let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
@@ -342,8 +329,6 @@ async fn key_value_path_segments_are_split_into_a_per_file_map() {
     );
 }
 
-// Scenario Coverage (parquet-directory-seam): Footers fold into one schema under the
-// proven-castable widening pairs
 #[tokio::test]
 async fn fold_widens_only_across_supported_pairs_and_names_conflicts() {
     let probe = store_holding(vec![
@@ -395,8 +380,6 @@ async fn fold_widens_only_across_supported_pairs_and_names_conflicts() {
     );
 }
 
-// Scenario Coverage (parquet-directory-seam): Footers fold into one schema under the
-// proven-castable widening pairs
 #[tokio::test]
 async fn a_column_folds_pairwise_in_listing_order_to_the_widest_reachable_type() {
     let probe = store_holding(vec![
@@ -427,8 +410,6 @@ async fn a_column_folds_pairwise_in_listing_order_to_the_widest_reachable_type()
     );
 }
 
-// Scenario Coverage (parquet-directory-seam): Footers fold into one schema under the
-// proven-castable widening pairs
 #[tokio::test]
 async fn a_pair_no_widening_rule_covers_fails_naming_the_column_both_types_and_both_files() {
     let probe = store_holding(vec![
@@ -464,7 +445,6 @@ async fn a_pair_no_widening_rule_covers_fails_naming_the_column_both_types_and_b
     }
 }
 
-// Scenario Coverage (parquet-directory-seam): The merge mode selects every footer or exactly one
 #[tokio::test]
 async fn merge_mode_selects_every_footer_or_the_first() {
     let objects = [
@@ -540,7 +520,6 @@ async fn merge_mode_selects_every_footer_or_the_first() {
     );
 }
 
-// Scenario Coverage (parquet-directory-seam): The merge mode selects every footer or exactly one
 #[tokio::test]
 async fn a_single_file_prefix_folds_identically_under_both_modes() {
     let object = [(
@@ -576,8 +555,6 @@ async fn a_single_file_prefix_folds_identically_under_both_modes() {
     );
 }
 
-// Scenario Coverage (parquet-directory-seam): The folded column set is the union of the files'
-// column sets
 #[tokio::test]
 async fn folded_columns_are_the_nullable_union_in_first_appearance_order() {
     let probe = store_holding(vec![
@@ -629,8 +606,6 @@ async fn folded_columns_are_the_nullable_union_in_first_appearance_order() {
     );
 }
 
-// Scenario Coverage (parquet-directory-seam): The folded column set is the union of the files'
-// column sets
 #[tokio::test]
 async fn two_names_equal_after_the_uppercase_fold_fail_the_fold() {
     let probe = store_holding(vec![
@@ -665,8 +640,6 @@ async fn two_names_equal_after_the_uppercase_fold_fail_the_fold() {
     }
 }
 
-// Scenario Coverage (parquet-directory-seam): A nested or unrepresentable Parquet type folds to
-// the JSON string declaration
 #[tokio::test]
 async fn nested_and_unrepresentable_types_fold_to_the_string_declaration() {
     let entries = Field::new(
@@ -729,8 +702,6 @@ async fn nested_and_unrepresentable_types_fold_to_the_string_declaration() {
     }
 }
 
-// Scenario Coverage (parquet-directory-seam): One seam answers the file list and the schema for
-// both callers
 #[tokio::test]
 async fn a_prefix_holding_no_data_file_answers_an_empty_list_and_schema() {
     let probe = store_holding(vec![(&format!("{TABLE_ROOT}/_SUCCESS"), b"".to_vec())]).await;
@@ -754,13 +725,8 @@ async fn a_prefix_holding_no_data_file_answers_an_empty_list_and_schema() {
     );
 }
 
-/// Scenario: One seam answers the file list and the schema for both callers.
-///
-/// Both callers address a table through a store scoped to the URI's
-/// `scheme://userinfo@host:port` slice, so the prefix below that slice is derived here
-/// rather than once per caller. It is percent-DECODED, because an object store
-/// addresses a key by its decoded name, and the container an `abfss://` URI carries in
-/// its userinfo is the store's own scope rather than part of the key.
+/// Percent-DECODED, since an object store addresses a key by its decoded name; an `abfss://`
+/// URI's userinfo (the container) is the store's own scope, not part of the key.
 #[test]
 fn the_store_prefix_is_the_percent_decoded_path_below_the_store_root() {
     for (uri, expected) in [

@@ -1,13 +1,5 @@
-/// Parses and validates the three virtual-schema properties a `DIRECT_STORAGE`
-/// virtual schema reads, so an operator scopes and tunes a catalog-free
-/// virtual schema from `CREATE VIRTUAL SCHEMA` alone: `NAMESPACE` scopes which
-/// subtree under the CONNECTION address holds the tables, `MERGE_SCHEMA`
-/// selects whether a table's declared schema folds every data file's footer
-/// or samples one, and `HIVE_PARTITIONING` is parsed and validated ahead of
-/// its implementation (issue #408).
-///
-/// Read only under `CatalogKind::DirectStorage`; the other two kinds ignore
-/// all three properties rather than rejecting them.
+//! Parses and validates the `DIRECT_STORAGE` virtual-schema properties: `NAMESPACE`,
+//! `MERGE_SCHEMA`, `HIVE_PARTITIONING`. Read only under `CatalogKind::DirectStorage`.
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -17,27 +9,18 @@ const PROP_HIVE_PARTITIONING: &str = "HIVE_PARTITIONING";
 /// The resolved direct-storage properties for one virtual schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectStorageProperties {
-    /// The CONNECTION address joined with `NAMESPACE` (when supplied), by
-    /// exactly one `/`; the CONNECTION address alone when `NAMESPACE` is
-    /// absent.
+    /// CONNECTION address joined with `NAMESPACE` (exactly one `/`), or the CONNECTION address
+    /// alone when `NAMESPACE` is absent.
     pub base_path: String,
-    /// Whether a table's declared schema folds every data file's footer
-    /// (`true`, the default) or samples exactly one file's footer (`false`).
+    /// Fold every data file's footer (`true`, default) vs. sample one file's footer (`false`).
     pub merge_schema: bool,
-    /// Parsed and validated but not yet acted on (issue #408): this plan
-    /// declares no partition column and carries no per-file partition value
-    /// derived from it, regardless of this value.
+    /// Parsed and validated but not yet acted on (#408): no partition column or per-file
+    /// partition value is derived from this yet.
     pub hive_partitioning: bool,
 }
 
-/// Resolve the three direct-storage VS properties against the given
-/// CONNECTION address.
-///
-/// An unparseable `MERGE_SCHEMA` or `HIVE_PARTITIONING` value is rejected
-/// rather than defaulted: a typo that silently selected the opposite mode
-/// would return a narrower schema instead of an error. A `NAMESPACE` value
-/// carrying a URI scheme or a leading `/` is rejected rather than repaired,
-/// because both spellings express an intent the property cannot carry.
+/// An unparseable `MERGE_SCHEMA`/`HIVE_PARTITIONING` value is rejected rather than defaulted, and
+/// a `NAMESPACE` with a URI scheme or leading `/` is rejected rather than repaired.
 pub fn resolve_direct_storage_properties(
     props: &Json,
     connection_address: &str,
@@ -53,16 +36,8 @@ pub fn resolve_direct_storage_properties(
     })
 }
 
-/// Join a direct-storage base path and an optional path segment with exactly
-/// one `/` — the ONE owner of that join for this kind.
-///
-/// Both the `NAMESPACE` scoping at property-resolution time and the table-root
-/// composition at pushdown time ask the same question, so both ask it here: two
-/// formulas over one base path could answer `…/direct//events` and
-/// `…/direct/events` for the same table and list its files from two different
-/// prefixes. Every trailing `/` on `base` is stripped before the separator is
-/// appended, so a CONNECTION address ending in any number of separators joins
-/// to exactly one. An absent segment returns `base` unchanged.
+/// The ONE owner of the base-path join for this kind, so `NAMESPACE` scoping and table-root
+/// composition can never disagree on the separator and list two different prefixes for one table.
 pub fn join_storage_path(base: &str, segment: Option<&str>) -> String {
     match segment {
         None => base.to_string(),

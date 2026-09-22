@@ -54,7 +54,6 @@ fn catalog_storage_props_omits_empty_connection_fields_and_an_absent_token() {
     );
 }
 
-/// Scenario: The address scheme must agree with the credential shape.
 #[test]
 fn addresses_scheme_accepts_s3_and_s3a_for_the_s3_backend() {
     let backend = StorageBackend::S3(StorageProps::default());

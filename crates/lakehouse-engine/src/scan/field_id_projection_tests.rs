@@ -1726,13 +1726,7 @@ fn a_binding_that_diverts_a_column_always_withholds_row_filter_pushdown() {
     );
 }
 
-/// Scenario: a logical field carrying no binding key binds by its own name.
-///
-/// The raw-Parquet-directory case: one folded logical schema over files that declare
-/// DIFFERENT column sets in DIFFERENT orders. Each file binds every column it carries
-/// by name and leaves the rest unbound for the NULL fill, so a column's physical
-/// ORDINAL is never consulted — which is exactly why such a schema must synthesize no
-/// ordinal field-id: an ordinal would bind the wrong column of the other file.
+/// Files with different column sets/orders must bind by name only — an ordinal field-id would bind the wrong column of the other file.
 #[test]
 fn identity_binding_spans_files_with_different_column_sets() {
     let logical = Schema::new(vec![

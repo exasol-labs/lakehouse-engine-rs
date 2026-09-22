@@ -452,15 +452,7 @@ pub fn iceberg_type_to_arrow(ty: &iceberg::spec::Type) -> DataType {
 
 /// Convert an Arrow `DataType` to the compact string tag used in `ScanSpec::logical_schema`.
 ///
-/// The tag vocabulary covers every Arrow type [`compatible_exasol_type`] admits:
-/// - `"bool"`, `"int8"`, `"int16"`, `"int32"`, `"int64"`, `"uint8"`, `"uint16"`,
-///   `"uint32"`, `"uint64"`, `"float32"`, `"float64"`, `"utf8"`, `"large_utf8"`,
-///   `"date32"`
-/// - `"timestamp_s"`, `"timestamp_ms"`, `"timestamp_us"`, `"timestamp_ns"` and
-///   their tz-aware `"timestamptz_*"` counterparts, one pair per `TimeUnit`
-/// - `"decimal128(p,s)"` for in-range `Decimal128`
-///
-/// Unknown / other types fall back to `"utf8"` (JSON VARCHAR path).
+/// The tag vocabulary covers every Arrow type [`compatible_exasol_type`] admits; unknown/other types fall back to `"utf8"` (JSON VARCHAR path).
 pub fn arrow_type_to_tag(dt: &DataType) -> String {
     use arrow::datatypes::TimeUnit;
     match dt {

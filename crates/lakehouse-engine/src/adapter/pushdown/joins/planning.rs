@@ -195,8 +195,8 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
 /// and never per node (mission.md "resolve metadata once per query"). `total_bytes`
 /// is the sum of every file's resolved size (`FileEntry::size` — the Iceberg
 /// manifest's `file_size_in_bytes`, the Delta `add` action's `size`, or the
-/// object-store listing response under direct storage; NO Parquet read on any of
-/// the three), the quantity the broadcast threshold is evaluated against.
+/// object-store listing response under direct storage; no Parquet read for any),
+/// the quantity the broadcast threshold is evaluated against.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedJoinSide {
     /// The Exasol virtual table name (a detected join leaf).

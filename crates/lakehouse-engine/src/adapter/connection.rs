@@ -9,7 +9,7 @@ use crate::scan::sealed::{
 use crate::scan::spec::{CatalogProps, StorageBackend};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
-use lakehouse_catalog::StorageCreds;
+use lakehouse_catalog::{StorageCreds, scheme_of};
 
 use super::catalog_kind::CatalogKind;
 use super::nonempty_str;
@@ -145,34 +145,20 @@ fn validate_direct_storage_preconditions(
         )));
     }
 
-    // Fields meaningless under the direct-storage kind because it reaches no catalog
-    // service; supplying one is rejected rather than silently ignored, so an operator
-    // learns the field does nothing here instead of assuming it took effect.
-    let mut rejected: Vec<&str> = Vec::new();
-    if !creds.warehouse.is_empty() {
-        rejected.push("warehouse");
-    }
-    if creds.token.is_some() {
-        rejected.push("token");
-    }
-    if creds.client_id.is_some() {
-        rejected.push("client_id");
-    }
-    if creds.client_secret.is_some() {
-        rejected.push("client_secret");
-    }
-    if creds.oauth2_server_uri.is_some() {
-        rejected.push("oauth2_server_uri");
-    }
-    if creds.scope.is_some() {
-        rejected.push("scope");
-    }
-    if creds.use_sigv4 {
-        rejected.push("use_sigv4");
-    }
-    if creds.use_vended_credentials {
-        rejected.push("use_vended_credentials");
-    }
+    // Catalog-auth fields are meaningless under direct storage; reject rather than silently ignore them.
+    let rejected: Vec<&str> = [
+        ("warehouse", !creds.warehouse.is_empty()),
+        ("token", creds.token.is_some()),
+        ("client_id", creds.client_id.is_some()),
+        ("client_secret", creds.client_secret.is_some()),
+        ("oauth2_server_uri", creds.oauth2_server_uri.is_some()),
+        ("scope", creds.scope.is_some()),
+        ("use_sigv4", creds.use_sigv4),
+        ("use_vended_credentials", creds.use_vended_credentials),
+    ]
+    .into_iter()
+    .filter_map(|(field, present)| present.then_some(field))
+    .collect();
     if !rejected.is_empty() {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' supplies field(s) {} but the direct-storage catalog kind \
@@ -207,14 +193,6 @@ fn validate_direct_storage_preconditions(
         )));
     }
     Ok(())
-}
-
-/// The (already-lowercased) URI scheme of a CONNECTION address, or empty when
-/// the address carries none.
-fn scheme_of(address: &str) -> String {
-    address
-        .split_once("://")
-        .map_or(String::new(), |(scheme, _)| scheme.to_ascii_lowercase())
 }
 
 fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {

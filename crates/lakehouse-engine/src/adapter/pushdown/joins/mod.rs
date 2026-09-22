@@ -197,24 +197,14 @@ pub(super) async fn plan_join(
         props,
     )
     .await?;
-    // ONE leg per FROM-tree leaf, so the pruning predicate is attributed by LEG
-    // INDEX: a self-join's two occurrences share a `tableName`, and keying pruning on
-    // the name would hand each occurrence the other's predicate too — over-filtered
-    // rows with no error.
-    //
-    // Every leg's sub-predicate is derived BEFORE any resolution starts, so each
-    // resolution borrows a value that outlives the whole fan-out.
+    // Legs are indexed positionally, not by tableName (which a self-join's two
+    // occurrences share); each leg's filter is precomputed before resolution starts.
     let legs = join.legs();
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
         .collect();
-    // Driven CONCURRENTLY over the request's ONE session, so a two-leg join's
-    // plan-time latency approaches its slowest leg rather than the sum of its legs.
-    // `try_join_all` answers in INPUT order, which is leg-index order — the whole
-    // contract, because every later step indexes a side by its leg rather than by its
-    // name — and surfaces ONE failing leg's own error rather than a combined one. The
-    // request's single admission-limited store (direct storage) and single catalog
-    // session (Iceberg, Unity) already bound what the added concurrency can issue.
+    // Resolved concurrently via try_join_all, which preserves input (leg-index) order —
+    // required since later steps index sides by leg, not name.
     let sides: Vec<ResolvedJoinSide> = try_join_all(join.tables.iter().zip(&side_filters).map(
         |(leaf, side_filter)| {
             resolve_one_join_side(

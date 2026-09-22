@@ -421,10 +421,8 @@ fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
         .collect()
 }
 
-/// A minimal three-column batch for the raw-Parquet direct-storage fixture:
-/// `EVENT_ID` (Int64), `NAME` (Utf8), `SCORE` (Float64). Carries no Iceberg
-/// field-id metadata — direct storage reaches no catalog, so its fixture must
-/// look like a plain Parquet file a non-Iceberg writer would produce.
+/// Minimal batch for the raw-Parquet direct-storage fixture; carries no Iceberg
+/// field-id metadata, since direct storage reaches no catalog.
 fn azure_direct_events_batch(ids: &[i64]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("EVENT_ID", DataType::Int64, false),
@@ -444,10 +442,8 @@ fn azure_direct_events_batch(ids: &[i64]) -> RecordBatch {
     .expect("azure direct-storage events batch construction is infallible")
 }
 
-/// Write `batch` as one Parquet object at `path` inside `container`, through a
-/// standalone Azure Blob client built from the run's account key — never
-/// through the shared `local_stack_storage()` MinIO backend the S3-only
-/// `raw_parquet` helper uses. Creates no catalog table, commits no snapshot.
+/// Writes `batch` as Parquet to Azure Blob via a standalone client (not the
+/// S3-only `raw_parquet` helper's MinIO backend).
 fn write_azure_parquet_fixture(
     container: &str,
     account: &str,
@@ -628,22 +624,18 @@ fn azure_static_and_vended_creds_end_to_end() {
         "the ordered cross-arm projection must cover all {SEED_TOTAL_ROWS} seeded rows"
     );
 
-    // 8. The raw-Parquet direct-storage scenario, over the same per-run
-    //    container this test already guards.
+    // 8. Raw-Parquet direct-storage scenario, reusing this test's per-run container guard.
     direct_storage_over_adls_returns_correct_rows(&mut conn, &fixture);
 }
 
-/// Scenario: an end-to-end scan over a raw Parquet directory on ADLS returns
-/// correct rows.
+/// End-to-end scan over a raw Parquet directory on ADLS returns correct rows.
 ///
-/// Runs inside [`azure_static_and_vended_creds_end_to_end`] so it shares that
-/// test's per-run container guard: the `abfss://` prefix it writes is disjoint
-/// from both credential arms' warehouses, and the container's `Drop` deletes
-/// everything either arm or this scenario wrote.
+/// Runs inside [`azure_static_and_vended_creds_end_to_end`] to share its per-run
+/// container guard: the `abfss://` prefix it writes is disjoint from both credential
+/// arms' warehouses, so `Drop` cleans up everything together.
 fn direct_storage_over_adls_returns_correct_rows(conn: &mut ExaConn, fixture: &AzureFixture) {
-    // No Lakekeeper warehouse and no catalog CONNECTION field — just the account key and a
-    // bare `abfss://` prefix disjoint from both credential arms' warehouses (whose
-    // key-prefixes are `{container}-static` / `{container}-vended`).
+    // No Lakekeeper warehouse/catalog CONNECTION field — just the account key and an
+    // `abfss://` prefix disjoint from both credential arms' warehouses.
     let account_key = azure::account_key();
     write_azure_parquet_fixture(
         &fixture.container_name,

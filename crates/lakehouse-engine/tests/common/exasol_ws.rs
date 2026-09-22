@@ -183,9 +183,8 @@ impl ExaConn {
 
     /// Execute SQL and return all data as column-major Vec<Vec<Value>>.
     ///
-    /// Fetches from a result set handle if necessary (large result sets). A zero-row
-    /// result still yields one empty column per declared column, so a caller may index
-    /// by column without first checking for rows.
+    /// Fetches from a result set handle if necessary (large result sets); a zero-row
+    /// result still yields one empty column per declared column.
     pub fn query_columns(&mut self, sql: &str) -> Vec<Vec<Value>> {
         let resp = self.execute(sql);
         let result_set = &resp["responseData"]["results"][0]["resultSet"];
@@ -213,8 +212,7 @@ impl ExaConn {
         num_bytes: u64,
     ) -> (Vec<Vec<Value>>, usize) {
         let advertised = result_set["numRows"].as_u64();
-        // Exasol omits `data` entirely from a zero-row result set, so the declared
-        // column list is the only source for its shape.
+        // Exasol omits `data` for a zero-row result, so declared columns are the only shape source.
         let declared_columns = result_set["numColumns"]
             .as_u64()
             .or_else(|| result_set["columns"].as_array().map(|c| c.len() as u64))

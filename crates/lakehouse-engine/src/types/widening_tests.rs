@@ -1,14 +1,7 @@
 use super::*;
 use crate::scan::type_relaxation::supported_relaxation_pairs;
 
-/// Pairs no row of the supported set covers in EITHER ordering, curated rather than generated so
-/// the refusals a caller depends on are named one by one.
-///
-/// `Int64` / `Float64` is the pair `arrow::compute::can_cast_types` accepts and neither table
-/// format permits, so its presence here is what pins the owner to the recorded table rather than
-/// to the cast kernel. `Int8` / `Int16` is refused because the recorded table renders `byte` →
-/// `short` as `Int8` → `Int32`: the owner answers over the table's CONCRETE Arrow pairs and
-/// invents none. The two timestamp entries are the mixed-unit limitation.
+/// Pairs no row of the supported set covers in either ordering, curated so each refusal is named individually.
 fn unsupported_pairs() -> Vec<(&'static str, DataType, DataType)> {
     vec![
         ("long -> double", DataType::Int64, DataType::Float64),

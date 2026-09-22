@@ -25,13 +25,7 @@ pub enum CatalogKind {
     DirectStorage,
 }
 
-/// Resolve the `CATALOG_KIND` VS property.
-///
-/// Absent resolves `IcebergRest`. A value naming the Unity Catalog kind
-/// resolves `UnityCatalogNative` and a value naming direct storage resolves
-/// `DirectStorage`, both compared case-insensitively. Any other value is
-/// rejected rather than silently defaulted — defaulting an unrecognized kind
-/// would resolve a misconfigured virtual schema against the wrong catalog.
+/// Resolve the `CATALOG_KIND` VS property. Unrecognized values are rejected rather than defaulted, to avoid resolving a misconfigured schema against the wrong catalog.
 pub fn resolve_catalog_kind(props: &Json) -> Result<CatalogKind, UdfError> {
     match super::nonempty_str(props, PROP_CATALOG_KIND) {
         None => Ok(CatalogKind::IcebergRest),

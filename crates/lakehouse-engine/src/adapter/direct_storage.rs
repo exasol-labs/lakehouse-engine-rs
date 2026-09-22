@@ -6,6 +6,7 @@ use crate::scan::spec::StorageBackend;
 use crate::types::mapping::{arrow_type_to_tag, needs_json_fallback};
 use arrow::datatypes::DataType;
 use exasol_udf_sdk::error::UdfError;
+use futures::future::try_join_all;
 use lakehouse_catalog::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
     CatalogTableType, ColumnSourceType, SkipReason, SkippedTable, TableFormat,
@@ -18,14 +19,9 @@ use std::sync::Arc;
 
 /// A [`CatalogClient`] over a plain object-storage prefix, with no catalog service behind it.
 ///
-/// Declared here rather than in `lakehouse-catalog`: constructing it needs the engine's
-/// admission-limited `object_store` builder, and `vs-adapter/catalog-crate-structure` forbids the
-/// catalog crate's manifest from declaring `object_store` as a direct dependency. Declaring the
-/// client there would point that dependency edge backwards. Rust's orphan rule permits this `impl`
-/// because the TYPE is local even though the trait is not, and no recorded rule requires an
-/// implementor of `CatalogClient` to live in the catalog crate — only that the engine reach every
-/// enumeration and table-load operation THROUGH the trait, which this placement keeps unchanged:
-/// the single `Box<dyn CatalogClient>` construction site is already engine-side.
+/// Lives here, not in `lakehouse-catalog`, because building it needs the engine's
+/// admission-limited `object_store` builder and that crate may not depend on `object_store`
+/// directly (`vs-adapter/catalog-crate-structure`).
 pub struct DirectStorageCatalogClient {
     store: Arc<dyn ObjectStore>,
     prefix: StorePath,
@@ -34,9 +30,7 @@ pub struct DirectStorageCatalogClient {
 }
 
 impl DirectStorageCatalogClient {
-    /// Opens the ONE admission-limited object store this client, and every table it enumerates,
-    /// read through — rooted at `base_path` (the CONNECTION address already joined with
-    /// `NAMESPACE` by the caller).
+    /// `base_path` is the CONNECTION address already joined with `NAMESPACE` by the caller.
     pub fn new(
         backend: &StorageBackend,
         base_path: &str,
@@ -48,8 +42,6 @@ impl DirectStorageCatalogClient {
         Self::over_store(store, base_path, merge_mode)
     }
 
-    /// The half of [`Self::new`] that derives the client's listing prefix from `base_path`,
-    /// through the same seam the plan path lists a table root with.
     fn over_store(
         store: Arc<dyn ObjectStore>,
         base_path: &str,
@@ -65,11 +57,8 @@ impl DirectStorageCatalogClient {
 }
 
 impl CatalogClient for DirectStorageCatalogClient {
-    /// Enumerates the first-level directories under this client's base path: each one is a table,
-    /// named for the directory alone (an EMPTY namespace), so the shared flatten and `TABLE_MAP`
-    /// helpers produce the bare directory name with no branch on catalog kind. `namespace` is
-    /// unread: the base path was already fully composed from `CATALOG_CONNECTION` and `NAMESPACE`
-    /// at construction.
+    /// Each first-level directory under the base path is a table with an empty namespace;
+    /// `namespace` is unread since the base path already encodes `CATALOG_CONNECTION` + `NAMESPACE`.
     fn list_tables(
         &self,
         _namespace: &[String],
@@ -88,12 +77,18 @@ impl CatalogClient for DirectStorageCatalogClient {
                 .collect();
             names.sort();
 
+            // Fan out per-table directory resolution instead of serializing it.
+            let directories = try_join_all(names.iter().map(|name| {
+                let table_prefix = self.prefix.clone().join(name.as_str());
+                async move {
+                    resolve_parquet_directory(&self.store, &table_prefix, self.merge_mode).await
+                }
+            }))
+            .await?;
+
             let mut tables = Vec::with_capacity(names.len());
             let mut skipped = Vec::new();
-            for name in names {
-                let table_prefix = self.prefix.clone().join(name.as_str());
-                let directory =
-                    resolve_parquet_directory(&self.store, &table_prefix, self.merge_mode).await?;
+            for (name, directory) in names.into_iter().zip(directories) {
                 let ident = CatalogTableIdent {
                     namespace: Vec::new(),
                     name: name.clone(),
@@ -119,9 +114,8 @@ impl CatalogClient for DirectStorageCatalogClient {
         })
     }
 
-    /// Unreachable on this kind's happy path: the pushdown path resolves a direct-storage table
-    /// from its own composed root rather than from a catalog load, so this always returns a clear
-    /// named error instead of panicking or synthesizing a table.
+    /// Unreachable on the happy path: pushdown resolves a direct-storage table from its own
+    /// composed root instead of a catalog load, so this just returns a named error.
     fn load_table(
         &self,
         ident: &CatalogTableIdent,
@@ -137,16 +131,8 @@ impl CatalogClient for DirectStorageCatalogClient {
     }
 }
 
-/// Map a folded Parquet schema's fields to the neutral, ordered column list the shared listing
-/// pipeline consumes, applying the string substitution for a nested or unrepresentable column
-/// BEFORE rendering each Arrow tag, so every tag this client emits names a type the vocabulary can
-/// express.
-///
-/// The tag, not the footer's own Arrow type, is what this kind declares: a type the vocabulary
-/// normalizes rather than reproduces — a timezone-aware timestamp, whose specific timezone label
-/// the tag intentionally discards — is declared at its normalized form, exactly as the plan path's
-/// `logical_schema` renders the same footer. Refusing such a column here instead would fail
-/// `CREATE VIRTUAL SCHEMA` for a whole directory over a legal Parquet file the plan path accepts.
+/// Falls back to Utf8 for nested/unrepresentable columns before tagging, matching the plan path's
+/// `logical_schema` normalization — refusing them here would fail `CREATE VIRTUAL SCHEMA` outright.
 fn resolve_columns(schema: &arrow::datatypes::SchemaRef) -> Vec<CatalogColumn> {
     schema
         .fields()

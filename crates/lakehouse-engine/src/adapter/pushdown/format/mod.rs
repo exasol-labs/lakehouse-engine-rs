@@ -110,12 +110,7 @@ pub enum ScanSource<'a> {
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
     },
-    /// A directory of raw Parquet files, read through the request's ONE
-    /// admission-limited object store.
-    ///
-    /// Carries no catalog table metadata because this source loads no table:
-    /// `table_root` is composed by the resolver from the CONNECTION address, the
-    /// namespace property, and the directory name recorded at create time.
+    /// A directory of raw Parquet files; no catalog table metadata, since this source loads no table.
     DirectParquet {
         store: &'a Arc<dyn ObjectStore>,
         table_root: &'a str,

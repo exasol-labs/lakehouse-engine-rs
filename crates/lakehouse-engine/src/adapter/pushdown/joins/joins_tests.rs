@@ -654,14 +654,7 @@ async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     );
 }
 
-/// An Iceberg REST catalog that answers `/v1/config` at once but holds EVERY
-/// `loadTable` response until `parties` of them are in flight together.
-///
-/// The rendezvous is what makes concurrency observable without a timing margin: a
-/// loop that awaits each leg before starting the next can never release it, because
-/// the first leg's response is still pending when the second would be issued. Each
-/// connection is served on its own task, so the server itself never serializes what
-/// the client sent concurrently.
+/// Holds every `loadTable` response until `parties` are in flight together, making concurrent (vs. sequential) resolution observable without a timing margin.
 struct RendezvousCatalog {
     uri: String,
 }
@@ -710,8 +703,7 @@ impl RendezvousCatalog {
     }
 }
 
-/// Plan `request` as an Iceberg REST pushdown against `catalog_uri`, with
-/// `join_broadcast_max_bytes` large enough that it never decides the shape here.
+/// `join_broadcast_max_bytes` is large enough here that it never decides the shape.
 async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, UdfError> {
     let conn = ResolvedConnectionConfig {
         catalog_uri: catalog_uri.to_string(),
@@ -732,9 +724,7 @@ async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, Udf
     .await
 }
 
-/// [`delta_pushdown`] with a broadcast threshold of ZERO, so every non-empty side is
-/// above it and the request takes the N-scan fallback — the one renderer that indexes
-/// the resolved sides by leg.
+/// Broadcast threshold of zero forces the N-scan fallback, the renderer that indexes resolved sides by leg.
 async fn delta_n_scan_pushdown(
     request: &Json,
     catalog_uri: &str,
@@ -760,18 +750,7 @@ async fn delta_n_scan_pushdown(
     .await
 }
 
-/// Scenario: A request's table resolutions run concurrently rather than one after
-/// another.
-///
-/// Both legs must be in flight at the SAME time: the catalog holds every `loadTable`
-/// response until two of them have arrived, so a loop awaiting each leg before
-/// starting the next runs the clock out instead of planning. The wait is bounded
-/// rather than unbounded, so a regression fails the test by name instead of hanging.
-///
-/// The order half of this scenario is pinned by
-/// [`resolved_join_sides_stay_in_leg_index_order`], which needs non-empty sides to
-/// observe it; both legs here resolve empty, which is what keeps this test's catalog
-/// fixture free of a snapshot and a manifest.
+// Verifies concurrent (not sequential) leg resolution via the rendezvous catalog, under a bounded timeout so a regression fails by name rather than hangs. Ordering is covered separately by resolved_join_sides_stay_in_leg_index_order.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_legs_resolve_concurrently_in_leg_index_order() {
     let catalog = RendezvousCatalog::spawn(2).await;
@@ -794,14 +773,7 @@ async fn join_legs_resolve_concurrently_in_leg_index_order() {
     );
 }
 
-/// Scenario: A request's table resolutions run concurrently rather than one after
-/// another.
-///
-/// The resolved sides are answered in LEG-INDEX order, because the N-scan renderer
-/// indexes both the resolved sides and the per-leg fan-outs by leg. CUSTOMER is the
-/// left leaf, so its own files must be rendered ahead of ORDERS'; a side list in
-/// completion order rather than input order would pair each leg's alias with the
-/// other leg's files.
+// Resolved sides must stay in leg-index (input) order, not completion order — the N-scan renderer indexes fan-outs by leg, so out-of-order sides would pair the wrong files with each alias.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resolved_join_sides_stay_in_leg_index_order() {
     let catalog = unity_delta_catalog().await;

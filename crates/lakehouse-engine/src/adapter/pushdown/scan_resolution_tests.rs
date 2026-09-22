@@ -300,8 +300,7 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
     );
 }
 
-/// An empty, non-truncated S3 listing — enough for the store to answer a directory
-/// with no data file, and short enough to fit the fixture server's single read.
+/// An empty, non-truncated S3 listing: a directory with no data file.
 const EMPTY_LIST_BUCKET_RESULT: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8"?>"#,
     r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
@@ -312,9 +311,7 @@ const EMPTY_LIST_BUCKET_RESULT: &str = concat!(
 /// The CONNECTION address a direct-storage virtual schema is created over.
 const DIRECT_STORAGE_ADDRESS: &str = "s3://warehouse";
 
-/// An S3-compatible endpoint answering every listing with an EMPTY result and
-/// recording each request line, so a test observes exactly which prefixes a request
-/// listed and how many listings it cost.
+/// An S3-compatible endpoint answering every listing empty while recording each request line.
 async fn empty_s3_endpoint() -> RecordingCatalog {
     RecordingCatalog::spawn(|_| (200, EMPTY_LIST_BUCKET_RESULT.to_string())).await
 }
@@ -331,13 +328,7 @@ fn direct_storage_backend(endpoint: &str) -> StorageBackend {
     })
 }
 
-/// Scenario: One catalog session per request serves every table the request resolves.
-///
-/// The direct-storage half, where the request's session is an OBJECT STORE rather
-/// than a catalog client. The store is built ONCE, before any leg, and costs no
-/// request at all; each leg then lists only its OWN table root under the base path
-/// the CONNECTION address and `NAMESPACE` compose, so a two-table join costs exactly
-/// one listing per leg and no per-leg session setup.
+// Direct-storage case: the object store is built once (no request cost) and each leg lists only its own table root — one listing per leg, no per-leg session setup.
 #[tokio::test]
 async fn one_session_or_store_per_request_serves_every_leg() {
     let endpoint = empty_s3_endpoint().await;
@@ -390,12 +381,7 @@ async fn one_session_or_store_per_request_serves_every_leg() {
     );
 }
 
-/// Scenario: Table naming and the TABLE_MAP round trip reuse the shared helpers.
-///
-/// A recovered identifier that names no first-level directory is refused when the
-/// request's resolver is built, BEFORE any listing: each of these values would
-/// compose a table root reaching OUTSIDE the storage base path the operator scoped
-/// the virtual schema to.
+// Identifiers naming no first-level directory are refused before any listing, since they'd compose a table root outside the storage base path.
 #[tokio::test]
 async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused() {
     let endpoint = empty_s3_endpoint().await;
@@ -434,12 +420,7 @@ async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused(
     );
 }
 
-/// Scenario: One base path composes ONE table root, whichever path composes it.
-///
-/// A CONNECTION address may end in any number of separators. The pushdown path must
-/// compose the SAME table root the enumeration path records as a table's
-/// `storage_location`, so both name one storage location for one table: two join
-/// formulas answer `…/direct//events` and `…/direct/events` for the same directory.
+// The pushdown path must compose the same table_root as enumeration's storage_location, regardless of trailing separators in the CONNECTION address.
 #[tokio::test]
 async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location() {
     let endpoint = empty_s3_endpoint().await;
@@ -478,12 +459,7 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
     );
 }
 
-/// Scenario: The catalog kind is matched at one added construction site and nowhere
-/// else.
-///
-/// The private already-resolved-session value carries ONE variant per catalog kind:
-/// every kind builds its own session here, so no later step needs a second kind
-/// match to learn what a request resolves through.
+// RequestSession has one variant per catalog kind, built once here, so no later step needs a second kind match.
 #[tokio::test]
 async fn request_session_has_one_variant_per_kind() {
     let iceberg = iceberg_catalog().await;

@@ -62,8 +62,6 @@ fn the_type_relaxation_suite_and_fixture_are_wired_into_run_fixtures_and_make_te
     );
 }
 
-/// The direct-storage suite is wired into the suite gate: `make test-e2e` runs its binary, so no
-/// direct-storage regression can pass the gate by simply never being executed.
 #[test]
 fn make_test_e2e_runs_the_direct_storage_binary() {
     let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");

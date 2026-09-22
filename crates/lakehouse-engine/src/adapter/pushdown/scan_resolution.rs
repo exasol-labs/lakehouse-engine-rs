@@ -52,10 +52,7 @@ enum RequestSession {
     /// Boxed: a Unity Catalog session is several times the size of an Iceberg
     /// one, and a request holds exactly one session either way.
     Unity(Box<UnityCatalogSession>),
-    /// No catalog at all: the request's ONE admission-limited object store takes
-    /// the session's role, so its limiter bounds the whole request rather than
-    /// each leg. `base_path` is the subtree every table root is composed under
-    /// and `merge_mode` the footer policy the virtual schema resolved.
+    /// No catalog: the object store itself takes the session's role, bounding the whole request under one admission limiter.
     DirectStorage {
         store: Arc<dyn ObjectStore>,
         base_path: String,
@@ -80,10 +77,7 @@ impl<'a> TableScanResolver<'a> {
     /// identifier checked afterwards would surface a transport error from an
     /// unreachable catalog rather than the parse error it is.
     ///
-    /// `props` are the request's merged virtual-schema properties. Only the arm
-    /// whose kind declares a property reads one, so no property name is parsed for
-    /// a kind that ignores it and the kind-specific configuration stays inside the
-    /// one match this seam already owns.
+    /// `props`: the merged virtual-schema properties; each kind's arm reads only the property names it declares.
     pub(super) async fn for_request(
         kind: CatalogKind,
         catalog_uri: &str,
@@ -141,11 +135,11 @@ impl<'a> TableScanResolver<'a> {
     /// they were resolved THROUGH, its logical schema, its table root, its name
     /// mapping, and its partition columns.
     ///
-    /// `table_identifier` is the original-cased identifier recorded in `TABLE_MAP`
-    /// at create time — the dot-joined catalog identifier under a catalog kind, the
-    /// bare directory name under direct storage. `filter_json` is the request's raw
-    /// filter, forwarded unchanged so each format prunes by it wherever its own
-    /// planning can; `None` prunes nothing.
+    /// `table_identifier` is the original-cased identifier recorded in `TABLE_MAP` at
+    /// create time — dot-joined under a catalog kind, a bare directory name under
+    /// direct storage. `filter_json` is the request's raw filter, forwarded unchanged
+    /// so each format prunes by it wherever its own planning can; `None` prunes
+    /// nothing.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
@@ -200,18 +194,7 @@ impl<'a> TableScanResolver<'a> {
     }
 }
 
-/// Recover a direct-storage table's first-level directory name from the identifier
-/// recorded in `TABLE_MAP` — the ONE place the direct-storage identifier shape is
-/// decided.
-///
-/// A first-level directory name is the WHOLE identifier: this kind records the bare
-/// original-cased directory name, because a directory name may itself contain a dot
-/// and a dotted form could not be split back unambiguously.
-///
-/// Every value that names no first-level directory is refused here rather than
-/// composed into a table root: an empty or blank name, a name carrying a path
-/// separator, and the two relative-path names. Each would compose a root reaching
-/// OUTSIDE the storage base path the operator scoped the virtual schema to.
+/// The bare, un-split directory name (it may itself contain a dot); empty, separator-carrying, or relative-path values are refused, since they'd compose a table root outside the storage base path.
 fn direct_storage_directory(table_identifier: &str) -> Result<&str, UdfError> {
     let refusal = |reason: &str| {
         Err(UdfError::User(format!(

@@ -1002,10 +1002,7 @@ fn column_source_type_maps_to_exasol_in_one_home() {
     );
 }
 
-/// Scenario: A Parquet-sourced column reads its Arrow tag back through the
-/// existing tag parser and declares the same Exasol type `arrow_to_exasol_type`
-/// declares for the type that tag parses to — the declared type and the Arrow
-/// tag never drift apart because both routes share the one parser.
+/// Scenario: A Parquet-sourced column's declared type and its Arrow tag never drift apart — both routes share the one parser.
 #[test]
 fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_type() {
     for (tag, expected) in [
@@ -1039,9 +1036,7 @@ fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_typ
     }
 }
 
-/// Scenario: An unparseable Arrow tag still resolves to a declared Exasol
-/// type — the resolver stays infallible by falling through to the JSON
-/// VARCHAR fallback, same as any other unrecognized Arrow type.
+/// Scenario: An unparseable Arrow tag still resolves — falls through to the JSON VARCHAR fallback.
 #[test]
 fn parquet_column_source_type_with_an_unparseable_tag_resolves_to_varchar_json() {
     assert_eq!(
@@ -1053,12 +1048,7 @@ fn parquet_column_source_type_with_an_unparseable_tag_resolves_to_varchar_json()
     );
 }
 
-/// Scenario: Every Arrow type `compatible_exasol_type` admits renders to a tag
-/// via `arrow_type_to_tag` and parses back to itself via `arrow_type_from_tag`
-/// — the widened tag vocabulary loses no admitted type on the round trip. A
-/// tz-aware timestamp is round-tripped starting from the `"UTC"` label, since
-/// the tag intentionally discards which specific tz string an Arrow input
-/// carried (see `compatible_exasol_type`'s doc comment).
+/// Scenario: Every admitted Arrow type round-trips through its tag; a tz-aware timestamp round-trips from the `"UTC"` label since the tag discards which tz string the input carried.
 #[test]
 fn every_admitted_arrow_type_round_trips_through_its_tag() {
     use arrow::datatypes::TimeUnit;
@@ -1100,9 +1090,7 @@ fn every_admitted_arrow_type_round_trips_through_its_tag() {
     }
 }
 
-/// Scenario: A refused Arrow type (one `compatible_exasol_type` maps to `None`)
-/// still renders to the `"utf8"` fallback tag and parses back to `Utf8` — the
-/// JSON VARCHAR path stays reachable for every type outside the admitted set.
+/// Scenario: A refused Arrow type still renders/parses via the `"utf8"` fallback tag.
 #[test]
 fn refused_arrow_types_fall_back_to_the_utf8_tag() {
     for dt in [

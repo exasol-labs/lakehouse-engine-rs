@@ -145,9 +145,7 @@ pub async fn handle_pushdown(
         .cloned()
         .unwrap_or(Json::Null);
 
-    // The request's virtual-schema properties, merged the ONE way the handshake
-    // merged them to resolve the CONNECTION, and threaded to the resolver so the
-    // catalog kind that declares a property reads it inside its own arm.
+    // Merged the same way the handshake merged them, so each catalog-kind arm reads its own property from one source.
     let props = get_properties(request);
 
     // Inner-join handling MUST run before the single-table path. `handle_pushdown`

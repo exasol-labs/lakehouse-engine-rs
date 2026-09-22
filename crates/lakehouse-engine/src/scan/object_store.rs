@@ -203,9 +203,7 @@ pub(crate) fn build_table_root_store(
     )
 }
 
-/// The two concurrency bounds one object store is built under: how many idle
-/// connections it retains and, when the caller caps it, how many requests it
-/// admits at once.
+/// The idle-connection retention budget and, when capped, the concurrent-request admission limit.
 struct StoreBounds {
     connection_budget: usize,
     /// `None` leaves the store uncapped — the caller bounds concurrency itself.
@@ -286,12 +284,7 @@ fn build_undecorated_store(
     }
 }
 
-/// Erase a concrete store into `Arc<dyn ObjectStore>`, wrapping it in
-/// [`LimitStore`] first when an admission cap is given.
-///
-/// A concrete store must be wrapped BEFORE erasure: `LimitStore<T>` requires
-/// `T: ObjectStore`, which the already-erased `Arc<dyn ObjectStore>` does not
-/// itself satisfy.
+/// Wraps in `LimitStore` before erasing — `LimitStore<T>` requires `T: ObjectStore`, which the already-erased `Arc<dyn ObjectStore>` no longer satisfies.
 fn apply_admission_limit<T: ObjectStore>(
     store: T,
     admission_limit: Option<usize>,
@@ -302,24 +295,10 @@ fn apply_admission_limit<T: ObjectStore>(
     }
 }
 
-/// Concurrent-request admission cap for the ONE object store a direct-storage
-/// adapter call builds — a single bound over the whole call rather than one
-/// scoped per table (plan `add-direct-storage-catalog-kind`, Decision >
-/// Patterns: "Admission-limited object store per adapter call").
-///
-/// Unmeasured: a deliberately conservative first guess. A refresh sweeping
-/// many thousands of footers tolerates far more concurrency than a per-query
-/// plan; the measurement that would set it is issue #419.
+/// Concurrent-request cap for the one object store a direct-storage adapter call builds; unmeasured, a deliberately conservative default.
 pub(crate) const DIRECT_STORAGE_ADMISSION_LIMIT: usize = 16;
 
-/// Build the ONE admission-limited object store a direct-storage adapter call
-/// reads every table's directory listing, footers, and data files through.
-///
-/// Caps concurrent in-flight requests at [`DIRECT_STORAGE_ADMISSION_LIMIT`]
-/// via [`LimitStore`], and derives the warm-connection retention budget
-/// (`client_options_for`) from that SAME constant, so the call's two
-/// concurrency knobs — in-flight request admission and idle-connection
-/// retention — never drift into two different numbers for one call.
+/// Derives the idle-connection budget from the same constant as the admission cap, so the two concurrency knobs never drift apart.
 pub(crate) fn build_admission_limited_store(
     backend: &StorageBackend,
     store_url: &Url,

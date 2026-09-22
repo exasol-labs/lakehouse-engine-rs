@@ -22,19 +22,7 @@ use crate::types::mapping::arrow_type_to_tag;
 #[path = "parquet_format_reader_tests.rs"]
 mod tests;
 
-/// The raw-Parquet-directory reader: one storage directory resolved into the scan
-/// the pushdown layer plans against.
-///
-/// It implements NO table format and claims conformance to none. A directory that
-/// happens to hold an Iceberg or a Delta table is read here as raw Parquet — no
-/// snapshot selection, no delete file, no deletion vector — because the operator
-/// selected a catalog kind that names no table format, and a layout heuristic would
-/// fail a supported read on a directory it guessed wrong about.
-///
-/// It owns NO listing and NO footer parsing of its own: both come from
-/// [`resolve_parquet_directory`], the same seam table enumeration reads, so the
-/// schema a query plans against and the schema the virtual schema declared cannot be
-/// folded by two different policies.
+/// Reads every directory as raw Parquet (no Iceberg/Delta detection); reuses [`resolve_parquet_directory`] so declared and scanned schemas can't diverge.
 pub(super) struct ParquetFormatReader<'a> {
     store: &'a Arc<dyn ObjectStore>,
     table_root: &'a str,
@@ -43,10 +31,7 @@ pub(super) struct ParquetFormatReader<'a> {
 }
 
 impl<'a> ParquetFormatReader<'a> {
-    /// `store` is the request's ONE admission-limited object store, whose limiter
-    /// therefore bounds every leg of the request rather than each leg separately.
-    /// `connection` is the CONNECTION's static storage decision; this kind reaches
-    /// no credential-vending catalog, so that backend is also the effective one.
+    /// `store` is shared across every leg of the request (one admission limiter); this kind reaches no credential-vending catalog, so `connection`'s static backend is the effective one.
     pub(super) fn new(
         store: &'a Arc<dyn ObjectStore>,
         table_root: &'a str,
@@ -63,12 +48,7 @@ impl<'a> ParquetFormatReader<'a> {
 }
 
 impl FormatReader for ParquetFormatReader<'_> {
-    /// `filter_json` prunes nothing here and is deliberately unread: this kind has no
-    /// catalog statistics and no manifest, so the plan-time file list is every data
-    /// file under the table root and a filter narrows the rows the scan emits without
-    /// narrowing the files it reads. Path-based partition pruning is issue #408 and
-    /// footer-statistics pruning is issue #412; both are tracked exceptions rather
-    /// than silent gaps.
+    /// `filter_json` is deliberately unread: with no manifest or catalog statistics, the plan-time file list is every file under the table root regardless of filter.
     fn resolve_scan<'a>(
         &'a self,
         _filter_json: Option<&'a Json>,
@@ -95,16 +75,7 @@ impl FormatReader for ParquetFormatReader<'_> {
     }
 }
 
-/// One listed file as a scan entry: its path, its LISTED byte size, no delete
-/// mechanism, and no partition value.
-///
-/// The size comes from the listing response the seam already carried, so neither the
-/// scan's `ObjectMeta` construction nor a broadcast join's side sizing costs an
-/// object-store HEAD or a Parquet read.
-///
-/// The path is encoded relative to the table root, the compact form every
-/// unpartitioned delete-free scan already produces. A path the root does not cover
-/// is encoded as the absolute URI `FileEntry::path` documents for that case.
+/// Size comes from the listing response (no extra HEAD or Parquet read); path is encoded relative to the table root, or as an absolute URI if outside it.
 fn file_entry(file: &ParquetFile, prefix: &StorePath, store_root: &str) -> FileEntry {
     let relative = file.path.prefix_match(prefix).map(|parts| {
         parts
@@ -121,13 +92,7 @@ fn file_entry(file: &ParquetFile, prefix: &StorePath, store_root: &str) -> FileE
     }
 }
 
-/// The folded schema as logical fields bound by IDENTITY.
-///
-/// Each field carries neither a field-id nor a declared physical name, so the scan
-/// binds it by its own name through the binding Delta's `none` column-mapping mode
-/// already ships. No ordinal field-id is synthesized: an ordinal is a value no writer
-/// ever wrote into any file, so tagging the logical schema with one would invite a
-/// false `PARQUET:field_id` match against a file that does carry ids.
+/// Fields bind by name (identity), like Delta's `none` column-mapping mode; no ordinal field-id is synthesized, to avoid a false `PARQUET:field_id` match.
 fn logical_schema(schema: &Schema) -> Vec<LogicalField> {
     schema
         .fields()
@@ -144,14 +109,7 @@ fn logical_schema(schema: &Schema) -> Vec<LogicalField> {
         .collect()
 }
 
-/// The nested member descriptor a container column carries, or `None` for a
-/// primitive.
-///
-/// A nested column is declared with the string Arrow tag, so the scan reaches it
-/// through the JSON renderer rather than through a cast — and the renderer is
-/// selected by this descriptor's PRESENCE, so a struct, list, or map column without
-/// one would reach the cast path, where no string kernel exists. Every member binds
-/// by identity, matching the top-level fields.
+/// This descriptor's presence selects the JSON renderer for nested columns (declared with the string Arrow tag); without it, a struct/list/map would reach the cast path, which has no string kernel.
 fn nested_members(data_type: &DataType) -> Option<NestedMembers> {
     match data_type {
         DataType::Struct(fields) => Some(NestedMembers::Struct {

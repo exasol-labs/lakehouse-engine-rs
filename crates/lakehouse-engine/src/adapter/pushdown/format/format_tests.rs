@@ -159,12 +159,8 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
     );
 }
 
-/// Scenario: The format reader is selected at the same one site for a third source.
-///
-/// The third source selects the raw-Parquet reader at the SAME one site, matching the
-/// scan source rather than the catalog kind — so the permitted-site set the catalog
-/// kind's own baseline records gains no file. Selection reads nothing: the store holds
-/// no object, so a site that listed or parsed a footer here could not answer `Ok`.
+// Selecting the reader must not touch the store: it holds no object, so listing or
+// footer-parsing here would fail.
 #[test]
 fn third_scan_source_selects_the_parquet_reader() {
     let creds = offline_sigv4_creds();

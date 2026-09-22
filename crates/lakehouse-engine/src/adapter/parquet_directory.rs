@@ -1,20 +1,5 @@
-/// Answers "what are the data files under this storage prefix, and what is their combined
-/// schema" in ONE place, from an object store and a prefix alone.
-///
-/// Table enumeration and query planning both ask that question, so both read the same files and
-/// fold the same footers and cannot disagree about a table's columns. Neither caller carries its
-/// own listing filter, its own footer reader, or its own merge policy: two policies over one
-/// `MERGE_SCHEMA` value is the drift this module exists to prevent.
-///
-/// The module names no catalog kind, no table format, no Exasol connection, and no virtual-schema
-/// property — it takes a store and a prefix rather than a configuration. It receives no credential
-/// either: the caller's store holds them, so no message produced here can carry one.
-///
-/// The declaration decides the emitted width and the footer decides the structure. A fold taken
-/// over a narrower file set than the one that produced a stored declaration is not a defect to be
-/// repaired by narrowing that declaration: the emit boundary coerces every column to its declared
-/// `EMITS` type, and a plan-time fold WIDER than the declaration is the ordinary stale-declaration
-/// case `REFRESH VIRTUAL SCHEMA` already owns.
+//! Single source of truth for a prefix's Parquet file list and folded schema, so table
+//! enumeration and query planning can't disagree about a table's columns.
 use crate::types::widening::widen;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use exasol_udf_sdk::error::UdfError;
@@ -28,23 +13,18 @@ use parquet::file::metadata::ParquetMetaData;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Which of the listed files' footers the fold reads. Both modes return the SAME file list: the
-/// mode narrows which footers are read, never which files are scanned.
+/// Which footers the fold reads; both modes return the same file list — only the footer set differs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeMode {
-    /// Every listed file's footer, so a column appearing at several types resolves to the widest
-    /// one successive supported widenings reach.
+    /// Every listed file's footer; a column at several types resolves to the widest reachable one.
     FoldEveryFile,
-    /// Exactly the first listed file's footer. The other files are listed and scanned, but their
-    /// declared types are never read.
+    /// Only the first listed file's footer; the rest are listed and scanned but never read.
     SampleOneFile,
 }
 
 impl MergeMode {
-    /// The mode a resolved `MERGE_SCHEMA` value selects.
-    ///
-    /// The ONE owner of that decision, so the enumeration path and the plan path cannot resolve
-    /// one property value into two modes and declare a table at two different schemas.
+    /// The ONE owner of this decision, so enumeration and planning can't resolve `MERGE_SCHEMA`
+    /// into two different modes.
     pub fn for_merge_schema(merge_schema: bool) -> Self {
         match merge_schema {
             true => Self::FoldEveryFile,
@@ -58,16 +38,11 @@ pub struct ParquetFile {
     pub path: StorePath,
     /// Carried from the listing response, so no consumer issues an object-store HEAD for it.
     pub size: u64,
-    /// The file's `key=value` path segments below the prefix, deepest occurrence winning. Parsed
-    /// here so the parser exists once; read by nobody yet.
+    /// The file's `key=value` path segments below the prefix, deepest occurrence winning; unread
+    /// so far.
     pub partition_segments: HashMap<String, String>,
-    /// The PARSED footer, present exactly for the files the merge mode read and absent for every
-    /// other listed file. A consumer reads this presence rather than indexing positionally against
-    /// the file list: under [`MergeMode::SampleOneFile`] the two sequences have different lengths.
-    /// Under [`MergeMode::FoldEveryFile`] every file carries one, so a consumer pruning files from
-    /// footer statistics re-reads no footer. A consumer needing statistics for a file the
-    /// sample-one-file mode left unread asks this module for them rather than opening that footer
-    /// behind its back.
+    /// Present iff this file's footer was read under the merge mode — check presence, not
+    /// position, since [`MergeMode::SampleOneFile`] leaves most files' footers unset.
     pub footer: Option<Arc<ParquetMetaData>>,
 }
 
@@ -78,15 +53,9 @@ pub struct ParquetDirectory {
     pub schema: SchemaRef,
 }
 
-/// The store-relative prefix a storage URI names — the second half of the pair
-/// [`crate::scan::store_root_url`] answers the first half of.
-///
-/// A store built for a URI is scoped to that URI's `scheme://userinfo@host:port` slice: the
-/// bucket on S3, the container on ADLS. Everything below that slice is the prefix this module
-/// lists under, percent-decoded exactly as the object store itself addresses a key. Table
-/// enumeration and query planning both need it, so it is derived HERE rather than once per
-/// caller: two derivations could disagree about a key and list a table's files from two
-/// different prefixes.
+/// The store-relative prefix a storage URI names (pairs with [`crate::scan::store_root_url`]).
+/// Derived here once rather than per caller, so enumeration and planning can't disagree and list
+/// a table's files from two different prefixes.
 pub fn store_prefix(uri: &str) -> Result<StorePath, UdfError> {
     let url = url::Url::parse(uri)
         .map_err(|e| UdfError::User(format!("invalid storage URI '{uri}': {e}")))?;
@@ -94,10 +63,8 @@ pub fn store_prefix(uri: &str) -> Result<StorePath, UdfError> {
         .map_err(|e| UdfError::User(format!("invalid storage path in '{uri}': {e}")))
 }
 
-/// Lists `prefix`'s Parquet data files and folds the footers `mode` selects into one schema.
-///
-/// A prefix holding no data file answers an empty file list and an empty schema: whether that is
-/// a table at all is the caller's decision, not this module's.
+/// A prefix holding no data file returns an empty file list and schema; whether that counts as a
+/// table is the caller's decision.
 pub async fn resolve_parquet_directory(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,
@@ -109,8 +76,7 @@ pub async fn resolve_parquet_directory(
         MergeMode::SampleOneFile => files.len().min(1),
     };
 
-    // One fan-out rather than one serialized round-trip per file. The concurrency bound is the
-    // admission limiter the caller's store carries, so this module adds no second one.
+    // Concurrency is bounded by the caller's store's admission limiter, not a second one here.
     let read = try_join_all(
         files
             .iter()
@@ -150,16 +116,13 @@ async fn list_data_files(
         })
         .collect();
 
-    // The store's own listing order is not a contract, and the sample-one-file mode must sample
-    // the same footer on the enumeration path and the plan path.
+    // Listing order isn't a contract; sort so SampleOneFile picks the same footer every time.
     files.sort_by(|left, right| left.path.as_ref().cmp(right.path.as_ref()));
     Ok(files)
 }
 
-/// `location`'s path segments below `prefix`, or `None` when it is not a data file of that prefix.
-///
-/// A data file's name ends in `.parquet` and NO segment below the prefix begins with `_` or `.`,
-/// which excludes a hidden or staging directory's contents however their own names read.
+/// A data file's name ends in `.parquet` and no segment below the prefix starts with `_` or `.`,
+/// which excludes hidden/staging directories regardless of their own names.
 fn data_file_segments(location: &StorePath, prefix: &StorePath) -> Option<Vec<String>> {
     let segments: Vec<String> = location
         .prefix_match(prefix)?
