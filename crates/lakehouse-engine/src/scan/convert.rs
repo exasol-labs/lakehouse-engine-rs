@@ -6,11 +6,13 @@
 /// Only SDK `Value` types are produced — no Arrow types cross the `.so` boundary.
 use arrow::array::{
     Array, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, LargeStringArray, StringArray, TimestampMicrosecondArray,
-    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    Int16Array, Int32Array, Int64Array, LargeStringArray, PrimitiveArray, StringArray, UInt8Array,
     UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::datatypes::{DataType, TimeUnit};
+use arrow::datatypes::{
+    ArrowPrimitiveType, DataType, TimeUnit, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType,
+};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::value::{Decimal, Value};
@@ -165,48 +167,27 @@ const NANOS_PER_SECOND: i64 = 1_000_000_000;
 /// no digit it carries.
 ///
 /// Splits the raw value into whole seconds and a sub-second remainder rather than
-/// normalizing it to one integer count: an `i64` count of NANOSECONDS represents
-/// only 1677-2262, a narrower range than the timestamps an Iceberg or Delta source
-/// can legitimately carry, and an `i64` count of MICROSECONDS would drop the three
-/// digits a nanosecond column holds.
-///
-/// Fails rather than substituting a value when the instant falls outside the range
-/// `chrono::NaiveDateTime` represents — a substituted value would silently emit the
-/// wrong row instead of surfacing the loss.
+/// normalizing it to one integer count: an `i64` of nanoseconds spans only
+/// 1677-2262, and an `i64` of microseconds would drop a nanosecond column's last
+/// three digits. Fails rather than substituting a value out of range, which would
+/// silently emit the wrong row.
 fn timestamp_to_naive_datetime(
     col: &dyn Array,
     row: usize,
     unit: &TimeUnit,
 ) -> Result<NaiveDateTime, UdfError> {
+    fn cell<T: ArrowPrimitiveType<Native = i64>>(col: &dyn Array, row: usize) -> i64 {
+        col.as_any()
+            .downcast_ref::<PrimitiveArray<T>>()
+            .unwrap()
+            .value(row)
+    }
+
     let (raw, per_second) = match unit {
-        TimeUnit::Second => (
-            col.as_any()
-                .downcast_ref::<TimestampSecondArray>()
-                .unwrap()
-                .value(row),
-            1,
-        ),
-        TimeUnit::Millisecond => (
-            col.as_any()
-                .downcast_ref::<TimestampMillisecondArray>()
-                .unwrap()
-                .value(row),
-            1_000,
-        ),
-        TimeUnit::Microsecond => (
-            col.as_any()
-                .downcast_ref::<TimestampMicrosecondArray>()
-                .unwrap()
-                .value(row),
-            1_000_000,
-        ),
-        TimeUnit::Nanosecond => (
-            col.as_any()
-                .downcast_ref::<TimestampNanosecondArray>()
-                .unwrap()
-                .value(row),
-            NANOS_PER_SECOND,
-        ),
+        TimeUnit::Second => (cell::<TimestampSecondType>(col, row), 1),
+        TimeUnit::Millisecond => (cell::<TimestampMillisecondType>(col, row), 1_000),
+        TimeUnit::Microsecond => (cell::<TimestampMicrosecondType>(col, row), 1_000_000),
+        TimeUnit::Nanosecond => (cell::<TimestampNanosecondType>(col, row), NANOS_PER_SECOND),
     };
     let seconds = raw.div_euclid(per_second);
     let subsecond_nanos = (raw.rem_euclid(per_second) * (NANOS_PER_SECOND / per_second)) as u32;

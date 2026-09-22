@@ -400,11 +400,9 @@ where
 
 /// [`create_and_append_files`] with table `properties` supplied at creation.
 ///
-/// The REST catalog fixes a table's format version when it creates the table, and honours it only
-/// from the `format-version` PROPERTY: `TableCreation::format_version` is a no-op against a REST
-/// catalog. A seed needing an Iceberg v3 type — `timestamp_ns`, `timestamptz_ns`, `variant`,
-/// `geometry`, `geography`, `unknown` (Iceberg table spec, `§ Appendix E: Format version changes`)
-/// — must therefore come through here.
+/// The REST catalog honours a table's format version only from the `format-version` PROPERTY:
+/// `TableCreation::format_version` is a no-op against it. A seed needing an Iceberg v3 type
+/// (`timestamp_ns`, `variant`, `geometry`, ...) must therefore come through here.
 pub async fn create_and_append_files_with_properties<F, B>(
     catalog: &impl Catalog,
     namespace: &str,
@@ -3557,10 +3555,9 @@ pub const TSPRECISION_MICROS: [i64; 4] = [
 /// Nanoseconds since UNIX_EPOCH for the `ts_ns` column: TWO values, each on two rows, that differ
 /// ONLY below the microsecond.
 ///
-/// They are two distinct instants at `TIMESTAMP(9)` and ONE at every coarser declaration, so
+/// Two distinct instants at `TIMESTAMP(9)` and ONE at every coarser declaration, so
 /// `COUNT(DISTINCT)` alone separates an engine that carries a genuine sub-microsecond digit
-/// through to Exasol from one that clamps it away. [`TSPRECISION_MICROS`] cannot make that
-/// distinction: its finest gap is a whole microsecond.
+/// from one that clamps it away. [`TSPRECISION_MICROS`]'s finest gap is a whole microsecond.
 pub const TSPRECISION_NANOS: [i64; 4] = [
     BASE_TS_MICROS * 1_000 + 1,
     BASE_TS_MICROS * 1_000 + 2,

@@ -117,12 +117,8 @@ fn rendered_column(column: &[serde_json::Value], name: &str) -> Vec<String> {
         .collect()
 }
 
-/// `values` with each rendering's trailing fractional zeros removed.
-///
-/// The module note above records the WebSocket protocol rendering six fractional digits for a
-/// `TIMESTAMP(3)` column; how many it renders for a `TIMESTAMP(9)` one is not recorded anywhere
-/// and is not what these tests pin. Normalising both sides of a comparison keeps the assertion on
-/// the VALUE and lets the digit count be whatever the engine chose.
+/// `values` with each rendering's trailing fractional zeros removed, so a comparison
+/// asserts the VALUE and lets the protocol render whatever digit count it chose.
 fn without_trailing_fraction_zeros(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
@@ -136,9 +132,8 @@ fn without_trailing_fraction_zeros(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// [`engine_honors_declared_precision`] for the `[C3]` CAST-target domain, reporting on stderr
-/// when it declines so a leg's log records WHY a width was not exercised there rather than
-/// leaving the test silently vacuous.
+/// [`engine_honors_declared_precision`] for the `[C3]` CAST-target domain, logging why
+/// a width was not exercised so a declining leg is not silently vacuous.
 fn accepts_every_cast_precision(conn: &mut ExaConn) -> bool {
     if engine_honors_declared_precision(conn) {
         return true;
@@ -175,24 +170,18 @@ fn emits_clause(sql: &str) -> String {
     panic!("unbalanced EMITS clause in:\n{sql}")
 }
 
-/// PRECONDITION for every value assertion below: the scan's `EMITS` clause declares `expected`,
-/// so the width under test actually reached the emit boundary.
-///
-/// Asserted BEFORE any value is compared, because a failure here has two causes and neither is
-/// the SLC rejecting an Arrow unit — the outcome this plan exists to measure. Reported as a
-/// returned string rather than an `assert_eq!` on the whole statement so the wrapper shape,
-/// which carries its own declarations, stays readable.
+/// PRECONDITION for every value assertion below: the scan's `EMITS` clause declares
+/// `expected`, so the width under test actually reached the emit boundary. Returns the
+/// generated SQL so a caller can assert further on the wrapper shape.
 fn assert_emits_declares(conn: &mut ExaConn, query_sql: &str, expected: &str) -> String {
     let pushdown_sql = isolated_pushdown_statement(conn, query_sql);
     let emits = emits_clause(&pushdown_sql);
     assert!(
         emits.contains(expected),
-        "the scan must declare {expected} in its EMITS clause, got {emits}. Two causes produce \
-         this, NEITHER of them an SLC rejection of the Arrow unit: (1) this engine build stripped \
-         `fractionalSecondsPrecision` from the pushdown echo, the behaviour decision-log.md [C2] \
-         captured on 8.29.13 and this run measures on its own build; (2) the engine rejected the \
-         `TIMESTAMP(p)` CAST target as `0A000 Feature not supported`, the rejection [C3] records \
-         on 8.29.13 for every p outside {{3, 6}}.\ngenerated SQL: {pushdown_sql}"
+        "the scan must declare {expected} in its EMITS clause, got {emits}. Neither cause is an \
+         SLC rejection of the Arrow unit: either this build stripped `fractionalSecondsPrecision` \
+         from the pushdown echo (decision-log.md [C2]), or it rejected the `TIMESTAMP(p)` CAST \
+         target as `0A000 Feature not supported` ([C3]).\ngenerated SQL: {pushdown_sql}"
     );
     pushdown_sql
 }
@@ -276,10 +265,9 @@ fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
 //
 // The three widths a projected `CAST(ts AS TIMESTAMP(p))` reaches once
 // `ExaType::Timestamp { precision }` carries the declaration to the emit
-// boundary. (a) and (b) feed the SLC's strict Arrow-IPC block a `Nanosecond`
-// and a `Millisecond` unit — units no emit path in this repo had ever fed it,
-// which is what makes them a measurement rather than a regression test. (c)
-// pins the declined width, computed by Exasol in the adapter's own wrapper.
+// boundary. The `Nanosecond` and `Millisecond` units are ones no emit path in
+// this repo had ever fed the SLC, so those two legs are a measurement rather
+// than a regression test.
 
 /// The VS-served `schema.table` the probe is queried through.
 fn qualified_probe() -> String {
@@ -298,11 +286,10 @@ fn cast_projection_sql(target: &str) -> String {
 
 /// Scenario (type-mapping-timestamp-precision): a projected `CAST(ts AS TIMESTAMP(9))` declares
 /// nine digits in the scan's `EMITS` clause and emits an Arrow `Timestamp(Nanosecond, None)`
-/// column, which the SLC accepts and the engine honors — every seeded value survives and all four
-/// stay distinct.
+/// column the SLC accepts, so every seeded value survives and all four stay distinct.
 ///
 /// Guarded on the `>= 2025` arm: 8.29.13 rejects `TIMESTAMP(9)` as a CAST target outright
-/// (`0A000`, decision-log.md `[C3]`), before any pushdown happens.
+/// (`0A000`, decision-log.md `[C3]`).
 #[test]
 fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_value() {
     setup();
@@ -350,10 +337,9 @@ fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_value() {
 /// Arrow `Timestamp(Millisecond, None)` column and the seeded `.000001/.000002` and
 /// `.123456/.123457` pairs collapse pairwise, leaving two distinct values.
 ///
-/// Unguarded: `p = 3` is inside `[C3]`'s CAST-target domain on both engines. The EMITS literal
-/// itself IS arm-selected — `[C2]` captured 8.29.13 stripping `fractionalSecondsPrecision` from
-/// the pushdown echo, which leaves the adapter declaring a bare `TIMESTAMP`. Both declarations
-/// resolve to the same `Millisecond` unit, so the value assertion holds on both legs.
+/// Unguarded: `p = 3` is inside `[C3]`'s CAST-target domain on both engines. Only the EMITS
+/// literal is arm-selected, because 8.29.13 strips `fractionalSecondsPrecision` from the
+/// pushdown echo (`[C2]`); both declarations resolve to the same `Millisecond` unit.
 #[test]
 fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     setup();
@@ -413,9 +399,8 @@ fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
 /// adapter routes the request to its qualified single-table wrapper, which computes the CAST in
 /// Exasol's own dialect over the scanned rows.
 ///
-/// The scan's `EMITS` therefore carries the RAW `ts` declaration and must never carry
-/// `TIMESTAMP(2)`, and the returned values must equal what Exasol computes natively for the same
-/// expression over the same literals in the same session.
+/// The scan's `EMITS` therefore carries the RAW `ts` declaration, and the returned values equal
+/// what Exasol computes natively over the same literals in the same session.
 ///
 /// Guarded on the `>= 2025` arm: 8.29.13 rejects `TIMESTAMP(2)` as a CAST target outright
 /// (`0A000`, decision-log.md `[C3]`).
@@ -483,15 +468,14 @@ fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
 /// a no-op against a REST catalog — is declared at the width the engine can emit, and its
 /// genuinely sub-microsecond digit survives to Exasol on the arm that can hold it.
 ///
-/// This is the only end-to-end proof that a real ninth digit reaches Exasol: the
-/// `TSPRECISION_MICROS` fixture's finest gap is a whole microsecond, so `CAST(ts AS
-/// TIMESTAMP(9))` widens a value rather than carrying one. `TSPRECISION_NANOS` carries two
-/// instants that differ ONLY below the microsecond, so `COUNT(DISTINCT)` separates the arms.
+/// The only end-to-end proof that a real ninth digit reaches Exasol: `TSPRECISION_MICROS`'s
+/// finest gap is a whole microsecond, so `CAST(ts AS TIMESTAMP(9))` widens a value rather than
+/// carrying one, while `TSPRECISION_NANOS` carries two instants that differ ONLY below the
+/// microsecond.
 ///
-/// Both arms assert; neither is skipped. On `>= 2025` the column is declared `TIMESTAMP(9)` and
-/// both instants survive. On `< 2025` the engine clamp declares it bare `TIMESTAMP`, which
-/// `SYS.EXA_ALL_COLUMNS` reports as `TIMESTAMP(3)` (decision-log.md `[C1]`), and the two collapse
-/// to ONE — the six-digit loss the 8.x limitation names, measured rather than assumed.
+/// Both arms assert. On `>= 2025` the column is declared `TIMESTAMP(9)` and both instants
+/// survive. On `< 2025` the clamp declares it bare `TIMESTAMP`, reported as `TIMESTAMP(3)`
+/// (decision-log.md `[C1]`), and the two collapse to ONE.
 #[test]
 fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     setup();

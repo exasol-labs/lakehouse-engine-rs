@@ -136,17 +136,17 @@ pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
     if upper == "DATE" {
         return Some(DataType::Date32);
     }
-    if upper == "TIMESTAMP" {
-        return Some(DataType::Timestamp(
-            TimestampPrecision::from_declared_digits(BARE_TIMESTAMP_DECLARED_DIGITS).arrow_unit(),
-            None,
-        ));
-    }
-    if let Some(digits) = upper
-        .strip_prefix("TIMESTAMP(")
-        .and_then(|rest| rest.strip_suffix(')'))
-        .and_then(|digits| digits.trim().parse::<u32>().ok())
-    {
+    // Exasol's bare `TIMESTAMP` IS `TIMESTAMP(3)`, so it resolves through the same
+    // precision table as a parameterized declaration.
+    let timestamp_digits = if upper == "TIMESTAMP" {
+        Some(3)
+    } else {
+        upper
+            .strip_prefix("TIMESTAMP(")
+            .and_then(|rest| rest.strip_suffix(')'))
+            .and_then(|digits| digits.trim().parse::<u32>().ok())
+    };
+    if let Some(digits) = timestamp_digits {
         return Some(DataType::Timestamp(
             TimestampPrecision::from_declared_digits(digits).arrow_unit(),
             None,
@@ -173,10 +173,6 @@ pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
     // Arrow target). Returning None signals "route through the Utf8/JSON path".
     None
 }
-
-/// Exasol's bare `TIMESTAMP` IS `TIMESTAMP(3)`, so an unparameterized declaration
-/// resolves through the same precision table as a parameterized one.
-const BARE_TIMESTAMP_DECLARED_DIGITS: u32 = 3;
 
 /// Max precision a scale-0 DECIMAL fits into a 32-bit int (Exasol ExaType Int32).
 pub const DECIMAL_INT32_MAX_PRECISION: u8 = 9;
@@ -291,19 +287,12 @@ const FIRST_CALENDAR_VERSIONED_MAJOR: u32 = 2025;
 
 /// The fractional-second width a catalog declares for ONE timestamp COLUMN.
 ///
-/// Sole owner of that width's vocabulary and of every translation out of it: the
-/// Exasol declaration string, the Arrow `TimeUnit`, and the reverse reading of a
-/// declared Exasol precision. Both the adapter's declaration producers and the
-/// scan's emit boundary resolve through this one table, so a declared
-/// `TIMESTAMP(9)` cannot mean one width where it is declared and another where it
-/// is emitted.
-///
-/// Three values, not the ten Exasol precisions: these are the three sub-second
-/// Parquet timestamp encodings (MILLIS, MICROS, NANOS) and the three sub-second
-/// Arrow `TimeUnit`s, so the vocabulary is format-neutral by construction and a
-/// reader for a format this repo does not yet support names a value without
-/// widening the type. What a running engine can actually emit is a separate
-/// decision, owned by [`EngineTimestampSupport`].
+/// Sole owner of the Exasol declaration string, the Arrow `TimeUnit`, and the
+/// reverse reading of a declared precision, so a `TIMESTAMP(9)` cannot mean one
+/// width where it is declared and another where it is emitted. Three values, not
+/// the ten Exasol precisions: these are the three sub-second Parquet encodings
+/// and Arrow `TimeUnit`s, so the vocabulary is format-neutral. What the running
+/// engine can emit is [`EngineTimestampSupport`]'s decision, not this one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimestampPrecision {
     Millisecond,
@@ -331,15 +320,12 @@ impl TimestampPrecision {
         }
     }
 
-    /// The width a declared Exasol `TIMESTAMP(p)` names: the COARSEST of the three
-    /// that is not coarser than `p` — the widest unit that still holds every digit
-    /// `p` declares, floored at millisecond — so a mapping error can only ever emit
-    /// a value Exasol truncates, never one the scan has already destroyed.
+    /// The width a declared Exasol `TIMESTAMP(p)` names: the coarsest of the three
+    /// that is not coarser than `p`, so a mapping error can only emit a value
+    /// Exasol truncates, never one the scan has already destroyed.
     ///
     /// `p` below 3 floors at millisecond rather than reaching Arrow's `Second`
-    /// unit, which no emit path in this repo has ever fed the SLC; the only
-    /// declaration that reaches `p = 0` is a projected `CAST(x AS TIMESTAMP(0))`,
-    /// whose single Exasol-side truncation is the cheaper risk.
+    /// unit, which no emit path here has ever fed the SLC.
     pub fn from_declared_digits(digits: u32) -> Self {
         match digits {
             0..=3 => Self::Millisecond,
@@ -349,20 +335,15 @@ impl TimestampPrecision {
     }
 }
 
-/// The finest fractional-second width the RUNNING Exasol engine can emit — a
+/// The finest fractional-second width the running Exasol engine can emit, a
 /// property of the REQUEST, resolved once per `createVirtualSchema`.
 ///
-/// Sole owner of the version rule and of the clamp it implies. Both engine lines
-/// accept a parameterized declaration, but only the calendar-versioned line honors
-/// it: 8.x silently downgrades the declared type to `TIMESTAMP(3)` and strips
-/// `fractionalSecondsPrecision` from the pushdown echo (decision-log.md
-/// `[C1]`/`[C3]`). Clamping here rather than leaving that downgrade implicit keeps
-/// `SYS.EXA_ALL_COLUMNS` honest about what the adapter actually obtained.
-///
-/// Takes the version as a string rather than a `UdfContext`, so this module reads
-/// no ambient state and performs no I/O; the single `ctx.database_version()` read
-/// belongs to the adapter. What width a COLUMN carries is a separate decision,
-/// owned by [`TimestampPrecision`].
+/// Both engine lines accept a parameterized declaration, but only the
+/// calendar-versioned line honors it: 8.x silently downgrades it to
+/// `TIMESTAMP(3)` and strips `fractionalSecondsPrecision` from the pushdown echo
+/// (decision-log.md `[C1]`/`[C3]`). Clamping here keeps `SYS.EXA_ALL_COLUMNS`
+/// honest about what the adapter actually obtained. Takes the version as a string
+/// rather than a `UdfContext`, so this module performs no I/O.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineTimestampSupport {
     /// Exasol 8.x and earlier: every source width narrows to the bare `TIMESTAMP`.
@@ -378,12 +359,11 @@ impl EngineTimestampSupport {
     /// separates the two lines.
     ///
     /// Infallible by design, so the enumeration it feeds cannot fail on it. An empty
-    /// or unparseable version takes the fidelity-preserving arm — the user's recorded
-    /// deliberate choice (decision-log.md interview Q2). On an 8.x-like engine this
-    /// is not loud: the engine accepts and clamps the declaration (`[C1]`), so the
-    /// choice trades a silent misdeclaration in `SYS.EXA_ALL_COLUMNS` against
-    /// silently truncating every value on an unrecognised engine that would have
-    /// honored the precision.
+    /// or unparseable version takes the fidelity-preserving arm, the user's recorded
+    /// deliberate choice (decision-log.md interview Q2): an 8.x-like engine accepts
+    /// and clamps the declaration (`[C1]`), trading a misdeclared
+    /// `SYS.EXA_ALL_COLUMNS` against truncating every value on an unrecognised
+    /// engine that would have honored the precision.
     pub fn from_database_version(version: &str) -> Self {
         match version
             .split('.')

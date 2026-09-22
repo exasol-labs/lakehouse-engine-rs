@@ -21,9 +21,8 @@ pub struct ExpectedTimestampPrecision {
     ///
     /// Usable as a `CAST(... AS {declared_column_type})` target only within `p in {3, 6}`: Exasol
     /// 8.29.13 rejects every other parameterized precision as `0A000 Feature not supported`
-    /// (decision-log.md `[C3]`). [`ExpectedTimestampPrecision::NANOSECOND`] is therefore outside
-    /// the CAST domain on 8.x, and a caller casting to an arm's declared type must select that arm
-    /// through [`live_engine_version`] rather than assume it holds on both engines.
+    /// (decision-log.md `[C3]`). A caller casting to an arm's declared type must therefore select
+    /// the arm through [`engine_honors_declared_precision`].
     pub declared_column_type: &'static str,
     /// The number of distinct values `COUNT(DISTINCT)` reports over the seeded
     /// `.000001/.000002/.123456/.123457` fixture at this arm's precision.
@@ -70,8 +69,7 @@ pub fn live_engine_version(conn: &mut ExaConn) -> String {
 }
 
 /// Parse a version string's leading dot-separated component as an integer, this oracle's own
-/// parse shared by every rule below — the production rule is a separate implementation of the
-/// same shape.
+/// parse shared by every rule below.
 fn leading_version_component(version: &str) -> Option<u32> {
     version.split('.').next().and_then(|s| s.parse().ok())
 }
@@ -94,11 +92,9 @@ pub fn expected_timestamp_precision(conn: &mut ExaConn) -> ExpectedTimestampPrec
 /// True when the live engine's leading version component parses as an integer `>= 2025`, or does
 /// not parse at all.
 ///
-/// Both recorded engine differences turn on this one boundary, measured on 2025.2.1 and 8.29.13:
-/// `[C3]`'s CAST-target domain (8.29.13 rejects `TIMESTAMP(p)` for every `p` outside `{3, 6}` as
-/// `0A000 Feature not supported`, before any pushdown happens) and `[C2]`'s pushdown echo
-/// (8.29.13 omits `fractionalSecondsPrecision` entirely). Each caller names which of the two it
-/// depends on.
+/// Both recorded engine differences turn on this one boundary: `[C3]`'s CAST-target domain
+/// (8.29.13 rejects `TIMESTAMP(p)` outside `{3, 6}` as `0A000 Feature not supported`) and
+/// `[C2]`'s pushdown echo (8.29.13 omits `fractionalSecondsPrecision`). Each caller names which.
 pub fn engine_honors_declared_precision(conn: &mut ExaConn) -> bool {
     let version = live_engine_version(conn);
     leading_version_component(&version).is_none_or(|year| year >= 2025)

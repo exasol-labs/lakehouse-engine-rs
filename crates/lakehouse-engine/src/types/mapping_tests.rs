@@ -1247,37 +1247,14 @@ fn expected_mapping(pt: &PrimitiveType) -> (&'static str, DataType) {
 /// reports on the two engine lines.
 #[test]
 fn database_version_leading_component_selects_the_declared_timestamp_precision() {
+    use EngineTimestampSupport::{DeclaredPrecision, MillisecondOnly};
     let cases = [
-        (
-            "2025.2.1",
-            EngineTimestampSupport::DeclaredPrecision,
-            "TIMESTAMP(6)",
-        ),
-        (
-            "2026.1.0",
-            EngineTimestampSupport::DeclaredPrecision,
-            "TIMESTAMP(6)",
-        ),
-        (
-            "2025",
-            EngineTimestampSupport::DeclaredPrecision,
-            "TIMESTAMP(6)",
-        ),
-        (
-            "2024.12.31",
-            EngineTimestampSupport::MillisecondOnly,
-            "TIMESTAMP",
-        ),
-        (
-            "8.29.13",
-            EngineTimestampSupport::MillisecondOnly,
-            "TIMESTAMP",
-        ),
-        (
-            "7.1.20",
-            EngineTimestampSupport::MillisecondOnly,
-            "TIMESTAMP",
-        ),
+        ("2025.2.1", DeclaredPrecision, "TIMESTAMP(6)"),
+        ("2026.1.0", DeclaredPrecision, "TIMESTAMP(6)"),
+        ("2025", DeclaredPrecision, "TIMESTAMP(6)"),
+        ("2024.12.31", MillisecondOnly, "TIMESTAMP"),
+        ("8.29.13", MillisecondOnly, "TIMESTAMP"),
+        ("7.1.20", MillisecondOnly, "TIMESTAMP"),
     ];
     for (version, expected, expected_declaration) in cases {
         let resolved = EngineTimestampSupport::from_database_version(version);
@@ -1363,14 +1340,10 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
 }
 
 /// Scenario (type-mapping-timestamp-precision): Each of the four Iceberg timestamp
-/// variants is declared at ITS OWN source width, on both engine arms. The two `_ns`
-/// variants take `TIMESTAMP(9)` on the unclamped arm; collapsing them onto the
-/// microsecond declaration is the recorded defect, and it destroyed every nanosecond
-/// digit at the emit boundary. On the clamped arm all four take the bare declaration,
-/// a named Exasol 8.x target-type limitation. A zoned variant collapses to the plain
-/// Exasol `TIMESTAMP` family rather than `TIMESTAMP WITH LOCAL TIME ZONE`, which Exasol
-/// rejects as a UDF EMITS output type; that zone flattening and the fractional-second
-/// width are independent.
+/// variants is declared at ITS OWN source width, on both engine arms. On the clamped
+/// arm all four take the bare declaration, a named Exasol 8.x target-type limitation.
+/// A zoned variant collapses to the plain `TIMESTAMP` family rather than `TIMESTAMP
+/// WITH LOCAL TIME ZONE`, independently of the fractional-second width.
 #[test]
 fn every_iceberg_timestamp_variant_declares_its_own_source_width() {
     let cases = [

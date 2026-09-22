@@ -1,3 +1,5 @@
+use arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray};
+
 /// Convert a full RecordBatch to a Vec of rows (each row is a Vec<Value>), propagating any
 /// per-cell conversion error rather than panicking.
 ///

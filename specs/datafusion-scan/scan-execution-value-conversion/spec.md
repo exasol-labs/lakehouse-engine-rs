@@ -33,22 +33,20 @@ to `datafusion-scan/type-mapping`.
   An absent or wrong-arity declaration is drift and is reported rather than worked around.
 * `ExaType::Numeric` carries a REQUIRED `precision` and `scale` since `exasol-udf-sdk` 0.28.1,
   resolved at the handshake with an SLC-side default when the database sends none. An absent
-  payload is no longer constructible, so the drift guard both emit paths carried for it is deleted
-  rather than left unreachable. The out-of-range guard stays, because Exasol caps DECIMAL precision
-  at 36 and a wider value is still drift.
-* The scan can no longer distinguish a database-supplied NUMERIC payload from the SLC's default.
-  That detection was unreachable in practice, because a valid Exasol NUMERIC declaration always
-  carries both values, and the plan accepts the loss rather than re-deriving the pair from
+  payload is not constructible, so neither emit path guards against one. The out-of-range guard
+  stays, because Exasol caps DECIMAL precision at 36 and a wider value is still drift.
+* The scan cannot distinguish a database-supplied NUMERIC payload from the SLC's default. That
+  detection was unreachable in practice, because a valid Exasol NUMERIC declaration always carries
+  both values, and the loss is accepted rather than re-deriving the pair from
   `ColumnInfo::type_name`.
 * `ExaType` is a closed set of ten variants since 0.28.1. Upstream removed `TimestampTz`,
   `Geometry`, `HashType`, `IntervalYearToMonth` and `IntervalDayToSecond` as unreachable, confirmed
   by its own live canaries on 8.29.x, 2025.1.x and 2026.1.x. No emitted value changes, because
   Exasol never declared a UDF column at any of those types.
 * `ExaType::Timestamp { precision }` makes the declared fractional-second precision readable at the
-  emit boundary for the first time, so the coercion target follows it instead of being fixed at
-  microsecond. The precision-to-`TimeUnit` table is owned by
-  `datafusion-scan/type-mapping-timestamp-precision`, not restated here; this feature owns only the
-  rule that the coercion target is read from the declaration.
+  emit boundary, so the coercion target follows it rather than being fixed at microsecond. The
+  precision-to-`TimeUnit` table belongs to `datafusion-scan/type-mapping-timestamp-precision`. This
+  feature owns only the rule that the coercion target is read from the declaration.
 
 ## Scenarios
 

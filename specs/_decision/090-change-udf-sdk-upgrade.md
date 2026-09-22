@@ -12,10 +12,9 @@
 which `0.26.1` could not. Under the old, precision-blind type, the scan's Arrow coercion target was
 fixed at `Timestamp(Microsecond, None)` for every declared `TIMESTAMP(p)`. That fixed target
 destroyed every nanosecond digit of an Iceberg `timestamp_ns`/`timestamptz_ns` column through the
-strict (`safe: false`) cast in `coerce_column`, an unrecorded, silent gap distinct from the named
-Exasol 8.x millisecond-truncation trade-off. It also made the 8.x arm rely on Exasol silently
-narrowing an emitted microsecond value rather than on a declared narrowing. Two prior specs recorded
-a reason for staying at microsecond that was never verifiable either way.
+strict (`safe: false`) cast in `coerce_column`, an unrecorded gap distinct from the named Exasol
+8.x millisecond-truncation trade-off. It also left the 8.x arm relying on Exasol silently narrowing
+an emitted microsecond value rather than on a declared narrowing.
 
 ### Decision
 
@@ -33,20 +32,22 @@ equals EMITTED on both engine arms, so no component truncates after the scan.
 
 ### Consequences
 
-Group C measured all three emit widths live against `exasol/docker-db:2025.1.16` and
+All three emit widths were measured live against `exasol/docker-db:2025.1.16` and
 `exasol/docker-db:8.29.13`, from a cleared `exa-data` volume on each leg: 15 test binaries, 0
-failures on both. No SLC fingerprint mismatch at UDF load. No width was rejected. On 2025.1.16,
-`SYS.EXA_ALL_COLUMNS` reports `TIMESTAMP(6)` for Iceberg `timestamp`/`timestamptz` and `TIMESTAMP(9)`
-for `timestamp_ns`; the SLC accepted `Timestamp(Nanosecond, None)` into `TIMESTAMP(9)` and
-`Timestamp(Millisecond, None)` into `TIMESTAMP(3)`, neither ever fed to it before, and all four
-seeded nanosecond values round-tripped unchanged. A `timestamp_ns` v3 fixture, seeded through the
-`format-version` table property against `apache/iceberg-rest-fixture:1.10.1` and iceberg-rust
-0.10.0, confirmed the nanosecond evidence end to end rather than declaration-only: two instants
-differing only below the microsecond survived distinct. On 8.29.13, the adapter declares all three
-timestamp columns bare `TIMESTAMP`, `SYS.EXA_ALL_COLUMNS` reports each as `TIMESTAMP(3)`, and the
-SLC-reported `precision` for that bare-`TIMESTAMP` output column is 3, so
-`from_declared_digits` takes its `Millisecond` arm and DECLARED equals EMITTED on that arm too. A
-nanosecond column there loses its six digits exactly as the stated 8.x trade-off predicts.
+failures on both, no SLC fingerprint mismatch, no width rejected.
+
+On 2025.1.16, `SYS.EXA_ALL_COLUMNS` reports `TIMESTAMP(6)` for Iceberg `timestamp`/`timestamptz`
+and `TIMESTAMP(9)` for `timestamp_ns`. The SLC accepted `Timestamp(Nanosecond, None)` into
+`TIMESTAMP(9)` and `Timestamp(Millisecond, None)` into `TIMESTAMP(3)`, neither ever fed to it
+before. A `timestamp_ns` v3 fixture, seeded through the `format-version` table property against
+`apache/iceberg-rest-fixture:1.10.1` and iceberg-rust 0.10.0, carried two instants differing only
+below the microsecond and both survived distinct, so the nanosecond evidence is end to end rather
+than declaration-only.
+
+On 8.29.13, the adapter declares all three timestamp columns bare `TIMESTAMP`,
+`SYS.EXA_ALL_COLUMNS` reports each as `TIMESTAMP(3)`, and the SLC reports `precision: 3` for that
+column, so `from_declared_digits` takes its `Millisecond` arm and DECLARED equals EMITTED there
+too. A nanosecond column loses its six digits, exactly as the stated 8.x trade-off predicts.
 
 ## ADR: Two owners for the two precision axes, not one enum with a third variant
 
@@ -96,12 +97,11 @@ at different precisions by construction.
 ### Context
 
 For a projected `CAST(x AS TIMESTAMP(p))` with `p` outside `{0,3,6,9}`, `snap_timestamp_precision`
-rendered the DataFusion side at the nearest member of that set instead of the requested value — a
-silent approximation. It was paired with an unverified claim that the EMITS-declared Exasol column
-would truncate the up-snapped value back to the requested `p`; nothing ever measured that claim, and
-it predates issue #405. The approximation also directly contradicted this feature's own recorded
-rule that the rendered CAST target set must be exactly the set whose DataFusion result matches
-Exasol's.
+rendered the DataFusion side at the nearest member of that set instead of the requested value, a
+silent approximation. It was paired with an unmeasured claim that the EMITS-declared Exasol column
+would truncate the up-snapped value back to the requested `p`. The approximation also contradicted
+this feature's own recorded rule that the rendered CAST target set must be exactly the set whose
+DataFusion result matches Exasol's.
 
 ### Decision
 
@@ -109,8 +109,8 @@ Exasol's.
 declines every other value (`Err`/`None`); `snap_timestamp_precision` is deleted. A declined node
 routes into SQL the adapter itself writes in the Exasol dialect, which renders `TIMESTAMP(p)`
 verbatim for every `p` in 0-9, and Exasol computes the value natively there. Every position a CAST
-node can occupy — select list, WHERE, GROUP BY, ORDER BY — already had this route before this plan;
-none is added.
+node can occupy (select list, WHERE, GROUP BY, ORDER BY) already carries this route. No new route
+is added.
 
 ### Options Considered
 

@@ -2039,15 +2039,10 @@ fn timestamp_cast_select_request(precision: u64) -> Json {
 }
 
 /// Scenario (sql-comprehension/vs-expression-translator-cast): a projected
-/// `CAST(x AS TIMESTAMP(2))` names a precision DataFusion's SQL frontend cannot
-/// parse, so the DataFusion-dialect renderer declines it, `project_columns`
-/// widens to the full base row, and the request routes to the qualified
-/// single-table wrapper — which computes the CAST itself, in Exasol's own
-/// dialect, over the scanned rows.
-///
-/// This routing is what makes the decline safe rather than lossy: the scan never
-/// sees `TIMESTAMP(2)` in its `EMITS` clause, so no value is computed at a
-/// precision neither engine agreed on.
+/// `CAST(x AS TIMESTAMP(2))` names a precision DataFusion cannot parse, so the
+/// renderer declines it and the request routes to the qualified single-table
+/// wrapper, which computes the CAST in Exasol's own dialect. The scan never sees
+/// `TIMESTAMP(2)` in its `EMITS` clause, which is what makes the decline safe.
 #[test]
 fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(2));
