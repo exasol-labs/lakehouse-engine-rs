@@ -320,7 +320,7 @@ fn varchar_type_string_alone_does_not_decide_the_json_fallback() {
 /// Each Iceberg primitive → correct Exasol type; complex types → VARCHAR(2000000).
 #[test]
 fn iceberg_types_map_to_exasol_type() {
-    let ts_precision = TimestampPrecision::Millisecond;
+    let ts_precision = EngineTimestampSupport::MillisecondOnly;
     // primitives
     assert_eq!(
         iceberg_type_to_exasol(&Type::Primitive(PrimitiveType::Boolean), ts_precision),
@@ -429,9 +429,10 @@ fn exasol_type_to_arrow_reproduces_decimal_precision_binning() {
         ("BOOLEAN", DataType::Boolean),
         ("DOUBLE PRECISION", DataType::Float64),
         ("DATE", DataType::Date32),
+        // Exasol's bare TIMESTAMP is TIMESTAMP(3).
         (
             "TIMESTAMP",
-            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
         ),
         (
             "TIMESTAMP WITH LOCAL TIME ZONE",
@@ -459,18 +460,23 @@ fn exasol_type_to_arrow_reproduces_decimal_precision_binning() {
     }
 }
 
-/// Scenario: a `TIMESTAMP(p)` EMITS string (produced once the CAST renderer
-/// and EMITS-type derivation stop collapsing precision to bare `TIMESTAMP`)
-/// maps back to the same microsecond Arrow timestamp as bare `TIMESTAMP`,
-/// regardless of the declared precision `p`. The project already collapses
-/// every TIMESTAMP precision to one Arrow representation on the way in, so
-/// the emit-boundary coercion mirrors that on the way out (issue #212).
+/// Scenario (type-mapping-timestamp-precision): a `TIMESTAMP(p)` EMITS string maps back to
+/// the Arrow unit of that precision, not to one fixed unit.
 #[test]
 fn exasol_type_to_arrow_parses_timestamp_precision() {
-    let expected = Some(DataType::Timestamp(TimeUnit::Microsecond, None));
-    assert_eq!(exasol_type_to_arrow("TIMESTAMP(0)"), expected);
-    assert_eq!(exasol_type_to_arrow("TIMESTAMP(6)"), expected);
-    assert_eq!(exasol_type_to_arrow("TIMESTAMP(9)"), expected);
+    let cases = [
+        ("TIMESTAMP(0)", TimeUnit::Millisecond),
+        ("TIMESTAMP(6)", TimeUnit::Microsecond),
+        ("TIMESTAMP(9)", TimeUnit::Nanosecond),
+        ("TIMESTAMP", TimeUnit::Millisecond),
+    ];
+    for (declared, expected_unit) in cases {
+        assert_eq!(
+            exasol_type_to_arrow(declared),
+            Some(DataType::Timestamp(expected_unit, None)),
+            "declared={declared}"
+        );
+    }
 }
 
 /// Scenario: the live bench failures map to the correct integer Arrow target.
@@ -979,7 +985,7 @@ fn column_source_type_maps_to_exasol_in_one_home() {
     assert_eq!(
         column_source_type_to_exasol(
             &ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
-            TimestampPrecision::Millisecond,
+            EngineTimestampSupport::MillisecondOnly,
         ),
         "DECIMAL(20,0)"
     );
@@ -990,7 +996,7 @@ fn column_source_type_maps_to_exasol_in_one_home() {
                 precision: 0,
                 scale: 0,
             },
-            TimestampPrecision::Millisecond,
+            EngineTimestampSupport::MillisecondOnly,
         ),
         "DECIMAL(20,0)"
     );
@@ -1021,7 +1027,7 @@ fn unity_spark_types_map_to_exasol() {
             scale,
         };
         assert_eq!(
-            column_source_type_to_exasol(&source, TimestampPrecision::Millisecond),
+            column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly),
             expected,
             "type_name={type_name} precision={precision} scale={scale}"
         );
@@ -1032,7 +1038,7 @@ fn unity_spark_types_map_to_exasol() {
 /// DECIMAL both fall back to VARCHAR
 #[test]
 fn incompatible_unity_types_declared_varchar() {
-    let ts_precision = TimestampPrecision::Millisecond;
+    let ts_precision = EngineTimestampSupport::MillisecondOnly;
     for type_name in ["ARRAY", "MAP", "STRUCT", "BINARY", "INTERVAL", "VARIANT"] {
         let source = ColumnSourceType::Unity {
             type_name: type_name.to_string(),
@@ -1119,7 +1125,7 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
                 precision,
                 scale,
             })),
-            TimestampPrecision::Millisecond,
+            EngineTimestampSupport::MillisecondOnly,
         );
         let unity_result = column_source_type_to_exasol(
             &ColumnSourceType::Unity {
@@ -1127,7 +1133,7 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
                 precision,
                 scale,
             },
-            TimestampPrecision::Millisecond,
+            EngineTimestampSupport::MillisecondOnly,
         );
         assert_eq!(
             iceberg_result, expected,
@@ -1180,7 +1186,7 @@ fn iceberg_primitive_mappings_are_exhaustive_so_a_new_variant_breaks_the_build()
     for variant in &every_variant {
         let (expected_exasol, expected_arrow) = expected_mapping(variant);
         assert_eq!(
-            iceberg_primitive_to_exasol(variant, TimestampPrecision::Millisecond),
+            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::MillisecondOnly),
             expected_exasol,
             "iceberg_primitive_to_exasol mapped {variant:?} to an unexpected Exasol type"
         );
@@ -1231,46 +1237,53 @@ fn expected_mapping(pt: &PrimitiveType) -> (&'static str, DataType) {
     }
 }
 
-/// Scenario (datafusion-scan/type-mapping): A catalog timestamp column is declared
-/// TIMESTAMP(6) on Exasol 2025.x and later — the version rule and both declaration
-/// strings at their single owner. `8.29.13` and `2025.2.1` are the real Docker image
-/// tags `ctx.database_version()` reports on the two engine lines.
+/// Scenario (type-mapping-timestamp-precision): the version rule, and the declaration a
+/// microsecond source takes through each arm. The versions are real Docker image tags.
 #[test]
 fn database_version_leading_component_selects_the_declared_timestamp_precision() {
+    use EngineTimestampSupport::{DeclaredPrecision, MillisecondOnly};
     let cases = [
-        ("2025.2.1", TimestampPrecision::Microsecond, "TIMESTAMP(6)"),
-        ("2026.1.0", TimestampPrecision::Microsecond, "TIMESTAMP(6)"),
-        ("2025", TimestampPrecision::Microsecond, "TIMESTAMP(6)"),
-        ("2024.12.31", TimestampPrecision::Millisecond, "TIMESTAMP"),
-        ("8.29.13", TimestampPrecision::Millisecond, "TIMESTAMP"),
-        ("7.1.20", TimestampPrecision::Millisecond, "TIMESTAMP"),
+        ("2025.2.1", DeclaredPrecision, "TIMESTAMP(6)"),
+        ("2026.1.0", DeclaredPrecision, "TIMESTAMP(6)"),
+        ("2025", DeclaredPrecision, "TIMESTAMP(6)"),
+        ("2024.12.31", MillisecondOnly, "TIMESTAMP"),
+        ("8.29.13", MillisecondOnly, "TIMESTAMP"),
+        ("7.1.20", MillisecondOnly, "TIMESTAMP"),
     ];
     for (version, expected, expected_declaration) in cases {
-        let resolved = TimestampPrecision::from_database_version(version);
+        let resolved = EngineTimestampSupport::from_database_version(version);
         assert_eq!(resolved, expected, "version={version}");
         assert_eq!(
-            resolved.declaration(),
+            resolved
+                .clamp(TimestampPrecision::Microsecond)
+                .declaration(),
             expected_declaration,
             "version={version}"
         );
     }
 }
 
-/// Scenario (datafusion-scan/type-mapping): An empty or unparseable database version
-/// declares the microsecond precision — the SAME arm a recognised 2025.x version takes,
-/// deliberately not the bare-TIMESTAMP default.
+/// Scenario (type-mapping-timestamp-precision): an empty or unparseable version takes the
+/// same arm as 2025.x, deliberately not the conservative default.
 #[test]
-fn unreadable_database_version_declares_microsecond_precision() {
+fn unreadable_database_version_declares_the_source_width_unclamped() {
     for version in ["", "v2025.2.1", "unknown", ".2.1", "8x.1.0", " "] {
-        let resolved = TimestampPrecision::from_database_version(version);
+        let resolved = EngineTimestampSupport::from_database_version(version);
         assert_eq!(
             resolved,
-            TimestampPrecision::Microsecond,
+            EngineTimestampSupport::DeclaredPrecision,
             "version={version:?}"
         );
         assert_eq!(
-            resolved.declaration(),
+            resolved
+                .clamp(TimestampPrecision::Microsecond)
+                .declaration(),
             "TIMESTAMP(6)",
+            "version={version:?}"
+        );
+        assert_eq!(
+            resolved.clamp(TimestampPrecision::Nanosecond).declaration(),
+            "TIMESTAMP(9)",
             "version={version:?}"
         );
     }
@@ -1282,14 +1295,14 @@ fn unreadable_database_version_declares_microsecond_precision() {
 #[test]
 fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
     let cases = [
-        (TimestampPrecision::Microsecond, "TIMESTAMP(6)"),
-        (TimestampPrecision::Millisecond, "TIMESTAMP"),
+        (EngineTimestampSupport::DeclaredPrecision, "TIMESTAMP(6)"),
+        (EngineTimestampSupport::MillisecondOnly, "TIMESTAMP"),
     ];
-    for (precision, expected) in cases {
+    for (engine, expected) in cases {
         assert_eq!(
-            iceberg_primitive_to_exasol(&PrimitiveType::Timestamp, precision),
+            iceberg_primitive_to_exasol(&PrimitiveType::Timestamp, engine),
             expected,
-            "iceberg timestamp at {precision:?}"
+            "iceberg timestamp on {engine:?}"
         );
         assert_eq!(
             column_source_type_to_exasol(
@@ -1298,10 +1311,10 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
                     precision: 0,
                     scale: 0,
                 },
-                precision,
+                engine,
             ),
             expected,
-            "delta TIMESTAMP at {precision:?}"
+            "delta TIMESTAMP on {engine:?}"
         );
         assert_eq!(
             column_source_type_to_exasol(
@@ -1310,10 +1323,60 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
                     precision: 0,
                     scale: 0,
                 },
-                precision,
+                engine,
             ),
             expected,
-            "delta TIMESTAMP_NTZ at {precision:?}"
+            "delta TIMESTAMP_NTZ on {engine:?}"
+        );
+    }
+}
+
+/// Scenario (type-mapping-timestamp-precision): each of the four Iceberg timestamp variants
+/// is declared at its OWN source width, and all four take the bare declaration on the
+/// clamped arm. A zoned variant collapses to the plain `TIMESTAMP` family.
+#[test]
+fn every_iceberg_timestamp_variant_declares_its_own_source_width() {
+    let cases = [
+        (PrimitiveType::Timestamp, "TIMESTAMP(6)"),
+        (PrimitiveType::Timestamptz, "TIMESTAMP(6)"),
+        (PrimitiveType::TimestampNs, "TIMESTAMP(9)"),
+        (PrimitiveType::TimestamptzNs, "TIMESTAMP(9)"),
+    ];
+    for (variant, unclamped_declaration) in &cases {
+        assert_eq!(
+            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::DeclaredPrecision),
+            *unclamped_declaration,
+            "{variant:?} on an engine that honors the declared precision"
+        );
+        assert_eq!(
+            iceberg_primitive_to_exasol(variant, EngineTimestampSupport::MillisecondOnly),
+            "TIMESTAMP",
+            "{variant:?} on an engine that emits milliseconds only"
+        );
+    }
+}
+
+/// Scenario (type-mapping-timestamp-precision): a declared precision resolves to the
+/// coarsest width not coarser than it, floored at millisecond.
+#[test]
+fn declared_digits_resolve_to_the_arrow_unit_of_their_source_width() {
+    let cases = [
+        (0, TimeUnit::Millisecond),
+        (1, TimeUnit::Millisecond),
+        (2, TimeUnit::Millisecond),
+        (3, TimeUnit::Millisecond),
+        (4, TimeUnit::Microsecond),
+        (5, TimeUnit::Microsecond),
+        (6, TimeUnit::Microsecond),
+        (7, TimeUnit::Nanosecond),
+        (8, TimeUnit::Nanosecond),
+        (9, TimeUnit::Nanosecond),
+    ];
+    for (digits, expected_unit) in cases {
+        assert_eq!(
+            TimestampPrecision::from_declared_digits(digits).arrow_unit(),
+            expected_unit,
+            "declared precision={digits}"
         );
     }
 }
@@ -1337,26 +1400,6 @@ fn arrow_input_resolver_stays_outside_the_timestamp_version_gate() {
         )),
         "TIMESTAMP"
     );
-}
-
-/// Scenario (datafusion-scan/type-mapping): `timestamptz` keeps collapsing to the
-/// plain (now precision-gated) Exasol TIMESTAMP declaration rather than TIMESTAMP
-/// WITH LOCAL TIME ZONE, which Exasol rejects as a UDF EMITS output type.
-#[test]
-fn iceberg_timestamptz_declares_timestamp_at_the_gated_precision() {
-    let zoned = [PrimitiveType::Timestamptz, PrimitiveType::TimestamptzNs];
-    for variant in &zoned {
-        assert_eq!(
-            iceberg_primitive_to_exasol(variant, TimestampPrecision::Microsecond),
-            "TIMESTAMP(6)",
-            "{variant:?}"
-        );
-        assert_eq!(
-            iceberg_primitive_to_exasol(variant, TimestampPrecision::Millisecond),
-            "TIMESTAMP",
-            "{variant:?}"
-        );
-    }
 }
 
 /// Scenario (datafusion-scan/type-mapping): A parameterized `TIMESTAMP(p)` renders

@@ -10,21 +10,10 @@ to `datafusion-scan/type-mapping`.
 
 ## Background
 
-* **This delta is issue #350.** It relocates WHERE the JSON serialization of a nested column happens
-  and names the consequence for the value-conversion boundary. It changes ONE scenario. The emit-time
-  ExaType coercion is untouched.
-* **A nested column is rendered to JSON at the Arrow COLUMN level, upstream of the per-value
-  conversion.** `datafusion-scan/nested-json-rendering` owns the rendering and applies it while the
-  scan is still inside DataFusion, so the batch that reaches the emit boundary already carries `Utf8`.
-  This is not a preference: `arrow::json::writer::make_encoder`'s encoder borrows the array and holds
-  a reusable scratch buffer, so it is built once per column and reused across rows, which a per-cell
-  `fn(&ArrayRef, usize)` signature cannot express.
-* **The consequence is that `arrow_value_at` never receives a nested Arrow column, and its wildcard
-  display-string arm is therefore left exactly as recorded.** That arm stays a wildcard match on
-  `DataType`, unrouted through the Arrow classifier, per
-  `datafusion-scan/type-mapping-module-structure`'s recorded exemptions — this delta adds no arm to it
-  and removes none. Its only remaining reachable inputs are the NON-nested half of the incompatible
-  set, which arrives already `Utf8` through `CAST(col AS VARCHAR)`.
+* A nested column is rendered to JSON at the Arrow COLUMN level, upstream of the per-value
+  conversion. `datafusion-scan/nested-json-rendering` owns the rendering, so the batch that
+  reaches the emit boundary already carries `Utf8`. `arrow_value_at` therefore never receives
+  a nested Arrow column.
 * Only `Value::String` types cross the `.so` boundary on the value-conversion path; the raw-row path
   crosses as Arrow IPC bytes via `emit_batch` per `datafusion-scan/scan-execution`.
 * Logical Iceberg-to-Arrow and Arrow-to-Exasol type mapping RULES are owned by
@@ -36,6 +25,28 @@ to `datafusion-scan/type-mapping`.
   None-vs-UTC difference is reconciled at the EMITS-coercion scenario below — see
   `datafusion-scan/scan-execution`'s INT96 decode scenario for the physical-decode side of this
   reconciliation.
+* The scan reads its declared output type from `UdfContext::output_column(idx)`, which
+  reports the `ExaType` the engine chose for the call-site `EMITS (...)` clause. The
+  `ExaType` variant IS the bin Exasol chose (e.g. `Int32`, `Int64`, `Numeric`), so the
+  scan reads the result rather than re-deriving it from a type string.
+* The declared-type list is not optional. Every scan call has a call-site `EMITS` clause.
+  An absent or wrong-arity declaration is drift and is reported rather than worked around.
+* `ExaType::Numeric` carries a REQUIRED `precision` and `scale` since `exasol-udf-sdk` 0.28.1,
+  resolved at the handshake with an SLC-side default when the database sends none. An absent
+  payload is not constructible, so neither emit path guards against one. The out-of-range guard
+  stays, because Exasol caps DECIMAL precision at 36 and a wider value is still drift.
+* The scan cannot distinguish a database-supplied NUMERIC payload from the SLC's default. That
+  detection was unreachable in practice, because a valid Exasol NUMERIC declaration always carries
+  both values, and the loss is accepted rather than re-deriving the pair from
+  `ColumnInfo::type_name`.
+* `ExaType` is a closed set of ten variants since 0.28.1. Upstream removed `TimestampTz`,
+  `Geometry`, `HashType`, `IntervalYearToMonth` and `IntervalDayToSecond` as unreachable, confirmed
+  by its own live canaries on 8.29.x, 2025.1.x and 2026.1.x. No emitted value changes, because
+  Exasol never declared a UDF column at any of those types.
+* `ExaType::Timestamp { precision }` makes the declared fractional-second precision readable at the
+  emit boundary, so the coercion target follows it rather than being fixed at microsecond. The
+  precision-to-`TimeUnit` table belongs to `datafusion-scan/type-mapping-timestamp-precision`. This
+  feature owns only the rule that the coercion target is read from the declaration.
 
 ## Scenarios
 
@@ -58,11 +69,16 @@ to `datafusion-scan/type-mapping`.
 
 ### Scenario: Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch
 
-* *GIVEN* a scan spec carrying `emit_exa_types` (the declared Exasol EMITS type string per output column, positionally aligned)
-* *AND* a result Arrow batch whose column types diverge from those declarations (e.g. an `Int32` column declared `DECIMAL(10,0)`, a `Utf8View` column declared `VARCHAR`, or a `Decimal128(10,0)` column declared `DECIMAL(10,0)`)
+* *GIVEN* a scan call whose generated `EMITS (...)` clause declares one Exasol type per output column
+* *AND* a result Arrow batch whose column types diverge from those declarations, for example an `Int32` column declared `DECIMAL(20,0)`, a `Float32` column declared `DOUBLE PRECISION`, or a `Utf8View` column declared `VARCHAR(2000000)`
 * *WHEN* the scan UDF processes the batch
-* *THEN* the UDF SHALL coerce each output column to the Arrow type that `emit_batch`'s strict IPC feed requires for its declared ExaType, before passing the batch to `emit_batch`
-* *AND* the coercion SHALL reproduce Exasol's DECIMAL precision binning: scale-0 precision ≤ 9 → `Int32`; scale-0 precision ≤ 18 → `Int64`; scale > 0 or precision 19..=36 → `Decimal128(p,s)`
-* *AND* string-family declarations (`VARCHAR`, `CHAR`) SHALL coerce the column to `Utf8`, subsuming `Utf8View`/`BinaryView` view-type normalization
-* *AND* a column already of the correct Arrow type SHALL be passed through unchanged (zero-copy fast path)
-* *AND* when `emit_exa_types` is absent or shorter than the column count (specs that predate this field), unmatched columns SHALL fall back to view-type normalization only (`Utf8View` → `Utf8`, `BinaryView` → `Binary`)
+* *THEN* the UDF SHALL read the declared type of output column `i` from `UdfContext::output_column(i)`, and MUST NOT read any declared type carried in the scan spec
+* *AND* the UDF SHALL coerce each output column to the Arrow type that `emit_batch`'s strict IPC feed requires for the reported `ExaType`, before passing the batch to `emit_batch`, taking the DECIMAL binning from the reported variant rather than re-deriving it from a type string: `Int32` to `Int32`, `Int64` to `Int64`, and `Numeric { precision, scale }` to `Decimal128(precision, scale)`
+* *AND* the remaining variants SHALL map as `Double` to `Float64`, `Boolean` to `Boolean`, `Date` to `Date32`, `Timestamp { precision }` to `Timestamp(unit, None)` where `unit` FOLLOWS the reported `precision` under the one mapping `datafusion-scan/type-mapping-timestamp-precision` owns, and the three that remain (`String`, `Char` and `Unsupported`) to `Utf8`, which subsumes `Utf8View`/`BinaryView` normalization and preserves the behavior the removed type-string path gave an unrecognized declaration
+* *AND* the timestamp arm MUST NOT resolve a fixed `Microsecond` target at every precision, because `coerce_column` casts strictly (`safe: false`) and a microsecond target under a `TIMESTAMP(9)` declaration silently destroys the nanosecond digits of an Iceberg `timestamp_ns`/`timestamptz_ns` column, which `iceberg_primitive_to_arrow` already registers as Arrow `Timestamp(Nanosecond, _)`
+* *AND* the timestamp arm MUST NOT carry its own precision-to-unit table, because the adapter's declaration producer reads the same table and two copies would let a declared `TIMESTAMP(9)` mean one width on the declaring side and another at the emit boundary
+* *AND* the match over `ExaType` SHALL stay EXHAUSTIVE with no wildcard arm, so a variant added or removed upstream becomes a compile error here rather than a silent `Utf8` substitution
+* *AND* the UDF SHALL fail the call on either emit path, naming the offending output column, when a `Numeric` column reports a `precision` or `scale` outside what `Decimal128` represents, and MUST NOT substitute `Utf8` or any other target type, because a valid Exasol NUMERIC declaration always carries a precision and a scale within that range
+* *AND* a column already of the required Arrow type SHALL be passed through unchanged, on the zero-copy fast path
+* *AND* the UDF SHALL fail the call, and MUST NOT emit the batch, when `output_column_count()` does not equal the batch's column count, naming both counts, or when `output_column(i)` returns an error for a column the batch carries, naming `i`
+* *AND* the UDF MUST NOT fall back to a spec-carried or source-derived type in either failure case, because an absent declaration is drift rather than a legacy spec

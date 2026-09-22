@@ -30,7 +30,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use arrow::array::{
     BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray,
+    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
 use arrow::json::ReaderBuilder;
@@ -387,6 +387,33 @@ where
     F: IntoIterator<Item = B>,
     B: IntoIterator<Item = RecordBatch>,
 {
+    create_and_append_files_with_properties(
+        catalog,
+        namespace,
+        table_name,
+        iceberg_schema,
+        HashMap::new(),
+        files,
+    )
+    .await
+}
+
+/// [`create_and_append_files`] with table `properties` supplied at creation.
+///
+/// The REST catalog honours a format version only from the `format-version` PROPERTY:
+/// `TableCreation::format_version` is a no-op against it. Iceberg v3 types come through here.
+pub async fn create_and_append_files_with_properties<F, B>(
+    catalog: &impl Catalog,
+    namespace: &str,
+    table_name: &str,
+    iceberg_schema: IcebergSchema,
+    properties: HashMap<String, String>,
+    files: F,
+) -> Result<bool>
+where
+    F: IntoIterator<Item = B>,
+    B: IntoIterator<Item = RecordBatch>,
+{
     let ns = NamespaceIdent::new(namespace.to_string());
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
 
@@ -428,14 +455,13 @@ where
         .name(table_name.to_string())
         .schema(iceberg_schema)
         .partition_spec(partition_spec)
-        .properties(HashMap::new())
+        .properties(properties)
         .build();
     let mut table = match catalog.create_table(&ns, creation).await {
         Ok(t) => t,
-        Err(_) => catalog
-            .load_table(&ident)
-            .await
-            .context("load existing table after create failed")?,
+        Err(create_error) => catalog.load_table(&ident).await.with_context(|| {
+            format!("create table failed ({create_error}); loading it instead also failed")
+        })?,
     };
 
     // Check again after load (race).
@@ -2758,6 +2784,49 @@ pub fn typed_ts_case_distinct() -> i64 {
     )
 }
 
+/// Sample mean and sample standard deviation (SQL `STDDEV`, i.e.
+/// `STDDEV_SAMP`) of the non-`None` cells of an `f64` column — the reference
+/// oracle for `AVG`/`STDDEV` end-to-end assertions, computed independently of
+/// the scan/aggregate pushdown path this seed backs.
+fn avg_and_stddev_samp(values: impl Iterator<Item = Option<f64>>) -> (f64, f64) {
+    let xs: Vec<f64> = values.flatten().collect();
+    let n = xs.len() as f64;
+    let mean = xs.iter().sum::<f64>() / n;
+    let variance = xs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    (mean, variance.sqrt())
+}
+
+/// `AVG(id)`/`STDDEV(id)` oracle for `typed_distinct_probe`'s bare `BIGINT`
+/// `id` column (issue #399: exercises the `AvgSum`/`StatSum`/`StatSumSq`
+/// partial-aggregate mismatch over a non-`DOUBLE` column for the first time).
+pub fn typed_id_avg_stddev() -> (f64, f64) {
+    avg_and_stddev_samp(typed_probe().ids.into_iter().map(|id| Some(id as f64)))
+}
+
+/// `AVG(c_decimal_a)`/`STDDEV(c_decimal_a)` oracle (`DECIMAL(9,2)`).
+pub fn typed_decimal_a_avg_stddev() -> (f64, f64) {
+    let (_, scale) = TYPED_DECIMAL_A_PS;
+    let divisor = 10f64.powi(scale as i32);
+    avg_and_stddev_samp(
+        typed_probe()
+            .decimal_a
+            .into_iter()
+            .map(|v| v.map(|unscaled| unscaled as f64 / divisor)),
+    )
+}
+
+/// `AVG(c_decimal_b)`/`STDDEV(c_decimal_b)` oracle (`DECIMAL(20,4)`).
+pub fn typed_decimal_b_avg_stddev() -> (f64, f64) {
+    let (_, scale) = TYPED_DECIMAL_B_PS;
+    let divisor = 10f64.powi(scale as i32);
+    avg_and_stddev_samp(
+        typed_probe()
+            .decimal_b
+            .into_iter()
+            .map(|v| v.map(|unscaled| unscaled as f64 / divisor)),
+    )
+}
+
 /// Seed the `typed_distinct_probe` table into the `e2e_lakehouse` namespace across
 /// TWO data files (rows 1..=6, 7..=12). Idempotent.
 pub async fn seed_typed_distinct_probe(catalog_url: &str, warehouse: &str) -> Result<()> {
@@ -3452,6 +3521,10 @@ fn make_complex_join_probe_batch() -> RecordBatch {
     .expect("complex_join_probe RecordBatch construction is infallible")
 }
 
+/// The table property that fixes a format version, and the version admitting `timestamp_ns`.
+const ICEBERG_FORMAT_VERSION_PROPERTY: &str = "format-version";
+const ICEBERG_FORMAT_VERSION_3: &str = "3";
+
 /// Namespace and table for the timestamp-precision E2E probe
 /// (`add-timestamp-precision-versioning` task 6). Its OWN namespace, so this
 /// table never enters any other suite's `createVirtualSchema` table
@@ -3464,6 +3537,7 @@ pub const E2E_TSPRECISION_NAMESPACE: &str = "e2e_tsprecision";
 pub const E2E_TSPRECISION_TABLE: &str = "ts_precision_probe";
 pub const TSPRECISION_COL_TS: &str = "ts";
 pub const TSPRECISION_COL_TSTZ: &str = "tstz";
+pub const TSPRECISION_COL_TS_NS: &str = "ts_ns";
 
 /// Microseconds since UNIX_EPOCH for `2024-01-01 00:00:00.000001`,
 /// `.000002`, `.123456`, `.123457` — two pairs that collapse to the same
@@ -3474,6 +3548,16 @@ pub const TSPRECISION_MICROS: [i64; 4] = [
     BASE_TS_MICROS + 2,
     BASE_TS_MICROS + 123_456,
     BASE_TS_MICROS + 123_457,
+];
+
+/// Nanoseconds for the `ts_ns` column: TWO values, each on two rows, differing ONLY below the
+/// microsecond, so `COUNT(DISTINCT)` is 2 at `TIMESTAMP(9)` and 1 at every coarser width.
+/// [`TSPRECISION_MICROS`]'s finest gap is a whole microsecond and cannot make that distinction.
+pub const TSPRECISION_NANOS: [i64; 4] = [
+    BASE_TS_MICROS * 1_000 + 1,
+    BASE_TS_MICROS * 1_000 + 2,
+    BASE_TS_MICROS * 1_000 + 1,
+    BASE_TS_MICROS * 1_000 + 2,
 ];
 
 /// Seed the timestamp-precision probe (`id`, `ts`, `tstz`) into its own
@@ -3506,16 +3590,26 @@ pub async fn seed_timestamp_precision_probe(catalog_url: &str, warehouse: &str) 
                 Type::Primitive(PrimitiveType::Timestamptz),
             )
             .into(),
+            NestedField::required(
+                4,
+                TSPRECISION_COL_TS_NS,
+                Type::Primitive(PrimitiveType::TimestampNs),
+            )
+            .into(),
         ])
         .build()
         .context("build timestamp precision probe Iceberg schema")?;
 
-    create_and_append(
+    create_and_append_files_with_properties(
         &catalog,
         E2E_TSPRECISION_NAMESPACE,
         E2E_TSPRECISION_TABLE,
         iceberg_schema,
-        vec![make_timestamp_precision_probe_batch()],
+        HashMap::from([(
+            ICEBERG_FORMAT_VERSION_PROPERTY.to_string(),
+            ICEBERG_FORMAT_VERSION_3.to_string(),
+        )]),
+        std::iter::once(vec![make_timestamp_precision_probe_batch()]),
     )
     .await
     .context("seed timestamp precision probe table")?;
@@ -3537,6 +3631,11 @@ fn make_timestamp_precision_probe_batch() -> RecordBatch {
             DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
             false,
         ),
+        Field::new(
+            TSPRECISION_COL_TS_NS,
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            false,
+        ),
     ]));
 
     RecordBatch::try_new(
@@ -3548,6 +3647,7 @@ fn make_timestamp_precision_probe_batch() -> RecordBatch {
                 TimestampMicrosecondArray::from(TSPRECISION_MICROS.to_vec())
                     .with_timezone("+00:00"),
             ),
+            Arc::new(TimestampNanosecondArray::from(TSPRECISION_NANOS.to_vec())),
         ],
     )
     .expect("timestamp precision probe RecordBatch construction is infallible")

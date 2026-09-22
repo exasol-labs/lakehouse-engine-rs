@@ -37,6 +37,7 @@ use chrono::{TimeZone, Utc};
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
 use exasol_udf_sdk::test_support::TestContext;
+use exasol_udf_sdk::value::ExaType;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::{
@@ -414,7 +415,10 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     evict_session
         .runtime_env()
         .register_object_store(&Url::parse(&data_url).expect("register url"), evict_store);
-    let mut evict_ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut evict_ctx = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![]),
+        &[ExaType::Int64, scan_fixture::varchar()],
+    );
     let mut evict_timers = PhaseTimers::start();
     block_on(run_raw_scan_with_session(
         &mut evict_ctx,
@@ -466,7 +470,10 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     default_session
         .runtime_env()
         .register_object_store(&Url::parse(&data_url).expect("register url"), default_store);
-    let mut default_ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut default_ctx = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![]),
+        &[ExaType::Int64, scan_fixture::varchar()],
+    );
     let mut default_timers = PhaseTimers::start();
     block_on(run_raw_scan_with_session(
         &mut default_ctx,
@@ -549,7 +556,10 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         })
         .collect();
     let limit_session = SessionContext::new_with_config(session_config_for_spec(&limit_spec));
-    let mut limit_ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut limit_ctx = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![]),
+        &[ExaType::Int64, scan_fixture::varchar()],
+    );
     let mut limit_timers = PhaseTimers::start();
     block_on(run_raw_scan_with_session(
         &mut limit_ctx,
@@ -665,7 +675,10 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
         spec
     };
 
-    let mut ctx_a = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut ctx_a = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![]),
+        &[ExaType::Int64, scan_fixture::varchar()],
+    );
     block_on(run_scan_one(
         &mut ctx_a,
         spec_for(&data_a, &delete_a),
@@ -679,7 +692,10 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
         "1 row deleted out of 40 in file A"
     );
 
-    let mut ctx_b = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut ctx_b = scan_fixture::BatchCapturingCtx::declaring(
+        TestContext::scalar(vec![]),
+        &[ExaType::Int64, scan_fixture::varchar()],
+    );
     block_on(run_scan_one(
         &mut ctx_b,
         spec_for(&data_b, &delete_b),

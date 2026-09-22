@@ -416,28 +416,6 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
         .collect()
 }
 
-/// Snap a TIMESTAMP fractional-seconds precision to the nearest unit
-/// DataFusion 54's SQL frontend can parse in `CAST(x AS TIMESTAMP(p))`.
-///
-/// DataFusion 54 parses `TIMESTAMP(p)` only for `p` in `{0,3,6,9}`; any other
-/// value (1,2,4,5,7,8) is a parse error. This maps each precision to the
-/// nearest supported unit — `0→0, 1→0, 2→3, 4→3, 5→6, 7→6, 8→9`, with
-/// `0/3/6/9` mapping to themselves — and clamps anything above 9 to 9. The gaps
-/// have non-integer midpoints (1.5/4.5/7.5), so "nearest" is unambiguous. Only
-/// the DataFusion dialect needs this; Exasol's parser accepts every precision
-/// 0-9 verbatim. Pure integer arithmetic — no DataFusion types (this crate has
-/// no DataFusion dependency). Mirrors the colocated-pure-helper precedent of
-/// `format_decimal_exasol_style` (issue #211).
-fn snap_timestamp_precision(p: u64) -> u64 {
-    match p {
-        0..=1 => 0,
-        2..=4 => 3,
-        5..=7 => 6,
-        // 8, 9, and anything above 9 clamp to 9 (DataFusion's max).
-        _ => 9,
-    }
-}
-
 const DOUBLE_TYPE: &str = "DOUBLE";
 
 /// Map a VS `dataType` JSON object to a DataFusion SQL type name.
@@ -527,11 +505,15 @@ fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfE
                 // Exasol's own parser accepts any precision 0-9 verbatim.
                 Some(p) => match dialect {
                     Dialect::Exasol => Ok(format!("TIMESTAMP({p})")),
-                    // DataFusion 54's SQL frontend parses TIMESTAMP(p) only for
-                    // p in {0,3,6,9}; snap to the nearest supported unit.
-                    Dialect::DataFusion => {
-                        Ok(format!("TIMESTAMP({})", snap_timestamp_precision(p)))
-                    }
+                    // DataFusion 54 parses only p in {0,3,6,9}. Decline the rest
+                    // rather than approximate; the adapter renders them in the
+                    // Exasol dialect instead.
+                    Dialect::DataFusion => match p {
+                        0 | 3 | 6 | 9 => Ok(format!("TIMESTAMP({p})")),
+                        _ => Err(UdfError::User(format!(
+                            "unsupported CAST target type: TIMESTAMP({p})"
+                        ))),
+                    },
                 },
             }
         }

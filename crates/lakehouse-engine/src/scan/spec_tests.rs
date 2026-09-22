@@ -177,51 +177,39 @@ fn optional_fields_omitted_when_none() {
     );
 }
 
-/// `emit_exa_types` round-trips through JSON, is omitted when empty, and a
-/// legacy payload lacking it deserializes to an empty Vec (backward-compatible).
+/// The common blob declares no EMITS types (issue #399): the call-site
+/// `EMITS (...)` clause is the sole declaration and the scan reads it back
+/// through `UdfContext::output_column`. A row-scan spec — the one shape that
+/// used to carry the key — serializes without it, and a blob that still
+/// declares it reconstitutes to the same value as one that does not, so an
+/// in-flight payload from an older adapter is inert rather than a hard failure.
 #[test]
-fn emit_exa_types_round_trips_and_defaults_to_empty() {
-    // Empty (default): the field is omitted from serialized JSON.
+fn common_blob_carries_no_emit_type_key() {
     let row_spec = sample_spec();
-    assert!(row_spec.common.emit_exa_types.is_empty());
-    let row_json = row_spec.to_json();
     assert!(
-        !row_json.contains("emit_exa_types"),
-        "empty emit_exa_types must be absent from JSON: {row_json}"
+        !row_spec.common.projection.is_empty(),
+        "fixture must be a projecting row scan — the shape that carried the key"
     );
 
-    // Non-empty: the declared EMITS types survive the round-trip in order.
-    let mut spec = sample_spec();
-    spec.common.emit_exa_types = vec![
-        "DECIMAL(20,0)".to_string(),
-        "VARCHAR(2000000)".to_string(),
-        "DOUBLE PRECISION".to_string(),
-    ];
-    let json = spec.to_json();
+    let common_json = row_spec.common.to_json();
     assert!(
-        json.contains("emit_exa_types"),
-        "non-empty emit_exa_types must appear in JSON: {json}"
+        !common_json.contains("emit_exa_types"),
+        "common blob must carry no EMITS-type key: {common_json}"
     );
-    let back = ScanSpec::from_json(&json).unwrap();
+    assert!(
+        !row_spec.to_json().contains("emit_exa_types"),
+        "whole-spec JSON must carry no EMITS-type key either"
+    );
+
+    let mut legacy: serde_json::Value = serde_json::from_str(&common_json).unwrap();
+    legacy.as_object_mut().unwrap().insert(
+        "emit_exa_types".to_string(),
+        serde_json::json!(["DECIMAL(20,0)", "VARCHAR(2000000)"]),
+    );
     assert_eq!(
-        back.common.emit_exa_types,
-        vec![
-            "DECIMAL(20,0)".to_string(),
-            "VARCHAR(2000000)".to_string(),
-            "DOUBLE PRECISION".to_string()
-        ]
-    );
-
-    // Legacy payload without the field deserializes to an empty Vec.
-    let legacy_json = r#"{
-        "files": [["s3://w/f0.parquet", 100]],
-        "projection": [],
-        "storage": {"inline": {"s3": {"endpoint": "http://minio:9000", "region": "us-east-1", "access_key": "k", "secret_key": "s"}}}
-    }"#;
-    let legacy = ScanSpec::from_json(legacy_json).unwrap();
-    assert!(
-        legacy.common.emit_exa_types.is_empty(),
-        "missing emit_exa_types must default to empty (backward-compat)"
+        CommonScanSpec::from_json(&legacy.to_string()).unwrap(),
+        row_spec.common,
+        "a blob still declaring EMITS types must reconstitute identically"
     );
 }
 

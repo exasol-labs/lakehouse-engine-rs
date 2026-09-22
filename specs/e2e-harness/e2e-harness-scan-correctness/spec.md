@@ -10,75 +10,24 @@ the Exasol-version CI gate.
 
 ## Background
 
-* **This delta is issue #350.** It adds ONE scenario and ONE seed fixture: an Iceberg table carrying
-  populated `list`, `struct`, and `map` columns, queried end to end so the JSON rendering
-  `datafusion-scan/nested-json-rendering` specifies is proven against real Parquet data rather than
-  against a hand-built Arrow array. No existing scenario changes.
-* **No existing Iceberg seed helper writes a nested column.** Every `seed_*` function in
-  `crates/lakehouse-engine/tests/common/seed.rs` declares primitive `NestedField`s only, which is why
-  the gap this delta closes went untested: the pre-existing unit assertions for the JSON fallback used
-  a ZERO-FIELD struct, a shape that sidesteps every field-wise code path.
-* **The probe table needs the non-string-keyed map case, which is the one shape the JSON encoder
-  cannot render without stringification.** The Iceberg spec permits any key type
-  (https://iceberg.apache.org/spec/#nested-types), and `arrow-json`'s map encoder rejects every
-  non-`Utf8` key outright, so a fixture without such a column would leave the map-key contract
-  covered by unit tests alone.
-* **Every requested shape IS writable, including `map<int, string>`, which refutes a stale comment in
-  the seed module.** `crates/lakehouse-engine/tests/common/seed.rs` states that complex list/struct
-  columns *"are not written here because iceberg-rust does not expose a struct/list writer"*. A live
-  probe wrote `list<string>`, `list<int>`, `struct<street, city>`, `map<string, string>`,
-  `map<int, string>`, and `list<struct<a: int>>` into one Iceberg Parquet file with iceberg-rust 0.10
-  and parquet 58. That comment is corrected by this delta, not worked around.
-* **The real obstacle is nested FIELD-ID REASSIGNMENT, and the existing seed helpers cannot absorb
-  it.** `iceberg-rest-fixture` assigns fresh field ids on `create_table`, and
-  `common::seed::overlay_iceberg_field_ids` repairs only TOP-LEVEL ids, matching them by name — nested
-  ids keep the values the test authored. Feeding a batch built from the AUTHORED schema therefore fails
-  with `DataInvalid => Field id 9 not found in struct array`. The fixture MUST build its Arrow batch
-  from `iceberg::arrow::schema_to_arrow_schema(table.metadata().current_schema())` AFTER
-  `create_table` returns. `create_and_append_files` takes its batches up front and so cannot do this,
-  which is why a nested-type seed needs its own create-then-write path rather than that helper.
-* **The derived Arrow schema is already correct and carries a `PARQUET:field_id` on every nested
-  field** — list elements, struct fields, and map key/value alike — which is what makes the nested
-  field-id binding `datafusion-scan/nested-json-rendering` relies on implementable.
+* The nested-column E2E fixture seeds an Iceberg table carrying `list`, `struct`, and `map`
+  columns (including a non-`Utf8`-keyed map) to prove JSON rendering against real Parquet
+  data. The fixture builds its Arrow batch from the catalog-assigned schema AFTER
+  `create_table`, because the REST catalog reassigns nested field ids and the existing
+  `overlay_iceberg_field_ids` helper repairs only top-level ids.
 * The file-pruning E2E seeds a partitioned Iceberg table whose data files are distributed
   across partition values, so a partition-column predicate can prune whole files.
-* **This delta is issue #359.** It adds THREE scenarios and amends no recorded clause. The first is a
-  timestamp round-trip that asserts VALUE fidelity at the declared precision; the second gates the
-  suite on both supported Exasol major versions (`e2e-harness/e2e-harness`); the third repairs the
-  one existing assertion that compares a VS timestamp's RENDERED STRING against a native oracle.
-  Every recorded scenario, seed fixture, and provisioning helper otherwise stays as recorded.
-* **Every timestamp-adjacent assertion in the suite today is blind to precision loss, which is why
-  microsecond truncation shipped untested on every Exasol version.**
-  `e2e_projection_filter_limit_returns_correct_rows` asserts only that `event_ts` is non-null;
-  `e2e_int96_far_future_timestamp_scans_without_overflow` prefix-matches
-  `"9999-12-31 23:59:59"` at seconds resolution;
-  `count_distinct_bare_column_type_matrix_matches_single_node` counts distinct `c_ts` values whose
-  `typed_probe()` offsets are whole milliseconds (`BASE_TS_MICROS + ms * 1_000`), so no sub-millisecond
-  content exists to lose; and `create_vs_maps_iceberg_schema` matches the declared type by PREFIX, so
-  `TIMESTAMP` and `TIMESTAMP(6)` are indistinguishable to it. None of these is wrong — together they
-  simply cannot fail on a truncating engine.
-* **The new fixture needs its OWN namespace and virtual schema, per the recorded precedent.**
-  `vs-adapter/create-virtual-schema` records that a fixture added to `e2e_lakehouse` enters every
-  existing suite's `createVirtualSchema` enumeration and can churn assertions a plan promises to leave
-  untouched; `e2e_non_ascii_identifier_test` is the working precedent for a standalone binary that
-  seeds its own namespace, creates its own VS, and is invisible to the rest of the suite.
-* **The new E2E binary MUST be added to the `test-e2e` make target.** That target enumerates its test
-  binaries explicitly, so a new binary that is not listed never runs in the suite gate.
-* **The expected precision MUST be derived from the LIVE session, not from an environment variable or
-  a Docker image tag.** `cargo test --features exasol-e2e` runs against whatever stack is up, so an
-  `EXASOL_IMAGE`-derived expectation silently picks the wrong arm whenever the variable is absent or
-  stale — the same class of failure a stray `bench/.env` produces. Reading the running engine's own
-  version makes the expectation correct however the stack was started.
-* **The expectation MUST be an INDEPENDENT oracle, not a call into the production version parser.** A
-  test that computes its expected declaration by calling the very rule under test cannot fail when that
-  rule is wrong. The helper therefore carries its own explicit version-to-precision table, and the
-  production rule's own inputs are covered separately by a unit matrix over concrete version strings.
-* **Two whole-millisecond-agreeing value families are chosen deliberately, so the assertion cannot
-  depend on whether Exasol truncates or rounds to the declared precision.** Every seeded fractional
-  part has a fourth digit below 5 (`.000001`, `.000002`, `.123456`, `.123457`), so truncation and
-  round-to-nearest both produce the same millisecond value on the 8.x arm. Asserting the millisecond
-  PREFIX rather than a rounding mode keeps the 8.x expectation honest without pinning behavior the
-  scenario has not captured.
+* Timestamp precision E2E fixtures seed values that differ only below millisecond resolution,
+  with every fourth fractional digit below 5 so truncation and round-to-nearest agree at
+  millisecond resolution on the 8.x arm.
+* Each standalone E2E fixture needs its OWN namespace and virtual schema (per the
+  `e2e_non_ascii_identifier_test` precedent) and MUST be listed in the `test-e2e` make target.
+* Expected precision MUST be derived from the LIVE session (not an environment variable) and
+  MUST be an independent oracle (not a call into the production version parser).
+* Two seeded tables span the type mix: `typed_distinct_probe` (long, decimal, double, string,
+  date, timestamp, boolean) and `complex_probe` (list, struct, map declared `VARCHAR(2000000)`).
+  The `ExaType::Int32` bin is reached via a projected `CAST(<col> AS DECIMAL(5,0))`, since no
+  catalog-declared column in these fixtures bins to `Int32`.
 
 ## Scenarios
 
@@ -144,3 +93,13 @@ the Exasol-version CI gate.
 * *AND* the expected declared type SHALL come from the ONE shared helper this delta's round-trip scenario introduces, and MUST NOT be a second copy of the version-to-precision table
 * *AND* every OTHER recorded timestamp assertion SHALL keep passing unchanged on both version arms, and the reason SHALL be that each is precision-insensitive rather than precision-correct: the declared-type checks in `create_vs_maps_iceberg_schema` and the Delta/Unity suites match by PREFIX, the INT96 far-future check prefix-matches at seconds resolution, and every `HOURS_BETWEEN`/`YEAR`/`SECOND(c_ts, 3)`/`COUNT(DISTINCT)` assertion reads a derived value no sub-millisecond digit reaches
 * *AND* no recorded assertion SHALL be loosened to accommodate the new declaration — the one assertion that moves is the oracle's CAST target, and it moves to become MORE specific, not less
+
+### Scenario: The scan returns correct values across the type mix with no spec-carried emit types
+
+* *GIVEN* the seeded `typed_distinct_probe` and `complex_probe` Iceberg tables served through the virtual schema
+* *AND* a query whose select list spans `long`, `decimal`, `double`, `string`, `date`, `timestamp`, and `boolean` columns, a projected `CAST(<col> AS DECIMAL(5,0))`, and the `list`, `struct`, and `map` columns the adapter declares `VARCHAR(2000000)`
+* *WHEN* the query runs end to end against the local Exasol Docker container
+* *THEN* `EXPLAIN VIRTUAL` SHALL show the generated `EMITS (...)` clause declaring one Exasol type per select-list item
+* *AND* the generated scan spec JSON MUST NOT contain the key `emit_exa_types`, because the scan carries no second copy of that declaration
+* *AND* the query SHALL return the seeded values for every column, with the nested columns returned as the JSON documents `datafusion-scan/nested-json-rendering` specifies
+* *AND* the run SHALL exercise the `ExaType` variants `Int64`, `Int32`, `Numeric`, `Double`, `String`, `Date`, `Timestamp`, and `Boolean`, so the context-driven coercion is exercised for every variant the scan can meet on this fixture set rather than for a single column type

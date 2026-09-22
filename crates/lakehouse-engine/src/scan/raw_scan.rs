@@ -59,7 +59,7 @@ pub async fn run_raw_scan_with_session(
         .execute_stream()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
-    emit_stream(ctx, stream, &secrets, &spec.common.emit_exa_types, timers).await?;
+    emit_stream(ctx, stream, &secrets, timers).await?;
     // One per-VM telemetry record at completion. Gated + best-effort: a
     // logging/sink failure NEVER fails the scan (the scan already succeeded).
     emit_phase_telemetry(ctx, timers);

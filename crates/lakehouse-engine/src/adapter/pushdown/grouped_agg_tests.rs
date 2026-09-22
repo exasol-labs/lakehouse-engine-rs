@@ -1,6 +1,6 @@
 use super::super::detect_aggregates;
 use super::super::joins::{
-    build_qualified_single_table_fallback_sql, referenced_column_projection,
+    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
 };
 use super::super::support::{
     DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, extract_all_column_types, shard_count,
@@ -2051,16 +2051,16 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     let fan_out_spec = ScanSpec {
         common: CommonScanSpec {
             projection: proj_cols,
-            emit_exa_types: proj_types,
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
         files: vec![],
     };
+    let fan_out = FanOutProjection::new(&fan_out_spec, &proj_types).expect("aligned fan-out");
     let sql = build_qualified_single_table_fallback_sql(
         &request,
         &pushdown_req,
-        &fan_out_spec,
+        &fan_out,
         &[vec![("s3://wh/f0.parquet".to_string(), 1u64)]],
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,

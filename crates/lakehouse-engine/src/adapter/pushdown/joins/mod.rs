@@ -26,7 +26,7 @@ pub(super) use sql_builders::qualified_single_table_fallback_pushdown;
 // production callers go through `qualified_single_table_fallback_pushdown` above.
 #[cfg(test)]
 pub(super) use sql_builders::{
-    build_qualified_single_table_fallback_sql, referenced_column_projection,
+    FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
 };
 
 pub(super) use planning::JoinWindowPlan;

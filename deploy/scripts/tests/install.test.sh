@@ -1241,7 +1241,7 @@ test_version_smoke_pass_and_fail() {
   # run_smoke_test's last statement, so falling through would report an unverified install as good.
   reset_env
   local out rc
-  # shellcheck disable=SC2317  # both overrides are reached indirectly, from the sourced run_smoke_test
+  # shellcheck disable=SC2317,SC2329  # both overrides are reached indirectly, from the sourced run_smoke_test
   out="$(
     source "$INSTALLER"
     run_sql() { printf 'LAKEHOUSE_ENGINE_VERSION\n0.45.0\n'; }

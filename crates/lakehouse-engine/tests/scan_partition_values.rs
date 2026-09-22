@@ -32,6 +32,7 @@ use datafusion::execution::context::SessionContext;
 use datafusion::physical_plan::ExecutionPlan;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::TestContext;
+use exasol_udf_sdk::value::ExaType;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage, StorageBackend, StorageProps,
@@ -203,12 +204,13 @@ async fn try_run_scan_with_store(
     spec: &ScanSpec,
     register_url: &str,
     store: Arc<dyn ObjectStore>,
+    emits: &[ExaType],
 ) -> Result<Vec<RecordBatch>, UdfError> {
     let session = SessionContext::new_with_config(session_config_for_spec(spec));
     session
         .runtime_env()
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(TestContext::scalar(vec![]), emits);
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(
         &mut ctx,
@@ -223,13 +225,21 @@ async fn try_run_scan_with_store(
 
 /// Run the production raw scan over a plain `LocalFileSystem`, panicking on scan
 /// failure.
-fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
+fn run_scan(spec: &ScanSpec, register_url: &str, emits: &[ExaType]) -> Vec<RecordBatch> {
     block_on(try_run_scan_with_store(
         spec,
         register_url,
         Arc::new(LocalFileSystem::new()),
+        emits,
     ))
     .expect("raw scan must succeed")
+}
+
+/// The `EMITS` list for `basic_partitioned_spec`'s full logical schema:
+/// `letter` VARCHAR, `number` DECIMAL in the engine's Int64 bin, `a_float`
+/// DOUBLE PRECISION.
+fn letter_number_float_emits() -> Vec<ExaType> {
+    vec![scan_fixture::varchar(), ExaType::Int64, ExaType::Double]
 }
 
 fn total_rows(batches: &[RecordBatch]) -> usize {
@@ -274,7 +284,7 @@ fn absent_partition_column_is_materialized_per_file() {
     let table_root = dir_url(&dir);
     let spec = basic_partitioned_spec(entries, &table_root, None, None);
 
-    let rows = run_scan(&spec, &table_root);
+    let rows = run_scan(&spec, &table_root, &letter_number_float_emits());
 
     assert_eq!(total_rows(&rows), 6, "one row per file across six files");
     let got = letter_number_rows(&rows);
@@ -314,7 +324,7 @@ fn absent_and_empty_partition_values_materialize_null() {
 
     let table_root = dir_url(&dir);
     let spec = basic_partitioned_spec(vec![hive_entry, empty_entry], &table_root, None, None);
-    let rows = run_scan(&spec, &table_root);
+    let rows = run_scan(&spec, &table_root, &letter_number_float_emits());
 
     assert_eq!(total_rows(&rows), 2);
     let got = letter_number_rows(&rows);
@@ -384,7 +394,16 @@ fn partition_values_convert_to_their_declared_type_or_fail_cleanly() {
         ]),
     );
     let ok_spec = spec_with_flag(vec![ok_entry], &table_root);
-    let rows = run_scan(&ok_spec, &table_root);
+    let rows = run_scan(
+        &ok_spec,
+        &table_root,
+        &[
+            scan_fixture::varchar(),
+            ExaType::Int64,
+            ExaType::Double,
+            ExaType::Int32,
+        ],
+    );
     assert_eq!(total_rows(&rows), 1);
     let flags = rows[0]
         .column(3)
@@ -410,6 +429,12 @@ fn partition_values_convert_to_their_declared_type_or_fail_cleanly() {
         &bad_spec,
         &table_root,
         Arc::new(LocalFileSystem::new()),
+        &[
+            scan_fixture::varchar(),
+            ExaType::Int64,
+            ExaType::Double,
+            ExaType::Int32,
+        ],
     ))
     .expect_err("an unrepresentable partition value must be refused, not applied");
     let msg = err.to_string();
@@ -497,7 +522,11 @@ fn logged_partition_value_wins_over_a_physical_partition_column() {
         files: vec![entry],
     };
 
-    let rows = run_scan(&spec, &table_root);
+    let rows = run_scan(
+        &spec,
+        &table_root,
+        &[scan_fixture::varchar(), ExaType::Int64],
+    );
     assert_eq!(total_rows(&rows), 1);
     let letters = rows[0]
         .column(0)
@@ -531,7 +560,11 @@ fn materialized_partition_column_serves_projection_filter_and_group_by() {
 
     let mut proj_spec = basic_partitioned_spec(entries.clone(), &table_root, None, None);
     proj_spec.common.projection = vec!["LETTER".into(), "NUMBER".into()];
-    let proj_rows = run_scan(&proj_spec, &table_root);
+    let proj_rows = run_scan(
+        &proj_spec,
+        &table_root,
+        &[scan_fixture::varchar(), ExaType::Int64],
+    );
     assert_eq!(total_rows(&proj_rows), 6);
     for b in &proj_rows {
         assert_eq!(b.num_columns(), 2, "projection must drop A_FLOAT");
@@ -543,7 +576,7 @@ fn materialized_partition_column_serves_projection_filter_and_group_by() {
         Some("\"LETTER\" = 'a'".to_string()),
         None,
     );
-    let filter_rows = run_scan(&filter_spec, &table_root);
+    let filter_rows = run_scan(&filter_spec, &table_root, &letter_number_float_emits());
     let mut numbers: Vec<i64> = letter_number_rows(&filter_rows)
         .into_iter()
         .map(|(_, n)| n)
@@ -723,7 +756,7 @@ fn scan_without_partition_columns_is_byte_identical() {
          the partition split introduced no plan-shape change for an unpartitioned table"
     );
 
-    let rows = run_scan(&spec, &table_root);
+    let rows = run_scan(&spec, &table_root, &[ExaType::Int64, ExaType::Double]);
     assert_eq!(total_rows(&rows), 1);
 
     let _ = std::fs::remove_dir_all(&dir);

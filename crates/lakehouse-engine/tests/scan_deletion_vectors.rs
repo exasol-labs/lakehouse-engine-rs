@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::TestContext;
+use exasol_udf_sdk::value::ExaType;
 use futures::stream::BoxStream;
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
@@ -210,7 +211,10 @@ async fn try_run_scan_with_store(
     session
         .runtime_env()
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+    // Every fixture here projects the single `VALUE` column, an int32 the
+    // adapter declares in the engine's Int32 DECIMAL bin.
+    let mut ctx =
+        scan_fixture::BatchCapturingCtx::declaring(TestContext::scalar(vec![]), &[ExaType::Int32]);
     let mut timers = PhaseTimers::start();
     run_raw_scan_with_session(
         &mut ctx,
@@ -753,7 +757,10 @@ fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
             &Url::parse(&file_url(&data_path)).expect("register url"),
             Arc::new(LocalFileSystem::new()),
         );
-        let mut ctx = scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]));
+        let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
+            TestContext::scalar(vec![]),
+            &[ExaType::Int32],
+        );
         let mut timers = PhaseTimers::start();
         let err = block_on(run_raw_scan_with_session(
             &mut ctx,

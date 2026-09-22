@@ -596,7 +596,6 @@ pub(super) fn build_row_sql_with_root(
         common: CommonScanSpec {
             table_root: table_root.to_string(),
             projection: proj_items.clone(),
-            emit_exa_types: proj_types.clone(),
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },

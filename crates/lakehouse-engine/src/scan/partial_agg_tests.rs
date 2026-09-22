@@ -1,5 +1,11 @@
 use super::*;
+use crate::scan::emit::declared_columns_test_support::{declared, numeric, varchar};
 use crate::scan::spec::AggKind;
+use arrow::array::{ArrayRef, Decimal128Array, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use exasol_udf_sdk::value::ExaType;
+use std::sync::Arc;
 
 /// Test-only no-filter wrapper over `build_partial_agg_sql_filtered`
 /// (`filter = None`); also reached by `grouped_agg_tests` and
@@ -478,9 +484,12 @@ fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
 }
 
 /// Stat aggregate null fallback row has 3 values: cnt=0, sum=NULL, sumsq=NULL.
+///
+/// The counter arrives at the `DECIMAL(20,0)` the adapter declares for every
+/// counting partial column, so its zero is a `Value::Numeric`.
 #[test]
 fn stat_aggregate_null_fallback_row_has_three_values() {
-    use exasol_udf_sdk::value::Value;
+    use exasol_udf_sdk::value::{Decimal, Value};
     for kind in &[
         AggKind::VarPop,
         AggKind::VarSamp,
@@ -492,12 +501,118 @@ fn stat_aggregate_null_fallback_row_has_three_values() {
             column: Some("X".into()),
             arg_expr: None,
         }];
-        let row = emit_null_partial_row(&plans);
+        let row = emit_null_partial_row(
+            &plans,
+            &declared(&[
+                ("PARTIAL_statcnt_0", numeric(20, 0)),
+                ("PARTIAL_statsum_0", ExaType::Double),
+                ("PARTIAL_statsumsq_0", ExaType::Double),
+            ]),
+        )
+        .expect("the stat fallback row must build against its declared columns");
         assert_eq!(row.len(), 3, "{kind:?} fallback row must have 3 values");
-        assert_eq!(row[0], Value::Int64(0), "{kind:?} cnt must be 0");
+        assert_eq!(
+            row[0],
+            Value::Numeric(Decimal {
+                unscaled: 0,
+                scale: 0
+            }),
+            "{kind:?} cnt must be 0 at its declared DECIMAL(20,0)"
+        );
         assert_eq!(row[1], Value::Null, "{kind:?} sum must be NULL");
         assert_eq!(row[2], Value::Null, "{kind:?} sumsq must be NULL");
     }
+}
+
+/// Scenario: an empty shard's fallback row carries each counter's zero at the
+/// `Value` variant its declared output column admits, and NULL for every value
+/// column.
+///
+/// Both arms of the single-group path emit into the SAME declared columns, so a
+/// fixed `Value::Int64(0)` would hand the SDK a variant the column rejects for
+/// exactly the columns the adapter declares `DECIMAL(20,0)` — the populated arm
+/// coerces to that declaration, and this arm must reach the same variant.
+#[test]
+fn null_partial_row_conforms_to_declared_output_columns() {
+    use exasol_udf_sdk::value::{Decimal, Value};
+
+    let plans = vec![
+        AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        },
+        AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+            arg_expr: None,
+        },
+    ];
+
+    let row = emit_null_partial_row(
+        &plans,
+        &declared(&[
+            ("PARTIAL_cnt_0", numeric(20, 0)),
+            ("PARTIAL_sum_1", ExaType::Double),
+        ]),
+    )
+    .expect("an empty shard must build its row against the declared columns");
+
+    assert_eq!(
+        row,
+        vec![
+            Value::Numeric(Decimal {
+                unscaled: 0,
+                scale: 0
+            }),
+            Value::Null
+        ],
+        "a DECIMAL(20,0)-declared counter must contribute Value::Numeric(0), not Value::Int64(0)"
+    );
+}
+
+/// Scenario: a declared list that does not cover the fallback row's columns
+/// fails the call naming both counts, exactly as the populated arm's does.
+#[test]
+fn null_partial_row_fails_when_the_declared_list_is_short() {
+    let plans = vec![
+        AggregatePlan {
+            kind: AggKind::Count,
+            column: None,
+            arg_expr: None,
+        },
+        AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+            arg_expr: None,
+        },
+    ];
+
+    let err = emit_null_partial_row(&plans, &declared(&[("PARTIAL_cnt_0", numeric(20, 0))]))
+        .expect_err("a declared list shorter than the row must fail the call");
+    let text = err.to_string();
+    assert!(
+        text.contains('1') && text.contains('2'),
+        "the error must name both counts: {text}"
+    );
+}
+
+/// Scenario: a counter column declared a type no row count can inhabit fails
+/// the call naming that column, rather than emitting a zero the SDK rejects.
+#[test]
+fn null_partial_row_fails_when_a_counter_is_declared_non_numeric() {
+    let plans = vec![AggregatePlan {
+        kind: AggKind::Count,
+        column: None,
+        arg_expr: None,
+    }];
+
+    let err = emit_null_partial_row(&plans, &declared(&[("BAD_COUNTER", ExaType::Date)]))
+        .expect_err("a counter declared DATE must fail the call");
+    assert!(
+        err.to_string().contains("BAD_COUNTER"),
+        "the error must name the offending counter column: {err}"
+    );
 }
 
 /// Mixed stat + count: stat at index 1 uses PARTIAL_stat_*_1 names.
@@ -590,5 +705,356 @@ fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
     assert!(
         !text_storage.contains("memory exhausted"),
         "non-OOM error must NOT look like a memory error: {text_storage}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Every emitted partial-aggregate cell matches its declared output column
+// ---------------------------------------------------------------------------
+
+fn decimal_column(values: Vec<i128>, precision: u8, scale: i8) -> ArrayRef {
+    Arc::new(
+        Decimal128Array::from(values)
+            .with_precision_and_scale(precision, scale)
+            .expect("decimal column"),
+    )
+}
+
+fn one_row_batch(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
+    let fields: Vec<Field> = columns
+        .iter()
+        .map(|(name, col)| Field::new(*name, col.data_type().clone(), true))
+        .collect();
+    let arrays: Vec<ArrayRef> = columns.into_iter().map(|(_, col)| col).collect();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("partial batch")
+}
+
+/// Scenario: each partial-aggregate cell is coerced to the Arrow type its
+/// declared output column requires, so the emitted `Value` variant is one the
+/// SDK's `column_accepts` rule admits.
+///
+/// The four pre-existing mismatches the SDK bump turns into query failures, all
+/// of them shaped the same way — the adapter declares a type, DataFusion keeps
+/// the argument type, and nothing enforced agreement:
+///
+/// 1. `AVG(<iceberg long>)`'s `SUM` stays `Int64` under a `DOUBLE PRECISION`
+///    column, which rejects `Value::Int64`.
+/// 2. `AVG(<iceberg decimal>)`'s `SUM` stays `Decimal128` under the same
+///    `DOUBLE PRECISION` column, which rejects `Value::Numeric`.
+/// 3. `SUM` over a wide decimal widens past `Decimal128(36, s)`, and
+///    `arrow_value_at` then stringifies it into a numeric column.
+/// 4. `MIN`/`MAX` over a `decimal(p,0)` with `p` at most 18 stays `Decimal128`
+///    under a column Exasol binned to `Int64`.
+///
+/// Plus the nested-aggregate slot, whose hardcoded `DOUBLE PRECISION`
+/// declaration meets a `Decimal128` DataFusion expression.
+#[test]
+fn partial_cells_conform_to_declared_output_columns() {
+    use exasol_udf_sdk::value::Value;
+
+    // AVG over an Iceberg long: COUNT stays Int64 under DECIMAL(20,0), SUM
+    // stays Int64 under DOUBLE PRECISION.
+    let avg_long = one_row_batch(vec![
+        ("PARTIAL_avg_cnt_0", Arc::new(Int64Array::from(vec![7i64]))),
+        ("PARTIAL_avg_sum_0", Arc::new(Int64Array::from(vec![42i64]))),
+    ]);
+    let row = partial_row_from_batch(
+        &[AggregatePlan {
+            kind: AggKind::Avg,
+            column: Some("QTY".into()),
+            arg_expr: None,
+        }],
+        &avg_long,
+        &declared(&[
+            ("PARTIAL_avg_cnt_0", numeric(20, 0)),
+            ("PARTIAL_avg_sum_0", ExaType::Double),
+        ]),
+    )
+    .expect("AVG over a long must conform to its declared columns");
+    assert_eq!(
+        row,
+        vec![
+            Value::Numeric(exasol_udf_sdk::value::Decimal {
+                unscaled: 7,
+                scale: 0
+            }),
+            Value::Double(42.0)
+        ],
+        "an Int64 SUM must reach a DOUBLE PRECISION column as Value::Double"
+    );
+
+    // AVG over an Iceberg decimal: SUM is Decimal128 under DOUBLE PRECISION.
+    let avg_decimal = one_row_batch(vec![
+        ("PARTIAL_avg_cnt_0", Arc::new(Int64Array::from(vec![4i64]))),
+        ("PARTIAL_avg_sum_0", decimal_column(vec![12_550], 10, 2)),
+    ]);
+    let row = partial_row_from_batch(
+        &[AggregatePlan {
+            kind: AggKind::Avg,
+            column: Some("PRICE".into()),
+            arg_expr: None,
+        }],
+        &avg_decimal,
+        &declared(&[
+            ("PARTIAL_avg_cnt_0", numeric(20, 0)),
+            ("PARTIAL_avg_sum_0", ExaType::Double),
+        ]),
+    )
+    .expect("AVG over a decimal must conform to its declared columns");
+    assert_eq!(
+        row[1],
+        Value::Double(125.50),
+        "a Decimal128 SUM must reach a DOUBLE PRECISION column as Value::Double"
+    );
+
+    // SUM over a decimal wide enough that DataFusion's sum type exceeds
+    // DECIMAL(36,s): arrow_value_at would stringify Decimal128(38,2).
+    let wide_sum = one_row_batch(vec![(
+        "PARTIAL_sum_0",
+        decimal_column(vec![123_456_789_012_345], 38, 2),
+    )]);
+    let row = partial_row_from_batch(
+        &[AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+            arg_expr: None,
+        }],
+        &wide_sum,
+        &declared(&[("PARTIAL_sum_0", numeric(36, 2))]),
+    )
+    .expect("a wide-decimal SUM must conform to its declared column");
+    assert_eq!(
+        row[0],
+        Value::Numeric(exasol_udf_sdk::value::Decimal {
+            unscaled: 123_456_789_012_345,
+            scale: 2
+        }),
+        "a Decimal128(38,2) SUM must reach DECIMAL(36,2) as Value::Numeric, never a string"
+    );
+
+    // MIN/MAX over decimal(p,0) with p at most 18: the column Exasol binned to
+    // Int64 must receive Value::Int64, not Value::Numeric.
+    let minmax = one_row_batch(vec![
+        ("PARTIAL_min_0", decimal_column(vec![11], 18, 0)),
+        ("PARTIAL_max_0", decimal_column(vec![99], 18, 0)),
+    ]);
+    let row = partial_row_from_batch(
+        &[
+            AggregatePlan {
+                kind: AggKind::Min,
+                column: Some("N".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Max,
+                column: Some("N".into()),
+                arg_expr: None,
+            },
+        ],
+        &minmax,
+        &declared(&[
+            ("PARTIAL_min_0", ExaType::Int64),
+            ("PARTIAL_max_0", ExaType::Int64),
+        ]),
+    )
+    .expect("MIN/MAX over a narrow decimal must conform to its declared columns");
+    assert_eq!(
+        row,
+        vec![Value::Int64(11), Value::Int64(99)],
+        "a Decimal128(18,0) extremum must reach an Int64-binned column as Value::Int64"
+    );
+
+    // A nested-only aggregate: NESTED_AGGREGATE_PLAN_TYPE declares
+    // DOUBLE PRECISION while the DataFusion expression yields Decimal128.
+    let nested = one_row_batch(vec![("PARTIAL_sum_0", decimal_column(vec![2_500], 20, 4))]);
+    let row = partial_row_from_batch(
+        &[AggregatePlan {
+            kind: AggKind::Sum,
+            column: None,
+            arg_expr: Some(r#""DEC_A" * "DEC_B""#.into()),
+        }],
+        &nested,
+        &declared(&[("PARTIAL_sum_0", ExaType::Double)]),
+    )
+    .expect("a nested-only aggregate must conform to its declared column");
+    assert_eq!(
+        row[0],
+        Value::Double(0.25),
+        "a Decimal128 nested aggregate must reach DOUBLE PRECISION as Value::Double"
+    );
+}
+
+/// Scenario (`scan-execution-partial-agg`): a `MIN`/`MAX` cell over a `TIMESTAMP(9)` column
+/// reaches its `Value::Timestamp` with all nine digits. A second conversion site,
+/// independent of the Arrow `emit_batch` one.
+#[test]
+fn partial_agg_minmax_over_a_nanosecond_timestamp_keeps_every_digit() {
+    use arrow::array::TimestampNanosecondArray;
+
+    let lowest = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+        .unwrap()
+        .and_hms_nano_opt(0, 0, 0, 123_456_789)
+        .unwrap();
+    let highest = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
+        .unwrap()
+        .and_hms_nano_opt(23, 59, 59, 987_654_321)
+        .unwrap();
+    let cell = |instant: chrono::NaiveDateTime| -> ArrayRef {
+        Arc::new(TimestampNanosecondArray::from(vec![Some(
+            instant.and_utc().timestamp_nanos_opt().unwrap(),
+        )]))
+    };
+    let batch = one_row_batch(vec![
+        ("PARTIAL_min_0", cell(lowest)),
+        ("PARTIAL_max_0", cell(highest)),
+    ]);
+
+    let row = partial_row_from_batch(
+        &[
+            AggregatePlan {
+                kind: AggKind::Min,
+                column: Some("TS_NS".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Max,
+                column: Some("TS_NS".into()),
+                arg_expr: None,
+            },
+        ],
+        &batch,
+        &declared(&[
+            ("PARTIAL_min_0", ExaType::Timestamp { precision: 9 }),
+            ("PARTIAL_max_0", ExaType::Timestamp { precision: 9 }),
+        ]),
+    )
+    .expect("MIN/MAX over a nanosecond timestamp must conform to its declared columns");
+
+    assert_eq!(
+        row,
+        vec![Value::Timestamp(lowest), Value::Timestamp(highest)],
+        "a nanosecond extremum must keep all nine digits under a TIMESTAMP(9) declaration"
+    );
+}
+
+/// Scenario: a partial-aggregate `Numeric` column out of range fails the call naming it,
+/// matching the Arrow `emit_batch` path.
+#[test]
+fn partial_agg_fails_on_numeric_with_out_of_range_payload() {
+    let drifted = vec![
+        ("precision above Decimal128", numeric(39, 0)),
+        ("scale above precision", numeric(10, 12)),
+    ];
+
+    for (label, typ) in drifted {
+        let batch = one_row_batch(vec![("PARTIAL_sum_0", decimal_column(vec![1], 10, 0))]);
+        let err = partial_row_from_batch(
+            &[AggregatePlan {
+                kind: AggKind::Sum,
+                column: Some("N".into()),
+                arg_expr: None,
+            }],
+            &batch,
+            &declared(&[("OFFENDING_PARTIAL", typ)]),
+        )
+        .expect_err("a drifted NUMERIC declaration must fail the call");
+        assert!(
+            err.to_string().contains("OFFENDING_PARTIAL"),
+            "{label}: the error must name the offending column: {err}"
+        );
+    }
+}
+
+/// Scenario: a partial-aggregate value its declared column cannot represent
+/// fails the call naming that column.
+///
+/// The Exasol outer wrapper merges each shard's partial row positionally and
+/// reads a NULL as "this shard contributed nothing", so a lenient cast that
+/// NULLs an overflowing `SUM` turns a value too wide for its declaration into a
+/// silently wrong final aggregate. Both emit paths share one coercion rule, so
+/// this path fails on overflow exactly as the Arrow raw-scan path does.
+#[test]
+fn partial_agg_fails_when_a_value_does_not_fit_its_declared_target() {
+    // Unscaled 10^36 needs 37 digits: one more than DECIMAL(36,2) holds.
+    let too_wide: i128 = 10i128.pow(36);
+    let batch = one_row_batch(vec![(
+        "PARTIAL_sum_0",
+        decimal_column(vec![too_wide], 38, 2),
+    )]);
+
+    let err = partial_row_from_batch(
+        &[AggregatePlan {
+            kind: AggKind::Sum,
+            column: Some("AMOUNT".into()),
+            arg_expr: None,
+        }],
+        &batch,
+        &declared(&[("WIDE_PARTIAL", numeric(36, 2))]),
+    )
+    .expect_err("a SUM wider than its declared DECIMAL(36,2) must fail the call");
+    assert!(
+        err.to_string().contains("WIDE_PARTIAL"),
+        "the error must name the column that could not be coerced: {err}"
+    );
+}
+
+/// Scenario: the grouped path coerces only the partial-aggregate columns. A
+/// group key routed through an Arrow cast would format differently from
+/// `value_to_gk_string`, changing the group's merge identity.
+#[test]
+fn grouped_coercion_leaves_the_group_key_columns_untouched() {
+    use arrow::array::Date32Array;
+
+    let batch = one_row_batch(vec![
+        ("GK_0", Arc::new(Date32Array::from(vec![19_000i32]))),
+        ("PARTIAL_sum_0", decimal_column(vec![5], 10, 0)),
+    ]);
+    let columns = coerce_partial_agg_columns(
+        &batch,
+        &declared(&[("GK_0", varchar()), ("PARTIAL_sum_0", ExaType::Int64)]),
+        1,
+    )
+    .expect("the grouped coercion must succeed");
+
+    assert_eq!(
+        columns[0].data_type(),
+        &DataType::Date32,
+        "the group-key column must keep its source type, uncoerced"
+    );
+    assert_eq!(
+        columns[1].data_type(),
+        &DataType::Int64,
+        "the partial-aggregate column must be coerced to its declared target"
+    );
+}
+
+/// Scenario: a declared list that does not cover the produced partial row fails
+/// the call rather than emitting a short or misaligned row.
+#[test]
+fn partial_agg_fails_when_the_declared_column_count_disagrees() {
+    let batch = one_row_batch(vec![
+        ("PARTIAL_min_0", decimal_column(vec![1], 10, 0)),
+        ("PARTIAL_max_0", decimal_column(vec![2], 10, 0)),
+    ]);
+    let err = partial_row_from_batch(
+        &[
+            AggregatePlan {
+                kind: AggKind::Min,
+                column: Some("N".into()),
+                arg_expr: None,
+            },
+            AggregatePlan {
+                kind: AggKind::Max,
+                column: Some("N".into()),
+                arg_expr: None,
+            },
+        ],
+        &batch,
+        &declared(&[("PARTIAL_min_0", ExaType::Int64)]),
+    )
+    .expect_err("a short declaration must fail the call");
+    assert!(
+        err.to_string().contains('1') && err.to_string().contains('2'),
+        "the error must name both counts: {err}"
     );
 }

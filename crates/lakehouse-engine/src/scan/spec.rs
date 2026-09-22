@@ -1143,10 +1143,6 @@ pub struct CommonScanSpec {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub distinct: bool,
 
-    /// Declared Exasol EMITS type string for each output column.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub emit_exa_types: Vec<String>,
-
     /// Full logical schema of the table at query time, each field carrying the
     /// binding key its producer selected (see [`LogicalField`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1255,7 +1251,6 @@ impl Default for CommonScanSpec {
             aggregates: None,
             group_keys: None,
             distinct: false,
-            emit_exa_types: Vec::new(),
             logical_schema: Vec::new(),
             name_mapping: Vec::new(),
             join: None,

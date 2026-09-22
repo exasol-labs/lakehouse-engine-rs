@@ -29,7 +29,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::{EmitPolicy, TestContext};
-use exasol_udf_sdk::value::Value;
+use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
     CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage,
@@ -204,14 +204,16 @@ fn join_spec(
     }
 }
 
-/// Run the production join scan for `spec` against a capturing context, returning
-/// the decoded emitted batches.
-fn run_join(spec: &ScanSpec) -> Vec<RecordBatch> {
+/// Run the production join scan for `spec` against a capturing context declaring
+/// `emits` as its output columns, returning the decoded emitted batches.
+fn run_join(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
     block_on(async {
-        let mut ctx =
-            scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]).with_emit_policy(
-                EmitPolicy::Reject(UdfError::User("join path must use emit_batch".into())),
-            ));
+        let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
+            TestContext::scalar(vec![]).with_emit_policy(EmitPolicy::Reject(UdfError::User(
+                "join path must use emit_batch".into(),
+            ))),
+            emits,
+        );
         let session = SessionContext::new_with_config(session_config_for_spec(spec));
         let mut timers = PhaseTimers::start();
         run_join_scan_with_session(
@@ -307,7 +309,7 @@ fn join_registers_each_side_against_its_own_backend() {
         None,
         None,
     );
-    let batches = run_join(&spec);
+    let batches = run_join(&spec, &[ExaType::Int64, scan_fixture::varchar()]);
 
     // 5 of 6 orders match a customer (custkey 999 is unmatched).
     assert_eq!(
@@ -374,7 +376,10 @@ fn join_projection_filter_limit_streamed() {
         Some("\"O_CUSTKEY\" = 10"),
         Some(1),
     );
-    let batches = run_join(&spec);
+    let batches = run_join(
+        &spec,
+        &[ExaType::Int64, ExaType::Double, scan_fixture::varchar()],
+    );
 
     assert_eq!(
         total_rows(&batches),
@@ -470,7 +475,15 @@ fn each_join_side_materializes_its_own_partition_columns() {
         files: vec![fact_file],
     };
 
-    let batches = run_join(&spec);
+    let batches = run_join(
+        &spec,
+        &[
+            ExaType::Int64,
+            scan_fixture::varchar(),
+            scan_fixture::varchar(),
+            scan_fixture::varchar(),
+        ],
+    );
 
     assert_eq!(
         total_rows(&batches),
@@ -531,7 +544,7 @@ fn join_limit_bounds_joined_output_not_scanned_input() {
         Some(2),
     );
 
-    let batches = run_join(&spec);
+    let batches = run_join(&spec, &[ExaType::Int64, scan_fixture::varchar()]);
     assert_eq!(
         total_rows(&batches),
         2,
@@ -675,10 +688,12 @@ fn unreadable_join_file_error_redacts_both_sides_credentials() {
     );
 
     let err = block_on(async {
-        let mut ctx =
-            scan_fixture::BatchCapturingCtx::new(TestContext::scalar(vec![]).with_emit_policy(
-                EmitPolicy::Reject(UdfError::User("join path must use emit_batch".into())),
-            ));
+        let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
+            TestContext::scalar(vec![]).with_emit_policy(EmitPolicy::Reject(UdfError::User(
+                "join path must use emit_batch".into(),
+            ))),
+            &[ExaType::Int64, scan_fixture::varchar()],
+        );
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));
         let mut timers = PhaseTimers::start();
         run_join_scan_with_session(
@@ -812,7 +827,7 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
         files: vec![FileEntry::new("s3://test-bucket/data/part-0.parquet", 4096)],
     };
 
-    let mut ctx = scan_fixture::BatchCapturingCtx::new(
+    let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![
             Value::String(spec.to_common_json()),
             Value::String(ScanSpec::files_json(&spec.files)),
@@ -820,6 +835,7 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
         .with_emit_policy(EmitPolicy::Reject(UdfError::User(
             "join path must use emit_batch".into(),
         ))),
+        &[ExaType::Int64, scan_fixture::varchar()],
     );
     let err = lakehouse_engine::scan::run_scan(&mut ctx)
         .expect_err("both sides' endpoints refuse every read, so the scan must fail");

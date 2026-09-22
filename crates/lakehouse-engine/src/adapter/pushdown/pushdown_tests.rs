@@ -42,7 +42,6 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
     let spec = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into()],
-            emit_exa_types: vec!["DECIMAL(20,0)".into()],
             storage: ScanStorage::Inline(vended_storage),
             ..Default::default()
         },
@@ -420,7 +419,6 @@ fn scan_spec_carries_no_catalog_block() {
             projection: vec!["ID".into(), "NAME".into()],
             filter: Some("(\"ID\" > 10)".into()),
             limit: Some(100),
-            emit_exa_types: vec!["DECIMAL(20,0)".into(), "VARCHAR(2000000)".into()],
             storage: ScanStorage::Inline(sample_storage()),
             ..Default::default()
         },
@@ -2020,6 +2018,66 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
 }
 
 // ---------------------------------------------------------------------------
+// Declined TIMESTAMP(p) CAST target routing (issue #405)
+// ---------------------------------------------------------------------------
+
+/// The wire shape Exasol sends for `SELECT CAST(name AS TIMESTAMP(p)) FROM …`.
+fn timestamp_cast_select_request(precision: u64) -> Json {
+    serde_json::json!({
+        "selectList": [{
+            "type": "function_scalar_cast",
+            "name": "CAST",
+            "dataType": {"type": "TIMESTAMP", "fractionalSecondsPrecision": precision},
+            "arguments": [{"type": "column", "name": "NAME", "tableName": "EVENTS"}]
+        }],
+        "selectListDataTypes": [
+            {"type": "timestamp", "fractionalSecondsPrecision": precision}
+        ],
+    })
+}
+
+/// Scenario (sql-comprehension/vs-expression-translator-cast): DataFusion cannot parse
+/// `TIMESTAMP(2)`, so the renderer declines and the request routes to the qualified
+/// single-table wrapper. The scan never sees `TIMESTAMP(2)` in its `EMITS` clause.
+#[test]
+fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
+    let sql = dispatch_sql_for_body(timestamp_cast_select_request(2));
+
+    assert!(
+        sql.starts_with(r#"SELECT CAST("LHS_T0"."NAME" AS TIMESTAMP(2)) FROM ("#),
+        "the declined CAST must be computed in the wrapper's outer select list: {sql}"
+    );
+    assert!(
+        sql.contains(r#"AS "LHS_T0""#),
+        "a declined CAST target must route to the qualified single-table wrapper: {sql}"
+    );
+    let emits = sql
+        .find("EMITS (")
+        .map(|at| &sql[at..])
+        .unwrap_or_else(|| panic!("the wrapper must still drive the scan UDF: {sql}"));
+    assert!(
+        emits.contains(r#""NAME" VARCHAR(2000000)"#) && !emits.contains("TIMESTAMP"),
+        "the scan must emit the raw column, never the declined CAST target: {sql}"
+    );
+}
+
+/// Control for the decline above: `TIMESTAMP(6)` is one of the four precisions DataFusion
+/// parses, so the same shape stays on the scan path.
+#[test]
+fn accepted_timestamp_precision_cast_takes_scan_path() {
+    let sql = dispatch_sql_for_body(timestamp_cast_select_request(6));
+
+    assert!(
+        !sql.contains("LHS_T0"),
+        "an accepted CAST target must NOT route to the qualified wrapper: {sql}"
+    );
+    assert!(
+        sql.contains("TIMESTAMP(6)"),
+        "the accepted CAST must reach the scan at its declared precision: {sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Parse-before-config ordering — regression coverage
 // ---------------------------------------------------------------------------
 
@@ -2617,7 +2675,6 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
             "df_batch_size",
             "df_target_partitions",
             "df_threads_per_udf",
-            "emit_exa_types",
             "instance_overhead_mb",
             "logical_schema",
             "memory_pool_fraction",
@@ -2635,7 +2692,6 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
     let expected = CommonScanSpec {
         table_root: "s3://bucket/orders".to_string(),
         projection: vec![ProjectionItem::Column("INT_COL".to_string())],
-        emit_exa_types: vec!["DECIMAL(10,0)".to_string()],
         logical_schema: vec![LogicalField {
             field_id: None,
             name: "int_col".to_string(),
