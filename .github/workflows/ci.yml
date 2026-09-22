@@ -51,14 +51,6 @@ jobs:
           - runner: ubuntu-24.04-arm
             arch: aarch64
     steps:
-      # A cold release build of the full DataFusion/Arrow/Iceberg tree plus a
-      # cached target/ restore can exhaust the ~21 GB default runner disk — the
-      # same ENOSPC class that killed lint/unit-tests. Reclaim ~12 GB up front.
-      # (Latent until now because CI has only hit the warm path; a Cargo.lock
-      # bump forces the cold path.)
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
 
       # This build runs INSIDE rust:1.94-trixie with its cargo home at
@@ -149,9 +141,6 @@ jobs:
     name: Build Host Workspace
     runs-on: ubuntu-latest
     steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
 
       - name: Install Rust 1.94
@@ -177,12 +166,6 @@ jobs:
     name: Check & Lint
     runs-on: ubuntu-latest
     steps:
-      # Same rationale as build-so: reclaim ~12 GB before restoring the
-      # shared cache and compiling on top of it, so clippy's --all-targets pass
-      # doesn't ENOSPC on the ~21 GB default runner disk.
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
 
       - name: Install Rust 1.94
@@ -234,9 +217,6 @@ jobs:
     # instruments workspace members only.
     timeout-minutes: 45
     steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
 
       - name: Install Rust 1.94
@@ -350,9 +330,6 @@ jobs:
     runs-on: ubuntu-24.04-arm
     timeout-minutes: 45
     steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
 
       - name: Install Rust 1.94
@@ -433,9 +410,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
-      - name: Free disk space
-        run: sudo rm -rf /usr/local/lib/android /usr/share/dotnet
-
       - uses: actions/checkout@v7
 
       - name: Pull Exasol image
