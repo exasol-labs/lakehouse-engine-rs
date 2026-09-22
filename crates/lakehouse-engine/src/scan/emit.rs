@@ -9,12 +9,11 @@
 /// - Rely on the SDK's 4,000,000-byte auto-flush; always flush at end.
 /// - Only IPC bytes cross the .so boundary — never Arrow types or Value intermediates.
 use crate::scan::diagnostics::PhaseTimers;
+use crate::types::mapping::TimestampPrecision;
 use arrow::array::ArrayRef;
 use arrow::compute::CastOptions;
 use arrow::compute::kernels::cast::cast_with_options;
-use arrow::datatypes::{
-    DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Field, Schema, TimeUnit,
-};
+use arrow::datatypes::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::error::DataFusionError;
 use datafusion::physical_plan::SendableRecordBatchStream;
@@ -235,36 +234,20 @@ pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfEr
         ExaType::Int64 => DataType::Int64,
         ExaType::Numeric { precision, scale } => decimal_target(declared, *precision, *scale)?,
         ExaType::Date => DataType::Date32,
-        // ExaType carries no fractional-second precision: every declared
-        // TIMESTAMP(p) arrives as this one variant, and microseconds are this
-        // project's fixed internal representation for all of them.
-        ExaType::Timestamp => DataType::Timestamp(TimeUnit::Microsecond, None),
-        ExaType::TimestampTz => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
-        ExaType::String { .. }
-        | ExaType::Char { .. }
-        | ExaType::Geometry
-        | ExaType::HashType
-        | ExaType::IntervalYearToMonth
-        | ExaType::IntervalDayToSecond
-        | ExaType::Unsupported => DataType::Utf8,
+        ExaType::Timestamp { precision } => DataType::Timestamp(
+            TimestampPrecision::from_declared_digits(*precision).arrow_unit(),
+            None,
+        ),
+        ExaType::String { .. } | ExaType::Char { .. } | ExaType::Unsupported => DataType::Utf8,
     })
 }
 
-/// The `Decimal128` a NUMERIC-binned declaration maps to.
-///
-/// The wire carries one optional precision/scale pair for every column type, so
-/// `ExaType::Numeric` can structurally hold `None`. A valid Exasol NUMERIC
-/// declaration always carries both, inside `Decimal128`'s range — so an absent
-/// or out-of-range payload is drift, and the call fails rather than falling back
-/// to a string target that would put text into a numeric column.
-fn decimal_target(
-    declared: &ColumnInfo,
-    precision: Option<u32>,
-    scale: Option<u32>,
-) -> Result<DataType, UdfError> {
-    let representable = precision
-        .zip(scale)
-        .and_then(|(p, s)| Some((u8::try_from(p).ok()?, i8::try_from(s).ok()?)))
+/// The `Decimal128` a NUMERIC-binned declaration maps to. A pair outside
+/// `Decimal128`'s range is drift: fail rather than put text into a numeric column.
+fn decimal_target(declared: &ColumnInfo, precision: u32, scale: u32) -> Result<DataType, UdfError> {
+    let representable = u8::try_from(precision)
+        .ok()
+        .zip(i8::try_from(scale).ok())
         .filter(|(p, s)| {
             *p >= 1
                 && *p <= DECIMAL128_MAX_PRECISION
@@ -274,8 +257,8 @@ fn decimal_target(
     match representable {
         Some((p, s)) => Ok(DataType::Decimal128(p, s)),
         None => Err(UdfError::User(format!(
-            "emit failed: output column {} is declared NUMERIC with precision {precision:?} \
-             and scale {scale:?}, which is not a decimal the emit boundary can represent",
+            "emit failed: output column {} is declared NUMERIC with precision {precision} \
+             and scale {scale}, which is not a decimal the emit boundary can represent",
             declared.name
         ))),
     }

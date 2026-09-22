@@ -1659,9 +1659,12 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
         }],
     };
 
-    let (tables_json, table_map, skipped) =
-        build_listing_virtual_tables(&configured_ns, &listing, TimestampPrecision::Millisecond)
-            .unwrap();
+    let (tables_json, table_map, skipped) = build_listing_virtual_tables(
+        &configured_ns,
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .unwrap();
 
     assert_eq!(tables_json.len(), 1);
     assert_eq!(tables_json[0]["name"], "EU__ORDERS");

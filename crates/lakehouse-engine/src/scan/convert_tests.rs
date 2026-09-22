@@ -1,18 +1,27 @@
-/// Convert a full RecordBatch to a Vec of rows (each row is a Vec<Value>).
+use arrow::array::{TimestampMicrosecondArray, TimestampNanosecondArray, TimestampSecondArray};
+
+/// Convert a full RecordBatch to a Vec of rows (each row is a Vec<Value>), propagating any
+/// per-cell conversion error rather than panicking.
 ///
 /// Row order matches the batch order; columns match the batch schema order.
-fn batch_to_rows(batch: &RecordBatch) -> Vec<Vec<Value>> {
+fn try_batch_to_rows(batch: &RecordBatch) -> Result<Vec<Vec<Value>>, UdfError> {
     let num_rows = batch.num_rows();
     let num_cols = batch.num_columns();
     let mut rows = Vec::with_capacity(num_rows);
     for row in 0..num_rows {
         let mut values = Vec::with_capacity(num_cols);
         for col in 0..num_cols {
-            values.push(arrow_value_at(batch.column(col), row).unwrap());
+            values.push(arrow_value_at(batch.column(col), row)?);
         }
         rows.push(values);
     }
-    rows
+    Ok(rows)
+}
+
+/// [`try_batch_to_rows`], panicking on a conversion error — every sibling test here expects
+/// every cell to convert.
+fn batch_to_rows(batch: &RecordBatch) -> Vec<Vec<Value>> {
+    try_batch_to_rows(batch).unwrap()
 }
 
 use super::*;
@@ -269,6 +278,67 @@ fn tz_aware_timestamp_converts_to_utc_instant_value() {
         .and_hms_opt(0, 0, 0)
         .unwrap();
     assert_eq!(rows[0][0], Value::Timestamp(expected));
+}
+
+/// Scenario (scan-execution-partial-agg): a `Timestamp(Nanosecond, _)` cell keeps all
+/// nine fractional digits.
+#[test]
+fn nanosecond_timestamp_keeps_every_fractional_digit() {
+    let instant = NaiveDate::from_ymd_opt(2024, 1, 1)
+        .unwrap()
+        .and_hms_nano_opt(0, 0, 0, 123_456_789)
+        .unwrap();
+    let arr = TimestampNanosecondArray::from(vec![Some(
+        instant.and_utc().timestamp_nanos_opt().unwrap(),
+    )]);
+    let batch = single_col_batch("ts", Arc::new(arr));
+    assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
+}
+
+/// Scenario (scan-execution-partial-agg): a pre-epoch cell keeps its sub-second digits,
+/// so the seconds/remainder split floors rather than truncating toward zero.
+#[test]
+fn pre_epoch_nanosecond_timestamp_keeps_every_fractional_digit() {
+    let instant = NaiveDate::from_ymd_opt(1969, 12, 31)
+        .unwrap()
+        .and_hms_nano_opt(23, 59, 59, 123_456_789)
+        .unwrap();
+    let arr = TimestampNanosecondArray::from(vec![Some(
+        instant.and_utc().timestamp_nanos_opt().unwrap(),
+    )]);
+    let batch = single_col_batch("ts", Arc::new(arr));
+    assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
+}
+
+/// Scenario (scan-execution-partial-agg): an instant outside an `i64` nanosecond count's
+/// 1677-2262 range still converts, because the split avoids that normalization.
+#[test]
+fn timestamp_outside_the_nanosecond_epoch_range_still_converts() {
+    let instant = NaiveDate::from_ymd_opt(1500, 3, 17)
+        .unwrap()
+        .and_hms_micro_opt(4, 5, 6, 654_321)
+        .unwrap();
+    assert!(
+        instant.and_utc().timestamp_nanos_opt().is_none(),
+        "fixture must lie outside the i64-nanosecond range this test guards"
+    );
+    let arr = TimestampMicrosecondArray::from(vec![Some(instant.and_utc().timestamp_micros())]);
+    let batch = single_col_batch("ts", Arc::new(arr));
+    assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
+}
+
+/// Scenario: an instant `chrono::NaiveDateTime` cannot represent fails with an error naming
+/// the Arrow unit, rather than silently substituting the epoch.
+#[test]
+fn timestamp_outside_the_representable_range_fails_the_conversion() {
+    let arr = TimestampSecondArray::from(vec![Some(i64::MAX)]);
+    let batch = single_col_batch("ts", Arc::new(arr));
+    let err = try_batch_to_rows(&batch).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("Second"),
+        "error must name the column's Arrow unit (Second): {message}"
+    );
 }
 
 #[test]
