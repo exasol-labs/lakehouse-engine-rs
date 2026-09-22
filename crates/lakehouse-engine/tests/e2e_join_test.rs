@@ -286,6 +286,61 @@ fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
     );
 }
 
+/// A division by zero inside the FACT-leg filter of a broadcast join fails the
+/// query, and does so from INSIDE the broadcast plan (#370).
+///
+/// Both halves matter. The shape assertion proves the predicate actually rode
+/// into the node-local join rather than disqualifying the broadcast plan and
+/// falling back to the two-scan wrapper, where Exasol would evaluate the
+/// division itself. The failure assertion proves the fact-leg filter is one of
+/// the pushed expressions the session-registered checked division reaches —
+/// pre-fix it was a filter position, so it silently changed the joined row
+/// count exactly as the single-table predicate did.
+#[test]
+fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let query = format!(
+        "{} AND 0 < o.O_ORDERKEY / (o.O_CUSTKEY - o.O_CUSTKEY)",
+        join_query(VS_NAME)
+    );
+
+    let pushed = explain_virtual_sql(&mut conn, &query);
+    assert!(
+        has_broadcast_join_block(&pushed),
+        "the fact-leg division must ride INSIDE the broadcast fan-out (one scan \
+         UDF, common-blob join block), else the division never reaches the \
+         scan:\n{pushed}"
+    );
+    assert!(
+        !has_two_scan_wrapper(&pushed),
+        "a fact-leg division must NOT force the two-scan Exasol-joined fallback \
+         (LHS_T0/LHS_T1), where Exasol would evaluate the division \
+         itself:\n{pushed}"
+    );
+    assert!(
+        pushed.contains(vs_expression::CHECKED_FLOAT_DIV_FN),
+        "the pushed broadcast plan must carry the checked-division call:\n{pushed}"
+    );
+
+    let resp = conn.try_execute(&query);
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "a division by zero in a broadcast join's fact-leg filter must fail the \
+         query rather than change the joined row count: {resp}"
+    );
+    let message = resp["exception"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    assert!(
+        message.contains("division by zero"),
+        "the surfaced message must name a division by zero: {resp}"
+    );
+}
+
 /// Two more ordered shapes stay broadcast: a bare `ORDER BY` with NO `LIMIT`
 /// (the full join, ordered), and `ORDER BY … LIMIT … OFFSET` (an exact offset
 /// window). The offset arm is the one shape where Exasol's grammar rule tying
