@@ -505,16 +505,38 @@ jobs:
     # (same rationale as build-so's timeout).
     timeout-minutes: 45
     env:
-      # Standard GitHub-hosted runners have 2 vCPUs; docker-compose.yml's
-      # exasol service default (4) exceeds what Docker will accept ("range of
-      # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
-      LH_EXASOL_CPUS: "2"
+      # LH_EXASOL_CPUS is deliberately NOT set here — the "Size the Exasol CPU
+      # quota below the runner" step below derives it from the runner's measured
+      # vCPU count and exports it through $GITHUB_ENV. A job-level entry of the
+      # same name would shadow that export in every subsequent step.
+      #
       # Selects the matrix leg's Exasol image; docker-compose.yml's exasol
       # service reads this with a 2025.1.16 fallback.
       EXASOL_IMAGE: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
+
+      # `adapter_detects_container_cpu_quota` (e2e_scan_test.rs) proves the
+      # adapter sizes its thread budget from the CPU quota of its own container
+      # rather than from the host's core count — and it can only tell the two
+      # apart while the quota stays STRICTLY below the runner's vCPU count.
+      # Hosted-runner sizes have changed under this workflow before (the cap
+      # this replaces was hardcoded to 2 against a then-2-vCPU runner), so the
+      # cap is measured rather than asserted: the printed nproc is the record of
+      # what the runner actually had, and nproc - 1 is the largest cap that
+      # still satisfies the inequality. docker-compose.yml's exasol service
+      # default (4) is rejected outright on a runner with fewer vCPUs than that.
+      - name: Size the Exasol CPU quota below the runner
+        run: |
+          RUNNER_CPUS=$(nproc)
+          echo "runner vCPUs (nproc): $RUNNER_CPUS"
+          if [ "$RUNNER_CPUS" -lt 2 ]; then
+            echo "::error::a 1-vCPU runner leaves no CPU quota strictly below it, so adapter_detects_container_cpu_quota cannot distinguish the container from the host"
+            exit 1
+          fi
+          echo "LH_EXASOL_CPUS=$((RUNNER_CPUS - 1))" >> "$GITHUB_ENV"
+          echo "Exasol container CPU quota: $((RUNNER_CPUS - 1)) (must stay strictly below $RUNNER_CPUS)"
 
       # No tarball cache here (tried it, dropped it): restoring a GHA cache
       # tarball and `docker load`-ing it is a wash against a direct registry
@@ -617,7 +639,10 @@ jobs:
     # `e2e`'s budget rather than needing more.
     timeout-minutes: 45
     env:
-      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
+      # Conservative fixed cap for a hosted runner: docker-compose.yml's exasol
+      # service default (4) is rejected on a runner with fewer vCPUs than that.
+      # Unlike the `e2e` job, this job runs no container-CPU-quota probe, so the
+      # cap needs no relation to the runner's measured vCPU count.
       LH_EXASOL_CPUS: "2"
     steps:
       - uses: actions/checkout@v7
@@ -720,7 +745,10 @@ jobs:
     # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`.
     timeout-minutes: 45
     env:
-      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
+      # Conservative fixed cap for a hosted runner: docker-compose.yml's exasol
+      # service default (4) is rejected on a runner with fewer vCPUs than that.
+      # Unlike the `e2e` job, this job runs no container-CPU-quota probe, so the
+      # cap needs no relation to the runner's measured vCPU count.
       LH_EXASOL_CPUS: "2"
     steps:
       - uses: actions/checkout@v7
@@ -823,7 +851,10 @@ jobs:
     # cost here is real-cloud round-trips, not extra local services.
     timeout-minutes: 45
     env:
-      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
+      # Conservative fixed cap for a hosted runner: docker-compose.yml's exasol
+      # service default (4) is rejected on a runner with fewer vCPUs than that.
+      # Unlike the `e2e` job, this job runs no container-CPU-quota probe, so the
+      # cap needs no relation to the runner's measured vCPU count.
       LH_EXASOL_CPUS: "2"
     steps:
       - uses: actions/checkout@v7

@@ -329,7 +329,6 @@ fn build_adapter_notes_merges_existing() {
     });
     let notes = build_adapter_notes(
         &req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -362,7 +361,6 @@ fn adapter_notes_omit_cluster_nodes() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &request,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -379,6 +377,10 @@ fn adapter_notes_omit_cluster_nodes() {
     assert!(
         parsed.get("CLUSTER_NODES").is_none(),
         "a freshly built createVirtualSchema response must carry no CLUSTER_NODES key"
+    );
+    assert!(
+        parsed.get("NR_OF_CORES").is_none(),
+        "a freshly built createVirtualSchema response must carry no NR_OF_CORES key"
     );
     assert_eq!(
         parsed[NOTE_PARALLELISM_FACTOR].as_str(),
@@ -399,6 +401,7 @@ fn refresh_rebuilds_table_map_preserves_notes() {
         "schemaMetadataInfo": {
             "adapterNotes": serde_json::json!({
                 "OTHER_KEY": "keep-me",
+                "NR_OF_CORES": "8",
                 "TABLE_MAP": {"OLD_TABLE": "ns.old_table"},
             })
             .to_string(),
@@ -408,7 +411,6 @@ fn refresh_rebuilds_table_map_preserves_notes() {
     let fresh_table_map = vec![("NEW_TABLE".to_string(), "ns.new_table".to_string())];
     let notes = build_adapter_notes(
         &req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -427,6 +429,14 @@ fn refresh_rebuilds_table_map_preserves_notes() {
         parsed["OTHER_KEY"].as_str(),
         Some("keep-me"),
         "an unrelated adapterNotes key must survive a refresh's TABLE_MAP rebuild"
+    );
+
+    assert_eq!(
+        parsed["NR_OF_CORES"].as_str(),
+        Some("8"),
+        "an NR_OF_CORES entry inherited from an older virtual schema must survive \
+         unread and unchanged: the adapter no longer writes the key, so nothing \
+         may clobber it either"
     );
 
     let table_map = parsed[NOTE_TABLE_MAP]
@@ -462,7 +472,6 @@ fn create_vs_records_parallelism_factor() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &request,
-        16,
         factor,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -508,7 +517,6 @@ fn adapter_notes_carry_parallelism_factor() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        0,
         12,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -535,16 +543,23 @@ fn adapter_notes_carry_parallelism_factor() {
 }
 
 // ---------------------------------------------------------------------------
-// T5 — NR_OF_CORES note tests
+// T5 — core-count detection tests
 // ---------------------------------------------------------------------------
 
-/// Scenario: Adapter records the per-node core count in the virtual-schema adapterNotes.
+/// Scenario: the per-node core count is detected from
+/// `std::thread::available_parallelism()` — a positive, host-sourced value, so
+/// the assertion is positivity rather than an exact count — and is consumed
+/// only as a derivation input, never persisted into adapterNotes.
 #[test]
-fn adapter_notes_records_nr_of_cores() {
-    let req = serde_json::json!({"type": "createVirtualSchema"});
+fn core_count_from_available_parallelism_is_not_recorded() {
+    let core_count = resolve_nr_of_cores();
+    assert!(
+        core_count >= 1,
+        "the detected core count must be positive, got {core_count}"
+    );
+
     let notes = build_adapter_notes(
-        &req,
-        16,
+        &serde_json::json!({"type": "createVirtualSchema"}),
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -558,23 +573,23 @@ fn adapter_notes_records_nr_of_cores() {
     );
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
-    assert_eq!(
-        parsed[NOTE_NR_OF_CORES].as_str(),
-        Some("16"),
-        "NR_OF_CORES must be written into adapterNotes"
+    assert!(
+        parsed.get("NR_OF_CORES").is_none(),
+        "the detected core count must not be written into adapterNotes"
     );
 }
 
-/// Scenario: with no NR_OF_CORES override, the core count is auto-detected
-/// from `std::thread::available_parallelism()` — a positive, host-sourced
-/// value (not injectable, so we assert positivity rather than an exact count).
+/// Scenario: when the platform cannot report a core count the resolver floors
+/// at a single core, so no derivation ever receives an unusable count.
 #[test]
-fn nr_of_cores_from_available_parallelism_when_unavailable() {
-    let props = serde_json::json!({});
-    let nr_of_cores = resolve_nr_of_cores(&props);
-    assert!(
-        nr_of_cores >= 1,
-        "nr_of_cores must be auto-detected from available_parallelism() (>= 1), got {nr_of_cores}"
+fn core_count_defaults_to_one_when_detection_fails() {
+    let detection_failed: std::io::Result<std::num::NonZeroUsize> = Err(std::io::Error::other(
+        "available_parallelism is unsupported",
+    ));
+    assert_eq!(
+        core_count_or_default(detection_failed),
+        1,
+        "a failed core-count detection must resolve to a single core"
     );
 }
 
@@ -582,7 +597,7 @@ fn nr_of_cores_from_available_parallelism_when_unavailable() {
 // T5 — parallelism factor formula tests
 // ---------------------------------------------------------------------------
 
-/// Scenario: Default parallelism factor equals NR_OF_CORES × 2 when cores > 4.
+/// Scenario: Default parallelism factor equals the detected core count × 2 when cores > 4.
 #[test]
 fn default_parallelism_factor_is_cores_times_two() {
     let props = serde_json::json!({});
@@ -595,7 +610,7 @@ fn default_parallelism_factor_is_cores_times_two() {
 }
 
 /// Scenario: Default parallelism factor is floored at DEFAULT_PARALLELISM_FACTOR (8)
-/// when NR_OF_CORES × 2 would produce a smaller value (e.g., 0 or 2).
+/// when the detected core count × 2 would produce a smaller value.
 #[test]
 fn default_parallelism_factor_floors_at_eight() {
     let props = serde_json::json!({});
@@ -622,7 +637,7 @@ fn explicit_parallelism_factor_overrides_default() {
     let factor = resolve_parallelism_factor(&props, 32);
     assert_eq!(
         factor, 5,
-        "explicit property must override the NR_OF_CORES formula"
+        "explicit property must override the core-count formula"
     );
 }
 
@@ -667,7 +682,6 @@ fn df_target_partitions_uses_supplied_value() {
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         val,
@@ -720,7 +734,6 @@ fn df_batch_size_uses_supplied_value() {
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -783,7 +796,6 @@ fn df_threads_per_udf_uses_supplied_value() {
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -970,7 +982,6 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -1002,7 +1013,6 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -1033,81 +1043,69 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
 }
 
 // ---------------------------------------------------------------------------
-// Tasks 2.1–2.8 — NR_OF_CORES property override and cores-driven defaults.
+// Cores-driven defaults, and the removed NR_OF_CORES property.
 // ---------------------------------------------------------------------------
 
-/// Task 2.1 — NR_OF_CORES VS property ≥ 1 is used directly, overriding the
-/// `available_parallelism()` auto-detect (tested via the pure helper and the
-/// override-wins path).
+/// Scenario: `NR_OF_CORES` is no longer a recognised VS property. A
+/// `CREATE VIRTUAL SCHEMA` statement that still supplies it is accepted, and
+/// every budget resolves to exactly the value it resolves to without the key —
+/// the backward-compatibility guarantee for statements written against the
+/// removed property.
 #[test]
-fn nr_of_cores_property_overrides_auto_detect() {
-    // A positive integer property must parse to Some(n).
-    let props_4 = serde_json::json!({ PROP_NR_OF_CORES: "4" });
+fn nr_of_cores_property_is_ignored() {
+    let without = serde_json::json!({});
+    let with = serde_json::json!({ "NR_OF_CORES": "999" });
+    let detected_cores = 8;
+    let instances = 4;
+
     assert_eq!(
-        parse_nr_of_cores_override(&props_4),
-        Some(4u32),
-        "NR_OF_CORES=4 must return Some(4)"
+        resolve_parallelism_factor(&with, detected_cores),
+        resolve_parallelism_factor(&without, detected_cores),
+        "PARALLELISM_FACTOR must not react to an NR_OF_CORES property"
     );
-
-    let props_1 = serde_json::json!({ PROP_NR_OF_CORES: "1" });
     assert_eq!(
-        parse_nr_of_cores_override(&props_1),
-        Some(1u32),
-        "NR_OF_CORES=1 (minimum valid) must return Some(1)"
+        resolve_threading_mode(&with),
+        resolve_threading_mode(&without),
+        "DATAFUSION_THREADING_MODE must not react to an NR_OF_CORES property"
     );
-
-    // When the override is present, resolve_nr_of_cores returns it directly
-    // instead of auto-detecting.
-    let cores = resolve_nr_of_cores(&serde_json::json!({ PROP_NR_OF_CORES: "8" }));
-    assert_eq!(cores, 8u32, "NR_OF_CORES override must be returned");
-}
-
-/// Task 2.2 — NR_OF_CORES absent, empty, zero, or negative falls back to
-/// auto-detect (tested via the pure helper returning None, and the
-/// `available_parallelism()` fallback returning a positive count).
-#[test]
-fn nr_of_cores_property_falls_back_to_auto_detect() {
-    // Absent → None.
+    for mode in [ThreadingMode::Auto, ThreadingMode::Fixed] {
+        assert_eq!(
+            resolve_df_threading(mode, &with, detected_cores, instances),
+            resolve_df_threading(mode, &without, detected_cores, instances),
+            "{mode:?} threading must not react to an NR_OF_CORES property"
+        );
+    }
+    for key in [PROP_DF_TARGET_PARTITIONS, PROP_DF_THREADS_PER_UDF] {
+        assert_eq!(
+            resolve_df_fixed_count(&with, key, detected_cores),
+            resolve_df_fixed_count(&without, key, detected_cores),
+            "{key} must not react to an NR_OF_CORES property"
+        );
+    }
     assert_eq!(
-        parse_nr_of_cores_override(&serde_json::json!({})),
-        None,
-        "absent NR_OF_CORES must return None"
+        resolve_s3_max_connections(&with, detected_cores, instances),
+        resolve_s3_max_connections(&without, detected_cores, instances),
+        "S3_MAX_CONNECTIONS must not react to an NR_OF_CORES property"
     );
-
-    // Empty string → None (nonempty_str filters empty strings).
     assert_eq!(
-        parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "" })),
-        None,
-        "empty NR_OF_CORES must return None"
+        resolve_df_batch_size(&with),
+        resolve_df_batch_size(&without),
+        "DATAFUSION_BATCH_SIZE must not react to an NR_OF_CORES property"
     );
-
-    // Zero → None (fails the ≥ 1 filter).
     assert_eq!(
-        parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "0" })),
-        None,
-        "NR_OF_CORES=0 must return None"
+        resolve_memory_pool_fraction(&with),
+        resolve_memory_pool_fraction(&without),
+        "MEMORY_POOL_FRACTION must not react to an NR_OF_CORES property"
     );
-
-    // Negative (u32 parse fails) → None.
     assert_eq!(
-        parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "-1" })),
-        None,
-        "NR_OF_CORES=-1 must return None"
+        resolve_instance_overhead_mb(&with),
+        resolve_instance_overhead_mb(&without),
+        "INSTANCE_OVERHEAD_MB must not react to an NR_OF_CORES property"
     );
-
-    // Non-numeric → None.
     assert_eq!(
-        parse_nr_of_cores_override(&serde_json::json!({ PROP_NR_OF_CORES: "bad" })),
-        None,
-        "NR_OF_CORES=bad must return None"
-    );
-
-    // With no override, resolve_nr_of_cores auto-detects the core count from
-    // available_parallelism() (positive, host-sourced).
-    let cores = resolve_nr_of_cores(&serde_json::json!({}));
-    assert!(
-        cores >= 1,
-        "no override must fall back to available_parallelism() (>= 1), got {cores}"
+        resolve_join_broadcast_max_bytes(&with),
+        resolve_join_broadcast_max_bytes(&without),
+        "JOIN_BROADCAST_MAX_BYTES must not react to an NR_OF_CORES property"
     );
 }
 
@@ -1134,14 +1132,14 @@ fn df_target_partitions_defaults_to_nr_of_cores() {
     );
 }
 
-/// Task 2.5 — Absent DATAFUSION_TARGET_PARTITIONS with nr_of_cores=0 defaults to 1.
+/// Task 2.5 — Absent DATAFUSION_TARGET_PARTITIONS with nr_of_cores=1 defaults to 1.
 #[test]
-fn df_target_partitions_unknown_cores_defaults_to_1() {
+fn df_target_partitions_one_core_defaults_to_1() {
     let props = serde_json::json!({});
     assert_eq!(
-        resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 0),
+        resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 1),
         1,
-        "absent property with nr_of_cores=0 (unknown) must default to 1"
+        "absent property on a single-core node must default to 1"
     );
 }
 
@@ -1168,14 +1166,14 @@ fn df_threads_per_udf_defaults_to_nr_of_cores() {
     );
 }
 
-/// Task 2.8 — Absent DATAFUSION_THREADS_PER_UDF with nr_of_cores=0 defaults to 1.
+/// Task 2.8 — Absent DATAFUSION_THREADS_PER_UDF with nr_of_cores=1 defaults to 1.
 #[test]
-fn df_threads_per_udf_unknown_cores_defaults_to_1() {
+fn df_threads_per_udf_one_core_defaults_to_1() {
     let props = serde_json::json!({});
     assert_eq!(
-        resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 0),
+        resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 1),
         1,
-        "absent property with nr_of_cores=0 (unknown) must default to 1"
+        "absent property on a single-core node must default to 1"
     );
 }
 
@@ -1228,7 +1226,6 @@ fn threading_mode_defaults_to_auto() {
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -1250,7 +1247,7 @@ fn threading_mode_defaults_to_auto() {
 }
 
 /// 1.5 — AUTO mode derives a per-instance thread budget that does not
-/// oversubscribe a node: instances × threads ≤ NR_OF_CORES, with target
+/// oversubscribe a node: instances × threads ≤ nr_of_cores, with target
 /// partitions held in lockstep with threads.
 #[test]
 fn auto_mode_derives_non_oversubscribing_threads() {
@@ -1265,7 +1262,7 @@ fn auto_mode_derives_non_oversubscribing_threads() {
     // The oversubscription invariant must hold explicitly.
     assert!(
         4 * threads <= 16,
-        "udf_instances_per_node × threads must not exceed NR_OF_CORES"
+        "udf_instances_per_node × threads must not exceed nr_of_cores"
     );
 
     // Non-divisible case: 10 cores / 3 instances → floor(10/3) = 3; 3×3=9 ≤ 10.
@@ -1285,18 +1282,21 @@ fn auto_mode_derives_non_oversubscribing_threads() {
     assert_eq!(tp_ignored, 4, "AUTO ignores supplied target partitions");
 }
 
-/// 1.5 — AUTO mode falls back to a single thread / partition when the core
-/// count is unknown (NR_OF_CORES = 0).
+/// 1.5 — AUTO mode yields a single thread / partition on a single-core node,
+/// where the `max(1, …)` floor is what the formula produces.
 #[test]
-fn auto_mode_falls_back_to_one_when_cores_zero() {
+fn auto_mode_yields_one_thread_on_one_core() {
     let (target_partitions, threads) =
-        resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 0, 8);
-    assert_eq!(threads, 1, "cores=0 → 1 thread");
-    assert_eq!(target_partitions, 1, "cores=0 → 1 target partition");
+        resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 1, 8);
+    assert_eq!(threads, 1, "one core across eight instances → 1 thread");
+    assert_eq!(
+        target_partitions, 1,
+        "one core across eight instances → 1 target partition"
+    );
 }
 
 /// 1.5 — FIXED mode uses the operator-supplied values verbatim; absent or
-/// non-positive values fall back to max(NR_OF_CORES, 1) per field.
+/// non-positive values fall back to max(nr_of_cores, 1) per field.
 #[test]
 fn fixed_mode_uses_supplied_values() {
     // Explicit positive values are used verbatim, regardless of cores.
@@ -1308,7 +1308,7 @@ fn fixed_mode_uses_supplied_values() {
     assert_eq!(tp, 3, "FIXED uses supplied target partitions verbatim");
     assert_eq!(th, 2, "FIXED uses supplied threads verbatim");
 
-    // Absent values fall back to max(NR_OF_CORES, 1) — the pre-mode behaviour.
+    // Absent values fall back to max(nr_of_cores, 1) — the pre-mode behaviour.
     let (tp_d, th_d) = resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 8, 4);
     assert_eq!(tp_d, 8, "absent target partitions → max(cores,1) = 8");
     assert_eq!(th_d, 8, "absent threads → max(cores,1) = 8");
@@ -1336,7 +1336,6 @@ fn table_map_round_trips_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -1375,7 +1374,6 @@ fn table_map_stored_as_nested_json_object() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -1413,7 +1411,6 @@ fn table_map_merges_with_existing_notes() {
     });
     let notes = build_adapter_notes(
         &req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -1463,7 +1460,6 @@ fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &st
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -1584,7 +1580,6 @@ fn create_vs_records_table_map_in_adapter_notes() {
     });
     let notes = build_adapter_notes(
         &request,
-        0,
         DEFAULT_PARALLELISM_FACTOR,
         ThreadingMode::Auto,
         DEFAULT_DF_TARGET_PARTITIONS,
@@ -1740,11 +1735,11 @@ fn resolve_s3_max_connections_fixed_value_wins() {
         64,
         "explicit S3_MAX_CONNECTIONS must be used verbatim"
     );
-    // Independent of node capacity (even the unknown-cores path).
+    // Independent of node capacity, down to the smallest node.
     assert_eq!(
-        resolve_s3_max_connections(&props, 0, 4),
+        resolve_s3_max_connections(&props, 1, 4),
         64,
-        "explicit value wins even when cores are unknown"
+        "explicit value wins even on a single-core node"
     );
 }
 
@@ -1801,22 +1796,24 @@ fn resolve_s3_max_connections_auto_scales_with_cores() {
     );
 }
 
-/// Scenario: AUTO derivation falls back to the default budget when the core
-/// count is unknown (the `0` sentinel), rather than producing a zero/negative
-/// budget.
+/// Scenario: on a single-core node the AUTO derivation applies the same
+/// uniform `threads × S3_CONNECTIONS_PER_THREAD` formula it applies at every
+/// other core count, yielding 4 connections. There is no separate
+/// default-budget branch: the former unknown-core fallback returned
+/// `DEFAULT_S3_MAX_CONNECTIONS` (16) here, and dropping it is a deliberate
+/// behavior change.
 #[test]
-fn resolve_s3_max_connections_auto_zero_cores_defaults() {
+fn resolve_s3_max_connections_auto_one_core_yields_four() {
     let absent = serde_json::json!({});
     assert_eq!(
-        resolve_s3_max_connections(&absent, 0, 1),
-        DEFAULT_S3_MAX_CONNECTIONS,
-        "unknown cores (0) must fall back to the built-in default"
+        resolve_s3_max_connections(&absent, 1, 1),
+        4,
+        "one core on one instance must derive one thread's worth of connections"
     );
-    // Instance share is irrelevant once cores are unknown.
     assert_eq!(
-        resolve_s3_max_connections(&absent, 0, 8),
-        DEFAULT_S3_MAX_CONNECTIONS,
-        "0-cores fallback ignores the instance share"
+        resolve_s3_max_connections(&absent, 1, 8),
+        4,
+        "one core split across eight instances still derives one thread's worth"
     );
 }
 

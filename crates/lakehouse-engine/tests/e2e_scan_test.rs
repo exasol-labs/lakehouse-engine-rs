@@ -34,8 +34,8 @@ use common::seed::{
     typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use common::stack::{
-    build_create_connection_sql, iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog,
-    wait_for_minio,
+    build_create_connection_sql, exasol_container, iceberg_catalog_url, wait_for_exasol,
+    wait_for_iceberg_catalog, wait_for_minio,
 };
 
 use lakehouse_catalog::CatalogSession;
@@ -48,6 +48,11 @@ use std::sync::OnceLock;
 // ---------------------------------------------------------------------------
 
 const VS_NAME: &str = "MY_LAKEHOUSE";
+
+/// Dedicated virtual schema for the CPU-quota probe, kept separate from the
+/// shared `VS_NAME` so its `PARALLELISM_FACTOR = 1` does not alter the budgets
+/// every other test observes.
+const CPU_PROBE_VS_NAME: &str = "CPU_PROBE_VS";
 
 // ---------------------------------------------------------------------------
 // One-time setup
@@ -1286,10 +1291,12 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
-/// After createVirtualSchema the schema's adapterNotes carry PARALLELISM_FACTOR
-/// and NR_OF_CORES, but no CLUSTER_NODES key — the node count is no longer
-/// persisted in adapterNotes at all; `pushdown` now reads it live from
-/// `UdfContext::node_count()` on every request instead.
+/// After createVirtualSchema the schema's adapterNotes carry PARALLELISM_FACTOR,
+/// but neither a CLUSTER_NODES nor an NR_OF_CORES key. Neither input is
+/// persisted in adapterNotes any more: `pushdown` reads the node count live from
+/// `UdfContext::node_count()` on every request, and the per-node core count is
+/// detected at createVirtualSchema time, consumed by the budget derivations, and
+/// discarded.
 ///
 /// Queries SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES — the observable catalog
 /// column for adapter-controlled schema state. Exasol does NOT persist
@@ -1333,14 +1340,118 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
         "ADAPTER_NOTES must carry PARALLELISM_FACTOR: {notes:?}"
     );
     assert!(
-        parsed.get("NR_OF_CORES").is_some(),
-        "ADAPTER_NOTES must carry NR_OF_CORES: {notes:?}"
+        parsed.get("NR_OF_CORES").is_none(),
+        "ADAPTER_NOTES must NOT carry NR_OF_CORES (the core count is detected \
+         per createVirtualSchema request, consumed by the budget derivations, \
+         and never persisted): {notes:?}"
     );
     assert!(
         parsed.get("CLUSTER_NODES").is_none(),
         "ADAPTER_NOTES must NOT carry CLUSTER_NODES (node count is read live \
          from UdfContext::node_count() per pushdown request, never persisted): \
          {notes:?}"
+    );
+}
+
+/// Effective CPU quota of the running Exasol container, read from the
+/// container's own cgroup rather than from this test process's environment.
+///
+/// `/sys/fs/cgroup/cpu.max` holds `"<quota> <period>"` in microseconds; the
+/// number of whole CPUs the container may use is `quota / period`. A literal
+/// `max` quota means the container is unconstrained, which this probe cannot
+/// work with.
+fn container_cpu_quota() -> usize {
+    let container = exasol_container();
+    let out = std::process::Command::new("docker")
+        .args(["exec", &container, "cat", "/sys/fs/cgroup/cpu.max"])
+        .output()
+        .unwrap_or_else(|e| panic!("docker exec {container} to read /sys/fs/cgroup/cpu.max: {e}"));
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let mut fields = raw.split_whitespace();
+    let quota = fields
+        .next()
+        .unwrap_or_else(|| panic!("/sys/fs/cgroup/cpu.max in {container} is empty: {raw:?}"));
+    assert_ne!(
+        quota, "max",
+        "the Exasol container {container} runs with an unlimited CPU quota, so it \
+         cannot be distinguished from the host — set LH_EXASOL_CPUS for this stack"
+    );
+    let quota: u64 = quota
+        .parse()
+        .unwrap_or_else(|e| panic!("cpu.max quota {quota:?} is not an integer ({e}): {raw:?}"));
+    let period: u64 = fields
+        .next()
+        .unwrap_or_else(|| panic!("cpu.max in {container} carries no period: {raw:?}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("cpu.max period is not an integer ({e}): {raw:?}"));
+    assert!(period > 0, "cpu.max period must be positive: {raw:?}");
+    usize::try_from(quota / period).expect("a CPU quota must fit a usize")
+}
+
+/// Auto-detection reads the CPU capacity the adapter's VM actually has, not the
+/// capacity of the machine hosting the container.
+///
+/// `PARALLELISM_FACTOR = 1` makes the per-node UDF-instance share 1, so the AUTO
+/// threading derivation (`floor(cores / instances)`) records the detected core
+/// count unchanged as `DF_THREADS_PER_UDF`. That note is therefore a direct
+/// read-out of what `std::thread::available_parallelism()` saw inside the
+/// container.
+///
+/// The expected value is read back from the running container's own
+/// `/sys/fs/cgroup/cpu.max`, never from this test process's environment: the two
+/// differ exactly when the container is CPU-limited, and that difference is what
+/// the assertion is for. The precondition is asserted first because at an equal
+/// quota and host count the main assertion would pass whether the adapter read
+/// the container quota or the unconstrained host, proving nothing.
+#[test]
+fn adapter_detects_container_cpu_quota() {
+    setup_e2e();
+
+    let container_cpus = container_cpu_quota();
+    let host_cpus = std::thread::available_parallelism()
+        .expect("the test host must report a core count")
+        .get();
+    assert!(
+        container_cpus < host_cpus,
+        "PRECONDITION UNMET: the Exasol container's CPU quota ({container_cpus}) must be \
+         strictly below the test host's core count ({host_cpus}); at an equal quota this \
+         test cannot tell a container-scoped detection from a host-scoped one. Lower \
+         LH_EXASOL_CPUS below {host_cpus} and recreate the stack."
+    );
+
+    let mut conn = exa_conn();
+    create_virtual_schema(
+        &mut conn,
+        &VsProps::new(CPU_PROBE_VS_NAME, E2E_NAMESPACE).with_parallelism_factor(1),
+    );
+
+    let cols = conn.query_columns(&format!(
+        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS \
+         WHERE SCHEMA_NAME = '{CPU_PROBE_VS_NAME}'"
+    ));
+    let notes = cols
+        .first()
+        .and_then(|col| col.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("the probe virtual schema must expose ADAPTER_NOTES: {cols:?}"));
+    let parsed: serde_json::Value = serde_json::from_str(notes)
+        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be valid JSON ({e}): {notes:?}"));
+    let threads: usize = parsed
+        .get("DF_THREADS_PER_UDF")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry DF_THREADS_PER_UDF: {notes:?}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("DF_THREADS_PER_UDF must be an integer ({e}): {notes:?}"));
+
+    let _ = conn.try_execute(&format!(
+        "DROP VIRTUAL SCHEMA IF EXISTS {CPU_PROBE_VS_NAME} CASCADE"
+    ));
+
+    assert_eq!(
+        threads, container_cpus,
+        "with PARALLELISM_FACTOR = 1 the adapter must record the container's own CPU \
+         quota ({container_cpus}) as DF_THREADS_PER_UDF; {host_cpus} would mean \
+         auto-detection read the unconstrained host instead of the VM's cgroup"
     );
 }
 

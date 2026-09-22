@@ -1315,12 +1315,14 @@ fn default_instance_overhead_mb() -> u64 {
     200
 }
 
-/// Built-in fallback connection-concurrency budget: used both as the serde
-/// default for [`CommonScanSpec::s3_max_connections`] / [`ScanSpec::s3_max_connections`]
-/// when the field is absent from JSON, and by the adapter's AUTO derivation
-/// (`resolve_s3_max_connections`) when `nr_of_cores` is `0` (unknown). Defined
-/// here rather than in `adapter` so `scan::spec` — the lower-level module the
-/// adapter already depends on — has no reverse dependency on `adapter`.
+/// Built-in fallback connection-concurrency budget, serving two roles: the serde
+/// default for [`CommonScanSpec::s3_max_connections`] /
+/// [`ScanSpec::s3_max_connections`] when a `ScanSpec` JSON payload omits the
+/// field, and the pushdown-side fallback in `adapter/mod.rs`'s
+/// `handle_pushdown_request` when the `S3_MAX_CONNECTIONS` adapterNote is absent
+/// or unparseable. Defined here rather than in `adapter` so `scan::spec` — the
+/// lower-level module the adapter already depends on — has no reverse dependency
+/// on `adapter`, even though both remaining consumers live in `adapter`.
 pub(crate) const DEFAULT_S3_MAX_CONNECTIONS: usize = 16;
 
 /// Conservative built-in default for [`CommonScanSpec::s3_max_connections`] /
