@@ -14,11 +14,11 @@
 //! the live engine version and maps it with its own table rather than by
 //! calling the production rule under test.
 //!
-//! The rendered fractional DIGIT COUNT is deliberately never asserted: the
-//! WebSocket protocol renders six fractional digits for every `TIMESTAMP`
-//! regardless of declared precision (a `TIMESTAMP(3)` column renders
-//! `...123000`), so only the rendered VALUE and `COUNT(DISTINCT)` discriminate
-//! the two arms.
+//! The rendered fractional DIGIT COUNT is deliberately never asserted: a
+//! `TIMESTAMP` renders through `NLS_TIMESTAMP_FORMAT`, not at its declared
+//! precision (a `TIMESTAMP(3)` column renders `...123000` under the default six
+//! digits), so only the rendered VALUE and `COUNT(DISTINCT)` discriminate the
+//! two arms.
 //!
 //! Per project rules this test FAILS (never skips) when its stack is
 //! unreachable: the `wait_for_*` helpers panic rather than return `Err`.
@@ -41,6 +41,8 @@ use common::timestamp_precision::{
 use std::sync::OnceLock;
 
 const VS_NAME: &str = "TS_PRECISION_VS";
+
+const NANOSECOND_TIMESTAMP_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS.FF9";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -294,6 +296,11 @@ fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     if !accepts_every_cast_precision(&mut conn) {
         return;
     }
+    // The seeded instants differ in the ninth digit, which the default six-digit render drops.
+    conn.execute(&format!(
+        "ALTER SESSION SET NLS_TIMESTAMP_FORMAT='{NANOSECOND_TIMESTAMP_FORMAT}'"
+    ));
+
     let target = ExpectedTimestampPrecision::NANOSECOND.declared_column_type;
     let ts_ns_column = TSPRECISION_COL_TS_NS.to_uppercase();
     let projection_sql = cast_projection_sql(&ts_ns_column, target);
