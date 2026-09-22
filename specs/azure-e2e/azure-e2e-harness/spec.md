@@ -233,3 +233,16 @@ shared-harness provisioning, and DDL-failure output redaction.
 * *AND* a delete failure encountered while unwinding SHALL be reported without panicking a second time, so the original test failure remains the reported one
 * *AND* a name collision at create time SHALL fail the run, because the millisecond-suffixed name makes a collision a defect rather than a tolerable state
 * *AND* a container already absent at delete time SHALL be treated as deleted
+
+### Scenario: End-to-end scan over a raw Parquet directory on ADLS returns correct rows
+
+* *GIVEN* the per-run blob container the harness already creates, holding a prefix `direct/` under which one first-level directory `events/` carries two Parquet files written by the harness, at a prefix disjoint from both Iceberg warehouses' `key-prefix` values
+* *AND* a CONNECTION whose address is the `abfss://<container>@<account>.dfs.core.windows.net/direct` storage base path and whose password carries `account_name` and `account_key` and NO catalog-authentication field
+* *AND* a virtual schema created over that CONNECTION with the direct-storage `CATALOG_KIND` and no `NAMESPACE`
+* *WHEN* a user runs `SELECT <subset of columns> FROM <vs>.EVENTS WHERE <predicate>`
+* *THEN* `CREATE VIRTUAL SCHEMA` SHALL declare exactly ONE virtual table named for the `events` directory, with the columns the two files' folded footers carry
+* *AND* the query SHALL return exactly the rows of BOTH files that satisfy the predicate, projected to the selected columns, with values matching what the harness wrote
+* *AND* the scan SHALL read the files at their `abfss://` locations with the account key carried in the CONNECTION, so this scenario proves the `abfss` scheme reaches storage under a kind that authenticates no catalog
+* *AND* no account-key value SHALL appear in any test output or in any returned SQL string
+* *AND* the fixture SHALL be written under the per-run container's own guard, so it is deleted with the container when the owning scope ends, including on panic
+* *AND* the test MUST fail (not skip) when the local stack or the Azure account is unavailable

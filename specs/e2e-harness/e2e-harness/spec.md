@@ -79,7 +79,8 @@ scenarios.
 * *WHEN* any binary's setup provisions the lakehouse VS scan path
 * *THEN* the binary SHALL install `LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and the adapter script from that shared definition, so the script DDL is byte-identical across every binary
 * *AND* the shared definition SHALL issue `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts to `CURRENT_USER` after the last `CREATE OR REPLACE` of either object (both drop the grant), skipping `SYS` (Exasol refuses it; DBA holds all CONNECTIONs implicitly)
-* *AND* the per-binary Virtual Schema properties that vary (VS name, Iceberg namespace, catalog CONNECTION name, `PARALLELISM_FACTOR`, `JOIN_BROADCAST_MAX_BYTES`) SHALL be supplied as explicit parameters rather than by re-declaring the provisioning logic
+* *AND* the per-binary Virtual Schema properties that vary (VS name, the namespace property, catalog CONNECTION name, `PARALLELISM_FACTOR`, `JOIN_BROADCAST_MAX_BYTES`, `CATALOG_KIND`, and `MERGE_SCHEMA`) SHALL be supplied as explicit parameters rather than by re-declaring the provisioning logic, SUPERSEDING the recorded list, which named an Iceberg namespace and omitted the two catalog-kind-dependent properties
+* *AND* a parameter a binary does not supply SHALL be OMITTED from the generated `CREATE VIRTUAL SCHEMA` rather than emitted empty, so an Iceberg binary's DDL is byte-identical to the one it generates today and no existing binary's assertions change
 * *AND* an end-to-end query through any binary's Virtual Schema SHALL return results identical to the single-node DataFusion equivalent, and the affected tests MUST fail (not skip) when the Exasol Docker container or MinIO is unavailable
 
 ### Scenario: A least-privilege user queries the VS and recovers no credential from the plan

@@ -85,7 +85,7 @@ The catalog endpoint and storage credentials are supplied through the Exasol CON
 * *AND* that fold SHALL be owned by exactly ONE site — the shared `CatalogClient` listing pipeline, which folds every declared name for BOTH catalog kinds and produces the `(name, Exasol type)` pairs the response's column list is built from — and no other code path SHALL declare a differently-cased name
 * *AND* the full-Unicode fold's one-to-many expansions SHALL be recorded as a deliberate Exasol-target trade-off rather than left unstated: `ß` becomes `SS`, so an Iceberg column `straße` is queryable ONLY as the ASCII identifier `STRASSE` and the `ß`-bearing form resolves against no declared column, and two Iceberg columns in one table differing only in that expansion declare the same Exasol name with no collision check to reject it
 * *AND* the adapter MUST NOT persist any catalog metadata between requests other than the table-name map recorded in `adapterNotes`
-* *AND* a `createVirtualSchema` request that supplies no `NAMESPACE` property SHALL fail with the required-property error naming `NAMESPACE`
+* *AND* a `createVirtualSchema` request that resolves to a CATALOG kind and supplies no `NAMESPACE` property SHALL fail with the required-property error naming `NAMESPACE`, SUPERSEDING the unconditional form of this clause, because the `DIRECT_STORAGE` kind reaches its tables from the CONNECTION address alone and treats an absent `NAMESPACE` as the address itself, per `vs-adapter/direct-storage-properties`
 
 ### Scenario: One non-Iceberg table in the namespace is skipped rather than aborting the schema
 

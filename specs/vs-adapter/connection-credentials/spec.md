@@ -57,17 +57,18 @@ catalog `load_table` request, ahead of any credential vending); `endpoint` stays
 
 ### Scenario: One storage-credential projection and one selector serve both readers
 
-* *GIVEN* the two readers of a CONNECTION on the vending-disabled path — the adapter at plan time, and the scan UDF at execution time under `vs-adapter/scan-spec-credential-reference`
-* *WHEN* either reader turns a resolved CONNECTION password into a storage backend
-* *THEN* exactly ONE storage-credential projection type — declaring EXACTLY `endpoint`, `region`, `access_key`, `secret_key`, `session_token`, `path_style`, `account_name`, `account_key`, and `sas_token` — and exactly ONE selector over it SHALL serve both readers, and neither reader SHALL carry its own copy of either
-* *AND* the projection SHALL carry `path_style` as an OPTION of boolean, preserving whether the CONNECTION stated a value, and the ONE selector SHALL be the single place that resolves an unstated value to `false`, so the two readers cannot resolve the same absent field differently
+* *GIVEN* the readers of a CONNECTION on the vending-disabled path — the adapter at plan time, the scan UDF at execution time under `vs-adapter/scan-spec-credential-reference`, and the adapter's table-enumeration path under `CatalogKind::DirectStorage`, which opens a store before any table exists
+* *WHEN* any reader turns a resolved CONNECTION password into a storage backend
+* *THEN* exactly ONE storage-credential projection type — declaring EXACTLY `endpoint`, `region`, `access_key`, `secret_key`, `session_token`, `path_style`, `account_name`, `account_key`, and `sas_token` — and exactly ONE selector over it SHALL serve EVERY reader, and no reader SHALL carry its own copy of either
+* *AND* the projection SHALL carry `path_style` as an OPTION of boolean, preserving whether the CONNECTION stated a value, and the ONE selector SHALL be the single place that resolves an unstated value to `false`, so no two readers resolve the same absent field differently
 * *AND* the parse step SHALL NOT resolve that value, because a parse that already substituted `false` would destroy the distinction the vended path reads
 * *AND* that pair SHALL live in the crate that already owns `ConnectionCreds`, `StorageProps`, and `StorageBackend`, while `read_connection`, `validate_creds`, `parse_creds`, `storage_block`, `catalog_block`, and `REQUIRED_KEY` SHALL ALL STAY in the adapter module where `vs-adapter/catalog-crate-structure` pins them, so the scan path depends inward on a credential type and no function interpreting the Exasol CONNECTION object crosses the crate boundary
-* *AND* the adapter's own CONNECTION-to-backend entry point SHALL reach that selector through the projection rather than re-implementing the selection, and the nine storage field spellings SHALL have exactly ONE reader, so the two readers cannot normalise an empty or absent field differently
-* *AND* the backend the two readers derive from one CONNECTION password and one `allow_http` value SHALL be field-for-field EQUAL, asserted by a test over a password carrying every storage field, over one carrying empty strings, and over one omitting fields
+* *AND* the adapter's own CONNECTION-to-backend entry point SHALL reach that selector through the projection rather than re-implementing the selection, and the nine storage field spellings SHALL have exactly ONE reader, so no two readers normalise an empty or absent field differently
+* *AND* the backend the readers derive from one CONNECTION password and one `allow_http` value SHALL be field-for-field EQUAL, asserted by a test over a password carrying every storage field, over one carrying empty strings, and over one omitting fields
 * *AND* the scan-side reader SHALL apply the DERIVATION only and MUST NOT re-run the acceptance validation the adapter applies, because that validation is parameterized by the resolved `CatalogKind` and answers a plan-time question the adapter already answered for this query
+* *AND* that acceptance validation SHALL require `warehouse` under every CATALOG kind and SHALL REJECT it under `DIRECT_STORAGE`, which reaches no catalog, SUPERSEDING this feature's recorded statement that `warehouse` is the only unconditionally-required field; `vs-adapter/connection-credentials-direct-storage` owns that kind's required, rejected, and address-agreement rules
 * *AND* the selection rule — Azure when `account_name` is present with exactly one of `account_key` and `sas_token`, S3 otherwise — SHALL be UNCHANGED, so a CONNECTION resolves to the same backend it resolved to before this delta
-* *AND* no supplied credential value SHALL appear in any error message, returned SQL, or log line from either reader
+* *AND* no supplied credential value SHALL appear in any error message, returned SQL, or log line from any reader
 
 ### Scenario: Missing connection name is rejected with a clear, credential-safe error
 
