@@ -30,7 +30,9 @@ mod sql_support;
 pub use sql_support::build_alias_items;
 
 mod object_store;
-pub(crate) use self::object_store::build_table_root_store;
+pub(crate) use self::object_store::{
+    build_admission_limited_store, build_table_root_store, store_root_url,
+};
 use object_store::build_session_context;
 pub(crate) use spec::reconstruct_abs_uri;
 
@@ -65,7 +67,7 @@ mod test_support;
 
 #[cfg(test)]
 #[path = "type_relaxation_tests.rs"]
-mod type_relaxation;
+pub(crate) mod type_relaxation;
 
 /// Bounded grace period for draining background async work at runtime teardown.
 ///

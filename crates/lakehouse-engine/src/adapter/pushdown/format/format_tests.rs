@@ -158,3 +158,34 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
         "an Iceberg REST source must select its reader without issuing a request"
     );
 }
+
+/// Scenario: The format reader is selected at the same one site for a third source.
+///
+/// The third source selects the raw-Parquet reader at the SAME one site, matching the
+/// scan source rather than the catalog kind — so the permitted-site set the catalog
+/// kind's own baseline records gains no file. Selection reads nothing: the store holds
+/// no object, so a site that listed or parsed a footer here could not answer `Ok`.
+#[test]
+fn third_scan_source_selects_the_parquet_reader() {
+    let creds = offline_sigv4_creds();
+    let storage = sample_storage();
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+    let selected = format_reader(
+        ScanSource::DirectParquet {
+            store: &store,
+            table_root: "s3://warehouse/direct/events",
+            merge_mode: MergeMode::FoldEveryFile,
+        },
+        &ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    );
+
+    assert!(
+        selected.is_ok(),
+        "a raw Parquet directory must select its reader without reading anything"
+    );
+}

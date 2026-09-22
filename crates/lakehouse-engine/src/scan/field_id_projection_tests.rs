@@ -1725,3 +1725,70 @@ fn a_binding_that_diverts_a_column_always_withholds_row_filter_pushdown() {
         "no declared member tree means no diversion, so nothing is rendered to lose a predicate"
     );
 }
+
+/// Scenario: a logical field carrying no binding key binds by its own name.
+///
+/// The raw-Parquet-directory case: one folded logical schema over files that declare
+/// DIFFERENT column sets in DIFFERENT orders. Each file binds every column it carries
+/// by name and leaves the rest unbound for the NULL fill, so a column's physical
+/// ORDINAL is never consulted — which is exactly why such a schema must synthesize no
+/// ordinal field-id: an ordinal would bind the wrong column of the other file.
+#[test]
+fn identity_binding_spans_files_with_different_column_sets() {
+    let logical = Schema::new(vec![
+        field_no_id("id", DataType::Int64, true),
+        field_no_id("extra", DataType::Utf8, true),
+        field_no_id("name", DataType::Utf8, true),
+    ]);
+    let first = Schema::new(vec![
+        field_no_id("name", DataType::Utf8, true),
+        field_no_id("id", DataType::Int64, true),
+    ]);
+    let second = Schema::new(vec![
+        field_no_id("extra", DataType::Utf8, true),
+        field_no_id("id", DataType::Int64, true),
+    ]);
+
+    let first_binding = bind_columns(&logical, &first, &bare_resolution());
+    assert!(
+        first_binding.bound_logical_names.contains("id")
+            && first_binding.bound_logical_names.contains("name"),
+        "the first file's own columns bind by name whatever their ordinal"
+    );
+    assert!(
+        !first_binding.bound_logical_names.contains("extra"),
+        "a column the first file does not carry stays unbound for the NULL fill"
+    );
+
+    let second_binding = bind_columns(&logical, &second, &bare_resolution());
+    assert!(
+        second_binding.bound_logical_names.contains("id")
+            && second_binding.bound_logical_names.contains("extra"),
+        "the second file's own columns bind by name too"
+    );
+    assert!(
+        !second_binding.bound_logical_names.contains("name"),
+        "a column the second file does not carry stays unbound for the NULL fill"
+    );
+
+    let logical_ref = Arc::new(logical);
+    let in_first = rewrite(
+        Arc::clone(&logical_ref),
+        Arc::new(first),
+        Column::new("id", 0),
+    )
+    .expect("rewrite ok");
+    let in_second =
+        rewrite(logical_ref, Arc::new(second), Column::new("id", 0)).expect("rewrite ok");
+
+    assert_eq!(
+        bound_physical_index(&in_first),
+        Some(1),
+        "`id` binds to its own name at the first file's ordinal 1"
+    );
+    assert_eq!(
+        bound_physical_index(&in_second),
+        Some(1),
+        "`id` binds to its own name in the second file too, whose column set differs"
+    );
+}

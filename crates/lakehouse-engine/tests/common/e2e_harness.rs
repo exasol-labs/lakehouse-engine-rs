@@ -208,6 +208,8 @@ pub struct VsProps<'a> {
     catalog_conn_name: &'a str,
     parallelism_factor: Option<usize>,
     join_broadcast_max_bytes: Option<&'a str>,
+    catalog_kind: Option<&'a str>,
+    merge_schema: Option<&'a str>,
 }
 
 impl<'a> VsProps<'a> {
@@ -220,6 +222,8 @@ impl<'a> VsProps<'a> {
             catalog_conn_name: DEFAULT_CATALOG_CONN_NAME,
             parallelism_factor: None,
             join_broadcast_max_bytes: None,
+            catalog_kind: None,
+            merge_schema: None,
         }
     }
 
@@ -240,6 +244,18 @@ impl<'a> VsProps<'a> {
         self.catalog_conn_name = name;
         self
     }
+
+    /// Set the `CATALOG_KIND` VS property (e.g. `"DIRECT_STORAGE"`).
+    pub fn with_catalog_kind(mut self, kind: &'a str) -> Self {
+        self.catalog_kind = Some(kind);
+        self
+    }
+
+    /// Set the `MERGE_SCHEMA` VS property (e.g. `"FALSE"`).
+    pub fn with_merge_schema(mut self, merge_schema: &'a str) -> Self {
+        self.merge_schema = Some(merge_schema);
+        self
+    }
 }
 
 /// Create (or replace) a Virtual Schema from `props`.
@@ -248,9 +264,10 @@ impl<'a> VsProps<'a> {
 /// credentials (harmless to repeat, and folds the join binary's separate
 /// `create_connection`), drops any existing VS, then emits `CREATE VIRTUAL
 /// SCHEMA` with the base properties plus the optional `PARALLELISM_FACTOR` /
-/// `JOIN_BROADCAST_MAX_BYTES` clauses when set. VS properties use
-/// docker-network-internal URLs because the adapter UDF runs inside the Exasol
-/// container.
+/// `JOIN_BROADCAST_MAX_BYTES` / `CATALOG_KIND` / `MERGE_SCHEMA` clauses when
+/// set — a clause a binary does not supply is omitted entirely rather than
+/// emitted empty. VS properties use docker-network-internal URLs because the
+/// adapter UDF runs inside the Exasol container.
 pub fn create_virtual_schema(conn: &mut ExaConn, props: &VsProps) {
     let password = local_stack_connection_password();
     let catalog_uri = iceberg_catalog_url_internal();
@@ -266,7 +283,9 @@ pub fn create_virtual_schema(conn: &mut ExaConn, props: &VsProps) {
 /// (carried on `password.warehouse`), and namespace (`props.namespace`)
 /// without re-declaring the shared schema/script/SLC provisioning in
 /// `create_schema_and_scripts` — only the CONNECTION password and VS
-/// properties vary per catalog.
+/// properties vary per catalog. `NAMESPACE` is optional (e.g. direct
+/// storage): an empty `props.namespace` omits the clause entirely rather
+/// than sending `NAMESPACE = ''`, which Exasol rejects.
 pub fn create_virtual_schema_with_password(
     conn: &mut ExaConn,
     props: &VsProps,
@@ -292,16 +311,27 @@ pub fn create_virtual_schema_with_password(
         .join_broadcast_max_bytes
         .map(|b| format!("\n  JOIN_BROADCAST_MAX_BYTES = '{b}'"))
         .unwrap_or_default();
+    let catalog_kind_clause = props
+        .catalog_kind
+        .map(|k| format!("\n  CATALOG_KIND = '{k}'"))
+        .unwrap_or_default();
+    let merge_schema_clause = props
+        .merge_schema
+        .map(|m| format!("\n  MERGE_SCHEMA = '{m}'"))
+        .unwrap_or_default();
+    let namespace_clause = if props.namespace.is_empty() {
+        String::new()
+    } else {
+        format!("\n  NAMESPACE   = '{}'", props.namespace)
+    };
 
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
-  NAMESPACE   = '{namespace}'
-  ALLOW_HTTP          = 'true'{parallelism_clause}{join_clause}"#,
+  ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}"#,
         vs_name = props.vs_name,
         catalog_conn_name = props.catalog_conn_name,
-        namespace = props.namespace,
     ));
 }
 

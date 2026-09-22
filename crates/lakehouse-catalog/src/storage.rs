@@ -193,6 +193,23 @@ impl StorageBackend {
             .with_props(self.catalog_storage_props())
             .build()
     }
+
+    /// Whether this backend addresses the given (already-lowercased) URI
+    /// scheme, so a CONNECTION address whose scheme names a different backend
+    /// than the credential shape it carries can be rejected at validation
+    /// time rather than at the first object-store request.
+    ///
+    /// Matched exhaustively with no catch-all arm, so an added storage
+    /// backend is a build failure here rather than silently accepting every
+    /// scheme. The Azure arm accepts only `abfss`: the plaintext `abfs`
+    /// consent gate lives on the vended path this check never reaches, so
+    /// `abfs` is rejected here rather than accepted and downgraded.
+    pub fn addresses_scheme(&self, scheme: &str) -> bool {
+        match self {
+            Self::S3(_) => matches!(scheme, "s3" | "s3a"),
+            Self::Adls { .. } => scheme == "abfss",
+        }
+    }
 }
 
 /// The storage-backend KIND a vended table location's URI scheme selects — the

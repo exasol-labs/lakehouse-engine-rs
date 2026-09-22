@@ -1137,3 +1137,50 @@ async fn sized_store_serves_head_from_index_and_delegates_otherwise() {
         "a data read must delegate to the inner store, not the size index"
     );
 }
+
+// ---------------------------------------------------------------------------
+// build_admission_limited_store — the one admission-limited object store a
+// direct-storage adapter call builds
+// ---------------------------------------------------------------------------
+
+/// The returned store is wrapped in [`LimitStore`] capped at
+/// [`DIRECT_STORAGE_ADMISSION_LIMIT`], observable through `LimitStore`'s own
+/// `Display` impl (`LimitStore(<max_requests>, <inner>)`), and is NOT further
+/// wrapped in [`SpecSizedObjectStore`] — a direct-storage call has no
+/// pre-resolved file-size index to build one from.
+#[test]
+fn build_admission_limited_store_wraps_the_s3_backend_in_a_limit_store() {
+    let backend = s3_backend("http://s3.example.com", "secret");
+    let store_url = Url::parse("s3://test-bucket").expect("URL must parse");
+
+    let store = build_admission_limited_store(&backend, &store_url, &[])
+        .expect("an S3 backend must build an admission-limited store");
+
+    assert!(
+        store
+            .to_string()
+            .starts_with(&format!("LimitStore({DIRECT_STORAGE_ADMISSION_LIMIT}, ")),
+        "expected a LimitStore capped at {DIRECT_STORAGE_ADMISSION_LIMIT}, got: {store}"
+    );
+    assert!(
+        !store.to_string().starts_with("SpecSizedObjectStore("),
+        "a direct-storage store must not be wrapped in SpecSizedObjectStore: {store}"
+    );
+}
+
+#[test]
+fn build_admission_limited_store_wraps_the_adls_backend_in_a_limit_store() {
+    let backend = adls_backend(AdlsCred::AccountKey(VALID_ACCOUNT_KEY.into()));
+    let store_url =
+        Url::parse("abfss://container@acct.dfs.core.windows.net").expect("URL must parse");
+
+    let store = build_admission_limited_store(&backend, &store_url, &[])
+        .expect("an Adls backend must build an admission-limited store");
+
+    assert!(
+        store
+            .to_string()
+            .starts_with(&format!("LimitStore({DIRECT_STORAGE_ADMISSION_LIMIT}, ")),
+        "expected a LimitStore capped at {DIRECT_STORAGE_ADMISSION_LIMIT}, got: {store}"
+    );
+}

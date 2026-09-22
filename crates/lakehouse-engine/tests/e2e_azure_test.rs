@@ -41,8 +41,8 @@ mod common;
 use common::azure::{self, AzureContainer};
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, SYS_PASSWORD, VsProps,
-    create_schema_and_scripts, create_virtual_schema_with_password, exa_conn, install_slc,
-    parse_int, upload_so,
+    create_schema_and_scripts, create_virtual_schema_with_password, exa_conn, explain_virtual_sql,
+    install_slc, parse_int, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -59,7 +59,15 @@ use common::stack::{
     wait_for_exasol, wait_for_url,
 };
 
+use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use futures::FutureExt;
+use object_store::azure::MicrosoftAzureBuilder;
+use object_store::path::Path as ObjectStorePath;
+use object_store::{ObjectStoreExt, PutPayload};
+use parquet::arrow::ArrowWriter;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
@@ -413,6 +421,71 @@ fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
         .collect()
 }
 
+/// A minimal three-column batch for the raw-Parquet direct-storage fixture:
+/// `EVENT_ID` (Int64), `NAME` (Utf8), `SCORE` (Float64). Carries no Iceberg
+/// field-id metadata — direct storage reaches no catalog, so its fixture must
+/// look like a plain Parquet file a non-Iceberg writer would produce.
+fn azure_direct_events_batch(ids: &[i64]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("EVENT_ID", DataType::Int64, false),
+        Field::new("NAME", DataType::Utf8, true),
+        Field::new("SCORE", DataType::Float64, true),
+    ]));
+    let names: Vec<String> = ids.iter().map(|id| format!("event-{id}")).collect();
+    let scores: Vec<f64> = ids.iter().map(|&id| id as f64 * 1.5).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Float64Array::from(scores)),
+        ],
+    )
+    .expect("azure direct-storage events batch construction is infallible")
+}
+
+/// Write `batch` as one Parquet object at `path` inside `container`, through a
+/// standalone Azure Blob client built from the run's account key — never
+/// through the shared `local_stack_storage()` MinIO backend the S3-only
+/// `raw_parquet` helper uses. Creates no catalog table, commits no snapshot.
+fn write_azure_parquet_fixture(
+    container: &str,
+    account: &str,
+    key: &str,
+    path: &str,
+    batch: RecordBatch,
+) {
+    let mut buf = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None)
+            .unwrap_or_else(|e| panic!("open Arrow Parquet writer for {path}: {e}"));
+        writer
+            .write(&batch)
+            .unwrap_or_else(|e| panic!("write Azure raw-Parquet fixture batch at {path}: {e}"));
+        writer
+            .close()
+            .unwrap_or_else(|e| panic!("close Azure raw-Parquet fixture writer for {path}: {e}"));
+    }
+
+    let store = MicrosoftAzureBuilder::new()
+        .with_account(account)
+        .with_container_name(container)
+        .with_access_key(key)
+        .build()
+        .unwrap_or_else(|e| panic!("configure Azure object store for {path}: {e}"));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for Azure raw-Parquet fixture write");
+    rt.block_on(async {
+        store
+            .put(&ObjectStorePath::from(path), PutPayload::from(buf))
+            .await
+            .unwrap_or_else(|e| panic!("PUT Azure raw-Parquet fixture at {path}: {e}"));
+    });
+}
+
 /// Both credential arms — static account key and vended SAS — end to end over
 /// one per-run container, in one test because they share one fixture.
 ///
@@ -553,6 +626,89 @@ fn azure_static_and_vended_creds_end_to_end() {
         vended_rows.len(),
         SEED_TOTAL_ROWS,
         "the ordered cross-arm projection must cover all {SEED_TOTAL_ROWS} seeded rows"
+    );
+
+    // 8. The raw-Parquet direct-storage scenario, over the same per-run
+    //    container this test already guards.
+    direct_storage_over_adls_returns_correct_rows(&mut conn, &fixture);
+}
+
+/// Scenario: an end-to-end scan over a raw Parquet directory on ADLS returns
+/// correct rows.
+///
+/// Runs inside [`azure_static_and_vended_creds_end_to_end`] so it shares that
+/// test's per-run container guard: the `abfss://` prefix it writes is disjoint
+/// from both credential arms' warehouses, and the container's `Drop` deletes
+/// everything either arm or this scenario wrote.
+fn direct_storage_over_adls_returns_correct_rows(conn: &mut ExaConn, fixture: &AzureFixture) {
+    // No Lakekeeper warehouse and no catalog CONNECTION field — just the account key and a
+    // bare `abfss://` prefix disjoint from both credential arms' warehouses (whose
+    // key-prefixes are `{container}-static` / `{container}-vended`).
+    let account_key = azure::account_key();
+    write_azure_parquet_fixture(
+        &fixture.container_name,
+        &fixture.account_name,
+        &account_key,
+        "direct/events/file1.parquet",
+        azure_direct_events_batch(&[1, 2]),
+    );
+    write_azure_parquet_fixture(
+        &fixture.container_name,
+        &fixture.account_name,
+        &account_key,
+        "direct/events/file2.parquet",
+        azure_direct_events_batch(&[3, 4]),
+    );
+
+    let direct_vs = "AZ_DIRECT_STORAGE_VS";
+    let direct_address = format!(
+        "abfss://{}@{}.dfs.core.windows.net/direct",
+        fixture.container_name, fixture.account_name
+    );
+    let direct_password = CatalogConnectionPassword {
+        account_name: Some(fixture.account_name.clone()),
+        account_key: Some(account_key.clone()),
+        ..Default::default()
+    };
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(direct_vs, "")
+            .with_catalog_conn_name("AZ_DIRECT_STORAGE_CREDS")
+            .with_catalog_kind("DIRECT_STORAGE"),
+        &direct_address,
+        &direct_password,
+    );
+
+    let tables = conn.query_columns(&format!(
+        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{direct_vs}'"
+    ));
+    let table_names: Vec<String> = tables
+        .first()
+        .map(|col| col.iter().map(value_to_string).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        table_names,
+        vec!["EVENTS".to_string()],
+        "a single first-level directory under the direct-storage base path must declare \
+         exactly one table named EVENTS: {table_names:?}"
+    );
+
+    let direct_cols = conn.query_columns(&format!(
+        "SELECT EVENT_ID, NAME FROM {direct_vs}.EVENTS WHERE EVENT_ID > 2 ORDER BY EVENT_ID"
+    ));
+    let ids: Vec<i64> = direct_cols[0].iter().map(parse_int).collect();
+    let names: Vec<String> = direct_cols[1].iter().map(value_to_string).collect();
+    assert_eq!(
+        ids,
+        vec![3, 4],
+        "the two-file EVENTS directory must fold and return rows from both files: {ids:?}"
+    );
+    assert_eq!(names, vec!["event-3".to_string(), "event-4".to_string()]);
+
+    let explained = explain_virtual_sql(conn, &format!("SELECT EVENT_ID FROM {direct_vs}.EVENTS"));
+    assert!(
+        !explained.contains(&account_key),
+        "EXPLAIN VIRTUAL output must never leak the Azure account key"
     );
 }
 

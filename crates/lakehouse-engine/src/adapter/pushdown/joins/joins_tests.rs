@@ -1,7 +1,9 @@
 use super::attribution::JoinLegs;
 use super::*;
+use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
+use crate::scan::spec::CatalogProps;
 use crate::scan::spec::{FileEntry, LogicalField};
 
 // Shared join-test fixtures at the joins-module root — the join analog of the
@@ -649,5 +651,192 @@ async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     assert!(
         !sql.contains("o_status=closed/part-0.parquet"),
         "ORDERS' own local filter must prune its non-matching file, unaffected by CUSTOMER's filter: {sql}"
+    );
+}
+
+/// An Iceberg REST catalog that answers `/v1/config` at once but holds EVERY
+/// `loadTable` response until `parties` of them are in flight together.
+///
+/// The rendezvous is what makes concurrency observable without a timing margin: a
+/// loop that awaits each leg before starting the next can never release it, because
+/// the first leg's response is still pending when the second would be issued. Each
+/// connection is served on its own task, so the server itself never serializes what
+/// the client sent concurrently.
+struct RendezvousCatalog {
+    uri: String,
+}
+
+impl RendezvousCatalog {
+    async fn spawn(parties: usize) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let uri = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("local_addr").port()
+        );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(parties));
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let barrier = std::sync::Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let read = stream.read(&mut buf).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    let raw = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let body = if target.starts_with("/v1/config") {
+                        "{}".to_string()
+                    } else {
+                        let table = target.rsplit('/').next().unwrap_or("t").to_string();
+                        barrier.wait().await;
+                        snapshotless_load_table_body(&format!("s3://bucket/{table}"))
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Self { uri }
+    }
+}
+
+/// Plan `request` as an Iceberg REST pushdown against `catalog_uri`, with
+/// `join_broadcast_max_bytes` large enough that it never decides the shape here.
+async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, UdfError> {
+    let conn = ResolvedConnectionConfig {
+        catalog_uri: catalog_uri.to_string(),
+        storage: sample_storage(),
+        creds: unauthenticated_creds(),
+        allow_http: true,
+        catalog_kind: CatalogKind::IcebergRest,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
+    };
+    let catalog = CatalogProps {
+        warehouse: "wh".into(),
+        table: "lh.customer".into(),
+    };
+    crate::adapter::pushdown::handle_pushdown(
+        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
+    )
+    .await
+}
+
+/// [`delta_pushdown`] with a broadcast threshold of ZERO, so every non-empty side is
+/// above it and the request takes the N-scan fallback — the one renderer that indexes
+/// the resolved sides by leg.
+async fn delta_n_scan_pushdown(
+    request: &Json,
+    catalog_uri: &str,
+    storage: StorageBackend,
+    table: &str,
+) -> Result<Json, UdfError> {
+    let conn = ResolvedConnectionConfig {
+        catalog_uri: catalog_uri.to_string(),
+        storage,
+        creds: unauthenticated_creds(),
+        allow_http: true,
+        catalog_kind: CatalogKind::UnityCatalogNative,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
+    };
+    let catalog = CatalogProps {
+        warehouse: "wh".into(),
+        table: table.into(),
+    };
+    crate::adapter::pushdown::handle_pushdown(
+        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 0,
+    )
+    .await
+}
+
+/// Scenario: A request's table resolutions run concurrently rather than one after
+/// another.
+///
+/// Both legs must be in flight at the SAME time: the catalog holds every `loadTable`
+/// response until two of them have arrived, so a loop awaiting each leg before
+/// starting the next runs the clock out instead of planning. The wait is bounded
+/// rather than unbounded, so a regression fails the test by name instead of hanging.
+///
+/// The order half of this scenario is pinned by
+/// [`resolved_join_sides_stay_in_leg_index_order`], which needs non-empty sides to
+/// observe it; both legs here resolve empty, which is what keeps this test's catalog
+/// fixture free of a snapshot and a manifest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_legs_resolve_concurrently_in_leg_index_order() {
+    let catalog = RendezvousCatalog::spawn(2).await;
+    let request = join_request(Json::Null, equi_condition());
+
+    let planned = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        iceberg_pushdown(&request, &catalog.uri),
+    )
+    .await
+    .expect(
+        "both legs must be resolving at once; a loop that awaits each leg before starting \
+         the next can never release the catalog's rendezvous",
+    )
+    .expect("two snapshotless Iceberg legs plan the shape-correct empty result");
+
+    assert_eq!(
+        planned["type"], "pushdown",
+        "the concurrency change must leave the planned response shape untouched: {planned:?}"
+    );
+}
+
+/// Scenario: A request's table resolutions run concurrently rather than one after
+/// another.
+///
+/// The resolved sides are answered in LEG-INDEX order, because the N-scan renderer
+/// indexes both the resolved sides and the per-leg fan-outs by leg. CUSTOMER is the
+/// left leaf, so its own files must be rendered ahead of ORDERS'; a side list in
+/// completion order rather than input order would pair each leg's alias with the
+/// other leg's files.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolved_join_sides_stay_in_leg_index_order() {
+    let catalog = unity_delta_catalog().await;
+    let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
+    let select_list = serde_json::json!([
+        {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
+        {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
+    ]);
+    let request = delta_join_request_over(
+        serde_json::json!([
+            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "C_REGION", "dataType": {"type": "varchar", "size": 100}},
+        ]),
+        serde_json::json!([
+            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "O_STATUS", "dataType": {"type": "varchar", "size": 100}},
+        ]),
+        select_list,
+    );
+
+    let result = delta_n_scan_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect("two non-empty Delta legs plan the N-scan fallback");
+    let sql = result["sql"]
+        .as_str()
+        .expect("a planned pushdown carries sql");
+
+    let customer = sql
+        .find("c_region=")
+        .expect("the left leg's own files must be rendered");
+    let orders = sql
+        .find("o_status=")
+        .expect("the right leg's own files must be rendered");
+    assert!(
+        customer < orders,
+        "the resolved sides must stay in leg-index order, left leaf first: {sql}"
     );
 }

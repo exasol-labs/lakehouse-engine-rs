@@ -230,6 +230,49 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
     }
 }
 
+/// The three neutral variants added for the direct-storage catalog kind — the
+/// Parquet table format, the Parquet column source (an Arrow tag string, never
+/// an Arrow `DataType` value), and the no-data-file skip reason — are
+/// constructible and observable from outside the crate, exactly as the
+/// recorded variants already are above. No source-text assertion: this probe
+/// only has to fail to COMPILE if a variant is narrowed or removed.
+#[test]
+fn added_neutral_variants_are_reachable_from_outside_the_crate() {
+    assert_eq!(TableFormat::Parquet, TableFormat::Parquet);
+    assert_ne!(TableFormat::Parquet, TableFormat::Iceberg);
+    assert_ne!(TableFormat::Parquet, TableFormat::Delta);
+
+    let column = CatalogColumn {
+        name: "c".into(),
+        source_type: ColumnSourceType::Parquet("int64".into()),
+    };
+    match &column.source_type {
+        ColumnSourceType::Parquet(tag) => assert_eq!(tag, "int64"),
+        other => panic!("expected a Parquet source type, got {other:?}"),
+    }
+
+    let ident = CatalogTableIdent {
+        namespace: vec!["ns".into()],
+        name: "t".into(),
+    };
+    let listing = CatalogListing {
+        tables: vec![CatalogTable {
+            ident: ident.clone(),
+            table_type: CatalogTableType::Table,
+            storage_location: None,
+            format: TableFormat::Parquet,
+            vended_credential_key: None,
+            columns: vec![column],
+        }],
+        skipped: vec![SkippedTable {
+            ident,
+            reason: SkipReason::NoDataFile,
+        }],
+    };
+    assert_eq!(listing.tables[0].format, TableFormat::Parquet);
+    assert_eq!(listing.skipped[0].reason, SkipReason::NoDataFile);
+}
+
 /// The raw Unity Catalog wire fields behind the neutral format tag and the
 /// credential-vending key stay inside the Unity client: only their neutral
 /// PROJECTIONS cross the boundary. `client.rs` — the module declaring every

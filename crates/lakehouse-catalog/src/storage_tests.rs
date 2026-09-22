@@ -54,6 +54,57 @@ fn catalog_storage_props_omits_empty_connection_fields_and_an_absent_token() {
     );
 }
 
+/// Scenario: The address scheme must agree with the credential shape.
+#[test]
+fn addresses_scheme_accepts_s3_and_s3a_for_the_s3_backend() {
+    let backend = StorageBackend::S3(StorageProps::default());
+
+    assert!(backend.addresses_scheme("s3"));
+    assert!(backend.addresses_scheme("s3a"));
+}
+
+#[test]
+fn addresses_scheme_rejects_abfss_for_the_s3_backend() {
+    let backend = StorageBackend::S3(StorageProps::default());
+
+    assert!(!backend.addresses_scheme("abfss"));
+}
+
+#[test]
+fn addresses_scheme_accepts_abfss_for_the_adls_backend() {
+    let backend = StorageBackend::Adls {
+        account_name: "acct".into(),
+        cred: AdlsCred::AccountKey("key".into()),
+    };
+
+    assert!(backend.addresses_scheme("abfss"));
+}
+
+#[test]
+fn addresses_scheme_rejects_plaintext_abfs_for_the_adls_backend() {
+    let backend = StorageBackend::Adls {
+        account_name: "acct".into(),
+        cred: AdlsCred::AccountKey("key".into()),
+    };
+
+    assert!(
+        !backend.addresses_scheme("abfs"),
+        "the plaintext 'abfs' scheme must be rejected; only 'abfss' is accepted"
+    );
+}
+
+#[test]
+fn addresses_scheme_rejects_an_unrelated_scheme_for_either_backend() {
+    let s3 = StorageBackend::S3(StorageProps::default());
+    let adls = StorageBackend::Adls {
+        account_name: "acct".into(),
+        cred: AdlsCred::AccountKey("key".into()),
+    };
+
+    assert!(!s3.addresses_scheme("gs"));
+    assert!(!adls.addresses_scheme("gs"));
+}
+
 /// A `Some("")` session token is gated on presence, NOT on being non-empty —
 /// unlike the four connection fields. Preserved verbatim from the pre-refactor
 /// `if let Some(token)` so the props map stays byte-identical.

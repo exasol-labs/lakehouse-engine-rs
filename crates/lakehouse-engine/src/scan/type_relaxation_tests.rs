@@ -19,7 +19,7 @@ use std::sync::Arc;
 /// one row, so they contribute three entries here). `can_cast_types` decides castability from the
 /// two `DataType` variants alone, so a representative precision/scale stands in for every concrete
 /// decimal the rows describe.
-fn supported_relaxation_pairs() -> Vec<(&'static str, DataType, DataType)> {
+pub(crate) fn supported_relaxation_pairs() -> Vec<(&'static str, DataType, DataType)> {
     vec![
         ("1: int -> long", DataType::Int32, DataType::Int64),
         ("2: float -> double", DataType::Float32, DataType::Float64),

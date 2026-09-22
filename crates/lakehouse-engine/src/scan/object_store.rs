@@ -15,6 +15,7 @@ use lakehouse_catalog::redact_error_text;
 use object_store::ClientOptions;
 use object_store::aws::AmazonS3Builder;
 use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
+use object_store::limit::LimitStore;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{
     CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult, MultipartUpload, ObjectMeta,
@@ -164,7 +165,15 @@ fn build_side_store(
 ) -> Result<Arc<dyn ObjectStore>, UdfError> {
     let sizes = side_size_index(side.files, side.table_root)?;
     let store_url = side_store_url(side.files, side.table_root)?;
-    let store = build_undecorated_store(side.backend, &store_url, connection_budget, all_secrets)?;
+    let store = build_undecorated_store(
+        side.backend,
+        &store_url,
+        StoreBounds {
+            connection_budget,
+            admission_limit: None,
+        },
+        all_secrets,
+    )?;
     Ok(Arc::new(SpecSizedObjectStore::new(store, sizes)))
 }
 
@@ -183,24 +192,36 @@ pub(crate) fn build_table_root_store(
     all_secrets: &[&str],
 ) -> Result<Arc<dyn ObjectStore>, UdfError> {
     let store_url = store_root_url(table_root)?;
-    build_undecorated_store(backend, &store_url, connection_budget, all_secrets)
+    build_undecorated_store(
+        backend,
+        &store_url,
+        StoreBounds {
+            connection_budget,
+            admission_limit: None,
+        },
+        all_secrets,
+    )
 }
 
-/// Build the undecorated store `backend`'s credential covers, scoped to
-/// `store_url`.
-///
-/// Dispatches on the storage backend because CONSTRUCTING the store is a
-/// backend-specific decision. The store root is not: it arrives already derived,
-/// and each arm only reads out of it the part its builder needs — the host as an S3
-/// bucket name, the whole URL for Azure. The caller derives it because the two
-/// callers derive it from different things: a scan side from its first file, a
-/// Delta table from its root alone.
+/// The two concurrency bounds one object store is built under: how many idle
+/// connections it retains and, when the caller caps it, how many requests it
+/// admits at once.
+struct StoreBounds {
+    connection_budget: usize,
+    /// `None` leaves the store uncapped — the caller bounds concurrency itself.
+    admission_limit: Option<usize>,
+}
+
 fn build_undecorated_store(
     backend: &StorageBackend,
     store_url: &Url,
-    connection_budget: usize,
+    bounds: StoreBounds,
     all_secrets: &[&str],
 ) -> Result<Arc<dyn ObjectStore>, UdfError> {
+    let StoreBounds {
+        connection_budget,
+        admission_limit,
+    } = bounds;
     match backend {
         StorageBackend::S3(storage) => {
             let bucket = store_url.host_str().ok_or_else(|| {
@@ -242,7 +263,7 @@ fn build_undecorated_store(
                 ))
             })?;
 
-            Ok(Arc::new(s3))
+            Ok(apply_admission_limit(s3, admission_limit))
         }
         StorageBackend::Adls { cred, .. } => {
             let builder = MicrosoftAzureBuilder::new()
@@ -260,9 +281,59 @@ fn build_undecorated_store(
                 ))
             })?;
 
-            Ok(Arc::new(azure))
+            Ok(apply_admission_limit(azure, admission_limit))
         }
     }
+}
+
+/// Erase a concrete store into `Arc<dyn ObjectStore>`, wrapping it in
+/// [`LimitStore`] first when an admission cap is given.
+///
+/// A concrete store must be wrapped BEFORE erasure: `LimitStore<T>` requires
+/// `T: ObjectStore`, which the already-erased `Arc<dyn ObjectStore>` does not
+/// itself satisfy.
+fn apply_admission_limit<T: ObjectStore>(
+    store: T,
+    admission_limit: Option<usize>,
+) -> Arc<dyn ObjectStore> {
+    match admission_limit {
+        Some(limit) => Arc::new(LimitStore::new(store, limit)),
+        None => Arc::new(store),
+    }
+}
+
+/// Concurrent-request admission cap for the ONE object store a direct-storage
+/// adapter call builds — a single bound over the whole call rather than one
+/// scoped per table (plan `add-direct-storage-catalog-kind`, Decision >
+/// Patterns: "Admission-limited object store per adapter call").
+///
+/// Unmeasured: a deliberately conservative first guess. A refresh sweeping
+/// many thousands of footers tolerates far more concurrency than a per-query
+/// plan; the measurement that would set it is issue #419.
+pub(crate) const DIRECT_STORAGE_ADMISSION_LIMIT: usize = 16;
+
+/// Build the ONE admission-limited object store a direct-storage adapter call
+/// reads every table's directory listing, footers, and data files through.
+///
+/// Caps concurrent in-flight requests at [`DIRECT_STORAGE_ADMISSION_LIMIT`]
+/// via [`LimitStore`], and derives the warm-connection retention budget
+/// (`client_options_for`) from that SAME constant, so the call's two
+/// concurrency knobs — in-flight request admission and idle-connection
+/// retention — never drift into two different numbers for one call.
+pub(crate) fn build_admission_limited_store(
+    backend: &StorageBackend,
+    store_url: &Url,
+    all_secrets: &[&str],
+) -> Result<Arc<dyn ObjectStore>, UdfError> {
+    build_undecorated_store(
+        backend,
+        store_url,
+        StoreBounds {
+            connection_budget: DIRECT_STORAGE_ADMISSION_LIMIT,
+            admission_limit: Some(DIRECT_STORAGE_ADMISSION_LIMIT),
+        },
+        all_secrets,
+    )
 }
 
 /// HTTP client options that bound the object store's warm connection pool to the
@@ -444,7 +515,7 @@ fn side_store_url(files: &[FileEntry], table_root: &str) -> Result<Url, UdfError
 /// the one `ListingTableUrl::object_store()` takes, and it deliberately KEEPS the
 /// userinfo — which is where an `abfss://` URI carries its container — unlike
 /// DataFusion's coarser registry key, which drops it.
-fn store_root_url(uri: &str) -> Result<Url, UdfError> {
+pub(crate) fn store_root_url(uri: &str) -> Result<Url, UdfError> {
     let url = Url::parse(uri).map_err(|e| UdfError::User(format!("invalid file URI: {e}")))?;
     let store = &url[Position::BeforeScheme..Position::BeforePath];
     Url::parse(store)

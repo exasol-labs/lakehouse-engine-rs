@@ -452,9 +452,12 @@ pub fn iceberg_type_to_arrow(ty: &iceberg::spec::Type) -> DataType {
 
 /// Convert an Arrow `DataType` to the compact string tag used in `ScanSpec::logical_schema`.
 ///
-/// The tag vocabulary covers every type reachable from [`iceberg_type_to_arrow`]:
-/// - `"bool"`, `"int32"`, `"int64"`, `"float32"`, `"float64"`, `"utf8"`, `"date32"`
-/// - `"timestamp_us"`, `"timestamp_ns"`, `"timestamptz_us"`, `"timestamptz_ns"`
+/// The tag vocabulary covers every Arrow type [`compatible_exasol_type`] admits:
+/// - `"bool"`, `"int8"`, `"int16"`, `"int32"`, `"int64"`, `"uint8"`, `"uint16"`,
+///   `"uint32"`, `"uint64"`, `"float32"`, `"float64"`, `"utf8"`, `"large_utf8"`,
+///   `"date32"`
+/// - `"timestamp_s"`, `"timestamp_ms"`, `"timestamp_us"`, `"timestamp_ns"` and
+///   their tz-aware `"timestamptz_*"` counterparts, one pair per `TimeUnit`
 /// - `"decimal128(p,s)"` for in-range `Decimal128`
 ///
 /// Unknown / other types fall back to `"utf8"` (JSON VARCHAR path).
@@ -462,14 +465,25 @@ pub fn arrow_type_to_tag(dt: &DataType) -> String {
     use arrow::datatypes::TimeUnit;
     match dt {
         DataType::Boolean => "bool".to_string(),
+        DataType::Int8 => "int8".to_string(),
+        DataType::Int16 => "int16".to_string(),
         DataType::Int32 => "int32".to_string(),
         DataType::Int64 => "int64".to_string(),
+        DataType::UInt8 => "uint8".to_string(),
+        DataType::UInt16 => "uint16".to_string(),
+        DataType::UInt32 => "uint32".to_string(),
+        DataType::UInt64 => "uint64".to_string(),
         DataType::Float32 => "float32".to_string(),
         DataType::Float64 => "float64".to_string(),
         DataType::Utf8 => "utf8".to_string(),
+        DataType::LargeUtf8 => "large_utf8".to_string(),
         DataType::Date32 => "date32".to_string(),
+        DataType::Timestamp(TimeUnit::Second, None) => "timestamp_s".to_string(),
+        DataType::Timestamp(TimeUnit::Millisecond, None) => "timestamp_ms".to_string(),
         DataType::Timestamp(TimeUnit::Microsecond, None) => "timestamp_us".to_string(),
         DataType::Timestamp(TimeUnit::Nanosecond, None) => "timestamp_ns".to_string(),
+        DataType::Timestamp(TimeUnit::Second, Some(_)) => "timestamptz_s".to_string(),
+        DataType::Timestamp(TimeUnit::Millisecond, Some(_)) => "timestamptz_ms".to_string(),
         DataType::Timestamp(TimeUnit::Microsecond, Some(_)) => "timestamptz_us".to_string(),
         DataType::Timestamp(TimeUnit::Nanosecond, Some(_)) => "timestamptz_ns".to_string(),
         DataType::Decimal128(p, s) => format!("decimal128({p},{s})"),
@@ -493,14 +507,25 @@ pub fn arrow_type_from_tag(tag: &str) -> DataType {
     use arrow::datatypes::TimeUnit;
     match tag {
         "bool" => DataType::Boolean,
+        "int8" => DataType::Int8,
+        "int16" => DataType::Int16,
         "int32" => DataType::Int32,
         "int64" => DataType::Int64,
+        "uint8" => DataType::UInt8,
+        "uint16" => DataType::UInt16,
+        "uint32" => DataType::UInt32,
+        "uint64" => DataType::UInt64,
         "float32" => DataType::Float32,
         "float64" => DataType::Float64,
         "utf8" => DataType::Utf8,
+        "large_utf8" => DataType::LargeUtf8,
         "date32" => DataType::Date32,
+        "timestamp_s" => DataType::Timestamp(TimeUnit::Second, None),
+        "timestamp_ms" => DataType::Timestamp(TimeUnit::Millisecond, None),
         "timestamp_us" => DataType::Timestamp(TimeUnit::Microsecond, None),
         "timestamp_ns" => DataType::Timestamp(TimeUnit::Nanosecond, None),
+        "timestamptz_s" => DataType::Timestamp(TimeUnit::Second, Some("UTC".into())),
+        "timestamptz_ms" => DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
         "timestamptz_us" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         "timestamptz_ns" => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         other => {
@@ -555,6 +580,7 @@ pub(crate) fn column_source_type_to_exasol(
             },
             engine,
         ),
+        ColumnSourceType::Parquet(tag) => arrow_to_exasol_type(&arrow_type_from_tag(tag)),
     }
 }
 

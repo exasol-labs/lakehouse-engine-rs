@@ -1424,3 +1424,217 @@ fn sealing_key_is_absent_for_a_password_carrying_no_secret_field_at_the_read_con
         "a non-empty secret_key is key material, so the boundary must derive a key"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scenario: A direct-storage CONNECTION carries storage credentials and a
+// storage base path
+// ---------------------------------------------------------------------------
+
+#[test]
+fn direct_storage_requires_a_non_empty_storage_base_path() {
+    let ctx = with_conn("", &serde_json::json!({}).to_string());
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect_err("an empty CONNECTION address must be rejected under direct storage");
+    let msg = err.to_string();
+
+    assert!(msg.contains("MY_CONN"), "must name the CONNECTION: {msg}");
+    assert!(
+        msg.to_lowercase().contains("storage base path"),
+        "must state that a storage base path is expected, not a catalog URI: {msg}"
+    );
+    assert!(
+        !msg.to_lowercase().contains("catalog uri"),
+        "must not tell the operator to supply a catalog URI this kind never contacts: {msg}"
+    );
+}
+
+#[test]
+fn direct_storage_accepts_a_connection_without_warehouse() {
+    let password = serde_json::json!({
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "region": "us-east-1",
+    })
+    .to_string();
+    let ctx = with_conn("s3://bucket/lake", &password);
+
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect("a direct-storage CONNECTION without warehouse must be accepted");
+    assert_eq!(resolved.creds.warehouse, "");
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: Catalog-authentication and vending fields are rejected, not
+// ignored
+// ---------------------------------------------------------------------------
+
+#[test]
+fn direct_storage_rejects_every_catalog_auth_and_vending_field() {
+    let cases: [(serde_json::Value, &str, &str); 6] = [
+        (
+            serde_json::json!({"warehouse": "wh", "access_key": "AKID", "secret_key": "SECRET"}),
+            "warehouse",
+            "wh",
+        ),
+        (
+            serde_json::json!({"token": "SENTINEL_TOKEN", "access_key": "AKID", "secret_key": "SECRET"}),
+            "token",
+            "SENTINEL_TOKEN",
+        ),
+        (
+            serde_json::json!({"client_id": "SENTINEL_CID", "access_key": "AKID", "secret_key": "SECRET"}),
+            "client_id",
+            "SENTINEL_CID",
+        ),
+        (
+            serde_json::json!({"client_secret": "SENTINEL_CSECRET", "access_key": "AKID", "secret_key": "SECRET"}),
+            "client_secret",
+            "SENTINEL_CSECRET",
+        ),
+        (
+            serde_json::json!({"oauth2_server_uri": "https://auth.example.com", "access_key": "AKID", "secret_key": "SECRET"}),
+            "oauth2_server_uri",
+            "https://auth.example.com",
+        ),
+        (
+            serde_json::json!({"scope": "SENTINEL_SCOPE", "access_key": "AKID", "secret_key": "SECRET"}),
+            "scope",
+            "SENTINEL_SCOPE",
+        ),
+    ];
+
+    for (password, field, value) in cases {
+        let ctx = with_conn("s3://bucket/lake", &password.to_string());
+        let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+            .expect_err(&format!("{field} must be rejected under direct storage"));
+        let msg = err.to_string();
+        assert!(msg.contains(field), "must name {field}: {msg}");
+        assert!(
+            !msg.contains(value),
+            "must not leak the value of {field}: {msg}"
+        );
+    }
+}
+
+#[test]
+fn direct_storage_rejects_use_sigv4_and_use_vended_credentials_when_true() {
+    for field in ["use_sigv4", "use_vended_credentials"] {
+        let password = serde_json::json!({
+            field: true,
+            "access_key": "AKID",
+            "secret_key": "SECRET",
+        })
+        .to_string();
+        let ctx = with_conn("s3://bucket/lake", &password);
+
+        let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage).expect_err(
+            &format!("{field}=true must be rejected under direct storage"),
+        );
+        assert!(err.to_string().contains(field), "{}", err);
+    }
+}
+
+#[test]
+fn direct_storage_accepts_use_sigv4_and_use_vended_credentials_when_explicitly_false() {
+    for field in ["use_sigv4", "use_vended_credentials"] {
+        let password = serde_json::json!({
+            field: false,
+            "access_key": "AKID",
+            "secret_key": "SECRET",
+            "region": "us-east-1",
+        })
+        .to_string();
+        let ctx = with_conn("s3://bucket/lake", &password);
+
+        read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage).unwrap_or_else(|err| {
+            panic!("{field}=false explicitly must be accepted under direct storage: {err}")
+        });
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: The address scheme must agree with the credential shape
+// ---------------------------------------------------------------------------
+
+#[test]
+fn direct_storage_rejects_s3_scheme_with_azure_shaped_credentials() {
+    let password = serde_json::json!({
+        "account_name": "myaccount",
+        "account_key": AZURE_ACCOUNT_KEY,
+    })
+    .to_string();
+    let ctx = with_conn("s3://bucket/lake", &password);
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect_err("an s3:// address with Azure-shaped credentials must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("s3"), "{msg}");
+    assert!(!msg.contains(AZURE_ACCOUNT_KEY), "{msg}");
+}
+
+#[test]
+fn direct_storage_rejects_abfss_scheme_with_s3_shaped_credentials() {
+    let password = serde_json::json!({
+        "access_key": "AKID",
+        "secret_key": S3_SECRET,
+    })
+    .to_string();
+    let ctx = with_conn(
+        "abfss://container@account.dfs.core.windows.net/lake",
+        &password,
+    );
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect_err("an abfss:// address with S3-shaped credentials must be rejected");
+    let msg = err.to_string();
+    assert!(msg.contains("abfss"), "{msg}");
+    assert!(!msg.contains(S3_SECRET), "{msg}");
+}
+
+#[test]
+fn direct_storage_rejects_plaintext_abfs_naming_abfss() {
+    let password = serde_json::json!({
+        "account_name": "myaccount",
+        "account_key": AZURE_ACCOUNT_KEY,
+    })
+    .to_string();
+    let ctx = with_conn(
+        "abfs://container@account.dfs.core.windows.net/lake",
+        &password,
+    );
+
+    let err = read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect_err("a plaintext abfs:// address must be rejected under direct storage");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("abfss"),
+        "must name 'abfss' as the secure spelling: {msg}"
+    );
+    assert!(!msg.contains(AZURE_ACCOUNT_KEY), "{msg}");
+}
+
+#[test]
+fn direct_storage_accepts_matching_scheme_and_credential_shape() {
+    let s3_password = serde_json::json!({
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "region": "us-east-1",
+    })
+    .to_string();
+    let ctx = with_conn("s3://bucket/lake", &s3_password);
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect("an s3:// address with S3-shaped credentials must be accepted");
+
+    let azure_password = serde_json::json!({
+        "account_name": "myaccount",
+        "account_key": AZURE_ACCOUNT_KEY,
+    })
+    .to_string();
+    let ctx = with_conn(
+        "abfss://container@account.dfs.core.windows.net/lake",
+        &azure_password,
+    );
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
+        .expect("an abfss:// address with Azure-shaped credentials must be accepted");
+}

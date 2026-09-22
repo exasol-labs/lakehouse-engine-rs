@@ -60,7 +60,7 @@ pub fn read_connection(
         .map_err(|_| UdfError::User(format!("CONNECTION '{name}' could not be resolved")))?;
 
     let uri = conn.address;
-    if uri.is_empty() {
+    if uri.is_empty() && kind != CatalogKind::DirectStorage {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' has no address; expected the catalog URI"
         )));
@@ -79,7 +79,7 @@ pub fn read_connection(
     }
 
     let creds = parse_creds(&json);
-    validate_creds(name, &creds, kind)?;
+    validate_creds(name, &creds, kind, &uri)?;
     let sealed_storage_key = connection_password_carries_key_material(&creds)
         .then(|| derive_sealed_storage_key(&conn.password));
     Ok(Resolved {
@@ -89,8 +89,13 @@ pub fn read_connection(
     })
 }
 
-fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Result<(), UdfError> {
-    validate_kind_preconditions(name, creds, kind)?;
+fn validate_creds(
+    name: &str,
+    creds: &ConnectionCreds,
+    kind: CatalogKind,
+    address: &str,
+) -> Result<(), UdfError> {
+    validate_kind_preconditions(name, creds, kind, address)?;
     validate_azure_storage_creds(name, creds)?;
     validate_sigv4_creds(name, creds)?;
     validate_exclusive_catalog_auth_creds(name, creds)?;
@@ -103,6 +108,7 @@ fn validate_kind_preconditions(
     name: &str,
     creds: &ConnectionCreds,
     kind: CatalogKind,
+    address: &str,
 ) -> Result<(), UdfError> {
     match kind {
         CatalogKind::IcebergRest => {
@@ -121,8 +127,94 @@ fn validate_kind_preconditions(
                 )));
             }
         }
+        CatalogKind::DirectStorage => {
+            validate_direct_storage_preconditions(name, creds, address)?;
+        }
     }
     Ok(())
+}
+
+fn validate_direct_storage_preconditions(
+    name: &str,
+    creds: &ConnectionCreds,
+    address: &str,
+) -> Result<(), UdfError> {
+    if address.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' has no address; a storage base path is expected"
+        )));
+    }
+
+    // Fields meaningless under the direct-storage kind because it reaches no catalog
+    // service; supplying one is rejected rather than silently ignored, so an operator
+    // learns the field does nothing here instead of assuming it took effect.
+    let mut rejected: Vec<&str> = Vec::new();
+    if !creds.warehouse.is_empty() {
+        rejected.push("warehouse");
+    }
+    if creds.token.is_some() {
+        rejected.push("token");
+    }
+    if creds.client_id.is_some() {
+        rejected.push("client_id");
+    }
+    if creds.client_secret.is_some() {
+        rejected.push("client_secret");
+    }
+    if creds.oauth2_server_uri.is_some() {
+        rejected.push("oauth2_server_uri");
+    }
+    if creds.scope.is_some() {
+        rejected.push("scope");
+    }
+    if creds.use_sigv4 {
+        rejected.push("use_sigv4");
+    }
+    if creds.use_vended_credentials {
+        rejected.push("use_vended_credentials");
+    }
+    if !rejected.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies field(s) {} but the direct-storage catalog kind \
+             reaches no catalog service; remove them",
+            rejected.join(", ")
+        )));
+    }
+
+    let scheme = scheme_of(address);
+    let backend = storage_block(creds, false);
+    if !backend.addresses_scheme(&scheme) {
+        let azure_fields = supplied_azure_fields(creds);
+        let (shape, accepted): (String, &[&str]) = if azure_fields.is_empty() {
+            (
+                format!(
+                    "S3 credential field(s) {}",
+                    supplied_s3_fields(creds).join(", ")
+                ),
+                &["s3", "s3a"],
+            )
+        } else {
+            (
+                format!("Azure credential field(s) {}", azure_fields.join(", ")),
+                &["abfss"],
+            )
+        };
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' address scheme '{scheme}' does not agree with its {shape}; \
+             the two must address the same storage backend; accepted scheme(s) for these \
+             credentials: {}",
+            accepted.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// The (already-lowercased) URI scheme of a CONNECTION address, or empty when
+/// the address carries none.
+fn scheme_of(address: &str) -> String {
+    address
+        .split_once("://")
+        .map_or(String::new(), |(scheme, _)| scheme.to_ascii_lowercase())
 }
 
 fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
