@@ -46,7 +46,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: ubuntu-latest
+          - runner: ubuntu-26.04
             arch: x86_64
           - runner: ubuntu-24.04-arm
             arch: aarch64
@@ -139,7 +139,7 @@ jobs:
   # `unit-tests` is the test gate.
   build-host:
     name: Build Host Workspace
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -164,7 +164,7 @@ jobs:
 
   lint:
     name: Check & Lint
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -211,7 +211,7 @@ jobs:
   # lcov report the `sonar` job uploads.
   unit-tests:
     name: Unit Tests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # Backstop, not a budget: the cold cost is dominated by the
     # UNinstrumented dependency tree (~12 min, #133) — cargo-llvm-cov
     # instruments workspace members only.
@@ -297,7 +297,7 @@ jobs:
   # `sed -i "s|$GITHUB_WORKSPACE/||g" lcov-unit.info` before upload.
   sonar:
     name: Sonar Analysis
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     needs: [unit-tests]
     # Fork PRs receive no repository secrets, so an unguarded scan fails on an
     # empty token. merge_group is skipped too: it would analyse a throwaway
@@ -352,7 +352,7 @@ jobs:
 
   licenses:
     name: License Check
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -382,7 +382,7 @@ jobs:
   # must both be required checks AND block `release` (see release.needs).
   install-script:
     name: Install Script
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v7
 
@@ -407,7 +407,7 @@ jobs:
   # it needs a real SaaS tenant + PAT that CI doesn't have (tracked in #252).
   install-script-e2e:
     name: Install Script E2E (BucketFS)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v7
@@ -475,7 +475,7 @@ jobs:
   # (separate manual ops step) — tracked in #364.
   e2e:
     name: ${{ matrix.check_name }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # build-so only — its .so artifact is all this job consumes. NOT also
     # depending on lint/unit-tests/licenses trades away ~18 min of fail-fast
     # serialization: all three are separately-required checks (ruleset + merge
@@ -605,7 +605,7 @@ jobs:
   # alongside `e2e` (see the `release` job's `needs`).
   e2e-lakekeeper:
     name: E2E (Lakekeeper)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # See `e2e`'s identical `needs` and its rationale.
     needs: [build-so]
     # This stack's own healthchecks (docker-compose.lakekeeper.yml) already
@@ -714,7 +714,7 @@ jobs:
   # Not yet in `main`'s ruleset required checks — tracked in #336.
   e2e-unity:
     name: E2E (Unity)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # See `e2e`'s identical `needs` and its rationale.
     needs: [build-so]
     # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`.
@@ -816,7 +816,7 @@ jobs:
   # Azure incident or rotated secret block every release.
   e2e-azure:
     name: E2E (Azure)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # See `e2e`'s identical `needs` and its rationale.
     needs: [build-so]
     # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`; the extra
@@ -908,7 +908,7 @@ jobs:
   # ── release: main-push-with-version-bump, or a direct tag push ──────────
   release:
     name: Release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     # lint/unit-tests/licenses listed EXPLICITLY, not inherited: they used to
     # gate this transitively through `e2e`'s `needs`. Now that e2e only needs
     # build-so, a main push with failing tests would otherwise mint a tag +
