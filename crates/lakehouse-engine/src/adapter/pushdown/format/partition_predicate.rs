@@ -5,31 +5,22 @@ use std::collections::BTreeMap;
 /// Decides, from one file's partition values alone, whether any of its rows can satisfy a
 /// pushdown filter.
 ///
-/// Each filter node evaluates to the SET of SQL truth values its rows can reach. A node comparing
-/// a partition column with string literals is exact per file, because a partition value is the
-/// same for every row of its file. Every other node can reach TRUE, FALSE, and NULL, because only
-/// the rows themselves decide it. A file is kept iff TRUE is reachable at the root, so a node this
-/// type cannot evaluate widens the kept set and never narrows it: soundness holds by construction,
-/// with no separate bookkeeping of which subtrees translated exactly.
-///
-/// Strings compare in Rust's native `str` order (UTF-8 byte, i.e. codepoint, order), which is
-/// DataFusion's `Utf8` order and, as verified live, Exasol's own `VARCHAR` order.
+/// A file is kept iff TRUE is reachable at the root; an untranslatable node reaches every truth
+/// value, so it can only widen the kept set. Strings compare in codepoint order, as Exasol does.
 pub(super) struct PartitionPredicate {
     root: Node,
 }
 
 impl PartitionPredicate {
-    /// Translates `filter_json` once, so each file costs only an evaluation; `None` keeps every
-    /// file.
+    /// `None` keeps every file.
     pub(super) fn from_filter(filter_json: Option<&Json>) -> Self {
         Self {
             root: filter_json.map_or(Node::Opaque, translate),
         }
     }
 
-    /// Whether any row of the file carrying `partition_values` can satisfy the filter. A filter
-    /// column names a partition key when both fold to the same uppercase name, the fold the
-    /// table's declaration applies.
+    /// Whether any row of the file carrying `partition_values` can satisfy the filter. Column
+    /// names match partition keys case-insensitively (uppercase fold).
     pub(super) fn keeps(&self, partition_values: &BTreeMap<String, Option<String>>) -> bool {
         self.root.reachable(partition_values).can_be_true
     }
@@ -230,8 +221,7 @@ fn translate(node: &Json) -> Node {
     }
 }
 
-/// `None` for an empty operand list, which Exasol never sends: an empty OR would otherwise
-/// evaluate FALSE and prune every file.
+/// `None` for an empty operand list: an empty OR would evaluate FALSE and prune every file.
 fn operands(node: &Json) -> Option<Vec<Node>> {
     let operands = node.get("expressions")?.as_array()?;
     (!operands.is_empty()).then(|| operands.iter().map(translate).collect())

@@ -171,8 +171,6 @@ fn a_base_path_with_repeated_trailing_separators_joins_to_one_separator() {
     }
 }
 
-/// The ONE derivation site: both switches must reach [`DirectoryOptions`] exactly as resolved, so
-/// `createVirtualSchema` and pushdown cannot apply two different policies.
 #[test]
 fn directory_options_derive_both_switches() {
     for (merge_schema, hive_partitioning, expected_mode) in [

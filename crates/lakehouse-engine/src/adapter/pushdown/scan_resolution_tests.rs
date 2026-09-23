@@ -561,26 +561,20 @@ async fn hive_partitioning_reaches_the_seam_on_pushdown() {
 
     let pruned = resolve_events_under_hive_partitioning(&endpoint.uri, "TRUE", &year_2099)
         .await
-        .expect(
-            "HIVE_PARTITIONING=TRUE declares `year`, so the filter prunes the only file before \
-             its unreadable footer is read",
-        );
+        .expect("HIVE_PARTITIONING=TRUE must prune the file before its footer is read");
     assert_eq!(pruned.partition_columns, vec!["year".to_string()]);
     assert!(
         pruned.files.is_empty(),
-        "the file under year=2026 is pruned by YEAR = '2099': {:?}",
+        "year=2026 file must be pruned by YEAR = '2099': {:?}",
         pruned.files
     );
 
     let error = resolve_events_under_hive_partitioning(&endpoint.uri, "FALSE", &year_2099)
         .await
-        .expect_err(
-            "HIVE_PARTITIONING=FALSE declares no key, so nothing prunes the file and its \
-             unreadable footer is read",
-        )
+        .expect_err("HIVE_PARTITIONING=FALSE must not prune, so the bad footer is read")
         .to_string();
     assert!(
         error.contains("failed to read the Parquet footer"),
-        "the footer read proves no key was declared and no file was pruned: {error}"
+        "expected a footer-read error: {error}"
     );
 }

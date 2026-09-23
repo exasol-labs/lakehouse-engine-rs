@@ -49,7 +49,7 @@ fn between(name: &str, low: Json, high: Json) -> Json {
     json!({"type": "predicate_between", "expression": column(name), "left": low, "right": high})
 }
 
-/// A request filter no partition column can decide: a comparison on an ordinary Parquet column.
+/// A filter no partition column can decide.
 fn on_a_data_column() -> Json {
     compare("predicate_equal", column("ID"), number("1"))
 }
@@ -64,7 +64,6 @@ fn kept(filter: &Json, files: &[BTreeMap<String, Option<String>>]) -> Vec<bool> 
     files.iter().map(|values| predicate.keeps(values)).collect()
 }
 
-/// `year=2026`, `year=2025`, and a file whose `year` value reads NULL.
 fn year_files() -> [BTreeMap<String, Option<String>>; 3] {
     [
         file_with("year", Some("2026")),
@@ -73,8 +72,7 @@ fn year_files() -> [BTreeMap<String, Option<String>>; 3] {
     ]
 }
 
-/// `region=B`, `region=a`, `region=é`, and a NULL region: byte order ranks them B < a < é, which
-/// neither a case-insensitive nor a locale order does.
+/// Byte order ranks B < a < é, unlike a case-insensitive or locale order.
 fn region_files() -> [BTreeMap<String, Option<String>>; 4] {
     [
         file_with("region", Some("B")),
@@ -326,7 +324,7 @@ fn a_non_string_or_empty_literal_never_prunes() {
         assert_eq!(
             kept(&filter, &files),
             [true, true, true],
-            "{label}: must count as any truth value, keeping every file"
+            "{label}: must keep every file"
         );
     }
 }

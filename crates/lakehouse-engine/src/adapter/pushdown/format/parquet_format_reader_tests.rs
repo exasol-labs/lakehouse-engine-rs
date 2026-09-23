@@ -14,8 +14,7 @@ use std::collections::BTreeMap;
 /// The CONNECTION address plus the namespace property, joined by the resolver.
 const TABLE_ROOT: &str = "s3://warehouse/direct/events";
 
-/// Bytes no Parquet reader accepts, so resolving a directory that reads such a file's footer
-/// fails: a successful resolution proves that footer was never read.
+/// Unreadable as Parquet: a successful resolution proves its footer was never read.
 const NOT_PARQUET: &[u8] = b"not a parquet file";
 
 /// One row of nulls is enough for the footer to declare `fields` without needing a value per Arrow type.
@@ -40,8 +39,6 @@ fn nullable(name: &str, data_type: DataType) -> Field {
     Field::new(name, data_type, true)
 }
 
-/// Keys are stored verbatim, so a key holding `%`, `#`, or `?` is exactly the object the listing
-/// returns.
 async fn store_holding(objects: Vec<(&str, Vec<u8>)>) -> Arc<dyn ObjectStore> {
     let store = InMemory::new();
     for (key, bytes) in objects {
@@ -174,7 +171,7 @@ async fn resolved_scan_carries_identity_bound_fields_and_no_deletes() {
             BTreeMap::from([("day".to_string(), Some("2".to_string()))]),
             BTreeMap::from([("day".to_string(), None)]),
         ],
-        "each entry carries the seam's partition values, a segment-less file's key unset"
+        "a file without the partition segment carries the key unset"
     );
     for file in &scan.files {
         assert!(
@@ -208,8 +205,7 @@ async fn resolved_scan_carries_identity_bound_fields_and_no_deletes() {
     assert_eq!(
         column_names(&scan),
         vec!["id", "extra", "name", "day"],
-        "the folded union in first-appearance order over the listing order, then the partition \
-         columns"
+        "folded union in listing order, then the partition columns"
     );
     assert_eq!(
         scan.partition_columns,
@@ -270,16 +266,16 @@ async fn file_entry_paths_round_trip_to_the_listed_object() {
     listed.sort();
     assert_eq!(
         scanned, listed,
-        "each entry must address at scan time exactly the object the listing returned"
+        "each entry must resolve to the listed object"
     );
     assert!(
         file_paths(&scan).contains(&"plain/p.parquet"),
-        "a path holding no character the URL parse mangles stays byte-identical: {:?}",
+        "a plain path stays byte-identical: {:?}",
         file_paths(&scan)
     );
     assert!(
         file_paths(&scan).contains(&"region=a%252Fb/p%2525.parquet"),
-        "a key's own '%' is encoded, never decoded to the '/' its partition value reads as: {:?}",
+        "a key's '%' is encoded, not decoded: {:?}",
         file_paths(&scan)
     );
 }
@@ -305,8 +301,7 @@ async fn plan_reads_selected_footers_and_lists_every_file() {
     assert_eq!(
         file_paths(&folded),
         vec!["day=2/part-1.parquet", "part-0.parquet"],
-        "a filter on no partition column narrows the rows the scan emits, never the files it \
-         reads (#412)"
+        "a non-partition filter never prunes files (#412)"
     );
     assert_eq!(
         column_names(&folded),
@@ -341,9 +336,9 @@ async fn a_partition_filter_prunes_files_before_their_footers_are_read() {
     .await;
     let options = hive(MergeMode::FoldEveryFile);
 
-    let unpruned = try_resolve(&store, options, None, &[]).await.expect_err(
-        "reading a pruned file's footer fails, so a success below proves none was read",
-    );
+    let unpruned = try_resolve(&store, options, None, &[])
+        .await
+        .expect_err("an unpruned scan reads the unreadable footers");
     assert!(
         unpruned
             .to_string()
@@ -376,7 +371,7 @@ async fn a_predicate_keeping_no_file_reads_no_footer_and_errors_never() {
 
     try_resolve(&store, options, None, &columns)
         .await
-        .expect_err("reading either file's footer fails, so a success below proves none was read");
+        .expect_err("an unpruned scan reads the unreadable footers");
 
     let scan = try_resolve(&store, options, Some(&year_equals("2099")), &columns)
         .await
@@ -386,8 +381,7 @@ async fn a_predicate_keeping_no_file_reads_no_footer_and_errors_never() {
     assert_eq!(
         column_names(&scan),
         vec!["year", "ID"],
-        "the partition column comes from the unfiltered listing, and every other declared column \
-         from the request, so the schema survives pruning every file"
+        "the schema survives pruning every file"
     );
 }
 
@@ -426,8 +420,7 @@ async fn a_declared_column_absent_from_kept_files_is_added_as_a_null_field() {
     assert_eq!(
         column_names(&pruned),
         vec!["id", "year", "DISCOUNT", "NOTE", "PLACE"],
-        "a declared column no kept file carries is appended once; one the fold or the partition \
-         columns already carry, under any case, is not repeated"
+        "only declared columns absent from the fold and partition columns are appended"
     );
     assert_eq!(
         column_names(&unpruned),
@@ -441,7 +434,7 @@ async fn a_declared_column_absent_from_kept_files_is_added_as_a_null_field() {
             .map(|field| field.arrow_type.as_str())
             .collect::<Vec<_>>(),
         vec!["float64", "utf8", "utf8"],
-        "typed from the declared Exasol type, a string-family or unmapped type as utf8"
+        "typed from the declared Exasol type, unmapped types as utf8"
     );
     for field in added {
         assert!(

@@ -26,18 +26,18 @@ mod tests;
 
 /// Reads every directory as raw Parquet (no Iceberg/Delta detection); reuses [`resolve_parquet_directory`] so declared and scanned schemas can't diverge.
 pub(super) struct ParquetFormatReader<'a> {
-    /// Shared across every leg of the request, so every leg shares one admission limiter.
+    /// Shared across every leg of the request (one admission limiter).
     pub(super) store: &'a Arc<dyn ObjectStore>,
     pub(super) table_root: &'a str,
     pub(super) options: DirectoryOptions,
     pub(super) declared_columns: &'a [(String, String)],
-    /// The CONNECTION's static backend, which is the effective one: this kind reaches no
-    /// credential-vending catalog.
+    /// The CONNECTION's static backend; no credential-vending catalog overrides it.
     pub(super) storage: &'a StorageBackend,
 }
 
 impl FormatReader for ParquetFormatReader<'_> {
-    /// Prunes by `filter_json`'s partition-column predicates before any footer is read (see [`PartitionPredicate`]); with no manifest or catalog statistics, a filter on no partition column narrows the rows the scan emits, never the files it reads.
+    /// Prunes files by partition-column predicates before any footer is read; other predicates
+    /// never prune (no file statistics).
     fn resolve_scan<'a>(
         &'a self,
         filter_json: Option<&'a Json>,
@@ -74,10 +74,10 @@ impl FormatReader for ParquetFormatReader<'_> {
     }
 }
 
-/// `ListingTableUrl::parse` percent-decodes the path and reads a raw `#` or `?` as a fragment or query, so exactly these three are encoded and every other path stays byte-identical.
+/// The characters `ListingTableUrl::parse` would decode or read as fragment/query.
 const URL_PARSE_UNSAFE: &AsciiSet = &AsciiSet::EMPTY.add(b'%').add(b'#').add(b'?');
 
-/// Size comes from the listing response (no extra HEAD or Parquet read); path is encoded relative to the table root, or as an absolute URI if outside it, so the scan resolves it to the listed object.
+/// Size comes from the listing response (no extra HEAD or Parquet read); path is encoded relative to the table root, or as an absolute URI if outside it.
 fn file_entry(file: &ParquetFile, prefix: &StorePath, store_root: &str) -> FileEntry {
     let relative = file.path.prefix_match(prefix).map(encoded_path);
     let store_root = store_root.trim_end_matches('/');
@@ -97,7 +97,7 @@ fn encoded_path<'p>(parts: impl Iterator<Item = PathPart<'p>>) -> String {
         .join("/")
 }
 
-/// Pruning narrows which files a query reads, never the table's schema: a declared column no kept footer and no partition column carries (uppercase fold) still resolves, typed as Exasol declared it, and reads NULL from every scanned file.
+/// Declared columns absent from `schema` (uppercase fold), typed as declared; they read NULL.
 fn absent_declared_fields(
     declared_columns: &[(String, String)],
     schema: &Schema,

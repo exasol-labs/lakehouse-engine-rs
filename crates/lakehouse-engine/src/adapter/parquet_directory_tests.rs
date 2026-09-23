@@ -457,14 +457,14 @@ async fn declared_keys_are_the_ordered_union_and_fill_every_file() {
     assert_eq!(
         column_types(&directory.schema).last(),
         Some(&("year".to_string(), DataType::Utf8)),
-        "the partition column is appended after the folded columns as nullable Utf8"
+        "partition column appended as nullable Utf8"
     );
     assert_eq!(
         file_at(&directory, "A/p.parquet")
             .partition_values
             .get("year"),
         Some(&None),
-        "every file's map carries EVERY declared key, NULL where its own path lacks the segment"
+        "a declared key missing from the path reads NULL"
     );
     assert_eq!(
         file_at(&directory, "year=2026/p.parquet")
@@ -494,15 +494,14 @@ async fn sample_mode_declares_only_the_sampled_files_keys() {
 
     assert!(
         directory.partition_columns.is_empty(),
-        "under SampleOneFile the declared keys come from the sampled (first) file's own path \
-         alone: {:?}",
+        "only the sampled file declares keys: {:?}",
         directory.partition_columns
     );
     assert!(
         file_at(&directory, "year=2026/p.parquet")
             .partition_values
             .is_empty(),
-        "a key only OTHER files carry is ignored under SampleOneFile"
+        "an unsampled file's key is ignored"
     );
 }
 
@@ -523,7 +522,7 @@ async fn two_declared_keys_folding_to_the_same_name_fail_naming_both_spellings()
     )
     .await
     .err()
-    .expect("two spellings folding to the same uppercase name must fail the declaration")
+    .expect("case-colliding keys must fail")
     .to_string();
 
     for expected in [
@@ -534,8 +533,7 @@ async fn two_declared_keys_folding_to_the_same_name_fail_naming_both_spellings()
     ] {
         assert!(
             error.contains(expected),
-            "the refusal must name both spellings and a file carrying each; '{expected}' is \
-             missing from: {error}"
+            "'{expected}' missing from: {error}"
         );
     }
 }
@@ -557,10 +555,7 @@ async fn a_key_spelling_collision_fails_even_when_keep_prunes_one_spelling() {
     )
     .await
     .err()
-    .expect(
-        "both spellings are declared from the unfiltered listing, so the collision must fail \
-         even when the predicate prunes every file carrying one of them",
-    )
+    .expect("case-colliding keys must fail even when keep prunes one")
     .to_string();
 
     for expected in [
@@ -571,8 +566,7 @@ async fn a_key_spelling_collision_fails_even_when_keep_prunes_one_spelling() {
     ] {
         assert!(
             error.contains(expected),
-            "the refusal must name both spellings and a file carrying each; '{expected}' is \
-             missing from: {error}"
+            "'{expected}' missing from: {error}"
         );
     }
 }
@@ -598,12 +592,12 @@ async fn a_key_folding_onto_a_column_drops_the_column_and_keeps_the_key() {
         &keep_all,
     )
     .await
-    .expect("every file carries the key's own segment, so the column is overridden, not refused");
+    .expect("the key overrides the stored column");
 
     assert_eq!(
         column_types(&directory.schema),
         vec![("k".to_string(), DataType::Utf8)],
-        "K is declared exactly once, as the partition column, never as the stored Parquet column"
+        "K is declared once, as the partition column"
     );
     assert_eq!(
         file_at(&directory, "p1.parquet").partition_values.get("k"),
@@ -633,17 +627,13 @@ async fn a_file_missing_the_colliding_keys_segment_fails_the_fold_naming_it() {
     )
     .await
     .err()
-    .expect(
-        "a file carrying the stored column without the key's own segment has neither a \
-         directory value nor permission to fall back to its own stored value",
-    )
+    .expect("a file storing K without a k= segment must fail")
     .to_string();
 
     for expected in ["K", "k", &format!("{TABLE_ROOT}/p2.parquet")] {
         assert!(
             error.contains(expected),
-            "the refusal must name the column, the key, and the segment-less file's path; \
-             '{expected}' is missing from: {error}"
+            "'{expected}' missing from: {error}"
         );
     }
 }
@@ -668,10 +658,7 @@ async fn a_default_or_empty_key_segment_counts_as_carrying_the_colliding_key() {
         &keep_all,
     )
     .await
-    .expect(
-        "a segment reading NULL is still the key's own segment, so the stored column is \
-         overridden, not refused",
-    );
+    .expect("a NULL-valued segment still overrides the stored column");
 
     assert_eq!(
         column_types(&directory.schema),
@@ -709,17 +696,13 @@ async fn a_sampled_files_missing_segment_fails_the_fold_under_sample_one_file() 
     )
     .await
     .err()
-    .expect(
-        "the SAMPLED file's own footer carries K while its own path holds no k= segment, even \
-         though another file declares the key",
-    )
+    .expect("the sampled file stores K without a k= segment")
     .to_string();
 
     for expected in ["K", "k", &format!("{TABLE_ROOT}/a.parquet")] {
         assert!(
             error.contains(expected),
-            "the refusal must name the column, the key, and the SAMPLED file's own path; \
-             '{expected}' is missing from: {error}"
+            "'{expected}' missing from: {error}"
         );
     }
 }
@@ -748,7 +731,7 @@ async fn hive_partitioning_off_parses_no_segment_and_checks_no_collision() {
         &keep_all,
     )
     .await
-    .expect("with hive_partitioning off, no key exists, so no collision check runs");
+    .expect("no keys, so no collision check");
 
     assert!(directory.partition_columns.is_empty());
     assert!(
@@ -764,7 +747,7 @@ async fn hive_partitioning_off_parses_no_segment_and_checks_no_collision() {
             ("id".to_string(), DataType::Int32),
             ("K".to_string(), DataType::Int32),
         ],
-        "the directories that would collide as partition keys are read as plain directories"
+        "key=value directories are plain directories"
     );
 }
 
@@ -789,7 +772,7 @@ async fn a_keep_predicate_narrows_files_before_any_footer_is_read() {
     assert_eq!(
         directory.partition_columns,
         vec!["year".to_string()],
-        "the declared columns come from the UNFILTERED listing, never depending on the predicate"
+        "keys come from the unfiltered listing"
     );
     assert_eq!(
         paths(&directory),

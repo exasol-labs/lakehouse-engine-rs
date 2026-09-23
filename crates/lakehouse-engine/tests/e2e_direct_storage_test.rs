@@ -664,8 +664,7 @@ fn write_all_fixtures() {
         stored_k_batch(1, 99),
     );
 
-    // direct_hive_collision_missing/ — isolated root: p2 stores K but carries no k= segment,
-    // which fails enumeration, so it must not share a base path with any passing scenario.
+    // direct_hive_collision_missing/ — isolated root: p2 has K but no k= segment.
     write_parquet_fixture(
         &format!("{BASE_COLLISION_MISSING}collision_missing_segment/k=1/p1.parquet"),
         stored_k_batch(1, 99),
@@ -742,7 +741,6 @@ fn served_tables(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
     cols[0].iter().map(value_to_string).collect()
 }
 
-/// `table`'s declared column names, in declaration order.
 fn declared_columns(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<String> {
     let cols = conn.query_columns(&format!(
         "SELECT COLUMN_NAME FROM SYS.EXA_ALL_COLUMNS \
@@ -1441,8 +1439,7 @@ const HIVE_OFF_UNION: DirectoryOptions = DirectoryOptions {
 
 const SALES_2026_FILE: &str = "year=2026/month=09/p1.parquet";
 
-/// Resolves `table` under `BASE_DIRECT` through the format-reader seam a pushdown request plans
-/// through, in-process against live MinIO, so a test sees exactly which files a filter keeps.
+/// Resolves `table` in-process through the pushdown format-reader seam, exposing the kept files.
 fn resolve_in_process(
     table: &str,
     options: DirectoryOptions,
@@ -1475,7 +1472,6 @@ fn resolve_in_process(
         .unwrap_or_else(|e| panic!("resolve_scan({table}, {filter:?}) must succeed: {e}"))
 }
 
-/// The table-relative paths of the files `filter` keeps in `table`.
 fn kept_paths(table: &str, filter: Option<&Json>) -> BTreeSet<String> {
     resolve_in_process(table, HIVE_UNION, filter)
         .files
@@ -1577,9 +1573,8 @@ fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
     assert_eq!(regions, ["a/b"], "a partition value must percent-decode");
 }
 
-/// `mixed/`'s partition columns are the union of its files' keys, so the plain-directory file
-/// reads NULL for `YEAR`; under `MERGE_SCHEMA = 'FALSE'` the sampled, first-listed plain-directory
-/// file declares no key, and the other file's key is ignored without failing the query.
+/// The plain-directory file reads NULL for `YEAR`; under `MERGE_SCHEMA = 'FALSE'` the sampled
+/// plain-directory file declares no key and the other file's key is ignored.
 #[test]
 fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
     setup();
@@ -1677,10 +1672,8 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     );
 }
 
-/// A file storing `K` under no `k=` segment, beside a file under one, fails `CREATE VIRTUAL
-/// SCHEMA` naming the column, the key, and that file; with hive partitioning off no key exists to
-/// collide, so the same base declares its table. Uses the isolated
-/// `direct_hive_collision_missing/` root so no passing scenario shares its enumeration.
+/// A file storing `K` under no `k=` segment fails `CREATE VIRTUAL SCHEMA` naming column, key and
+/// file; with hive partitioning off the same base declares its table.
 #[test]
 fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
     setup();
@@ -1912,9 +1905,8 @@ fn returned_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
     cols[0].iter().map(value_to_string).collect()
 }
 
-/// A range or `BETWEEN` predicate on `REGION` keeps exactly the files whose value Exasol's own
-/// `VARCHAR` comparison selects, in-process, in the scan Exasol is handed, and in the rows
-/// returned; a declined conjunct beside it changes none of the three.
+/// Range/`BETWEEN` pruning on `REGION` keeps exactly what Exasol's native `VARCHAR` comparison
+/// selects (in-process, pushed scan, and rows); a declined conjunct beside it changes nothing.
 #[test]
 fn range_pruning_matches_exasols_native_varchar_ordering() {
     setup();

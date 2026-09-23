@@ -133,9 +133,8 @@ impl<'a> TableScanResolver<'a> {
     /// create time — dot-joined under a catalog kind, a bare directory name under
     /// direct storage. `filter_json` is the request's raw filter, forwarded unchanged
     /// so each format prunes by it wherever its own planning can; `None` prunes
-    /// nothing. `declared_columns` is the table's `(Exasol name, Exasol type)`
-    /// declaration from the request's `involvedTables`; only a format whose pruning
-    /// can drop every file carrying a column reads it.
+    /// nothing. `declared_columns` is the table's `involvedTables` declaration,
+    /// read only by a format whose pruning can drop every file carrying a column.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,

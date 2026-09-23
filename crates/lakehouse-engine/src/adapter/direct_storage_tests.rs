@@ -306,7 +306,7 @@ async fn columns_and_files_come_from_the_shared_seam() {
     assert_eq!(
         names,
         vec!["id", "tags", "region"],
-        "columns appear in the folded schema's own order, followed by the partition column"
+        "folded columns, then partition columns"
     );
     assert_eq!(
         table.columns[0].source_type,
@@ -315,7 +315,7 @@ async fn columns_and_files_come_from_the_shared_seam() {
     assert_eq!(
         table.columns[2].source_type,
         ColumnSourceType::Parquet("utf8".to_string()),
-        "the key=value directory declares a VARCHAR partition column from the shared seam"
+        "partition column is utf8"
     );
     assert_eq!(
         table.columns[1].source_type,
@@ -572,6 +572,6 @@ async fn hive_partitioning_reaches_the_seam_on_enumeration() {
             .map(|c| c.name.as_str())
             .collect::<Vec<&str>>(),
         vec!["id", "year"],
-        "HIVE_PARTITIONING = TRUE (default) reaches the shared seam and declares the partition column"
+        "HIVE_PARTITIONING = TRUE declares the partition column"
     );
 }

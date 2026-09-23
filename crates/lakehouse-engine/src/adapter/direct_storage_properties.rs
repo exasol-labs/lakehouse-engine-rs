@@ -15,14 +15,12 @@ pub struct DirectStorageProperties {
     pub base_path: String,
     /// Fold every data file's footer (`true`, default) vs. sample one file's footer (`false`).
     pub merge_schema: bool,
-    /// `TRUE` (default) declares `key=value` directory segments as partition columns; `FALSE`
-    /// reads them as plain directories, per `vs-adapter/direct-storage-hive-partitioning`.
+    /// Whether `key=value` directory segments declare partition columns (default `TRUE`).
     pub hive_partitioning: bool,
 }
 
 impl DirectStorageProperties {
-    /// The ONE derivation site for the seam's two layout switches, so `createVirtualSchema` and
-    /// pushdown resolve the identical [`DirectoryOptions`] and can never disagree.
+    /// The only place [`DirectoryOptions`] is derived, so enumeration and pushdown can't disagree.
     pub fn directory_options(&self) -> DirectoryOptions {
         DirectoryOptions {
             merge_mode: MergeMode::for_merge_schema(self.merge_schema),

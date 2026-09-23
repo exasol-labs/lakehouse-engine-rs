@@ -113,9 +113,8 @@ pub enum ScanSource<'a> {
     },
     /// A directory of raw Parquet files; no catalog table metadata, since this source loads no table.
     ///
-    /// `declared_columns` is the table's `(Exasol name, Exasol type)` declaration as Exasol fixed
-    /// it at `REFRESH` and echoes in every pushdown request: pruning narrows which files a query
-    /// reads, never the table's schema, so a column no kept file carries still resolves from it.
+    /// `declared_columns` is the table's `(Exasol name, Exasol type)` declaration from the pushdown
+    /// request, so a column no kept file carries still resolves.
     DirectParquet {
         store: &'a Arc<dyn ObjectStore>,
         table_root: &'a str,

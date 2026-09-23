@@ -15,8 +15,7 @@ use std::sync::Arc;
 
 const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
-/// Which files' footers the fold reads and whose paths declare the partition keys: every listed
-/// file, or only the first.
+/// Which files' footers are folded and whose paths declare the partition keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeMode {
     /// Every listed file's footer; a column at several types resolves to the widest reachable one.
@@ -36,18 +35,14 @@ impl MergeMode {
     }
 }
 
-/// The seam's two layout switches, resolved once by
-/// [`crate::adapter::direct_storage_properties::DirectStorageProperties::directory_options`], so
-/// both callers apply the identical policy — the seam itself names no virtual-schema property.
+/// The seam's layout switches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryOptions {
     pub merge_mode: MergeMode,
     pub hive_partitioning: bool,
 }
 
-/// A file-keep decision over its filled partition values, evaluated after key declaration and
-/// before any footer read; `Send + Sync` because the seam holds a reference to it across `.await`
-/// inside the `Send` futures its callers return.
+/// Decides whether to keep a file, given its filled partition values; runs before any footer read.
 pub type PartitionKeepPredicate = dyn Fn(&BTreeMap<String, Option<String>>) -> bool + Send + Sync;
 
 /// One Parquet data file under the prefix.
@@ -55,26 +50,21 @@ pub struct ParquetFile {
     pub path: StorePath,
     /// Carried from the listing response, so no consumer issues an object-store HEAD for it.
     pub size: u64,
-    /// Every key `hive_partitioning` declares for this table, filled from this file's own
-    /// `key=value` path segments where present and `None` where the file's path lacks the segment
-    /// or the segment decodes to `__HIVE_DEFAULT_PARTITION__`/empty; empty when `hive_partitioning`
-    /// is `false`.
+    /// Every declared partition key; `None` where this file's path lacks the segment or its value
+    /// is empty/`__HIVE_DEFAULT_PARTITION__`.
     pub partition_values: BTreeMap<String, Option<String>>,
     /// Present iff this file's footer was read under the merge mode — check presence, not
     /// position, since [`MergeMode::SampleOneFile`] leaves most files' footers unset.
     pub footer: Option<Arc<ParquetMetaData>>,
 }
 
-/// The data files under one prefix, their declared partition columns, and the one schema their
-/// footers fold to (folded columns followed by the partition columns).
+/// The data files under one prefix, their partition columns, and their folded schema.
 pub struct ParquetDirectory {
     pub files: Vec<ParquetFile>,
     /// Every column NULLABLE, named and ordered exactly as the files declare them, followed by the
     /// partition columns.
     pub schema: SchemaRef,
-    /// The declared partition-key names, in the order appended to `schema`; empty when
-    /// `hive_partitioning` is `false` or no file in the merge mode's declaration scope (every
-    /// file, or the first file under `SampleOneFile`) carries a partition segment.
+    /// The declared partition-key names, in the order appended to `schema`.
     pub partition_columns: Vec<String>,
 }
 
@@ -91,13 +81,8 @@ pub fn store_prefix(uri: &str) -> Result<StorePath, UdfError> {
 /// A prefix holding no data file returns an empty file list and schema; whether that counts as a
 /// table is the caller's decision.
 ///
-/// `keep` narrows the files this call returns to those it accepts, evaluated against each file's
-/// partition values after key declaration and before any footer read; the partition keys are
-/// declared from the UNFILTERED listing and never depend on `keep`, while the fold-every-file
-/// mode reads only kept files' footers, so a rejected file costs no footer read. The
-/// sample-one-file mode still reads the footer of the first file in the UNFILTERED listing, kept
-/// or not, so the enumeration and plan paths sample the same file regardless of which predicate
-/// either one supplies.
+/// Partition keys and the `SampleOneFile` footer come from the unfiltered listing, so `keep` never
+/// changes the declared schema.
 pub async fn resolve_parquet_directory(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,
@@ -129,9 +114,7 @@ pub async fn resolve_parquet_directory(
     })
 }
 
-/// A listed data file before partition-key declaration narrows and fills its map; kept separate
-/// from [`ParquetFile`] so a file's OWN raw carried-keys set survives past the fill step for the
-/// collision checks in [`validate_key_column_overrides`], which need it undiluted.
+/// A listed file with its own raw partition segments, before filling against the declared keys.
 struct RawFile {
     path: StorePath,
     size: u64,
@@ -198,11 +181,7 @@ fn data_file_segments(location: &StorePath, prefix: &StorePath) -> Option<Vec<St
     Some(segments)
 }
 
-/// A directory segment declares a partition key iff it matches `^[^/=]+=[^/]*$`; the file's own
-/// name (the last segment) is never a candidate. The value is percent-decoded, keeping the raw
-/// text when it does not decode to valid UTF-8; `__HIVE_DEFAULT_PARTITION__` and an empty value
-/// both decode to `None`. A key repeated within one path takes its deepest value, keeping the
-/// position of its first occurrence so cross-file union ordering stays shallow-to-deep.
+/// A key repeated within one path takes its deepest value but keeps its first position.
 fn parse_partition_segments(segments: &[String]) -> Vec<(String, Option<String>)> {
     let Some((_, directories)) = segments.split_last() else {
         return Vec::new();
@@ -240,10 +219,6 @@ fn decode_partition_value(raw: &str) -> Option<String> {
     }
 }
 
-/// The files whose paths declare the partition keys: every file under
-/// [`MergeMode::FoldEveryFile`], or the first file alone under [`MergeMode::SampleOneFile`] —
-/// always a slice of the UNFILTERED listing, so the declared columns never depend on a keep
-/// predicate.
 fn declaration_scope(raw_files: &[RawFile], mode: MergeMode) -> &[RawFile] {
     match mode {
         MergeMode::FoldEveryFile => raw_files,
@@ -264,9 +239,6 @@ fn union_of_partition_keys(raw_files: &[RawFile]) -> Vec<String> {
     keys
 }
 
-/// Every declared key, filled from `raw`'s own value where present and `None` where `raw` carries
-/// no such key — so a consumer never checks for a missing key, and an undeclared key `raw` happens
-/// to carry is dropped.
 fn fill_partition_values(
     raw: &[(String, Option<String>)],
     declared_keys: &[String],
@@ -305,8 +277,7 @@ fn kept_files<'a>(
         .collect()
 }
 
-/// A file whose footer the fold reads; `kept_index` is its position among the returned files, or
-/// `None` for a sampled file `keep` rejected.
+/// `kept_index` is `None` for a sampled file that `keep` rejected.
 struct FoldSource {
     path: StorePath,
     size: u64,
@@ -400,14 +371,8 @@ fn key_spelling_collision(
     ))
 }
 
-/// A folded Parquet column whose uppercase fold equals a `candidates` key is dropped from the fold
-/// (the key's own nullable partition column is the only column of that name) when EVERY file whose
-/// footer was read and that carries the stored column also carries the key's segment in its own
-/// raw carried-keys set; a qualifying file that carries the column but not the segment fails the
-/// whole resolution instead, since it has neither a directory value nor permission to fall back to
-/// its own stored value. `candidates` holds every listed file's keys whatever the merge mode,
-/// because a key only an unsampled file carries still collides with a column the sampled footer
-/// stores.
+/// A stored column named like a partition key is dropped in favor of the key; a read file that
+/// stores the column but lacks the key's segment is an error.
 fn validate_key_column_overrides(
     fold_sources: &[FoldSource],
     read: &[ArrowReaderMetadata],

@@ -352,8 +352,7 @@ pub(super) fn select_broadcast_sides(
 /// conjuncts are already excluded from `filter_json`. `None` (no side-local
 /// conjunct) prunes nothing — every file is kept.
 ///
-/// `declared_columns` is this side's own `involvedTables` column declaration,
-/// forwarded exactly as `col_types` is on the single-table path.
+/// `declared_columns` is this side's own `involvedTables` column declaration.
 pub(super) async fn resolve_one_join_side(
     table_name: &str,
     table_identifier: &str,
