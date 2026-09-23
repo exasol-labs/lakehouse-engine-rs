@@ -16,9 +16,6 @@
 
 **Reviewer concern (verbatim from the user):** "try to adjust to prose of the specs. The agent has a tendency to document the 'transition', I mean to narrate: 'we had this property, now we don't have it'. This is not correct. The specs document the state. So there shouldn't be this 'narrative', the property shouldn't appear on the specs, as if it hasn't never been there in the first place. It must appear on the plan of course. And it may appear on the decisions, but shouldn't appear on the specs."
 
-**Reviewer concern (PR #422 review, close paraphrase):** Cross-region Glue and S3 still do not work. A common setup puts the Glue catalog in one region and the S3 bucket in another (their example: Glue in `eu-west-1`, the bucket in `us-east-1`). One `region` value cannot serve two jobs — signing Glue and placing the S3 store — under "stated always wins": a stated `region` matching the bucket signs Glue requests for the wrong region and Glue rejects them; an omitted `region` with static S3 keys leaves the store address empty; an omitted `region` with vended credentials depends on Glue vending `client.region`, unverified. Request: for a standard commercial Glue endpoint, sign with the region the URL names — even when the CONNECTION also states `region` — and use the stated `region` only to place the S3 store; keep today's behavior (stated `region` required, used for signing) for every other endpoint. Not the original scope of issue #127, but adopted here since region inference is already being changed. Confirmed non-breaking: a CONNECTION whose stated region matches its URL signs identically; one whose stated region differs was already rejected by Glue before this change.
-**A:** Accepted. See decision [4] (revised) below.
-
 ## Design Decisions
 
 ### [1] The derived region signs catalog requests only and never becomes the CONNECTION's `region`
