@@ -1002,6 +1002,108 @@ fn column_source_type_maps_to_exasol_in_one_home() {
     );
 }
 
+/// Scenario: A Parquet-sourced column's declared type and its Arrow tag never drift apart — both routes share the one parser.
+#[test]
+fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_type() {
+    for (tag, expected) in [
+        ("bool", "BOOLEAN"),
+        ("int32", "DECIMAL(10,0)"),
+        ("int64", "DECIMAL(20,0)"),
+        ("float32", "DOUBLE PRECISION"),
+        ("float64", "DOUBLE PRECISION"),
+        ("utf8", "VARCHAR(2000000)"),
+        ("date32", "DATE"),
+        ("timestamp_us", "TIMESTAMP"),
+        ("timestamptz_ns", "TIMESTAMP"),
+        ("decimal128(10,2)", "DECIMAL(10,2)"),
+    ] {
+        assert_eq!(
+            column_source_type_to_exasol(
+                &ColumnSourceType::Parquet(tag.to_string()),
+                EngineTimestampSupport::MillisecondOnly,
+            ),
+            expected,
+            "tag `{tag}` must declare `{expected}`"
+        );
+        assert_eq!(
+            column_source_type_to_exasol(
+                &ColumnSourceType::Parquet(tag.to_string()),
+                EngineTimestampSupport::MillisecondOnly,
+            ),
+            arrow_to_exasol_type(&arrow_type_from_tag(tag)),
+            "tag `{tag}` must resolve through the same parser both routes share"
+        );
+    }
+}
+
+/// Scenario: An unparseable Arrow tag still resolves — falls through to the JSON VARCHAR fallback.
+#[test]
+fn parquet_column_source_type_with_an_unparseable_tag_resolves_to_varchar_json() {
+    assert_eq!(
+        column_source_type_to_exasol(
+            &ColumnSourceType::Parquet("not-a-real-tag".to_string()),
+            EngineTimestampSupport::MillisecondOnly,
+        ),
+        "VARCHAR(2000000)"
+    );
+}
+
+/// Scenario: Every admitted Arrow type round-trips through its tag; a tz-aware timestamp round-trips from the `"UTC"` label since the tag discards which tz string the input carried.
+#[test]
+fn every_admitted_arrow_type_round_trips_through_its_tag() {
+    use arrow::datatypes::TimeUnit;
+
+    let mut admitted = vec![
+        DataType::Boolean,
+        DataType::Int8,
+        DataType::Int16,
+        DataType::Int32,
+        DataType::Int64,
+        DataType::UInt8,
+        DataType::UInt16,
+        DataType::UInt32,
+        DataType::UInt64,
+        DataType::Float32,
+        DataType::Float64,
+        DataType::Utf8,
+        DataType::LargeUtf8,
+        DataType::Date32,
+        DataType::Decimal128(10, 2),
+    ];
+    for unit in [
+        TimeUnit::Second,
+        TimeUnit::Millisecond,
+        TimeUnit::Microsecond,
+        TimeUnit::Nanosecond,
+    ] {
+        admitted.push(DataType::Timestamp(unit, None));
+        admitted.push(DataType::Timestamp(unit, Some("UTC".into())));
+    }
+
+    for dt in admitted {
+        let tag = arrow_type_to_tag(&dt);
+        assert_eq!(
+            arrow_type_from_tag(&tag),
+            dt,
+            "tag `{tag}` rendered from {dt:?} must parse back to it"
+        );
+    }
+}
+
+/// Scenario: A refused Arrow type still renders/parses via the `"utf8"` fallback tag.
+#[test]
+fn refused_arrow_types_fall_back_to_the_utf8_tag() {
+    for dt in [
+        DataType::Binary,
+        DataType::LargeBinary,
+        DataType::Decimal256(10, 2),
+    ] {
+        let tag = arrow_type_to_tag(&dt);
+        assert_eq!(tag, "utf8");
+        assert_eq!(arrow_type_from_tag(&tag), DataType::Utf8);
+    }
+}
+
 /// Scenario: Unity Catalog Spark column types map to Exasol types
 #[test]
 fn unity_spark_types_map_to_exasol() {

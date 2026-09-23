@@ -9,7 +9,7 @@ use crate::scan::sealed::{
 use crate::scan::spec::{CatalogProps, StorageBackend};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
-use lakehouse_catalog::StorageCreds;
+use lakehouse_catalog::{StorageCreds, scheme_of};
 
 use super::catalog_kind::CatalogKind;
 use super::nonempty_str;
@@ -60,7 +60,7 @@ pub fn read_connection(
         .map_err(|_| UdfError::User(format!("CONNECTION '{name}' could not be resolved")))?;
 
     let uri = conn.address;
-    if uri.is_empty() {
+    if uri.is_empty() && kind != CatalogKind::DirectStorage {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' has no address; expected the catalog URI"
         )));
@@ -79,7 +79,7 @@ pub fn read_connection(
     }
 
     let creds = parse_creds(&json);
-    validate_creds(name, &creds, kind)?;
+    validate_creds(name, &creds, kind, &uri)?;
     let sealed_storage_key = connection_password_carries_key_material(&creds)
         .then(|| derive_sealed_storage_key(&conn.password));
     Ok(Resolved {
@@ -89,8 +89,13 @@ pub fn read_connection(
     })
 }
 
-fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Result<(), UdfError> {
-    validate_kind_preconditions(name, creds, kind)?;
+fn validate_creds(
+    name: &str,
+    creds: &ConnectionCreds,
+    kind: CatalogKind,
+    address: &str,
+) -> Result<(), UdfError> {
+    validate_kind_preconditions(name, creds, kind, address)?;
     validate_azure_storage_creds(name, creds)?;
     validate_sigv4_creds(name, creds)?;
     validate_exclusive_catalog_auth_creds(name, creds)?;
@@ -103,6 +108,7 @@ fn validate_kind_preconditions(
     name: &str,
     creds: &ConnectionCreds,
     kind: CatalogKind,
+    address: &str,
 ) -> Result<(), UdfError> {
     match kind {
         CatalogKind::IcebergRest => {
@@ -121,6 +127,70 @@ fn validate_kind_preconditions(
                 )));
             }
         }
+        CatalogKind::DirectStorage => {
+            validate_direct_storage_preconditions(name, creds, address)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_direct_storage_preconditions(
+    name: &str,
+    creds: &ConnectionCreds,
+    address: &str,
+) -> Result<(), UdfError> {
+    if address.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' has no address; a storage base path is expected"
+        )));
+    }
+
+    // Catalog-auth fields are meaningless under direct storage; reject rather than silently ignore them.
+    let rejected: Vec<&str> = [
+        ("warehouse", !creds.warehouse.is_empty()),
+        ("token", creds.token.is_some()),
+        ("client_id", creds.client_id.is_some()),
+        ("client_secret", creds.client_secret.is_some()),
+        ("oauth2_server_uri", creds.oauth2_server_uri.is_some()),
+        ("scope", creds.scope.is_some()),
+        ("use_sigv4", creds.use_sigv4),
+        ("use_vended_credentials", creds.use_vended_credentials),
+    ]
+    .into_iter()
+    .filter_map(|(field, present)| present.then_some(field))
+    .collect();
+    if !rejected.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies field(s) {} but the direct-storage catalog kind \
+             reaches no catalog service; remove them",
+            rejected.join(", ")
+        )));
+    }
+
+    let scheme = scheme_of(address);
+    let backend = storage_block(creds, false);
+    if !backend.addresses_scheme(&scheme) {
+        let azure_fields = supplied_azure_fields(creds);
+        let (shape, accepted): (String, &[&str]) = if azure_fields.is_empty() {
+            (
+                format!(
+                    "S3 credential field(s) {}",
+                    supplied_s3_fields(creds).join(", ")
+                ),
+                &["s3", "s3a"],
+            )
+        } else {
+            (
+                format!("Azure credential field(s) {}", azure_fields.join(", ")),
+                &["abfss"],
+            )
+        };
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' address scheme '{scheme}' does not agree with its {shape}; \
+             the two must address the same storage backend; accepted scheme(s) for these \
+             credentials: {}",
+            accepted.join(", ")
+        )));
     }
     Ok(())
 }

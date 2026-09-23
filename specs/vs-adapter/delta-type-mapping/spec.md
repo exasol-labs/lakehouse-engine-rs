@@ -255,10 +255,21 @@ surface this feature maps, quoted from its § Schema Serialization Format:
   | `timestamp without time zone` | `timestamp_us` | TIMESTAMP(6) on Exasol 2025.x and later, TIMESTAMP on 8.x |
   | `decimal(p,s)`, `1 ≤ p ≤ 36` and `s ≤ p` | `decimal128(p,s)` | DECIMAL(p,s) |
 
-* *AND* `byte` and `short` SHALL both map to the EXISTING `int32` tag, and this feature MUST NOT add an
-  `int8` or an `int16` tag to the shared tag vocabulary, because Exasol gives Int8, Int16, and Int32
-  the same `DECIMAL(precision, 0)` shape and the Parquet reader's physical `Int8`/`Int16` widens to
-  logical `Int32` losslessly through the scan's existing physical-expression adapter
+* *AND* `byte` and `short` SHALL both keep the EXISTING `int32` tag, and the Delta reader MUST NOT
+  tag either column `int8` or `int16`, because the Parquet reader produces physical `Int8` and
+  `Int16` and the scan's existing physical-expression adapter widens each to logical `Int32`
+  losslessly
+* *AND* that mapping SHALL be the Delta reader's OWN deliberate choice rather than a consequence of
+  what the shared tag vocabulary spells, SUPERSEDING the recorded reason that the vocabulary holds no
+  `int8` or `int16` entry, because `datafusion-scan/type-mapping` adds both entries for the
+  direct-storage producer
+* *AND* the recorded claim that Exasol gives Int8, Int16, and Int32 one shared
+  `DECIMAL(precision, 0)` shape SHALL be DELETED rather than retained, because
+  `compatible_exasol_type` returns `DECIMAL(3,0)`, `DECIMAL(5,0)`, and `DECIMAL(10,0)` for the three,
+  exactly as the table above already declares
+* *AND* NO Delta declared Exasol type and NO Delta emitted value SHALL change under this amendment,
+  so every row of the table above stays byte-identical and every recorded assertion of this feature's
+  suite passes with no change to any expected value
 * *AND* the decimal domain check SHALL read the SINGLE shared
   `exasol_representable_catalog_decimal` predicate in `crates/lakehouse-engine/src/types/mapping.rs`
   and MUST NOT carry its own copy, so the Delta, Iceberg, and Unity Catalog answers stay in lockstep
@@ -269,8 +280,8 @@ surface this feature maps, quoted from its § Schema Serialization Format:
   MUST NOT restate the rule or either literal
 * *AND* the ten tags this table shares with the superseded scenario SHALL stay byte-identical, so no
   already-queryable Delta column changes the Arrow tag it is bound by; the ONLY declared type that
-  moves under this delta is the fractional-second precision of the two timestamp rows, and it moves on
-  the 2025.x arm only
+  moves under the recorded #359 amendment is the fractional-second precision of the two timestamp
+  rows, and it moves on the 2025.x arm only
 
 ### Scenario: A Delta type Exasol cannot represent natively is surfaced as a VARCHAR rendering
 

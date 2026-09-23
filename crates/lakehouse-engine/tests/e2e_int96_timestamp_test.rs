@@ -49,10 +49,7 @@ use common::int96_fixtures::{
 };
 use common::stack::{wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio};
 
-use lakehouse_engine::scan::spec::StorageBackend;
-
 use object_store::ObjectStoreExt;
-use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectStorePath;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 
@@ -125,27 +122,8 @@ fn vs_table(vs_name: &str, table: &str) -> String {
 /// The Iceberg reader yields an absolute `s3://<bucket>/<key>` (or `s3a://…`)
 /// URI; this splits off the bucket and reads the object by its key.
 async fn fetch_object_bytes(uri: &str) -> bytes::Bytes {
-    let without_scheme = uri
-        .strip_prefix("s3://")
-        .or_else(|| uri.strip_prefix("s3a://"))
-        .unwrap_or_else(|| panic!("data file URI must be an s3/s3a URI, got: {uri}"));
-    let (bucket, key) = without_scheme
-        .split_once('/')
-        .unwrap_or_else(|| panic!("data file URI must have a <bucket>/<key> form, got: {uri}"));
-
-    let StorageBackend::S3(storage) = local_stack_storage() else {
-        panic!("LocalStack fixture is S3-only")
-    };
-    let store = AmazonS3Builder::new()
-        .with_bucket_name(bucket)
-        .with_region(&storage.region)
-        .with_access_key_id(&storage.access_key)
-        .with_secret_access_key(&storage.secret_key)
-        .with_endpoint(&storage.endpoint)
-        .with_allow_http(storage.allow_http)
-        .with_virtual_hosted_style_request(!storage.path_style)
-        .build()
-        .unwrap_or_else(|e| panic!("configure MinIO object store for {uri}: {e}"));
+    let (bucket, key) = split_s3_bucket_and_key(uri);
+    let store = local_stack_s3_store(bucket);
 
     store
         .get(&ObjectStorePath::from(key))

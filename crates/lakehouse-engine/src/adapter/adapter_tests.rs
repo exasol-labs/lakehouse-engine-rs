@@ -217,6 +217,56 @@ fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
     );
 }
 
+/// `NAMESPACE` stays required for a catalog kind but is optional under `DIRECT_STORAGE`.
+#[test]
+fn namespace_is_required_for_catalog_kinds_only() {
+    let catalog_req = serde_json::json!({
+        "type": "createVirtualSchema",
+        "properties": { "CATALOG_CONNECTION": "MY_CONN" },
+    });
+    let catalog_err = dispatch(
+        &mut TestContext::scalar(vec![]).with_connection(
+            "MY_CONN",
+            password_connection("http://catalog.example.com", s3_style_password()),
+        ),
+        &catalog_req,
+    )
+    .expect_err("ICEBERG_REST still requires NAMESPACE");
+    let expected = format!("property '{PROP_NAMESPACE}' is required");
+    assert!(
+        catalog_err.to_string().contains(&expected),
+        "expected the required-property error '{expected}', got: {catalog_err}"
+    );
+
+    let direct_password = serde_json::json!({
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "region": "us-east-1",
+        "endpoint": CLOSED_PORT_ADDRESS,
+        "path_style": true,
+    })
+    .to_string();
+    let direct_req = serde_json::json!({
+        "type": "createVirtualSchema",
+        "properties": {
+            "CATALOG_CONNECTION": "MY_CONN",
+            "CATALOG_KIND": "DIRECT_STORAGE",
+        },
+    });
+    let direct_err = dispatch(
+        &mut TestContext::scalar(vec![]).with_connection(
+            "MY_CONN",
+            password_connection("s3://bucket/lake", direct_password),
+        ),
+        &direct_req,
+    )
+    .expect_err("no live object store is reachable in a unit test");
+    assert!(
+        !direct_err.to_string().contains(&expected),
+        "DIRECT_STORAGE must not require NAMESPACE, got: {direct_err}"
+    );
+}
+
 // An address that is a closed local port — a connection refused, no DNS, no
 // hang — so a request that reaches catalog resolution fails fast,
 // deterministically, on the FIRST call the resolved kind's client makes.
@@ -1506,6 +1556,37 @@ fn pushdown_known_involved_table_resolves_identifier() {
         resolve_pushdown_identifier(&request).unwrap(),
         "prod.finance.orders",
         "ORDERS must resolve to prod.finance.orders"
+    );
+}
+
+/// A direct-storage identifier carries an empty namespace, so `TABLE_MAP` records the bare directory name with no dots.
+#[test]
+fn table_map_records_the_bare_directory_name_and_round_trips() {
+    let idents = vec![
+        CatalogTableIdent {
+            namespace: Vec::new(),
+            name: "Orders".to_string(),
+        },
+        CatalogTableIdent {
+            namespace: Vec::new(),
+            name: "events".to_string(),
+        },
+    ];
+    let table_map = build_table_map(&[], &idents).unwrap();
+
+    assert_eq!(
+        table_map,
+        vec![
+            ("ORDERS".to_string(), "Orders".to_string()),
+            ("EVENTS".to_string(), "events".to_string()),
+        ]
+    );
+
+    let request = pushdown_request_with_table_map(&table_map, "ORDERS");
+    assert_eq!(
+        resolve_pushdown_identifier(&request).unwrap(),
+        "Orders",
+        "the recorded bare directory name round-trips through pushdown resolution"
     );
 }
 

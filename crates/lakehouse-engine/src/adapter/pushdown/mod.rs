@@ -12,11 +12,11 @@
 //! - No credential value (catalog-auth or storage) appears in any returned SQL
 //!   string or error message.
 
-use crate::adapter::ResolvedConnectionConfig;
 #[cfg(test)]
 use crate::adapter::catalog_kind::CatalogKind;
 #[cfg(test)]
 use crate::adapter::connection::ConnectionCreds;
+use crate::adapter::{ResolvedConnectionConfig, get_properties};
 use crate::scan::spec::{
     CatalogProps, CommonScanSpec, FileEntry, LogicalField, NameMappingEntry, ProjectionItem,
     ScanSpec, ScanStorage,
@@ -145,6 +145,9 @@ pub async fn handle_pushdown(
         .cloned()
         .unwrap_or(Json::Null);
 
+    // Merged the same way the handshake merged them, so each catalog-kind arm reads its own property from one source.
+    let props = get_properties(request);
+
     // Inner-join handling MUST run before the single-table path. `handle_pushdown`
     // is invoked once per pushdown REQUEST, resolving only `involvedTables[0]`
     // (adapter::mod::handle_pushdown_request); a join-shaped `from` that fell through
@@ -163,6 +166,7 @@ pub async fn handle_pushdown(
                 &pushdown_req,
                 &join,
                 conn,
+                &props,
                 scan_schema,
                 cluster_nodes,
                 parallelism_factor,
@@ -224,6 +228,7 @@ pub async fn handle_pushdown(
         &conn.catalog_uri,
         connection,
         &[catalog.table.as_str()],
+        &props,
     )
     .await?;
     let ResolvedScan {
