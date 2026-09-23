@@ -3185,7 +3185,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.47.0"
+version = "0.48.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
@@ -3211,6 +3211,7 @@ dependencies = [
  "native-tls",
  "object_store",
  "parquet",
+ "percent-encoding",
  "rand 0.8.6",
  "reqsign-core",
  "reqwest 0.12.28",

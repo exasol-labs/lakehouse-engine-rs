@@ -39,7 +39,7 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
     .expect("a Unity Catalog session is built without contacting the catalog");
 
     let err = resolver
-        .resolve("cat.sch.orders", None)
+        .resolve("cat.sch.orders", None, &[])
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
 
@@ -190,7 +190,7 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
     .expect("an Iceberg session resolves against a reachable catalog");
 
     let resolved = resolver
-        .resolve("db.t", None)
+        .resolve("db.t", None, &[])
         .await
         .expect("a snapshotless Iceberg table resolves an empty scan");
 
@@ -233,8 +233,14 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     .await
     .expect("an Iceberg session resolves against a reachable catalog");
 
-    resolver.resolve("db.t", None).await.expect("first table");
-    resolver.resolve("db.u", None).await.expect("second table");
+    resolver
+        .resolve("db.t", None, &[])
+        .await
+        .expect("first table");
+    resolver
+        .resolve("db.u", None, &[])
+        .await
+        .expect("second table");
 
     assert_eq!(
         catalog.targets(),
@@ -279,11 +285,11 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
     .expect("a Unity Catalog session is built without contacting the catalog");
 
     let err1 = resolver
-        .resolve("cat.sch.orders", None)
+        .resolve("cat.sch.orders", None, &[])
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
     let err2 = resolver
-        .resolve("cat.sch.customers", None)
+        .resolve("cat.sch.customers", None, &[])
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
     assert!(err1.to_string().contains("cat.sch.orders"));
@@ -356,11 +362,11 @@ async fn one_session_or_store_per_request_serves_every_leg() {
     );
 
     resolver
-        .resolve("events", None)
+        .resolve("events", None, &[])
         .await
         .expect("a directory with no data file resolves an empty scan");
     resolver
-        .resolve("event_labels", None)
+        .resolve("event_labels", None, &[])
         .await
         .expect("a directory with no data file resolves an empty scan");
 
@@ -443,7 +449,7 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
     .expect("a direct-storage store is built from the CONNECTION alone");
 
     let scan = resolver
-        .resolve("events", None)
+        .resolve("events", None, &[])
         .await
         .expect("a directory with no data file resolves an empty scan");
 
@@ -502,4 +508,79 @@ async fn request_session_has_one_variant_per_kind() {
         .await
         .unwrap_or_else(|e| panic!("{kind:?} must resolve a session of its own: {e}"));
     }
+}
+
+/// A non-truncated S3 listing holding one Hive-partitioned object whose bytes are no Parquet file.
+const ONE_UNREADABLE_HIVE_FILE_LIST_BUCKET_RESULT: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+    r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    "<Name>warehouse</Name><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>",
+    "<IsTruncated>false</IsTruncated>",
+    "<Contents><Key>events/year=2026/p.parquet</Key>",
+    "<LastModified>2026-01-01T00:00:00.000Z</LastModified><Size>18</Size></Contents>",
+    "</ListBucketResult>",
+);
+
+async fn resolve_events_under_hive_partitioning(
+    endpoint_uri: &str,
+    hive_partitioning: &str,
+    filter: &Json,
+) -> Result<ResolvedScan, UdfError> {
+    let creds = unauthenticated_creds();
+    let storage = direct_storage_backend(endpoint_uri);
+    let resolver = TableScanResolver::for_request(
+        CatalogKind::DirectStorage,
+        DIRECT_STORAGE_ADDRESS,
+        ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+        &["events"],
+        &serde_json::json!({ "HIVE_PARTITIONING": hive_partitioning }),
+    )
+    .await?;
+    resolver.resolve("events", Some(filter), &[]).await
+}
+
+#[tokio::test]
+async fn hive_partitioning_reaches_the_seam_on_pushdown() {
+    let endpoint = RecordingCatalog::spawn(|target| {
+        if target.contains("list-type=2") {
+            (200, ONE_UNREADABLE_HIVE_FILE_LIST_BUCKET_RESULT.to_string())
+        } else {
+            (200, "not a parquet file".to_string())
+        }
+    })
+    .await;
+    let year_2099 = serde_json::json!({
+        "type": "predicate_equal",
+        "left": {"type": "column", "name": "YEAR"},
+        "right": {"type": "literal_string", "value": "2099"}
+    });
+
+    let pruned = resolve_events_under_hive_partitioning(&endpoint.uri, "TRUE", &year_2099)
+        .await
+        .expect(
+            "HIVE_PARTITIONING=TRUE declares `year`, so the filter prunes the only file before \
+             its unreadable footer is read",
+        );
+    assert_eq!(pruned.partition_columns, vec!["year".to_string()]);
+    assert!(
+        pruned.files.is_empty(),
+        "the file under year=2026 is pruned by YEAR = '2099': {:?}",
+        pruned.files
+    );
+
+    let error = resolve_events_under_hive_partitioning(&endpoint.uri, "FALSE", &year_2099)
+        .await
+        .expect_err(
+            "HIVE_PARTITIONING=FALSE declares no key, so nothing prunes the file and its \
+             unreadable footer is read",
+        )
+        .to_string();
+    assert!(
+        error.contains("failed to read the Parquet footer"),
+        "the footer read proves no key was declared and no file was pruned: {error}"
+    );
 }

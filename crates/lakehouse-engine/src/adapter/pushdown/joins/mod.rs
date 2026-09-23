@@ -203,18 +203,28 @@ pub(super) async fn plan_join(
     let side_filters: Vec<Option<Json>> = (0..join.tables.len())
         .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
         .collect();
+    let side_columns: Vec<Vec<(String, String)>> = join
+        .tables
+        .iter()
+        .map(|leaf| involved_table_columns(request, &leaf.table_name))
+        .collect();
     // Resolved concurrently via try_join_all, which preserves input (leg-index) order —
     // required since later steps index sides by leg, not name.
-    let sides: Vec<ResolvedJoinSide> = try_join_all(join.tables.iter().zip(&side_filters).map(
-        |(leaf, side_filter)| {
-            resolve_one_join_side(
-                &leaf.table_name,
-                &leaf.table_identifier,
-                &resolver,
-                side_filter.as_ref(),
-            )
-        },
-    ))
+    let sides: Vec<ResolvedJoinSide> = try_join_all(
+        join.tables
+            .iter()
+            .zip(&side_filters)
+            .zip(&side_columns)
+            .map(|((leaf, side_filter), columns)| {
+                resolve_one_join_side(
+                    &leaf.table_name,
+                    &leaf.table_identifier,
+                    &resolver,
+                    side_filter.as_ref(),
+                    columns,
+                )
+            }),
+    )
     .await?;
 
     ensure_no_side_refuses_a_referenced_column(request, pushdown_req, &sides)?;

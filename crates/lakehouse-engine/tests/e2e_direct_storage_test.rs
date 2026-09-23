@@ -9,7 +9,8 @@ mod common;
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCHEMA_NAME, VsProps, create_schema_and_scripts,
     create_virtual_schema_with_password, exa_conn, explain_virtual_sql, install_slc,
-    local_stack_storage, parse_int, parse_numeric, upload_so, value_to_string,
+    local_stack_creds, local_stack_s3_store, local_stack_storage, parse_int, parse_numeric,
+    upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::write_parquet_fixture;
@@ -18,6 +19,10 @@ use common::stack::{
     wait_for_minio,
 };
 
+use lakehouse_engine::adapter::parquet_directory::{DirectoryOptions, MergeMode};
+use lakehouse_engine::adapter::pushdown::{
+    ConnectionStorage, ResolvedScan, ScanSource, format_reader,
+};
 use lakehouse_engine::scan::spec::StorageBackend;
 
 use arrow::array::{
@@ -30,9 +35,11 @@ use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectStorePath;
-use object_store::{ObjectStoreExt, PutPayload};
+use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use serde_json::{Value as Json, json};
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
 // ---------------------------------------------------------------------------
@@ -42,17 +49,26 @@ use std::sync::{Arc, OnceLock};
 const BASE_DIRECT: &str = "s3://warehouse/direct/";
 const BASE_INCOMPATIBLE: &str = "s3://warehouse/direct_incompatible/";
 const BASE_DISCOVERY: &str = "s3://warehouse/direct_discovery/";
+const BASE_COLLISION: &str = "s3://warehouse/direct_hive_collision/";
+const BASE_COLLISION_MISSING: &str = "s3://warehouse/direct_hive_collision_missing/";
 
 const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
 const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
+const VS_HIVE_OFF: &str = "DIRECT_HIVE_OFF";
 const VS_INCOMPATIBLE: &str = "DIRECT_INCOMPATIBLE_VS";
 const VS_DISCOVERY: &str = "DIRECT_DISCOVERY_VS";
 const VS_DISCOVERY_NS: &str = "DIRECT_DISCOVERY_NS_VS";
 const VS_DISCOVERY_EMPTY_NS: &str = "DIRECT_DISCOVERY_EMPTY_NS_VS";
+const VS_COLLISION: &str = "DIRECT_HIVE_COLLISION";
+const VS_COLLISION_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_OFF";
+const VS_COLLISION_MISSING: &str = "DIRECT_HIVE_COLLISION_MISSING";
+const VS_COLLISION_MISSING_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_MISSING_OFF";
 
 const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
 const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
+const CONN_COLLISION: &str = "DIRECT_STORAGE_COLLISION_CREDS";
+const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
 
 /// `CatalogConnectionPassword` for a direct-storage CONNECTION: static S3 creds,
 /// no `warehouse` (the direct-storage kind rejects that field).
@@ -98,6 +114,15 @@ fn setup() {
                 .with_catalog_kind("DIRECT_STORAGE")
                 .with_catalog_conn_name(CONN_DIRECT)
                 .with_merge_schema("FALSE"),
+            BASE_DIRECT,
+            &direct_storage_password(),
+        );
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(VS_HIVE_OFF, "")
+                .with_catalog_kind("DIRECT_STORAGE")
+                .with_catalog_conn_name(CONN_DIRECT)
+                .with_hive_partitioning("FALSE"),
             BASE_DIRECT,
             &direct_storage_password(),
         );
@@ -394,6 +419,72 @@ fn complex_batch() -> RecordBatch {
     .expect("complex batch construction is infallible")
 }
 
+fn sales_batch(ids: &[i64]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("AMOUNT", DataType::Float64, true),
+    ]));
+    let amounts: Vec<f64> = ids.iter().map(|&id| id as f64 * 10.5).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(Float64Array::from(amounts)),
+        ],
+    )
+    .expect("sales batch construction is infallible")
+}
+
+/// `sales_batch` plus a `DISCOUNT` column, which only the `year=2026` file carries.
+fn discounted_sales_batch(ids: &[i64]) -> RecordBatch {
+    let sales = sales_batch(ids);
+    let mut fields = sales.schema().fields().to_vec();
+    fields.push(Arc::new(Field::new("DISCOUNT", DataType::Float64, true)));
+    let mut columns = sales.columns().to_vec();
+    let discounts: Vec<f64> = ids.iter().map(|&id| id as f64 / 10.0).collect();
+    columns.push(Arc::new(Float64Array::from(discounts)));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .expect("discounted sales batch construction is infallible")
+}
+
+/// Byte order ranks these `B < a < é`, which neither a case-insensitive nor a locale order does,
+/// so a range predicate over them tells the orders apart. Row `n` of the fixture is `ID = n + 1`.
+const REGION_VALUES: [&str; 3] = ["B", "a", "é"];
+
+/// 2026-01-01 00:00:05.25 UTC: its `SECOND(TS, 3)` is 5.25, so `SECOND(TS, 3) > 1` holds on every row.
+const REGION_TS_MICROS: i64 = 1_767_225_605_250_000;
+
+fn regions_batch(id: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("TS", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![id])),
+            Arc::new(TimestampMicrosecondArray::from(vec![REGION_TS_MICROS])),
+        ],
+    )
+    .expect("regions batch construction is infallible")
+}
+
+/// A stored `K` column that a `k=` directory segment collides with once uppercased.
+fn stored_k_batch(id: i64, stored_k: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("K", DataType::Int64, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![id])),
+            Arc::new(Int64Array::from(vec![stored_k])),
+        ],
+    )
+    .expect("stored-K batch construction is infallible")
+}
+
 /// PUTs raw bytes at `uri` — for Delta transaction-log JSON, which isn't Parquet
 /// and so falls outside `write_parquet_fixture`'s contract.
 fn put_raw_bytes(uri: &str, bytes: Vec<u8>) {
@@ -508,6 +599,44 @@ fn write_all_fixtures() {
     // delta_caveat/ — a Delta table directory read as raw Parquet.
     write_delta_caveat_fixture();
 
+    // sales/ — three year partitions with disjoint rows; only year=2026 carries DISCOUNT.
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}sales/year=2026/month=09/p1.parquet"),
+        discounted_sales_batch(&[1, 2]),
+    );
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}sales/year=2025/month=__HIVE_DEFAULT_PARTITION__/p2.parquet"),
+        sales_batch(&[3]),
+    );
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}sales/year=2024/month=01/p3.parquet"),
+        sales_batch(&[4]),
+    );
+
+    // encoded/ — a percent-encoded partition value, keyed verbatim as Spark writes it.
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}encoded/region=a%2Fb/p.parquet"),
+        discovery_id_batch(1),
+    );
+
+    // mixed/ — one plain directory, listed first, and one key=value directory.
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}mixed/A/p.parquet"),
+        discovery_id_batch(1),
+    );
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}mixed/year=2026/p.parquet"),
+        discovery_id_batch(2),
+    );
+
+    // regions/ — one file per REGION value.
+    for (id, region) in (1..).zip(REGION_VALUES) {
+        write_parquet_fixture(
+            &format!("{BASE_DIRECT}regions/region={region}/p.parquet"),
+            regions_batch(id),
+        );
+    }
+
     // Loose file and empty-of-data-files directory under the base path: neither becomes a table.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}loose.parquet"),
@@ -527,6 +656,23 @@ fn write_all_fixtures() {
     write_parquet_fixture(
         &format!("{BASE_INCOMPATIBLE}incompatible/file2.parquet"),
         incompatible_file2(),
+    );
+
+    // direct_hive_collision/ — isolated root: the k=1 segment overrides the stored K = 99.
+    write_parquet_fixture(
+        &format!("{BASE_COLLISION}collision_override/k=1/p.parquet"),
+        stored_k_batch(1, 99),
+    );
+
+    // direct_hive_collision_missing/ — isolated root: p2 stores K but carries no k= segment,
+    // which fails enumeration, so it must not share a base path with any passing scenario.
+    write_parquet_fixture(
+        &format!("{BASE_COLLISION_MISSING}collision_missing_segment/k=1/p1.parquet"),
+        stored_k_batch(1, 99),
+    );
+    write_parquet_fixture(
+        &format!("{BASE_COLLISION_MISSING}collision_missing_segment/p2.parquet"),
+        stored_k_batch(2, 42),
     );
 
     // direct_discovery/ — discovery + NAMESPACE fixtures.
@@ -592,6 +738,16 @@ fn assert_declared_type(
 fn served_tables(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
     let cols = conn.query_columns(&format!(
         "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA='{vs_name}' ORDER BY TABLE_NAME"
+    ));
+    cols[0].iter().map(value_to_string).collect()
+}
+
+/// `table`'s declared column names, in declaration order.
+fn declared_columns(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<String> {
+    let cols = conn.query_columns(&format!(
+        "SELECT COLUMN_NAME FROM SYS.EXA_ALL_COLUMNS \
+         WHERE COLUMN_SCHEMA='{vs_name}' AND COLUMN_TABLE='{table}' \
+         ORDER BY COLUMN_ORDINAL_POSITION"
     ));
     cols[0].iter().map(value_to_string).collect()
 }
@@ -978,17 +1134,15 @@ fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtre
     );
 
     let deep_cols = conn.query_columns(&format!(
-        "SELECT ID FROM {} ",
+        "SELECT ID, Y FROM {} ",
         vs_table(VS_DISCOVERY, "DEEP")
     ));
     assert_eq!(parse_int(&deep_cols[0][0]), 200);
-    let deep_column_count = conn.query_columns(
-        &format!("SELECT COUNT(*) FROM SYS.EXA_ALL_COLUMNS WHERE COLUMN_SCHEMA='{VS_DISCOVERY}' AND COLUMN_TABLE='DEEP'"),
-    );
+    assert_eq!(value_to_string(&deep_cols[1][0]), "2026");
     assert_eq!(
-        parse_int(&deep_column_count[0][0]),
-        1,
-        "a y=2026 path segment must not become a column"
+        declared_columns(&mut conn, VS_DISCOVERY, "DEEP"),
+        ["ID", "Y"],
+        "a y=2026 path segment must become the partition column Y, after the Parquet column"
     );
 
     let ns_tables = served_tables(&mut conn, VS_DISCOVERY_NS);
@@ -1268,5 +1422,589 @@ fn two_table_join_matches_the_unpushed_answer_in_one_request() {
     assert!(
         pushed_sql.contains("event_labels"),
         "join pushdown request must name EVENT_LABELS: {pushed_sql}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Hive partitioning: declaration, collisions, pruning, VARCHAR ordering
+// ---------------------------------------------------------------------------
+
+const HIVE_UNION: DirectoryOptions = DirectoryOptions {
+    merge_mode: MergeMode::FoldEveryFile,
+    hive_partitioning: true,
+};
+
+const HIVE_OFF_UNION: DirectoryOptions = DirectoryOptions {
+    merge_mode: MergeMode::FoldEveryFile,
+    hive_partitioning: false,
+};
+
+const SALES_2026_FILE: &str = "year=2026/month=09/p1.parquet";
+
+/// Resolves `table` under `BASE_DIRECT` through the format-reader seam a pushdown request plans
+/// through, in-process against live MinIO, so a test sees exactly which files a filter keeps.
+fn resolve_in_process(
+    table: &str,
+    options: DirectoryOptions,
+    filter: Option<&Json>,
+) -> ResolvedScan {
+    let store: Arc<dyn ObjectStore> = Arc::new(local_stack_s3_store("warehouse"));
+    let storage = local_stack_storage();
+    let creds = local_stack_creds();
+    let connection = ConnectionStorage {
+        storage: &storage,
+        creds: &creds,
+        allow_http: true,
+    };
+    let table_root = format!("{BASE_DIRECT}{table}");
+    let reader = format_reader(
+        ScanSource::DirectParquet {
+            store: &store,
+            table_root: &table_root,
+            options,
+            declared_columns: &[],
+        },
+        &connection,
+    )
+    .unwrap_or_else(|e| panic!("format_reader({table}) must succeed: {e}"));
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for in-process scan resolution")
+        .block_on(reader.resolve_scan(filter))
+        .unwrap_or_else(|e| panic!("resolve_scan({table}, {filter:?}) must succeed: {e}"))
+}
+
+/// The table-relative paths of the files `filter` keeps in `table`.
+fn kept_paths(table: &str, filter: Option<&Json>) -> BTreeSet<String> {
+    resolve_in_process(table, HIVE_UNION, filter)
+        .files
+        .into_iter()
+        .map(|file| file.path)
+        .collect()
+}
+
+fn column(name: &str) -> Json {
+    json!({"type": "column", "name": name})
+}
+
+fn string(value: &str) -> Json {
+    json!({"type": "literal_string", "value": value})
+}
+
+fn equal(left: Json, right: Json) -> Json {
+    json!({"type": "predicate_equal", "left": left, "right": right})
+}
+
+/// Exasol advertises no greater-than predicate: it sends `a > b` as `b < a`.
+fn less(left: Json, right: Json) -> Json {
+    json!({"type": "predicate_less", "left": left, "right": right})
+}
+
+fn between(expression: Json, low: Json, high: Json) -> Json {
+    json!({"type": "predicate_between", "expression": expression, "left": low, "right": high})
+}
+
+fn nullable_string(value: &Json) -> Option<String> {
+    (!value.is_null()).then(|| value_to_string(value))
+}
+
+fn int_column(cells: &[Json]) -> Vec<i64> {
+    let mut ids: Vec<i64> = cells.iter().map(parse_int).collect();
+    ids.sort();
+    ids
+}
+
+/// `sales/`'s `year=`/`month=` segments declare `VARCHAR` partition columns after its Parquet
+/// columns; `__HIVE_DEFAULT_PARTITION__` reads NULL and `encoded/`'s `a%2Fb` decodes to `a/b`.
+#[test]
+fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
+    setup();
+    let mut conn = exa_conn();
+
+    assert_eq!(
+        declared_columns(&mut conn, VS_DIRECT, "SALES"),
+        ["ID", "AMOUNT", "DISCOUNT", "YEAR", "MONTH"],
+        "partition columns must follow the folded Parquet columns"
+    );
+    for partition_column in ["YEAR", "MONTH"] {
+        assert_declared_type(
+            &mut conn,
+            VS_DIRECT,
+            "SALES",
+            partition_column,
+            "VARCHAR(2000000)",
+        );
+    }
+
+    let cols = conn.query_columns(&format!(
+        "SELECT ID, \"YEAR\", \"MONTH\" FROM {} ORDER BY ID",
+        vs_table(VS_DIRECT, "SALES")
+    ));
+    let rows: Vec<(i64, Option<String>, Option<String>)> = (0..cols[0].len())
+        .map(|row| {
+            (
+                parse_int(&cols[0][row]),
+                nullable_string(&cols[1][row]),
+                nullable_string(&cols[2][row]),
+            )
+        })
+        .collect();
+    let some = |value: &str| Some(value.to_string());
+    assert_eq!(
+        rows,
+        vec![
+            (1, some("2026"), some("09")),
+            (2, some("2026"), some("09")),
+            (3, some("2025"), None),
+            (4, some("2024"), some("01")),
+        ],
+        "each row must carry its own file's partition values"
+    );
+
+    assert_declared_type(
+        &mut conn,
+        VS_DIRECT,
+        "ENCODED",
+        "REGION",
+        "VARCHAR(2000000)",
+    );
+    let encoded = conn.query_columns(&format!(
+        "SELECT REGION FROM {}",
+        vs_table(VS_DIRECT, "ENCODED")
+    ));
+    let regions: Vec<String> = encoded[0].iter().map(value_to_string).collect();
+    assert_eq!(regions, ["a/b"], "a partition value must percent-decode");
+}
+
+/// `mixed/`'s partition columns are the union of its files' keys, so the plain-directory file
+/// reads NULL for `YEAR`; under `MERGE_SCHEMA = 'FALSE'` the sampled, first-listed plain-directory
+/// file declares no key, and the other file's key is ignored without failing the query.
+#[test]
+fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
+    setup();
+    let mut conn = exa_conn();
+
+    assert_eq!(
+        declared_columns(&mut conn, VS_DIRECT, "MIXED"),
+        ["ID", "YEAR"]
+    );
+    let cols = conn.query_columns(&format!(
+        "SELECT ID, \"YEAR\" FROM {} ORDER BY ID",
+        vs_table(VS_DIRECT, "MIXED")
+    ));
+    let rows: Vec<(i64, Option<String>)> = (0..cols[0].len())
+        .map(|row| (parse_int(&cols[0][row]), nullable_string(&cols[1][row])))
+        .collect();
+    assert_eq!(
+        rows,
+        vec![(1, None), (2, Some("2026".to_string()))],
+        "the file lacking the year= segment must read NULL for YEAR"
+    );
+
+    assert_eq!(
+        declared_columns(&mut conn, VS_DIRECT_NARROW, "MIXED"),
+        ["ID"],
+        "MERGE_SCHEMA = 'FALSE' must declare the sampled file's keys alone"
+    );
+    let narrow = conn.query_columns(&format!(
+        "SELECT ID FROM {}",
+        vs_table(VS_DIRECT_NARROW, "MIXED")
+    ));
+    assert_eq!(
+        int_column(&narrow[0]),
+        [1, 2],
+        "an ignored key must neither fail the query nor drop a row"
+    );
+}
+
+/// `collision_override/k=1/`'s directory value overrides the file's own stored `K = 99`, which
+/// only a `HIVE_PARTITIONING = 'FALSE'` schema over the same base reads.
+#[test]
+fn partition_key_colliding_with_a_parquet_column_overrides_it() {
+    setup();
+    let mut conn = exa_conn();
+
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(VS_COLLISION, "")
+            .with_catalog_kind("DIRECT_STORAGE")
+            .with_catalog_conn_name(CONN_COLLISION),
+        BASE_COLLISION,
+        &direct_storage_password(),
+    );
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(VS_COLLISION_HIVE_OFF, "")
+            .with_catalog_kind("DIRECT_STORAGE")
+            .with_catalog_conn_name(CONN_COLLISION)
+            .with_hive_partitioning("FALSE"),
+        BASE_COLLISION,
+        &direct_storage_password(),
+    );
+
+    assert_eq!(
+        declared_columns(&mut conn, VS_COLLISION, "COLLISION_OVERRIDE"),
+        ["ID", "K"],
+        "K must be declared exactly once, as the partition column"
+    );
+    assert_declared_type(
+        &mut conn,
+        VS_COLLISION,
+        "COLLISION_OVERRIDE",
+        "K",
+        "VARCHAR(2000000)",
+    );
+    let overridden = conn.query_columns(&format!(
+        "SELECT K FROM {}",
+        vs_table(VS_COLLISION, "COLLISION_OVERRIDE")
+    ));
+    let values: Vec<String> = overridden[0].iter().map(value_to_string).collect();
+    assert_eq!(
+        values,
+        ["1"],
+        "K must read the k=1 directory value, never the stored 99"
+    );
+
+    let stored = conn.query_columns(&format!(
+        "SELECT K FROM {}",
+        vs_table(VS_COLLISION_HIVE_OFF, "COLLISION_OVERRIDE")
+    ));
+    assert_eq!(
+        int_column(&stored[0]),
+        [99],
+        "with hive partitioning off, K must read the file's own stored value"
+    );
+}
+
+/// A file storing `K` under no `k=` segment, beside a file under one, fails `CREATE VIRTUAL
+/// SCHEMA` naming the column, the key, and that file; with hive partitioning off no key exists to
+/// collide, so the same base declares its table. Uses the isolated
+/// `direct_hive_collision_missing/` root so no passing scenario shares its enumeration.
+#[test]
+fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
+    setup();
+    let mut conn = exa_conn();
+
+    conn.execute(&build_create_connection_sql(
+        CONN_COLLISION_MISSING,
+        BASE_COLLISION_MISSING,
+        &direct_storage_password(),
+    ));
+    let _ = conn.try_execute(&format!(
+        "DROP VIRTUAL SCHEMA IF EXISTS {VS_COLLISION_MISSING} CASCADE"
+    ));
+    let resp = conn.try_execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {VS_COLLISION_MISSING}
+USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
+  CATALOG_CONNECTION  = '{CONN_COLLISION_MISSING}'
+  CATALOG_KIND        = 'DIRECT_STORAGE'
+  ALLOW_HTTP          = 'true'"#
+    ));
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "a K-storing file with no k= segment must fail CREATE VIRTUAL SCHEMA: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.contains("column 'K'"),
+        "error must name the column K: {msg}"
+    );
+    assert!(
+        msg.contains("partition key 'k='"),
+        "error must name the key k: {msg}"
+    );
+    assert!(
+        msg.contains("collision_missing_segment/p2.parquet"),
+        "error must name the file lacking the segment: {msg}"
+    );
+    assert!(
+        !msg.contains("minioadmin"),
+        "error must not leak credential values: {msg}"
+    );
+
+    create_virtual_schema_with_password(
+        &mut conn,
+        &VsProps::new(VS_COLLISION_MISSING_HIVE_OFF, "")
+            .with_catalog_kind("DIRECT_STORAGE")
+            .with_catalog_conn_name(CONN_COLLISION_MISSING)
+            .with_hive_partitioning("FALSE"),
+        BASE_COLLISION_MISSING,
+        &direct_storage_password(),
+    );
+    assert_eq!(
+        served_tables(&mut conn, VS_COLLISION_MISSING_HIVE_OFF),
+        ["COLLISION_MISSING_SEGMENT"]
+    );
+    let stored = conn.query_columns(&format!(
+        "SELECT K FROM {}",
+        vs_table(VS_COLLISION_MISSING_HIVE_OFF, "COLLISION_MISSING_SEGMENT")
+    ));
+    assert_eq!(
+        int_column(&stored[0]),
+        [42, 99],
+        "with hive partitioning off, every file must read its own stored K"
+    );
+}
+
+/// Under `HIVE_PARTITIONING = 'FALSE'` a `key=value` segment is a plain directory: no table
+/// declares a partition column, every file entry carries an empty value map, and none is pruned.
+#[test]
+fn hive_partitioning_false_declares_no_partition_columns() {
+    setup();
+    let mut conn = exa_conn();
+
+    let expected: [(&str, &[&str]); 4] = [
+        ("SALES", &["ID", "AMOUNT", "DISCOUNT"]),
+        ("ENCODED", &["ID"]),
+        ("MIXED", &["ID"]),
+        ("REGIONS", &["ID", "TS"]),
+    ];
+    for (table, columns) in expected {
+        assert_eq!(
+            declared_columns(&mut conn, VS_HIVE_OFF, table),
+            columns,
+            "{table} must declare no partition column"
+        );
+    }
+    let count = conn.query_columns(&format!(
+        "SELECT COUNT(*) FROM {}",
+        vs_table(VS_HIVE_OFF, "SALES")
+    ));
+    assert_eq!(parse_int(&count[0][0]), 4, "no SALES file may be pruned");
+
+    let resolved = resolve_in_process("sales", HIVE_OFF_UNION, None);
+    assert!(resolved.partition_columns.is_empty());
+    assert_eq!(resolved.files.len(), 3);
+    assert!(
+        resolved
+            .files
+            .iter()
+            .all(|file| file.partition_values.is_empty()),
+        "every file entry must carry an empty partition-value map: {:?}",
+        resolved.files
+    );
+}
+
+/// `YEAR = '2026'` and `YEAR > '2025'` each keep only the `year=2026` file, in-process and in the
+/// scan Exasol is handed, and return that file's rows.
+#[test]
+fn partition_filter_prunes_the_resolved_file_list() {
+    setup();
+    let mut conn = exa_conn();
+
+    let unfiltered = kept_paths("sales", None);
+    assert_eq!(unfiltered.len(), 3, "unfiltered SALES: {unfiltered:?}");
+
+    let cases = [
+        ("\"YEAR\" = '2026'", equal(column("YEAR"), string("2026"))),
+        ("\"YEAR\" > '2025'", less(string("2025"), column("YEAR"))),
+    ];
+    for (predicate, filter) in cases {
+        let kept = kept_paths("sales", Some(&filter));
+        assert!(
+            kept.len() < unfiltered.len(),
+            "{predicate} must prune: kept {kept:?} of {unfiltered:?}"
+        );
+        assert_eq!(
+            kept,
+            BTreeSet::from([SALES_2026_FILE.to_string()]),
+            "{predicate} must keep only the year=2026 file"
+        );
+
+        let sql = format!(
+            "SELECT ID FROM {} WHERE {predicate}",
+            vs_table(VS_DIRECT, "SALES")
+        );
+        let pushed = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            pushed.contains(SALES_2026_FILE),
+            "{predicate}: the pushed scan must name the year=2026 file: {pushed}"
+        );
+        for pruned in ["year=2025/", "year=2024/"] {
+            assert!(
+                !pushed.contains(pruned),
+                "{predicate}: the pushed scan must not name a {pruned} file: {pushed}"
+            );
+        }
+
+        let rows = conn.query_columns(&sql);
+        assert_eq!(int_column(&rows[0]), [1, 2], "{predicate}");
+    }
+}
+
+/// `DISCOUNT`, declared from the `year=2026` file's footer, still reads NULL when pruning keeps
+/// only the `year=2025` file, whose footer lacks it.
+#[test]
+fn a_column_only_pruned_files_carry_reads_null() {
+    setup();
+    let mut conn = exa_conn();
+
+    let sql = format!(
+        "SELECT ID, DISCOUNT FROM {} WHERE \"YEAR\" = '2025'",
+        vs_table(VS_DIRECT, "SALES")
+    );
+    let pushed = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        pushed.contains("year=2025/") && !pushed.contains("year=2026/"),
+        "the scan must keep only the DISCOUNT-less year=2025 file: {pushed}"
+    );
+
+    let cols = conn.query_columns(&sql);
+    assert_eq!(int_column(&cols[0]), [3]);
+    assert!(
+        cols[1][0].is_null(),
+        "DISCOUNT must read NULL from a file lacking it"
+    );
+}
+
+/// The regions of `REGION_VALUES` Exasol's own `VARCHAR` comparison selects for `predicate`,
+/// written over the column `R`.
+fn natively_selected_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
+    let values = REGION_VALUES
+        .iter()
+        .map(|region| format!("SELECT CAST('{region}' AS VARCHAR(2000000)) AS R"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let cols = conn.query_columns(&format!("SELECT R FROM ({values}) WHERE {predicate}"));
+    cols[0].iter().map(value_to_string).collect()
+}
+
+fn regions_of(kept_paths: &BTreeSet<String>) -> BTreeSet<String> {
+    kept_paths
+        .iter()
+        .map(|path| {
+            let encoded = path
+                .strip_prefix("region=")
+                .and_then(|rest| rest.strip_suffix("/p.parquet"))
+                .unwrap_or_else(|| panic!("unexpected REGIONS file path {path}"));
+            percent_encoding::percent_decode_str(encoded)
+                .decode_utf8()
+                .unwrap_or_else(|e| {
+                    panic!("REGIONS file path segment {encoded} is not valid UTF-8: {e}")
+                })
+                .into_owned()
+        })
+        .collect()
+}
+
+fn regions_named_by(pushed_sql: &str) -> BTreeSet<String> {
+    const PATH_UNSAFE: &percent_encoding::AsciiSet = &percent_encoding::AsciiSet::EMPTY
+        .add(b'%')
+        .add(b'#')
+        .add(b'?');
+    REGION_VALUES
+        .iter()
+        .filter(|region| {
+            let encoded = percent_encoding::utf8_percent_encode(region, PATH_UNSAFE).to_string();
+            pushed_sql.contains(&format!("region={encoded}/p.parquet"))
+        })
+        .map(|region| region.to_string())
+        .collect()
+}
+
+fn returned_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
+    let cols = conn.query_columns(&format!(
+        "SELECT REGION FROM {} WHERE {predicate}",
+        vs_table(VS_DIRECT, "REGIONS")
+    ));
+    cols[0].iter().map(value_to_string).collect()
+}
+
+/// A range or `BETWEEN` predicate on `REGION` keeps exactly the files whose value Exasol's own
+/// `VARCHAR` comparison selects, in-process, in the scan Exasol is handed, and in the rows
+/// returned; a declined conjunct beside it changes none of the three.
+#[test]
+fn range_pruning_matches_exasols_native_varchar_ordering() {
+    setup();
+    let mut conn = exa_conn();
+
+    let cases = [
+        ("{column} > 'Z'", less(string("Z"), column("REGION"))),
+        ("{column} < 'z'", less(column("REGION"), string("z"))),
+        (
+            "{column} BETWEEN 'B' AND 'a'",
+            between(column("REGION"), string("B"), string("a")),
+        ),
+    ];
+    for (template, filter) in cases {
+        let native = natively_selected_regions(&mut conn, &template.replace("{column}", "R"));
+        let predicate = template.replace("{column}", "REGION");
+
+        assert_eq!(
+            regions_of(&kept_paths("regions", Some(&filter))),
+            native,
+            "{predicate}: the in-process kept files must match Exasol's native selection"
+        );
+        let pushed = explain_virtual_sql(
+            &mut conn,
+            &format!(
+                "SELECT ID FROM {} WHERE {predicate}",
+                vs_table(VS_DIRECT, "REGIONS")
+            ),
+        );
+        assert_eq!(
+            regions_named_by(&pushed),
+            native,
+            "{predicate}: the pushed scan's files must match Exasol's native selection: {pushed}"
+        );
+        assert_eq!(
+            returned_regions(&mut conn, &predicate),
+            native,
+            "{predicate}: the returned rows must match Exasol's native selection"
+        );
+    }
+
+    let native = natively_selected_regions(&mut conn, "R > 'Z'");
+    let predicate = "REGION > 'Z' AND SECOND(TS, 3) > 1";
+    let pushed = explain_virtual_sql(
+        &mut conn,
+        &format!(
+            "SELECT ID FROM {} WHERE {predicate}",
+            vs_table(VS_DIRECT, "REGIONS")
+        ),
+    );
+    assert_eq!(
+        regions_named_by(&pushed),
+        native,
+        "{predicate}: pruning must still run on the REGION conjunct: {pushed}"
+    );
+    assert_eq!(
+        returned_regions(&mut conn, predicate),
+        native,
+        "{predicate}: the declined conjunct holds on every row, so the row set must not change"
+    );
+}
+
+/// A partition predicate no file satisfies resolves zero files and returns zero rows, not an error.
+#[test]
+fn zero_matching_files_prune_to_zero_rows_without_error() {
+    setup();
+    let mut conn = exa_conn();
+
+    let kept = kept_paths("sales", Some(&equal(column("YEAR"), string("2099"))));
+    assert!(kept.is_empty(), "YEAR = '2099' must keep no file: {kept:?}");
+
+    let sql = format!(
+        "SELECT ID FROM {} WHERE \"YEAR\" = '2099'",
+        vs_table(VS_DIRECT, "SALES")
+    );
+    let pushed = explain_virtual_sql(&mut conn, &sql);
+    assert!(
+        !pushed.contains("year="),
+        "the pushed scan must name no SALES file: {pushed}"
+    );
+
+    let resp = conn.try_execute(&sql);
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("ok"),
+        "a query keeping no file must not fail: {resp}"
+    );
+    assert_eq!(
+        resp["responseData"]["results"][0]["resultSet"]["numRows"].as_i64(),
+        Some(0),
+        "a query keeping no file must return zero rows: {resp}"
     );
 }

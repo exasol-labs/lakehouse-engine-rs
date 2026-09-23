@@ -210,6 +210,7 @@ pub struct VsProps<'a> {
     join_broadcast_max_bytes: Option<&'a str>,
     catalog_kind: Option<&'a str>,
     merge_schema: Option<&'a str>,
+    hive_partitioning: Option<&'a str>,
 }
 
 impl<'a> VsProps<'a> {
@@ -224,6 +225,7 @@ impl<'a> VsProps<'a> {
             join_broadcast_max_bytes: None,
             catalog_kind: None,
             merge_schema: None,
+            hive_partitioning: None,
         }
     }
 
@@ -254,6 +256,12 @@ impl<'a> VsProps<'a> {
     /// Set the `MERGE_SCHEMA` VS property (e.g. `"FALSE"`).
     pub fn with_merge_schema(mut self, merge_schema: &'a str) -> Self {
         self.merge_schema = Some(merge_schema);
+        self
+    }
+
+    /// Set the `HIVE_PARTITIONING` VS property (e.g. `"FALSE"`).
+    pub fn with_hive_partitioning(mut self, hive_partitioning: &'a str) -> Self {
+        self.hive_partitioning = Some(hive_partitioning);
         self
     }
 }
@@ -312,6 +320,7 @@ pub fn create_virtual_schema_with_password(
     let join_clause = optional_clause("JOIN_BROADCAST_MAX_BYTES", props.join_broadcast_max_bytes);
     let catalog_kind_clause = optional_clause("CATALOG_KIND", props.catalog_kind);
     let merge_schema_clause = optional_clause("MERGE_SCHEMA", props.merge_schema);
+    let hive_partitioning_clause = optional_clause("HIVE_PARTITIONING", props.hive_partitioning);
     let namespace_clause = if props.namespace.is_empty() {
         String::new()
     } else {
@@ -322,7 +331,7 @@ pub fn create_virtual_schema_with_password(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
-  ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}"#,
+  ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}{hive_partitioning_clause}"#,
         vs_name = props.vs_name,
         catalog_conn_name = props.catalog_conn_name,
     ));

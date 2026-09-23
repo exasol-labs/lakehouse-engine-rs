@@ -1,5 +1,6 @@
 //! Parses and validates the `DIRECT_STORAGE` virtual-schema properties: `NAMESPACE`,
 //! `MERGE_SCHEMA`, `HIVE_PARTITIONING`. Read only under `CatalogKind::DirectStorage`.
+use crate::adapter::parquet_directory::{DirectoryOptions, MergeMode};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
@@ -14,9 +15,20 @@ pub struct DirectStorageProperties {
     pub base_path: String,
     /// Fold every data file's footer (`true`, default) vs. sample one file's footer (`false`).
     pub merge_schema: bool,
-    /// Parsed and validated but not yet acted on (#408): no partition column or per-file
-    /// partition value is derived from this yet.
+    /// `TRUE` (default) declares `key=value` directory segments as partition columns; `FALSE`
+    /// reads them as plain directories, per `vs-adapter/direct-storage-hive-partitioning`.
     pub hive_partitioning: bool,
+}
+
+impl DirectStorageProperties {
+    /// The ONE derivation site for the seam's two layout switches, so `createVirtualSchema` and
+    /// pushdown resolve the identical [`DirectoryOptions`] and can never disagree.
+    pub fn directory_options(&self) -> DirectoryOptions {
+        DirectoryOptions {
+            merge_mode: MergeMode::for_merge_schema(self.merge_schema),
+            hive_partitioning: self.hive_partitioning,
+        }
+    }
 }
 
 /// An unparseable `MERGE_SCHEMA`/`HIVE_PARTITIONING` value is rejected rather than defaulted, and

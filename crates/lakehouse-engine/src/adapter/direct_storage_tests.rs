@@ -1,10 +1,12 @@
 use super::*;
+use crate::adapter::parquet_directory::MergeMode;
 use arrow::array::new_empty_array;
 use arrow::datatypes::{Field, Fields, Schema};
 use arrow::record_batch::RecordBatch;
 use object_store::memory::InMemory;
 use object_store::{ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
+use std::collections::BTreeMap;
 
 fn nullable(name: &str, data_type: DataType) -> Field {
     Field::new(name, data_type, true)
@@ -37,8 +39,19 @@ fn test_client(
     base_path: &str,
     merge_mode: MergeMode,
 ) -> DirectStorageCatalogClient {
-    DirectStorageCatalogClient::over_store(store, base_path, merge_mode)
-        .expect("the fixture base path is a valid storage URI")
+    DirectStorageCatalogClient::over_store(
+        store,
+        base_path,
+        DirectoryOptions {
+            merge_mode,
+            hive_partitioning: false,
+        },
+    )
+    .expect("the fixture base path is a valid storage URI")
+}
+
+fn keep_all(_: &BTreeMap<String, Option<String>>) -> bool {
+    true
 }
 
 /// An [`ObjectStore`] decorator recording every `list`/`list_with_delimiter` prefix and `get`
@@ -255,6 +268,7 @@ async fn columns_and_files_come_from_the_shared_seam() {
     for key in [
         "lake/orders/part-0.parquet",
         "lake/orders/2026/part-1.parquet",
+        "lake/orders/region=us/part-2.parquet",
     ] {
         inner
             .put(
@@ -275,7 +289,15 @@ async fn columns_and_files_come_from_the_shared_seam() {
             .expect("the in-memory store accepts the fixture object");
     }
 
-    let client = test_client(inner, "s3://bucket/lake", MergeMode::FoldEveryFile);
+    let client = DirectStorageCatalogClient::over_store(
+        inner,
+        "s3://bucket/lake",
+        DirectoryOptions {
+            merge_mode: MergeMode::FoldEveryFile,
+            hive_partitioning: true,
+        },
+    )
+    .expect("the fixture base path is a valid storage URI");
     let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
 
     assert_eq!(listing.tables.len(), 1);
@@ -283,12 +305,17 @@ async fn columns_and_files_come_from_the_shared_seam() {
     let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["id", "tags"],
-        "columns appear in the folded schema's own order"
+        vec!["id", "tags", "region"],
+        "columns appear in the folded schema's own order, followed by the partition column"
     );
     assert_eq!(
         table.columns[0].source_type,
         ColumnSourceType::Parquet("int64".to_string())
+    );
+    assert_eq!(
+        table.columns[2].source_type,
+        ColumnSourceType::Parquet("utf8".to_string()),
+        "the key=value directory declares a VARCHAR partition column from the shared seam"
     );
     assert_eq!(
         table.columns[1].source_type,
@@ -465,7 +492,11 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
     let directory = resolve_parquet_directory(
         &(Arc::clone(&inner) as Arc<dyn ObjectStore>),
         &StorePath::from("lake/events"),
-        MergeMode::FoldEveryFile,
+        DirectoryOptions {
+            merge_mode: MergeMode::FoldEveryFile,
+            hive_partitioning: false,
+        },
+        &keep_all,
     )
     .await
     .expect("the fixture directory folds");
@@ -486,5 +517,61 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
         ColumnSourceType::Parquet("timestamptz_us".to_string()),
         "the tag vocabulary discards WHICH timezone the file declared, by design; the column is \
          declared at that normalized tag — the same one the plan path's logical_schema renders"
+    );
+}
+
+#[tokio::test]
+async fn hive_partitioning_reaches_the_seam_on_enumeration() {
+    let inner: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+    inner
+        .put(
+            &StorePath::from("lake/sales/year=2026/part-0.parquet"),
+            PutPayload::from(parquet_bytes(vec![nullable("id", DataType::Int64)])),
+        )
+        .await
+        .expect("the in-memory store accepts the fixture object");
+
+    let off = DirectStorageCatalogClient::over_store(
+        Arc::clone(&inner),
+        "s3://bucket/lake",
+        DirectoryOptions {
+            merge_mode: MergeMode::FoldEveryFile,
+            hive_partitioning: false,
+        },
+    )
+    .expect("the fixture base path is a valid storage URI")
+    .list_tables(&[])
+    .await
+    .expect("enumeration succeeds");
+    assert_eq!(
+        off.tables[0]
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<&str>>(),
+        vec!["id"],
+        "HIVE_PARTITIONING = FALSE declares no partition column"
+    );
+
+    let on = DirectStorageCatalogClient::over_store(
+        inner,
+        "s3://bucket/lake",
+        DirectoryOptions {
+            merge_mode: MergeMode::FoldEveryFile,
+            hive_partitioning: true,
+        },
+    )
+    .expect("the fixture base path is a valid storage URI")
+    .list_tables(&[])
+    .await
+    .expect("enumeration succeeds");
+    assert_eq!(
+        on.tables[0]
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<&str>>(),
+        vec!["id", "year"],
+        "HIVE_PARTITIONING = TRUE (default) reaches the shared seam and declares the partition column"
     );
 }

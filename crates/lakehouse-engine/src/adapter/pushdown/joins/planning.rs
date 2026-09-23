@@ -351,13 +351,19 @@ pub(super) fn select_broadcast_sides(
 /// side's rows to survive, so pruning by it is sound; cross-table and OR-spanning
 /// conjuncts are already excluded from `filter_json`. `None` (no side-local
 /// conjunct) prunes nothing — every file is kept.
+///
+/// `declared_columns` is this side's own `involvedTables` column declaration,
+/// forwarded exactly as `col_types` is on the single-table path.
 pub(super) async fn resolve_one_join_side(
     table_name: &str,
     table_identifier: &str,
     resolver: &TableScanResolver<'_>,
     filter_json: Option<&Json>,
+    declared_columns: &[(String, String)],
 ) -> Result<ResolvedJoinSide, UdfError> {
-    let resolved = resolver.resolve(table_identifier, filter_json).await?;
+    let resolved = resolver
+        .resolve(table_identifier, filter_json, declared_columns)
+        .await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
         table_identifier.to_string(),

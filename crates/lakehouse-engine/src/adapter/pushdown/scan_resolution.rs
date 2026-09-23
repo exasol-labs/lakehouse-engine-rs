@@ -16,7 +16,7 @@ use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::direct_storage_properties::{
     join_storage_path, resolve_direct_storage_properties,
 };
-use crate::adapter::parquet_directory::MergeMode;
+use crate::adapter::parquet_directory::DirectoryOptions;
 use crate::scan::{build_admission_limited_store, store_root_url};
 
 #[cfg(test)]
@@ -40,13 +40,6 @@ pub(super) struct TableScanResolver<'a> {
     connection: ConnectionStorage<'a>,
 }
 
-/// The request's live catalog session, in the shape its catalog kind resolved
-/// into.
-///
-/// Deliberately NOT the [`CatalogKind`] value: the kind is matched once, in
-/// [`TableScanResolver::for_request`], and an already-resolved session is all
-/// every later step needs. Carrying the kind alongside it would invite a second
-/// match site free to disagree with the first.
 enum RequestSession {
     Iceberg(CatalogSession),
     /// Boxed: a Unity Catalog session is several times the size of an Iceberg
@@ -56,7 +49,7 @@ enum RequestSession {
     DirectStorage {
         store: Arc<dyn ObjectStore>,
         base_path: String,
-        merge_mode: MergeMode,
+        options: DirectoryOptions,
     },
 }
 
@@ -118,10 +111,11 @@ impl<'a> TableScanResolver<'a> {
                     &store_root_url(&properties.base_path)?,
                     &connection.storage.secret_values(),
                 )?;
+                let options = properties.directory_options();
                 RequestSession::DirectStorage {
                     store,
                     base_path: properties.base_path,
-                    merge_mode: MergeMode::for_merge_schema(properties.merge_schema),
+                    options,
                 }
             }
         };
@@ -139,11 +133,14 @@ impl<'a> TableScanResolver<'a> {
     /// create time — dot-joined under a catalog kind, a bare directory name under
     /// direct storage. `filter_json` is the request's raw filter, forwarded unchanged
     /// so each format prunes by it wherever its own planning can; `None` prunes
-    /// nothing.
+    /// nothing. `declared_columns` is the table's `(Exasol name, Exasol type)`
+    /// declaration from the request's `involvedTables`; only a format whose pruning
+    /// can drop every file carrying a column reads it.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
         filter_json: Option<&Json>,
+        declared_columns: &[(String, String)],
     ) -> Result<ResolvedScan, UdfError> {
         match &self.session {
             RequestSession::Iceberg(session) => {
@@ -176,7 +173,7 @@ impl<'a> TableScanResolver<'a> {
             RequestSession::DirectStorage {
                 store,
                 base_path,
-                merge_mode,
+                options,
             } => {
                 let table_root =
                     join_storage_path(base_path, Some(direct_storage_directory(table_identifier)?));
@@ -184,7 +181,8 @@ impl<'a> TableScanResolver<'a> {
                     ScanSource::DirectParquet {
                         store,
                         table_root: &table_root,
-                        merge_mode: *merge_mode,
+                        options: *options,
+                        declared_columns,
                     },
                     &self.connection,
                 )?;
