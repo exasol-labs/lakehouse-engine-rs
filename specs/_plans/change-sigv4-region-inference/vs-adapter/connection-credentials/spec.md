@@ -21,7 +21,7 @@ Unchanged by this plan, and reproduced here only because the delta validator req
 * **A resolved `false` DISCARDS a configured endpoint** (`build_undecorated_store`, `object_store.rs:226-231`, passes `endpoint` to `AmazonS3Builder` only inside `if storage.path_style`). This forces the new guard: a non-vended CONNECTION with an `endpoint` and no stated `path_style` is rejected rather than silently reaching the wrong host.
 * **`StorageProps` keeps its `bool` and `true` serde default.** It is the resolved wire type; the adapter always serializes the field. Decision [5] in the decision-log records the rationale.
 * **Neither the Iceberg table spec nor the Delta protocol constrain this choice.** `s3.path-style-access` appears nowhere in the Iceberg REST spec; Delta's `PROTOCOL.md` contains no `path-style`/`path_style`/`virtual-hosted`. Decision [9] records the evidence.
-* **The SigV4 signing region is a separate value from the CONNECTION's `region`.** The signing region is the stated `region` when that field is non-empty. Otherwise it is the region that a standard commercial AWS Glue endpoint in the CONNECTION address names. Only the SigV4 guard and catalog request signing read the signing region. `region` holds exactly what the CONNECTION states, because an AWS Glue catalog and the S3 buckets of its tables can sit in different regions.
+* **The SigV4 signing region is a separate value from the CONNECTION's `region`.** The signing region is the stated `region` when that field is non-empty. Otherwise it is the region a standard AWS Glue endpoint names: an address with the `https` scheme whose host, compared case-insensitively, is exactly `glue.<region>.amazonaws.com`, where `<region>` is a commercial AWS region code — two letters, a hyphen, one or more letters, a hyphen, one or more digits, for example `us-east-1` or `ap-southeast-2`. Port and path do not affect the match, and no other address form — AWS GovCloud (US), AWS China, FIPS, dual-stack, VPC interface, a private or proxy host, or any `http` address — supplies a signing region. Only the SigV4 guard and catalog request signing read the signing region. `region` holds exactly what the CONNECTION states, because an AWS Glue catalog and the S3 buckets of its tables can sit in different regions.
 
 The connection name is supplied as the VS property `CATALOG_CONNECTION`. The adapter
 resolves it with `ctx.connection(name)`. The resolved `ConnectionObject.address` is the
@@ -57,7 +57,7 @@ address is a standard commercial AWS Glue endpoint. `endpoint` stays optional.
 ### Scenario: When SigV4 is enabled, access_key, secret_key, and a signing region are required
 
 * *GIVEN* a CONNECTION whose JSON password sets `use_sigv4` to true and supplies `warehouse`
-* *AND* the password omits `access_key`, omits `secret_key`, or omits `region` while the CONNECTION address is not a standard AWS Glue endpoint as § "A standard AWS Glue endpoint supplies the SigV4 signing region when the CONNECTION omits region" defines it
+* *AND* the password omits `access_key`, omits `secret_key`, or omits `region` while the CONNECTION address is not a standard AWS Glue endpoint, per § Background
 * *WHEN* the adapter resolves the connection
 * *THEN* the adapter SHALL return an error naming each omitted field among `access_key` and `secret_key`, and naming `region` when the CONNECTION supplies no signing region
 * *AND* the error SHALL state that the named fields are required when SigV4 signing is enabled
@@ -73,14 +73,9 @@ address is a standard commercial AWS Glue endpoint. `endpoint` stays optional.
 * *GIVEN* a CONNECTION whose address is `https://glue.eu-west-1.amazonaws.com/iceberg`
 * *AND* the CONNECTION's JSON password sets `use_sigv4` to true, supplies `warehouse`, `access_key`, and `secret_key`, and omits `region`
 * *WHEN* the adapter resolves the connection and issues its SigV4-signed catalog requests
-* *THEN* the adapter SHALL accept the CONNECTION without reporting `region` as missing
+* *THEN* the adapter SHALL accept the CONNECTION without reporting `region` as missing, per the standard-AWS-Glue-endpoint definition in § Background
 * *AND* the adapter SHALL sign every SigV4-signed catalog request for the region `eu-west-1`, covering both the namespace-enumeration requests and the `loadTable` request
-* *AND* a standard AWS Glue endpoint SHALL mean an address with the `https` scheme whose host, compared case-insensitively, is exactly `glue.<region>.amazonaws.com`
-* *AND* `<region>` SHALL be a commercial AWS region code: two letters, a hyphen, one or more letters, a hyphen, and one or more digits, for example `us-east-1` or `ap-southeast-2`
-* *AND* the port and the path of the address SHALL NOT affect that match
-* *AND* no other address SHALL supply a signing region, including an AWS GovCloud (US) endpoint such as `https://glue.us-gov-west-1.amazonaws.com`, an AWS China endpoint such as `https://glue.cn-north-1.amazonaws.com.cn`, a FIPS endpoint such as `https://glue-fips.us-east-1.amazonaws.com`, a VPC interface endpoint such as `https://vpce-0abc123.glue.us-east-1.vpce.amazonaws.com`, a dual-stack endpoint such as `https://glue.us-east-1.api.aws`, a private or proxy host such as `https://glue.internal.example.com`, and any `http` address
-* *AND* the adapter MUST NOT write the derived signing region into the CONNECTION's `region`, so `ConnectionCreds.region` SHALL stay empty for this CONNECTION
-* *AND* every rule that reads the CONNECTION's `region` SHALL therefore see it as unstated, including the store-addressing precedence of `vs-adapter/pushdown-planning-cloud-credentials`, the S3 region that `storage_block` builds, and the Azure-and-S3 mixed-fields guard
+* *AND* the adapter MUST NOT write the derived signing region into the CONNECTION's `region`, so `ConnectionCreds.region` SHALL stay empty and every other rule that reads it — the store-addressing precedence of `vs-adapter/pushdown-planning-cloud-credentials`, the S3 region `storage_block` builds, and the Azure-and-S3 mixed-fields guard — SHALL see it as unstated
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->

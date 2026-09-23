@@ -33,8 +33,8 @@
 
 - **Decision:** A standard AWS Glue endpoint is an `https` address whose host is exactly `glue.<region>.amazonaws.com`, where `<region>` matches the commercial region-code shape: two letters, a hyphen, one or more letters, a hyphen, one or more digits. The host is compared after `url::Url` normalization, which lowercases it. Port and path do not affect the match.
 - **Alternatives:** Match on the `amazonaws.com` domain with any single-label region. Rejected: AWS GovCloud (US) Glue endpoints are `glue.us-gov-west-1.amazonaws.com` and `glue.us-gov-east-1.amazonaws.com`, so a domain-only rule admits GovCloud ([AWS Glue endpoints and quotas](https://docs.aws.amazon.com/general/latest/gr/glue.html)). That endpoints table lists no `amazonaws-us-gov.com` host for Glue, so the interview's GovCloud example does not describe the endpoints an operator configures. An explicit region allow-list. Rejected: it goes stale each time AWS opens a commercial region. A `us-gov-` prefix exclusion. Rejected: it is ad hoc and does not state the rule the operator chose.
-- **Rationale:** Interview answer 2 asks for commercial only and a narrow shape. Commercial region codes have three hyphen-separated parts with a two-letter area (for example `us-east-1`, `ap-southeast-2`, `il-central-1`). GovCloud codes have four parts (`us-gov-west-1`), so the shape excludes them. China endpoints use the `amazonaws.com.cn` suffix, so the exact-suffix rule excludes them. FIPS (`glue-fips.`), dual-stack (`.api.aws`), and VPC interface endpoints (`vpce-*.glue.<region>.vpce.amazonaws.com`) fail the exact-host rule. `url::Url` parsing, not string slicing, decides the host, so `https://glue.us-east-1.amazonaws.com@evil.example/` resolves to host `evil.example` and does not match.
-- **Promotes to ADR:** yes
+- **Rationale:** Interview answer 2 asks for commercial only and a narrow shape. Commercial region codes have three hyphen-separated parts with a two-letter area (for example `us-east-1`, `ap-southeast-2`, `il-central-1`). GovCloud codes have four parts (`us-gov-west-1`), so the shape excludes them. China endpoints use the `amazonaws.com.cn` suffix, so the exact-suffix rule excludes them. FIPS (`glue-fips.`), dual-stack (`.api.aws`), and VPC interface endpoints (`vpce-*.glue.<region>.vpce.amazonaws.com`) fail the exact-host rule. `url::Url` parsing, not string slicing, decides the host, so `https://glue.us-east-1.amazonaws.com@evil.example/` resolves to host `evil.example` and does not match. A parsing rule local to one helper, not a system architecture decision — the scenario in `vs-adapter/connection-credentials` already pins the exact shape, so no ADR is needed to keep it discoverable.
+- **Promotes to ADR:** no
 
 ### [3] An address that is not a standard AWS Glue endpoint keeps the hard `region` requirement
 
@@ -84,10 +84,10 @@
 
 - **Decision:** New scenarios and new Background bullets describe how the system behaves, with no "previously", "now", "this delta", or SUPERSEDES wording. Existing narrative bullets from earlier deltas stay verbatim, except for the clauses that the new scenarios contradict. Those clauses are corrected in place and gain no narrative wording.
 - **Alternatives:** Keep the house style of "This delta ..." and SUPERSEDES bullets for the new material. Rejected by the user's reviewer concern (Interview section).
-- **Rationale:** This is a project-wide process convention, and it meets the override: (a) it binds every future plan's spec deltas, (b) it is not scoped to this plan, and (c) it is not a corollary of another decision. The user stated it as a general rule: "The specs document the state."
+- **Rationale:** This is a project-wide process convention, and it meets the override: (a) it binds every future plan's spec deltas, (b) it is not scoped to this plan, and (c) it is not a corollary of another decision. The user stated it as a general rule: "The specs document the state." It is a spec-writing convention, though, not a decision about the system's architecture — it belongs in process docs (`speq:writing-guardrails`), not the ADR log, and copying it into `specs/_decision/` would also strand its own "lives only in the plan and this log" clause once it no longer does.
 - **Consequences:**
   - Corrected clauses: the `region` half of the SUPERSEDES bullet and the trailing Background paragraph of `vs-adapter/connection-credentials`, the SigV4 clause of its vending scenario, and one clause each in the Background and the vended scenario of `e2e-harness/cloud-e2e-harness`.
-- **Promotes to ADR:** yes
+- **Promotes to ADR:** no
 
 ### [10] The live Glue proof is metadata-only
 
