@@ -29,6 +29,8 @@ pub(crate) use json_render::render_nested_column_as_json;
 mod sql_support;
 pub use sql_support::build_alias_items;
 
+mod checked_div;
+
 mod object_store;
 pub(crate) use self::object_store::{
     build_admission_limited_store, build_table_root_store, store_root_url,
@@ -324,7 +326,13 @@ async fn run_scan_dispatch(
         };
         emit_footer_refetch_diagnostic(ctx, session_ctx, coverage);
     }
-    result
+    // A checked division raised inside a pushed FILTER predicate loses its
+    // error type crossing DataFusion's Parquet row-filter boundary, so the
+    // run paths above surface it with the storage-read framing. This is the one
+    // place every run path funnels through, and the session still holds the
+    // failure as a typed value — so the arithmetic error is named here rather
+    // than at three call sites that would each have to remember to.
+    result.map_err(|e| emit::reframe_checked_division(session_ctx, e, &storage.all_secret_values()))
 }
 
 /// Emit the per-VM phase-telemetry record, gated on the debug level.
