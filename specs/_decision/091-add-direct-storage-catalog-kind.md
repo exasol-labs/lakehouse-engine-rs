@@ -8,11 +8,11 @@
 
 ### Context
 
-`DirectStorageCatalogClient` needs the engine-side object-store builder, and
+`DirectStorageCatalogClient` needs the engine-side object-store builder.
 `vs-adapter/catalog-crate-structure` forbids `lakehouse-catalog` from declaring `object_store` as a
 direct dependency. Declaring the client in `lakehouse-catalog` beside the two shipped implementors
 would point that dependency edge backwards. Rust's orphan rule permits the impl because the type is
-local even though the trait is not, and no recorded rule requires an implementor of `CatalogClient`
+local even though the trait is not. No recorded rule requires an implementor of `CatalogClient`
 to live in the catalog crate. The recorded requirement is only that the engine reach every
 enumeration and table-load operation through the trait. The single `Box<dyn CatalogClient>`
 construction site is already engine-side, so this placement adds no new seam.
@@ -47,7 +47,7 @@ that `CatalogKind`'s variant names appear in no production module outside an enu
 probe was never built. What exists today is a compile-time signature probe
 (`catalog_client_tests.rs`) whose own doc comment states it "does not (and cannot) prove the kind is
 matched nowhere else". The only probe that could assert the recorded clause would read production
-source text and match variant names against an allowlist.
+source text. It would match variant names against an allowlist.
 
 ### Decision
 
