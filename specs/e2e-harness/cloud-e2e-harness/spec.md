@@ -81,14 +81,14 @@ credential-bearing SQL never reaches test output.
 * *AND* when an ASSERTED key is absent, the test MUST fail naming that config key, rather than passing on a credential the CONNECTION happened to supply
 * *AND* the test output MUST NOT contain any vended or static credential value
 
-### Scenario: Remote bench wires NR_OF_CORES and PARALLELISM_FACTOR into the virtual schema
+### Scenario: Remote bench wires PARALLELISM_FACTOR into the virtual schema
 
 * *GIVEN* the remote bench target running against a real Glue catalog and external Exasol cluster
-* *AND* `BENCH_NR_OF_CORES` and `BENCH_PARALLELISM_FACTOR` set in the bench environment
+* *AND* `BENCH_PARALLELISM_FACTOR` set in the bench environment
 * *WHEN* the bench harness builds the `CREATE VIRTUAL SCHEMA` statement for the remote target
-* *THEN* the harness SHALL pass `NR_OF_CORES` and `PARALLELISM_FACTOR` as virtual-schema properties on the remote target, just as the docker target already does
-* *AND* the property values SHALL come from `BENCH_NR_OF_CORES` and `BENCH_PARALLELISM_FACTOR`, applying the same defaults the docker path uses when those variables are unset
-* *AND* the remote path MUST NOT emit an empty extra-properties block that drops these parallelism knobs (the prior behaviour where the cluster ran at its built-in defaults)
+* *THEN* the harness SHALL pass `PARALLELISM_FACTOR` as a virtual-schema property on the remote target, just as the docker target already does, taking the value from `BENCH_PARALLELISM_FACTOR` and applying the same default the docker path uses when that variable is unset, and MUST NOT emit an empty extra-properties block that drops it
+* *AND* the harness MUST NOT pass an `NR_OF_CORES` virtual-schema property on either target, and MUST NOT read a `BENCH_NR_OF_CORES` variable, because the adapter resolves the per-node core count on its executing node and reads no property for it; the harness's offline self-check SHALL assert the extra-properties block against that exact shape
+* *AND* the remote run SHALL size its per-instance thread and connection budgets from the cluster node's own detected core count
 
 ### Scenario: Cloud suite drives Exasol through the shared redacting WebSocket client
 
@@ -109,7 +109,7 @@ credential-bearing SQL never reaches test output.
 * *AND* when the variable names Lakekeeper, the CONNECTION address SHALL be the Lakekeeper catalog URI and the CONNECTION password SHALL be built by a Lakekeeper-specific builder, not by the Glue builder with different arguments
 * *AND* when the variable holds any other value, the harness SHALL exit with an error naming the accepted values, rather than silently falling back to either catalog
 * *AND* the docker target's behavior MUST NOT change under any value of that variable, because the local stack has exactly one catalog
-* *AND* both remote arms SHALL keep passing `NR_OF_CORES` and `PARALLELISM_FACTOR` as virtual-schema properties from the same bench variables with the same defaults, per this feature's recorded remote-parallelism scenario
+* *AND* both remote arms SHALL keep passing `PARALLELISM_FACTOR` as a virtual-schema property from the same bench variable with the same default, per this feature's recorded remote-parallelism scenario
 * *AND* the benchmark report header SHALL name the catalog the run used, so two reports over the same data are distinguishable after the fact — this is the ONLY report-output change on the Glue arm, whose required variables, catalog URI, CONNECTION password, virtual-schema properties, query set, and row counts all stay unchanged
 * *AND* that header field SHALL carry the catalog NAME only and MUST NOT carry an `s3://`-shaped value, because `bench/import_ceiling.sh:29` greps the whole report file with `grep -oE 's3://[^"]*/lineitem'` to derive its table root, so an `s3://`-shaped header value poisons that downstream script
 * *AND* that header field SHALL be emitted on the REMOTE target ONLY, and the DOCKER target's report header SHALL carry no such field under any value of the catalog-selection variable, including unset. `bench/run.sh:378-383` writes ONE header block for every target, so the field MUST be emitted conditionally rather than unconditionally: the selection variable defaults to `glue`, and the local stack's catalog is neither Glue nor the deployed Lakekeeper, so an unconditional field would label a local run `catalog=glue` and write that false value into `bench/reports/*.txt`

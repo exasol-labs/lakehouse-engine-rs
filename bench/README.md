@@ -100,12 +100,16 @@ the live row set by applying Parquet position-delete files during a scan.
 
 Each run writes a timestamped report to `bench/reports/` (gitignored).
 
-## Parallelism (docker)
+## Parallelism
 
-`BENCH_NR_OF_CORES` (default 4) overrides the auto-detected core count and drives
-the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
-(`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 8) drive the
-`GROUP BY shard_key` fan-out. See `../CLAUDE.md` for the engine memory/fan-out model.
+The adapter auto-detects the per-node core count (`std::thread::available_parallelism()`)
+and drives the DataFusion target-partitions / threads-per-UDF defaults from it; multi-file
+tables (`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 8) drive the `GROUP BY
+shard_key` fan-out. In docker mode, `LH_EXASOL_CPUSET` pins the Exasol container to a CPU
+set (for example `0-1`), and the adapter detects exactly that set, so it is the lever for
+the detected core count. Name CPUs the host actually has: Docker rejects a cpuset naming an
+absent CPU. Remote mode has no equivalent lever: the detected core count there is the real
+cluster node's core count. See `../CLAUDE.md` for the engine memory/fan-out model.
 
 ## Companion scripts
 

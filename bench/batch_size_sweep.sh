@@ -24,7 +24,6 @@ cd "$(dirname "$0")/.."
 set -a; . bench/.env; set +a
 DSN="exasol://sys:${EXASOL_SYS_PASSWORD}@${EXASOL_HOST}:${LH_EXASOL_PORT:-8563}?validateservercertificate=0"
 NS="${NAMESPACE:-tpch}"
-CORES="${BENCH_NR_OF_CORES:-8}"
 PF="${BENCH_PARALLELISM_FACTOR:-8}"
 KEY=33007128                 # L_ORDERKEY < KEY -> 33,006,459 rows (matches the re-gate VS side)
 NATIVE_RPS=2073703           # native IMPORT ceiling (10/60 files, 30,006,480 rows / 14.47 s); re-gate baseline
@@ -45,7 +44,6 @@ recreate_vs() {  # batch_size
 USING ${SCHEMA}.${ADAPTER} WITH
   CATALOG_CONNECTION    = '${CONN}'
   NAMESPACE             = '${NS}'
-  NR_OF_CORES           = '${CORES}'
   PARALLELISM_FACTOR    = '${PF}'
   DATAFUSION_BATCH_SIZE = '${bs}'" | exapump sql -d "$DSN" >/dev/null 2>&1
   # Confirm the value was resolved into adapterNotes (proves it reaches the scan).
@@ -68,7 +66,7 @@ timed_ctas() {  # label  select_expr
 }
 
 q "CREATE SCHEMA IF NOT EXISTS BENCH"
-echo "=== DATAFUSION_BATCH_SIZE emit sweep (PF=${PF}, cores=${CORES}, filter L_ORDERKEY<${KEY}) ===" | tee -a "$REPORT"
+echo "=== DATAFUSION_BATCH_SIZE emit sweep (PF=${PF}, filter L_ORDERKEY<${KEY}) ===" | tee -a "$REPORT"
 echo "native IMPORT ceiling (re-gate, 10/60 files, 30,006,480 rows): ${NATIVE_RPS} rows/s" | tee -a "$REPORT"
 echo | tee -a "$REPORT"
 

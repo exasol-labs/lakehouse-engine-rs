@@ -109,8 +109,8 @@ fn run_on_runtime<T>(
 /// Build the Tokio runtime for the scan UDF.
 ///
 /// When `threads` is 1 (the default), a current-thread runtime is created —
-/// one OS thread, matching Exasol's per-instance model and the
-/// `NR_OF_CORES`-bound VM pool. When `threads` exceeds 1, a multi-thread
+/// one OS thread, matching Exasol's per-instance model and the VM pool each
+/// node sizes to its own core count. When `threads` exceeds 1, a multi-thread
 /// runtime is created with exactly `threads` worker threads, which is only
 /// correct when the operator has explicitly widened the thread budget via the
 /// `DATAFUSION_THREADS_PER_UDF` VS property.
