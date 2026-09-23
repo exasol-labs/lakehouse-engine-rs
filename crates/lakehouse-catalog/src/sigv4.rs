@@ -28,13 +28,12 @@ pub(crate) const MISSING_SIGNING_REGION: &str = "SigV4 catalog signing requires 
                                       stated region nor the catalog URI supplies one";
 
 impl ConnectionCreds {
-    /// Region a SigV4-signed catalog request is signed for: the region a
-    /// standard commercial AWS Glue endpoint host names, when the address is
-    /// one — even when `region` is also stated, and even when the two differ.
-    /// Otherwise the stated `region` when non-empty, else `None`. Signing-only
-    /// by design: the result is never written back into `region`, because a
-    /// Glue catalog and its tables' buckets can sit in different regions and
-    /// `region` places the store, not the signature.
+    /// Region a SigV4-signed catalog request is signed for: the region a standard
+    /// commercial AWS Glue endpoint host names, even when `region` is also stated
+    /// and differs. Otherwise the stated `region` when non-empty, else `None`.
+    /// Never written back into `region`, since a Glue catalog and its tables'
+    /// bucket can sit in different regions and `region` places the store, not
+    /// the signature.
     pub fn sigv4_signing_region(&self, catalog_uri: &str) -> Option<String> {
         glue_endpoint_region(catalog_uri)
             .or_else(|| (!self.region.is_empty()).then(|| self.region.clone()))

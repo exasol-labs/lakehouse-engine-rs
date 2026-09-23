@@ -505,16 +505,12 @@ fn cloud_smoke_projection_filter_query() {
     // embedded in any variable printed above.)
 }
 
-/// A Glue CONNECTION that omits `region` still lists the Glue table through
-/// SigV4-signed catalog requests, when the CONNECTION address is a standard AWS
-/// Glue endpoint for `AWS_REGION` — the endpoint's own region signs the
-/// namespace-enumeration and `loadTable` requests, so a signing region derived
-/// from the address places no S3 store and no data file is read.
+/// Scenario: a region-less Glue CONNECTION still lists the Glue table, when the
+/// address is a standard AWS Glue endpoint for `AWS_REGION` — the endpoint's own
+/// region signs the catalog requests, and no data file is read.
 ///
-/// Skips when `GLUE_CATALOG_URI` is not a standard AWS Glue endpoint for the
-/// configured `AWS_REGION` (a private, GovCloud, China, FIPS, VPC-interface, or
-/// dual-stack Glue endpoint would still require a stated `region`, per
-/// `vs-adapter/connection-credentials` § Background).
+/// Skips when `GLUE_CATALOG_URI` is not that standard form (a private, GovCloud,
+/// China, FIPS, VPC-interface, or dual-stack endpoint still requires `region`).
 #[test]
 fn cloud_sigv4_region_derived_from_glue_endpoint_lists_table() {
     let env = match CloudEnv::from_env() {

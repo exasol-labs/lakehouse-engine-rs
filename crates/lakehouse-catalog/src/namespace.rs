@@ -266,13 +266,11 @@ impl<'a> SignedEnumeration<'a> {
                 })?;
             all.extend(tables_response.identifiers);
 
-            // List child namespaces and recurse. Best-effort: flat catalogs (e.g. AWS
-            // Glue) reject nested-namespace listing with HTTP 400 "does not support
-            // multipart namespace" — treat any failure here as "no children" and return
-            // the tables already collected from this namespace.
-            // ponytail: swallows ALL child-listing errors, not just the flat-catalog 400;
-            // on a genuinely nested catalog a transient error would silently skip a
-            // subtree. Upgrade path: branch on catalog capability from GET /v1/config.
+            // List child namespaces and recurse. Best-effort: a flat catalog (e.g. AWS
+            // Glue) rejects nested-namespace listing with HTTP 400, so any failure here
+            // is treated as "no children". Caveat: this also swallows a transient error
+            // on a genuinely nested catalog, silently skipping a subtree. Upgrade path:
+            // branch on catalog capability from GET /v1/config.
             let ns_url = build_list_namespaces_url(self.catalog_uri, self.prefix, ns);
             let ns_json = match self.signed_get_json(&ns_url).await {
                 Ok(j) => j,
