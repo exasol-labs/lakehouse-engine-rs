@@ -508,39 +508,14 @@ jobs:
       # Selects the matrix leg's Exasol image; docker-compose.yml's exasol
       # service reads this with a 2025.1.16 fallback.
       EXASOL_IMAGE: ${{ matrix.image }}
+      # Caps the Exasol container the same way the other E2E jobs do. Hosted
+      # runners have more than 2 vCPUs, so this also satisfies
+      # `adapter_detects_container_cpuset`'s precondition that the container's
+      # CPU set names strictly fewer CPUs than the runner has.
+      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
-
-      # Sole owner of LH_EXASOL_CPUSET for this job: the value is set here and
-      # nowhere else, so no job-level env entry competes with this step's
-      # $GITHUB_ENV write. docker-compose.yml's exasol service defaults to the
-      # CPU set 0-3, which can exceed a hosted runner's core count — Docker
-      # rejects a cpuset naming a CPU the host does not have. On top of that,
-      # `adapter_detects_container_cpuset` (crates/lakehouse-engine/tests/
-      # e2e_scan_test.rs) reads the Exasol container's CPU set back from its own
-      # cgroup and asserts the adapter VM detected exactly that many cores. That
-      # only discriminates a container-affinity read from an unconstrained host
-      # read while the set names strictly fewer CPUs than the runner has, so
-      # this step measures the runner and narrows the set to fit. The printed
-      # nproc is the authority on the runner's size; no vCPU count is assumed
-      # here.
-      - name: Narrow the Exasol CPU set below the runner core count
-        run: |
-          # Baseline CPU count for this job, lowered below if the runner is smaller.
-          cpus=2
-          cores="$(nproc)"
-          echo "runner vCPUs (nproc): $cores"
-          if [ "$cores" -lt 2 ]; then
-            echo "::error::runner reports $cores vCPU; the E2E suite needs at least 2 so the Exasol container can be pinned to a CPU set naming strictly fewer CPUs than the runner has"
-            exit 1
-          fi
-          if [ "$cpus" -ge "$cores" ]; then
-            echo "baseline CPU count $cpus is not below the runner's $cores vCPU; lowering to $((cores - 1))"
-            cpus="$((cores - 1))"
-          fi
-          echo "LH_EXASOL_CPUSET=0-$((cpus - 1))" >> "$GITHUB_ENV"
-          echo "effective LH_EXASOL_CPUSET: 0-$((cpus - 1))"
 
       # No tarball cache here (tried it, dropped it): restoring a GHA cache
       # tarball and `docker load`-ing it is a wash against a direct registry

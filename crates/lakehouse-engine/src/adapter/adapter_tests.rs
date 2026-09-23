@@ -447,7 +447,6 @@ fn refresh_rebuilds_table_map_preserves_notes() {
         "schemaMetadataInfo": {
             "adapterNotes": serde_json::json!({
                 "OTHER_KEY": "keep-me",
-                "NR_OF_CORES": "8",
                 "TABLE_MAP": {"OLD_TABLE": "ns.old_table"},
             })
             .to_string(),
@@ -475,12 +474,6 @@ fn refresh_rebuilds_table_map_preserves_notes() {
         parsed["OTHER_KEY"].as_str(),
         Some("keep-me"),
         "an unrelated adapterNotes key must survive a refresh's TABLE_MAP rebuild"
-    );
-    assert_eq!(
-        parsed["NR_OF_CORES"].as_str(),
-        Some("8"),
-        "an NR_OF_CORES entry persisted by another adapter version must survive the \
-         rebuild carrying its original value, unread and inert"
     );
 
     let table_map = parsed[NOTE_TABLE_MAP]
@@ -591,36 +584,14 @@ fn adapter_notes_carry_parallelism_factor() {
 // ---------------------------------------------------------------------------
 
 /// Scenario: Adapter derives the per-node core count from available_parallelism()
-/// on every request. The count is host-sourced and not injectable, so the
-/// assertion is positivity rather than an exact value; the recorded notes must
-/// carry no entry for it, because no pushdown reads it back.
+/// on every request — a positive, host-sourced value (not injectable, so we
+/// assert positivity rather than an exact count).
 #[test]
-fn core_count_from_available_parallelism_is_not_recorded() {
+fn core_count_comes_from_available_parallelism() {
     let nr_of_cores = resolve_nr_of_cores();
     assert!(
         nr_of_cores >= 1,
         "the core count must come from available_parallelism() (>= 1), got {nr_of_cores}"
-    );
-
-    let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &[],
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
-    assert!(
-        parsed.get("NR_OF_CORES").is_none(),
-        "the resolved core count must reach no adapterNotes entry"
     );
 }
 
@@ -1102,63 +1073,8 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
 }
 
 // ---------------------------------------------------------------------------
-// Cores-driven defaults, and an unrecognized property name reaching no budget.
+// Cores-driven defaults for DATAFUSION_TARGET_PARTITIONS / DATAFUSION_THREADS_PER_UDF.
 // ---------------------------------------------------------------------------
-
-/// Scenario: the adapter accepts a property name it does not recognize and
-/// resolves every budget to the same value it resolves without that name, so
-/// `NR_OF_CORES` reaches neither the core count nor any derivation.
-#[test]
-fn nr_of_cores_property_is_ignored() {
-    const CORES: u32 = 4;
-    const INSTANCES: usize = 2;
-
-    let without = serde_json::json!({});
-    let with = serde_json::json!({ "NR_OF_CORES": "999" });
-
-    assert_eq!(
-        resolve_parallelism_factor(&with, CORES),
-        resolve_parallelism_factor(&without, CORES),
-        "the parallelism factor must not read an NR_OF_CORES property"
-    );
-    assert_eq!(
-        resolve_threading_mode(&with),
-        resolve_threading_mode(&without),
-        "the threading mode must not read an NR_OF_CORES property"
-    );
-    for mode in [ThreadingMode::Auto, ThreadingMode::Fixed] {
-        assert_eq!(
-            resolve_df_threading(mode, &with, CORES, INSTANCES),
-            resolve_df_threading(mode, &without, CORES, INSTANCES),
-            "{mode:?} threading must not read an NR_OF_CORES property"
-        );
-    }
-    assert_eq!(
-        resolve_s3_max_connections(&with, CORES, INSTANCES),
-        resolve_s3_max_connections(&without, CORES, INSTANCES),
-        "the connection budget must not read an NR_OF_CORES property"
-    );
-    assert_eq!(
-        resolve_df_batch_size(&with),
-        resolve_df_batch_size(&without),
-        "the batch size must not read an NR_OF_CORES property"
-    );
-    assert_eq!(
-        resolve_memory_pool_fraction(&with),
-        resolve_memory_pool_fraction(&without),
-        "the memory-pool fraction must not read an NR_OF_CORES property"
-    );
-    assert_eq!(
-        resolve_instance_overhead_mb(&with),
-        resolve_instance_overhead_mb(&without),
-        "the instance overhead must not read an NR_OF_CORES property"
-    );
-    assert_eq!(
-        resolve_join_broadcast_max_bytes(&with),
-        resolve_join_broadcast_max_bytes(&without),
-        "the broadcast threshold must not read an NR_OF_CORES property"
-    );
-}
 
 /// Task 2.3 — Explicit DATAFUSION_TARGET_PARTITIONS wins over cores-driven default.
 #[test]
