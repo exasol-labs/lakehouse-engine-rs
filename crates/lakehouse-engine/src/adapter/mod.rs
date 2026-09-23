@@ -658,12 +658,8 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
 /// DF_THREADING_MODE, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
 /// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS,
 /// JOIN_BROADCAST_MAX_BYTES, and TABLE_MAP (a nested JSON object mapping Exasol
-/// table names to original-cased catalog identifiers). Every entry except
-/// DF_THREADING_MODE is read back by `handle_pushdown_request`; DF_THREADING_MODE
-/// is recorded purely as an operator-visible record of which derivation ran. The
-/// per-node core count is a derivation input the adapter discards once the
-/// budgets are resolved, not a recorded entry. Any pre-existing notes on the
-/// request are preserved (merge, not clobber).
+/// table names to original-cased catalog identifiers). Any pre-existing notes on
+/// the request are preserved (merge, not clobber).
 // ponytail: args mirror the resolved notes fields one-to-one; a params struct is
 // pure boilerplate for a single private callee.
 #[allow(clippy::too_many_arguments)]
@@ -927,12 +923,9 @@ fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
 }
 
 /// Per-node CPU core count used to derive the AUTO parallelism, DataFusion
-/// threading, and S3 connection budgets.
-///
-/// Read from the executing node with `std::thread::available_parallelism()`,
-/// which honours the CPU quota of the container the adapter VM runs in. The
-/// detection result is handed to [`core_count_or_default`], keeping the
-/// failure branch testable without an ambient dependency on the host.
+/// threading, and S3 connection budgets. Read from the executing node with
+/// `std::thread::available_parallelism()`, which honours the CPU quota of the
+/// container the adapter VM runs in.
 fn resolve_nr_of_cores() -> u32 {
     core_count_or_default(std::thread::available_parallelism())
 }

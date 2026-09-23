@@ -1291,9 +1291,9 @@ fn order_by_without_limit_falls_back_correctly() {
 }
 
 /// After createVirtualSchema the schema's adapterNotes carry PARALLELISM_FACTOR,
-/// but neither of the two counts: `pushdown` reads the node count live from
-/// `UdfContext::node_count()` on every request, and nothing reads the per-node
-/// core count back, so the adapter derives its budgets from it and discards it.
+/// but no NR_OF_CORES or CLUSTER_NODES key: `pushdown` reads the node count live
+/// from `UdfContext::node_count()` per request, and nothing reads the per-node
+/// core count back — the adapter discards it once budgets are derived.
 ///
 /// Queries SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES — the observable catalog
 /// column for adapter-controlled schema state. Exasol does NOT persist
@@ -1350,22 +1350,13 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
 }
 
 /// The adapter VM's core count comes from the Exasol container's CPU set, not
-/// from the unconstrained host.
+/// the unconstrained host: a probe VS created with `PARALLELISM_FACTOR = '1'`
+/// records the detected core count unchanged as `DF_THREADS_PER_UDF`, read back
+/// from the container's own cgroup rather than this process's environment.
 ///
-/// A probe VS created with `PARALLELISM_FACTOR = '1'` sets the per-node UDF
-/// instance share to 1, so the AUTO threading derivation divides the detected
-/// core count by 1 and records it unchanged as `DF_THREADS_PER_UDF`. That note is
-/// therefore a direct readout of what `std::thread::available_parallelism()`
-/// returned inside the adapter VM.
-///
-/// The CPU set is read back from the running container's own cgroup rather than
-/// from this process's environment, which records what the harness asked for
-/// rather than what the container got.
-///
-/// This replaces `adapter_detects_container_cpu_quota`, which constrained the
-/// container with a CFS bandwidth quota instead. The UDF sandbox mounts no
-/// cgroup filesystem, so a bandwidth quota never reaches the adapter VM and that
-/// assertion could not hold; a CPU affinity limit does reach it.
+/// Replaces `adapter_detects_container_cpu_quota`, which used a CFS bandwidth
+/// quota instead — invisible to the UDF sandbox since it mounts no cgroup
+/// filesystem; a CPU affinity limit does reach it.
 #[test]
 fn adapter_detects_container_cpuset() {
     setup_e2e();
@@ -1416,16 +1407,10 @@ fn adapter_detects_container_cpuset() {
     );
 }
 
-/// How many CPUs the Exasol container's effective CPU set names, read from the
-/// container's own cgroup rather than from this process's environment.
-///
-/// `/sys/fs/cgroup/cpuset.cpus.effective` holds the set the container is pinned
-/// to, written as a comma-separated list of CPU ids and inclusive ranges, so
-/// both `0-1` and `0,2-3` occur. Its cardinality is the count
-/// `available_parallelism()` reports inside the container, because the kernel
-/// reports that set as the process affinity mask. An unconstrained container
-/// names every host CPU; the caller's precondition assertion rejects that case,
-/// since it evidences nothing about affinity detection.
+/// Number of CPUs the Exasol container's effective CPU set names, read from
+/// `/sys/fs/cgroup/cpuset.cpus.effective` inside the container (a
+/// comma-separated list of CPU ids and inclusive ranges, e.g. `0-1` or
+/// `0,2-3`) rather than from this process's environment.
 fn exasol_container_cpuset_cores() -> usize {
     let container = exasol_container();
     let path = "/sys/fs/cgroup/cpuset.cpus.effective";

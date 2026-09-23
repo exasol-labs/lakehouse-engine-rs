@@ -114,14 +114,10 @@ services:
   exasol:
     image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.1.16}"
     privileged: true
-    # Pin the container to a CPU set instead of capping it with a CFS bandwidth
-    # quota (`cpus:`). The Exasol UDF sandbox mounts no cgroup filesystem, so a
-    # bandwidth quota is invisible to the adapter VM, while a CPU affinity limit
-    # reaches it and is what it detects as the node's core count (plan.md
-    # § CPU-limit detection boundary, issue #421). Keep the set wide enough that
-    # the scan UDF's shard fan-out + DataFusion threading have cores to run on
-    # (the live-smoke test exercises this). A host with fewer than four CPUs must
-    # name a narrower set: Docker rejects a cpuset naming a CPU the host lacks.
+    # Pin to a CPU set, not a CFS bandwidth quota (`cpus:`): the UDF sandbox
+    # mounts no cgroup filesystem, so only a CPU affinity limit is visible to
+    # the adapter VM's core-count detection (issue #421). Host must have at
+    # least as many CPUs as this set names.
     cpuset: "${LH_EXASOL_CPUSET:-0-3}"
     # 2g (was 1g): the UDF script VM needs far more than Docker's 64 MB
     # default once it actually spawns a UDF sandbox — which this stack's E2E

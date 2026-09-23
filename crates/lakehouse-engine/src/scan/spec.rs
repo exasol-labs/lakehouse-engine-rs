@@ -1315,15 +1315,12 @@ fn default_instance_overhead_mb() -> u64 {
     200
 }
 
-/// Built-in fallback connection-concurrency budget, in three roles: the serde
-/// default for [`CommonScanSpec::s3_max_connections`] / [`ScanSpec::s3_max_connections`]
-/// when a JSON payload omits the field, the pushdown-side fallback the
-/// adapter applies when the `S3_MAX_CONNECTIONS` adapterNote is absent or does
-/// not parse, and the connection budget `delta_format_reader::read_delta_log`
-/// gives `build_table_root_store` when reading a Delta table root at plan time.
-/// Defined here rather than in `adapter` so `scan::spec` — the
-/// lower-level module the adapter already depends on — has no reverse
-/// dependency on `adapter`.
+/// Built-in fallback connection-concurrency budget: the serde default for
+/// [`CommonScanSpec::s3_max_connections`] / [`ScanSpec::s3_max_connections`],
+/// the pushdown-side fallback when the `S3_MAX_CONNECTIONS` adapterNote is
+/// absent or invalid, and the budget `delta_format_reader::read_delta_log`
+/// gives `build_table_root_store`. Defined here, not in `adapter`, so
+/// `scan::spec` has no reverse dependency on it.
 pub(crate) const DEFAULT_S3_MAX_CONNECTIONS: usize = 16;
 
 /// Conservative built-in default for [`CommonScanSpec::s3_max_connections`] /
