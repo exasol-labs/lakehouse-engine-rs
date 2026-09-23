@@ -221,11 +221,12 @@ column is nullable and defines no default.
 
 ### Scenario: Every supported primitive initial-default survives the scan-spec serialization round-trip
 
-* *GIVEN* a scan spec whose logical schema carries one field for every supported primitive Arrow-type tag (`bool`, `int32`, `int64`, `float32`, `float64`, `utf8`, `date32`, `timestamp_us`, `timestamp_ns`, `timestamptz_us`, `timestamptz_ns`, and a `decimal128(p,s)` with non-trivial precision and scale), each field encoding that type's `initial-default`
+* *GIVEN* a scan spec whose logical schema carries one field for every supported primitive Arrow-type tag, meaning `bool`, `int32`, `int64`, `float32`, `float64`, `utf8`, `date32`, `timestamp_us`, `timestamp_ns`, `timestamptz_us`, `timestamptz_ns`, a `decimal128(p,s)` with non-trivial precision and scale, and each further primitive tag the widened vocabulary carries for `Int8`, `Int16`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `LargeUtf8`, and the remaining `Timestamp` time units, each field encoding that type's `initial-default`
 * *AND* one further field whose Iceberg `initial-default` is non-primitive (struct / list / map)
 * *WHEN* the scan spec is serialized to JSON, deserialized, and each field's encoded default is reconstructed to a `ScalarValue`
 * *THEN* the reconstructed `ScalarValue` for each primitive field SHALL equal the originally encoded value and SHALL match that field's Arrow-type tag, for every supported primitive tag in the vocabulary
-* *AND* the non-primitive field SHALL carry no encoded default after the round-trip, so it falls through to NULL (nullable) or the required-absent error at scan time
+* *AND* the tag list SHALL be read from the ONE vocabulary owner `datafusion-scan/type-mapping` specifies, SUPERSEDING the recorded twelve-tag enumeration both in this GIVEN and in this feature's Background, so widening the vocabulary cannot leave this scenario pinning a shorter list
+* *AND* the vocabulary SHALL stay PRIMITIVE-ONLY, so the non-primitive field SHALL carry no encoded default after the round-trip and falls through to NULL (nullable) or the required-absent error at scan time, exactly as recorded
 * *AND* the serialized form SHALL be credential-free
 
 ### Scenario: Added nullable column absent from a file with no initial-default is NULL-filled
@@ -275,23 +276,15 @@ column is nullable and defines no default.
 
 ### Scenario: A logical field carrying no binding key binds by its own name
 
-* *GIVEN* a scan spec whose logical schema carries a field with NO field-id and NO declared physical
-  name (the identity binding a Delta `none` column mapping produces), a second such field that is
-  ABSENT from one assigned file and nullable, and a third such field that is absent from that file,
-  required, and carries no `initial-default`
+* *GIVEN* a scan spec whose logical schema carries a field with NO field-id and NO declared physical name — the identity binding a Delta `none` column mapping produces, and the one a direct-storage table's merged Parquet schema produces for EVERY field — a second such field that is ABSENT from one assigned file and nullable, and a third such field that is absent from that file, required, and carries no `initial-default`
 * *WHEN* the scan UDF reads the assigned files
-* *THEN* the UDF SHALL install the column-binding adapter, because the scan spec CARRIES a logical
-  schema, and SHALL bind the identity-bound field to the physical column whose name equals its logical
-  name
-* *AND* the UDF SHALL emit NULL for the absent nullable field for rows from the file lacking it, and SHALL
-  emit its `initial-default` instead when one is encoded, per file
-* *AND* the UDF SHALL return the same clean required-absent error for the absent required field as it
-  returns for a field-id-bound required column, and MUST NOT substitute NULL for it
-* *AND* the UDF MUST NOT tag an identity-bound logical field with a `PARQUET:field_id`, because a
-  synthesized id is a value no writer put in any file and would invite a false match against a file
-  that does carry field-ids
-* *AND* this identity binding MUST NOT be reached by an Iceberg scan, because the Iceberg planning
-  path populates a field-id on every logical field
+* *THEN* the UDF SHALL install the column-binding adapter, because the scan spec CARRIES a logical schema, and SHALL bind the identity-bound field to the physical column whose name equals its logical name
+* *AND* the UDF SHALL emit NULL for the absent nullable field for rows from the file lacking it, and SHALL emit its `initial-default` instead when one is encoded, per file
+* *AND* the UDF SHALL return the same clean required-absent error for the absent required field as it returns for a field-id-bound required column, and MUST NOT substitute NULL for it
+* *AND* the UDF MUST NOT tag an identity-bound logical field with a `PARQUET:field_id`, because a synthesized id is a value no writer put in any file and would invite a false match against a file that does carry field-ids
+* *AND* this identity binding MUST NOT be reached by an Iceberg scan, because the Iceberg planning path populates a field-id on every logical field
+* *AND* the binding SHALL hold for a shard whose assigned files carry DIFFERENT column sets, because a direct-storage table's declared schema is the union of its files' columns, so the absent-column path is the ordinary case for that kind rather than an evolution edge case
+* *AND* the binding MUST NOT require the physical field's Arrow type to equal the logical one, so an identity-bound field whose file carries a narrower type is cast per file by the adapter `datafusion-scan/type-relaxation` owns, exactly as a field-id-bound field is
 
 ### Scenario: Scan without a logical schema falls back to first-file inference
 

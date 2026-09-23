@@ -2,6 +2,7 @@ use crate::adapter::ResolvedConnectionConfig;
 #[cfg(test)]
 use crate::scan::spec::StorageBackend;
 use exasol_udf_sdk::error::UdfError;
+use futures::future::try_join_all;
 use serde_json::Value as Json;
 
 use super::ConnectionStorage;
@@ -157,6 +158,7 @@ pub(super) async fn plan_join(
     pushdown_req: &Json,
     join: &DetectedJoin,
     conn: &ResolvedConnectionConfig,
+    props: &Json,
     scan_schema: Option<&str>,
     cluster_nodes: usize,
     parallelism_factor: usize,
@@ -192,25 +194,28 @@ pub(super) async fn plan_join(
         &conn.catalog_uri,
         connection,
         &identifiers,
+        props,
     )
     .await?;
-    // ONE leg per FROM-tree leaf, so the resolve loop is driven by LEG INDEX: a
-    // self-join's two occurrences share a `tableName`, and keying pruning on the name
-    // would hand each occurrence the other's predicate too — over-filtered rows with
-    // no error.
+    // Legs are indexed positionally, not by tableName (which a self-join's two
+    // occurrences share); each leg's filter is precomputed before resolution starts.
     let legs = join.legs();
-    let mut sides = Vec::with_capacity(join.tables.len());
-    for (leg, leaf) in join.tables.iter().enumerate() {
-        let side_filter = filter.and_then(|f| leg_local_filter(f, &legs, leg));
-        let side = resolve_one_join_side(
-            &leaf.table_name,
-            &leaf.table_identifier,
-            &resolver,
-            side_filter.as_ref(),
-        )
-        .await?;
-        sides.push(side);
-    }
+    let side_filters: Vec<Option<Json>> = (0..join.tables.len())
+        .map(|leg| filter.and_then(|f| leg_local_filter(f, &legs, leg)))
+        .collect();
+    // Resolved concurrently via try_join_all, which preserves input (leg-index) order —
+    // required since later steps index sides by leg, not name.
+    let sides: Vec<ResolvedJoinSide> = try_join_all(join.tables.iter().zip(&side_filters).map(
+        |(leaf, side_filter)| {
+            resolve_one_join_side(
+                &leaf.table_name,
+                &leaf.table_identifier,
+                &resolver,
+                side_filter.as_ref(),
+            )
+        },
+    ))
+    .await?;
 
     ensure_no_side_refuses_a_referenced_column(request, pushdown_req, &sides)?;
 

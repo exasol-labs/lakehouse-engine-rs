@@ -1,5 +1,13 @@
 use super::*;
 
+type CatalogClientConstruction = fn(
+    CatalogKind,
+    String,
+    StorageBackend,
+    ConnectionCreds,
+    &Json,
+) -> Result<Box<dyn CatalogClient>, UdfError>;
+
 /// The listing pipeline cannot branch on the catalog kind.
 ///
 /// This is a compile-time surface probe: `build_listing_virtual_tables` compiles
@@ -12,18 +20,13 @@ use super::*;
 /// kind→session construction site — legitimately consult the kind, both OUTSIDE
 /// this listing pipeline.
 #[test]
-fn catalog_kind_is_matched_only_at_the_construction_site() {
+fn construction_site_is_exhaustive_and_fallible_for_three_kinds() {
     let _pipeline: fn(
         &[String],
         &CatalogListing,
         EngineTimestampSupport,
     ) -> Result<VirtualTables, UdfError> = build_listing_virtual_tables;
-    let _constructor: fn(
-        CatalogKind,
-        String,
-        StorageBackend,
-        ConnectionCreds,
-    ) -> Box<dyn CatalogClient> = construct_catalog_client;
+    let _constructor: CatalogClientConstruction = construct_catalog_client;
 }
 
 /// Both catalog kinds resolve their tables through the ONE shared listing

@@ -208,6 +208,8 @@ pub struct VsProps<'a> {
     catalog_conn_name: &'a str,
     parallelism_factor: Option<usize>,
     join_broadcast_max_bytes: Option<&'a str>,
+    catalog_kind: Option<&'a str>,
+    merge_schema: Option<&'a str>,
 }
 
 impl<'a> VsProps<'a> {
@@ -220,6 +222,8 @@ impl<'a> VsProps<'a> {
             catalog_conn_name: DEFAULT_CATALOG_CONN_NAME,
             parallelism_factor: None,
             join_broadcast_max_bytes: None,
+            catalog_kind: None,
+            merge_schema: None,
         }
     }
 
@@ -240,6 +244,18 @@ impl<'a> VsProps<'a> {
         self.catalog_conn_name = name;
         self
     }
+
+    /// Set the `CATALOG_KIND` VS property (e.g. `"DIRECT_STORAGE"`).
+    pub fn with_catalog_kind(mut self, kind: &'a str) -> Self {
+        self.catalog_kind = Some(kind);
+        self
+    }
+
+    /// Set the `MERGE_SCHEMA` VS property (e.g. `"FALSE"`).
+    pub fn with_merge_schema(mut self, merge_schema: &'a str) -> Self {
+        self.merge_schema = Some(merge_schema);
+        self
+    }
 }
 
 /// Create (or replace) a Virtual Schema from `props`.
@@ -248,9 +264,9 @@ impl<'a> VsProps<'a> {
 /// credentials (harmless to repeat, and folds the join binary's separate
 /// `create_connection`), drops any existing VS, then emits `CREATE VIRTUAL
 /// SCHEMA` with the base properties plus the optional `PARALLELISM_FACTOR` /
-/// `JOIN_BROADCAST_MAX_BYTES` clauses when set. VS properties use
-/// docker-network-internal URLs because the adapter UDF runs inside the Exasol
-/// container.
+/// `JOIN_BROADCAST_MAX_BYTES` / `CATALOG_KIND` / `MERGE_SCHEMA` clauses when
+/// set. VS properties use docker-network-internal URLs because the adapter
+/// UDF runs inside the Exasol container.
 pub fn create_virtual_schema(conn: &mut ExaConn, props: &VsProps) {
     let password = local_stack_connection_password();
     let catalog_uri = iceberg_catalog_url_internal();
@@ -266,7 +282,15 @@ pub fn create_virtual_schema(conn: &mut ExaConn, props: &VsProps) {
 /// (carried on `password.warehouse`), and namespace (`props.namespace`)
 /// without re-declaring the shared schema/script/SLC provisioning in
 /// `create_schema_and_scripts` — only the CONNECTION password and VS
-/// properties vary per catalog.
+/// properties vary per catalog. An empty `props.namespace` omits `NAMESPACE`
+/// entirely — Exasol rejects `NAMESPACE = ''`.
+/// A `\n  KEY = 'value'` CREATE VIRTUAL SCHEMA clause when `value` is present, or empty when not.
+fn optional_clause(key: &str, value: Option<impl std::fmt::Display>) -> String {
+    value
+        .map(|v| format!("\n  {key} = '{v}'"))
+        .unwrap_or_default()
+}
+
 pub fn create_virtual_schema_with_password(
     conn: &mut ExaConn,
     props: &VsProps,
@@ -284,24 +308,23 @@ pub fn create_virtual_schema_with_password(
         props.vs_name
     ));
 
-    let parallelism_clause = props
-        .parallelism_factor
-        .map(|f| format!("\n  PARALLELISM_FACTOR  = '{f}'"))
-        .unwrap_or_default();
-    let join_clause = props
-        .join_broadcast_max_bytes
-        .map(|b| format!("\n  JOIN_BROADCAST_MAX_BYTES = '{b}'"))
-        .unwrap_or_default();
+    let parallelism_clause = optional_clause("PARALLELISM_FACTOR ", props.parallelism_factor);
+    let join_clause = optional_clause("JOIN_BROADCAST_MAX_BYTES", props.join_broadcast_max_bytes);
+    let catalog_kind_clause = optional_clause("CATALOG_KIND", props.catalog_kind);
+    let merge_schema_clause = optional_clause("MERGE_SCHEMA", props.merge_schema);
+    let namespace_clause = if props.namespace.is_empty() {
+        String::new()
+    } else {
+        format!("\n  NAMESPACE   = '{}'", props.namespace)
+    };
 
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
-  NAMESPACE   = '{namespace}'
-  ALLOW_HTTP          = 'true'{parallelism_clause}{join_clause}"#,
+  ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}"#,
         vs_name = props.vs_name,
         catalog_conn_name = props.catalog_conn_name,
-        namespace = props.namespace,
     ));
 }
 
@@ -423,6 +446,34 @@ pub fn local_stack_storage() -> StorageBackend {
         allow_http: true,
         ..Default::default()
     })
+}
+
+/// Split an `s3://<bucket>/<key>` (or `s3a://`) URI into its bucket and key.
+pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {
+    let without_scheme = uri
+        .strip_prefix("s3://")
+        .or_else(|| uri.strip_prefix("s3a://"))
+        .unwrap_or_else(|| panic!("expected an s3/s3a URI, got: {uri}"));
+    without_scheme
+        .split_once('/')
+        .unwrap_or_else(|| panic!("expected a <bucket>/<key> URI, got: {uri}"))
+}
+
+/// S3 object store for `bucket` via the shared [`local_stack_storage`] backend.
+pub fn local_stack_s3_store(bucket: &str) -> object_store::aws::AmazonS3 {
+    let StorageBackend::S3(storage) = local_stack_storage() else {
+        panic!("local_stack_storage() must be S3 to build a MinIO object store")
+    };
+    object_store::aws::AmazonS3Builder::new()
+        .with_bucket_name(bucket)
+        .with_region(&storage.region)
+        .with_access_key_id(&storage.access_key)
+        .with_secret_access_key(&storage.secret_key)
+        .with_endpoint(&storage.endpoint)
+        .with_allow_http(storage.allow_http)
+        .with_virtual_hosted_style_request(!storage.path_style)
+        .build()
+        .unwrap_or_else(|e| panic!("configure MinIO object store for bucket '{bucket}': {e}"))
 }
 
 /// `CatalogProps` for the host-visible local Docker stack, for `table`.

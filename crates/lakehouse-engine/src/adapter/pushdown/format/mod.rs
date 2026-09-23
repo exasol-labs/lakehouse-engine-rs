@@ -3,14 +3,17 @@
 
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
     CatalogProps, CatalogSession, CatalogTable, ConnectionCreds, StorageBackend, TableFormat,
     UnityCatalogSession,
 };
+use object_store::ObjectStore;
 use serde_json::Value as Json;
 
+use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 
@@ -20,11 +23,13 @@ mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
 mod iceberg;
+mod parquet_format_reader;
 
 use delta_format_reader::DeltaFormatReader;
 use iceberg::IcebergFormatReader;
 #[cfg(test)]
 pub(crate) use iceberg::build_logical_schema;
+use parquet_format_reader::ParquetFormatReader;
 
 #[cfg(test)]
 #[path = "format_tests.rs"]
@@ -105,6 +110,12 @@ pub enum ScanSource<'a> {
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
     },
+    /// A directory of raw Parquet files; no catalog table metadata, since this source loads no table.
+    DirectParquet {
+        store: &'a Arc<dyn ObjectStore>,
+        table_root: &'a str,
+        merge_mode: MergeMode,
+    },
 }
 
 /// The CONNECTION's static storage decision, threaded together because its three
@@ -156,5 +167,12 @@ pub fn format_reader<'a>(
             }
             Ok(Box::new(DeltaFormatReader::new(session, table, connection)))
         }
+        ScanSource::DirectParquet {
+            store,
+            table_root,
+            merge_mode,
+        } => Ok(Box::new(ParquetFormatReader::new(
+            store, table_root, merge_mode, connection,
+        ))),
     }
 }

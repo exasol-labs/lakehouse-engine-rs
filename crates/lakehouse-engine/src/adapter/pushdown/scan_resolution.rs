@@ -1,15 +1,23 @@
 //! Per-request table resolution: the pushdown path's ONE catalog-kind match, and
 //! the ONE thing the pipeline learns about a table.
 
+use std::sync::Arc;
+
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
     CatalogClient, CatalogProps, CatalogSession, CatalogTableIdent, UnityCatalogSession,
     parse_table_ident,
 };
+use object_store::ObjectStore;
 use serde_json::Value as Json;
 
 use super::{ConnectionStorage, ResolvedScan, ScanSource, format_reader};
 use crate::adapter::catalog_kind::CatalogKind;
+use crate::adapter::direct_storage_properties::{
+    join_storage_path, resolve_direct_storage_properties,
+};
+use crate::adapter::parquet_directory::MergeMode;
+use crate::scan::{build_admission_limited_store, store_root_url};
 
 #[cfg(test)]
 #[path = "scan_resolution_tests.rs"]
@@ -44,6 +52,12 @@ enum RequestSession {
     /// Boxed: a Unity Catalog session is several times the size of an Iceberg
     /// one, and a request holds exactly one session either way.
     Unity(Box<UnityCatalogSession>),
+    /// No catalog: the object store itself takes the session's role, bounding the whole request under one admission limiter.
+    DirectStorage {
+        store: Arc<dyn ObjectStore>,
+        base_path: String,
+        merge_mode: MergeMode,
+    },
 }
 
 impl<'a> TableScanResolver<'a> {
@@ -62,11 +76,14 @@ impl<'a> TableScanResolver<'a> {
     /// Iceberg arm resolves its `/v1/config` prefix over the network, so an
     /// identifier checked afterwards would surface a transport error from an
     /// unreachable catalog rather than the parse error it is.
+    ///
+    /// `props`: the merged virtual-schema properties; each kind's arm reads only the property names it declares.
     pub(super) async fn for_request(
         kind: CatalogKind,
         catalog_uri: &str,
         connection: ConnectionStorage<'a>,
         table_identifiers: &[&str],
+        props: &Json,
     ) -> Result<Self, UdfError> {
         let session = match kind {
             CatalogKind::IcebergRest => {
@@ -91,6 +108,22 @@ impl<'a> TableScanResolver<'a> {
                     connection.creds.clone(),
                 )))
             }
+            CatalogKind::DirectStorage => {
+                for identifier in table_identifiers {
+                    direct_storage_directory(identifier)?;
+                }
+                let properties = resolve_direct_storage_properties(props, catalog_uri)?;
+                let store = build_admission_limited_store(
+                    connection.storage,
+                    &store_root_url(&properties.base_path)?,
+                    &connection.storage.secret_values(),
+                )?;
+                RequestSession::DirectStorage {
+                    store,
+                    base_path: properties.base_path,
+                    merge_mode: MergeMode::for_merge_schema(properties.merge_schema),
+                }
+            }
         };
         Ok(Self {
             session,
@@ -102,10 +135,11 @@ impl<'a> TableScanResolver<'a> {
     /// they were resolved THROUGH, its logical schema, its table root, its name
     /// mapping, and its partition columns.
     ///
-    /// `table_identifier` is the original-cased, dot-joined catalog identifier
-    /// recorded in `TABLE_MAP` at create time. `filter_json` is the request's raw
-    /// filter, forwarded unchanged so each format prunes by it wherever its own
-    /// planning can; `None` prunes nothing.
+    /// `table_identifier` is the original-cased identifier recorded in `TABLE_MAP` at
+    /// create time — dot-joined under a catalog kind, a bare directory name under
+    /// direct storage. `filter_json` is the request's raw filter, forwarded unchanged
+    /// so each format prunes by it wherever its own planning can; `None` prunes
+    /// nothing.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
@@ -139,8 +173,46 @@ impl<'a> TableScanResolver<'a> {
                 )?;
                 reader.resolve_scan(filter_json).await
             }
+            RequestSession::DirectStorage {
+                store,
+                base_path,
+                merge_mode,
+            } => {
+                let table_root =
+                    join_storage_path(base_path, Some(direct_storage_directory(table_identifier)?));
+                let reader = format_reader(
+                    ScanSource::DirectParquet {
+                        store,
+                        table_root: &table_root,
+                        merge_mode: *merge_mode,
+                    },
+                    &self.connection,
+                )?;
+                reader.resolve_scan(filter_json).await
+            }
         }
     }
+}
+
+/// The bare, un-split directory name (it may itself contain a dot); empty, separator-carrying, or relative-path values are refused, since they'd compose a table root outside the storage base path.
+fn direct_storage_directory(table_identifier: &str) -> Result<&str, UdfError> {
+    let refusal = |reason: &str| {
+        Err(UdfError::User(format!(
+            "pushdown: the recorded catalog identifier '{table_identifier}' names no \
+             first-level directory under the storage base path — {reason}; drop and \
+             recreate the virtual schema"
+        )))
+    };
+    if table_identifier.trim().is_empty() {
+        return refusal("it is empty");
+    }
+    if table_identifier.contains('/') || table_identifier.contains('\\') {
+        return refusal("it carries a path separator");
+    }
+    if table_identifier == "." || table_identifier == ".." {
+        return refusal("it names a relative path rather than a directory");
+    }
+    Ok(table_identifier)
 }
 
 /// Recover a Unity Catalog table's identity from the dot-joined identifier

@@ -5,7 +5,10 @@
 pub mod capabilities;
 pub mod catalog_kind;
 pub mod connection;
+pub mod direct_storage;
+pub mod direct_storage_properties;
 pub mod iceberg_predicate;
+pub mod parquet_directory;
 pub mod pushdown;
 #[cfg(test)]
 #[path = "pushdown_surface_probe_tests.rs"]
@@ -17,6 +20,8 @@ use crate::adapter::capabilities::get_capabilities_response;
 use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
+use crate::adapter::direct_storage::DirectStorageCatalogClient;
+use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::pushdown::handle_pushdown;
 use crate::adapter::tables::{catalog_identifier_string, flatten_table_name};
 use crate::scan::sealed::SealedStorageKey;
@@ -240,11 +245,16 @@ fn handle_create_virtual_schema(
     // single `CATALOG_KIND` parse, reused below for `construct_catalog_client`.
     let config = resolve_connection_config(ctx, &props)?;
 
-    let namespace = nonempty_str(&props, PROP_NAMESPACE)
-        .ok_or_else(|| UdfError::User(format!("property '{PROP_NAMESPACE}' is required")))?
-        .to_string();
-
-    let configured_ns: Vec<String> = namespace.split('.').map(|s| s.to_string()).collect();
+    // `NAMESPACE` is optional under direct storage: its CONNECTION address alone already denotes a complete storage subtree.
+    let configured_ns: Vec<String> = match config.catalog_kind {
+        CatalogKind::DirectStorage => Vec::new(),
+        _ => {
+            let namespace = nonempty_str(&props, PROP_NAMESPACE).ok_or_else(|| {
+                UdfError::User(format!("property '{PROP_NAMESPACE}' is required"))
+            })?;
+            namespace.split('.').map(|s| s.to_string()).collect()
+        }
+    };
 
     let nr_of_cores = resolve_nr_of_cores();
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
@@ -273,13 +283,15 @@ fn handle_create_virtual_schema(
         .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
 
     // The ONLY site that matches `CatalogKind`; after it the listing pipeline is
-    // identical for both kinds and never asks which catalog it holds.
+    // identical for all three kinds and never asks which catalog it holds.
     let client = construct_catalog_client(
         config.catalog_kind,
         config.catalog_uri,
         config.storage.clone(),
         config.creds,
-    );
+        &props,
+    )
+    .map_err(|e| redact_error(&config.storage, e))?;
     let listing = rt
         .block_on(async { client.list_tables(&configured_ns).await })
         .map_err(|e| redact_error(&config.storage, e))?;
@@ -317,9 +329,6 @@ fn handle_create_virtual_schema(
     Ok(build_schema_response(request, schema_metadata))
 }
 
-/// The operator-facing warning for one entry the catalog client declined to
-/// list. The wording is chosen from the entry's neutral reason and never from
-/// the catalog kind, which this side of the pipeline never learns.
 fn skip_warning(entry: &SkippedTable) -> String {
     match &entry.reason {
         SkipReason::NotLoadableIcebergTable => format!(
@@ -330,6 +339,10 @@ fn skip_warning(entry: &SkippedTable) -> String {
             "createVirtualSchema: skipping non-Delta-base entry '{}' ({})",
             catalog_identifier_string(&entry.ident),
             detail
+        ),
+        SkipReason::NoDataFile => format!(
+            "createVirtualSchema: skipping directory '{}' (holds no data file)",
+            catalog_identifier_string(&entry.ident)
         ),
     }
 }
@@ -562,20 +575,39 @@ fn build_table_map(
 type VirtualTables = (Vec<Json>, Vec<(String, String)>, Vec<SkippedTable>);
 
 /// The SINGLE site that matches a [`CatalogKind`]: it selects and constructs the
-/// matching [`CatalogClient`] and is the only place the two kinds diverge. Every
+/// matching [`CatalogClient`] and is the only place the three kinds diverge. Every
 /// listing operation after it runs one shared pipeline that never re-matches the
-/// kind — a third kind is a build failure here, not a silently-missed branch.
+/// kind — a fourth kind is a build failure here, not a silently-missed branch.
+///
+/// `props` lets the direct-storage arm alone resolve `NAMESPACE`, `MERGE_SCHEMA`, and `HIVE_PARTITIONING`; fallible because opening the object store can fail.
 fn construct_catalog_client(
     kind: CatalogKind,
     catalog_uri: String,
     storage: StorageBackend,
     creds: ConnectionCreds,
-) -> Box<dyn CatalogClient> {
+    props: &Json,
+) -> Result<Box<dyn CatalogClient>, UdfError> {
     match kind {
-        CatalogKind::IcebergRest => {
-            Box::new(IcebergRestCatalogClient::new(catalog_uri, storage, creds))
+        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(
+            catalog_uri,
+            storage,
+            creds,
+        ))),
+        CatalogKind::UnityCatalogNative => {
+            Ok(Box::new(UnityCatalogSession::new(&catalog_uri, creds)))
         }
-        CatalogKind::UnityCatalogNative => Box::new(UnityCatalogSession::new(&catalog_uri, creds)),
+        CatalogKind::DirectStorage => {
+            let resolved =
+                direct_storage_properties::resolve_direct_storage_properties(props, &catalog_uri)?;
+            let secrets = storage.secret_values();
+            let client = DirectStorageCatalogClient::new(
+                &storage,
+                &resolved.base_path,
+                MergeMode::for_merge_schema(resolved.merge_schema),
+                &secrets,
+            )?;
+            Ok(Box::new(client))
+        }
     }
 }
 
