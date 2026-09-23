@@ -662,20 +662,14 @@ fn static_store_address_is_reachable_and_declares_no_credential_field() {
     assert_static_store_address_declares_no_credential_field();
 }
 
-/// The vended policy steps `storage.rs` now owns are mechanism, not surface: the
-/// two construction functions, the three derivations they read a location
-/// through, and the neutral `VendedS3` both selectors reduce their own wire shape
-/// to. Moving them into one shared home widened nothing — a `pub` on any of them,
-/// or a `lib.rs` re-export, would turn an internal refactor into a permanent API
-/// obligation. Each is asserted here and nowhere else:
-/// `demoted_and_deleted_functions_are_not_declared_public` covers their deleted
-/// predecessors instead.
+/// These vended-storage mechanism steps must stay crate-private; a `pub` or a
+/// `lib.rs` re-export turns an internal refactor into a permanent API. Excludes
+/// `scheme_of`, which `connection.rs` legitimately reuses outside vended policy.
 #[test]
 fn shared_vended_policy_steps_are_not_public() {
-    const SHARED_STEPS: [(&str, &str); 6] = [
+    const SHARED_STEPS: [(&str, &str); 5] = [
         ("pub fn s3_backend", "s3_backend"),
         ("pub fn adls_backend", "adls_backend"),
-        ("pub fn scheme_of", "scheme_of"),
         ("pub fn location_host", "location_host"),
         ("pub fn adls_account_name", "adls_account_name"),
         ("pub struct VendedS3", "VendedS3"),
