@@ -35,14 +35,14 @@ require() {
   done
 }
 
-# Build the VS_EXTRA_PROPS string: NR_OF_CORES + PARALLELISM_FACTOR, and optionally
-# ALLOW_HTTP for targets that use plain-HTTP catalogs/storage (docker only).
-# Args: allow_http (true|false) nr_of_cores parallelism_factor
+# Build the VS_EXTRA_PROPS string: PARALLELISM_FACTOR, and optionally ALLOW_HTTP for
+# targets that use plain-HTTP catalogs/storage (docker only).
+# Args: allow_http (true|false) parallelism_factor
 build_vs_extra_props() {
-  local allow_http="$1" nr_of_cores="$2" parallelism_factor="$3"
+  local allow_http="$1" parallelism_factor="$2"
   local props
-  props="$(printf "\n  NR_OF_CORES         = '%s'\n  PARALLELISM_FACTOR  = '%s'" \
-    "${nr_of_cores}" "${parallelism_factor}")"
+  props="$(printf "\n  PARALLELISM_FACTOR  = '%s'" \
+    "${parallelism_factor}")"
   [ "$allow_http" = "true" ] && \
     props="$(printf "\n  ALLOW_HTTP          = 'true'")${props}"
   # Sweep knobs (Task 7.1): append DataFusion threading props only when set in env,
@@ -144,21 +144,21 @@ if [ "${1:-}" = "selftest" ]; then
     *'"path_style":true'*'"use_sigv4":false'*) ;; *) echo "FAIL: local password shape"; exit 1;; esac
   if (require __DEFINITELY_UNSET_VAR__ >/dev/null 2>&1); then echo "FAIL: require passed on unset"; exit 1; fi
   # build_vs_extra_props: docker path includes ALLOW_HTTP; remote path does not.
-  docker_props="$(build_vs_extra_props true 8 16)"
-  case "$docker_props" in *"ALLOW_HTTP"*"NR_OF_CORES"*"'8'"*"PARALLELISM_FACTOR"*"'16'"*) ;; \
+  docker_props="$(build_vs_extra_props true 16)"
+  case "$docker_props" in *"ALLOW_HTTP"*"PARALLELISM_FACTOR"*"'16'"*) ;; \
     *) echo "FAIL: docker vs_extra_props shape: $docker_props"; exit 1;; esac
-  remote_props="$(build_vs_extra_props false 8 8)"
+  remote_props="$(build_vs_extra_props false 8)"
   case "$remote_props" in *"ALLOW_HTTP"*) echo "FAIL: remote vs_extra_props must not contain ALLOW_HTTP: $remote_props"; exit 1;; esac
-  case "$remote_props" in *"NR_OF_CORES"*"'8'"*"PARALLELISM_FACTOR"*"'8'"*) ;; \
+  case "$remote_props" in *"PARALLELISM_FACTOR"*"'8'"*) ;; \
     *) echo "FAIL: remote vs_extra_props shape: $remote_props"; exit 1;; esac
   # S3_MAX_CONNECTIONS is appended only when the env knob is set (default run omits it).
   case "$remote_props" in *"S3_MAX_CONNECTIONS"*) echo "FAIL: S3_MAX_CONNECTIONS must be absent when unset: $remote_props"; exit 1;; esac
-  s3_props="$(BENCH_S3_MAX_CONNECTIONS=64 build_vs_extra_props false 8 1)"
+  s3_props="$(BENCH_S3_MAX_CONNECTIONS=64 build_vs_extra_props false 1)"
   case "$s3_props" in *"PARALLELISM_FACTOR"*"'1'"*"S3_MAX_CONNECTIONS"*"'64'"*) ;; \
     *) echo "FAIL: S3_MAX_CONNECTIONS append shape: $s3_props"; exit 1;; esac
   # DATAFUSION_BATCH_SIZE is appended only when the env knob is set (default run omits it).
   case "$remote_props" in *"DATAFUSION_BATCH_SIZE"*) echo "FAIL: DATAFUSION_BATCH_SIZE must be absent when unset: $remote_props"; exit 1;; esac
-  bs_props="$(BENCH_DF_BATCH_SIZE=131072 build_vs_extra_props false 8 8)"
+  bs_props="$(BENCH_DF_BATCH_SIZE=131072 build_vs_extra_props false 8)"
   case "$bs_props" in *"PARALLELISM_FACTOR"*"'8'"*"DATAFUSION_BATCH_SIZE"*"'131072'"*) ;; \
     *) echo "FAIL: DATAFUSION_BATCH_SIZE append shape: $bs_props"; exit 1;; esac
   # delete_header_suffix: empty when OFF, "deletes=on ns=<ns>" when ON.
@@ -364,10 +364,12 @@ case "$TARGET" in
     NAMESPACE="${NAMESPACE:-tpch}"
     CATALOG_URI="http://iceberg-rest:8181"          # internal: reachable from the UDF
     CONN_PW="$(build_conn_password_local)"
-    # http catalog/S3 + parallelism knobs. NR_OF_CORES (new VS property) drives the
-    # DataFusion target-partitions / threads-per-UDF defaults so scans use the cores;
-    # multi-file tables (loader) + PARALLELISM_FACTOR drive the GROUP BY shard_key fan-out.
-    VS_EXTRA_PROPS="$(build_vs_extra_props true "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
+    # http catalog/S3 + parallelism knobs. The adapter auto-detects the core count
+    # (std::thread::available_parallelism(), which in docker mode reports the CPU set
+    # LH_EXASOL_CPUSET pins the container to) and derives the DataFusion
+    # target-partitions / threads-per-UDF defaults from it; multi-file tables (loader)
+    # + PARALLELISM_FACTOR drive the GROUP BY shard_key fan-out.
+    VS_EXTRA_PROPS="$(build_vs_extra_props true "${BENCH_PARALLELISM_FACTOR:-8}")"
     PROFILE_ON=0
     echo "== docker: bringing up local stack (minio, iceberg-rest, exasol) =="
     docker compose up -d
@@ -401,7 +403,7 @@ case "$TARGET" in
     HOST="$EXASOL_HOST"
     SYS_PASS="$EXASOL_SYS_PASSWORD"
     export BUCKETFS_WRITE_PASS                      # make's $(shell) reads it from the environment
-    VS_EXTRA_PROPS="$(build_vs_extra_props "$CATALOG_ALLOW_HTTP" "${BENCH_NR_OF_CORES:-4}" "${BENCH_PARALLELISM_FACTOR:-8}")"
+    VS_EXTRA_PROPS="$(build_vs_extra_props "$CATALOG_ALLOW_HTTP" "${BENCH_PARALLELISM_FACTOR:-8}")"
     PROFILE_ON="${BENCH_PROFILE:-1}"
     ;;
   *) echo "ERROR: BENCH_TARGET must be 'docker' or 'remote' (got '$TARGET')"; exit 1;;

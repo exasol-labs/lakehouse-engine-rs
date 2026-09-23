@@ -34,8 +34,8 @@ use common::seed::{
     typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use common::stack::{
-    build_create_connection_sql, iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog,
-    wait_for_minio,
+    build_create_connection_sql, exasol_container, iceberg_catalog_url, wait_for_exasol,
+    wait_for_iceberg_catalog, wait_for_minio,
 };
 
 use lakehouse_catalog::CatalogSession;
@@ -48,6 +48,10 @@ use std::sync::OnceLock;
 // ---------------------------------------------------------------------------
 
 const VS_NAME: &str = "MY_LAKEHOUSE";
+
+/// A second VS, created with `PARALLELISM_FACTOR = '1'` so its recorded
+/// `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
+const CPU_PROBE_VS_NAME: &str = "LHVS_CPU_PROBE";
 
 // ---------------------------------------------------------------------------
 // One-time setup
@@ -1286,10 +1290,10 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
-/// After createVirtualSchema the schema's adapterNotes carry PARALLELISM_FACTOR
-/// and NR_OF_CORES, but no CLUSTER_NODES key — the node count is no longer
-/// persisted in adapterNotes at all; `pushdown` now reads it live from
-/// `UdfContext::node_count()` on every request instead.
+/// After createVirtualSchema the schema's adapterNotes carry PARALLELISM_FACTOR,
+/// but no NR_OF_CORES or CLUSTER_NODES key: `pushdown` reads the node count live
+/// from `UdfContext::node_count()` per request, and nothing reads the per-node
+/// core count back — the adapter discards it once budgets are derived.
 ///
 /// Queries SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES — the observable catalog
 /// column for adapter-controlled schema state. Exasol does NOT persist
@@ -1333,8 +1337,9 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
         "ADAPTER_NOTES must carry PARALLELISM_FACTOR: {notes:?}"
     );
     assert!(
-        parsed.get("NR_OF_CORES").is_some(),
-        "ADAPTER_NOTES must carry NR_OF_CORES: {notes:?}"
+        parsed.get("NR_OF_CORES").is_none(),
+        "ADAPTER_NOTES must NOT carry NR_OF_CORES (the per-node core count is a \
+         derivation input the adapter discards, never a persisted note): {notes:?}"
     );
     assert!(
         parsed.get("CLUSTER_NODES").is_none(),
@@ -1342,6 +1347,110 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
          from UdfContext::node_count() per pushdown request, never persisted): \
          {notes:?}"
     );
+}
+
+/// The adapter VM's core count comes from the Exasol container's CPU set, not
+/// the unconstrained host: a probe VS created with `PARALLELISM_FACTOR = '1'`
+/// records the detected core count unchanged as `DF_THREADS_PER_UDF`, read back
+/// from the container's own cgroup rather than this process's environment.
+///
+/// Replaces `adapter_detects_container_cpu_quota`, which used a CFS bandwidth
+/// quota instead — invisible to the UDF sandbox since it mounts no cgroup
+/// filesystem; a CPU affinity limit does reach it.
+#[test]
+fn adapter_detects_container_cpuset() {
+    setup_e2e();
+
+    let cpuset_cores = exasol_container_cpuset_cores();
+    let host_cores = std::thread::available_parallelism()
+        .expect("the test host must report a core count")
+        .get();
+    assert!(
+        cpuset_cores < host_cores,
+        "PRECONDITION UNMET: the Exasol container's CPU set must name fewer CPUs \
+         ({cpuset_cores}) than this host's core count ({host_cores}). At an equal \
+         cardinality the assertion below holds whether the adapter reads the \
+         container's CPU set or the unconstrained host, so it would record no \
+         evidence. Narrow LH_EXASOL_CPUSET to a smaller set of CPUs and recreate \
+         the container."
+    );
+
+    let mut conn = exa_conn();
+    create_virtual_schema(
+        &mut conn,
+        &VsProps::new(CPU_PROBE_VS_NAME, E2E_NAMESPACE).with_parallelism_factor(1),
+    );
+
+    let cols = conn.query_columns(&format!(
+        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS \
+         WHERE SCHEMA_NAME = '{CPU_PROBE_VS_NAME}'"
+    ));
+    let notes = cols
+        .first()
+        .and_then(|col| col.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("{CPU_PROBE_VS_NAME} must have ADAPTER_NOTES: {cols:?}"));
+    let parsed: serde_json::Value = serde_json::from_str(notes)
+        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be valid JSON ({e}): {notes:?}"));
+    let detected: usize = parsed["DF_THREADS_PER_UDF"]
+        .as_str()
+        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry DF_THREADS_PER_UDF: {notes:?}"))
+        .parse()
+        .unwrap_or_else(|e| panic!("DF_THREADS_PER_UDF must be an integer ({e}): {notes:?}"));
+
+    assert_eq!(
+        detected, cpuset_cores,
+        "at PARALLELISM_FACTOR = '1' the recorded DF_THREADS_PER_UDF is the core \
+         count the adapter VM detected; it must equal the number of CPUs in the \
+         container's CPU set ({cpuset_cores}), and so be neither the \
+         undetectable-platform fallback of 1 nor the host's {host_cores} cores"
+    );
+}
+
+/// Number of CPUs the Exasol container's effective CPU set names, read from
+/// `/sys/fs/cgroup/cpuset.cpus.effective` inside the container (a
+/// comma-separated list of CPU ids and inclusive ranges, e.g. `0-1` or
+/// `0,2-3`) rather than from this process's environment.
+fn exasol_container_cpuset_cores() -> usize {
+    let container = exasol_container();
+    let path = "/sys/fs/cgroup/cpuset.cpus.effective";
+    let out = std::process::Command::new("docker")
+        .args(["exec", &container, "cat", path])
+        .output()
+        .unwrap_or_else(|e| panic!("docker exec {container} to read {path}: {e}"));
+    assert!(
+        out.status.success(),
+        "reading {path} in {container} failed ({status}): {stderr}",
+        status = out.status,
+        stderr = String::from_utf8_lossy(&out.stderr).trim()
+    );
+    let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    assert!(
+        !raw.is_empty(),
+        "{path} in {container} is empty, so the container is pinned to no CPU at \
+         all — set LH_EXASOL_CPUSET to a set of CPUs this host has and recreate \
+         the container"
+    );
+    raw.split(',')
+        .map(|entry| {
+            let (first, last) = entry.split_once('-').unwrap_or((entry, entry));
+            let cpu_id = |bound: &str| {
+                bound.parse::<usize>().unwrap_or_else(|e| {
+                    panic!(
+                        "{path} in {container} reads {raw:?}, whose entry {entry:?} is \
+                         neither a CPU id nor an inclusive range of them ({e})"
+                    )
+                })
+            };
+            let (first, last) = (cpu_id(first), cpu_id(last));
+            assert!(
+                first <= last,
+                "{path} in {container} reads {raw:?}, whose entry {entry:?} names a \
+                 descending range"
+            );
+            last - first + 1
+        })
+        .sum()
 }
 
 /// Even with CLUSTER_NODES no longer persisted in adapterNotes,

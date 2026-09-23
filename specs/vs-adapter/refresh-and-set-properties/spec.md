@@ -30,10 +30,10 @@ The Exasol virtual-schema JSON protocol sends a `refresh` request for `ALTER VIR
 
 ### Scenario: Refresh rebuilds the table map and preserves other adapter notes
 
-* *GIVEN* a `refresh` request whose `schemaMetadataInfo.adapterNotes` carries the persisted notes from creation (`NR_OF_CORES`, `PARALLELISM_FACTOR`, the DataFusion threading and memory-budget entries, and `TABLE_MAP`)
+* *GIVEN* a `refresh` request whose `schemaMetadataInfo.adapterNotes` carries the persisted notes from creation (`PARALLELISM_FACTOR`, the DataFusion threading and memory-budget entries, and `TABLE_MAP`)
 * *WHEN* the adapter builds the `refresh` response
 * *THEN* the adapter SHALL rebuild `TABLE_MAP` from the re-enumerated tables — a full rebuild, never a diff or patch of the prior map
-* *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry when writing the rebuilt `TABLE_MAP`
+* *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry when writing the rebuilt `TABLE_MAP`, including an entry the adapter does not itself write, which survives the rebuild unread and inert
 * *AND* the adapter MUST NOT persist the map anywhere other than the returned `schemaMetadata.adapterNotes`
 
 ### Scenario: Refresh echoes requestedTables when present

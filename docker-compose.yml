@@ -114,9 +114,11 @@ services:
   exasol:
     image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.1.16}"
     privileged: true
-    # Give Exasol multiple CPUs so the scan UDF's shard fan-out + DataFusion
-    # threading have cores to run on (the live-smoke test exercises this).
-    cpus: "${LH_EXASOL_CPUS:-4}"
+    # Pin to a CPU set, not a CFS bandwidth quota (`cpus:`): the UDF sandbox
+    # mounts no cgroup filesystem, so only a CPU affinity limit is visible to
+    # the adapter VM's core-count detection (issue #421). Host must have at
+    # least as many CPUs as this set names.
+    cpuset: "${LH_EXASOL_CPUSET:-0-3}"
     # 2g (was 1g): the UDF script VM needs far more than Docker's 64 MB
     # default once it actually spawns a UDF sandbox — which this stack's E2E
     # suite does (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN), unlike sibling stacks

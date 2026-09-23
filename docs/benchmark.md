@@ -51,7 +51,6 @@ Other configuration variables include:
 
 - `BENCH_WITH_DELETES` — re-runs the suite against 5%-position-deleted Iceberg v2 merge-on-read
   copies
-- `BENCH_NR_OF_CORES`
 - `BENCH_PARALLELISM_FACTOR`
 - the `BENCH_DF_*` DataFusion threading variables
 - `BENCH_S3_MAX_CONNECTIONS`

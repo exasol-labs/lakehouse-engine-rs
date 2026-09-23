@@ -505,13 +505,14 @@ jobs:
     # (same rationale as build-so's timeout).
     timeout-minutes: 45
     env:
-      # Standard GitHub-hosted runners have 2 vCPUs; docker-compose.yml's
-      # exasol service default (4) exceeds what Docker will accept ("range of
-      # CPUs is from 0.01 to 2.00, as there are only 2 CPUs available").
-      LH_EXASOL_CPUS: "2"
       # Selects the matrix leg's Exasol image; docker-compose.yml's exasol
       # service reads this with a 2025.1.16 fallback.
       EXASOL_IMAGE: ${{ matrix.image }}
+      # Caps the Exasol container the same way the other E2E jobs do. Hosted
+      # runners have more than 2 vCPUs, so this also satisfies
+      # `adapter_detects_container_cpuset`'s precondition that the container's
+      # CPU set names strictly fewer CPUs than the runner has.
+      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -617,8 +618,11 @@ jobs:
     # `e2e`'s budget rather than needing more.
     timeout-minutes: 45
     env:
-      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
-      LH_EXASOL_CPUS: "2"
+      # Caps the Exasol container the same way the `e2e` job does, but with no
+      # runtime measurement step: this job's test binary carries no
+      # container-affinity assertion, so the CPU set only has to fit a hosted
+      # runner.
+      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -720,8 +724,11 @@ jobs:
     # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`.
     timeout-minutes: 45
     env:
-      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
-      LH_EXASOL_CPUS: "2"
+      # Caps the Exasol container the same way the `e2e` job does, but with no
+      # runtime measurement step: this job's test binary carries no
+      # container-affinity assertion, so the CPU set only has to fit a hosted
+      # runner.
+      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -823,8 +830,11 @@ jobs:
     # cost here is real-cloud round-trips, not extra local services.
     timeout-minutes: 45
     env:
-      # See the `e2e` job's identical override — same 2-vCPU hosted-runner cap.
-      LH_EXASOL_CPUS: "2"
+      # Caps the Exasol container the same way the `e2e` job does, but with no
+      # runtime measurement step: this job's test binary carries no
+      # container-affinity assertion, so the CPU set only has to fit a hosted
+      # runner.
+      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
