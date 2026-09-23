@@ -3,6 +3,7 @@ use crate::adapter::catalog_kind::CatalogKind;
 use crate::scan::spec::{AdlsCred, StorageProps};
 use exasol_udf_sdk::connect_back::ConnectionObject;
 use exasol_udf_sdk::test_support::TestContext;
+use lakehouse_catalog::{StaticStoreAddress, StorageCreds};
 
 // ---------------------------------------------------------------------------
 // TestContext construction helpers for unit tests
@@ -877,11 +878,15 @@ fn s3_fields_optional_when_not_sigv4() {
     read_connection(&ctx2, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
 }
 
-/// When SigV4 is enabled, access_key, secret_key, and region are required.
+/// When SigV4 is enabled, access_key, secret_key, and a signing region are required.
+///
+/// Covers spec scenario "When SigV4 is enabled, access_key, secret_key, and a signing
+/// region are required" (`vs-adapter/connection-credentials`).
 ///
 /// Asserts:
 /// - Missing any of the three fields with use_sigv4=true → rejected; error names the
 ///   missing field(s) and references SigV4; no value leaked.
+/// - The error also states the Glue-endpoint alternative when it names `region`.
 /// - Fires identically when use_vended_credentials is also true.
 /// - A missing `endpoint` alone does NOT trigger rejection under SigV4.
 #[test]
@@ -911,6 +916,10 @@ fn sigv4_requires_access_secret_region() {
         "must reference SigV4: {msg}"
     );
     assert!(!msg.contains("s3cr3t-VALUE"), "must not leak value: {msg}");
+    assert!(
+        !msg.contains("https://glue.<region>.amazonaws.com"),
+        "must not state the Glue-endpoint alternative when region is not named: {msg}"
+    );
 
     // --- Missing secret_key ---
     let pw = make_pw(serde_json::json!({
@@ -926,6 +935,10 @@ fn sigv4_requires_access_secret_region() {
         "must reference SigV4: {msg}"
     );
     assert!(!msg.contains("AKID-VALUE"), "must not leak value: {msg}");
+    assert!(
+        !msg.contains("https://glue.<region>.amazonaws.com"),
+        "must not state the Glue-endpoint alternative when region is not named: {msg}"
+    );
 
     // --- Missing region ---
     let pw = make_pw(serde_json::json!({
@@ -941,6 +954,10 @@ fn sigv4_requires_access_secret_region() {
         "must reference SigV4: {msg}"
     );
     assert!(!msg.contains("s3cr3t-VALUE"), "must not leak value: {msg}");
+    assert!(
+        msg.contains("https://glue.<region>.amazonaws.com"),
+        "must state the Glue-endpoint alternative when region is named: {msg}"
+    );
 
     // --- Fires also when use_vended_credentials = true ---
     let pw = serde_json::json!({
@@ -961,6 +978,10 @@ fn sigv4_requires_access_secret_region() {
     );
     assert!(!msg.contains("s3cr3t-VALUE"), "must not leak value: {msg}");
     assert!(!msg.contains("AKID-VALUE"), "must not leak value: {msg}");
+    assert!(
+        msg.contains("https://glue.<region>.amazonaws.com"),
+        "must state the Glue-endpoint alternative when region is named: {msg}"
+    );
 
     // --- Missing endpoint alone does NOT trigger rejection ---
     let pw = serde_json::json!({
@@ -975,6 +996,164 @@ fn sigv4_requires_access_secret_region() {
     let ctx = with_conn("http://catalog.example.com", &pw);
     read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
         .expect("endpoint is optional under SigV4; must not be rejected");
+}
+
+/// A non-standard Glue-shaped host still requires a stated `region`.
+///
+/// Covers spec scenario "When SigV4 is enabled, access_key, secret_key, and a signing
+/// region are required" (`vs-adapter/connection-credentials`) for the non-standard
+/// address forms named in § Background: AWS GovCloud (US), AWS China, FIPS, a VPC
+/// interface endpoint, dual-stack, a private host, and a bare `http` address.
+#[test]
+fn sigv4_region_required_for_non_standard_glue_hosts() {
+    let non_standard_glue_addresses = [
+        "https://glue.us-gov-west-1.amazonaws.com",
+        "https://glue.cn-north-1.amazonaws.com.cn",
+        "https://glue-fips.us-east-1.amazonaws.com",
+        "https://vpce-0123456789abcdef0-abcd1234.glue.us-east-1.vpce.amazonaws.com",
+        "https://glue.us-east-1.api.aws",
+        "https://glue.internal.mycorp.example",
+        "http://glue.us-east-1.amazonaws.com",
+    ];
+
+    for address in non_standard_glue_addresses {
+        let pw = serde_json::json!({
+            "warehouse": "wh",
+            "use_sigv4": true,
+            "access_key": "AKID-VALUE",
+            "secret_key": "s3cr3t-VALUE"
+        })
+        .to_string();
+        let ctx = with_conn(address, &pw);
+        let result = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest);
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("{address} must still require region"),
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("region"),
+            "{address}: must name missing region: {msg}"
+        );
+        assert!(
+            !msg.contains("AKID-VALUE"),
+            "{address}: must not leak value: {msg}"
+        );
+        assert!(
+            !msg.contains("s3cr3t-VALUE"),
+            "{address}: must not leak value: {msg}"
+        );
+    }
+}
+
+/// A standard AWS Glue endpoint supplies the SigV4 signing region when `region`
+/// is omitted, and that derived region is NEVER written into `region` itself.
+///
+/// Covers spec scenario "A standard AWS Glue endpoint supplies the SigV4 signing
+/// region when the CONNECTION omits region" (`vs-adapter/connection-credentials`).
+#[test]
+fn sigv4_region_derived_from_standard_glue_endpoint_is_accepted() {
+    let pw = serde_json::json!({
+        "warehouse": "wh",
+        "use_sigv4": true,
+        "access_key": "AKID-VALUE",
+        "secret_key": "s3cr3t-VALUE"
+    })
+    .to_string();
+    let ctx = with_conn("https://glue.eu-west-1.amazonaws.com/iceberg", &pw);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("a standard Glue endpoint must supply the signing region");
+
+    assert_eq!(resolved.creds.region, "");
+    assert_eq!(StorageCreds::from(&resolved.creds).region, "");
+    assert_eq!(StaticStoreAddress::from(&resolved.creds).region(), "");
+}
+
+/// The same derivation holds under `use_vended_credentials = true`: the derived
+/// signing region still places no store.
+///
+/// Covers spec scenario "Static storage credentials are ignored, not rejected,
+/// when vending is requested" (`vs-adapter/connection-credentials`), the clause
+/// that a signing region derived from the CONNECTION address places no store.
+#[test]
+fn sigv4_derived_region_places_no_store_under_vending() {
+    let pw = serde_json::json!({
+        "warehouse": "wh",
+        "use_sigv4": true,
+        "use_vended_credentials": true,
+        "access_key": "AKID-VALUE",
+        "secret_key": "s3cr3t-VALUE"
+    })
+    .to_string();
+    let ctx = with_conn("https://glue.eu-west-1.amazonaws.com/iceberg", &pw);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("a standard Glue endpoint must supply the signing region under vending");
+
+    assert_eq!(resolved.creds.region, "");
+    assert_eq!(StorageCreds::from(&resolved.creds).region, "");
+    assert_eq!(StaticStoreAddress::from(&resolved.creds).region(), "");
+}
+
+/// A Glue catalog and its tables' S3 bucket may sit in different AWS regions: the
+/// endpoint's own region always signs, while a stated `region` still places the store.
+///
+/// Covers spec scenario "A standard AWS Glue endpoint signs the catalog request
+/// even when the CONNECTION states a different region"
+/// (`vs-adapter/connection-credentials`).
+#[test]
+fn sigv4_cross_region_glue_and_s3_is_supported() {
+    let pw = serde_json::json!({
+        "warehouse": "wh",
+        "use_sigv4": true,
+        "access_key": "AKID-VALUE",
+        "secret_key": "s3cr3t-VALUE",
+        "region": "us-east-1"
+    })
+    .to_string();
+    let ctx = with_conn("https://glue.eu-west-1.amazonaws.com/iceberg", &pw);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("a stated region must not be rejected alongside a standard Glue endpoint");
+
+    assert_eq!(
+        resolved.creds.sigv4_signing_region(&resolved.uri),
+        Some("eu-west-1".to_string()),
+        "the endpoint's own region must sign, not the stated region"
+    );
+    assert_eq!(
+        StaticStoreAddress::from(&resolved.creds).region(),
+        "us-east-1",
+        "the stated region must still place the S3 store"
+    );
+}
+
+/// A non-standard endpoint is unaffected by this change: the stated `region` both
+/// signs and places the store, exactly as before.
+///
+/// Covers spec scenario "When SigV4 is enabled, access_key, secret_key, and a
+/// signing region are required" (`vs-adapter/connection-credentials`).
+#[test]
+fn sigv4_stated_region_used_for_non_standard_endpoint() {
+    let pw = serde_json::json!({
+        "warehouse": "wh",
+        "use_sigv4": true,
+        "access_key": "AKID-VALUE",
+        "secret_key": "s3cr3t-VALUE",
+        "region": "us-gov-west-1"
+    })
+    .to_string();
+    let ctx = with_conn("https://glue.us-gov-west-1.amazonaws.com", &pw);
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::IcebergRest)
+        .expect("a stated region must be accepted for a non-standard endpoint");
+
+    assert_eq!(
+        resolved.creds.sigv4_signing_region(&resolved.uri),
+        Some("us-gov-west-1".to_string()),
+        "the stated region must sign a non-standard endpoint's requests"
+    );
+    assert_eq!(
+        StaticStoreAddress::from(&resolved.creds).region(),
+        "us-gov-west-1"
+    );
 }
 
 /// Static bearer token is exposed on the resolved credentials.

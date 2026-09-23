@@ -135,3 +135,185 @@ fn disabled_sigv4_produces_unsigned_request() {
         "unsigned request must carry no x-amz-date header"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Signing-region resolution (ConnectionCreds::sigv4_signing_region)
+// ---------------------------------------------------------------------------
+
+fn creds_stating_region(region: &str) -> ConnectionCreds {
+    ConnectionCreds {
+        region: region.into(),
+        ..ConnectionCreds::default()
+    }
+}
+
+/// Standard commercial AWS Glue endpoint addresses, each with the region its
+/// host names: case, port, and path never affect the match.
+const STANDARD_GLUE_ENDPOINTS: [(&str, &str); 5] = [
+    ("https://glue.eu-west-1.amazonaws.com/iceberg", "eu-west-1"),
+    ("https://GLUE.EU-WEST-1.AMAZONAWS.COM/iceberg", "eu-west-1"),
+    (
+        "https://glue.eu-west-1.amazonaws.com:443/iceberg",
+        "eu-west-1",
+    ),
+    (
+        "https://glue.eu-west-1.amazonaws.com:8443/iceberg",
+        "eu-west-1",
+    ),
+    (
+        "https://glue.ap-southeast-2.amazonaws.com/iceberg",
+        "ap-southeast-2",
+    ),
+];
+
+/// Addresses that are not a standard commercial AWS Glue endpoint, labelled by
+/// the form each one represents.
+const NON_STANDARD_ADDRESSES: [(&str, &str); 18] = [
+    (
+        "GovCloud",
+        "https://glue.us-gov-west-1.amazonaws.com/iceberg",
+    ),
+    ("China", "https://glue.cn-north-1.amazonaws.com.cn/iceberg"),
+    ("FIPS", "https://glue-fips.us-east-1.amazonaws.com/iceberg"),
+    (
+        "VPC interface",
+        "https://vpce-0123456789abcdef0-abcdefgh.glue.us-east-1.vpce.amazonaws.com/iceberg",
+    ),
+    ("dual-stack", "https://glue.us-east-1.api.aws/iceberg"),
+    ("private host", "https://catalog.internal.example/iceberg"),
+    ("http scheme", "http://glue.us-east-1.amazonaws.com/iceberg"),
+    (
+        "userinfo form",
+        "https://glue.us-east-1.amazonaws.com@evil.example/",
+    ),
+    (
+        "trailing-dot host",
+        "https://glue.us-east-1.amazonaws.com./iceberg",
+    ),
+    (
+        "multi-label region",
+        "https://glue.us-east-1.extra.amazonaws.com/iceberg",
+    ),
+    (
+        "two-part region",
+        "https://glue.us-east.amazonaws.com/iceberg",
+    ),
+    (
+        "three-letter area",
+        "https://glue.use-east-1.amazonaws.com/iceberg",
+    ),
+    (
+        "non-digit ordinal",
+        "https://glue.us-east-x.amazonaws.com/iceberg",
+    ),
+    ("empty subarea", "https://glue.us--1.amazonaws.com/iceberg"),
+    (
+        "empty ordinal",
+        "https://glue.us-east-.amazonaws.com/iceberg",
+    ),
+    ("bare Glue domain", "https://glue.amazonaws.com/iceberg"),
+    ("empty URI", ""),
+    (
+        "unparseable URI",
+        "https://glue.us-east-1.amazonaws.com:99999/iceberg",
+    ),
+];
+
+/// Scenario: A standard AWS Glue endpoint supplies the SigV4 signing region
+/// when the CONNECTION omits region.
+#[test]
+fn standard_glue_endpoint_supplies_the_signing_region_when_none_is_stated() {
+    let creds = creds_stating_region("");
+
+    for (uri, expected) in STANDARD_GLUE_ENDPOINTS {
+        assert_eq!(
+            creds.sigv4_signing_region(uri).as_deref(),
+            Some(expected),
+            "a standard Glue endpoint must supply its own region: {uri}"
+        );
+    }
+}
+
+/// Scenario: A standard AWS Glue endpoint signs the catalog request even when
+/// the CONNECTION states a different region.
+#[test]
+fn standard_glue_endpoint_region_signs_even_when_a_different_region_is_stated() {
+    let creds = creds_stating_region("us-east-1");
+
+    assert_eq!(
+        creds
+            .sigv4_signing_region("https://glue.eu-west-1.amazonaws.com/iceberg")
+            .as_deref(),
+        Some("eu-west-1"),
+        "the endpoint's own region must sign, not the stated bucket region"
+    );
+}
+
+/// Scenario: When SigV4 is enabled, access_key, secret_key, and a signing
+/// region are required — no address form outside the standard Glue shape
+/// supplies a signing region on its own.
+#[test]
+fn non_standard_addresses_supply_no_signing_region() {
+    let creds = creds_stating_region("");
+
+    for (form, uri) in NON_STANDARD_ADDRESSES {
+        assert_eq!(
+            creds.sigv4_signing_region(uri),
+            None,
+            "a {form} address must not supply a signing region: {uri}"
+        );
+    }
+}
+
+/// Scenario: a non-standard address signs with the stated `region`, unaffected
+/// by the standard-Glue-endpoint rule.
+#[test]
+fn stated_region_signs_for_a_non_standard_address() {
+    let creds = creds_stating_region("us-gov-west-1");
+
+    for (form, uri) in NON_STANDARD_ADDRESSES {
+        assert_eq!(
+            creds.sigv4_signing_region(uri).as_deref(),
+            Some("us-gov-west-1"),
+            "a {form} address must sign with the stated region: {uri}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signing-region refusal (required_signing_region)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn required_signing_region_returns_the_resolved_region() {
+    let creds = creds_stating_region("");
+
+    let region = required_signing_region(&creds, "https://glue.eu-west-1.amazonaws.com/iceberg")
+        .expect("a standard Glue endpoint supplies a signing region");
+
+    assert_eq!(region, "eu-west-1");
+}
+
+/// The refusal names `region` and carries neither a credential value nor the
+/// catalog URI: the exact-text pin below is what proves both absences.
+#[test]
+fn required_signing_region_refuses_without_a_signing_region() {
+    let creds = ConnectionCreds {
+        access_key: "AKID_SENTINEL".into(),
+        secret_key: "SECRET_SENTINEL".into(),
+        session_token: Some("SESSION_SENTINEL".into()),
+        ..creds_stating_region("")
+    };
+
+    let err = required_signing_region(&creds, "https://catalog.internal.example/iceberg")
+        .expect_err("no stated region and no standard Glue endpoint must refuse");
+
+    let UdfError::User(msg) = err else {
+        panic!("the refusal must be a user error, got {err:?}");
+    };
+    assert_eq!(
+        msg,
+        "SigV4 catalog signing requires a region: neither the stated region nor the catalog URI \
+         supplies one"
+    );
+}

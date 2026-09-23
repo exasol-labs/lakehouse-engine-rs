@@ -141,3 +141,68 @@ async fn list_tables_signed_url_carries_catalogs_prefix() {
         "signed list_tables URL must NOT use the bare warehouse as the prefix: {request_line}"
     );
 }
+
+/// A reply both enumeration requests parse: an empty `list_tables` page and an
+/// empty `list_namespaces` page, so the enumeration stops after one level.
+const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
+
+/// Scenario: A standard AWS Glue endpoint signs the catalog request even when
+/// the CONNECTION states a different region — every namespace-enumeration
+/// request is signed for the resolved region handed to the enumeration, never
+/// for the stated `creds.region`.
+#[tokio::test]
+async fn signed_enumeration_is_signed_for_the_resolved_region() {
+    let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
+    let mut creds = base_creds();
+    creds.use_sigv4 = true;
+    creds.region = "us-east-1".into();
+    let ns = NamespaceIdent::new("db".into());
+
+    let enumeration = SignedEnumeration {
+        catalog_uri: &catalog_uri,
+        prefix: "catalogs/123456789012",
+        creds: &creds,
+        region: "eu-west-1",
+    };
+    enumeration
+        .list_in_namespace_signed(&ns)
+        .await
+        .expect("the signed enumeration must succeed against the stub");
+
+    let heads = heads.lock().unwrap();
+    assert!(
+        !heads.is_empty(),
+        "the enumeration must have sent at least its list_tables request"
+    );
+    for head in heads.iter() {
+        let authorization = authorization_header(head).expect("every request must be signed");
+        assert!(
+            authorization.contains("/eu-west-1/glue/aws4_request"),
+            "every enumeration request must be signed for the resolved region: {authorization}"
+        );
+    }
+}
+
+/// Scenario: the signed enumeration refuses, before sending any request, when
+/// neither the stated region nor the catalog URI supplies a signing region —
+/// with an error naming `region`.
+#[tokio::test]
+async fn signed_enumeration_refuses_without_signing_region() {
+    let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
+    let storage = static_backend();
+    let mut creds = base_creds();
+    creds.use_sigv4 = true;
+    creds.region = String::new();
+
+    let Err(UdfError::User(msg)) =
+        list_namespace_tables(&catalog_uri, &["db".to_string()], &storage, &creds).await
+    else {
+        panic!("a SigV4 enumeration with no signing region must be refused as a user error");
+    };
+
+    assert_eq!(msg, crate::sigv4::MISSING_SIGNING_REGION);
+    assert!(
+        heads.lock().unwrap().is_empty(),
+        "no catalog request may be sent without a signing region"
+    );
+}
