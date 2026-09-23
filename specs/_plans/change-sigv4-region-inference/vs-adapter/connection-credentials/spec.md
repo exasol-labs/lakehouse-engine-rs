@@ -21,7 +21,7 @@ Unchanged by this plan, and reproduced here only because the delta validator req
 * **A resolved `false` DISCARDS a configured endpoint** (`build_undecorated_store`, `object_store.rs:226-231`, passes `endpoint` to `AmazonS3Builder` only inside `if storage.path_style`). This forces the new guard: a non-vended CONNECTION with an `endpoint` and no stated `path_style` is rejected rather than silently reaching the wrong host.
 * **`StorageProps` keeps its `bool` and `true` serde default.** It is the resolved wire type; the adapter always serializes the field. Decision [5] in the decision-log records the rationale.
 * **Neither the Iceberg table spec nor the Delta protocol constrain this choice.** `s3.path-style-access` appears nowhere in the Iceberg REST spec; Delta's `PROTOCOL.md` contains no `path-style`/`path_style`/`virtual-hosted`. Decision [9] records the evidence.
-* **The SigV4 signing region is a separate value from the CONNECTION's `region`.** The signing region is the stated `region` when that field is non-empty. Otherwise it is the region a standard AWS Glue endpoint names: an address with the `https` scheme whose host, compared case-insensitively, is exactly `glue.<region>.amazonaws.com`, where `<region>` is a commercial AWS region code — two letters, a hyphen, one or more letters, a hyphen, one or more digits, for example `us-east-1` or `ap-southeast-2`. Port and path do not affect the match, and no other address form — AWS GovCloud (US), AWS China, FIPS, dual-stack, VPC interface, a private or proxy host, or any `http` address — supplies a signing region. Only the SigV4 guard and catalog request signing read the signing region. `region` holds exactly what the CONNECTION states, because an AWS Glue catalog and the S3 buckets of its tables can sit in different regions.
+* **The SigV4 signing region is a separate value from the CONNECTION's `region`, and for a standard AWS Glue endpoint the two are independent even when both are present.** For a standard AWS Glue endpoint — an address with the `https` scheme whose host, compared case-insensitively, is exactly `glue.<region>.amazonaws.com`, where `<region>` is a commercial AWS region code (two letters, a hyphen, one or more letters, a hyphen, one or more digits, for example `us-east-1` or `ap-southeast-2`; port and path do not affect the match) — the signing region is ALWAYS the region that address names, even when `region` is also stated and even when the two differ, because a Glue catalog and the S3 buckets of its tables can sit in different regions and `region` places the store, not the signature. For any other address form — AWS GovCloud (US), AWS China, FIPS, dual-stack, VPC interface, a private or proxy host, or any `http` address — the signing region is the stated `region`. Only the SigV4 guard and catalog request signing read the signing region; `region` holds exactly what the CONNECTION states and independently places the S3 store.
 
 The connection name is supplied as the VS property `CATALOG_CONNECTION`. The adapter
 resolves it with `ctx.connection(name)`. The resolved `ConnectionObject.address` is the
@@ -36,8 +36,9 @@ catalog used with static S3 credentials (the catalog-auth modes themselves are s
 `connection-credentials-catalog-auth`). The one conditional requirement is the AWS Glue SigV4
 path: when `use_sigv4` is true, the static `access_key`, the static `secret_key`, and a SigV4
 signing region are required. These inputs sign the catalog `load_table` request, ahead of any
-credential vending. A CONNECTION that omits `region` supplies a signing region only when its
-address is a standard commercial AWS Glue endpoint. `endpoint` stays optional.
+credential vending. A CONNECTION whose address is a standard commercial AWS Glue endpoint always
+signs with the region that address names, whether or not `region` is also stated; any other
+address requires a stated `region`. `endpoint` stays optional.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios
@@ -79,14 +80,14 @@ address is a standard commercial AWS Glue endpoint. `endpoint` stays optional.
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
-### Scenario: A stated region is the SigV4 signing region even when the catalog address names another
+### Scenario: A standard AWS Glue endpoint signs the catalog request even when the CONNECTION states a different region
 
 * *GIVEN* a CONNECTION whose address is `https://glue.eu-west-1.amazonaws.com/iceberg`
 * *AND* the CONNECTION's JSON password sets `use_sigv4` to true and supplies `warehouse`, `access_key`, `secret_key`, and a `region` of `us-east-1`
 * *WHEN* the adapter resolves the connection and issues its SigV4-signed catalog requests
-* *THEN* the adapter SHALL accept the CONNECTION, although the stated region differs from the region that the address names
-* *AND* the adapter SHALL sign every SigV4-signed catalog request for the stated region `us-east-1`, used verbatim
-* *AND* `ConnectionCreds.region` SHALL stay `us-east-1` for every other rule that reads it
+* *THEN* the adapter SHALL accept the CONNECTION
+* *AND* the adapter SHALL sign every SigV4-signed catalog request for `eu-west-1`, the region the address names, and NOT for the stated `us-east-1`
+* *AND* `ConnectionCreds.region` SHALL stay `us-east-1` for every other rule that reads it, so the stated `region` places the S3 store in a region DIFFERENT from the one that signs the catalog request — the deployment shape where a Glue catalog and its tables' S3 bucket sit in different AWS regions
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:CHANGED -->

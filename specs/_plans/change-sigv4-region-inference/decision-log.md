@@ -12,9 +12,12 @@
 **A:** Hard error, same as today. `validate_creds` keeps rejecting the CONNECTION and naming `region` as a missing required field for any URI that is not the recognized commercial Glue hostname shape. The error wording also explains that `region` may be omitted when the catalog URI is a standard commercial Glue hostname, so the operator knows the escape hatch exists. Non-standard and private endpoints see no behavior change.
 
 **Q (not asked, stated by the orchestrator as following from the answers above):** When both an explicit `region` and an inferable URI are present, which wins?
-**A:** The explicit value always wins and is used verbatim for signing. Inference is a fallback that activates only when `region` is empty or absent. The resolution order is: explicit, else inference, else error.
+**A:** The explicit value always wins and is used verbatim for signing. Inference is a fallback that activates only when `region` is empty or absent. The resolution order is: explicit, else inference, else error. **Superseded by decision [4]** after PR review (below): for a standard Glue endpoint the derived value always signs, and the explicit `region` only places the S3 store.
 
 **Reviewer concern (verbatim from the user):** "try to adjust to prose of the specs. The agent has a tendency to document the 'transition', I mean to narrate: 'we had this property, now we don't have it'. This is not correct. The specs document the state. So there shouldn't be this 'narrative', the property shouldn't appear on the specs, as if it hasn't never been there in the first place. It must appear on the plan of course. And it may appear on the decisions, but shouldn't appear on the specs."
+
+**Reviewer concern (PR #422 review, close paraphrase):** Cross-region Glue and S3 still do not work. A common setup puts the Glue catalog in one region and the S3 bucket in another (their example: Glue in `eu-west-1`, the bucket in `us-east-1`). One `region` value cannot serve two jobs — signing Glue and placing the S3 store — under "stated always wins": a stated `region` matching the bucket signs Glue requests for the wrong region and Glue rejects them; an omitted `region` with static S3 keys leaves the store address empty; an omitted `region` with vended credentials depends on Glue vending `client.region`, unverified. Request: for a standard commercial Glue endpoint, sign with the region the URL names — even when the CONNECTION also states `region` — and use the stated `region` only to place the S3 store; keep today's behavior (stated `region` required, used for signing) for every other endpoint. Not the original scope of issue #127, but adopted here since region inference is already being changed. Confirmed non-breaking: a CONNECTION whose stated region matches its URL signs identically; one whose stated region differs was already rejected by Glue before this change.
+**A:** Accepted. See decision [4] (revised) below.
 
 ## Design Decisions
 
@@ -43,12 +46,17 @@
 - **Rationale:** Interview answer 3. A plan-time error that names the field is the cheapest failure an operator can act on.
 - **Promotes to ADR:** no
 
-### [4] A stated `region` always wins, verbatim, with no mismatch check
+### [4] A standard AWS Glue endpoint's derived region always signs; a stated `region` places the S3 store, independently
 
-- **Decision:** `sigv4_signing_region` returns the stated `region` whenever it is non-empty, without parsing the address. The adapter accepts a CONNECTION whose stated region differs from the region its Glue host names.
-- **Alternatives:** Reject or warn on a mismatch. Rejected: the operator's stated value is authoritative (interview), and a mismatch check adds a rule nobody asked for.
-- **Rationale:** Explicit, else inference, else error, as the orchestrator recorded. Every existing CONNECTION signs exactly as before.
-- **Promotes to ADR:** no
+- **Decision:** `sigv4_signing_region` checks the address FIRST: when it is a standard AWS Glue endpoint, the method returns the region the host names, even when `region` is also stated and even when the two differ. Only when the address is NOT a standard Glue endpoint does the method fall back to the stated `region`. `ConnectionCreds.region` is untouched either way (decision [1]), so a stated `region` still places the S3 store regardless of which value signed the catalog request.
+- **Alternatives:** The plan's original design — the stated `region` always wins for signing, with no mismatch check (round-1 planning; interview answer 4). Rejected after PR review: a Glue catalog and its tables' S3 bucket are commonly in different AWS regions (the reviewer's example: Glue in `eu-west-1`, the bucket in `us-east-1`). Under "stated always wins", an operator who states the bucket's region to place the store also forces Glue's signature to that same wrong region, and Glue rejects it — the exact cross-region deployment shape decision [1] exists to support becomes unreachable. A mismatch check that rejects a differing stated region. Rejected: it would forbid the cross-region configuration this change now exists to support. A second field carrying the signing region separately from `region`. Rejected: `ConnectionCreds.region` already serves as the pure storage-region field the moment signing stops reading it for standard Glue endpoints (decision [1]); a second field duplicates that separation for no benefit and touches the wire/JSON schema for no reason.
+- **Rationale:** A Glue catalog and its tables' S3 buckets can sit in different regions. `region` needs to serve the STORAGE side in that case; making the SAME value also sign the Glue request makes the combination unsupportable, because Glue rejects a signature computed for the bucket's region. Deriving the signing region from the URL removes the conflict for the case the derivation already recognizes: a standard commercial Glue endpoint. This reverses this plan's own signing-precedence decision after review; getting it wrong again later (e.g. "simplifying" back to "stated always wins") would silently reintroduce the cross-region bug this change exists to fix — the reason this promotes to a permanent ADR below.
+- **Consequences:**
+  - A CONNECTION whose stated `region` differs from a standard Glue endpoint's own region now works: Glue signing uses the endpoint's region, and the S3 store places at the stated region.
+  - A CONNECTION whose stated `region` matches the endpoint's region is unaffected (same signing outcome as before).
+  - Not a breaking change: a CONNECTION with a differing stated `region` was already rejected by Glue before this change (signed for the wrong region); it now succeeds instead.
+  - `vs-adapter/connection-credentials`'s "stated region wins" scenario is replaced by one asserting the endpoint's region signs regardless of a differing stated value.
+- **Promotes to ADR:** yes
 
 ### [5] One public method on `ConnectionCreds`, declared in `sigv4.rs`, owns the host rule and the precedence
 

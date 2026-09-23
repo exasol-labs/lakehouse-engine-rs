@@ -28,7 +28,7 @@ explicit reviewed edit to the crate's reachability probe at
 * *WHEN* the crate's public surface is declared
 * *THEN* `ConnectionCreds` SHALL declare exactly ONE additional `pub` method, which returns that signing region from the credential set and a catalog URI, and returns nothing when neither the stated `region` nor the URI supplies one
 * *AND* the crate SHALL add no other item to its public surface for the signing region
-* *AND* the standard AWS Glue endpoint host rule and the stated-region-wins precedence of `vs-adapter/connection-credentials` SHALL each have exactly ONE declaration, beside the crate's SigV4 request signing, so the adapter guard and the two signing paths cannot disagree about whether a signing region exists
+* *AND* the standard AWS Glue endpoint host rule and the signing-region precedence of `vs-adapter/connection-credentials` SHALL each have exactly ONE declaration, beside the crate's SigV4 request signing, so the adapter guard and the two signing paths cannot disagree about whether a signing region exists
 * *AND* every step behind that method, including the host-shape parser, SHALL stay crate-private
 * *AND* each of the two signing paths SHALL resolve its region through that method once per session or enumeration, and SHALL refuse to sign, returning an error that names `region` and contains no credential value, when the method returns nothing
 * *AND* the method SHALL name no Exasol CONNECTION or virtual-schema-property delivery mechanism, and no `lakehouse-catalog` source file SHALL name `lakehouse_engine`

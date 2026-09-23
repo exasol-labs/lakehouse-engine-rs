@@ -2,7 +2,7 @@
 
 ## Summary
 
-A SigV4 CONNECTION to a standard commercial AWS Glue endpoint (`https://glue.<region>.amazonaws.com/...`) can omit `region`, because the adapter signs its catalog requests for the host's region. The derived region signs catalog requests only and never becomes the CONNECTION's `region`, so storage addressing is unchanged (closes #127).
+A SigV4 CONNECTION to a standard commercial AWS Glue endpoint (`https://glue.<region>.amazonaws.com/...`) signs its catalog requests for the host's region, whether or not `region` is also stated — and can omit `region` entirely. A stated `region` never signs a standard Glue endpoint's requests; it only places the S3 store, independently, so a Glue catalog and its tables' S3 bucket can be in different AWS regions (closes #127).
 
 ## Design
 
@@ -16,14 +16,14 @@ A SigV4 CONNECTION to a standard commercial AWS Glue endpoint (`https://glue.<re
 
 - **Goals**
   - A SigV4 CONNECTION whose address is a standard commercial AWS Glue endpoint passes validation without `region`.
-  - Namespace enumeration and every `CatalogSession` request sign for the derived region.
-  - A stated `region` always wins, verbatim.
+  - Namespace enumeration and every `CatalogSession` request sign for a standard Glue endpoint's own derived region, even when the CONNECTION also states a (possibly different) `region` — so a Glue catalog and its tables' S3 bucket can be in different AWS regions.
+  - For any other endpoint, `region` is required and signs the request, exactly as before.
   - One declaration owns the Glue host rule and the precedence. The adapter guard and both signing paths call it.
   - The missing-`region` error names the Glue-endpoint alternative.
 - **Non-Goals**
   - Region derivation for AWS GovCloud (US), AWS China, FIPS, dual-stack, VPC interface, private, or proxy endpoints.
-  - Any change to storage addressing. A derived region places no store.
-  - A mismatch check between a stated region and the region the host names.
+  - Any change to storage addressing. `region` places the S3 store exactly as before (decision-log [1]); this plan only changes which value SIGNS a standard Glue endpoint's requests.
+  - A mismatch check, error, or warning when a stated `region` differs from a standard Glue endpoint's own region — the difference is the supported case (cross-region Glue and S3), not a defect to flag (decision-log [4]).
   - Changes to `vs-adapter/scan-spec-credential-reference` (decision-log [8]).
 
 ### Decision
@@ -38,8 +38,9 @@ read_connection(ctx, name, kind)
   creds = parse_creds(json)       (region = stated value, never derived)
   validate_creds(name, &creds, kind, &uri)
     validate_sigv4_creds(name, &creds, &uri) ───▶ ConnectionCreds::sigv4_signing_region(&uri)   sigv4.rs, pub
-      None → error naming `region`                  stated region non-empty ──▶ Some(stated)
-             + Glue-endpoint clause                 else glue_endpoint_region(uri) ──▶ Some(r) / None   private
+      None → error naming `region`                  glue_endpoint_region(uri) is Some(r) ──▶ Some(r)   private
+             + Glue-endpoint clause                 else stated region non-empty ──▶ Some(stated)
+                                                     else None
 Resolved { uri, creds }
   │
   ├─ list_tables ─▶ list_namespace_tables(uri, ns, storage, creds)             namespace.rs
@@ -73,17 +74,20 @@ The host rule inside `glue_endpoint_region`:
 | Resolve once, carry in the strategy | `CatalogAuth::Sigv4 { region }` | `CatalogSession` already resolves auth and prefix once per query |
 | Parse, then compare | `url::Url` host in `glue_endpoint_region` | String slicing mis-reads `https://glue.us-east-1.amazonaws.com@evil.example/` as a Glue host |
 | Derived value kept out of parsed input | `ConnectionCreds.region` untouched | Storage rules keep reading only what the CONNECTION states |
+| Endpoint recognized before stated value is read | `sigv4_signing_region` checks `glue_endpoint_region` first | A standard Glue endpoint's own region must sign regardless of what `region` states, so a stated bucket region can differ (decision-log [4]) |
 
 #### Key Interfaces
 
 ```rust
 // crates/lakehouse-catalog/src/sigv4.rs
 impl ConnectionCreds {
-    /// Region a SigV4-signed catalog request is signed for: the stated `region`
-    /// when non-empty, else the region a standard commercial AWS Glue endpoint
-    /// host names, else `None`. Signing-only by design: the result is never
-    /// written back into `region`, because a Glue catalog and its tables'
-    /// buckets can sit in different regions.
+    /// Region a SigV4-signed catalog request is signed for: the region a
+    /// standard commercial AWS Glue endpoint host names, when the address is
+    /// one — even when `region` is also stated, and even when the two differ.
+    /// Otherwise the stated `region` when non-empty, else `None`. Signing-only
+    /// by design: the result is never written back into `region`, because a
+    /// Glue catalog and its tables' buckets can sit in different regions and
+    /// `region` places the store, not the signature.
     pub fn sigv4_signing_region(&self, catalog_uri: &str) -> Option<String>;
 }
 pub(crate) fn required_signing_region(creds: &ConnectionCreds, catalog_uri: &str) -> Result<String, UdfError>;
@@ -129,6 +133,7 @@ Error texts. Neither text contains a credential value or the catalog URI.
 | Derived region is signing-only (decision-log [1]) | Write it into `ConnectionCreds.region`, or add a `signing_region` field | A plain `String` cannot tell derived from stated values. Storage rules would read a catalog region as a bucket region. |
 | Commercial region-code shape (decision-log [2]) | Domain-only match, region allow-list, `us-gov-` exclusion | GovCloud Glue endpoints share `amazonaws.com`. An allow-list goes stale. |
 | Hard error off the standard shape (decision-log [3]) | Default region, or sign with an empty region | A named-field plan-time error is actionable. A Glue 403 is not. |
+| A standard Glue endpoint's own region always signs, over a stated `region` (decision-log [4]) | Stated `region` always wins for signing (this plan's original design); a mismatch check or rejection | Glue and its tables' S3 bucket are commonly in different regions. "Stated always wins" makes that combination unsupportable: Glue rejects a signature computed for the bucket's region. |
 | Method on `ConnectionCreds` in `sigv4.rs` (decision-log [5]) | Free `pub fn`, engine-side parser, new constructor parameters, inference inside `sign_request` | This option adds no new public item and keeps one owner. It changes no pinned signature. |
 | Resolve once and refuse without a region (decision-log [6]) | Re-derive per request, or sign with an empty region | `CatalogSession::resolve` is public and is reachable without the adapter's guard. |
 
@@ -147,7 +152,7 @@ Not applicable. This plan changes CONNECTION validation and catalog request sign
 
 What each delta changes, as a transition (the deltas themselves state only the resulting behavior, per decision-log [9]):
 
-- `vs-adapter/connection-credentials`: `region` is required under SigV4 only when the address is not a standard commercial AWS Glue endpoint, where it used to be unconditional. The guard scenario is renamed (removed and re-added), two scenarios are added, and one clause of the vending scenario and two Background passages are corrected.
+- `vs-adapter/connection-credentials`: `region` is required under SigV4 only when the address is not a standard commercial AWS Glue endpoint, where it used to be unconditional; and a standard Glue endpoint's own region always signs, even when `region` is also stated, where the stated value used to win unconditionally. The guard scenario is renamed (removed and re-added), two scenarios are added, and one clause of the vending scenario and two Background passages are corrected.
 - `vs-adapter/catalog-crate-public-surface-extensions`: one scenario records the new `pub` method. The description drops its stale "four narrow additions" count.
 - `e2e-harness/cloud-e2e-harness`: one live scenario is added. Two clauses that called `region` a SigV4 requirement are corrected.
 - `vs-adapter/pushdown-planning-cloud-credentials`: four Background clauses that presume every SigV4 or Glue CONNECTION states `region` are corrected (decision-log [8]). The Glue-region discharge now covers only a Glue CONNECTION that states `region`. A region-less Glue vended CONNECTION places its store from the vended `client.region` alone. No scenario changes, so § Verification adds no coverage row for this delta.
@@ -155,10 +160,11 @@ What each delta changes, as a transition (the deltas themselves state only the r
 ## Impact
 
 - **Operators, new option:** a SigV4 CONNECTION whose address is `https://glue.<region>.amazonaws.com/...` in a commercial region can omit `region`. `CREATE VIRTUAL SCHEMA`, `REFRESH`, and pushdown planning sign for the host's region.
-- **Existing CONNECTIONs:** unchanged. A stated `region` signs exactly as before. Not a breaking change.
+- **Operators, cross-region Glue and S3 (new capability):** a CONNECTION whose Glue catalog and S3 bucket sit in different AWS regions can now state `region` as the BUCKET's region to place the S3 store; Glue signing derives its own region from the endpoint automatically, regardless of what `region` states. This directly resolves issue #127's open question on precedence, revised after review: the stated value no longer wins for signing on a standard Glue endpoint.
+- **Existing CONNECTIONs:** a CONNECTION whose stated `region` matches its standard Glue endpoint's own region signs identically to before. A CONNECTION whose stated `region` differs from its endpoint's region was already rejected by Glue before this change (signed for the wrong region) — it now succeeds, signing for the endpoint's region while `region` places the S3 store. Not a breaking change.
 - **Error text:** the missing-field error keeps its prefix. When it names `region`, it gains the Glue-endpoint clause. A caller that matches the full text exactly sees a longer message.
-- **Storage region, operator action:** omitting `region` also leaves the S3 store region unstated. On the static-credential path, `AmazonS3Builder::with_region("")` builds `https://<bucket>.s3..amazonaws.com` (object_store 0.13.2 `src/aws/builder.rs:1086,1218`). The virtual schema is created, but scans fail at read time. `docs/catalogs.md` instructs operators to keep stating `region` whenever scans read with static S3 keys. Under vending, a Glue CONNECTION that omits `region` places the store from Glue's vended `client.region` alone. No suite asserts that key: `vs-adapter/pushdown-planning-cloud-credentials` records its verification obligation as discharged and observation-only.
-- **GovCloud, China, FIPS, dual-stack, VPC interface, private, and proxy endpoints:** unchanged. They still state `region`.
+- **Storage region, operator action:** omitting `region` also leaves the S3 store region unstated. On the static-credential path, `AmazonS3Builder::with_region("")` builds `https://<bucket>.s3..amazonaws.com` (object_store 0.13.2 `src/aws/builder.rs:1086,1218`). The virtual schema is created, but scans fail at read time. `docs/catalogs.md` instructs operators to keep stating `region` whenever scans read with static S3 keys — including the bucket's own region when it differs from a standard Glue endpoint's region. Under vending, a Glue CONNECTION that omits `region` places the store from Glue's vended `client.region` alone. No suite asserts that key: `vs-adapter/pushdown-planning-cloud-credentials` records its verification obligation as discharged and observation-only.
+- **GovCloud, China, FIPS, dual-stack, VPC interface, private, and proxy endpoints:** unchanged. They still state `region`, which still signs the request (no endpoint-derived region exists for these forms).
 - **Library surface:** `lakehouse-catalog` gains one `pub` method, `ConnectionCreds::sigv4_signing_region`. No public signature changes.
 - **Concurrent plan:** `refactor-nr-of-cores-detection` also changes `e2e-harness/cloud-e2e-harness`. Its blocks touch only the remote-bench scenarios, and this plan's blocks touch the Background, the vended scenario, and one new scenario. The two plans can record in either order.
 
@@ -170,13 +176,13 @@ What each delta changes, as a transition (the deltas themselves state only the r
 
 ## Migration
 
-None. Every existing CONNECTION validates and signs as before. An operator can remove `region` from a Glue CONNECTION only when its scans get the store region elsewhere, as the Impact entry "Storage region, operator action" describes.
+None required. Every existing CONNECTION whose stated `region` matches its standard Glue endpoint validates and signs as before; one whose stated `region` differed was already failing at Glue and now succeeds. An operator can remove `region` from a Glue CONNECTION only when its scans get the store region elsewhere, as the Impact entry "Storage region, operator action" describes. An operator whose Glue catalog and S3 bucket sit in different regions should now state `region` as the bucket's region — a standard Glue endpoint signs from its own hostname regardless of that value.
 
 ## Implementation Tasks
 
 ### 1. Signing-region resolver (`lakehouse-catalog`)
 
-- [ ] 1.1 Write failing unit tests in `crates/lakehouse-catalog/src/sigv4_tests.rs` for `ConnectionCreds::sigv4_signing_region`. Cover the scenario host matrix: `https://glue.eu-west-1.amazonaws.com/iceberg`, an uppercase host, an explicit `:443` port, and `ap-southeast-2` all match. GovCloud, China, FIPS, VPC interface, dual-stack, private host, `http` scheme, the userinfo form `https://glue.us-east-1.amazonaws.com@evil.example/`, a trailing-dot host, a multi-label region, an empty URI, and an unparseable URI all fail. Also cover stated-region-wins and the empty-region, non-Glue `None` case.
+- [ ] 1.1 Write failing unit tests in `crates/lakehouse-catalog/src/sigv4_tests.rs` for `ConnectionCreds::sigv4_signing_region`. Cover the scenario host matrix: `https://glue.eu-west-1.amazonaws.com/iceberg`, an uppercase host, an explicit `:443` port, and `ap-southeast-2` all match. GovCloud, China, FIPS, VPC interface, dual-stack, private host, `http` scheme, the userinfo form `https://glue.us-east-1.amazonaws.com@evil.example/`, a trailing-dot host, a multi-label region, an empty URI, and an unparseable URI all fail. Also cover: a standard Glue endpoint with NO stated `region` derives the endpoint's region (unchanged); a standard Glue endpoint with a stated `region` that DIFFERS from the endpoint's own region STILL derives the endpoint's region, not the stated one; a non-standard endpoint with a stated `region` returns the stated value (unaffected); and the empty-region, non-Glue `None` case.
 - [ ] 1.2 Implement `sigv4_signing_region` and the private `glue_endpoint_region` in `crates/lakehouse-catalog/src/sigv4.rs` with `url::Url`, per the host rule in Design. Write the doc comment as shown in Key Interfaces, and name no Exasol CONNECTION mechanism. [expert]
 - [ ] 1.3 Add `pub(crate) fn required_signing_region` in `sigv4.rs`, returning the credential-safe refusal error from the Design table.
 
@@ -186,7 +192,7 @@ None. Every existing CONNECTION validates and signs as before. An operator can r
 - [ ] 2.2 In `crates/lakehouse-catalog/src/iceberg_io.rs`, make `authed_get_json` sign with the region the variant carries. Update its redaction match arm to `Sigv4 { .. }`. Update the match in `resolve_load_table_prefix` (`crates/lakehouse-catalog/src/session.rs:149`).
 - [ ] 2.3 In `crates/lakehouse-catalog/src/namespace.rs`, resolve the region once in `list_namespace_tables` through `required_signing_region`, before the first request. Thread a `region: &str` parameter through `list_in_namespace_signed` and `signed_get_json`, and delete `&creds.region` from that `sign_request` call.
 - [ ] 2.4 Update the tests that name the unit variant: `session_tests.rs:187` and `session_tests.rs:340`, and `auth_tests.rs:366`.
-- [ ] 2.5 Add tests in `auth_tests.rs`: `sigv4_auth_carries_region_derived_from_glue_endpoint`, `sigv4_auth_prefers_stated_region`, and `sigv4_auth_refuses_without_signing_region`. The SigV4 branch makes no network call.
+- [ ] 2.5 Add tests in `auth_tests.rs`: `sigv4_auth_carries_region_derived_from_glue_endpoint`, `sigv4_auth_derives_region_even_when_a_different_region_is_stated`, and `sigv4_auth_refuses_without_signing_region`. The SigV4 branch makes no network call.
 - [ ] 2.6 Add `sigv4_request_is_signed_for_the_carried_region` in `iceberg_io_tests.rs`. Use a local TCP listener (the pattern of `namespace_tests.rs:74-143`), set `creds.region` to empty, pass `CatalogAuth::Sigv4 { region: "eu-west-1".into() }`, and assert that the captured `Authorization` header contains `/eu-west-1/glue/aws4_request`.
 - [ ] 2.7 Add `signed_enumeration_is_signed_for_the_resolved_region` and `signed_enumeration_refuses_without_signing_region` in `namespace_tests.rs`, using the same capture pattern against `list_in_namespace_signed` and `list_namespace_tables`.
 - [ ] 2.8 In `crates/lakehouse-catalog/tests/catalog_public_surface.rs`, add `connection_creds_sigv4_signing_region_is_reachable`, which calls the method. Add `signing_region_steps_are_not_public`, which asserts from `sigv4.rs` source that it declares no `pub fn glue_endpoint_region` and no `pub fn required_signing_region`, and contains no `CONNECTION` or `UdfContext` token.
@@ -198,7 +204,7 @@ None. Every existing CONNECTION validates and signs as before. An operator can r
 - [ ] 3.3 Rewrite the `REQUIRED_KEY` doc comment (`connection.rs:17-22`) so that it states the conditional `region` rule.
 - [ ] 3.4 In `crates/lakehouse-engine/src/adapter/connection_tests.rs`, update `sigv4_requires_access_secret_region`: cite the new scenario title in its doc comment, and assert the Glue-endpoint clause when `region` is named.
 - [ ] 3.5 Add `sigv4_region_required_for_non_standard_glue_hosts` in `connection_tests.rs`. Cover the GovCloud, China, FIPS, VPC interface, dual-stack, private-host, and `http` addresses. Each case is rejected with an error that names `region` and leaks no key.
-- [ ] 3.6 Add three tests in `connection_tests.rs`. `sigv4_region_derived_from_standard_glue_endpoint_is_accepted` asserts `Ok`, an empty `resolved.creds.region`, an empty `StorageCreds::from(&resolved.creds).region`, and an empty `StaticStoreAddress::from(&resolved.creds).region()`. `sigv4_stated_region_kept_when_glue_endpoint_names_another` covers precedence. `sigv4_derived_region_places_no_store_under_vending` repeats the empty-region assertions with `use_vended_credentials: true`.
+- [ ] 3.6 Add four tests in `connection_tests.rs`. `sigv4_region_derived_from_standard_glue_endpoint_is_accepted` asserts `Ok`, an empty `resolved.creds.region`, an empty `StorageCreds::from(&resolved.creds).region`, and an empty `StaticStoreAddress::from(&resolved.creds).region()`. `sigv4_derived_region_places_no_store_under_vending` repeats the empty-region assertions with `use_vended_credentials: true`. `sigv4_cross_region_glue_and_s3_is_supported` builds a CONNECTION whose address is `https://glue.eu-west-1.amazonaws.com/iceberg` and whose stated `region` is `us-east-1`, asserts `resolved.creds.sigv4_signing_region(&uri) == Some("eu-west-1".into())` (the endpoint's own region signs) while `StaticStoreAddress::from(&resolved.creds).region() == "us-east-1"` (the stated region still places the store) — the reviewer's cross-region scenario end to end. `sigv4_stated_region_used_for_non_standard_endpoint` asserts a non-standard address (e.g. GovCloud) still signs with the stated `region`, unaffected by this change.
 
 ### 4. Operator documentation
 
@@ -213,7 +219,7 @@ None. Every existing CONNECTION validates and signs as before. An operator can r
 
 | Group | Tasks | Depends on | Knowledge |
 |-------|-------|------------|-----------|
-| A: Signing-region resolver and both catalog signing paths | 1.1-1.3, 2.1-2.8 | — | spec deltas `vs-adapter/connection-credentials` (scenarios "A standard AWS Glue endpoint supplies the SigV4 signing region when the CONNECTION omits region" and "A stated region is the SigV4 signing region even when the catalog address names another", signing clauses) and `vs-adapter/catalog-crate-public-surface-extensions`; `crates/lakehouse-catalog/src/sigv4.rs`, `sigv4_tests.rs`, `auth.rs`, `auth_tests.rs`, `iceberg_io.rs`, `iceberg_io_tests.rs`, `session.rs`, `session_tests.rs`, `namespace.rs`, `namespace_tests.rs`, `crates/lakehouse-catalog/tests/catalog_public_surface.rs` |
+| A: Signing-region resolver and both catalog signing paths | 1.1-1.3, 2.1-2.8 | — | spec deltas `vs-adapter/connection-credentials` (scenarios "A standard AWS Glue endpoint supplies the SigV4 signing region when the CONNECTION omits region" and "A standard AWS Glue endpoint signs the catalog request even when the CONNECTION states a different region", signing clauses) and `vs-adapter/catalog-crate-public-surface-extensions`; `crates/lakehouse-catalog/src/sigv4.rs`, `sigv4_tests.rs`, `auth.rs`, `auth_tests.rs`, `iceberg_io.rs`, `iceberg_io_tests.rs`, `session.rs`, `session_tests.rs`, `namespace.rs`, `namespace_tests.rs`, `crates/lakehouse-catalog/tests/catalog_public_surface.rs` |
 | B: Adapter guard, operator docs, and live Glue proof | 3.1-3.6, 4.1, 5.1-5.2 | A (calls `ConnectionCreds::sigv4_signing_region`) | spec deltas `vs-adapter/connection-credentials` (guard scenario, acceptance and no-leak clauses, vending scenario), `e2e-harness/cloud-e2e-harness`, and `vs-adapter/pushdown-planning-cloud-credentials` (Background, for task 4.1); `crates/lakehouse-engine/src/adapter/connection.rs`, `crates/lakehouse-engine/src/adapter/connection_tests.rs`, `docs/catalogs.md`, `crates/lakehouse-engine/tests/cloud_e2e_test.rs` |
 
 Both groups cite `vs-adapter/connection-credentials`, so they run in sequence, not in parallel. They share no source file. Group A holds the catalog-side mental model: Glue endpoint rules, `CatalogAuth`, and the two signing paths. Group B holds the CONNECTION-delivery model: validation order, error text, the docs, and the cloud harness. Group B starts from A's finished method signature.
@@ -238,7 +244,7 @@ Only task 1.2 carries `[expert]`, so group A routes to the expert implementer an
 | connection-credentials: A standard AWS Glue endpoint supplies ... (`loadTable` path signs for the derived region) | Integration | `crates/lakehouse-catalog/src/auth_tests.rs`, `crates/lakehouse-catalog/src/iceberg_io_tests.rs` | `sigv4_auth_carries_region_derived_from_glue_endpoint`, `sigv4_request_is_signed_for_the_carried_region` |
 | connection-credentials: A standard AWS Glue endpoint supplies ... (namespace enumeration signs for the derived region) | Integration | `crates/lakehouse-catalog/src/namespace_tests.rs` | `signed_enumeration_is_signed_for_the_resolved_region` |
 | connection-credentials: A standard AWS Glue endpoint supplies ... (real Glue accepts both signatures) | Integration (live, opt-in) | `crates/lakehouse-engine/tests/cloud_e2e_test.rs` | `cloud_sigv4_region_derived_from_glue_endpoint_lists_table` |
-| connection-credentials: A stated region is the SigV4 signing region even when the catalog address names another | Unit + Integration | `crates/lakehouse-catalog/src/sigv4_tests.rs`, `crates/lakehouse-catalog/src/auth_tests.rs`, `crates/lakehouse-engine/src/adapter/connection_tests.rs` | `stated_region_wins_over_glue_endpoint_region`, `sigv4_auth_prefers_stated_region`, `sigv4_stated_region_kept_when_glue_endpoint_names_another` |
+| connection-credentials: A standard AWS Glue endpoint signs the catalog request even when the CONNECTION states a different region | Unit + Integration | `crates/lakehouse-catalog/src/sigv4_tests.rs`, `crates/lakehouse-catalog/src/auth_tests.rs`, `crates/lakehouse-engine/src/adapter/connection_tests.rs` | `signing_region_derived_from_standard_glue_endpoint` (differing-stated-region case), `sigv4_auth_derives_region_even_when_a_different_region_is_stated`, `sigv4_cross_region_glue_and_s3_is_supported`, `sigv4_stated_region_used_for_non_standard_endpoint` |
 | connection-credentials: Static storage credentials are ignored, not rejected, when vending is requested | Integration | `crates/lakehouse-engine/src/adapter/connection_tests.rs` | `static_storage_fields_with_vending_are_accepted_and_unused` (existing), `sigv4_derived_region_places_no_store_under_vending` |
 | catalog-crate-public-surface-extensions: The SigV4 signing-region resolver is a public method of the shared credential type (reachability, crate-private steps, no delivery mechanism) | Integration | `crates/lakehouse-catalog/tests/catalog_public_surface.rs` | `connection_creds_sigv4_signing_region_is_reachable`, `signing_region_steps_are_not_public`, `demoted_and_deleted_functions_are_not_declared_public` (existing, unweakened) |
 | catalog-crate-public-surface-extensions: The SigV4 signing-region resolver ... (refusal on both signing paths) | Integration | `crates/lakehouse-catalog/src/auth_tests.rs`, `crates/lakehouse-catalog/src/namespace_tests.rs` | `sigv4_auth_refuses_without_signing_region`, `signed_enumeration_refuses_without_signing_region` |
