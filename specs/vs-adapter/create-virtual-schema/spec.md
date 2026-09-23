@@ -121,7 +121,7 @@ The catalog endpoint and storage credentials are supplied through the Exasol CON
 * *GIVEN* a `createVirtualSchema` request that enumerates one or more tables in the configured namespace
 * *WHEN* the adapter builds the `createVirtualSchema` response
 * *THEN* the adapter SHALL record, inside the response's `schemaMetadata.adapterNotes` (a stringified JSON object), a `TABLE_MAP` entry mapping each uppercased `__`-flattened Exasol table name to its original-cased fully-qualified Iceberg identifier (dot-joined namespace segments plus table name)
-* *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry (`NR_OF_CORES`, `PARALLELISM_FACTOR`, and the DataFusion threading and memory-budget entries) when writing `TABLE_MAP`
+* *AND* the adapter SHALL preserve every other pre-existing `adapterNotes` entry (`PARALLELISM_FACTOR`, and the DataFusion threading and memory-budget entries) when writing `TABLE_MAP`
 * *AND* the recorded map SHALL round-trip back to the adapter at pushdown time so a pushdown can recover the exact Iceberg identifier from the Exasol table name without re-listing the catalog
 * *AND* the adapter MUST NOT persist the map anywhere other than the returned `adapterNotes`
 
