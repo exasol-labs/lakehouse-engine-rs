@@ -229,6 +229,9 @@ async fn a_unity_decimal_column_carries_its_precision_and_scale() {
             scale,
         } => assert_eq!((type_name.as_str(), *precision, *scale), ("DECIMAL", 10, 2)),
         ColumnSourceType::Iceberg(ty) => panic!("expected a Unity source type, got iceberg {ty}"),
+        ColumnSourceType::Parquet(tag) => {
+            panic!("expected a Unity source type, got a Parquet tag {tag}")
+        }
     }
 }
 

@@ -25,6 +25,7 @@ Find the row that matches your catalog. Then copy its recipe.
 | [Generic REST with token / OAuth2](#generic-rest-with-static-token-or-oauth2) | Iceberg REST | bearer token or OAuth2 | Supported |
 | [Lakekeeper](#lakekeeper-oidc-via-keycloak--minio) | Iceberg REST | OAuth2 client-credentials (OIDC) | Supported |
 | [Unity Catalog (Delta tables)](#unity-catalog-delta-tables) | Unity Catalog | none, PAT, or Databricks OAuth M2M | Supported |
+| [Direct storage (raw Parquet, no catalog)](#direct-storage-raw-parquet-no-catalog) | Direct storage | none (storage credentials only) | Supported |
 
 The steps here cover only the catalog CONNECTION and the Virtual Schema. They are the
 [Point the VS at your data](install.md#point-the-vs-at-your-data) step of [Install](install.md).
@@ -279,6 +280,78 @@ To authenticate with a Databricks OAuth machine-to-machine service principal ins
 access token, replace `token` with `client_id` and `client_secret`; the adapter mints and caches the
 bearer itself, minting again a minute ahead of its stated expiry, and defaults `oauth2_server_uri`
 to `{catalog-uri}/oidc/v1/token` and `scope` to `all-apis` when you omit them.
+
+## Direct storage (raw Parquet, no catalog)
+
+Set `CATALOG_KIND = 'DIRECT_STORAGE'` to read a plain directory tree of Parquet files with **no
+catalog service at all** — no Iceberg REST, no Unity Catalog. Every first-level directory under the
+CONNECTION address (joined with `NAMESPACE` when set) becomes one table; every `*.parquet` file
+found anywhere below it, at any depth, is that table's data. A path segment that starts with `_` or
+`.` (for example `_delta_log/`, `_SUCCESS`, `.spark-staging`) is excluded from both directory
+discovery and file eligibility, so a loose file directly under the base path serves no table, and a
+directory with no eligible file is skipped rather than served empty.
+
+**CONNECTION shape.** The address is the storage base path itself — an `s3://`/`s3a://` bucket
+prefix, or an `abfss://<container>@<account>.dfs.core.windows.net/<prefix>` container prefix — not a
+catalog URI. The password carries ONLY storage credentials (the same S3 or Azure fields every other
+recipe on this page uses): no catalog-auth field is accepted, and supplying one is a rejected
+CONNECTION rather than a silently ignored one. `warehouse`, `token`, `client_id`, `client_secret`,
+`oauth2_server_uri`, `scope`, `use_sigv4`, and `use_vended_credentials` (S3-vending; Azure vending
+does not apply here) are all rejected under this kind. The address scheme must agree with the
+credential shape: `s3`/`s3a` for S3 credentials, `abfss` only for Azure credentials — `abfs` (without
+the trailing `s`) is rejected, naming `abfss` as the accepted spelling.
+
+```sql
+CREATE OR REPLACE CONNECTION DIRECT_STORAGE_CREDS
+  TO 's3://warehouse/events'
+  USER ''
+  IDENTIFIED BY '{
+    "endpoint":   "http://minio:9000",
+    "region":     "us-east-1",
+    "access_key": "minioadmin",
+    "secret_key": "minioadmin",
+    "path_style": true
+  }';
+
+CREATE VIRTUAL SCHEMA MY_RAW_PARQUET
+USING LHVS.LAKEHOUSE_ADAPTER WITH
+  CATALOG_CONNECTION = 'DIRECT_STORAGE_CREDS'
+  CATALOG_KIND       = 'DIRECT_STORAGE'
+  ALLOW_HTTP         = 'true';
+```
+
+**The three properties.**
+
+| Property | Default | Meaning |
+|---|---|---|
+| `NAMESPACE` | absent (the CONNECTION address alone is the base path) | Narrows discovery to a subtree: joined onto the CONNECTION address with a single `/` to form the storage base path. Not a `catalog.schema` reference — there is no catalog to resolve it against |
+| `MERGE_SCHEMA` | `TRUE` | `TRUE` reads every listed file's footer and folds them into one declared schema (widening a narrower numeric/date type into a wider one, unioning columns present in only some files). `FALSE` samples only the lexicographically first file's footer and declares that schema alone — cheaper, but a column or a wider type that only a later file carries is invisible, and a row that does not fit the sampled type fails at read time rather than at `CREATE VIRTUAL SCHEMA` time |
+| `HIVE_PARTITIONING` | `TRUE` | Parsed and validated (an unparseable value is rejected, never silently defaulted) but not yet acted on by directory discovery or scanning — reserved for `key=value` path-segment partition pruning |
+
+An unparseable `MERGE_SCHEMA` or `HIVE_PARTITIONING` value is rejected rather than defaulted, since a
+typo that silently selected the opposite mode would return a narrower schema instead of an error.
+
+**Iceberg or Delta directory caveat.** Pointing this catalog kind at a directory that is actually an
+Iceberg table or a Delta table is a supported but almost always wrong choice: direct storage knows
+nothing about snapshots, manifests, or the transaction log, so it reads every physical Parquet file
+under the directory, including files a real Iceberg snapshot or Delta log would mark deleted,
+tombstoned, or superseded — the `_delta_log/` directory itself is silently skipped by the `_`-prefix
+exclusion rule above, not read. This returns wrong rows, not an error. If you actually want a
+catalog-aware, delete-correct read of an Iceberg or Delta table, use the matching kind instead: leave
+`CATALOG_KIND` absent (Iceberg REST, the default) or set it to `'UNITY_CATALOG'` — see the recipes
+above.
+
+**Plan-time footer cost.** Every `CREATE VIRTUAL SCHEMA` and every `REFRESH` lists the directory tree
+and reads Parquet file footers directly from object storage — there is no manifest, snapshot, or log
+to consult instead, unlike the Iceberg REST and Unity Catalog kinds. `MERGE_SCHEMA = 'FALSE'` bounds
+this to one footer read per table; the default `'TRUE'` reads every file's footer.
+
+**Limitation: mixed timestamp units do not fold.** The type-widening rules this kind applies when
+folding schemas cover integer, float, and date widening, but carry no timestamp-to-timestamp rule.
+Two files that declare the same column as `TIMESTAMP` at different units (for example microsecond in
+one file, nanosecond in another) fail to fold under the default `MERGE_SCHEMA = 'TRUE'`. Set
+`MERGE_SCHEMA = 'FALSE'` to work around it — the sampled file's declared unit then wins, and a file
+whose column does not fit that declared width fails at read time instead.
 
 ## Addressing
 

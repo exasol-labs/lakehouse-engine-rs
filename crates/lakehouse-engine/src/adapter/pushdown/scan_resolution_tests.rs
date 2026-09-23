@@ -3,6 +3,7 @@ use super::super::test_support::{
     iceberg_catalog, locationless_delta_table_body, sample_storage, unauthenticated_creds,
 };
 use super::*;
+use crate::scan::spec::{StorageBackend, StorageProps};
 
 /// Scenario: A Unity Catalog table's identity survives the round trip from the
 /// involved table.
@@ -32,6 +33,7 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
             allow_http: true,
         },
         &["cat.sch.orders"],
+        &Json::Null,
     )
     .await
     .expect("a Unity Catalog session is built without contacting the catalog");
@@ -104,6 +106,7 @@ async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalo
                 allow_http: true,
             },
             &[unresolvable],
+            &Json::Null,
         )
         .await
         .err()
@@ -142,6 +145,7 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_ca
             allow_http: true,
         },
         &["db.t", "malformed"],
+        &Json::Null,
     )
     .await
     .err()
@@ -180,6 +184,7 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
             allow_http: true,
         },
         &["db.t"],
+        &Json::Null,
     )
     .await
     .expect("an Iceberg session resolves against a reachable catalog");
@@ -223,6 +228,7 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
             allow_http: true,
         },
         &["db.t", "db.u"],
+        &Json::Null,
     )
     .await
     .expect("an Iceberg session resolves against a reachable catalog");
@@ -267,6 +273,7 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
             allow_http: true,
         },
         &["cat.sch.orders", "cat.sch.customers"],
+        &Json::Null,
     )
     .await
     .expect("a Unity Catalog session is built without contacting the catalog");
@@ -291,4 +298,208 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
         "the second table must be loaded on the SAME session the first one used, \
          with no repeated auth target"
     );
+}
+
+/// An empty, non-truncated S3 listing: a directory with no data file.
+const EMPTY_LIST_BUCKET_RESULT: &str = concat!(
+    r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+    r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
+    "<Name>warehouse</Name><KeyCount>0</KeyCount><MaxKeys>1000</MaxKeys>",
+    "<IsTruncated>false</IsTruncated></ListBucketResult>",
+);
+
+/// The CONNECTION address a direct-storage virtual schema is created over.
+const DIRECT_STORAGE_ADDRESS: &str = "s3://warehouse";
+
+/// An S3-compatible endpoint answering every listing empty while recording each request line.
+async fn empty_s3_endpoint() -> RecordingCatalog {
+    RecordingCatalog::spawn(|_| (200, EMPTY_LIST_BUCKET_RESULT.to_string())).await
+}
+
+fn direct_storage_backend(endpoint: &str) -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: endpoint.to_string(),
+        region: "us-east-1".into(),
+        access_key: "minioadmin".into(),
+        secret_key: "minioadmin".into(),
+        allow_http: true,
+        path_style: true,
+        ..Default::default()
+    })
+}
+
+// Direct-storage case: the object store is built once (no request cost) and each leg lists only its own table root — one listing per leg, no per-leg session setup.
+#[tokio::test]
+async fn one_session_or_store_per_request_serves_every_leg() {
+    let endpoint = empty_s3_endpoint().await;
+    let creds = unauthenticated_creds();
+    let storage = direct_storage_backend(&endpoint.uri);
+    let props = serde_json::json!({"NAMESPACE": "direct"});
+    let resolver = TableScanResolver::for_request(
+        CatalogKind::DirectStorage,
+        DIRECT_STORAGE_ADDRESS,
+        ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+        &["events", "event_labels"],
+        &props,
+    )
+    .await
+    .expect("a direct-storage store is built from the CONNECTION alone");
+
+    assert!(
+        endpoint.targets().is_empty(),
+        "building the request's one store must cost no object-store request: {:?}",
+        endpoint.targets()
+    );
+
+    resolver
+        .resolve("events", None)
+        .await
+        .expect("a directory with no data file resolves an empty scan");
+    resolver
+        .resolve("event_labels", None)
+        .await
+        .expect("a directory with no data file resolves an empty scan");
+
+    let targets = endpoint.targets();
+    assert_eq!(
+        targets.len(),
+        2,
+        "each leg costs exactly one listing and no session setup of its own: {targets:?}"
+    );
+    assert!(
+        targets[0].contains("direct%2Fevents%2F") || targets[0].contains("direct/events/"),
+        "the first leg lists its own table root under the composed base path: {targets:?}"
+    );
+    assert!(
+        targets[1].contains("direct%2Fevent_labels%2F")
+            || targets[1].contains("direct/event_labels/"),
+        "the second leg lists its own table root, not the first leg's: {targets:?}"
+    );
+}
+
+// Identifiers naming no first-level directory are refused before any listing, since they'd compose a table root outside the storage base path.
+#[tokio::test]
+async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused() {
+    let endpoint = empty_s3_endpoint().await;
+    let creds = unauthenticated_creds();
+    let storage = direct_storage_backend(&endpoint.uri);
+
+    for unresolvable in ["", "   ", "sub/dir", "sub\\dir", "..", "."] {
+        let err = TableScanResolver::for_request(
+            CatalogKind::DirectStorage,
+            DIRECT_STORAGE_ADDRESS,
+            ConnectionStorage {
+                storage: &storage,
+                creds: &creds,
+                allow_http: true,
+            },
+            &["events", unresolvable],
+            &Json::Null,
+        )
+        .await
+        .err()
+        .expect("an identifier naming no first-level directory must be refused");
+        assert!(
+            err.to_string().contains(&format!("'{unresolvable}'")),
+            "the refusal must name the identifier it rejected: {err}"
+        );
+        assert!(
+            err.to_string().contains("recreate the virtual schema"),
+            "the refusal must tell the operator how to repair it: {err}"
+        );
+    }
+
+    assert!(
+        endpoint.targets().is_empty(),
+        "a refused identifier must cost no object-store request: {:?}",
+        endpoint.targets()
+    );
+}
+
+// The pushdown path must compose the same table_root as enumeration's storage_location, regardless of trailing separators in the CONNECTION address.
+#[tokio::test]
+async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location() {
+    let endpoint = empty_s3_endpoint().await;
+    let creds = unauthenticated_creds();
+    let storage = direct_storage_backend(&endpoint.uri);
+    let address = "s3://warehouse/direct//";
+
+    let resolver = TableScanResolver::for_request(
+        CatalogKind::DirectStorage,
+        address,
+        ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+        &["events"],
+        &Json::Null,
+    )
+    .await
+    .expect("a direct-storage store is built from the CONNECTION alone");
+
+    let scan = resolver
+        .resolve("events", None)
+        .await
+        .expect("a directory with no data file resolves an empty scan");
+
+    assert_eq!(
+        scan.table_root,
+        join_storage_path(address, Some("events")),
+        "the pushdown table root must be the join the enumeration path composes \
+         `storage_location` with"
+    );
+    assert_eq!(
+        scan.table_root, "s3://warehouse/direct/events",
+        "repeated trailing separators on the CONNECTION address collapse to exactly one"
+    );
+}
+
+// RequestSession has one variant per catalog kind, built once here, so no later step needs a second kind match.
+#[tokio::test]
+async fn request_session_has_one_variant_per_kind() {
+    let iceberg = iceberg_catalog().await;
+    let endpoint = empty_s3_endpoint().await;
+    let creds = unauthenticated_creds();
+    let storage = sample_storage();
+    let direct_storage = direct_storage_backend(&endpoint.uri);
+
+    for (kind, uri, backend, identifier) in [
+        (
+            CatalogKind::IcebergRest,
+            iceberg.uri.as_str(),
+            &storage,
+            "db.t",
+        ),
+        (
+            CatalogKind::UnityCatalogNative,
+            iceberg.uri.as_str(),
+            &storage,
+            "cat.sch.orders",
+        ),
+        (
+            CatalogKind::DirectStorage,
+            DIRECT_STORAGE_ADDRESS,
+            &direct_storage,
+            "events",
+        ),
+    ] {
+        TableScanResolver::for_request(
+            kind,
+            uri,
+            ConnectionStorage {
+                storage: backend,
+                creds: &creds,
+                allow_http: true,
+            },
+            &[identifier],
+            &Json::Null,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{kind:?} must resolve a session of its own: {e}"));
+    }
 }

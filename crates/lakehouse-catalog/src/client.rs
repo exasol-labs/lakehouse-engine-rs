@@ -48,6 +48,8 @@ pub enum ColumnSourceType {
         precision: u32,
         scale: u32,
     },
+    /// A tag string of the engine's scan-spec vocabulary, not an Arrow `DataType`: this crate's manifest forbids declaring `arrow`.
+    Parquet(String),
 }
 
 /// The storage format a catalog reports one of its tables in.
@@ -60,6 +62,7 @@ pub enum ColumnSourceType {
 pub enum TableFormat {
     Iceberg,
     Delta,
+    Parquet,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -105,6 +108,8 @@ pub enum SkipReason {
     /// `detail` is the disqualifier fragment naming the offending value verbatim,
     /// such as `table_type=VIEW` or `data_source_format=ICEBERG`.
     NotDeltaBaseTable { detail: String },
+    /// A first-level directory holds no data file.
+    NoDataFile,
 }
 
 /// One entry the catalog listed that the enumeration excluded, with its reason.

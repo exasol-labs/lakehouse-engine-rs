@@ -158,3 +158,30 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
         "an Iceberg REST source must select its reader without issuing a request"
     );
 }
+
+// Selecting the reader must not touch the store: it holds no object, so listing or
+// footer-parsing here would fail.
+#[test]
+fn third_scan_source_selects_the_parquet_reader() {
+    let creds = offline_sigv4_creds();
+    let storage = sample_storage();
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+
+    let selected = format_reader(
+        ScanSource::DirectParquet {
+            store: &store,
+            table_root: "s3://warehouse/direct/events",
+            merge_mode: MergeMode::FoldEveryFile,
+        },
+        &ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    );
+
+    assert!(
+        selected.is_ok(),
+        "a raw Parquet directory must select its reader without reading anything"
+    );
+}

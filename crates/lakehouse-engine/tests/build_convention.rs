@@ -54,11 +54,27 @@ fn the_type_relaxation_suite_and_fixture_are_wired_into_run_fixtures_and_make_te
         recipe_line.contains("--test e2e_type_relaxation_test"),
         "test-e2e target must run --test e2e_type_relaxation_test"
     );
-
     let fixture_sql =
         workspace_root.join("scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql");
     assert!(
         fixture_sql.exists(),
         "scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql must exist on disk"
+    );
+}
+
+#[test]
+fn make_test_e2e_runs_the_direct_storage_binary() {
+    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let makefile = std::fs::read_to_string(workspace_root.join("Makefile"))
+        .expect("Makefile must be readable");
+    let mut lines = makefile.lines();
+    let recipe_line = lines
+        .find(|line| line.starts_with("test-e2e:"))
+        .and_then(|_| lines.next())
+        .expect("Makefile must have a test-e2e target followed by a recipe line");
+
+    assert!(
+        recipe_line.contains("--test e2e_direct_storage_test"),
+        "test-e2e target must run --test e2e_direct_storage_test"
     );
 }
