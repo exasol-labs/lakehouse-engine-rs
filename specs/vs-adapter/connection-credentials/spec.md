@@ -6,7 +6,9 @@ CONNECTION and specified by the sibling feature `connection-credentials-catalog-
 The Azure Data Lake Storage Gen2 credential shape is specified by the sibling feature
 `connection-credentials-azure`. Parameterizing validation by the resolved `CatalogKind`
 and the Unity Catalog reuse of these auth fields is specified by the sibling feature
-`connection-credentials-unity-catalog`.
+`connection-credentials-unity-catalog`. The AWS Glue SigV4 catalog-signing requirement —
+`access_key`, `secret_key`, a signing region, and the standard-AWS-Glue-endpoint region
+derivation — is specified by the sibling feature `connection-credentials-sigv4`.
 
 ## Background
 
@@ -17,7 +19,7 @@ and the Unity Catalog reuse of these auth fields is specified by the sibling fea
 * **A vended-only Azure CONNECTION supplies NO Azure field, so no Azure guard fires.** Such a CONNECTION carries `warehouse`, its catalog-auth fields, and `use_vended_credentials = true` and nothing else. `validate_creds` accepts it, `storage_block` produces an S3 backend with every field empty, and the vended resolution never reads that backend — the table location's `abfss://` scheme selects the ADLS backend instead. This is why the vended path cannot be reached from `storage_block`'s output and had to become its own selector.
 * **The SigV4 requirement on `access_key`, `secret_key`, and `region` is unchanged and stays independent of vending.** Those three sign the catalog `load_table` request before any credential is vended, so they are catalog-authentication inputs. What this delta separates is their second, previously conflated use: they no longer reach the scan's storage once vending is requested.
 * **This delta separates CREDENTIALS from ADDRESSING under vending and is issue #330. It changes no parsing rule, no guard, and no error text.** `ConnectionCreds` gains no field and loses none; `validate_creds` gains no rule. What changes is only what a supplied `endpoint` and `region` MEAN once `use_vended_credentials` is true.
-* **SUPERSEDES the `region` half of the SigV4-static-values bullet.** That bullet read: "**The SigV4 requirement on `access_key`, `secret_key`, and `region` is unchanged and stays independent of vending.** … What this delta separates is their second, previously conflated use: **they no longer reach the scan's storage once vending is requested.**" The static `access_key` and `secret_key` still do not reach the scan's storage under vending. The static `region` DOES, as addressing. The SigV4 REQUIREMENT itself is untouched — those three fields are still required when `use_sigv4` is true and still sign the catalog `load_table` request — so what widens is the consequence of supplying `region`, not the rule that demands it.
+* **SUPERSEDES the `region` half of the SigV4-static-values bullet.** That bullet read: "**The SigV4 requirement on `access_key`, `secret_key`, and `region` is unchanged and stays independent of vending.** … What this delta separates is their second, previously conflated use: **they no longer reach the scan's storage once vending is requested.**" The static `access_key` and `secret_key` still do not reach the scan's storage under vending. The static `region` DOES, as addressing. The SigV4 REQUIREMENT itself is untouched — those three fields still sign the catalog `load_table` request when the CONNECTION states them — so what widens is the consequence of supplying `region`, not the rule that demands it.
 * **SUPERSEDES this feature's earlier description sentence "Under vending, the CONNECTION's storage credentials are ignored; `vs-adapter/pushdown-planning-cloud-credentials` specifies the effective storage."** This feature is where the CONNECTION's field vocabulary is defined, and it elsewhere groups `endpoint` and `region` with `access_key` and `secret_key` under "static S3 credentials" — so a summary saying the storage credentials are ignored under vending would contradict the scenario below in the SAME spec file. The corrected sentence names the split: credentials ignored, `endpoint` and `region` read as addressing.
 * **The precedence rule itself stays single-homed and is CITED here, not restated.** `vs-adapter/pushdown-planning-cloud-credentials` § "Vended-credentials request advertises access delegation and resolves the store address with the CONNECTION winning when set" is the one normative home for which source wins per field. Restating it here would recreate the duplicated-rule-in-two-homes failure this plan exists to remove — that duplication is why this delta is needed at all.
 * **This delta widens `path_style` to a tri-state and flips its unstated meaning from `true` to `false` (#130).** `ConnectionCreds.path_style` and `StorageCreds.path_style` become `Option<bool>`: absent = unstated, supplied = the operator chose. AMENDS three scenarios, ADDS one, SUPERSEDES two Background bullets.
@@ -26,6 +28,7 @@ and the Unity Catalog reuse of these auth fields is specified by the sibling fea
 * **A resolved `false` DISCARDS a configured endpoint** (`build_undecorated_store`, `object_store.rs:226-231`, passes `endpoint` to `AmazonS3Builder` only inside `if storage.path_style`). This forces the new guard: a non-vended CONNECTION with an `endpoint` and no stated `path_style` is rejected rather than silently reaching the wrong host.
 * **`StorageProps` keeps its `bool` and `true` serde default.** It is the resolved wire type; the adapter always serializes the field. Decision [5] in the decision-log records the rationale.
 * **Neither the Iceberg table spec nor the Delta protocol constrain this choice.** `s3.path-style-access` appears nowhere in the Iceberg REST spec; Delta's `PROTOCOL.md` contains no `path-style`/`path_style`/`virtual-hosted`. Decision [9] records the evidence.
+* **The SigV4 signing region is a separate value from the CONNECTION's `region`.** `connection-credentials-sigv4` specifies the AWS Glue SigV4 catalog-signing requirement and the standard-AWS-Glue-endpoint region derivation. `region` itself holds exactly what the CONNECTION states and independently places the S3 store, whether or not a SigV4 signing region is derived from the address.
 
 The connection name is supplied as the VS property `CATALOG_CONNECTION`. The adapter
 resolves it with `ctx.connection(name)`. The resolved `ConnectionObject.address` is the
@@ -38,9 +41,7 @@ authentication and S3 storage credentials are fully orthogonal: any combination 
 including an unauthenticated catalog that vends S3 credentials and an OAuth-authenticated
 catalog used with static S3 credentials (the catalog-auth modes themselves are specified in
 `connection-credentials-catalog-auth`). The one conditional requirement is the AWS Glue SigV4
-path: when `use_sigv4`
-is true the static `access_key`, `secret_key`, and `region` are required (they sign the
-catalog `load_table` request, ahead of any credential vending); `endpoint` stays optional.
+path, specified by the sibling feature `connection-credentials-sigv4`. `endpoint` stays optional.
 
 ## Scenarios
 
@@ -99,15 +100,6 @@ catalog `load_table` request, ahead of any credential vending); `endpoint` stays
 * *THEN* the adapter SHALL accept the password without reporting any of `endpoint`, `region`, `access_key`, or `secret_key` as missing
 * *AND* the adapter SHALL treat each omitted S3 field as absent, independently of whether any catalog-auth field or `use_vended_credentials` is set
 
-### Scenario: When SigV4 is enabled, access_key, secret_key, and region are required
-
-* *GIVEN* a CONNECTION whose JSON password sets `use_sigv4` to true and supplies `warehouse` but omits one or more of `access_key`, `secret_key`, and `region`
-* *WHEN* the adapter resolves the connection
-* *THEN* the adapter SHALL return an error naming the missing field(s) and stating they are required when SigV4 signing is enabled
-* *AND* the adapter SHALL apply this guard even when `use_vended_credentials` is true, because the static `access_key`, `secret_key`, and `region` sign the catalog `load_table` request before any vended credentials are used
-* *AND* `endpoint` SHALL remain optional even when `use_sigv4` is true
-* *AND* the error message MUST NOT contain any supplied credential value
-
 ### Scenario: Optional credential fields default sensibly
 
 * *GIVEN* a CONNECTION password that supplies `warehouse` but omits the optional `endpoint`, `region`, `access_key`, `secret_key`, `session_token`, `path_style`, `use_sigv4`, `use_vended_credentials`, `token`, `client_id`, `client_secret`, `oauth2_server_uri`, `scope`, `account_name`, `account_key`, and `sas_token` fields
@@ -139,5 +131,6 @@ catalog `load_table` request, ahead of any credential vending); `endpoint` stays
 * *AND* the adapter SHALL read the CONNECTION's `endpoint`, `region`, and `path_style` into the effective scan storage as ADDRESSING when the CONNECTION states them, under the ONE precedence rule specified in `vs-adapter/pushdown-planning-cloud-credentials` § "Vended-credentials request advertises access delegation and resolves the store address with the CONNECTION winning when set" — SUPERSEDING the recorded clause that named `endpoint` and `region` alone, and SUPERSEDING the recorded clause "the adapter MUST NOT read the CONNECTION's `path_style`... because that field is a plain boolean with a `true` default and cannot express 'unstated'", whose reason no longer holds (#130)
 * *AND* "states them" SHALL mean non-empty for `endpoint` and `region` and PRESENT for `path_style`, because an absent boolean and an empty string are the two spellings of unstated that these field types admit
 * *AND* the adapter SHALL still apply the existing guard rejecting a CONNECTION that supplies BOTH Azure and static S3 storage fields, because that input declares two incompatible intents whether or not either is read
-* *AND* the adapter SHALL still require `access_key`, `secret_key`, and `region` when `use_sigv4` is true, because those sign the catalog `load_table` request rather than reaching object storage — and under vending the `region` they supply now ALSO places the store, which repairs the Glue vended path rather than changing what the guard demands
+* *AND* the adapter SHALL still apply the guard of `connection-credentials-sigv4` § "When SigV4 is enabled, access_key, secret_key, and a signing region are required" when `use_sigv4` is true, because those inputs sign the catalog `load_table` request rather than reaching object storage
+* *AND* a `region` the CONNECTION states SHALL ALSO place the store under vending, while a signing region derived from the CONNECTION address SHALL place no store
 * *AND* no supplied credential value SHALL appear in any error message, returned SQL, or log line

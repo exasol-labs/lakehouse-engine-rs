@@ -29,7 +29,7 @@ credential-bearing SQL never reaches test output.
 * **No in-repo suite covers Databricks Unity Catalog, which reaches this same path.** `specs/mission.md` Core Capability 7 makes Databricks-managed Iceberg a first-class target, and `crates/lakehouse-catalog/src/vended.rs` names its flat-`config` fixture "the Databricks Unity Catalog shape where `storage_credentials` is empty and vended creds live in the flat config". A Unity Catalog response vending a key pair but neither `client.region` nor `s3.endpoint` now fails at plan time with the same clear address error, and no suite in this repository can observe it.
 * **The suite's opt-in SKIP semantics are unchanged.** A missing AWS credential still skips cleanly; only the assertions inside the vended scenario change. That skip is exactly why the new assertion is a verification OBLIGATION on this suite rather than a gate the workspace `cargo test` run can discharge.
 * **No credential value may appear in the new assertion's failure output.** The assertion reports which config KEY was absent from the vended response, never a vended or static value, matching the existing rule that this suite's credential-bearing DDL failures print neither the SQL nor the Exasol response.
-* **This delta REDUCES one verification obligation and adds nothing else; it is issue #330.** `vs-adapter/pushdown-planning-cloud-credentials` now resolves the vended store address from the CONNECTION when the CONNECTION states one and from the `loadTable` response otherwise, so Glue's static `region` — which `use_sigv4` already requires for catalog signing — places the store.
+* **This delta REDUCES one verification obligation and adds nothing else; it is issue #330.** `vs-adapter/pushdown-planning-cloud-credentials` now resolves the vended store address from the CONNECTION when the CONNECTION states one and from the `loadTable` response otherwise, so a Glue CONNECTION that states `region` places the store with that value.
 * **SUPERSEDES the premise that Glue's vended `client.region` is load-bearing.** The recorded bullet counted "three keys at stake, not one — `s3.access-key-id`, `s3.secret-access-key`, and the store address (`client.region`, since Glue vends no `s3.endpoint`)". Two remain at stake. The address is no longer one of them, because an absent vended address is now legal and the CONNECTION's `region` fills it.
 * **The credential half of the obligation is UNCHANGED and stays hard.** The suite's CONNECTION carries static AWS keys, so a passing scan alone still cannot evidence that Glue vended a key pair. That assertion stays a failure, not a report.
 * **The address key becomes an OBSERVATION rather than an assertion, and the reason is that its absence is no longer a defect.** Reporting what Glue vends still has diagnostic value — it is the only in-repo window onto a real cloud vended payload — but failing the suite on it would assert a requirement the engine no longer has.
@@ -71,7 +71,7 @@ credential-bearing SQL never reaches test output.
 ### Scenario: Vended credentials are exercised end to end against Glue
 
 * *GIVEN* the AWS credentials are present and the CONNECTION enables `use_vended_credentials`
-* *AND* that CONNECTION supplies a static `access_key`, `secret_key`, and `region` because `use_sigv4` requires them for catalog signing
+* *AND* that CONNECTION supplies a static `access_key`, `secret_key`, and `region`, because SigV4 signs the catalog requests with them and the stated `region` also places the store
 * *WHEN* the test runs a scan query whose data files are read using credentials vended by Glue's `load_table` response
 * *THEN* the scan SHALL successfully read the data files using the vended credentials
 * *AND* the scan SHALL succeed WITHOUT reading any static CREDENTIAL from the CONNECTION, so a successful row set proves Glue's vended response alone supplied the access key, secret key, and session token
@@ -80,6 +80,18 @@ credential-bearing SQL never reaches test output.
 * *AND* the test SHALL REPORT whether `s3.session-token` is present, because an absent vended token beside a vended temporary key pair yields no token and fails at read time rather than plan time
 * *AND* when an ASSERTED key is absent, the test MUST fail naming that config key, rather than passing on a credential the CONNECTION happened to supply
 * *AND* the test output MUST NOT contain any vended or static credential value
+
+### Scenario: A Glue CONNECTION that omits region lists the Glue table through SigV4-signed catalog requests
+
+* *GIVEN* the AWS credential and endpoint environment variables are present
+* *AND* `GLUE_CATALOG_URI` begins with `https://glue.<AWS_REGION>.amazonaws.com/`, so it is a standard AWS Glue endpoint for the region that `AWS_REGION` holds
+* *AND* an Exasol CONNECTION whose address is `GLUE_CATALOG_URI` and whose password JSON enables SigV4, supplies the key pair, and omits `region`
+* *WHEN* the test creates a virtual schema over the Glue namespace through that CONNECTION
+* *THEN* `CREATE VIRTUAL SCHEMA` SHALL succeed
+* *AND* the virtual schema SHALL list the configured Glue table, which proves that Glue accepted the namespace-enumeration and `loadTable` requests signed for the region that the endpoint host names
+* *AND* the test SHALL read no data file through that virtual schema, because a signing region derived from the endpoint places no S3 store
+* *AND* when `GLUE_CATALOG_URI` does not begin with that prefix, the test SHALL skip with a message that names the reason, and MUST NOT fail
+* *AND* the test output MUST NOT contain any credential value
 
 ### Scenario: Remote bench wires PARALLELISM_FACTOR into the virtual schema
 
