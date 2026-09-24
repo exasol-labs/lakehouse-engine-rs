@@ -23,6 +23,16 @@ Project mission in: @specs/mission.md
   `initial_instructions` before the first code read/grep/edit — don't default to
   built-in tools out of habit.
 
+## Code comment style
+
+- **Default to no comments.** Only keep essential, concise comments for a non-obvious
+  "why", never to explain how the code got this way — that belongs in the commit message.
+- **A doc comment on a test names the scenario in one line** (`/// Scenario: <fact>`),
+  matching the convention already used across `*_tests.rs` files. It does not repeat the
+  scenario title as a second, separately-quoted sentence.
+- Before committing, scan new/changed comments for ones exceeding roughly 4-5 lines or
+  restating the same idea twice, and trim them.
+
 ## Unit test layout
 
 - **No test code in a production source file.** Unit tests MUST live in a sibling file named after

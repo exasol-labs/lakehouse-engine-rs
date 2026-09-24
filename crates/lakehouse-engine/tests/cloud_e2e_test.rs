@@ -64,6 +64,7 @@ const CLOUD_VS_NAME: &str = "CLOUD_LAKEHOUSE";
 const CLOUD_ADAPTER_SCRIPT: &str = "LAKEHOUSE_ADAPTER";
 const CLOUD_CATALOG_CONN: &str = "GLUE_CATALOG_CREDS";
 const CLOUD_CATALOG_CONN_VENDED: &str = "GLUE_CATALOG_CREDS_VENDED";
+const CLOUD_CATALOG_CONN_NO_REGION: &str = "GLUE_CATALOG_CREDS_NO_REGION";
 const CLOUD_CATALOG_CONN_AUTH: &str = "CATALOG_AUTH_CREDS";
 
 // ---------------------------------------------------------------------------
@@ -158,6 +159,15 @@ impl CloudEnv {
     fn catalog_connection_password_vended(&self) -> CatalogConnectionPassword {
         CatalogConnectionPassword {
             use_vended_credentials: true,
+            ..self.catalog_connection_password()
+        }
+    }
+
+    /// Build a `CatalogConnectionPassword` with SigV4 enabled and `region` omitted,
+    /// so a standard AWS Glue endpoint must supply its own SigV4 signing region.
+    fn catalog_connection_password_without_region(&self) -> CatalogConnectionPassword {
+        CatalogConnectionPassword {
+            region: String::new(),
             ..self.catalog_connection_password()
         }
     }
@@ -332,14 +342,17 @@ impl CatalogAuthEnv {
 // Schema + VS setup helpers
 // ---------------------------------------------------------------------------
 
-fn vs_table(glue_table: &str) -> String {
-    // The adapter uppercases the table's last component.
-    let table_part = glue_table
+/// The adapter uppercases the table's last component.
+fn vs_table_name(glue_table: &str) -> String {
+    glue_table
         .split('.')
         .next_back()
         .unwrap_or(glue_table)
-        .to_uppercase();
-    format!("{CLOUD_VS_NAME}.{table_part}")
+        .to_uppercase()
+}
+
+fn vs_table(glue_table: &str) -> String {
+    format!("{CLOUD_VS_NAME}.{}", vs_table_name(glue_table))
 }
 
 /// The Iceberg namespace of a `namespace.table` identifier (everything before the
@@ -348,39 +361,29 @@ fn glue_namespace(glue_table: &str) -> &str {
     glue_table.rsplit_once('.').map_or(glue_table, |(ns, _)| ns)
 }
 
-fn setup_cloud_vs(conn: &mut ExaConn, env: &CloudEnv, conn_name: &str, vs_name: &str) {
+/// A CONNECTION-plus-virtual-schema target: the three values that always
+/// travel together when standing up a virtual schema against a Glue catalog.
+struct CloudVsTarget<'a> {
+    conn_name: &'a str,
+    vs_name: &'a str,
+    password: CatalogConnectionPassword,
+}
+
+fn setup_cloud_vs(conn: &mut ExaConn, env: &CloudEnv, target: &CloudVsTarget) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
 
-    let password = env.catalog_connection_password();
-    let create_conn_sql = build_create_connection_sql(conn_name, &env.glue_catalog_uri, &password);
+    let create_conn_sql =
+        build_create_connection_sql(target.conn_name, &env.glue_catalog_uri, &target.password);
     conn.execute(&create_conn_sql);
 
+    let vs_name = target.vs_name;
     let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{conn_name}'
+  CATALOG_CONNECTION = '{}'
   NAMESPACE  = '{}'"#,
-        glue_namespace(&env.glue_table)
-    ));
-}
-
-fn setup_cloud_vs_vended(conn: &mut ExaConn, env: &CloudEnv) {
-    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
-
-    let password = env.catalog_connection_password_vended();
-    let create_conn_sql =
-        build_create_connection_sql(CLOUD_CATALOG_CONN_VENDED, &env.glue_catalog_uri, &password);
-    conn.execute(&create_conn_sql);
-
-    let _ = conn.try_execute(&format!(
-        "DROP VIRTUAL SCHEMA IF EXISTS {CLOUD_VS_NAME}_VENDED CASCADE"
-    ));
-    conn.execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {CLOUD_VS_NAME}_VENDED
-USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
-  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_VENDED}'
-  NAMESPACE  = '{}'"#,
+        target.conn_name,
         glue_namespace(&env.glue_table)
     ));
 }
@@ -455,7 +458,15 @@ fn cloud_smoke_projection_filter_query() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs(&mut conn, &env, CLOUD_CATALOG_CONN, CLOUD_VS_NAME);
+    setup_cloud_vs(
+        &mut conn,
+        &env,
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN,
+            vs_name: CLOUD_VS_NAME,
+            password: env.catalog_connection_password(),
+        },
+    );
 
     let table = vs_table(&env.glue_table);
 
@@ -494,6 +505,72 @@ fn cloud_smoke_projection_filter_query() {
     // embedded in any variable printed above.)
 }
 
+/// Scenario: a region-less Glue CONNECTION still lists the Glue table, via the
+/// standard AWS Glue endpoint built from `AWS_REGION` — the endpoint's own
+/// region signs the catalog requests, and no data file is read.
+#[test]
+fn cloud_sigv4_region_derived_from_glue_endpoint_lists_table() {
+    let env = match CloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!(
+                "SKIPPED: cloud_sigv4_region_derived_from_glue_endpoint_lists_table — env vars absent"
+            );
+            return;
+        }
+    };
+
+    let standard_glue_uri = format!("https://glue.{}.amazonaws.com/iceberg", env.aws_region);
+    let env = CloudEnv {
+        glue_catalog_uri: standard_glue_uri,
+        ..env
+    };
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+
+    let vs_name = format!("{CLOUD_VS_NAME}_NO_REGION");
+
+    setup_cloud_vs(
+        &mut conn,
+        &env,
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN_NO_REGION,
+            vs_name: &vs_name,
+            password: env.catalog_connection_password_without_region(),
+        },
+    );
+
+    let table_names = conn.query_columns(&format!(
+        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{vs_name}'"
+    ));
+    let listed: Vec<String> = table_names
+        .first()
+        .map(|c| {
+            c.iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_uppercase()))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let expected_table = vs_table_name(&env.glue_table);
+
+    assert!(
+        listed.contains(&expected_table),
+        "SigV4-signed catalog requests using the endpoint-derived region must list \
+         the configured Glue table; found {listed:?}, expected {expected_table}"
+    );
+
+    println!(
+        "cloud_sigv4_region_derived_from_glue_endpoint_lists_table: listed {} table(s), including {expected_table}",
+        listed.len()
+    );
+}
+
 /// Cloud performance + aggregate smoke test: grouped COUNT/SUM, wall-clock timing.
 ///
 /// Records the query duration for manual inspection. No hard latency threshold.
@@ -515,7 +592,15 @@ fn cloud_perf_grouped_aggregate_smoke() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs(&mut conn, &env, CLOUD_CATALOG_CONN, CLOUD_VS_NAME);
+    setup_cloud_vs(
+        &mut conn,
+        &env,
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN,
+            vs_name: CLOUD_VS_NAME,
+            password: env.catalog_connection_password(),
+        },
+    );
 
     let table = vs_table(&env.glue_table);
 
@@ -597,17 +682,17 @@ fn cloud_scan_reads_with_vended_credentials() {
         &env.exasol_password,
     );
 
-    setup_cloud_vs_vended(&mut conn, &env);
+    setup_cloud_vs(
+        &mut conn,
+        &env,
+        &CloudVsTarget {
+            conn_name: CLOUD_CATALOG_CONN_VENDED,
+            vs_name: &format!("{CLOUD_VS_NAME}_VENDED"),
+            password: env.catalog_connection_password_vended(),
+        },
+    );
 
-    let vended_table = {
-        let table_part = env
-            .glue_table
-            .split('.')
-            .next_back()
-            .unwrap_or(&env.glue_table)
-            .to_uppercase();
-        format!("{CLOUD_VS_NAME}_VENDED.{table_part}")
-    };
+    let vended_table = format!("{CLOUD_VS_NAME}_VENDED.{}", vs_table_name(&env.glue_table));
 
     // A simple scan via vended credentials must return rows.
     let cols = conn.query_columns(&format!("SELECT * FROM {vended_table} LIMIT 5"));

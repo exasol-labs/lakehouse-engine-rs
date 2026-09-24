@@ -146,7 +146,7 @@ async fn resolve_load_table_prefix(
     creds: &ConnectionCreds,
 ) -> String {
     // SigV4/Glue: the prefix is derived from the warehouse — no /v1/config round-trip.
-    if let CatalogAuth::Sigv4 = auth {
+    if let CatalogAuth::Sigv4 { .. } = auth {
         return glue_catalog_prefix(warehouse);
     }
     let encoded_warehouse: String =

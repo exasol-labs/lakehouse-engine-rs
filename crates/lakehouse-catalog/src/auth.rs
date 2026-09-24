@@ -9,6 +9,7 @@
 use crate::ConnectionCreds;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
 use crate::redaction::redact_error_text;
+use crate::sigv4::required_signing_region;
 use exasol_udf_sdk::error::UdfError;
 use std::collections::HashMap;
 
@@ -100,8 +101,9 @@ pub(crate) fn redact_catalog_auth_error(msg: &str, creds: &ConnectionCreds) -> S
 /// Orthogonal to credential vending: this selects HOW a request is authenticated,
 /// never WHETHER vended credentials are extracted.
 pub(crate) enum CatalogAuth {
-    /// AWS SigV4 request signing against the `glue` service.
-    Sigv4,
+    /// AWS SigV4 request signing against the `glue` service, for the region
+    /// resolved once through `ConnectionCreds::sigv4_signing_region`.
+    Sigv4 { region: String },
     /// `Authorization: Bearer <token>` — either a static `token` or a token
     /// obtained from the OAuth2 client-credentials grant.
     Bearer(String),
@@ -223,13 +225,17 @@ async fn oauth2_client_credentials_grant(
 /// `validate_creds` rule 4 rejects a CONNECTION supplying SigV4 signing together
 /// with catalog token/OAuth credentials, so the two are mutually exclusive
 /// upstream and the branch chooses between strategies that cannot co-occur.
+/// The SigV4 strategy carries its signing region, and is refused when the
+/// credentials and `catalog_uri` supply none.
 pub(crate) async fn resolve_catalog_auth(
     client: &reqwest::Client,
     catalog_uri: &str,
     creds: &ConnectionCreds,
 ) -> Result<CatalogAuth, UdfError> {
     if creds.use_sigv4 {
-        return Ok(CatalogAuth::Sigv4);
+        return Ok(CatalogAuth::Sigv4 {
+            region: required_signing_region(creds, catalog_uri)?,
+        });
     }
     match creds.supplied_catalog_auth() {
         SuppliedCatalogAuth::Unauthenticated => Ok(CatalogAuth::None),

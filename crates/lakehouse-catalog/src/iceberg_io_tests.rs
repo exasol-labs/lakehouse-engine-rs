@@ -186,6 +186,39 @@ async fn catalog_error_message_uses_http_status_prefix() {
     );
 }
 
+/// Scenario: A standard AWS Glue endpoint supplies the SigV4 signing region
+/// when the CONNECTION omits region — the `loadTable` request is signed for the
+/// region the resolved strategy carries, never for `creds.region`, which stays
+/// empty here exactly as it does for a region-less CONNECTION.
+#[tokio::test]
+async fn sigv4_request_is_signed_for_the_carried_region() {
+    let (catalog_uri, heads) = spawn_recording_catalog("{}").await;
+    let mut creds = creds_no_auth();
+    creds.use_sigv4 = true;
+    creds.region = String::new();
+    let auth = CatalogAuth::Sigv4 {
+        region: "eu-west-1".into(),
+    };
+    let url = format!("{catalog_uri}/v1/catalogs/123456789012/namespaces/db/tables/t");
+
+    authed_get_json::<serde_json::Value>(&reqwest::Client::new(), &url, &auth, false, &creds)
+        .await
+        .expect("the signed request must reach the stub and succeed");
+
+    let heads = heads.lock().unwrap();
+    let [head] = heads.as_slice() else {
+        panic!(
+            "exactly one catalog request must be sent, got {}",
+            heads.len()
+        );
+    };
+    let authorization = authorization_header(head).expect("the request must be signed");
+    assert!(
+        authorization.contains("/eu-west-1/glue/aws4_request"),
+        "the credential scope must name the carried region: {authorization}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Task 4.5 / 3.1 — Redaction: secrets never in errors from the new paths
 // ---------------------------------------------------------------------------

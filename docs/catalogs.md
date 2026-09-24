@@ -39,7 +39,7 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 |---|---|---|
 | `warehouse` | yes under `ICEBERG_REST`; not used under `UNITY_CATALOG` | Catalog routing identifier — an AWS account id under Glue, a warehouse **name** under Lakekeeper, or whatever identifier a generic Iceberg REST catalog registered — never read as a storage location, so a URI-shaped value (as the bundled `iceberg-rest`/MinIO stack below uses) is still only an identifier. A native Unity Catalog is addressed by `catalog.schema.table` instead, so this field is not required (or read) under `CATALOG_KIND = 'UNITY_CATALOG'` |
 | `endpoint` | yes, unless `use_sigv4` or vended credentials | S3 endpoint URL |
-| `region` | yes, unless `use_sigv4` or vended credentials | S3 region |
+| `region` | yes, unless `use_sigv4` and the address is a standard AWS Glue endpoint (`https://glue.<region>.amazonaws.com`), or vended credentials | S3 region — also the SigV4 signing region unless a standard Glue endpoint supplies its own; state it whenever a scan reads with static S3 keys |
 | `access_key` | yes, unless `use_sigv4` or vended credentials | S3 access key |
 | `secret_key` | yes, unless `use_sigv4` or vended credentials | S3 secret key |
 | `session_token` | no | STS session token |
@@ -54,7 +54,7 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 
 **Mutual exclusivity:** you cannot combine `use_sigv4` with `token`, `client_id`, or `client_secret`. The adapter rejects a CONNECTION that sets both. SigV4 signs the catalog requests itself. A separate catalog token or OAuth2 flow conflicts with it. `use_sigv4` is rejected outright under `CATALOG_KIND = 'UNITY_CATALOG'` — a native Unity Catalog authenticates with a bearer token or Databricks OAuth, never AWS SigV4.
 
-With `CATALOG_KIND` absent (Iceberg REST, the default), `warehouse` is always required. If you turn `use_sigv4` on, `region`, `access_key`, and `secret_key` become required instead. These three fields sign the catalog request, and `endpoint` stays optional. If you turn `use_vended_credentials` on without SigV4, you can omit all static S3 fields. The catalog then vends short-lived credentials from `load_table`. Under `CATALOG_KIND = 'UNITY_CATALOG'`, the same static-vs-vended S3 field choice applies, but `warehouse` is never required.
+With `CATALOG_KIND` absent (Iceberg REST, the default), `warehouse` is always required. If you turn `use_sigv4` on, `access_key` and `secret_key` become required, and `region` becomes required too unless the CONNECTION's address is a standard, commercial AWS Glue endpoint of the form `https://glue.<region>.amazonaws.com` — such an endpoint supplies its own SigV4 signing region. These fields sign the catalog request, and `endpoint` stays optional. `region` also places the S3 store independently of whatever region signs the catalog request, so state it whenever a scan reads data with static S3 keys, even against a standard Glue endpoint. If you turn `use_vended_credentials` on without SigV4, you can omit all static S3 fields. The catalog then vends short-lived credentials from `load_table`. Under `CATALOG_KIND = 'UNITY_CATALOG'`, the same static-vs-vended S3 field choice applies, but `warehouse` is never required.
 
 An unstated `path_style` resolves to `false` on a non-vended CONNECTION, which discards `endpoint` and derives a virtual-hosted AWS host from `region` instead. If you configure a non-vended `endpoint` (MinIO, Ceph, or any other self-hosted S3-compatible store), you must state `path_style` explicitly — the adapter rejects a CONNECTION that sets `endpoint` without it. On a vended CONNECTION (`use_vended_credentials` on, or a catalog that vends storage credentials automatically), a stated `path_style` wins over the value the catalog response vends; omit the field there to keep the vended value.
 
@@ -90,7 +90,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 
 ## AWS Glue Iceberg REST (SigV4)
 
-The catalog URI is the Glue Iceberg REST endpoint. `warehouse` is the AWS **account id**, not an `s3://` path. The adapter derives the Glue REST prefix `catalogs/{account-id}` from it automatically. Turn `use_sigv4` on. `region`, `access_key`, and `secret_key` then become required, and they sign the catalog requests. Omit `endpoint`. With `path_style: false`, the S3 client derives the standard AWS endpoint from `region`. The account id below is a placeholder, so substitute your own.
+The catalog URI is the Glue Iceberg REST endpoint. `warehouse` is the AWS **account id**, not an `s3://` path. The adapter derives the Glue REST prefix `catalogs/{account-id}` from it automatically. Turn `use_sigv4` on. `access_key` and `secret_key` then become required, and they sign the catalog requests. When the CONNECTION's address is a standard, commercial AWS Glue endpoint of the form `https://glue.<region>.amazonaws.com` — as below — that endpoint supplies its own SigV4 signing region, so `region` may be omitted for signing purposes; any other Glue endpoint (AWS GovCloud, AWS China, FIPS, a VPC interface endpoint, a private or proxy host) still requires a stated `region`. `region` also places the S3 store, independently of whatever region signs the catalog request, so state it whenever a scan reads data with static S3 keys — even against a standard endpoint. Omit `endpoint`. With `path_style: false`, the S3 client derives the standard AWS endpoint from `region`. The account id below is a placeholder, so substitute your own.
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
@@ -112,7 +112,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
   NAMESPACE          = 'default';
 ```
 
-`session_token` is optional. For a long-lived key pair, remove it. To let the catalog vend short-lived S3 credentials for data access instead of the static pair, add `"use_vended_credentials": true`. The static `access_key`, `secret_key`, and `region` are still required to sign the first `load_table` call. `ALLOW_HTTP` is absent because Glue and AWS S3 use HTTPS.
+`session_token` is optional. For a long-lived key pair, remove it. To let the catalog vend short-lived S3 credentials for data access instead of the static pair, add `"use_vended_credentials": true`. The static `access_key` and `secret_key` are still required to sign the first `load_table` call, and `region` is too unless the CONNECTION's address is a standard AWS Glue endpoint, which supplies its own signing region. If you omit `region` against a standard endpoint under vending, store placement then depends entirely on whatever `client.region` Glue's vended response carries — no test in this repository asserts that Glue actually vends that key, so verify it against a live Glue catalog before relying on it, or state `region` explicitly for a guaranteed store placement. `ALLOW_HTTP` is absent because Glue and AWS S3 use HTTPS.
 
 ## Generic REST with static token or OAuth2
 

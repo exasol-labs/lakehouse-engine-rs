@@ -30,7 +30,7 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
         let base = redact_catalog_auth_error(msg, creds);
         match auth {
             CatalogAuth::Bearer(token) => redact_secret_values(&base, &[token.as_str()]),
-            CatalogAuth::Sigv4 | CatalogAuth::None => base,
+            CatalogAuth::Sigv4 { .. } | CatalogAuth::None => base,
         }
     };
 
@@ -49,12 +49,12 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
     })?;
 
     let request = match auth {
-        CatalogAuth::Sigv4 => crate::sigv4::sign_request(
+        CatalogAuth::Sigv4 { region } => crate::sigv4::sign_request(
             request,
             &creds.access_key,
             &creds.secret_key,
             creds.session_token.as_deref(),
-            &creds.region,
+            region,
             "glue",
         )
         .map_err(|e| {

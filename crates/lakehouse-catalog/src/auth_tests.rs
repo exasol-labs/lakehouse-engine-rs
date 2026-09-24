@@ -363,8 +363,8 @@ async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
         .await
         .expect("sigv4 resolution must not fail");
     assert!(
-        matches!(auth, CatalogAuth::Sigv4),
-        "use_sigv4 must resolve to CatalogAuth::Sigv4"
+        matches!(&auth, CatalogAuth::Sigv4 { region } if region == "us-east-1"),
+        "use_sigv4 must resolve to CatalogAuth::Sigv4 carrying the stated region"
     );
 
     // The OAuth2 client-credentials grant shape is the network branch and is
@@ -393,6 +393,30 @@ async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
         matches!(auth, CatalogAuth::None),
         "no auth fields supplied must resolve to CatalogAuth::None"
     );
+}
+
+fn sigv4_creds_stating_region(region: &str) -> ConnectionCreds {
+    let mut creds = creds_no_auth();
+    creds.use_sigv4 = true;
+    creds.region = region.into();
+    creds
+}
+
+/// Scenario: the `CatalogSession` signing path refuses to resolve a SigV4
+/// strategy when neither the stated region nor the catalog URI supplies one,
+/// with an error naming `region`.
+#[tokio::test]
+async fn sigv4_auth_refuses_without_signing_region() {
+    let client = reqwest::Client::new();
+    let creds = sigv4_creds_stating_region("");
+
+    let Err(UdfError::User(msg)) =
+        resolve_catalog_auth(&client, "https://catalog.example.com/iceberg", &creds).await
+    else {
+        panic!("a SigV4 CONNECTION with no signing region must be refused as a user error");
+    };
+
+    assert_eq!(msg, crate::sigv4::MISSING_SIGNING_REGION);
 }
 
 /// Scenario: `token` supplied alongside a complete `client_id`/`client_secret`

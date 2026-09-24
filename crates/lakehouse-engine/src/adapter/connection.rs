@@ -18,8 +18,12 @@ use super::nonempty_str;
 ///
 /// The four S3 fields (`endpoint`, `region`, `access_key`, `secret_key`) are
 /// optional at the base level; they are orthogonal to catalog authentication and
-/// credential vending. `region`/`access_key`/`secret_key` become required only
-/// when `use_sigv4` is enabled (see `read_connection`).
+/// credential vending. `access_key` and `secret_key` become required whenever
+/// `use_sigv4` is enabled. `region` becomes required only when `use_sigv4` is
+/// enabled AND the CONNECTION's address is not a standard AWS Glue endpoint of
+/// the form `https://glue.<region>.amazonaws.com` — such an endpoint supplies
+/// its own SigV4 signing region (see `ConnectionCreds::sigv4_signing_region`
+/// and `read_connection`).
 pub const REQUIRED_KEY: &str = "warehouse";
 
 /// Parsed credential fields from a CONNECTION password JSON object, declared once
@@ -97,7 +101,7 @@ fn validate_creds(
 ) -> Result<(), UdfError> {
     validate_kind_preconditions(name, creds, kind, address)?;
     validate_azure_storage_creds(name, creds)?;
-    validate_sigv4_creds(name, creds)?;
+    validate_sigv4_creds(name, creds, address)?;
     validate_exclusive_catalog_auth_creds(name, creds)?;
     validate_oauth2_creds(name, creds)?;
     validate_path_style_with_endpoint(name, creds)?;
@@ -232,7 +236,11 @@ fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(
     Ok(())
 }
 
-fn validate_sigv4_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+fn validate_sigv4_creds(
+    name: &str,
+    creds: &ConnectionCreds,
+    catalog_uri: &str,
+) -> Result<(), UdfError> {
     if creds.use_sigv4 && creds.has_catalog_auth() {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' enables SigV4 signing together with catalog \
@@ -248,13 +256,19 @@ fn validate_sigv4_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfEr
         if creds.secret_key.is_empty() {
             missing.push("secret_key");
         }
-        if creds.region.is_empty() {
+        if creds.sigv4_signing_region(catalog_uri).is_none() {
             missing.push("region");
         }
         if !missing.is_empty() {
+            let glue_hint = if missing.contains(&"region") {
+                "; a CONNECTION whose address is a standard AWS Glue endpoint of the form \
+                 https://glue.<region>.amazonaws.com can omit region"
+            } else {
+                ""
+            };
             return Err(UdfError::User(format!(
                 "CONNECTION '{name}' enables SigV4 signing but is missing field(s) \
-                 required when SigV4 signing is enabled: {}",
+                 required when SigV4 signing is enabled: {}{glue_hint}",
                 missing.join(", ")
             )));
         }
