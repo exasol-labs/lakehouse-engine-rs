@@ -82,6 +82,9 @@ anyhow     = { version = "1" }
 chrono  = { version = "0.4" }
 futures = { version = "0.3" }
 url     = { version = "2" }
+# Percent-decodes Hive partition-directory values and percent-encodes direct-storage FileEntry
+# paths; already resolved to 2.3.2 transitively through url and object_store.
+percent-encoding = { version = "2" }
 
 # AWS SigV4 signing for the Glue REST catalog: lakehouse-catalog signs every
 # catalog request it issues on that path.

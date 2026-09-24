@@ -28,11 +28,14 @@ fn encode_parquet(batch: &RecordBatch) -> Bytes {
 
 /// Writes `batch` as one Parquet object at `uri` (e.g.
 /// `"s3://warehouse/direct/events/file1.parquet"`) via the shared local-stack S3
-/// backend. Idempotent: a repeated call at the same `uri` overwrites the object.
+/// backend, keying it verbatim so `region=a%2Fb` stays literal as Spark writes it.
+/// Idempotent: a repeated call at the same `uri` overwrites the object.
 pub fn write_parquet_fixture(uri: &str, batch: RecordBatch) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);
     let bytes = encode_parquet(&batch);
+    let key = ObjectStorePath::parse(key)
+        .unwrap_or_else(|e| panic!("raw-Parquet fixture key {key} is not a valid store path: {e}"));
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -40,7 +43,7 @@ pub fn write_parquet_fixture(uri: &str, batch: RecordBatch) {
         .expect("tokio runtime for raw-Parquet fixture write");
     rt.block_on(async {
         store
-            .put(&ObjectStorePath::from(key), PutPayload::from(bytes))
+            .put(&key, PutPayload::from(bytes))
             .await
             .unwrap_or_else(|e| panic!("PUT raw-Parquet fixture at {uri}: {e}"));
     });

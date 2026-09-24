@@ -909,7 +909,7 @@ pub struct FileEntry {
     /// Path to the data file, relative to [`CommonScanSpec::table_root`] when
     /// non-empty and the file lives under it, otherwise an absolute URI. Stored
     /// exactly as the source catalog or transaction log records it, resolved by
-    /// nothing at plan time.
+    /// nothing at plan time. Read as a URL-encoded reference (see [`encode_file_path`]).
     pub path: String,
     /// Byte size, used to build the file's `ObjectMeta` without an
     /// object-store HEAD.
@@ -1452,6 +1452,31 @@ pub(crate) fn reconstruct_abs_uri(entry_path: &str, table_root: &str) -> String 
     let root = table_root.strip_suffix('/').unwrap_or(table_root);
     let rel = entry_path.strip_prefix('/').unwrap_or(entry_path);
     format!("{root}/{rel}")
+}
+
+/// The characters `ListingTableUrl::parse` would decode or read as fragment/query.
+const URL_PARSE_UNSAFE: &percent_encoding::AsciiSet = &percent_encoding::AsciiSet::EMPTY
+    .add(b'%')
+    .add(b'#')
+    .add(b'?');
+
+/// Joins store path parts into a [`FileEntry::path`], escaping what `ListingTableUrl::parse`
+/// would otherwise decode; `len_hint` pre-sizes the result.
+pub(crate) fn encode_file_path<'p>(
+    parts: impl Iterator<Item = object_store::path::PathPart<'p>>,
+    len_hint: usize,
+) -> String {
+    let mut encoded = String::with_capacity(len_hint);
+    for (index, part) in parts.enumerate() {
+        if index > 0 {
+            encoded.push('/');
+        }
+        encoded.extend(percent_encoding::utf8_percent_encode(
+            part.as_ref(),
+            URL_PARSE_UNSAFE,
+        ));
+    }
+    encoded
 }
 
 #[cfg(test)]
