@@ -147,7 +147,10 @@ services:
   # `lakekeeper` user below, so returned session creds are capped at the
   # `warehouse` bucket. One-shot; idempotent on re-`up`.
   minio-lakekeeper-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    # bitnamilegacy mirrors the same `mc` binary — quay.io/minio/mc is no
+    # longer pullable without a subscription (see docker-compose.yml's `minio`
+    # service comment).
+    image: bitnamilegacy/minio-client:2025.7.21-debian-12-r3
     depends_on:
       minio:
         condition: service_healthy
