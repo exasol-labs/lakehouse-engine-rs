@@ -48,15 +48,21 @@ Extends `datafusion-scan/scan-execution` with node-local broadcast inner equi-jo
 * *WHEN* the scan UDF ranks the joined rows for its local top-N
 * *THEN* the UDF SHALL rank the rows exactly as the Exasol-side wrapper ranks the emitted rows, so the shard's local top-N keeps every row of that shard that the wrapper's global top-N selects
 * *AND* a key column the scan emits through the JSON rendering or the `CAST(... AS VARCHAR)` fallback SHALL rank by that emitted text, not by its native value
-* *AND* an emitted empty string SHALL rank as NULL, placed by the key's NULL placement, because Exasol's VARCHAR domain has no empty string
-* *AND* a `NaN` in a `Float32` or `Float64` key SHALL rank as NULL, placed by the key's NULL placement, because the `emit_batch` path emits it as NULL (#246)
+* *AND* an emitted empty string SHALL rank as NULL, placed by the key's NULL placement
+* *AND* a `NaN` in a `Float32` or `Float64` key SHALL rank as NULL, placed by the key's NULL placement (#246)
 <!-- /DELTA:NEW -->
 
-<!-- DELTA:NEW -->
-### Scenario: A join block without a post-join ordering keeps its encoding
+<!-- DELTA:CHANGED -->
+### Scenario: Join projection, filter, and LIMIT are applied and rows streamed as Arrow IPC
 
-* *GIVEN* a join scan spec whose serialized join block omits the post-join ordering
-* *WHEN* the scan UDF parses its arguments and builds the join query
-* *THEN* the spec SHALL deserialize with an empty post-join ordering, and the UDF SHALL render no `ORDER BY` for it
+* *GIVEN* a join scan spec carrying a projection spanning both sides, an optional filter, and an optional post-join row cap `n` and post-join ordering carried in its JOIN BLOCK
+* *WHEN* the scan UDF runs
+* *THEN* the UDF SHALL emit only the projected join-output columns, in spec order, for rows satisfying both the join condition and the filter
+* *AND* the UDF SHALL emit no more rows than the cap when one is carried, reading it from the join block and MUST NOT consult the spec's shard-invariant row-limit field on this path (issue #307)
+* *AND* a join spec whose serialized join block omits the cap, the ordering, or both SHALL deserialize with no cap and no ordering and behave exactly as an unlimited, unordered join scan, so a spec produced before this delta is unaffected
 * *AND* a join block whose post-join ordering is empty SHALL serialize without the ordering key, so a broadcast plan that carries no per-shard ordering keeps its encoding
-<!-- /DELTA:NEW -->
+* *AND* the cap SHALL bound JOINED OUTPUT rows and MUST NOT bound either side's scanned input rows, so for a fixture whose first `n` fact rows match no dimension row the UDF SHALL still emit `n` joined rows rather than zero (issue #307)
+* *AND* the UDF MUST NOT register either side with an input-side fetch, and the executed plan MUST NOT carry a limit below the join node on either input
+* *AND* the UDF SHALL emit each result batch via the SDK Arrow-batch emit path (`emit_batch`), fetching one batch, emitting it, and dropping it before the next, never materializing the entire joined result set
+* *AND* no typed Arrow value SHALL cross the `.so` boundary — only the serialized IPC byte buffer
+<!-- /DELTA:CHANGED -->
