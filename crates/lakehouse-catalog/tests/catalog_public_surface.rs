@@ -319,6 +319,24 @@ fn list_namespace_tables_is_no_longer_public() {
     );
 }
 
+/// `ConnectionCreds::sigv4_signing_region` is the ONE item the SigV4 signing
+/// region adds to the public surface. Calling it here, rather than only naming
+/// the type, makes narrowing it below `pub` a compile failure in this
+/// external-crate probe. The call exercises the region-less standard Glue
+/// endpoint the adapter's guard relies on.
+#[test]
+fn connection_creds_sigv4_signing_region_is_reachable() {
+    let creds = ConnectionCreds {
+        region: String::new(),
+        ..connection_creds()
+    };
+
+    let region: Option<String> =
+        creds.sigv4_signing_region("https://glue.eu-west-1.amazonaws.com/iceberg");
+
+    assert_eq!(region.as_deref(), Some("eu-west-1"));
+}
+
 /// The native Unity Catalog public items — the session, the temporary-table-
 /// credentials response type, the vended selector, and the store address that
 /// selector takes — are reachable from outside the crate through the `unity` and

@@ -184,7 +184,9 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
 
     let mut creds = base_creds();
     creds.use_sigv4 = true;
-    let auth = CatalogAuth::Sigv4;
+    let auth = CatalogAuth::Sigv4 {
+        region: "us-east-1".into(),
+    };
 
     let client = reqwest::Client::new();
     let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
@@ -331,14 +333,15 @@ async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
 
     let mut creds = base_creds();
     creds.use_sigv4 = true;
+    creds.region = String::new();
 
     let session = CatalogSession::resolve(catalog_uri, warehouse, &creds)
         .await
         .expect("sigv4 session resolution must not fail without any network access");
 
     assert!(
-        matches!(session.auth, CatalogAuth::Sigv4),
-        "sigv4 creds must resolve to CatalogAuth::Sigv4"
+        matches!(&session.auth, CatalogAuth::Sigv4 { region } if region == "us-east-1"),
+        "sigv4 creds must resolve to CatalogAuth::Sigv4 carrying the endpoint's region"
     );
     assert_eq!(
         session.prefix,

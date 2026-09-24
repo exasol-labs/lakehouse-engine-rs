@@ -2,7 +2,8 @@
 
 Tracks each explicit, reviewed extension of `lakehouse-catalog`'s enumerated public surface after
 the crate boundary itself was drawn — the shared `CatalogClient` trait, a demotion once a caller
-moved in-crate, and four narrow additions the engine-side format and credential work required.
+moved in-crate, and the narrow additions that the engine-side format, credential, and catalog-signing
+work required.
 
 This is the sibling of `vs-adapter/catalog-crate-structure`, split out once the base feature's
 scenario count crossed this library's per-spec organization threshold. `vs-adapter/catalog-crate-structure`
@@ -149,3 +150,16 @@ explicit reviewed edit to the crate's reachability probe at
 * *AND* that edit MUST NOT add a source-TEXT assertion over any enum's variant list, because a structural invariant enforced by matching production source text is not one this project accepts; the probe's value here is that it compiles against the crate from outside it
 * *AND* the probe's existing demotion assertions — that the crate declares no `pub fn` for the demoted vended-mechanism functions and no `pub fn list_namespace_tables` — SHALL remain intact and unweakened
 * *AND* the table-format enum SHALL NOT gain an exhaustive production match as part of this change, and the ONE existing guard — the Delta reader-selection arm's equality check, which refuses a table whose reported format is not Delta — SHALL be recorded as the guard that a Parquet-tagged table is not misrouted, because a reader expecting a compile error would otherwise read its absence as an oversight
+
+### Scenario: The SigV4 signing-region resolver is a public method of the shared credential type
+
+* *GIVEN* the enumerated public surface of `lakehouse-catalog` and its external-vantage reachability probe at `crates/lakehouse-catalog/tests/catalog_public_surface.rs`, which fails to compile if any enumerated item is narrowed below `pub`
+* *AND* three readers that need the region a SigV4-signed catalog request is signed for: the adapter's SigV4 credential guard in `lakehouse-engine`, the crate's signed namespace enumeration, and the crate's `CatalogSession` catalog requests
+* *WHEN* the crate's public surface is declared
+* *THEN* `ConnectionCreds` SHALL declare exactly ONE additional `pub` method, which returns that signing region from the credential set and a catalog URI, and returns nothing when neither the stated `region` nor the URI supplies one
+* *AND* the crate SHALL add no other item to its public surface for the signing region
+* *AND* the standard AWS Glue endpoint host rule and the signing-region precedence of `vs-adapter/connection-credentials` SHALL each have exactly ONE declaration, beside the crate's SigV4 request signing, so the adapter guard and the two signing paths cannot disagree about whether a signing region exists
+* *AND* every step behind that method, including the host-shape parser, SHALL stay crate-private
+* *AND* each of the two signing paths SHALL resolve its region through that method once per session or enumeration, and SHALL refuse to sign, returning an error that names `region` and contains no credential value, when the method returns nothing
+* *AND* the method SHALL name no Exasol CONNECTION or virtual-schema-property delivery mechanism, and no `lakehouse-catalog` source file SHALL name `lakehouse_engine`
+* *AND* the probe SHALL call the method, and its existing demotion assertions SHALL remain intact and unweakened
