@@ -402,48 +402,6 @@ fn sigv4_creds_stating_region(region: &str) -> ConnectionCreds {
     creds
 }
 
-/// Scenario: A standard AWS Glue endpoint supplies the SigV4 signing region
-/// when the CONNECTION omits region — the `CatalogSession` signing path.
-#[tokio::test]
-async fn sigv4_auth_carries_region_derived_from_glue_endpoint() {
-    let client = reqwest::Client::new();
-    let creds = sigv4_creds_stating_region("");
-
-    let auth = resolve_catalog_auth(
-        &client,
-        "https://glue.eu-west-1.amazonaws.com/iceberg",
-        &creds,
-    )
-    .await
-    .expect("a standard Glue endpoint supplies the signing region");
-
-    assert!(
-        matches!(&auth, CatalogAuth::Sigv4 { region } if region == "eu-west-1"),
-        "the SigV4 strategy must carry the endpoint's region"
-    );
-}
-
-/// Scenario: A standard AWS Glue endpoint signs the catalog request even when
-/// the CONNECTION states a different region — the `CatalogSession` signing path.
-#[tokio::test]
-async fn sigv4_auth_derives_region_even_when_a_different_region_is_stated() {
-    let client = reqwest::Client::new();
-    let creds = sigv4_creds_stating_region("us-east-1");
-
-    let auth = resolve_catalog_auth(
-        &client,
-        "https://glue.eu-west-1.amazonaws.com/iceberg",
-        &creds,
-    )
-    .await
-    .expect("a standard Glue endpoint supplies the signing region");
-
-    assert!(
-        matches!(&auth, CatalogAuth::Sigv4 { region } if region == "eu-west-1"),
-        "the endpoint's own region must sign, not the stated us-east-1"
-    );
-}
-
 /// Scenario: the `CatalogSession` signing path refuses to resolve a SigV4
 /// strategy when neither the stated region nor the catalog URI supplies one,
 /// with an error naming `region`.

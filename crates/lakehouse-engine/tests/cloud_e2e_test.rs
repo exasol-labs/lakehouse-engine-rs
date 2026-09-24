@@ -505,12 +505,9 @@ fn cloud_smoke_projection_filter_query() {
     // embedded in any variable printed above.)
 }
 
-/// Scenario: a region-less Glue CONNECTION still lists the Glue table, when the
-/// address is a standard AWS Glue endpoint for `AWS_REGION` — the endpoint's own
+/// Scenario: a region-less Glue CONNECTION still lists the Glue table, via the
+/// standard AWS Glue endpoint built from `AWS_REGION` — the endpoint's own
 /// region signs the catalog requests, and no data file is read.
-///
-/// Skips when `GLUE_CATALOG_URI` is not that standard form (a private, GovCloud,
-/// China, FIPS, VPC-interface, or dual-stack endpoint still requires `region`).
 #[test]
 fn cloud_sigv4_region_derived_from_glue_endpoint_lists_table() {
     let env = match CloudEnv::from_env() {
@@ -523,15 +520,11 @@ fn cloud_sigv4_region_derived_from_glue_endpoint_lists_table() {
         }
     };
 
-    let standard_glue_prefix = format!("https://glue.{}.amazonaws.com/", env.aws_region);
-    if !env.glue_catalog_uri.starts_with(&standard_glue_prefix) {
-        println!(
-            "SKIPPED: cloud_sigv4_region_derived_from_glue_endpoint_lists_table — \
-             GLUE_CATALOG_URI is not a standard AWS Glue endpoint for AWS_REGION \
-             (expected a prefix of {standard_glue_prefix})"
-        );
-        return;
-    }
+    let standard_glue_uri = format!("https://glue.{}.amazonaws.com/iceberg", env.aws_region);
+    let env = CloudEnv {
+        glue_catalog_uri: standard_glue_uri,
+        ..env
+    };
 
     let mut conn = ExaConn::connect_redacting(
         &env.exasol_host,

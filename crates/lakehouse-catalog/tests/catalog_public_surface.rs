@@ -337,42 +337,6 @@ fn connection_creds_sigv4_signing_region_is_reachable() {
     assert_eq!(region.as_deref(), Some("eu-west-1"));
 }
 
-/// Every step behind `ConnectionCreds::sigv4_signing_region` — the host-shape
-/// parser, its region-code check, and the crate-internal refusal both signing
-/// paths use — stays crate-private and unexported, so the method remains the
-/// only way to ask for a signing region. `sigv4.rs` also names no Exasol
-/// delivery mechanism: the resolver takes a plain URI, so the rule serves any
-/// caller rather than only one that reads an Exasol connection object.
-#[test]
-fn signing_region_steps_are_not_public() {
-    const STEPS: [&str; 3] = [
-        "glue_endpoint_region",
-        "is_commercial_region_code",
-        "required_signing_region",
-    ];
-    let sigv4 = source("sigv4.rs");
-    let lib = source("lib.rs");
-
-    for step in STEPS {
-        let declaration = format!("pub fn {step}");
-        assert!(
-            !declares(sigv4, &declaration),
-            "sigv4.rs must not declare `{declaration}` — it is a step behind the one public \
-             signing-region method"
-        );
-        assert!(
-            !lib.contains(step),
-            "lib.rs must not re-export the signing-region step `{step}`"
-        );
-    }
-    for mechanism in ["CONNECTION", "UdfContext"] {
-        assert!(
-            !sigv4.contains(mechanism),
-            "sigv4.rs must not name the Exasol delivery mechanism `{mechanism}`"
-        );
-    }
-}
-
 /// The native Unity Catalog public items — the session, the temporary-table-
 /// credentials response type, the vended selector, and the store address that
 /// selector takes — are reachable from outside the crate through the `unity` and

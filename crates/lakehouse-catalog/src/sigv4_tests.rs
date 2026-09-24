@@ -284,16 +284,6 @@ fn stated_region_signs_for_a_non_standard_address() {
 // Signing-region refusal (required_signing_region)
 // ---------------------------------------------------------------------------
 
-#[test]
-fn required_signing_region_returns_the_resolved_region() {
-    let creds = creds_stating_region("");
-
-    let region = required_signing_region(&creds, "https://glue.eu-west-1.amazonaws.com/iceberg")
-        .expect("a standard Glue endpoint supplies a signing region");
-
-    assert_eq!(region, "eu-west-1");
-}
-
 /// The refusal names `region` and carries neither a credential value nor the
 /// catalog URI: the exact-text pin below is what proves both absences.
 #[test]

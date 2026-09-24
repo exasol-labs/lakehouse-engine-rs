@@ -25,10 +25,8 @@ Project mission in: @specs/mission.md
 
 ## Code comment style
 
-- **Keep comments and doc comments short.** State the fact or the non-obvious "why" in
-  one or two sentences. Do not restate the same point twice in one comment block, and do
-  not quote a spec scenario title verbatim when the test name and a short `Scenario:`
-  line already identify it.
+- **Default to no comments.** Only keep essential, concise comments for a non-obvious
+  "why", never to explain how the code got this way — that belongs in the commit message.
 - **A doc comment on a test names the scenario in one line** (`/// Scenario: <fact>`),
   matching the convention already used across `*_tests.rs` files. It does not repeat the
   scenario title as a second, separately-quoted sentence.

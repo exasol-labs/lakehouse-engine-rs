@@ -65,55 +65,13 @@ async fn list_namespace_tables_rejects_empty_namespace() {
 /// entirely (it is `create-virtual-schema`'s namespace-enumeration path), so
 /// it needs its own proof that `glue_catalog_prefix` reached it too.
 ///
-/// A local HTTP server captures the raw request line of the `list_tables`
-/// GET. Any follow-up `list_namespaces?parent=` request (child-namespace
-/// recursion) is left unanswered — `list_in_namespace_signed` treats that as
-/// a flat catalog (no children) and returns, matching AWS Glue's actual
-/// behavior of rejecting nested-namespace listing.
+/// `list_in_namespace_signed` issues the `list_tables` GET first; the
+/// follow-up `list_namespaces?parent=` (child-namespace recursion) then sees
+/// `EMPTY_LISTING`'s empty `namespaces` and stops, matching AWS Glue's flat
+/// catalog. The first captured request head is therefore the `list_tables` one.
 #[tokio::test]
 async fn list_tables_signed_url_carries_catalogs_prefix() {
-    use std::net::SocketAddr;
-    use std::sync::{Arc, Mutex};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
-
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let addr: SocketAddr = listener.local_addr().expect("local_addr");
-    let port = addr.port();
-
-    let captured_request_line: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let captured = captured_request_line.clone();
-
-    tokio::spawn(async move {
-        loop {
-            let Ok((mut stream, _)) = listener.accept().await else {
-                break;
-            };
-            let mut buf = vec![0u8; 4096];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            if n == 0 {
-                continue;
-            }
-            let request = String::from_utf8_lossy(&buf[..n]).to_string();
-            let request_line = request.lines().next().unwrap_or("").to_string();
-
-            // Only the list_tables request (never the list_namespaces
-            // recursion request) gets a reply — an AWS Glue-shaped flat
-            // catalog. See `list_in_namespace_signed`'s "ponytail" fallback.
-            if !request_line.contains("?parent=") {
-                *captured.lock().unwrap() = Some(request_line);
-                let body = r#"{"identifiers":[]}"#;
-                let response = format!(
-                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-                    body.len(),
-                    body
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        }
-    });
-
-    let catalog_uri = format!("http://127.0.0.1:{port}");
+    let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
     let storage = static_backend();
     let mut creds = base_creds();
     creds.use_sigv4 = true;
@@ -127,11 +85,13 @@ async fn list_tables_signed_url_carries_catalogs_prefix() {
         result.err()
     );
 
-    let request_line = captured_request_line
+    let head = heads
         .lock()
         .unwrap()
-        .clone()
+        .first()
+        .cloned()
         .expect("the list_tables request must have been captured");
+    let request_line = head.lines().next().unwrap_or_default();
     assert!(
         request_line.contains("/v1/catalogs/123456789012/namespaces/db/tables"),
         "signed list_tables URL must carry the derived catalogs/{{account-id}} prefix: {request_line}"
