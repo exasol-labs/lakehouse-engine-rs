@@ -1,6 +1,9 @@
 use super::*;
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
 
+#[path = "parquet_fixture_tests.rs"]
+pub(super) mod parquet_fixture;
+
 #[test]
 fn dispatch_get_capabilities() {
     let req = serde_json::json!({"type": "getCapabilities"});

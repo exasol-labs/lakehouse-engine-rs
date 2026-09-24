@@ -24,17 +24,6 @@ pub enum MergeMode {
     SampleOneFile,
 }
 
-impl MergeMode {
-    /// The ONE owner of this decision, so enumeration and planning can't resolve `MERGE_SCHEMA`
-    /// into two different modes.
-    pub fn for_merge_schema(merge_schema: bool) -> Self {
-        match merge_schema {
-            true => Self::FoldEveryFile,
-            false => Self::SampleOneFile,
-        }
-    }
-}
-
 /// The seam's layout switches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryOptions {
@@ -90,25 +79,52 @@ pub async fn resolve_parquet_directory(
     keep: &PartitionKeepPredicate,
 ) -> Result<ParquetDirectory, UdfError> {
     let raw_files = list_data_files(store, prefix, options.hive_partitioning).await?;
-    let declaring_files = declaration_scope(&raw_files, options.merge_mode);
-    check_key_spelling_collisions(declaring_files)?;
-    let declared_keys = union_of_partition_keys(declaring_files);
-    let keys_any_file_carries = union_of_partition_keys(&raw_files);
-    let kept = kept_files(&raw_files, &declared_keys, keep);
-    let fold_sources = fold_sources_for(options.merge_mode, &raw_files, &kept);
+    let sampled = &raw_files[..raw_files.len().min(1)];
+    let declared_keys = declared_partition_keys(match options.merge_mode {
+        MergeMode::FoldEveryFile => &raw_files,
+        MergeMode::SampleOneFile => sampled,
+    })?;
+    // Even under SampleOneFile, a stored column named like a key any listed file carries is
+    // dropped for the key.
+    let key_columns = uppercase_index(raw_files.iter().flat_map(segment_keys));
+
+    let kept: Vec<(&RawFile, BTreeMap<String, Option<String>>)> = raw_files
+        .iter()
+        .filter_map(|raw| {
+            let filled = fill_partition_values(&raw.partition_segments, &declared_keys);
+            keep(&filled).then_some((raw, filled))
+        })
+        .collect();
+    let sources: Vec<&RawFile> = match options.merge_mode {
+        MergeMode::FoldEveryFile => kept.iter().map(|(raw, _)| *raw).collect(),
+        MergeMode::SampleOneFile => sampled.iter().collect(),
+    };
 
     // Concurrency is bounded by the caller's store's admission limiter, not a second one here.
     let read: Vec<ArrowReaderMetadata> = try_join_all(
-        fold_sources
+        sources
             .iter()
-            .map(|source| read_footer(Arc::clone(store), source.path.clone(), source.size)),
+            .map(|raw| read_footer(Arc::clone(store), &raw.path, raw.size)),
     )
     .await?;
 
-    let dropped = validate_key_column_overrides(&fold_sources, &read, &keys_any_file_carries)?;
-    let folded_fields = fold_schemas(&fold_sources, &read, &dropped)?;
+    let folded_fields = fold_schemas(&sources, &read, &key_columns)?;
+    let footers: HashMap<&StorePath, &Arc<ParquetMetaData>> = sources
+        .iter()
+        .zip(&read)
+        .map(|(raw, metadata)| (&raw.path, metadata.metadata()))
+        .collect();
+    let files = kept
+        .into_iter()
+        .map(|(raw, partition_values)| ParquetFile {
+            path: raw.path.clone(),
+            size: raw.size,
+            partition_values,
+            footer: footers.get(&raw.path).map(|footer| Arc::clone(footer)),
+        })
+        .collect();
     Ok(ParquetDirectory {
-        files: attach_footers(kept, &fold_sources, &read),
+        files,
         schema: schema_with_partition_columns(folded_fields, &declared_keys),
         partition_columns: declared_keys,
     })
@@ -121,11 +137,8 @@ struct RawFile {
     partition_segments: Vec<(String, Option<String>)>,
 }
 
-fn raw_key_set(raw: &RawFile) -> HashSet<String> {
-    raw.partition_segments
-        .iter()
-        .map(|(key, _)| key.clone())
-        .collect()
+fn segment_keys(raw: &RawFile) -> impl Iterator<Item = &str> {
+    raw.partition_segments.iter().map(|(key, _)| key.as_str())
 }
 
 async fn list_data_files(
@@ -144,7 +157,8 @@ async fn list_data_files(
         .filter_map(|meta| {
             let segments = data_file_segments(&meta.location, prefix)?;
             let partition_segments = if hive_partitioning {
-                parse_partition_segments(&segments)
+                let (_, directories) = segments.split_last()?;
+                parse_partition_segments(directories)
             } else {
                 Vec::new()
             };
@@ -182,12 +196,8 @@ fn data_file_segments(location: &StorePath, prefix: &StorePath) -> Option<Vec<St
 }
 
 /// A key repeated within one path takes its deepest value but keeps its first position.
-fn parse_partition_segments(segments: &[String]) -> Vec<(String, Option<String>)> {
-    let Some((_, directories)) = segments.split_last() else {
-        return Vec::new();
-    };
+fn parse_partition_segments(directories: &[String]) -> Vec<(String, Option<String>)> {
     let mut ordered: Vec<(String, Option<String>)> = Vec::new();
-    let mut index_of: HashMap<String, usize> = HashMap::new();
     for segment in directories {
         let Some((key, value)) = segment.split_once('=') else {
             continue;
@@ -196,12 +206,9 @@ fn parse_partition_segments(segments: &[String]) -> Vec<(String, Option<String>)
             continue;
         }
         let decoded = decode_partition_value(value);
-        match index_of.get(key) {
-            Some(&index) => ordered[index].1 = decoded,
-            None => {
-                index_of.insert(key.to_string(), ordered.len());
-                ordered.push((key.to_string(), decoded));
-            }
+        match ordered.iter_mut().find(|(existing, _)| existing == key) {
+            Some((_, existing_value)) => *existing_value = decoded,
+            None => ordered.push((key.to_string(), decoded)),
         }
     }
     ordered
@@ -219,24 +226,48 @@ fn decode_partition_value(raw: &str) -> Option<String> {
     }
 }
 
-fn declaration_scope(raw_files: &[RawFile], mode: MergeMode) -> &[RawFile] {
-    match mode {
-        MergeMode::FoldEveryFile => raw_files,
-        MergeMode::SampleOneFile => &raw_files[..raw_files.len().min(1)],
-    }
-}
-
-fn union_of_partition_keys(raw_files: &[RawFile]) -> Vec<String> {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut keys = Vec::new();
-    for raw in raw_files {
-        for (key, _) in &raw.partition_segments {
-            if seen.insert(key.clone()) {
-                keys.push(key.clone());
+/// The distinct keys `scope`'s paths carry, in first-seen order; two spellings of one uppercased
+/// name are an error.
+fn declared_partition_keys(scope: &[RawFile]) -> Result<Vec<String>, UdfError> {
+    let mut keys: Vec<String> = Vec::new();
+    let mut seen_spellings: HashSet<&str> = HashSet::new();
+    let mut by_uppercase: HashMap<String, (&str, &StorePath)> = HashMap::new();
+    for raw in scope {
+        for key in segment_keys(raw) {
+            if !seen_spellings.insert(key) {
+                continue;
+            }
+            let folded = key.to_uppercase();
+            match by_uppercase.get(&folded) {
+                Some(&(first, first_path)) => {
+                    return Err(UdfError::User(format!(
+                        "partition keys '{first}' (from '{first_path}') and '{key}' (from '{}') \
+                         are the same name once uppercased, so the declaration would advertise a \
+                         duplicate partition column. Neither directory spelling is preferred over \
+                         the other: rename one of them.",
+                        raw.path
+                    )));
+                }
+                None => {
+                    by_uppercase.insert(folded, (key, &raw.path));
+                    keys.push(key.to_string());
+                }
             }
         }
     }
-    keys
+    Ok(keys)
+}
+
+/// Uppercased key → its first-seen spelling.
+fn uppercase_index<'a>(keys: impl Iterator<Item = &'a str>) -> HashMap<String, &'a str> {
+    let mut seen_spellings: HashSet<&str> = HashSet::new();
+    let mut index: HashMap<String, &str> = HashMap::new();
+    for key in keys {
+        if seen_spellings.insert(key) {
+            index.entry(key.to_uppercase()).or_insert(key);
+        }
+    }
+    index
 }
 
 fn fill_partition_values(
@@ -255,154 +286,6 @@ fn fill_partition_values(
         .collect()
 }
 
-fn kept_files<'a>(
-    raw_files: &'a [RawFile],
-    declared_keys: &[String],
-    keep: &PartitionKeepPredicate,
-) -> Vec<(&'a RawFile, ParquetFile)> {
-    raw_files
-        .iter()
-        .filter_map(|raw| {
-            let filled = fill_partition_values(&raw.partition_segments, declared_keys);
-            keep(&filled).then(|| {
-                let file = ParquetFile {
-                    path: raw.path.clone(),
-                    size: raw.size,
-                    partition_values: filled,
-                    footer: None,
-                };
-                (raw, file)
-            })
-        })
-        .collect()
-}
-
-/// `kept_index` is `None` for a sampled file that `keep` rejected.
-struct FoldSource {
-    path: StorePath,
-    size: u64,
-    raw_keys: HashSet<String>,
-    kept_index: Option<usize>,
-}
-
-impl FoldSource {
-    fn of(raw: &RawFile, kept_index: Option<usize>) -> Self {
-        Self {
-            path: raw.path.clone(),
-            size: raw.size,
-            raw_keys: raw_key_set(raw),
-            kept_index,
-        }
-    }
-}
-
-fn fold_sources_for(
-    mode: MergeMode,
-    raw_files: &[RawFile],
-    kept: &[(&RawFile, ParquetFile)],
-) -> Vec<FoldSource> {
-    match mode {
-        MergeMode::FoldEveryFile => kept
-            .iter()
-            .enumerate()
-            .map(|(index, (raw, _))| FoldSource::of(raw, Some(index)))
-            .collect(),
-        MergeMode::SampleOneFile => raw_files
-            .first()
-            .map(|sampled| {
-                let sampled_was_kept = kept
-                    .first()
-                    .is_some_and(|(first_kept, _)| first_kept.path == sampled.path);
-                FoldSource::of(sampled, sampled_was_kept.then_some(0))
-            })
-            .into_iter()
-            .collect(),
-    }
-}
-
-fn attach_footers(
-    kept: Vec<(&RawFile, ParquetFile)>,
-    fold_sources: &[FoldSource],
-    read: &[ArrowReaderMetadata],
-) -> Vec<ParquetFile> {
-    let mut files: Vec<ParquetFile> = kept.into_iter().map(|(_, file)| file).collect();
-    for (source, footer) in fold_sources.iter().zip(read) {
-        if let Some(index) = source.kept_index {
-            files[index].footer = Some(Arc::clone(footer.metadata()));
-        }
-    }
-    files
-}
-
-fn check_key_spelling_collisions(scope: &[RawFile]) -> Result<(), UdfError> {
-    let mut declared: HashMap<String, (&str, &StorePath)> = HashMap::new();
-    for raw in scope {
-        for (key, _) in &raw.partition_segments {
-            let folded = key.to_uppercase();
-            match declared.get(&folded) {
-                Some(&(existing_spelling, existing_path)) if existing_spelling != key => {
-                    return Err(key_spelling_collision(
-                        existing_spelling,
-                        existing_path,
-                        key,
-                        &raw.path,
-                    ));
-                }
-                Some(_) => {}
-                None => {
-                    declared.insert(folded, (key, &raw.path));
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-fn key_spelling_collision(
-    first: &str,
-    first_path: &StorePath,
-    second: &str,
-    second_path: &StorePath,
-) -> UdfError {
-    UdfError::User(format!(
-        "partition keys '{first}' (from '{first_path}') and '{second}' (from '{second_path}') are \
-         the same name once uppercased, so the declaration would advertise a duplicate partition \
-         column. Neither directory spelling is preferred over the other: rename one of them."
-    ))
-}
-
-/// A stored column named like a partition key is dropped in favor of the key; a read file that
-/// stores the column but lacks the key's segment is an error.
-fn validate_key_column_overrides(
-    fold_sources: &[FoldSource],
-    read: &[ArrowReaderMetadata],
-    candidates: &[String],
-) -> Result<HashSet<String>, UdfError> {
-    let mut dropped = HashSet::new();
-    for key in candidates {
-        let folded_key = key.to_uppercase();
-        for (source, metadata) in fold_sources.iter().zip(read) {
-            let Some(field) = metadata
-                .schema()
-                .fields()
-                .iter()
-                .find(|field| field.name().to_uppercase() == folded_key)
-            else {
-                continue;
-            };
-            let carries_segment = source
-                .raw_keys
-                .iter()
-                .any(|k| k.to_uppercase() == folded_key);
-            if !carries_segment {
-                return Err(missing_segment_error(field.name(), key, &source.path));
-            }
-            dropped.insert(folded_key.clone());
-        }
-    }
-    Ok(dropped)
-}
-
 fn missing_segment_error(column: &str, key: &str, path: &StorePath) -> UdfError {
     UdfError::User(format!(
         "Parquet column '{column}' in '{path}' collides with the partition key '{key}=' once \
@@ -414,7 +297,7 @@ fn missing_segment_error(column: &str, key: &str, path: &StorePath) -> UdfError 
 
 async fn read_footer(
     store: Arc<dyn ObjectStore>,
-    path: StorePath,
+    path: &StorePath,
     size: u64,
 ) -> Result<ArrowReaderMetadata, UdfError> {
     let mut reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
@@ -435,19 +318,24 @@ struct FoldedColumn {
     source: StorePath,
 }
 
+/// A stored column named like a partition key (`key_columns`, keyed uppercase) is dropped in favor
+/// of the key; a read file that stores the column but lacks the key's segment is an error.
 fn fold_schemas(
-    fold_sources: &[FoldSource],
+    sources: &[&RawFile],
     read: &[ArrowReaderMetadata],
-    dropped: &HashSet<String>,
+    key_columns: &HashMap<String, &str>,
 ) -> Result<Vec<Field>, UdfError> {
     let mut columns: Vec<FoldedColumn> = Vec::new();
     let mut by_uppercase: HashMap<String, usize> = HashMap::new();
 
-    for (source, metadata) in fold_sources.iter().zip(read) {
+    for (source, metadata) in sources.iter().zip(read) {
         let path = &source.path;
         for field in metadata.schema().fields() {
             let folded = field.name().to_uppercase();
-            if dropped.contains(&folded) {
+            if let Some(key) = key_columns.get(&folded) {
+                if !segment_keys(source).any(|own| own.to_uppercase() == folded) {
+                    return Err(missing_segment_error(field.name(), key, path));
+                }
                 continue;
             }
             match by_uppercase.get(&folded).copied() {

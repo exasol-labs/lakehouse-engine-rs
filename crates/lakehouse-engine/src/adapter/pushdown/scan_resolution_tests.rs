@@ -1,6 +1,8 @@
+use super::super::test_support::filter_json::equal;
 use super::super::test_support::{
     ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog, UNITY_TABLE_TARGET,
-    iceberg_catalog, locationless_delta_table_body, sample_storage, unauthenticated_creds,
+    iceberg_catalog, locationless_delta_table_body, object_endpoint, sample_storage,
+    unauthenticated_creds,
 };
 use super::*;
 use crate::scan::spec::{StorageBackend, StorageProps};
@@ -510,29 +512,17 @@ async fn request_session_has_one_variant_per_kind() {
     }
 }
 
-/// A non-truncated S3 listing holding one Hive-partitioned object whose bytes are no Parquet file.
-const ONE_UNREADABLE_HIVE_FILE_LIST_BUCKET_RESULT: &str = concat!(
-    r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-    r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
-    "<Name>warehouse</Name><KeyCount>1</KeyCount><MaxKeys>1000</MaxKeys>",
-    "<IsTruncated>false</IsTruncated>",
-    "<Contents><Key>events/year=2026/p.parquet</Key>",
-    "<LastModified>2026-01-01T00:00:00.000Z</LastModified><Size>18</Size></Contents>",
-    "</ListBucketResult>",
-);
-
 async fn resolve_events_under_hive_partitioning(
-    endpoint_uri: &str,
+    storage: &StorageBackend,
     hive_partitioning: &str,
     filter: &Json,
 ) -> Result<ResolvedScan, UdfError> {
     let creds = unauthenticated_creds();
-    let storage = direct_storage_backend(endpoint_uri);
     let resolver = TableScanResolver::for_request(
         CatalogKind::DirectStorage,
         DIRECT_STORAGE_ADDRESS,
         ConnectionStorage {
-            storage: &storage,
+            storage,
             creds: &creds,
             allow_http: true,
         },
@@ -545,21 +535,17 @@ async fn resolve_events_under_hive_partitioning(
 
 #[tokio::test]
 async fn hive_partitioning_reaches_the_seam_on_pushdown() {
-    let endpoint = RecordingCatalog::spawn(|target| {
-        if target.contains("list-type=2") {
-            (200, ONE_UNREADABLE_HIVE_FILE_LIST_BUCKET_RESULT.to_string())
-        } else {
-            (200, "not a parquet file".to_string())
-        }
-    })
+    let storage = object_endpoint(
+        "warehouse",
+        vec![(
+            "events/year=2026/p.parquet".to_string(),
+            "not a parquet file".to_string(),
+        )],
+    )
     .await;
-    let year_2099 = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "YEAR"},
-        "right": {"type": "literal_string", "value": "2099"}
-    });
+    let year_2099 = equal("YEAR", "2099");
 
-    let pruned = resolve_events_under_hive_partitioning(&endpoint.uri, "TRUE", &year_2099)
+    let pruned = resolve_events_under_hive_partitioning(&storage, "TRUE", &year_2099)
         .await
         .expect("HIVE_PARTITIONING=TRUE must prune the file before its footer is read");
     assert_eq!(pruned.partition_columns, vec!["year".to_string()]);
@@ -569,7 +555,7 @@ async fn hive_partitioning_reaches_the_seam_on_pushdown() {
         pruned.files
     );
 
-    let error = resolve_events_under_hive_partitioning(&endpoint.uri, "FALSE", &year_2099)
+    let error = resolve_events_under_hive_partitioning(&storage, "FALSE", &year_2099)
         .await
         .expect_err("HIVE_PARTITIONING=FALSE must not prune, so the bad footer is read")
         .to_string();

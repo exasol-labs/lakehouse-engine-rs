@@ -7,22 +7,16 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCHEMA_NAME, VsProps, create_schema_and_scripts,
-    create_virtual_schema_with_password, exa_conn, explain_virtual_sql, install_slc,
-    local_stack_creds, local_stack_s3_store, local_stack_storage, parse_int, parse_numeric,
-    upload_so, value_to_string,
+    VsProps, create_schema_and_scripts, create_virtual_schema_with_password, exa_conn,
+    explain_virtual_sql, install_slc, local_stack_storage, parse_int, parse_numeric,
+    try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::write_parquet_fixture;
 use common::stack::{
-    CatalogConnectionPassword, build_create_connection_sql, minio_url_internal, wait_for_exasol,
-    wait_for_minio,
+    CatalogConnectionPassword, minio_url_internal, wait_for_exasol, wait_for_minio,
 };
 
-use lakehouse_engine::adapter::parquet_directory::{DirectoryOptions, MergeMode};
-use lakehouse_engine::adapter::pushdown::{
-    ConnectionStorage, ResolvedScan, ScanSource, format_reader,
-};
 use lakehouse_engine::scan::spec::StorageBackend;
 
 use arrow::array::{
@@ -35,9 +29,9 @@ use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
 use arrow::record_batch::RecordBatch;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectStorePath;
-use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStoreExt, PutPayload};
 use parquet::file::reader::{FileReader, SerializedFileReader};
-use serde_json::{Value as Json, json};
+use serde_json::Value as Json;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
@@ -49,7 +43,6 @@ use std::sync::{Arc, OnceLock};
 const BASE_DIRECT: &str = "s3://warehouse/direct/";
 const BASE_INCOMPATIBLE: &str = "s3://warehouse/direct_incompatible/";
 const BASE_DISCOVERY: &str = "s3://warehouse/direct_discovery/";
-const BASE_COLLISION: &str = "s3://warehouse/direct_hive_collision/";
 const BASE_COLLISION_MISSING: &str = "s3://warehouse/direct_hive_collision_missing/";
 
 const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
@@ -59,15 +52,12 @@ const VS_INCOMPATIBLE: &str = "DIRECT_INCOMPATIBLE_VS";
 const VS_DISCOVERY: &str = "DIRECT_DISCOVERY_VS";
 const VS_DISCOVERY_NS: &str = "DIRECT_DISCOVERY_NS_VS";
 const VS_DISCOVERY_EMPTY_NS: &str = "DIRECT_DISCOVERY_EMPTY_NS_VS";
-const VS_COLLISION: &str = "DIRECT_HIVE_COLLISION";
-const VS_COLLISION_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_OFF";
 const VS_COLLISION_MISSING: &str = "DIRECT_HIVE_COLLISION_MISSING";
 const VS_COLLISION_MISSING_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_MISSING_OFF";
 
 const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
 const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
-const CONN_COLLISION: &str = "DIRECT_STORAGE_COLLISION_CREDS";
 const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
 
 /// `CatalogConnectionPassword` for a direct-storage CONNECTION: static S3 creds,
@@ -80,6 +70,41 @@ fn direct_storage_password() -> CatalogConnectionPassword {
         secret_key: "minioadmin".to_string(),
         path_style: true,
         ..Default::default()
+    }
+}
+
+/// A root-namespace `DIRECT_STORAGE` Virtual Schema `vs_name` over CONNECTION `conn_name`.
+fn direct_vs<'a>(vs_name: &'a str, conn_name: &'a str) -> VsProps<'a> {
+    VsProps::new(vs_name, "")
+        .with_catalog_kind("DIRECT_STORAGE")
+        .with_catalog_conn_name(conn_name)
+}
+
+/// Attempts `CREATE VIRTUAL SCHEMA` for `direct_vs(vs_name, conn_name)` over `base`,
+/// returning the raw response so a rejection can be asserted.
+fn try_create_direct_vs(conn: &mut ExaConn, vs_name: &str, conn_name: &str, base: &str) -> Json {
+    try_create_virtual_schema_with_password(
+        conn,
+        &direct_vs(vs_name, conn_name),
+        base,
+        &direct_storage_password(),
+    )
+}
+
+/// Asserts `resp` is an error and returns its message; `what` names the rejected case.
+fn rejection_message<'a>(resp: &'a Json, what: &str) -> &'a str {
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "{what} must fail CREATE VIRTUAL SCHEMA: {resp}"
+    );
+    resp["exception"]["text"].as_str().unwrap_or("")
+}
+
+/// Asserts `msg` contains every one of `needles`.
+fn assert_mentions(msg: &str, needles: &[&str]) {
+    for needle in needles {
+        assert!(msg.contains(needle), "error must mention {needle:?}: {msg}");
     }
 }
 
@@ -110,28 +135,20 @@ fn setup() {
         );
         create_virtual_schema_with_password(
             &mut conn,
-            &VsProps::new(VS_DIRECT_NARROW, "")
-                .with_catalog_kind("DIRECT_STORAGE")
-                .with_catalog_conn_name(CONN_DIRECT)
-                .with_merge_schema("FALSE"),
+            &direct_vs(VS_DIRECT_NARROW, CONN_DIRECT).with_merge_schema("FALSE"),
             BASE_DIRECT,
             &direct_storage_password(),
         );
         create_virtual_schema_with_password(
             &mut conn,
-            &VsProps::new(VS_HIVE_OFF, "")
-                .with_catalog_kind("DIRECT_STORAGE")
-                .with_catalog_conn_name(CONN_DIRECT)
-                .with_hive_partitioning("FALSE"),
+            &direct_vs(VS_HIVE_OFF, CONN_DIRECT).with_hive_partitioning("FALSE"),
             BASE_DIRECT,
             &direct_storage_password(),
         );
 
         create_virtual_schema_with_password(
             &mut conn,
-            &VsProps::new(VS_DISCOVERY, "")
-                .with_catalog_kind("DIRECT_STORAGE")
-                .with_catalog_conn_name(CONN_DISCOVERY),
+            &direct_vs(VS_DISCOVERY, CONN_DISCOVERY),
             BASE_DISCOVERY,
             &direct_storage_password(),
         );
@@ -314,10 +331,20 @@ fn event_labels_batch() -> RecordBatch {
     .expect("event_labels batch construction is infallible")
 }
 
+/// A one-row batch: a non-null `ID = id` followed by the `extra` columns.
+fn id_row<const N: usize>(id: i64, extra: [(Field, ArrayRef); N]) -> RecordBatch {
+    let (fields, columns): (Vec<Field>, Vec<ArrayRef>) = std::iter::once((
+        Field::new("ID", DataType::Int64, false),
+        Arc::new(Int64Array::from(vec![id])) as ArrayRef,
+    ))
+    .chain(extra)
+    .unzip();
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns)
+        .expect("one-row fixture batch construction is infallible")
+}
+
 fn discovery_id_batch(id: i64) -> RecordBatch {
-    let schema = Arc::new(Schema::new(vec![Field::new("ID", DataType::Int64, false)]));
-    RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![id]))])
-        .expect("discovery-fixture batch construction is infallible")
+    id_row(id, [])
 }
 
 /// One `list<utf8>` cell (`TAGS`), populated for row 0, null for row 1.
@@ -658,9 +685,9 @@ fn write_all_fixtures() {
         incompatible_file2(),
     );
 
-    // direct_hive_collision/ — isolated root: the k=1 segment overrides the stored K = 99.
+    // collision_override/ — the k=1 segment overrides the stored K = 99.
     write_parquet_fixture(
-        &format!("{BASE_COLLISION}collision_override/k=1/p.parquet"),
+        &format!("{BASE_DIRECT}collision_override/k=1/p.parquet"),
         stored_k_batch(1, 99),
     );
 
@@ -734,20 +761,32 @@ fn assert_declared_type(
     );
 }
 
+/// `sql`'s first column, each cell rendered as a string.
+fn string_column<C: FromIterator<String>>(conn: &mut ExaConn, sql: &str) -> C {
+    conn.query_columns(sql)[0]
+        .iter()
+        .map(value_to_string)
+        .collect()
+}
+
 fn served_tables(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
-    let cols = conn.query_columns(&format!(
-        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA='{vs_name}' ORDER BY TABLE_NAME"
-    ));
-    cols[0].iter().map(value_to_string).collect()
+    string_column(
+        conn,
+        &format!(
+            "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA='{vs_name}' ORDER BY TABLE_NAME"
+        ),
+    )
 }
 
 fn declared_columns(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<String> {
-    let cols = conn.query_columns(&format!(
-        "SELECT COLUMN_NAME FROM SYS.EXA_ALL_COLUMNS \
-         WHERE COLUMN_SCHEMA='{vs_name}' AND COLUMN_TABLE='{table}' \
-         ORDER BY COLUMN_ORDINAL_POSITION"
-    ));
-    cols[0].iter().map(value_to_string).collect()
+    string_column(
+        conn,
+        &format!(
+            "SELECT COLUMN_NAME FROM SYS.EXA_ALL_COLUMNS \
+             WHERE COLUMN_SCHEMA='{vs_name}' AND COLUMN_TABLE='{table}' \
+             ORDER BY COLUMN_ORDINAL_POSITION"
+        ),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1001,41 +1040,14 @@ fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     setup();
     let mut conn = exa_conn();
 
-    let create_conn_sql = build_create_connection_sql(
+    let resp = try_create_direct_vs(
+        &mut conn,
+        VS_INCOMPATIBLE,
         CONN_INCOMPATIBLE,
         BASE_INCOMPATIBLE,
-        &direct_storage_password(),
     );
-    conn.execute(&create_conn_sql);
-    let _ = conn.try_execute(&format!(
-        "DROP VIRTUAL SCHEMA IF EXISTS {VS_INCOMPATIBLE} CASCADE"
-    ));
-
-    let resp = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {VS_INCOMPATIBLE}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{CONN_INCOMPATIBLE}'
-  CATALOG_KIND        = 'DIRECT_STORAGE'
-  ALLOW_HTTP          = 'true'"#
-    ));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "the incompatible pair must fail CREATE VIRTUAL SCHEMA: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("X"),
-        "error must name the offending column X: {msg}"
-    );
-    assert!(
-        msg.contains("file1.parquet") || msg.contains("incompatible/file1.parquet"),
-        "error must name file1: {msg}"
-    );
-    assert!(
-        msg.contains("file2.parquet") || msg.contains("incompatible/file2.parquet"),
-        "error must name file2: {msg}"
-    );
+    let msg = rejection_message(&resp, "the incompatible pair");
+    assert_mentions(msg, &["X", "file1.parquet", "file2.parquet"]);
     assert!(
         !msg.contains("minioadmin"),
         "error must not leak credential values: {msg}"
@@ -1165,7 +1177,6 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
     setup();
     let mut conn = exa_conn();
 
-    let base = direct_storage_password();
     let s3_secret = "SUPER_SECRET_S3_KEY";
     let azure_secret = "SUPER_SECRET_AZURE_KEY";
 
@@ -1218,24 +1229,13 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
 
     for (index, (label, address, password)) in cases.into_iter().enumerate() {
         let conn_name = format!("DIRECT_STORAGE_BAD_CREDS_{index}");
-        let vs_name = label;
-        conn.execute(&build_create_connection_sql(
-            &conn_name, &address, &password,
-        ));
-        let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
-        let resp = conn.try_execute(&format!(
-            r#"CREATE VIRTUAL SCHEMA {vs_name}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{conn_name}'
-  CATALOG_KIND        = 'DIRECT_STORAGE'
-  ALLOW_HTTP          = 'true'"#
-        ));
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "{label} must fail CREATE VIRTUAL SCHEMA: {resp}"
+        let resp = try_create_virtual_schema_with_password(
+            &mut conn,
+            &direct_vs(label, &conn_name),
+            &address,
+            &password,
         );
-        let msg = resp["exception"]["text"].as_str().unwrap_or("");
+        let msg = rejection_message(&resp, label);
         assert!(
             !msg.contains(s3_secret),
             "{label} must not leak the S3 secret: {msg}"
@@ -1245,16 +1245,13 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
             "{label} must not leak the Azure key: {msg}"
         );
         if label == "REJECTS_WAREHOUSE" {
-            assert!(msg.contains("warehouse"), "{label}: {msg}");
+            assert_mentions(msg, &["warehouse"]);
         }
         if label == "REJECTS_TOKEN" {
-            assert!(msg.contains("token"), "{label}: {msg}");
+            assert_mentions(msg, &["token"]);
         }
         if label == "REJECTS_PLAINTEXT_ABFS" {
-            assert!(
-                msg.contains("abfss"),
-                "{label} must name abfss as the accepted spelling: {msg}"
-            );
+            assert_mentions(msg, &["abfss"]);
         }
         if label == "REJECTS_EMPTY_ADDRESS" {
             assert!(
@@ -1263,31 +1260,22 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
             );
         }
         if label == "REJECTS_AZURE_CREDS_ON_S3_SCHEME" {
-            assert!(msg.contains("s3"), "{label}: {msg}");
+            assert_mentions(msg, &["s3"]);
         }
     }
 
     // An unparseable MERGE_SCHEMA value likewise fails at CREATE VIRTUAL SCHEMA.
-    let conn_name = "DIRECT_STORAGE_BAD_MERGE_SCHEMA_CREDS";
-    conn.execute(&build_create_connection_sql(
-        conn_name,
+    let resp = try_create_virtual_schema_with_password(
+        &mut conn,
+        &direct_vs(
+            "REJECTS_MERGE_SCHEMA",
+            "DIRECT_STORAGE_BAD_MERGE_SCHEMA_CREDS",
+        )
+        .with_merge_schema("NOTABOOL"),
         BASE_DISCOVERY,
-        &base,
-    ));
-    let _ = conn.try_execute("DROP VIRTUAL SCHEMA IF EXISTS REJECTS_MERGE_SCHEMA CASCADE");
-    let resp = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA REJECTS_MERGE_SCHEMA
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{conn_name}'
-  CATALOG_KIND        = 'DIRECT_STORAGE'
-  MERGE_SCHEMA        = 'NOTABOOL'
-  ALLOW_HTTP          = 'true'"#
-    ));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "an unparseable MERGE_SCHEMA value must fail CREATE VIRTUAL SCHEMA: {resp}"
+        &direct_storage_password(),
     );
+    rejection_message(&resp, "an unparseable MERGE_SCHEMA value");
 }
 
 /// Projection, filter, and `LIMIT` reach the scan spec: returned rows match, and the
@@ -1427,79 +1415,7 @@ fn two_table_join_matches_the_unpushed_answer_in_one_request() {
 // Hive partitioning: declaration, collisions, pruning, VARCHAR ordering
 // ---------------------------------------------------------------------------
 
-const HIVE_UNION: DirectoryOptions = DirectoryOptions {
-    merge_mode: MergeMode::FoldEveryFile,
-    hive_partitioning: true,
-};
-
-const HIVE_OFF_UNION: DirectoryOptions = DirectoryOptions {
-    merge_mode: MergeMode::FoldEveryFile,
-    hive_partitioning: false,
-};
-
 const SALES_2026_FILE: &str = "year=2026/month=09/p1.parquet";
-
-/// Resolves `table` in-process through the pushdown format-reader seam, exposing the kept files.
-fn resolve_in_process(
-    table: &str,
-    options: DirectoryOptions,
-    filter: Option<&Json>,
-) -> ResolvedScan {
-    let store: Arc<dyn ObjectStore> = Arc::new(local_stack_s3_store("warehouse"));
-    let storage = local_stack_storage();
-    let creds = local_stack_creds();
-    let connection = ConnectionStorage {
-        storage: &storage,
-        creds: &creds,
-        allow_http: true,
-    };
-    let table_root = format!("{BASE_DIRECT}{table}");
-    let reader = format_reader(
-        ScanSource::DirectParquet {
-            store: &store,
-            table_root: &table_root,
-            options,
-            declared_columns: &[],
-        },
-        &connection,
-    )
-    .unwrap_or_else(|e| panic!("format_reader({table}) must succeed: {e}"));
-    tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime for in-process scan resolution")
-        .block_on(reader.resolve_scan(filter))
-        .unwrap_or_else(|e| panic!("resolve_scan({table}, {filter:?}) must succeed: {e}"))
-}
-
-fn kept_paths(table: &str, filter: Option<&Json>) -> BTreeSet<String> {
-    resolve_in_process(table, HIVE_UNION, filter)
-        .files
-        .into_iter()
-        .map(|file| file.path)
-        .collect()
-}
-
-fn column(name: &str) -> Json {
-    json!({"type": "column", "name": name})
-}
-
-fn string(value: &str) -> Json {
-    json!({"type": "literal_string", "value": value})
-}
-
-fn equal(left: Json, right: Json) -> Json {
-    json!({"type": "predicate_equal", "left": left, "right": right})
-}
-
-/// Exasol advertises no greater-than predicate: it sends `a > b` as `b < a`.
-fn less(left: Json, right: Json) -> Json {
-    json!({"type": "predicate_less", "left": left, "right": right})
-}
-
-fn between(expression: Json, low: Json, high: Json) -> Json {
-    json!({"type": "predicate_between", "expression": expression, "left": low, "right": high})
-}
 
 fn nullable_string(value: &Json) -> Option<String> {
     (!value.is_null()).then(|| value_to_string(value))
@@ -1565,11 +1481,10 @@ fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
         "REGION",
         "VARCHAR(2000000)",
     );
-    let encoded = conn.query_columns(&format!(
-        "SELECT REGION FROM {}",
-        vs_table(VS_DIRECT, "ENCODED")
-    ));
-    let regions: Vec<String> = encoded[0].iter().map(value_to_string).collect();
+    let regions: Vec<String> = string_column(
+        &mut conn,
+        &format!("SELECT REGION FROM {}", vs_table(VS_DIRECT, "ENCODED")),
+    );
     assert_eq!(regions, ["a/b"], "a partition value must percent-decode");
 }
 
@@ -1620,41 +1535,25 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     setup();
     let mut conn = exa_conn();
 
-    create_virtual_schema_with_password(
-        &mut conn,
-        &VsProps::new(VS_COLLISION, "")
-            .with_catalog_kind("DIRECT_STORAGE")
-            .with_catalog_conn_name(CONN_COLLISION),
-        BASE_COLLISION,
-        &direct_storage_password(),
-    );
-    create_virtual_schema_with_password(
-        &mut conn,
-        &VsProps::new(VS_COLLISION_HIVE_OFF, "")
-            .with_catalog_kind("DIRECT_STORAGE")
-            .with_catalog_conn_name(CONN_COLLISION)
-            .with_hive_partitioning("FALSE"),
-        BASE_COLLISION,
-        &direct_storage_password(),
-    );
-
     assert_eq!(
-        declared_columns(&mut conn, VS_COLLISION, "COLLISION_OVERRIDE"),
+        declared_columns(&mut conn, VS_DIRECT, "COLLISION_OVERRIDE"),
         ["ID", "K"],
         "K must be declared exactly once, as the partition column"
     );
     assert_declared_type(
         &mut conn,
-        VS_COLLISION,
+        VS_DIRECT,
         "COLLISION_OVERRIDE",
         "K",
         "VARCHAR(2000000)",
     );
-    let overridden = conn.query_columns(&format!(
-        "SELECT K FROM {}",
-        vs_table(VS_COLLISION, "COLLISION_OVERRIDE")
-    ));
-    let values: Vec<String> = overridden[0].iter().map(value_to_string).collect();
+    let values: Vec<String> = string_column(
+        &mut conn,
+        &format!(
+            "SELECT K FROM {}",
+            vs_table(VS_DIRECT, "COLLISION_OVERRIDE")
+        ),
+    );
     assert_eq!(
         values,
         ["1"],
@@ -1663,7 +1562,7 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
 
     let stored = conn.query_columns(&format!(
         "SELECT K FROM {}",
-        vs_table(VS_COLLISION_HIVE_OFF, "COLLISION_OVERRIDE")
+        vs_table(VS_HIVE_OFF, "COLLISION_OVERRIDE")
     ));
     assert_eq!(
         int_column(&stored[0]),
@@ -1679,38 +1578,20 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
     setup();
     let mut conn = exa_conn();
 
-    conn.execute(&build_create_connection_sql(
+    let resp = try_create_direct_vs(
+        &mut conn,
+        VS_COLLISION_MISSING,
         CONN_COLLISION_MISSING,
         BASE_COLLISION_MISSING,
-        &direct_storage_password(),
-    ));
-    let _ = conn.try_execute(&format!(
-        "DROP VIRTUAL SCHEMA IF EXISTS {VS_COLLISION_MISSING} CASCADE"
-    ));
-    let resp = conn.try_execute(&format!(
-        r#"CREATE VIRTUAL SCHEMA {VS_COLLISION_MISSING}
-USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
-  CATALOG_CONNECTION  = '{CONN_COLLISION_MISSING}'
-  CATALOG_KIND        = 'DIRECT_STORAGE'
-  ALLOW_HTTP          = 'true'"#
-    ));
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "a K-storing file with no k= segment must fail CREATE VIRTUAL SCHEMA: {resp}"
     );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("column 'K'"),
-        "error must name the column K: {msg}"
-    );
-    assert!(
-        msg.contains("partition key 'k='"),
-        "error must name the key k: {msg}"
-    );
-    assert!(
-        msg.contains("collision_missing_segment/p2.parquet"),
-        "error must name the file lacking the segment: {msg}"
+    let msg = rejection_message(&resp, "a K-storing file with no k= segment");
+    assert_mentions(
+        msg,
+        &[
+            "column 'K'",
+            "partition key 'k='",
+            "collision_missing_segment/p2.parquet",
+        ],
     );
     assert!(
         !msg.contains("minioadmin"),
@@ -1719,9 +1600,7 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
 
     create_virtual_schema_with_password(
         &mut conn,
-        &VsProps::new(VS_COLLISION_MISSING_HIVE_OFF, "")
-            .with_catalog_kind("DIRECT_STORAGE")
-            .with_catalog_conn_name(CONN_COLLISION_MISSING)
+        &direct_vs(VS_COLLISION_MISSING_HIVE_OFF, CONN_COLLISION_MISSING)
             .with_hive_partitioning("FALSE"),
         BASE_COLLISION_MISSING,
         &direct_storage_password(),
@@ -1742,7 +1621,7 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
 }
 
 /// Under `HIVE_PARTITIONING = 'FALSE'` a `key=value` segment is a plain directory: no table
-/// declares a partition column, every file entry carries an empty value map, and none is pruned.
+/// declares a partition column and no file is pruned.
 #[test]
 fn hive_partitioning_false_declares_no_partition_columns() {
     setup();
@@ -1766,46 +1645,16 @@ fn hive_partitioning_false_declares_no_partition_columns() {
         vs_table(VS_HIVE_OFF, "SALES")
     ));
     assert_eq!(parse_int(&count[0][0]), 4, "no SALES file may be pruned");
-
-    let resolved = resolve_in_process("sales", HIVE_OFF_UNION, None);
-    assert!(resolved.partition_columns.is_empty());
-    assert_eq!(resolved.files.len(), 3);
-    assert!(
-        resolved
-            .files
-            .iter()
-            .all(|file| file.partition_values.is_empty()),
-        "every file entry must carry an empty partition-value map: {:?}",
-        resolved.files
-    );
 }
 
-/// `YEAR = '2026'` and `YEAR > '2025'` each keep only the `year=2026` file, in-process and in the
-/// scan Exasol is handed, and return that file's rows.
+/// `YEAR = '2026'` and `YEAR > '2025'` each keep only the `year=2026` file in the scan Exasol is
+/// handed, and return that file's rows.
 #[test]
 fn partition_filter_prunes_the_resolved_file_list() {
     setup();
     let mut conn = exa_conn();
 
-    let unfiltered = kept_paths("sales", None);
-    assert_eq!(unfiltered.len(), 3, "unfiltered SALES: {unfiltered:?}");
-
-    let cases = [
-        ("\"YEAR\" = '2026'", equal(column("YEAR"), string("2026"))),
-        ("\"YEAR\" > '2025'", less(string("2025"), column("YEAR"))),
-    ];
-    for (predicate, filter) in cases {
-        let kept = kept_paths("sales", Some(&filter));
-        assert!(
-            kept.len() < unfiltered.len(),
-            "{predicate} must prune: kept {kept:?} of {unfiltered:?}"
-        );
-        assert_eq!(
-            kept,
-            BTreeSet::from([SALES_2026_FILE.to_string()]),
-            "{predicate} must keep only the year=2026 file"
-        );
-
+    for predicate in ["\"YEAR\" = '2026'", "\"YEAR\" > '2025'"] {
         let sql = format!(
             "SELECT ID FROM {} WHERE {predicate}",
             vs_table(VS_DIRECT, "SALES")
@@ -1860,75 +1709,53 @@ fn natively_selected_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<St
         .map(|region| format!("SELECT CAST('{region}' AS VARCHAR(2000000)) AS R"))
         .collect::<Vec<_>>()
         .join(" UNION ALL ");
-    let cols = conn.query_columns(&format!("SELECT R FROM ({values}) WHERE {predicate}"));
-    cols[0].iter().map(value_to_string).collect()
+    string_column(conn, &format!("SELECT R FROM ({values}) WHERE {predicate}"))
 }
 
-fn regions_of(kept_paths: &BTreeSet<String>) -> BTreeSet<String> {
-    kept_paths
-        .iter()
-        .map(|path| {
-            let encoded = path
-                .strip_prefix("region=")
-                .and_then(|rest| rest.strip_suffix("/p.parquet"))
-                .unwrap_or_else(|| panic!("unexpected REGIONS file path {path}"));
+/// The decoded `REGION` values of the `region=<value>/p.parquet` files the pushed scan names.
+fn regions_named_by(pushed_sql: &str) -> BTreeSet<String> {
+    pushed_sql
+        .split("region=")
+        .skip(1)
+        .filter_map(|rest| rest.split_once("/p.parquet"))
+        .map(|(encoded, _)| {
             percent_encoding::percent_decode_str(encoded)
                 .decode_utf8()
-                .unwrap_or_else(|e| {
-                    panic!("REGIONS file path segment {encoded} is not valid UTF-8: {e}")
-                })
+                .unwrap_or_else(|e| panic!("REGIONS path segment {encoded} is not UTF-8: {e}"))
                 .into_owned()
         })
         .collect()
 }
 
-fn regions_named_by(pushed_sql: &str) -> BTreeSet<String> {
-    const PATH_UNSAFE: &percent_encoding::AsciiSet = &percent_encoding::AsciiSet::EMPTY
-        .add(b'%')
-        .add(b'#')
-        .add(b'?');
-    REGION_VALUES
-        .iter()
-        .filter(|region| {
-            let encoded = percent_encoding::utf8_percent_encode(region, PATH_UNSAFE).to_string();
-            pushed_sql.contains(&format!("region={encoded}/p.parquet"))
-        })
-        .map(|region| region.to_string())
-        .collect()
-}
-
 fn returned_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
-    let cols = conn.query_columns(&format!(
-        "SELECT REGION FROM {} WHERE {predicate}",
-        vs_table(VS_DIRECT, "REGIONS")
-    ));
-    cols[0].iter().map(value_to_string).collect()
+    string_column(
+        conn,
+        &format!(
+            "SELECT REGION FROM {} WHERE {predicate}",
+            vs_table(VS_DIRECT, "REGIONS")
+        ),
+    )
 }
 
 /// Range/`BETWEEN` pruning on `REGION` keeps exactly what Exasol's native `VARCHAR` comparison
-/// selects (in-process, pushed scan, and rows); a declined conjunct beside it changes nothing.
+/// selects (pushed scan and rows); a declined conjunct beside it changes nothing.
 #[test]
 fn range_pruning_matches_exasols_native_varchar_ordering() {
     setup();
     let mut conn = exa_conn();
 
-    let cases = [
-        ("{column} > 'Z'", less(string("Z"), column("REGION"))),
-        ("{column} < 'z'", less(column("REGION"), string("z"))),
-        (
-            "{column} BETWEEN 'B' AND 'a'",
-            between(column("REGION"), string("B"), string("a")),
-        ),
+    let templates = [
+        "{column} > 'Z'",
+        "{column} < 'z'",
+        "{column} BETWEEN 'B' AND 'a'",
     ];
-    for (template, filter) in cases {
-        let native = natively_selected_regions(&mut conn, &template.replace("{column}", "R"));
+    let natives: Vec<BTreeSet<String>> = templates
+        .iter()
+        .map(|template| natively_selected_regions(&mut conn, &template.replace("{column}", "R")))
+        .collect();
+    for (template, native) in templates.iter().zip(&natives) {
         let predicate = template.replace("{column}", "REGION");
 
-        assert_eq!(
-            regions_of(&kept_paths("regions", Some(&filter))),
-            native,
-            "{predicate}: the in-process kept files must match Exasol's native selection"
-        );
         let pushed = explain_virtual_sql(
             &mut conn,
             &format!(
@@ -1937,18 +1764,18 @@ fn range_pruning_matches_exasols_native_varchar_ordering() {
             ),
         );
         assert_eq!(
-            regions_named_by(&pushed),
+            &regions_named_by(&pushed),
             native,
             "{predicate}: the pushed scan's files must match Exasol's native selection: {pushed}"
         );
         assert_eq!(
-            returned_regions(&mut conn, &predicate),
+            &returned_regions(&mut conn, &predicate),
             native,
             "{predicate}: the returned rows must match Exasol's native selection"
         );
     }
 
-    let native = natively_selected_regions(&mut conn, "R > 'Z'");
+    let native = &natives[0];
     let predicate = "REGION > 'Z' AND SECOND(TS, 3) > 1";
     let pushed = explain_virtual_sql(
         &mut conn,
@@ -1958,12 +1785,12 @@ fn range_pruning_matches_exasols_native_varchar_ordering() {
         ),
     );
     assert_eq!(
-        regions_named_by(&pushed),
+        &regions_named_by(&pushed),
         native,
         "{predicate}: pruning must still run on the REGION conjunct: {pushed}"
     );
     assert_eq!(
-        returned_regions(&mut conn, predicate),
+        &returned_regions(&mut conn, predicate),
         native,
         "{predicate}: the declined conjunct holds on every row, so the row set must not change"
     );
@@ -1975,9 +1802,6 @@ fn zero_matching_files_prune_to_zero_rows_without_error() {
     setup();
     let mut conn = exa_conn();
 
-    let kept = kept_paths("sales", Some(&equal(column("YEAR"), string("2099"))));
-    assert!(kept.is_empty(), "YEAR = '2099' must keep no file: {kept:?}");
-
     let sql = format!(
         "SELECT ID FROM {} WHERE \"YEAR\" = '2099'",
         vs_table(VS_DIRECT, "SALES")
@@ -1988,15 +1812,9 @@ fn zero_matching_files_prune_to_zero_rows_without_error() {
         "the pushed scan must name no SALES file: {pushed}"
     );
 
-    let resp = conn.try_execute(&sql);
     assert_eq!(
-        resp["status"].as_str(),
-        Some("ok"),
-        "a query keeping no file must not fail: {resp}"
-    );
-    assert_eq!(
-        resp["responseData"]["results"][0]["resultSet"]["numRows"].as_i64(),
-        Some(0),
-        "a query keeping no file must return zero rows: {resp}"
+        conn.query_row_count(&sql),
+        0,
+        "a query keeping no file must return zero rows"
     );
 }

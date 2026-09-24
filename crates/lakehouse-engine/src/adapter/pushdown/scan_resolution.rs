@@ -40,6 +40,13 @@ pub(super) struct TableScanResolver<'a> {
     connection: ConnectionStorage<'a>,
 }
 
+/// The request's live catalog session, in the shape its catalog kind resolved
+/// into.
+///
+/// Deliberately NOT the [`CatalogKind`] value: the kind is matched once, in
+/// [`TableScanResolver::for_request`], and an already-resolved session is all
+/// every later step needs. Carrying the kind alongside it would invite a second
+/// match site free to disagree with the first.
 enum RequestSession {
     Iceberg(CatalogSession),
     /// Boxed: a Unity Catalog session is several times the size of an Iceberg

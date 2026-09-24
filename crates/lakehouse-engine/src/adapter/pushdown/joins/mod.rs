@@ -233,10 +233,7 @@ pub(super) async fn plan_join(
     // shape-correct empty result over the combined N-table column universe (stable
     // side order) rather than a fan-out over an empty file list.
     if sides.iter().any(|s| s.files.is_empty()) {
-        let mut combined = Vec::new();
-        for leaf in &join.tables {
-            combined.extend(involved_table_columns(request, &leaf.table_name));
-        }
+        let combined = side_columns.concat();
         let (proj_cols, proj_types, widened) = project_columns(pushdown_req, combined.clone())?;
         return empty_result_sql(pushdown_req, &proj_cols, &proj_types, widened, &combined);
     }

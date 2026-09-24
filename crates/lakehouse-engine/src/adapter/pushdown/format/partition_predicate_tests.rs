@@ -1,53 +1,6 @@
 use super::*;
+use crate::adapter::pushdown::test_support::filter_json::*;
 use serde_json::json;
-
-fn column(name: &str) -> Json {
-    json!({"type": "column", "name": name, "tableName": "SALES"})
-}
-
-fn string(value: &str) -> Json {
-    json!({"type": "literal_string", "value": value})
-}
-
-fn number(value: &str) -> Json {
-    json!({"type": "literal_exactnumeric", "value": value})
-}
-
-fn compare(kind: &str, left: Json, right: Json) -> Json {
-    json!({"type": kind, "left": left, "right": right})
-}
-
-fn equal(name: &str, value: &str) -> Json {
-    compare("predicate_equal", column(name), string(value))
-}
-
-fn not(expression: Json) -> Json {
-    json!({"type": "predicate_not", "expression": expression})
-}
-
-fn and(expressions: Vec<Json>) -> Json {
-    json!({"type": "predicate_and", "expressions": expressions})
-}
-
-fn or(expressions: Vec<Json>) -> Json {
-    json!({"type": "predicate_or", "expressions": expressions})
-}
-
-fn is_null(name: &str) -> Json {
-    json!({"type": "predicate_is_null", "expression": column(name)})
-}
-
-fn is_not_null(name: &str) -> Json {
-    json!({"type": "predicate_is_not_null", "expression": column(name)})
-}
-
-fn in_list(name: &str, arguments: Vec<Json>) -> Json {
-    json!({"type": "predicate_in_constlist", "expression": column(name), "arguments": arguments})
-}
-
-fn between(name: &str, low: Json, high: Json) -> Json {
-    json!({"type": "predicate_between", "expression": column(name), "left": low, "right": high})
-}
 
 /// A filter no partition column can decide.
 fn on_a_data_column() -> Json {
@@ -265,6 +218,45 @@ fn a_non_partition_node_never_prunes() {
             json!({"left": column("YEAR")}),
             [true, true, true],
         ),
+        (
+            "a numeric literal, which Exasol compares numerically",
+            compare("predicate_equal", column("YEAR"), number("2024")),
+            [true, true, true],
+        ),
+        (
+            "an empty string, which Exasol reads as NULL",
+            equal("YEAR", ""),
+            [true, true, true],
+        ),
+        (
+            "a NULL literal",
+            compare(
+                "predicate_equal",
+                column("YEAR"),
+                json!({"type": "literal_null"}),
+            ),
+            [true, true, true],
+        ),
+        (
+            "an IN list holding one non-string element",
+            in_list("YEAR", vec![string("2024"), number("2023")]),
+            [true, true, true],
+        ),
+        (
+            "an IN list holding one empty string",
+            in_list("YEAR", vec![string("2024"), string("")]),
+            [true, true, true],
+        ),
+        (
+            "a BETWEEN with one non-string bound",
+            between("YEAR", string("2023"), number("2024")),
+            [true, true, true],
+        ),
+        (
+            "a range comparison against an empty string",
+            compare("predicate_greater", column("YEAR"), string("")),
+            [true, true, true],
+        ),
     ];
 
     for (label, filter, expected) in cases {
@@ -280,53 +272,6 @@ fn a_non_partition_node_never_prunes() {
         files.iter().all(|values| unfiltered.keeps(values)),
         "an absent filter keeps every file"
     );
-}
-
-#[test]
-fn a_non_string_or_empty_literal_never_prunes() {
-    let files = year_files();
-    let cases: Vec<(&str, Json)> = vec![
-        (
-            "a numeric literal, which Exasol compares numerically",
-            compare("predicate_equal", column("YEAR"), number("2024")),
-        ),
-        (
-            "an empty string, which Exasol reads as NULL",
-            equal("YEAR", ""),
-        ),
-        (
-            "a NULL literal",
-            compare(
-                "predicate_equal",
-                column("YEAR"),
-                json!({"type": "literal_null"}),
-            ),
-        ),
-        (
-            "an IN list holding one non-string element",
-            in_list("YEAR", vec![string("2024"), number("2023")]),
-        ),
-        (
-            "an IN list holding one empty string",
-            in_list("YEAR", vec![string("2024"), string("")]),
-        ),
-        (
-            "a BETWEEN with one non-string bound",
-            between("YEAR", string("2023"), number("2024")),
-        ),
-        (
-            "a range comparison against an empty string",
-            compare("predicate_greater", column("YEAR"), string("")),
-        ),
-    ];
-
-    for (label, filter) in cases {
-        assert_eq!(
-            kept(&filter, &files),
-            [true, true, true],
-            "{label}: must keep every file"
-        );
-    }
 }
 
 #[test]

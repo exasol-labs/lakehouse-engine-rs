@@ -22,6 +22,7 @@ mod delta_predicate;
 mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
+mod filter_json;
 mod iceberg;
 mod parquet_format_reader;
 mod partition_predicate;

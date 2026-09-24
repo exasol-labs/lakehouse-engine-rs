@@ -2,22 +2,21 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Schema};
+use arrow::datatypes::{DataType, Field, Schema};
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::StorageBackend;
 use object_store::ObjectStore;
-use object_store::path::{Path as StorePath, PathPart};
-use percent_encoding::{AsciiSet, utf8_percent_encode};
+use object_store::path::Path as StorePath;
 use serde_json::Value as Json;
 use std::collections::HashSet;
 
 use super::partition_predicate::PartitionPredicate;
 use super::{FormatReader, ResolvedScan};
 use crate::adapter::parquet_directory::{
-    DirectoryOptions, ParquetFile, resolve_parquet_directory, store_prefix,
+    DirectoryOptions, ParquetDirectory, ParquetFile, resolve_parquet_directory, store_prefix,
 };
 use crate::scan::spec::{FileEntry, LogicalField, NestedField, NestedMembers};
-use crate::scan::store_root_url;
+use crate::scan::{encode_file_path, store_root_url};
 use crate::types::mapping::{arrow_type_to_tag, exasol_type_to_arrow};
 
 #[cfg(test)]
@@ -46,62 +45,59 @@ impl FormatReader for ParquetFormatReader<'_> {
             let store_root = store_root_url(self.table_root)?;
             let prefix = store_prefix(self.table_root)?;
             let predicate = PartitionPredicate::from_filter(filter_json);
-            let directory =
-                resolve_parquet_directory(self.store, &prefix, self.options, &move |values| {
-                    predicate.keeps(values)
-                })
-                .await?;
+            let ParquetDirectory {
+                files,
+                schema,
+                partition_columns,
+            } = resolve_parquet_directory(self.store, &prefix, self.options, &move |values| {
+                predicate.keeps(values)
+            })
+            .await?;
 
-            let mut logical_schema = logical_schema(&directory.schema);
-            logical_schema.extend(absent_declared_fields(
+            let mut logical = logical_schema(&schema);
+            logical.extend(logical_schema(&Schema::new(absent_declared_fields(
                 self.declared_columns,
-                &directory.schema,
-            ));
+                &schema,
+            ))));
             Ok(ResolvedScan {
-                files: directory
-                    .files
-                    .iter()
+                files: files
+                    .into_iter()
                     .map(|file| file_entry(file, &prefix, store_root.as_str()))
                     .collect(),
                 effective_storage: self.storage.clone(),
-                logical_schema,
+                logical_schema: logical,
                 table_root: self.table_root.to_string(),
                 name_mapping: Vec::new(),
-                partition_columns: directory.partition_columns,
+                partition_columns,
                 refused_columns: Vec::new(),
             })
         })
     }
 }
 
-/// The characters `ListingTableUrl::parse` would decode or read as fragment/query.
-const URL_PARSE_UNSAFE: &AsciiSet = &AsciiSet::EMPTY.add(b'%').add(b'#').add(b'?');
-
 /// Size comes from the listing response (no extra HEAD or Parquet read); path is encoded relative to the table root, or as an absolute URI if outside it.
-fn file_entry(file: &ParquetFile, prefix: &StorePath, store_root: &str) -> FileEntry {
-    let relative = file.path.prefix_match(prefix).map(encoded_path);
+fn file_entry(file: ParquetFile, prefix: &StorePath, store_root: &str) -> FileEntry {
+    let len_hint = file.path.as_ref().len();
+    let relative = file
+        .path
+        .prefix_match(prefix)
+        .map(|parts| encode_file_path(parts, len_hint));
     let store_root = store_root.trim_end_matches('/');
     FileEntry {
-        path: relative
-            .unwrap_or_else(|| format!("{store_root}/{}", encoded_path(file.path.parts()))),
+        path: relative.unwrap_or_else(|| {
+            format!(
+                "{store_root}/{}",
+                encode_file_path(file.path.parts(), len_hint)
+            )
+        }),
         size: file.size,
         deletes: Vec::new(),
-        partition_values: file.partition_values.clone(),
+        partition_values: file.partition_values,
     }
 }
 
-fn encoded_path<'p>(parts: impl Iterator<Item = PathPart<'p>>) -> String {
-    parts
-        .map(|part| utf8_percent_encode(part.as_ref(), URL_PARSE_UNSAFE).to_string())
-        .collect::<Vec<String>>()
-        .join("/")
-}
-
 /// Declared columns absent from `schema` (uppercase fold), typed as declared; they read NULL.
-fn absent_declared_fields(
-    declared_columns: &[(String, String)],
-    schema: &Schema,
-) -> Vec<LogicalField> {
+fn absent_declared_fields(declared_columns: &[(String, String)], schema: &Schema) -> Vec<Field> {
     let present: HashSet<String> = schema
         .fields()
         .iter()
@@ -110,16 +106,9 @@ fn absent_declared_fields(
     declared_columns
         .iter()
         .filter(|(name, _)| !present.contains(&name.to_uppercase()))
-        .map(|(name, exasol_type)| LogicalField {
-            field_id: None,
-            name: name.clone(),
-            arrow_type: arrow_type_to_tag(
-                &exasol_type_to_arrow(exasol_type).unwrap_or(DataType::Utf8),
-            ),
-            nullable: true,
-            initial_default: None,
-            nested: None,
-            physical_name: None,
+        .map(|(name, exasol_type)| {
+            let data_type = exasol_type_to_arrow(exasol_type).unwrap_or(DataType::Utf8);
+            Field::new(name, data_type, true)
         })
         .collect()
 }

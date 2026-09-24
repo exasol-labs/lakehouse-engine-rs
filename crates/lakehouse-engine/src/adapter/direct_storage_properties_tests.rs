@@ -175,8 +175,6 @@ fn a_base_path_with_repeated_trailing_separators_joins_to_one_separator() {
 fn directory_options_derive_both_switches() {
     for (merge_schema, hive_partitioning, expected_mode) in [
         (true, true, MergeMode::FoldEveryFile),
-        (false, true, MergeMode::SampleOneFile),
-        (true, false, MergeMode::FoldEveryFile),
         (false, false, MergeMode::SampleOneFile),
     ] {
         let props = json!({

@@ -305,6 +305,30 @@ pub fn create_virtual_schema_with_password(
     catalog_uri: &str,
     password: &CatalogConnectionPassword,
 ) {
+    let create_vs_sql = prepare_create_virtual_schema(conn, props, catalog_uri, password);
+    conn.execute(&create_vs_sql);
+}
+
+/// `create_virtual_schema_with_password`, but returns the raw `CREATE VIRTUAL SCHEMA`
+/// response instead of panicking on an error — for tests asserting a rejection.
+pub fn try_create_virtual_schema_with_password(
+    conn: &mut ExaConn,
+    props: &VsProps,
+    catalog_uri: &str,
+    password: &CatalogConnectionPassword,
+) -> serde_json::Value {
+    let create_vs_sql = prepare_create_virtual_schema(conn, props, catalog_uri, password);
+    conn.try_execute(&create_vs_sql)
+}
+
+/// Creates the CONNECTION, grants it, drops any existing VS, and returns the
+/// `CREATE VIRTUAL SCHEMA` statement for `props`.
+fn prepare_create_virtual_schema(
+    conn: &mut ExaConn,
+    props: &VsProps,
+    catalog_uri: &str,
+    password: &CatalogConnectionPassword,
+) -> String {
     let create_conn_sql =
         build_create_connection_sql(props.catalog_conn_name, catalog_uri, password);
     conn.execute(&create_conn_sql);
@@ -327,14 +351,14 @@ pub fn create_virtual_schema_with_password(
         format!("\n  NAMESPACE   = '{}'", props.namespace)
     };
 
-    conn.execute(&format!(
+    format!(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
   ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}{hive_partitioning_clause}"#,
         vs_name = props.vs_name,
         catalog_conn_name = props.catalog_conn_name,
-    ));
+    )
 }
 
 pub fn current_user(conn: &mut ExaConn) -> String {

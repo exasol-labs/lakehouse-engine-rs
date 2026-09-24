@@ -224,13 +224,23 @@ pub(super) fn delta_commit_zero_key(name: &str) -> String {
 /// per commit — and 404s everything else, including every data-file read, which no
 /// plan-time resolution performs.
 pub(super) async fn delta_object_endpoint(objects: Vec<(String, String)>) -> StorageBackend {
+    object_endpoint("bucket", objects).await
+}
+
+/// A loopback path-style S3 endpoint serving `objects` (bucket-relative key → body) from
+/// `bucket`: `ListObjectsV2` listings, a GET per served key, and a 404 for everything else.
+pub(super) async fn object_endpoint(
+    bucket: &str,
+    objects: Vec<(String, String)>,
+) -> StorageBackend {
     let objects = Arc::new(objects);
+    let bucket = Arc::new(bucket.to_string());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
     let port = listener.local_addr().expect("local_addr").port();
 
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
-            let objects = objects.clone();
+            let (objects, bucket) = (objects.clone(), bucket.clone());
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
                 let read = stream.read(&mut buf).await.unwrap_or(0);
@@ -248,11 +258,17 @@ pub(super) async fn delta_object_endpoint(objects: Vec<(String, String)>) -> Sto
                     .to_string();
                 let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
                 let response = if query.contains("list-type=2") {
-                    ok_response("application/xml", &list_bucket_result(query, &objects))
+                    ok_response(
+                        "application/xml",
+                        &list_bucket_result(&bucket, query, &objects),
+                    )
                 } else {
+                    let key = path
+                        .strip_prefix(&format!("/{bucket}/"))
+                        .map(|key| percent_encoding::percent_decode_str(key).decode_utf8_lossy());
                     match objects
                         .iter()
-                        .find(|(key, _)| key == path.trim_start_matches("/bucket/"))
+                        .find(|(served, _)| key.as_deref() == Some(served.as_str()))
                     {
                         Some((_, body)) => ok_response("application/octet-stream", body),
                         None => {
@@ -294,7 +310,7 @@ fn ok_response(content_type: &str, body: &str) -> String {
 
 /// The `ListObjectsV2` answer for the listing `query`, over every served key under
 /// its `prefix` that sorts after its `start-after` marker.
-fn list_bucket_result(query: &str, objects: &[(String, String)]) -> String {
+fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -> String {
     let param = |key: &str| {
         url::form_urlencoded::parse(query.as_bytes())
             .find(|(name, _)| name == key)
@@ -319,7 +335,7 @@ fn list_bucket_result(query: &str, objects: &[(String, String)]) -> String {
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Name>bucket</Name><Prefix>{prefix}</Prefix><MaxKeys>1000</MaxKeys>\
+         <Name>{bucket}</Name><Prefix>{prefix}</Prefix><MaxKeys>1000</MaxKeys>\
          <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
     )
 }
@@ -654,4 +670,57 @@ pub(super) fn agg_item_expr(
         "arguments": [arg],
         "distinct": distinct,
     })
+}
+
+/// Builders for Exasol pushdown filter-JSON nodes.
+pub(crate) mod filter_json {
+    use serde_json::{Value as Json, json};
+
+    pub(crate) fn column(name: &str) -> Json {
+        json!({"type": "column", "name": name, "tableName": "SALES"})
+    }
+
+    pub(crate) fn string(value: &str) -> Json {
+        json!({"type": "literal_string", "value": value})
+    }
+
+    pub(crate) fn number(value: &str) -> Json {
+        json!({"type": "literal_exactnumeric", "value": value})
+    }
+
+    pub(crate) fn compare(kind: &str, left: Json, right: Json) -> Json {
+        json!({"type": kind, "left": left, "right": right})
+    }
+
+    pub(crate) fn equal(name: &str, value: &str) -> Json {
+        compare("predicate_equal", column(name), string(value))
+    }
+
+    pub(crate) fn not(expression: Json) -> Json {
+        json!({"type": "predicate_not", "expression": expression})
+    }
+
+    pub(crate) fn and(expressions: Vec<Json>) -> Json {
+        json!({"type": "predicate_and", "expressions": expressions})
+    }
+
+    pub(crate) fn or(expressions: Vec<Json>) -> Json {
+        json!({"type": "predicate_or", "expressions": expressions})
+    }
+
+    pub(crate) fn is_null(name: &str) -> Json {
+        json!({"type": "predicate_is_null", "expression": column(name)})
+    }
+
+    pub(crate) fn is_not_null(name: &str) -> Json {
+        json!({"type": "predicate_is_not_null", "expression": column(name)})
+    }
+
+    pub(crate) fn in_list(name: &str, arguments: Vec<Json>) -> Json {
+        json!({"type": "predicate_in_constlist", "expression": column(name), "arguments": arguments})
+    }
+
+    pub(crate) fn between(name: &str, low: Json, high: Json) -> Json {
+        json!({"type": "predicate_between", "expression": column(name), "left": low, "right": high})
+    }
 }

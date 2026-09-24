@@ -1,14 +1,13 @@
 use super::*;
 use crate::adapter::parquet_directory::MergeMode;
+use crate::adapter::pushdown::test_support::filter_json::{column, compare, equal, number, string};
 use crate::adapter::pushdown::test_support::sample_storage;
+use crate::adapter::tests::parquet_fixture::{
+    directory_options, in_memory_store, nullable, parquet_bytes,
+};
 use crate::scan::spec::reconstruct_abs_uri;
-use arrow::array::new_null_array;
-use arrow::datatypes::{Field, Fields, Schema as ArrowSchema};
-use arrow::record_batch::RecordBatch;
+use arrow::datatypes::Fields;
 use datafusion::datasource::listing::ListingTableUrl;
-use object_store::memory::InMemory;
-use object_store::{ObjectStoreExt, PutPayload};
-use parquet::arrow::ArrowWriter;
 use std::collections::BTreeMap;
 
 /// The CONNECTION address plus the namespace property, joined by the resolver.
@@ -17,47 +16,13 @@ const TABLE_ROOT: &str = "s3://warehouse/direct/events";
 /// Unreadable as Parquet: a successful resolution proves its footer was never read.
 const NOT_PARQUET: &[u8] = b"not a parquet file";
 
-/// One row of nulls is enough for the footer to declare `fields` without needing a value per Arrow type.
-fn parquet_bytes(fields: Vec<Field>) -> Vec<u8> {
-    let schema = Arc::new(ArrowSchema::new(fields));
-    let columns: Vec<arrow::array::ArrayRef> = schema
-        .fields()
-        .iter()
-        .map(|field| new_null_array(field.data_type(), 1))
-        .collect();
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .expect("the fixture batch matches its own schema");
-    let mut bytes = Vec::new();
-    let mut writer =
-        ArrowWriter::try_new(&mut bytes, schema, None).expect("the fixture schema is writable");
-    writer.write(&batch).expect("the fixture batch is writable");
-    writer.close().expect("the fixture file closes");
-    bytes
+/// One row of nulls declares `fields` without needing a value per Arrow type.
+fn parquet(fields: Vec<Field>) -> Vec<u8> {
+    parquet_bytes(fields, 1)
 }
 
-fn nullable(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, true)
-}
-
-async fn store_holding(objects: Vec<(&str, Vec<u8>)>) -> Arc<dyn ObjectStore> {
-    let store = InMemory::new();
-    for (key, bytes) in objects {
-        store
-            .put(
-                &StorePath::parse(key).expect("the fixture key is a valid store path"),
-                PutPayload::from(bytes),
-            )
-            .await
-            .expect("the in-memory store accepts the fixture object");
-    }
-    Arc::new(store)
-}
-
-fn hive(merge_mode: MergeMode) -> DirectoryOptions {
-    DirectoryOptions {
-        merge_mode,
-        hive_partitioning: true,
-    }
+async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<dyn ObjectStore> {
+    in_memory_store(objects).await
 }
 
 async fn try_resolve(
@@ -83,7 +48,7 @@ async fn resolve(
     merge_mode: MergeMode,
     filter_json: Option<&Json>,
 ) -> ResolvedScan {
-    try_resolve(store, hive(merge_mode), filter_json, &[])
+    try_resolve(store, directory_options(merge_mode, true), filter_json, &[])
         .await
         .expect("a directory of readable Parquet files resolves a scan")
 }
@@ -99,22 +64,6 @@ fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
     scan.files.iter().map(|file| file.path.as_str()).collect()
 }
 
-fn year_equals(value: &str) -> Json {
-    serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "YEAR"},
-        "right": {"type": "literal_string", "value": value},
-    })
-}
-
-fn year_greater_than(value: &str) -> Json {
-    serde_json::json!({
-        "type": "predicate_greater",
-        "left": {"type": "column", "name": "YEAR"},
-        "right": {"type": "literal_string", "value": value},
-    })
-}
-
 fn declared(columns: &[(&str, &str)]) -> Vec<(String, String)> {
     columns
         .iter()
@@ -124,28 +73,28 @@ fn declared(columns: &[(&str, &str)]) -> Vec<(String, String)> {
 
 /// Two data files at different depths/schemas, plus two objects the listing must skip (a hidden segment, a sibling table's directory).
 async fn two_depth_directory() -> Arc<dyn ObjectStore> {
-    store_holding(vec![
+    store_holding(&[
         (
             "direct/events/part-0.parquet",
-            parquet_bytes(vec![
+            &parquet(vec![
                 nullable("id", DataType::Int32),
                 nullable("name", DataType::Utf8),
             ]),
         ),
         (
             "direct/events/day=2/part-1.parquet",
-            parquet_bytes(vec![
+            &parquet(vec![
                 nullable("id", DataType::Int64),
                 nullable("extra", DataType::Utf8),
             ]),
         ),
         (
             "direct/events/_staging/part-9.parquet",
-            parquet_bytes(vec![nullable("hidden", DataType::Utf8)]),
+            &parquet(vec![nullable("hidden", DataType::Utf8)]),
         ),
         (
             "direct/other/part-0.parquet",
-            parquet_bytes(vec![nullable("other", DataType::Utf8)]),
+            &parquet(vec![nullable("other", DataType::Utf8)]),
         ),
     ])
     .await
@@ -242,8 +191,9 @@ async fn file_entry_paths_round_trip_to_the_listed_object() {
         "direct/events/é/ü.parquet",
         "direct/events/plain/p.parquet",
     ];
-    let data = parquet_bytes(vec![nullable("id", DataType::Int64)]);
-    let store = store_holding(keys.iter().map(|key| (*key, data.clone())).collect()).await;
+    let data = parquet(vec![nullable("id", DataType::Int64)]);
+    let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data.as_slice())).collect();
+    let store = store_holding(&objects).await;
 
     let scan = resolve(&store, MergeMode::FoldEveryFile, None).await;
 
@@ -284,11 +234,7 @@ async fn file_entry_paths_round_trip_to_the_listed_object() {
 #[tokio::test]
 async fn plan_reads_selected_footers_and_lists_every_file() {
     let store = two_depth_directory().await;
-    let filter = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "ID"},
-        "right": {"type": "literal_exactnumeric", "value": "1"},
-    });
+    let filter = compare("predicate_equal", column("ID"), number("1"));
 
     let folded = resolve(&store, MergeMode::FoldEveryFile, Some(&filter)).await;
     let sampled = resolve(&store, MergeMode::SampleOneFile, Some(&filter)).await;
@@ -325,18 +271,19 @@ async fn plan_reads_selected_footers_and_lists_every_file() {
 
 #[tokio::test]
 async fn a_partition_filter_prunes_files_before_their_footers_are_read() {
-    let store = store_holding(vec![
+    let store = store_holding(&[
         (
             "direct/events/year=2026/p1.parquet",
-            parquet_bytes(vec![nullable("id", DataType::Int64)]),
+            &parquet(vec![nullable("id", DataType::Int64)]),
         ),
-        ("direct/events/year=2025/p2.parquet", NOT_PARQUET.to_vec()),
-        ("direct/events/year=2024/p3.parquet", NOT_PARQUET.to_vec()),
+        ("direct/events/year=2025/p2.parquet", NOT_PARQUET),
+        ("direct/events/year=2024/p3.parquet", NOT_PARQUET),
     ])
     .await;
-    let options = hive(MergeMode::FoldEveryFile);
+    let options = directory_options(MergeMode::FoldEveryFile, true);
+    let columns = declared(&[("ID", "DECIMAL(20,0)"), ("YEAR", "VARCHAR(2000000) UTF8")]);
 
-    let unpruned = try_resolve(&store, options, None, &[])
+    let unpruned = try_resolve(&store, options, None, &columns)
         .await
         .expect_err("an unpruned scan reads the unreadable footers");
     assert!(
@@ -346,58 +293,46 @@ async fn a_partition_filter_prunes_files_before_their_footers_are_read() {
         "{unpruned}"
     );
 
-    for filter in [year_equals("2026"), year_greater_than("2025")] {
-        let scan = try_resolve(&store, options, Some(&filter), &[])
+    for (filter, kept, columns_after) in [
+        (
+            equal("YEAR", "2026"),
+            vec!["year=2026/p1.parquet"],
+            vec!["id", "year"],
+        ),
+        (
+            compare("predicate_greater", column("YEAR"), string("2025")),
+            vec!["year=2026/p1.parquet"],
+            vec!["id", "year"],
+        ),
+        // Keeping no file still resolves, and the schema survives pruning every file.
+        (equal("YEAR", "2099"), vec![], vec!["year", "ID"]),
+    ] {
+        let scan = try_resolve(&store, options, Some(&filter), &columns)
             .await
             .unwrap_or_else(|e| panic!("{filter}: a pruned file's footer must not be read: {e}"));
         assert_eq!(
             file_paths(&scan),
-            vec!["year=2026/p1.parquet"],
+            kept,
             "{filter}: only the file whose partition value can satisfy the filter is kept"
         );
         assert_eq!(scan.partition_columns, vec!["year".to_string()]);
+        assert_eq!(column_names(&scan), columns_after, "{filter}");
     }
 }
 
 #[tokio::test]
-async fn a_predicate_keeping_no_file_reads_no_footer_and_errors_never() {
-    let store = store_holding(vec![
-        ("direct/events/year=2026/p1.parquet", NOT_PARQUET.to_vec()),
-        ("direct/events/year=2025/p2.parquet", NOT_PARQUET.to_vec()),
-    ])
-    .await;
-    let options = hive(MergeMode::FoldEveryFile);
-    let columns = declared(&[("ID", "DECIMAL(20,0)"), ("YEAR", "VARCHAR(2000000) UTF8")]);
-
-    try_resolve(&store, options, None, &columns)
-        .await
-        .expect_err("an unpruned scan reads the unreadable footers");
-
-    let scan = try_resolve(&store, options, Some(&year_equals("2099")), &columns)
-        .await
-        .expect("a predicate keeping no file resolves without reading any footer");
-
-    assert!(scan.files.is_empty(), "no file can satisfy YEAR = '2099'");
-    assert_eq!(
-        column_names(&scan),
-        vec!["year", "ID"],
-        "the schema survives pruning every file"
-    );
-}
-
-#[tokio::test]
 async fn a_declared_column_absent_from_kept_files_is_added_as_a_null_field() {
-    let store = store_holding(vec![
+    let store = store_holding(&[
         (
             "direct/events/year=2026/p1.parquet",
-            parquet_bytes(vec![
+            &parquet(vec![
                 nullable("id", DataType::Int64),
                 nullable("discount", DataType::Float64),
             ]),
         ),
         (
             "direct/events/year=2025/p2.parquet",
-            parquet_bytes(vec![nullable("id", DataType::Int64)]),
+            &parquet(vec![nullable("id", DataType::Int64)]),
         ),
     ])
     .await;
@@ -408,9 +343,9 @@ async fn a_declared_column_absent_from_kept_files_is_added_as_a_null_field() {
         ("PLACE", "GEOMETRY"),
         ("YEAR", "VARCHAR(2000000) UTF8"),
     ]);
-    let options = hive(MergeMode::FoldEveryFile);
+    let options = directory_options(MergeMode::FoldEveryFile, true);
 
-    let pruned = try_resolve(&store, options, Some(&year_equals("2025")), &columns)
+    let pruned = try_resolve(&store, options, Some(&equal("YEAR", "2025")), &columns)
         .await
         .expect("the kept file resolves a scan");
     let unpruned = try_resolve(&store, options, None, &columns)
@@ -454,9 +389,9 @@ async fn a_nested_column_declares_the_string_tag_and_an_identity_bound_descripto
         nullable("a", DataType::Int32),
         nullable("b", DataType::Utf8),
     ]);
-    let store = store_holding(vec![(
+    let store = store_holding(&[(
         "direct/events/part-0.parquet",
-        parquet_bytes(vec![
+        &parquet(vec![
             nullable("point", DataType::Struct(inner)),
             nullable(
                 "tags",
@@ -505,11 +440,8 @@ async fn a_nested_column_declares_the_string_tag_and_an_identity_bound_descripto
 // An empty prefix resolves an empty scan, not an error — whether it's a table was decided at create time.
 #[tokio::test]
 async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
-    let store = store_holding(vec![(
-        "direct/events/_delta_log/00000000000000000000.json",
-        b"{}".to_vec(),
-    )])
-    .await;
+    let store =
+        store_holding(&[("direct/events/_delta_log/00000000000000000000.json", b"{}")]).await;
 
     let scan = resolve(&store, MergeMode::FoldEveryFile, None).await;
 
@@ -521,9 +453,9 @@ async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
 // Planning must render the same normalized timestamptz_* tag as enumeration, or CREATE VIRTUAL SCHEMA could accept a column that planning then refuses.
 #[tokio::test]
 async fn a_non_utc_timezone_column_plans_at_its_normalized_tag() {
-    let store = store_holding(vec![(
+    let store = store_holding(&[(
         "direct/events/part-0.parquet",
-        parquet_bytes(vec![nullable(
+        &parquet(vec![nullable(
             "occurred_at",
             DataType::Timestamp(
                 arrow::datatypes::TimeUnit::Microsecond,

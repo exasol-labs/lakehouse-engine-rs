@@ -23,7 +23,11 @@ impl DirectStorageProperties {
     /// The only place [`DirectoryOptions`] is derived, so enumeration and pushdown can't disagree.
     pub fn directory_options(&self) -> DirectoryOptions {
         DirectoryOptions {
-            merge_mode: MergeMode::for_merge_schema(self.merge_schema),
+            merge_mode: if self.merge_schema {
+                MergeMode::FoldEveryFile
+            } else {
+                MergeMode::SampleOneFile
+            },
             hive_partitioning: self.hive_partitioning,
         }
     }
