@@ -21,7 +21,6 @@ use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
-use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::pushdown::handle_pushdown;
 use crate::adapter::tables::{catalog_identifier_string, flatten_table_name};
 use crate::scan::sealed::SealedStorageKey;
@@ -603,7 +602,7 @@ fn construct_catalog_client(
             let client = DirectStorageCatalogClient::new(
                 &storage,
                 &resolved.base_path,
-                MergeMode::for_merge_schema(resolved.merge_schema),
+                resolved.directory_options(),
                 &secrets,
             )?;
             Ok(Box::new(client))

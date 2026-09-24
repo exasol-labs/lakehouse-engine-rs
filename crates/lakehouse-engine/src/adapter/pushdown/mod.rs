@@ -239,7 +239,9 @@ pub async fn handle_pushdown(
         name_mapping,
         partition_columns,
         refused_columns,
-    } = resolver.resolve(&catalog.table, filter_json_raw).await?;
+    } = resolver
+        .resolve(&catalog.table, filter_json_raw, &col_types)
+        .await?;
     let scan_storage = scan_storage_for(
         &conn.creds,
         &conn.connection_name,

@@ -325,11 +325,37 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 | Property | Default | Meaning |
 |---|---|---|
 | `NAMESPACE` | absent (the CONNECTION address alone is the base path) | Narrows discovery to a subtree: joined onto the CONNECTION address with a single `/` to form the storage base path. Not a `catalog.schema` reference — there is no catalog to resolve it against |
-| `MERGE_SCHEMA` | `TRUE` | `TRUE` reads every listed file's footer and folds them into one declared schema (widening a narrower numeric/date type into a wider one, unioning columns present in only some files). `FALSE` samples only the lexicographically first file's footer and declares that schema alone — cheaper, but a column or a wider type that only a later file carries is invisible, and a row that does not fit the sampled type fails at read time rather than at `CREATE VIRTUAL SCHEMA` time |
-| `HIVE_PARTITIONING` | `TRUE` | Parsed and validated (an unparseable value is rejected, never silently defaulted) but not yet acted on by directory discovery or scanning — reserved for `key=value` path-segment partition pruning |
+| `MERGE_SCHEMA` | `TRUE` | `TRUE` reads every listed file's footer and folds them into one declared schema (widening a narrower numeric/date type into a wider one, unioning columns present in only some files). `FALSE` samples only the lexicographically first file's footer and declares that schema alone — cheaper, but a column or a wider type that only a later file carries is invisible, and a row that does not fit the sampled type fails at read time rather than at `CREATE VIRTUAL SCHEMA` time. `FALSE` takes the partition keys from the sampled file's path alone too, so it requires every file to share one partition layout: a key only other files carry is ignored, and a file lacking a sampled key reads NULL for it |
+| `HIVE_PARTITIONING` | `TRUE` | `TRUE` declares each `key=value` directory segment below a table's root as a `VARCHAR` partition column and prunes files on it when a query is planned (see *Partition columns* below). `FALSE` reads such segments as plain directories: no partition column and no pruning |
 
 An unparseable `MERGE_SCHEMA` or `HIVE_PARTITIONING` value is rejected rather than defaulted, since a
 typo that silently selected the opposite mode would return a narrower schema instead of an error.
+
+**Partition columns.** Under the default `HIVE_PARTITIONING = 'TRUE'`, a directory segment below a
+table's root of the form `key=value`, at any depth and in any order (never the file name itself),
+declares the partition column `KEY` as `VARCHAR(2000000)`: a directory value carries no type, and a
+type inferred from the values seen would change whenever a new directory appeared. Partition columns
+follow the Parquet columns, in the order each key first appears in the listing. The value is
+percent-decoded (`region=a%2Fb` reads `a/b`), and `__HIVE_DEFAULT_PARTITION__` or an empty value
+reads NULL. Under `MERGE_SCHEMA = 'TRUE'` a table's partition columns are the union of every file's
+keys, and a file whose path lacks one of them reads NULL for it. Keys compare by their uppercase
+form, the name they are declared under, which gives three rules:
+
+- Two keys that differ only in case (`Year=` and `year=`) fail `CREATE VIRTUAL SCHEMA` and `REFRESH`,
+  naming both spellings, since neither directory encoding is preferred over the other. This rule
+  holds across the table under `MERGE_SCHEMA = 'TRUE'`; under `'FALSE'` it covers only the sampled
+  file's own keys.
+- A key that names a Parquet column (a `k=` segment over a file storing `K`) overrides it: `K` is
+  declared once, as the `VARCHAR` partition column, and every row reads the directory value, never
+  the file's stored one.
+- A table where some but not all of the files storing such a column carry the key's segment fails
+  the statement, naming the column, the key, and a file lacking the segment (a
+  `k=__HIVE_DEFAULT_PARTITION__/` or empty `k=/` segment counts as present, and reads NULL). Under
+  `MERGE_SCHEMA = 'TRUE'` any such file fails it; under `'FALSE'` only the sampled file itself is
+  checked, and an unsampled file with the same problem stays undetected.
+
+Before this release a `key=value` directory was read as a plain directory; set
+`HIVE_PARTITIONING = 'FALSE'` to keep that behavior across the upgrade.
 
 **Iceberg or Delta directory caveat.** Pointing this catalog kind at a directory that is actually an
 Iceberg table or a Delta table is a supported but almost always wrong choice: direct storage knows
@@ -343,8 +369,16 @@ above.
 
 **Plan-time footer cost.** Every `CREATE VIRTUAL SCHEMA` and every `REFRESH` lists the directory tree
 and reads Parquet file footers directly from object storage — there is no manifest, snapshot, or log
-to consult instead, unlike the Iceberg REST and Unity Catalog kinds. `MERGE_SCHEMA = 'FALSE'` bounds
-this to one footer read per table; the default `'TRUE'` reads every file's footer.
+to consult instead, unlike the Iceberg REST and Unity Catalog kinds. Planning a query lists the table
+again and reads the footers of the files it keeps. `MERGE_SCHEMA = 'FALSE'` bounds this to one footer
+read per table; the default `'TRUE'` reads every kept file's footer. Partition pruning runs before
+any footer is read, so a pruned file's footer is never read: a filter comparing a partition column
+with a string literal by equality (`=`, `<>`), `IN`, a NULL check (`IS NULL`, `IS NOT NULL`), or a
+range (`<`, `<=`, `>`, `>=`, `BETWEEN`), combined by `AND`, `OR`, and `NOT`, drops every file whose
+partition values cannot satisfy it. Range and `BETWEEN` compare partition values as strings, the
+order Exasol applies to `VARCHAR`, so `month=10` sorts before `month=9`. A filter on any other
+column, or one that applies a function to a partition column, prunes no file: there is no
+footer-statistics pruning (#412), and nothing bounds how many files a table may hold (#419).
 
 **Limitation: mixed timestamp units do not fold.** The type-widening rules this kind applies when
 folding schemas cover integer, float, and date widening, but carry no timestamp-to-timestamp rule.

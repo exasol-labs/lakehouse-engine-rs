@@ -3,6 +3,11 @@ use delta_kernel::schema::{DataType, DecimalType, PrimitiveType, StructType};
 use delta_kernel::{Expression, Predicate};
 use serde_json::Value as Json;
 
+use super::filter_json::{
+    Comparison, between_operands, comparison_operands, in_operands, non_empty_str, operands,
+    subject_column,
+};
+
 /// Translate an Exasol pushdown filter JSON node into a Delta pruning
 /// predicate against the given schema.
 ///
@@ -32,38 +37,6 @@ impl Translated {
     }
 }
 
-#[derive(Clone, Copy)]
-enum Comparison {
-    Equal,
-    Less,
-    LessEqual,
-    Greater,
-    GreaterEqual,
-}
-
-impl Comparison {
-    fn from_node_type(kind: &str) -> Option<Self> {
-        Some(match kind {
-            "predicate_equal" => Self::Equal,
-            "predicate_less" => Self::Less,
-            "predicate_lessequal" => Self::LessEqual,
-            "predicate_greater" => Self::Greater,
-            "predicate_greaterequal" => Self::GreaterEqual,
-            _ => return None,
-        })
-    }
-
-    fn flipped(self) -> Self {
-        match self {
-            Self::Equal => Self::Equal,
-            Self::Less => Self::Greater,
-            Self::LessEqual => Self::GreaterEqual,
-            Self::Greater => Self::Less,
-            Self::GreaterEqual => Self::LessEqual,
-        }
-    }
-}
-
 fn translate_node(filter_json: &Json, schema: &StructType) -> Option<Translated> {
     let kind = filter_json.get("type")?.as_str()?;
     if let Some(comparison) = Comparison::from_node_type(kind) {
@@ -72,34 +45,28 @@ fn translate_node(filter_json: &Json, schema: &StructType) -> Option<Translated>
 
     match kind {
         "predicate_in_constlist" => translate_in(filter_json, schema),
-
-        // predicate_notequal: not soundly prunable to a single range.
-        "predicate_notequal" => None,
-
         "predicate_is_null" => {
-            let col_node = filter_json.get("expression")?;
-            let col_name = extract_column(col_node)?;
-            let (field_name, _prim) = resolve_column(col_name, schema)?;
+            let (field_name, _prim) = resolve_column(subject_column(filter_json)?, schema)?;
             Some(Translated::exact(Predicate::is_null(Expression::column([
                 field_name,
             ]))))
         }
         "predicate_is_not_null" => {
-            let col_node = filter_json.get("expression")?;
-            let col_name = extract_column(col_node)?;
-            let (field_name, _prim) = resolve_column(col_name, schema)?;
+            let (field_name, _prim) = resolve_column(subject_column(filter_json)?, schema)?;
             Some(Translated::exact(Predicate::is_not_null(
                 Expression::column([field_name]),
             )))
         }
-        "predicate_and" => {
-            let exprs = filter_json.get("expressions")?.as_array()?;
-            fold_and(exprs.iter().map(|expr| translate_node(expr, schema)))
-        }
-        "predicate_or" => {
-            let exprs = filter_json.get("expressions")?.as_array()?;
-            fold_or(exprs.iter().map(|expr| translate_node(expr, schema)))
-        }
+        "predicate_and" => fold_and(
+            operands(filter_json)?
+                .iter()
+                .map(|expr| translate_node(expr, schema)),
+        ),
+        "predicate_or" => fold_or(
+            operands(filter_json)?
+                .iter()
+                .map(|expr| translate_node(expr, schema)),
+        ),
         "predicate_not" => {
             let inner = filter_json.get("expression")?;
             let Translated { predicate, exact } = translate_node(inner, schema)?;
@@ -226,11 +193,6 @@ fn literal_to_scalar(lit: &Json, prim: &PrimitiveType) -> Option<Scalar> {
     }
 }
 
-fn non_empty_str(value: &Json) -> Option<&str> {
-    let s = value.as_str()?;
-    (!s.is_empty()).then_some(s)
-}
-
 fn parse_bool(value: &Json) -> Option<bool> {
     match value {
         Json::Bool(b) => Some(*b),
@@ -309,29 +271,15 @@ fn translate_comparison(
     comparison: Comparison,
     schema: &StructType,
 ) -> Option<Translated> {
-    let left = node.get("left")?;
-    let right = node.get("right")?;
-
-    let (col_name, lit_node, col_is_left) = if let Some(name) = extract_column(left) {
-        (name, right, true)
-    } else if let Some(name) = extract_column(right) {
-        (name, left, false)
-    } else {
-        return None;
-    };
-
+    let (col_name, lit_node, comparison) = comparison_operands(node, comparison)?;
     let (field_name, prim) = resolve_column(col_name, schema)?;
     let scalar = literal_to_scalar(lit_node, prim)?;
     let column = Expression::column([field_name]);
     let literal = Expression::literal(scalar);
 
-    let effective = if col_is_left {
-        comparison
-    } else {
-        comparison.flipped()
-    };
-
-    let predicate = match effective {
+    let predicate = match comparison {
+        // Not soundly prunable to a single range.
+        Comparison::NotEqual => return None,
         Comparison::Equal => Predicate::eq(column, literal),
         Comparison::Less => Predicate::lt(column, literal),
         Comparison::LessEqual => Predicate::le(column, literal),
@@ -348,11 +296,8 @@ fn translate_comparison(
 /// hand-written OR: keeping the remaining equalities would prune files that
 /// the dropped element could still match.
 fn translate_in(node: &Json, schema: &StructType) -> Option<Translated> {
-    let col_node = node.get("expression")?;
-    let col_name = extract_column(col_node)?;
+    let (col_name, args) = in_operands(node)?;
     let (field_name, prim) = resolve_column(col_name, schema)?;
-
-    let args = node.get("arguments")?.as_array()?;
     fold_or(args.iter().map(|arg| {
         let scalar = literal_to_scalar(arg, prim)?;
         Some(Translated::exact(Predicate::eq(
@@ -366,38 +311,23 @@ fn translate_in(node: &Json, schema: &StructType) -> Option<Translated> {
 /// Either bound alone is still implied by BETWEEN, so a failing bound is
 /// dropped under the implicit AND (sound: drops one conjunct, widens set).
 fn translate_between(node: &Json, schema: &StructType) -> Option<Translated> {
-    let col_node = node.get("expression")?;
-    let col_name = extract_column(col_node)?;
+    let (col_name, low, high) = between_operands(node)?;
     let (field_name, prim) = resolve_column(col_name, schema)?;
 
-    let low_pred = node
-        .get("left")
-        .and_then(|n| literal_to_scalar(n, prim))
-        .map(|scalar| {
-            Translated::exact(Predicate::ge(
-                Expression::column([field_name]),
-                Expression::literal(scalar),
-            ))
-        });
-    let high_pred = node
-        .get("right")
-        .and_then(|n| literal_to_scalar(n, prim))
-        .map(|scalar| {
-            Translated::exact(Predicate::le(
-                Expression::column([field_name]),
-                Expression::literal(scalar),
-            ))
-        });
+    let low_pred = low.and_then(|n| literal_to_scalar(n, prim)).map(|scalar| {
+        Translated::exact(Predicate::ge(
+            Expression::column([field_name]),
+            Expression::literal(scalar),
+        ))
+    });
+    let high_pred = high.and_then(|n| literal_to_scalar(n, prim)).map(|scalar| {
+        Translated::exact(Predicate::le(
+            Expression::column([field_name]),
+            Expression::literal(scalar),
+        ))
+    });
 
     fold_and([low_pred, high_pred].into_iter())
-}
-
-fn extract_column(node: &Json) -> Option<&str> {
-    if node.get("type")?.as_str()? == "column" {
-        node.get("name")?.as_str()
-    } else {
-        None
-    }
 }
 
 #[cfg(test)]

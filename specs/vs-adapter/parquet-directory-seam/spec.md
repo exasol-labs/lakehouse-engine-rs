@@ -1,19 +1,21 @@
 # Feature: Parquet Directory Seam
 
-Answers "what are the data files under this storage prefix, and what is their combined schema" in
-ONE place, from an object store and a prefix alone. Table enumeration and query planning therefore
-read the same files and fold the same footers. The two callers cannot disagree about a table's
+Answers "what are the data files under this storage prefix, what are their partition values, and
+what is their combined schema" in ONE place, from an object store, a prefix, and two layout
+switches. Table enumeration and query planning therefore read the same files, declare the same
+partition columns, and fold the same footers. The two callers cannot disagree about a table's
 columns.
 
 ## Background
 
 * The seam names NO catalog kind, NO table format, and NO Exasol virtual-schema property. It takes
-  an object store, a prefix, and a merge mode. Any later consumer that needs "the Parquet files
-  under this prefix and their schema" calls it directly.
+  an object store, a prefix, a merge mode, a partitioning switch, and a file-keep predicate over
+  partition values. Any later consumer that needs "the Parquet files under this prefix and their
+  schema" calls it directly.
 * It has TWO consumers today, and they ask the same question in different contexts. Table
   enumeration maps the folded schema to the neutral catalog columns the listing pipeline declares.
   Query planning maps it to the scan spec's logical fields. One implementation is what keeps
-  `MERGE_SCHEMA` from needing a second policy per path.
+  `MERGE_SCHEMA` and `HIVE_PARTITIONING` from needing a second policy per path.
 * The widening rules the fold applies are NOT new. `datafusion-scan/type-relaxation` already owns
   the set of physical-to-logical pairs this engine casts at scan time. That set is proven castable
   pair by pair and grounded in the Apache Iceberg and Delta promotion tables. The fold picks the
@@ -27,8 +29,8 @@ columns.
   pruning from footer statistics is issue
   [#412](https://github.com/exasol-labs/lakehouse-engine-rs/issues/412). A seam that returned
   the schema alone would force that plan to re-read every footer it had already parsed.
-* `key=value` path segments are split out of each file's path and returned unused. Acting on them
-  is issue [#408](https://github.com/exasol-labs/lakehouse-engine-rs/issues/408).
+* Hive-style partition discovery belongs to this seam. `vs-adapter/direct-storage-hive-partitioning`
+  specifies its rules.
 * Apache Iceberg and Delta specification check: NOT implicated. This seam reads raw Parquet
   footers and implements neither table format. Its ONE point of contact with either specification
   is the widening pair set. The seam reads that set from `datafusion-scan/type-relaxation` rather
@@ -40,13 +42,14 @@ columns.
 
 ### Scenario: One seam answers the file list and the schema for both callers
 
-* *GIVEN* an object store, a storage prefix, and a merge mode
+* *GIVEN* an object store, a storage prefix, a merge mode, a partitioning switch, and a file-keep predicate
 * *WHEN* table enumeration and query planning each ask for that prefix's data files and schema
-* *THEN* exactly ONE function SHALL answer both, taking the store, the prefix, and the mode, and returning the data-file list with each file's byte size, the folded Arrow schema, and each file's parsed Parquet metadata
-* *AND* that function SHALL name no catalog kind, no table format, no Exasol connection, and no virtual-schema property, so it takes a store and a prefix rather than a configuration
-* *AND* neither caller SHALL carry its own listing filter, its own footer reader, or its own merge policy, because two policies over one `MERGE_SCHEMA` value is the drift this seam exists to prevent
+* *THEN* exactly ONE function SHALL answer both, returning the kept data files with each file's byte size and partition values, the declared partition columns, the folded Arrow schema, and each read file's parsed Parquet metadata
+* *AND* that function SHALL name no catalog kind, no table format, no Exasol connection, and no virtual-schema property, so it takes two switch values rather than the properties that set them
+* *AND* neither caller SHALL carry its own listing filter, its own footer reader, its own merge policy, or its own partition parser, because two policies over one property is the drift this seam exists to prevent
 * *AND* the returned per-file metadata SHALL be the PARSED footer rather than the schema alone, so a later consumer that prunes files from footer statistics re-reads no footer for a file whose footer this call already read
-* *AND* that no-re-read promise SHALL be SCOPED to the fold-every-file mode, which is the only mode under which every listed file has a parsed footer, and a consumer needing statistics for a file the sample-one-file mode left unread SHALL ask the SEAM for them rather than opening that footer behind the seam's back, so the seam stays the one place a footer is read
+* *AND* that no-re-read promise SHALL be SCOPED to the fold-every-file mode, which is the only mode under which every kept file has a parsed footer, and a consumer needing statistics for a file the sample-one-file mode left unread SHALL ask the SEAM for them rather than opening that footer behind the seam's back, so the seam stays the one place a footer is read
+* *AND* a consumer that prunes from footer statistics MUST NOT use the statistics of a Parquet column the fold dropped for a partition-key collision (`vs-adapter/direct-storage-hive-partitioning`), because those statistics describe values the scan never emits
 * *AND* every failure SHALL be returned as an error value rather than raised as a panic, and no error message SHALL contain a credential value
 
 ### Scenario: Data files are listed recursively in a deterministic order
@@ -57,8 +60,29 @@ columns.
 * *AND* it SHALL return ONLY objects whose name ends in `.parquet`, so `_SUCCESS`, `_metadata`, and `p1.parquet.crc` are excluded by that rule alone
 * *AND* it SHALL exclude every object any of whose path segments below the prefix begins with `_` or `.`, so `_staging/p4.parquet` and `.hidden/p5.parquet` are excluded even though their file names qualify
 * *AND* it SHALL carry each returned file's byte size from the listing response, so no consumer issues an object-store HEAD for a size the listing already reported
-* *AND* it SHALL return the files in a DETERMINISTIC order that does not depend on the store's listing order, because the merge mode that samples one footer must sample the same one on the enumeration path and the plan path
-* *AND* it SHALL split each returned file's `key=value` path segments into a per-file map and SHALL leave that map UNREAD by this plan, so the parser exists once when issue #408 acts on it
+* *AND* it SHALL return the files in a DETERMINISTIC order that does not depend on the store's listing order, because the sample-one-file mode reads the same footer on the enumeration path and the plan path only when both see one order
+
+### Scenario: The merge mode selects every footer or exactly one
+
+* *GIVEN* the same prefix, once under the fold-every-file mode and once under the sample-one-file mode
+* *WHEN* the seam resolves the schema
+* *THEN* the fold-every-file mode SHALL read every kept file's footer, and the sample-one-file mode SHALL read EXACTLY ONE footer, that of the FIRST file in the deterministic listing order
+* *AND* the sample-one-file mode SHALL return the same file LIST as the other mode, so the mode narrows which footers are read and never which files are scanned
+* *AND* the returned per-file metadata SHALL be PAIRED with the files whose footers the mode actually read and SHALL be ABSENT for every other returned file, so the return carries a presence-per-file shape rather than one entry per listed file: with every file kept, the sample-one-file mode returns N files with metadata present for exactly ONE of them, and the fold-every-file mode returns N files with metadata present for all N
+* *AND* a consumer SHALL read that PRESENCE rather than assume an entry exists, and MUST NOT index the metadata positionally against the file list, because the two sequences have different lengths under the sample-one-file mode
+* *AND* the two modes SHALL be two values of ONE argument to ONE function, so both callers reach the same behaviour from the same code
+* *AND* a prefix holding exactly one data file SHALL produce an IDENTICAL schema under both modes, so the mode is observable only where footers differ
+
+### Scenario: The folded column set is the union of the files' column sets
+
+* *GIVEN* a prefix whose first file carries columns `A` and `B` and whose second file carries `A` and `C`, under the fold-every-file mode
+* *WHEN* the seam folds those footers
+* *THEN* the folded schema SHALL carry `A`, `B`, and `C`, ordered by each column's first appearance in the deterministic listing order, so a golden encoding of one folded schema is stable across runs
+* *AND* every folded column SHALL be declared NULLABLE, because a column absent from one file is filled with NULL for that file's rows and a column declared required but absent would instead fail the scan
+* *AND* two columns whose names are equal after the declaration's uppercase fold SHALL fail the fold with an error naming both spellings and the files that carry them, because the declaration would otherwise advertise a duplicate column name and identity binding cannot bind two logical fields to one physical name
+* *AND* a Parquet column whose uppercase fold equals a declared partition key SHALL be EXEMPT from this union and from the collision failure above: it SHALL be dropped rather than added, per the collision rule `vs-adapter/direct-storage-hive-partitioning` specifies, so the union described above names only columns that name no declared key
+* *AND* the seam MUST NOT reorder, rename, or case-fold a column name it returns, so the logical name it produces is the name the scan binds against in each file
+* *AND* the seam's returned schema SHALL end with the declared partition columns, appended after every column of the union above
 
 ### Scenario: Footers fold into one schema under the proven-castable widening pairs
 
@@ -71,26 +95,7 @@ columns.
 * *AND* it SHALL read the footers CONCURRENTLY through the caller's store, bounded by the admission limiter that store carries, so a prefix holding many files costs one bounded fan-out rather than one serialized round-trip per file
 * *AND* a column whose two declared types are covered by NO supported pair SHALL fail the fold with an error naming the column, BOTH conflicting types, and BOTH file paths, so an operator can locate the offending files without listing the prefix
 * *AND* the fold MUST NOT resolve such a conflict by declaring the column as a string, dropping it, or taking one file's type, because each of those answers a correctness question by guessing
-
-### Scenario: The merge mode selects every footer or exactly one
-
-* *GIVEN* the same prefix, once under the fold-every-file mode and once under the sample-one-file mode
-* *WHEN* the seam resolves the schema
-* *THEN* the fold-every-file mode SHALL read every listed file's footer, and the sample-one-file mode SHALL read EXACTLY ONE footer, that of the FIRST file in the deterministic listing order
-* *AND* the sample-one-file mode SHALL return the same file LIST as the other mode, so the mode narrows which footers are read and never which files are scanned
-* *AND* the returned per-file metadata SHALL be PAIRED with the files whose footers the mode actually read and SHALL be ABSENT for every other listed file, so the return carries a presence-per-file shape rather than one entry per listed file: the sample-one-file mode returns N files with metadata present for exactly ONE of them, and the fold-every-file mode returns N files with metadata present for all N
-* *AND* a consumer SHALL read that PRESENCE rather than assume an entry exists, and MUST NOT index the metadata positionally against the file list, because the two sequences have different lengths under the sample-one-file mode
-* *AND* the two modes SHALL be two values of ONE argument to ONE function, so both callers reach the same behaviour from the same code
-* *AND* a prefix holding exactly one data file SHALL produce an IDENTICAL schema under both modes, so the mode is observable only where footers differ
-
-### Scenario: The folded column set is the union of the files' column sets
-
-* *GIVEN* a prefix whose first file carries columns `A` and `B` and whose second file carries `A` and `C`, under the fold-every-file mode
-* *WHEN* the seam folds those footers
-* *THEN* the folded schema SHALL carry `A`, `B`, and `C`, ordered by each column's first appearance in the deterministic listing order, so a golden encoding of one folded schema is stable across runs
-* *AND* every folded column SHALL be declared NULLABLE, because a column absent from one file is filled with NULL for that file's rows and a column declared required but absent would instead fail the scan
-* *AND* two columns whose names are equal after the declaration's uppercase fold SHALL fail the fold with an error naming both spellings and the files that carry them, because the declaration would otherwise advertise a duplicate column name and identity binding cannot bind two logical fields to one physical name
-* *AND* the seam MUST NOT reorder, rename, or case-fold a column name it returns, so the logical name it produces is the name the scan binds against in each file
+* *AND* a Parquet column whose uppercase fold equals a declared partition key SHALL be EXEMPT from this widening check: it SHALL be dropped before types are compared, per the collision rule `vs-adapter/direct-storage-hive-partitioning` specifies, so two files that disagree on that column's own type never reach this check
 
 ### Scenario: A nested or unrepresentable Parquet type folds to the JSON string declaration
 
@@ -110,3 +115,13 @@ columns.
 * *AND* the footer set SHALL be the sole source of each column's STRUCTURE and nested members, because the declared type of a nested column is `VARCHAR(2000000)` and carries none
 * *AND* a plan-time fold WIDER than the declaration SHALL be treated as the ordinary stale-declaration case the recorded relaxation rules already own, resolved by `REFRESH VIRTUAL SCHEMA` rather than by any planning-side compensation, so this kind adds no new staleness mechanism
 * *AND* this division SHALL be recorded as a property of the seam rather than of one caller, so a later reader does not read the resulting asymmetry as a defect and repair it by narrowing the declaration to the plan-time fold
+
+### Scenario: A file-keep predicate narrows the files before any footer is read
+
+* *GIVEN* a prefix whose files sit under `year=2025/` and `year=2026/` directories, and a file-keep predicate that rejects every file whose `year` value is not `2026`
+* *WHEN* the seam resolves that prefix
+* *THEN* it SHALL declare the partition columns from the UNFILTERED listing, so the declared columns never depend on the predicate
+* *AND* it SHALL evaluate the predicate on each file's partition values before it reads any footer, and SHALL return only the kept files
+* *AND* the fold-every-file mode SHALL read the footers of the kept files alone, so a rejected file costs no footer read
+* *AND* the sample-one-file mode SHALL still read the footer of the first file in the UNFILTERED listing, kept or not, so the enumeration path and the plan path sample the same file
+* *AND* table enumeration SHALL pass a predicate that keeps every file
