@@ -28,9 +28,9 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    DIM_CUSTOMER_ROWS, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_SUPPLIER_TABLE,
-    FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey, order_date_days,
-    order_totalprice_unscaled, seed_events,
+    DIM_CUSTOMER_ROWS, E2E_BLANK_LABEL_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE,
+    E2E_SUPPLIER_TABLE, FACT_ORDERS_ROWS, LINEITEM_ROWS, O_TOTALPRICE_PS, order_custkey,
+    order_date_days, order_totalprice_unscaled, seed_events,
 };
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
@@ -101,10 +101,27 @@ fn vs_supplier_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_SUPPLIER_TABLE.to_uppercase())
 }
 
-/// Fetch a 2-column `(C_NAME, O_ORDERDATE)` join query's rows in the exact order
-/// Exasol returned them — unlike `fetch_join_rows`/`columns_to_sorted_pairs`, which
-/// sort for order-independent multiset comparison, an `ORDER BY` test needs the
-/// query's own row order preserved to assert against.
+fn vs_blank_label_table(vs_name: &str) -> String {
+    format!("{vs_name}.{}", E2E_BLANK_LABEL_TABLE.to_uppercase())
+}
+
+/// The `SELECT b.B_LABEL, o.O_ORDERKEY FROM fact_orders JOIN dim_blank_label ...`
+/// query for one VS, with the given `ORDER BY` clause and `LIMIT`.
+fn blank_label_join_query(vs_name: &str, order_by: &str, limit: usize) -> String {
+    format!(
+        "SELECT b.B_LABEL, o.O_ORDERKEY FROM {} o \
+         JOIN {} b ON o.O_CUSTKEY = b.B_CUSTKEY \
+         ORDER BY {order_by} LIMIT {limit}",
+        vs_fact_table(vs_name),
+        vs_blank_label_table(vs_name)
+    )
+}
+
+/// Fetch a 2-column join query's rows (such as `(C_NAME, O_ORDERDATE)` or
+/// `(B_LABEL, O_ORDERKEY)`) in the exact order Exasol returned them — unlike
+/// `fetch_join_rows`/`columns_to_sorted_pairs`, which sort for order-independent
+/// multiset comparison, an `ORDER BY` test needs the query's own row order
+/// preserved to assert against.
 fn fetch_join_rows_in_query_order(conn: &mut ExaConn, query_sql: &str) -> Vec<(String, String)> {
     let cols = conn.query_columns(query_sql);
     assert_eq!(
@@ -116,7 +133,7 @@ fn fetch_join_rows_in_query_order(conn: &mut ExaConn, query_sql: &str) -> Vec<(S
     cols[0]
         .iter()
         .zip(cols[1].iter())
-        .map(|(name, date)| (value_to_string(name), value_to_string(date)))
+        .map(|(first, second)| (value_to_string(first), value_to_string(second)))
         .collect()
 }
 
@@ -273,6 +290,16 @@ fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
         "ORDER BY ... LIMIT must NOT force the two-scan Exasol-joined fallback \
          (LHS_T0/LHS_T1):\n{pushed}"
     );
+    assert!(
+        pushed.contains("\"post_join_order_by\""),
+        "a zero-offset ORDER BY ... LIMIT must bound each shard with a post-join \
+         ordering:\n{pushed}"
+    );
+    assert!(
+        pushed.contains(&format!("\"post_join_limit\":{TOP_N}")),
+        "a zero-offset ORDER BY ... LIMIT must bound each shard to its own \
+         top-{TOP_N}:\n{pushed}"
+    );
 
     let actual = fetch_join_rows_in_query_order(&mut conn, &query);
     let expected: Vec<(String, String)> = expected_join_rows_by_orderdate_desc(&mut conn, VS_NAME)
@@ -362,6 +389,11 @@ fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
         !has_two_scan_wrapper(&pushed),
         "a bare ORDER BY (no LIMIT) must NOT force the two-scan fallback:\n{pushed}"
     );
+    assert!(
+        !pushed.contains("\"post_join_order_by\"") && !pushed.contains("\"post_join_limit\""),
+        "a bare ORDER BY with no LIMIT must leave every shard unbounded and \
+         unsorted, since only the wrapper carries the window:\n{pushed}"
+    );
 
     let actual_unlimited = fetch_join_rows_in_query_order(&mut conn, &unlimited_query);
     let expected_ordered = expected_join_rows_by_orderdate_desc(&mut conn, VS_NAME);
@@ -388,6 +420,11 @@ fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
         "ORDER BY ... LIMIT ... OFFSET ... must NOT force the two-scan \
          fallback:\n{pushed}"
     );
+    assert!(
+        !pushed.contains("\"post_join_order_by\"") && !pushed.contains("\"post_join_limit\""),
+        "a non-zero OFFSET must leave every shard unbounded and unsorted, since \
+         a per-shard OFFSET does not compose:\n{pushed}"
+    );
 
     let actual_windowed = fetch_join_rows_in_query_order(&mut conn, &windowed_query);
     let expected_windowed: Vec<(String, String)> = expected_ordered
@@ -405,6 +442,125 @@ fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
         "ORDER BY O_ORDERDATE DESC LIMIT {WINDOW_LIMIT} OFFSET {WINDOW_OFFSET} must \
          return the exact offset window of the unwindowed ordered join.\n\
          actual:   {actual_windowed:?}\nexpected: {expected_windowed:?}"
+    );
+}
+
+/// An empty-string sort key ranks as NULL under the broadcast per-shard top-N,
+/// exactly as the declined two-scan wrapper's `nullif` rule already ranks it
+/// (issue #309). `dim_blank_label` seeds two empty-string labels ahead of three
+/// ascending non-empty ones (`alpha`, `bravo`, `charlie`), each joined against
+/// two orders (`seed::order_custkey`), so an ASC NULLS LAST ordering surfaces the
+/// non-empty labels first and a DESC NULLS FIRST ordering surfaces the empty
+/// ones first — the SAME result either plan (broadcast or two-scan) must
+/// compute.
+#[test]
+fn e2e_broadcast_join_top_n_ranks_empty_string_as_null() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    for (order_by, expected_rows) in [
+        (
+            "b.B_LABEL ASC NULLS LAST, o.O_ORDERKEY ASC",
+            Some(vec![
+                ("alpha".to_string(), "3".to_string()),
+                ("alpha".to_string(), "8".to_string()),
+            ]),
+        ),
+        ("b.B_LABEL DESC NULLS FIRST, o.O_ORDERKEY ASC", None),
+    ] {
+        let broadcast_query = blank_label_join_query(VS_NAME, order_by, 2);
+        let fallback_query = blank_label_join_query(VS_NAME_LOW, order_by, 2);
+
+        let pushed = explain_virtual_sql(&mut conn, &broadcast_query);
+        assert!(
+            has_broadcast_join_block(&pushed),
+            "a zero-offset ORDER BY ... LIMIT over dim_blank_label must still \
+             drive the broadcast fan-out:\n{pushed}"
+        );
+        assert!(
+            pushed.contains("\"post_join_order_by\""),
+            "the broadcast plan must bound each shard with a post-join \
+             ordering:\n{pushed}"
+        );
+
+        let pushed_low = explain_virtual_sql(&mut conn, &fallback_query);
+        assert!(
+            has_two_scan_wrapper(&pushed_low),
+            "above the broadcast threshold this join must fall back to the \
+             two-scan wrapper:\n{pushed_low}"
+        );
+
+        let broadcast_rows = fetch_join_rows_in_query_order(&mut conn, &broadcast_query);
+        let fallback_rows = fetch_join_rows_in_query_order(&mut conn, &fallback_query);
+        assert_eq!(
+            broadcast_rows, fallback_rows,
+            "the broadcast and two-scan plans must return the same rows in the \
+             same order:\nbroadcast: {broadcast_rows:?}\nfallback:  {fallback_rows:?}"
+        );
+        assert!(
+            fallback_rows.iter().all(|(label, _)| !label.is_empty()),
+            "an emitted empty string must rank as NULL, never surface as a value \
+             here. If the two-scan wrapper ranks it as non-NULL, the nullif rule \
+             is wrong — stop and escalate: {fallback_rows:?}"
+        );
+        if let Some(expected) = expected_rows {
+            assert_eq!(
+                broadcast_rows, expected,
+                "the ascending top-2 must be the alpha rows of orders 3 and 8: {broadcast_rows:?}"
+            );
+        }
+    }
+}
+
+/// LIMIT 3 with no secondary sort key. The two alpha rows rank first (in either
+/// order); the third is one of the two tied bravo rows (orders 4 and 9), which
+/// sit in different fact files, so the merged result carries the single-node
+/// label sequence even though the tied rows come from different shards.
+#[test]
+fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let tie_query = blank_label_join_query(VS_NAME, "b.B_LABEL ASC NULLS LAST", 3);
+    let pushed_tie = explain_virtual_sql(&mut conn, &tie_query);
+    assert!(
+        pushed_tie.contains("\"post_join_order_by\""),
+        "the tie-case plan must bound each shard with a post-join ordering:\n{pushed_tie}"
+    );
+
+    let tie_rows = fetch_join_rows_in_query_order(&mut conn, &tie_query);
+    assert_eq!(
+        tie_rows.len(),
+        3,
+        "LIMIT 3 must return exactly 3 rows: {tie_rows:?}"
+    );
+    let labels: Vec<&str> = tie_rows.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!(
+        labels,
+        vec!["alpha", "alpha", "bravo"],
+        "the tie-case label sequence must be alpha, alpha, bravo: {tie_rows:?}"
+    );
+    let first_two: std::collections::BTreeSet<&str> =
+        tie_rows[..2].iter().map(|(_, k)| k.as_str()).collect();
+    assert_eq!(
+        first_two,
+        std::collections::BTreeSet::from(["3", "8"]),
+        "the first two rows must be orders 3 and 8, in either order: {tie_rows:?}"
+    );
+    assert!(
+        tie_rows[2].1 == "4" || tie_rows[2].1 == "9",
+        "the third row must be one of the two tied bravo rows (orders 4 or 9): \
+         {tie_rows:?}"
+    );
+
+    let tie_rows_low = fetch_join_rows_in_query_order(
+        &mut conn,
+        &blank_label_join_query(VS_NAME_LOW, "b.B_LABEL ASC NULLS LAST", 3),
+    );
+    let labels_low: Vec<&str> = tie_rows_low.iter().map(|(l, _)| l.as_str()).collect();
+    assert_eq!(
+        labels_low, labels,
+        "VS_NAME_LOW must return the same label sequence: {tie_rows_low:?}"
     );
 }
 

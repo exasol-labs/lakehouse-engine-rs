@@ -612,12 +612,19 @@ pub struct JoinSpec {
     /// It lives here rather than on [`CommonScanSpec::limit`] because that field
     /// caps the SCAN — the wrong stage for a join — and because a spec carrying no
     /// join block has no post-join stage at all, so there is no field on which such
-    /// a cap could exist. Only an UNORDERED cap is ever pushed: any `n` rows answer
-    /// an unordered `LIMIT n`, so each shard may truncate its own joined output at
-    /// `n` and the merge truncate again at `n`. An ordered window is global and
-    /// rides on the adapter's outer wrapper instead, leaving every shard unbounded.
+    /// a cap could exist. Alone, the cap answers an unordered `LIMIT n`: any `n`
+    /// rows do, so each shard may truncate its own joined output at `n` and the
+    /// merge truncate again at `n`. Paired with [`Self::post_join_order_by`], it
+    /// answers a zero-offset `ORDER BY … LIMIT n`: each shard keeps its own top-`n`,
+    /// and the adapter's outer wrapper merges those and cuts the global top-`n`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_join_limit: Option<u64>,
+
+    /// Sort keys applied AFTER the node-local join and its WHERE, never to a side's scan.
+    /// Set only together with `post_join_limit`. The scan ranks each key by the value it
+    /// emits for that column, so the shard's cut agrees with the adapter's merge ranking.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_join_order_by: Vec<SortKey>,
 
     /// The dimension table's partition-column names, in partition order — the same
     /// neutral concept as [`CommonScanSpec::partition_columns`], needed on this side
