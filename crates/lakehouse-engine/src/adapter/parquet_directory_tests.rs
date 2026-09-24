@@ -1,19 +1,19 @@
 use super::*;
+use crate::adapter::tests::parquet_fixture::{
+    directory_options, in_memory_store, nullable, parquet_bytes,
+};
 use crate::types::mapping::arrow_to_exasol_type;
-use arrow::array::new_empty_array;
 use arrow::datatypes::{Fields, TimeUnit};
-use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
-use object_store::memory::InMemory;
 use object_store::{ObjectMeta, ObjectStoreExt, PutPayload};
-use parquet::arrow::ArrowWriter;
 
 /// The prefix every fixture is written under, so a test also pins that objects OUTSIDE it are
 /// never listed.
 const TABLE_ROOT: &str = "warehouse/direct/events";
 
 /// Hands back the inner store's listing REVERSED (so a test can't pass by luck against
-/// [`InMemory`]'s already-sorted order) and records every read, HEAD vs. GET distinctly.
+/// [`InMemory`](object_store::memory::InMemory)'s already-sorted order) and records every read,
+/// HEAD vs. GET distinctly.
 #[derive(Debug)]
 struct ReversedListingStore {
     inner: Arc<dyn ObjectStore>,
@@ -125,50 +125,54 @@ impl ObjectStore for ReversedListingStore {
     }
 }
 
-/// A store holding the given objects, seen through the reversing, read-recording decorator.
-async fn store_holding(objects: Vec<(&str, Vec<u8>)>) -> Arc<ReversedListingStore> {
-    let inner = Arc::new(InMemory::new());
-    for (key, bytes) in objects {
-        inner
-            .put(&StorePath::from(key), PutPayload::from(bytes))
-            .await
-            .expect("the in-memory store accepts the fixture object");
-    }
-    ReversedListingStore::wrapping(inner)
+fn under_root(key: &str) -> String {
+    format!("{TABLE_ROOT}/{key}")
 }
 
-fn store_of(probe: &Arc<ReversedListingStore>) -> Arc<dyn ObjectStore> {
-    Arc::clone(probe) as Arc<dyn ObjectStore>
+fn rooted(keys: &[&str]) -> Vec<String> {
+    keys.iter().map(|key| under_root(key)).collect()
 }
 
-/// A Parquet file declaring `fields` and holding `rows` rows of nulls (0 rows for a non-nullable
-/// field, since a null value would fail the batch's own validation).
-fn parquet_bytes(fields: Vec<Field>, rows: usize) -> Vec<u8> {
-    let schema = Arc::new(Schema::new(fields));
-    let columns: Vec<arrow::array::ArrayRef> = schema
-        .fields()
+/// A store holding each object at its key below [`TABLE_ROOT`], seen through the reversing,
+/// read-recording decorator.
+async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<ReversedListingStore> {
+    let keys: Vec<String> = objects.iter().map(|(key, _)| under_root(key)).collect();
+    let rooted: Vec<(&str, &[u8])> = keys
         .iter()
-        .map(|field| {
-            if rows == 0 {
-                new_empty_array(field.data_type())
-            } else {
-                arrow::array::new_null_array(field.data_type(), rows)
-            }
-        })
+        .zip(objects)
+        .map(|(key, (_, bytes))| (key.as_str(), *bytes))
         .collect();
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .expect("the fixture batch matches its own schema");
-
-    let mut bytes = Vec::new();
-    let mut writer =
-        ArrowWriter::try_new(&mut bytes, schema, None).expect("the fixture schema is writable");
-    writer.write(&batch).expect("the fixture batch is writable");
-    writer.close().expect("the fixture file closes");
-    bytes
+    ReversedListingStore::wrapping(in_memory_store(&rooted).await)
 }
 
-fn nullable(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, true)
+/// [`store_holding`] with the same bytes at every key.
+async fn store_with(keys: &[&str], data: &[u8]) -> Arc<ReversedListingStore> {
+    let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data)).collect();
+    store_holding(&objects).await
+}
+
+async fn resolve(
+    probe: &Arc<ReversedListingStore>,
+    merge_mode: MergeMode,
+    keep: &PartitionKeepPredicate,
+) -> Result<ParquetDirectory, UdfError> {
+    resolve_parquet_directory(
+        &(Arc::clone(probe) as Arc<dyn ObjectStore>),
+        &root(),
+        directory_options(merge_mode, true),
+        keep,
+    )
+    .await
+}
+
+fn assert_mentions(error: &UdfError, expected: &[&str]) {
+    let message = error.to_string();
+    for fragment in expected {
+        assert!(
+            message.contains(fragment),
+            "'{fragment}' missing from: {message}"
+        );
+    }
 }
 
 fn root() -> StorePath {
@@ -191,26 +195,31 @@ fn paths(directory: &ParquetDirectory) -> Vec<String> {
         .collect()
 }
 
+fn keep_year_2026(values: &BTreeMap<String, Option<String>>) -> bool {
+    values.get("year").and_then(|value| value.as_deref()) == Some("2026")
+}
+
+fn file_at<'a>(directory: &'a ParquetDirectory, suffix: &str) -> &'a ParquetFile {
+    directory
+        .files
+        .iter()
+        .find(|file| file.path.as_ref().ends_with(suffix))
+        .unwrap_or_else(|| panic!("fixture file '{suffix}' is listed: {:?}", paths(directory)))
+}
+
 #[tokio::test]
 async fn one_seam_returns_files_sizes_schema_and_footers() {
     let first = parquet_bytes(vec![nullable("id", DataType::Int32)], 3);
     let second = parquet_bytes(vec![nullable("id", DataType::Int64)], 5);
-    let probe = store_holding(vec![
-        (&format!("{TABLE_ROOT}/a.parquet"), first.clone()),
-        (&format!("{TABLE_ROOT}/b.parquet"), second.clone()),
-    ])
-    .await;
+    let probe = store_holding(&[("a.parquet", &first), ("b.parquet", &second)]).await;
 
-    let directory = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .expect("a prefix of readable Parquet files resolves");
 
     assert_eq!(
         paths(&directory),
-        vec![
-            format!("{TABLE_ROOT}/a.parquet"),
-            format!("{TABLE_ROOT}/b.parquet")
-        ],
+        rooted(&["a.parquet", "b.parquet"]),
         "one call answers the data-file list"
     );
     assert_eq!(
@@ -257,30 +266,32 @@ async fn one_seam_returns_files_sizes_schema_and_footers() {
 #[tokio::test]
 async fn listing_is_recursive_filtered_and_deterministic() {
     let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
-    let probe = store_holding(vec![
-        (&format!("{TABLE_ROOT}/p1.parquet"), data.clone()),
-        (&format!("{TABLE_ROOT}/a/p2.parquet"), data.clone()),
-        (&format!("{TABLE_ROOT}/a/b/p3.parquet"), data.clone()),
-        (&format!("{TABLE_ROOT}/_SUCCESS"), b"".to_vec()),
-        (&format!("{TABLE_ROOT}/_metadata"), b"".to_vec()),
-        (&format!("{TABLE_ROOT}/p1.parquet.crc"), b"".to_vec()),
-        (&format!("{TABLE_ROOT}/_staging/p4.parquet"), data.clone()),
-        (&format!("{TABLE_ROOT}/.hidden/p5.parquet"), data.clone()),
-        ("warehouse/direct/other/p6.parquet", data.clone()),
+    let probe = store_holding(&[
+        ("p1.parquet", &data),
+        ("a/p2.parquet", &data),
+        ("a/b/p3.parquet", &data),
+        ("_SUCCESS", b""),
+        ("_metadata", b""),
+        ("p1.parquet.crc", b""),
+        ("_staging/p4.parquet", &data),
+        (".hidden/p5.parquet", &data),
     ])
     .await;
+    probe
+        .put(
+            &StorePath::from("warehouse/direct/other/p6.parquet"),
+            PutPayload::from(data.clone()),
+        )
+        .await
+        .expect("the in-memory store accepts the fixture object");
 
-    let directory = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .expect("the prefix resolves");
 
     assert_eq!(
         paths(&directory),
-        vec![
-            format!("{TABLE_ROOT}/a/b/p3.parquet"),
-            format!("{TABLE_ROOT}/a/p2.parquet"),
-            format!("{TABLE_ROOT}/p1.parquet"),
-        ],
+        rooted(&["a/b/p3.parquet", "a/p2.parquet", "p1.parquet"]),
         "recursion reaches unlimited depth, only '*.parquet' objects qualify, a segment beginning \
          '_' or '.' excludes the object below it, and the order does not depend on the store's \
          own listing order, which this store reverses"
@@ -300,43 +311,365 @@ async fn listing_is_recursive_filtered_and_deterministic() {
 }
 
 #[tokio::test]
-async fn key_value_path_segments_are_split_into_a_per_file_map() {
+async fn directory_segments_follow_the_key_value_rule_and_decode_values() {
     let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
-    let probe = store_holding(vec![
-        (
-            &format!("{TABLE_ROOT}/year=2024/month=01/p1.parquet"),
-            data.clone(),
-        ),
-        (&format!("{TABLE_ROOT}/plain/p2.parquet"), data.clone()),
-    ])
+    let probe = store_with(
+        &[
+            "year=2024/month=01/p1.parquet",
+            "plain/p2.parquet",
+            "region=a%2Fb/p3.parquet",
+            "month=__HIVE_DEFAULT_PARTITION__/p4.parquet",
+            "flag=/p5.parquet",
+            "year=2020/year=2021/p6.parquet",
+            "x=1.parquet",
+            "=x/p7.parquet",
+            "v=%FF/p8.parquet",
+        ],
+        &data,
+    )
     .await;
 
-    let directory = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .expect("the prefix resolves");
 
-    assert_eq!(
-        directory.files[1].partition_segments,
-        HashMap::from([
-            ("year".to_string(), "2024".to_string()),
-            ("month".to_string(), "01".to_string()),
-        ]),
-        "every 'key=value' segment below the prefix is split out for the file that carries it"
-    );
+    for (file, key, expected, rule) in [
+        (
+            "p1.parquet",
+            "year",
+            Some(Some("2024")),
+            "a key=value segment declares the key",
+        ),
+        (
+            "p1.parquet",
+            "month",
+            Some(Some("01")),
+            "every such segment declares its key",
+        ),
+        (
+            "p3.parquet",
+            "region",
+            Some(Some("a/b")),
+            "the VALUE is percent-decoded",
+        ),
+        (
+            "p4.parquet",
+            "month",
+            Some(None),
+            "__HIVE_DEFAULT_PARTITION__ reads NULL",
+        ),
+        (
+            "p5.parquet",
+            "flag",
+            Some(None),
+            "an empty value reads NULL",
+        ),
+        (
+            "p6.parquet",
+            "year",
+            Some(Some("2021")),
+            "a repeated key takes its deepest value",
+        ),
+        (
+            "p7.parquet",
+            "",
+            None,
+            "a segment with an empty key declares nothing",
+        ),
+        (
+            "p8.parquet",
+            "v",
+            Some(Some("%FF")),
+            "a non-UTF-8 value keeps its raw text",
+        ),
+    ] {
+        assert_eq!(
+            file_at(&directory, file)
+                .partition_values
+                .get(key)
+                .map(Option::as_deref),
+            expected,
+            "{file} '{key}': {rule}"
+        );
+    }
     assert!(
-        directory.files[0].partition_segments.is_empty(),
-        "a plain directory segment contributes no entry"
+        !directory
+            .partition_columns
+            .iter()
+            .any(|key| key == "x" || key.is_empty()),
+        "neither a file NAME matching key=value nor an empty key declares a partition column: {:?}",
+        directory.partition_columns
     );
 }
 
 #[tokio::test]
-async fn fold_widens_only_across_supported_pairs_and_names_conflicts() {
-    let probe = store_holding(vec![
+async fn declared_keys_are_the_ordered_union_and_fill_every_file() {
+    let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
+    let probe = store_with(&["A/p.parquet", "year=2026/p.parquet"], &data).await;
+
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
+        .await
+        .expect("the prefix resolves");
+
+    assert_eq!(directory.partition_columns, vec!["year".to_string()]);
+    assert_eq!(
+        column_types(&directory.schema).last(),
+        Some(&("year".to_string(), DataType::Utf8)),
+        "partition column appended as nullable Utf8"
+    );
+    assert_eq!(
+        file_at(&directory, "A/p.parquet")
+            .partition_values
+            .get("year"),
+        Some(&None),
+        "a declared key missing from the path reads NULL"
+    );
+    assert_eq!(
+        file_at(&directory, "year=2026/p.parquet")
+            .partition_values
+            .get("year"),
+        Some(&Some("2026".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn sample_mode_declares_only_the_sampled_files_keys() {
+    let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
+    let probe = store_with(&["a/p.parquet", "year=2026/p.parquet"], &data).await;
+
+    let directory = resolve(&probe, MergeMode::SampleOneFile, &|_| true)
+        .await
+        .expect("the prefix resolves");
+
+    assert!(
+        directory.partition_columns.is_empty(),
+        "only the sampled file declares keys: {:?}",
+        directory.partition_columns
+    );
+    assert!(
+        file_at(&directory, "year=2026/p.parquet")
+            .partition_values
+            .is_empty(),
+        "an unsampled file's key is ignored"
+    );
+}
+
+#[tokio::test]
+async fn two_declared_keys_folding_to_the_same_name_fail_naming_both_spellings() {
+    let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
+    let cases: [(&str, &PartitionKeepPredicate); 2] = [
+        ("Year=2026/p1.parquet", &|_| true),
+        // The collision is checked on the unfiltered listing, so pruning one spelling still fails.
+        ("Year=2025/p1.parquet", &keep_year_2026),
+    ];
+    for (upper, keep) in cases {
+        let lower = "year=2026/p2.parquet";
+        let probe = store_with(&[upper, lower], &data).await;
+
+        let error = resolve(&probe, MergeMode::FoldEveryFile, keep)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{upper}: case-colliding keys must fail"));
+
+        assert_mentions(
+            &error,
+            &["Year", "year", &under_root(upper), &under_root(lower)],
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_key_folding_onto_a_column_drops_the_column_and_keeps_the_key() {
+    let stored_k = parquet_bytes(vec![nullable("K", DataType::Int32)], 1);
+    let probe = store_with(&["k=1/p1.parquet", "k=2/p2.parquet"], &stored_k).await;
+
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
+        .await
+        .expect("the key overrides the stored column");
+
+    assert_eq!(
+        column_types(&directory.schema),
+        vec![("k".to_string(), DataType::Utf8)],
+        "K is declared once, as the partition column"
+    );
+    assert_eq!(
+        file_at(&directory, "p1.parquet").partition_values.get("k"),
+        Some(&Some("1".to_string()))
+    );
+}
+
+#[tokio::test]
+async fn a_file_missing_the_colliding_keys_segment_fails_the_fold_naming_it() {
+    let stored_k = parquet_bytes(vec![nullable("K", DataType::Int32)], 1);
+    let stored_n = parquet_bytes(vec![nullable("n", DataType::Int32)], 1);
+    for (merge_mode, objects, missing) in [
         (
-            &format!("{TABLE_ROOT}/a.parquet"),
-            parquet_bytes(
+            MergeMode::FoldEveryFile,
+            [("k=1/p1.parquet", &stored_k), ("p2.parquet", &stored_k)],
+            "p2.parquet",
+        ),
+        (
+            MergeMode::SampleOneFile,
+            [("a.parquet", &stored_k), ("k=1/b.parquet", &stored_n)],
+            "a.parquet",
+        ),
+    ] {
+        let objects = objects.map(|(key, bytes)| (key, bytes.as_slice()));
+        let probe = store_holding(&objects).await;
+
+        let error = resolve(&probe, merge_mode, &|_| true)
+            .await
+            .err()
+            .unwrap_or_else(|| panic!("{merge_mode:?}: '{missing}' stores K without a k= segment"));
+
+        assert_mentions(&error, &["K", "k", &under_root(missing)]);
+    }
+}
+
+#[tokio::test]
+async fn a_default_or_empty_key_segment_counts_as_carrying_the_colliding_key() {
+    let stored_k = parquet_bytes(vec![nullable("K", DataType::Int32)], 1);
+    let probe = store_with(
+        &[
+            "k=1/p1.parquet",
+            "k=__HIVE_DEFAULT_PARTITION__/p2.parquet",
+            "k=/p3.parquet",
+        ],
+        &stored_k,
+    )
+    .await;
+
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
+        .await
+        .expect("a NULL-valued segment still overrides the stored column");
+
+    assert_eq!(
+        column_types(&directory.schema),
+        vec![("k".to_string(), DataType::Utf8)],
+        "K is declared exactly once, as the partition column"
+    );
+    for suffix in ["p2.parquet", "p3.parquet"] {
+        assert_eq!(
+            file_at(&directory, suffix).partition_values.get("k"),
+            Some(&None),
+            "'{suffix}' carries the segment and reads K as NULL"
+        );
+    }
+}
+
+#[tokio::test]
+async fn hive_partitioning_off_parses_no_segment_and_checks_no_collision() {
+    let probe = store_holding(&[
+        (
+            "Year=2026/p1.parquet",
+            &parquet_bytes(vec![nullable("id", DataType::Int32)], 1),
+        ),
+        (
+            "year=2026/p2.parquet",
+            &parquet_bytes(vec![nullable("K", DataType::Int32)], 1),
+        ),
+    ])
+    .await;
+
+    let directory = resolve_parquet_directory(
+        &(probe as Arc<dyn ObjectStore>),
+        &root(),
+        directory_options(MergeMode::FoldEveryFile, false),
+        &|_| true,
+    )
+    .await
+    .expect("no keys, so no collision check");
+
+    assert!(directory.partition_columns.is_empty());
+    assert!(
+        directory
+            .files
+            .iter()
+            .all(|file| file.partition_values.is_empty()),
+        "every file entry carries an empty partition-value map"
+    );
+    assert_eq!(
+        column_types(&directory.schema),
+        vec![
+            ("id".to_string(), DataType::Int32),
+            ("K".to_string(), DataType::Int32),
+        ],
+        "key=value directories are plain directories"
+    );
+}
+
+#[tokio::test]
+async fn a_keep_predicate_narrows_files_before_any_footer_is_read() {
+    let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
+    let probe = store_with(&["year=2026/p1.parquet", "year=2025/p2.parquet"], &data).await;
+
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &keep_year_2026)
+        .await
+        .expect("the prefix resolves");
+
+    assert_eq!(
+        directory.partition_columns,
+        vec!["year".to_string()],
+        "keys come from the unfiltered listing"
+    );
+    assert_eq!(paths(&directory), rooted(&["year=2026/p1.parquet"]));
+    assert_eq!(
+        probe.files_read(),
+        rooted(&["year=2026/p1.parquet"]),
+        "a rejected file costs no footer read"
+    );
+}
+
+#[tokio::test]
+async fn sample_mode_reads_the_first_unfiltered_footer_even_when_keep_rejects_it() {
+    let probe = store_holding(&[
+        (
+            "year=2025/p1.parquet",
+            &parquet_bytes(vec![nullable("a", DataType::Int32)], 1),
+        ),
+        (
+            "year=2026/p2.parquet",
+            &parquet_bytes(vec![nullable("b", DataType::Int32)], 1),
+        ),
+    ])
+    .await;
+
+    let directory = resolve(&probe, MergeMode::SampleOneFile, &keep_year_2026)
+        .await
+        .expect("the prefix resolves");
+
+    assert_eq!(
+        paths(&directory),
+        rooted(&["year=2026/p2.parquet"]),
+        "the rejected sampled file is not returned"
+    );
+    assert_eq!(
+        probe.files_read(),
+        rooted(&["year=2025/p1.parquet"]),
+        "the sampled footer is the first UNFILTERED file's, kept or not"
+    );
+    assert_eq!(
+        column_types(&directory.schema),
+        vec![
+            ("a".to_string(), DataType::Int32),
+            ("year".to_string(), DataType::Utf8),
+        ],
+        "the schema comes from the sampled file's footer"
+    );
+    assert!(
+        file_at(&directory, "p2.parquet").footer.is_none(),
+        "the rejected sampled file's footer attaches to no kept file"
+    );
+}
+
+#[tokio::test]
+async fn fold_widens_pairwise_in_listing_order_to_the_widest_reachable_type() {
+    let probe = store_holding(&[
+        (
+            "a.parquet",
+            &parquet_bytes(
                 vec![
-                    nullable("n", DataType::Int32),
+                    nullable("n", DataType::Int8),
                     nullable("f", DataType::Float32),
                     nullable("d", DataType::Decimal128(10, 2)),
                 ],
@@ -344,20 +677,24 @@ async fn fold_widens_only_across_supported_pairs_and_names_conflicts() {
             ),
         ),
         (
-            &format!("{TABLE_ROOT}/b.parquet"),
-            parquet_bytes(
+            "b.parquet",
+            &parquet_bytes(
                 vec![
-                    nullable("n", DataType::Int64),
+                    nullable("n", DataType::Int32),
                     nullable("f", DataType::Float64),
                     nullable("d", DataType::Decimal128(12, 2)),
                 ],
                 1,
             ),
         ),
+        (
+            "c.parquet",
+            &parquet_bytes(vec![nullable("n", DataType::Int64)], 1),
+        ),
     ])
     .await;
 
-    let directory = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .expect("every pair is a recorded relaxation");
 
@@ -368,119 +705,64 @@ async fn fold_widens_only_across_supported_pairs_and_names_conflicts() {
             ("f".to_string(), DataType::Float64),
             ("d".to_string(), DataType::Decimal128(12, 2)),
         ],
-        "each column resolves to the WIDER member of its pair"
-    );
-    assert_eq!(
-        probe.files_read(),
-        vec![
-            format!("{TABLE_ROOT}/a.parquet"),
-            format!("{TABLE_ROOT}/b.parquet")
-        ],
-        "every listed file's footer is read"
-    );
-}
-
-#[tokio::test]
-async fn a_column_folds_pairwise_in_listing_order_to_the_widest_reachable_type() {
-    let probe = store_holding(vec![
-        (
-            &format!("{TABLE_ROOT}/a.parquet"),
-            parquet_bytes(vec![nullable("n", DataType::Int8)], 1),
-        ),
-        (
-            &format!("{TABLE_ROOT}/b.parquet"),
-            parquet_bytes(vec![nullable("n", DataType::Int32)], 1),
-        ),
-        (
-            &format!("{TABLE_ROOT}/c.parquet"),
-            parquet_bytes(vec![nullable("n", DataType::Int64)], 1),
-        ),
-    ])
-    .await;
-
-    let directory = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
-        .await
-        .expect("Int8 widens to Int32 and Int32 to Int64");
-
-    assert_eq!(
-        column_types(&directory.schema),
-        vec![("n".to_string(), DataType::Int64)],
-        "a column appearing at three types resolves to the widest one successive supported \
-         widenings reach"
+        "each column resolves to the widest type successive supported widenings reach \
+         (n: Int8 -> Int32 -> Int64)"
     );
 }
 
 #[tokio::test]
 async fn a_pair_no_widening_rule_covers_fails_naming_the_column_both_types_and_both_files() {
-    let probe = store_holding(vec![
+    let probe = store_holding(&[
         (
-            &format!("{TABLE_ROOT}/a.parquet"),
-            parquet_bytes(vec![nullable("n", DataType::Int32)], 1),
+            "a.parquet",
+            &parquet_bytes(vec![nullable("n", DataType::Int32)], 1),
         ),
         (
-            &format!("{TABLE_ROOT}/b.parquet"),
-            parquet_bytes(vec![nullable("n", DataType::Utf8)], 1),
+            "b.parquet",
+            &parquet_bytes(vec![nullable("n", DataType::Utf8)], 1),
         ),
     ])
     .await;
 
-    let error = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let error = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .err()
-        .expect("no supported pair covers Int32 and Utf8, so the fold must fail rather than guess")
-        .to_string();
+        .expect("no supported pair covers Int32 and Utf8, so the fold must fail rather than guess");
 
-    for expected in [
-        "n",
-        "Int32",
-        "Utf8",
-        &format!("{TABLE_ROOT}/a.parquet"),
-        &format!("{TABLE_ROOT}/b.parquet"),
-    ] {
-        assert!(
-            error.contains(expected),
-            "the refusal must name the column, BOTH types, and BOTH file paths so an operator \
-             locates the files without listing the prefix; '{expected}' is missing from: {error}"
-        );
-    }
+    assert_mentions(
+        &error,
+        &[
+            "n",
+            "Int32",
+            "Utf8",
+            &under_root("a.parquet"),
+            &under_root("b.parquet"),
+        ],
+    );
 }
 
 #[tokio::test]
 async fn merge_mode_selects_every_footer_or_the_first() {
-    let objects = [
-        (
-            format!("{TABLE_ROOT}/a.parquet"),
-            parquet_bytes(vec![nullable("n", DataType::Int32)], 1),
-        ),
-        (
-            format!("{TABLE_ROOT}/b.parquet"),
-            parquet_bytes(vec![nullable("n", DataType::Int64)], 1),
-        ),
-        (
-            format!("{TABLE_ROOT}/c.parquet"),
-            parquet_bytes(vec![nullable("n", DataType::Int64)], 1),
-        ),
+    let int32 = parquet_bytes(vec![nullable("n", DataType::Int32)], 1);
+    let int64 = parquet_bytes(vec![nullable("n", DataType::Int64)], 1);
+    let objects: [(&str, &[u8]); 3] = [
+        ("a.parquet", &int32),
+        ("b.parquet", &int64),
+        ("c.parquet", &int64),
     ];
-    let borrowed = || {
-        objects
-            .iter()
-            .map(|(key, bytes)| (key.as_str(), bytes.clone()))
-            .collect::<Vec<(&str, Vec<u8>)>>()
-    };
 
-    let every = store_holding(borrowed()).await;
-    let folded = resolve_parquet_directory(&store_of(&every), &root(), MergeMode::FoldEveryFile)
+    let every = store_holding(&objects).await;
+    let folded = resolve(&every, MergeMode::FoldEveryFile, &|_| true)
         .await
         .expect("the prefix resolves");
-
-    let one = store_holding(borrowed()).await;
-    let sampled = resolve_parquet_directory(&store_of(&one), &root(), MergeMode::SampleOneFile)
+    let one = store_holding(&objects).await;
+    let sampled = resolve(&one, MergeMode::SampleOneFile, &|_| true)
         .await
         .expect("the prefix resolves");
 
     assert_eq!(
         one.files_read(),
-        vec![format!("{TABLE_ROOT}/a.parquet")],
+        rooted(&["a.parquet"]),
         "the sample-one-file mode reads EXACTLY one footer, the FIRST in the deterministic order, \
          which this store's reversed listing would otherwise make the last"
     );
@@ -518,49 +800,26 @@ async fn merge_mode_selects_every_footer_or_the_first() {
         folded.files.iter().all(|file| file.footer.is_some()),
         "under the fold-every-file mode every listed file carries its parsed footer"
     );
-}
 
-#[tokio::test]
-async fn a_single_file_prefix_folds_identically_under_both_modes() {
-    let object = [(
-        format!("{TABLE_ROOT}/a.parquet"),
-        parquet_bytes(vec![nullable("n", DataType::Int32)], 1),
-    )];
-    let borrowed = || vec![(object[0].0.as_str(), object[0].1.clone())];
-
-    let folded = resolve_parquet_directory(
-        &store_of(&store_holding(borrowed()).await),
-        &root(),
-        MergeMode::FoldEveryFile,
-    )
-    .await
-    .expect("the prefix resolves");
-    let sampled = resolve_parquet_directory(
-        &store_of(&store_holding(borrowed()).await),
-        &root(),
-        MergeMode::SampleOneFile,
-    )
-    .await
-    .expect("the prefix resolves");
-
-    assert_eq!(
-        column_types(&folded.schema),
-        vec![("n".to_string(), DataType::Int32)],
-        "the single file's own declaration is the folded schema"
-    );
-    assert_eq!(
-        column_types(&folded.schema),
-        column_types(&sampled.schema),
-        "the mode is observable only where footers differ"
-    );
+    let single = store_with(&["a.parquet"], &int32).await;
+    for merge_mode in [MergeMode::FoldEveryFile, MergeMode::SampleOneFile] {
+        let directory = resolve(&single, merge_mode, &|_| true)
+            .await
+            .expect("the prefix resolves");
+        assert_eq!(
+            column_types(&directory.schema),
+            vec![("n".to_string(), DataType::Int32)],
+            "{merge_mode:?}: a single-file prefix declares that file's own schema under both modes"
+        );
+    }
 }
 
 #[tokio::test]
 async fn folded_columns_are_the_nullable_union_in_first_appearance_order() {
-    let probe = store_holding(vec![
+    let probe = store_holding(&[
         (
-            &format!("{TABLE_ROOT}/a.parquet"),
-            parquet_bytes(
+            "a.parquet",
+            &parquet_bytes(
                 vec![
                     Field::new("A", DataType::Int32, false),
                     nullable("B", DataType::Utf8),
@@ -569,8 +828,8 @@ async fn folded_columns_are_the_nullable_union_in_first_appearance_order() {
             ),
         ),
         (
-            &format!("{TABLE_ROOT}/b.parquet"),
-            parquet_bytes(
+            "b.parquet",
+            &parquet_bytes(
                 vec![
                     nullable("A", DataType::Int32),
                     nullable("C", DataType::Utf8),
@@ -581,7 +840,7 @@ async fn folded_columns_are_the_nullable_union_in_first_appearance_order() {
     ])
     .await;
 
-    let directory = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .expect("the prefix resolves");
 
@@ -608,36 +867,32 @@ async fn folded_columns_are_the_nullable_union_in_first_appearance_order() {
 
 #[tokio::test]
 async fn two_names_equal_after_the_uppercase_fold_fail_the_fold() {
-    let probe = store_holding(vec![
+    let probe = store_holding(&[
         (
-            &format!("{TABLE_ROOT}/a.parquet"),
-            parquet_bytes(vec![nullable("id", DataType::Int32)], 0),
+            "a.parquet",
+            &parquet_bytes(vec![nullable("id", DataType::Int32)], 0),
         ),
         (
-            &format!("{TABLE_ROOT}/b.parquet"),
-            parquet_bytes(vec![nullable("ID", DataType::Int32)], 0),
+            "b.parquet",
+            &parquet_bytes(vec![nullable("ID", DataType::Int32)], 0),
         ),
     ])
     .await;
 
-    let error = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let error = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .err()
-        .expect("the declaration would advertise a duplicate column name")
-        .to_string();
+        .expect("the declaration would advertise a duplicate column name");
 
-    for expected in [
-        "id",
-        "ID",
-        &format!("{TABLE_ROOT}/a.parquet"),
-        &format!("{TABLE_ROOT}/b.parquet"),
-    ] {
-        assert!(
-            error.contains(expected),
-            "the refusal names both spellings and the files that carry them; '{expected}' is \
-             missing from: {error}"
-        );
-    }
+    assert_mentions(
+        &error,
+        &[
+            "id",
+            "ID",
+            &under_root("a.parquet"),
+            &under_root("b.parquet"),
+        ],
+    );
 }
 
 #[tokio::test]
@@ -650,9 +905,9 @@ async fn nested_and_unrepresentable_types_fold_to_the_string_declaration() {
         ])),
         false,
     );
-    let probe = store_holding(vec![(
-        &format!("{TABLE_ROOT}/a.parquet"),
-        parquet_bytes(
+    let probe = store_holding(&[(
+        "a.parquet",
+        &parquet_bytes(
             vec![
                 nullable(
                     "s",
@@ -671,7 +926,7 @@ async fn nested_and_unrepresentable_types_fold_to_the_string_declaration() {
     )])
     .await;
 
-    let directory = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .expect("a nested column is folded rather than refused");
 
@@ -704,9 +959,9 @@ async fn nested_and_unrepresentable_types_fold_to_the_string_declaration() {
 
 #[tokio::test]
 async fn a_prefix_holding_no_data_file_answers_an_empty_list_and_schema() {
-    let probe = store_holding(vec![(&format!("{TABLE_ROOT}/_SUCCESS"), b"".to_vec())]).await;
+    let probe = store_holding(&[("_SUCCESS", b"")]).await;
 
-    let directory = resolve_parquet_directory(&store_of(&probe), &root(), MergeMode::FoldEveryFile)
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
         .await
         .expect("an empty prefix is answered rather than raised as a panic");
 

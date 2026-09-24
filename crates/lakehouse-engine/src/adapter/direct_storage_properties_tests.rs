@@ -171,22 +171,27 @@ fn a_base_path_with_repeated_trailing_separators_joins_to_one_separator() {
     }
 }
 
-/// Pins one `MergeMode` mapping for a `MERGE_SCHEMA` value, so enumeration and pushdown can't
-/// drift onto two different modes.
 #[test]
-fn merge_schema_resolves_the_same_mode_on_both_paths() {
-    for (value, expected) in [
-        ("TRUE", MergeMode::FoldEveryFile),
-        ("FALSE", MergeMode::SampleOneFile),
+fn directory_options_derive_both_switches() {
+    for (merge_schema, hive_partitioning, expected_mode) in [
+        (true, true, MergeMode::FoldEveryFile),
+        (false, false, MergeMode::SampleOneFile),
     ] {
-        let props = json!({ "MERGE_SCHEMA": value });
+        let props = json!({
+            "MERGE_SCHEMA": if merge_schema { "TRUE" } else { "FALSE" },
+            "HIVE_PARTITIONING": if hive_partitioning { "TRUE" } else { "FALSE" },
+        });
         let resolved = resolve_direct_storage_properties(&props, "s3://bucket/lake")
-            .unwrap_or_else(|err| panic!("'{value}' must resolve: {err}"));
+            .expect("both switches resolve");
 
+        let options = resolved.directory_options();
         assert_eq!(
-            MergeMode::for_merge_schema(resolved.merge_schema),
-            expected,
-            "MERGE_SCHEMA={value} must resolve one mode for both paths"
+            options.merge_mode, expected_mode,
+            "MERGE_SCHEMA={merge_schema}"
+        );
+        assert_eq!(
+            options.hive_partitioning, hive_partitioning,
+            "HIVE_PARTITIONING={hive_partitioning}"
         );
     }
 }

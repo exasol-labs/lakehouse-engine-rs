@@ -41,7 +41,7 @@ pushes down the same operations every other catalog kind pushes down.
 * *THEN* the virtual schema SHALL serve EXACTLY the tables `ORDERS` and `DEEP`, so a directory is a table when and only when the shared listing rules find a data file under it
 * *AND* `EMPTY` and `HIDDEN_ONLY` SHALL be ABSENT from the served tables, and `CREATE VIRTUAL SCHEMA` SHALL still succeed, so a directory with no visible data file is skipped rather than fatal
 * *AND* no table SHALL be served for `notes.parquet`, so a loose data file under the base path names no table
-* *AND* a `SELECT` over `DEEP` SHALL return that file's rows with ZERO partition columns, so a `key=value` path segment is parsed but not acted on, which is the tracked exception issue [#408](https://github.com/exasol-labs/lakehouse-engine-rs/issues/408) covers
+* *AND* a `SELECT` over `DEEP` SHALL return that file's rows with its `y=2026` segment as the partition column `Y`, because `HIVE_PARTITIONING` defaults to TRUE
 * *AND* the test MUST fail, not skip, when Exasol or MinIO is unavailable
 
 ### Scenario: NAMESPACE scopes discovery to a subtree of the CONNECTION address

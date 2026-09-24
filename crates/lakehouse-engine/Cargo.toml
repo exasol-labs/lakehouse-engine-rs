@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.47.0"
+version = "0.48.0"
 edition = "2024"
 license.workspace = true
 
@@ -78,6 +78,7 @@ serde_json = { workspace = true }
 chrono  = { workspace = true }
 futures = { workspace = true }
 url     = { workspace = true }
+percent-encoding = { workspace = true }
 
 # udf_log! and ctx.debug_level() need tracing::Level; default-features off so no
 # subscriber machinery crosses into the .so.
