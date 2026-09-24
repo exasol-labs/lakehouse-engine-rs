@@ -1,46 +1,46 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{sample_storage, unauthenticated_creds};
-use arrow::array::new_null_array;
-use arrow::datatypes::{Field, Fields, Schema as ArrowSchema};
-use arrow::record_batch::RecordBatch;
-use object_store::memory::InMemory;
-use object_store::{ObjectStoreExt, PutPayload};
-use parquet::arrow::ArrowWriter;
+use crate::adapter::parquet_directory::MergeMode;
+use crate::adapter::pushdown::test_support::filter_json::{column, compare, equal, number, string};
+use crate::adapter::pushdown::test_support::sample_storage;
+use crate::adapter::tests::parquet_fixture::{
+    directory_options, in_memory_store, nullable, parquet_bytes,
+};
+use crate::scan::spec::reconstruct_abs_uri;
+use arrow::datatypes::Fields;
+use datafusion::datasource::listing::ListingTableUrl;
+use std::collections::BTreeMap;
 
 /// The CONNECTION address plus the namespace property, joined by the resolver.
 const TABLE_ROOT: &str = "s3://warehouse/direct/events";
 
-/// One row of nulls is enough for the footer to declare `fields` without needing a value per Arrow type.
-fn parquet_bytes(fields: Vec<Field>) -> Vec<u8> {
-    let schema = Arc::new(ArrowSchema::new(fields));
-    let columns: Vec<arrow::array::ArrayRef> = schema
-        .fields()
-        .iter()
-        .map(|field| new_null_array(field.data_type(), 1))
-        .collect();
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .expect("the fixture batch matches its own schema");
-    let mut bytes = Vec::new();
-    let mut writer =
-        ArrowWriter::try_new(&mut bytes, schema, None).expect("the fixture schema is writable");
-    writer.write(&batch).expect("the fixture batch is writable");
-    writer.close().expect("the fixture file closes");
-    bytes
+/// Unreadable as Parquet: a successful resolution proves its footer was never read.
+const NOT_PARQUET: &[u8] = b"not a parquet file";
+
+/// One row of nulls declares `fields` without needing a value per Arrow type.
+fn parquet(fields: Vec<Field>) -> Vec<u8> {
+    parquet_bytes(fields, 1)
 }
 
-fn nullable(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, true)
+async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<dyn ObjectStore> {
+    in_memory_store(objects).await
 }
 
-async fn store_holding(objects: Vec<(&str, Vec<u8>)>) -> Arc<dyn ObjectStore> {
-    let store = InMemory::new();
-    for (key, bytes) in objects {
-        store
-            .put(&StorePath::from(key), PutPayload::from(bytes))
-            .await
-            .expect("the in-memory store accepts the fixture object");
+async fn try_resolve(
+    store: &Arc<dyn ObjectStore>,
+    options: DirectoryOptions,
+    filter_json: Option<&Json>,
+    declared_columns: &[(String, String)],
+) -> Result<ResolvedScan, UdfError> {
+    let storage = sample_storage();
+    ParquetFormatReader {
+        store,
+        table_root: TABLE_ROOT,
+        options,
+        declared_columns,
+        storage: &storage,
     }
-    Arc::new(store)
+    .resolve_scan(filter_json)
+    .await
 }
 
 async fn resolve(
@@ -48,15 +48,7 @@ async fn resolve(
     merge_mode: MergeMode,
     filter_json: Option<&Json>,
 ) -> ResolvedScan {
-    let storage = sample_storage();
-    let creds = unauthenticated_creds();
-    let connection = ConnectionStorage {
-        storage: &storage,
-        creds: &creds,
-        allow_http: true,
-    };
-    ParquetFormatReader::new(store, TABLE_ROOT, merge_mode, &connection)
-        .resolve_scan(filter_json)
+    try_resolve(store, directory_options(merge_mode, true), filter_json, &[])
         .await
         .expect("a directory of readable Parquet files resolves a scan")
 }
@@ -72,30 +64,37 @@ fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
     scan.files.iter().map(|file| file.path.as_str()).collect()
 }
 
+fn declared(columns: &[(&str, &str)]) -> Vec<(String, String)> {
+    columns
+        .iter()
+        .map(|(name, exasol_type)| (name.to_string(), exasol_type.to_string()))
+        .collect()
+}
+
 /// Two data files at different depths/schemas, plus two objects the listing must skip (a hidden segment, a sibling table's directory).
 async fn two_depth_directory() -> Arc<dyn ObjectStore> {
-    store_holding(vec![
+    store_holding(&[
         (
             "direct/events/part-0.parquet",
-            parquet_bytes(vec![
+            &parquet(vec![
                 nullable("id", DataType::Int32),
                 nullable("name", DataType::Utf8),
             ]),
         ),
         (
             "direct/events/day=2/part-1.parquet",
-            parquet_bytes(vec![
+            &parquet(vec![
                 nullable("id", DataType::Int64),
                 nullable("extra", DataType::Utf8),
             ]),
         ),
         (
             "direct/events/_staging/part-9.parquet",
-            parquet_bytes(vec![nullable("hidden", DataType::Utf8)]),
+            &parquet(vec![nullable("hidden", DataType::Utf8)]),
         ),
         (
             "direct/other/part-0.parquet",
-            parquet_bytes(vec![nullable("other", DataType::Utf8)]),
+            &parquet(vec![nullable("other", DataType::Utf8)]),
         ),
     ])
     .await
@@ -112,14 +111,21 @@ async fn resolved_scan_carries_identity_bound_fields_and_no_deletes() {
         vec!["day=2/part-1.parquet", "part-0.parquet"],
         "every data file under the root, encoded relative to it, and nothing else"
     );
+    assert_eq!(
+        scan.files
+            .iter()
+            .map(|file| file.partition_values.clone())
+            .collect::<Vec<_>>(),
+        vec![
+            BTreeMap::from([("day".to_string(), Some("2".to_string()))]),
+            BTreeMap::from([("day".to_string(), None)]),
+        ],
+        "a file without the partition segment carries the key unset"
+    );
     for file in &scan.files {
         assert!(
             file.deletes.is_empty(),
             "a raw Parquet directory declares no delete mechanism: {file:?}"
-        );
-        assert!(
-            file.partition_values.is_empty(),
-            "a raw Parquet directory declares no partition value: {file:?}"
         );
         assert!(
             file.size > 0,
@@ -147,12 +153,13 @@ async fn resolved_scan_carries_identity_bound_fields_and_no_deletes() {
     }
     assert_eq!(
         column_names(&scan),
-        vec!["id", "extra", "name"],
-        "the folded union in first-appearance order over the listing order"
+        vec!["id", "extra", "name", "day"],
+        "folded union in listing order, then the partition columns"
     );
-    assert!(
-        scan.partition_columns.is_empty(),
-        "a raw directory declares no partition column"
+    assert_eq!(
+        scan.partition_columns,
+        vec!["day".to_string()],
+        "the scan carries the seam's partition columns"
     );
     assert!(
         scan.name_mapping.is_empty(),
@@ -174,15 +181,60 @@ async fn resolved_scan_carries_identity_bound_fields_and_no_deletes() {
     );
 }
 
+#[tokio::test]
+async fn file_entry_paths_round_trip_to_the_listed_object() {
+    let keys = [
+        "direct/events/region=a%2Fb/p%25.parquet",
+        "direct/events/c#d/p#.parquet",
+        "direct/events/e?f/p?.parquet",
+        "direct/events/g h/p q.parquet",
+        "direct/events/é/ü.parquet",
+        "direct/events/plain/p.parquet",
+    ];
+    let data = parquet(vec![nullable("id", DataType::Int64)]);
+    let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data.as_slice())).collect();
+    let store = store_holding(&objects).await;
+
+    let scan = resolve(&store, MergeMode::FoldEveryFile, None).await;
+
+    let mut scanned: Vec<StorePath> = scan
+        .files
+        .iter()
+        .map(|file| {
+            let uri = reconstruct_abs_uri(&file.path, &scan.table_root);
+            ListingTableUrl::parse(&uri)
+                .unwrap_or_else(|e| panic!("the scan parses the entry URI '{uri}': {e}"))
+                .prefix()
+                .clone()
+        })
+        .collect();
+    let mut listed: Vec<StorePath> = keys
+        .iter()
+        .map(|key| StorePath::parse(key).expect("the fixture key is a valid store path"))
+        .collect();
+    scanned.sort();
+    listed.sort();
+    assert_eq!(
+        scanned, listed,
+        "each entry must resolve to the listed object"
+    );
+    assert!(
+        file_paths(&scan).contains(&"plain/p.parquet"),
+        "a plain path stays byte-identical: {:?}",
+        file_paths(&scan)
+    );
+    assert!(
+        file_paths(&scan).contains(&"region=a%252Fb/p%2525.parquet"),
+        "a key's '%' is encoded, not decoded: {:?}",
+        file_paths(&scan)
+    );
+}
+
 // merge_mode narrows which footers are read, never which files are scanned or filtered.
 #[tokio::test]
 async fn plan_reads_selected_footers_and_lists_every_file() {
     let store = two_depth_directory().await;
-    let filter = serde_json::json!({
-        "type": "predicate_equal",
-        "left": {"type": "column", "name": "ID"},
-        "right": {"type": "literal_exactnumeric", "value": "1"},
-    });
+    let filter = compare("predicate_equal", column("ID"), number("1"));
 
     let folded = resolve(&store, MergeMode::FoldEveryFile, Some(&filter)).await;
     let sampled = resolve(&store, MergeMode::SampleOneFile, Some(&filter)).await;
@@ -195,16 +247,16 @@ async fn plan_reads_selected_footers_and_lists_every_file() {
     assert_eq!(
         file_paths(&folded),
         vec!["day=2/part-1.parquet", "part-0.parquet"],
-        "a filter narrows the rows the scan emits, never the files it reads (#408, #412)"
+        "a non-partition filter never prunes files (#412)"
     );
     assert_eq!(
         column_names(&folded),
-        vec!["id", "extra", "name"],
+        vec!["id", "extra", "name", "day"],
         "folding every footer reaches the second listed file's own column"
     );
     assert_eq!(
         column_names(&sampled),
-        vec!["id", "extra"],
+        vec!["id", "extra", "day"],
         "sampling one footer reads the FIRST listed file's declaration alone"
     );
     assert_eq!(
@@ -218,14 +270,128 @@ async fn plan_reads_selected_footers_and_lists_every_file() {
 }
 
 #[tokio::test]
+async fn a_partition_filter_prunes_files_before_their_footers_are_read() {
+    let store = store_holding(&[
+        (
+            "direct/events/year=2026/p1.parquet",
+            &parquet(vec![nullable("id", DataType::Int64)]),
+        ),
+        ("direct/events/year=2025/p2.parquet", NOT_PARQUET),
+        ("direct/events/year=2024/p3.parquet", NOT_PARQUET),
+    ])
+    .await;
+    let options = directory_options(MergeMode::FoldEveryFile, true);
+    let columns = declared(&[("ID", "DECIMAL(20,0)"), ("YEAR", "VARCHAR(2000000) UTF8")]);
+
+    let unpruned = try_resolve(&store, options, None, &columns)
+        .await
+        .expect_err("an unpruned scan reads the unreadable footers");
+    assert!(
+        unpruned
+            .to_string()
+            .contains("failed to read the Parquet footer"),
+        "{unpruned}"
+    );
+
+    for (filter, kept, columns_after) in [
+        (
+            equal("YEAR", "2026"),
+            vec!["year=2026/p1.parquet"],
+            vec!["id", "year"],
+        ),
+        (
+            compare("predicate_greater", column("YEAR"), string("2025")),
+            vec!["year=2026/p1.parquet"],
+            vec!["id", "year"],
+        ),
+        // Keeping no file still resolves, and the schema survives pruning every file.
+        (equal("YEAR", "2099"), vec![], vec!["year", "ID"]),
+    ] {
+        let scan = try_resolve(&store, options, Some(&filter), &columns)
+            .await
+            .unwrap_or_else(|e| panic!("{filter}: a pruned file's footer must not be read: {e}"));
+        assert_eq!(
+            file_paths(&scan),
+            kept,
+            "{filter}: only the file whose partition value can satisfy the filter is kept"
+        );
+        assert_eq!(scan.partition_columns, vec!["year".to_string()]);
+        assert_eq!(column_names(&scan), columns_after, "{filter}");
+    }
+}
+
+#[tokio::test]
+async fn a_declared_column_absent_from_kept_files_is_added_as_a_null_field() {
+    let store = store_holding(&[
+        (
+            "direct/events/year=2026/p1.parquet",
+            &parquet(vec![
+                nullable("id", DataType::Int64),
+                nullable("discount", DataType::Float64),
+            ]),
+        ),
+        (
+            "direct/events/year=2025/p2.parquet",
+            &parquet(vec![nullable("id", DataType::Int64)]),
+        ),
+    ])
+    .await;
+    let columns = declared(&[
+        ("ID", "DECIMAL(20,0)"),
+        ("DISCOUNT", "DOUBLE PRECISION"),
+        ("NOTE", "VARCHAR(2000000) UTF8"),
+        ("PLACE", "GEOMETRY"),
+        ("YEAR", "VARCHAR(2000000) UTF8"),
+    ]);
+    let options = directory_options(MergeMode::FoldEveryFile, true);
+
+    let pruned = try_resolve(&store, options, Some(&equal("YEAR", "2025")), &columns)
+        .await
+        .expect("the kept file resolves a scan");
+    let unpruned = try_resolve(&store, options, None, &columns)
+        .await
+        .expect("both files resolve a scan");
+
+    assert_eq!(
+        column_names(&pruned),
+        vec!["id", "year", "DISCOUNT", "NOTE", "PLACE"],
+        "only declared columns absent from the fold and partition columns are appended"
+    );
+    assert_eq!(
+        column_names(&unpruned),
+        vec!["id", "discount", "year", "NOTE", "PLACE"],
+        "a column a kept file carries keeps its footer-derived field"
+    );
+    let added = &pruned.logical_schema[2..];
+    assert_eq!(
+        added
+            .iter()
+            .map(|field| field.arrow_type.as_str())
+            .collect::<Vec<_>>(),
+        vec!["float64", "utf8", "utf8"],
+        "typed from the declared Exasol type, unmapped types as utf8"
+    );
+    for field in added {
+        assert!(
+            field.nullable,
+            "every scanned file reads it as NULL: {field:?}"
+        );
+        assert_eq!(field.field_id, None, "no binding key: {field:?}");
+        assert_eq!(field.physical_name, None, "no binding key: {field:?}");
+        assert_eq!(field.nested, None, "no nested descriptor: {field:?}");
+        assert_eq!(field.initial_default, None, "{field:?}");
+    }
+}
+
+#[tokio::test]
 async fn a_nested_column_declares_the_string_tag_and_an_identity_bound_descriptor() {
     let inner = Fields::from(vec![
         nullable("a", DataType::Int32),
         nullable("b", DataType::Utf8),
     ]);
-    let store = store_holding(vec![(
+    let store = store_holding(&[(
         "direct/events/part-0.parquet",
-        parquet_bytes(vec![
+        &parquet(vec![
             nullable("point", DataType::Struct(inner)),
             nullable(
                 "tags",
@@ -274,11 +440,8 @@ async fn a_nested_column_declares_the_string_tag_and_an_identity_bound_descripto
 // An empty prefix resolves an empty scan, not an error — whether it's a table was decided at create time.
 #[tokio::test]
 async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
-    let store = store_holding(vec![(
-        "direct/events/_delta_log/00000000000000000000.json",
-        b"{}".to_vec(),
-    )])
-    .await;
+    let store =
+        store_holding(&[("direct/events/_delta_log/00000000000000000000.json", b"{}")]).await;
 
     let scan = resolve(&store, MergeMode::FoldEveryFile, None).await;
 
@@ -290,9 +453,9 @@ async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
 // Planning must render the same normalized timestamptz_* tag as enumeration, or CREATE VIRTUAL SCHEMA could accept a column that planning then refuses.
 #[tokio::test]
 async fn a_non_utc_timezone_column_plans_at_its_normalized_tag() {
-    let store = store_holding(vec![(
+    let store = store_holding(&[(
         "direct/events/part-0.parquet",
-        parquet_bytes(vec![nullable(
+        &parquet(vec![nullable(
             "occurred_at",
             DataType::Timestamp(
                 arrow::datatypes::TimeUnit::Microsecond,

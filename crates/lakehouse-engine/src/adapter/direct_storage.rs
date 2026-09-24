@@ -1,7 +1,9 @@
 //! The `CatalogClient` implementor for `CatalogKind::DirectStorage`: a plain object-storage
 //! prefix holding directories of Parquet files, with no catalog service.
 use crate::adapter::direct_storage_properties::join_storage_path;
-use crate::adapter::parquet_directory::{MergeMode, resolve_parquet_directory, store_prefix};
+use crate::adapter::parquet_directory::{
+    DirectoryOptions, resolve_parquet_directory, store_prefix,
+};
 use crate::scan::spec::StorageBackend;
 use crate::types::mapping::{arrow_type_to_tag, needs_json_fallback};
 use arrow::datatypes::DataType;
@@ -26,7 +28,7 @@ pub struct DirectStorageCatalogClient {
     store: Arc<dyn ObjectStore>,
     prefix: StorePath,
     base_path: String,
-    merge_mode: MergeMode,
+    options: DirectoryOptions,
 }
 
 impl DirectStorageCatalogClient {
@@ -34,24 +36,24 @@ impl DirectStorageCatalogClient {
     pub fn new(
         backend: &StorageBackend,
         base_path: &str,
-        merge_mode: MergeMode,
+        options: DirectoryOptions,
         all_secrets: &[&str],
     ) -> Result<Self, UdfError> {
         let store_url = crate::scan::store_root_url(base_path)?;
         let store = crate::scan::build_admission_limited_store(backend, &store_url, all_secrets)?;
-        Self::over_store(store, base_path, merge_mode)
+        Self::over_store(store, base_path, options)
     }
 
     fn over_store(
         store: Arc<dyn ObjectStore>,
         base_path: &str,
-        merge_mode: MergeMode,
+        options: DirectoryOptions,
     ) -> Result<Self, UdfError> {
         Ok(Self {
             store,
             prefix: store_prefix(base_path)?,
             base_path: base_path.to_string(),
-            merge_mode,
+            options,
         })
     }
 }
@@ -81,7 +83,8 @@ impl CatalogClient for DirectStorageCatalogClient {
             let directories = try_join_all(names.iter().map(|name| {
                 let table_prefix = self.prefix.clone().join(name.as_str());
                 async move {
-                    resolve_parquet_directory(&self.store, &table_prefix, self.merge_mode).await
+                    resolve_parquet_directory(&self.store, &table_prefix, self.options, &|_| true)
+                        .await
                 }
             }))
             .await?;

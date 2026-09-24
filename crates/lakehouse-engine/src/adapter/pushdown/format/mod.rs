@@ -13,7 +13,7 @@ use lakehouse_catalog::{
 use object_store::ObjectStore;
 use serde_json::Value as Json;
 
-use crate::adapter::parquet_directory::MergeMode;
+use crate::adapter::parquet_directory::DirectoryOptions;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 
@@ -22,8 +22,10 @@ mod delta_predicate;
 mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
+mod filter_json;
 mod iceberg;
 mod parquet_format_reader;
+mod partition_predicate;
 
 use delta_format_reader::DeltaFormatReader;
 use iceberg::IcebergFormatReader;
@@ -111,10 +113,14 @@ pub enum ScanSource<'a> {
         table: &'a CatalogTable,
     },
     /// A directory of raw Parquet files; no catalog table metadata, since this source loads no table.
+    ///
+    /// `declared_columns` is the table's `(Exasol name, Exasol type)` declaration from the pushdown
+    /// request, so a column no kept file carries still resolves.
     DirectParquet {
         store: &'a Arc<dyn ObjectStore>,
         table_root: &'a str,
-        merge_mode: MergeMode,
+        options: DirectoryOptions,
+        declared_columns: &'a [(String, String)],
     },
 }
 
@@ -170,9 +176,14 @@ pub fn format_reader<'a>(
         ScanSource::DirectParquet {
             store,
             table_root,
-            merge_mode,
-        } => Ok(Box::new(ParquetFormatReader::new(
-            store, table_root, merge_mode, connection,
-        ))),
+            options,
+            declared_columns,
+        } => Ok(Box::new(ParquetFormatReader {
+            store,
+            table_root,
+            options,
+            declared_columns,
+            storage: connection.storage,
+        })),
     }
 }

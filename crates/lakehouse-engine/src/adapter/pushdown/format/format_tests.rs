@@ -1,5 +1,6 @@
 use super::super::test_support::sample_storage;
 use super::*;
+use crate::adapter::parquet_directory::MergeMode;
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType};
 
 /// Credentials whose SigV4 mode lets `CatalogSession::resolve` build a session
@@ -171,7 +172,11 @@ fn third_scan_source_selects_the_parquet_reader() {
         ScanSource::DirectParquet {
             store: &store,
             table_root: "s3://warehouse/direct/events",
-            merge_mode: MergeMode::FoldEveryFile,
+            options: DirectoryOptions {
+                merge_mode: MergeMode::FoldEveryFile,
+                hive_partitioning: true,
+            },
+            declared_columns: &[],
         },
         &ConnectionStorage {
             storage: &storage,

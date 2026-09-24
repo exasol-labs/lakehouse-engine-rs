@@ -1,44 +1,38 @@
 use super::*;
-use arrow::array::new_empty_array;
-use arrow::datatypes::{Field, Fields, Schema};
-use arrow::record_batch::RecordBatch;
+use crate::adapter::parquet_directory::MergeMode;
+use crate::adapter::tests::parquet_fixture::{
+    directory_options, in_memory_store, nullable, parquet_bytes,
+};
+use arrow::datatypes::{Field, Fields};
+use object_store::PutPayload;
 use object_store::memory::InMemory;
-use object_store::{ObjectStoreExt, PutPayload};
-use parquet::arrow::ArrowWriter;
 
-fn nullable(name: &str, data_type: DataType) -> Field {
-    Field::new(name, data_type, true)
-}
-
-/// A Parquet file declaring `fields` and holding zero rows: the declaration survives the batch's
-/// own validation with no value needed per Arrow type.
-fn parquet_bytes(fields: Vec<Field>) -> Vec<u8> {
-    let schema = Arc::new(Schema::new(fields));
-    let columns: Vec<arrow::array::ArrayRef> = schema
-        .fields()
-        .iter()
-        .map(|field| new_empty_array(field.data_type()))
-        .collect();
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
-        .expect("the fixture batch matches its own schema");
-
-    let mut bytes = Vec::new();
-    let mut writer =
-        ArrowWriter::try_new(&mut bytes, schema, None).expect("the fixture schema is writable");
-    writer.write(&batch).expect("the fixture batch is writable");
-    writer.close().expect("the fixture file closes");
-    bytes
-}
+const FOLD_NO_HIVE: DirectoryOptions = DirectoryOptions {
+    merge_mode: MergeMode::FoldEveryFile,
+    hive_partitioning: false,
+};
 
 /// Builds the client through the production constructor's own prefix derivation, so no test
 /// injects a prefix the real `base_path` would not have produced.
 fn test_client(
     store: Arc<dyn ObjectStore>,
     base_path: &str,
-    merge_mode: MergeMode,
+    options: DirectoryOptions,
 ) -> DirectStorageCatalogClient {
-    DirectStorageCatalogClient::over_store(store, base_path, merge_mode)
+    DirectStorageCatalogClient::over_store(store, base_path, options)
         .expect("the fixture base path is a valid storage URI")
+}
+
+/// A zero-row file declaring a single nullable `id BIGINT`.
+fn id_file() -> Vec<u8> {
+    parquet_bytes(vec![nullable("id", DataType::Int64)], 0)
+}
+
+/// A store holding `id_file()` at each key.
+async fn id_files_at(keys: &[&str]) -> Arc<InMemory> {
+    let data = id_file();
+    let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data.as_slice())).collect();
+    in_memory_store(&objects).await
 }
 
 /// An [`ObjectStore`] decorator recording every `list`/`list_with_delimiter` prefix and `get`
@@ -163,18 +157,15 @@ fn client_is_reachable_as_a_boxed_catalog_client() {
     assert_is_catalog_client::<DirectStorageCatalogClient>();
 
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let client: Box<dyn CatalogClient> = Box::new(test_client(
-        store,
-        "s3://bucket/lake",
-        MergeMode::FoldEveryFile,
-    ));
+    let client: Box<dyn CatalogClient> =
+        Box::new(test_client(store, "s3://bucket/lake", FOLD_NO_HIVE));
     drop(client);
 }
 
 #[tokio::test]
 async fn load_table_returns_a_clear_error_naming_the_direct_storage_kind() {
     let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
-    let client = test_client(store, "s3://bucket/lake", MergeMode::FoldEveryFile);
+    let client = test_client(store, "s3://bucket/lake", FOLD_NO_HIVE);
 
     let ident = CatalogTableIdent {
         namespace: Vec::new(),
@@ -202,23 +193,15 @@ async fn load_table_returns_a_clear_error_naming_the_direct_storage_kind() {
 
 #[tokio::test]
 async fn first_level_directories_are_the_tables() {
-    let inner = Arc::new(InMemory::new());
-    for key in [
+    let inner = id_files_at(&[
         "lake/orders/part-0.parquet",
         "lake/events/part-0.parquet",
         "lake/orders/2026/part-1.parquet",
         "lake/notes.parquet",
-    ] {
-        inner
-            .put(
-                &StorePath::from(key),
-                PutPayload::from(parquet_bytes(vec![nullable("id", DataType::Int64)])),
-            )
-            .await
-            .expect("the in-memory store accepts the fixture object");
-    }
+    ])
+    .await;
 
-    let client = test_client(inner, "s3://bucket/lake", MergeMode::FoldEveryFile);
+    let client = test_client(inner, "s3://bucket/lake", FOLD_NO_HIVE);
     let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
 
     let mut names: Vec<&str> = listing
@@ -251,31 +234,28 @@ async fn first_level_directories_are_the_tables() {
 #[tokio::test]
 async fn columns_and_files_come_from_the_shared_seam() {
     let nested = Fields::from(vec![Field::new("x", DataType::Int32, true)]);
-    let inner = Arc::new(InMemory::new());
-    for key in [
-        "lake/orders/part-0.parquet",
-        "lake/orders/2026/part-1.parquet",
-    ] {
-        inner
-            .put(
-                &StorePath::from(key),
-                PutPayload::from(parquet_bytes(vec![
-                    nullable("id", DataType::Int64),
-                    nullable("tags", DataType::Struct(nested.clone())),
-                ])),
-            )
-            .await
-            .expect("the in-memory store accepts the fixture object");
-    }
-    // Objects the shared seam's own filter excludes: a marker file and a hidden Parquet file.
-    for key in ["lake/orders/_SUCCESS", "lake/orders/.hidden.parquet"] {
-        inner
-            .put(&StorePath::from(key), PutPayload::from(Vec::<u8>::new()))
-            .await
-            .expect("the in-memory store accepts the fixture object");
-    }
+    let data = parquet_bytes(
+        vec![
+            nullable("id", DataType::Int64),
+            nullable("tags", DataType::Struct(nested)),
+        ],
+        0,
+    );
+    let inner = in_memory_store(&[
+        ("lake/orders/part-0.parquet", &data),
+        ("lake/orders/2026/part-1.parquet", &data),
+        ("lake/orders/region=us/part-2.parquet", &data),
+        // Objects the shared seam's own filter excludes: a marker file and a hidden Parquet file.
+        ("lake/orders/_SUCCESS", b""),
+        ("lake/orders/.hidden.parquet", b""),
+    ])
+    .await;
 
-    let client = test_client(inner, "s3://bucket/lake", MergeMode::FoldEveryFile);
+    let client = test_client(
+        inner,
+        "s3://bucket/lake",
+        directory_options(MergeMode::FoldEveryFile, true),
+    );
     let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
 
     assert_eq!(listing.tables.len(), 1);
@@ -283,12 +263,17 @@ async fn columns_and_files_come_from_the_shared_seam() {
     let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["id", "tags"],
-        "columns appear in the folded schema's own order"
+        vec!["id", "tags", "region"],
+        "folded columns, then partition columns"
     );
     assert_eq!(
         table.columns[0].source_type,
         ColumnSourceType::Parquet("int64".to_string())
+    );
+    assert_eq!(
+        table.columns[2].source_type,
+        ColumnSourceType::Parquet("utf8".to_string()),
+        "partition column is utf8"
     );
     assert_eq!(
         table.columns[1].source_type,
@@ -299,23 +284,13 @@ async fn columns_and_files_come_from_the_shared_seam() {
 
 #[tokio::test]
 async fn directory_with_no_data_file_is_skipped_with_a_neutral_reason() {
-    let inner = Arc::new(InMemory::new());
-    inner
-        .put(
-            &StorePath::from("lake/orders/part-0.parquet"),
-            PutPayload::from(parquet_bytes(vec![nullable("id", DataType::Int64)])),
-        )
-        .await
-        .expect("the in-memory store accepts the fixture object");
-    inner
-        .put(
-            &StorePath::from("lake/empty/_SUCCESS"),
-            PutPayload::from(Vec::<u8>::new()),
-        )
-        .await
-        .expect("the in-memory store accepts the fixture object");
+    let inner = in_memory_store(&[
+        ("lake/orders/part-0.parquet", &id_file()),
+        ("lake/empty/_SUCCESS", b""),
+    ])
+    .await;
 
-    let client = test_client(inner, "s3://bucket/lake", MergeMode::FoldEveryFile);
+    let client = test_client(inner, "s3://bucket/lake", FOLD_NO_HIVE);
     let listing = client
         .list_tables(&[])
         .await
@@ -331,22 +306,13 @@ async fn directory_with_no_data_file_is_skipped_with_a_neutral_reason() {
 
 #[tokio::test]
 async fn one_admission_limited_store_serves_the_whole_call() {
-    let inner = Arc::new(InMemory::new());
-    for key in ["lake/orders/part-0.parquet", "lake/events/part-0.parquet"] {
-        inner
-            .put(
-                &StorePath::from(key),
-                PutPayload::from(parquet_bytes(vec![nullable("id", DataType::Int64)])),
-            )
-            .await
-            .expect("the in-memory store accepts the fixture object");
-    }
+    let inner = id_files_at(&["lake/orders/part-0.parquet", "lake/events/part-0.parquet"]).await;
 
     let recording = RecordingStore::wrapping(inner);
     let client = test_client(
         Arc::clone(&recording) as Arc<dyn ObjectStore>,
         "s3://bucket/lake",
-        MergeMode::FoldEveryFile,
+        FOLD_NO_HIVE,
     );
 
     let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
@@ -369,20 +335,13 @@ async fn one_admission_limited_store_serves_the_whole_call() {
 
 #[tokio::test]
 async fn new_derives_the_store_prefix_from_the_base_path() {
-    let inner = Arc::new(InMemory::new());
-    inner
-        .put(
-            &StorePath::from("lake/finance/orders/part-0.parquet"),
-            PutPayload::from(parquet_bytes(vec![nullable("id", DataType::Int64)])),
-        )
-        .await
-        .expect("the in-memory store accepts the fixture object");
+    let inner = id_files_at(&["lake/finance/orders/part-0.parquet"]).await;
 
     let recording = RecordingStore::wrapping(inner);
     let client = test_client(
         Arc::clone(&recording) as Arc<dyn ObjectStore>,
         "s3://bucket/lake/finance",
-        MergeMode::FoldEveryFile,
+        FOLD_NO_HIVE,
     );
 
     let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
@@ -408,38 +367,27 @@ async fn new_derives_the_store_prefix_from_the_base_path() {
 }
 
 #[tokio::test]
-async fn merge_schema_true_and_false_select_every_footer_or_exactly_one() {
-    let files = [
-        "lake/orders/part-0.parquet".to_string(),
-        "lake/orders/part-1.parquet".to_string(),
-    ];
+async fn merge_mode_selects_every_footer_or_exactly_one() {
+    let files = ["lake/orders/part-0.parquet", "lake/orders/part-1.parquet"];
 
-    for (merge_schema, expected) in [(false, vec![files[0].clone()]), (true, files.to_vec())] {
-        let inner = Arc::new(InMemory::new());
-        for key in &files {
-            inner
-                .put(
-                    &StorePath::from(key.as_str()),
-                    PutPayload::from(parquet_bytes(vec![nullable("id", DataType::Int64)])),
-                )
-                .await
-                .expect("the in-memory store accepts the fixture object");
-        }
-
-        let recording = RecordingStore::wrapping(inner);
+    for (merge_mode, expected) in [
+        (MergeMode::SampleOneFile, &files[..1]),
+        (MergeMode::FoldEveryFile, &files[..]),
+    ] {
+        let recording = RecordingStore::wrapping(id_files_at(&files).await);
         let client = test_client(
             Arc::clone(&recording) as Arc<dyn ObjectStore>,
             "s3://bucket/lake",
-            MergeMode::for_merge_schema(merge_schema),
+            directory_options(merge_mode, false),
         );
 
         let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
-        assert_eq!(listing.tables.len(), 1, "MERGE_SCHEMA={merge_schema}");
+        assert_eq!(listing.tables.len(), 1, "{merge_mode:?}");
 
         assert_eq!(
             recording.files_fetched(),
             expected,
-            "MERGE_SCHEMA={merge_schema} must open exactly these footers"
+            "{merge_mode:?} must open exactly these footers"
         );
     }
 }
@@ -450,22 +398,17 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
         arrow::datatypes::TimeUnit::Microsecond,
         Some("America/New_York".into()),
     );
-    let inner = Arc::new(InMemory::new());
-    inner
-        .put(
-            &StorePath::from("lake/events/part-0.parquet"),
-            PutPayload::from(parquet_bytes(vec![nullable(
-                "occurred_at",
-                declared.clone(),
-            )])),
-        )
-        .await
-        .expect("the in-memory store accepts the fixture object");
+    let inner = in_memory_store(&[(
+        "lake/events/part-0.parquet",
+        &parquet_bytes(vec![nullable("occurred_at", declared.clone())], 0),
+    )])
+    .await;
 
     let directory = resolve_parquet_directory(
         &(Arc::clone(&inner) as Arc<dyn ObjectStore>),
         &StorePath::from("lake/events"),
-        MergeMode::FoldEveryFile,
+        FOLD_NO_HIVE,
+        &|_| true,
     )
     .await
     .expect("the fixture directory folds");
@@ -476,7 +419,7 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
          exercises nothing"
     );
 
-    let client = test_client(inner, "s3://bucket/lake", MergeMode::FoldEveryFile);
+    let client = test_client(inner, "s3://bucket/lake", FOLD_NO_HIVE);
     let listing = client.list_tables(&[]).await.expect(
         "a legal timezone-aware Parquet column must enumerate, not fail the whole virtual schema",
     );
@@ -487,4 +430,29 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
         "the tag vocabulary discards WHICH timezone the file declared, by design; the column is \
          declared at that normalized tag — the same one the plan path's logical_schema renders"
     );
+}
+
+#[tokio::test]
+async fn hive_partitioning_reaches_the_seam_on_enumeration() {
+    let inner: Arc<dyn ObjectStore> = id_files_at(&["lake/sales/year=2026/part-0.parquet"]).await;
+
+    for (hive_partitioning, expected) in [(false, vec!["id"]), (true, vec!["id", "year"])] {
+        let listing = test_client(
+            Arc::clone(&inner),
+            "s3://bucket/lake",
+            directory_options(MergeMode::FoldEveryFile, hive_partitioning),
+        )
+        .list_tables(&[])
+        .await
+        .expect("enumeration succeeds");
+        assert_eq!(
+            listing.tables[0]
+                .columns
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<&str>>(),
+            expected,
+            "HIVE_PARTITIONING = {hive_partitioning}"
+        );
+    }
 }
