@@ -1404,14 +1404,11 @@ fn join_block_round_trips_through_split_and_merge() {
     assert_eq!(via_struct, spec);
 }
 
-/// `post_join_limit` is additive-optional: a join block serialized without it —
-/// every one written before the field existed — loads as `None`, and a cap that
-/// IS set survives the common/per-shard split the UDF actually receives.
-#[test]
-fn join_spec_omitting_post_join_limit_deserializes_to_none() {
-    let mut spec = sample_spec();
-    let storage = spec.common.storage.clone();
-    spec.common.join = Some(JoinSpec {
+/// A minimal join block on `"F_KEY" = "D_KEY"` against one dimension file, no
+/// ordering or cap — the shared fixture the `post_join_limit` /
+/// `post_join_order_by` backward-compatibility tests mutate.
+fn sample_join_spec(storage: ScanStorage) -> JoinSpec {
+    JoinSpec {
         table_root: "s3://warehouse/db/dim".into(),
         files: vec![FileEntry::new("data/dim-00000.parquet", 512)],
         logical_schema: Vec::new(),
@@ -1422,7 +1419,17 @@ fn join_spec_omitting_post_join_limit_deserializes_to_none() {
         post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage,
-    });
+    }
+}
+
+/// `post_join_limit` is additive-optional: a join block serialized without it —
+/// every one written before the field existed — loads as `None`, and a cap that
+/// IS set survives the common/per-shard split the UDF actually receives.
+#[test]
+fn join_spec_omitting_post_join_limit_deserializes_to_none() {
+    let mut spec = sample_spec();
+    let storage = spec.common.storage.clone();
+    spec.common.join = Some(sample_join_spec(storage));
 
     let uncapped = serde_json::to_value(spec.common.join.as_ref().unwrap()).unwrap();
     assert!(
@@ -1450,18 +1457,7 @@ fn join_spec_omitting_post_join_limit_deserializes_to_none() {
 fn join_spec_omitting_post_join_order_by_deserializes_to_empty() {
     let mut spec = sample_spec();
     let storage = spec.common.storage.clone();
-    spec.common.join = Some(JoinSpec {
-        table_root: "s3://warehouse/db/dim".into(),
-        files: vec![FileEntry::new("data/dim-00000.parquet", 512)],
-        logical_schema: Vec::new(),
-        name_mapping: Vec::new(),
-        join_type: JoinType::Inner,
-        condition: "\"F_KEY\" = \"D_KEY\"".into(),
-        post_join_limit: None,
-        post_join_order_by: Vec::new(),
-        partition_columns: Vec::new(),
-        storage,
-    });
+    spec.common.join = Some(sample_join_spec(storage));
 
     let unordered = serde_json::to_value(spec.common.join.as_ref().unwrap()).unwrap();
     assert!(

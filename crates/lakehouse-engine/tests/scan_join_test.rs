@@ -15,6 +15,7 @@
 //! - `join_build_side_is_dimension`
 //! - `join_unreadable_file_errors_without_secrets`
 //! - `join_order_by_limit_emits_bounded_top_n_after_join`
+//! - `join_order_by_limit_plans_as_topk_above_join`
 //! - `join_top_n_ranks_an_empty_string_key_as_null`
 
 mod scan_fixture;
@@ -278,6 +279,31 @@ fn ordered_join_spec(
         .expect("join_spec carries a join block")
         .post_join_order_by = order_by;
     spec
+}
+
+/// A join spec ordering `C_NAME DESC NULLS FIRST` (dimension) then `O_ORDERKEY
+/// ASC NULLS LAST` (fact), capped at 2, backed by on-disk fact/dimension
+/// fixtures under a freshly created `dir_tag`-named temp dir. Shared by the
+/// behavioral (`join_order_by_limit_emits_bounded_top_n_after_join`) and
+/// physical-plan-structure (`join_order_by_limit_plans_as_topk_above_join`)
+/// tests below.
+fn ordered_top_n_join_fixture(dir_tag: &str) -> (std::path::PathBuf, ScanSpec) {
+    let dir = std::env::temp_dir().join(format!("{dir_tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let orders = write_orders(&dir);
+    let customer = write_customer(&dir);
+
+    let mut spec = ordered_join_spec(
+        orders,
+        customer,
+        vec![
+            sort_key("C_NAME", false, false),
+            sort_key("O_ORDERKEY", true, true),
+        ],
+        2,
+    );
+    spec.common.order_by = vec![sort_key("O_ORDERKEY", true, true)];
+    (dir, spec)
 }
 
 fn sort_key(column: &str, ascending: bool, nulls_last: bool) -> SortKey {
@@ -665,26 +691,10 @@ fn join_limit_bounds_joined_output_not_scanned_input() {
 /// NULLS LAST` (fact), capped at 2: of the five joined rows, Carol's order 3 ranks
 /// first and Bob's lower order 2 second. The conflicting shard-invariant
 /// `order_by` would keep orders 1 and 2, so the rows also prove the scan reads its
-/// ordering from the join block alone. The plan folds the ordering and the cap
-/// into one TopK above the join, with neither a sort nor a fetch below it on
-/// either input.
+/// ordering from the join block alone.
 #[test]
 fn join_order_by_limit_emits_bounded_top_n_after_join() {
-    let dir = std::env::temp_dir().join(format!("lh_join_top_n_{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let orders = write_orders(&dir);
-    let customer = write_customer(&dir);
-
-    let mut spec = ordered_join_spec(
-        orders,
-        customer,
-        vec![
-            sort_key("C_NAME", false, false),
-            sort_key("O_ORDERKEY", true, true),
-        ],
-        2,
-    );
-    spec.common.order_by = vec![sort_key("O_ORDERKEY", true, true)];
+    let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n");
 
     let batches = run_join(&spec, &[ExaType::Int64, scan_fixture::varchar()]);
     assert_eq!(
@@ -692,6 +702,15 @@ fn join_order_by_limit_emits_bounded_top_n_after_join() {
         vec![(3, "Carol".to_string()), (2, "Bob".to_string())],
         "the shard must emit its own top-2 under the join block's ordering"
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario: the post-join ordering and cap plan as one TopK above the
+/// `HashJoinExec`, with neither a sort nor a fetch below it on either input.
+#[test]
+fn join_order_by_limit_plans_as_topk_above_join() {
+    let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n_plan");
 
     let plan = block_on(async {
         let session = SessionContext::new_with_config(session_config_for_spec(&spec));

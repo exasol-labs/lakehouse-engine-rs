@@ -461,12 +461,23 @@ fn e2e_broadcast_join_top_n_ranks_empty_string_as_null() {
     for (order_by, expected_rows) in [
         (
             "b.B_LABEL ASC NULLS LAST, o.O_ORDERKEY ASC",
-            Some(vec![
+            vec![
                 ("alpha".to_string(), "3".to_string()),
                 ("alpha".to_string(), "8".to_string()),
-            ]),
+            ],
         ),
-        ("b.B_LABEL DESC NULLS FIRST, o.O_ORDERKEY ASC", None),
+        (
+            "b.B_LABEL DESC NULLS FIRST, o.O_ORDERKEY ASC",
+            // The two blank-labeled dimension rows (custkey 1 and 2) rank first
+            // under DESC NULLS FIRST; their emitted NULL label serializes as the
+            // JSON text "null". Ties on the NULL-ranked label break on
+            // O_ORDERKEY ASC across BOTH blank custkeys, so orders 1 and 2 (not
+            // 1 and 6) survive the top-2 cut.
+            vec![
+                ("null".to_string(), "1".to_string()),
+                ("null".to_string(), "2".to_string()),
+            ],
+        ),
     ] {
         let broadcast_query = blank_label_join_query(VS_NAME, order_by, 2);
         let fallback_query = blank_label_join_query(VS_NAME_LOW, order_by, 2);
@@ -497,18 +508,10 @@ fn e2e_broadcast_join_top_n_ranks_empty_string_as_null() {
             "the broadcast and two-scan plans must return the same rows in the \
              same order:\nbroadcast: {broadcast_rows:?}\nfallback:  {fallback_rows:?}"
         );
-        assert!(
-            fallback_rows.iter().all(|(label, _)| !label.is_empty()),
-            "an emitted empty string must rank as NULL, never surface as a value \
-             here. If the two-scan wrapper ranks it as non-NULL, the nullif rule \
-             is wrong — stop and escalate: {fallback_rows:?}"
+        assert_eq!(
+            broadcast_rows, expected_rows,
+            "order_by={order_by:?} must return the exact top-2 rows: {broadcast_rows:?}"
         );
-        if let Some(expected) = expected_rows {
-            assert_eq!(
-                broadcast_rows, expected,
-                "the ascending top-2 must be the alpha rows of orders 3 and 8: {broadcast_rows:?}"
-            );
-        }
     }
 }
 

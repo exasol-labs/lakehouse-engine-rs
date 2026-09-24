@@ -681,17 +681,14 @@ pub(super) fn build_side_fan_out_sql(
     ))
 }
 
-fn bound_sort_key<'k>(
-    key: &'k ParsedSortKey,
-    projection: &[ProjectionItem],
-) -> Option<&'k SortKey> {
+fn bound_sort_key(key: &ParsedSortKey, projection: &[ProjectionItem]) -> Option<SortKey> {
     let ParsedSortKey::Column(key) = key else {
         return None;
     };
     projection
         .iter()
         .any(|item| matches!(item, ProjectionItem::Column(name) if *name == key.column))
-        .then_some(key)
+        .then(|| key.clone())
 }
 
 struct BroadcastWindowPlacement {
@@ -701,6 +698,24 @@ struct BroadcastWindowPlacement {
     wrapper: Option<(Vec<ParsedSortKey>, Option<u64>, u64)>,
 }
 
+/// Decide where `window`'s row bound lands: the join block (per shard), the
+/// outer merge, an outer wrapper over the merged fan-out, or nowhere at all.
+/// Returns `None` only for [`JoinWindowPlan::ExasolPostProcessed`] — the
+/// caller's signal to fall through to the N-scan wrapper.
+///
+/// Whatever lands in the join block lands only AFTER the node-local join, never
+/// on a side's scanned input, for the reason stated once in
+/// [`JoinSpec::post_join_limit`]. An unordered cap ([`JoinWindowPlan::BareLimit`])
+/// composes per shard, so it rides in the join block AND on the outer merge. An
+/// ordered window ([`JoinWindowPlan::Ordered`]) always rides on an outer wrapper
+/// over the merged fan-out, because only the wrapper sees the global rank. A
+/// zero-offset `ORDER BY … LIMIT n` also puts the same sort keys and `n` in the
+/// join block (`post_join_order_by` + `post_join_limit`), so each shard keeps its
+/// own top-`n` joined rows and the wrapper merges and re-cuts the global top-`n`.
+/// The merge itself carries no `LIMIT`, because a cut before the wrapper's sort
+/// keeps arbitrary rows. Every other ordered shape leaves every shard uncapped
+/// and unsorted: a per-shard `OFFSET` would skip each shard's own first rows,
+/// and an ordering with no `LIMIT` bounds nothing.
 fn place_broadcast_window(
     window: JoinWindowPlan,
     projection: &[ProjectionItem],
@@ -730,7 +745,7 @@ fn place_broadcast_window(
             // to.
             let bound_keys = keys
                 .iter()
-                .map(|key| bound_sort_key(key, projection).cloned())
+                .map(|key| bound_sort_key(key, projection))
                 .collect::<Option<Vec<SortKey>>>()?;
             let (shard_cap, shard_order_by) = match (offset, limit) {
                 (0, Some(n)) => (Some(n), bound_keys),
@@ -766,18 +781,8 @@ fn place_broadcast_window(
 /// credential is scoped to the table it was resolved for, so the two sides' file
 /// lists must never be read through one shared storage value.
 ///
-/// `window` decides where the request's row window lands. Whatever lands in the join
-/// block lands only AFTER the node-local join, never on a side's scanned input, for the
-/// reason stated once in [`JoinSpec::post_join_limit`]. An unordered cap composes per
-/// shard, so it rides in the join block AND on the outer merge. An ordered window always
-/// rides on an outer wrapper over the merged fan-out, because only the wrapper sees the
-/// global rank. A zero-offset `ORDER BY … LIMIT n` also puts the same sort keys and `n`
-/// in the join block (`post_join_order_by` + `post_join_limit`), so each shard keeps its
-/// own top-`n` joined rows and the wrapper merges and re-cuts the global top-`n`. The
-/// merge itself carries no `LIMIT`, because a cut before the wrapper's sort keeps
-/// arbitrary rows. Every other ordered shape leaves every shard uncapped and unsorted: a
-/// per-shard `OFFSET` would skip each shard's own first rows, and an ordering with no
-/// `LIMIT` bounds nothing.
+/// `window` decides where the request's row window lands — see
+/// [`place_broadcast_window`] for the placement policy.
 ///
 /// Each side's `partition_columns` ride in that side's own spec block: the fact
 /// side's in the common blob, the dimension side's in this [`JoinSpec`].
