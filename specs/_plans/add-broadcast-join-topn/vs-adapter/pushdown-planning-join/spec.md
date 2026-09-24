@@ -46,8 +46,9 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 
 * *GIVEN* a `pushdown` request that is broadcast-eligible in every other respect, carrying a non-empty `orderBy` whose every element is a bare `column` node that carries both `isAscending` and `nullsLast` and names a bare-column item of the broadcast projection, and an optional `limit` with `numElements` = `n` and an optional `limit.offset` = `m`
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL serve the request with the broadcast fan-out, MUST NOT route it to the unified unaccelerated fallback (issue #307), and SHALL wrap that fan-out in ONE outer `SELECT <visible projection items> FROM (<fan-out>) ORDER BY <keys>` plus the request's full retained window, rendering the window through the SAME shared limit-and-offset seam every other wrapper uses (` LIMIT n` byte-for-byte for a zero or absent offset, ` LIMIT n OFFSET m` for a non-zero one) and the select list and keys through the SAME shared emitted-identifier and direction/NULL-placement seams the declined row-scan wrapper uses (`vs-adapter/pushdown-planning-topn`), so no column is leaked and no identifier drifts from the fan-out's EMITS clause
+* *THEN* the adapter SHALL serve the request with the broadcast fan-out, MUST NOT route it to the unified unaccelerated fallback (issue #307), and SHALL wrap that fan-out in ONE outer `SELECT <visible projection items> FROM (<fan-out>) ORDER BY <keys>` plus the request's full retained window, rendering the window through the SAME shared limit-and-offset seam every other wrapper uses (` LIMIT n` byte-for-byte for a zero or absent offset, ` LIMIT n OFFSET m` for a non-zero one) and the select list and keys through the SAME shared emitted-identifier and direction/NULL-placement seams the declined row-scan wrapper uses (`vs-adapter/pushdown-planning-topn`)
 * *AND* the fan-out's own outer scalar select SHALL carry NO `LIMIT`, and the shard-invariant common scan spec SHALL carry NO `limit` and NO `order_by` key, so the wrapper is the ONLY place the global ordering and window are applied; what each shard's join block carries is set by this feature's two per-shard ordered-window scenarios
+* *AND* an UNORDERED broadcast request — with or without a bare `LIMIT` — SHALL still be emitted as the bare fan-out with no wrapping select, byte-identically to its pre-change output
 * *AND* the adapter MUST NOT emit a broadcast ordered plan whose outer wrapper renders NO `ORDER BY`: a wrapper that returned the fan-out unchanged SHALL instead decline to the unified unaccelerated fallback rather than return rows that are silently unordered while `ORDER_BY_COLUMN` is advertised
 * *AND* the returned result SHALL equal the same `ORDER BY … [LIMIT n [OFFSET m]]` evaluated over the same inner join on a single node
 <!-- /DELTA:CHANGED -->
@@ -60,15 +61,6 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 * *THEN* the shard-invariant common scan spec's JOIN BLOCK SHALL carry a post-join ordering equal to the request's sort keys, in pushed order, each with its column, direction, and NULL placement, together with a post-join cap of `n`, so every fact-shard invocation emits at most `n` joined rows, its own top-ranked ones (issue #309)
 * *AND* the adapter MUST NOT divide `n` across shards, because every row of the global top-n can come from one shard
 * *AND* a request carrying `limit.offset` EQUAL TO ZERO SHALL produce the same SQL as a request carrying no `offset` key, so the eligibility test is a non-zero test and not a key-presence test
+* *AND* a request with no `limit` or a non-zero offset SHALL carry NEITHER post-join field, so every shard emits its complete local joined output for the wrapper to sort and window
 * *AND* the returned result SHALL carry the same sort-key values, in the same order, as the same `ORDER BY … LIMIT n` evaluated over the same inner join on a single node, and every returned row SHALL be a row of that join
-<!-- /DELTA:NEW -->
-
-<!-- DELTA:NEW -->
-### Scenario: An ordered broadcast window with a non-zero offset or no LIMIT leaves every shard unbounded
-
-* *GIVEN* a `pushdown` request that the ordered broadcast wrapper serves, carrying either no `limit` or a `limit` with a non-zero `limit.offset` = `m`
-* *WHEN* Exasol sends the `pushdown` request
-* *THEN* the shard-invariant common scan spec's join block SHALL carry NO post-join ordering and NO post-join cap, so every shard emits its complete local joined output
-* *AND* the wrapper SHALL apply the whole `ORDER BY <keys> [LIMIT n OFFSET m]` window over the complete merged fan-out
-* *AND* the returned result SHALL equal the same ordered, windowed query evaluated over the same inner join on a single node
 <!-- /DELTA:NEW -->
