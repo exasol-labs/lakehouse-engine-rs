@@ -136,6 +136,7 @@ pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandl
     seed_star_schema(catalog_url, warehouse).await?;
     seed_multi_table_join_extension(catalog_url, warehouse).await?;
     seed_char_pad_table(catalog_url, warehouse).await?;
+    seed_blank_label_table(catalog_url, warehouse).await?;
     Ok(events_handle)
 }
 
@@ -1340,6 +1341,64 @@ pub async fn seed_multi_table_join_extension(catalog_url: &str, warehouse: &str)
     )
     .await
     .context("seed fact_lineitem table")?;
+    Ok(())
+}
+
+/// Table name for the broadcast top-N empty-string-ranks-as-NULL E2E tests
+/// (#309): joins against `fact_orders` on `B_CUSTKEY = O_CUSTKEY`.
+pub const E2E_BLANK_LABEL_TABLE: &str = "dim_blank_label";
+fn make_blank_label_batch() -> RecordBatch {
+    let labels = ["", "", "alpha", "bravo", "charlie"];
+    let keys: Vec<i64> = (1..=labels.len() as i64).collect();
+
+    let schema = Arc::new(ArrowSchema::new(vec![
+        Field::new("B_CUSTKEY", DataType::Int64, false),
+        Field::new("B_LABEL", DataType::Utf8, false),
+    ]));
+
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(keys)),
+            Arc::new(StringArray::from(labels.to_vec())),
+        ],
+    )
+    .expect("dim_blank_label RecordBatch construction is infallible")
+}
+
+/// Seed `dim_blank_label` into the `e2e_lakehouse` namespace: a small dimension
+/// table whose label column carries two empty strings ahead of three ascending
+/// values (`"alpha"`, `"bravo"`, `"charlie"`), all in one file, for the broadcast
+/// top-N empty-string-ranks-as-NULL E2E tests (#309). Idempotent.
+pub async fn seed_blank_label_table(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-blank-label").await?;
+    let ns = NamespaceIdent::new(E2E_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for dim_blank_label")?
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "B_CUSTKEY", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::required(2, "B_LABEL", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build dim_blank_label Iceberg schema")?;
+    create_and_append_files(
+        &catalog,
+        E2E_NAMESPACE,
+        E2E_BLANK_LABEL_TABLE,
+        schema,
+        vec![vec![make_blank_label_batch()]],
+    )
+    .await
+    .context("seed dim_blank_label table")?;
     Ok(())
 }
 

@@ -635,6 +635,7 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         join_type: JoinType::Inner,
         condition: r#"("C_CUSTKEY" = "O_CUSTKEY")"#.to_string(),
         post_join_limit: None,
+        post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage: ScanStorage::Inline(test_storage()),
     };

@@ -136,6 +136,7 @@ fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
         join_type: JoinType::Inner,
         condition: r#""F_KEY" = "D_KEY""#.into(),
         post_join_limit: None,
+        post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage: join_spec.common.storage.clone(),
     });

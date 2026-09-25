@@ -458,9 +458,10 @@ pub(in super::super) enum JoinWindowPlan {
     /// A `limit` with no ordering, so the cap composes per shard: each shard may
     /// truncate its own joined output at `n` and the merge truncate again at `n`.
     BareLimit(u64),
-    /// A bare-column ordering, served by an outer wrapper over the merged fan-out.
-    /// The window rides on that wrapper, never per shard: a per-shard `OFFSET`
-    /// would skip each shard's OWN first rows.
+    /// A bare-column ordering: one or more sort keys, an optional `limit`, and the
+    /// `offset`, parsed from the request's `orderBy` array. `place_broadcast_window`
+    /// (`sql_builders.rs`) decides where this window lands — the join block, an
+    /// outer wrapper, or both.
     Ordered {
         keys: Vec<ParsedSortKey>,
         limit: Option<u64>,

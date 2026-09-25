@@ -13,7 +13,10 @@ use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::spec::{ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
-use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
+use crate::types::mapping::{
+    ExaTypeClass, arrow_to_exasol_type, classify_exa_type, needs_json_fallback,
+    needs_nested_json_rendering,
+};
 
 use super::raw_scan::{NESTED_JSON_RENDER_UDF_NAME, delete_path_read_limiter, register_file_list};
 use super::sql_support::{build_alias_items, quote_ident};
@@ -29,13 +32,16 @@ const JOIN_DIM_TABLE: &str = "dim_scan";
 /// dimension file list (`spec.common.join.files`) as two tables in the SAME session, each
 /// wrapped in an aliased sub-SELECT exposing Exasol-facing uppercase column names,
 /// then executes `SELECT <projection> FROM (dim) INNER JOIN (fact) ON <condition>
-/// [WHERE <filter>] [LIMIT n]` and streams the joined batches through [`emit_stream`]
-/// (one fetched, emitted, dropped before the next — never collect-all).
+/// [WHERE <filter>] [ORDER BY <post-join keys>] [LIMIT n]` and streams the joined
+/// batches through [`emit_stream`] (one fetched, emitted, dropped before the next —
+/// never collect-all). The ordering and the cap come from the join block and bound the
+/// JOINED output only; paired, they keep this shard's own top-`n` (see `build_join_sql`).
 ///
 /// The bounded dimension side is placed on the LEFT of the join and join reordering
 /// is disabled (see [`session_config_for_spec`]), so the dimension is deterministically
 /// the hash-join build side regardless of table statistics. Read/deserialization
 /// errors for EITHER side route through [`classify_scan_error`] against the UNION of
+/// both sides' secret values, so neither side's credential can reach the error text.
 pub async fn run_join_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
@@ -138,10 +144,18 @@ async fn register_join_tables(
 /// The dimension side is placed on the LEFT so it is the hash-join build side (see
 /// [`run_join_scan_with_session`]). Output column order follows `spec.common.projection`
 /// (positionally aligned with the call-site `EMITS (...)` declaration); an empty
-/// projection expands to every column, dimension columns first. The row cap comes from
-/// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit)
-/// and is applied HERE — after the join and its
-/// `WHERE` — never to either side's registered scan; see that field's doc.
+/// projection expands to every column, dimension columns first. The ordering comes from
+/// [`JoinSpec::post_join_order_by`](crate::scan::spec::JoinSpec::post_join_order_by)
+/// and the row cap from
+/// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit); both
+/// are applied HERE — `ORDER BY` then `LIMIT`, after the join and its `WHERE` — never
+/// to either side's registered scan, and together they plan as a TopK retaining only
+/// `n` rows. See those fields' docs.
+///
+/// Each sort key ranks by the value this shard EMITS for its column, never the native
+/// value it reads, because the adapter's Exasol-side wrapper merges and ranks the
+/// emitted rows: a shard ranking any other value can cut a row the wrapper's global
+/// top-`n` needs (see `render_join_sort_target`).
 ///
 /// The JSON-render scalar function is registered here so `render_join_select_item`
 /// can name it in the generated select list.
@@ -210,6 +224,16 @@ async fn build_join_sql(
         sql.push_str(filter);
     }
 
+    if !join.post_join_order_by.is_empty() {
+        let elements: Vec<String> = join
+            .post_join_order_by
+            .iter()
+            .map(|key| key.render_ordered(&render_join_sort_target(&key.column, &combined)))
+            .collect();
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&elements.join(", "));
+    }
+
     if let Some(limit) = join.post_join_limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
@@ -246,22 +270,53 @@ fn render_join_select_item(
     match item {
         ProjectionItem::Expr { expr } => expr.clone(),
         ProjectionItem::Column(col_name) => {
-            let upper = col_name.to_uppercase();
-            let data_type = combined
-                .iter()
-                .find(|(name, _)| *name == upper)
-                .map(|(_, dt)| dt.clone());
-            match data_type {
-                Some(dt) if needs_nested_json_rendering(&dt) => {
-                    format!("{NESTED_JSON_RENDER_UDF_NAME}({})", quote_ident(&upper))
+            let ident = quote_ident(&col_name.to_uppercase());
+            match combined_type(col_name, combined) {
+                Some(dt) if needs_nested_json_rendering(dt) => {
+                    format!("{NESTED_JSON_RENDER_UDF_NAME}({ident})")
                 }
-                Some(dt) if needs_json_fallback(&dt) => {
-                    format!("CAST({} AS VARCHAR)", quote_ident(&upper))
-                }
-                _ => quote_ident(&upper),
+                Some(dt) if needs_json_fallback(dt) => format!("CAST({ident} AS VARCHAR)"),
+                _ => ident,
             }
         }
     }
+}
+
+/// Render the ordering target of one post-join sort key: the value the shard EMITS
+/// for `column`, which is what the adapter's Exasol-side wrapper ranks. Starts from
+/// the column's [`render_join_select_item`] output, so a column emitted as JSON or
+/// `CAST(... AS VARCHAR)` text ranks by that text. A value Exasol receives as a
+/// character type (per `arrow_to_exasol_type`) is wrapped in `nullif(<expr>, '')`
+/// because Exasol's VARCHAR domain has no empty string, so an emitted `''` arrives
+/// as NULL. A `Float32`/`Float64` value maps `NaN` to NULL because `emit_batch`
+/// emits a stored `NaN` as NULL (#246).
+fn render_join_sort_target(
+    column: &str,
+    combined: &[(String, arrow::datatypes::DataType)],
+) -> String {
+    use arrow::datatypes::DataType;
+
+    let emitted = render_join_select_item(&ProjectionItem::Column(column.to_string()), combined);
+    match combined_type(column, combined) {
+        Some(DataType::Float32 | DataType::Float64) => {
+            format!("CASE WHEN isnan({emitted}) THEN NULL ELSE {emitted} END")
+        }
+        Some(dt) if classify_exa_type(&arrow_to_exasol_type(dt)) == ExaTypeClass::Character => {
+            format!("nullif({emitted}, '')")
+        }
+        _ => emitted,
+    }
+}
+
+fn combined_type<'a>(
+    column: &str,
+    combined: &'a [(String, arrow::datatypes::DataType)],
+) -> Option<&'a arrow::datatypes::DataType> {
+    let upper = column.to_uppercase();
+    combined
+        .iter()
+        .find(|(name, _)| *name == upper)
+        .map(|(_, dt)| dt)
 }
 
 /// Build the physical plan for the two-table inner equi-join, registering both
