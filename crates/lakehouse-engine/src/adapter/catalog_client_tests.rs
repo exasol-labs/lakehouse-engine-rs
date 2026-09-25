@@ -54,6 +54,7 @@ fn both_kinds_share_one_listing_pipeline() {
             storage_location: None,
             format,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
             columns: vec![CatalogColumn {
                 name: "order_id".to_string(),
                 source_type,
@@ -72,6 +73,7 @@ fn both_kinds_share_one_listing_pipeline() {
             type_name: "LONG".to_string(),
             precision: 0,
             scale: 0,
+            type_json: None,
         },
     );
 
@@ -131,6 +133,7 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
             storage_location: None,
             format: TableFormat::Iceberg,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
             columns: vec![
                 CatalogColumn {
                     name: "ts".to_string(),
@@ -144,6 +147,7 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
                         type_name: "TIMESTAMP".to_string(),
                         precision: 0,
                         scale: 0,
+                        type_json: None,
                     },
                 },
             ],

@@ -130,6 +130,34 @@ pub async fn resolve_parquet_directory(
     })
 }
 
+/// The listing answer, for a caller whose catalog already declares the schema and the partition
+/// columns: the same data files [`resolve_parquet_directory`] selects, with no footer read.
+///
+/// Each file's values carry every `partition_columns` entry, keyed by the caller's spelling and
+/// filled from the deepest path segment whose key equals it under the uppercase fold; a segment
+/// naming no declared column is a plain directory. `keep` runs on those values.
+pub async fn list_parquet_files(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &StorePath,
+    partition_columns: &[String],
+    keep: &PartitionKeepPredicate,
+) -> Result<Vec<ParquetFile>, UdfError> {
+    let raw_files = list_data_files(store, prefix, true).await?;
+    Ok(raw_files
+        .into_iter()
+        .filter_map(|raw| {
+            let partition_values =
+                fill_declared_partition_values(&raw.partition_segments, partition_columns);
+            keep(&partition_values).then_some(ParquetFile {
+                path: raw.path,
+                size: raw.size,
+                partition_values,
+                footer: None,
+            })
+        })
+        .collect())
+}
+
 /// A listed file with its own raw partition segments, before filling against the declared keys.
 struct RawFile {
     path: StorePath,
@@ -195,23 +223,14 @@ fn data_file_segments(location: &StorePath, prefix: &StorePath) -> Option<Vec<St
     Some(segments)
 }
 
-/// A key repeated within one path takes its deepest value but keeps its first position.
+/// Every `key=value` segment in path order, repeats included; the fill step picks the deepest.
 fn parse_partition_segments(directories: &[String]) -> Vec<(String, Option<String>)> {
-    let mut ordered: Vec<(String, Option<String>)> = Vec::new();
-    for segment in directories {
-        let Some((key, value)) = segment.split_once('=') else {
-            continue;
-        };
-        if key.is_empty() {
-            continue;
-        }
-        let decoded = decode_partition_value(value);
-        match ordered.iter_mut().find(|(existing, _)| existing == key) {
-            Some((_, existing_value)) => *existing_value = decoded,
-            None => ordered.push((key.to_string(), decoded)),
-        }
-    }
-    ordered
+    directories
+        .iter()
+        .filter_map(|segment| segment.split_once('='))
+        .filter(|(key, _)| !key.is_empty())
+        .map(|(key, value)| (key.to_string(), decode_partition_value(value)))
+        .collect()
 }
 
 fn decode_partition_value(raw: &str) -> Option<String> {
@@ -279,9 +298,26 @@ fn fill_partition_values(
         .map(|key| {
             let value = raw
                 .iter()
-                .find(|(candidate, _)| candidate == key)
+                .rfind(|(candidate, _)| candidate == key)
                 .and_then(|(_, value)| value.clone());
             (key.clone(), value)
+        })
+        .collect()
+}
+
+fn fill_declared_partition_values(
+    raw: &[(String, Option<String>)],
+    declared_columns: &[String],
+) -> BTreeMap<String, Option<String>> {
+    declared_columns
+        .iter()
+        .map(|column| {
+            let folded = column.to_uppercase();
+            let value = raw
+                .iter()
+                .rfind(|(candidate, _)| candidate.to_uppercase() == folded)
+                .and_then(|(_, value)| value.clone());
+            (column.clone(), value)
         })
         .collect()
 }

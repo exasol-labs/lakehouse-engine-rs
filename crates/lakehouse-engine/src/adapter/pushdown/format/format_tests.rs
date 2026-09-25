@@ -44,6 +44,7 @@ fn unity_table(format: TableFormat) -> CatalogTable {
         storage_location: Some("s3://bucket/cat/sch/orders".into()),
         format,
         vended_credential_key: Some("table-id-1".into()),
+        partition_columns: Vec::new(),
         columns: Vec::new(),
     }
 }
@@ -51,19 +52,19 @@ fn unity_table(format: TableFormat) -> CatalogTable {
 /// Scenario: The format reader is selected at one site and refuses a mismatched
 /// pairing.
 ///
-/// A Unity Catalog table whose loaded metadata reports a non-Delta format is
-/// refused by name, naming the reported format — never routed into the Delta
-/// reader, where it would surface as a missing transaction log instead of a
-/// format refusal.
+/// A Unity Catalog table whose loaded metadata reports Iceberg is refused by name,
+/// naming the reported format — never routed into a reader of another format,
+/// where it would surface as a missing log or a wrong schema instead of a format
+/// refusal.
 #[test]
-fn format_reader_refuses_a_non_delta_table_under_the_unity_source() {
+fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     let creds = offline_sigv4_creds();
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
     let table = unity_table(TableFormat::Iceberg);
     let storage = sample_storage();
 
     let err = format_reader(
-        ScanSource::UnityDelta {
+        ScanSource::Unity {
             session: &session,
             table: &table,
         },
@@ -106,7 +107,7 @@ fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_t
     let storage = sample_storage();
 
     let selected = format_reader(
-        ScanSource::UnityDelta {
+        ScanSource::Unity {
             session: &session,
             table: &table,
         },
@@ -120,6 +121,34 @@ fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_t
     assert!(
         selected.is_ok(),
         "a Unity Catalog table reporting Delta must select its reader without issuing a \
+         request"
+    );
+}
+
+/// Scenario: The format reader is selected at one site and refuses a mismatched pairing
+#[test]
+fn format_reader_selects_the_unity_parquet_reader_for_a_parquet_table_without_contacting_the_catalog()
+ {
+    let creds = offline_sigv4_creds();
+    let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
+    let table = unity_table(TableFormat::Parquet);
+    let storage = sample_storage();
+
+    let selected = format_reader(
+        ScanSource::Unity {
+            session: &session,
+            table: &table,
+        },
+        &ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    );
+
+    assert!(
+        selected.is_ok(),
+        "a Unity Catalog table reporting Parquet must select its reader without issuing a \
          request"
     );
 }

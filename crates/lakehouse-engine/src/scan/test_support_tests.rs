@@ -1,7 +1,33 @@
-use crate::scan::ResolvedScanStorage;
+use crate::scan::field_id_projection::build_logical_arrow_schema;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, ScanSpec, ScanStorage, StorageBackend, StorageProps,
+    CommonScanSpec, FileEntry, LogicalField, ScanSpec, ScanStorage, StorageBackend, StorageProps,
 };
+use crate::scan::{FieldIdExprAdapterFactory, FieldIdResolution, ResolvedScanStorage};
+use arrow::array::ArrayRef;
+use arrow::datatypes::{Field, Schema, SchemaRef};
+use arrow::record_batch::RecordBatch;
+use parquet::arrow::ArrowWriter;
+use std::path::Path;
+use std::sync::Arc;
+
+/// Write one single-batch Parquet file of non-nullable columns, returning its `file://` URL.
+pub(super) fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> String {
+    let schema = Arc::new(Schema::new(
+        columns
+            .iter()
+            .map(|(name, array)| Field::new(*name, array.data_type().clone(), false))
+            .collect::<Vec<_>>(),
+    ));
+    let arrays: Vec<ArrayRef> = columns.into_iter().map(|(_, array)| array).collect();
+    let file = std::fs::File::create(path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("arrow writer");
+    let batch = RecordBatch::try_new(schema, arrays).expect("record batch");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+    url::Url::from_file_path(path)
+        .expect("absolute path")
+        .to_string()
+}
 
 pub(super) fn local_file_size(file_url: &str) -> u64 {
     let path = url::Url::parse(file_url)
@@ -9,6 +35,23 @@ pub(super) fn local_file_size(file_url: &str) -> u64 {
         .to_file_path()
         .expect("file:// URL");
     std::fs::metadata(path).expect("stat local parquet").len()
+}
+
+/// The logical file schema and column-binding adapter factory the raw scan installs for an
+/// unpartitioned table declaring `logical_schema` with no name mapping.
+pub(crate) fn column_binding_for(
+    logical_schema: &[LogicalField],
+    table_root: &str,
+) -> (SchemaRef, FieldIdExprAdapterFactory) {
+    let resolution = FieldIdResolution::for_logical_schema(logical_schema, &[])
+        .expect("the logical schema's initial defaults reconstruct");
+    (
+        build_logical_arrow_schema(logical_schema),
+        FieldIdExprAdapterFactory {
+            resolution,
+            table_root: table_root.to_string(),
+        },
+    )
 }
 
 pub(super) fn minimal_spec() -> ScanSpec {

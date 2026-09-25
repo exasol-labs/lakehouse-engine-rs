@@ -26,12 +26,15 @@ mod filter_json;
 mod iceberg;
 mod parquet_format_reader;
 mod partition_predicate;
+mod unity_parquet_format_reader;
+mod unity_table_storage;
 
 use delta_format_reader::DeltaFormatReader;
 use iceberg::IcebergFormatReader;
 #[cfg(test)]
 pub(crate) use iceberg::build_logical_schema;
 use parquet_format_reader::ParquetFormatReader;
+use unity_parquet_format_reader::UnityParquetFormatReader;
 
 #[cfg(test)]
 #[path = "format_tests.rs"]
@@ -106,9 +109,9 @@ pub enum ScanSource<'a> {
         session: &'a CatalogSession,
         catalog_props: &'a CatalogProps,
     },
-    /// A Delta table in a Unity Catalog, paired with the metadata that catalog
-    /// loaded for it — whose format tag [`format_reader`] checks.
-    UnityDelta {
+    /// A table in a Unity Catalog, paired with the metadata that catalog loaded for
+    /// it — whose format tag [`format_reader`] matches to select the reader.
+    Unity {
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
     },
@@ -137,14 +140,14 @@ pub struct ConnectionStorage<'a> {
 
 /// The reader that plans `source`'s scan.
 ///
-/// The ONE site that matches a [`ScanSource`], so a third table format or a third
+/// The ONE site that matches a [`ScanSource`], so a fourth table format or a fourth
 /// catalog kind is a compile error here rather than a silent fall-through. It
 /// matches the source rather than the catalog kind, which is what leaves that
 /// enum's frozen match-site baseline intact.
 ///
-/// The Unity Catalog source's format tag is checked HERE because the single-table
-/// load applies no listing filter: a non-Delta table routed into the Delta reader
-/// would surface as a missing transaction log instead of a format refusal.
+/// The Unity Catalog source's format tag is matched HERE because the single-table
+/// load applies no listing filter: a table routed into another format's reader
+/// would surface as a missing log or a wrong schema instead of a format refusal.
 ///
 /// `connection` is the CONNECTION's static storage decision this source reads
 /// through: the static storage backend, resolved credentials, and the resolved
@@ -162,17 +165,18 @@ pub fn format_reader<'a>(
             catalog_props,
             connection: *connection,
         })),
-        ScanSource::UnityDelta { session, table } => {
-            if table.format != TableFormat::Delta {
-                return Err(UdfError::User(format!(
-                    "Unity Catalog table {} reports the {:?} table format, which the Delta \
-                     reader this source selects cannot plan",
-                    catalog_identifier_string(&table.ident),
-                    table.format
-                )));
-            }
-            Ok(Box::new(DeltaFormatReader::new(session, table, connection)))
-        }
+        ScanSource::Unity { session, table } => match table.format {
+            TableFormat::Delta => Ok(Box::new(DeltaFormatReader::new(session, table, connection))),
+            TableFormat::Parquet => Ok(Box::new(UnityParquetFormatReader::new(
+                session, table, connection,
+            ))),
+            TableFormat::Iceberg => Err(UdfError::User(format!(
+                "Unity Catalog table {} reports the {:?} table format, which no Unity Catalog \
+                 reader plans",
+                catalog_identifier_string(&table.ident),
+                table.format
+            ))),
+        },
         ScanSource::DirectParquet {
             store,
             table_root,

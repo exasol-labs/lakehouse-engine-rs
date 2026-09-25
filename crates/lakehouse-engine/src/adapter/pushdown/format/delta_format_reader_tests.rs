@@ -3,7 +3,7 @@ use crate::adapter::pushdown::test_support::{
     delta_commit_zero_key, delta_object_endpoint, sample_storage,
 };
 use crate::scan::spec::StorageProps;
-use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, TableFormat};
+use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, ConnectionCreds, TableFormat};
 
 /// A closed port: any credential request the reader issued would fail loudly with a
 /// transport error, which is distinguishable from every refusal asserted here.
@@ -49,6 +49,7 @@ fn delta_table(
         storage_location: storage_location.map(str::to_string),
         format: TableFormat::Delta,
         vended_credential_key: vended_credential_key.map(str::to_string),
+        partition_columns: Vec::new(),
         columns: Vec::new(),
     }
 }
@@ -181,41 +182,6 @@ fn closed_port_storage() -> StorageBackend {
     })
 }
 
-/// Every effective-storage secret is masked, and only the secrets are: redaction is
-/// the single guard between an object-store error that echoes a credential verbatim
-/// and the text Exasol surfaces, so it must mask each value it was handed while
-/// leaving the rest of the message readable enough to act on.
-#[test]
-fn redacted_masks_every_effective_storage_secret_in_a_raised_error() {
-    let secrets = [SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY];
-    let raised = UdfError::User(format!(
-        "failed to resolve the current Delta version for table root '{DELTA_TABLE_ROOT}': \
-         signature mismatch for {SENTINEL_ACCESS_KEY} signed with {SENTINEL_SECRET_KEY}"
-    ));
-
-    let message = match redacted(raised, &secrets) {
-        UdfError::User(message) => message,
-        other => panic!("redaction must answer a user error, got {other:?}"),
-    };
-
-    assert!(
-        !message.contains(SENTINEL_ACCESS_KEY),
-        "the access key must not survive redaction: {message}"
-    );
-    assert!(
-        !message.contains(SENTINEL_SECRET_KEY),
-        "the secret key must not survive redaction: {message}"
-    );
-    assert!(
-        message.starts_with("failed to resolve the current Delta version"),
-        "the non-secret text must survive verbatim: {message}"
-    );
-    assert!(
-        message.contains(DELTA_TABLE_ROOT),
-        "the table root the read failed on must survive: {message}"
-    );
-}
-
 /// Scenario: Delta planning resolves its storage credential through the table's own
 /// catalog.
 ///
@@ -276,13 +242,17 @@ fn a_table_whose_every_column_is_refused_is_refused_as_a_whole() {
         refused("variant_col", "variant renders no meaningful value"),
     ];
 
-    let error = ensure_table_has_a_mappable_column(&[], &refused_columns)
+    let error = ensure_table_has_a_mappable_column(&[], &refused_columns, "Delta")
         .expect_err("a table with zero mappable columns must be refused as a whole");
 
     let message = match error {
         UdfError::User(message) => message,
         other => panic!("every refusal must be a user error, got {other:?}"),
     };
+    assert!(
+        message.starts_with("Delta table has no mappable column; every column is refused: "),
+        "message was: {message}"
+    );
     assert!(message.contains("binary_col"), "message was: {message}");
     assert!(
         message.contains("binary is refused, see #351"),
@@ -310,7 +280,7 @@ fn a_table_with_at_least_one_mappable_column_is_not_refused_as_a_whole() {
     }];
     let refused_columns = vec![refused("binary_col", "binary is refused, see #351")];
 
-    ensure_table_has_a_mappable_column(&logical_schema, &refused_columns)
+    ensure_table_has_a_mappable_column(&logical_schema, &refused_columns, "Delta")
         .expect("a table with a mappable column must not be refused as a whole");
 }
 
@@ -318,7 +288,7 @@ fn a_table_with_at_least_one_mappable_column_is_not_refused_as_a_whole() {
 /// no refused column to justify a whole-table refusal.
 #[test]
 fn a_table_with_no_columns_and_no_refusals_is_not_refused_as_a_whole() {
-    ensure_table_has_a_mappable_column(&[], &[])
+    ensure_table_has_a_mappable_column(&[], &[], "Delta")
         .expect("an empty schema with nothing refused must not be refused as a whole");
 }
 

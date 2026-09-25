@@ -31,6 +31,7 @@ impl FixedCatalogClient {
             storage_location: Some("s3://warehouse/orders".to_string()),
             format: TableFormat::Iceberg,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
             columns: vec![CatalogColumn {
                 name: "order_id".to_string(),
                 source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
@@ -48,12 +49,14 @@ impl FixedCatalogClient {
             storage_location: Some("s3://warehouse/payments".to_string()),
             format: TableFormat::Delta,
             vended_credential_key: Some("payments-uuid".to_string()),
+            partition_columns: Vec::new(),
             columns: vec![CatalogColumn {
                 name: "total".to_string(),
                 source_type: ColumnSourceType::Unity {
                     type_name: "DECIMAL".to_string(),
                     precision: 10,
                     scale: 2,
+                    type_json: None,
                 },
             }],
         }
@@ -227,6 +230,7 @@ async fn a_unity_decimal_column_carries_its_precision_and_scale() {
             type_name,
             precision,
             scale,
+            ..
         } => assert_eq!((type_name.as_str(), *precision, *scale), ("DECIMAL", 10, 2)),
         ColumnSourceType::Iceberg(ty) => panic!("expected a Unity source type, got iceberg {ty}"),
         ColumnSourceType::Parquet(tag) => {
@@ -507,6 +511,12 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
         assert_eq!(
             table.vended_credential_key, None,
             "{} must carry no vending key",
+            table.ident.name
+        );
+        assert_eq!(
+            table.partition_columns,
+            Vec::<String>::new(),
+            "{} must carry no partition columns",
             table.ident.name
         );
     }

@@ -162,9 +162,11 @@ fn both_clients_are_catalog_client_trait_objects() {
 /// The shared trait and its catalog-neutral metadata types are constructible
 /// from outside the crate, while the Unity Catalog wire types stay hidden —
 /// never re-exported and never `pub`-declared — so the engine consumes only the
-/// neutral shape. `CatalogTable` is constructed with its FORMAT tag and its
-/// credential-vending key named explicitly, so dropping either field or narrowing
-/// `TableFormat` below `pub` is a build failure here rather than a silent gap.
+/// neutral shape. `CatalogTable` is constructed with its FORMAT tag, its
+/// credential-vending key, and its partition columns named explicitly, and its
+/// Unity column with its `type_json` named explicitly, so dropping any of these
+/// fields or narrowing `TableFormat` below `pub` is a build failure here rather
+/// than a silent gap.
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     let ident = CatalogTableIdent {
@@ -177,6 +179,7 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
             type_name: "int".into(),
             precision: 0,
             scale: 0,
+            type_json: Some("{\"type\":\"integer\"}".into()),
         },
     };
     let table = CatalogTable {
@@ -185,9 +188,16 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         storage_location: None,
         format: TableFormat::Delta,
         vended_credential_key: Some("opaque-vending-key".into()),
+        partition_columns: vec!["c".into()],
         columns: vec![column],
     };
     assert_eq!(table.format, TableFormat::Delta);
+    assert_eq!(table.partition_columns, vec!["c".to_string()]);
+    if let ColumnSourceType::Unity { type_json, .. } = &table.columns[0].source_type {
+        assert_eq!(type_json.as_deref(), Some("{\"type\":\"integer\"}"));
+    } else {
+        panic!("expected a Unity source type");
+    }
     assert_ne!(
         TableFormat::Iceberg,
         TableFormat::Delta,
@@ -262,6 +272,7 @@ fn added_neutral_variants_are_reachable_from_outside_the_crate() {
             storage_location: None,
             format: TableFormat::Parquet,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
             columns: vec![column],
         }],
         skipped: vec![SkippedTable {

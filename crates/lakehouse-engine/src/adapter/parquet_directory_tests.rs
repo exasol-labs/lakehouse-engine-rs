@@ -1005,3 +1005,94 @@ fn the_store_prefix_is_the_percent_decoded_path_below_the_store_root() {
         "the refusal must name the value it rejected: {err}"
     );
 }
+
+fn values(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
+        .collect()
+}
+
+/// Scenario: The listing answer serves a caller that declares its own partition columns
+#[tokio::test]
+async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_footer() {
+    let probe = store_with(
+        &[
+            "year=2024/region=eu/a.parquet",
+            "Year=2025/b.parquet",
+            "other=x/c.parquet",
+            "year=1999/YEAR=2000/year=2001/d.parquet",
+            "e.parquet",
+            "_SUCCESS",
+        ],
+        b"not a parquet file",
+    )
+    .await;
+    let store = Arc::clone(&probe) as Arc<dyn ObjectStore>;
+    let declared = ["year".to_string(), "region".to_string()];
+
+    let files = list_parquet_files(&store, &root(), &declared, &|_| true)
+        .await
+        .expect("a listing that reads no footer succeeds over unreadable bodies");
+
+    let listed: Vec<(String, BTreeMap<String, Option<String>>)> = files
+        .iter()
+        .map(|file| {
+            (
+                file.path.as_ref().to_string(),
+                file.partition_values.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        vec![
+            (
+                under_root("Year=2025/b.parquet"),
+                values(&[("year", Some("2025")), ("region", None)]),
+            ),
+            (
+                under_root("e.parquet"),
+                values(&[("year", None), ("region", None)]),
+            ),
+            (
+                under_root("other=x/c.parquet"),
+                values(&[("year", None), ("region", None)]),
+            ),
+            (
+                under_root("year=1999/YEAR=2000/year=2001/d.parquet"),
+                values(&[("year", Some("2001")), ("region", None)]),
+            ),
+            (
+                under_root("year=2024/region=eu/a.parquet"),
+                values(&[("year", Some("2024")), ("region", Some("eu"))]),
+            ),
+        ],
+        "every declared column is keyed by the caller's spelling and filled from the deepest \
+         segment equal to it under the uppercase fold; an undeclared segment contributes nothing"
+    );
+    assert!(
+        files
+            .iter()
+            .all(|file| file.size == b"not a parquet file".len() as u64 && file.footer.is_none()),
+        "each size comes from the listing and no footer is attached"
+    );
+    assert!(
+        probe.files_read().is_empty(),
+        "the listing answer reads no object: {:?}",
+        probe.reads()
+    );
+
+    let kept = list_parquet_files(&store, &root(), &declared, &|values| {
+        values.get("region").and_then(|value| value.as_deref()) == Some("eu")
+    })
+    .await
+    .expect("a narrowing keep predicate resolves");
+    assert_eq!(
+        kept.iter()
+            .map(|file| file.path.as_ref().to_string())
+            .collect::<Vec<_>>(),
+        rooted(&["year=2024/region=eu/a.parquet"]),
+        "the keep predicate runs on the filled values before the files are returned"
+    );
+}

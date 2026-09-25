@@ -43,10 +43,13 @@ pub enum ColumnSourceType {
     Iceberg(iceberg::spec::Type),
     /// A Unity Catalog Spark type, fully parameterized: `precision` and `scale`
     /// carry the `DECIMAL(p, s)` arguments and are `0` for a type taking none.
+    /// `type_json` is the column's Spark `StructField` JSON representation,
+    /// absent when the catalog did not report one.
     Unity {
         type_name: String,
         precision: u32,
         scale: u32,
+        type_json: Option<String>,
     },
     /// A tag string of the engine's scan-spec vocabulary, not an Arrow `DataType`: this crate's manifest forbids declaring `arrow`.
     Parquet(String),
@@ -91,6 +94,10 @@ pub struct CatalogTable {
     /// one fails naming the table rather than requesting against an empty scope.
     /// An empty or whitespace-only key is treated the same as an absent one.
     pub vended_credential_key: Option<String>,
+    /// Names of the columns the catalog declares as partition columns, in the
+    /// catalog's own order. Empty for a catalog kind that does not declare
+    /// partition columns itself.
+    pub partition_columns: Vec<String>,
     pub columns: Vec<CatalogColumn>,
 }
 
@@ -256,6 +263,7 @@ impl IcebergRestCatalogClient {
             storage_location: Some(storage_location),
             format: TableFormat::Iceberg,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
             columns,
         })
     }

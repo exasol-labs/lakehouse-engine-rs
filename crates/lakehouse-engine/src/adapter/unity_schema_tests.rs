@@ -208,6 +208,17 @@ fn table_entry_typed(name: &str, table_type: &str, columns: Vec<Json>) -> Json {
     })
 }
 
+/// An EXTERNAL Parquet base table list entry.
+fn parquet_table_entry(name: &str, columns: Vec<Json>) -> Json {
+    json!({
+        "name": name,
+        "table_type": "EXTERNAL",
+        "storage_location": format!("s3://warehouse/{name}"),
+        "data_source_format": "PARQUET",
+        "columns": columns,
+    })
+}
+
 /// A MANAGED base table list entry whose `data_source_format` is not `DELTA`.
 fn non_delta_table_entry(name: &str, columns: Vec<Json>) -> Json {
     json!({
@@ -215,6 +226,19 @@ fn non_delta_table_entry(name: &str, columns: Vec<Json>) -> Json {
         "table_type": "MANAGED",
         "storage_location": format!("s3://warehouse/{name}"),
         "data_source_format": "ICEBERG",
+        "columns": columns,
+    })
+}
+
+/// A MANAGED base table list entry whose `data_source_format` this engine can
+/// never plan, unlike `ICEBERG`, which is at least a format the engine can plan
+/// for a different catalog kind.
+fn csv_table_entry(name: &str, columns: Vec<Json>) -> Json {
+    json!({
+        "name": name,
+        "table_type": "MANAGED",
+        "storage_location": format!("s3://warehouse/{name}"),
+        "data_source_format": "CSV",
         "columns": columns,
     })
 }
@@ -404,7 +428,49 @@ fn lists_managed_external_and_shallow_clone_delta_tables() {
 }
 
 #[test]
-fn excludes_view_non_delta_and_other_type_entries() {
+fn lists_a_parquet_base_table_with_every_declared_column() {
+    let mock = MockUnityCatalog::start(|req| {
+        if req.is_get_table_call() {
+            return unexpected_get_table();
+        }
+        let entries = vec![parquet_table_entry(
+            "raw_events",
+            vec![long_col("id"), string_col("region")],
+        )];
+        (200, tables_page(entries, None))
+    });
+
+    let response = create_vs_over(&mock).expect("Unity createVirtualSchema must succeed");
+
+    let names: Vec<&str> = response_tables(&response)
+        .iter()
+        .map(|t| t["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["RAW_EVENTS"],
+        "the PARQUET external table is listed"
+    );
+
+    let table = table_named(&response, "RAW_EVENTS");
+    let column_names: Vec<&str> = table["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        column_names,
+        vec!["ID", "REGION"],
+        "every declared column is listed"
+    );
+
+    assert!(table_map(&response).contains_key("RAW_EVENTS"));
+    assert_eq!(mock.get_table_call_count(), 0);
+}
+
+#[test]
+fn excludes_view_unplannable_format_and_other_type_entries() {
     let mock = MockUnityCatalog::start(|req| {
         if req.is_get_table_call() {
             return unexpected_get_table();
@@ -416,6 +482,7 @@ fn excludes_view_non_delta_and_other_type_entries() {
                 vec![long_col("order_id"), string_col("region")],
             ),
             non_delta_table_entry("orders_raw", vec![long_col("order_id")]),
+            csv_table_entry("orders_csv", vec![long_col("order_id")]),
             other_type_entry("orders_stream", vec![long_col("order_id")]),
         ];
         (200, tables_page(entries, None))
@@ -439,6 +506,10 @@ fn excludes_view_non_delta_and_other_type_entries() {
     assert!(
         !map.contains_key("ORDERS_RAW"),
         "the non-Delta-format table is excluded from TABLE_MAP"
+    );
+    assert!(
+        !map.contains_key("ORDERS_CSV"),
+        "the CSV-format table is excluded from TABLE_MAP"
     );
     assert!(
         !map.contains_key("ORDERS_STREAM"),
