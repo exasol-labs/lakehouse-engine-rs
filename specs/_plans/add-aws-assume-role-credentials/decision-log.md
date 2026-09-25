@@ -9,7 +9,7 @@
 **A:** Once per query, sealed and distributed (Recommended). "The VS/plan layer calls STS AssumeRole once per query, then ships the resulting short-lived credentials to every shard through the same sealed-envelope mechanism already used for catalog-vended credentials. Avoids up to G (≤300) separate STS calls per query and reuses existing crypto machinery."
 
 **Q:** A CONNECTION could set both use_vended_credentials=true (catalog vends short-lived S3 credentials per table) and aws_assume_role_arn (role assumption for storage). How should that combination be handled?
-**A:** Allow both, assumed role wins for storage. "Assumed-role credentials override vended per-table credentials for storage access, on the theory that an explicit role assumption is a stronger operator intent than the catalog's default vending." The user declined the recommended option, which rejected the combination.
+**A:** Allow both, assumed role wins for storage. "Assumed-role credentials override vended per-table credentials for storage access, on the theory that an explicit role assumption is a stronger operator intent than the catalog's default vending." The user declined the recommended option, which rejected the combination. Superseded by decision [2] after PR #441 review.
 
 **Q:** Should role assumption be wired into the generic static-credential pipeline (so it also works for Delta/Unity Catalog static-storage CONNECTIONs), or scoped specifically to the Iceberg REST/Glue path from the ticket's example?
 **A:** Generic (Recommended). "Build assume-role into the shared ConnectionCreds → StorageCreds resolution used by every catalog kind, per the project's format-neutral field rule. It works for Iceberg REST (incl. Glue) and Delta/Unity static-storage CONNECTIONs alike."
@@ -18,7 +18,7 @@
 **A:** Static access_key/secret_key required (Recommended). "Matches the ticket's example exactly: aws_assume_role_arn requires access_key and secret_key on the same CONNECTION as the base identity for the AssumeRole call. No ambient/instance-profile credential resolution." Ambient credential-chain support is out of scope.
 
 **Q:** (Settled by the ticket text, not re-asked.) How do `aws_assume_role_arn` and `aws_external_id` relate?
-**A:** "aws_assume_role_arn and aws_external_id are optional but if either of them is present the other must be present." This is a project-chosen guard, stricter than AWS, which accepts AssumeRole without an ExternalId.
+**A:** "aws_assume_role_arn and aws_external_id are optional but if either of them is present the other must be present." This is a project-chosen guard, stricter than AWS, which accepts AssumeRole without an ExternalId. Superseded by decision [5] after PR #441 review.
 
 ## Design Decisions
 
@@ -34,16 +34,16 @@
   - The STS module redacts its own errors against the base `secret_key`, base `session_token`, and external id, because the rebuilt backend no longer holds them.
 - **Promotes to ADR:** yes
 
-### [2] One function owns the storage credential source precedence: assumed role, then vending, then the CONNECTION
+### [2] The assumed role replaces the CONNECTION's key pair only where that pair is read, and leaves credential vending unchanged
 
-- **Decision:** `ConnectionCreds::storage_credential_source()` returns `StorageCredentialSource::{AssumedRole, Vended, Connection}`. Every site that decides where storage credentials come from matches it exhaustively. The five sites are the Iceberg and Delta readers' split, the access-delegation header, the Unity Catalog temporary-credentials request, `scan_storage_for`, and the `path_style` guard.
-- **Alternatives:** (a) Reject a CONNECTION that sets both a role and vending. This was the recommended interview option, and the user declined it (Q3). (b) Run the vended resolution, then swap the session into the resolved S3 backend. Rejected: it requests credentials it discards, it fails when the catalog vends none, and it splits one precedence across two steps. (c) A compound boolean check at each site. Rejected: the precedence would leak into five sites.
-- **Rationale:** Interview Q3 sets the precedence. One owner keeps the five sites from disagreeing, and an exhaustive match makes a fourth source a build error at each site.
+- **Decision:** The session of decision [1] replaces the key pair for its two reads: SigV4 catalog signing, and object storage when `use_vended_credentials` is false. Every site that chooses between vending and static storage keeps branching on `use_vended_credentials`: the Iceberg and Delta readers' split, the `X-Iceberg-Access-Delegation` header, the Unity Catalog temporary-credentials request, and the `path_style` guard. The one changed site is `scan_storage_for`. It returns the CONNECTION reference only when the CONNECTION neither vends nor names a role, and the sealed envelope otherwise.
+- **Alternatives:** (a) An assumed role wins over vending for storage, through a `StorageCredentialSource` precedence enum matched at five sites. Rejected: it changes how vending works, it drops vended credentials the operator asked for, and it edits four sites that never read the key pair for storage. (b) Reject a CONNECTION that names a role and sets `use_vended_credentials`. Rejected: the combination is valid, because the session signs the catalog requests and the catalog vends storage. (c) A three-variant source enum consumed only by `scan_storage_for`. Rejected: that function already owns the wire variant (`vs-adapter/scan-spec-credential-reference`), so the enum adds a public type with one caller.
+- **Rationale:** Interview Q1 scopes the session to SigV4 signing and the non-vended storage path. Vending never reads the key pair for storage, so a role has nothing to replace there. The substitution of decision [1] already reaches both reads, so no reader learns about roles. Whether AWS Glue vends credentials is unverified. If it does, vending supplies storage and the session signs the request that asks for it, with no special case.
 - **Consequences:**
-  - `use_vended_credentials` has no effect on a CONNECTION that names a role. The adapter sends no `X-Iceberg-Access-Delegation` header and requests no Unity Catalog temporary credentials.
-  - The `path_style` guard applies to a role CONNECTION with vending, because its storage resolves on the static path.
-  - The wire variant is sealed for both `AssumedRole` and `Vended`. This applies ADR `seal-vended-storage-block-hkdf-aes-gcm-refuse-when-no-key-material` to a second credential the CONNECTION does not state. A role CONNECTION always has key material, because it requires `secret_key`.
-  - A role CONNECTION reads S3 only. An `abfss://` table location fails as it fails for any static-S3 CONNECTION today.
+  - A role CONNECTION with `use_vended_credentials` sends the access-delegation header, requests Unity Catalog temporary credentials, and skips the `path_style` guard, exactly as without the role.
+  - A role CONNECTION without vending carries session credentials that the CONNECTION does not state, so its storage block is sealed. This applies ADR `seal-vended-storage-block-hkdf-aes-gcm-refuse-when-no-key-material` to a second credential. A role CONNECTION always has key material, because it requires `secret_key`.
+  - A role CONNECTION without vending reads S3 only. An `abfss://` table location fails as it fails for any static-S3 CONNECTION today.
+  - **Known open gap, left unresolved per PR #441 review:** `pushdown-planning-cloud-credentials` §§ "Unsigned catalog path is unchanged when SigV4 and vending are both disabled" and "Static credentials are used for data files when vending is disabled", and `delta-table-planning` § "Delta planning resolves its storage credential through the table's own catalog", each still say, unconditionally and without a role carve-out, that a non-vended CONNECTION's scan spec carries a bare CONNECTION REFERENCE. That is now false for a non-vended role CONNECTION, which this decision requires to seal. This plan carries no delta for either spec, per the reviewer's explicit instruction to remove them (see the `[pr-review]` finding below). The actual code stays correct regardless — `scan_storage_for` is the ONE function every storage-block site calls (`vs-adapter/scan-spec-credential-reference`), and it already seals a non-vended role CONNECTION — but the recorded prose of these two specs will read as contradicting `connection-credentials-assume-role` for that one input until someone edits them. Flagged for the reviewer to confirm before implementation.
 - **Promotes to ADR:** yes
 
 ### [3] The STS client is a signed Query-API GET, parsed with the `quick-xml` already compiled into the workspace
@@ -66,11 +66,11 @@
   - `aws_sts_endpoint` is a third CONNECTION field beyond the ticket's two. It is optional and rejected without a role.
 - **Promotes to ADR:** no
 
-### [5] `aws_assume_role_arn` and `aws_external_id` are required together, as a product rule
+### [5] `aws_external_id` is optional and requires a role
 
-- **Decision:** A CONNECTION supplying exactly one of the two fields is rejected, naming the absent one.
-- **Alternatives:** Follow AWS and make `ExternalId` optional. Rejected by the ticket text.
-- **Rationale:** The AWS STS API reference lists `ExternalId` as "Required: No". The stricter rule is defense in depth against the confused-deputy problem for cross-account roles. The spec states the rule as a product choice, not as an AWS requirement.
+- **Decision:** A CONNECTION states no role, a role alone, or a role with an external id. The adapter rejects `aws_external_id` without `aws_assume_role_arn`, naming the field. The `AssumeRole` request carries `ExternalId` only when the CONNECTION states one.
+- **Alternatives:** (a) Require the role and the external id together. Rejected: it blocks a same-account role whose trust policy has no `sts:ExternalId` condition, which AWS accepts. (b) Accept an external id without a role and ignore it. Rejected: the value qualifies a role assumption only, so a lone external id is a configuration mistake that ignoring it would hide.
+- **Rationale:** The AWS STS API reference lists `ExternalId` as "Required: No". The role's trust policy decides whether an external id is required, and STS denies a request that omits a required one. That denial surfaces as the credential-safe error of `connection-credentials-assume-role` § "A failed AssumeRole is a clear, credential-safe error". The rule matches `aws_sts_endpoint`, which also requires a role.
 - **Promotes to ADR:** no
 
 ### [6] The base identity is the CONNECTION's own key pair, and no ambient credential chain is read
@@ -88,19 +88,19 @@
 - **Consequences:** A query whose scan phase ends more than one hour after planning fails with the store's expired-token error, as a vended credential does. `docs/catalogs.md` states this limit. STS `Throttling` and 5xx responses are also not retried: a concurrent workload that drives one STS call per `createVirtualSchema`/`refresh`/`setProperties`/pushdown into throttling surfaces as failed user queries rather than a transient retry. This is an accepted limitation, not an oversight; task 5.1 states it in `docs/catalogs.md` so an operator sizing a role CONNECTION for concurrent load knows the failure mode. No follow-up issue: no reporter has hit it, and adding a bounded retry has no stated need yet.
 - **Promotes to ADR:** no
 
-### [8] `pushdown-planning-cloud-credentials` is scoped by its description, other specs by scenario edits
+### [8] `connection-credentials-direct-storage`, `rest-catalog-oauth-auth`, and `scan-spec-credential-reference` edit only the scenario clauses a role CONNECTION without vending contradicts; `pushdown-planning-cloud-credentials` and `delta-table-planning` are not edited
 
-- **Decision:** The `pushdown-planning-cloud-credentials` description states that the feature covers CONNECTIONs naming no role. The one exception is § "SigV4/Glue derives the catalogs/{account-id} REST prefix on every catalog request", because the prefix rule does not depend on the credential source. `connection-credentials`, `connection-credentials-direct-storage`, `delta-table-planning`, `rest-catalog-oauth-auth`, `scan-spec-credential-reference`, and `storage-backend-enum` edit only the scenario clauses a role CONNECTION would contradict.
-- **Alternatives:** (a) Narrow every conflicting scenario of `pushdown-planning-cloud-credentials`. Rejected: at least eight scenario copies for one scoping fact. (b) Add a scoping bullet to that feature's Background. Rejected: the delta must copy the whole Background of about 110 lines to add one bullet.
-- **Rationale:** One scoping sentence in a short description removes eight conflicts without growing the permanent spec. Elsewhere only one or two clauses conflict, so a targeted edit is smaller.
-- **Consequences:** Scenario-level retrieval (`speq feature get "<domain>/<feature>/<scenario>"`) prints a scenario without its feature description, so a reader of one `pushdown-planning-cloud-credentials` scenario does not see the no-role scope.
+- **Decision:** `connection-credentials-direct-storage`, `rest-catalog-oauth-auth`, and `scan-spec-credential-reference` edit only the scenario clauses that a role CONNECTION without vending contradicts. `connection-credentials` gains only a description pointer to the new sibling feature. `pushdown-planning-cloud-credentials` and `delta-table-planning` carry no delta at all, per PR #441 review (see the `[pr-review]` finding below) — their recorded scenarios stand unedited, and decision [2]'s Consequences record the resulting gap.
+- **Alternatives:** (a) Narrow each conflicting scenario of `pushdown-planning-cloud-credentials`: § "Catalog REST requests to Glue are SigV4-signed when enabled", § "Unsigned catalog path is unchanged when SigV4 and vending are both disabled", and § "Static credentials are used for data files when vending is disabled". Rejected: three scenario copies, two of which carry recorded SUPERSEDING clauses that the copy would reproduce. (b) Add a bullet to that feature's Background. Rejected: the delta must copy the whole Background of about 110 lines to add one bullet. (c) Keep a narrowed delta-table-planning/pushdown-planning-cloud-credentials delta stating the sealed exception for a non-vended role CONNECTION. Rejected by PR #441 review, which asked for both deltas removed outright.
+- **Rationale:** For the three specs that keep a delta, one targeted edit is smaller than a full scenario copy and avoids growing the permanent spec. `pushdown-planning-cloud-credentials` and `delta-table-planning` carry no delta because the reviewer asked for their removal; see decision [2] for what that leaves unresolved in the recorded text.
+- **Consequences:** Scenario-level retrieval (`speq feature get "<domain>/<feature>/<scenario>"`) prints a scenario without its feature description, so a reader of one `connection-credentials-direct-storage`/`rest-catalog-oauth-auth`/`scan-spec-credential-reference` scenario relies on the scenario's own edited clause, not a description-level scope note.
 - **Promotes to ADR:** no
 
 ### [9] The Iceberg and Delta compliance gate does not apply to this plan
 
-- **Decision:** No Iceberg table spec or Delta protocol section is cited. The one Iceberg-adjacent change, omitting `X-Iceberg-Access-Delegation` for a role CONNECTION, cites the Iceberg REST OpenAPI.
+- **Decision:** No Iceberg table spec or Delta protocol section is cited.
 - **Alternatives:** none
-- **Rationale:** The plan resolves credentials. It changes no scanning, pushdown, or schema or type handling. The Iceberg REST OpenAPI marks `X-Iceberg-Access-Delegation` `required: false`, an "Optional signal", so omitting it is compliant. The Delta protocol does not cover Unity Catalog's temporary-credentials API.
+- **Rationale:** The plan resolves credentials. It changes no scanning, pushdown, or schema or type handling. A role leaves the `X-Iceberg-Access-Delegation` header and the Unity Catalog temporary-credentials request unchanged (decision [2]), so no catalog-protocol behavior changes either.
 - **Promotes to ADR:** no
 
 ### [10] The local E2E models role assumption with an STS stub and two MinIO users, and real AWS runs in the opt-in cloud suite
@@ -161,4 +161,28 @@
 
 - **Finding:** Background bullet 1 of `e2e-harness/assume-role-e2e` was design rationale that no scenario step depended on, and decision [10] already held it. Bullet 3 stated that the stub rejects a bad signature with `SignatureDoesNotMatch`, but no scenario sent a badly signed request. A stub that skips signature verification passed every scenario.
 - **Direction change:** Bullet 1 is deleted. The new scenario "A wrong base secret fails CREATE VIRTUAL SCHEMA with the STS signature error" requires the `SignatureDoesNotMatch` code and no secret key in the error. Task 3.5 adds `a_wrong_base_secret_fails_create_with_signature_does_not_match`. § Scenario Coverage maps it to the new scenario and to the signed-request scenario of `connection-credentials-assume-role`.
+- **Promotes to ADR:** no
+
+### [pr-review] An assumed role overrode credential vending instead of leaving it unchanged
+
+- **Finding:** Decision [2] made an assumed role win over `use_vended_credentials` for storage. A role CONNECTION with vending sent no access-delegation header, requested no Unity Catalog temporary credentials, and fell under the `path_style` guard. The role only needs to replace the key pair where the key pair is read: SigV4 catalog signing, and storage without vending.
+- **Direction change:**
+  - Decision [2] states the narrower rule. The `StorageCredentialSource` enum and its method are removed, because only `scan_storage_for` still distinguishes a role, and it already owns the wire variant.
+  - Tasks 1.2 (enum), 1.3 (header), and 2.2 (`path_style` guard) are removed. Task 2.4 only extends a Delta-reader test with a role case. Old tasks 1.4-1.8 are now 1.2-1.6, and old tasks 2.3 and 2.5 are now 2.2 and 2.3. Task 2.3 seals when the CONNECTION vends or names a role.
+  - The `storage-backend-enum` delta and both `connection-credentials` scenario edits are removed. `connection-credentials` keeps its description pointer, without the precedence phrase.
+  - `connection-credentials-assume-role` drops the precedence and access-delegation Background bullets and both precedence scenarios. It gains § "A role leaves credential vending unchanged", and scopes its storage and sealing scenarios to a CONNECTION that does not vend.
+  - `delta-table-planning` and `pushdown-planning-cloud-credentials` carry no delta, removed outright per the reviewer's literal instruction. Their recorded scenarios are left exactly as recorded, unedited. Decision [8] states the new scope. **This reintroduces the same class of conflict round-1 plan-review flagged as a BLOCKER for `connection-credentials-direct-storage`** (a recorded scenario asserting REFERENCE for an input `connection-credentials-assume-role` requires SEALED): decision [2]'s Consequences records it as a known open gap in the spec text, left unresolved because the reviewer asked for these two deltas removed rather than narrowed. The actual behavior stays correct because `scan_storage_for` is the single owner of the wire-variant decision (`vs-adapter/scan-spec-credential-reference`) and already seals this case; only the prose of these two other specs is stale.
+  - `rest-catalog-oauth-auth`, `scan-spec-credential-reference`, and `connection-credentials-direct-storage` name `use_vended_credentials` and `aws_assume_role_arn` in place of the enum. `catalog-crate-public-surface-extensions` drops the enum and the method. Decision [9] drops the Iceberg REST OpenAPI citation, because the header is no longer omitted.
+- **Promotes to ADR:** no
+
+### [pr-review] `aws_external_id` was required beside every role
+
+- **Finding:** Decision [5] required `aws_assume_role_arn` and `aws_external_id` together. AWS lists `ExternalId` as optional, and a same-account role often has no `sts:ExternalId` condition, so the rule rejected a valid CONNECTION. Only an external id without a role has no meaning.
+- **Direction change:** Decision [5] makes `aws_external_id` optional and rejects it only without a role. `connection-credentials-assume-role` replaces the pairing scenario with § "An external id is accepted only beside a role", deletes the pairing Background bullet, folds the "Required: No" quote into the request-shape bullet, and sends `ExternalId` only when stated. Task 2.1 and § Scenario Coverage replace `assume_role_arn_and_external_id_are_required_together` with `external_id_without_a_role_is_rejected` and `a_role_without_an_external_id_is_accepted`. Task 1.3 adds `a_role_without_an_external_id_sends_no_external_id_parameter`. The Interview answer that quotes the pairing rule points to decision [5].
+- **Promotes to ADR:** no
+
+### [pr-review] A Unity Catalog role CONNECTION with static keys had no test reaching a Delta scan
+
+- **Finding:** Removing the format-reader precedence task left no test in which a Unity Catalog CONNECTION with static S3 keys and a role reads a Delta table through the session.
+- **Direction change:** `e2e-harness/assume-role-e2e` gains § "A Unity Catalog CONNECTION with static keys naming the role reads a Delta table through the session". Task 3.7 adds `unity_role_connection_reads_a_delta_table_through_the_session` to `e2e_unity_test.rs`. The Unity suite already runs a static-key Unity Catalog CONNECTION through real Delta queries against MinIO. MinIO denies the base user, so returned rows prove that the session reached the Delta log read and the scan. `adapter_tests.rs` has no live Unity Catalog: its one Unity case proves routing only by the load-table failure it surfaces. Task 3.7 also starts `sts-stub` in `unity-up`, in the `e2e-unity` CI job, and in the `docker-compose.unity.yml` Exasol hosts loop. The suite-gate scenario names both CI jobs.
 - **Promotes to ADR:** no
