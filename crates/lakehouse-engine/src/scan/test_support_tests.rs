@@ -80,7 +80,7 @@ pub(super) fn refusing_backend(endpoint: &str, secret: &str) -> StorageBackend {
 pub(super) struct SinkCtx;
 
 impl exasol_udf_sdk::context::UdfContext for SinkCtx {
-    fn num_columns(&self) -> usize {
+    fn input_column_count(&self) -> usize {
         0
     }
     fn get(

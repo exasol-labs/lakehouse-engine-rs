@@ -154,8 +154,8 @@ impl BatchCapturingCtx {
 }
 
 impl UdfContext for BatchCapturingCtx {
-    fn num_columns(&self) -> usize {
-        self.inner.num_columns()
+    fn input_column_count(&self) -> usize {
+        self.inner.input_column_count()
     }
     fn input_column(&self, idx: usize) -> Result<&ColumnInfo, UdfError> {
         self.inner.input_column(idx)
