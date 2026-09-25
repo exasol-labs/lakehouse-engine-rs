@@ -1,15 +1,6 @@
-//! Permanent regression coverage for the harness's row-cap default
-//! (`fix-e2e-harness-undeclared-limit`, issue #312): `exa_conn()` must declare
-//! no row cap unless a call site asks, per `ExaConn::capped_result_sets`'s doc
-//! comment.
+//! `exa_conn()` declares no row cap unless a call site asks (#312).
 //!
-//! Seeds only `typed_distinct_probe` (12 rows) through the shared
-//! `common::e2e_harness` provisioning helpers — the cheapest fixture task 1.2's
-//! live capture already exercised for the bare-projection shape — per
-//! `e2e-harness/e2e-harness`'s "every E2E binary provisions the scan path from
-//! one shared harness definition".
-//!
-//! All tests FAIL (never skip) when the stack is unavailable — per project rules.
+//! All tests FAIL (never skip) when the stack is unavailable.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -57,12 +48,7 @@ fn typed_table() -> String {
     format!("{VS_NAME}.{}", E2E_TYPED_TABLE.to_uppercase())
 }
 
-/// A bare projection carrying no SQL `LIMIT`, issued through a connection that
-/// declares no cap, pushes no `limit` into the generated scan spec and returns
-/// every seeded row rather than a prefix — the harness default this plan
-/// establishes. Says nothing about a *declared* cap, which does reach the
-/// adapter as a pushdown `limit`; see
-/// `declared_cap_truncates_returned_row_count` below.
+/// Scenario: an undeclared-cap connection pushes no `limit` and returns every row
 #[test]
 fn undeclared_cap_pushes_no_limit() {
     setup_e2e();
@@ -85,23 +71,9 @@ fn undeclared_cap_pushes_no_limit() {
     );
 }
 
-/// A declared row cap truncates the delivered result set: the same bare
-/// projection returns exactly the capped row count through a capped connection
-/// and the fixture's full row count through an uncapped one.
-///
-/// Scoped deliberately to the DELIVERED row count. A declared cap is not inert on
-/// the adapter exchange — on a real query execution it reaches the adapter as a
-/// pushdown `limit`. That effect is invisible here because `EXPLAIN VIRTUAL` is a
-/// separate exchange that never carries a cap-derived limit, so no assertion in
-/// this file could observe it. The proof lives elsewhere: direct capture of the
-/// adapter's incoming request
-/// (`specs/_plans/fix-e2e-harness-undeclared-limit/injection-surface.md`) for the
-/// limit itself.
-///
-/// A pushed limit is no longer itself a plan-shape consequence: a bare `LIMIT`
-/// stays broadcast-eligible, and only a join request's OTHER forcing conditions
-/// (aggregate, GROUP BY, ORDER BY, HAVING) fall back to the N-scan wrapper — see
-/// `JoinSpec::post_join_limit`.
+/// Scenario: a declared row cap truncates the delivered row count
+// Only the delivered count is asserted: `EXPLAIN VIRTUAL` never carries a
+// cap-derived pushdown `limit`, so it cannot observe one.
 #[test]
 fn declared_cap_truncates_returned_row_count() {
     setup_e2e();

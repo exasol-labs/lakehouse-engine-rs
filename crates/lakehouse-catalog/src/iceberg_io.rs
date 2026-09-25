@@ -1,21 +1,11 @@
-//! The authenticated catalog `GET` the catalog layer's REST access is built on:
-//! it applies the resolved auth strategy to the request and deserializes the JSON
-//! body.
-//!
-//! Moved verbatim from the engine's `adapter/pushdown/credentials.rs`.
-//! Credential values NEVER appear in any returned error — every error site
-//! routes through a redaction closure.
+//! The authenticated catalog `GET`. Credential values never appear in any
+//! returned error.
 
 use crate::ConnectionCreds;
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
 use crate::redaction::redact_secret_values;
 use exasol_udf_sdk::error::UdfError;
 
-/// Build and authenticate a `GET` request against `url`, applying the resolved
-/// catalog-auth strategy and (when vending) the access-delegation header, then
-/// execute it and deserialize the JSON body into `T`.
-///
-/// Credential values NEVER appear in the returned error.
 pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
     url: &str,
@@ -23,9 +13,7 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
     send_access_delegation: bool,
     creds: &ConnectionCreds,
 ) -> Result<T, UdfError> {
-    // Redact static catalog-auth secrets AND the live bearer token (which, for the
-    // OAuth2 mode, is the grant-obtained access token and is NOT present in
-    // `creds`). Every error site below routes through this closure.
+    // The OAuth2 grant-obtained bearer token is not in `creds`, so redact it explicitly.
     let redact = |msg: &str| {
         let base = redact_catalog_auth_error(msg, creds);
         match auth {

@@ -19,8 +19,6 @@ import time
 
 from pyspark.sql import SparkSession
 
-# {ns} is substituted once via .format(ns=namespace) in main() — not an f-string, since this list
-# is built at import time, before any namespace argument has been parsed.
 QUERIES = [
     ("q1", """
         SELECT n.n_name, r.r_name, COUNT(*) AS suppliers
@@ -46,8 +44,6 @@ QUERIES = [
         FROM glue.{ns}.lineitem WHERE l_shipdate <= DATE '1998-09-01'
         GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus
     """),
-    # Q5-Q9b probe specific pushdown strengths/weaknesses beyond Q1-Q4 — identical SQL
-    # (dialect-adjusted) in bench/run.sh, bench/athena_compare.sh, bench/trino_compare.sh.
     ("q5", """
         SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
         FROM glue.{ns}.orders o JOIN glue.{ns}.lineitem l ON o.o_orderkey = l.l_orderkey
@@ -77,9 +73,6 @@ QUERIES = [
                SUM(length(l_comment))
         FROM glue.{ns}.lineitem
     """),
-    # NQ1-NQ5 close the arithmetic-aggregate-pushdown gap + probe LIKE/IN filters, ORDER BY+LIMIT,
-    # a 4-way join, and GROUP BY+HAVING — identical SQL (dialect-adjusted) in bench/run.sh,
-    # bench/athena_compare.sh, bench/trino_compare.sh.
     ("nq1", """
         SELECT SUM(l_extendedprice * l_discount) AS revenue FROM glue.{ns}.lineitem
         WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'
@@ -127,7 +120,7 @@ def main():
         t0 = time.time()
         spark.sql(sql.format(ns=namespace)).collect()
         elapsed = time.time() - t0
-        # Scraped back out of the driver stdout log by bench/spark_compare.sh — keep this exact format.
+        # bench/spark_compare.sh scrapes this exact format.
         print(f"elapsed: {name} {elapsed:.2f}s")
 
     spark.stop()

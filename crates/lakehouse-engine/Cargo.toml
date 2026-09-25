@@ -16,8 +16,7 @@ cloud-e2e = []
 lakekeeper-e2e = []
 # Requires the Azure (ADLS Gen2) static-credential stack; same FAIL contract as exasol-e2e.
 azure-e2e = []
-# Requires a live Exasol + MinIO + Unity Catalog OSS stack (docker-compose.unity.yml,
-# `make unity-up`); same FAIL contract as exasol-e2e.
+# Requires a live Exasol + MinIO + Unity Catalog OSS stack; same FAIL contract as exasol-e2e.
 unity-e2e = []
 
 [dependencies]
@@ -33,32 +32,20 @@ datafusion = { workspace = true, features = ["unicode_expressions"] }
 
 # `azure`: ADLS Gen2 (`abfss://`) object store; unions with the workspace `aws`.
 object_store = { workspace = true, features = ["azure"] }
-# Implements object_store's #[async_trait] ObjectStore for the spec-size HEAD wrapper.
 async-trait = "0.1"
-# Names the Bytes in object_store's own `ObjectStore::get_ranges` signature, which the
-# routing store implements explicitly; object_store re-exports no alias for it.
+# object_store re-exports no alias for the Bytes in `ObjectStore::get_ranges`.
 bytes = "1"
 
-# Unions delete positions into a RoaringTreemap for the vendored build_deletes_row_selection.
 roaring = { workspace = true }
 
 iceberg = { workspace = true }
 
-# Declared directly on this member manifest, not `[workspace.dependencies]` — member
-# manifests enter CI's cache key, the workspace manifest does not. De-risked by the
-# #317 spike against arrow 58 / parquet 58 / object_store 0.13.2 / DataFusion 54.1.
-# `delta_kernel_default_engine`'s own `default` feature set pulls in `arrow-59`
-# unconditionally, unioning a second arrow tree onto the `arrow-58` we ask for —
-# `default-features = false` is required to actually get exactly one arrow version.
-# `internal-api` is the ONLY way 0.26 exposes a table's ordered partition-column list,
-# its protocol-gated column-mapping mode, and its reader protocol
-# (`TableConfiguration::partition_columns` / `::column_mapping_mode` / `::protocol`,
-# `Snapshot::table_configuration`, `Protocol::min_reader_version` / `::reader_features`,
-# and the `TableFeature` enum, all `pub(crate)` without it). It is the crate's declared
-# UNSTABLE surface — it changes visibility only, never behaviour, but carries no semver
-# guarantee across 0.26.x. Every accessor is called from ONE place, `format::delta_replay`,
-# and `format::delta_protocol` alone names `TableFeature`, so a kernel upgrade that drops
-# one is a compile error there rather than a silent behaviour change.
+# Declared here, not in `[workspace.dependencies]`: member manifests enter CI's cache key.
+# `default-features = false` on the default engine: its defaults pull in `arrow-59`, a
+# second arrow tree next to `arrow-58`.
+# `internal-api` is the only way 0.26 exposes partition columns, column-mapping mode, and
+# the reader protocol; it has no semver guarantee, so its accessors are confined to
+# `format::delta_replay` and `format::delta_protocol`.
 delta_kernel = { version = "0.26", features = [
     "default-engine-base",
     "arrow-58",
@@ -69,8 +56,7 @@ delta_kernel_default_engine = { version = "0.26", default-features = false, feat
     "rustls",
 ] }
 
-# rt-multi-thread: for DATAFUSION_THREADS_PER_UDF > 1. sync: tokio::sync::Semaphore
-# (shared delete-read limiter), declared directly rather than pulled in transitively.
+# rt-multi-thread: DATAFUSION_THREADS_PER_UDF > 1. sync: shared delete-read Semaphore.
 tokio      = { workspace = true, features = ["rt-multi-thread", "sync"] }
 serde      = { workspace = true }
 serde_json = { workspace = true }
@@ -80,8 +66,7 @@ futures = { workspace = true }
 url     = { workspace = true }
 percent-encoding = { workspace = true }
 
-# udf_log! and ctx.debug_level() need tracing::Level; default-features off so no
-# subscriber machinery crosses into the .so.
+# default-features off so no subscriber machinery enters the .so.
 tracing = { version = "0.1", default-features = false }
 
 aes-gcm = "0.10"
@@ -91,29 +76,20 @@ base64  = "0.22"
 rand    = "0.8"
 
 [dev-dependencies]
-# time: forces deterministic overlap in concurrency-bound tests. net + io-util: the
-# loopback catalog fake in file_resolution.rs's unit tests. Declared directly rather
-# than left to transitive feature unification.
+# time: deterministic overlap in concurrency tests. net + io-util: loopback catalog fake.
 tokio               = { workspace = true, features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
-# Serves both src/**/*_tests.rs unit tests and the tests/ integration targets — cargo
-# unifies dev-dependency features into the crate under test.
 exasol-udf-sdk      = { workspace = true, features = ["test-support"] }
 arrow               = { workspace = true, features = ["ipc"] }
 parquet             = { workspace = true }
-# TPC-H row generator for tpch_loader.rs; core has no arrow dep, so tpchgen-arrow
-# (no arrow-58 release) isn't needed.
+# Not tpchgen-arrow: it has no arrow-58 release.
 tpchgen             = { version = "2.0.2" }
 iceberg             = { workspace = true }
 iceberg-catalog-rest = { workspace = true }
-# opendal-azdls: seed.rs's ADLS arm needs OpenDalStorageFactory::Azdls, declared
-# directly rather than relying on lakehouse-catalog's feature unification.
 iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 reqwest             = { workspace = true, features = ["blocking"] }
-# Seed harness: implements ProvideCredential to force static MinIO admin credentials
-# over Lakekeeper's vended STS token (seed.rs build_seed_catalog_with_auth).
+# Seed harness forces static MinIO admin credentials over Lakekeeper's vended STS token.
 reqsign-core        = "3.0.1"
-# azure-e2e harness only (tests/common/azure.rs): per-run container lifecycle via
-# Entra ID service-principal auth, while the scan path under test uses the account key.
+# azure-e2e harness: container lifecycle via Entra ID; the scan path uses the account key.
 azure_storage_blob  = "1.0"
 azure_identity      = "1.0"
 azure_core          = "1.1"

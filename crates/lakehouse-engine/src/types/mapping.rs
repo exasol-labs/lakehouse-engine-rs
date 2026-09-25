@@ -1,27 +1,11 @@
-//! Arrow-to-Exasol type mapping — authoritative table shared by createVirtualSchema schema
-//! declaration and Arrow→Value conversion in the scan.
-//!
-//! This module owns the conversions between the three representations a type takes
-//! as it crosses the VS boundary: the Arrow `DataType` (the scan's in-process
-//! representation), the Exasol SQL type string (e.g. `"DECIMAL(20,0)"`, as it appears
-//! in an EMITS clause or a pushed-down column declaration), and the VS `dataType`
-//! JSON object (the Exasol Virtual Schema protocol's own wire shape for a column's
-//! type, e.g. `{"type": "decimal", "precision": 20, "scale": 0}`, sent and received
-//! in `createVirtualSchema` / pushdown request-response payloads).
-//!
-//! The mapping is pure: no I/O, no external state — the `serde_json` import is for
-//! the JSON object's in-process `Value` representation (one of the three
-//! representations above), not for performing I/O. The module owns a wire
-//! representation, never a wire operation; reading/writing the request or response
-//! itself is the adapter layer's job.
+//! Arrow-to-Exasol type mapping shared by `createVirtualSchema` and the scan's Arrow→Value
+//! conversion. Pure: no I/O.
 use arrow::datatypes::{DataType, TimeUnit};
 use lakehouse_catalog::ColumnSourceType;
 use serde_json::{Value as Json, json};
 
-/// The Exasol SQL type string for a given Arrow data type.
-///
-/// Returns `"VARCHAR(2000000)"` for every incompatible Arrow type rather than
-/// erroring — incompatible values are serialized to JSON strings in the scan.
+/// Returns `"VARCHAR(2000000)"` for every incompatible Arrow type rather than erroring;
+/// the scan serializes those values to JSON strings.
 pub fn arrow_to_exasol_type(dt: &DataType) -> String {
     match compatible_exasol_type(dt) {
         Some(CompatibleExaType::Fixed(s)) => s.to_string(),
@@ -30,25 +14,17 @@ pub fn arrow_to_exasol_type(dt: &DataType) -> String {
     }
 }
 
-/// A compatible Exasol type, deferring string formatting until the caller needs
-/// it — `needs_json_fallback` only needs the `Option`'s discriminant, not the
-/// rendered string.
 enum CompatibleExaType {
     Fixed(&'static str),
     Decimal(u8, i8),
 }
 
-/// The Exasol type for an Arrow type Exasol represents directly, or `None` for
-/// one that has to cross the boundary as a JSON string.
-///
-/// `None` IS the JSON-fallback flag: `Utf8` and an out-of-range `Decimal128` both
-/// surface as `VARCHAR(2000000)`, so the rendered string cannot separate the type
-/// that crosses unchanged from the one that must be serialized first.
+/// `None` is the JSON-fallback flag: `Utf8` and an out-of-range `Decimal128` both render as
+/// `VARCHAR(2000000)`, so the rendered string cannot tell them apart.
 fn compatible_exasol_type(dt: &DataType) -> Option<CompatibleExaType> {
     let exasol_type = match dt {
         DataType::Boolean => "BOOLEAN",
 
-        // Integers, signed and unsigned, by the precision that holds their range.
         DataType::Int8 | DataType::UInt8 => "DECIMAL(3,0)",
         DataType::Int16 | DataType::UInt16 => "DECIMAL(5,0)",
         DataType::Int32 => "DECIMAL(10,0)",
@@ -60,70 +36,30 @@ fn compatible_exasol_type(dt: &DataType) -> Option<CompatibleExaType> {
 
         DataType::Date32 => "DATE",
 
-        // Both timezone-naive and timezone-aware timestamps map to plain Exasol
-        // TIMESTAMP: Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS
-        // output type, and an Iceberg timestamptz is a UTC instant, so the emitted
-        // value is unchanged. The internal tz-aware Arrow label is preserved
-        // elsewhere (arrow_type_to_tag / exasol_type_to_arrow). Not version-gated:
-        // an Arrow input type, not a catalog declaration.
+        // Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS type; a tz-aware
+        // value is a UTC instant, so plain TIMESTAMP emits it unchanged.
         DataType::Timestamp(_, _) => "TIMESTAMP",
 
         DataType::Decimal128(p, s) if *p <= 36 && *s <= 36 => {
             return Some(CompatibleExaType::Decimal(*p, *s));
         }
 
-        // Every incompatible type (List, Struct, Map, Binary, ...): VARCHAR via
-        // the JSON fallback.
         _ => return None,
     };
     Some(CompatibleExaType::Fixed(exasol_type))
 }
 
-/// The canonical Arrow `DataType` that the engine's `emit_batch` IPC feed accepts
-/// for a column declared as the given Exasol EMITS type string.
+/// The Arrow type `emit_batch`'s strict Arrow→ExaType validation accepts for a column
+/// declared with this EMITS type string (case-insensitive, whitespace-tolerant).
 ///
-/// This is the inverse of [`arrow_to_exasol_type`] and is the single source of
-/// truth for the type an emitted Arrow column must have so the strict
-/// Arrow→ExaType validation in `emit_batch` accepts it. The scan coerces every
-/// output column to this target before emitting.
+/// `None` for the string family: the right source coercion (JSON vs plain Utf8 cast)
+/// depends on the source column, not the target.
 ///
-/// The input is a declared Exasol type string exactly as it appears in an EMITS
-/// clause (e.g. `"DECIMAL(20,0)"`, `"DOUBLE PRECISION"`, `"VARCHAR(2000000)"`).
-/// Parsing is case-insensitive and tolerant of surrounding whitespace.
-///
-/// Returns `None` for a type string that maps to `VARCHAR` (string family) —
-/// the caller routes those through the JSON/Utf8 string path, which already
-/// handles arbitrary Arrow source types (including the incompatible set). A
-/// `VARCHAR` target is intentionally not represented as a single fixed Arrow
-/// type because the correct source coercion (display/JSON for incompatible
-/// types vs a plain Utf8 cast) depends on the source column, not the target.
-///
-/// ## DECIMAL precision binning (CRITICAL)
-///
-/// Exasol does NOT represent every `DECIMAL(p,s)` as the same internal type.
-/// The engine bins a `DECIMAL(p,s)` into an ExaType **by precision when the
-/// scale is 0**, and `emit_batch` requires the fed Arrow column to match that
-/// ExaType's Arrow representation:
-///
-/// - scale 0, precision ≤ [`DECIMAL_INT32_MAX_PRECISION`] (9)  → ExaType Int32 → Arrow `Int32`
-/// - scale 0, precision ≤ [`DECIMAL_INT64_MAX_PRECISION`] (18) → ExaType Int64 → Arrow `Int64`
-/// - scale > 0, OR precision 19..=36                            → ExaType Numeric → Arrow `Decimal128(p,s)`
-///
-/// These 9 / 18 thresholds are the standard Exasol DECIMAL internal
-/// representation (precision ≤ 9 fits a 32-bit int, ≤ 18 fits a 64-bit int,
-/// ≤ 36 needs 128-bit). Confirmed by:
-/// - Exasol "Sizing for Data Types" docs (DECIMAL with total precision ≤ 18
-///   fits 64-bit);
-/// - the SLC emit block layout (`exa-udf-runtime` `rowset.rs`): `ExaType::Int32`
-///   → int32 block, `ExaType::Int64` → int64 block, `ExaType::Numeric` → string
-///   (decimal) block;
-/// - the two live bench failures: `DECIMAL(10,0)` (COUNT(*)) binned to ExaType
-///   Int64 (rejecting a `Decimal128(10,0)` feed), and an Iceberg `int`
-///   (`DECIMAL(10,0)`, p≤18) binned to Int64 (rejecting an `Int32` feed).
-///
-/// A previous version mapped every `DECIMAL(p,s)` → `Decimal128(p,s)`, which is
-/// wrong for the integer-binned cases (the engine rejects `Decimal128(10,0)` for
-/// an Int64 column).
+/// Exasol bins a scale-0 `DECIMAL(p,0)` by precision, and `emit_batch` rejects any other
+/// Arrow representation:
+/// - scale 0, p ≤ [`DECIMAL_INT32_MAX_PRECISION`] → `Int32`
+/// - scale 0, p ≤ [`DECIMAL_INT64_MAX_PRECISION`] → `Int64`
+/// - otherwise → `Decimal128(p,s)`
 pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
     let upper = exasol_type.trim().to_uppercase();
 
@@ -136,8 +72,7 @@ pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
     if upper == "DATE" {
         return Some(DataType::Date32);
     }
-    // Exasol's bare `TIMESTAMP` IS `TIMESTAMP(3)`, so it resolves through the same
-    // precision table as a parameterized declaration.
+    // Exasol's bare `TIMESTAMP` is `TIMESTAMP(3)`.
     let timestamp_digits = if upper == "TIMESTAMP" {
         Some(3)
     } else {
@@ -159,7 +94,6 @@ pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
         ));
     }
     if let Some((p, s)) = parse_decimal_args(&upper) {
-        // Replicate Exasol's DECIMAL→ExaType precision binning (see doc comment).
         if s == 0 && p <= DECIMAL_INT32_MAX_PRECISION {
             return Some(DataType::Int32);
         }
@@ -169,35 +103,17 @@ pub fn exasol_type_to_arrow(exasol_type: &str) -> Option<DataType> {
         return Some(DataType::Decimal128(p, s));
     }
 
-    // VARCHAR / CHAR / unknown → string path (handled by the caller, not a fixed
-    // Arrow target). Returning None signals "route through the Utf8/JSON path".
     None
 }
 
-/// Max precision a scale-0 DECIMAL fits into a 32-bit int (Exasol ExaType Int32).
 pub const DECIMAL_INT32_MAX_PRECISION: u8 = 9;
 
-/// Max precision a scale-0 DECIMAL fits into a 64-bit int (Exasol ExaType Int64).
 pub const DECIMAL_INT64_MAX_PRECISION: u8 = 18;
 
-/// Exasol's maximum DECIMAL precision. `CAST(1 AS DECIMAL(0,0))` fails live with
-/// "illegal precision value: 0" and a precision above this ceiling is rejected the
-/// same way (SQL state 42000), so a catalog-declared decimal outside `1..=36` is
-/// declared VARCHAR(2000000) instead.
 const EXASOL_DECIMAL_MAX_PRECISION: u32 = 36;
 
-/// Parse the `(p,s)` arguments of a `DECIMAL(p,s)` Exasol type string.
-///
-/// Accepts `DECIMAL(p,s)` and `DECIMAL(p)` (scale defaults to 0). The input must
-/// be upper-cased, and the `DECIMAL(` prefix must start at offset 0 — leading or
-/// trailing whitespace around the whole string yields `None`. Whitespace around
-/// each individual argument (`p`, `s`), by contrast, IS trimmed before parsing.
-/// Returns `None` for any string that is not a well-formed DECIMAL declaration.
-///
-/// This is the only implementation of the Exasol `DECIMAL` argument grammar; it
-/// is `pub(crate)` so every consumer of an Exasol type string reads precision and
-/// scale the same way, rather than re-deriving the parse and silently disagreeing
-/// on the edges (an absent scale, a negative scale, an out-of-range argument).
+/// Accepts `DECIMAL(p,s)` and `DECIMAL(p)` (scale 0). Input must be upper-cased with no
+/// surrounding whitespace; whitespace around each argument is trimmed.
 pub(crate) fn parse_decimal_args(upper: &str) -> Option<(u8, i8)> {
     let inner = upper.strip_prefix("DECIMAL(")?.strip_suffix(')')?;
     let mut parts = inner.split(',');
@@ -212,20 +128,12 @@ pub(crate) fn parse_decimal_args(upper: &str) -> Option<(u8, i8)> {
     Some((p, s))
 }
 
-/// Whether an Arrow DataType needs JSON serialization before crossing the boundary.
-/// True for out-of-range Decimal128 and all incompatible types.
 pub fn needs_json_fallback(dt: &DataType) -> bool {
     compatible_exasol_type(dt).is_none()
 }
 
-/// Whether an Arrow DataType is one of the five variants
-/// `datafusion-scan/nested-json-rendering` renders as a JSON document (`List`,
-/// `LargeList`, `FixedSizeList`, `Struct`, `Map`).
-///
-/// Narrower than `needs_json_fallback`, which also answers true for `Binary` and an
-/// out-of-range `Decimal128` — both of which keep the `CAST(col AS VARCHAR)`
-/// Arrow-display path this predicate diverts columns away from. The two predicates
-/// answer different questions and neither is derived from the other.
+/// Narrower than `needs_json_fallback`: `Binary` and an out-of-range `Decimal128` keep the
+/// `CAST(col AS VARCHAR)` Arrow-display path instead of JSON document rendering.
 pub fn needs_nested_json_rendering(dt: &DataType) -> bool {
     matches!(
         dt,
@@ -237,43 +145,21 @@ pub fn needs_nested_json_rendering(dt: &DataType) -> bool {
     )
 }
 
-/// Whether Exasol can express a CATALOG-declared `DECIMAL(precision, scale)`.
-///
-/// Sole owner of Exasol's DECIMAL domain for catalog wire input:
-/// `1 <= p <= EXASOL_DECIMAL_MAX_PRECISION` and `s <= p`. Both bounds are live
-/// captures rather than documented limits — `CAST(1 AS DECIMAL(0,0))` is rejected
-/// with "illegal precision value: 0" and `CAST(1 AS DECIMAL(5,10))` with "illegal
-/// scale value: 10", both SQL state 42000. `s >= 0` needs no test: every
-/// catalog-sourced scale is unsigned.
-///
-/// Every consumer of a catalog-declared decimal reads the decision here — the
-/// Exasol type string, the logical Arrow tag, and the `initial-default` encoding
-/// gate — so a Unity `DECIMAL(0,0)`, an Iceberg `decimal(0,0)`, and the Arrow type
-/// the scan builds for it cannot disagree.
-///
-/// The two ARROW-input guards deliberately do NOT read this (decision-log decision
-/// [7]): `compatible_exasol_type` takes a signed `Decimal128` scale that is
-/// legitimately negative and has no `s <= p` analogue, and `exasol_type_from_json`
-/// reads Exasol's own `dataType` for a type Exasol has already accepted.
+/// Exasol's DECIMAL domain for catalog-declared decimals: `1 <= p <= 36`, `s <= p` (live:
+/// `DECIMAL(0,0)` and `DECIMAL(5,10)` are rejected with SQL state 42000). Every catalog
+/// decimal consumer reads this so the Exasol type, Arrow tag, and default encoding agree.
+/// The Arrow-input guards don't: an Arrow scale may be negative, and `exasol_type_from_json`
+/// reads a type Exasol already accepted.
 pub(crate) fn exasol_representable_catalog_decimal(precision: u32, scale: u32) -> bool {
     (1..=EXASOL_DECIMAL_MAX_PRECISION).contains(&precision) && scale <= precision
 }
 
-/// A catalog-declared decimal's precision and scale, carried as one value so a
-/// caller with a third parameter to add (e.g. `timestamp_precision`) has room
-/// under the guardrail limit of three function parameters.
 #[derive(Debug, Clone, Copy)]
 struct CatalogDecimal {
     precision: u32,
     scale: u32,
 }
 
-/// Decide the Exasol type for a catalog-declared decimal.
-///
-/// Outside [`exasol_representable_catalog_decimal`] the column is declared
-/// VARCHAR(2000000) and carried as a JSON string, the same fallback an
-/// out-of-range precision already took. Both catalog kinds read the decision here
-/// so a Unity `DECIMAL(0,0)` and an Iceberg `decimal(0,0)` cannot diverge.
 fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> String {
     if exasol_representable_catalog_decimal(precision, scale) {
         format!("DECIMAL({precision},{scale})")
@@ -282,11 +168,8 @@ fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> String {
     }
 }
 
-/// Exasol's first calendar-versioned release; every earlier line numbers 8.x or below.
 const FIRST_CALENDAR_VERSIONED_MAJOR: u32 = 2025;
 
-/// The fractional-second width a catalog declares for ONE timestamp column. Sole
-/// owner of the declaration string and the Arrow unit, so the two cannot disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimestampPrecision {
     Millisecond,
@@ -311,9 +194,8 @@ impl TimestampPrecision {
         }
     }
 
-    /// Rounds UP in fidelity: the coarsest width that still holds every digit `p`
-    /// declares, floored at millisecond because no emit path here feeds Arrow's
-    /// `Second` unit. A mapping error can then only emit a value Exasol truncates.
+    /// Rounds up to the coarsest width holding every declared digit, floored at millisecond
+    /// because no emit path feeds Arrow's `Second` unit.
     pub fn from_declared_digits(digits: u32) -> Self {
         match digits {
             0..=3 => Self::Millisecond,
@@ -323,24 +205,17 @@ impl TimestampPrecision {
     }
 }
 
-/// The finest width the running engine can emit, resolved once per request.
-///
-/// Both engine lines ACCEPT a parameterized declaration, but 8.x silently
-/// downgrades it to `TIMESTAMP(3)` (decision-log.md `[C1]`/`[C3]`). Clamping here
-/// keeps `SYS.EXA_ALL_COLUMNS` honest about what the adapter obtained.
+/// Exasol 8.x accepts a parameterized timestamp declaration but silently downgrades it to
+/// `TIMESTAMP(3)`; clamping keeps `SYS.EXA_ALL_COLUMNS` honest.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EngineTimestampSupport {
-    /// Exasol 8.x and earlier: every source width narrows to the bare `TIMESTAMP`.
     MillisecondOnly,
-    /// Exasol 2025.x and later: the source width is declared and emitted as-is.
     DeclaredPrecision,
 }
 
 impl EngineTimestampSupport {
-    /// Infallible, so the enumeration it feeds cannot fail on it. An empty or
-    /// unparseable version takes the fidelity-preserving arm deliberately: an 8.x
-    /// engine only misdeclares, while an unrecognised newer one would otherwise
-    /// truncate every value (decision-log.md interview Q2).
+    /// An unparseable version maps to `DeclaredPrecision`: misdeclaring on 8.x is harmless,
+    /// whereas truncating on an unrecognised newer engine would lose data.
     pub fn from_database_version(version: &str) -> Self {
         match version
             .split('.')
@@ -360,8 +235,6 @@ impl EngineTimestampSupport {
     }
 }
 
-/// Map an Iceberg `PrimitiveType` to an Exasol type string, used by
-/// `createVirtualSchema`. Each timestamp variant names its own Iceberg-spec width.
 pub fn iceberg_primitive_to_exasol(
     pt: &iceberg::spec::PrimitiveType,
     engine: EngineTimestampSupport,
@@ -375,13 +248,9 @@ pub fn iceberg_primitive_to_exasol(
         Double => "DOUBLE PRECISION".to_string(),
         Decimal { precision, scale } => catalog_decimal_to_exasol(*precision, *scale),
         Date => "DATE".to_string(),
-        // Time has no Exasol equivalent → VARCHAR via JSON
         Time => "VARCHAR(2000000)".to_string(),
-        // timestamptz collapses to plain Exasol TIMESTAMP alongside timestamp:
-        // Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS output type,
-        // and an Iceberg timestamptz is a UTC instant, so the emitted value is
-        // unchanged. The internal tz-aware Arrow representation is kept in
-        // iceberg_primitive_to_arrow.
+        // Exasol rejects TIMESTAMP WITH LOCAL TIME ZONE as a UDF EMITS type; timestamptz is
+        // a UTC instant, so plain TIMESTAMP emits it unchanged.
         Timestamp | Timestamptz => engine
             .clamp(TimestampPrecision::Microsecond)
             .declaration()
@@ -391,28 +260,13 @@ pub fn iceberg_primitive_to_exasol(
             .declaration()
             .to_string(),
         String | Uuid => "VARCHAR(2000000)".to_string(),
-        // Fixed-width binary and arbitrary binary → VARCHAR via JSON
         Fixed(_) | Binary => "VARCHAR(2000000)".to_string(),
     }
 }
 
-/// Map an Iceberg `PrimitiveType` to an Arrow `DataType`, used for building the
-/// logical Arrow schema carried in `ScanSpec::logical_schema`.
-///
-/// Held in lockstep with [`iceberg_primitive_to_exasol`] by reading the same
-/// [`exasol_representable_catalog_decimal`] predicate: a decimal within Exasol's
-/// catalog-decimal domain (`1 <= p <= 36`, `s <= p`) maps to `Decimal128(p, s)`,
-/// and one outside it maps to `Utf8` (surfaced as JSON VARCHAR) alongside the
-/// types with no Arrow equivalent (Time, Fixed, Binary). The lockstep is load-
-/// bearing in both directions: a tag naming `Decimal128` for a column
-/// `createVirtualSchema` declared VARCHAR would break the single-source-of-truth
-/// contract in [`exasol_type_to_arrow`], and arrow-rs rejects `precision == 0`
-/// and `scale > precision` outright, so such a tag would name an Arrow type the
-/// scan cannot instantiate.
-///
-/// This is the logical Iceberg→Arrow mapping and is unaffected by physical
-/// Parquet INT96 decode coercion, which is a scan-layer concern (see
-/// `crates/lakehouse-engine/src/scan/`) — not this file.
+/// Must stay in lockstep with [`iceberg_primitive_to_exasol`] on the decimal domain: a
+/// `Decimal128` tag for a column declared VARCHAR breaks [`exasol_type_to_arrow`], and
+/// arrow-rs rejects `precision == 0` and `scale > precision` outright.
 pub fn iceberg_primitive_to_arrow(pt: &iceberg::spec::PrimitiveType) -> DataType {
     use arrow::datatypes::TimeUnit;
     use iceberg::spec::PrimitiveType::*;
@@ -440,8 +294,6 @@ pub fn iceberg_primitive_to_arrow(pt: &iceberg::spec::PrimitiveType) -> DataType
     }
 }
 
-/// Map an Iceberg `Type` to an Arrow `DataType`.
-/// Non-primitive types (List, Struct, Map) → `Utf8` (JSON fallback).
 pub fn iceberg_type_to_arrow(ty: &iceberg::spec::Type) -> DataType {
     use iceberg::spec::Type;
     match ty {
@@ -450,9 +302,6 @@ pub fn iceberg_type_to_arrow(ty: &iceberg::spec::Type) -> DataType {
     }
 }
 
-/// Convert an Arrow `DataType` to the compact string tag used in `ScanSpec::logical_schema`.
-///
-/// The tag vocabulary covers every Arrow type [`compatible_exasol_type`] admits; unknown/other types fall back to `"utf8"` (JSON VARCHAR path).
 pub fn arrow_type_to_tag(dt: &DataType) -> String {
     use arrow::datatypes::TimeUnit;
     match dt {
@@ -483,18 +332,8 @@ pub fn arrow_type_to_tag(dt: &DataType) -> String {
     }
 }
 
-/// Parse a compact string tag (from `ScanSpec::logical_schema`) back to an Arrow `DataType`.
-///
-/// Returns `DataType::Utf8` for any unrecognised tag — the JSON VARCHAR fallback.
-///
-/// The lowercase `decimal128(p,s)` parse below is deliberately NOT routed through
-/// [`parse_decimal_args`], despite the surface similarity. It reads the internal
-/// `ScanSpec::logical_schema` tag vocabulary produced by [`arrow_type_to_tag`] —
-/// a different wire format from the Exasol SQL type grammar, changing for a
-/// different reason — and it requires BOTH arguments, where `parse_decimal_args`
-/// defaults an absent scale to `0`. Sharing one parser between the two would
-/// either accept a scale-less `decimal128(p)` tag no producer emits or force a
-/// prefix/arity parameter onto the Exasol-side parser.
+/// Returns `DataType::Utf8` for any unrecognised tag. `decimal128(p,s)` deliberately does not
+/// use [`parse_decimal_args`]: the tag grammar requires both arguments.
 pub fn arrow_type_from_tag(tag: &str) -> DataType {
     use arrow::datatypes::TimeUnit;
     match tag {
@@ -521,7 +360,6 @@ pub fn arrow_type_from_tag(tag: &str) -> DataType {
         "timestamptz_us" => DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
         "timestamptz_ns" => DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
         other => {
-            // Try to parse "decimal128(p,s)"
             if let Some(inner) = other
                 .strip_prefix("decimal128(")
                 .and_then(|s| s.strip_suffix(')'))
@@ -538,22 +376,14 @@ pub fn arrow_type_from_tag(tag: &str) -> DataType {
     }
 }
 
-/// Map an Iceberg `Type` to an Exasol type string.
-/// Non-primitive types (List, Struct, Map) → VARCHAR(2000000) via JSON.
 pub fn iceberg_type_to_exasol(ty: &iceberg::spec::Type, engine: EngineTimestampSupport) -> String {
     use iceberg::spec::Type;
     match ty {
         Type::Primitive(pt) => iceberg_primitive_to_exasol(pt, engine),
-        // List, Struct, Map → JSON string fallback
         _ => "VARCHAR(2000000)".to_string(),
     }
 }
 
-/// Map a column's source-tagged type descriptor to an Exasol type string.
-///
-/// The single home both catalog kinds go through: [`ColumnSourceType`] is not
-/// `#[non_exhaustive]`, so adding a third source becomes a compile error here
-/// rather than a silently-unmapped type elsewhere.
 pub(crate) fn column_source_type_to_exasol(
     source_type: &ColumnSourceType,
     engine: EngineTimestampSupport,
@@ -576,14 +406,7 @@ pub(crate) fn column_source_type_to_exasol(
     }
 }
 
-/// Map a Unity Catalog Spark scalar type name to an Exasol type string, per the
-/// project's Arrow-to-Exasol convention. `decimal` only applies to `DECIMAL` and
-/// is ignored otherwise; `engine` narrows the timestamp arm's source width to what
-/// the running engine emits, and applies to no other arm. Any type
-/// without a clean scalar Exasol equivalent falls back to VARCHAR(2000000) via
-/// JSON rather than failing enumeration; for `DECIMAL` that fallback is decided
-/// by the shared [`exasol_representable_catalog_decimal`] domain
-/// (`1 <= p <= 36`, `s <= p`).
+/// Unmappable Spark types fall back to VARCHAR(2000000) rather than failing enumeration.
 fn unity_type_name_to_exasol(
     type_name: &str,
     decimal: CatalogDecimal,
@@ -598,23 +421,16 @@ fn unity_type_name_to_exasol(
         "FLOAT" | "DOUBLE" => "DOUBLE PRECISION".to_string(),
         "STRING" => "VARCHAR(2000000)".to_string(),
         "DATE" => "DATE".to_string(),
-        // No nanosecond arm: the Delta protocol types both `timestamp` and
-        // `timestamp without time zone` as microsecond precision and defines no
-        // nanosecond timestamp type.
+        // The Delta protocol defines no nanosecond timestamp type.
         "TIMESTAMP" | "TIMESTAMP_NTZ" => engine
             .clamp(TimestampPrecision::Microsecond)
             .declaration()
             .to_string(),
         "DECIMAL" => catalog_decimal_to_exasol(decimal.precision, decimal.scale),
-        // Every incompatible Spark type (ARRAY, MAP, STRUCT, BINARY, INTERVAL,
-        // VARIANT, ...): VARCHAR via JSON fallback.
         _ => "VARCHAR(2000000)".to_string(),
     }
 }
 
-/// The family an Exasol SQL type string belongs to, as the pushdown guards
-/// (`guard_like_subject`, `is_bare_decimal_column`, `coerce_string_position_arg` in
-/// `adapter/pushdown/support.rs`) branch on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExaTypeClass {
     Character,
@@ -623,20 +439,8 @@ pub enum ExaTypeClass {
     Other,
 }
 
-/// Classify an Exasol SQL type string into the family the three pushdown guards in
-/// `adapter/pushdown/support.rs` — `guard_like_subject`, `is_bare_decimal_column`,
-/// and `coerce_string_position_arg` — branch on.
-///
-/// - [`ExaTypeClass::Character`] iff the string starts with `"VARCHAR"` or `"CHAR"`.
-/// - [`ExaTypeClass::Decimal`] iff the string starts with `"DECIMAL"` — deliberately
-///   NOT `"DECIMAL("`, because the bare string `DECIMAL` (no arguments) is also
-///   classified as DECIMAL by all three guards.
-/// - [`ExaTypeClass::Date`] iff the string equals `"DATE"` exactly.
-/// - [`ExaTypeClass::Other`] otherwise.
-///
-/// The column-lookup-miss case the three guards also decline on is the caller's own
-/// branch (an absent/unresolved column type), not part of this classifier, which
-/// takes a resolved type string.
+/// Matches the `"DECIMAL"` prefix, not `"DECIMAL("`, so a bare `DECIMAL` also classifies as
+/// Decimal.
 pub fn classify_exa_type(type_str: &str) -> ExaTypeClass {
     if type_str.starts_with("VARCHAR") || type_str.starts_with("CHAR") {
         ExaTypeClass::Character
@@ -649,8 +453,6 @@ pub fn classify_exa_type(type_str: &str) -> ExaTypeClass {
     }
 }
 
-/// Convert an Exasol type string to the VS column dataType JSON object.
-/// Minimal implementation covering the types produced by our mapping.
 pub(crate) fn exasol_type_to_json(exasol_type: &str) -> Json {
     let upper = exasol_type.to_uppercase();
     if upper == "BOOLEAN" {
@@ -676,11 +478,9 @@ pub(crate) fn exasol_type_to_json(exasol_type: &str) -> Json {
         return json!({"type": "timestamp", "fractionalSecondsPrecision": p});
     }
     if let Some((p, s)) = parse_decimal_args(&upper) {
-        // `s` stays an `i8` here: serialized as a SIGNED JSON number so a negative
-        // Arrow decimal scale can never wrap into a large unsigned value.
+        // Signed on purpose: a negative Arrow scale must not wrap to a large unsigned value.
         return json!({"type": "decimal", "precision": p, "scale": s});
     }
-    // Default: VARCHAR(size)
     let size = if let Some(inner) = upper
         .strip_prefix("VARCHAR(")
         .and_then(|s| s.strip_suffix(')'))
@@ -692,19 +492,11 @@ pub(crate) fn exasol_type_to_json(exasol_type: &str) -> Json {
     json!({"type": "varchar", "size": size})
 }
 
-/// Exasol's maximum CHAR width. A wider declaration is rejected outright:
-/// `CAST('a' AS CHAR(2001))` fails live with "specified length too long for char
-/// type - maximum is 2000". So a CHAR `size` is capped here rather than reusing
-/// VARCHAR's 2,000,000 ceiling.
+/// Exasol rejects `CHAR(2001)` and wider.
 const EXASOL_CHAR_MAX_SIZE: u64 = 2000;
 
-/// The character-set suffix a CHAR/VARCHAR declaration needs, `" ASCII"` or `""`.
-///
-/// Exasol treats an unsuffixed character declaration as UTF8, so a column it
-/// declared `ASCII` must carry the suffix back or its type check reports a "Data
-/// type mismatch" (issue #136 follow-up). Shared by the CHAR and the catch-all
-/// VARCHAR arm: the rule must be identical for both, and a second copy would
-/// drift (issue #52).
+/// Exasol treats an unsuffixed character declaration as UTF8, so an `ASCII` column must carry
+/// the suffix back or its type check reports "Data type mismatch".
 fn character_set_suffix(dt: &Json) -> &'static str {
     let is_ascii = dt
         .get("characterSet")
@@ -713,7 +505,6 @@ fn character_set_suffix(dt: &Json) -> &'static str {
     if is_ascii { " ASCII" } else { "" }
 }
 
-/// Derive an Exasol type string from the VS column dataType JSON.
 pub(crate) fn exasol_type_from_json(dt: &Json) -> String {
     let type_name = dt.get("type").and_then(|t| t.as_str()).unwrap_or("varchar");
     match type_name.to_lowercase().as_str() {
@@ -747,18 +538,9 @@ pub(crate) fn exasol_type_from_json(dt: &Json) -> String {
             }
         }
         "char" => {
-            // A genuine CHAR must stay CHAR: Exasol validates the pushdown output
-            // column type positionally, and it declares an equal-length CASE, a bare
-            // string literal, and an explicit CAST-to-CHAR as CHAR(n) — rendering
-            // those VARCHAR(n) is rejected with "Data type mismatch" (issue #192).
-            //
-            // An absent `size` is unreachable from a real Exasol `dataType` — but if
-            // it occurred, it must NOT default to the maximum width: `CHAR(2000)`
-            // would blank-pad every value of that column to 2,000 characters, the
-            // most damaging default available. Instead fall back to the project's
-            // "unknown width" convention (`VARCHAR(2000000)`), matching
-            // `vs-expression`'s `render_cast_target` Exasol CHAR arm. The
-            // `EXASOL_CHAR_MAX_SIZE` cap applies only to a PRESENT `size`.
+            // Exasol validates pushdown output types positionally, so CHAR(n) rendered as
+            // VARCHAR(n) is rejected (#192). A missing size must not default to CHAR(2000),
+            // which would blank-pad every value.
             match dt.get("size").and_then(|v| v.as_u64()) {
                 Some(size) => {
                     let capped = size.min(EXASOL_CHAR_MAX_SIZE);
@@ -768,7 +550,6 @@ pub(crate) fn exasol_type_from_json(dt: &Json) -> String {
             }
         }
         _ => {
-            // VARCHAR and all others.
             let size = dt.get("size").and_then(|v| v.as_u64()).unwrap_or(2000000);
             let capped = size.min(2000000);
             format!("VARCHAR({capped}){}", character_set_suffix(dt))

@@ -1,15 +1,6 @@
-//! The one JSON encoder for nested Arrow columns.
-//!
-//! Exasol has no array, list, struct, or map type, so every such column is surfaced as the
-//! `VARCHAR(2000000)` the schema declares for it, carrying one JSON document per value. This
-//! module is that rendering, and it is reached from BOTH scan paths — as the expression the
-//! column-binding adapter substitutes for a nested physical column, and as the function the
-//! generated SQL invokes on the legacy inferred-schema path — so a given value renders
-//! identically whichever path produced it.
-//!
-//! `arrow-cast` is deliberately not involved: it offers no `Struct → Utf8` or `Map → Utf8`
-//! cast at all, and its `List → Utf8` cast produces Arrow display text (`[hello, world]`,
-//! unquoted and ambiguous for a null element) rather than JSON.
+//! The one JSON encoder for nested Arrow columns, shared by both scan paths so a value renders
+//! identically either way. `arrow-cast` is not used: it has no `Struct`/`Map → Utf8` cast and its
+//! `List → Utf8` cast yields Arrow display text (`[hello, world]`), not JSON.
 
 use crate::types::mapping::needs_nested_json_rendering;
 use arrow::array::cast::AsArray;
@@ -23,17 +14,9 @@ use arrow::json::writer::{EncoderOptions, make_encoder};
 use datafusion::error::{DataFusionError, Result};
 use std::sync::Arc;
 
-/// Render one nested Arrow column as a `Utf8` column of JSON documents.
-///
-/// A null cell renders as a NULL in the returned column — never as the text `null`, `{}`, or
-/// `[]` — because the encoder's own contract leaves a null index unspecified and renders an
-/// empty container for one. A null MEMBER of a populated cell renders as an explicit JSON
-/// `null`, so every row of one column carries the same object shape and an Exasol
-/// `JSON_VALUE` path never disappears between rows.
-///
-/// Only the five nested types [`needs_nested_json_rendering`] owns are accepted. That
-/// predicate is the single authority on which types this encoder serves, so no caller can
-/// classify a column into the JSON-rendered half while this module classifies it out.
+/// A null cell renders as NULL, not `null`/`{}`/`[]`, because the encoder leaves a null index
+/// unspecified. A null member renders as explicit JSON `null` so every row keeps the same shape
+/// and an Exasol `JSON_VALUE` path never disappears between rows.
 pub(crate) fn render_nested_column_as_json(array: &ArrayRef) -> Result<StringArray> {
     if !needs_nested_json_rendering(array.data_type()) {
         return Err(DataFusionError::Execution(format!(
@@ -75,12 +58,8 @@ fn encode_documents(array: &ArrayRef) -> Result<StringArray> {
     Ok(documents.finish())
 }
 
-/// Rebuild `array` with every map key child replaced by a `Utf8` array of stringified keys,
-/// at any depth, leaving the array untouched when no such key exists.
-///
-/// A JSON object name is a string (RFC 8259) while the Iceberg spec permits ANY type as a
-/// map key, and the encoder refuses a non-`Utf8` key outright — so the replacement happens
-/// here, before encoding, rather than as a fallback inside the encoder.
+/// JSON object names must be strings (RFC 8259) while Iceberg permits any map key type, and the
+/// encoder refuses non-`Utf8` keys, so keys are stringified here before encoding.
 fn with_stringified_map_keys(array: &ArrayRef) -> Result<ArrayRef> {
     if !map_keys_need_stringifying(array.data_type()) {
         return Ok(Arc::clone(array));

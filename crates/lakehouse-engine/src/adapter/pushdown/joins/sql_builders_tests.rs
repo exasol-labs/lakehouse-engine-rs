@@ -12,10 +12,7 @@ use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::{SortKey, StorageBackend, StorageProps};
 use vs_expression::{render_expression_exasol_safe, render_expression_safe};
 
-/// The Q1-shape three-table inner-join pushdown request:
-/// `(SUPPLIER ⋈ NATION) ⋈ REGION`, all three in `TABLE_MAP`. Leaves in stable
-/// tree order SUPPLIER, NATION, REGION; two join conditions
-/// (`S_NATIONKEY=N_NATIONKEY`, `N_REGIONKEY=R_REGIONKEY`).
+/// Q1 shape: `(SUPPLIER ⋈ NATION) ⋈ REGION`.
 fn q1_join_request() -> Json {
     serde_json::json!({
         "involvedTables": [
@@ -54,31 +51,9 @@ fn q1_join_request() -> Json {
     })
 }
 
-// -----------------------------------------------------------------------
-// Join SQL-shape and decline routing
-// -----------------------------------------------------------------------
-
-/// pushdown-planning-join "A join outside the broadcast contract is declined
-/// safely". Two independent facets are asserted together because they are the
-/// two ways a join leaves the broadcast contract:
-///
-/// 1. A shape `detect_join` classifies `Ineligible` (a non-inner join node in the
-///    tree, or a malformed shape) cannot be rendered at all — so it MUST map to a
-///    `User` decline error, NEVER fall through to the single-table path (which
-///    would scan only the first involved table and silently drop the join).
-///    Spanning more than two tables, non-equi, and overlapping column names are
-///    NOT Ineligible — they are served by the unified fallback.
-/// 2. An otherwise-eligible join whose two tables share a column name fails the
-///    disjoint-column guard, so `render_broadcast_join` declines with `Ok(None)`.
-///    The `vs-expression` translator emits only bare column names, so a two-scan
-///    wrapper would carry an ambiguous `ON`/`WHERE`/`SELECT` — hence the router
-///    treats `None` as "fallback cannot be built" and errors rather than emit a
-///    wrong plan.
+/// Scenario: A join outside the broadcast contract is declined safely
 #[test]
 fn join_outside_contract_declined_safely() {
-    // Facet 1: every ineligible reason declines to a HARD error — a
-    // client-facing F-UDF-CL-RUST-9001, NEVER a native re-plan. The message must
-    // say so plainly (contains "declined"/"cannot") and MUST NOT claim a retry.
     for reason in [
         IneligibleJoinReason::NotInnerJoinType,
         IneligibleJoinReason::UnsupportedShape,
@@ -99,7 +74,6 @@ fn join_outside_contract_declined_safely() {
         }
     }
 
-    // An outer join reaches the decline path as Ineligible, never Join.
     let outer = join_request(
         serde_json::json!({"join_type": "left_outer"}),
         equi_condition(),
@@ -114,7 +88,6 @@ fn join_outside_contract_declined_safely() {
         "an outer join must classify Ineligible so the decline path is taken"
     );
 
-    // Facet 2: overlapping column names → render declines with Ok(None).
     let mut request = join_request(Json::Null, equi_condition());
     for table_idx in [0, 1] {
         request["involvedTables"][table_idx]["columns"]
@@ -134,18 +107,7 @@ fn join_outside_contract_declined_safely() {
     );
 }
 
-/// A widened derived projection is the full two-table base row, not one item per
-/// select-list item, so a broadcast fan-out would emit the wrong column shape.
-/// `render_broadcast_join` must take its EXISTING clean-decline exit (`Ok(None)`,
-/// never an error) and let the unified N-scan wrapper re-render the select list
-/// table-qualified (#196).
-///
-/// The widening trigger is issue #234's own: a rendered item whose declared type
-/// is not a valid UDF EMITS output (`TIMESTAMP WITH LOCAL TIME ZONE`, sqlCode
-/// 22002). The request carries no aggregate/GROUP BY/ORDER BY/LIMIT/HAVING, so it
-/// genuinely reaches broadcast eligibility live rather than being skipped by
-/// `classify_join_window`. The same request with an EMITS-valid
-/// declared type renders, so the decline is caused by the widening alone.
+/// Scenario: A widened projection declines broadcast for the N-scan wrapper (#196, #234)
 #[test]
 fn broadcast_join_declines_widened_projection() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -160,7 +122,6 @@ fn broadcast_join_declines_widened_projection() {
     ));
     let detected = detected_join(&request);
 
-    // Control: an EMITS-valid declared type does not widen, so broadcast renders.
     let mut ok_req = request.clone();
     ok_req["pushdownRequest"]["selectListDataTypes"] =
         serde_json::json!([{"type": "varchar", "size": 100}]);
@@ -174,7 +135,6 @@ fn broadcast_join_declines_widened_projection() {
         "the control must render a broadcast plan, so only the widening differs"
     );
 
-    // An EMITS-rejected declared type widens the projection to the full base row.
     request["pushdownRequest"]["selectListDataTypes"] =
         serde_json::json!([{"type": "timestamp", "withLocalTimeZone": true}]);
     let pushdown_req = pd(&request);
@@ -195,14 +155,7 @@ fn broadcast_join_declines_widened_projection() {
     );
 }
 
-/// A broadcast-eligible join whose WHERE filter DataFusion cannot render must
-/// decline the broadcast plan (`Ok(None)`), exactly like the disjoint-schema and
-/// widened-projection declines above — a broadcast plan has no outer `WHERE` to
-/// catch a predicate the scan spec cannot carry, so the request MUST fall
-/// through to the N-scan fallback, whose wrapper self-applies it. The
-/// absent-filter case (same join, no filter at all) is the control: it MUST
-/// remain broadcast-eligible, proving the decline is caused by the filter alone,
-/// not the join shape.
+/// Scenario: An unrenderable filter declines broadcast; an absent filter stays eligible
 #[test]
 fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -228,7 +181,6 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
          request falls through to the N-scan fallback, which self-applies it"
     );
 
-    // Control: the same join with no filter at all must stay broadcast-eligible.
     let absent_request = join_request(Json::Null, equi_condition());
     let absent_detected = detected_join(&absent_request);
     assert!(
@@ -239,19 +191,7 @@ fn broadcast_declines_on_unrenderable_filter_stays_eligible_when_absent() {
     );
 }
 
-/// A `LIKE` over a side column whose Exasol type is `DECIMAL(20,0)` (issue #207)
-/// must decline the broadcast plan through the SAME type-rewrite pipeline the
-/// single-table WHERE surface runs (`classify_where_filter` →
-/// `apply_type_rewrites` → `like_subject_type_guard`): DataFusion has no
-/// LIKE-DECIMAL coercion, so pushing this bare would hard-fail the scan at
-/// execution time (sqlCode 22002, issue #215). A broadcast plan has no outer
-/// WHERE to self-apply a declined predicate, so the whole plan must fall through
-/// to the N-scan fallback, whose wrapper self-applies it instead.
-///
-/// Regression: today's syntactic `datafusion_renderable` pre-check has no
-/// column-type awareness — a bare LIKE over C_CUSTKEY renders fine syntactically
-/// — so this assertion is false until `render_broadcast_join` is wired to
-/// `classify_where_filter`.
+/// Scenario: LIKE over a DECIMAL side column declines broadcast (#207, #215)
 #[test]
 fn broadcast_declines_like_over_decimal_side_column() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -272,17 +212,7 @@ fn broadcast_declines_like_over_decimal_side_column() {
     );
 }
 
-/// A `LIKE` over a side column whose Exasol type is `DATE` keeps the broadcast
-/// plan: `like_subject_type_guard` rewraps the subject as
-/// `CAST(<col> AS VARCHAR)` (DataFusion's `Date32`→`Utf8` cast matches Exasol's
-/// default `NLS_DATE_FORMAT`), so the rewritten tree still renders for DataFusion
-/// and the broadcast optimization survives — unlike the DECIMAL case above, which
-/// has no such safe rewrite.
-///
-/// Regression: today's code calls the raw `render_df_filter_safe` over the
-/// UNREWRITTEN tree, so the rendered filter carries a bare `"O_ORDERDATE" LIKE`
-/// with no CAST — this assertion is false until the type-rewrite pipeline is
-/// wired in.
+/// Scenario: LIKE over a DATE side column keeps broadcast with a CAST-to-VARCHAR subject
 #[test]
 fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -306,17 +236,7 @@ fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
     );
 }
 
-/// `INSTR(C_NAME, 'b', 3)` — a three-argument call whose arity
-/// `string_function_arg_type_guard` declines because `vs-expression` renders it
-/// incompletely (issue #228) — must decline the broadcast plan through the same
-/// pipeline, exactly like the LIKE/DECIMAL case above: Exasol must evaluate the
-/// native three-argument INSTR itself rather than receive a silently truncated
-/// two-argument rendering.
-///
-/// Regression: today's syntactic pre-check does not distinguish an incomplete
-/// rendering from a correct one — `vs-expression` DOES produce SOME SQL for this
-/// arity, just the wrong SQL — so this assertion is false until the type-rewrite
-/// pipeline's arity guard is wired in.
+/// Scenario: INSTR with a start-position argument declines broadcast (#228)
 #[test]
 fn broadcast_declines_instr_with_start_position_argument() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -345,11 +265,7 @@ fn broadcast_declines_instr_with_start_position_argument() {
     );
 }
 
-/// An absent filter and a trivially-true filter both stay broadcast-eligible with
-/// no scan-spec filter carried at all: `classify_where_filter`'s
-/// absent-vs-declined distinction must not treat "nothing to render" as a
-/// decline, so wiring it into `render_broadcast_join` must not regress either
-/// no-filter shape.
+/// Scenario: Absent and trivially-true filters stay broadcast-eligible with no scan filter
 #[test]
 fn broadcast_absent_and_trivially_true_filter_stay_eligible() {
     let absent_request = join_request(Json::Null, equi_condition());
@@ -377,11 +293,7 @@ fn broadcast_absent_and_trivially_true_filter_stay_eligible() {
     );
 }
 
-/// The unified fallback (N = 2): each side scanned through its own sharded
-/// fan-out, joined by an `INNER JOIN … ON` chain (the join condition on the join
-/// point), projecting the qualified select list. The single ORDERS-side-local
-/// filter is pushed into the ORDERS leg, so the outer WHERE has no residual. The
-/// two-table case uses the SAME `LHS_T*` renderer as N ≥ 3.
+/// Scenario: A two-table join falls back to the unified N-scan wrapper
 #[test]
 fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -420,8 +332,6 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
         sql.contains(r#"SELECT "LHS_T0"."C_NAME", "LHS_T1"."O_ORDERDATE" FROM"#),
         "the cross-table projection must drive the outer SELECT in order: {sql}"
     );
-    // The lone ORDERS-side-local filter is pushed into the ORDERS leg, so no
-    // residual conjunct remains and there is no outer WHERE.
     assert!(
         sql.contains("'1995-01-01'"),
         "the ORDERS-side-local filter must be pushed into that leg's fan-out: {sql}"
@@ -430,7 +340,6 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
         !sql.contains(" WHERE "),
         "every side-local filter is pushed into its leg, so no residual outer WHERE: {sql}"
     );
-    // The unified fallback is an INNER JOIN chain, never a broadcast join block.
     assert!(sql.contains("INNER JOIN"), "{sql}");
     assert!(
         !sql.contains("\"join\":{"),
@@ -438,15 +347,7 @@ fn two_table_join_falls_back_to_unified_n_scan_wrapper() {
     );
 }
 
-/// A residual set that renders TRIVIALLY TRUE emits no outer WHERE and MUST NOT
-/// error. `render_df_filter_qualified` suppresses a trivially-true render to
-/// `None` exactly as its DataFusion twin does, so gating the
-/// unrenderable-residual error on that `None` alone would hard-fail a query that
-/// correctly emits no clause. The non-suppressing `render_expression_qualified`
-/// over the same tree separates the two causes.
-///
-/// A column-free conjunct is residual by construction (`JoinLegs::conjunct_leg` is
-/// `None`), so this is the shape that reaches the gate.
+/// Scenario: A trivially-true residual emits no outer WHERE and does not error
 #[test]
 fn trivially_true_residual_emits_no_outer_where_and_does_not_error() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -475,16 +376,7 @@ fn trivially_true_residual_emits_no_outer_where_and_does_not_error() {
     );
 }
 
-// -----------------------------------------------------------------------
-// Qualified two-scan fallback: rendering independent of the disjoint-column
-// guard, and aggregate-over-join routed through two-scan.
-// -----------------------------------------------------------------------
-
-/// A join whose two tables share a column name (`ID`) fails the disjoint guard
-/// (so the broadcast path declines), but the unified N-scan fallback still builds
-/// a correct, UNAMBIGUOUS wrapper (N = 2): the condition and projection reference
-/// `"LHS_T0"."ID"` / `"LHS_T1"."ID"`, never a bare ambiguous `"ID"`. This is the
-/// `EVENTS ⋈ LABELS ON a.id = b.id` regression.
+/// Scenario: Colliding column names render a qualified unified wrapper without error
 #[test]
 fn colliding_columns_render_qualified_unified_wrapper_without_error() {
     let request = serde_json::json!({
@@ -513,8 +405,6 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
                 .to_string()},
     });
 
-    // Precondition: the shared ID column fails the disjoint guard, so broadcast
-    // rendering declines (Ok(None)) — the very reason the OLD code errored.
     let left = involved_table_columns(&request, "EVENTS");
     let right = involved_table_columns(&request, "LABELS");
     assert!(!disjoint_schema_guard(&left, &right));
@@ -551,12 +441,7 @@ fn colliding_columns_render_qualified_unified_wrapper_without_error() {
     assert!(sql.contains("INNER JOIN"), "{sql}");
 }
 
-/// The N-scan (N≥3) builder produces an `INNER JOIN … ON` chain — N distinct
-/// `LHS_T*` fan-out aliases, every one of the N-1 join conditions rendered
-/// table-qualified and greedily attached to its join point, and the select list
-/// qualified to its owning side — never an `Err` for an all-inner tree over
-/// resolvable tables (pushdown-planning-join "A three-or-more-table inner join
-/// falls back to an N-scan unaccelerated wrapper").
+/// Scenario: A three-or-more-table inner join falls back to an N-scan unaccelerated wrapper
 #[test]
 fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
     let request = three_table_join_request();
@@ -605,9 +490,7 @@ fn build_n_scan_join_sql_produces_qualified_n_scan_wrapper() {
     );
 }
 
-/// The N-scan builder also handles the Q1 shape (`supplier⋈nation⋈region`): three
-/// distinct `LHS_T*` fan-out aliases and both join conditions rendered
-/// table-qualified, never an `Err`.
+/// Scenario: The N-scan builder handles the Q1 shape
 #[test]
 fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
     let request = q1_join_request();
@@ -647,10 +530,7 @@ fn build_n_scan_join_sql_for_q1_shape_supplier_nation_region() {
     );
 }
 
-/// The N-scan builder also handles the NQ3 shape
-/// (`part⋈partsupp⋈supplier⋈nation`, N=4): four distinct `LHS_T*` fan-out
-/// aliases and all three join conditions rendered table-qualified, never an
-/// `Err` — the builder generalizes past N=3.
+/// Scenario: The N-scan builder handles the four-table NQ3 shape
 #[test]
 fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
     let request = nq3_join_request();
@@ -695,10 +575,7 @@ fn build_n_scan_join_sql_for_nq3_shape_part_partsupp_supplier_nation() {
     );
 }
 
-/// Three tables that ALL share a column name (`ID`) — the N-table analog of
-/// `colliding_columns_render_qualified_two_scan_without_error` — still build a
-/// correct, unambiguous N-scan wrapper: every `ID` reference (both join
-/// conditions and the select list) is table-qualified, never bare.
+/// Scenario: Three tables sharing a column name render fully qualified
 #[test]
 fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name() {
     let request = serde_json::json!({
@@ -764,27 +641,13 @@ fn build_n_scan_join_sql_renders_qualified_when_three_tables_share_column_name()
         sql.contains(r#""LHS_T1"."ID" = "LHS_T2"."ID""#),
         "second condition must be table-qualified, never bare/ambiguous: {sql}"
     );
-    // The outer wrapper's own SELECT list (as opposed to each independently
-    // scanned, unambiguous per-side fan-out's inner projection) must qualify
-    // every shared `ID` reference — never a bare, cross-side-ambiguous `"ID"`.
     assert!(
         sql.starts_with(r#"SELECT "LHS_T0"."ID", "LHS_T1"."LABEL", "LHS_T2"."TAG_NAME" FROM "#),
         "the outer SELECT list must qualify the shared ID column, never bare: {sql}"
     );
 }
 
-// ---------------------------------------------------------------------------
-// Self-join leg attribution (issue #361): each occurrence of a repeated table
-// renders as its own leg, never collapsing onto one.
-// ---------------------------------------------------------------------------
-
-/// Issue #361's own repro shape: `FROM FACT_ORDERS a JOIN FACT_ORDERS b ON
-/// a.O_ORDERKEY = b.O_ORDERKEY`. Before the fix the rendered `ON` compared
-/// `"LHS_T1"."O_ORDERKEY"` to itself (a tautology) and the select list was
-/// wrongly all-`LHS_T1`. Run for both a fully-aliased self-join and a mixed
-/// aliased/unaliased one (`FROM FACT_ORDERS JOIN FACT_ORDERS b`, also captured
-/// live returning 100 rows instead of 10) — both must resolve to exactly two
-/// distinct legs.
+/// Scenario: A self-join renders each occurrence as its own leg (#361)
 #[test]
 fn self_join_renders_each_occurrence_as_its_own_leg() {
     for leg_aliases in [[Some("A"), Some("B")], [None, Some("B")]] {
@@ -818,11 +681,7 @@ fn self_join_renders_each_occurrence_as_its_own_leg() {
     }
 }
 
-/// A three-leg self-join (`FACT_ORDERS a JOIN FACT_ORDERS b JOIN FACT_ORDERS c`)
-/// attaches its two conditions at two DIFFERENT join points, each exactly once —
-/// the pre-fix collapse rendered `ON 1=1` at one join point and duplicated the
-/// same tautology at the other, returning 1000 rows instead of 10 over a 10-row
-/// table (live capture).
+/// Scenario: A three-leg self-join attaches each condition at its own join point
 #[test]
 fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
     let request = self_join_request(&[Some("A"), Some("B"), Some("C")]);
@@ -861,9 +720,7 @@ fn three_leg_self_join_attaches_each_condition_at_its_own_join_point() {
     );
 }
 
-/// A `column` reference whose `tableAlias` matches neither self-join occurrence
-/// is a hard client-facing error naming the column and its table — never an
-/// arbitrary leg guess, which would silently return wrong rows.
+/// Scenario: An unattributable column reference is a hard error naming the column
 #[test]
 fn unattributable_column_reference_is_a_hard_error_naming_the_column() {
     let mut request = self_join_request(&[Some("A"), Some("B")]);
@@ -900,11 +757,7 @@ fn unattributable_column_reference_is_a_hard_error_naming_the_column() {
     }
 }
 
-/// A `sides` list that does not carry one resolved side per FROM-tree leaf is a
-/// client-visible decline naming BOTH counts — never the debug-only assertion this
-/// replaced, which a release UDF drops: the FROM chain emits one leg per resolved side,
-/// so a reference qualified to a leg the chain never emitted (captured: `"LHS_T1"` over
-/// a one-leg FROM) would reach Exasol as invalid SQL.
+/// Scenario: A leg count disagreeing with the resolved sides declines naming both counts
 #[test]
 fn a_leg_count_disagreeing_with_the_resolved_sides_declines_naming_both_counts() {
     let request = self_join_request(&[Some("A"), Some("B")]);
@@ -935,9 +788,7 @@ fn a_leg_count_disagreeing_with_the_resolved_sides_declines_naming_both_counts()
     }
 }
 
-/// Every outer-wrapper clause the unified fallback renders — SELECT, GROUP BY,
-/// HAVING, and ORDER BY — qualifies by the referencing occurrence's own leg on a
-/// self-join, including a column buried inside an aggregate argument.
+/// Scenario: Every outer-wrapper clause on a self-join qualifies by its own occurrence's leg
 #[test]
 fn n_scan_wrapper_qualifies_every_clause_by_leg() {
     fn col(alias: &str) -> Json {
@@ -996,11 +847,7 @@ fn n_scan_wrapper_qualifies_every_clause_by_leg() {
     );
 }
 
-/// A self-join WHERE filter with one conjunct local to EACH occurrence
-/// partitions exactly: both conjuncts push into their own occurrence's
-/// `ScanSpec.filter` (never the other's, despite the shared table name), the
-/// join condition attaches to the `ON` clause, and no cross-leg residual
-/// remains in the outer `WHERE`.
+/// Scenario: Self-join leg-local filters partition exactly and the condition attaches to ON
 #[test]
 fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
     fn col(alias: &str) -> Json {
@@ -1042,8 +889,6 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
         "both conjuncts are leg-local, so no cross-leg residual remains in the outer WHERE: {sql}"
     );
 
-    // The UDF argument literals alternate common blob, files; every other one is
-    // a leg's common blob (see `fallback_leg_fan_out_spec_never_carries_a_limit_or_sort`).
     let legs: Vec<Json> = sql
         .split('\'')
         .skip(1)
@@ -1070,10 +915,7 @@ fn conditions_attach_by_leg_set_and_leg_local_filters_partition_exactly() {
     );
 }
 
-/// The two-table above-broadcast-threshold fallback renders
-/// its FROM as a left-to-right `INNER JOIN … ON` chain (not a comma cross-join +
-/// flat WHERE). The single equi-condition attaches as the join point's `ON`
-/// clause, table-qualified, at the point that brings the second leg into scope.
+/// Scenario: The two-table above-threshold fallback renders an INNER JOIN … ON chain
 #[test]
 fn above_threshold_join_falls_back_inner_join_on() {
     let request = join_request(Json::Null, equi_condition());
@@ -1111,10 +953,7 @@ fn above_threshold_join_falls_back_inner_join_on() {
     );
 }
 
-/// A three-table inner join renders a two-hop
-/// `INNER JOIN … ON` chain, each condition greedily attached at the earliest
-/// join point where all its tables are in scope (by table-name set). No residual
-/// filter → no outer WHERE.
+/// Scenario: A three-table join renders a two-hop INNER JOIN … ON chain
 #[test]
 fn three_table_join_inner_join_on_chain() {
     let request = three_table_join_request();
@@ -1155,13 +994,7 @@ fn three_table_join_inner_join_on_chain() {
     );
 }
 
-/// Greedy-attach by table-name set AND the WHERE split.
-/// A star shape `(N1 ⋈ (N2 ⋈ FACT))` where BOTH conditions reference FACT (the
-/// deepest leaf, `LHS_T2`): both attach at the last join point, so the middle
-/// join point (bringing `LHS_T2`'s sibling `LHS_T1` into scope) has no
-/// newly-resolvable condition and renders `ON 1=1`. A CUSTOMER-side-local WHERE
-/// conjunct is pushed into that leg's fan-out (never re-applied in the outer
-/// WHERE); only the cross-table residual conjunct survives in the outer WHERE.
+/// Scenario: Conditions greedy-attach by table set and side-local conjuncts push into their leg
 #[test]
 fn join_conditions_greedy_attach_and_side_local_pushdown() {
     let cond_n2_fact = serde_json::json!({
@@ -1226,24 +1059,19 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
     )
     .expect("the star-shape greedy-attach fallback must build");
 
-    // The middle join point brings N2 (LHS_T1) into scope but neither condition is
-    // resolvable there (both also need FACT / LHS_T2) → ON 1=1.
     assert!(
         sql.contains(r#"AS "LHS_T1" ON 1=1"#),
         "a join point with no newly-resolvable condition must render ON 1=1: {sql}"
     );
-    // Both conditions greedily attach at the last join point (LHS_T2), AND-conjoined.
     assert!(
         sql.contains(r#"AS "LHS_T2" ON (("LHS_T1"."N2_KEY" = "LHS_T2"."F_N2KEY")) AND (("LHS_T0"."N1_KEY" = "LHS_T2"."F_N1KEY"))"#),
         "both FACT-touching conditions must attach greedily at the final join point: {sql}"
     );
 
-    // The N1-side-local conjunct is pushed into N1's fan-out leg…
     assert!(
         sql.contains("'ACME'"),
         "the side-local conjunct must be pushed into its leg's fan-out: {sql}"
     );
-    // …and NOT re-applied in the outer WHERE, which keeps only the cross-table residual.
     let where_clause = &sql[sql
         .find(" WHERE ")
         .expect("the cross-table residual must remain in an outer WHERE")..];
@@ -1258,10 +1086,6 @@ fn join_conditions_greedy_attach_and_side_local_pushdown() {
     );
 }
 
-/// The two-table N-scan wrapper SQL for `request`, split at the outer `WHERE` into
-/// `(fan-out legs, outer WHERE)` — the two halves the leg/residual partition must
-/// divide a filter's conjuncts between. The outer half is empty when the wrapper
-/// emits no `WHERE` at all.
 fn n_scan_legs_and_outer_where(request: &Json) -> (String, String) {
     let detected = detected_join(request);
     let sides = vec![
@@ -1298,15 +1122,7 @@ fn like_over(column: &str, table: &str, pattern: &str) -> Json {
     })
 }
 
-/// A side-local `LIKE` over that side's `DECIMAL(20,0)` column is syntactically
-/// renderable but has no DataFusion coercion (issue #207/#215), so the per-side
-/// TYPE screen must move it out of that side's fan-out leg and into the outer
-/// wrapper's `WHERE`, table-qualified — where Exasol evaluates it natively.
-///
-/// Regression: today's per-leg screen is `renderable_only` alone, which has no
-/// column-type awareness, so this LIKE is pushed bare into the ORDERS leg and the
-/// wrapper emits no outer `WHERE` at all — the scan then hard-fails at execution
-/// time (sqlCode 22002).
+/// Scenario: A type-declined side-local conjunct moves to the outer WHERE (#207, #215)
 #[test]
 fn n_scan_type_declined_side_local_conjunct_moves_to_outer_where() {
     let request = n_scan_request_with_filter(like_over("O_CUSTKEY", "ORDERS", "1%"));
@@ -1325,13 +1141,7 @@ fn n_scan_type_declined_side_local_conjunct_moves_to_outer_where() {
     );
 }
 
-/// A side-local `LIKE` over that side's `DATE` column KEEPS its pushdown: the type
-/// pipeline rewraps the subject as `CAST(<col> AS VARCHAR)`, which DataFusion does
-/// coerce, so the leg receives the REWRITTEN tree and the wrapper needs no outer
-/// `WHERE` for it.
-///
-/// Regression: today the leg is handed the UNREWRITTEN tree, so its scan-spec
-/// filter carries a bare `"O_ORDERDATE" LIKE` with no CAST.
+/// Scenario: A side-local DATE LIKE reaches its leg as a CAST
 #[test]
 fn n_scan_date_like_side_local_conjunct_reaches_leg_as_cast() {
     let request = n_scan_request_with_filter(like_over("O_ORDERDATE", "ORDERS", "1995%"));
@@ -1349,10 +1159,7 @@ fn n_scan_date_like_side_local_conjunct_reaches_leg_as_cast() {
     );
 }
 
-/// One type-declining conjunct must not forfeit its side's other pushable
-/// conjuncts: with both a type-accepted and a type-declined conjunct local to the
-/// SAME side, the accepted one still reaches that side's leg (rewritten) while only
-/// the declined one becomes residual — the screen is per conjunct, not per side.
+/// Scenario: A type-accepted conjunct still pushes when a same-side sibling declines
 #[test]
 fn n_scan_type_accepted_side_local_conjunct_still_pushes_when_a_sibling_declines() {
     let request = n_scan_request_with_filter(serde_json::json!({
@@ -1385,32 +1192,22 @@ fn n_scan_type_accepted_side_local_conjunct_still_pushes_when_a_sibling_declines
     );
 }
 
-/// The composed partition stays TOTAL and DISJOINT once the type screen joins the
-/// syntactic one: every top-level conjunct of a filter exercising all four routes —
-/// side-local type-accepted, side-local type-DECLINED, side-local
-/// syntactically-declined, and cross-table — appears exactly ONCE across the
-/// fan-out legs plus the outer `WHERE`. A conjunct in neither returns wrong rows; a
-/// conjunct in both double-applies a predicate.
+/// Scenario: The leg/residual partition stays total and disjoint with the type screen
 #[test]
 fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
     let request = n_scan_request_with_filter(serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            // 1. CUSTOMER-side-local, type-accepted → CUSTOMER leg.
             {"type": "predicate_equal",
              "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
              "right": {"type": "literal_string", "value": "ACME"}},
-            // 2. ORDERS-side-local, type-accepted THROUGH a rewrite → ORDERS leg.
             like_over("O_ORDERDATE", "ORDERS", "1995%"),
-            // 3. CUSTOMER-side-local, type-DECLINED → outer WHERE.
             like_over("C_CUSTKEY", "CUSTOMER", "1%"),
-            // 4. ORDERS-side-local, SYNTACTICALLY declined → outer WHERE.
             {"type": "predicate_greater",
              "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
                  {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
                  {"type": "literal_exactnumeric", "value": 3}]},
              "right": {"type": "literal_exactnumeric", "value": 1}},
-            // 5. Cross-table → outer WHERE.
             {"type": "predicate_greater",
              "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
              "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}},
@@ -1457,12 +1254,7 @@ fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
     );
 }
 
-/// A `LIKE` over a side column whose Exasol type is VARCHAR (`C_NAME`) must push
-/// down IDENTICALLY at both join sites: the type-rewrite pipeline recognizes a
-/// string subject as already renderable and must not wrap it in a spurious CAST,
-/// unlike the DECIMAL and DATE side columns covered above/below. Closes the
-/// plan's Verification gap for `pushdown-planning-like-type-coercion / LIKE on a
-/// VARCHAR or CHAR column pushes down unchanged`.
+/// Scenario: LIKE over a VARCHAR side column pushes down unchanged at both join sites
 #[test]
 fn join_like_over_varchar_side_column_pushes_down_unchanged() {
     let request = n_scan_request_with_filter(like_over("C_NAME", "CUSTOMER", "A%"));
@@ -1491,11 +1283,7 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
     );
 }
 
-/// `LENGTH(<DECIMAL(20,2) side column>) > 3` must render Exasol's
-/// trailing-zero-trim form (issue #211) at BOTH join sites: the broadcast
-/// plan's DataFusion-bound filter, and the N-scan ORDERS fan-out leg. This is
-/// the plan's headline justification for wiring the full type-rewrite pipeline
-/// (rather than the LIKE guard alone) into both join sites.
+/// Scenario: DECIMAL stringification renders trimmed at both join sites (#211)
 #[test]
 fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -1538,11 +1326,7 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
     );
 }
 
-/// The N-scan half of `broadcast_declines_instr_with_start_position_argument`
-/// above: `INSTR(C_NAME, 'b', 3)` — a three-argument call whose arity guard
-/// declines through the type-rewrite pipeline (issue #228) — must move to the
-/// outer WHERE at the N-scan join site too, table-qualified, and must NOT reach
-/// the CUSTOMER fan-out leg.
+/// Scenario: INSTR beyond two arguments declines at both join sites (#228)
 #[test]
 fn join_instr_beyond_two_args_declines_at_both_join_sites() {
     let filter = serde_json::json!({
@@ -1574,11 +1358,7 @@ fn join_instr_beyond_two_args_declines_at_both_join_sites() {
     );
 }
 
-/// An aggregate over a join (`COUNT(*), MIN(o.O_ORDERDATE)`) routes through the
-/// unified N-scan wrapper and lets Exasol evaluate the aggregate over the
-/// materialized join — a two-column result (`COUNT(*)`,
-/// `MIN("LHS_T1"."O_ORDERDATE")`), not the full-row projection the old code
-/// emitted (which produced the "expected 2 columns but pushdown has 5" failure).
+/// Scenario: An aggregate over a join renders an Exasol aggregate over the unified wrapper
 #[test]
 fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -1624,9 +1404,6 @@ fn aggregate_over_join_renders_exasol_aggregate_over_unified_wrapper() {
     );
 }
 
-/// A three-leg binding (CUSTOMER→`LHS_T0`, ORDERS→`LHS_T1`, LINEITEM→`LHS_T2`) for
-/// the seam-unification tests, built the way the N-scan wrapper builds it — one leg
-/// per FROM-tree leaf.
 fn seam_legs() -> JoinLegs {
     let leaves: Vec<JoinLeaf> = ["CUSTOMER", "ORDERS", "LINEITEM"]
         .iter()
@@ -1639,21 +1416,13 @@ fn seam_legs() -> JoinLegs {
     legs_from_leaves(leaves)
 }
 
-/// The one-leg binding over a single involved table, exactly as the N = 1 qualified
-/// wrapper builds it.
 fn single_scan_legs(table_name: &str) -> JoinLegs {
     JoinLegs::for_single_scan(&serde_json::json!({
         "involvedTables": [{ "name": table_name }]
     }))
 }
 
-/// A select item that is a SCALAR FUNCTION WRAPPING AGGREGATES — e.g.
-/// `ROUND(100.0 * SUM(CASE WHEN l_returnflag='R' THEN 1 ELSE 0 END) / COUNT(*), 2)`
-/// — renders through `render_expression_qualified` (NOT `None`, no decline),
-/// with its nested aggregates spliced verbatim and its nested column argument
-/// table-qualified to the owning side. Before the vs-expression aggregate arm +
-/// seam unification this recursed into the translator's catch-all and returned
-/// `None`, declining the whole grouped-join pushdown at every arity.
+/// Scenario: A scalar function over aggregates renders qualified, never declining
 #[test]
 fn render_expression_qualified_renders_scalar_over_aggregate() {
     let legs = seam_legs();
@@ -1693,11 +1462,7 @@ fn render_expression_qualified_renders_scalar_over_aggregate() {
     );
 }
 
-/// A byte-compatibility guard: a TOP-LEVEL bare aggregate renders through the
-/// unified `render_expression_qualified` byte-identically to the
-/// former dedicated `render_aggregate_qualified` — a single-arg aggregate as
-/// `NAME("ALIAS"."COL")`, `COUNT(*)` as `COUNT(*)`, and `DISTINCT` preserved. The
-/// exact expected strings are captured here so any future drift at the seam fails.
+/// Scenario: A top-level bare aggregate renders byte-compatibly through the unified seam
 #[test]
 fn render_expression_qualified_top_level_aggregate_byte_compatible() {
     let legs = seam_legs();
@@ -1735,17 +1500,7 @@ fn render_expression_qualified_top_level_aggregate_byte_compatible() {
     );
 }
 
-/// The exact failing-E2E shape: `COUNT(DISTINCT CAST(col AS CHAR(20)))`
-/// routed to the qualified wrapper must render the CAST target as the
-/// declared, LENGTH-QUALIFIED `CHAR(20) ASCII`, never bare `VARCHAR` and
-/// never a collapsed `VARCHAR(20)`. The qualified wrapper SQL is parsed and
-/// type-checked by Exasol's own engine: a bare `VARCHAR` is the "unexpected
-/// ')', expecting '('" parse error
-/// (`count_distinct_expression_arg_via_wrapper_matches_single_node`), and a
-/// `VARCHAR(20)` where Exasol declared `CHAR(20) ASCII` is the "Data type
-/// mismatch" pushdown rejection of #192. This guards the
-/// join/qualified-wrapper one of the three Exasol-dialect CAST consumers
-/// under plain `cargo test`, without Docker/Exasol.
+/// Scenario: Qualified COUNT(DISTINCT CAST(col AS CHAR(20))) keeps the CHAR(20) ASCII target (#192)
 #[test]
 fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
     let legs = seam_legs();
@@ -1779,12 +1534,7 @@ fn qualified_count_distinct_cast_char_renders_exasol_char_target() {
     );
 }
 
-/// The N-scan unaccelerated join wrapper — the second of the three
-/// Exasol-dialect CAST consumers — carries the same CAST-to-CHAR select item
-/// through `n_scan_join_select_items`, so its outer SELECT list must declare
-/// the target as `CHAR(20) ASCII` too. The wrapper's SELECT is validated
-/// positionally against Exasol's `selectListDataTypes`, so a collapsed
-/// `VARCHAR(20)` here is the same #192 "Data type mismatch" rejection.
+/// Scenario: The N-scan wrapper's SELECT list keeps the CHAR(20) ASCII target (#192)
 #[test]
 fn n_scan_join_select_list_renders_exasol_char_target() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -1828,9 +1578,7 @@ fn n_scan_join_select_list_renders_exasol_char_target() {
     );
 }
 
-/// A bare-column ORDER BY over a join is rendered table-qualified in the unified
-/// wrapper (with explicit direction + NULL placement), so Exasol — which has
-/// delegated the ordering — sorts on the unambiguous, owning-side column.
+/// Scenario: A bare-column ORDER BY over a join renders qualified in the unified wrapper
 #[test]
 fn order_by_over_join_renders_qualified_in_unified_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -1842,8 +1590,6 @@ fn order_by_over_join_renders_qualified_in_unified_wrapper() {
          "isAscending": true, "nullsLast": false},
     ]);
 
-    // Unprojected key: classifies `Ordered`, but downgrades to the fallback at
-    // construction (see `broadcast_ordered_unprojected_key_downgrades_to_the_fallback`).
     assert!(matches!(
         classify_join_window(&pd(&request)),
         JoinWindowPlan::Ordered { .. }
@@ -1870,12 +1616,7 @@ fn order_by_over_join_renders_qualified_in_unified_wrapper() {
     );
 }
 
-/// An EXPRESSION (non-bare-column) ORDER BY key over a join — e.g.
-/// `UPPER(orders.o_orderstatus)` — is rendered table-qualified in the unified
-/// wrapper, with explicit direction + NULL placement, exactly like a bare
-/// column (#198). Before this, `qualified_join_order_by` only accepted a bare
-/// `column` expression node and declined (hard error) on anything else,
-/// hiding a renderable ORDER BY expression behind a spurious pushdown failure.
+/// Scenario: An expression ORDER BY over a join renders qualified in the unified wrapper (#198)
 #[test]
 fn order_by_expression_renders_qualified_in_unified_wrapper() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -1912,11 +1653,7 @@ fn order_by_expression_renders_qualified_in_unified_wrapper() {
     );
 }
 
-/// `classify_join_window` serves the plain, bare-limit, and bare-column-ordered
-/// shapes structurally, and falls through to `ExasolPostProcessed` for every
-/// clause the broadcast in-UDF join cannot render: an OFFSET without an
-/// ORDER BY, an expression sort key, an aggregate select item, a GROUP BY, a
-/// group-by aggregation, and a HAVING.
+/// Scenario: Join window classification covers every served and Exasol-post-processed shape
 #[test]
 fn join_window_classification_covers_every_forcing_and_served_shape() {
     let plain = join_request(Json::Null, equi_condition());
@@ -1993,10 +1730,7 @@ fn join_window_classification_covers_every_forcing_and_served_shape() {
     ));
 }
 
-/// The window is classified from the request BEFORE the broadcast render runs.
-/// That ordering is what keeps `render_broadcast_join`'s hard `Err` on a request
-/// carrying no column metadata unreachable from `plan_join`: the same request
-/// classifies `ExasolPostProcessed` and routes straight to the N-scan fallback.
+/// Scenario: The window is classified before the broadcast render that would error
 #[test]
 fn aggregate_over_join_classifies_before_the_render_that_would_error() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -2014,19 +1748,11 @@ fn aggregate_over_join_classifies_before_the_render_that_would_error() {
     assert!(render_broadcast_join(&request, &pushdown_req, &detected_join(&request)).is_err());
 }
 
-// -----------------------------------------------------------------------
-// Golden-SQL characterization gate. Full-string byte-identity freeze of each
-// join code path this refactor's duplication reductions can touch. Re-run
-// after every dedup extraction.
-// -----------------------------------------------------------------------
-
 #[test]
 fn golden_broadcast_join_sql_unchanged() {
     let fact = resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]);
     let mut dimension = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]);
-    // Distinct from the fact side's `sample_storage()` — the point of this
-    // golden is to prove the two sides' backends are genuinely different, not
-    // coincidentally equal.
+    // Deliberately distinct from the fact side's backend.
     dimension.effective_storage = StorageBackend::S3(StorageProps {
         endpoint: "http://minio-dim:9000".into(),
         region: "us-east-2".into(),
@@ -2143,10 +1869,8 @@ fn broadcast_carries_each_sides_own_storage() {
     );
 }
 
-/// The one-file-per-side broadcast fixture the window tests share: LINEITEM (fact)
-/// ⋈ ORDERS (dimension), projecting `L_ORDERKEY` alone. A single fact file means a
-/// single shard, so the fan-out is the from-less scalar call — any ` FROM (` in a
-/// result is therefore the ordering wrapper's and nothing else.
+/// A single fact file means a single shard, so any ` FROM (` in the result is the
+/// ordering wrapper's.
 fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
     let sides = JoinSides {
         fact: resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]),
@@ -2182,8 +1906,6 @@ fn ascending_key(column: &str) -> ParsedSortKey {
     })
 }
 
-/// Every ordered-window test asserts this: an ordered window is global, so nothing
-/// may truncate or sort a shard's own output before the wrapper does.
 fn assert_shards_carry_no_window(sql: &str) {
     let common = broadcast_common_blob(sql);
     assert!(
@@ -2200,10 +1922,7 @@ fn assert_shards_carry_no_window(sql: &str) {
     );
 }
 
-/// A bare `LIMIT n` composes per shard: the cap rides in the join block (applied
-/// AFTER the node-local join) and again on the outer merge, and NOTHING else about
-/// the plan changes — in particular no `common.limit`, which caps the fact side's
-/// SCAN and would drop rows the join would have kept.
+/// Scenario: A bare LIMIT caps each shard's post-join output and the merge, never the fact scan
 #[test]
 fn broadcast_bare_limit_caps_each_shard_and_the_merge() {
     let unbounded =
@@ -2238,8 +1957,7 @@ fn broadcast_bare_limit_caps_each_shard_and_the_merge() {
     );
 }
 
-/// An ordered window cannot compose per shard, so the shards stay unbounded and
-/// unsorted and the whole window rides on ONE outer wrapper over the merged fan-out.
+/// Scenario: An ordered window wraps the fan-out once and leaves shards unbounded
 #[test]
 fn broadcast_ordered_wraps_fan_out_and_leaves_shards_unbounded() {
     let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
@@ -2256,7 +1974,7 @@ fn broadcast_ordered_wraps_fan_out_and_leaves_shards_unbounded() {
     assert_shards_carry_no_window(&sql);
 }
 
-/// A bare `ORDER BY` renders the wrapper's ordering and nothing after it.
+/// Scenario: A bare ORDER BY renders the wrapper's ordering with no window
 #[test]
 fn broadcast_ordered_without_limit_wraps_fan_out_with_no_window() {
     let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
@@ -2273,8 +1991,7 @@ fn broadcast_ordered_without_limit_wraps_fan_out_with_no_window() {
     assert_shards_carry_no_window(&sql);
 }
 
-/// The window follows the sort on the wrapper, and reaches no shard: a per-shard
-/// `OFFSET` would skip each shard's OWN first rows.
+/// Scenario: LIMIT and OFFSET render on the wrapper only, never per shard
 #[test]
 fn broadcast_ordered_renders_limit_and_offset_on_the_wrapper_only() {
     let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
@@ -2291,9 +2008,7 @@ fn broadcast_ordered_renders_limit_and_offset_on_the_wrapper_only() {
     assert_shards_carry_no_window(&sql);
 }
 
-/// The projection-membership downgrade the classifier structurally cannot make:
-/// the wrapper's `ORDER BY` binds against the fan-out's EMITTED columns, so a key
-/// the projection does not carry has nothing to bind to.
+/// Scenario: An ORDER BY key outside the projection downgrades to the N-scan fallback
 #[test]
 fn broadcast_ordered_unprojected_key_downgrades_to_the_fallback() {
     assert!(
@@ -2307,9 +2022,7 @@ fn broadcast_ordered_unprojected_key_downgrades_to_the_fallback() {
     );
 }
 
-/// An `Ordered` plan that renders no `ORDER BY` disagrees with its own variant.
-/// Emitting the unwrapped fan-out would return silently unordered rows under an
-/// advertised `ORDER_BY_COLUMN`, so it is a programming error, not a downgrade.
+/// Scenario: An Ordered plan rendering no ORDER BY is a programming error
 #[test]
 #[should_panic(expected = "must render an ORDER BY")]
 fn broadcast_ordered_plan_rendering_no_order_by_is_a_programming_error() {
@@ -2320,11 +2033,7 @@ fn broadcast_ordered_plan_rendering_no_order_by_is_a_programming_error() {
     });
 }
 
-/// A fallback leg carries NO window and NO join block, for a request that carries a
-/// limit, an offset AND an `orderBy`. The absent join block is what makes a
-/// post-join cap unexpressible on a leg at all: the leg scans one table, so it has
-/// no post-join stage to cap, and the whole window is the outer wrapper's to apply
-/// over the reconstructed join.
+/// Scenario: A fallback leg never carries a limit, sort, or join block
 #[test]
 fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -2350,8 +2059,6 @@ fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
     )
     .expect("the two-table unified fallback must build");
 
-    // The UDF argument literals alternate common blob, files; every other one is a
-    // leg's common blob.
     let legs: Vec<Json> = sql
         .split('\'')
         .skip(1)
@@ -2377,9 +2084,7 @@ fn fallback_leg_fan_out_spec_never_carries_a_limit_or_sort() {
     );
 }
 
-/// Pins the property that a request in which no table occurs twice emits SQL
-/// byte-identical to its pre-self-join-fix output — the self-join attribution
-/// change must not perturb this ordinary two-distinct-table join's rendered SQL.
+/// Scenario: A join with no repeated table renders byte-identical golden SQL
 #[test]
 fn golden_n_scan_join_sql_unchanged() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -2463,13 +2168,7 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
     );
 }
 
-/// Pins the full text of all six qualified N-scan render-decline messages, now
-/// produced through the shared `join_render_decline` template rather than as six
-/// separate `UdfError::User` string literals: a future reword of the template or
-/// of any caller's clause fragment fails here. Each case is triggered directly
-/// against the producing function with a node of an unrecognized `type`, which
-/// the `vs-expression` translator declines to render (`None`), rather than through
-/// the full `build_n_scan_join_sql` pipeline where that is unnecessary.
+/// Scenario: The six qualified N-scan render-decline messages keep their exact text
 #[test]
 fn golden_n_scan_render_decline_messages_unchanged() {
     fn user_message(err: UdfError) -> String {
@@ -2479,10 +2178,8 @@ fn golden_n_scan_render_decline_messages_unchanged() {
         }
     }
     let unrenderable = || serde_json::json!({"type": "totally_unsupported_node_type"});
-    // No leg at all: every fixture below is column-free, so attribution never runs.
     let legs = legs_from_leaves(Vec::new());
 
-    // n_scan_join_select_items: an unrenderable select-list item.
     let select_list_req = serde_json::json!({ "selectList": [unrenderable()] });
     let msg = user_message(
         n_scan_join_select_items(&select_list_req, &legs, &[])
@@ -2494,7 +2191,6 @@ fn golden_n_scan_render_decline_messages_unchanged() {
          qualified N-scan join; this is a hard error, not a native re-plan"
     );
 
-    // build_n_scan_join_sql: an involved table carries no column metadata.
     let mut no_columns_request = join_request(Json::Null, equi_condition());
     no_columns_request["involvedTables"][1]["columns"] = serde_json::json!([]);
     let no_columns_sides = vec![
@@ -2520,7 +2216,6 @@ fn golden_n_scan_render_decline_messages_unchanged() {
          native re-plan"
     );
 
-    // build_n_scan_join_sql: an unrenderable join condition.
     let bad_condition_request = join_request(Json::Null, unrenderable());
     let bad_condition_sides = vec![
         resolved_side("CUSTOMER", vec![("s3://w/c-0.parquet", 10)]),
@@ -2544,7 +2239,6 @@ fn golden_n_scan_render_decline_messages_unchanged() {
          qualified N-scan schema; this is a hard error, not a native re-plan"
     );
 
-    // qualified_join_group_by: an unrenderable GROUP BY key.
     let group_by_req = serde_json::json!({ "groupBy": [unrenderable()] });
     let msg = user_message(
         qualified_join_group_by(&group_by_req, &legs)
@@ -2556,7 +2250,6 @@ fn golden_n_scan_render_decline_messages_unchanged() {
          N-scan join; this is a hard error, not a native re-plan"
     );
 
-    // qualified_join_having: an unrenderable HAVING expression.
     let having_req = serde_json::json!({ "having": unrenderable() });
     let msg = user_message(
         qualified_join_having(&having_req, &legs)
@@ -2568,7 +2261,6 @@ fn golden_n_scan_render_decline_messages_unchanged() {
          N-scan join; this is a hard error, not a native re-plan"
     );
 
-    // qualified_join_order_by: an unrenderable ORDER BY expression.
     let order_by_req = serde_json::json!({
         "orderBy": [{
             "isAscending": true,
@@ -2587,23 +2279,7 @@ fn golden_n_scan_render_decline_messages_unchanged() {
     );
 }
 
-// -----------------------------------------------------------------------
-// Shared referenced-column narrowing (issue #160)
-// -----------------------------------------------------------------------
-
-/// Issue #160 regression: BOTH decline wrappers — the grouped decline wrapper AND
-/// the single-group Case 2/3 `COUNT(DISTINCT)` wrapper — obtain their inner-scan
-/// projection from the ONE shared `referenced_column_projection` helper, which
-/// narrows to only the columns the wrapper references and NEVER falls back to the
-/// full base-table schema.
-///
-/// The narrowing walks the FULL expression tree of every clause the wrapper
-/// renders: a column referenced ONLY inside an aggregate argument
-/// (`SUM(CASE WHEN region='R' ...)` surfaces `REGION`), a column referenced ONLY in
-/// HAVING, and a column referenced ONLY in ORDER BY (and the WHERE filter) are all
-/// surfaced, while an unreferenced base-table column is dropped. Then each wrapper
-/// is built from that narrowed projection and asserted to omit the unreferenced
-/// column entirely (its EMITS clause names only referenced columns).
+/// Scenario: Both decline wrappers narrow the inner scan to referenced columns only (#160)
 #[test]
 fn fallback_projection_narrows_to_referenced_columns() {
     fn col(name: &str, ty: &str) -> (String, String) {
@@ -2631,10 +2307,6 @@ fn fallback_projection_narrows_to_referenced_columns() {
     let request = serde_json::json!({"involvedTables": [{"name": "T"}]});
     let shards = [vec![("s3://wh/f0.parquet".to_string(), 1u64)]];
 
-    // --- The shared helper narrows across EVERY reference site (pure #160 core). ---
-    // GK: group key + bare select; REGION: only inside SUM(CASE ...); HCOL: only in
-    // HAVING; OCOL: only in ORDER BY; FCOL: only in the WHERE filter;
-    // IRRELEVANT_COL: never referenced.
     let all_cols = vec![
         col("GK", "VARCHAR(10)"),
         col("REGION", "VARCHAR(10)"),
@@ -2692,8 +2364,6 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "types stay positionally aligned with columns"
     );
 
-    // --- Grouped decline wrapper is BUILT from the narrowed projection. ---
-    // REGION is referenced ONLY inside the SUM(CASE ...) aggregate argument.
     let grouped_all = vec![
         col("GK", "VARCHAR(10)"),
         col("REGION", "VARCHAR(10)"),
@@ -2742,7 +2412,6 @@ fn fallback_projection_narrows_to_referenced_columns() {
         "the grouped wrapper renders the aggregate over the narrowed aliased scan: {gsql}"
     );
 
-    // --- Single-group Case 2/3 wrapper is BUILT from the same shared helper. ---
     let sg_all = vec![
         col("A", "VARCHAR(10)"),
         col("B", "VARCHAR(10)"),
@@ -2790,21 +2459,7 @@ fn fallback_projection_narrows_to_referenced_columns() {
     );
 }
 
-/// `referenced_column_projection` returns the FULL base row — never a narrowing —
-/// for every "no select list" wire form, because that request is a `SELECT *` whose
-/// result Exasol validates positionally against the whole row (`04000` otherwise).
-///
-/// The tolerated set is deliberately wider than what Exasol sends today (Postel's
-/// law): the live capture shows the `selectList` KEY OMITTED for `SELECT *`, while
-/// the protocol documents the same intent as an empty select list — so JSON `null`,
-/// `[]`, and a non-array value are accepted as the same shape, and a future Exasol
-/// that switches wire form lands on this arm with no code change.
-///
-/// This arm is shared with [`n_scan_join_select_items`]'s own no-select-list arm, so
-/// the projection and the outer SELECT list cannot disagree on the row's arity. It
-/// does NOT merge the OTHER divergence from [`referenced_side_columns`]: a request
-/// that HAS a select list but names no source column still falls back to the first
-/// column alone, pinned by `referenced_column_projection_falls_back_to_first_column`.
+/// Scenario: Every no-select-list wire form keeps the full base row
 #[test]
 fn no_select_list_wire_forms_all_keep_the_full_base_row() {
     let all_cols = vec![
@@ -2824,9 +2479,7 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
     let full_types: Vec<String> = all_cols.iter().map(|(_, ty)| ty.clone()).collect();
 
     for req in [
-        // Absent key — the form live-captured from Exasol for `SELECT *`.
         serde_json::json!({"filter": filter.clone()}),
-        // Forms Exasol does not send today but might; all mean `SELECT *`.
         serde_json::json!({"selectList": [], "filter": filter.clone()}),
         serde_json::json!({"selectList": null, "filter": filter.clone()}),
         serde_json::json!({"selectList": "*", "filter": filter.clone()}),
@@ -2845,9 +2498,7 @@ fn no_select_list_wire_forms_all_keep_the_full_base_row() {
     }
 }
 
-/// A REAL select list beside a filter still narrows: only the columns the rendered
-/// clauses NAME reach the inner scan, the filter's included. This is the half of
-/// #160 the decline route used to forfeit wholesale.
+/// Scenario: A real select list beside a filter still narrows (#160)
 #[test]
 fn referenced_column_projection_narrows_with_a_real_select_list() {
     let all_cols = vec![
@@ -2879,11 +2530,7 @@ fn referenced_column_projection_narrows_with_a_real_select_list() {
     );
 }
 
-/// A request naming no source column at all still yields exactly one projected
-/// column — the FIRST of `all_cols` — because an empty Exasol `EMITS` clause is
-/// invalid. That first-column fallback is `referenced_column_projection`'s own
-/// policy; `referenced_side_columns` falls back to its full column set instead,
-/// and the two MUST stay divergent.
+/// Scenario: A request naming no source column falls back to the first column only
 #[test]
 fn referenced_column_projection_falls_back_to_first_column() {
     let all_cols = vec![
@@ -2904,17 +2551,7 @@ fn referenced_column_projection_falls_back_to_first_column() {
     assert_eq!(types, vec!["DECIMAL(18,0)".to_string()]);
 }
 
-// -----------------------------------------------------------------------
-// The one widening trigger the wrapper cannot render: a node type NEITHER
-// dialect knows. Both wrapper entry points reach the same refusal site in
-// `n_scan_join_select_items`, and both hard-error there — Exasol receives an
-// error, never a wrong-shaped result. Pre-existing behaviour, pinned here (#196).
-// -----------------------------------------------------------------------
-
-/// A select-list node no dialect renders: the DataFusion dialect declines it (so
-/// `project_columns` widens and the broadcast plan cleanly falls through), and
-/// the Exasol dialect declines it too, so the N-scan wrapper's select list cannot
-/// be rendered. That is a `UdfError::User`, NOT a silent full-row fallback.
+/// Scenario: An untranslatable N-scan select item is a hard error (#196)
 #[test]
 fn n_scan_join_untranslatable_select_item_is_hard_error() {
     let unknown = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
@@ -2959,12 +2596,7 @@ fn n_scan_join_untranslatable_select_item_is_hard_error() {
     );
 }
 
-/// The SINGLE-TABLE route to the same refusal site:
-/// `qualified_single_table_fallback_pushdown` →
-/// `build_qualified_single_table_fallback_sql` → `outer_wrapper_clauses` →
-/// `n_scan_join_select_items`. This is the path the widened-projection dispatch
-/// routing feeds most directly, so an untranslatable item must surface an error
-/// there too — never a wrong-shaped result.
+/// Scenario: An untranslatable single-table wrapper select item is a hard error (#196)
 #[test]
 fn qualified_single_table_untranslatable_select_item_is_hard_error() {
     let request = serde_json::json!({
@@ -3002,14 +2634,7 @@ fn qualified_single_table_untranslatable_select_item_is_hard_error() {
     );
 }
 
-/// Issue #218: a projected `literal_timestamputc` constant renders as
-/// `CAST(CONVERT_TZ(…, 'UTC', SESSIONTIMEZONE) AS TIMESTAMP WITH LOCAL TIME
-/// ZONE)` — the Exasol-dialect rendering `vs-expression`'s own arm produces
-/// (see that crate's `literal_timestamp_utc`/`literal_timestamputc` arms),
-/// converting the UTC-normalized wire value into the CALLER's session zone
-/// and re-declaring it TSTZ so the wrapper's positional type check passes.
-/// This wrapper adds no rendering logic of its own for this item; it only
-/// carries the already-correct rendering through into the outer SELECT.
+/// Scenario: A projected TSTZ literal converts into the session zone (#218)
 #[test]
 fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zone() {
     let request = serde_json::json!({
@@ -3054,8 +2679,6 @@ fn qualified_single_table_wrapper_projects_tstz_literal_converted_to_session_zon
     );
 }
 
-/// The fixed single-table `T` fixture the declined-predicate wrapper tests share:
-/// `ID` plus the `C_TS` column the declined predicate reads.
 fn declined_filter_request() -> Json {
     serde_json::json!({
         "involvedTables": [{"name": "T", "columns": [
@@ -3065,9 +2688,8 @@ fn declined_filter_request() -> Json {
     })
 }
 
-/// The `ID` + `C_TS` fan-out spec those tests wrap. `filter` is deliberately
-/// left at its `None` default: on the decline route the predicate lives in the
-/// wrapper's `WHERE` and nowhere else.
+/// `filter` stays `None`: on the decline route the predicate lives only in the
+/// wrapper's `WHERE`.
 fn declined_filter_fan_out_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -3082,14 +2704,10 @@ fn declined_filter_fan_out_spec() -> ScanSpec {
     }
 }
 
-/// The declared Exasol types of [`declined_filter_fan_out_spec`]'s projection,
-/// positionally aligned with it.
 fn declined_filter_proj_types() -> Vec<String> {
     vec!["DECIMAL(20,0)".to_string(), "TIMESTAMP".to_string()]
 }
 
-/// Build the single-table wrapper over [`declined_filter_fan_out_spec`] for
-/// `pushdown_req` with `declined` as the self-applied predicate.
 fn declined_filter_wrapper_sql(
     pushdown_req: &Json,
     declined: Option<&Json>,
@@ -3108,15 +2726,7 @@ fn declined_filter_wrapper_sql(
     )
 }
 
-/// Scenario: a `proj_types` list that is not positionally aligned with the
-/// fan-out projection cannot be paired with it, and the refusal names both
-/// lengths.
-///
-/// The alignment is load-bearing — the two lists are zipped into the wrapper's
-/// type universe and into the inner scan's `EMITS` clause — and the only build
-/// that ever runs inside Exasol is a release build, where a `debug_assert` is
-/// compiled out entirely. Pairing the two behind one constructed value is what
-/// makes a misaligned pair unrepresentable downstream.
+/// Scenario: Misaligned proj_types fail FanOutProjection construction naming both lengths
 #[test]
 fn fan_out_projection_rejects_misaligned_proj_types() {
     let spec = declined_filter_fan_out_spec();
@@ -3131,8 +2741,7 @@ fn fan_out_projection_rejects_misaligned_proj_types() {
     );
 }
 
-/// `SECOND(C_TS, 3) > 1` — the live-verified shape whose DataFusion render
-/// declines on arity while Exasol renders it fine.
+/// DataFusion declines this on arity while Exasol renders it (live-verified).
 fn second_arity_predicate() -> Json {
     serde_json::json!({
         "type": "predicate_greater",
@@ -3144,16 +2753,7 @@ fn second_arity_predicate() -> Json {
     })
 }
 
-/// Scenario (pushdown-declined-filter-self-apply): a WHERE predicate the
-/// DataFusion dialect refuses is applied by the wrapper ITSELF, in Exasol
-/// dialect and table-qualified against the `LHS_T0` alias, positioned BETWEEN
-/// the raw fan-out and every trailing clause.
-///
-/// Both halves of the guarantee are asserted: the fan-out scan spec carries NO
-/// `filter` (so the predicate is applied exactly once), and the `WHERE` precedes
-/// the ORDER BY and the LIMIT (so it restricts the rows they consume rather than
-/// their output — the reason this wrapper, not an outer `WHERE` around the
-/// emitted SQL, is the correct position for all five request shapes).
+/// Scenario: A DataFusion-declined WHERE self-applies in Exasol dialect before ORDER BY/LIMIT
 #[test]
 fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
     let declined = second_arity_predicate();
@@ -3204,19 +2804,7 @@ fn single_table_wrapper_renders_declined_predicate_in_exasol_dialect() {
     );
 }
 
-/// A `literal_timestamputc` predicate self-applied in the declined-WHERE
-/// path against `C_TS` (this project's plain-`TIMESTAMP`-mapped Iceberg
-/// column, per `007-fix-timestamptz-mapping`) renders the literal via
-/// `CAST(CONVERT_TZ(…) AS TIMESTAMP WITH LOCAL TIME ZONE)`, NOT a bare
-/// `TIMESTAMP` literal compared naively against `C_TS`. Verified live
-/// (Exasol 2025.2.1, `SESSIONTIMEZONE = EUROPE/BERLIN`): a bare comparison
-/// of the UTC-normalized wire value against a naive column disagrees with
-/// Exasol's own `TIMESTAMP > TIMESTAMP WITH LOCAL TIME ZONE` coercion rule
-/// (which reads the naive side as session-local) — `TIMESTAMP
-/// '09:30:00' > TIMESTAMP '09:00:00'` is `TRUE` while Exasol's native
-/// `TIMESTAMP '09:30:00' > CAST(TIMESTAMP '10:00:00' AS TSTZ)` is `FALSE`.
-/// Rendering the literal as a genuine TSTZ expression makes Exasol apply
-/// that SAME coercion rule to `C_TS`, reproducing the native result.
+/// Scenario: A self-applied TSTZ literal predicate renders via CONVERT_TZ, matching native
 #[test]
 fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
     let declined = serde_json::json!({
@@ -3245,11 +2833,7 @@ fn declined_filter_self_apply_renders_tstz_literal_via_convert_tz() {
     );
 }
 
-/// The gate's SECOND outcome. `render_df_filter_qualified` suppresses a
-/// trivially-true render to `None` exactly as its DataFusion twin does, so its
-/// `None` alone must NOT be read as "unrenderable": a no-op predicate correctly
-/// emits no clause at all and must not error. Reading it the other way would
-/// re-create this plan's own root-cause conflation one dialect over.
+/// Scenario: A trivially-true declined predicate emits no WHERE
 #[test]
 fn single_table_wrapper_trivially_true_declined_predicate_emits_no_where() {
     let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
@@ -3266,10 +2850,7 @@ fn single_table_wrapper_trivially_true_declined_predicate_emits_no_where() {
     );
 }
 
-/// The gate's THIRD outcome, decided by the NON-suppressing renderer: a
-/// predicate no dialect renders can be applied nowhere, so returning rows
-/// without it would be wrong. This is a route to the wrapper's existing
-/// last-resort refusal, not a new failure mode.
+/// Scenario: A declined predicate rendering in neither dialect is a hard error
 #[test]
 fn single_table_wrapper_errors_when_declined_predicate_renders_in_neither_dialect() {
     let unrenderable = serde_json::json!({"type": "no_such_node_type_in_either_dialect"});
@@ -3290,18 +2871,7 @@ fn single_table_wrapper_errors_when_declined_predicate_renders_in_neither_dialec
     );
 }
 
-/// join-fallback scenario (#198, task 1.2), asserted at the FAMILY level: all
-/// four qualified-wrapper entry points (N-scan join, grouped `GroupByWrapper`,
-/// Case 2/3 `COUNT(DISTINCT)`, widened-projection row scan) reach this one
-/// `outer_wrapper_clauses` seam, so asserting here covers every one of them at
-/// once. A renderable EXPRESSION sort key must render table-qualified with its
-/// direction and NULL placement — before #198 `qualified_join_order_by` accepted
-/// only a bare `column` node and turned this into a spurious hard decline.
-///
-/// The same fixture pins the trailing clause ORDER against regression: the
-/// builder appends GROUP BY → HAVING → ORDER BY → LIMIT, and a `LIMIT` emitted
-/// ahead of the `ORDER BY` would truncate BEFORE the sort — the unit-level
-/// companion to the grouped top-N-groups e2e case's group-set equality.
+/// Scenario: The outer wrapper renders a qualified expression sort key before LIMIT (#198)
 #[test]
 fn outer_wrapper_renders_qualified_expression_sort_key() {
     let legs = single_scan_legs("T");
@@ -3309,8 +2879,6 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
         ("ID".to_string(), "DECIMAL(20,0)".to_string()),
         ("NAME".to_string(), "VARCHAR(100)".to_string()),
     ]];
-    // Group-key-only select list ordered by an expression the select list never
-    // names — issue #198's own shape — plus a LIMIT that must apply after it.
     let pushdown_req = serde_json::json!({
         "selectList": [{"type": "column", "name": "ID", "tableName": "T"}],
         "groupBy": [{"type": "column", "name": "ID", "tableName": "T"}],
@@ -3350,12 +2918,6 @@ fn outer_wrapper_renders_qualified_expression_sort_key() {
     );
 }
 
-/// The trailing clause suffix the qualified wrapper renders for `pushdown_req`
-/// against `legs` — the SAME kind of binding production builds for that request
-/// shape: the N = 1 single-leg binding for row 8's genuine single scan, or a real
-/// two-leg self-join binding (`DetectedJoin::legs`, one leg per occurrence) for
-/// rows 9-11, exactly as [`build_n_scan_join_sql`] constructs it. No row is
-/// evaluated against a collapsed stand-in binding.
 fn seam_trailing(pushdown_req: &Json, legs: &JoinLegs) -> Result<String, UdfError> {
     let cols = vec![
         ("ID".to_string(), "DECIMAL(20,0)".to_string()),
@@ -3366,27 +2928,8 @@ fn seam_trailing(pushdown_req: &Json, legs: &JoinLegs) -> Result<String, UdfErro
     outer_wrapper_clauses(pushdown_req, legs, &cols_per_leg).map(|clauses| clauses.trailing)
 }
 
-/// The FOUR live-captured offset-carrying request shapes that reach this seam
-/// (#191 reachability capture rows 8-11), as
-/// `(shape, pushdown_req, legs, expected trailing tail)`:
-///
-/// - row 8: `GROUP BY MOD(id,4)` with `COUNT(DISTINCT id)`, `ORDER BY 1 LIMIT 2
-///   OFFSET 1` — the qualified single-table (N = 1) wrapper entry point, so
-///   `legs` is the N = 1 single-leg binding
-/// - row 9: self-join, `ORDER BY 1 LIMIT 5 OFFSET 2`
-/// - row 10: self-join, `ORDER BY a.id LIMIT 5 OFFSET 2` (sort key outside the
-///   select list)
-/// - row 11: self-join + `GROUP BY a.id`, `ORDER BY 1 LIMIT 5 OFFSET 2`
-///
-/// Rows 9-11 reach the N-scan join wrapper, so `legs` for each is a genuine
-/// two-leg self-join binding (`DetectedJoin::legs`, occurrences `A`/`B`) —
-/// the same binding [`build_n_scan_join_sql`] constructs in production — and
-/// every referenced column carries occurrence `A`'s own `tableAlias`, per the
-/// per-occurrence signal production actually sends. No row is evaluated against
-/// a single-leg stand-in it would not reach in production.
-///
-/// Every one carries a non-empty `orderBy` beside its offset — fact 5, which is
-/// what makes the offset-without-`ORDER BY` state unreachable rather than guarded.
+/// The four live-captured offset-carrying shapes reaching this seam (#191 capture rows
+/// 8-11), each with the binding production builds for it; each carries an `orderBy`.
 fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, JoinLegs, &'static str)> {
     let single_scan = single_scan_legs("EVENTS");
     let self_join = legs_from_leaves(vec![
@@ -3420,10 +2963,6 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, JoinLegs, &'stati
     let count_star = serde_json::json!({
         "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false
     });
-    // Rows 9-11 are a self-join, so every referenced column carries the
-    // `tableAlias` of the occurrence it actually belongs to — occurrence `A`,
-    // resolving to leg 0 — rather than the bare, alias-free form only a genuine
-    // single-table request sends.
     let id_a = serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS", "tableAlias": "A"});
     let score_a = serde_json::json!({"type": "column", "name": "SCORE", "tableName": "EVENTS", "tableAlias": "A"});
     let name_a = serde_json::json!({"type": "column", "name": "NAME", "tableName": "EVENTS", "tableAlias": "A"});
@@ -3476,15 +3015,7 @@ fn offset_carrying_seam_fixtures() -> Vec<(&'static str, Json, JoinLegs, &'stati
     ]
 }
 
-/// join-fallback scenario (#191): the qualified wrapper renders the request's
-/// OFFSET on every entry point that reaches it — all four reach this one
-/// `outer_wrapper_clauses` seam, so the four live-captured offset-carrying shapes
-/// are asserted here at the family level.
-///
-/// The trailing tail must be exactly ` ORDER BY <clause> LIMIT n OFFSET m`: the
-/// window follows the sort (an OFFSET ahead of the ORDER BY would skip rows before
-/// the ordering is established) and the OFFSET follows its own LIMIT (Exasol's
-/// grammar rejects a bare OFFSET).
+/// Scenario: The qualified wrapper renders LIMIT … OFFSET after ORDER BY (#191)
 #[test]
 fn qualified_wrapper_renders_limit_offset() {
     for (shape, pushdown_req, legs, expected_tail) in offset_carrying_seam_fixtures() {
@@ -3497,11 +3028,7 @@ fn qualified_wrapper_renders_limit_offset() {
     }
 }
 
-/// The same four shapes, plus the un-ordered control, pinned against the OTHER
-/// half of Exasol's OFFSET grammar: an `OFFSET` is only legal after an `ORDER BY`
-/// (`sqlCode 42000` otherwise). So no rendered trailing clause may carry an
-/// `OFFSET` token that is not preceded by an `ORDER BY` — and a request with
-/// neither an `orderBy` nor an offset must carry no `OFFSET` token at all.
+/// Scenario: The qualified wrapper never renders OFFSET without a preceding ORDER BY
 #[test]
 fn qualified_wrapper_never_renders_offset_without_order_by() {
     let mut cases: Vec<(&str, Json, JoinLegs)> = offset_carrying_seam_fixtures()
@@ -3531,12 +3058,7 @@ fn qualified_wrapper_never_renders_offset_without_order_by() {
     }
 }
 
-/// A request with no `orderBy` and no offset — the overwhelming majority — must
-/// stay BYTE-IDENTICAL to the pre-#191 rendering, so the shared seam cannot
-/// change the shape of an already-correct plan. The full-SQL goldens
-/// (`golden_n_scan_join_sql_unchanged`,
-/// `golden_grouped_qualified_fallback_sql_unchanged`) freeze the limit-free
-/// wrappers; this freezes the trailing window itself.
+/// Scenario: A request with no orderBy and no offset renders a byte-identical LIMIT (#191)
 #[test]
 fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
     let legs = single_scan_legs("EVENTS");
@@ -3547,8 +3069,7 @@ fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
     let bare = seam_trailing(&pushdown_req, &legs).expect("a plain limited request must render");
     assert_eq!(bare, " LIMIT 5");
 
-    // Exasol normalises `OFFSET 0` away, but an explicit zero must render the
-    // same string if it ever arrives.
+    // Exasol normalises `OFFSET 0` away; an explicit zero must still render identically.
     pushdown_req["limit"] = serde_json::json!({"numElements": 5, "offset": 0});
     let zero = seam_trailing(&pushdown_req, &legs).expect("an explicit zero offset must render");
     assert_eq!(zero, bare);

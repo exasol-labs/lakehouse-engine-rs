@@ -1,14 +1,6 @@
 use super::*;
 
 /// Scenario: Catalog REST requests to Glue are SigV4-signed when enabled.
-///
-/// Asserts the signed request carries an `Authorization` header that:
-///   - uses the `AWS4-HMAC-SHA256` algorithm
-///   - includes the configured region (`us-east-1`) in the credential scope
-///   - includes the configured service name (`glue`) in the credential scope
-///   - ends with the `aws4_request` terminator
-///
-/// Also asserts the `x-amz-date` header is present.
 #[test]
 fn signed_request_carries_sigv4_header() {
     let client = reqwest::Client::new();
@@ -57,10 +49,7 @@ fn signed_request_carries_sigv4_header() {
     );
 }
 
-/// Verifies that the secret key does NOT appear in any signed request header.
-///
-/// The Authorization header contains a hex-encoded HMAC signature *derived from*
-/// the secret key, but must never contain the key in plaintext.
+/// Scenario: The secret key does not appear in any signed request header.
 #[test]
 fn secret_key_absent_from_signed_headers() {
     let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
@@ -89,10 +78,7 @@ fn secret_key_absent_from_signed_headers() {
     }
 }
 
-/// Verifies that the `Credentials` `Debug` impl redacts `secret_access_key`.
-///
-/// Exercises the library's built-in redaction guarantee so that credentials
-/// included in logs or error chains cannot leak the secret.
+/// Scenario: The `Credentials` `Debug` impl redacts `secret_access_key`.
 #[test]
 fn credentials_debug_redacts_secret() {
     let creds = Credentials::new(
@@ -114,10 +100,6 @@ fn credentials_debug_redacts_secret() {
 }
 
 /// Scenario: Unsigned catalog path is unchanged when SigV4 is disabled.
-///
-/// The disabled path means the caller simply does not invoke `sign_request`.
-/// Verifies that an unsigned request carries no `Authorization` or `x-amz-date`
-/// header, confirming the disabled path leaves the request untouched.
 #[test]
 fn disabled_sigv4_produces_unsigned_request() {
     let client = reqwest::Client::new();
@@ -136,10 +118,6 @@ fn disabled_sigv4_produces_unsigned_request() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Signing-region resolution (ConnectionCreds::sigv4_signing_region)
-// ---------------------------------------------------------------------------
-
 fn creds_stating_region(region: &str) -> ConnectionCreds {
     ConnectionCreds {
         region: region.into(),
@@ -147,8 +125,6 @@ fn creds_stating_region(region: &str) -> ConnectionCreds {
     }
 }
 
-/// Standard commercial AWS Glue endpoint addresses, each with the region its
-/// host names: case, port, and path never affect the match.
 const STANDARD_GLUE_ENDPOINTS: [(&str, &str); 5] = [
     ("https://glue.eu-west-1.amazonaws.com/iceberg", "eu-west-1"),
     ("https://GLUE.EU-WEST-1.AMAZONAWS.COM/iceberg", "eu-west-1"),
@@ -166,8 +142,6 @@ const STANDARD_GLUE_ENDPOINTS: [(&str, &str); 5] = [
     ),
 ];
 
-/// Addresses that are not a standard commercial AWS Glue endpoint, labelled by
-/// the form each one represents.
 const NON_STANDARD_ADDRESSES: [(&str, &str); 18] = [
     (
         "GovCloud",
@@ -219,8 +193,7 @@ const NON_STANDARD_ADDRESSES: [(&str, &str); 18] = [
     ),
 ];
 
-/// Scenario: A standard AWS Glue endpoint supplies the SigV4 signing region
-/// when the CONNECTION omits region.
+/// Scenario: A standard AWS Glue endpoint supplies the SigV4 signing region when the CONNECTION omits region.
 #[test]
 fn standard_glue_endpoint_supplies_the_signing_region_when_none_is_stated() {
     let creds = creds_stating_region("");
@@ -234,8 +207,7 @@ fn standard_glue_endpoint_supplies_the_signing_region_when_none_is_stated() {
     }
 }
 
-/// Scenario: A standard AWS Glue endpoint signs the catalog request even when
-/// the CONNECTION states a different region.
+/// Scenario: A standard AWS Glue endpoint signs the catalog request even when the CONNECTION states a different region.
 #[test]
 fn standard_glue_endpoint_region_signs_even_when_a_different_region_is_stated() {
     let creds = creds_stating_region("us-east-1");
@@ -249,9 +221,7 @@ fn standard_glue_endpoint_region_signs_even_when_a_different_region_is_stated() 
     );
 }
 
-/// Scenario: When SigV4 is enabled, access_key, secret_key, and a signing
-/// region are required — no address form outside the standard Glue shape
-/// supplies a signing region on its own.
+/// Scenario: No address form outside the standard Glue shape supplies a signing region on its own.
 #[test]
 fn non_standard_addresses_supply_no_signing_region() {
     let creds = creds_stating_region("");
@@ -265,8 +235,7 @@ fn non_standard_addresses_supply_no_signing_region() {
     }
 }
 
-/// Scenario: a non-standard address signs with the stated `region`, unaffected
-/// by the standard-Glue-endpoint rule.
+/// Scenario: A non-standard address signs with the stated `region`.
 #[test]
 fn stated_region_signs_for_a_non_standard_address() {
     let creds = creds_stating_region("us-gov-west-1");
@@ -280,12 +249,7 @@ fn stated_region_signs_for_a_non_standard_address() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Signing-region refusal (required_signing_region)
-// ---------------------------------------------------------------------------
-
-/// The refusal names `region` and carries neither a credential value nor the
-/// catalog URI: the exact-text pin below is what proves both absences.
+/// Scenario: The signing-region refusal carries neither a credential value nor the catalog URI.
 #[test]
 fn required_signing_region_refuses_without_a_signing_region() {
     let creds = ConnectionCreds {

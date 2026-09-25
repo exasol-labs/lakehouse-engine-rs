@@ -1,7 +1,6 @@
 use super::*;
 use crate::scan::type_relaxation::supported_relaxation_pairs;
 
-/// Pairs no row of the supported set covers in either ordering, curated so each refusal is named individually.
 fn unsupported_pairs() -> Vec<(&'static str, DataType, DataType)> {
     vec![
         ("long -> double", DataType::Int64, DataType::Float64),
@@ -40,8 +39,7 @@ fn unsupported_pairs() -> Vec<(&'static str, DataType, DataType)> {
     ]
 }
 
-// Scenario Coverage (type-relaxation): The supported pair set answers a plan-time widening
-// question from one production owner
+/// Scenario: The supported pair set answers a plan-time widening question from one production owner
 #[test]
 fn widening_owner_answers_every_supported_pair_and_refuses_the_rest() {
     for (row, narrow, wide) in supported_relaxation_pairs() {
@@ -74,8 +72,7 @@ fn widening_owner_answers_every_supported_pair_and_refuses_the_rest() {
     }
 }
 
-// Scenario Coverage (type-relaxation): The supported pair set answers a plan-time widening
-// question from one production owner
+/// Scenario: The supported pair set answers a plan-time widening question from one production owner
 #[test]
 fn two_equal_types_resolve_to_the_shared_type() {
     for shared in [
@@ -93,8 +90,7 @@ fn two_equal_types_resolve_to_the_shared_type() {
     }
 }
 
-// Scenario Coverage (type-relaxation): The supported pair set answers a plan-time widening
-// question from one production owner
+/// Scenario: The supported pair set answers a plan-time widening question from one production owner
 #[test]
 fn decimal_rows_are_evaluated_on_the_concrete_precision_and_scale() {
     assert_eq!(

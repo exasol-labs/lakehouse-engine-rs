@@ -14,11 +14,8 @@ use parquet::arrow::ArrowWriter;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Every physical-to-logical Arrow pair `datafusion-scan/type-relaxation`'s supported-set table
-/// declares readable, one entry per table row (rows 9 and 10 each cover three physical types under
-/// one row, so they contribute three entries here). `can_cast_types` decides castability from the
-/// two `DataType` variants alone, so a representative precision/scale stands in for every concrete
-/// decimal the rows describe.
+/// One entry per supported-set table row (rows 9 and 10 contribute three each). `can_cast_types`
+/// looks only at the variants, so one precision/scale stands in for every decimal.
 pub(crate) fn supported_relaxation_pairs() -> Vec<(&'static str, DataType, DataType)> {
     vec![
         ("1: int -> long", DataType::Int32, DataType::Int64),
@@ -69,8 +66,7 @@ pub(crate) fn supported_relaxation_pairs() -> Vec<(&'static str, DataType, DataT
     ]
 }
 
-// Scenario Coverage (type-relaxation): Every supported relaxation pair is proven castable rather
-// than assumed
+/// Scenario: every supported relaxation pair is proven castable rather than assumed.
 #[test]
 fn arrow_castability_pins_every_supported_relaxation_pair() {
     for (row, physical, logical) in supported_relaxation_pairs() {
@@ -83,8 +79,7 @@ fn arrow_castability_pins_every_supported_relaxation_pair() {
     }
 }
 
-// Scenario Coverage (type-relaxation): Every supported relaxation pair is proven castable rather
-// than assumed
+/// Scenario: long -> double is absent from the supported relaxation set.
 #[test]
 fn long_to_double_is_absent_from_the_supported_relaxation_set() {
     assert!(
@@ -103,9 +98,8 @@ fn long_to_double_is_absent_from_the_supported_relaxation_set() {
     );
 }
 
-/// One supported-set row read end to end. `expected` is written out by hand rather than derived
-/// with `arrow::compute::cast`, so a pair that is castable in principle but wrong in practice fails
-/// here instead of agreeing with the kernel under test.
+/// `expected` is hand-written, not derived via `arrow::compute::cast`, so it cannot agree with
+/// the kernel under test.
 struct RelaxationRead {
     row: &'static str,
     physical: ArrayRef,
@@ -121,8 +115,7 @@ fn decimal128(values: Vec<i128>, precision: u8, scale: i8) -> ArrayRef {
     )
 }
 
-/// A read case per row of [`supported_relaxation_pairs`], in the same order, carrying the narrow
-/// type's boundary values so a cast that truncates or wraps cannot pass.
+/// Same order as [`supported_relaxation_pairs`]; boundary values catch a truncating or wrapping cast.
 fn supported_relaxation_reads() -> Vec<RelaxationRead> {
     vec![
         RelaxationRead {
@@ -277,8 +270,7 @@ fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> String {
         .to_string()
 }
 
-/// The Arrow types a written fixture file actually carries. A Parquet round-trip that silently
-/// widened the narrow column would leave the read assertions proving nothing about relaxation.
+/// A Parquet round-trip that silently widened the narrow column would make the read assertions vacuous.
 fn parquet_column_types(path: &Path) -> Vec<DataType> {
     let file = std::fs::File::open(path).expect("open parquet file");
     let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)
@@ -291,8 +283,7 @@ fn parquet_column_types(path: &Path) -> Vec<DataType> {
         .collect()
 }
 
-/// Drive the exact production scan path — `register_files` then `build_scan_sql` — so the cast under
-/// test is the one `FieldIdExprAdapterFactory` delegates to, not one the test performs.
+/// Uses the production path so the cast under test is the one `FieldIdExprAdapterFactory` delegates to.
 async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
     let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
     register_files(&ctx, "scan_target", spec, &inline_resolved(spec))
@@ -307,8 +298,7 @@ async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
         .expect("scan must read the assigned files")
 }
 
-// Scenario Coverage (type-relaxation): Every supported relaxation pair is proven castable rather
-// than assumed
+/// Scenario: every supported relaxation pair reads its real values from a narrow Parquet file.
 #[tokio::test]
 async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_parquet_file() {
     let cases = supported_relaxation_reads();
@@ -375,8 +365,7 @@ async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_par
     }
 }
 
-// Scenario Coverage (type-relaxation): A narrow physical column binds to the current wider logical
-// type and is cast per file
+/// Scenario: a narrow physical column binds to the current wider logical type and is cast per file.
 #[tokio::test]
 async fn a_narrow_physical_column_is_cast_to_the_current_logical_type_per_file() {
     let dir = std::env::temp_dir().join(format!(

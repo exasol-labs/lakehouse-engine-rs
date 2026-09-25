@@ -1,24 +1,7 @@
-//! Permanent E2E coverage for issue #399: scan output values stay correct now
-//! that the scan spec carries no `emit_exa_types` copy of the declared column
-//! types — the generated `EMITS` clause is the sole authority, and the scan
-//! reads it back via `UdfContext::output_column` at runtime. See
-//! `specs/_plans/remove-emit-exa-types/e2e-harness/e2e-harness-scan-correctness`.
+//! The generated `EMITS` clause is the sole authority for scan output types (#399).
 //!
-//! Deliberately does NOT compare the declared `EMITS` list against the SDK's
-//! runtime `output_column` accessors — that agreement is the SDK/SLC's own
-//! contract (`language-container-rs` populates both from the one parsed
-//! `EMITS` clause the engine sent) and was proven once, at implementation
-//! time, against this same local Exasol Docker container (task 1.6). A
-//! recurring comparison here would re-test that upstream guarantee rather
-//! than this repo's own logic.
-//!
-//! Seeds `typed_distinct_probe` and `complex_probe` (`common::seed`), the two
-//! fixtures that together span the type mix: bare `long`, `decimal`,
-//! `double`, `string`, `date`, `timestamp`, and `boolean` columns, a
-//! projected `CAST(id AS DECIMAL(5,0))` (the only reachable probe for the
-//! `Int32` bin — no catalog-declared column in these fixtures bins there),
-//! and `list`/`struct`/`map` columns the adapter declares `VARCHAR(2000000)`
-//! and renders as JSON.
+//! Does not compare `EMITS` against the SDK's runtime `output_column`: that
+//! agreement is the SDK/SLC's own contract.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -39,9 +22,6 @@ const VS_NAME: &str = "EMIT_DECL_VS";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
-/// Seed both fixtures and provision the shared VS, once per binary — each E2E
-/// binary runs in its own process, so setup is intentionally not shared with
-/// the other `e2e_*_test.rs` files (mirrors `e2e_complex_type_test.rs`).
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
@@ -77,12 +57,8 @@ fn complex_table() -> String {
     format!("{VS_NAME}.{}", E2E_COMPLEX_TABLE.to_uppercase())
 }
 
-/// The generated scan-driving SQL alone (`EXPLAIN VIRTUAL`'s `PUSHDOWN_SQL`
-/// column), without Exasol's echoed request JSON — the only surface on which
-/// a scan-spec field assertion is meaningful, since the echoed request
-/// repeats the user's own select list and would satisfy a naive substring
-/// probe. Duplicated from `e2e_scan_test.rs` per this crate's E2E-binary
-/// convention: each binary is self-contained.
+/// `PUSHDOWN_SQL` only: the echoed request JSON repeats the user's select list
+/// and would satisfy a naive substring probe.
 fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
@@ -94,9 +70,6 @@ fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
         .join(" ")
 }
 
-/// The inner text of the top-level `EMITS (...)` clause in `pushed_sql`,
-/// depth-aware so a nested `DECIMAL(p,s)` type's own parens do not end the
-/// scan early.
 fn emits_clause(pushed_sql: &str) -> String {
     let marker = "EMITS (";
     let start = pushed_sql
@@ -121,8 +94,6 @@ fn emits_clause(pushed_sql: &str) -> String {
     pushed_sql[start..end].to_string()
 }
 
-/// Split `s` on top-level commas only, so a nested `DECIMAL(p,s)` type's own
-/// comma is not mistaken for an item separator.
 fn split_top_level(s: &str) -> Vec<String> {
     let mut depth = 0i32;
     let mut parts = Vec::new();
@@ -150,11 +121,7 @@ fn split_top_level(s: &str) -> Vec<String> {
     parts
 }
 
-/// Assert `pushed`'s scan spec carries no `emit_exa_types` key and its
-/// top-level `EMITS (...)` clause declares exactly `expected_types`, one per
-/// select-list item, each as a substring of its item (identifiers are not
-/// pinned — a bare column keeps its real name, an expression gets a
-/// positional synthetic alias).
+/// Types are matched as substrings: an expression item gets a synthetic alias.
 fn assert_emits_clause_declares(pushed: &str, expected_types: &[&str]) {
     assert!(
         !pushed.contains("emit_exa_types"),
@@ -174,18 +141,9 @@ fn assert_emits_clause_declares(pushed: &str, expected_types: &[&str]) {
     }
 }
 
-/// Scenario: the scan returns correct values across the type mix with no
-/// spec-carried emit types (issue #399).
-///
-/// `typed_distinct_probe` row `id=1` carries a bare `long`, `decimal`,
-/// `double`, `string`, `date`, `timestamp`, and `boolean` column, plus a
-/// projected `CAST(id AS DECIMAL(5,0))` reaching the `Int32` bin. The `date`/
-/// `timestamp`/`boolean` columns are pinned via an equality `WHERE` predicate
-/// rather than a returned-cell string comparison, so the assertion does not
-/// depend on the session's TIMESTAMP display precision (bare `TIMESTAMP` vs
-/// `TIMESTAMP(6)`, engine-version dependent). `complex_probe` row `id=1`
-/// (`COMPLEX_ROW_POPULATED`) carries `list`, `struct`, and `map` columns the
-/// adapter declares `VARCHAR(2000000)` and renders as JSON.
+/// Scenario: the scan returns correct values across the type mix with no spec-carried emit types
+// date/timestamp/boolean are pinned via WHERE, not cell comparison, so the test
+// is independent of the engine-version-dependent TIMESTAMP display precision.
 #[test]
 fn scan_returns_correct_values_across_type_mix_with_no_spec_carried_emit_types() {
     setup();
@@ -208,14 +166,14 @@ fn scan_returns_correct_values_across_type_mix_with_no_spec_carried_emit_types()
     assert_emits_clause_declares(
         &pushed,
         &[
-            "DECIMAL(20,0)",    // id (long) -> ExaType::Int64
-            "DECIMAL(9,2)",     // c_decimal_a -> ExaType::Numeric
-            "DOUBLE PRECISION", // c_double -> ExaType::Double
-            "VARCHAR(2000000)", // c_varchar -> ExaType::String
-            "DATE",             // c_date -> ExaType::Date
-            "TIMESTAMP",        // c_ts -> ExaType::Timestamp (bare or TIMESTAMP(6))
-            "BOOLEAN",          // c_bool -> ExaType::Boolean
-            "DECIMAL(5,0)",     // CAST(id AS DECIMAL(5,0)) -> ExaType::Int32
+            "DECIMAL(20,0)",
+            "DECIMAL(9,2)",
+            "DOUBLE PRECISION",
+            "VARCHAR(2000000)",
+            "DATE",
+            "TIMESTAMP", // bare or TIMESTAMP(6)
+            "BOOLEAN",
+            "DECIMAL(5,0)", // the only reachable Int32-bin probe
         ],
     );
 
@@ -262,10 +220,10 @@ fn scan_returns_correct_values_across_type_mix_with_no_spec_carried_emit_types()
     assert_emits_clause_declares(
         &pushed_complex,
         &[
-            "DECIMAL(20,0)",    // id (long) -> ExaType::Int64
-            "VARCHAR(2000000)", // tags (list<string>) -> JSON via VARCHAR
-            "VARCHAR(2000000)", // addr (struct) -> JSON via VARCHAR
-            "VARCHAR(2000000)", // attrs (map<string,string>) -> JSON via VARCHAR
+            "DECIMAL(20,0)",
+            "VARCHAR(2000000)",
+            "VARCHAR(2000000)",
+            "VARCHAR(2000000)",
         ],
     );
 

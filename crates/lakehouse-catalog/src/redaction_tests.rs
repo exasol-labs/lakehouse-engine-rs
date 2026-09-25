@@ -22,8 +22,6 @@ fn redact_no_false_positives_on_clean_message() {
 
 #[test]
 fn redact_secret_values_strips_literal_credential_values() {
-    // S3 signature-style error shape that embeds the raw access key without
-    // a recognizable `access_key=` label — the label heuristic misses this.
     let secret = "wJalrXUtnFEMIK7MDENGbPxRfiCYEXAMPLEKEY";
     let msg = format!(
         "<Error><Code>SignatureDoesNotMatch</Code><AWSAccessKeyId>AKIAIOSFODNN7EXAMPLE</AWSAccessKeyId><StringToSign>{secret}</StringToSign></Error>"
@@ -41,9 +39,6 @@ fn redact_secret_values_strips_literal_credential_values() {
     assert!(safe.contains("[REDACTED]"), "redaction marker must appear");
 }
 
-// ---------------------------------------------------------------------------
-// Task 4.4 — Extended redaction: bearer token + SigV4 Authorization + vended STS
-// ---------------------------------------------------------------------------
 #[test]
 fn redact_credentials_strips_authorization_header() {
     let auth_value = "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20231201/us-east-1/glue/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123";
@@ -83,7 +78,6 @@ fn redact_credentials_strips_vended_sts_keys() {
         !safe.contains("VENDED_TOK"),
         "vended session token must be redacted: {safe}"
     );
-    // Labels must be preserved so the error is still readable.
     assert!(
         safe.contains("s3.access-key-id"),
         "label must be preserved: {safe}"
@@ -161,7 +155,6 @@ fn redact_error_text_removes_a_sas_token_whole_unlike_the_inverted_order() {
 }
 #[test]
 fn redact_credentials_redacts_all_occurrences_of_repeated_label() {
-    // Two occurrences of "access_key" with distinct values — both must vanish.
     let msg = "access_key=FIRST_KEY_VALUE, access_key=SECOND_KEY_VALUE";
     let safe = redact_credentials(msg);
     assert!(
@@ -172,7 +165,6 @@ fn redact_credentials_redacts_all_occurrences_of_repeated_label() {
         !safe.contains("SECOND_KEY_VALUE"),
         "second occurrence must be redacted: {safe}"
     );
-    // Labels themselves should still be visible so the error is readable.
     assert!(
         safe.contains("access_key"),
         "label must be preserved: {safe}"
@@ -188,9 +180,6 @@ fn redact_credentials_strips_x_amz_security_token() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 4.3 — No credential in error text
-// ---------------------------------------------------------------------------
 #[test]
 fn catalog_error_message_strips_credentials() {
     let msg = "GET failed: access_key=AKID_SECRET_VALUE region=us-east-1";

@@ -1,27 +1,3 @@
-//! Host integration tests for the reshaped `(path, size)` scan payload (task 5.1).
-//!
-//! Two behaviours are exercised end-to-end against a local `file://` Parquet (no
-//! S3 / MinIO stack), driving the production raw-scan pipeline
-//! ([`run_raw_scan_with_session`] → `build_dataframe` → `register_files`):
-//!
-//! 1. `scan_uses_spec_size_and_issues_no_head` — a scan whose spec carries
-//!    CALLER-SUPPLIED file sizes returns rows identical to a scan that discovers
-//!    the size from the store, AND its per-file metadata (`head`) lookup is
-//!    satisfied from the spec size without ever reaching the wrapped store. The
-//!    proof reuses the exact production mechanism the S3 wrapper uses in
-//!    `scan/mod.rs`: `head` dispatches through `object_store` to
-//!    `get_opts(head: true)`, which a size-carrying [`ObjectStore`] decorator
-//!    intercepts. A `HashMap`-empty decorator (the discovery baseline) forwards
-//!    the same `head` to the inner store; the two scans must yield identical rows.
-//!
-//! 2. `relative_and_absolute_entries_resolve_to_same_files` — a relative
-//!    `(path, size)` entry joined onto `table_root` reconstitutes to the same
-//!    absolute file as the equivalent absolute entry, and both scans emit the
-//!    same rows.
-//!
-//! The no-network-HEAD behaviour of the production S3 wrapper is additionally
-//! unit-covered in `scan/mod.rs` (`SpecSizedObjectStore::get_opts`).
-
 mod scan_fixture;
 
 use std::collections::HashMap;
@@ -59,18 +35,13 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 use url::Url;
 
-/// Iceberg reserved field-ids for a positional-delete file's `file_path`/`pos`
-/// columns (mirrors `scan::positional_deletes`'s private constants; duplicated
-/// here since this integration test cannot import a `pub(crate)` item).
+/// Iceberg reserved field-ids; duplicated because the engine's constants are `pub(crate)`.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 
-/// Shared HEAD-lookup counters observed from outside a registered store.
 #[derive(Clone, Debug, Default)]
 struct HeadCounts {
-    /// `head` requests satisfied from the caller-supplied size map (no inner I/O).
     from_spec: Arc<AtomicUsize>,
-    /// `head` requests forwarded to the wrapped store.
     to_inner: Arc<AtomicUsize>,
 }
 
@@ -83,12 +54,8 @@ impl HeadCounts {
     }
 }
 
-/// An [`ObjectStore`] decorator that mirrors the production `SpecSizedObjectStore`
-/// mechanism: a `head` (dispatched by `object_store` as `get_opts(head: true)`)
-/// whose location is present in `sizes` is answered from the spec size with no I/O
-/// to the inner store; every other operation delegates. When `sizes` is empty it
-/// forwards all `head`s to the inner store — the discovery baseline. Both branches
-/// increment the corresponding [`HeadCounts`] so a test can prove which path ran.
+/// Mirrors the production `SpecSizedObjectStore`: a `head` for a location in `sizes` is
+/// answered without inner I/O. `object_store` dispatches `head` as `get_opts(head: true)`.
 #[derive(Debug)]
 struct CountingHeadStore {
     inner: Arc<dyn ObjectStore>,
@@ -193,8 +160,6 @@ impl ObjectStore for CountingHeadStore {
     }
 }
 
-/// Storage props are never dialed for a local `file://` scan; a placeholder keeps
-/// the spec well-formed.
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
@@ -206,9 +171,6 @@ fn dummy_storage() -> StorageBackend {
     })
 }
 
-/// Build a raw-scan `ScanSpec` over `files` (already `(path, size)` shaped) with
-/// the given `table_root`. Row scan (no aggregates/group keys), projecting id+name
-/// so the output ordering is deterministic.
 fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -222,28 +184,9 @@ fn raw_spec(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
     }
 }
 
-/// Build a raw-scan `ScanSpec` exactly like [`raw_spec`], but with a non-empty
-/// `common.logical_schema` matching the fixture Parquet this file writes
-/// (`write_local_parquet`): `id` (field-id 1, `int64`, non-nullable) and `name`
-/// (field-id 2, `utf8`, non-nullable).
-///
-/// This is NOT interchangeable with [`raw_spec`] for a request-count assertion.
-/// `register_file_list` installs the field-id expression adapter only when
-/// `logical_schema` is non-empty; an empty schema takes the
-/// `ParquetFormat::infer_schema` fallback instead, which fetches and caches the
-/// FIRST assigned file's footer before Phase B (`PositionalDeleteScanTable::
-/// partitioned_files`) ever runs. Any later Phase-B request-count assertion then
-/// observes a pure cache hit and holds regardless of how many round-trips that
-/// fetch would actually cost — the exact gap decision-log [8] documents. Kept as
-/// a separate helper rather than changing `raw_spec` itself: `raw_spec`'s other
-/// three callers (`scan_uses_spec_size_and_issues_no_head`,
-/// `relative_and_absolute_entries_resolve_to_same_files`,
-/// `scan_issues_no_head_for_delete_files`) assert unrelated no-HEAD properties
-/// that do not depend on which registration branch runs.
-///
-/// The fixture Parquet carries no Iceberg field-id metadata on `id`/`name`
-/// themselves, so the installed adapter falls back to binding by name; that is
-/// expected and changes no read, only which registration branch runs.
+/// Request-count assertions must use this, not [`raw_spec`]: an empty `logical_schema`
+/// triggers schema inference, which pre-caches the first file's footer and hides
+/// Phase B's real round-trips.
 fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -277,12 +220,6 @@ fn raw_spec_with_logical_schema(files: Vec<(String, u64)>, table_root: String) -
     }
 }
 
-/// Logical fields for a `columns`-wide fixture written by
-/// [`write_wide_local_parquet`]: `id` (field-id 1, `int64`), `name` (field-id 2,
-/// `utf8`), then `c2 … c{columns-1}` (`int64`), field-ids assigned from 1 in
-/// declaration order. Names are lowercase to match the physical Parquet, while
-/// the spec's `projection` stays uppercase, exactly as
-/// [`raw_spec_with_logical_schema`] already does.
 fn wide_logical_fields(columns: usize) -> Vec<LogicalField> {
     (0..columns)
         .map(|i| LogicalField {
@@ -301,18 +238,8 @@ fn wide_logical_fields(columns: usize) -> Vec<LogicalField> {
         .collect()
 }
 
-/// Build a raw-scan `ScanSpec` over a `columns`-wide fixture: the
-/// `common.logical_schema` names ALL `columns` (so `register_file_list` installs
-/// the field-id adapter rather than taking the `ParquetFormat::infer_schema`
-/// fallback — load-bearing for the same reason documented on
-/// [`raw_spec_with_logical_schema`]), while `common.projection` stays at the two
-/// columns [`rows_of`] decodes.
-///
-/// The asymmetry is deliberate: the wide logical schema is what makes the cached
-/// `ParquetMetaData` entry large (one `ColumnChunkMetaData` per
-/// `columns × row_groups`), and the narrow projection is what keeps the opener's
-/// execute-time column reads cheap, so a footer-reuse assertion can be run at a
-/// realistic metadata scale without also reading a realistic volume of data.
+/// The wide logical schema makes the cached footer large while the two-column projection
+/// keeps execute-time reads cheap.
 fn raw_spec_with_wide_logical_schema(
     files: Vec<(String, u64)>,
     table_root: String,
@@ -331,8 +258,6 @@ fn raw_spec_with_wide_logical_schema(
     }
 }
 
-/// Write a local Parquet at `dir/relative` (creating parent dirs) with `rows` rows
-/// across small row groups. Returns the file's absolute `file://` URL.
 fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -364,21 +289,8 @@ fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> Stri
         .to_string()
 }
 
-/// Write a local Parquet at `dir/relative` whose FOOTER is deliberately wide:
-/// `columns` columns × `row_groups` row groups × `rows_per_row_group` rows.
-/// Returns the file's absolute `file://` URL.
-///
-/// `columns` and `row_groups` — not the row count — are the knobs that set the
-/// size of the cached `ParquetMetaData` entry: the parsed footer holds one
-/// `ColumnChunkMetaData` per `columns × row_groups`, and that product dominates
-/// `ParquetMetaData::memory_size()`, which is exactly what the session
-/// `FileMetadataCache` charges against its limit. `rows_per_row_group` is kept
-/// small on purpose so a wide footer costs little actual data.
-///
-/// Column 0 is `id` (Int64) and column 1 is `name` (Utf8), matching
-/// [`write_local_parquet`], so the `["ID", "NAME"]` projection and [`rows_of`]
-/// apply unchanged; the remaining `columns - 2` are `cN` Int64 padding whose only
-/// job is to widen the footer.
+/// `columns × row_groups` sets the cached footer's `memory_size()`, which the session
+/// `FileMetadataCache` charges against its limit; columns past `id`/`name` are padding.
 fn write_wide_local_parquet(
     dir: &std::path::Path,
     relative: &str,
@@ -429,8 +341,7 @@ fn write_wide_local_parquet(
         .to_string()
 }
 
-/// The object-store `Path` DataFusion passes to `head` for an exact-file URL — the
-/// key production `build_spec_size_index` uses. Computed identically here.
+/// Must match the key production `build_spec_size_index` uses.
 fn head_key(abs_file_url: &str) -> ObjectStorePath {
     ListingTableUrl::parse(abs_file_url)
         .expect("listing url")
@@ -438,10 +349,6 @@ fn head_key(abs_file_url: &str) -> ObjectStorePath {
         .clone()
 }
 
-/// Write a local positional-delete Parquet at `dir/relative`: `file_path`/`pos`
-/// columns tagged with the Iceberg reserved field-ids, one row per
-/// `(referenced_file_abs_url, position)` entry. Returns the file's absolute
-/// `file://` URL.
 fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str, i64)]) -> String {
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
@@ -474,15 +381,10 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
         .to_string()
 }
 
-/// One logged request: the location, whether it was a HEAD, and the byte
-/// range requested (if any).
+/// `(location, is_head, range)`.
 type LoggedRequest = (ObjectStorePath, bool, Option<GetRange>);
 
-/// An [`ObjectStore`] decorator that records the location of every request
-/// (HEAD or GET, with its byte range) into a shared log and answers every HEAD
-/// from a caller-supplied size map with NO inner I/O — extending
-/// [`CountingHeadStore`]'s head-interception with a full request log so a test
-/// can assert exactly WHICH locations, and how many times each, were fetched.
+/// Logs every request and answers HEADs from `sizes` without inner I/O.
 #[derive(Debug)]
 struct RequestLoggingStore {
     inner: Arc<dyn ObjectStore>,
@@ -593,12 +495,7 @@ async fn run_scan_with_store(
         .0
 }
 
-/// Run the production raw scan exactly as [`run_scan_with_store`] does, but also
-/// hand back the [`SessionContext`] it ran on, so a caller can interrogate that
-/// session's `FileMetadataCache` (`runtime_env().cache_manager
-/// .get_file_metadata_cache().list_entries()`) once the scan has finished. The
-/// cache is per-session, so this is the only way to observe what the scan cached
-/// and what survived to the opener.
+/// Returns the session too: the `FileMetadataCache` is per-session.
 async fn run_scan_capturing_session(
     spec: &ScanSpec,
     register_url: &str,
@@ -645,9 +542,7 @@ fn rows_of(batches: &[RecordBatch]) -> Vec<(i64, String)> {
     out
 }
 
-/// A spec carrying the caller-supplied file size scans the same rows as a
-/// discovery-based scan, and its per-file `head` is served from the spec size
-/// without ever reaching the wrapped store (no network HEAD).
+/// Scenario: a spec-supplied file size serves the per-file HEAD with no store request and identical rows
 #[test]
 fn scan_uses_spec_size_and_issues_no_head() {
     let dir = std::env::temp_dir().join(format!("lh_no_head_{}", std::process::id()));
@@ -657,8 +552,6 @@ fn scan_uses_spec_size_and_issues_no_head() {
         .expect("stat parquet")
         .len();
 
-    // Discovery baseline: an empty size map forwards every `head` to the inner
-    // LocalFileSystem, which reports the real size.
     let discover_counts = HeadCounts::default();
     let discover_store = Arc::new(CountingHeadStore::new(
         Arc::new(LocalFileSystem::new()),
@@ -682,8 +575,6 @@ fn scan_uses_spec_size_and_issues_no_head() {
         "discovery scan must not answer any HEAD from a spec size"
     );
 
-    // Spec-size path: the exact same size, but keyed into the store so the `head`
-    // is served from the spec without touching the inner store.
     let spec_counts = HeadCounts::default();
     let mut sizes = HashMap::new();
     sizes.insert(head_key(&file_url), real_size);
@@ -707,7 +598,6 @@ fn scan_uses_spec_size_and_issues_no_head() {
         spec_counts.forwarded_to_inner()
     );
 
-    // The spec-size path produces identical, correct data.
     let discovered_rows = rows_of(&discovered);
     let spec_rows = rows_of(&via_spec);
     assert_eq!(discovered_rows.len(), 200, "row count");
@@ -719,29 +609,23 @@ fn scan_uses_spec_size_and_issues_no_head() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A relative `(path, size)` entry joined onto `table_root` resolves to the same
-/// file as the equivalent absolute entry, and both scans emit the same rows.
+/// Scenario: a relative entry joined onto `table_root` resolves to the same file as the absolute entry
 #[test]
 fn relative_and_absolute_entries_resolve_to_same_files() {
     let dir = std::env::temp_dir().join(format!("lh_rel_abs_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // File lives under <dir>/data/f.parquet so the relative entry "data/f.parquet"
-    // joins onto the <dir> table root to the same absolute URL.
     let abs_url = write_local_parquet(&dir, "data/f.parquet", 150);
     let real_size = std::fs::metadata(abs_url.strip_prefix("file://").unwrap())
         .expect("stat parquet")
         .len();
     let table_root = url::Url::from_file_path(&dir).expect("dir url").to_string();
 
-    // Absolute entry, empty root (passthrough reconstruction).
     let abs_spec = raw_spec(vec![(abs_url.clone(), real_size)], String::new());
-    // Relative entry joined onto table_root.
     let rel_spec = raw_spec(
         vec![("data/f.parquet".to_string(), real_size)],
         table_root.clone(),
     );
 
-    // Sanity: both reconstitute to the identical absolute head-lookup key.
     assert_eq!(
         head_key(&abs_url),
         head_key(&format!(
@@ -771,10 +655,7 @@ fn relative_and_absolute_entries_resolve_to_same_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (file-metadata): a delete-carrying scan issues NO object-store HEAD
-/// for its associated positional-delete file — the delete file's `ObjectMeta`
-/// is built directly from the spec-supplied size (`DeleteMechanism`'s `size`), the
-/// same no-HEAD mechanism `FileEntry::size` already gives data files.
+/// Scenario: a delete-carrying scan issues no HEAD for its positional-delete file
 #[test]
 fn scan_issues_no_head_for_delete_files() {
     let dir = std::env::temp_dir().join(format!("lh_no_head_del_{}", std::process::id()));
@@ -827,25 +708,7 @@ fn scan_issues_no_head_for_delete_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (file-metadata / memory-creds): the shared session
-/// `FileMetadataCache` (task 2.5) means attaching a positional-delete file to a
-/// data file causes NO additional object-store GET against the DATA file
-/// itself — the footer is parsed once (through the cache) and reused by both
-/// the access-plan construction and the opener's own read, rather than being
-/// fetched a second time.
-///
-/// Both specs MUST carry a non-empty `common.logical_schema`, built via
-/// [`raw_spec_with_logical_schema`] rather than [`raw_spec`]. Without it,
-/// `register_file_list` takes the `ParquetFormat::infer_schema` fallback, which
-/// fetches and caches the delta file's footer BEFORE Phase B
-/// (`PositionalDeleteScanTable::partitioned_files`) ever runs — so the
-/// access-plan fetch this test cares about is then a pure cache hit, and the
-/// range-equality assertion below holds regardless of how many round-trips
-/// that fetch would actually have cost. Production always supplies a logical
-/// schema, so Phase B is the FIRST reader of the footer there, making its
-/// request shape fully load-bearing (decision-log [8]). The fixture Parquet
-/// carries no Iceberg field-id metadata of its own, so the installed adapter
-/// binds `id`/`name` by name fallback; that is expected and changes no read.
+/// Scenario: attaching a positional-delete file adds no GET against the data file's own footer
 #[test]
 fn scan_reads_footer_via_range_get_once() {
     let dir = std::env::temp_dir().join(format!("lh_footer_once_{}", std::process::id()));
@@ -858,9 +721,7 @@ fn scan_reads_footer_via_range_get_once() {
     let delta_size = std::fs::metadata(delta_url.strip_prefix("file://").unwrap())
         .expect("stat delta parquet")
         .len();
-    // A single deleted position (never a whole row group) so every row group of
-    // the delta file is opened identically to the baseline — isolating any
-    // difference in call pattern to metadata/footer reads.
+    // One deleted position, so every row group is still opened as in the baseline.
     let delete_url = write_delete_parquet(&dir, "delta/deletes.parquet", &[(&delta_url, 5)]);
     let delete_size = std::fs::metadata(delete_url.strip_prefix("file://").unwrap())
         .expect("stat delete parquet")
@@ -910,12 +771,6 @@ fn scan_reads_footer_via_range_get_once() {
     let delta_rows = block_on(run_scan_with_store(&delta_spec, &delta_url, delta_store));
     assert_eq!(rows_of(&delta_rows).len(), 199, "1 row deleted out of 200");
 
-    // Every non-HEAD GET the delta scan issues AGAINST THE DATA FILE (i.e.
-    // excluding the delete file's own, separately necessary, reads) must be
-    // byte-range-identical to the baseline's data-file reads: the delete
-    // file's associated access-plan construction reads the SAME footer through
-    // the shared `FileMetadataCache` the opener uses, rather than fetching it a
-    // second time from the object store.
     let baseline_data_calls: Vec<Option<GetRange>> = baseline_log
         .lock()
         .unwrap()
@@ -939,25 +794,10 @@ fn scan_reads_footer_via_range_get_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (file-metadata): plan construction ALONE — before any row is
-/// executed — fetches a delete-carrying data file's own Parquet footer with
-/// EXACTLY ONE non-HEAD object-store request, and that request is a bounded
-/// suffix range rather than the unhinted footer-length-probe shape.
-///
-/// Registers one delete-carrying data file through the production
-/// `register_files` seam, with a non-empty `logical_schema` via
-/// `raw_spec_with_logical_schema` (load-bearing for the same reason documented
-/// on that helper), then calls `build_raw_scan_physical_plan` and STOPS: plan
-/// construction runs Phase A (`collect_delete_positions`) and Phase B
-/// (`partitioned_files`) and nothing else, so the request log at that point
-/// holds only preparation reads — none of the opener's execute-time column
-/// reads, which only happen once the returned plan is executed.
-///
-/// More than one non-HEAD request against the data file means Phase B lost
-/// either the metadata size hint or the `PageIndexPolicy::Skip` and is back to
-/// a probe-then-metadata(-then-page-index) sequence.
+/// Scenario: plan construction fetches a delete-carrying data file's footer with one bounded suffix GET
 #[test]
 fn scan_access_plan_footer_fetch_is_one_range_get() {
+    // More than one request means Phase B lost the metadata size hint or `PageIndexPolicy::Skip`.
     let dir = std::env::temp_dir().join(format!("lh_access_plan_footer_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let data_url = write_local_parquet(&dir, "data.parquet", 200);
@@ -1004,9 +844,7 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
         )
         .await
         .expect("register_files must succeed on the delete-carrying data file");
-        // STOP HERE: build the physical plan and go no further. Executing it
-        // would add the opener's execute-time column reads to the same log,
-        // which is the exact contamination this test exists to avoid.
+        // Never execute: the opener's reads would contaminate the log.
         build_raw_scan_physical_plan(&session, &spec)
             .await
             .expect("physical plan must build");
@@ -1045,69 +883,18 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (memory-and-credentials): the footer-reuse property holds at SHARD
-/// SCALE, with the session `FileMetadataCache` loaded close to its eviction
-/// cliff — the check issue #165 asks for in place of assuming the cache never
-/// evicts.
-///
-/// Two scans run over the SAME `SHARD_FILE_COUNT` data files: one delete-free,
-/// one where every file carries a one-position positional-delete file. The total
-/// number of non-HEAD `get_opts` against the DATA-file locations must be EQUAL
-/// between them. Equality is the proof: on the delete-carrying run the footer is
-/// fetched by access-plan construction (Phase B) and must be READ BACK from the
-/// cache by the opener, so a footer the cache failed to retain would show up as a
-/// second GET the delete-free run never pays. The per-entry `hits >= 1` assertion
-/// pins the same property from the cache's side.
-///
-/// # Why the fixture is wide rather than merely numerous
-///
-/// A cached entry is a parsed `ParquetMetaData` holding one
-/// `ColumnChunkMetaData` per `columns × row_groups`, so `columns` and
-/// `row_groups` — not the row count — set the entry size the cache charges
-/// against its limit. A two-column, 64-row-group footer measures ~64 KB, so 64
-/// of them occupy ~8% of the 50 MiB `DEFAULT_METADATA_CACHE_LIMIT`: the reuse
-/// assertion would then be structurally unable to fail for eviction, the one
-/// cause it is offered as the guard for. The shape below was CALIBRATED by
-/// measurement instead (decision-log [6]): 64 columns × 64 row groups × 4 rows
-/// per row group measures 1,865,550 bytes per entry, and
-/// `SHARD_FILE_COUNT = 22` of them aggregate to 41,042,100 bytes — 78.3% of the
-/// limit. Close enough to the cliff that seven more files, or a 22% smaller
-/// limit, would evict; still far enough under it that the positive case is
-/// expected to pass. Verified during calibration: at `SHARD_FILE_COUNT = 29`
-/// (nominally 54,100,950 bytes) the cache evicts, and the delete-carrying run
-/// pays 23 extra data-file GETs — so the equality assertion below genuinely does
-/// fail for eviction rather than merely being offered as a guard against it.
-///
-/// # What this assertion is sensitive to
-///
-/// - `DEFAULT_METADATA_CACHE_LIMIT` (50 MiB). The band assertion below fails
-///   loudly if the limit or `ParquetMetaData::memory_size()` changes, rather
-///   than letting the fixture silently drift back under the cliff.
-/// - LRU eviction on `put`. Phase B `put`s all `SHARD_FILE_COUNT` entries before
-///   the opener reads any of them, so an aggregate over the limit evicts the
-///   earliest-cached footers and the opener re-fetches them.
-/// - An entry whose own `size_bytes` exceeds the WHOLE limit is silently never
-///   cached at all — no eviction, no error, just a permanent miss. This test
-///   cannot cover that case (it needs an aggregate UNDER the limit to have a
-///   passing positive case); `scan_footer_refetch_observable.rs` covers it.
-///
-/// # Runtime cost
-///
-/// Deliberate, not accidental: the fixture writes 22 wide Parquet files (~20 MB)
-/// and the two scans parse all 22 wide footers each, so this test costs seconds
-/// rather than milliseconds. Wide footers are the whole point — a cheaper
-/// fixture cannot reach the cliff this test exists to sit next to.
+/// Scenario: footer reuse holds at shard scale with the metadata cache near its eviction limit (#165)
 #[test]
 fn scan_footer_reuse_holds_at_shard_scale() {
+    // The fixture is calibrated (decision-log [6]) so 22 footers of 64 columns × 64 row groups
+    // fill ~78% of `DEFAULT_METADATA_CACHE_LIMIT`; at 29 files the cache evicts and the GET
+    // equality fails. The band assertion catches drift in the limit or `memory_size()`.
     use datafusion::execution::cache::cache_manager::DEFAULT_METADATA_CACHE_LIMIT;
     use std::collections::HashSet;
 
-    /// Calibrated fixture shape: `COLUMNS × ROW_GROUPS` column chunks per footer.
     const COLUMNS: usize = 64;
     const ROW_GROUPS: usize = 64;
     const ROWS_PER_ROW_GROUP: usize = 4;
-    /// K: the shard's delete-carrying data-file count, calibrated so the K
-    /// cached footers occupy 70-90% of `DEFAULT_METADATA_CACHE_LIMIT`.
     const SHARD_FILE_COUNT: usize = 22;
     const BAND_LOW_PERCENT: usize = 70;
     const BAND_HIGH_PERCENT: usize = 90;
@@ -1131,9 +918,7 @@ fn scan_footer_reuse_holds_at_shard_scale() {
             ROW_GROUPS,
             ROWS_PER_ROW_GROUP,
         );
-        // Position 0 only: one row of a 4-row row group, so no row group is ever
-        // fully deleted and every row group is opened on BOTH runs — isolating
-        // any difference in the request count to the footer fetch itself.
+        // One position only, so no row group is fully deleted and both runs open every group.
         let delete_url =
             write_delete_parquet(&dir, &format!("deletes/d{i}.parquet"), &[(&data_url, 0)]);
         data_files.push((data_url.clone(), stat(&data_url)));
@@ -1158,7 +943,6 @@ fn scan_footer_reuse_holds_at_shard_scale() {
             .count()
     };
 
-    // Run 1 — delete-free: the opener is the only reader of every footer.
     let mut free_spec = raw_spec_with_wide_logical_schema(vec![], String::new(), COLUMNS);
     free_spec.files = data_files
         .iter()
@@ -1177,8 +961,6 @@ fn scan_footer_reuse_holds_at_shard_scale() {
         "the delete-free run must return every fixture row"
     );
 
-    // Run 2 — every data file carries a one-position delete file, so access-plan
-    // construction fetches and caches each footer and the opener must read it back.
     let mut delta_spec = raw_spec_with_wide_logical_schema(vec![], String::new(), COLUMNS);
     delta_spec.files = data_files
         .iter()

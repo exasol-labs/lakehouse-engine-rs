@@ -1,21 +1,6 @@
-//! Integration tests (Task 3.4, plan `add-delta-scan-execution`) for **partition-value
-//! materialization at scan time**, over the vendored `basic_partitioned` fixture on a
-//! local filesystem store.
-//!
-//! The fixture is real Delta writer output: a `letter` (Utf8), `number` (Int64),
-//! `a_float` (Float64) table partitioned on `letter`, with six data files — two under
-//! `letter=a`, one each under `letter=b`, `letter=c`, `letter=e`, and one under the
-//! Hive-convention default-partition directory `letter=__HIVE_DEFAULT_PARTITION__`
-//! whose commit logs `"letter": null`, not the directory text. Each file carries
-//! exactly one row (`_delta_log` `numRecords: 1`), so `number` uniquely identifies the
-//! originating file: `1`/`4` → `a`, `2` → `b`, `3` → `c`, `5` → `e`, `6` → the
-//! default-partition file.
-//!
-//! Every test drives the production raw-scan pipeline (`register_files` /
-//! `run_raw_scan_with_session` / `build_raw_scan_physical_plan` →
-//! `PositionalDeleteScanTable` → `crate::scan::partition_values`) against a
-//! temp-directory copy of the vendored bytes, so nothing here mutates the checked-in
-//! fixture.
+//! Fixture `basic_partitioned`: one row per file, so `number` identifies the file
+//! (`1`/`4` → `a`, `2` → `b`, `3` → `c`, `5` → `e`, `6` → the
+//! `__HIVE_DEFAULT_PARTITION__` file, whose commit logs `"letter": null`).
 
 mod scan_fixture;
 
@@ -85,8 +70,6 @@ fn file_size(path: &Path) -> u64 {
         .len()
 }
 
-/// Copy a vendored fixture data file into `dir/partition_dir/`, returning its
-/// table-root-relative path and absolute size.
 fn copy_partition_file(dir: &Path, partition_dir: &str, file_name: &str) -> (String, u64) {
     let sub = dir.join(partition_dir);
     std::fs::create_dir_all(&sub).expect("create partition subdir");
@@ -101,10 +84,6 @@ fn letter_value(letter: Option<&str>) -> BTreeMap<String, Option<String>> {
     BTreeMap::from([("letter".to_string(), letter.map(str::to_string))])
 }
 
-/// Copy all six vendored data files into `dir`, each carrying the SAME logged
-/// partition value its own `_delta_log` commit records — including the
-/// default-partition file's logged `null`, never the `__HIVE_DEFAULT_PARTITION__`
-/// directory text.
 fn all_six_entries(dir: &Path) -> Vec<FileEntry> {
     let files: [(&str, &str, Option<&str>); 6] = [
         ("letter=a", LETTER_A_FILE_1, Some("a")),
@@ -155,8 +134,6 @@ fn basic_partitioned_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
-/// Storage props are never dialed for a local `file://` scan; a placeholder keeps
-/// the spec well-formed.
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
@@ -197,9 +174,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Run the production raw scan for `spec` against a session registering `store` for
-/// `register_url`'s scheme/authority. Returns the decoded emitted batches, or the
-/// scan's error.
 async fn try_run_scan_with_store(
     spec: &ScanSpec,
     register_url: &str,
@@ -223,8 +197,6 @@ async fn try_run_scan_with_store(
     Ok(ctx.into_batches())
 }
 
-/// Run the production raw scan over a plain `LocalFileSystem`, panicking on scan
-/// failure.
 fn run_scan(spec: &ScanSpec, register_url: &str, emits: &[ExaType]) -> Vec<RecordBatch> {
     block_on(try_run_scan_with_store(
         spec,
@@ -235,9 +207,6 @@ fn run_scan(spec: &ScanSpec, register_url: &str, emits: &[ExaType]) -> Vec<Recor
     .expect("raw scan must succeed")
 }
 
-/// The `EMITS` list for `basic_partitioned_spec`'s full logical schema:
-/// `letter` VARCHAR, `number` DECIMAL in the engine's Int64 bin, `a_float`
-/// DOUBLE PRECISION.
 fn letter_number_float_emits() -> Vec<ExaType> {
     vec![scan_fixture::varchar(), ExaType::Int64, ExaType::Double]
 }
@@ -246,9 +215,6 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-/// Each row's `(letter, number)` pair, decoded from the batches' first two
-/// columns — the declared column order this fixture's logical schema always
-/// projects in when no projection narrows it.
 fn letter_number_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
     let mut out = Vec::new();
     for b in batches {
@@ -275,8 +241,7 @@ fn letter_number_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
     out
 }
 
-/// Scenario: a partition column absent from every data file is materialized per
-/// file, from that file's own logged value — never another file's.
+/// Scenario: a partition column absent from every data file is materialized from each file's own logged value
 #[test]
 fn absent_partition_column_is_materialized_per_file() {
     let dir = temp_dir("absent_per_file");
@@ -305,9 +270,7 @@ fn absent_partition_column_is_materialized_per_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: an absent logged value (the default-partition file's logged `null`)
-/// AND an explicit empty-string logged value both materialize SQL NULL — never the
-/// `__HIVE_DEFAULT_PARTITION__` directory text and never an empty string.
+/// Scenario: absent and empty-string logged partition values both materialize SQL NULL
 #[test]
 fn absent_and_empty_partition_values_materialize_null() {
     let dir = temp_dir("absent_and_empty");
@@ -375,10 +338,7 @@ fn spec_with_flag(files: Vec<FileEntry>, table_root: &str) -> ScanSpec {
     }
 }
 
-/// Scenario: a logged partition value converts to its column's declared Arrow
-/// type end to end through the production scan; a value that type cannot
-/// represent is refused cleanly through the SAME pipeline, never coerced,
-/// truncated, or silently nulled.
+/// Scenario: a logged partition value converts to its declared type or is refused cleanly
 #[test]
 fn partition_values_convert_to_their_declared_type_or_fail_cleanly() {
     let dir = temp_dir("type_conversion");
@@ -494,10 +454,7 @@ fn one_off_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
-/// Scenario: a data file that physically carries its own column of the SAME name
-/// as a declared partition column is still read through the logged value — the
-/// physical column never wins, and the split leaves the file schema unable to see
-/// it at all.
+/// Scenario: the logged partition value wins over a physical column of the same name
 #[test]
 fn logged_partition_value_wins_over_a_physical_partition_column() {
     let dir = temp_dir("logged_wins");
@@ -549,9 +506,7 @@ fn logged_partition_value_wins_over_a_physical_partition_column() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a materialized partition column is a first-class scan column —
-/// projection can drop it or keep it, filter pushdown narrows on it, and GROUP BY
-/// aggregates over it, including its own NULL group.
+/// Scenario: a materialized partition column serves projection, filter pushdown, and GROUP BY
 #[test]
 fn materialized_partition_column_serves_projection_filter_and_group_by() {
     let dir = temp_dir("proj_filter_group");
@@ -628,8 +583,6 @@ fn materialized_partition_column_serves_projection_filter_and_group_by() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Recurse the physical plan, collecting every leaf node (mirrors
-/// `scan_positional_deletes.rs`'s `collect_leaf_execs`).
 fn collect_leaf_execs(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
     let children = plan.children();
     if children.is_empty() {
@@ -641,8 +594,6 @@ fn collect_leaf_execs(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn Execu
     }
 }
 
-/// The raw scan plan's single leaf, downcast to its `FileScanConfig` (mirrors
-/// `scan_positional_deletes.rs`'s `leaf_file_scan_config`).
 fn leaf_file_scan_config(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> datafusion::datasource::physical_plan::FileScanConfig {
@@ -680,9 +631,7 @@ fn unpartitioned_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
-/// Scenario: a scan with NO partition columns is unchanged — the (empty) split
-/// leaves the file schema, the table_partition_cols, and the projected output
-/// schema exactly as they were before `PartitionedScanSchema` existed.
+/// Scenario: a scan with no partition columns keeps its file schema and plan shape unchanged
 #[test]
 fn scan_without_partition_columns_is_byte_identical() {
     let dir = temp_dir("unpartitioned");
@@ -737,11 +686,7 @@ fn scan_without_partition_columns_is_byte_identical() {
         file_scan_config.table_partition_cols().is_empty(),
         "an unpartitioned scan must attach no table_partition_cols"
     );
-    // `build_scan_sql` unconditionally wraps every scan (partitioned or not) in an
-    // uppercase-aliasing SELECT (Exasol identifier casing); DataFusion pushes that
-    // rename into the leaf's own projected schema regardless of partitioning. The
-    // partition-column dimension this scenario proves byte-identical is declared
-    // column ORDER and COUNT, not this pre-existing casing behavior.
+    // Uppercase names come from the scan's aliasing SELECT, not from partitioning.
     let expected_projected_schema = Schema::new(vec![
         Field::new("NUMBER", DataType::Int64, true),
         Field::new("A_FLOAT", DataType::Float64, true),

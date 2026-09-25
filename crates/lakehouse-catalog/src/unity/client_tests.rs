@@ -1,7 +1,3 @@
-//! Contract tests for the native Unity Catalog REST client: listing, single-table
-//! load, pagination, credential-safe failures, and the OSS/Databricks request
-//! shape. Every request is served by an in-process mock; no live network.
-
 use super::*;
 use crate::test_support::base_creds;
 use crate::unity::mock_server::spawn;
@@ -10,9 +6,7 @@ use exasol_udf_sdk::error::UdfError;
 
 const PAT_SENTINEL: &str = "PAT_SECRET_SENTINEL_VALUE";
 
-/// A single-table wire body whose `data_source_format` member is the given raw
-/// JSON fragment — `"data_source_format":"CSV",`, `"data_source_format":null,`,
-/// or `""` for a body that omits the member entirely.
+/// `raw_format_member` is a JSON fragment with trailing comma, or `""` to omit it.
 fn table_body_with_raw_format(raw_format_member: &str) -> String {
     format!(
         r#"{{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED",{raw_format_member}"storage_location":"s3://bucket/orders","table_id":"uuid-1","columns":[]}}"#
@@ -311,8 +305,7 @@ async fn follows_pagination_across_pages() {
 
 #[tokio::test]
 async fn request_failure_is_credential_safe_error() {
-    // The mock echoes the bearer it received into its error body, so the test
-    // proves the token is stripped from the surfaced error.
+    // The mock echoes the received bearer into its error body.
     let server = spawn(|req| {
         (
             500,
@@ -351,7 +344,6 @@ async fn identical_request_shape_oss_and_databricks() {
     let oss = spawn(|_req| (200, empty_tables_body())).await;
     let databricks = spawn(|_req| (200, empty_tables_body())).await;
 
-    // OSS with auth disabled; Databricks-managed reached with a PAT.
     let oss_session = UnityCatalogSession::new(&oss.base_url, base_creds());
     let mut databricks_creds = base_creds();
     databricks_creds.token = Some("dbx-pat".to_string());
@@ -426,10 +418,7 @@ async fn posts_temporary_table_credentials() {
     );
 }
 
-/// Every table the listing ADMITS carries the Delta tag and its vending key,
-/// while the admission filter itself is unchanged: the tag restates the filter's
-/// outcome, so a `VIEW` and a non-`DELTA` base table still reach `skipped` with
-/// their own reasons rather than being returned under a tag.
+/// Scenario: admitted tables carry the Delta tag and vending key; VIEW and non-DELTA still skip
 #[tokio::test]
 async fn list_tables_tags_every_admitted_table_delta_and_keeps_the_skip_filter() {
     let body = r#"{"tables":[
@@ -492,8 +481,7 @@ async fn list_tables_tags_every_admitted_table_delta_and_keeps_the_skip_filter()
     );
 }
 
-/// The single-table load returns the mapped format tag, the vending key, and the
-/// columns in the order the response declares them.
+/// Scenario: load returns the format tag, vending key, and columns in declared order
 #[tokio::test]
 async fn load_table_returns_format_tag_vending_key_and_ordered_columns() {
     let server = spawn(|_req| (200, single_table_body())).await;
@@ -517,9 +505,7 @@ async fn load_table_returns_format_tag_vending_key_and_ordered_columns() {
     );
 }
 
-/// A Unity Catalog UniForm table reporting `ICEBERG` is named accurately rather
-/// than refused: the load applies no admission filter, so both formats the engine
-/// can plan map to their own tag.
+/// Scenario: a UniForm table reporting `ICEBERG` loads under the Iceberg tag
 #[tokio::test]
 async fn load_table_maps_the_uppercase_iceberg_format_to_the_iceberg_tag() {
     let body = table_body_with_raw_format(r#""data_source_format":"ICEBERG","#);
@@ -534,9 +520,7 @@ async fn load_table_maps_the_uppercase_iceberg_format_to_the_iceberg_tag() {
     assert_eq!(table.format, TableFormat::Iceberg);
 }
 
-/// The load applies no admission filter, so an absent or unrecognized
-/// `data_source_format` is a refusal naming the table and the value — never a tag
-/// defaulted to Delta, which would route the table into the Delta log reader.
+/// Scenario: an absent or unrecognized `data_source_format` is refused, never defaulted to Delta
 #[tokio::test]
 async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     for (raw_format_member, expected_value) in [
@@ -571,8 +555,7 @@ async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     }
 }
 
-/// The format refusal carries the table's identity and the reported format value
-/// only — never the resolved bearer the request was sent with.
+/// Scenario: the format refusal never carries the resolved bearer
 #[tokio::test]
 async fn load_table_format_refusal_carries_no_credential() {
     let body = table_body_with_raw_format(r#""data_source_format":"CSV","#);
@@ -595,9 +578,7 @@ async fn load_table_format_refusal_carries_no_credential() {
     );
 }
 
-/// A whitespace-only `table_id` is not a catalog-assigned key: it must project to
-/// an absent vending key through the public `load_table` path, matching the
-/// crate's own published guarantee that an empty-or-whitespace key is absent.
+/// Scenario: a whitespace-only `table_id` projects to an absent vending key via `load_table`
 #[tokio::test]
 async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     let body = r#"{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"   ","columns":[]}"#.to_string();
@@ -615,9 +596,7 @@ async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     );
 }
 
-/// An entry carrying no key — or an empty one — projects to an ABSENT key, so a
-/// caller that requires one fails naming the table instead of requesting
-/// credentials against an empty scope.
+/// Scenario: a missing, null, or empty `table_id` projects to an absent vending key
 #[test]
 fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
     for raw_key_member in ["", r#""table_id":null,"#, r#""table_id":"","#] {
@@ -660,9 +639,7 @@ fn delta_base_skip_reason_type_wins_over_format_for_other_even_when_delta() {
     );
 }
 
-/// The detail must name the spelling the catalog actually sent, for every
-/// disqualifying `table_type` — including one the neutral mapping folds onto
-/// `View`, whose raw spelling would otherwise be lost.
+/// Scenario: the skip detail names the raw `table_type` spelling the catalog sent
 #[test]
 fn delta_base_skip_reason_names_the_raw_table_type_it_was_handed() {
     for raw in [

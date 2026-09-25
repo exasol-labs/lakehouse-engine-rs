@@ -1,13 +1,3 @@
-/// Batch-by-batch incremental emit loop using Arrow IPC.
-///
-/// Streams DataFusion result one RecordBatch at a time: emit via IPC → drop.
-/// Never collects all batches in memory simultaneously.
-///
-/// Architecture rules (CLAUDE.md):
-/// - Fetch one batch, call `ctx.emit_batch(&batch)` (Arrow IPC bytes — ABI-safe),
-///   drop the batch before fetching the next.
-/// - Rely on the SDK's 4,000,000-byte auto-flush; always flush at end.
-/// - Only IPC bytes cross the .so boundary — never Arrow types or Value intermediates.
 use crate::scan::checked_div::{
     CheckedFloatDivError, find_checked_float_div_error, session_checked_float_div_failure,
 };
@@ -27,26 +17,10 @@ use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 use futures::StreamExt;
 use std::sync::Arc;
 
-/// Emit all rows from a DataFusion stream, batch by batch via Arrow IPC.
-///
-/// Each batch is emitted via `ctx.emit_batch` (Arrow IPC bytes — ABI-safe),
-/// then dropped before the next fetch. No `Vec<Value>` intermediate is created.
-/// Returns Ok(rows_emitted) on success; surfaces scan errors as UdfError
-/// with credentials redacted. `secrets` are the literal credential values that
-/// must be stripped from any surfaced error string.
-///
-/// The call site's generated `EMITS (...)` clause is the sole declaration of
-/// this call's output schema, so the declared columns are read once from `ctx`
-/// before the batch loop and every column is coerced to the Arrow type its
-/// declared `ExaType` accepts. DataFusion's physical Parquet type can diverge
-/// from the logical type the VS declared, and `emit_batch` rejects ANY mismatch.
-///
-/// `timers` carries the phase accumulators (Task 4): the wait for each
-/// `stream.next()` is attributed to the object-storage import phase, and the
-/// coercion + `emit_batch` of each batch is attributed to the send-back/emit
-/// phase. The timing only reads a monotonic clock around the SAME fetch / emit /
-/// drop operations — it does NOT change the streaming discipline (one batch
-/// fetched, emitted, dropped before the next).
+/// Each batch is emitted then dropped before the next fetch, never collected. Every column is
+/// coerced to the Arrow type its declared `ExaType` accepts: the physical Parquet type can
+/// diverge from the VS-declared logical type, and `emit_batch` rejects ANY mismatch. `secrets`
+/// are the literal credential values stripped from any surfaced error.
 pub async fn emit_stream(
     ctx: &mut dyn UdfContext,
     mut stream: SendableRecordBatchStream,
@@ -55,17 +29,14 @@ pub async fn emit_stream(
 ) -> Result<u64, UdfError> {
     let declared = declared_output_columns(ctx)?;
     let mut total: u64 = 0;
-    // Startup ends at the first batch fetch — seal it as the import loop opens.
     timers.seal_startup();
     loop {
-        // --- object-storage import phase: await the next batch ---
         timers.import_started();
         let next = stream.next().await;
         timers.import_ended();
 
         let Some(result) = next else { break };
 
-        // --- send-back/emit phase: coerce + emit this batch ---
         timers.emit_started();
         let emit_result = emit_one_batch(ctx, result, secrets, &declared);
         timers.emit_ended();
@@ -74,11 +45,7 @@ pub async fn emit_stream(
     Ok(total)
 }
 
-/// Coerce and emit one fetched batch, returning the row count it contributed.
-///
-/// Factored out so the emit phase boundary in [`emit_stream`] brackets exactly
-/// the coercion + `emit_batch` work, with the batch dropped before the next
-/// fetch — preserving the never-hold-two-batches discipline.
+/// Factored out so the emit phase timer brackets exactly coercion + `emit_batch`.
 fn emit_one_batch(
     ctx: &mut dyn UdfContext,
     result: Result<RecordBatch, DataFusionError>,
@@ -87,21 +54,15 @@ fn emit_one_batch(
 ) -> Result<u64, UdfError> {
     let batch = result.map_err(|e| classify_scan_error(e, secrets))?;
     let batch = coerce_batch_to_exa_types(batch, declared)?;
-    // Count rows before emitting — batch is borrowed by emit_batch.
     let rows = batch.num_rows() as u64;
     ctx.emit_batch(&batch)?;
     drop(batch);
     Ok(rows)
 }
 
-/// The output columns this call site declared, read once from the context.
-///
-/// The generated `EMITS (...)` clause is the only declaration of a scan call's
-/// output schema, so both emit paths read it here rather than trusting a second
-/// copy carried in the scan spec. The metadata is cloned because the borrow the
-/// context hands out cannot outlive the `&mut` borrow `emit_batch` then needs.
-/// A column the context cannot hand out is drift, and is reported rather than
-/// worked around.
+/// The generated `EMITS (...)` clause is the only declaration of the output schema, so it is
+/// read here rather than from a second copy in the scan spec. Cloned because the context's
+/// borrow cannot outlive the `&mut` borrow `emit_batch` needs.
 pub(crate) fn declared_output_columns(ctx: &dyn UdfContext) -> Result<Vec<ColumnInfo>, UdfError> {
     (0..ctx.output_column_count())
         .map(|idx| {
@@ -114,10 +75,7 @@ pub(crate) fn declared_output_columns(ctx: &dyn UdfContext) -> Result<Vec<Column
         .collect()
 }
 
-/// Reject a produced column count that the declared list does not cover.
-///
-/// Shared by both emit paths so a declaration that does not match what the scan
-/// produced fails identically whichever path is emitting.
+/// Shared by both emit paths so a mismatched declaration fails identically on each.
 pub(crate) fn check_declared_arity(
     declared: &[ColumnInfo],
     produced: usize,
@@ -131,13 +89,8 @@ pub(crate) fn check_declared_arity(
     )))
 }
 
-/// Coerce every column of a RecordBatch to the Arrow type the engine's strict
-/// `emit_batch` IPC feed accepts for its declared output column.
-///
-/// `declared[i]` is the metadata Exasol reports for output column `i` of this
-/// call's `EMITS (...)` clause, positionally aligned with the batch columns.
-/// A column already of its target type is kept as-is (shared `Arc`, zero copy),
-/// and a batch whose every column already matches is returned untouched.
+/// `declared[i]` is positionally aligned with the batch columns. Matching columns are kept as
+/// the same `Arc`, and a fully matching batch is returned untouched.
 pub fn coerce_batch_to_exa_types(
     batch: RecordBatch,
     declared: &[ColumnInfo],
@@ -145,14 +98,12 @@ pub fn coerce_batch_to_exa_types(
     let schema = batch.schema();
     check_declared_arity(declared, schema.fields().len())?;
 
-    // Decide the target Arrow type for each column up front, so a drifted
-    // declaration is reported before any column is rebuilt.
+    // Resolved up front so a drifted declaration is reported before any column is rebuilt.
     let targets: Vec<DataType> = declared
         .iter()
         .map(target_arrow_type)
         .collect::<Result<_, _>>()?;
 
-    // Fast path: every column already matches its target — no allocation.
     if schema
         .fields()
         .iter()
@@ -189,18 +140,9 @@ pub fn coerce_batch_to_exa_types(
     })
 }
 
-/// Cast one output column to the Arrow type its declared output column requires.
-///
-/// `target` is the type [`target_arrow_type`] resolved for `declared`; it is
-/// passed in so the decision is made once per column by the caller that already
-/// needs it for its own fast-path check. A column already at that type is
-/// returned as the same shared `Arc`, so the common case costs no copy.
-///
-/// The cast is deliberately strict (`safe: false`): this boundary is the last
-/// thing between a produced value and the wire, so the lenient cast's NULL for
-/// an unrepresentable value would leave the shard emitting an absent value where
-/// it has a real one — which Exasol's outer wrapper merges as "this shard
-/// contributed nothing" rather than surfacing as the error it is.
+/// Deliberately strict (`safe: false`): a lenient cast's NULL for an unrepresentable value
+/// would be merged by Exasol's outer wrapper as "this shard contributed nothing" instead of
+/// surfacing as the error it is.
 pub(crate) fn coerce_column(
     column: &ArrayRef,
     declared: &ColumnInfo,
@@ -222,14 +164,7 @@ pub(crate) fn coerce_column(
     })
 }
 
-/// The Arrow type the engine's strict `emit_batch` IPC feed accepts for a column
-/// declared with this `ExaType`.
-///
-/// The reported variant IS the bin Exasol chose for the declaration, so nothing
-/// here re-derives that choice from a type string: `Int32`, `Int64` and
-/// `Numeric` arrive already distinguished. Every remaining variant feeds `Utf8`,
-/// which subsumes the `Utf8View`/`BinaryView` normalization and preserves what
-/// an unrecognized declaration used to get.
+/// The reported variant IS the bin Exasol chose, so nothing is re-derived from a type string.
 pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfError> {
     Ok(match &declared.typ {
         ExaType::Boolean => DataType::Boolean,
@@ -246,8 +181,7 @@ pub(crate) fn target_arrow_type(declared: &ColumnInfo) -> Result<DataType, UdfEr
     })
 }
 
-/// The `Decimal128` a NUMERIC-binned declaration maps to. A pair outside
-/// `Decimal128`'s range is drift: fail rather than put text into a numeric column.
+/// A pair outside `Decimal128`'s range is drift: fail rather than put text into a numeric column.
 fn decimal_target(declared: &ColumnInfo, precision: u32, scale: u32) -> Result<DataType, UdfError> {
     let representable = u8::try_from(precision)
         .ok()
@@ -268,24 +202,10 @@ fn decimal_target(declared: &ColumnInfo, precision: u32, scale: u32) -> Result<D
     }
 }
 
-/// Classify a DataFusion scan error and produce a UdfError without credential leaks.
-///
-/// A checked-division failure is recognised first, BY TYPE through
-/// [`find_checked_float_div_error`], because a user's own division by zero is
-/// not a storage failure and `scan failed: assigned data could not be read`
-/// would send a support case looking at object storage. Recognition never
-/// matches message text: that would be a silent coupling breaking on any
-/// wording change.
-///
-/// Otherwise calls `find_root()` on the error chain to detect `ResourcesExhausted`
-/// through any nesting of `Context`, `External`, or `ArrowError` wrappers — which
-/// DataFusion 54 uses internally (e.g. sort wraps OOM errors with `.context()`).
-///
-/// - checked-division failure → the arithmetic error itself, unframed
-/// - `ResourcesExhausted` → clean memory-exhaustion error (distinct from storage errors)
-/// - Everything else → storage-read error via `redact_storage_error`
-///
-/// Credential redaction is applied in every path.
+/// A checked-division failure is recognised first, BY TYPE, so a user's division by zero is not
+/// framed as a storage failure. `find_root()` sees `ResourcesExhausted` through any
+/// `Context`/`External`/`ArrowError` nesting (DataFusion's sort wraps OOM with `.context()`).
+/// Credential redaction applies on every path.
 pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
     if let Some(division) = find_checked_float_div_error(&e) {
         return checked_division_error(division, secrets);
@@ -296,67 +216,30 @@ pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
     }
 }
 
-/// Surface a checked-division failure as the arithmetic error it is.
-///
-/// Only the division's own message is surfaced. Every wrapping layer's text is
-/// dropped, exactly as [`resources_exhausted_error`] drops it and for the same
-/// reason: a `.context()` string can carry a credential-bearing fragment from an
-/// outer error layer. Redaction still runs over what remains, so the
-/// no-credential guarantee is a property of this classifier rather than of what
-/// each error variant happens to interpolate.
+/// Wrapping layers' text is dropped, as in [`resources_exhausted_error`]: a `.context()` string
+/// can carry a credential-bearing fragment. Redaction still runs over what remains.
 fn checked_division_error(division: &CheckedFloatDivError, secrets: &[&str]) -> UdfError {
     let safe = redact_credentials(&redact_secret_values(&division.to_string(), secrets));
     UdfError::User(safe)
 }
 
-/// Introduces the memory exhaustion a scan surfaced alongside its checked
-/// division, so a reader sees two failures rather than one run-on message.
 const CONCURRENT_FAILURE_PREAMBLE: &str = "the scan also surfaced:";
 
-/// Labels the memory-exhaustion classification, for both the function that
-/// writes it and [`reframe_checked_division`], which reads it back to tell a
-/// structurally-recognised `ResourcesExhausted` from every other
-/// classification.
-///
-/// This is not the message-text coupling this module refuses elsewhere. That
-/// rule is about DataFusion's wording, which changes under us with no compile
-/// error. This wording is our own, and one constant owns it for the writer and
-/// the reader alike, so rewording it cannot make them disagree.
+/// Read back by [`reframe_checked_division`]. Unlike DataFusion's wording, this text is our own
+/// and one constant owns it for writer and reader, so matching on it is safe.
 const MEMORY_EXHAUSTED_LABEL: &str = "scan failed: memory exhausted (ResourcesExhausted):";
 
-/// Report the checked-division failure `session` recorded as the failure the
-/// scan surfaced.
+/// The type of a division raised inside a pushed Parquet row filter does not survive to
+/// [`classify_scan_error`] (DataFusion flattens it to text, issue #370's route), so the session's
+/// typed record is consulted once per scan at the dispatcher all run paths funnel through.
 ///
-/// [`classify_scan_error`] already recognises the division wherever its type
-/// survives to it. The type does not survive a predicate pushed into the Parquet
-/// row filter, which DataFusion flattens into a message string, and that is
-/// issue #370's own route. The session keeps the typed value for exactly that
-/// case, so this runs once per scan, at the one dispatcher all three run paths
-/// funnel through.
+/// A recorded division REPLACES the surfaced failure, except memory exhaustion, which it leads:
+/// that is the only failure separable from the flattened division without matching DataFusion's
+/// wording. Accepted limitation: an unrelated storage failure in another partition of a scan
+/// that also divided by zero is masked.
 ///
-/// A recorded division REPLACES the surfaced failure, except a memory
-/// exhaustion, which it leads instead. Memory exhaustion is the only surfaced
-/// failure separable from the flattened division without matching DataFusion's
-/// wording: [`classify_scan_error`] recognises `ResourcesExhausted` on the typed
-/// root, before any text exists, and labels it with [`MEMORY_EXHAUSTED_LABEL`].
-/// Every other classification lands in the generic storage-read branch, which is
-/// exactly where the flattened division's own text lands, so appending it would
-/// republish `scan failed: assigned data could not be read` on 100% of issue
-/// #370's route, under the one framing this change exists to remove.
-///
-/// Accepted limitation, chosen rather than overlooked: an unrelated storage
-/// failure raised in another partition of a scan that also divided by zero is
-/// MASKED. DataFusion evaluates partitions concurrently and surfaces exactly one
-/// of their errors, so the collision is real; it is also rarer than issue #370's
-/// own route and has never been observed live, whereas the storage framing on a
-/// user's own division is measured and is what
-/// `e2e_float_div_by_zero_in_filter_fails_like_native_exasol` fails on. Memory
-/// exhaustion, the collision the mission's bounded-execution guarantee rests on,
-/// is the one kept visible.
-///
-/// The composed text is redacted here rather than trusted. `raw_scan` and
-/// `partial_agg` classify with the fact side's credentials alone, while this
-/// dispatcher holds the union that also covers a join's dimension side.
+/// Redacted here because `raw_scan` and `partial_agg` classify with the fact side's secrets
+/// alone, while this dispatcher holds the union covering a join's dimension side.
 pub fn reframe_checked_division(
     session: &SessionContext,
     error: UdfError,
@@ -374,29 +257,16 @@ pub fn reframe_checked_division(
     UdfError::User(format!("{division}; {CONCURRENT_FAILURE_PREAMBLE} {safe}"))
 }
 
-/// Produce a clean memory-exhaustion UdfError, redacting any credential values.
-///
-/// Only the innermost `ResourcesExhausted` `msg` is surfaced here. Any wrapping
-/// `.context()` message (e.g. from DataFusion sort's OOM path) is intentionally
-/// dropped: context strings may carry credential-bearing fragments from outer
-/// error layers, so exposing them defeats the redaction guarantee.
-///
-/// The message opens with [`MEMORY_EXHAUSTED_LABEL`], which is also how
-/// [`reframe_checked_division`] recognises this classification.
+/// Only the innermost `msg` is surfaced: a wrapping `.context()` may carry credential-bearing
+/// fragments. Opens with [`MEMORY_EXHAUSTED_LABEL`] for [`reframe_checked_division`].
 fn resources_exhausted_error(msg: &str, secrets: &[&str]) -> UdfError {
     let safe = redact_credentials(&redact_secret_values(msg, secrets));
     UdfError::User(format!("{MEMORY_EXHAUSTED_LABEL} {safe}"))
 }
 
-/// Map a storage/scan error string to a UdfError that does not leak credentials.
-///
-/// First strips the literal credential values (`secrets`), then applies the
-/// label-based heuristic. The value-based pass catches S3 XML / signature error
-/// shapes that embed the raw key without a recognizable label.
+/// Strips literal `secrets` first, catching S3 XML/signature shapes that embed the raw key
+/// without a recognizable label, then applies the label-based heuristic.
 pub fn redact_storage_error(msg: String, secrets: &[&str]) -> UdfError {
-    // ponytail: regex-free redaction: strip known secret values, then any
-    // credential-shaped query/auth params. The full error likely contains S3
-    // auth headers.
     let safe = redact_credentials(&redact_secret_values(&msg, secrets));
     UdfError::User(format!(
         "scan failed: assigned data could not be read: {safe}"

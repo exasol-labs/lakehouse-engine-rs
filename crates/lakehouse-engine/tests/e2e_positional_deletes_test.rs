@@ -1,22 +1,6 @@
-//! End-to-end positional-delete matrix for the lakehouse-engine Virtual Schema.
-//!
-//! Drives Iceberg merge-on-read positional-delete tables through the full
-//! VS → adapter → scan UDF → DataFusion stack against the local Exasol
-//! Docker + Apache Spark fixtures (`packaging/e2e-harness-positional-deletes`,
-//! `packaging/positional-delete-fixtures`).
-//!
-//! The fixture tables (`mor_pos_file`, `mor_pos_partition`, and the
-//! unsupported-delete `mor_dv_unsupported`) are authored ONCE by the
-//! `spark-iceberg-fixtures` one-shot Compose job at stack bring-up (see
-//! `scripts/spark-fixtures/`) — this file never seeds them itself, only the
-//! delete-free `events` table used by the no-regression scenario. Ground
-//! truth for the fixtures lives in `tests/common/pos_delete_fixtures.rs` and
-//! MUST stay in lockstep with the Spark SQL scripts that produce them.
-//!
-//! All tests FAIL (never skip) when the stack is unavailable — per project
-//! rules — because every test starts with `setup_e2e()`, which panics (via
-//! `wait_for_exasol`/`wait_for_minio`/`wait_for_iceberg_catalog`) rather than
-//! returning an `Err` when a dependency is down.
+//! The positional-delete fixtures are authored once at stack bring-up by the
+//! `spark-iceberg-fixtures` Compose job (`scripts/spark-fixtures/`);
+//! `tests/common/pos_delete_fixtures.rs` MUST stay in lockstep with those scripts.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -41,35 +25,13 @@ use lakehouse_engine::scan::spec::DeleteMechanism;
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
 
-// ---------------------------------------------------------------------------
-// Constants (schema/script names mirror e2e_scan_test.rs / e2e_capability_test.rs
-// / e2e_count_distinct_test.rs — same .so, same idempotent CREATE OR REPLACE
-// objects, shared across every E2E test binary).
-// ---------------------------------------------------------------------------
-
-/// Shared VS used by every other E2E test binary too (idempotent CREATE OR
-/// REPLACE with an identical body, so concurrent recreation is harmless).
+/// Shared across E2E binaries; recreation is idempotent with an identical body.
 const VS_NAME: &str = "MY_LAKEHOUSE";
-/// Dedicated VS forcing a single work-unit shard (`PARALLELISM_FACTOR = 1`)
-/// over the shared namespace, used only by the fan-out-invariance test.
 const SAMESHARD_VS_NAME: &str = "POSDEL_SAMESHARD_VS";
-/// Dedicated VS forcing one shard per data file
-/// (`PARALLELISM_FACTOR = SPLIT_PARALLELISM_FACTOR`, chosen to equal the
-/// `mor_pos_partition` fixture's data-file count), used only by the
-/// fan-out-invariance test.
 const SPLITSHARD_VS_NAME: &str = "POSDEL_SPLITSHARD_VS";
-/// `mor_pos_partition` has 4 data files (2 partitions × 2 files); setting
-/// `PARALLELISM_FACTOR` to this value on a 1-node cluster makes
-/// `shard_count(1, SPLIT_PARALLELISM_FACTOR, 4) == 4`, so every shard gets
-/// exactly one file (see `partition_files_by_bytes`'s greedy-lightest-shard
-/// assignment: with as many shards as files, each shard is filled exactly
-/// once, regardless of file byte sizes) — a deterministic split-shard
-/// placement, not a hash-partitioning gamble.
+/// Equals `mor_pos_partition`'s data-file count, so a 1-node cluster gets exactly
+/// one file per shard.
 const SPLIT_PARALLELISM_FACTOR: usize = 4;
-
-// ---------------------------------------------------------------------------
-// One-time setup (idempotent; identical shape to the other E2E test binaries)
-// ---------------------------------------------------------------------------
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -79,10 +41,6 @@ fn setup_e2e() {
         wait_for_minio();
         wait_for_iceberg_catalog();
 
-        // The mor_pos_file / mor_pos_partition fixtures are authored by the
-        // spark-iceberg-fixtures Compose job, not by this harness. We only
-        // need to seed the delete-free `events` table used by
-        // e2e_delete_free_table_no_regression.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -119,34 +77,10 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
     cols[0].iter().map(parse_int).collect()
 }
 
-// ---------------------------------------------------------------------------
-// Fixture-shape tests (packaging/positional-delete-fixtures) — inspect the
-// Spark-committed Iceberg manifests directly via the Iceberg reader, bypassing
-// Exasol, to verify the fixtures actually have the delete-file shape the
-// e2e_* correctness tests below assume.
-// ---------------------------------------------------------------------------
-
-/// Spark's `write.delete.granularity=file` fixture commits exactly one
-/// Parquet positional-delete file PER data file (two data files → two
-/// distinct delete files), verified by directly reading the table's
-/// `position_deletes` metadata table: delete file 1 contains ONLY entries
-/// whose `file_path` is data file 1, delete file 2 contains ONLY entries
-/// whose `file_path` is data file 2. No cross-references.
-///
-/// UPSTREAM TRACKING (#345): what this test can actually OBSERVE through the
-/// Iceberg reader is weaker than what Spark committed. `iceberg-rust`
-/// 0.10.0's `DeleteFileIndex` has not yet closed the TODO in
-/// `delete_file_index.rs` that gates position deletes by their
-/// `referenced_data_file` field — it still applies every partition-scoped
-/// position-delete file to every data file in the same partition (correct
-/// for `write.delete.granularity=partition`, but for `granularity=file` on
-/// this UNPARTITIONED table it means each of the two data files resolves
-/// BOTH delete files, not just its own). DROP CONDITION: see #345 for the
-/// upstream PRs to track; once released, tighten this assertion back to
-/// "exactly 1 delete file per data file, referencing only that file" (the
-/// ORIGINAL, intended assertion — see git history) and cross-check against
-/// `position_deletes` as done here to confirm the read side, not just the
-/// write side, is now correct.
+/// Scenario: the file-granularity fixture commits one positional-delete file per data file
+// #345: iceberg-rust's `DeleteFileIndex` ignores `referenced_data_file`, so each
+// data file resolves BOTH delete files. Once fixed upstream, tighten to exactly
+// one delete file per data file.
 #[test]
 fn fixture_spark_file_granularity_delete_table() {
     setup_e2e();
@@ -169,10 +103,6 @@ fn fixture_spark_file_granularity_delete_table() {
         "sanity: fixture ground truth must be non-empty"
     );
 
-    // Achievable invariant given the upstream gap documented above: each data
-    // file resolves BOTH partition-scoped delete files (iceberg-rust cannot
-    // yet narrow to the one it actually needs), and there are exactly 2
-    // distinct delete files overall, each referenced by both data files.
     let mut refs_per_delete_path: HashMap<String, usize> = HashMap::new();
     for entry in &files {
         assert_eq!(
@@ -214,10 +144,7 @@ fn fixture_spark_file_granularity_delete_table() {
     }
 }
 
-/// Spark's `write.delete.granularity=partition` fixture commits exactly one
-/// Parquet positional-delete file PER PARTITION (four data files, two
-/// partitions → two delete files, each referenced by exactly the two data
-/// files of its own partition).
+/// Scenario: the partition-granularity fixture commits one positional-delete file per partition
 #[test]
 fn fixture_spark_partition_granularity_delete_table() {
     setup_e2e();
@@ -279,12 +206,7 @@ fn fixture_spark_partition_granularity_delete_table() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// End-to-end correctness: file granularity
-// ---------------------------------------------------------------------------
-
-/// A `SELECT` over the file-granularity delete table returns exactly the
-/// seeded rows minus the recorded deleted rows, with no deleted id present.
+/// Scenario: a file-granularity delete table returns exactly the post-delete rows
 #[test]
 fn e2e_file_granularity_returns_post_delete_rows() {
     setup_e2e();
@@ -322,13 +244,7 @@ fn e2e_file_granularity_returns_post_delete_rows() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// End-to-end correctness: partition granularity
-// ---------------------------------------------------------------------------
-
-/// A `SELECT` over the partition-granularity delete table returns exactly the
-/// seeded rows minus the recorded deleted rows, each partition-scoped delete
-/// file applied only to the data files it references.
+/// Scenario: a partition-granularity delete table returns exactly the post-delete rows
 #[test]
 fn e2e_partition_granularity_returns_post_delete_rows() {
     setup_e2e();
@@ -359,10 +275,7 @@ fn e2e_partition_granularity_returns_post_delete_rows() {
     );
 }
 
-/// The multi-partition-spanning delete is applied correctly PER PARTITION:
-/// querying each partition in isolation returns exactly that partition's
-/// seeded rows minus its own recorded deleted rows — proving the "east"
-/// delete file is not applied to "west" data files and vice versa.
+/// Scenario: each partition-scoped delete file applies only to its own partition
 #[test]
 fn e2e_partition_delete_spans_multiple_partitions() {
     setup_e2e();
@@ -411,32 +324,11 @@ fn e2e_partition_delete_spans_multiple_partitions() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Fan-out invariance: post-delete result must not depend on shard placement
-// ---------------------------------------------------------------------------
-
-/// Deterministically forces both a same-shard and a different-shard
-/// placement of `mor_pos_partition`'s affected data files (via
-/// `PARALLELISM_FACTOR`, not hash-partitioning luck) and asserts the
-/// post-delete result is identical either way.
-///
-/// The shard placement itself is proven directly against the production
-/// `shard_count` + `partition_files_by_bytes` functions (the same ones the
-/// running adapter uses) before the two VS queries even run:
-/// - `PARALLELISM_FACTOR = 1` → `shard_count(1, 1, 4) == 1` → EVERY data file
-///   (including any two files that share a partition-scoped delete file)
-///   lands in the SAME single shard.
-/// - `PARALLELISM_FACTOR = SPLIT_PARALLELISM_FACTOR (4)` →
-///   `shard_count(1, 4, 4) == 4` → with as many shards as files,
-///   `partition_files_by_bytes`'s greedy-lightest-shard assignment puts
-///   EXACTLY one file per shard, so every data file lands in a DIFFERENT
-///   shard from every other — including the two files that share a delete
-///   file.
+/// Scenario: the post-delete result is identical under same-shard and split-shard placement
 #[test]
 fn e2e_partition_delete_invariant_across_fanout() {
     setup_e2e();
 
-    // --- Prove the shard placement claim directly against production code ---
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -489,7 +381,6 @@ fn e2e_partition_delete_invariant_across_fanout() {
         );
     }
 
-    // --- Run the actual query under both forced placements ---
     let deleted: HashSet<i64> = PARTITION_GRANULARITY_DELETED_IDS.iter().copied().collect();
     let expected: Vec<i64> = (1..=PARTITION_GRANULARITY_TOTAL_ROWS as i64)
         .filter(|id| !deleted.contains(id))
@@ -526,16 +417,7 @@ fn e2e_partition_delete_invariant_across_fanout() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Composition with pushdown + aggregation
-// ---------------------------------------------------------------------------
-
-/// Deletes compose with projection (drops `region`), a WHERE filter
-/// (`region = 'west'`), and a LIMIT: the returned rows equal the same
-/// projection/filter/LIMIT evaluated over the post-delete data.
-///
-/// West partition post-delete ids: 11,12,15,16,18,20 (west deleted:
-/// 13,14,17,19). `ORDER BY id LIMIT 3` → 11,12,15 → vals row-11,row-12,row-15.
+/// Scenario: deletes compose with projection, filter, and LIMIT
 #[test]
 fn e2e_deletes_with_projection_filter_limit() {
     setup_e2e();
@@ -581,19 +463,12 @@ fn e2e_deletes_with_projection_filter_limit() {
     }
 }
 
-/// Deletes compose with a single-group aggregate: `COUNT(*)`/`SUM(id)` over
-/// the file-granularity table equal the same aggregates over the post-delete
-/// data (count=16, sum = Σ(1..20) - Σ{3,8,13,17} = 210 - 41 = 169).
-///
-/// Deletes also compose with a GROUP BY aggregate: grouping the
-/// partition-granularity table by `region` yields 6 remaining rows in each
-/// of "east" and "west" (12 total), never counting a deleted row.
+/// Scenario: deletes compose with single-group and GROUP BY aggregates
 #[test]
 fn e2e_deletes_with_single_and_grouped_agg() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // --- single-group aggregate over mor_pos_file ---
     let single_sql = format!(
         "SELECT COUNT(*), SUM(id) FROM {}",
         vs_table(VS_NAME, FILE_GRANULARITY_TABLE)
@@ -613,7 +488,6 @@ fn e2e_deletes_with_single_and_grouped_agg() {
         "SUM(id) over mor_pos_file must be {expected_sum} (={total}-{deleted_sum}), got {sum}"
     );
 
-    // --- grouped aggregate over mor_pos_partition ---
     let grouped_sql = format!(
         "SELECT {PARTITION_COL}, COUNT(*) FROM {} GROUP BY {PARTITION_COL} ORDER BY {PARTITION_COL}",
         vs_table(VS_NAME, PARTITION_GRANULARITY_TABLE)
@@ -652,32 +526,11 @@ fn e2e_deletes_with_single_and_grouped_agg() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Unsupported delete mechanism — fail loud at plan time
-// ---------------------------------------------------------------------------
-
-/// End-to-end: a query over a table whose snapshot carries an unsupported
-/// delete mechanism (equality delete or Puffin/v3 deletion vector) MUST fail
-/// at plan time with a clean error naming the mechanism, and MUST NOT return
-/// any rows or leak credentials.
-///
-/// Targets `mor_dv_unsupported` (`DELETION_VECTOR_TABLE`), a
-/// `format-version=3` merge-on-read table whose Spark `DELETE FROM` commits a
-/// Puffin deletion vector instead of a Parquet positional-delete file (see
-/// `scripts/spark-fixtures/create_deletion_vector_fixture.sql`). The
-/// EqualityDelete arm of `UnsupportedDeleteMechanism` remains untested at the
-/// E2E level — only Flink's row-level upsert connectors write equality
-/// deletes, and Flink is not part of this stack
-/// (`scripts/spark-fixtures/run_fixtures.sh`'s header) — but shares the same
-/// plan-time gate (`classify_manifest_file` in `adapter/pushdown.rs`) as the
-/// DeletionVector arm exercised here, and is covered directly by that
-/// function's unit tests.
-///
-/// UPSTREAM TRACKING (#12): once iceberg-rust gains v3 deletion-vector READ
-/// support, `mor_dv_unsupported` becomes readable rather than rejected, and
-/// this test will need a genuinely unsupported fixture in its place (or
-/// retirement) plus a new positive-path DV read test. See #12 for the
-/// upstream PRs to track.
+/// Scenario: an unsupported delete mechanism fails at plan time with a clean error
+// Equality deletes have no E2E fixture (only Flink writes them); they share the
+// same plan-time gate, covered by `classify_manifest_file`'s unit tests.
+// #12: once iceberg-rust reads v3 deletion vectors, this fixture becomes readable
+// and needs replacing.
 #[test]
 fn e2e_unsupported_delete_fails_loud() {
     setup_e2e();
@@ -727,14 +580,7 @@ fn e2e_unsupported_delete_fails_loud() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Delete-free non-regression
-// ---------------------------------------------------------------------------
-
-/// A delete-free table's existing projection/filter/LIMIT and aggregate
-/// queries return the same results as before this feature, confirming the
-/// unified `ParquetSource`-backed provider does not regress the
-/// no-deletes path.
+/// Scenario: a delete-free table's filter, LIMIT, and aggregate results are unchanged
 #[test]
 fn e2e_delete_free_table_no_regression() {
     setup_e2e();
@@ -766,7 +612,7 @@ fn e2e_delete_free_table_no_regression() {
         .as_f64()
         .or_else(|| agg_cols[1][0].as_str().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| panic!("SUM(score) not numeric: {:?}", agg_cols[1][0]));
-    // scores are 5.0 * id for id=1..=SEED_TOTAL_ROWS → sum = 5.0 * Σ(1..=SEED_TOTAL_ROWS).
+    // Seed: score = 5.0 * id.
     let n = SEED_TOTAL_ROWS as f64;
     let expected_total_score = 5.0 * (n * (n + 1.0) / 2.0);
     assert!(
@@ -776,17 +622,7 @@ fn e2e_delete_free_table_no_regression() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Stack-unavailable contract
-// ---------------------------------------------------------------------------
-
-/// The positional-delete suite FAILS (never skips) when the stack is
-/// unavailable — same contract as `e2e_fails_when_stack_unavailable` in
-/// `e2e_scan_test.rs`: every test above starts with `setup_e2e()`, whose
-/// `wait_for_exasol`/`wait_for_minio`/`wait_for_iceberg_catalog` calls panic
-/// (never return an `Err` to swallow) on a dependency that never comes up.
-/// This test documents that contract by verifying the underlying connect
-/// helper panics on an unreachable host rather than returning `Ok`.
+/// Scenario: connecting to an unreachable host panics rather than skipping
 #[test]
 fn positional_delete_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| ExaConn::connect("192.0.2.1", 8563, "sys", "exasol"));

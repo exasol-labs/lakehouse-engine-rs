@@ -1,24 +1,10 @@
-//! Golden dispatch-SQL baseline (issue #175 / plan
-//! `refactor-scan-spec-dispatch-dedup`, task 1.2).
-//!
-//! Twenty-four committed fixtures under `testdata/dispatch_golden/` —
-//! eighteen non-empty dispatch shapes rendered through the production
-//! [`build_dispatch_sql`] seam (or the broadcast-join / N-scan-join sites for
-//! the two cross-site fixtures), and six empty shapes rendered through
-//! [`empty_result_sql`]. The eighteen non-empty fixtures each carry a
-//! credential-bearing `storage` value and are regenerated whenever that
-//! rendering changes (plan `fix-connection-credential-exposure`, task 3.4,
-//! moved them from an inline credential to the REFERENCE `ScanStorage::
-//! Connection` variant); the six `empty_*` fixtures carry no `storage` value
-//! at all and MUST stay byte-identical across every such change — a diff in
-//! one of them is always a regression, never an expected update. Every
-//! assertion is a full-string `assert_eq!` against the committed file — never
-//! `.contains(...)` or `.matches(...).count()`.
+//! Golden dispatch-SQL fixtures under `testdata/dispatch_golden/`, compared by
+//! full-string `assert_eq!`. The `empty_*` fixtures carry no `storage` value, so a
+//! diff in one of them is always a regression, never an expected update.
 
 use super::test_support::{agg_item, pd, sample_scan_storage, sample_storage};
 use super::*;
 
-/// The fixed three-shard file list every non-empty golden dispatches over.
 fn fixed_shards() -> Vec<Vec<FileEntry>> {
     vec![
         vec![FileEntry::new("data/part-0.parquet", 1_000)],
@@ -27,8 +13,6 @@ fn fixed_shards() -> Vec<Vec<FileEntry>> {
     ]
 }
 
-/// The fixed four-column universe (`EVENTS`) every golden fixture projects
-/// against: two VARCHAR columns, one numeric DECIMAL, one DECIMAL id.
 fn base_col_types() -> Vec<(String, String)> {
     vec![
         ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
@@ -38,7 +22,6 @@ fn base_col_types() -> Vec<(String, String)> {
     ]
 }
 
-/// Wrap a `pushdownRequest` body with the fixed `EVENTS` `involvedTables` block.
 fn events_request(pushdown_req: Json) -> Json {
     serde_json::json!({
         "involvedTables": [{
@@ -54,8 +37,6 @@ fn events_request(pushdown_req: Json) -> Json {
     })
 }
 
-/// Grouped-aggregate shape: `GROUP BY REGION`, `SUM(AMOUNT)` — decomposes into
-/// the partial/merge grouped scan.
 fn grouped_request() -> Json {
     events_request(serde_json::json!({
         "aggregationType": "group_by",
@@ -71,10 +52,7 @@ fn grouped_request() -> Json {
     }))
 }
 
-/// `grouped_request()` plus a HAVING (`COUNT(*) > 0`) that matches no plan in
-/// its select list (only `SUM(AMOUNT)` is projected) — unrenderable over the
-/// merge, so it falls through to `RequestShape::GroupByWrapper` rather than
-/// staying `Grouped` (issue #195).
+/// HAVING matches no projected plan, so it routes to `GroupByWrapper` (#195).
 fn unmergeable_having_request() -> Json {
     let mut req = grouped_request();
     req["pushdownRequest"]["having"] = serde_json::json!({
@@ -85,11 +63,7 @@ fn unmergeable_having_request() -> Json {
     req
 }
 
-/// Group-by fallback shape: `GROUP BY REGION`, `SUM(NAME)` where `NAME` is
-/// VARCHAR — declines grouped decomposition (non-numeric SUM target, no
-/// HAVING) and routes to the qualified single-table wrapper. Carries
-/// `selectListDataTypes` so the empty counterpart exercises the
-/// `GroupByWrapper` typed-empty shape.
+/// Non-numeric SUM target: declines grouped decomposition to the qualified wrapper.
 fn group_by_fallback_request() -> Json {
     events_request(serde_json::json!({
         "aggregationType": "group_by",
@@ -105,8 +79,6 @@ fn group_by_fallback_request() -> Json {
     }))
 }
 
-/// Lone `COUNT(DISTINCT ID)` shape: the only count-distinct shape that fans
-/// out to its own DISTINCT row-scan counted by a native `COUNT(DISTINCT "V")`.
 fn lone_count_distinct_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [agg_item("COUNT", Some("ID"), true)],
@@ -114,8 +86,6 @@ fn lone_count_distinct_request() -> Json {
     }))
 }
 
-/// Multi/mixed `COUNT(DISTINCT)` decline shape: two distinct items — declines
-/// the fan-out and routes to the qualified single-table wrapper.
 fn multi_count_distinct_decline_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [
@@ -129,7 +99,6 @@ fn multi_count_distinct_decline_request() -> Json {
     }))
 }
 
-/// Plain row-scan shape: two projected columns, no aggregate, no GROUP BY.
 fn row_scan_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [
@@ -143,8 +112,6 @@ fn row_scan_request() -> Json {
     }))
 }
 
-/// The row-scan fixture's own projection (matching `row_scan_request`'s
-/// `selectList`), reused for both the non-empty and empty row-scan goldens.
 fn row_scan_projection() -> (Vec<ProjectionItem>, Vec<String>) {
     (
         vec![
@@ -155,9 +122,6 @@ fn row_scan_projection() -> (Vec<ProjectionItem>, Vec<String>) {
     )
 }
 
-/// Plain single-group aggregate shape (`SUM(AMOUNT)`, no distinct, no GROUP
-/// BY) — used only for the empty single-group-aggregate golden (its non-empty
-/// counterpart is not one of the five listed dispatch shapes).
 fn single_group_agg_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [agg_item("SUM", Some("AMOUNT"), false)],
@@ -165,11 +129,7 @@ fn single_group_agg_request() -> Json {
     }))
 }
 
-/// Scalar-over-aggregate select list with an inner `DISTINCT`
-/// (`ROUND(SUM(DISTINCT AMOUNT), 2)`) — the decomposition declines on the
-/// inner `DISTINCT`, so the depth-insensitive floor widens the projection and
-/// routes to the qualified single-table wrapper rather than evaluating the
-/// aggregate per shard.
+/// An inner `DISTINCT` declines the decomposition, so the projection widens (#194).
 fn nested_aggregate_decline_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [ {
@@ -184,9 +144,6 @@ fn nested_aggregate_decline_request() -> Json {
     }))
 }
 
-/// Single-group select list that is a lone scalar function wrapping an
-/// aggregate (`ROUND(SUM(AMOUNT), 2)`, issue #194's shape) — decomposes into
-/// one partial column and one merged row.
 fn single_group_scalar_over_aggregate_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [ {
@@ -201,9 +158,7 @@ fn single_group_scalar_over_aggregate_request() -> Json {
     }))
 }
 
-/// A bare `COUNT(*)` alongside a scalar-over-aggregate item that nests the
-/// SAME `COUNT(*)` (`ROUND(SUM(AMOUNT) / COUNT(*), 2)`) — the nested
-/// occurrence must dedup against the bare item's partial column.
+/// The nested `COUNT(*)` must dedup against the bare item's partial column.
 fn single_group_scalar_over_aggregate_dedup_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [
@@ -231,8 +186,6 @@ fn single_group_scalar_over_aggregate_dedup_request() -> Json {
     }))
 }
 
-/// A bare aggregate, a scalar-over-aggregate item, and another bare aggregate
-/// interleaved in `selectList` order, each carrying its own declared type.
 fn single_group_scalar_over_aggregate_interleaved_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [
@@ -262,8 +215,6 @@ fn single_group_scalar_over_aggregate_interleaved_request() -> Json {
     }))
 }
 
-/// A scalar-wrapped statistical aggregate (`ROUND(VARIANCE(AMOUNT), 4)`,
-/// issue #188's shape) resolves through the shared `AggKind` tables.
 fn single_group_scalar_over_variance_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [ {
@@ -278,13 +229,8 @@ fn single_group_scalar_over_variance_request() -> Json {
     }))
 }
 
-/// Render a non-empty dispatch SQL for `request` through the production
-/// [`build_dispatch_sql`] seam, over the fixed three-shard fixture and a fixed
-/// tuning/storage/schema common blob. `has_order_by` is always `false`: none
-/// of the five golden shapes exercise the ordered top-N or declined-order-by
-/// paths. The widening flag is always `false` too — every golden shape derives
-/// one projection item per select-list item, so none routes to the qualified
-/// single-table wrapper.
+/// Every golden shape has no ORDER BY and derives one projection item per
+/// select-list item, so `has_order_by` and the widening flag are always `false`.
 fn dispatch_sql(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
@@ -304,11 +250,8 @@ fn dispatch_sql(
     )
 }
 
-/// Like [`dispatch_sql`], but derives its projection inputs (and widening flag)
-/// through the production [`project_columns`](super::support::project_columns)
-/// helper instead of hardcoding them, so the golden proves the fixture ITSELF
-/// widens rather than only that `build_dispatch_sql` honours a widening signal
-/// it was handed.
+/// Derives the projection through `project_columns`, so the golden proves the
+/// fixture itself widens.
 fn dispatch_sql_widened(request: &Json) -> String {
     let pushdown_req = pd(request);
     let (proj_cols, proj_types, widened) =
@@ -351,11 +294,8 @@ fn dispatch_sql_widened(request: &Json) -> String {
         .to_string()
 }
 
-/// Like [`dispatch_sql`], but takes the `pushdownRequest` body explicitly
-/// instead of deriving it (unstripped) from `request` — so a caller can drive
-/// [`build_dispatch_sql`] with a deliberately stripped OR deliberately
-/// alias-carrying `pushdown_req`, to pin the alias-leak fix (issue #193) at
-/// the dispatch level without touching the frozen golden fixtures above.
+/// Takes `pushdown_req` explicitly so callers can pass a stripped or alias-carrying
+/// body (#193).
 fn dispatch_sql_with_pushdown_req(
     request: &Json,
     pushdown_req: &Json,
@@ -398,9 +338,6 @@ fn dispatch_sql_with_pushdown_req(
         .to_string()
 }
 
-/// Render the empty-result SQL for `request` through [`empty_result_sql`],
-/// over the same fixed column universe every non-empty golden uses. Every captured
-/// fixture is a non-widened projection, so the widening signal is `false` here.
 fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[String]) -> String {
     let pushdown_req = pd(request);
     let result = empty_result_sql(
@@ -417,8 +354,7 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[String]
         .to_string()
 }
 
-/// Grouped-aggregate dispatch SQL stays byte-identical to the captured
-/// pre-dedup golden.
+/// Scenario: grouped-aggregate dispatch SQL matches its golden
 #[test]
 fn grouped_aggregate_matches_golden() {
     let actual = dispatch_sql(
@@ -432,8 +368,7 @@ fn grouped_aggregate_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Group-by fallback (declined decomposition) dispatch SQL stays
-/// byte-identical to the captured pre-dedup golden.
+/// Scenario: group-by fallback dispatch SQL matches its golden
 #[test]
 fn group_by_fallback_matches_golden() {
     let actual = dispatch_sql(
@@ -447,8 +382,7 @@ fn group_by_fallback_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Lone `COUNT(DISTINCT)` dispatch SQL stays byte-identical to the captured
-/// pre-dedup golden.
+/// Scenario: lone COUNT(DISTINCT) dispatch SQL matches its golden
 #[test]
 fn lone_count_distinct_matches_golden() {
     let actual = dispatch_sql(
@@ -462,8 +396,7 @@ fn lone_count_distinct_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Multi/mixed `COUNT(DISTINCT)` decline dispatch SQL stays byte-identical to
-/// the captured pre-dedup golden.
+/// Scenario: multi/mixed COUNT(DISTINCT) decline dispatch SQL matches its golden
 #[test]
 fn multi_count_distinct_decline_matches_golden() {
     let actual = dispatch_sql(
@@ -477,8 +410,7 @@ fn multi_count_distinct_decline_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Single-group / row-scan dispatch SQL stays byte-identical to the captured
-/// pre-dedup golden.
+/// Scenario: single-group row-scan dispatch SQL matches its golden
 #[test]
 fn single_group_row_scan_matches_golden() {
     let (proj_cols, proj_types) = row_scan_projection();
@@ -493,9 +425,7 @@ fn single_group_row_scan_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// A nested aggregate the merge decomposition declines widens the projection
-/// and routes to the qualified single-table wrapper, not a per-shard
-/// projection — the floor's dispatch-level assertion (#194).
+/// Scenario: a declined nested aggregate widens to the qualified wrapper (#194)
 #[test]
 fn nested_aggregate_decline_matches_qualified_wrapper_golden() {
     let actual = dispatch_sql_widened(&nested_aggregate_decline_request());
@@ -503,8 +433,7 @@ fn nested_aggregate_decline_matches_qualified_wrapper_golden() {
     assert_eq!(actual, expected);
 }
 
-/// A lone scalar-over-aggregate select item (`ROUND(SUM(AMOUNT), 2)`)
-/// decomposes into one deduplicated partial column and one merged row.
+/// Scenario: a lone scalar-over-aggregate item matches its golden
 #[test]
 fn single_group_scalar_over_aggregate_matches_golden() {
     let actual = dispatch_sql(
@@ -518,8 +447,7 @@ fn single_group_scalar_over_aggregate_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// A bare `COUNT(*)` and a `ROUND(SUM(AMOUNT) / COUNT(*), 2)` item share the
-/// same nested `COUNT(*)`, which must dedup into ONE partial column.
+/// Scenario: a nested COUNT(*) dedups against the bare COUNT(*) partial column
 #[test]
 fn single_group_scalar_over_aggregate_dedup_matches_golden() {
     let actual = dispatch_sql(
@@ -534,9 +462,7 @@ fn single_group_scalar_over_aggregate_dedup_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// A bare aggregate, a scalar-over-aggregate item, and another bare
-/// aggregate interleave in `selectList` order, each cast to its own
-/// declared type.
+/// Scenario: interleaved scalar-over-aggregate items keep selectList order and own casts
 #[test]
 fn single_group_scalar_over_aggregate_interleaved_matches_golden() {
     let actual = dispatch_sql(
@@ -551,9 +477,7 @@ fn single_group_scalar_over_aggregate_interleaved_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// A scalar-wrapped statistical aggregate (`ROUND(VARIANCE(AMOUNT), 4)`)
-/// resolves through the shared `AggKind` tables, so no aggregate name
-/// reaches DataFusion.
+/// Scenario: a scalar-wrapped statistical aggregate matches its golden
 #[test]
 fn single_group_scalar_over_variance_matches_golden() {
     let actual = dispatch_sql(
@@ -567,8 +491,7 @@ fn single_group_scalar_over_variance_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Empty-grouped result SQL stays byte-identical to the captured pre-dedup
-/// golden.
+/// Scenario: empty grouped result SQL matches its golden
 #[test]
 fn empty_grouped_matches_golden() {
     let actual = empty_sql(&grouped_request(), &[], &[]);
@@ -576,8 +499,7 @@ fn empty_grouped_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Empty `GroupByWrapper` (typed from `selectListDataTypes`) result SQL stays
-/// byte-identical to the captured pre-dedup golden.
+/// Scenario: empty GroupByWrapper result SQL matches its golden
 #[test]
 fn empty_group_by_wrapper_matches_golden() {
     let actual = empty_sql(&group_by_fallback_request(), &[], &[]);
@@ -585,16 +507,7 @@ fn empty_group_by_wrapper_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// An unmergeable HAVING (`COUNT(*) > 0` over a select list that only
-/// projects `SUM(AMOUNT)`) routes the empty path to the SAME `GroupByWrapper`
-/// shape the non-empty path commits to (issue #195), not the plain `Grouped`
-/// empty shape its HAVING-less sibling `grouped_request()` produces.
-///
-/// Both empty renderers type every column from `selectListDataTypes` at the
-/// same select-list index, so for this fixture (a plain group-key + one
-/// aggregate select list) their output is byte-identical — the golden text
-/// alone cannot distinguish `Grouped` from `GroupByWrapper`. The
-/// `classify_request_shape` assertion below is the actual regression guard.
+/// Scenario: an empty unmergeable HAVING routes to GroupByWrapper (#195)
 #[test]
 fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
     let request = unmergeable_having_request();
@@ -611,8 +524,7 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
     );
 }
 
-/// Empty single-group-aggregate result SQL stays byte-identical to the
-/// captured pre-dedup golden.
+/// Scenario: empty single-group aggregate result SQL matches its golden
 #[test]
 fn empty_single_group_agg_matches_golden() {
     let actual = empty_sql(&single_group_agg_request(), &[], &[]);
@@ -620,8 +532,7 @@ fn empty_single_group_agg_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Empty row-scan result SQL stays byte-identical to the captured pre-dedup
-/// golden.
+/// Scenario: empty row-scan result SQL matches its golden
 #[test]
 fn empty_row_scan_matches_golden() {
     let (proj_cols, proj_types) = row_scan_projection();
@@ -630,9 +541,7 @@ fn empty_row_scan_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// A fully-pruned file list over a scalar-over-aggregate select list yields
-/// one shape-correct empty row, its `NULL` cast to the item's own declared
-/// type.
+/// Scenario: an empty scalar-over-aggregate row casts NULL to the item's declared type
 #[test]
 fn empty_single_group_scalar_over_aggregate_matches_golden() {
     let actual = empty_sql(&single_group_scalar_over_aggregate_request(), &[], &[]);
@@ -641,10 +550,7 @@ fn empty_single_group_scalar_over_aggregate_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// `grouped_request`'s `GROUP BY REGION` / `SUM(AMOUNT)` shape, but with every
-/// column node stamped `tableName: "EVENTS"` / `tableAlias: "E"` — the shape
-/// Exasol sends for an aliased single-table query (`FROM EVENTS e`, issue
-/// #193).
+/// Every column node carries `tableAlias: "E"`, as for `FROM EVENTS e` (#193).
 fn aliased_grouped_request() -> Json {
     let column = |name: &str| serde_json::json!({"type": "column", "name": name, "tableName": "EVENTS", "tableAlias": "E"});
     events_request(serde_json::json!({
@@ -666,15 +572,7 @@ fn aliased_grouped_request() -> Json {
     }))
 }
 
-/// Regression for issue #193: an ALIASED single-table `GROUP BY` request,
-/// fed through `strip_table_alias` (the `handle_pushdown` chokepoint) into
-/// `build_dispatch_sql`, must render the GROUP BY key and the select-list
-/// aggregate argument as BARE `"REGION"` / `"AMOUNT"` — never
-/// `"E"."REGION"` / `"E"."AMOUNT"` — because the scan target this dispatches
-/// over exposes bare column names and does not resolve an alias-qualified
-/// reference. Stripping tableAlias is a no-op on rendering otherwise (the
-/// translator ignores the surviving `tableName`), so the output must be
-/// byte-identical to the unaliased `grouped_aggregate` golden fixture.
+/// Scenario: an aliased single-table GROUP BY renders bare column names (#193)
 #[test]
 fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
     let request = aliased_grouped_request();
@@ -712,9 +610,6 @@ fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
     );
 }
 
-/// `multi_count_distinct_decline_request`'s two-`COUNT(DISTINCT)` shape, but
-/// with every column node stamped `tableName: "EVENTS"` / `tableAlias: "E"` —
-/// the shape that routes to `qualified_single_table_fallback_pushdown`.
 fn aliased_multi_count_distinct_decline_request() -> Json {
     let column = |name: &str| serde_json::json!({"type": "column", "name": name, "tableName": "EVENTS", "tableAlias": "E"});
     events_request(serde_json::json!({
@@ -739,21 +634,7 @@ fn aliased_multi_count_distinct_decline_request() -> Json {
     }))
 }
 
-/// Regression for issue #193's qualified-fallback guarantee: the multi-
-/// `COUNT(DISTINCT)` decline routes to `qualified_single_table_fallback_pushdown`
-/// (`build_qualified_single_table_fallback_sql`), which re-derives its
-/// `"LHS_T0"` qualification from each column's `tableName` via
-/// `annotate_columns_with_alias` — unconditionally overwriting any incoming
-/// `tableAlias`. So the wrapper must render identically qualified SQL whether
-/// the request carries a stale `tableAlias` or has already been stripped,
-/// and in both cases every reference must be qualified `"LHS_T0"."…"`.
-///
-/// Unlike the other golden requests, `tableName` is present here (the real
-/// Exasol wire shape always carries it), so this is deliberately NOT compared
-/// against the frozen `multi_count_distinct_decline` golden fixture: that
-/// fixture's columns carry no `tableName` at all, which is what makes ITS
-/// render come out bare rather than `"LHS_T0"`-qualified (`annotate_columns_
-/// with_alias` only qualifies a column whose `tableName` resolves).
+/// Scenario: the multi-COUNT(DISTINCT) fallback qualifies every column as LHS_T0 regardless of alias
 #[test]
 fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_presence() {
     let request = aliased_multi_count_distinct_decline_request();
@@ -792,24 +673,9 @@ fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_pr
     );
 }
 
-// --- All-agg-kinds fixtures (plan `refactor-pushdown-agg-dedup`, task 1.1) ---
-//
-// These two fixtures cover every `AggKind` variant and every partial-column
-// arity (1, 2, and 3 columns) in one request, so the pre-refactor column
-// contract (`PARTIAL_*` names, `EMITS` types, merge SELECT) is pinned before
-// task 1.3 rewires the five sites that encode it. The mixed arities are
-// deliberate: they exercise the plan-ordinal-versus-column-ordinal
-// distinction that is the drift risk the refactor must not disturb.
-//
-// A dedicated column universe (ID/SCORE/TS/REGION), not the shared
-// `base_col_types` REGION/NAME/AMOUNT/ID one every other golden fixture
-// above uses: SCORE must be numeric (SUM/AVG/the four statistical kinds all
-// require it), TS is a MIN/MAX target of any comparable type, and neither
-// fits the existing universe.
+// Covers every `AggKind` and every partial-column arity (1, 2, 3) in one request,
+// over a dedicated column universe with a numeric SCORE and a MIN/MAX target TS.
 
-/// The ID/SCORE/TS/REGION column universe both all-agg-kinds fixtures
-/// dispatch over: SCORE numeric (required by SUM/AVG/the statistical
-/// family), TS a MIN/MAX target, ID a COUNT target, REGION the group key.
 fn all_agg_kinds_col_types() -> Vec<(String, String)> {
     vec![
         ("ID".to_string(), "DECIMAL(20,0)".to_string()),
@@ -819,8 +685,6 @@ fn all_agg_kinds_col_types() -> Vec<(String, String)> {
     ]
 }
 
-/// Wrap a `pushdownRequest` body with the `involvedTables` block matching
-/// [`all_agg_kinds_col_types`].
 fn all_agg_kinds_request(pushdown_req: Json) -> Json {
     serde_json::json!({
         "involvedTables": [{
@@ -836,12 +700,6 @@ fn all_agg_kinds_request(pushdown_req: Json) -> Json {
     })
 }
 
-/// The select-list items exercising all ten `AggKind` variants, in the same
-/// order the plan names them: `Count`, `CountCol`, `Sum`, `Min`, `Max`,
-/// `Avg` (arity 1 then 1 then 1 then 1 then 1 then 2), then the four
-/// statistical kinds `StddevSamp`, `StddevPop`, `VarSamp`, `VarPop` (arity 3
-/// each) — `STDDEV`/`STDDEV_POP`/`VARIANCE`/`VAR_POP` map onto them per
-/// `parse_agg_item`.
 fn all_agg_kinds_select_list() -> Vec<Json> {
     vec![
         agg_item("COUNT", None, false),
@@ -857,10 +715,6 @@ fn all_agg_kinds_select_list() -> Vec<Json> {
     ]
 }
 
-/// The declared Exasol result type Exasol would assign each item in
-/// [`all_agg_kinds_select_list`], at the same index: `DECIMAL(18,0)` for the
-/// two COUNTs, `TIMESTAMP` for MIN/MAX(ts), `DOUBLE PRECISION` for
-/// SUM/AVG(score) and every statistical kind over a DOUBLE column.
 fn all_agg_kinds_declared_types() -> Vec<Json> {
     vec![
         serde_json::json!({"type": "decimal", "precision": 18, "scale": 0}),
@@ -876,7 +730,6 @@ fn all_agg_kinds_declared_types() -> Vec<Json> {
     ]
 }
 
-/// Single-group (ungrouped) shape: all ten `AggKind` variants, no GROUP BY.
 fn single_group_all_agg_kinds_request() -> Json {
     all_agg_kinds_request(serde_json::json!({
         "selectList": all_agg_kinds_select_list(),
@@ -884,11 +737,8 @@ fn single_group_all_agg_kinds_request() -> Json {
     }))
 }
 
-/// Grouped shape: the same ten `AggKind` variants, plus `GROUP BY region` —
-/// the region key occupies select-list ordinal 0, so the ten aggregates sit
-/// at ordinals 1..=10, one higher than in the single-group sibling above.
-/// That shift is exactly the plan-ordinal-versus-column-ordinal distinction
-/// the mixed arities are meant to exercise.
+/// The group key at ordinal 0 shifts the aggregates by one, exercising the
+/// plan-ordinal versus column-ordinal distinction.
 fn grouped_all_agg_kinds_request() -> Json {
     let mut select_list = vec![serde_json::json!({"type": "column", "name": "REGION"})];
     select_list.extend(all_agg_kinds_select_list());
@@ -902,10 +752,6 @@ fn grouped_all_agg_kinds_request() -> Json {
     }))
 }
 
-/// Like [`dispatch_sql`], but takes `col_types` explicitly instead of the
-/// shared `base_col_types()` — the two all-agg-kinds fixtures dispatch over
-/// [`all_agg_kinds_col_types`], not the REGION/NAME/AMOUNT/ID universe every
-/// other golden fixture in this module shares.
 fn dispatch_sql_with_col_types(request: &Json, col_types: Vec<(String, String)>) -> String {
     dispatch_sql_with_pushdown_req(
         request,
@@ -918,10 +764,7 @@ fn dispatch_sql_with_col_types(request: &Json, col_types: Vec<(String, String)>)
     )
 }
 
-/// Single-group all-agg-kinds dispatch SQL stays byte-identical to the
-/// captured pre-refactor golden — the only baseline over the `EMITS` clause
-/// and outer merge SELECT for every `AggKind` at once (plan
-/// `refactor-pushdown-agg-dedup`, task 1.1).
+/// Scenario: single-group all-agg-kinds dispatch SQL matches its golden
 #[test]
 fn single_group_all_agg_kinds_matches_golden() {
     let actual = dispatch_sql_with_col_types(
@@ -932,9 +775,7 @@ fn single_group_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Grouped all-agg-kinds dispatch SQL stays byte-identical to the captured
-/// pre-refactor golden — the grouped-path sibling of
-/// `single_group_all_agg_kinds_matches_golden`.
+/// Scenario: grouped all-agg-kinds dispatch SQL matches its golden
 #[test]
 fn grouped_all_agg_kinds_matches_golden() {
     let actual =
@@ -943,23 +784,10 @@ fn grouped_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-// --- Cross-site fixtures (plan `fix-declined-filter-self-apply`, task 2.6) ---
-//
-// The ten fixtures above pin the single-table dispatch seam alone. The two
-// fixtures below additionally drive the broadcast-join and N-scan-join render
-// sites (`render_broadcast_join` + `build_broadcast_join_sql`, and
-// `build_n_scan_join_sql`) so a single pair of tests proves ALL THREE sites
-// named in the plan's Design > Context table stay byte-identical for a
-// filterless request and for a request whose filter renders cleanly — the
-// only two cases the fix is required to leave unchanged.
-
 use super::joins::{
     JoinScanRequestConfig, JoinWindowPlan, build_broadcast_join_sql, build_n_scan_join_sql,
 };
 
-/// A minimal CUSTOMER ⋈ ORDERS inner equi-join pushdown request (disjoint
-/// column names, a broadcast-eligible shape), with an optional WHERE filter —
-/// the join-side counterpart of `row_scan_request`.
 fn two_table_join_request(filter: Option<Json>) -> Json {
     let mut pushdown_req = serde_json::json!({
         "type": "select",
@@ -1003,8 +831,6 @@ fn two_table_join_request(filter: Option<Json>) -> Json {
     })
 }
 
-/// The detected join shape for [`two_table_join_request`], resolved through
-/// the production [`detect_join`] seam rather than hand-built.
 fn two_table_detected_join(request: &Json) -> DetectedJoin {
     match detect_join(request, &pd(request)).expect("two-table join must be detected") {
         JoinShape::Join(join) => join,
@@ -1012,7 +838,6 @@ fn two_table_detected_join(request: &Json) -> DetectedJoin {
     }
 }
 
-/// CUSTOMER's resolved join side: one small file, columns disjoint from ORDERS.
 fn resolved_customer_side() -> ResolvedJoinSide {
     ResolvedJoinSide {
         table_name: "CUSTOMER".to_string(),
@@ -1036,7 +861,6 @@ fn resolved_customer_side() -> ResolvedJoinSide {
     }
 }
 
-/// ORDERS' resolved join side: one larger file, columns disjoint from CUSTOMER.
 fn resolved_orders_side() -> ResolvedJoinSide {
     ResolvedJoinSide {
         table_name: "ORDERS".to_string(),
@@ -1060,7 +884,6 @@ fn resolved_orders_side() -> ResolvedJoinSide {
     }
 }
 
-/// The fixed join tuning knobs both join-site goldens dispatch over.
 fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
     JoinScanRequestConfig {
         cluster_nodes: 1,
@@ -1075,16 +898,9 @@ fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
     }
 }
 
-/// A filterless request — single-table row scan, and CUSTOMER ⋈ ORDERS at the
-/// broadcast and N-scan join sites — must emit byte-identical SQL at all
-/// three pushdown render sites named in the plan's Design > Context table:
-/// `handle_pushdown`'s `build_dispatch_sql` seam, `render_broadcast_join` +
-/// `build_broadcast_join_sql`, and `build_n_scan_join_sql`. Proves tasks
-/// 2.1-2.5 changed nothing for the "no filter in the request" case, which was
-/// always correct to omit.
+/// Scenario: a filterless request emits unchanged SQL at the single-table, broadcast, and N-scan sites
 #[test]
 fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
-    // Site 1: single-table WHERE (`handle_pushdown` / `build_dispatch_sql`).
     let (proj_cols, proj_types) = row_scan_projection();
     let single_table_sql = dispatch_sql(&row_scan_request(), proj_cols, proj_types, None, None);
     assert_eq!(
@@ -1092,7 +908,6 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
         include_str!("testdata/dispatch_golden/filterless_single_table.sql")
     );
 
-    // Site 2: broadcast join (`render_broadcast_join` + `build_broadcast_join_sql`).
     let request = two_table_join_request(None);
     let pushdown_req = pd(&request);
     let join = two_table_detected_join(&request);
@@ -1119,7 +934,6 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
         include_str!("testdata/dispatch_golden/filterless_broadcast_join.sql")
     );
 
-    // Site 3: N-scan per-leg fallback (`build_n_scan_join_sql`).
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
     let n_scan_sql = build_n_scan_join_sql(
         &request,
@@ -1137,16 +951,9 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     );
 }
 
-/// A filter that RENDERS cleanly in DataFusion dialect must ALSO emit
-/// byte-identical SQL at all three sites — the fix changes behavior only for
-/// a DECLINED filter, never a rendering one. Proves the single-table path
-/// stays on its wrapper-free fast scan (no `LHS_T0` qualified fallback), the
-/// broadcast join keeps its accelerated shape, and the N-scan fallback keeps
-/// pushing the rendering conjunct into its owning leg rather than the outer
-/// WHERE.
+/// Scenario: a rendering filter emits unchanged, wrapper-free SQL at all three sites
 #[test]
 fn rendering_filter_emits_unchanged_wrapper_free_scan() {
-    // Site 1: single-table WHERE.
     let (proj_cols, proj_types) = row_scan_projection();
     let single_table_sql = dispatch_sql(
         &row_scan_request(),
@@ -1160,7 +967,6 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         include_str!("testdata/dispatch_golden/rendering_single_table.sql")
     );
 
-    // Site 2: broadcast join.
     let renderable_filter = serde_json::json!({
         "type": "predicate_equal",
         "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
@@ -1192,7 +998,6 @@ fn rendering_filter_emits_unchanged_wrapper_free_scan() {
         include_str!("testdata/dispatch_golden/rendering_broadcast_join.sql")
     );
 
-    // Site 3: N-scan per-leg fallback.
     let sides = vec![resolved_customer_side(), resolved_orders_side()];
     let n_scan_sql = build_n_scan_join_sql(
         &request,

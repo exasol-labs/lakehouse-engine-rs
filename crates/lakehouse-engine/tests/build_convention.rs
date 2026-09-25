@@ -1,16 +1,3 @@
-//! Pure convention test (no I/O): asserts the build documentation states that a
-//! host `cargo build --release` of the UDF crate produces an artifact that
-//! cannot be loaded inside Exasol.
-//!
-//! Covers packaging/single-so-two-entry-points scenario:
-//! "Host release build of the .so is rejected by convention" — the documentation
-//! MUST state that host `cargo build --release` produces an unloadable artifact.
-//!
-//! The documentation is embedded at compile time via `include_str!`, so this is
-//! a pure test: it reads no files at runtime and needs no live services.
-
-/// Workspace build-convention documentation, embedded at compile time.
-/// Path is relative to this source file: crates/lakehouse-engine/tests -> workspace root.
 const WORKSPACE_CLAUDE_MD: &str = include_str!("../../../CLAUDE.md");
 
 #[test]

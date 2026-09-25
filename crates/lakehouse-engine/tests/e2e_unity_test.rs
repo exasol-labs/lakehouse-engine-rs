@@ -1,29 +1,6 @@
-//! End-to-end integration tests for the lakehouse-engine Virtual Schema against
-//! a native Unity Catalog OSS server (the second catalog kind), backed by the
-//! base stack's MinIO and seeded with the vendored Delta fixtures (#325 harness).
-//!
-//! These tests run against the overlay stack (Exasol + MinIO + Unity Catalog),
-//! brought up by `make unity-up`. They FAIL (never skip) when the stack is
-//! unavailable — the same contract as the baseline `exasol-e2e` suite. #318
-//! lists tables and their column metadata; `handle_pushdown` now routes a Unity
-//! Catalog / Delta pushdown request through the same `TableScanResolver` and
-//! `FormatReader` seam an Iceberg request uses (#320), so the round-trip
-//! scenarios below issue real queries through Exasol and assert the rows they
-//! return. `unity_delta_planning_agrees_under_vended_and_static_credentials`
-//! separately exercises Delta table PLANNING directly through the seam
-//! (`format_reader`/`ScanSource::UnityDelta`), bypassing `handle_pushdown`
-//! entirely.
-//!
-//! All tests share one Exasol (one virtual schema), so they must run serially
-//! (`--test-threads=1`); the `make test-e2e-unity` target passes the flag.
-//!
-//! The CONNECTION address is the docker-network Unity Catalog host and its
-//! password supplies no CATALOG-auth field, because the OSS server's
-//! authorization is disabled — but it does carry the MinIO endpoint and static
-//! storage credentials the UDF-side scan reads through, since the OSS Unity
-//! Catalog server vends no S3 endpoint of its own.
-//! `unity_credentials_never_appear_in_output` pins the redaction contract on
-//! the failure path.
+//! All tests share one virtual schema, so they must run serially (`--test-threads=1`).
+//! The OSS Unity Catalog server has authorization disabled and vends no S3 endpoint, so the
+//! CONNECTION carries no catalog-auth field but does carry MinIO's endpoint and static keys.
 #![cfg(feature = "unity-e2e")]
 
 mod common;
@@ -52,18 +29,13 @@ use lakehouse_engine::scan::spec::{DeleteMechanism, FileEntry};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-/// Virtual Schema over the seeded `unity.delta_e2e` namespace.
 const VS_NAME: &str = "UNITY_DELTA_E2E_VS";
-/// Catalog CONNECTION carrying the (no-auth) Unity Catalog address.
 const CONN_NAME: &str = "UNITY_CATALOG_CREDS";
-/// The seeded catalog + schema, addressed `catalog.schema`.
 const UNITY_NAMESPACE: &str = "unity.delta_e2e";
-/// Unity Catalog as reached from inside the Exasol UDF container (docker network).
 const UNITY_CATALOG_URI_INTERNAL: &str = "http://unitycatalog:8080";
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The eight seeded fixture tables, as their flatten-and-uppercase Exasol names.
 const EXPECTED_TABLES: &[&str] = &[
     "TABLE_WITH_DV",
     "CM_NAME_MODE",
@@ -75,7 +47,6 @@ const EXPECTED_TABLES: &[&str] = &[
     "TYPE_WIDENING",
 ];
 
-/// Unity Catalog REST host port (host-side). `LH_UNITY_PORT`, default 18080.
 fn unity_port() -> u16 {
     std::env::var("LH_UNITY_PORT")
         .ok()
@@ -83,10 +54,7 @@ fn unity_port() -> u16 {
         .unwrap_or(18080)
 }
 
-/// Assert the Unity Catalog REST server is serving; panic if not.
-///
-/// A 2xx on the `catalogs` endpoint proves the server is actually serving, not
-/// merely that the port is open — the same signal the compose healthcheck uses.
+/// A 2xx on `catalogs` proves the server is serving, not merely that the port is open.
 fn wait_for_unity_catalog() {
     let url = format!(
         "http://localhost:{}/api/2.1/unity-catalog/catalogs",
@@ -95,22 +63,14 @@ fn wait_for_unity_catalog() {
     wait_for_url(&url, READINESS_TIMEOUT);
 }
 
-// ---------------------------------------------------------------------------
-// One-time setup (shared across the serial binary).
-// ---------------------------------------------------------------------------
-
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        // Readiness — fail loud, never skip.
         wait_for_exasol();
         wait_for_minio();
         wait_for_unity_catalog();
 
-        // Shared-harness provisioning (SLC + .so + scripts) — REUSED, never
-        // redeclared, so the adapter script DDL is byte-identical to every other
-        // E2E binary.
         install_slc();
         upload_so();
         let mut conn = exa_conn();
@@ -120,16 +80,7 @@ fn setup() {
     });
 }
 
-/// Create the Unity Catalog virtual schema over `unity.delta_e2e` through the
-/// shared adapter script. The CONNECTION carries the Unity address plus a
-/// password that now also carries the MinIO endpoint and static storage
-/// credentials the UDF-side scan reads through; the `UNITY_CATALOG` catalog
-/// kind routes createVirtualSchema through the native Unity Catalog client.
 fn create_unity_virtual_schema(conn: &mut ExaConn) {
-    // MinIO endpoint + static storage credentials, the SAME shape every other
-    // E2E suite's CONNECTION carries: the OSS Unity Catalog server vends no
-    // S3 endpoint of its own, so the UDF-side scan resolves object storage
-    // through this CONNECTION rather than a test-process injection.
     let password = local_stack_connection_password();
     let create_conn_sql =
         build_create_connection_sql(CONN_NAME, UNITY_CATALOG_URI_INTERNAL, &password);
@@ -147,11 +98,6 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     ));
 }
 
-// ---------------------------------------------------------------------------
-// Result helpers.
-// ---------------------------------------------------------------------------
-
-/// The uppercased table names enumerated for `vs_name`.
 fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
     let cols = conn.query_columns(&format!(
         "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{vs_name}'"
@@ -165,8 +111,6 @@ fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The `(COLUMN_NAME, COLUMN_TYPE)` pairs declared for `table` under `vs_name`,
-/// both uppercased.
 fn column_types(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<(String, String)> {
     let cols = conn.query_columns(&format!(
         "SELECT COLUMN_NAME, COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
@@ -182,10 +126,8 @@ fn column_types(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<(String, 
         .collect()
 }
 
-/// Assert `column` is declared with an Exasol type in `expected`'s family,
-/// tolerant of Exasol's `COLUMN_TYPE` rendering (whitespace, a `VARCHAR ... UTF8`
-/// charset suffix, a `DOUBLE`/`DOUBLE PRECISION` alias) by matching on the
-/// space-stripped prefix.
+/// Prefix match tolerates `COLUMN_TYPE` rendering: a `VARCHAR ... UTF8` suffix, the
+/// `DOUBLE PRECISION` alias.
 fn assert_col_type(cols: &[(String, String)], column: &str, expected: &str) {
     let actual = cols
         .iter()
@@ -201,16 +143,7 @@ fn assert_col_type(cols: &[(String, String)], column: &str, expected: &str) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Create virtual schema lists the fixture tables and their columns.
-// ---------------------------------------------------------------------------
-
-/// createVirtualSchema over the seeded Unity Catalog namespace enumerates every
-/// fixture table and declares representative columns with the expected
-/// Exasol-mapped types, including an incompatible Spark type surfaced as VARCHAR.
-/// Enumeration runs the native Unity Catalog client's single `GET /tables` sweep
-/// over the no-auth OSS server; the tables appearing proves that client reached
-/// the catalog and mapped its inline `columns[]`.
+/// Scenario: createVirtualSchema enumerates every fixture table with Exasol-mapped column types
 #[test]
 fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
     setup();
@@ -224,32 +157,19 @@ fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
         );
     }
 
-    // Representative scalar column set: LONG -> DECIMAL(20,0), STRING -> VARCHAR,
-    // DOUBLE -> DOUBLE PRECISION.
     let cm_cols = column_types(&mut conn, VS_NAME, "CM_NAME_MODE");
     assert_col_type(&cm_cols, "ID", "DECIMAL(20,0)");
     assert_col_type(&cm_cols, "NAME", "VARCHAR(2000000)");
     assert_col_type(&cm_cols, "VALUE", "DOUBLE");
 
-    // An incompatible Spark type (ARRAY) is declared as VARCHAR, not failed.
     let stats_cols = column_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
     assert_col_type(&stats_cols, "ARRAY_COL", "VARCHAR(2000000)");
 }
 
-// ---------------------------------------------------------------------------
-// Fail-not-skip when the stack is down.
-// ---------------------------------------------------------------------------
-
-/// The Unity Catalog readiness contract is fail-loud: a readiness wait against an
-/// unreachable stack PANICS (never returns cleanly), so a down stack surfaces as
-/// a test failure, never a silent skip. Exercises the very `wait_for_url` helper
-/// `wait_for_unity_catalog` is built on, pointed at a closed local port with a
-/// short deadline.
+/// Scenario: a readiness wait against an unreachable stack panics rather than skipping
 #[test]
 fn unity_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| {
-        // 127.0.0.1:1 refuses immediately; the poll loop hits the short deadline
-        // and panics rather than returning — the fail-not-skip contract.
         wait_for_url(
             "http://127.0.0.1:1/api/2.1/unity-catalog/catalogs",
             Duration::from_secs(2),
@@ -262,15 +182,7 @@ fn unity_suite_fails_when_stack_unavailable() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// No credential value ever appears in captured output / panic messages.
-// ---------------------------------------------------------------------------
-
-/// A failing, token-bearing Unity Catalog CONNECTION DDL executed through a
-/// redacting `ExaConn` must not surface the SQL text or the bearer token in the
-/// failure output. An obviously-fake sentinel carries the token, an invalid
-/// trailing token forces the DDL-failure path, and the captured panic message is
-/// asserted to contain neither the sentinel nor the SQL text.
+/// Scenario: a failing token-bearing CONNECTION DDL leaks neither the SQL text nor the token
 #[test]
 fn unity_credentials_never_appear_in_output() {
     const SENTINEL_TOKEN: &str = "UC_DUMMY_BEARER_TOKEN_SENTINEL";
@@ -313,23 +225,12 @@ fn unity_credentials_never_appear_in_output() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Delta table planning through the FormatReader seam (bypasses handle_pushdown).
-// ---------------------------------------------------------------------------
-
-/// Unity Catalog REST base URL as reached from the test process (host-side).
 fn unity_catalog_url() -> String {
     format!("http://localhost:{}", unity_port())
 }
 
-/// Credential fields for reading `unity.delta_e2e`'s MinIO-backed tables.
-///
-/// `endpoint`/`region` are the CONNECTION's own static store address. Under
-/// vending they cross over into the vended backend through
-/// `StaticStoreAddress::from(&ConnectionCreds)`, because the OSS Unity Catalog
-/// server vends NO S3 endpoint of its own (`scripts/unity/README.md`) — the
-/// client injects MinIO's address itself, exactly as it does under the fully
-/// static run below.
+/// Under vending, `endpoint`/`region` still reach the vended backend because the OSS server
+/// vends no S3 endpoint of its own.
 fn delta_creds(use_vended_credentials: bool) -> ConnectionCreds {
     ConnectionCreds {
         warehouse: String::new(),
@@ -352,8 +253,6 @@ fn delta_creds(use_vended_credentials: bool) -> ConnectionCreds {
     }
 }
 
-/// The CONNECTION's own static storage backend — what `format_reader` reads
-/// the log through when vending is disabled.
 fn delta_static_storage() -> StorageBackend {
     storage_block(&delta_creds(false), true)
 }
@@ -365,12 +264,6 @@ fn delta_e2e_table(name: &str) -> CatalogTableIdent {
     }
 }
 
-/// Resolve `table_name`'s Delta scan through the `FormatReader` seam: load the
-/// table's metadata from the live Unity Catalog server, select the Delta reader
-/// via `format_reader`, and resolve its scan. `use_vended_credentials` selects
-/// which of the two credential modes the request exercises; `filter` forwards
-/// an optional pushdown filter to `resolve_scan`; `handle_pushdown` is never
-/// reached, matching this plan's scope.
 async fn resolve_delta_scan(
     table_name: &str,
     use_vended_credentials: bool,
@@ -403,14 +296,8 @@ async fn resolve_delta_scan(
         .unwrap_or_else(|e| panic!("resolve_scan({table_name}) failed: {e}"))
 }
 
-/// Each resolved file's `letter` partition value, ordered by path — the live
-/// counterpart of the offline pin in
-/// `crates/lakehouse-engine/src/adapter/pushdown/format/delta_replay_tests.rs`.
-///
-/// Panics unless EVERY entry carries exactly one partition entry keyed `letter`:
-/// partition values live only in the transaction log, so an empty map is a
-/// resolution that silently lost them, which comparing two runs against each
-/// other cannot detect.
+/// Panics on an empty partition map: comparing two runs cannot detect both silently losing
+/// the values, which live only in the transaction log.
 fn path_sorted_letter_values(files: &[FileEntry]) -> Vec<Option<String>> {
     let mut carried: Vec<(&str, Option<String>)> = files
         .iter()
@@ -446,33 +333,7 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
-/// Scenario: Delta planning resolves its storage credential through the
-/// table's own catalog.
-///
-/// `basic_partitioned` is resolved twice — once under vending (a real Unity
-/// Catalog temporary-table-credentials request, vending a real MinIO STS session
-/// minted and injected by the fixture harness, never a static key)
-/// and once under the CONNECTION's own static MinIO credential — and both runs
-/// must agree on the file list, the per-file partition values (carried in
-/// `FileEntry::partition_values`), and the table root: both read the SAME transaction log
-/// through two DIFFERENT credential paths that must terminate in an equivalent
-/// view of the table. `effective_storage` is deliberately NOT compared, since
-/// the two runs read through genuinely different credentials by design.
-///
-/// Agreement alone would be satisfied by two identically-empty partition maps, so the
-/// `letter` values are pinned outright: six files, one partition entry each, and the
-/// `letter=__HIVE_DEFAULT_PARTITION__/` file resolved to an explicit NULL rather than to
-/// the directory literal. That pin mirrors the offline one in `delta_replay_tests.rs`,
-/// which reads a local filesystem store and so could not catch a live-S3-only regression
-/// that dropped partition values or resolved no Delta block at all.
-///
-/// `table_with_dv`'s single active file must carry a deletion-vector
-/// reference, proving the reader returns the re-added `add` action rather than
-/// the delete-free one it replaced.
-///
-/// Fails, never skips, when the stack is unreachable: `wait_for_minio` and
-/// `wait_for_unity_catalog` panic on a timed-out readiness poll rather than
-/// returning early.
+/// Scenario: Delta planning agrees under vended and static credentials
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     wait_for_minio();
@@ -593,20 +454,12 @@ fn unity_delta_filters_prune_the_resolved_file_list() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Round-trip query scenarios (#320): the format-reader seam wired into
-// production pushdown, exercised end to end through Exasol.
-// ---------------------------------------------------------------------------
-
-/// A virtual table reference, `VS_NAME.TABLE`.
 fn table_ref(table: &str) -> String {
     format!("{VS_NAME}.{table}")
 }
 
-/// Parse the JSON value (object or array) starting at `start` — the index of its
-/// opening `{` or `[` — within `text`, matching brackets through quoted strings so
-/// an embedded `{`/`}`/`[`/`]` inside a string value cannot end the scan early.
-/// Returns the parsed value and the index just past its closing bracket.
+/// Returns the JSON value opening at `start` and the index past its closing bracket; brackets
+/// inside quoted strings are skipped.
 fn json_value_at(text: &str, start: usize) -> (serde_json::Value, usize) {
     let bytes = text.as_bytes();
     let (open, close) = match bytes[start] {
@@ -649,16 +502,7 @@ fn json_value_at(text: &str, start: usize) -> (serde_json::Value, usize) {
     (value, end)
 }
 
-/// Scenario: A delete-free Delta table returns its rows end to end.
-///
-/// `multi_part_stats` (5 files, 5 rows, delete-free, unpartitioned) is this
-/// engine's FIRST full round trip over a Delta table. `create_unity_virtual_schema`'s
-/// CONNECTION carries the MinIO endpoint and static storage credentials
-/// (`local_stack_connection_password`, the same credential shape and shared-harness
-/// provisioning every other E2E binary uses), because the OSS Unity Catalog server
-/// vends no S3 endpoint of its own — this table's non-NULL column values prove the
-/// UDF-side scan actually resolved a credential from the CONNECTION; with none, the
-/// read against MinIO would fail.
+/// Scenario: a delete-free Delta table returns its rows end to end
 #[test]
 fn unity_delta_delete_free_table_returns_its_rows() {
     setup();
@@ -689,10 +533,7 @@ fn unity_delta_delete_free_table_returns_its_rows() {
     );
 }
 
-/// Scenario: A Delta table with deletion vectors returns only its live rows.
-///
-/// `table_with_dv` (1 file, 10 physical rows, a UUID-relative deletion vector of
-/// cardinality 2) removes the rows whose `value` is 0 and 9.
+/// Scenario: a Delta table with deletion vectors returns only its live rows
 #[test]
 fn unity_delta_deletion_vector_table_returns_only_live_rows() {
     setup();
@@ -729,20 +570,7 @@ fn unity_delta_deletion_vector_table_returns_only_live_rows() {
     );
 }
 
-/// Scenario: A column-mapped Delta table returns values under its logical
-/// column names.
-///
-/// `cm_id_mode` and `cm_name_mode` carry Parquet columns physically named
-/// `col-<uuid>` while their Delta schemas declare `id`, `name`, `value`. Neither
-/// column may be NULL — a logical-name-only binding against a `col-<uuid>`
-/// physical name would produce exactly that.
-///
-/// The two fixtures are independently seeded delta-kernel-rs CDF tables that
-/// share a schema shape, not two views of the same underlying data: a live run
-/// shows `cm_id_mode` holding ids `{1,2,4}` and `cm_name_mode` holding ids
-/// `{2,3,4}` with different names and values throughout. So this scenario
-/// verifies each table's binding independently rather than asserting row
-/// equality between them.
+/// Scenario: a column-mapped Delta table returns values under its logical column names
 #[test]
 fn unity_delta_column_mapped_tables_return_logical_column_values() {
     setup();
@@ -783,14 +611,7 @@ fn unity_delta_column_mapped_tables_return_logical_column_values() {
     }
 }
 
-/// Scenario: A partitioned Delta table returns its partition column values.
-///
-/// `basic_partitioned` (6 files, 6 rows) is partitioned by `letter`; one file
-/// lives under the Hive default-partition directory because its `letter` is
-/// NULL. The live values are pinned outright — `a,a,b,c,e,NULL` — the same
-/// six-file fixture `unity_delta_planning_agrees_under_vended_and_static_credentials`
-/// already proves at the `FormatReader` layer; this scenario proves the SAME
-/// values reach a real query, its WHERE clause, and its GROUP BY.
+/// Scenario: a partitioned Delta table returns its partition column values
 #[test]
 fn unity_delta_partitioned_table_returns_partition_values() {
     setup();
@@ -868,26 +689,7 @@ fn unity_delta_partitioned_table_returns_partition_values() {
     );
 }
 
-/// Scenario: Join and aggregate pushdown reach a Delta table by the same route
-/// as a scan.
-///
-/// Every assertion below is self-consistent against a ground-truth full scan
-/// fetched in-process, rather than a fixture value pinned in the test, since
-/// only `basic_partitioned`'s partition values are pinned upstream (the
-/// previous scenario and `unity_delta_planning_agrees_under_vended_and_static_credentials`).
-///
-/// - a grouped aggregate (`GROUP BY ID`) over `multi_part_stats`
-/// - an `ORDER BY ... LIMIT` top-N over `multi_part_stats`
-/// - a broadcast-eligible inner equi-join whose broadcast side is
-///   `basic_partitioned`, the PARTITIONED table, joined against `cm_id_mode`
-///   (NOT `multi_part_stats`: a live run's active-file byte totals are
-///   `basic_partitioned` 4505, `multi_part_stats` 3804, `cm_id_mode` 5253 —
-///   `select_broadcast_sides` gives the broadcast/dimension role to the
-///   SMALLER side, so pairing with `multi_part_stats` would make
-///   `basic_partitioned` the FACT side instead, never exercising
-///   `JoinSpec.partition_columns`. `cm_id_mode` is already seeded and larger
-///   than `basic_partitioned`, so it reliably keeps `basic_partitioned` on the
-///   broadcast side.)
+/// Scenario: join and aggregate pushdown reach a Delta table by the same route as a scan
 #[test]
 fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
     setup();
@@ -904,8 +706,6 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         "multi_part_stats holds 5 rows: {raw_ids:?}"
     );
 
-    // Grouped aggregate: GROUP BY ID must match a hand-computed grouping of the
-    // same ground-truth ids.
     let grouped = conn.query_columns(&format!(
         "SELECT ID, COUNT(*) FROM {} GROUP BY ID",
         table_ref("MULTI_PART_STATS")
@@ -931,8 +731,6 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         "GROUP BY ID must cover every id the ground-truth scan saw: missing {expected_group_counts:?}"
     );
 
-    // ORDER BY ... LIMIT: top-3 by ID DESC must match a full sort + truncate of
-    // the same ground-truth ids.
     let mut expected_top3 = raw_ids.clone();
     expected_top3.sort_unstable_by(|a, b| b.cmp(a));
     expected_top3.truncate(3);
@@ -948,8 +746,8 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
         "ORDER BY ID DESC LIMIT 3 must match a full sort + truncate"
     );
 
-    // Broadcast join: basic_partitioned (partitioned, the smaller side) joined
-    // to cm_id_mode on NUMBER = ID.
+    // Broadcast goes to the smaller side by active-file bytes; cm_id_mode (5253) outweighs
+    // basic_partitioned (4505), keeping the partitioned table on the broadcast side.
     let join_sql = format!(
         "SELECT p.LETTER, c.ID FROM {} p JOIN {} c ON p.NUMBER = c.ID",
         table_ref("BASIC_PARTITIONED"),
@@ -992,7 +790,6 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
          basic_partitioned's table root, the PARTITIONED table: {pushed}"
     );
 
-    // Ground-truth join, computed in-process from both tables' full contents.
     let cm_ids: Vec<i64> = conn
         .query_columns(&format!("SELECT ID FROM {}", table_ref("CM_ID_MODE")))[0]
         .iter()
@@ -1038,23 +835,12 @@ fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
     );
 }
 
-/// `type_widening`'s eleven Delta-protocol-supported columns (`byte_decimal` and
-/// `short_decimal` are refused per column — decision [15]), in the order the
-/// scenario below indexes their query results.
+/// `byte_decimal` and `short_decimal` are refused per column (decision [15]).
 const TYPE_WIDENING_SUPPORTED_COLUMNS: &str = "BYTE_LONG, INT_LONG, FLOAT_DOUBLE, BYTE_DOUBLE, SHORT_DOUBLE, INT_DOUBLE, \
      DECIMAL_DECIMAL_SAME_SCALE, DECIMAL_DECIMAL_GREATER_SCALE, INT_DECIMAL, LONG_DECIMAL, \
      DATE_TIMESTAMP_NTZ";
 
-/// Scenario: A Delta table using an unsupported reader feature fails the query
-/// loud.
-///
-/// `unshredded_variant` declares `variantType-preview`; `DeltaSnapshot::open`
-/// refuses it at plan time, before any log replay. The refusal must be the
-/// protocol gate's own message — never something that looks like the per-column
-/// type-mapping refusal (which names a column and cites #350) — and the session
-/// must survive to prove no crashed UDF VM took it down. `type_widening` is no
-/// longer a case here: `typeWidening-preview` is now allow-listed, so the error
-/// must not cite the now-closed issue #349 either.
+/// Scenario: a Delta table using an unsupported reader feature fails the query loud
 #[test]
 fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     setup();
@@ -1097,15 +883,7 @@ fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     );
 }
 
-/// Scenario: A type-widened Delta table returns its current wider types across
-/// the widening boundary.
-///
-/// `type_widening`'s two live data files straddle commit 2's widening — one row
-/// was written under the narrow types, the other under the widened ones — so
-/// every column must read back at its CURRENT wider type from both files.
-/// Eleven of the table's thirteen recorded type changes are supported by the
-/// Delta type-widening protocol; `byte_decimal` and `short_decimal` are refused
-/// per column, leaving the other eleven queryable (decision [15]).
+/// Scenario: a type-widened Delta table returns its wider types across the widening boundary
 #[test]
 fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
     setup();
@@ -1154,8 +932,6 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
          failed: {rows:?}"
     );
 
-    // ORDER BY INT_LONG puts the pre-widening row (INT_LONG = 2) first and the
-    // post-widening row (INT_LONG = 9223372036854775807, i64::MAX) second.
     const PRE: usize = 0;
     const POST: usize = 1;
 
@@ -1284,27 +1060,11 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
     }
 }
 
-/// The 15 Delta types this engine maps for `stats_all_types`, in fixture column
-/// order. `array_col`, `map_col`, and `nested_struct` are rendered as JSON
-/// `VARCHAR(2000000)` per `datafusion-scan/nested-json-rendering`. The one
-/// remaining refused column (`binary_col`) is exercised by
-/// `unity_delta_refused_column_refuses_only_the_queries_naming_it`.
 const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LONG_COL, FLOAT_COL, DOUBLE_COL, DATE_COL, \
      TIMESTAMP_COL, TIMESTAMP_NTZ_COL, STRING_COL, DECIMAL_COL, BOOLEAN_COL, ARRAY_COL, \
      MAP_COL, NESTED_STRUCT";
 
-/// Scenario: A Delta table spanning varied types returns the expected Exasol
-/// types and values.
-///
-/// `stats_all_types` carries one active Parquet file of 4 rows across its 15
-/// mappable columns. `BYTE_COL`/`SHORT_COL` are checked by their real logged
-/// values (not merely "present") to prove `byte`/`short` are not silently
-/// NULLed by a missing mapping; `ARRAY_COL`'s strict-JSON rendering matches the
-/// scan-level expression-adapter cast proven in `raw_scan_tests`. `NESTED_STRUCT`
-/// is the nested column-mapping fixture: its physical inner names are
-/// `col-7f2f94cf-...`/`col-26fcfd6b-...`/`col-92dcf16d-...`, so a rendering keyed
-/// by those physical names — rather than the logical `inner_int`/`inner_string`/
-/// `inner_double` — would be immediately visible here.
+/// Scenario: a Delta table spanning varied types returns the expected Exasol types and values
 #[test]
 fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     setup();
@@ -1448,17 +1208,7 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     );
 }
 
-/// Scenario: A Delta timestamp column's declared Exasol type is asserted
-/// exactly at the engine's precision.
-///
-/// The prefix-tolerant `assert_col_type` checks above only confirm each
-/// column starts with `TIMESTAMP`; they pass identically whether the engine
-/// declares `TIMESTAMP(3)` or `TIMESTAMP(6)`. This test asserts the exact
-/// declared `COLUMN_TYPE` — read from the same `expected_timestamp_precision`
-/// oracle task 5 and task 8 use — for the same three Delta timestamp columns:
-/// `STATS_ALL_TYPES.TIMESTAMP_COL`, `STATS_ALL_TYPES.TIMESTAMP_NTZ_COL`, and
-/// `TYPE_WIDENING.DATE_TIMESTAMP_NTZ`. The declared value is whitespace-stripped
-/// before comparison, matching `e2e_timestamp_precision_test::declared_type`.
+/// Scenario: Delta timestamp columns declare exactly the engine-gated precision
 #[test]
 fn unity_delta_timestamp_columns_declare_the_exact_gated_precision() {
     setup();
@@ -1494,19 +1244,7 @@ fn unity_delta_timestamp_columns_declare_the_exact_gated_precision() {
     );
 }
 
-/// Scenario: A Delta column this engine cannot render refuses only the queries
-/// that name it.
-///
-/// `stats_all_types` carries exactly one refused column — `binary_col` (issue
-/// #351). `map_col` and `nested_struct` were refused per column (issue #350)
-/// before this delta; they are now rendered as JSON `VARCHAR(2000000)` per
-/// `datafusion-scan/nested-json-rendering`, so this scenario also proves they
-/// query successfully and appear in no refusal. A projection naming
-/// `binary_col`, a `SELECT *` (which widens to the full base row), and a WHERE
-/// clause referencing it all refuse; the 15-column mappable projection from
-/// `unity_delta_varied_types_return_their_expected_exasol_types_and_values`
-/// still succeeds afterward on the SAME connection, proving the refusal is
-/// per-request rather than session-poisoning.
+/// Scenario: a Delta column this engine cannot render refuses only the queries naming it (#351)
 #[test]
 fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
     setup();

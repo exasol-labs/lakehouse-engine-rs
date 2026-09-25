@@ -5,8 +5,6 @@ use super::super::validate_agg_col_types;
 use super::*;
 use crate::scan::spec::AggKind;
 
-/// Extract the [`AggregatePlan`] from an ordinary-aggregate item, panicking on a
-/// `COUNT(DISTINCT)` item — the detection tests assert the ordinary shape.
 fn agg_of(item: &SingleGroupItem) -> &AggregatePlan {
     match item {
         SingleGroupItem::Aggregate(plan) => plan,
@@ -16,7 +14,6 @@ fn agg_of(item: &SingleGroupItem) -> &AggregatePlan {
     }
 }
 
-/// Extract the [`DistinctCount`] from a `COUNT(DISTINCT)` item.
 fn distinct_of(item: &SingleGroupItem) -> &DistinctCount {
     match item {
         SingleGroupItem::Distinct(dc) => dc,
@@ -26,7 +23,6 @@ fn distinct_of(item: &SingleGroupItem) -> &DistinctCount {
     }
 }
 
-/// `LENGTH(<col>)` scalar-expression node — renders to `character_length("<COL>")`.
 fn length_expr(col: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
@@ -35,9 +31,7 @@ fn length_expr(col: &str) -> serde_json::Value {
     })
 }
 
-/// `<a> * <b>` two-column product node, as Exasol pushes it once `FN_MULT` is
-/// advertised (node name `MULT`; see decision-log entry [7]). Renders to
-/// `("<A>" * "<B>")` via the vs-expression translator.
+/// Exasol's `MULT` node, pushed once `FN_MULT` is advertised (decision-log [7]).
 fn mult_expr(a: &str, b: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
@@ -49,8 +43,6 @@ fn mult_expr(a: &str, b: &str) -> serde_json::Value {
     })
 }
 
-/// `ROUND(<inner>, <digits>)` scalar node, as Exasol pushes it once `FN_ROUND`
-/// is advertised.
 fn round_expr(inner: serde_json::Value, digits: i64) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
@@ -59,7 +51,6 @@ fn round_expr(inner: serde_json::Value, digits: i64) -> serde_json::Value {
     })
 }
 
-/// `<a> / <b>` division node.
 fn float_div(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
@@ -68,19 +59,13 @@ fn float_div(a: serde_json::Value, b: serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// A `DECIMAL(p,s)` `selectListDataTypes` entry.
 fn decimal_type(precision: u32, scale: u32) -> serde_json::Value {
     serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
 }
 
-/// Scenario (`pushdown-planning-single-group-agg-scalar-over-aggregate`): an
-/// ungrouped select item that wraps aggregates in scalar/arithmetic structure is
-/// classified as a single-group item instead of declining the whole detection —
-/// while every shape the decomposition cannot express still declines, so the
-/// projection guard routes it to the qualified wrapper.
+/// Scenario: a single-group scalar-over-aggregate item is accepted while undecomposable shapes still decline
 #[test]
 fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecomposable() {
-    // Issue #194's shape: ROUND(SUM(L_QUANTITY), 2).
     let req = serde_json::json!({
         "selectList": [round_expr(agg_item("SUM", Some("L_QUANTITY"), false), 2)],
         "selectListDataTypes": [decimal_type(36, 2)],
@@ -92,8 +77,6 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         "a scalar-over-aggregate is not a distinct fan-out"
     );
 
-    // Issue #188's shape: a scalar-wrapped statistical aggregate resolves through
-    // the shared AggKind tables, so no aggregate name reaches DataFusion.
     let variance_req = serde_json::json!({
         "selectList": [round_expr(agg_item("VARIANCE", Some("C_ACCTBAL"), false), 4)],
         "selectListDataTypes": [decimal_type(36, 4)],
@@ -103,8 +86,6 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         "ROUND(VARIANCE(col), 4) must decompose rather than reach DataFusion by name"
     );
 
-    // An interleaved list of a bare aggregate and a scalar-over-aggregate keeps
-    // one resolved item per select-list item, in order.
     let interleaved = serde_json::json!({
         "selectList": [
             agg_item("SUM", Some("L_QUANTITY"), false),
@@ -125,7 +106,6 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         2
     );
 
-    // A DISTINCT inner aggregate is not decomposable: the WHOLE detection declines.
     let distinct_req = serde_json::json!({
         "selectList": [round_expr(agg_item("COUNT", Some("L_ORDERKEY"), true), 2)],
         "selectListDataTypes": [decimal_type(18, 0)],
@@ -135,7 +115,6 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         "ROUND(COUNT(DISTINCT col), 2) must decline the whole detection"
     );
 
-    // An unsupported inner aggregate declines.
     let median_req = serde_json::json!({
         "selectList": [round_expr(agg_item("MEDIAN", Some("L_QUANTITY"), false), 2)],
         "selectListDataTypes": [decimal_type(36, 2)],
@@ -145,8 +124,6 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         "ROUND(MEDIAN(col), 2) must decline the whole detection"
     );
 
-    // A bare source column OUTSIDE the aggregate cannot be referenced by the
-    // outer merge wrapper (which exposes only PARTIAL_* columns) → decline.
     let residual_req = serde_json::json!({
         "selectList": [serde_json::json!({
             "type": "function_scalar",
@@ -163,8 +140,6 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
         "a residual bare column must decline the whole detection"
     );
 
-    // A scalar item with NO nested aggregate is not a scalar-over-aggregate — the
-    // pre-existing decline for a plain scalar projection is unchanged.
     let scalar_only = serde_json::json!({
         "selectList": [length_expr("L_COMMENT")],
         "selectListDataTypes": [decimal_type(18, 0)],
@@ -175,10 +150,7 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
     );
 }
 
-/// Scenario (`pushdown-planning-single-group-agg-scalar-over-aggregate`): a
-/// scalar-over-aggregate item carries its OWN select-list ordinal and its OWN
-/// declared type, so an interleaved list can be reassembled in `selectList` order
-/// with per-item output casts.
+/// Scenario: a scalar-over-aggregate item carries its own select-list ordinal and declared type
 #[test]
 fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types() {
     let req = serde_json::json!({
@@ -212,14 +184,10 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
     );
     assert_eq!(agg_of(&items[2]).kind, AggKind::Count);
 
-    // Only two partial columns: the nested SUM and COUNT dedup against the bare
-    // items at ordinals 0 and 2.
     assert_eq!(ordinary_plans(&items).len(), 2);
 }
 
-/// A scalar-over-aggregate item whose ordinal has no `selectListDataTypes` entry
-/// falls back to the same `VARCHAR(2000000)` default the grouped planner uses —
-/// the sentinel `cast_to_declared_type` reads as "no cast".
+/// Scenario: a scalar-over-aggregate item without a declared type defaults to VARCHAR(2000000)
 #[test]
 fn single_group_scalar_over_aggregate_defaults_declared_type_when_absent() {
     let req = serde_json::json!({
@@ -233,12 +201,7 @@ fn single_group_scalar_over_aggregate_defaults_declared_type_when_absent() {
     ));
 }
 
-/// Scenario (`pushdown-planning-single-group-agg-scalar-over-aggregate`): inner
-/// aggregates shared across the select list collapse into ONE partial column.
-/// Dedup is a correctness requirement, not an optimization: the merge rewrite
-/// resolves each nested aggregate to the FIRST structurally-equal slot, so an
-/// un-deduplicated `[Count, Sum, Count]` would bind the nested `COUNT(*)` to slot
-/// 0 while its `EMITS` column was declared at slot 2 (decision-log [6]).
+/// Scenario: inner aggregates shared across the select list collapse into one partial column
 #[test]
 fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
     let req = serde_json::json!({
@@ -274,8 +237,7 @@ fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
     assert_eq!(plans[1].column.as_deref(), Some("L_QUANTITY"));
 }
 
-/// The nested aggregates of a lone scalar-over-aggregate item are folded in
-/// encounter order, so the item contributes every partial column it needs.
+/// Scenario: a lone scalar-over-aggregate item folds its nested plans in encounter order
 #[test]
 fn single_group_scalar_over_aggregate_folds_nested_plans_in_encounter_order() {
     let req = serde_json::json!({
@@ -295,9 +257,7 @@ fn single_group_scalar_over_aggregate_folds_nested_plans_in_encounter_order() {
     assert_eq!(plans[1].kind, AggKind::Count);
 }
 
-/// Regression: widening `ordinary_plans` into a folding walk leaves every select
-/// list WITHOUT a nested aggregate folding exactly as before — one plan per
-/// ordinary aggregate item, in select-list order.
+/// Scenario: select lists without nested aggregates fold one plan per ordinary aggregate item
 #[test]
 fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
     let req = serde_json::json!({
@@ -315,7 +275,7 @@ fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
     assert_eq!(plans[2].kind, AggKind::Min);
 }
 
-/// COUNT(*) translates to Count with column=None.
+/// Scenario: COUNT(*) translates to Count with no column
 #[test]
 fn detect_count_star_produces_count_no_column() {
     let req = serde_json::json!({
@@ -327,7 +287,7 @@ fn detect_count_star_produces_count_no_column() {
     assert!(agg_of(&plans[0]).column.is_none());
 }
 
-/// COUNT(col) translates to CountCol with the column name.
+/// Scenario: COUNT(col) translates to CountCol with the column name
 #[test]
 fn detect_count_col_produces_count_col() {
     let req = serde_json::json!({
@@ -338,7 +298,7 @@ fn detect_count_col_produces_count_col() {
     assert_eq!(agg_of(&plans[0]).column.as_deref(), Some("AMOUNT"));
 }
 
-/// SUM/MIN/MAX/AVG each translate to the right kind + column.
+/// Scenario: SUM/MIN/MAX/AVG each translate to the right kind and column
 #[test]
 fn detect_sum_min_max_avg_produce_correct_plans() {
     let req = serde_json::json!({
@@ -360,7 +320,7 @@ fn detect_sum_min_max_avg_produce_correct_plans() {
     assert_eq!(agg_of(&plans[3]).column.as_deref(), Some("SCORE"));
 }
 
-/// GROUP BY present and non-empty => fall back (None).
+/// Scenario: a non-empty GROUP BY falls back
 #[test]
 fn detect_aggregates_falls_back_on_group_by() {
     let req = serde_json::json!({
@@ -373,9 +333,7 @@ fn detect_aggregates_falls_back_on_group_by() {
     );
 }
 
-/// A non-COUNT DISTINCT aggregate (e.g. SUM DISTINCT) => fall back.
-/// (Single-group COUNT(DISTINCT) is now decomposed — see
-/// `count_distinct_builds_distinct_row_scan_spec`.)
+/// Scenario: a non-COUNT DISTINCT aggregate falls back
 #[test]
 fn detect_aggregates_falls_back_on_distinct() {
     let req = serde_json::json!({
@@ -387,8 +345,7 @@ fn detect_aggregates_falls_back_on_distinct() {
     );
 }
 
-/// Unsupported aggregate function (e.g., MEDIAN) => fall back to row scan.
-/// Note: STDDEV is a supported decomposable aggregate via sufficient-statistics.
+/// Scenario: an unsupported aggregate function falls back to a row scan
 #[test]
 fn detect_aggregates_falls_back_on_unsupported_function() {
     let req = serde_json::json!({
@@ -403,7 +360,7 @@ fn detect_aggregates_falls_back_on_unsupported_function() {
     );
 }
 
-/// Non-aggregate select item (e.g., plain column) => fall back.
+/// Scenario: a plain column select item falls back
 #[test]
 fn detect_aggregates_falls_back_on_column_select() {
     let req = serde_json::json!({
@@ -417,16 +374,14 @@ fn detect_aggregates_falls_back_on_column_select() {
     );
 }
 
-/// Empty select list => None.
+/// Scenario: an empty select list yields None
 #[test]
 fn detect_aggregates_returns_none_for_empty_select_list() {
     let req = serde_json::json!({ "selectList": [] });
     assert!(detect_aggregates(&req).is_none());
 }
 
-/// Scenario (bare-column regression): COUNT(*), COUNT(col), SUM/MIN/MAX/AVG(col)
-/// and the STDDEV family keep the bare-column fast path — `column` populated,
-/// `arg_expr` None — so the pre-existing decomposition is byte-for-byte unchanged.
+/// Scenario: bare-column aggregates keep the fast path with no arg_expr
 #[test]
 fn bare_column_aggregates_unchanged_regression() {
     let req = serde_json::json!({
@@ -441,7 +396,6 @@ fn bare_column_aggregates_unchanged_regression() {
         ]
     });
     let plans = detect_aggregates(&req).expect("bare-column aggregates must decompose");
-    // Every plan takes the fast path: no rendered expression argument.
     assert!(
         plans.iter().all(|p| agg_of(p).arg_expr.is_none()),
         "bare-column aggregates must never populate arg_expr: {plans:?}"
@@ -455,9 +409,6 @@ fn bare_column_aggregates_unchanged_regression() {
     assert_eq!(agg_of(&plans[5]).kind, AggKind::Avg);
     assert_eq!(agg_of(&plans[6]).kind, AggKind::StddevSamp);
 
-    // The partial EMITS clause is identical to the pre-change output: bare-column
-    // SUM over DECIMAL widens to DECIMAL(36,s) from the COLUMN type (aggregate_types
-    // is ignored for bare columns), independent of any declared aggregate type.
     let col_types = vec![
         ("AMOUNT".to_string(), "DECIMAL(20,0)".to_string()),
         ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
@@ -468,19 +419,13 @@ fn bare_column_aggregates_unchanged_regression() {
         column: Some("AMOUNT".into()),
         arg_expr: None,
     }];
-    // A misleading declared type must NOT override the bare-column source type.
     let emits = partial_emits_items(&sum_only, &col_types, &["VARCHAR(2000000)".to_string()]);
     assert_eq!(emits, vec![r#""PARTIAL_sum_0" DECIMAL(36,0)"#.to_string()]);
 }
 
-/// Scenario: a renderable scalar-expression argument is carried in `arg_expr`
-/// (not `column`), and the partial/merge column TYPE is derived from the
-/// aggregate item's declared type — SUM(expr)::DECIMAL widens to DECIMAL(36,s),
-/// SUM(expr)::DOUBLE stays DOUBLE, MIN/MAX(expr) take the declared type verbatim,
-/// and COUNT(expr) stays DECIMAL(20,0).
+/// Scenario: an expression argument goes in arg_expr and partial types derive from the declared type
 #[test]
 fn expression_arg_partial_and_merge_types_from_declared_type() {
-    // Detection: SUM(LENGTH(L_COMMENT)) renders the argument into arg_expr.
     let req = serde_json::json!({
         "selectList": [agg_item_expr("SUM", length_expr("L_COMMENT"), false)]
     });
@@ -496,8 +441,7 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
         "the rendered DataFusion fragment must be carried in arg_expr"
     );
 
-    // Typing: no source column exists, so the type comes from the declared type.
-    // There is deliberately NO matching entry in col_types.
+    // Deliberately no matching entry in col_types: the type must come from the declared type.
     let col_types: Vec<(String, String)> = vec![];
 
     let sum_expr = vec![AggregatePlan {
@@ -505,17 +449,14 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
         column: None,
         arg_expr: Some(r#"character_length("L_COMMENT")"#.into()),
     }];
-    // SUM(expr) declared DECIMAL(38,4) → partial widens to DECIMAL(36,4).
     let emits = partial_emits_items(&sum_expr, &col_types, &["DECIMAL(38,4)".to_string()]);
     assert_eq!(emits, vec![r#""PARTIAL_sum_0" DECIMAL(36,4)"#.to_string()]);
-    // SUM(expr) declared DOUBLE → partial stays DOUBLE PRECISION.
     let emits = partial_emits_items(&sum_expr, &col_types, &["DOUBLE PRECISION".to_string()]);
     assert_eq!(
         emits,
         vec![r#""PARTIAL_sum_0" DOUBLE PRECISION"#.to_string()]
     );
 
-    // MIN(expr) takes the declared type verbatim.
     let min_expr = vec![AggregatePlan {
         kind: AggKind::Min,
         column: None,
@@ -524,7 +465,6 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
     let emits = partial_emits_items(&min_expr, &col_types, &["DATE".to_string()]);
     assert_eq!(emits, vec![r#""PARTIAL_min_0" DATE"#.to_string()]);
 
-    // COUNT(expr) is a plain count → DECIMAL(20,0), declared type irrelevant.
     let count_expr = vec![AggregatePlan {
         kind: AggKind::CountCol,
         column: None,
@@ -536,27 +476,15 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
         vec![r#""PARTIAL_count_0" DECIMAL(20,0)"#.to_string()]
     );
 
-    // An expression SUM/MIN/MAX validates (its declared type is numeric in
-    // practice; the missing column resolves to the numeric DOUBLE fallback).
     assert!(
         validate_agg_col_types(&sum_expr, &col_types),
         "expression-argument SUM must pass validation, not force a row scan"
     );
 }
 
-/// Scenario (NQ1 / TPC-H Q6 shape): `SUM(L_EXTENDEDPRICE * L_DISCOUNT)` over two
-/// DECIMAL(15,2) columns. Exasol declares the SUM result as DECIMAL(36,4) (it
-/// widens the DECIMAL(30,4) product's precision to its max 36, holding the
-/// natural scale 4 — verified live, decision-log entry [7]). The partial column
-/// must be sized from that declared type — NOT recomputed from the operands'
-/// own DECIMAL(15,2) types — so it widens to DECIMAL(36,4), and the merge casts
-/// to the same declared DECIMAL(36,4). This exercises the DECIMAL-with-nonzero-
-/// scale declared-type path for a two-column product argument.
+/// Scenario: SUM of a DECIMAL(15,2) product is sized from its declared DECIMAL(36,4), not the operands
 #[test]
 fn decimal_product_sum_partial_widens_to_decimal_36() {
-    // Detection: SUM(L_EXTENDEDPRICE * L_DISCOUNT) carries the product in
-    // arg_expr (no bare source column) — proving the aggregate is decomposed,
-    // not declined into a raw two-column row scan.
     let req = serde_json::json!({
         "selectList": [
             agg_item_expr("SUM", mult_expr("L_EXTENDEDPRICE", "L_DISCOUNT"), false)
@@ -577,10 +505,7 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
         "the rendered product must be carried in arg_expr"
     );
 
-    // Typing is driven purely by Exasol's declared result type; there is
-    // deliberately NO operand column in col_types (the product has none), so a
-    // type recomputed from operands would have to reimplement Exasol's widening
-    // rules. The declared DECIMAL(36,4) is authoritative and read verbatim.
+    // No operand column in col_types: the declared type is authoritative.
     let col_types: Vec<(String, String)> = vec![];
     let declared = ["DECIMAL(36,4)".to_string()];
 
@@ -591,8 +516,6 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
         "partial SUM column must widen to the declared DECIMAL(36,4)"
     );
 
-    // The merge wrapper casts the summed partial back to the declared type so
-    // it matches Exasol's positional selectListDataTypes validation.
     let merge = cast_merge_items(&plans, &declared);
     assert_eq!(
         merge,
@@ -600,14 +523,10 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
         "merge must cast the summed partial to the declared DECIMAL(36,4)"
     );
 
-    // The expression-argument SUM validates (no operand column → numeric
-    // DOUBLE fallback), so it is never forced into a row scan.
     assert!(validate_agg_col_types(&plans, &col_types));
 }
 
-/// Scenario: an aggregate whose argument the VS translator cannot render
-/// declines the whole aggregate pushdown (row-scan fallback), rather than
-/// emitting a plan referencing an argument it could not render soundly.
+/// Scenario: an unrenderable aggregate argument declines the whole aggregate pushdown
 #[test]
 fn unrenderable_agg_arg_falls_back_to_row_scan() {
     let unknown = serde_json::json!({
@@ -624,7 +543,6 @@ fn unrenderable_agg_arg_falls_back_to_row_scan() {
             "{name} over an unrenderable argument must fall back to row scan"
         );
     }
-    // A distinct COUNT over an unrenderable argument also falls back.
     let req = serde_json::json!({
         "selectList": [agg_item_expr("COUNT", unknown.clone(), true)]
     });
@@ -634,14 +552,9 @@ fn unrenderable_agg_arg_falls_back_to_row_scan() {
     );
 }
 
-/// Scenario: single-group COUNT(DISTINCT col) is decomposed into a DISTINCT
-/// row-scan fan-out descriptor ([`SingleGroupItem::Distinct`], bare column
-/// populated); COUNT(DISTINCT expr) carries the rendered argument; and neither
-/// contributes an ordinary aggregate plan (so no partial-aggregate column is
-/// emitted for it — the count is a native `COUNT(DISTINCT "V")` over the fan-out).
+/// Scenario: single-group COUNT(DISTINCT) becomes a DISTINCT row-scan descriptor, not an ordinary plan
 #[test]
 fn count_distinct_builds_distinct_row_scan_spec() {
-    // COUNT(DISTINCT L_SHIPMODE) — bare column fast path.
     let req = serde_json::json!({
         "selectList": [agg_item("COUNT", Some("L_SHIPMODE"), true)]
     });
@@ -651,13 +564,11 @@ fn count_distinct_builds_distinct_row_scan_spec() {
     let dc = distinct_of(&items[0]);
     assert_eq!(dc.column.as_deref(), Some("L_SHIPMODE"));
     assert!(dc.arg_expr.is_none());
-    // A distinct item is NOT an ordinary aggregate: it drives no partial column.
     assert!(
         ordinary_plans(&items).is_empty(),
         "a COUNT(DISTINCT) item must not appear among the ordinary aggregate plans"
     );
 
-    // COUNT(DISTINCT LENGTH(col)) — rendered expression argument.
     let req_expr = serde_json::json!({
         "selectList": [agg_item_expr("COUNT", length_expr("L_COMMENT"), true)]
     });
@@ -670,15 +581,9 @@ fn count_distinct_builds_distinct_row_scan_spec() {
     );
 }
 
-/// Scenario (task 6.5): single-group `COUNT(DISTINCT)` detection fans out ONLY a
-/// lone distinct (Case 1 — `is_lone_count_distinct` true), and declines every
-/// multi-distinct or distinct-plus-ordinary-aggregate shape (Case 2/3 —
-/// `is_lone_count_distinct` false while `has_distinct` stays true), which is the
-/// dispatch condition the `mod.rs` Case 2/3 guard uses to route the request to the
-/// qualified single-table wrapper instead of the fan-out.
+/// Scenario: only a lone COUNT(DISTINCT) fans out; multi or mixed distinct shapes decline
 #[test]
 fn multi_count_distinct_declines_to_qualified_wrapper() {
-    // Case 1: exactly one COUNT(DISTINCT), nothing else → fans out.
     let lone = serde_json::json!({
         "selectList": [agg_item("COUNT", Some("CATEGORY"), true)],
     });
@@ -688,7 +593,6 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         "a lone COUNT(DISTINCT) is the only shape that fans out (Case 1)"
     );
 
-    // Case 2: more than one COUNT(DISTINCT) → declines the fan-out.
     let multi = serde_json::json!({
         "selectList": [
             agg_item("COUNT", Some("CATEGORY"), true),
@@ -701,7 +605,6 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
         "more than one COUNT(DISTINCT) must decline the fan-out (Case 2)"
     );
 
-    // Case 3: a COUNT(DISTINCT) mixed with an ordinary aggregate → declines.
     let mixed = serde_json::json!({
         "selectList": [
             agg_item("COUNT", Some("CATEGORY"), true),
@@ -715,24 +618,9 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     );
 }
 
-/// Scenario (PR #163 review finding, task 1.4): a LONE
-/// `COUNT(DISTINCT <expression>)` (e.g. `COUNT(DISTINCT LENGTH(name))`, nothing
-/// else in the select list) must NOT take the per-shard fan-out. After narrowing
-/// `is_lone_count_distinct` to bare-column arguments, an expression argument makes
-/// `is_lone_count_distinct` false while `has_distinct` stays true — which is the
-/// EXACT dispatch condition (`has_distinct && !is_lone_count_distinct`) the `mod.rs`
-/// Case 2/3 guard uses to decline the fan-out and route to the qualified
-/// single-table wrapper, where Exasol evaluates the expression and DISTINCT natively
-/// over exact-typed base columns (no `arrow::compute::cast(.., Utf8)` injectivity
-/// dependency, which could silently undercount). A lone BARE-COLUMN distinct is
-/// unaffected — it still fans out (Case 1).
-///
-/// This is the direct regression test for the dispatch narrowing: before it, a lone
-/// expression distinct wrongly matched "lone" and fanned out with a VARCHAR-typed
-/// `"V"`; it must now route exactly like a genuine multi-distinct/mixed Case 2/3.
+/// Scenario: a lone COUNT(DISTINCT <expression>) declines the fan-out to the qualified wrapper
 #[test]
 fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
-    // Lone COUNT(DISTINCT LENGTH(NAME)) — a single expression-argument distinct.
     let expr = serde_json::json!({
         "selectList": [agg_item_expr("COUNT", length_expr("NAME"), true)],
     });
@@ -757,7 +645,6 @@ fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
          VARCHAR-typed \"V\")"
     );
 
-    // Contrast: a lone BARE-COLUMN COUNT(DISTINCT) IS a lone distinct — still fans out.
     let bare = serde_json::json!({
         "selectList": [agg_item("COUNT", Some("NAME"), true)],
     });
@@ -769,8 +656,7 @@ fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
     );
 }
 
-/// MEDIAN, *_DISTINCT, APPROX_COUNT_DISTINCT, LISTAGG, GROUP_CONCAT all cause
-/// parse_agg_item / detect_aggregates to return None (row-scan fallback).
+/// Scenario: non-decomposable aggregates fall back to a row scan
 #[test]
 fn non_decomposable_aggregate_falls_back_to_row_scan() {
     for name in &[
@@ -787,9 +673,6 @@ fn non_decomposable_aggregate_falls_back_to_row_scan() {
             "{name} must fall back to row scan"
         );
     }
-    // A non-COUNT DISTINCT (SUM DISTINCT) is not decomposable — falls back.
-    // (Single-group COUNT(DISTINCT) IS decomposed; see
-    // `count_distinct_builds_distinct_row_scan_spec`.)
     let req_distinct = serde_json::json!({
         "selectList": [agg_item("SUM", Some("AMOUNT"), true)],
     });
@@ -799,7 +682,7 @@ fn non_decomposable_aggregate_falls_back_to_row_scan() {
     );
 }
 
-/// parse_agg_item returns a stat plan for STDDEV/VARIANCE family names.
+/// Scenario: parse_agg_item returns a stat plan for STDDEV/VARIANCE family names
 #[test]
 fn parse_agg_item_recognises_stat_functions() {
     for (name, expected_kind) in &[
@@ -822,17 +705,7 @@ fn parse_agg_item_recognises_stat_functions() {
     }
 }
 
-/// A statistical aggregate whose first argument is not a bare `column` node
-/// declines, so the whole single-group select list declines and Exasol computes
-/// the statistic natively over the Tier 3 row scan.
-///
-/// Before this decline such an item parsed to a plan carrying NEITHER `column`
-/// nor `arg_expr`, passed type validation on the declared-type default, was
-/// given three `EMITS` columns, and then failed inside the scan on an argument
-/// naming no field. Measured 2026-07-31 against the Docker Exasol container:
-/// `SELECT STDDEV(score + id) FROM MY_LAKEHOUSE.EVENTS` is PUSHED by Exasol and
-/// fails with `sqlCode 22002`, `partial aggregate SQL error: Schema error: No
-/// field named .`
+/// Scenario: a statistical aggregate over an expression argument declines
 #[test]
 fn stat_aggregate_over_expression_argument_declines() {
     for arg in [length_expr("SCORE"), mult_expr("SCORE", "ID")] {
@@ -849,9 +722,7 @@ fn stat_aggregate_over_expression_argument_declines() {
     }
 }
 
-/// The bare-column form is untouched by the expression-argument decline:
-/// `STDDEV(SCORE)` still decomposes into the (cnt, sum, sum_sq) triple over the
-/// source column, with no rendered argument.
+/// Scenario: a statistical aggregate over a bare column still decomposes
 #[test]
 fn stat_aggregate_over_bare_column_still_parses() {
     let plan = parse_agg_item(&agg_item("STDDEV", Some("SCORE"), false))
@@ -978,11 +849,7 @@ fn single_group_plan_types_skips_distinct_items() {
     );
 }
 
-/// A plan slot reached ONLY through a nested scalar-over-aggregate is typed
-/// `DOUBLE PRECISION`, not `VARCHAR(2000000)`: `plan_types` also types the scan's
-/// `EMITS` clause, and an expression-argument MIN/MAX has no source column to fall
-/// back to — a character partial column would make the merge's `MIN(...)` a
-/// lexicographic minimum of a numeric expression.
+/// Scenario: a nested-only expression-argument MIN emits a numeric partial column
 #[test]
 fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
     let req = serde_json::json!({
@@ -1006,10 +873,7 @@ fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
     );
 }
 
-/// Scenario (`pushdown-planning-single-group-agg-scalar-over-aggregate`): issue
-/// #194's shape. The merge SELECT wraps the scalar structure around the MERGED
-/// partial column, so the query answers one merged row — never one unwrapped
-/// per-shard partial per shard.
+/// Scenario: the merge SELECT wraps the scalar structure around the merged partial (#194)
 #[test]
 fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
     let req = serde_json::json!({
@@ -1028,12 +892,7 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
     );
 }
 
-/// Scenario (`pushdown-planning-single-group-agg-scalar-over-aggregate`): an
-/// interleaved list keeps `selectList` order and casts each item to ITS OWN
-/// declared type — the bare aggregates to their plan slots' types, the scalar
-/// item to the type Exasol declared for the scalar item itself. Exasol validates
-/// the pushdown output columns positionally, so a transposed or mistyped item is
-/// a hard `04000`.
+/// Scenario: an interleaved merge SELECT keeps selectList order with per-item casts
 #[test]
 fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
     let req = serde_json::json!({
@@ -1065,8 +924,7 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
     );
 }
 
-/// A slot with no usable declared type emits the bare uncast merge expression —
-/// the same `VARCHAR(2000000)`-means-no-cast rule the grouped merge follows.
+/// Scenario: a slot without a usable declared type emits an uncast merge expression
 #[test]
 fn merge_select_leaves_items_uncast_without_a_declared_type() {
     let req = serde_json::json!({
@@ -1088,11 +946,7 @@ fn merge_select_leaves_items_uncast_without_a_declared_type() {
     );
 }
 
-/// A `COUNT(DISTINCT)` item has no merge expression at all — it is served by its
-/// own DISTINCT row-scan fan-out. Assembling a merge SELECT over a list holding
-/// one must DECLINE, not silently emit a shorter select list: a dropped column
-/// is a positional `04000` at best and a wrong answer at worst. The dispatcher
-/// routes such a list to the qualified wrapper before reaching here.
+/// Scenario: a merge SELECT over a list holding a COUNT(DISTINCT) declines
 #[test]
 fn merge_select_declines_a_list_holding_a_distinct_item() {
     let req = serde_json::json!({
@@ -1113,14 +967,7 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
     );
 }
 
-/// A scalar structure the Exasol-dialect renderer cannot render (an unsupported
-/// CAST target, here) carries no merge expression, so the merge assembly must
-/// DECLINE — the reachability boundary the dispatcher's `else` arm in `mod.rs`
-/// routes to the qualified wrapper. No current node type actually reaches this
-/// path through `detect_aggregates` (an unrenderable structure declines at
-/// `classify_scalar_over_aggregate` time, before a `ScalarOverAggregate` item is
-/// ever produced), so this constructs the item directly to pin the function's own
-/// contract at this boundary.
+/// Scenario: a merge SELECT declines when the scalar structure fails to render
 #[test]
 fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
     let node = serde_json::json!({
@@ -1143,10 +990,7 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
     );
 }
 
-/// A literal duplicate bare aggregate collapses to ONE partial slot, yet the merge
-/// SELECT still carries ONE item per select-list item: Exasol validates the
-/// returned column count positionally against the select list it sent, so a
-/// deduplicated merge would be an arity mismatch, not an optimization (#190).
+/// Scenario: duplicate bare aggregates share one slot but keep one merge item each (#190)
 #[test]
 fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
     let req = serde_json::json!({

@@ -9,14 +9,7 @@ use super::super::{detect_aggregates, ordinary_plans, validate_agg_col_types};
 use super::*;
 use crate::scan::spec::{CommonScanSpec, FileEntry, ScanSpec, ScanStorage};
 
-// -----------------------------------------------------------------------
-// Ordered top-N pushdown (B3)
-// -----------------------------------------------------------------------
-
-/// Reproduce `handle_pushdown`'s SYNCHRONOUS row-scan decision path (everything
-/// after resolution) so tests exercise the real `detect_topn`,
-/// `effective_limit` withholding glue, and `build_scan_driving_sql` — the exact
-/// composition production runs, minus the network file resolution.
+/// Mirrors `handle_pushdown`'s synchronous post-resolution row-scan path.
 fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize) -> String {
     let pushdown_req = request
         .get("pushdownRequest")
@@ -27,11 +20,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     let limit = extract_limit(&pushdown_req);
     let has_order_by = order_by_present(&pushdown_req);
     let col_types = extract_all_column_types(request);
-    // Production classifies the WHERE filter ONCE through `classify_where_filter`
-    // and routes a DECLINED one to the qualified single-table wrapper AHEAD of the
-    // routing classifier. This mirror reproduces the classification but covers only
-    // the no-decline half of it — the shape whose scan spec carries the filter — so
-    // a declining fixture belongs on `build_dispatch_sql`, which owns that route.
+    // Covers only the no-decline half; a declining fixture belongs on `build_dispatch_sql`.
     let (filter, declined_filter) = classify_where_filter(
         pushdown_req.get("filter").filter(|f| !f.is_null()),
         &col_types,
@@ -43,8 +32,6 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
 
     let items = detect_aggregates(&pushdown_req)
         .filter(|it| validate_agg_col_types(&ordinary_plans(it), &col_types));
-    // Mirrors the dispatcher's single-group aggregate inputs: the folded plans, their
-    // per-plan declared `EMITS` types, and the caller-owned merge SELECT.
     let merge_inputs = items.as_deref().map(|it| {
         let plans = ordinary_plans(it);
         let plan_types = single_group_plan_types(&pushdown_req, it);
@@ -54,17 +41,12 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
             .expect("one merge item per select-list item is never empty")
     });
     let aggregates = items.map(|it| ordinary_plans(&it));
-    // Production routes a widened projection to the qualified single-table
-    // wrapper ONLY from the `RequestShape::RowScan` arm (`mod.rs`'s
-    // `if projection_widened` sits inside it). An aggregate select list ALWAYS
-    // widens — `project_columns` keeps aggregates off the projection — and never
-    // reaches that guard, so the mirror must accept it on the aggregate path.
+    // An aggregate select list always widens (aggregates stay off the projection), and
+    // production guards widening only on the `RowScan` arm.
     assert!(
         !widened || aggregates.is_some(),
         "plan_scan_sql mirrors only the non-widened dispatch path; a widened row-scan fixture needs build_dispatch_sql, not this helper"
     );
-    // Production always resolves a logical schema before detect_topn; reproduce
-    // the LINEITEM schema every plan_scan_sql caller's request scans over.
     let logical_schema = lineitem_logical_schema();
     let topn = if aggregates.is_none() {
         detect_topn(request, &pushdown_req, &proj_cols, &logical_schema)
@@ -78,19 +60,14 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         limit
     };
 
-    // Row-scan DECLINE path via the SHARED helpers the dispatcher calls, so this
-    // mirror cannot drift from the real wrapping shape. Position is load-bearing on
-    // both sides, exactly as in `build_dispatch_sql`: AFTER `detect_topn` (which
-    // must see the pre-extension projection) and BEFORE the `spec_template` below
-    // (whose `projection` must carry the appended hidden column that the EMITS
-    // clause is built from).
+    // Position is load-bearing, as in `build_dispatch_sql`: after `detect_topn` (which
+    // must see the pre-extension projection), before `spec_template` (whose projection
+    // must carry the hidden column).
     let visible_count = proj_cols.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let keys = parse_order_by_keys(&pushdown_req);
-        // Mirrors the dispatcher's correctness-safety guard at the same position
-        // (#198). Every fixture routed through this helper renders in full; a
-        // declining one belongs on `build_dispatch_sql`, which returns the error.
+        // Mirrors the dispatcher's guard (#198); a declining fixture belongs on `build_dispatch_sql`.
         ensure_every_sort_key_renders(&keys)
             .expect("plan_scan_sql mirrors only fixtures whose pushed ORDER BY renders in full");
         extend_projection_with_sort_keys(&mut proj_cols, &mut proj_types, &keys, &col_types);
@@ -139,9 +116,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
     }
 }
 
-/// The logical schema production resolves for the NQ4 (LINEITEM) requests: both
-/// sort-eligible columns are in-range DECIMALs, so neither needs the JSON
-/// fallback and `detect_topn` matches. Field-ids are illustrative.
+/// Both sort-eligible columns are in-range DECIMALs, so neither needs the JSON fallback.
 fn lineitem_logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
@@ -165,11 +140,7 @@ fn lineitem_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
-/// [`parse_sort_flags`] reads direction + NULL placement off ANY `orderBy`
-/// element, with no column-node requirement, so an expression sort key can reach
-/// the shared `render_ordered` seam. [`parse_sort_key_element`]'s bare-column gate
-/// is untouched by it — the same expression element still yields no [`SortKey`],
-/// which is what keeps [`detect_topn`] eligibility unchanged.
+/// Scenario: Sort flags parse off an expression `orderBy` element, which still yields no `SortKey`.
 #[test]
 fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
     let expression_element = serde_json::json!({
@@ -198,7 +169,6 @@ fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
     });
     assert_eq!(parse_sort_flags(&column_element), Some((true, false)));
 
-    // A missing flag is an unexpected shape on either side: no default is invented.
     for missing in ["isAscending", "nullsLast"] {
         let mut partial = expression_element.clone();
         partial.as_object_mut().unwrap().remove(missing);
@@ -210,10 +180,7 @@ fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
     }
 }
 
-/// Match: the ordered top-N wraps the fan-out in an outer `ORDER BY … LIMIT n`
-/// and carries the SAME sort keys + limit into the shard-invariant common blob
-/// (which the scan UDF renders as the per-shard bounded sort). Multi-shard so a
-/// real fan-out + merge is exercised.
+/// Scenario: A matched top-N sorts and limits both the outer merge and every shard's common blob.
 #[test]
 fn ordered_topn_emits_per_shard_and_outer_order_by() {
     let request = nq4_request();
@@ -221,16 +188,12 @@ fn ordered_topn_emits_per_shard_and_outer_order_by() {
         ("s3://w/part-0.parquet".to_string(), 1000u64),
         ("s3://w/part-1.parquet".to_string(), 1000u64),
     ];
-    // Two nodes → two shards → a genuine GROUP BY shard_key fan-out.
     let sql = plan_scan_sql(&request, files, 2);
 
-    // Outer merge ORDER BY, explicit direction + NULL placement, before LIMIT.
     assert!(
         sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST LIMIT 20"#),
         "matched top-N must render an outer ORDER BY … LIMIT: {sql}"
     );
-    // The per-shard common blob carries the identical sort keys AND the limit,
-    // so every shard runs the same bounded sort (rendered by the scan UDF).
     let common = common_arg_literal(&sql);
     assert!(
         common.contains(
@@ -244,11 +207,7 @@ fn ordered_topn_emits_per_shard_and_outer_order_by() {
     );
 }
 
-/// A NON-ZERO `limit.offset` DECLINES the bounded per-shard top-N, and the window
-/// is rendered ONCE — on the declined wrapper, beside the `ORDER BY` it renders
-/// itself: `ORDER BY … LIMIT n OFFSET m` (issue #191). A per-shard
-/// `LIMIT n OFFSET m` would skip each shard's OWN first m rows and does not
-/// compose, so the fan-out stays unbounded and unsorted.
+/// Scenario: A non-zero offset renders only on the wrapper, since a per-shard OFFSET does not compose (#191).
 #[test]
 fn nonzero_offset_declines_bounded_topn() {
     let mut request = nq4_request();
@@ -290,12 +249,7 @@ fn nonzero_offset_declines_bounded_topn() {
     );
 }
 
-/// `offset: 0` is the SAME request as an ABSENT `offset` key (Exasol normalises an
-/// explicit `OFFSET 0` away), so it must still MATCH the bounded top-N and yield
-/// byte-identical SQL: the guard is a non-zero test, not a presence test. A
-/// presence test behaves identically on today's Exasol but would silently decline
-/// every ordered LIMIT query cluster-wide on a future build that does attach
-/// `offset: 0`.
+/// Scenario: `offset: 0` matches the bounded top-N exactly like an absent `offset`.
 #[test]
 fn zero_offset_still_matches_bounded_topn_byte_identically() {
     let baseline = nq4_request();
@@ -341,21 +295,9 @@ fn zero_offset_still_matches_bounded_topn_byte_identically() {
     );
 }
 
-/// Decline (sort key not projected): `ORDER BY` is present but the sort column
-/// is not in the projection, so the bounded top-N declines. The PER-SHARD sort
-/// keys and LIMIT are still withheld from the common blob (anti-wrong-truncation
-/// invariant, decision [4]), but the OUTER wrapper renders a self-contained
-/// global `ORDER BY … LIMIT n` (add-topn-pushdown B6): once `ORDER_BY_COLUMN` is
-/// advertised Exasol no longer re-applies its own backstop sort/limit, so the
-/// adapter reproduces it in the returned SQL.
-///
-/// The unprojected sort key `L_EXTENDEDPRICE` is APPENDED to the scan as a HIDDEN
-/// column (issues #225 / #189) so that outer `ORDER BY` binds against a column the
-/// scan actually emits, while the wrapper's visible select list still names only
-/// `"L_ORDERKEY"` — the derived projection — keeping the returned arity at 1.
+/// Scenario: An unprojected sort key is hidden in the scan and sorted only by the wrapper (#225, #189).
 #[test]
 fn order_by_present_without_topn_match_withholds_per_shard_limit() {
-    // Project only L_ORDERKEY, but ORDER BY L_EXTENDEDPRICE (unprojected).
     let request = serde_json::json!({
         "involvedTables": [{
             "name": "LINEITEM",
@@ -381,7 +323,6 @@ fn order_by_present_without_topn_match_withholds_per_shard_limit() {
             "limit": {"numElements": 20}
         }
     });
-    // detect_topn declines the unprojected-key shape.
     assert!(
         detect_topn(
             &request,
@@ -399,14 +340,10 @@ fn order_by_present_without_topn_match_withholds_per_shard_limit() {
     ];
     let sql = plan_scan_sql(&request, files, 2);
 
-    // The OUTER wrapper renders a self-contained global ORDER BY + LIMIT
-    // (reproducing Exasol's former backstop, which no longer runs).
     assert!(
         sql.contains(r#"ORDER BY "L_EXTENDEDPRICE" DESC NULLS LAST LIMIT 20"#),
         "declined shape must render a self-contained outer ORDER BY … LIMIT: {sql}"
     );
-    // The wrapper's VISIBLE select list is the derived projection alone; the
-    // appended sort key is emitted by the scan but dropped from the result.
     assert!(
         sql.contains(r#"SELECT "L_ORDERKEY" FROM ("#),
         "wrapper must name only the derived projection, never SELECT *: {sql}"
@@ -421,8 +358,6 @@ fn order_by_present_without_topn_match_withholds_per_shard_limit() {
         "the scan must EMIT the appended hidden sort key: {}",
         emits_clause(&sql)
     );
-    // But the PER-SHARD common blob still carries NO sort keys and NO limit:
-    // the fan-out stays unbounded and unsorted (anti-wrong-truncation invariant).
     let common = common_arg_literal(&sql);
     assert!(
         !common.contains("\"limit\""),
@@ -434,10 +369,8 @@ fn order_by_present_without_topn_match_withholds_per_shard_limit() {
     );
 }
 
-/// A LINEITEM row-scan request whose `orderBy` is `order_by` — the shared fixture
-/// for the expression-sort-key cases. `select_list` names the VISIBLE columns; any
-/// column an `orderBy` expression references but the select list omits must reach
-/// the scan as an APPENDED HIDDEN column.
+/// Any column an `orderBy` expression references but `select_list` omits must reach
+/// the scan as a hidden column.
 fn lineitem_order_by_request(select_list: &[&str], order_by: Json, limit: Option<u64>) -> Json {
     let type_of = |name: &str| {
         if name == "L_ORDERKEY" {
@@ -470,7 +403,6 @@ fn lineitem_order_by_request(select_list: &[&str], order_by: Json, limit: Option
     })
 }
 
-/// One `orderBy` element over `expression`, with explicit direction + NULL placement.
 fn order_by_element(expression: Json, ascending: bool, nulls_last: bool) -> Json {
     serde_json::json!({
         "type": "order_by_element",
@@ -480,29 +412,13 @@ fn order_by_element(expression: Json, ascending: bool, nulls_last: bool) -> Json
     })
 }
 
-/// `ABS(<column>)` — the canonical expression sort key from issue #198's repro.
 fn abs_of(column: &str) -> Json {
     serde_json::json!({"type": "function_scalar", "name": "ABS", "arguments": [
         {"type": "column", "name": column, "tableName": "LINEITEM"}
     ]})
 }
 
-/// A declined `ORDER BY` on an EXPRESSION renders that expression in the Exasol
-/// dialect on the outer wrapper and emits the base columns it references as
-/// HIDDEN scan columns — the expression-key twin of the bare-column case above
-/// (issue #198).
-///
-/// The rendered name is Exasol's own `ABS`, not DataFusion's `abs`: this wrapper
-/// is parsed by Exasol's core engine, so the Exasol dialect reproduces the call
-/// Exasol sent (issue #209).
-///
-/// `("L_EXTENDEDPRICE" + "L_ORDERKEY")` renders identically in both dialects,
-/// because `ADD` is an operator wire name the gate's `<NAME>(<args>)` rule
-/// cannot derive — not because the two dialects disagree on its shape.
-///
-/// The referenced column is absent from the select list, so it is APPENDED to
-/// the scan's emitted set and dropped again by the wrapper's explicit visible
-/// select list, keeping the returned arity at the derived projection's 1.
+/// Scenario: A declined expression sort key renders in the Exasol dialect on the wrapper (#198, #209).
 #[test]
 fn declined_order_by_expression_appends_referenced_columns_as_hidden() {
     let request = lineitem_order_by_request(
@@ -543,11 +459,7 @@ fn declined_order_by_expression_appends_referenced_columns_as_hidden() {
     );
 }
 
-/// Two expression sort keys in ONE clause both render, in order, and their
-/// referenced base columns are appended AT MOST ONCE — deduped against each other
-/// (`L_EXTENDEDPRICE` is referenced by both keys) and against the existing
-/// select-list items (`L_ORDERKEY` is already projected). A repeated EMITS
-/// identifier would be a duplicate-column error.
+/// Scenario: Two expression sort keys render in order and append each referenced column at most once.
 #[test]
 fn declined_order_by_two_expression_keys_renders_both_and_leaks_none() {
     let sum_expr = serde_json::json!({"type": "function_scalar", "name": "ADD", "arguments": [
@@ -589,12 +501,7 @@ fn declined_order_by_two_expression_keys_renders_both_and_leaks_none() {
     );
 }
 
-/// Composition order (#198): an expression sort key whose referenced column IS
-/// already projected and which carries a `LIMIT` — the shape that would match the
-/// bounded top-N if the bare-column gate were widened. It must NOT: `detect_topn`
-/// still declines, the per-shard common blob carries neither sort keys nor a limit,
-/// and the query takes the declined wrapper path. The projection is left untouched
-/// (nothing to hide), proving the append dedupes against existing select-list items.
+/// Scenario: An expression sort key over a projected column still declines the top-N (#198).
 #[test]
 fn expression_sort_key_declines_bounded_topn_and_takes_declined_path() {
     let request = lineitem_order_by_request(
@@ -642,9 +549,7 @@ fn expression_sort_key_declines_bounded_topn_and_takes_declined_path() {
     );
 }
 
-/// Every unsupported ordered-query shape declines the top-N path (returns None),
-/// while the NQ4 shape matches. Covers: join (multiple involved tables), GROUP
-/// BY present, an expression (non-bare-column) sort key, ORDER BY with no LIMIT.
+/// Scenario: Every non-NQ4 ordered shape declines the top-N.
 #[test]
 fn unsupported_order_by_shape_declines_topn() {
     let projected = vec![
@@ -652,7 +557,6 @@ fn unsupported_order_by_shape_declines_topn() {
         ProjectionItem::Column("L_EXTENDEDPRICE".into()),
     ];
 
-    // Baseline: the well-formed NQ4 shape matches.
     let ok = nq4_request();
     assert_eq!(
         detect_topn(&ok, &pd(&ok), &projected, &lineitem_logical_schema()),
@@ -664,7 +568,6 @@ fn unsupported_order_by_shape_declines_topn() {
         "the NQ4 shape must match"
     );
 
-    // Join: two involved tables.
     let mut join = nq4_request();
     let extra_table = serde_json::json!({
         "name": "ORDERS",
@@ -679,7 +582,6 @@ fn unsupported_order_by_shape_declines_topn() {
         "a multi-table (join) shape must decline"
     );
 
-    // GROUP BY present.
     let mut grouped = nq4_request();
     grouped["pushdownRequest"]["aggregationType"] = serde_json::json!("group_by");
     grouped["pushdownRequest"]["groupBy"] =
@@ -695,7 +597,6 @@ fn unsupported_order_by_shape_declines_topn() {
         "a GROUP BY shape must decline"
     );
 
-    // Expression (non-bare-column) sort key.
     let mut expr_key = nq4_request();
     expr_key["pushdownRequest"]["orderBy"] = serde_json::json!([{
         "type": "order_by_element",
@@ -716,7 +617,6 @@ fn unsupported_order_by_shape_declines_topn() {
         "an expression sort key must decline (ORDER_BY_EXPRESSION unadvertised)"
     );
 
-    // ORDER BY with no LIMIT: not a bounded top-N.
     let mut no_limit = nq4_request();
     no_limit["pushdownRequest"]
         .as_object_mut()
@@ -734,12 +634,7 @@ fn unsupported_order_by_shape_declines_topn() {
     );
 }
 
-/// B3b correctness guard: a sort key whose column requires the JSON-fallback
-/// VARCHAR cast declines the top-N path, because the per-shard `ORDER BY col`
-/// sorts the native value while the emitted `CAST(col AS VARCHAR)` is a JSON
-/// string — so Exasol's outer merge would re-rank on the wrong representation.
-/// A plain in-range DECIMAL sort key still matches (regression guard), and a
-/// sort key absent from the logical schema declines defensively.
+/// Scenario: A JSON-fallback sort key declines, since shards sort native values but Exasol merges strings.
 #[test]
 fn json_fallback_typed_sort_key_declines_topn() {
     let projected = vec![
@@ -748,7 +643,6 @@ fn json_fallback_typed_sort_key_declines_topn() {
     ];
     let request = nq4_request();
 
-    // Regression: plain in-range DECIMAL sort key (L_EXTENDEDPRICE) matches.
     assert!(
         detect_topn(
             &request,
@@ -760,9 +654,7 @@ fn json_fallback_typed_sort_key_declines_topn() {
         "a plain in-range DECIMAL sort key must still match the top-N shape"
     );
 
-    // The sort key column typed as an OUT-OF-RANGE Decimal128 (emitted as
-    // JSON-fallback VARCHAR): the reachable fallback tag from the logical-schema
-    // vocabulary (List/Struct/Binary all collapse to `utf8`). Must decline.
+    // The reachable JSON-fallback tag (List/Struct/Binary all collapse to `utf8`).
     let fallback_schema = vec![
         LogicalField {
             field_id: Some(1),
@@ -794,7 +686,6 @@ fn json_fallback_typed_sort_key_declines_topn() {
         "a JSON-fallback-typed sort key must decline the top-N path"
     );
 
-    // The sort key column absent from the logical schema declines defensively.
     let missing_schema = vec![LogicalField {
         field_id: Some(1),
         name: "L_ORDERKEY".into(),
@@ -810,15 +701,9 @@ fn json_fallback_typed_sort_key_declines_topn() {
     );
 }
 
-/// cap-ext scenario: an ORDER BY the adapter cannot bound as a top-N (here: no
-/// LIMIT) is correctness-safe. The bounded top-N declines (no per-shard sort, no
-/// per-shard limit in the common blob), but the OUTER wrapper renders a
-/// self-contained global `ORDER BY` (no LIMIT) — since once `ORDER_BY_COLUMN` is
-/// advertised Exasol no longer re-applies its own backstop sort (add-topn-pushdown
-/// B6), the adapter's returned SQL must specify the ordering itself.
+/// Scenario: An ORDER BY without LIMIT declines the top-N and is sorted by the wrapper.
 #[test]
 fn unbounded_order_by_falls_back_correctness_safe() {
-    // ORDER BY a projected column but NO LIMIT (unbounded).
     let mut request = nq4_request();
     request["pushdownRequest"]
         .as_object_mut()
@@ -841,11 +726,7 @@ fn unbounded_order_by_falls_back_correctness_safe() {
     );
 }
 
-/// Row-scan DECLINE with `order_by` but NO `limit` (projected sort column):
-/// the outer wrapper renders a self-contained global `ORDER BY` (no LIMIT), and
-/// the per-shard common blob stays clean. Proves the decline path no longer
-/// withholds the ordering entirely (add-topn-pushdown B6), independent of a
-/// LIMIT being present.
+/// Scenario: A declined projected-key ORDER BY without LIMIT keeps the common blob clean.
 #[test]
 fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
     let request = serde_json::json!({
@@ -872,7 +753,6 @@ fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
                 "isAscending": false,
                 "nullsLast": true
             }]
-            // No "limit" key: no LIMIT clause anywhere.
         }
     });
     let files = vec![
@@ -896,24 +776,7 @@ fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
     );
 }
 
-/// cap-ext scenario (#198): a pushed `ORDER BY` over a SINGLE-GROUP aggregate
-/// keeps the request's `LIMIT` — `SELECT COUNT(*) … ORDER BY COUNT(*) LIMIT 0`
-/// must return ZERO rows, not the one-row aggregate.
-///
-/// Driven through the `plan_scan_sql` COMPOSITION mirror, not
-/// `build_scan_driving_sql` directly, and that is load-bearing: the leaf
-/// renderer takes no `orderBy`, so calling it directly could only hand-feed
-/// `request_limit: Some(0)` — the exact value production must derive for
-/// itself — and would pass with task 5.1's plumbing absent. The mirror instead
-/// reproduces the full dispatch: `order_by_present` is true, `detect_topn` is
-/// skipped because `aggregates.is_some()`, and the shared `effective_limit`
-/// guard therefore yields `None`. So a rendered `LIMIT 0` can only have arrived
-/// via the separate raw-`limit` → `request_limit` channel.
-///
-/// Both halves are asserted: the outer merge SELECT ends in `LIMIT 0`, AND the
-/// per-shard common blob still carries NO `limit`. Together they pin the
-/// plumbing, the render site, and the untouched `effective_limit` withholding —
-/// a leaked per-shard `LIMIT 0` would zero out each shard's partial instead.
+/// Scenario: An ordered single-group aggregate applies `LIMIT 0` on the merge, never per shard (#198).
 #[test]
 fn aggregate_merge_renders_request_limit_zero_through_plan_composition() {
     let request = serde_json::json!({

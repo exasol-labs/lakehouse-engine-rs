@@ -1,5 +1,3 @@
-//! Shape readers for Exasol pushdown filter-JSON nodes, shared by the pruning backends.
-
 use serde_json::Value as Json;
 use std::cmp::Ordering;
 
@@ -48,7 +46,6 @@ impl Comparison {
     }
 }
 
-/// The name of a `column` node, as the request spells it.
 pub(super) fn column_name(node: &Json) -> Option<&str> {
     if node.get("type")?.as_str()? != "column" {
         return None;
@@ -67,8 +64,7 @@ pub(super) fn operands(node: &Json) -> Option<&[Json]> {
     non_empty(node.get("expressions")?)
 }
 
-/// A comparison's column, its other operand, and the comparison as read with the column on the
-/// left.
+/// The comparison is normalized to read with the column on the left.
 pub(super) fn comparison_operands(
     node: &Json,
     comparison: Comparison,
@@ -85,18 +81,15 @@ pub(super) fn comparison_operands(
     ))
 }
 
-/// The column of an IS [NOT] NULL, IN, or BETWEEN node.
 pub(super) fn subject_column(node: &Json) -> Option<&str> {
     column_name(node.get("expression")?)
 }
 
-/// An IN node's column and its elements; `None` when empty, since an empty IN would prune every
-/// file.
+/// `None` when empty, since an empty IN would prune every file.
 pub(super) fn in_operands(node: &Json) -> Option<(&str, &[Json])> {
     Some((subject_column(node)?, non_empty(node.get("arguments")?)?))
 }
 
-/// A BETWEEN node's column and its low and high bounds.
 pub(super) fn between_operands(node: &Json) -> Option<(&str, Option<&Json>, Option<&Json>)> {
     Some((subject_column(node)?, node.get("left"), node.get("right")))
 }

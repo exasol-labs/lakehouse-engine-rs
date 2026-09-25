@@ -1,33 +1,6 @@
-//! Per-row scalar-dispatch coverage for the SCALAR-EMIT scan.
-//!
-//! Under SDK 0.21.0 Exasol drives a scalar `run()` once PER ROW — it does NOT
-//! hand a whole multi-row batch to one call, and `ctx.next()` in scalar context
-//! is now a runtime error rather than a loop advance. So the scan reconstitutes
-//! exactly one row's `ScanSpec` (via [`read_scan_spec`], no `ctx.next()`), scans
-//! that row's assigned file list, and returns; Exasol invokes it again for the
-//! next row. The "no dropped rows" guarantee is therefore an emergent property of
-//! the fan-out: the UNION of every per-row [`run_scan_one`] call must cover every
-//! shard. (An earlier batch-loop bug silently dropped every shard past the first,
-//! returning 108M of 210M rows — the exact regression these tests guard.)
-//!
-//! These tests drive [`run_scan_one`] once per row against a single-row fake
-//! `UdfContext` backed by local `file://` Parquet, injecting a local-file
-//! `SessionContext` builder so the path runs without an S3 / MinIO stack — the
-//! same seam [`run_raw_scan_with_session`] already exposes for host tests. This
-//! harness mirrors `run_scan`'s structure (reconstitute spec, build runtime,
-//! run, tear down) but calls [`run_scan_one`] and [`build_scan_runtime`]
-//! directly rather than through `run_scan` itself, so it checks the harness's
-//! own call discipline rather than exercising `run_scan` end to end.
-//!
-//! - `per_row_calls_emit_union_of_all_shards`: N independent per-row calls emit
-//!   the UNION of all shards' disjoint file contents — not just the first row's.
-//! - `run_scan_one_builds_and_tears_down_runtime_per_call`: this harness builds
-//!   and tears down its own fresh Tokio runtime per row (mirroring `run_scan`'s
-//!   structure); it does not exercise `run_scan` itself, which calls
-//!   `build_scan_runtime` directly rather than through an injected seam.
-//! - `single_row_call_is_byte_identical_to_direct_raw_scan`: one row through the
-//!   per-row seam is byte-for-byte identical to the unchanged downstream
-//!   [`run_raw_scan_with_session`] path over the same spec.
+//! Exasol drives a scalar `run()` once per row and `ctx.next()` is an error in scalar
+//! context, so "no dropped shards" holds only if the union of per-row [`run_scan_one`]
+//! calls covers every shard. This harness mirrors `run_scan` but does not call it.
 
 mod scan_fixture;
 
@@ -55,9 +28,6 @@ use lakehouse_engine::scan::{
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-/// Write a local Parquet at `dir/name` with `count` rows whose ids run
-/// `start..start+count` (so files carry disjoint id ranges), and return its
-/// `file://` URL.
 fn write_parquet_ids(dir: &std::path::Path, name: &str, start: i64, count: i64) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -92,14 +62,10 @@ fn file_size(file_url: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// The `EMITS` list the adapter generates for the ID/NAME projection: `ID` as a
-/// `DECIMAL(20,0)` the engine bins to NUMERIC, `NAME` as `VARCHAR(2000000)`.
 fn id_name_emits() -> Vec<ExaType> {
     vec![scan_fixture::decimal(20, 0), scan_fixture::varchar()]
 }
 
-/// A minimal raw-scan `ScanSpec` over one file (absolute `file://` URL, empty
-/// `table_root`, no filter/limit), projecting ID/NAME.
 fn spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
     ScanSpec {
@@ -120,8 +86,6 @@ fn spec_for_file(file_url: String) -> ScanSpec {
     }
 }
 
-/// Write a local Parquet at `dir/name` with a single Utf8 `category` column
-/// holding `values` verbatim (duplicates included), and return its `file://` URL.
 fn write_parquet_categories(dir: &std::path::Path, name: &str, values: &[&str]) -> String {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "category",
@@ -140,9 +104,6 @@ fn write_parquet_categories(dir: &std::path::Path, name: &str, values: &[&str]) 
         .to_string()
 }
 
-/// Write a local Parquet at `dir/name` with `id` (Int64) and a populated
-/// `list<string>` `tags` column (one row: `["hello","world"]`), and return its
-/// `file://` URL.
 fn write_parquet_tags(dir: &std::path::Path, name: &str) -> String {
     let mut tags_builder = ListBuilder::new(StringBuilder::new());
     tags_builder.values().append_value("hello");
@@ -169,8 +130,6 @@ fn write_parquet_tags(dir: &std::path::Path, name: &str) -> String {
         .to_string()
 }
 
-/// A raw-scan `ScanSpec` over one file declaring `tags` as a nested `list`
-/// column via the logical schema (field-id path), projecting ID/TAGS.
 fn nested_spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
     ScanSpec {
@@ -211,11 +170,7 @@ fn nested_spec_for_file(file_url: String) -> ScanSpec {
     }
 }
 
-/// A DISTINCT row-scan `ScanSpec` over one file: single-column `CATEGORY`
-/// projection with `distinct: true` and no LIMIT/ORDER BY — the same fan-out
-/// shape the single-group `COUNT(DISTINCT col)` adapter path builds
-/// (`single_group_agg.rs`), minus the NULL-excluding filter (not needed here
-/// since the fixture carries no NULLs).
+/// The `COUNT(DISTINCT col)` fan-out shape, minus the NULL filter (the fixture has no NULLs).
 fn distinct_spec_for_file(file_url: String) -> ScanSpec {
     let size = file_size(&file_url);
     ScanSpec {
@@ -237,8 +192,6 @@ fn distinct_spec_for_file(file_url: String) -> ScanSpec {
     }
 }
 
-/// Build one scalar-input row for `spec`: `[common blob, files JSON]`, exactly as
-/// the adapter splices the scalar scan's two arguments for a single fan-out row.
 fn row_for_spec(spec: &ScanSpec) -> Vec<Value> {
     vec![
         Value::String(spec.to_common_json()),
@@ -246,9 +199,6 @@ fn row_for_spec(spec: &ScanSpec) -> Vec<Value> {
     ]
 }
 
-/// A local-file `SessionContext` builder injected in place of the production
-/// `build_session_context` (which requires an S3 bucket host). `file://` URLs
-/// resolve through DataFusion's default LocalFileSystem store — no S3 needed.
 fn local_session(
     spec: &ScanSpec,
     _storage: &ResolvedScanStorage,
@@ -271,11 +221,6 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-/// Collect the ID column across all emitted batches as `i64`. The raw emit path
-/// coerces column 0 to the Arrow type its declared `DECIMAL(20,0)` EMITS type
-/// accepts — `Decimal128(20,0)` (p>18) — so the id arrives as a scale-0
-/// `Decimal128Array`; a spec with no declared type would keep the source
-/// `Int64Array`. Handle both so the assertion tracks the real coercion.
 fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
     let mut out = Vec::new();
     for b in batches {
@@ -296,12 +241,6 @@ fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
     out
 }
 
-/// Collect the CATEGORY column across all emitted batches as `String`, sorted.
-/// DataFusion's Parquet reader may return the raw scan plan's string column as
-/// either `Utf8` or `Utf8View`; the emit path coerces it before it crosses the
-/// UDF boundary, so `StringArray` is expected here, but both are accepted per
-/// the repo's established downcast pattern (`scan_parquet_pruning.rs`,
-/// `scan_plan_shape.rs`).
 fn categories_of(batches: &[RecordBatch]) -> Vec<String> {
     let mut out = Vec::new();
     for b in batches {
@@ -322,24 +261,12 @@ fn categories_of(batches: &[RecordBatch]) -> Vec<String> {
     out
 }
 
-/// Build a fresh Tokio runtime for one per-row scan by calling the real
-/// runtime builder [`build_scan_runtime`], recording the construction in `built`.
-/// This harness calls the builder once per row by construction, so `built`
-/// counts this test's own call discipline — it does NOT exercise `run_scan`
-/// (the actual UDF entry point), which calls `build_scan_runtime` directly
-/// rather than through an injected seam. A future regression that cached a
-/// runtime inside `run_scan` itself would not be caught by this counter.
-/// `threads` comes from the row's `df_threads_per_udf`, so the runtime kind
-/// matches what production would size for this row.
+/// Counts this harness's own runtime builds; a runtime cached inside `run_scan` would not show.
 fn counting_build_runtime(threads: usize, built: &AtomicUsize) -> tokio::runtime::Runtime {
     built.fetch_add(1, Ordering::SeqCst);
     build_scan_runtime(threads).expect("build per-row runtime")
 }
 
-/// Drive ONE scalar `run()` call for a single shard: reconstitute the row's spec
-/// (proving the read-one-row-no-`next()` contract), build a fresh runtime, run
-/// [`run_scan_one`] to completion on it, then tear that runtime down explicitly —
-/// mirroring production `run_scan` for a single row. Returns the emitted batches.
 fn run_one_row(spec: &ScanSpec, emits: &[ExaType], built: &AtomicUsize) -> Vec<RecordBatch> {
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(row_for_spec(spec)).with_next_policy(NextPolicy::Reject(
@@ -349,8 +276,6 @@ fn run_one_row(spec: &ScanSpec, emits: &[ExaType], built: &AtomicUsize) -> Vec<R
         )),
         emits,
     );
-    // Reconstitute this row's spec from the two scalar arguments, exactly as
-    // production does — reading only columns 0 and 1, never calling ctx.next().
     let reconstituted = read_scan_spec(&ctx).expect("reconstitute row spec");
     let rt = counting_build_runtime(reconstituted.common.df_threads_per_udf, built);
     let storage = scan_fixture::resolved_storage(&reconstituted);
@@ -361,15 +286,10 @@ fn run_one_row(spec: &ScanSpec, emits: &[ExaType], built: &AtomicUsize) -> Vec<R
         local_session,
     ));
     result.expect("per-row scan");
-    // Explicit, deterministic teardown of THIS call's runtime — the runtime is a
-    // call-local value consumed here, never hoisted out of the per-row loop.
     rt.shutdown_timeout(std::time::Duration::from_secs(5));
     ctx.into_batches()
 }
 
-/// Drive one independent scalar `run()` call per shard spec and concatenate the
-/// emitted batches across all N calls. This concatenation IS the fan-out UNION the
-/// regression guard asserts against.
 fn run_all_rows(specs: &[ScanSpec], emits: &[ExaType], built: &AtomicUsize) -> Vec<RecordBatch> {
     specs
         .iter()
@@ -377,15 +297,12 @@ fn run_all_rows(specs: &[ScanSpec], emits: &[ExaType], built: &AtomicUsize) -> V
         .collect()
 }
 
-/// N independent per-row `run()` calls emit the UNION of every shard: the three
-/// files' disjoint id ranges, all present — not just the first row's (the
-/// drop-past-first bug that returned 108M of 210M rows).
+/// Scenario: N per-row calls emit the union of every shard, not just the first row's
 #[test]
 fn per_row_calls_emit_union_of_all_shards() {
     let dir = std::env::temp_dir().join(format!("lh_perrow_multi_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Three shards, disjoint id ranges: 0..10, 100..110, 200..210.
     let specs = vec![
         spec_for_file(write_parquet_ids(&dir, "f0.parquet", 0, 10)),
         spec_for_file(write_parquet_ids(&dir, "f1.parquet", 100, 10)),
@@ -412,10 +329,7 @@ fn per_row_calls_emit_union_of_all_shards() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// This harness's `run_one_row` builds and tears down its own fresh Tokio
-/// runtime per row (mirroring `run_scan`'s structure). Driving N shards
-/// constructs exactly N runtimes in the harness — this does not exercise
-/// `run_scan` itself; see [`counting_build_runtime`].
+/// Scenario: each per-row call builds and tears down its own runtime
 #[test]
 fn run_scan_one_builds_and_tears_down_runtime_per_call() {
     let dir = std::env::temp_dir().join(format!("lh_perrow_rt_{}", std::process::id()));
@@ -436,8 +350,6 @@ fn run_scan_one_builds_and_tears_down_runtime_per_call() {
         "harness must build one fresh runtime per row (this checks the harness's own \
          call discipline, not run_scan's)"
     );
-    // Sanity: with one fresh runtime per call, every shard still emits its rows —
-    // teardown of each call-local runtime does not drop the next call's output.
     assert_eq!(
         total_rows(&emitted),
         30,
@@ -448,20 +360,16 @@ fn run_scan_one_builds_and_tears_down_runtime_per_call() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A single row through the per-row seam is byte-for-byte identical to the
-/// unchanged downstream `run_raw_scan_with_session` path over the same one spec.
+/// Scenario: a single per-row call is byte-identical to the direct raw-scan path
 #[test]
 fn single_row_call_is_byte_identical_to_direct_raw_scan() {
     let dir = std::env::temp_dir().join(format!("lh_perrow_single_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let spec = spec_for_file(write_parquet_ids(&dir, "only.parquet", 0, 200));
 
-    // Per-row path: one scalar run() call through the production per-row seam.
     let built = AtomicUsize::new(0);
     let per_row = run_one_row(&spec, &id_name_emits(), &built);
 
-    // Reference: drive the unchanged downstream raw-scan path over the same spec,
-    // with an equivalent local session.
     let reference = block_on(async {
         let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
             TestContext::scalar(row_for_spec(&spec)).with_next_policy(NextPolicy::Reject(
@@ -496,21 +404,12 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `distinct: true` scan spec streams exactly one row per shard-local distinct
-/// projected value through the same `emit_batch`/batch-loop mechanism ordinary
-/// row-scans use — the single-group `COUNT(DISTINCT col)` fan-out shape
-/// (`vs-adapter/pushdown-planning-count-distinct`; see `scan/mod.rs`
-/// `build_dataframe`'s `if spec.distinct { df.distinct() }`). Ten rows over a
-/// three-value column collapse to exactly those three distinct values, each
-/// appearing once, proving `.distinct()` is actually applied at the DataFusion/
-/// batch level rather than merely accepted at the SQL-generation level (that
-/// contract is covered separately by the `support.rs` SQL-shape unit tests).
+/// Scenario: a `distinct: true` row scan streams one row per shard-local distinct value
 #[test]
 fn distinct_row_scan_streams_one_row_per_distinct_value() {
     let dir = std::env::temp_dir().join(format!("lh_distinct_row_scan_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
 
-    // Ten rows, three distinct values, each duplicated at least once.
     let values = ["a", "b", "a", "c", "b", "a", "c", "b", "a", "c"];
     let file_url = write_parquet_categories(&dir, "categories.parquet", &values);
     let spec = distinct_spec_for_file(file_url);
@@ -533,18 +432,7 @@ fn distinct_row_scan_streams_one_row_per_distinct_value() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (`datafusion-scan/scan-execution-emit-declaration`): every column
-/// the raw scan emits carries the Arrow type its declared `EMITS` `ExaType`
-/// requires, through the real `run_scan_one` path rather than a direct call to
-/// the coercion function.
-///
-/// Both projected columns need a genuine cast: DataFusion's Parquet scan yields
-/// `Int64` for `ID` while the call declares `DECIMAL(20,0)` (which Exasol bins
-/// to NUMERIC, so the target is `Decimal128(20,0)`), and the string column is
-/// declared `VARCHAR(2000000)`, whose target is `Utf8`. The declaration read
-/// back from the context is the sole authority here — no type travels in the
-/// scan spec — so this proves the accessors reach the batch loop and that the
-/// values survive the cast unchanged.
+/// Scenario: every emitted column carries the Arrow type its declared `EMITS` type requires
 #[test]
 fn raw_scan_coerces_every_column_to_its_declared_output_type() {
     let dir = std::env::temp_dir().join(format!("lh_emit_coercion_{}", std::process::id()));
@@ -582,12 +470,7 @@ fn raw_scan_coerces_every_column_to_its_declared_output_type() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (nested-json-rendering): a nested column already rendered to JSON
-/// upstream crosses `coerce_batch_to_exa_types` (the emit-coercion boundary)
-/// UNCHANGED. The declared `VARCHAR(2000000)` column takes the cast-to-Utf8
-/// branch, and the JSON text arrives byte-identical — proof that branch needs no
-/// nested-aware special case, because the rendering already happened upstream of
-/// this boundary.
+/// Scenario: a nested column rendered to JSON upstream crosses the emit coercion unchanged
 #[test]
 fn rendered_nested_column_passes_the_emit_coercion_unchanged() {
     let dir = std::env::temp_dir().join(format!("lh_emit_nested_{}", std::process::id()));

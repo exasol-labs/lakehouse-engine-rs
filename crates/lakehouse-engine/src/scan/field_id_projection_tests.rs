@@ -5,7 +5,6 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
 
-/// A field tagged with its field-id (`PARQUET:field_id`).
 fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> Field {
     Field::new(name, dt, nullable).with_metadata(HashMap::from([(
         PARQUET_FIELD_ID_META_KEY.to_string(),
@@ -13,14 +12,11 @@ fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> Field {
     )]))
 }
 
-/// A field carrying no field-id metadata (an older writer, or a column that
-/// binds by its declared physical name or by identity).
 fn field_no_id(name: &str, dt: DataType, nullable: bool) -> Field {
     Field::new(name, dt, nullable)
 }
 
-/// A resolution carrying no binding tables and no defaults: binding is then
-/// embedded-field-id-then-physical-name.
+/// Binding is then embedded-field-id-then-physical-name.
 fn bare_resolution() -> FieldIdResolution {
     FieldIdResolution {
         name_mapping: Vec::new(),
@@ -30,7 +26,6 @@ fn bare_resolution() -> FieldIdResolution {
     }
 }
 
-/// A resolution carrying only a flattened `schema.name-mapping.default`.
 fn resolution_with_mapping(entries: &[(&str, i32)]) -> FieldIdResolution {
     FieldIdResolution {
         name_mapping: entries
@@ -44,8 +39,7 @@ fn resolution_with_mapping(entries: &[(&str, i32)]) -> FieldIdResolution {
     }
 }
 
-/// A resolution carrying only the logical names claimed by declared physical
-/// names, keyed by physical name — what `index_declared_physical_names` builds.
+/// Keyed by physical name, as `index_declared_physical_names` builds it.
 fn resolution_with_declared_names(entries: &[(&str, &str)]) -> FieldIdResolution {
     FieldIdResolution {
         declared_physical_names: entries
@@ -56,8 +50,6 @@ fn resolution_with_declared_names(entries: &[(&str, &str)]) -> FieldIdResolution
     }
 }
 
-/// A resolution carrying only reconstructed `defaults`, keyed by LOGICAL column
-/// name, so the absent-with-default fill seam can be exercised directly.
 fn resolution_with_defaults(defaults: &[(&str, ScalarValue)]) -> FieldIdResolution {
     FieldIdResolution {
         defaults: defaults
@@ -76,8 +68,6 @@ fn rewrite(
     rewrite_with(logical, physical, bare_resolution(), column)
 }
 
-/// Rewrite a single column through a factory carrying an explicit
-/// [`FieldIdResolution`].
 fn rewrite_with(
     logical: SchemaRef,
     physical: SchemaRef,
@@ -90,16 +80,11 @@ fn rewrite_with(
     adapter.rewrite(Arc::new(column))
 }
 
-/// The reconstructed `ScalarValue` from a `Literal`, for asserting the
-/// injected default literal's value.
 fn literal_value(expr: &Arc<dyn PhysicalExpr>) -> Option<ScalarValue> {
     expr.downcast_ref::<Literal>().map(|l| l.value().clone())
 }
 
-/// The physical index a rewritten expression binds, accepting a bare `Column` or
-/// one wrapped in an identity cast — a physical field whose field-id metadata
-/// differs from its logical field's binds through a cast. `None` whenever nothing
-/// binds a column, a default `Literal` included.
+/// Accepts a bare `Column` or one in an identity cast (fields whose field-id metadata differs).
 fn bound_physical_index(expr: &Arc<dyn PhysicalExpr>) -> Option<usize> {
     expr.downcast_ref::<Column>()
         .map(Column::index)
@@ -110,33 +95,28 @@ fn bound_physical_index(expr: &Arc<dyn PhysicalExpr>) -> Option<usize> {
         })
 }
 
-/// A renamed column (physical `score`, logical `rating`, same field-id 2)
-/// binds to the physical column BY field-id, not by name.
+/// Scenario: a renamed column binds to the physical column by field-id, not by name.
 #[test]
 fn resolves_renamed_column_by_field_id() {
     let logical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]));
-    // Physical file predates the rename: field-id 2 is named `score`, at index 1.
     let physical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("score", DataType::Int64, true, 2),
     ]));
 
-    // The planner references the CURRENT logical name `rating`.
     let result = rewrite(logical, physical, Column::new("rating", 1)).expect("rewrite ok");
 
-    // Types match, so it resolves to a plain physical Column (no cast),
-    // and it must point at physical index 1 (the `score` slot).
+    // Types match, so a plain Column at physical index 1 (no cast).
     let col = result
         .downcast_ref::<Column>()
         .expect("renamed column resolves to a Column, no cast");
     assert_eq!(col.index(), 1, "must bind to physical field-id-2 slot");
 }
 
-/// A type divergence between the logical and physical field (same field-id)
-/// is wrapped in a cast (delegated to the default adapter).
+/// Scenario: a type divergence under one field-id is wrapped in a cast.
 #[test]
 fn casts_on_type_divergence_by_field_id() {
     let logical = Arc::new(Schema::new(vec![field_with_id(
@@ -145,7 +125,6 @@ fn casts_on_type_divergence_by_field_id() {
         true,
         5,
     )]));
-    // Same field-id 5 but a narrower physical type, and a different physical name.
     let physical = Arc::new(Schema::new(vec![field_with_id(
         "amt",
         DataType::Int32,
@@ -164,9 +143,7 @@ fn casts_on_type_divergence_by_field_id() {
     assert_eq!(inner.index(), 0, "cast must wrap the field-id-5 slot");
 }
 
-/// A dropped column (present physically with an id absent from the logical
-/// schema) is simply not referenced by the projection; the adapter leaves
-/// the remaining physical fields resolvable by their logical names.
+/// Scenario: a dropped physical column is unreferenced while kept columns still bind.
 #[test]
 fn ignores_dropped_physical_column() {
     let logical = Arc::new(Schema::new(vec![field_with_id(
@@ -175,13 +152,11 @@ fn ignores_dropped_physical_column() {
         false,
         1,
     )]));
-    // Physical file still has an old, since-dropped column (field-id 7).
     let physical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("legacy", DataType::Utf8, true, 7),
     ]));
 
-    // The kept logical column `id` still binds correctly.
     let result = rewrite(logical, physical, Column::new("id", 0)).expect("rewrite ok");
     let col = result
         .downcast_ref::<Column>()
@@ -189,9 +164,7 @@ fn ignores_dropped_physical_column() {
     assert_eq!(col.index(), 0);
 }
 
-/// The logical Arrow schema built from `ScanSpec::logical_schema` tags each
-/// field-id-bound field with its field-id, reconstructs the Arrow type from the
-/// tag, and preserves the declared nullability.
+/// Scenario: the logical Arrow schema carries field-ids, reconstructed types, and declared nullability.
 #[test]
 fn builds_logical_arrow_schema_with_field_ids() {
     use super::{build_logical_arrow_schema, field_id_of};
@@ -235,11 +208,6 @@ fn builds_logical_arrow_schema_with_field_ids() {
 }
 
 /// Scenario: a logical field carrying no binding key binds by its own name.
-///
-/// A field that binds by identity — and one that binds by a declared physical
-/// name — is tagged with NO `PARQUET:field_id` metadata at all: a synthesized id
-/// is a value no writer put in any file and would invite a false match against a
-/// file that DOES carry field-ids. A field-id-bound sibling is still tagged.
 #[test]
 fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
     use super::{build_logical_arrow_schema, field_id_of};
@@ -293,16 +261,14 @@ fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
     }
 }
 
-/// Scenario: a physical field with NO embedded field-id, whose physical
-/// name IS covered by a `name_mapping` entry pointing to a field-id that
-/// IS present in the logical schema, resolves to that logical field's name.
+/// Scenario: a physical field without an embedded id binds via a matching name-mapping entry.
 #[test]
 fn name_mapping_resolves_no_field_id_column() {
     let logical = Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]);
-    // No embedded field-id: name-mapping maps `score` -> id 2 -> `rating`.
+    // `score` -> id 2 -> `rating` via name-mapping.
     let physical = Schema::new(vec![field_no_id("score", DataType::Int64, true)]);
 
     let binding = bind_columns(
@@ -326,10 +292,7 @@ fn name_mapping_resolves_no_field_id_column() {
     );
 }
 
-/// Scenario: a physical field WITH an embedded field-id that resolves via
-/// `logical_name_by_id` wins over a conflicting name-mapping entry for the
-/// same physical name pointing at a DIFFERENT field-id; the name-mapping
-/// is not consulted when an embedded field-id is present.
+/// Scenario: an embedded field-id wins over a conflicting name-mapping entry.
 #[test]
 fn embedded_field_id_wins_over_name_mapping() {
     let logical = Schema::new(vec![
@@ -351,10 +314,7 @@ fn embedded_field_id_wins_over_name_mapping() {
     );
 }
 
-/// Scenario: `name_mapping` is empty/absent, so a physical field with no
-/// embedded field-id keeps its physical name unchanged — and a kept name that
-/// MATCHES a logical field counts as bound, because the physical-name fallback
-/// supplies that column's real values and must never be defaulted over.
+/// Scenario: without name-mapping the physical name is kept, and a matching one counts as bound.
 #[test]
 fn no_name_mapping_falls_back_to_physical_name() {
     let logical = Schema::new(vec![
@@ -380,9 +340,7 @@ fn no_name_mapping_falls_back_to_physical_name() {
     );
 }
 
-/// Scenario: `name_mapping` has entries, but none cover this particular
-/// physical field's name, so the physical name is kept unchanged (the
-/// name-mapping augments but never replaces the fallback).
+/// Scenario: name-mapping entries not covering a field leave its physical name unchanged.
 #[test]
 fn uncovered_name_mapping_falls_back_to_physical_name() {
     let logical = Schema::new(vec![
@@ -408,9 +366,7 @@ fn uncovered_name_mapping_falls_back_to_physical_name() {
     );
 }
 
-/// Edge case: an embedded field-id that is present but ABSENT from the
-/// logical schema must NOT fall through to the name-mapping — it keeps
-/// the physical name, exactly like the no-mapping fallback.
+/// Scenario: an embedded field-id absent from the logical schema does not fall through to name-mapping.
 #[test]
 fn embedded_field_id_absent_from_logical_schema_skips_name_mapping() {
     let logical = Schema::new(vec![
@@ -433,15 +389,9 @@ fn embedded_field_id_absent_from_logical_schema_skips_name_mapping() {
 }
 
 /// Scenario: column projection binds by a logical field's declared physical name.
-///
-/// The declared physical name claims the physical column even when a
-/// `name_mapping` entry covers that same physical name for a DIFFERENT logical
-/// field: a per-column declaration read from the table's own metadata is
-/// authoritative, while a name-mapping entry is only a table-level fallback.
 #[test]
 fn declared_physical_name_wins_over_a_covering_name_mapping_entry() {
-    // `amount` declares physical name `col-abc`; `other` binds by field-id 7,
-    // which the name-mapping ALSO reaches from `col-abc`.
+    // Name-mapping also reaches `other` (id 7) from `col-abc`; the declaration must win.
     let logical = Schema::new(vec![
         field_no_id("amount", DataType::Int64, true),
         field_with_id("other", DataType::Int64, true, 7),
@@ -469,12 +419,7 @@ fn declared_physical_name_wins_over_a_covering_name_mapping_entry() {
     );
 }
 
-/// Scenario: column projection binds by a logical field's declared physical name.
-///
-/// A physical field carrying an embedded field-id that NO logical field declares
-/// is not consumed by the field-id step, so a logical field declaring that
-/// physical name still claims it — the shape a `name`-mapped table has when its
-/// files were written with Parquet field-ids, whose logical fields carry none.
+/// Scenario: a declared physical name claims a field whose embedded id no logical field declares.
 #[test]
 fn declared_physical_name_claims_a_field_whose_embedded_id_is_unknown() {
     let logical = Schema::new(vec![field_no_id("amount", DataType::Int64, true)]);
@@ -494,11 +439,7 @@ fn declared_physical_name_claims_a_field_whose_embedded_id_is_unknown() {
     assert!(binding.bound_logical_names.contains("amount"));
 }
 
-/// Scenario: a logical field carrying no binding key binds by its own name.
-///
-/// An identity-bound field present in the file binds to the physical column of
-/// the same name; one absent from the file stays unbound, which is what routes it
-/// to the per-file `initial-default` / NULL fill.
+/// Scenario: an identity-bound field binds when present and stays unbound when absent.
 #[test]
 fn identity_bound_fields_bind_by_their_own_name() {
     let logical = Schema::new(vec![
@@ -525,19 +466,13 @@ fn identity_bound_fields_bind_by_their_own_name() {
     );
 }
 
-/// Scenario: field-id resolution falls back to physical name when a file
-/// field carries no embedded field-id.
-///
-/// A file whose fields carry no `PARQUET:field_id` metadata cannot be bound
-/// by id; the adapter falls through to the physical-name match so the
-/// column is still resolved correctly.
+/// Scenario: field-id resolution falls back to physical name when a file field carries no field-id.
 #[test]
 fn field_id_adapter_falls_back_to_name_without_field_id() {
     let logical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 2),
     ]));
-    // Physical file carries NO field-ids at all (older writer).
     let physical = Arc::new(Schema::new(vec![
         field_no_id("id", DataType::Int64, false),
         field_no_id("rating", DataType::Int64, true),
@@ -561,18 +496,12 @@ fn field_id_adapter_falls_back_to_name_without_field_id() {
 }
 
 /// Scenario: added nullable column absent from an older file is NULL-filled.
-///
-/// When a column was added to the schema AFTER a file was written, the file
-/// simply does not contain the field. The adapter delegates to
-/// `DefaultPhysicalExprAdapter` which returns a NULL literal for nullable
-/// missing columns rather than erroring.
 #[test]
 fn field_id_adapter_null_fills_added_nullable_column() {
     let logical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("note", DataType::Utf8, true, 9),
     ]));
-    // Physical file predates the addition: field-id 9 is absent.
     let physical = Arc::new(Schema::new(vec![field_with_id(
         "id",
         DataType::Int64,
@@ -588,9 +517,6 @@ fn field_id_adapter_null_fills_added_nullable_column() {
 }
 
 /// Scenario: added required column missing from an older file errors cleanly.
-///
-/// A REQUIRED (non-nullable) column that is absent from an older file must
-/// produce a clean descriptive error — never wrong data or a silent NULL.
 #[test]
 fn field_id_adapter_errors_on_missing_required_column() {
     let logical = Arc::new(Schema::new(vec![
@@ -613,13 +539,9 @@ fn field_id_adapter_errors_on_missing_required_column() {
     );
 }
 
-/// An absent field with a defined `initial-default` emits `Literal(default)`
-/// — for BOTH a required-with-default and a nullable-with-default field
-/// (rule 3 applies regardless of nullability, and the default must be
-/// substituted BEFORE delegating so the required-absent path does not error).
+/// Scenario: an absent field with an `initial-default` emits it, whether required or nullable.
 #[test]
 fn absent_field_with_initial_default_emits_default_literal() {
-    // Required-with-default: id 9 is absent from the physical file.
     let logical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("required_added", DataType::Utf8, false, 9),
@@ -646,7 +568,6 @@ fn absent_field_with_initial_default_emits_default_literal() {
         "a required absent field with a default must emit Literal(default), not error"
     );
 
-    // Nullable-with-default: id 9 is absent; the default wins over NULL-fill.
     let logical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("nullable_added", DataType::Int64, true, 9),
@@ -665,8 +586,7 @@ fn absent_field_with_initial_default_emits_default_literal() {
     );
 }
 
-/// An absent NULLABLE field with NO default NULL-fills — the default map is
-/// consulted per field-id, so a default for an UNRELATED id does not leak in.
+/// Scenario: an absent nullable field without its own default NULL-fills, ignoring unrelated defaults.
 #[test]
 fn absent_nullable_without_default_is_null_filled() {
     let logical = Arc::new(Schema::new(vec![
@@ -679,7 +599,6 @@ fn absent_nullable_without_default_is_null_filled() {
         false,
         1,
     )]));
-    // A default exists, but for a DIFFERENT column (`elsewhere`), not for `note`.
     let result = rewrite_with(
         logical,
         physical,
@@ -697,8 +616,7 @@ fn absent_nullable_without_default_is_null_filled() {
     );
 }
 
-/// An absent REQUIRED field with NO default still errors cleanly (naming the
-/// column), never a silent NULL or a bogus default.
+/// Scenario: an absent required field without a default errors naming the column.
 #[test]
 fn absent_required_without_default_errors_cleanly() {
     let logical = Arc::new(Schema::new(vec![
@@ -711,7 +629,6 @@ fn absent_required_without_default_errors_cleanly() {
         false,
         1,
     )]));
-    // No default for the required-absent field.
     let err = rewrite_with(
         logical,
         physical,
@@ -726,12 +643,7 @@ fn absent_required_without_default_errors_cleanly() {
     );
 }
 
-/// A field PRESENT in the file binds to its REAL physical values and is NEVER
-/// defaulted, even when a default exists for its logical column name. All four
-/// resolution paths that can claim a physical field are covered: a matching
-/// embedded field-id, a `name_mapping` entry, the physical-name fallback for a
-/// field carrying no embedded id, and that same fallback for a field whose
-/// embedded id no logical field claims.
+/// Scenario: a present field is never defaulted, via any of the four claiming paths.
 #[test]
 fn present_field_binds_real_value_not_default() {
     let logical = Arc::new(Schema::new(vec![
@@ -740,7 +652,6 @@ fn present_field_binds_real_value_not_default() {
     ]));
     let resolution = resolution_with_defaults(&[("rating", ScalarValue::Int64(Some(999)))]);
 
-    // Present by embedded field-id (renamed score->rating, id 2).
     let physical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("score", DataType::Int64, true, 2),
@@ -758,7 +669,6 @@ fn present_field_binds_real_value_not_default() {
         .expect("a present field-id must bind a real Column, not a default Literal");
     assert_eq!(col.index(), 1, "must bind the physical field-id-2 slot");
 
-    // Present by name-mapping (no embedded id; score->id 2->rating).
     let physical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_no_id("score", DataType::Int64, true),
@@ -786,8 +696,6 @@ fn present_field_binds_real_value_not_default() {
         "name-mapping must bind the score slot"
     );
 
-    // Present by the physical-name fallback: no embedded id, no name_mapping
-    // entry, the physical name already IS the logical name.
     let physical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_no_id("rating", DataType::Int64, true),
@@ -809,8 +717,7 @@ fn present_field_binds_real_value_not_default() {
         "the physical-name fallback must bind the rating slot"
     );
 
-    // Present under an embedded field-id no logical field claims: the field-id
-    // step matches nothing, the physical name still supplies the column.
+    // An embedded id no logical field claims: the physical name still supplies the column.
     let physical = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("rating", DataType::Int64, true, 99),
@@ -828,9 +735,7 @@ fn present_field_binds_real_value_not_default() {
     );
 }
 
-/// The fill decision is PER FILE: one factory (one reconstructed default map)
-/// yields a real-value binding for a file that HAS the field-id and a
-/// `Literal(default)` for a file that LACKS it.
+/// Scenario: one factory binds a real value for a file with the field and the default for one without.
 #[test]
 fn default_fill_decision_is_per_file() {
     let logical = Arc::new(Schema::new(vec![
@@ -844,7 +749,6 @@ fn default_fill_decision_is_per_file() {
         )]),
     };
 
-    // File B: the added column IS present — binds its real value.
     let physical_present = Arc::new(Schema::new(vec![
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("added", DataType::Utf8, true, 9),
@@ -860,7 +764,6 @@ fn default_fill_decision_is_per_file() {
         "a file carrying field-id 9 must bind a real Column"
     );
 
-    // File A: the added column is ABSENT — emits the default literal.
     let physical_absent = Arc::new(Schema::new(vec![field_with_id(
         "id",
         DataType::Int64,
@@ -881,19 +784,6 @@ fn default_fill_decision_is_per_file() {
 }
 
 /// Scenario: column projection binds by Iceberg field-id across physical layouts.
-///
-/// Row-level regression for the E2E `e2e_renamed_column_resolves_by_field_id`
-/// failure: a Parquet file whose PHYSICAL column is `score` (field-id 2) is
-/// registered through the production `register_files` path against a LOGICAL
-/// schema that calls field-id 2 `rating`. Selecting `RATING` through the same
-/// `build_scan_sql` the UDF runs must read the physical `score` values — the
-/// projected output column must be remapped by field-id on the READ path, not
-/// looked up by the (non-existent) physical name `rating`.
-///
-/// Before the fix this fails with the exact E2E error
-/// (`Unable to get field named "rating". Valid fields: ["id", "score"]`)
-/// because the projected `Column("rating")` is resolved by NAME against the
-/// real physical file schema `[id, score]`.
 #[tokio::test]
 async fn field_id_adapter_reads_renamed_column_rows() {
     use super::super::raw_scan::{build_scan_sql, register_files};
@@ -906,8 +796,7 @@ async fn field_id_adapter_reads_renamed_column_rows() {
     use parquet::arrow::ArrowWriter;
     use std::collections::HashMap;
 
-    // Write a local Parquet file with PHYSICAL fields id (field-id 1) and
-    // score (field-id 2) — the pre-rename layout. score = 10 * id.
+    // Pre-rename layout: id (field-id 1), score (field-id 2) = 10 * id.
     let dir = std::env::temp_dir().join(format!("lh_fieldid_rows_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("renamed.parquet");
@@ -943,7 +832,6 @@ async fn field_id_adapter_reads_renamed_column_rows() {
         .expect("absolute path")
         .to_string();
 
-    // Logical (current) schema: field-id 2 is now `rating`, not `score`.
     let logical = vec![
         LogicalField {
             field_id: Some(1),
@@ -969,11 +857,8 @@ async fn field_id_adapter_reads_renamed_column_rows() {
     let file_size = local_file_size(&file_url);
     spec.files = vec![FileEntry::new(file_url, file_size)];
     spec.common.logical_schema = logical;
-    // The adapter pushes uppercase current-name projection.
     spec.common.projection = vec!["ID".into(), "RATING".into()];
 
-    // Drive the EXACT production path: register_files + build_scan_sql, then
-    // collect the resulting rows.
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
     register_files(&ctx, "scan_target", &spec, &inline_resolved(&spec))
         .await
@@ -984,7 +869,6 @@ async fn field_id_adapter_reads_renamed_column_rows() {
     let df = ctx.sql(&sql).await.expect("plan scan SQL");
     let batches = df.collect().await.expect("scan must read renamed column");
 
-    // Assert the RATING output column carries the physical `score` values.
     let mut got: Vec<(i64, f64)> = Vec::new();
     for batch in &batches {
         let id_col = batch
@@ -1011,14 +895,7 @@ async fn field_id_adapter_reads_renamed_column_rows() {
     );
 }
 
-/// Scenario: column projection binds by Iceberg field-id across physical layouts.
-///
-/// The multi-file mirror of the E2E: one shard covers a file written BEFORE a
-/// rename (physical column `score`) and a file written AFTER it (physical column
-/// `rating`), both carrying field-id 2. A single `ListingTable` over both must
-/// bind each file's field-id-2 column to the current logical name `rating` — the
-/// per-file expr adapter is created once per file, so divergent physical layouts
-/// in the same shard each resolve correctly.
+/// Scenario: one shard over pre- and post-rename files binds each file's field-id-2 column.
 #[tokio::test]
 async fn field_id_adapter_reads_divergent_layouts_across_files() {
     use super::super::raw_scan::{build_scan_sql, register_files};
@@ -1047,8 +924,7 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
     let dir = std::env::temp_dir().join(format!("lh_fieldid_multi_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
 
-    // Write one file per physical layout. score = 10 * id; ids 1..=3 (old
-    // `score`), 4..=6 (new `rating`).
+    // ids 1..=3 as old `score`, 4..=6 as new `rating`; value = 10 * id.
     let write_file = |name: &str, physical_col: &str, ids: &[i64]| -> String {
         let schema = Arc::new(Schema::new(vec![id_field(), score_field(physical_col)]));
         let scores: Vec<f64> = ids.iter().map(|i| 10.0 * *i as f64).collect();
@@ -1142,22 +1018,12 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
     );
 }
 
-/// Task 3.3: every supported primitive `initial-default` survives the full
-/// scan-spec serialization round-trip, across the ENTIRE Arrow-type-tag
-/// vocabulary. For each case the encoded default is placed on a `LogicalField`,
-/// the whole `ScanSpec` is serialized to JSON and back, and the value is
-/// reconstructed to the exact `ScalarValue` (with its timezone / precision /
-/// scale) against the field's tag. The SAME test proves a non-primitive
-/// (struct) `initial-default` encodes NO default through the VS layer's
-/// `build_logical_schema`, and that the default carrier is credential-free.
-///
-/// This is ONE parametrized test — NOT one `#[test]` per type.
+/// Scenario: every primitive `initial-default` survives the scan-spec round-trip; a struct default encodes none.
 #[test]
 fn initial_default_round_trips_across_full_type_vocabulary() {
     use crate::scan::spec::LogicalField;
 
-    // (arrow_type tag, encoded initial-default text, expected ScalarValue).
-    // Float values are chosen to round-trip exactly through Display/FromStr.
+    // Float values round-trip exactly through Display/FromStr.
     let cases: Vec<(&str, &str, ScalarValue)> = vec![
         ("bool", "true", ScalarValue::Boolean(Some(true))),
         ("int32", "-42", ScalarValue::Int32(Some(-42))),
@@ -1201,8 +1067,6 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
         ),
     ];
 
-    // Carry every primitive case on ONE ScanSpec so the assertion exercises the
-    // real serialize → deserialize path once for the whole vocabulary.
     let mut spec = minimal_spec();
     spec.common.logical_schema = cases
         .iter()
@@ -1237,10 +1101,7 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
         );
     }
 
-    // The default carrier is credential-free: the encoded defaults are bare
-    // scalars, so the serialized logical schema contains no storage secret
-    // (minimal_spec's credentials are "testkey"/"testsecret", carried only in
-    // the separate `storage` block).
+    // Defaults are bare scalars, so the serialized logical schema holds no storage secret.
     let logical_json = serde_json::to_string(&back.common.logical_schema).unwrap();
     for secret in ["testkey", "testsecret", "access_key", "secret_key"] {
         assert!(
@@ -1249,10 +1110,7 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
         );
     }
 
-    // The SAME test: a non-primitive (struct) initial-default encodes NO default
-    // through the VS layer's build_logical_schema — Exasol has no struct type,
-    // so it surfaces as a JSON-fallback VARCHAR and falls through to NULL /
-    // required-error downstream rather than a bogus default literal.
+    // Exasol has no struct type, so a struct default encodes none and falls to NULL/required-error.
     {
         use iceberg::spec::{
             Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Type,
@@ -1285,8 +1143,6 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
     }
 }
 
-/// One nested struct field binding by its nested field-id — the Iceberg nested key,
-/// and Delta's under `id` column mapping.
 fn nested_by_id(field_id: i32, name: &str) -> crate::scan::spec::NestedField {
     crate::scan::spec::NestedField {
         field_id: Some(field_id),
@@ -1296,8 +1152,7 @@ fn nested_by_id(field_id: i32, name: &str) -> crate::scan::spec::NestedField {
     }
 }
 
-/// One nested struct field binding by the physical name it declares — Delta `name`
-/// column mapping, whose file-side member names are opaque identifiers.
+/// Delta `name` column mapping, whose file-side member names are opaque.
 fn nested_by_physical_name(name: &str, physical_name: &str) -> crate::scan::spec::NestedField {
     crate::scan::spec::NestedField {
         field_id: None,
@@ -1307,7 +1162,6 @@ fn nested_by_physical_name(name: &str, physical_name: &str) -> crate::scan::spec
     }
 }
 
-/// The member names of a resolved struct field, in resolved order.
 fn struct_member_names(data_type: &DataType) -> Vec<&str> {
     match data_type {
         DataType::Struct(fields) => fields.iter().map(|f| f.name().as_str()).collect(),
@@ -1315,12 +1169,7 @@ fn struct_member_names(data_type: &DataType) -> Vec<&str> {
     }
 }
 
-/// A nested column's members resolve onto the logical tree by the SAME
-/// first-match-wins order a top-level column binds by — a nested field-id, a
-/// declared physical name, or identity — renamed to their logical names, reordered
-/// into logical order, an unclaimed physical member dropped and an absent logical
-/// field null-filled, so the rendered JSON is keyed by the TABLE's names and never
-/// by the file's.
+/// Scenario: nested members resolve onto the logical tree by the top-level binding order.
 #[test]
 fn nested_fields_resolve_to_logical_names_across_binding_keys() {
     use crate::scan::render_nested_column_as_json;
@@ -1331,8 +1180,7 @@ fn nested_fields_resolve_to_logical_names_across_binding_keys() {
     use arrow::buffer::OffsetBuffer;
     use arrow::datatypes::Fields;
 
-    // An Iceberg struct: the file names field-id 11 `street_v2` and holds it AFTER
-    // field-id 12, carries a member no logical field claims, and omits field-id 13.
+    // Field-id 11 renamed and after 12, an unclaimed member, and field-id 13 omitted.
     let addr_physical: ArrayRef = Arc::new(StructArray::from(vec![
         (
             Arc::new(field_with_id("city", DataType::Utf8, true, 12)),
@@ -1347,13 +1195,10 @@ fn nested_fields_resolve_to_logical_names_across_binding_keys() {
             Arc::new(Int32Array::from(vec![7])) as ArrayRef,
         ),
     ]));
-    // A Delta `name`-mapped struct: the file's member name is an opaque identifier.
     let props_physical: ArrayRef = Arc::new(StructArray::from(vec![(
         Arc::new(field_no_id("col-i", DataType::Int32, true)),
         Arc::new(Int32Array::from(vec![1])) as ArrayRef,
     )]));
-    // A list whose element is itself a struct: the element is positional, the struct
-    // inside it binds by field-id.
     let labels = Arc::new(StructArray::from(vec![(
         Arc::new(field_with_id("lbl", DataType::Utf8, true, 21)),
         Arc::new(StringArray::from(vec!["x", "y"])) as ArrayRef,
@@ -1367,8 +1212,6 @@ fn nested_fields_resolve_to_logical_names_across_binding_keys() {
         )
         .expect("list builds"),
     );
-    // A map whose VALUE is a struct: key and value are positional, the struct inside
-    // the value binds by field-id.
     let map_values = Arc::new(StructArray::from(vec![(
         Arc::new(field_with_id("v_old", DataType::Int32, true, 31)),
         Arc::new(Int32Array::from(vec![5])) as ArrayRef,
@@ -1483,9 +1326,7 @@ fn nested_fields_resolve_to_logical_names_across_binding_keys() {
     assert_eq!(rendered("attrs", &attrs_physical), r#"{"a":{"amount":5}}"#);
 }
 
-/// A nested column THIS file does not carry NULL-fills through the delegate's own
-/// absent-column path rather than a nested-specific one: nothing is read, so nothing
-/// is diverted, and the fill takes the logical `Utf8` the schema declares.
+/// Scenario: a nested column absent from the file NULL-fills through the delegate's absent-column path.
 #[test]
 fn nested_column_absent_from_a_file_null_fills_as_the_logical_utf8() {
     use crate::scan::spec::NestedMembers;
@@ -1520,14 +1361,7 @@ fn nested_column_absent_from_a_file_null_fills_as_the_logical_utf8() {
     );
 }
 
-/// A nested physical column reaches `Utf8` by JSON RENDERING, never by a cast: the
-/// resolution keeps the column NESTED — the schema the delegate resolves against
-/// carries the resolved `Struct`, not a primitive — while arrow-cast has no
-/// struct-to-text kernel at all, which is why the cast must be diverted.
-///
-/// The diversion is what the delegate's two schemas make possible: they carry ONE
-/// identical field for the column, so the delegate emits a bare `Column` for it and
-/// `FieldIdExprAdapter` substitutes the rendering expression for that column.
+/// Scenario: a nested column reaches `Utf8` by JSON rendering, never by a cast.
 #[test]
 fn nested_physical_column_bypasses_the_cast_and_yields_utf8() {
     use crate::scan::spec::NestedMembers;
@@ -1543,8 +1377,7 @@ fn nested_physical_column_bypasses_the_cast_and_yields_utf8() {
         true,
         10,
     )]));
-    // The file names the column `addr_old`, so the rename and the diversion have to
-    // compose: the wrapped child must carry the file's own name.
+    // The rename and the diversion must compose: the wrapped child carries the file's own name.
     let physical = Arc::new(Schema::new(vec![field_with_id(
         "addr_old",
         addr_physical.data_type().clone(),
@@ -1636,12 +1469,7 @@ fn nested_physical_column_bypasses_the_cast_and_yields_utf8() {
     );
 }
 
-/// The declared member tree is the ONLY signal that diverts a column around the
-/// cast. A physically nested column whose logical field declares none is left to
-/// the delegate, which has no struct-to-text kernel and fails loudly — the one
-/// outcome that cannot silently lose a predicate, because the row-filter-pushdown
-/// withdrawal reads that same descriptor and would otherwise stay ON for a column
-/// this site had quietly rendered.
+/// Scenario: a nested column declaring no member tree is left to the delegate, which fails loudly.
 #[test]
 fn a_nested_physical_column_with_no_descriptor_fails_the_cast_rather_than_rendering() {
     use arrow::array::{ArrayRef, StringArray, StructArray};
@@ -1672,11 +1500,7 @@ fn a_nested_physical_column_with_no_descriptor_fails_the_cast_rather_than_render
     );
 }
 
-/// The cast diversion and the row-filter-pushdown withdrawal read ONE signal, so a
-/// file binding that diverts a column can only come from a resolution that also
-/// withholds Parquet row-filter pushdown. Were the two to drift apart, DataFusion
-/// would approve the pushdown against the `Utf8` logical schema, drop the conjunct
-/// against the physical nested schema, and return EVERY row.
+/// Scenario: a diverted column always comes with withheld Parquet row-filter pushdown.
 #[test]
 fn a_binding_that_diverts_a_column_always_withholds_row_filter_pushdown() {
     use crate::scan::raw_scan::scan_table_parquet_format;
@@ -1726,7 +1550,7 @@ fn a_binding_that_diverts_a_column_always_withholds_row_filter_pushdown() {
     );
 }
 
-/// Files with different column sets/orders must bind by name only — an ordinal field-id would bind the wrong column of the other file.
+/// Scenario: files with different column sets bind by name only, never by ordinal field-id.
 #[test]
 fn identity_binding_spans_files_with_different_column_sets() {
     let logical = Schema::new(vec![

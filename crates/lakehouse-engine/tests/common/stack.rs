@@ -1,4 +1,3 @@
-//! Stack readiness helpers and environment accessors for lakehouse-engine E2E tests.
 #![cfg(any(
     feature = "exasol-e2e",
     feature = "cloud-e2e",
@@ -12,11 +11,7 @@ use std::time::{Duration, Instant};
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 
-/// Read a `u16` port from `env_var`, falling back to `default`.
-///
-/// Port discipline: the suite targets the lakehouse-engine compose stack's
-/// dedicated host ports, all overridable so a fresh stack can always pick
-/// free ports. Defaults match `docker-compose.yml`.
+/// Defaults match `docker-compose.yml`; overridable so a fresh stack can pick free ports.
 fn port_from_env(env_var: &str, default: u16) -> u16 {
     std::env::var(env_var)
         .ok()
@@ -24,75 +19,56 @@ fn port_from_env(env_var: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-/// Hostname/IP of the Exasol container.
 pub fn exasol_host() -> String {
     std::env::var("EXASOL_HOST").unwrap_or_else(|_| "localhost".to_string())
 }
 
-/// Exasol SQL (WebSocket) host port. `LH_EXASOL_PORT`, default 28563.
 pub fn exasol_sql_port() -> u16 {
     port_from_env("LH_EXASOL_PORT", 28563)
 }
 
-/// Exasol BucketFS HTTPS host port. `LH_BUCKETFS_PORT`, default 22581.
 pub fn bucketfs_port() -> u16 {
     port_from_env("LH_BUCKETFS_PORT", 22581)
 }
 
-/// MinIO S3 host port. `LH_MINIO_PORT`, default 19000.
 pub fn minio_port() -> u16 {
     port_from_env("LH_MINIO_PORT", 19000)
 }
 
-/// Iceberg REST catalog host port. `LH_REST_PORT`, default 18181.
 pub fn rest_port() -> u16 {
     port_from_env("LH_REST_PORT", 18181)
 }
 
-/// Base URL of the Iceberg REST catalog as seen from the test process (host-side).
 pub fn iceberg_catalog_url() -> String {
     std::env::var("ICEBERG_CATALOG_URL")
         .unwrap_or_else(|_| format!("http://localhost:{}", rest_port()))
 }
 
-/// Base URL of MinIO as seen from the test process (host-side).
 pub fn minio_url() -> String {
     std::env::var("MINIO_URL").unwrap_or_else(|_| format!("http://localhost:{}", minio_port()))
 }
 
-/// The Iceberg catalog URL as reached from inside the Exasol UDF (Docker network).
-///
-/// The UDF runs inside the Exasol container on the `lakehouse` network and
-/// reaches the catalog by its in-container address (alias `iceberg-rest`,
-/// internal port 8181), NOT the host-published port.
+/// The UDF runs inside the Exasol container, so it needs the in-network address, not the
+/// host-published port.
 pub fn iceberg_catalog_url_internal() -> String {
     std::env::var("ICEBERG_CATALOG_URL_INTERNAL")
         .unwrap_or_else(|_| "http://iceberg-rest:8181".to_string())
 }
 
-/// MinIO endpoint as reached from inside the Exasol UDF (Docker network).
 pub fn minio_url_internal() -> String {
     std::env::var("MINIO_URL_INTERNAL").unwrap_or_else(|_| "http://minio:9000".to_string())
 }
 
-/// The Exasol container name (for `docker exec` credential extraction).
-///
-/// Resolution order:
-/// 1. `EXASOL_CONTAINER` env var (CI / manual override).
-/// 2. Discover the running container by its Compose service label, narrowed to
-///    the one publishing this stack's SQL port — works regardless of the
-///    Compose project prefix (`lakehouse-vs-*`, `lakehouse-engine-rs-*`, …) and
-///    stays correct when an unrelated Exasol stack is also running.
-/// 3. Hardcoded directory-derived default.
+/// Prefers `EXASOL_CONTAINER`, then the compose-labelled container publishing this
+/// stack's SQL port, then a directory-derived default.
 pub fn exasol_container() -> String {
     if let Ok(c) = std::env::var("EXASOL_CONTAINER")
         && !c.trim().is_empty()
     {
         return c.trim().to_string();
     }
-    // Disambiguate by the published SQL port so we never read credentials from a
-    // different Exasol stack that happens to share the `exasol` compose-service
-    // label. (A bare label filter assumes a single exasol container on the host.)
+    // Filter by the published SQL port too, so credentials are never read from an
+    // unrelated Exasol stack sharing the `exasol` compose-service label.
     if let Ok(out) = std::process::Command::new("docker")
         .args([
             "ps",
@@ -114,12 +90,6 @@ pub fn exasol_container() -> String {
     "lakehouse-engine-rs-exasol-1".to_string()
 }
 
-/// Extract the BucketFS write password.
-///
-/// Resolution order:
-/// 1. `BUCKETFS_WRITE_PASSWORD` env var
-/// 2. `BUCKETFS_WRITE_PASS` env var
-/// 3. docker exec into the Exasol container to read `/exa/etc/EXAConf`
 pub fn bucketfs_write_password() -> String {
     if let Ok(p) = std::env::var("BUCKETFS_WRITE_PASSWORD")
         && !p.is_empty()
@@ -145,7 +115,6 @@ pub fn bucketfs_write_password() -> String {
     pw
 }
 
-/// Polls a URL until it returns 2xx or the timeout expires.
 pub fn wait_for_url(url: &str, timeout: Duration) {
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(5))
@@ -169,7 +138,6 @@ pub fn wait_for_url(url: &str, timeout: Duration) {
     }
 }
 
-/// Assert Exasol SQL port is reachable; panic if not.
 pub fn wait_for_exasol() {
     use std::net::TcpStream;
     let host = exasol_host();
@@ -188,20 +156,16 @@ pub fn wait_for_exasol() {
     }
 }
 
-/// Assert MinIO is reachable; panic if not.
 pub fn wait_for_minio() {
     let url = format!("{}/minio/health/live", minio_url());
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
-/// Assert Iceberg REST catalog is reachable; panic if not.
 pub fn wait_for_iceberg_catalog() {
     let url = format!("{}/v1/config", iceberg_catalog_url());
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
-/// Upload a file to BucketFS via HTTPS PUT.
-///
 /// The file surfaces inside the DB at `/buckets/bfsdefault/default/<name>`.
 pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
     assert!(
@@ -221,11 +185,8 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
         .timeout(Duration::from_secs(120))
         .build()
         .expect("build BucketFS HTTPS client");
-    // BucketFS's HTTPS listener can transiently refuse/reset a connection right
-    // after the SQL port already accepts connections (`wait_for_exasol` only
-    // checks the SQL port). Retry a few times on a connection-level send()
-    // error before giving up; a non-2xx HTTP response is a real failure and
-    // is NOT retried.
+    // BucketFS can transiently refuse connections after the SQL port is already up, so
+    // connection-level send errors are retried; a non-2xx response is not.
     const MAX_ATTEMPTS: u32 = 5;
     let mut last_err = None;
     let mut resp = None;
@@ -261,7 +222,6 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
     );
 }
 
-/// Path (host-side) of the compiled lakehouse-engine .so.
 #[cfg(any(
     feature = "exasol-e2e",
     feature = "lakekeeper-e2e",
@@ -269,9 +229,7 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
     feature = "unity-e2e"
 ))]
 pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
-    // CARGO_MANIFEST_DIR = lakehouse-engine-rs/crates/lakehouse-engine; go up two levels to workspace root.
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    // crates/lakehouse-engine -> workspace root is ../../
     manifest
         .parent()
         .and_then(|p| p.parent())
@@ -279,23 +237,7 @@ pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
         .join("target/release/liblakehouse_engine.so")
 }
 
-// ---------------------------------------------------------------------------
-// CONNECTION credential helpers (shared by local-E2E and cloud-E2E)
-// ---------------------------------------------------------------------------
-
-/// Build the JSON password string for a catalog CONNECTION object.
-///
-/// The resulting string is suitable for use in:
-///   `CREATE OR REPLACE CONNECTION <name> TO '<uri>' USER '' IDENTIFIED BY '<json>'`
-///
-/// All boolean flags, including `path_style`, default to `false` under this
-/// struct's `Default` — callers that want `path_style: true` (e.g. MinIO) must
-/// set it explicitly, as `local_stack_connection_password` and the Lakekeeper
-/// static-warehouse password already do.
-/// The catalog-auth fields (`token`, `client_id`, `client_secret`,
-/// `oauth2_server_uri`, `scope`) are `Option<String>` and default to `None`
-/// (absent from the serialized JSON) so existing callers built via struct-update
-/// syntax (`..Default::default()`) need not set them.
+/// `path_style` defaults to `false`; MinIO callers must set it explicitly.
 #[derive(Default)]
 pub struct CatalogConnectionPassword {
     pub warehouse: String,
@@ -307,26 +249,17 @@ pub struct CatalogConnectionPassword {
     pub path_style: bool,
     pub use_sigv4: bool,
     pub use_vended_credentials: bool,
-    /// Static bearer token for catalog authentication. Absent when not supplied.
     pub token: Option<String>,
-    /// OAuth2 client ID for catalog client-credentials flow. Absent when not supplied.
     pub client_id: Option<String>,
-    /// OAuth2 client secret for catalog client-credentials flow. Absent when not supplied.
     pub client_secret: Option<String>,
-    /// Optional OAuth2 token endpoint URI. Absent when not supplied.
     pub oauth2_server_uri: Option<String>,
-    /// Optional OAuth2 scope. Absent when not supplied.
     pub scope: Option<String>,
-    /// Azure storage account name (ADLS static credential). Absent when not supplied.
     pub account_name: Option<String>,
-    /// Azure storage account key (ADLS static credential). Absent when not supplied.
     pub account_key: Option<String>,
 }
 
 impl CatalogConnectionPassword {
-    /// Serialize to a JSON string suitable for the CONNECTION `IDENTIFIED BY` clause.
-    ///
-    /// Single quotes within the value are escaped as `''` for SQL embedding.
+    /// Single quotes are escaped as `''` for SQL embedding.
     pub fn to_sql_password_json(&self) -> String {
         let mut obj = serde_json::json!({
             "warehouse": self.warehouse,
@@ -362,35 +295,22 @@ impl CatalogConnectionPassword {
         if let Some(account_key) = &self.account_key {
             obj["account_key"] = serde_json::Value::String(account_key.clone());
         }
-        // Escape single quotes for safe SQL embedding (SQL string literal).
         obj.to_string().replace('\'', "''")
     }
 }
 
-/// Build the `CREATE OR REPLACE CONNECTION` SQL statement for a catalog connection.
-///
-/// `conn_name`: the Exasol CONNECTION object name (bare, no quoting)
-/// `catalog_uri`: the Iceberg REST catalog address (goes into CONNECTION address)
-/// `password`: credential parameters for the JSON password
 pub fn build_create_connection_sql(
     conn_name: &str,
     catalog_uri: &str,
     password: &CatalogConnectionPassword,
 ) -> String {
     let json_pw = password.to_sql_password_json();
-    // catalog_uri goes into TO '...' — escape any single quotes in it too.
     let safe_uri = catalog_uri.replace('\'', "''");
     format!(
         "CREATE OR REPLACE CONNECTION {conn_name} TO '{safe_uri}' USER '' IDENTIFIED BY '{json_pw}'"
     )
 }
 
-/// Build and return the `CatalogConnectionPassword` for the local Docker stack
-/// (MinIO + Iceberg REST catalog, internal Docker network addresses).
-///
-/// Uses the same internal URLs that `create_virtual_schema` uses for
-/// CATALOG_URI / S3_ENDPOINT — these are the addresses reachable from
-/// inside the Exasol UDF container.
 #[cfg(any(
     feature = "exasol-e2e",
     feature = "lakekeeper-e2e",
@@ -412,12 +332,7 @@ pub fn local_stack_connection_password() -> CatalogConnectionPassword {
     }
 }
 
-/// Extract a libtest panic payload as an owned `String`, when it carries one.
-///
-/// A panic always carries either a `&'static str` or a `String` — libtest's
-/// payload contract — so these are the only two downcasts tried; anything else
-/// yields `None`. Centralizes the downcast shared by every credential-redaction
-/// panic-message assertion under `tests/`.
+/// A libtest panic payload is always a `&'static str` or a `String`.
 pub fn panic_payload_message(payload: &(dyn std::any::Any + Send)) -> Option<String> {
     payload
         .downcast_ref::<String>()
@@ -461,8 +376,7 @@ mod catalog_connection_password_tests {
         }
     }
 
-    /// Token and OAuth2 are separate CONNECTION shapes: `validate_creds` rule 6
-    /// rejects a password supplying both, so each is modelled on its own.
+    /// Scenario: token auth serializes alone, since `validate_creds` rejects token plus OAuth2
     #[test]
     fn serializes_token_auth_field_when_present() {
         let password = CatalogConnectionPassword {
@@ -474,8 +388,7 @@ mod catalog_connection_password_tests {
         assert_eq!(parsed["token"], "bearer-token");
     }
 
-    /// Token and OAuth2 are separate CONNECTION shapes: `validate_creds` rule 6
-    /// rejects a password supplying both, so each is modelled on its own.
+    /// Scenario: OAuth2 auth serializes alone, since `validate_creds` rejects token plus OAuth2
     #[test]
     fn serializes_oauth2_auth_fields_when_present() {
         let password = CatalogConnectionPassword {

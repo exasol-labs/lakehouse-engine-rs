@@ -1,7 +1,5 @@
-//! Raw-Parquet fixture writer for the direct-storage E2E suites: PUTs Parquet bytes
-//! directly at a chosen object key (no catalog table, snapshot, or Iceberg field-id
-//! metadata), unlike every other fixture, which goes through `seed.rs`'s iceberg-rust
-//! writer stack.
+//! Raw-Parquet fixture writer: PUTs Parquet bytes at a chosen object key, with no
+//! catalog table, snapshot, or Iceberg field-id metadata.
 #![cfg(any(feature = "exasol-e2e", feature = "azure-e2e"))]
 
 use super::e2e_harness::{local_stack_s3_store, split_s3_bucket_and_key};
@@ -12,7 +10,6 @@ use object_store::path::Path as ObjectStorePath;
 use object_store::{ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
 
-/// Encodes `batch` as Parquet with no Iceberg field-id metadata — just `batch`'s own Arrow schema.
 fn encode_parquet(batch: &RecordBatch) -> Bytes {
     let mut buf = Vec::new();
     let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None)
@@ -26,10 +23,7 @@ fn encode_parquet(batch: &RecordBatch) -> Bytes {
     Bytes::from(buf)
 }
 
-/// Writes `batch` as one Parquet object at `uri` (e.g.
-/// `"s3://warehouse/direct/events/file1.parquet"`) via the shared local-stack S3
-/// backend, keying it verbatim so `region=a%2Fb` stays literal as Spark writes it.
-/// Idempotent: a repeated call at the same `uri` overwrites the object.
+/// Keys the object verbatim so `region=a%2Fb` stays literal, as Spark writes it.
 pub fn write_parquet_fixture(uri: &str, batch: RecordBatch) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);

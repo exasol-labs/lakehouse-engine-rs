@@ -1,18 +1,6 @@
-//! Compile-time reachability probe for the `pushdown` module's public surface,
-//! from an external-crate vantage.
-//!
-//! This is a pure `use` list with no behavior. Unlike
-//! `src/adapter/pushdown_surface_probe_tests.rs`, which shares the crate and so also
-//! sees `pub(crate)` items, this file lives in the `tests/` crate and can only
-//! see items that are genuinely `pub`. Its 17 items are therefore a subset of
-//! that probe's 27.
-//!
-//! The `use` list below IS the baseline for the externally-`pub` half of the
-//! façade. There is no separate baseline file to consult, so there is nothing
-//! for the surface contract to drift from. Narrowing any of these items to
-//! `pub(crate)` or less fails this file's compilation. As with the in-crate
-//! probe, the count is stated because the compiler catches only narrowing, not
-//! deletion. Changing the set or the count requires a spec delta against
+//! External-crate reachability probe: only genuinely `pub` items of `pushdown` compile here
+//! (17 items, a subset of the in-crate probe's 27). The count is stated because the compiler
+//! catches narrowing, not deletion; changing it requires a spec delta against
 //! `vs-adapter/pushdown-module-structure`.
 #![allow(unused_imports)]
 

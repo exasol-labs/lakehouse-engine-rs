@@ -1,22 +1,5 @@
-//! Host integration test for the column-binding resolution order in
-//! `crates/lakehouse-engine/src/scan/field_id_projection.rs::bind_columns`:
-//! embedded `PARQUET:field_id` -> declared `physical_name` -> `name_mapping`
-//! -> identity. Docker-free: drives the production raw-scan pipeline
-//! (`run_raw_scan_with_session` -> `build_dataframe` -> `register_files` ->
-//! `bind_columns`) against local `file://` Parquet written via `ArrowWriter`,
-//! mirroring the harness in `scan_name_mapping.rs` / `scan_no_head_test.rs`.
-//!
-//! Two scenarios:
-//!
-//! 1. `declared_physical_name_binds_the_renamed_physical_column` — a
-//!    `LogicalField` declaring `physical_name` binds the matching physical
-//!    column, and wins over a `name_mapping` entry that covers the same
-//!    physical name for a DIFFERENT logical field.
-//! 2. `identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics`
-//!    — a `LogicalField` with neither `field_id` nor `physical_name` binds by
-//!    its own name: absent-nullable NULL-fills, absent-with-`initial_default`
-//!    substitutes the default, and absent-required-without-default errors
-//!    cleanly rather than panicking.
+//! Column-binding order in `bind_columns`: embedded `PARQUET:field_id` -> declared
+//! `physical_name` -> `name_mapping` -> identity.
 
 use std::sync::Arc;
 
@@ -39,8 +22,6 @@ use parquet::arrow::ArrowWriter;
 
 mod scan_fixture;
 
-/// Storage props are never dialed for a local `file://` scan; a placeholder
-/// keeps the spec well-formed (copied from `scan_no_head_test.rs`).
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
@@ -52,11 +33,7 @@ fn dummy_storage() -> StorageBackend {
     })
 }
 
-/// Write a local Parquet at `dir/relative` with the given Int64 columns
-/// (name, nullable) pairs, NONE carrying `PARQUET:field_id` metadata — every
-/// binding under test here resolves without an embedded field-id. `id`
-/// (assumed to be the first column) takes values `0..rows`; every other
-/// column takes `10 * id`. Returns the file's absolute `file://` URL.
+/// No column carries `PARQUET:field_id`. The first column holds `0..rows`, the rest `10 * id`.
 fn write_local_parquet(
     dir: &std::path::Path,
     relative: &str,
@@ -79,8 +56,6 @@ fn write_local_parquet(
         .iter()
         .enumerate()
         .map(|(index, _)| {
-            // The first column is always `id`, carrying the identity values,
-            // every other column carries `10 * id`.
             let values: Vec<i64> = if index == 0 {
                 ids.clone()
             } else {
@@ -128,8 +103,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Run the production raw scan for `spec` against a session whose `file://`
-/// object store is a plain `LocalFileSystem` (no HEAD interception needed).
 async fn run_scan(
     spec: &ScanSpec,
     register_url: &str,
@@ -157,13 +130,7 @@ fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
         .expect("int64 column")
 }
 
-/// A `LogicalField` declaring `physical_name: Some("col-abc")` binds the
-/// physical column of that name (`AMOUNT` carries the real `10 * id`
-/// values), and that declared binding wins even though a `name_mapping`
-/// entry ALSO covers `col-abc` for a DIFFERENT logical field (`OTHER`,
-/// bound by field-id 7): had `name_mapping` won instead, `OTHER` would carry
-/// the real values and `AMOUNT` would be the one left NULL — the reverse of
-/// what this test asserts.
+/// Scenario: a declared `physical_name` binds its column and wins over a `name_mapping` entry for another field
 #[test]
 fn declared_physical_name_binds_the_renamed_physical_column() {
     let dir = std::env::temp_dir().join(format!(
@@ -253,10 +220,7 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A `LogicalField` with neither `field_id` nor `physical_name` set binds by
-/// its own name (identity): present -> real value, absent-nullable ->
-/// NULL-fill, absent-with-`initial_default` -> the default value, and
-/// absent-required-without-default -> a clean scan error, never a panic.
+/// Scenario: identity-bound fields bind by name and keep NULL-fill, default, and required-error semantics
 #[test]
 fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
     let dir =
@@ -278,8 +242,6 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
         physical_name: None,
     };
 
-    // Absent nullable field (no default) NULL-fills; absent field with an
-    // `initial_default` substitutes it instead of NULL.
     let logical_schema = vec![
         id_field(),
         LogicalField {
@@ -335,8 +297,6 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
     }
     assert_eq!(row_count, rows as usize, "row count");
 
-    // Absent REQUIRED identity-bound field with no default must error
-    // cleanly, naming the column, never panic.
     let required_missing_schema = vec![
         id_field(),
         LogicalField {
@@ -367,11 +327,7 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (type-mapping): one Parquet file carrying a nested `list` column, a
-/// nested `struct` column, and an ordinary primitive column together — the
-/// nested columns render as valid JSON while the primitive column passes
-/// through the scan completely unaffected, proving the two column-handling
-/// paths coexist correctly within one scan.
+/// Scenario: nested list/struct columns render as JSON while a primitive column in the same scan passes through
 #[test]
 fn mixed_column_parquet_file_emits_json_for_populated_list_and_struct() {
     use arrow::array::{ArrayRef, ListBuilder, StringArray, StringBuilder, StructArray};

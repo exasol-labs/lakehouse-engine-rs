@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
-# Install the deploying-machine toolchain for the lakehouse-engine perf-test stacks.
-# Idempotent: each tool is skipped if already present. Run with sudo:
 #   sudo deploy/scripts/install-prereqs.sh
-#
-# Installs: OpenTofu, AWS CLI v2, jq, openssh-client, curl, unzip.
-# Checks (does NOT install) Docker — it needs a daemon + group setup the repo already documents.
+# Docker is only checked, not installed: it needs daemon + group setup.
 set -euo pipefail
 
 if [[ $EUID -ne 0 ]]; then
@@ -12,7 +8,6 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# Resolve a non-root user for 'aws configure' hints later (best-effort).
 REAL_USER="${SUDO_USER:-$(id -un)}"
 
 log()  { printf '\033[1;34m==>\033[0m %s\n' "$*"; }
@@ -23,7 +18,6 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq jq curl unzip ca-certificates gnupg openssh-client
 
-# --- OpenTofu ---------------------------------------------------------------
 if have tofu; then
   log "OpenTofu already installed: $(tofu version | head -1)"
 else
@@ -36,7 +30,6 @@ else
   log "OpenTofu installed: $(tofu version | head -1)"
 fi
 
-# --- AWS CLI v2 -------------------------------------------------------------
 if have aws && aws --version 2>&1 | grep -q 'aws-cli/2'; then
   log "AWS CLI v2 already installed: $(aws --version 2>&1)"
 else
@@ -55,7 +48,6 @@ else
   log "AWS CLI v2 installed: $(aws --version 2>&1)"
 fi
 
-# --- Docker (check only) ----------------------------------------------------
 if have docker; then
   log "Docker present: $(docker --version)"
 else

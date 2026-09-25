@@ -1,45 +1,26 @@
 #!/usr/bin/env bash
-# Seed the Unity Catalog + Delta E2E stack (spike #325):
-#   1. upload every vendored Delta fixture table to MinIO (bucket `warehouse`)
-#   2. mint the MinIO STS session Unity Catalog vends for `s3://warehouse` and
-#      restart the server with it (see server.properties for why it must be real)
-#   3. register the fixtures in Unity Catalog as EXTERNAL Delta tables
+# Re-running replaces every table registration, so a manifest/fixture change
+# never leaves a stale one behind.
 #
-# Convergent: re-running replaces every table registration from the manifest, so a
-# manifest/fixture change never leaves a stale registration behind. Fail-loud: any
-# step that fails aborts non-zero (the E2E contract is FAIL, not skip, when the
-# fixture cannot be provisioned).
+# Fixtures are prebuilt delta-kernel-rs test tables (fixtures/PROVENANCE.md)
+# because delta-rs cannot write deletion vectors or column mapping.
 #
-# Fixtures are prebuilt delta-kernel-rs test tables (see fixtures/PROVENANCE.md)
-# because delta-rs cannot WRITE deletion vectors or column mapping — the two
-# correctness features this milestone delivers (SPIKE_UC_DELTA_HARNESS.md §Q3).
-#
-# NOTE on UC columns: for an EXTERNAL Delta table the engine reads the real
-# schema + protocol from the Delta log; the UC column list is an advisory
-# discovery hint. Nested/incompatible Delta types (array/map/struct/variant/
-# binary) are registered here as STRING — mirroring how the engine surfaces them
-# to Exasol (JSON VARCHAR). Each downstream issue refines expectations as needed.
-#
-# Prereqs: the stack is up (docker compose ... up -d minio exasol unitycatalog)
-# and MinIO's `warehouse` bucket exists (base `minio-init`). Needs docker + python3.
+# UC columns are advisory for EXTERNAL Delta tables (the engine reads the Delta
+# log); nested/incompatible types are registered as STRING.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
-NETWORK="${LH_NETWORK:-lakehouse-engine}"        # base compose sets name: lakehouse-engine
-# pgsty/mc mirrors mc — see docker-compose.yml's `minio` service comment.
+NETWORK="${LH_NETWORK:-lakehouse-engine}"
 MC_IMAGE="pgsty/mc:RELEASE.2026-09-16T00-00-00Z"
 export UC_BASE="http://localhost:${LH_UNITY_PORT:-18080}/api/2.1/unity-catalog"
 export UC_CATALOG="unity"
 export UC_SCHEMA="delta_e2e"
-export UC_PREFIX="delta"                          # tables land at s3://warehouse/delta/<dir>
+export UC_PREFIX="delta"
 
 echo "=== unity-seed: uploading Delta fixtures to MinIO (bucket warehouse) ==="
-# Bind-mount the vendored fixtures (repo path is shareable with Docker Desktop)
-# and mirror each table dir into the bucket. Idempotent; preserves the
-# _delta_log/ + parquet + deletion-vector .bin layout (relative paths only).
 docker run --rm --network "$NETWORK" -v "$FIXTURES_DIR":/fx:ro \
   --entrypoint /bin/sh "$MC_IMAGE" -c '
     set -e
@@ -52,20 +33,11 @@ docker run --rm --network "$NETWORK" -v "$FIXTURES_DIR":/fx:ro \
   '
 
 echo "=== unity-seed: minting the MinIO STS session Unity Catalog vends ==="
-# Unity Catalog OSS 0.5.0 can only vend a credential for `s3://warehouse` through
-# its per-bucket static generator, and that generator is selected ONLY by a
-# non-empty `s3.sessionToken.0` — which it then hands back verbatim. A vended
-# session token is contractually real (the client must send it as
-# `x-amz-security-token`), and MinIO rejects any token that is not a live STS
-# session with 403 InvalidTokenId, so a placeholder there makes every vended read
-# fail. UC's own STS generator cannot stand in: its bundled SDK ignores
-# AWS_ENDPOINT_URL[_STS], so it would call the real sts.amazonaws.com.
-#
-# The harness therefore mints a genuine, expiring MinIO STS session here and
-# injects the resulting triple as UC's preset credential. MinIO serves STS
-# AssumeRole at its S3 endpoint (the same mechanism the Lakekeeper overlay's
-# vended warehouse uses); the session inherits the parent's permissions and lasts
-# MinIO's 7-day maximum, so it outlives the stack it is minted for.
+# UC OSS 0.5.0 vends for `s3://warehouse` only via its static generator, which
+# is selected by a non-empty `s3.sessionToken.0` and returns it verbatim. MinIO
+# rejects any token that is not a live STS session (403 InvalidTokenId), and UC's
+# own STS generator ignores AWS_ENDPOINT_URL, so a real 7-day MinIO STS session
+# is minted here.
 STS_TRIPLE=$(
   MINIO_STS_ENDPOINT="http://localhost:${LH_MINIO_PORT:-19000}" python3 - <<'PY'
 import datetime, hashlib, hmac, os, sys, urllib.error, urllib.request
@@ -129,14 +101,9 @@ PY
 read -r STS_ACCESS_KEY STS_SECRET_KEY STS_SESSION_TOKEN <<<"$STS_TRIPLE"
 
 echo "=== unity-seed: restarting Unity Catalog with the vended credential ==="
-# UC reads server.properties and its environment once, at boot, so the freshly
-# minted credential can only reach it through a container recreate. This runs
-# BEFORE registration on purpose: `server.env=test` keeps UC's catalog in an
-# in-memory H2 database, so a recreate discards every registration.
-#
-# `env` rather than a shell assignment because UC's property names are also the
-# environment-variable names it looks them up under, and `s3.accessKey.0` is not a
-# valid shell identifier. The compose service passes these three through by name.
+# UC reads credentials only at boot, so it must be recreated; this runs before
+# registration because `server.env=test` keeps the catalog in in-memory H2.
+# `env` because `s3.accessKey.0` is not a valid shell identifier.
 env "s3.accessKey.0=$STS_ACCESS_KEY" \
     "s3.secretKey.0=$STS_SECRET_KEY" \
     "s3.sessionToken.0=$STS_SESSION_TOKEN" \
@@ -144,8 +111,6 @@ env "s3.accessKey.0=$STS_ACCESS_KEY" \
   up -d --wait unitycatalog
 
 echo "=== unity-seed: registering catalog/schema/tables in Unity Catalog ==="
-# Registration is data-driven (a manifest) — Python keeps the multi-column and
-# nested-type cases readable, which the bash string-concat approach could not.
 python3 - <<'PY'
 import json, os, urllib.request, urllib.error
 

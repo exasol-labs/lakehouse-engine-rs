@@ -1,27 +1,5 @@
-//! End-to-end inner equi-join pushdown tests for the lakehouse-engine Virtual
-//! Schema, against the local Exasol + MinIO + Iceberg Docker stack.
-//!
-//! Covers the two correctness-critical paths of the broadcast join feature
-//! (plan `add-join-pushdown-broadcast`, tasks 5.4 / 5.5):
-//!
-//!   * BROADCAST — the smaller (dimension) side is within
-//!     `JOIN_BROADCAST_MAX_BYTES`, so the join is pushed down as a SINGLE
-//!     scan-UDF-driving query: the fact side is sharded and the dimension side
-//!     rides as a file list in the common ScanSpec blob's join block, joined
-//!     node-locally in DataFusion.
-//!   * UNACCELERATED FALLBACK — with `JOIN_BROADCAST_MAX_BYTES = '1'` the
-//!     dimension side exceeds the threshold, so the adapter emits a deterministic
-//!     two-scan join (each side its own sharded fan-out, joined by Exasol's core
-//!     engine). This must return the IDENTICAL result to the broadcast path —
-//!     the plan's promise to "never regress correctness for any inner equi-join
-//!     Exasol pushes".
-//!
-//! Seed tables: `dim_customer` (C_CUSTKEY, C_NAME; 5 rows, 1 file) and
-//! `fact_orders` (O_ORDERKEY, O_CUSTKEY, O_ORDERDATE; 10 rows, 2 files), with
-//! DISJOINT column-name prefixes so the adapter's disjoint-column guard lets it
-//! render the join. Every order references a valid customer. See `common/seed.rs`.
-//!
-//! All tests FAIL (never skip) when the stack is unavailable.
+//! E2E inner equi-join pushdown tests: broadcast join and the unaccelerated fallback,
+//! which must return identical results. Fail, never skip, without the stack.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -39,21 +17,10 @@ use common::stack::{
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-// ---------------------------------------------------------------------------
-// Constants (mirror e2e_capability_test.rs — same stack, same scan schema)
-// ---------------------------------------------------------------------------
-
-/// Virtual schema with the DEFAULT broadcast threshold (128 MiB): the small
-/// dimension side is broadcast-eligible.
+/// Default broadcast threshold: the small dimension side is broadcast-eligible.
 const VS_NAME: &str = "MY_LAKEHOUSE_JOIN";
-/// Virtual schema forced ABOVE the broadcast threshold (`JOIN_BROADCAST_MAX_BYTES
-/// = '1'`): every dimension candidate exceeds 1 byte → unaccelerated two-scan.
+/// `JOIN_BROADCAST_MAX_BYTES = '1'` forces every join onto the unaccelerated fallback.
 const VS_NAME_LOW: &str = "MY_LAKEHOUSE_JOIN_LOW";
-
-// ---------------------------------------------------------------------------
-// One-time setup (idempotent; identical stack to e2e_capability_test.rs, plus a
-// second virtual schema forced above the broadcast threshold)
-// ---------------------------------------------------------------------------
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -78,9 +45,7 @@ fn setup_e2e() {
 
         let mut conn = exa_conn();
         create_schema_and_scripts(&mut conn);
-        // Broadcast VS (default threshold) and low-threshold VS (forced fallback).
-        // The catalog CONNECTION is re-issued idempotently inside each
-        // `create_virtual_schema`, so no separate create_connection step is needed.
+        // Each `create_virtual_schema` re-issues the catalog CONNECTION idempotently.
         create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
         create_virtual_schema(
             &mut conn,
@@ -88,10 +53,6 @@ fn setup_e2e() {
         );
     });
 }
-
-// ---------------------------------------------------------------------------
-// Query helpers
-// ---------------------------------------------------------------------------
 
 fn vs_lineitem_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_LINEITEM_TABLE.to_uppercase())
@@ -101,10 +62,7 @@ fn vs_supplier_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_SUPPLIER_TABLE.to_uppercase())
 }
 
-/// Fetch a 2-column `(C_NAME, O_ORDERDATE)` join query's rows in the exact order
-/// Exasol returned them — unlike `fetch_join_rows`/`columns_to_sorted_pairs`, which
-/// sort for order-independent multiset comparison, an `ORDER BY` test needs the
-/// query's own row order preserved to assert against.
+/// Preserves Exasol's row order, for `ORDER BY` assertions.
 fn fetch_join_rows_in_query_order(conn: &mut ExaConn, query_sql: &str) -> Vec<(String, String)> {
     let cols = conn.query_columns(query_sql);
     assert_eq!(
@@ -120,11 +78,8 @@ fn fetch_join_rows_in_query_order(conn: &mut ExaConn, query_sql: &str) -> Vec<(S
         .collect()
 }
 
-/// Ground truth for `ORDER BY O_ORDERDATE DESC` over the join: the same rows
-/// `expected_join_rows` computes independently of the join pushdown, re-ordered by
-/// `O_ORDERDATE` descending. Dates are one calendar day apart per order key in this
-/// fixture (`seed::order_date_days`), so there are no ties to break and a plain
-/// string sort on the ISO `YYYY-MM-DD` text matches chronological order.
+/// Dates are one day apart per order key, so there are no ties and ISO text sorts
+/// chronologically.
 fn expected_join_rows_by_orderdate_desc(
     conn: &mut ExaConn,
     vs_name: &str,
@@ -134,21 +89,7 @@ fn expected_join_rows_by_orderdate_desc(
     rows
 }
 
-// ---------------------------------------------------------------------------
-// 5.4  Broadcast join: single scan-UDF-driving shape + correct result
-// ---------------------------------------------------------------------------
-
-// Both tests below run on `exa_conn()`'s default connection, which declares NO row
-// cap (`exasol_ws.rs:98`, `result_set_max_rows: 0` — uncapped since #314). That is
-// no longer load-bearing the way it once was: a bare SQL `LIMIT` no longer
-// disqualifies the broadcast plan, so a declared cap would not silently move either
-// the shape or the correctness assertion below onto the two-scan fallback path.
-// `e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates` below pins that a
-// bare `LIMIT` now stays broadcast.
-
-/// EXPLAIN VIRTUAL of a broadcast-eligible inner equi-join shows the SINGLE
-/// scan-UDF-driving broadcast fan-out (matching the plan's first Manual Testing
-/// row): one `LAKEHOUSE_SCAN` invocation, NOT the two-scan Exasol-joined shape.
+/// Scenario: a broadcast-eligible join is pushed as a single scan-UDF broadcast fan-out
 #[test]
 fn e2e_broadcast_join_pushdown_shape() {
     setup_e2e();
@@ -167,9 +108,7 @@ fn e2e_broadcast_join_pushdown_shape() {
     );
 }
 
-/// The broadcast join returns the correct result: identical (as a sorted
-/// multiset) to the join computed independently from the two tables read
-/// un-joined through the same VS.
+/// Scenario: the broadcast join matches the join computed from the un-joined tables
 #[test]
 fn e2e_broadcast_join_result_correct() {
     setup_e2e();
@@ -178,8 +117,6 @@ fn e2e_broadcast_join_result_correct() {
     let actual = fetch_join_rows(&mut conn, VS_NAME);
     let expected = expected_join_rows(&mut conn, VS_NAME);
 
-    // Every order with O_ORDERDATE >= 2024-01-05 (order keys 5..=10) matches a
-    // customer → 6 result rows.
     assert_eq!(
         actual.len(),
         6,
@@ -193,18 +130,7 @@ fn e2e_broadcast_join_result_correct() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// A bare LIMIT or a bare-column ORDER BY over a broadcast-eligible join now
-// STAYS broadcast (issue #307): the classifier forces the two-scan fallback
-// only for the genuinely Exasol-postprocessed shapes below it.
-// ---------------------------------------------------------------------------
-
-/// A bare SQL `LIMIT` over the otherwise broadcast-eligible join of
-/// `e2e_broadcast_join_pushdown_shape` no longer disqualifies the broadcast plan:
-/// each fact shard caps its own joined output at `n` before the outer merge
-/// truncates to `n` again, so EXPLAIN VIRTUAL still shows the single scan-UDF
-/// broadcast fan-out, and the query returns exactly `n` rows, each one of the
-/// unbounded join's rows.
+/// Scenario: a bare LIMIT over a broadcast-eligible join stays broadcast and returns exactly n join rows
 #[test]
 fn e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates() {
     setup_e2e();
@@ -246,11 +172,7 @@ fn e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates() {
     }
 }
 
-/// An `ORDER BY … LIMIT` over the same join is served by an outer wrapper over
-/// the broadcast fan-out: EXPLAIN VIRTUAL still shows the broadcast join block,
-/// and the result is the exact top-N rows of the join ordered by `O_ORDERDATE`
-/// descending — computed independently, without the window, as the
-/// single-node-equivalent ground truth.
+/// Scenario: ORDER BY … LIMIT over a broadcast join returns the exact top-N via an outer wrapper
 #[test]
 fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
     setup_e2e();
@@ -286,16 +208,7 @@ fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
     );
 }
 
-/// A division by zero inside the FACT-leg filter of a broadcast join fails the
-/// query, and does so from INSIDE the broadcast plan (#370).
-///
-/// Both halves matter. The shape assertion proves the predicate actually rode
-/// into the node-local join rather than disqualifying the broadcast plan and
-/// falling back to the two-scan wrapper, where Exasol would evaluate the
-/// division itself. The failure assertion proves the fact-leg filter is one of
-/// the pushed expressions the session-registered checked division reaches —
-/// pre-fix it was a filter position, so it silently changed the joined row
-/// count exactly as the single-table predicate did.
+/// Scenario: division by zero in a broadcast join's fact-leg filter fails the query from inside the broadcast plan (#370)
 #[test]
 fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
     setup_e2e();
@@ -341,12 +254,7 @@ fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
     );
 }
 
-/// Two more ordered shapes stay broadcast: a bare `ORDER BY` with NO `LIMIT`
-/// (the full join, ordered), and `ORDER BY … LIMIT … OFFSET` (an exact offset
-/// window). The offset arm is the one shape where Exasol's grammar rule tying
-/// `OFFSET` to a preceding `ORDER BY` is load-bearing — the `OFFSET` this query
-/// carries is only legal SQL because the `ORDER BY` precedes it — so it is run
-/// against the live database rather than inspected as a SQL string only.
+/// Scenario: a bare ORDER BY and ORDER BY … LIMIT … OFFSET over the join stay broadcast
 #[test]
 fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
     setup_e2e();
@@ -408,16 +316,7 @@ fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
     );
 }
 
-/// Two shapes still fall back to the two-scan wrapper. An aggregate over the
-/// join is unrelated to this plan's classification change (already pinned by
-/// `e2e_aggregate_over_join_uses_two_scan_wrapper`; reasserted here alongside
-/// the offset arm as one "still falls back" group). A `LIMIT … OFFSET` with NO
-/// `ORDER BY` never reaches the adapter at all: Exasol's grammar rejects an
-/// `OFFSET` with no preceding `ORDER BY` (`sqlCode 42000`, "OFFSET not allowed
-/// in LIMIT without ORDER BY") before the query is ever parsed into a pushdown
-/// request — the offset-implies-ordering invariant this plan's ordered arm
-/// relies on. It can therefore never become broadcast-eligible, exactly as the
-/// pre-existing two-scan-only aggregate arm never did.
+/// Scenario: an aggregate over the join falls back to two-scan, and Exasol rejects LIMIT … OFFSET without ORDER BY before pushdown
 #[test]
 fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
     setup_e2e();
@@ -456,16 +355,7 @@ fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5.5  Above-threshold unaccelerated fallback: two-scan shape + same result
-// ---------------------------------------------------------------------------
-
-/// With `JOIN_BROADCAST_MAX_BYTES = '1'` the dimension side exceeds the
-/// threshold, so EXPLAIN VIRTUAL shows the deterministic two-scan fallback (two
-/// independent per-table fan-outs joined by Exasol's core engine): the unified
-/// renderer's `LHS_T0`/`LHS_T1` wrapper and TWO scan-UDF invocations. It must
-/// NOT be the broadcast shape and must NOT be a native retry (which would carry
-/// no `LHS_T*` wrapper).
+/// Scenario: above the broadcast threshold the join uses the two-scan `LHS_T0`/`LHS_T1` wrapper
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();
@@ -484,9 +374,7 @@ fn e2e_above_threshold_unaccelerated_fallback_shape() {
     );
 }
 
-/// The above-threshold unaccelerated fallback returns the IDENTICAL result to
-/// the broadcast path — the plan's promise never to regress correctness for any
-/// inner equi-join Exasol pushes.
+/// Scenario: the above-threshold fallback returns the same result as the broadcast path
 #[test]
 fn e2e_above_threshold_result_matches_broadcast() {
     setup_e2e();
@@ -506,16 +394,9 @@ fn e2e_above_threshold_result_matches_broadcast() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Aggregate over a join (the plan's second Manual Testing query). Exasol pushes
-// the whole `COUNT(*), MIN(o.O_ORDERDATE) FROM fact JOIN dim ON ...` — aggregate
-// AND join — to the adapter. It is served by the two-scan wrapper with the
-// aggregate rendered as ordinary Exasol SQL over the materialized join (Exasol
-// aggregates the joined-and-materialized rows, exactly as before any `JOIN`
-// capability existed), NEVER the broadcast in-UDF join.
-// ---------------------------------------------------------------------------
+// An aggregate over a join is served by the two-scan wrapper with Exasol aggregating
+// the materialized join, never by the broadcast in-UDF join.
 
-/// `SELECT COUNT(*), MIN(o.O_ORDERDATE) FROM fact JOIN dim ON ...` for one VS.
 fn aggregate_join_query(vs_name: &str) -> String {
     format!(
         "SELECT COUNT(*), MIN(o.O_ORDERDATE) FROM {} o \
@@ -525,10 +406,7 @@ fn aggregate_join_query(vs_name: &str) -> String {
     )
 }
 
-/// An aggregate over a join is routed to the two-scan wrapper (aggregate executed
-/// by Exasol over the join), NOT the broadcast in-UDF join — even on the
-/// broadcast-eligible VS. This is the routing fix: an aggregate select list cannot
-/// ride the broadcast join, so it forces the qualified two-scan path.
+/// Scenario: an aggregate over a join routes to the two-scan wrapper even on the broadcast-eligible VS
 #[test]
 fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
     setup_e2e();
@@ -551,21 +429,12 @@ fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
     );
 }
 
-/// The aggregate-over-join result is correct: COUNT(*) and MIN(O_ORDERDATE) over
-/// the join equal the same aggregate over the fact table alone — every order has a
-/// matching customer, so the inner join neither drops nor duplicates a fact row.
-/// Asserted on BOTH the broadcast-eligible VS and the forced-fallback VS (both take
-/// the two-scan aggregate path), so neither regresses the correctness the plan
-/// promises. This is the `SELECT COUNT(*), MIN(o.O_ORDERDATE) FROM CUSTOMER JOIN
-/// ORDERS ...` query that previously failed with "expected 2 columns but pushdown
-/// query has 5".
+/// Scenario: an aggregate over a join equals the same aggregate over the fact table on both VSs
 #[test]
 fn e2e_aggregate_over_join_result_correct() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Ground truth: the single-table aggregate over the fact table (already served
-    // by the working single-table aggregate pushdown).
     let truth = conn.query_columns(&format!(
         "SELECT COUNT(*), MIN(O_ORDERDATE) FROM {}",
         vs_fact_table(VS_NAME)
@@ -603,20 +472,9 @@ fn e2e_aggregate_over_join_result_correct() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 6.2  N-scan unaccelerated fallback: 3-table and 4-table inner joins actually
-// succeed end-to-end (no F-UDF-CL-RUST-9001) and return correct results.
-//
-// Chain: dim_customer ⋈ fact_orders ⋈ fact_lineitem [⋈ dim_supplier], joined on
-// C_CUSTKEY=O_CUSTKEY, then O_ORDERKEY=L_ORDERKEY, then (4-table only)
-// L_SUPPKEY=S_SUPPKEY. See `common/seed.rs::seed_multi_table_join_extension`:
-// every line item references exactly one seeded order and one seeded supplier,
-// so both joins yield every seeded `fact_lineitem` row — `LINEITEM_ROWS`.
-// ---------------------------------------------------------------------------
+// Every line item references exactly one order and one supplier, so the 3- and 4-table
+// joins both yield every `fact_lineitem` row.
 
-/// Fetch a query's result columns as a sorted `Vec<Vec<String>>` (row-major,
-/// order-independent multiset comparison), generalizing `columns_to_sorted_pairs`
-/// past a fixed 2-column shape.
 fn fetch_rows_as_vecs(cols: &[Vec<serde_json::Value>]) -> Vec<Vec<String>> {
     let row_count = cols.first().map_or(0, Vec::len);
     let mut rows: Vec<Vec<String>> = (0..row_count)
@@ -626,9 +484,6 @@ fn fetch_rows_as_vecs(cols: &[Vec<serde_json::Value>]) -> Vec<Vec<String>> {
     rows
 }
 
-/// Build a `key -> value` map from a 2-column `(key, value)` query result,
-/// generalizing the map-building step `expected_join_rows` inlines for a single
-/// pair, reused across the 3-table and 4-table expected-result computations.
 fn build_key_to_value_map(cols: &[Vec<serde_json::Value>]) -> HashMap<String, String> {
     assert_eq!(
         cols.len(),
@@ -643,7 +498,6 @@ fn build_key_to_value_map(cols: &[Vec<serde_json::Value>]) -> HashMap<String, St
         .collect()
 }
 
-/// `dim_customer ⋈ fact_orders ⋈ fact_lineitem` for one VS.
 fn three_table_join_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY FROM {} c \
@@ -655,8 +509,6 @@ fn three_table_join_query(vs_name: &str) -> String {
     )
 }
 
-/// `dim_customer ⋈ fact_orders ⋈ fact_lineitem ⋈ dim_supplier` for one VS —
-/// the same chain as [`three_table_join_query`] extended with the supplier side.
 fn four_table_join_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY, s.S_NAME FROM {} c \
@@ -692,9 +544,7 @@ fn fetch_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<Stri
     fetch_rows_as_vecs(&cols)
 }
 
-/// Compute the expected 3-table join result INDEPENDENTLY of the join pushdown:
-/// read all three tables un-joined through the same VS and join them in-process
-/// — the ground truth the N-scan wrapper result must match.
+/// Ground truth independent of join pushdown: tables read un-joined and joined in-process.
 fn expected_three_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<String>> {
     let custkey_to_name = build_key_to_value_map(&conn.query_columns(&format!(
         "SELECT C_CUSTKEY, C_NAME FROM {}",
@@ -730,9 +580,6 @@ fn expected_three_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<
     rows
 }
 
-/// Compute the expected 4-table join result INDEPENDENTLY of the join pushdown
-/// — the same ground-truth approach as [`expected_three_table_join_rows`],
-/// extended with the supplier side.
 fn expected_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<String>> {
     let custkey_to_name = build_key_to_value_map(&conn.query_columns(&format!(
         "SELECT C_CUSTKEY, C_NAME FROM {}",
@@ -777,12 +624,7 @@ fn expected_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<S
     rows
 }
 
-/// A three-table inner-join pushdown (`dim_customer ⋈ fact_orders ⋈
-/// fact_lineitem`) succeeds end-to-end (no `F-UDF-CL-RUST-9001` — issue #76's
-/// hard failure) via the N-scan unaccelerated wrapper (three distinct `LHS_T*`
-/// aliases), never a broadcast join or the two-table `LHS_T0`/`LHS_T1`
-/// shape, and returns the result computed independently from the un-joined
-/// tables.
+/// Scenario: a three-table join succeeds via the N-scan wrapper and matches the independently computed result (#76)
 #[test]
 fn e2e_three_table_join_result_correct() {
     setup_e2e();
@@ -808,8 +650,6 @@ fn e2e_three_table_join_result_correct() {
     let actual = fetch_three_table_join_rows(&mut conn, VS_NAME);
     let expected = expected_three_table_join_rows(&mut conn, VS_NAME);
 
-    // Every line item matches exactly one order and every order matches exactly
-    // one customer, so the inner join drops nothing and duplicates nothing.
     assert_eq!(
         actual.len(),
         LINEITEM_ROWS,
@@ -823,11 +663,7 @@ fn e2e_three_table_join_result_correct() {
     );
 }
 
-/// A four-table inner-join pushdown (`dim_customer ⋈ fact_orders ⋈
-/// fact_lineitem ⋈ dim_supplier`) succeeds end-to-end (no `F-UDF-CL-RUST-9001`)
-/// via the N-scan unaccelerated wrapper (four distinct `LHS_T*` aliases),
-/// never a broadcast join or the two-table wrapper, and returns the result
-/// computed independently from the un-joined tables.
+/// Scenario: a four-table join succeeds via the N-scan wrapper and matches the independently computed result
 #[test]
 fn e2e_four_table_join_result_correct() {
     setup_e2e();
@@ -853,8 +689,6 @@ fn e2e_four_table_join_result_correct() {
     let actual = fetch_four_table_join_rows(&mut conn, VS_NAME);
     let expected = expected_four_table_join_rows(&mut conn, VS_NAME);
 
-    // Every line item matches exactly one order, one customer, and one
-    // supplier, so the inner join drops nothing and duplicates nothing.
     assert_eq!(
         actual.len(),
         LINEITEM_ROWS,
@@ -868,31 +702,11 @@ fn e2e_four_table_join_result_correct() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Scalar function wrapping aggregates in a grouped join select list (PR #78
-// review finding #4 / plan `fix-join-decline-hard-fail`, spec scenario "A
-// scalar function wrapping aggregates in a grouped join select list is
-// rendered, not declined"). The reported query is TPC-H-Q1-shaped:
-// `ROUND(100.0 * SUM(CASE WHEN l_returnflag = 'R' THEN 1 ELSE 0 END) /
-// COUNT(*), 2)` alongside plain `SUM`/`AVG` aggregates, `GROUP BY`, `HAVING`,
-// `ORDER BY`, and `LIMIT` — over a JOIN rather than a single table. Before the
-// fix, the join select-list renderer could not recurse a scalar function around
-// a nested `function_aggregate` node and declined the request, which the FFI
-// shim turns into a hard `F-UDF-CL-RUST-9001` client error (`ExaConn::execute`
-// panics on any non-"ok" status, surfacing that error verbatim). The fix routes
-// this rendering through `crates/vs-expression`'s shared aggregate arm, so
-// these tests fail before the fix (query panics with F-UDF-CL-RUST-9001) and
-// pass after.
-//
-// Ground truth: every seeded `fact_lineitem` row matches exactly one order
-// (and, for the three-table case, exactly one customer), so neither join drops
-// nor duplicates a row — the grouped aggregate over either join must equal the
-// SAME select list evaluated directly over the un-joined `fact_lineitem` table.
-// ---------------------------------------------------------------------------
+// A scalar function wrapping aggregates in a grouped join select list must be rendered,
+// not declined. Every `fact_lineitem` row matches exactly one order and customer, so
+// the grouped result must equal the same select list over `fact_lineitem` alone.
 
-/// The scalar-over-aggregate grouped select list, with each `fact_lineitem`
-/// column referenced through `col_prefix` (a table alias like `"l."`, or `""`
-/// for an unqualified single-table query).
+/// `col_prefix` is a table alias like `"l."`, or `""` for a single-table query.
 fn scalar_over_aggregate_select_list(col_prefix: &str) -> String {
     format!(
         "{col_prefix}L_RETURNFLAG, \
@@ -903,8 +717,6 @@ fn scalar_over_aggregate_select_list(col_prefix: &str) -> String {
     )
 }
 
-/// Two-table (N=2) grouped join: `fact_orders ⋈ fact_lineitem` on
-/// `O_ORDERKEY = L_ORDERKEY`.
 fn scalar_over_aggregate_join_query(vs_name: &str) -> String {
     format!(
         "SELECT {} FROM {} o JOIN {} l ON o.O_ORDERKEY = l.L_ORDERKEY \
@@ -915,9 +727,6 @@ fn scalar_over_aggregate_join_query(vs_name: &str) -> String {
     )
 }
 
-/// Three-table (N>=3) grouped join: `dim_customer ⋈ fact_orders ⋈
-/// fact_lineitem`, extending [`scalar_over_aggregate_join_query`] with the
-/// customer side exactly as [`three_table_join_query`] extends [`join_query`].
 fn scalar_over_aggregate_n_table_join_query(vs_name: &str) -> String {
     format!(
         "SELECT {} FROM {} c \
@@ -931,23 +740,10 @@ fn scalar_over_aggregate_n_table_join_query(vs_name: &str) -> String {
     )
 }
 
-/// Native (non-virtual) table the ground truth is materialized into — see
-/// [`ensure_ground_truth_lineitem_table`].
 const GROUND_TRUTH_LINEITEM_TABLE: &str = "GROUND_TRUTH_LINEITEM";
 
-/// Materialize the `fact_lineitem` columns the ground truth needs into a
-/// NATIVE Exasol table (in the same schema as the adapter scripts), via a
-/// plain projection over the VS.
-///
-/// The ground truth must be computed by Exasol over native data so it is an
-/// oracle independent of the pushdown path under test: once the base columns
-/// are materialized natively, Exasol computes the scalar-over-aggregate
-/// itself — correct, and formatted identically to the join wrapper's
-/// Exasol-side aggregation, so plain string comparison stays valid.
-///
-/// `CREATE OR REPLACE TABLE` is idempotent and always rebuilds from the same
-/// source VS data, so both scalar-over-aggregate tests can safely share and
-/// re-run this under the suite's `--test-threads=1` serial execution.
+/// Materialized natively so Exasol computes the ground truth independently of the
+/// pushdown path, formatted identically to the wrapper's Exasol-side aggregation.
 fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
     conn.execute(&format!(
         "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} AS \
@@ -956,11 +752,6 @@ fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
     ));
 }
 
-/// The same select list evaluated directly over the natively materialized
-/// `fact_lineitem` columns (see [`ensure_ground_truth_lineitem_table`]) — the
-/// ground truth both grouped-join queries above must match, since every
-/// `fact_lineitem` row appears in exactly one result row of either join,
-/// independent of how many tables are joined.
 fn scalar_over_aggregate_ground_truth_query() -> String {
     format!(
         "SELECT {} FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE} \
@@ -969,10 +760,6 @@ fn scalar_over_aggregate_ground_truth_query() -> String {
     )
 }
 
-/// Fetch a scalar-over-aggregate query's 5 result columns
-/// (`L_RETURNFLAG, SUM_QTY, RETURN_COUNT, AVG_PRICE, RETURN_PCT`) as a sorted
-/// `Vec<Vec<String>>`, reusing [`fetch_rows_as_vecs`]'s order-independent
-/// row-major comparison shape.
 fn fetch_scalar_over_aggregate_rows(conn: &mut ExaConn, query_sql: &str) -> Vec<Vec<String>> {
     let cols = conn.query_columns(query_sql);
     assert_eq!(
@@ -985,12 +772,7 @@ fn fetch_scalar_over_aggregate_rows(conn: &mut ExaConn, query_sql: &str) -> Vec<
     fetch_rows_as_vecs(&cols)
 }
 
-/// A scalar function wrapping aggregates (`ROUND(100.0 * SUM(CASE …) /
-/// COUNT(*), 2)`) in a grouped two-table join select list is rendered, not
-/// declined: the query succeeds (no `F-UDF-CL-RUST-9001`), the pushed SQL is
-/// the unified N-scan wrapper (N=2, `LHS_T0`/`LHS_T1`) rather than a broadcast
-/// join, and the result equals the same select list evaluated over the
-/// un-joined `fact_lineitem` table.
+/// Scenario: a scalar over aggregates in a grouped two-table join select list is rendered via the N-scan wrapper and correct
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
     setup_e2e();
@@ -1027,13 +809,7 @@ fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
     );
 }
 
-/// The N>=3-table counterpart of
-/// [`e2e_scalar_over_aggregate_grouped_join_result_correct`]: the identical
-/// scalar-over-aggregate grouped select list over a three-table inner join
-/// (`dim_customer ⋈ fact_orders ⋈ fact_lineitem`) is rendered by the SAME
-/// unified fallback renderer (N=3, `LHS_T0..LHS_T2`), not declined, and returns
-/// the same result as the ground truth (and, transitively, as the two-table
-/// case).
+/// Scenario: a scalar over aggregates in a grouped three-table join select list is rendered via the N-scan wrapper and correct
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
     setup_e2e();
@@ -1070,26 +846,11 @@ fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Declined-filter self-apply at the join render sites (plan
-// fix-declined-filter-self-apply, tasks 2.8/2.9, #279). A side-local WHERE
-// conjunct DataFusion's dialect cannot render — `SECOND(<col>, 3)`, the same
-// 2-argument arity refusal `vs-expression`'s
-// second_with_precision_declines_for_datafusion_renders_for_exasol pins —
-// must still be applied: at the broadcast site by declining the broadcast
-// plan altogether (task 2.3), and at the N-scan site as a residual
-// outer-WHERE conjunct alongside a rendering conjunct that still reaches its
-// own leg's scan-spec filter (task 2.4). `O_ORDERDATE` is a plain DATE column
-// (no time component), so `SECOND(O_ORDERDATE, 3)` is always `0` — verified
-// live against the Docker Exasol container (`SELECT SECOND(DATE
-// '2024-01-05', 3)` = `0`) — making the declined predicate always-true over
-// the seeded data. The correctness assertion is therefore that the declined
-// filter costs no rows, not that it narrows them.
-// ---------------------------------------------------------------------------
+// A side-local conjunct DataFusion cannot render (`SECOND(<col>, 3)`) must still be
+// applied: the broadcast plan is declined, and the N-scan wrapper applies it in the
+// outer WHERE. `O_ORDERDATE` is a DATE, so `SECOND(O_ORDERDATE, 3)` is always 0
+// (verified live).
 
-/// A below-threshold two-table inner equi-join with a single declined
-/// side-local conjunct (`SECOND(O_ORDERDATE, 3) = 0`, always true for the
-/// seeded DATE column) and no postprocessing.
 fn broadcast_declined_filter_join_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
@@ -1100,11 +861,8 @@ fn broadcast_declined_filter_join_query(vs_name: &str) -> String {
     )
 }
 
-/// The full (unfiltered) `fact_orders ⋈ dim_customer` join, computed
-/// independently of the join pushdown — the ground truth
-/// [`broadcast_declined_filter_join_query`] must match, since its sole filter
-/// is always true over the seeded data. Same shape as [`expected_join_rows`]
-/// with the `O_ORDERDATE` WHERE bound dropped.
+/// The declined filter in [`broadcast_declined_filter_join_query`] is always true, so
+/// the full join is its ground truth.
 fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
     let dim_cols = conn.query_columns(&format!(
         "SELECT C_CUSTKEY, C_NAME FROM {}",
@@ -1139,12 +897,7 @@ fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, St
     rows
 }
 
-/// A below-threshold two-table inner equi-join carrying a declined side-local
-/// WHERE conjunct (`SECOND(O_ORDERDATE, 3)`, a 2-argument arity refusal under
-/// the DataFusion dialect) declines the broadcast plan altogether (task 2.3)
-/// rather than silently dropping the predicate and riding the broadcast
-/// in-UDF join unfiltered: the pushed plan is the N-scan wrapper, never a
-/// broadcast common-blob join block, and the result is correct.
+/// Scenario: a declined side-local conjunct declines the broadcast plan and falls back to the N-scan wrapper with correct rows
 #[test]
 fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
     setup_e2e();
@@ -1186,15 +939,7 @@ fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
     );
 }
 
-/// A below-threshold two-table inner equi-join carrying a declined side-local
-/// WHERE conjunct that is FALSE for every seeded row (`SECOND(O_ORDERDATE, 3)
-/// = 1`, since `O_ORDERDATE` is a plain DATE with no time component so
-/// `SECOND(..., 3)` is always `0`). Unlike
-/// [`e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters`], whose
-/// always-true conjunct cannot distinguish "self-applied" from "silently
-/// dropped", this always-false conjunct can: a build that dropped the
-/// declined predicate instead of self-applying it would return every row,
-/// while the correct self-apply excludes them all.
+/// Scenario: an always-false declined conjunct returns no rows, proving it is self-applied rather than dropped
 #[test]
 fn e2e_broadcast_declined_filter_excludes_rows() {
     setup_e2e();
@@ -1224,10 +969,6 @@ fn e2e_broadcast_declined_filter_excludes_rows() {
     );
 }
 
-/// A three-table inner equi-join carrying BOTH a rendering side-local
-/// conjunct (`O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}'`, unchanged from
-/// [`join_query`]) and a declined side-local conjunct (`SECOND(O_ORDERDATE,
-/// 3) = 0`, always true), both local to the `fact_orders` side.
 fn three_table_join_with_mixed_filters_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, l.L_LINENUMBER, l.L_QUANTITY FROM {} c \
@@ -1241,12 +982,7 @@ fn three_table_join_with_mixed_filters_query(vs_name: &str) -> String {
     )
 }
 
-/// The expected result of [`three_table_join_with_mixed_filters_query`],
-/// computed independently of the join pushdown: the same
-/// `O_ORDERDATE >= {ORDERDATE_LOWER_BOUND}` bound narrows `fact_orders`
-/// before joining against `dim_customer` and `fact_lineitem`; the declined
-/// `SECOND(...) = 0` conjunct contributes no additional narrowing (always
-/// true for the seeded DATE column), so it is not applied here.
+/// The declined `SECOND(...) = 0` conjunct is always true, so it is not applied here.
 fn expected_three_table_join_rows_with_orderdate_filter(
     conn: &mut ExaConn,
     vs_name: &str,
@@ -1283,22 +1019,7 @@ fn expected_three_table_join_rows_with_orderdate_filter(
     rows
 }
 
-/// A three-table inner-join whose WHERE carries both a rendering side-local
-/// conjunct and a declined side-local conjunct — both local to the
-/// `fact_orders` side — is served by the N-scan wrapper with the two
-/// conjuncts partitioned correctly (task 2.4): the declined conjunct
-/// (`SECOND(..., 3)`) is carried by the outer wrapper's `WHERE` in Exasol
-/// dialect (it can only appear there — DataFusion never renders it, so it
-/// cannot reach any leg's `ScanSpec.filter`), while the rendering conjunct
-/// (`O_ORDERDATE >= DATE '...'`) still reaches its own leg's DataFusion
-/// `ScanSpec.filter`, unchanged from the single-conjunct case. The result is
-/// correct.
-///
-/// Exasol canonicalizes the rendering conjunct before the adapter ever sees
-/// it — the pushdown request carries `predicate_lessequal(literal_date,
-/// column)`, i.e. `DATE '...' <= O_ORDERDATE`, not the `>=` form as written —
-/// so the leg's rendered filter is asserted in that canonical (flipped)
-/// shape, confirmed against the live EXPLAIN VIRTUAL output.
+/// Scenario: mixed rendering and declined conjuncts split between the leg filter and the outer wrapper WHERE
 #[test]
 fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
     setup_e2e();
@@ -1317,24 +1038,16 @@ fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
          block:\n{pushed}"
     );
 
-    // The declined conjunct is rendered as a verbatim Exasol function call
-    // (`SECOND(...)`) — it can appear ONLY in the outer wrapper's WHERE,
-    // never inside a leg's DataFusion-rendered `ScanSpec.filter` (that
-    // dialect refuses the 2-argument form), so this substring alone proves
-    // the declined conjunct was self-applied rather than silently dropped.
+    // DataFusion refuses the 2-argument `SECOND`, so it can only appear in the outer
+    // wrapper's WHERE: this proves the conjunct was self-applied, not dropped.
     assert!(
         pushed.contains("SECOND("),
         "the declined SECOND(..., 3) conjunct must be rendered as a verbatim \
          Exasol call in the outer wrapper's WHERE:\n{pushed}"
     );
-    // The rendering conjunct is rendered under the DataFusion dialect
-    // (bare/unqualified, `render_df_filter_safe`) into its leg's
-    // `ScanSpec.filter` as a SQL string, itself embedded in the outer JSON
-    // scan-spec blob — hence the doubled single-quote (SQL string-literal
-    // escaping) around the DATE literal. This exact form cannot appear in
-    // Exasol's own echoed pushdown-request JSON, which encodes the DATE
-    // literal as a plain `"value" : "2024-01-05"` field, never wrapped in
-    // `DATE ''...''`.
+    // The doubled quotes come from the leg filter being embedded in the scan-spec blob;
+    // Exasol's echoed request encodes the DATE literal as a plain `"value"` field instead.
+    // Exasol canonicalizes `>=` to `DATE '...' <= O_ORDERDATE` before the adapter sees it.
     assert!(
         pushed.contains(&format!("DATE ''{ORDERDATE_LOWER_BOUND}''")),
         "the rendering O_ORDERDATE >= DATE '{ORDERDATE_LOWER_BOUND}' conjunct \
@@ -1363,22 +1076,10 @@ fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Join-filter type-coercion: `apply_type_rewrites` (the single-table WHERE
-// surface's pipeline) is now wired into BOTH join WHERE-filter sites. A `LIKE` over a non-string, non-DATE
-// column has no DataFusion coercion and used to hard-fail the scan (#215); a
-// `LIKE` over a DATE column is rewrapped in `CAST(... AS VARCHAR)` and keeps its
-// pushdown; an `INSTR`/`LOCATE` call beyond 2 arguments used to silently drop the
-// extra argument (#228); a `DECIMAL` column stringified in a WHERE filter used to
-// render the untrimmed fixed-scale text instead of Exasol's own trimmed form
-// (#223 slice 2). Every case now either renders correctly or declines cleanly and
-// self-applies (#285), never silently mis-answering or crashing.
-// ---------------------------------------------------------------------------
+// `apply_type_rewrites` runs at both join WHERE sites: each case renders correctly or
+// declines and self-applies (#215, #223, #228, #285).
 
-/// A below-threshold two-table inner equi-join whose WHERE carries `LIKE` over
-/// the `DECIMAL(20,0)` `O_CUSTKEY` column. `like_subject_type_guard`
-/// has no DECIMAL coercion, so this must decline the broadcast plan and fall
-/// back to the N-scan wrapper, whose outer WHERE self-applies the LIKE.
+/// `like_subject_type_guard` has no DECIMAL coercion, so this declines the broadcast plan.
 fn like_on_custkey_join_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
@@ -1389,15 +1090,9 @@ fn like_on_custkey_join_query(vs_name: &str) -> String {
     )
 }
 
-/// The same below-threshold join, but with `LIKE` over the `DATE` `O_ORDERDATE`
-/// column. `like_subject_type_guard` rewraps the subject as
-/// `CAST(<col> AS VARCHAR)`, which DataFusion renders, so the broadcast plan
-/// survives. The `'2024-01-0%'` pattern matches Exasol's default
-/// `NLS_DATE_FORMAT` (ISO `YYYY-MM-DD`), but the test does not depend on that
-/// format being in effect: the expected rows are computed by running the SAME
-/// pattern through the single-table WHERE surface (which renders through the
-/// identical CAST-to-VARCHAR rewrite under whatever format is ambient), so actual
-/// and expected agree regardless of session format.
+/// The subject is rewrapped as `CAST(<col> AS VARCHAR)`, so the broadcast plan survives.
+/// Expected rows run the same pattern through the single-table WHERE path, so the
+/// result is independent of the session's `NLS_DATE_FORMAT`.
 fn like_on_orderdate_join_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
@@ -1408,11 +1103,7 @@ fn like_on_orderdate_join_query(vs_name: &str) -> String {
     )
 }
 
-/// `LIKE` over the `DECIMAL` `O_CUSTKEY` column declines the broadcast plan:
-/// the pushed SQL must be the N-scan wrapper, never a broadcast
-/// common-blob join block, and no leg's scan-spec may carry the declined
-/// predicate — it must be self-applied in the wrapper's own outer WHERE
-/// instead. The returned rows must equal the ground truth.
+/// Scenario: LIKE over a DECIMAL column declines the broadcast plan and is self-applied in the wrapper WHERE
 #[test]
 fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
     setup_e2e();
@@ -1455,11 +1146,7 @@ fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
     );
 }
 
-/// `LIKE` over the `DATE` `O_ORDERDATE` column keeps the broadcast plan: the
-/// pushed SQL must still carry a broadcast common-blob join block, and
-/// the rewritten filter must carry a `CAST(...)` over `O_ORDERDATE`. The returned
-/// rows must equal the ground truth, and must be a genuine subset of the full
-/// fact table (order key 10, `2024-01-10`, does not match the pattern).
+/// Scenario: LIKE over a DATE column keeps the broadcast plan with a CAST-rewritten filter
 #[test]
 fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
     setup_e2e();
@@ -1495,11 +1182,7 @@ fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
     );
 }
 
-/// Against `VS_NAME_LOW` (forced N-scan fallback), a side-local `LIKE` over the
-/// `DECIMAL` `O_CUSTKEY` column must be screened out of its leg and applied only
-/// in the wrapper's own outer WHERE: the per-side type screen
-/// (`type_screened_leg_filter`) must reject it from `build_side_fan_out_sql`'s
-/// leg just as it does at the broadcast site.
+/// Scenario: on the forced-fallback VS, LIKE over a DECIMAL column is screened out of its leg and applied only in the wrapper WHERE
 #[test]
 fn e2e_n_scan_like_on_decimal_side_column_applied_in_outer_where() {
     setup_e2e();
@@ -1537,21 +1220,7 @@ fn e2e_n_scan_like_on_decimal_side_column_applied_in_outer_where() {
     );
 }
 
-/// A join WHERE filter carrying `INSTR(C_NAME, 'c', 3)` — a three-argument call
-/// over the VARCHAR `C_NAME` column — exercises the #228 side effect: wiring the
-/// full type-rewrite pipeline into the join sites (not just the LIKE guard) also
-/// narrows #228's exposure there, so the whole arity-3 call declines and Exasol
-/// evaluates it natively rather than a start-position-ignoring 2-argument
-/// `strpos` silently mis-answering it.
-///
-/// Every seeded `dim_customer.C_NAME` is `"customer-0N"`: `'c'` occurs only at
-/// position 1, before the start position 3, so the CORRECT native
-/// `INSTR(C_NAME, 'c', 3)` is 0 for every customer — the WHERE keeps every row
-/// (the full join, `FACT_ORDERS_ROWS` rows). A `strpos`-style rewrite that
-/// silently drops the start-position argument would instead find `'c'` at
-/// position 1 for every customer, answer `1`, and make `= 0` false for every
-/// row — returning zero rows instead.
-
+/// Scenario: a three-argument INSTR in a join filter declines and Exasol evaluates it natively (#228)
 #[test]
 fn e2e_join_instr_with_start_position_returns_native_result() {
     setup_e2e();
@@ -1570,9 +1239,8 @@ fn e2e_join_instr_with_start_position_returns_native_result() {
         "the 3-argument INSTR must decline the broadcast plan and fall through \
          to the N-scan wrapper:\n{pushed}"
     );
-    // Confirmed against live EXPLAIN VIRTUAL output: the outer wrapper's WHERE
-    // renders the verbatim Exasol 3-argument form with the literal start
-    // position, not the DataFusion-dialect `strpos` that drops it.
+    // `'c'` occurs only at position 1, so native `INSTR(C_NAME, 'c', 3)` is 0 for every row;
+    // a `strpos` rewrite dropping the start position would answer 1 and return no rows.
     assert!(
         pushed.contains(r#"INSTR("LHS_T1"."C_NAME", 'c', 3)"#),
         "the outer WHERE must carry the verbatim 3-argument INSTR call with the \
@@ -1602,15 +1270,8 @@ fn e2e_join_instr_with_start_position_returns_native_result() {
     );
 }
 
-/// The trimmed decimal text Exasol renders for a seeded `fact_orders.O_TOTALPRICE`,
-/// derived from the fixture alone: [`order_totalprice_unscaled`] divided by
-/// `10 ^ O_TOTALPRICE_PS.1`, since Exasol drops an all-zero fractional part
-/// (`2912.00` -> `2912`, the `pushdown-planning-decimal-string-format` convention,
-/// #211).
-///
-/// The all-zero fractional part is a seed invariant `order_totalprice_unscaled`
-/// documents and this function ASSERTS, so a seed edit that introduced a non-zero
-/// scale digit fails here rather than silently changing what the oracle means.
+/// Exasol drops an all-zero fractional part (#211); asserts the seed invariant so a
+/// non-zero scale digit fails here rather than silently changing the oracle.
 fn expected_totalprice_text(order_key: usize) -> String {
     let divisor = 10_i64
         .pow(u32::try_from(O_TOTALPRICE_PS.1).expect("the O_TOTALPRICE scale is non-negative"));
@@ -1626,8 +1287,6 @@ fn expected_totalprice_text(order_key: usize) -> String {
     (unscaled / divisor).to_string()
 }
 
-/// The `YYYY-MM-DD` text Exasol returns for a seeded order's `O_ORDERDATE`,
-/// derived from [`order_date_days`] alone — no VS query involved.
 fn expected_orderdate_text(order_key: usize) -> String {
     const SECONDS_PER_DAY: i64 = 86_400;
     chrono::DateTime::from_timestamp(i64::from(order_date_days(order_key)) * SECONDS_PER_DAY, 0)
@@ -1636,18 +1295,7 @@ fn expected_orderdate_text(order_key: usize) -> String {
         .to_string()
 }
 
-/// The #223 slice-2 headline repro carried into the JOIN surfaces: a join WHERE
-/// filter stringifying `fact_orders.O_TOTALPRICE` (a scale-2 DECIMAL column,
-/// `LENGTH(O_TOTALPRICE) > 3`) must match Exasol's own trimmed-string `LENGTH`
-/// semantics at BOTH join surfaces — the broadcast plan (`VS_NAME`) and the
-/// N-scan per-leg fallback (`VS_NAME_LOW`) — not the untrimmed full-scale text a
-/// bare DataFusion CAST would produce.
-///
-/// Ground truth is computed in Rust from the seed fixture alone
-/// ([`expected_totalprice_text`] over [`order_totalprice_unscaled`], paired via
-/// [`order_custkey`] and [`expected_orderdate_text`]) — never through another VS
-/// surface, which would run the SAME `rewrite_decimal_stringifications` pass on
-/// both sides of the comparison and pass for any wrong-but-nonzero trimming.
+/// Scenario: a DECIMAL-stringifying join filter matches Exasol's trimmed LENGTH semantics on both join surfaces (#223)
 #[test]
 fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
     setup_e2e();
@@ -1693,14 +1341,6 @@ fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Self-join attribution: issue #361 regression coverage (plan
-// fix-join-fallback-self-join-attribution)
-// ---------------------------------------------------------------------------
-
-/// Fetch `fact_orders`' `(O_ORDERKEY, O_CUSTKEY)` rows un-joined, in row order —
-/// the single-node ground truth every self-join test below joins in-process,
-/// independently of the pushdown under test.
 fn fetch_order_rows(conn: &mut ExaConn) -> Vec<(String, String)> {
     let cols = conn.query_columns(&format!(
         "SELECT O_ORDERKEY, O_CUSTKEY FROM {}",
@@ -1719,11 +1359,7 @@ fn fetch_order_rows(conn: &mut ExaConn) -> Vec<(String, String)> {
         .collect()
 }
 
-/// A two-leg self-join on the primitive, unique `O_ORDERKEY` column permanently
-/// reproduces issue #361's headline repro: before the fix, both occurrences
-/// collapsed to one alias-map entry, the rendered `ON` became a tautology
-/// (`LHS_T1.O_ORDERKEY = LHS_T1.O_ORDERKEY`), and the query returned every
-/// row-pair combination (100 rows) instead of each row matching only itself.
+/// Scenario: a two-leg self-join on the unique key matches each row only to itself (#361)
 #[test]
 fn e2e_self_join_on_primitive_column_matches_single_node() {
     setup_e2e();
@@ -1765,13 +1401,7 @@ fn e2e_self_join_on_primitive_column_matches_single_node() {
     );
 }
 
-/// A self-join with one occurrence left unaliased — Exasol omits both that
-/// leaf's `alias` key and its columns' `tableAlias`, so its leg key is the
-/// ABSENT alias, distinct from `b`'s `Some("B")` — resolves to exactly two
-/// legs instead of collapsing, per issue #361's `FROM T JOIN T b` repro shape.
-/// Joining on `O_CUSTKEY` (which repeats across two orders per customer)
-/// asserts a non-trivial multiset a tautological `ON` could not coincidentally
-/// reproduce.
+/// Scenario: a self-join with one unaliased occurrence resolves to two distinct legs (#361)
 #[test]
 fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
     setup_e2e();
@@ -1825,11 +1455,7 @@ fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
     );
 }
 
-/// A three-leg self-join permanently reproduces issue #361's second repro
-/// shape: before the fix, the N-way FROM-chain's condition attachment
-/// misplaced or duplicated conditions once a table occurred three times,
-/// rendering `ON 1=1` at one join point and returning every 3-row combination
-/// (1000 rows) instead of each row matching only itself at both join points.
+/// Scenario: a three-leg self-join attaches each condition to its own join point (#361)
 #[test]
 fn e2e_three_leg_self_join_matches_single_node() {
     setup_e2e();
@@ -1873,14 +1499,7 @@ fn e2e_three_leg_self_join_matches_single_node() {
     );
 }
 
-/// A self-join carrying a WHERE conjunct against only one alias must push
-/// that filter into only that occurrence's leg. Before the fix, the
-/// tableName-keyed side-local filter derivation collapsed both occurrences
-/// into one map entry and silently applied `a`'s filter to `b` too — a wrong
-/// answer with no error, harder to notice than a visible cross product.
-/// Joining on `O_CUSTKEY` (many-to-many across the two same-customer orders)
-/// makes leaking the filter onto `b` change the result, unlike joining on the
-/// unique `O_ORDERKEY` where `a` and `b` are always the same row.
+/// Scenario: a WHERE conjunct on one self-join alias is pushed only into that occurrence's leg (#361)
 #[test]
 fn e2e_self_join_with_one_sided_filter_matches_single_node() {
     setup_e2e();
@@ -1932,17 +1551,7 @@ fn e2e_self_join_with_one_sided_filter_matches_single_node() {
     );
 }
 
-/// The floor for a nested aggregate on the broadcast-join path: an UNGROUPED
-/// scalar function wrapping an aggregate is the shape `carries_aggregation_clause`
-/// does not recognise — its select item is a `function_scalar`, not a
-/// `function_aggregate`, and there is no GROUP BY, HAVING, or `group_by`
-/// aggregation type to catch it either.
-///
-/// The broadcast in-UDF join renders projection, filter, and join condition only,
-/// so an aggregate riding along with it would be evaluated per shard. The
-/// projection-widening guard must therefore push the request to the N-scan
-/// wrapper, where Exasol aggregates over the materialized join: exactly ONE row
-/// equal to the single-node result, never one partial row per shard.
+/// Scenario: an ungrouped scalar over an aggregate on a broadcast-eligible join routes to the N-scan wrapper and returns one row
 #[test]
 fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
     setup_e2e();
@@ -1977,8 +1586,6 @@ fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
          partial row per shard: {actual:?}"
     );
 
-    // Every `fact_lineitem` row joins exactly one `fact_orders` row, so the sum
-    // over the join equals the sum over `fact_lineitem` alone.
     let expected = conn.query_columns(&format!(
         "SELECT ROUND(SUM(L_QUANTITY), 2) FROM {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_TABLE}"
     ));

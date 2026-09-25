@@ -1,22 +1,10 @@
 #!/usr/bin/env bash
-# Docker-mode delete-authoring helper: runs the apache/spark:3.5.7 image against
-# scripts/spark-fixtures/create_tpch_deletes.sql to author a merge-on-read,
-# 5%-position-deleted copy of the baseline TPC-H namespace (see that file's
-# header for the full MOR/position-delete rationale and the #340 drop
-# condition). Docker mode is always `rest_catalog` (see run_fixtures.sh), so
-# that catalog name is fixed here rather than taken as an argument.
-#
+# Authors a merge-on-read, 5%-position-deleted copy of a TPC-H namespace in the local Docker
+# stack via scripts/spark-fixtures/create_tpch_deletes.sql. The stack must already be up.
 # Usage: bench/make_deletes_docker.sh <source_ns> <target_ns>
-# Caller contract (bench/run.sh, Task B.2): the local stack must already be up
-# (`docker compose up -d`) -- this script only runs Spark against the already-
-# running iceberg-rest/minio services, it does not start the stack itself.
 #
-# Idempotent: create_tpch_deletes.sql has no `DROP TABLE IF EXISTS` (re-running
-# it would double-delete an already-deleted target and break the 5% contract),
-# so this script skips the Spark run if <target_ns> already has all 8 TPC-H
-# tables -- mirroring tpch_loader.rs's "skip if already present" idempotency,
-# via a REST-catalog `curl` (the same catalog run_fixtures.sh/run.sh already use)
-# instead of pulling in a Rust/pyiceberg dependency just to list tables.
+# Skips when <target_ns> already has all 8 tables: re-running the SQL would double-delete and
+# break the 5% contract.
 set -euo pipefail
 
 SOURCE_NS="${1:?usage: make_deletes_docker.sh <source_ns> <target_ns>}"
@@ -26,9 +14,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 CATALOG="rest_catalog"
 REST_PORT="${LH_REST_PORT:-18181}"
 TPCH_TABLES="region nation supplier customer part partsupp orders lineitem"
-# Docker-compose's explicit network `name:` override (docker-compose.yml) --
-# fixed regardless of COMPOSE_PROJECT_NAME, same network spark-iceberg-fixtures
-# and iceberg-rest/minio join.
+# Fixed by docker-compose.yml's network `name:`, independent of COMPOSE_PROJECT_NAME.
 COMPOSE_NETWORK="lakehouse-engine"
 
 already_populated() {
@@ -52,11 +38,7 @@ echo "== make_deletes_docker: authoring '${TARGET_NS}' from '${SOURCE_NS}' via S
 ICEBERG_VERSION="1.10.1"
 SPARK_PACKAGES="org.apache.iceberg:iceberg-spark-runtime-3.5_2.12:${ICEBERG_VERSION},org.apache.iceberg:iceberg-aws-bundle:${ICEBERG_VERSION}"
 
-# SAME SPARK_CONF as scripts/spark-fixtures/run_fixtures.sh (local REST catalog +
-# MinIO, Ivy cache workaround). Duplicated rather than sourced: there is no
-# "source a bash array from another script" primitive across a `docker run`
-# boundary. Keep in lockstep with run_fixtures.sh if the catalog/MinIO wiring
-# ever changes.
+# Keep in lockstep with scripts/spark-fixtures/run_fixtures.sh's SPARK_CONF.
 SPARK_CONF=(
   --master "local[*]"
   --packages "$SPARK_PACKAGES"

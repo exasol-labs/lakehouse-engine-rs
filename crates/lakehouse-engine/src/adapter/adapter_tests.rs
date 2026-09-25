@@ -27,10 +27,7 @@ fn dispatch_unknown_type_errors() {
     assert!(err.to_string().contains("unsupported"));
 }
 
-/// `refresh` and `setProperties` are recognised protocol types: dispatch
-/// routes them into `handle_create_virtual_schema`, so they fail (if at all)
-/// on connection resolution — never with the `unsupported VS request type`
-/// error the dead `refreshVirtualSchema` arm used to produce.
+/// Scenario: `refresh` and `setProperties` route to schema creation, never `unsupported`.
 #[test]
 fn refresh_and_set_properties_dispatched_not_unsupported() {
     for req_type in ["refresh", "setProperties"] {
@@ -47,8 +44,7 @@ fn refresh_and_set_properties_dispatched_not_unsupported() {
     }
 }
 
-/// The response `type` mirrors the request `type` for every enumeration
-/// request type (Exasol VS protocol requirement).
+/// Scenario: the response `type` mirrors the request `type` (Exasol VS protocol requirement).
 #[test]
 fn build_schema_response_type_mirrors_request() {
     let schema_metadata = serde_json::json!({"tables": [], "adapterNotes": "{}"});
@@ -63,8 +59,7 @@ fn build_schema_response_type_mirrors_request() {
     }
 }
 
-/// `requestedTables` is echoed verbatim when the request carries it and is
-/// absent from the response otherwise (pure pass-through).
+/// Scenario: `requestedTables` is echoed verbatim when present and absent otherwise.
 #[test]
 fn build_schema_response_echoes_requested_tables_present_and_absent() {
     let schema_metadata = serde_json::json!({"tables": [], "adapterNotes": "{}"});
@@ -88,9 +83,7 @@ fn build_schema_response_echoes_requested_tables_present_and_absent() {
     );
 }
 
-/// `merge_set_properties`: request props win over persisted props, and an
-/// explicit `null` in the request unsets (removes) the property — the
-/// inverse precedence of `get_properties`.
+/// Scenario: in `merge_set_properties` request values win and an explicit `null` unsets.
 #[test]
 fn merge_set_properties_new_wins_and_null_unsets() {
     let req = serde_json::json!({
@@ -109,20 +102,14 @@ fn merge_set_properties_new_wins_and_null_unsets() {
     });
     let merged = merge_set_properties(&req);
 
-    // Request value wins over the persisted value.
     assert_eq!(nonempty_str(&merged, "NAMESPACE"), Some("new_ns"));
-    // A null request value removes the persisted property entirely.
     assert!(
         merged.get("ALLOW_HTTP").is_none(),
         "a null request value must unset the property"
     );
-    // A persisted property the request does not mention is retained.
     assert_eq!(nonempty_str(&merged, "CATALOG_CONNECTION"), Some("keep_me"));
 }
 
-// A `PASSWORD`-kind CONNECTION carrying the given address and password, for
-// registering under `MY_CONN` on a `TestContext` so `connection()` resolves
-// successfully instead of failing on a missing/unresolvable CONNECTION.
 fn password_connection(
     address: &str,
     password: impl Into<String>,
@@ -147,14 +134,7 @@ fn s3_style_password() -> String {
     .to_string()
 }
 
-/// [human-requested, PR #153 review, adversarial-review finding A2] A
-/// `setProperties` request that null-unsets a required property
-/// (`NAMESPACE`) must fail with the normal required-property
-/// error — never a panic, and never a silent fallback to the stale
-/// persisted value. `merge_set_properties` on its own only proves the key
-/// is removed from the merged map; this drives the null-unset through the
-/// real `setProperties` dispatch path so the removal is proven to reach
-/// `handle_create_virtual_schema`'s required-property check end-to-end.
+/// Scenario: null-unsetting `NAMESPACE` via `setProperties` fails the required-property check.
 #[test]
 fn set_properties_null_unset_required_property_errors_not_panic() {
     let req = serde_json::json!({
@@ -186,12 +166,7 @@ fn set_properties_null_unset_required_property_errors_not_panic() {
     );
 }
 
-/// A `createVirtualSchema` request supplying only the old, now-removed
-/// `ICEBERG_NAMESPACE` alias — and no `NAMESPACE` — must fail with the
-/// normal required-property error naming `NAMESPACE`. Pins the no-alias
-/// contract: if an alias for the renamed property is ever reintroduced,
-/// this request would satisfy the `NAMESPACE` requirement and `dispatch`
-/// would succeed, which trips `expect_err` below and fails this test.
+/// Scenario: the removed `ICEBERG_NAMESPACE` alias does not satisfy `NAMESPACE`.
 #[test]
 fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
     let req = serde_json::json!({
@@ -220,7 +195,7 @@ fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
     );
 }
 
-/// `NAMESPACE` stays required for a catalog kind but is optional under `DIRECT_STORAGE`.
+/// Scenario: `NAMESPACE` is required for catalog kinds but optional under `DIRECT_STORAGE`.
 #[test]
 fn namespace_is_required_for_catalog_kinds_only() {
     let catalog_req = serde_json::json!({
@@ -270,20 +245,10 @@ fn namespace_is_required_for_catalog_kinds_only() {
     );
 }
 
-// An address that is a closed local port — a connection refused, no DNS, no
-// hang — so a request that reaches catalog resolution fails fast,
-// deterministically, on the FIRST call the resolved kind's client makes.
+// A closed local port: connection refused, no DNS, no hang, so resolution fails fast.
 const CLOSED_PORT_ADDRESS: &str = "http://127.0.0.1:1";
 
-/// A pushdown request under `CATALOG_KIND: UNITY_CATALOG` is planned as a Delta
-/// scan: it reaches the SAME resolver the Iceberg path reaches — no early
-/// refusal, no routing through the Iceberg REST file-resolution path.
-///
-/// No live Unity Catalog is reachable in a unit test, so this proves routing by
-/// WHICH failure surfaces: `UnityCatalogSession`'s own "Unity Catalog load table
-/// request failed" error, naming its `unity-catalog/tables` endpoint, never the
-/// removed "not yet supported" refusal and never an Iceberg-shaped error (no
-/// `/v1/config` involved).
+/// Scenario: a Unity-kind pushdown reaches the Unity Catalog load-table call.
 #[test]
 
 fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
@@ -328,8 +293,6 @@ fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
 
 #[test]
 fn cluster_nodes_from_context_defaults_to_one_when_node_count_zero() {
-    // A context reporting node_count() == 0 (no live handshake — the trait
-    // default, as on DefaultsCtx) maps to 1.
     assert_eq!(cluster_nodes_from_context(&DefaultsCtx), 1usize);
     assert_eq!(
         cluster_nodes_from_context(&TestContext::scalar(vec![]).with_node_count(0)),
@@ -339,30 +302,24 @@ fn cluster_nodes_from_context_defaults_to_one_when_node_count_zero() {
 
 #[test]
 fn cluster_nodes_from_context_passes_through_reported_node_count() {
-    // A live cluster reporting node_count() == N (> 1) is passed through
-    // verbatim, widened to usize.
     assert_eq!(
         cluster_nodes_from_context(&TestContext::scalar(vec![]).with_node_count(4)),
         4usize
     );
 }
 
-/// Verifies the default-to-1 fallback when adapterNotes is absent or
-/// unparseable on a pushdown request.
+/// Scenario: adapterNotes absent, unparseable, or empty yields no note.
 #[test]
 fn adapter_note_absent_or_unparseable_yields_none() {
-    // No schemaMetadataInfo at all.
     let bare = serde_json::json!({"type": "pushdown"});
     assert!(adapter_note(&bare, NOTE_PARALLELISM_FACTOR).is_none());
 
-    // adapterNotes present but not valid JSON.
     let garbage = serde_json::json!({
         "type": "pushdown",
         "schemaMetadataInfo": { "adapterNotes": "not json" },
     });
     assert!(adapter_note(&garbage, NOTE_PARALLELISM_FACTOR).is_none());
 
-    // adapterNotes empty string.
     let empty = serde_json::json!({
         "type": "pushdown",
         "schemaMetadataInfo": { "adapterNotes": "" },
@@ -370,8 +327,7 @@ fn adapter_note_absent_or_unparseable_yields_none() {
     assert!(adapter_note(&empty, NOTE_PARALLELISM_FACTOR).is_none());
 }
 
-/// Verifies merge-not-clobber: a pre-existing adapterNotes key survives
-/// `build_adapter_notes`.
+/// Scenario: `build_adapter_notes` merges into, rather than clobbers, existing notes.
 #[test]
 fn build_adapter_notes_merges_existing() {
     let req = serde_json::json!({
@@ -407,8 +363,7 @@ fn build_adapter_notes_merges_existing() {
     );
 }
 
-/// Verifies that the createVirtualSchema response's adapterNotes carry no
-/// CLUSTER_NODES key at all — the note is no longer written.
+/// Scenario: adapterNotes carry no CLUSTER_NODES key.
 #[test]
 fn adapter_notes_omit_cluster_nodes() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
@@ -438,11 +393,7 @@ fn adapter_notes_omit_cluster_nodes() {
     );
 }
 
-/// Refresh re-enumerates the namespace and passes the freshly resolved
-/// `table_map` into `build_adapter_notes` on every call; TABLE_MAP must be
-/// rebuilt from that fresh map (not merged with whatever was persisted
-/// from the prior enumeration), while unrelated adapterNotes keys survive
-/// the rewrite untouched.
+/// Scenario: refresh rebuilds TABLE_MAP from the fresh listing and preserves unrelated notes.
 #[test]
 fn refresh_rebuilds_table_map_preserves_notes() {
     let req = serde_json::json!({
@@ -498,17 +449,13 @@ fn refresh_rebuilds_table_map_preserves_notes() {
     );
 }
 
-/// Task 2.2 — Adapter records the parallelism factor in the virtual-schema adapterNotes.
-/// Covers scenario `create_vs_records_parallelism_factor`.
+/// Scenario: createVirtualSchema records the parallelism factor in adapterNotes.
 #[test]
 fn create_vs_records_parallelism_factor() {
-    // Request with an explicit PARALLELISM_FACTOR property — nr_of_cores is
-    // irrelevant because the explicit property wins.
     let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" });
     let factor = resolve_parallelism_factor(&props, 16);
     assert_eq!(factor, 4, "factor must be read from the property");
 
-    // Build adapterNotes and verify PARALLELISM_FACTOR is present.
     let request = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &request,
@@ -532,7 +479,6 @@ fn create_vs_records_parallelism_factor() {
         "PARALLELISM_FACTOR must be recorded in adapterNotes"
     );
 
-    // Default when property absent and nr_of_cores = 0 → floor at DEFAULT_PARALLELISM_FACTOR.
     let empty_props = serde_json::json!({});
     let default_factor = resolve_parallelism_factor(&empty_props, 0);
     assert_eq!(
@@ -540,7 +486,6 @@ fn create_vs_records_parallelism_factor() {
         "must default to {DEFAULT_PARALLELISM_FACTOR} when property absent and cores=0"
     );
 
-    // Zero or invalid value also defaults (explicit "0" is treated as absent).
     let zero_props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "0" });
     let zero_factor = resolve_parallelism_factor(&zero_props, 0);
     assert_eq!(
@@ -549,11 +494,9 @@ fn create_vs_records_parallelism_factor() {
     );
 }
 
-/// Task 2.2 — PARALLELISM_FACTOR round-trips through adapterNotes.
-/// Covers scenario `adapter_notes_carry_parallelism_factor`.
+/// Scenario: PARALLELISM_FACTOR round-trips through adapterNotes.
 #[test]
 fn adapter_notes_carry_parallelism_factor() {
-    // createVirtualSchema records the value.
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
@@ -570,7 +513,6 @@ fn adapter_notes_carry_parallelism_factor() {
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
-    // Exasol persists that string and hands it back on the next pushdown request.
     let pushdown_req = serde_json::json!({
         "type": "pushdown",
         "schemaMetadataInfo": { "adapterNotes": notes_str },
@@ -582,13 +524,7 @@ fn adapter_notes_carry_parallelism_factor() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// T5 — per-node core-count resolution
-// ---------------------------------------------------------------------------
-
-/// Scenario: Adapter derives the per-node core count from available_parallelism()
-/// on every request — a positive, host-sourced value (not injectable, so we
-/// assert positivity rather than an exact count).
+/// Scenario: the core count comes from available_parallelism() and is positive.
 #[test]
 fn core_count_comes_from_available_parallelism() {
     let nr_of_cores = resolve_nr_of_cores();
@@ -598,9 +534,7 @@ fn core_count_comes_from_available_parallelism() {
     );
 }
 
-/// Scenario: Adapter uses a core count of 1 when available_parallelism() cannot
-/// report one, so an undetectable platform derives exactly the budgets a genuine
-/// single-core node derives.
+/// Scenario: an undetectable core count defaults to 1, matching a genuine single-core node.
 #[test]
 fn core_count_defaults_to_one_when_detection_fails() {
     let detection_failed = Err(std::io::Error::other("platform reports no core count"));
@@ -611,9 +545,7 @@ fn core_count_defaults_to_one_when_detection_fails() {
     );
 }
 
-/// Scenario: Adapter derives the budgets from the core count the platform
-/// actually reports, so a multi-core node is not collapsed to the
-/// detection-failure budget of a single-core one.
+/// Scenario: a detected multi-core count is used, not collapsed to the single-core fallback.
 #[test]
 fn core_count_uses_the_detected_count_when_detection_succeeds() {
     let detected = Ok(std::num::NonZeroUsize::new(12).unwrap());
@@ -625,15 +557,10 @@ fn core_count_uses_the_detected_count_when_detection_succeeds() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// T5 — parallelism factor formula tests
-// ---------------------------------------------------------------------------
-
 /// Scenario: Default parallelism factor equals nr_of_cores × 2 when cores > 4.
 #[test]
 fn default_parallelism_factor_is_cores_times_two() {
     let props = serde_json::json!({});
-    // 10 cores × 2 = 20, which is > DEFAULT_PARALLELISM_FACTOR (8), so 20 wins.
     let factor = resolve_parallelism_factor(&props, 10);
     assert_eq!(
         factor, 20,
@@ -641,20 +568,16 @@ fn default_parallelism_factor_is_cores_times_two() {
     );
 }
 
-/// Scenario: Default parallelism factor is floored at DEFAULT_PARALLELISM_FACTOR (8)
-/// when nr_of_cores × 2 would produce a smaller value (e.g., 1 or 2).
+/// Scenario: the default parallelism factor floors at DEFAULT_PARALLELISM_FACTOR.
 #[test]
 fn default_parallelism_factor_floors_at_eight() {
     let props = serde_json::json!({});
-    // 1 core × 2 = 2, the smallest product a detected core count can yield;
-    // must floor to DEFAULT_PARALLELISM_FACTOR.
     let factor_one_core = resolve_parallelism_factor(&props, 1);
     assert_eq!(
         factor_one_core, DEFAULT_PARALLELISM_FACTOR,
         "must floor at 8 on a one-core node"
     );
 
-    // 2 cores × 2 = 4; still below floor.
     let factor_small = resolve_parallelism_factor(&props, 2);
     assert_eq!(
         factor_small, DEFAULT_PARALLELISM_FACTOR,
@@ -666,7 +589,6 @@ fn default_parallelism_factor_floors_at_eight() {
 #[test]
 fn explicit_parallelism_factor_overrides_default() {
     let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "5" });
-    // Even with 32 cores (32×2=64 > 8), the explicit prop wins.
     let factor = resolve_parallelism_factor(&props, 32);
     assert_eq!(
         factor, 5,
@@ -674,12 +596,7 @@ fn explicit_parallelism_factor_overrides_default() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// T8 — DF_TARGET_PARTITIONS and DF_THREADS_PER_UDF note tests
-// ---------------------------------------------------------------------------
-
-/// Scenario: DF_TARGET_PARTITIONS defaults to 1 when property is absent/zero/invalid
-/// and nr_of_cores is 0 (unknown).
+/// Scenario: DF_TARGET_PARTITIONS defaults to 1 when absent/zero/invalid with unknown cores.
 #[test]
 fn df_target_partitions_defaults_to_one() {
     let absent = serde_json::json!({});
@@ -711,7 +628,6 @@ fn df_target_partitions_uses_supplied_value() {
     let val = resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 0);
     assert_eq!(val, 4, "explicit value must be returned");
 
-    // Verify it round-trips through adapterNotes.
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
@@ -735,19 +651,13 @@ fn df_target_partitions_uses_supplied_value() {
     );
 }
 
-/// R1: Supplied DATAFUSION_BATCH_SIZE flows create → adapterNote → pushdown → ScanSpec.
-///
-/// Verifies the full round-trip: resolve_df_batch_size reads the VS property,
-/// build_adapter_notes persists it as NOTE_DF_BATCH_SIZE, and the pushdown path
-/// reads it back via adapter_note. Also checks default and zero-clamp behaviour.
+/// Scenario: DATAFUSION_BATCH_SIZE flows create → adapterNote → pushdown, clamping zero to 1.
 #[test]
 fn df_batch_size_uses_supplied_value() {
-    // Explicit value is returned as-is (clamped to ≥1, but 4096 is already ≥1).
     let props = serde_json::json!({ PROP_DF_BATCH_SIZE: "4096" });
     let val = resolve_df_batch_size(&props);
     assert_eq!(val, 4096, "explicit DATAFUSION_BATCH_SIZE must be returned");
 
-    // Zero is clamped to 1.
     let zero_props = serde_json::json!({ PROP_DF_BATCH_SIZE: "0" });
     assert_eq!(
         resolve_df_batch_size(&zero_props),
@@ -755,7 +665,6 @@ fn df_batch_size_uses_supplied_value() {
         "DATAFUSION_BATCH_SIZE=0 must be clamped to 1"
     );
 
-    // Absent → default.
     let absent = serde_json::json!({});
     assert_eq!(
         resolve_df_batch_size(&absent),
@@ -763,7 +672,6 @@ fn df_batch_size_uses_supplied_value() {
         "absent property must return DEFAULT_DF_BATCH_SIZE (8192)"
     );
 
-    // Verify it round-trips through adapterNotes (create → note → pushdown).
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
@@ -780,7 +688,6 @@ fn df_batch_size_uses_supplied_value() {
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
-    // Pushdown reads it back.
     let pushdown_req = serde_json::json!({
         "type": "pushdown",
         "schemaMetadataInfo": { "adapterNotes": notes_str },
@@ -792,8 +699,7 @@ fn df_batch_size_uses_supplied_value() {
     );
 }
 
-/// Scenario: DF_THREADS_PER_UDF defaults to 1 when property is absent/zero/invalid
-/// and nr_of_cores is 0 (unknown).
+/// Scenario: DF_THREADS_PER_UDF defaults to 1 when absent/zero/invalid with unknown cores.
 #[test]
 fn df_threads_per_udf_defaults_to_one() {
     let absent = serde_json::json!({});
@@ -825,7 +731,6 @@ fn df_threads_per_udf_uses_supplied_value() {
     let val = resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 0);
     assert_eq!(val, 2, "explicit value must be returned");
 
-    // Verify it round-trips through adapterNotes.
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
@@ -849,14 +754,9 @@ fn df_threads_per_udf_uses_supplied_value() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 5.1 — MEMORY_POOL_FRACTION and INSTANCE_OVERHEAD_MB resolver tests
-// ---------------------------------------------------------------------------
-
 /// Scenario: resolve_memory_pool_fraction defaults/validates.
 #[test]
 fn resolve_memory_pool_fraction_defaults_and_validates() {
-    // Absent → default.
     let absent = serde_json::json!({});
     assert_eq!(
         resolve_memory_pool_fraction(&absent),
@@ -864,7 +764,6 @@ fn resolve_memory_pool_fraction_defaults_and_validates() {
         "absent → default 0.6"
     );
 
-    // Empty string → default (nonempty_str filters empty strings).
     let empty = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "" });
     assert_eq!(
         resolve_memory_pool_fraction(&empty),
@@ -872,7 +771,6 @@ fn resolve_memory_pool_fraction_defaults_and_validates() {
         "empty → default 0.6"
     );
 
-    // "0" → out of range (must be > 0.0) → default.
     let zero = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "0" });
     assert_eq!(
         resolve_memory_pool_fraction(&zero),
@@ -880,7 +778,6 @@ fn resolve_memory_pool_fraction_defaults_and_validates() {
         "\"0\" is out of range → default 0.6"
     );
 
-    // "1.5" → > 1.0, out of range → default.
     let too_large = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "1.5" });
     assert_eq!(
         resolve_memory_pool_fraction(&too_large),
@@ -888,7 +785,6 @@ fn resolve_memory_pool_fraction_defaults_and_validates() {
         "\"1.5\" is out of range → default 0.6"
     );
 
-    // "0.5" → valid.
     let valid = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "0.5" });
     assert_eq!(
         resolve_memory_pool_fraction(&valid),
@@ -896,7 +792,6 @@ fn resolve_memory_pool_fraction_defaults_and_validates() {
         "\"0.5\" must be accepted"
     );
 
-    // "1.0" → exactly 1.0, boundary valid.
     let one = serde_json::json!({ PROP_MEMORY_POOL_FRACTION: "1.0" });
     assert_eq!(
         resolve_memory_pool_fraction(&one),
@@ -908,7 +803,6 @@ fn resolve_memory_pool_fraction_defaults_and_validates() {
 /// Scenario: resolve_instance_overhead_mb defaults/validates.
 #[test]
 fn resolve_instance_overhead_mb_defaults_and_validates() {
-    // Absent → default.
     let absent = serde_json::json!({});
     assert_eq!(
         resolve_instance_overhead_mb(&absent),
@@ -916,7 +810,6 @@ fn resolve_instance_overhead_mb_defaults_and_validates() {
         "absent → default 200"
     );
 
-    // Empty string → default (nonempty_str filters empty strings).
     let empty = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "" });
     assert_eq!(
         resolve_instance_overhead_mb(&empty),
@@ -924,7 +817,6 @@ fn resolve_instance_overhead_mb_defaults_and_validates() {
         "empty → default 200"
     );
 
-    // "0" → valid (zero overhead is permitted).
     let zero = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "0" });
     assert_eq!(
         resolve_instance_overhead_mb(&zero),
@@ -932,7 +824,6 @@ fn resolve_instance_overhead_mb_defaults_and_validates() {
         "\"0\" is a valid overhead (zero)"
     );
 
-    // "256" → valid.
     let valid = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "256" });
     assert_eq!(
         resolve_instance_overhead_mb(&valid),
@@ -940,7 +831,6 @@ fn resolve_instance_overhead_mb_defaults_and_validates() {
         "\"256\" must be returned as-is"
     );
 
-    // Garbage → default.
     let garbage = serde_json::json!({ PROP_INSTANCE_OVERHEAD_MB: "not-a-number" });
     assert_eq!(
         resolve_instance_overhead_mb(&garbage),
@@ -950,12 +840,8 @@ fn resolve_instance_overhead_mb_defaults_and_validates() {
 }
 
 /// Scenario: resolve_join_broadcast_max_bytes defaults/validates.
-/// Task 3.6 — property present + valid numeric parses correctly; absent
-/// defaults to 128 MiB; invalid (non-numeric or zero/negative) falls back
-/// to the default. See backlog BL-001 / plan `add-join-pushdown-broadcast`.
 #[test]
 fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
-    // Absent → default 128 MiB.
     let absent = serde_json::json!({});
     assert_eq!(
         resolve_join_broadcast_max_bytes(&absent),
@@ -967,7 +853,6 @@ fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
         "default must be exactly 128 MiB"
     );
 
-    // Empty string → default (nonempty_str filters empty strings).
     let empty = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "" });
     assert_eq!(
         resolve_join_broadcast_max_bytes(&empty),
@@ -975,7 +860,6 @@ fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
         "empty → default 128 MiB"
     );
 
-    // Present + valid numeric → parsed correctly.
     let valid = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "67108864" });
     assert_eq!(
         resolve_join_broadcast_max_bytes(&valid),
@@ -983,7 +867,6 @@ fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
         "\"67108864\" (64 MiB) must be parsed as-is"
     );
 
-    // Non-numeric → default.
     let garbage = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "not-a-number" });
     assert_eq!(
         resolve_join_broadcast_max_bytes(&garbage),
@@ -991,7 +874,6 @@ fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
         "unparseable value → default 128 MiB"
     );
 
-    // Zero → invalid (must be positive) → default.
     let zero = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "0" });
     assert_eq!(
         resolve_join_broadcast_max_bytes(&zero),
@@ -999,7 +881,6 @@ fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
         "\"0\" is not positive → default 128 MiB"
     );
 
-    // Negative → invalid (u64 parse fails) → default.
     let negative = serde_json::json!({ PROP_JOIN_BROADCAST_MAX_BYTES: "-1" });
     assert_eq!(
         resolve_join_broadcast_max_bytes(&negative),
@@ -1008,8 +889,7 @@ fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
     );
 }
 
-/// Scenario: JOIN_BROADCAST_MAX_BYTES round-trips through build_adapter_notes →
-/// adapter_note (mirroring memory_budget_params_round_trip_through_adapter_notes).
+/// Scenario: JOIN_BROADCAST_MAX_BYTES round-trips through build_adapter_notes → adapter_note.
 #[test]
 fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
@@ -1039,8 +919,7 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
     );
 }
 
-/// Scenario: MEMORY_POOL_FRACTION and INSTANCE_OVERHEAD_MB round-trip through
-/// build_adapter_notes → adapter_note.
+/// Scenario: MEMORY_POOL_FRACTION and INSTANCE_OVERHEAD_MB round-trip through adapterNotes.
 #[test]
 fn memory_budget_params_round_trip_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
@@ -1075,15 +954,10 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Cores-driven defaults for DATAFUSION_TARGET_PARTITIONS / DATAFUSION_THREADS_PER_UDF.
-// ---------------------------------------------------------------------------
-
-/// Task 2.3 — Explicit DATAFUSION_TARGET_PARTITIONS wins over cores-driven default.
+/// Scenario: an explicit DATAFUSION_TARGET_PARTITIONS wins over the cores-driven default.
 #[test]
 fn df_target_partitions_explicit_wins() {
     let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "3" });
-    // Even with nr_of_cores=8, explicit "3" must win.
     assert_eq!(
         resolve_df_fixed_count(&props, PROP_DF_TARGET_PARTITIONS, 8),
         3,
@@ -1091,7 +965,7 @@ fn df_target_partitions_explicit_wins() {
     );
 }
 
-/// Task 2.4 — Absent DATAFUSION_TARGET_PARTITIONS with nr_of_cores=8 defaults to 8.
+/// Scenario: absent DATAFUSION_TARGET_PARTITIONS with 8 cores defaults to 8.
 #[test]
 fn df_target_partitions_defaults_to_nr_of_cores() {
     let props = serde_json::json!({});
@@ -1102,7 +976,7 @@ fn df_target_partitions_defaults_to_nr_of_cores() {
     );
 }
 
-/// Task 2.5 — Absent DATAFUSION_TARGET_PARTITIONS with nr_of_cores=1 defaults to 1.
+/// Scenario: absent DATAFUSION_TARGET_PARTITIONS with 1 core defaults to 1.
 #[test]
 fn df_target_partitions_one_core_defaults_to_1() {
     let props = serde_json::json!({});
@@ -1113,11 +987,10 @@ fn df_target_partitions_one_core_defaults_to_1() {
     );
 }
 
-/// Task 2.6 — Explicit DATAFUSION_THREADS_PER_UDF wins over cores-driven default.
+/// Scenario: an explicit DATAFUSION_THREADS_PER_UDF wins over the cores-driven default.
 #[test]
 fn df_threads_per_udf_explicit_wins() {
     let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
-    // Even with nr_of_cores=16, explicit "2" must win.
     assert_eq!(
         resolve_df_fixed_count(&props, PROP_DF_THREADS_PER_UDF, 16),
         2,
@@ -1125,7 +998,7 @@ fn df_threads_per_udf_explicit_wins() {
     );
 }
 
-/// Task 2.7 — Absent DATAFUSION_THREADS_PER_UDF with nr_of_cores=8 defaults to 8.
+/// Scenario: absent DATAFUSION_THREADS_PER_UDF with 8 cores defaults to 8.
 #[test]
 fn df_threads_per_udf_defaults_to_nr_of_cores() {
     let props = serde_json::json!({});
@@ -1136,7 +1009,7 @@ fn df_threads_per_udf_defaults_to_nr_of_cores() {
     );
 }
 
-/// Task 2.8 — Absent DATAFUSION_THREADS_PER_UDF with nr_of_cores=1 defaults to 1.
+/// Scenario: absent DATAFUSION_THREADS_PER_UDF with 1 core defaults to 1.
 #[test]
 fn df_threads_per_udf_one_core_defaults_to_1() {
     let props = serde_json::json!({});
@@ -1147,12 +1020,7 @@ fn df_threads_per_udf_one_core_defaults_to_1() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 1 — Threading mode AUTO/FIXED tests
-// ---------------------------------------------------------------------------
-
-/// 1.1 — DATAFUSION_THREADING_MODE parses case-insensitively; absent / empty /
-/// unrecognized values resolve to AUTO.
+/// Scenario: DATAFUSION_THREADING_MODE parses case-insensitively; other values resolve to AUTO.
 #[test]
 fn threading_mode_parses_case_insensitively() {
     assert_eq!(
@@ -1172,8 +1040,7 @@ fn threading_mode_parses_case_insensitively() {
     );
 }
 
-/// 1.5 — Threading mode defaults to AUTO when the property is absent, empty,
-/// or holds an unrecognized value; the resolved mode is recorded in adapterNotes.
+/// Scenario: threading mode defaults to AUTO and the resolved mode is recorded in adapterNotes.
 #[test]
 fn threading_mode_defaults_to_auto() {
     assert_eq!(
@@ -1192,7 +1059,6 @@ fn threading_mode_defaults_to_auto() {
         "unrecognized value → Auto"
     );
 
-    // The resolved AUTO mode is recorded in adapterNotes.
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
@@ -1216,12 +1082,9 @@ fn threading_mode_defaults_to_auto() {
     );
 }
 
-/// 1.5 — AUTO mode derives a per-instance thread budget that does not
-/// oversubscribe a node: instances × threads ≤ nr_of_cores, with target
-/// partitions held in lockstep with threads.
+/// Scenario: AUTO derives threads with instances × threads ≤ cores, partitions in lockstep.
 #[test]
 fn auto_mode_derives_non_oversubscribing_threads() {
-    // 16 cores, parallelism_factor (= udf_instances_per_node) = 4 → 16/4 = 4.
     let (target_partitions, threads) =
         resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 16, 4);
     assert_eq!(threads, 4, "16 cores / 4 instances → 4 threads");
@@ -1229,19 +1092,16 @@ fn auto_mode_derives_non_oversubscribing_threads() {
         target_partitions, threads,
         "target_partitions must equal threads (lockstep)"
     );
-    // The oversubscription invariant must hold explicitly.
     assert!(
         4 * threads <= 16,
         "udf_instances_per_node × threads must not exceed nr_of_cores"
     );
 
-    // Non-divisible case: 10 cores / 3 instances → floor(10/3) = 3; 3×3=9 ≤ 10.
     let (tp, th) = resolve_df_threading(ThreadingMode::Auto, &serde_json::json!({}), 10, 3);
     assert_eq!(th, 3, "floor(10/3) = 3");
     assert_eq!(tp, th, "lockstep");
     assert!(3 * th <= 10, "invariant: 3 × 3 = 9 ≤ 10");
 
-    // A supplied DATAFUSION_TARGET_PARTITIONS is ignored in AUTO mode.
     let (tp_ignored, th_ignored) = resolve_df_threading(
         ThreadingMode::Auto,
         &serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "99", PROP_DF_THREADS_PER_UDF: "99" }),
@@ -1252,8 +1112,7 @@ fn auto_mode_derives_non_oversubscribing_threads() {
     assert_eq!(tp_ignored, 4, "AUTO ignores supplied target partitions");
 }
 
-/// 1.5 — AUTO mode yields a single thread / partition on a one-core node, even
-/// when the per-node instance share exceeds the core count.
+/// Scenario: AUTO mode yields one thread and one partition on a one-core node.
 #[test]
 fn auto_mode_yields_one_thread_on_one_core() {
     let (target_partitions, threads) =
@@ -1262,11 +1121,9 @@ fn auto_mode_yields_one_thread_on_one_core() {
     assert_eq!(target_partitions, 1, "one core → 1 target partition");
 }
 
-/// 1.5 — FIXED mode uses the operator-supplied values verbatim; absent or
-/// non-positive values fall back to max(nr_of_cores, 1) per field.
+/// Scenario: FIXED mode uses supplied values verbatim, else max(nr_of_cores, 1) per field.
 #[test]
 fn fixed_mode_uses_supplied_values() {
-    // Explicit positive values are used verbatim, regardless of cores.
     let props = serde_json::json!({
         PROP_DF_TARGET_PARTITIONS: "3",
         PROP_DF_THREADS_PER_UDF: "2",
@@ -1275,22 +1132,16 @@ fn fixed_mode_uses_supplied_values() {
     assert_eq!(tp, 3, "FIXED uses supplied target partitions verbatim");
     assert_eq!(th, 2, "FIXED uses supplied threads verbatim");
 
-    // Absent values fall back to max(nr_of_cores, 1) per field.
     let (tp_d, th_d) = resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 8, 4);
     assert_eq!(tp_d, 8, "absent target partitions → max(cores,1) = 8");
     assert_eq!(th_d, 8, "absent threads → max(cores,1) = 8");
 
-    // Unknown cores → 1.
     let (tp_z, th_z) = resolve_df_threading(ThreadingMode::Fixed, &serde_json::json!({}), 0, 4);
     assert_eq!(tp_z, 1, "absent target partitions, cores=0 → 1");
     assert_eq!(th_z, 1, "absent threads, cores=0 → 1");
 }
 
-// ---------------------------------------------------------------------------
-// TABLE_MAP round-trip, pushdown table derivation, and collision tests.
-// ---------------------------------------------------------------------------
-
-/// TABLE_MAP round-trips through build_adapter_notes → read_table_map.
+/// Scenario: TABLE_MAP round-trips through build_adapter_notes → read_table_map.
 #[test]
 fn table_map_round_trips_through_adapter_notes() {
     let table_map = vec![
@@ -1334,7 +1185,7 @@ fn table_map_round_trips_through_adapter_notes() {
     assert_eq!(recovered.len(), 2, "map must have exactly two entries");
 }
 
-/// TABLE_MAP is stored as a nested JSON object, not a string.
+/// Scenario: TABLE_MAP is stored as a nested JSON object, not a string.
 #[test]
 fn table_map_stored_as_nested_json_object() {
     let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
@@ -1355,7 +1206,6 @@ fn table_map_stored_as_nested_json_object() {
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
     let parsed: serde_json::Value =
         serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
-    // TABLE_MAP must be a JSON object, not a string.
     assert!(
         parsed[NOTE_TABLE_MAP].is_object(),
         "TABLE_MAP must be a nested JSON object: {parsed}"
@@ -1367,7 +1217,7 @@ fn table_map_stored_as_nested_json_object() {
     );
 }
 
-/// TABLE_MAP round-trip preserves other adapterNotes entries (merge, not clobber).
+/// Scenario: TABLE_MAP merges with existing adapterNotes entries.
 #[test]
 fn table_map_merges_with_existing_notes() {
     let req = serde_json::json!({
@@ -1400,14 +1250,13 @@ fn table_map_merges_with_existing_notes() {
     assert!(parsed[NOTE_TABLE_MAP].is_object());
 }
 
-/// read_table_map returns an empty map when TABLE_MAP is absent from adapterNotes.
+/// Scenario: read_table_map returns an empty map when TABLE_MAP is absent.
 #[test]
 fn read_table_map_absent_returns_empty() {
     let req = serde_json::json!({"type": "pushdown"});
     let map = read_table_map(&req);
     assert!(map.is_empty(), "absent TABLE_MAP must return empty map");
 
-    // adapterNotes present but no TABLE_MAP key.
     let req2 = serde_json::json!({
         "type": "pushdown",
         "schemaMetadataInfo": {
@@ -1421,8 +1270,6 @@ fn read_table_map_absent_returns_empty() {
     );
 }
 
-/// Build a pushdown request whose adapterNotes carry `table_map` and whose
-/// involved virtual table is `involved`.
 fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &str) -> Json {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
@@ -1446,7 +1293,7 @@ fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &st
     })
 }
 
-/// Pushdown with an unknown virtual table name returns a clear error naming it.
+/// Scenario: a pushdown naming an unknown virtual table errors naming it.
 #[test]
 fn pushdown_unknown_involved_table_errors() {
     let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
@@ -1459,7 +1306,7 @@ fn pushdown_unknown_involved_table_errors() {
     );
 }
 
-/// TABLE_MAP lookup succeeds for a known virtual table name.
+/// Scenario: TABLE_MAP lookup resolves a known virtual table.
 #[test]
 fn pushdown_known_involved_table_resolves_identifier() {
     let table_map = vec![("ORDERS".to_string(), "prod.finance.orders".to_string())];
@@ -1472,7 +1319,7 @@ fn pushdown_known_involved_table_resolves_identifier() {
     );
 }
 
-/// A direct-storage identifier carries an empty namespace, so `TABLE_MAP` records the bare directory name with no dots.
+/// Scenario: a direct-storage TABLE_MAP entry is the bare directory name and round-trips.
 #[test]
 fn table_map_records_the_bare_directory_name_and_round_trips() {
     let idents = vec![
@@ -1510,15 +1357,7 @@ fn cat_ident(ns: &[&str], name: &str) -> CatalogTableIdent {
     }
 }
 
-/// Multi-level namespace flattening is deterministic and collision detection
-/// returns a clear error naming the colliding Exasol table name.
-///
-/// Scenario: configured `prod.finance` namespace.
-/// - ns `prod.finance` table `orders`   → Exasol name `ORDERS`
-/// - ns `prod.finance.eu` table `orders` → Exasol name `EU__ORDERS`
-///
-/// Collision pair: ns `prod.finance` table `eu__orders` AND
-/// ns `prod.finance.eu` table `orders` both flatten to `EU__ORDERS`.
+/// Scenario: multi-level flattening is deterministic and a collision names the Exasol table.
 #[test]
 fn flatten_multilevel_namespace_and_detect_collision() {
     let configured_ns = vec!["prod".to_string(), "finance".to_string()];
@@ -1540,8 +1379,7 @@ fn flatten_multilevel_namespace_and_detect_collision() {
         )
     );
 
-    // Collision: ns `prod.finance` table `eu__orders` clashes with
-    // ns `prod.finance.eu` table `orders` — both flatten to `EU__ORDERS`.
+    // `prod.finance`.`eu__orders` and `prod.finance.eu`.`orders` both flatten to `EU__ORDERS`.
     let collider_a = cat_ident(&["prod", "finance"], "eu__orders");
     let collider_b = cat_ident(&["prod", "finance", "eu"], "orders");
     let err = build_table_map(&configured_ns, &[collider_a, collider_b]).unwrap_err();
@@ -1556,10 +1394,7 @@ fn flatten_multilevel_namespace_and_detect_collision() {
     );
 }
 
-/// Build a table_map, write it through build_adapter_notes, parse the
-/// adapterNotes JSON string, and assert:
-/// - TABLE_MAP contains the expected Exasol-name → Iceberg-identifier entries.
-/// - A pre-existing note (CLUSTER_NODES) is still present after the merge.
+/// Scenario: createVirtualSchema records TABLE_MAP in adapterNotes, preserving foreign notes.
 #[test]
 fn create_vs_records_table_map_in_adapter_notes() {
     let configured_ns = vec!["prod".to_string(), "finance".to_string()];
@@ -1569,7 +1404,6 @@ fn create_vs_records_table_map_in_adapter_notes() {
     ];
     let table_map = build_table_map(&configured_ns, &idents).unwrap();
 
-    // Simulate a request with a pre-existing, foreign adapterNotes key.
     let request = serde_json::json!({
         "type": "createVirtualSchema",
         "schemaMetadataInfo": {
@@ -1593,7 +1427,6 @@ fn create_vs_records_table_map_in_adapter_notes() {
     let parsed: serde_json::Value =
         serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
 
-    // TABLE_MAP must be a nested object mapping Exasol names → Iceberg identifiers.
     let table_map_obj = parsed[NOTE_TABLE_MAP]
         .as_object()
         .expect("TABLE_MAP must be a JSON object");
@@ -1608,7 +1441,6 @@ fn create_vs_records_table_map_in_adapter_notes() {
         "TABLE_MAP must map EU__ORDERS → prod.finance.eu.orders"
     );
 
-    // A pre-existing, foreign adapterNotes key must survive the merge.
     assert_eq!(
         parsed["CLUSTER_NODES"].as_str(),
         Some("3"),
@@ -1616,10 +1448,7 @@ fn create_vs_records_table_map_in_adapter_notes() {
     );
 }
 
-/// The Iceberg listing output — table names, declared column names and types,
-/// `TABLE_MAP`, and skipped identifiers — stays byte-identical behind the shared
-/// `CatalogClient` trait, including the full-Unicode `to_uppercase` fold that
-/// turns `straße` into `STRASSE`.
+/// Scenario: Iceberg listing output is unchanged behind `CatalogClient`, incl. the `ß` fold.
 #[test]
 fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     use iceberg::spec::{PrimitiveType, Type};
@@ -1668,7 +1497,6 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
         columns[0]["dataType"],
         json!({"type": "decimal", "precision": 20, "scale": 0})
     );
-    // Full-Unicode fold: `ß` expands to `SS`, so `straße` declares as `STRASSE`.
     assert_eq!(columns[1]["name"], "STRASSE");
     assert_eq!(
         columns[1]["dataType"],
@@ -1683,7 +1511,6 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
         )]
     );
 
-    // A skipped identifier passes through verbatim for the handler to warn on.
     assert_eq!(
         skipped,
         vec![SkippedTable {
@@ -1693,9 +1520,7 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     );
 }
 
-/// The Iceberg wording is a recorded byte-identical invariant, and the
-/// Delta-base wording carries the client's own neutral detail verbatim — so both
-/// rendered lines are pinned here rather than left to an uncaptured log call.
+/// Scenario: both skip-warning lines are pinned: the Iceberg line and the Unity detail line.
 #[test]
 fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
     assert_eq!(
@@ -1716,24 +1541,15 @@ fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// S3_MAX_CONNECTIONS resolution (Task 2.3 / Scenario Coverage rows 3–5)
-// ---------------------------------------------------------------------------
-
-/// Scenario: FIXED value overrides the AUTO derivation at createVirtualSchema.
-///
-/// An explicit positive-integer property is used verbatim regardless of the
-/// node capacity that AUTO would otherwise derive a different budget from.
+/// Scenario: an explicit S3_MAX_CONNECTIONS overrides the AUTO derivation.
 #[test]
 fn resolve_s3_max_connections_fixed_value_wins() {
     let props = serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "64" });
-    // Cores/instances would AUTO-derive 8 * 4 = 32; the explicit value must win.
     assert_eq!(
         resolve_s3_max_connections(&props, 8, 1),
         64,
         "explicit S3_MAX_CONNECTIONS must be used verbatim"
     );
-    // Independent of node capacity, down to the smallest node.
     assert_eq!(
         resolve_s3_max_connections(&props, 1, 4),
         64,
@@ -1741,24 +1557,17 @@ fn resolve_s3_max_connections_fixed_value_wins() {
     );
 }
 
-/// Scenario: AUTO derivation sizes the per-instance budget from node capacity.
-///
-/// With no explicit property the budget is `per_instance_threads * mult`, and
-/// the aggregate per-node budget (`instances * per_instance`) tracks
-/// `nr_of_cores * mult` regardless of the instance/thread split.
+/// Scenario: AUTO sizes the budget so the per-node aggregate tracks nr_of_cores × multiplier.
 #[test]
 fn resolve_s3_max_connections_auto_scales_with_cores() {
     let absent = serde_json::json!({});
 
-    // One instance on an 8-core node: 8 threads * 4 = 32 connections.
     assert_eq!(
         resolve_s3_max_connections(&absent, 8, 1),
         8 * S3_CONNECTIONS_PER_THREAD,
         "single instance gets the whole node's core count * multiplier"
     );
 
-    // Eight single-thread instances on the same node: 1 thread * 4 = 4 each,
-    // and the aggregate (8 * 4 = 32) matches the one-instance case above.
     let per_instance = resolve_s3_max_connections(&absent, 8, 8);
     assert_eq!(
         per_instance, S3_CONNECTIONS_PER_THREAD,
@@ -1770,14 +1579,12 @@ fn resolve_s3_max_connections_auto_scales_with_cores() {
         "aggregate per-node budget is invariant across the instance/thread split"
     );
 
-    // A larger node scales the budget up.
     assert_eq!(
         resolve_s3_max_connections(&absent, 16, 1),
         16 * S3_CONNECTIONS_PER_THREAD,
         "budget scales with core count"
     );
 
-    // Empty / zero / invalid property strings all fall through to AUTO.
     for bad in ["", "0", "not-a-number", "-4"] {
         let props = serde_json::json!({ PROP_S3_MAX_CONNECTIONS: bad });
         assert_eq!(
@@ -1787,8 +1594,6 @@ fn resolve_s3_max_connections_auto_scales_with_cores() {
         );
     }
 
-    // More instances than cores → the per-instance thread floor of 1 keeps the
-    // budget at exactly one thread's share, never a collapsed or empty one.
     assert_eq!(
         resolve_s3_max_connections(&absent, 2, 8),
         S3_CONNECTIONS_PER_THREAD,
@@ -1797,20 +1602,15 @@ fn resolve_s3_max_connections_auto_scales_with_cores() {
     );
 }
 
-/// Scenario: AUTO derivation yields the single-core budget when the core count
-/// cannot be detected, which is the same budget a genuine one-core node gets:
-/// one thread's worth of connections, never a zero or negative budget.
+/// Scenario: AUTO on one core yields one thread's connection share, never zero.
 #[test]
 fn resolve_s3_max_connections_auto_one_core_yields_one_threads_share() {
     let absent = serde_json::json!({});
-    // One core, one instance → one thread → one thread's connection share.
     assert_eq!(
         resolve_s3_max_connections(&absent, 1, 1),
         S3_CONNECTIONS_PER_THREAD,
         "a one-core node must get one thread's connection share"
     );
-    // The per-instance thread floor keeps the budget at one thread's share even
-    // when the instance share exceeds the core count.
     assert_eq!(
         resolve_s3_max_connections(&absent, 1, 8),
         S3_CONNECTIONS_PER_THREAD,

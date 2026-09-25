@@ -1,16 +1,10 @@
-//! Pushdown planning: resolve the Iceberg file list ONCE and build the
-//! scan-driving SQL that invokes the LAKEHOUSE_SCAN SCALAR EMIT UDF.
+//! Pushdown planning: resolve the file list once and build the SQL that invokes
+//! the scan UDF with an explicit file list.
 //!
-//! Architecture invariants:
-//! - File list resolved exactly ONCE here, in the planning layer.
-//! - The scan SCALAR EMIT UDF receives the explicit file list; it NEVER discovers files.
-//! - A predicate the adapter cannot faithfully translate into the DataFusion scan is
-//!   self-applied by the adapter itself (e.g. as an outer WHERE), never OMITTED from
-//!   the spec. There is no Exasol-side fallback to defer to — see CLAUDE.md
-//!   § "Virtual Schema pushdown delegation" and `specs/_decision/045`.
-//! - LIMIT appears in both the scan spec and the returned SQL (correctness backstop).
-//! - No credential value (catalog-auth or storage) appears in any returned SQL
-//!   string or error message.
+//! A predicate the adapter cannot translate into the DataFusion scan must be
+//! self-applied by the adapter, never omitted: Exasol does not re-apply a delegated
+//! capability (`specs/_decision/045`). No credential value may appear in any
+//! returned SQL or error message.
 
 #[cfg(test)]
 use crate::adapter::catalog_kind::CatalogKind;
@@ -70,10 +64,7 @@ mod request_shape;
 use request_shape::{RequestShape, classify_request_shape};
 
 mod joins;
-// The join types plus `render_broadcast_join` are re-exported to preserve the
-// pre-refactor `crate::adapter::pushdown::<name>` surface; several are consumed
-// only by the `#[cfg(test)]` reachability probe and tests, so a non-test build
-// reads the re-export as unused.
+// Several re-exports are consumed only by tests and the reachability probe.
 #[allow(unused_imports)]
 pub(crate) use joins::{
     DetectedJoin, IneligibleJoinReason, JoinLeaf, JoinShape, JoinSides, RenderedJoinPushdown,
@@ -85,8 +76,7 @@ use joins::{
 
 #[cfg(test)]
 use crate::scan::spec::{AggKind, AggregatePlan, StorageBackend};
-// The filter pipeline's two halves, imported for the test mirrors that pin their
-// composition; production reaches them through `classify_where_filter`.
+// Imported for the test mirrors of `classify_where_filter`'s two halves.
 #[cfg(test)]
 use support::apply_type_rewrites;
 #[cfg(test)]
@@ -100,30 +90,8 @@ mod test_support;
 #[path = "dispatch_golden_tests.rs"]
 mod dispatch_golden;
 
-/// Resolve the Iceberg snapshot + file list and build pushdown SQL.
-///
-/// `cluster_nodes` — the number of Exasol nodes, captured from `ctx.node_count()`
-/// in `dispatch`'s pushdown arm (default 1 when the handshake reports 0).
-///
-/// `parallelism_factor` — the oversubscription multiplier read from the
-/// `PARALLELISM_FACTOR` adapterNotes entry (default 8).
-///
-/// `join_broadcast_max_bytes` — the byte-size threshold read from the
-/// `JOIN_BROADCAST_MAX_BYTES` adapterNotes entry (default 128 MiB); a two-table
-/// inner equi-join broadcasts its smaller side when that side's Iceberg-manifest
-/// byte size is at or below this threshold. See backlog BL-001 / plan
-/// `add-join-pushdown-broadcast`.
-///
-/// `conn` — the resolved `CATALOG_CONNECTION` configuration: `catalog_uri` and
-/// `catalog_kind` (threaded from `dispatch`'s single handshake-time resolution so
-/// the pushdown path matches it nowhere else; passed to
-/// [`TableScanResolver::for_request`], the seam's own one construction site),
-/// `creds` (used to determine whether to sign catalog requests and whether to
-/// apply vended storage credentials), `storage`, and `allow_http` (under vending,
-/// the operator's consent gate for plaintext transport).
-///
-/// Returns JSON `{"type":"pushdown","sql":"..."}`.
-///
+/// `join_broadcast_max_bytes`: a two-table inner equi-join broadcasts its smaller
+/// side when that side's manifest byte size is at or below this threshold.
 #[allow(clippy::too_many_arguments)]
 pub async fn handle_pushdown(
     request: &Json,
@@ -145,18 +113,11 @@ pub async fn handle_pushdown(
         .cloned()
         .unwrap_or(Json::Null);
 
-    // Merged the same way the handshake merged them, so each catalog-kind arm reads its own property from one source.
     let props = get_properties(request);
 
-    // Inner-join handling MUST run before the single-table path. `handle_pushdown`
-    // is invoked once per pushdown REQUEST, resolving only `involvedTables[0]`
-    // (adapter::mod::handle_pushdown_request); a join-shaped `from` that fell through
-    // would scan just the first table and silently drop the join. `NotAJoin` is
-    // today's normal single-table request — fall through unchanged. `Ineligible` is a
-    // shape the adapter cannot render at all (a non-inner join node, or a malformed
-    // shape), so it is a hard client-facing error (Exasol does not re-plan on an
-    // adapter error). `Join` is served here by the single unified join path and
-    // returns directly.
+    // Join handling must run first: this path resolves only `involvedTables[0]`, so a
+    // join falling through would silently scan one table. `Ineligible` is a hard error
+    // because Exasol does not re-plan on an adapter error.
     match detect_join(request, &pushdown_req)? {
         JoinShape::NotAJoin => {}
         JoinShape::Ineligible(reason) => return Err(ineligible_join_decline(reason)),
@@ -182,10 +143,7 @@ pub async fn handle_pushdown(
         }
     }
 
-    // Single-table chokepoint (issue #193): strip every `tableAlias` here, after the
-    // join gate (which returned above on the original, alias-carrying request) and
-    // before the first read of `pushdown_req` below, so the shadowing rebind covers
-    // every downstream render. See `strip_table_alias`'s doc comment for why.
+    // Strip every `tableAlias` after the join gate and before any read (#193).
     let pushdown_req = strip_table_alias(&pushdown_req);
 
     let (proj_cols, proj_types, projection_widened) = extract_projection(request, &pushdown_req)?;
@@ -194,30 +152,16 @@ pub async fn handle_pushdown(
 
     let col_types = extract_all_column_types(request);
 
-    // ONE classification of the request's WHERE filter, owned by
-    // `classify_where_filter`: `filter` is the DataFusion-bound scan-spec predicate,
-    // `declined_filter` the original tree the adapter must self-apply because the
-    // scan cannot carry it. At most one is `Some`. `filter_json_raw` itself is left
-    // completely unmodified for the later format-level pruning the resolver
-    // applies below, which must see the original, un-rewritten predicate tree — a
-    // decline changes what the ADAPTER renders, never what pruning sees.
+    // `filter_json_raw` stays unmodified: format-level pruning must see the original
+    // predicate tree, whatever the adapter declines.
     let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
 
     let limit = extract_limit(&pushdown_req);
 
-    // Whether Exasol pushed an ORDER BY. Drives the anti-wrong-truncation guard
-    // (decision [4]): a limit is withheld from every ORDER-BY-carrying request the
-    // adapter does not match as a bounded top-N, so a bare per-shard/outer LIMIT is
-    // never emitted ahead of an ordering the adapter did not itself render.
+    // A limit is withheld from any ORDER BY request not matched as a bounded top-N, so
+    // a bare LIMIT never precedes an ordering the adapter did not render (decision [4]).
     let has_order_by = order_by_present(&pushdown_req);
 
-    // Resolve the table exactly once, on one resolver built once for this request:
-    // the ONE format-reader seam every request shape resolves through. The returned
-    // `effective_storage` carries vended STS creds when use_vended_credentials is
-    // true; otherwise it equals the static `storage` passed in. Every per-shard
-    // ScanSpec uses this storage. filter_json_raw is forwarded for format-level file
-    // pruning; ScanSpec.filter (DataFusion SQL string) is set separately above and
-    // left completely unchanged.
     let connection = ConnectionStorage {
         storage: &conn.storage,
         creds: &conn.creds,
@@ -250,9 +194,8 @@ pub async fn handle_pushdown(
         conn.sealed_storage_key.as_ref(),
     )?;
 
-    // BEFORE the zero-active-files early return: a table with no active file must
-    // still refuse a request naming a column it cannot render, never answer that
-    // request with an empty result.
+    // Before the zero-files early return: a refused column must error, never yield an
+    // empty result.
     ensure_no_refused_column_referenced(
         request,
         (!projection_widened).then_some(proj_cols.as_slice()),
@@ -269,19 +212,11 @@ pub async fn handle_pushdown(
         );
     }
 
-    // Compute G = shard_count(node_count, parallelism_factor, file_count) and
-    // partition files into G byte-balanced work-unit shards (GROUP BY shard_key fan-out).
     let g = shard_count(cluster_nodes, parallelism_factor, files.len());
     let shards = crate::adapter::sharding::partition_files_by_bytes(files, g);
-    // Emit each under-root file path relative to `table_root` (carried once in the
-    // common blob) so the per-shard payload stops repeating the table-location
-    // prefix. Sizes and shard membership are unchanged; paths not under the root
-    // stay absolute. The scan UDF rejoins relative paths onto `table_root`.
     let shards = relativize_shards_to_root(shards, &table_root);
 
-    // The scan and distributor UDFs must be schema-qualified: the pushdown query
-    // executes outside the adapter script's schema, so an unqualified name would not
-    // resolve ("function or script LAKEHOUSE_SCAN not found").
+    // Schema-qualified: the pushdown query runs outside the adapter script's schema.
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);
     let distribute_udf_name = qualify_udf(scan_schema, DISTRIBUTE_FILES_UDF_NAME);
 
@@ -313,24 +248,9 @@ pub async fn handle_pushdown(
     )
 }
 
-/// Build the dispatch SQL for a resolved, non-empty pushdown request.
-///
-/// Extracted verbatim from `handle_pushdown`'s post-resolution dispatch body
-/// (issue #175 / plan `refactor-scan-spec-dispatch-dedup`, task 1.1): a pure,
-/// behavior-preserving move — no field, clause, argument, or ordering change.
-/// `handle_pushdown` resolves the file list, shards it, and qualifies the UDF
-/// names before calling this; every parameter here is an already-resolved
-/// input from that resolution.
-///
-/// `projection_widened` is `extract_projection`'s widening signal for the
-/// `proj_cols`/`proj_types` pair passed alongside it: `true` means they are the full
-/// base row rather than one item per select-list item (#196).
-///
-/// `filter` and `declined_filter` are the two halves of `classify_where_filter`'s
-/// single classification and are never both `Some`: `filter` is the predicate the
-/// scan spec carries, `declined_filter` the ORIGINAL tree the adapter must self-apply
-/// because the scan cannot carry it. This dispatcher does not re-derive
-/// renderability — that classification has exactly one owner.
+/// `projection_widened` means `proj_cols`/`proj_types` are the full base row rather
+/// than one item per select-list item (#196). `filter` and `declined_filter` are
+/// never both `Some`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn build_dispatch_sql(
     request: &Json,
@@ -358,12 +278,6 @@ pub(crate) fn build_dispatch_sql(
     instance_overhead_mb: u64,
     s3_max_connections: usize,
 ) -> Result<Json, UdfError> {
-    // Shard-invariant fields shared by every fan-out `ScanSpec` this dispatcher
-    // builds below. Each site spreads `..base.clone()` and sets only the fields
-    // that differ; a field left unset keeps the inert placeholder here
-    // unchanged (empty projection/order_by, no filter/limit/
-    // aggregates/group_keys, `distinct: false` — the same neutral defaults
-    // every non-aggregate, non-projecting site already needed).
     let base = CommonScanSpec {
         table_root: table_root.clone(),
         projection: Vec::new(),
@@ -386,8 +300,8 @@ pub(crate) fn build_dispatch_sql(
         s3_max_connections,
     };
 
-    // Declined WHERE route, ahead of shape routing so it applies before aggregating,
-    // grouping, and truncating (see `_decision/045`).
+    // Ahead of shape routing so it applies before aggregating, grouping, and
+    // truncating (`_decision/045`).
     if let Some(declined) = declined_filter {
         return qualified_single_table_fallback_pushdown(
             request,
@@ -402,18 +316,6 @@ pub(crate) fn build_dispatch_sql(
         );
     }
 
-    // One shared classifier decides the routing shape for BOTH this dispatcher and
-    // the empty-result path (`empty_result::empty_result_sql`), so their output
-    // shapes are identical by construction rather than by two hand-synced routing
-    // trees. The 3-tier priority (grouped → single-group → row scan), the numeric
-    // gates, and the grouped HAVING merge-render — whose failure is a route to
-    // `GroupByWrapper`, not an error — all live in the classifier; each arm below
-    // renders ONLY its own SQL. The fall-through arms
-    // (ordinary single-group aggregate, row scan) yield the shared aggregate inputs
-    // the row-scan/partial-aggregate rendering below consumes: the ordinary plans
-    // (`Some` for the aggregate sub-path, `None` for a row scan), their per-plan
-    // declared `EMITS` types, and the ready-to-emit outer merge SELECT — all three
-    // empty on the row-scan sub-path, which reads none of them.
     let single_group_merge = match classify_request_shape(pushdown_req, &col_types) {
         RequestShape::Grouped {
             detection,
@@ -426,40 +328,13 @@ pub(crate) fn build_dispatch_sql(
                 plan_types: grouped_agg_types,
                 select_items,
             } = detection;
-            // `having` arrives ALREADY rendered over the merge decomposition (each
-            // aggregate reference rewritten to its merged expression, SUM(score) →
-            // SUM("PARTIAL_sum_0")) — the classifier renders it, because a HAVING
-            // that does not render routes to `GroupByWrapper` instead of reaching
-            // this arm.
-
-            // `grouped_order_by` likewise arrives ALREADY RESOLVED over the merge
-            // decomposition (a group key as its positional output ordinal, an
-            // aggregate as its merged PARTIAL_* expression). Once ORDER_BY_COLUMN is
-            // advertised Exasol delegates any ORDER BY on the grouped output and NO
-            // LONGER re-sorts the rows the adapter returns (add-topn-pushdown B6), so
-            // the merge SQL must render its own explicit final ORDER BY — and an
-            // ordering the merge cannot express routes to `GroupByWrapper` instead of
-            // reaching this arm (issue #198).
-
-            // With the ordering now rendered explicitly, the outer LIMIT is a true
-            // global top-N over the merged groups, so it is safe to apply. When there
-            // is no ORDER BY it stays a plain grouped LIMIT (unchanged). The per-shard
-            // partial scan still never carries a LIMIT (the fan-out common blob is
-            // rebuilt with `limit = None`), preserving the anti-wrong-truncation
-            // invariant (decision [4]).
+            // Safe to apply the outer LIMIT: the merge renders its own ORDER BY, and the
+            // per-shard partial never carries a LIMIT (decision [4]).
             let grouped_limit = limit;
-            // Resolved BEFORE the spec: the DataFusion-side group keys are derived
-            // from these declared types, because a CHAR(n)-declared key must be
-            // blank-padded to n to reproduce Exasol's own CHAR grouping (#192).
-            // ONLY the spec copy is padded — the `classify_request_shape` ORDER BY
-            // resolution (`build_grouped_order_by_clause`) and
-            // `build_grouped_aggregate_scan_sql` below keep the unpadded fragments,
-            // which are what a pushed ORDER BY is matched against.
+            // A CHAR(n) key must be blank-padded to reproduce Exasol's CHAR grouping (#192).
+            // Only the spec copy is padded; ORDER BY matching uses the unpadded fragments.
             let group_key_types = group_key_exasol_types(pushdown_req, &group_keys, &select_items);
-            // This branch is ALWAYS an aggregate dispatch — see `ScanSpec::projection`
-            // doc for why an empty `projection` is inert here, not "all columns"
-            // (#145): it stays at `base`'s empty placeholder, so it is not set
-            // explicitly below.
+            // Empty `projection` is inert on an aggregate dispatch (#145).
             let spec_template = ScanSpec {
                 common: CommonScanSpec {
                     filter,
@@ -470,11 +345,8 @@ pub(crate) fn build_dispatch_sql(
                 },
                 files: vec![],
             };
-            // Per-plan declared types, aligned 1:1 with `grouped_agg_plans` (which
-            // now includes aggregates nested inside a scalar-over-aggregate item).
-            // These must come from the detection-built `plan_types`, never from a
-            // `selectList`-keyed lookup — that would misalign once nested aggregates
-            // join the plan list.
+            // From detection, never a `selectList`-keyed lookup: nested aggregates would
+            // misalign it.
             let aggregate_types = grouped_agg_types;
             let sql = build_grouped_aggregate_scan_sql(
                 &spec_template,
@@ -495,23 +367,10 @@ pub(crate) fn build_dispatch_sql(
             return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
         }
         RequestShape::GroupByWrapper => {
-            // A GROUP BY request that did NOT push down as a grouped partial/merge
-            // must NEVER fall through to the bare row scan: for a grouped request
-            // Exasol expects the pushdown query to return exactly the `selectList`
-            // columns, but a raw full-row scan returns the projected source columns
-            // instead → SQL state `04000` "Expected number of columns is N but
-            // pushdown query has M". Route it to a qualified single-table wrapper —
-            // the join N-scan fallback at N=1 — that renders the exact grouped select
-            // list (aggregates verbatim) over a materialized sharded raw scan so
-            // Exasol's core engine aggregates the returned rows (issue #82).
-            //
-            // Per-shard scan stays LIMIT-free and sort-free (no aggregates, no group
-            // keys); the group keys, HAVING, ORDER BY, and LIMIT go in the outer
-            // wrapper only. The WHERE filter is pushed into the scan, exactly as the
-            // grouped push-down path does, and needs no outer WHERE — not because an
-            // advertised capability guarantees a translatable predicate (it does not),
-            // but because a predicate the scan cannot carry never reaches this arm: the
-            // declined-filter route above intercepts it and self-applies it.
+            // Never fall through to the bare row scan: Exasol expects exactly the
+            // `selectList` columns (`04000` otherwise). The qualified wrapper lets Exasol
+            // aggregate the materialized rows (#82). No outer WHERE is needed: an
+            // untranslatable filter never reaches this arm.
             return qualified_single_table_fallback_pushdown(
                 request,
                 pushdown_req,
@@ -525,22 +384,10 @@ pub(crate) fn build_dispatch_sql(
             );
         }
         RequestShape::SingleGroupAgg { items } => {
-            // Case 1 COUNT(DISTINCT) path: EXACTLY one COUNT(DISTINCT <bare column>)
-            // and nothing else. This is the ONLY count-distinct shape that fans out —
-            // a dedicated DISTINCT row-scan counted by a native COUNT(DISTINCT "V").
-            // The request-level LIMIT lands ONLY on that outer wrapper — never inside
-            // the fan-out sub-scan (a leaked LIMIT would truncate a shard's local
-            // distinct set → a wrong count). The base spec carries no projection/
-            // aggregates/limit/order-by/distinct: the wrapper builder derives the
-            // fan-out from it.
-            //
-            // No offset ever reaches this site (fact 6, issue #191): Exasol rejects
-            // an OFFSET in ANY ungrouped aggregated select with sqlCode 42000 before
-            // the adapter is consulted, so `build_count_distinct_scan_sql` takes no
-            // offset parameter and this `debug_assert!` documents the invariant
-            // rather than guarding against something reachable (it compiles out of
-            // the release-profile `.so`; the live backstop is the e2e sqlCode 42000
-            // assertion).
+            // Lone bare-column COUNT(DISTINCT): the only fan-out shape. LIMIT goes only on
+            // the outer wrapper; inside the fan-out it would truncate a shard's distinct set.
+            // Exasol rejects OFFSET in an ungrouped aggregate (`42000`) before the adapter
+            // is consulted.
             if is_lone_count_distinct(&items) {
                 debug_assert!(
                     support::extract_offset(pushdown_req) == 0,
@@ -566,22 +413,10 @@ pub(crate) fn build_dispatch_sql(
                 );
                 return Ok(serde_json::json!({"type": "pushdown", "sql": sql}));
             }
-            // Case 2/3 single-group COUNT(DISTINCT) decline: MORE THAN ONE
-            // COUNT(DISTINCT), or a distinct mixed with an ordinary SUM/MIN/MAX/COUNT/
-            // AVG aggregate. Like the grouped guard, it MUST NOT fall through to the
-            // bare row scan below: a raw full-row scan returns the projected source
-            // columns where Exasol's pushdown validation expects one column per
-            // aggregate select item → SQL state `04000`, because Exasol never
-            // re-aggregates a declined pushdown (it runs the returned SQL as the final
-            // answer as-is). A per-distinct fan-out likewise cannot be composed as
-            // sibling SELECT-list scalar subqueries (Exasol rejects an emitting UDF
-            // nested in a scalar subquery, `04000` "emitting function in expression").
-            // Route it to the shared qualified single-table wrapper (the join N-scan
-            // fallback at N = 1), which renders the exact single-group select list —
-            // every COUNT(DISTINCT) and ordinary aggregate spliced verbatim — over a
-            // materialized sharded raw scan narrowed to only the referenced columns
-            // (issue #160), so Exasol's core engine aggregates the returned rows and
-            // the result column count matches its positional validation.
+            // Multiple or mixed distincts: the bare row scan would fail Exasol's positional
+            // validation (`04000`), and per-distinct fan-outs cannot be composed as scalar
+            // subqueries ("emitting function in expression"). Use the qualified wrapper,
+            // narrowed to referenced columns (#160).
             if has_distinct(&items) {
                 return qualified_single_table_fallback_pushdown(
                     request,
@@ -595,29 +430,15 @@ pub(crate) fn build_dispatch_sql(
                     None,
                 );
             }
-            // No distinct item: the ordinary single-group aggregate plans drive the
-            // shared per-shard partial/merge scan below. The plans fold in every
-            // aggregate nested inside a scalar-over-aggregate item, so the per-plan
-            // declared types come from `single_group_plan_types` (aligned 1:1 with
-            // the folded list), never from a select-list-keyed lookup.
             let plans = ordinary_plans(&items);
             let plan_types = single_group_plan_types(pushdown_req, &items);
-            // The merge SELECT is assembled HERE because what each item says depends
-            // on select-list classification, which the SQL builder cannot see.
+            // Assembled here because it depends on select-list classification.
             let merge_inputs =
                 single_group_merge_select(&items, &plans, &plan_types).and_then(|merge_select| {
                     AggregateMergeInputs::new(plan_types, merge_select, limit)
                 });
             let Some(merge_inputs) = merge_inputs else {
-                // An unassemblable item would silently shorten the returned select
-                // list, which Exasol validates positionally — route the whole request
-                // to the wrapper, exactly as the multi-distinct decline above does.
-                // Defensive: no `selectList` shape currently reaches this arm through
-                // `detect_aggregates`, since `classify_scalar_over_aggregate` already
-                // validates the same scalar structure's renderability before a
-                // `ScalarOverAggregate` item is produced — see
-                // `merge_select_declines_when_the_scalar_structure_fails_to_render`
-                // (`single_group_agg_tests.rs`) for the boundary this guards.
+                // Defensive: a shortened select list fails Exasol's positional validation.
                 return qualified_single_table_fallback_pushdown(
                     request,
                     pushdown_req,
@@ -632,33 +453,11 @@ pub(crate) fn build_dispatch_sql(
             };
             Some((plans, merge_inputs))
         }
-        // No decomposable aggregate (or the numeric gate demoted it) → row scan.
         RequestShape::RowScan => {
-            // A real (non-empty) selectList that `project_columns` could not render
-            // item-for-item — e.g. `string_function_arg_type_guard` declining a
-            // select-list item's non-coercible argument type (issue #210), or a
-            // declared type Exasol rejects as an EMITS output (#234) — widens to the
-            // base-row projection (every source column, bare) instead of one item per
-            // select-list item. Exasol's pushdown validation is positional: the
-            // returned SQL must carry exactly the selectList's columns, in its order,
-            // with its declared types, or it hard-errors — `04000` "Expected number of
-            // columns is N but pushdown query has M" when the counts differ, and
-            // `04000` "Data type mismatch in column number K" when they coincide but
-            // the types do not. Route a widened projection to the same qualified
-            // single-table wrapper the `GroupByWrapper` and multi-`DISTINCT` declines
-            // above use: it renders the exact original select list (the declined item
-            // included) as native Exasol SQL over a raw, referenced-column-only scan,
-            // so Exasol evaluates the item itself.
-            //
-            // The routing decision is `project_columns`'s OWN widening signal, piped
-            // here as `projection_widened` — never a comparison of `proj_cols.len()`
-            // against the selectList's item count. That count comparison, which this
-            // replaces, was a lossy re-derivation blind in two directions (#196): it
-            // missed every widening whose base-row column count happens to equal the
-            // select-list arity (reproduced live — a 10-item select list over a
-            // 10-column table returned `04000` "Data type mismatch in column number
-            // 10"), and being local to this arm it never ran on the empty-result or
-            // broadcast-join paths, which consume the same widened projection.
+            // A widened projection must go to the qualified wrapper: Exasol validates the
+            // returned columns positionally (`04000`). Decided by `project_columns`'s own
+            // widening signal, never by comparing column counts, which misses widenings
+            // whose base-row width equals the select-list arity (#196).
             if projection_widened {
                 return qualified_single_table_fallback_pushdown(
                     request,
@@ -676,24 +475,14 @@ pub(crate) fn build_dispatch_sql(
         }
     };
 
-    // Both halves come from ONE Option, so an aggregate spec can never be paired with
-    // absent merge inputs (or vice versa) further down.
+    // One Option, so an aggregate spec can never pair with absent merge inputs.
     let (aggregates, merge_inputs) = single_group_merge
         .map(|(plans, inputs)| (Some(plans), Some(inputs)))
         .unwrap_or((None, None));
 
-    // Ordered top-N applies ONLY to the pure row-scan path (no aggregates). On a
-    // match the sort keys are carried into the common blob (per-shard bounded sort)
-    // and the outer wrapper renders `ORDER BY … LIMIT n`.
-    //
-    // `proj_cols` is passed here EXACTLY as `extract_projection` derived it: the
-    // declined-path sort-key extension below deliberately runs AFTER this call
-    // (issues #225 / #189, decision [2]). Extending first — as the removed #190
-    // full-base-row widening did — would let an appended column make an otherwise
-    // ineligible shape match the bounded top-N, whose rendering path emits
-    // `proj_cols` directly as the FINAL visible EMITS with no wrapping SELECT. A
-    // hidden column would then leak into the result and reintroduce the very arity
-    // mismatch this fix removes.
+    // Must run before the declined-path sort-key extension below: an appended hidden
+    // column could otherwise make a shape match top-N, whose output has no wrapping
+    // SELECT to drop it (#225).
     let topn = if aggregates.is_none() {
         detect_topn(request, pushdown_req, &proj_cols, &logical_schema)
     } else {
@@ -701,61 +490,29 @@ pub(crate) fn build_dispatch_sql(
     };
     let order_by = topn.unwrap_or_default();
 
-    // Fact 5 (issue #191): `extract_offset(pushdown_req) > 0` NEVER arrives without a
-    // non-empty `orderBy` — Exasol's grammar requires an ORDER BY for a pushed OFFSET,
-    // and withholds `limit` entirely when it cannot delegate the ordering it cannot
-    // express (live capture, plan.md rows 1-13). The two guards below are CHAINED on
-    // `has_order_by`, not independent: a non-zero offset declines the bounded top-N
-    // (`detect_topn`, above) so `order_by` is empty here, which is what NULLS
-    // `effective_limit` next and keeps S3 (`build_row_scan_sql`) from ever rendering a
-    // `LIMIT`/`OFFSET` with no `ORDER BY` beside it. This `debug_assert!` documents the
-    // invariant only — it compiles out of the release-profile `.so`; the live backstop
-    // is Task 8's unrenderable-ordering e2e canary.
+    // Exasol requires ORDER BY for a pushed OFFSET, and a non-zero offset declines
+    // top-N, so `effective_limit` is nulled and no LIMIT/OFFSET renders without an
+    // ORDER BY (#191).
     debug_assert!(
         support::extract_offset(pushdown_req) == 0 || has_order_by,
         "fact 5: a non-zero offset must never arrive without a non-empty orderBy"
     );
 
-    // Withhold the limit when an ORDER BY is present but the shape is not a matched
-    // top-N (`order_by` empty): never a bare per-shard/outer LIMIT ahead of an
-    // ordering the adapter did not render (decision [4]). A matched top-N keeps the
-    // limit (bounded per-shard sort + outer merge limit); a plain LIMIT-only query
-    // (no ORDER BY) is unchanged.
     let effective_limit = if has_order_by && order_by.is_empty() {
         None
     } else {
         limit
     };
 
-    // Row-scan DECLINE path, part 1 of 2 (issues #225 / #189): an ORDER BY was pushed
-    // but the shape did not match the bounded top-N (`order_by` empty). Such a sort
-    // key need not be emitted by the derived projection at all — it may name a
-    // different column, or be referenced only INSIDE a projected expression — so the
-    // scan's emitted-column set is EXTENDED with each missing sort-key column as a
-    // HIDDEN column. Part 2 (the wrapper, below) names only the visible columns
-    // explicitly, so every hidden column is dropped from the query's result again.
-    //
-    // `visible_count` is the number of projection items `extract_projection` already
-    // derived before this extension runs (`proj_cols.len()` at this point) — NOT
-    // necessarily the raw select-list arity. A widened projection never reaches this
-    // point at all: the `RowScan` arm above returns to the qualified single-table
-    // wrapper on `projection_widened`, ahead of both `detect_topn` and this extension
-    // (#196), so `proj_cols` here is always the per-select-list-item derivation.
-    //
-    // Position is load-bearing on BOTH sides. AFTER `detect_topn` (see its comment
-    // above), and BEFORE the `spec_template` literal below: that literal derives the
-    // common blob's `projection` from the same vector that `build_scan_driving_sql`
-    // renders the EMITS clause from, so extending afterwards would declare a hidden
-    // column in EMITS that the scan spec never projects — and the UDF would never
-    // emit it.
+    // Declined ORDER BY: missing sort-key columns are appended as hidden columns, and
+    // the wrapper below drops them again (#225). Must run after `detect_topn` and
+    // before `spec_template`, so EMITS and the scan projection stay in sync.
     let visible_count = proj_cols.len();
     let declined_order_by = has_order_by && order_by.is_empty() && aggregates.is_none();
     let declined_sort_keys = if declined_order_by {
         let keys = parse_order_by_keys(pushdown_req);
-        // Correctness-safety guard (issue #198): Exasol delegated this ordering and no
-        // longer re-sorts, so a key that renders nothing must decline HERE — before the
-        // projection is extended and before any SQL is built. Rendering only the
-        // surviving keys would answer a different query than the one asked, silently.
+        // Exasol does not re-sort a delegated ordering, so an unrenderable key must
+        // decline before any SQL is built (#198).
         topn::ensure_every_sort_key_renders(&keys)?;
         topn::extend_projection_with_sort_keys(&mut proj_cols, &mut proj_types, &keys, &col_types);
         keys
@@ -763,21 +520,12 @@ pub(crate) fn build_dispatch_sql(
         Vec::new()
     };
 
-    // Computed once before the struct literal moves `aggregates` into its field:
-    // `projection` is emptied on the aggregate sub-path of this shared
-    // `spec_template` (see its field comment below).
     let has_aggregates = aggregates.is_some();
 
     let spec_template = ScanSpec {
         common: CommonScanSpec {
-            // This `spec_template` is SHARED between the single-group aggregate sub-path
-            // (`aggregates.is_some()`) and the row-scan sub-path. On the aggregate
-            // sub-path the scan never reads `projection` (the referenced columns live in
-            // `aggregates`; DataFusion prunes the physical Parquet read from the query
-            // text), so it is emptied — an inert value that keeps EXPLAIN VIRTUAL
-            // accurate (#145). The row-scan sub-path MUST keep its projection: it drives
-            // both the EMITS clause and the pushed-down scan, so `proj_cols` is preserved
-            // whenever there are no aggregates.
+            // Empty on the aggregate sub-path (inert, keeps EXPLAIN VIRTUAL accurate, #145);
+            // the row-scan sub-path's projection drives EMITS and the scan.
             projection: if has_aggregates {
                 Vec::new()
             } else {
@@ -792,15 +540,6 @@ pub(crate) fn build_dispatch_sql(
         files: vec![],
     };
 
-    // Fact 6 (issue #191): when this call drives the ordinary single-group
-    // aggregate merge (`has_aggregates`, i.e. `build_aggregate_scan_sql`), no
-    // offset can ever reach it — Exasol rejects an OFFSET in ANY ungrouped
-    // aggregated select with sqlCode 42000 before the adapter is consulted, so
-    // `build_aggregate_scan_sql` takes no offset parameter. This `debug_assert!`
-    // documents that unreachability rather than guarding against it (it compiles
-    // out of the release-profile `.so`; the live backstop is the e2e sqlCode
-    // 42000 assertion). It says nothing about the row-scan sub-path this same
-    // call also drives when `has_aggregates` is false.
     debug_assert!(
         !has_aggregates || support::extract_offset(pushdown_req) == 0,
         "fact 6: Exasol rejects OFFSET in an ungrouped aggregated select \
@@ -819,22 +558,9 @@ pub(crate) fn build_dispatch_sql(
         distribute_udf_name,
     );
 
-    // Row-scan DECLINE path, part 2 of 2 (add-topn-pushdown B6; issues #225 / #189).
-    // Once ORDER_BY_COLUMN is advertised Exasol delegates the ordering and NO LONGER
-    // re-applies its own backstop sort/limit on the returned rows, so the adapter
-    // reproduces that former backstop as self-contained SQL: wrap the unbounded
-    // fan-out in a global ORDER BY (plus the original LIMIT, if any).
-    //
-    // The wrapper names the FIRST `visible_count` projection items explicitly rather
-    // than `SELECT *`, so any sort-key column part 1 appended above stays HIDDEN — the
-    // outer ORDER BY binds against it, and it is dropped from the query's result. That
-    // is what keeps the returned column count equal to the derived projection's, which
-    // Exasol validates POSITIONALLY against the original select list (a wider row is
-    // rejected outright with `sqlCode 04000`, never re-projected).
-    //
-    // The per-shard common blob still carries no sort keys and no LIMIT
-    // (anti-wrong-truncation invariant, decision [4]); this is the unoptimized
-    // correctness restoration, not the bounded per-shard top-N.
+    // Exasol does not re-apply a delegated sort/limit, so wrap the unbounded fan-out
+    // in a global ORDER BY naming only the visible columns; a wider row fails
+    // positional validation (`04000`).
     let sql = if declined_order_by {
         topn::wrap_declined_order_by(
             &sql,

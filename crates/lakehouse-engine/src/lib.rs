@@ -1,30 +1,9 @@
-//! Lakehouse Virtual Schema — single `.so`, three entry points.
+//! One `.so`, three entry points: VS adapter, DataFusion scan UDF, version UDF.
 //!
-//! Entry point #1: VS adapter (`__exa_udf_entry_LAKEHOUSE_ADAPTER`)
-//!   Handles the Exasol Virtual Schema JSON protocol: getCapabilities,
-//!   createVirtualSchema, refresh, setProperties, dropVirtualSchema, pushdown.
-//!   Resolves the Iceberg file list ONCE in `pushdown` and returns SQL that
-//!   invokes the scan SCALAR EMIT UDF with the explicit file list.
-//!
-//! Entry point #2: DataFusion scan SCALAR EMIT UDF (`__exa_udf_entry_LAKEHOUSE_SCAN`)
-//!   Invoked once per input row (SDK 0.21.0 scalar dispatch). Each call reads one
-//!   row's ScanSpec, builds a DataFusion session on a fresh per-call Tokio runtime,
-//!   registers only that row's assigned files over MinIO, applies
-//!   projection/filter/limit, converts Arrow batches to SDK `Value` rows, and emits
-//!   them incrementally. The union of all per-row calls covers every shard.
-//!
-//! Entry point #3: version query SCALAR RETURNS UDF (`__exa_udf_entry_LAKEHOUSE_VERSION`)
-//!   Zero-argument, zero-I/O call that reports [`ENGINE_VERSION`], the crate
-//!   version compiled into this `.so`. Needs no CONNECTION and no Virtual
-//!   Schema.
-//!
-//! Architecture invariants enforced here:
-//! - Only SDK `Value` types cross the `.so` boundary — never Arrow types.
-//! - The scan UDF is stateless and discovers no files itself.
-//! - Credentials never appear in error messages.
-//!
-//! Build: `make cross-udf-build` (inside `rust:1.94-trixie`).
-//! Never `cargo build --release` on the host — produces an unloadable host-glibc `.so`.
+//! Invariants: only SDK `Value` types (or Arrow IPC bytes) cross the `.so` boundary, never
+//! Arrow types; the scan UDF discovers no files itself; credentials never appear in errors.
+//! Build only via `make cross-udf-build`; a host `cargo build --release` yields an
+//! unloadable host-glibc `.so`.
 
 use exasol_udf_macros::exasol_udf;
 use exasol_udf_sdk::context::UdfContext;

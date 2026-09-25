@@ -4,7 +4,7 @@ name: Azure Orphan Container Sweep
 
 on:
   schedule:
-    # Weekly, Monday 02:00 UTC. No dry_run input here, so this always deletes.
+    # Scheduled runs have no dry_run input, so they always delete.
     - cron: "0 2 * * 1"
   workflow_dispatch:
     inputs:
@@ -18,7 +18,6 @@ jobs:
   sweep:
     name: Sweep orphaned containers
     runs-on: ubuntu-latest
-    # Only calls the Azure CLI; no repo token needed.
     permissions: {}
     steps:
       - name: Sweep orphaned containers
@@ -51,7 +50,6 @@ jobs:
             -p "$AZURE_CLIENT_SECRET" \
             --tenant "$AZURE_TENANT_ID"
 
-          # DRY_RUN is the string 'true'/'false' — compare as a string.
           if [ "$DRY_RUN" = "true" ]; then
             echo "DRY-RUN: listing stale lhrs-e2e- containers (last_modified older than 24h); nothing will be deleted."
           else
@@ -61,8 +59,7 @@ jobs:
           # JMESPath can't compare dates, so compute the cutoff in bash.
           CUTOFF=$(date -u -d '24 hours ago' +%s)
 
-          # --num-results '*' returns all matches, not the 5000 default. Capture
-          # to a variable (not a pipe) so a failed az call still trips set -e.
+          # Captured to a variable (not a pipe) so a failed az call trips set -e.
           containers=$(az storage container list \
             --account-name "$AZURE_STORAGE_ACCOUNT_NAME" \
             --auth-mode login \

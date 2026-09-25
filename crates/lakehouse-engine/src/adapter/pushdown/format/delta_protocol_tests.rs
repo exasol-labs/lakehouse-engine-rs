@@ -123,7 +123,7 @@ fn a_version_3_table_with_no_reader_feature_list_is_refused_as_malformed() {
 fn the_readable_version_range_is_inclusive_at_both_ends() {
     ensure_readable(0, None).expect_err("reader version 0 is below the readable range");
     ensure_readable(1, None).expect("reader version 1 is the readable range's lower bound");
-    // Reader version 3 must carry the array; an empty one is the feature-free version-3 shape.
+    // Version 3 must carry the array; an empty one is the feature-free shape.
     ensure_readable(3, Some(&[])).expect("reader version 3 is the readable range's upper bound");
 }
 

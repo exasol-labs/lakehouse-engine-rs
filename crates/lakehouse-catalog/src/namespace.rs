@@ -1,10 +1,3 @@
-//! Namespace enumeration for `createVirtualSchema`, plus the Iceberg identifier
-//! parsing every catalog request needs.
-//!
-//! Moved verbatim from the engine's `adapter/pushdown/namespace.rs`.
-//! `parse_table_ident` arrived ahead of the rest because the `loadTable` GET
-//! this crate owns calls it.
-
 use crate::redaction::redact_credentials;
 use crate::session::{build_rest_catalog, glue_catalog_prefix};
 use crate::sigv4::required_signing_region;
@@ -12,14 +5,8 @@ use crate::{CatalogProps, ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use iceberg::{Catalog, NamespaceIdent, TableIdent};
 
-/// Parse a fully-qualified Iceberg identifier into `(NamespaceIdent, table_name)`.
-///
-/// The trailing `.`-delimited segment is the table name; all preceding segments form the
-/// namespace. Supports any number of namespace levels:
-/// - `"db.table"` → `(NamespaceIdent(["db"]), "table")`
-/// - `"prod.finance.orders"` → `(NamespaceIdent(["prod","finance"]), "orders")`
-///
-/// Returns an error when the input contains no `.` (a bare table name with no namespace).
+/// The last `.`-delimited segment is the table name, all preceding ones the
+/// namespace. Errors when the input contains no `.`.
 pub fn parse_table_ident(qualified: &str) -> Result<(NamespaceIdent, String), UdfError> {
     let mut parts: Vec<&str> = qualified.split('.').collect();
     if parts.len() < 2 {
@@ -33,23 +20,8 @@ pub fn parse_table_ident(qualified: &str) -> Result<(NamespaceIdent, String), Ud
     Ok((ns_ident, table_name))
 }
 
-// ---------------------------------------------------------------------------
-// Namespace enumeration (createVirtualSchema)
-// ---------------------------------------------------------------------------
-
-/// Enumerate every `TableIdent` in the configured namespace and all descendants.
-///
-/// Branches on `creds.use_sigv4`: unsigned path uses `RestCatalog::list_namespaces`
-/// and `list_tables`; signed path issues SigV4-signed GETs directly against the
-/// `catalogs/{warehouse}` prefix derived by `glue_catalog_prefix` (AWS Glue's
-/// required REST prefix format), all signed for the one region resolved before
-/// the first request — and refused, with no request sent, when none resolves.
-///
-/// The configured namespace is passed as split segments (e.g. `["prod","finance"]`).
-/// Credentials NEVER appear in returned errors.
-///
-/// Crate-private: `IcebergRestCatalogClient::list_tables` is its only caller — the
-/// engine reaches enumeration through the `CatalogClient` trait, not this function.
+/// Includes descendant namespaces. The signed path issues SigV4 GETs against
+/// AWS Glue's required `catalogs/{warehouse}` prefix.
 pub(crate) async fn list_namespace_tables(
     catalog_uri: &str,
     configured_ns: &[String],
@@ -80,10 +52,6 @@ pub(crate) async fn list_namespace_tables(
     }
 }
 
-/// Enumerate tables using the unsigned `RestCatalog` path.
-///
-/// Recursively lists all direct-child namespaces of `parent`, collecting tables at
-/// every level. `list_namespaces(parent)` returns only direct children.
 async fn list_namespace_tables_unsigned(
     catalog_uri: &str,
     parent: &NamespaceIdent,
@@ -91,7 +59,6 @@ async fn list_namespace_tables_unsigned(
     storage: &StorageBackend,
     creds: &ConnectionCreds,
 ) -> Result<Vec<TableIdent>, UdfError> {
-    // Build a temporary CatalogProps with an empty table to construct the RestCatalog.
     let dummy_catalog = CatalogProps {
         warehouse: warehouse.to_string(),
         table: String::new(),
@@ -100,7 +67,6 @@ async fn list_namespace_tables_unsigned(
     list_in_namespace_unsigned(&catalog, parent).await
 }
 
-/// Recursively collect tables in `ns` and all descendant namespaces using an unsigned catalog.
 fn list_in_namespace_unsigned<'a>(
     catalog: &'a iceberg_catalog_rest::RestCatalog,
     ns: &'a NamespaceIdent,
@@ -110,7 +76,6 @@ fn list_in_namespace_unsigned<'a>(
     Box::pin(async move {
         let mut all: Vec<TableIdent> = Vec::new();
 
-        // Tables directly in this namespace.
         let tables = catalog.list_tables(ns).await.map_err(|e: iceberg::Error| {
             UdfError::User(format!(
                 "failed to list tables in namespace '{}': {}",
@@ -120,7 +85,6 @@ fn list_in_namespace_unsigned<'a>(
         })?;
         all.extend(tables);
 
-        // Recurse into direct child namespaces.
         let children = catalog
             .list_namespaces(Some(ns))
             .await
@@ -141,9 +105,6 @@ fn list_in_namespace_unsigned<'a>(
     })
 }
 
-/// Build the `list_namespaces` URL for a given parent namespace.
-///
-/// `GET {catalog_uri}/v1/{warehouse?}/namespaces?parent={ns_url}`
 fn build_list_namespaces_url(
     catalog_uri: &str,
     warehouse: &str,
@@ -157,9 +118,6 @@ fn build_list_namespaces_url(
     }
 }
 
-/// Build the `list_tables` URL for a given namespace.
-///
-/// `GET {catalog_uri}/v1/{warehouse?}/namespaces/{ns_url}/tables`
 fn build_list_tables_url(catalog_uri: &str, warehouse: &str, ns: &NamespaceIdent) -> String {
     let ns_url = ns.to_url_string();
     if warehouse.is_empty() {
@@ -169,8 +127,6 @@ fn build_list_tables_url(catalog_uri: &str, warehouse: &str, ns: &NamespaceIdent
     }
 }
 
-/// Groups the constants of a SigV4-signed namespace/table enumeration — only
-/// the namespace being listed varies across the recursion.
 struct SignedEnumeration<'a> {
     catalog_uri: &'a str,
     prefix: &'a str,
@@ -179,9 +135,6 @@ struct SignedEnumeration<'a> {
 }
 
 impl<'a> SignedEnumeration<'a> {
-    /// Sign and execute a GET request, returning the response body as JSON.
-    ///
-    /// Credential values NEVER appear in returned errors.
     async fn signed_get_json(&self, url: &str) -> Result<serde_json::Value, UdfError> {
         let client = reqwest::Client::new();
         let request = client
@@ -233,9 +186,6 @@ impl<'a> SignedEnumeration<'a> {
         })
     }
 
-    /// Recursively collect tables in `ns` and all descendants using SigV4-signed GETs
-    /// (mirrors the SigV4 arm of `load_table_any_auth`). Credential values NEVER
-    /// appear in errors.
     fn list_in_namespace_signed<'s>(
         &'s self,
         ns: &'s NamespaceIdent,
@@ -247,7 +197,6 @@ impl<'a> SignedEnumeration<'a> {
 
             let mut all: Vec<TableIdent> = Vec::new();
 
-            // List tables in this namespace.
             let tables_url = build_list_tables_url(self.catalog_uri, self.prefix, ns);
             let tables_json = self.signed_get_json(&tables_url).await.map_err(|e| {
                 UdfError::User(format!(
@@ -266,11 +215,9 @@ impl<'a> SignedEnumeration<'a> {
                 })?;
             all.extend(tables_response.identifiers);
 
-            // List child namespaces and recurse. Best-effort: a flat catalog (e.g. AWS
-            // Glue) rejects nested-namespace listing with HTTP 400, so any failure here
-            // is treated as "no children". Caveat: this also swallows a transient error
-            // on a genuinely nested catalog, silently skipping a subtree. Upgrade path:
-            // branch on catalog capability from GET /v1/config.
+            // Best-effort: a flat catalog (AWS Glue) rejects nested-namespace listing
+            // with HTTP 400, so any failure means "no children". This also swallows a
+            // transient error on a nested catalog, skipping that subtree.
             let ns_url = build_list_namespaces_url(self.catalog_uri, self.prefix, ns);
             let ns_json = match self.signed_get_json(&ns_url).await {
                 Ok(j) => j,

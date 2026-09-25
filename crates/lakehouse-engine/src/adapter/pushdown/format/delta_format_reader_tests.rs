@@ -5,13 +5,12 @@ use crate::adapter::pushdown::test_support::{
 use crate::scan::spec::StorageProps;
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, TableFormat};
 
-/// A closed port: any credential request the reader issued would fail loudly with a
-/// transport error, which is distinguishable from every refusal asserted here.
+/// Closed port: a stray credential request fails with a transport error, distinguishable
+/// from every refusal asserted here.
 const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
 
 const TABLE_NAME: &str = "cat.sch.orders";
 
-/// The static storage credential a forbidden fallback would silently reach for.
 const STATIC_SECRET: &str = "minioadmin";
 
 fn creds(use_vended_credentials: bool) -> ConnectionCreds {
@@ -53,7 +52,6 @@ fn delta_table(
     }
 }
 
-/// Resolve one table's scan and answer the user-error message it fails with.
 async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
     let creds = creds(use_vended_credentials);
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
@@ -76,14 +74,7 @@ async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
     }
 }
 
-/// Scenario: Delta planning resolves its storage credential through the table's own
-/// catalog.
-///
-/// With vending enabled and no catalog-assigned vending key, resolution fails naming
-/// the table. It MUST NOT reach the CONNECTION's static credential instead: a fallback
-/// would have built that store and failed on the transaction log, so a message naming
-/// the log — or one carrying the static credential — is the observable signature of the
-/// fallback this refusal exists to prevent.
+/// Scenario: Vending without a catalog vending key errors and never falls back to the static credential
 #[tokio::test]
 async fn vending_without_a_vending_key_errors_and_never_falls_back_to_static() {
     for absent_key in [None, Some("")] {
@@ -113,13 +104,7 @@ async fn vending_without_a_vending_key_errors_and_never_falls_back_to_static() {
     }
 }
 
-/// Scenario: An empty table storage location is rejected before any object-store
-/// access.
-///
-/// The location check runs before the vended/static split, so every combination of
-/// credential mode and vending key reports the IDENTICAL text. A check placed after
-/// the split would answer the vending-key refusal, or a transport error from the
-/// credential request, for the vending-enabled rows.
+/// Scenario: An empty table storage location is rejected identically before any object-store access
 #[tokio::test]
 async fn empty_storage_location_errors_identically_under_both_credential_modes() {
     let mut messages = Vec::new();
@@ -154,21 +139,15 @@ async fn empty_storage_location_errors_identically_under_both_credential_modes()
     );
 }
 
-/// A closed port on the loopback interface: every S3 request a log read issues is
-/// refused locally, so the failure is deterministic and reaches no network.
 const CLOSED_PORT_ENDPOINT: &str = "http://127.0.0.1:1";
 
-/// Two DISTINCT sentinel credential values, so a leak names which half of the
-/// static credential escaped.
 const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
 const SENTINEL_SECRET_KEY: &str = "sentinel-secret-value-0002";
 
 const DELTA_TABLE_ROOT: &str = "s3://bucket/cat/sch/orders";
 
-/// `sample_storage()`'s shape carrying sentinel credentials and an endpoint nothing
-/// listens on. `path_style` is set deliberately: without it `object_store` ignores the
-/// endpoint and derives a real AWS host from the region, which would send this test's
-/// requests out to the internet.
+/// `path_style` is required: without it `object_store` ignores the endpoint and derives a
+/// real AWS host from the region.
 fn closed_port_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: CLOSED_PORT_ENDPOINT.into(),
@@ -181,10 +160,7 @@ fn closed_port_storage() -> StorageBackend {
     })
 }
 
-/// Every effective-storage secret is masked, and only the secrets are: redaction is
-/// the single guard between an object-store error that echoes a credential verbatim
-/// and the text Exasol surfaces, so it must mask each value it was handed while
-/// leaving the rest of the message readable enough to act on.
+/// Scenario: Redaction masks every effective-storage secret and leaves the rest readable
 #[test]
 fn redacted_masks_every_effective_storage_secret_in_a_raised_error() {
     let secrets = [SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY];
@@ -216,14 +192,7 @@ fn redacted_masks_every_effective_storage_secret_in_a_raised_error() {
     );
 }
 
-/// Scenario: Delta planning resolves its storage credential through the table's own
-/// catalog.
-///
-/// The static-credential half, driven to the point where the log is actually read: the
-/// storage location and the credential decision both succeed, so this is the one test
-/// that enters `read_delta_log` and fails inside it. The refusal must name the table
-/// root it could not read and carry NEITHER static credential value, which is the
-/// redaction this layer owns rather than a message that never held a secret.
+/// Scenario: A failed log read through the static credential reports no credential value
 #[tokio::test]
 async fn a_failed_log_read_reports_no_static_credential_value() {
     let creds = creds(false);
@@ -267,8 +236,7 @@ fn refused(column_name: &str, reason: &str) -> RefusedColumn {
     }
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta table with no mappable column is refused as a
-// whole
+/// Scenario: A Delta table with no mappable column is refused as a whole
 #[test]
 fn a_table_whose_every_column_is_refused_is_refused_as_a_whole() {
     let refused_columns = vec![
@@ -295,8 +263,7 @@ fn a_table_whose_every_column_is_refused_is_refused_as_a_whole() {
     );
 }
 
-/// The `stats_all_types` shape: some columns refused, at least one mappable. The table stays
-/// queryable on its mappable columns rather than being refused as a whole.
+/// Scenario: A table with at least one mappable column stays queryable
 #[test]
 fn a_table_with_at_least_one_mappable_column_is_not_refused_as_a_whole() {
     let logical_schema = vec![LogicalField {
@@ -314,8 +281,7 @@ fn a_table_with_at_least_one_mappable_column_is_not_refused_as_a_whole() {
         .expect("a table with a mappable column must not be refused as a whole");
 }
 
-/// A table declaring no column at all trivially satisfies "every column is mappable" — there is
-/// no refused column to justify a whole-table refusal.
+/// Scenario: A table with no columns and no refusals is not refused as a whole
 #[test]
 fn a_table_with_no_columns_and_no_refusals_is_not_refused_as_a_whole() {
     ensure_table_has_a_mappable_column(&[], &[])

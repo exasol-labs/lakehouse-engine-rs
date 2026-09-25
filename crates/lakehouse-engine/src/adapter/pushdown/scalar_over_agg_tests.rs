@@ -215,10 +215,7 @@ fn classify_declines_a_node_with_no_nested_aggregate() {
     );
 }
 
-/// Classification is purely structural: a bare aggregate satisfies it (one nested
-/// aggregate, no residual column). Routing a top-level aggregate to the plain
-/// aggregate path is the caller's decision, made before consulting this function —
-/// so this test pins the structural answer, not a routing rule.
+/// Scenario: classification is structural, so a bare aggregate is its own single plan
 #[test]
 fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
     let plans = classify_scalar_over_aggregate(&agg("SUM", "X", false))
@@ -246,9 +243,7 @@ fn classify_declines_a_residual_column_outside_the_aggregate() {
     assert!(classify_scalar_over_aggregate(&node).is_none());
 }
 
-/// The one owner of the decomposition mechanism serves both aggregate planners
-/// without naming either: the merged `PARTIAL_*` expressions arrive as a
-/// parameter, so this module renders whatever merge shape its caller owns.
+/// Scenario: render substitutes the caller's merged expressions by plan slot
 #[test]
 fn render_substitutes_the_callers_merged_expressions_by_plan_slot() {
     let node = round_of(sum_over_count(), 2);
@@ -297,14 +292,7 @@ fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
     );
 }
 
-/// The GROUP BY planner and the single-group planner drive `fold_aggregate_plan`
-/// and `render_scalar_over_merge` from structurally different starting states — the
-/// grouped planner's `plans` list already carries an EARLIER, unrelated bare
-/// aggregate from a preceding select-list item (`COUNT(L_ORDERKEY)`), while the
-/// single-group planner's starts empty. Both must fold and render the SAME
-/// scalar-over-aggregate node identically once each caller supplies the merged
-/// expression for its OWN matched slot — proving the shared primitives carry no
-/// assumption about which planner, or which starting `plans` shape, drives them.
+/// Scenario: fold and render yield identical SQL for grouped and single-group starting plan lists
 #[test]
 fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
     let node = round_of(sum_over_count(), 2);

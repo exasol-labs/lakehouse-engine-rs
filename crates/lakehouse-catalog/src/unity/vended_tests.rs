@@ -1,8 +1,3 @@
-//! Tests for `resolve_uc_vended_storage`: the S3 and ADLS terminations, the
-//! scheme-only variant selection, and the unsupported-scheme, missing-credential,
-//! and plaintext-consent error paths — all pure, no network. Every error path is
-//! asserted credential-safe.
-
 use super::*;
 use crate::{AdlsCred, ConnectionCreds, StaticStoreAddress, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
@@ -39,8 +34,7 @@ fn azure_response(sas: &str) -> TemporaryTableCredentials {
     }
 }
 
-/// A response carrying BOTH credential families, so the variant a location
-/// resolves to is proven to come from its scheme, not from the family present.
+/// Both families present, proving the variant comes from the scheme.
 fn both_families() -> TemporaryTableCredentials {
     TemporaryTableCredentials {
         aws_temp_credentials: Some(AwsTempCredentials {
@@ -185,7 +179,6 @@ fn unsupported_scheme_is_error() {
 
 #[test]
 fn missing_matching_credential_is_error() {
-    // An S3 location whose response carries only ADLS credentials.
     let s3_msg = user_message(
         resolve_uc_vended_storage(
             &azure_response(SAS_SENTINEL),
@@ -201,7 +194,6 @@ fn missing_matching_credential_is_error() {
         "no vended secret in the error: {s3_msg}"
     );
 
-    // An ADLS location whose response carries only S3 credentials.
     let adls_msg = user_message(
         resolve_uc_vended_storage(
             &aws_response("AK", SECRET_KEY_SENTINEL, None, None),
@@ -249,7 +241,6 @@ fn plaintext_endpoint_requires_allow_http() {
         "no vended secret in the error: {msg}"
     );
 
-    // Honored with the operator's explicit consent.
     let backend = resolve_uc_vended_storage(
         &response,
         "s3://bucket/tbl",
@@ -285,7 +276,6 @@ fn abfs_location_requires_allow_http_on_the_unity_path() {
         "no vended secret in the error: {msg}"
     );
 
-    // Honored with the operator's explicit consent.
     let backend =
         resolve_uc_vended_storage(&response, location, true, &StaticStoreAddress::default())
             .expect("resolves with allow_http");
@@ -297,11 +287,8 @@ fn abfs_location_requires_allow_http_on_the_unity_path() {
 
 #[test]
 fn s3_vended_response_with_no_store_address_resolves_successfully() {
-    // Real Databricks AWS responses vend a key pair with no endpoint and no
-    // region at all; the CONNECTION is silent too, so neither source resolves
-    // an address. That is a successful resolution — the AWS default chain
-    // places the store at read time — not the deleted "store address
-    // undetermined" refusal.
+    // Databricks AWS responses vend no endpoint or region; the AWS default chain
+    // places the store at read time.
     let response = aws_response("AK", SECRET_KEY_SENTINEL, None, None);
 
     let backend = resolve_uc_vended_storage(

@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
-# Destroy the Lakekeeper catalog box for a named env (EC2, EBS, SG, IAM role/user, SSM parameters;
-# data-stack / S3 / Glue / the Exasol test1 cluster all untouched).
-#
-#   AWS_PROFILE=spot-strata-deployer ./lakekeeper-down.sh <env_name>
+# Usage: AWS_PROFILE=spot-strata-deployer ./lakekeeper-down.sh <env_name>
 set -euo pipefail
 
 ENV="${1:?usage: lakekeeper-down.sh <env_name>}"

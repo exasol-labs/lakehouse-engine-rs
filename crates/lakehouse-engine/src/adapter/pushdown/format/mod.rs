@@ -1,5 +1,5 @@
-//! Table-format selection: the ONE site that pairs a resolved catalog session
-//! with the table it reads and answers the reader that plans that table's scan.
+//! Table-format selection: the one site pairing a resolved catalog session with its table
+//! and answering the reader that plans the scan.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -37,85 +37,52 @@ use parquet_format_reader::ParquetFormatReader;
 #[path = "format_tests.rs"]
 mod tests;
 
-/// One column a table format's reader declined to map to an Arrow tag, named
-/// with the reason it gave. Iceberg never produces one; a Delta reader does for
-/// a `binary` or `variant` column, or a container carrying one at any depth.
-///
-/// Never a `ScanSpec` field: the scan itself never reads this list, only the
-/// pushdown-resolution gate that runs before it.
+/// Never a `ScanSpec` field: only the pre-scan pushdown-resolution gate reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RefusedColumn {
     pub column_name: String,
     pub reason: String,
 }
 
-/// One table's resolved scan, in the shape every table format answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedScan {
-    /// The data files active at the table's current version.
     pub files: Vec<FileEntry>,
-    /// The storage the files were resolved THROUGH and must be read through: the
-    /// vended backend under vending, the CONNECTION's own otherwise.
+    /// The storage the files were resolved through and must be read through (vended under
+    /// vending, the CONNECTION's own otherwise).
     pub effective_storage: StorageBackend,
-    /// The table's logical schema, in declared column order.
     pub logical_schema: Vec<LogicalField>,
-    /// The table's own storage root, carried once per fan-out.
     pub table_root: String,
     /// Physical-name-to-field-id entries for data files carrying no embedded id.
     pub name_mapping: Vec<NameMappingEntry>,
-    /// The table's ordered partition-column names. Empty on every Iceberg scan,
-    /// which is what keeps an Iceberg spec's encoding byte-identical to its
-    /// pre-Delta form.
+    /// Always empty for Iceberg.
     pub partition_columns: Vec<String>,
-    /// Columns this reader declined to map, absent from `logical_schema`. Always
-    /// empty on Iceberg.
     pub refused_columns: Vec<RefusedColumn>,
 }
 
-/// Resolving ONE table into the scan the pushdown layer plans against, for one
-/// table format.
-///
-/// Each implementation owns its WHOLE resolution — catalog request, storage
-/// credential, and file discovery — because no shared caller can pre-fetch what
-/// every format needs to reach its file list: the Iceberg path needs the catalog's
-/// own table metadata, the Delta path only a table root and a credentialed store.
-///
-/// The method answers a boxed future rather than being an `async fn`, because a
-/// native `async fn` in a trait is not dyn-compatible and [`format_reader`]
-/// answers one `Box<dyn FormatReader>`.
+/// Each implementation owns its whole resolution (catalog request, credential, file
+/// discovery) because formats need different inputs to reach their file list. Returns a
+/// boxed future because `async fn` in a trait is not dyn-compatible.
 pub trait FormatReader: Send + Sync {
-    /// This reader's table as it stands now, pruned by `filter_json` wherever the
-    /// format's own planning can apply it. `None` disables that pruning.
+    /// `None` disables format-level pruning.
     fn resolve_scan<'a>(
         &'a self,
         filter_json: Option<&'a Json>,
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedScan, UdfError>> + Send + 'a>>;
 }
 
-/// One table paired with the live catalog session that reads it.
-///
-/// Deliberately NOT the catalog kind: the kind is a parsed virtual-schema property
-/// whose match sites are frozen at their own construction seam, while this carries
-/// a session already resolved and, for Unity Catalog, the table metadata that
-/// session already loaded. Matching this is what keeps format selection from
-/// needing a second kind match site.
+/// Deliberately not the catalog kind: it carries an already-resolved session (and, for
+/// Unity, the loaded table), so format selection needs no second kind match site.
 pub enum ScanSource<'a> {
-    /// A table in an Iceberg REST catalog, named by the request's catalog
-    /// properties.
     Iceberg {
         session: &'a CatalogSession,
         catalog_props: &'a CatalogProps,
     },
-    /// A Delta table in a Unity Catalog, paired with the metadata that catalog
-    /// loaded for it — whose format tag [`format_reader`] checks.
     UnityDelta {
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
     },
-    /// A directory of raw Parquet files; no catalog table metadata, since this source loads no table.
-    ///
-    /// `declared_columns` is the table's `(Exasol name, Exasol type)` declaration from the pushdown
-    /// request, so a column no kept file carries still resolves.
+    /// `declared_columns` is the request's `(Exasol name, Exasol type)` declaration, so a column
+    /// no kept file carries still resolves.
     DirectParquet {
         store: &'a Arc<dyn ObjectStore>,
         table_root: &'a str,
@@ -124,10 +91,7 @@ pub enum ScanSource<'a> {
     },
 }
 
-/// The CONNECTION's static storage decision, threaded together because its three
-/// parts always travel together: the static storage backend, the resolved
-/// credentials it was built from, and the resolved `ALLOW_HTTP` consent gate for
-/// plaintext transport (the operator's consent gate under vending too).
+/// Under vending, `allow_http` is still the operator's consent gate for plaintext transport.
 #[derive(Clone, Copy)]
 pub struct ConnectionStorage<'a> {
     pub storage: &'a StorageBackend,
@@ -135,20 +99,9 @@ pub struct ConnectionStorage<'a> {
     pub allow_http: bool,
 }
 
-/// The reader that plans `source`'s scan.
-///
-/// The ONE site that matches a [`ScanSource`], so a third table format or a third
-/// catalog kind is a compile error here rather than a silent fall-through. It
-/// matches the source rather than the catalog kind, which is what leaves that
-/// enum's frozen match-site baseline intact.
-///
-/// The Unity Catalog source's format tag is checked HERE because the single-table
-/// load applies no listing filter: a non-Delta table routed into the Delta reader
-/// would surface as a missing transaction log instead of a format refusal.
-///
-/// `connection` is the CONNECTION's static storage decision this source reads
-/// through: the static storage backend, resolved credentials, and the resolved
-/// `ALLOW_HTTP` consent gate.
+/// The one site matching a [`ScanSource`], so a new format or catalog kind is a compile
+/// error here. The Unity format tag is checked here because the single-table load applies
+/// no listing filter: a non-Delta table would otherwise surface as a missing transaction log.
 pub fn format_reader<'a>(
     source: ScanSource<'a>,
     connection: &ConnectionStorage<'a>,

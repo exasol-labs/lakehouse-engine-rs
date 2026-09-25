@@ -1,25 +1,4 @@
-//! Host integration test for `schema.name-mapping.default` field-id resolution
-//! (task 4.1, `specs/_plans/change-name-mapping-fallback/plan.md`).
-//!
-//! Docker-free: drives the production raw-scan pipeline
-//! (`run_raw_scan_with_session` -> `build_dataframe` -> `register_files` ->
-//! `bind_columns`) against a local `file://` Parquet written via
-//! `ArrowWriter`, exactly mirroring the harness in `scan_no_head_test.rs`.
-//!
-//! Two scenarios (see plan.md "Verification" table):
-//!
-//! 1. `name_mapping_resolves_no_field_id_column` — a Parquet file whose column
-//!    carries NO embedded `PARQUET:field_id` and whose physical name
-//!    (`old_col`) differs from the CURRENT logical name (`new_col`) still
-//!    resolves to real, non-NULL values under the logical name when
-//!    `ScanSpec::name_mapping` maps `old_col` -> the `new_col` field-id. Without
-//!    the name-mapping resolution step this would NULL-fill the column instead
-//!    (the logical field is nullable specifically so the unresolved case is a
-//!    silent NULL, not a hard error, making "never NULL" the meaningful proof).
-//! 2. `empty_name_mapping_preserves_physical_name_binding` — the pre-existing
-//!    physical-name-identity fallback still binds correctly when
-//!    `name_mapping` is empty and the physical name already equals the current
-//!    logical name.
+//! `schema.name-mapping.default` field-id resolution for Parquet columns without field-ids.
 
 mod scan_fixture;
 
@@ -40,8 +19,6 @@ use lakehouse_engine::scan::{run_raw_scan_with_session, session_config_for_spec}
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 
-/// Storage props are never dialed for a local `file://` scan; a placeholder
-/// keeps the spec well-formed (copied from `scan_no_head_test.rs`).
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
@@ -53,11 +30,7 @@ fn dummy_storage() -> StorageBackend {
     })
 }
 
-/// Write a local Parquet at `dir/relative` with two Int64 columns
-/// (`id_col_name`, `other_col_name`), NEITHER carrying `PARQUET:field_id`
-/// metadata — the "file written before field-id support" shape both scenarios
-/// need. `id` takes values `0..rows`; the other column takes `10 * id`.
-/// Returns the file's absolute `file://` URL.
+/// Neither column carries `PARQUET:field_id`. `id` holds `0..rows`, the other `10 * id`.
 fn write_local_parquet_two_int_cols(
     dir: &std::path::Path,
     relative: &str,
@@ -92,11 +65,6 @@ fn write_local_parquet_two_int_cols(
         .to_string()
 }
 
-/// Build a raw-scan `ScanSpec` over one local file, carrying `logical_schema`
-/// (so the field-id adapter is installed, `use_field_id_adapter = true`) and
-/// `name_mapping`. Projects `ID` + `NEW_COL` (uppercase, matching the
-/// adapter's Exasol-identifier-casing convention exercised by
-/// `scan_no_head_test.rs`'s `raw_spec`).
 fn name_mapping_spec(
     file_url: String,
     file_size: u64,
@@ -116,10 +84,7 @@ fn name_mapping_spec(
     }
 }
 
-/// The logical schema shared by both scenarios: `id` (field-id 1, required)
-/// and `new_col` (field-id 2, the CURRENT logical name, nullable). Nullable so
-/// an unresolved binding would silently NULL-fill rather than hard-error —
-/// the meaningful "never NULL" proof for scenario 1.
+/// `new_col` is nullable so an unresolved binding NULL-fills silently, making "never NULL" the proof.
 fn logical_schema() -> Vec<LogicalField> {
     vec![
         LogicalField {
@@ -151,10 +116,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Run the production raw scan for `spec` against a session whose `file://`
-/// object store is a plain `LocalFileSystem` (no HEAD interception needed —
-/// this test proves name-mapping resolution, not the no-HEAD size mechanism
-/// `scan_no_head_test.rs` already covers). Returns the decoded emitted batches.
 async fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
     let session = datafusion::execution::context::SessionContext::new_with_config(
         session_config_for_spec(spec),
@@ -163,7 +124,6 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
         &url::Url::parse(register_url).expect("register url"),
         Arc::new(LocalFileSystem::new()),
     );
-    // Both scans project two Int64 columns: ID and the renamed NEW_COL.
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![]),
         &[ExaType::Int64, ExaType::Int64],
@@ -181,9 +141,6 @@ async fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
     ctx.into_batches()
 }
 
-/// Extract `(id, new_col)` pairs from the emitted batches, asserting the
-/// second column is named `NEW_COL` (the CURRENT logical name, uppercased —
-/// never `OLD_COL`) and recording whether each `new_col` value was NULL.
 fn id_to_new_col(batches: &[RecordBatch]) -> HashMap<i64, Option<i64>> {
     let mut out = HashMap::new();
     for b in batches {
@@ -214,13 +171,7 @@ fn id_to_new_col(batches: &[RecordBatch]) -> HashMap<i64, Option<i64>> {
     out
 }
 
-/// A Parquet file whose column carries NO embedded `PARQUET:field_id` and
-/// whose physical name (`old_col`) differs from the current logical name
-/// (`new_col`, field-id 2). A `ScanSpec::name_mapping` entry mapping
-/// `old_col` -> field-id 2 must resolve the column: every row's `NEW_COL`
-/// value is the REAL value from the file (`10 * id`), never NULL — proving
-/// the rename was resolved via the name-mapping, not a physical-name-identity
-/// match (which would fail here since the names differ).
+/// Scenario: `name_mapping` resolves a renamed column that has no embedded field-id
 #[test]
 fn name_mapping_resolves_no_field_id_column() {
     let dir = std::env::temp_dir().join(format!("lh_name_mapping_{}", std::process::id()));
@@ -256,10 +207,7 @@ fn name_mapping_resolves_no_field_id_column() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Companion case: `name_mapping` is empty AND the Parquet column's physical
-/// name already equals the current logical name (`new_col`), so the
-/// PRE-EXISTING physical-name-identity fallback is what resolves the column —
-/// proving the new name-mapping step did not regress that fallback.
+/// Scenario: with an empty `name_mapping`, a column whose physical name matches binds by identity
 #[test]
 fn empty_name_mapping_preserves_physical_name_binding() {
     let dir = std::env::temp_dir().join(format!("lh_name_mapping_empty_{}", std::process::id()));

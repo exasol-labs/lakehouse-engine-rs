@@ -2,12 +2,7 @@ use super::*;
 use crate::scan::session_config_for_spec;
 use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
 
-/// Both INT96 call sites (`positional_deletes.rs`'s decode path and this
-/// module's legacy schema-inference branch) build their `ParquetFormat` via
-/// the SAME shared [`int96_coerced_parquet_format`] helper, so asserting the
-/// helper's own output once is sufficient to guard against the two sites
-/// drifting apart (a divergence between inferred and decoded time units would
-/// be a schema mismatch).
+/// Scenario: the shared INT96 `ParquetFormat` helper coerces to microseconds as UTC.
 #[test]
 fn both_parquet_format_sites_coerce_int96_us_utc() {
     let format = int96_coerced_parquet_format();
@@ -23,16 +18,7 @@ fn both_parquet_format_sites_coerce_int96_us_utc() {
     );
 }
 
-/// The per-table Parquet read options are decided by the presence of a nested
-/// member tree, and every table keeps the INT96 coercion either way.
-///
-/// A table carrying a JSON-rendered nested column reads WITHOUT row-filter
-/// pushdown, because DataFusion would approve the pushdown against the `utf8`
-/// logical tag and then drop the conjunct against the physical nested type,
-/// applying it nowhere. Statistics, page-index, and bloom-filter pruning stay ON
-/// for BOTH tables: they cannot prune on the rendered column (proven in
-/// `tests/scan_parquet_pruning.rs`), so disabling them would only cost the
-/// table's primitive columns their pruning.
+/// Scenario: a nested-carrying table reads without row-filter pushdown, keeping INT96 coercion and pruning.
 #[test]
 fn a_nested_carrying_table_reads_without_row_filter_pushdown() {
     use crate::scan::spec::NestedMembers;
@@ -78,14 +64,7 @@ fn a_nested_carrying_table_reads_without_row_filter_pushdown() {
     }
 }
 
-/// The session-level `pushdown_filters` flag is withheld for a scan that renders
-/// a nested column on EITHER side, and only for such a scan.
-///
-/// It has to be: `ParquetSource::try_pushdown_filters` ORs the session flag with
-/// the table's own, so a session-level `true` would re-enable the pushdown for the
-/// very table `scan_table_parquet_format` withheld it from. Leaving it off at
-/// session level and opting each table back in is what keeps the decision per
-/// table — the non-nested side of a broadcast join keeps its pushdown.
+/// Scenario: the session withholds `pushdown_filters` only for a scan rendering nested JSON on either side.
 #[test]
 fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
     use crate::scan::spec::{JoinSpec, JoinType, LogicalField, NestedMembers};
@@ -145,8 +124,7 @@ fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
     );
 }
 
-/// A malformed/hand-crafted `ScanSpec` with `s3_max_connections: 0` must not
-/// deadlock every delete-file read via `Semaphore::new(0)`.
+/// Scenario: `s3_max_connections: 0` clamps to one permit instead of deadlocking.
 #[test]
 fn delete_path_read_limiter_clamps_zero_connections_to_one() {
     let mut spec = minimal_spec();
@@ -155,11 +133,6 @@ fn delete_path_read_limiter_clamps_zero_connections_to_one() {
 }
 
 /// Scenario: scan without a logical schema falls back to first-file inference.
-///
-/// When `spec.common.logical_schema` is empty (legacy or unset), `register_files`
-/// must infer the Arrow schema from the first file and register the table
-/// without installing the field-id adapter. The registered table must be
-/// queryable and return all rows written to the file.
 #[tokio::test]
 async fn register_files_falls_back_without_logical_schema() {
     use arrow::array::Int64Array;
@@ -169,7 +142,6 @@ async fn register_files_falls_back_without_logical_schema() {
     use parquet::arrow::ArrowWriter;
     use std::sync::Arc;
 
-    // Write a minimal local Parquet file.
     let dir = std::env::temp_dir().join(format!("lh_fallback_inference_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("fallback.parquet");
@@ -196,10 +168,7 @@ async fn register_files_falls_back_without_logical_schema() {
         .expect("absolute path")
         .to_string();
 
-    // Build a spec with empty logical_schema — the fallback inference path.
-    // Absolute file:// entry (empty table_root) exercises the passthrough
-    // reconstruction branch; the real file size is supplied because the
-    // provider builds each file's ObjectMeta from it (no-HEAD design).
+    // Absolute file:// entry with the real size, since the provider builds ObjectMeta from it.
     let mut spec = minimal_spec();
     let file_size = local_file_size(&file_url);
     spec.files = vec![FileEntry::new(file_url, file_size)];
@@ -210,7 +179,6 @@ async fn register_files_falls_back_without_logical_schema() {
         .await
         .expect("register_files must succeed on first-file inference path");
 
-    // The table must be registered and queryable.
     let table = ctx
         .table("scan_target")
         .await
@@ -228,14 +196,7 @@ async fn register_files_falls_back_without_logical_schema() {
     );
 }
 
-/// Scenario: scan without a logical schema falls back to first-file inference.
-///
-/// The fallback is selected by the ABSENCE of a logical schema ALONE: a spec whose
-/// logical schema IS present still installs the column-binding adapter even when
-/// every field binds by identity (no field-id, no declared physical name). The
-/// observable difference from inference is what this asserts — the DECLARED schema
-/// becomes the table schema, and a declared column absent from the file NULL-fills
-/// instead of being unknown to the query.
+/// Scenario: a logical schema of identity-bound fields still installs the binding adapter.
 #[tokio::test]
 async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter() {
     use crate::scan::spec::LogicalField;
@@ -245,8 +206,7 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
     use datafusion::execution::context::SessionContext;
     use parquet::arrow::ArrowWriter;
 
-    // A file written with NO field-id metadata at all, as a Delta `none`
-    // column-mapping table's files are.
+    // No field-id metadata, as in a Delta `none` column-mapping table's files.
     let dir = std::env::temp_dir().join(format!("lh_identity_binding_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("identity.parquet");
@@ -274,7 +234,6 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
         .expect("absolute path")
         .to_string();
 
-    // Every field binds by identity, and `added` is absent from the file.
     let identity_field = |name: &str, nullable: bool| LogicalField {
         field_id: None,
         name: name.to_string(),
@@ -299,8 +258,7 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
         .await
         .expect("register_files must succeed for an all-identity logical schema");
 
-    // The DECLARED schema is the table schema — first-file inference would have
-    // registered the file's own two columns instead.
+    // First-file inference would have registered the file's own two columns instead.
     let registered = ctx
         .table("scan_target")
         .await
@@ -350,14 +308,7 @@ async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter(
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Task B4 (scenario `topn: Ordered top-N preserves descending and NULL ordering`):
-/// `build_scan_sql` renders a pushed-down ORDER BY through the SAME shared
-/// `render_order_by_clause` the adapter's outer merge uses, so per-shard and
-/// merge agree on direction AND explicit NULL placement. Over a local Parquet
-/// file whose sort column carries NULLs, a DESC sort yields a bounded,
-/// correctly-ordered result, and flipping ONLY the `nulls_last` flag moves the
-/// NULLs from the head to the tail — proving the NULL placement is honored
-/// explicitly, not left to a DataFusion default.
+/// Scenario: ordered top-N preserves descending and NULL ordering.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ordered_scan_sql_preserves_desc_and_null_placement() {
     use crate::scan::spec::SortKey;
@@ -367,7 +318,6 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
     use datafusion::execution::context::SessionContext;
     use parquet::arrow::ArrowWriter;
 
-    // price is nullable with NULLs interleaved among descending-comparable values.
     let dir = std::env::temp_dir().join(format!("lh_topn_nulls_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let path = dir.join("topn.parquet");
@@ -399,8 +349,7 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         .expect("absolute path")
         .to_string();
 
-    // Collect the (id, Option<price>) rows build_scan_sql produces for a given
-    // sort direction / NULL placement / limit, IN PLAN ORDER (no test-side re-sort).
+    // Rows in plan order, with no test-side re-sort.
     async fn topn_rows(
         file_url: &str,
         ascending: bool,
@@ -451,7 +400,6 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         rows
     }
 
-    // DESC + NULLS FIRST, bounded to 3: the two NULLs rank first, then the max.
     let desc_nulls_first = topn_rows(&file_url, false, false, 3).await;
     assert_eq!(
         desc_nulls_first.len(),
@@ -468,8 +416,6 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
         "after the NULLs the largest value comes next: {desc_nulls_first:?}"
     );
 
-    // DESC + NULLS LAST, bounded to 3: flipping ONLY the NULL flag moves the NULLs
-    // to the tail, so the top-3 are the descending non-NULL values.
     let desc_nulls_last = topn_rows(&file_url, false, true, 3).await;
     assert_eq!(
         desc_nulls_last.iter().map(|(_, p)| *p).collect::<Vec<_>>(),
@@ -480,10 +426,7 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Task 4.3: `build_scan_sql`'s uppercase-alias inner-SELECT wrapper works
-/// unchanged over a registered logical (current-name) schema — the table
-/// schema DataFusion sees is the logical one, so aliases and projection
-/// resolve against the current names.
+/// Scenario: the uppercase-alias wrapper resolves against a registered logical schema.
 #[tokio::test]
 async fn build_scan_sql_aliases_over_logical_schema() {
     use crate::scan::spec::LogicalField;
@@ -512,9 +455,7 @@ async fn build_scan_sql_aliases_over_logical_schema() {
     ];
     let logical_schema = build_logical_arrow_schema(&logical);
 
-    // Register the logical schema as the table schema (as register_files
-    // does via with_schema), with no rows — build_scan_sql only reads the
-    // advertised schema.
+    // No rows: build_scan_sql only reads the advertised schema.
     let ctx = SessionContext::new();
     let table = MemTable::try_new(logical_schema.clone(), vec![vec![]]).unwrap();
     ctx.register_table("scan_target", Arc::new(table)).unwrap();
@@ -525,23 +466,17 @@ async fn build_scan_sql_aliases_over_logical_schema() {
 
     let sql = build_scan_sql(&ctx, "scan_target", &spec).await.unwrap();
 
-    // Inner SELECT aliases each current (lowercase) name to its uppercase form.
     assert!(
         sql.contains(r#""id" AS "ID""#) && sql.contains(r#""rating" AS "RATING""#),
         "inner SELECT must alias current names to uppercase: {sql}"
     );
-    // Outer projection references the uppercase aliases.
     assert!(
         sql.contains(r#""ID""#) && sql.contains(r#""RATING""#),
         "outer projection must use uppercase aliases: {sql}"
     );
 }
 
-/// A bare column projected alongside an unaliased `CAST` of that SAME
-/// column (e.g. `SELECT id, CAST(id AS VARCHAR(2000000)) ...`, issue
-/// #136's select-list shape) must not trip DataFusion's "duplicate
-/// projection name" check — each `build_scan_sql` select item carries
-/// its own explicit positional alias precisely to prevent this.
+/// Scenario: a bare column plus a CAST of the same column does not trip the duplicate-name check (#136).
 #[tokio::test]
 async fn build_scan_sql_disambiguates_column_and_cast_of_same_column() {
     use crate::scan::spec::ProjectionItem;
@@ -593,30 +528,7 @@ async fn build_scan_sql_disambiguates_column_and_cast_of_same_column() {
     );
 }
 
-/// Scenario (delta-type-mapping): a Delta type Exasol cannot represent natively is
-/// surfaced as a VARCHAR rendering.
-///
-/// The classifier tags a mappable `array<E>` column `utf8`, so the LOGICAL schema
-/// declares `Utf8` while the physical Parquet column is a real `List(Int32)`.
-/// `build_scan_sql` emits NO `CAST(... AS VARCHAR)` for a logically-`Utf8` column,
-/// so the physical-to-logical adaptation can only come from the scan's OWN
-/// [`FieldIdExprAdapter`] — not from DataFusion's default schema adapter, which
-/// this provider never installs. That link is what this asserts. The available
-/// `List → Utf8` cast produces Arrow display text, which is not JSON.
-///
-/// The logical field declares its nested member tree, which is the ONE signal the
-/// diversion is keyed on — the same one the Parquet row-filter-pushdown withdrawal
-/// reads, so a rendered column can never keep a pushdown that would drop a predicate
-/// over it.
-///
-/// The column binds by field-id across a physical-name divergence (Delta `id`
-/// column mapping), so the rename and the rendering have to compose: the outer
-/// rewrite must restore the physical name UNDER the rendering expression for the
-/// opener's name-based lookups.
-///
-/// NULL and empty lists are covered because the three render differently and the
-/// distinction is observable in Exasol: a NULL array must stay NULL rather than
-/// collapse to `[]` or the empty string.
+/// Scenario: a Delta type Exasol cannot represent natively is surfaced as a VARCHAR rendering.
 #[tokio::test]
 async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_adapter() {
     use crate::scan::spec::LogicalField;
@@ -630,8 +542,7 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
 
-    // Physical file: an obfuscated Delta `id`-mapping physical name over a real
-    // List(Int32) column, with one populated, one NULL, and one empty list.
+    // An obfuscated Delta `id`-mapping physical name with a populated, a NULL, and an empty list.
     let dir = std::env::temp_dir().join("lh_list_utf8_cast");
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp dir");
@@ -665,8 +576,7 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
         .expect("absolute path")
         .to_string();
 
-    // Logical schema: field-id 2 is the current name `arr_col`, tagged `utf8` —
-    // exactly what the Delta classifier emits for `array<integer>`.
+    // Tagged `utf8`, as the Delta classifier emits for `array<integer>`.
     let mut spec = minimal_spec();
     let file_size = local_file_size(&file_url);
     spec.files = vec![FileEntry::new(file_url, file_size)];
@@ -744,18 +654,7 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (nested-json-rendering): a `struct` and a `map` column are diverted
-/// around the physical-to-logical cast too — the two arrow-cast cannot convert to
-/// text AT ALL, so before the diversion the scan failed outright rather than
-/// returning display text.
-///
-/// Read end to end through the Parquet opener, because that is where the diversion
-/// has to hold: the opener resolves the wrapped column by NAME against the real
-/// physical file schema, so a wrapper that lost the physical name would silently
-/// project the column away instead of reading it. The members bind by their DECLARED
-/// physical names — the Delta `name` column-mapping shape — so the rendered documents
-/// prove the JSON is keyed by the table's logical names and not the file's opaque
-/// ones.
+/// Scenario: struct and map columns render as JSON through the Parquet opener.
 #[tokio::test]
 async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
@@ -927,9 +826,7 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (nested-json-rendering): the legacy no-logical-schema path routes a
-/// nested column through the SAME JSON encoder the field-id path uses, instead of
-/// the `List → Utf8` display-text cast that answers `needs_json_fallback`.
+/// Scenario: the legacy path routes a nested column through the shared JSON encoder.
 #[tokio::test]
 async fn build_scan_sql_diverts_a_nested_column_to_the_json_render_function() {
     use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder};
@@ -995,9 +892,7 @@ async fn build_scan_sql_diverts_a_nested_column_to_the_json_render_function() {
     );
 }
 
-/// A non-nested incompatible column (e.g. `Binary`) must keep emitting
-/// `CAST(col AS VARCHAR)` byte-identical to before — only the five nested types
-/// `needs_nested_json_rendering` owns divert to the JSON render function.
+/// Scenario: a non-nested incompatible column keeps `CAST(col AS VARCHAR)`.
 #[tokio::test]
 async fn build_scan_sql_keeps_a_non_nested_incompatible_column_cast_unchanged() {
     use arrow::array::BinaryArray;
@@ -1100,8 +995,7 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
         value
     }
 
-    // Logical-schema path: the field-id adapter substitutes `NestedJsonRenderExpr`
-    // for the physical list column at the physical-plan level.
+    // Logical-schema path: the adapter substitutes the render expression at plan level.
     let mut logical_spec = minimal_spec();
     logical_spec.files = vec![FileEntry::new(file_url.clone(), file_size)];
     logical_spec.common.logical_schema = vec![
@@ -1145,9 +1039,7 @@ async fn inferred_schema_path_renders_nested_columns_through_the_same_encoder() 
     );
     let logical_rendered = rendered_tags(&logical_ctx, &logical_sql).await;
 
-    // Legacy path: no logical schema, so the registered table reports the real
-    // physical List type and `build_scan_sql` routes it through the SQL-level
-    // `NESTED_JSON_RENDER_UDF_NAME` call instead.
+    // Legacy path: `build_scan_sql` routes the physical List type through the SQL-level call.
     let mut legacy_spec = minimal_spec();
     legacy_spec.files = vec![FileEntry::new(file_url, file_size)];
     legacy_spec.common.logical_schema = Vec::new();

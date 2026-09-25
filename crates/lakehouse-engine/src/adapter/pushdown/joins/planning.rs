@@ -7,84 +7,44 @@ use super::super::support::{column_types, extract_limit, extract_offset};
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use super::super::{RefusedColumn, ResolvedScan};
 
-/// Why a join `from` clause cannot be rendered by the join path at all.
-///
-/// The unified join path serves EVERY inner join of any arity (broadcast or the
-/// N-scan fallback), so an `Ineligible` shape is the genuine last resort — a shape
-/// the adapter cannot render, routed to a hard client-facing error. Each variant
-/// names the specific reason so a caller can log or test it; every variant carries
-/// no data because the shape check alone explains the decline.
+/// Every inner join of any arity is served, so an ineligible shape is the last resort,
+/// routed to a hard client-facing error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum IneligibleJoinReason {
-    /// A join node ANYWHERE in the tree has `join_type` other than `"inner"` (e.g.
-    /// an outer join); a cross-join + conjunctive WHERE cannot reproduce its
-    /// semantics.
+    /// A join node anywhere in the tree is not inner; a cross join plus WHERE cannot reproduce
+    /// outer-join semantics.
     NotInnerJoinType,
-    /// A join node is missing a `left`/`right`/`condition` field, or a leaf is
-    /// neither a `join` nor a `table` node — a shape the planner does not recognize.
     UnsupportedShape,
 }
 
-/// One base-table leaf of a detected inner-join tree, with its original-cased
-/// catalog identifier already recovered from `TABLE_MAP`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinLeaf {
-    /// The Exasol virtual table name (a `from`-tree leaf's `name`).
     pub table_name: String,
-    /// This occurrence's SQL alias (the leaf's `alias`), verbatim — Exasol applies
-    /// no case folding. `None` when the occurrence carries no alias: Exasol omits
-    /// the key outright rather than emitting an empty string, and an alias-less
-    /// occurrence is a distinct leg identity, not a missing value.
+    /// Verbatim (Exasol does not fold it). `None` when absent: Exasol omits the key, and an
+    /// alias-less occurrence is a distinct leg identity.
     pub table_alias: Option<String>,
-    /// `table_name`'s original-cased catalog identifier, from `TABLE_MAP`.
+    /// Original-cased catalog identifier from `TABLE_MAP`.
     pub table_identifier: String,
 }
 
-/// A detected all-inner join tree over N ≥ 2 involved tables — the single unified
-/// join shape (the two-involved-table case is simply N = 2).
-///
-/// `tables` are the base-table leaves in stable left-to-right tree order; every
-/// leaf's catalog identifier is resolved from `TABLE_MAP` at detection time (a
-/// missing leaf is a hard `Err`, not a value here). `conditions` are the N-1
-/// join-node `condition` expressions collected while walking the tree —
-/// AND-conjoined by the N-scan fallback, which is order-agnostic for an all-inner
-/// join.
+/// `conditions` are AND-conjoined by the N-scan fallback, which is order-agnostic for an
+/// all-inner join.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DetectedJoin {
-    /// The N ≥ 2 base-table leaves in stable left-to-right tree order.
+    /// Stable left-to-right tree order.
     pub tables: Vec<JoinLeaf>,
-    /// The N-1 raw join-node `condition` expressions, unrendered.
     pub conditions: Vec<Json>,
 }
 
-/// The result of inspecting a pushdown request's `from` clause for the inner
-/// equi-join shape this phase plans.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum JoinShape {
-    /// The `from` clause is a plain table reference (or absent) — today's
-    /// single-table pushdown path applies unchanged.
     NotAJoin,
-    /// The `from` clause is a join the adapter cannot render at all (a non-inner
-    /// join node in the tree, or a malformed shape). Routed to a hard error — the
-    /// genuine last resort, never a native re-plan.
     Ineligible(IneligibleJoinReason),
-    /// An all-inner join tree spanning N ≥ 2 involved tables, every leaf's catalog
-    /// identifier resolved from `TABLE_MAP`. Served by the SINGLE unified join path
-    /// ([`plan_join`]): broadcast when the two-table (N = 2) case is eligible,
-    /// otherwise the N-scan unaccelerated fallback. The two-table case is simply
-    /// N = 2 — there is no separate two-table shape.
     Join(DetectedJoin),
 }
 
-/// Recursively collect a join tree's base-table leaves as `(name, alias)` pairs
-/// (into `leaves`, stable left-to-right order) and every join node's `condition`
-/// (into `conditions`, post-order). A leaf without an `alias` key contributes
-/// `None` — that occurrence is alias-less, which is a leg identity of its own.
-///
-/// Returns the specific [`IneligibleJoinReason`] on the first non-inner join node
-/// ([`IneligibleJoinReason::NotInnerJoinType`]), a join node missing a
-/// `left`/`right`/`condition` field or a leaf missing its `name`, or a leaf that is
-/// neither a `join` nor a `table` node ([`IneligibleJoinReason::UnsupportedShape`]).
+/// Leaves in left-to-right order, conditions in post-order. A leaf without `alias` is an
+/// alias-less occurrence, a leg identity of its own.
 fn collect_join_tree(
     node: &Json,
     leaves: &mut Vec<(String, Option<String>)>,
@@ -127,33 +87,9 @@ fn collect_join_tree(
     }
 }
 
-/// Detect whether a pushdown request's `from` clause is an inner-join tree the
-/// unified join path serves, over N ≥ 2 involved tables.
-///
-/// Per the Exasol virtual-schema-common-java pushdown JSON shape, a join `from`
-/// node looks like:
-/// ```json
-/// {"type": "join", "join_type": "inner", "left": {...}, "right": {...}, "condition": {...}}
-/// ```
-/// where `left`/`right` are each a base-table reference (`{"name": ..., "type":
-/// "table"}`, carrying an `alias` key only when that occurrence is aliased) or a
-/// nested `join` node. The whole tree is walked ONCE by [`collect_join_tree`]: it
-/// collects the base-table leaves with their aliases (stable left-to-right order)
-/// and every join node's `condition`, asserting every join node is
-/// `join_type = "inner"`. The two-involved-table case is simply N = 2 — there is no
-/// separate two-table shape, and no equi-condition gate here (broadcast
-/// eligibility, computed later in [`plan_join`], is what requires an equi
-/// condition; the N-scan fallback renders any inner-join condition into its WHERE).
-///
-/// A request whose `from` clause is absent or a plain table reference is
-/// [`JoinShape::NotAJoin`]: today's single-table pushdown path, unaffected.
-///
-/// A non-inner join node or a malformed node is [`JoinShape::Ineligible`] (a hard
-/// error, the genuine last resort). Once the tree is a valid all-inner join, every
-/// involved table's original-cased catalog identifier MUST be recoverable from
-/// `TABLE_MAP` — a virtual table absent from `TABLE_MAP` is the same "stale virtual
-/// schema" condition the single-table path reports, so it is a hard `Err`, not a
-/// decline.
+/// No equi-condition gate here: only broadcast eligibility (in [`plan_join`]) requires one;
+/// the N-scan fallback renders any inner condition. A leaf absent from `TABLE_MAP` is the
+/// same stale-schema condition the single-table path reports, so a hard `Err`.
 pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinShape, UdfError> {
     let from = match pushdown_req.get("from") {
         Some(from) => from,
@@ -188,52 +124,30 @@ pub(crate) fn detect_join(request: &Json, pushdown_req: &Json) -> Result<JoinSha
     Ok(JoinShape::Join(DetectedJoin { tables, conditions }))
 }
 
-/// One fully-resolved side of a two-table inner equi-join.
-///
-/// Every field is resolved ONCE per query in the VS planning layer, through the
-/// same `TableScanResolver` seam the single-table scan uses — never per shard
-/// and never per node (mission.md "resolve metadata once per query"). `total_bytes`
-/// is the sum of every file's resolved size (`FileEntry::size` — the Iceberg
-/// manifest's `file_size_in_bytes`, the Delta `add` action's `size`, or the
-/// object-store listing response under direct storage; no Parquet read for any),
-/// the quantity the broadcast threshold is evaluated against.
+/// Resolved once per query in the VS layer, never per shard. `total_bytes` sums the
+/// resolved file sizes (manifest, Delta `add`, or listing; no Parquet read) and is what the
+/// broadcast threshold is evaluated against.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ResolvedJoinSide {
-    /// The Exasol virtual table name (a detected join leaf).
     pub table_name: String,
-    /// The original-cased catalog identifier this side was resolved from.
     pub table_identifier: String,
-    /// The table's storage root; empty ⇒ every `files` path is absolute.
+    /// Empty ⇒ every `files` path is absolute.
     pub table_root: String,
-    /// This side's FULL file list as [`FileEntry`] values (path,
-    /// `FileEntry::size`, and any associated positional-delete files). Deletes
-    /// are resolved once here — the same resolver seam the single-table scan
-    /// uses — and travel with the side so the scan applies them per side.
+    /// Includes positional deletes, so the scan applies them per side.
     pub files: Vec<FileEntry>,
-    /// Full logical schema of this side's table at query time.
     pub logical_schema: Vec<LogicalField>,
-    /// This side's flattened Iceberg `schema.name-mapping.default` entries
-    /// (empty when the table has no name-mapping property, and on every Delta
-    /// side). Resolved ONCE per query alongside `logical_schema`.
+    /// Empty when the table has no name-mapping property, and on every Delta side.
     pub name_mapping: Vec<NameMappingEntry>,
-    /// Effective storage for this side (vended STS creds when applicable).
     pub effective_storage: StorageBackend,
-    /// This side's ordered partition-column names — the same neutral concept as
-    /// [`crate::scan::spec::CommonScanSpec::partition_columns`]. Empty on every
-    /// Iceberg side.
+    /// Empty on every Iceberg side.
     pub partition_columns: Vec<String>,
-    /// Sum of every file's `FileEntry::size` — the broadcast-threshold metric.
     pub total_bytes: u64,
-    /// The columns THIS side's format reader declined to map, each with its reason.
-    /// Empty on every Iceberg side. Carried per side rather than merged across the
-    /// join because a reason belongs to the table that raised it.
+    /// Per side, not merged: a refusal belongs to the table that raised it.
     pub refused_columns: Vec<RefusedColumn>,
 }
 
 impl ResolvedJoinSide {
-    /// Assemble a resolved side, computing `total_bytes` from the file list with a
-    /// saturating sum (a byte total that overflows `u64` is clamped to `u64::MAX`,
-    /// which is correctly treated as "far over any broadcast threshold").
+    /// Saturating sum: an overflowing total clamps to `u64::MAX`, i.e. over any threshold.
     pub(super) fn new(
         table_name: String,
         table_identifier: String,
@@ -266,56 +180,23 @@ impl ResolvedJoinSide {
     }
 }
 
-/// The outcome of resolving BOTH sides of an eligible inner equi-join once and
-/// deciding broadcast eligibility from each side's total `FileEntry::size`.
+/// Both sides stay fully resolved because the N-scan fallback scans both;
+/// `broadcast_eligible` only routes between the two builders and is never an error.
 ///
-/// Both sides are always carried fully resolved: the broadcast path shards `fact`
-/// and replicates `dimension`; the unaccelerated fallback scans BOTH sides through
-/// their own fan-outs, so it needs both here too. The only role of
-/// `broadcast_eligible` is to route between those two SQL builders — it is NEVER an
-/// error: an ineligible join takes the deterministic N-scan fallback, not a native
-/// re-plan.
-///
-/// # Edge cases
-///
-/// - **Self-join** (both sides the same table): resolved and sized like
-///   any other pair — both sides carry identical file lists and equal byte totals,
-///   so the tie-break makes the LEFT side the dimension. Broadcasting a table
-///   against itself is a *correct* inner join (every fact-shard row is matched
-///   against the full table). No special case is needed here; the disjoint-
-///   column-name guard independently declines a self-join to the unaccelerated
-///   path because its two sides share every column name.
-/// - **Empty side** (either side resolves to zero files): its `total_bytes` is 0,
-///   so an empty side is always the (trivially broadcast-eligible) dimension. An
-///   inner join with an empty side yields zero rows either way; the caller may
-///   short-circuit to an empty result by testing `fact.files.is_empty() ||
-///   dimension.files.is_empty()`. Selection deliberately does not special-case it
-///   — sizing and role assignment stay total and deterministic.
+/// A self-join ties, so the left side becomes the dimension; broadcasting a table against
+/// itself is a correct inner join, and the disjoint-column-name guard declines it anyway.
+/// An empty side has 0 bytes and is always the dimension; selection does not special-case
+/// it so role assignment stays total.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinSides {
-    /// The LARGER side by total bytes — sharded across the cluster exactly like
-    /// the single-table scan path.
+    /// Larger side by bytes, sharded like the single-table scan.
     pub fact: ResolvedJoinSide,
-    /// The SMALLER side by total bytes — the broadcast/dimension candidate.
+    /// Smaller side by bytes, the broadcast candidate.
     pub dimension: ResolvedJoinSide,
-    /// `true` when `dimension.total_bytes <= join_broadcast_max_bytes`: plan a
-    /// broadcast join. `false`: the smaller side is still too big to replicate to
-    /// every shard, so the caller builds the unaccelerated two-scan fallback SQL.
     pub broadcast_eligible: bool,
 }
 
-/// Choose the fact (sharded) and dimension (broadcast) roles from two resolved
-/// sides and gate broadcast eligibility on the dimension's byte size.
-///
-/// The SMALLER side by total resolved file bytes is the dimension; the larger
-/// is the fact. On an exact byte-size tie the first argument (`a`) becomes the
-/// dimension — deterministic and arbitrary, since equal-sized candidates are
-/// interchangeable. The join is broadcast-eligible iff the chosen dimension's
-/// total bytes are at or below `join_broadcast_max_bytes`.
-///
-/// This is the pure, catalog-free core of side selection so it is unit-testable
-/// without a live catalog; [`plan_join`] resolves each side and delegates
-/// here for the two-table broadcast role/threshold decision.
+/// On an exact byte tie `a` becomes the dimension (arbitrary but deterministic).
 pub(super) fn select_broadcast_sides(
     a: ResolvedJoinSide,
     b: ResolvedJoinSide,
@@ -334,25 +215,9 @@ pub(super) fn select_broadcast_sides(
     }
 }
 
-/// Resolve ONE join side's file list, logical schema, table root, effective
-/// storage, and partition columns, through the SAME per-request
-/// `TableScanResolver` the single-table scan uses.
-///
-/// `table_identifier` (the original-cased identifier recovered from `TABLE_MAP`)
-/// is this side's table identifier; both sides resolve through the same
-/// `resolver`, which is built once per request, so a two-leg join performs no
-/// more catalog authentication round-trips than a single-table scan.
-///
-/// `filter_json` is this side's LEG-LOCAL sub-predicate (see
-/// [`super::rendering::leg_local_filter`])
-/// — the conjuncts of the WHERE every column of which is this table's — forwarded
-/// for format-level file pruning exactly as `filter_json_raw` is on the single-table
-/// path. For an inner join a side-local conjunct is a necessary condition for that
-/// side's rows to survive, so pruning by it is sound; cross-table and OR-spanning
-/// conjuncts are already excluded from `filter_json`. `None` (no side-local
-/// conjunct) prunes nothing — every file is kept.
-///
-/// `declared_columns` is this side's own `involvedTables` column declaration.
+/// All sides share one per-request `resolver`, so a join costs no more catalog auth
+/// round-trips than a single scan. `filter_json` is the leg-local sub-predicate
+/// ([`super::rendering::leg_local_filter`]); pruning by it is sound for an inner join.
 pub(super) async fn resolve_one_join_side(
     table_name: &str,
     table_identifier: &str,
@@ -370,30 +235,13 @@ pub(super) async fn resolve_one_join_side(
     ))
 }
 
-/// The (folded name, Exasol type) columns of the named involved table.
-///
-/// Locates the `involvedTables[]` entry whose `name` equals `table_name` (the
-/// Exasol virtual table name carried in a [`JoinLeaf`]) and maps its columns to
-/// `support::column_types`' folded names plus Exasol types from `dataType`.
-/// Returns an empty vec when the table or its columns are absent.
-///
-/// A partial application of `support::column_types`, supplying the find-by-name
-/// selection.
-///
-/// CROSS-FOLD SEAM: this output travels into `referenced_leg_columns`
-/// (`joins/rendering.rs`) as `full_cols`, where it is string-matched against the name
-/// set `collect_leg_column_names` builds with the ASCII-only `to_ascii_uppercase`.
-/// The two folds are different BY DESIGN and MUST NOT be reconciled by changing
-/// either one: `column_types` owns this side's fold, and unifying the collect walks'
-/// is forbidden by `walk_column_nodes`' doc comment and by
-/// `vs-adapter/pushdown-module-structure`'s "One blind traversal primitive backs every
-/// column-collecting walk" scenario. The two sides agree not by construction but by
-/// premise — `build_listing_virtual_tables` (`adapter/mod.rs`) Unicode-uppercases every name it declares, so no
-/// LOWERCASE name reaches either side. Non-ASCII letters can still reach both sides
-/// (e.g. `über` uppercases to `ÜBER`, not to an ASCII form); the folds still agree
-/// there because `to_ascii_uppercase` only touches ASCII `a`-`z`, none of which
-/// remain once a name is already Unicode-uppercased. The E2E test
-/// `non_ascii_table_and_column_stay_queryable` guards that premise.
+/// CROSS-FOLD SEAM: the result is string-matched in `referenced_leg_columns` against names
+/// folded with ASCII-only `to_ascii_uppercase`, while `column_types` folds differently. Do
+/// not reconcile the folds (see `walk_column_nodes` and
+/// `vs-adapter/pushdown-module-structure`). They agree by premise:
+/// `build_listing_virtual_tables` Unicode-uppercases every declared name, leaving no ASCII
+/// lowercase for either fold to touch. E2E `non_ascii_table_and_column_stay_queryable`
+/// guards that premise.
 pub(super) fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(String, String)> {
     column_types(request, |tables: &[Json]| {
         tables
@@ -402,28 +250,17 @@ pub(super) fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(S
     })
 }
 
-/// The disjoint-column-name guard for reusing the `vs-expression` translator
-/// unchanged on a two-table join.
-///
-/// Returns `true` when no column NAME appears on both sides. Only then do bare,
-/// non-table-qualified column references (which is all the translator renders —
-/// see `render_expression`) resolve unambiguously against the COMBINED DataFusion
-/// schema of both registered tables. A single shared name makes a bare reference
-/// ambiguous, so the join is NOT eligible for translator-reuse rendering; the
-/// caller declines to the unaccelerated two-scan path (this is a clean decline,
-/// never an error). Comparison is by name only — a name collision breaks
-/// resolution regardless of the columns' types. Both inputs already carry
-/// uppercased names, so the check is exact.
+/// `true` when no column name appears on both sides. The translator renders bare column
+/// references, which resolve unambiguously against the combined schema only then; a
+/// collision declines cleanly to the fallback. Both inputs are already uppercased.
 pub(super) fn disjoint_schema_guard(left: &[(String, String)], right: &[(String, String)]) -> bool {
     let left_names: std::collections::HashSet<&str> =
         left.iter().map(|(n, _)| n.as_str()).collect();
     !right.iter().any(|(n, _)| left_names.contains(n.as_str()))
 }
 
-/// Whether a join pushdown request carries an aggregation Exasol must execute over
-/// the materialized two-scan join: an aggregate select item, a GROUP BY, a group-by
-/// aggregation, or a HAVING. The broadcast in-UDF join renders only projection,
-/// filter, and join condition, so none of these can ride along with it.
+/// The broadcast in-UDF join renders only projection, filter, and join condition, so any
+/// aggregation must be executed by Exasol over the materialized join.
 fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
     let has_aggregate_item = pushdown_req
         .get("selectList")
@@ -445,39 +282,25 @@ fn carries_aggregation_clause(pushdown_req: &Json) -> bool {
     has_aggregate_item || has_group_by || is_group_by_aggregation || has_having
 }
 
-/// What a join pushdown request's window clauses oblige the broadcast path to
-/// render, and the single decision on whether that path may be taken at all.
-///
-/// [`Self::ExasolPostProcessed`] is a fall-through to the qualified two-scan
-/// fallback, which renders every one of these clauses as ordinary Exasol SQL over
-/// the materialized join — never an error.
+/// [`Self::ExasolPostProcessed`] falls through to the fallback, never an error.
 #[derive(Debug)]
 pub(in super::super) enum JoinWindowPlan {
-    /// No `limit` and no `orderBy`: the broadcast fan-out is the whole answer.
     Unbounded,
-    /// A `limit` with no ordering, so the cap composes per shard: each shard may
-    /// truncate its own joined output at `n` and the merge truncate again at `n`.
+    /// The cap composes: each shard truncates at `n` and the merge truncates again.
     BareLimit(u64),
-    /// A bare-column ordering, served by an outer wrapper over the merged fan-out.
-    /// The window rides on that wrapper, never per shard: a per-shard `OFFSET`
-    /// would skip each shard's OWN first rows.
+    /// Served by an outer wrapper over the merged fan-out; a per-shard `OFFSET` would skip
+    /// each shard's own first rows.
     Ordered {
         keys: Vec<ParsedSortKey>,
         limit: Option<u64>,
         offset: u64,
     },
-    /// Exasol executes the request's remaining work over the two-scan join.
     ExasolPostProcessed,
 }
 
-/// Classify what the broadcast join path would have to render for `pushdown_req`,
-/// from the REQUEST alone.
-///
-/// Whether the rendered projection can bind an `Ordered` key is deliberately NOT
-/// decided here: no projection exists yet at classification time, and rendering one
-/// first would reverse `plan_join`'s short-circuit — an aggregate-carrying join
-/// would then reach a render that can hard-`Err` on absent column metadata. The
-/// construction site owns that one downgrade instead.
+/// Whether the projection can bind an `Ordered` key is decided at construction: rendering
+/// a projection here would let an aggregate-carrying join reach a render that can `Err` on
+/// absent column metadata.
 pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
     if carries_aggregation_clause(pushdown_req) {
         return JoinWindowPlan::ExasolPostProcessed;
@@ -489,9 +312,7 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
         .and_then(|v| v.as_array())
         .filter(|elements| !elements.is_empty())
     else {
-        // Without an ordering there is no wrapper to carry an OFFSET — Exasol's
-        // grammar rejects one without an ORDER BY, and a per-shard offset does not
-        // compose — so only a bare cap survives here.
+        // Exasol rejects OFFSET without ORDER BY and a per-shard offset does not compose.
         if offset != 0 {
             return JoinWindowPlan::ExasolPostProcessed;
         }
@@ -503,10 +324,8 @@ pub(super) fn classify_join_window(pushdown_req: &Json) -> JoinWindowPlan {
 
     let mut keys = Vec::with_capacity(order_by.len());
     for element in order_by {
-        // The wrapper binds its ORDER BY against the fan-out's emitted columns and
-        // this path appends no hidden ones, so only a flagged bare column is
-        // servable; an expression, an aggregate, or a missing direction / NULL
-        // placement flag falls back rather than guessing an order.
+        // The wrapper binds ORDER BY against emitted columns and appends no hidden ones, so
+        // only a flagged bare column is servable.
         let Some(key) = parse_sort_key_element(element) else {
             return JoinWindowPlan::ExasolPostProcessed;
         };

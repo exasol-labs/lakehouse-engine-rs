@@ -1,28 +1,6 @@
-//! Host integration tests for the metadata-cache footer re-fetch observable
-//! (task 1.7b): a re-fetch caused by an evicted (or never-admitted) session
-//! `FileMetadataCache` entry must be countable via `footer_refetch_count`, not
-//! silent — and nothing else may be counted as one.
-//!
-//! Kept in its OWN file, holding TWO test functions that between them cover
-//! three things: the eviction signal itself, the limit-pushdown FALSE POSITIVE
-//! (a footer the opener never opened is not a re-fetch), and the
-//! invocation-start reset of the recorded set in `run_scan_dispatch`.
-//! `scan::diagnostics` records access-plan-cached footer paths in a
-//! PROCESS-GLOBAL set (there is no per-session handle for it), so both tests
-//! take `serialize_footer_record`'s lock for their whole body and clear the set
-//! on entry — no sibling test may run against that global concurrently, and no
-//! foreign leftovers may reach a count.
-//!
-//! The miss is forced deterministically rather than by scale: the first run
-//! builds its session with a metadata-cache limit of a few bytes
-//! (`RuntimeEnvBuilder::with_metadata_cache_limit`), well under any real
-//! Parquet footer's `memory_size()`, so `DefaultFilesMetadataCacheState::put`
-//! declines every entry outright — the deterministic "never admitted" half of
-//! "evicted, or never admitted" (`datafusion-execution-54.1.0/src/cache/
-//! file_metadata_cache.rs:69-73`). The second run re-runs the identical scan on
-//! a fresh session with the DEFAULT cache limit, and the third pushes a
-//! `LIMIT 1` over four delete-carrying files so the opener provably leaves
-//! footers unopened.
+//! A footer re-fetch from an evicted or never-admitted `FileMetadataCache` entry must be
+//! countable via `footer_refetch_count`, and nothing else may count as one. The recorded
+//! footer set is process-global, so both tests serialize on one lock.
 
 mod scan_fixture;
 
@@ -60,27 +38,16 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use url::Url;
 
-/// Iceberg reserved field-ids for a positional-delete file's `file_path`/`pos`
-/// columns (mirrors `scan::positional_deletes`'s private constants; duplicated
-/// here since this integration test cannot import a `pub(crate)` item — same
-/// duplication `scan_no_head_test.rs` already carries).
+/// Iceberg reserved field-ids; duplicated because the engine's constants are `pub(crate)`.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 
-/// Metadata-cache limit forced small enough that `DefaultFilesMetadataCacheState
-/// ::put` declines every footer entry outright (`value_size > memory_limit`),
-/// well under any real Parquet footer's `memory_size()` — deterministic, no
-/// reliance on LRU eviction ordering.
+/// Below any footer's `memory_size()`, so `put` declines every entry: no reliance on LRU order.
 const TINY_CACHE_LIMIT_BYTES: usize = 100;
 
-/// One logged request: the location, whether it was a HEAD, and the byte
-/// range requested (if any).
 type LoggedRequest = (ObjectStorePath, bool, Option<GetRange>);
 
-/// An [`ObjectStore`] decorator that records the location of every request
-/// (HEAD or GET, with its byte range) into a shared log and answers every HEAD
-/// from a caller-supplied size map with NO inner I/O — mirrors
-/// `scan_no_head_test.rs`'s `RequestLoggingStore`.
+/// Logs every request and answers HEADs from a size map with no inner I/O.
 #[derive(Debug)]
 struct RequestLoggingStore {
     inner: Arc<dyn ObjectStore>,
@@ -173,8 +140,6 @@ impl ObjectStore for RequestLoggingStore {
     }
 }
 
-/// Storage props are never dialed for a local `file://` scan; a placeholder
-/// keeps the spec well-formed.
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
@@ -186,13 +151,8 @@ fn dummy_storage() -> StorageBackend {
     })
 }
 
-/// Build a raw-scan `ScanSpec` with a non-empty `common.logical_schema`
-/// matching `write_local_parquet`'s fixture (`id` field-id 1 `int64`, `name`
-/// field-id 2 `utf8`) — load-bearing exactly as `scan_no_head_test.rs`'s
-/// `raw_spec_with_logical_schema` documents: an empty logical schema would
-/// route registration through `ParquetFormat::infer_schema`, which fetches and
-/// caches the footer BEFORE Phase B ever runs, making this test's request
-/// counts vacuous.
+/// A non-empty logical schema avoids schema inference, which would fetch and cache the footer
+/// before Phase B and make the request counts vacuous.
 fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -226,8 +186,6 @@ fn raw_spec_with_logical_schema(table_root: String) -> ScanSpec {
     }
 }
 
-/// Write a local Parquet at `dir/relative` (creating parent dirs) with `rows`
-/// rows across small row groups. Returns the file's absolute `file://` URL.
 fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -256,10 +214,6 @@ fn write_local_parquet(dir: &std::path::Path, relative: &str, rows: i64) -> Stri
         .to_string()
 }
 
-/// Write a local positional-delete Parquet at `dir/relative`: `file_path`/`pos`
-/// columns tagged with the Iceberg reserved field-ids, one row per
-/// `(referenced_file_abs_url, position)` entry. Returns the file's absolute
-/// `file://` URL.
 fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str, i64)]) -> String {
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
@@ -292,8 +246,6 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
         .to_string()
 }
 
-/// The object-store `Path` DataFusion resolves an exact-file URL to — the same
-/// key production request logging keys HEAD/GET calls by.
 fn data_key(abs_file_url: &str) -> ObjectStorePath {
     use datafusion::datasource::listing::ListingTableUrl;
     ListingTableUrl::parse(abs_file_url)
@@ -310,12 +262,8 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Count the non-HEAD `get_opts` calls in `log` against `key` whose range is a
-/// bounded suffix ending at `size` and wider than the 8-byte footer-length
-/// probe — the shape `DFParquetMetadata::fetch_metadata` issues under the
-/// hint/page-index-skip configuration this scan uses, whether served from the
-/// cache or fetched fresh (mirrors the shape asserted in
-/// `scan_no_head_test.rs::scan_access_plan_footer_fetch_is_one_range_get`).
+/// Counts bounded suffix GETs ending at `size` and wider than the 8-byte footer-length probe:
+/// the shape `fetch_metadata` issues under this scan's hint configuration.
 fn footer_shaped_get_count(
     log: &Arc<std::sync::Mutex<Vec<LoggedRequest>>>,
     key: &ObjectStorePath,
@@ -332,15 +280,8 @@ fn footer_shaped_get_count(
         .count()
 }
 
-/// Serialize the two tests in this binary and hand back the guard they hold for
-/// their whole body. `scan::diagnostics` keeps the record of access-plan-cached
-/// footer paths in a PROCESS-GLOBAL set with no per-session handle, so on
-/// cargo's default parallel test threads each test would see the other's
-/// recorded paths. The workspace carries no `serial_test` dev-dependency and
-/// this file adds none — one `std::sync::Mutex` is the whole mechanism. A
-/// poisoned lock is recovered from rather than propagated, so a failing test
-/// reports its own assertion instead of a misleading poison panic in its
-/// sibling.
+/// The footer record is a process-global set; poison is recovered so a failing test reports
+/// its own assertion rather than a poison panic in its sibling.
 fn serialize_footer_record() -> std::sync::MutexGuard<'static, ()> {
     static FOOTER_RECORD: std::sync::Mutex<()> = std::sync::Mutex::new(());
     FOOTER_RECORD
@@ -348,24 +289,10 @@ fn serialize_footer_record() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// Scenario (memory-and-credentials): a metadata-cache eviction that re-fetches
-/// a footer is observable — `footer_refetch_count` reports at least one
-/// re-fetch when the cache cannot retain the footer access-plan construction
-/// cached, reports exactly zero for the identical scan under the default cache
-/// limit, and reports zero for a scan the opener could not finish opening.
-///
-/// All three runs live in this ONE function, in this order, so they cannot
-/// interleave over the process-global record. Run 2 is the control that the
-/// observable reports a LOST footer rather than firing on every
-/// delete-carrying scan: its own session retains the footer its own
-/// access-plan construction cached, so its count is computed purely from its
-/// own entries. It says nothing about the invocation-start reset — it rescans
-/// the SAME file, so a stale record would be indistinguishable from a fresh
-/// one; `scan_dispatch_resets_the_footer_record_between_invocations` covers the
-/// reset. Run 3 is the control against the opposite failure, a count that fires
-/// on footers nothing ever re-fetched.
+/// Scenario: a metadata-cache eviction that re-fetches a footer is observable
 #[test]
 fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
+    // The three runs share one function so they cannot interleave over the process-global record.
     let _serialized = serialize_footer_record();
     reset_access_plan_cached_footers();
 
@@ -397,9 +324,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         (data_key(&delete_url), delete_size),
     ]);
 
-    // Run 1 — a cache limit far below any real footer's memory_size() means
-    // `put` declines every entry outright: Phase B's own fetch and the
-    // opener's later fetch are each a fresh, uncached hinted request.
+    // Run 1: the tiny cache limit forces a re-fetch.
     let evict_runtime = RuntimeEnvBuilder::new()
         .with_metadata_cache_limit(TINY_CACHE_LIMIT_BYTES)
         .build_arc()
@@ -455,11 +380,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         evict_log.lock().unwrap()
     );
 
-    // Run 2 — the IDENTICAL scan on a fresh session with the DEFAULT cache
-    // limit. This session's own Phase B call re-records the same data-file
-    // path, and this session's own cache retains it, so the check below is
-    // computed purely from THIS run's entries — proving the observable
-    // reports a lost footer rather than firing on every delete-carrying scan.
+    // Run 2: default cache limit; the observable must not fire on every delete-carrying scan.
     let default_session = SessionContext::new_with_config(session_config_for_spec(&spec));
     let default_log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let default_store = Arc::new(RequestLoggingStore {
@@ -512,14 +433,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
         default_log.lock().unwrap()
     );
 
-    // Run 3 — the limit-pushdown control: a pushed `LIMIT 1` over FOUR
-    // delete-carrying data files. Access-plan construction fetches, caches and
-    // records all four footers, but the opener stops the stream once the row
-    // budget is spent and never opens the later files, leaving their entries at
-    // `hits == 0` although nothing was evicted and no footer was fetched twice.
-    // The record is reset first because the two runs above left this run's
-    // predecessor path in the process-global set — exactly what
-    // `run_scan_dispatch` does at every real invocation start.
+    // Run 3: `LIMIT 1` leaves later footers unopened (`hits == 0`) though none was re-fetched.
     reset_access_plan_cached_footers();
     let limit_urls: Vec<String> = (0..4)
         .map(|i| write_local_parquet(&dir, &format!("limit_data_{i}.parquet"), 40))
@@ -598,29 +512,7 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (memory-and-credentials): the invocation-start reset of the
-/// process-global footer record is what keeps a pooled UDF process from
-/// reporting an earlier invocation's footers against a later invocation's cache.
-///
-/// Two sequential [`run_scan_one`] calls — the public entry that routes through
-/// the private `run_scan_dispatch`, which is where the reset lives — scan
-/// DIFFERENT data files, each with its own one-position delete file, each on its
-/// own default-cache-limit session. Invocation 2's cache can only ever hold file
-/// B's footer, so invocation 1's recorded path A is absent from it and counts as
-/// an unconditional re-fetch unless the reset cleared the record first. That is
-/// what the two runs of the test above cannot show: they scan the SAME file, so
-/// a stale record is indistinguishable from a fresh one.
-///
-/// `run_scan_one` drops its session before returning, so the injected
-/// `build_session` closure stashes a clone: `SessionContext` is cheaply
-/// cloneable and its `RuntimeEnv` — carrying the `FileMetadataCache` — is an
-/// `Arc`, so the cache outlives that drop and stays readable here.
-///
-/// Verified to exercise the reset rather than merely pass: with the
-/// `diagnostics::reset_access_plan_cached_footers()` call in `run_scan_dispatch`
-/// (`crates/lakehouse-engine/src/scan/mod.rs`) commented out, this test FAILS —
-/// invocation 2 reports 1 re-fetch, file A's stale path; with the call restored
-/// it PASSES.
+/// Scenario: the invocation-start reset keeps a pooled process from reporting an earlier invocation's footers
 #[test]
 fn scan_dispatch_resets_the_footer_record_between_invocations() {
     let _serialized = serialize_footer_record();
@@ -642,8 +534,7 @@ fn scan_dispatch_resets_the_footer_record_between_invocations() {
         .map(|url| (data_key(url), file_size(url)))
         .collect();
 
-    // Every invocation's session is captured here before `run_scan_one` drops
-    // it, so the assertions below read invocation 2's own metadata cache.
+    // Captured before `run_scan_one` drops it; the `Arc`'d cache outlives the drop.
     let captured: std::sync::Mutex<Vec<SessionContext>> = std::sync::Mutex::new(Vec::new());
     let log = Arc::new(std::sync::Mutex::new(Vec::new()));
     let store_url = Url::parse(&data_a).expect("register url");

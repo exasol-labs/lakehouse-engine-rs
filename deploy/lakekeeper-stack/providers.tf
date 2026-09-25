@@ -6,8 +6,7 @@ terraform {
     random = { source = "hashicorp/random", version = "~> 3.6" }
   }
 
-  # Shared S3 state (was local backend, see data-stack/providers.tf for why). Bucket/key/region come
-  # from `tofu init -backend-config=backend.hcl` (gitignored), not hardcoded here.
+  # Bucket/key/region come from `tofu init -backend-config=backend.hcl` (gitignored).
   backend "s3" {}
 }
 
@@ -23,8 +22,8 @@ locals {
     "exa:DataClassification" = var.data_classification
     "exa:AutoShutdown"       = "true"
   }
-  # CreatedDate/ExpiryDate are recommended for temp resources; include only when created_date is set
-  # (keeps default_tags plan-known -> avoids the tags_all "inconsistent final plan" provider bug).
+  # Only set when created_date is given: keeps default_tags plan-known, avoiding the provider's
+  # tags_all "inconsistent final plan" bug.
   date_tags = var.created_date != "" ? {
     "exa:CreatedDate" = var.created_date
     "exa:ExpiryDate"  = formatdate("YYYY-MM-DD", timeadd("${var.created_date}T00:00:00Z", "${var.ttl_days * 24}h"))
@@ -40,19 +39,13 @@ provider "aws" {
   }
 }
 
-# AWS S3 object tagging caps at 10 tags per object (vs. 50 for most other taggable resource types).
-# local.default_tags already carries 11 entries, which every OTHER resource in this stack accepts
-# fine under the default provider above — but aws_s3_object.keycloak_realm is the one S3 OBJECT
-# (not bucket) this stack creates, so it alone needs an aliased provider with no default_tags to
-# opt out of that merge. Referenced ONLY by aws_s3_object.keycloak_realm in main.tf.
+# S3 objects accept at most 10 tags and default_tags carries 11, so aws_s3_object.keycloak_realm
+# uses this untagged provider.
 provider "aws" {
   alias  = "no_default_tags"
   region = var.region
 }
 
-# Read the persistent data-stack outputs (same VPC/subnet, S3 bucket, Glue REST catalog the
-# provisioning script reads its source tables from).
-# var.tofu_state_bucket comes from terraform.tfvars (gitignored) — not hardcoded (see backend above).
 data "terraform_remote_state" "data" {
   backend = "s3"
   config = {

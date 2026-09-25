@@ -1,11 +1,7 @@
 use super::*;
 use crate::scan::spec::DeltaDeletionVectorStorage;
 
-/// The 45-byte deletion-vector container Delta wrote for the vendored
-/// `table-with-dv-small` fixture, plus the `add.deletionVector` descriptor its commit
-/// logs for it. Real writer output rather than hand-assembled bytes, so the version
-/// byte, the big-endian size, the portable magic, and the CRC-32 are the ones a Delta
-/// engine actually produces.
+/// Real Delta writer output for the `table-with-dv-small` fixture, not hand-assembled bytes.
 const SIDECAR_BODY: &[u8] = include_bytes!(
     "../../../../scripts/unity/fixtures/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
 );
@@ -13,8 +9,7 @@ const LOGGED_PATH: &str = "vBn[lx{q8@P<9BNH/isA";
 const LOGGED_SIZE_IN_BYTES: i32 = 36;
 const LOGGED_CARDINALITY: i64 = 2;
 
-/// That same vector's `magicNumber ++ bitmapData` — the sidecar body without its
-/// container framing — Z85-encoded, which is exactly what an inline descriptor carries.
+/// The sidecar body without its container framing, Z85-encoded, as an inline descriptor carries it.
 const INLINE_PAYLOAD: &str = "^Bg9^0rr910000000000iXQKl0rr91000315c8Xg000r9";
 
 const TABLE_ROOT: &str = "s3://bucket/db/table_with_dv";
@@ -70,9 +65,7 @@ fn body_with_byte(index: usize, value: u8) -> Vec<u8> {
     body
 }
 
-/// Assert a refusal names the affected data file, carries nothing secret, and never
-/// echoes an inline payload — the guarantees every deletion-vector error owes the
-/// scan, whichever validation produced it.
+/// Every refusal names the data file, carries nothing secret, and never echoes an inline payload.
 fn assert_clean_refusal<T>(result: Result<T, UdfError>, context: &str) -> String {
     let Err(err) = result else {
         panic!("{context} must be refused");
@@ -93,9 +86,7 @@ fn assert_clean_refusal<T>(result: Result<T, UdfError>, context: &str) -> String
     err
 }
 
-/// The three Delta storage kinds resolve to where their bytes live exactly once: a
-/// UUID-relative descriptor reconstructs `<table root>/deletion_vector_<uuid>.bin`, an
-/// absolute one is taken verbatim, and an inline one resolves no path at all.
+/// Scenario: each storage kind resolves its sidecar path exactly once (relative, absolute, inline).
 #[test]
 fn sidecar_path_is_resolved_once_for_each_storage_kind() {
     let uuid_relative = resolve(DeltaDeletionVectorStorage::UuidRelative, LOGGED_PATH).unwrap();
@@ -121,9 +112,7 @@ fn sidecar_path_is_resolved_once_for_each_storage_kind() {
     );
 }
 
-/// The decoder is handed bytes and never a live storage client: the shim answers a read
-/// of an already-fetched body and refuses every other operation with an error rather
-/// than a panic, which inside a UDF would be an abnormal VM exit.
+/// Scenario: the storage shim serves prefetched bytes and refuses every other operation without panicking.
 #[test]
 fn storage_shim_serves_prefetched_bytes_and_refuses_every_other_operation() {
     let served = Url::parse(SIDECAR_URL).unwrap();
@@ -182,8 +171,7 @@ fn storage_shim_serves_prefetched_bytes_and_refuses_every_other_operation() {
     );
 }
 
-/// An inline vector's bytes are the descriptor itself, so it decodes to the same
-/// positions the sidecar carries without any fetched body being supplied.
+/// Scenario: an inline vector decodes from its payload without any fetched body.
 #[test]
 fn inline_vector_decodes_from_its_payload_without_any_prefetched_bytes() {
     let inline = resolve(DeltaDeletionVectorStorage::Inline, INLINE_PAYLOAD)
@@ -197,10 +185,7 @@ fn inline_vector_decodes_from_its_payload_without_any_prefetched_bytes() {
     );
 }
 
-/// Every container the scan cannot trust — a wrong version byte, a size the log
-/// contradicts, a foreign magic, a broken checksum, a truncated container, a payload
-/// that does not decode, and bytes that were never fetched — fails as an error value
-/// before any row is emitted, and never as a panic.
+/// Scenario: every untrustworthy container fails as an error value before any row is emitted, never a panic.
 #[test]
 fn untrusted_deletion_vector_containers_fail_loud_without_panicking() {
     assert_clean_refusal(
@@ -234,10 +219,7 @@ fn untrusted_deletion_vector_containers_fail_loud_without_panicking() {
     );
 }
 
-/// A descriptor whose own fields the Delta protocol forbids is refused at resolution,
-/// before the scan fetches anything for it — including the two shapes whose bytes the
-/// decoder would index unguarded: an inline payload too short to hold the portable
-/// magic, and a persisted size smaller than that magic.
+/// Scenario: a descriptor the Delta protocol forbids is refused at resolution, before any fetch.
 #[test]
 fn descriptors_the_protocol_forbids_are_refused_before_any_fetch() {
     for payload in ["", "0", "01234"] {
@@ -279,8 +261,7 @@ fn descriptors_the_protocol_forbids_are_refused_before_any_fetch() {
     );
 }
 
-/// A decoded set the log's own cardinality contradicts is a row set the scan cannot
-/// trust, so it fails rather than emitting rows the table may have deleted.
+/// Scenario: a decoded set contradicting the declared cardinality fails the scan.
 #[test]
 fn decoded_set_disagreeing_with_the_declared_cardinality_fails_the_scan() {
     let overstated = DeletionVector::resolve(

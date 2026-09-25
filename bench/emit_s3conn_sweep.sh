@@ -1,19 +1,7 @@
 #!/usr/bin/env bash
-# S3_MAX_CONNECTIONS sweep on the RAW-EMIT path (NOT a spec feature).
-#
-# A prior sweep tested S3_MAX_CONNECTIONS only against the Q4 aggregate query
-# (few rows over the wire -> found <2% movement). This tests it on the raw
-# full-emit path instead — the filtered `CREATE TABLE AS SELECT *` that streams
-# ~33M rows out via synchronous MT_EMIT — to answer whether a wider S3 fetch
-# pipeline keeps more decoded batches ready to emit and hides emit-wait, even
-# though it did not matter for the aggregate shape.
-#
-# Batch size is fixed at the batch-size-sweep winner (default 65536); everything
-# else at the shipped default (PARALLELISM_FACTOR=8 => G=16, threading AUTO).
-# Recreates ONLY the VS per config (property resolved at createVirtualSchema).
-#
-#   ./bench/emit_s3conn_sweep.sh                 # AUTO 8 32 64 128 at bs=65536
-#   ./bench/emit_s3conn_sweep.sh 131072 "AUTO 64"
+# S3_MAX_CONNECTIONS sweep on the raw-emit path (filtered CTAS streaming ~33 M rows via
+# synchronous MT_EMIT): does a wider S3 fetch pipeline hide emit-wait?
+#   ./bench/emit_s3conn_sweep.sh [batch_size] ["AUTO 8 32 64 128"]
 set -uo pipefail
 cd "$(dirname "$0")/.."
 [ -f bench/.env ] || { echo "ERROR: bench/.env required"; exit 1; }
@@ -30,7 +18,7 @@ q()   { printf '%s' "$1" | exapump sql -d "$DSN" >/dev/null 2>&1; }
 qout(){ printf '%s' "$1" | exapump sql -d "$DSN" -f csv 2>&1; }
 scalar(){ printf '%s' "$1" | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]'; }
 
-recreate_vs() {  # s3conn ("AUTO" => omit property, let it AUTO-derive)
+recreate_vs() {  # s3conn ("AUTO" omits the property)
   local s3="$1" s3line=""
   [ "$s3" != "AUTO" ] && s3line="$(printf "\n  S3_MAX_CONNECTIONS    = '%s'" "$s3")"
   q "DROP VIRTUAL SCHEMA IF EXISTS ${VS} CASCADE"

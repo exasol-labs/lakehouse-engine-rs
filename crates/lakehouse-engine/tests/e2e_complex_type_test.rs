@@ -1,11 +1,5 @@
-//! Permanent E2E coverage for issue #350: Iceberg `list`/`struct`/`map` columns
-//! scan and render as valid JSON end to end, keyed by logical field names, and
-//! behave as the declared `VARCHAR(2000000)` in every pushdown shape.
-//!
-//! Seeds its own `complex_probe` table into the shared `e2e_lakehouse` namespace
-//! (`common::seed::seed_complex_types_probe`) — see that seed for the exact row
-//! layout `COMPLEX_ROW_POPULATED`/`COMPLEX_ROW_NULL`/`COMPLEX_ROW_EMPTY`/
-//! `COMPLEX_ROW_ALT` reference.
+//! Issue #350: Iceberg `list`/`struct`/`map` columns render as JSON and behave
+//! as the declared `VARCHAR(2000000)` in every pushdown shape.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -26,7 +20,6 @@ const VS_NAME: &str = "COMPLEX_TYPE_VS";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
-/// Seed the fixture and provision the shared VS, once per binary.
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
@@ -54,12 +47,10 @@ fn setup() {
     });
 }
 
-/// The Exasol-served name of the seeded `complex_probe` table.
 fn served_table() -> String {
     E2E_COMPLEX_TABLE.to_uppercase()
 }
 
-/// The declared `COLUMN_TYPE` for `column`, whitespace-stripped.
 fn declared_type(conn: &mut ExaConn, table: &str, column: &str) -> String {
     let ty = conn.query_columns(&format!(
         "SELECT COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
@@ -71,8 +62,6 @@ fn declared_type(conn: &mut ExaConn, table: &str, column: &str) -> String {
     ty.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Assert `cell` parses as JSON equal to `expected`, or is SQL NULL when
-/// `expected` is `None`.
 fn assert_rendered(cell: &serde_json::Value, expected: Option<serde_json::Value>, context: &str) {
     match (cell, expected) {
         (serde_json::Value::Null, None) => {}
@@ -85,15 +74,7 @@ fn assert_rendered(cell: &serde_json::Value, expected: Option<serde_json::Value>
     }
 }
 
-/// Scenario: An Iceberg table's list, struct, and map columns return valid JSON
-/// end to end.
-///
-/// `complex_probe` carries every shape `datafusion-scan/nested-json-rendering`
-/// renders: `list<string>` (`TAGS`), `list<int>` (`NUMS`),
-/// `struct<street, city>` (`ADDR`), `map<string, string>` (`ATTRS`),
-/// `map<int, string>` (`INT_MAP`), and `list<struct<a>>` (`ITEMS`) — each with a
-/// fully-populated row, an all-NULL row, and a row exercising an empty
-/// collection plus a NULL struct member.
+/// Scenario: An Iceberg table's list, struct, and map columns return valid JSON end to end
 #[test]
 fn iceberg_nested_columns_return_valid_json_end_to_end() {
     setup();
@@ -242,9 +223,6 @@ fn iceberg_nested_columns_return_valid_json_end_to_end() {
     );
 }
 
-/// Assert `sql` reaches the scan UDF rather than an unaccelerated fallback,
-/// naming `shape` in the failure so a shape that stops being pushed is identified
-/// without reading the captured plan.
 fn assert_pushed_to_scan_udf(conn: &mut ExaConn, sql: &str, shape: &str) {
     let pushed = explain_virtual_sql(conn, sql);
     assert!(
@@ -253,18 +231,7 @@ fn assert_pushed_to_scan_udf(conn: &mut ExaConn, sql: &str, shape: &str) {
     );
 }
 
-/// Scenario: Every pushdown shape treats a nested column as the VARCHAR Exasol
-/// declared.
-///
-/// A predicate over a `list` column returned EVERY row before this feature, so the
-/// WHERE fixture is chosen to discriminate: it must match exactly one of four rows,
-/// and a conjunction with a primitive predicate must narrow further, not widen back
-/// to every row.
-///
-/// Each shape is captured with `EXPLAIN VIRTUAL` as well as executed, so a shape
-/// that silently stops reaching the scan UDF is caught even while its rows stay
-/// right. The join condition compares the rendered column against a SECOND,
-/// distinct table (`complex_join_probe`) rather than an alias of the probe itself.
+/// Scenario: Every pushdown shape treats a nested column as the VARCHAR Exasol declared
 #[test]
 fn nested_columns_push_down_as_the_declared_varchar_in_every_shape() {
     setup();
@@ -369,10 +336,7 @@ fn nested_columns_push_down_as_the_declared_varchar_in_every_shape() {
     assert_pushed_to_scan_udf(&mut conn, &upper_sql, "the select-list UPPER(TAGS)");
 }
 
-/// Scenario: A self-join on a nested JSON-rendered column (issue #361's second
-/// repro, `FROM complex_probe a JOIN complex_probe b ON a.TAGS = b.TAGS`) pairs
-/// each row only with itself. `COMPLEX_ROW_NULL` must match nothing — including
-/// itself — since SQL `NULL = NULL` is never true.
+/// Scenario: A self-join on a nested JSON-rendered column pairs each row only with itself (#361)
 #[test]
 fn e2e_self_join_on_nested_json_column_matches_single_node() {
     setup();

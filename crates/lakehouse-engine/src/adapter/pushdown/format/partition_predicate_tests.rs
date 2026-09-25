@@ -11,7 +11,6 @@ fn file_with(key: &str, value: Option<&str>) -> BTreeMap<String, Option<String>>
     BTreeMap::from([(key.to_string(), value.map(str::to_string))])
 }
 
-/// Which of `files` the filter keeps, in order.
 fn kept(filter: &Json, files: &[BTreeMap<String, Option<String>>]) -> Vec<bool> {
     let predicate = PartitionPredicate::from_filter(Some(filter));
     files.iter().map(|values| predicate.keeps(values)).collect()

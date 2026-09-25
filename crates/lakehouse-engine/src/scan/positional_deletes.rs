@@ -1,34 +1,9 @@
-//! Scan-side application of **row-position deletes**, whichever table format expresses
-//! them: Iceberg merge-on-read Parquet positional deletes and Delta deletion vectors.
-//!
-//! The adapter resolves each data file's deletes once per query and carries them in the
-//! per-shard files argument (see [`crate::scan::spec::FileEntry`]). At read time this
-//! module runs a two-phase pipeline in
-//! [`PositionalDeleteScanTable::partitioned_files`]:
-//!
-//! 1. **Phase A** classifies every mechanism the shard carries via
-//!    [`applicable_delete_mechanism`], then reads each UNIQUE payload exactly once,
-//!    concurrently within one shared connection budget: a positional-delete Parquet
-//!    file's `file_path` / `pos` columns (Iceberg reserved field-ids 2147483546 /
-//!    2147483545), bucketing each surviving `pos` value under its `file_path`
-//!    (restricted to the assigned data files — the shape required for `partition`
-//!    granularity, where one delete file references many data files); and each Delta
-//!    deletion-vector sidecar body, decoded per descriptor by
-//!    [`crate::scan::deletion_vectors`]. Both merge into one
-//!    `HashMap<data_file_path, `[`RoaringTreemap`]`>`, so nothing downstream learns
-//!    which mechanism produced an entry;
-//! 2. converts that set plus the data file's per-row-group row counts into a
-//!    per-row-group [`RowSelection`] via [`build_deletes_row_selection`];
-//! 3. attaches it as a base [`ParquetAccessPlan`] on the data file's
-//!    `PartitionedFile`, so DataFusion's Parquet opener reads it as the base
-//!    plan and intersects predicate / row-group / page pruning ON TOP — deletes
-//!    compose with pushdown rather than defeating it.
-//!
-//! The scan engine stays DataFusion's own `ParquetSource`; this module only adds
-//! a base access plan and a thin custom `TableProvider` around it (replacing the
-//! previous `ListingTable`), preserving projection/filter/LIMIT pushdown,
-//! row-group + page pruning, statistics, streaming, and the existing
-//! `FieldIdExprAdapter`.
+//! Applies row-position deletes (Iceberg positional-delete files and Delta deletion vectors).
+//! Phase A reads every unique delete payload once within one shared connection budget and
+//! merges positions into one `HashMap<data_file_path, RoaringTreemap>`, mechanism-agnostic.
+//! Phase B turns each set into a base [`ParquetAccessPlan`] on the data file's
+//! `PartitionedFile`, so DataFusion's opener intersects predicate/row-group/page pruning on
+//! top and deletes compose with pushdown.
 
 use crate::scan::deletion_vectors::{DeletionVector, LoggedDeletionVector};
 use crate::scan::diagnostics;
@@ -66,34 +41,15 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 use url::Url;
 
-/// Iceberg reserved field-id for the `file_path` column of a positional-delete file.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
-/// Iceberg reserved field-id for the `pos` column of a positional-delete file.
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 
-/// Compute a whole-file [`RowSelection`] that rejects the deleted rows.
-///
-/// Given the data file's per-row-group metadata and an ascending set of deleted
-/// row positions (file-global 0-based indices), produce a `RowSelection` that
-/// `skip`s the deleted rows and `select`s the rest, honoring row-group
-/// boundaries and any `selected_row_groups` restriction (row groups already
-/// pruned away, whose deletes must be stepped over without disturbing the
-/// deletes that belong to the surviving row groups).
-///
-/// # Attribution
+/// `selected_row_groups` lists surviving row groups; deletes in pruned ones are stepped over.
 ///
 /// Vendored from apache/iceberg-rust
-/// (`crates/iceberg/src/arrow/reader/positional_deletes.rs::build_deletes_row_selection`,
-/// tag `v0.10.0`), where it is `pub(super)` on `ArrowReader` and therefore
-/// not importable. Kept algorithmically identical to reuse its verified
-/// row-group-boundary handling (including the multi-row-group and skipped-row-group
-/// bug fixes upstream added), differing only in taking the delete set as a
-/// [`RoaringTreemap`] directly rather than iceberg's private `DeleteVector`
-/// wrapper — roaring 0.11's `RoaringTreemap::iter()` already exposes the
-/// `advance_to` the wrapper existed to provide.
-///
-/// Upstream tracking: #344. Once iceberg-rust exposes this routine publicly,
-/// this vendored copy can be reconsidered.
+/// (`crates/iceberg/src/arrow/reader/positional_deletes.rs::build_deletes_row_selection`, tag
+/// `v0.10.0`), where it is not importable. Algorithmically identical, but takes a
+/// [`RoaringTreemap`] directly instead of iceberg's private `DeleteVector`. Upstream tracking: #344.
 pub(crate) fn build_deletes_row_selection(
     row_group_metadata_list: &[RowGroupMetaData],
     selected_row_groups: &Option<Vec<usize>>,
@@ -109,33 +65,23 @@ pub(crate) fn build_deletes_row_selection(
         let row_group_num_rows = row_group_metadata.num_rows() as u64;
         let next_row_group_base_idx = current_row_group_base_idx + row_group_num_rows;
 
-        // if row group selection is enabled,
         if let Some(selected_row_groups) = selected_row_groups {
-            // if we've consumed all the selected row groups, we're done
             if selected_row_groups_idx == selected_row_groups.len() {
                 break;
             }
 
             if idx == selected_row_groups[selected_row_groups_idx] {
-                // we're in a selected row group. Increment selected_row_groups_idx
-                // so that next time around the for loop we're looking for the next
-                // selected row group
                 selected_row_groups_idx += 1;
             } else {
-                // Advance iterator past all deletes in the skipped row group.
-                // advance_to() positions the iterator to the first delete >= next_row_group_base_idx.
-                // However, if our cached next_deleted_row_idx_opt is in the skipped range,
-                // we need to call next() to update the cache with the newly positioned value.
+                // `advance_to` repositions the iterator, but a cached value in the skipped
+                // range is stale and must be refreshed with `next()`.
                 delete_vector_iter.advance_to(next_row_group_base_idx);
-                // Only update the cache if the cached value is stale (in the skipped range)
                 if let Some(cached_idx) = next_deleted_row_idx_opt
                     && cached_idx < next_row_group_base_idx
                 {
                     next_deleted_row_idx_opt = delete_vector_iter.next();
                 }
 
-                // still increment the current page base index but then skip to the next row group
-                // in the file
                 current_row_group_base_idx += row_group_num_rows;
                 continue;
             }
@@ -143,8 +89,6 @@ pub(crate) fn build_deletes_row_selection(
 
         let mut next_deleted_row_idx = match next_deleted_row_idx_opt {
             Some(next_deleted_row_idx) => {
-                // if the index of the next deleted row is beyond this row group, add a selection for
-                // the remainder of this row group and skip to the next row group
                 if next_deleted_row_idx >= next_row_group_base_idx {
                     results.push(RowSelector::select(row_group_num_rows as usize));
                     current_row_group_base_idx += row_group_num_rows;
@@ -154,7 +98,6 @@ pub(crate) fn build_deletes_row_selection(
                 next_deleted_row_idx
             }
 
-            // If there are no more pos deletes, add a selector for the entirety of this row group.
             _ => {
                 results.push(RowSelector::select(row_group_num_rows as usize));
                 current_row_group_base_idx += row_group_num_rows;
@@ -164,14 +107,12 @@ pub(crate) fn build_deletes_row_selection(
 
         let mut current_idx = current_row_group_base_idx;
         'chunks: while next_deleted_row_idx < next_row_group_base_idx {
-            // `select` all rows that precede the next delete index
             if current_idx < next_deleted_row_idx {
                 let run_length = next_deleted_row_idx - current_idx;
                 results.push(RowSelector::select(run_length as usize));
                 current_idx += run_length;
             }
 
-            // `skip` all consecutive deleted rows in the current row group
             let mut run_length = 0;
             while next_deleted_row_idx == current_idx
                 && next_deleted_row_idx < next_row_group_base_idx
@@ -183,9 +124,7 @@ pub(crate) fn build_deletes_row_selection(
                 next_deleted_row_idx = match next_deleted_row_idx_opt {
                     Some(next_deleted_row_idx) => next_deleted_row_idx,
                     _ => {
-                        // We've processed the final positional delete.
-                        // Conclude the skip and then break so that we select the remaining
-                        // rows in the row group and move on to the next row group
+                        // Final delete: conclude the skip, then select the row group's remainder.
                         results.push(RowSelector::skip(run_length));
                         break 'chunks;
                     }
@@ -208,16 +147,13 @@ pub(crate) fn build_deletes_row_selection(
     results.into()
 }
 
-/// Redact any credential fragments from an error string before surfacing it.
 fn redact(msg: String, secrets: &[String]) -> String {
     let borrowed: Vec<&str> = secrets.iter().map(String::as_str).collect();
     let stripped = crate::scan::emit::redact_secret_values(&msg, &borrowed);
     crate::scan::emit::redact_credentials(&stripped)
 }
 
-/// The object-store [`ObjectMeta`] for an absolute file URI and its known byte
-/// size, keyed by the same `Path` the store observes — built without any
-/// object-store HEAD (the size is supplied by the caller).
+/// Built without a HEAD; the caller supplies the size.
 fn object_meta_for(abs_uri: &str, size: u64) -> Result<ObjectMeta, UdfError> {
     let url = ListingTableUrl::parse(abs_uri)
         .map_err(|e| UdfError::User(format!("invalid file URL '{abs_uri}': {e}")))?;
@@ -230,38 +166,19 @@ fn object_meta_for(abs_uri: &str, size: u64) -> Result<ObjectMeta, UdfError> {
     })
 }
 
-/// A delete mechanism this engine applies, carrying what applying it needs.
-///
-/// Both members feed ONE position map: an accumulated positional-delete set and a
-/// decoded deletion vector are both a bitmap of 0-based row positions in one data
-/// file, so nothing downstream of the read phase learns which mechanism produced an
-/// entry.
+/// Both variants feed ONE position map, so nothing downstream learns which mechanism produced it.
 #[derive(Debug)]
 enum ApplicableDelete<'a> {
-    /// An Iceberg Parquet positional-delete FILE, named by the path and byte size the
-    /// delete read consumes. One such file may carry deletes for many data files.
+    /// One such file may carry deletes for many data files.
     PositionalDeleteFile { path: &'a str, size: u64 },
-    /// A Delta deletion vector, already validated and resolved to the sidecar body it
-    /// needs — or to none, when the vector is inline. Its positions index the ONE data
-    /// file that carries it.
+    /// `sidecar` is `None` for an inline vector. Positions index the ONE data file carrying it.
     DeletionVector(DeletionVector),
 }
 
-/// Read-time backstop: dispatch on a delete mechanism's own variant, classifying the
-/// two mechanisms this engine applies and refusing every other variant with a clean,
-/// credential-redacted error.
-///
-/// The refusal is what makes the dispatch total: a mechanism the scan cannot apply can
-/// neither be read nor silently skipped, because the payload needed to act on a delete
-/// is reachable only through this call. The plan-time gate (adapter) is the
-/// authoritative filter; this is cheap defense-in-depth against an unsupported
-/// mechanism slipping through, and it runs before any row of the affected data file is
-/// emitted.
-///
-/// `data_file_path` names the entry carrying `delete`, and is what a deletion-vector
-/// refusal reports: that variant has no delete-file path to name, and its
-/// `path_or_inline_dv` is an opaque token or payload rather than a diagnostic.
-/// `table_root` is what a UUID-relative vector's sidecar path is reconstructed against.
+/// Read-time backstop behind the plan-time adapter gate: an unapplicable mechanism is refused
+/// before any row of its data file is emitted, and the payload is reachable only through here,
+/// so it can neither be read nor silently skipped. `data_file_path` is what a deletion-vector
+/// refusal names, since its `path_or_inline_dv` is opaque.
 fn applicable_delete_mechanism<'a>(
     delete: &'a DeleteMechanism,
     data_file_path: &str,
@@ -309,9 +226,7 @@ fn applicable_delete_mechanism<'a>(
     )))
 }
 
-/// Locate the `file_path` and `pos` columns of a positional-delete file by
-/// Iceberg reserved field-id (authoritative), falling back to the spec column
-/// names. Returns `(file_path_idx, pos_idx)`.
+/// Field-id is authoritative; the spec column names are the fallback.
 fn locate_delete_columns(schema: &SchemaRef) -> Result<(usize, usize), UdfError> {
     let by_field_id = |target: i32| {
         schema.fields().iter().position(|f| {
@@ -338,19 +253,9 @@ fn locate_delete_columns(schema: &SchemaRef) -> Result<(usize, usize), UdfError>
     Ok((file_path_idx, pos_idx))
 }
 
-/// Whether a delete-file row group can hold deletes for any assigned data file,
-/// judged from its `file_path` column min/max statistics.
-///
-/// Pruning is RANGE-based: a row group is skipped ONLY when every assigned path
-/// sorts strictly outside the `[min, max]` byte range (before `min` or after
-/// `max`). Parquet truncates string statistics — min DOWN and max UP — so the
-/// stored `[min, max]` is a superset of the true range; a byte-wise range test
-/// therefore stays valid on truncated bounds and never prunes a row group that
-/// could contain a match. An equality shortcut (`min == max == target`) is NOT
-/// used: it would wrongly prune a row group whose truncated bounds bracket a
-/// longer real path. A row group whose `file_path` statistics are absent,
-/// partial (min or max unset), or not a byte-array is never pruned — overlap
-/// cannot be ruled out.
+/// Range-based: Parquet truncates string statistics (min down, max up), so `[min, max]` is a
+/// superset and a byte-wise range test never prunes a possible match. An equality shortcut would
+/// wrongly prune truncated bounds bracketing a longer path. Absent or partial stats never prune.
 fn delete_row_group_may_match(
     row_group: &RowGroupMetaData,
     file_path_idx: usize,
@@ -371,20 +276,9 @@ fn delete_row_group_may_match(
     })
 }
 
-/// Read one positional-delete Parquet file exactly once (Phase A), bucketing
-/// each surviving `pos` value under its `file_path` — restricted to `assigned`,
-/// the set of this shard's data-file absolute paths (required for `partition`
-/// granularity, where one delete file references many data files, only some of
-/// which this shard reads). Returns a per-delete-file
-/// `HashMap<data_file_path, `[`RoaringTreemap`]`>`; the caller unions these
-/// across delete files.
-///
-/// Delete-file row groups whose `file_path` min/max statistics cannot overlap
-/// any assigned data-file path are pruned via [`delete_row_group_may_match`], so
-/// only the surviving row groups' data pages are decoded (exploiting Iceberg's
-/// required (`file_path`, `pos`) sort). Each data file's set is bulk-built from
-/// its collected positions rather than one insert per row. Never issues an
-/// object-store HEAD (the file size is supplied).
+/// Restricted to `assigned` because one partition-granularity delete file references many data
+/// files. Row groups whose `file_path` range cannot overlap are skipped, exploiting Iceberg's
+/// required (`file_path`, `pos`) sort. No HEAD is issued.
 async fn read_delete_file_positions(
     store: Arc<dyn ObjectStore>,
     delete_meta: ObjectMeta,
@@ -399,8 +293,6 @@ async fn read_delete_file_positions(
     let schema = Arc::clone(builder.schema());
     let (file_path_idx, pos_idx) = locate_delete_columns(&schema)?;
 
-    // Keep only the row groups whose `file_path` range can overlap an assigned
-    // data file; the rest are skipped so their data pages are never fetched.
     let selected: Vec<usize> = builder
         .metadata()
         .row_groups()
@@ -410,11 +302,8 @@ async fn read_delete_file_positions(
         .map(|(idx, _)| idx)
         .collect();
 
-    // Collect matching positions per data file, then bulk-build each set below.
     let mut positions_by_data_file: HashMap<String, Vec<u64>> = HashMap::new();
 
-    // When every row group is pruned there is nothing to decode; skip building
-    // the stream so no data pages are read at all.
     if !selected.is_empty() {
         let mut stream = builder.with_row_groups(selected).build().map_err(|e| {
             UdfError::User(redact(format!("failed to read delete file: {e}"), secrets))
@@ -433,11 +322,7 @@ async fn read_delete_file_positions(
                     UdfError::User("positional-delete pos column is not Int64".into())
                 })?;
 
-            // Downcast the `file_path` column once per batch (tolerating `Utf8`/`LargeUtf8`)
-            // and borrow each cell in place — no per-row downcast or allocation. Fail
-            // loud on any other type: a silent `None`-for-every-row fallback would drop
-            // ALL positional deletes without error — exactly the silent-correctness
-            // failure mode this feature exists to eliminate.
+            // Fail loud on any other type: a silent `None` would drop every positional delete.
             let utf8 = file_paths.as_any().downcast_ref::<StringArray>();
             let large_utf8 = file_paths.as_any().downcast_ref::<LargeStringArray>();
             if utf8.is_none() && large_utf8.is_none() {
@@ -463,26 +348,18 @@ async fn read_delete_file_positions(
                     continue;
                 }
                 let Some(path) = path_at(row) else { continue };
-                // Only bucket deletes for data files this shard is reading; a
-                // partition-granularity delete file referencing sibling files
-                // contributes nothing here.
                 if !assigned.contains(path) {
                     continue;
                 }
                 let pos = positions.value(row);
-                // A negative `pos` is malformed: casting it to u64 would wrap to a
-                // huge index and silently drop the delete. Reject it loudly rather
-                // than emit a row Iceberg intended to delete.
+                // Casting a negative `pos` to u64 would wrap and silently drop the delete.
                 if pos < 0 {
                     return Err(UdfError::User(format!(
                         "positional-delete file has a negative pos ({pos}); refusing to \
                          apply a malformed delete"
                     )));
                 }
-                // Probe with the borrowed `&str` and only allocate an owned key
-                // when the bucket is new. `entry` would force `path.to_string()`
-                // on every matching row — one heap allocation per deleted
-                // position in the dominant single-data-file case.
+                // `entry` would allocate `path.to_string()` on every matching row.
                 if let Some(bucket) = positions_by_data_file.get_mut(path) {
                     bucket.push(pos as u64);
                 } else {
@@ -492,11 +369,8 @@ async fn read_delete_file_positions(
         }
     }
 
-    // Bulk-build each data file's set. The Iceberg spec sorts a delete file by
-    // (`file_path`, `pos`), so per data file the positions arrive ascending;
-    // sort + dedup makes the bulk build robust to any deviation without changing
-    // the resulting set (`RoaringTreemap` is a set, so order and duplicates do
-    // not affect the outcome — only the efficient sorted build path).
+    // Positions normally arrive sorted per the Iceberg spec; sort + dedup keeps the bulk
+    // `from_sorted_iter` build robust to deviations.
     let mut result: HashMap<String, RoaringTreemap> =
         HashMap::with_capacity(positions_by_data_file.len());
     for (path, mut positions) in positions_by_data_file {
@@ -512,14 +386,7 @@ async fn read_delete_file_positions(
     Ok(result)
 }
 
-/// Build a base [`ParquetAccessPlan`] for a delete-carrying data file (task 2.4).
-///
-/// Converts the whole-file [`RowSelection`] (from [`build_deletes_row_selection`],
-/// with no row-group restriction — the opener applies pruning ON TOP) into a
-/// per-row-group `Selection` on the access plan by splitting it at row-group
-/// boundaries. Row groups the deletes do not touch stay `Scan`. The opener seeds
-/// its `RowGroupAccessPlanFilter` with this plan and intersects predicate /
-/// row-group / page pruning on top, so deletes compose with pushdown.
+/// Splits the whole-file selection at row-group boundaries; untouched row groups stay `Scan`.
 fn build_access_plan(
     row_groups: &[RowGroupMetaData],
     deletes: &RoaringTreemap,
@@ -529,9 +396,6 @@ fn build_access_plan(
     for (idx, rg) in row_groups.iter().enumerate() {
         let num_rows = rg.num_rows() as usize;
         let per_row_group = whole.split_off(num_rows);
-        // Only attach a Selection when this row group actually loses rows; an
-        // all-select row group is left as `Scan` (equivalent, and lets the
-        // opener treat it as a plain full scan).
         if per_row_group.iter().any(|selector| selector.skip) {
             plan.scan_selection(idx, per_row_group);
         }
@@ -539,42 +403,18 @@ fn build_access_plan(
     plan
 }
 
-/// Custom [`TableProvider`] over DataFusion's `ParquetSource` (task 2.1),
-/// replacing the previous `ListingTable`.
+/// All files go into ONE `FileGroup` (one output partition, no repartition). The plan is built
+/// through [`ParquetFormat::create_physical_plan`], which applies THIS provider's Parquet
+/// options (making row-filter pushdown per table) and a `CachedParquetFileReaderFactory` over
+/// the session [`FileMetadataCache`]. Access-plan construction reads through that same cache
+/// with the same [`ParquetFormat::metadata_size_hint`], so a footer parses once. That holds only
+/// because access-plan construction is the FIRST footer reader: the adapter always supplies a
+/// `logical_schema`, keeping `register_file_list` off the `infer_schema` fallback.
 ///
-/// It registers ONLY the assigned files (no catalog discovery), builds a
-/// [`FileScanConfig`] directly so each delete-carrying data file can carry a
-/// base [`ParquetAccessPlan`] on its `PartitionedFile` extensions, and preserves
-/// exactly: the logical schema, the [`FieldIdExprAdapterFactory`], and the lean
-/// single-partition plan (all files in ONE `FileGroup` ⇒ one output partition,
-/// no repartition/coalesce). Delete-free files take the identical path with no
-/// access plan attached, so the change is unified across all scans.
-///
-/// The physical plan is produced through [`ParquetFormat::create_physical_plan`]
-/// — the same seam `ListingTable` uses — which applies THIS provider's Parquet
-/// options (it overwrites the source's with the `format`'s, which is what makes
-/// the row-filter-pushdown decision per table rather than per session) and
-/// installs a `CachedParquetFileReaderFactory` backed by the session
-/// [`FileMetadataCache`]; access-plan construction reads through that SAME cache
-/// with the SAME metadata size hint, so a delete-carrying file's footer parses
-/// ONCE for both access-plan construction and the scan. The hint has exactly one
-/// owner — [`ParquetFormat::metadata_size_hint`] on the `format` this provider
-/// already holds — read back rather than duplicated as a second constant, so the
-/// two readers cannot disagree on request shape. The once-per-footer property
-/// holds on the production path only because access-plan construction is the
-/// FIRST reader of the footer: the adapter always supplies a non-empty
-/// `logical_schema`, which keeps `register_file_list` off the
-/// `ParquetFormat::infer_schema` fallback that would otherwise populate the
-/// cache first, under a request shape the hinted fetch does not match.
-///
-/// [`FileScanConfig`]: datafusion::datasource::physical_plan::FileScanConfig
 /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
 #[derive(Debug)]
 pub(crate) struct PositionalDeleteScanTable {
     object_store_url: ObjectStoreUrl,
-    /// The table's declared logical schema together with the
-    /// `file_schema ++ table_partition_cols` split the `FileScanConfig` scans it
-    /// through — see [`PartitionedScanSchema`].
     schema: PartitionedScanSchema,
     use_field_id_adapter: bool,
     field_id_resolution: FieldIdResolution,
@@ -582,39 +422,15 @@ pub(crate) struct PositionalDeleteScanTable {
     table_root: String,
     secrets: Vec<String>,
     format: Arc<ParquetFormat>,
-    /// Shared instance-level bound on every object-store read the delete path
-    /// issues while preparing a scan — Phase A delete-file bodies and
-    /// deletion-vector sidecars and Phase B data-file footers alike, one permit
-    /// per read — sized `s3_max_connections`
-    /// and constructed once per scan invocation. Every provider registered for
-    /// the same invocation (including both sides of a broadcast join) holds a
-    /// clone of the SAME `Arc`, so the whole instance stays within one
-    /// N-permit budget rather than each provider getting its own N.
+    /// Shared by every provider of one invocation (both join sides included), so the whole
+    /// instance stays within one N-permit budget.
     delete_path_read_limiter: Arc<Semaphore>,
 }
 
 impl PositionalDeleteScanTable {
-    /// Construct the provider from the split logical Arrow schema and the
-    /// per-shard file list. `use_field_id_adapter` mirrors the previous
-    /// `register_files` behavior: the [`FieldIdExprAdapterFactory`] is attached
-    /// only when the adapter supplied a logical schema, whichever key its fields
-    /// bind by; legacy specs that fell back to first-file inference bind by name.
-    /// `field_id_resolution` groups this side's (fact or dimension) binding
-    /// tables — the flattened `schema.name-mapping.default` entries and the
-    /// logical name each declared physical name claims — together with the
-    /// reconstructed Iceberg `initial-default` values keyed by logical column
-    /// name, all resolved once in the VS alongside the logical schema and empty
-    /// when the table declares none of them. It is carried through unchanged to
-    /// the [`FieldIdExprAdapterFactory`] installed in [`Self::scan`], and its
-    /// nested member trees also decide THIS table's Parquet read options through
-    /// [`scan_table_parquet_format`] — the one place a table carrying a
-    /// JSON-rendered nested column is told to read without row-filter pushdown.
-    /// `delete_path_read_limiter` is the shared
-    /// instance-level semaphore bounding every object-store read the delete
-    /// path issues while preparing a scan — Phase A delete-file bodies and
-    /// Phase B data-file footers alike, one permit per read — sized
-    /// `s3_max_connections`, constructed once per scan invocation and shared
-    /// across every registered provider — see the struct-level doc comment).
+    /// `use_field_id_adapter` is false only for legacy specs that fell back to first-file
+    /// inference. `field_id_resolution`'s nested member trees also decide this table's Parquet
+    /// read options via [`scan_table_parquet_format`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         object_store_url: ObjectStoreUrl,
@@ -645,24 +461,9 @@ impl PositionalDeleteScanTable {
         }
     }
 
-    /// Phase A: read every delete this shard carries, whichever mechanism expresses
-    /// it, and merge the resulting positions into ONE
-    /// `HashMap<data_file_path, `[`RoaringTreemap`]`>` keyed by the data-file absolute
-    /// path each delete targets.
-    ///
-    /// Every mechanism on every assigned entry passes through
-    /// [`applicable_delete_mechanism`] BEFORE any I/O, so an unapplicable mechanism
-    /// anywhere in the shard fails loud before a single delete-file body,
-    /// deletion-vector sidecar, or data-file footer is fetched. That call is also what
-    /// supplies the payload keyed and read below, which is why the dedup cannot key on
-    /// a mechanism the scan does not apply.
-    ///
-    /// The two mechanisms' fan-outs run concurrently but draw permits from the ONE
-    /// shared [`Self::delete_path_read_limiter`], so the whole instance — both sides of
-    /// a broadcast join included — stays within one connection budget. Merging is
-    /// order-independent: [`RoaringTreemap`] union is commutative and associative, so
-    /// the non-deterministic completion order of the concurrent reads cannot change the
-    /// result.
+    /// Every mechanism passes [`applicable_delete_mechanism`] BEFORE any I/O, so an unapplicable
+    /// one fails before anything is fetched. The two fan-outs share one limiter; `RoaringTreemap`
+    /// union is commutative, so completion order cannot change the result.
     async fn collect_delete_positions(
         &self,
         store: &Arc<dyn ObjectStore>,
@@ -721,11 +522,7 @@ impl PositionalDeleteScanTable {
         Ok(merged)
     }
 
-    /// Read each UNIQUE positional-delete file exactly once, concurrently within the
-    /// shared [`Self::delete_path_read_limiter`] budget, yielding one
-    /// `HashMap<data_file_path, `[`RoaringTreemap`]`>` per delete file for the caller
-    /// to union. No object-store HEAD is issued: each delete file's [`ObjectMeta`] is
-    /// built from its spec-supplied byte size via [`object_meta_for`].
+    /// No HEAD: each [`ObjectMeta`] is built from the spec-supplied size.
     async fn read_delete_files(
         &self,
         store: &Arc<dyn ObjectStore>,
@@ -750,24 +547,15 @@ impl PositionalDeleteScanTable {
         try_join_all(reads).await
     }
 
-    /// Fetch each UNIQUE deletion-vector sidecar exactly once for the whole shard,
-    /// keyed on the resolved absolute path, concurrently within the SAME
-    /// [`Self::delete_path_read_limiter`] budget the delete-file reads draw on — so a
-    /// mixed shard's total in-flight object-store reads stay within one budget.
-    ///
-    /// The WHOLE object is fetched rather than the descriptor's byte range: the decoder
-    /// validates the container's format-version byte at file position 0, which a range
-    /// starting at the descriptor's offset would not carry. Fetching whole is also what
-    /// lets one body serve every descriptor that resolves to it. No object-store HEAD is
-    /// issued — a descriptor carries the VECTOR's size, never the sidecar's, so a
-    /// sidecar's size is a size the scan never needs.
+    /// Fetched WHOLE, not by the descriptor's range: the decoder validates the version byte at
+    /// position 0, and one body can then serve every descriptor naming it. No HEAD: descriptors
+    /// carry the vector's size, never the sidecar's.
     async fn fetch_deletion_vector_sidecars(
         &self,
         store: &Arc<dyn ObjectStore>,
         vectors: &[(&str, DeletionVector)],
     ) -> Result<HashMap<Url, Bytes>, UdfError> {
-        // Each sidecar is named by whichever data file first referenced it: a failed
-        // fetch has to report a DATA file, and a shared sidecar has several.
+        // A failed fetch must name a DATA file; a shared sidecar is named by its first referrer.
         let mut unique: HashMap<&Url, &str> = HashMap::new();
         for (data_file, vector) in vectors {
             if let Some(url) = vector.sidecar_url() {
@@ -809,37 +597,13 @@ impl PositionalDeleteScanTable {
         Ok(try_join_all(reads).await?.into_iter().collect())
     }
 
-    /// Build one `PartitionedFile` per assigned data file, attaching that file's
-    /// partition values as scan-time constants and a base `ParquetAccessPlan` (task
-    /// 2.4) to each delete-carrying file.
+    /// Partition values convert first, so a spec-content failure precedes every fetch.
     ///
-    /// Partition values are converted for the whole shard before any read: they are
-    /// the one thing here that can fail on the spec's own content rather than on
-    /// storage, and doing them first keeps that failure ahead of every fetch, exactly
-    /// as [`applicable_delete_mechanism`] keeps an unapplicable mechanism ahead of
-    /// Phase A's.
-    ///
-    /// Phase A ([`Self::collect_delete_positions`]) performs all delete-file
-    /// I/O up front. Phase B (this method) is a bounded-concurrent,
-    /// order-preserving fan-out (`try_join_all` over ALL assigned files,
-    /// preserving input order in the returned `Vec<PartitionedFile>`) that
-    /// performs no DELETE-file I/O of its own: a delete-free entry takes no
-    /// permit from the shared `delete_path_read_limiter` and issues no read. A
-    /// delete-carrying entry instead fetches ITS OWN data file's Parquet footer
-    /// — one object-store round-trip, under one permit from that same shared
-    /// limiter — through the shared session [`FileMetadataCache`], the same
-    /// cache the opener's `CachedParquetFileReaderFactory` reads. The fetch
-    /// supplies the metadata size hint [`ParquetFormat::metadata_size_hint`]
-    /// already governs for the opener, collapsing it to ONE hinted range GET,
-    /// and explicitly skips the page index, since [`build_access_plan`] reads
-    /// only each row group's row count and never the page index. The footer
-    /// therefore parses ONCE for both access-plan construction and the scan,
-    /// and no object-store HEAD is issued — then builds the base
-    /// [`ParquetAccessPlan`] via [`build_access_plan`]. Every footer fetched
-    /// here is also recorded via
-    /// [`diagnostics::record_access_plan_cached_footer`], so a metadata-cache
-    /// eviction that costs the opener a second fetch is observable rather than
-    /// silent (task 1.7b).
+    /// Only delete-carrying entries take a limiter permit, fetching their own footer through the
+    /// shared session [`FileMetadataCache`] with the opener's size hint and page index skipped
+    /// ([`build_access_plan`] needs only row counts), so the footer parses once for both. Each
+    /// fetched footer is recorded via [`diagnostics::record_access_plan_cached_footer`] so a
+    /// cache eviction is observable.
     ///
     /// [`FileMetadataCache`]: datafusion::execution::cache::cache_manager::FileMetadataCache
     async fn partitioned_files(
@@ -921,9 +685,7 @@ impl PositionalDeleteScanTable {
 
 #[async_trait]
 impl TableProvider for PositionalDeleteScanTable {
-    /// The table's DECLARED column order — the order the user's SQL and the
-    /// virtual schema's column list expect. The `file ++ partition` split stays
-    /// inside [`Self::scan`], reconciled by the projection remap.
+    /// DECLARED column order; the `file ++ partition` split stays inside [`Self::scan`].
     fn schema(&self) -> SchemaRef {
         Arc::clone(self.schema.declared_schema())
     }
@@ -954,9 +716,7 @@ impl TableProvider for PositionalDeleteScanTable {
             }) as Arc<_>
         });
 
-        // All assigned files go into ONE file group ⇒ one output partition. With
-        // `target_partitions = 1` (the scan default) the plan stays lean: no
-        // repartition/coalesce is inserted.
+        // One file group ⇒ one output partition; with `target_partitions = 1` no repartition.
         let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
             .with_file_group(FileGroup::new(files))
             .with_projection_indices(self.schema.remap_projection(projection))?
@@ -971,10 +731,8 @@ impl TableProvider for PositionalDeleteScanTable {
         &self,
         filters: &[&Expr],
     ) -> datafusion::error::Result<Vec<TableProviderFilterPushDown>> {
-        // Mirror `ListingTable`'s non-partition behavior: the filter is pushed to
-        // the Parquet scan for row-group/page pruning, but DataFusion keeps a
-        // `FilterExec` above the scan (Inexact) so correctness never depends on
-        // the scan fully applying it.
+        // Inexact, like `ListingTable`: the scan prunes with it, but a `FilterExec` above keeps
+        // correctness independent of the scan.
         Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }

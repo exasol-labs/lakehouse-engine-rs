@@ -3,10 +3,7 @@ use crate::scan::raw_scan::register_nested_json_render_udf;
 use crate::scan::spec::{JoinSpec, JoinType};
 use crate::scan::test_support::minimal_spec;
 
-/// A non-nested incompatible column (e.g. `Binary`) reaching the join select
-/// list must keep the byte-identical `CAST(col AS VARCHAR)` this path has
-/// always emitted — only the five nested types `needs_nested_json_rendering`
-/// owns divert to the JSON render function.
+/// Scenario: a non-nested incompatible join column keeps `CAST(col AS VARCHAR)`.
 #[test]
 fn render_join_select_item_keeps_a_non_nested_incompatible_column_cast_unchanged() {
     let combined = vec![("PAYLOAD".to_string(), arrow::datatypes::DataType::Binary)];
@@ -17,9 +14,7 @@ fn render_join_select_item_keeps_a_non_nested_incompatible_column_cast_unchanged
     assert_eq!(rendered, "CAST(\"PAYLOAD\" AS VARCHAR)");
 }
 
-/// A nested column reaching the join select list is rendered by name through
-/// the SAME JSON encoder the single-table legacy path uses, never cast to
-/// Arrow display text.
+/// Scenario: a nested join column routes through the shared JSON render function.
 #[test]
 fn render_join_select_item_diverts_a_nested_column_to_the_json_render_function() {
     let list_type = arrow::datatypes::DataType::List(std::sync::Arc::new(
@@ -37,9 +32,7 @@ fn render_join_select_item_diverts_a_nested_column_to_the_json_render_function()
     );
 }
 
-/// End-to-end: a nested column joined through the legacy (no-logical-schema)
-/// broadcast join path renders as strict JSON, not the `List → Utf8` Arrow
-/// display-text cast.
+/// Scenario: a nested column on the legacy broadcast join path renders as strict JSON.
 #[tokio::test]
 async fn build_join_sql_renders_a_nested_column_as_valid_json_end_to_end() {
     use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder};

@@ -1,7 +1,5 @@
-//! End-to-end coverage for `CATALOG_KIND = 'DIRECT_STORAGE'`: a plain directory of
-//! Parquet files on MinIO, queried through the Virtual Schema with no catalog service
-//! involved. Per project rules this suite FAILS (never skips) when the stack is
-//! unreachable.
+//! `CATALOG_KIND = 'DIRECT_STORAGE'`: a plain directory of Parquet files on MinIO,
+//! queried with no catalog service. FAILS (never skips) when the stack is unreachable.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -36,10 +34,6 @@ use serde_json::Value as Json;
 use std::collections::BTreeSet;
 use std::sync::{Arc, OnceLock};
 
-// ---------------------------------------------------------------------------
-// Virtual Schemas / CONNECTIONs / base paths
-// ---------------------------------------------------------------------------
-
 const BASE_DIRECT: &str = "s3://warehouse/direct/";
 const BASE_INCOMPATIBLE: &str = "s3://warehouse/direct_incompatible/";
 const BASE_DISCOVERY: &str = "s3://warehouse/direct_discovery/";
@@ -60,8 +54,7 @@ const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
 const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
 const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
 
-/// `CatalogConnectionPassword` for a direct-storage CONNECTION: static S3 creds,
-/// no `warehouse` (the direct-storage kind rejects that field).
+/// No `warehouse`: the direct-storage kind rejects that field.
 fn direct_storage_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         endpoint: minio_url_internal(),
@@ -73,15 +66,12 @@ fn direct_storage_password() -> CatalogConnectionPassword {
     }
 }
 
-/// A root-namespace `DIRECT_STORAGE` Virtual Schema `vs_name` over CONNECTION `conn_name`.
 fn direct_vs<'a>(vs_name: &'a str, conn_name: &'a str) -> VsProps<'a> {
     VsProps::new(vs_name, "")
         .with_catalog_kind("DIRECT_STORAGE")
         .with_catalog_conn_name(conn_name)
 }
 
-/// Attempts `CREATE VIRTUAL SCHEMA` for `direct_vs(vs_name, conn_name)` over `base`,
-/// returning the raw response so a rejection can be asserted.
 fn try_create_direct_vs(conn: &mut ExaConn, vs_name: &str, conn_name: &str, base: &str) -> Json {
     try_create_virtual_schema_with_password(
         conn,
@@ -91,7 +81,6 @@ fn try_create_direct_vs(conn: &mut ExaConn, vs_name: &str, conn_name: &str, base
     )
 }
 
-/// Asserts `resp` is an error and returns its message; `what` names the rejected case.
 fn rejection_message<'a>(resp: &'a Json, what: &str) -> &'a str {
     assert_eq!(
         resp["status"].as_str(),
@@ -101,16 +90,11 @@ fn rejection_message<'a>(resp: &'a Json, what: &str) -> &'a str {
     resp["exception"]["text"].as_str().unwrap_or("")
 }
 
-/// Asserts `msg` contains every one of `needles`.
 fn assert_mentions(msg: &str, needles: &[&str]) {
     for needle in needles {
         assert!(msg.contains(needle), "error must mention {needle:?}: {msg}");
     }
 }
-
-// ---------------------------------------------------------------------------
-// One-time setup: write every fixture, provision every Virtual Schema.
-// ---------------------------------------------------------------------------
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -175,10 +159,6 @@ fn vs_table(vs_name: &str, table: &str) -> String {
     format!("{vs_name}.{}", table.to_uppercase())
 }
 
-// ---------------------------------------------------------------------------
-// Fixture writers
-// ---------------------------------------------------------------------------
-
 fn events_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("EVENT_ID", DataType::Int64, false),
@@ -195,8 +175,7 @@ fn events_schema() -> Arc<Schema> {
     ]))
 }
 
-/// Row order: id, name, active, score. Shared ground truth for every EVENTS
-/// assertion in this file.
+/// Indexed by `EVENT_ID - 1`.
 const EVENT_NAMES: [&str; 5] = ["alice", "bob", "carol", "dave", "erin"];
 const EVENT_ACTIVE: [bool; 5] = [true, false, true, false, true];
 const EVENT_SCORES: [f64; 5] = [1.1, 2.2, 3.3, 4.4, 5.5];
@@ -264,8 +243,8 @@ fn widened_narrow_file() -> RecordBatch {
     .expect("widened narrow-file batch construction is infallible")
 }
 
-/// `QTY` (`5_000_000_000`) exceeds `i32` — errors only under a narrow
-/// (`MERGE_SCHEMA = 'FALSE'`) width; the wide/default-merge declaration reads it unchanged.
+/// `QTY = 5_000_000_000` exceeds `i32`, so it errors only under the narrow
+/// `MERGE_SCHEMA = 'FALSE'` declaration.
 fn widened_wide_file() -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("ID", DataType::Int64, false),
@@ -331,7 +310,6 @@ fn event_labels_batch() -> RecordBatch {
     .expect("event_labels batch construction is infallible")
 }
 
-/// A one-row batch: a non-null `ID = id` followed by the `extra` columns.
 fn id_row<const N: usize>(id: i64, extra: [(Field, ArrayRef); N]) -> RecordBatch {
     let (fields, columns): (Vec<Field>, Vec<ArrayRef>) = std::iter::once((
         Field::new("ID", DataType::Int64, false),
@@ -347,7 +325,6 @@ fn discovery_id_batch(id: i64) -> RecordBatch {
     id_row(id, [])
 }
 
-/// One `list<utf8>` cell (`TAGS`), populated for row 0, null for row 1.
 fn tags_column() -> ArrayRef {
     let mut builder = ListBuilder::new(StringBuilder::new());
     builder.values().append_option(Some("x"));
@@ -357,8 +334,6 @@ fn tags_column() -> ArrayRef {
     Arc::new(builder.finish())
 }
 
-/// One `struct<STREET: utf8, CITY: utf8>` cell (`ADDRESS`), populated for row
-/// 0, null for row 1.
 fn address_column() -> ArrayRef {
     let street: ArrayRef = Arc::new(StringArray::from(vec![Some("Main St"), None]));
     let city: ArrayRef = Arc::new(StringArray::from(vec![Some("Town"), None]));
@@ -375,8 +350,6 @@ fn address_column() -> ArrayRef {
     )
 }
 
-/// One `map<utf8, utf8>` cell (`ATTRS`): row 0 carries two entries, row 1 is
-/// null (zero entries at a null offset span).
 fn attrs_column() -> ArrayRef {
     let keys: ArrayRef = Arc::new(StringArray::from(vec!["a", "b"]));
     let values: ArrayRef = Arc::new(StringArray::from(vec!["1", "2"]));
@@ -462,7 +435,6 @@ fn sales_batch(ids: &[i64]) -> RecordBatch {
     .expect("sales batch construction is infallible")
 }
 
-/// `sales_batch` plus a `DISCOUNT` column, which only the `year=2026` file carries.
 fn discounted_sales_batch(ids: &[i64]) -> RecordBatch {
     let sales = sales_batch(ids);
     let mut fields = sales.schema().fields().to_vec();
@@ -474,11 +446,11 @@ fn discounted_sales_batch(ids: &[i64]) -> RecordBatch {
         .expect("discounted sales batch construction is infallible")
 }
 
-/// Byte order ranks these `B < a < é`, which neither a case-insensitive nor a locale order does,
-/// so a range predicate over them tells the orders apart. Row `n` of the fixture is `ID = n + 1`.
+/// Byte order ranks these `B < a < é`, unlike a case-insensitive or locale order,
+/// so a range predicate tells the orders apart.
 const REGION_VALUES: [&str; 3] = ["B", "a", "é"];
 
-/// 2026-01-01 00:00:05.25 UTC: its `SECOND(TS, 3)` is 5.25, so `SECOND(TS, 3) > 1` holds on every row.
+/// `SECOND(TS, 3)` is 5.25, so `SECOND(TS, 3) > 1` holds on every row.
 const REGION_TS_MICROS: i64 = 1_767_225_605_250_000;
 
 fn regions_batch(id: i64) -> RecordBatch {
@@ -496,7 +468,6 @@ fn regions_batch(id: i64) -> RecordBatch {
     .expect("regions batch construction is infallible")
 }
 
-/// A stored `K` column that a `k=` directory segment collides with once uppercased.
 fn stored_k_batch(id: i64, stored_k: i64) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("ID", DataType::Int64, false),
@@ -512,8 +483,6 @@ fn stored_k_batch(id: i64, stored_k: i64) -> RecordBatch {
     .expect("stored-K batch construction is infallible")
 }
 
-/// PUTs raw bytes at `uri` — for Delta transaction-log JSON, which isn't Parquet
-/// and so falls outside `write_parquet_fixture`'s contract.
 fn put_raw_bytes(uri: &str, bytes: Vec<u8>) {
     let without_scheme = uri.strip_prefix("s3://").expect("uri must be s3://...");
     let (bucket, key) = without_scheme
@@ -571,7 +540,6 @@ fn write_delta_caveat_fixture() {
 }
 
 fn write_all_fixtures() {
-    // events/ — mixed-type column set, two files.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}events/file1.parquet"),
         events_batch(&[1, 2, 3]),
@@ -581,7 +549,6 @@ fn write_all_fixtures() {
         events_batch(&[4, 5]),
     );
 
-    // nested/ — one table, two subdirectory files, zero partition columns.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}nested/A/p1.parquet"),
         nested_batch(1, "from-a"),
@@ -591,7 +558,7 @@ fn write_all_fixtures() {
         nested_batch(2, "from-b"),
     );
 
-    // widened/ — file1 (narrow, sorts first) then file2 (wide).
+    // The narrow file must sort first: MERGE_SCHEMA = 'FALSE' samples the first-listed file.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}widened/file1.parquet"),
         widened_narrow_file(),
@@ -601,7 +568,6 @@ fn write_all_fixtures() {
         widened_wide_file(),
     );
 
-    // missing_col/ — file1 carries A and B, file2 carries only A.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}missing_col/file1.parquet"),
         missing_col_file1(),
@@ -611,22 +577,18 @@ fn write_all_fixtures() {
         missing_col_file2(),
     );
 
-    // complex/ — one struct, one list, one map column.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}complex/file1.parquet"),
         complex_batch(),
     );
 
-    // event_labels/ — join partner for events/, EVENT_ID subset {1,3,5}.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}event_labels/file1.parquet"),
         event_labels_batch(),
     );
 
-    // delta_caveat/ — a Delta table directory read as raw Parquet.
     write_delta_caveat_fixture();
 
-    // sales/ — three year partitions with disjoint rows; only year=2026 carries DISCOUNT.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}sales/year=2026/month=09/p1.parquet"),
         discounted_sales_batch(&[1, 2]),
@@ -640,13 +602,12 @@ fn write_all_fixtures() {
         sales_batch(&[4]),
     );
 
-    // encoded/ — a percent-encoded partition value, keyed verbatim as Spark writes it.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}encoded/region=a%2Fb/p.parquet"),
         discovery_id_batch(1),
     );
 
-    // mixed/ — one plain directory, listed first, and one key=value directory.
+    // The plain directory must list first so MERGE_SCHEMA = 'FALSE' samples it.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}mixed/A/p.parquet"),
         discovery_id_batch(1),
@@ -656,7 +617,6 @@ fn write_all_fixtures() {
         discovery_id_batch(2),
     );
 
-    // regions/ — one file per REGION value.
     for (id, region) in (1..).zip(REGION_VALUES) {
         write_parquet_fixture(
             &format!("{BASE_DIRECT}regions/region={region}/p.parquet"),
@@ -664,7 +624,6 @@ fn write_all_fixtures() {
         );
     }
 
-    // Loose file and empty-of-data-files directory under the base path: neither becomes a table.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}loose.parquet"),
         discovery_id_batch(999),
@@ -674,8 +633,8 @@ fn write_all_fixtures() {
         discovery_id_batch(0),
     );
 
-    // direct_incompatible/incompatible/ — isolated root: this pair fails enumeration,
-    // must not share a base path with any passing scenario.
+    // Isolated root (as is BASE_COLLISION_MISSING): it fails enumeration, so it must
+    // not share a base path with any passing scenario.
     write_parquet_fixture(
         &format!("{BASE_INCOMPATIBLE}incompatible/file1.parquet"),
         incompatible_file1(),
@@ -685,13 +644,11 @@ fn write_all_fixtures() {
         incompatible_file2(),
     );
 
-    // collision_override/ — the k=1 segment overrides the stored K = 99.
     write_parquet_fixture(
         &format!("{BASE_DIRECT}collision_override/k=1/p.parquet"),
         stored_k_batch(1, 99),
     );
 
-    // direct_hive_collision_missing/ — isolated root: p2 has K but no k= segment.
     write_parquet_fixture(
         &format!("{BASE_COLLISION_MISSING}collision_missing_segment/k=1/p1.parquet"),
         stored_k_batch(1, 99),
@@ -701,7 +658,6 @@ fn write_all_fixtures() {
         stored_k_batch(2, 42),
     );
 
-    // direct_discovery/ — discovery + NAMESPACE fixtures.
     write_parquet_fixture(
         &format!("{BASE_DISCOVERY}orders/file.parquet"),
         discovery_id_batch(100),
@@ -728,10 +684,6 @@ fn write_all_fixtures() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Small query helpers
-// ---------------------------------------------------------------------------
-
 fn declared_type(conn: &mut ExaConn, vs_name: &str, table: &str, column: &str) -> String {
     let ty = conn.query_columns(&format!(
         "SELECT COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
@@ -743,9 +695,8 @@ fn declared_type(conn: &mut ExaConn, vs_name: &str, table: &str, column: &str) -
     ty.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// Asserts `column`'s declared type starts with `expected`, tolerant of Exasol's
-/// `COLUMN_TYPE` rendering quirks (whitespace, charset suffix, `DOUBLE PRECISION`
-/// -> `DOUBLE`, substituted `TIMESTAMP` precision).
+/// Prefix match tolerates Exasol's `COLUMN_TYPE` rendering (charset suffix,
+/// `DOUBLE PRECISION` -> `DOUBLE`, substituted `TIMESTAMP` precision).
 fn assert_declared_type(
     conn: &mut ExaConn,
     vs_name: &str,
@@ -761,7 +712,6 @@ fn assert_declared_type(
     );
 }
 
-/// `sql`'s first column, each cell rendered as a string.
 fn string_column<C: FromIterator<String>>(conn: &mut ExaConn, sql: &str) -> C {
     conn.query_columns(sql)[0]
         .iter()
@@ -789,12 +739,7 @@ fn declared_columns(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<Strin
     )
 }
 
-// ---------------------------------------------------------------------------
-// Fixture-shape guard
-// ---------------------------------------------------------------------------
-
-/// Reads the fixture's own Parquet footer back from MinIO (bypassing Exasol) to
-/// catch a silently normalized fixture before it lets a later read test pass vacuously.
+/// Scenario: the raw Parquet fixture is physically the types it declares
 #[test]
 fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
     setup();
@@ -846,13 +791,7 @@ fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
     assert_eq!(physical("SCORE").to_string(), "DOUBLE");
 }
 
-// ---------------------------------------------------------------------------
-// Mixed-type directory, widening, missing column, incompatible pair,
-// MERGE_SCHEMA=FALSE, Delta-directory caveat
-// ---------------------------------------------------------------------------
-
-/// `events/` declares the Arrow-to-Exasol mapping for every carried type and
-/// returns the union of its two files' rows.
+/// Scenario: `events/` declares the Arrow-to-Exasol mapping and returns both files' rows
 #[test]
 fn events_directory_declares_and_returns_mixed_types_across_both_files() {
     setup();
@@ -890,8 +829,7 @@ fn events_directory_declares_and_returns_mixed_types_across_both_files() {
     assert_eq!(parse_int(&non_null_count[0][0]), 5);
 }
 
-/// `nested/A/` and `nested/B/` union into one `NESTED` table with zero partition
-/// columns — an unlimited-depth directory contributes files, not columns.
+/// Scenario: nested subdirectories union into one table with zero partition columns
 #[test]
 fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
     setup();
@@ -917,8 +855,7 @@ fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
     assert_eq!(value_to_string(&cols[1][1]), "from-b");
 }
 
-/// `complex/`'s struct, list, and map columns declare `VARCHAR(2000000)` and
-/// render as parseable JSON.
+/// Scenario: struct, list, and map columns declare `VARCHAR(2000000)` and render as JSON
 #[test]
 fn complex_directory_declares_varchar_and_returns_parseable_json() {
     setup();
@@ -970,8 +907,7 @@ fn complex_directory_declares_varchar_and_returns_parseable_json() {
     assert!(cols[3][1].is_null(), "ATTRS row 1 must be SQL NULL");
 }
 
-/// A loose file and a data-file-less directory under the base path serve no
-/// table; `CREATE VIRTUAL SCHEMA` still succeeds.
+/// Scenario: a loose file and a data-file-less directory serve no table
 #[test]
 fn loose_file_and_empty_directory_serve_no_table() {
     setup();
@@ -982,8 +918,7 @@ fn loose_file_and_empty_directory_serve_no_table() {
     assert!(tables.contains(&"EVENTS".to_string()));
 }
 
-/// `widened/`'s columns declare the WIDER type folded across both files; every row
-/// reads back unchanged — the narrow file's values widened, the wide file's as-is.
+/// Scenario: widened columns declare the wider type and every row reads back
 #[test]
 fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
     setup();
@@ -1011,8 +946,7 @@ fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
     }
 }
 
-/// `missing_col/` declares the union of both files' columns; the row from
-/// the file lacking `B` reads NULL for it, unchanged for `A`.
+/// Scenario: a column missing from one file is declared and reads NULL there
 #[test]
 fn missing_column_declares_the_union_and_nulls_the_absent_column() {
     setup();
@@ -1032,9 +966,7 @@ fn missing_column_declares_the_union_and_nulls_the_absent_column() {
     assert_eq!(parse_int(&cols[0][2]), 3);
 }
 
-/// A column pair no supported widening covers fails `CREATE VIRTUAL SCHEMA`, naming
-/// the column and both files; uses the isolated `direct_incompatible/` root so no
-/// passing scenario shares its enumeration.
+/// Scenario: an incompatible column pair fails CREATE VIRTUAL SCHEMA naming the column and both files
 #[test]
 fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     setup();
@@ -1054,9 +986,7 @@ fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     );
 }
 
-/// Under `MERGE_SCHEMA = 'FALSE'`, `WIDENED.QTY` declares the NARROW type sampled
-/// from the first-listed file; a query never touching the out-of-range column
-/// still returns every row of both files.
+/// Scenario: `MERGE_SCHEMA = 'FALSE'` declares the sampled narrow type and a fitting projection reads all rows
 #[test]
 fn merge_schema_false_declares_the_narrow_sampled_type_and_reads_the_fitting_projection() {
     setup();
@@ -1083,9 +1013,7 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_reads_the_fitting_pro
     }
 }
 
-/// A wide-file `QTY` value that doesn't fit the narrow declared type surfaces a
-/// clean error, not a silently wrong/NULL value — proving the stale (narrow)
-/// declaration reaches the scan plan, not just the refresh path.
+/// Scenario: a value outside the stale narrow declaration surfaces a clean error
 #[test]
 fn stale_declaration_decides_the_emitted_width() {
     setup();
@@ -1102,8 +1030,7 @@ fn stale_declaration_decides_the_emitted_width() {
     );
 }
 
-/// A Delta table directory read as raw Parquet returns every file's rows, including
-/// the tombstoned one its transaction log removes — deliberate, not a defect.
+/// Scenario: a Delta directory read as raw Parquet deliberately returns tombstoned rows
 #[test]
 fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
     setup();
@@ -1122,12 +1049,7 @@ fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Discovery, NAMESPACE, CONNECTION rejection, pushdown parity
-// ---------------------------------------------------------------------------
-
-/// Only first-level directories holding a data file become tables; `NAMESPACE`
-/// scopes discovery to a subtree of the CONNECTION address.
+/// Scenario: only first-level directories with a data file become tables and `NAMESPACE` narrows to a subtree
 #[test]
 fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtree() {
     setup();
@@ -1170,8 +1092,7 @@ fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtre
     );
 }
 
-/// A CONNECTION the direct-storage kind cannot accept is rejected at `CREATE VIRTUAL
-/// SCHEMA`, naming the offending field or scheme and never a credential value.
+/// Scenario: malformed CONNECTIONs are rejected at CREATE VIRTUAL SCHEMA without leaking credentials
 #[test]
 fn malformed_connections_are_rejected_at_create_virtual_schema() {
     setup();
@@ -1264,7 +1185,6 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
         }
     }
 
-    // An unparseable MERGE_SCHEMA value likewise fails at CREATE VIRTUAL SCHEMA.
     let resp = try_create_virtual_schema_with_password(
         &mut conn,
         &direct_vs(
@@ -1278,8 +1198,7 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
     rejection_message(&resp, "an unparseable MERGE_SCHEMA value");
 }
 
-/// Projection, filter, and `LIMIT` reach the scan spec: returned rows match, and the
-/// pushed spec carries the projected columns, the predicate, and the limit.
+/// Scenario: projection, filter, and `LIMIT` reach the scan spec
 #[test]
 fn projection_filter_and_limit_reach_the_scan() {
     setup();
@@ -1311,8 +1230,7 @@ fn projection_filter_and_limit_reach_the_scan() {
     );
 }
 
-/// A single-group aggregate and a `GROUP BY` aggregate over `events/` each
-/// return the same answer the equivalent unpushed query returns.
+/// Scenario: single-group and `GROUP BY` aggregates match the unpushed answer
 #[test]
 fn group_by_aggregate_matches_the_unpushed_answer() {
     setup();
@@ -1354,9 +1272,7 @@ fn group_by_aggregate_matches_the_unpushed_answer() {
     }
 }
 
-/// An INNER equi-join between `EVENTS` and `EVENT_LABELS` on `EVENT_ID` returns
-/// exactly the unpushed join's rows, and `EXPLAIN VIRTUAL` carries ONE pushdown
-/// request naming both tables.
+/// Scenario: a two-table inner equi-join matches the unpushed answer in one pushdown request
 #[test]
 fn two_table_join_matches_the_unpushed_answer_in_one_request() {
     setup();
@@ -1411,10 +1327,6 @@ fn two_table_join_matches_the_unpushed_answer_in_one_request() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Hive partitioning: declaration, collisions, pruning, VARCHAR ordering
-// ---------------------------------------------------------------------------
-
 const SALES_2026_FILE: &str = "year=2026/month=09/p1.parquet";
 
 fn nullable_string(value: &Json) -> Option<String> {
@@ -1427,8 +1339,7 @@ fn int_column(cells: &[Json]) -> Vec<i64> {
     ids
 }
 
-/// `sales/`'s `year=`/`month=` segments declare `VARCHAR` partition columns after its Parquet
-/// columns; `__HIVE_DEFAULT_PARTITION__` reads NULL and `encoded/`'s `a%2Fb` decodes to `a/b`.
+/// Scenario: hive segments declare trailing `VARCHAR` partition columns with decoded values
 #[test]
 fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
     setup();
@@ -1488,8 +1399,7 @@ fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
     assert_eq!(regions, ["a/b"], "a partition value must percent-decode");
 }
 
-/// The plain-directory file reads NULL for `YEAR`; under `MERGE_SCHEMA = 'FALSE'` the sampled
-/// plain-directory file declares no key and the other file's key is ignored.
+/// Scenario: a mixed layout unions partition keys and nulls the missing key
 #[test]
 fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
     setup();
@@ -1528,8 +1438,7 @@ fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
     );
 }
 
-/// `collision_override/k=1/`'s directory value overrides the file's own stored `K = 99`, which
-/// only a `HIVE_PARTITIONING = 'FALSE'` schema over the same base reads.
+/// Scenario: a partition key colliding with a Parquet column overrides it
 #[test]
 fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     setup();
@@ -1571,8 +1480,7 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     );
 }
 
-/// A file storing `K` under no `k=` segment fails `CREATE VIRTUAL SCHEMA` naming column, key and
-/// file; with hive partitioning off the same base declares its table.
+/// Scenario: a colliding column in a file with no matching segment fails CREATE VIRTUAL SCHEMA
 #[test]
 fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
     setup();
@@ -1620,8 +1528,7 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
     );
 }
 
-/// Under `HIVE_PARTITIONING = 'FALSE'` a `key=value` segment is a plain directory: no table
-/// declares a partition column and no file is pruned.
+/// Scenario: `HIVE_PARTITIONING = 'FALSE'` declares no partition columns and prunes no file
 #[test]
 fn hive_partitioning_false_declares_no_partition_columns() {
     setup();
@@ -1647,8 +1554,7 @@ fn hive_partitioning_false_declares_no_partition_columns() {
     assert_eq!(parse_int(&count[0][0]), 4, "no SALES file may be pruned");
 }
 
-/// `YEAR = '2026'` and `YEAR > '2025'` each keep only the `year=2026` file in the scan Exasol is
-/// handed, and return that file's rows.
+/// Scenario: a partition filter prunes the resolved file list
 #[test]
 fn partition_filter_prunes_the_resolved_file_list() {
     setup();
@@ -1676,8 +1582,7 @@ fn partition_filter_prunes_the_resolved_file_list() {
     }
 }
 
-/// `DISCOUNT`, declared from the `year=2026` file's footer, still reads NULL when pruning keeps
-/// only the `year=2025` file, whose footer lacks it.
+/// Scenario: a column only pruned files carry reads NULL
 #[test]
 fn a_column_only_pruned_files_carry_reads_null() {
     setup();
@@ -1701,8 +1606,6 @@ fn a_column_only_pruned_files_carry_reads_null() {
     );
 }
 
-/// The regions of `REGION_VALUES` Exasol's own `VARCHAR` comparison selects for `predicate`,
-/// written over the column `R`.
 fn natively_selected_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
     let values = REGION_VALUES
         .iter()
@@ -1712,7 +1615,6 @@ fn natively_selected_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<St
     string_column(conn, &format!("SELECT R FROM ({values}) WHERE {predicate}"))
 }
 
-/// The decoded `REGION` values of the `region=<value>/p.parquet` files the pushed scan names.
 fn regions_named_by(pushed_sql: &str) -> BTreeSet<String> {
     pushed_sql
         .split("region=")
@@ -1737,8 +1639,7 @@ fn returned_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
     )
 }
 
-/// Range/`BETWEEN` pruning on `REGION` keeps exactly what Exasol's native `VARCHAR` comparison
-/// selects (pushed scan and rows); a declined conjunct beside it changes nothing.
+/// Scenario: range pruning matches Exasol's native `VARCHAR` ordering
 #[test]
 fn range_pruning_matches_exasols_native_varchar_ordering() {
     setup();
@@ -1796,7 +1697,7 @@ fn range_pruning_matches_exasols_native_varchar_ordering() {
     );
 }
 
-/// A partition predicate no file satisfies resolves zero files and returns zero rows, not an error.
+/// Scenario: a partition predicate no file satisfies returns zero rows without error
 #[test]
 fn zero_matching_files_prune_to_zero_rows_without_error() {
     setup();

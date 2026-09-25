@@ -1,79 +1,27 @@
-# Unity Catalog (native) + Delta E2E overlay — layered ON TOP of docker-compose.yml:
-#
+# Overlay on docker-compose.yml:
 #   docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
 #     minio exasol unitycatalog
-#   ./scripts/unity/seed.sh          # upload Delta fixtures, mint + inject the
-#                                     # MinIO STS session, register them in UC
-#
-# Adds a native Unity Catalog OSS server (the SECOND catalog kind in the
-# `native-unity-catalog-delta` milestone) backed by the base stack's MinIO,
-# serving Delta Lake tables (the SECOND table format). It REUSES the base
-# `minio` and `exasol` services; the only base service this overlay overrides
-# is `exasol`, and only to extend its /etc/hosts loop so the UDF can resolve
-# the new `unitycatalog` service name (same mechanism as the Lakekeeper overlay).
-#
-# --- What this stack exposes (consumed by the seed script + the future Rust
-#     harness — keep in sync with scripts/unity/seed.sh and tests/common) -------
-#   UC server (UDF-side) ...... http://unitycatalog:8080
-#   UC server (host-side) ..... http://localhost:${LH_UNITY_PORT:-18080}
-#   Auth ...................... DISABLED (UC OSS default; no token needed locally)
-#   REST base ................. /api/2.1/unity-catalog
-#   Catalog / schema .......... unity / delta_e2e            (created by seed.sh)
-#   MinIO warehouse bucket .... warehouse                    (created by base minio-init)
-#   Credential vending ........ a real MinIO STS session for s3://warehouse,
-#                               minted + injected by scripts/unity/seed.sh
-#
-# CREDENTIAL-VENDING CAVEAT (spike #325 / SPIKE_UC_DELTA_HARNESS.md):
-#   UC OSS 0.5.x has NO S3 endpoint-override config (upstream issue #43), so the
-#   `temporary-table-credentials` response carries the vended credential but NOT
-#   the MinIO endpoint. The CLIENT (our engine's ObjectStore) must inject the
-#   MinIO endpoint itself — exactly the per-side storage-routing seam already
-#   built for issue #294. The vended credential is a genuine, expiring MinIO STS
-#   session rather than a static key pair, because MinIO rejects a vended
-#   `session_token` that is not a live session and UC OSS cannot vend any
-#   credential without one (see server.properties for the full reasoning).
-#
-# Host port is env-overridable (matching the base file's convention):
-#   Unity Catalog 8080 -> ${LH_UNITY_PORT:-18080}
+#   ./scripts/unity/seed.sh
+# UC OSS 0.5.x has no S3 endpoint override (upstream #43), so the engine's
+# ObjectStore injects the MinIO endpoint for vended credentials itself.
 
 services:
   unitycatalog:
-    # Pinned rationale mirrors the base iceberg-rest pin: an unpinned tag on a
-    # core E2E dependency is a silent-CI-break risk. 0.5.0 is the current UC OSS
-    # server line. NOTE: the image is large (~5.7 GB, bundles a JDK); the CI
-    # e2e-setup free-disk step already accounts for heavy images.
     image: "${LH_UNITY_IMAGE:-unitycatalog/unitycatalog:v0.5.0}"
     depends_on:
       minio:
         condition: service_healthy
-    # The server reads etc/conf/server.properties on boot. The image's workdir is
-    # /home/unitycatalog (NOT /opt/unitycatalog as some docs state — verified by
-    # the spike), and it ships NO server.properties by default, so this mount is
-    # what turns on S3 credential vending for the `warehouse` bucket.
+    # Workdir is /home/unitycatalog (not /opt as some docs state); no default server.properties.
     volumes:
       - ./scripts/unity/server.properties:/home/unitycatalog/etc/conf/server.properties:ro
-    # The credential UC vends for s3://warehouse. UC reads a property from the
-    # environment before the file, so these three supply the (absent) file keys.
-    # They hold a real MinIO STS session that `scripts/unity/seed.sh` mints and
-    # injects by recreating this container — see server.properties for why the
-    # session must be genuine and why UC cannot obtain one itself.
-    #
-    # Pass-through form (name, no value) on purpose: an unset variable is then
-    # ABSENT from the container rather than present-but-empty. UC strips blank
-    # values only from the properties FILE, so a present-but-empty key would keep
-    # the bucket's vending entry alive with no credential in it and route UC into
-    # its STS generator — a real sts.amazonaws.com AssumeRole attempt against
-    # whatever ambient AWS credentials the host happens to carry (verified live).
-    # Absent keys instead leave the bucket unvended, which fails locally and
-    # loudly at vend time. Every value here is minted per bring-up, so nothing
-    # about the harness depends on the developer's own environment.
+    # The MinIO STS session seed.sh mints and injects. Pass-through form on
+    # purpose: a present-but-empty key would send UC to a real
+    # sts.amazonaws.com AssumeRole with the host's ambient AWS credentials.
     environment:
       - s3.accessKey.0
       - s3.secretKey.0
       - s3.sessionToken.0
-    # Alpine/busybox image: no curl, but wget is present. A 2xx on the catalogs
-    # endpoint proves the REST server is actually serving, not merely that the
-    # port is open.
+    # No curl in the image; wget is present.
     healthcheck:
       test:
         [
@@ -90,12 +38,7 @@ services:
       lakehouse:
         ipv4_address: 10.84.0.50
 
-  # OVERRIDE of the base `exasol` service — extends it, does not replace it.
-  # Exasol's exaconf rewrites /etc/hosts on startup, so the static-host loop in
-  # the entrypoint is the only channel by which the in-UDF DataFusion/catalog
-  # client resolves a docker-network service name. The base entrypoint injects
-  # minio + iceberg-rest; this overlay's UDF must also reach `unitycatalog`, so
-  # the loop is re-declared here to inject all three (each checked independently).
+  # Re-declares the base /etc/hosts loop to add unitycatalog.
   exasol:
     extra_hosts:
       - "unitycatalog:10.84.0.50"

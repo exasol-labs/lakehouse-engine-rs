@@ -1,39 +1,12 @@
-//! End-to-end integration tests for the lakehouse-engine Virtual Schema against
-//! a Lakekeeper Iceberg REST catalog — OpenID-secured via Keycloak, backed by
-//! the base stack's MinIO.
+//! E2E tests against a Lakekeeper Iceberg REST catalog, OpenID-secured via
+//! Keycloak and backed by the base stack's MinIO.
 //!
-//! These tests run against the overlay stack (Exasol + MinIO + Keycloak +
-//! Lakekeeper). They FAIL (never skip) when the stack is unavailable — per
-//! project rules, the same contract as the baseline `exasol-e2e` suite.
+//! Tests share one Exasol with two virtual schemas, so they must run serially
+//! (`--test-threads=1`). They FAIL (never skip) when the stack is unavailable.
 //!
-//! All tests share one Exasol (two virtual schemas), so they must run serially
-//! (`--test-threads=1`); the `make test-e2e-lakekeeper` target passes the flag.
-//!
-//! # What this suite proves
-//!
-//! Two DISTINCT OAuth2 client-credentials implementations reach Keycloak on the
-//! green path, and each is verified independently:
-//!   * `iceberg-catalog-rest`'s own built-in OAuth2 client — used by the
-//!     createVirtualSchema enumeration path (`lakekeeper_create_virtual_schema_lists_tables_over_oidc`).
-//!   * the adapter's own `oauth2_client_credentials_grant` — used by the
-//!     scan/file-resolution path (`lakekeeper_static_creds_projection_filter_limit`,
-//!     `lakekeeper_vended_creds_projection_filter`).
-//!
-//! Both static-credential and vended (STS/AssumeRole against MinIO) S3 read modes
-//! are exercised as hard pass/fail requirements.
-//!
-//! # Setup (done once via `setup` called from each stack-dependent test)
-//! 1. Wait for Exasol, MinIO, Keycloak, and Lakekeeper.
-//! 2. Bootstrap Lakekeeper and create the static- and vended-credential warehouses.
-//! 3. Seed the `events` table (identical 20-row shape as the baseline) into BOTH
-//!    warehouses through the OIDC-secured catalog.
-//! 4. Provision the SLC / `.so` / scripts via the SHARED harness (not redeclared).
-//! 5. Create one Virtual Schema per warehouse.
-//!
-//! # Credential safety
-//! No credential value (Keycloak client secret, bearer token, S3 access/secret
-//! keys) is ever printed by these tests; `lakekeeper_credentials_never_appear_in_output`
-//! pins the redaction contract on the failure path.
+//! Two distinct OAuth2 client-credentials implementations are verified:
+//! `iceberg-catalog-rest`'s built-in client (createVirtualSchema enumeration) and
+//! the adapter's own `oauth2_client_credentials_grant` (scan/file resolution).
 #![cfg(feature = "lakekeeper-e2e")]
 
 mod common;
@@ -69,28 +42,13 @@ use object_store::{ObjectStore, ObjectStoreExt};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Constants — the two warehouses each get their own CONNECTION + Virtual Schema.
-// ---------------------------------------------------------------------------
-
-/// Virtual Schema over the static-credential (delegation-off) warehouse.
 const VS_STATIC: &str = "LK_STATIC_LAKEHOUSE";
-/// Virtual Schema over the vended-credential (STS) warehouse.
 const VS_VENDED: &str = "LK_VENDED_LAKEHOUSE";
-/// Catalog CONNECTION for the static-credential warehouse.
 const CONN_STATIC: &str = "LK_STATIC_CATALOG_CREDS";
-/// Catalog CONNECTION for the vended-credential warehouse.
 const CONN_VENDED: &str = "LK_VENDED_CATALOG_CREDS";
 
-/// Lakekeeper catalog base URL as reached from inside the Exasol UDF container —
-/// the Docker-network name plus the `/catalog` base-path segment. This is the
-/// CONNECTION address the adapter's OAuth2 catalog path resolves the table under;
-/// preserving the `/catalog` base path through `build_load_table_url` is exactly
-/// what `lakekeeper_oauth_prefix_under_base_path_resolves` verifies.
 const LAKEKEEPER_CATALOG_URI_INTERNAL: &str = "http://lakekeeper:8181/catalog";
 
-/// Lakekeeper catalog base URL as reached from the host (mapped port), used only
-/// for host-side seeding. Same `/catalog` base path as the UDF-internal URL.
 fn lakekeeper_catalog_url_host() -> String {
     format!("http://localhost:{}/catalog", lakekeeper::lakekeeper_port())
 }
@@ -103,31 +61,20 @@ fn vs_vended_table() -> String {
     format!("{VS_VENDED}.{}", E2E_TABLE.to_uppercase())
 }
 
-// ---------------------------------------------------------------------------
-// One-time setup (shared across the serial binary).
-// ---------------------------------------------------------------------------
-
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        // 1. Readiness — fail loud, never skip.
         wait_for_exasol();
         wait_for_minio();
         lakekeeper::wait_for_keycloak();
         lakekeeper::wait_for_lakekeeper();
 
-        // 2. Bootstrap the server and create both warehouses (idempotent).
         lakekeeper::lakekeeper_bootstrap();
         lakekeeper::lakekeeper_create_warehouse(&WarehouseProfile::static_creds());
         lakekeeper::lakekeeper_create_warehouse(&WarehouseProfile::vended());
 
-        // 3. Seed the events table into BOTH warehouses through the OIDC-secured
-        //    catalog. Per the cross-module note, seeding authenticates with a
-        //    host-side Keycloak bearer token (static-token catalog auth) rather
-        //    than threading OAuth2 client-credentials through the seeder. A fresh
-        //    token is fetched per warehouse so a short token lifetime cannot make
-        //    a multi-call seed go stale mid-write.
+        // A fresh token per warehouse so a short token lifetime cannot expire mid-seed.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -157,17 +104,11 @@ fn setup() {
             });
         }
 
-        // 4. Shared-harness provisioning (SLC + .so + scripts) — REUSED, never
-        //    redeclared. `lakekeeper_binary_uses_shared_harness_provisioning`
-        //    asserts these shared scripts are what backs the scan path.
         install_slc();
         upload_so();
         let mut conn = exa_conn();
         create_schema_and_scripts(&mut conn);
 
-        // 5. One Virtual Schema per warehouse via the shared password-parameterized
-        //    helper (task 3.3), each carrying the Lakekeeper CONNECTION password and
-        //    the `/catalog` base-path catalog URI.
         let static_pw = lakekeeper_connection_password(WAREHOUSE_STATIC, false);
         create_virtual_schema_with_password(
             &mut conn,
@@ -186,11 +127,6 @@ fn setup() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Result helpers.
-// ---------------------------------------------------------------------------
-
-/// Column-major table names enumerated for a virtual schema, uppercased.
 fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
     let cols = conn.query_columns(&format!(
         "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{vs_name}'"
@@ -204,7 +140,6 @@ fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The `(id, name, score)` rows of `table`, ordered by id, as comparable tuples.
 fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
     let cols = conn.query_columns(&format!("SELECT id, name, score FROM {table} ORDER BY id"));
     assert_eq!(
@@ -229,14 +164,7 @@ fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// 5.1 — harness bootstraps Lakekeeper and provisions both warehouses.
-// ---------------------------------------------------------------------------
-
-/// Setup bootstraps Lakekeeper and creates both MinIO-backed warehouses; a
-/// Virtual Schema is created over each. Both VS existing in the catalog is the
-/// downstream proof that bootstrap + warehouse creation + seeding all succeeded
-/// (a VS cannot be created over a non-existent, unseeded warehouse).
+/// Scenario: setup bootstraps Lakekeeper and a virtual schema exists over each warehouse
 #[test]
 fn lakekeeper_bootstrap_and_warehouses_provision() {
     setup();
@@ -255,14 +183,7 @@ fn lakekeeper_bootstrap_and_warehouses_provision() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 5.2 — createVirtualSchema enumeration over the built-in OAuth2 client.
-// ---------------------------------------------------------------------------
-
-/// createVirtualSchema enumerates the seeded table over OAuth2 client-credentials
-/// auth. Enumeration runs `iceberg-catalog-rest`'s OWN built-in OAuth2 client
-/// against Keycloak (independent of the adapter's scan-time grant); the seeded
-/// `EVENTS` table appearing in the schema proves that client authenticated.
+/// Scenario: createVirtualSchema enumerates the seeded table via the built-in OAuth2 client
 #[test]
 fn lakekeeper_create_virtual_schema_lists_tables_over_oidc() {
     setup();
@@ -277,22 +198,13 @@ fn lakekeeper_create_virtual_schema_lists_tables_over_oidc() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5.3 — static-credential projection + filter + LIMIT correctness.
-// ---------------------------------------------------------------------------
-
-/// End-to-end projection + filter + LIMIT over the static-credential warehouse
-/// returns the correct rows. The scan exercises the adapter's OWN
-/// `oauth2_client_credentials_grant` (a separate OAuth2 implementation from 5.2's
-/// built-in enumeration client), then reads MinIO with the warehouse's static S3
-/// credentials.
+/// Scenario: projection + filter + LIMIT over the static-credential warehouse returns correct rows
 #[test]
 fn lakekeeper_static_creds_projection_filter_limit() {
     setup();
     let mut conn = exa_conn();
 
-    // Seeded shape (identical to the baseline): id 1..20, score = 5.0 * id.
-    // score > 15.0 → id >= 4; LIMIT 5 → ids 4,5,6,7,8.
+    // Seed: id 1..20, score = 5.0 * id.
     let cols = conn.query_columns(&format!(
         "SELECT id, name, score FROM {} WHERE score > 15.0 LIMIT 5",
         vs_static_table()
@@ -321,7 +233,6 @@ fn lakekeeper_static_creds_projection_filter_limit() {
         "id < 4 appeared (score would be <= 15): {ids:?}"
     );
 
-    // Whole-table filter + total counts pin the known seed shape.
     let filtered = conn.query_row_count(&format!(
         "SELECT id FROM {} WHERE score > 15.0",
         vs_static_table()
@@ -337,27 +248,14 @@ fn lakekeeper_static_creds_projection_filter_limit() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5.4 — vended-credential (STS/AssumeRole) projection + filter correctness. [expert]
-// ---------------------------------------------------------------------------
-
-/// End-to-end projection + filter over the VENDED-credential warehouse returns
-/// rows identical to the static warehouse's, over a CONNECTION that carries no
-/// static storage field at all.
-///
-/// The empty-static shape asserted below is the REQUIRED shape of a vended CONNECTION,
-/// not merely sufficient evidence of delegation: a static key pair would be a live
-/// credential that is never read, but a static `endpoint` or `region` would OVERRIDE
-/// the vended store address (`storage::resolved_address_field` prefers the CONNECTION
-/// value per field). With nothing to substitute for either a credential or the store
-/// address, the row set below can only have come through the
-/// `X-Iceberg-Access-Delegation: vended-credentials` request.
+/// Scenario: a vended-credential scan with no static storage field returns the static warehouse's rows
+// With no static credential or store address to fall back on, rows can only come
+// through the vended-credentials delegation.
 #[test]
 fn lakekeeper_vended_creds_projection_filter() {
     setup();
     let mut conn = exa_conn();
 
-    // The required shape: a vended CONNECTION carries no static storage field.
     let vended_pw = lakekeeper_connection_password(WAREHOUSE_VENDED, true);
     assert!(
         vended_pw.use_vended_credentials,
@@ -373,7 +271,6 @@ fn lakekeeper_vended_creds_projection_filter() {
          store address"
     );
 
-    // Same query shape as the static warehouse — results must be identical.
     let cols = conn.query_columns(&format!(
         "SELECT id, name, score FROM {} WHERE score > 15.0 LIMIT 5",
         vs_vended_table()
@@ -399,9 +296,6 @@ fn lakekeeper_vended_creds_projection_filter() {
         );
     }
 
-    // The full ordered row set read via vended creds must equal the static one:
-    // the two warehouses hold identical seed data, so vending must not corrupt or
-    // truncate the result.
     let static_rows = projection_rows(&mut conn, &vs_static_table());
     let vended_rows = projection_rows(&mut conn, &vs_vended_table());
     assert_eq!(
@@ -416,20 +310,10 @@ fn lakekeeper_vended_creds_projection_filter() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5.5 — fail-not-skip when the stack is down.
-// ---------------------------------------------------------------------------
-
-/// The Lakekeeper readiness contract is fail-loud: a readiness wait against an
-/// unreachable stack PANICS (never returns cleanly), so a down stack surfaces as
-/// a test failure, never a silent skip. This exercises the very `wait_for_url`
-/// helper the Lakekeeper readiness waits (`wait_for_keycloak` / `wait_for_lakekeeper`)
-/// are built on, pointed at a closed local port with a short deadline.
+/// Scenario: a readiness wait against an unreachable stack panics rather than skipping
 #[test]
 fn lakekeeper_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| {
-        // 127.0.0.1:1 refuses immediately; the poll loop hits the short deadline
-        // and panics rather than returning — the fail-not-skip contract.
         wait_for_url("http://127.0.0.1:1/health", Duration::from_secs(2));
     });
     assert!(
@@ -439,15 +323,7 @@ fn lakekeeper_suite_fails_when_stack_unavailable() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5.6a — the scan path is provisioned from the shared harness definition.
-// ---------------------------------------------------------------------------
-
-/// The Lakekeeper binary provisions its scan path from the SHARED harness
-/// definition (`create_schema_and_scripts` in `common/e2e_harness`), not a
-/// duplicated local one. Both the adapter and scan scripts exist under the shared
-/// schema and reference the shared `.so`, and both virtual schemas are created
-/// `USING` that shared adapter script — proving reuse rather than duplication.
+/// Scenario: both virtual schemas use the shared harness's adapter and scan scripts
 #[test]
 fn lakekeeper_binary_uses_shared_harness_provisioning() {
     setup();
@@ -468,11 +344,7 @@ fn lakekeeper_binary_uses_shared_harness_provisioning() {
         );
     }
 
-    // Both VS use the shared adapter script from the shared schema. Exasol 8
-    // (`SYS.EXA_ALL_VIRTUAL_SCHEMAS`) exposes the adapter as the split
-    // `ADAPTER_SCRIPT_SCHEMA`/`ADAPTER_SCRIPT_NAME` columns (there is no combined
-    // `ADAPTER_SCRIPT` column), so reconstruct the qualified name the assertion
-    // below checks against.
+    // Exasol 8 has no combined `ADAPTER_SCRIPT` column.
     let cols = conn.query_columns(&format!(
         "SELECT ADAPTER_SCRIPT_SCHEMA || '.' || ADAPTER_SCRIPT_NAME \
          FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS \
@@ -501,27 +373,13 @@ fn lakekeeper_binary_uses_shared_harness_provisioning() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 5.6b — OAuth2 path resolves tables under the `/catalog` base path.
-// ---------------------------------------------------------------------------
-
-/// The OAuth2 client-credentials path resolves tables from Lakekeeper's
-/// multi-warehouse catalog served under the `/catalog` base path. The CONNECTION
-/// address carries `/catalog`; a projection query returning the correct rows
-/// proves that BOTH `resolve_load_table_prefix`'s `GET /v1/config?warehouse=`
-/// negotiation and `build_load_table_url`'s base-path preservation worked against
-/// a real Lakekeeper — a malformed URL (dropped base path or mishandled
-/// per-warehouse prefix) would have failed the `loadTable` fetch and returned no
-/// rows.
+/// Scenario: the OAuth2 path resolves tables under the `/catalog` base path
 #[test]
 fn lakekeeper_oauth_prefix_under_base_path_resolves() {
     setup();
     let mut conn = exa_conn();
 
-    // The live CONNECTION address must carry the `/catalog` base-path segment.
-    // Exasol 8 exposes `CONNECTION_STRING` only via the DBA view
-    // (`SYS.EXA_DBA_CONNECTIONS`); `SYS.EXA_ALL_CONNECTIONS` no longer carries it.
-    // The suite connects as `sys` (a DBA), so the DBA view is readable.
+    // Exasol 8 exposes `CONNECTION_STRING` only via the DBA view.
     let cols = conn.query_columns(&format!(
         "SELECT CONNECTION_STRING FROM SYS.EXA_DBA_CONNECTIONS WHERE CONNECTION_NAME = '{CONN_STATIC}'"
     ));
@@ -535,7 +393,6 @@ fn lakekeeper_oauth_prefix_under_base_path_resolves() {
         "the catalog CONNECTION address must carry the `/catalog` base path, got: {address}"
     );
 
-    // Resolving + scanning under that base path returns the seeded rows.
     let cols = conn.query_columns(&format!(
         "SELECT id, name FROM {} WHERE id = 7",
         vs_static_table()
@@ -549,18 +406,7 @@ fn lakekeeper_oauth_prefix_under_base_path_resolves() {
     assert_eq!(parse_int(&cols[0][0]), 7, "resolved row must be id=7");
 }
 
-// ---------------------------------------------------------------------------
-// 5.6c — no credential value ever appears in captured output / panic messages.
-// ---------------------------------------------------------------------------
-
-/// A failing, credential-bearing Lakekeeper CONNECTION DDL executed through a
-/// redacting `ExaConn` must not surface the SQL text or any credential value
-/// (Keycloak client secret, S3 access/secret keys) in the failure output.
-///
-/// Mirrors the cloud suite's redaction negative test: obviously-fake sentinels
-/// carry the credentials, an invalid trailing token forces the DDL-failure path,
-/// and the captured panic message is asserted to contain none of the sentinels
-/// nor the SQL text.
+/// Scenario: a failing credential-bearing CONNECTION DDL leaks neither SQL text nor credentials
 #[test]
 fn lakekeeper_credentials_never_appear_in_output() {
     const SENTINEL_CLIENT_SECRET: &str = "LK_DUMMY_CLIENT_SECRET_SENTINEL";
@@ -615,15 +461,7 @@ fn lakekeeper_credentials_never_appear_in_output() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Vended-credential scope probe (issue #294 gate).
-// ---------------------------------------------------------------------------
-
-/// What one table's access-delegated `loadTable` response vends: the S3 identity
-/// the shipped resolver's selection rule picks for that table's own location.
-///
-/// Deliberately not `Debug` and never formatted as a whole — three of its fields
-/// are live credentials.
+/// Deliberately not `Debug`: three fields are live credentials.
 struct VendedProbe {
     table: &'static str,
     location: String,
@@ -636,7 +474,6 @@ struct VendedProbe {
 }
 
 impl VendedProbe {
-    /// Every value of this probe that must never reach test output.
     fn secrets(&self) -> Vec<&str> {
         let mut secrets = vec![self.access_key.as_str(), self.secret_key.as_str()];
         secrets.extend(self.session_token.as_deref());
@@ -644,7 +481,6 @@ impl VendedProbe {
     }
 }
 
-/// Split an `s3://bucket/key…` (or `s3a://…`) URI into its bucket and key parts.
 fn split_s3_uri(uri: &str) -> (String, String) {
     let rest = uri
         .strip_prefix("s3://")
@@ -656,8 +492,6 @@ fn split_s3_uri(uri: &str) -> (String, String) {
     (bucket.to_string(), key.to_string())
 }
 
-/// Issue the access-delegated `loadTable` GET for one table and read the
-/// credential source the adapter would select for that table's location.
 async fn probe_vended_credential(
     session: &CatalogSession,
     creds: &ConnectionCreds,
@@ -709,12 +543,8 @@ async fn probe_vended_credential(
     }
 }
 
-/// An S3 client signing as `probe`'s vended identity, against `bucket`.
-///
-/// The endpoint is the HOST-mapped MinIO URL rather than the `s3.endpoint`
-/// Lakekeeper vends: that one names MinIO's Docker-network address, which the
-/// test process cannot reach. Only the network address differs — the identity
-/// under test is the vended one.
+/// Uses the host-mapped MinIO URL: the vended `s3.endpoint` is a Docker-network
+/// address the test process cannot reach.
 fn s3_client_as(probe: &VendedProbe, bucket: &str) -> AmazonS3 {
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
@@ -734,9 +564,6 @@ fn s3_client_as(probe: &VendedProbe, bucket: &str) -> AmazonS3 {
         .unwrap_or_else(|e| panic!("configure a MinIO S3 client for bucket {bucket}: {e}"))
 }
 
-/// The first `.parquet` object under `key_prefix`. Iceberg writes data files as
-/// `.parquet` and metadata as `.json`/`.avro`, so the suffix alone selects a data
-/// file.
 async fn first_parquet_under(
     store: &AmazonS3,
     key_prefix: &str,
@@ -757,30 +584,10 @@ async fn first_parquet_under(
     panic!("no .parquet data file under {key_prefix}: the star-schema seed must have written one")
 }
 
-/// Whether the two star-schema tables' vended credentials differ in SCOPE — not
-/// merely in value — observed rather than assumed.
-///
-/// The broadcast-join fix carries a per-side vended backend. Whether DISCARDING
-/// the dimension side's backend is a read ERROR or merely cosmetic depends on a
-/// fact about this fixture that no documentation settles: Lakekeeper's vended
-/// MinIO user holds a BUCKET-scoped IAM policy, and whether Lakekeeper further
-/// narrows each STS session with an inline per-table-prefix policy is unverified.
-///
-/// So this test observes, in the defect's own direction: it reads the credential
-/// source each table's access-delegated `loadTable` vends, records the `prefix`
-/// that source was selected by, and then reads ONE `dim_customer` data file with
-/// `fact_orders`' vended identity — exactly what a join that keeps only the fact
-/// side's credential does. A DENIED read is what makes per-side credential
-/// carriage load-bearing; an ALLOWED read fails the suite, because it means this
-/// fixture cannot reproduce issue #294 as a read error and a green join test
-/// would conceal that.
-///
-/// Reading `dim_customer`'s file with `dim_customer`'s OWN credential first is
-/// the control: without it a denial could be a wrong key or an unreachable
-/// endpoint rather than a scope boundary.
-///
-/// No credential value reaches the report or any failure message — presence,
-/// equality, and prefixes only, with provider error text scrubbed.
+/// Scenario: fact_orders' vended credential is denied reading dim_customer's data file (#294)
+// An ALLOWED cross read means this fixture cannot reproduce #294 and a green join
+// test would prove only carriage. The own-credential control read rules out a
+// broken probe. No credential value may reach output.
 #[test]
 fn lakekeeper_vended_credentials_are_scoped_per_table() {
     setup();
@@ -809,8 +616,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
         let dim = probe_vended_credential(&session, &creds, E2E_DIM_TABLE).await;
         let secrets = [fact.secrets(), dim.secrets()].concat();
 
-        // Printed before the reads below so the observed state survives in the
-        // log even when the control read fails.
+        // Printed first so the observed state survives a failing control read.
         println!(
             "lakekeeper_vended_credentials_are_scoped_per_table:\n  \
              {} location={}\n  \
@@ -829,10 +635,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
         let dim_store = s3_client_as(&dim, &dim.bucket);
         let victim = first_parquet_under(&dim_store, &dim.key_prefix, &secrets).await;
 
-        // Bytes are drained for the same reason the cross read below drains them: a
-        // body-level failure must not leave the control green while the cross read
-        // fails for a reason other than credential scope, which would silently break
-        // the denial-vs-broken-probe discrimination this test is built on.
+        // Drained so a body-level failure cannot leave the control green.
         match dim_store.get(&victim).await {
             Ok(result) => result.bytes().await.map(|bytes| bytes.len()),
             Err(e) => Err(e),
@@ -845,9 +648,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
             )
         });
 
-        // The defect's own direction: the dimension side's file, read with the
-        // fact side's credential. Bytes are drained so a lazily-surfaced denial
-        // cannot read as success.
+        // Drained so a lazily-surfaced denial cannot read as success.
         let cross = match s3_client_as(&fact, &dim.bucket).get(&victim).await {
             Ok(result) => result.bytes().await.map(|bytes| bytes.len()),
             Err(e) => Err(e),
@@ -873,17 +674,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
     });
 }
 
-/// The broadcast join over the VENDED-credential warehouse returns the correct
-/// result: identical (as a sorted multiset) to the join computed independently
-/// from the two tables read un-joined through the same VS.
-///
-/// Reproduces issue #294 (plan `fix-broadcast-join-per-side-storage-credentials`,
-/// task 1.4): `lakekeeper_vended_credentials_are_scoped_per_table` established
-/// that this fixture DENIES a cross-table vended read, so a broadcast join that
-/// discards the dimension side's own credential and reads with the fact side's
-/// is EXPECTED to fail here with a read/credential error — that failure IS the
-/// reproduction. It must start failing this fixture's own warehouse until the
-/// per-side storage-credential fix (tasks 2-4) lands.
+/// Scenario: a broadcast join over per-table-scoped vended credentials returns correct rows (#294)
 #[test]
 fn lakekeeper_vended_broadcast_join_result_correct() {
     setup();
