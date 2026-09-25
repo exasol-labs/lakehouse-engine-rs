@@ -1,0 +1,100 @@
+# Plan Review Findings: fix-string-fn-type-coercion-udf (round 1)
+
+## Summary
+- Axes checked: 6/6
+- Total findings: 11 (Blockers: 3, Advisory: 8)
+- Intent Fidelity blockers: 0
+- Human-escalation blockers: 0
+
+## Premortem
+
+Six months from now this plan failed. These are the likely causes:
+
+1. **Empty tables return no row for an aggregate.** An analyst runs `SELECT COUNT(UPPER(c_double)) FROM t WHERE <predicate that prunes every file>`. The new classifier check routes the request to `RowScan`. The empty-result path turns a widened `RowScan` into `SELECT ... FROM DUAL WHERE 1=0`, so the query returns zero rows where Exasol returns one row with `0`. Before this plan the same request classified as `SingleGroupAgg` and returned the correct row on the empty path. The regression is silent. Routed to Requirement Quality, finding 1.
+2. **Boolean arguments fail at scan planning.** An implementer follows the first string-conversion scenario literally and renders `UPPER(a > 1)` as `upper(exa_to_varchar(...))`. `exa_to_varchar` rejects `Boolean`, and the adapter check does not see a predicate argument, so the query fails with an F-UDF error. The literal scenario of the same delta demands the CASE form for `literal_bool`, so the unit tests cannot all pass. Routed to Requirement Quality, finding 2.
+3. **The two open plans collide.** This plan deletes large parts of `adapter/pushdown/support.rs`. The `add-aws-assume-role-credentials` plan edits the same file and its two test files. Both sets of artifacts sit on the same branch. One plan's merge breaks the other. Routed to Feasibility, advisory.
+
+## Intent Fidelity
+
+No blocker. Axis checked against issue #227's body (`gh issue view 227`) and the three interview answers:
+- Planner point 1 (18 deltas): Background diffs against the recorded specs show edits limited to bullets that name removed items (`string_function_arg_type_guard`, `rewrite_decimal_stringifications`, `decimal_to_varchar_exasol`, the three-pass pipeline). `type-mapping-module-structure` changes only the consumer names in one scenario. No unrelated scope was found.
+- Planner point 2 (JSON-fallback types): justified. The issue's literal table would trim a `Decimal128(38,4)` value to `123.45`, but Exasol sees that column as the VARCHAR `123.4500` that `raw_scan::build_scan_sql` emits through `CAST(col AS VARCHAR)`. The literal table would also break a working `CAST(<time column> AS VARCHAR)`. The extension serves the issue's own gate ("all examples above return the same result as native Exasol").
+- Planner point 3 (literal render errors): consistent with the issue. The adapter check stays read-only. The render error sits in the renderer, and every surface routes it to native evaluation (`detect_group_by_aggregates`, `arg_column_or_expr`, `build_grouped_order_by_clause`, `project_columns`, `classify_where_filter` verified). The empty-path gap in finding 1 applies to this route too.
+- Planner point 4 (registration site): verified. `register_checked_float_div_udf` is called at `scan/object_store.rs:62` inside `build_session_context`. Task 3.1 and decision-log [2] name that site and add one standalone registration, per interview A2.
+- Planner point 8: no delta of this plan targets a feature that `specs/_plans/add-aws-assume-role-credentials/` also changes. Code overlap is an advisory under Feasibility.
+
+#### [INTENT_DRIFT] ADVISORY
+- Location: plan.md § Impact, "Behavior change, computed DOUBLE, BOOLEAN, or TIMESTAMP arguments"; decision-log.md [9]
+- Issue: Issue #227 § Remaining limits says a computed DOUBLE/BOOLEAN/TIMESTAMP argument "hard-fails in `exa_to_varchar` at planning time. That is a clear error, and the same as today." That is true for `UPPER` and false for `CONCAT` and a string CAST. Today `CAST(c_price * c_qty AS VARCHAR(30))` and `c_varchar || (c_double * 2)` return DataFusion's text. After this plan they fail the query. The plan discloses this correctly, but the user approved the issue's design on the premise of "the same as today".
+- Fix: Add one line to plan.md § Impact that names a concrete example (`CAST(c_price * c_qty AS VARCHAR(30))` over the DOUBLE `c_price`) and states that this availability regression needs the requester's acknowledgement before merge.
+
+## Feasibility
+
+Axis otherwise checked: `render_nested_column_as_json(&ArrayRef) -> Result<StringArray>` is `pub(crate)` in `scan/json_render.rs` and callable from a UDF. `build_session_context` is the only `SessionContext` constructor in production code. `is_boolean_producing` already covers `literal_bool`. The advertised string capabilities (`capabilities.rs:93-116`) are exactly the functions in the string-converted argument table.
+
+#### [HIDDEN_DEPENDENCY] ADVISORY
+- Location: plan.md § Dependencies ("None")
+- Issue: The user required this plan to stay separate from `add-aws-assume-role-credentials` and not affect it. That plan's group B edits `adapter/pushdown/support.rs`, `support_tests.rs`, and `pushdown_tests.rs` (its plan.md Parallelization row B). This plan deletes seven functions and their tests from the same files. Both plans' artifacts also sit untracked on branch `feat/add-aws-assume-role-credentials`. Nothing states which plan lands first or how the second one rebases.
+- Fix: In plan.md § Dependencies, name the file overlap with `add-aws-assume-role-credentials` (`support.rs`, `support_tests.rs`, `pushdown_tests.rs`), state that this plan branches from `main`, and state that whichever plan merges second rebases before its group C runs.
+
+#### [COMPLETENESS_GAP] ADVISORY
+- Location: sql-comprehension/vs-expression-translator-string-conversion § "A string-converted literal DataFusion cannot convert faithfully is a DataFusion-dialect render error"; plan.md task 2.6
+- Issue: The rule errors only on a `literal_exactnumeric` "whose value text carries a decimal point or an exponent". DataFusion's SQL number parser tries `i64`, then `u64`, and otherwise parses `f64` while `parse_float_as_decimal` is off. An integer literal outside that range (for example `123456789012345678901234`, a valid Exasol DECIMAL(36,0) literal) therefore becomes `Float64`. `CONCAT(c_varchar, 123456789012345678901234)` renders normally and then fails the query in `exa_to_varchar` instead of falling back.
+- Fix: Extend task 2.6 and the literal scenario so that an integer `literal_exactnumeric` outside the `i64` range (and above `u64::MAX`) is also a DataFusion-dialect render error, and add that case to the `unconvertible_string_converted_literal_is_a_datafusion_render_error` test.
+
+#### [NFR_IGNORED] ADVISORY
+- Location: plan.md § Impact, "Sibling project"; § Implementation Tasks
+- Issue: The change breaks `crates/vs-expression`'s DataFusion-dialect contract for its sibling-project consumer in three ways: every string function now needs a registered `exa_to_varchar`, `INSTR`/`LOCATE` beyond two arguments now errors, and the `decimal_to_varchar_exasol` node disappears. The sibling's test suite cannot catch this, and no task tracks it outside this repo. No task bumps the crate version either.
+- Fix: Add a task that opens a tracking issue in the sibling project naming the three contract changes, and a task that bumps `crates/vs-expression`'s version in its `Cargo.toml`.
+
+## Requirement Quality
+
+Axis otherwise checked: Iceberg and Delta citations. The quoted rows match `format/spec.md` § Primitive Types (`boolean` "True or false", `double` "64-bit IEEE 754 floating point", `decimal(P,S)` "Fixed-point decimal; precision P, scale S" / "Scale is fixed, precision must be 38 or less", `date`, `timestamp`, v3 `unknown`) and Delta `PROTOCOL.md` § Primitive Types (`decimal` "The precision and scale can be up to 38", `void` "A column that contains only `null` values and is never materialized in data files"). The no-deviation conclusion is sound, and the 37- and 38-digit decimal trade-off is named in both required specs.
+
+#### [COMPLETENESS_GAP] [REQUIREMENT_CONFLICT] BLOCKER
+- Location: vs-adapter/pushdown-planning-string-fn-type-coercion § "The decline check reaches GROUP BY keys, aggregate arguments, HAVING, and ORDER BY"; vs-adapter/pushdown-planning-expression-aggregate § "An aggregate over a string function resolves one shape on the empty-result path"; plan.md task 4.5; decision-log.md [4] Consequences
+- Issue: The scenario routes a non-grouped decline to `RequestShape::RowScan` "on the non-empty dispatch path and on the empty-result path", and then requires "the returned rows SHALL equal native Exasol evaluation". On the empty path that cannot hold. `empty_result.rs::empty_result_sql` answers `RequestShape::RowScan if projection_widened` with `empty_select_list_typed_sql`, which is `SELECT CAST(NULL AS <ty>) ... FROM DUAL WHERE 1=0` (pinned by `empty_result_tests.rs::empty_result_sql_widened_row_scan_uses_select_list_types`). `project_columns` widens every select list that carries an aggregate, so `SELECT COUNT(UPPER(c_double)) FROM t` over a fully pruned file list returns zero rows. Exasol returns one row holding `0`. This contradicts the recorded `vs-adapter/pushdown-planning-empty-result` scenario "Single-group aggregate with all files pruned returns one shape-correct empty row" ("exactly one row"). It is also a regression: today the renderer has no type context, so the same request classifies as `SingleGroupAgg` and `empty_agg_sql` returns the correct row. Decision-log [6] routes more shapes into the same arm: a single-group aggregate whose argument carries `INSTR`/`LOCATE` with three arguments or a fractional literal now fails `arg_column_or_expr`, so `detect_aggregates` returns `None` and the request becomes `RowScan`. Decision-log [4]'s claim "A `RowScan` route for a single-group aggregate works because `project_columns` already widens" holds only for the non-empty path.
+- Fix: Make the empty-result path return exactly one row for a non-GROUP-BY request whose select list carries an aggregate and whose shape is `RowScan`. One option is to render the original select list in the Exasol dialect over a zero-row derived table typed from the referenced columns. Another is a dedicated `RequestShape` for the declined single-group case whose empty arm renders one row. Add a DELTA:NEW scenario to `vs-adapter/pushdown-planning-string-fn-type-coercion` (or `vs-adapter/pushdown-planning-empty-result`) requiring `COUNT(UPPER(c_double))` to return one row `0` and `MAX(INSTR(c_varchar, 'b', 3))` one NULL row over a fully pruned file list. Map it to a test in `empty_result_tests.rs` and to an E2E test with a filter that prunes every file. Correct decision-log [4] Consequences, and put the fix in task 4.5.
+- Escalation: MECHANICAL. The recorded empty-result spec settles the expected result, and the codebase shows the zero-row arm.
+
+#### [REQUIREMENT_CONFLICT] [AMBIGUOUS_REQUIREMENT] BLOCKER
+- Location: sql-comprehension/vs-expression-translator-string-conversion § "String-converted function arguments render through exa_to_varchar in the DataFusion dialect", § "A string CAST renders as a cast of exa_to_varchar in the DataFusion dialect" (third AND), § "A string-converted literal DataFusion cannot convert faithfully..." (second AND), § "The string-converted argument table is one query shared with the adapter"; plan.md task 2.3; plan.md § Scenario Coverage test `string_converted_args_returns_exactly_the_wrapped_arguments`
+- Issue: The first scenario says "the translator SHALL render every string-converted argument as `exa_to_varchar(<arg>)`". The literal scenario says a string-converted `literal_bool` "SHALL render normally, the boolean one through its CASE form". For `UPPER(TRUE)` the two scenarios require different SQL, so no implementation passes both. The CAST scenario exempts a boolean-producing argument only for "a string CAST or a `CONCAT` argument". Task 2.3 says "Keep the #200 CASE form ... in the string-function arm, the CONCAT arm, and the INSTR/LOCATE arms". The current renderer applies `render_bool_to_string_case` only in `render_cast` and the CONCAT arm (`vs-expression/src/lib.rs:598` and `:1191`), so for the other string functions this is new behavior, not "keep". If the first scenario wins, `UPPER(c_a > 1)` renders as `upper(exa_to_varchar(...))` and fails at scan planning on `Boolean`. The adapter check never sees a predicate argument, so no decline happens. The table scenario also says the query returns the arguments the dialect "converts", while its test name says "wrapped". A CASE-rendered argument is converted but not wrapped.
+- Fix: In the first scenario, state that a boolean-producing string-converted argument in every arm (string functions, `INSTR`/`LOCATE`, `CONCAT`, string CAST) renders through the #200 CASE form with no `exa_to_varchar` wrapper. Align the CAST scenario's third AND and the literal scenario's second AND with that rule. Reword the table scenario to "converted, either wrapped or CASE-rendered", and rename its test to `string_converted_args_returns_exactly_the_converted_arguments`. In task 2.3, replace "Keep" with "Apply" and add a `lib_tests.rs` case for `UPPER(<predicate_less>)` and `UPPER(TRUE)`.
+- Escalation: MECHANICAL. Two scenarios of one delta conflict, and reading the renderer settles the current behavior.
+
+#### [IMPLEMENTATION_LEAKAGE] BLOCKER
+- Location: datafusion-scan/scan-execution-exa-to-varchar § Background, bullet "A NULL-typed argument is the Arrow `Null` type..."; sql-comprehension/vs-expression-translator-string-conversion § Background, bullet "The crate names the function and does not implement it..."
+- Issue: (a) The NULL bullet says the `Null` type arrives "from a NULL literal, from an Iceberg v3 `unknown` column ..., or from a Delta `void` column". The only scenario that uses it ("A NULL-typed argument converts to NULL text") depends on the NULL literal alone. The Iceberg source is also unreachable here: `types/mapping.rs::iceberg_primitive_to_exasol` matches the pinned iceberg-rust `PrimitiveType` exhaustively with no `Unknown` arm, so the crate has no such variant. No artifact checks the Delta `void` path. (b) The bullet naming `EXA_TO_VARCHAR_FN` as "the only link between the renderer and the registered implementation" backs no scenario in this spec. No string-conversion scenario mentions the constant. Only the registration scenario of `scan-execution-exa-to-varchar` does.
+- Fix: (a) Reduce the NULL bullet to "A NULL literal reaches the function as the Arrow `Null` type", and delete the Iceberg v3 `unknown` and Delta `void` sources. Keep them only if a scenario and a fixture exercise them. (b) Add an AND to the first string-conversion scenario: "the wrapper SHALL be named by the exported constant `EXA_TO_VARCHAR_FN`, and the crate SHALL NOT implement the function", or move the bullet into `scan-execution-exa-to-varchar`'s Background beside its registration scenario.
+- Escalation: MECHANICAL. Resolved by reading each delta's scenarios against its Background.
+
+#### [AMBIGUOUS_REQUIREMENT] ADVISORY
+- Location: datafusion-scan/scan-execution-exa-to-varchar § "A JSON-fallback type converts to the text the scan emits for it" and § "A DOUBLE, BOOLEAN, or TIMESTAMP argument fails at planning time"; plan.md tasks 3.2 and 3.4
+- Issue: Task 3.4 says to reuse `needs_json_fallback`. That predicate is `compatible_exasol_type(dt).is_none()`, so it is also true for `Utf8View`, `Null`, and `Float16`. If the dispatch tests it before the string, `Null`, and `Float16` arms, `Float16` converts instead of raising the specified error. `Float16` also contradicts decision-log [5]'s rule, because a `Float16` column is declared `VARCHAR(2000000)` and Exasol sees its emitted text. Neither Iceberg nor Delta produces `Float16`, so the case has no practical reach. The scan's JSON-fallback text also comes from a SQL `CAST(col AS VARCHAR)` evaluated with DataFusion's cast options. A direct `arrow::compute::cast` with arrow's default options treats invalid UTF-8 `Binary` differently.
+- Fix: In task 3.2, state the arm order: string types, then `Null`, then the `Float16`/`Float32`/`Float64`/`Boolean`/`Timestamp` error, then in-domain `Decimal128`, integers, and `Date32`, then JSON fallback. In task 3.4, state that the fallback cast uses the same cast options as DataFusion's `CAST`.
+
+## Task Breakdown
+
+Axis otherwise checked: every delta scenario maps to a task and a named test. The cited existing tests (`e2e_upper_varchar_pushdown`, `e2e_instr_arity_decline_where_matches_native_oracle`, `e2e_join_decimal_stringification_matches_native_at_both_surfaces`, `classify_exa_type_matches_pushdown_guard_predicates`, `type_rewrite_pipeline_runs_like_guard`, and 20 others) exist at the stated files. Task 5.1 is concrete enough: its named per-scenario tests gate each text-match site before merge, and because no adapter rewrite remains on the grouped path, the sites render one raw tree.
+
+#### [TASK_GRANULARITY] ADVISORY
+- Location: plan.md tasks 4.1 and 4.3; § Parallelization paragraph
+- Issue: Task 4.1 updates the rendering expectations while `string_function_arg_type_guard` and `rewrite_decimal_stringifications` are still live. Task 4.3 deletes them. A DECIMAL or DATE argument updated in 4.1 therefore pins a transitional double conversion, such as `upper(exa_to_varchar(regexp_replace(...)))`, and task 4.3 changes the same assertions again.
+- Fix: Run task 4.3 before task 4.1, or merge the expectation updates into task 4.3, and update the § Parallelization sentence that says the suites "go green again at task 4.1".
+
+#### [TRACEABILITY_GAP] ADVISORY
+- Location: plan.md task 5.1; § Scenario Coverage
+- Issue: Task 5.1 lists `parse_count_distinct` as a text-match site, but no scenario or test covers a single-group `COUNT(DISTINCT UPPER(c_custkey))`, whose distinct fan-out carries the rendered `arg_expr`.
+- Fix: Add a `single_group_agg_tests.rs` test for `COUNT(DISTINCT UPPER(c_custkey))` that asserts `upper(exa_to_varchar("C_CUSTKEY"))` in the distinct fan-out, and add its row to § Scenario Coverage.
+
+## Design Depth
+
+No objection. Axis checked: `string_converted_args` gives the renderer and the adapter check one table, and a table change reaches both readers. The constant-plus-registration split repeats `CHECKED_FLOAT_DIV_FN`. `ScanSpec` and the wire format stay unchanged. Decision-log [1] is the only `Promotes to ADR: yes` entry. It moves string conversion from the adapter to the scan session, which is an architectural change, so it passes the promotion gate. The duplicated "which types convert" knowledge (the adapter's Exasol-family pass set and the UDF's Arrow-type dispatch) is part of the issue's design, which interview A1 settled. Decision-log [4] records its one safe drift direction. The standalone registration has a scheduled revisit (#431 or #201).
+
+## Prose Quality
+
+#### [PROSE_BLOAT] ADVISORY
+- Location: plan.md § Summary, second sentence; decision-log.md [1] Alternatives and [6] Alternatives; vs-adapter/pushdown-planning-string-fn-type-coercion feature description, last sentence
+- Issue: The Summary's second sentence has about 35 words and four ideas ("moves ..., renders ..., keeps ..., and deletes ..."). Decision-log [1] Alternatives packs eight site names, a consequence, and a panic into one sentence. Decision-log [6] Alternatives contains a semicolon ("before pushdown; the decline is correct"). The feature description ends with a sentence over 30 words, and it says the check covers GROUP BY, HAVING, and aggregate arguments "on the single-table and the join paths". `classify_request_shape` does not run on the join paths.
+- Fix: Split the plan.md Summary sentence into one sentence per action. Split decision-log [1] Alternatives into the site list and the consequence. Replace the semicolon in [6] with a period. Rewrite the feature description's last sentence to say that `classify_request_shape` covers GROUP BY keys, aggregate arguments, HAVING, and ORDER BY on the single-table path, and that the type-rewrite pipeline covers the WHERE filter and the select list on the single-table and join paths.
