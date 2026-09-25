@@ -1,6 +1,6 @@
 use crate::adapter::ResolvedConnectionConfig;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage, SortKey,
     StorageBackend, render_ordered,
 };
 use exasol_udf_sdk::error::UdfError;
@@ -681,13 +681,70 @@ pub(super) fn build_side_fan_out_sql(
     ))
 }
 
-fn binds_to_projection(key: &ParsedSortKey, projection: &[ProjectionItem]) -> bool {
+fn bound_sort_key(key: &ParsedSortKey, projection: &[ProjectionItem]) -> Option<SortKey> {
     let ParsedSortKey::Column(key) = key else {
-        return false;
+        return None;
     };
     projection
         .iter()
         .any(|item| matches!(item, ProjectionItem::Column(name) if *name == key.column))
+        .then(|| key.clone())
+}
+
+struct BroadcastWindowPlacement {
+    shard_cap: Option<u64>,
+    shard_order_by: Vec<SortKey>,
+    merge_cap: Option<u64>,
+    wrapper: Option<(Vec<ParsedSortKey>, Option<u64>, u64)>,
+}
+
+/// Decides where `window`'s row bound lands: the join block, the outer merge,
+/// an outer wrapper, or nowhere. `None` means fall through to the N-scan
+/// wrapper — either the window itself, or an `Ordered` key absent from `projection`.
+fn place_broadcast_window(
+    window: JoinWindowPlan,
+    projection: &[ProjectionItem],
+) -> Option<BroadcastWindowPlacement> {
+    match window {
+        JoinWindowPlan::Unbounded => Some(BroadcastWindowPlacement {
+            shard_cap: None,
+            shard_order_by: Vec::new(),
+            merge_cap: None,
+            wrapper: None,
+        }),
+        JoinWindowPlan::BareLimit(n) => Some(BroadcastWindowPlacement {
+            shard_cap: Some(n),
+            shard_order_by: Vec::new(),
+            merge_cap: Some(n),
+            wrapper: None,
+        }),
+        JoinWindowPlan::Ordered {
+            keys,
+            limit,
+            offset,
+        } => {
+            // The projection-membership downgrade the classifier structurally cannot
+            // make: no projection exists yet at classification time, and the
+            // wrapper's ORDER BY binds against the fan-out's EMITTED columns — this
+            // path appends no hidden ones, so an unprojected key has nothing to bind
+            // to.
+            let bound_keys = keys
+                .iter()
+                .map(|key| bound_sort_key(key, projection))
+                .collect::<Option<Vec<SortKey>>>()?;
+            let (shard_cap, shard_order_by) = match (offset, limit) {
+                (0, Some(n)) => (Some(n), bound_keys),
+                _ => (None, Vec::new()),
+            };
+            Some(BroadcastWindowPlacement {
+                shard_cap,
+                shard_order_by,
+                merge_cap: None,
+                wrapper: Some((keys, limit, offset)),
+            })
+        }
+        JoinWindowPlan::ExasolPostProcessed => None,
+    }
 }
 
 /// Build the broadcast fan-out scan-driving SQL, or `None` when the request's
@@ -709,11 +766,8 @@ fn binds_to_projection(key: &ParsedSortKey, projection: &[ProjectionItem]) -> bo
 /// credential is scoped to the table it was resolved for, so the two sides' file
 /// lists must never be read through one shared storage value.
 ///
-/// `window` decides where the request's row window lands, and it lands only ever
-/// AFTER the node-local join — never on a side's scanned input, for the reason
-/// stated once in [`JoinSpec::post_join_limit`]. An unordered cap composes per
-/// shard, so it rides in the join block AND on the outer merge; an ordered window
-/// is global, so it rides on an outer wrapper with every shard left unbounded.
+/// `window` decides where the request's row window lands — see
+/// [`place_broadcast_window`] for the placement policy.
 ///
 /// Each side's `partition_columns` ride in that side's own spec block: the fact
 /// side's in the common blob, the dimension side's in this [`JoinSpec`].
@@ -725,28 +779,8 @@ pub(in super::super) fn build_broadcast_join_sql(
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
-    let (shard_cap, ordering) = match window {
-        JoinWindowPlan::Unbounded => (None, None),
-        JoinWindowPlan::BareLimit(n) => (Some(n), None),
-        JoinWindowPlan::Ordered {
-            keys,
-            limit,
-            offset,
-        } => {
-            // The projection-membership downgrade the classifier structurally cannot
-            // make: no projection exists yet at classification time, and the
-            // wrapper's ORDER BY binds against the fan-out's EMITTED columns — this
-            // path appends no hidden ones, so an unprojected key has nothing to bind
-            // to.
-            if !keys
-                .iter()
-                .all(|key| binds_to_projection(key, &rendered.projection))
-            {
-                return Ok(None);
-            }
-            (None, Some((keys, limit, offset)))
-        }
-        JoinWindowPlan::ExasolPostProcessed => return Ok(None),
+    let Some(placement) = place_broadcast_window(window, &rendered.projection) else {
+        return Ok(None);
     };
 
     let fact = &sides.fact;
@@ -761,7 +795,8 @@ pub(in super::super) fn build_broadcast_join_sql(
         name_mapping: dimension.name_mapping.clone(),
         join_type: JoinType::Inner,
         condition: rendered.condition.clone(),
-        post_join_limit: shard_cap,
+        post_join_limit: placement.shard_cap,
+        post_join_order_by: placement.shard_order_by,
         partition_columns: dimension.partition_columns.clone(),
         storage: scan_storage_for_side(&dimension.effective_storage, inputs)?,
     };
@@ -779,14 +814,14 @@ pub(in super::super) fn build_broadcast_join_sql(
         &shards,
         &rendered.projection,
         &rendered.projection_types,
-        shard_cap,
+        placement.merge_cap,
         &[],
         None,
         udf_name,
         distribute_udf_name,
     );
 
-    let Some((keys, limit, offset)) = ordering else {
+    let Some((keys, limit, offset)) = placement.wrapper else {
         return Ok(Some(fan_out));
     };
     let wrapped = wrap_declined_order_by(

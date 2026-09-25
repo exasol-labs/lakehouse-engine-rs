@@ -1336,6 +1336,7 @@ fn join_block_round_trips_through_split_and_merge() {
         join_type: JoinType::Inner,
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
         post_join_limit: None,
+        post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage: ScanStorage::Inline(dim_storage.clone()),
     });
@@ -1403,14 +1404,11 @@ fn join_block_round_trips_through_split_and_merge() {
     assert_eq!(via_struct, spec);
 }
 
-/// `post_join_limit` is additive-optional: a join block serialized without it —
-/// every one written before the field existed — loads as `None`, and a cap that
-/// IS set survives the common/per-shard split the UDF actually receives.
-#[test]
-fn join_spec_omitting_post_join_limit_deserializes_to_none() {
-    let mut spec = sample_spec();
-    let storage = spec.common.storage.clone();
-    spec.common.join = Some(JoinSpec {
+/// A minimal join block on `"F_KEY" = "D_KEY"` against one dimension file, no
+/// ordering or cap — the shared fixture the `post_join_limit` /
+/// `post_join_order_by` backward-compatibility tests mutate.
+fn sample_join_spec(storage: ScanStorage) -> JoinSpec {
+    JoinSpec {
         table_root: "s3://warehouse/db/dim".into(),
         files: vec![FileEntry::new("data/dim-00000.parquet", 512)],
         logical_schema: Vec::new(),
@@ -1418,9 +1416,20 @@ fn join_spec_omitting_post_join_limit_deserializes_to_none() {
         join_type: JoinType::Inner,
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
         post_join_limit: None,
+        post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage,
-    });
+    }
+}
+
+/// `post_join_limit` is additive-optional: a join block serialized without it —
+/// every one written before the field existed — loads as `None`, and a cap that
+/// IS set survives the common/per-shard split the UDF actually receives.
+#[test]
+fn join_spec_omitting_post_join_limit_deserializes_to_none() {
+    let mut spec = sample_spec();
+    let storage = spec.common.storage.clone();
+    spec.common.join = Some(sample_join_spec(storage));
 
     let uncapped = serde_json::to_value(spec.common.join.as_ref().unwrap()).unwrap();
     assert!(
@@ -1437,6 +1446,48 @@ fn join_spec_omitting_post_join_limit_deserializes_to_none() {
         round_tripped.common.join.unwrap().post_join_limit,
         Some(7),
         "a set cap must survive the common/per-shard split"
+    );
+}
+
+/// `post_join_order_by` is additive and defaulted like `post_join_limit`: an empty
+/// ordering emits no key, so a join block without one keeps its encoding, a join
+/// block serialized without it loads as an empty ordering, and an ordering that IS
+/// set survives the common/per-shard split the UDF actually receives.
+#[test]
+fn join_spec_omitting_post_join_order_by_deserializes_to_empty() {
+    let mut spec = sample_spec();
+    let storage = spec.common.storage.clone();
+    spec.common.join = Some(sample_join_spec(storage));
+
+    let unordered = serde_json::to_value(spec.common.join.as_ref().unwrap()).unwrap();
+    assert!(
+        unordered.get("post_join_order_by").is_none(),
+        "an empty ordering must emit no key at all: {unordered}"
+    );
+    let back: JoinSpec = serde_json::from_value(unordered).unwrap();
+    assert!(back.post_join_order_by.is_empty());
+
+    let ordering = vec![
+        SortKey {
+            column: "D_NAME".into(),
+            ascending: false,
+            nulls_last: false,
+        },
+        SortKey {
+            column: "F_KEY".into(),
+            ascending: true,
+            nulls_last: true,
+        },
+    ];
+    let join = spec.common.join.as_mut().unwrap();
+    join.post_join_order_by = ordering.clone();
+    join.post_join_limit = Some(7);
+    let round_tripped = ScanSpec::from_parts_json(&spec.to_common_json(), "[]")
+        .expect("the common blob must reconstitute");
+    assert_eq!(
+        round_tripped.common.join.unwrap().post_join_order_by,
+        ordering,
+        "a set ordering must survive the common/per-shard split, keys in order"
     );
 }
 
@@ -1463,6 +1514,7 @@ fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identi
         join_type: JoinType::Inner,
         condition: "\"F_KEY\" = \"D_KEY\"".into(),
         post_join_limit: None,
+        post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage: ScanStorage::Inline(storage),
     };
