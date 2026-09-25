@@ -30,13 +30,6 @@ The install script gains a `--deployment` flag that targets an Exasol Personal i
 * *AND* the script MUST NOT issue its own `ALTER SYSTEM SET SCRIPT_LANGUAGES`, because the launcher owns that registration, and the SCRIPT_LANGUAGES entries other than `RUST` MUST survive
 * *AND* the version smoke test MUST still run
 
-### Scenario: --skip-slc on a local deployment replaces only the engine
-
-* *GIVEN* a local deployment whose `RUST` custom SLC is already installed
-* *WHEN* the install script is invoked with `--skip-slc`
-* *THEN* the script MUST NOT download the SLC or run any `exasol slc custom` command, so the database is not restarted
-* *AND* the engine `.so` MUST still be written and the scripts created
-
 ### Scenario: A local deployment rejects BucketFS HTTP flags
 
 * *GIVEN* a local deployment

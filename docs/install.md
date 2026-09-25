@@ -102,7 +102,7 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
     apply.
   - It installs the Rust SLC with `exasol slc custom install` (or `update` when a `RUST` custom
     SLC already exists). The launcher registers the `RUST` language itself and restarts the
-    database. `--skip-slc` skips this step, so an engine-only upgrade needs no restart.
+    database.
 
   This path needs the `exasol` launcher CLI on PATH. Architecture auto-detects from the host's
   `uname -m` unless you pass `--arch` explicitly. Personal-local on Apple Silicon auto-detects as
