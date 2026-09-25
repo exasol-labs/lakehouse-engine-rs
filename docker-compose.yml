@@ -8,7 +8,9 @@
 
 services:
   minio:
-    image: quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z
+    # quay.io/minio and Docker Hub's minio/minio now require a subscription;
+    # pgsty/silo is a public, protocol-compatible MinIO fork.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
@@ -30,8 +32,8 @@ services:
         ipv4_address: 10.84.0.10
 
   minio-init:
-    # Pinned (was :latest) — same rationale as the iceberg-rest-fixture pin below.
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    # pgsty/mc mirrors mc — see the `minio` service comment above.
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
       minio:
         condition: service_healthy
