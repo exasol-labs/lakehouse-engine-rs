@@ -76,7 +76,7 @@ impl CapturingCtx {
 }
 
 impl exasol_udf_sdk::context::UdfContext for CapturingCtx {
-    fn num_columns(&self) -> usize {
+    fn input_column_count(&self) -> usize {
         0
     }
     fn get(&self, _col: usize) -> Result<&Value, exasol_udf_sdk::error::UdfError> {

@@ -28,10 +28,14 @@ example is a network with no path to GitHub.
   profile, plus any `--bfs-*` overrides you give. If `exapump` is missing, the install script
   offers to fetch and install it for you via its own public installer (auto-confirmed when there
   is no terminal to ask, e.g. the one-liner below) — you still need to configure a profile
-  afterward.
+  afterward. A local Exasol Personal deployment needs the `exapump` binary but no profile: the
+  connection resolves from the deployment directory.
 - `jq`, but only if you use `--deployment` to target an Exasol Personal deployment. It parses the
   deployment descriptor (`deployment.json`) to resolve connection details and backend. SaaS and
   BucketFS targets don't need it.
+- The Exasol Personal [`exasol` launcher CLI](https://github.com/exasol/exasol-personal), but only
+  for a local Exasol Personal deployment (2.3+). The install script requires it even with
+  `--skip-slc`, and otherwise installs the Rust SLC with `exasol slc custom`.
 
 ## Install with one command
 
@@ -89,10 +93,11 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
 | bash -s -- --deployment my-local-db
 ```
 
-- A **local** deployment (running on this machine) has no BucketFS HTTP endpoint, so the script
-  installs over SSH instead, using the deployment's own node key. Architecture auto-detects from
-  the host's `uname -m` unless you pass `--arch` explicitly — Personal-local on Apple Silicon
-  auto-detects as `aarch64`.
+- A **local** deployment (Exasol Personal 2.3+, running on this machine) has no BucketFS HTTP
+  endpoint, so the script writes the engine into the deployment's BucketFS directory and installs
+  the SLC with `exasol slc custom`. This needs the `exasol` CLI on PATH. Architecture
+  auto-detects from the host's `uname -m` unless you pass `--arch` explicitly — Personal-local on
+  Apple Silicon auto-detects as `aarch64`.
 - A **cloud** deployment (backend other than `local`) uses the existing BucketFS HTTP upload path
   and needs `--bfs-write-password`, since Exasol Personal provisions no BucketFS password for you:
 
@@ -131,16 +136,16 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--account-id <id>` | SaaS target only. SaaS account ID, from the SaaS web console. |
 | `--database-id <id>` | SaaS target only. SaaS database ID, from the SaaS web console. |
 | `--staging` | SaaS target only. Targets `cloud-staging.exasol.com` instead of `cloud.exasol.com`. |
-| `--bfs-host <host>` | BucketFS target only. Default: the profile's `bfs_host`, else its host. |
-| `--bfs-port <port>` | BucketFS target only. Default: the profile's `bfs_port`, else `2581`. |
-| `--bfs-bucket <name>` | BucketFS target only. Default: `default`. |
-| `--bfs-write-password <p>` | BucketFS target only. Default: the profile's `bfs_write_password`. |
+| `--bfs-host <host>` | BucketFS target only. Default: the profile's `bfs_host`, else its host. Rejected for a local Exasol Personal deployment. |
+| `--bfs-port <port>` | BucketFS target only. Default: the profile's `bfs_port`, else `2581`. Rejected for a local Exasol Personal deployment. |
+| `--bfs-bucket <name>` | BucketFS target only, including a local Exasol Personal deployment. Default: `default`. |
+| `--bfs-write-password <p>` | BucketFS target only. Default: the profile's `bfs_write_password`. Rejected for a local Exasol Personal deployment. |
 | `--target <saas\|bucketfs>` | Both targets. Asserts the target you expect. If it does not match the detected target, the command stops with an error. |
 | `--schema <name>` | Both targets. Default: `LHVS`. |
 | `--lakehouse-version <v>` | Both targets. Pins the engine version. Default: latest release. |
-| `--slc-version <v>` | Both targets. Pins the SLC version. Default: latest release. |
+| `--slc-version <v>` | Both targets. Pins the SLC version. Default: the version the engine release pins through its `exasol-udf-sdk` dependency. |
 | `--skip-slc` | Both targets. Skips the SLC download and registration. Every other step still runs. |
-| `--arch <x86_64\|aarch64>` | Both targets. Default: `x86_64`. Selects unsuffixed vs `-aarch64`-suffixed release assets. |
+| `--arch <x86_64\|aarch64>` | Both targets. Default: `x86_64`, or the host's architecture for a local Exasol Personal deployment. Selects unsuffixed vs `-aarch64`-suffixed release assets. |
 | `--help` | Prints this reference. Needs no network access and no credentials. |
 
 `--account-id` and `--database-id` together select the SaaS target. Neither flag selects the
