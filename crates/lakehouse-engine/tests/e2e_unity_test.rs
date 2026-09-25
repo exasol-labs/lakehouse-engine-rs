@@ -1849,17 +1849,16 @@ fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
         "createVirtualSchema must enumerate 'sales_parquet'"
     );
     let cols = column_types(&mut conn, VS_NAME, "SALES_PARQUET");
-    let declared: Vec<(&str, &str)> = cols.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+    let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
-        declared,
-        [
-            ("ID", "DECIMAL(20,0)"),
-            ("AMOUNT", "DOUBLE"),
-            ("YEAR", "DECIMAL(10,0)"),
-            ("REGION", "VARCHAR(2000000)")
-        ],
+        names,
+        ["ID", "AMOUNT", "YEAR", "REGION"],
         "Parquet columns must precede partition columns, in declared order"
     );
+    assert_col_type(&cols, "ID", "DECIMAL(20,0)");
+    assert_col_type(&cols, "AMOUNT", "DOUBLE");
+    assert_col_type(&cols, "YEAR", "DECIMAL(10,0)");
+    assert_col_type(&cols, "REGION", "VARCHAR(2000000)");
 
     let cols = conn.query_columns(&format!(
         "SELECT ID, AMOUNT, \"YEAR\", REGION FROM {} ORDER BY ID",
