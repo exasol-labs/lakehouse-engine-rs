@@ -398,7 +398,8 @@ STUB
 }
 
 write_exasol_stub() {
-  cat > "$1/exasol" <<'STUB'
+  local dir="$1"
+  cat > "$dir/exasol" <<'STUB'
 #!/usr/bin/env bash
 printf 'exasol %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
 case "$1 $2" in
@@ -416,7 +417,8 @@ case "$1 $2" in
 esac
 exit 0
 STUB
-  chmod +x "$1/exasol"
+  chmod +x "$dir/exasol"
+  return 0
 }
 
 write_exapump_stub "$STUBDIR"
@@ -2441,6 +2443,7 @@ deployment_local_selects_launcher() {
     "udf_object=buckets/bfsdefault/mybucket/udf/liblakehouse_engine.so"
   assert_contains "launcher deployment: the bucket is a directory under local/runtime/exa/bucketfs" "$out" \
     "bucket_dir=$dir/local/runtime/exa/bucketfs/bfsdefault/mybucket"
+  return 0
 }
 
 # Scenario: a local deployment rejects BucketFS HTTP flags and unsafe bucket names
@@ -2477,6 +2480,7 @@ deployment_local_rejects_bfs_flags() {
   rc=$?
   assert_rc_nonzero "local deployment with --bfs-bucket ..: nonzero exit" "$rc"
   assert_contains "local deployment with --bfs-bucket ..: error names --bfs-bucket" "$out" "--bfs-bucket"
+  return 0
 }
 
 # Scenario: a local deployment requires the exasol launcher CLI
@@ -2485,8 +2489,13 @@ deployment_local_requires_exasol_cli() {
   local out rc
   out="$(
     source "$INSTALLER"
-    # shellcheck disable=SC2329  # shadows the sourced have_cmd, called from check_prereqs
-    have_cmd() { [[ "$1" != "exasol" ]] && command -v "$1" >/dev/null 2>&1; }
+    # shellcheck disable=SC2317,SC2329  # shadows the sourced have_cmd, called from check_prereqs
+    have_cmd() {
+      local cmd="$1"
+      [[ "$cmd" != "exasol" ]] || return 1
+      command -v "$cmd" >/dev/null 2>&1
+      return $?
+    }
     PATH="$STUBDIR:$ORIG_PATH"
     TARGET_MODE="bucketfs"
     DEPLOYMENT_TRANSPORT="launcher"
@@ -2495,6 +2504,7 @@ deployment_local_requires_exasol_cli() {
   rc=$?
   assert_rc_nonzero "no exasol CLI: check_prereqs fails" "$rc"
   assert_contains "no exasol CLI: error names the launcher CLI" "$out" "'exasol'"
+  return 0
 }
 
 # Drives main() through the launcher transport under a sandboxed HOME.
@@ -2509,6 +2519,7 @@ run_launcher_deployment() {
   run_file --deployment "$dep_name" --arch aarch64 "$@"
   export HOME="$saved_home"
   LAUNCHER_DEP_DIR="$fake_home/.exasol/personal/deployments/$dep_name"
+  return 0
 }
 
 # Scenario: a launcher install installs the plain SLC via exasol slc custom and writes the .so into BucketFS
@@ -2540,6 +2551,7 @@ deployment_launcher_installs_slc_and_engine() {
   else
     pass "launcher install: no partial file is left behind"
   fi
+  return 0
 }
 
 # Scenario: an already-installed RUST custom SLC is replaced via exasol slc custom update
@@ -2552,6 +2564,7 @@ deployment_launcher_updates_existing_slc() {
   local log; log="$(log_content)"
   assert_contains "launcher update: updates the RUST custom SLC" "$log" "exasol slc custom update --alias RUST"
   assert_not_contains "launcher update: does not re-install" "$log" "exasol slc custom install"
+  return 0
 }
 
 # Scenario: --skip-slc on a local deployment replaces only the engine .so
@@ -2569,6 +2582,7 @@ deployment_launcher_skip_slc_installs_engine_only() {
   else
     fail "launcher --skip-slc: the engine .so is still written"
   fi
+  return 0
 }
 
 # Scenario: launcher and bucket-registration failures stop the install with an actionable message
@@ -2594,6 +2608,7 @@ deployment_launcher_failures_are_actionable() {
   assert_rc_nonzero "unregistered bucket: nonzero exit" "$LAST_RC"
   assert_contains "unregistered bucket: error names the bucket" "$LAST_OUT" "bfsdefault/unregistered"
   assert_not_contains "unregistered bucket: no scripts are created" "$(log_content)" "CREATE OR REPLACE RUST"
+  return 0
 }
 
 main() {
