@@ -392,6 +392,21 @@ jobs:
       - name: Unit tests (stubbed exapump/curl, no network)
         run: make test-install
 
+  # The one-liner runs under stock macOS /bin/bash (3.2) for every Exasol Personal user; the
+  # runner's PATH bash is Homebrew's 5.x, so the shim pins the suite and its stubs to /bin/bash.
+  install-script-macos-bash32:
+    name: Install Script (macOS bash 3.2)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Unit tests under /bin/bash 3.2
+        run: |
+          mkdir -p "$RUNNER_TEMP/bash32"
+          ln -sf /bin/bash "$RUNNER_TEMP/bash32/bash"
+          /bin/bash --version | head -1
+          PATH="$RUNNER_TEMP/bash32:$PATH" /bin/bash deploy/scripts/tests/install.test.sh
+
   # ── install script: real end-to-end run against a live BucketFS Exasol ──
   # Proves the BucketFS target (Exasol AsApp/Docker/on-premise all speak the same
   # BucketFS HTTP interface) against a REAL Exasol, using a REAL prior

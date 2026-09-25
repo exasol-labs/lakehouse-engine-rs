@@ -59,6 +59,13 @@ VM_RECONCILE_POLL_SECONDS=2
 # BUCKETFS_REACHABLE_POLL_SECONDS=0 exercises the exact same production code path fast.
 BUCKETFS_REACHABLE_TRIES="${BUCKETFS_REACHABLE_TRIES:-30}"
 BUCKETFS_REACHABLE_POLL_SECONDS="${BUCKETFS_REACHABLE_POLL_SECONDS:-2}"
+# Exasol Personal 2.3+ local deployments publish no SSH inputs and hide the shared BucketFS
+# directory from UDFs, so the SLC goes in through `exasol slc custom install|update` and the
+# engine .so rides inside the SLC's own rootfs, addressed by its in-container path.
+LAUNCHER_SLC_ALIAS="RUST"
+LAUNCHER_SLC_LANGUAGE="rust"
+LAUNCHER_SO_ROOTFS_DIR="udf"
+LAUNCHER_SO_UDF_OBJECT="/$LAUNCHER_SO_ROOTFS_DIR/liblakehouse_engine.so"
 SSH_OPTIONS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
   -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 
@@ -383,6 +390,11 @@ deployment_key_path() {
   printf '%s\n' "$1/$NODE_KEY_RELATIVE_PATH"
 }
 
+# Selected from the inputs the SSH transport consumes, never from a Personal version string.
+deployment_supports_ssh() {
+  deployment_ssh_port "$1" >/dev/null 2>&1 && [[ -r "$(deployment_key_path "$1")" ]]
+}
+
 deployment_db_password() {
   read_descriptor_field "$1/$SECRETS_DESCRIPTOR" '.dbPassword'
 }
@@ -490,8 +502,12 @@ Both modes:
                             -aarch64-suffixed release assets
   --deployment <name>       target an Exasol Personal deployment by name, resolving connection and
                             backend from $HOME/.exasol/personal/deployments/<name>/deployment.json;
-                            local backend installs over SSH, cloud backend falls through to the
-                            BucketFS HTTP path above (--bfs-write-password required for cloud)
+                            local backend installs over SSH when the deployment publishes an SSH
+                            port and node key (Personal < 2.3), otherwise through the `exasol`
+                            launcher's `slc custom install|update` with the engine bundled into
+                            the SLC (Personal 2.3+; --skip-slc unsupported there); cloud backend
+                            falls through to the BucketFS HTTP path above (--bfs-write-password
+                            required for cloud)
   --help                    show this help
 
 Examples:
@@ -704,23 +720,31 @@ resolve_deployment_transport() {
     return 0
   fi
 
+  resolve_deployment_connection "$DEPLOYMENT_DIR" "$PERSONAL_DB_HOST_DEFAULT" || return 1
+  if [[ "$ARG_ARCH_SET" -eq 0 ]]; then
+    ARG_ARCH="$(detect_host_arch)" || return 1
+  fi
+  if ! deployment_supports_ssh "$DEPLOYMENT_DIR"; then
+    DEPLOYMENT_TRANSPORT="launcher"
+    if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
+      err "--skip-slc is not supported for '$ARG_DEPLOYMENT': this deployment publishes no SSH inputs, so the engine .so is installed inside the Rust SLC via 'exasol slc custom', and installing the engine always re-installs the SLC."
+      return 1
+    fi
+    have_cmd exasol || {
+      err "deployment '$ARG_DEPLOYMENT' supports neither local install mechanism: SSH needs a numeric '.connection.sshPort' in $DEPLOYMENT_DESCRIPTOR and a readable $NODE_KEY_RELATIVE_PATH (Exasol Personal < 2.3), and the launcher mechanism needs the 'exasol' CLI on PATH (Exasol Personal 2.3+)."
+      return 1
+    }
+    log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND' and publishes no SSH inputs: installing $ARG_ARCH artifacts through 'exasol slc custom' with the engine bundled into the Rust SLC."
+    return 0
+  fi
+
   DEPLOYMENT_TRANSPORT="ssh"
   if [[ ! "$ARG_BFS_BUCKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
     err "--bfs-bucket '$ARG_BFS_BUCKET' is not a valid bucket name: it names the directory inside the deployment VM's BucketFS that the SSH transport replaces, and is interpolated into a remote command, so it must match [A-Za-z0-9._-]+."
     return 1
   fi
-  resolve_deployment_connection "$DEPLOYMENT_DIR" "$PERSONAL_DB_HOST_DEFAULT" || return 1
-  if ! DEPLOYMENT_SSH_PORT="$(deployment_ssh_port "$DEPLOYMENT_DIR")"; then
-    return 1
-  fi
+  DEPLOYMENT_SSH_PORT="$(deployment_ssh_port "$DEPLOYMENT_DIR")" || return 1
   DEPLOYMENT_KEY_PATH="$(deployment_key_path "$DEPLOYMENT_DIR")"
-  if [[ ! -r "$DEPLOYMENT_KEY_PATH" ]]; then
-    err "no readable node key at '$DEPLOYMENT_KEY_PATH'. Exasol Personal writes it when the deployment is created; check that '$ARG_DEPLOYMENT' is a local deployment created by this user."
-    return 1
-  fi
-  if [[ "$ARG_ARCH_SET" -eq 0 ]]; then
-    ARG_ARCH="$(detect_host_arch)" || return 1
-  fi
   log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND': installing $ARG_ARCH artifacts over SSH into the deployment VM (ssh port $DEPLOYMENT_SSH_PORT)."
   return 0
 }
@@ -756,6 +780,9 @@ resolve_target_layout() {
       TARGET_RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///$BFS_SERVICE/$ARG_BFS_BUCKET/slc/lakehouse-rustslc?lang=rust#buckets/$BFS_SERVICE/$ARG_BFS_BUCKET/slc/lakehouse-rustslc/exaudf/exaudfclient"
       TARGET_SLC_BFS_PATH="$BFS_SLC_PATH"
       TARGET_ENGINE_BFS_PATH="$BFS_ENGINE_SO_PATH"
+      if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+        TARGET_SO_UDF_OBJECT="$LAUNCHER_SO_UDF_OBJECT"
+      fi
       ;;
     saas|*)
       TARGET_SO_UDF_OBJECT="$ENGINE_SO_PATH"
@@ -812,6 +839,9 @@ check_prereqs() {
   if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
     have_cmd ssh || { err "required tool 'ssh' not found on PATH. An Exasol Personal deployment with the '$LOCAL_BACKEND' backend exposes no BucketFS HTTP endpoint, so artifacts travel to its VM over SSH."; ok=0; }
     have_cmd scp || { err "required tool 'scp' not found on PATH. An Exasol Personal deployment with the '$LOCAL_BACKEND' backend exposes no BucketFS HTTP endpoint, so artifacts travel to its VM over SSH."; ok=0; }
+  fi
+  if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+    have_cmd gzip || { err "required tool 'gzip' not found on PATH. It repacks the Rust SLC with the engine .so bundled inside. Install it via your OS package manager."; ok=0; }
   fi
   [[ "$ok" -eq 1 ]]
 }
@@ -1227,6 +1257,76 @@ vm_wait_for_reconciled_path() {
   return 1
 }
 
+# Runs the Exasol Personal launcher against this run's deployment directory.
+exasol_launcher() {
+  exasol "$@" --deployment-dir "$DEPLOYMENT_DIR" </dev/null
+}
+
+launcher_slc_list() {
+  local out
+  if ! out="$(exasol_launcher slc list --json 2>&1)"; then
+    err "'exasol slc list' failed for deployment '$ARG_DEPLOYMENT'. Check that it is running ('exasol status'). exasol said: $out"
+    return 1
+  fi
+  printf '%s\n' "$out"
+}
+
+# Prints "update" when a custom SLC with the RUST alias is already installed, else "install".
+launcher_slc_action() {
+  local list installed
+  list="$(launcher_slc_list)" || return 1
+  if ! installed="$(jq -r --arg alias "$LAUNCHER_SLC_ALIAS" \
+      '[.[] | select(.type == "custom" and .alias == $alias)] | length' <<<"$list" 2>&1)"; then
+    err "could not parse 'exasol slc list --json' output. jq said: $installed"
+    return 1
+  fi
+  if [[ "$installed" -gt 0 ]]; then printf 'update\n'; else printf 'install\n'; fi
+}
+
+# Appends ./udf/liblakehouse_engine.so to the SLC tarball rather than extracting and repacking
+# it: a Linux rootfs does not survive a round trip through a case-insensitive macOS filesystem.
+bundle_engine_into_slc() {
+  local slc_tarball="$1" so_path="$2" dest="$3" stage="$WORKDIR/bundle-stage" plain="$WORKDIR/bundle.tar" out
+  if ! out="$(mkdir -p "$stage/$LAUNCHER_SO_ROOTFS_DIR" 2>&1 && cp "$so_path" "$stage$LAUNCHER_SO_UDF_OBJECT" 2>&1 && chmod 0755 "$stage/$LAUNCHER_SO_ROOTFS_DIR" && chmod 0644 "$stage$LAUNCHER_SO_UDF_OBJECT")"; then
+    err "could not stage the engine .so for bundling into the Rust SLC: $out"
+    return 1
+  fi
+  if ! out="$(gzip -dc "$slc_tarball" 2>&1 >"$plain")"; then
+    err "could not decompress the Rust SLC archive '$slc_tarball': $out"
+    return 1
+  fi
+  if ! out="$(COPYFILE_DISABLE=1 tar --no-xattrs -rf "$plain" -C "$stage" "./$LAUNCHER_SO_ROOTFS_DIR" 2>&1)"; then
+    err "could not append the engine .so to the Rust SLC archive: $out"
+    return 1
+  fi
+  if ! out="$(gzip -c "$plain" 2>&1 >"$dest")"; then
+    err "could not recompress the bundled Rust SLC archive: $out"
+    return 1
+  fi
+  rm -f "$plain"
+  return 0
+}
+
+deploy_personal_launcher() {
+  local so_path bundle="$WORKDIR/rustslc-with-engine.tar.gz" action out
+  log "Installing Rust SLC $RESOLVED_SLC_VERSION with lakehouse-engine $RESOLVED_ENGINE_VERSION bundled, via 'exasol slc custom' ..."
+  download_slc || return 1
+  download_engine || return 1
+  if ! so_path="$(extract_engine_so "$WORKDIR/$ENGINE_ASSET" "$WORKDIR/extracted")"; then
+    return 1
+  fi
+  bundle_engine_into_slc "$WORKDIR/rustslc.tar.gz" "$so_path" "$bundle" || return 1
+  action="$(launcher_slc_action)" || return 1
+  log "Running 'exasol slc custom $action --alias $LAUNCHER_SLC_ALIAS' (restarts the database) ..."
+  if ! out="$(exasol_launcher slc custom "$action" --alias "$LAUNCHER_SLC_ALIAS" \
+      --language "$LAUNCHER_SLC_LANGUAGE" --source "$bundle" --auto-approve 2>&1)"; then
+    err "'exasol slc custom $action' failed for deployment '$ARG_DEPLOYMENT'. exasol said: $out"
+    return 1
+  fi
+  create_engine_scripts || return 1
+  return 0
+}
+
 # --- Upload dispatch ---------------------------------------------------------
 # The ONE seam between the two target modes: SaaS addresses an upload by its files-API key,
 # BucketFS by its bucket-relative path. Each mode ignores the other's argument.
@@ -1563,14 +1663,17 @@ print_next_step_template() {
   emit ""
   emit "-- Grant the VS OWNER's scripts CONNECTION access (BEFORE CREATE VIRTUAL SCHEMA). See docs/security.md."
   emit ""
-  if [[ "${installing_user,,}" == "sys" ]]; then
-    emit "-- SYS holds every CONNECTION implicitly; skip the grants."
-  else
-    emit "CREATE ROLE $role;"
-    emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
-    emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
-    emit "GRANT $role TO $installing_user;"
-  fi
+  case "$installing_user" in
+    [Ss][Yy][Ss])
+      emit "-- SYS holds every CONNECTION implicitly; skip the grants."
+      ;;
+    *)
+      emit "CREATE ROLE $role;"
+      emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_ADAPTER TO $role;"
+      emit "GRANT ACCESS ON CONNECTION LAKEHOUSE_CATALOG_CREDS FOR SCRIPT $schema.LAKEHOUSE_SCAN TO $role;"
+      emit "GRANT $role TO $installing_user;"
+      ;;
+  esac
   emit ""
   emit "CREATE VIRTUAL SCHEMA <MY_LAKEHOUSE>"
   emit "USING $schema.LAKEHOUSE_ADAPTER WITH"
@@ -1623,6 +1726,8 @@ main() {
     bucketfs)
       if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
         ssh_vm_reachable || exit 1
+      elif [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+        launcher_slc_list >/dev/null || exit 1
       else
         validate_bucketfs_required || exit 1
         # shellcheck disable=SC2119  # tries/sleep_seconds default; see bucketfs_reachable
@@ -1640,6 +1745,8 @@ main() {
   resolve_versions || exit 1
   if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
     deploy_personal_local || exit 1
+  elif [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+    deploy_personal_launcher || exit 1
   else
     if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
       log "Skipping SLC registration (--skip-slc)."

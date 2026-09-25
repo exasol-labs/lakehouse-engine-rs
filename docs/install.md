@@ -32,6 +32,8 @@ example is a network with no path to GitHub.
 - `jq`, but only if you use `--deployment` to target an Exasol Personal deployment. It parses the
   deployment descriptor (`deployment.json`) to resolve connection details and backend. SaaS and
   BucketFS targets don't need it.
+- The `exasol` launcher CLI, but only for a local Exasol Personal 2.3+ deployment. That version
+  installs the Rust SLC through `exasol slc custom`, which the launcher alone can run.
 
 ## Install with one command
 
@@ -89,10 +91,21 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
 | bash -s -- --deployment my-local-db
 ```
 
-- A **local** deployment (running on this machine) has no BucketFS HTTP endpoint, so the script
-  installs over SSH instead, using the deployment's own node key. Architecture auto-detects from
-  the host's `uname -m` unless you pass `--arch` explicitly — Personal-local on Apple Silicon
-  auto-detects as `aarch64`.
+- A **local** deployment (running on this machine) has no BucketFS HTTP endpoint. The script
+  picks one of two mechanisms from the deployment directory's contents, not from a version
+  string. Architecture auto-detects from the host's `uname -m` unless you pass `--arch`
+  explicitly. Personal-local on Apple Silicon auto-detects as `aarch64`.
+  - **Exasol Personal 2.3 and later** publishes no SSH port and no node key. UDFs also cannot see
+    files dropped into the deployment's shared BucketFS directory. The script therefore appends
+    the engine `.so` to the Rust SLC tarball at `udf/liblakehouse_engine.so` and installs the
+    bundle with `exasol slc custom install` (or `update` when a `RUST` custom SLC already exists).
+    The scripts load the `.so` from its in-container path, `%udf_object /udf/liblakehouse_engine.so`.
+    The launcher registers the `RUST` language itself and restarts the database. This path needs the
+    `exasol` launcher CLI on PATH, and it rejects `--skip-slc` because every engine install
+    re-installs the SLC.
+  - **Earlier Personal versions** publish `connection.sshPort` in `deployment.json` and a node key
+    at `local/node_access.pem`. When both exist, the script installs over SSH into the VM's
+    BucketFS directory, as before.
 - A **cloud** deployment (backend other than `local`) uses the existing BucketFS HTTP upload path
   and needs `--bfs-write-password`, since Exasol Personal provisions no BucketFS password for you:
 
@@ -127,7 +140,7 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--profile <name>` | An `exapump` named profile. One of three connectivity flags. Give exactly one. |
 | `--dsn <dsn>` | A direct `exapump` DSN. You can set `EXAPUMP_DSN` instead. |
 | `--host <host:port> --user <u> --password <p>` | A direct connection. `--host` must include the port. There is no separate `--port` flag. |
-| `--deployment <name>` | Target an Exasol Personal deployment by name. Resolves connection from `~/.exasol/personal/deployments/<name>/`. Cannot be combined with `--profile`, `--dsn`, `--host`, or `--account-id`/`--database-id`. Requires `jq`. |
+| `--deployment <name>` | Target an Exasol Personal deployment by name. Resolves connection from `~/.exasol/personal/deployments/<name>/`. Cannot be combined with `--profile`, `--dsn`, `--host`, or `--account-id`/`--database-id`. Requires `jq`, and the `exasol` launcher CLI on Personal 2.3+ local deployments. |
 | `--account-id <id>` | SaaS target only. SaaS account ID, from the SaaS web console. |
 | `--database-id <id>` | SaaS target only. SaaS database ID, from the SaaS web console. |
 | `--staging` | SaaS target only. Targets `cloud-staging.exasol.com` instead of `cloud.exasol.com`. |

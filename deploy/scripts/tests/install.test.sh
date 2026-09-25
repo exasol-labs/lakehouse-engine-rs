@@ -81,8 +81,9 @@ command -v python3 >/dev/null 2>&1 || {
 # the other run_* helpers.
 run_with_pty() {
   local reply="$1"; shift
-  local py_out
-  py_out="$(python3 - "$RUN_PATH" "$reply" "$BASH_BIN" "$INSTALLER" "$@" <<'PYEOF'
+  local py_out py_out_file="$SANDBOX/pty.out"
+  # Not inside $(...): bash 3.2 mis-scans a quote character in a heredoc nested in a substitution.
+  python3 - "$RUN_PATH" "$reply" "$BASH_BIN" "$INSTALLER" "$@" >"$py_out_file" <<'PYEOF'
 import os, pty, select, subprocess, sys, time
 
 path, reply, bash_bin, installer = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
@@ -141,7 +142,7 @@ os.close(master_fd)
 sys.stdout.buffer.write(f"{rc}\n".encode())
 sys.stdout.buffer.write(output)
 PYEOF
-)"
+  py_out="$(cat "$py_out_file")"
   LAST_RC="$(printf '%s' "$py_out" | head -1)"
   LAST_OUT="$(printf '%s' "$py_out" | tail -n +2)"
   return 0
@@ -437,8 +438,36 @@ STUB
   chmod +x "$1/scp"
 }
 
+write_exasol_stub() {
+  cat > "$1/exasol" <<'STUB'
+#!/usr/bin/env bash
+printf 'exasol %s\n' "$*" >> "${STUB_LOG:-/dev/null}"
+case "$1 $2" in
+  "slc list")
+    if [[ "${EXASOL_LIST_FAIL:-0}" == "1" ]]; then echo "Error: deployment is not running" >&2; exit 1; fi
+    if [[ "${EXASOL_RUST_INSTALLED:-0}" == "1" ]]; then
+      printf '[{"type":"official","language":"java","aliases":["JAVA"],"installed":false},{"type":"custom","language":"rust","alias":"RUST","installed":true}]\n'
+    else
+      printf '[{"type":"official","language":"java","aliases":["JAVA"],"installed":false}]\n'
+    fi
+    exit 0 ;;
+  "slc custom")
+    if [[ "${EXASOL_CUSTOM_FAIL:-0}" == "1" ]]; then echo "Error: custom SLC import failed" >&2; exit 1; fi
+    _prev=""
+    for _a in "$@"; do
+      [[ "$_prev" == "--source" && -n "${STUB_EXASOL_SOURCE_COPY:-}" ]] && cp "$_a" "$STUB_EXASOL_SOURCE_COPY"
+      _prev="$_a"
+    done
+    exit 0 ;;
+esac
+exit 0
+STUB
+  chmod +x "$1/exasol"
+}
+
 write_exapump_stub "$STUBDIR"
 write_curl_stub "$STUBDIR"
+write_exasol_stub "$STUBDIR"
 write_ssh_stub "$STUBDIR"
 write_scp_stub "$STUBDIR"
 # missing-curl dir: exapump only (no curl)
@@ -525,6 +554,15 @@ write_local_deployment_fixture_custom_connection() {
   chmod 600 "$dir/local/node_access.pem"
 }
 
+# Exasol Personal 2.3+: the descriptor names no sshPort and the deployment writes no node key.
+write_launcher_deployment_fixture() {
+  local dir="$1"
+  mkdir -p "$dir/local"
+  printf '{"backend":"local","connection":{"host":"127.0.0.1","dbPort":8563,"username":"sys","shellSupported":true}}\n' \
+    > "$dir/deployment.json"
+  printf '{"dbPassword":"fixture-secret"}\n' > "$dir/secrets.json"
+}
+
 write_cloud_deployment_fixture() {
   local dir="$1" backend="$2"
   mkdir -p "$dir"
@@ -580,6 +618,7 @@ reset_env() {
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
   unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_LS_AUTH_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY EXAPUMP_BFS_TOPLEVEL_LS_DELAY 2>/dev/null || true
   unset SSH_FAIL SCP_FAIL SSH_PATH_NEVER SSH_PATH_DELAY 2>/dev/null || true
+  unset EXASOL_LIST_FAIL EXASOL_RUST_INSTALLED EXASOL_CUSTOM_FAIL STUB_EXASOL_SOURCE_COPY 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
   unset BUCKETFS_REACHABLE_TRIES BUCKETFS_REACHABLE_POLL_SECONDS 2>/dev/null || true
@@ -2848,6 +2887,150 @@ deployment_local_requires_ssh_and_scp() {
 }
 
 # ============================================================================
+# Scenario: a local deployment without SSH inputs selects the launcher transport
+deployment_local_without_ssh_selects_launcher() {
+  echo "== deployment_local_without_ssh_selects_launcher =="
+  local dir out
+  dir="$(mktemp -d "$SANDBOX/dep-launcher.XXXXXX")"
+  write_launcher_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    PATH="$STUBDIR:$ORIG_PATH"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    resolve_deployment_transport 2>&1
+    printf 'rc=%s transport=%s host=%s user=%s password=%s\n' \
+      "$?" "$DEPLOYMENT_TRANSPORT" "$ARG_HOST" "$ARG_USER" "$ARG_PASSWORD"
+    resolve_target_layout
+    printf 'udf_object=%s\n' "$TARGET_SO_UDF_OBJECT"
+  )"
+  assert_contains "launcher deployment: resolves successfully" "$out" "rc=0"
+  assert_contains "launcher deployment: selects the launcher transport" "$out" "transport=launcher"
+  assert_contains "launcher deployment: connection resolves from the descriptor" "$out" "host=127.0.0.1:8563 user=sys password=fixture-secret"
+  assert_contains "launcher deployment: scripts load the .so from inside the SLC rootfs" "$out" "udf_object=/udf/liblakehouse_engine.so"
+}
+
+# Scenario: a local deployment with neither SSH inputs nor the exasol CLI names both mechanisms
+deployment_local_without_ssh_or_launcher_fails() {
+  echo "== deployment_local_without_ssh_or_launcher_fails =="
+  local dir out rc
+  dir="$(mktemp -d "$SANDBOX/dep-nolauncher.XXXXXX")"
+  write_launcher_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    # shellcheck disable=SC2329  # shadows the sourced have_cmd, called from resolve_deployment_transport
+    have_cmd() { [[ "$1" != "exasol" ]] && command -v "$1" >/dev/null 2>&1; }
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "no ssh inputs and no exasol CLI: nonzero exit" "$rc"
+  assert_contains "no ssh inputs and no exasol CLI: error names sshPort" "$out" "sshPort"
+  assert_contains "no ssh inputs and no exasol CLI: error names the exasol CLI" "$out" "'exasol' CLI"
+}
+
+# Scenario: --skip-slc is rejected on the launcher transport
+deployment_launcher_rejects_skip_slc() {
+  echo "== deployment_launcher_rejects_skip_slc =="
+  local dir out rc
+  dir="$(mktemp -d "$SANDBOX/dep-launcher-skip.XXXXXX")"
+  write_launcher_deployment_fixture "$dir"
+
+  out="$(
+    source "$INSTALLER"
+    PATH="$STUBDIR:$ORIG_PATH"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
+    ARG_SKIP_SLC=1
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "launcher --skip-slc: nonzero exit" "$rc"
+  assert_contains "launcher --skip-slc: error names --skip-slc" "$out" "--skip-slc"
+}
+
+# Drives main() through the launcher transport under a sandboxed HOME.
+run_launcher_deployment() {
+  local fake_home dep_name="personal-23" saved_home
+  fake_home="$(mktemp -d "$SANDBOX/dep-home-launcher.XXXXXX")"
+  write_launcher_deployment_fixture "$fake_home/.exasol/personal/deployments/$dep_name"
+  export GH_ASSET_TARBALL="$ENGINE_TARBALL_GOOD"
+  export STUB_EXASOL_SOURCE_COPY="$SANDBOX/launcher-source.tar.gz"
+  rm -f "$STUB_EXASOL_SOURCE_COPY"
+  : > "$STUB_LOG"
+  saved_home="$HOME"
+  export HOME="$fake_home"
+  run_file --deployment "$dep_name" --arch aarch64
+  export HOME="$saved_home"
+  LAUNCHER_DEP_DIR="$fake_home/.exasol/personal/deployments/$dep_name"
+}
+
+# Scenario: a fresh launcher install bundles the engine into the SLC and installs it via exasol slc custom install
+deployment_launcher_installs_bundled_slc() {
+  echo "== deployment_launcher_installs_bundled_slc =="
+  reset_env
+  run_launcher_deployment
+  assert_rc_zero "launcher install: the install succeeds end to end" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_contains "launcher install: installs the RUST custom SLC against the deployment dir" "$log" \
+    "exasol slc custom install --alias RUST --language rust --source "
+  assert_contains "launcher install: targets the deployment directory explicitly" "$log" \
+    "--auto-approve --deployment-dir $LAUNCHER_DEP_DIR"
+  assert_contains "launcher install: scripts point at the in-rootfs .so" "$log" \
+    "%udf_object /udf/liblakehouse_engine.so"
+  assert_contains "launcher install: aarch64 SLC asset is downloaded" "$log" "lc-rust-0.21.0-aarch64.tar.gz"
+  assert_not_contains "launcher install: no SSH session is opened" "$log" "ssh "
+  assert_not_contains "launcher install: no scp is run" "$log" "scp "
+  assert_not_contains "launcher install: the launcher owns SCRIPT_LANGUAGES" "$log" "ALTER SYSTEM SET SCRIPT_LANGUAGES"
+  assert_not_contains "launcher install: no BucketFS HTTP call" "$log" "exapump bucketfs"
+  assert_contains "launcher install: the version smoke test runs" "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
+  local listing; listing="$(tar -tzf "$STUB_EXASOL_SOURCE_COPY" 2>&1)"
+  assert_contains "launcher install: the bundle keeps the SLC's own entries" "$listing" "udf/liblakehouse_engine.so"
+  assert_contains "launcher install: the bundle carries the engine .so at ./udf/" "$listing" "./udf/liblakehouse_engine.so"
+}
+
+# Scenario: an already-installed RUST custom SLC is replaced via exasol slc custom update
+deployment_launcher_updates_existing_slc() {
+  echo "== deployment_launcher_updates_existing_slc =="
+  reset_env
+  export EXASOL_RUST_INSTALLED=1
+  run_launcher_deployment
+  assert_rc_zero "launcher update: the install succeeds end to end" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_contains "launcher update: updates the RUST custom SLC" "$log" "exasol slc custom update --alias RUST"
+  assert_not_contains "launcher update: does not re-install" "$log" "exasol slc custom install"
+}
+
+# Scenario: launcher failures stop the install with the launcher's own message
+deployment_launcher_failures_are_actionable() {
+  echo "== deployment_launcher_failures_are_actionable =="
+  reset_env
+  export EXASOL_LIST_FAIL=1
+  run_launcher_deployment
+  assert_rc_nonzero "launcher preflight failure: nonzero exit" "$LAST_RC"
+  assert_contains "launcher preflight failure: surfaces the launcher message" "$LAST_OUT" "deployment is not running"
+  assert_not_contains "launcher preflight failure: nothing is downloaded" "$(log_content)" "releases/download"
+
+  reset_env
+  export EXASOL_CUSTOM_FAIL=1
+  run_launcher_deployment
+  assert_rc_nonzero "launcher install failure: nonzero exit" "$LAST_RC"
+  assert_contains "launcher install failure: surfaces the launcher message" "$LAST_OUT" "custom SLC import failed"
+  assert_not_contains "launcher install failure: no scripts are created" "$(log_content)" "CREATE OR REPLACE RUST"
+}
+
 main() {
   test_missing_prereq_fails_fast
   test_exapump_auto_install
@@ -2928,6 +3111,12 @@ main() {
   deployment_local_ssh_failures_are_actionable
   deployment_local_waits_for_reconciled_paths
   deployment_local_requires_ssh_and_scp
+  deployment_local_without_ssh_selects_launcher
+  deployment_local_without_ssh_or_launcher_fails
+  deployment_launcher_rejects_skip_slc
+  deployment_launcher_installs_bundled_slc
+  deployment_launcher_updates_existing_slc
+  deployment_launcher_failures_are_actionable
 
   echo ""
   echo "=================================================="
