@@ -29,10 +29,8 @@ FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 NETWORK="${LH_NETWORK:-lakehouse-engine}"        # base compose sets name: lakehouse-engine
-# bitnamilegacy mirrors the same `mc` binary — quay.io/minio/mc is no longer
-# pullable without a MinIO subscription (see docker-compose.yml's `minio`
-# service comment).
-MC_IMAGE="bitnamilegacy/minio-client:2025.7.21-debian-12-r3"
+# pgsty/mc mirrors mc — see docker-compose.yml's `minio` service comment.
+MC_IMAGE="pgsty/mc:RELEASE.2026-09-16T00-00-00Z"
 export UC_BASE="http://localhost:${LH_UNITY_PORT:-18080}/api/2.1/unity-catalog"
 export UC_CATALOG="unity"
 export UC_SCHEMA="delta_e2e"

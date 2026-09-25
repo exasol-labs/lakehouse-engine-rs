@@ -8,27 +8,19 @@
 
 services:
   minio:
-    # quay.io/minio/minio and Docker Hub's minio/minio are both now unpullable
-    # without a MinIO subscription ("unauthorized: access to the requested
-    # resource is not authorized" — verified live, every tag). bitnamilegacy is
-    # Broadcom's frozen, still-public archive of the pre-lockdown Bitnami
-    # images; same upstream `minio` binary, wrapped in Bitnami's launcher
-    # scripts. No `command:` override here: the wrapper's entrypoint only runs
-    # its own setup.sh (data-dir permissions, default buckets, key regen) when
-    # it recognizes its OWN default CMD, so pass configuration via `environment`
-    # instead. Default data dir moves to /bitnami/minio/data accordingly (the
-    # image creates and owns that path at build time; the non-root container
-    # user cannot chown an arbitrary bind path itself).
-    image: bitnamilegacy/minio:2025.7.23-debian-12-r5
+    # quay.io/minio and Docker Hub's minio/minio now require a subscription;
+    # pgsty/silo is a public, protocol-compatible MinIO fork.
+    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     environment:
       MINIO_ROOT_USER: minioadmin
       MINIO_ROOT_PASSWORD: minioadmin
       MINIO_DOMAIN: localhost
+    command: server /data --console-address ":9001"
     ports:
       - "${LH_MINIO_PORT:-19000}:9000"
       - "${LH_MINIO_CONSOLE_PORT:-19001}:9001"
     volumes:
-      - minio-data:/bitnami/minio/data
+      - minio-data:/data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
       interval: 10s
@@ -40,9 +32,8 @@ services:
         ipv4_address: 10.84.0.10
 
   minio-init:
-    # Pinned; bitnamilegacy mirrors the same `mc` binary — see the `minio`
-    # service comment above for why quay.io/minio/mc had to move.
-    image: bitnamilegacy/minio-client:2025.7.21-debian-12-r3
+    # pgsty/mc mirrors mc — see the `minio` service comment above.
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
       minio:
         condition: service_healthy
