@@ -26,12 +26,9 @@ use crate::scan::{build_table_root_store, store_root_url};
 mod tests;
 
 /// The Unity Catalog Parquet table reader: the catalog is the schema authority, and the files
-/// supply only the listing and the partition values.
-///
-/// Each column's `type_json` is the Spark `StructField` JSON the Delta log also records, so the
-/// Delta reader's classifier types it and no third Spark-type mapping can drift from the other two.
-/// No footer is read at plan time: the scan binds and admits each file's columns against this
-/// declaration, the same rules it applies to every format.
+/// supply only the listing and the partition values. Each column's `type_json` is the Spark
+/// `StructField` JSON the Delta log also records, so the Delta reader's classifier types it and
+/// no third Spark-type mapping can drift from the other two. No footer is read at plan time.
 pub(super) struct UnityParquetFormatReader<'a> {
     storage: UnityTableStorage<'a>,
     table: &'a CatalogTable,

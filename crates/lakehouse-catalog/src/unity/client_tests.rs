@@ -575,7 +575,7 @@ async fn load_table_maps_the_uppercase_iceberg_format_to_the_iceberg_tag() {
     assert_eq!(table.format, TableFormat::Iceberg);
 }
 
-/// Scenario: The single-table load refuses a data source format the crate cannot name
+/// Scenario: The single-table load maps an uppercase Parquet format to the Parquet tag
 #[tokio::test]
 async fn load_table_maps_the_uppercase_parquet_format_to_the_parquet_tag() {
     let body = table_body_with_raw_format(r#""data_source_format":"PARQUET","#);

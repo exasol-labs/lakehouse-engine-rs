@@ -17,12 +17,9 @@ mod tests;
 const READ_OPERATION: &str = "READ";
 
 /// One Unity Catalog table's storage decision: its checked table root and the
-/// backend its files are read through.
-///
-/// The one owner of that decision for every format Unity Catalog hosts, so the
-/// no-fallback vending rule cannot drift between readers. Under vending the
-/// decision is scoped to THIS table's catalog-assigned key, which is why no shared
-/// caller can hoist it.
+/// backend its files are read through. The single owner of that decision across
+/// every format Unity Catalog hosts, so the no-fallback vending rule can't drift
+/// between readers; scoped to this table's key, so it can't be hoisted to a shared caller.
 pub(super) struct UnityTableStorage<'a> {
     session: &'a UnityCatalogSession,
     table: &'a CatalogTable,
@@ -57,14 +54,11 @@ impl<'a> UnityTableStorage<'a> {
         Ok((table_root, effective_storage))
     }
 
-    /// This table's own catalog-reported storage location.
-    ///
-    /// The ONE check that runs before the vended/static split, so both values of
-    /// `use_vended_credentials` report identical text and a malformed catalog
-    /// response costs zero object-storage access. Nothing else denotes the table's
-    /// object store — the catalog URI names a REST service and the CONNECTION
-    /// endpoint names the operator's own store address — so no CONNECTION-derived
-    /// value may stand in for a location the catalog left empty.
+    /// This table's own catalog-reported storage location — checked before the
+    /// vended/static split so both credential modes fail identically, and before
+    /// any object-storage access. The catalog URI and CONNECTION endpoint denote
+    /// something else (a REST service, the operator's store address), so neither
+    /// may stand in for a location the catalog left empty.
     fn checked_table_root(&self) -> Result<&'a str, UdfError> {
         match self.table.storage_location.as_deref() {
             Some(location) if !location.trim().is_empty() => Ok(location),
@@ -78,12 +72,10 @@ impl<'a> UnityTableStorage<'a> {
     }
 
     /// The vended backend under vending, the CONNECTION's static one otherwise.
-    ///
-    /// Vending is credentials-only: a table whose catalog assigned no vending key
-    /// fails here rather than falling back, because the fallback would read object
-    /// storage with a credential the operator did not select for this table. An empty
-    /// key counts as none — requesting against an empty scope asks the catalog to
-    /// choose the table for us.
+    /// Vending is credentials-only: a table with no assigned vending key fails
+    /// here rather than falling back to a credential the operator didn't select
+    /// for it. An empty key counts as none, since an empty scope would let the
+    /// catalog choose the table for us.
     async fn effective_storage(&self, table_root: &str) -> Result<StorageBackend, UdfError> {
         if !self.creds.use_vended_credentials {
             return Ok(self.storage.clone());
@@ -121,12 +113,10 @@ impl<'a> UnityTableStorage<'a> {
     }
 }
 
-/// Re-raise `error` with every value in `secrets` masked.
-///
-/// Collapses onto [`UdfError::User`] deliberately: every error reaching here is a
-/// plan-time refusal a user must read, and rendering the error through `Display`
-/// keeps a variant's own prefix in the text while leaving no payload a future SDK
-/// variant could smuggle a secret through unmasked.
+/// Re-raise `error` with every value in `secrets` masked. Collapses onto
+/// [`UdfError::User`] since every error reaching here is a plan-time refusal a
+/// user must read, and masking through `Display` leaves no payload a future
+/// SDK variant could smuggle a secret through unmasked.
 pub(super) fn redacted(error: UdfError, secrets: &[&str]) -> UdfError {
     UdfError::User(redact_error_text(&error.to_string(), secrets))
 }
