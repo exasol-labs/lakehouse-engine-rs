@@ -44,30 +44,22 @@ BFS_ENGINE_SO_PATH="udf/liblakehouse_engine.so"
 DEPLOYMENT_ROOT="$HOME/.exasol/personal/deployments"
 DEPLOYMENT_DESCRIPTOR="deployment.json"
 SECRETS_DESCRIPTOR="secrets.json"
-NODE_KEY_RELATIVE_PATH="local/node_access.pem"
 LOCAL_BACKEND="local"
 PERSONAL_DB_HOST_DEFAULT="127.0.0.1"
 PERSONAL_DB_PORT_DEFAULT="8563"
 PERSONAL_DB_USER_DEFAULT="sys"
-PERSONAL_SSH_USER="root"
-PERSONAL_SSH_HOST="127.0.0.1"
-VM_BUCKETFS_ROOT="/var/lib/exa/bucketfs"
-VM_RECONCILE_TRIES=30
-VM_RECONCILE_POLL_SECONDS=2
-# Env-overridable (unlike VM_RECONCILE_*) so the test suite can drive the full script through a
+# Env-overridable so the test suite can drive the full script through a
 # real run_file invocation without a real ~30s wait -- BUCKETFS_REACHABLE_TRIES=3
 # BUCKETFS_REACHABLE_POLL_SECONDS=0 exercises the exact same production code path fast.
 BUCKETFS_REACHABLE_TRIES="${BUCKETFS_REACHABLE_TRIES:-30}"
 BUCKETFS_REACHABLE_POLL_SECONDS="${BUCKETFS_REACHABLE_POLL_SECONDS:-2}"
-# Exasol Personal 2.3+ local deployments publish no SSH inputs and hide the shared BucketFS
-# directory from UDFs, so the SLC goes in through `exasol slc custom install|update` and the
-# engine .so rides inside the SLC's own rootfs, addressed by its in-container path.
+# Exasol Personal (2.3+) local deployments publish no BucketFS endpoint and hide the shared
+# BucketFS directory from UDFs, so the SLC goes in through `exasol slc custom install|update` and
+# the engine .so rides inside the SLC's own rootfs, addressed by its in-container path.
 LAUNCHER_SLC_ALIAS="RUST"
 LAUNCHER_SLC_LANGUAGE="rust"
 LAUNCHER_SO_ROOTFS_DIR="udf"
 LAUNCHER_SO_UDF_OBJECT="/$LAUNCHER_SO_ROOTFS_DIR/liblakehouse_engine.so"
-SSH_OPTIONS=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-  -o IdentitiesOnly=yes -o BatchMode=yes -o LogLevel=ERROR)
 
 # --- Global state (defaults; parse_args re-seeds arg-derived ones) -----------
 ARG_ACCOUNT_ID=""
@@ -95,8 +87,6 @@ ARG_HELP=0
 
 DEPLOYMENT_TRANSPORT=""
 DEPLOYMENT_DIR=""
-DEPLOYMENT_SSH_PORT=""
-DEPLOYMENT_KEY_PATH=""
 CONNECTIVITY_MODE=""
 TARGET_MODE=""
 TARGET_SO_UDF_OBJECT=""
@@ -354,7 +344,7 @@ deployment_backend() {
     return 1
   fi
   if [[ -z "$backend" ]]; then
-    err "'$dir/$DEPLOYMENT_DESCRIPTOR' carries no '.backend' field, so the install transport (local SSH copy vs cloud BucketFS HTTP upload) cannot be determined."
+    err "'$dir/$DEPLOYMENT_DESCRIPTOR' carries no '.backend' field, so the install transport (local 'exasol slc custom' vs cloud BucketFS HTTP upload) cannot be determined."
     return 1
   fi
   printf '%s\n' "$backend"
@@ -371,28 +361,6 @@ deployment_field() {
   fi
   printf '%s\n' "$value"
   return 0
-}
-
-deployment_ssh_port() {
-  local dir="$1" port
-  if ! port="$(read_descriptor_field "$dir/$DEPLOYMENT_DESCRIPTOR" '.connection.sshPort')"; then
-    return 1
-  fi
-  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
-    err "'$dir/$DEPLOYMENT_DESCRIPTOR' carries no numeric '.connection.sshPort' (got '$port'). Exasol Personal writes it when the deployment starts; start the deployment and re-run."
-    return 1
-  fi
-  printf '%s\n' "$port"
-  return 0
-}
-
-deployment_key_path() {
-  printf '%s\n' "$1/$NODE_KEY_RELATIVE_PATH"
-}
-
-# Selected from the inputs the SSH transport consumes, never from a Personal version string.
-deployment_supports_ssh() {
-  deployment_ssh_port "$1" >/dev/null 2>&1 && [[ -r "$(deployment_key_path "$1")" ]]
 }
 
 deployment_db_password() {
@@ -502,12 +470,11 @@ Both modes:
                             -aarch64-suffixed release assets
   --deployment <name>       target an Exasol Personal deployment by name, resolving connection and
                             backend from $HOME/.exasol/personal/deployments/<name>/deployment.json;
-                            local backend installs over SSH when the deployment publishes an SSH
-                            port and node key (Personal < 2.3), otherwise through the `exasol`
-                            launcher's `slc custom install|update` with the engine bundled into
-                            the SLC (Personal 2.3+; --skip-slc unsupported there); cloud backend
-                            falls through to the BucketFS HTTP path above (--bfs-write-password
-                            required for cloud)
+                            local backend installs through the `exasol` launcher's
+                            `slc custom install|update` with the engine bundled into the SLC
+                            (Exasol Personal 2.3+; --skip-slc and --bfs-* unsupported there);
+                            cloud backend falls through to the BucketFS HTTP path above
+                            (--bfs-write-password required for cloud)
   --help                    show this help
 
 Examples:
@@ -720,32 +687,25 @@ resolve_deployment_transport() {
     return 0
   fi
 
+  DEPLOYMENT_TRANSPORT="launcher"
+  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
+    err "--skip-slc is not supported for a local Exasol Personal deployment: the engine .so is installed inside the Rust SLC via 'exasol slc custom', so installing the engine always re-installs the SLC."
+    return 1
+  fi
+  local bfs_flags_given=""
+  [[ -n "$ARG_BFS_HOST" ]] && bfs_flags_given="$bfs_flags_given --bfs-host"
+  [[ -n "$ARG_BFS_PORT" ]] && bfs_flags_given="$bfs_flags_given --bfs-port"
+  [[ "$ARG_BFS_BUCKET_SET" -eq 1 ]] && bfs_flags_given="$bfs_flags_given --bfs-bucket"
+  [[ -n "$ARG_BFS_WRITE_PASSWORD" ]] && bfs_flags_given="$bfs_flags_given --bfs-write-password"
+  if [[ -n "$bfs_flags_given" ]]; then
+    err "BucketFS-only flag(s)$bfs_flags_given were given, but deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND', which is installed through 'exasol slc custom', not BucketFS. Drop the BucketFS flag(s)."
+    return 1
+  fi
   resolve_deployment_connection "$DEPLOYMENT_DIR" "$PERSONAL_DB_HOST_DEFAULT" || return 1
   if [[ "$ARG_ARCH_SET" -eq 0 ]]; then
     ARG_ARCH="$(detect_host_arch)" || return 1
   fi
-  if ! deployment_supports_ssh "$DEPLOYMENT_DIR"; then
-    DEPLOYMENT_TRANSPORT="launcher"
-    if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
-      err "--skip-slc is not supported for '$ARG_DEPLOYMENT': this deployment publishes no SSH inputs, so the engine .so is installed inside the Rust SLC via 'exasol slc custom', and installing the engine always re-installs the SLC."
-      return 1
-    fi
-    have_cmd exasol || {
-      err "deployment '$ARG_DEPLOYMENT' supports neither local install mechanism: SSH needs a numeric '.connection.sshPort' in $DEPLOYMENT_DESCRIPTOR and a readable $NODE_KEY_RELATIVE_PATH (Exasol Personal < 2.3), and the launcher mechanism needs the 'exasol' CLI on PATH (Exasol Personal 2.3+)."
-      return 1
-    }
-    log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND' and publishes no SSH inputs: installing $ARG_ARCH artifacts through 'exasol slc custom' with the engine bundled into the Rust SLC."
-    return 0
-  fi
-
-  DEPLOYMENT_TRANSPORT="ssh"
-  if [[ ! "$ARG_BFS_BUCKET" =~ ^[A-Za-z0-9._-]+$ ]]; then
-    err "--bfs-bucket '$ARG_BFS_BUCKET' is not a valid bucket name: it names the directory inside the deployment VM's BucketFS that the SSH transport replaces, and is interpolated into a remote command, so it must match [A-Za-z0-9._-]+."
-    return 1
-  fi
-  DEPLOYMENT_SSH_PORT="$(deployment_ssh_port "$DEPLOYMENT_DIR")" || return 1
-  DEPLOYMENT_KEY_PATH="$(deployment_key_path "$DEPLOYMENT_DIR")"
-  log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND': installing $ARG_ARCH artifacts over SSH into the deployment VM (ssh port $DEPLOYMENT_SSH_PORT)."
+  log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND': installing $ARG_ARCH artifacts through 'exasol slc custom' with the engine bundled into the Rust SLC."
   return 0
 }
 
@@ -836,11 +796,8 @@ check_prereqs() {
   if [[ "$TARGET_MODE" == "bucketfs" ]]; then
     have_cmd tar   || { err "required tool 'tar' not found on PATH. The BucketFS install target extracts liblakehouse_engine.so out of the engine archive locally before uploading it. Install it via your OS package manager."; ok=0; }
   fi
-  if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
-    have_cmd ssh || { err "required tool 'ssh' not found on PATH. An Exasol Personal deployment with the '$LOCAL_BACKEND' backend exposes no BucketFS HTTP endpoint, so artifacts travel to its VM over SSH."; ok=0; }
-    have_cmd scp || { err "required tool 'scp' not found on PATH. An Exasol Personal deployment with the '$LOCAL_BACKEND' backend exposes no BucketFS HTTP endpoint, so artifacts travel to its VM over SSH."; ok=0; }
-  fi
   if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+    have_cmd exasol || { err "required tool 'exasol' (the Exasol Personal launcher CLI) not found on PATH. A local Exasol Personal deployment is installed through 'exasol slc custom'."; ok=0; }
     have_cmd gzip || { err "required tool 'gzip' not found on PATH. It repacks the Rust SLC with the engine .so bundled inside. Install it via your OS package manager."; ok=0; }
   fi
   [[ "$ok" -eq 1 ]]
@@ -1075,9 +1032,8 @@ exapump_bucketfs() {
 # bucketfs_wait_for_path: a freshly started Exasol container's SQL port (what this script's own
 # reachability checks and Docker healthchecks key off) can go up before BucketFS's HTTP endpoint
 # is actually listening, so a single-shot check races that startup ordering instead of waiting it
-# out. Same 30-tries/2s budget as VM_RECONCILE_TRIES/POLL_SECONDS: BucketFS coming up is exactly
-# the same kind of "engine subsystem starts asynchronously after the SQL port does" wait, and 5
-# tries/1s (10s) measurably wasn't enough headroom on a live container in CI. tries/sleep_seconds
+# out. 30 tries/2s, because 5 tries/1s (10s) measurably wasn't enough headroom on a live container
+# in CI. tries/sleep_seconds
 # are only ever overridden by the test suite (to run the retry loop with sleep_seconds=0); the one
 # production call site always takes the defaults.
 #
@@ -1179,84 +1135,6 @@ extract_engine_so() {
   return 0
 }
 
-vm_bucket_dir() {
-  printf '%s\n' "$VM_BUCKETFS_ROOT/$BFS_SERVICE/$ARG_BFS_BUCKET"
-}
-
-vm_slc_dir() {
-  printf '%s\n' "$(vm_bucket_dir)/${TARGET_SLC_BFS_PATH%.tar.gz}"
-}
-
-vm_engine_so_path() {
-  printf '%s\n' "$(vm_bucket_dir)/$TARGET_ENGINE_BFS_PATH"
-}
-
-ssh_vm() {
-  ssh "${SSH_OPTIONS[@]}" -i "$DEPLOYMENT_KEY_PATH" -p "$DEPLOYMENT_SSH_PORT" \
-    "$PERSONAL_SSH_USER@$PERSONAL_SSH_HOST" "$1" </dev/null
-}
-
-scp_to_vm() {
-  scp "${SSH_OPTIONS[@]}" -i "$DEPLOYMENT_KEY_PATH" -P "$DEPLOYMENT_SSH_PORT" \
-    "$1" "$PERSONAL_SSH_USER@$PERSONAL_SSH_HOST:$2" </dev/null
-}
-
-ssh_vm_reachable() {
-  local out
-  if ! out="$(ssh_vm true 2>&1)"; then
-    err "the deployment VM is not reachable over SSH at $PERSONAL_SSH_HOST:$DEPLOYMENT_SSH_PORT with key '$DEPLOYMENT_KEY_PATH'. Check that the deployment is running ('exasol status'); the SSH port is reassigned on every start, so a stopped or restarted deployment invalidates it. ssh said: $out"
-    return 1
-  fi
-  return 0
-}
-
-push_slc_to_vm() {
-  local tarball="$1" staged="/tmp/lakehouse-rustslc.tar.gz" dest out
-  dest="$(vm_slc_dir)"
-  if ! out="$(scp_to_vm "$tarball" "$staged" 2>&1)"; then
-    err "failed to copy the Rust SLC to '$staged' on the deployment VM. scp said: $out"
-    return 1
-  fi
-  if ! out="$(ssh_vm "set -e; rm -rf '$dest'; mkdir -p '$dest'; tar -xzf '$staged' -C '$dest'; rm -f '$staged'; test -x '$dest/exaudf/exaudfclient'" 2>&1)"; then
-    err "failed to extract the Rust SLC into '$dest' on the deployment VM; the extracted tree must contain an executable exaudf/exaudfclient. ssh said: $out"
-    return 1
-  fi
-  log "Extracted the Rust SLC into $dest on the deployment VM."
-  return 0
-}
-
-push_engine_so_to_vm() {
-  local so_path="$1" staged="/tmp/liblakehouse_engine.so" dest dest_dir out
-  dest="$(vm_engine_so_path)"
-  dest_dir="${dest%/*}"
-  if ! out="$(scp_to_vm "$so_path" "$staged" 2>&1)"; then
-    err "failed to copy the engine .so to '$staged' on the deployment VM. scp said: $out"
-    return 1
-  fi
-  if ! out="$(ssh_vm "set -e; mkdir -p '$dest_dir'; mv -f '$staged' '$dest'; chmod 0644 '$dest'; test -s '$dest'" 2>&1)"; then
-    err "failed to install the engine .so at '$dest' on the deployment VM. ssh said: $out"
-    return 1
-  fi
-  log "Installed the engine .so at $dest on the deployment VM."
-  return 0
-}
-
-vm_wait_for_reconciled_path() {
-  local vm_path="$1" tries="${2:-$VM_RECONCILE_TRIES}" sleep_seconds="${3:-$VM_RECONCILE_POLL_SECONDS}" i=1
-  while [[ "$i" -le "$tries" ]]; do
-    if ssh_vm "test -e '$vm_path'" >/dev/null 2>&1; then
-      log "Verified $vm_path on the deployment VM."
-      return 0
-    fi
-    if [[ "$i" -lt "$tries" ]]; then
-      sleep "$sleep_seconds"
-    fi
-    i=$((i + 1))
-  done
-  err "the deployment VM did not expose '$vm_path' after $tries checks over $((tries * sleep_seconds))s. The copy itself reported success, so check that '$ARG_BFS_BUCKET' is the BucketFS bucket this deployment's database actually reads."
-  return 1
-}
-
 # Runs the Exasol Personal launcher against this run's deployment directory.
 exasol_launcher() {
   exasol "$@" --deployment-dir "$DEPLOYMENT_DIR" </dev/null
@@ -1265,7 +1143,7 @@ exasol_launcher() {
 launcher_slc_list() {
   local out
   if ! out="$(exasol_launcher slc list --json 2>&1)"; then
-    err "'exasol slc list' failed for deployment '$ARG_DEPLOYMENT'. Check that it is running ('exasol status'). exasol said: $out"
+    err "'exasol slc list' failed for deployment '$ARG_DEPLOYMENT'. Check that it is running ('exasol status') and that the launcher is Exasol Personal 2.3 or later ('exasol version'). exasol said: $out"
     return 1
   fi
   printf '%s\n' "$out"
@@ -1569,32 +1447,6 @@ install_engine() {
   return 0
 }
 
-deploy_personal_local() {
-  local so_path
-  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
-    log "Skipping SLC upload and registration (--skip-slc)."
-  else
-    log "Installing Rust SLC $RESOLVED_SLC_VERSION over SSH ..."
-    download_slc || return 1
-    push_slc_to_vm "$WORKDIR/rustslc.tar.gz" || return 1
-  fi
-
-  log "Installing lakehouse-engine $RESOLVED_ENGINE_VERSION over SSH ..."
-  download_engine || return 1
-  if ! so_path="$(extract_engine_so "$WORKDIR/$ENGINE_ASSET" "$WORKDIR/extracted")"; then
-    return 1
-  fi
-  push_engine_so_to_vm "$so_path" || return 1
-
-  if [[ "$ARG_SKIP_SLC" -eq 0 ]]; then
-    vm_wait_for_reconciled_path "$(vm_slc_dir)" || return 1
-    register_script_languages || return 1
-  fi
-  vm_wait_for_reconciled_path "$(vm_engine_so_path)" || return 1
-  create_engine_scripts || return 1
-  return 0
-}
-
 # fingerprint-mismatch -> the .so/SLC fingerprint check itself failed; other-error -> any other
 # failure to run the smoke-test query; version-mismatch -> the query succeeded but reported a
 # version different from the release the installer downloaded; pass -> exact match.
@@ -1724,9 +1576,7 @@ main() {
       saas_db_reachable || exit 1
       ;;
     bucketfs)
-      if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
-        ssh_vm_reachable || exit 1
-      elif [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+      if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
         launcher_slc_list >/dev/null || exit 1
       else
         validate_bucketfs_required || exit 1
@@ -1743,9 +1593,7 @@ main() {
   trap 'rm -rf "$WORKDIR"' EXIT
 
   resolve_versions || exit 1
-  if [[ "$DEPLOYMENT_TRANSPORT" == "ssh" ]]; then
-    deploy_personal_local || exit 1
-  elif [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
+  if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
     deploy_personal_launcher || exit 1
   else
     if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
