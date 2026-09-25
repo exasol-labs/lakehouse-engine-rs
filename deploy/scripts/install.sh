@@ -471,9 +471,8 @@ Both modes:
                             -aarch64-suffixed release assets
   --deployment <name>       target an Exasol Personal deployment by name, resolving connection and
                             backend from $HOME/.exasol/personal/deployments/<name>/deployment.json;
-                            local backend (Exasol Personal 2.3+) installs the SLC through the
-                            `exasol` launcher's `slc custom install|update` and writes the engine
-                            into the deployment's BucketFS directory (only --bfs-bucket applies);
+                            local backend (Exasol Personal 2.3+) writes into the deployment's
+                            BucketFS directory and installs the SLC with `exasol slc custom`;
                             cloud backend falls through to the BucketFS HTTP path above
                             (--bfs-write-password required for cloud)
   --help                    show this help
@@ -697,8 +696,8 @@ resolve_deployment_transport() {
     err "BucketFS HTTP flag(s)$bfs_flags_given were given, but deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND', which has no BucketFS HTTP endpoint: the engine is written straight into its BucketFS directory. Drop the flag(s); only --bfs-bucket applies."
     return 1
   fi
-  if [[ ! "$ARG_BFS_BUCKET" =~ ^[A-Za-z0-9._-]+$ || "$ARG_BFS_BUCKET" == "." || "$ARG_BFS_BUCKET" == ".." ]]; then
-    err "--bfs-bucket '$ARG_BFS_BUCKET' is not a valid bucket name: it names a directory under the deployment's BucketFS directory, so it must match [A-Za-z0-9._-]+ and not be '.' or '..'."
+  if [[ ! "$ARG_BFS_BUCKET" =~ ^[A-Za-z0-9_-][A-Za-z0-9._-]*$ ]]; then
+    err "--bfs-bucket '$ARG_BFS_BUCKET' is not a valid bucket name: it names a directory under the deployment's BucketFS directory, so it must match [A-Za-z0-9_-][A-Za-z0-9._-]*."
     return 1
   fi
   resolve_deployment_connection "$DEPLOYMENT_DIR" "$PERSONAL_DB_HOST_DEFAULT" || return 1

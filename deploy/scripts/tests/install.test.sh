@@ -412,11 +412,6 @@ case "$1 $2" in
     exit 0 ;;
   "slc custom")
     if [[ "${EXASOL_CUSTOM_FAIL:-0}" == "1" ]]; then echo "Error: custom SLC import failed" >&2; exit 1; fi
-    _prev=""
-    for _a in "$@"; do
-      [[ "$_prev" == "--source" && -n "${STUB_EXASOL_SOURCE_COPY:-}" ]] && cp "$_a" "$STUB_EXASOL_SOURCE_COPY"
-      _prev="$_a"
-    done
     exit 0 ;;
 esac
 exit 0
@@ -550,7 +545,7 @@ reset_env() {
   unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING GH_ASSET_TARBALL 2>/dev/null || true
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
   unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_LS_AUTH_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY EXAPUMP_BFS_TOPLEVEL_LS_DELAY 2>/dev/null || true
-  unset EXASOL_LIST_FAIL EXASOL_RUST_INSTALLED EXASOL_CUSTOM_FAIL STUB_EXASOL_SOURCE_COPY 2>/dev/null || true
+  unset EXASOL_LIST_FAIL EXASOL_RUST_INSTALLED EXASOL_CUSTOM_FAIL 2>/dev/null || true
   unset PERSONAL_BUCKET_TRIES PERSONAL_BUCKET_POLL_SECONDS 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
@@ -2508,12 +2503,10 @@ run_launcher_deployment() {
   fake_home="$(mktemp -d "$SANDBOX/dep-home-launcher.XXXXXX")"
   write_local_deployment_fixture "$fake_home/.exasol/personal/deployments/$dep_name"
   export GH_ASSET_TARBALL="$ENGINE_TARBALL_GOOD"
-  export STUB_EXASOL_SOURCE_COPY="$SANDBOX/launcher-source.tar.gz"
-  rm -f "$STUB_EXASOL_SOURCE_COPY"
   : > "$STUB_LOG"
   saved_home="$HOME"
   export HOME="$fake_home"
-  run_file --deployment "$dep_name" --arch aarch64 "${LAUNCHER_EXTRA_ARGS[@]+"${LAUNCHER_EXTRA_ARGS[@]}"}"
+  run_file --deployment "$dep_name" --arch aarch64 "$@"
   export HOME="$saved_home"
   LAUNCHER_DEP_DIR="$fake_home/.exasol/personal/deployments/$dep_name"
 }
@@ -2522,7 +2515,6 @@ run_launcher_deployment() {
 deployment_launcher_installs_slc_and_engine() {
   echo "== deployment_launcher_installs_slc_and_engine =="
   reset_env
-  LAUNCHER_EXTRA_ARGS=()
   run_launcher_deployment
   assert_rc_zero "launcher install: the install succeeds end to end" "$LAST_RC"
   local log; log="$(log_content)"
@@ -2555,7 +2547,6 @@ deployment_launcher_updates_existing_slc() {
   echo "== deployment_launcher_updates_existing_slc =="
   reset_env
   export EXASOL_RUST_INSTALLED=1
-  LAUNCHER_EXTRA_ARGS=()
   run_launcher_deployment
   assert_rc_zero "launcher update: the install succeeds end to end" "$LAST_RC"
   local log; log="$(log_content)"
@@ -2567,8 +2558,7 @@ deployment_launcher_updates_existing_slc() {
 deployment_launcher_skip_slc_installs_engine_only() {
   echo "== deployment_launcher_skip_slc_installs_engine_only =="
   reset_env
-  LAUNCHER_EXTRA_ARGS=(--skip-slc)
-  run_launcher_deployment
+  run_launcher_deployment --skip-slc
   assert_rc_zero "launcher --skip-slc: the install succeeds end to end" "$LAST_RC"
   local log; log="$(log_content)"
   assert_not_contains "launcher --skip-slc: no SLC is installed or updated" "$log" "exasol slc custom"
@@ -2586,7 +2576,6 @@ deployment_launcher_failures_are_actionable() {
   echo "== deployment_launcher_failures_are_actionable =="
   reset_env
   export EXASOL_LIST_FAIL=1
-  LAUNCHER_EXTRA_ARGS=()
   run_launcher_deployment
   assert_rc_nonzero "launcher preflight failure: nonzero exit" "$LAST_RC"
   assert_contains "launcher preflight failure: surfaces the launcher message" "$LAST_OUT" "deployment is not running"
@@ -2601,8 +2590,7 @@ deployment_launcher_failures_are_actionable() {
 
   reset_env
   export PERSONAL_BUCKET_TRIES=2 PERSONAL_BUCKET_POLL_SECONDS=0
-  LAUNCHER_EXTRA_ARGS=(--bfs-bucket unregistered)
-  run_launcher_deployment
+  run_launcher_deployment --bfs-bucket unregistered
   assert_rc_nonzero "unregistered bucket: nonzero exit" "$LAST_RC"
   assert_contains "unregistered bucket: error names the bucket" "$LAST_OUT" "bfsdefault/unregistered"
   assert_not_contains "unregistered bucket: no scripts are created" "$(log_content)" "CREATE OR REPLACE RUST"
