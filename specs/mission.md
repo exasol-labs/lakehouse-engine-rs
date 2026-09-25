@@ -91,7 +91,7 @@ Every query is executed independently, starts from source metadata, and leaves n
 | Language | Rust (edition 2024) | UDF + VS adapter implementation |
 | Query engine | DataFusion + Arrow/Parquet 58 | Node-local vectorized scan & pushdown execution |
 | Lakehouse | `iceberg-rust` (Iceberg REST catalog, incl. Databricks-managed Iceberg) + `delta-kernel-rs` 0.26 (Delta tables via native Unity Catalog) | Snapshot discovery, file resolution, table registration |
-| UDF runtime | `exasol-udf-sdk` 0.23.0 (connect-back), `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit`, connect-back SQL session |
+| UDF runtime | `exasol-udf-sdk` 0.30.0 (connect-back), `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit`, connect-back SQL session |
 | Build | `rust:1.94-trixie` (glibc 2.41) in Docker | Builds `.so` matching the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
 
