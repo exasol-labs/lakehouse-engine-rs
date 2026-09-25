@@ -480,13 +480,9 @@ fn delta_e2e_table(name: &str) -> CatalogTableIdent {
     }
 }
 
-/// Resolve `table_name`'s scan through the `FormatReader` seam: load the
-/// table's metadata from the live Unity Catalog server, select its format
-/// reader (Delta or Unity Parquet) via `format_reader`, and resolve its scan.
-/// `use_vended_credentials` selects which of the two credential modes the
-/// request exercises; `filter` forwards an optional pushdown filter to
-/// `resolve_scan`; `handle_pushdown` is never reached, matching this plan's
-/// scope.
+/// Resolve `table_name`'s scan through the `FormatReader` seam (Delta or Unity
+/// Parquet, via `format_reader`) against the live Unity Catalog server.
+/// `handle_pushdown` is never reached here.
 async fn resolve_unity_scan(
     table_name: &str,
     use_vended_credentials: bool,
@@ -1959,13 +1955,10 @@ fn unity_parquet_table_returns_its_rows_and_partition_values() {
     );
 }
 
-/// Scenario: A Unity Parquet table's scan resolves identically under vended
-/// and static credentials.
-///
-/// Mirrors `unity_delta_planning_agrees_under_vended_and_static_credentials`:
-/// `effective_storage` is deliberately NOT compared, since the two runs read
-/// through genuinely different credentials by design, and neither run's
-/// credential values are asserted or printed here.
+/// Scenario: a Unity Parquet table's scan resolves identically under vended
+/// and static credentials (mirrors the Delta version; `effective_storage`
+/// itself is not compared, since the two runs read through different
+/// credentials by design).
 #[test]
 fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     setup();

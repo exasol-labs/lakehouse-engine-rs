@@ -159,14 +159,10 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
-/// The shared trait and its catalog-neutral metadata types are constructible
-/// from outside the crate, while the Unity Catalog wire types stay hidden —
-/// never re-exported and never `pub`-declared — so the engine consumes only the
-/// neutral shape. `CatalogTable` is constructed with its FORMAT tag, its
-/// credential-vending key, and its partition columns named explicitly, and its
-/// Unity column with its `type_json` named explicitly, so dropping any of these
-/// fields or narrowing `TableFormat` below `pub` is a build failure here rather
-/// than a silent gap.
+/// Scenario: the shared trait and its catalog-neutral metadata types are
+/// constructible from outside the crate, with every `CatalogTable`/`CatalogColumn`
+/// field named explicitly — a narrowed field is a build failure here, not a
+/// silent gap — while the Unity Catalog wire types stay hidden.
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     let ident = CatalogTableIdent {

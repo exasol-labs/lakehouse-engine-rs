@@ -226,11 +226,10 @@ struct StructSlot {
 /// members reordered into logical order, an unclaimed physical member dropped, and a
 /// logical field this file's struct does not carry null-filled.
 ///
-/// A struct member is claimed by [`claim_logical`], the same exact order
-/// [`bind_columns`] applies to a top-level column, without its letter-case fold. The
-/// `schema.name-mapping.default` fallback is not reachable at depth: its nested entries
-/// go unparsed (issue #28), so no nested member can carry a mapped field-id for step 3
-/// to match.
+/// A struct member is claimed by [`claim_logical`] in the same order as a
+/// top-level column, minus the letter-case fold. `schema.name-mapping.default`
+/// is unreachable at depth — its nested entries go unparsed (issue #28) — so no
+/// nested member can carry a mapped field-id.
 ///
 /// A list's element and a map's key and value are POSITIONAL — one child slot each —
 /// so they resolve by recursion alone, with no name or id to match, and only when the
@@ -920,11 +919,9 @@ impl ColumnBinding {
         }
     }
 
-    /// Every bound column whose file type its declared type does not [`admits`], keyed by
-    /// LOGICAL column index. The physical side is the field the delegate resolves the name
-    /// to; a column the scan renders to JSON is left out, since its rendering, not a cast,
-    /// adapts it, while a declared tree the file contradicts with a primitive is judged
-    /// like any other column.
+    /// Every bound column whose file type its declared type does not [`admits`], keyed
+    /// by LOGICAL column index. A column rendered to JSON is excluded, since rendering
+    /// — not a cast — adapts it.
     fn refused_columns(&self, logical: &arrow::datatypes::Schema) -> HashMap<usize, RefusedColumn> {
         logical
             .fields()

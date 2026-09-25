@@ -54,11 +54,9 @@ impl<'a> UnityTableStorage<'a> {
         Ok((table_root, effective_storage))
     }
 
-    /// This table's own catalog-reported storage location — checked before the
-    /// vended/static split so both credential modes fail identically, and before
-    /// any object-storage access. The catalog URI and CONNECTION endpoint denote
-    /// something else (a REST service, the operator's store address), so neither
-    /// may stand in for a location the catalog left empty.
+    /// This table's own catalog-reported storage location, checked before the
+    /// vended/static split and before any object-storage access — neither the
+    /// catalog URI nor the CONNECTION endpoint may substitute for one left empty.
     fn checked_table_root(&self) -> Result<&'a str, UdfError> {
         match self.table.storage_location.as_deref() {
             Some(location) if !location.trim().is_empty() => Ok(location),
@@ -72,10 +70,8 @@ impl<'a> UnityTableStorage<'a> {
     }
 
     /// The vended backend under vending, the CONNECTION's static one otherwise.
-    /// Vending is credentials-only: a table with no assigned vending key fails
-    /// here rather than falling back to a credential the operator didn't select
-    /// for it. An empty key counts as none, since an empty scope would let the
-    /// catalog choose the table for us.
+    /// A table with no vending key (empty counts as none) fails rather than
+    /// falling back to a credential the operator didn't select for it.
     async fn effective_storage(&self, table_root: &str) -> Result<StorageBackend, UdfError> {
         if !self.creds.use_vended_credentials {
             return Ok(self.storage.clone());

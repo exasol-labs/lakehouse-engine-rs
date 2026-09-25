@@ -342,14 +342,10 @@ const PARQUET_DATA_SOURCE_FORMAT: &str = "PARQUET";
 /// format refusal.
 const ABSENT_DATA_SOURCE_FORMAT: &str = "absent";
 
-/// The admitted `TableFormat` for a listed entry, or why it is not one: an
-/// entry is admitted iff its neutral type is a base table AND its
-/// `data_source_format` is exactly `DELTA` or `PARQUET`. A disqualifying type is
-/// reported ahead of the format, so a view — which carries no format — is
-/// reported by its `table_type`. Takes the raw wire `table_type` rather than the
-/// already-lossy neutral kind, so the returned detail names the offending wire
-/// value verbatim and this module keeps a single home for Unity's `table_type`
-/// vocabulary.
+/// The admitted `TableFormat` for a listed entry, or why it is not one: admitted
+/// iff the neutral type is a base table and `data_source_format` is `DELTA` or
+/// `PARQUET`. Takes the raw wire `table_type` (not the neutral kind) so a
+/// refusal names the actual wire value.
 fn admission(
     raw_table_type: &str,
     data_source_format: Option<&str>,
