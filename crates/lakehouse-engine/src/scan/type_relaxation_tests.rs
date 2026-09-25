@@ -1,7 +1,7 @@
-use crate::scan::raw_scan::{build_scan_sql, register_files};
-use crate::scan::session_config_for_spec;
-use crate::scan::spec::{FileEntry, LogicalField, ScanSpec};
-use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec, write_parquet};
+use crate::scan::spec::{FileEntry, LogicalField};
+use crate::scan::test_support::{
+    local_file_size, minimal_spec, run_scan, try_run_scan, write_parquet,
+};
 use crate::types::mapping::arrow_type_from_tag;
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
@@ -9,8 +9,6 @@ use arrow::array::{
 };
 use arrow::compute::can_cast_types;
 use arrow::datatypes::{DataType, TimeUnit};
-use arrow::record_batch::RecordBatch;
-use datafusion::execution::context::SessionContext;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -273,114 +271,55 @@ fn parquet_column_types(path: &Path) -> Vec<DataType> {
         .collect()
 }
 
-/// Drive the exact production scan path — `register_files` then `build_scan_sql` — so the cast under
-/// test is the one `FieldIdExprAdapterFactory` delegates to, not one the test performs.
-async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
-    try_run_scan(spec)
-        .await
-        .expect("scan must read the assigned files")
-}
-
-async fn try_run_scan(spec: &ScanSpec) -> datafusion::error::Result<Vec<RecordBatch>> {
-    let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
-    register_files(&ctx, "scan_target", spec, &inline_resolved(spec))
-        .await
-        .expect("register_files must succeed with a logical schema");
-    let sql = build_scan_sql(&ctx, "scan_target", spec)
-        .await
-        .expect("build_scan_sql");
-    let df = ctx.sql(&sql).await.expect("plan scan SQL");
-    df.collect().await
-}
-
-async fn assert_every_scan_is_refused(test_dir: &str, cases: Vec<(&str, ArrayRef, &str)>) {
-    let dir = std::env::temp_dir().join(format!("{test_dir}_{}", std::process::id()));
+// Scenario Coverage (type-relaxation): A physical type outside identity and the supported set is
+// refused before any cast
+// Scenario Coverage (type-relaxation): A narrow physical column binds to the current wider logical
+// type and is cast per file
+#[tokio::test]
+async fn a_physical_type_outside_identity_and_the_supported_set_is_refused_before_any_cast() {
+    let dir = std::env::temp_dir().join(format!("lh_type_refusal_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let table_root = url::Url::from_directory_path(&dir)
         .expect("absolute directory")
         .to_string();
+    let cases: Vec<(ArrayRef, &str)> = vec![
+        (Arc::new(Float64Array::from(vec![1.7])), "int32"),
+        (
+            Arc::new(TimestampMicrosecondArray::from(vec![0i64])),
+            "date32",
+        ),
+        (Arc::new(StringArray::from(vec!["1"])), "int64"),
+        (Arc::new(Int64Array::from(vec![1i64])), "utf8"),
+        (Arc::new(Int64Array::from(vec![1i64, 40])), "int32"),
+        (Arc::new(Float64Array::from(vec![3.5f64])), "float32"),
+    ];
 
-    for (index, (pair, physical, logical_tag)) in cases.into_iter().enumerate() {
+    for (index, (physical, logical_tag)) in cases.into_iter().enumerate() {
         let path = dir.join(format!("refused_{index}.parquet"));
         let file_url = write_parquet(&path, vec![("val", physical)]);
-        let file_size = local_file_size(&file_url);
         let mut spec = minimal_spec();
         spec.common.table_root = table_root.clone();
-        spec.files = vec![FileEntry::new(file_url, file_size)];
+        spec.files = vec![FileEntry::new(file_url.clone(), local_file_size(&file_url))];
         spec.common.logical_schema = vec![logical_field("val", logical_tag)];
         spec.common.projection = vec!["VAL".into()];
 
+        let physical_type = parquet_column_types(&path)[0].to_string();
         let message = try_run_scan(&spec)
             .await
-            .err()
-            .unwrap_or_else(|| panic!("{pair}: the scan must refuse the pair rather than cast it"))
+            .expect_err("the scan must refuse the pair rather than cast it")
             .to_string();
         for needle in [
             table_root.clone(),
             "'val'".to_string(),
-            parquet_column_types(&path)[0].to_string(),
+            physical_type,
             arrow_type_from_tag(logical_tag).to_string(),
         ] {
             assert!(
                 message.contains(&needle),
-                "{pair}: the refusal must name `{needle}`, got: {message}"
+                "the refusal must name `{needle}`, got: {message}"
             );
         }
     }
-}
-
-// Scenario Coverage (type-relaxation): A physical type outside identity and the supported set is
-// refused before any cast
-#[tokio::test]
-async fn a_physical_type_outside_identity_and_the_supported_set_is_refused_before_any_cast() {
-    assert_every_scan_is_refused(
-        "lh_type_refusal",
-        vec![
-            (
-                "double under int",
-                Arc::new(Float64Array::from(vec![1.7])) as ArrayRef,
-                "int32",
-            ),
-            (
-                "timestamp under date",
-                Arc::new(TimestampMicrosecondArray::from(vec![0i64])),
-                "date32",
-            ),
-            (
-                "string under a numeric type",
-                Arc::new(StringArray::from(vec!["1"])),
-                "int64",
-            ),
-            (
-                "a numeric type under string",
-                Arc::new(Int64Array::from(vec![1i64])),
-                "utf8",
-            ),
-        ],
-    )
-    .await;
-}
-
-// Scenario Coverage (type-relaxation): A narrow physical column binds to the current wider logical
-// type and is cast per file
-#[tokio::test]
-async fn a_narrower_logical_type_than_the_file_is_refused_not_narrowed() {
-    assert_every_scan_is_refused(
-        "lh_type_narrowing_refusal",
-        vec![
-            (
-                "int64 under int32, every value fitting",
-                Arc::new(Int64Array::from(vec![1i64, 40])) as ArrayRef,
-                "int32",
-            ),
-            (
-                "double under float",
-                Arc::new(Float64Array::from(vec![3.5f64])),
-                "float32",
-            ),
-        ],
-    )
-    .await;
 }
 
 // Scenario Coverage (type-relaxation): Every supported relaxation pair is proven castable rather

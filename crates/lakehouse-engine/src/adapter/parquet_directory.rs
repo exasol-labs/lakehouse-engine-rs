@@ -91,7 +91,12 @@ pub async fn resolve_parquet_directory(
     let kept: Vec<(&RawFile, BTreeMap<String, Option<String>>)> = raw_files
         .iter()
         .filter_map(|raw| {
-            let filled = fill_partition_values(&raw.partition_segments, &declared_keys);
+            let filled = fill_partition_values(
+                &raw.partition_segments,
+                &declared_keys,
+                &declared_keys,
+                |candidate, key| candidate == key,
+            );
             keep(&filled).then_some((raw, filled))
         })
         .collect();
@@ -139,11 +144,24 @@ pub async fn list_parquet_files(
     keep: &PartitionKeepPredicate,
 ) -> Result<Vec<ParquetFile>, UdfError> {
     let raw_files = list_data_files(store, prefix, true).await?;
+    let folded_columns: Vec<String> = partition_columns
+        .iter()
+        .map(|column| column.to_uppercase())
+        .collect();
     Ok(raw_files
         .into_iter()
         .filter_map(|raw| {
-            let partition_values =
-                fill_declared_partition_values(&raw.partition_segments, partition_columns);
+            let partition_values = fill_partition_values(
+                &raw.partition_segments,
+                partition_columns,
+                &folded_columns,
+                |candidate, folded| {
+                    candidate
+                        .chars()
+                        .flat_map(char::to_uppercase)
+                        .eq(folded.chars())
+                },
+            );
             keep(&partition_values).then_some(ParquetFile {
                 path: raw.path,
                 size: raw.size,
@@ -288,32 +306,18 @@ fn uppercase_index<'a>(keys: impl Iterator<Item = &'a str>) -> HashMap<String, &
 fn fill_partition_values(
     raw: &[(String, Option<String>)],
     declared_keys: &[String],
+    match_keys: &[String],
+    key_matches: impl Fn(&str, &str) -> bool,
 ) -> BTreeMap<String, Option<String>> {
     declared_keys
         .iter()
-        .map(|key| {
+        .zip(match_keys)
+        .map(|(key, match_key)| {
             let value = raw
                 .iter()
-                .rfind(|(candidate, _)| candidate == key)
+                .rfind(|(candidate, _)| key_matches(candidate, match_key))
                 .and_then(|(_, value)| value.clone());
             (key.clone(), value)
-        })
-        .collect()
-}
-
-fn fill_declared_partition_values(
-    raw: &[(String, Option<String>)],
-    declared_columns: &[String],
-) -> BTreeMap<String, Option<String>> {
-    declared_columns
-        .iter()
-        .map(|column| {
-            let folded = column.to_uppercase();
-            let value = raw
-                .iter()
-                .rfind(|(candidate, _)| candidate.to_uppercase() == folded)
-                .and_then(|(_, value)| value.clone());
-            (column.clone(), value)
         })
         .collect()
 }

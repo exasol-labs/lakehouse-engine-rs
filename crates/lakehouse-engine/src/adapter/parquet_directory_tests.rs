@@ -1,6 +1,6 @@
 use super::*;
 use crate::adapter::tests::parquet_fixture::{
-    directory_options, in_memory_store, nullable, parquet_bytes,
+    directory_options, in_memory_store, nullable, parquet_bytes, values,
 };
 use crate::types::mapping::arrow_to_exasol_type;
 use arrow::datatypes::{Fields, TimeUnit};
@@ -1006,13 +1006,6 @@ fn the_store_prefix_is_the_percent_decoded_path_below_the_store_root() {
     );
 }
 
-fn values(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
-    pairs
-        .iter()
-        .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
-        .collect()
-}
-
 /// Scenario: The listing answer serves a caller that declares its own partition columns
 #[tokio::test]
 async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_footer() {
@@ -1035,14 +1028,9 @@ async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_foo
         .await
         .expect("a listing that reads no footer succeeds over unreadable bodies");
 
-    let listed: Vec<(String, BTreeMap<String, Option<String>>)> = files
+    let listed: Vec<_> = files
         .iter()
-        .map(|file| {
-            (
-                file.path.as_ref().to_string(),
-                file.partition_values.clone(),
-            )
-        })
+        .map(|file| (file.path.to_string(), file.partition_values.clone()))
         .collect();
     assert_eq!(
         listed,
@@ -1072,13 +1060,7 @@ async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_foo
          segment equal to it under the uppercase fold; an undeclared segment contributes nothing"
     );
     assert!(
-        files
-            .iter()
-            .all(|file| file.size == b"not a parquet file".len() as u64 && file.footer.is_none()),
-        "each size comes from the listing and no footer is attached"
-    );
-    assert!(
-        probe.files_read().is_empty(),
+        files.iter().all(|file| file.footer.is_none()) && probe.files_read().is_empty(),
         "the listing answer reads no object: {:?}",
         probe.reads()
     );

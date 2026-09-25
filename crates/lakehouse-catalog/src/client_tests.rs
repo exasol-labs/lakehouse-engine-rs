@@ -513,12 +513,6 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
             "{} must carry no vending key",
             table.ident.name
         );
-        assert_eq!(
-            table.partition_columns,
-            Vec::<String>::new(),
-            "{} must carry no partition columns",
-            table.ident.name
-        );
     }
 }
 

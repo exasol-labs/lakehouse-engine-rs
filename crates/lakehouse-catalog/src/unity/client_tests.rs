@@ -428,12 +428,17 @@ async fn posts_temporary_table_credentials() {
 }
 
 /// Scenario: The client lists tables in a configured catalog and schema
+/// Scenario: The client admits a Parquet base table and reports its partition columns
 #[tokio::test]
 async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     let body = r#"{"tables":[
         {"name":"orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://b/orders","table_id":"uuid-managed","columns":[]},
         {"name":"external_orders","table_type":"EXTERNAL","data_source_format":"DELTA","storage_location":"s3://b/external","table_id":"uuid-external","columns":[]},
-        {"name":"raw_orders","table_type":"EXTERNAL","data_source_format":"PARQUET","storage_location":"s3://b/raw","table_id":"uuid-parquet","columns":[]},
+        {"name":"raw_orders","table_type":"EXTERNAL","data_source_format":"PARQUET","storage_location":"s3://b/raw","table_id":"uuid-parquet","columns":[
+            {"name":"region","type_name":"STRING","partition_index":1},
+            {"name":"payload","type_name":"STRING"},
+            {"name":"event_date","type_name":"DATE","partition_index":0}
+        ]},
         {"name":"orders_summary","table_type":"VIEW","data_source_format":null,"columns":[]},
         {"name":"legacy_orders","table_type":"MANAGED","data_source_format":"ICEBERG","table_id":"uuid-iceberg","columns":[]}
     ]}"#
@@ -494,36 +499,8 @@ async fn list_tables_tags_each_admitted_table_by_its_own_format() {
         ],
         "an ICEBERG base table is skipped, not tagged"
     );
-}
-
-/// Scenario: The client admits a Parquet base table and reports its partition columns
-#[tokio::test]
-async fn list_tables_admits_a_parquet_base_table_with_its_partition_columns() {
-    let body = r#"{"tables":[
-        {"name":"raw_events","table_type":"EXTERNAL","data_source_format":"PARQUET","storage_location":"s3://bucket/raw_events","table_id":"uuid-parquet","columns":[
-            {"name":"region","type_name":"STRING","partition_index":1},
-            {"name":"payload","type_name":"STRING"},
-            {"name":"event_date","type_name":"DATE","partition_index":0}
-        ]}
-    ]}"#
-    .to_string();
-    let server = spawn(move |_req| (200, body.clone())).await;
-    let session = UnityCatalogSession::new(&server.base_url, base_creds());
-
-    let listing = session
-        .list_tables(&["cat".to_string(), "sch".to_string()])
-        .await
-        .expect("list failed");
-
     assert_eq!(
-        listing.tables.len(),
-        1,
-        "the PARQUET external table is admitted"
-    );
-    let table = &listing.tables[0];
-    assert_eq!(table.format, TableFormat::Parquet);
-    assert_eq!(
-        table.partition_columns,
+        listing.tables[2].partition_columns,
         vec!["event_date".to_string(), "region".to_string()],
         "partition columns are reported in partition_index order"
     );
@@ -558,36 +535,24 @@ async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered
     );
 }
 
-/// A Unity Catalog UniForm table reporting `ICEBERG` is named accurately rather
-/// than refused: the load applies no admission filter, so both formats the engine
-/// can plan map to their own tag.
-#[tokio::test]
-async fn load_table_maps_the_uppercase_iceberg_format_to_the_iceberg_tag() {
-    let body = table_body_with_raw_format(r#""data_source_format":"ICEBERG","#);
-    let server = spawn(move |_req| (200, body.clone())).await;
-    let session = UnityCatalogSession::new(&server.base_url, base_creds());
-
-    let table = session
-        .load_table(&orders_ident())
-        .await
-        .expect("an ICEBERG table loads under the Iceberg tag");
-
-    assert_eq!(table.format, TableFormat::Iceberg);
-}
-
 /// Scenario: The single-table load maps an uppercase Parquet format to the Parquet tag
 #[tokio::test]
-async fn load_table_maps_the_uppercase_parquet_format_to_the_parquet_tag() {
-    let body = table_body_with_raw_format(r#""data_source_format":"PARQUET","#);
-    let server = spawn(move |_req| (200, body.clone())).await;
-    let session = UnityCatalogSession::new(&server.base_url, base_creds());
+async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags() {
+    for (raw_format, expected) in [
+        ("ICEBERG", TableFormat::Iceberg),
+        ("PARQUET", TableFormat::Parquet),
+    ] {
+        let body = table_body_with_raw_format(&format!(r#""data_source_format":"{raw_format}","#));
+        let server = spawn(move |_req| (200, body.clone())).await;
+        let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
-    let table = session
-        .load_table(&orders_ident())
-        .await
-        .expect("a PARQUET table loads under the Parquet tag");
+        let table = session
+            .load_table(&orders_ident())
+            .await
+            .expect("the table loads under its own tag");
 
-    assert_eq!(table.format, TableFormat::Parquet);
+        assert_eq!(table.format, expected, "{raw_format}");
+    }
 }
 
 /// The load applies no admission filter, so an absent or unrecognized
@@ -691,44 +656,20 @@ fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
     }
 }
 
+/// A disqualifying `table_type` wins over the format and is named by its raw spelling; a
+/// format is admitted only as exact uppercase `DELTA` or `PARQUET`, else named verbatim.
 #[test]
-fn admission_admits_a_table_with_delta_format() {
-    assert_eq!(admission("MANAGED", Some("DELTA")), Ok(TableFormat::Delta));
-}
-
-#[test]
-fn admission_admits_a_table_with_parquet_format() {
-    assert_eq!(
-        admission("EXTERNAL", Some("PARQUET")),
-        Ok(TableFormat::Parquet)
-    );
-}
-
-#[test]
-fn admission_type_wins_over_format_for_a_view_even_when_delta() {
-    assert_eq!(
-        admission("VIEW", Some("DELTA")),
+fn admission_admits_delta_and_parquet_base_tables_and_names_every_refusal() {
+    let skip = |detail: &str| {
         Err(SkipReason::NotDeltaBaseTable {
-            detail: "table_type=VIEW".to_string()
+            detail: detail.to_string(),
         })
-    );
-}
-
-#[test]
-fn admission_type_wins_over_format_for_other_even_when_delta() {
-    assert_eq!(
-        admission("STREAMING_TABLE", Some("DELTA")),
-        Err(SkipReason::NotDeltaBaseTable {
-            detail: "table_type=STREAMING_TABLE".to_string()
-        })
-    );
-}
-
-/// The detail must name the spelling the catalog actually sent, for every
-/// disqualifying `table_type` — including one the neutral mapping folds onto
-/// `View`, whose raw spelling would otherwise be lost.
-#[test]
-fn admission_names_the_raw_table_type_it_was_handed() {
+    };
+    let mut cases = vec![
+        ("MANAGED", Some("DELTA"), Ok(TableFormat::Delta)),
+        ("EXTERNAL", Some("PARQUET"), Ok(TableFormat::Parquet)),
+        ("MANAGED", None, skip("data_source_format=absent")),
+    ];
     for raw in [
         "VIEW",
         "MATERIALIZED_VIEW",
@@ -736,70 +677,21 @@ fn admission_names_the_raw_table_type_it_was_handed() {
         "FOREIGN",
         "MANAGED_SHALLOW_CLONE",
     ] {
+        cases.push((raw, Some("DELTA"), skip(&format!("table_type={raw}"))));
+    }
+    for format in ["ICEBERG", "CSV", "delta", "Delta", "parquet", "Parquet"] {
+        cases.push((
+            "EXTERNAL",
+            Some(format),
+            skip(&format!("data_source_format={format}")),
+        ));
+    }
+
+    for (table_type, format, expected) in cases {
         assert_eq!(
-            admission(raw, Some("DELTA")),
-            Err(SkipReason::NotDeltaBaseTable {
-                detail: format!("table_type={raw}")
-            }),
-            "raw table_type {raw} must be reported by its own spelling"
+            admission(table_type, format),
+            expected,
+            "{table_type} / {format:?}"
         );
     }
-}
-
-#[test]
-fn admission_reports_a_non_delta_format_verbatim() {
-    assert_eq!(
-        admission("MANAGED", Some("ICEBERG")),
-        Err(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=ICEBERG".to_string()
-        })
-    );
-    assert_eq!(
-        admission("EXTERNAL", Some("CSV")),
-        Err(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=CSV".to_string()
-        })
-    );
-}
-
-#[test]
-fn admission_reports_an_absent_format() {
-    assert_eq!(
-        admission("MANAGED", None),
-        Err(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=absent".to_string()
-        })
-    );
-}
-
-#[test]
-fn admission_rejects_a_lowercase_or_mixed_case_delta_spelling() {
-    assert_eq!(
-        admission("MANAGED", Some("delta")),
-        Err(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=delta".to_string()
-        })
-    );
-    assert_eq!(
-        admission("MANAGED", Some("Delta")),
-        Err(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=Delta".to_string()
-        })
-    );
-}
-
-#[test]
-fn admission_rejects_a_lowercase_or_mixed_case_parquet_spelling() {
-    assert_eq!(
-        admission("EXTERNAL", Some("parquet")),
-        Err(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=parquet".to_string()
-        })
-    );
-    assert_eq!(
-        admission("EXTERNAL", Some("Parquet")),
-        Err(SkipReason::NotDeltaBaseTable {
-            detail: "data_source_format=Parquet".to_string()
-        })
-    );
 }

@@ -265,7 +265,7 @@ fn full_name(ident: &CatalogTableIdent) -> String {
 /// that requires one fails naming the table rather than requesting credentials
 /// against an empty scope.
 fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat) -> CatalogTable {
-    let mut partition_columns: Vec<(u32, String)> = info
+    let mut indexed: Vec<(u32, String)> = info
         .columns
         .iter()
         .filter_map(|column| {
@@ -274,7 +274,8 @@ fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat)
                 .map(|index| (index, column.name.clone()))
         })
         .collect();
-    partition_columns.sort_by_key(|(index, _)| *index);
+    indexed.sort_by_key(|(index, _)| *index);
+    let partition_columns = indexed.into_iter().map(|(_, name)| name).collect();
 
     CatalogTable {
         ident,
@@ -284,10 +285,7 @@ fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat)
             .filter(|location| !location.is_empty()),
         format,
         vended_credential_key: info.table_id.filter(|key| !key.trim().is_empty()),
-        partition_columns: partition_columns
-            .into_iter()
-            .map(|(_, name)| name)
-            .collect(),
+        partition_columns,
         columns: info.columns.into_iter().map(neutral_column).collect(),
     }
 }
@@ -339,9 +337,8 @@ fn admission(
     data_source_format: Option<&str>,
 ) -> Result<TableFormat, SkipReason> {
     let detail = match neutral_table_type(raw_table_type) {
-        CatalogTableType::Table => match data_source_format {
-            Some(DELTA_DATA_SOURCE_FORMAT) => return Ok(TableFormat::Delta),
-            Some(PARQUET_DATA_SOURCE_FORMAT) => return Ok(TableFormat::Parquet),
+        CatalogTableType::Table => match format_of(data_source_format) {
+            Some(format @ (TableFormat::Delta | TableFormat::Parquet)) => return Ok(format),
             _ => format!(
                 "data_source_format={}",
                 data_source_format.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
@@ -356,16 +353,24 @@ fn neutral_table_format(
     data_source_format: Option<&str>,
     table: &str,
 ) -> Result<TableFormat, UdfError> {
-    match data_source_format.filter(|format| !format.trim().is_empty()) {
-        Some(DELTA_DATA_SOURCE_FORMAT) => Ok(TableFormat::Delta),
-        Some(ICEBERG_DATA_SOURCE_FORMAT) => Ok(TableFormat::Iceberg),
-        Some(PARQUET_DATA_SOURCE_FORMAT) => Ok(TableFormat::Parquet),
-        unrecognized => Err(UdfError::User(format!(
+    format_of(data_source_format).ok_or_else(|| {
+        UdfError::User(format!(
             "Unity Catalog table {table} reports data_source_format={}, which names no table \
              format this engine can plan (expected {DELTA_DATA_SOURCE_FORMAT}, \
              {ICEBERG_DATA_SOURCE_FORMAT}, or {PARQUET_DATA_SOURCE_FORMAT})",
-            unrecognized.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
-        ))),
+            data_source_format
+                .filter(|format| !format.trim().is_empty())
+                .unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
+        ))
+    })
+}
+
+fn format_of(data_source_format: Option<&str>) -> Option<TableFormat> {
+    match data_source_format? {
+        DELTA_DATA_SOURCE_FORMAT => Some(TableFormat::Delta),
+        ICEBERG_DATA_SOURCE_FORMAT => Some(TableFormat::Iceberg),
+        PARQUET_DATA_SOURCE_FORMAT => Some(TableFormat::Parquet),
+        _ => None,
     }
 }
 
@@ -423,7 +428,6 @@ struct TableInfo {
 /// type name plus the `DECIMAL(p, s)` precision and scale, absent (and read as 0)
 /// for a type taking none. `partition_index` is its 0-based partition-column position.
 #[derive(Deserialize)]
-
 struct ColumnInfo {
     name: String,
     type_name: String,

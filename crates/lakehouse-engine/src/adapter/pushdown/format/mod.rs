@@ -52,6 +52,26 @@ pub struct RefusedColumn {
     pub reason: String,
 }
 
+/// Refuses the table when no column is mappable: `raw_scan` cannot scan an empty schema.
+fn ensure_table_has_a_mappable_column(
+    logical_schema: &[LogicalField],
+    refused_columns: &[RefusedColumn],
+    table_kind: &str,
+) -> Result<(), UdfError> {
+    if !logical_schema.is_empty() || refused_columns.is_empty() {
+        return Ok(());
+    }
+
+    let reasons = refused_columns
+        .iter()
+        .map(|column| format!("'{}': {}", column.column_name, column.reason))
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(UdfError::User(format!(
+        "{table_kind} table has no mappable column; every column is refused: {reasons}"
+    )))
+}
+
 /// One table's resolved scan, in the shape every table format answers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedScan {

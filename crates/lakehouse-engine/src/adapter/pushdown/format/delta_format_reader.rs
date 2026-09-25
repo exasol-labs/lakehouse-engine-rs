@@ -10,7 +10,10 @@ use super::delta_predicate::to_delta_predicate;
 use super::delta_replay::DeltaSnapshot;
 use super::delta_schema::build_delta_table_schema;
 use super::unity_table_storage::{UnityTableStorage, redacted};
-use super::{ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan};
+use super::{
+    ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan,
+    ensure_table_has_a_mappable_column,
+};
 use crate::scan::build_table_root_store;
 use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
 
@@ -123,24 +126,4 @@ fn read_delta_log(
         .map_err(|error| redacted(error, secrets))?;
 
     Ok((files, logical_schema, partition_columns, refused_columns))
-}
-
-/// Refuses the table when no column is mappable: `raw_scan` cannot scan an empty schema.
-pub(super) fn ensure_table_has_a_mappable_column(
-    logical_schema: &[LogicalField],
-    refused_columns: &[RefusedColumn],
-    table_kind: &str,
-) -> Result<(), UdfError> {
-    if !logical_schema.is_empty() || refused_columns.is_empty() {
-        return Ok(());
-    }
-
-    let reasons = refused_columns
-        .iter()
-        .map(|column| format!("'{}': {}", column.column_name, column.reason))
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(UdfError::User(format!(
-        "{table_kind} table has no mappable column; every column is refused: {reasons}"
-    )))
 }

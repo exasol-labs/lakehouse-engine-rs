@@ -26,7 +26,7 @@ use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray, RecordBatch,
     StructArray, new_null_array,
 };
-use arrow::datatypes::{DataType, Field, FieldRef, Fields, TimeUnit};
+use arrow::datatypes::{DataType, Field, FieldRef, Fields};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::ColumnarValue;
 use datafusion::physical_expr::PhysicalExpr;
@@ -135,6 +135,9 @@ fn claim_by_case_fold(
 ) -> (Vec<Option<usize>>, Vec<AmbiguousFold>) {
     use std::collections::{BTreeMap, HashSet};
 
+    if exact.iter().all(Option::is_some) || !logical.iter().any(BindingKeys::binds_by_identity) {
+        return (exact.to_vec(), Vec::new());
+    }
     let exactly_claimed: HashSet<usize> = exact.iter().flatten().copied().collect();
     let mut groups: BTreeMap<String, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
     for (index, field) in physical.fields().iter().enumerate() {
@@ -711,15 +714,17 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
         };
         use datafusion::physical_expr::expressions::{Column, Literal};
 
-        expr.apply(|node| {
-            match node
-                .downcast_ref::<Column>()
-                .and_then(|column| self.refused_by_index.get(&column.index()))
-            {
-                Some(refused) => Err(refused.refusal(&self.table_root)),
-                None => Ok(TreeNodeRecursion::Continue),
-            }
-        })?;
+        if !self.refused_by_index.is_empty() {
+            expr.apply(|node| {
+                match node
+                    .downcast_ref::<Column>()
+                    .and_then(|column| self.refused_by_index.get(&column.index()))
+                {
+                    Some(refused) => Err(refused.refusal(&self.table_root)),
+                    None => Ok(TreeNodeRecursion::Continue),
+                }
+            })?;
+        }
 
         // Intercept the absent-with-default case BEFORE delegating: the default
         // adapter NULL-fills a nullable-absent field and ERRORS on a
@@ -916,6 +921,12 @@ impl ColumnBinding {
 
     /// Keyed by logical index; JSON-rendered columns are excluded since no cast adapts them.
     fn refused_columns(&self, logical: &arrow::datatypes::Schema) -> HashMap<usize, RefusedColumn> {
+        let mut physical_by_name: HashMap<&str, &arrow::datatypes::Field> = HashMap::new();
+        for field in self.renamed_physical.fields() {
+            physical_by_name
+                .entry(field.name().as_str())
+                .or_insert(field.as_ref());
+        }
         logical
             .fields()
             .iter()
@@ -926,7 +937,7 @@ impl ColumnBinding {
                 })
             })
             .filter_map(|(index, field)| {
-                let physical = self.renamed_physical.field_with_name(field.name()).ok()?;
+                let physical = physical_by_name.get(field.name().as_str())?;
                 (!admits(physical.data_type(), field.data_type())).then(|| {
                     (
                         index,
@@ -1049,16 +1060,7 @@ fn admits_timestamp(physical: &DataType, logical: &DataType) -> bool {
         && physical_zone
             .as_deref()
             .is_some_and(|zone| !matches!(zone, "UTC" | "+00:00"));
-    fineness(*physical_unit) <= fineness(*logical_unit) && !shifts_instant
-}
-
-fn fineness(unit: TimeUnit) -> u8 {
-    match unit {
-        TimeUnit::Second => 0,
-        TimeUnit::Millisecond => 1,
-        TimeUnit::Microsecond => 2,
-        TimeUnit::Nanosecond => 3,
-    }
+    physical_unit <= logical_unit && !shifts_instant
 }
 
 fn admits_as_text(physical: &DataType, logical: &DataType) -> bool {

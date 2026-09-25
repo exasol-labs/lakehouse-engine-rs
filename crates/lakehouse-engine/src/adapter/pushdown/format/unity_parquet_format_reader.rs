@@ -10,13 +10,15 @@ use lakehouse_catalog::{
 };
 use serde_json::Value as Json;
 
-use super::delta_format_reader::ensure_table_has_a_mappable_column;
 use super::delta_schema::build_delta_table_schema;
 use super::parquet_format_reader::file_entry;
 use super::partition_predicate::PartitionPredicate;
 use super::unity_table_storage::{UnityTableStorage, redacted};
-use super::{ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan};
-use crate::adapter::parquet_directory::{list_parquet_files, store_prefix};
+use super::{
+    ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan,
+    ensure_table_has_a_mappable_column,
+};
+use crate::adapter::parquet_directory::{PartitionKeepPredicate, list_parquet_files, store_prefix};
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
 use crate::scan::{build_table_root_store, store_root_url};
@@ -45,25 +47,21 @@ impl<'a> UnityParquetFormatReader<'a> {
     }
 
     async fn plan(
-        &self,
         table_root: &str,
         storage: &StorageBackend,
-        filter_json: Option<&Json>,
-    ) -> Result<(Vec<FileEntry>, CatalogSchema), UdfError> {
-        let secrets = storage.secret_values();
-        let schema = catalog_schema(self.table)?;
-        let keep = string_partition_keep(filter_json, schema.string_partition_columns.clone());
-
+        secrets: &[&str],
+        partition_columns: &[String],
+        keep: &PartitionKeepPredicate,
+    ) -> Result<Vec<FileEntry>, UdfError> {
         let store =
-            build_table_root_store(storage, table_root, DEFAULT_S3_MAX_CONNECTIONS, &secrets)?;
+            build_table_root_store(storage, table_root, DEFAULT_S3_MAX_CONNECTIONS, secrets)?;
         let prefix = store_prefix(table_root)?;
         let store_root = store_root_url(table_root)?;
-        let files = list_parquet_files(&store, &prefix, &schema.partition_columns, &keep)
+        Ok(list_parquet_files(&store, &prefix, partition_columns, keep)
             .await?
             .into_iter()
             .map(|file| file_entry(file, &prefix, store_root.as_str()))
-            .collect();
-        Ok((files, schema))
+            .collect())
     }
 }
 
@@ -75,22 +73,34 @@ impl FormatReader for UnityParquetFormatReader<'_> {
         filter_json: Option<&'a Json>,
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedScan, UdfError>> + Send + 'a>> {
         Box::pin(async move {
+            let CatalogSchema {
+                logical_schema,
+                partition_columns,
+                refused_columns,
+                string_partition_columns,
+            } = catalog_schema(self.table)?;
+            let keep = string_partition_keep(filter_json, string_partition_columns);
+
             let (table_root, effective_storage) = self.storage.resolve().await?;
             let secrets = effective_storage.secret_values();
-
-            let (files, schema) = self
-                .plan(table_root, &effective_storage, filter_json)
-                .await
-                .map_err(|error| redacted(error, &secrets))?;
+            let files = Self::plan(
+                table_root,
+                &effective_storage,
+                &secrets,
+                &partition_columns,
+                &keep,
+            )
+            .await
+            .map_err(|error| redacted(error, &secrets))?;
 
             Ok(ResolvedScan {
                 files,
                 effective_storage,
-                logical_schema: schema.logical_schema,
+                logical_schema,
                 table_root: table_root.to_string(),
                 name_mapping: Vec::new(),
-                partition_columns: schema.partition_columns,
-                refused_columns: schema.refused_columns,
+                partition_columns,
+                refused_columns,
             })
         })
     }

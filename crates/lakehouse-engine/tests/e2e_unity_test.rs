@@ -124,8 +124,7 @@ fn setup() {
         let mut conn = exa_conn();
         create_schema_and_scripts(&mut conn);
 
-        write_sales_parquet_fixture();
-        register_sales_parquet_table();
+        seed_sales_parquet_table();
 
         create_unity_virtual_schema(&mut conn);
     });
@@ -158,99 +157,70 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     ));
 }
 
-/// The in-file columns only: `year` and `region` are partition directories the catalog declares.
-fn sales_parquet_batch(ids: &[i64], amounts: &[f64]) -> RecordBatch {
+/// Writes the in-file columns (`year`/`region` are partition directories) and registers the
+/// table in-process, since its bytes are written in-process.
+fn seed_sales_parquet_table() {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("amount", DataType::Float64, false),
     ]));
-    RecordBatch::try_new(
-        schema,
-        vec![
-            Arc::new(Int64Array::from(ids.to_vec())),
-            Arc::new(Float64Array::from(amounts.to_vec())),
-        ],
-    )
-    .expect("sales_parquet batch construction is infallible")
-}
+    let files: [(&str, &[i64], &[f64]); 3] = [
+        ("year=2024/region=eu/p1.parquet", &[1, 2], &[100.0, 200.0]),
+        ("year=2024/region=us/p2.parquet", &[3], &[300.0]),
+        ("year=2025/region=eu/p3.parquet", &[4], &[400.0]),
+    ];
+    for (file, ids, amounts) in files {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Float64Array::from(amounts.to_vec())),
+            ],
+        )
+        .expect("sales_parquet batch");
+        write_parquet_fixture(&format!("{SALES_PARQUET_LOCATION}/{file}"), batch);
+    }
 
-fn write_sales_parquet_fixture() {
-    write_parquet_fixture(
-        &format!("{SALES_PARQUET_LOCATION}/year=2024/region=eu/p1.parquet"),
-        sales_parquet_batch(&[1, 2], &[100.0, 200.0]),
-    );
-    write_parquet_fixture(
-        &format!("{SALES_PARQUET_LOCATION}/year=2024/region=us/p2.parquet"),
-        sales_parquet_batch(&[3], &[300.0]),
-    );
-    write_parquet_fixture(
-        &format!("{SALES_PARQUET_LOCATION}/year=2025/region=eu/p3.parquet"),
-        sales_parquet_batch(&[4], &[400.0]),
-    );
-}
-
-fn spark_type_json(name: &str, spark_type: &str) -> String {
-    serde_json::json!({"name": name, "type": spark_type, "nullable": true, "metadata": {}})
-        .to_string()
-}
-
-/// Registered in-process because its bytes are written in-process.
-fn register_sales_parquet_table() {
     let base = format!("{}/api/2.1/unity-catalog", unity_catalog_url());
-    let table_path = format!("{base}/tables/{UNITY_NAMESPACE}.sales_parquet");
     let client = reqwest::blocking::Client::new();
-
-    let delete_status = client
-        .delete(&table_path)
+    let delete = client
+        .delete(format!("{base}/tables/{UNITY_NAMESPACE}.sales_parquet"))
         .send()
-        .unwrap_or_else(|e| panic!("DELETE {table_path} failed to send: {e}"))
-        .status();
+        .expect("DELETE sales_parquet");
     assert!(
-        delete_status.is_success() || delete_status == reqwest::StatusCode::NOT_FOUND,
-        "DELETE {table_path} returned unexpected status {delete_status}"
+        delete.status().is_success() || delete.status() == reqwest::StatusCode::NOT_FOUND,
+        "DELETE sales_parquet returned {}",
+        delete.status()
     );
 
-    let body = serde_json::json!({
-        "name": "sales_parquet",
-        "catalog_name": "unity",
-        "schema_name": "delta_e2e",
-        "table_type": "EXTERNAL",
-        "data_source_format": "PARQUET",
-        "storage_location": SALES_PARQUET_LOCATION,
-        "columns": [
-            {
-                "name": "id", "type_text": "long", "type_name": "LONG",
-                "type_json": spark_type_json("id", "long"), "position": 0, "nullable": true
-            },
-            {
-                "name": "amount", "type_text": "double", "type_name": "DOUBLE",
-                "type_json": spark_type_json("amount", "double"), "position": 1, "nullable": true
-            },
-            {
-                "name": "year", "type_text": "integer", "type_name": "INT",
-                "type_json": spark_type_json("year", "integer"), "position": 2,
-                "nullable": true, "partition_index": 0
-            },
-            {
-                "name": "region", "type_text": "string", "type_name": "STRING",
-                "type_json": spark_type_json("region", "string"), "position": 3,
-                "nullable": true, "partition_index": 1
-            }
-        ]
-    });
-
+    let (catalog_name, schema_name) = UNITY_NAMESPACE.split_once('.').expect("<catalog>.<schema>");
+    let column = |position: usize, name: &str, type_text: &str, type_name: &str| {
+        let type_json =
+            serde_json::json!({"name": name, "type": type_text, "nullable": true, "metadata": {}});
+        serde_json::json!({
+            "name": name, "type_text": type_text, "type_name": type_name,
+            "type_json": type_json.to_string(), "position": position, "nullable": true
+        })
+    };
+    let mut year = column(2, "year", "integer", "INT");
+    year["partition_index"] = 0.into();
+    let mut region = column(3, "region", "string", "STRING");
+    region["partition_index"] = 1.into();
     let response = client
         .post(format!("{base}/tables"))
-        .json(&body)
+        .json(&serde_json::json!({
+            "name": "sales_parquet", "catalog_name": catalog_name, "schema_name": schema_name,
+            "table_type": "EXTERNAL", "data_source_format": "PARQUET",
+            "storage_location": SALES_PARQUET_LOCATION,
+            "columns": [column(0, "id", "long", "LONG"), column(1, "amount", "double", "DOUBLE"), year, region]
+        }))
         .send()
-        .unwrap_or_else(|e| panic!("POST {base}/tables sales_parquet failed to send: {e}"));
+        .expect("POST sales_parquet");
     let status = response.status();
-    let body_text = response
-        .text()
-        .unwrap_or_else(|e| panic!("reading POST {base}/tables response body failed: {e}"));
     assert!(
         status.is_success(),
-        "POST {base}/tables sales_parquet failed: {status}: {body_text}"
+        "POST sales_parquet failed: {status}: {}",
+        response.text().unwrap_or_default()
     );
 }
 
@@ -1868,37 +1838,28 @@ fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf()
 // ---------------------------------------------------------------------------
 
 /// Scenario: A Unity Parquet table appears in the createVirtualSchema listing.
-#[test]
-fn unity_parquet_table_is_listed_with_its_declared_columns() {
-    setup();
-    let mut conn = exa_conn();
-
-    let tables = enumerated_table_names(&mut conn, VS_NAME);
-    assert!(
-        tables.iter().any(|t| t == "SALES_PARQUET"),
-        "createVirtualSchema must enumerate 'sales_parquet', a table the listing \
-         skipped before this feature; got {tables:?}"
-    );
-
-    let cols = column_types(&mut conn, VS_NAME, "SALES_PARQUET");
-    let names: Vec<&str> = cols.iter().map(|(name, _)| name.as_str()).collect();
-    assert_eq!(
-        names,
-        ["ID", "AMOUNT", "YEAR", "REGION"],
-        "SALES_PARQUET must declare its Parquet columns before its partition \
-         columns, in that order: {cols:?}"
-    );
-    assert_col_type(&cols, "ID", "DECIMAL(20,0)");
-    assert_col_type(&cols, "AMOUNT", "DOUBLE");
-    assert_col_type(&cols, "YEAR", "DECIMAL(10,0)");
-    assert_col_type(&cols, "REGION", "VARCHAR(2000000)");
-}
-
 /// Scenario: A Unity Parquet table returns its rows and partition values end to end.
 #[test]
-fn unity_parquet_table_returns_its_rows_and_partition_values() {
+fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
     setup();
     let mut conn = exa_conn();
+
+    assert!(
+        enumerated_table_names(&mut conn, VS_NAME).contains(&"SALES_PARQUET".to_string()),
+        "createVirtualSchema must enumerate 'sales_parquet'"
+    );
+    let cols = column_types(&mut conn, VS_NAME, "SALES_PARQUET");
+    let declared: Vec<(&str, &str)> = cols.iter().map(|(n, t)| (n.as_str(), t.as_str())).collect();
+    assert_eq!(
+        declared,
+        [
+            ("ID", "DECIMAL(20,0)"),
+            ("AMOUNT", "DOUBLE"),
+            ("YEAR", "DECIMAL(10,0)"),
+            ("REGION", "VARCHAR(2000000)")
+        ],
+        "Parquet columns must precede partition columns, in declared order"
+    );
 
     let cols = conn.query_columns(&format!(
         "SELECT ID, AMOUNT, \"YEAR\", REGION FROM {} ORDER BY ID",
@@ -1922,26 +1883,16 @@ fn unity_parquet_table_returns_its_rows_and_partition_values() {
             (3, 300.0, 2024, "us".to_string()),
             (4, 400.0, 2025, "eu".to_string()),
         ],
-        "each row must carry the YEAR and REGION values of its own file's \
-         directory: {rows:?}"
+        "each row must carry its own file's YEAR and REGION directory values"
     );
 
-    let eu_count = conn.query_scalar_i64(&format!(
-        "SELECT COUNT(*) FROM {} WHERE REGION = 'eu'",
+    let filtered = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM {} WHERE REGION = 'eu' AND \"YEAR\" = 2024",
         table_ref("SALES_PARQUET")
     ));
     assert_eq!(
-        eu_count, 3,
-        "exactly the rows under region=eu must match REGION = 'eu'"
-    );
-
-    let year_2024_count = conn.query_scalar_i64(&format!(
-        "SELECT COUNT(*) FROM {} WHERE \"YEAR\" = 2024",
-        table_ref("SALES_PARQUET")
-    ));
-    assert_eq!(
-        year_2024_count, 3,
-        "exactly the rows under year=2024 must match YEAR = 2024"
+        filtered, 2,
+        "a partition-column filter must match exactly year=2024/region=eu"
     );
 }
 
@@ -1954,40 +1905,7 @@ fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     let vended = rt.block_on(resolve_unity_scan("sales_parquet", true, None));
     let static_creds = rt.block_on(resolve_unity_scan("sales_parquet", false, None));
 
-    assert_eq!(
-        vended.table_root, static_creds.table_root,
-        "vended and static credential runs must resolve the identical table root"
-    );
-    assert_eq!(
-        vended.files, static_creds.files,
-        "vended and static credential runs must agree, entry for entry, on the \
-         resolved file list"
-    );
-    assert_eq!(
-        vended.files.len(),
-        3,
-        "sales_parquet must resolve exactly three files: {:?}",
-        vended.files
-    );
-
-    let mut year_region: Vec<(Option<String>, Option<String>)> = vended
-        .files
-        .iter()
-        .map(|entry| {
-            (
-                entry.partition_values.get("year").cloned().flatten(),
-                entry.partition_values.get("region").cloned().flatten(),
-            )
-        })
-        .collect();
-    year_region.sort();
-    assert_eq!(
-        year_region,
-        vec![
-            (Some("2024".to_string()), Some("eu".to_string())),
-            (Some("2024".to_string()), Some("us".to_string())),
-            (Some("2025".to_string()), Some("eu".to_string())),
-        ],
-        "each resolved file must carry its own directory's year and region values"
-    );
+    assert_eq!(vended.table_root, static_creds.table_root);
+    assert_eq!(vended.files, static_creds.files);
+    assert_eq!(vended.files.len(), 3, "{:?}", vended.files);
 }

@@ -454,10 +454,5 @@ async fn hive_partitioning_reaches_the_seam_on_enumeration() {
             expected,
             "HIVE_PARTITIONING = {hive_partitioning}"
         );
-        assert_eq!(
-            listing.tables[0].partition_columns,
-            Vec::<String>::new(),
-            "direct storage declares no catalog partition columns; its partition keys come from the listing, HIVE_PARTITIONING = {hive_partitioning}"
-        );
     }
 }

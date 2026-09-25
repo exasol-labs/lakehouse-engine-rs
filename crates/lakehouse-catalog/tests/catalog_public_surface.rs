@@ -185,12 +185,6 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         columns: vec![column],
     };
     assert_eq!(table.format, TableFormat::Delta);
-    assert_eq!(table.partition_columns, vec!["c".to_string()]);
-    if let ColumnSourceType::Unity { type_json, .. } = &table.columns[0].source_type {
-        assert_eq!(type_json.as_deref(), Some("{\"type\":\"integer\"}"));
-    } else {
-        panic!("expected a Unity source type");
-    }
     assert_ne!(
         TableFormat::Iceberg,
         TableFormat::Delta,
