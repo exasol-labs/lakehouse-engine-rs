@@ -763,35 +763,36 @@ fn join_top_n_ranks_an_empty_string_key_as_null() {
     let customer = write_customer_with_blank_names(&dir);
     let emits = [ExaType::Int64, scan_fixture::varchar()];
 
-    let ascending = ordered_join_spec(
-        orders.clone(),
-        customer.clone(),
-        vec![
-            sort_key("C_NAME", true, true),
-            sort_key("O_ORDERKEY", true, true),
-        ],
-        2,
-    );
-    assert_eq!(
-        orderkey_name_rows(&run_join(&ascending, &emits)),
-        vec![(2, "Bob".to_string()), (5, "Bob".to_string())],
-        "under ASC NULLS LAST the empty-name rows rank last, as the NULLs Exasol receives"
-    );
-
-    let descending = ordered_join_spec(
-        orders,
-        customer,
-        vec![
-            sort_key("C_NAME", false, false),
-            sort_key("O_ORDERKEY", true, true),
-        ],
-        2,
-    );
-    assert_eq!(
-        orderkey_name_rows(&run_join(&descending, &emits)),
-        vec![(1, String::new()), (4, String::new())],
-        "under DESC NULLS FIRST the empty-name rows rank first, as the NULLs Exasol receives"
-    );
+    let cases = [
+        (
+            true,
+            true,
+            vec![(2, "Bob".to_string()), (5, "Bob".to_string())],
+            "under ASC NULLS LAST the empty-name rows rank last, as the NULLs Exasol receives",
+        ),
+        (
+            false,
+            false,
+            vec![(1, String::new()), (4, String::new())],
+            "under DESC NULLS FIRST the empty-name rows rank first, as the NULLs Exasol receives",
+        ),
+    ];
+    for (name_ascending, name_nulls_last, expected, message) in cases {
+        let spec = ordered_join_spec(
+            orders.clone(),
+            customer.clone(),
+            vec![
+                sort_key("C_NAME", name_ascending, name_nulls_last),
+                sort_key("O_ORDERKEY", true, true),
+            ],
+            2,
+        );
+        assert_eq!(
+            orderkey_name_rows(&run_join(&spec, &emits)),
+            expected,
+            "{message}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

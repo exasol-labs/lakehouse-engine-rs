@@ -157,54 +157,6 @@ async fn run_join_sql(ctx: &SessionContext, spec: &ScanSpec) -> Vec<RecordBatch>
         .expect("collect")
 }
 
-/// Column `idx`'s values across `batches`, downcast as `Utf8` text.
-fn utf8_values(batches: &[RecordBatch], idx: usize) -> Vec<String> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            let column = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("column must arrive as Utf8");
-            column.iter().map(|v| v.unwrap_or_default().to_string())
-        })
-        .collect()
-}
-
-/// Column `idx`'s values across `batches`, downcast as `Float64`.
-fn f64_values(batches: &[RecordBatch], idx: usize) -> Vec<f64> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            let column = batch
-                .column(idx)
-                .as_any()
-                .downcast_ref::<Float64Array>()
-                .expect("column must arrive as Float64");
-            column.values().to_vec()
-        })
-        .collect()
-}
-
-/// Column `idx`'s values across `batches`, `CAST(... AS VARCHAR)` (the JSON
-/// fallback rendering) before collecting as text.
-fn cast_text_values(batches: &[RecordBatch], idx: usize) -> Vec<String> {
-    batches
-        .iter()
-        .flat_map(|batch| {
-            let text = arrow::compute::cast(batch.column(idx), &DataType::Utf8).unwrap();
-            let text = text
-                .as_any()
-                .downcast_ref::<StringArray>()
-                .expect("column must arrive as text (JSON fallback)");
-            text.iter()
-                .map(|v| v.unwrap_or_default().to_string())
-                .collect::<Vec<_>>()
-        })
-        .collect()
-}
-
 /// A join block carrying a cap but no ordering renders the unordered SQL it always
 /// has: no `ORDER BY`, the cap last.
 #[tokio::test]
@@ -249,7 +201,18 @@ async fn build_join_sql_ranks_a_json_rendered_key_by_its_emitted_text() {
 
     let batches = run_join_sql(&ctx, &spec).await;
 
-    assert_eq!(utf8_values(&batches, 2), vec!["[10]".to_string()]);
+    let values: Vec<Option<&str>> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column must arrive as Utf8")
+                .iter()
+        })
+        .collect();
+    assert_eq!(values, vec![Some("[10]")]);
 }
 
 /// A `NaN` in a `Float64` key ranks as the NULL that `emit_batch` emits for it
@@ -266,7 +229,18 @@ async fn build_join_sql_ranks_a_nan_float_key_as_null() {
 
     let batches = run_join_sql(&ctx, &spec).await;
 
-    assert_eq!(f64_values(&batches, 2), vec![1.0]);
+    let values: Vec<Option<f64>> = batches
+        .iter()
+        .flat_map(|batch| {
+            let column = batch
+                .column(2)
+                .as_any()
+                .downcast_ref::<Float64Array>()
+                .expect("column must arrive as Float64");
+            (0..column.len()).map(|i| column.is_valid(i).then(|| column.value(i)))
+        })
+        .collect();
+    assert_eq!(values, vec![Some(1.0)]);
 }
 
 /// The `CAST(... AS VARCHAR)` fallback path (an out-of-range `Decimal128`) also
@@ -287,5 +261,18 @@ async fn build_join_sql_ranks_a_cast_fallback_key_by_its_emitted_text() {
 
     let batches = run_join_sql(&ctx, &spec).await;
 
-    assert_eq!(cast_text_values(&batches, 2), vec!["10".to_string()]);
+    let values: Vec<Option<String>> = batches
+        .iter()
+        .flat_map(|batch| {
+            let text = arrow::compute::cast(batch.column(2), &DataType::Utf8).unwrap();
+            let text = text
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("column must arrive as text (JSON fallback)");
+            text.iter()
+                .map(|v| v.map(str::to_string))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(values, vec![Some("10".to_string())]);
 }

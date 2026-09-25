@@ -40,7 +40,12 @@ seam.
 
 ### Consequences
 
-The rule assumes DataFusion's comparison of two strings agrees with Exasol's VARCHAR comparison;
-the flat-scan top-N path makes the same assumption, and this plan does not verify it. A future
-fix of issue #246 that changes the emitted `NaN` value changes this rule with it. Every future
-per-shard sort, including a fix of the flat-scan path's ranking divergence, follows this rule.
+The rule assumes DataFusion's comparison of two strings agrees with Exasol's VARCHAR comparison.
+For partition-value range/`BETWEEN` comparisons this is already verified live against a running
+Exasol instance — both use byte/codepoint order (`specs/vs-adapter/direct-storage-hive-partitioning/spec.md`,
+the partition-pruning scenario). What remains unverified is that the same equivalence extends from
+partition-value strings to an arbitrary post-join sort key's string value (e.g. longer values, or
+values under a non-default NLS/collation setting); the flat-scan top-N path makes the same
+unverified extension. A future fix of issue #246 that changes the emitted `NaN` value changes this
+rule with it. Every future per-shard sort, including a fix of the flat-scan path's ranking
+divergence, follows this rule.
