@@ -5,10 +5,8 @@
 #     -f docker-compose.lakekeeper.azure.yml up -d --wait \
 #     exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
 #
-# Drops `lakekeeper`'s `minio: service_healthy` dependency — this suite's
-# warehouse storage is ADLS Gen2, not MinIO. `!override` (not a plain key) is
-# required: Compose merges depends_on maps by key, so a plain override can't
-# remove an entry.
+# Drops lakekeeper's minio dependency (storage is ADLS Gen2); `!override` is
+# required because Compose merges depends_on maps by key.
 services:
   lakekeeper:
     depends_on: !override

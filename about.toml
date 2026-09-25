@@ -1,5 +1,6 @@
-# cargo-about config for the third-party license bundle attached to GitHub
-# Releases. Keep `accepted` in sync with deny.toml's [licenses].allow — they
+# Keep in sync with deny.toml's [licenses].allow; "OpenSSL" is the only
+# intentional extra (native-tls/openssl-sys combined notice).
+accepted` in sync with deny.toml's [licenses].allow — they
 # must name the same set of licenses (this list adds "OpenSSL", which
 # native-tls/openssl-sys carry as a combined notice; that's the only
 # intentional difference).

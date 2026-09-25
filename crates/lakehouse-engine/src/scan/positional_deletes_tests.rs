@@ -41,12 +41,7 @@ fn get_test_schema_descr() -> SchemaDescPtr {
     Arc::new(SchemaDescriptor::new(Arc::new(schema)))
 }
 
-/// Vendored verbatim from apache/iceberg-rust's own unit test for
-/// `build_deletes_row_selection` (tag `v0.10.0`), adapted only to feed a
-/// `RoaringTreemap` directly. It is the correctness oracle for the vendored
-/// row-group-boundary algorithm: it exercises skip/select runs at the first,
-/// intermediate, and last positions of skipped and selected row groups, both
-/// with row-group selection enabled (`Some([1, 3])`) and disabled (`None`).
+/// Scenario: the vendored row-selection matches apache/iceberg-rust's own oracle test (tag `v0.10.0`).
 #[test]
 fn build_deletes_row_selection_matches_upstream() {
     let schema_descr = get_test_schema_descr();
@@ -72,7 +67,6 @@ fn build_deletes_row_selection_matches_upstream() {
         2001, 2100, 2200, 2201, 2202, 2999, 3000,
     ]);
 
-    // using selected row groups 1 and 3
     let result = build_deletes_row_selection(
         &row_groups_metadata,
         &selected_row_groups,
@@ -95,7 +89,6 @@ fn build_deletes_row_selection_matches_upstream() {
 
     assert_eq!(result, expected);
 
-    // selecting all row groups
     let result = build_deletes_row_selection(&row_groups_metadata, &None, &positional_deletes);
 
     let expected = RowSelection::from(vec![
@@ -125,11 +118,7 @@ fn build_deletes_row_selection_matches_upstream() {
     assert_eq!(result, expected);
 }
 
-/// Task 2.4: the base `ParquetAccessPlan` built from the whole-file
-/// `RowSelection` recombines (via `into_overall_row_selection`) to EXACTLY
-/// the whole-file selection — i.e. splitting per row group then letting the
-/// opener recombine is lossless. Row groups the deletes don't touch stay
-/// `Scan`; touched row groups become `Selection`.
+/// Scenario: the per-row-group access plan recombines losslessly to the whole-file selection.
 #[test]
 fn access_plan_round_trips_to_whole_file_selection() {
     use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
@@ -145,18 +134,15 @@ fn access_plan_round_trips_to_whole_file_selection() {
         build_test_row_group_meta(schema_descr.clone(), columns.clone(), 500, 2),
     ];
 
-    // Deletes touch row group 0 (pos 0, 999) and row group 2 (pos 1500), but
-    // NOT row group 1 (rows 1000..1500).
+    // Deletes touch row groups 0 and 2 but not row group 1 (rows 1000..1500).
     let deletes = RoaringTreemap::from_iter([0u64, 999, 1500]);
 
     let plan = build_access_plan(&metas, &deletes);
 
-    // Row group 1 is untouched ⇒ left as Scan; 0 and 2 carry a Selection.
     assert!(matches!(plan.inner()[0], RowGroupAccess::Selection(_)));
     assert!(matches!(plan.inner()[1], RowGroupAccess::Scan));
     assert!(matches!(plan.inner()[2], RowGroupAccess::Selection(_)));
 
-    // Recombining the per-row-group plan yields the whole-file selection.
     let whole = build_deletes_row_selection(&metas, &None, &deletes);
     let recombined = plan
         .into_overall_row_selection(&metas)
@@ -165,8 +151,7 @@ fn access_plan_round_trips_to_whole_file_selection() {
     assert_eq!(recombined, whole);
 }
 
-/// Task 2.4: a fully-deleted file — every row of every row group deleted —
-/// yields an access plan whose overall selection skips all rows.
+/// Scenario: a fully-deleted file yields an access plan skipping all rows.
 #[test]
 fn access_plan_fully_deleted_file_selects_no_rows() {
     let schema_descr = get_test_schema_descr();
@@ -186,12 +171,7 @@ fn access_plan_fully_deleted_file_selects_no_rows() {
     );
 }
 
-/// Task 2.3: a positional-delete file whose `file_path` column references
-/// TWO data files (the `partition` granularity shape) is bucketed by
-/// `file_path`, restricted to the assigned data files. Only the assigned
-/// file's `pos` values survive; the sibling file (absent from the assigned
-/// set) is filtered out. Columns are located by Iceberg reserved field-id,
-/// and the read never issues a HEAD (the size is supplied on the `ObjectMeta`).
+/// Scenario: a partition-granularity delete file is bucketed by `file_path`, restricted to assigned files.
 #[test]
 fn reads_and_filters_delete_positions_by_file_path() {
     use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -246,15 +226,12 @@ fn reads_and_filters_delete_positions_by_file_path() {
             e_tag: None,
             version: None,
         };
-        // Only `target` is assigned to this shard; `other` is a sibling file.
         let assigned = HashSet::from([target.to_string()]);
         read_delete_file_positions(store, meta, &assigned, &[])
             .await
             .unwrap()
     });
 
-    // Only f1's positions (3, 7, 9) are bucketed; f2's position (5) is
-    // filtered out because f2 is not in the assigned set.
     assert_eq!(
         by_data_file
             .get(target)
@@ -269,11 +246,7 @@ fn reads_and_filters_delete_positions_by_file_path() {
     );
 }
 
-/// The read-time backstop dispatches on the delete mechanism's own variant, and
-/// exactly two reach the delete-application pipeline: an Iceberg positional-delete
-/// file yields the payload the delete read needs, a Delta deletion vector yields a
-/// resolved vector, and the two Iceberg mechanisms this engine never applies are
-/// refused with a clean, credential-redacted error naming the offending delete FILE.
+/// Scenario: only positional-delete files and deletion vectors pass the backstop; other mechanisms are refused cleanly.
 #[test]
 fn only_iceberg_equality_and_puffin_delete_mechanisms_are_refused() {
     const SECRET: &str = "SECRETKEY";
@@ -349,9 +322,7 @@ fn only_iceberg_equality_and_puffin_delete_mechanisms_are_refused() {
     assert!(!err.contains(SECRET), "must not leak credentials: {err}");
 }
 
-/// Build a single-row-group meta whose `file_path` column (index 0) carries
-/// the given byte-array min/max statistics (or no statistics when the tuple
-/// is `(None, None)` AND `with_stats` is false).
+/// Statistics are omitted entirely when `with_stats` is false.
 fn row_group_with_file_path_stats(
     min: Option<&str>,
     max: Option<&str>,
@@ -379,9 +350,7 @@ fn row_group_with_file_path_stats(
     build_test_row_group_meta(schema_descr.clone(), vec![col0, col1], 4, 0)
 }
 
-/// Task 3: pruning is range-based. A row group is decoded when an assigned
-/// path falls within the `[min, max]` byte range, and pruned only when EVERY
-/// assigned path sorts strictly outside it — on either side.
+/// Scenario: a row group is pruned only when every assigned path sorts outside `[min, max]`.
 #[test]
 fn pruning_is_range_based() {
     let rg = row_group_with_file_path_stats(
@@ -408,8 +377,7 @@ fn pruning_is_range_based() {
         "a path strictly after max must be pruned"
     );
 
-    // Two assigned paths straddling the range but neither inside it: the row
-    // group cannot hold either file's deletes, so it is pruned.
+    // Straddling but neither inside: pruned.
     let straddle = HashSet::from([
         "s3://b/data/f1.parquet".to_string(),
         "s3://b/data/f9.parquet".to_string(),
@@ -420,9 +388,7 @@ fn pruning_is_range_based() {
     );
 }
 
-/// Task 3: a row group with absent statistics — no `Statistics` at all, or a
-/// `Statistics` whose min/max are unset — MUST be decoded (overlap cannot be
-/// ruled out).
+/// Scenario: a row group with absent or unset statistics is always decoded.
 #[test]
 fn absent_statistics_are_never_pruned() {
     let assigned = HashSet::from(["s3://b/data/f1.parquet".to_string()]);
@@ -440,15 +406,9 @@ fn absent_statistics_are_never_pruned() {
     );
 }
 
-/// Task 3: Parquet truncates string statistics (min DOWN, max UP), so a
-/// row group's real paths can be strictly inside its truncated `[min, max]`.
-/// A byte-wise RANGE test still decodes it correctly, where an
-/// `min == max == target` equality shortcut would wrongly prune it (min, max
-/// and target are three distinct strings here).
+/// Scenario: truncated `[min, max]` bounds bracketing longer real paths still decode.
 #[test]
 fn truncated_bounds_keep_range_valid() {
-    // Truncated min "…/f" sorts below every real "…/file_*"; truncated max
-    // "…/g" sorts above every real "…/file_*".
     let rg = row_group_with_file_path_stats(
         Some("s3://bucket/data/f"),
         Some("s3://bucket/data/g"),
@@ -461,9 +421,7 @@ fn truncated_bounds_keep_range_valid() {
     );
 }
 
-/// Task 3: reading a multi-row-group delete file whose row groups carry
-/// disjoint `file_path` ranges yields EXACTLY the assigned file's positions —
-/// the pruned read equals an unpruned read (correctness-preserving).
+/// Scenario: a pruned multi-row-group delete-file read equals an unpruned one.
 #[test]
 fn reads_multi_row_group_delete_file_correctly() {
     use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -487,8 +445,7 @@ fn reads_multi_row_group_delete_file_correctly() {
             .with_metadata(field_id_meta(FIELD_ID_POSITIONAL_DELETE_POS)),
     ]));
 
-    // Rows sorted by (file_path, pos) as Iceberg requires; two rows per row
-    // group ⇒ each data file lands in its own row group with a tight range.
+    // Sorted by (file_path, pos) as Iceberg requires, one data file per row group.
     let f1 = "s3://bucket/db/t/data/f1.parquet";
     let f2 = "s3://bucket/db/t/data/f2.parquet";
     let f3 = "s3://bucket/db/t/data/f3.parquet";
@@ -525,8 +482,6 @@ fn reads_multi_row_group_delete_file_correctly() {
             e_tag: None,
             version: None,
         };
-        // Only f2 is assigned: its row group must be decoded, the f1 and f3
-        // row groups pruned. The result must still be exactly f2's positions.
         let assigned = HashSet::from([f2.to_string()]);
         read_delete_file_positions(store, meta, &assigned, &[])
             .await
@@ -542,7 +497,6 @@ fn reads_multi_row_group_delete_file_correctly() {
     assert!(!by_data_file.contains_key(f3));
 }
 
-/// A shard's data-file entry carrying the given delete mechanisms.
 fn entry_with(path: &str, deletes: Vec<DeleteMechanism>) -> FileEntry {
     FileEntry {
         path: path.to_string(),
@@ -552,11 +506,8 @@ fn entry_with(path: &str, deletes: Vec<DeleteMechanism>) -> FileEntry {
     }
 }
 
-/// A provider over `files` rooted at `table_root`, holding an N-permit read budget.
-/// Built field-by-field because Phase A needs none of the session-bound state
-/// [`PositionalDeleteScanTable::new`] derives from a storage backend — except the
-/// Parquet read options, which come from the same production decision so this
-/// helper cannot read files under options production never uses.
+/// Built field-by-field since Phase A needs no session-bound state; the Parquet format still comes
+/// from the production decision.
 fn scan_table_over(
     files: Vec<FileEntry>,
     table_root: &str,
@@ -582,7 +533,6 @@ fn scan_table_over(
     }
 }
 
-/// Serialize an Iceberg positional-delete file naming `(data file, position)` pairs.
 fn positional_delete_file_bytes(rows: &[(&str, i64)]) -> Vec<u8> {
     use arrow::array::{Int64Array, RecordBatch, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -620,8 +570,7 @@ fn positional_delete_file_bytes(rows: &[(&str, i64)]) -> Vec<u8> {
     buf
 }
 
-/// The 45-byte deletion-vector container Delta wrote for the vendored
-/// `table-with-dv-small` fixture, and the descriptor its commit logs for it.
+/// Real Delta writer output for the `table-with-dv-small` fixture.
 const DV_SIDECAR_BODY: &[u8] = include_bytes!(
     "../../../../scripts/unity/fixtures/table-with-dv-small/deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin"
 );
@@ -638,9 +587,7 @@ fn logged_deletion_vector() -> DeleteMechanism {
     }
 }
 
-/// A shard mixing Iceberg positional-delete files with Delta deletion vectors
-/// accumulates BOTH into one map from data-file path to deleted positions, and the
-/// sidecar two data files share is fetched exactly once for the whole shard.
+/// Scenario: mixed positional deletes and deletion vectors merge into one map; a shared sidecar is fetched once.
 #[test]
 fn both_delete_mechanisms_converge_on_one_position_map() {
     use object_store::memory::InMemory;
@@ -729,8 +676,7 @@ fn both_delete_mechanisms_converge_on_one_position_map() {
     );
 }
 
-/// An unapplicable mechanism anywhere in the shard fails the whole shard before a
-/// single delete-file body or deletion-vector sidecar is fetched.
+/// Scenario: an unapplicable mechanism anywhere fails the shard before any fetch.
 #[test]
 fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
     use object_store::ObjectStore;
@@ -769,8 +715,7 @@ fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
     assert_eq!(reads, 0, "no body is fetched once the backstop has refused");
 }
 
-/// An [`ObjectStore`] that records the location of every data read it forwards, so a
-/// test can assert how many times a shard actually went to storage for one object.
+/// Records every forwarded data read so a test can count storage trips per object.
 #[derive(Debug)]
 struct CountingObjectStore {
     inner: Arc<dyn ObjectStore>,
@@ -869,9 +814,6 @@ impl ObjectStore for CountingObjectStore {
     }
 }
 
-/// The provider from [`scan_table_over`] re-registered under a declared schema and
-/// its partition columns, so a test can exercise the split without restating every
-/// session-independent field.
 fn scan_table_partitioned_by(
     files: Vec<FileEntry>,
     declared: SchemaRef,
@@ -901,7 +843,6 @@ fn entry_in_partition(path: &str, part: Option<&str>) -> FileEntry {
     )
 }
 
-/// A session whose runtime resolves the `memory://` store the test provider scans.
 fn memory_session() -> datafusion::execution::session_state::SessionState {
     use datafusion::prelude::SessionContext;
     let ctx = SessionContext::new();
@@ -912,8 +853,7 @@ fn memory_session() -> datafusion::execution::session_state::SessionState {
     ctx.state()
 }
 
-/// The registered table's schema is what a query sees, so it stays in DECLARED
-/// order even though the scan reads through `file ++ partition` order.
+/// Scenario: the registered schema stays in declared order despite the `file ++ partition` scan order.
 #[test]
 fn the_provider_reports_the_declared_schema_while_scanning_the_split_one() {
     let declared = partitioned_declared_schema();
@@ -944,8 +884,7 @@ fn the_provider_reports_the_declared_schema_while_scanning_the_split_one() {
     );
 }
 
-/// Each assigned file carries ITS OWN partition value, converted to the column's
-/// declared type and positioned to line up with `table_partition_cols`.
+/// Scenario: each file carries its own partition value, typed and aligned with `table_partition_cols`.
 #[test]
 fn each_partitioned_file_carries_its_own_logged_partition_values() {
     let table = scan_table_partitioned_by(
@@ -987,8 +926,7 @@ fn each_partitioned_file_carries_its_own_logged_partition_values() {
     );
 }
 
-/// An unpartitioned scan attaches no partition value at all, so its
-/// `PartitionedFile`s are what they were before partition materialization existed.
+/// Scenario: an unpartitioned scan attaches no partition values.
 #[test]
 fn an_unpartitioned_scan_attaches_no_partition_values() {
     let table = scan_table_over(
@@ -1008,8 +946,7 @@ fn an_unpartitioned_scan_attaches_no_partition_values() {
     assert!(files[0].partition_values.is_empty());
 }
 
-/// A value the declared type cannot represent fails the scan before any
-/// object-store read, on the same terms an unapplicable delete mechanism does.
+/// Scenario: an unrepresentable partition value fails the scan before any object-store read.
 #[test]
 fn an_unrepresentable_partition_value_fails_the_scan() {
     let table = scan_table_partitioned_by(

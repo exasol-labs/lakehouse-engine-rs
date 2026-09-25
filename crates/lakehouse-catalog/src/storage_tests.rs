@@ -7,9 +7,7 @@ const ACCESS_KEY: &str = "AKIDEXAMPLE";
 const SECRET_KEY: &str = "wJalrXUtnFEMI_EXAMPLE_KEY";
 const SESSION_TOKEN: &str = "FwoGZXIvYXdzEXAMPLE_TOKEN";
 
-/// Every connection field populated, a session token present, and
-/// `allow_http` deliberately ON — the latter is NOT an iceberg storage config
-/// key, so an exact map comparison against this fixture pins its absence.
+/// `allow_http` is ON so exact map comparisons pin that it is not an iceberg config key.
 fn populated_backend() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: ENDPOINT.into(),
@@ -22,7 +20,6 @@ fn populated_backend() -> StorageBackend {
     })
 }
 
-/// The exact six-key iceberg config map [`populated_backend`] must produce.
 fn expected_populated_config() -> HashMap<String, String> {
     HashMap::from([
         (S3_ENDPOINT.to_string(), ENDPOINT.to_string()),
@@ -104,9 +101,7 @@ fn addresses_scheme_rejects_an_unrelated_scheme_for_either_backend() {
     assert!(!adls.addresses_scheme("gs"));
 }
 
-/// A `Some("")` session token is gated on presence, NOT on being non-empty —
-/// unlike the four connection fields. Preserved verbatim from the pre-refactor
-/// `if let Some(token)` so the props map stays byte-identical.
+/// Scenario: A present-but-empty session token is still emitted, unlike empty connection fields
 #[test]
 fn catalog_storage_props_emits_a_present_but_empty_session_token() {
     let backend = StorageBackend::S3(StorageProps {
@@ -176,10 +171,7 @@ fn s3_round_trips_through_its_tagged_encoding() {
     );
 }
 
-/// The externally-tagged decision, asserted from the decode side: a bare
-/// (untagged) props object and an unknown or wrong-case variant key must
-/// all be rejected rather than resolved by trial deserialization — for
-/// both the `s3` and `adls` variants.
+/// Scenario: Untagged, unknown, wrong-case, or mismatched variant payloads are rejected
 #[test]
 fn only_matching_lowercase_variant_keys_decode() {
     for payload in [
@@ -198,9 +190,6 @@ fn only_matching_lowercase_variant_keys_decode() {
     }
 }
 
-/// Mirrors [`populated_backend`]/[`expected_populated_config`] for the S3
-/// arm: each `AdlsCred` state must produce exactly the account-name key
-/// plus its one matching credential key, nothing else.
 #[test]
 fn adls_catalog_storage_props_emit_the_account_and_one_credential_key() {
     let account_key_backend = StorageBackend::Adls {
@@ -277,10 +266,7 @@ fn adls_secret_values_are_the_one_credential_and_omit_an_empty_one() {
     );
 }
 
-/// The manual `Debug` impl on `AdlsCred` is what stands between a
-/// logged/`{:?}`-formatted error and a live storage credential, so both
-/// credential states — standalone and wrapped in the `Adls` backend
-/// variant — must never print the secret.
+/// Scenario: AdlsCred never prints its secret via Debug, standalone or inside StorageBackend
 #[test]
 fn adls_cred_is_redacted_in_debug_output() {
     let account_key = AdlsCred::AccountKey("azure-static-key-secret".into());
@@ -342,10 +328,6 @@ fn adls_round_trips_through_its_tagged_encoding() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Shared vended derivations: scheme_of, location_host, adls_account_name.
-// ---------------------------------------------------------------------------
-
 #[test]
 fn scheme_of_lowercases_a_mixed_case_scheme() {
     assert_eq!(scheme_of("S3A://bucket/key"), "s3a");
@@ -361,9 +343,7 @@ fn location_host_reads_the_authority_when_there_is_no_userinfo() {
     assert_eq!(location_host("s3://bucket/db/t"), "bucket");
 }
 
-/// The container segment of an ADLS location (`<container>@<host>`) is userinfo,
-/// not part of the host — reading it as the host would select the wrong SAS key
-/// and the wrong account name.
+/// Scenario: An ADLS `<container>@` segment is userinfo, not part of the host
 #[test]
 fn location_host_reads_the_host_after_the_container_userinfo() {
     let host = "myacct.dfs.core.windows.net";
@@ -383,11 +363,7 @@ fn adls_account_name_reads_the_hosts_leading_label() {
     );
 }
 
-/// A location whose storage host has no leading label — either an empty
-/// authority behind a `<container>@` segment, or a host whose first
-/// dot-separated label is itself empty — carries no account name to read; the
-/// shared refusal names both the location and the offending host, and neither
-/// catalog kind.
+/// Scenario: A storage host with no leading label yields a catalog-neutral refusal
 #[test]
 fn adls_account_name_errs_when_the_host_has_no_leading_label() {
     for location in [
@@ -414,15 +390,6 @@ fn adls_account_name_errs_when_the_host_has_no_leading_label() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The store address a CONNECTION may contribute to a vended resolution.
-// ---------------------------------------------------------------------------
-
-// ---------------------------------------------------------------------------
-// Shared construction: the consent gates and the address rule every caller of
-// the construction functions passes through, whichever catalog kind vended.
-// ---------------------------------------------------------------------------
-
 const ADLS_HOST: &str = "myacct.dfs.core.windows.net";
 const VENDED_SAS: &str = "sv=2024-11-04&sig=VENDED_SAS_SIGNATURE";
 
@@ -433,11 +400,7 @@ fn user_message(error: UdfError) -> String {
     }
 }
 
-/// Scenario: `abfs://` names plaintext transport and this engine has no plaintext
-/// Azure path, so honouring one takes the operator's `ALLOW_HTTP` consent rather
-/// than a silent upgrade onto HTTPS. `abfss://` already names TLS, so consent is
-/// never asked for it — the gate is on the transport the scheme names, not on
-/// the backend it selects.
+/// Scenario: `abfs://` requires ALLOW_HTTP consent; `abfss://` is never gated
 #[test]
 fn adls_backend_gates_abfs_on_allow_http_and_never_gates_abfss() {
     let plaintext = format!("abfs://mycontainer@{ADLS_HOST}/db/t");
@@ -519,13 +482,7 @@ fn vended_s3(endpoint: Option<&str>, region: Option<&str>, path_style: Option<bo
     }
 }
 
-/// Scenario: the plaintext gate reads the endpoint that RESOLVES, not the one the
-/// catalog vended. A CONNECTION `http://` endpoint wins the address rule over an
-/// HTTPS vended one or over none at all, so a gate reading only the vended value
-/// would wave through the very plaintext transport the operator withheld consent
-/// for — and would do so precisely when the CONNECTION's value is the one the
-/// scan reads through. The gate's scheme match is case-insensitive, so a
-/// `HTTP://` spelling must be refused exactly like `http://`.
+/// Scenario: The plaintext gate reads the resolved endpoint, case-insensitively, including a CONNECTION-supplied one
 #[test]
 fn s3_backend_gates_a_plaintext_endpoint_the_connection_supplied() {
     let plaintext = "http://minio:9000";
@@ -582,11 +539,7 @@ fn s3_backend_gates_a_plaintext_endpoint_the_connection_supplied() {
     );
 }
 
-/// Scenario: the store address resolves `endpoint` and `region` INDEPENDENTLY —
-/// the CONNECTION's value when non-empty, else the vended one, else empty. Read
-/// as a pair, a CONNECTION that configured only a region would drag the vended
-/// endpoint out of the resolution with it (or the reverse), which is a store
-/// address neither source asked for.
+/// Scenario: Endpoint and region resolve independently, CONNECTION first, then vended
 #[test]
 fn store_address_resolves_endpoint_and_region_independently_with_the_connection_winning() {
     let connection_endpoint = "https://connection.endpoint.invalid";
@@ -647,12 +600,7 @@ fn store_address_resolves_endpoint_and_region_independently_with_the_connection_
     }
 }
 
-/// Scenario: a vended response that states neither a region nor an endpoint,
-/// beside a CONNECTION that configures neither, resolves SUCCESSFULLY with both
-/// empty. This is exactly the shape a real Databricks AWS response takes — a
-/// short-lived key pair and no address at all — so refusing it at plan time would
-/// reject a legal table; the AWS default credential and region chain places the
-/// store at read time instead.
+/// Scenario: A store address empty on both sides resolves (Databricks AWS vends no address)
 #[test]
 fn a_both_empty_store_address_resolves_rather_than_refusing() {
     let props = s3_payload(
@@ -675,12 +623,7 @@ fn a_both_empty_store_address_resolves_rather_than_refusing() {
     );
 }
 
-/// Scenario: `path_style` composes the response's stated `s3.path-style-access`
-/// with whether an endpoint RESOLVED. A stated value always wins — that is the
-/// operator-visible override — and only its absence falls back to the resolved
-/// endpoint. The fallback reads the RESOLVED endpoint, so a CONNECTION-supplied
-/// endpoint beside a silent response is reachable rather than silently dropped
-/// for a virtual-hosted host derived from the region.
+/// Scenario: A stated vended path_style wins; otherwise it follows whether an endpoint resolved
 #[test]
 fn path_style_composes_the_vended_override_with_the_resolved_endpoint() {
     let endpoint = "https://minio.invalid";

@@ -4,31 +4,16 @@ use crate::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage, StorageProps,
 };
 
-// ---------------------------------------------------------------------------
-// Task 4.4 — catalog-auth secrets never in ScanSpec
-//
-// Relocated from the former `pushdown/credentials.rs` when that module moved
-// into `lakehouse-catalog`: the assertion is about the ENGINE's scan-spec
-// serialization, and the catalog crate must not name `ScanSpec`,
-// `CommonScanSpec`, or `FileEntry`. The four vended sentinels it reads are
-// re-declared here with the same literal values the crate's own
-// `test_support` uses, so both sides' assertions stay comparable.
-// ---------------------------------------------------------------------------
-
+// The vended sentinels below repeat the literal values `lakehouse-catalog`'s own
+// `test_support` uses, so both crates' assertions stay comparable.
 const VENDED_AK: &str = "VENDED_AK_SENTINEL";
 const VENDED_SK: &str = "VENDED_SK_SENTINEL";
 const VENDED_TOK: &str = "VENDED_TOKEN_SENTINEL";
 const VENDED_REGION: &str = "eu-west-2";
 
-/// Scenario: Catalog auth props are never placed in any scan spec, even when
-/// `use_vended_credentials` is enabled and vended creds are in the storage.
-///
-/// The ScanSpec must carry ONLY S3 storage credentials (vended or static).
-/// Auth fields (`token`, `client_secret`, etc.) must never appear in the JSON.
+/// Scenario: Catalog auth props are never placed in any scan spec, even with vended credentials.
 #[test]
 fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
-    // Build a spec with VENDED storage credentials (simulating what
-    // the format-reader seam returns after vended extraction).
     let vended_storage = StorageBackend::S3(StorageProps {
         endpoint: "https://s3.amazonaws.com".into(),
         region: VENDED_REGION.into(),
@@ -53,9 +38,7 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
 
     let json = spec.to_json();
 
-    // Auth field NAMES must never appear as JSON keys in the serialized spec.
-    // Check for the exact key pattern `"<field>":` to avoid false-positives
-    // from legitimate substrings (e.g. `"session_token"` contains `"token"`).
+    // Match `"<field>":` exactly, since e.g. `"session_token"` contains `"token"`.
     for field in [
         "\"token\":",
         "\"credential\":",
@@ -63,8 +46,7 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
         "\"client_secret\":",
         "\"oauth2_server_uri\":",
         "\"oauth2-server-uri\":",
-        // scope is too short and appears in storage endpoint strings, so it
-        // is checked by key name only, above, not by a sentinel value.
+        // scope appears in storage endpoint strings, so it is checked by key name only.
     ] {
         assert!(
             !json.contains(field),
@@ -72,7 +54,6 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
         );
     }
 
-    // Vended credentials MUST be present in the storage block.
     assert!(
         json.contains(VENDED_AK),
         "vended access_key must be in storage: {json}"
@@ -83,11 +64,7 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// ScanSpec GROUP BY — group-key fragments propagated to the scan spec
-// ---------------------------------------------------------------------------
-
-/// Grouped scan spec carries group-key rendered SQL fragments.
+/// Scenario: A grouped scan spec carries the group keys' rendered SQL fragments.
 #[test]
 fn grouped_scan_spec_carries_group_keys() {
     let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
@@ -110,11 +87,7 @@ fn grouped_scan_spec_carries_group_keys() {
     assert_eq!(keys, group_keys, "group_keys must survive spec round-trip");
 }
 
-/// Scenario: A LIKE-only filter still yields a valid `ScanSpec.filter` (DataFusion
-/// evaluates it) while `to_iceberg_predicate` returns `None` (no file pruning).
-///
-/// This confirms the correctness invariant: LIKE is not prunable but remains
-/// fully enforced by DataFusion.
+/// Scenario: A LIKE-only filter still yields a DataFusion filter but no Iceberg pruning predicate.
 #[test]
 fn like_filter_yields_df_string_and_no_iceberg_predicate() {
     use crate::adapter::iceberg_predicate::to_iceberg_predicate;
@@ -137,14 +110,12 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
         "pattern": {"type": "literal_string", "value": "A%"}
     });
 
-    // DataFusion path must still yield Some (LIKE is translatable to DataFusion SQL).
     let df_filter = render_df_filter_safe(&filter_json);
     assert!(
         df_filter.is_some(),
         "LIKE filter must still produce a DataFusion SQL string: {df_filter:?}"
     );
 
-    // Iceberg path must be None — LIKE is not soundly prunable.
     let iceberg_pred = to_iceberg_predicate(&filter_json, &schema);
     assert!(
         iceberg_pred.is_none(),
@@ -152,26 +123,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
     );
 }
 
-/// Wiring sanity: the WHERE-clause filter chain composes
-/// `string_function_arg_type_guard` and `rewrite_decimal_stringifications` between
-/// `like_subject_type_guard` and `render_df_filter_safe`, so a
-/// `LENGTH(<DECIMAL column>) > 5` predicate renders with Exasol's trailing-zero-trim
-/// form wrapping the column EXACTLY ONCE (issue #211's headline COUNT-divergence
-/// repro) — NOT a bare `character_length("C_DECIMAL_A")` over DataFusion's untrimmed
-/// decimal→string, and NOT a double-wrapped trim. `string_function_arg_type_guard`
-/// coerces `LENGTH`'s bare DECIMAL argument into a `decimal_to_varchar_exasol` node
-/// first, so by the time `rewrite_decimal_stringifications` runs, the argument is no
-/// longer a bare column and its own CONCAT/LENGTH-specific DECIMAL handling is a
-/// no-op — a composition `string_function_arg_type_guard`'s own unit tests cannot
-/// observe, since `rewrite_decimal_stringifications` is only chained after it here.
-/// Calls the same pipeline function `handle_pushdown` calls
-/// (`apply_type_rewrites`, then `render_df_filter_safe`) on the
-/// DataFusion-bound filter tree.
-///
-/// Mirrors only the NO-DECLINE half of production's filter pipeline:
-/// `handle_pushdown` classifies through `classify_where_filter`, which routes a
-/// DECLINED filter to the qualified single-table wrapper rather than into the scan
-/// spec. This fixture renders, so the mirror and production agree.
+/// Scenario: `LENGTH(<DECIMAL>) > 5` renders the Exasol trim form exactly once through the WHERE pipeline (#211).
 #[test]
 fn where_filter_decimal_stringification_rewritten_to_trim() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -203,20 +155,7 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
     );
 }
 
-/// Exhaustive coverage: a DECIMAL column in a NON-stringifying WHERE
-/// filter context (`c_decimal_a > 5`, a `predicate_greater` — not a stringifier)
-/// renders EXACTLY as before this fix through the same pipeline function
-/// (`apply_type_rewrites`) as
-/// `where_filter_decimal_stringification_rewritten_to_trim` — the DECIMAL column
-/// stays a bare, unwrapped column reference, proving the WHERE-path wiring doesn't
-/// over-wrap a non-stringifying context. `predicate_greater` is not a
-/// `function_scalar`, so `string_function_arg_type_guard` has nothing to dispatch on
-/// here and the rendering is byte-identical to before this guard was wired in.
-///
-/// Mirrors only the NO-DECLINE half of production's filter pipeline:
-/// `handle_pushdown` classifies through `classify_where_filter`, which routes a
-/// DECLINED filter to the qualified single-table wrapper rather than into the scan
-/// spec. This fixture renders, so the mirror and production agree.
+/// Scenario: A DECIMAL column in a non-stringifying WHERE context stays a bare column reference.
 #[test]
 fn filter_decimal_comparison_not_rewritten() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -241,17 +180,7 @@ fn filter_decimal_comparison_not_rewritten() {
     );
 }
 
-/// `UPPER(c_decimal_a) = 'X'` is a `predicate_equal`, whose `function_scalar` sits
-/// under `left`. `string_function_arg_type_guard`'s post-order recursion — sharing
-/// `rewrite_expr_tree`'s broad curated field list with `rewrite_decimal_stringifications`
-/// — reaches it there, coercing the DECIMAL argument into the trimmed
-/// `decimal_to_varchar_exasol` form through the same pipeline function
-/// `handle_pushdown` calls (issue #210).
-///
-/// Mirrors only the NO-DECLINE half of production's filter pipeline:
-/// `handle_pushdown` classifies through `classify_where_filter`, which routes a
-/// DECLINED filter to the qualified single-table wrapper rather than into the scan
-/// spec. This fixture renders, so the mirror and production agree.
+/// Scenario: `UPPER(c_decimal_a) = 'X'` coerces the DECIMAL argument to the trimmed text form (#210).
 #[test]
 fn where_filter_string_fn_under_comparison_predicate_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -277,18 +206,7 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
     );
 }
 
-/// `UPPER(c_double) = 'X'` must decline through the same pipeline function
-/// `handle_pushdown` calls: DOUBLE PRECISION has no safe cast-to-text form that
-/// matches Exasol's own conversion (same reasoning as `guard_like_subject`'s
-/// BOOLEAN/DOUBLE/TIMESTAMP declines), so the whole filter is omitted rather than
-/// pushed with a possibly-wrong text comparison (issue #210).
-///
-/// Mirrors only the SCAN-SPEC half of production's filter pipeline. The decline
-/// keeps the predicate out of the scan spec — still true — but production no longer
-/// OMITS it: there is no Exasol-side backstop, so `classify_where_filter` hands the
-/// original tree to the qualified single-table wrapper, which applies it in its own
-/// `WHERE`. That half is pinned by
-/// `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`.
+/// Scenario: `UPPER(c_double) = 'X'` keeps the predicate out of the scan spec (#210).
 #[test]
 fn where_filter_string_fn_over_double_declines() {
     let col_types = vec![("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string())];
@@ -313,17 +231,7 @@ fn where_filter_string_fn_over_double_declines() {
     );
 }
 
-/// `UPPER(c_decimal_a) LIKE '1%'` proves the new guard's coercion reaches INSIDE a
-/// LIKE subject that `like_subject_type_guard`'s own `guard_like_subject` leaves
-/// completely untouched: the LIKE subject here is a `function_scalar` (`UPPER`), not
-/// a bare `column`, so `guard_like_subject`'s bare-column dispatch has nothing to do
-/// and passes the node through unchanged. `string_function_arg_type_guard` then
-/// coerces the DECIMAL argument nested inside that same `UPPER` call (issue #210).
-///
-/// Mirrors only the NO-DECLINE half of production's filter pipeline:
-/// `handle_pushdown` classifies through `classify_where_filter`, which routes a
-/// DECLINED filter to the qualified single-table wrapper rather than into the scan
-/// spec. This fixture renders, so the mirror and production agree.
+/// Scenario: A DECIMAL argument nested inside a LIKE subject's `UPPER` is coerced (#210).
 #[test]
 fn where_filter_upper_decimal_inside_like_subject_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -350,18 +258,7 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
     );
 }
 
-/// Regression (#207 blind spot), through the same pipeline function
-/// `handle_pushdown` calls: a DECIMAL-typed LIKE buried inside a
-/// `function_scalar_case`'s `arguments`, itself nested under `predicate_equal`'s
-/// `left`, must decline the whole filter — a `LIKE` at this non-junction position
-/// is type-guarded like any other.
-///
-/// Mirrors only the SCAN-SPEC half of production's filter pipeline. The decline
-/// keeps the predicate out of the scan spec — still true — but production no longer
-/// OMITS it: there is no Exasol-side backstop, so `classify_where_filter` hands the
-/// original tree to the qualified single-table wrapper, which applies it in its own
-/// `WHERE`. That half is pinned by
-/// `declined_filter_routes_every_dispatch_shape_to_qualified_wrapper`.
+/// Scenario: A DECIMAL LIKE nested inside a CASE under `predicate_equal` declines the filter (#207).
 #[test]
 fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
@@ -397,23 +294,14 @@ fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     );
 }
 
-/// Scenario: Catalog auth props — and the whole catalog block — are never placed
-/// in any scan spec.
-///
-/// The UDF-boundary secret invariant: auth lives on `ConnectionCreds` and is
-/// consumed only in the planning-layer catalog build. A `ScanSpec` (serialized
-/// for the UDF boundary) must carry no catalog block at all, none of the auth
-/// field NAMES, nor any auth VALUE — the scan UDF never calls the catalog.
+/// Scenario: Catalog auth props and the whole catalog block are never placed in any scan spec.
 #[test]
 fn scan_spec_carries_no_catalog_block() {
-    // Distinctive sentinels: any of these surfacing in the serialized spec is a leak.
     const TOKEN_SENTINEL: &str = "TOKEN_SENTINEL_VALUE";
     const SECRET_SENTINEL: &str = "CLIENT_SECRET_SENTINEL_VALUE";
     const OAUTH_URI_SENTINEL: &str = "https://oauth-uri-sentinel.example/token";
     const SCOPE_SENTINEL: &str = "SCOPE_SENTINEL_VALUE";
 
-    // Build a spec exactly as handle_pushdown does — auth creds exist but are
-    // NEVER threaded into ScanSpec (it has no auth fields by construction).
     let spec = ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
@@ -430,8 +318,6 @@ fn scan_spec_carries_no_catalog_block() {
 
     let json = spec.to_json();
 
-    // The dropped `catalog` block must not appear in the full spec nor the
-    // shard-invariant common blob (the scan UDF never touches the catalog).
     assert!(
         !json.contains("catalog"),
         "ScanSpec JSON must not carry a catalog block: {json}"
@@ -442,7 +328,6 @@ fn scan_spec_carries_no_catalog_block() {
         spec.to_common_json()
     );
 
-    // No auth field NAMES (planning-layer concepts) in the serialized spec.
     for field in [
         "token",
         "credential",
@@ -458,7 +343,6 @@ fn scan_spec_carries_no_catalog_block() {
         );
     }
 
-    // No auth VALUES, even if a future refactor wired creds in by mistake.
     for value in [
         TOKEN_SENTINEL,
         SECRET_SENTINEL,
@@ -471,32 +355,18 @@ fn scan_spec_carries_no_catalog_block() {
         );
     }
 
-    // The storage block carries only the S3 storage credentials, exactly as
-    // in the established credential flows.
     assert!(
         json.contains("minioadmin"),
         "storage S3 creds must still be present: {json}"
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 3.2 — Pushdown spec carries logical schema field-ids
-// ---------------------------------------------------------------------------
-
-/// Scenario (pushdown-planning): A pushdown request produces a scan spec whose
-/// `logical_schema` carries the expected field-ids, current names, and nullability.
-///
-/// Builds an in-memory Iceberg schema and verifies that `build_logical_schema`
-/// produces a `Vec<LogicalField>` with the correct field-id, name, arrow_type
-/// tag, and nullable flag for each field. This covers: required field (nullable=false),
-/// optional field (nullable=true), and multiple Iceberg type families.
+/// Scenario: A pushdown scan spec's `logical_schema` carries field-ids, names, and nullability.
 #[test]
 fn pushdown_carries_logical_schema_in_common_arg() {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
-    // Construct an Iceberg schema with 4 fields covering required, optional,
-    // and several type families.
     let schema = Schema::builder()
         .with_schema_id(1)
         .with_fields(vec![
@@ -531,7 +401,6 @@ fn pushdown_carries_logical_schema_in_common_arg() {
 
     assert_eq!(logical.len(), 4, "must carry all 4 fields");
 
-    // Field 1: required Int → nullable=false, arrow_type="int32"
     assert_eq!(logical[0].field_id, Some(1));
     assert_eq!(logical[0].name, "id");
     assert_eq!(logical[0].arrow_type, "int32");
@@ -540,7 +409,6 @@ fn pushdown_carries_logical_schema_in_common_arg() {
         "required field must have nullable=false"
     );
 
-    // Field 2: optional Double → nullable=true, arrow_type="float64"
     assert_eq!(logical[1].field_id, Some(2));
     assert_eq!(logical[1].name, "score");
     assert_eq!(logical[1].arrow_type, "float64");
@@ -549,19 +417,16 @@ fn pushdown_carries_logical_schema_in_common_arg() {
         "optional field must have nullable=true"
     );
 
-    // Field 3: required String → nullable=false, arrow_type="utf8"
     assert_eq!(logical[2].field_id, Some(3));
     assert_eq!(logical[2].name, "label");
     assert_eq!(logical[2].arrow_type, "utf8");
     assert!(!logical[2].nullable);
 
-    // Field 4: optional Decimal(18,4) → nullable=true, arrow_type="decimal128(18,4)"
     assert_eq!(logical[3].field_id, Some(4));
     assert_eq!(logical[3].name, "amount");
     assert_eq!(logical[3].arrow_type, "decimal128(18,4)");
     assert!(logical[3].nullable);
 
-    // Verify round-trip through ScanSpec: logical_schema survives JSON serde.
     let spec = ScanSpec {
         common: CommonScanSpec {
             logical_schema: logical.clone(),
@@ -580,8 +445,6 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     assert_eq!(back.common.logical_schema[0], logical[0]);
     assert_eq!(back.common.logical_schema[3], logical[3]);
 
-    // The logical schema is a shard-invariant field, so it must be carried in the
-    // common (arg 0) blob — the scan UDF reads it identically for every shard.
     let common_json = spec.to_common_json();
     let common_back = crate::scan::spec::CommonScanSpec::from_json(&common_json).unwrap();
     assert_eq!(
@@ -590,15 +453,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 3.1 — build_logical_schema encodes the Iceberg initial-default
-// (Iceberg column-projection rule 3), once per query, into the scan spec.
-// ---------------------------------------------------------------------------
-
-/// The VS encodes each field's Iceberg `initial-default` once per query into
-/// the scan spec: a PRIMITIVE required-with-default and a PRIMITIVE
-/// nullable-with-default each carry their default as the raw scalar text keyed
-/// to the field's Arrow-type tag.
+/// Scenario: Primitive required and nullable fields carry their Iceberg `initial-default` as raw scalar text.
 #[test]
 fn build_logical_schema_encodes_primitive_initial_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -607,12 +462,10 @@ fn build_logical_schema_encodes_primitive_initial_default() {
     let schema = Schema::builder()
         .with_schema_id(1)
         .with_fields(vec![
-            // Required (nullable=false) Long with an initial-default.
             Arc::new(
                 NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long))
                     .with_initial_default(Literal::long(7)),
             ),
-            // Nullable (optional) String with an initial-default.
             Arc::new(
                 NestedField::optional(2, "note", Type::Primitive(PrimitiveType::String))
                     .with_initial_default(Literal::string("hi")),
@@ -625,7 +478,6 @@ fn build_logical_schema_encodes_primitive_initial_default() {
 
     assert_eq!(logical.len(), 2);
 
-    // Required-with-default encodes the raw i64 scalar as decimal text.
     assert_eq!(logical[0].field_id, Some(1));
     assert!(!logical[0].nullable, "required field must be non-nullable");
     assert_eq!(logical[0].arrow_type, "int64");
@@ -635,7 +487,6 @@ fn build_logical_schema_encodes_primitive_initial_default() {
         "required-with-default must encode its default"
     );
 
-    // Nullable-with-default encodes the string value verbatim.
     assert_eq!(logical[1].field_id, Some(2));
     assert!(logical[1].nullable, "optional field must be nullable");
     assert_eq!(logical[1].arrow_type, "utf8");
@@ -646,7 +497,7 @@ fn build_logical_schema_encodes_primitive_initial_default() {
     );
 }
 
-/// A field with NO `initial-default` encodes no default (`None`).
+/// Scenario: A field with no `initial-default` encodes no default.
 #[test]
 fn build_logical_schema_omits_default_for_no_default_field() {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -671,11 +522,7 @@ fn build_logical_schema_omits_default_for_no_default_field() {
     );
 }
 
-/// A decimal outside Exasol's catalog-decimal domain reaches only the `"utf8"`
-/// Arrow tag, so its `initial-default` must encode NO default: the scan side
-/// reconstructs an encoded default against the tag alone, so a raw `i128`
-/// mantissa carried under `"utf8"` would come back as that mantissa's digits in
-/// a string column. Pins the encoding gate to the shared domain predicate.
+/// Scenario: A decimal outside Exasol's domain maps to `utf8` and encodes no default, or its mantissa would leak.
 #[test]
 fn build_logical_schema_omits_default_for_decimal_outside_exasol_domain() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -727,10 +574,7 @@ fn build_logical_schema_omits_default_for_decimal_outside_exasol_domain() {
     }
 }
 
-/// A NON-primitive (struct) `initial-default` encodes NO default: Exasol has no
-/// struct type (it surfaces as JSON-fallback VARCHAR), so the default is dropped
-/// and the column falls through to NULL / required-error downstream — a
-/// deliberate trade-off, not a silent gap.
+/// Scenario: A struct `initial-default` encodes no default, a deliberate Exasol no-struct trade-off.
 #[test]
 fn build_logical_schema_omits_non_primitive_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Type};
@@ -764,8 +608,7 @@ fn build_logical_schema_omits_non_primitive_default() {
     );
 }
 
-/// `write-default` is never read: a field carrying ONLY a `write-default`
-/// (no `initial-default`) encodes `None` — writes are irrelevant to reads.
+/// Scenario: A field carrying only a `write-default` encodes no default.
 #[test]
 fn build_logical_schema_ignores_write_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -789,8 +632,7 @@ fn build_logical_schema_ignores_write_default() {
     );
 }
 
-/// The encoded default form is credential-free: it is a bare scalar value, so
-/// the serialized `LogicalField` carrying it contains no storage credential.
+/// Scenario: A serialized encoded default carries no storage credential.
 #[test]
 fn build_logical_schema_default_encoding_is_credential_free() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -808,8 +650,6 @@ fn build_logical_schema_default_encoding_is_credential_free() {
     let logical = build_logical_schema(&schema);
     assert_eq!(logical[0].initial_default.as_deref(), Some("plain-default"));
 
-    // Serializing the default carrier introduces no credential material — the
-    // encoding is a bare scalar, never a connection/storage blob.
     let json = serde_json::to_string(&logical).unwrap();
     for marker in ["access_key", "secret_key", "session_token", "endpoint"] {
         assert!(
@@ -819,9 +659,7 @@ fn build_logical_schema_default_encoding_is_credential_free() {
     }
 }
 
-/// A default-less schema round-trips unchanged: every `LogicalField` carries
-/// `None`, the field is absent from the serialized JSON, and a spec authored
-/// before the field existed deserializes identically (backward-compatible).
+/// Scenario: A default-less schema round-trips unchanged and older specs deserialize identically.
 #[test]
 fn build_logical_schema_default_less_spec_round_trips_unchanged() {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -870,12 +708,6 @@ fn build_logical_schema_default_less_spec_round_trips_unchanged() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Declined-ORDER-BY hidden sort-key columns (issues #225 / #189)
-// ---------------------------------------------------------------------------
-
-/// The fixed four-column `EVENTS` universe every guard test projects against
-/// (mirrors `dispatch_golden`'s `base_col_types`).
 fn guard_col_types() -> Vec<(String, String)> {
     vec![
         ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
@@ -885,8 +717,6 @@ fn guard_col_types() -> Vec<(String, String)> {
     ]
 }
 
-/// Wrap a `pushdownRequest` body with the fixed `EVENTS` `involvedTables` block
-/// (mirrors `dispatch_golden::events_request`).
 fn guard_events_request(pushdown_req: Json) -> Json {
     serde_json::json!({
         "involvedTables": [{
@@ -902,15 +732,7 @@ fn guard_events_request(pushdown_req: Json) -> Json {
     })
 }
 
-/// Drive `build_dispatch_sql` — the real dispatcher, exactly as `dispatch_golden`
-/// exercises it — for `request`/`proj_cols`/`proj_types`, returning the `sql`
-/// field of its pushdown response. `has_order_by` is always `true`: every guard
-/// test pushes an ORDER BY.
-///
-/// `projection_widened` is `extract_projection`'s widening signal for the
-/// `proj_cols`/`proj_types` pair — the flag the dispatcher routes on (#196). The
-/// declined-`ORDER BY` guard tests all pass `false`; the two widening-routing
-/// tests pass the same inputs under both values.
+/// `projection_widened` is the dispatcher's routing flag (#196).
 fn guard_dispatch_sql(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
@@ -934,12 +756,7 @@ fn guard_dispatch_sql(
         .to_string()
 }
 
-/// [`guard_dispatch_sql`] WITHOUT the success expectation, for the decline
-/// assertions: an unrenderable pushed sort key is a `User` error, not SQL.
-///
-/// `has_order_by` is DERIVED here via the production `order_by_present` rather
-/// than hardcoded, so a fixture carrying no `orderBy` exercises the real
-/// non-declined route.
+/// An unrenderable pushed sort key is a `User` error, not SQL.
 fn guard_dispatch_result(
     request: &Json,
     proj_cols: Vec<ProjectionItem>,
@@ -978,13 +795,7 @@ fn guard_dispatch_result(
     )
 }
 
-// ---------------------------------------------------------------------------
-// Declined WHERE filter self-applied in the adapter's own SQL (issue #279)
-// ---------------------------------------------------------------------------
-
-/// `AMOUNT LIKE '1%'` over the guard fixture's DECIMAL column — the live-verified
-/// shape `like_subject_type_guard` declines, so `apply_type_rewrites` yields `None`
-/// and the scan spec can carry no filter at all, while Exasol renders it fine.
+/// A shape `like_subject_type_guard` declines though Exasol renders it.
 fn declined_like_on_decimal() -> Json {
     serde_json::json!({
         "type": "predicate_like",
@@ -993,13 +804,8 @@ fn declined_like_on_decimal() -> Json {
     })
 }
 
-/// Drive the real `build_dispatch_sql` over the fixed `EVENTS` fixture for any
-/// `pushdownRequest` body, deriving EVERY dispatch input through the same
-/// production helpers `handle_pushdown` uses — `extract_projection`,
-/// `classify_where_filter`, `extract_limit`, `order_by_present` — so this harness
-/// cannot drift from the pipeline it exercises. The logical schema is empty, which
-/// declines the bounded top-N unconditionally: the decline route is asserted to win
-/// over the shapes the classifier would otherwise pick, not to depend on them.
+/// The empty logical schema declines the bounded top-N unconditionally, so the
+/// decline route must win on its own.
 fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
     let request = guard_events_request(pushdown_req_body);
     let pushdown_req = pd(&request);
@@ -1043,16 +849,7 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
         .to_string()
 }
 
-/// Scenario (pushdown-declined-filter-self-apply): a declined WHERE filter routes
-/// EVERY single-table dispatch shape to the qualified wrapper, which applies the
-/// predicate itself. Asserted over the three shapes whose renderings otherwise
-/// diverge most — the bare row scan, the grouped partial/merge aggregate, and the
-/// ordered top-N — because the decline route sits AHEAD of the routing classifier,
-/// which is exactly what makes ONE route serve all five shapes.
-///
-/// Each shape asserts both halves of the guarantee: the predicate appears in the
-/// wrapper's `WHERE`, and the fan-out scan spec carries no `"filter"` — applied
-/// exactly once, never twice and never nowhere.
+/// Scenario: A declined WHERE filter routes every dispatch shape to the wrapper, applied exactly once.
 #[test]
 fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
     let declined = declined_like_on_decimal();
@@ -1115,11 +912,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
     }
 }
 
-/// A filter that renders trivially true is still OMITTED, with no wrapper: the
-/// three outcomes `None` used to collapse are absent, trivially true, and declined,
-/// and only the third needs self-applying. `classify_where_filter` hands back
-/// neither a scan filter nor a declined tree here, so the request keeps the
-/// wrapper-free fast scan.
+/// Scenario: A trivially true filter is omitted with no wrapper.
 #[test]
 fn trivially_true_filter_omitted_without_wrapper() {
     let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
@@ -1145,19 +938,7 @@ fn trivially_true_filter_omitted_without_wrapper() {
     );
 }
 
-/// A `SELECT *` request with a declined filter projects the FULL base row, not just
-/// the filter's columns. This shape reaches the qualified wrapper ONLY through the
-/// decline route, and narrowing collects only the columns the rendered clauses NAME —
-/// for a request with no `selectList` that is `AMOUNT` alone, which Exasol rejects
-/// positionally (`04000` "Expected number of columns is 4 but pushdown query has 1").
-/// `referenced_column_projection`'s no-select-list arm is what keeps both the inner
-/// scan and the outer select list at the full base row, in `col_types` order.
-///
-/// Live-verified wire form: Exasol OMITS the `selectList` key for `SELECT *` (and
-/// still sends a full-row `selectListDataTypes` beside it). The sibling test
-/// `no_select_list_wire_forms_all_keep_the_full_base_row` pins the tolerated
-/// variants, so a future Exasol that sends `[]` or `null` instead lands on the same
-/// arm.
+/// Scenario: A `SELECT *` request with a declined filter projects the full base row, not only filter columns.
 #[test]
 fn declined_filter_with_absent_select_list_projects_full_row() {
     let sql = dispatch_sql_for_body(serde_json::json!({
@@ -1177,14 +958,7 @@ fn declined_filter_with_absent_select_list_projects_full_row() {
     );
 }
 
-/// The counterpart: a declined filter beside a REAL select list KEEPS the
-/// referenced-column narrowing (#160). The full-row projection is owed to the
-/// `SELECT *` shape alone, not to the decline — so a request that names its columns
-/// ships only the select list's and the filter's, never the whole row.
-///
-/// This is the route where narrowing matters most: the fan-out carries no filter (the
-/// predicate is applied in the outer wrapper), so every row of the table crosses the
-/// UDF boundary and column width is the only remaining lever.
+/// Scenario: A declined filter beside a real select list keeps referenced-column narrowing (#160).
 #[test]
 fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
     let sql = dispatch_sql_for_body(serde_json::json!({
@@ -1212,11 +986,7 @@ fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
     );
 }
 
-/// Scenario (`pushdown-planning-single-group-agg-scalar-over-aggregate`): issue
-/// #194's shape, end to end through the real dispatcher. The scalar wrapper is
-/// rendered ONCE over the merged partial column in the outer merge SELECT — the
-/// per-shard scan carries the bare inner aggregate and nothing else — so the
-/// query answers one merged row instead of one partial per shard.
+/// Scenario: A single-group scalar over an aggregate renders once over the merged partial (#194).
 #[test]
 fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     let sql = dispatch_sql_for_body(serde_json::json!({
@@ -1242,11 +1012,7 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     );
 }
 
-/// A DataFusion render decline changes what the ADAPTER renders, never what Iceberg
-/// manifest pruning sees. `classify_where_filter` hands back the ORIGINAL,
-/// un-rewritten tree — the very tree `handle_pushdown` forwards to the
-/// resolver — so a still-prunable conjunct sitting beside the declined
-/// one keeps pruning exactly as many files as before.
+/// Scenario: A DataFusion render decline leaves Iceberg manifest pruning on the original tree.
 #[test]
 fn iceberg_pruning_input_unchanged_when_df_render_declines() {
     use crate::adapter::iceberg_predicate::to_iceberg_predicate;
@@ -1269,13 +1035,8 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ])
         .build()
         .unwrap();
-    // Three conjuncts, each carrying its own load. `id > 5` is prunable and must
-    // survive. `SECOND(ts, 3)` is refused by the DataFusion dialect on arity while
-    // Exasol renders it — the render-decline cause, distinct from the type-guard
-    // decline the LIKE fixtures above exercise. `LENGTH(amount) > 5` is REWRITTEN
-    // by `rewrite_decimal_stringifications` into the Exasol trim form, so the
-    // rewritten tree differs from this one by value and the equality assertion
-    // below genuinely discriminates the original from the rewritten tree.
+    // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; `LENGTH(amount) > 5`
+    // is rewritten, so the equality assertion distinguishes original from rewritten.
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
@@ -1334,22 +1095,7 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
     );
 }
 
-/// Scenario (pushdown-planning-capability-extensions, issues #225 / #189): a
-/// literal-only select list (`SELECT 1 FROM EVENTS`) with an `ORDER BY` on a column
-/// the derived projection does not emit (`NAME`) APPENDS that sort key to the scan
-/// as a HIDDEN column, and the wrapper names only the visible item explicitly.
-///
-/// This replaces the former full-base-row widening (issue #190), which forced the
-/// scan's emitted set and the query's visible set equal and therefore returned all
-/// four base columns where Exasol positionally expects the derived projection's one
-/// — `sqlCode 04000 "Expected number of columns is 1 but pushdown query has N"`
-/// (#225). The `REGION` / `AMOUNT` / `"ID"` absence assertions are what pin that.
-///
-/// `logical_schema` is deliberately EMPTY so `detect_topn` declines regardless of
-/// the projection (it requires a logical-schema entry per sort key), isolating the
-/// extension + wrapper shape from the top-N-match decision. That also makes this
-/// test order-blind by construction — the extend-after-`detect_topn` invariant is
-/// pinned separately by `declined_order_by_extension_runs_after_topn_detection`.
+/// Scenario: A literal-only select list hides its unprojected sort key in the scan and keeps arity 1 (#225, #189).
 #[test]
 fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     let request = guard_events_request(serde_json::json!({
@@ -1370,8 +1116,6 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
 
     let sql = guard_dispatch_sql(&request, proj_cols, proj_types, false, Some(10), Vec::new());
 
-    // The scan spec APPENDS the sort key AFTER the original expression item, so the
-    // per-shard scan actually emits the column the outer ORDER BY binds against.
     assert!(
         sql.contains(r#""projection":[{"expr":"1"},"NAME"]"#),
         "sort key NAME must be APPENDED to the derived projection: {sql}"
@@ -1380,8 +1124,7 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
         sql.contains(r#"EMITS ("_LH_PROJ_0" DECIMAL(1,0), "NAME" VARCHAR(2000000))"#),
         "EMITS must carry the visible expression column plus the hidden sort key: {sql}"
     );
-    // One visible column, matching the one-item derived projection: the wrapper's
-    // list is joined immediately ahead of ` FROM (`, so this pins the exact arity.
+    // The wrapper's list is joined immediately ahead of ` FROM (`, pinning the exact arity.
     assert!(
         sql.contains(r#"SELECT "_LH_PROJ_0" FROM ("#),
         "the wrapper must name ONLY the visible projection item: {sql}"
@@ -1396,17 +1139,7 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     );
 }
 
-/// Scenario (pushdown-planning-capability-extensions, issues #225 / #189), the
-/// bare-column shape: `SELECT name FROM EVENTS ORDER BY id` — one bare-projected
-/// column, an `ORDER BY` on a DIFFERENT unprojected column, no `LIMIT`.
-///
-/// The scan's emitted set and the query's visible set are two different sets:
-/// `"ID"` is EMITTED (so the outer `ORDER BY` can bind it) yet absent from the
-/// visible select list, so the returned arity stays 1 — what Exasol validates
-/// positionally. `SELECT *` would return 2 and be rejected with `04000`.
-///
-/// The absent `LIMIT` is what makes `detect_topn` decline here (a top-N needs a
-/// bound), so no `logical_schema` entry is required.
+/// Scenario: A bare-column select list ordered by an unprojected column emits it hidden, keeping arity 1 (#225, #189).
 #[test]
 fn declined_order_by_wrapper_selects_only_original_select_list() {
     let request = guard_events_request(serde_json::json!({
@@ -1448,13 +1181,7 @@ fn declined_order_by_wrapper_selects_only_original_select_list() {
     );
 }
 
-/// Scenario (pushdown-planning-capability-extensions): hidden sort-key columns are
-/// appended AT MOST ONCE. `ORDER BY name, id, name, id` over a projection that
-/// already bare-projects `NAME` exercises BOTH dedupe paths in one fixture:
-/// `NAME` is already emitted so it is never appended, and `ID` — named by two
-/// sort keys — is appended exactly ONCE, because the membership test re-scans
-/// `proj_cols` as it grows. A repeated EMITS identifier is a duplicate-column
-/// error, so "not twice" is the assertion that matters.
+/// Scenario: Hidden sort-key columns are appended at most once.
 #[test]
 fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
     let sort_key = |name: &str| {
@@ -1503,15 +1230,7 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
     );
 }
 
-/// Companion scenario: when every pushed sort key IS already a bare-projected
-/// column the extension is INERT — nothing appended, nothing widened — and the
-/// legitimately matched bounded top-N still forms exactly as before.
-///
-/// The matched path never reaches the declined-wrapper code at all: it renders
-/// `proj_cols` directly as the FINAL visible EMITS with no wrapping
-/// `SELECT … FROM (`, and carries the sort keys plus the limit into the per-shard
-/// common blob. That is precisely why the extension must not run ahead of
-/// `detect_topn` — a hidden column would leak straight into this path's result.
+/// Scenario: When every sort key is already projected, the extension is inert and the top-N matches.
 #[test]
 fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     let request = guard_events_request(serde_json::json!({
@@ -1558,12 +1277,10 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
         sql.contains(r#"ORDER BY "NAME""#) && sql.contains("LIMIT 5"),
         "a matched top-N must still form (sort key projected, native type): {sql}"
     );
-    // The fan-out IS the outermost query: no declined-path wrapper around it.
     assert!(
         sql.starts_with("SELECT LAKEHOUSE_SCAN(") && !sql.contains(" FROM ("),
         "a matched top-N must not be wrapped in an outer SELECT … FROM (: {sql}"
     );
-    // Only the matched path pushes the bounded sort and the limit per shard.
     let common = common_arg_literal(&sql);
     assert!(
         common.contains(r#""order_by":[{"column":"NAME","ascending":true,"nulls_last":true}]"#)
@@ -1572,16 +1289,7 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     );
 }
 
-/// S3 (`build_row_scan_sql`) is unreachable with an offset because the decline
-/// (issue #191, fact 5) NULLS `effective_limit` before it ever reaches that
-/// builder. Same fixture as
-/// `declined_order_by_all_keys_projected_leaves_projection_untouched` — every
-/// `detect_topn` guard would MATCH (single table, `NAME` projected as a bare
-/// column, a populated non-JSON-fallback logical schema) — except this request
-/// carries a NON-ZERO `offset`, which declines the bounded top-N and therefore
-/// nulls `effective_limit`: neither the per-shard fan-out nor a bare outer
-/// `LIMIT`/`OFFSET` may render ahead of the declined wrapper's own
-/// `ORDER BY … LIMIT n OFFSET m` (through the shared `render_limit_offset` seam).
+/// Scenario: A non-zero offset renders only on the declined wrapper, never ahead of it (#191).
 #[test]
 fn nonzero_offset_nulls_the_effective_limit() {
     let request = guard_events_request(serde_json::json!({
@@ -1616,8 +1324,6 @@ fn nonzero_offset_nulls_the_effective_limit() {
         logical_schema,
     );
 
-    // The declined wrapper renders the offset window exactly once, on its own
-    // ORDER BY — never a bare per-shard/outer LIMIT ahead of it.
     assert_eq!(
         sql.matches("LIMIT").count(),
         1,
@@ -1636,29 +1342,7 @@ fn nonzero_offset_nulls_the_effective_limit() {
     );
 }
 
-/// The projection extension runs strictly AFTER `detect_topn` (decision [2]) — the
-/// plan's most load-bearing ordering invariant, and one that is SILENT when
-/// violated (a mis-ordered implementation reintroduces `04000` with a green suite).
-///
-/// The fixture deliberately gives `detect_topn` everything it needs to MATCH
-/// except a projected sort key: exactly one involved table, `ORDER BY "NAME"` ASC
-/// NULLS LAST, a `LIMIT 5`, and a POPULATED `logical_schema` typing `NAME` as
-/// `utf8` (not a JSON-fallback type). Only the CALL ORDER decides the outcome:
-///
-/// - Correct order: `detect_topn` sees the pre-extension `[Expr("1")]`, finds
-///   `NAME` unprojected and declines; the declined path then appends `NAME` as a
-///   hidden column and renders the wrapper. Nothing per-shard.
-/// - Extension first: `proj_cols` would already be `[Expr("1"), Column("NAME")]`,
-///   so every remaining `detect_topn` guard passes, the bounded top-N MATCHES,
-///   `"order_by"` and `"limit":5` land in the common blob, and NO wrapper is
-///   rendered — failing all three assertions below. That path emits `proj_cols` as
-///   the FINAL visible EMITS, so the hidden `NAME` would leak into the result too.
-///
-/// A `detect_topn`-only assertion over the pre-extension projection cannot pin
-/// this: it holds whatever the call order (see `topn.rs`'s
-/// `unsupported_order_by_shape_declines_topn`). Nor can the sibling tests above —
-/// they force the decline via an empty `logical_schema` or an absent `LIMIT`, both
-/// order-blind.
+/// Scenario: The projection extension runs after `detect_topn`, so a matchable top-N still declines.
 #[test]
 fn declined_order_by_extension_runs_after_topn_detection() {
     let request = guard_events_request(serde_json::json!({
@@ -1676,8 +1360,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
         expr: "1".to_string(),
     }];
     let proj_types = vec!["DECIMAL(1,0)".to_string()];
-    // NAME as `utf8`: a native, non-JSON-fallback type, so the JSON-fallback guard
-    // would NOT be what declines the top-N had the extension already run.
+    // A non-JSON-fallback type, so that guard cannot be what declines the top-N.
     let logical_schema = vec![LogicalField {
         field_id: Some(2),
         name: "NAME".to_string(),
@@ -1715,28 +1398,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
     );
 }
 
-/// Scenario (pushdown-planning-capability-extensions, issue #198): "An ORDER BY
-/// the adapter cannot bound as a top-N remains correctness-safe."
-///
-/// Exasol DELEGATES a pushed ordering and no longer re-applies its own backstop
-/// sort, so the declined row-scan path has exactly two correctness-safe outcomes:
-/// render the ordering in FULL, or decline with a `User` error naming the key.
-/// Returning SQL that reproduces only PART of the pushed ordering is the
-/// silent-wrong-order outcome this guard exists to make unreachable.
-///
-/// Three facets, and facet (b) is why the guard tests ANY unrenderable element
-/// rather than ALL of them:
-/// (a) every element unrenderable — both kinds: an expression node NEITHER
-///     dialect knows, and a bare `column` node missing its `nullsLast` flag
-///     (direction / NULL placement is never silently defaulted). This SUPERSEDES
-///     `fix-225`'s "return the unwrapped SQL unchanged" rule for a NON-EMPTY
-///     `orderBy`.
-/// (b) MIXED — one renderable key and one not. An `all`-shaped guard would pass
-///     this through and render a partial ordering, which is precisely the silent
-///     corruption; only the unrenderable key's own ordering would be lost, and
-///     nothing downstream would notice.
-/// (c) ABSENT `orderBy` — unchanged: the unwrapped fan-out, no wrapper, no
-///     decline. Nothing was delegated, so nothing must be reproduced.
+/// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe (#198).
 #[test]
 fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     let unrenderable_expression = serde_json::json!({
@@ -1745,8 +1407,6 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
         "isAscending": true,
         "nullsLast": true
     });
-    // A bare column node whose NULL placement is absent: renderable as an
-    // identifier, but not as an ORDER BY element.
     let column_missing_nulls_last = serde_json::json!({
         "type": "order_by_element",
         "expression": {"type": "column", "name": "ID"},
@@ -1812,8 +1472,6 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
         }
     }
 
-    // (c) No `orderBy` at all: nothing was delegated, so the fan-out is returned
-    // unwrapped and the LIMIT is NOT withheld.
     let unordered = guard_events_request(serde_json::json!({
         "selectList": [{"type": "column", "name": "NAME"}],
         "selectListDataTypes": [{"type": "varchar", "size": 2000000}],
@@ -1841,18 +1499,7 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// COUNT(DISTINCT) wrapper limit withholding is dead code (issue #191)
-// ---------------------------------------------------------------------------
-
-/// Regression (issue #191, plan `fix-191-order-by-offset`): a lone
-/// `COUNT(DISTINCT)` request (Case 1) carrying BOTH a request-level `orderBy`
-/// and a request-level LIMIT must render that LIMIT on the outer wrapper.
-/// The now-deleted withholding (`let cd_limit = if has_order_by { None } else
-/// { limit };`) used to drop the limit in exactly this case — dead code,
-/// because Exasol never actually pushes an `orderBy` on an ungrouped
-/// aggregate request (fact 7), but the withholding branch fired on ANY
-/// `orderBy` this fixture forces regardless of whether Exasol would send one.
+/// Scenario: A lone COUNT(DISTINCT) with both orderBy and LIMIT renders the LIMIT on the wrapper (#191).
 #[test]
 fn lone_count_distinct_with_order_by_still_renders_limit() {
     let request = guard_events_request(serde_json::json!({
@@ -1898,14 +1545,7 @@ fn lone_count_distinct_with_order_by_still_renders_limit() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Widened-projection routing at coincidental arity (issues #196 / #234)
-// ---------------------------------------------------------------------------
-
-/// A `RequestShape::RowScan` request whose select-list arity EQUALS the base
-/// table's column count: four bare `EVENTS` columns, plus an `ORDER BY` the
-/// adapter does not match as a bounded top-N. Both routing tests below drive the
-/// dispatcher with these identical inputs and differ ONLY in the widening flag.
+/// Select-list arity equals the base table's column count.
 fn widening_arity_coincidence_request() -> Json {
     guard_events_request(serde_json::json!({
         "selectList": [
@@ -1929,7 +1569,6 @@ fn widening_arity_coincidence_request() -> Json {
     }))
 }
 
-/// The four-column full base row, as `project_columns` returns it when it widens.
 fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<String>) {
     let cols = guard_col_types()
         .into_iter()
@@ -1941,20 +1580,7 @@ fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<String>)
     )
 }
 
-/// Scenario (pushdown-planning-capability-extensions, issues #196 / #234): a
-/// WIDENED derived projection routes to `qualified_single_table_fallback_pushdown`
-/// even when its column count COINCIDES with the select-list arity.
-///
-/// The count comparison this replaced was blind here — four base columns against
-/// four select-list items looks like a clean per-item derivation, so the request
-/// reached the raw scan path and Exasol rejected the positionally-mismatched types
-/// (`04000` "Data type mismatch in column number N", reproduced live on a 10-item
-/// select list over a 10-column table). Routing on the producer's own widening
-/// signal cannot be fooled by the coincidence.
-///
-/// The `ORDER BY` also pins the early-return POSITION: the wrapper's own outer
-/// `ORDER BY` is what orders the result, so the widened projection never reached
-/// `detect_topn` or the declined-`ORDER BY` hidden-sort-key extension.
+/// Scenario: A widened projection routes to the wrapper even when its column count matches the select list (#196, #234).
 #[test]
 fn dispatch_widened_projection_at_matching_arity_routes_to_wrapper() {
     let request = widening_arity_coincidence_request();
@@ -1987,14 +1613,7 @@ fn dispatch_widened_projection_at_matching_arity_routes_to_wrapper() {
     );
 }
 
-/// The mirror of `dispatch_widened_projection_at_matching_arity_routes_to_wrapper`:
-/// the SAME request and the SAME four-item projection with the widening flag CLEAR
-/// — a genuine `SELECT region, name, amount, id ... ORDER BY name` — stays on the
-/// ordinary scan path and is NOT wrapped in the qualified fallback.
-///
-/// This pins the signal as load-bearing in BOTH directions: a later `, _`
-/// destructuring that swallows the flag, or a hardcoded `true`, fails a host test
-/// instead of silently unaccelerating every row scan.
+/// Scenario: The same projection with the widening flag clear stays on the scan path.
 #[test]
 fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
     let request = widening_arity_coincidence_request();
@@ -2017,11 +1636,6 @@ fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Declined TIMESTAMP(p) CAST target routing (issue #405)
-// ---------------------------------------------------------------------------
-
-/// The wire shape Exasol sends for `SELECT CAST(name AS TIMESTAMP(p)) FROM …`.
 fn timestamp_cast_select_request(precision: u64) -> Json {
     serde_json::json!({
         "selectList": [{
@@ -2036,9 +1650,7 @@ fn timestamp_cast_select_request(precision: u64) -> Json {
     })
 }
 
-/// Scenario (sql-comprehension/vs-expression-translator-cast): DataFusion cannot parse
-/// `TIMESTAMP(2)`, so the renderer declines and the request routes to the qualified
-/// single-table wrapper. The scan never sees `TIMESTAMP(2)` in its `EMITS` clause.
+/// Scenario: A CAST to `TIMESTAMP(2)`, which DataFusion cannot parse, routes to the wrapper (#405).
 #[test]
 fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(2));
@@ -2061,8 +1673,7 @@ fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     );
 }
 
-/// Control for the decline above: `TIMESTAMP(6)` is one of the four precisions DataFusion
-/// parses, so the same shape stays on the scan path.
+/// Scenario: A CAST to `TIMESTAMP(6)`, which DataFusion parses, stays on the scan path.
 #[test]
 fn accepted_timestamp_precision_cast_takes_scan_path() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(6));
@@ -2077,22 +1688,7 @@ fn accepted_timestamp_precision_cast_takes_scan_path() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Parse-before-config ordering — regression coverage
-// ---------------------------------------------------------------------------
-
-/// A malformed `catalog.table` identifier against an unreachable `catalog_uri`
-/// must fail with `parse_table_ident`'s own error, not a transport error from
-/// the unreachable host.
-///
-/// Proves `handle_pushdown` validates the identifier BEFORE
-/// `CatalogSession::resolve` runs the OAuth2 client-credentials grant (the
-/// only branch of `resolve_catalog_auth` that makes network contact — the
-/// no-auth and static-token branches never touch the network at all, so this
-/// test would pass vacuously against a broken build-then-validate ordering
-/// unless creds force the OAuth2 branch). `catalog_uri` is a closed local
-/// port (`127.0.0.1:1`, connection refused) so a wrongly-ordered
-/// implementation fails fast with a transport error instead of hanging.
+/// Scenario: A malformed identifier fails validation before the OAuth2 grant touches the network.
 #[tokio::test]
 
 async fn malformed_table_ident_fails_before_any_catalog_contact() {
@@ -2118,14 +1714,10 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
 
     let catalog = CatalogProps {
         warehouse: "warehouse".into(),
-        // No '.' separator: fails `parse_table_ident`'s validation before any
-        // catalog HTTP is issued.
         table: "malformed_identifier_with_no_namespace_separator".into(),
     };
 
-    // Two-column universe (non-empty): an empty `columns` array fails in
-    // `project_columns` before the code path under test even runs, which
-    // would mask the ordering this test proves.
+    // An empty `columns` array would fail in `project_columns` first, masking the ordering.
     let request = nq4_request();
 
     let conn = ResolvedConnectionConfig {
@@ -2156,8 +1748,6 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
     );
 }
 
-/// The tuning knobs `handle_pushdown` takes positionally, fixed to one shard /
-/// one node for every seam-resolution test in this section.
 async fn seam_handle_pushdown(
     request: &Json,
     catalog_uri: &str,
@@ -2180,16 +1770,7 @@ async fn seam_handle_pushdown(
     .await
 }
 
-/// Scenario: Every pushdown request shape resolves through the one
-/// format-reader seam.
-///
-/// Single-table sub-case: an `IcebergRest`-kind request reaches the Iceberg
-/// reader (its `/v1/config` + `loadTable` targets are hit) and a
-/// `UnityCatalogNative`-kind request reaches the Delta reader (its
-/// `unity-catalog/tables` target is hit, and the reader's OWN plan-time error
-/// — naming the table it could not plan — surfaces, never an Iceberg-shaped
-/// error). Both kinds are driven through the SAME `handle_pushdown` entry
-/// point, proving neither is special-cased ahead of the resolver.
+/// Scenario: Every pushdown request shape resolves through the one format-reader seam.
 #[tokio::test]
 async fn every_request_shape_resolves_through_the_format_reader_seam() {
     let iceberg = iceberg_catalog().await;
@@ -2249,24 +1830,13 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
     );
 }
 
-/// Scenario: One catalog session per request serves every table the request
-/// resolves — the production JOIN path's twin of
-/// `scan_resolution_tests.rs::one_catalog_session_serves_every_table_the_resolver_resolves`.
-///
-/// Drives a two-table inner-join pushdown request through `handle_pushdown`
-/// (via `seam_handle_pushdown`), asserting the resolver built inside
-/// `plan_join` is the SAME one both legs resolve through: exactly one
-/// `/v1/config` for the whole request, then one `loadTable` per leg — never a
-/// second config round-trip, which is the exact regression the collapse of
-/// per-leg `resolve_file_list` is meant to prevent.
+/// Scenario: One catalog session per request serves every table the request resolves.
 #[tokio::test]
 async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
     let iceberg = iceberg_catalog().await;
     let creds = unauthenticated_creds();
     let catalog_props = CatalogProps {
         warehouse: "wh".into(),
-        // Unused on the join path: `plan_join` resolves each leg's own
-        // identifier from `involvedTables`/`TABLE_MAP`, never `catalog.table`.
         table: "unused-on-the-join-path".into(),
     };
 
@@ -2332,14 +1902,7 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
     );
 }
 
-/// Scenario: A Unity Catalog table's identity survives the round trip from the
-/// involved table.
-///
-/// A recorded identifier is judged by the identifier rule of ITS OWN catalog
-/// kind: a Unity-kind request whose identifier carries no namespace separator is
-/// refused in Unity Catalog's terms, never by Iceberg's `namespace.table` rule,
-/// and — like the Iceberg arm above it — the refusal precedes any catalog
-/// contact, so a malformed identifier costs zero catalog HTTP under BOTH kinds.
+/// Scenario: A Unity Catalog table's identity survives the round trip from the involved table.
 #[tokio::test]
 async fn a_malformed_unity_identifier_is_refused_in_unity_terms_before_any_catalog_contact() {
     let unity = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
@@ -2379,21 +1942,16 @@ fn refused_column_table_request(select_list: Json) -> Json {
     refused_column_table(serde_json::json!({"type": "select", "selectList": select_list}))
 }
 
-/// The same `ORDERS` request, with a WHERE filter added beside the select list.
 fn refused_column_table_request_with_filter(select_list: Json, filter: Json) -> Json {
     refused_column_table(serde_json::json!({
         "type": "select", "selectList": select_list, "filter": filter,
     }))
 }
 
-/// The `SELECT *` wire form: no `selectList` key at all (Exasol omits it), so
-/// `extract_projection` falls back to the full base row.
 fn refused_column_table_select_star_request() -> Json {
     refused_column_table(serde_json::json!({"type": "select"}))
 }
 
-/// The shared `ORDERS` fixture: one mappable column (`INT_COL`) and one refused
-/// column (`BINARY_COL`), wrapped around any `pushdownRequest` shape.
 fn refused_column_table(pushdown_request: Json) -> Json {
     serde_json::json!({
         "involvedTables": [{
@@ -2407,8 +1965,6 @@ fn refused_column_table(pushdown_request: Json) -> Json {
     })
 }
 
-/// The `ORDERS` fixture's Delta log, matching [`refused_column_table`]'s declared
-/// columns: `int_col` maps, `binary_col` is refused. No active file.
 async fn refused_column_table_storage() -> crate::scan::spec::StorageBackend {
     delta_object_endpoint(vec![(
         delta_commit_zero_key("orders"),
@@ -2425,13 +1981,6 @@ fn column_item(name: &str) -> Json {
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// The ORDERING half. The table declares one mappable and one refused column and has
-/// NO active file, so both requests below reach the zero-active-files early return.
-/// The mappable-only request is answered by it; the request naming the refused column
-/// must be refused BEFORE it, because a gate placed after would answer that request
-/// with an empty result — a wrong answer, not a refusal. Only the gate's position
-/// distinguishes the two outcomes: the table, the catalog, and the store are the same.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_column_is_refused_before_the_zero_active_files_early_return() {
     let catalog = unity_delta_catalog().await;
@@ -2475,13 +2024,6 @@ async fn a_refused_column_is_refused_before_the_zero_active_files_early_return()
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// The PROJECTION half, complementing the ordering half proven above. The same
-/// `ORDERS` fixture (one mappable, one refused column) drives four request
-/// shapes: a projection naming only the mappable column plans; a projection
-/// naming the refused column, a WHERE filter reaching it while the select list
-/// names only the mappable column, and a `SELECT *` (whose absent `selectList`
-/// widens the projection to the full base row) all refuse it instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_delta_column_refuses_only_the_requests_that_reference_it() {
     let catalog = unity_delta_catalog().await;
@@ -2552,8 +2094,6 @@ fn assert_refuses_binary_col(error: UdfError) {
     );
 }
 
-/// The `ORDERS` fixture's Delta log, with the `protocol` action replaced so its
-/// reader features fall outside the plan-time gate's allow-list.
 async fn refused_protocol_table_storage() -> crate::scan::spec::StorageBackend {
     delta_object_endpoint(vec![(
         delta_commit_zero_key("orders"),
@@ -2571,13 +2111,7 @@ async fn refused_protocol_table_storage() -> crate::scan::spec::StorageBackend {
     .await
 }
 
-/// Scenario: The Delta reader is reached from production pushdown under the Unity
-/// Catalog kind
-///
-/// `handle_pushdown`'s per-COLUMN gate is proven above; this drives the reader
-/// PROTOCOL gate through the same production entrypoint, so a regression that stops
-/// `handle_pushdown` from surfacing a protocol refusal is caught here rather than
-/// only by `DeltaSnapshot::open` unit tests or a live Exasol E2E run.
+/// Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_unity_catalog_pushdown_gates_the_delta_protocol_and_refuses_per_column() {
     let catalog = unity_delta_catalog().await;
@@ -2603,19 +2137,7 @@ async fn a_unity_catalog_pushdown_gates_the_delta_protocol_and_refuses_per_colum
     );
 }
 
-/// Scenario: Enabling the kernel's skipping surfaces no statistic to the engine
-/// or the wire
-///
-/// This plan lets `ScanBuilder` keep its own default `StatsOptions`, restoring the
-/// kernel's internal data-skipping pass — but `ScanSpec` gains no new field to
-/// carry it (see this project's CLAUDE.md "Architecture boundaries": `ScanSpec`
-/// stays format-neutral). A non-pruning request (no WHERE clause, one active
-/// file) drives the SAME production `handle_pushdown` entry point the sibling
-/// Delta pushdown tests above use, and its serialized common blob is checked two
-/// ways: its JSON key set is exactly this plan's pre-change field set with none
-/// of them naming a statistic, bound, or null count, and the parsed
-/// `CommonScanSpec` equals a hand-built value carrying only the fields this
-/// request was always going to produce.
+/// Scenario: Enabling the kernel's skipping surfaces no statistic to the engine or the wire
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_no_statistic() {
     let catalog = unity_delta_catalog().await;
@@ -2718,16 +2240,6 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// `COUNT(*)` reads no column value at all — `parse_agg_item` gives
-/// `AggKind::Count` both `column: None` and `arg_expr: None` — so it must be
-/// admitted over a table carrying a refused column exactly like the mappable
-/// projection is. `project_columns` widens ANY select list holding an
-/// aggregate to the synthetic full base row (needed so `RequestShape::RowScan`
-/// can route a non-decomposable aggregate to Exasol's own post-processing),
-/// but that synthetic projection is never what the gate should read as "the
-/// columns this request touches" — the blind JSON walk over the whole request
-/// already finds every column a `function_aggregate`'s own arguments name.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_count_star_aggregate_is_admitted_over_a_table_with_a_refused_column() {
     let catalog = unity_delta_catalog().await;
@@ -2749,11 +2261,6 @@ async fn a_count_star_aggregate_is_admitted_over_a_table_with_a_refused_column()
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// The complement of the `COUNT(*)` admit above, driven through production
-/// pushdown. An aggregate select list widens the projection exactly the same way,
-/// so only the blind walk over the request's own JSON can tell `MAX(BINARY_COL)`
-/// — which reads the refused column — apart from `COUNT(*)`, which reads nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_aggregate_over_a_refused_column_is_refused() {
     let catalog = unity_delta_catalog().await;
@@ -2777,10 +2284,6 @@ async fn an_aggregate_over_a_refused_column_is_refused() {
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// The other half of the same complement: `COUNT(*)` reads no column value, but a
-/// WHERE clause on the refused column does — and the widened projection is withheld
-/// from the gate for both, so the filter is reached by the walk alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_count_star_filtered_on_a_refused_column_is_refused() {
     let catalog = unity_delta_catalog().await;
@@ -2807,11 +2310,6 @@ async fn a_count_star_filtered_on_a_refused_column_is_refused() {
 }
 
 /// Scenario: Resolved partition columns reach the scan spec for every side.
-///
-/// The fact/single-table side gets its partition columns from the resolved
-/// `ResolvedScan` through `build_dispatch_sql`'s shared `base`; the
-/// broadcast/dimension side gets its OWN, independently, into `JoinSpec` through
-/// `build_broadcast_join_sql`. Neither one derives the other's value.
 #[test]
 fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     let request = guard_events_request(serde_json::json!({"type": "select"}));
@@ -2917,13 +2415,6 @@ fn resolved_partition_columns_reach_the_common_spec_and_the_join_spec() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// CHAR-declared group-key blank padding through the real dispatcher (#192)
-// ---------------------------------------------------------------------------
-
-/// A `CAST(NAME AS CHAR(size))` select-list/`groupBy` node, declared with
-/// `character_set` so both the plain and the ` ASCII`-suffixed declared type
-/// can be driven through the dispatcher.
 fn char_cast_key(size: u64, character_set: &str) -> Json {
     serde_json::json!({
         "type": "function_scalar_cast",
@@ -2933,8 +2424,6 @@ fn char_cast_key(size: u64, character_set: &str) -> Json {
     })
 }
 
-/// Wrap a single group key + `COUNT(*)` into the grouped request shape, with
-/// the key's declared type at its own `selectListDataTypes` ordinal.
 fn char_grouped_request(key: Json, key_type: Json, order_by: Option<Json>) -> Json {
     let mut body = serde_json::json!({
         "aggregationType": "group_by",
@@ -2948,9 +2437,6 @@ fn char_grouped_request(key: Json, key_type: Json, order_by: Option<Json>) -> Js
     guard_events_request(body)
 }
 
-/// Wrap a single group key + `COUNT(*)` into the grouped request shape with the
-/// key ABSENT from `selectList` (`SELECT COUNT(*) … GROUP BY <key>`), so its
-/// declared type is reachable only through its own `groupBy` node.
 fn unprojected_char_grouped_request(key: Json) -> Json {
     guard_events_request(serde_json::json!({
         "aggregationType": "group_by",
@@ -2960,9 +2446,7 @@ fn unprojected_char_grouped_request(key: Json) -> Json {
     }))
 }
 
-/// The `group_keys` entry the emitted scan spec must carry, escaped exactly as
-/// the dispatcher embeds it: JSON-encoded into the spec blob, then wrapped in a
-/// SQL string literal (single quotes doubled).
+/// JSON-encoded into the spec blob, then wrapped in a SQL string literal.
 fn embedded_group_keys(fragments: &[String]) -> String {
     let encoded: Vec<String> = fragments
         .iter()
@@ -2971,11 +2455,7 @@ fn embedded_group_keys(fragments: &[String]) -> String {
     format!(r#""group_keys":[{}]"#, encoded.join(",")).replace('\'', "''")
 }
 
-/// The dispatcher's grouped arm must hand the DataFusion side a BLANK-PADDED
-/// copy of a `CHAR(20)`-declared group key, while the outer merge wrapper keeps
-/// casting the staging column back to `CHAR(20)`. Without the pad, `'ab'` and
-/// `'ab   '` reach the merge as two distinct `GK_0` values and the query returns
-/// two rows where Exasol's own `CAST(x AS CHAR(20))` returns one (issue #192).
+/// Scenario: The grouped dispatcher blank-pads a CHAR(20) key for DataFusion and casts it back on merge (#192).
 #[test]
 fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     let request = char_grouped_request(
@@ -3008,12 +2488,7 @@ fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     );
 }
 
-/// The same pad must reach the scan spec when the CHAR-declared key is NOT in
-/// the select list (`SELECT COUNT(*) … GROUP BY CAST(NAME AS CHAR(20))`). This
-/// shape is strictly more dangerous than the projected one: the outer wrapper
-/// has no `CAST("GK_0" AS CHAR(20))` output column, so an unpadded key raises
-/// no type mismatch — it just returns a row per trailing-blank variant where
-/// Exasol returns one merged row (#192 review finding).
+/// Scenario: An unprojected CHAR key is also padded, since no outer CAST would surface a mismatch (#192).
 #[test]
 fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     let request = unprojected_char_grouped_request(char_cast_key(20, "UTF8"));
@@ -3038,10 +2513,7 @@ fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     );
 }
 
-/// CONTROL for the unprojected path: a VARCHAR-declared `groupBy` node must
-/// reach the scan spec unpadded. The `groupBy` fallback fires here (the node
-/// carries a `dataType`), so this proves it resolves the declared type rather
-/// than padding every unprojected group key.
+/// Scenario: An unprojected VARCHAR `groupBy` key reaches the scan spec unpadded.
 #[test]
 fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = unprojected_char_grouped_request(serde_json::json!({
@@ -3072,10 +2544,7 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     );
 }
 
-/// The pad width must survive the ` ASCII` character-set suffix Exasol appends
-/// to an ASCII-declared CHAR — the #192 primary shape. A parse that trims a
-/// trailing `)` off the declared type would find no width here and ship the key
-/// unpadded, reintroducing the wrong-row-count bug for every ASCII CHAR key.
+/// Scenario: The pad width survives the ` ASCII` character-set suffix (#192).
 #[test]
 fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
     let request = char_grouped_request(
@@ -3108,9 +2577,7 @@ fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
     );
 }
 
-/// CONTROL: a VARCHAR-declared group key must reach the scan spec byte-identical
-/// to the pre-fix rendering — VARCHAR carries no blank padding, so wrapping it
-/// would change grouping semantics for every ordinary string GROUP BY.
+/// Scenario: A VARCHAR group key reaches the scan spec with no blank padding.
 #[test]
 fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = char_grouped_request(
@@ -3138,15 +2605,7 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     );
 }
 
-/// The padded copy goes ONLY to the DataFusion side: `build_grouped_order_by_clause`
-/// matches a pushed `orderBy` against the UNPADDED rendered group keys, so a sort
-/// on a CHAR-declared group key must still resolve to its output ordinal. Matching
-/// against the padded copy instead would make it `Unresolvable` and turn every
-/// `ORDER BY` over a CHAR group key into a hard pushdown decline.
-///
-/// The key is a bare column because `parse_sort_key_element` accepts only bare
-/// columns as sort keys — an expression sort key declines for its own, unrelated
-/// reason and would not exercise the padded/unpadded split at all.
+/// Scenario: An ORDER BY on a CHAR group key still resolves against the unpadded key.
 #[test]
 fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
     let request = char_grouped_request(
@@ -3315,13 +2774,7 @@ fn letter_partitioned_select_request() -> Json {
     })
 }
 
-/// Scenario: The Delta reader is reached from production pushdown under the Unity
-/// Catalog kind
-///
-/// Proves pruning end-to-end through `handle_pushdown`, not just the lower-level
-/// `DeltaSnapshot`/reader: a partition-equality filter must shrink the file list
-/// production pushdown embeds in the emitted scan SQL, relative to an equivalent
-/// unfiltered request over the same two-file fixture.
+/// Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_unity_catalog_pushdown_prunes_the_delta_file_list_by_its_filter() {
     let catalog = unity_delta_catalog().await;

@@ -23,12 +23,10 @@ fn test_client(
         .expect("the fixture base path is a valid storage URI")
 }
 
-/// A zero-row file declaring a single nullable `id BIGINT`.
 fn id_file() -> Vec<u8> {
     parquet_bytes(vec![nullable("id", DataType::Int64)], 0)
 }
 
-/// A store holding `id_file()` at each key.
 async fn id_files_at(keys: &[&str]) -> Arc<InMemory> {
     let data = id_file();
     let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data.as_slice())).collect();

@@ -1,7 +1,5 @@
-/// VS adapter logic: createVirtualSchema, getCapabilities, pushdown,
-/// refresh, setProperties, dropVirtualSchema.
-///
-/// Credentials (access_key, secret_key, session_token) NEVER appear in error messages.
+//! Credential values never appear in error messages.
+
 pub mod capabilities;
 pub mod catalog_kind;
 pub mod connection;
@@ -40,49 +38,27 @@ use serde_json::{Value as Json, json};
 use std::collections::HashMap;
 use std::num::NonZeroUsize;
 
-// The namespace to expose, for either catalog kind.
 const PROP_NAMESPACE: &str = "NAMESPACE";
-// Required: name of the Exasol CONNECTION object that holds the catalog URI
-// (as its address) and the credential JSON (as its password).
+// CONNECTION whose address is the catalog URI and whose password is the credential JSON.
 const PROP_CATALOG_CONNECTION: &str = "CATALOG_CONNECTION";
-// Allow HTTP to the catalog/storage endpoint (opt-in; defaults to false).
 const PROP_ALLOW_HTTP: &str = "ALLOW_HTTP";
-// VS property name for the parallelism factor (oversubscription multiplier).
-// Default: twice the detected per-node core count, floored at
-// DEFAULT_PARALLELISM_FACTOR. Stored in adapterNotes so the pushdown path can
-// read it back.
 const PROP_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
 const NOTE_PARALLELISM_FACTOR: &str = "PARALLELISM_FACTOR";
-/// Minimum parallelism factor: the floor the hardware-aware default takes on a
-/// node with few cores.
 const DEFAULT_PARALLELISM_FACTOR: usize = 8;
-// VS property names for DataFusion per-instance thread configuration.
 const PROP_DF_TARGET_PARTITIONS: &str = "DATAFUSION_TARGET_PARTITIONS";
 const PROP_DF_THREADS_PER_UDF: &str = "DATAFUSION_THREADS_PER_UDF";
-// VS/connection property selecting how the DataFusion thread/partition budget is
-// derived: AUTO (adapter derives a non-oversubscribing per-instance budget) or
-// FIXED (operator-supplied values used verbatim). Default AUTO. Case-insensitive.
 const PROP_DF_THREADING_MODE: &str = "DATAFUSION_THREADING_MODE";
-// adapterNotes keys for the DataFusion thread configuration.
 const NOTE_DF_TARGET_PARTITIONS: &str = "DF_TARGET_PARTITIONS";
 const NOTE_DF_THREADS_PER_UDF: &str = "DF_THREADS_PER_UDF";
-// adapterNotes key recording the resolved threading mode (AUTO|FIXED).
 const NOTE_DF_THREADING_MODE: &str = "DF_THREADING_MODE";
-/// Pushdown-path fallback for `target_partitions` when the adapterNote is absent or
-/// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
-/// `resolve_df_fixed_count`.)
+/// Pushdown-path fallback when the adapterNote is absent or unparseable.
 const DEFAULT_DF_TARGET_PARTITIONS: usize = 1;
-/// Pushdown-path fallback for threads-per-UDF when the adapterNote is absent or
-/// unparseable. (The createVirtualSchema default is now `max(nr_of_cores, 1)` — see
-/// `resolve_df_fixed_count`.)
+/// Pushdown-path fallback when the adapterNote is absent or unparseable.
 const DEFAULT_DF_THREADS_PER_UDF: usize = 1;
-// VS property and adapterNotes key names for the DataFusion batch_size parameter.
 const PROP_DF_BATCH_SIZE: &str = "DATAFUSION_BATCH_SIZE";
 const NOTE_DF_BATCH_SIZE: &str = "DF_BATCH_SIZE";
-/// Pushdown-path fallback for `batch_size` when the adapterNote is absent or unparseable.
-/// Matches DataFusion's own default of 8192 rows per RecordBatch.
+/// Pushdown-path fallback; matches DataFusion's default rows per RecordBatch.
 const DEFAULT_DF_BATCH_SIZE: usize = 8192;
-// VS property and adapterNotes key names for the DataFusion memory pool sizing parameters.
 const PROP_MEMORY_POOL_FRACTION: &str = "MEMORY_POOL_FRACTION";
 const PROP_INSTANCE_OVERHEAD_MB: &str = "INSTANCE_OVERHEAD_MB";
 const NOTE_MEMORY_POOL_FRACTION: &str = "MEMORY_POOL_FRACTION";
@@ -92,37 +68,19 @@ const DEFAULT_MEMORY_POOL_FRACTION: f64 = 0.6;
 /// Fixed container/binary overhead (MB) subtracted from the per-instance RSS limit before
 /// applying the pool fraction.
 const DEFAULT_INSTANCE_OVERHEAD_MB: u64 = 200;
-// VS property and adapterNotes key names for the join-broadcast byte-size threshold: the
-// smaller side of a two-table inner equi-join is broadcast (replicated into every shard's
-// common spec) when its total resolved file byte size is at or below this threshold; larger
-// joins fall back to an unaccelerated two-scan join. See backlog BL-001 / plan
-// `add-join-pushdown-broadcast`.
+// A join's smaller side is broadcast into every shard when its total file bytes are at or below
+// this threshold; larger joins fall back to an unaccelerated two-scan join.
 const PROP_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
 const NOTE_JOIN_BROADCAST_MAX_BYTES: &str = "JOIN_BROADCAST_MAX_BYTES";
-/// Default join-broadcast byte-size threshold: 128 MiB.
 const DEFAULT_JOIN_BROADCAST_MAX_BYTES: u64 = 134_217_728;
-// VS/connection property and adapterNotes key for the object-store connection-concurrency
-// budget (mirrors the native `IMPORT FROM PARQUET` `MaxConnections` vocabulary). An explicit
-// positive integer pins the per-instance budget (FIXED-like); absent/empty/zero/invalid
-// triggers the AUTO derivation in `resolve_s3_max_connections`.
+// Mirrors the native `IMPORT FROM PARQUET` `MaxConnections` knob.
 const PROP_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
 const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
-/// AUTO-mode oversubscription multiplier: concurrent object-store connections per DataFusion
-/// decode thread. S3 fetches are latency-bound (each byte-range GET spends most of its wall
-/// clock waiting on a network round-trip), so a decode thread that fetched one range at a time
-/// would leave the NIC idle between requests. By Little's law the concurrency needed to fill a
-/// pipe is `bandwidth × latency`, which for S3-class latency and NIC bandwidth is several
-/// in-flight requests per thread — and since an idle pooled TCP connection is far cheaper than
-/// an OS thread, the connection budget can be a small multiple of the thread budget rather than
-/// a 1:1 mirror. `4` keeps enough requests in flight to hide S3 latency while staying bounded.
+/// Connections per decode thread: S3 range GETs are latency-bound, so several in flight per
+/// thread keep the NIC busy, and idle pooled connections are far cheaper than threads.
 const S3_CONNECTIONS_PER_THREAD: usize = 4;
-// adapterNotes key for the Exasol-name → catalog identifier map persisted at create time.
 const NOTE_TABLE_MAP: &str = "TABLE_MAP";
 
-/// Main adapter dispatch function.
-///
-/// Signature matches the `vs_adapter(fn)` macro requirement:
-/// `fn(&mut dyn UdfContext, &str) -> Result<String, UdfError>`.
 pub fn adapter_call(ctx: &mut dyn UdfContext, json_arg: &str) -> Result<String, UdfError> {
     let request: Json = serde_json::from_str(json_arg)
         .map_err(|e| UdfError::User(format!("VS request is not valid JSON: {e}")))?;
@@ -135,28 +93,17 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
         Some("getCapabilities") => Ok(get_capabilities_response()),
         Some("createVirtualSchema") => handle_create_virtual_schema(ctx, request),
         Some("refresh") => {
-            // Stateless: refresh = re-resolve schema, same as create.
+            // Stateless: re-resolve the schema, same as create.
             handle_create_virtual_schema(ctx, request)
         }
         Some("setProperties") => {
-            // Stateless: setProperties = re-resolve schema with the new
-            // properties applied, same enumeration as create.
+            // Stateless: re-resolve the schema with the new properties, same as create.
             handle_create_virtual_schema(ctx, request)
         }
         Some("dropVirtualSchema") => Ok(json!({"type": "dropVirtualSchema"})),
         Some("pushdown") => {
-            // Resolve credentials synchronously before entering the async runtime:
-            // ctx.connection(), reached via resolve_connection_config, is a
-            // connect-back round-trip that may block on the UDF host, so it must
-            // not run inside the tokio runtime built below.
-            //
-            // ctx.script_schema() and cluster_nodes_from_context(ctx) are captured
-            // here too, but for a different reason — they are plain handshake-
-            // metadata field reads, not connect-back calls. Capturing them outside
-            // the async block keeps the planning body free of ambient-state reads
-            // and of a dependency on the UDF delivery mechanism. script_schema is
-            // the schema that qualifies the scan/distributor/merge UDF names in the
-            // generated pushdown SQL.
+            // ctx.connection() is a blocking connect-back round-trip, so resolve it before
+            // building the tokio runtime.
             let props = get_properties(request);
             let config = resolve_connection_config(ctx, &props)?;
             let script_schema = ctx.script_schema();
@@ -177,10 +124,6 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
     }
 }
 
-/// The catalog/storage configuration resolved from the `CATALOG_CONNECTION`
-/// object, bundled because [`resolve_connection_config`]'s callers thread every
-/// field on to [`TableScanResolver::for_request`] and [`ConnectionStorage`]
-/// without inspecting them individually.
 pub struct ResolvedConnectionConfig {
     pub(crate) catalog_uri: String,
     pub(crate) storage: StorageBackend,
@@ -191,19 +134,7 @@ pub struct ResolvedConnectionConfig {
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 
-/// Resolve the catalog/storage configuration from the `CATALOG_CONNECTION` object.
-///
-/// Shared by the createVirtualSchema and pushdown entry points. `ctx.connection()`
-/// is synchronous and must be called before entering any async runtime.
-/// Table identity is no longer fixed at config-resolution time; callers build
-/// `CatalogProps` with the specific per-table identifier when known.
-///
-/// `allow_http`, needed by both storage selectors (`storage_block` bakes it into
-/// the static S3 payload, the vended selector uses it as its plaintext-transport
-/// consent gate), and `catalog_kind`, reused by the create path instead of
-/// resolving `CATALOG_KIND` a second time for client construction, ride on the
-/// returned [`ResolvedConnectionConfig`] alongside the rest of the resolved
-/// configuration.
+/// `ctx.connection()` is synchronous and must be called before entering any async runtime.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
@@ -231,20 +162,15 @@ fn handle_create_virtual_schema(
     ctx: &mut dyn UdfContext,
     request: &Json,
 ) -> Result<Json, UdfError> {
-    // `setProperties` must let the incoming ALTER ... SET values win over the
-    // persisted properties (and delete on an explicit null); every other request
-    // type keeps the pushdown-oriented persisted-wins precedence.
+    // `setProperties` carries ALTER ... SET values, which must win over the persisted ones.
     let props = if request.get("type").and_then(|t| t.as_str()) == Some("setProperties") {
         merge_set_properties(request)
     } else {
         get_properties(request)
     };
-    // `allow_http` is discarded here: schema enumeration reaches no vended selector,
-    // and `storage_block` already baked it into `storage`. `catalog_kind` is the
-    // single `CATALOG_KIND` parse, reused below for `construct_catalog_client`.
     let config = resolve_connection_config(ctx, &props)?;
 
-    // `NAMESPACE` is optional under direct storage: its CONNECTION address alone already denotes a complete storage subtree.
+    // Optional under direct storage: the CONNECTION address alone denotes the storage subtree.
     let configured_ns: Vec<String> = match config.catalog_kind {
         CatalogKind::DirectStorage => Vec::new(),
         _ => {
@@ -257,13 +183,8 @@ fn handle_create_virtual_schema(
 
     let nr_of_cores = resolve_nr_of_cores();
     let parallelism_factor = resolve_parallelism_factor(&props, nr_of_cores);
-    // At createVirtualSchema the file list is not yet known, so the per-node UDF
-    // instance share cannot use the file-count clamp. Before that clamp,
-    // G = node_count × parallelism_factor distributes round-robin, so the per-node
-    // share is exactly `parallelism_factor`. Using the un-clamped factor is the
-    // conservative choice for AUTO derivation: it assumes the maximal per-node
-    // fan-out, so the derived thread budget never oversubscribes a node even when
-    // the shard fan-out reaches its configured maximum.
+    // The file-count clamp is unknown here, so the un-clamped factor (maximal per-node fan-out)
+    // keeps the AUTO thread and connection budgets from oversubscribing a node.
     let df_threading_mode = resolve_threading_mode(&props);
     let (df_target_partitions, df_threads_per_udf) =
         resolve_df_threading(df_threading_mode, &props, nr_of_cores, parallelism_factor);
@@ -271,9 +192,6 @@ fn handle_create_virtual_schema(
     let memory_pool_fraction = resolve_memory_pool_fraction(&props);
     let instance_overhead_mb = resolve_instance_overhead_mb(&props);
     let join_broadcast_max_bytes = resolve_join_broadcast_max_bytes(&props);
-    // Same un-clamped `parallelism_factor` used as `udf_instances_per_node` above:
-    // the conservative maximal per-node fan-out keeps the AUTO connection budget
-    // from oversubscribing a node even at the configured shard-fan-out ceiling.
     let s3_max_connections = resolve_s3_max_connections(&props, nr_of_cores, parallelism_factor);
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -281,8 +199,6 @@ fn handle_create_virtual_schema(
         .build()
         .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
 
-    // The ONLY site that matches `CatalogKind`; after it the listing pipeline is
-    // identical for all three kinds and never asks which catalog it holds.
     let client = construct_catalog_client(
         config.catalog_kind,
         config.catalog_uri,
@@ -305,7 +221,6 @@ fn handle_create_virtual_schema(
         udf_log!(ctx, warn, "{}", skip_warning(entry));
     }
 
-    // Build adapterNotes including TABLE_MAP (merge, not clobber).
     let adapter_notes = build_adapter_notes(
         request,
         parallelism_factor,
@@ -346,17 +261,8 @@ fn skip_warning(entry: &SkippedTable) -> String {
     }
 }
 
-/// Assemble the createVirtualSchema / refresh / setProperties response.
-///
-/// The response `type` mirrors the request `type` per the Exasol VS adapter
-/// protocol (`createVirtualSchema` | `refresh` | `setProperties`). When the
-/// request carries `requestedTables` (a partial-refresh subset) it is echoed
-/// back verbatim only because the protocol requires a well-formed response to
-/// mirror the fields of the request it answers — it is NOT relied upon to
-/// scope the resulting refresh: verified against the live engine, Exasol
-/// applies the adapter's full `schemaMetadata.tables` response to the whole
-/// namespace regardless of `requestedTables`. It is omitted when the request
-/// did not include it.
+/// `requestedTables` is echoed only because the protocol requires mirroring request fields;
+/// Exasol applies the full `tables` list to the whole namespace regardless (verified live).
 fn build_schema_response(request: &Json, schema_metadata: Json) -> Json {
     let response_type = request
         .get("type")
@@ -378,11 +284,7 @@ async fn handle_pushdown_request(
     script_schema: &str,
     cluster_nodes: usize,
 ) -> Result<Json, UdfError> {
-    // PARALLELISM_FACTOR and the other tuning values below are carried in
-    // adapterNotes (persisted by Exasol), NOT in properties (dropped by
-    // Exasol). Read them from schemaMetadataInfo.adapterNotes; default to
-    // safe values when absent. cluster_nodes is no longer one of them — it
-    // arrives as a parameter, captured from the live handshake in dispatch.
+    // Tuning values come from adapterNotes, which Exasol persists; properties are dropped.
     let parallelism_factor = adapter_note(request, NOTE_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
@@ -415,7 +317,6 @@ async fn handle_pushdown_request(
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES);
 
-    // Derive the scanned table from involvedTables[0].name via TABLE_MAP.
     let iceberg_identifier = resolve_pushdown_identifier(request)?;
     let catalog = catalog_block(&config.creds, &iceberg_identifier);
 
@@ -438,11 +339,6 @@ async fn handle_pushdown_request(
     .map_err(|e| redact_error(&config.storage, e))
 }
 
-// ---------------------------------------------------------------------------
-// Property extraction helpers
-// ---------------------------------------------------------------------------
-
-/// Merge VS `properties` with `schemaMetadataInfo.properties`.
 /// `schemaMetadataInfo.properties` wins on conflict.
 fn get_properties(request: &Json) -> Json {
     let mut merged = match request.get("properties") {
@@ -459,16 +355,8 @@ fn get_properties(request: &Json) -> Json {
     Json::Object(merged)
 }
 
-/// Merge persisted and request properties for a `setProperties` request.
-///
-/// The persisted `schemaMetadataInfo.properties` are the base; the request
-/// `properties` override on conflict (request wins), and a request value of
-/// `null` unsets — removes — that property. This is the inverse precedence of
-/// [`get_properties`]: `setProperties` carries the incoming
-/// `ALTER VIRTUAL SCHEMA ... SET` values, which must take effect, and an
-/// explicit NULL must delete the property (so a required property that is
-/// null-unset then correctly fails the required-property check rather than
-/// silently retaining its old persisted value).
+/// Inverse precedence of [`get_properties`]: request values win, and a `null` removes the
+/// property, so a null-unset required property fails its check instead of keeping its old value.
 fn merge_set_properties(request: &Json) -> Json {
     let mut merged = match request
         .get("schemaMetadataInfo")
@@ -489,21 +377,13 @@ fn merge_set_properties(request: &Json) -> Json {
     Json::Object(merged)
 }
 
-/// Read `key` from a JSON object as a non-empty string.
-///
-/// Returns `Some` only for a present, string-typed, non-empty value — absent,
-/// null, non-string, and empty-string all fall through to `None`, so callers
-/// can chain `.unwrap_or(default)` and treat every one of those cases as
-/// "use the default" uniformly.
 fn nonempty_str<'a>(obj: &'a Json, key: &str) -> Option<&'a str> {
     obj.get(key)
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
 }
 
-/// Parse `request.schemaMetadataInfo.adapterNotes` (a JSON *string*) into a JSON
-/// object. Returns an empty object when adapterNotes is absent, empty, or not a
-/// parseable JSON object — callers fall back to their own defaults.
+/// adapterNotes arrives as a JSON-encoded string, not an object.
 fn parse_adapter_notes(request: &Json) -> serde_json::Map<String, Json> {
     request
         .get("schemaMetadataInfo")
@@ -518,7 +398,6 @@ fn parse_adapter_notes(request: &Json) -> serde_json::Map<String, Json> {
         .unwrap_or_default()
 }
 
-/// Read a single string value from the persisted adapterNotes.
 fn adapter_note(request: &Json, key: &str) -> Option<String> {
     parse_adapter_notes(request)
         .get(key)
@@ -527,10 +406,6 @@ fn adapter_note(request: &Json, key: &str) -> Option<String> {
         .map(|s| s.to_string())
 }
 
-/// Read the TABLE_MAP nested object from adapterNotes.
-///
-/// Returns a `HashMap<String, String>` mapping Exasol table name → original-cased
-/// catalog identifier. Returns an empty map when TABLE_MAP is absent or malformed.
 fn read_table_map(request: &Json) -> HashMap<String, String> {
     parse_adapter_notes(request)
         .get(NOTE_TABLE_MAP)
@@ -543,11 +418,6 @@ fn read_table_map(request: &Json) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-/// Flatten each identifier to an Exasol name, detect `__` collisions, and
-/// return the `(exasol_name, catalog_identifier_string)` pairs.
-///
-/// Returns an error naming the colliding Exasol table name when two distinct
-/// identifiers flatten to the same Exasol name.
 fn build_table_map(
     configured_ns: &[String],
     idents: &[CatalogTableIdent],
@@ -568,17 +438,10 @@ fn build_table_map(
     Ok(table_map)
 }
 
-/// The createVirtualSchema table list, `TABLE_MAP`, and the entries the catalog
-/// listed but excluded (skipped), each carrying the neutral reason the handler
-/// renders its warning from.
 type VirtualTables = (Vec<Json>, Vec<(String, String)>, Vec<SkippedTable>);
 
-/// The SINGLE site that matches a [`CatalogKind`]: it selects and constructs the
-/// matching [`CatalogClient`] and is the only place the three kinds diverge. Every
-/// listing operation after it runs one shared pipeline that never re-matches the
-/// kind — a fourth kind is a build failure here, not a silently-missed branch.
-///
-/// `props` lets the direct-storage arm alone resolve `NAMESPACE`, `MERGE_SCHEMA`, and `HIVE_PARTITIONING`; fallible because opening the object store can fail.
+/// The only site that matches a [`CatalogKind`]; the listing pipeline after it never re-matches
+/// the kind.
 fn construct_catalog_client(
     kind: CatalogKind,
     catalog_uri: String,
@@ -610,20 +473,8 @@ fn construct_catalog_client(
     }
 }
 
-/// The shared createVirtualSchema listing pipeline, identical for both catalog
-/// kinds: it reads catalog-neutral metadata and never asks which catalog produced
-/// it. For each listed table it flattens the identifier to an Exasol name, folds
-/// every column name into Exasol's canonical (uppercase) identifier casing through
-/// the one shared fold home, and maps each column's source-tagged type to an Exasol
-/// type via [`column_source_type_to_exasol`], narrowed to the caller-resolved
-/// `engine_timestamps` support. `TABLE_MAP` and the `__`-collision
-/// check are built from the listed identifiers via [`build_table_map`], and the
-/// catalog's skipped entries pass through, each with its neutral skip reason,
-/// for the handler to warn on.
-///
-/// The full-Unicode `to_uppercase` fold is a deliberate Exasol-target trade-off:
-/// `ß` expands to `SS`, so a column `straße` is declared as `STRASSE` and two
-/// columns differing only in that expansion collapse to one name with no check.
+/// The full-Unicode `to_uppercase` fold is a deliberate Exasol-target trade-off: `ß` expands to
+/// `SS`, so two columns differing only in that expansion collapse to one name with no check.
 fn build_listing_virtual_tables(
     configured_ns: &[String],
     listing: &CatalogListing,
@@ -658,12 +509,7 @@ fn build_listing_virtual_tables(
     Ok((tables_json, table_map, listing.skipped.clone()))
 }
 
-/// Resolve the catalog identifier for the pushdown's involved virtual table.
-///
-/// Reads `involvedTables[0].name`, looks it up in the persisted `TABLE_MAP`, and
-/// returns the original-cased catalog identifier. Errors when the request carries
-/// no involved table, or the name is absent from `TABLE_MAP` (never silently
-/// scans a different or stale table).
+/// Errors when the name is absent from `TABLE_MAP` rather than scanning a different or stale table.
 fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
     let involved_table_name = request
         .get("involvedTables")
@@ -684,15 +530,8 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
         })
 }
 
-/// Build the adapterNotes value for the createVirtualSchema response: a JSON
-/// *string* (Exasol rejects a raw object) carrying PARALLELISM_FACTOR,
-/// DF_THREADING_MODE, DF_TARGET_PARTITIONS, DF_THREADS_PER_UDF, DF_BATCH_SIZE,
-/// MEMORY_POOL_FRACTION, INSTANCE_OVERHEAD_MB, S3_MAX_CONNECTIONS,
-/// JOIN_BROADCAST_MAX_BYTES, and TABLE_MAP (a nested JSON object mapping Exasol
-/// table names to original-cased catalog identifiers). Any pre-existing notes on
-/// the request are preserved (merge, not clobber).
-// ponytail: args mirror the resolved notes fields one-to-one; a params struct is
-// pure boilerplate for a single private callee.
+/// Exasol rejects a raw-object adapterNotes, so it is a JSON string; pre-existing notes are merged.
+// Args mirror the notes fields one-to-one; a params struct is boilerplate for one private callee.
 #[allow(clippy::too_many_arguments)]
 fn build_adapter_notes(
     request: &Json,
@@ -744,7 +583,6 @@ fn build_adapter_notes(
         NOTE_JOIN_BROADCAST_MAX_BYTES.to_string(),
         Json::String(join_broadcast_max_bytes.to_string()),
     );
-    // TABLE_MAP: nested JSON object within the notes string.
     let map_obj: serde_json::Map<String, Json> = table_map
         .iter()
         .map(|(k, v)| (k.clone(), Json::String(v.clone())))
@@ -753,12 +591,6 @@ fn build_adapter_notes(
     Json::String(Json::Object(notes).to_string())
 }
 
-/// Read and validate the PARALLELISM_FACTOR VS property.
-///
-/// When the property is absent, empty, zero, or invalid, the default is
-/// `max(nr_of_cores * 2, DEFAULT_PARALLELISM_FACTOR)` — hardware-aware but
-/// floored at `DEFAULT_PARALLELISM_FACTOR`, so a dev VM or any other node with
-/// few cores keeps a useful minimum shard fan-out.
 fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
     nonempty_str(props, PROP_PARALLELISM_FACTOR)
         .and_then(|s| s.parse::<usize>().ok())
@@ -766,13 +598,7 @@ fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {
         .unwrap_or_else(|| ((nr_of_cores as usize) * 2).max(DEFAULT_PARALLELISM_FACTOR))
 }
 
-/// How the DataFusion per-instance thread/partition budget is derived.
-///
-/// `Auto` lets the adapter compute a non-oversubscribing budget from the node's
-/// core count and the per-node UDF-instance share; `Fixed` uses operator-supplied
-/// property values verbatim (the pre-mode behaviour). The mode is a planning-time
-/// concept resolved at `createVirtualSchema`; only the resulting integers reach
-/// the scan UDF, which stays mode-agnostic.
+/// Planning-time only: just the resulting integers reach the scan UDF, which stays mode-agnostic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ThreadingMode {
     Auto,
@@ -780,7 +606,6 @@ enum ThreadingMode {
 }
 
 impl ThreadingMode {
-    /// The adapterNotes string form (`AUTO` / `FIXED`).
     fn as_note(self) -> &'static str {
         match self {
             ThreadingMode::Auto => "AUTO",
@@ -789,10 +614,6 @@ impl ThreadingMode {
     }
 }
 
-/// Resolve the DATAFUSION_THREADING_MODE VS property.
-///
-/// Parses `AUTO` / `FIXED` case-insensitively. An absent, empty, or unrecognized
-/// value resolves to `Auto`.
 fn resolve_threading_mode(props: &Json) -> ThreadingMode {
     match nonempty_str(props, PROP_DF_THREADING_MODE) {
         Some(s) if s.eq_ignore_ascii_case("FIXED") => ThreadingMode::Fixed,
@@ -800,17 +621,6 @@ fn resolve_threading_mode(props: &Json) -> ThreadingMode {
     }
 }
 
-/// Resolve the `(df_target_partitions, df_threads_per_udf)` pair for the selected
-/// threading mode.
-///
-/// In `Fixed` mode each field is the supplied property when it is a positive
-/// integer, else `max(nr_of_cores, 1)` (the pre-mode behaviour). In `Auto` mode
-/// the adapter derives a per-instance thread budget that does not oversubscribe a
-/// node — `threads = max(1, floor(nr_of_cores / udf_instances_per_node))` — and
-/// holds the target partition count in lockstep with it, ignoring any supplied
-/// `DATAFUSION_TARGET_PARTITIONS` / `DATAFUSION_THREADS_PER_UDF` values. Both
-/// fields floor at `1`, so a single-core node runs one thread over one
-/// partition.
 fn resolve_df_threading(
     mode: ThreadingMode,
     props: &Json,
@@ -829,25 +639,13 @@ fn resolve_df_threading(
     }
 }
 
-/// Derive the AUTO-mode per-instance thread budget.
-///
-/// `max(1, floor(nr_of_cores / udf_instances_per_node))`, which yields `1` on a
-/// single-core node. The floor guarantees the non-oversubscription invariant
-/// `udf_instances_per_node × threads ≤ nr_of_cores` whenever the node has at least
-/// as many cores as instances; when instances exceed cores the `max(1, …)` floor
-/// keeps each instance single-threaded (the engine multiplexes the surplus
-/// instances onto the core pool).
+/// Guarantees `instances × threads ≤ nr_of_cores` whenever cores ≥ instances; otherwise each
+/// instance stays single-threaded and the engine multiplexes the surplus onto the core pool.
 fn auto_threads_per_udf(nr_of_cores: u32, udf_instances_per_node: usize) -> usize {
     let instances = udf_instances_per_node.max(1);
     ((nr_of_cores as usize) / instances).max(1)
 }
 
-/// Read and validate a FIXED-mode DataFusion count property (target partitions or
-/// threads-per-UDF, selected by `key`).
-///
-/// An explicit positive-integer property wins. When absent, empty, zero, or
-/// invalid the default is `max(nr_of_cores, 1)`, so scans auto-parallelize to
-/// the detected core count and a single-core node stays single-threaded.
 fn resolve_df_fixed_count(props: &Json, key: &str, nr_of_cores: u32) -> usize {
     nonempty_str(props, key)
         .and_then(|s| s.parse::<usize>().ok())
@@ -855,41 +653,8 @@ fn resolve_df_fixed_count(props: &Json, key: &str, nr_of_cores: u32) -> usize {
         .unwrap_or_else(|| (nr_of_cores as usize).max(1))
 }
 
-/// Resolve the `S3_MAX_CONNECTIONS` object-store connection-concurrency budget.
-///
-/// Explicit-wins-else-AUTO (Design Decision [3]), a single knob with no separate
-/// MODE property (connection concurrency is one field, unlike the coupled
-/// partition/thread pair behind `DATAFUSION_THREADING_MODE`):
-///
-/// * An explicit positive-integer `S3_MAX_CONNECTIONS` property is used verbatim
-///   (FIXED-like) — same `nonempty_str → parse → filter(>=1)` shape as
-///   `resolve_df_fixed_count`.
-/// * Absent/empty/zero/invalid triggers an AUTO derivation from `nr_of_cores` and
-///   the per-node UDF-instance share, which floors at the single-core budget of
-///   `S3_CONNECTIONS_PER_THREAD` connections however the node is sharded.
-///
-/// # AUTO formula
-///
-/// `per_instance_threads × S3_CONNECTIONS_PER_THREAD`, where `per_instance_threads`
-/// is exactly the AUTO thread budget from [`auto_threads_per_udf`] (reused here so
-/// the two knobs stay in lockstep and share the same `0`-instances handling).
-///
-/// The connection budget is a *multiple* of the thread budget, not a 1:1 mirror,
-/// because S3 data fetching is latency-bound rather than CPU-bound: a decode thread
-/// spends most of a byte-range GET waiting on a network round-trip, so keeping
-/// `S3_CONNECTIONS_PER_THREAD` requests in flight per thread hides that latency and
-/// keeps the NIC busy (Little's law: fill-the-pipe concurrency ≈ bandwidth × latency).
-/// Idle pooled TCP connections are cheap relative to OS threads, so oversubscribing
-/// the IO axis relative to the CPU axis is the correct asymmetry for approaching the
-/// native `IMPORT FROM PARQUET` throughput ceiling.
-///
-/// This yields a clean invariant: because `per_instance_threads ≈ nr_of_cores /
-/// instances`, the *aggregate* per-node connection budget
-/// (`instances × per_instance_threads × mult`) is ≈ `nr_of_cores × mult` regardless
-/// of how the node is sharded into instances — so the node-wide fetch concurrency
-/// tracks node capacity and lands in the native importer's low-double-digit
-/// `MaxConnections` range (e.g. 8 cores, one instance → 8 × 4 = 32; 8 cores, eight
-/// single-thread instances → 8 × (1 × 4) = 32 aggregate).
+/// An explicit positive value wins; otherwise the aggregate per-node budget is
+/// ≈ `nr_of_cores × S3_CONNECTIONS_PER_THREAD` however the node is sharded into instances.
 fn resolve_s3_max_connections(
     props: &Json,
     nr_of_cores: u32,
@@ -906,11 +671,6 @@ fn resolve_s3_max_connections(
     per_instance_threads * S3_CONNECTIONS_PER_THREAD
 }
 
-/// Read and validate the DATAFUSION_BATCH_SIZE VS property.
-///
-/// An explicit positive-integer property wins. When absent, empty, zero, or
-/// invalid the default is `DEFAULT_DF_BATCH_SIZE` (8192, matching DataFusion's
-/// built-in default). A supplied value is clamped to ≥1.
 fn resolve_df_batch_size(props: &Json) -> usize {
     nonempty_str(props, PROP_DF_BATCH_SIZE)
         .and_then(|s| s.parse::<usize>().ok())
@@ -918,10 +678,6 @@ fn resolve_df_batch_size(props: &Json) -> usize {
         .unwrap_or(DEFAULT_DF_BATCH_SIZE)
 }
 
-/// Read and validate the MEMORY_POOL_FRACTION VS property.
-///
-/// Accepts any value in the range (0.0, 1.0]. When the property is absent, empty,
-/// zero, out-of-range, or unparseable the default is `DEFAULT_MEMORY_POOL_FRACTION`.
 fn resolve_memory_pool_fraction(props: &Json) -> f64 {
     nonempty_str(props, PROP_MEMORY_POOL_FRACTION)
         .and_then(|s| s.parse::<f64>().ok())
@@ -929,23 +685,12 @@ fn resolve_memory_pool_fraction(props: &Json) -> f64 {
         .unwrap_or(DEFAULT_MEMORY_POOL_FRACTION)
 }
 
-/// Read and validate the INSTANCE_OVERHEAD_MB VS property.
-///
-/// Any successfully parsed u64 value (including zero) is accepted. When the
-/// property is absent, empty, or unparseable the default is
-/// `DEFAULT_INSTANCE_OVERHEAD_MB`.
 fn resolve_instance_overhead_mb(props: &Json) -> u64 {
     nonempty_str(props, PROP_INSTANCE_OVERHEAD_MB)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_INSTANCE_OVERHEAD_MB)
 }
 
-/// Read and validate the JOIN_BROADCAST_MAX_BYTES VS property.
-///
-/// A positive `u64` byte count wins. When the property is absent, empty,
-/// non-numeric, zero, or (since `u64` cannot hold one) negative, the default is
-/// `DEFAULT_JOIN_BROADCAST_MAX_BYTES` (128 MiB). See backlog BL-001 / plan
-/// `add-join-pushdown-broadcast`.
 fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
     nonempty_str(props, PROP_JOIN_BROADCAST_MAX_BYTES)
         .and_then(|s| s.parse::<u64>().ok())
@@ -953,10 +698,7 @@ fn resolve_join_broadcast_max_bytes(props: &Json) -> u64 {
         .unwrap_or(DEFAULT_JOIN_BROADCAST_MAX_BYTES)
 }
 
-/// Per-node CPU core count used to derive the AUTO parallelism, DataFusion
-/// threading, and S3 connection budgets. Read from the executing node with
-/// `std::thread::available_parallelism()`, which honours the CPU quota of the
-/// container the adapter VM runs in.
+/// `available_parallelism()` honours the CPU quota of the adapter VM's container.
 fn resolve_nr_of_cores() -> u32 {
     core_count_or_default(std::thread::available_parallelism())
 }
@@ -965,11 +707,7 @@ fn core_count_or_default(detected: std::io::Result<NonZeroUsize>) -> u32 {
     detected.map_or(1, |n| n.get() as u32)
 }
 
-/// Cluster node count for pushdown sharding, read directly from the UDF
-/// handshake via [`UdfContext::node_count`] — no persisted note, no
-/// create-time capture. A live cluster reports its node count directly (`1`
-/// on a single node); a `0` (stub, test double, or missing handshake) maps
-/// to `1` so sharding keeps the single-shard fallback behaviour.
+/// `0` (stub or missing handshake) maps to `1`, the single-shard fallback.
 fn cluster_nodes_from_context(ctx: &dyn UdfContext) -> usize {
     match ctx.node_count() {
         0 => 1,
@@ -977,11 +715,7 @@ fn cluster_nodes_from_context(ctx: &dyn UdfContext) -> usize {
     }
 }
 
-/// Redact credential values from a UdfError message.
-///
-/// Strips the literal secret values held in `storage` (value-based) and then
-/// applies the label-based heuristic, so credentials cannot leak through error
-/// shapes the label heuristic misses.
+/// Value-based stripping runs first to catch secrets the label-based heuristic misses.
 fn redact_error(storage: &StorageBackend, e: UdfError) -> UdfError {
     match e {
         UdfError::User(msg) => {
@@ -991,10 +725,6 @@ fn redact_error(storage: &StorageBackend, e: UdfError) -> UdfError {
         other => other,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Public test surface
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "adapter_tests.rs"]

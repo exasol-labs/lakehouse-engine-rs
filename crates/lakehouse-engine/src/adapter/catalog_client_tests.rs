@@ -8,17 +8,7 @@ type CatalogClientConstruction = fn(
     &Json,
 ) -> Result<Box<dyn CatalogClient>, UdfError>;
 
-/// The listing pipeline cannot branch on the catalog kind.
-///
-/// This is a compile-time surface probe: `build_listing_virtual_tables` compiles
-/// with a signature naming neither `CatalogKind` nor a `CatalogClient`, so the
-/// listing pipeline is structurally incapable of consulting the kind or a client;
-/// `construct_catalog_client` is the listing path's sole kind→client construction
-/// site. The probe pins only these two signatures — it does not (and cannot) prove
-/// the kind is matched nowhere else. `validate_creds` and the pushdown path's
-/// `TableScanResolver::for_request` — the pushdown pipeline's own ONE
-/// kind→session construction site — legitimately consult the kind, both OUTSIDE
-/// this listing pipeline.
+/// Scenario: the listing pipeline's signature names neither `CatalogKind` nor a `CatalogClient`.
 #[test]
 fn construction_site_is_exhaustive_and_fallible_for_three_kinds() {
     let _pipeline: fn(
@@ -29,12 +19,7 @@ fn construction_site_is_exhaustive_and_fallible_for_three_kinds() {
     let _constructor: CatalogClientConstruction = construct_catalog_client;
 }
 
-/// Both catalog kinds resolve their tables through the ONE shared listing
-/// pipeline: fed two listings that carry the same table and column names and
-/// differ only in the table's format tag and each column's source-tagged type —
-/// exactly what a real Iceberg vs Unity client attaches — the pipeline produces
-/// the same Exasol table name, the same case-folded column name, and the same
-/// `TABLE_MAP`.
+/// Scenario: both catalog kinds resolve their tables through the one shared listing pipeline.
 #[test]
 fn both_kinds_share_one_listing_pipeline() {
     use iceberg::spec::{PrimitiveType, Type};
@@ -88,7 +73,6 @@ fn both_kinds_share_one_listing_pipeline() {
     )
     .unwrap();
 
-    // One pipeline: identical flatten, case-fold, and TABLE_MAP for both kinds.
     assert_eq!(ib_tables[0]["name"], "ORDERS");
     assert_eq!(ib_tables[0]["name"], uc_tables[0]["name"]);
     assert_eq!(ib_tables[0]["columns"][0]["name"], "ORDER_ID");
@@ -102,17 +86,13 @@ fn both_kinds_share_one_listing_pipeline() {
     );
     assert_eq!(ib_map, uc_map);
 
-    // The ONE type-mapping home maps `LONG` identically for both source kinds.
     assert_eq!(
         ib_tables[0]["columns"][0]["dataType"],
         uc_tables[0]["columns"][0]["dataType"]
     );
 }
 
-/// Scenario (datafusion-scan/type-mapping): the resolved precision reaches the
-/// declared column type. The listing pipeline declares a timestamp column at the
-/// precision it is handed — the threading half of the createVirtualSchema
-/// response, with no live engine involved.
+/// Scenario: the listing pipeline declares a timestamp column at the precision it is handed.
 #[test]
 fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
     use iceberg::spec::{PrimitiveType, Type};

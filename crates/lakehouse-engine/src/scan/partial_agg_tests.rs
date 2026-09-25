@@ -7,21 +7,13 @@ use arrow::record_batch::RecordBatch;
 use exasol_udf_sdk::value::ExaType;
 use std::sync::Arc;
 
-/// Test-only no-filter wrapper over `build_partial_agg_sql_filtered`
-/// (`filter = None`); also reached by `grouped_agg_tests` and
-/// `scan_surface_probe` via `crate::scan::`.
+/// Also reached by `grouped_agg_tests` and `scan_surface_probe` via `crate::scan::`.
 pub fn build_partial_agg_sql(aggregates: &[AggregatePlan], aliased_table: &str) -> String {
     build_partial_agg_sql_filtered(aggregates, aliased_table, None)
 }
 
-/// One `AggregatePlan` per `AggKind` variant, in the same order as
-/// `testdata/dispatch_golden/single_group_all_agg_kinds.sql` /
-/// `grouped_all_agg_kinds.sql` (plan `refactor-pushdown-agg-dedup`, task
-/// 1.1): `Count`, `CountCol`, `Sum`, `Min`, `Max`, `Avg` (arity 1 then 1
-/// then 1 then 1 then 1 then 2), then the four statistical kinds
-/// `StddevSamp`, `StddevPop`, `VarSamp`, `VarPop` (arity 3 each) — the
-/// mixed arities exercise the plan-ordinal-versus-column-ordinal
-/// distinction the refactor must not disturb.
+/// Same order as the `dispatch_golden` all-agg-kinds fixtures; the mixed arities (1, 1, 1, 1, 1,
+/// 2, then 3 × 4) exercise plan-ordinal versus column-ordinal naming.
 fn all_agg_kinds_plans() -> Vec<AggregatePlan> {
     vec![
         AggregatePlan {
@@ -77,12 +69,7 @@ fn all_agg_kinds_plans() -> Vec<AggregatePlan> {
     ]
 }
 
-/// The scan's own single-group partial-aggregate SQL over every `AggKind`
-/// stays byte-identical to the captured pre-refactor golden — the only
-/// baseline over `partial_select_items`' output (plan
-/// `refactor-pushdown-agg-dedup`, task 1.1), which no `dispatch_golden`
-/// fixture can reach: the scan's DataFusion SELECT list is built here, at
-/// runtime, not by `build_dispatch_sql`.
+/// Scenario: single-group partial-aggregate SQL over every AggKind matches the golden byte for byte.
 #[test]
 fn partial_agg_sql_all_agg_kinds_matches_golden() {
     let actual = build_partial_agg_sql(&all_agg_kinds_plans(), "aliased");
@@ -90,11 +77,7 @@ fn partial_agg_sql_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// The scan's own grouped partial-aggregate SQL (one group key, no
-/// filter) over every `AggKind` stays byte-identical to the captured
-/// pre-refactor golden — the grouped-path sibling of
-/// `partial_agg_sql_all_agg_kinds_matches_golden`, and equally
-/// unreachable from any `dispatch_golden` fixture.
+/// Scenario: grouped partial-aggregate SQL over every AggKind matches the golden byte for byte.
 #[test]
 fn grouped_partial_agg_sql_all_agg_kinds_matches_golden() {
     let actual = build_grouped_partial_agg_sql(
@@ -133,7 +116,7 @@ fn sample_plans_count_sum_min_max() -> Vec<AggregatePlan> {
     ]
 }
 
-/// Column order: COUNT(*) first, then SUM, MIN, MAX — each one column.
+/// Scenario: COUNT(*), SUM, MIN, MAX each yield one column in order.
 #[test]
 fn partial_agg_sql_count_star_uses_count_star() {
     let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
@@ -147,7 +130,7 @@ fn partial_agg_sql_count_star_uses_count_star() {
     );
 }
 
-/// COUNT(col) plan uses COUNT("COL"), not COUNT(*).
+/// Scenario: a COUNT(col) plan uses COUNT("COL"), not COUNT(*).
 #[test]
 fn partial_agg_sql_count_col_uses_count_col() {
     let plans = vec![AggregatePlan {
@@ -170,7 +153,7 @@ fn partial_agg_sql_count_col_uses_count_col() {
     );
 }
 
-/// SUM plan uses SUM("COL") at index 1.
+/// Scenario: a SUM plan uses SUM("COL") at index 1.
 #[test]
 fn partial_agg_sql_sum_uses_sum_col() {
     let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
@@ -180,7 +163,7 @@ fn partial_agg_sql_sum_uses_sum_col() {
     );
 }
 
-/// MIN/MAX plans use MIN/MAX("COL").
+/// Scenario: MIN/MAX plans use MIN/MAX("COL").
 #[test]
 fn partial_agg_sql_min_max_use_min_max_col() {
     let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
@@ -194,7 +177,7 @@ fn partial_agg_sql_min_max_use_min_max_col() {
     );
 }
 
-/// AVG plan emits TWO columns: sum first, count second.
+/// Scenario: an AVG plan emits two columns, sum then count.
 #[test]
 fn partial_agg_sql_avg_emits_sum_count_pair() {
     let plans = vec![AggregatePlan {
@@ -203,25 +186,21 @@ fn partial_agg_sql_avg_emits_sum_count_pair() {
         arg_expr: None,
     }];
     let sql = build_partial_agg_sql(&plans, "aliased");
-    // Must NOT emit an AVG() function.
     assert!(
         !sql.contains("AVG("),
         "must not use AVG() for partial avg: {sql}"
     );
-    // Must emit SUM for the sum part.
     assert!(
         sql.contains(r#"SUM("SCORE") AS "PARTIAL_avg_sum_0""#),
         "AVG plan must emit SUM as PARTIAL_avg_sum_0: {sql}"
     );
-    // Must emit COUNT(col) for the count part (not COUNT(*)).
     assert!(
         sql.contains(r#"COUNT("SCORE") AS "PARTIAL_avg_cnt_0""#),
         "AVG plan must emit COUNT(col) as PARTIAL_avg_cnt_0: {sql}"
     );
 }
 
-/// Mixed: COUNT/SUM/AVG — AVG contributes two columns at indices 2 (sum) and 2 (cnt),
-/// i.e., each plan item is indexed by its position in the aggregates vec.
+/// Scenario: each plan item is indexed by its position in the aggregates vec, AVG's pair sharing one index.
 #[test]
 fn partial_agg_sql_mixed_column_order_and_indices() {
     let plans = vec![
@@ -242,11 +221,8 @@ fn partial_agg_sql_mixed_column_order_and_indices() {
         },
     ];
     let sql = build_partial_agg_sql(&plans, "aliased");
-    // COUNT at index 0.
     assert!(sql.contains("PARTIAL_count_0"), "count at index 0: {sql}");
-    // SUM at index 1.
     assert!(sql.contains("PARTIAL_sum_1"), "sum at index 1: {sql}");
-    // AVG at index 2 -> both sum and cnt use index 2.
     assert!(
         sql.contains("PARTIAL_avg_sum_2"),
         "avg sum at index 2: {sql}"
@@ -257,7 +233,7 @@ fn partial_agg_sql_mixed_column_order_and_indices() {
     );
 }
 
-/// Filter is applied when present.
+/// Scenario: a present filter is applied.
 #[test]
 fn partial_agg_sql_applies_filter() {
     let plans = vec![AggregatePlan {
@@ -276,7 +252,7 @@ fn partial_agg_sql_applies_filter() {
     );
 }
 
-/// No filter: no WHERE clause.
+/// Scenario: no filter yields no WHERE clause.
 #[test]
 fn partial_agg_sql_no_filter_no_where() {
     let plans = vec![AggregatePlan {
@@ -291,9 +267,7 @@ fn partial_agg_sql_no_filter_no_where() {
     );
 }
 
-/// A partial aggregate over a rendered scalar expression argument substitutes
-/// that fragment VERBATIM as the DataFusion function argument — it is NOT
-/// re-quoted as an identifier — while a bare-column plan is unchanged.
+/// Scenario: a rendered expression argument is substituted verbatim while a bare column stays quoted.
 #[test]
 fn partial_sql_uses_rendered_expression_argument() {
     let plans = vec![
@@ -307,7 +281,6 @@ fn partial_sql_uses_rendered_expression_argument() {
             column: None,
             arg_expr: Some(r#"("A" + "B")"#.into()),
         },
-        // A bare-column plan alongside the expression ones stays quoted-identifier.
         AggregatePlan {
             kind: AggKind::Sum,
             column: Some("AMOUNT".into()),
@@ -316,30 +289,26 @@ fn partial_sql_uses_rendered_expression_argument() {
     ];
     let sql = build_partial_agg_sql(&plans, "aliased");
 
-    // Expression argument is substituted raw (no identifier quoting of the whole expr).
     assert!(
         sql.contains(r#"SUM(LENGTH("L_COMMENT")) AS "PARTIAL_sum_0""#),
         "SUM over an expression must render the expression verbatim: {sql}"
     );
-    // The rendered expression must NOT be wrapped as a single quoted identifier.
     assert!(
         !sql.contains(r#"SUM("LENGTH("#),
         "expression argument must not be re-quoted as an identifier: {sql}"
     );
-    // AVG over an expression emits the sum/count pair over the same fragment.
     assert!(
         sql.contains(r#"SUM(("A" + "B")) AS "PARTIAL_avg_sum_1""#)
             && sql.contains(r#"COUNT(("A" + "B")) AS "PARTIAL_avg_cnt_1""#),
         "AVG over an expression must decompose over the rendered fragment: {sql}"
     );
-    // The bare-column plan is unchanged.
     assert!(
         sql.contains(r#"SUM("AMOUNT") AS "PARTIAL_sum_2""#),
         "bare-column aggregate must remain quoted-identifier: {sql}"
     );
 }
 
-/// Single group key with COUNT(*): SELECT includes the key and COUNT(*).
+/// Scenario: a single group key with COUNT(*) appears in the SELECT.
 #[test]
 fn grouped_partial_agg_sql_single_key_count() {
     let plans = vec![AggregatePlan {
@@ -360,8 +329,7 @@ fn grouped_partial_agg_sql_single_key_count() {
     assert!(sql.contains("GROUP BY"), "must have GROUP BY clause: {sql}");
 }
 
-/// The emitted SELECT layout matches the GK_* then PARTIAL_* adapter contract:
-/// group keys appear before partial aggregate columns in the SELECT list.
+/// Scenario: group keys precede partial aggregate columns in the SELECT list.
 #[test]
 fn grouped_partial_agg_sql_layout_matches_emits() {
     let plans = vec![
@@ -382,7 +350,6 @@ fn grouped_partial_agg_sql_layout_matches_emits() {
         "aliased",
         None,
     );
-    // Verify ordering: group key positions come before partial aggregate positions.
     let region_pos = sql.find(r#""REGION""#).expect("REGION must appear");
     let partial_count_pos = sql
         .find("PARTIAL_count_0")
@@ -402,7 +369,7 @@ fn grouped_partial_agg_sql_layout_matches_emits() {
     );
 }
 
-/// No LIMIT is ever added to a grouped partial aggregate SQL.
+/// Scenario: no LIMIT is ever added to a grouped partial aggregate.
 #[test]
 fn grouped_partial_agg_sql_no_limit() {
     let plans = vec![AggregatePlan {
@@ -417,8 +384,7 @@ fn grouped_partial_agg_sql_no_limit() {
     );
 }
 
-/// Expression group keys (e.g. YEAR("DATE")) are inserted verbatim into the
-/// DataFusion GROUP BY clause without any quoting or transformation.
+/// Scenario: expression group keys are inserted verbatim into SELECT and GROUP BY.
 #[test]
 fn grouped_partial_agg_sql_expression_key_verbatim() {
     let plans = vec![AggregatePlan {
@@ -433,7 +399,6 @@ fn grouped_partial_agg_sql_expression_key_verbatim() {
         sql.contains(&expr_key),
         "expression key must appear verbatim in SQL: {sql}"
     );
-    // Must appear in both SELECT and GROUP BY.
     let first_pos = sql.find(&expr_key).unwrap();
     let second_pos = sql[first_pos + 1..]
         .find(&expr_key)
@@ -444,7 +409,7 @@ fn grouped_partial_agg_sql_expression_key_verbatim() {
     );
 }
 
-/// Stat aggregate partial emits COUNT(col), SUM(col), SUM(col*col) at index 0.
+/// Scenario: a stat aggregate emits COUNT(col), SUM(col), SUM(col*col) at index 0.
 #[test]
 fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
     for kind in &[
@@ -471,7 +436,6 @@ fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
             sql.contains(r#"SUM("SCORE" * "SCORE") AS "PARTIAL_stat_sumsq_0""#),
             "{kind:?} must emit SUM(col*col) as PARTIAL_stat_sumsq_0: {sql}"
         );
-        // Must NOT use AVG or STDDEV directly — only sufficient statistics
         assert!(
             !sql.contains("STDDEV"),
             "{kind:?} must not emit STDDEV: {sql}"
@@ -483,10 +447,7 @@ fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
     }
 }
 
-/// Stat aggregate null fallback row has 3 values: cnt=0, sum=NULL, sumsq=NULL.
-///
-/// The counter arrives at the `DECIMAL(20,0)` the adapter declares for every
-/// counting partial column, so its zero is a `Value::Numeric`.
+/// Scenario: a stat aggregate's null fallback row is cnt=0 (as `Value::Numeric`), sum=NULL, sumsq=NULL.
 #[test]
 fn stat_aggregate_null_fallback_row_has_three_values() {
     use exasol_udf_sdk::value::{Decimal, Value};
@@ -524,14 +485,7 @@ fn stat_aggregate_null_fallback_row_has_three_values() {
     }
 }
 
-/// Scenario: an empty shard's fallback row carries each counter's zero at the
-/// `Value` variant its declared output column admits, and NULL for every value
-/// column.
-///
-/// Both arms of the single-group path emit into the SAME declared columns, so a
-/// fixed `Value::Int64(0)` would hand the SDK a variant the column rejects for
-/// exactly the columns the adapter declares `DECIMAL(20,0)` — the populated arm
-/// coerces to that declaration, and this arm must reach the same variant.
+/// Scenario: an empty shard's fallback row carries each counter's zero at its declared variant, NULL elsewhere.
 #[test]
 fn null_partial_row_conforms_to_declared_output_columns() {
     use exasol_udf_sdk::value::{Decimal, Value};
@@ -571,8 +525,7 @@ fn null_partial_row_conforms_to_declared_output_columns() {
     );
 }
 
-/// Scenario: a declared list that does not cover the fallback row's columns
-/// fails the call naming both counts, exactly as the populated arm's does.
+/// Scenario: a declared list not covering the fallback row fails naming both counts.
 #[test]
 fn null_partial_row_fails_when_the_declared_list_is_short() {
     let plans = vec![
@@ -597,8 +550,7 @@ fn null_partial_row_fails_when_the_declared_list_is_short() {
     );
 }
 
-/// Scenario: a counter column declared a type no row count can inhabit fails
-/// the call naming that column, rather than emitting a zero the SDK rejects.
+/// Scenario: a counter declared a type no row count can inhabit fails naming the column.
 #[test]
 fn null_partial_row_fails_when_a_counter_is_declared_non_numeric() {
     let plans = vec![AggregatePlan {
@@ -615,7 +567,7 @@ fn null_partial_row_fails_when_a_counter_is_declared_non_numeric() {
     );
 }
 
-/// Mixed stat + count: stat at index 1 uses PARTIAL_stat_*_1 names.
+/// Scenario: a stat aggregate at index 1 uses PARTIAL_stat_*_1 names.
 #[test]
 fn stat_aggregate_index_follows_plan_order() {
     let plans = vec![
@@ -646,12 +598,7 @@ fn stat_aggregate_index_follows_plan_order() {
     );
 }
 
-/// R2: ResourcesExhausted on the grouped/ungrouped partial-aggregate paths surfaces
-/// as a memory-exhaustion error, not a storage error, and leaks no credentials.
-///
-/// This test exercises classify_scan_error directly (the same function now called
-/// at all five mod.rs error sites) to confirm the classification is correct for
-/// the DataFusion error shapes that aggregation and execution produce.
+/// Scenario: ResourcesExhausted on the partial-aggregate paths surfaces as memory exhaustion without credentials.
 #[test]
 fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
     use crate::scan::emit::classify_scan_error;
@@ -660,7 +607,6 @@ fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
     let secret = "my-secret-key-value";
     let secrets = [secret];
 
-    // 1. Direct ResourcesExhausted (e.g., from HashAggregateExec OOM).
     let direct = DataFusionError::ResourcesExhausted(
         "Failed to allocate additional 512 MiB for HashAggregateExec".to_string(),
     );
@@ -676,7 +622,7 @@ fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
     );
     assert!(!text.contains(secret), "must not leak credentials: {text}");
 
-    // 2. Context-wrapped ResourcesExhausted (DataFusion sort wraps with .context()).
+    // DataFusion's sort wraps with .context().
     let ctx_wrapped = DataFusionError::ResourcesExhausted("pool limit hit".to_string())
         .context(format!("External sort failed secret={secret}"));
     let err_ctx = classify_scan_error(ctx_wrapped, &secrets);
@@ -694,7 +640,6 @@ fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
         "context-wrapped must not leak credentials: {text_ctx}"
     );
 
-    // 3. Non-ResourcesExhausted errors still route to the storage-error path.
     let storage_err = DataFusionError::Execution("S3 403 Forbidden".to_string());
     let err_storage = classify_scan_error(storage_err, &[]);
     let text_storage = err_storage.to_string();
@@ -707,10 +652,6 @@ fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
         "non-OOM error must NOT look like a memory error: {text_storage}"
     );
 }
-
-// ---------------------------------------------------------------------------
-// Every emitted partial-aggregate cell matches its declared output column
-// ---------------------------------------------------------------------------
 
 fn decimal_column(values: Vec<i128>, precision: u8, scale: i8) -> ArrayRef {
     Arc::new(
@@ -729,31 +670,12 @@ fn one_row_batch(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("partial batch")
 }
 
-/// Scenario: each partial-aggregate cell is coerced to the Arrow type its
-/// declared output column requires, so the emitted `Value` variant is one the
-/// SDK's `column_accepts` rule admits.
-///
-/// The four pre-existing mismatches the SDK bump turns into query failures, all
-/// of them shaped the same way — the adapter declares a type, DataFusion keeps
-/// the argument type, and nothing enforced agreement:
-///
-/// 1. `AVG(<iceberg long>)`'s `SUM` stays `Int64` under a `DOUBLE PRECISION`
-///    column, which rejects `Value::Int64`.
-/// 2. `AVG(<iceberg decimal>)`'s `SUM` stays `Decimal128` under the same
-///    `DOUBLE PRECISION` column, which rejects `Value::Numeric`.
-/// 3. `SUM` over a wide decimal widens past `Decimal128(36, s)`, and
-///    `arrow_value_at` then stringifies it into a numeric column.
-/// 4. `MIN`/`MAX` over a `decimal(p,0)` with `p` at most 18 stays `Decimal128`
-///    under a column Exasol binned to `Int64`.
-///
-/// Plus the nested-aggregate slot, whose hardcoded `DOUBLE PRECISION`
-/// declaration meets a `Decimal128` DataFusion expression.
+/// Scenario: each partial-aggregate cell is coerced to its declared column's Arrow type.
 #[test]
 fn partial_cells_conform_to_declared_output_columns() {
     use exasol_udf_sdk::value::Value;
 
-    // AVG over an Iceberg long: COUNT stays Int64 under DECIMAL(20,0), SUM
-    // stays Int64 under DOUBLE PRECISION.
+    // AVG over an Iceberg long: SUM stays Int64 under DOUBLE PRECISION.
     let avg_long = one_row_batch(vec![
         ("PARTIAL_avg_cnt_0", Arc::new(Int64Array::from(vec![7i64]))),
         ("PARTIAL_avg_sum_0", Arc::new(Int64Array::from(vec![42i64]))),
@@ -783,7 +705,6 @@ fn partial_cells_conform_to_declared_output_columns() {
         "an Int64 SUM must reach a DOUBLE PRECISION column as Value::Double"
     );
 
-    // AVG over an Iceberg decimal: SUM is Decimal128 under DOUBLE PRECISION.
     let avg_decimal = one_row_batch(vec![
         ("PARTIAL_avg_cnt_0", Arc::new(Int64Array::from(vec![4i64]))),
         ("PARTIAL_avg_sum_0", decimal_column(vec![12_550], 10, 2)),
@@ -807,8 +728,7 @@ fn partial_cells_conform_to_declared_output_columns() {
         "a Decimal128 SUM must reach a DOUBLE PRECISION column as Value::Double"
     );
 
-    // SUM over a decimal wide enough that DataFusion's sum type exceeds
-    // DECIMAL(36,s): arrow_value_at would stringify Decimal128(38,2).
+    // DataFusion's sum type exceeds DECIMAL(36,s); arrow_value_at would stringify it.
     let wide_sum = one_row_batch(vec![(
         "PARTIAL_sum_0",
         decimal_column(vec![123_456_789_012_345], 38, 2),
@@ -832,8 +752,7 @@ fn partial_cells_conform_to_declared_output_columns() {
         "a Decimal128(38,2) SUM must reach DECIMAL(36,2) as Value::Numeric, never a string"
     );
 
-    // MIN/MAX over decimal(p,0) with p at most 18: the column Exasol binned to
-    // Int64 must receive Value::Int64, not Value::Numeric.
+    // MIN/MAX over decimal(p≤18,0): Exasol binned the column to Int64.
     let minmax = one_row_batch(vec![
         ("PARTIAL_min_0", decimal_column(vec![11], 18, 0)),
         ("PARTIAL_max_0", decimal_column(vec![99], 18, 0)),
@@ -864,8 +783,7 @@ fn partial_cells_conform_to_declared_output_columns() {
         "a Decimal128(18,0) extremum must reach an Int64-binned column as Value::Int64"
     );
 
-    // A nested-only aggregate: NESTED_AGGREGATE_PLAN_TYPE declares
-    // DOUBLE PRECISION while the DataFusion expression yields Decimal128.
+    // NESTED_AGGREGATE_PLAN_TYPE declares DOUBLE PRECISION; DataFusion yields Decimal128.
     let nested = one_row_batch(vec![("PARTIAL_sum_0", decimal_column(vec![2_500], 20, 4))]);
     let row = partial_row_from_batch(
         &[AggregatePlan {
@@ -884,9 +802,7 @@ fn partial_cells_conform_to_declared_output_columns() {
     );
 }
 
-/// Scenario (`scan-execution-partial-agg`): a `MIN`/`MAX` cell over a `TIMESTAMP(9)` column
-/// reaches its `Value::Timestamp` with all nine digits. A second conversion site,
-/// independent of the Arrow `emit_batch` one.
+/// Scenario: a MIN/MAX cell over TIMESTAMP(9) keeps all nine digits in its `Value::Timestamp`.
 #[test]
 fn partial_agg_minmax_over_a_nanosecond_timestamp_keeps_every_digit() {
     use arrow::array::TimestampNanosecondArray;
@@ -937,8 +853,7 @@ fn partial_agg_minmax_over_a_nanosecond_timestamp_keeps_every_digit() {
     );
 }
 
-/// Scenario: a partial-aggregate `Numeric` column out of range fails the call naming it,
-/// matching the Arrow `emit_batch` path.
+/// Scenario: an out-of-range partial-aggregate `Numeric` column fails naming it.
 #[test]
 fn partial_agg_fails_on_numeric_with_out_of_range_payload() {
     let drifted = vec![
@@ -965,17 +880,10 @@ fn partial_agg_fails_on_numeric_with_out_of_range_payload() {
     }
 }
 
-/// Scenario: a partial-aggregate value its declared column cannot represent
-/// fails the call naming that column.
-///
-/// The Exasol outer wrapper merges each shard's partial row positionally and
-/// reads a NULL as "this shard contributed nothing", so a lenient cast that
-/// NULLs an overflowing `SUM` turns a value too wide for its declaration into a
-/// silently wrong final aggregate. Both emit paths share one coercion rule, so
-/// this path fails on overflow exactly as the Arrow raw-scan path does.
+/// Scenario: a partial-aggregate value its declared column cannot represent fails naming the column.
 #[test]
 fn partial_agg_fails_when_a_value_does_not_fit_its_declared_target() {
-    // Unscaled 10^36 needs 37 digits: one more than DECIMAL(36,2) holds.
+    // 10^36 needs 37 digits: one more than DECIMAL(36,2) holds.
     let too_wide: i128 = 10i128.pow(36);
     let batch = one_row_batch(vec![(
         "PARTIAL_sum_0",
@@ -998,9 +906,7 @@ fn partial_agg_fails_when_a_value_does_not_fit_its_declared_target() {
     );
 }
 
-/// Scenario: the grouped path coerces only the partial-aggregate columns. A
-/// group key routed through an Arrow cast would format differently from
-/// `value_to_gk_string`, changing the group's merge identity.
+/// Scenario: the grouped path coerces only the partial-aggregate columns, never group keys.
 #[test]
 fn grouped_coercion_leaves_the_group_key_columns_untouched() {
     use arrow::array::Date32Array;
@@ -1028,8 +934,7 @@ fn grouped_coercion_leaves_the_group_key_columns_untouched() {
     );
 }
 
-/// Scenario: a declared list that does not cover the produced partial row fails
-/// the call rather than emitting a short or misaligned row.
+/// Scenario: a declared list not covering the produced partial row fails the call.
 #[test]
 fn partial_agg_fails_when_the_declared_column_count_disagrees() {
     let batch = one_row_batch(vec![

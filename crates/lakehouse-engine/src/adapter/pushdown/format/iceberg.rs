@@ -26,37 +26,14 @@ pub(super) struct IcebergFormatReader<'a> {
 }
 
 impl FormatReader for IcebergFormatReader<'_> {
-    /// Resolve this table's data-file list from the Iceberg REST catalog, on the
-    /// [`CatalogSession`] the resolver already built.
+    /// Vended-credential extraction is gated solely on `creds.use_vended_credentials`,
+    /// orthogonal to the catalog-auth mode. Credentials stay vended-only (a missing vended
+    /// credential errors rather than falling back to the static one), while the CONNECTION's
+    /// `endpoint` and `region` may override vended addressing via [`StaticStoreAddress`], which
+    /// cannot carry a credential.
     ///
-    /// The catalog load_table request is self-issued via `load_table_any_auth`, which
-    /// chooses how to authenticate (SigV4 | static bearer | OAuth2-derived bearer |
-    /// none). Vended-credential extraction is gated SOLELY on
-    /// `creds.use_vended_credentials` — orthogonal to the catalog-auth mode. When it is
-    /// true, `resolve_vended_storage` builds the whole `StorageBackend` from the loadTable
-    /// response, the anchor's URI scheme, and the CONNECTION's store ADDRESS alone.
-    /// Credentials stay vended-only — one the catalog does not vend is an error here
-    /// rather than a silent fall-back to the static one — while addressing may cross
-    /// over: the CONNECTION's `endpoint` and `region` reach the selector through a
-    /// [`StaticStoreAddress`], which cannot carry a credential, and each wins over the
-    /// vended value independently when the CONNECTION sets it. When it is false, returns
-    /// the static `storage` unchanged — byte-identical to the no-vending behaviour on
-    /// every auth mode.
-    ///
-    /// An empty table `location` is rejected above the vended/static split, so both
-    /// values of `use_vended_credentials` report the identical error.
-    ///
-    /// Every error surfaced from here on is redacted against the secret values of the
-    /// EFFECTIVE storage, not the static one: the `file_io` built from it is what talks
-    /// to object storage, so those are exactly the values an underlying provider error
-    /// can echo back.
-    ///
-    /// `filter_json` is the raw pushdown filter JSON forwarded to `plan_files_from_table`
-    /// for Iceberg-level file pruning. `None` disables that pruning.
-    ///
-    /// This reader carries no partition columns: an Iceberg scan's
-    /// [`ResolvedScan::partition_columns`] is always empty, which is what keeps an
-    /// Iceberg spec's encoding byte-identical to its pre-Delta form.
+    /// Errors are redacted against the effective storage's secrets, since its `file_io` is
+    /// what talks to object storage.
     fn resolve_scan<'a>(
         &'a self,
         filter_json: Option<&'a Json>,
@@ -67,24 +44,14 @@ impl FormatReader for IcebergFormatReader<'_> {
             allow_http,
         } = self.connection;
         Box::pin(async move {
-            // Single auth-mode-agnostic path: self-issue the loadTable GET under
-            // whatever catalog-auth mode applies, then derive the effective storage
-            // gated SOLELY on `use_vended_credentials` (orthogonal to the auth mode),
-            // and build the Table from the response metadata so plan_files() can read
-            // manifests from S3.
             let result = load_table_any_auth(self.session, self.catalog_props, creds).await?;
 
-            // Refuse a recorded `date` -> `timestamp`/`timestamp_ns` promotion from the
-            // schema history ALONE, before any manifest is loaded and before the Table
-            // is even built, so the refusal fires identically for a filtered request and
-            // an unfiltered (`SELECT *`) one.
+            // Decided from schema history alone, before any manifest is read, so filtered and
+            // unfiltered requests are refused identically.
             refuse_date_promotion(&result.metadata, &self.catalog_props.table)?;
 
-            // Resolve the effective storage (vended or static). The anchor is the
-            // TABLE'S OWN location: what `storage_credentials[*].prefix` is matched
-            // against, and the sole input the backend variant is read from. Nothing
-            // else can stand in — the catalog REST URI names no object store, and the
-            // REST `warehouse` is a routing identifier.
+            // The anchor is the table's own location: what vended `prefix`es match against.
+            // The REST URI names no object store and `warehouse` is only a routing identifier.
             let table_location = result.metadata.location();
             if table_location.is_empty() {
                 return Err(UdfError::User(format!(
@@ -94,10 +61,6 @@ impl FormatReader for IcebergFormatReader<'_> {
                     self.catalog_props.table
                 )));
             }
-            // Own the table root before `result.metadata` is moved into the table
-            // builder below. Returned so the adapter can carry it once in the common
-            // blob and emit per-shard file paths relative to it (non-empty, per the
-            // guard above).
             let table_root = table_location.to_string();
             let effective_storage = if creds.use_vended_credentials {
                 resolve_vended_storage(
@@ -111,7 +74,6 @@ impl FormatReader for IcebergFormatReader<'_> {
             };
             let secrets = effective_storage.secret_values();
 
-            // Build the iceberg Table so plan_files() can read manifests from S3.
             let (namespace, table_name) = parse_table_ident(&self.catalog_props.table)?;
             let table_ident = TableIdent::new(namespace, table_name);
             let file_io = effective_storage.file_io();
@@ -138,15 +100,9 @@ impl FormatReader for IcebergFormatReader<'_> {
                 ))
             })?;
 
-            // Extract the logical schema before `plan_files_from_table` consumes
-            // `table`.
             let logical_schema = build_logical_schema(table.metadata().current_schema());
 
-            // Resolve the Iceberg name-mapping fallback (`schema.name-mapping.default`)
-            // ONCE per query here — alongside `logical_schema`, and likewise before
-            // `plan_files_from_table` consumes `table` — so it is resolved in the VS
-            // planning layer, never per UDF invocation. Absent property ⇒ empty; a
-            // present-but-malformed property fails loud with a clean plan-time error.
+            // Absent ⇒ empty; malformed ⇒ plan-time error.
             let name_mapping = parse_name_mapping(
                 table
                     .metadata()
@@ -155,12 +111,8 @@ impl FormatReader for IcebergFormatReader<'_> {
                     .map(String::as_str),
             )?;
 
-            // AUTHORITATIVE correctness gate: fail loud at the manifest/`DataFile`
-            // level on any delete/data mechanism this engine cannot apply (equality
-            // delete, Puffin/v3 deletion vector, ORC/Avro data or delete file) BEFORE
-            // building any scan-driving SQL. This must run before
-            // `plan_files_from_table` so the deletes it associates are guaranteed to
-            // be applicable Parquet positional deletes.
+            // Must run before `plan_files_from_table`, which drops the information needed to tell
+            // a Puffin deletion vector from a Parquet positional delete.
             ensure_supported_delete_mechanisms(&table, &self.catalog_props.table, &secrets).await?;
 
             let files =
@@ -180,28 +132,9 @@ impl FormatReader for IcebergFormatReader<'_> {
     }
 }
 
-/// Parse the Iceberg `schema.name-mapping.default` table property into the flat
-/// `Vec<NameMappingEntry>` the scan-side resolver looks up by physical name.
-///
-/// `raw` is the property's raw JSON value (`None` when the property is absent).
-///
-/// Behaviour (Iceberg column-projection rule #2 scope — see the plan):
-/// - Absent property (`None`) → an empty `Vec` (NOT an error): a table with no
-///   name-mapping is the common, fully-supported case.
-/// - Present but malformed JSON → a clean, credential-free plan-time `UdfError`
-///   (mirrors the fail-loud discipline of `ensure_supported_delete_mechanisms`;
-///   the property carries only column names + field-ids, never credentials, and
-///   `serde_json`'s error reports only a parse position).
-/// - Present and valid → flatten ONLY the TOP-LEVEL entries: for each top-level
-///   mapping that HAS a `field-id`, emit one `NameMappingEntry { name, field_id }`
-///   per name in its `names` list. Entries without a `field-id` are skipped (they
-///   exist only in the Iceberg schema, not in imported files — nothing to map to).
-///   Nested `fields` (struct/map/list child mappings) are deliberately NOT
-///   recursed into — out of scope for this phase (deferred to issue #83).
-///
-/// Parsed via the `iceberg` crate's own spec-accurate `NameMapping` deserializer
-/// (kebab-case `field-id`, `DefaultOnNull` nested `fields`), never a hand-rolled
-/// struct. Resolved ONCE per query in the VS planning layer.
+/// Only top-level entries with a `field-id` are flattened; id-less entries exist only in
+/// the schema. Nested child mappings are not recursed (#83). A malformed property is a
+/// credential-free plan-time error (`serde_json` reports only a position).
 fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfError> {
     let Some(raw) = raw else {
         return Ok(Vec::new());
@@ -214,8 +147,6 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     })?;
     let mut entries = Vec::new();
     for field in mapping.fields() {
-        // Skip id-less entries (schema-only, not present in imported files) and do
-        // NOT recurse into `field.fields()` (nested child mappings, out of scope).
         let Some(field_id) = field.field_id() else {
             continue;
         };
@@ -229,34 +160,21 @@ fn parse_name_mapping(raw: Option<&str>) -> Result<Vec<NameMappingEntry>, UdfErr
     Ok(entries)
 }
 
-/// A data- or delete-file mechanism the lakehouse engine cannot apply on read.
-///
-/// This engine applies ONLY Parquet positional deletes over Parquet data files.
-/// Every other mechanism must fail loud at plan time — invalid results must never
-/// be returned (mission: "correctness and safety are first-class"). The variant is
-/// used solely to name the mechanism in a clean, credential-free error; it never
-/// carries a file path or any secret.
+/// Only Parquet positional deletes over Parquet data files are applied; everything else
+/// must fail loud at plan time. Carries no path or secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UnsupportedDeleteMechanism {
-    /// Iceberg equality deletes (`DataContentType::EqualityDeletes`).
     EqualityDelete,
-    /// Iceberg v3 Puffin deletion vector (position delete stored as a Puffin blob).
+    /// Iceberg v3 Puffin deletion vector.
     DeletionVector,
-    /// An ORC data file (`DataFileFormat::Orc`).
     OrcDataFile,
-    /// An Avro data file (`DataFileFormat::Avro`).
     AvroDataFile,
-    /// An ORC positional-delete file.
     OrcDeleteFile,
-    /// An Avro positional-delete file.
     AvroDeleteFile,
-    /// A data file in a format this engine does not read as columnar Parquet.
     NonParquetDataFile,
 }
 
 impl UnsupportedDeleteMechanism {
-    /// A stable, credential-free English name for the mechanism, spliced into the
-    /// plan-time fail-loud error. Never includes a file path or any secret value.
     fn describe(self) -> &'static str {
         match self {
             UnsupportedDeleteMechanism::EqualityDelete => "Iceberg equality deletes",
@@ -270,15 +188,8 @@ impl UnsupportedDeleteMechanism {
     }
 }
 
-/// Classify one manifest `DataFile` by its content type and file format, at the
-/// authoritative manifest level (where the Puffin discriminator and file format
-/// are still visible — `plan_files` drops them, so a deletion vector would be
-/// indistinguishable from a Parquet positional delete at read time).
-///
-/// Returns `Ok(())` ONLY for the two mechanisms this engine can apply correctly:
-/// a Parquet DATA file and a Parquet POSITION-DELETE file. Every other
-/// (content, format) combination returns the specific unsupported mechanism so
-/// the caller can fail loud before building any scan-driving SQL.
+/// Must run at manifest level: `plan_files` drops the Puffin discriminator and file format,
+/// making a deletion vector indistinguishable from a Parquet positional delete.
 fn classify_manifest_file(
     content: iceberg::spec::DataContentType,
     format: iceberg::spec::DataFileFormat,
@@ -304,11 +215,7 @@ fn classify_manifest_file(
     }
 }
 
-/// Build the plan-time fail-loud error for an unsupported delete mechanism.
-///
-/// The message names ONLY the mechanism (never a file path, which could in
-/// principle embed a presigned credential) and is defensively passed through
-/// [`redact_credentials`] so no secret can survive into surfaced SQL/error text.
+/// Names only the mechanism, never a file path (which could embed a presigned credential).
 fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &str) -> UdfError {
     let msg = format!(
         "lakehouse pushdown declined for table '{}': it uses {}, which this engine \
@@ -320,36 +227,17 @@ fn unsupported_delete_error(mechanism: UnsupportedDeleteMechanism, table_name: &
     UdfError::User(redact_credentials(&msg))
 }
 
-/// Refuse a pushdown request against an Iceberg table whose schema history records a
-/// `date` → `timestamp` or `date` → `timestamp_ns` promotion, naming the table, the
-/// column, both Iceberg types, and the tracked issue (#355).
+/// Refuses a recorded `date` → `timestamp`/`timestamp_ns` promotion (#355).
 ///
-/// The decision is read from [`iceberg::spec::TableMetadata::schemas_iter`] alone, so it
-/// spends no object-store byte and MUST run BEFORE
-/// [`ensure_supported_delete_mechanisms`]: the failure it stands in front of is raised
-/// inside manifest Avro deserialization, which every request performs — `iceberg` 0.10.0
-/// reads a `timestamp` / `timestamp_ns` bound as 8 bytes unconditionally instead of
-/// applying the spec's bounds-width inference, so a pre-promotion file's 4-byte bound
-/// surfaces as `failed to convert byte slice to array`, naming neither column nor
-/// promotion, and a second bounds decode in the same crate `unwrap()`s, giving the shape a
-/// reachable panic path. Gating on that decode error would therefore sit downstream of a
-/// panic and depend on an error string; gating on the schema history refuses an unfiltered
-/// `SELECT *` exactly as it refuses a filtered request.
+/// `iceberg` 0.10.0 reads such bounds as 8 bytes, skipping the spec's bounds-width
+/// inference, so a pre-promotion file's 4-byte bound fails manifest decoding with an
+/// unhelpful error, and a second decode path `unwrap()`s. Deciding from schema history
+/// alone avoids that decode and spends no object-store byte; it must run before
+/// [`ensure_supported_delete_mechanisms`].
 ///
-/// A promotion counts as recorded when ANY schema in the history declares the field id as
-/// `date`. Position within [`iceberg::spec::TableMetadata::schemas_iter`] is not consulted:
-/// the current schema already declares the field `timestamp` / `timestamp_ns`, so it can
-/// never match, and any other schema that ever declared it `date` could have written a
-/// still-live 4-byte-bound file. The whole field-id index is walked, so a promoted field
-/// nested inside a struct, list, or map is caught too — manifest bounds are keyed by field
-/// id, not by nesting depth.
-///
-/// DELIBERATELY CONSERVATIVE: the refusal fires on the RECORDED PROMOTION ALONE, WITHOUT
-/// checking whether any pre-promotion data file still exists. A table whose files were ALL
-/// rewritten after the promotion carries only 8-byte bounds and would read fine, and is
-/// refused anyway. That over-refusal is intentional and accepted, not a defect —
-/// establishing that no pre-promotion file remains requires reading every manifest, which
-/// is the very operation that fails.
+/// Any schema declaring the field id as `date` counts, at any nesting depth (manifest bounds
+/// are keyed by field id). Deliberately conservative: a table whose files were all rewritten
+/// after the promotion is refused too, since proving that requires reading every manifest.
 fn refuse_date_promotion(
     metadata: &iceberg::spec::TableMetadata,
     table_name: &str,
@@ -396,22 +284,8 @@ fn refuse_date_promotion(
     Ok(())
 }
 
-/// Fail loud at plan time if the table's current snapshot uses ANY delete/data
-/// mechanism this engine cannot apply, detected at the manifest/`DataFile` level.
-///
-/// This is the AUTHORITATIVE correctness gate (invalid results must never be
-/// returned). It enumerates the current snapshot's manifest list, loads each
-/// manifest, and classifies every ALIVE `DataFile` (both data and delete
-/// manifests) via [`classify_manifest_file`]. Detection happens here — before any
-/// scan-driving SQL is built — because `plan_files` collapses each task to a bare
-/// path and drops the Puffin discriminator and file format needed to tell a
-/// Parquet positional delete from a deletion vector.
-///
-/// A table with no current snapshot (empty table) trivially passes.
-///
-/// Every manifest read here goes through the caller's object-store credentials, so
-/// `secrets` carries their literal values for the value-based half of
-/// [`redact_error_text`].
+/// Classifies every alive manifest `DataFile`. This is the authoritative correctness gate:
+/// `plan_files` drops the information needed to detect unsupported mechanisms.
 async fn ensure_supported_delete_mechanisms(
     table: &iceberg::table::Table,
     table_name: &str,
@@ -463,8 +337,7 @@ async fn ensure_supported_delete_mechanisms(
             ))
         })?;
         for entry in manifest.entries() {
-            // Skip entries removed in this snapshot: a DELETED manifest entry no
-            // longer applies, so failing on it would spuriously reject queries.
+            // A DELETED entry no longer applies; failing on it would spuriously reject queries.
             if !entry.is_alive() {
                 continue;
             }
@@ -477,18 +350,9 @@ async fn ensure_supported_delete_mechanisms(
     Ok(())
 }
 
-/// Build the [`DeleteMechanism`] for one iceberg task-level delete of `size` bytes
-/// at `path`.
-///
-/// By the time a `FileScanTask`'s deletes reach here, the plan-time fail-loud gate
-/// ([`ensure_supported_delete_mechanisms`]) has already rejected any table that
-/// uses equality deletes or Puffin deletion vectors, so every `PositionDeletes`
-/// task delete is guaranteed to be a Parquet positional delete. The other arms
-/// are mapped honestly for defense-in-depth: they can only be produced if a
-/// mechanism somehow slips past the gate, and the scan reader's read-time backstop
-/// then rejects them cleanly. `Data` never appears in a task's delete list; it is
-/// mapped to a non-positional sentinel so it is likewise rejected rather than
-/// silently applied.
+/// The plan-time gate has already rejected equality deletes and deletion vectors; the other
+/// arms exist for defense-in-depth so the read-time backstop rejects anything that slips
+/// past. `Data` never appears here and maps to a non-positional sentinel for the same reason.
 fn iceberg_delete_mechanism(
     path: String,
     size: u64,
@@ -507,15 +371,7 @@ fn iceberg_delete_mechanism(
     }
 }
 
-/// Drive the iceberg scan and collect the data-file paths with their sizes.
-///
-/// When `filter_json` is `Some`, an Iceberg pruning predicate is applied before
-/// `plan_files` so manifests and files that cannot match are skipped. DataFusion
-/// remains the row-level correctness backstop; this is pruning-only.
-///
-/// `secrets` carries the literal values of the object-store credentials the scan
-/// planning below reads manifests with, for the value-based half of
-/// [`redact_error_text`].
+/// Iceberg predicate pruning is best-effort; DataFusion remains the row-level backstop.
 async fn plan_files_from_table(
     table: iceberg::table::Table,
     table_name: &str,
@@ -551,11 +407,7 @@ async fn plan_files_from_table(
         ))
     })?;
 
-    // Associate each data file's Parquet positional-delete files into its entry.
-    // The plan-time fail-loud gate (`ensure_supported_delete_mechanisms`) has
-    // already run, so any `.deletes` present here are applicable Parquet
-    // positional deletes. Absolute delete paths are relativized later, in
-    // `relativize_shards_to_root`, EXACTLY like the data-file path.
+    // Delete paths are relativized later in `relativize_shards_to_root`, like data-file paths.
     Ok(tasks
         .into_iter()
         .map(|t| {
@@ -575,11 +427,6 @@ async fn plan_files_from_table(
         .collect())
 }
 
-/// Build the logical schema (`Vec<LogicalField>`) from an Iceberg current schema.
-///
-/// Iterates over the top-level struct fields of `schema` and maps each to a
-/// `LogicalField` carrying its Iceberg field-id, current name, Arrow type tag,
-/// and nullability (required → `false`, optional → `true`).
 pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
     schema
         .as_struct()
@@ -618,9 +465,8 @@ fn derive_nested_members(ty: &iceberg::spec::Type) -> Option<NestedMembers> {
                 })
                 .collect(),
         }),
-        // A list's element and a map's key/value are positional (see `NestedMembers`),
-        // so only their own field-type recurses — the pseudo-field's own Iceberg id is
-        // never carried across.
+        // List elements and map key/value are positional: the pseudo-field's Iceberg id is never
+        // carried across.
         Type::List(l) => Some(NestedMembers::List {
             element: derive_nested_members(&l.element_field.field_type).map(Box::new),
         }),
@@ -631,26 +477,11 @@ fn derive_nested_members(ty: &iceberg::spec::Type) -> Option<NestedMembers> {
     }
 }
 
-/// Encode a field's Iceberg `initial-default` as the raw primitive scalar in
-/// plain text, or `None` when there is nothing to carry.
-///
-/// Reads `initial_default` ONLY (never `write_default`, which governs writes,
-/// not reads). Returns `None` when the field has no `initial-default`, when the
-/// default is non-primitive (struct/list/map — `as_primitive_literal` yields
-/// `None`), or when the field's `PrimitiveType` reaches only the JSON-fallback
-/// `"utf8"` path (`uuid`/`time`/`fixed`/`binary`/oversized `decimal`).
-///
-/// The `(PrimitiveType, PrimitiveLiteral)` match is deliberately gated on the
-/// PrimitiveType, NOT on the computed Arrow tag: several distinct primitives
-/// collapse onto the `"utf8"` tag, and the scan-side reconstruction dispatches
-/// on that tag alone — so encoding a non-`String` value under `"utf8"` would be
-/// misread. Only the exact set that maps to a first-class Arrow tag in
-/// `iceberg_primitive_to_arrow` is encoded, mirroring the `PrimitiveType`
-/// dispatch in `iceberg_predicate::literal_to_datum`. Temporals carry their raw
-/// integer (days / micros / nanos) and a decimal carries its `i128` unscaled
-/// mantissa, so the scan side reconstructs a `ScalarValue` against the Arrow tag
-/// with no second temporal/decimal parse. The encoded text is a bare scalar, so
-/// it is inherently credential-free.
+/// Reads `initial_default` only (`write_default` governs writes). Gated on the
+/// `PrimitiveType`, not the Arrow tag: several primitives collapse onto `"utf8"` and the
+/// scan side dispatches on the tag alone, so only primitives with a first-class Arrow tag
+/// are encoded (mirroring `iceberg_predicate::literal_to_datum`). Temporals carry their raw
+/// integer and decimals their unscaled `i128`, so the scan side needs no second parse.
 fn encode_initial_default(field: &iceberg::spec::NestedField) -> Option<String> {
     use iceberg::spec::{PrimitiveLiteral, PrimitiveType};
 

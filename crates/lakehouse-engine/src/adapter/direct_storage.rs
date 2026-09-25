@@ -1,5 +1,3 @@
-//! The `CatalogClient` implementor for `CatalogKind::DirectStorage`: a plain object-storage
-//! prefix holding directories of Parquet files, with no catalog service.
 use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::parquet_directory::{
     DirectoryOptions, resolve_parquet_directory, store_prefix,
@@ -19,11 +17,8 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-/// A [`CatalogClient`] over a plain object-storage prefix, with no catalog service behind it.
-///
-/// Lives here, not in `lakehouse-catalog`, because building it needs the engine's
-/// admission-limited `object_store` builder and that crate may not depend on `object_store`
-/// directly (`vs-adapter/catalog-crate-structure`).
+/// Lives here, not in `lakehouse-catalog`, because it needs the engine's admission-limited
+/// `object_store` builder, which that crate may not depend on.
 pub struct DirectStorageCatalogClient {
     store: Arc<dyn ObjectStore>,
     prefix: StorePath,
@@ -79,7 +74,6 @@ impl CatalogClient for DirectStorageCatalogClient {
                 .collect();
             names.sort();
 
-            // Fan out per-table directory resolution instead of serializing it.
             let directories = try_join_all(names.iter().map(|name| {
                 let table_prefix = self.prefix.clone().join(name.as_str());
                 async move {

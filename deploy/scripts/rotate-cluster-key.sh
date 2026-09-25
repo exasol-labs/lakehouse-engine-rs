@@ -1,20 +1,8 @@
 #!/usr/bin/env bash
-# Seed or rotate the SHARED cluster SSH key pair. Generates a fresh ed25519 key, re-imports the EC2
-# key pair under the same name, and stores the new private key in SSM SecureString at
-# /spot-strata/deploy/ssh_key/<key_pair_name> — the single source of truth cluster-up.sh auto-fetches
-# from. Occasional MANUAL operator action; run it when the key is lost, is compromised, or you rotate
-# on a schedule. This is the ONE shared key across all env_name workspaces (test1 and any future
-# named clusters); per-environment keys would be a separate change, not this script.
-#
+# Seeds or rotates the one SSH key shared by all env_name workspaces; SSM is its source of truth.
 #   AWS_PROFILE=spot-strata-deployer ./rotate-cluster-key.sh [key_pair_name]   # default spot-strata-key
-#
-# Security: the private key exists only inside a 0700 tempdir, is pushed to SSM via file:// (never on
-# a command line or stdout), and the tempdir is shredded + removed on ANY exit (trap). The key
-# material is never printed.
-#
-# NOTE: rotating does NOT touch already-running nodes' authorized_keys — the new public key takes
-# effect for nodes created AFTER this runs. Re-provision affected clusters (tofu apply + cluster-up)
-# to move them onto the new key.
+# The private key goes to SSM via file://, never a command line or stdout.
+# Running nodes keep the old key in authorized_keys until re-provisioned.
 set -euo pipefail
 
 KEY_NAME="${1:-spot-strata-key}"
@@ -23,7 +11,6 @@ SSH_KEY_SSM="/spot-strata/deploy/ssh_key/${KEY_NAME}"
 command -v aws >/dev/null 2>&1        || { echo "aws CLI not found"; exit 1; }
 command -v ssh-keygen >/dev/null 2>&1 || { echo "ssh-keygen not found"; exit 1; }
 
-# Private tempdir; clean it on ANY exit so no key material is ever left on disk.
 WORK="$(mktemp -d)"
 chmod 700 "$WORK"
 cleanup() {

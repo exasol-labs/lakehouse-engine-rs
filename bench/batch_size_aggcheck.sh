@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Aggregate-path regression check for the DATAFUSION_BATCH_SIZE sweep.
-# Recreates the VS at each given batch size and times the Q1-Q4 query set
-# (same queries as run.sh) so a batch size chosen for the raw-emit path can be
-# confirmed not to regress the compute-heavy aggregate/join path.
+# Checks that a DATAFUSION_BATCH_SIZE chosen for the raw-emit path does not regress the
+# aggregate/join path (run.sh's Q1-Q4).
 #   ./bench/batch_size_aggcheck.sh 8192 131072
 set -uo pipefail
 cd "$(dirname "$0")/.."

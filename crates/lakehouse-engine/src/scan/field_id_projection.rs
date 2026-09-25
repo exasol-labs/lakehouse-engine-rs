@@ -1,21 +1,8 @@
-//! Column binding for the scan's logical schema: logical-schema construction,
-//! the one binding pass that claims each physical field for a logical field
-//! ([`bind_columns`]), the `PhysicalExprAdapter` that installs it
-//! ([`FieldIdExprAdapterFactory`] / `FieldIdExprAdapter`), and `initial-default`
-//! reconstruction.
-//!
-//! A logical field declares HOW it binds, and the pass dispatches on that
-//! declaration: by field-id (an Iceberg field-id, or a Delta `id` column-mapping
-//! id) against a physical field's embedded `PARQUET:field_id`; by a declared
-//! physical name (Delta `name` column mapping) against the physical column's own
-//! name; or by identity (Delta `none` column mapping) against the logical name
-//! itself. Iceberg additionally falls back to `schema.name-mapping.default` and
-//! then to the physical name.
-//!
-//! A NESTED logical field declares that same choice for each of its own members
-//! ([`NestedMembers`]), and [`resolve_nested_field`] recurses the one binding pass
-//! into them, so a member's field-id or declared physical name means at depth
-//! exactly what it means at the top.
+//! A logical field declares how it binds: by field-id (Iceberg, or Delta `id` column mapping)
+//! against `PARQUET:field_id`, by declared physical name (Delta `name` mapping), or by identity
+//! (Delta `none` mapping); Iceberg also falls back to `schema.name-mapping.default` and then the
+//! physical name. Nested members declare the same choice, and [`resolve_nested_field`] recurses
+//! the one binding pass into them.
 
 use crate::scan::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 use crate::scan::render_nested_column_as_json;
@@ -36,18 +23,10 @@ use datafusion::scalar::ScalarValue;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Arrow field-metadata key that carries a column's field-id.
-///
-/// Re-exported from the arrow-58 parquet crate so the whole scan crate has one
-/// canonical spelling; [`build_logical_arrow_schema`] tags a field-id-bound
-/// logical field with it (and ONLY such a field), and [`bind_columns`] reads it
-/// off both the logical and physical schemas.
+/// Only field-id-bound logical fields are tagged with it.
 pub(crate) use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 
-/// Read the field-id off an Arrow field, if present.
-///
-/// Returns `None` when the field carries no `PARQUET:field_id` metadata (an older
-/// writer) or the value is not a parseable `i32`.
+/// `None` without metadata (older writers) or when the value is not an `i32`.
 fn field_id_of(field: &arrow::datatypes::Field) -> Option<i32> {
     field
         .metadata()
@@ -55,17 +34,13 @@ fn field_id_of(field: &arrow::datatypes::Field) -> Option<i32> {
         .and_then(|v| v.parse::<i32>().ok())
 }
 
-/// The binding keys ONE logical field offers a physical field, in the order
-/// [`claim_logical`] tries them. Built from a top-level logical column or from a
-/// nested [`NestedField`] alike, which is what lets one order serve both depths.
+/// In the order [`claim_logical`] tries them; shared by top-level and nested fields.
 struct BindingKeys<'a> {
     name: &'a str,
     field_id: Option<i32>,
     physical_name: Option<&'a str>,
 }
 
-/// The physical side of one claim attempt: the facts [`claim_logical`] reads about
-/// the physical field being matched against a logical field's [`BindingKeys`].
 struct PhysicalKeys<'a> {
     name: &'a str,
     embedded_id: Option<i32>,
@@ -93,67 +68,40 @@ fn claim_logical(physical: PhysicalKeys<'_>, logical: &[BindingKeys<'_>]) -> Opt
         .or_else(|| logical.iter().position(|keys| keys.name == physical.name))
 }
 
-/// One file's resolution of one nested column onto the nested tree the table
-/// declares: the Arrow field the resolved column takes — logical member names, in
-/// logical order — and how each physical member reaches its logical slot.
-///
-/// The other half of the nested read path from
-/// [`render_nested_column_as_json`](crate::scan::render_nested_column_as_json),
-/// which turns the resolved array into the JSON documents Exasol reads: without the
-/// resolution those documents would be keyed by the file's own member names, which
-/// on a column-mapped table are opaque identifiers rather than the names the table
-/// declares.
+/// Without it, the rendered JSON would be keyed by the file's member names, which on a
+/// column-mapped table are opaque identifiers.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) struct NestedResolution {
     field: FieldRef,
     members: ResolvedMembers,
 }
 
-/// How one resolved member's array is built from its physical counterpart.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum ResolvedMembers {
-    /// Nothing to restructure: the physical member IS the resolved member.
     Verbatim,
-    /// One slot per logical field, in the logical tree's order.
     Struct(Vec<StructSlot>),
-    /// The element resolution of a `list`, `large_list`, or `fixed_size_list`.
     Element(Box<NestedResolution>),
-    /// The key and value resolutions of a `map`'s entries. The entries field and
-    /// sortedness are not stored here: they are already carried by the enclosing
-    /// [`NestedResolution::field`], retyped to `DataType::Map` in
-    /// [`resolve_nested_field`], and read from there by [`NestedResolution::apply`].
+    /// The entries field and sortedness live in the enclosing [`NestedResolution::field`].
     Entries {
         key: Box<NestedResolution>,
         value: Box<NestedResolution>,
     },
 }
 
-/// One logical struct field's slot: the physical child index that claimed it, or
-/// `None` when no member of this file's struct binds it.
+/// `source` is `None` when no member of this file's struct binds the slot.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct StructSlot {
     source: Option<usize>,
     resolution: NestedResolution,
 }
 
-/// Resolve one file's physical nested field onto the logical tree `members`
-/// declares: each struct member renamed to the logical name that claims it, the
-/// members reordered into logical order, an unclaimed physical member dropped, and a
-/// logical field this file's struct does not carry null-filled.
+/// Struct members are renamed to their claiming logical name, reordered, unclaimed ones dropped,
+/// and missing ones null-filled, using [`claim_logical`]. The name-mapping fallback is not
+/// reachable at depth: nested entries go unparsed (issue #28).
 ///
-/// A struct member is claimed by [`claim_logical`], the same order [`bind_columns`]
-/// applies to a top-level column. The `schema.name-mapping.default` fallback is not
-/// reachable at depth: its nested entries go unparsed (issue #28), so no nested
-/// member can carry a mapped field-id for step 3 to match.
-///
-/// A list's element and a map's key and value are POSITIONAL — one child slot each —
-/// so they resolve by recursion alone, with no name or id to match, and only when the
-/// member is itself a container the descriptor names.
-///
-/// A descriptor disagreeing with the file's own type — a `struct` tree over a column
-/// this file wrote as something else — resolves VERBATIM, leaving the physical-to-
-/// logical adaptation the file schema already goes through to decide what such a file
-/// means, rather than second-guessing it here.
+/// List elements and map keys/values are positional and resolve by recursion alone. A descriptor
+/// contradicting the file's own type resolves VERBATIM, leaving the file schema's adaptation to
+/// decide.
 pub(super) fn resolve_nested_field(
     physical: &FieldRef,
     members: &NestedMembers,
@@ -223,8 +171,6 @@ pub(super) fn resolve_nested_field(
     }
 }
 
-/// The resolution of a member nothing restructures: its own physical field, used as
-/// it stands.
 fn verbatim(physical: &FieldRef) -> NestedResolution {
     NestedResolution {
         field: Arc::clone(physical),
@@ -232,8 +178,6 @@ fn verbatim(physical: &FieldRef) -> NestedResolution {
     }
 }
 
-/// Resolve one POSITIONAL member — a list element, a map key, a map value — which
-/// recurses only when the descriptor names it as a container of its own.
 fn resolve_member(physical: &FieldRef, members: Option<&NestedMembers>) -> NestedResolution {
     match members {
         Some(members) => resolve_nested_field(physical, members),
@@ -241,15 +185,9 @@ fn resolve_member(physical: &FieldRef, members: Option<&NestedMembers>) -> Neste
     }
 }
 
-/// Claim each physical member of one struct for the logical field that binds it,
-/// then lay the slots out in LOGICAL order. A physical member claimed by a slot
-/// another member already claimed is left unclaimed, so a duplicated binding key
-/// cannot silently overwrite the first match.
-///
-/// A slot no member claims is typed [`DataType::Null`]: the descriptor carries names
-/// and binding keys, never types, so the only honest Arrow type for a field this file
-/// does not carry is the one that holds nothing but nulls — which is also what the
-/// JSON encoder renders as an explicit `null`.
+/// A member claiming an already-claimed slot is left unclaimed, so a duplicate key cannot
+/// overwrite the first match. Unclaimed slots are typed [`DataType::Null`]: the descriptor
+/// carries no types, and a null array renders as explicit JSON `null`.
 fn claim_struct_slots(children: &Fields, logical: &[NestedField]) -> Vec<StructSlot> {
     let keys: Vec<BindingKeys<'_>> = logical
         .iter()
@@ -295,18 +233,12 @@ fn claim_struct_slots(children: &Fields, logical: &[NestedField]) -> Vec<StructS
 }
 
 impl NestedResolution {
-    /// The Arrow field the resolved column takes: logical member names, in logical
-    /// order. The column's own name and nullability are the physical field's, since
-    /// only its MEMBERS are resolved here.
+    /// Only members are resolved; the column's own name and nullability stay physical.
     pub(super) fn resolved_field(&self) -> &FieldRef {
         &self.field
     }
 
-    /// Restructure one file's physical array into [`Self::resolved_field`], so a
-    /// consumer reading member names off the result reads the table's logical names.
-    ///
-    /// Fails when the array is not the type the resolution was built from, which can
-    /// only mean the resolution was applied to a different column.
+    /// Fails only if applied to a different column than it was built from.
     pub(super) fn apply(&self, array: &ArrayRef) -> datafusion::error::Result<ArrayRef> {
         match &self.members {
             ResolvedMembers::Verbatim => Ok(Arc::clone(array)),
@@ -367,8 +299,7 @@ impl NestedResolution {
     }
 }
 
-/// Rebuild one list array over its resolved element, keeping the offsets, length,
-/// and nulls the file wrote — only the element's own layout is resolved.
+/// Only the element's layout is resolved; offsets, length, and nulls stay as written.
 fn apply_to_list(
     array: &ArrayRef,
     element: &NestedResolution,
@@ -408,8 +339,6 @@ fn apply_to_list(
     }
 }
 
-/// Downcast one physical array to the Arrow array type its resolution was built
-/// from, naming the mismatch rather than panicking on it.
 fn downcast_array<'a, T: Array + 'static>(
     array: &'a ArrayRef,
     expected: &str,
@@ -422,75 +351,28 @@ fn downcast_array<'a, T: Array + 'static>(
     })
 }
 
-/// Factory for the column-binding [`PhysicalExprAdapter`], installed on the
-/// `ListingTableConfig` via `with_expr_adapter_factory`. The Parquet opener calls
-/// [`Self::create`] once per file, so files with divergent physical layouts each
-/// bind correctly.
+/// The Parquet opener calls [`Self::create`] once per file, so divergent layouts each bind.
 ///
-/// It does NOT reimplement schema adaptation. It composes two steps around
-/// [`DefaultPhysicalExprAdapter`]:
-///
-/// 1. Feed the default a physical schema renamed to the logical names its fields
-///    were claimed by (see [`bind_columns`] for the field-id / declared-physical-name
-///    / name-mapping / identity resolution order). The default then resolves each
-///    logical column to the correct physical index and reuses its own behavior for
-///    the rest — nullable-missing → NULL literal, type divergence → cast,
-///    required-missing → error. Every binding strategy therefore shares ONE set of
-///    adaptation semantics rather than getting a thinner path of its own.
-/// 2. Rename the default's OUTPUT columns back to the real physical names (at
-///    their already-correct indices) — see [`FieldIdExprAdapter`].
-///
-/// # Why the output must be renamed back (the E2E `rating`/`score` failure)
-///
-/// The default adapter resolves columns by NAME, so feeding it logical names on
-/// both sides makes it emit `Column`s carrying the LOGICAL name (`rating`). But in
-/// DataFusion 54 the Parquet opener applies the expr adapter to the PROJECTION as
-/// well as the filter, and every downstream consumer of the rewritten projection —
-/// `build_projection_read_plan`, `reassign_expr_columns`, and `make_projector` —
-/// resolves those `Column`s by NAME against the REAL physical file schema
-/// (`score`). A projected `Column("rating")` therefore fails with
-/// `Unable to get field named "rating"`. Renaming the output back to the real
-/// physical name (order is preserved, so the index is already right) makes those
-/// name-based lookups succeed while keeping the binding.
-///
-/// Carries the query's whole [`FieldIdResolution`] — the binding tables and the
-/// reconstructed `initial-default` values, resolved once in the VS and threaded
-/// down via [`register_file_list`] / [`PositionalDeleteScanTable`]. Holding that
-/// one value rather than mirroring its members keeps a new binding table from
-/// needing a second home here.
+/// It composes around [`DefaultPhysicalExprAdapter`] instead of reimplementing adaptation:
+/// 1. The default gets a physical schema renamed to the claiming logical names (see
+///    [`bind_columns`]), so every binding strategy shares its NULL-fill/cast/required-missing
+///    semantics.
+/// 2. Output columns are renamed back to the real physical names (see [`FieldIdExprAdapter`]).
 #[derive(Debug)]
 pub(crate) struct FieldIdExprAdapterFactory {
     pub(crate) resolution: FieldIdResolution,
 }
 
-/// Per-query column-binding metadata for one scan side (fact or dimension),
-/// resolved once in the VS alongside the logical schema: the tables a physical
-/// field is matched against, plus the reconstructed `initial-default` values an
-/// absent logical column falls back to. Grouped into one value so
-/// [`register_file_list`] threads a single argument through
-/// [`crate::scan::positional_deletes::PositionalDeleteScanTable::new`], which in
-/// turn hands the same value to [`FieldIdExprAdapterFactory`] on each
-/// [`crate::scan::positional_deletes::PositionalDeleteScanTable::scan`] call.
+/// Per-query binding metadata for one scan side, resolved once in the VS.
 #[derive(Debug, Clone)]
 pub(crate) struct FieldIdResolution {
-    /// Flattened `schema.name-mapping.default` entries: the table-level
-    /// physical-name → field-id fallback for files whose columns carry no
-    /// field-id at all. Empty when the table declares no name mapping.
+    /// Physical-name → field-id fallback for files whose columns carry no field-id.
     pub(crate) name_mapping: Vec<NameMappingEntry>,
-    /// Logical column name keyed by the physical name that column DECLARES,
-    /// built by [`index_declared_physical_names`]. Empty for a table whose
-    /// fields all bind by field-id or by identity — every Iceberg table.
+    /// Physical name → logical name. Empty for every Iceberg table.
     pub(crate) declared_physical_names: HashMap<String, String>,
-    /// Reconstructed `initial-default` values keyed by LOGICAL COLUMN NAME —
-    /// the one key every logical field carries, now that a field-id is optional,
-    /// and stable under projection as a column index would not be. Empty when no
-    /// field declares a default.
+    /// Keyed by logical name: the one key every field carries, and stable under projection.
     pub(crate) defaults: HashMap<String, ScalarValue>,
-    /// The nested member tree each nested column exposes, keyed by LOGICAL COLUMN
-    /// NAME and built by [`index_nested_members`]. It carries the same binding keys
-    /// at depth that a top-level field carries, so [`bind_columns`] resolves a
-    /// file's own nested layout onto the logical one. Empty for a table with no
-    /// list, struct, or map column.
+    /// Keyed by logical name.
     pub(crate) nested_members: HashMap<String, NestedMembers>,
 }
 
@@ -500,23 +382,16 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         logical_file_schema: arrow::datatypes::SchemaRef,
         physical_file_schema: arrow::datatypes::SchemaRef,
     ) -> datafusion::error::Result<Arc<dyn PhysicalExprAdapter>> {
-        // Delegate to the default adapter over a physical schema whose fields are
-        // renamed to the logical names that claimed them. The default then resolves
-        // each logical column to the correct physical INDEX (order is preserved by
-        // the rename) and applies cast / NULL-fill / required-missing-error against
-        // the logical field — the reused behavior.
+        // The rename preserves order, so the default resolves each logical column to the
+        // correct physical index.
         let binding = bind_columns(
             &logical_file_schema,
             &physical_file_schema,
             &self.resolution,
         );
 
-        // The absent-with-default fill map is PER FILE: a logical column that NO
-        // physical field of THIS file claimed and that carries a reconstructed
-        // default is keyed by its logical column index (what an incoming `Column`
-        // carries) so `rewrite` can substitute a `Literal(<default>)` BEFORE
-        // delegating. A claimed column is present and is NEVER defaulted, even if a
-        // default exists.
+        // Per file: only logical columns no physical field claimed get their default, keyed by
+        // the logical index an incoming `Column` carries.
         let absent_default_by_index: HashMap<usize, ScalarValue> = logical_file_schema
             .fields()
             .iter()
@@ -530,11 +405,8 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
             })
             .collect();
 
-        // Divert every nested column around the delegate's cast: the delegate is
-        // handed ONE identical field on both sides for such a column, so it emits a
-        // bare `Column` for it, which `rewrite` then replaces with the JSON-rendering
-        // expression. Every primitive column keeps the delegate's own
-        // physical-to-logical cast untouched.
+        // The delegate sees identical fields for a nested column, so it emits a bare `Column`
+        // that `rewrite` replaces with the JSON-rendering expression.
         let nested = binding.nested_columns();
         let delegate_physical = binding.delegate_physical_schema(&nested);
         let delegate_logical =
@@ -551,43 +423,21 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
     }
 }
 
-/// Wraps [`DefaultPhysicalExprAdapter`] so column binding reaches the projection
-/// READ path, not just filter/predicate expressions.
+/// The default adapter binds by name, so fed logical names it emits `Column`s with LOGICAL
+/// names. In DataFusion 54 the Parquet opener applies the adapter to the projection too, and
+/// `build_projection_read_plan`, `reassign_expr_columns`, and `make_projector` resolve by name
+/// against the REAL file schema, failing with `Unable to get field named "rating"`. So resolved
+/// columns are renamed back to the physical name at their already-correct index.
 ///
-/// The default adapter resolves columns by NAME. We feed it a physical schema
-/// renamed to the logical names that claimed its fields (so it binds by whichever
-/// key the logical field declares and reuses its cast / NULL-fill /
-/// required-missing logic), which makes it emit `Column`s carrying
-/// the LOGICAL name at the correct physical index. But every downstream consumer
-/// in the Parquet opener — `build_projection_read_plan`, `reassign_expr_columns`,
-/// and `make_projector` — resolves those `Column`s by NAME against the REAL
-/// physical file schema (`score`, not `rating`). Left as-is a renamed column
-/// projection fails with `Unable to get field named "rating"`.
-///
-/// So after delegating, we walk the rewritten expression and rename each
-/// resolved `Column` back to the real physical field NAME at its (already
-/// correct) index. Order is preserved by [`bind_columns`], so the column's index
-/// still points at the right physical slot; only the name must be restored so the
-/// opener's name-based lookups succeed. NULL-filled columns become `Literal`s (no
-/// `Column` to rename) and pass through untouched.
-///
-/// That same pass also DIVERTS a nested column: no cast can carry a `List`, `Struct`,
-/// or `Map` to the `Utf8` the logical schema declares, so the renamed `Column` is
-/// wrapped in a [`NestedJsonRenderExpr`] that renders the column instead — see
-/// [`delegate_logical_schema`] for why the delegate never attempts the cast itself.
+/// The same pass wraps nested columns in a [`NestedJsonRenderExpr`], since no cast carries a
+/// `List`/`Struct`/`Map` to `Utf8`.
 #[derive(Debug)]
 struct FieldIdExprAdapter {
     inner: Arc<dyn PhysicalExprAdapter>,
     physical_file_schema: arrow::datatypes::SchemaRef,
-    /// Absent-with-default fill map for THIS file, keyed by LOGICAL column index
-    /// (the index an incoming `Column` carries). Populated only for logical
-    /// field-ids absent from this physical file that carry a reconstructed
-    /// Iceberg `initial-default`; a present field-id is never an entry, so a
-    /// real-value binding is never overridden.
+    /// Keyed by LOGICAL column index; only absent fields with a reconstructed `initial-default`.
     absent_default_by_index: HashMap<usize, ScalarValue>,
-    /// The nested columns of THIS file, keyed by PHYSICAL column index — the index
-    /// every `Column` the delegate emits carries — each with the resolution that
-    /// restructures the file's array to the table's logical member names.
+    /// Keyed by PHYSICAL column index, the index every delegate-emitted `Column` carries.
     nested: HashMap<usize, NestedResolution>,
 }
 
@@ -601,12 +451,8 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
         };
         use datafusion::physical_expr::expressions::{Column, Literal};
 
-        // Intercept the absent-with-default case BEFORE delegating: the default
-        // adapter NULL-fills a nullable-absent field and ERRORS on a
-        // required-absent field, so an absent field's Iceberg `initial-default`
-        // (column-projection rule 3) must be substituted first. The incoming
-        // `Column` indices are into the logical file schema, which is how
-        // `absent_default_by_index` is keyed.
+        // Substitute an absent field's `initial-default` (column-projection rule 3) BEFORE
+        // delegating, since the default adapter NULL-fills or errors on absent fields.
         let intercepted = expr
             .transform_down(|node| {
                 if let Some(column) = node.downcast_ref::<Column>()
@@ -620,16 +466,9 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
             })
             .data()?;
 
-        // Delegate the remainder: a present field-id binds to its real physical
-        // values; an absent field with NO default NULL-fills (nullable) or errors
-        // cleanly (required) inside the default adapter, unchanged.
         let rewritten = self.inner.rewrite(intercepted)?;
 
-        // Rename each resolved logical `Column` name back to the real physical
-        // field NAME at its (already correct) index so the opener's name-based
-        // lookups succeed, and wrap a nested column in its JSON rendering — the one
-        // physical-to-logical adaptation no cast can express. Injected `Literal`s
-        // carry no `Column` and pass through.
+        // Injected `Literal`s carry no `Column` and pass through.
         rewritten
             .transform_down(|node| {
                 let Some((index, keeps_name)) = node.downcast_ref::<Column>().map(|column| {
@@ -646,8 +485,7 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
                     )),
                 };
                 match self.nested.get(&index) {
-                    // Stop the walk at the substituted node: descending into it would
-                    // meet the same column again and wrap it endlessly.
+                    // Jump: descending would meet the same column and wrap it endlessly.
                     Some(resolution) => Ok(Transformed::new(
                         Arc::new(NestedJsonRenderExpr::new(bound, resolution.clone()))
                             as Arc<dyn PhysicalExpr>,
@@ -665,24 +503,16 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
     }
 }
 
-/// The expression [`FieldIdExprAdapter`] substitutes for a nested physical column:
-/// the file's own array restructured to the table's logical member names, then
-/// rendered as one JSON document per value — which is how the column reaches the plan
-/// as the `Utf8` the logical schema declares for it.
-///
-/// It exists because no cast can do this: arrow-cast has no `Struct → Utf8` or
-/// `Map → Utf8` kernel, and its `List → Utf8` kernel renders Arrow display text rather
-/// than JSON. Its child stays a bare `Column` carrying the file's REAL physical name,
-/// so the Parquet opener's name-based projection read plan, column reassignment, and
-/// projector still resolve the column against the file schema and actually read it.
+/// Needed because arrow-cast has no `Struct`/`Map → Utf8` kernel and its `List → Utf8` yields
+/// display text. The child stays a bare `Column` with the REAL physical name so the opener's
+/// name-based lookups still read it.
 #[derive(Debug, Eq)]
 struct NestedJsonRenderExpr {
     input: Arc<dyn PhysicalExpr>,
     resolution: NestedResolution,
 }
 
-// Written out rather than derived because rust-lang/rust#78808 blocks deriving either
-// trait for a struct holding an `Arc<dyn Trait>`.
+// Not derived: rust-lang/rust#78808 blocks deriving for a struct holding `Arc<dyn Trait>`.
 impl PartialEq for NestedJsonRenderExpr {
     fn eq(&self, other: &Self) -> bool {
         self.input.eq(&other.input) && self.resolution.eq(&other.resolution)
@@ -756,43 +586,23 @@ impl PhysicalExpr for NestedJsonRenderExpr {
     }
 }
 
-/// One file's column binding: the physical schema renamed to the logical names
-/// that claimed its fields, the set of logical column names some physical field
-/// claimed, and the nested resolution of each claimed nested column.
-///
-/// The first two views come out of ONE pass because they are one decision seen
-/// twice: the delegate adapter resolves a logical column by NAME against
-/// `renamed_physical`, so a logical name present there is exactly a column this file
-/// supplies, and a logical name absent from it is exactly a column the per-file
-/// `initial-default` / NULL fill must cover. The third is that same claim recursed
-/// into a nested column's members.
+/// The renamed schema and bound names come from one pass: the delegate resolves by name against
+/// `renamed_physical`, so a name there is exactly a column this file supplies and an absent one
+/// is exactly what the default/NULL fill must cover.
 struct ColumnBinding {
     renamed_physical: arrow::datatypes::SchemaRef,
     bound_logical_names: std::collections::HashSet<String>,
-    /// Per-file nested resolution keyed by LOGICAL COLUMN NAME, one entry per bound
-    /// column whose logical field declares a nested member tree. Empty for a table
-    /// with no list, struct, or map column.
+    /// Keyed by LOGICAL COLUMN NAME.
     nested: HashMap<String, NestedResolution>,
 }
 
 impl ColumnBinding {
-    /// Every nested column of this file, keyed by its PHYSICAL index — the columns
-    /// [`FieldIdExprAdapter`] renders to JSON and the delegate must therefore never
-    /// cast — each carrying the resolution that restructures it to the table's
-    /// logical member names.
+    /// Keyed by PHYSICAL index; these are rendered to JSON and never cast by the delegate.
     ///
-    /// The logical field's DECLARED member tree is the necessary signal, the same one
-    /// [`crate::scan::raw_scan::renders_nested_json`] reads to withhold Parquet
-    /// row-filter pushdown. Keying on it here is what stops the two sites drifting:
-    /// no column can be rendered while a pushdown DataFusion approves against the
-    /// `Utf8` logical schema — and then drops against the physical nested schema,
-    /// returning every row — stays on for its table. A physically nested column
-    /// declaring no tree is therefore left to the delegate, which has no
-    /// struct-to-text kernel and fails loudly rather than silently losing a predicate.
-    ///
-    /// A tree the file's own type contradicts resolves VERBATIM to that type, and a
-    /// verbatim primitive is left to the delegate too: the JSON encoder would quote
-    /// it rather than render a document.
+    /// Keyed on the declared member tree, the same signal
+    /// [`crate::scan::raw_scan::renders_nested_json`] uses to withhold row-filter pushdown, so a
+    /// rendered column never keeps a pushdown that would drop its predicate. A verbatim primitive
+    /// is left to the delegate: the JSON encoder would quote it rather than render a document.
     fn nested_columns(&self) -> HashMap<usize, NestedResolution> {
         self.renamed_physical
             .fields()
@@ -806,14 +616,8 @@ impl ColumnBinding {
             .collect()
     }
 
-    /// The physical schema the delegate resolves logical columns against: the renamed
-    /// schema with each nested column carrying the type its resolution produces.
-    ///
-    /// The renamed schema is already the file AS THE LOGICAL SCHEMA SEES IT — it
-    /// carries the logical name of every column it supplies rather than the file's
-    /// own — and for a nested column that view reaches its members too, so the
-    /// delegate compares the logical field against the member names and order the
-    /// resolved array will carry rather than against the file's.
+    /// Nested columns carry their resolved type, so the delegate compares against the member
+    /// names and order the resolved array will carry.
     fn delegate_physical_schema(
         &self,
         nested: &HashMap<usize, NestedResolution>,
@@ -843,21 +647,10 @@ impl ColumnBinding {
     }
 }
 
-/// The logical schema the delegate adapts TO, with each nested column's field taken
-/// WHOLE from `delegate_physical` — name, type, nullability, and metadata together.
-///
-/// That whole-field substitution is what stops the delegate casting the column:
-/// `DefaultPhysicalExprAdapter` emits a bare `Column` only when the logical and
-/// physical fields are FULLY equal and answers any difference — a diverging data type,
-/// a diverging nullability, or diverging metadata alone — with a cast. Substituting
-/// only the resolved data type would leave a file whose nested column carries no
-/// `PARQUET:field_id` differing in metadata, and arrow-cast has no `Struct → Utf8` or
-/// `Map → Utf8` kernel at all while its `List → Utf8` kernel renders Arrow display
-/// text rather than JSON.
-///
-/// A nested column ABSENT from this file has no entry, so its logical field stays the
-/// `Utf8` the schema declares and the delegate's own NULL fill covers it exactly as it
-/// covers an absent primitive.
+/// `DefaultPhysicalExprAdapter` emits a bare `Column` only when logical and physical fields are
+/// FULLY equal, and casts on any difference, even metadata alone. Substituting the whole field
+/// keeps it from attempting a cast arrow-cast cannot do. A nested column absent from this file
+/// keeps its `Utf8` field and is NULL-filled like an absent primitive.
 fn delegate_logical_schema(
     logical: &arrow::datatypes::SchemaRef,
     delegate_physical: &arrow::datatypes::Schema,
@@ -887,31 +680,13 @@ fn delegate_logical_schema(
     ))
 }
 
-/// Bind one file's physical fields to the logical schema, renaming each physical
-/// field to the logical name that claims it and preserving field order, type,
-/// nullability, and metadata.
+/// Preserves field order, type, nullability, and metadata; an unclaimed field keeps its name
+/// and is never referenced, which is how a dropped column falls away. Claimed nested fields are
+/// also resolved by [`resolve_nested_field`].
 ///
-/// [`claim_logical`] decides which logical field claims a physical one — by embedded
-/// field-id, by declared physical name, by `schema.name-mapping.default`, or by
-/// identity, first match wins. An unclaimed physical field keeps its own name and is
-/// simply never referenced: that is how a dropped column falls away.
-///
-/// A claimed field whose logical field declares a nested member tree is ALSO resolved
-/// member-by-member by [`resolve_nested_field`], so the file's own member names,
-/// order, and omissions are reconciled with the table's by the same binding order,
-/// one level down.
-///
-/// A logical field counts as BOUND when the renamed schema supplies its name, which
-/// is precisely the question the delegate will ask, so the fill seam and the delegate
-/// can never disagree about whether a column is present in this file.
-///
-/// Assumes post-rename logical names are unique among the referenced physical
-/// fields, and that no two logical fields declare the same physical name (the
-/// Delta protocol guarantees the latter). Name collisions from
-/// drop+rename-into-a-reused-name are a distinct, still-open concern, NOT resolved
-/// by (or in scope for) name-mapping support: `schema.name-mapping.default` maps
-/// CURRENT-state physical names to field-ids, so it cannot disambiguate a dropped
-/// column whose old physical name was later reused by an unrelated field.
+/// Assumes post-rename logical names are unique among referenced fields and no two logical
+/// fields declare one physical name (guaranteed by Delta). A dropped column whose physical name
+/// was later reused is not disambiguated: name mapping keys CURRENT names.
 fn bind_columns(
     logical: &arrow::datatypes::Schema,
     physical: &arrow::datatypes::Schema,
@@ -994,16 +769,8 @@ fn bind_columns(
     }
 }
 
-/// Build the logical Arrow schema from the spec's query-time logical schema.
-///
-/// Each field carries the schema's declared nullability (Iceberg `optional`) and
-/// an Arrow data type reconstructed from the compact tag via
-/// [`arrow_type_from_tag`]. A field that declares a field-id is ALSO tagged with
-/// it (`PARQUET:field_id`) so [`bind_columns`] can match a physical field's
-/// embedded id against it. A field that binds by a declared physical name or by
-/// identity is tagged with NO field-id: a synthesized id is a value no writer ever
-/// put in any file, and tagging one here would invite a false match against a file
-/// that does carry ids.
+/// Only field-id-bound fields are tagged `PARQUET:field_id`: a synthesized id would invite a
+/// false match against a file that does carry ids.
 pub(super) fn build_logical_arrow_schema(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> arrow::datatypes::SchemaRef {
@@ -1032,24 +799,9 @@ pub(super) fn build_logical_arrow_schema(
     Arc::new(arrow::datatypes::Schema::new(fields))
 }
 
-/// Reconstruct a DataFusion [`ScalarValue`] from a [`LogicalField`]'s Arrow-type
-/// tag and its encoded `initial_default` text — the scan-side inverse of the VS
-/// layer's `encode_initial_default`.
-///
-/// The tag fixes the target `ScalarValue` variant (and its timezone /
-/// precision / scale) via [`arrow_type_from_tag`], so the reconstructed value's
-/// implied Arrow type matches the logical schema field built by
-/// [`build_logical_arrow_schema`] exactly. The encoded text is the RAW primitive
-/// scalar (a decimal integer for a temporal's days / micros / nanos, an `i128`
-/// mantissa for a decimal), parsed directly here with no second temporal /
-/// decimal parse — mirroring the `PrimitiveType`-keyed dispatch in
-/// `iceberg_predicate::literal_to_datum` and `convert::arrow_value_at`.
-///
-/// A parse failure returns a clean `Err(String)` — never a panic — naming the
-/// tag and the (inherently credential-free) encoded scalar, so a malformed spec
-/// surfaces diagnostically rather than aborting the VM.
-///
-/// [`LogicalField`]: crate::scan::spec::LogicalField
+/// The scan-side inverse of the VS layer's `encode_initial_default`. The tag fixes the variant
+/// via [`arrow_type_from_tag`], matching [`build_logical_arrow_schema`]; the encoded text is the
+/// raw primitive (days/micros/nanos, or an `i128` decimal mantissa). Errors, never panics.
 pub(crate) fn reconstruct_initial_default(
     arrow_type_tag: &str,
     encoded: &str,
@@ -1063,8 +815,7 @@ pub(crate) fn reconstruct_initial_default(
         })
     }
 
-    // Reconstruct against the SAME DataType the logical schema field is built
-    // from, so the reconstructed value's timezone / precision / scale line up.
+    // Same DataType as the logical schema field, so timezone/precision/scale line up.
     let value = match arrow_type_from_tag(arrow_type_tag) {
         DataType::Boolean => ScalarValue::Boolean(Some(parse_scalar(encoded, arrow_type_tag)?)),
         DataType::Int32 => ScalarValue::Int32(Some(parse_scalar(encoded, arrow_type_tag)?)),
@@ -1093,14 +844,7 @@ pub(crate) fn reconstruct_initial_default(
     Ok(value)
 }
 
-/// Reconstruct every field's encoded Iceberg `initial-default` into a
-/// `logical column name → ScalarValue` map, built ONCE from the logical schema and
-/// handed to the [`FieldIdExprAdapterFactory`] so the per-file fill seam can look a
-/// default up for a column no physical field claimed. Keyed by logical name
-/// because that is the one key every logical field carries — a field-id belongs to
-/// one binding strategy only, and a column index is not stable under projection.
-/// Fields with no `initial_default` contribute no entry; a reconstruction failure
-/// aborts with a clean `Err` (never a panic).
+/// Keyed by logical name, stable under projection. A reconstruction failure is a clean `Err`.
 pub(super) fn reconstruct_initial_defaults(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> Result<HashMap<String, ScalarValue>, String> {
@@ -1115,14 +859,7 @@ pub(super) fn reconstruct_initial_defaults(
         .collect()
 }
 
-/// Index the logical schema's DECLARED physical names as
-/// `physical name → logical column name`, built ONCE per registration and handed
-/// to the [`FieldIdExprAdapterFactory`] so [`bind_columns`] can let a logical field
-/// claim the physical column it names (step 2 — Delta `name` column mapping).
-///
-/// A field that binds by field-id or by identity declares no physical name and
-/// contributes no entry, so the index is empty for every Iceberg table and step 2
-/// is then a no-op.
+/// `physical name → logical column name`; empty for every Iceberg table.
 pub(super) fn index_declared_physical_names(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> HashMap<String, String> {
@@ -1136,14 +873,7 @@ pub(super) fn index_declared_physical_names(
         .collect()
 }
 
-/// Index the logical schema's nested member trees as
-/// `logical column name → members`, built ONCE per registration and handed to the
-/// [`FieldIdExprAdapterFactory`] so [`bind_columns`] can resolve each file's own
-/// nested layout onto the logical one.
-///
-/// A primitive column declares no tree and contributes no entry, so the index is
-/// empty for a table with no list, struct, or map column and the nested resolution is
-/// then reached for no column at all.
+/// `logical column name → members`; empty for a table with no nested column.
 pub(super) fn index_nested_members(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> HashMap<String, NestedMembers> {

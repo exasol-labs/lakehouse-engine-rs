@@ -1,37 +1,19 @@
-//! External-vantage proof that the engine's re-exported catalog types are the
-//! catalog crate's own types, not merely structurally-similar look-alikes, plus
-//! an independent golden-string pin on `StorageProps`' wire encoding.
-//!
-//! `StorageProps`, `CatalogProps`, and `ConnectionCreds` are declared in
-//! `lakehouse-catalog` and re-exported at their pre-move engine path
-//! (`scan::spec::{StorageProps, CatalogProps}`,
-//! `adapter::connection::ConnectionCreds`) so no consumer `use` path had to
-//! change. A `pub use` re-export does not create a new type — it adds another
-//! import path to the same one — but Rust's nominal (non-structural) type
-//! system makes that easy to verify: a function that names
-//! `lakehouse_catalog::StorageProps` in its signature accepts a value built via
-//! `lakehouse_engine::scan::spec::StorageProps` only if the two paths name the
-//! identical type. No `From`/`Into` conversion or `TypeId` machinery is
-//! involved anywhere below; the proof is that this file compiles at all.
+//! The engine's re-exported catalog types are the catalog crate's own types: nominal typing
+//! means this file compiles only if both paths name the identical type.
 
 use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::scan::spec::{AdlsCred, CatalogProps, StorageProps};
 
-/// Accepts only the catalog crate's own `StorageProps` — never a re-export.
 fn accepts_catalog_crate_storage_props(_props: lakehouse_catalog::StorageProps) {}
 
-/// Accepts only the catalog crate's own `CatalogProps` — never a re-export.
 fn accepts_catalog_crate_catalog_props(_props: lakehouse_catalog::CatalogProps) {}
 
-/// Accepts only the catalog crate's own `ConnectionCreds` — never a re-export.
 fn accepts_catalog_crate_connection_creds(_creds: lakehouse_catalog::ConnectionCreds) {}
 
-/// Accepts only the catalog crate's own `AdlsCred` — never a re-export.
 fn accepts_catalog_crate_adls_cred(_cred: lakehouse_catalog::AdlsCred) {}
 
 #[test]
 fn reexported_paths_resolve_to_the_catalog_crate_types() {
-    // Built via the engine's re-exported `scan::spec` path.
     let storage = StorageProps {
         endpoint: "http://minio:9000".into(),
         region: "us-east-1".into(),
@@ -42,14 +24,12 @@ fn reexported_paths_resolve_to_the_catalog_crate_types() {
     };
     accepts_catalog_crate_storage_props(storage);
 
-    // Built via the engine's re-exported `scan::spec` path.
     let catalog = CatalogProps {
         warehouse: "warehouse".into(),
         table: "ns.table".into(),
     };
     accepts_catalog_crate_catalog_props(catalog);
 
-    // Built via the engine's re-exported `adapter::connection` path.
     let creds = ConnectionCreds {
         warehouse: "warehouse".into(),
         endpoint: "http://minio:9000".into(),
@@ -71,19 +51,11 @@ fn reexported_paths_resolve_to_the_catalog_crate_types() {
     };
     accepts_catalog_crate_connection_creds(creds);
 
-    // Built via the engine's re-exported `scan::spec` path.
     let adls_cred = AdlsCred::AccountKey("k".into());
     accepts_catalog_crate_adls_cred(adls_cred);
 }
 
-/// Independent, integration-level pin on `StorageProps`' serde encoding,
-/// asserting the exact same field values and byte-for-byte JSON that the
-/// crate-internal unit test `common_blob_wire_is_byte_stable`
-/// (`crates/lakehouse-engine/src/scan/spec.rs`) pins as the embedded `storage`
-/// segment of its `CommonScanSpec` golden string. That unit test proves the
-/// wire format is stable inside `CommonScanSpec`; this test proves the same
-/// thing for `StorageProps` alone, from outside the crate, so the guarantee
-/// survives even if the unit test were ever deleted.
+/// Scenario: `StorageProps` serializes byte-for-byte to the golden wire encoding
 #[test]
 fn storage_props_wire_encoding_unchanged() {
     let storage = StorageProps {
@@ -100,11 +72,7 @@ fn storage_props_wire_encoding_unchanged() {
     assert_eq!(serde_json::to_string(&storage).unwrap(), golden);
 }
 
-/// Companion pin to [`storage_props_wire_encoding_unchanged`]: `StorageBackend`
-/// wraps [`StorageProps`] in an externally-tagged, lowercase-keyed `s3` variant,
-/// so the exact same field values now round-trip under `{"s3": {...}}` rather
-/// than the bare object above. This is the one deliberate byte-level wire
-/// change the storage-backend-enum refactor makes.
+/// Scenario: `StorageBackend::S3` round-trips under an externally-tagged `{"s3": {...}}` key
 #[test]
 fn storage_backend_wire_encoding_tags_the_s3_payload() {
     use lakehouse_engine::scan::spec::StorageBackend;

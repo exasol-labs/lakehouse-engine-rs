@@ -1,23 +1,7 @@
-//! End-to-end capability-alignment tests for the lakehouse-engine Virtual Schema.
-//!
-//! Exercises the full advertised → translated → executed path for each newly
-//! advertised capability group: math/string/date scalar functions in filters,
-//! REGEXP_LIKE, scalar select-list expressions, HAVING, STDDEV/VARIANCE, and
-//! CAST / unary-minus (NEG) / WEEK (#104, #105, #107).
-//!
-//! Shares the same Exasol + MinIO + Iceberg stack and seed table as
-//! `e2e_scan_test.rs`.  The setup (SLC install, BucketFS upload, VS creation)
-//! is intentionally NOT duplicated — this file calls into the same `setup_e2e`
-//! logic by re-running it idempotently via its own `OnceLock`.  All helpers
-//! are shared from `common/`.
-//!
-//! Seed recap (20 rows, id = 1..20):
-//!   score      = 5.0 * id          (5.0, 10.0, …, 100.0)
-//!   name       = "event-NN"
-//!   event_date = 2024-01-01 + (id-1) days   (all January 2024, day = id)
-//!   event_ts   = 2024-01-01T00:00:00Z + (id-1) hours
-//!
-//! All tests FAIL (never skip) when the stack is unavailable.
+//! E2E capability-alignment tests: each advertised capability group runs the full
+//! advertised → translated → executed path. Seed: id 1..=20, score = 5.0 * id,
+//! name = "event-NN", event_date = 2024-01-01 + (id-1) days. Fail, never skip,
+//! without the stack.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -36,23 +20,12 @@ use common::timestamp_precision::expected_timestamp_precision;
 
 use std::sync::OnceLock;
 
-// ---------------------------------------------------------------------------
-// Constants (mirror e2e_scan_test.rs — same stack, same VS)
-// ---------------------------------------------------------------------------
-
 const VS_NAME: &str = "MY_LAKEHOUSE";
 
-/// Relative tolerance for the FLOAT_DIV native-oracle comparisons. Basis:
-/// decision-log [7] measured the fix's worst-case divergence from native
-/// Exasol at ~1 ULP (max relative difference `3.17e-16`), so `1e-15` holds
-/// with ~3x headroom.
+/// The fix's measured worst-case divergence from native Exasol is ~1 ULP (3.17e-16).
 const FLOAT_DIV_ORACLE_REL_TOLERANCE: f64 = 1e-15;
 
-// ---------------------------------------------------------------------------
-// One-time setup (idempotent; identical to e2e_scan_test.rs)
-// ponytail: duplicate of e2e_scan_test setup — both test binaries link the
-// same binary but run independently, so we need local OnceLock guards.
-// ---------------------------------------------------------------------------
+// Each test binary runs independently, so this file needs its own OnceLock setup.
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -70,11 +43,7 @@ fn setup_e2e() {
             seed_events(&iceberg_catalog_url(), "s3://warehouse/")
                 .await
                 .expect("seed Iceberg events table");
-            // Additive: `typed_distinct_probe` seeds into the SAME namespace
-            // (E2E_NAMESPACE) as `events`, so it becomes queryable through this
-            // file's single `MY_LAKEHOUSE` virtual schema below without a second
-            // VS. Used only by the #211 decimal-string-trimming regression
-            // tests further down this file.
+            // Same namespace as `events`, so it is queryable through the one `MY_LAKEHOUSE` VS.
             seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
                 .await
                 .expect("seed typed_distinct_probe table")
@@ -109,29 +78,14 @@ fn vs_char_pad_table() -> String {
     format!("{VS_NAME}.{}", E2E_CHAR_PAD_TABLE.to_uppercase())
 }
 
-// ---------------------------------------------------------------------------
-// 5.1  Inner equi-join capability advertisement (live round-trip)
-// ---------------------------------------------------------------------------
-
-/// A live `getCapabilities` round-trip against the running VS advertises the
-/// inner equi-join capabilities `JOIN`, `JOIN_TYPE_INNER`, and
-/// `JOIN_CONDITION_EQUI`.
-///
-/// `EXPLAIN VIRTUAL` of a query over a virtual schema drives Exasol's planner
-/// through `getCapabilities`, and its output echoes the adapter's capability
-/// response verbatim (a compact JSON `"capabilities":[...]` array). Asserting the
-/// three join tokens are present in that live response — rather than only against
-/// the in-process `CAPABILITIES` constant (the unit test) — proves the deployed
-/// `.so` advertises them end to end. The comma-adjacent `"JOIN","JOIN_TYPE_INNER"`
-/// substring isolates the bare `JOIN` capability token from the `INNER JOIN` SQL
-/// keyword and the `JOIN_*` compound tokens.
+/// Scenario: a live getCapabilities round-trip advertises JOIN, JOIN_TYPE_INNER and JOIN_CONDITION_EQUI
 #[test]
 fn e2e_advertises_inner_equi_join_capability() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // A join query guarantees the join capabilities are exercised in planning;
-    // the capability list itself is echoed regardless of the query shape.
+    // EXPLAIN VIRTUAL echoes the adapter's capability response; the comma-adjacent
+    // `"JOIN","JOIN_TYPE_INNER"` substring isolates the bare `JOIN` token.
     let query = format!(
         "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
          JOIN {} c ON o.O_CUSTKEY = c.C_CUSTKEY",
@@ -155,31 +109,12 @@ fn e2e_advertises_inner_equi_join_capability() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 5.2  COUNT(DISTINCT) aggregate-pushdown capability advertisement (live round-trip)
-// ---------------------------------------------------------------------------
-
-/// A live `getCapabilities` round-trip against the running VS advertises
-/// `FN_AGG_COUNT_DISTINCT` — single-group `COUNT(DISTINCT col)` pushdown
-/// (issue #56, revisited by fix-count-distinct-shard-cap).
-///
-/// Mirrors `e2e_advertises_inner_equi_join_capability`: `EXPLAIN VIRTUAL` of a
-/// query over the virtual schema drives Exasol's planner through
-/// `getCapabilities`, and its output echoes the adapter's capability response
-/// verbatim. Asserting `FN_AGG_COUNT_DISTINCT` is present in that live
-/// response — rather than only against the in-process `CAPABILITIES` constant
-/// (`capabilities_advertise_count_distinct` in
-/// `src/adapter/capabilities.rs`) — proves the deployed `.so` advertises it
-/// end to end. `AGGREGATE_SINGLE_GROUP` must also be present since
-/// single-group `COUNT(DISTINCT)` pushdown depends on it.
+/// Scenario: a live getCapabilities round-trip advertises FN_AGG_COUNT_DISTINCT and AGGREGATE_SINGLE_GROUP (#56)
 #[test]
 fn advertises_count_distinct_capability() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // A COUNT(DISTINCT) query guarantees the capability is exercised in
-    // planning; the capability list itself is echoed regardless of the query
-    // shape.
     let query = format!("SELECT COUNT(DISTINCT name) FROM {}", vs_table());
     let advertised = explain_virtual_sql(&mut conn, &query);
 
@@ -198,16 +133,7 @@ fn advertises_count_distinct_capability() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.2  Math functions in WHERE filter
-// ---------------------------------------------------------------------------
-
-/// Math scalar functions in a WHERE filter push down and return correct rows.
-///
-/// Filter: `ABS(score - 50.0) < 20.0` — strict less-than, so scores where
-/// |score - 50| < 20, i.e. 30 < score < 70.
-/// Scores are 5*id (5,10,…,100). 30 < 5*id < 70 → 6 < id < 14 → ids 7..13 → 7 rows.
-/// id=6 has score=30.0 → ABS(30.0-50.0)=20.0, NOT < 20.0 → excluded.
+/// Scenario: ABS(score - 50.0) < 20.0 in a WHERE filter pushes down and returns ids 7..=13
 #[test]
 fn e2e_math_functions_in_filter() {
     setup_e2e();
@@ -220,7 +146,6 @@ fn e2e_math_functions_in_filter() {
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
 
-    // ids 7..13 inclusive → 7 rows (id=6 has score=30.0, boundary is excluded by strict <).
     let expected_count = 7i64;
     assert_eq!(
         cols[0].len() as i64,
@@ -229,7 +154,6 @@ fn e2e_math_functions_in_filter() {
         cols[0].len()
     );
 
-    // Every returned score must satisfy |score - 50.0| < 20.0.
     for v in &cols[1] {
         let s = parse_numeric(v);
         assert!(
@@ -239,7 +163,6 @@ fn e2e_math_functions_in_filter() {
         );
     }
 
-    // IDs must be 7..13 in order.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     for (pos, &id) in ids.iter().enumerate() {
         let expected = 7 + pos as i64;
@@ -250,14 +173,7 @@ fn e2e_math_functions_in_filter() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.3  String functions in WHERE filter
-// ---------------------------------------------------------------------------
-
-/// String scalar functions in a WHERE filter push down and return correct rows.
-///
-/// Filter: `LOWER(name) LIKE 'event-1%'` — names event-10..19 → 10 rows (id 10..19).
-/// LOWER is a no-op here (names already lowercase); the key test is translation.
+/// Scenario: LOWER(name) LIKE 'event-1%' in a WHERE filter pushes down and returns ids 10..=19
 #[test]
 fn e2e_string_functions_in_filter() {
     setup_e2e();
@@ -270,7 +186,6 @@ fn e2e_string_functions_in_filter() {
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, name): {cols:?}");
 
-    // Names event-10..event-19 → 10 rows.
     let expected_count = 10i64;
     assert_eq!(
         cols[0].len() as i64,
@@ -279,7 +194,6 @@ fn e2e_string_functions_in_filter() {
         cols[0].len()
     );
 
-    // All returned names must start with 'event-1'.
     for v in &cols[1] {
         let n = v
             .as_str()
@@ -290,7 +204,6 @@ fn e2e_string_functions_in_filter() {
         );
     }
 
-    // IDs must be 10..19 in order.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     for (pos, &id) in ids.iter().enumerate() {
         let expected = 10 + pos as i64;
@@ -301,14 +214,7 @@ fn e2e_string_functions_in_filter() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.4  Date functions (EXTRACT / DATE_TRUNC) in WHERE filter
-// ---------------------------------------------------------------------------
-
-/// Date scalar functions in a WHERE filter push down and return correct rows.
-///
-/// Seed dates: 2024-01-01 + (id-1) days, so day-of-month = id (id 1..20, all Jan).
-/// Filter: `EXTRACT(DAY FROM event_date) > 10` → id 11..20 → 10 rows.
+/// Scenario: EXTRACT(DAY FROM event_date) > 10 in a WHERE filter pushes down and returns ids 11..=20
 #[test]
 fn e2e_date_functions_in_filter() {
     setup_e2e();
@@ -325,7 +231,6 @@ fn e2e_date_functions_in_filter() {
         "expected 2 columns (id, event_date): {cols:?}"
     );
 
-    // id 11..20 → 10 rows.
     let expected_count = 10i64;
     assert_eq!(
         cols[0].len() as i64,
@@ -334,7 +239,6 @@ fn e2e_date_functions_in_filter() {
         cols[0].len()
     );
 
-    // IDs must be 11..20 in order.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     for (pos, &id) in ids.iter().enumerate() {
         let expected = 11 + pos as i64;
@@ -345,14 +249,7 @@ fn e2e_date_functions_in_filter() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.5  REGEXP_LIKE in WHERE filter
-// ---------------------------------------------------------------------------
-
-/// REGEXP_LIKE in a WHERE filter pushes down and returns correct rows.
-///
-/// Pattern `event-0[0-9]` matches names event-01..event-09 → 9 rows (id 1..9).
-/// event-10..20 have two digits after the dash and do NOT match `0[0-9]`.
+/// Scenario: REGEXP_LIKE(name, 'event-0[0-9]') in a WHERE filter pushes down and returns ids 1..=9
 #[test]
 fn e2e_regexp_like_in_filter() {
     setup_e2e();
@@ -365,7 +262,6 @@ fn e2e_regexp_like_in_filter() {
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, name): {cols:?}");
 
-    // event-01..event-09 → 9 rows.
     let expected_count = 9i64;
     assert_eq!(
         cols[0].len() as i64,
@@ -374,7 +270,6 @@ fn e2e_regexp_like_in_filter() {
         cols[0].len()
     );
 
-    // IDs must be 1..9 in order.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     for (pos, &id) in ids.iter().enumerate() {
         let expected = 1 + pos as i64;
@@ -384,7 +279,6 @@ fn e2e_regexp_like_in_filter() {
         );
     }
 
-    // All names must match the pattern.
     for v in &cols[1] {
         let n = v
             .as_str()
@@ -396,17 +290,7 @@ fn e2e_regexp_like_in_filter() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.6  Scalar expressions in the SELECT list
-// ---------------------------------------------------------------------------
-
-/// Scalar expressions in the SELECT list push down and return correct evaluated values.
-///
-/// Query: `SELECT id, score * 2.0, UPPER(name) FROM ... WHERE id <= 3 ORDER BY id`
-/// Expected:
-///   id=1: score*2=10.0, UPPER(name)="EVENT-01"
-///   id=2: score*2=20.0, UPPER(name)="EVENT-02"
-///   id=3: score*2=30.0, UPPER(name)="EVENT-03"
+/// Scenario: scalar expressions in the SELECT list push down and return correct values
 #[test]
 fn e2e_selectlist_expression_pushdown() {
     setup_e2e();
@@ -424,7 +308,6 @@ fn e2e_selectlist_expression_pushdown() {
     );
     assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1..3): {cols:?}");
 
-    // Verify score * 2.0 for each id.
     let expected_scores = [10.0f64, 20.0, 30.0];
     for (i, expected) in expected_scores.iter().enumerate() {
         let s = parse_numeric(&cols[1][i]);
@@ -434,7 +317,6 @@ fn e2e_selectlist_expression_pushdown() {
         );
     }
 
-    // Verify UPPER(name) for each id.
     let expected_names = ["EVENT-01", "EVENT-02", "EVENT-03"];
     for (i, expected) in expected_names.iter().enumerate() {
         let n = cols[2][i]
@@ -448,13 +330,8 @@ fn e2e_selectlist_expression_pushdown() {
     }
 }
 
-/// True if `"projection"` is followed somewhere later by an `"expr"` key —
-/// the signal that the pushed scan spec's projection carries a positional
-/// `Expr` item, not the full-base-row fallback (bare `Column` string
-/// entries, no `"expr"` key at all). Shared by every test in this file that
-/// needs this check — `explain_virtual_sql` flattens EXPLAIN's result cells
-/// by joining them with a single space, so JSON tokens can end up split
-/// across a cell boundary; an exact adjacent-substring match would be flaky.
+/// Not an adjacent-substring match: `explain_virtual_sql` joins result cells with a space,
+/// so JSON tokens can be split across a cell boundary.
 fn has_expr_after_projection(pushed_sql: &str) -> bool {
     pushed_sql
         .find(r#""projection""#)
@@ -462,20 +339,12 @@ fn has_expr_after_projection(pushed_sql: &str) -> bool {
         .is_some()
 }
 
-/// Regression for issue #196: `IN`, `BETWEEN`, `IS NULL`, `IS NOT NULL`, and
-/// `<>` select-list items must push down as a positional expression, not
-/// widen the derived projection to the full base row. Each predicate runs
-/// independently, over `EVENTS` (`vs_table()`) for the id-based predicates
-/// and `typed_distinct_probe` (`vs_typed_table()`) for the NULL-column
-/// predicates, and asserts BOTH the returned boolean values (computed from
-/// the real seeded rows) AND — via `has_expr_after_projection` — that the
-/// scan spec carries a positional `Expr` projection for the predicate item.
+/// Scenario: IN, BETWEEN, IS NULL, IS NOT NULL and <> select-list items push down as positional expressions (#196)
 #[test]
 fn e2e_selectlist_predicate_projection_pushdown() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // IN (...): `id IN (1,2,3)` over ids 1..5.
     {
         let sql = format!(
             "SELECT id, id IN (1,2,3) FROM {} WHERE id <= 5 ORDER BY id",
@@ -505,7 +374,6 @@ fn e2e_selectlist_predicate_projection_pushdown() {
         );
     }
 
-    // BETWEEN ... AND ...: `id BETWEEN 2 AND 4` over ids 1..5.
     {
         let sql = format!(
             "SELECT id, id BETWEEN 2 AND 4 FROM {} WHERE id <= 5 ORDER BY id",
@@ -535,10 +403,7 @@ fn e2e_selectlist_predicate_projection_pushdown() {
         );
     }
 
-    // IS NULL: `c_decimal_a IS NULL` over typed_distinct_probe ids 1..4
-    // (id=3 is the only NULL c_decimal_a among these — see
-    // `common/seed.rs`'s `typed_probe()`, reproduced below as
-    // `TYPED_DECIMAL_A_UNSCALED`).
+    // id=3 is the only NULL `c_decimal_a` among ids 1..=4.
     {
         let sql = format!(
             "SELECT id, c_decimal_a IS NULL FROM {} WHERE id <= 4 ORDER BY id",
@@ -573,7 +438,6 @@ fn e2e_selectlist_predicate_projection_pushdown() {
         );
     }
 
-    // IS NOT NULL: same column, negated.
     {
         let sql = format!(
             "SELECT id, c_decimal_a IS NOT NULL FROM {} WHERE id <= 4 ORDER BY id",
@@ -608,7 +472,6 @@ fn e2e_selectlist_predicate_projection_pushdown() {
         );
     }
 
-    // <> (not-equal): `id <> 3` over ids 1..5.
     {
         let sql = format!(
             "SELECT id, id <> 3 FROM {} WHERE id <= 5 ORDER BY id",
@@ -639,12 +502,7 @@ fn e2e_selectlist_predicate_projection_pushdown() {
     }
 }
 
-/// One row of `typed_distinct_probe` (`id`, `c_decimal_b` unscaled scale-4,
-/// `c_double`, `c_varchar`, `c_bool`, `c_price`, `c_qty`). `c_decimal_a` is
-/// deliberately absent: it's already tracked for all 12 rows by
-/// `TYPED_DECIMAL_A_UNSCALED` (section 8.14, below), so `assert_typed_probe_prefix`
-/// looks it up from there instead of re-encoding it here. `c_qty` is never
-/// NULL; every other field mirrors its column's nullability.
+/// `c_decimal_a` is absent: `TYPED_DECIMAL_A_UNSCALED` already tracks it.
 struct TypedProbeRow {
     id: i64,
     decimal_b: Option<i128>,
@@ -655,9 +513,6 @@ struct TypedProbeRow {
     qty: i64,
 }
 
-/// Rows 1..=3 of `typed_distinct_probe`, copied from `common/seed.rs`'s
-/// `typed_probe()` (see its module doc for the full 12-row fixture). Row 3
-/// (index 2) is NULL in every optional column; `c_qty` is never NULL.
 const TYPED_ROWS_1_TO_3: [TypedProbeRow; 3] = [
     TypedProbeRow {
         id: 1,
@@ -688,14 +543,7 @@ const TYPED_ROWS_1_TO_3: [TypedProbeRow; 3] = [
     },
 ];
 
-/// Assert columns 0..=8 (`id`, `c_decimal_a`, `c_decimal_b`, `c_double`,
-/// `c_varchar`, `c_date`, `c_ts`, `c_bool`, `c_price`) of row `i` against
-/// `TYPED_ROWS_1_TO_3` (plus `TYPED_DECIMAL_A_UNSCALED` for `c_decimal_a`,
-/// looked up by `id`). `c_date`/`c_ts` are checked only for NULL-ness (their
-/// exact rendering is covered elsewhere, sections 8.14/8.16); every other
-/// nullable column is checked against its real seeded value. Shared by the
-/// two coincidental-arity widening tests below, which both project these
-/// same nine columns and vary only the tenth (widening) item.
+/// `c_date`/`c_ts` are checked only for NULL-ness; their rendering is covered elsewhere.
 fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
     let row = &TYPED_ROWS_1_TO_3[i];
     assert_eq!(parse_int(&cols[0][i]), row.id, "row {i}: id mismatch");
@@ -754,14 +602,8 @@ fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
             cols[4][i]
         ),
     }
-    // Coupling note: `c_date`/`c_ts` are checked only for NULL-ness here, using
-    // `decimal_a` as the oracle rather than their own real values — this is
-    // correct only because row 3 (id=3) is NULL in every optional column of
-    // `typed_probe()`'s seed data (see `common/seed.rs`), so `decimal_a`'s
-    // null flag happens to double as the oracle for every other nullable
-    // column too, including these two. A future seed-data edit that breaks
-    // this coupling (a row NULL in `c_decimal_a` but not in `c_date`/`c_ts`,
-    // or vice versa) would silently invalidate these two assertions.
+    // Valid only because row 3 is NULL in every optional column of the seed, so
+    // `decimal_a`'s null flag doubles as the oracle for `c_date`/`c_ts`.
     assert_eq!(
         cols[5][i].is_null(),
         decimal_a.is_none(),
@@ -798,23 +640,7 @@ fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
     }
 }
 
-/// Arity-coincidence repro for issue #196/#234: a 10-item select list over
-/// `typed_distinct_probe` (10 columns) whose LAST item is `(c_qty BETWEEN 1
-/// AND 3)`. Pre-hardening, the dispatcher's arity-based safety net could not
-/// distinguish a widened 10-column projection from a genuine 10-item
-/// non-widened select list, and Exasol rejected the mismatched EMITS type at
-/// position 10 with `sqlCode 04000` ("Data type mismatch in column number
-/// 10 ... Expected BOOLEAN, but got DECIMAL(20,0)"). Task 1 of this plan
-/// whitelisted `predicate_between` as a pushable select-list item kind (see
-/// `selectlist_between_projects_as_expr` in
-/// `crates/lakehouse-engine/src/adapter/pushdown/support.rs`), so this item
-/// now projects as a positional `Expr` on the ORDINARY scan path — the
-/// projection is never widened, and the query never reaches
-/// `qualified_single_table_fallback_pushdown`. That non-widening is exactly
-/// what makes the 10-item/10-column arity coincidence harmless here: with no
-/// widening, there is nothing for a coincidence to mask. This asserts both
-/// the 10 correct columns AND (via `has_expr_after_projection`) the
-/// positional-`Expr` projection shape that proves no widening occurred.
+/// Scenario: a 10-item select list ending in a BETWEEN over a 10-column table projects positionally without widening (#196, #234)
 #[test]
 fn e2e_selectlist_between_at_matching_arity_projects_as_expr() {
     setup_e2e();
@@ -852,24 +678,12 @@ fn e2e_selectlist_between_at_matching_arity_projects_as_expr() {
     );
 }
 
-/// A DIFFERENT widening trigger at the same coincidental arity, proving the
-/// hardened routing (#196/#234) is not predicate-specific: `LENGTH(c_double)`
-/// widens because issue #210's string-function argument-type guard declines
-/// a DOUBLE argument to `LENGTH` (a string function), not because of the
-/// predicate whitelist task 1 of this plan extended. Also covers the (#234)
-/// shape as a variant: the same widening (`LENGTH(score)`, DOUBLE argument)
-/// plus a trailing `ORDER BY id`, over a table (`EVENTS`, 5 columns) whose
-/// column count DIFFERS from the select-list arity (10) — the pre-existing
-/// arity-mismatch routing task 2.4 of this plan confirmed already includes
-/// `ORDER BY` columns.
+/// Scenario: a LENGTH(DOUBLE) widening at the coincidental arity, and over a table of different arity with ORDER BY, returns correct rows (#196, #234)
 #[test]
 fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Base shape: matching arity (10 items, 10 real columns). `ORDER BY id`
-    // is only for this test's own deterministic row order, not the (#234)
-    // trigger — that variant follows below.
     {
         let sql = format!(
             "SELECT id, c_decimal_a, c_decimal_b, c_double, c_varchar, c_date, \
@@ -884,10 +698,8 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
         for (i, row) in TYPED_ROWS_1_TO_3.iter().enumerate() {
             assert_typed_probe_prefix(&cols, i);
 
-            // LENGTH(c_double)'s implicit DOUBLE-to-VARCHAR rendering is
-            // Exasol-implementation-defined, so — matching section 8.16's
-            // convention — the expected value comes from Exasol's own
-            // in-session native oracle, not a hand-computed string length.
+            // LENGTH over DOUBLE depends on Exasol's implementation-defined DOUBLE-to-VARCHAR
+            // rendering, so the expectation comes from a native oracle.
             let oracle_sql = match row.double {
                 Some(d) => format!("SELECT LENGTH(CAST({d} AS DOUBLE))"),
                 None => "SELECT LENGTH(CAST(NULL AS DOUBLE))".to_string(),
@@ -918,10 +730,7 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
         );
     }
 
-    // (#234) variant: same widening (`LENGTH(score)`, DOUBLE argument
-    // declined by #210's guard) plus a trailing `ORDER BY id`, over `EVENTS`
-    // (5 real columns) — a select-list arity (10) that DIFFERS from the
-    // table's column count, the shape #234 originally reported.
+    // #234 variant: a select-list arity (10) that differs from `EVENTS`'s column count (5).
     {
         let sql = format!(
             "SELECT id, score, name, event_date, event_ts, id, score, name, \
@@ -956,20 +765,13 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
     }
 }
 
-/// Regression for issue #190: a projected constant/literal select-list item
-/// must push down without collapsing to the full base-table row. Runs three
-/// literal-projection shapes over the full 20-row EVENTS table (no WHERE)
-/// and asserts both the emitted column arity and the constant value in every
-/// literal position — including BOTH positions of a duplicated literal,
-/// which pre-fix collapsed to arity 2 (value-based dedup) or failed with a
-/// column-count error (full-row fallback).
+/// Scenario: projected literal select-list items, including a duplicated literal, keep their arity and values (#190)
 #[test]
 fn e2e_selectlist_literal_projection_pushdown() {
     setup_e2e();
     let mut conn = exa_conn();
     let table = vs_table();
 
-    // `SELECT 1 FROM <t>`: single literal column, all 20 rows, every value 1.
     {
         let sql = format!("SELECT 1 FROM {table}");
         let cols = conn.query_columns(&sql);
@@ -984,7 +786,6 @@ fn e2e_selectlist_literal_projection_pushdown() {
         }
     }
 
-    // `SELECT 1, name FROM <t>`: literal + real column, arity 2.
     {
         let sql = format!("SELECT 1, name FROM {table}");
         let cols = conn.query_columns(&sql);
@@ -1013,10 +814,7 @@ fn e2e_selectlist_literal_projection_pushdown() {
         }
     }
 
-    // `SELECT 1, name, 1 FROM <t>`: duplicated literal — the arity-3 regression
-    // case for issue #190. Both literal positions (0 and 2) must independently
-    // carry the constant 1; a pre-fix value-based dedup would have collapsed
-    // this to arity 2, and the full-row fallback would have errored on arity.
+    // Both literal positions must carry 1; a value-based dedup would collapse to arity 2.
     {
         let sql = format!("SELECT 1, name, 1 FROM {table}");
         let cols = conn.query_columns(&sql);
@@ -1042,21 +840,13 @@ fn e2e_selectlist_literal_projection_pushdown() {
     }
 }
 
-/// Regression for issue #205: `COUNT(*)` over a `LIMIT`-bearing derived table
-/// must not fail with a pushdown column-count mismatch. Exasol represents its
-/// "select any one column" contract for the inner derived-table request as a
-/// single-element `literal_null` select list once a LIMIT barrier separates
-/// the outer aggregate from the derived table — the same literal-select-list
-/// code path #190 fixed (`is_literal_selectlist_item` in
-/// `crates/lakehouse-engine/src/adapter/pushdown/support.rs`), so this guards
-/// that fix against a regression on the LIMIT-barrier trigger surface.
+/// Scenario: COUNT(*) over a LIMIT-bearing derived table does not fail with a column-count mismatch (#205)
 #[test]
 fn e2e_count_star_over_limited_subselect_pushdown() {
     setup_e2e();
     let mut conn = exa_conn();
     let table = vs_table();
 
-    // Primary shape: single projected column behind the LIMIT barrier.
     let primary_sql = format!("SELECT COUNT(*) FROM (SELECT id FROM {table} LIMIT 5)");
     assert_eq!(
         conn.query_scalar_i64(&primary_sql),
@@ -1064,7 +854,6 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
         "COUNT(*) over a single-column LIMITed derived table must be 5: {primary_sql}"
     );
 
-    // Two-column subselect variant.
     let two_col_sql = format!("SELECT COUNT(*) FROM (SELECT id, name FROM {table} LIMIT 5)");
     assert_eq!(
         conn.query_scalar_i64(&two_col_sql),
@@ -1072,7 +861,6 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
         "COUNT(*) over a two-column LIMITed derived table must be 5: {two_col_sql}"
     );
 
-    // WHERE + LIMIT variant.
     let where_limit_sql =
         format!("SELECT COUNT(*) FROM (SELECT id FROM {table} WHERE id <= 10 LIMIT 5)");
     assert_eq!(
@@ -1081,12 +869,7 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
         "COUNT(*) over a WHERE+LIMITed derived table must be 5: {where_limit_sql}"
     );
 
-    // Guard the pushdown shape itself, not only the numeric result: the inner
-    // derived-table scan for the primary shape must push a positional literal
-    // projection, not the full-base-row fallback (which would emit every
-    // base column and yield the #205 column-count mismatch). See
-    // `has_expr_after_projection`'s doc comment for why this is a substring
-    // check rather than an exact match.
+    // The inner scan must push a positional literal projection, not the full base row.
     let pushed_sql = explain_virtual_sql(&mut conn, &primary_sql);
     assert!(
         has_expr_after_projection(&pushed_sql),
@@ -1096,23 +879,15 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
     );
 }
 
-/// Regression for issue #190: a query whose predicate prunes every Iceberg
-/// data file (`id > 1000` against a max seeded id of 20) must still accept a
-/// select list of repeated literals plus a real column. This exercises the
-/// `empty_pushdown_sql` path with positional-unique synthetic EMITS aliases
-/// for the two `1` literals — proving Exasol accepts the zero-row shape
-/// rather than rejecting it on a duplicate-alias or arity error.
+/// Scenario: an all-files-pruned predicate still accepts repeated literals plus a real column (#190)
 #[test]
 fn e2e_all_files_pruned_literal_projection_empty_shape() {
     setup_e2e();
     let mut conn = exa_conn();
 
     let sql = format!("SELECT 1, name, 1 FROM {} WHERE id > 1000", vs_table());
-    // `execute` panics if Exasol rejects the pushdown (a duplicate EMITS alias
-    // or a column-count mismatch), so reaching the assertions already proves
-    // Exasol accepted the empty-pushdown shape. Assert on the resultSet
-    // METADATA, not `query_columns`: that helper returns an empty vec for any
-    // zero-row result, so it cannot observe the column count of zero rows.
+    // `execute` panics if Exasol rejects the shape. `query_columns` cannot observe the
+    // column count of a zero-row result, so the metadata is asserted instead.
     let resp = conn.execute(&sql);
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let num_columns = result_set["numColumns"]
@@ -1131,24 +906,17 @@ fn e2e_all_files_pruned_literal_projection_empty_shape() {
     );
 }
 
-/// Execute `sql` and parse its first column, first row as `f64` —
-/// `SECONDS_BETWEEN` returns a fractional-seconds `DECIMAL`, not an integer.
 fn scalar_seconds(conn: &mut ExaConn, sql: &str) -> f64 {
     let cols = conn.query_columns(sql);
     parse_numeric(&cols[0][0])
 }
 
-/// Sets the session's time zone explicitly, so the value assertions below
-/// (#218/#238) have a deterministic, non-UTC zone to check against.
 fn pin_session_time_zone(conn: &mut ExaConn) {
     conn.execute("ALTER SESSION SET TIME_ZONE = 'EUROPE/BERLIN'");
 }
 
-/// The pinned session's UTC offset in seconds. A fixed local wall-clock
-/// anchor, interpreted in `SESSIONTIMEZONE` and converted to UTC: the
-/// difference is exactly the session's UTC offset at that instant, without
-/// conflating `SESSIONTIMEZONE` (the caller's zone) with `DBTIMEZONE` (the
-/// database's own zone, a separate setting `SYSTIMESTAMP` uses instead).
+/// Converts a fixed local wall-clock anchor to UTC, so `SESSIONTIMEZONE` is not
+/// conflated with `DBTIMEZONE`.
 fn session_utc_offset_seconds(conn: &mut ExaConn) -> f64 {
     scalar_seconds(
         conn,
@@ -1157,14 +925,7 @@ fn session_utc_offset_seconds(conn: &mut ExaConn) -> f64 {
     )
 }
 
-/// Issue #238 (and the identically-caused #239, filter side — not exercised
-/// here): `CURRENT_TIMESTAMP`/`SYSTIMESTAMP` no longer reach the adapter at
-/// all — the `fix-vs-expression-dialect` plan withdrew their capabilities
-/// entirely (`specs/_decision/037-fix-vs-expression-dialect.md`), so Exasol
-/// evaluates its own clock instead of delegating. This is a regression guard
-/// for that already-shipped fix, not new adapter behavior: it pins that a
-/// projected `CURRENT_TIMESTAMP`/`SYSTIMESTAMP` succeeds and matches Exasol's
-/// own native value, rather than the pre-#238 UTC-shifted wrong answer.
+/// Scenario: a projected CURRENT_TIMESTAMP/SYSTIMESTAMP matches Exasol's native session-local value (#238)
 #[test]
 fn e2e_now_family_projection_matches_native_session_local_value() {
     setup_e2e();
@@ -1179,12 +940,8 @@ fn e2e_now_family_projection_matches_native_session_local_value() {
     );
 
     for expr in ["CURRENT_TIMESTAMP", "SYSTIMESTAMP"] {
-        // Native and projected are measured within a SINGLE statement — the
-        // outer `{expr}` against the subquery's pushed-down `{expr}` — rather
-        // than two separate round-trips, so no wall-clock time can elapse
-        // between the two measurements. A two-statement version's deviation
-        // would be `offset - elapsed_between_queries`, which can still land
-        // under the offset threshold and let a UTC-shift regression pass.
+        // Measured within one statement, so no wall-clock time elapses between the two values
+        // that could mask a UTC-shift regression.
         let deviation = scalar_seconds(
             &mut conn,
             &format!("SELECT SECONDS_BETWEEN({expr}, (SELECT {expr} FROM {table} WHERE id = 1))"),
@@ -1201,13 +958,7 @@ fn e2e_now_family_projection_matches_native_session_local_value() {
     }
 }
 
-/// Issue #218: a projected `TIMESTAMP WITH LOCAL TIME ZONE` constant — a
-/// `literal_timestamputc` node once Exasol constant-folds the CAST — must
-/// push down and return the EXACT session-local value Exasol computes
-/// natively, not fail with SQL state `04000` (the pre-fix full-base-row
-/// column-count mismatch) and not the pre-fix UTC wall clock. Also covers the
-/// zero-file (all-pruned) path, which must route identically rather than hit
-/// the same `04000` before the dispatcher ever runs.
+/// Scenario: a projected TIMESTAMP WITH LOCAL TIME ZONE constant returns the exact session-local value, also with all files pruned (#218)
 #[test]
 fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
     setup_e2e();
@@ -1217,9 +968,6 @@ fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
 
     let projection = "CAST(TIMESTAMP '2024-03-01 10:00:00' AS TIMESTAMP WITH LOCAL TIME ZONE)";
 
-    // Resolved-file path: exact value match against the same expression
-    // evaluated natively (not hardcoded), so the assertion stays valid if the
-    // fixture's pinned zone ever changes.
     let native = conn
         .query_columns(&format!("SELECT {projection}"))
         .into_iter()
@@ -1241,8 +989,8 @@ fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
          same expression in the same session"
     );
 
-    // The pushed wrapper renders the item in the Exasol dialect over a qualified
-    // (`AS "LHS_T0"`) scan, not a narrowed positional `_LH_PROJ_0` EMITS column.
+    // Rendered in the Exasol dialect over a qualified `LHS_T0` scan, not a positional
+    // `_LH_PROJ_0` EMITS column.
     let pushed = explain_virtual_sql(&mut conn, &projected_sql);
     assert!(
         pushed.contains(r#"AS "LHS_T0""#),
@@ -1253,10 +1001,7 @@ fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
         "must not be a narrowed positional EMITS projection: {pushed}"
     );
 
-    // Zero-file path: the same query under an all-pruning predicate must
-    // succeed with zero rows, never SQL state 04000 — the defect class this
-    // guards is a COLUMN-COUNT mismatch, so assert numColumns too, not only
-    // numRows (mirrors `e2e_all_files_pruned_literal_projection_empty_shape`).
+    // The defect class is a column-count mismatch, so numColumns is asserted too.
     let resp = conn.execute(&format!("SELECT {projection} FROM {table} WHERE id > 1000"));
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let num_columns = result_set["numColumns"]
@@ -1276,25 +1021,7 @@ fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.7  HAVING clause pushdown
-// ---------------------------------------------------------------------------
-
-/// HAVING applied to the outer merged result, not per-shard, keeps groups that only
-/// pass the threshold after merging.
-///
-/// Seed: 20 rows across 2 data files (file 1: ids 1..=10, file 2: ids 11..=20).
-/// Grouping: `MOD(id, 4)` → four groups (0,1,2,3), 5 rows each total.
-///
-/// Per-file counts (shards = files):
-///   File 1 (ids 1-10):  group 0={4,8}→2, group 1={1,5,9}→3, group 2={2,6,10}→3, group 3={3,7}→2
-///   File 2 (ids 11-20): group 0={12,16,20}→3, group 1={13,17}→2, group 2={14,18}→2, group 3={11,15,19}→3
-///
-/// Max per-shard count per group = 3. Threshold: `HAVING COUNT(*) > 3`.
-/// A buggy per-shard HAVING would drop all 4 groups (3 is not > 3).
-/// Correct outer-wrapper HAVING keeps all 4 groups (merged count = 5 > 3).
-///
-/// Asserting 4 groups back is the discriminating check: 0 groups = buggy, 4 groups = correct.
+/// Scenario: HAVING COUNT(*) > 3 applies to the merged result, keeping groups whose per-shard counts are at most 3
 #[test]
 fn e2e_having_clause_pushdown() {
     setup_e2e();
@@ -1307,8 +1034,7 @@ fn e2e_having_clause_pushdown() {
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (key, count): {cols:?}");
 
-    // Merged count per group = 5 > 3 → all 4 groups survive.
-    // Per-shard count per group ≤ 3 (not > 3) → a buggy per-shard HAVING would return 0 groups.
+    // Per-shard counts are at most 3, so a per-shard HAVING would return 0 groups.
     assert_eq!(
         cols[0].len(),
         4,
@@ -1324,7 +1050,6 @@ fn e2e_having_clause_pushdown() {
         );
     }
 
-    // Total rows = 20.
     let total: i64 = cols[1].iter().map(parse_int).sum();
     assert_eq!(
         total, 20,
@@ -1332,25 +1057,7 @@ fn e2e_having_clause_pushdown() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.8  Statistical aggregates (STDDEV / VARIANCE)
-// ---------------------------------------------------------------------------
-
-/// Statistical aggregates push down and merge to the single-node result within float tolerance.
-///
-/// Scores = 5*id for id=1..20: arithmetic sequence 5,10,…,100 (n=20, mean=52.5).
-///
-/// Population statistics:
-///   VAR_POP  = Σ(x - mean)² / n = 831.25
-///   STDDEV_POP = √831.25 ≈ 28.8316...
-///
-/// Sample statistics (Exasol default STDDEV/VARIANCE use divisor n-1):
-///   VARIANCE = n/(n-1) * VAR_POP = 20/19 * 831.25 = 875.0
-///   STDDEV   = √875.0 ≈ 29.5804...
-///
-/// The engine reconstructs STDDEV/VARIANCE from (count, sum, sum_sq) sufficient
-/// statistics accumulated across shards; the result must match within 1e-6 relative
-/// tolerance.
+/// Scenario: STDDEV/VARIANCE and their POP variants merge to the single-node result within tolerance
 #[test]
 fn e2e_stddev_variance_pushdown() {
     setup_e2e();
@@ -1368,16 +1075,11 @@ fn e2e_stddev_variance_pushdown() {
         "each aggregate must return 1 row: {cols:?}"
     );
 
-    // Expected values (exact arithmetic for this seed).
-    // sum_sq = 25 * Σk² for k=1..20 = 25 * (20*21*41/6) = 25 * 2870 = 71750
-    // var_pop  = 71750/20 - 52.5² = 3587.5 - 2756.25 = 831.25
-    // var_samp = 20/19 * 831.25 = 875.0
     let expected_var_pop: f64 = 831.25;
     let expected_var_samp: f64 = 875.0;
     let expected_stddev_pop: f64 = expected_var_pop.sqrt();
     let expected_stddev_samp: f64 = expected_var_samp.sqrt();
 
-    // Relative tolerance for floating-point reconstruction from sufficient statistics.
     let tol = 1e-6f64;
 
     let stddev_samp = parse_numeric(&cols[0][0]);
@@ -1409,25 +1111,7 @@ fn e2e_stddev_variance_pushdown() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.8b Statistical aggregate over an expression argument (declines, #179)
-// ---------------------------------------------------------------------------
-
-/// `STDDEV(score + id)` — a statistical aggregate over an expression rather than a
-/// bare column — returns the correct sample standard deviation.
-///
-/// The statistical family decomposes into (cnt, sum, sum_sq) sufficient statistics
-/// only over a bare source column, so the adapter declines the partial/merge
-/// decomposition for this shape and Exasol computes the statistic natively over the
-/// rows the scan returns. Before the decline the adapter accepted the shape and the
-/// query FAILED: measured 2026-07-31 against this same stack, `sqlCode 22002`,
-/// `partial aggregate SQL error: Schema error: No field named .`
-///
-/// The reference value is recomputed from the rows read back through a plain
-/// projection query, so the expectation never passes through the aggregate path
-/// under test. For this seed (id = 1..20, score = 5.0 * id) `score + id` is `6 * id`
-/// and the sample standard deviation is `6 * sqrt(35)`, asserted as a closed-form
-/// cross-check on the reference itself.
+/// Scenario: STDDEV(score + id) declines decomposition and Exasol computes the correct sample standard deviation (#179)
 #[test]
 fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
     setup_e2e();
@@ -1435,8 +1119,7 @@ fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
 
     let sql = format!("SELECT STDDEV(score + id) FROM {}", vs_table());
 
-    // A statistical partial column in the generated SQL is exactly the
-    // accepted-then-failing shape this decline removes.
+    // A statistical partial column here is the accepted-then-failing shape the decline removes.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         !pushed_sql.contains("PARTIAL_stat_"),
@@ -1449,7 +1132,6 @@ fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
     assert_eq!(cols[0].len(), 1, "expected exactly 1 row: {cols:?}");
     let actual = parse_numeric(&cols[0][0]);
 
-    // Native reference over the SAME rows, read back as plain projected values.
     let row_cols = conn.query_columns(&format!("SELECT score, id FROM {}", vs_table()));
     let values: Vec<f64> = row_cols[0]
         .iter()
@@ -1479,15 +1161,8 @@ fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.8c Grouped statistical aggregate over an expression argument (declines, #179)
-// ---------------------------------------------------------------------------
-
-/// Sample standard deviation (divisor `n - 1`, matching Exasol's `STDDEV`
-/// default) of the values collected for one group.
-///
-/// Panics below two values rather than returning the NaN a relative-error
-/// comparison could not attribute to a missing row versus a wrong statistic.
+/// Panics below two values rather than returning a NaN that cannot distinguish a
+/// missing row from a wrong statistic.
 fn sample_stddev(values: &[f64]) -> f64 {
     assert!(
         values.len() > 1,
@@ -1498,33 +1173,7 @@ fn sample_stddev(values: &[f64]) -> f64 {
     (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
 }
 
-/// Grouped `STDDEV(score + id)` over `GROUP BY MOD(id, 4)` returns each group's
-/// correct sample standard deviation.
-///
-/// The ungrouped sibling above covers `detect_aggregates`. Task 1.2 measured the
-/// same expression-argument shape as pushed-and-broken on the grouped
-/// `detect_group_by_aggregates` path too: `EXPLAIN VIRTUAL` returned status `ok`
-/// with a grouped partial-aggregate wrapper rendered, and execution failed with
-/// `sqlCode 22002`, `grouped partial aggregate SQL error: Schema error: No field
-/// named .` (measured 2026-07-31 against this same stack). The unit tests in
-/// `grouped_agg.rs` prove detection now declines; only a live grouped query
-/// proves Exasol then computes the right per-group statistic over the Tier 1b
-/// qualified wrapper the decline routes to.
-///
-/// The reference is recomputed in Rust from rows read back through a plain
-/// projection, never through a second aggregate query — an aggregate oracle
-/// would travel the same path under test and could agree with a wrong result.
-///
-/// For this seed (id = 1..20, score = 5.0 * id) `score + id` is `6 * id`, and
-/// each `MOD(id, 4)` group holds five ids spaced 4 apart — an arithmetic
-/// progression of common difference 24, whose sample standard deviation is
-/// `sqrt(2.5) * 24 = 12 * sqrt(10)` ≈ 37.947332 in every group. That closed form
-/// cross-checks the reference computation itself, and it sits well clear of the
-/// whole-table `6 * sqrt(35)` ≈ 35.496479, so a single global statistic repeated
-/// per group fails. Because all four groups share one standard deviation, group
-/// identity is guarded separately: the returned key set must equal the projected
-/// rows' distinct keys and the row count must equal the group count, so a
-/// dropped, duplicated, or mislabelled group cannot pass on the value alone.
+/// Scenario: grouped STDDEV(score + id) declines decomposition and returns each group's correct sample standard deviation (#179)
 #[test]
 fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
     const GROUP_MODULUS: i64 = 4;
@@ -1538,8 +1187,7 @@ fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
         vs_table()
     );
 
-    // A statistical partial column in the generated SQL is exactly the
-    // accepted-then-failing grouped shape this decline removes.
+    // A statistical partial column here is the accepted-then-failing shape the decline removes.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         !pushed_sql.contains("PARTIAL_stat_"),
@@ -1547,8 +1195,6 @@ fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
          partial/merge decomposition, got:\n{pushed_sql}"
     );
 
-    // Reference over the SAME rows, read back as plain projected values and
-    // grouped here rather than by any aggregate query.
     let row_cols = conn.query_columns(&format!("SELECT id, score FROM {}", vs_table()));
     let mut group_values: std::collections::BTreeMap<i64, Vec<f64>> =
         std::collections::BTreeMap::new();
@@ -1610,21 +1256,8 @@ fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.9  Filter-pushdown alignment helper (CAST / NEG / WEEK)
-// ---------------------------------------------------------------------------
-
-/// Asserts the pushed scan spec carries a non-empty `filter` field — proof
-/// the WHERE predicate was translated and pushed into the DataFusion scan
-/// (`CommonScanSpec::filter`), rather than falling back to Exasol evaluating
-/// the whole WHERE clause itself over an unfiltered raw-row scan (which would
-/// omit the `filter` field entirely: it is `#[serde(skip_serializing_if =
-/// "Option::is_none")]`).
-///
-/// Each caller below uses a query whose WHERE clause is a single CAST / NEG /
-/// WEEK expression, so field presence alone attributes the pushdown to that
-/// expression: if its translation had declined, the whole top-level filter
-/// would be dropped (there is nothing else in the clause to push instead).
+/// `filter` is omitted when `None`. Callers use a WHERE clause with a single expression,
+/// so field presence alone attributes the pushdown to that expression.
 fn assert_filter_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     let pushed_sql = explain_virtual_sql(conn, query_sql);
     assert!(
@@ -1635,20 +1268,7 @@ fn assert_filter_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.10  CAST in a WHERE filter (#104)
-// ---------------------------------------------------------------------------
-
-/// `CAST(id AS VARCHAR(2000000))` in a WHERE filter pushes down and returns
-/// the correct row.
-///
-/// `id` is DECIMAL(20,0) in Exasol; `CAST(id AS VARCHAR(2000000)) = '15'`
-/// matches only id=15 (score = 5.0*15 = 75.0). Exasol's CAST grammar requires
-/// an explicit length for VARCHAR (this project's own data-type convention:
-/// VARCHAR(n≤2,000,000)); the DataFusion-facing translation in
-/// `render_cast_target` ignores the length and always renders the bare
-/// DataFusion `VARCHAR` type, so this is purely an Exasol-facing SQL detail,
-/// not a translator concern.
+/// Scenario: CAST(id AS VARCHAR(2000000)) = '15' in a WHERE filter pushes down and returns id 15 (#104)
 #[test]
 fn e2e_cast_in_filter() {
     setup_e2e();
@@ -1681,14 +1301,7 @@ fn e2e_cast_in_filter() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.11  Unary minus (NEG) in a WHERE filter (#105)
-// ---------------------------------------------------------------------------
-
-/// Unary minus in a WHERE filter pushes down and returns the correct rows.
-///
-/// `-score < -50.0` is equivalent to `score > 50.0`. Scores are 5.0*id for
-/// id=1..20 (5,10,…,100), so score > 50.0 -> id > 10 -> ids 11..20 -> 10 rows.
+/// Scenario: -score < -50.0 in a WHERE filter pushes down and returns ids 11..=20 (#105)
 #[test]
 fn e2e_unary_minus_in_filter() {
     setup_e2e();
@@ -1703,7 +1316,6 @@ fn e2e_unary_minus_in_filter() {
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, score): {cols:?}");
 
-    // ids 11..20 inclusive -> 10 rows.
     let expected_count = 10i64;
     assert_eq!(
         cols[0].len() as i64,
@@ -1712,7 +1324,6 @@ fn e2e_unary_minus_in_filter() {
         cols[0].len()
     );
 
-    // IDs must be 11..20 in order.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     for (pos, &id) in ids.iter().enumerate() {
         let expected = 11 + pos as i64;
@@ -1722,26 +1333,13 @@ fn e2e_unary_minus_in_filter() {
         );
     }
 
-    // Every returned score must satisfy score > 50.0.
     for v in &cols[1] {
         let s = parse_numeric(v);
         assert!(s > 50.0, "filter violated: score {s} must be > 50.0");
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.12  WEEK in a WHERE filter (#107)
-// ---------------------------------------------------------------------------
-
-/// `WEEK(event_date)` in a WHERE filter pushes down and returns the correct
-/// ISO-8601 week's rows.
-///
-/// Seed dates: `event_date` = 2024-01-01 + (id-1) days, so day-of-month = id
-/// for every row (id 1..20, all January 2024). 2024-01-01 is a Monday, so
-/// ISO-8601 week 1 = Jan 1..7 (id 1..7), week 2 = Jan 8..14 (id 8..14), week 3
-/// = Jan 15..21 (id 15..20, truncated at the seed's last row). Verified with
-/// `date -d 2024-01-08 +%V` = 02 and `date -d 2024-01-14 +%V` = 02 (both
-/// Monday-start ISO week 2). `WEEK(event_date) = 2` -> id 8..14 -> 7 rows.
+/// Scenario: WEEK(event_date) = 2 in a WHERE filter pushes down and returns ISO week 2, ids 8..=14 (#107)
 #[test]
 fn e2e_week_in_filter() {
     setup_e2e();
@@ -1760,7 +1358,6 @@ fn e2e_week_in_filter() {
         "expected 2 columns (id, event_date): {cols:?}"
     );
 
-    // id 8..14 -> 7 rows.
     let expected_count = 7i64;
     assert_eq!(
         cols[0].len() as i64,
@@ -1769,7 +1366,6 @@ fn e2e_week_in_filter() {
         cols[0].len()
     );
 
-    // IDs must be 8..14 in order.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     for (pos, &id) in ids.iter().enumerate() {
         let expected = 8 + pos as i64;
@@ -1780,20 +1376,9 @@ fn e2e_week_in_filter() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.12b  Date-difference pushdown parity (#107, task 3.1)
-// ---------------------------------------------------------------------------
-//
-// Only the four *_BETWEEN functions are advertised. ADD_HOURS/ADD_MINUTES were
-// WITHDRAWN during this task: the microsecond round-trip renders a fixed
-// TIMESTAMP(3), but Exasol infers TIMESTAMP(0) for a DATE argument, so Exasol
-// rejects the pushdown of ADD_HOURS(<date>, n) ("Data type mismatch ... Expected
-// TIMESTAMP(0), but got TIMESTAMP(3)"). A type-blind string translator cannot
-// vary the result precision by argument type — see the plan's disposition table.
+// Only the four *_BETWEEN functions are advertised: ADD_HOURS/ADD_MINUTES over a DATE
+// would render TIMESTAMP(3) where Exasol infers TIMESTAMP(0), so Exasol rejects them.
 
-/// Run `EXPLAIN VIRTUAL <query_sql>` and assert the pushed SQL contains
-/// `fragment`, proving the projection expression pushed down (rather than
-/// falling back to a raw column scan).
 fn assert_select_pushed_down(conn: &mut ExaConn, query_sql: &str, fragment: &str) {
     let pushed = explain_virtual_sql(conn, query_sql);
     assert!(
@@ -1802,14 +1387,7 @@ fn assert_select_pushed_down(conn: &mut ExaConn, query_sql: &str, fragment: &str
     );
 }
 
-/// `DAYS_BETWEEN` pushes down as an `Int64` whole-day date difference and
-/// preserves Exasol's sign convention: first argument earlier than the second
-/// yields a NEGATIVE result (task 3.1 case e).
-///
-/// Seed: `event_date` = 2024-01-01 + (id-1) days. id=1 → 2024-01-01, so
-/// `DAYS_BETWEEN(event_date, DATE '2024-01-10')` = 2024-01-01 − 2024-01-10 = −9.
-/// Verified against native Exasol: `DAYS_BETWEEN(DATE '2024-01-01', DATE
-/// '2024-01-10')` = −9.
+/// Scenario: DAYS_BETWEEN pushes down with Exasol's sign convention, earlier first argument yields -9
 #[test]
 fn e2e_days_between_matches_exasol() {
     setup_e2e();
@@ -1817,10 +1395,8 @@ fn e2e_days_between_matches_exasol() {
     let t = vs_table();
 
     let sql = format!("SELECT DAYS_BETWEEN(event_date, DATE '2024-01-10') FROM {t} WHERE id = 1");
-    // "AS DATE" alone can also match Exasol's echoed pushdownRequest (e.g. a DATE
-    // literal/cast in the original query), so anchor on "- CAST(" instead — that
-    // sequence only appears in the adapter's own `(CAST(.. AS DATE) - CAST(.. AS
-    // DATE))` rendering, never in the echoed request.
+    // "AS DATE" can also match Exasol's echoed request; "- CAST(" only appears in the
+    // adapter's own rendering.
     assert_select_pushed_down(&mut conn, &sql, "- CAST(");
 
     let cols = conn.query_columns(&sql);
@@ -1831,14 +1407,7 @@ fn e2e_days_between_matches_exasol() {
     );
 }
 
-/// `HOURS_BETWEEN`, `MINUTES_BETWEEN`, and `SECONDS_BETWEEN` push down as
-/// fractional epoch-second differences and match Exasol's fractional values
-/// (task 3.1 case d — fractional 2.5-hour gap).
-///
-/// Seed: `event_ts` = 2024-01-01T00:00:00 + (id-1) hours. id=6 → 05:00:00.
-/// Against the fixed anchor 02:30:00 the gap is exactly 2.5 hours =
-/// 150 minutes = 9000 seconds. Native Exasol confirms `HOURS_BETWEEN` over a
-/// 2.5-hour gap = 2.5.
+/// Scenario: HOURS/MINUTES/SECONDS_BETWEEN push down and match Exasol's fractional values over a 2.5-hour gap
 #[test]
 fn e2e_time_between_matches_exasol() {
     setup_e2e();
@@ -1848,12 +1417,8 @@ fn e2e_time_between_matches_exasol() {
     let anchor = "TIMESTAMP '2024-01-01 02:30:00'";
 
     let hours_sql = format!("SELECT HOURS_BETWEEN(event_ts, {anchor}) FROM {t} WHERE id = 6");
-    // The projected expression now lands in the scan spec's JSON `projection`
-    // field, which is embedded as the single-quoted `LAKEHOUSE_SCAN('…')`
-    // argument, so its single quotes are doubled by SQL-string escaping
-    // (`date_part('epoch'` → `date_part(''epoch''`). Before the positional
-    // EMITS-naming change (#190) the expression also appeared verbatim as the
-    // EMITS identifier; it no longer does — the EMITS name is now `_LH_PROJ_0`.
+    // The expression is embedded in the single-quoted `LAKEHOUSE_SCAN('…')` argument, so
+    // its quotes are doubled.
     assert_select_pushed_down(&mut conn, &hours_sql, "date_part(''epoch''");
     let hours = parse_numeric(&conn.query_columns(&hours_sql)[0][0]);
     assert!(
@@ -1878,32 +1443,7 @@ fn e2e_time_between_matches_exasol() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.13  CAST / EXTRACT / CASE together in the SELECT list (#136)
-// ---------------------------------------------------------------------------
-
-/// `CAST`, `EXTRACT`, and `CASE` in the SELECT list all push down together
-/// and return correct evaluated values, with no "Expected number of columns"
-/// error.
-///
-/// Regression test for #136: a CAST in a virtual-schema SELECT list broke
-/// pushdown with a column-count mismatch. The root cause was that
-/// `project_columns` (`crates/lakehouse-engine/src/adapter/pushdown/support.rs`)
-/// did not dispatch `function_scalar_cast` — nor, by the same gap,
-/// `function_scalar_extract` and `function_scalar_case` — into
-/// `render_expression_safe`, so a SELECT-list item using CAST/EXTRACT/CASE
-/// fell back to projecting the full base row instead of the single evaluated
-/// expression column, producing a column-count mismatch against the
-/// advertised select list (`query_columns` panics on any adapter error, so
-/// this test failing to run at all would itself reproduce #136). All three
-/// functions are selected together to prove the fix covers all three
-/// dispatch gaps, not only CAST.
-///
-/// Seed: id 1..20, event_date = 2024-01-01 + (id-1) days (all January 2024).
-/// For id <= 3:
-///   CAST(id AS VARCHAR(2000000)) = "1", "2", "3"
-///   EXTRACT(YEAR FROM event_date) = 2024 for every row
-///   CASE WHEN id > 10 THEN 'high' ELSE 'low' END = 'low' for every row (id <= 3)
+/// Scenario: CAST, EXTRACT and CASE together in the SELECT list push down with correct values (#136)
 #[test]
 fn e2e_selectlist_cast_extract_case_pushdown() {
     setup_e2e();
@@ -1922,7 +1462,6 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
     );
     assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1..3): {cols:?}");
 
-    // Verify CAST(id AS VARCHAR(2000000)) for each id.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     for (i, &id) in ids.iter().enumerate() {
         let cast_str = cols[1][i].as_str().unwrap_or_else(|| {
@@ -1938,7 +1477,6 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
         );
     }
 
-    // Verify EXTRACT(YEAR FROM event_date) is 2024 for every row.
     for (i, v) in cols[2].iter().enumerate() {
         let year = parse_int(v);
         assert_eq!(
@@ -1947,7 +1485,6 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
         );
     }
 
-    // Verify CASE WHEN id > 10 THEN 'high' ELSE 'low' END is 'low' for id <= 3.
     for (i, v) in cols[3].iter().enumerate() {
         let case_val = v
             .as_str()
@@ -1959,46 +1496,16 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// ---------------------------------------------------------------------------
-// 8.12  ORDER BY on a column outside the select list (#225)
-// ---------------------------------------------------------------------------
-
-/// Regression test for #225: `ORDER BY <col>` must push down correctly even
-/// when `<col>` is not itself a projected select-list item.
-///
-/// Pre-fix, the adapter widened the projection to the FULL base row whenever a
-/// pushed sort key was not a bare projected column, so the returned pushdown
-/// query's column count no longer matched the (unwidened) select list —
-/// Exasol rejects that positionally with `sqlCode 04000 "Expected number of
-/// columns is N but pushdown query has M"`. Post-fix, the sort key is appended
-/// as a HIDDEN extra scan/EMITS column and the declined-ORDER-BY wrapper
-/// selects only the ORIGINAL select-list items, so the returned arity always
-/// matches.
-///
-/// Case 1 is issue #225's own literal repro: `id` drives the ORDER BY but is
-/// not selected at all. Case 2 proves the hidden sort column actually DRIVES
-/// the ordering (not just that the query no longer errors) by sorting
-/// DESCENDING on `id` while selecting only `name`, and checking the returned
-/// row order.
-///
-/// Seed: id 1..20, score = 5.0 * id, name = "event-NN" (`common/seed.rs`).
+/// Scenario: ORDER BY a column outside the select list pushes down via a hidden sort column that drives the order (#225)
 #[test]
 fn e2e_order_by_unprojected_column_bare_projection() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Case 1: #225's literal repro.
     let sql = format!("SELECT score FROM {} WHERE id = 1 ORDER BY id", vs_table());
 
-    // Task 3.3: the pushed scan spec must carry the hidden sort key `ID` as an
-    // extra projection column, and the row-scan fan-out must NOT have widened
-    // to a full-base-row `SELECT * FROM (...)`. Scoped to the adapter's OWN
-    // emitted `"projection":[...]` scan-spec JSON array, not the whole SQL
-    // string (the EVENTS Iceberg schema's field names are lowercase, so an
-    // uppercase whole-string check like `!contains("EVENT_DATE")` would pass
-    // by casing accident rather than by actually proving the projection is
-    // narrow).
+    // Scoped to the adapter's own `"projection":[...]`: EVENTS field names are lowercase,
+    // so an uppercase whole-string check would pass by casing accident.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed_sql.contains("\"projection\":[\"SCORE\",\"ID\"]"),
@@ -2020,9 +1527,6 @@ fn e2e_order_by_unprojected_column_bare_projection() {
         "id=1 must have score=5.0 (5.0*1), got {score}"
     );
 
-    // Case 2: prove the hidden sort column actually drives the ordering (and
-    // is dropped from the visible result) by sorting DESCENDING on `id` while
-    // selecting only `name`.
     let sql_desc = format!(
         "SELECT name FROM {} WHERE id <= 5 ORDER BY id DESC",
         vs_table()
@@ -2051,30 +1555,7 @@ fn e2e_order_by_unprojected_column_bare_projection() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.13  ORDER BY on a column referenced only inside a projected expression (#225)
-// ---------------------------------------------------------------------------
-
-/// Regression test for #225's OTHER repro shape: the ORDER BY sort key is
-/// referenced only INSIDE a computed select-list expression, never bare
-/// projected — exercising the fix via a `ProjectionItem::Expr` instead of a
-/// bare `ProjectionItem::Column`.
-///
-/// `id || '-' || name` pushes down as ONE `Expr` select-list item
-/// (`FN_CONCAT` is advertised, `adapter/capabilities.rs:87`, and the
-/// translator renders it as DataFusion `concat(...)`,
-/// `vs-expression/src/lib.rs:632`), so `id` never appears as a bare projected
-/// column even though it also drives the ORDER BY.
-///
-/// Pre-check (done live against the `typed_distinct_probe` seed table via
-/// `scripts/capture-pushdown-payload.sh` before writing this test): concat of
-/// an Int64 column (`ID`) with a VARCHAR literal executes correctly end to
-/// end (`"1-aa"`, `"2-AA"`, `"3-"` for `ID || '-' || C_VARCHAR`) — DataFusion
-/// 54.1's `concat()` coerces the non-string argument cleanly, unlike the
-/// LIKE-pushdown type-coercion bug fixed in `a6e829e`. No `CAST(id AS
-/// VARCHAR)` fallback is needed; the literal `||` repro is used as specified.
-///
-/// Seed: id 1..20, name = "event-NN" (`common/seed.rs`).
+/// Scenario: ORDER BY a column referenced only inside a projected expression pushes down correctly (#225)
 #[test]
 fn e2e_order_by_column_referenced_only_in_projected_expression() {
     setup_e2e();
@@ -2108,32 +1589,10 @@ fn e2e_order_by_column_referenced_only_in_projected_expression() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.14  DECIMAL→string trailing-zero trimming (#211)
-// ---------------------------------------------------------------------------
-//
-// Exasol's own DECIMAL→VARCHAR conversion trims trailing scale zeros — and
-// drops the decimal point entirely when the fractional part is all zeros:
-// `30.00` becomes `"30"`, not `"30.00"`. Before the #211 fix, `CAST`, `||`
-// (CONCAT), and `LENGTH` over a DECIMAL column all silently rendered the
-// fixed-scale (untrimmed) string instead, producing silently-wrong results
-// rather than an error. This session's STATUS.md documents the live-captured
-// pre-fix values: `CAST(c_decimal_a AS VARCHAR(20))` returned `"10.50"` /
-// `"30.00"` / `"40.99"` (should be `"10.5"` / `"30"` / `"40.99"`),
-// `id||'-'||c_decimal_a` returned `"1-10.50"` / `"4-30.00"` (should be
-// `"1-10.5"` / `"4-30"`), and `LENGTH(c_decimal_a)` returned a uniform `5` for
-// every row instead of the correct 2/4/5 mix.
-//
-// Uses `typed_distinct_probe`'s `c_decimal_a` column (Exasol `DECIMAL(9,2)`,
-// 12 rows, ids 3 and 10 NULL — see `common/seed.rs`'s `typed_probe()`). The
-// raw unscaled values are reproduced below (the seed module keeps
-// `typed_probe()` private) so every expected string/length in this section is
-// computed independently in Rust from those raw values, never hand-guessed —
-// and never by calling the production `format_decimal_exasol_style` helper,
-// so this stays an independent oracle rather than a tautology check.
+// Exasol's DECIMAL→VARCHAR conversion trims trailing scale zeros and drops an all-zero
+// fraction (`30.00` → `"30"`) (#211). Expected strings come from an independent Rust
+// oracle, never from the production `format_decimal_exasol_style`.
 
-/// `(id, unscaled_value)` for `typed_distinct_probe.c_decimal_a` (scale 2),
-/// copied from `common/seed.rs`'s `typed_probe().decimal_a`.
 const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
     (1, Some(1050)),
     (2, Some(2025)),
@@ -2149,12 +1608,7 @@ const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
     (12, Some(3000)),
 ];
 
-/// Independently reproduce Exasol's DECIMAL→VARCHAR trimming rule from a raw
-/// unscaled value + scale: render the full fixed-scale digit string, then
-/// trim trailing fractional zeros, dropping the decimal point too if the
-/// whole fraction is zero. This is a from-scratch implementation (not a call
-/// into `vs-expression`'s `format_decimal_exasol_style`), so it serves as this
-/// test's own expected-value oracle.
+/// From scratch, not `format_decimal_exasol_style`, so it is an independent oracle.
 fn exasol_trim_decimal_string(unscaled: i128, scale: u32) -> String {
     let negative = unscaled < 0;
     let digits = unscaled.unsigned_abs().to_string();
@@ -2178,10 +1632,7 @@ fn exasol_trim_decimal_string(unscaled: i128, scale: u32) -> String {
     out
 }
 
-/// `exasol_trim_decimal_string` matches the documented Exasol trimming rule
-/// for every `c_decimal_a` value used by this section, pinning the oracle
-/// itself against the values this session live-captured (STATUS.md) before
-/// it is used to derive further expected results.
+/// Scenario: the `exasol_trim_decimal_string` oracle matches Exasol's trimming rule for every `c_decimal_a` value
 #[test]
 fn exasol_trim_decimal_string_matches_documented_values() {
     assert_eq!(exasol_trim_decimal_string(1050, 2), "10.5");
@@ -2192,8 +1643,7 @@ fn exasol_trim_decimal_string_matches_documented_values() {
     assert_eq!(exasol_trim_decimal_string(6000, 2), "60");
 }
 
-/// Explicit `CAST(c_decimal_a AS VARCHAR(20))` trims trailing scale zeros the
-/// way native Exasol does (#211).
+/// Scenario: CAST(c_decimal_a AS VARCHAR(20)) trims trailing scale zeros like native Exasol (#211)
 #[test]
 fn e2e_decimal_cast_trims_trailing_zeros() {
     setup_e2e();
@@ -2220,21 +1670,7 @@ fn e2e_decimal_cast_trims_trailing_zeros() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.15  Issue #189 cross-verification (same root cause as #225)
-// ---------------------------------------------------------------------------
-
-/// Issue #189 ("ORDER BY on a non-projected column generates invalid pushdown
-/// (column not found)") reported the shape-equivalent live repro
-/// `SELECT c_acctbal FROM CUSTOMER WHERE c_custkey <= 5 ORDER BY c_custkey`
-/// against a remote Databricks-backed TPC-H `CUSTOMER` table — not reproducible
-/// on this local stack, which has no `CUSTOMER`/`c_acctbal` table. This test
-/// verifies the SAME root-cause shape against the locally seeded `dim_customer`
-/// table instead: a projected column (`c_name`) with an `ORDER BY` on a
-/// DIFFERENT, unprojected column (`c_custkey`).
-///
-/// Seed: `dim_customer` has 5 rows, `c_custkey` 1..=5, `c_name` =
-/// "customer-01".."customer-05" (`common/seed.rs::make_customer_batch`).
+/// Scenario: projecting one column while ordering by a different unprojected column pushes down correctly (#189)
 #[test]
 fn e2e_issue_189_shape_equivalent_local_verification() {
     setup_e2e();
@@ -2271,16 +1707,7 @@ fn e2e_issue_189_shape_equivalent_local_verification() {
     }
 }
 
-/// Implicit CONCAT (`||`) over a DECIMAL operand trims trailing scale zeros
-/// the way native Exasol does (#211).
-///
-/// `id` is projected alongside the CONCAT expression (not only embedded
-/// inside it) — an unrelated pre-existing pushdown limitation rejects `ORDER
-/// BY <col>` when `<col>` is not itself a top-level SELECT-list item (even
-/// when referenced inside another projected expression), reproducible on the
-/// baseline `events` table with a bare column and no decimal/CONCAT
-/// involved. Projecting `id` directly sidesteps that unrelated limitation so
-/// this test isolates the #211 CONCAT-trimming behavior only.
+/// Scenario: CONCAT over a DECIMAL operand trims trailing scale zeros like native Exasol (#211)
 #[test]
 fn e2e_decimal_concat_trims_trailing_zeros() {
     setup_e2e();
@@ -2307,13 +1734,7 @@ fn e2e_decimal_concat_trims_trailing_zeros() {
     }
 }
 
-/// Implicit `LENGTH(c_decimal_a)` reflects the TRIMMED string's length, not
-/// the fixed-scale (untrimmed) string's length (#211).
-///
-/// `id` is projected alongside `LENGTH(...)` for the same reason as
-/// `e2e_decimal_concat_trims_trailing_zeros` above: `ORDER BY id` requires
-/// `id` to be a top-level SELECT-list item, an unrelated pre-existing
-/// pushdown limitation orthogonal to #211.
+/// Scenario: LENGTH(c_decimal_a) reflects the trimmed string's length (#211)
 #[test]
 fn e2e_decimal_length_reflects_trimmed_string() {
     setup_e2e();
@@ -2327,8 +1748,7 @@ fn e2e_decimal_length_reflects_trimmed_string() {
     assert_eq!(cols.len(), 2, "expected 2 columns (id, LENGTH): {cols:?}");
     assert_eq!(cols[0].len(), 3, "expected 3 rows (id 1,4,6): {cols:?}");
 
-    // "10.5"=4, "30"=2, "40.99"=5. Pre-fix code returned 5 for all three
-    // (untrimmed "10.50" / "30.00" / "40.99" are all 5 characters).
+    // Untrimmed "10.50" / "30.00" / "40.99" would all be 5 characters.
     let expected = [4i64, 2, 5];
     for (i, exp) in expected.iter().enumerate() {
         let len = parse_int(&cols[1][i]);
@@ -2340,21 +1760,13 @@ fn e2e_decimal_length_reflects_trimmed_string() {
     }
 }
 
-/// The headline #211 repro: `COUNT(*) FROM ... WHERE LENGTH(c_decimal_a) > N`
-/// must match native Exasol's own trimmed-string `LENGTH` semantics, not the
-/// untrimmed fixed-scale string's length. Also independently verifies every
-/// row's `LENGTH(c_decimal_a)` against a Rust-computed trimmed length, proving
-/// the per-row divergence mechanism (not just the final aggregate number) is
-/// fixed.
+/// Scenario: COUNT(*) WHERE LENGTH(c_decimal_a) > N matches Exasol's trimmed LENGTH semantics per row and in aggregate (#211)
 #[test]
 fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
     setup_e2e();
     let mut conn = exa_conn();
     let t = vs_typed_table();
 
-    // Expected trimmed LENGTH per row, computed from the seed's own unscaled
-    // c_decimal_a values (scale 2) via the independent oracle above — never
-    // hardcoded, never derived from the production formatter.
     let expected_lengths: Vec<(i64, Option<i64>)> = TYPED_DECIMAL_A_UNSCALED
         .iter()
         .map(|&(id, unscaled)| {
@@ -2374,11 +1786,8 @@ fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
         .filter(|(_, len)| len.is_some())
         .count() as i64;
 
-    // Every c_decimal_a value renders as exactly 5 characters BEFORE
-    // trimming ("XX.XX", scale 2, values 10.50..60.00), so a pre-fix build
-    // would match every one of the 10 non-NULL rows here. Asserting the
-    // trimmed count differs from that untrimmed count is what makes this
-    // test discriminate old vs. new code, rather than passing by accident.
+    // Every untrimmed value is 5 characters, so a differing count is what discriminates
+    // old from new behavior.
     assert_ne!(
         expected_count, untrimmed_count,
         "expected trimmed-length count must differ from the untrimmed-length \
@@ -2386,7 +1795,6 @@ fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
          old vs. new code"
     );
 
-    // Row-by-row check over all 12 seed rows.
     let row_sql = format!("SELECT id, LENGTH(c_decimal_a) FROM {t} ORDER BY id");
     let cols = conn.query_columns(&row_sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (id, LENGTH): {cols:?}");
@@ -2417,7 +1825,6 @@ fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
         }
     }
 
-    // The headline COUNT(*) repro.
     let count_sql = format!("SELECT COUNT(*) FROM {t} WHERE LENGTH(c_decimal_a) > 4");
     let count_cols = conn.query_columns(&count_sql);
     let actual_count = parse_int(&count_cols[0][0]);
@@ -2430,43 +1837,11 @@ fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.15  String-function argument-type coercion repro (#210)
-// ---------------------------------------------------------------------------
-//
-// `crates/vs-expression/src/lib.rs`'s string-function family (`UPPER`,
-// `LOWER`, `TRIM`, `INSTR`, `LOCATE`, ...) used to hand every argument
-// straight to DataFusion with zero type inspection. Exasol implicitly
-// converts a numeric or DATE argument to VARCHAR before invoking a string
-// function; DataFusion refuses, and pre-fix the scan died at plan time with
-// `F-UDF-CL-RUST-9001 ... DataFusion SQL error: Error during planning ...
-// requires String, but received ...` — a hard error, not a native fallback.
-// The new `string_function_arg_type_guard` dispatches each string-position
-// argument on its Exasol column type before rendering: VARCHAR/CHAR pass
-// through unchanged, DATE is wrapped in `CAST(... AS VARCHAR)`, DECIMAL
-// reuses #211's trimmed `decimal_to_varchar_exasol` rendering, and every
-// other resolvable type (BOOLEAN, DOUBLE, TIMESTAMP) declines to native
-// Exasol evaluation (covered separately in section 8.16 below).
-//
-// Uses `typed_distinct_probe` (`vs_typed_table()`): `c_varchar`, `id`
-// (DECIMAL(20,0)), `c_decimal_a` (DECIMAL(9,2)), `c_date`. Reuses the #211
-// `TYPED_DECIMAL_A_UNSCALED` table and `exasol_trim_decimal_string` oracle
-// defined in section 8.14 above.
+// String functions over non-string arguments (#210): Exasol converts implicitly, but
+// DataFusion refuses. VARCHAR/CHAR pass through, DATE is CAST to VARCHAR, DECIMAL uses
+// the trimmed rendering, and other types decline to native Exasol.
 
-/// `UPPER(c_varchar)` still pushes down and returns the uppercased string,
-/// guarding the new dispatch table's VARCHAR-passthrough `Coerce([0])`
-/// branch (#210) against a regression.
-///
-/// Unlike the other tests in this section, `UPPER(c_varchar)` never
-/// hard-failed pre-fix: `c_varchar` is already a string, so the type-blind
-/// original renderer already passed it straight through to DataFusion's
-/// `upper()` with no coercion needed. This test proves the new per-argument
-/// type dispatch — added to fix the OTHER (numeric/DATE) cases below — does
-/// not silently degrade this already-working VARCHAR case to the full-row
-/// fallback.
-///
-/// Seed: `typed_distinct_probe.c_varchar` for id=1 is `"aa"` (see
-/// `common/seed.rs`'s `typed_probe()`).
+/// Scenario: UPPER(c_varchar) still pushes down through the VARCHAR passthrough (#210)
 #[test]
 fn e2e_upper_varchar_pushdown() {
     setup_e2e();
@@ -2493,17 +1868,7 @@ fn e2e_upper_varchar_pushdown() {
     );
 }
 
-/// `UPPER(id)` over the DECIMAL(20,0) `id` column returns the plain digit
-/// string, exercising the new DECIMAL-coercion branch of
-/// `string_function_arg_type_guard` (#210) for a scale-0 (integer) DECIMAL.
-///
-/// Pre-fix, `id` (a numeric argument) hard-failed with
-/// `F-UDF-CL-RUST-9001 ... requires String, but received ...` inside the
-/// DataFusion scan, the same way #210's `UPPER(c_custkey)` repro did.
-/// Post-fix the argument is wrapped in the trimmed decimal-to-string
-/// rendering shared with #211; since `id`'s scale is 0 there is no
-/// fractional part to trim, so this really just confirms `UPPER('4')` =
-/// `'4'` — a bare digit string, no decimal point.
+/// Scenario: UPPER over a DECIMAL(20,0) column returns the plain digit string (#210)
 #[test]
 fn e2e_upper_id_trims_to_plain_integer_string() {
     setup_e2e();
@@ -2523,19 +1888,7 @@ fn e2e_upper_id_trims_to_plain_integer_string() {
     );
 }
 
-/// `LTRIM(c_decimal_a)` returns the Exasol-trimmed decimal string (#210),
-/// reusing the #211 `exasol_trim_decimal_string` oracle and
-/// `TYPED_DECIMAL_A_UNSCALED` table from section 8.14.
-///
-/// Pre-fix, `c_decimal_a` (a DECIMAL column) hard-failed with
-/// `F-UDF-CL-RUST-9001 ... requires String, but received ...` when passed to
-/// `LTRIM`, mirroring #210's `LTRIM(c_acctbal)` repro. Post-fix the argument
-/// is wrapped in the same trimmed decimal-to-string rendering #211 already
-/// proved for `CAST`/`CONCAT`/`LENGTH`. `LTRIM` strips no characters here —
-/// the trimmed string has no leading whitespace — so the expected value is
-/// simply the trimmed decimal string itself: id=1 -> "10.5", id=4 -> "30",
-/// id=6 -> "40.99" — the same three ids `e2e_decimal_cast_trims_trailing_zeros`
-/// uses, for consistency.
+/// Scenario: LTRIM(c_decimal_a) returns the Exasol-trimmed decimal string (#210)
 #[test]
 fn e2e_ltrim_decimal_trims_trailing_zeros() {
     setup_e2e();
@@ -2575,21 +1928,7 @@ fn e2e_ltrim_decimal_trims_trailing_zeros() {
     }
 }
 
-/// `LOWER(c_date)` returns Exasol's default `YYYY-MM-DD` textual DATE
-/// rendering (#210) — the same DATE-cast rationale `guard_like_subject`
-/// already applies for #207's `LIKE` subject guard.
-///
-/// Pre-fix, `c_date` (a DATE column) hard-failed with
-/// `F-UDF-CL-RUST-9001 ... requires String, but received ...` when passed to
-/// `LOWER`, mirroring #210's `LOWER(l_shipdate)` repro. Post-fix the
-/// argument is wrapped in an explicit `CAST(... AS VARCHAR)`, matching
-/// Exasol's own `NLS_DATE_FORMAT` default.
-///
-/// Seed: `c_date` for id=1 is `BASE_DATE + 0` days. `common/seed.rs` defines
-/// `BASE_DATE = 19_723` (days since epoch) and separately documents
-/// `BASE_DATE + 182` as the literal date 2024-07-01 (`INITDEF_REAL_DATE_DAYS`
-/// comment), which confirms `BASE_DATE` itself is 2024-01-01 (Jan 1 + 182
-/// days = Jul 1 in the 2024 leap year: 31+29+31+30+31+30 = 182).
+/// Scenario: LOWER(c_date) returns Exasol's default YYYY-MM-DD rendering (#210)
 #[test]
 fn e2e_lower_date_formats_as_iso() {
     setup_e2e();
@@ -2612,17 +1951,7 @@ fn e2e_lower_date_formats_as_iso() {
     );
 }
 
-/// `INSTR(c_decimal_a, '.')` returns the position of `.` WITHIN the trimmed
-/// decimal string (#210), not the untrimmed fixed-scale text.
-///
-/// Pre-fix, `c_decimal_a` hard-failed with `F-UDF-CL-RUST-9001 ... requires
-/// String, but received ...` when passed to `INSTR`, mirroring #210's
-/// `INSTR(c_custkey, '1')` repro. Post-fix the argument is wrapped in the
-/// #211 trimmed rendering before `strpos` is applied, so the returned
-/// position reflects the TRIMMED string, not the fixed-scale ("XX.XX")
-/// string. Positions are computed in Rust from `exasol_trim_decimal_string`'s
-/// output (`s.find('.').map(|i| i as i64 + 1).unwrap_or(0)`), never
-/// hardcoded: id=1 "10.5" -> 3, id=4 "30" -> 0 (no '.'), id=6 "40.99" -> 3.
+/// Scenario: INSTR(c_decimal_a, '.') returns the position within the trimmed decimal string (#210)
 #[test]
 fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
     setup_e2e();
@@ -2662,39 +1991,11 @@ fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// 8.16  String-function argument-type decline native-oracle parity (#210)
-// ---------------------------------------------------------------------------
-//
-// BOOLEAN, DOUBLE, and TIMESTAMP are non-coercible resolvable types for
-// `string_function_arg_type_guard`: they are not VARCHAR/CHAR (pass through),
-// not DATE (CAST-wrapped), and not DECIMAL (trim-wrapped), so the guard
-// returns `None` and the whole select-list item degrades to the full base
-// row projection instead of hard-failing. Exasol's own SQL engine then
-// evaluates the string function over the raw returned column natively.
-//
-// Each comparison below is against an IN-SESSION NATIVE ORACLE: a second
-// query over a bare literal value, with NO virtual schema reference, run
-// over the SAME connection — so the comparison is not a tautology. A
-// regressed guard would either hard-fail (if it stopped declining) or
-// return DataFusion's own divergent text formatting (if something coerced
-// instead of declining); either way this comparison would catch it.
-//
-// Exasol's public Type Conversion Rules
-// (https://docs.exasol.com/db/latest/sql_references/data_types/typeconversionrules.htm)
-// document implicit BOOLEAN/TIMESTAMP-to-VARCHAR conversion as supported,
-// which is why `c_ts`/`c_bool` are included here alongside `c_double` rather
-// than omitted. If the native-oracle query for either ever fails against a
-// live Exasol container (an Exasol-side rejection of its own documented
-// implicit conversion, unrelated to this fix), drop that specific test and
-// record why here — never weaken its assertion to make it pass regardless.
+// BOOLEAN, DOUBLE and TIMESTAMP string-function arguments decline to native Exasol.
+// Each result is compared with an in-session native oracle over a bare literal, so a
+// regressed guard either hard-fails or returns DataFusion's divergent formatting.
 
-/// `UPPER(c_double)` over the virtual table declines pushdown and falls back
-/// to native Exasol evaluation, matching an in-session native oracle over a
-/// bare `DOUBLE` literal (#210).
-///
-/// Seed: `typed_distinct_probe.c_double` for id=1 is `0.5` (see
-/// `common/seed.rs`'s `typed_probe()`).
+/// Scenario: UPPER(c_double) declines pushdown and matches a native DOUBLE oracle (#210)
 #[test]
 fn e2e_upper_double_declines_to_native_oracle() {
     setup_e2e();
@@ -2728,19 +2029,7 @@ fn e2e_upper_double_declines_to_native_oracle() {
     );
 }
 
-/// `UPPER(c_ts)` over the virtual table declines pushdown the same way
-/// `UPPER(c_double)` does (#210) and matches an in-session native oracle over
-/// a `CAST` to the engine's declared timestamp precision.
-///
-/// Seed: `typed_distinct_probe.c_ts` for id=1 is `BASE_TS_MICROS + 100ms` =
-/// 2024-01-01 00:00:00.100 (see `common/seed.rs`'s `typed_probe()`; its
-/// `ts(100)` closure computes `BASE_TS_MICROS + 100 * 1_000` microseconds).
-/// The oracle's `CAST` target is read from `expected_timestamp_precision`
-/// (task 5) rather than hardcoded. The `.100` fixture renders identically
-/// under both CAST targets on both engines (decision-log.md `[C4]`), so
-/// reading the target from the oracle changes no assertion today; it exists
-/// so this test stays correct if the fixture ever gains sub-millisecond
-/// digits.
+/// Scenario: UPPER(c_ts) declines pushdown and matches a native oracle cast to the engine's timestamp precision (#210)
 #[test]
 fn e2e_upper_timestamp_declines_to_native_oracle() {
     setup_e2e();
@@ -2774,15 +2063,7 @@ fn e2e_upper_timestamp_declines_to_native_oracle() {
     );
 }
 
-/// `UPPER(c_bool)` over the virtual table declines pushdown the same way
-/// `UPPER(c_double)` does (#210) and matches an in-session native oracle over
-/// a bare `BOOLEAN` literal. Exasol's implicit BOOLEAN-to-VARCHAR conversion
-/// renders `TRUE`/`FALSE` (Exasol Type Conversion Rules), so
-/// `UPPER(CAST(TRUE AS BOOLEAN))` -> `"TRUE"` is the expected oracle value.
-///
-/// Seed: `typed_distinct_probe.c_bool` for id=1 is `true` (see
-/// `common/seed.rs`'s `typed_probe()`). See the section note above regarding
-/// live-stack verification of this case.
+/// Scenario: UPPER(c_bool) declines pushdown and matches a native BOOLEAN oracle (#210)
 #[test]
 fn e2e_upper_boolean_declines_to_native_oracle() {
     setup_e2e();
@@ -2814,8 +2095,6 @@ fn e2e_upper_boolean_declines_to_native_oracle() {
          vs={vs_value:?} oracle={oracle_value:?}"
     );
 }
-
-// 8.16b  SUBSTR/LEFT pushdown parity (#187)
 
 #[test]
 fn e2e_substr_left_pushdown() {
@@ -2864,34 +2143,10 @@ fn e2e_substr_left_pushdown() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.17  INSTR/LOCATE arity decline (#228)
-// ---------------------------------------------------------------------------
-//
-// `INSTR`/`LOCATE` beyond 2 arguments unconditionally decline, regardless of
-// argument type: `vs-expression`'s renderer reads only `args[0]`/`args[1]`
-// and drops the rest (#228), so coercing index 0 would let a truncated
-// rendering plan successfully and return a position computed as if the
-// start-position argument had never been given — a silent WRONG ANSWER,
-// where a hard DataFusion error would at least have been loud. Both wired
-// surfaces (select-list projection and WHERE-clause filter) are covered.
+// INSTR/LOCATE beyond 2 arguments always decline: the renderer drops extra arguments
+// (#228), which would silently return a wrong position.
 
-/// Select-list `INSTR` beyond 2 arguments declines to native Exasol
-/// evaluation instead of coercing and silently truncating to a 2-argument
-/// `strpos` call (#228).
-///
-/// Seed: `typed_distinct_probe.c_varchar` for id=1 is `"aa"` (see
-/// `common/seed.rs`'s `typed_probe()`). Exasol's `INSTR('aa', 'a', 2)`
-/// searches for `'a'` starting AT position 2 — the second `'a'` in `"aa"` —
-/// and returns `2`. A regressed build that coerced `INSTR(c_varchar, 'a', 2)`
-/// down to a 2-argument `strpos(c_varchar, 'a')` (silently dropping the
-/// start-position argument) would instead return `1` (the FIRST `'a'`) — a
-/// different, silently wrong number, so this test discriminates
-/// correct-decline from silently-wrong-coerce.
-///
-/// The expected value of `2` is independently confirmed against a native
-/// in-session oracle (`SELECT INSTR('aa', 'a', 2)`, no virtual schema),
-/// pinning the oracle itself before using it to judge the VS result.
+/// Scenario: select-list INSTR with a start position declines to native Exasol instead of truncating (#228)
 #[test]
 fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
     setup_e2e();
@@ -2919,21 +2174,7 @@ fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
     );
 }
 
-/// WHERE-clause `INSTR` beyond 2 arguments declines to native Exasol
-/// evaluation instead of coercing and silently truncating (#228) — the
-/// WHERE-clause counterpart of the select-list case above.
-///
-/// Seed: `typed_distinct_probe.c_varchar` for id=4 is `"bb"` (length 2), see
-/// `common/seed.rs`'s `typed_probe()`. Exasol's `INSTR('bb', 'b', 3)`
-/// searches for `'b'` starting at position 3 — beyond the string's length —
-/// and returns `0` natively, so `WHERE INSTR(c_varchar, 'b', 3) = 0` matches
-/// id=4. A regressed build that coerced down to 2-argument
-/// `strpos(c_varchar, 'b')` (ignoring the start position) would compute `1`
-/// for id=4 (the first `'b'`), so `1 != 0` would make the predicate NEVER
-/// match id=4 — the discriminating check below.
-///
-/// The expected value of `0` is independently confirmed against a native
-/// in-session oracle (`SELECT INSTR('bb', 'b', 3)`, no virtual schema).
+/// Scenario: WHERE-clause INSTR with a start position declines to native Exasol instead of truncating (#228)
 #[test]
 fn e2e_instr_arity_decline_where_matches_native_oracle() {
     setup_e2e();
@@ -2961,40 +2202,17 @@ fn e2e_instr_arity_decline_where_matches_native_oracle() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.18  ORDER BY on an expression or aggregate outside the select list (#198)
-// ---------------------------------------------------------------------------
-//
-// `ORDER_BY_EXPRESSION` is advertised, so Exasol pushes a structured `orderBy`
-// for an expression or aggregate sort key instead of silently appending that
-// key to the `selectList` — the append is what surfaced pre-fix as an extra
-// result column named `HIDDEN_COL_n`. Every case below asserts BOTH halves:
-// no leaked column, AND the pushed ordering genuinely applied. The second half
-// is not redundant — advertising the capability with no backing path returns
-// rows in raw file order with no error at all, which is strictly worse than
-// the leak it replaces (plan decision-log [2], measured live).
-//
-// All cases run against `typed_distinct_probe` (`vs_typed_table()`), 12 rows,
-// `id` 1..12 with one row per `id`. Every expected ordering below is computed
-// by hand from `common/seed.rs`'s `typed_probe()`:
+// ORDER BY an expression or aggregate outside the select list (#198). Each case asserts
+// no leaked `HIDDEN_COL_n` and that the ordering applied: advertising the capability
+// without a backing path returns raw file order with no error.
 //
 //   id       1  2     3  4  5  6  |  7  8  9  10    11  12
 //   c_price  2  3  NULL  4  2  5  |  2  3  6   4  NULL   5
 //   c_qty    3  2     5  1  3  2  |  6  4  1   2     3   4
 //
-// `c_price` is NULL for id 3 and 11; `c_qty` has no NULLs. Exasol's default
-// NULL placement is NULLS FIRST under DESC and NULLS LAST under ASC —
-// confirmed against a native in-session oracle
-// (`SELECT V FROM (SELECT 1 AS V UNION ALL SELECT NULL UNION ALL SELECT 3)
-// ORDER BY V DESC` → NULL, 3, 1) — and the adapter renders whichever
-// placement Exasol pushes on the wire, so the NULL rows' positions are part of
-// what these tests pin.
+// Exasol defaults to NULLS FIRST under DESC and NULLS LAST under ASC.
 
-/// Run `sql` and return `(column names, column-major data)`.
-///
-/// `query_columns` drops the result-set metadata, but a `HIDDEN_COL_n` leak is
-/// visible ONLY in the column NAMES — the arity alone does not distinguish a
-/// leaked sort key from a legitimately selected third column.
+/// A `HIDDEN_COL_n` leak is visible only in the column names, not the arity.
 fn query_named_columns(
     conn: &mut ExaConn,
     sql: &str,
@@ -3011,7 +2229,6 @@ fn query_named_columns(
     (names, cols)
 }
 
-/// Assert the result leaked no synthetic `HIDDEN_COL_n` column (#198).
 fn assert_no_hidden_columns(names: &[String], sql: &str) {
     assert!(
         !names.iter().any(|n| n.starts_with("HIDDEN_COL")),
@@ -3020,17 +2237,8 @@ fn assert_no_hidden_columns(names: &[String], sql: &str) {
     );
 }
 
-/// Extract the REAL wire `pushdownRequest` object Exasol sent the adapter for
-/// `sql`, as parsed JSON.
-///
-/// `EXPLAIN VIRTUAL` returns the adapter-generated SQL *and* a column carrying
-/// the echoed adapter exchange (`getCapabilities` + `pushdown` request /
-/// response) as a JSON array. `explain_virtual_sql` flattens all of that into
-/// one blob, which is fine for substring-matching the generated SQL but too
-/// coarse to assert on Exasol's wire payload — a `contains("limit")` there also
-/// matches the adapter's own snake_case scan-spec keys, and misses an uppercase
-/// rendered `LIMIT`. This picks out the `pushdownRequest` object itself so its
-/// keys can be asserted directly.
+/// `explain_virtual_sql`'s flattened blob is too coarse for asserting Exasol's wire
+/// payload: `contains("limit")` would also match the adapter's own scan-spec keys.
 fn explain_virtual_pushdown_request(conn: &mut ExaConn, sql: &str) -> serde_json::Value {
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {sql}"));
     let result_set = resp["responseData"]["results"][0]["resultSet"].clone();
@@ -3044,38 +2252,23 @@ fn explain_virtual_pushdown_request(conn: &mut ExaConn, sql: &str) -> serde_json
         .unwrap_or_else(|| panic!("EXPLAIN VIRTUAL carried no echoed pushdownRequest for:\n{sql}"))
 }
 
-/// Collect a column's integer values as a set, for assertions over a group set
-/// whose internal row order is not deterministic (ties on the sort measure).
 fn int_set(values: &[serde_json::Value]) -> std::collections::HashSet<i64> {
     values.iter().map(parse_int).collect()
 }
 
-/// Row scan: an expression sort key absent from the select list leaks no
-/// `HIDDEN_COL_n` and still orders the result correctly (#198, tasks 9.1/9.2).
-///
-/// Case 1 (single key) is the plan's row-scan repro. Its sort expression
-/// references only `c_price`, which is ALREADY a visible select-list column,
-/// so the declined-ORDER-BY wrapper must append NO extra scan column — the
-/// "at most once, never invented" rule.
-///
-/// Case 2 (two keys) adds a second key over `c_qty`, which is NOT selected, so
-/// exactly one hidden base column is appended after the two visible ones while
-/// `c_price` is still not duplicated. Both keys must render, with their own
-/// direction and NULL placement, or the second key's tie-break ordering below
-/// cannot hold.
+/// Scenario: row scan with an expression sort key absent from the select list leaks no HIDDEN_COL and orders correctly (#198)
 #[test]
 fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // --- Case 1: single expression sort key, not selected (task 9.1) -------
     let sql = format!(
         "SELECT id, c_price FROM {} WHERE id<=5 ORDER BY ABS(c_price) DESC",
         vs_typed_table()
     );
 
-    // The sort expression references only the already-projected C_PRICE, so
-    // the scan spec's projection must stay at the two visible columns.
+    // The sort expression references only the already-projected C_PRICE, so the projection
+    // stays at the two visible columns.
     let pushed = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed.contains("\"projection\":[\"ID\",\"C_PRICE\"]"),
@@ -3107,7 +2300,6 @@ fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
         "ids 1 and 5 both have c_price 2.0 (tied last), got ids={ids:?}"
     );
 
-    // --- Case 2: two expression sort keys, neither selected (task 9.2) -----
     let sql2 = format!(
         "SELECT id, c_price FROM {} ORDER BY ABS(c_price) DESC, c_qty+1 ASC",
         vs_typed_table()
@@ -3154,23 +2346,7 @@ fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
     );
 }
 
-/// Grouped, issue #198's own repro shape: a group-key-only select list with an
-/// `ORDER BY` over an aggregate that is not selected, plus a `LIMIT` that must
-/// genuinely cut groups (task 9.3).
-///
-/// This routes through `RequestShape::GroupByWrapper` — the qualified
-/// single-table wrapper — so it is also the end-to-end coverage for that entry
-/// point of the wrapper family (task 1.2).
-///
-/// `id` has 12 distinct values over the 12-row seed (one group per row), so
-/// `LIMIT 4` drops 8 groups. `SUM(c_qty)` per `id` is just `c_qty`, whose top
-/// values are 6 (id 7), 5 (id 3), then 4 (ids 8 and 12) — the tie at the 4th
-/// position falls ENTIRELY inside the limit, so the returned group SET is
-/// deterministic even though the row order within that tie is not. Group-set
-/// EQUALITY is what proves the `LIMIT` is both rendered AND applied AFTER the
-/// `ORDER BY`: a limit applied before the ordering, or absent, fails it.
-/// `SUM(c_price)` is deliberately NOT used — `c_price` is NULL for ids 3 and
-/// 11, which would make the assertion depend on NULL placement under `DESC`.
+/// Scenario: a group-key-only select list ordered by an unselected aggregate with LIMIT returns the correct group set (#198)
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
     setup_e2e();
@@ -3210,31 +2386,12 @@ fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
     );
 }
 
-/// Grouped: an aggregate sort key absent from the select list leaks no
-/// `HIDDEN_COL_n` when a DIFFERENT aggregate is already selected — and the
-/// variant whose sort key IS selected keeps the partial/merge path (task 9.4).
-///
-/// Case 1 reaches `GroupedOrderBy::Unresolvable` with a NON-empty plan list
-/// (one `COUNT(*)` plan the sort key does not match), the same wrapper route
-/// as the group-key-only shape above but from a different plan-list state.
-///
-/// Case 2 is the control that must NOT route to the wrapper: `SUM(c_price)` is
-/// in the select list, so the sort key resolves against that plan's merged
-/// partial expression and the partial/merge decomposition is retained. It is
-/// distinguished from Case 1 by the scan spec carrying `group_keys` (a
-/// per-shard partial aggregation) and the merge SELECT ordering on
-/// `SUM("PARTIAL_sum_…")` rather than on a base column.
-///
-/// `c_bool` groups: true (ids 1,2,5,6,7,9,11,12), false (ids 4,8), NULL (ids
-/// 3,10). `SUM(c_price)` is 25 / 7 / 4 respectively — all non-NULL, so the
-/// group order under `DESC` is deterministic without depending on NULL
-/// placement.
+/// Scenario: an unselected aggregate sort key leaks no HIDDEN_COL beside another selected aggregate, and a selected sort key keeps the partial/merge path (#198)
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // --- Case 1: sort aggregate NOT selected, another aggregate selected ---
     let sql = format!(
         "SELECT c_bool, COUNT(*) FROM {} GROUP BY c_bool ORDER BY SUM(c_price) DESC",
         vs_typed_table()
@@ -3263,7 +2420,6 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
         "COUNT(*) per c_bool group must be 8 / 2 / 2 in that order"
     );
 
-    // --- Case 2: sort aggregate IS selected → partial/merge path retained --
     let sql2 = format!(
         "SELECT c_bool, SUM(c_price) FROM {} GROUP BY c_bool ORDER BY SUM(c_price) DESC",
         vs_typed_table()
@@ -3304,16 +2460,7 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
     }
 }
 
-/// Control: the sort expression IS also a select-list item, so nothing is
-/// hidden and nothing is stripped (task 9.5).
-///
-/// The plan proved that this shape and the leaking one push a BYTE-IDENTICAL
-/// `selectList` while `ORDER_BY_EXPRESSION` is unadvertised — Exasol picks the
-/// client-facing name (`A` here, `HIDDEN_COL_2` there) server-side. So this
-/// case exists to prove the fix did not regress the shape that was already
-/// correct: the third column must survive, named `A`.
-///
-/// `ORDER BY ABS(c_price)` is ascending, so NULLs (ids 3 and 11) sort LAST.
+/// Scenario: a sort expression that is also a select-list item survives under its own name
 #[test]
 fn e2e_order_by_expression_also_selected_control() {
     setup_e2e();
@@ -3369,24 +2516,7 @@ fn e2e_order_by_expression_also_selected_control() {
     );
 }
 
-/// Multi-`COUNT(DISTINCT)` (Case 2/3) with an aggregate `ORDER BY`: the second
-/// qualified-wrapper entry point returns a correct, leak-free result (task
-/// 9.6).
-///
-/// This shape declines the partial/merge path and routes to the qualified
-/// single-table wrapper, which is the seam task 1.2 relaxed.
-///
-/// MEASURED CAVEAT, same finding as plan decision-log [10]: this is an
-/// `aggregationType: "single_group"` request, and Exasol pushes NO structured
-/// `orderBy` for a single-group aggregate even with `ORDER_BY_EXPRESSION`
-/// advertised — sorting one row costs nothing to do client-side. Verified live
-/// for this exact query: the captured payload carries no `orderBy` key. So
-/// what this case pins end to end is that the wrapper route stays correct and
-/// leak-free under an aggregate `ORDER BY`; the wrapper's expression-sort-key
-/// RENDERING is proven by the unit test on `outer_wrapper_clauses`, which can
-/// feed the `orderBy` this shape never receives.
-///
-/// `c_bool` has 2 distinct non-NULL values, `id` has 12.
+/// Scenario: multi-COUNT(DISTINCT) with an aggregate ORDER BY routes to the qualified wrapper and returns a correct, leak-free result
 #[test]
 fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
     setup_e2e();
@@ -3421,15 +2551,7 @@ fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
     assert_eq!(parse_int(&cols[1][0]), 12, "COUNT(DISTINCT id) must be 12");
 }
 
-/// `LIMIT 0` over a one-row aggregate result returns ZERO rows, not one
-/// `COUNT = 0` row (task 9.9).
-///
-/// Pins decision-log [10]: for an `aggregationType: "single_group"` request
-/// Exasol keeps BOTH the sort and the truncation client-side, pushing neither
-/// wire key — so the zero rows here come from Exasol's own truncation, not from
-/// a `LIMIT 0` rendered on the adapter's merge SELECT (`request_limit` is
-/// `None`). Task 5.1's render site is covered by the `plan_scan_sql` unit test,
-/// which can feed the wire `limit: 0` this shape never receives.
+/// Scenario: LIMIT 0 over a one-row aggregate returns zero rows, truncated by Exasol itself
 #[test]
 fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
     setup_e2e();
@@ -3440,9 +2562,8 @@ fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
         vs_typed_table()
     );
 
-    // Assert on the wire payload itself, not on the flattened EXPLAIN blob:
-    // these keys DO appear here when Exasol pushes them (verified against a
-    // `ORDER BY <col> DESC LIMIT n` row scan on this same table).
+    // Exasol pushes no `orderBy`/`limit` for a single-group aggregate; these keys do appear
+    // on the wire when pushed (verified on an ORDER BY … LIMIT row scan).
     let request = explain_virtual_pushdown_request(&mut conn, &sql);
     assert!(
         request.get("orderBy").is_none(),
@@ -3475,52 +2596,12 @@ fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// 8.19  Issue #209 dialect-fix E2E parity + now-family withdrawal
-// ---------------------------------------------------------------------------
-//
-// `fix-vs-expression-dialect` makes every `vs-expression` rendering arm
-// dialect-aware, not only `CAST` targets. Pre-fix, a scalar function or
-// timestamp literal spliced into an Exasol-parsed wrapper SQL string (a
-// `COUNT(DISTINCT <expr>)` qualified single-table fallback, a grouped
-// scalar-over-aggregate merge SELECT, or a select-list `REGEXP_LIKE`/`CASE`)
-// rendered in DataFusion form regardless of dialect, so Exasol's own SQL
-// engine rejected the whole statement outright (`function or script X not
-// found`, 42000, or a syntax error) rather than returning a result.
-//
-// Issue #209 lists seven such repro queries against a real customer dataset
-// shaped like TPC-H (`c_acctbal`, `l_shipdate`, `l_discount`, `CUSTOMER`,
-// `LINEITEM`). That schema does not exist in this E2E stack's seed tables, so
-// every test below re-targets the SAME failure shape onto `events`
-// (`vs_table()`) or `typed_distinct_probe` (`vs_typed_table()`) columns
-// instead — matching the query SHAPE (the wrapper path exercised, the
-// function family involved) rather than the literal column names. The
-// `INSTR` case is a #210 REGRESSION GUARD, not a new-failure repro: `INSTR`
-// already had an Exasol-verbatim rendering arm before this plan, so it
-// already passed pre-fix; it is included to prove the surrounding
-// dialect-branching rework did not regress it.
-//
-// Every comparison below is against an IN-SESSION NATIVE Exasol oracle: a
-// second query — either a bare literal expression or a literal-reproduced
-// derived table — with NO virtual schema reference, run over the SAME
-// connection, so the comparison is not a tautology. Every oracle SQL string
-// and its expected value has been run against the pinned container
-// (`exasol/docker-db:2025.2.1`) during implementation; see each test's doc
-// comment for the specific verified facts (Exasol's Monday-start ISO-8601
-// week numbering, `REGEXP_LIKE`'s whole-string match semantics, `DBTIMEZONE`
-// defaulting to `EUROPE/BERLIN`, etc.) rather than relying on memory or
-// documentation alone.
+// Dialect-aware rendering in Exasol-parsed wrapper SQL (#209): pre-fix, DataFusion
+// function names reached Exasol and were rejected (42000). The TPC-H-shaped repros are
+// retargeted onto `events`/`typed_distinct_probe`, each compared with an in-session
+// native oracle.
 
-/// Parse a `SELECT SYSTIMESTAMP` value read back from Exasol into a
-/// `chrono::NaiveDateTime`.
-///
-/// Exasol renders this as `"<date> <time>.<6-digit microseconds>"` —
-/// space-separated, microsecond precision (empirically observed against the
-/// pinned container: e.g. `"2026-07-28 18:56:00.581000"`). The separator is
-/// normalized to `T` before parsing; the fractional-seconds format specifier
-/// (`%.f`) accepts any digit count, including none at all (e.g.
-/// `"2024-01-01T00:00:00"`), so a single format string covers every shape
-/// this function's caller produces.
+/// `%.f` accepts any fractional digit count, including none.
 fn parse_exasol_timestamp(s: &str) -> chrono::NaiveDateTime {
     let normalized = s.replacen(' ', "T", 1);
     let fmt = "%Y-%m-%dT%H:%M:%S%.f";
@@ -3556,9 +2637,6 @@ fn parse_exasol_timestamp_accepts_space_and_t_separators_with_or_without_fractio
     );
 }
 
-/// Parse a JSON result value as an `Option<i64>`: `Value::Null` maps to
-/// `None`; every other value goes through [`parse_int`] (numeric or
-/// string-encoded integer).
 fn parse_int_opt(v: &serde_json::Value) -> Option<i64> {
     if v.is_null() {
         None
@@ -3567,10 +2645,6 @@ fn parse_int_opt(v: &serde_json::Value) -> Option<i64> {
     }
 }
 
-/// Collect column-major `(group_col, value_col)` data into a map keyed by a
-/// stable string label for the group (`"true"`/`"false"`/`"NULL"` for a
-/// `BOOLEAN` grouping column), so comparing a VS query's grouped result to a
-/// native oracle's does not depend on either query's row order.
 fn grouped_by_label<T>(
     keys: &[serde_json::Value],
     values: &[serde_json::Value],
@@ -3589,22 +2663,7 @@ fn grouped_by_label<T>(
         .collect()
 }
 
-/// `COUNT(DISTINCT SIGN(c_price - 3))` compiles and matches an in-session
-/// native Exasol oracle (issue #209 repro: `COUNT(DISTINCT
-/// SIGN(c_acctbal))`). Pre-fix, `SIGN` rendered as DataFusion's
-/// `signum(...)` inside the Exasol-parsed qualified single-table wrapper
-/// SQL, so Exasol rejected the whole statement with `function or script
-/// SIGNUM not found` (42000).
-///
-/// Adapted to this stack's seed data (`typed_distinct_probe` has no
-/// `c_acctbal`-shaped column that varies sign): `SIGN(c_price - 3)`
-/// recentres `c_price` around zero. Seed (`common/seed.rs`'s
-/// `typed_probe()`): `c_price` per row = [2,3,NULL,4,2,5,2,3,6,4,NULL,5], so
-/// `c_price - 3` = [-1,0,NULL,1,-1,2,-1,0,3,1,NULL,2] and `SIGN(...)` over
-/// the non-NULL cells takes exactly the three values {-1, 0, 1}.
-/// Independently confirmed against a native in-session oracle over the same
-/// 12 reproduced values (verified against the pinned container: `COUNT(
-/// DISTINCT SIGN(v - 3))` = 3).
+/// Scenario: COUNT(DISTINCT SIGN(c_price - 3)) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_count_distinct_sign_matches_native_oracle() {
     setup_e2e();
@@ -3635,28 +2694,7 @@ fn e2e_count_distinct_sign_matches_native_oracle() {
     );
 }
 
-/// `COUNT(DISTINCT YEAR(...))` and `COUNT(DISTINCT WEEK(...))` both compile
-/// and match in-session native Exasol oracles (issue #209 repro: `COUNT(
-/// DISTINCT YEAR(l_shipdate))`, extended to `WEEK` from the same
-/// field-shortcut date family). Pre-fix, both rendered as DataFusion's
-/// `date_part('YEAR'/'WEEK', ...)` inside the Exasol-parsed qualified
-/// single-table wrapper SQL, so Exasol rejected the statement with
-/// `function or script DATE_PART not found` (42000).
-///
-/// Adapted to this stack's seed data (`events` has no `l_shipdate`-shaped
-/// column): `event_date` over the 20-row `events` table (`vs_table()`).
-/// Seed (this file's own header comment): `event_date` = 2024-01-01 +
-/// (id-1) days, id=1..20, spanning 2024-01-01..2024-01-20 with no NULLs.
-/// Every date falls in calendar year 2024, so `COUNT(DISTINCT
-/// YEAR(event_date))` = 1 — a trivial but still load-bearing check (a
-/// regressed build hard-fails before returning any row at all, rather than
-/// returning a wrong count). The span crosses two ISO-8601 week boundaries
-/// (2024-01-01 is a Monday, verified against the pinned container via
-/// `TO_CHAR(DATE '2024-01-01', 'IW')` = `"01"`): week 1 = Jan 1-7, week 2 =
-/// Jan 8-14, week 3 = Jan 15-21, so `COUNT(DISTINCT WEEK(event_date))` = 3.
-/// Both counts are independently confirmed against a native in-session
-/// oracle that reproduces the same 20-day span via `CONNECT BY LEVEL <= 20`
-/// (verified against the pinned container).
+/// Scenario: COUNT(DISTINCT YEAR(...)) and COUNT(DISTINCT WEEK(...)) compile and match native oracles (#209)
 #[test]
 fn e2e_count_distinct_date_field_matches_native_oracle() {
     setup_e2e();
@@ -3704,20 +2742,7 @@ fn e2e_count_distinct_date_field_matches_native_oracle() {
     );
 }
 
-/// `COUNT(DISTINCT HOURS_BETWEEN(...))` compiles and matches an in-session
-/// native Exasol oracle (issue #209 repro: the `HOURS_BETWEEN` family
-/// shipped in `add-date-arithmetic-pushdown`). Pre-fix, `HOURS_BETWEEN`
-/// rendered as DataFusion's `date_part('epoch', ...)` arithmetic inside the
-/// Exasol-parsed qualified single-table wrapper SQL, so Exasol rejected the
-/// statement with `function or script DATE_PART not found` (42000).
-///
-/// Uses `events` (`vs_table()`, 20 rows). Seed (this file's own header
-/// comment): `event_ts` = 2024-01-01T00:00:00Z + (id-1) hours, id=1..20, so
-/// `HOURS_BETWEEN(event_ts, TIMESTAMP '2024-01-01 00:00:00')` yields the
-/// integer hour offsets 0..19 — 20 distinct values, no NULLs, no collisions.
-/// Independently confirmed against a native in-session oracle that
-/// reproduces the same 20 offsets via `CONNECT BY LEVEL <= 20` and interval
-/// arithmetic (verified against the pinned container).
+/// Scenario: COUNT(DISTINCT HOURS_BETWEEN(...)) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_count_distinct_hours_between_matches_native_oracle() {
     setup_e2e();
@@ -3747,21 +2772,7 @@ fn e2e_count_distinct_hours_between_matches_native_oracle() {
     );
 }
 
-/// `COUNT(DISTINCT INSTR(c_varchar, 'a'))` compiles and matches an
-/// in-session native Exasol oracle (issue #209 repro: `COUNT(DISTINCT
-/// INSTR(...))`). Unlike the other tests in this section, this is a #210
-/// REGRESSION GUARD, not a new-failure repro: `INSTR` already had an
-/// Exasol-verbatim rendering arm before this plan (#210), so this query
-/// already passed pre-fix; it is included to prove the surrounding
-/// dialect-branching rework did not regress it.
-///
-/// Seed (`common/seed.rs`'s `typed_probe()`): `c_varchar` per row = ["aa",
-/// "AA", NULL, "bb", "aa", "cc", "Aa", "dd", "BB", NULL, "ee", "cc"].
-/// `INSTR(v, 'a')` (case-sensitive) = [1, 0, NULL, 0, 1, 0, 2, 0, 0, NULL, 0,
-/// 0] — the position of the first lowercase `'a'`, or 0 if absent. Distinct
-/// non-NULL values: {0, 1, 2} = 3. Independently confirmed against a native
-/// in-session oracle over the same 12 reproduced values (verified against
-/// the pinned container).
+/// Scenario: COUNT(DISTINCT INSTR(c_varchar, 'a')) still matches the native oracle after the dialect rework (#210)
 #[test]
 fn e2e_count_distinct_instr_matches_native_oracle() {
     setup_e2e();
@@ -3792,23 +2803,7 @@ fn e2e_count_distinct_instr_matches_native_oracle() {
     );
 }
 
-/// A grouped scalar-over-aggregate `SIGN(SUM(...) - <const>)` compiles and
-/// matches an in-session native Exasol oracle (issue #209 repro: grouped
-/// `SIGN(SUM(l_discount) - 0.5)`). Pre-fix, `SIGN` rendered as DataFusion's
-/// `signum(...)` inside the Exasol-parsed merge SQL, so Exasol rejected the
-/// whole statement with `function or script SIGNUM not found` (42000).
-///
-/// Adapted to this stack's seed data (`typed_distinct_probe` has no
-/// `l_discount`-shaped column): grouped by `c_bool`, `SIGN(SUM(c_price) -
-/// 10)`. Seed (`common/seed.rs`'s `typed_probe()`): `c_price` per row =
-/// [2,3,NULL,4,2,5,2,3,6,4,NULL,5]; `c_bool` per row =
-/// [T,T,NULL,F,T,T,T,F,T,NULL,T,T]. Grouped `SUM(c_price)`: TRUE group =
-/// 2+3+2+5+2+6+5 = 25 (id 11's NULL price excluded), FALSE group = 4+3 = 7,
-/// NULL group = 4 (id 3's NULL price excluded; id 10 contributes 4).
-/// `SIGN(SUM - 10)`: TRUE -> `SIGN(15)` = 1, FALSE -> `SIGN(-3)` = -1, NULL
-/// -> `SIGN(-6)` = -1. Independently confirmed against a native in-session
-/// oracle over the same 12 reproduced (bool, price) pairs (verified against
-/// the pinned container).
+/// Scenario: grouped SIGN(SUM(c_price) - 10) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_grouped_scalar_over_aggregate_sign_matches_native_oracle() {
     setup_e2e();
@@ -3850,24 +2845,7 @@ fn e2e_grouped_scalar_over_aggregate_sign_matches_native_oracle() {
     );
 }
 
-/// A grouped scalar-over-aggregate `YEAR(MIN(...))` compiles and matches an
-/// in-session native Exasol oracle (issue #209 repro: grouped
-/// `YEAR(MIN(...))`). Pre-fix, `YEAR` rendered as DataFusion's
-/// `date_part('YEAR', ...)` inside the Exasol-parsed merge SQL, so Exasol
-/// rejected the whole statement with `function or script DATE_PART not
-/// found` (42000).
-///
-/// Grouped by `c_bool` over `typed_distinct_probe`, `YEAR(MIN(c_ts))`. Seed
-/// (`common/seed.rs`'s `typed_probe()`): `c_ts` millisecond offsets per row =
-/// [100,200,NULL,300,100,400,100,500,200,NULL,600,300]; `c_bool` per row =
-/// [T,T,NULL,F,T,T,T,F,T,NULL,T,T]. Grouped `MIN(c_ts)`: the TRUE group's
-/// minimum offset is 100ms (2024-01-01 00:00:00.100) -> `YEAR` = 2024; the
-/// FALSE group's minimum is 300ms -> `YEAR` = 2024; the NULL-`c_bool` group
-/// (ids 3 and 10) has `c_ts` NULL on BOTH its rows, so `MIN(c_ts)` = NULL and
-/// `YEAR(NULL)` = NULL — a deliberate null-propagation edge case.
-/// Independently confirmed against a native in-session oracle over the same
-/// 12 reproduced (bool, timestamp) pairs (verified against the pinned
-/// container).
+/// Scenario: grouped YEAR(MIN(c_ts)) compiles and matches the native oracle, including a NULL group (#209)
 #[test]
 fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
     setup_e2e();
@@ -3914,32 +2892,7 @@ fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
     );
 }
 
-/// A select-list `REGEXP_LIKE` inside `COUNT(DISTINCT ...)` compiles and
-/// matches an in-session native Exasol oracle (issue #209 repro: `SELECT
-/// COUNT(DISTINCT (c_name REGEXP_LIKE '^C')) FROM <vs>.CUSTOMER WHERE
-/// c_custkey <= 10000`). Pre-fix, the infix `REGEXP_LIKE` predicate rendered
-/// as DataFusion's `regexp_like(...)` function call inside the Exasol-parsed
-/// qualified single-table wrapper SQL, so Exasol rejected the statement with
-/// `syntax error, unexpected REGEXP_LIKE_` (42000).
-///
-/// The predicate MUST sit in the SELECT LIST, not the WHERE clause: a
-/// WHERE-clause `REGEXP_LIKE` is applied inside the scan by
-/// `build_qualified_single_table_fallback_sql`, rendered through the
-/// DataFusion trio, and never reaches the Exasol dialect at all — so it
-/// would pass identically with or without this plan's fix (plan
-/// `Verification` section).
-///
-/// Exasol's infix `REGEXP_LIKE` requires the WHOLE string to match the
-/// pattern (verified against the pinned container: `'aa' REGEXP_LIKE 'a'` =
-/// `false`, `'aa' REGEXP_LIKE 'a.*'` = `true`), so the pattern below is
-/// `'a.*'`, not a bare prefix anchor. Seed (`common/seed.rs`'s
-/// `typed_probe()`): `c_varchar` per row = ["aa", "AA", NULL, "bb", "aa",
-/// "cc", "Aa", "dd", "BB", NULL, "ee", "cc"]. Only the two `"aa"` rows
-/// (case-sensitive) match `'a.*'`; every other non-NULL value does not, so
-/// `COUNT(DISTINCT (c_varchar REGEXP_LIKE 'a.*'))` exercises both TRUE and
-/// FALSE = 2 distinct values. Independently confirmed against a native
-/// in-session oracle over the same 12 reproduced values (verified against
-/// the pinned container).
+/// Scenario: a select-list REGEXP_LIKE inside COUNT(DISTINCT ...) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_count_distinct_regexp_like_matches_native_oracle() {
     setup_e2e();
@@ -3971,24 +2924,7 @@ fn e2e_count_distinct_regexp_like_matches_native_oracle() {
     );
 }
 
-/// A `CASE WHEN <col> > TIMESTAMP '<literal>' ...` comparison inside
-/// `COUNT(DISTINCT ...)` compiles and matches an in-session native Exasol
-/// oracle (issue #209 repro: `SELECT COUNT(DISTINCT CASE WHEN event_ts >
-/// TIMESTAMP '2020-01-01 00:00:00' THEN 1 ELSE 0 END) FROM
-/// <vs>.<typed_table>`). Pre-fix, the timestamp literal rendered with an
-/// explicit UTC offset via DataFusion's `arrow_cast(...)` inside the
-/// Exasol-parsed qualified single-table wrapper SQL, so Exasol rejected the
-/// statement with `function or script ARROW_CAST not found` (42000).
-///
-/// Seed (`common/seed.rs`'s `typed_probe()`): `c_ts` millisecond offsets per
-/// row = [100,200,NULL,300,100,400,100,500,200,NULL,600,300], all within
-/// 2024-01-01, so every non-NULL value is well after 2020-01-01 (`CASE`
-/// evaluates to 1). A NULL `c_ts` makes the `>` comparison unknown, so the
-/// `CASE` falls through to `ELSE 0` rather than propagating NULL — the two
-/// NULL rows (ids 3 and 10) therefore evaluate to 0, giving exactly the two
-/// distinct values {0, 1}. Independently confirmed against a native
-/// in-session oracle over the same 12 reproduced values (verified against
-/// the pinned container).
+/// Scenario: a CASE with a TIMESTAMP literal comparison inside COUNT(DISTINCT ...) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
     setup_e2e();
@@ -4029,46 +2965,13 @@ fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
     );
 }
 
-/// The now-family withdrawal (`CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`,
-/// `SYSTIMESTAMP`) is correct: a select-list `SYSTIMESTAMP` over the virtual
-/// table is statement-constant and reflects Exasol's own `DBTIMEZONE`-zoned
-/// clock, rather than a scan-side `now()` evaluated once per shard in an
-/// unstated zone. `SYSTIMESTAMP` (not `CURRENT_TIMESTAMP`) is the probe
-/// because `CURRENT_TIMESTAMP` is declared `TIMESTAMP(3) WITH LOCAL TIME
-/// ZONE`, which fails `is_valid_emits_output_type`
-/// (`adapter/pushdown/support.rs:1016-1018`) and so never emits a pushed
-/// scan projection at all — it cannot show the defect either way.
-/// `SYSTIMESTAMP` is declared plain `TIMESTAMP(3)` and passes that gate.
-///
-/// Three assertions, per the plan:
-///
-/// (a) Precondition: `DBTIMEZONE` must not be `UTC` (read via `SELECT
-/// DBTIMEZONE`), or the offset comparison below is vacuous. The pinned
-/// container defaults to `EUROPE/BERLIN` (verified live); this MUST FAIL,
-/// not skip, if the zone is ever `UTC`.
-///
-/// (b) `SELECT SYSTIMESTAMP FROM <vs>.typed_distinct_probe` (2 data files,
-/// `TYPED_FILE_SPLIT`) returns exactly ONE distinct value across all rows —
-/// the statement-constancy Exasol guarantees. Pre-withdrawal this returned
-/// one distinct value PER SHARD, measured as two over this two-file table,
-/// because each UDF invocation evaluated `now()` independently.
-///
-/// (c) That single value is within 60 seconds of an in-session NATIVE
-/// Exasol oracle — a bare `SELECT SYSTIMESTAMP`, with NO virtual schema
-/// reference, run on the SAME connection. A 60s tolerance is deliberately
-/// loose: the two statements execute at different instants, while the
-/// defect this catches is a whole-zone offset of one hour or more. Exact
-/// equality is NOT asserted, and the probe is deliberately NOT a
-/// pure-constant predicate (e.g. `WHERE CURRENT_TIMESTAMP > TIMESTAMP
-/// '<t>'`) — Exasol constant-folds such a predicate before building the
-/// pushdown request, so nothing would be pushed and the test would pass in
-/// both states.
+/// Scenario: a select-list SYSTIMESTAMP is statement-constant across shards and matches Exasol's DBTIMEZONE clock
 #[test]
 fn e2e_now_family_matches_native_oracle() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // (a) Precondition.
+    // A UTC DBTIMEZONE would make the offset comparison vacuous.
     let tz_cols = conn.query_columns("SELECT DBTIMEZONE");
     let db_timezone = tz_cols[0][0]
         .as_str()
@@ -4082,7 +2985,6 @@ fn e2e_now_family_matches_native_oracle() {
          {db_timezone:?}"
     );
 
-    // (b) Statement-constancy across shards.
     let vs_sql = format!("SELECT SYSTIMESTAMP FROM {}", vs_typed_table());
     let vs_cols = conn.query_columns(&vs_sql);
     let vs_values: Vec<&str> = vs_cols[0]
@@ -4110,7 +3012,9 @@ fn e2e_now_family_matches_native_oracle() {
     );
     let vs_ts = parse_exasol_timestamp(vs_values[0]);
 
-    // (c) Within 60s of an in-session native oracle, same connection.
+    // Loose tolerance: the statements run at different instants, and the defect is a
+    // whole-zone offset of an hour or more. CURRENT_TIMESTAMP is not the probe because its
+    // TIMESTAMP WITH LOCAL TIME ZONE type never emits a pushed projection.
     let oracle_cols = conn.query_columns("SELECT SYSTIMESTAMP");
     let oracle_str = oracle_cols[0][0].as_str().unwrap_or_else(|| {
         panic!(
@@ -4131,35 +3035,10 @@ fn e2e_now_family_matches_native_oracle() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Declined-filter self-apply (#279, `fix-declined-filter-self-apply`): a WHERE
-// predicate the adapter cannot push into the DataFusion scan must still be
-// applied — in the adapter's OWN Exasol-dialect SQL — rather than silently
-// dropped (see CLAUDE.md § "Virtual Schema pushdown delegation"). Before this
-// fix, all three render sites read a declined render as "safe to omit", so
-// every query below returned all 12 seeded rows instead of the filtered
-// subset.
-//
-// Every predicate here is one of the three DECLINE sources the plan verified
-// live against this Docker Exasol stack: `SECOND(ts, 3)` (DataFusion-dialect
-// arity refusal), `LIKE` against a DECIMAL column (`like_subject_type_guard`),
-// and `INSTR` with a 3rd argument (`string_function_arg_type_guard`'s >2-arg
-// decline).
-// ---------------------------------------------------------------------------
+// Declined-filter self-apply (#279): a WHERE predicate the adapter cannot push into the
+// scan must be applied in its own Exasol-dialect SQL, since Exasol never re-applies it.
 
-/// `SECOND(c_ts, 3)` — the 3-argument form with an explicit fractional-seconds
-/// precision — is advertised (`FN_SECOND`) but declines DataFusion rendering
-/// (only the 1-argument form renders; see this plan's
-/// `second_with_precision_declines_for_datafusion_renders_for_exasol` in
-/// `crates/vs-expression`). Every seeded `c_ts` shares the same whole second
-/// (fraction 0), so `SECOND(c_ts, 3) > 1` is false for every row: the correct
-/// answer is 0 rows. Before the fix the whole filter was dropped and all 12
-/// rows came back.
-///
-/// Also asserts the emitted `EXPLAIN VIRTUAL` SQL carries the wrapper's own
-/// `WHERE` (qualified single-table fallback, alias `LHS_T0`) rather than a
-/// scan-spec `"filter"` field — proof the declined predicate is applied in the
-/// adapter's own SQL, not pushed into the DataFusion scan.
+/// Scenario: a declined SECOND(c_ts, 3) filter is applied in the wrapper WHERE and returns 0 rows
 #[test]
 fn e2e_declined_filter_second_arity_returns_filtered_rows() {
     setup_e2e();
@@ -4189,11 +3068,7 @@ fn e2e_declined_filter_second_arity_returns_filtered_rows() {
     );
 }
 
-/// `LIKE` against a `DECIMAL` column declines (`like_subject_type_guard`)
-/// rather than being pushed into the DataFusion scan. Per `common/seed.rs`'s
-/// `typed_probe()`, `c_decimal_a`'s unscaled value is `1050` (-> `"10.50"`)
-/// for ids 1, 5, and 7 only; every other row's `c_decimal_a` renders with a
-/// different leading digit or is NULL. Before the fix all 12 rows came back.
+/// Scenario: a declined LIKE over a DECIMAL column is self-applied and returns ids 1, 5, 7
 #[test]
 fn e2e_declined_filter_like_on_decimal_returns_filtered_rows() {
     setup_e2e();
@@ -4214,20 +3089,7 @@ fn e2e_declined_filter_like_on_decimal_returns_filtered_rows() {
     );
 }
 
-/// `INSTR` with a 3rd (start-position) argument declines
-/// (`string_function_arg_type_guard`'s >2-arg refusal) rather than being
-/// coerced down to a 2-argument DataFusion `strpos`, which would silently
-/// ignore the start position.
-///
-/// Per `common/seed.rs`'s `typed_probe()`, `c_varchar` values are: id1="aa",
-/// id2="AA", id3=NULL, id4="bb", id5="aa", id6="cc", id7="Aa", id8="dd",
-/// id9="BB", id10=NULL, id11="ee", id12="cc". `INSTR` is case-sensitive, so
-/// `INSTR(c_varchar, 'a', 2)` is nonzero only for ids 1, 5, 7 (each has a
-/// lowercase `'a'` at or after position 2) and NULL for ids 3, 10 (excluded
-/// by `= 0`); every other id is exactly 0. Confirmed against Exasol's own
-/// `INSTR` evaluation via the already-correct SELECT-list expression pushdown
-/// (unrelated to this plan's WHERE-clause fix). Before the fix all 12 rows
-/// came back for the WHERE-clause shape below.
+/// Scenario: a declined three-argument INSTR filter is self-applied instead of truncated to strpos
 #[test]
 fn e2e_declined_filter_instr_three_arg_returns_filtered_rows() {
     setup_e2e();
@@ -4248,10 +3110,7 @@ fn e2e_declined_filter_instr_three_arg_returns_filtered_rows() {
     );
 }
 
-/// A declined filter is applied BEFORE aggregation, not after — `COUNT(*)`
-/// over the LIKE-decline predicate (ids 1, 5, 7) must be 3, not 12. If the
-/// self-applied `WHERE` were instead wrapped AROUND an unfiltered aggregate
-/// (or omitted entirely), this would count all 12 rows.
+/// Scenario: a declined filter applies before aggregation, so COUNT(*) is 3, not 12
 #[test]
 fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
     setup_e2e();
@@ -4268,11 +3127,7 @@ fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
     );
 }
 
-/// A declined filter is applied BEFORE `ORDER BY … LIMIT` truncation, not
-/// after. The LIKE-decline predicate matches ids 1, 5, 7 (in ascending
-/// order); `LIMIT 2` must return `[1, 5]`. A build that truncated the
-/// UNFILTERED 12-row set first would instead return `[1, 2]` — the first two
-/// ids overall, not the first two MATCHING ids.
+/// Scenario: a declined filter applies before ORDER BY … LIMIT truncation
 #[test]
 fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     setup_e2e();
@@ -4293,21 +3148,7 @@ fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     );
 }
 
-/// `SELECT * … WHERE SECOND(C_TS, 3) > 1` — a genuine `SELECT *` (absent
-/// `selectList`) over a declined filter — must return the FULL base row
-/// (every one of the 10 `typed_distinct_probe` columns, in order) and the
-/// correct 0 rows, with NO `04000` "Expected number of columns" positional
-/// error. The qualified wrapper's inner projection is normally narrowed to
-/// only the columns the rendered clauses NAME (`referenced_column_projection`);
-/// for a genuine `SELECT *` that narrowed set would be the filter's columns
-/// alone (`C_TS`), which Exasol would reject positionally against the base
-/// row's 10 real columns. The projection-override fix (task 2.5) must instead
-/// project every `col_types` column, in order, for this shape.
-///
-/// Uses the raw `resultSet` metadata (`numColumns`/`numRows`), not
-/// `query_columns`, which returns an empty vec for any zero-row result and so
-/// cannot observe the column count of zero rows (see
-/// `e2e_all_files_pruned_literal_projection_empty_shape` above).
+/// Scenario: SELECT * over a declined filter returns the full base row with no column-count error
 #[test]
 fn e2e_declined_filter_select_star_returns_full_row_shape() {
     setup_e2e();
@@ -4317,9 +3158,7 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
         "SELECT * FROM {} WHERE SECOND(C_TS, 3) > 1",
         vs_typed_table()
     );
-    // `execute` panics on a rejected pushdown (e.g. a `04000` column-count
-    // mismatch), so reaching the assertions below already proves Exasol
-    // accepted the full-base-row shape.
+    // `execute` panics on a rejected pushdown, so reaching here proves Exasol accepted it.
     let resp = conn.execute(&sql);
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let num_columns = result_set["numColumns"]
@@ -4340,21 +3179,7 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
     );
 }
 
-/// A WHERE predicate carrying an advertised `FN_CAST` to a target refused in
-/// BOTH dialects (`HASHTYPE` — see `render_cast_target` in
-/// `crates/vs-expression/src/lib.rs`, which has no HASHTYPE/INTERVAL/GEOMETRY
-/// arm in either the Exasol or DataFusion branch) reaches the adapter — the
-/// RHS is a valid `HASHTYPE` literal so Exasol's own parser accepts and does
-/// not constant-fold away the predicate before pushdown (confirmed live via
-/// `EXPLAIN VIRTUAL`: the pushdown request carries a `predicate_equal` node
-/// whose left side is `CAST(C_VARCHAR AS HASHTYPE)`). Neither dialect can
-/// render that CAST, so the adapter must return a clean error naming the
-/// unrenderable predicate — not the wrong-rows defect this plan fixes, and
-/// not a query that runs to completion.
-///
-/// The error must also carry no credential leakage: the storage credentials
-/// (`minioadmin`/`minioadmin`, the seeded MinIO access/secret key) must never
-/// appear in the adapter's error text.
+/// Scenario: a CAST to HASHTYPE refused by both dialects fails with a clean error that leaks no credentials
 #[test]
 fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
     setup_e2e();
@@ -4383,46 +3208,14 @@ fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// #192 CHAR-declared pushdown shapes (fix-192-char-type-pushdown, Task 8)
-// ---------------------------------------------------------------------------
+// #192: CHAR-declared pushdown shapes.
 
-/// The four #192 CHAR-declared pushdown shapes over `events` all return rows
-/// — never Exasol's "data type mismatch" error — with correct values.
-///
-/// #192: Exasol infers `CHAR(n)` (not `VARCHAR(n)`) for a value whose every
-/// possible branch/literal has the SAME length — an equal-length
-/// CASE-of-string-literals expression, a `CAST(... AS CHAR(n))`, and a bare
-/// string literal used as a GROUP BY key all hit this. Before the fix,
-/// `exasol_type_from_json` had no arm for the `"char"` JSON type tag Exasol's
-/// pushdown payload sends for these shapes, so the adapter rejected the
-/// pushdown outright.
-///
-/// - Shape A: `CASE WHEN score <= 50.0 THEN 'LOW' ELSE 'BIG' END` (both
-///   branches 3 characters) as a GROUP BY key. Scores are `5*id` for id
-///   1..20, so `score<=50.0` covers id 1..10 (10 rows) and `score>50.0`
-///   covers id 11..20 (10 rows) — an even 10/10 split makes the two-group
-///   result trivial to assert.
-/// - Shape B: `CAST(name AS CHAR(20))` as a plain SELECT-list projection.
-///   `name` values are exactly 8 characters (`event-NN`); Exasol space-pads a
-///   CHAR(20) result to the full declared width, so the value returned for
-///   id=1 must be exactly 20 characters: `"event-01"` plus 12 trailing
-///   spaces.
-/// - Shape C: a bare string literal used as a GROUP BY key
-///   (`SELECT 'X' G, COUNT(*) FROM events GROUP BY 1`) — every one of the 20
-///   rows folds into the single literal group, so exactly one row comes
-///   back: `('X', 20)`.
-/// - VARCHAR control: `GROUP BY name` groups on a genuine VARCHAR column
-///   (every `name` value is unique), so the fix must leave this shape
-///   unaffected — 20 distinct groups, each with count 1 — mirroring the
-///   deliberately unequal-length `'high'`/`'low'` CASE control in
-///   `e2e_selectlist_cast_extract_case_pushdown` above.
+/// Scenario: equal-length CASE keys, CAST AS CHAR(20) and literal GROUP BY keys return correct rows, VARCHAR control unaffected (#192)
 #[test]
 fn char_declared_pushdown_shapes_match_native() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Shape A: equal-length CASE-of-string-literals GROUP BY key.
     let sql = format!(
         "SELECT CASE WHEN score <= 50.0 THEN 'LOW' ELSE 'BIG' END g, COUNT(*) c \
          FROM {} GROUP BY 1 ORDER BY 1",
@@ -4446,9 +3239,7 @@ fn char_declared_pushdown_shapes_match_native() {
         "expected BIG/LOW to each cover 10 rows: {case_groups:?}"
     );
 
-    // Prove the pushdown was actually taken and carries the CHAR(3) declaration
-    // — otherwise this test could still pass if the adapter declined the
-    // pushdown and Exasol computed the CASE key natively.
+    // Assert the pushdown carries CHAR(3); a declined pushdown would pass the value checks.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed_sql.contains("CHAR(3)") && !pushed_sql.contains("VARCHAR(3)"),
@@ -4456,8 +3247,6 @@ fn char_declared_pushdown_shapes_match_native() {
          declare CHAR(3) (not VARCHAR(3)), got: {pushed_sql}"
     );
 
-    // Shape B: CAST(name AS CHAR(20)) as a plain SELECT-list projection —
-    // must be space-padded to exactly 20 characters.
     let sql = format!(
         "SELECT CAST(name AS CHAR(20)) FROM {} WHERE id = 1",
         vs_table()
@@ -4480,9 +3269,7 @@ fn char_declared_pushdown_shapes_match_native() {
         "CAST(name AS CHAR(20)) must be \"event-01\" plus 12 trailing spaces, got {padded:?}"
     );
 
-    // Prove the pushdown was actually taken and carries the CHAR(20)
-    // declaration — otherwise this test could still pass if the adapter
-    // declined the pushdown and Exasol computed the CAST natively.
+    // Assert the pushdown carries CHAR(20); a declined pushdown would pass the value checks.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed_sql.contains("CHAR(20)") && !pushed_sql.contains("VARCHAR(20)"),
@@ -4490,7 +3277,6 @@ fn char_declared_pushdown_shapes_match_native() {
          (not VARCHAR(20)), got: {pushed_sql}"
     );
 
-    // Shape C: a bare string literal used as a GROUP BY key.
     let sql = format!("SELECT 'X' g, COUNT(*) c FROM {} GROUP BY 1", vs_table());
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (g, c): {cols:?}");
@@ -4510,9 +3296,7 @@ fn char_declared_pushdown_shapes_match_native() {
         "expected all 20 rows folded into the single literal group: {cols:?}"
     );
 
-    // Prove the pushdown was actually taken and carries the CHAR(1)
-    // declaration — otherwise this test could still pass if the adapter
-    // declined the pushdown and Exasol folded the literal group natively.
+    // Assert the pushdown carries CHAR(1); a declined pushdown would pass the value checks.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed_sql.contains("CHAR(1)") && !pushed_sql.contains("VARCHAR(1)"),
@@ -4520,7 +3304,6 @@ fn char_declared_pushdown_shapes_match_native() {
          CHAR(1) (not VARCHAR(1)), got: {pushed_sql}"
     );
 
-    // VARCHAR control: GROUP BY a genuine VARCHAR column — behavior unchanged.
     let sql = format!("SELECT name, COUNT(*) c FROM {} GROUP BY 1", vs_table());
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (name, c): {cols:?}");
@@ -4538,15 +3321,7 @@ fn char_declared_pushdown_shapes_match_native() {
     }
 }
 
-/// The `char_pad_probe` table (Task 7) isolates the CHAR(n) blank-pad merge
-/// behavior for GROUP BY keys: `'ab'` and `'ab   '` differ only in trailing
-/// spaces already present in the source data, and a `CHAR(30)` cast — wide
-/// enough to fit every seeded value, including the 25-character over-length
-/// row — must blank-pad both to the same width and merge them into ONE
-/// group, exactly as native Exasol's CHAR comparison semantics would (SQL
-/// CHAR-to-CHAR comparison ignores trailing blanks). `CHAR(30)` isolates
-/// this merge behavior from the truncation behavior exercised by the next
-/// two tests.
+/// Scenario: a CHAR(30) cast blank-pads 'ab' and 'ab   ' into one GROUP BY group
 #[test]
 fn char_group_key_merges_trailing_space_variants_like_native() {
     setup_e2e();
@@ -4557,10 +3332,7 @@ fn char_group_key_merges_trailing_space_variants_like_native() {
         vs_char_pad_table()
     );
 
-    // Prove the pushdown was actually taken and carries the CHAR(30)
-    // declaration — otherwise native Exasol would perform the same blank-pad
-    // merge if the adapter simply declined the pushdown, and the group-count
-    // assertions below could not tell the two apart.
+    // Assert the pushdown carries CHAR(30); native Exasol would merge the same way.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed_sql.contains("CHAR(30)") && !pushed_sql.contains("VARCHAR(30)"),
@@ -4621,22 +3393,7 @@ fn char_group_key_merges_trailing_space_variants_like_native() {
     );
 }
 
-/// `CHAR(20)` is over-length for the 25-character seeded value: Exasol's
-/// pad/width semantics must raise a truncation error rather than silently
-/// truncating the value into a wrong, merged group — proving Task 6's
-/// non-truncating group-key pad surfaces width violations as errors, exactly
-/// like a native Exasol `CHAR(20)` column would, rather than ever computing a
-/// silently wrong result.
-///
-/// Live-verified sqlCode is `22002` ("VM error: data exception - string data,
-/// right truncation"), not the `22001` a native `CAST(<over-length> AS
-/// CHAR(n))` raises directly in Exasol's core engine: this pushdown's
-/// truncation is caught at the outer merge wrapper's own
-/// `CAST("GK_0" AS CHAR(20))`, which Exasol's engine reports through the
-/// UDF/VM error path rather than the plain parser path. Same failure class
-/// (clean rejection, never a silently truncated/merged result), different
-/// sqlCode — the divergence the plan's spec (`vs-adapter/pushdown-planning-char-type-declaration`)
-/// already flags as expected between the UDF-emit and native-cast origins.
+/// Scenario: an over-length value under a CHAR(20) group key raises a truncation error (22002) instead of merging
 #[test]
 fn over_length_char_group_key_raises_truncation_error_like_native() {
     setup_e2e();
@@ -4647,10 +3404,7 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
         vs_char_pad_table()
     );
 
-    // Prove the pushdown was actually taken and carries the CHAR declaration —
-    // otherwise native Exasol raises the same class of truncation error when
-    // the adapter simply declines the pushdown, and the assertion below
-    // cannot tell the two apart.
+    // Assert the pushdown carries the CHAR declaration; native Exasol raises the same error class.
     let pushed = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed.contains("CHAR(20)") && !pushed.contains("VARCHAR(20)"),
@@ -4678,20 +3432,7 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
     );
 }
 
-/// The over-length 25-character value also fails cleanly when projected
-/// through `CAST(val AS CHAR(20))` with no GROUP BY — the projection facet,
-/// where the CHAR(20) width is enforced by the raw CAST/emit path (Task 4/5's
-/// `exasol_type_from_json`/`render_cast_target`), not by Task 6's group-key
-/// blank-pad logic. This is the assertion that confirms the Rust SLC's
-/// `emit_batch` Arrow IPC path surfaces the same clean truncation failure the
-/// LUA probe found for a native CHAR(20) column, rather than silently
-/// truncating the value.
-///
-/// Live-verified sqlCode is `22002` ("VM error: data exception - string data,
-/// right truncation: max length: 20, emitted: 25"), raised at the UDF emit
-/// boundary itself (matching the LUA probe's "string too long" origin) —
-/// distinct wording from the group-key test's outer-CAST truncation, but the
-/// same failure class: clean rejection, never a silently truncated value.
+/// Scenario: an over-length value projected through CAST AS CHAR(20) fails with a truncation error at the emit boundary
 #[test]
 fn over_length_char_projection_fails_cleanly() {
     setup_e2e();
@@ -4702,10 +3443,7 @@ fn over_length_char_projection_fails_cleanly() {
         vs_char_pad_table()
     );
 
-    // Prove the pushdown was actually taken and carries the CHAR declaration —
-    // otherwise native Exasol raises the same class of truncation error when
-    // the adapter simply declines the pushdown, and the assertion below
-    // cannot tell the two apart.
+    // Assert the pushdown carries the CHAR declaration; native Exasol raises the same error class.
     let pushed = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed.contains("CHAR(20)") && !pushed.contains("VARCHAR(20)"),
@@ -4733,12 +3471,7 @@ fn over_length_char_projection_fails_cleanly() {
     );
 }
 
-/// `C_DECIMAL_A/7` at `id=6` (`c_decimal_a=40.99`, `DECIMAL(9,2)`) against a
-/// native oracle over the same literal value. Native Exasol's `/` is
-/// `FN_FLOAT_DIV`, always true float division: `40.99/7` =
-/// `5.855714285714286`. Pre-fix, the DataFusion dialect rendered `FLOAT_DIV`
-/// as a bare `/`, which DataFusion coerces `Decimal128/Int64` division to
-/// scale 6, truncating the pushed-down value to `5.855714` (#186).
+/// Scenario: C_DECIMAL_A/7 pushes down as full float division, matching the native oracle (#186)
 #[test]
 fn e2e_float_div_decimal_over_int_matches_native_oracle() {
     setup_e2e();
@@ -4763,12 +3496,7 @@ fn e2e_float_div_decimal_over_int_matches_native_oracle() {
     );
 }
 
-/// `C_DECIMAL_A/C_DECIMAL_B` at `id=6` (`c_decimal_a=40.99` `DECIMAL(9,2)`,
-/// `c_decimal_b=400000.0004` `DECIMAL(20,4)`) against a native oracle over
-/// the same literal values: `40.99/400000.0004` = `0.000102474999897525`.
-/// Pre-fix, the DataFusion dialect's bare `/` coerces `Decimal128/Decimal128`
-/// division to scale 6, truncating the pushed-down value to `0.000102`
-/// (#186).
+/// Scenario: C_DECIMAL_A/C_DECIMAL_B pushes down as full float division, matching the native oracle (#186)
 #[test]
 fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
     setup_e2e();

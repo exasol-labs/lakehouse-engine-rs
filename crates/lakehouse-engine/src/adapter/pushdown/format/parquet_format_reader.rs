@@ -23,7 +23,7 @@ use crate::types::mapping::{arrow_type_to_tag, exasol_type_to_arrow};
 #[path = "parquet_format_reader_tests.rs"]
 mod tests;
 
-/// Reads every directory as raw Parquet (no Iceberg/Delta detection); reuses [`resolve_parquet_directory`] so declared and scanned schemas can't diverge.
+/// Reuses [`resolve_parquet_directory`] so declared and scanned schemas can't diverge.
 pub(super) struct ParquetFormatReader<'a> {
     /// Shared across every leg of the request (one admission limiter).
     pub(super) store: &'a Arc<dyn ObjectStore>,
@@ -75,7 +75,7 @@ impl FormatReader for ParquetFormatReader<'_> {
     }
 }
 
-/// Size comes from the listing response (no extra HEAD or Parquet read); path is encoded relative to the table root, or as an absolute URI if outside it.
+/// Size comes from the listing (no extra HEAD); a path outside the table root stays absolute.
 fn file_entry(file: ParquetFile, prefix: &StorePath, store_root: &str) -> FileEntry {
     let len_hint = file.path.as_ref().len();
     let relative = file
@@ -113,7 +113,7 @@ fn absent_declared_fields(declared_columns: &[(String, String)], schema: &Schema
         .collect()
 }
 
-/// Fields bind by name (identity), like Delta's `none` column-mapping mode; no ordinal field-id is synthesized, to avoid a false `PARQUET:field_id` match.
+/// No ordinal field-id is synthesized: it could falsely match a file's `PARQUET:field_id`.
 fn logical_schema(schema: &Schema) -> Vec<LogicalField> {
     schema
         .fields()
@@ -130,7 +130,8 @@ fn logical_schema(schema: &Schema) -> Vec<LogicalField> {
         .collect()
 }
 
-/// This descriptor's presence selects the JSON renderer for nested columns (declared with the string Arrow tag); without it, a struct/list/map would reach the cast path, which has no string kernel.
+/// Its presence routes nested columns to the JSON renderer; the cast path has no string kernel
+/// for struct/list/map.
 fn nested_members(data_type: &DataType) -> Option<NestedMembers> {
     match data_type {
         DataType::Struct(fields) => Some(NestedMembers::Struct {

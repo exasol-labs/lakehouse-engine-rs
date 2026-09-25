@@ -1,28 +1,3 @@
-//! Integration test for Parquet row-group & page pruning, and for what a
-//! predicate over a JSON-RENDERED NESTED column does to both pruning stages.
-//!
-//! Asserts two things the spec scenario "Scan enables Parquet row-group and
-//! page pruning so the reader skips non-matching data" requires:
-//!   1. The session config the scan UDF builds enables predicate pushdown,
-//!      row-group statistics pruning, and page-index pruning (not the
-//!      DataFusion defaults — `pushdown_filters` defaults OFF).
-//!   2. Pruning narrows what is read, never the result set: a filtered scan
-//!      returns byte-identical rows with pruning ON vs OFF.
-//!
-//! Then two things `datafusion-scan/nested-json-rendering` requires of a
-//! predicate over a list, struct, or map column:
-//!   3. It is EVALUATED, never silently dropped — the wrong-rows bug that
-//!      returned every row while the pushdown was approved against the `utf8`
-//!      logical tag and then dropped against the physical nested type.
-//!   4. No Parquet pruning stage drops the row group that holds the match,
-//!      proven positively against a MULTI-row-group file whose per-group LEAF
-//!      statistics (`min = "hello"`, `max = "world"`) would falsely exclude the
-//!      rendered document `["hello","world"]`.
-//!
-//! Host-runnable: writes a local Parquet file (multiple row groups so row-group
-//! pruning is actually exercisable) and registers it through DataFusion's local
-//! object store — no S3 / MinIO stack required.
-
 mod scan_fixture;
 
 use std::sync::Arc;
@@ -45,8 +20,6 @@ use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-/// Write a Parquet file with several small row groups (so row-group statistics
-/// pruning has something to skip) and return its `file://` URL.
 fn write_local_parquet(dir: &std::path::Path) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -56,9 +29,6 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
     let path = dir.join("pruning_data.parquet");
     let file = std::fs::File::create(&path).expect("create parquet file");
 
-    // Small row groups: 100 rows each, ids monotonically increasing, so each
-    // row group's id min/max are tight and disjoint — exactly what row-group
-    // statistics pruning skips when a predicate excludes a group's range.
     let props = WriterProperties::builder()
         .set_max_row_group_row_count(Some(100))
         .build();
@@ -83,8 +53,6 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Build a ScanSpec for a single local file with a filter that excludes most
-/// row groups (id range 0..1000, predicate keeps only 200..=399).
 fn pruning_spec(file_url: String) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
         .map(|m| m.len())
@@ -130,9 +98,7 @@ async fn collect_rows(
             .as_any()
             .downcast_ref::<Int64Array>()
             .expect("col 0 Int64");
-        // DataFusion 54's Parquet reader defaults `schema_force_view_types=true`,
-        // so the string column arrives as Utf8View on the raw-scan plan (the
-        // production emit path coerces it to Utf8 later). Accept either.
+        // `schema_force_view_types` defaults on, so strings may arrive as Utf8View.
         let name_col = batch.column(1);
         let name_at: Box<dyn Fn(usize) -> String> =
             if let Some(v) = name_col.as_any().downcast_ref::<StringViewArray>() {
@@ -160,7 +126,6 @@ async fn scan_enables_rowgroup_and_page_pruning() {
     let file_url = write_local_parquet(&dir);
     let spec = pruning_spec(file_url.clone());
 
-    // 1. The flags the scan UDF sets are the pruning flags, not the defaults.
     let on = session_config_for_spec(&spec);
     let parquet = &on.options().execution.parquet;
     assert!(parquet.pruning, "row-group statistics pruning must be ON");
@@ -170,9 +135,6 @@ async fn scan_enables_rowgroup_and_page_pruning() {
         "predicate pushdown must be ON (DataFusion defaults it off)"
     );
 
-    // 2. Result parity: the same filtered scan with pruning explicitly DISABLED
-    //    must produce the identical row set. Pruning changes what is read, not
-    //    what is returned.
     let off = SessionConfig::new()
         .with_information_schema(false)
         .with_target_partitions(1)
@@ -188,7 +150,6 @@ async fn scan_enables_rowgroup_and_page_pruning() {
         rows_on, rows_off,
         "pruning must not change the result set (read-narrowing only)"
     );
-    // The predicate keeps ids 200..=399 → exactly 200 rows.
     assert_eq!(rows_on.len(), 200, "predicate must keep exactly 200 rows");
     assert_eq!(rows_on.first().unwrap().0, 200);
     assert_eq!(rows_on.last().unwrap().0, 399);
@@ -196,17 +157,9 @@ async fn scan_enables_rowgroup_and_page_pruning() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Write a Parquet file carrying `id: Int64` and `tags: List<Utf8>`, one row per
-/// row group so each group's leaf statistics describe exactly one document.
-///
-/// Row 1's tags are `["hello", "world"]`, so its row group's LEAF statistics are
-/// `min = "hello"`, `max = "world"` — the shape that would falsely exclude the
-/// rendered document `["hello","world"]` under a min/max range check, because
-/// `[` (0x5B) sorts below `h` (0x68).
-///
-/// Page-level statistics and a bloom filter are written too, so the page-index and
-/// bloom-filter pruning stages have real input and their zero-pruned results are
-/// evidence about the predicate rather than about a missing index.
+/// Row 1's leaf stats are `min = "hello"`, `max = "world"`, which a min/max check would use to
+/// falsely exclude the rendered `["hello","world"]` (`[` sorts below `h`). Page stats and a
+/// bloom filter are written so zero-pruned results are evidence, not a missing index.
 fn write_nested_parquet(dir: &std::path::Path, rows_per_group: usize) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -249,9 +202,6 @@ fn write_nested_parquet(dir: &std::path::Path, rows_per_group: usize) -> String 
         .to_string()
 }
 
-/// A spec over the nested fixture whose logical schema declares `tags` as the
-/// `utf8` tag every list, struct, and map column carries, with the nested member
-/// descriptor a `list<string>` produces. Both fields bind by identity.
 fn nested_spec(file_url: String, filter: &str) -> ScanSpec {
     let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
         .map(|m| m.len())
@@ -290,8 +240,6 @@ fn nested_spec(file_url: String, filter: &str) -> ScanSpec {
     }
 }
 
-/// Run one nested-column scan through the production registration seam and
-/// return both the `(id, rendered tags)` rows and the executed plan.
 async fn run_nested_scan(spec: &ScanSpec) -> (Vec<(i64, String)>, Arc<dyn ExecutionPlan>) {
     let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
     ctx.runtime_env().register_object_store(
@@ -340,13 +288,7 @@ async fn run_nested_scan(spec: &ScanSpec) -> (Vec<(i64, String)>, Arc<dyn Execut
     (rows, plan)
 }
 
-/// One Parquet pruning metric's pruned count summed across the executed plan, or
-/// `None` when no node reports a metric under that name at all.
-///
-/// An ABSENT metric and a metric reporting zero are different answers and only the
-/// second is evidence: were DataFusion to rename a stage's metric, a summing
-/// function that folded both into `0` would turn every zero-pruned assertion into a
-/// silent no-op.
+/// `None` when no node reports the metric: a renamed metric must not read as zero pruned.
 fn sum_pruned(plan: &dyn ExecutionPlan, metric_name: &str) -> Option<usize> {
     let mut total: Option<usize> = None;
     if let Some(metrics) = plan.metrics() {
@@ -369,12 +311,8 @@ fn sum_pruned(plan: &dyn ExecutionPlan, metric_name: &str) -> Option<usize> {
     total
 }
 
-/// What one row group's leaf column chunk carries in the footer: the min/max bounds
-/// a range check would read, and whether the page index and bloom filter the two
-/// other pruning stages consume were written at all.
-///
-/// A stage whose input is absent from the file prunes nothing no matter what the
-/// scan asks of it, so "nothing was pruned" is only evidence once these are true.
+/// A stage whose input is absent from the file prunes nothing, so zero-pruned is only
+/// evidence once these facts hold.
 struct LeafChunkFacts {
     min: String,
     max: String,
@@ -414,12 +352,7 @@ fn leaf_chunk_facts(file_url: &str, row_group: usize, leaf_path: &str) -> LeafCh
     }
 }
 
-/// Scenario "A predicate over a rendered nested column is evaluated, never
-/// silently dropped": DataFusion approves the Parquet row-filter pushdown
-/// against the LOGICAL schema (where the column is `Utf8`, so "supported"),
-/// removes the `FilterExec`, and then drops the conjunct at file open because it
-/// does not match the PHYSICAL nested schema — applying it nowhere and returning
-/// EVERY row. Both assertions here returned wrong rows before the fix.
+/// Scenario: a predicate over a rendered nested column is evaluated, never silently dropped
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn predicate_over_a_rendered_nested_column_is_applied_not_dropped() {
     let dir = std::env::temp_dir().join(format!("lh_nested_pushdown_{}", std::process::id()));
@@ -450,32 +383,13 @@ async fn predicate_over_a_rendered_nested_column_is_applied_not_dropped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario "Every pushdown shape treats a nested column as the VARCHAR Exasol
-/// declared", pruning clause: proven POSITIVELY against a MULTI-row-group file
-/// whose per-group LEAF statistics would falsely exclude the rendered document.
-/// Row 1 sits alone in a row group whose `tags` leaf statistics are
-/// `min = "hello"`, `max = "world"`, and the predicate compares against the
-/// rendered text `["hello","world"]`, which sorts BELOW both — so a min/max range
-/// check over those statistics would conclude the group cannot match and skip the
-/// row that does. That premise is read out of the written footer rather than
-/// asserted in prose, together with the page index and the bloom filter the other
-/// two stages consume — a stage whose input the writer never emitted prunes nothing
-/// for reasons that have nothing to do with this fix.
-///
-/// The second half is what makes the first half evidence rather than an
-/// accident: statistics pruning is left ENABLED for the table, and a PRIMITIVE
-/// predicate over the very same file prunes a row group. So "nothing was pruned"
-/// cannot be read as "the stage never ran" — the stage runs, prunes when it can,
-/// and still cannot prune the rendered nested column. Every stage is required to
-/// REPORT its metric as well as to prune nothing, so a DataFusion rename breaks the
-/// test rather than quietly satisfying it. If a future DataFusion or parquet-rs
-/// release ever did resolve a nested column's leaf statistics into this predicate,
-/// the first half fails loudly rather than silently returning fewer rows.
+/// Scenario: no pruning stage drops a row group holding a rendered nested-column match
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn statistics_pruning_cannot_drop_a_row_group_holding_a_rendered_nested_match() {
+    // The primitive predicate at the end proves statistics pruning is enabled, so the
+    // zero-pruned result is evidence rather than a stage that never ran.
     let dir = std::env::temp_dir().join(format!("lh_nested_pruning_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
-    // One row per row group: row 1's group carries min "hello" / max "world".
     let file_url = write_nested_parquet(&dir, 1);
     let facts = leaf_chunk_facts(&file_url, 0, "tags.list.item");
     assert_eq!(

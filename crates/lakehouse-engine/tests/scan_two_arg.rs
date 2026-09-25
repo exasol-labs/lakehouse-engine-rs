@@ -1,21 +1,3 @@
-//! Integration test for the two-argument scan UDF reconstitution (task 2.3).
-//!
-//! The scan SET UDF now receives its spec across TWO VARCHAR arguments: the
-//! shard-invariant common blob (column 0, serialized once per fan-out) and the
-//! per-shard files JSON array (column 1). `run_scan` reads both via
-//! `ctx.get_string(0)` / `ctx.get_string(1)` and reconstitutes a `ScanSpec`
-//! through [`read_scan_spec`] → `ScanSpec::from_parts_json`.
-//!
-//! This test drives the EXACT production two-argument reconstitution
-//! ([`read_scan_spec`]) against a fake `UdfContext` backed by a local `file://`
-//! Parquet (no S3 / MinIO), then runs the unchanged downstream raw-scan path
-//! ([`run_raw_scan_with_session`]) and asserts the emitted rows are byte-for-byte
-//! identical to the pre-split single-argument path (a whole `ScanSpec` parsed via
-//! `ScanSpec::from_json`). It also pins the NULL-argument contract for BOTH
-//! arguments.
-//!
-//! Host-runnable: no S3 / MinIO stack — the scan registers a `file://` Parquet.
-
 mod scan_fixture;
 
 use std::collections::HashMap;
@@ -37,14 +19,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::WriterProperties;
 
-/// Iceberg reserved field-ids for a positional-delete file's `file_path`/`pos`
-/// columns (mirrors `scan::positional_deletes`'s private constants; duplicated
-/// here since this integration test cannot import a `pub(crate)` item).
+/// Iceberg reserved field-ids; duplicated because the engine's constants are `pub(crate)`.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 
-/// Write a local Parquet file with `rows` rows across small row groups (so the
-/// scan produces several batches) and return its `file://` URL.
 fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -73,15 +51,10 @@ fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> St
         .to_string()
 }
 
-/// The `EMITS` list for the `ID`/`NAME` projection when the adapter declares
-/// `ID` as `DECIMAL(20,0)` — above the engine's integer bins, so `ID` reaches
-/// the emitted batch as a decimal.
 fn id_name_as_decimal() -> Vec<ExaType> {
     vec![scan_fixture::decimal(20, 0), scan_fixture::varchar()]
 }
 
-/// The same projection when the adapter declares `ID` in the engine's `Int64`
-/// bin, so `ID` reaches the emitted batch as an `Int64`.
 fn id_name_as_int64() -> Vec<ExaType> {
     vec![ExaType::Int64, scan_fixture::varchar()]
 }
@@ -109,10 +82,6 @@ fn scan_spec(file_url: String) -> ScanSpec {
     }
 }
 
-/// Run the raw scan for `spec` against a capture-only context (whatever input
-/// columns it carries are irrelevant here — the spec is passed directly), and
-/// return the decoded emitted batches. Models the PRE-SPLIT single-argument
-/// path: the whole spec parsed up front, then the unchanged downstream scan.
 async fn run_with_spec(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![Value::String(spec.to_json())]),
@@ -132,10 +101,6 @@ async fn run_with_spec(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
     ctx.into_batches()
 }
 
-/// Run the raw scan driving the TWO-ARGUMENT reconstitution: feed the common
-/// blob (col 0) and the per-shard files JSON (col 1) through the production
-/// [`read_scan_spec`], then run the unchanged downstream scan over the
-/// reconstituted spec. Returns the decoded emitted batches.
 async fn run_two_arg(common_json: &str, files_json: &str, emits: &[ExaType]) -> Vec<RecordBatch> {
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![
@@ -144,7 +109,6 @@ async fn run_two_arg(common_json: &str, files_json: &str, emits: &[ExaType]) -> 
         ]),
         emits,
     );
-    // Production two-argument reconstitution (the code under test).
     let spec = read_scan_spec(&ctx).expect("reconstitute spec from two args");
     let session = SessionContext::new_with_config(session_config_for_spec(&spec));
     let mut timers = PhaseTimers::start();
@@ -188,17 +152,12 @@ fn ids_of(batches: &[RecordBatch]) -> Vec<i64> {
     out
 }
 
-/// Byte size of a local file, given its `file://` URL.
 fn file_size(file_url: &str) -> u64 {
     std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(file_url))
         .map(|m| m.len())
         .unwrap_or(0)
 }
 
-/// Write a local positional-delete Parquet at `dir/relative`: `file_path`/`pos`
-/// columns tagged with the Iceberg reserved field-ids, one row per
-/// `(referenced_file_abs_url, position)` entry. Returns the file's absolute
-/// `file://` URL.
 fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str, i64)]) -> String {
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
@@ -231,9 +190,6 @@ fn write_delete_parquet(dir: &std::path::Path, relative: &str, entries: &[(&str,
         .to_string()
 }
 
-/// A row-scan `ScanSpec` over `files` (already absolute, `table_root` empty),
-/// with no filter/limit pushdown — a minimal template for tests that only care
-/// about which files/deletes are carried through the two-argument split.
 fn spec_for_files(files: Vec<FileEntry>) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -253,8 +209,7 @@ fn spec_for_files(files: Vec<FileEntry>) -> ScanSpec {
     }
 }
 
-/// The two-argument reconstitution path scans exactly the assigned file and
-/// emits rows byte-for-byte identical to the pre-split single-argument path.
+/// Scenario: the two-argument path emits rows identical to the single-argument path
 #[test]
 fn scan_registers_only_assigned_files_two_arg() {
     let dir = std::env::temp_dir().join(format!("lh_two_arg_{}", std::process::id()));
@@ -262,8 +217,6 @@ fn scan_registers_only_assigned_files_two_arg() {
     let file_url = write_local_parquet(&dir, 200, 64);
     let spec = scan_spec(file_url);
 
-    // Split the spec the way the adapter does: common blob serialized once,
-    // files as a separate JSON array. The common blob must not carry `files`.
     let common_json = spec.to_common_json();
     let files_json = ScanSpec::files_json(&spec.files);
     assert!(
@@ -271,8 +224,6 @@ fn scan_registers_only_assigned_files_two_arg() {
         "common blob must not carry a files key: {common_json}"
     );
 
-    // Reconstituted spec equals the pre-split spec (defense-in-depth vs. the
-    // unit-level round-trip test).
     let reconstituted =
         ScanSpec::from_parts_json(&common_json, &files_json).expect("from_parts_json");
     assert_eq!(
@@ -280,7 +231,6 @@ fn scan_registers_only_assigned_files_two_arg() {
         "two-arg reconstitution must equal spec"
     );
 
-    // Drive both paths against the same local Parquet.
     let single = block_on(run_with_spec(&spec, &id_name_as_decimal()));
     let two_arg = block_on(run_two_arg(
         &common_json,
@@ -288,7 +238,6 @@ fn scan_registers_only_assigned_files_two_arg() {
         &id_name_as_decimal(),
     ));
 
-    // Filter is "ID >= 10" over ids 0..200 → 190 surviving rows.
     assert_eq!(total_rows(&single), 190, "single-arg row count");
     assert_eq!(
         total_rows(&two_arg),
@@ -296,7 +245,6 @@ fn scan_registers_only_assigned_files_two_arg() {
         "two-arg row count must match the filtered file contents"
     );
 
-    // Byte-for-byte identical emitted output: same batch count, same batches.
     assert_eq!(
         two_arg.len(),
         single.len(),
@@ -310,14 +258,12 @@ fn scan_registers_only_assigned_files_two_arg() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A SQL NULL in EITHER argument is a user error — the NULL-handling contract is
-/// preserved for both arguments (mirrors the pre-split single-arg NULL check).
+/// Scenario: a SQL NULL in either argument is a user error
 #[test]
 fn two_arg_null_in_either_argument_is_user_error() {
     let files_json = ScanSpec::files_json(&[FileEntry::new("s3://w/f0.parquet", 0)]);
     let common_json = scan_spec("s3://w/f0.parquet".into()).to_common_json();
 
-    // NULL common blob (col 0).
     let ctx = TestContext::scalar(vec![Value::Null, Value::String(files_json.clone())]);
     let err = read_scan_spec(&ctx).expect_err("NULL common must error");
     assert!(
@@ -325,7 +271,6 @@ fn two_arg_null_in_either_argument_is_user_error() {
         "NULL common must be a user error naming the common arg: {err:?}"
     );
 
-    // NULL files blob (col 1).
     let ctx = TestContext::scalar(vec![Value::String(common_json), Value::Null]);
     let err = read_scan_spec(&ctx).expect_err("NULL files must error");
     assert!(
@@ -334,12 +279,7 @@ fn two_arg_null_in_either_argument_is_user_error() {
     );
 }
 
-/// Scenario (scan-execution): the two-argument reconstitution registers ONLY
-/// the assigned file through the `PositionalDeleteScanTable`/`ParquetSource`
-/// provider that replaced `ListingTable` in `register_files` — no directory
-/// discovery. A second "decoy" file sits in the SAME directory with a
-/// disjoint id range; if the provider ever discovered files itself (rather
-/// than reading exactly the assigned list), the decoy's rows would leak in.
+/// Scenario: only the assigned file is scanned; an unassigned sibling file never leaks in
 #[test]
 fn scan_registers_assigned_files_via_parquet_provider() {
     let dir = std::env::temp_dir().join(format!("lh_provider_{}", std::process::id()));
@@ -348,12 +288,9 @@ fn scan_registers_assigned_files_via_parquet_provider() {
     std::fs::create_dir_all(&assigned_dir).unwrap();
     std::fs::create_dir_all(&decoy_dir).unwrap();
 
-    // Assigned file: ids 0..30. Decoy file (same directory tree, NOT assigned):
-    // ids 10_000..10_500 — a disjoint range that makes any accidental discovery
-    // immediately visible.
     let assigned_url = write_local_parquet(&assigned_dir, 30, 8);
     let decoy_url = write_local_parquet(&decoy_dir, 500, 64);
-    let _ = &decoy_url; // written to disk; deliberately never assigned to the spec.
+    let _ = &decoy_url;
 
     let entry = FileEntry::new(assigned_url.clone(), file_size(&assigned_url));
     let spec = spec_for_files(vec![entry]);
@@ -378,12 +315,7 @@ fn scan_registers_assigned_files_via_parquet_provider() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (reconstitution): a `ScanSpec` whose files carry positional-delete
-/// refs reconstitutes byte-for-byte through the two-argument split
-/// (`to_common_json` + `files_json` → `from_parts_json`), AND the reconstituted
-/// spec's deletes are FUNCTIONALLY enforced when driven through the exact
-/// two-argument scan pipeline the production UDF uses (not merely structurally
-/// equal).
+/// Scenario: positional-delete refs survive the two-argument split and are enforced
 #[test]
 fn spec_reconstitutes_with_delete_entries() {
     let dir = std::env::temp_dir().join(format!("lh_recon_del_{}", std::process::id()));
@@ -409,8 +341,6 @@ fn spec_reconstitutes_with_delete_entries() {
         "per-shard files JSON must carry the delete file: {files_json}"
     );
 
-    // Structural reconstitution: byte-for-byte equal to the pre-split spec,
-    // deletes included.
     let reconstituted =
         ScanSpec::from_parts_json(&common_json, &files_json).expect("from_parts_json");
     assert_eq!(
@@ -423,8 +353,6 @@ fn spec_reconstitutes_with_delete_entries() {
         DeleteMechanism::IcebergPositionalDelete { .. }
     ));
 
-    // Functional reconstitution: driving the two-argument pipeline actually
-    // applies the reconstituted deletes.
     let rows = block_on(run_two_arg(&common_json, &files_json, &id_name_as_int64()));
     assert_eq!(total_rows(&rows), 18, "2 of 20 rows deleted");
     let ids = ids_of(&rows);

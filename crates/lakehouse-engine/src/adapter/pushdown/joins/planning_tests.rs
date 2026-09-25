@@ -6,13 +6,7 @@ use super::super::tests::{
 use super::*;
 use crate::adapter::pushdown::test_support::*;
 
-// ---------------------------------------------------------------------------
-// Join detection: `detect_join` shape classification.
-// ---------------------------------------------------------------------------
-
-/// A genuine two-table inner equi-join is detected as the unified `Join` shape,
-/// with both leaves' original-cased Iceberg identifiers recovered from `TABLE_MAP`
-/// (the two-table case is simply N = 2).
+/// Scenario: A two-table inner equi-join is detected with both identifiers from TABLE_MAP
 #[test]
 fn genuine_inner_equi_join_is_detected_with_both_idents() {
     let request = join_request(Json::Null, equi_condition());
@@ -32,8 +26,7 @@ fn genuine_inner_equi_join_is_detected_with_both_idents() {
     }
 }
 
-/// A plain single-table pushdown request (today's normal case, no `from` field
-/// at all) is `NotAJoin` and completely unaffected by the detector.
+/// Scenario: A request with no from field is not a join
 #[test]
 fn plain_single_table_request_is_not_a_join() {
     let request = nq4_request();
@@ -41,8 +34,7 @@ fn plain_single_table_request_is_not_a_join() {
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
-/// A `from` clause that is a plain table reference (`type: "table"`) is also
-/// `NotAJoin` — the single-table shape some requests carry explicitly.
+/// Scenario: A from clause that is a plain table reference is not a join
 #[test]
 fn from_table_node_is_not_a_join() {
     let mut request = nq4_request();
@@ -51,8 +43,7 @@ fn from_table_node_is_not_a_join() {
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
-/// Left/right/full outer joins are declined as `Ineligible(NotInnerJoinType)`,
-/// never `Eligible` — the broadcast contract advertises only `JOIN_TYPE_INNER`.
+/// Scenario: Outer joins are ineligible
 #[test]
 fn outer_join_is_ineligible() {
     for outer in ["left_outer", "right_outer", "full_outer"] {
@@ -66,10 +57,7 @@ fn outer_join_is_ineligible() {
     }
 }
 
-/// A non-equi two-table inner join (e.g. `<`) is NOT declined — it is served by
-/// the unified fallback, so it yields the `Join` shape carrying both tables and
-/// the (non-equi) condition. Only broadcast (an inner optimization) is gated on
-/// equi; the N-scan fallback renders any inner-join condition into its WHERE.
+/// Scenario: A non-equi two-table inner join is served by the unified fallback
 #[test]
 fn non_equi_two_table_join_is_served_by_unified_fallback() {
     let condition = serde_json::json!({
@@ -87,11 +75,7 @@ fn non_equi_two_table_join_is_served_by_unified_fallback() {
     }
 }
 
-/// A three-table all-inner nested join is classified as the unified `Join` shape
-/// (never an error, never Ineligible): the three leaves in stable tree order and
-/// the two collected join conditions, each leaf's Iceberg ident recovered from
-/// `TABLE_MAP` (pushdown-planning-join "A three-or-more-table inner join falls
-/// back to an N-scan unaccelerated wrapper").
+/// Scenario: A three-table inner join is the unified Join shape
 #[test]
 fn three_table_inner_join_is_unified_join() {
     let request = three_table_join_request();
@@ -112,9 +96,7 @@ fn three_table_inner_join_is_unified_join() {
     }
 }
 
-/// A non-inner join node ANYWHERE in the tree (here the nested left node is a
-/// left outer join) declines as `Ineligible(NotInnerJoinType)` — a cross-join +
-/// conjunctive WHERE cannot reproduce outer-join semantics.
+/// Scenario: A non-inner join node anywhere in the tree is ineligible
 #[test]
 fn non_inner_node_in_join_tree_is_ineligible() {
     let mut request = three_table_join_request();
@@ -126,8 +108,7 @@ fn non_inner_node_in_join_tree_is_ineligible() {
     );
 }
 
-/// A leaf of a multi-table tree absent from `TABLE_MAP` is a hard `Err` (stale
-/// virtual schema), identical to the two-table path — never a silent decline.
+/// Scenario: A multi-table leaf absent from TABLE_MAP is a hard error
 #[test]
 fn multi_table_leaf_absent_from_table_map_is_err() {
     let mut request = three_table_join_request();
@@ -143,10 +124,7 @@ fn multi_table_leaf_absent_from_table_map_is_err() {
     );
 }
 
-/// A four-table all-inner nested join (NQ3 shape: `part⋈partsupp⋈supplier⋈nation`)
-/// is the unified `Join` shape with all four leaves (stable tree order) and the
-/// three collected join conditions — the detector generalizes past N=3, never
-/// capping at three tables.
+/// Scenario: A four-table inner join is the unified Join shape
 #[test]
 fn four_table_inner_join_is_unified_join() {
     let request = nq3_join_request();
@@ -170,10 +148,7 @@ fn four_table_inner_join_is_unified_join() {
     }
 }
 
-/// `detect_join` is driven by the `from` TREE, not the `involvedTables` count:
-/// a two-table `from` yields the unified `Join` shape with exactly those two
-/// tables even when `involvedTables` lists more (the old `TooManyTables`
-/// defensive belt is gone — the tree is authoritative).
+/// Scenario: Detection follows the from tree, not the involvedTables count
 #[test]
 fn detect_join_follows_from_tree_not_involved_tables_count() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -190,9 +165,7 @@ fn detect_join_follows_from_tree_not_involved_tables_count() {
     }
 }
 
-/// An otherwise-eligible join whose virtual table name is absent from
-/// `TABLE_MAP` is a hard `Err` (stale virtual schema), not a decline — the
-/// same treatment the single-table path gives an unmapped involved table.
+/// Scenario: A join whose table is absent from TABLE_MAP is a hard error, not a decline
 #[test]
 fn join_with_unmapped_table_is_an_error() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -206,11 +179,6 @@ fn join_with_unmapped_table_is_an_error() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Leaf-alias retention: `collect_join_tree` keeps each occurrence's `alias`.
-// ---------------------------------------------------------------------------
-
-/// The `(table_name, table_alias)` key of every collected leaf, in tree order.
 fn leaf_keys(join: &DetectedJoin) -> Vec<(&str, Option<&str>)> {
     join.tables
         .iter()
@@ -218,10 +186,7 @@ fn leaf_keys(join: &DetectedJoin) -> Vec<(&str, Option<&str>)> {
         .collect()
 }
 
-/// A two-leg self-join collects TWO leaves sharing one `table_name`, each carrying
-/// its own FROM-tree `alias` — the per-occurrence signal issue #361 lost, which is
-/// what makes the pair `(table_name, table_alias)` injective where the name alone
-/// is not.
+/// Scenario: A two-leg self-join's leaves carry their own aliases
 #[test]
 fn two_leg_self_join_leaves_carry_their_own_aliases() {
     let request = self_join_request(&[Some("A"), Some("B")]);
@@ -237,9 +202,7 @@ fn two_leg_self_join_leaves_carry_their_own_aliases() {
     );
 }
 
-/// A self-join leg the user left unaliased collects `None` — Exasol omits the
-/// `alias` key entirely rather than emitting an empty string, and an alias-less
-/// occurrence is a distinct leg identity, not a missing value.
+/// Scenario: An unaliased self-join leg collects None and stays distinct
 #[test]
 fn unaliased_self_join_leg_collects_none_and_stays_distinct() {
     let request = self_join_request(&[None, Some("B")]);
@@ -250,8 +213,7 @@ fn unaliased_self_join_leg_collects_none_and_stays_distinct() {
     assert_ne!(keys[0], keys[1], "the two legs must remain distinguishable");
 }
 
-/// A quoted mixed-case alias is retained verbatim — no upper- or lower-casing —
-/// so a verbatim comparison against a column node's `tableAlias` matches.
+/// Scenario: A mixed-case leaf alias is retained verbatim
 #[test]
 fn mixed_case_leaf_alias_is_retained_verbatim() {
     let request = self_join_request(&[Some("myAlias"), Some("B")]);
@@ -260,9 +222,7 @@ fn mixed_case_leaf_alias_is_retained_verbatim() {
     assert_eq!(join.tables[0].table_alias.as_deref(), Some("myAlias"));
 }
 
-/// A three-leg left-deep self-join collects one leaf per occurrence, each with its
-/// own alias, at every tree depth — alias retention is not limited to the two-leg
-/// shape.
+/// Scenario: A three-leg left-deep self-join collects one aliased leaf per occurrence
 #[test]
 fn three_leg_left_deep_self_join_collects_one_aliased_leaf_per_occurrence() {
     let request = self_join_request(&[Some("A"), Some("B"), Some("C")]);
@@ -279,9 +239,7 @@ fn three_leg_left_deep_self_join_collects_one_aliased_leaf_per_occurrence() {
     assert_eq!(join.conditions.len(), 2, "N-1 conditions for N=3 legs");
 }
 
-/// A join over two DIFFERENT tables written without aliases collects `None` for
-/// both leaves — the common, currently-correct case gains no alias out of thin
-/// air.
+/// Scenario: An unaliased two-table join's leaves carry no alias
 #[test]
 fn unaliased_two_table_join_leaves_carry_no_alias() {
     let request = join_request(Json::Null, equi_condition());
@@ -290,37 +248,23 @@ fn unaliased_two_table_join_leaves_carry_no_alias() {
     assert_eq!(leaf_keys(&join), [("CUSTOMER", None), ("ORDERS", None)]);
 }
 
-// ---------------------------------------------------------------------------
-// Join side selection + broadcast threshold: `select_broadcast_sides`.
-// The pure core of the two-table broadcast role/threshold decision — exercised
-// without a live Iceberg catalog. `plan_join` resolves each side via
-// `resolve_one_join_side` and delegates here, so this covers the decision.
-// ---------------------------------------------------------------------------
-
-/// The default `JOIN_BROADCAST_MAX_BYTES` (128 MiB).
 const BROADCAST_MAX: u64 = 134_217_728;
 
-/// `total_bytes` is the saturating sum of every file's `file_size_in_bytes`
-/// (the Iceberg-manifest size — no Parquet read).
+/// Scenario: A side's total bytes is the saturating sum of its file sizes
 #[test]
 fn resolved_side_sums_file_bytes_saturating() {
     assert_eq!(
         resolved_side("ORDERS", vec![("a", 100), ("b", 250), ("c", 4)]).total_bytes,
         354
     );
-    // Empty side ⇒ zero bytes.
     assert_eq!(resolved_side("EMPTY", vec![]).total_bytes, 0);
-    // A byte total that would overflow u64 saturates to u64::MAX (treated as
-    // "far over any threshold"), never wraps.
     assert_eq!(
         resolved_side("HUGE", vec![("x", u64::MAX), ("y", 1)]).total_bytes,
         u64::MAX
     );
 }
 
-/// The smaller side by bytes is the dimension; the larger is the fact, and the
-/// full resolved payload (files, schema, root, storage, idents) rides along
-/// with each role. Here the LEFT argument is smaller.
+/// Scenario: The smaller left side is the dimension and carries its resolved payload
 #[test]
 fn dimension_is_left_when_left_side_is_smaller() {
     let customer = resolved_side("CUSTOMER", vec![("c1", 1_000)]);
@@ -335,7 +279,6 @@ fn dimension_is_left_when_left_side_is_smaller() {
         sides.broadcast_eligible,
         "1000 bytes is well under the 128 MiB threshold"
     );
-    // Resolved payload travels with the role.
     assert_eq!(sides.dimension.table_identifier, "lh.customer");
     assert_eq!(sides.fact.table_identifier, "lh.orders");
     assert_eq!(sides.dimension.files, vec![FileEntry::new("c1", 1_000)]);
@@ -344,8 +287,7 @@ fn dimension_is_left_when_left_side_is_smaller() {
     assert_eq!(sides.dimension.effective_storage, sample_storage());
 }
 
-/// Reversing the FROM-clause order (larger side first) still selects the
-/// smaller side as the dimension — selection is by byte size, not position.
+/// Scenario: Selection is by byte size, not FROM-clause position
 #[test]
 fn dimension_is_right_when_right_side_is_smaller() {
     let orders = resolved_side("ORDERS", vec![("o1", 50_000), ("o2", 50_000)]);
@@ -358,14 +300,11 @@ fn dimension_is_right_when_right_side_is_smaller() {
     assert!(sides.broadcast_eligible);
 }
 
-/// The dimension (smaller) side exceeding the threshold is reported as NOT
-/// broadcast-eligible — cleanly via the flag, never an error — so the caller
-/// builds the deterministic unaccelerated two-scan fallback.
+/// Scenario: A dimension over the threshold is not broadcast-eligible
 #[test]
 fn dimension_over_threshold_is_not_broadcast_eligible() {
     let part = resolved_side("PART", vec![("p1", 200)]);
     let lineitem = resolved_side("LINEITEM", vec![("l1", 900)]);
-    // Threshold 100 is below even the smaller side's 200 bytes.
     let sides = select_broadcast_sides(part, lineitem, 100);
 
     assert_eq!(
@@ -379,8 +318,7 @@ fn dimension_over_threshold_is_not_broadcast_eligible() {
     );
 }
 
-/// A dimension exactly AT the threshold is eligible (inclusive `<=`); one byte
-/// over is not — the boundary the byte-size decision hinges on.
+/// Scenario: The broadcast threshold boundary is inclusive
 #[test]
 fn threshold_boundary_is_inclusive() {
     let at = select_broadcast_sides(
@@ -404,8 +342,7 @@ fn threshold_boundary_is_inclusive() {
     );
 }
 
-/// An empty side (zero files ⇒ zero bytes) is the trivially broadcast-eligible
-/// dimension, and selection stays deterministic (documented empty-side edge).
+/// Scenario: An empty side is the eligible dimension
 #[test]
 fn empty_side_is_the_eligible_dimension() {
     let empty = resolved_side("EMPTYDIM", vec![]);
@@ -418,8 +355,7 @@ fn empty_side_is_the_eligible_dimension() {
     assert!(sides.broadcast_eligible);
 }
 
-/// On an exact byte-size tie (e.g. a self-join, both sides the same table) the
-/// FIRST argument is the dimension — deterministic, documented tie-break.
+/// Scenario: An exact byte-size tie breaks to the first argument
 #[test]
 fn equal_size_tie_breaks_to_first_argument() {
     let a = resolved_side("SELF_A", vec![("s", 4_242)]);
@@ -431,17 +367,7 @@ fn equal_size_tie_breaks_to_first_argument() {
     assert_eq!(sides.dimension.total_bytes, sides.fact.total_bytes);
 }
 
-// ---------------------------------------------------------------------------
-// A self-join never reaches the broadcast path.
-// ---------------------------------------------------------------------------
-
-/// A self-join declares an IDENTICAL column set on both occurrences (both leaves
-/// share one `table_name`, so [`involved_table_columns`] returns the same list
-/// twice), which the disjoint-schema guard already declines on its own — no
-/// same-table guard is added; this pins the decline that already covers it.
-/// [`render_broadcast_join`] therefore returns `Ok(None)`, the same clean
-/// fall-through an overlapping-column two-table join takes, so `plan_join` falls
-/// to the unified N-scan fallback rather than ever building a broadcast plan.
+/// Scenario: A self-join is never broadcast-eligible
 #[test]
 fn self_join_is_never_broadcast_eligible() {
     let request = self_join_request(&[Some("A"), Some("B")]);

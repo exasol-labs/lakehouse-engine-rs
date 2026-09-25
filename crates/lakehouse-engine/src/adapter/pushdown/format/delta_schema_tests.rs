@@ -3,14 +3,8 @@ use delta_kernel::table_features::ColumnMappingMode;
 
 use super::*;
 
-/// Verbatim `schemaString` from the `cdf-column-mapping-name-mode` fixture's first commit
-/// (`scripts/unity/fixtures/cdf-column-mapping-name-mode/_delta_log/00000000000000000000.json`):
-/// `name`-mode column mapping with `col-<uuid>` physical names.
 const CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-80396d42-d765-483e-b86e-7ac1e13ef88c"}},{"name":"name","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"col-ed3e45cf-632b-4a07-bb22-d9f4693bbaa1"}},{"name":"value","type":"double","nullable":true,"metadata":{"delta.columnMapping.id":3,"delta.columnMapping.physicalName":"col-95e13b58-72f1-4d26-8390-49469180a8a2"}}]}"#;
 
-/// Verbatim `nested_struct` field from the vendored `stats-all-types` fixture's `schemaString`
-/// (`scripts/unity/fixtures/stats-all-types/_delta_log/00000000000000000000.json`): `name`-mode
-/// column mapping, with a `col-<uuid>` physical name on every INNER field as well as on the column.
 const STATS_ALL_TYPES_NESTED_STRUCT_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"nested_struct","type":{"type":"struct","fields":[{"name":"inner_int","type":"integer","nullable":true,"metadata":{"delta.columnMapping.id":17,"delta.columnMapping.physicalName":"col-7f2f94cf-7082-430c-bba7-852bc6c5215e"}},{"name":"inner_string","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":18,"delta.columnMapping.physicalName":"col-26fcfd6b-04c7-4772-8bdf-04ac9425f06e"}},{"name":"inner_double","type":"double","nullable":true,"metadata":{"delta.columnMapping.id":19,"delta.columnMapping.physicalName":"col-92dcf16d-d249-48a9-afb8-93deeaf7ce23"}}]},"nullable":true,"metadata":{"delta.columnMapping.id":16,"delta.columnMapping.physicalName":"col-481c7590-d3b8-4e9c-b40e-7b7128a972f4"}}]}"#;
 
 const INNER_INT_PHYSICAL_NAME: &str = "col-7f2f94cf-7082-430c-bba7-852bc6c5215e";
@@ -28,8 +22,6 @@ fn user_message(err: UdfError) -> String {
     }
 }
 
-/// `field` annotated the way the Delta protocol requires under `id`/`name` mode: both a
-/// column-mapping id and a physical name.
 fn annotated(field: StructField, id: i64, physical_name: &str) -> StructField {
     field.with_metadata([
         ("delta.columnMapping.id", MetadataValue::Number(id)),
@@ -40,7 +32,6 @@ fn annotated(field: StructField, id: i64, physical_name: &str) -> StructField {
     ])
 }
 
-/// An annotated `integer` field, the shape most binding-key assertions need.
 fn mapped_field(name: &str, id: i64, physical_name: &str) -> StructField {
     annotated(
         StructField::not_null(name, DataType::INTEGER),
@@ -49,9 +40,7 @@ fn mapped_field(name: &str, id: i64, physical_name: &str) -> StructField {
     )
 }
 
-/// Every logical field's binding key rendered as `<logical name>=<key>`, so one expected string
-/// asserts BOTH which key a column carries and that it carries no second one — a field populating
-/// both renders as `BOTH(...)` rather than passing a one-sided assertion.
+/// A field populating both keys renders as `BOTH(...)`, so one string asserts exactly one key.
 fn binding_keys(fields: &[LogicalField]) -> String {
     fields
         .iter()
@@ -83,7 +72,6 @@ fn struct_of(fields: impl IntoIterator<Item = StructField>) -> DataType {
         .into()
 }
 
-/// One expected primitive nested field: its logical name and the ONE binding key its mode selects.
 fn nested_field(name: &str, field_id: Option<i32>, physical_name: Option<&str>) -> NestedField {
     NestedField {
         field_id,
@@ -93,12 +81,10 @@ fn nested_field(name: &str, field_id: Option<i32>, physical_name: Option<&str>) 
     }
 }
 
-/// `field` carrying `entries` as its `delta.typeChanges` annotation.
 fn with_type_changes(field: StructField, entries: serde_json::Value) -> StructField {
     field.with_metadata([("delta.typeChanges", MetadataValue::Other(entries))])
 }
 
-/// The single logical field a one-column table resolves to under `mode`.
 fn only_logical_field(schema: &StructType, mode: ColumnMappingMode) -> LogicalField {
     let (logical_fields, _, refused_columns) = build_delta_table_schema(schema, mode, Vec::new())
         .expect("this fixture's only column is mappable");
@@ -110,9 +96,6 @@ fn only_logical_field(schema: &StructType, mode: ColumnMappingMode) -> LogicalFi
     logical_fields.into_iter().next().unwrap()
 }
 
-/// The refusal reason a single-column table of `data_type` produces. A single refused column
-/// never fails `build_delta_table_schema` by itself — only the reader's whole-table guard does
-/// that, once it sees an empty successful schema — so this reads the reason off the refused list.
 fn refusal_message(column_name: &str, data_type: DataType) -> String {
     let schema = StructType::try_new([StructField::nullable(column_name, data_type)]).unwrap();
     let (logical_fields, _, refused_columns) =
@@ -130,8 +113,7 @@ fn refusal_message(column_name: &str, data_type: DataType) -> String {
     refused_columns[0].reason.clone()
 }
 
-// Scenario Coverage (refactor-neutralize-scan-spec): `build_delta_table_schema` is `pub(super)`,
-// so this scenario is reached as a crate-internal unit test rather than `tests/delta_log_replay.rs`.
+/// Scenario: Each column-mapping mode selects its own binding key
 #[test]
 fn each_column_mapping_mode_selects_its_own_binding_key() {
     let schema = StructType::try_new([
@@ -156,8 +138,7 @@ fn each_column_mapping_mode_selects_its_own_binding_key() {
     assert_eq!(binding_keys(&none_mode), "a=identity, b=identity");
 }
 
-/// The `name`-mode fixture's columns each bind by their `col-<uuid>` physical name, and their
-/// Delta types reach the Arrow tags the logical schema declares.
+/// Scenario: Name-mode fixture columns bind by their declared physical name
 #[test]
 fn name_mode_fixture_columns_bind_by_their_declared_physical_name() {
     let schema = parse_schema(CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA);
@@ -181,11 +162,7 @@ fn name_mode_fixture_columns_bind_by_their_declared_physical_name() {
     assert_eq!(logical_fields[2].arrow_type, "float64");
 }
 
-/// Under `none` mode a residual column-mapping annotation is INERT — the Delta protocol
-/// resolves every physical name to its logical one there, and `delta_kernel` documents the
-/// same read tolerance — so the column binds by its own logical name and carries neither key.
-/// Honouring the annotation would hand the scan a key its unannotated siblings cannot offer.
-/// Also pins the Delta `INTEGER` -> `int32` Arrow tag mapping.
+/// Scenario: None mode ignores a residual column-mapping annotation
 #[test]
 fn none_mode_ignores_a_residual_column_mapping_annotation() {
     let schema = StructType::try_new([
@@ -204,10 +181,7 @@ fn none_mode_ignores_a_residual_column_mapping_annotation() {
     );
 }
 
-/// Under `id`/`name` mode the Delta protocol REQUIRES every field to carry a
-/// `delta.columnMapping.id`, and nothing on the read path validates that. Substituting
-/// the ordinal position would hand the scan an id that can collide with a sibling
-/// column's assigned one, so an absent (or non-numeric) annotation is refused.
+/// Scenario: A mapped-mode column without a column-mapping id is refused naming the column
 #[test]
 fn id_mode_column_without_a_column_mapping_id_is_refused_naming_the_column() {
     let unannotated_id = StructField::not_null("b", DataType::INTEGER).with_metadata([(
@@ -233,10 +207,7 @@ fn id_mode_column_without_a_column_mapping_id_is_refused_naming_the_column() {
     }
 }
 
-/// A `delta.columnMapping.id` outside `i32` is refused rather than truncated or
-/// replaced by an ordinal: the wire field-id is an `i32`, and the Delta protocol
-/// restricts the annotation to a 32-bit non-negative integer, so an out-of-range value
-/// describes no column this engine can bind.
+/// Scenario: A column-mapping id outside i32 is refused naming the column
 #[test]
 fn id_mode_column_with_an_out_of_range_column_mapping_id_is_refused_naming_the_column() {
     let oversized = i64::from(i32::MAX) + 1;
@@ -257,10 +228,7 @@ fn id_mode_column_with_an_out_of_range_column_mapping_id_is_refused_naming_the_c
     );
 }
 
-/// Under `id`/`name` mode the physical name is the ONLY name the writer used in the
-/// Parquet file, so an absent — or present but non-string — annotation is refused.
-/// Falling back to the logical name would have the scan read a column the writer
-/// never wrote.
+/// Scenario: A mapped-mode column without a usable physical name is refused naming the column
 #[test]
 fn id_mode_column_without_a_physical_name_is_refused_naming_the_column() {
     let absent = vec![("delta.columnMapping.id", MetadataValue::Number(1))];
@@ -288,13 +256,7 @@ fn id_mode_column_without_a_physical_name_is_refused_naming_the_column() {
     }
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta type whose Arrow form cannot be rendered
-// faithfully is refused by name
-/// A refused column's binding key is never looked up, even when that lookup would itself fail:
-/// under `id` mode `bad_binary` carries no `delta.columnMapping.id` at all, which would refuse
-/// the whole call on a MISSING ANNOTATION if binding-key resolution ran before type
-/// classification. Because classification runs first, `bad_binary` is refused for its `binary`
-/// type, its malformed binding key is never read, and the mappable `id` column is unaffected.
+/// Scenario: A refused column's binding key is never looked up, even when it would fail
 #[test]
 fn a_refused_columns_binding_key_is_never_looked_up_even_when_it_would_itself_fail() {
     let mappable = mapped_field("id", 1, "col-id");
@@ -333,8 +295,7 @@ fn partition_columns_are_threaded_through_verbatim_and_in_order() {
     assert_eq!(carried_partition_columns, partition_columns);
 }
 
-// Scenario Coverage (delta-type-mapping): Every Delta type Exasol represents natively maps to
-// its own Arrow tag
+/// Scenario: Every Delta type Exasol represents natively maps to its own Arrow tag
 #[test]
 fn every_natively_representable_delta_type_maps_to_its_own_arrow_tag() {
     let schema = StructType::try_new([
@@ -396,8 +357,7 @@ fn decimal_within_exasol_domain_maps_to_decimal128_tag() {
     assert_eq!(logical_fields[0].arrow_type, "decimal128(10,2)");
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta type Exasol cannot represent natively is
-// surfaced as a VARCHAR rendering
+/// Scenario: A Delta type Exasol cannot represent natively is surfaced as a VARCHAR rendering
 #[test]
 fn decimal_outside_exasol_domain_maps_to_utf8() {
     let schema = StructType::try_new([StructField::not_null(
@@ -413,8 +373,7 @@ fn decimal_outside_exasol_domain_maps_to_utf8() {
     assert_eq!(logical_fields[0].arrow_type, "utf8");
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta type Exasol cannot represent natively is
-// surfaced as a VARCHAR rendering
+/// Scenario: A Delta type Exasol cannot represent natively is surfaced as a VARCHAR rendering
 #[test]
 fn void_and_interval_types_are_tagged_utf8() {
     let schema = StructType::try_new([
@@ -448,11 +407,7 @@ fn nullability_is_carried_from_the_delta_schema() {
     assert!(!logical_fields[1].nullable);
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta type Exasol cannot represent natively is
-// surfaced as a VARCHAR rendering
-/// A container is tagged `utf8` exactly when every one of its members is itself renderable, at
-/// every nesting depth and through every member position — an `array`'s element, a `struct`'s
-/// field, and a `map`'s key and value alike.
+/// Scenario: A container of renderable members is tagged utf8 at every depth and position
 #[test]
 fn containers_classify_recursively_by_renderability() {
     let schema = StructType::try_new([
@@ -538,12 +493,7 @@ fn containers_classify_recursively_by_renderability() {
     );
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta type whose Arrow form cannot be rendered
-// faithfully is refused by name
-/// `binary` and `variant` are the whole refused set, and a container joins it exactly when one of
-/// its members is in it — at any depth, through any member position. One composer states every
-/// container refusal: the column's OWN declared type, the offending member's path, and that
-/// member's own cause, so no operator is told the column has a member's type.
+/// Scenario: A Delta type whose Arrow form cannot be rendered faithfully is refused by name
 #[test]
 fn refused_set_is_binary_variant_and_containers_of_them() {
     let variant = DataType::unshredded_variant();
@@ -627,12 +577,7 @@ fn refused_set_is_binary_variant_and_containers_of_them() {
     }
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta type whose Arrow form cannot be rendered
-// faithfully is refused by name
-/// The nested counterpart of `a_refused_columns_binding_key_is_never_looked_up_even_when_it_would
-/// _itself_fail`: a column refused for one member's TYPE must never instead FAIL the call for a
-/// sibling member's missing column-mapping annotation, which under `id` mode the whole nested tree
-/// would otherwise be checked for.
+/// Scenario: A refused container's nested binding key is never looked up
 #[test]
 fn a_refused_containers_nested_binding_key_is_never_looked_up() {
     let refused_member_beside_an_unannotated_one = annotated(
@@ -664,8 +609,7 @@ fn a_refused_containers_nested_binding_key_is_never_looked_up() {
     );
 }
 
-// Scenario Coverage (delta-type-mapping): Every recorded Delta type change is validated, and an
-// unsupported one refuses its column
+/// Scenario: A field with no type-changes metadata parses to an empty list
 #[test]
 fn a_field_with_no_type_changes_metadata_parses_to_an_empty_list() {
     let field = StructField::not_null("plain", DataType::INTEGER);
@@ -675,8 +619,7 @@ fn a_field_with_no_type_changes_metadata_parses_to_an_empty_list() {
     assert!(changes.is_empty());
 }
 
-/// A field carrying OTHER metadata but no `delta.typeChanges` key still parses to an empty list —
-/// the key's absence, not the field's overall metadata shape, decides.
+/// Scenario: A field with other metadata but no type-changes key parses to an empty list
 #[test]
 fn a_field_with_other_metadata_but_no_type_changes_key_parses_to_an_empty_list() {
     let field = mapped_field("a", 1, "col-a");
@@ -686,9 +629,7 @@ fn a_field_with_other_metadata_but_no_type_changes_key_parses_to_an_empty_list()
     assert!(changes.is_empty());
 }
 
-/// Verbatim shape of one entry from the vendored `type-widening` fixture's commit 2
-/// `schemaString`, `tableVersion` included — Delta 3.2-era clients still write the superseded RFC
-/// key on every entry, and it must be ignored rather than refused.
+/// Scenario: The superseded tableVersion key is ignored rather than refused
 #[test]
 fn parses_fromtype_totype_ignoring_the_superseded_tableversion_key() {
     let field = StructField::nullable("byte_long", DataType::LONG).with_metadata([(
@@ -705,8 +646,7 @@ fn parses_fromtype_totype_ignoring_the_superseded_tableversion_key() {
     assert_eq!(changes[0].to_type, "long");
 }
 
-/// An entry's `fieldPath` is RETAINED: the refusal reports it so an operator can locate the change
-/// inside a nested tree, even though it is never an input to the supported-pair check.
+/// Scenario: An entry's optional fieldPath is retained for the refusal to report
 #[test]
 fn parses_multiple_entries_and_retains_an_optional_field_path() {
     let field = StructField::nullable("m", DataType::STRING).with_metadata([(
@@ -800,8 +740,6 @@ fn type_change(from_type: &str, to_type: &str) -> RecordedTypeChange {
     }
 }
 
-/// A recorded entry carrying a `fieldPath`, which the protocol writes when the change applies to a
-/// map key/value or an array element rather than to the annotated field itself.
 fn type_change_at(from_type: &str, to_type: &str, field_path: &str) -> RecordedTypeChange {
     RecordedTypeChange {
         from_type: from_type.to_string(),
@@ -810,14 +748,11 @@ fn type_change_at(from_type: &str, to_type: &str, field_path: &str) -> RecordedT
     }
 }
 
-/// The recorded entries `field` carries, read at the path a top-level column of its name occupies.
 fn parsed_type_changes(field: &StructField) -> Result<Vec<RecordedTypeChange>, UdfError> {
     recorded_type_changes(field, &FieldPath::column(field.name()))
 }
 
-/// Every `fromType`/`toType` pair the Delta protocol's § Type Widening lists, spelled as the Delta
-/// schema spells them. `decimal(10,2)` -> `decimal(10,2)` is the `k1 = k2 = 0` corner the
-/// protocol's own formula admits.
+/// `decimal(10,2)` -> `decimal(10,2)` is the `k1 = k2 = 0` corner the protocol admits.
 const PROTOCOL_SUPPORTED_PAIRS: &[(&str, &str)] = &[
     ("byte", "short"),
     ("byte", "integer"),
@@ -854,17 +789,13 @@ fn every_pair_the_protocol_lists_is_supported() {
     );
 }
 
-/// The floating-point bullet names `Byte`, `Short` or `Int` and omits `Long`, which is lossy above
-/// 2^53. arrow-cast performs the cast regardless — `scan/type_relaxation_tests.rs` pins that — so
-/// castability is no evidence of protocol support.
+/// Scenario: long to double is refused because the protocol omits it, though arrow-cast performs it
 #[test]
 fn long_to_double_is_refused_because_the_protocol_omits_it() {
     assert!(!is_supported_type_change(&type_change("long", "double")));
 }
 
-/// `decimal(10,1)` -> `decimal(11,3)` grows BOTH precision and scale, so the `P' >= P && S' >= S`
-/// paraphrase accepts it; the protocol's `k1 >= k2 >= 0` refuses it because the integral digit
-/// count shrinks from 9 to 8.
+/// Scenario: A decimal target is checked as k1 >= k2 >= 0, not as precision and scale both growing
 #[test]
 fn a_decimal_target_is_checked_as_k1_ge_k2_ge_0_not_as_precision_and_scale_both_growing() {
     assert!(!is_supported_type_change(&type_change(
@@ -891,9 +822,7 @@ fn a_decimal_target_narrowing_precision_or_scale_is_refused() {
     }
 }
 
-/// `Byte`, `Short`, and `Int` are all stored as `INT32`, so the protocol's integral-to-decimal
-/// target is `Decimal(10 + k1, k2)` for all three and `Decimal(20 + k1, k2)` for `Long` — never a
-/// target derived from the declared source type's own narrower range.
+/// Scenario: An integral source is checked against the protocol's INT32 and INT64 decimal bases
 #[test]
 fn an_integral_source_is_checked_against_the_protocols_int32_and_int64_decimal_bases() {
     for (from_type, to_type) in [
@@ -928,8 +857,7 @@ fn a_narrowing_or_unrelated_pair_is_refused() {
     }
 }
 
-/// A name no Delta primitive spelling matches — a nested type, another format's spelling, or a
-/// decimal outside the type's own domain — is one more pair the protocol's list does not contain.
+/// Scenario: A type name that is not a Delta primitive is refused
 #[test]
 fn a_type_name_that_is_not_a_delta_primitive_is_refused() {
     for (from_type, to_type) in [
@@ -946,9 +874,7 @@ fn a_type_name_that_is_not_a_delta_primitive_is_refused() {
     }
 }
 
-/// An entry carrying a `fieldPath` is validated by its pair ALONE: the path is retained for the
-/// refusal to report and never interpreted, coerced into a type decision, or resolved against the
-/// schema.
+/// Scenario: An entry carrying a fieldPath is validated by its pair alone
 #[test]
 fn an_entry_carrying_a_field_path_is_validated_by_its_pair_alone() {
     let supported = type_change_at("byte", "long", "value");
@@ -958,8 +884,7 @@ fn an_entry_carrying_a_field_path_is_validated_by_its_pair_alone() {
     assert!(!is_supported_type_change(&unsupported));
 }
 
-// Scenario Coverage (delta-type-mapping): Every recorded Delta type change is validated, and an
-// unsupported one refuses its column
+/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
 #[test]
 fn a_field_carrying_an_unsupported_recorded_type_change_is_refused_naming_both_types() {
     let field = StructField::nullable("value", DataType::DOUBLE).with_metadata([(
@@ -1008,11 +933,7 @@ fn a_field_whose_recorded_type_changes_are_all_supported_plans_normally() {
     assert_eq!(logical_fields[0].name, "value");
 }
 
-// Scenario Coverage (delta-type-mapping): Every recorded Delta type change is validated, and an
-// unsupported one refuses its column
-/// Every recorded entry is validated at EVERY nesting depth, and the refusal reports the
-/// structural path from the top-level column down to the annotated field, composed with that
-/// entry's own `fieldPath` when it carries one.
+/// Scenario: Nested type changes are validated and refuse with a composed path
 #[test]
 fn nested_type_changes_are_validated_and_refuse_with_a_composed_path() {
     let long_to_double = || serde_json::json!([{"fromType": "long", "toType": "double"}]);
@@ -1080,8 +1001,7 @@ fn nested_type_changes_are_validated_and_refuse_with_a_composed_path() {
     }
 }
 
-/// The `fieldPath` an entry on the TOP-LEVEL field carries is reported too: the annotation sits on
-/// the column, but the change it records applies to the column's map value.
+/// Scenario: A top-level entry's own fieldPath is reported below the column
 #[test]
 fn a_top_level_entrys_own_field_path_is_reported_below_the_column() {
     let schema = StructType::try_new([with_type_changes(
@@ -1101,8 +1021,7 @@ fn a_top_level_entrys_own_field_path_is_reported_below_the_column() {
     );
 }
 
-/// A SUPPORTED nested change refuses nothing, and a MALFORMED nested annotation surfaces the same
-/// `UdfError` a malformed top-level one does rather than being skipped for sitting in a container.
+/// Scenario: A nested annotation is supported or malformed by the same rules as a top-level one
 #[test]
 fn a_nested_annotation_is_supported_or_malformed_by_the_same_rules_as_a_top_level_one() {
     let supported = StructType::try_new([StructField::nullable(
@@ -1138,11 +1057,7 @@ fn a_nested_annotation_is_supported_or_malformed_by_the_same_rules_as_a_top_leve
     assert!(message.contains("fromType"), "message was: {message}");
 }
 
-// Scenario Coverage (delta-type-mapping): Every nested field's logical name and binding key reach
-// the scan
-/// The vendored `stats-all-types` fixture's `nested_struct` is the pairing the JSON renderer keys
-/// by: each inner field's LOGICAL name plus the ONE binding key the mode in force selects, and
-/// never a `col-`-prefixed physical name in the `name` slot.
+/// Scenario: Every nested field's logical name and binding key reach the scan
 #[test]
 fn nested_descriptor_carries_logical_names_and_mode_selected_binding_keys() {
     let schema = parse_schema(STATS_ALL_TYPES_NESTED_STRUCT_SCHEMA);
@@ -1186,11 +1101,7 @@ fn nested_descriptor_carries_logical_names_and_mode_selected_binding_keys() {
     }
 }
 
-// Scenario Coverage (delta-type-mapping): Every nested field's logical name and binding key reach
-// the scan
-/// A list's element and a map's key and value are POSITIONAL: the descriptor records them without
-/// a name or a binding key, and records them at all only when the member is itself a container.
-/// A primitive column carries no descriptor whatsoever.
+/// Scenario: Positional members carry no name and a primitive column carries no descriptor
 #[test]
 fn positional_members_carry_no_name_and_a_primitive_column_carries_no_descriptor() {
     let schema = StructType::try_new([
@@ -1246,11 +1157,7 @@ fn positional_members_carry_no_name_and_a_primitive_column_carries_no_descriptor
     );
 }
 
-// Scenario Coverage (delta-type-mapping): Every nested field's logical name and binding key reach
-// the scan
-/// A nested field whose physical identity the writer never wrote cannot be bound, so it is refused
-/// at the depth it is missing, by the same rule and the same message a missing top-level
-/// annotation already uses.
+/// Scenario: A nested field missing its mode's annotation is refused naming its path
 #[test]
 fn a_nested_field_missing_its_modes_annotation_is_refused_naming_its_path() {
     let schema = StructType::try_new([annotated(

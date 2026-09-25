@@ -1,6 +1,3 @@
-//! Per-request table resolution: the pushdown path's ONE catalog-kind match, and
-//! the ONE thing the pipeline learns about a table.
-
 use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
@@ -23,36 +20,18 @@ use crate::scan::{build_admission_limited_store, store_root_url};
 #[path = "scan_resolution_tests.rs"]
 mod tests;
 
-/// One pushdown request's table resolver: every table the request touches, in the
-/// one shape every table format answers.
-///
-/// Built ONCE per request, which is what makes a per-table session rebuild
-/// inexpressible — the catalog session is resolved INTO the resolver and
-/// [`Self::resolve`] takes `&self`, so a two-leg join performs no more catalog
-/// authentication round-trips than a single-table scan.
-///
-/// Deep by design: a [`ResolvedScan`] is the whole of what the pipeline learns
-/// about a table, so the single-table path, each join leg, and every aggregate
-/// shape resolve identically and none of them names a table format or a catalog
-/// kind.
+/// Built once per request with the catalog session resolved into it, so a
+/// multi-leg join costs no more catalog authentication than a single scan.
 pub(super) struct TableScanResolver<'a> {
     session: RequestSession,
     connection: ConnectionStorage<'a>,
 }
 
-/// The request's live catalog session, in the shape its catalog kind resolved
-/// into.
-///
-/// Deliberately NOT the [`CatalogKind`] value: the kind is matched once, in
-/// [`TableScanResolver::for_request`], and an already-resolved session is all
-/// every later step needs. Carrying the kind alongside it would invite a second
-/// match site free to disagree with the first.
+/// Deliberately not the [`CatalogKind`]: the kind is matched once in
+/// [`TableScanResolver::for_request`], so no second match site can disagree.
 enum RequestSession {
     Iceberg(CatalogSession),
-    /// Boxed: a Unity Catalog session is several times the size of an Iceberg
-    /// one, and a request holds exactly one session either way.
     Unity(Box<UnityCatalogSession>),
-    /// No catalog: the object store itself takes the session's role, bounding the whole request under one admission limiter.
     DirectStorage {
         store: Arc<dyn ObjectStore>,
         base_path: String,
@@ -61,23 +40,11 @@ enum RequestSession {
 }
 
 impl<'a> TableScanResolver<'a> {
-    /// Resolve this request's catalog session at the pushdown path's ONE
-    /// exhaustive [`CatalogKind`] match, so a third catalog kind is a compile
-    /// error here rather than a silent fall-through.
+    /// The pushdown path's one exhaustive [`CatalogKind`] match.
     ///
-    /// `connection` is the CONNECTION's static storage decision every table this
-    /// request resolves is read through.
-    ///
-    /// `table_identifiers` names every table the request will go on to resolve.
-    /// Each is checked against the identifier rule of the kind's OWN table format,
-    /// inside that kind's arm and ahead of the session that arm builds — so the
-    /// shape decision cannot be taken by another format's rule, and cannot be
-    /// skipped by a caller that forgets it. The ordering is load-bearing: the
-    /// Iceberg arm resolves its `/v1/config` prefix over the network, so an
-    /// identifier checked afterwards would surface a transport error from an
-    /// unreachable catalog rather than the parse error it is.
-    ///
-    /// `props`: the merged virtual-schema properties; each kind's arm reads only the property names it declares.
+    /// Every `table_identifiers` entry is validated by its own format's rule before
+    /// the session is built: the Iceberg arm contacts the network for `/v1/config`,
+    /// so a later check would surface a transport error instead of the parse error.
     pub(super) async fn for_request(
         kind: CatalogKind,
         catalog_uri: &str,
@@ -132,16 +99,9 @@ impl<'a> TableScanResolver<'a> {
         })
     }
 
-    /// `table_identifier`'s table as it stands now: its active files, the storage
-    /// they were resolved THROUGH, its logical schema, its table root, its name
-    /// mapping, and its partition columns.
-    ///
-    /// `table_identifier` is the original-cased identifier recorded in `TABLE_MAP` at
-    /// create time — dot-joined under a catalog kind, a bare directory name under
-    /// direct storage. `filter_json` is the request's raw filter, forwarded unchanged
-    /// so each format prunes by it wherever its own planning can; `None` prunes
-    /// nothing. `declared_columns` is the table's `involvedTables` declaration,
-    /// read only by a format whose pruning can drop every file carrying a column.
+    /// `table_identifier` is the original-cased `TABLE_MAP` identifier. `filter_json`
+    /// is forwarded unchanged for format-side pruning. `declared_columns` is read only
+    /// by a format whose pruning can drop every file carrying a column.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
@@ -198,7 +158,8 @@ impl<'a> TableScanResolver<'a> {
     }
 }
 
-/// The bare, un-split directory name (it may itself contain a dot); empty, separator-carrying, or relative-path values are refused, since they'd compose a table root outside the storage base path.
+/// Refuses empty, separator-carrying, or relative-path values, which would compose
+/// a table root outside the storage base path.
 fn direct_storage_directory(table_identifier: &str) -> Result<&str, UdfError> {
     let refusal = |reason: &str| {
         Err(UdfError::User(format!(
@@ -219,20 +180,9 @@ fn direct_storage_directory(table_identifier: &str) -> Result<&str, UdfError> {
     Ok(table_identifier)
 }
 
-/// Recover a Unity Catalog table's identity from the dot-joined identifier
-/// recorded in `TABLE_MAP` — the ONE place the Unity Catalog identifier shape is
-/// decided.
-///
-/// The split is the exact inverse of the join that recorded it, and the Unity
-/// Catalog addresses a table by that same dotted full name — the loader re-joins
-/// the segments verbatim — so the round trip is lossless and cannot address a
-/// different table.
-///
-/// Both shapes that name no Unity Catalog table are refused here rather than
-/// sent to the catalog: an identifier carrying no separator at all recovers an
-/// EMPTY namespace, which addresses nothing under `catalog.schema.table`; and an
-/// identifier whose last segment is empty names no table, where falling back to
-/// the segment before it would resolve a DIFFERENT table.
+/// An identifier with no separator (empty namespace) or an empty last segment is
+/// refused rather than sent to the catalog: falling back to an earlier segment
+/// would address a different table.
 fn unity_table_ident(table_identifier: &str) -> Result<CatalogTableIdent, UdfError> {
     let Some((namespace, name)) = table_identifier.rsplit_once('.') else {
         return Err(UdfError::User(format!(

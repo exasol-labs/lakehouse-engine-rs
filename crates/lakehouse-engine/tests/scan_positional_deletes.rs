@@ -1,15 +1,3 @@
-//! Scan-level no-container tests for Iceberg merge-on-read **Parquet positional
-//! deletes** (Task 4.1).
-//!
-//! Every test here writes a data Parquet and a positional-delete Parquet to a
-//! local temp directory (no S3 / MinIO, no Docker), hand-builds a `ScanSpec`
-//! whose `FileEntry`s carry `DeleteMechanism`s, drives the production raw-scan
-//! pipeline ([`run_raw_scan_with_session`] → `build_dataframe` →
-//! `register_files` → `PositionalDeleteScanTable`), and asserts the deleted
-//! rows are gone from the emitted output.
-//!
-//! Host-runnable: everything lives under `file://`.
-
 mod scan_fixture;
 
 use std::collections::HashMap;
@@ -51,14 +39,10 @@ use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use url::Url;
 
-/// Iceberg reserved field-ids for a positional-delete file's `file_path`/`pos`
-/// columns (mirrors `scan::positional_deletes`'s private constants; duplicated
-/// here since this integration test cannot import a `pub(crate)` item).
+/// Iceberg reserved field-ids; duplicated because the engine's constants are `pub(crate)`.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 
-/// Storage props are never dialed for a local `file://` scan; a placeholder
-/// keeps the spec well-formed.
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
@@ -70,8 +54,6 @@ fn dummy_storage() -> StorageBackend {
     })
 }
 
-/// Byte size of a local file, given its `file://` URL — robust to
-/// URL-encoding (unlike a bare `strip_prefix("file://")`).
 fn local_file_size(file_url: &str) -> u64 {
     let path = Url::parse(file_url)
         .expect("valid file URL")
@@ -80,10 +62,6 @@ fn local_file_size(file_url: &str) -> u64 {
     std::fs::metadata(path).expect("stat local parquet").len()
 }
 
-/// Write a local data Parquet at `dir/relative` with an `id`/`name` row per
-/// entry in `ids` (`name` is `row-<id>`), across small row groups so
-/// multi-row-group deletes are exercised. Returns the file's absolute
-/// `file://` URL.
 fn write_data_parquet(dir: &Path, relative: &str, ids: &[i64], row_group: usize) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -114,10 +92,6 @@ fn write_data_parquet(dir: &Path, relative: &str, ids: &[i64], row_group: usize)
         .to_string()
 }
 
-/// Write a local positional-delete Parquet at `dir/relative`: `file_path`/`pos`
-/// columns tagged with the Iceberg reserved field-ids, one row per
-/// `(referenced_file_abs_url, position)` entry. Returns the file's absolute
-/// `file://` URL.
 fn write_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i64)]) -> String {
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
@@ -150,8 +124,6 @@ fn write_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i64)]) -> 
         .to_string()
 }
 
-/// A [`DeleteMechanism::IcebergPositionalDelete`] for the Parquet positional-delete
-/// file at `abs_url`.
 fn delete_ref(abs_url: &str) -> DeleteMechanism {
     DeleteMechanism::IcebergPositionalDelete {
         path: abs_url.to_string(),
@@ -159,8 +131,6 @@ fn delete_ref(abs_url: &str) -> DeleteMechanism {
     }
 }
 
-/// A row-scan `ScanSpec` over `files` (already absolute, `table_root` empty),
-/// optionally pushing a filter and/or a limit.
 fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -175,12 +145,7 @@ fn scan_spec(files: Vec<FileEntry>, filter: Option<String>, limit: Option<u64>) 
     }
 }
 
-/// Build a `Vec<LogicalField>` from `(name, arrow_type_tag)` pairs, assigning
-/// Iceberg field-ids sequentially from 1 in the given order. The single seam
-/// every non-empty `logical_schema` in this file is built through, so a
-/// differently-shaped keyed-column schema (e.g. `o_key`/`o_data` on a join's
-/// fact side) can be built through the exact same construction as the
-/// `id`/`name` shape `scan_spec_with_logical_schema` uses.
+/// Field-ids are assigned sequentially from 1.
 fn logical_fields(fields: &[(&str, &str)]) -> Vec<LogicalField> {
     fields
         .iter()
@@ -197,23 +162,8 @@ fn logical_fields(fields: &[(&str, &str)]) -> Vec<LogicalField> {
         .collect()
 }
 
-/// Like [`scan_spec`], but with a populated `common.logical_schema`: `id`
-/// (field-id 1, `int64`) and `name` (field-id 2, `utf8`), both non-nullable —
-/// matching `write_data_parquet`'s fixture schema and this helper's own
-/// `["ID", "NAME"]` projection (lowercase logical names against an uppercase
-/// projection, exactly as `scan_name_mapping.rs`'s helper already does).
-///
-/// Every new request-count assertion in this file MUST build its spec through
-/// this helper, never through `scan_spec` (decision-log [8]). An empty
-/// `logical_schema` sends `register_file_list` down the
-/// `ParquetFormat::infer_schema` branch (`crates/lakehouse-engine/src/scan/raw_scan.rs:203-216`),
-/// which fetches the FIRST assigned file's Parquet footer BEFORE Phase B runs
-/// and which `TrackingStore::get_opts` records — so with a delete-free file
-/// first the per-file zero-GET assertion would fail, and with a
-/// delete-carrying file first the fetched-once assertion would fail, because
-/// the inference entry carries `LocalFileSystem`'s real `last_modified` while
-/// `object_meta_for` builds `Utc.timestamp_nanos(0)`, `CachedFileMetadataEntry
-/// ::is_valid_for` misses, and Phase B re-fetches.
+/// Request-count assertions must use this, not [`scan_spec`]: an empty `logical_schema`
+/// triggers schema inference, which fetches the first file's footer and skews GET counts.
 fn scan_spec_with_logical_schema(
     files: Vec<FileEntry>,
     filter: Option<String>,
@@ -241,9 +191,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Run the production raw scan for `spec` against a session registering
-/// `store` for every `register_url` scheme/authority. Returns the decoded
-/// emitted batches, or the scan's error.
 async fn try_run_scan_with_store(
     spec: &ScanSpec,
     register_url: &str,
@@ -267,9 +214,6 @@ async fn try_run_scan_with_store(
     Ok(ctx.into_batches())
 }
 
-/// Run the production raw scan over a plain `LocalFileSystem`, panicking on
-/// scan failure (the happy-path helper used by every scenario except the
-/// backstop-rejection test).
 fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
     block_on(try_run_scan_with_store(
         spec,
@@ -280,8 +224,6 @@ fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
     .expect("raw scan must succeed")
 }
 
-/// The `EMITS` list for the `ID`/`NAME` projection these fixtures scan: `ID` in
-/// the engine's `Int64` DECIMAL bin, `NAME` as `VARCHAR(2000000)`.
 fn id_name_emits() -> Vec<ExaType> {
     vec![ExaType::Int64, scan_fixture::varchar()]
 }
@@ -312,8 +254,7 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Scenario: `write.delete.granularity=file` — a data file's OWN positional-delete
-/// file removes exactly its flagged row positions.
+/// Scenario: a file-granularity positional-delete file removes exactly its flagged positions
 #[test]
 fn scan_applies_file_granularity_positional_deletes() {
     let dir = temp_dir("file_gran");
@@ -341,15 +282,12 @@ fn scan_applies_file_granularity_positional_deletes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: `write.delete.granularity=partition` — ONE delete file references
-/// data files spanning multiple files; each data file's read is filtered to
-/// only the delete rows whose `file_path` matches ITS own absolute URI.
+/// Scenario: a partition-granularity delete file applies to each data file only by `file_path`
 #[test]
 fn scan_filters_partition_delete_by_file_path() {
     let dir = temp_dir("partition_gran");
     let f0 = write_data_parquet(&dir, "p0/data.parquet", &(100..110).collect::<Vec<_>>(), 4);
     let f1 = write_data_parquet(&dir, "p1/data.parquet", &(200..210).collect::<Vec<_>>(), 4);
-    // One shared partition-granularity delete file: 2 rows for f0, 1 row for f1.
     let delete_url = write_delete_parquet(
         &dir,
         "shared_delete.parquet",
@@ -368,7 +306,6 @@ fn scan_filters_partition_delete_by_file_path() {
     let spec = scan_spec(entries, None, None);
     let rows = run_scan(&spec, &f0);
 
-    // f0 loses positions 2,5 -> ids 102,105; f1 loses position 1 -> id 201.
     assert_eq!(total_rows(&rows), 17, "20 rows - 3 deleted = 17");
     let ids = ids_of(&rows);
     for missing in [102, 105, 201] {
@@ -383,15 +320,12 @@ fn scan_filters_partition_delete_by_file_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: multiple positional-delete files associated with the SAME data
-/// file are unioned (including an overlapping position) rather than only the
-/// last one applying.
+/// Scenario: multiple positional-delete files on one data file are unioned
 #[test]
 fn scan_unions_multiple_delete_files() {
     let dir = temp_dir("union");
     let data_url = write_data_parquet(&dir, "data.parquet", &(0..20).collect::<Vec<_>>(), 8);
     let delete_a = write_delete_parquet(&dir, "del_a.parquet", &[(&data_url, 1), (&data_url, 4)]);
-    // Overlaps position 4 with delete_a; also deletes 9.
     let delete_b = write_delete_parquet(&dir, "del_b.parquet", &[(&data_url, 4), (&data_url, 9)]);
 
     let entry = FileEntry::with_deletes(
@@ -402,7 +336,6 @@ fn scan_unions_multiple_delete_files() {
     let spec = scan_spec(vec![entry], None, None);
     let rows = run_scan(&spec, &data_url);
 
-    // Union of {1,4} and {4,9} = {1,4,9}: exactly 3 rows removed, not 4.
     assert_eq!(
         total_rows(&rows),
         17,
@@ -425,8 +358,7 @@ fn scan_unions_multiple_delete_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a delete file that flags EVERY row of its data file yields zero
-/// rows for that file (rather than erroring or returning stale rows).
+/// Scenario: a delete file flagging every row yields zero rows for that file
 #[test]
 fn scan_fully_deleted_file_yields_no_rows() {
     let dir = temp_dir("fully_deleted");
@@ -460,23 +392,10 @@ fn scan_fully_deleted_file_yields_no_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: positional deletes compose with projection/filter pushdown +
-/// row-group pruning, and separately with LIMIT pushdown, rather than
-/// disabling either — the base access plan (deletes) and the opener's own
-/// pruning/limit intersect to the correct final row set in both cases.
-///
-/// Filter and LIMIT are exercised in SEPARATE sub-scans here rather than
-/// combined in one query: combining a WHERE predicate with LIMIT in this
-/// engine's scan pipeline currently mis-orders results even with NO deletes
-/// involved at all (reproduced independently against the plain `ListingTable`
-/// path via `build_raw_scan_physical_plan`, i.e. a pre-existing scan-execution
-/// gap unrelated to positional-delete application — out of scope here; see
-/// Task 4.2's plan-shape/pruning gate).
+/// Scenario: positional deletes compose with filter pushdown + row-group pruning and with LIMIT
 #[test]
 fn scan_deletes_compose_with_pushdown_and_pruning() {
     let dir = temp_dir("compose");
-    // Small row groups (16 rows) so a predicate can prune whole row groups
-    // while the base access plan still carries the deletes.
     let data_url = write_data_parquet(&dir, "data.parquet", &(0..100).collect::<Vec<_>>(), 16);
     let delete_url = write_delete_parquet(
         &dir,
@@ -489,9 +408,6 @@ fn scan_deletes_compose_with_pushdown_and_pruning() {
         vec![delete_ref(&delete_url)],
     );
 
-    // Filter pushdown + row-group pruning: a predicate that prunes several
-    // whole row groups (keeps only ids >= 60, spanning groups 3..6) still
-    // composes correctly with the base delete access plan.
     let filter_spec = scan_spec(vec![entry.clone()], Some("\"ID\" >= 60".to_string()), None);
     let filter_rows = run_scan(&filter_spec, &data_url);
     let expected_filtered: Vec<i64> = (60..100).filter(|id| *id != 95).collect();
@@ -501,7 +417,6 @@ fn scan_deletes_compose_with_pushdown_and_pruning() {
         "filter pushdown + row-group pruning must compose with the delete (only 95 was in-range)"
     );
 
-    // LIMIT pushdown: the first N surviving (post-delete) rows in file order.
     let limit_spec = scan_spec(vec![entry], None, Some(10));
     let limit_rows = run_scan(&limit_spec, &data_url);
     assert_eq!(
@@ -513,11 +428,7 @@ fn scan_deletes_compose_with_pushdown_and_pruning() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (backstop): an assigned delete file this engine cannot apply
-/// (equality delete) is rejected with a clean, mechanism-naming error rather
-/// than silently ignored or applied incorrectly. Because the read-time
-/// backstop check runs BEFORE the delete file is opened, the referenced path
-/// need not exist.
+/// Scenario: an equality delete is rejected with a mechanism-naming error before the file is opened
 #[test]
 fn scan_rejects_unapplicable_delete_file() {
     let dir = temp_dir("unapplicable");
@@ -550,15 +461,7 @@ fn scan_rejects_unapplicable_delete_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (backstop): an assigned delete file this engine cannot apply
-/// (Puffin / v3 deletion vector) is rejected with a clean, mechanism-naming
-/// error rather than silently ignored or applied incorrectly. Same shape as
-/// `scan_rejects_unapplicable_delete_file` (the equality-delete case): the
-/// read-time backstop check runs BEFORE the delete file is opened, so the
-/// referenced path need not exist, and the error is credential-free — only
-/// the (non-secret) path is redacted before being interpolated, and the
-/// mechanism text `ensure_positional_delete` emits is a fixed literal that
-/// never carries storage credentials.
+/// Scenario: a Puffin deletion vector is rejected with a mechanism-naming error before opening
 #[test]
 fn scan_rejects_puffin_deletion_vector() {
     let dir = temp_dir("puffin_dv");
@@ -591,9 +494,7 @@ fn scan_rejects_puffin_deletion_vector() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (fail loud): a malformed positional-delete file carrying a negative
-/// `pos` is rejected with a clean error rather than silently dropped (casting a
-/// negative to `u64` would wrap to a huge index and skip the delete).
+/// Scenario: a negative positional-delete `pos` is rejected rather than wrapping to a huge index
 #[test]
 fn scan_rejects_negative_positional_delete() {
     let dir = temp_dir("neg_pos");
@@ -613,8 +514,7 @@ fn scan_rejects_negative_positional_delete() {
         &id_name_emits(),
     ))
     .expect_err("a negative pos must be rejected, not silently dropped");
-    // NB: the `dummy_storage` secret_key is "s", so credential redaction strips
-    // every "s" from the message — assert on tokens that survive it.
+    // secret_key is "s", so redaction strips every "s" from the message.
     let msg = err.to_string();
     assert!(
         msg.contains("negative") && msg.contains("(-1)"),
@@ -624,16 +524,12 @@ fn scan_rejects_negative_positional_delete() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (fail loud): a spec whose files resolve to more than one
-/// object-store root is rejected at registration. The scan registers a single
-/// store (keyed by the first file); a file under a different scheme/host would
-/// otherwise be read through the wrong store and fail confusingly.
+/// Scenario: a spec whose files span more than one object-store root is rejected at registration
 #[test]
 fn scan_rejects_mixed_object_store_roots() {
     let dir = temp_dir("mixed_roots");
     let data_url = write_data_parquet(&dir, "data.parquet", &(0..10).collect::<Vec<_>>(), 8);
     let local = FileEntry::new(data_url.clone(), local_file_size(&data_url));
-    // A second data file under a DIFFERENT (s3://) root than the first (file://).
     let foreign = FileEntry::new("s3://other-bucket/part-0.parquet", 10);
     let spec = scan_spec(vec![local, foreign], None, None);
 
@@ -652,9 +548,7 @@ fn scan_rejects_mixed_object_store_roots() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a data file with NO associated delete files scans unchanged —
-/// the unified `PositionalDeleteScanTable` path must not regress the
-/// delete-free case.
+/// Scenario: a data file with no delete files scans unchanged
 #[test]
 fn scan_delete_free_file_unchanged() {
     let dir = temp_dir("delete_free");
@@ -674,44 +568,21 @@ fn scan_delete_free_file_unchanged() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An [`ObjectStore`] decorator that records every non-HEAD `get` it serves, by
-/// location. Delegates everything to `inner` (a plain [`LocalFileSystem`]).
-/// Used to prove the delete file is fetched through the SAME registered
-/// object-store instance the data file uses — i.e. delete-file reads ride the
-/// identical credentialed client the scan configures from `spec.storage`
-/// rather than opening a separate, unauthenticated path.
+/// Records every non-HEAD `get` by location.
 #[derive(Debug)]
 struct TrackingStore {
     inner: Arc<dyn ObjectStore>,
     gets: Arc<std::sync::Mutex<Vec<ObjectStorePath>>>,
     calls: Arc<AtomicUsize>,
-    /// Present for both the delete-read AND footer-fetch concurrency-bound
-    /// tests (`scan_delete_reads_*`, `scan_footer_fetches_*`); `None` for the
-    /// plain tracking uses. When set, a non-HEAD `get_opts` whose location
-    /// matches a probed needle (a delete file's or a data file's bare filename,
-    /// depending on which the test supplies) is counted as an in-flight probed
-    /// read (peak recorded) and delayed a fixed interval to force deterministic
-    /// overlap. A read matching no needle is neither counted nor delayed.
     concurrency: Option<ConcurrencyProbe>,
 }
 
-/// Instrumentation shared by the delete-read AND footer-fetch concurrency-bound
-/// tests: an atomic peak-concurrency counter over probed reads (delete-file
-/// bodies, or data-file footers for the footer-fetch tests) plus a fixed
-/// artificial delay that forces genuine overlap without real I/O timing.
+/// Peak-concurrency counter over probed reads, with a fixed delay forcing deterministic overlap.
 #[derive(Debug)]
 struct ConcurrencyProbe {
-    /// Bare filenames identifying the reads to instrument — delete files for
-    /// the delete-read bound tests, data files for the footer-fetch bound
-    /// tests. A non-HEAD `get_opts` whose object-store path contains any of
-    /// these is a probed read.
     needles: Vec<String>,
-    /// Probed reads currently inside a delayed `get_opts`.
     in_flight: Arc<AtomicUsize>,
-    /// Maximum value `in_flight` ever reached — the observed peak concurrency.
     peak: Arc<AtomicUsize>,
-    /// Fixed per-read delay holding the read "in flight" long enough that every
-    /// concurrently-admitted read overlaps deterministically.
     delay: Duration,
 }
 
@@ -722,9 +593,7 @@ impl ConcurrencyProbe {
     }
 }
 
-/// Decrements the in-flight counter on scope exit, INCLUDING on future
-/// cancellation (a fired test timeout drops the read mid-await) — so a leaked
-/// in-flight count can never survive to corrupt a later assertion.
+/// Decrements on drop so a cancelled read (fired timeout) never leaks an in-flight count.
 struct InFlightGuard {
     in_flight: Arc<AtomicUsize>,
 }
@@ -769,19 +638,8 @@ impl ObjectStore for TrackingStore {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.gets.lock().unwrap().push(location.clone());
         }
-        // Concurrency instrumentation: record the peak number of overlapping
-        // PROBED reads and hold each one "in flight" for a fixed interval. Gated
-        // to non-HEAD reads matching a needle (see `ConcurrencyProbe::needles`) so
-        // unrelated reads are neither counted nor delayed. When the needles name
-        // DELETE files, the permit that bounds this concurrency is held by the
-        // production code across the whole `read_delete_file_positions` call,
-        // whose `get_opts` are sequential — so the count observed here is exactly
-        // the number of delete reads holding a semaphore permit, and can never
-        // exceed the budget. When the needles name DATA files instead (the
-        // footer-fetch bound tests), that guarantee holds ONLY for a driver that
-        // constructs the physical plan and never executes it: an executed scan's
-        // opener re-reads those same data files at execute time while holding no
-        // permit, which would inflate this monotonic peak past the budget.
+        // For data-file needles the peak is only meaningful when the plan is built but never
+        // executed: execution re-reads data files without holding a permit.
         if !options.head
             && let Some(probe) = &self.concurrency
             && probe.is_probed_read(location)
@@ -828,12 +686,7 @@ impl ObjectStore for TrackingStore {
     }
 }
 
-/// Scenario (memory-creds): delete files are read through the SAME registered
-/// object-store instance the scan configures for data-file access — modeling
-/// "read with vended credentials" locally: a store standing in for a
-/// credentialed client is registered ONCE for the scan, and both the data
-/// file's read AND the associated delete file's read must flow through it (no
-/// separate, unauthenticated object-store path for delete files).
+/// Scenario: delete files are read through the same registered (credentialed) store as data files
 #[test]
 fn scan_reads_delete_files_with_vended_credentials() {
     let dir = temp_dir("vended_creds");
@@ -867,8 +720,6 @@ fn scan_reads_delete_files_with_vended_credentials() {
 
     assert_eq!(total_rows(&rows), 18, "2 deletes applied");
 
-    // The delete file's content was fetched via a `get` (not just a HEAD),
-    // proving it went through the SAME registered store as the data file.
     assert!(
         calls.load(Ordering::SeqCst) >= 2,
         "both the data file and the delete file must be fetched via the registered store (got {} calls)",
@@ -886,9 +737,6 @@ fn scan_reads_delete_files_with_vended_credentials() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Counts of non-HEAD `get_opts` calls whose location contains
-/// `needle` (typically a delete file's bare filename), taken from a
-/// [`TrackingStore`]'s recorded `gets`.
 fn count_gets_matching(gets: &std::sync::Mutex<Vec<ObjectStorePath>>, needle: &str) -> usize {
     gets.lock()
         .unwrap()
@@ -897,8 +745,6 @@ fn count_gets_matching(gets: &std::sync::Mutex<Vec<ObjectStorePath>>, needle: &s
         .count()
 }
 
-/// Run `spec` against a fresh [`TrackingStore`]-wrapped `LocalFileSystem`,
-/// returning the emitted rows and the recorded non-HEAD `get_opts` locations.
 fn run_scan_tracked(
     spec: &ScanSpec,
     register_url: &str,
@@ -923,28 +769,14 @@ fn run_scan_tracked(
     (rows, gets)
 }
 
-/// Scenario (perf regression guard, Phase A dedup): a single
-/// partition-granularity delete file referenced by TWO assigned data files —
-/// the same fixture shape as `scan_filters_partition_delete_by_file_path` — is
-/// read from the object store the SAME number of times regardless of how many
-/// data files reference it, proving Phase A dedups by delete-file path rather
-/// than reading once per referencing data file. Reuses the [`TrackingStore`]
-/// decorator (already proven in `scan_reads_delete_files_with_vended_credentials`)
-/// to count every non-HEAD `get_opts` by location — the actual body-read op,
-/// not an indirect proxy.
-///
-/// A single logical Parquet open (footer metadata + row-group data) issues
-/// more than one range `get_opts` on this object-store implementation, so
-/// "read exactly once" is proven by comparing traffic against a SOLO baseline
-/// (one referencing data file) rather than asserting a magic total: if Phase A
-/// re-read the delete file per referencing data file, the two-referencer count
-/// would be double the solo count instead of identical to it.
+/// Scenario: a delete file shared by two data files is read once per shard
 #[test]
 fn scan_reads_shared_delete_file_once_per_shard() {
+    // One Parquet open issues several range GETs, so this compares against a one-referencer
+    // baseline instead of asserting a magic total.
     let dir = temp_dir("shared_delete_once");
     let f0 = write_data_parquet(&dir, "p0/data.parquet", &(100..110).collect::<Vec<_>>(), 4);
     let f1 = write_data_parquet(&dir, "p1/data.parquet", &(200..210).collect::<Vec<_>>(), 4);
-    // One shared partition-granularity delete file: 2 rows for f0, 1 row for f1.
     let delete_url = write_delete_parquet(
         &dir,
         "shared_delete.parquet",
@@ -953,7 +785,6 @@ fn scan_reads_shared_delete_file_once_per_shard() {
     let shared_delete = delete_ref(&delete_url);
     let delete_filename = file_needle(&delete_url);
 
-    // Baseline: only f0 references the delete file (K=1 referencer).
     let solo_entries = vec![FileEntry::with_deletes(
         f0.clone(),
         local_file_size(&f0),
@@ -967,7 +798,6 @@ fn scan_reads_shared_delete_file_once_per_shard() {
         "the solo baseline scan must actually fetch the delete file's body"
     );
 
-    // Both f0 and f1 reference the SAME delete file (K=2 referencers).
     let shared_entries = vec![
         FileEntry::with_deletes(
             f0.clone(),
@@ -980,8 +810,6 @@ fn scan_reads_shared_delete_file_once_per_shard() {
     let (shared_rows, shared_gets) = run_scan_tracked(&shared_spec, &f0);
     let shared_delete_reads = count_gets_matching(&shared_gets, &delete_filename);
 
-    // Read-once-per-shard: adding a second referencing data file must not add
-    // any extra delete-file traffic.
     assert_eq!(
         shared_delete_reads, solo_delete_reads,
         "the shared delete file must be read exactly once per shard regardless of \
@@ -989,9 +817,6 @@ fn scan_reads_shared_delete_file_once_per_shard() {
          get_opts, shared (2 referencers) = {shared_delete_reads}"
     );
 
-    // Same post-delete row set as scan_filters_partition_delete_by_file_path:
-    // f0 loses positions 2,5 -> ids 102,105; f1 loses position 1 -> id 201.
-    // The dedup-by-path restructure must not change this result.
     assert_eq!(total_rows(&shared_rows), 17, "20 rows - 3 deleted = 17");
     let ids = ids_of(&shared_rows);
     for missing in [102, 105, 201] {
@@ -1006,21 +831,13 @@ fn scan_reads_shared_delete_file_once_per_shard() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fixed per-read delay for the concurrency-bound tests. Long enough that, on the
-/// tests' current-thread runtime, every read admitted in one scheduling wave has
-/// incremented the peak counter before any timer fires (a current-thread runtime
-/// only fires timers once it parks, i.e. after the whole wave is polled) — so the
-/// observed peak is deterministic, not a race on real I/O timing.
+/// A current-thread runtime fires timers only once it parks, so every read admitted in one
+/// scheduling wave bumps the peak before any delay elapses.
 const DELETE_READ_DELAY: Duration = Duration::from_millis(50);
 
-/// Explicit upper bound on each concurrency assertion: a mis-wired limiter that
-/// deadlocks (or never admits a read) fails here rather than hanging CI.
+/// A deadlocked limiter fails here rather than hanging CI.
 const DELETE_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Build a [`TrackingStore`] over a plain `LocalFileSystem` instrumented with a
-/// peak-concurrency probe over the given bare filenames — delete files for the
-/// `scan_delete_reads_*` tests, data files for the `scan_footer_fetches_*`
-/// tests. Returns the store and a handle to its peak-concurrency counter.
 fn tracking_store_with_probe(needles: Vec<String>) -> (Arc<TrackingStore>, Arc<AtomicUsize>) {
     let peak = Arc::new(AtomicUsize::new(0));
     let store = Arc::new(TrackingStore {
@@ -1037,21 +854,11 @@ fn tracking_store_with_probe(needles: Vec<String>) -> (Arc<TrackingStore>, Arc<A
     (store, peak)
 }
 
-/// Scenario (connection-concurrency bound): with a delete-read budget of N and
-/// MORE than N unique delete files to read, the concurrent delete-file reads peak
-/// at EXACTLY N — the shared instance-level semaphore admits N at a time and no
-/// more. The peak reaching N (not 0 or 1) proves the bound is genuinely
-/// exercised, not vacuously respected.
-///
-/// Determinism: each fake read holds one semaphore permit across its whole
-/// `read_delete_file_positions` call and sleeps a fixed interval inside its
-/// `get_opts`, so on the current-thread runtime the first scheduling wave admits
-/// exactly N reads (they all reach the sleep and bump the peak to N) before the
-/// (N+1)-th blocks on the permit — no reliance on real I/O timing.
+/// Scenario: concurrent delete-file reads peak at exactly the connection budget
 #[test]
 fn scan_delete_reads_bounded_by_connection_budget() {
     const BUDGET: usize = 3;
-    const UNIQUE_DELETES: usize = 6; // strictly greater than BUDGET
+    const UNIQUE_DELETES: usize = 6;
 
     let dir = temp_dir("bounded_budget");
     let data_url = write_data_parquet(&dir, "data.parquet", &(0..12).collect::<Vec<_>>(), 4);
@@ -1087,16 +894,13 @@ fn scan_delete_reads_bounded_by_connection_budget() {
          a lower peak means the fan-out was not exercised, a higher peak means the bound leaked"
     );
 
-    // Post-delete correctness: positions 0..6 removed from a 12-row file.
     assert_eq!(total_rows(&rows), 6, "6 of 12 rows deleted");
     assert_eq!(ids_of(&rows), (6..12).collect::<Vec<_>>());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (connection-concurrency bound, N=1): a budget of 1 forces delete-file
-/// reads to run strictly serially — the peak in-flight count is exactly 1 even
-/// when several unique delete files must be read.
+/// Scenario: a connection budget of 1 serializes delete-file reads
 #[test]
 fn scan_delete_reads_serial_when_budget_is_one() {
     const UNIQUE_DELETES: usize = 4;
@@ -1134,16 +938,13 @@ fn scan_delete_reads_serial_when_budget_is_one() {
         "a budget of 1 must serialize delete-file reads (peak in-flight == 1)"
     );
 
-    // Post-delete correctness: positions 0..4 removed from a 10-row file.
     assert_eq!(total_rows(&rows), 6, "4 of 10 rows deleted");
     assert_eq!(ids_of(&rows), (4..10).collect::<Vec<_>>());
 
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Write a two-column keyed Parquet (`key_col` Int64, `data_col` Utf8) with one
-/// row per key. Disjoint column names between the two join sides satisfy the VS
-/// disjoint-column guarantee the join path relies on. Returns the `file://` URL.
+/// Join sides must use disjoint column names: the join path relies on the VS guarantee.
 fn write_keyed_parquet(
     dir: &Path,
     relative: &str,
@@ -1178,36 +979,14 @@ fn write_keyed_parquet(
         .to_string()
 }
 
-/// Scenario (shared limiter across join sides — the regression guard a
-/// single-provider test cannot cover): a broadcast join whose fact AND dimension
-/// sides BOTH carry positional deletes, with more than N unique delete files
-/// across the two sides combined. `register_join_tables` builds ONE
-/// `Arc<Semaphore>` sized `s3_max_connections` and clones it into both sides; with
-/// `planning_concurrency` pinned to 2 DataFusion plans the two scan leaves
-/// concurrently, so both sides' Phase A delete reads contend for the SAME budget.
-///
-/// The peak reaches EXACTLY N only when the two sides genuinely overlap and draw
-/// from one shared pool: here N=3 with 2 unique delete files per side, so N is
-/// reached only by 2 fact reads + 1 dimension read in flight together — impossible
-/// without concurrent planning of both leaves (hence the explicit
-/// `planning_concurrency = 2`, never the runner's core-count default).
-///
-/// This FAILS against a per-provider-semaphore implementation: each side would get
-/// its own size-3 pool, admit both its reads at once, and the shared counter would
-/// peak at 4 (2 + 2) — exceeding N. That divergence (3 for the shared handle, 4
-/// for a per-provider handle) is exactly what pins the shared-`Arc` wiring.
-///
-/// The two sides' delete positions are also DELIBERATELY DISJOINT (fact: 0,1;
-/// dimension: 2,3) so the dimension side's own delete is falsifiable through the
-/// join's row count alone — a per-side credential/routing regression that read the
-/// dimension's delete file through the wrong store (or dropped it) would surface
-/// as an extra row, not just a different connection-count peak.
+/// Scenario: both join sides' delete-file reads share one connection budget
 #[test]
 fn scan_delete_reads_bounded_across_join_sides() {
+    // N=3 with 2 delete files per side: a per-side semaphore would peak at 4. Delete positions
+    // are disjoint per side so a dropped dimension-side delete shows up in the row count.
     const BUDGET: usize = 3;
 
     let dir = temp_dir("join_shared_budget");
-    // Fact (orders) and dimension (customer) sides, disjoint columns, joinable keys.
     let orders_url = write_keyed_parquet(
         &dir,
         "orders.parquet",
@@ -1225,8 +1004,6 @@ fn scan_delete_reads_bounded_across_join_sides() {
         4,
     );
 
-    // Two unique delete files per side (four total > BUDGET), each removing one
-    // row position from its side's data file.
     let mut needles = Vec::new();
     let mut fact_deletes = Vec::new();
     for i in 0..2 {
@@ -1238,9 +1015,6 @@ fn scan_delete_reads_bounded_across_join_sides() {
     let mut dim_deletes = Vec::new();
     for i in 0..2 {
         let name = format!("dim_del_{i}.parquet");
-        // Positions 2,3 — DISTINCT from the fact side's 0,1 — so the dimension
-        // side's own delete has an effect on the join output that the fact
-        // side's delete cannot also produce (see the row-count assertion below).
         let url = write_delete_parquet(&dir, &name, &[(&customer_url, (2 + i) as i64)]);
         dim_deletes.push(delete_ref(&url));
         needles.push(name);
@@ -1274,15 +1048,12 @@ fn scan_delete_reads_bounded_across_join_sides() {
 
     let (store, peak) = tracking_store_with_probe(needles);
     let rows = block_on(async {
-        // The join projects O_KEY and C_DATA.
         let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
             TestContext::scalar(vec![]),
             &[ExaType::Int64, scan_fixture::varchar()],
         );
         let mut config = session_config_for_spec(&spec);
-        // Pin concurrent planning of the two scan leaves regardless of core count,
-        // so both sides' Phase A runs concurrently against the one shared budget —
-        // a single-core runner must not serialize the leaves and pass vacuously.
+        // A single-core runner would otherwise serialize the leaves and pass vacuously.
         config.options_mut().execution.planning_concurrency = 2;
         let session = SessionContext::new_with_config(config);
         session
@@ -1313,14 +1084,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
          {BUDGET} (up to 4) would mean each provider built its own size-{BUDGET} semaphore"
     );
 
-    // Post-delete correctness: the fact side drops keys 0 and 1 (positions 0,1);
-    // the dimension side drops keys 2 and 3 (positions 2,3) — a different range,
-    // read through the dimension side's OWN routed store, not the fact side's.
-    // That makes the dimension-side delete falsifiable on its own: were it never
-    // applied, the dimension side would still offer keys 2 and 3, and the inner
-    // join would additionally match them against the fact side's surviving keys
-    // 2..8, yielding 6 rows instead of 4. Fact surviving {2,3,4,5,6,7} ∩
-    // dimension surviving {0,1,4,5,6,7} = {4,5,6,7} -> 4 rows.
+    // Fact {2..7} ∩ dimension {0,1,4..7} = {4..7}.
     assert_eq!(
         total_rows(&rows),
         4,
@@ -1332,14 +1096,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// An [`ObjectStore`] decorator that sums the byte length of every non-HEAD
-/// `get_opts` whose location contains `needle`, and counts how many such
-/// requests occurred. Delegates everything else to `inner` (a plain
-/// [`LocalFileSystem`]). Used by the row-group pruning tests (task 6) to
-/// observe HOW MUCH of a delete file's body a read actually transfers — the
-/// externally-visible signal that some row groups were skipped rather than
-/// decoded, since `with_row_groups(selected)` only fetches the column data of
-/// the selected row groups.
+/// Sums bytes of non-HEAD reads matching `needle`: skipped row groups transfer no column data.
 #[derive(Debug)]
 struct RangeBytesStore {
     inner: Arc<dyn ObjectStore>,
@@ -1417,8 +1174,6 @@ impl ObjectStore for RangeBytesStore {
     }
 }
 
-/// The bare filename of a `file://` URL, used as a [`RangeBytesStore`] /
-/// [`TrackingStore`]-style needle that matches only that file's own path.
 fn file_needle(abs_url: &str) -> String {
     let path = Url::parse(abs_url)
         .expect("valid file URL")
@@ -1430,13 +1185,7 @@ fn file_needle(abs_url: &str) -> String {
         .to_string()
 }
 
-/// Like [`write_delete_parquet`], but with control over row-group size,
-/// whether statistics are written, and the statistics truncation length.
-///
-/// Pass `None` for `truncate_length` unless the test targets the truncated-
-/// statistics fallback: arrow-rs truncates min/max to 64 bytes by default,
-/// but real Iceberg writers (parquet-java) don't truncate, so `None` matches
-/// real-world data.
+/// Pass `None` for `truncate_length` to match parquet-java, which does not truncate stats.
 fn write_delete_parquet_shaped(
     dir: &Path,
     relative: &str,
@@ -1486,11 +1235,7 @@ fn write_delete_parquet_shaped(
         .to_string()
 }
 
-/// Three data files' delete-entry rows, sorted by `(file_path, pos)` as
-/// Iceberg requires, `rows_per_file` positions each (`0..rows_per_file`). With
-/// a row-group size of exactly `rows_per_file`, each file's rows land in its
-/// own row group, so each group's true `file_path` min/max collapses to that
-/// one file's own path.
+/// Sorted by `(file_path, pos)` as Iceberg requires.
 fn one_row_group_per_file_entries(files: [&str; 3], rows_per_file: usize) -> Vec<(String, i64)> {
     let mut entries = Vec::with_capacity(files.len() * rows_per_file);
     for path in files {
@@ -1501,22 +1246,10 @@ fn one_row_group_per_file_entries(files: [&str; 3], rows_per_file: usize) -> Vec
     entries
 }
 
-/// Scenario (row-group pruning correctness, task 3 regression guard): a
-/// partition-granularity delete file with THREE row groups, each holding only
-/// one referenced data file's positions, is read by two shards that differ
-/// ONLY in which files are assigned. A shard assigning just the MIDDLE file
-/// must transfer strictly fewer, and less-than-half, of the delete file's
-/// bytes than a shard assigning all three files (whose every row group's own
-/// tight range matches its own assigned entry, so none is pruned) — an
-/// externally observable proof that the un-assigned files' row groups were
-/// skipped rather than decoded-and-discarded. Both shards still apply the
-/// correct, identical delete set to the middle file.
+/// Scenario: delete-file row groups for unassigned data files are pruned by `file_path` stats
 #[test]
 fn scan_prunes_delete_row_groups_by_file_path() {
-    // Large enough that each row group's `pos` column data dwarfs the fixed
-    // per-scan footer-read overhead the byte counter also captures — without
-    // this margin, the footer cost alone can keep the pruned/full ratio above
-    // one-half even though strictly fewer row groups are decoded.
+    // Large enough that row-group data dwarfs the footer bytes the counter also captures.
     const ROWS_PER_FILE: usize = 500;
 
     let dir = temp_dir("row_group_pruning");
@@ -1537,8 +1270,6 @@ fn scan_prunes_delete_row_groups_by_file_path() {
     let shared_delete = delete_ref(&delete_url);
     let needle = file_needle(&delete_url);
 
-    // Pruned shard: only f2 is assigned. f1's and f3's row groups cannot
-    // overlap f2's path and must be pruned, leaving one row group to decode.
     let pruned_entries = vec![FileEntry::with_deletes(
         f2.clone(),
         local_file_size(&f2),
@@ -1559,8 +1290,6 @@ fn scan_prunes_delete_row_groups_by_file_path() {
     ))
     .expect("pruned scan must succeed");
 
-    // Full shard: all three files are assigned, so every row group's own
-    // tight range matches its own assigned entry and none is pruned.
     let full_entries = vec![
         FileEntry::with_deletes(
             f1.clone(),
@@ -1606,9 +1335,6 @@ fn scan_prunes_delete_row_groups_by_file_path() {
          pruned={pruned_total} full={full_total}"
     );
 
-    // Correctness: f2's declared deletes (positions 0..100) cover all 5 of its
-    // real rows, and the pruned read must apply exactly the same delete set an
-    // unpruned read would.
     assert_eq!(
         total_rows(&pruned_rows),
         0,
@@ -1618,25 +1344,12 @@ fn scan_prunes_delete_row_groups_by_file_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (row-group pruning fallback — real string-statistics truncation):
-/// long, near-identical paths (mirroring deep S3 URI namespaces) whose shared
-/// prefix exceeds Parquet's 64-byte statistics-truncation length force the
-/// WRITER itself — not a hand-crafted fixture — to truncate the `file_path`
-/// column's min/max statistics. Each assigned file's own row group then
-/// carries truncated bounds that are DIFFERENT byte strings from its real
-/// path (a shortened prefix for min, an incremented shortened prefix for
-/// max): an equality-based pruning shortcut would wrongly skip such a row
-/// group, while the range-based check must still decode it. Confirms pruning
-/// under genuine truncation still yields the correct (unpruned-equivalent)
-/// delete set.
+/// Scenario: truncated `file_path` statistics never prune the assigned file's own row group
 #[test]
 fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     const ROWS_PER_FILE: usize = 20;
 
     let dir = temp_dir("truncated_stats");
-    // Deliberately longer than the 64-byte statistics-truncation length so the
-    // three files' paths share a prefix that itself exceeds the truncation
-    // boundary; they differ only in their final path segment.
     let long_prefix =
         "warehouse/analytics/very/long/namespace/orders/table/data/nested/deeply/for/truncation";
     assert!(
@@ -1674,9 +1387,6 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
         Some(64),
     );
 
-    // Only f_b (the MIDDLE file) is assigned; its own row group's truncated
-    // bounds must still be recognized as overlapping its real (untruncated)
-    // path, or its deletes would be silently skipped.
     let entry = FileEntry::with_deletes(
         f_b.clone(),
         local_file_size(&f_b),
@@ -1685,7 +1395,6 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     let spec = scan_spec(vec![entry], None, None);
     let rows = run_scan(&spec, &f_b);
 
-    // f_b's declared deletes (positions 0..20) cover all 5 of its real rows.
     assert_eq!(
         total_rows(&rows),
         0,
@@ -1697,16 +1406,7 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (row-group pruning fallback — absent statistics): a delete file
-/// written with column statistics DISABLED carries no `file_path` min/max on
-/// any row group. [`delete_row_group_may_match`] must treat an
-/// absent-statistics row group as "cannot rule out a match" and decode it
-/// rather than pruning it. Confirmed two ways: the read transfers essentially
-/// the WHOLE delete-file body (no row group is skipped for lack of stats to
-/// prune by), and it still yields the correct delete set for the assigned
-/// file.
-///
-/// [`delete_row_group_may_match`]: lakehouse_engine::scan::positional_deletes
+/// Scenario: delete-file row groups without `file_path` statistics are all decoded, never pruned
 #[test]
 fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
     const ROWS_PER_FILE: usize = 100;
@@ -1729,8 +1429,6 @@ fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
     let delete_total_size = local_file_size(&delete_url);
     let needle = file_needle(&delete_url);
 
-    // Only f2 is assigned; with no file_path statistics to prune by, f1's and
-    // f3's row groups cannot be ruled out and must be decoded too.
     let entry = FileEntry::with_deletes(
         f2.clone(),
         local_file_size(&f2),
@@ -1762,11 +1460,6 @@ fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Recurse the physical plan, collecting every leaf node (no children) as an
-/// owned `Arc<dyn ExecutionPlan>`. Mirrors `scan_agg_projection_pruning.rs`'s
-/// `collect_leaf_scans`, which collects labels/schemas instead of the node
-/// itself; this variant returns the node so its `DataSourceExec` can be
-/// downcast to inspect the `FileScanConfig` it built.
 fn collect_leaf_execs(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn ExecutionPlan>>) {
     let children = plan.children();
     if children.is_empty() {
@@ -1778,10 +1471,6 @@ fn collect_leaf_execs(plan: &Arc<dyn ExecutionPlan>, out: &mut Vec<Arc<dyn Execu
     }
 }
 
-/// The raw scan plan's single leaf, downcast to its `FileScanConfig` (the
-/// Parquet `DataSourceExec` the production provider builds). Asserts there is
-/// exactly one leaf and that it is Parquet-backed, so a caller can inspect
-/// `file_groups` directly.
 fn leaf_file_scan_config(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> datafusion::datasource::physical_plan::FileScanConfig {
@@ -1796,26 +1485,13 @@ fn leaf_file_scan_config(
     file_scan_config.clone()
 }
 
-/// Scenario (connection-concurrency bound, PLAN CONSTRUCTION ONLY): with a
-/// footer-fetch budget of N and MORE than N delete-carrying data files to
-/// fetch footers for, the concurrent footer fetches peak at EXACTLY N — the
-/// shared instance-level semaphore Phase B now shares with Phase A admits N at
-/// a time and no more.
-///
-/// PLAN CONSTRUCTION ONLY: `build_raw_scan_physical_plan` is awaited and
-/// `peak` is read IMMEDIATELY afterward; the returned plan is NEVER executed.
-/// The needles here are DATA-file names, not delete-file names (unlike
-/// `scan_delete_reads_bounded_by_connection_budget`), so executing the plan
-/// would let the opener's execute-time column reads of those same files —
-/// which hold no semaphore permit — latch into the same monotonic `fetch_max`
-/// peak and turn the assertion into an order-dependent flake.
-///
-/// File order is asserted from the PLAN itself (`leaf_file_scan_config`'s
-/// `file_groups`), not from execution.
+/// Scenario: concurrent footer fetches peak at exactly the connection budget
 #[test]
 fn scan_footer_fetches_bounded_by_connection_budget() {
+    // The plan is built but never executed: execute-time reads of the needled data files hold no
+    // permit and would inflate the peak.
     const BUDGET: usize = 3;
-    const DATA_FILES: usize = 6; // strictly greater than BUDGET
+    const DATA_FILES: usize = 6;
 
     let dir = temp_dir("footer_bounded_budget");
 
@@ -1894,21 +1570,12 @@ fn scan_footer_fetches_bounded_by_connection_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (file-metadata, PLAN CONSTRUCTION ONLY): a shard mixing
-/// delete-carrying and delete-free data files fetches a footer ONLY for the
-/// delete-carrying ones, and exactly once each — a delete-free file costs no
-/// footer fetch of its own, proving Phase B's fan-out (task 1.6) does not
-/// widen I/O beyond the entries that actually need an access plan.
-///
-/// PLAN CONSTRUCTION ONLY, for the same reason as
-/// `scan_footer_fetches_bounded_by_connection_budget`: the plan is built and
-/// never executed, so the opener's execute-time reads of these same files
-/// never contaminate the `get_opts` counts read immediately afterward.
+/// Scenario: a mixed shard fetches footers only for delete-carrying files, once each
 #[test]
 fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
+    // The plan is never executed so execute-time reads do not contaminate the counts.
     let dir = temp_dir("mixed_shard_footers");
 
-    // Interleaved order: delete-free, delete-carrying, delete-free, delete-carrying.
     let free_a = write_data_parquet(&dir, "free_a.parquet", &(0..10).collect::<Vec<_>>(), 4);
     let carrying_b =
         write_data_parquet(&dir, "carrying_b.parquet", &(0..10).collect::<Vec<_>>(), 4);
@@ -2012,65 +1679,17 @@ fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (shared limiter across join sides, PLAN CONSTRUCTION ONLY — the
-/// regression guard the single-provider footer tests cannot give): a broadcast
-/// join whose fact AND dimension sides BOTH carry positional deletes on every
-/// assigned data file, so BOTH sides run a Phase B footer fan-out.
-/// `register_join_tables` builds ONE `Arc<Semaphore>` sized `s3_max_connections`
-/// and clones it into both sides; with `planning_concurrency` pinned to 2
-/// DataFusion plans the two scan leaves concurrently, so both sides' footer
-/// fetches contend for the SAME budget.
-///
-/// The peak reaches EXACTLY N only when the two sides genuinely overlap and draw
-/// from one shared pool: here N=3 with 2 delete-carrying data files per side, so
-/// N is reached only by 2 fact footers + 1 dimension footer in flight together.
-/// A per-provider — or Phase-B-private — semaphore would give each side its own
-/// size-3 pool, admit both its footers at once, and peak at 4. That divergence
-/// (3 for one shared handle, 4 for two) is the whole point of this test, and no
-/// single-provider test can observe it.
-///
-/// A peak of 2 would mean the two leaves were planned sequentially rather than
-/// concurrently, collapsing the overlap to one in-flight footer fetch per side
-/// at a time; a peak of 4 would mean each side drew from its own per-provider
-/// semaphore instead of the one shared handle.
-///
-/// PLAN CONSTRUCTION ONLY: [`build_join_physical_plan`] registers both sides and
-/// returns the physical plan WITHOUT executing it, and `peak` is read
-/// immediately after it returns. `run_join_scan_with_session` MUST NOT be used
-/// here. The needles below are DATA-file names, not the delete-file names
-/// `scan_delete_reads_bounded_across_join_sides` uses, and the opener never
-/// reads a delete file — so an executed join would count and delay the opener's
-/// execute-time column reads of those same four data files, which hold no
-/// semaphore permit, into this same monotonic `fetch_max` peak, latching any
-/// execute-time overlap above N permanently and turning `assert_eq!` into an
-/// order-dependent flake.
-///
-/// Needling only the DATA files also keeps Phase A's delete-file reads
-/// undelayed, so the peak this test pins is built purely from Phase B windows.
-///
-/// BOTH sides carry a non-empty `logical_schema`, built through the same
-/// [`logical_fields`] seam as the single-provider tests but with the column
-/// names `write_keyed_parquet` actually writes (decision-log [8] applies to a
-/// join's peak assertion exactly as it does to a single provider's): an empty
-/// `logical_schema` sends `register_file_list` down the
-/// `ParquetFormat::infer_schema` branch, whose GET against the first assigned —
-/// and therefore needled — DATA file is a DELAYED read taken outside the
-/// semaphore, contaminating the very peak asserted here.
-///
-/// Post-delete row-set equality is deliberately NOT asserted here;
-/// `scan_delete_reads_bounded_across_join_sides` already covers it, executing
-/// against its own store with no data-file needles.
+/// Scenario: both join sides' footer fetches share one connection budget
 #[test]
 fn scan_footer_fetches_bounded_across_join_sides() {
+    // N=3 with 2 files per side: a per-side semaphore would peak at 4, sequential planning at 2.
+    // The plan is never executed (execute-time reads hold no permit), and both sides need a
+    // `logical_schema` so schema inference does not add an unpermitted GET.
     const BUDGET: usize = 3;
-    const FILES_PER_SIDE: usize = 2; // 2 + 2 = 4 footers, strictly greater than BUDGET
+    const FILES_PER_SIDE: usize = 2;
 
     let dir = temp_dir("join_footer_shared_budget");
 
-    // Fact (orders) and dimension (customer) sides with disjoint column names,
-    // as the VS disjoint-column guarantee the join path relies on requires.
-    // EVERY data file carries its own one-position delete file, so both sides
-    // fetch a footer per assigned file during access-plan construction.
     let mut needles = Vec::with_capacity(2 * FILES_PER_SIDE);
     let mut fact_entries = Vec::with_capacity(FILES_PER_SIDE);
     let mut dim_entries = Vec::with_capacity(FILES_PER_SIDE);
@@ -2134,10 +1753,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
 
     block_on(async {
         let mut config = session_config_for_spec(&spec);
-        // Pin concurrent planning of the two scan leaves regardless of core
-        // count, so both sides' Phase B fan-out runs against the one shared
-        // budget — a single-core runner must not serialize the leaves and pass
-        // vacuously.
+        // A single-core runner would otherwise serialize the leaves and pass vacuously.
         config.options_mut().execution.planning_concurrency = 2;
         let session = SessionContext::new_with_config(config);
         session

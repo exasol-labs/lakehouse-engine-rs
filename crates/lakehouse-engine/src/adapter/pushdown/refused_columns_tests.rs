@@ -21,10 +21,6 @@ fn user_message(err: UdfError) -> String {
     }
 }
 
-/// The `stats_all_types` shape — `map_col` and `nested_struct` are rendered as JSON and only
-/// `binary_col` is refused — plus a `variant_col`, the one other type that stays refused, so a
-/// request can name one refused column or two. Exasol's catalog declares every one of them,
-/// mappable or not, so a request can name any.
 fn involved_tables() -> Json {
     json!([{
         "name": "STATS_ALL_TYPES",
@@ -168,14 +164,6 @@ fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// `COUNT(*)` widens `extract_projection`'s output to the synthetic full base
-/// row (an aggregate select list, per `project_columns`), but names no column
-/// anywhere in the request JSON. Unlike a real `SELECT *` (whose projection IS
-/// the emitted row, proven above), a widened projection is withheld — passed as
-/// `None` — because it is a placeholder `build_dispatch_sql` never reads for a
-/// decomposable aggregate; unioning it would refuse a query that reads no column
-/// value at all.
 #[test]
 fn a_widened_projection_from_an_aggregate_select_list_is_not_unioned_into_the_touched_set() {
     let request = json!({
@@ -203,13 +191,6 @@ fn a_widened_projection_from_an_aggregate_select_list_is_not_unioned_into_the_to
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// The complementary half of the widened branch, and the whole safety argument for
-/// withholding a widened projection: the blind walk alone must still refuse an
-/// aggregate whose own `arguments` name a refused column. If the walk ever stopped
-/// reaching aggregate arguments, filters, or GROUP BY items on a widened request,
-/// `MAX(BINARY_COL)` would be silently admitted and every admit-side test would
-/// still pass.
 #[test]
 fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused_column() {
     let request = json!({
@@ -282,11 +263,7 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
     );
 }
 
-// Scenario Coverage (delta-type-mapping): A refused column refuses only the requests that read or
-// emit it
-/// In the `stats_all_types` shape only `binary_col` is refused: a request reading or emitting
-/// `map_col` or `nested_struct` — both rendered as JSON since issue #350 — is planned normally,
-/// while one naming `binary_col` is still refused.
+/// Scenario: in the stats_all_types shape only binary_col refuses requests
 #[test]
 fn only_binary_col_refuses_requests_in_the_stats_all_types_shape() {
     let refused = [refused_column("binary_col", BINARY_REASON)];

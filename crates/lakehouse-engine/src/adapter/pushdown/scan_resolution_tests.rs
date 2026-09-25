@@ -7,13 +7,7 @@ use super::super::test_support::{
 use super::*;
 use crate::scan::spec::{StorageBackend, StorageProps};
 
-/// Scenario: A Unity Catalog table's identity survives the round trip from the
-/// involved table.
-///
-/// The recorded dotted identifier is split into namespace segments and a table
-/// name, and the loader re-joins them into the SAME dotted full name the Unity
-/// Catalog addresses a table by — so exactly the recorded table is loaded, and
-/// the reader that plans it names that same table back.
+/// Scenario: a Unity Catalog table's identity survives the round trip from the involved table
 #[tokio::test]
 async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
     let catalog = RecordingCatalog::spawn(|target| {
@@ -56,14 +50,7 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
     );
 }
 
-/// Scenario: A Unity Catalog table's identity survives the round trip from the
-/// involved table.
-///
-/// The split is the exact inverse of the join that recorded the identifier: the
-/// leading segments become the namespace and the last one the table name. An
-/// identifier carrying no separator at all recovers an EMPTY namespace, which
-/// addresses no Unity Catalog table, so it is refused here rather than sent to
-/// the catalog.
+/// Scenario: a recorded identifier splits into namespace segments and table name; a bare one is refused
 #[test]
 fn a_recorded_identifier_recovers_its_namespace_segments_and_table_name() {
     let three_level = unity_table_ident("cat.sch.orders").expect("a three-level identifier");
@@ -85,13 +72,7 @@ fn a_recorded_identifier_recovers_its_namespace_segments_and_table_name() {
     );
 }
 
-/// Scenario: A Unity Catalog table's identity survives the round trip from the
-/// involved table.
-///
-/// A recorded identifier that names no table — an empty last segment, or no
-/// segment separator at all — is refused by name when the request's resolver is
-/// built, BEFORE any catalog request, because trimming it back to the segment
-/// before would address a different table.
+/// Scenario: an identifier naming no table is refused before any catalog request
 #[tokio::test]
 async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalog_request() {
     let catalog = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
@@ -126,12 +107,7 @@ async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalo
     );
 }
 
-/// Scenario: One catalog session per request serves every table the request
-/// resolves.
-///
-/// EVERY identifier the request will resolve is checked, not just the first: a
-/// join whose second leg is malformed is refused before the session is built, so
-/// it costs no catalog round-trip at all.
+/// Scenario: a malformed identifier on any join leg is refused before any catalog request
 #[tokio::test]
 async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_catalog_request() {
     let catalog = iceberg_catalog().await;
@@ -164,14 +140,7 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_ca
     );
 }
 
-/// Scenario: Every pushdown request shape resolves through the one format-reader
-/// seam.
-///
-/// An `IcebergRest` kind reaches the Iceberg reader, which resolves the
-/// requested identifier and comes back with EMPTY partition columns — what the
-/// resolver itself owns. The reader's own resolved shape (table root, files,
-/// effective storage, logical schema, name mapping) is covered by
-/// `format/iceberg_tests.rs`.
+/// Scenario: an Iceberg identifier resolves through the Iceberg reader with no partition columns
 #[tokio::test]
 async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_partition_columns() {
     let catalog = iceberg_catalog().await;
@@ -210,12 +179,7 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
     );
 }
 
-/// Scenario: One catalog session per request serves every table the request
-/// resolves.
-///
-/// The session is resolved into the resolver ONCE and reused for every table,
-/// so a two-table request performs no more catalog authentication round-trips
-/// than a single-table one.
+/// Scenario: one catalog session per request serves every table the request resolves
 #[tokio::test]
 async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     let catalog = iceberg_catalog().await;
@@ -255,10 +219,7 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     );
 }
 
-/// Scenario: One catalog session per request serves every table the request
-/// resolves — the `UnityCatalogNative` twin of
-/// `one_catalog_session_serves_every_table_the_resolver_resolves`, since that
-/// test covers only the Iceberg arm of the resolver doc's session-reuse claim.
+/// Scenario: one Unity Catalog session per request serves every table the request resolves
 #[tokio::test]
 async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
     const SECOND_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.customers";
@@ -308,7 +269,6 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
     );
 }
 
-/// An empty, non-truncated S3 listing: a directory with no data file.
 const EMPTY_LIST_BUCKET_RESULT: &str = concat!(
     r#"<?xml version="1.0" encoding="UTF-8"?>"#,
     r#"<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">"#,
@@ -316,10 +276,8 @@ const EMPTY_LIST_BUCKET_RESULT: &str = concat!(
     "<IsTruncated>false</IsTruncated></ListBucketResult>",
 );
 
-/// The CONNECTION address a direct-storage virtual schema is created over.
 const DIRECT_STORAGE_ADDRESS: &str = "s3://warehouse";
 
-/// An S3-compatible endpoint answering every listing empty while recording each request line.
 async fn empty_s3_endpoint() -> RecordingCatalog {
     RecordingCatalog::spawn(|_| (200, EMPTY_LIST_BUCKET_RESULT.to_string())).await
 }
@@ -336,7 +294,7 @@ fn direct_storage_backend(endpoint: &str) -> StorageBackend {
     })
 }
 
-// Direct-storage case: the object store is built once (no request cost) and each leg lists only its own table root — one listing per leg, no per-leg session setup.
+/// Scenario: a direct-storage store is built once and each leg lists only its own table root
 #[tokio::test]
 async fn one_session_or_store_per_request_serves_every_leg() {
     let endpoint = empty_s3_endpoint().await;
@@ -389,7 +347,7 @@ async fn one_session_or_store_per_request_serves_every_leg() {
     );
 }
 
-// Identifiers naming no first-level directory are refused before any listing, since they'd compose a table root outside the storage base path.
+/// Scenario: a direct-storage identifier naming no first-level directory is refused before listing
 #[tokio::test]
 async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused() {
     let endpoint = empty_s3_endpoint().await;
@@ -428,7 +386,7 @@ async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused(
     );
 }
 
-// The pushdown path must compose the same table_root as enumeration's storage_location, regardless of trailing separators in the CONNECTION address.
+/// Scenario: the pushdown table root equals the discovery-composed storage location
 #[tokio::test]
 async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location() {
     let endpoint = empty_s3_endpoint().await;
@@ -467,7 +425,7 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
     );
 }
 
-// RequestSession has one variant per catalog kind, built once here, so no later step needs a second kind match.
+/// Scenario: every catalog kind resolves a request session of its own
 #[tokio::test]
 async fn request_session_has_one_variant_per_kind() {
     let iceberg = iceberg_catalog().await;

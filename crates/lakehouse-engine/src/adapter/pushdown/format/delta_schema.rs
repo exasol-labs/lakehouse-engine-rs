@@ -13,61 +13,29 @@ use super::RefusedColumn;
 #[path = "delta_schema_tests.rs"]
 mod tests;
 
-/// The three values `build_delta_table_schema` answers: the ordered [`LogicalField`] list, the
-/// table's ordered partition-column names, and the columns it declined to map.
 type DeltaTableSchema = (Vec<LogicalField>, Vec<String>, Vec<RefusedColumn>);
 
-/// Resolves a Delta table's logical schema and metadata into the three format-neutral values the
-/// scan spec carries for it: the ordered [`LogicalField`] list feeding `ScanSpec::logical_schema`,
-/// each field carrying the ONE binding key its column-mapping mode selects; the table's ordered
-/// partition-column names feeding `CommonScanSpec::partition_columns`; and the columns this call
-/// declined to map, each named with the reason.
+/// Maps a Delta schema to the scan spec's logical fields (each with the one binding key its
+/// column-mapping mode selects), the partition columns, and the refused columns.
 ///
-/// `column_mapping_mode` is the column-mapping mode already IN FORCE — the protocol-gated mode
-/// from [`DeltaSnapshot::column_mapping_mode`](super::delta_replay::DeltaSnapshot::column_mapping_mode),
-/// never the raw `delta.columnMapping.mode` property. Passing the ungated property would have
-/// this engine expect physical column names the table never wrote, because the Delta protocol
-/// requires that property to be ignored unless the protocol supports the `columnMapping` reader
-/// feature. The mode itself is carried NO further than this call: its only consumer is the
-/// per-field binding-key choice made here, so encoding that choice on each field leaves no second
-/// home free to disagree with it.
+/// `column_mapping_mode` must be the protocol-gated mode in force, never the raw
+/// `delta.columnMapping.mode` property, which the protocol says to ignore without the
+/// `columnMapping` reader feature. The mode goes no further than this call.
 ///
-/// `partition_columns` is the table's own partition-column list, threaded through unchanged so a
-/// table with zero active files still carries it. Maps each column's Delta type onto its own Arrow
-/// tag, onto the `utf8` tag when Exasol cannot represent the type natively — an out-of-domain
-/// decimal, `void`, either interval type, or a CONTAINER (`array`, `struct`, or `map`) every one of
-/// whose members is itself mappable at every nesting depth — or REFUSES the column: no
-/// [`LogicalField`] is emitted for it, and it is recorded in the returned refused list, naming the
-/// reason its type cannot be rendered faithfully. A refused column never fails this call by
-/// itself — refusing the whole table when NO column is mappable is the caller's decision, made once
-/// every column has been classified. A [`UdfError`] surfaces from this call for two reasons only: a
-/// MAPPABLE column carries a malformed column-mapping annotation at any depth, or any column
-/// carries a malformed `delta.typeChanges` annotation at any depth. An UNSUPPORTED (as opposed to
-/// malformed) recorded type change refuses only its own column and never fails the call. Performs
-/// no Delta reader-feature gating.
+/// Types Exasol cannot represent natively (out-of-domain decimal, `void`, intervals, and
+/// containers whose members all map) are tagged `utf8`; others are refused. A refused column
+/// never fails the call; refusing a table with no mappable column is the caller's decision.
+/// Errors arise only from a malformed column-mapping annotation on a mappable column or a
+/// malformed `delta.typeChanges` annotation. Performs no reader-feature gating.
 ///
-/// Each column is resolved by ONE recursive walk that visits every nested field exactly once, so
-/// the three answers a column needs — its Arrow tag, its recorded type changes' validity, and the
-/// nested descriptor the JSON renderer keys its value by — can never disagree about which fields
-/// the column has.
+/// Per field, checks run type, then recorded type changes, then binding key, so a column
+/// refused for its type or change is never failed for an annotation this engine won't read.
+/// Per `PROTOCOL.md` § Reader Requirements for Type Widening, readers must *"validate that
+/// they support all type changes … and fail when finding any unsupported type change"*; an
+/// unsupported change refuses only its own column.
 ///
-/// A column's TYPE is classified BEFORE its `delta.columnMapping.*` binding key is ever read, at
-/// every depth: a refused column's binding key is never looked up, so a column is refused for its
-/// type and never for an annotation on a column this engine will not read.
-///
-/// A column whose type classifies successfully is then checked against the recorded
-/// `delta.typeChanges` history of EVERY field it carries, nested ones included: an entry whose
-/// `fromType`/`toType` pair the Delta protocol's type-widening feature does not support refuses the
-/// column, naming both types and the annotated field's path, through the SAME refused-column list —
-/// the reader obligation `PROTOCOL.md` § Reader Requirements for Type Widening states as *"validate
-/// that they support all type changes … and fail when finding any unsupported type change"*. This
-/// check runs BEFORE the binding-key lookup too, for the same reason: a column refused for an
-/// unsupported recorded change is never also failed for a missing column-mapping annotation.
-///
-/// Under `id`/`name` column mapping a MAPPABLE column's binding key comes from its
-/// `delta.columnMapping.*` annotations ALONE, at every depth: a field missing either annotation, or
-/// carrying an id no `i32` holds, is refused — its ordinal position and its logical name are values
-/// the writer never used.
+/// Under `id`/`name` mapping the binding key comes from the annotations alone: ordinal
+/// position and logical name are values the writer never used.
 pub(super) fn build_delta_table_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
@@ -109,19 +77,9 @@ fn unsupported_type_change(
         .find(|change| !is_supported_type_change(change)))
 }
 
-/// The ONE binding key `field` binds by, as the `(field_id, physical_name)` pair both
-/// [`LogicalField`] and [`NestedField`] hold — one rule for a top-level column and a nested field
-/// alike, `path` locating the field for the message a missing annotation produces. At most one member is ever populated: two keys would need a precedence
-/// rule the Delta protocol does not define, and the second would never be consulted.
-///
-/// `Id` mode selects the `delta.columnMapping.id` annotation — the only mode in which Delta writes
-/// Parquet field-ids. `Name` mode selects the `delta.columnMapping.physicalName` annotation, which
-/// the protocol REQUIRES a `name`-mode reader to match on. `None` mode selects NEITHER, leaving the
-/// column to bind by its own logical name: an ordinal position is a value no writer ever wrote into
-/// any file, so carrying one invites a false field-id match against a file that does carry ids.
-///
-/// The dispatch is exhaustive rather than defaulted, so a column-mapping mode added to the Delta
-/// protocol is a compile error here rather than a column silently bound by the wrong key.
+/// At most one member is populated: two keys would need a precedence rule the protocol does
+/// not define. `None` mode binds by logical name; an ordinal would invite a false field-id
+/// match against a file that does carry ids. Exhaustive so a new mode is a compile error.
 fn binding_key(
     field: &StructField,
     path: &FieldPath,
@@ -140,12 +98,8 @@ fn binding_key(
     }
 }
 
-/// BOTH `delta.columnMapping.*` annotations a column must carry under `id`/`name` mode.
-///
-/// Both are read in EITHER mapped mode even though only one becomes the column's binding key,
-/// because the Delta protocol requires both in either mode and nothing on the read path validates
-/// either — so a column declaring only the one its current mode happens to select is refused here
-/// rather than reaching the scan as a half-annotated column.
+/// Both are required in either mapped mode by the protocol and nothing on the read path
+/// validates them, so a half-annotated column is refused here.
 fn mapped_column_annotations(
     field: &StructField,
     path: &FieldPath,
@@ -157,11 +111,6 @@ fn mapped_column_annotations(
     ))
 }
 
-/// The `delta.columnMapping.physicalName` annotation `field` carries — the name its Parquet
-/// counterpart was written under.
-///
-/// Absent, or present but non-string, is refused rather than substituted, because nothing on the
-/// read path validates the annotation and the logical name is a column the writer never wrote.
 fn column_mapping_physical_name(
     field: &StructField,
     path: &FieldPath,
@@ -183,11 +132,7 @@ fn column_mapping_physical_name(
     }
 }
 
-/// The `delta.columnMapping.id` annotation `field` carries, refused when absent or wider than the
-/// `i32` the wire carries.
-///
-/// Never substituted by the field's ordinal position: an ordinal can collide with a sibling
-/// column's assigned id, and no writer ever wrote it into a file.
+/// Never substituted by the ordinal position, which can collide with a sibling's assigned id.
 fn column_mapping_id(
     field: &StructField,
     path: &FieldPath,
@@ -218,29 +163,20 @@ fn unusable_column_mapping(path: &FieldPath, mode: ColumnMappingMode, problem: S
     ))
 }
 
-/// What walking one Delta type or one Delta field answers: it maps, or the column carrying it is
-/// refused.
-///
-/// Refusing a column is an expected outcome of reading a Delta schema — never a failure of it — so
-/// it is answered as a value rather than signalled as an error and converted back to data one line
-/// later. That leaves a [`UdfError`] out of [`build_delta_table_schema`] meaning a MALFORMED
-/// annotation — either column-mapping or `delta.typeChanges` — and nothing else.
+/// A refusal is an expected outcome, not an error, so a [`UdfError`] from
+/// [`build_delta_table_schema`] means only a malformed annotation.
 enum Walked<T> {
     Mapped(T),
     Refused(Refusal),
 }
 
-/// Why a column is not mapped: the cause, phrased as the predicate a composer completes with the
-/// column's name, and the path of the nested member the cause belongs to — `None` when the cause is
-/// the column's own declared type or its own recorded type change.
+/// `member_path` is `None` when the cause is the column's own type or type change.
 struct Refusal {
     member_path: Option<String>,
     cause: String,
 }
 
 impl Refusal {
-    /// This refusal stated for the column that carries it, by whichever of the two composers the
-    /// cause's own location selects.
     fn stated_for(&self, column: &StructField) -> String {
         match &self.member_path {
             Some(member_path) => refused_container_member(column, member_path, &self.cause),
@@ -249,25 +185,18 @@ impl Refusal {
     }
 }
 
-/// What one mapped Delta TYPE answers: the Arrow tag the scan binds it by, and — for a container —
-/// the members the JSON renderer keys its value by, `None` for every other type.
 struct MappedType {
     arrow_type: String,
     members: Option<NestedMembers>,
 }
 
-/// What one mapped Delta FIELD answers: its type's Arrow tag, which only a top-level column
-/// declares, and the descriptor entry carrying its logical name, its one binding key, and its own
-/// members.
 struct MappedField {
     arrow_type: String,
     descriptor: NestedField,
 }
 
-/// One field's path within the top-level column that carries it: the column's own name, then one
-/// segment per nesting step — a `struct` field's name, or `element`, `key`, or `value` for the
-/// positional member of an `array` or a `map`, which is the vocabulary the Delta protocol's own
-/// `fieldPath` uses for exactly those positions.
+/// Segments use the protocol's own `fieldPath` vocabulary: `element`, `key`, `value` for
+/// positional container members.
 #[derive(Clone)]
 struct FieldPath(Vec<String>);
 
@@ -286,29 +215,18 @@ impl FieldPath {
         self.0.join(".")
     }
 
-    /// This path as the member path a refusal reports, or `None` when it is the top-level column
-    /// itself and therefore names no member inside it.
     fn member_path(&self) -> Option<String> {
         (self.0.len() > 1).then(|| self.rendered())
     }
 }
 
-/// The path segment naming an `array`'s element.
 const ELEMENT_SEGMENT: &str = "element";
 
-/// The path segment naming a `map`'s key.
 const KEY_SEGMENT: &str = "key";
 
-/// The path segment naming a `map`'s value.
 const VALUE_SEGMENT: &str = "value";
 
-/// Walks `field` — a top-level Delta column, or a `struct` field at any depth — at its own `path`
-/// within its column, into the three answers its column needs from it.
-///
-/// The three checks run in the order their outcomes must outrank one another: the field's TYPE
-/// first, so a field refused for its type is never instead failed for an annotation on a column
-/// this engine will not read; then the field's own recorded `delta.typeChanges` history; then the
-/// binding key its column-mapping mode selects.
+/// Check order sets precedence: type, then recorded type changes, then binding key.
 fn walk_field(
     field: &StructField,
     path: &FieldPath,
@@ -338,17 +256,10 @@ fn walk_field(
     }))
 }
 
-/// Walks `data_type` at `path`, recursing through every member of a container: an `array`'s
-/// element, a `struct`'s every field, and a `map`'s key AND value.
-///
-/// A container maps exactly when every one of its members maps, and is tagged `utf8` because the
-/// JSON renderer recurses natively through every nesting depth. Membership of the rendered set is
-/// therefore decided by whether each member is itself RENDERABLE — never by whether the container's
-/// Arrow form can be cast to text, which for `struct` and `map` it cannot be and for `array` yields
-/// display text rather than JSON.
-///
-/// A member's REFUSAL outranks a sibling's malformed annotation: a column refused for one member's
-/// type must never instead fail the call for an annotation on a column this engine will not read.
+/// A container maps exactly when every member maps, and is tagged `utf8` because the JSON
+/// renderer recurses natively; casting the Arrow form to text is not an option (`struct` and
+/// `map` can't be cast, `array` yields display text). A member's refusal outranks a
+/// sibling's malformed annotation.
 fn walk_type(
     data_type: &DataType,
     path: &FieldPath,
@@ -431,8 +342,6 @@ fn tagged(arrow_type: &str) -> Walked<MappedType> {
     })
 }
 
-/// A container this engine renders as one JSON document: tagged `utf8`, carrying the members the
-/// renderer keys that document by.
 fn rendered_container(members: NestedMembers) -> Walked<MappedType> {
     Walked::Mapped(MappedType {
         arrow_type: "utf8".to_string(),
@@ -440,8 +349,6 @@ fn rendered_container(members: NestedMembers) -> Walked<MappedType> {
     })
 }
 
-/// A refusal whose cause is the type at `path` itself, which `path` alone decides is the column's
-/// own type or one member inside it.
 fn refused_type(path: &FieldPath, cause: String) -> Walked<MappedType> {
     Walked::Refused(Refusal {
         member_path: path.member_path(),
@@ -449,17 +356,10 @@ fn refused_type(path: &FieldPath, cause: String) -> Walked<MappedType> {
     })
 }
 
-/// The refusal of a column for its OWN declared type or its OWN recorded type change.
 fn refused_column(column: &StructField, cause: &str) -> String {
     format!("Delta column '{}' {cause}", column.name())
 }
 
-/// The refusal of a column for ONE member inside its container type — an `array`'s element, a
-/// `struct`'s field, or a `map`'s key or value alike, at any nesting depth.
-///
-/// The one composer every container kind shares. It names the column's own declared type, the path
-/// of the offending member, and that member's own cause, so nesting adds no message layer per kind
-/// and no operator is told the column has a member's type.
 fn refused_container_member(column: &StructField, member_path: &str, cause: &str) -> String {
     format!(
         "Delta column '{}' has type '{}', whose member '{member_path}' {cause}",
@@ -481,18 +381,12 @@ fn variant_cause() -> String {
         .to_string()
 }
 
-/// The `delta.typeChanges` metadata key, quoted from the Delta protocol's § Type Change Metadata.
+/// Per the Delta protocol's § Type Change Metadata.
 const TYPE_CHANGES_KEY: &str = "delta.typeChanges";
 
-/// One recorded entry of a Delta field's `delta.typeChanges` metadata: a single type change the
-/// table schema declares as applied to this field, per § Type Change Metadata. `from_type` and
-/// `to_type` are the RAW `fromType`/`toType` strings the entry carries — `"byte"`, `"long"`,
-/// `"decimal(10,2)"`, and so on — left unparsed because interpreting them against the protocol's
-/// supported-pair rule is a separate concern from reading the entry's shape. `field_path` is the
-/// entry's optional `fieldPath`, present only "When updating the type of a map key/value or array
-/// element", per the protocol: it is retained verbatim and never interpreted, locating the change
-/// for the operator who reads a refusal while the `fromType`/`toType` pair stays the sole validation
-/// input.
+/// `from_type`/`to_type` are the raw strings. `field_path` is present only for a map
+/// key/value or array element change; it is kept verbatim for the refusal message and never
+/// used for validation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RecordedTypeChange {
     from_type: String,
@@ -501,9 +395,7 @@ struct RecordedTypeChange {
 }
 
 impl RecordedTypeChange {
-    /// The path of the field this entry's change applies to: the annotated field's own path,
-    /// extended by the entry's own `fieldPath` when it carries one, because the protocol writes that
-    /// key only for a change applying to a member BELOW the annotated field.
+    /// The protocol writes `fieldPath` only for a change applying below the annotated field.
     fn applied_to(&self, annotated: &FieldPath) -> FieldPath {
         match &self.field_path {
             Some(field_path) => annotated.child(field_path),
@@ -520,16 +412,9 @@ fn type_change_cause(from_type: &str, to_type: &str) -> String {
     )
 }
 
-/// Parses `field`'s `delta.typeChanges` metadata into its recorded type-change entries.
-///
-/// Validates only the entry's SHAPE, never whether the recorded change is one this engine
-/// supports — that predicate belongs to the Delta protocol validation this parser feeds, not to
-/// reading the annotation. Returns an empty list for a field carrying no `delta.typeChanges` key,
-/// so an unannotated table (or column) is unaffected. Ignores every entry key besides `fromType`,
-/// `toType`, and `fieldPath` — notably `tableVersion`, which the superseded accepted RFC required
-/// and which Delta 3.2-era clients still write on every entry, including all thirteen entries of
-/// the vendored `type-widening` fixture — because rejecting an unrecognized key would refuse an
-/// otherwise valid, protocol-conformant entry for carrying one.
+/// Validates shape only; support is decided by [`is_supported_type_change`]. Unknown keys are
+/// ignored, notably `tableVersion`, which Delta 3.2-era writers still emit (as in the vendored
+/// `type-widening` fixture) and rejecting it would refuse conformant entries.
 fn recorded_type_changes(
     field: &StructField,
     path: &FieldPath,
@@ -606,31 +491,17 @@ fn malformed_type_change(path: &FieldPath, problem: String) -> UdfError {
     ))
 }
 
-/// The precision the Delta protocol gives a `Byte`, `Short`, or `Int` source when the target is a
-/// decimal. All three are stored as `INT32`, so the protocol's supported target is
-/// `Decimal(10 + k1, k2)` for every one of them — never a target derived from the declared source
-/// type's own narrower range.
+/// All of `Byte`, `Short`, `Int` are stored as `INT32`, so the protocol's supported decimal
+/// target is `Decimal(10 + k1, k2)` for each, not one derived from the source's own range.
 const INT32_SOURCE_DECIMAL_PRECISION: u8 = 10;
 
-/// The precision the Delta protocol gives a `Long` source when the target is a decimal:
-/// `Decimal(20 + k1, k2)`, `INT64` being the physical form.
+/// `Long` → `Decimal(20 + k1, k2)`, `INT64` being the physical form.
 const INT64_SOURCE_DECIMAL_PRECISION: u8 = 20;
 
-/// Answers whether the Delta protocol's type-widening feature supports the change `change`
-/// records, per § Type Widening's supported list — the check § Reader Requirements for Type
-/// Widening makes a reader obligation: *"Readers must validate that they support all type changes
-/// in the `delta.typeChanges` field … and fail when finding any unsupported type change."*
-///
-/// Answers the protocol's list and nothing else. `long` → `double` is REFUSED: the floating-point
-/// bullet names `Byte`, `Short` or `Int` and omits `Long`, which is lossy above 2^53, so a cast
-/// arrow-cast will happily perform is still not a change any conforming writer records.
-///
-/// The entry's `field_path` is never an input here: the protocol's supported-pair rule does not
-/// depend on it, so the path is retained for the refusal to REPORT and its grammar is never parsed.
-///
-/// A `fromType`/`toType` that is not a Delta primitive type name answers `false` — one more pair
-/// the protocol's list does not contain. It is not a malformed entry: [`recorded_type_changes`]
-/// owns the entry's shape, and every type change the protocol defines is primitive to primitive.
+/// The protocol's § Type Widening supported list and nothing else. `long` → `double` is
+/// refused: the list omits `Long` (lossy above 2^53) even though arrow-cast would do it.
+/// A non-primitive type name answers `false`, not malformed: every protocol change is
+/// primitive to primitive.
 fn is_supported_type_change(change: &RecordedTypeChange) -> bool {
     match (
         parse_delta_type(&change.from_type),
@@ -659,19 +530,15 @@ fn widens(from: &PrimitiveType, to: &PrimitiveType) -> bool {
     }
 }
 
-/// The protocol's decimal rule: `Decimal(p, s)` → `Decimal(p + k1, s + k2)` where `k1 >= k2 >= 0`.
-/// `k1 >= k2` forbids the INTEGRAL digit count shrinking, which makes this strictly stronger than
-/// "precision and scale may both grow" — `decimal(10,1)` → `decimal(11,3)` grows both and is
-/// still refused.
+/// `Decimal(p, s)` → `Decimal(p + k1, s + k2)` with `k1 >= k2 >= 0`: integral digits may not
+/// shrink, so `decimal(10,1)` → `decimal(11,3)` is refused.
 fn widens_decimal((from_precision, from_scale): (u8, u8), to: &DecimalType) -> bool {
     let precision_growth = i32::from(to.precision()) - i32::from(from_precision);
     let scale_growth = i32::from(to.scale()) - i32::from(from_scale);
     scale_growth >= 0 && precision_growth >= scale_growth
 }
 
-/// Parses a raw `fromType`/`toType` name with the SAME deserializer the table's `schemaString` is
-/// read by, so the two can never disagree on a spelling — including `decimal(p,s)`, whose grammar
-/// would otherwise have a second owner here.
+/// Uses the same deserializer as `schemaString` so the two never disagree on a spelling.
 fn parse_delta_type(raw: &str) -> Option<PrimitiveType> {
     serde_json::from_value(serde_json::Value::String(raw.to_string())).ok()
 }

@@ -7,12 +7,7 @@ use datafusion::common::config::ConfigOptions;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 
-/// Evaluate the registered checked division over one batch of two operand
-/// arrays, returning the `Float64` result column or the raised error.
-///
-/// Drives the same `invoke_with_args` entry point DataFusion calls per batch,
-/// so a test asserts the function's observable output rather than any helper
-/// it happens to be built from.
+/// Drives `invoke_with_args` as DataFusion does per batch, asserting observable output only.
 fn divide(left: ArrayRef, right: ArrayRef) -> Result<Float64Array, DataFusionError> {
     let rows = left.len();
     let udf = ScalarUDF::from(CheckedFloatDivUdf::new());
@@ -31,8 +26,7 @@ fn divide(left: ArrayRef, right: ArrayRef) -> Result<Float64Array, DataFusionErr
     Ok(array.as_primitive::<Float64Type>().clone())
 }
 
-/// `DECIMAL(20, 0)` — the Exasol type an Iceberg `long` column maps to, and the
-/// decimal pairing a pushed `FLOAT_DIV` over two integral columns really sees.
+/// The Exasol type an Iceberg `long` maps to, as a pushed `FLOAT_DIV` over integral columns sees it.
 fn decimal(values: Vec<Option<i128>>) -> ArrayRef {
     Arc::new(
         Decimal128Array::from(values)
@@ -49,9 +43,7 @@ fn float64(values: Vec<Option<f64>>) -> ArrayRef {
     Arc::new(Float64Array::from(values))
 }
 
-/// The error the checked division raised, or a panic naming what came back
-/// instead. Every raising test goes through here so a silently-returned value
-/// fails as loudly as a wrong error would.
+/// Panics on a returned value, so a silently-returned value fails as loudly as a wrong error.
 fn raised(left: ArrayRef, right: ArrayRef) -> DataFusionError {
     match divide(left, right) {
         Err(error) => error,
@@ -61,11 +53,7 @@ fn raised(left: ArrayRef, right: ArrayRef) -> DataFusionError {
     }
 }
 
-/// Evaluate the registered checked division over an arbitrary argument count.
-///
-/// Only a direct `invoke_with_args` call reaches a count other than two:
-/// `Signature::any(2, ..)` makes DataFusion reject every other arity at plan
-/// time, so the arity guard has no route through planned SQL.
+/// `Signature::any(2, ..)` rejects other arities at plan time, so only a direct call reaches them.
 fn invoke_with_argument_count(arguments: Vec<ArrayRef>) -> Result<ColumnarValue, DataFusionError> {
     let rows = arguments.first().map_or(0, |first| first.len());
     let udf = ScalarUDF::from(CheckedFloatDivUdf::new());
@@ -89,10 +77,7 @@ fn invoke_with_argument_count(arguments: Vec<ArrayRef>) -> Result<ColumnarValue,
     udf.invoke_with_args(args)
 }
 
-/// Every operand pairing Iceberg or Delta can present divides as `DOUBLE` and
-/// comes back `Float64`, so the caller needs no CAST of its own on either side.
-/// `7 / 2` is `3.5` for all of them: an `Int64 / Int64` pairing must NOT
-/// truncate to `3.0` the way DataFusion's own `/` operator does (#186).
+/// Scenario: every Iceberg/Delta operand pairing divides as DOUBLE; `Int64 / Int64` must not truncate (#186).
 #[test]
 fn checked_float_div_divides_every_operand_pairing_as_double() {
     let pairings: Vec<(&str, ArrayRef, ArrayRef)> = vec![
@@ -145,9 +130,7 @@ fn checked_float_div_divides_every_operand_pairing_as_double() {
     }
 }
 
-/// A NULL in either operand yields NULL for that row with no error, including
-/// the case a naive zero-divisor guard would raise on: a NULL numerator over a
-/// zero divisor. A NULL row is absent, not a value to divide.
+/// Scenario: a NULL in either operand yields NULL with no error, including NULL over zero.
 #[test]
 fn checked_float_div_propagates_null_in_either_operand() {
     let left = float64(vec![None, Some(7.0), None, Some(7.0)]);
@@ -168,9 +151,7 @@ fn checked_float_div_propagates_null_in_either_operand() {
     );
 }
 
-/// A zero divisor under a non-zero numerator raises, naming a division by zero
-/// in Exasol's own vocabulary rather than returning the `+Inf` that silently
-/// changed a pushed filter's row count (#370).
+/// Scenario: a zero divisor raises a division-by-zero error instead of returning `+Inf` (#370).
 #[test]
 fn checked_float_div_raises_on_a_zero_divisor() {
     let message = raised(float64(vec![Some(7.0)]), float64(vec![Some(0.0)])).to_string();
@@ -186,9 +167,7 @@ fn checked_float_div_raises_on_a_zero_divisor() {
     );
 }
 
-/// `0 / 0` raises with the same division-by-zero message a non-zero numerator
-/// gets, rather than reaching the raw-scan NaN-at-emit gap that returned a
-/// silent NULL (#246).
+/// Scenario: `0 / 0` raises the same division-by-zero message instead of a silent NULL (#246).
 #[test]
 fn checked_float_div_raises_on_zero_over_zero() {
     let message = raised(float64(vec![Some(0.0)]), float64(vec![Some(0.0)])).to_string();
@@ -199,8 +178,7 @@ fn checked_float_div_raises_on_zero_over_zero() {
     );
 }
 
-/// IEEE-754 `-0.0` equals `0.0`, so a negative-zero divisor is a division by
-/// zero and not an overflow, whichever sign of infinity the quotient carries.
+/// Scenario: a `-0.0` divisor is a division by zero, not an overflow.
 #[test]
 fn checked_float_div_treats_negative_zero_as_zero() {
     let message = raised(float64(vec![Some(7.0)]), float64(vec![Some(-0.0)])).to_string();
@@ -211,9 +189,7 @@ fn checked_float_div_treats_negative_zero_as_zero() {
     );
 }
 
-/// A finite numerator over a tiny finite divisor overflows to `+Inf` with no
-/// zero in sight. It raises too, because Exasol can represent no non-finite
-/// `DOUBLE` — but as an out-of-range value, not a division by zero.
+/// Scenario: an overflow to `+Inf` raises as an out-of-range value, not a division by zero.
 #[test]
 fn checked_float_div_raises_on_an_overflow_to_infinity() {
     let message = raised(float64(vec![Some(1e300)]), float64(vec![Some(1e-300)])).to_string();
@@ -230,9 +206,7 @@ fn checked_float_div_raises_on_an_overflow_to_infinity() {
     );
 }
 
-/// A `NaN` stored in the source column raises as an out-of-range value. This is
-/// the deliberate trade-off the spec records (#393): Exasol admits no non-finite
-/// `DOUBLE`, so the value could not have been returned anyway.
+/// Scenario: a stored `NaN` operand raises as out-of-range, the deliberate trade-off recorded in #393.
 #[test]
 fn checked_float_div_raises_on_a_stored_non_finite_operand() {
     let message = raised(float64(vec![Some(f64::NAN)]), float64(vec![Some(2.0)])).to_string();
@@ -243,14 +217,7 @@ fn checked_float_div_raises_on_a_stored_non_finite_operand() {
     );
 }
 
-/// The transition case between the two variants: a stored non-finite numerator
-/// over a ZERO divisor is a division by zero, not an out-of-range value.
-///
-/// [`checked_quotient`] tests finiteness first and classifies on
-/// `divisor == 0.0` after it, which is what also makes a `-0.0` divisor a
-/// division by zero. `NaN / 0.0` is the one input where the two variants
-/// compete, and the pushdown spec makes a normative claim about which message
-/// it gets, so the actual classification is pinned here.
+/// Scenario: a stored non-finite numerator over a zero divisor reports a division by zero.
 #[test]
 fn checked_float_div_reports_a_stored_non_finite_numerator_over_a_zero_divisor_as_a_zero_divisor() {
     let message = raised(float64(vec![Some(f64::NAN)]), float64(vec![Some(0.0)])).to_string();
@@ -267,8 +234,7 @@ fn checked_float_div_reports_a_stored_non_finite_numerator_over_a_zero_divisor_a
     );
 }
 
-/// An empty batch is not an error: DataFusion evaluates a scalar function over
-/// a zero-row batch whenever a filter or a file's row group leaves nothing.
+/// Scenario: an empty batch returns no rows rather than an error.
 #[test]
 fn checked_float_div_returns_no_rows_for_an_empty_batch() {
     let quotient = divide(float64(vec![]), float64(vec![])).expect("an empty batch must not raise");
@@ -281,25 +247,15 @@ fn checked_float_div_returns_no_rows_for_an_empty_batch() {
     );
 }
 
-/// Pins the route a division over two LITERAL operands takes out of the scan,
-/// which the plan required establishing rather than assuming: an `Immutable`
-/// scalar function is eligible for const-folding during optimization, and a
-/// fold that raised would surface through `raw_scan`'s
-/// `UdfError::User("DataFusion SQL error: {e}")` — bypassing
-/// `classify_scan_error` and its framing entirely.
-///
-/// Measured on DataFusion 54.1: `ctx.sql` plans the statement successfully and
-/// the raise arrives from the stream, the SAME route a column operand takes, so
-/// the classifier sees it and no second framing site is needed. Should a later
-/// DataFusion version fold this at plan time instead, `ctx.sql` starts returning
-/// the error, this assertion fails, and the four planning sites
-/// (`raw_scan` ×2, `partial_agg` ×2) then need the framing too.
+/// Scenario: a two-literal division plans and raises from the stream, the same route a column takes.
 #[tokio::test]
 async fn checked_float_div_over_two_literals_surfaces_a_division_by_zero_message() {
     let ctx = SessionContext::new();
     register_checked_float_div_udf(&ctx);
     let sql = format!("SELECT {CHECKED_FLOAT_DIV_FN}(0, 0) AS quotient");
 
+    // If DataFusion ever const-folds this at plan time, the four planning sites
+    // (`raw_scan` ×2, `partial_agg` ×2) bypass `classify_scan_error` and need framing too.
     let planned = ctx
         .sql(&sql)
         .await
@@ -323,15 +279,7 @@ async fn checked_float_div_over_two_literals_surfaces_a_division_by_zero_message
     );
 }
 
-/// The session keeps the failure as a TYPED value, which is what makes the
-/// route DataFusion flattens recoverable.
-///
-/// `datafusion-datasource-parquet` 54.1's `row_filter.rs` turns ANY predicate
-/// error into `ArrowError::ComputeError(format!("...{e:?}"))`, so a checked
-/// division raised inside a pushed filter — issue #370's own route — reaches
-/// the classifier with its type gone. Recovering it from that text would be the
-/// message-matching coupling the spec forbids, so the lookup below must answer
-/// from the session instead.
+/// Scenario: the session records the failure as a typed value, surviving the row filter's flattening.
 #[tokio::test]
 async fn checked_float_div_records_its_failure_on_the_session() {
     let ctx = SessionContext::new();
@@ -360,9 +308,7 @@ async fn checked_float_div_records_its_failure_on_the_session() {
     );
 }
 
-/// A session that never divided by zero records nothing, so the reframing is
-/// inert for every scan whose SQL contains no division — the overwhelming
-/// majority — and cannot turn an unrelated scan failure into a division error.
+/// Scenario: a successful division records no session failure.
 #[tokio::test]
 async fn a_successful_checked_division_records_no_session_failure() {
     let ctx = SessionContext::new();
@@ -382,15 +328,7 @@ async fn a_successful_checked_division_records_no_session_failure() {
     );
 }
 
-/// The recorded failure is scoped to ONE session, which is one scan invocation.
-///
-/// The pushdown spec requires that no failure survive into another scan. The
-/// property holds because [`register_checked_float_div_udf`] builds a fresh
-/// instance per call. Caching one instance in a `static`, a `LazyLock`, or a
-/// shared `Arc` would leak one query's division failure into the next scan on a
-/// pooled UDF VM, which reframes that scan's unrelated failure as a division by
-/// zero. The scoping is pinned here rather than left to the registration's
-/// shape.
+/// Scenario: a second session records no failure from the first (no cached UDF instance).
 #[tokio::test]
 async fn a_second_session_records_no_failure_from_the_first() {
     let divided = SessionContext::new();
@@ -422,12 +360,7 @@ async fn a_second_session_records_no_failure_from_the_first() {
     );
 }
 
-/// The arity guard in `invoke_with_args` refuses any count other than two.
-///
-/// Unreachable through planned SQL, because `Signature::any(2, ..)` makes
-/// DataFusion reject a wrong arity first. It guards the direct-call path, which
-/// is the one every test here uses and the one a future in-process caller would
-/// use, so a silent wrong-arity read of `args.args` never happens.
+/// Scenario: the arity guard refuses any argument count other than two.
 #[test]
 fn checked_float_div_refuses_an_argument_count_other_than_two() {
     let too_few = vec![float64(vec![Some(7.0)])];

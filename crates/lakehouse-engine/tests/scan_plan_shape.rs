@@ -1,14 +1,3 @@
-//! Integration test for Task 2 — repartition-free raw-scan pipeline.
-//!
-//! Spec scenario "Raw-scan physical plan carries no needless repartition or
-//! coalesce-partitions stage": with `df_target_partitions == 1` the committed
-//! raw-row pipeline is `ParquetExec → FilterExec → ProjectionExec →
-//! CoalesceBatchesExec` and contains NO `RepartitionExec`,
-//! `CoalescePartitionsExec`, global `SortExec`, or global aggregate.
-//!
-//! Host-runnable: writes a local Parquet file and inspects the displayable
-//! physical plan the production raw-scan path builds.
-
 mod scan_fixture;
 
 use std::sync::Arc;
@@ -102,8 +91,6 @@ async fn raw_scan_plan_has_no_repartition_stage() {
     let rendered = displayable(plan.as_ref()).indent(true).to_string();
     eprintln!("=== raw-scan physical plan ===\n{rendered}\n=============================");
 
-    // No stage may redistribute or re-buffer rows beyond projection / filter /
-    // batch coalescing on the single-partition raw-scan path.
     for forbidden in [
         "RepartitionExec",
         "CoalescePartitionsExec",
@@ -116,32 +103,20 @@ async fn raw_scan_plan_has_no_repartition_stage() {
         );
     }
 
-    // The lean pipeline scans Parquet (DataFusion 54 renamed `ParquetExec` to a
-    // `DataSourceExec` over a ParquetSource).
     assert!(
         rendered.contains("DataSourceExec") || rendered.contains("ParquetExec"),
         "plan must scan Parquet:\n{rendered}"
     );
-    // The pushed-down predicate is carried — either as a standalone `FilterExec`
-    // or, when `pushdown_filters` fuses it into the scan (the leaner outcome of
-    // Task 3), as a `predicate=` clause on the Parquet source. Either form
-    // satisfies "no stage re-buffers beyond what filter requires"; the predicate
-    // applying inside the scan is strictly better than a separate FilterExec.
+    // `pushdown_filters` may fuse the predicate into the scan as `predicate=`.
     assert!(
         rendered.contains("FilterExec") || rendered.contains("predicate="),
         "plan must carry the pushed-down filter (as FilterExec or scan predicate):\n{rendered}"
     );
-    // The projection (uppercase SELECT list) is present — either as a
-    // standalone `ProjectionExec` or fused into the scan `projection=`.
     assert!(
         rendered.contains("ProjectionExec") || rendered.contains("projection="),
         "plan must carry the projection:\n{rendered}"
     );
 
-    // Result parity: the lean single-partition plan returns the same rows as a
-    // baseline plan with the optimizations turned off (multi-partition,
-    // pushdown disabled). Pruning / repartition-elision narrow what is read and
-    // how rows flow, never the result set.
     let rows_lean = collect_rows(&ctx, &spec).await;
 
     let baseline_config = SessionConfig::new()
@@ -166,8 +141,6 @@ async fn raw_scan_plan_has_no_repartition_stage() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Write a Parquet file with `id` (Int64), `score` (Float64), `name` (Utf8) and
-/// return its `file://` URL. Backs the mixed-projection regression test.
 fn write_local_parquet_with_score(dir: &std::path::Path) -> String {
     use arrow::array::Float64Array;
     let schema = Arc::new(Schema::new(vec![
@@ -197,16 +170,7 @@ fn write_local_parquet_with_score(dir: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Regression (host-runnable) for the raw-scan expression-projection bug: a
-/// projection that mixes a bare column with rendered scalar expressions must be
-/// spliced into the scan SELECT correctly — the `Expr` items VERBATIM, the
-/// `Column` item quoted as an identifier. Before the fix, `build_scan_sql`
-/// quoted every projection entry as an identifier, so `("SCORE" * 2)` became a
-/// phantom column name and DataFusion rejected the plan with
-/// `No field named "(""SCORE"" * 2)"`.
-///
-/// Mirrors the E2E `e2e_selectlist_expression_pushdown`
-/// (`SELECT id, score * 2.0, UPPER(name) ...`) without needing the Exasol stack.
+/// Scenario: a projection mixing a bare column with expressions splices expressions verbatim and quotes the column
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_scan_projects_mixed_column_and_expression_items() {
     let dir = std::env::temp_dir().join(format!("lh_mixed_proj_{}", std::process::id()));
@@ -215,9 +179,6 @@ async fn raw_scan_projects_mixed_column_and_expression_items() {
 
     let mut spec = single_partition_spec(file_url);
     spec.common.filter = None;
-    // id (bare column), score * 2 (expression), UPPER(name) (expression) — the
-    // expressions reference the uppercase-aliased inner columns, exactly as the
-    // adapter's `render_expression` emits them.
     spec.common.projection = vec![
         ProjectionItem::Column("ID".into()),
         ProjectionItem::Expr {
@@ -233,8 +194,6 @@ async fn raw_scan_projects_mixed_column_and_expression_items() {
         .await
         .expect("register local parquet");
 
-    // Before the fix this errored at plan build with the phantom-identifier
-    // schema error; it must now build and evaluate the expressions.
     let plan = build_raw_scan_physical_plan(&ctx, &spec)
         .await
         .expect("mixed column+expression projection must build a valid scan plan");
@@ -286,7 +245,6 @@ async fn raw_scan_projects_mixed_column_and_expression_items() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Build and collect the raw-scan plan's rows as sorted `(id, name)` tuples.
 async fn collect_rows(ctx: &SessionContext, spec: &ScanSpec) -> Vec<(i64, String)> {
     let plan = build_raw_scan_physical_plan(ctx, spec)
         .await
@@ -321,25 +279,17 @@ async fn collect_rows(ctx: &SessionContext, spec: &ScanSpec) -> Vec<(i64, String
     rows
 }
 
-/// Scenario `scan-exec: Scan emits a bounded local top-N when the spec carries an
-/// order-by`: with `order_by` + `limit` set, the production raw-scan pipeline folds
-/// `ORDER BY <col> LIMIT n` into a bounded, fetch-limited `SortExec` — a TopK — NOT
-/// an unbounded global sort that materializes and sorts every row.
-///
-/// Per decision-log A3, BOTH the bounded and unbounded `SortExec` display forms
-/// contain the bare substring `"SortExec"`, so a blanket `!contains("SortExec")`
-/// check is insufficient. The discriminating assertions are the TopK-specific
-/// substring `"TopK(fetch="` (present) and the unbounded-form prefix
-/// `"SortExec: expr=["` (absent).
+/// Scenario: scan emits a bounded local top-N when the spec carries an order-by
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn order_by_spec_emits_bounded_topk_not_global_sort() {
+    // Both SortExec display forms contain "SortExec", so the check discriminates on
+    // `TopK(fetch=` versus `SortExec: expr=[`.
     let dir = std::env::temp_dir().join(format!("lh_topn_shape_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let file_url = write_local_parquet(&dir);
 
     let mut spec = single_partition_spec(file_url);
     spec.common.filter = None;
-    // ORDER BY ID DESC NULLS LAST LIMIT 5 over the 100-row fixture.
     spec.common.order_by = vec![SortKey {
         column: "ID".into(),
         ascending: false,
@@ -372,8 +322,6 @@ async fn order_by_spec_emits_bounded_topk_not_global_sort() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// A minimal aggregate-carrying spec template (no files/storage detail matters
-/// for the SQL-shape assertion; `aggregates` drives the aggregate branch).
 fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -395,16 +343,9 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
     }
 }
 
-/// Plan-shape (host-runnable): the NQ1 shape `SUM(L_EXTENDEDPRICE * L_DISCOUNT)`
-/// pushes down as a decomposed partial/merge aggregate — the driving SQL carries
-/// the `aggregates` plan with the product in `arg_expr` and a `PARTIAL_sum_0`
-/// partial column, NOT a raw two-column row-scan fallback. The partial column is
-/// sized from Exasol's declared DECIMAL(36,4) result type (decision-log entry [7]),
-/// verifying the DECIMAL-with-nonzero-scale path.
+/// Scenario: `SUM(col * col)` pushes down as a partial/merge aggregate sized from the declared type
 #[test]
 fn sum_two_column_product_emits_aggregates_not_raw_scan() {
-    // The pushdown request Exasol sends once FN_MULT is advertised: SUM over a
-    // MULT function_scalar of two columns (no GROUP BY → single-group aggregate).
     let req = serde_json::json!({
         "selectList": [{
             "type": "function_aggregate",
@@ -421,12 +362,8 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
         }]
     });
 
-    // Detection must decompose the aggregate — `None` here would mean the raw
-    // two-column row-scan fallback (Exasol would aggregate itself).
     let items = detect_aggregates(&req)
         .expect("SUM(col * col) must decompose to an aggregate plan, not a row scan");
-    // This SUM is an ordinary (non-distinct) aggregate, so it must appear among
-    // the ordinary plans — not be dropped as a COUNT(DISTINCT) fan-out item.
     let plans = ordinary_plans(&items);
     assert_eq!(plans.len(), 1);
     assert_eq!(plans[0].kind, AggKind::Sum);
@@ -439,50 +376,40 @@ fn sum_two_column_product_emits_aggregates_not_raw_scan() {
         Some(r#"("L_EXTENDEDPRICE" * "L_DISCOUNT")"#)
     );
 
-    // Build the driving SQL through the real single-group aggregate path, with
-    // Exasol's declared DECIMAL(36,4) result type for the SUM ordinal.
     let spec = aggregate_spec(plans);
     let shards = vec![vec![("lineitem/data/f0.parquet".to_string(), 4096u64)]];
-    // The merge SELECT is the caller's; the adapter assembles it from the
-    // classified select list (`single_group_merge_select`, crate-internal).
     let merge_inputs = AggregateMergeInputs::new(
-        vec!["DECIMAL(36,4)".to_string()], // Exasol's declared SUM result type
+        vec!["DECIMAL(36,4)".to_string()],
         vec![r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,4))"#.to_string()],
-        None, // request_limit
+        None,
     )
     .expect("one merge item for one select-list item");
     let sql = build_scan_driving_sql(
         &spec,
         &shards,
-        &[],  // proj cols — unused on the aggregate path
-        &[],  // proj types — unused on the aggregate path
-        None, // limit
-        &[],  // col_types — a product has no source column
+        &[],
+        &[],
+        None,
+        &[],
         Some(&merge_inputs),
         "LAKEHOUSE_SCAN",
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 
-    // Partial column widened from the declared type (NOT recomputed from operands).
     assert!(
         sql.contains(r#""PARTIAL_sum_0" DECIMAL(36,4)"#),
         "partial SUM column must be the declared DECIMAL(36,4):\n{sql}"
     );
-    // The rendered product travels in the scan spec's serialized aggregate plan.
     assert!(
         sql.contains("arg_expr"),
         "the aggregate plan must carry the product argument (arg_expr):\n{sql}"
     );
-    // NOT a raw row-scan fallback: the aggregate path wraps the fan-out in an
-    // outer merge SELECT, never `SELECT * FROM (SELECT ...)` over raw columns.
     assert!(
         !sql.contains("SELECT * FROM"),
         "must not be a raw two-column row-scan fallback:\n{sql}"
     );
 }
 
-/// A minimal row-scan (no-aggregate) spec template — `aggregates: None` drives the
-/// row-scan branch of `build_scan_driving_sql`. Callers set `order_by`/`limit`.
 fn row_scan_spec() -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -493,12 +420,7 @@ fn row_scan_spec() -> ScanSpec {
     }
 }
 
-/// work-unit-sharding "Scan-driving query fans out via a nested distributor over a
-/// scalar scan UDF": a multi-shard raw row scan (no aggregates) is driven by the
-/// OUTER ungrouped scalar `LAKEHOUSE_SCAN(...)` select itself — never a `SELECT *
-/// FROM (...)` materializing wrapper — with the `LAKEHOUSE_DISTRIBUTE_FILES`
-/// distributor and its `GROUP BY shard_key` fan-out nested inside that outer
-/// select's FROM clause (decision [1]/[5]).
+/// Scenario: scan-driving query fans out via a nested distributor over a scalar scan UDF
 #[test]
 fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
     let proj = vec![ProjectionItem::Column("L_ORDERKEY".into())];
@@ -521,13 +443,10 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 
-    // The outer ungrouped scalar scan IS the top-level driving query.
     assert!(
         sql.starts_with("SELECT LAKEHOUSE_SCAN("),
         "row scan must be driven directly by the outer scalar scan:\n{sql}"
     );
-    // The distributor + its GROUP BY shard_key fan-out are nested inside the outer
-    // scan's FROM clause, not the other way around.
     assert!(
         sql.contains("FROM (SELECT LAKEHOUSE_DISTRIBUTE_FILES(files) FROM (VALUES"),
         "the distributor subquery must be nested inside the outer scan's FROM:\n{sql}"
@@ -536,23 +455,17 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
         sql.contains("AS shards(shard_key, files) GROUP BY shard_key)"),
         "GROUP BY shard_key must be nested inside the distributor, not top-level:\n{sql}"
     );
-    // No materializing `SELECT * FROM (...)` wrapper anywhere.
     assert!(
         !sql.contains("SELECT * FROM"),
         "row scan must not have a SELECT * materializing wrapper:\n{sql}"
     );
-    // Both shards' files travel through the distributor's VALUES rows.
     assert!(
         sql.contains("data/part-0.parquet") && sql.contains("data/part-1.parquet"),
         "both shards' files must appear in the distributor's VALUES list:\n{sql}"
     );
 }
 
-/// pushdown-planning-topn "Ordered top-N over a projected column is pushed down":
-/// with `order_by` + `limit` set on a multi-shard row-scan spec, `ORDER BY … LIMIT n`
-/// attaches DIRECTLY to the outer ungrouped scalar select — after the nested
-/// distributor's fan-out closes, never inside the distributor's own `GROUP BY
-/// shard_key` subquery, and with no `SELECT * FROM (...)` wrapper in between.
+/// Scenario: ordered top-N attaches ORDER BY … LIMIT to the outer scalar select, after the fan-out
 #[test]
 fn topn_order_by_limit_attaches_to_outer_scalar_select() {
     let proj = vec![ProjectionItem::Column("L_EXTENDEDPRICE".into())];
@@ -605,7 +518,6 @@ fn topn_order_by_limit_attaches_to_outer_scalar_select() {
     );
 }
 
-/// Minimal MinIO-style storage for spec construction (no secrets asserted here).
 fn test_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://minio:9000".to_string(),
@@ -617,16 +529,9 @@ fn test_storage() -> StorageBackend {
     })
 }
 
-/// pushdown-planning-join "Broadcast-eligible inner equi-join is planned as a
-/// broadcast fan-out". The broadcast plan shards ONLY the fact side and carries the
-/// dimension side's FULL file list once in the shard-invariant common blob's join
-/// block (`ScanSpec.join`), so the generated fan-out is exactly the single-table
-/// nested-distributor + scalar-scan fan-out (decision [1]/[5]) with the join block
-/// riding along in the common blob: every shard invocation re-scans the same
-/// dimension side and joins it node-locally. No `SELECT * FROM (...)` wrapper.
+/// Scenario: broadcast-eligible inner equi-join is planned as a broadcast fan-out
 #[test]
 fn broadcast_fact_side_uses_distributor_scalar_scan() {
-    // Dimension side: full file list, carried once (shard-invariant) in the join block.
     let join = JoinSpec {
         table_root: "s3://warehouse/lh/customer".to_string(),
         files: vec![FileEntry::new("data/cust-0.parquet", 4096)],
@@ -653,7 +558,6 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         files: vec![],
     };
 
-    // Fact side sharded into two byte-balanced work units → a real GROUP BY fan-out.
     let shards = vec![
         vec![("data/ord-0.parquet".to_string(), 8192u64)],
         vec![("data/ord-1.parquet".to_string(), 8192u64)],
@@ -672,9 +576,6 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         "LAKEHOUSE_DISTRIBUTE_FILES",
     );
 
-    // The fact side's fan-out is the nested-distributor + outer scalar-scan shape:
-    // the outer ungrouped scalar scan IS the top-level query, with the
-    // `GROUP BY shard_key` distribution nested inside the distributor subquery.
     assert!(
         sql.starts_with("SELECT LAKEHOUSE_SCAN("),
         "broadcast join must drive the fact side through the outer ungrouped scalar scan:\n{sql}"
@@ -688,19 +589,15 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         !sql.contains("SELECT * FROM"),
         "no materializing SELECT * wrapper over the broadcast fan-out:\n{sql}"
     );
-    // EMITS the cross-table projection in order and type.
     assert!(
         sql.contains(r#"EMITS ("C_NAME" VARCHAR(100), "O_ORDERDATE" DATE)"#),
         "the EMITS clause must span both tables in projection order:\n{sql}"
     );
-    // The join block rides in the shard-invariant common blob (serialized once).
-    // The common blob is a single-quoted SQL literal, so JSON object keys appear
-    // with raw (unescaped) double quotes.
+    // The common blob is a single-quoted SQL literal, so JSON keys keep raw double quotes.
     assert!(
         sql.contains(r#""join":{"#),
         "the common blob must carry a join block:\n{sql}"
     );
-    // The dimension side's full file list and the rendered condition are carried once.
     assert!(
         sql.contains("data/cust-0.parquet"),
         "the dimension side's file list must ride in the common blob:\n{sql}"
@@ -713,19 +610,12 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
         sql.contains(r#""join_type":"inner""#),
         "the join block must declare an inner join:\n{sql}"
     );
-    // Only the fact side is sharded per work unit; the dimension side is NOT
-    // partitioned into the per-shard VALUES rows.
     assert!(
         sql.contains("data/ord-0.parquet") && sql.contains("data/ord-1.parquet"),
         "the fact side must be sharded across the VALUES work units:\n{sql}"
     );
 }
 
-/// Write a data Parquet with ten tight, disjoint row groups (100 rows each,
-/// `id` monotonically increasing 0..1000) so row-group statistics pruning has
-/// something to skip, and return its `file://` URL. Mirrors the fixture the
-/// dedicated pruning test uses, so the two tests prove pruning fires on the
-/// SAME shape — this one additionally with a base `ParquetAccessPlan` attached.
 fn write_multi_row_group_parquet(dir: &std::path::Path) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -755,15 +645,7 @@ fn write_multi_row_group_parquet(dir: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Write an Iceberg-shaped positional-delete Parquet (`file_path`/`pos` columns,
-/// located by the reserved field-ids 2147483546 / 2147483545) that deletes the
-/// single row `pos = 250` of `data_file_url`, and return its `file://` URL.
-///
-/// `pos = 250` lands inside row group 2 (rows 200..300) — a row group the
-/// pruning predicate KEEPS — so the delete is applied precisely where pruning
-/// does NOT remove the group, proving deletes compose WITH (never replace)
-/// pruning. `file_path` carries the full data-file URL because the provider
-/// filters delete rows by exact `file_path` equality (partition-granularity).
+/// Deletes `pos = 250`, inside a row group the pruning predicate keeps.
 fn write_positional_delete_parquet(dir: &std::path::Path, data_file_url: &str) -> String {
     use std::collections::HashMap;
     let field_id_meta =
@@ -796,9 +678,6 @@ fn local_size(file_url: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Sum the `row_groups_pruned_statistics` pruned count across every node of the
-/// executed physical plan. A non-zero total is direct evidence that Parquet
-/// row-group statistics pruning fired.
 fn sum_row_groups_pruned(plan: &dyn ExecutionPlan) -> usize {
     let mut total = 0;
     if let Some(metrics) = plan.metrics() {
@@ -819,40 +698,15 @@ fn sum_row_groups_pruned(plan: &dyn ExecutionPlan) -> usize {
     total
 }
 
-/// GATE test (plan Task 4.2) for the unified-vs-conditional provider decision
-/// (Task 2.1). It asserts BOTH halves of the gate on the SAME scan — a
-/// delete-carrying data file driven through the real production
-/// `PositionalDeleteScanTable` provider (registered via `register_files`, the
-/// exact production seam; the built-in `register_parquet` shortcut the other
-/// plan-shape tests use never attaches a base `ParquetAccessPlan`):
-///
-/// 1. **Lean shape preserved** — the raw-scan physical plan has exactly ONE
-///    output partition and contains NO `RepartitionExec` and NO
-///    `CoalescePartitionsExec`, even with the access plan attached.
-/// 2. **Pruning preserved WITH a base access plan** — row-group statistics
-///    pruning STILL fires (`row_groups_pruned_statistics` > 0) when a base
-///    `ParquetAccessPlan` (from the positional delete) is attached, i.e. the
-///    opener intersects pruning ON TOP of the delete's access plan rather than
-///    the access plan defeating pruning.
-///
-/// The result set proves the two compose correctly: the predicate keeps ids
-/// 200..=399 (row groups 2 and 3; the other eight are pruned) and the delete
-/// removes id 250 from the KEPT row group 2 — so exactly 199 rows survive and
-/// 250 is absent. Were the access plan silently dropped, 250 would remain and
-/// the count would be 200; were pruning defeated, the pruned metric would be 0.
-///
-/// If this test fails, the unified provider path is NOT safe and the plan's
-/// conditional fallback (`ListingTable` for delete-free files, custom provider
-/// only when deletes are present) must be adopted.
+/// Scenario: a delete-carrying scan stays single-partition and still prunes row groups with an access plan attached
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_plan_lean_and_prunes_with_access_plan() {
+    // Uses `register_files`: `register_parquet` never attaches a base `ParquetAccessPlan`.
     let dir = std::env::temp_dir().join(format!("lh_gate_access_plan_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     let data_url = write_multi_row_group_parquet(&dir);
     let delete_url = write_positional_delete_parquet(&dir, &data_url);
 
-    // A single delete-carrying data file: the provider will read the delete
-    // file, build a base `ParquetAccessPlan` skipping pos 250, and attach it.
     let mut spec = single_partition_spec(data_url.clone());
     spec.files = vec![FileEntry::with_deletes(
         data_url.clone(),
@@ -862,12 +716,8 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
             size: local_size(&delete_url),
         }],
     )];
-    // Predicate keeps only ids 200..=399 → row groups 2 and 3; prunes the other
-    // eight tight, disjoint row groups.
     spec.common.filter = Some(r#""ID" >= 200 AND "ID" < 400"#.into());
 
-    // Register the REAL production provider (attaches the access plan), then ask
-    // for the exact committed raw-scan pipeline.
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
     let storage = scan_fixture::resolved_storage(&spec);
     register_files(&ctx, "scan_target", &spec, &storage)
@@ -877,7 +727,6 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
         .await
         .expect("build physical plan through the delete-carrying provider");
 
-    // GATE part 1: the lean single-partition shape survives the access plan.
     let rendered = displayable(plan.as_ref()).indent(true).to_string();
     eprintln!(
         "=== gate raw-scan physical plan ===\n{rendered}\n==================================="
@@ -894,13 +743,10 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
         "delete-carrying raw-scan plan must have exactly one output partition:\n{rendered}"
     );
 
-    // Execute; pruning + delete metrics accumulate on the plan tree.
     let batches = datafusion::physical_plan::collect(Arc::clone(&plan), ctx.task_ctx())
         .await
         .expect("collect delete-carrying scan");
 
-    // GATE part 2: row-group statistics pruning STILL fires with the base
-    // access plan attached (the novel assertion this gate exists for).
     let pruned = sum_row_groups_pruned(plan.as_ref());
     eprintln!("row_groups_pruned_statistics (pruned) = {pruned}");
     assert!(
@@ -909,7 +755,6 @@ async fn raw_plan_lean_and_prunes_with_access_plan() {
          (deletes must compose WITH pruning, not defeat it); pruned = {pruned}\n{rendered}"
     );
 
-    // Composition correctness: the kept predicate range minus the deleted row.
     let mut rows: Vec<i64> = Vec::new();
     for batch in &batches {
         let ids = batch

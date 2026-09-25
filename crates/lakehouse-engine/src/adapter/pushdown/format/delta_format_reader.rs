@@ -21,20 +21,13 @@ use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
 #[path = "delta_format_reader_tests.rs"]
 mod tests;
 
-/// The Unity Catalog credential-vending operation a plan-time log read asks for.
-/// Planning never writes, and a write-scoped credential would grant the scan more
-/// than it needs.
+/// Planning never writes; a write-scoped credential would over-grant the scan.
 const READ_OPERATION: &str = "READ";
 
-/// The Delta table reader: one Unity Catalog table's transaction log resolved into
-/// the scan the pushdown layer plans against.
-///
-/// Deep by design — it owns the WHOLE resolution behind one call, including the
-/// storage-credential decision. That decision cannot be hoisted to a shared caller:
-/// under vending it is scoped to THIS table's catalog-assigned key, and the log is
-/// read through its result, so the credential and the file list are one indivisible
-/// step. The effective backend leaves with the resolved scan precisely because the
-/// scan side must read the files through the same backend the log was read through.
+/// Owns the whole resolution, including the storage-credential decision: under vending
+/// the credential is scoped to this table's catalog-assigned key and the log is read
+/// through it, so credential and file list are one step. The scan side must read files
+/// through the same backend, hence it leaves with the resolved scan.
 pub(super) struct DeltaFormatReader<'a> {
     session: &'a UnityCatalogSession,
     table: &'a CatalogTable,
@@ -44,9 +37,8 @@ pub(super) struct DeltaFormatReader<'a> {
 }
 
 impl<'a> DeltaFormatReader<'a> {
-    /// `connection` is the CONNECTION's static storage decision: its static storage
-    /// backend and resolved credentials, plus the resolved `ALLOW_HTTP` property,
-    /// which under vending is the operator's consent gate for plaintext transport.
+    /// Under vending, `connection.allow_http` is the operator's consent gate for plaintext
+    /// transport.
     pub(super) fn new(
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
@@ -61,14 +53,10 @@ impl<'a> DeltaFormatReader<'a> {
         }
     }
 
-    /// This table's own catalog-reported storage location.
-    ///
-    /// The ONE check that runs before the vended/static split, so both values of
-    /// `use_vended_credentials` report identical text and a malformed catalog
-    /// response costs zero object-storage access. Nothing else denotes the table's
-    /// object store — the catalog URI names a REST service and the CONNECTION
-    /// endpoint names the operator's own store address — so no CONNECTION-derived
-    /// value may stand in for a location the catalog left empty.
+    /// Runs before the vended/static split so both modes report identical text and a
+    /// malformed catalog response costs no object-storage access. No CONNECTION-derived
+    /// value may stand in for an empty location: the catalog URI names a REST service and
+    /// the endpoint names the operator's own store.
     fn checked_table_root(&self) -> Result<&'a str, UdfError> {
         match self.table.storage_location.as_deref() {
             Some(location) if !location.trim().is_empty() => Ok(location),
@@ -81,14 +69,9 @@ impl<'a> DeltaFormatReader<'a> {
         }
     }
 
-    /// The storage backend this table's log is read THROUGH: the vended backend under
-    /// vending, the CONNECTION's static one otherwise.
-    ///
-    /// Vending is credentials-only: a table whose catalog assigned no vending key
-    /// fails here rather than falling back, because the fallback would read object
-    /// storage with a credential the operator did not select for this table. An empty
-    /// key counts as none — requesting against an empty scope asks the catalog to
-    /// choose the table for us.
+    /// Vending is credentials-only: a table with no (or an empty) vending key fails rather
+    /// than falling back to the static credential the operator did not select for it; an
+    /// empty scope would let the catalog choose the table.
     async fn effective_storage(&self, table_root: &str) -> Result<StorageBackend, UdfError> {
         if !self.creds.use_vended_credentials {
             return Ok(self.storage.clone());
@@ -127,15 +110,9 @@ impl<'a> DeltaFormatReader<'a> {
 }
 
 impl FormatReader for DeltaFormatReader<'_> {
-    /// Forwards `filter_json` to [`read_delta_log`], which builds a `delta_kernel`
-    /// predicate from it and applies it during log replay to prune files by partition
-    /// value and per-file statistics before scanning.
-    ///
-    /// `name_mapping` is always empty: a column binding by physical name declares that
-    /// name on its own [`LogicalField`], which the scan-side binding consults BEFORE
-    /// any table-level mapping. An Iceberg-shaped name mapping here could therefore
-    /// never be reached, and would be a second home for one decision, free to drift
-    /// from it.
+    /// `name_mapping` is always empty: a physical-name binding lives on its own
+    /// [`LogicalField`], which the scan side consults before any table-level mapping, so a
+    /// mapping here would be unreachable and a second home for the same decision.
     fn resolve_scan<'a>(
         &'a self,
         filter_json: Option<&'a Json>,
@@ -161,9 +138,6 @@ impl FormatReader for DeltaFormatReader<'_> {
     }
 }
 
-/// The four values a Delta log read contributes to a [`ResolvedScan`]: the active
-/// data files, the logical schema, the table's ordered partition columns, and the
-/// columns the schema step declined to map.
 type DeltaLogContents = (
     Vec<FileEntry>,
     Vec<LogicalField>,
@@ -171,18 +145,10 @@ type DeltaLogContents = (
     Vec<RefusedColumn>,
 );
 
-/// Read `table_root`'s Delta log through a store built from `storage`, answering the
-/// active file list, the logical schema, the table's ordered partition columns, and
-/// the columns the schema step declined to map.
+/// Blocks: `delta_kernel`'s read path is synchronous and drives its own runtime.
 ///
-/// Blocks: `delta_kernel`'s read path is synchronous and drives its own runtime on its
-/// own thread, so this stalls only the caller's own executor, which has nothing else
-/// to make progress on while the log is being read.
-///
-/// Every error is redacted here rather than where it was raised: the replay and schema
-/// steps know nothing about credentials by design, and this is the layer that made the
-/// credential decision and therefore knows the value set an object-store error could
-/// echo back.
+/// Errors are redacted here because this layer made the credential decision and knows
+/// which secrets an object-store error could echo; replay and schema know none.
 fn read_delta_log(
     storage: &StorageBackend,
     table_root: &str,
@@ -213,15 +179,10 @@ fn read_delta_log(
     Ok((files, logical_schema, partition_columns, refused_columns))
 }
 
-/// Refuses the WHOLE table when NO column classified as mappable: `raw_scan` registers
-/// `logical_schema` as the DataFusion table's own schema, and an EMPTY logical schema is not a
-/// table this engine can scan. Falling back to the first data file's own schema — the only other
-/// source such a table could offer — would bind columns by physical file order and by physical
-/// file name, exactly the unauthorized binding the column-mapping binding key exists to prevent.
-///
-/// A table with at least one mappable column is left fully alone here: it stays queryable on its
-/// mappable columns, and only a request that reads or emits a refused one is turned away — this
-/// function refuses a whole TABLE, never a single request.
+/// An empty logical schema is not scannable, and falling back to a data file's own schema
+/// would bind by physical order and name, which column mapping exists to prevent. A table
+/// with at least one mappable column stays queryable; only requests touching a refused
+/// column are turned away elsewhere.
 fn ensure_table_has_a_mappable_column(
     logical_schema: &[LogicalField],
     refused_columns: &[RefusedColumn],
@@ -240,12 +201,8 @@ fn ensure_table_has_a_mappable_column(
     )))
 }
 
-/// Re-raise `error` with every value in `secrets` masked.
-///
-/// Collapses onto [`UdfError::User`] deliberately: every error reaching here is a
-/// plan-time refusal a user must read, and rendering the error through `Display`
-/// keeps a variant's own prefix in the text while leaving no payload a future SDK
-/// variant could smuggle a secret through unmasked.
+/// Collapses to [`UdfError::User`] via `Display`, so the variant prefix survives while no
+/// future variant payload can carry a secret unmasked.
 fn redacted(error: UdfError, secrets: &[&str]) -> UdfError {
     UdfError::User(redact_error_text(&error.to_string(), secrets))
 }

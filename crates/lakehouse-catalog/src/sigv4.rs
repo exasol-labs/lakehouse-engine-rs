@@ -1,19 +1,6 @@
-//! SigV4 request-signing helper for AWS Glue catalog REST requests, and the one
-//! owner of the region those requests are signed for.
-//!
-//! Signs a `reqwest::Request` with an AWS SigV4 `Authorization` header. This is the
-//! signing mechanism behind `iceberg_io`'s authenticated GET and `namespace`'s signed
-//! enumeration; crate-private by design. The standard-Glue-endpoint host rule and
-//! the signing-region precedence live only here, behind
-//! [`ConnectionCreds::sigv4_signing_region`], so every reader of the signing region
-//! gets the same answer.
-//!
-//! Credential safety guarantees:
-//!   - `aws_credential_types::Credentials` redacts `secret_access_key` in its `Debug`
-//!     impl ("** redacted **") — the test `credentials_debug_redacts_secret` verifies this.
-//!   - This module never stores raw key material in any struct. Keys are accepted as
-//!     short-lived `&str` function parameters and are handed directly to the signing library.
-//!   - `SigningError` from aws-sigv4 carries no credential fields.
+//! SigV4 signing for AWS Glue catalog requests, and the sole owner of the
+//! signing-region rule. Key material is never stored; `SigningError` carries no
+//! credential fields.
 use crate::ConnectionCreds;
 use aws_credential_types::Credentials;
 use aws_sigv4::http_request::{
@@ -28,22 +15,17 @@ pub(crate) const MISSING_SIGNING_REGION: &str = "SigV4 catalog signing requires 
                                       stated region nor the catalog URI supplies one";
 
 impl ConnectionCreds {
-    /// Region a SigV4-signed catalog request is signed for: the region a standard
-    /// commercial AWS Glue endpoint host names, even when `region` is also stated
-    /// and differs. Otherwise the stated `region` when non-empty, else `None`.
-    /// Never written back into `region`, since a Glue catalog and its tables'
-    /// bucket can sit in different regions and `region` places the store, not
-    /// the signature.
+    /// A standard commercial Glue endpoint host's region wins over a stated,
+    /// differing `region`; otherwise the non-empty stated `region`. Never written
+    /// back into `region`: the catalog and its bucket may sit in different regions.
     pub fn sigv4_signing_region(&self, catalog_uri: &str) -> Option<String> {
         glue_endpoint_region(catalog_uri)
             .or_else(|| (!self.region.is_empty()).then(|| self.region.clone()))
     }
 }
 
-/// The region a catalog request about to be SigV4-signed is signed for, or a
-/// refusal naming `region` when [`ConnectionCreds::sigv4_signing_region`]
-/// supplies none — never an empty region, which Glue would only reject later
-/// with an opaque 403. The refusal carries no credential value and no URI.
+/// Refuses up front rather than signing for an empty region, which Glue rejects
+/// later with an opaque 403.
 pub(crate) fn required_signing_region(
     creds: &ConnectionCreds,
     catalog_uri: &str,
@@ -80,16 +62,6 @@ fn is_commercial_region_code(candidate: &str) -> bool {
         && ordinal.bytes().all(|b| b.is_ascii_digit())
 }
 
-/// Sign a `reqwest::Request` for the given AWS service with SigV4 header-based signing.
-///
-/// Produces an `Authorization` header (`AWS4-HMAC-SHA256`), an `x-amz-date` header,
-/// and — when a session token is present — an `x-amz-security-token` header.
-///
-/// Signing keys are never stored, logged, or embedded in any error message.
-///
-/// Crate-private: signing is a mechanism of this crate's catalog and storage
-/// access, never a service it offers outward. Keeping it inside the crate also
-/// keeps `aws_sigv4`'s `SigningError` off the public surface.
 pub(crate) fn sign_request(
     mut request: reqwest::Request,
     access_key: &str,
@@ -98,7 +70,6 @@ pub(crate) fn sign_request(
     region: &str,
     service: &str,
 ) -> Result<reqwest::Request, SigningError> {
-    // Build credentials. `Credentials::Debug` redacts `secret_access_key` automatically.
     let creds = Credentials::new(
         access_key,
         secret_key,
@@ -109,11 +80,9 @@ pub(crate) fn sign_request(
     let identity: Identity = creds.into();
 
     let mut settings = SigningSettings::default();
-    // Emit `x-amz-content-sha256` and sign over the actual body hash. Without this,
-    // signing UnsignedPayload but sending no such header makes AWS Glue recompute a
-    // different payload hash → canonical-request mismatch → 403 SignatureDoesNotMatch.
+    // Without `x-amz-content-sha256`, Glue recomputes a different payload hash and
+    // returns 403 SignatureDoesNotMatch.
     settings.payload_checksum_kind = PayloadChecksumKind::XAmzSha256;
-    // All builder fields are set; `.expect` is unreachable.
     let params: aws_sigv4::http_request::SigningParams<'_> = v4::SigningParams::builder()
         .identity(&identity)
         .region(region)
@@ -126,9 +95,7 @@ pub(crate) fn sign_request(
 
     let url = request.url().to_string();
 
-    // SigV4 canonicalization requires a `host` header. reqwest populates it
-    // automatically on the wire, but we must supply it explicitly here because we
-    // are constructing the SignableRequest before the HTTP stack adds it.
+    // reqwest adds `host` only on the wire, but SigV4 canonicalization needs it now.
     let host_value: String = {
         let h = request.url().host_str().unwrap_or("");
         match request.url().port() {
@@ -137,7 +104,6 @@ pub(crate) fn sign_request(
         }
     };
 
-    // Collect existing headers plus the synthetic host header.
     let existing: Vec<(String, String)> = request
         .headers()
         .iter()
@@ -158,17 +124,12 @@ pub(crate) fn sign_request(
         request.method().as_str(),
         &url,
         header_pairs.into_iter(),
-        // Read-path requests (loadTable / listTables / config) are GETs with no body.
-        // Sign over the empty-body SHA256 (a constant) so Glue's recomputed canonical
-        // request matches; paired with XAmzSha256 above it also sends the header.
+        // Every signed request is a bodiless GET.
         SignableBody::Bytes(&[]),
     )?;
 
     let (instructions, _signature) = sign(signable, &params)?.into_parts();
 
-    // Apply Authorization + x-amz-date (+ optional x-amz-security-token) to the request.
-    // aws-sigv4 only emits well-known header names and hex/base64-encoded ASCII values,
-    // so both `parse()` calls are safe to unwrap.
     for (name, value) in instructions.headers() {
         let header_name = name
             .parse::<reqwest::header::HeaderName>()
@@ -180,10 +141,6 @@ pub(crate) fn sign_request(
 
     Ok(request)
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "sigv4_tests.rs"]

@@ -1,21 +1,5 @@
-//! Compile-time reachability probe for `lakehouse-catalog`'s public surface,
-//! from an external-crate vantage.
-//!
-//! This is a `use` list plus minimal behavioral pins with almost no logic. It
-//! lives in the `tests/` crate so it only sees items that are actually `pub`
-//! (and re-exported at the crate root) — not the elevated visibility a
-//! descendant `mod tests` would see. Every module in `src/` (`auth`, `client`,
-//! `creds`, `iceberg_io`, `namespace`, `redaction`, `session`, `sigv4`,
-//! `storage`, `unity`, `vended`) is private (`mod`, not `pub mod`); the only
-//! externally reachable items are the ones `src/lib.rs` re-exports with
-//! `pub use`. If any of the items below is narrowed below `pub` or its
-//! re-export is removed, this file fails to compile — turning an effective
-//! visibility regression into a build failure rather than a silent gap that
-//! only a `pub use` text diff would miss.
-//!
-//! Covers the Verification > Scenario Coverage row "The crate exposes the
-//! concept-level API and hides every mechanism step"
-//! (vs-adapter/catalog-crate-structure).
+//! External-crate reachability probe: narrowing any item used here below `pub`, or
+//! dropping its `lib.rs` re-export, fails to compile.
 #![allow(unused_imports)]
 
 use std::collections::BTreeSet;
@@ -32,10 +16,6 @@ use lakehouse_catalog::{
     resolve_uc_vended_storage, resolve_vended_storage,
 };
 
-/// Every production `.rs` source file under `crates/lakehouse-catalog/src/`
-/// (`*_tests.rs` siblings hold no production surface), embedded at compile time
-/// via `include_str!`. Paths are relative to this test file:
-/// `crates/lakehouse-catalog/tests` -> `crates/lakehouse-catalog/src`.
 const CATALOG_SOURCES: &[(&str, &str)] = &[
     ("auth.rs", include_str!("../src/auth.rs")),
     ("client.rs", include_str!("../src/client.rs")),
@@ -83,10 +63,7 @@ fn connection_creds() -> ConnectionCreds {
     }
 }
 
-/// True when `source` declares `declaration` — e.g. `pub fn s3_backend` — as that
-/// item ITSELF rather than as the prefix of a longer name. Without the boundary
-/// check `pub fn s3_backend` would also fire on `pub fn s3_backend_from_vended`,
-/// and the shared policy steps could not be asserted in exactly one probe apiece.
+/// Boundary-checked so `pub fn s3_backend` does not match `pub fn s3_backend_from_vended`.
 fn declares(source: &str, declaration: &str) -> bool {
     source.match_indices(declaration).any(|(index, matched)| {
         source[index + matched.len()..]
@@ -96,17 +73,7 @@ fn declares(source: &str, declaration: &str) -> bool {
     })
 }
 
-/// Mechanism steps behind `resolve_vended_storage`/`StorageBackend::file_io` that
-/// were demoted from `pub` or deleted outright. `merge_vended_into_storage` and
-/// `select_credential_source` are the two demoted steps; `extract_vended_keys`
-/// names the four `extract_vended_*` readers the consolidation inlined;
-/// `build_s3_file_io` is the deleted predecessor of `StorageBackend::file_io`.
-/// `s3_backend_from_vended` and `adls_backend_from_vended` are deleted
-/// predecessors too — the shared `s3_backend`/`adls_backend` in `storage.rs`
-/// replaced BOTH, one construction per backend for both catalog kinds — and it is
-/// `shared_vended_policy_steps_are_not_public`, not this test, that asserts those
-/// replacements stay crate-private. A `pub` on any name here is how a demotion or
-/// deletion could be silently reversed.
+/// Scenario: Vended-storage mechanism steps are never declared public
 #[test]
 fn demoted_and_deleted_functions_are_not_declared_public() {
     for (name, source) in CATALOG_SOURCES {
@@ -128,12 +95,7 @@ fn demoted_and_deleted_functions_are_not_declared_public() {
     }
 }
 
-/// `StorageBackend::secret_values` and `StorageBackend::file_io` are called
-/// directly here — not just the `StorageBackend` type named in the `use` list
-/// above — so narrowing either method below `pub` is a compile failure in
-/// this external-crate probe, rather than a silent gap the type-only import
-/// would miss. `catalog_storage_props` is deliberately NOT referenced here:
-/// it is `pub(crate)`, not part of the public surface.
+/// Scenario: StorageBackend's secret_values and file_io are callable from outside the crate
 #[test]
 fn storage_backend_secret_values_and_file_io_are_reachable() {
     let backend = StorageBackend::S3(StorageProps::default());
@@ -141,10 +103,7 @@ fn storage_backend_secret_values_and_file_io_are_reachable() {
     let _: iceberg::io::FileIO = backend.file_io();
 }
 
-/// The Iceberg REST client and the Unity Catalog session are both usable as
-/// `Box<dyn CatalogClient>`: the trait is dyn-compatible and each type
-/// implements it, so the engine's single construction site can hold either
-/// behind one boxed trait object.
+/// Scenario: Both catalog clients are usable as Box<dyn CatalogClient>
 #[test]
 fn both_clients_are_catalog_client_trait_objects() {
     let iceberg: Box<dyn CatalogClient> = Box::new(IcebergRestCatalogClient::new(
@@ -159,12 +118,7 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
-/// The shared trait and its catalog-neutral metadata types are constructible
-/// from outside the crate, while the Unity Catalog wire types stay hidden —
-/// never re-exported and never `pub`-declared — so the engine consumes only the
-/// neutral shape. `CatalogTable` is constructed with its FORMAT tag and its
-/// credential-vending key named explicitly, so dropping either field or narrowing
-/// `TableFormat` below `pub` is a build failure here rather than a silent gap.
+/// Scenario: Neutral catalog types are constructible outside the crate while Unity wire types stay hidden
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     let ident = CatalogTableIdent {
@@ -230,12 +184,7 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
     }
 }
 
-/// The three neutral variants added for the direct-storage catalog kind — the
-/// Parquet table format, the Parquet column source (an Arrow tag string, never
-/// an Arrow `DataType` value), and the no-data-file skip reason — are
-/// constructible and observable from outside the crate, exactly as the
-/// recorded variants already are above. No source-text assertion: this probe
-/// only has to fail to COMPILE if a variant is narrowed or removed.
+/// Scenario: The direct-storage neutral variants are reachable from outside the crate
 #[test]
 fn added_neutral_variants_are_reachable_from_outside_the_crate() {
     assert_eq!(TableFormat::Parquet, TableFormat::Parquet);
@@ -273,14 +222,7 @@ fn added_neutral_variants_are_reachable_from_outside_the_crate() {
     assert_eq!(listing.skipped[0].reason, SkipReason::NoDataFile);
 }
 
-/// The raw Unity Catalog wire fields behind the neutral format tag and the
-/// credential-vending key stay inside the Unity client: only their neutral
-/// PROJECTIONS cross the boundary. `client.rs` — the module declaring every
-/// neutral type — must name neither field in production code, so re-exposing a
-/// raw wire field on a neutral type fails here rather than putting a Unity
-/// Catalog concept on the crate's surface for every consumer to match on.
-/// Matched through `declares`, whose trailing-boundary check is what keeps the
-/// pre-existing local `table_ident` from reading as `table_id`.
+/// Scenario: Raw Unity wire fields do not appear in the neutral types
 #[test]
 fn raw_unity_wire_fields_do_not_appear_in_the_neutral_types() {
     let neutral = production_code(source("client.rs"));
@@ -295,11 +237,7 @@ fn raw_unity_wire_fields_do_not_appear_in_the_neutral_types() {
     }
 }
 
-/// `list_namespace_tables` was demoted `pub` -> `pub(crate)` now that
-/// `IcebergRestCatalogClient::list_tables` is its only caller, and its `lib.rs`
-/// re-export was removed. Naming it in the `use` list above would already fail
-/// to compile; this pins the demotion at the source so a re-widening to `pub`
-/// or a re-added re-export fails here too.
+/// Scenario: list_namespace_tables stays crate-private and is not re-exported
 #[test]
 fn list_namespace_tables_is_no_longer_public() {
     let namespace = source("namespace.rs");
@@ -319,11 +257,7 @@ fn list_namespace_tables_is_no_longer_public() {
     );
 }
 
-/// `ConnectionCreds::sigv4_signing_region` is the ONE item the SigV4 signing
-/// region adds to the public surface. Calling it here, rather than only naming
-/// the type, makes narrowing it below `pub` a compile failure in this
-/// external-crate probe. The call exercises the region-less standard Glue
-/// endpoint the adapter's guard relies on.
+/// Scenario: ConnectionCreds::sigv4_signing_region is callable from outside the crate
 #[test]
 fn connection_creds_sigv4_signing_region_is_reachable() {
     let creds = ConnectionCreds {
@@ -337,10 +271,7 @@ fn connection_creds_sigv4_signing_region_is_reachable() {
     assert_eq!(region.as_deref(), Some("eu-west-1"));
 }
 
-/// The native Unity Catalog public items — the session, the temporary-table-
-/// credentials response type, the vended selector, and the store address that
-/// selector takes — are reachable from outside the crate through the `unity` and
-/// `storage` re-exports.
+/// Scenario: The native Unity Catalog public items are reachable from outside the crate
 #[test]
 fn unity_catalog_public_items_are_reachable() {
     let _session = UnityCatalogSession::new("http://unity", connection_creds());
@@ -357,8 +288,6 @@ fn unity_catalog_public_items_are_reachable() {
     );
 }
 
-/// Minimal `LoadTableResult` fixture; `vended.rs`'s own helper of the same shape is
-/// `#[cfg(test)]`-private to that crate and unreachable from here.
 fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {
     let meta_json = serde_json::json!({
         "format-version": 2,
@@ -388,18 +317,7 @@ fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {
     }
 }
 
-/// Pins `resolve_vended_storage`'s arity and return type from OUTSIDE the crate:
-/// `(&LoadTableResult, anchor: &str, allow_http: bool, address: &StaticStoreAddress)
-/// -> Result<StorageBackend, UdfError>`. The store address is the ONLY
-/// CONNECTION-derived parameter, and it is a type that cannot carry a credential —
-/// asserted here as part of the arity pin, because the arity is only worth pinning
-/// while the added parameter stays credential-free. Its three addressing fields
-/// — `endpoint`, `region`, and `path_style` — are the full set of CONNECTION
-/// values that may cross into a vended resolution. Reintroducing a
-/// `base: &StorageBackend`, or widening the address to `&ConnectionCreds`, would
-/// fail here rather than only in the crate's own `#[cfg(test)]`-private unit tests.
-/// Called with an UNSET address, so the assertions below still read the vended
-/// values.
+/// Scenario: resolve_vended_storage takes only a credential-free store address, never a backend
 #[test]
 fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() {
     let result = minimal_load_table_result(vec![
@@ -426,18 +344,7 @@ fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() 
     assert_static_store_address_declares_no_credential_field();
 }
 
-/// Pins `resolve_uc_vended_storage`'s arity and return type from OUTSIDE the
-/// crate: `(&TemporaryTableCredentials, storage_location: &str, allow_http: bool,
-/// address: &StaticStoreAddress) -> Result<StorageBackend, UdfError>`. It carries
-/// no `warehouse`, no static credential, and no existing `StorageBackend` — the
-/// three vended selectors' input disjointness is enforced by this signature. The
-/// one CONNECTION-derived value it does take is a store ADDRESS whose three
-/// addressing fields — `endpoint`, `region`, and `path_style` — are the full set
-/// of CONNECTION values that may cross into a vended resolution. Its type cannot
-/// carry a credential, asserted here as part of the arity pin so the added
-/// parameter cannot widen back into a credential-bearing one. A response with no
-/// usable S3 credential for an `s3://` location is a clear error, not a fabricated
-/// backend.
+/// Scenario: resolve_uc_vended_storage takes only a credential-free store address
 #[test]
 fn resolve_uc_vended_storage_signature_takes_only_a_credential_free_store_address() {
     let vended = TemporaryTableCredentials {
@@ -461,10 +368,7 @@ fn resolve_uc_vended_storage_signature_takes_only_a_credential_free_store_addres
     assert_static_store_address_declares_no_credential_field();
 }
 
-/// The production half of a crate source file, with whole-line comments removed:
-/// everything before its `#[cfg(test)]` sibling-module declaration, minus every
-/// `//`-prefixed line. A name a doc comment merely MENTIONS must not satisfy a
-/// probe that asks where a value is CONSTRUCTED or DISPATCHED on.
+/// Comment lines are dropped so a name a doc comment merely mentions satisfies no probe.
 fn production_code(source: &str) -> String {
     let production = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
     production
@@ -474,8 +378,6 @@ fn production_code(source: &str) -> String {
         .join("\n")
 }
 
-/// The `{ ... }` body of the named declaration in `source` — `enum StorageBackend`,
-/// `struct StaticStoreAddress` — brace-matched, so a nested body cannot end it early.
 fn declaration_body<'a>(source: &'a str, declaration: &str) -> &'a str {
     let start = source
         .find(declaration)
@@ -507,9 +409,6 @@ fn declaration_body<'a>(source: &'a str, declaration: &str) -> &'a str {
     &source[body_start..body_end]
 }
 
-/// Every variant name the named enum declares in `source`, extracted generically
-/// rather than hardcoded, so a variant added to `StorageBackend` or a kind added
-/// to `VendedBackendKind` propagates into every probe below.
 fn enum_variant_names<'a>(source: &'a str, enum_name: &str) -> Vec<&'a str> {
     let body = declaration_body(source, &format!("enum {enum_name}"));
 
@@ -536,11 +435,7 @@ fn enum_variant_names<'a>(source: &'a str, enum_name: &str) -> Vec<&'a str> {
     variant_names
 }
 
-/// `storage.rs` — the enum's own module — is the shared home the vended policy
-/// moved into, so every `StorageBackend` variant is CONSTRUCTED there. Neither
-/// vended selector names a variant any more: each classifies a location's scheme
-/// into a `VendedBackendKind` and hands neutral values to this home, which is the
-/// same relocation the dispatch probe below pins from the selectors' side.
+/// Scenario: storage.rs constructs every StorageBackend variant
 #[test]
 fn shared_vended_home_constructs_every_storage_backend_variant() {
     let storage = source("storage.rs");
@@ -557,12 +452,7 @@ fn shared_vended_home_constructs_every_storage_backend_variant() {
     }
 }
 
-/// Each vended selector dispatches on EVERY `VendedBackendKind` before calling
-/// into the shared home, so a kind added to the enum fails here until BOTH
-/// selectors map it. Leaving this to the construction probe alone would stop
-/// forcing that per-selector — and a kind one selector handled and the other did
-/// not is exactly the drift that let a plaintext `abfs://` location through
-/// ungated.
+/// Scenario: Each vended selector dispatches on every VendedBackendKind
 #[test]
 fn each_vended_selector_dispatches_every_vended_backend_kind() {
     let kinds = enum_variant_names(source("storage.rs"), "VendedBackendKind");
@@ -581,10 +471,7 @@ fn each_vended_selector_dispatches_every_vended_backend_kind() {
     }
 }
 
-/// The two enums stay in step: every kind a selector can dispatch to has a
-/// constructible `StorageBackend` variant, and every variant has a kind that
-/// selects it. Without this binding, growing one enum alone would leave the
-/// construction probe and the dispatch probe each passing over a different set.
+/// Scenario: VendedBackendKind and StorageBackend declare the same variant set
 #[test]
 fn vended_kind_and_storage_backend_variant_sets_are_equal() {
     let storage = source("storage.rs");
@@ -603,10 +490,6 @@ fn vended_kind_and_storage_backend_variant_sets_are_equal() {
     );
 }
 
-/// Every field declaration `storage.rs`'s own `struct StaticStoreAddress`
-/// declaration carries, comment lines dropped and trailing commas removed, so the
-/// probes below read what the struct DECLARES rather than what its doc comment
-/// mentions.
 fn static_store_address_field_declarations() -> Vec<&'static str> {
     let body = declaration_body(source("storage.rs"), "struct StaticStoreAddress");
     let fields: Vec<&str> = body
@@ -624,12 +507,6 @@ fn static_store_address_field_declarations() -> Vec<&'static str> {
     fields
 }
 
-/// `StaticStoreAddress` is the capability-narrowed parameter both vended selectors
-/// take instead of `&ConnectionCreds`: it can carry a store address and nothing
-/// else. The guarantee is the TYPE's, so it is asserted against that type's own
-/// declaration — a field added there is the single edit that would put a static
-/// credential back within a vended resolution's reach, and it must fail a test
-/// rather than depend on review.
 fn assert_static_store_address_declares_no_credential_field() {
     for declaration in static_store_address_field_declarations() {
         let name = declaration
@@ -658,12 +535,7 @@ fn assert_static_store_address_declares_no_credential_field() {
     }
 }
 
-/// The store address both vended selectors take is reachable from OUTSIDE the
-/// crate through exactly the two constructions its private fields leave open —
-/// `Default` and the single `From<&ConnectionCreds>` conversion — and its
-/// declaration names no credential field. Together those decide WHICH CONNECTION
-/// values may cross into a vended resolution in one reviewed conversion rather
-/// than at each call site.
+/// Scenario: StaticStoreAddress is reachable via Default and From<&ConnectionCreds> and declares no credential field
 #[test]
 fn static_store_address_is_reachable_and_declares_no_credential_field() {
     let unset = StaticStoreAddress::default();
@@ -680,9 +552,7 @@ fn static_store_address_is_reachable_and_declares_no_credential_field() {
     assert_static_store_address_declares_no_credential_field();
 }
 
-/// These vended-storage mechanism steps must stay crate-private; a `pub` or a
-/// `lib.rs` re-export turns an internal refactor into a permanent API. Excludes
-/// `scheme_of`, which `connection.rs` legitimately reuses outside vended policy.
+/// Scenario: Shared vended policy steps stay crate-private (`scheme_of` is reused by the engine)
 #[test]
 fn shared_vended_policy_steps_are_not_public() {
     const SHARED_STEPS: [(&str, &str); 5] = [
@@ -714,14 +584,7 @@ fn shared_vended_policy_steps_are_not_public() {
     }
 }
 
-/// Both `StaticStoreAddress` fields stay non-`pub`. Their privacy is the whole
-/// mechanism: it leaves `Default` and the single `From<&ConnectionCreds>`
-/// conversion as the only constructions reachable outside `storage.rs`, so WHICH
-/// CONNECTION values cross into a vended resolution is one reviewed edit rather
-/// than a field any call site can set. Widening either field to `pub` restores
-/// field-by-field construction at a distance and must fail here rather than pass
-/// silently — `static_store_address_is_reachable_and_declares_no_credential_field`
-/// would not notice, since it constrains which fields EXIST, not who may set them.
+/// Scenario: StaticStoreAddress fields stay non-public
 #[test]
 fn static_store_address_fields_are_not_public() {
     for declaration in static_store_address_field_declarations() {

@@ -1,15 +1,7 @@
 #!/usr/bin/env bash
-# Task 9 sweep driver: verify the "IO-bound throughput is capped by under-concurrent
-# fetching" hypothesis by sweeping the shard/thread/connection shape. Each config row
-# sets PARALLELISM_FACTOR (shard fan-out), DATAFUSION_THREADING_MODE, and
-# S3_MAX_CONNECTIONS; "-" leaves a knob unset so .env / AUTO-derivation applies.
-# Reuses staged .so+SLC (BENCH_SKIP_UPLOAD=1 recommended). Prints Q1-Q4 elapsed per
-# config. NOT a spec feature.
-#
-# Hypothesis shape (few big shards + high S3 concurrency):
-#   PARALLELISM_FACTOR=1  -> G = node_count shards (one per node)
-#   DATAFUSION_THREADING_MODE=AUTO -> that one instance gets all the node's cores
-#   S3_MAX_CONNECTIONS swept unset(AUTO)/32/64/128 -> saturate network/IO
+# Sweeps the shard/thread/S3-connection shape to test whether IO-bound throughput is capped by
+# under-concurrent fetching (few big shards + high S3 concurrency). BENCH_SKIP_UPLOAD=1
+# recommended.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 OUT="${1:-/tmp/lh-sweep.txt}"
@@ -25,8 +17,6 @@ configs=(
 for c in "${configs[@]}"; do
   set -- $c; label=$1 pf=$2 mode=$3 s3=$4
   echo "=================== SWEEP $label (PF=$pf mode=$mode s3_max_conn=$s3) ===================" | tee -a "$OUT"
-  # "-" -> unset (leave to .env default / AUTO-derivation). Collect into one args
-  # array so an unset knob adds no empty argument (safe under `set -u`).
   envargs=(LAKEHOUSE_UDF_DEBUG_LEVEL=info)
   [ "$pf"   != "-" ] && envargs+=("BENCH_PARALLELISM_FACTOR=$pf")
   [ "$mode" != "-" ] && envargs+=("BENCH_DF_THREADING_MODE=$mode")

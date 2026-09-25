@@ -1,8 +1,5 @@
-/// Resolve an Exasol CONNECTION object into catalog and storage configuration.
-///
-/// The CONNECTION's `address` is the Iceberg REST catalog URI; the `password`
-/// is a JSON object carrying credential and behavioural fields. Credential
-/// values NEVER appear in any error message produced by this module.
+//! Credential values never appear in an error message produced by this module.
+
 use crate::scan::sealed::{
     SealedStorageKey, connection_password_carries_key_material, derive_sealed_storage_key,
 };
@@ -14,29 +11,8 @@ use lakehouse_catalog::{StorageCreds, scheme_of};
 use super::catalog_kind::CatalogKind;
 use super::nonempty_str;
 
-/// The only unconditionally-required field in the CONNECTION password JSON.
-///
-/// The four S3 fields (`endpoint`, `region`, `access_key`, `secret_key`) are
-/// optional at the base level; they are orthogonal to catalog authentication and
-/// credential vending. `access_key` and `secret_key` become required whenever
-/// `use_sigv4` is enabled. `region` becomes required only when `use_sigv4` is
-/// enabled AND the CONNECTION's address is not a standard AWS Glue endpoint of
-/// the form `https://glue.<region>.amazonaws.com` — such an endpoint supplies
-/// its own SigV4 signing region (see `ConnectionCreds::sigv4_signing_region`
-/// and `read_connection`).
 pub const REQUIRED_KEY: &str = "warehouse";
 
-/// Parsed credential fields from a CONNECTION password JSON object, declared once
-/// in the `lakehouse-catalog` crate and re-exported here at its pre-move path.
-///
-/// The type lives in the catalog crate because that crate is what consumes it —
-/// catalog authentication, prefix resolution, and credential vending all read
-/// these fields — and the dependency edge points engine → catalog, so a type both
-/// crates name must be declared on the catalog side. What stays in this module is
-/// everything that interprets the Exasol CONNECTION delivery mechanism:
-/// [`read_connection`], `parse_creds`, `validate_creds`, [`storage_block`],
-/// [`catalog_block`], and [`REQUIRED_KEY`]. The catalog crate must not name that
-/// mechanism.
 pub use lakehouse_catalog::ConnectionCreds;
 
 #[derive(Debug)]
@@ -149,7 +125,7 @@ fn validate_direct_storage_preconditions(
         )));
     }
 
-    // Catalog-auth fields are meaningless under direct storage; reject rather than silently ignore them.
+    // Catalog-auth fields are meaningless under direct storage; reject rather than ignore them.
     let rejected: Vec<&str> = [
         ("warehouse", !creds.warehouse.is_empty()),
         ("token", creds.token.is_some()),
@@ -304,14 +280,6 @@ fn validate_oauth2_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfE
     }
 }
 
-/// A non-vended CONNECTION that names a store `endpoint` but states no
-/// `path_style` is rejected rather than defaulted.
-///
-/// `path_style` gates whether [`StorageCreds::backend`] uses the endpoint at
-/// all, not only how it addresses a bucket: an absent value resolves to
-/// `false`, and `false` discards `endpoint` in favor of a derived AWS host.
-/// Silently defaulting a CONNECTION that already names a working endpoint
-/// would turn it into a wrong-host read instead of a clear, named error.
 fn validate_path_style_with_endpoint(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     if !creds.endpoint.is_empty() && creds.path_style.is_none() && !creds.use_vended_credentials {
         return Err(UdfError::User(format!(
@@ -396,10 +364,6 @@ pub fn catalog_block(creds: &ConnectionCreds, table: &str) -> CatalogProps {
         table: table.to_string(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "connection_tests.rs"]

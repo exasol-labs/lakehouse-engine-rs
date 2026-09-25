@@ -12,9 +12,7 @@ use crate::adapter::pushdown::support::apply_type_rewrites;
 use crate::adapter::pushdown::test_support::*;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
-/// A `JoinLegs` binding over `names`, one leg per name in FROM-tree order, every
-/// occurrence unaliased — the no-table-occurs-twice shape whose behaviour must stay
-/// byte-identical. Leg `i` is `names[i]`.
+/// One unaliased leg per name, in FROM-tree order.
 fn legs_of(names: &[&str]) -> JoinLegs {
     let leaves: Vec<JoinLeaf> = names
         .iter()
@@ -27,14 +25,10 @@ fn legs_of(names: &[&str]) -> JoinLegs {
     legs_from_leaves(leaves)
 }
 
-/// The standard `CUSTOMER` (leg 0) ⋈ `ORDERS` (leg 1) binding.
 fn customer_orders_legs() -> JoinLegs {
     legs_of(&["CUSTOMER", "ORDERS"])
 }
 
-/// A two-leg self-join binding: both leaves share `FACT_ORDERS` but carry their
-/// own occurrence alias (`A` at leg 0, `B` at leg 1) — the shape issue #361's
-/// fix makes distinguishable.
 fn self_join_legs() -> JoinLegs {
     legs_from_leaves(vec![
         JoinLeaf {
@@ -50,13 +44,7 @@ fn self_join_legs() -> JoinLegs {
     ])
 }
 
-// ---------------------------------------------------------------------------
-// Join rendering: disjoint-column guard + condition/filter/projection
-// rendering via the reused vs-expression translator.
-// ---------------------------------------------------------------------------
-
-/// Two tables whose column names are genuinely disjoint (TPC-H `C_*` vs `O_*`)
-/// pass the guard, so bare column names resolve unambiguously.
+/// Scenario: Disjoint column names pass the guard
 #[test]
 fn disjoint_schema_guard_passes_for_disjoint_column_names() {
     let request = join_request(Json::Null, equi_condition());
@@ -68,13 +56,10 @@ fn disjoint_schema_guard_passes_for_disjoint_column_names() {
     );
 }
 
-/// ANY overlapping column name fails the guard, and the failure is surfaced as
-/// a clean decline (`Ok(None)`) — the caller falls through to the unaccelerated
-/// path — never as an error.
+/// Scenario: An overlapping column name fails the guard and declines without error
 #[test]
 fn overlapping_column_name_fails_guard_and_declines_without_error() {
     let mut request = join_request(Json::Null, equi_condition());
-    // Give BOTH sides a column with the same name.
     for table_idx in [0, 1] {
         request["involvedTables"][table_idx]["columns"]
             .as_array_mut()
@@ -92,7 +77,6 @@ fn overlapping_column_name_fails_guard_and_declines_without_error() {
         "a shared column name must fail the disjoint guard"
     );
 
-    // The whole rendering entry point declines cleanly, not with an Err.
     let detected = detected_join(&request);
     let outcome = render_broadcast_join(&request, &pd(&request), &detected)
         .expect("a guard failure is a decline, not an error");
@@ -102,9 +86,7 @@ fn overlapping_column_name_fails_guard_and_declines_without_error() {
     );
 }
 
-/// A simple equi-condition renders to the correct DataFusion SQL boolean
-/// expression via the reused translator, and is threaded verbatim into the
-/// rendered join's `condition` (→ `JoinSpec::condition`).
+/// Scenario: The join condition renders via the reused translator
 #[test]
 fn join_condition_renders_via_translator() {
     assert_eq!(
@@ -121,8 +103,7 @@ fn join_condition_renders_via_translator() {
     assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
 }
 
-/// A WHERE filter referencing columns from BOTH sides renders correctly against
-/// the combined schema (bare names, disjoint → unambiguous).
+/// Scenario: A WHERE filter spanning both sides renders against the combined schema
 #[test]
 fn join_where_filter_spanning_both_sides_renders() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -159,9 +140,7 @@ fn join_where_filter_spanning_both_sides_renders() {
     );
 }
 
-/// The cross-table projection attributes each projected column to its OWNING
-/// side's Exasol type: `C_NAME` from CUSTOMER (`VARCHAR(100)`), `O_ORDERDATE`
-/// from ORDERS (`DATE`).
+/// Scenario: Each projected column carries its owning side's Exasol type
 #[test]
 fn join_projection_emits_attribute_each_side_owning_type() {
     let request = join_request(Json::Null, equi_condition());
@@ -184,12 +163,7 @@ fn join_projection_emits_attribute_each_side_owning_type() {
     );
 }
 
-/// A `function_scalar_cast` over a side column in a join's select list
-/// resolves through `extract_join_projection` to a `ProjectionItem::Expr`,
-/// NOT the two-table full-row fallback (issue #136). `extract_join_projection`
-/// reuses `project_columns` verbatim against the disjoint union of both
-/// tables' columns, so the same dispatch fix that covers the single-table
-/// row-scan path (`support.rs`) must also cover this join path.
+/// Scenario: A join-list CAST resolves to an Expr projection, not the full-row fallback (#136)
 #[test]
 fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -219,22 +193,7 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
     );
 }
 
-/// `string_function_arg_type_guard` (issue #210) reaches through the join-shared
-/// `project_columns`, exercised across two calls into `extract_join_projection`
-/// on the same detected join:
-///
-/// (a) `UPPER(C_CUSTKEY)` (CUSTOMER's DECIMAL column) still projects as a single
-///     coerced `ProjectionItem::Expr` carrying the trimmed decimal-to-string
-///     form — proving coercion reaches through the join-shared `project_columns`,
-///     not just the single-table path.
-/// (b) A decline falls back to the FULL projection over the UNION of BOTH
-///     joined tables' columns, not just one side.
-///
-/// `join_request`'s fixture carries no DOUBLE-typed column on either side, so the
-/// decline trigger used for (b) is the #228 ARITY decline instead —
-/// `INSTR(C_NAME, 'b', 3)`, three arguments, over CUSTOMER's own VARCHAR column —
-/// which reaches the exact same `None` path a type decline would, with no
-/// fixture change.
+/// Scenario: String-function coercion and arity declines reach the join projection (#210, #228)
 #[test]
 fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     let request = join_request(Json::Null, equi_condition());
@@ -291,18 +250,7 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     );
 }
 
-/// `like_subject_type_guard` (issue #219) reaches through the join-shared
-/// `project_columns`, exercised across two calls into `extract_join_projection`
-/// on the same detected join — the select-list analog of
-/// [`join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity`]:
-///
-/// (a) `C_NAME LIKE 'A%'` (CUSTOMER's VARCHAR(100) column) still projects as a
-///     single `ProjectionItem::Expr`, proving the guard's pass-through for a
-///     string subject reaches the broadcast-join SELECT list.
-/// (b) `C_CUSTKEY LIKE '1%'` (CUSTOMER's DECIMAL column) declines and falls back
-///     to the FULL projection over the UNION of BOTH joined tables' columns —
-///     the reach this plan wires by adding `like_subject_type_guard` as the
-///     first pass of `apply_type_rewrites`.
+/// Scenario: The LIKE subject type guard reaches the join select list (#219)
 #[test]
 fn join_projection_like_guard_reaches_join_select_list() {
     let request = join_request(Json::Null, equi_condition());
@@ -372,14 +320,7 @@ fn join_projection_like_guard_reaches_join_select_list() {
     );
 }
 
-// -----------------------------------------------------------------------
-// Per-side pruning: side-local conjunct attribution, projection narrowing,
-// and per-side filter pushdown in the fallback path.
-// -----------------------------------------------------------------------
-
-/// A conjunct referencing only one leg's columns is attributed to that leg
-/// alone: the CUSTOMER-only conjunct threads to leg 0, the ORDERS-only
-/// conjunct to leg 1, and neither leaks to the other.
+/// Scenario: A single-leg conjunct is attributed to its owning leg only
 #[test]
 fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
     let filter = serde_json::json!({
@@ -414,20 +355,15 @@ fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
     );
 }
 
-/// A cross-leg conjunct (references both legs) and an OR spanning both legs
-/// are withheld from BOTH legs' pruning — only the outer wrapper's WHERE
-/// applies them. A single-leg-local conjunct alongside a cross-leg one is
-/// still extracted for its leg.
+/// Scenario: Cross-leg and leg-spanning OR conjuncts are withheld from every leg
 #[test]
 fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
-            // cross-table: references CUSTOMER and ORDERS
             {"type": "predicate_equal",
              "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
              "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"}},
-            // CUSTOMER-local
             {"type": "predicate_equal",
              "left": {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
              "right": {"type": "literal_string", "value": "ACME"}},
@@ -447,7 +383,6 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
         "ORDERS is only referenced by the cross-leg conjunct, so nothing is leg-local to it"
     );
 
-    // An OR spanning both legs is one opaque conjunct referencing both → withheld.
     let or_filter = serde_json::json!({
         "type": "predicate_or",
         "expressions": [
@@ -462,7 +397,6 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     assert!(leg_local_filter(&or_filter, &legs, 0).is_none());
     assert!(leg_local_filter(&or_filter, &legs, 1).is_none());
 
-    // An OR referencing only ONE leg is leg-local to it (still prunable).
     let one_side_or = serde_json::json!({
         "type": "predicate_or",
         "expressions": [
@@ -481,8 +415,7 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     assert!(leg_local_filter(&one_side_or, &legs, 1).is_none());
 }
 
-/// A filter that is a single (non-AND) conjunct is attributed to its owning leg
-/// without a top-level AND wrapper.
+/// Scenario: A single non-AND conjunct is attributed to its owning leg
 #[test]
 fn leg_local_filter_handles_a_single_conjunct() {
     let single = serde_json::json!({
@@ -495,10 +428,7 @@ fn leg_local_filter_handles_a_single_conjunct() {
     assert!(leg_local_filter(&single, &legs, 1).is_none());
 }
 
-/// Attribution is by LEG, NOT by column name: with a column name shared
-/// across both tables (`ID`), a conjunct on `EVENTS.ID` is leg-local to EVENTS'
-/// leg only and is never applied to LABELS' (which also has an `ID`). This is the
-/// shared-column-name safety the whole per-leg pruning rests on.
+/// Scenario: A shared column name is attributed by leg, not by name
 #[test]
 fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
     let filter = serde_json::json!({
@@ -533,15 +463,7 @@ fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
     );
 }
 
-/// The self-join analog of the shared-column-name test above: TWO OCCURRENCES of
-/// the SAME table, each carrying its own conjunct. A conjunct against occurrence
-/// A must reach only occurrence A's leg-local filter — the value
-/// [`leg_local_filter`] hands BOTH to a leg's `ScanSpec.filter` (via
-/// [`super::super::sql_builders`]'s type-screening) and, unscreened, to that
-/// leg's Iceberg manifest-pruning predicate in `plan_join` — never occurrence B's,
-/// despite the two occurrences sharing one `tableName`. This is exactly the defect
-/// issue #361 also caused: name-keyed attribution would have handed one
-/// occurrence's predicate to the other, over-filtering it with no error.
+/// Scenario: A self-join occurrence's conjunct reaches only its own leg (#361)
 #[test]
 fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
     let filter = serde_json::json!({
@@ -579,7 +501,6 @@ fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
     );
 }
 
-/// The ORDERS-side-local conjunct the DataFusion dialect CAN express.
 fn orders_local_rendering_conjunct() -> Json {
     serde_json::json!({
         "type": "predicate_greater",
@@ -588,9 +509,7 @@ fn orders_local_rendering_conjunct() -> Json {
     })
 }
 
-/// The ORDERS-side-local conjunct the DataFusion dialect REFUSES (its `SECOND`
-/// field shortcut permits exactly one argument) while Exasol renders it — the
-/// dialect asymmetry the render-site screen exists to route.
+/// DataFusion refuses a two-argument `SECOND` while Exasol renders it.
 fn orders_local_declined_conjunct() -> Json {
     serde_json::json!({
         "type": "predicate_greater",
@@ -606,8 +525,6 @@ fn orders_local_declined_conjunct() -> Json {
     })
 }
 
-/// Both ORDERS-side-local conjuncts under one AND: one renders for DataFusion,
-/// one declines.
 fn orders_local_rendering_and_declined_filter() -> Json {
     serde_json::json!({
         "type": "predicate_and",
@@ -618,10 +535,7 @@ fn orders_local_rendering_and_declined_filter() -> Json {
     })
 }
 
-/// A side-local conjunct whose DataFusion render DECLINES is reclassified as
-/// residual: `declined_only` keeps exactly it, `renderable_only` keeps exactly
-/// the complement, and it still renders in the Exasol dialect — so the outer
-/// wrapper's WHERE can apply what no leg can.
+/// Scenario: A DataFusion-declined side-local conjunct partitions to the residual
 #[test]
 fn declined_side_local_conjunct_partitions_to_residual() {
     let filter = orders_local_rendering_and_declined_filter();
@@ -655,9 +569,7 @@ fn declined_side_local_conjunct_partitions_to_residual() {
     );
 }
 
-/// The complement: a side-local conjunct the DataFusion dialect CAN express
-/// still reaches its own leg through the screened tree, so the screen costs the
-/// rendering case nothing.
+/// Scenario: A DataFusion-renderable side-local conjunct still reaches its leg
 #[test]
 fn rendering_side_local_conjunct_still_reaches_its_leg() {
     let filter = orders_local_rendering_and_declined_filter();
@@ -675,11 +587,7 @@ fn rendering_side_local_conjunct_still_reaches_its_leg() {
     );
 }
 
-/// The Iceberg manifest-pruning input is NOT screened: `plan_join` passes the
-/// RAW filter to `leg_local_filter`, so a conjunct whose DataFusion render
-/// declines still prunes that leg's manifests. Only the leg's `ScanSpec.filter`
-/// sees the screened tree — screening inside `leg_local_filter` would silently
-/// open more files with no failing test.
+/// Scenario: Manifest-pruning input is unscreened when the DataFusion render declines
 #[test]
 fn join_side_pruning_input_unchanged_when_df_render_declines() {
     let filter = orders_local_rendering_and_declined_filter();
@@ -717,14 +625,10 @@ fn join_side_pruning_input_unchanged_when_df_render_declines() {
     );
 }
 
-/// CUSTOMER's `(name, Exasol type)` universe from the standard two-table join
-/// request: `C_CUSTKEY DECIMAL(20,0)`, `C_NAME VARCHAR(100)`.
 fn customer_col_types() -> Vec<(String, String)> {
     involved_table_columns(&join_request(Json::Null, equi_condition()), "CUSTOMER")
 }
 
-/// ORDERS' `(name, Exasol type)` universe: `O_CUSTKEY DECIMAL(20,0)`,
-/// `O_ORDERDATE DATE` — one type the LIKE guard declines and one it rewrites.
 fn orders_col_types() -> Vec<(String, String)> {
     involved_table_columns(&join_request(Json::Null, equi_condition()), "ORDERS")
 }
@@ -749,10 +653,7 @@ fn conjunct_count(filter: Option<&Json>) -> usize {
     })
 }
 
-/// Every conjunct the type pipeline accepts reaches the leg half REWRITTEN and the
-/// declined half stays empty — so an all-accepted side keeps its full pushdown, and
-/// the leg receives the rewritten tree (`CAST("O_ORDERDATE" AS VARCHAR) LIKE …`),
-/// not the raw one DataFusion would refuse to coerce.
+/// Scenario: An all-accepted side-local set reaches the leg rewritten
 #[test]
 fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
     let filter = and_of(vec![
@@ -779,10 +680,7 @@ fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
     );
 }
 
-/// When no conjunct survives the screen the leg half is `None` and the outer
-/// wrapper receives the WHOLE side-local set in RAW form — the DECIMAL LIKE
-/// unwrapped, because the Exasol dialect must render what the DataFusion dialect
-/// declined, and the rewrites target the DataFusion dialect only.
+/// Scenario: A fully declined side-local set goes to the outer wrapper raw
 #[test]
 fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     let decimal_like = like_over("O_CUSTKEY", "ORDERS", "1%");
@@ -809,11 +707,7 @@ fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     );
 }
 
-/// The partition is TOTAL and DISJOINT over the side-local conjuncts in every
-/// shape — all accepted, all declined, mixed — and it FAILS CLOSED: whenever the
-/// leg half is absent the declined half carries every conjunct, so a predicate is
-/// never dropped from both halves (that would return wrong rows, where a residual
-/// conjunct is merely slower).
+/// Scenario: The type-screen partition is total and fails closed
 #[test]
 fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
     let date_like = like_over("O_ORDERDATE", "ORDERS", "1995%");
@@ -869,12 +763,7 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
     );
 }
 
-/// A conjunct the type pipeline ACCEPTS but the DataFusion dialect cannot render
-/// lands in the DECLINED half in RAW form, never dropped from both: the leg renders
-/// the REWRITTEN tree, so that is the tree whose renderability decides the
-/// partition. `SECOND(CAST(<DECIMAL col> AS VARCHAR), 3)` is exactly that shape —
-/// the decimal pass rewrites the cast, and the two-argument `SECOND` arity is one
-/// the DataFusion dialect refuses.
+/// Scenario: A type-accepted but unrenderable rewrite lands raw in the declined half
 #[test]
 fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
     let col_types = customer_col_types();
@@ -915,11 +804,7 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
     );
 }
 
-/// The N-scan path has NO disjoint-column-name precondition, so each side is
-/// screened against ITS OWN `col_types`: the same bare `SHARED_KEY` LIKE is
-/// accepted (and CAST) on the side declaring it `DATE` and declined on the side
-/// declaring it `DECIMAL`. A shared union would resolve one name to two types and
-/// screen at least one side against the wrong one.
+/// Scenario: Each N-scan side is type-screened against its own column types
 #[test]
 fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
     let request = serde_json::json!({
@@ -962,9 +847,7 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
     );
 }
 
-/// The fallback projection is narrowed to the columns the outer wrapper
-/// references for a leg — SELECT list + join condition + WHERE — preserving
-/// the full-column order/type, and dropping columns referenced nowhere.
+/// Scenario: Leg columns narrow to those the wrapper references, in full-column order
 #[test]
 fn referenced_leg_columns_narrows_to_used_columns() {
     let pushdown_req = serde_json::json!({
@@ -992,15 +875,13 @@ fn referenced_leg_columns_narrows_to_used_columns() {
         vec!["C_CUSTKEY", "C_NAME", "C_ADDRESS"],
         "narrows to condition + select + filter columns, in full-column order, dropping C_PHONE"
     );
-    // The kept columns retain their full-column Exasol types.
     assert_eq!(
         narrowed[1],
         ("C_NAME".to_string(), "VARCHAR(100)".to_string())
     );
 }
 
-/// An absent (or empty) SELECT list means the wrapper projects every column via
-/// `SELECT *`, so no narrowing is applied — all columns are kept.
+/// Scenario: An absent select list keeps every leg column
 #[test]
 fn referenced_leg_columns_keeps_all_when_select_list_absent() {
     let condition = serde_json::json!({
@@ -1025,10 +906,7 @@ fn referenced_leg_columns_keeps_all_when_select_list_absent() {
     );
 }
 
-/// A narrowing that selects no column of this leg keeps the FULL column set —
-/// `referenced_leg_columns` never emits a zero-column fan-out leg. That full-set
-/// fallback is its own policy; `referenced_column_projection` falls back to only
-/// the first column instead, and the two MUST stay divergent.
+/// Scenario: An empty narrowing keeps the full column set, never a zero-column leg
 #[test]
 fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
     let pushdown_req = serde_json::json!({
@@ -1053,13 +931,7 @@ fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
     );
 }
 
-/// The two column collectors MUST keep their divergent case folding:
-/// `collect_all_column_names` folds with Unicode `to_uppercase`, the joins module's
-/// own walks with ASCII-only `to_ascii_uppercase`. `ß` is the
-/// witness — Unicode folds it to `SS`, ASCII leaves it untouched. No other test in
-/// this crate uses a non-ASCII identifier, so without this test reconciling the two
-/// folds (which sharing one clause walk invites) would change behavior while the
-/// whole suite still passed.
+/// Scenario: The column collectors keep their divergent Unicode vs ASCII case folding
 #[test]
 fn column_collectors_keep_divergent_case_folding() {
     let expr = serde_json::json!({
@@ -1087,14 +959,7 @@ fn column_collectors_keep_divergent_case_folding() {
     );
 }
 
-/// A per-side fan-out pushes its side-local filter down as a DataFusion
-/// `ScanSpec.filter` (present in the common blob); absent when there is none.
-///
-/// Exasol sends each column with a `tableAlias` (the query's `FROM fact_orders o`
-/// alias). The fan-out is a SINGLE-TABLE scan over a relation with BARE
-/// uppercase columns, so its pushed filter MUST render bare — the alias must be
-/// stripped, or the alias-qualified reference fails to resolve against the
-/// fan-out.
+/// Scenario: A fan-out pushes its side-local filter bare (alias stripped) into the common blob
 #[test]
 fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
     let side = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]);
@@ -1102,7 +967,6 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
         ("O_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string()),
         ("O_ORDERDATE".to_string(), "DATE".to_string()),
     ];
-    // Exactly the Exasol shape: BOTH tableName AND tableAlias present.
     let filter = serde_json::json!({
         "type": "predicate_greater",
         "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "FACT_ORDERS", "tableAlias": "O"},
@@ -1138,10 +1002,7 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
     );
 }
 
-/// A multi-shard join leg routes through the distributor + scalar scan
-/// primitive: the fan-out `GROUP BY shard_key` lives in the distributor and the
-/// outer scalar `SCAN` is ungrouped, with NO `SELECT * FROM (...)` materialization
-/// wrapper. The leg is a bare subquery the outer join wrapper reads.
+/// Scenario: A multi-shard leg routes through the distributor and scalar scan, no wrapper
 #[test]
 fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
     let side = resolved_side(
@@ -1149,7 +1010,6 @@ fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
         vec![("s3://w/o-0.parquet", 100), ("s3://w/o-1.parquet", 100)],
     );
     let cols = vec![("O_CUSTKEY".to_string(), "DECIMAL(20,0)".to_string())];
-    // Force two shards: two nodes × factor 1 over two files.
     let tuning = JoinScanRequestConfig {
         cluster_nodes: 2,
         parallelism_factor: 1,
@@ -1173,10 +1033,7 @@ fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
     );
 }
 
-/// The broadcast fact side routes through the same distributor + scalar scan
-/// primitive: a multi-file fact side fans out via the nested distributor under
-/// an outer ungrouped scalar `SCAN`, with no `SELECT * FROM (...)` wrapper; the
-/// dimension side rides once in the common blob's join block.
+/// Scenario: The broadcast fact side uses the distributor and scalar scan
 #[test]
 fn broadcast_fact_side_uses_distributor_scalar_scan() {
     let fact = resolved_side(
@@ -1225,14 +1082,10 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
     );
 }
 
-/// The broadcast path strips Exasol's native `tableAlias` qualifier before
-/// rendering `rendered.filter`: `build_join_sql` wraps each side in an
-/// UNALIASED derived sub-SELECT, so a preserved alias would not resolve
-/// against it (`No field named "O"."O_ORDERDATE"`).
+/// Scenario: Broadcast rendering strips the native tableAlias from the filter
 #[test]
 fn render_broadcast_join_strips_native_table_alias_from_filter() {
     let mut request = join_request(Json::Null, equi_condition());
-    // Give every join column node Exasol's native tableAlias, as the live cluster does.
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_greater",
         "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS", "tableAlias": "O"},
@@ -1253,9 +1106,7 @@ fn render_broadcast_join_strips_native_table_alias_from_filter() {
     );
 }
 
-/// An equi-condition whose two column nodes both carry Exasol's native
-/// `tableAlias` — the exact shape of the live defect — renders bare, matching
-/// the unaliased shape `build_join_sql`'s derived sub-SELECTs expose.
+/// Scenario: Broadcast rendering strips the native tableAlias from the condition
 #[test]
 fn render_broadcast_join_strips_native_table_alias_from_condition() {
     let condition = serde_json::json!({
@@ -1271,9 +1122,7 @@ fn render_broadcast_join_strips_native_table_alias_from_condition() {
     assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
 }
 
-/// A select-list scalar expression over an aliased column renders its
-/// `ProjectionItem::Expr` bare, not alias-qualified — `extract_join_projection`
-/// also renders via `render_expression_safe`, so it needs the same stripping.
+/// Scenario: Broadcast rendering strips the native tableAlias from projections
 #[test]
 fn render_broadcast_join_strips_native_table_alias_from_projection() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -1296,12 +1145,7 @@ fn render_broadcast_join_strips_native_table_alias_from_projection() {
     }
 }
 
-/// End-to-end fallback wiring: the unified wrapper prunes each leg (side-local
-/// filter pushed into BOTH fan-out common blobs) AND narrows each leg's
-/// projection (an involved column referenced nowhere in the wrapper is dropped).
-/// Here BOTH filter conjuncts are side-local (one per leg), so the outer WHERE
-/// has no residual conjunct and is omitted entirely; the join condition attaches
-/// to the INNER JOIN's ON clause instead.
+/// Scenario: The unified wrapper prunes and narrows each leg
 #[test]
 fn unified_join_prunes_and_narrows_each_leg() {
     let request = serde_json::json!({
@@ -1355,7 +1199,6 @@ fn unified_join_prunes_and_narrows_each_leg() {
     )
     .expect("unified wrapper must build");
 
-    // Columns referenced nowhere in the wrapper are dropped from the legs.
     assert!(
         !sql.contains("C_ADDRESS"),
         "an unreferenced CUSTOMER column must be narrowed out of the fan-out: {sql}"
@@ -1365,15 +1208,12 @@ fn unified_join_prunes_and_narrows_each_leg() {
         "an unreferenced ORDERS column must be narrowed out of the fan-out: {sql}"
     );
 
-    // Each leg gets its own side-local filter pushed into its common blob.
     assert_eq!(
         sql.matches("\"filter\"").count(),
         2,
         "both fan-out legs must carry a side-local ScanSpec.filter: {sql}"
     );
 
-    // Both side-local conjuncts are pushed into their legs' common blobs; the
-    // outer WHERE keeps only cross-table residual, of which there is none here.
     assert!(
         sql.contains("'ACME'") && sql.contains("'1995-01-01'"),
         "each leg's side-local conjunct must be pushed into its fan-out: {sql}"
@@ -1382,7 +1222,6 @@ fn unified_join_prunes_and_narrows_each_leg() {
         !sql.contains(" WHERE "),
         "no cross-table residual conjunct remains, so the outer WHERE is omitted: {sql}"
     );
-    // The join condition attaches to the INNER JOIN chain's ON clause.
     assert!(
         sql.contains(r#"ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY"))"#),
         "the equi-condition attaches to the join point's ON clause: {sql}"

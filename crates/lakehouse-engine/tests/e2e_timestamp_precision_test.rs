@@ -1,27 +1,6 @@
-//! End-to-end coverage for the version-gated timestamp precision declaration
-//! (`add-timestamp-precision-versioning`): an Iceberg `timestamp` /
-//! `timestamptz` column is declared — and round-trips — at the precision the
-//! running engine actually supports.
-//!
-//! Seeds `e2e_tsprecision.ts_precision_probe` (`common::seed::
-//! seed_timestamp_precision_probe`) into its OWN Iceberg namespace and creates
-//! its own Virtual Schema over it, so the probe never enters another suite's
-//! table enumeration. The four seeded values (`.000001`, `.000002`, `.123456`,
-//! `.123457`) are two pairs that stay distinct at microsecond precision and
-//! collapse pairwise at millisecond precision.
-//!
-//! Expectations come from `common::timestamp_precision`, an oracle that reads
-//! the live engine version and maps it with its own table rather than by
-//! calling the production rule under test.
-//!
-//! The rendered fractional DIGIT COUNT is deliberately never asserted: a
-//! `TIMESTAMP` renders through `NLS_TIMESTAMP_FORMAT`, not at its declared
-//! precision (a `TIMESTAMP(3)` column renders `...123000` under the default six
-//! digits), so only the rendered VALUE and `COUNT(DISTINCT)` discriminate the
-//! two arms.
-//!
-//! Per project rules this test FAILS (never skips) when its stack is
-//! unreachable: the `wait_for_*` helpers panic rather than return `Err`.
+//! Seeded values (`.000001`, `.000002`, `.123456`, `.123457`) stay distinct at microsecond and
+//! collapse pairwise at millisecond precision. The rendered fractional digit count is never
+//! asserted: a `TIMESTAMP` renders through `NLS_TIMESTAMP_FORMAT`, not its declared precision.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -46,7 +25,6 @@ const NANOSECOND_TIMESTAMP_FORMAT: &str = "YYYY-MM-DD HH24:MI:SS.FF9";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
-/// Seed the probe and provision its Virtual Schema, once per binary.
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
@@ -71,12 +49,10 @@ fn setup() {
     });
 }
 
-/// The Exasol-served name of the seeded probe table.
 fn served_table() -> String {
     E2E_TSPRECISION_TABLE.to_uppercase()
 }
 
-/// The declared `COLUMN_TYPE` for `column`, whitespace-stripped.
 fn declared_type(conn: &mut ExaConn, table: &str, column: &str) -> String {
     let ty = conn.query_columns(&format!(
         "SELECT COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
@@ -88,15 +64,13 @@ fn declared_type(conn: &mut ExaConn, table: &str, column: &str) -> String {
     ty.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
-/// The microsecond value that survives storage at `precision` fractional digits.
 /// Clamped at six: the seeded values carry no finer digit.
 fn retained_at(micros: i64, precision: u32) -> i64 {
     let step = 10i64.pow(6 - precision.min(6));
     micros.div_euclid(step) * step
 }
 
-/// Render `micros` the way the WebSocket protocol renders a `TIMESTAMP` — six
-/// fractional digits, whatever the declared precision.
+/// The WebSocket protocol renders six fractional digits whatever the declared precision.
 fn rendered(micros: i64) -> String {
     chrono::DateTime::from_timestamp_micros(micros)
         .unwrap_or_else(|| panic!("seeded value {micros} must be a valid instant"))
@@ -104,7 +78,6 @@ fn rendered(micros: i64) -> String {
         .to_string()
 }
 
-/// Every value of `column` as the protocol rendered it.
 fn rendered_column(column: &[serde_json::Value], name: &str) -> Vec<String> {
     column
         .iter()
@@ -117,8 +90,6 @@ fn rendered_column(column: &[serde_json::Value], name: &str) -> Vec<String> {
         .collect()
 }
 
-/// Trailing fractional zeros removed, so a comparison asserts the value rather than
-/// the digit count the protocol chose.
 fn without_trailing_fraction_zeros(values: Vec<String>) -> Vec<String> {
     values
         .into_iter()
@@ -132,8 +103,6 @@ fn without_trailing_fraction_zeros(values: Vec<String>) -> Vec<String> {
         .collect()
 }
 
-/// [`engine_honors_declared_precision`] for the `[C3]` CAST-target domain, logging why
-/// a declining leg skipped the width.
 fn accepts_every_cast_precision(conn: &mut ExaConn) -> bool {
     if engine_honors_declared_precision(conn) {
         return true;
@@ -146,8 +115,7 @@ fn accepts_every_cast_precision(conn: &mut ExaConn) -> bool {
     false
 }
 
-/// The `EMITS (...)` list of `sql`'s scan-UDF call, parentheses balanced so a
-/// `DECIMAL(20,0)` column does not truncate it.
+/// Balances parentheses so a `DECIMAL(20,0)` column does not truncate the clause.
 fn emits_clause(sql: &str) -> String {
     const MARKER: &str = "EMITS (";
     let at = sql
@@ -170,8 +138,6 @@ fn emits_clause(sql: &str) -> String {
     panic!("unbalanced EMITS clause in:\n{sql}")
 }
 
-/// Precondition for every value assertion below: the width under test reached the
-/// emit boundary. Returns the generated SQL for further assertions.
 fn assert_emits_declares(conn: &mut ExaConn, query_sql: &str, expected: &str) -> String {
     let pushdown_sql = isolated_pushdown_statement(conn, query_sql);
     let emits = emits_clause(&pushdown_sql);
@@ -185,7 +151,6 @@ fn assert_emits_declares(conn: &mut ExaConn, query_sql: &str, expected: &str) ->
     pushdown_sql
 }
 
-/// Assert `sql` reaches the scan UDF rather than an unaccelerated fallback.
 fn assert_pushed_to_scan_udf(conn: &mut ExaConn, sql: &str, shape: &str) {
     let pushed = explain_virtual_sql(conn, sql);
     assert!(
@@ -194,16 +159,7 @@ fn assert_pushed_to_scan_udf(conn: &mut ExaConn, sql: &str, shape: &str) {
     );
 }
 
-/// Scenario: Microsecond-distinct Iceberg timestamps round-trip at the declared
-/// precision, and `createVirtualSchema` declares that precision from the live
-/// engine version.
-///
-/// On an engine that supports microseconds both columns are declared
-/// `TIMESTAMP(6)` and all four seeded values stay distinct; on a
-/// millisecond-only engine both are declared `TIMESTAMP(3)` and the four
-/// collapse to two. Rendered values are asserted for the naive `ts` column only
-/// — a `timestamptz` rendering additionally depends on the session time zone,
-/// which is not what this scenario pins.
+/// Scenario: microsecond-distinct timestamps round-trip at the version-gated declared precision
 #[test]
 fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     setup();
@@ -258,18 +214,10 @@ fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Projected CAST emit widths (issue #405)
-// ---------------------------------------------------------------------------
-//
-// The Nanosecond and Millisecond legs feed the SLC units no emit path here had
-// fed it before, so they are a measurement rather than a regression test.
-
 fn qualified_probe() -> String {
     format!("{VS_NAME}.{}", served_table())
 }
 
-/// `ID` keeps the ordering deterministic without relying on scan order.
 fn cast_projection_sql(column: &str, target: &str) -> String {
     format!(
         "SELECT ID, CAST({column} AS {target}) FROM {} ORDER BY ID",
@@ -283,12 +231,7 @@ fn rendered_nanos(nanos: i64) -> String {
         .to_string()
 }
 
-/// Scenario (type-mapping-timestamp-precision): `CAST(ts_ns AS TIMESTAMP(9))` emits an Arrow
-/// `Timestamp(Nanosecond, None)` column the SLC accepts, carrying every seeded digit.
-///
-/// Casts `ts_ns`, not `ts`: `TSPRECISION_MICROS` has no sub-microsecond digit, so the
-/// assertions would hold just as well against a silently narrowed unit. Guarded on the
-/// `>= 2025` arm, since 8.29.13 rejects `TIMESTAMP(9)` as a CAST target (`[C3]`).
+/// Scenario: `CAST(ts_ns AS TIMESTAMP(9))` emits nanoseconds and keeps every seeded digit
 #[test]
 fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     setup();
@@ -327,8 +270,7 @@ fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
         "the TIMESTAMP(9) cast projection",
     );
 
-    // 2 at TIMESTAMP(9), 1 at every coarser width. NANOSECOND.distinct_count describes the
-    // TSPRECISION_MICROS fixture, so it is not the oracle here.
+    // NANOSECOND.distinct_count describes the TSPRECISION_MICROS fixture, not this one.
     let distinct_sql = format!(
         "SELECT COUNT(DISTINCT CAST({ts_ns_column} AS {target})) FROM {}",
         qualified_probe()
@@ -341,11 +283,7 @@ fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     );
 }
 
-/// Scenario (type-mapping-timestamp-precision): `CAST(ts AS TIMESTAMP(3))` emits an Arrow
-/// `Timestamp(Millisecond, None)` column and the two seeded pairs collapse pairwise.
-///
-/// Unguarded: `p = 3` is inside `[C3]`'s domain on both engines. Only the EMITS literal is
-/// arm-selected, since 8.29.13 strips `fractionalSecondsPrecision` (`[C2]`).
+/// Scenario: `CAST(ts AS TIMESTAMP(3))` emits milliseconds and the seeded pairs collapse
 #[test]
 fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     setup();
@@ -400,10 +338,7 @@ fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     );
 }
 
-/// Scenario (sql-comprehension/vs-expression-translator-cast): DataFusion cannot parse
-/// `TIMESTAMP(2)`, so the renderer declines it and the adapter routes to its qualified
-/// single-table wrapper. The scan's `EMITS` carries the raw `ts` declaration, and the values
-/// equal what Exasol computes natively. Guarded on the `>= 2025` arm (`[C3]`).
+/// Scenario: a declined `CAST(ts AS TIMESTAMP(2))` is computed natively by Exasol in the wrapper
 #[test]
 fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
     setup();
@@ -459,16 +394,7 @@ fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// A genuine nanosecond SOURCE column (issue #405)
-// ---------------------------------------------------------------------------
-
-/// Scenario (type-mapping-timestamp-precision): an Iceberg `timestamp_ns` column (a v3 type,
-/// seeded through the `format-version` PROPERTY) is declared at the width the engine emits.
-///
-/// Both arms assert. On `>= 2025` it is `TIMESTAMP(9)` and both seeded instants survive; on
-/// `< 2025` the clamp declares bare `TIMESTAMP`, reported `TIMESTAMP(3)` (`[C1]`), and the two
-/// collapse to one.
+/// Scenario: an Iceberg `timestamp_ns` column is declared and retained per engine arm
 #[test]
 fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     setup();

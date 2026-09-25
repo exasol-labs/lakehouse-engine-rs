@@ -1,8 +1,3 @@
-//! Two-table broadcast inner equi-join scan path: registers the sharded fact
-//! file list and the full, shard-invariant dimension file list into ONE
-//! session, builds the joined SQL exposing Exasol-facing uppercase column
-//! names, and streams the joined batches back through `ctx.emit`.
-
 use std::sync::Arc;
 
 use datafusion::execution::context::SessionContext;
@@ -18,24 +13,11 @@ use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 use super::raw_scan::{NESTED_JSON_RENDER_UDF_NAME, delete_path_read_limiter, register_file_list};
 use super::sql_support::{build_alias_items, quote_ident};
 
-/// Registered table name for the sharded fact (large) side of a broadcast join.
 const JOIN_FACT_TABLE: &str = "fact_scan";
-/// Registered table name for the full dimension (small/build) side of a broadcast join.
 const JOIN_DIM_TABLE: &str = "dim_scan";
 
-/// Stream a two-table inner equi-join over an already-built session.
-///
-/// Registers the sharded fact file list (`spec.files`) and the full, shard-invariant
-/// dimension file list (`spec.common.join.files`) as two tables in the SAME session, each
-/// wrapped in an aliased sub-SELECT exposing Exasol-facing uppercase column names,
-/// then executes `SELECT <projection> FROM (dim) INNER JOIN (fact) ON <condition>
-/// [WHERE <filter>] [LIMIT n]` and streams the joined batches through [`emit_stream`]
-/// (one fetched, emitted, dropped before the next — never collect-all).
-///
-/// The bounded dimension side is placed on the LEFT of the join and join reordering
-/// is disabled (see [`session_config_for_spec`]), so the dimension is deterministically
-/// the hash-join build side regardless of table statistics. Read/deserialization
-/// errors for EITHER side route through [`classify_scan_error`] against the UNION of
+/// The dimension side sits on the LEFT with join reordering disabled (see
+/// [`session_config_for_spec`]), so it is deterministically the hash-join build side.
 pub async fn run_join_scan_with_session(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
@@ -82,23 +64,11 @@ async fn register_join_tables(
         )
     })?;
 
-    // Each side carries its OWN storage backend (StorageBackend) alongside its own
-    // table_root, file list, logical schema, and per-file positional deletes, all
-    // of which register_file_list applies to the dimension registration exactly as
-    // it does for the fact side. A vended credential is scoped to the table it was
-    // resolved for, so the dimension side is registered against join.storage and
-    // never common.storage: that is what makes its reads — data files and delete
-    // files alike — redact against ITS own secret values rather than the fact
-    // side's.
+    // The dimension side registers against `join.storage`, never `common.storage`: a vended
+    // credential is scoped to its own table, and its reads must redact against its own secrets.
     //
-    // ONE shared delete-path read semaphore for this invocation, cloned into BOTH
-    // sides' registration: DataFusion plans a broadcast join's two scan leaves
-    // concurrently, so a per-side semaphore would allow up to 2N concurrent
-    // delete-path reads (Phase A delete-file bodies and Phase B data-file footers
-    // alike) instead of the intended N. This is deliberately NOT per side, unlike
-    // the object store above: the semaphore bounds in-flight reads for the whole
-    // instance, whereas each side needs its own store to read through its own
-    // credential.
+    // One delete-path read semaphore is shared by BOTH sides: DataFusion plans the two scan
+    // leaves concurrently, so a per-side semaphore would allow 2N concurrent reads instead of N.
     let delete_path_read_limiter = delete_path_read_limiter(spec);
     register_file_list(
         ctx,
@@ -127,24 +97,10 @@ async fn register_join_tables(
     Ok(())
 }
 
-/// Build the DataFusion SQL for a two-table inner equi-join.
-///
-/// Both registered tables are wrapped in an aliased sub-SELECT exposing uppercase,
-/// Exasol-facing column names (the same seam the single-table and partial-aggregate
-/// paths use), so the pushed projection, the rendered join `condition`, and the
-/// WHERE filter — all uppercase and disjoint across the two tables — resolve
-/// unambiguously against the join's combined schema.
-///
-/// The dimension side is placed on the LEFT so it is the hash-join build side (see
-/// [`run_join_scan_with_session`]). Output column order follows `spec.common.projection`
-/// (positionally aligned with the call-site `EMITS (...)` declaration); an empty
-/// projection expands to every column, dimension columns first. The row cap comes from
-/// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit)
-/// and is applied HERE — after the join and its
-/// `WHERE` — never to either side's registered scan; see that field's doc.
-///
-/// The JSON-render scalar function is registered here so `render_join_select_item`
-/// can name it in the generated select list.
+/// Uppercase aliased sub-SELECTs make the pushed projection, `condition`, and filter resolve
+/// unambiguously against the combined schema. The dimension side is LEFT (the build side).
+/// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit) is applied here,
+/// after the join and its `WHERE`, never to either side's scan.
 async fn build_join_sql(
     ctx: &SessionContext,
     fact_table: &str,
@@ -177,9 +133,7 @@ async fn build_join_sql(
         build_alias_items(dim_schema).join(", ")
     );
 
-    // Uppercase output column names paired with their Arrow type, dimension side
-    // first (matching the left/build side). Columns are disjoint across the two
-    // tables (VS guarantee), so a bare uppercase name resolves in exactly one side.
+    // Columns are disjoint across the two tables (VS guarantee), so a bare name resolves once.
     let combined = combined_upper_fields(dim_schema, fact_schema);
 
     let proj_items: Vec<ProjectionItem> = if spec.common.projection.is_empty() {
@@ -196,7 +150,6 @@ async fn build_join_sql(
         .map(|item| render_join_select_item(item, &combined))
         .collect();
 
-    // Dimension on the LEFT = hash-join build side (reordering is disabled).
     let mut sql = format!(
         "SELECT {} FROM ({dim_aliased}) INNER JOIN ({fact_aliased}) ON {}",
         select_items.join(", "),
@@ -217,10 +170,7 @@ async fn build_join_sql(
     Ok(sql)
 }
 
-/// Build an ordered `(UPPERCASE_NAME, DataType)` list for every column across both
-/// join inputs, dimension columns first (matching the left/build side). Column
-/// names are disjoint across the two tables (VS guarantee), so the flattened list
-/// carries no duplicate names.
+/// Dimension columns first, matching the left/build side.
 fn combined_upper_fields(
     dim_schema: &datafusion::common::DFSchema,
     fact_schema: &datafusion::common::DFSchema,
@@ -233,12 +183,7 @@ fn combined_upper_fields(
         .collect()
 }
 
-/// Render one projection item for the join SELECT list. A rendered scalar
-/// expression is spliced verbatim; a bare column is quoted as an uppercase
-/// identifier, routed through [`NESTED_JSON_RENDER_UDF_NAME`] when its Arrow
-/// type is one of the five `needs_nested_json_rendering` owns, or wrapped in
-/// `CAST(... AS VARCHAR)` for every other type the JSON fallback covers — the
-/// same rule the single-table scan applies in `build_scan_sql`.
+/// Same column rendering rule as the single-table `build_scan_sql`.
 fn render_join_select_item(
     item: &ProjectionItem,
     combined: &[(String, arrow::datatypes::DataType)],
@@ -264,10 +209,7 @@ fn render_join_select_item(
     }
 }
 
-/// Build the physical plan for the two-table inner equi-join, registering both
-/// sides into `ctx`. Exposed so a host test can assert the bounded dimension side
-/// is the hash-join build (left) side without standing up an S3 store — the caller
-/// registers local Parquet files, then inspects the plan this function produces.
+/// Exposed so a host test can assert the dimension side is the hash-join build side.
 pub async fn build_join_physical_plan(
     ctx: &SessionContext,
     spec: &ScanSpec,

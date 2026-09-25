@@ -11,8 +11,7 @@ fn absent_catalog_kind_resolves_iceberg_rest() {
     assert_eq!(kind, CatalogKind::IcebergRest);
 }
 
-/// Scenario: CATALOG_KIND naming Unity Catalog resolves the native Unity
-/// Catalog kind, compared case-insensitively.
+/// Scenario: CATALOG_KIND naming Unity Catalog resolves the native kind, case-insensitively.
 #[test]
 fn unity_catalog_value_resolves_native_kind() {
     for value in ["UNITY_CATALOG", "unity_catalog", "Unity_Catalog"] {

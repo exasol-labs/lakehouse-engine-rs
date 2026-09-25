@@ -9,42 +9,16 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{CommonScanSpec, ScanStorage};
 
-// NOTE on the `sum_emit_type` tests below: routing `sum_emit_type` through the
-// canonical `parse_decimal_args` makes it GAIN a whitespace-trimming step it did
-// not have before, because `parse_decimal_args` trims each argument before
-// parsing. `DECIMAL(10, 2)` therefore yields `DECIMAL(36,2)` where it used to
-// yield `DECIMAL(36, 2)` — the raw scale slice echoed verbatim. That is an
-// INTENDED consequence of consolidation, not an incidental one, and it is
-// unreachable from every producer of `col_ty` in this repo (each emits a
-// canonical, already-trimmed `DECIMAL(p,s)` under a `p,s <= 36` guard).
-
-/// The one representative neither invariant generates: with no comma there is no
-/// scale text to diverge. The move comes solely from `parse_decimal_args`
-/// defaulting an absent scale to `0`, where `sum_emit_type` used to require a
-/// comma and decline the input entirely.
+/// Scenario: An absent scale defaults to `0`, so `DECIMAL(10)` widens to `DECIMAL(36,0)`.
 #[test]
 fn sum_emit_type_absent_scale_widens_to_a_scale_zero_decimal() {
     assert_eq!(sum_emit_type("DECIMAL(10)"), "DECIMAL(36,0)");
 }
 
-/// Invariant (a) as a property over an OPEN input set: for every scale text that
-/// is not already the canonical `i8` rendering, the answer is never the raw echo
-/// the pre-consolidation parser produced. Only a canonical rendering — or the
-/// numeric fallback — can emerge from a parsed `i8`. An open set is the right
-/// shape here because the pre-consolidation parser echoed the raw scale text
-/// without reading it, so the diverging input set has no closed enumeration.
-///
-/// The rows cover one divergence class each: untrimmed whitespace (the gained
-/// trimming step); a leading `+` or a leading zero, which `i8` parsing accepts
-/// and which therefore can only re-emerge canonically; a non-numeric scale, which
-/// used to be interpolated verbatim into an EMITS type Exasol cannot parse and now
-/// declines to the numeric fallback; a scale outside `i8`; and a further comma,
-/// where the old `split_once(',')` kept `2,3` as the scale text while
-/// `parse_decimal_args` rejects a third argument outright.
+/// Scenario: A non-canonical scale text re-emerges canonically or falls back, never echoed raw.
 #[test]
 fn sum_emit_type_never_echoes_a_non_canonical_scale_text() {
-    // (raw scale text, canonical answer once parsed) — `None` = the parser
-    // rejects the text, so the answer is the numeric fallback.
+    // `None` = the parser rejects the text, so the answer is the numeric fallback.
     let non_canonical: &[(&str, Option<&str>)] = &[
         (" 2", Some("DECIMAL(36,2)")),
         ("2 ", Some("DECIMAL(36,2)")),
@@ -71,14 +45,7 @@ fn sum_emit_type_never_echoes_a_non_canonical_scale_text() {
     }
 }
 
-/// Invariant (b) as a property over an OPEN input set: every precision
-/// `parse_decimal_args` rejects now declines to the numeric fallback, where it
-/// used to yield `DECIMAL(36,2)` regardless — the pre-consolidation parser bound
-/// the precision as `_p` and never read it, so even an unrepresentable precision
-/// borrowed a `DECIMAL(36,…)` width. That non-reading is also why the diverging
-/// set is open rather than a closed enumeration. The rows cover one rejection
-/// class each: a precision outside `u8`, a negative one, a non-numeric one, and
-/// an empty or whitespace-only one.
+/// Scenario: Every precision `parse_decimal_args` rejects declines to the numeric fallback.
 #[test]
 fn sum_emit_type_declines_every_precision_the_parser_rejects() {
     for rejected_precision in ["300", "256", "-1", "X", "", " "] {
@@ -91,15 +58,7 @@ fn sum_emit_type_declines_every_precision_the_parser_rejects() {
     }
 }
 
-/// A grouped-aggregate merge item that CASTs a scalar-over-aggregate to a
-/// CHAR target must render that target as the declared, LENGTH-QUALIFIED
-/// `CHAR(20) ASCII`: `render_scalar_over_merge`'s output is spliced into the
-/// OUTER merge wrapper that Exasol's own engine parses and type-checks, where
-/// a bare length-less `VARCHAR` is the "unexpected ')', expecting '('" parse
-/// error and a collapsed `VARCHAR(20)` is the #192 "Data type mismatch"
-/// rejection. Guards the grouped-merge one of the three Exasol-dialect CAST
-/// consumers; the DataFusion-side renderability check in
-/// `classify_scalar_over_aggregate` deliberately keeps bare `VARCHAR`.
+/// Scenario: A grouped merge CAST to CHAR renders the length-qualified `CHAR(20) ASCII` Exasol parses (#192).
 #[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = serde_json::json!({
@@ -129,11 +88,7 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
     );
 }
 
-/// A CAST-to-CHAR wrapping another CAST-to-CHAR over the same merged
-/// aggregate must render `CHAR(20) ASCII` at BOTH levels: the Exasol-dialect
-/// CHAR case is reached recursively through the translator, so a case that
-/// only fired at the outermost level would leave the inner target collapsed
-/// to `VARCHAR(20)` and reintroduce the #192 mismatch one level down.
+/// Scenario: A nested CAST to CHAR renders `CHAR(20) ASCII` at both levels (#192).
 #[test]
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     let sum_node = serde_json::json!({
@@ -165,9 +120,7 @@ fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     );
 }
 
-/// Scenario (capability-extensions): a GROUP BY request carrying a
-/// COUNT(DISTINCT) still declines (falls back to row scanning); grouped
-/// distinct is explicitly out of scope.
+/// Scenario: A GROUP BY request carrying COUNT(DISTINCT) declines to row scanning.
 #[test]
 fn grouped_count_distinct_falls_back_to_row_scan() {
     let req = serde_json::json!({
@@ -182,14 +135,13 @@ fn grouped_count_distinct_falls_back_to_row_scan() {
         detect_group_by_aggregates(&req).is_none(),
         "grouped COUNT(DISTINCT) must still decline (row-scan fallback)"
     );
-    // A non-grouped detection also declines this shape (it has a GROUP BY).
     assert!(
         detect_aggregates(&req).is_none(),
         "the single-group path rejects any request carrying a non-empty GROUP BY"
     );
 }
 
-/// R.1: MIN/MAX over a DATE column must EMIT DATE, not DOUBLE PRECISION.
+/// Scenario: MIN/MAX over a DATE column emits DATE, not DOUBLE PRECISION.
 #[test]
 fn partial_emits_min_max_preserve_date_timestamp_type() {
     let plans = vec![
@@ -221,7 +173,7 @@ fn partial_emits_min_max_preserve_date_timestamp_type() {
     );
 }
 
-/// R.1: SUM over a DECIMAL(20,0) integer column must emit DECIMAL(36,0), not DOUBLE.
+/// Scenario: SUM over a DECIMAL(20,0) column emits DECIMAL(36,0), not DOUBLE.
 #[test]
 fn partial_emits_sum_integer_stays_decimal() {
     let plans = vec![AggregatePlan {
@@ -236,7 +188,6 @@ fn partial_emits_sum_integer_stays_decimal() {
         "SUM over DECIMAL integer must emit DECIMAL, not DOUBLE: {:?}",
         emits[0]
     );
-    // Scale must be 0 (preserved from original DECIMAL(20,0)).
     assert!(
         emits[0].contains("DECIMAL(36,0)"),
         "SUM over DECIMAL(20,0) must widen to DECIMAL(36,0): {:?}",
@@ -244,7 +195,7 @@ fn partial_emits_sum_integer_stays_decimal() {
     );
 }
 
-/// R.1: SUM over a DOUBLE PRECISION column stays DOUBLE PRECISION.
+/// Scenario: SUM over a DOUBLE PRECISION column stays DOUBLE PRECISION.
 #[test]
 fn partial_emits_sum_double_stays_double() {
     let plans = vec![AggregatePlan {
@@ -261,7 +212,7 @@ fn partial_emits_sum_double_stays_double() {
     );
 }
 
-/// R.1: SUM over a VARCHAR/DATE column => validate_agg_col_types returns false (fall back).
+/// Scenario: SUM over a VARCHAR or DATE column fails `validate_agg_col_types`.
 #[test]
 fn aggregate_falls_back_to_row_scan_for_sum_of_non_numeric() {
     let col_types_varchar = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
@@ -287,13 +238,9 @@ fn aggregate_falls_back_to_row_scan_for_sum_of_non_numeric() {
     );
 }
 
-/// A grouped aggregate whose SUM targets a VARCHAR column must fall back to row
-/// scan (return None from detect_group_by_aggregates + validate_agg_col_types) —
-/// the same guard as the single-group path — rather than producing grouped scan SQL
-/// that would generate an opaque UDF error at execution time.
+/// Scenario: A grouped SUM over VARCHAR falls back to row scan instead of an opaque UDF error.
 #[test]
 fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
-    // Simulate the detection + validation sequence that handle_pushdown runs.
     let req = serde_json::json!({
         "aggregationType": "group_by",
         "groupBy": [{"type": "column", "name": "REGION"}],
@@ -303,7 +250,6 @@ fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
         ],
     });
 
-    // detect_group_by_aggregates must accept the shape (it doesn't know types).
     let detected = detect_group_by_aggregates(&req);
     assert!(
         detected.is_some(),
@@ -311,7 +257,6 @@ fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
     );
     let agg_plans = detected.unwrap().plans;
 
-    // Validation with VARCHAR col_types must fail — triggering fall-back.
     let col_types = vec![
         ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
         ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
@@ -321,7 +266,6 @@ fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
         "validate_agg_col_types must fail for SUM over VARCHAR (fall back to row scan)"
     );
 
-    // Confirm that a DATE column also fails for SUM.
     let col_types_date = vec![
         ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
         ("NAME".to_string(), "DATE".to_string()),
@@ -331,7 +275,6 @@ fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
         "validate_agg_col_types must fail for SUM over DATE (fall back to row scan)"
     );
 
-    // Confirm a numeric type passes (no fall back).
     let col_types_numeric = vec![
         ("REGION".to_string(), "VARCHAR(2000000)".to_string()),
         ("NAME".to_string(), "DOUBLE PRECISION".to_string()),
@@ -353,9 +296,6 @@ fn make_group_by_request(
     })
 }
 
-/// Like `make_group_by_request`, but also carries `selectListDataTypes` so
-/// ordering + type-position assertions are possible (positional matching
-/// against the outer wrapper SELECT and group-key type resolution).
 fn make_group_by_request_with_types(
     group_by: serde_json::Value,
     select_list: serde_json::Value,
@@ -369,9 +309,8 @@ fn make_group_by_request_with_types(
     })
 }
 
-/// `CAST(NAME AS CHAR(size))` as a `function_scalar_cast` node. Its own
-/// `dataType` is the group key's declared result type, which is the only place
-/// that type appears when the key is not also in the select list.
+/// Its own `dataType` is the only place the key's type appears when the key is not
+/// also in the select list.
 fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar_cast",
@@ -381,7 +320,6 @@ fn char_cast_key(size: u64, character_set: &str) -> serde_json::Value {
     })
 }
 
-/// `CAST(NAME AS VARCHAR(size))` — the VARCHAR control for `char_cast_key`.
 fn varchar_cast_key(size: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar_cast",
@@ -391,10 +329,6 @@ fn varchar_cast_key(size: u64) -> serde_json::Value {
     })
 }
 
-/// `MOD(<col>, <divisor>)` as a `function_scalar` node — renders to
-/// `("<COL>" % <divisor>)` via `render_expression`. Used to build the #33
-/// repro (`SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4)`) and its
-/// interleaved/HAVING variants.
 fn mod_item(col: &str, divisor: i64) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
@@ -406,9 +340,6 @@ fn mod_item(col: &str, divisor: i64) -> serde_json::Value {
     })
 }
 
-/// `UPPER(<col>)` as a `function_scalar` node — renders to `upper("<COL>")`
-/// via `render_expression`. Used to build all-expression multi-key GROUP BY
-/// tuples where every element (not just some) is an expression.
 fn upper_item(col: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
@@ -419,12 +350,11 @@ fn upper_item(col: &str) -> serde_json::Value {
     })
 }
 
-/// A DECIMAL `selectListDataTypes` entry, per the `exasol_type_from_json` shape.
 fn decimal_type(precision: u64, scale: u64) -> serde_json::Value {
     serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
 }
 
-/// Column reference in GROUP BY renders to a quoted identifier.
+/// Scenario: A column reference in GROUP BY renders to a quoted identifier.
 #[test]
 fn detect_group_by_aggregates_column_key() {
     let req = make_group_by_request(
@@ -450,7 +380,6 @@ fn detect_group_by_aggregates_column_key() {
     assert_eq!(plans[0].kind, AggKind::Count);
 }
 
-/// Build a minimal grouped `ScanSpec` for the merge-SQL builder tests.
 fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
     ScanSpec {
         common: CommonScanSpec {
@@ -463,12 +392,7 @@ fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
     }
 }
 
-/// A grouped aggregate whose request carries an `orderBy` on a group key but
-/// NO `limit` must still render an explicit final `ORDER BY` in its merge SQL:
-/// once `ORDER_BY_COLUMN` is advertised Exasol no longer re-sorts the grouped
-/// output, so a plain `GROUP BY … ORDER BY` must sort itself (add-topn-pushdown
-/// B6). The sort key is rendered as a POSITIONAL output ordinal so it sorts the
-/// type-cast output, not the lexicographic VARCHAR `GK_*` staging column.
+/// Scenario: A grouped ORDER BY without LIMIT renders a positional final ORDER BY, sorting typed output.
 #[test]
 fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     let mut req = make_group_by_request_with_types(
@@ -479,7 +403,6 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         ]),
         serde_json::json!([decimal_type(20, 0), decimal_type(20, 0)]),
     );
-    // ORDER BY id ASC NULLS LAST, and deliberately NO "limit" key.
     req["orderBy"] = serde_json::json!([{
         "type": "order_by_element",
         "expression": {"type": "column", "name": "ID"},
@@ -488,7 +411,6 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     }]);
 
     let result = detect_group_by_aggregates(&req).expect("grouped aggregate");
-    // The group key ID is output column 1 → positional ordinal, explicit dir+nulls.
     assert_eq!(
         build_grouped_order_by_clause(&req, &result),
         Some(GroupedOrderBy::Clause("1 ASC NULLS LAST".to_string())),
@@ -516,15 +438,10 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
         sql.contains(" ORDER BY 1 ASC NULLS LAST"),
         "merge SQL must render the explicit final ORDER BY: {sql}"
     );
-    // No LIMIT was requested, so none is rendered.
     assert!(!sql.contains("LIMIT"), "no LIMIT requested: {sql}");
 }
 
-/// An `ORDER BY` on an aggregate that IS among the detected select-list plans
-/// resolves to that aggregate's MERGED expression over the `PARTIAL_*` columns —
-/// the same rewrite, by the same `AggregatePlan`-equality match, the merged
-/// HAVING uses (issue #198). A group-key element mixed into the same `orderBy`
-/// still renders as its positional output ordinal, unchanged.
+/// Scenario: An ORDER BY on a detected aggregate resolves to its merged expression (#198).
 #[test]
 fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
     let mut req = make_group_by_request_with_types(
@@ -560,10 +477,7 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
     );
 }
 
-/// An `ORDER BY` on an aggregate ABSENT from the detected plans has no
-/// `PARTIAL_*` column to merge over, and the adapter does not fabricate one:
-/// the resolution reports `Unresolvable`, which `classify_request_shape` turns
-/// into a `GroupByWrapper` route (issue #198).
+/// Scenario: An ORDER BY on an undetected aggregate is `Unresolvable`, routing to a wrapper (#198).
 #[test]
 fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
     let mut req = make_group_by_request_with_types(
@@ -589,10 +503,9 @@ fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
     );
 }
 
-/// Scalar expression in GROUP BY (e.g., function_scalar YEAR) renders via render_expression.
+/// Scenario: A scalar expression in GROUP BY renders via `render_expression`.
 #[test]
 fn detect_group_by_aggregates_expression_key() {
-    // A predicate_equal used as an expression key — render_expression can handle it.
     let req = make_group_by_request(
         serde_json::json!([{
             "type": "predicate_equal",
@@ -602,7 +515,6 @@ fn detect_group_by_aggregates_expression_key() {
         serde_json::json!([agg_item("SUM", Some("AMOUNT"), false),]),
     );
     let result = detect_group_by_aggregates(&req);
-    // predicate_equal renders to (STATUS = 'active'), so it should succeed.
     assert!(result.is_some(), "renderable expression key must succeed");
     let GroupedAggregateDetection {
         group_keys: keys,
@@ -614,7 +526,7 @@ fn detect_group_by_aggregates_expression_key() {
     assert_eq!(plans[0].kind, AggKind::Sum);
 }
 
-/// An unsupported expression in GROUP BY causes the whole function to return None.
+/// Scenario: An unsupported GROUP BY expression makes detection return None.
 #[test]
 fn detect_group_by_unsupported_expression_falls_back() {
     let req = make_group_by_request(
@@ -627,10 +539,9 @@ fn detect_group_by_unsupported_expression_falls_back() {
     );
 }
 
-/// Select list with a non-aggregate, non-column item causes fallback.
+/// Scenario: A non-aggregate, non-column select-list item causes fallback.
 #[test]
 fn detect_group_by_mixed_select_falls_back() {
-    // function_scalar in selectList is not an aggregate and not a plain column.
     let req = make_group_by_request(
         serde_json::json!([{"type": "column", "name": "REGION"}]),
         serde_json::json!([
@@ -644,22 +555,7 @@ fn detect_group_by_mixed_select_falls_back() {
     );
 }
 
-/// Issue #52 regression guard (decision-log entry [4]): the exact composed
-/// `pushdownRequest` Exasol emits for
-/// `SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM EVENTS GROUP BY id) t`
-/// — a real `groupBy` but a `selectList` of only a `literal_null` placeholder
-/// (Exasol's "count the groups" rewrite: the outer query needs only the
-/// per-group row count, not the inner values). Fed verbatim (including the
-/// `from`/`type`/`columnNr`/`tableName` fields the detection path ignores,
-/// to prove they don't perturb parsing) from the spike's captured JSON.
-///
-/// Detection must preserve the GROUP BY (return `Some` with real group keys
-/// and NO aggregate plan) instead of falling back to a row scan — a row-scan
-/// fallback returns one row per source row, not per group, which is only
-/// accidentally correct when the group column happens to be unique (see
-/// decision-log entry [4]'s caveat). The rendered scan SQL must never
-/// reference a phantom `"NULL"` column identifier and must retain a real
-/// `GROUP BY` clause.
+/// Scenario: A `literal_null`-only grouped select list keeps its GROUP BY, never a row-scan fallback (#52).
 #[test]
 fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     let req = serde_json::json!({
@@ -697,8 +593,7 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         result.select_items
     );
 
-    // The generated grouped scan SQL must group by GK_0 and must never
-    // reference a phantom "NULL" column identifier.
+    // A row-scan fallback would return one row per source row, not per group.
     let group_key_types = group_key_exasol_types(&req, &result.group_keys, &result.select_items);
     let sql = build_grouped_aggregate_scan_sql(
         &ScanSpec {
@@ -732,24 +627,13 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
         sql.contains(r#"GROUP BY "GK_0""#),
         "outer wrapper must group by GK_0 to yield one row per distinct group: {sql}"
     );
-    // The constant placeholder projects a typed literal (declared BOOLEAN),
-    // not an empty select list and not a bare-literal column reference.
     assert!(
         sql.contains("SELECT CAST(NULL AS BOOLEAN) FROM"),
         "outer wrapper must project the type-cast constant placeholder: {sql}"
     );
 }
 
-/// Code-review follow-up on issue #52: `literal_bool` was missing from the
-/// literal-type set used to classify grouped `selectList` constants (only
-/// `literal_null` and six other literal kinds were listed, and the
-/// renderer in `vs-expression` supports `literal_bool` — see
-/// `render_expression`). A boolean literal placeholder in a grouped
-/// selectList (e.g. `SELECT k, TRUE AS flag, COUNT(*) FROM t GROUP BY k`)
-/// used to fall through to the group-key-matching `_` arm, fail to match
-/// any group key, and abort the ENTIRE grouped-aggregate detection to
-/// `None` — exactly the bug class the `literal_null` case guards against,
-/// just for `literal_bool`. `LITERAL_SELECTLIST_TYPES` closes this gap.
+/// Scenario: A `literal_bool` placeholder in a grouped select list does not abort detection (#52).
 #[test]
 fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
     let req = make_group_by_request_with_types(
@@ -782,12 +666,9 @@ fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
     );
 }
 
-/// #33 repro: an aggregate placed before the single group key in the
-/// selectList must classify with `select_index` 0 for the aggregate and 1
-/// for the group key — the original ordinals, not a keys-first reorder.
+/// Scenario: An aggregate before the group key keeps its original select-list ordinal (#33).
 #[test]
 fn detect_group_by_aggregates_preserves_select_list_order() {
-    // SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4)
     let req = make_group_by_request(
         serde_json::json!([mod_item("ID", 4)]),
         serde_json::json!([agg_item("SUM", Some("SCORE"), false), mod_item("ID", 4)]),
@@ -812,10 +693,7 @@ fn detect_group_by_aggregates_preserves_select_list_order() {
     );
 }
 
-/// Interleaved multi-key GROUP BY: `SELECT k1, SUM(score), k2 ... GROUP BY k1, k2`.
-/// Each classified item must carry its own selectList ordinal and the
-/// correct group-key slot (k1 → slot 0, k2 → slot 1), even though the
-/// aggregate sits between them in the select list.
+/// Scenario: Interleaved multi-key GROUP BY items keep their own ordinals and key slots.
 #[test]
 fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
     let req = make_group_by_request(
@@ -853,8 +731,7 @@ fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
     );
 }
 
-/// Expression group key placed after an aggregate:
-/// `SELECT COUNT(*), MOD(id,4) ... GROUP BY MOD(id,4)`.
+/// Scenario: An expression group key after an aggregate keeps its original ordinal.
 #[test]
 fn detect_group_by_aggregates_expr_key_after_agg_preserves_order() {
     let req = make_group_by_request(
@@ -879,9 +756,7 @@ fn detect_group_by_aggregates_expr_key_after_agg_preserves_order() {
     );
 }
 
-/// Aggregate-first GROUP BY with HAVING present: HAVING does not change
-/// selectList classification, but this exercises the same aggregate-first
-/// shape that flows into the HAVING-present outer-wrapper path.
+/// Scenario: HAVING does not change aggregate-first select-list classification.
 #[test]
 fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
     let req = serde_json::json!({
@@ -912,13 +787,7 @@ fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
     );
 }
 
-/// All-expression multi-key GROUP BY: `SELECT MOD(id,4), UPPER(name), COUNT(*)
-/// ... GROUP BY MOD(id,4), UPPER(name)`. Every tuple element is an expression
-/// (none a plain column) and must still be detected, each rendered on its own,
-/// and each element must appear rendered individually (not merged/collapsed)
-/// in the SQL built from the detection. If one element of the tuple is
-/// untranslatable, the whole detection must fall back to `None` (full
-/// raw-scan fallback), not a partial/degraded pushdown.
+/// Scenario: All-expression multi-key GROUP BY renders each key; one untranslatable key declines all.
 #[test]
 fn detect_group_by_all_expression_multi_key() {
     let req = make_group_by_request(
@@ -962,9 +831,6 @@ fn detect_group_by_all_expression_multi_key() {
         result.select_items
     );
 
-    // Each element must be rendered per-element (not merged) in the built SQL:
-    // the per-shard scan spec's common blob carries both rendered fragments
-    // verbatim, embedded in the SQL literal that drives the UDF call.
     let col_types: Vec<(String, String)> = vec![];
     let group_key_types = vec!["VARCHAR(2000000)".to_string(); 2];
     let aggregate_types = vec!["DECIMAL(18,0)".to_string()];
@@ -1007,7 +873,6 @@ fn detect_group_by_all_expression_multi_key() {
         "built SQL must emit both group-key slots: {sql}"
     );
 
-    // One untranslatable element in the tuple must collapse detection to None.
     let bad_req = make_group_by_request(
         serde_json::json!([mod_item("ID", 4), {"type": "fn_custom_unsupported", "name": "MYSTERY"}]),
         serde_json::json!([
@@ -1022,7 +887,6 @@ fn detect_group_by_all_expression_multi_key() {
     );
 }
 
-/// Helper: build grouped aggregate scan SQL.
 /// Keys-first classification: group keys at ordinals 0..m, aggregates after.
 fn keys_first_select_items(group_keys: usize, aggregates: usize) -> Vec<GroupedSelectItem> {
     let mut items = Vec::with_capacity(group_keys + aggregates);
@@ -1082,11 +946,9 @@ fn build_grouped_agg_sql(
     )
 }
 
-/// Grouped scan-driving SQL fans out via GROUP BY shard_key over G work units,
-/// serializing the common blob once and one files literal per shard.
+/// Scenario: Grouped SQL fans out via GROUP BY shard_key, one common blob and one files literal per shard.
 #[test]
 fn grouped_fan_out_common_once_files_per_shard() {
-    // Two distinct files, forced onto two shards (2 nodes × factor 1).
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
     let g = shard_count(2, 1, files.len());
     let sql = build_grouped_agg_sql(
@@ -1112,7 +974,6 @@ fn grouped_fan_out_common_once_files_per_shard() {
         "grouped fan-out must alias the VALUES table as shards(shard_key, files): {sql}"
     );
 
-    // Common blob (credentials + tuning) serialized once, not per shard.
     assert_eq!(
         sql.matches("http://minio:9000").count(),
         1,
@@ -1124,7 +985,6 @@ fn grouped_fan_out_common_once_files_per_shard() {
         "grouped common blob (tuning payload) must appear exactly once: {sql}"
     );
 
-    // Each shard's file appears exactly once, in its own VALUES row.
     for file in ["f0.parquet", "f1.parquet"] {
         assert_eq!(
             sql.matches(file).count(),
@@ -1134,11 +994,7 @@ fn grouped_fan_out_common_once_files_per_shard() {
     }
 }
 
-/// The `GROUP BY shard_key` fan-out lives INSIDE the distributor subquery, while
-/// the OUTER wrapper re-groups the per-shard partials on the user's group keys
-/// (`GROUP BY "GK_0"`) over the scalar scan (decision [5]/[7]). The two GROUP BYs
-/// are at different query levels: shard_key groups the fan-out `VALUES` rows for
-/// round-robin distribution; GK_* re-groups the partial groups every shard emits.
+/// Scenario: The shard_key GROUP BY sits inside the distributor; the outer wrapper re-groups on GK_*.
 #[test]
 fn grouped_group_by_shard_key_inside_distributor() {
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
@@ -1154,18 +1010,14 @@ fn grouped_group_by_shard_key_inside_distributor() {
         g,
     );
 
-    // The distributor carries the shard_key fan-out.
     assert!(
         sql.contains("AS shards(shard_key, files) GROUP BY shard_key"),
         "the shard_key fan-out must live in the distributor subquery: {sql}"
     );
-    // The outer wrapper re-groups on the user key staging column.
     assert!(
         sql.trim_end().ends_with(r#"GROUP BY "GK_0""#),
         "the outer wrapper must re-group on the user group key GK_0: {sql}"
     );
-    // The shard_key GROUP BY is nested strictly BEFORE the outer GK_0 GROUP BY:
-    // the distributor's grouping is not the outer one.
     let shard_gb = sql
         .find("GROUP BY shard_key")
         .expect("shard_key GROUP BY present");
@@ -1176,15 +1028,13 @@ fn grouped_group_by_shard_key_inside_distributor() {
         shard_gb < gk_gb,
         "shard_key GROUP BY (distributor) must precede the outer GK_0 GROUP BY: {sql}"
     );
-    // No materializing SELECT * wrapper between the outer re-group and the scan.
     assert!(
         !sql.contains("SELECT * FROM ("),
         "grouped wrapper must not use a SELECT * materialization boundary: {sql}"
     );
 }
 
-/// Single-shard grouped: the outer re-group sits over a from-less scalar scan on
-/// literals — the distributor short-circuits (no `VALUES`, no shard_key grouping).
+/// Scenario: Single-shard grouped SQL re-groups over a from-less scan, with no distributor.
 #[test]
 fn grouped_single_shard_short_circuits_distributor() {
     let sql = build_grouped_agg_sql(
@@ -1212,8 +1062,7 @@ fn grouped_single_shard_short_circuits_distributor() {
     );
 }
 
-/// LIMIT is NOT pushed into the shard scan for a grouped query. The shared common
-/// blob (arg 0) must not carry "limit"; only the outer wrapper may apply LIMIT.
+/// Scenario: A grouped LIMIT applies only on the outer wrapper, never in the shard blob.
 #[test]
 fn grouped_common_blob_has_no_limit() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
@@ -1221,7 +1070,7 @@ fn grouped_common_blob_has_no_limit() {
     let col_types = vec![("AMOUNT".to_string(), "DOUBLE PRECISION".to_string())];
     let spec_template = ScanSpec {
         common: CommonScanSpec {
-            limit: Some(100), // LIMIT should NOT appear inside the shard spec JSON
+            limit: Some(100),
             aggregates: Some(vec![AggregatePlan {
                 kind: AggKind::Count,
                 column: None,
@@ -1254,26 +1103,18 @@ fn grouped_common_blob_has_no_limit() {
         None,
         None,
     );
-    // The shared common blob (arg 0) is built once with limit = None, so it must
-    // NOT carry a "limit" key — this is the structural LIMIT-exclusion invariant.
     let common = common_arg_literal(&sql);
     assert!(
         !common.contains("\"limit\""),
         "grouped common blob must NOT carry limit: {common}"
     );
-    // The outer wrapper may still apply the final LIMIT.
     assert!(
         sql.contains("LIMIT 100"),
         "outer wrapper should still apply the final LIMIT: {sql}"
     );
 }
 
-/// A nonzero offset must never reach the per-shard fan-out spec: the common
-/// blob shared by every shard carries neither "limit" nor an "offset" key —
-/// there is no offset field on `CommonScanSpec` at all (design invariant: no
-/// `ScanSpec`/UDF wire change), so this also pins that no such field leaks into
-/// the shared JSON. The outer wrapper is the only place the offset renders
-/// (fix-191-order-by-offset).
+/// Scenario: A grouped offset renders only on the outer wrapper, never in the shared blob.
 #[test]
 fn grouped_merge_offset_never_reaches_per_shard_spec() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
@@ -1325,10 +1166,7 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
     );
 }
 
-/// Byte-identical requirement (fix-191-order-by-offset): a zero offset renders
-/// the exact pre-change ` LIMIT {n}` string with no OFFSET token, so every
-/// already-correct SQL-shape assertion for the grouped-agg path keeps passing
-/// unchanged.
+/// Scenario: A zero offset renders exactly ` LIMIT {n}` with no OFFSET token (#191).
 #[test]
 fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
@@ -1379,10 +1217,7 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
     );
 }
 
-/// The grouped merge renders `GROUP BY … ORDER BY … LIMIT n OFFSET m` in that
-/// exact clause order (fix-191-order-by-offset, capture rows 5-8):
-/// `render_limit_offset` is the shared seam every reachable wrapper calls, and
-/// this pins the grouped merge's wiring into it.
+/// Scenario: The grouped merge renders `GROUP BY … ORDER BY … LIMIT n OFFSET m` in that order (#191).
 #[test]
 fn grouped_merge_renders_limit_offset_in_clause_order() {
     let mut req = make_group_by_request_with_types(
@@ -1432,7 +1267,7 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
     );
 }
 
-/// Grouped aggregate wrapper SQL re-groups partial results per user group key.
+/// Scenario: The grouped wrapper re-groups partial results per user group key.
 #[test]
 fn grouped_aggregate_wrapper_sql_groups_by_user_key_cols() {
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
@@ -1454,7 +1289,6 @@ fn grouped_aggregate_wrapper_sql_groups_by_user_key_cols() {
         files,
         g,
     );
-    // Outer wrapper must GROUP BY GK_0, GK_1 (the group key columns).
     assert!(
         sql.contains("GK_0"),
         "wrapper SQL must reference GK_0: {sql}"
@@ -1463,7 +1297,6 @@ fn grouped_aggregate_wrapper_sql_groups_by_user_key_cols() {
         sql.contains("GK_1"),
         "wrapper SQL must reference GK_1: {sql}"
     );
-    // Outer GROUP BY must merge partial aggregates.
     assert!(
         sql.contains("SUM("),
         "wrapper must contain SUM for merge: {sql}"
@@ -1476,7 +1309,6 @@ fn grouped_aggregate_wrapper_sql_groups_by_user_key_cols() {
         sql.contains("PARTIAL_sum_1"),
         "wrapper must reference PARTIAL_sum_1: {sql}"
     );
-    // Outer must have GROUP BY GK_0, GK_1.
     let outer_group_by = sql
         .rfind("GROUP BY")
         .expect("must have GROUP BY in outer wrapper");
@@ -1491,12 +1323,8 @@ fn grouped_aggregate_wrapper_sql_groups_by_user_key_cols() {
     );
 }
 
-/// Extract the outer wrapper's SELECT list (between the leading `SELECT `
-/// and the `FROM (` that opens the fan-out subselect), split on the
-/// top-level commas of each column expression. Aggregate expressions and
-/// CAST(...) fragments never contain a bare `, ` outside of nested
-/// parens/quotes for the shapes used in these tests (SUM/COUNT merges and
-/// CAST("GK_i" AS ...)), so a paren-depth-aware split is sufficient.
+/// A paren-depth-aware split suffices: the merge and CAST shapes used here carry no
+/// top-level `, ` inside quotes.
 fn outer_select_items(sql: &str) -> Vec<String> {
     let from_pos = sql
         .find(" FROM (")
@@ -1528,8 +1356,6 @@ fn outer_select_items(sql: &str) -> Vec<String> {
     items
 }
 
-/// Build grouped aggregate scan SQL with explicit (non-keys-first) `select_items`
-/// and declared group-key types, so ordering + CAST type can be asserted.
 fn build_grouped_agg_sql_with_select_items(
     group_keys: Vec<String>,
     group_key_types: Vec<String>,
@@ -1570,10 +1396,7 @@ fn build_grouped_agg_sql_with_select_items(
     )
 }
 
-/// #33 repro: `SELECT SUM(score), MOD(id,4) ... GROUP BY MOD(id,4)`.
-/// The outer wrapper SELECT must place the merged SUM at position 0 and
-/// the CAST'd group key at position 1 — matching the user's selectList
-/// order, not the inner fan-out's keys-first shape.
+/// Scenario: The outer SELECT follows select-list order, merged SUM before the cast key (#33).
 #[test]
 fn grouped_wrapper_agg_before_key_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
@@ -1613,8 +1436,7 @@ fn grouped_wrapper_agg_before_key_ordering() {
     );
 }
 
-/// Interleaved multi-key: `SELECT k1, SUM(score), k2 ... GROUP BY k1, k2`.
-/// Outer SELECT order must be [key0, aggregate, key1], matching selectList.
+/// Scenario: Interleaved multi-key outer SELECT order is [key0, aggregate, key1].
 #[test]
 fn grouped_wrapper_interleaved_multi_key_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
@@ -1662,10 +1484,7 @@ fn grouped_wrapper_interleaved_multi_key_ordering() {
     );
 }
 
-/// Expression group key after an aggregate: `SELECT COUNT(*), MOD(id,4) ...
-/// GROUP BY MOD(id,4)`. The key's declared type (DECIMAL, from
-/// selectListDataTypes at its own select_index) must be preserved — this
-/// is what stops the silent VARCHAR(2000000) fallback for #33 sub-case 3.
+/// Scenario: An expression key after an aggregate keeps its declared DECIMAL type, not VARCHAR (#33).
 #[test]
 fn grouped_wrapper_expr_key_after_agg_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
@@ -1701,11 +1520,7 @@ fn grouped_wrapper_expr_key_after_agg_ordering() {
     );
 }
 
-/// Aggregate-first GROUP BY with HAVING: `SELECT SUM(score), MOD(id,4) ...
-/// GROUP BY MOD(id,4) HAVING SUM(score) > n`. Outer SELECT order must still
-/// follow selectList (aggregate first) and HAVING must be appended after
-/// GROUP BY, exercising the HAVING-present outer-wrapper path together with
-/// non-keys-first ordering.
+/// Scenario: Aggregate-first GROUP BY with HAVING keeps select-list order and appends HAVING after GROUP BY.
 #[test]
 fn grouped_wrapper_agg_first_with_having_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
@@ -1748,8 +1563,6 @@ fn grouped_wrapper_agg_first_with_having_ordering() {
     );
 }
 
-/// `CASE WHEN <col> = 'R' THEN 1 ELSE 0 END` — the conditional-count inner
-/// expression wrapped by #82's ROUND(...) select item.
 fn case_flag_eq(col: &str, val: &str) -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar_case",
@@ -1766,8 +1579,6 @@ fn case_flag_eq(col: &str, val: &str) -> serde_json::Value {
     })
 }
 
-/// #82's scalar-over-aggregate select item:
-/// `ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END) / COUNT(*), 2)`.
 fn round_pct_over_aggregates() -> serde_json::Value {
     serde_json::json!({
         "type": "function_scalar",
@@ -1796,9 +1607,7 @@ fn soa_col_types() -> Vec<(String, String)> {
     ]
 }
 
-/// Drive detection then the outer-wrapper builder with the detection outputs
-/// (plans + the plans-aligned `plan_types`), mirroring the production grouped
-/// branch of `handle_pushdown`.
+/// Mirrors the production grouped branch of `handle_pushdown`.
 fn build_grouped_from_detection(req: &serde_json::Value) -> String {
     let d = detect_group_by_aggregates(req)
         .expect("must detect the grouped scalar-over-aggregate pushdown");
@@ -1830,11 +1639,7 @@ fn build_grouped_from_detection(req: &serde_json::Value) -> String {
     )
 }
 
-/// Task 3.1: `detect_group_by_aggregates` over #82's select list (plus a bare
-/// `COUNT(*)` item) classifies the ROUND(...) item as `ScalarOverAggregate` and
-/// folds its inner `SUM(CASE …)` + `COUNT(*)` into the shared plan list — the
-/// nested `COUNT(*)` deduplicated against the bare `COUNT(*)` so there is exactly
-/// ONE count plan (one `PARTIAL_*` column).
+/// Scenario: A scalar-over-aggregate folds its inner aggregates into the plan list, deduping COUNT(*) (#82).
 #[test]
 fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
     let req = make_group_by_request_with_types(
@@ -1856,8 +1661,6 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
     );
     let d = detect_group_by_aggregates(&req).expect("must detect grouped scalar-over-aggregate");
 
-    // The ROUND item is classified as a scalar-over-aggregate at its own ordinal,
-    // carrying its own declared type.
     assert!(
         matches!(
             &d.select_items[3],
@@ -1871,8 +1674,6 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
         d.select_items[3]
     );
 
-    // Plans: SUM(L_QUANTITY), AVG(L_EXTENDEDPRICE), SUM(CASE …), COUNT(*) — the
-    // nested COUNT(*) and the bare COUNT(*) collapse to ONE plan.
     assert_eq!(
         d.plans.len(),
         4,
@@ -1890,8 +1691,6 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
         d.plans
     );
 
-    // The bare COUNT(*) select item (index 4) points at the SAME slot the nested
-    // COUNT(*) folded into.
     let count_slot = d
         .plans
         .iter()
@@ -1907,10 +1706,7 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
     );
 }
 
-/// Task 3.2: the outer wrapper renders the scalar-over-aggregate column over the
-/// MERGED partials (`ROUND(… SUM("PARTIAL_*") / SUM("PARTIAL_*") …)`), cast to its
-/// declared type, with NO source-column reference; the outer SELECT column count
-/// equals the `selectList` length.
+/// Scenario: The wrapper renders a scalar-over-aggregate over merged partials with no source column.
 #[test]
 fn grouped_scalar_over_aggregate_renders_merged_partials() {
     let req = make_group_by_request_with_types(
@@ -1949,9 +1745,6 @@ fn grouped_scalar_over_aggregate_renders_merged_partials() {
         soa.starts_with("CAST(") && soa.contains("DECIMAL(5,2)"),
         "wrapper item must be CAST to its declared type at its own ordinal: {soa}"
     );
-    // The nested aggregates' argument structure (the CASE, and every source
-    // column) is subsumed into the PARTIAL_* rewrite — the outer wrapper exposes
-    // only GK_*/PARTIAL_* columns.
     assert!(
         !soa.contains("CASE"),
         "the CASE must be folded into a PARTIAL_* column: {soa}"
@@ -1962,9 +1755,7 @@ fn grouped_scalar_over_aggregate_renders_merged_partials() {
     );
 }
 
-/// Task 3.3: a scalar-over-aggregate placed BEFORE the group key and a plain
-/// aggregate yields outer SELECT items in `selectList` order, each cast from
-/// `selectListDataTypes` at its own ordinal.
+/// Scenario: A scalar-over-aggregate before the key keeps select-list order and its declared cast.
 #[test]
 fn grouped_scalar_over_aggregate_preserves_selectlist_order() {
     let req = make_group_by_request_with_types(
@@ -2003,11 +1794,7 @@ fn grouped_scalar_over_aggregate_preserves_selectlist_order() {
     );
 }
 
-/// Task 3.4: a grouped request whose scalar-over-aggregate wraps a
-/// `COUNT(DISTINCT …)` (undecomposable) declines grouped detection and routes to
-/// the qualified single-table wrapper — `SELECT <selectList> FROM (<raw scan>) AS
-/// "LHS_T0" GROUP BY …` with a `selectList`-matching column count — NOT a bare
-/// `SELECT * FROM (…)` row scan (the `04000` bug).
+/// Scenario: A scalar over COUNT(DISTINCT) routes to the qualified wrapper, not a bare row scan.
 #[test]
 fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     let pushdown_req = serde_json::json!({
@@ -2029,7 +1816,6 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         ],
     });
 
-    // The COUNT(DISTINCT) inner aggregate is undecomposable → detection declines.
     assert!(
         detect_group_by_aggregates(&pushdown_req).is_none(),
         "a nested COUNT(DISTINCT) must decline the grouped partial/merge path"
@@ -2043,10 +1829,6 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         ]}]
     });
     let all_cols = extract_all_column_types(&request);
-    // The shared referenced-column helper (issue #160) narrows the inner scan to
-    // only the columns the wrapper references — here L_RETURNFLAG (GROUP BY +
-    // select) and X, Y (nested inside the SUM/COUNT aggregate arguments), which is
-    // the whole table, so the wrapper shape is identical to the old full-row scan.
     let (proj_cols, proj_types) = referenced_column_projection(&pushdown_req, &all_cols);
     let fan_out_spec = ScanSpec {
         common: CommonScanSpec {
@@ -2084,8 +1866,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
         sql.contains("COUNT(DISTINCT"),
         "the undecomposable aggregate is rendered verbatim for Exasol to compute: {sql}"
     );
-    // The FIRST ` FROM (` is the outer wrapper's (the fan-out subquery's own
-    // FROM comes later), so `outer_select_items` extracts the wrapper's SELECT.
+    // The first ` FROM (` is the outer wrapper's; the fan-out subquery's comes later.
     let items = outer_select_items(&sql);
     assert_eq!(
         items.len(),
@@ -2094,12 +1875,7 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     );
 }
 
-/// A HAVING `SUM(score) > literal` node built as Exasol sends it (a
-/// `predicate_greater` whose `left` is a `function_aggregate`) must render
-/// against the MERGE decomposition: the aggregate reference becomes the
-/// merged partial expression `SUM("PARTIAL_sum_0")`, NOT the source column
-/// `SUM("SCORE")` (which does not exist in the outer wrapper). This is the
-/// #33 HAVING repro (`... GROUP BY MOD(id,4) HAVING SUM(score) > 250`).
+/// Scenario: A HAVING aggregate renders against the merged partial, not the source column (#33).
 #[test]
 fn render_having_over_merge_rewrites_aggregate_to_partial() {
     let having = serde_json::json!({
@@ -2124,9 +1900,7 @@ fn render_having_over_merge_rewrites_aggregate_to_partial() {
     );
 }
 
-/// The full outer-wrapper SQL for the #33 HAVING repro must carry the merged
-/// HAVING `SUM("PARTIAL_sum_0") > 250` and must not reference the source
-/// `SCORE` column in the HAVING clause.
+/// Scenario: The #33 HAVING wrapper carries the merged HAVING and no source `SCORE` reference.
 #[test]
 fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let req = make_group_by_request_with_types(
@@ -2190,11 +1964,7 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     );
 }
 
-/// A HAVING referencing an aggregate that is NOT present among the plans
-/// (e.g. `COUNT(*)` when only `SUM(score)` was projected) cannot be merged,
-/// so `render_having_over_merge` returns None — the signal for
-/// `classify_request_shape` to route the request to `RequestShape::GroupByWrapper`
-/// rather than drop the HAVING.
+/// Scenario: A HAVING on an unplanned aggregate returns None so the request routes to a wrapper.
 #[test]
 fn render_having_over_merge_declines_unknown_aggregate() {
     let having = serde_json::json!({
@@ -2202,7 +1972,6 @@ fn render_having_over_merge_declines_unknown_aggregate() {
         "left": agg_item("COUNT", None, false),
         "right": {"type": "literal_exactnumeric", "value": 10},
     });
-    // Only SUM(score) was projected — COUNT(*) has no matching plan.
     let plans = vec![AggregatePlan {
         kind: AggKind::Sum,
         column: Some("SCORE".into()),
@@ -2214,10 +1983,7 @@ fn render_having_over_merge_declines_unknown_aggregate() {
     );
 }
 
-/// End-to-end wiring: `detect_group_by_aggregates`'s classification output
-/// feeds directly into `build_grouped_aggregate_scan_sql` and the outer
-/// wrapper SELECT follows the original selectList order (#33 repro, driven
-/// through both functions together rather than a hand-built select_items).
+/// Scenario: Detection output feeds the SQL builder and the wrapper follows select-list order (#33).
 #[test]
 fn grouped_wrapper_outer_select_follows_select_list_order() {
     let req = make_group_by_request_with_types(
@@ -2274,11 +2040,7 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
     );
 }
 
-/// Multi-key grouped SQL build with HAVING and LIMIT: `SELECT REGION,
-/// SUM(score), MOD(id,4) ... GROUP BY REGION, MOD(id,4) HAVING SUM(score) >
-/// 100 LIMIT 2`. HAVING and LIMIT must be placed ONLY in the outer wrapper —
-/// never in the per-shard partial scan, which must emit every partial group
-/// from every shard for the outer wrapper to merge and filter correctly.
+/// Scenario: Multi-key HAVING and LIMIT render only in the outer wrapper, never per shard.
 #[test]
 fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let req = make_group_by_request_with_types(
@@ -2322,8 +2084,6 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         },
         files: vec![],
     };
-    // Multiple shards so the inner scan is a real `GROUP BY shard_key` fan-out,
-    // not the single-shard direct-call shortcut.
     let shards = vec![
         vec![("s3://wh/f0.parquet".to_string(), 1u64)],
         vec![("s3://wh/f1.parquet".to_string(), 1u64)],
@@ -2345,8 +2105,6 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         None,
     );
 
-    // The per-shard partial scan ends at "GROUP BY shard_key"; everything up to
-    // and including that point must carry neither HAVING nor LIMIT.
     let shard_group_end = sql
         .find("GROUP BY shard_key")
         .map(|i| i + "GROUP BY shard_key".len())
@@ -2361,8 +2119,6 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
         "LIMIT must not appear in the per-shard partial scan: {inner_part}"
     );
 
-    // Everything after the per-shard scan is the outer wrapper: it must carry
-    // its own multi-key GROUP BY, then HAVING, then LIMIT, in that order.
     let outer_part = &sql[shard_group_end..];
     let outer_group_by_pos = outer_part
         .find("GROUP BY")
@@ -2387,16 +2143,9 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     );
 }
 
-/// An expression group key whose `groupBy` and `selectList` renderings
-/// differ only by whitespace/casing must still resolve its declared type
-/// by index (via `select_items`), not by comparing rendered SQL strings —
-/// which would silently fall back to VARCHAR(2000000) on any drift.
+/// Scenario: An expression key resolves its declared type by index, not by rendered-string match.
 #[test]
 fn group_key_type_resolved_by_index_not_string_match() {
-    // groupBy renders "(\"ID\" % 4)" (see MOD rendering); simulate a
-    // whitespace/casing-drifted selectList rendering by using a
-    // hand-built classification whose select_index points at a
-    // selectListDataTypes slot the rendered-string form would never find.
     let req = serde_json::json!({
         "aggregationType": "group_by",
         "groupBy": [mod_item("ID", 4)],
@@ -2411,13 +2160,7 @@ fn group_key_type_resolved_by_index_not_string_match() {
     });
     let detection = detect_group_by_aggregates(&req).expect("must detect grouped aggregate");
 
-    // Sanity: the real detection path already resolves this correctly by
-    // index. Now prove the mechanism is index-based, not string-based, by
-    // building a classification where the rendered groupBy fragment would
-    // NOT string-match the (hypothetically drifted) selectList rendering,
-    // yet the index-based lookup still finds DECIMAL(9,0) because it reads
-    // selectListDataTypes[select_index] directly.
-    let group_keys = vec![r#"("id" % 4)"#.to_string()]; // lowercase drift vs GK render
+    let group_keys = vec![r#"("id" % 4)"#.to_string()];
     let select_items = detection.select_items.clone();
     let types = group_key_exasol_types(&req, &group_keys, &select_items);
 
@@ -2429,11 +2172,7 @@ fn group_key_type_resolved_by_index_not_string_match() {
     );
 }
 
-/// Mixed-type multi-key GROUP BY: `SELECT REGION, MOD(id,4), COUNT(*) ...
-/// GROUP BY REGION, MOD(id,4)`. `REGION` is a plain column declared VARCHAR;
-/// `MOD(id,4)` is an expression declared DECIMAL. Each `GK_{i}` must resolve
-/// its own declared type by its own `selectList` index — a shared/defaulted
-/// VARCHAR for both would silently lose the DECIMAL key's real type.
+/// Scenario: Mixed-type multi-key GROUP BY resolves each key's own declared type.
 #[test]
 fn group_key_types_multi_key_mixed_types() {
     let req = make_group_by_request_with_types(
@@ -2469,13 +2208,7 @@ fn group_key_types_multi_key_mixed_types() {
     );
 }
 
-/// An equal-length CASE group key (`CASE WHEN c_decimal_a < 0 THEN 'NEG' ELSE
-/// 'POS' END`, the #192 primary shape) must resolve to `CHAR(3) ASCII` through
-/// `group_key_exasol_types`, driven through the real `detect_group_by_aggregates`
-/// entry point — not the bare `exasol_type_from_json` function. Exasol declares
-/// this expression `CHAR(3) ASCII` (live-verified) because both branches are the
-/// same length; the current catch-all renders it `VARCHAR(3) ASCII` instead,
-/// which Exasol's type checker rejects with "Data type mismatch" (facet A).
+/// Scenario: An equal-length CASE group key resolves to `CHAR(3) ASCII`, as Exasol declares it (#192).
 #[test]
 fn group_key_exasol_types_resolves_char_case_key() {
     let case_key = serde_json::json!({
@@ -2513,9 +2246,7 @@ fn group_key_exasol_types_resolves_char_case_key() {
     );
 }
 
-/// CONTROL: a plain VARCHAR-declared group key (`REGION`) must keep resolving
-/// to `VARCHAR(10)`, unaffected by the CHAR-type-declaration fix. MUST pass
-/// both before and after that fix.
+/// Scenario: A VARCHAR-declared group key keeps resolving to `VARCHAR(10)`.
 #[test]
 fn group_key_exasol_types_resolves_varchar_key_unchanged() {
     let req = make_group_by_request_with_types(
@@ -2540,14 +2271,7 @@ fn group_key_exasol_types_resolves_varchar_key_unchanged() {
     );
 }
 
-/// A group key that is NOT in the select list (`SELECT COUNT(*) … GROUP BY
-/// CAST(NAME AS CHAR(20))`) carries no `selectListDataTypes` ordinal, so its
-/// declared type is only readable from its own `groupBy` node. Without that
-/// fallback the slot keeps the `VARCHAR(2000000)` "unknown width" default,
-/// `blank_pad_char_group_keys` finds no CHAR width, and the key reaches
-/// DataFusion unpadded — `'ab'` and `'ab   '` stay two groups where Exasol
-/// returns one, with no outer `CAST("GK_0" AS CHAR(n))` on this path to
-/// surface the divergence as a type error (#192 review finding).
+/// Scenario: An unprojected group key reads its declared CHAR type from its `groupBy` node (#192).
 #[test]
 fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
     let req = make_group_by_request_with_types(
@@ -2576,12 +2300,7 @@ fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
     );
 }
 
-/// CONTROL for the `groupBy` fallback: an unprojected group key whose own
-/// `groupBy` node declares VARCHAR must resolve VARCHAR, never a CHAR width.
-/// The fallback fires here (the node carries a `dataType`), so this pins that
-/// it resolves the declared type rather than assuming CHAR — a VARCHAR key
-/// blank-padded to a width would change grouping semantics for every ordinary
-/// string GROUP BY that omits its key from the select list.
+/// Scenario: An unprojected VARCHAR group key resolves VARCHAR, never a padded CHAR width.
 #[test]
 fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
     let req = make_group_by_request_with_types(
@@ -2601,11 +2320,7 @@ fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
     );
 }
 
-/// PRECEDENCE: when a group key is BOTH projected and carries a `dataType` on
-/// its `groupBy` node, the `selectListDataTypes` entry wins. Exasol validates
-/// the outer wrapper SELECT positionally against `selectListDataTypes`, so a
-/// `groupBy`-derived type that disagreed would make the outer
-/// `CAST("GK_0" AS …)` contradict the column type Exasol is checking.
+/// Scenario: A projected key's `selectListDataTypes` entry wins over its `groupBy` type.
 #[test]
 fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
     let req = make_group_by_request_with_types(
@@ -2625,12 +2340,7 @@ fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
     );
 }
 
-/// A bare string-literal select item (`'X'`, the #192 constant-projection
-/// shape — `SELECT 'X' G, COUNT(*) ... GROUP BY 1`) declared `CHAR(1) ASCII`
-/// must render `CAST('X' AS CHAR(1) ASCII)` through `constant_projection_sql`,
-/// driven through the real `detect_group_by_aggregates` entry point (facet C).
-/// Exasol declares a bare string literal `CHAR(1) ASCII` (live-verified); the
-/// current catch-all renders `VARCHAR(1) ASCII` instead.
+/// Scenario: A bare string-literal select item renders `CAST('X' AS CHAR(1) ASCII)` (#192).
 #[test]
 fn constant_projection_casts_literal_to_char() {
     let req = make_group_by_request_with_types(
@@ -2662,12 +2372,7 @@ fn constant_projection_casts_literal_to_char() {
     );
 }
 
-/// `MIN(CAST(<col> AS CHAR(20)))` (an expression-argument aggregate — no source
-/// `column`, so its partial/merge type comes solely from its own declared
-/// `selectListDataTypes` entry) must declare its partial EMITS column
-/// `"PARTIAL_min_0" CHAR(20)` and cast its outer merge item to `CHAR(20)` — not
-/// VARCHAR(20) — driven through the real `detect_group_by_aggregates` entry
-/// point rather than hand-built `AggregatePlan`s.
+/// Scenario: `MIN(CAST(<col> AS CHAR(20)))` emits and merges as `CHAR(20)`, not VARCHAR.
 #[test]
 fn min_over_char_expression_declares_char_partial_and_merge_cast() {
     let cast_arg = serde_json::json!({
@@ -2712,17 +2417,15 @@ fn min_over_char_expression_declares_char_partial_and_merge_cast() {
     );
 }
 
-/// aggregationType missing or not "group_by" returns None.
+/// Scenario: A missing or non-"group_by" aggregationType returns None.
 #[test]
 fn detect_group_by_aggregates_no_group_by_type_returns_none() {
-    // No aggregationType.
     let req1 = serde_json::json!({
         "groupBy": [{"type": "column", "name": "REGION"}],
         "selectList": [agg_item("COUNT", None, false)],
     });
     assert!(detect_group_by_aggregates(&req1).is_none());
 
-    // aggregationType is "single_group".
     let req2 = serde_json::json!({
         "aggregationType": "single_group",
         "selectList": [agg_item("COUNT", None, false)],
@@ -2730,7 +2433,7 @@ fn detect_group_by_aggregates_no_group_by_type_returns_none() {
     assert!(detect_group_by_aggregates(&req2).is_none());
 }
 
-/// Empty groupBy array returns None.
+/// Scenario: An empty groupBy array returns None.
 #[test]
 fn detect_group_by_aggregates_empty_group_by_returns_none() {
     let req = serde_json::json!({
@@ -2741,7 +2444,7 @@ fn detect_group_by_aggregates_empty_group_by_returns_none() {
     assert!(detect_group_by_aggregates(&req).is_none());
 }
 
-/// partial_emits_items produces 3 columns for stat aggregates.
+/// Scenario: `partial_emits_items` produces 3 columns for stat aggregates.
 #[test]
 fn stat_aggregate_emits_three_partial_columns() {
     for kind in &[
@@ -2777,21 +2480,10 @@ fn stat_aggregate_emits_three_partial_columns() {
     }
 }
 
-/// The scan's partial SELECT list and the adapter's `EMITS` clause name the
-/// same partial columns, in the same order, for every `AggKind`.
-///
-/// The two lists are built in different modules and are otherwise only
-/// validated against each other at query time inside Exasol, where a
-/// mismatch surfaces as a wrong value or an `EMITS` arity error rather than
-/// as a test failure. The variant list below is an explicit literal: a
-/// variant added later that it omits is caught by the compile error
-/// `AggKind::partial_columns` raises, not here, so this test asserts
-/// alignment and never doubles as an exhaustiveness check it cannot enforce.
+/// Scenario: The scan's partial SELECT and the `EMITS` clause name the same partial columns in order.
 #[test]
 fn scan_select_list_and_emits_agree_per_agg_kind() {
-    /// Every `PARTIAL_…` name in `text`, in order of appearance. Both sides
-    /// terminate the name with a double quote — the scan as
-    /// `AS "PARTIAL_…"`, the `EMITS` item as `"PARTIAL_…" <type>`.
+    /// Both sides terminate the name with a double quote.
     fn partial_names_in(text: &str) -> Vec<String> {
         let mut names = Vec::new();
         let mut rest = text;
@@ -2840,8 +2532,7 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
         );
     }
 
-    // The same agreement under mixed arities, where a plan ordinal and a
-    // column ordinal diverge — the shape a per-kind check cannot reach.
+    // Mixed arities make a plan ordinal and a column ordinal diverge.
     let mixed: Vec<AggregatePlan> = all_kinds.iter().map(plan_for).collect();
     assert_eq!(
         partial_names_in(&crate::scan::build_partial_agg_sql(&mixed, "aliased")),
@@ -2850,7 +2541,7 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
     );
 }
 
-/// merge_select_items produces the correct reconstruction SQL for VAR_POP.
+/// Scenario: The VAR_POP merge guards the count with NULLIF and does not divide by N-1.
 #[test]
 fn var_pop_merge_formula_divides_by_n() {
     let plans = vec![AggregatePlan {
@@ -2859,19 +2550,17 @@ fn var_pop_merge_formula_divides_by_n() {
         arg_expr: None,
     }];
     let sql = merge_select_items(&plans).join(", ");
-    // Must contain NULLIF(..., 0) guard on the count
     assert!(
         sql.contains("NULLIF"),
         "var_pop merge must guard zero count: {sql}"
     );
-    // Must NOT divide by (count - 1)
     assert!(
         !sql.contains("- 1"),
         "var_pop must not subtract 1 from count: {sql}"
     );
 }
 
-/// merge_select_items for VAR_SAMP divides by N-1 and guards N<=1 → NULL.
+/// Scenario: The VAR_SAMP merge divides by N-1 and maps N<=1 to NULL.
 #[test]
 fn var_samp_merge_formula_divides_by_n_minus_1() {
     let plans = vec![AggregatePlan {
@@ -2880,9 +2569,6 @@ fn var_samp_merge_formula_divides_by_n_minus_1() {
         arg_expr: None,
     }];
     let sql = merge_select_items(&plans).join(", ");
-    // Must use CASE WHEN … <= 1 THEN NULL to guard count<=1 → NULL.
-    // Checking both `<= 1` and `CASE` ensures the N-1 sample divisor guard
-    // is specifically present — not just any CASE or NULLIF in the expression.
     assert!(
         sql.contains("<= 1"),
         "var_samp merge must guard count<=1 with '<= 1': {sql}"
@@ -2893,7 +2579,7 @@ fn var_samp_merge_formula_divides_by_n_minus_1() {
     );
 }
 
-/// STDDEV_POP merge formula wraps variance in SQRT.
+/// Scenario: The STDDEV_POP merge wraps the variance in SQRT.
 #[test]
 fn stddev_pop_merge_formula_uses_sqrt() {
     let plans = vec![AggregatePlan {
@@ -2909,7 +2595,7 @@ fn stddev_pop_merge_formula_uses_sqrt() {
     );
 }
 
-/// STDDEV_SAMP merge formula wraps variance-samp in SQRT.
+/// Scenario: The STDDEV_SAMP merge wraps the sample variance in SQRT.
 #[test]
 fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
     let plans = vec![AggregatePlan {
@@ -2919,7 +2605,6 @@ fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
     }];
     let sql = merge_select_items(&plans).join(", ");
     assert!(sql.contains("SQRT("), "stddev_samp must use SQRT: {sql}");
-    // N-1 guard: removing the N<=1 CASE would break this assertion.
     assert!(
         sql.contains("<= 1"),
         "stddev_samp must guard N<=1 (sample divisor): {sql}"
@@ -2930,12 +2615,7 @@ fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
     );
 }
 
-/// StddevPop merge SQL passes NULL through (N=0 → var_pop is NULL → stddev_pop NULL).
-///
-/// Exasol's GREATEST returns NULL if any argument is NULL, so a bare
-/// SQRT(GREATEST(...)) already yields NULL when cnt=0. The CASE WHEN IS NULL
-/// THEN NULL guard is redundant under that contract but retained for
-/// pinned golden-fixture SQL and explicitness at the merge site.
+/// Scenario: The STDDEV_POP merge passes NULL through for N=0.
 #[test]
 fn stddev_pop_merge_null_passthrough_for_n_zero() {
     let plans = vec![AggregatePlan {
@@ -2944,24 +2624,18 @@ fn stddev_pop_merge_null_passthrough_for_n_zero() {
         arg_expr: None,
     }];
     let sql = merge_select_items(&plans).join(", ");
-    // Must contain a NULL guard (CASE … IS NULL) that wraps the whole expression.
     assert!(
         sql.contains("IS NULL"),
         "stddev_pop must pass NULL through for N=0 via IS NULL guard: {sql}"
     );
-    // The GREATEST guard against tiny-negative float rounding must still be present.
+    // Guards against tiny-negative float rounding.
     assert!(
         sql.contains("GREATEST"),
         "stddev_pop must keep GREATEST rounding guard: {sql}"
     );
 }
 
-/// StddevSamp merge SQL passes NULL through for N=0 and N=1.
-///
-/// var_samp is NULL when cnt<=1 (CASE guard). Exasol's GREATEST returns NULL
-/// if any argument is NULL, so SQRT already receives NULL there; the CASE
-/// WHEN IS NULL wrapper is redundant under that contract but retained for
-/// pinned golden-fixture SQL and explicitness at the merge site.
+/// Scenario: The STDDEV_SAMP merge passes NULL through for N=0 and N=1.
 #[test]
 fn stddev_samp_merge_null_passthrough_for_n_zero_and_n_one() {
     let plans = vec![AggregatePlan {
@@ -2970,22 +2644,20 @@ fn stddev_samp_merge_null_passthrough_for_n_zero_and_n_one() {
         arg_expr: None,
     }];
     let sql = merge_select_items(&plans).join(", ");
-    // Must contain a NULL guard that wraps the whole expression.
     assert!(
         sql.contains("IS NULL"),
         "stddev_samp must pass NULL through for N<=1 via IS NULL guard: {sql}"
     );
-    // The GREATEST guard against tiny-negative float rounding must still be present.
+    // Guards against tiny-negative float rounding.
     assert!(
         sql.contains("GREATEST"),
         "stddev_samp must keep GREATEST rounding guard: {sql}"
     );
 }
 
-/// HAVING is rendered and appears in the outer GROUP BY wrapper SQL.
+/// Scenario: HAVING renders after GROUP BY in the outer wrapper.
 #[test]
 fn having_clause_appears_in_outer_wrapper_only() {
-    // Build a grouped aggregate SQL with a HAVING predicate.
     let having_filter = Some(r#"(SUM("AMOUNT") > 100)"#.to_string());
     let spec_template = ScanSpec {
         common: CommonScanSpec {
@@ -3026,7 +2698,6 @@ fn having_clause_appears_in_outer_wrapper_only() {
         having_filter.as_deref(),
         None,
     );
-    // HAVING must appear in the outer wrapper (after GROUP BY)
     assert!(
         sql.contains("HAVING"),
         "outer wrapper must contain HAVING: {sql}"
@@ -3035,7 +2706,6 @@ fn having_clause_appears_in_outer_wrapper_only() {
         sql.contains("100"),
         "HAVING predicate value must be in SQL: {sql}"
     );
-    // HAVING must come after GROUP BY
     let having_pos = sql.find("HAVING").unwrap();
     let group_by_pos = sql.find("GROUP BY").unwrap();
     assert!(
@@ -3044,16 +2714,9 @@ fn having_clause_appears_in_outer_wrapper_only() {
     );
 }
 
-// -----------------------------------------------------------------------
-// CHAR-declared group-key blank padding (issue #192, facet A)
-// -----------------------------------------------------------------------
-
-/// A value wider than the `CHAR(20)` group keys are padded to. 25 characters,
-/// matching the over-length row of the `char_pad_probe` seed table.
 const OVER_LENGTH_VALUE: &str = "over-length-value-abcdefg";
 
-/// The pad shape this fix commits to, spelled out independently of the
-/// production formatter so a silent change of construct fails the test.
+/// Spelled out independently of the production formatter so a changed construct fails.
 fn expected_pad(fragment: &str, width: u32) -> String {
     format!(
         "CASE WHEN character_length({fragment}) < {width} \
@@ -3061,10 +2724,7 @@ fn expected_pad(fragment: &str, width: u32) -> String {
     )
 }
 
-/// A `CHAR(20)`-declared group key must reach the DataFusion side wrapped in
-/// the blank pad, so two values differing only in trailing blanks emit the
-/// SAME `GK_0` staging value and the outer merge collapses them into one
-/// group — exactly as Exasol's own `CAST(x AS CHAR(20))` does natively.
+/// Scenario: A CHAR(20) group key is blank-padded so trailing-blank variants form one group (#192).
 #[test]
 fn char_declared_group_key_is_blank_padded_to_its_declared_width() {
     let fragment = r#"CAST("NAME" AS VARCHAR)"#.to_string();
@@ -3080,10 +2740,7 @@ fn char_declared_group_key_is_blank_padded_to_its_declared_width() {
     );
 }
 
-/// The width must be read from between the parentheses, NOT by trimming a
-/// trailing `)` off the declared type: Exasol declares the #192 primary shape
-/// (an equal-length CASE) `CHAR(3) ASCII`, and a suffix-intolerant parse would
-/// silently skip padding on every ASCII-declared CHAR key.
+/// Scenario: The pad width parses from inside the parentheses, so `CHAR(3) ASCII` still pads.
 #[test]
 fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
     let fragment = "CASE WHEN \"C_DECIMAL_A\" < 0 THEN 'NEG' ELSE 'POS' END".to_string();
@@ -3101,10 +2758,7 @@ fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
     );
 }
 
-/// The pad must be guarded by a length test rather than applied as a bare
-/// `rpad(x, n)`: `rpad` TRUNCATES an over-length value, which would merge a
-/// too-wide key into a wrong group and return rows where Exasol raises 22001.
-/// The `ELSE` branch must therefore hand the value on byte-identical.
+/// Scenario: An over-length value passes through untruncated, since `rpad` would merge it into a wrong group.
 #[test]
 fn char_pad_leaves_an_over_length_value_unmodified() {
     let fragment = r#""NAME""#.to_string();
@@ -3135,9 +2789,7 @@ fn char_pad_leaves_an_over_length_value_unmodified() {
     }
 }
 
-/// CONTROL: a VARCHAR-declared group key must be handed on untouched. Also
-/// guards the prefix match — `VARCHAR(10)` contains `CHAR(` and would be
-/// wrongly padded by a substring test instead of a prefix test.
+/// Scenario: A VARCHAR group key is untouched, proving a prefix rather than substring match.
 #[test]
 fn varchar_declared_group_key_is_left_unpadded() {
     let keys = vec![r#""REGION""#.to_string()];
@@ -3150,8 +2802,7 @@ fn varchar_declared_group_key_is_left_unpadded() {
     );
 }
 
-/// Padding is decided per group-key slot: a mixed VARCHAR + CHAR multi-key
-/// GROUP BY must pad only the CHAR slot, and at that slot's own width.
+/// Scenario: A mixed VARCHAR + CHAR multi-key GROUP BY pads only the CHAR slot at its own width.
 #[test]
 fn multi_key_pad_applies_only_to_the_char_slot() {
     let keys = vec![
@@ -3171,11 +2822,7 @@ fn multi_key_pad_applies_only_to_the_char_slot() {
     );
 }
 
-/// The padded fragment is spliced into three positions of one DataFusion SQL
-/// statement, so it must PLAN and EVALUATE there — not merely look right.
-/// Proves the whole #192 facet-A contract on the real engine: trailing-blank
-/// variants merge into one group, an over-length value survives at full width
-/// (so the outer Exasol cast can still raise 22001), and a NULL key stays NULL.
+/// Scenario: The padded fragment plans and evaluates in DataFusion with the #192 semantics.
 #[tokio::test]
 async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
     use arrow::array::{Array, Int64Array, StringArray};
@@ -3202,8 +2849,6 @@ async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
     let padded = blank_pad_char_group_keys(&[r#""V""#.to_string()], &["CHAR(20)".to_string()])
         .pop()
         .expect("one padded group key");
-    // Same shape `build_grouped_partial_agg_sql` emits: the identical fragment
-    // in the SELECT list and in the GROUP BY.
     let sql = format!(r#"SELECT {padded}, COUNT(*) FROM (SELECT "V" FROM t) GROUP BY {padded}"#);
 
     let batches = ctx
@@ -3267,10 +2912,7 @@ async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
     );
 }
 
-/// The fragment can itself be a `CASE` expression (the #192 primary shape), so
-/// the triple splice nests a `CASE` inside `character_length(...)`, inside
-/// `rpad(...)`, and — the one that could plausibly not parse — directly after
-/// the outer `ELSE`. Prove DataFusion parses and evaluates that nesting.
+/// Scenario: A CASE fragment nests inside the pad splice and still parses in DataFusion.
 #[tokio::test]
 async fn padded_case_fragment_plans_and_evaluates_in_datafusion() {
     use arrow::array::StringArray;
@@ -3309,15 +2951,7 @@ async fn padded_case_fragment_plans_and_evaluates_in_datafusion() {
     );
 }
 
-/// Grouped path: a `function_aggregate` select item whose statistical aggregate
-/// takes an expression argument declines the WHOLE grouped detection, so the
-/// request routes to the Tier 1b qualified single-table wrapper and Exasol
-/// computes the statistic over its rows.
-///
-/// Measured 2026-07-31 against the Docker Exasol container: `SELECT MOD(id, 4),
-/// STDDEV(score + id) FROM MY_LAKEHOUSE.EVENTS GROUP BY MOD(id, 4)` is PUSHED by
-/// Exasol and fails with `sqlCode 22002`, `grouped partial aggregate SQL error:
-/// Schema error: No field named .`
+/// Scenario: A grouped statistical aggregate over an expression argument declines to the wrapper.
 #[test]
 fn grouped_stat_aggregate_over_expression_argument_declines() {
     let req = make_group_by_request_with_types(
@@ -3335,15 +2969,7 @@ fn grouped_stat_aggregate_over_expression_argument_declines() {
     );
 }
 
-/// Grouped scalar-over-aggregate path: a select item WRAPPING a statistical
-/// aggregate over an expression argument (`SQRT(STDDEV(<expr>))`) does not
-/// classify, which declines the whole grouped detection and routes the request
-/// to the qualified single-table wrapper.
-///
-/// Measured 2026-07-31: `SELECT MOD(id, 4), SQRT(STDDEV(score + id)) FROM
-/// MY_LAKEHOUSE.EVENTS GROUP BY MOD(id, 4)` is PUSHED by Exasol as a
-/// scalar-over-aggregate — the merge wrapper renders — and fails with `sqlCode
-/// 22002`, `grouped partial aggregate SQL error: Schema error: No field named .`
+/// Scenario: A grouped `SQRT(STDDEV(<expr>))` declines to the qualified single-table wrapper.
 #[test]
 fn scalar_over_stat_aggregate_with_expression_argument_declines() {
     let sqrt_over_stat = serde_json::json!({
@@ -3368,16 +2994,7 @@ fn scalar_over_stat_aggregate_with_expression_argument_declines() {
     );
 }
 
-/// HAVING path: a HAVING comparing a statistical aggregate over an expression
-/// argument does not render over the merge wrapper, so `classify_request_shape`
-/// routes the request to the qualified single-table wrapper rather than emit a
-/// HAVING over a partial column no scan produces.
-///
-/// The `plans` slot here is the shape the pre-decline parse produced — a
-/// statistical kind carrying neither a source column nor a rendered argument.
-/// Matching that slot is what the decline now prevents; the realistic route,
-/// where the select list carries the same shape, is declined earlier by
-/// `grouped_stat_aggregate_over_expression_argument_declines`.
+/// Scenario: A HAVING over a statistical aggregate of an expression does not render over the merge.
 #[test]
 fn having_over_stat_aggregate_with_expression_argument_declines() {
     let having = serde_json::json!({

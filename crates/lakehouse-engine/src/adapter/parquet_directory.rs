@@ -24,7 +24,6 @@ pub enum MergeMode {
     SampleOneFile,
 }
 
-/// The seam's layout switches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DirectoryOptions {
     pub merge_mode: MergeMode,
@@ -34,7 +33,6 @@ pub struct DirectoryOptions {
 /// Decides whether to keep a file, given its filled partition values; runs before any footer read.
 pub type PartitionKeepPredicate = dyn Fn(&BTreeMap<String, Option<String>>) -> bool + Send + Sync;
 
-/// One Parquet data file under the prefix.
 pub struct ParquetFile {
     pub path: StorePath,
     /// Carried from the listing response, so no consumer issues an object-store HEAD for it.
@@ -47,7 +45,6 @@ pub struct ParquetFile {
     pub footer: Option<Arc<ParquetMetaData>>,
 }
 
-/// The data files under one prefix, their partition columns, and their folded schema.
 pub struct ParquetDirectory {
     pub files: Vec<ParquetFile>,
     /// Every column NULLABLE, named and ordered exactly as the files declare them, followed by the
@@ -130,7 +127,6 @@ pub async fn resolve_parquet_directory(
     })
 }
 
-/// A listed file with its own raw partition segments, before filling against the declared keys.
 struct RawFile {
     path: StorePath,
     size: u64,
@@ -258,7 +254,6 @@ fn declared_partition_keys(scope: &[RawFile]) -> Result<Vec<String>, UdfError> {
     Ok(keys)
 }
 
-/// Uppercased key → its first-seen spelling.
 fn uppercase_index<'a>(keys: impl Iterator<Item = &'a str>) -> HashMap<String, &'a str> {
     let mut seen_spellings: HashSet<&str> = HashSet::new();
     let mut index: HashMap<String, &str> = HashMap::new();

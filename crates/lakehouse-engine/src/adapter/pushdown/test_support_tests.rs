@@ -1,9 +1,3 @@
-//! Test-only fixtures shared across the `pushdown` submodule test modules.
-//!
-//! Extracted verbatim from the former flat `mod tests` "Helpers shared across
-//! tests" block. Each capability submodule's `#[cfg(test)] mod tests` reaches
-//! these through `super::test_support`.
-
 use super::*;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
@@ -11,11 +5,8 @@ use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// A loopback HTTP/1.1 catalog answering every request from a caller-supplied
-/// responder and recording each request target in arrival order.
-///
-/// Every response closes its connection, so the pooled client opens a fresh one
-/// per request and one accept loop serves the whole sequential stream in order.
+/// Every response closes its connection, so one accept loop serves the pooled
+/// client's sequential requests in arrival order.
 pub(super) struct RecordingCatalog {
     pub(super) uri: String,
     targets: Arc<Mutex<Vec<String>>>,
@@ -67,8 +58,7 @@ impl RecordingCatalog {
     }
 }
 
-/// Credentials supplying no catalog authentication at all, so a session issues
-/// exactly the requests its own resolution needs and no token grant.
+/// No catalog auth, so a session issues no token-grant request.
 pub(super) fn unauthenticated_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "wh".into(),
@@ -91,23 +81,13 @@ pub(super) fn unauthenticated_creds() -> ConnectionCreds {
     }
 }
 
-/// The `/v1/config` target every non-SigV4 Iceberg session resolves its prefix
-/// from, exactly once per session.
 pub(super) const ICEBERG_CONFIG_TARGET: &str = "/v1/config?warehouse=wh";
 
-/// The `loadTable` target the recorded identifier `db.t` addresses under an
-/// empty prefix.
 pub(super) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t";
 
-/// The Unity Catalog get-table target the recorded identifier `cat.sch.orders`
-/// addresses.
 pub(super) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
 
-/// A `loadTable` response for a snapshotless single-column table.
-///
-/// The absent snapshot is what keeps this offline: an empty table scan reads no
-/// manifest, so resolution completes without touching the store its location
-/// names.
+/// No snapshot, so the empty scan reads no manifest and resolution stays offline.
 pub(super) fn snapshotless_load_table_body(location: &str) -> String {
     serde_json::json!({
         "metadata-location": format!("{location}/metadata/v1.json"),
@@ -135,8 +115,7 @@ pub(super) fn snapshotless_load_table_body(location: &str) -> String {
     .to_string()
 }
 
-/// A loaded Unity Catalog Delta table carrying NO storage location, so the Delta
-/// reader refuses at its first check and reaches no object store.
+/// No storage location, so the Delta reader refuses before reaching any object store.
 pub(super) fn locationless_delta_table_body() -> String {
     serde_json::json!({
         "name": "orders",
@@ -148,9 +127,6 @@ pub(super) fn locationless_delta_table_body() -> String {
     .to_string()
 }
 
-/// A Unity Catalog serving a Delta table for every `cat.sch.<name>` identifier,
-/// each located at `s3://bucket/<name>` — the location the object endpoint below
-/// serves that table's log under.
 pub(super) async fn unity_delta_catalog() -> RecordingCatalog {
     RecordingCatalog::spawn(|target| match target.rsplit_once('.') {
         Some((_, name)) if !name.is_empty() => (
@@ -170,8 +146,6 @@ pub(super) async fn unity_delta_catalog() -> RecordingCatalog {
     .await
 }
 
-/// One Delta commit declaring `columns` as `(name, Delta type)` pairs and NO `add`
-/// action, so the table resolves with an EMPTY active-file list.
 pub(super) fn fileless_delta_commit(id: &str, columns: &[(&str, &str)]) -> String {
     fileless_delta_commit_with_protocol(
         id,
@@ -180,9 +154,6 @@ pub(super) fn fileless_delta_commit(id: &str, columns: &[(&str, &str)]) -> Strin
     )
 }
 
-/// [`fileless_delta_commit`], with the `protocol` action replaced by the caller's
-/// own — for a table whose reader protocol declares features outside the gate's
-/// allow-list.
 pub(super) fn fileless_delta_commit_with_protocol(
     id: &str,
     columns: &[(&str, &str)],
@@ -208,27 +179,17 @@ pub(super) fn fileless_delta_commit_with_protocol(
     format!("{protocol}\n{metadata}\n")
 }
 
-/// The log path a table located at `s3://bucket/<name>` holds its first commit at.
 pub(super) fn delta_commit_zero_key(name: &str) -> String {
     format!("{name}/_delta_log/00000000000000000000.json")
 }
 
-/// A loopback S3 endpoint serving a fixed key → body map, answered as the
-/// [`StorageBackend`] a CONNECTION would carry.
-///
-/// Serving the log over HTTP rather than injecting a store is what lets a WHOLE
-/// `handle_pushdown` call resolve a real Delta table offline: `read_delta_log`
-/// builds its own store from the storage backend, so no test store can be reached
-/// past that seam. Answers exactly the three request shapes a `delta_kernel` log
-/// read issues — the `_last_checkpoint` probe, the `_delta_log/` listing, and a GET
-/// per commit — and 404s everything else, including every data-file read, which no
-/// plan-time resolution performs.
+/// Served over HTTP because `read_delta_log` builds its own store from the
+/// storage backend, so no injected store is reachable. Data-file reads 404;
+/// plan-time resolution performs none.
 pub(super) async fn delta_object_endpoint(objects: Vec<(String, String)>) -> StorageBackend {
     object_endpoint("bucket", objects).await
 }
 
-/// A loopback path-style S3 endpoint serving `objects` (bucket-relative key → body) from
-/// `bucket`: `ListObjectsV2` listings, a GET per served key, and a 404 for everything else.
 pub(super) async fn object_endpoint(
     bucket: &str,
     objects: Vec<(String, String)>,
@@ -308,8 +269,6 @@ fn ok_response(content_type: &str, body: &str) -> String {
     )
 }
 
-/// The `ListObjectsV2` answer for the listing `query`, over every served key under
-/// its `prefix` that sorts after its `start-after` marker.
 fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -> String {
     let param = |key: &str| {
         url::form_urlencoded::parse(query.as_bytes())
@@ -340,8 +299,6 @@ fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -
     )
 }
 
-/// Drive a whole pushdown request against a Unity Catalog Delta table, on the
-/// single-shard tuning every offline resolution test uses.
 pub(super) async fn delta_pushdown(
     request: &Json,
     catalog_uri: &str,
@@ -367,8 +324,6 @@ pub(super) async fn delta_pushdown(
     .await
 }
 
-/// An Iceberg REST catalog serving its config and one snapshotless table per
-/// requested identifier.
 pub(super) async fn iceberg_catalog() -> RecordingCatalog {
     RecordingCatalog::spawn(|target| {
         if target.starts_with("/v1/config") {
@@ -435,9 +390,7 @@ pub(super) fn sample_storage() -> StorageBackend {
     })
 }
 
-/// Assemble the scan-driving SQL from a known file list + spec — the same
-/// logic `handle_pushdown` runs after resolution.
-/// Uses `cluster_nodes=1` (single-shard / legacy shape).
+/// Mirrors `handle_pushdown`'s post-resolution SQL assembly, single shard.
 pub(super) fn build_sql_for_fixture(
     files: Vec<String>,
     proj_cols: Vec<String>,
@@ -448,7 +401,6 @@ pub(super) fn build_sql_for_fixture(
     build_sql_for_fixture_n(files, proj_cols, proj_types, filter, limit, 1)
 }
 
-/// Assemble the scan-driving SQL for `cluster_nodes = n`.
 pub(super) fn build_sql_for_fixture_n(
     files: Vec<String>,
     proj_cols: Vec<String>,
@@ -457,7 +409,6 @@ pub(super) fn build_sql_for_fixture_n(
     limit: Option<u64>,
     cluster_nodes: usize,
 ) -> String {
-    // Build a col_types map from proj_cols/proj_types for row-scan tests.
     let col_types: Vec<(String, String)> = proj_cols
         .iter()
         .cloned()
@@ -495,10 +446,7 @@ pub(super) fn build_sql_for_fixture_n(
     )
 }
 
-/// The UDF's first-argument literal (the shard-invariant common blob), extracted
-/// as the substring between the first two single quotes. Valid for the test
-/// fixtures here, whose common JSON contains no embedded single quote (JSON uses
-/// double quotes; the rendered filters used in these tests carry none).
+/// Assumes the common JSON contains no single quote, true for these fixtures.
 pub(super) fn common_arg_literal(sql: &str) -> &str {
     let start = sql.find('\'').expect("SQL must contain a literal") + 1;
     let rest = &sql[start..];
@@ -506,14 +454,7 @@ pub(super) fn common_arg_literal(sql: &str) -> &str {
     &rest[..end]
 }
 
-/// The contents of the scan UDF's `EMITS (...)` clause — the scan's EMITTED column
-/// set, which on a declined-`ORDER BY` path is WIDER than the query's visible column
-/// set (it also carries the appended hidden sort-key columns).
-///
-/// Extracted paren-balanced: the declared types carry their own parentheses
-/// (`DECIMAL(20,0)`), so the clause does not end at the first `)`. Exactly one
-/// `EMITS (` appears in a fan-out — the distributor call carries none (its LUA SET
-/// script declares a static EMITS).
+/// Paren-balanced: declared types like `DECIMAL(20,0)` carry their own parentheses.
 pub(super) fn emits_clause(sql: &str) -> &str {
     let open = sql.find("EMITS (").expect("SQL must carry an EMITS clause") + "EMITS ".len();
     let mut depth = 0usize;
@@ -532,13 +473,8 @@ pub(super) fn emits_clause(sql: &str) -> &str {
     panic!("EMITS clause must be closed: {sql}");
 }
 
-/// The declined-`ORDER BY` wrapper's VISIBLE select list: everything between the
-/// leading `SELECT ` and the first ` FROM (`. A visible select list never contains
-/// ` FROM (` itself, so the first occurrence is always the wrapper's own — even for a
-/// multi-shard fan-out, which nests a second ` FROM (` inside.
-///
-/// Panics when the SQL carries no wrapper; use a `!sql.contains(" FROM (")`
-/// assertion for the no-wrapper cases instead.
+/// A visible select list never contains ` FROM (`, so the first occurrence is the
+/// wrapper's own. Panics when the SQL carries no wrapper.
 pub(super) fn outer_select_list(sql: &str) -> &str {
     let list = sql
         .strip_prefix("SELECT ")
@@ -549,8 +485,6 @@ pub(super) fn outer_select_list(sql: &str) -> &str {
     &list[..end]
 }
 
-/// A single-table request with the NQ4 shape: two projected columns and an
-/// `ORDER BY <projected col> DESC NULLS LAST LIMIT n`.
 pub(super) fn nq4_request() -> Json {
     serde_json::json!({
         "involvedTables": [{
@@ -581,16 +515,12 @@ pub(super) fn nq4_request() -> Json {
     })
 }
 
-/// The `pushdownRequest` sub-object of a request (for direct detector calls).
 pub(super) fn pd(request: &Json) -> Json {
     request.get("pushdownRequest").cloned().unwrap()
 }
 
-/// Build row-scan SQL the way `handle_pushdown` does for a resolved
-/// `(path, size)` file list under `table_root`: partition into shards,
-/// relativize under-root paths, then build. Exercises the SAME production
-/// stripping (`relativize_shards_to_root`) that runs in `handle_pushdown`, so
-/// the emitted per-shard paths match production exactly.
+/// Runs the same `relativize_shards_to_root` stripping as `handle_pushdown`, so
+/// per-shard paths match production.
 pub(super) fn build_row_sql_with_root(
     files: Vec<(String, u64)>,
     table_root: &str,
@@ -634,8 +564,6 @@ pub(super) fn build_row_sql_with_root(
     )
 }
 
-/// A `function_aggregate` select-list item over an optional bare column,
-/// shared by the single-group and grouped aggregate test modules.
 pub(super) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_json::Value {
     let mut args = serde_json::json!([]);
     if let Some(c) = col {
@@ -649,7 +577,6 @@ pub(super) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_j
     })
 }
 
-/// A Parquet positional-delete file ref.
 pub(super) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
     DeleteMechanism::IcebergPositionalDelete {
         path: path.into(),
@@ -657,8 +584,6 @@ pub(super) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
     }
 }
 
-/// An aggregate over a single explicit argument NODE (a scalar expression,
-/// e.g. `LENGTH(L_COMMENT)`), used to exercise expression-argument pushdown.
 pub(super) fn agg_item_expr(
     name: &str,
     arg: serde_json::Value,
@@ -672,7 +597,6 @@ pub(super) fn agg_item_expr(
     })
 }
 
-/// Builders for Exasol pushdown filter-JSON nodes.
 pub(crate) mod filter_json {
     use serde_json::{Value as Json, json};
 

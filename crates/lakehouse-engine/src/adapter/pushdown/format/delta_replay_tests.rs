@@ -12,8 +12,6 @@ use super::super::delta_predicate::to_delta_predicate;
 use super::*;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
-/// The vendored fixture tables are read through a plain local-filesystem store,
-/// which is the same injection the S3 path uses in production.
 fn local_store() -> Arc<dyn ObjectStore> {
     Arc::new(LocalFileSystem::new())
 }
@@ -47,14 +45,9 @@ impl super::DeltaSnapshot {
             .expect("the probe scan replays")
     }
 
-    /// Deliberately does NOT call `DeltaSnapshot::active_files` and MUST NOT be
-    /// refactored to: `active_files` no longer exposes `StatsOptions`, and
-    /// re-routing through it would make the two `disabling_stats_forfeits_*`
-    /// tests assert nothing about the mechanism this plan removed.
-    ///
-    /// `replay_probe` reproduces `active_files`'s replay loop minus its path
-    /// sort, so callers of this helper must assert on counts or on a
-    /// sorted/set-based comparison, never on raw order.
+    /// Must NOT route through `active_files`, which hides `StatsOptions`; the
+    /// `disabling_stats_forfeits_*` tests would then assert nothing. Unsorted, so callers
+    /// compare counts or sets, never raw order.
     fn files_surviving_without_stats(&self, prune: Predicate) -> Vec<FileEntry> {
         self.replay_probe(
             self.snapshot
@@ -124,9 +117,6 @@ const SYNTHETIC_PREAMBLE: &str = concat!(
     "\n",
 );
 
-/// A log written into an in-memory store, so an action no vendored fixture holds
-/// is exercised without a fixture on disk. The first commit carries the protocol
-/// and metadata every replay needs.
 async fn synthetic_table(commits: &[&str]) -> Arc<dyn ObjectStore> {
     let store = Arc::new(InMemory::new());
     for (version, actions) in commits.iter().enumerate() {
@@ -146,9 +136,7 @@ async fn synthetic_table(commits: &[&str]) -> Arc<dyn ObjectStore> {
     store
 }
 
-/// A log whose metadata declares TWO partition columns in a non-alphabetical order
-/// that is also not their schema order, which no vendored fixture carries and which
-/// neither a sorted nor a schema-derived partition-column list could reproduce.
+/// Two partition columns in an order that is neither alphabetical nor schema order.
 const SYNTHETIC_PARTITIONED_PREAMBLE: &str = concat!(
     r#"{"protocol":{"minReaderVersion":1,"minWriterVersion":2}}"#,
     "\n",
@@ -172,9 +160,8 @@ const SYNTHETIC_COMMIT_ZERO: &str = "00000000000000000000.json";
 
 const SYNTHETIC_ADD: &str = r#"{"add":{"path":"part-0.parquet","partitionValues":{},"size":100,"modificationTime":1,"dataChange":true}}"#;
 
-/// A log declaring a reader feature this engine does not implement (`variantType`),
-/// alongside an allow-listed one — so `delta_kernel` itself reads this log without
-/// complaint and the refusal can only come from this engine's own gate.
+/// `variantType` is refused by this engine but readable by `delta_kernel`, so the refusal
+/// can only come from our gate.
 const SYNTHETIC_REFUSED_PREAMBLE: &str = concat!(
     r#"{"protocol":{"minReaderVersion":3,"minWriterVersion":7,"readerFeatures":["variantType","deletionVectors"],"writerFeatures":["variantType","deletionVectors"]}}"#,
     "\n",
@@ -247,8 +234,7 @@ fn a_legacy_reader_version_table_passes_the_gate_and_keeps_its_column_mapping_mo
     assert_eq!(snapshot.column_mapping_mode(), ColumnMappingMode::Id);
 }
 
-// Scenario Coverage (add-delta-table-planning): `open`/`active_files` are `pub(super)`, so this
-// scenario is reached as a crate-internal unit test rather than `tests/delta_log_replay.rs`.
+/// Scenario: Replay returns only the files active at the current version
 #[test]
 fn replay_returns_only_the_files_active_at_the_current_version() {
     let files = replay_fixture("cdf-column-mapping-name-mode");
@@ -303,8 +289,7 @@ fn replay_carries_each_active_files_path_verbatim_and_its_size() {
     );
 }
 
-// Scenario Coverage (add-delta-table-planning): `open`/`active_files` are `pub(super)`, so this
-// scenario is reached as a crate-internal unit test rather than `tests/delta_log_replay.rs`.
+/// Scenario: Replay carries partition values and an explicit NULL for the default partition
 #[test]
 fn replay_carries_partition_values_and_an_explicit_null() {
     let files = replay_fixture("basic_partitioned");
@@ -352,8 +337,7 @@ fn replay_carries_no_partition_value_for_an_unpartitioned_table() {
     );
 }
 
-// Scenario Coverage (add-delta-table-planning): `open`/`active_files` are `pub(super)`, so this
-// scenario is reached as a crate-internal unit test rather than `tests/delta_log_replay.rs`.
+/// Scenario: Replay carries a re-added file's deletion vector exactly once
 #[test]
 fn replay_carries_a_readded_files_deletion_vector_exactly_once() {
     let files = replay_fixture("table-with-dv-small");
@@ -529,8 +513,6 @@ fn a_table_root_holding_no_delta_log_is_refused() {
     );
 }
 
-/// An [`ObjectStore`] decorator recording the location of every read it forwards,
-/// so a test can hold a refusal to the object-store work it actually cost.
 #[derive(Debug)]
 struct ReadRecordingStore {
     inner: Arc<dyn ObjectStore>,
@@ -627,10 +609,6 @@ impl ObjectStore for ReadRecordingStore {
 }
 
 /// Scenario: A reader feature outside the allow-list refuses the table before any log replay
-///
-/// The read count is the evidence: resolving the current version reads commit 0 once,
-/// and `active_files` reads it a SECOND time. Holding the refused table to exactly one
-/// read of that commit is therefore what pins the gate ahead of the replay.
 #[tokio::test]
 async fn an_unsupported_reader_feature_is_refused_before_any_schema_or_file_read() {
     let store = ReadRecordingStore::wrapping(synthetic_refused_table().await);
@@ -666,11 +644,6 @@ async fn an_unsupported_reader_feature_is_refused_before_any_schema_or_file_read
 }
 
 /// Scenario: The gate runs inside snapshot construction, so no resolution path can bypass it
-///
-/// Reaches the constructor directly, with no `DeltaFormatReader` in the call: a gate at the
-/// reader's entry point instead would let this call return an ungated snapshot, and every
-/// downstream step — schema, partition columns, column-mapping mode, active files — is
-/// reachable only through the value the constructor hands back.
 #[tokio::test]
 async fn the_protocol_gate_runs_inside_snapshot_construction() {
     let refused = DeltaSnapshot::open(synthetic_refused_table().await, SYNTHETIC_ROOT);
@@ -711,14 +684,7 @@ fn every_shipped_fixture_whose_reader_features_are_allow_listed_still_resolves()
     }
 }
 
-/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its
-/// column
-///
-/// Over the vendored `type-widening` fixture, whose commit-2 `schemaString` records a
-/// `delta.typeChanges` entry on every one of its thirteen columns. Eleven pairs are on the
-/// protocol's supported list; `byte_decimal` and `short_decimal` derive a negative `k1` against the
-/// protocol's fixed base-10 precision for a `Byte`/`Short`/`Int` source, so they fail
-/// `k1 >= k2 >= 0` and are refused one column at a time while the other eleven stay queryable.
+/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
 #[test]
 fn an_unsupported_recorded_type_change_refuses_only_its_own_column() {
     const QUERYABLE_COLUMNS: [&str; 11] = [
@@ -787,10 +753,7 @@ fn an_unsupported_recorded_type_change_refuses_only_its_own_column() {
     }
 }
 
-/// Scenario: A reader feature outside the allow-list refuses the table before any log replay
-///
-/// `unshredded-variant` declares `variantType-preview`, which this engine does not implement,
-/// over the real vendored fixture log rather than a synthetic one.
+/// Scenario: A vendored fixture declaring a reader feature outside the allow-list is refused
 #[test]
 fn a_vendored_fixture_declaring_a_reader_feature_outside_the_allow_list_is_refused() {
     let table = "unshredded-variant";
@@ -811,20 +774,11 @@ fn a_vendored_fixture_declaring_a_reader_feature_outside_the_allow_list_is_refus
     );
 }
 
-/// The `name`-mode physical name the synthetic `void` table assigns its mappable
-/// `integer` column — the one its data file actually carries.
 const VOID_TABLE_VALUE_PHYSICAL_NAME: &str = "col-a0f31c92";
 
-/// The `name`-mode physical name that table assigns its `void` column, which NO data
-/// file carries: the Delta protocol requires a writer to omit a `void` column from
-/// every data file, so its assigned physical name never reaches Parquet.
+/// No data file carries this: the protocol requires writers to omit `void` columns.
 const VOID_TABLE_VOID_PHYSICAL_NAME: &str = "col-7b4e2d15";
 
-/// A `name`-column-mapping table declaring one `integer` and one `void` column, written
-/// to disk beside a real Parquet file carrying the `integer` column's physical name
-/// alone, and answering the table root both the log read and the scan resolve against.
-///
-/// On disk rather than in memory because the scan reads the Parquet file itself.
 fn write_void_column_table(dir: &std::path::Path) -> String {
     use arrow::array::Int32Array;
     use arrow::datatypes::{Field, Schema};
@@ -919,14 +873,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Scenario: A Delta type Exasol cannot represent natively is surfaced as a VARCHAR rendering
-///
-/// Runs the whole read: log replay, schema build, and the production raw-scan pipeline
-/// over the real Parquet file. `name` column mapping is the mode that makes the case
-/// observable — the `void` column binds by an assigned physical name, and no data file
-/// carries it, because the protocol requires writers to omit `void` columns entirely.
-/// Reading it must reconstruct an all-NULL column rather than fail on the unmatched
-/// name, while its mappable sibling still reads its real values.
+/// Scenario: A void column reads as all-NULL under name column mapping
 #[test]
 fn a_void_column_reads_as_all_null_under_name_column_mapping() {
     use super::super::delta_schema::build_delta_table_schema;
@@ -1208,12 +1155,7 @@ async fn a_partly_untranslatable_conjunction_still_prunes_by_its_translatable_ha
     assert_eq!(paths, vec!["part-1.parquet"]);
 }
 
-/// Scenario: A predicate the kernel cannot evaluate keeps every file
-///
-/// Column mapping is NOT one of the keep-all cases: under both `name` and
-/// `id` column mapping the kernel resolves a logical predicate column to its
-/// physical statistics path, so pruning stays live and does not degrade to
-/// keep-all.
+/// Scenario: Pruning stays live under name and id column mapping
 #[test]
 fn pruning_under_column_mapping_records_its_observed_behavior() {
     let name_mode_all = replay_fixture("cdf-column-mapping-name-mode");

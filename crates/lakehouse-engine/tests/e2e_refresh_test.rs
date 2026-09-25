@@ -1,21 +1,6 @@
-//! End-to-end tests for `ALTER VIRTUAL SCHEMA ... REFRESH` and
-//! `ALTER VIRTUAL SCHEMA ... SET` (vs-adapter/refresh-and-set-properties, #147).
-//!
-//! Shares the Exasol + MinIO + Iceberg REST catalog stack with the other E2E
-//! test binaries (`iceberg_catalog_url_internal`, BucketFS upload, SLC
-//! install), but every test in this file uses its OWN dedicated Iceberg
-//! namespace and its OWN Virtual Schema instance. This is deliberate
-//! isolation, not incidental duplication: several scenarios here mutate the
-//! underlying catalog out of band (add a table, add a column, introduce a
-//! flatten-name collision), and a collision or schema change introduced into
-//! the SHARED `e2e_lakehouse` namespace used by `e2e_scan_test.rs` and
-//! siblings would permanently break every other E2E binary's
-//! `createVirtualSchema` call against that namespace for the rest of the
-//! Docker session. Dedicated namespaces keep this file's mutations from
-//! leaking into any other test binary.
-//!
-//! All tests FAIL (never skip) when the stack is unavailable, per project
-//! rules (`CLAUDE.md` Testing section).
+//! Every test uses its own Iceberg namespace and Virtual Schema: these scenarios mutate the
+//! catalog out of band, and doing so in the shared `e2e_lakehouse` namespace would break every
+//! other E2E binary's `createVirtualSchema` for the rest of the Docker session.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -38,17 +23,10 @@ use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 
-// ---------------------------------------------------------------------------
-// Constants (mirror e2e_scan_test.rs — same stack, own VS/connection names)
-// ---------------------------------------------------------------------------
-
-/// Dedicated CONNECTION name for this file — distinct from other E2E binaries'
-/// `LAKEHOUSE_CATALOG_CREDS` so a `CREATE OR REPLACE CONNECTION` here (used by
-/// the unreachable-catalog test) can never race with another binary's use of
-/// the same object name.
+/// Distinct from other binaries' connection so the unreachable-catalog test's
+/// `CREATE OR REPLACE CONNECTION` cannot race with them.
 const CATALOG_CONN_NAME: &str = "REFRESH_CATALOG_CREDS";
 
-// Dedicated namespaces — one per scenario, never the shared `e2e_lakehouse`.
 const NS_REENUM: &str = "e2e_refresh_reenum";
 const NS_COLCHANGE: &str = "e2e_refresh_colchange";
 const NS_SETPROPS_A: &str = "e2e_refresh_setprops_a";
@@ -56,12 +34,6 @@ const NS_SETPROPS_B: &str = "e2e_refresh_setprops_b";
 const NS_UNREACHABLE: &str = "e2e_refresh_unreachable";
 const NS_PARTIAL: &str = "e2e_refresh_partial";
 const NS_COLLISION: &str = "e2e_refresh_collision";
-
-// ---------------------------------------------------------------------------
-// One-time setup (idempotent; mirrors e2e_scan_test.rs, without the shared seed)
-// ponytail: duplicate of e2e_scan_test setup — each E2E binary runs
-// independently, so each needs its own OnceLock guard.
-// ---------------------------------------------------------------------------
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -79,11 +51,6 @@ fn setup_e2e() {
     });
 }
 
-/// Create (or replace) the dedicated `REFRESH_CATALOG_CREDS` catalog
-/// CONNECTION and issue `CREATE VIRTUAL SCHEMA <vs_name> ... NAMESPACE
-/// = '<namespace>'`. Thin wrapper over the shared harness helper: this file's
-/// tests each pass their own `vs_name`/`namespace` pair rather than sharing
-/// one file-local VS.
 fn create_virtual_schema(conn: &mut ExaConn, vs_name: &str, namespace: &str) {
     common::e2e_harness::create_virtual_schema(
         conn,
@@ -95,13 +62,6 @@ fn vs_table(vs_name: &str, table_name: &str) -> String {
     format!("{vs_name}.{}", table_name.to_uppercase())
 }
 
-// ---------------------------------------------------------------------------
-// Iceberg fixture helpers — build a REST catalog client and seed/mutate
-// dedicated single-column-set tables directly (out-of-band from Exasol),
-// mirroring the seed patterns in tests/common/seed.rs but scoped to this
-// file's own namespaces.
-// ---------------------------------------------------------------------------
-
 fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -109,7 +69,6 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
-/// Schema `(id BIGINT NOT NULL, val DOUBLE NOT NULL)`.
 fn id_val_schema(schema_id: i32) -> IcebergSchema {
     IcebergSchema::builder()
         .with_schema_id(schema_id)
@@ -121,9 +80,6 @@ fn id_val_schema(schema_id: i32) -> IcebergSchema {
         .expect("build id+val Iceberg schema")
 }
 
-/// Schema `(id BIGINT NOT NULL, val DOUBLE NOT NULL, new_col DOUBLE)` — the
-/// result of an `add-schema` evolution over [`id_val_schema`], adding one
-/// optional column (field-id 3) while preserving field-ids 1 and 2.
 fn id_val_schema_with_new_col(schema_id: i32) -> IcebergSchema {
     IcebergSchema::builder()
         .with_schema_id(schema_id)
@@ -151,8 +107,6 @@ fn id_val_batch(id: i64, val: f64) -> RecordBatch {
     .expect("id+val RecordBatch construction is infallible")
 }
 
-/// Create `namespace.table_name` (single-level namespace) with schema
-/// `(id, val)` and one row, if it does not already exist with data.
 async fn ensure_id_val_table(
     catalog: &impl Catalog,
     namespace: &str,
@@ -171,11 +125,7 @@ async fn ensure_id_val_table(
     .unwrap_or_else(|e| panic!("seed {namespace}.{table_name}: {e}"));
 }
 
-/// Evolve `namespace.table_name`'s current schema to add the optional
-/// `new_col DOUBLE` column (field-id 3), via a raw REST `add-schema` +
-/// `set-current-schema` commit (mirrors `common::seed::seed_renamed_column`).
-/// Existing rows are unaffected on disk; they project `new_col` as NULL
-/// (Iceberg column-projection rule 3 — no `initial-default` was set).
+/// Existing rows project `new_col` as NULL: no `initial-default` is set.
 async fn add_new_col(catalog: &impl Catalog, namespace: &str, table_name: &str) {
     let ident = TableIdent::new(
         NamespaceIdent::new(namespace.to_string()),
@@ -197,10 +147,7 @@ async fn add_new_col(catalog: &impl Catalog, namespace: &str, table_name: &str) 
     .unwrap_or_else(|e| panic!("add new_col to {namespace}.{table_name}: {e}"));
 }
 
-/// Create an empty (no data file) table at a possibly multi-level
-/// `NamespaceIdent`, for the flatten-collision fixture — collision detection
-/// happens in `build_table_map`, before any per-table schema/data resolution,
-/// so the colliding tables need no data files.
+/// Collision detection runs before any per-table resolution, so no data file is needed.
 async fn create_empty_table(catalog: &impl Catalog, ns: &NamespaceIdent, table_name: &str) {
     if !catalog
         .namespace_exists(ns)
@@ -223,16 +170,10 @@ async fn create_empty_table(catalog: &impl Catalog, ns: &NamespaceIdent, table_n
         .partition_spec(UnboundPartitionSpec::builder().with_spec_id(0).build())
         .properties(HashMap::new())
         .build();
-    // Tolerate a concurrent create (idempotent re-run of this test file).
     let _ = catalog.create_table(ns, creation).await;
 }
 
-/// Drop `ns.table_name` if it currently exists, so a table left behind by a
-/// PREVIOUS run against this same long-lived Docker warehouse (this stack is
-/// not torn down between `make test-e2e` invocations) cannot leak into this
-/// run's "must not exist yet" assertions. Mirrors the drop-before-reseed
-/// pattern in `common::seed::create_and_append_files`, but unconditional
-/// (callers here need a clean slate, not a schema-matches check).
+/// The Docker warehouse persists across `make test-e2e` runs, so a prior run's tables can leak in.
 async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table_name: &str) {
     let ident = TableIdent::new(ns.clone(), table_name.to_string());
     if catalog
@@ -247,14 +188,7 @@ async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// Refresh re-enumerates the namespace: a table added to the catalog after
-/// `CREATE VIRTUAL SCHEMA` is unreachable until `REFRESH`, then becomes
-/// queryable — proving `refresh` is dispatched to the real enumeration path
-/// rather than rejected as `unsupported VS request type` (#147's root cause).
+/// Scenario: a table added after CREATE becomes queryable only after REFRESH (#147)
 #[test]
 fn refresh_reenumerates_namespace() {
     setup_e2e();
@@ -268,10 +202,6 @@ fn refresh_reenumerates_namespace() {
         ))
         .expect("build seed catalog");
 
-    // Given a clean slate: a PREVIOUS run may have left T_NEW behind (this
-    // test's own seeding, further below), which would make it queryable
-    // right after CREATE and falsify the "T_NEW must be unknown before
-    // REFRESH" assertion below.
     let reenum_ns = NamespaceIdent::new(NS_REENUM.to_string());
     rt.block_on(drop_table_if_exists(&catalog, &reenum_ns, "t_orig"));
     rt.block_on(drop_table_if_exists(&catalog, &reenum_ns, "t_new"));
@@ -297,7 +227,6 @@ fn refresh_reenumerates_namespace() {
         "T_NEW must be unknown before it exists in the catalog and before REFRESH: {resp}"
     );
 
-    // Add the table out-of-band — Exasol/the VS never sees this write directly.
     rt.block_on(ensure_id_val_table(&catalog, NS_REENUM, "t_new", 42, 99.0));
 
     conn.execute("ALTER VIRTUAL SCHEMA REFRESH_REENUM_VS REFRESH");
@@ -312,12 +241,7 @@ fn refresh_reenumerates_namespace() {
     );
 }
 
-/// Refresh reflects a column added to the underlying catalog after
-/// `CREATE VIRTUAL SCHEMA`: the new column is unknown to Exasol (a SQL-level
-/// column-not-found error) until `REFRESH` re-resolves the table's current
-/// Iceberg schema, after which the column becomes selectable (NULL for the
-/// pre-existing row, per Iceberg's column-projection rule for a column absent
-/// from a data file with no `initial-default`).
+/// Scenario: a column added after CREATE becomes selectable (NULL for existing rows) after REFRESH
 #[test]
 fn refresh_reflects_added_table_and_column_change() {
     setup_e2e();
@@ -352,7 +276,6 @@ fn refresh_reflects_added_table_and_column_change() {
         "NEW_COL must be unknown to Exasol before REFRESH: {resp}"
     );
 
-    // Add the column out-of-band via a raw REST add-schema commit.
     rt.block_on(add_new_col(&catalog, NS_COLCHANGE, "evt"));
 
     conn.execute("ALTER VIRTUAL SCHEMA REFRESH_COLCHANGE_VS REFRESH");
@@ -373,10 +296,7 @@ fn refresh_reflects_added_table_and_column_change() {
     );
 }
 
-/// `setProperties` (`ALTER VIRTUAL SCHEMA ... SET NAMESPACE=...`)
-/// re-targets the virtual schema at a different namespace and rebuilds
-/// TABLE_MAP from scratch: the newly targeted namespace's table becomes
-/// queryable and the old namespace's table is no longer registered.
+/// Scenario: SET NAMESPACE re-targets the VS and fully rebuilds the table map
 #[test]
 fn set_properties_retargets_namespace() {
     setup_e2e();
@@ -452,12 +372,7 @@ fn set_properties_retargets_namespace() {
     );
 }
 
-/// Refresh against an unreachable catalog returns a clear error without
-/// leaking credentials — mirrors `create_vs_unreachable_catalog_errors_no_secret`
-/// (`e2e_scan_test.rs`), but exercised on the `refresh` path: the VS is first
-/// created successfully against the real local catalog, then the SAME
-/// CONNECTION object is replaced to point at a bogus, unreachable catalog
-/// endpoint with bogus secret values before REFRESH is issued.
+/// Scenario: REFRESH against an unreachable catalog errors without leaking credentials
 #[test]
 fn refresh_unreachable_catalog_redacts_credentials() {
     setup_e2e();
@@ -481,7 +396,6 @@ fn refresh_unreachable_catalog_redacts_credentials() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_UNREACHABLE_VS", NS_UNREACHABLE);
 
-    // Baseline: the VS works against the real, reachable catalog.
     let id = conn.query_scalar_i64(&format!(
         "SELECT id FROM {}",
         vs_table("REFRESH_UNREACHABLE_VS", "u_tbl")
@@ -491,8 +405,6 @@ fn refresh_unreachable_catalog_redacts_credentials() {
         "U_TBL must be queryable before the connection is broken"
     );
 
-    // Replace the SAME connection object with a bogus, unreachable endpoint
-    // carrying secret-shaped credentials.
     let bogus_password = CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
         endpoint: "http://does-not-exist.invalid:9000".to_string(),
@@ -522,8 +434,7 @@ fn refresh_unreachable_catalog_redacts_credentials() {
         "refresh error message must not leak credentials: {msg}"
     );
 
-    // Restore a working connection so any later test run against this
-    // namespace (or a re-run of this test) is not left in a broken state.
+    // Restore so later runs are not left with a broken connection.
     let create_conn_sql = build_create_connection_sql(
         CATALOG_CONN_NAME,
         &iceberg_catalog_url_internal(),
@@ -532,18 +443,7 @@ fn refresh_unreachable_catalog_redacts_credentials() {
     conn.execute(&create_conn_sql);
 }
 
-/// Adversarial-review finding A1 (PR #153): the plan's Non-Goals originally
-/// claimed the adapter trusts Exasol to scope a partial `REFRESH TABLES <t>`
-/// to only the named table. Running this test against the live stack
-/// disproved that claim: after mutating two tables and refreshing only
-/// `TABLE_ONE`, `TABLE_TWO`'s new column was ALSO visible. plan.md and
-/// spec.md were corrected to state the verified behavior; this test is now
-/// the regression test for that behavior instead of the disproved one.
-///
-/// This test creates two tables, changes BOTH out of band (adds `new_col` to
-/// each), then runs `REFRESH TABLES` naming only `TABLE_ONE`, and asserts
-/// BOTH tables' new column is visible afterward — Exasol applies the
-/// adapter's full-namespace response regardless of `requestedTables`.
+/// Scenario: REFRESH TABLES naming one table still refreshes the whole namespace
 #[test]
 fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
     setup_e2e();
@@ -575,7 +475,6 @@ fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_PARTIAL_VS", NS_PARTIAL);
 
-    // Baseline: neither table exposes NEW_COL yet.
     for table in ["table_one", "table_two"] {
         let resp = conn.try_execute(&format!(
             "SELECT new_col FROM {}",
@@ -588,11 +487,9 @@ fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
         );
     }
 
-    // Mutate BOTH tables out of band.
     rt.block_on(add_new_col(&catalog, NS_PARTIAL, "table_one"));
     rt.block_on(add_new_col(&catalog, NS_PARTIAL, "table_two"));
 
-    // Partial refresh naming ONLY table_one.
     conn.execute("ALTER VIRTUAL SCHEMA REFRESH_PARTIAL_VS REFRESH TABLES TABLE_ONE");
 
     let cols = conn.query_columns(&format!(
@@ -630,21 +527,7 @@ fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
     );
 }
 
-/// Adversarial-review finding A4 (PR #153): a flatten-name (`__`) collision
-/// surfaced by RE-ENUMERATION at refresh time must return the exact same
-/// class of error `createVirtualSchema` already returns for this case
-/// (`flatten_multilevel_namespace_and_detect_collision`,
-/// `crates/lakehouse-engine/src/adapter/mod.rs`) — not a silent overwrite or
-/// drop of one of the colliding tables.
-///
-/// Namespace `e2e_refresh_collision` starts with one baseline table and a
-/// working VS. Two tables are then added out of band whose flattened Exasol
-/// names collide: a direct table `eu__orders` (namespace
-/// `e2e_refresh_collision`) and a table `orders` in the descendant namespace
-/// `e2e_refresh_collision.eu` both flatten to `EU__ORDERS`
-/// (`adapter::tables::flatten_table_name`). `REFRESH` must then surface the
-/// same collision error a fresh `createVirtualSchema` over the same
-/// (now-colliding) namespace would.
+/// Scenario: a flatten-name collision surfaced by REFRESH returns the same error as CREATE
 #[test]
 fn refresh_flatten_collision_returns_same_error_as_create() {
     setup_e2e();
@@ -662,11 +545,6 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
     let eu_ns = NamespaceIdent::from_vec(vec![NS_COLLISION.to_string(), "eu".to_string()])
         .expect("build descendant NamespaceIdent");
 
-    // Given a clean slate: a PREVIOUS run may have left the colliding tables
-    // behind (introduced out-of-band further below), which would make the
-    // very first `create_virtual_schema` call hit the collision before the
-    // "BASELINE must be queryable before the collision is introduced"
-    // assertion ever runs.
     rt.block_on(drop_table_if_exists(&catalog, &top_ns, "baseline"));
     rt.block_on(drop_table_if_exists(&catalog, &top_ns, "eu__orders"));
     rt.block_on(drop_table_if_exists(&catalog, &eu_ns, "orders"));
@@ -676,7 +554,6 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_COLLISION_VS", NS_COLLISION);
 
-    // Baseline VS works before the collision is introduced.
     let resp = conn.try_execute(&format!(
         "SELECT * FROM {}",
         vs_table("REFRESH_COLLISION_VS", "baseline")
@@ -687,8 +564,7 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
         "BASELINE must be queryable before the collision is introduced: {resp}"
     );
 
-    // Introduce the collision out of band: direct `eu__orders` and descendant
-    // `eu.orders` both flatten to `EU__ORDERS`.
+    // Direct `eu__orders` and descendant `eu.orders` both flatten to `EU__ORDERS`.
     rt.block_on(create_empty_table(&catalog, &top_ns, "eu__orders"));
     rt.block_on(create_empty_table(&catalog, &eu_ns, "orders"));
 
@@ -708,9 +584,6 @@ fn refresh_flatten_collision_returns_same_error_as_create() {
         "refresh's collision error must mention 'collision': {refresh_msg}"
     );
 
-    // A fresh createVirtualSchema over the SAME now-colliding namespace must
-    // return the same class of error — proving refresh reuses the identical
-    // build_table_map path rather than a divergent one.
     let create_resp = conn.try_execute(&format!(
         r#"CREATE VIRTUAL SCHEMA REFRESH_COLLISION_CREATE_VS
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH

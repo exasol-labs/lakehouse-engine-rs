@@ -1,18 +1,6 @@
-//! Integration tests (Task 2.3, plan `add-delta-scan-execution`) for **Delta deletion
-//! vectors applied at scan time**, over the vendored `table-with-dv-small` fixture on a
-//! local filesystem store.
-//!
-//! The fixture is real Delta writer output: a 10-row single-column (`value` int32)
-//! Parquet file plus a 45-byte deletion-vector sidecar the table's second commit logs
-//! against it (`storage=u`, cardinality 2). `_delta_log/00000000000000000001.json`'s
-//! `DELETE ... WHERE value IN (0, 9)` deletes exactly the rows holding `value` 0 and 9,
-//! which sit at row positions 0 and 9 — confirmed once against the real sidecar bytes
-//! via `delta_kernel`'s own decoder, not assumed from the predicate text.
-//!
-//! Every test drives the production raw-scan pipeline (`register_files` /
-//! `run_raw_scan_with_session` → `PositionalDeleteScanTable` →
-//! `crate::scan::deletion_vectors`) against a temp-directory copy of the vendored
-//! bytes, so nothing here mutates the checked-in fixture.
+//! Delta deletion vectors applied at scan time, over the vendored `table-with-dv-small`
+//! fixture: 10 rows of `value` int32, with a deletion vector removing positions 0 and 9
+//! (verified against the real sidecar bytes via `delta_kernel`'s decoder).
 
 mod scan_fixture;
 
@@ -47,14 +35,10 @@ use parquet::arrow::ArrowWriter;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use url::Url;
 
-/// Iceberg reserved field-ids for a positional-delete file's `file_path`/`pos`
-/// columns (mirrors `scan::positional_deletes`'s private constants; duplicated here
-/// since this integration test cannot import a `pub(crate)` item).
+/// Iceberg reserved field-ids; duplicated because the engine's constants are `pub(crate)`.
 const FIELD_ID_POSITIONAL_DELETE_FILE_PATH: i32 = 2_147_483_546;
 const FIELD_ID_POSITIONAL_DELETE_POS: i32 = 2_147_483_545;
 
-/// The Delta `pathOrInlineDv` value `_delta_log/00000000000000000001.json` logs for the
-/// vendored fixture's deletion vector (`storage=u`, UUID-relative).
 const FIXTURE_LOGGED_PATH: &str = "vBn[lx{q8@P<9BNH/isA";
 const FIXTURE_SIDECAR_NAME: &str = "deletion_vector_61d16c75-6994-46b7-a15b-8b538852e50e.bin";
 const FIXTURE_DATA_FILE_NAME: &str =
@@ -63,10 +47,7 @@ const FIXTURE_OFFSET: i32 = 1;
 const FIXTURE_SIZE_IN_BYTES: i32 = 36;
 const FIXTURE_CARDINALITY: i64 = 2;
 
-/// The same vector's `magicNumber ++ bitmapData` (the sidecar body without its
-/// container framing), Z85-encoded — exactly what an inline descriptor carries.
-/// Decodes to the identical {0, 9} position set as the vendored sidecar (verified in
-/// `crate::scan::deletion_vectors_tests`, which vendors the same fixture bytes).
+/// The same vector's `magicNumber ++ bitmapData`, Z85-encoded as an inline descriptor carries it.
 const INLINE_PAYLOAD: &str = "^Bg9^0rr910000000000iXQKl0rr91000315c8Xg000r9";
 
 fn fixture_dir() -> PathBuf {
@@ -100,8 +81,6 @@ fn file_size(path: &Path) -> u64 {
         .len()
 }
 
-/// Copy the vendored fixture's data Parquet into `dir` under `name`, returning its
-/// absolute size.
 fn copy_fixture_data_file(dir: &Path, name: &str) -> (PathBuf, u64) {
     let dest = dir.join(name);
     std::fs::copy(fixture_dir().join(FIXTURE_DATA_FILE_NAME), &dest)
@@ -110,7 +89,6 @@ fn copy_fixture_data_file(dir: &Path, name: &str) -> (PathBuf, u64) {
     (dest, size)
 }
 
-/// Copy the vendored fixture's DV sidecar into `dir` under `name`.
 fn copy_fixture_sidecar(dir: &Path, name: &str) -> PathBuf {
     let dest = dir.join(name);
     std::fs::copy(fixture_dir().join(FIXTURE_SIDECAR_NAME), &dest)
@@ -118,9 +96,6 @@ fn copy_fixture_sidecar(dir: &Path, name: &str) -> PathBuf {
     dest
 }
 
-/// The [`DeleteMechanism::DeltaDeletionVector`] `_delta_log/...0001.json` logs for the
-/// fixture: a UUID-relative vector resolved against whatever `table_root` the caller's
-/// `ScanSpec` carries.
 fn fixture_deletion_vector() -> DeleteMechanism {
     DeleteMechanism::DeltaDeletionVector {
         storage: DeltaDeletionVectorStorage::UuidRelative,
@@ -131,8 +106,6 @@ fn fixture_deletion_vector() -> DeleteMechanism {
     }
 }
 
-/// An absolute-path deletion vector naming `sidecar_url` verbatim — bypasses table-root
-/// reconstruction entirely, so its `table_root` never needs to resolve.
 fn absolute_deletion_vector(sidecar_url: &str) -> DeleteMechanism {
     DeleteMechanism::DeltaDeletionVector {
         storage: DeltaDeletionVectorStorage::AbsolutePath,
@@ -143,8 +116,6 @@ fn absolute_deletion_vector(sidecar_url: &str) -> DeleteMechanism {
     }
 }
 
-/// An inline deletion vector carrying its own bitmap payload — resolves no sidecar path
-/// at all.
 fn inline_deletion_vector() -> DeleteMechanism {
     DeleteMechanism::DeltaDeletionVector {
         storage: DeltaDeletionVectorStorage::Inline,
@@ -155,8 +126,6 @@ fn inline_deletion_vector() -> DeleteMechanism {
     }
 }
 
-/// Storage props are never dialed for a local `file://` scan; a placeholder keeps the
-/// spec well-formed.
 fn dummy_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://localhost:9000".into(),
@@ -168,9 +137,6 @@ fn dummy_storage() -> StorageBackend {
     })
 }
 
-/// A row-scan `ScanSpec` over the fixture's single `value` column, rooted at
-/// `table_root` (needed to resolve a UUID-relative deletion vector), optionally
-/// pushing a filter and/or a limit.
 fn scan_spec(
     files: Vec<FileEntry>,
     table_root: &str,
@@ -199,9 +165,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Run the production raw scan for `spec` against a session registering `store` for
-/// `register_url`'s scheme/authority. Returns the decoded emitted batches, or the
-/// scan's error.
 async fn try_run_scan_with_store(
     spec: &ScanSpec,
     register_url: &str,
@@ -211,8 +174,6 @@ async fn try_run_scan_with_store(
     session
         .runtime_env()
         .register_object_store(&Url::parse(register_url).expect("register url"), store);
-    // Every fixture here projects the single `VALUE` column, an int32 the
-    // adapter declares in the engine's Int32 DECIMAL bin.
     let mut ctx =
         scan_fixture::BatchCapturingCtx::declaring(TestContext::scalar(vec![]), &[ExaType::Int32]);
     let mut timers = PhaseTimers::start();
@@ -227,8 +188,6 @@ async fn try_run_scan_with_store(
     Ok(ctx.into_batches())
 }
 
-/// Run the production raw scan over a plain `LocalFileSystem`, panicking on scan
-/// failure.
 fn run_scan(spec: &ScanSpec, register_url: &str) -> Vec<RecordBatch> {
     block_on(try_run_scan_with_store(
         spec,
@@ -258,9 +217,7 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-/// Scenario: a UUID-relative deletion vector — the real vendored fixture, end to
-/// end — removes exactly its flagged row positions: 10 physical rows yield 8, and
-/// the two deleted values (0 and 9) are absent.
+/// Scenario: a UUID-relative deletion vector removes exactly its flagged row positions
 #[test]
 fn uuid_relative_deletion_vector_removes_its_flagged_rows() {
     let dir = temp_dir("uuid_relative");
@@ -284,9 +241,7 @@ fn uuid_relative_deletion_vector_removes_its_flagged_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: an inline deletion vector is decoded from its own payload, with no
-/// object-store access for it at all — a store that errors on any non-HEAD read of a
-/// `.bin` sidecar still lets the scan succeed, because nothing ever asks it for one.
+/// Scenario: an inline deletion vector is decoded from its own payload with no sidecar read
 #[test]
 fn inline_deletion_vector_decodes_without_object_store_access() {
     let dir = temp_dir("inline");
@@ -318,27 +273,18 @@ fn inline_deletion_vector_decodes_without_object_store_access() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: an absolute-path deletion vector is read verbatim — resolution never
-/// joins it onto `table_root`. A deliberately wrong (non-existent) `table_root` proves
-/// it: if the code tried to reconstruct a UUID-relative-style path against it, the
-/// sidecar would not be found.
+/// Scenario: an absolute-path deletion vector is read verbatim, never joined onto `table_root`
 #[test]
 fn absolute_path_deletion_vector_is_read_verbatim() {
     let dir = temp_dir("absolute_path");
     let (data_path, data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
     let sidecar_path = copy_fixture_sidecar(&dir, FIXTURE_SIDECAR_NAME);
 
-    // The data-file entry is itself absolute, so a decoy `table_root` cannot affect
-    // ITS resolution either — isolating the assertion to the deletion vector's own
-    // path handling.
     let entry = FileEntry::with_deletes(
         file_url(&data_path),
         data_size,
         vec![absolute_deletion_vector(&file_url(&sidecar_path))],
     );
-    // A decoy table_root that shares no files with `dir` at all: if `AbsolutePath`
-    // resolution joined onto it (like `UuidRelative` does), the sidecar would not be
-    // found there.
     let decoy_root = "file:///nonexistent/decoy/root/";
     let spec = scan_spec(vec![entry], decoy_root, None, None);
     let rows = run_scan(&spec, &file_url(&data_path));
@@ -353,9 +299,7 @@ fn absolute_path_deletion_vector_is_read_verbatim() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a deletion-vector file shared by several data files is fetched exactly
-/// once per shard — an absolute-path vector naming the SAME sidecar from two distinct
-/// data-file entries triggers only one non-HEAD read of it.
+/// Scenario: a deletion-vector sidecar shared by several data files is fetched once per shard
 #[test]
 fn shared_deletion_vector_file_is_fetched_once_per_shard() {
     let dir = temp_dir("shared_sidecar");
@@ -399,20 +343,16 @@ fn shared_deletion_vector_file_is_fetched_once_per_shard() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Fixed per-read delay long enough that, on the tests' current-thread runtime, every
-/// read admitted in one scheduling wave has bumped the peak counter before any timer
-/// fires — deterministic, not a race on real I/O timing (mirrors
-/// `scan_positional_deletes.rs`'s `DELETE_READ_DELAY`).
+/// A current-thread runtime fires timers only once it parks, so every read admitted in one
+/// scheduling wave bumps the peak before any delay elapses.
 const DV_READ_DELAY: Duration = Duration::from_millis(50);
 const DV_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Scenario (connection-concurrency bound): with a read budget of N and MORE than N
-/// unique deletion-vector sidecars to fetch, the concurrent sidecar reads peak at
-/// EXACTLY N — the shared instance-level semaphore admits N at a time and no more.
+/// Scenario: concurrent sidecar reads peak at exactly the connection budget
 #[test]
 fn deletion_vector_reads_stay_within_the_connection_budget() {
     const BUDGET: usize = 3;
-    const UNIQUE_SIDECARS: usize = 6; // strictly greater than BUDGET
+    const UNIQUE_SIDECARS: usize = 6;
 
     let dir = temp_dir("bounded_budget");
     let mut entries = Vec::with_capacity(UNIQUE_SIDECARS);
@@ -472,10 +412,7 @@ fn deletion_vector_reads_stay_within_the_connection_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: deletion vectors compose with projection, filter, LIMIT, and
-/// aggregation — the base access plan (deletes) and the opener's own pushdown
-/// intersect to the correct final result in every case, rather than either
-/// disabling the other.
+/// Scenario: deletion vectors compose with projection, filter, LIMIT, and aggregation
 #[test]
 fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     let dir = temp_dir("compose");
@@ -483,8 +420,6 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     copy_fixture_sidecar(&dir, FIXTURE_SIDECAR_NAME);
     let table_root = dir_url(&dir);
 
-    // Projection + filter pushdown: only the "VALUE" column is registered, and the
-    // filter is evaluated over post-delete rows (1..=8), keeping 3..=8.
     let entry = FileEntry::with_deletes(
         FIXTURE_DATA_FILE_NAME,
         data_size,
@@ -503,7 +438,6 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
         "filter pushdown must see only post-delete rows"
     );
 
-    // LIMIT pushdown: the first N surviving (post-delete) rows in file order.
     let limit_spec = scan_spec(vec![entry], &table_root, None, Some(3));
     let limit_rows = run_scan(&limit_spec, &file_url(&data_path));
     assert_eq!(
@@ -512,10 +446,6 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
         "LIMIT pushdown must count only post-delete rows (values 0 and 9 are deleted)"
     );
 
-    // Aggregation: a COUNT(*) over the SAME registered production table
-    // (`PositionalDeleteScanTable`) reflects only the 8 live rows — the deletion
-    // vector's base access plan applies underneath any SQL run against it,
-    // aggregation included.
     let agg_entry = FileEntry::with_deletes(
         FIXTURE_DATA_FILE_NAME,
         data_size,
@@ -556,9 +486,7 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a Delta data file carrying NO deletion vector scans unchanged — the
-/// unified `PositionalDeleteScanTable` path must not regress the delete-free case for
-/// a Delta-sourced file any more than for an Iceberg one.
+/// Scenario: a Delta data file with no deletion vector scans unchanged
 #[test]
 fn delta_file_without_a_deletion_vector_scans_unchanged() {
     let dir = temp_dir("delete_free");
@@ -578,9 +506,6 @@ fn delta_file_without_a_deletion_vector_scans_unchanged() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Write a local Iceberg-style positional-delete Parquet at `dir/relative`:
-/// `file_path`/`pos` columns tagged with the Iceberg reserved field-ids. Returns the
-/// file's absolute `file://` URL.
 fn write_iceberg_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i64)]) -> String {
     let field_id_meta =
         |id: i32| HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string())]);
@@ -608,8 +533,6 @@ fn write_iceberg_delete_parquet(dir: &Path, relative: &str, entries: &[(&str, i6
     file_url(&path)
 }
 
-/// Write a local single-column (`value` int32) data Parquet with `values` as its
-/// rows. Returns the file's absolute `file://` URL.
 fn write_iceberg_data_parquet(dir: &Path, relative: &str, values: &[i32]) -> String {
     let schema = Arc::new(Schema::new(vec![Field::new(
         "value",
@@ -626,16 +549,11 @@ fn write_iceberg_data_parquet(dir: &Path, relative: &str, values: &[i32]) -> Str
     file_url(&path)
 }
 
-/// Scenario: both delete mechanisms converge on one position map and one
-/// access-plan pipeline — a shard mixing an Iceberg positional-delete file (on its
-/// own data file) with a Delta deletion vector (the vendored fixture, on a
-/// different data file) applies BOTH correctly in a single scan, end to end.
+/// Scenario: a shard mixing an Iceberg positional delete and a Delta deletion vector applies both
 #[test]
 fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
     let dir = temp_dir("mixed_shard");
 
-    // Iceberg leg: a 5-row data file with its own positional-delete file removing
-    // positions 1 and 3.
     let iceberg_data_url =
         write_iceberg_data_parquet(&dir, "iceberg_data.parquet", &[100, 101, 102, 103, 104]);
     let iceberg_delete_url = write_iceberg_delete_parquet(
@@ -647,7 +565,6 @@ fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
         iceberg_delete_url.strip_prefix("file://").unwrap(),
     ));
 
-    // Delta leg: the vendored fixture, deletion vector removing values 0 and 9.
     let (delta_data_path, delta_data_size) = copy_fixture_data_file(&dir, FIXTURE_DATA_FILE_NAME);
     copy_fixture_sidecar(&dir, FIXTURE_SIDECAR_NAME);
 
@@ -669,7 +586,6 @@ fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
     let spec = scan_spec(entries, &dir_url(&dir), None, None);
     let rows = run_scan(&spec, &file_url(&delta_data_path));
 
-    // Iceberg: 100,102,104 survive (101, 103 deleted). Delta: 1..8 survive (0, 9 deleted).
     let values = values_of(&rows);
     assert_eq!(
         total_rows(&rows),
@@ -704,10 +620,7 @@ fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario (fail loud): every deletion-vector container the scan cannot trust —
-/// wrong version byte, a stored size the log contradicts, a foreign magic, a broken
-/// checksum, and a truncated container — is rejected with a clean error through the
-/// FULL production scan pipeline, never a panic and never silently-emitted rows.
+/// Scenario: an untrustworthy deletion-vector container is rejected cleanly, never a panic or silent rows
 #[test]
 fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
     let sidecar_bytes = std::fs::read(fixture_dir().join(FIXTURE_SIDECAR_NAME)).unwrap();
@@ -789,10 +702,7 @@ fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
     }
 }
 
-/// An [`ObjectStore`] that errors on any non-HEAD `get_opts` whose location contains
-/// `needle`, delegating everything else to a plain [`LocalFileSystem`]. Proves a
-/// scenario never even attempts a read it should not need — a miscounted-but-silent
-/// read would fail the SCAN here, not just a follow-up assertion.
+/// Errors on any non-HEAD read matching `needle`, so an unneeded read fails the scan itself.
 #[derive(Debug)]
 struct RefusingReadStore {
     inner: LocalFileSystem,
@@ -885,12 +795,8 @@ impl ObjectStore for RefusingReadStore {
     }
 }
 
-/// Instrumentation shared by the concurrency-bound test: an atomic peak-concurrency
-/// counter over probed reads plus a fixed artificial delay forcing genuine overlap
-/// without real I/O timing (mirrors `scan_positional_deletes.rs`'s `ConcurrencyProbe`).
 #[derive(Debug)]
 struct ConcurrencyProbe {
-    /// Bare filenames identifying the sidecar reads to instrument.
     needles: Vec<String>,
     in_flight: Arc<AtomicUsize>,
     peak: Arc<AtomicUsize>,
@@ -914,9 +820,6 @@ impl Drop for InFlightGuard {
     }
 }
 
-/// An [`ObjectStore`] decorator that records every non-HEAD `get` it serves, by
-/// location, and optionally instruments a peak-concurrency probe (mirrors
-/// `scan_positional_deletes.rs`'s `TrackingStore`).
 #[derive(Debug)]
 struct TrackingStore {
     inner: Arc<dyn ObjectStore>,

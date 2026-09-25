@@ -10,7 +10,6 @@ use arrow::datatypes::Fields;
 use datafusion::datasource::listing::ListingTableUrl;
 use std::collections::BTreeMap;
 
-/// The CONNECTION address plus the namespace property, joined by the resolver.
 const TABLE_ROOT: &str = "s3://warehouse/direct/events";
 
 /// Unreadable as Parquet: a successful resolution proves its footer was never read.
@@ -71,7 +70,7 @@ fn declared(columns: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Two data files at different depths/schemas, plus two objects the listing must skip (a hidden segment, a sibling table's directory).
+/// Plus two objects the listing must skip: a hidden segment and a sibling table's directory.
 async fn two_depth_directory() -> Arc<dyn ObjectStore> {
     store_holding(&[
         (
@@ -230,7 +229,7 @@ async fn file_entry_paths_round_trip_to_the_listed_object() {
     );
 }
 
-// merge_mode narrows which footers are read, never which files are scanned or filtered.
+/// Scenario: The merge mode narrows which footers are read, never which files are scanned
 #[tokio::test]
 async fn plan_reads_selected_footers_and_lists_every_file() {
     let store = two_depth_directory().await;
@@ -437,7 +436,7 @@ async fn a_nested_column_declares_the_string_tag_and_an_identity_bound_descripto
     );
 }
 
-// An empty prefix resolves an empty scan, not an error — whether it's a table was decided at create time.
+/// Scenario: A directory holding no data file resolves an empty scan, not an error
 #[tokio::test]
 async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
     let store =
@@ -450,7 +449,7 @@ async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
     assert_eq!(scan.table_root, TABLE_ROOT);
 }
 
-// Planning must render the same normalized timestamptz_* tag as enumeration, or CREATE VIRTUAL SCHEMA could accept a column that planning then refuses.
+/// Scenario: Planning renders the same normalized timestamptz tag as enumeration
 #[tokio::test]
 async fn a_non_utc_timezone_column_plans_at_its_normalized_tag() {
     let store = store_holding(&[(

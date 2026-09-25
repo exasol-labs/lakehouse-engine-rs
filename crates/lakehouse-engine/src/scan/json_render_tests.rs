@@ -7,12 +7,11 @@ use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::datatypes::{DataType, Field, Fields};
 use std::sync::Arc;
 
-/// Assert `text` is a JSON document a real parser accepts, and return it parsed.
 fn parsed(text: &str) -> serde_json::Value {
     serde_json::from_str(text).unwrap_or_else(|e| panic!("{text} must parse as JSON: {e}"))
 }
 
-/// Render `array` and return every cell as `Option<String>` — `None` for a SQL NULL.
+/// `None` is a SQL NULL.
 fn rendered(array: ArrayRef) -> Vec<Option<String>> {
     let out = render_nested_column_as_json(&array).expect("a nested column must render");
     (0..out.len())
@@ -20,7 +19,6 @@ fn rendered(array: ArrayRef) -> Vec<Option<String>> {
         .collect()
 }
 
-/// One `list<utf8>` column from rows of optional elements.
 fn list_of_strings(rows: Vec<Option<Vec<Option<&str>>>>) -> ArrayRef {
     let mut builder = arrow::array::ListBuilder::new(arrow::array::StringBuilder::new());
     for row in rows {
@@ -37,8 +35,7 @@ fn list_of_strings(rows: Vec<Option<Vec<Option<&str>>>>) -> ArrayRef {
     Arc::new(builder.finish())
 }
 
-/// One `map<K,V>` column assembled from its key child, value child, entry offsets and
-/// cell nulls — the four parts `MapArray` is made of, so a key of any type is expressible.
+/// Built from its four `MapArray` parts so a key of any type is expressible.
 fn map_column(
     keys: ArrayRef,
     values: ArrayRef,
@@ -71,10 +68,7 @@ fn utf8(values: &[&str]) -> ArrayRef {
     Arc::new(StringArray::from(values.to_vec()))
 }
 
-/// nested-json-rendering / A list, struct, or map value renders as one valid JSON document.
-///
-/// Every shape carries POPULATED values, and every rendered cell is handed to a real JSON
-/// parser — the Arrow display text this encoder replaces (`[hello, world]`) would fail that.
+/// Scenario: a list, struct, or map value renders as one valid JSON document.
 #[test]
 
 fn populated_nested_values_render_as_valid_json_documents() {
@@ -206,10 +200,7 @@ fn populated_nested_values_render_as_valid_json_documents() {
     );
 }
 
-/// nested-json-rendering / A null nested value emits SQL NULL, not the text "null".
-///
-/// A null CELL is an Exasol NULL; a null MEMBER of a populated cell is an explicit JSON
-/// `null` inside the document, so one column renders the same object shape on every row.
+/// Scenario: a null nested value emits SQL NULL, not the text "null".
 #[test]
 fn null_cells_emit_sql_null_and_null_members_render_explicitly() {
     let lists = rendered(list_of_strings(vec![
@@ -268,10 +259,7 @@ fn null_cells_emit_sql_null_and_null_members_render_explicitly() {
     );
 }
 
-/// nested-json-rendering / A non-string map key is stringified into the JSON object name.
-///
-/// Every key type the Iceberg spec permits reaches a string object name: a nested key
-/// through its own JSON rendering, every other through the Arrow-to-`Utf8` cast.
+/// Scenario: a non-string map key is stringified into the JSON object name.
 #[test]
 
 fn non_utf8_map_keys_stringify_into_object_names() {
@@ -404,8 +392,7 @@ fn non_utf8_map_keys_stringify_into_object_names() {
     );
 }
 
-/// A key type no Arrow cast turns into text is refused BY NAME rather than rendered wrong
-/// — the one failure mode a silent fallback would turn into a wrong object name.
+/// Scenario: a map key type no Arrow cast turns into text is refused by name.
 #[test]
 fn a_map_key_type_no_cast_reaches_utf8_is_refused_by_name() {
     let keys = FixedSizeBinaryArray::try_from_iter([[0u8, 1u8]].into_iter())
@@ -426,8 +413,7 @@ fn a_map_key_type_no_cast_reaches_utf8_is_refused_by_name() {
     );
 }
 
-/// The renderer owns the five nested Arrow types and nothing else, so a column reaching it
-/// by mistake is refused instead of being silently re-encoded as a bare JSON scalar.
+/// Scenario: a non-nested column is refused by the nested renderer.
 #[test]
 fn a_non_nested_column_is_refused_by_the_nested_renderer() {
     let column: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
@@ -441,8 +427,7 @@ fn a_non_nested_column_is_refused_by_the_nested_renderer() {
     );
 }
 
-/// A map with a null key is a data defect, not a missing encoder — the refusal
-/// must name the cause instead of pointing at the type system.
+/// Scenario: a map with a null key is refused with a clean error naming the cause.
 #[test]
 fn a_map_column_with_a_null_key_is_refused_with_a_clean_error() {
     let keys = StringArray::from(vec![None, Some("b")]);

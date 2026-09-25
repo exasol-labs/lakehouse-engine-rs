@@ -15,11 +15,7 @@ fn empty_file_list_returns_empty_select() {
     assert!(sql.contains("CAST(NULL AS DECIMAL(20,0))"));
 }
 
-/// A pruned query with repeated literals in the projection (e.g.
-/// `SELECT 1, name, 1 ... WHERE <all files pruned>`) keeps unique EMITS
-/// aliases via `emits_ident`: the two `Expr` positions get distinct
-/// positional synthetic names, never a duplicated `AS "1"` collision
-/// (issue #190).
+/// Scenario: repeated literals in a pruned projection keep unique EMITS aliases (#190)
 #[test]
 fn empty_pushdown_sql_repeated_literals_unique_aliases() {
     let proj_cols: Vec<ProjectionItem> = vec![
@@ -58,9 +54,7 @@ fn empty_pushdown_sql_repeated_literals_unique_aliases() {
     );
 }
 
-/// Single-group empty result: one row, per-`AggKind` literal cast to its
-/// declared type — COUNT → `0`, SUM → `NULL` — with no `WHERE 1=0` (a bare
-/// `FROM DUAL` already yields exactly one row).
+/// Scenario: a single-group empty result is one row of per-AggKind literals cast to declared types
 #[test]
 fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
     let items = vec![
@@ -98,13 +92,7 @@ fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
     );
 }
 
-/// A `ScalarOverAggregate` item followed by a bare `Aggregate` item must not
-/// shift the bare item's declared-type lookup: each item's cast type comes from
-/// its OWN `selectList` index, never from a list compacted down to only the
-/// `function_aggregate`-typed items (which the `ScalarOverAggregate` item, typed
-/// `function_scalar`, is absent from — a type list compacted that way shifts
-/// every index after a `ScalarOverAggregate` item, so each item's cast type must
-/// be looked up at its own `selectList` index).
+/// Scenario: a ScalarOverAggregate item does not shift a later item's declared-type lookup
 #[test]
 fn empty_agg_sql_scalar_over_aggregate_item_does_not_shift_a_later_bare_aggregate_type() {
     let items = vec![
@@ -133,9 +121,7 @@ fn empty_agg_sql_scalar_over_aggregate_item_does_not_shift_a_later_bare_aggregat
     );
 }
 
-/// COUNT(DISTINCT) over zero files yields a plain `0` literal row — no distinct
-/// fan-out, no scan, and no merge step (with zero files there is nothing to scan
-/// or deduplicate).
+/// Scenario: COUNT(DISTINCT) over zero files yields a plain 0 row with no fan-out or merge
 #[test]
 fn empty_agg_sql_count_distinct_emits_zero_no_merge_udf() {
     let items = vec![SingleGroupItem::Distinct(DistinctCount {
@@ -172,15 +158,7 @@ fn round_of(inner: Json, digits: i64) -> Json {
     })
 }
 
-/// A fully-pruned file list yields one shape-correct empty row for a
-/// scalar-over-aggregate select list: each nested aggregate contributes its OWN
-/// zero-row literal (COUNT -> `0`, SUM -> a NULL typed from its argument column)
-/// substituted into the scalar structure, not a bare `NULL` for the whole item —
-/// and the result is cast to the item's own declared type, independent of
-/// `selectListDataTypes` (here absent from `pushdown_req` entirely).
-///
-/// The absent value MUST carry a type: Exasol rejects `ROUND(NULL, 2)` outright
-/// with `Feature not supported: Round with wrong type` (SQL state `0A000`).
+/// Scenario: a scalar-over-aggregate empty row substitutes each nested aggregate's typed zero-row literal
 #[test]
 fn empty_single_group_scalar_over_aggregate_emits_one_typed_row() {
     let items = vec![
@@ -216,9 +194,7 @@ fn empty_single_group_scalar_over_aggregate_emits_one_typed_row() {
     );
 }
 
-/// An absent nested aggregate with no argument column to type it from — here a
-/// `SUM` over a scalar expression — falls back to `DOUBLE PRECISION`, so the
-/// rendered scalar still receives a well-typed argument.
+/// Scenario: an absent nested aggregate with no argument column is typed DOUBLE PRECISION
 #[test]
 fn empty_single_group_scalar_over_expression_aggregate_types_its_null() {
     let items = vec![SingleGroupItem::ScalarOverAggregate {
@@ -245,14 +221,7 @@ fn sum_of_length(col: &str) -> Json {
     })
 }
 
-/// Issue #57 shape-consistency (task 6.7): when EVERY file is pruned, a Case 2/3
-/// single-group request (more than one `COUNT(DISTINCT)`, or a distinct mixed with
-/// an ordinary aggregate) must return the SAME N-aggregate-column shape
-/// (`empty_agg_sql`, one column per select item) that the non-empty qualified
-/// single-table wrapper returns — NEVER the full-row empty shape
-/// (`empty_pushdown_sql`), whose different column count trips Exasol's positional
-/// pushdown validation (`sqlCode 04000`, "Expected number of columns is N but
-/// pushdown query has M"), since Exasol never re-aggregates a declined pushdown.
+/// Scenario: an empty multi- or mixed-distinct single-group request keeps the N-aggregate-column shape (#57)
 #[test]
 fn empty_case_2_3_matches_non_empty_aggregate_shape() {
     fn count_top_level_cols(select_span: &str) -> usize {
@@ -269,7 +238,6 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
         cols
     }
 
-    // Case 3: two COUNT(DISTINCT) + one ordinary SUM → N = 3 output columns.
     let pushdown_req = serde_json::json!({
         "selectList": [
             agg_item("COUNT", Some("A"), true),
@@ -288,8 +256,6 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
         ("C".to_string(), "DECIMAL(36,2)".to_string()),
     ];
 
-    // The fixture must be a Case 2/3 shape: distinct present, but not a lone one
-    // (so the non-empty path declines the fan-out and routes to the wrapper).
     let items = detect_aggregates(&pushdown_req).expect("a Case 3 select list detects");
     assert!(
         super::super::single_group_agg::has_distinct(&items)
@@ -298,8 +264,7 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
     );
     let n = pushdown_req["selectList"].as_array().unwrap().len();
 
-    // A deliberately WIDER full-row projection (5 columns): if the empty dispatch
-    // wrongly returned the full-row shape, its column count would be 5, not N = 3.
+    // Wider than N so a wrongly returned full-row shape is detectable by column count.
     let proj_cols: Vec<ProjectionItem> = ["A", "B", "C", "D", "E"]
         .iter()
         .map(|c| ProjectionItem::from(*c))
@@ -316,7 +281,6 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
         .expect("empty Case 2/3 result must build");
     let empty_sql = empty["sql"].as_str().unwrap();
 
-    // Routes to the N-aggregate-column shape (empty_agg_sql), NOT the full-row shape.
     let direct = empty_agg_sql(&items, &pushdown_req, &[]);
     assert_eq!(
         empty_sql,
@@ -331,8 +295,6 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
         "the empty Case 2/3 dispatch must NOT return the full-row empty shape (#57): {empty_sql}"
     );
 
-    // Exactly N columns — the same one-per-select-item shape the non-empty wrapper
-    // returns, so empty and non-empty column shapes never diverge.
     let select_span = &empty_sql["SELECT ".len()..empty_sql.find(" FROM").expect("has FROM")];
     assert_eq!(
         count_top_level_cols(select_span),
@@ -340,8 +302,6 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
         "the empty shape must have exactly N={n} aggregate columns (one per select \
          item): {empty_sql}"
     );
-    // COUNT(DISTINCT) over zero files → 0; the ordinary SUM → NULL, each cast to
-    // its declared type.
     assert!(
         empty_sql.contains("CAST(0 AS DECIMAL(18,0))")
             && empty_sql.contains("CAST(NULL AS DECIMAL(36,2))"),
@@ -349,8 +309,7 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
     );
 }
 
-/// Every non-COUNT `AggKind` maps to the `NULL` empty literal — single-node
-/// SQL semantics over zero rows (only the COUNT family yields `0`).
+/// Scenario: every non-COUNT AggKind maps to the NULL empty literal
 #[test]
 fn empty_agg_literal_maps_non_count_kinds_to_null() {
     for kind in [
@@ -378,8 +337,7 @@ fn empty_agg_literal_maps_non_count_kinds_to_null() {
     }
 }
 
-/// Grouped empty result: zero rows (`WHERE 1=0`) with one `CAST(NULL AS <ty>)`
-/// per grouped output column, assembled in select-list order.
+/// Scenario: a grouped empty result is zero rows of one typed NULL per output column in select-list order
 #[test]
 fn empty_grouped_sql_emits_zero_rows_in_grouped_shape() {
     let select_items = vec![
@@ -419,10 +377,7 @@ fn empty_grouped_sql_emits_zero_rows_in_grouped_shape() {
     );
 }
 
-/// A `GroupedSelectItem::Constant` (Exasol's "count the groups" literal
-/// rewrite) reuses its already-rendered projection expression verbatim,
-/// slotted into select-list order alongside the group-key and aggregate
-/// columns — it contributes no aggregate plan and is not re-typed here.
+/// Scenario: a grouped Constant item reuses its rendered projection verbatim in select-list order
 #[test]
 fn empty_grouped_sql_includes_constant_projection_column() {
     let select_items = vec![
@@ -459,9 +414,7 @@ fn empty_grouped_sql_includes_constant_projection_column() {
     );
 }
 
-/// Dispatch priority mirrors the non-empty path: grouped first, then
-/// single-group aggregate (only when `validate_agg_col_types` passes), then
-/// row scan.
+/// Scenario: empty-result dispatch priority mirrors the non-empty path
 #[test]
 fn empty_result_sql_dispatches_by_plan_shape() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
@@ -505,7 +458,6 @@ fn empty_result_sql_dispatches_by_plan_shape() {
     );
     assert!(single_sql.contains("CAST(NULL AS DECIMAL(36,2))"));
 
-    // Non-numeric SUM target demotes to the row-scan empty shape (gate honored).
     let non_numeric = serde_json::json!({
         "selectList": [agg_item("SUM", Some("name"), false)],
         "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
@@ -528,13 +480,7 @@ fn empty_result_sql_dispatches_by_plan_shape() {
     );
 }
 
-/// A grouped aggregate over a non-numeric column with all files pruned no longer
-/// demotes to the full-row empty shape: since issue #82's fix, a grouped request
-/// that cannot push down (here, a non-numeric SUM with no HAVING) routes on the
-/// NON-empty path to the qualified single-table wrapper, whose output columns are
-/// the `selectList` items. The empty path must MIRROR that shape — a zero-row
-/// result typed per `selectListDataTypes` (the `selectList` column count/types),
-/// NOT the full base row — so the empty and non-empty shapes never diverge.
+/// Scenario: an empty non-numeric grouped aggregate mirrors the wrapper's selectList-typed shape
 #[test]
 fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
@@ -567,11 +513,7 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
     );
 }
 
-/// A non-numeric grouped aggregate that also carries a HAVING no longer hard
-/// errors: the classifier routes it to `GroupByWrapper` (the HAVING renders
-/// natively over the wrapper rather than being dropped), so the empty path must
-/// mirror the SAME selectList-typed empty shape as the no-HAVING sibling above,
-/// not an `Err`.
+/// Scenario: an empty non-numeric grouped aggregate with HAVING mirrors the wrapper's shape, not an Err
 #[test]
 fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
@@ -605,13 +547,7 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
     );
 }
 
-/// A row-scan request whose derived projection WIDENED to the full base row is
-/// routed on the non-empty path to the qualified single-table wrapper, whose
-/// output columns are the `selectList` items (#196). The empty path must mirror
-/// that shape — one `selectListDataTypes`-typed zero-row column — never the
-/// wider full base row, whose column count trips Exasol's positional `04000`
-/// check. The widening signal alone decides this: the identical request with a
-/// non-widened projection still gets the full-row shape.
+/// Scenario: an empty widened row scan mirrors the wrapper's selectList-typed shape (#196)
 #[test]
 fn empty_result_sql_widened_row_scan_uses_select_list_types() {
     let pushdown_req = serde_json::json!({
@@ -626,8 +562,6 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         ("NAME".to_string(), "VARCHAR(2000000)".to_string()),
         ("SCORE".to_string(), "DOUBLE PRECISION".to_string()),
     ];
-    // No aggregate anywhere, so the shared classifier picks `RowScan` — the arm
-    // under test, not the `GroupByWrapper` arm that already emits this shape.
     assert!(
         matches!(
             classify_request_shape(&pushdown_req, &col_types),
@@ -636,7 +570,6 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
         "the fixture must classify as RowScan for this test to exercise its arm"
     );
 
-    // The widened projection IS the full base row: three columns for one item.
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into(), "SCORE".into()];
     let proj_types: Vec<String> = col_types.iter().map(|(_, t)| t.clone()).collect();
 

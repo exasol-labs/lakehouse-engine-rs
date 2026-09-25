@@ -1,22 +1,6 @@
-//! End-to-end integration tests for the lakehouse-engine Virtual Schema.
-//!
-//! These tests run against a live Exasol + MinIO + Iceberg REST catalog stack.
-//! They FAIL (never skip) when the stack is unavailable — per project rules.
-//!
-//! All tests share one VS, so they must run serially (--test-threads=1).
-//! The Makefile `test-e2e` target passes this flag automatically.
-//!
-//! # Setup (done once via `setup_e2e` called from each test)
-//! 1. Seed the Iceberg table into the REST catalog over MinIO.
-//! 2. Install the Rust SLC pinned by the workspace `exasol-udf-sdk` version
-//!    (LHRUST alias) and upload liblakehouse_engine.so to BucketFS.
-//! 3. Create the LAKEHOUSE_ADAPTER script and the LAKEHOUSE_SCAN SCALAR script
-//!    (both from the same .so), and the LAKEHOUSE_DISTRIBUTE_FILES LUA SET
-//!    passthrough distributor.
-//! 4. Create the LHVS Virtual Schema over the seeded table.
-//!
-//! The VS properties carry UDF-internal URLs (docker-network names) for the
-//! catalog and MinIO, because the UDF runs inside the Exasol container.
+//! E2E tests against a live Exasol + MinIO + Iceberg REST stack. They fail, never
+//! skip, when the stack is unavailable, and share one VS, so run with
+//! `--test-threads=1`.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -43,31 +27,20 @@ use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_
 
 use std::sync::OnceLock;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const VS_NAME: &str = "MY_LAKEHOUSE";
 
-/// A second VS, created with `PARALLELISM_FACTOR = '1'` so its recorded
-/// `DF_THREADS_PER_UDF` reads back the core count the adapter VM detected.
+/// `PARALLELISM_FACTOR = '1'` so its recorded `DF_THREADS_PER_UDF` reads back the core
+/// count the adapter VM detected.
 const CPU_PROBE_VS_NAME: &str = "LHVS_CPU_PROBE";
 
-// ---------------------------------------------------------------------------
-// One-time setup
-// ---------------------------------------------------------------------------
-
-/// Marker so setup runs once across the serial test binary.
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
-        // 1. Verify stack is up.
         wait_for_exasol();
         wait_for_minio();
         wait_for_iceberg_catalog();
 
-        // 2. Seed the Iceberg table.
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -81,23 +54,15 @@ fn setup_e2e() {
                 .expect("seed Iceberg typed_distinct_probe table");
         });
 
-        // 3. Install the Rust SLC pinned by the workspace `exasol-udf-sdk` version
-        //    (download + upload + ALTER SYSTEM).
         install_slc();
 
-        // 4. Upload the .so to BucketFS.
         upload_so();
 
-        // 5. Create Exasol schema + scripts + VS.
         let mut conn = exa_conn();
         create_schema_and_scripts(&mut conn);
         create_virtual_schema(&mut conn, &VsProps::new(VS_NAME, E2E_NAMESPACE));
     });
 }
-
-// ---------------------------------------------------------------------------
-// Helpers: qualify VS table names (adapter uppercases all Iceberg names).
-// ---------------------------------------------------------------------------
 
 fn vs_table() -> String {
     format!("{VS_NAME}.{}", E2E_TABLE.to_uppercase())
@@ -111,41 +76,26 @@ fn vs_labels_table() -> String {
     format!("{VS_NAME}.{}", E2E_TABLE_2.to_uppercase())
 }
 
-/// `fact_lineitem` — seeded by `seed_events` (via `seed_multi_table_join_extension`)
-/// alongside the `events`/`labels` tables, so it is already available under this
-/// file's `VS_NAME` without any extra setup. See `common/seed.rs` for its columns
-/// (`L_RETURNFLAG`, `L_QUANTITY`, `L_EXTENDEDPRICE`, ...) and row layout.
 fn vs_lineitem_table() -> String {
     format!("{VS_NAME}.{}", E2E_LINEITEM_TABLE.to_uppercase())
 }
 
-/// `dim_customer` / `fact_orders` — seeded by `seed_events` (via
-/// `seed_star_schema`) alongside `events`, so already available under this
-/// file's `VS_NAME`. Used ONLY for the #193 outer-join-decline re-push shape,
-/// which `events` (a single table with no FK relationship) cannot express.
+/// Used only for the #193 outer-join-decline shape, which `events` cannot express.
 fn vs_dim_table() -> String {
     format!("{VS_NAME}.{}", E2E_DIM_TABLE.to_uppercase())
 }
 
-/// `fact_orders` counterpart to [`vs_dim_table`] — same seeding, same scope.
 fn vs_fact_table() -> String {
     format!("{VS_NAME}.{}", E2E_FACT_TABLE.to_uppercase())
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
-/// The E2E projection + filter + LIMIT query returns the correct projected,
-/// filtered, capped rows.
+/// Scenario: projection + filter + LIMIT returns the correct projected, filtered, capped rows
 #[test]
 fn e2e_projection_filter_limit_returns_correct_rows() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // SELECT id, name, score FROM ... WHERE score > 15.0 LIMIT 5
-    // Seeded rows: id 1..20, score = 5.0*id. score > 15.0 → id >= 4 (17 rows).
-    // LIMIT 5 → first 5 matching: id 4,5,6,7,8 (scores 20,25,30,35,40).
+    // score = 5.0*id, so score > 15.0 is ids 4..=20 and LIMIT 5 yields ids 4..=8.
     let sql = format!(
         "SELECT id, name, score FROM {} WHERE score > 15.0 LIMIT 5",
         vs_table()
@@ -163,7 +113,6 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
         "expected exactly 5 rows from LIMIT 5: {cols:?}"
     );
 
-    // All returned scores must be > 15.0.
     let score_col = &cols[2];
     for score in score_col {
         let s = score
@@ -172,7 +121,6 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
         assert!(s > 15.0, "filter violated: score {s} <= 15.0");
     }
 
-    // IDs must be ascending and >= 4 (score = 5*id > 15 → id >= 4).
     // Exasol serializes DECIMAL(20,0) as a JSON string, so accept either form.
     let ids: Vec<i64> = id_col
         .iter()
@@ -186,7 +134,6 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
         ids.iter().all(|&id| id >= 4),
         "id < 4 appeared (score would be <= 15): {ids:?}"
     );
-    // Verify names match the expected pattern.
     let name_col = &cols[1];
     for (i, name) in name_col.iter().enumerate() {
         let expected_id = ids[i];
@@ -199,11 +146,8 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
         );
     }
 
-    // #193 regression: aliased FROM (`EVENTS e`) must resolve exactly like the
-    // unaliased query above, proving the aliased projection + filter + top-N
-    // shape strips the leaked `tableAlias` and resolves bare names. Ordering
-    // explicitly by score ASC pins the exact row set: with score = 5.0*id
-    // (seed.rs), the 5 lowest scores > 15.0 are ids 4..8.
+    // #193: an aliased FROM must resolve like the unaliased query, stripping the leaked
+    // `tableAlias`.
     let sql_aliased = format!(
         "SELECT e.id, e.name, e.score FROM {} e WHERE e.score > 15.0 ORDER BY e.score LIMIT 5",
         vs_table()
@@ -227,10 +171,7 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
          (ids 4..8, score = 5.0*id): {aliased_ids:?}"
     );
 
-    // #193 regression: a scalar select-list expression over an aliased column
-    // (`e.score + 1`) must render the bare "SCORE" name under the scan
-    // relation, not the leaked "E"."SCORE". Row count matches
-    // SEED_ROWS_SCORE_GT_15 and every value is the filtered score + 1.
+    // #193: `e.score + 1` must render the bare "SCORE" under the scan relation, not "E"."SCORE".
     let sql_expr = format!(
         "SELECT e.score + 1 FROM {} e WHERE e.score > 15.0",
         vs_table()
@@ -246,8 +187,7 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
         SEED_ROWS_SCORE_GT_15,
         "scalar expression query expected {SEED_ROWS_SCORE_GT_15} rows: {cols_expr:?}"
     );
-    // score = 5.0*id, so score + 1 always ends in .0 with score % 5.0 == 0,
-    // meaning (score + 1) % 5.0 == 1.0 — this fails if the `+ 1` is dropped.
+    // (score + 1) % 5.0 == 1.0 fails if the `+ 1` is dropped.
     for v in &cols_expr[0] {
         let plus_one = parse_numeric(v);
         assert_eq!(
@@ -257,11 +197,7 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
         );
     }
 
-    // #193 regression: an UNQUALIFIED filter column (`score`, no `e.` prefix)
-    // under an aliased FROM. Exasol still stamps `tableAlias:"E"` on this
-    // column node even though the user wrote no qualifier — the leak this
-    // fix targets. Row count must match the same SEED_ROWS_SCORE_GT_15 the
-    // unaliased/qualified cases above use.
+    // #193: Exasol stamps `tableAlias:"E"` even on an unqualified column under an aliased FROM.
     let row_count_unqualified = conn.query_row_count(&format!(
         "SELECT id FROM {} e WHERE score > 15.0",
         vs_table()
@@ -273,24 +209,21 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
     );
 }
 
-/// Create VS maps the Iceberg table schema to Exasol types correctly.
+/// Scenario: create VS maps the Iceberg table schema to Exasol types
 #[test]
 fn create_vs_maps_iceberg_schema() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // DESCRIBE returns (COLUMN_NAME, COLUMN_TYPE, ...).
     let sql = format!("DESCRIBE {}", vs_table());
     let resp = conn.execute(&sql);
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let cols = conn.fetch_result_columns(result_set);
 
-    // cols[0] = column names, cols[1] = column types.
     let names = &cols[0];
     let types = &cols[1];
     assert!(!names.is_empty(), "DESCRIBE returned no columns");
 
-    // Verify each expected column exists with the right type.
     let expected = [
         ("ID", "DECIMAL"),
         ("NAME", "VARCHAR"),
@@ -319,7 +252,7 @@ fn create_vs_maps_iceberg_schema() {
     }
 }
 
-/// Filter predicate restricts the emitted rows (no extra rows).
+/// Scenario: a filter predicate restricts the emitted rows
 #[test]
 fn scan_filter_restricts_rows() {
     setup_e2e();
@@ -333,7 +266,7 @@ fn scan_filter_restricts_rows() {
     );
 }
 
-/// LIMIT caps the rows emitted by the scan.
+/// Scenario: LIMIT caps the rows emitted by the scan
 #[test]
 fn scan_limit_caps_rows() {
     setup_e2e();
@@ -346,13 +279,12 @@ fn scan_limit_caps_rows() {
     );
 }
 
-/// Both entry points (adapter + scan) resolve from the same uploaded .so artifact.
+/// Scenario: adapter and scan entry points resolve from the same uploaded .so
 #[test]
 fn both_scripts_resolve_one_artifact() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Verify both scripts exist and point to the same .so object path.
     let resp_adapter = conn.execute(&format!(
         "SELECT SCRIPT_TEXT FROM EXA_ALL_SCRIPTS WHERE SCRIPT_NAME='{ADAPTER_SCRIPT_NAME}' AND SCRIPT_SCHEMA='{SCHEMA_NAME}'"
     ));
@@ -369,7 +301,6 @@ fn both_scripts_resolve_one_artifact() {
         .unwrap_or("")
         .to_string();
 
-    // Both script bodies must reference the same .so artifact path.
     assert!(
         adapter_body.contains("liblakehouse_engine.so") || adapter_body.contains("udf"),
         "adapter script body does not reference the .so: {adapter_body}"
@@ -380,30 +311,26 @@ fn both_scripts_resolve_one_artifact() {
     );
 }
 
-/// Full projection + filter + date/timestamp columns round-trip correctly.
+/// Scenario: full projection with date and timestamp columns round-trips correctly
 #[test]
 fn mixed_column_parquet_round_trips() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Select all columns for the first row (id=1) to verify type conversion.
     let cols = conn.query_columns(&format!(
         "SELECT id, name, score, event_date, event_ts FROM {} WHERE id = 1",
         vs_table()
     ));
     assert_eq!(cols.len(), 5, "expected 5 columns: {cols:?}");
-    // Each column has exactly 1 row.
     for (i, col) in cols.iter().enumerate() {
         assert_eq!(col.len(), 1, "column {i} should have 1 row: {col:?}");
     }
-    // id = 1 (Exasol returns numerics as strings or numbers).
     let id_val = &cols[0][0];
     assert!(
         id_val.as_i64().map(|v| v == 1).unwrap_or(false)
             || id_val.as_str().map(|s| s == "1").unwrap_or(false),
         "id should be 1, got: {id_val:?}"
     );
-    // name = "event-01".
     let name_val = &cols[1][0];
     assert!(
         name_val
@@ -412,7 +339,6 @@ fn mixed_column_parquet_round_trips() {
             .unwrap_or(false),
         "name should be 'event-01', got: {name_val:?}"
     );
-    // score = 5.0 (5.0 * 1).
     let score_val = &cols[2][0];
     assert!(
         score_val
@@ -422,22 +348,16 @@ fn mixed_column_parquet_round_trips() {
             || score_val.as_str().map(|s| s.contains('5')).unwrap_or(false),
         "score should be 5.0, got: {score_val:?}"
     );
-    // event_date and event_ts: non-null values.
     assert!(!cols[3][0].is_null(), "event_date must not be null");
     assert!(!cols[4][0].is_null(), "event_ts must not be null");
 }
 
-/// Error scenario: CREATE VS with unreachable catalog returns a clear error without secrets.
-///
-/// The secret value lives in the CONNECTION password JSON (not in the SQL).
-/// The test asserts the error message does not contain the credential values.
+/// Scenario: CREATE VS with an unreachable catalog errors clearly without leaking credentials
 #[test]
 fn create_vs_unreachable_catalog_errors_no_secret() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Create a CONNECTION with a bogus catalog URI and bogus credentials.
-    // The credential values must not appear in any error message.
     let bogus_password = common::stack::CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
         endpoint: "http://does-not-exist.invalid:9000".to_string(),
@@ -474,12 +394,7 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     );
 }
 
-/// A CONNECTION supplying a static `token` together with a complete OAuth2
-/// `client_id`/`client_secret` pair is rejected through the real Exasol +
-/// deployed `.so` path, not just the unit-level `StubCtx`.
-///
-/// Iceberg kind only: the Unity kind's equivalent ambiguity is already
-/// covered by the unit test `token_with_complete_oauth_pair_is_rejected_under_both_kinds`.
+/// Scenario: a CONNECTION with both a static token and a complete OAuth2 pair is rejected through the deployed .so
 #[test]
 fn create_vs_ambiguous_catalog_auth_errors_no_secret() {
     setup_e2e();
@@ -530,19 +445,12 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     );
 }
 
-/// Querying a non-existent virtual table name in the VS errors with a clear TABLE_MAP message.
-///
-/// With namespace enumeration, a table that does not exist in the namespace was never
-/// registered in TABLE_MAP. Any pushdown for such a name must fail with a clear error
-/// rather than silently scanning the wrong table.
+/// Scenario: querying a table absent from TABLE_MAP errors clearly instead of scanning another table
 #[test]
 fn scan_unknown_virtual_table_errors() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Querying a table name that was not in the namespace at create time will fail
-    // at the pushdown stage because the Exasol table name is not in TABLE_MAP.
-    // We exercise this by querying a VS table that we know does not exist.
     let resp = conn.try_execute(&format!("SELECT * FROM {VS_NAME}.NO_SUCH_TABLE LIMIT 1"));
     assert_eq!(
         resp["status"].as_str(),
@@ -551,26 +459,11 @@ fn scan_unknown_virtual_table_errors() {
     );
 }
 
-/// Schema evolution with a renamed column resolves correctly by Iceberg field-id.
-///
-/// Scenario (seeded by `seed_renamed_column`), field-id 2 stable throughout:
-///   - file A: ids 1..=5,  physical parquet column `score`
-///   - catalog rename `score` -> `rating` (field-id 2 preserved)
-///   - file B: ids 6..=10, physical parquet column `rating`
-///
-/// The VS is created with `PARALLELISM_FACTOR = 1` so that on this single-node
-/// cluster the shard count G = clamp(1 * 1, 1, min(file_count, 300)) = 1. Both
-/// files therefore land in ONE shard → one `ScanSpec` → one DataFusion
-/// `ListingTable`. The two divergent physical layouts (`score` vs `rating` for
-/// field-id 2) are handled by the field-id expression adapter, which binds both
-/// files to the current logical name by field-id rather than by physical name.
-///
-/// Expected result: `EVO_TOTAL_ROWS` (10) rows, `rating = 10*id`, no NULLs.
+/// Scenario: a renamed column resolves by Iceberg field-id across pre- and post-rename files in one shard
 #[test]
 fn e2e_renamed_column_resolves_by_field_id() {
     setup_e2e();
 
-    // Seed the dedicated evo table: create + file A (score) + rename + file B (rating).
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -583,10 +476,8 @@ fn e2e_renamed_column_resolves_by_field_id() {
 
     let mut conn = exa_conn();
 
-    // A dedicated VS created AFTER evo exists, so the adapter enumerates it
-    // (the shared MY_LAKEHOUSE VS was created before evo and does not see it).
-    // PARALLELISM_FACTOR = 1 forces a single shard (G = 1 on this 1-node cluster),
-    // so both parquet files are scanned together in one ListingTable.
+    // Created after `evo` exists so the adapter enumerates it. PARALLELISM_FACTOR = 1 puts
+    // both files in one shard, so one ListingTable sees both physical layouts.
     let _ = conn.try_execute("DROP VIRTUAL SCHEMA IF EXISTS EVO_VS CASCADE");
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA EVO_VS
@@ -630,27 +521,11 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     }
 }
 
-/// Added columns absent from a pre-existing data file return their Iceberg
-/// `initial-default`; the same columns return real values where they are present.
-///
-/// Scenario (seeded by `seed_added_columns_initial_default`), Iceberg
-/// column-projection rule (3):
-///   - file A: ids `EVO_INITDEF_PRE_ADD_IDS`, physical parquet has only `id`
-///   - catalog `add-schema`: one column per primitive type (field-ids 2..=11),
-///     each with an `initial-default`; `c_bool` REQUIRED, the rest NULLABLE
-///   - file B: ids `EVO_INITDEF_POST_ADD_IDS`, all columns with real values
-///
-/// `PARALLELISM_FACTOR = 1` forces one shard, so both files land in one
-/// `ListingTable`. The per-file field-id adapter must, for the pre-add file, fill
-/// each absent added column with its `initial-default` (required AND nullable),
-/// and for the post-add file bind the real written values — never defaulting a
-/// present field. Asserted across ALL added primitive types.
+/// Scenario: added columns return their initial-default for a pre-add file and real values for a post-add file
 #[test]
 fn e2e_added_columns_initial_default_fill_all_types() {
     setup_e2e();
 
-    // Seed the dedicated initdef table: create + file A (id only) + add-columns +
-    // file B (all columns with real values).
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -663,9 +538,8 @@ fn e2e_added_columns_initial_default_fill_all_types() {
 
     let mut conn = exa_conn();
 
-    // A dedicated VS created AFTER initdef exists so the adapter enumerates it.
-    // PARALLELISM_FACTOR = 1 forces a single shard (G = 1 on this 1-node cluster),
-    // so both parquet files are scanned together in one ListingTable.
+    // Created after `initdef` exists so the adapter enumerates it. PARALLELISM_FACTOR = 1
+    // puts both files in one shard.
     let _ = conn.try_execute("DROP VIRTUAL SCHEMA IF EXISTS INITDEF_VS CASCADE");
     conn.execute(&format!(
         r#"CREATE VIRTUAL SCHEMA INITDEF_VS
@@ -744,46 +618,22 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     }
 }
 
-/// Verify the suite panics (not silently passes) when Exasol is unreachable.
-///
-/// This test is a behavioural assertion: if the connect helpers get a bad host,
-/// they panic/unwrap, which causes the test binary to abort — NOT return Ok.
-/// We verify the behaviour by showing the panic path is reachable.
+/// Scenario: connecting to an unreachable Exasol panics rather than returning Ok
 #[test]
 fn e2e_fails_when_stack_unavailable() {
-    // The design contract: ExaConn::connect panics on TCP failure.
-    // We verify the contract is enforced by asserting that attempting to connect
-    // to a known-bad address would panic. We do NOT actually panic here (that
-    // would fail the test), but we verify the function body takes the panic path.
-    //
-    // The real enforcement is that every test calls setup_e2e(), which calls
-    // wait_for_exasol() which panics on timeout — this test documents the contract.
-    let result = std::panic::catch_unwind(|| {
-        // This MUST panic — ExaConn::connect on a bad address panics, never returns Err.
-        ExaConn::connect("192.0.2.1", 8563, "sys", "exasol")
-    });
+    let result = std::panic::catch_unwind(|| ExaConn::connect("192.0.2.1", 8563, "sys", "exasol"));
     assert!(
         result.is_err(),
         "ExaConn::connect to an unreachable host must panic, not return Ok"
     );
 }
 
-// ---------------------------------------------------------------------------
-// Task 5.4 / Plan scenario coverage: partial-aggregate E2E stubs
-// Group D fills in the assertions; we define the function names here so the
-// plan's scenario table can reference them and they compile without the feature.
-// ---------------------------------------------------------------------------
-
-/// Scan computes a node-local partial aggregate instead of raw rows.
-///
-/// Verifies: spec with aggregate plan causes the UDF to emit one partial row
-/// per shard, not the full row set.
+/// Scenario: the scan emits node-local partial aggregates instead of raw rows
 #[test]
 fn scan_emits_partial_aggregate_row() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // COUNT(*) over the whole table: one merged row with the total row count.
     let cols = conn.query_columns(&format!("SELECT COUNT(*) FROM {}", vs_table()));
     assert_eq!(cols.len(), 1, "COUNT(*) must return one column: {cols:?}");
     assert_eq!(cols[0].len(), 1, "COUNT(*) must return one row: {cols:?}");
@@ -791,19 +641,16 @@ fn scan_emits_partial_aggregate_row() {
         .as_i64()
         .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| panic!("COUNT(*) result not integer: {:?}", cols[0][0]));
-    // The seeded table has 20 rows.
     assert_eq!(count, 20, "COUNT(*) should return 20 for the seeded table");
 }
 
-/// Partial COUNT/SUM/MIN/MAX emitted in merge-ready form.
-///
-/// Verifies: each aggregate type returns the correct merged scalar.
+/// Scenario: partial COUNT/SUM/MIN/MAX merge to the correct scalars
 #[test]
 fn partial_count_sum_min_max_merge_ready() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // score = 5.0 * id for id 1..20; SUM = 5*(1+2+...+20) = 5*210 = 1050.
+    // SUM(score) = 5 * (1 + ... + 20) = 1050.
     let cols = conn.query_columns(&format!(
         "SELECT COUNT(*), SUM(score), MIN(score), MAX(score) FROM {}",
         vs_table()
@@ -844,15 +691,12 @@ fn partial_count_sum_min_max_merge_ready() {
     );
 }
 
-/// AVG emitted as a partial sum and partial count pair.
-///
-/// Verifies: AVG(score) returns the correct average, including with a WHERE filter.
+/// Scenario: AVG is emitted as a partial sum and count and merges correctly, with and without a filter
 #[test]
 fn partial_avg_emits_sum_count_pair() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // AVG(score) over all rows: 1050.0 / 20 = 52.5.
     let cols = conn.query_columns(&format!("SELECT AVG(score) FROM {}", vs_table()));
     assert_eq!(cols.len(), 1, "AVG must return one column: {cols:?}");
     let avg = cols[0][0]
@@ -864,9 +708,7 @@ fn partial_avg_emits_sum_count_pair() {
         "AVG(score) must be 52.5, got {avg}"
     );
 
-    // AVG with WHERE: score > 15.0 → id >= 4 (17 rows), scores 20..100.
-    // SUM = 5*(4+5+...+20) = 5*(17*12) = 5*204... actually sum of 4..20 = (4+20)*17/2 = 204,
-    // so SUM(score) = 5*204 = 1020, AVG = 1020/17 = 60.0.
+    // score > 15.0 is ids 4..=20: SUM = 5 * 204 = 1020, AVG = 60.0.
     let cols_filtered = conn.query_columns(&format!(
         "SELECT AVG(score) FROM {} WHERE score > 15.0",
         vs_table()
@@ -881,16 +723,7 @@ fn partial_avg_emits_sum_count_pair() {
     );
 }
 
-/// `AVG`/`STDDEV` over a non-`DOUBLE` column: `typed_distinct_probe`'s seeded
-/// bare `long` `id` column, plus its `c_decimal_a`/`c_decimal_b`
-/// (`DECIMAL(9,2)`/`DECIMAL(20,4)`) columns.
-///
-/// Unit tests already sweep the `AvgSum`/`StatSum`/`StatSumSq`
-/// partial-aggregate coercion mismatch across every `ExaType` variant; this
-/// is the first place it runs end to end against a real Exasol Docker
-/// container over a non-`DOUBLE` column (issue #399). Expected values come
-/// from `common::seed::typed_*_avg_stddev`, computed from the SAME data the
-/// fixture seeds, never a hand-written constant.
+/// Scenario: AVG/STDDEV over BIGINT and DECIMAL columns match the seed-derived oracle (#399)
 #[test]
 fn partial_avg_stddev_over_non_double_columns() {
     setup_e2e();
@@ -920,15 +753,8 @@ fn partial_avg_stddev_over_non_double_columns() {
     }
 }
 
-/// Runs `EXPLAIN VIRTUAL` for a single-group (no GROUP BY) aggregate query and
-/// asserts the pushed SQL evidences single-group aggregate pushdown — an
-/// `aggregates` field in the scan spec — rather than a raw row-scan fallback
-/// that would ship every projected column to Exasol for it to aggregate itself.
-///
-/// Mirrors [`assert_group_by_pushed_down`]'s pattern for the single-group
-/// (non-GROUP-BY) aggregate path: `aggregates` (not `group_keys`) is this
-/// path's discriminating field, since single-group partial aggregation also
-/// emits `PARTIAL_` columns but never a `group_keys` array.
+/// `aggregates`, not `group_keys`, is the discriminating field: single-group partial
+/// aggregation also emits `PARTIAL_` columns but never `group_keys`.
 fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
     let resp = conn.execute(&explain_sql);
@@ -954,25 +780,7 @@ fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str
     );
 }
 
-/// Regression guard for issue #145: the `LAKEHOUSE_SCAN` common scan spec for
-/// a single-group (no GROUP BY) aggregate query MUST report an empty
-/// `projection` field, both for a bare `COUNT(*)` and a `SUM(score)`.
-///
-/// The aggregate-dispatch path builds its query from `aggregates`/`group_keys`,
-/// never from `projection` (see the doc comment on
-/// [`CommonScanSpec::projection`](lakehouse_engine::scan::spec::CommonScanSpec)),
-/// so `handle_pushdown` leaves it empty rather than splicing in the full
-/// base-table column list `extract_projection` would otherwise fall back to —
-/// that full-row splice is exactly what the reporter observed in #145.
-///
-/// Matches the precise, field-shaped `"projection":[]` marker against the
-/// adapter's OWN emitted scan-spec JSON, mirroring the `"order_by":` marker in
-/// [`ordered_topn_pushes_down_matches_single_node`]: `CommonScanSpec::projection`
-/// has no `skip_serializing_if`, so an empty vector always serializes as
-/// `"projection":[]`, and the common blob is spliced into the pushed SQL via
-/// `sql_string_literal`, which only doubles single quotes — the JSON's double
-/// quotes reach the pushed SQL text unescaped, so the un-escaped substring is
-/// the correct, confirmed marker (not an assumption).
+/// Scenario: a single-group aggregate's common scan spec carries an empty projection (#145)
 #[test]
 fn single_group_aggregate_scan_spec_projection_is_empty() {
     setup_e2e();
@@ -998,12 +806,7 @@ fn single_group_aggregate_scan_spec_projection_is_empty() {
     }
 }
 
-/// `SUM(LENGTH(col))` — an aggregate over a scalar expression argument, not a
-/// bare column — is pushed down as node-local partial aggregation instead of
-/// falling back to a raw row-scan.
-///
-/// `name` = "event-NN" for every seeded row (fixed 8-character format), so
-/// `SUM(LENGTH(name))` over all `SEED_TOTAL_ROWS` rows is `8 * SEED_TOTAL_ROWS`.
+/// Scenario: SUM(LENGTH(col)) is pushed down as node-local partial aggregation
 #[test]
 fn sum_length_expression_argument_pushed_down() {
     setup_e2e();
@@ -1025,32 +828,7 @@ fn sum_length_expression_argument_pushed_down() {
     );
 }
 
-/// `SUM(id * score)` — a SUM over a two-column binary-arithmetic argument
-/// (the NQ1 / TPC-H Q6 shape: `SUM(L_EXTENDEDPRICE * L_DISCOUNT)` with a
-/// date-range + BETWEEN + comparison filter) — is pushed down as a decomposed
-/// node-local partial/merge aggregate (`aggregates` + `arg_expr` in the scan
-/// spec), and the merged result across shards matches the value a single,
-/// undecomposed full-table scan would compute.
-///
-/// The `events` table is seeded across TWO Iceberg data files (ids 1..=10,
-/// 11..=20; see `common/seed.rs`), so this filter range is chosen to
-/// deliberately straddle both shards — proving the per-shard partial SUM of
-/// the product, merged back together, is not just plan-shape-correct but
-/// numerically correct across a shard boundary.
-///
-/// Filter shape mirrors NQ1 (`bench/run.sh`): a date range on `event_date`
-/// (mirrors `L_SHIPDATE`), a `BETWEEN` on `score` (mirrors `L_DISCOUNT`, which
-/// is also a product operand — same as NQ1), and a `<=` comparison on `id`
-/// (mirrors `L_QUANTITY <`).
-///
-/// Seeded data: `score = 5.0 * id`. `event_date >= '2024-01-05' AND
-/// event_date < '2024-01-15'` selects ids 5..=14; `score BETWEEN 30.0 AND
-/// 60.0` narrows to ids 6..=12; `id <= 12` is redundant (shape parity with
-/// NQ1's extra predicate). The "single-node" ground truth for `SUM(id *
-/// score)` over ids 6..=12 is `SUM(5 * id^2)` for id in 6..=12 = `5 * (36 +
-/// 49 + 64 + 81 + 100 + 121 + 144)` = `5 * 595` = `2975.0` — computed here as
-/// a closed form, i.e. exactly what a single, undecomposed scan of all
-/// matching rows would sum to, with no partial/merge step involved.
+/// Scenario: SUM(id * score) with an NQ1-shaped filter straddling both shards merges to the single-scan value
 #[test]
 fn sum_two_column_product_pushes_down_matches_single_node() {
     setup_e2e();
@@ -1094,23 +872,7 @@ fn sum_two_column_product_pushes_down_matches_single_node() {
     );
 }
 
-/// Regression check: an aggregate argument the VS expression translator
-/// genuinely cannot render must still decline aggregate pushdown and fall
-/// back to row scanning — proving the new arithmetic-pushdown capability
-/// (`FN_ADD`/`FN_SUB`/`FN_MULT`/`FN_FLOAT_DIV`) did not accidentally widen
-/// what counts as "translatable" in a way that breaks this safety net.
-///
-/// `BIT_AND` is a real Exasol scalar function (bitwise AND over two numeric
-/// values, see Exasol SQL reference) with no `vs-expression` translation arm
-/// — `render_expression_inner`'s `function_scalar` match falls through to its
-/// `other => Err("unsupported scalar function: ...")` arm, so `SUM(BIT_AND(id,
-/// 7))`'s argument cannot be rendered and the whole aggregate declines
-/// pushdown (`arg_column_or_expr` returns `None`).
-///
-/// The row-scan fallback must still compute the correct answer: seeded
-/// `id` runs 1..=20, so `id & 7` cycles `1,2,3,4,5,6,7,0` twice (ids 1..=8,
-/// 9..=16, each summing to 28) plus a partial cycle for ids 17..=20
-/// (`1+2+3+4` = 10), for a total of `28 + 28 + 10` = `66`.
+/// Scenario: an untranslatable aggregate argument (BIT_AND) declines aggregate pushdown and the row-scan fallback is correct
 #[test]
 fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
     setup_e2e();
@@ -1138,24 +900,7 @@ fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
     );
 }
 
-/// `ORDER BY score DESC LIMIT 12` — a bare, projected sort column with a LIMIT
-/// (the NQ4 / TPC-H top-N shape: `ORDER BY L_EXTENDEDPRICE DESC LIMIT 20`) — is
-/// pushed down as a decomposed per-shard bounded top-N plus an Exasol-side
-/// merge (`order_by` in the scan spec, `ORDER BY … LIMIT` in both the per-shard
-/// and outer merge SQL), and the merged result matches what a single, full
-/// scan + sort + limit would produce.
-///
-/// The `events` table is seeded across TWO Iceberg data files (ids 1..=10,
-/// 11..=20; see `common/seed.rs`). `LIMIT 12` is chosen deliberately so the
-/// top-12 by score DESC (ids 20..=9) straddles BOTH files — ids 9 and 10 come
-/// from the first file, ids 11..=20 from the second — proving the per-shard
-/// bounded top-N, merged back together, is not just plan-shape-correct but
-/// also correct across a real shard boundary (not merely a single shard's own
-/// local top-N happening to be the global answer).
-///
-/// Seeded data: `score = 5.0 * id` for id in 1..=20, so score is strictly
-/// increasing in id — the top-12 by score DESC is exactly ids 20,19,...,9, in
-/// that descending order, with score = 5.0 * id for each row.
+/// Scenario: ORDER BY score DESC LIMIT 12 straddling both files pushes a per-shard top-N and matches a single full scan
 #[test]
 fn ordered_topn_pushes_down_matches_single_node() {
     setup_e2e();
@@ -1167,20 +912,15 @@ fn ordered_topn_pushes_down_matches_single_node() {
     );
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
-    // `EXPLAIN VIRTUAL`'s output also echoes Exasol's incoming `pushdownRequest`,
-    // whose `orderBy` element carries a literal `"order_by_element"` type tag —
-    // that string is present for ANY ORDER-BY-carrying query, matched or not, so
-    // a bare `contains("order_by")` would be a false positive here. The precise,
-    // field-shaped marker `"order_by":` only appears in the ADAPTER'S OWN emitted
-    // scan-spec JSON (`"order_by":[{"column":"SCORE",...}]`), which is present
-    // only when `detect_topn` actually matched.
+    // Exasol's echoed `pushdownRequest` carries an `"order_by_element"` tag for any
+    // ORDER BY query, so only the field-shaped `"order_by":` marker proves the adapter's
+    // own scan spec matched.
     assert!(
         pushed_sql.contains("\"order_by\":"),
         "ORDER BY score DESC LIMIT 12 over a projected column must push down \
          as an 'order_by' top-N plan in the scan spec, got:\n{pushed_sql}"
     );
-    // The outer merge ORDER BY is self-contained (decision [5]): spliced directly
-    // after the shard fan-out's closing paren, not left to an Exasol backstop.
+    // The outer merge ORDER BY is spliced after the fan-out, not left to an Exasol backstop.
     assert!(
         pushed_sql.contains("GROUP BY shard_key) ORDER BY"),
         "pushed SQL must carry a self-contained outer ORDER BY immediately \
@@ -1219,32 +959,7 @@ fn ordered_topn_pushes_down_matches_single_node() {
     }
 }
 
-/// Regression check: `ORDER BY score DESC` with NO `LIMIT` must decline the
-/// ordered-top-N pushdown — `detect_topn` requires a `limit` to be present
-/// (decision: the shape is "single table, no GROUP BY/aggregates/HAVING,
-/// limit present with a zero (or absent) offset, ...") — and fall back to
-/// the pre-existing plan, relying on Exasol's own backstop `ORDER BY` for
-/// correctness. This
-/// proves the new top-N capability did not silently widen what counts as
-/// "matched" in a way that breaks the existing, unchanged fallback behavior
-/// for a plain (unbounded) sort.
-///
-/// Confirmed live (see below) that this decline shape IS safe today: when
-/// Exasol's pushdown request carries `orderBy` but no `limit` at all (because
-/// the query has no LIMIT), Exasol keeps its own top-level `ORDER BY` operator
-/// and re-sorts the adapter's returned (unsorted) rows itself — unlike the
-/// `orderBy` + `limit`-together case, where Exasol fully delegates both to the
-/// returned SQL and does not re-apply either if the adapter declines. (That
-/// latter shape — `ORDER BY <unprojected column> LIMIT n` — was verified live
-/// during this task to return WRONG, unsorted/unbounded results today because
-/// the withheld-limit fallback assumes an Exasol backstop that does not
-/// actually run once `ORDER_BY_COLUMN` is advertised; see the decision log /
-/// review notes for `add-topn-pushdown` B5 — this is a real gap in B3/B3b's
-/// "withhold the limit, Exasol re-applies" invariant, tracked separately from
-/// this regression test, which intentionally exercises a shape that IS safe.)
-///
-/// Same seeded data as the match case: the fallback's answer must still be
-/// every id, fully sorted by score DESC (20,19,...,1).
+/// Scenario: ORDER BY without LIMIT declines top-N pushdown and Exasol re-sorts the rows itself
 #[test]
 fn order_by_without_limit_falls_back_correctly() {
     setup_e2e();
@@ -1253,11 +968,7 @@ fn order_by_without_limit_falls_back_correctly() {
     let sql = format!("SELECT id, score FROM {} ORDER BY score DESC", vs_table());
 
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
-    // Use the precise field-shaped marker (see the comment in
-    // `ordered_topn_pushes_down_matches_single_node`): a bare `contains("order_by")`
-    // would false-positive on Exasol's echoed `pushdownRequest.orderBy[].type ==
-    // "order_by_element"`, which is present for ANY ORDER-BY query regardless of
-    // whether the adapter's own scan spec ends up carrying an `order_by` field.
+    // Field-shaped marker: a bare `contains("order_by")` false-positives on Exasol's echo.
     assert!(
         !pushed_sql.contains("\"order_by\":"),
         "ORDER BY with no LIMIT must decline the ordered-top-N pushdown \
@@ -1278,9 +989,8 @@ fn order_by_without_limit_falls_back_correctly() {
         "no LIMIT means all 20 rows must be returned: {cols:?}"
     );
 
-    // Exasol must re-apply the ORDER BY itself (the adapter's returned SQL
-    // carries no ORDER BY when the shape is unmatched) — all 20 ids in
-    // descending score order.
+    // With `orderBy` but no `limit` in the request, Exasol keeps its own ORDER BY operator
+    // and re-sorts the adapter's unsorted rows.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     let expected_ids: Vec<i64> = (1..=20).rev().collect();
     assert_eq!(
@@ -1290,19 +1000,7 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
-/// After createVirtualSchema the schema's adapterNotes carry PARALLELISM_FACTOR,
-/// but no NR_OF_CORES or CLUSTER_NODES key: `pushdown` reads the node count live
-/// from `UdfContext::node_count()` per request, and nothing reads the per-node
-/// core count back — the adapter discards it once budgets are derived.
-///
-/// Queries SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES — the observable catalog
-/// column for adapter-controlled schema state. Exasol does NOT persist
-/// adapter-returned schemaMetadata.properties (they are silently dropped and
-/// never appear in any catalog view), so the adapter carries its persisted
-/// properties in adapterNotes (a JSON string), which Exasol DOES persist and
-/// surface here.
-///
-/// (The view is keyed by SCHEMA_NAME, confirmed against the live DB.)
+/// Scenario: adapterNotes carry PARALLELISM_FACTOR but no NR_OF_CORES or CLUSTER_NODES
 #[test]
 fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     setup_e2e();
@@ -1349,14 +1047,7 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     );
 }
 
-/// The adapter VM's core count comes from the Exasol container's CPU set, not
-/// the unconstrained host: a probe VS created with `PARALLELISM_FACTOR = '1'`
-/// records the detected core count unchanged as `DF_THREADS_PER_UDF`, read back
-/// from the container's own cgroup rather than this process's environment.
-///
-/// Replaces `adapter_detects_container_cpu_quota`, which used a CFS bandwidth
-/// quota instead — invisible to the UDF sandbox since it mounts no cgroup
-/// filesystem; a CPU affinity limit does reach it.
+/// Scenario: the adapter VM's core count comes from the Exasol container's CPU set, not the host
 #[test]
 fn adapter_detects_container_cpuset() {
     setup_e2e();
@@ -1407,10 +1098,7 @@ fn adapter_detects_container_cpuset() {
     );
 }
 
-/// Number of CPUs the Exasol container's effective CPU set names, read from
-/// `/sys/fs/cgroup/cpuset.cpus.effective` inside the container (a
-/// comma-separated list of CPU ids and inclusive ranges, e.g. `0-1` or
-/// `0,2-3`) rather than from this process's environment.
+/// Read inside the container rather than from this process's environment.
 fn exasol_container_cpuset_cores() -> usize {
     let container = exasol_container();
     let path = "/sys/fs/cgroup/cpuset.cpus.effective";
@@ -1453,28 +1141,7 @@ fn exasol_container_cpuset_cores() -> usize {
         .sum()
 }
 
-/// Even with CLUSTER_NODES no longer persisted in adapterNotes,
-/// `EXPLAIN VIRTUAL` over a multi-file scan against the (now note-free)
-/// virtual schema still produces the `LAKEHOUSE_DISTRIBUTE_FILES` shard
-/// fan-out — i.e. dropping the persisted note did not break shard-fan-out
-/// emission: `pushdown` still plans the fan-out with no adapterNotes node
-/// count available.
-///
-/// This test cannot distinguish the handshake node-count source
-/// (`UdfContext::node_count()`, captured in `dispatch` and threaded through
-/// as `cluster_nodes`) from the pre-refactor absent-note default: the
-/// `events` fixture commits exactly two data files, which clamps
-/// `shard_count` to 2 for every node count >= 1, so the fan-out markers below
-/// are insensitive to the node count by construction on this single-node
-/// suite. The plan's `parallelism/work-unit-sharding (GATE: four-node
-/// staging)` manual check is the only one that distinguishes a correctly
-/// read four-node count from the `0 => 1` floor.
-///
-/// Uses the same fan-out marker style as
-/// `ordered_topn_pushes_down_matches_single_node`: the literal
-/// `AS shards(shard_key, files) GROUP BY shard_key)` string is the adapter's
-/// own emitted fan-out SQL, not an echo of Exasol's pushdown request, so it
-/// is a precise, non-false-positive marker.
+/// Scenario: with no node count in adapterNotes, a multi-file scan still emits the shard fan-out
 #[test]
 fn pushdown_shards_from_handshake_node_count_without_note() {
     setup_e2e();
@@ -1495,16 +1162,12 @@ fn pushdown_shards_from_handshake_node_count_without_note() {
     );
 }
 
-/// COUNT(col) aggregate pushdown returns the correct non-null row count.
-///
-/// Verifies COUNT(score) and COUNT(score) WHERE score > 15.0, covering the
-/// COUNT(col) case not exercised by existing COUNT(*) tests.
+/// Scenario: COUNT(col) pushdown returns the correct non-null row count, with and without a filter
 #[test]
 fn aggregate_count_col_returns_correct_value() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // COUNT(score) over all rows: all 20 rows have non-null score.
     let cols = conn.query_columns(&format!("SELECT COUNT(score) FROM {}", vs_table()));
     assert_eq!(
         cols.len(),
@@ -1522,7 +1185,6 @@ fn aggregate_count_col_returns_correct_value() {
         .unwrap_or_else(|| panic!("COUNT(score) result not integer: {:?}", cols[0][0]));
     assert_eq!(count_all, 20, "COUNT(score) must be 20 (all rows non-null)");
 
-    // COUNT(score) WHERE score > 15.0 → 17 rows (SEED_ROWS_SCORE_GT_15).
     let cols_filtered = conn.query_columns(&format!(
         "SELECT COUNT(score) FROM {} WHERE score > 15.0",
         vs_table()
@@ -1541,7 +1203,6 @@ fn aggregate_count_col_returns_correct_value() {
         "COUNT(score) WHERE score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, got {count_filtered}"
     );
 
-    // COUNT(*) WHERE score > 15.0 — also verifies the WHERE path for COUNT(*).
     let cols_star = conn.query_columns(&format!(
         "SELECT COUNT(*) FROM {} WHERE score > 15.0",
         vs_table()
@@ -1555,11 +1216,7 @@ fn aggregate_count_col_returns_correct_value() {
         "COUNT(*) WHERE score > 15.0 must be {SEED_ROWS_SCORE_GT_15}, got {count_star}"
     );
 
-    // #193 regression: the same COUNT(e.score) / COUNT(*) aggregates over an
-    // ALIASED FROM, with the filter column qualified by the alias. Expected
-    // values are the SAME SEED_ROWS_SCORE_GT_15 the unaliased case above
-    // asserts, proving alias stripping leaves single-group aggregate
-    // pushdown (aggregate args + filter) unchanged.
+    // #193: alias stripping must leave single-group aggregate pushdown unchanged.
     let cols_aliased_col = conn.query_columns(&format!(
         "SELECT COUNT(e.score) FROM {} e WHERE e.score > 15.0",
         vs_table()
@@ -1602,11 +1259,8 @@ fn aggregate_count_col_returns_correct_value() {
          got {count_aliased_star}"
     );
 
-    // #193 regression: a GROUP BY under an aliased FROM (group key + aggregate
-    // argument both alias-qualified). Grouping by the near-unique `id` under
-    // the same `e.score > 15.0` filter yields exactly SEED_ROWS_SCORE_GT_15
-    // groups (one per matching id), each with COUNT(e.score) == 1 — proving
-    // alias stripping applies to GROUP BY keys, not just filters/aggregates.
+    // #193: alias stripping must also apply to GROUP BY keys; grouping by `id` yields one
+    // group per matching row.
     let cols_grouped = conn.query_columns(&format!(
         "SELECT e.id, COUNT(e.score) FROM {} e WHERE e.score > 15.0 GROUP BY e.id",
         vs_table()
@@ -1635,20 +1289,7 @@ fn aggregate_count_col_returns_correct_value() {
     }
 }
 
-/// #193 regression: a declined outer join re-pushes a PLAIN single-table scan
-/// carrying the alias filter. The join gate hard-declines LEFT/RIGHT/FULL
-/// joins (see `pushdown-planning-join-fallback`); Exasol then falls back to
-/// executing the join itself over two adapter-returned single-table scans,
-/// each still carrying its own alias (`c`, `o`) on the WHERE filter. This is
-/// the one shape `events` cannot express (it has no FK relationship to join
-/// against), so it reuses the existing `dim_customer`/`fact_orders` star
-/// schema fixture instead of the events fixture the other cases use.
-///
-/// Every order's `O_CUSTKEY` cycles `1..=DIM_CUSTOMER_ROWS` across the seeded
-/// orders, so each of `C_CUSTKEY` 1, 2, 3 matches `FACT_ORDERS_ROWS /
-/// DIM_CUSTOMER_ROWS` orders and every customer has at least one order (no
-/// NULL-extended rows) — the LEFT JOIN filtered to `C_CUSTKEY <= 3` therefore
-/// yields exactly `3 * (FACT_ORDERS_ROWS / DIM_CUSTOMER_ROWS)` rows.
+/// Scenario: a declined outer join re-pushes plain single-table scans carrying the alias filter (#193)
 #[test]
 fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
     setup_e2e();
@@ -1677,13 +1318,7 @@ fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
     );
 }
 
-/// A multi-shard fan-out query returns the complete, non-overlapping row set.
-///
-/// The test Exasol stack is single-node so partition_files yields one shard at
-/// runtime; true cross-node file placement is exercised only on a real multi-node
-/// cluster. On the single-node stack this test asserts the union-completeness
-/// invariant: the fan-out/union path returns every row exactly once with no gaps
-/// and no duplicates — the correctness property that multi-shard sharding guarantees.
+/// Scenario: the fan-out path returns every row exactly once, with no gaps or duplicates
 #[test]
 fn multi_shard_row_query_matches_single_shard() {
     setup_e2e();
@@ -1716,26 +1351,12 @@ fn multi_shard_row_query_matches_single_shard() {
     }
 }
 
-/// A multi-file scan through the VS returns correct rows end-to-end with the
-/// reshaped `(path, size)` + `table_root` payload: the adapter resolves the file
-/// list once, byte-balances it into shards carrying `(relative-or-absolute path,
-/// byte-size)` entries under a table root serialized once in the common blob, and
-/// each fanned-out UDF reconstructs the absolute URIs and registers ONLY its
-/// assigned files. Proving every file across every shard is scanned exactly once
-/// (no gaps, no duplicates) with fully correct column values exercises the new
-/// payload through the real fan-out.
-///
-/// The generated fan-out SQL shape — table root carried ONCE in the common
-/// literal and per-shard `[[path, size], ...]` literals — is asserted host-side
-/// (no DB) by the pushdown unit test
-/// `fan_out_carries_root_once_and_path_size_tuples_per_shard`.
+/// Scenario: a multi-file scan with the `(path, size)` + `table_root` payload scans every file exactly once with correct values
 #[test]
 fn scan_registers_assigned_files_with_path_size_payload() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Full projection over the whole (multi-file) table. Seeded rows: id 1..20,
-    // name carries the zero-padded id, score = 5.0 * id.
     let sql = format!("SELECT id, name, score FROM {} ORDER BY id", vs_table());
     let cols = conn.query_columns(&sql);
     assert_eq!(
@@ -1766,8 +1387,7 @@ fn scan_registers_assigned_files_with_path_size_payload() {
             "id at position {pos} must be {expected}, got {id} (a file was missed or double-scanned)"
         );
 
-        // score = 5.0 * id — proves the data (not just the row count) is correct
-        // for the file this row came from.
+        // Proves the data, not just the row count, is correct for the file each row came from.
         let score = cols[2][pos]
             .as_f64()
             .unwrap_or_else(|| panic!("score not f64: {:?}", cols[2][pos]));
@@ -1777,7 +1397,6 @@ fn scan_registers_assigned_files_with_path_size_payload() {
             5.0 * expected as f64
         );
 
-        // name carries the zero-padded id.
         let name = cols[1][pos]
             .as_str()
             .unwrap_or_else(|| panic!("name not string: {:?}", cols[1][pos]));
@@ -1788,52 +1407,18 @@ fn scan_registers_assigned_files_with_path_size_payload() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Phase 5 — GROUP BY E2E tests
-//
-// Seed recap (20 rows, id=1..20):
-//   score  = 5.0 * id   (5.0, 10.0, ..., 100.0)
-//   name   = "event-NN"
-//   event_date = 2024-01-01 + (id-1) days
-//   event_ts   = 2024-01-01T00:00:00Z + (id-1) hours
-//
-// Group-key derivations used below:
-//   MOD(id, 4) → groups {0,1,2,3}, 5 rows each
-//   MOD(id, 2) × MOD(id, 4) × WHERE score > 50 → 4 groups across 10 rows
-//   CAST(score / 25.0 AS DECIMAL(4,0)) → groups {0,1,2,3,4} with sizes 2,5,5,5,3
-//     (Exasol CAST-to-DECIMAL rounds half away from zero)
-//   id → 20 groups, 1 row each (high cardinality / spill path)
-//   NULLIF(MOD(id, 5), 0) → groups {1,2,3,4,NULL}, sizes 4,4,4,4,4
-// ---------------------------------------------------------------------------
+// GROUP BY E2E tests. Seed: id 1..=20, score = 5.0 * id. Exasol's CAST to DECIMAL
+// rounds half away from zero, giving `CAST(score / 25.0 AS DECIMAL(4,0))` groups
+// {0..4} of sizes 2,5,5,5,3.
 
-/// Runs `EXPLAIN VIRTUAL` for a GROUP BY query and asserts the pushed SQL
-/// evidences a grouped partial-aggregate pushdown — not the raw row-scan
-/// fallback that Exasol would otherwise aggregate itself.
-///
-/// The real, shard-count-independent evidence of grouped pushdown is the
-/// `group_keys` field inside the `LAKEHOUSE_SCAN` scan spec: the grouped
-/// partial-aggregate path emits `"group_keys":[...]` (and the `PARTIAL_`
-/// aggregate-column prefix), while the raw-scan fallback emits neither.
-///
-/// `GROUP BY shard_key` is deliberately NOT used as the discriminator: that
-/// inner fan-out only appears when the scan spreads over MULTIPLE shards. When
-/// a WHERE filter prunes the file list to a SINGLE file/shard, grouped
-/// pushdown still occurs — it emits `... SUM("PARTIAL_...") ... GROUP BY
-/// "GK_0", "GK_1"` with no `GROUP BY shard_key` — so asserting on it would
-/// false-negative any legitimately pushed-down, single-shard grouped query.
-///
-/// Asserts: the pushed SQL contains `group_keys` and the `PARTIAL_` partial-
-/// aggregate column prefix (grouped pushdown occurred), contains no `IPROC()`
-/// (legacy, non-oversubscribed sharding), and is not a raw `SELECT * FROM
-/// (SELECT ...)` row-scan wrapper (which would mean the multi-key GROUP BY
-/// silently fell back instead of being pushed down as partial aggregation).
+/// Checks `group_keys` and the `PARTIAL_` prefix, not `GROUP BY shard_key`: a filter
+/// pruning to a single shard still pushes grouped aggregation but has no shard fan-out.
 fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     let explain_sql = format!("EXPLAIN VIRTUAL {query_sql}");
     let resp = conn.execute(&explain_sql);
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let cols = conn.fetch_result_columns(result_set);
 
-    // Flatten all returned text fragments into one string for pattern checks.
     let pushed_sql: String = cols
         .iter()
         .flat_map(|col| col.iter())
@@ -1862,21 +1447,7 @@ fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     );
 }
 
-/// Regression guard for issue #145: the `LAKEHOUSE_SCAN` common scan spec for
-/// a genuinely decomposed GROUP BY query (single key, real grouped
-/// partial-aggregate pushdown — NOT the undecomposable single-table raw-scan
-/// fallback `build_qualified_single_table_fallback_sql` falls back to, which
-/// legitimately carries a non-empty `projection`) MUST also report an empty
-/// `projection` field.
-///
-/// The grouped path builds its query from `group_keys`/`aggregates`, never
-/// from `projection` (see the doc comment on
-/// [`CommonScanSpec::projection`](lakehouse_engine::scan::spec::CommonScanSpec)),
-/// so leaving it empty is accurate — mirrors
-/// [`single_group_aggregate_scan_spec_projection_is_empty`] for the grouped
-/// dispatch path. [`assert_group_by_pushed_down`] confirms real grouped
-/// pushdown occurred (not the raw-scan fallback) before the `"projection":[]`
-/// marker is checked.
+/// Scenario: a decomposed GROUP BY query's common scan spec carries an empty projection (#145)
 #[test]
 fn grouped_aggregate_scan_spec_projection_is_empty() {
     setup_e2e();
@@ -1898,15 +1469,7 @@ fn grouped_aggregate_scan_spec_projection_is_empty() {
     );
 }
 
-/// GROUP BY returns correct per-group COUNT(*) and SUM(score).
-///
-/// Key: MOD(id, 4) — four equal-sized groups (5 rows each).
-///
-/// Expected:
-///   group 0 (id=4,8,12,16,20):  count=5, sum_score=300.0
-///   group 1 (id=1,5,9,13,17):   count=5, sum_score=225.0
-///   group 2 (id=2,6,10,14,18):  count=5, sum_score=250.0
-///   group 3 (id=3,7,11,15,19):  count=5, sum_score=275.0
+/// Scenario: GROUP BY MOD(id, 4) returns correct per-group COUNT(*) and SUM(score)
 #[test]
 fn test_group_by_sum_count() {
     setup_e2e();
@@ -1920,7 +1483,6 @@ fn test_group_by_sum_count() {
     assert_eq!(cols.len(), 3, "expected 3 columns: {cols:?}");
     assert_eq!(cols[0].len(), 4, "expected 4 groups: {cols:?}");
 
-    // Expected values sorted by group key 0..3.
     let expected_counts = [5i64, 5, 5, 5];
     let expected_sums = [300.0f64, 225.0, 250.0, 275.0];
 
@@ -1939,7 +1501,6 @@ fn test_group_by_sum_count() {
         );
     }
 
-    // Total rows across all groups = 20.
     let total: i64 = cols[1].iter().map(parse_int).sum();
     assert_eq!(
         total, 20,
@@ -1947,15 +1508,7 @@ fn test_group_by_sum_count() {
     );
 }
 
-/// Two GROUP BY keys with a WHERE filter returns correct per-group row counts.
-///
-/// Keys: MOD(id, 4) × MOD(id, 2), filter: score > 50.0 (id=11..20, 10 rows).
-///
-/// Expected 4 groups:
-///   (0, 0): id=12,16,20       → count=3
-///   (1, 1): id=13,17          → count=2
-///   (2, 0): id=14,18          → count=2
-///   (3, 1): id=11,15,19       → count=3
+/// Scenario: two GROUP BY keys with a WHERE filter return correct per-group row counts
 #[test]
 fn test_group_by_multi_key_with_filter() {
     setup_e2e();
@@ -1968,23 +1521,18 @@ fn test_group_by_multi_key_with_filter() {
         vs_table()
     );
 
-    // Pushdown-occurred assertion: multi-key GROUP BY (with a WHERE filter)
-    // must be pushed down as shard-key fan-out partial aggregation, not the
-    // raw row-scan fallback.
     assert_group_by_pushed_down(&mut conn, &sql);
 
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 3, "expected 3 columns: {cols:?}");
     assert_eq!(cols[0].len(), 4, "expected 4 distinct groups: {cols:?}");
 
-    // Total rows across all groups = 10 (id=11..20).
     let total: i64 = cols[2].iter().map(parse_int).sum();
     assert_eq!(
         total, 10,
         "total COUNT(*) across all groups must be 10 (id=11..20), got {total}"
     );
 
-    // No group can have more than 3 rows (id range 11..20 across 4 buckets).
     for (i, v) in cols[2].iter().enumerate() {
         let c = parse_int(v);
         assert!(
@@ -1994,18 +1542,7 @@ fn test_group_by_multi_key_with_filter() {
     }
 }
 
-/// GROUP BY a scalar expression key returns correct per-group counts.
-///
-/// Key expression: CAST(score / 25.0 AS DECIMAL(4,0)) — supported arithmetic (FLOAT_DIV) + CAST.
-///
-/// Exasol's CAST-to-DECIMAL rounds half away from zero. For scores 5..100 in
-/// steps of 5, score/25 = 0.2, 0.4, ..., 4.0, which rounds to:
-///   key 0: scores {5,10}             → count=2
-///   key 1: scores {15,20,25,30,35}   → count=5
-///   key 2: scores {40,45,50,55,60}   → count=5
-///   key 3: scores {65,70,75,80,85}   → count=5
-///   key 4: scores {90,95,100}        → count=3
-/// (2+5+5+5+3 = 20.)
+/// Scenario: GROUP BY a CAST(score / 25.0 AS DECIMAL(4,0)) expression key returns correct per-group counts
 #[test]
 fn test_group_by_expression_key() {
     setup_e2e();
@@ -2022,7 +1559,6 @@ fn test_group_by_expression_key() {
     assert_eq!(cols.len(), 2, "expected 2 columns (key, count): {cols:?}");
     assert_eq!(cols[0].len(), 5, "expected 5 groups: {cols:?}");
 
-    // Sort (key, count) pairs by key so the test is robust to row ordering.
     let mut pairs: Vec<(i64, i64)> = cols[0]
         .iter()
         .zip(cols[1].iter())
@@ -2043,7 +1579,6 @@ fn test_group_by_expression_key() {
         );
     }
 
-    // Total = 20.
     let total: i64 = pairs.iter().map(|(_, c)| *c).sum();
     assert_eq!(
         total, 20,
@@ -2051,15 +1586,7 @@ fn test_group_by_expression_key() {
     );
 }
 
-/// AVG(score) per group is correct for groups with unequal row counts.
-///
-/// Key expression: CAST(score / 25.0 AS DECIMAL(4,0)) — Exasol rounds half away
-/// from zero, so score/25 (0.2..4.0) buckets into groups of sizes 2,5,5,5,3:
-///   key 0 (scores {5,10}):              AVG = 15.0 / 2  = 7.5
-///   key 1 (scores {15,20,25,30,35}):    AVG = 125.0 / 5 = 25.0
-///   key 2 (scores {40,45,50,55,60}):    AVG = 250.0 / 5 = 50.0
-///   key 3 (scores {65,70,75,80,85}):    AVG = 375.0 / 5 = 75.0
-///   key 4 (scores {90,95,100}):         AVG = 285.0 / 3 = 95.0
+/// Scenario: AVG(score) per group is correct for groups with unequal row counts
 #[test]
 fn test_group_by_avg_correctness() {
     setup_e2e();
@@ -2076,7 +1603,6 @@ fn test_group_by_avg_correctness() {
     assert_eq!(cols.len(), 2, "expected 2 columns (key, avg): {cols:?}");
     assert_eq!(cols[0].len(), 5, "expected 5 groups: {cols:?}");
 
-    // Sort (key, avg) pairs by key so the test is robust to row ordering.
     let mut pairs: Vec<(i64, f64)> = cols[0]
         .iter()
         .zip(cols[1].iter())
@@ -2098,10 +1624,7 @@ fn test_group_by_avg_correctness() {
     }
 }
 
-/// GROUP BY a near-unique column (id) completes with correct per-group counts.
-///
-/// Exercises the high-cardinality path: 20 distinct groups, each with exactly one row.
-/// Verifies the memory-pool + spill backstop does not crash at high group cardinality.
+/// Scenario: GROUP BY a near-unique column completes under the memory-pool and spill backstop
 #[test]
 fn test_high_cardinality_group_by_spill() {
     setup_e2e();
@@ -2120,7 +1643,6 @@ fn test_high_cardinality_group_by_spill() {
         cols[0].len()
     );
 
-    // Every group must have exactly one row (id is unique).
     for (i, v) in cols[1].iter().enumerate() {
         let count = parse_int(v);
         assert_eq!(
@@ -2131,7 +1653,6 @@ fn test_high_cardinality_group_by_spill() {
         );
     }
 
-    // IDs must be 1..20 in order.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     for (pos, &id) in ids.iter().enumerate() {
         let expected = (pos + 1) as i64;
@@ -2142,26 +1663,20 @@ fn test_high_cardinality_group_by_spill() {
     }
 }
 
-/// EXPLAIN VIRTUAL shows shard_key fan-out and no IPROC() in the pushed SQL.
-///
-/// Verifies: the VS generates `GROUP BY shard_key` (oversubscribed fan-out)
-/// and never falls back to the legacy `IPROC()` node-count sharding.
+/// Scenario: EXPLAIN VIRTUAL shows the shard_key fan-out and no IPROC()
 #[test]
 fn test_shard_key_fanout_explain() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // EXPLAIN VIRTUAL returns the pushdown SQL as a single-column result set.
     let sql = format!(
         "EXPLAIN VIRTUAL SELECT id, COUNT(*) FROM {} GROUP BY id",
         vs_table()
     );
     let resp = conn.execute(&sql);
-    // Collect all text from the result set — each element is a fragment of the SQL.
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let cols = conn.fetch_result_columns(result_set);
 
-    // Flatten all returned text fragments into one string for pattern checks.
     let pushed_sql: String = cols
         .iter()
         .flat_map(|col| col.iter())
@@ -2183,20 +1698,13 @@ fn test_shard_key_fanout_explain() {
     );
 }
 
-/// NULL group keys are grouped together consistently.
-///
-/// Key: NULLIF(MOD(id, 5), 0) — multiples of 5 (id=5,10,15,20) yield NULL.
-/// Non-null groups are {1,2,3,4}, each with 4 rows; NULL group also has 4 rows.
-///
-/// Seed has no nullable columns; NULL is produced via NULLIF expression.
+/// Scenario: NULL group keys produced by NULLIF are grouped together consistently
 #[test]
 fn test_group_by_null_key_grouping() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // NULLIF(MOD(id, 5), 0): id=5,10,15,20 → 0 → NULL; id=1..4 → 1..4; etc.
-    // Non-null groups: 1 (id=1,6,11,16), 2 (id=2,7,12,17), 3 (id=3,8,13,18), 4 (id=4,9,14,19)
-    // NULL group: id=5,10,15,20 → 4 rows
+    // id = 5, 10, 15, 20 yield the NULL group; every group has 4 rows.
     let sql = format!(
         "SELECT NULLIF(MOD(id, 5), 0), COUNT(*) \
          FROM {} \
@@ -2206,14 +1714,12 @@ fn test_group_by_null_key_grouping() {
     );
     let cols = conn.query_columns(&sql);
     assert_eq!(cols.len(), 2, "expected 2 columns (key, count): {cols:?}");
-    // 5 groups: {1,2,3,4,NULL}
     assert_eq!(
         cols[0].len(),
         5,
         "expected 5 groups (1,2,3,4,NULL): {cols:?}"
     );
 
-    // All groups have exactly 4 rows.
     for (i, v) in cols[1].iter().enumerate() {
         let count = parse_int(v);
         assert_eq!(
@@ -2222,24 +1728,20 @@ fn test_group_by_null_key_grouping() {
         );
     }
 
-    // Total rows = 20.
     let total: i64 = cols[1].iter().map(parse_int).sum();
     assert_eq!(
         total, 20,
         "total rows across all groups must be 20, got {total}"
     );
 
-    // Exactly one group key must be NULL (the multiples-of-5 group).
-    // We scan for null entries rather than asserting a fixed position, because
-    // the ORDER BY NULLS LAST may not survive the GROUP BY pushdown — position
-    // is not guaranteed across execution paths.
+    // ORDER BY NULLS LAST may not survive the GROUP BY pushdown, so the NULL key's position
+    // is not asserted.
     let null_count = cols[0].iter().filter(|v| v.is_null()).count();
     assert_eq!(
         null_count, 1,
         "exactly one NULL group key must exist (multiples of 5): {cols:?}"
     );
 
-    // Find the null group's count and verify it is 4.
     let null_group_count = cols[0]
         .iter()
         .zip(cols[1].iter())
@@ -2252,20 +1754,7 @@ fn test_group_by_null_key_grouping() {
     );
 }
 
-/// Aggregate placed before the group key in the select list (GitHub #33 repro).
-///
-/// `SELECT SUM(score), MOD(id, 4) ... GROUP BY MOD(id, 4)` — the aggregate is
-/// select-list position 0, the group key is position 1. Before the fix, the
-/// adapter always emitted keys first in the outer merge SELECT, transposing
-/// this query's columns relative to `selectListDataTypes` and failing with a
-/// "Data type mismatch in column number 1" error. Values must match the
-/// already-correct key-first form (`test_group_by_sum_count`).
-///
-/// Key: MOD(id, 4) — four equal-sized groups (5 rows each).
-///   group 0 (id=4,8,12,16,20):  sum_score=300.0
-///   group 1 (id=1,5,9,13,17):   sum_score=225.0
-///   group 2 (id=2,6,10,14,18):  sum_score=250.0
-///   group 3 (id=3,7,11,15,19):  sum_score=275.0
+/// Scenario: an aggregate before the group key in the select list keeps its column position (#33)
 #[test]
 fn test_group_by_agg_before_key() {
     setup_e2e();
@@ -2279,7 +1768,6 @@ fn test_group_by_agg_before_key() {
     assert_eq!(cols.len(), 2, "expected 2 columns (sum, key): {cols:?}");
     assert_eq!(cols[0].len(), 4, "expected 4 groups: {cols:?}");
 
-    // Sort (key, sum) pairs by key so the test is robust to row ordering.
     let mut pairs: Vec<(i64, f64)> = cols[1]
         .iter()
         .zip(cols[0].iter())
@@ -2300,7 +1788,6 @@ fn test_group_by_agg_before_key() {
         );
     }
 
-    // Total across all groups = 5.0 * (1+2+...+20) = 1050.0.
     let total: f64 = pairs.iter().map(|(_, s)| *s).sum();
     assert!(
         (total - 1050.0).abs() < 0.01,
@@ -2308,19 +1795,7 @@ fn test_group_by_agg_before_key() {
     );
 }
 
-/// Interleaved multi-key GROUP BY: a group key, an aggregate, then a second
-/// group key — `SELECT MOD(id,4), SUM(score), MOD(id,2) ... GROUP BY MOD(id,4), MOD(id,2)`.
-///
-/// Select-list order is key(0), agg(1), key(2), which does not match either the
-/// keys-first or aggregate-first outer-SELECT ordering — exercising general
-/// positional reassembly rather than either single-swap special case.
-///
-/// Groups (16 combinations possible; only even/odd-consistent pairs occur since
-/// MOD(id,4) mod 2 == MOD(id,2)):
-///   (0,0): id=4,8,12,16,20  → sum=300.0
-///   (1,1): id=1,5,9,13,17   → sum=225.0
-///   (2,0): id=2,6,10,14,18  → sum=250.0
-///   (3,1): id=3,7,11,15,19  → sum=275.0
+/// Scenario: an interleaved key, aggregate, key select list is reassembled positionally
 #[test]
 fn test_group_by_interleaved_multi_key() {
     setup_e2e();
@@ -2331,9 +1806,6 @@ fn test_group_by_interleaved_multi_key() {
         vs_table()
     );
 
-    // Pushdown-occurred assertion: interleaved multi-key GROUP BY must be
-    // pushed down as shard-key fan-out partial aggregation, not the raw
-    // row-scan fallback.
     assert_group_by_pushed_down(&mut conn, &sql);
 
     let cols = conn.query_columns(&sql);
@@ -2344,7 +1816,6 @@ fn test_group_by_interleaved_multi_key() {
     );
     assert_eq!(cols[0].len(), 4, "expected 4 groups: {cols:?}");
 
-    // Sort (key1, sum, key2) triples by key1 so the test is robust to row ordering.
     let mut rows: Vec<(i64, f64, i64)> = cols[0]
         .iter()
         .zip(cols[1].iter())
@@ -2375,7 +1846,6 @@ fn test_group_by_interleaved_multi_key() {
         );
     }
 
-    // Total across all groups = 1050.0.
     let total: f64 = rows.iter().map(|(_, s, _)| *s).sum();
     assert!(
         (total - 1050.0).abs() < 0.01,
@@ -2383,16 +1853,7 @@ fn test_group_by_interleaved_multi_key() {
     );
 }
 
-/// Expression group key placed after an aggregate — `SELECT COUNT(*), MOD(id,4)
-/// ... GROUP BY MOD(id,4)` — and the key column's declared type must survive
-/// as its resolved DECIMAL type, not fall back to VARCHAR.
-///
-/// Guards against the secondary fragility described in the plan: resolving a
-/// group key's declared type by rendered-string comparison silently defaults
-/// to VARCHAR(2000000) if detection and lookup disagree; the fix resolves the
-/// type by select-list index instead.
-///
-/// Key: MOD(id, 4) — four equal-sized groups (5 rows each), counts of 5 each.
+/// Scenario: an expression group key after an aggregate keeps its resolved DECIMAL type, not VARCHAR
 #[test]
 fn test_group_by_expr_key_after_agg() {
     setup_e2e();
@@ -2404,7 +1865,6 @@ fn test_group_by_expr_key_after_agg() {
     );
     let resp = conn.execute(&sql);
 
-    // Assert the key column (position 1) carries a DECIMAL data type, not VARCHAR.
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
     let column_type = result_set["columns"][1]["dataType"]["type"]
         .as_str()
@@ -2418,7 +1878,6 @@ fn test_group_by_expr_key_after_agg() {
     assert_eq!(cols.len(), 2, "expected 2 columns (count, key): {cols:?}");
     assert_eq!(cols[0].len(), 4, "expected 4 groups: {cols:?}");
 
-    // Sort (key, count) pairs by key so the test is robust to row ordering.
     let mut pairs: Vec<(i64, i64)> = cols[1]
         .iter()
         .zip(cols[0].iter())
@@ -2444,42 +1903,12 @@ fn test_group_by_expr_key_after_agg() {
     );
 }
 
-/// Aggregate-first GROUP BY combined with HAVING — covers four HAVING shapes
-/// against the same EVENTS fixture (per-group `SUM(score)` = {0: 300.0, 1:
-/// 225.0, 2: 250.0, 3: 275.0}; 5 rows per `MOD(id,4)` group, 20 rows total,
-/// seeded `name` values `event-01`..`event-20`, all unique):
-///
-/// 1. **Matched control** — `SELECT SUM(score), MOD(id,4) ... HAVING
-///    SUM(score) > 250.0`, the aggregate ahead of the group key in the select
-///    list. The HAVING aggregate is selected, so this decomposes into the
-///    accelerated grouped partial/merge pushdown.
-/// 2. **Unmatched aggregate** (issue #195) — `SELECT MOD(id,4), COUNT(*) ...
-///    HAVING SUM(score) > 250.0`. `SUM(score)` is not in the select list, so
-///    `render_having_over_merge` cannot rewrite it over the merge; the request
-///    falls back to the qualified single-table wrapper (`LHS_T0`) instead of
-///    hard-erroring at `EXPLAIN VIRTUAL` time.
-/// 3. **Mixed AND junction** — same select list, `HAVING COUNT(*) > 0 AND
-///    SUM(score) > 250.0`. Only one conjunct matches a selected aggregate;
-///    the whole junction is unrenderable over the merge, so this also falls
-///    back to the wrapper.
-/// 4. **`COUNT(DISTINCT)` in HAVING** (issue #195's own repro shape) —
-///    `HAVING COUNT(DISTINCT name) > 4`/`> 5`. `parse_agg_item` rejects
-///    `distinct: true` unconditionally, so this is a third route to the same
-///    unrenderable-HAVING fallback. All `name` values are unique per group of
-///    5, so every group has exactly 5 distinct names: `> 4` keeps all 4
-///    groups and `> 5` keeps none — the pair that proves the HAVING was
-///    actually applied rather than silently dropped (a dropped HAVING would
-///    return all 4 groups for both thresholds).
-///
-/// Cases 2 and 3 assert the fallback shape inline via `explain_virtual_sql`:
-/// the pushed SQL must contain `LHS_T0` and must not contain `PARTIAL_`.
+/// Scenario: aggregate-first GROUP BY with matched, unmatched, mixed-junction, and COUNT(DISTINCT) HAVING shapes (#195)
 #[test]
 fn test_group_by_agg_first_with_having() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Case 1: matched control — HAVING aggregate is selected, decomposes into
-    // the accelerated grouped pushdown. Unchanged from before this fix.
     let sql = format!(
         "SELECT SUM(score), MOD(id, 4) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
         vs_table()
@@ -2492,7 +1921,6 @@ fn test_group_by_agg_first_with_having() {
         "HAVING SUM(score) > 250.0 must keep exactly 2 groups (0 and 3): {cols:?}"
     );
 
-    // Sort (key, sum) pairs by key so the test is robust to row ordering.
     let mut pairs: Vec<(i64, f64)> = cols[1]
         .iter()
         .zip(cols[0].iter())
@@ -2517,8 +1945,8 @@ fn test_group_by_agg_first_with_having() {
         );
     }
 
-    // Case 2: unmatched aggregate — SUM(score) is not selected, so the merge
-    // rewrite cannot find it. MUST succeed via the wrapper fallback, not error.
+    // Case 2: SUM(score) is not selected, so the merge rewrite cannot find it and the
+    // query must succeed via the wrapper fallback.
     let unmatched_sql = format!(
         "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) HAVING SUM(score) > 250.0",
         vs_table()
@@ -2555,9 +1983,8 @@ fn test_group_by_agg_first_with_having() {
          COUNT(*) = 5: {unmatched_pairs:?}"
     );
 
-    // Case 3: mixed AND junction — one conjunct matches a selected aggregate,
-    // the other does not. The whole junction is unrenderable over the merge,
-    // so this must also fall back to the wrapper with the same result.
+    // Case 3: only one conjunct matches a selected aggregate, so the whole junction falls
+    // back to the wrapper.
     let mixed_sql = format!(
         "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
          HAVING COUNT(*) > 0 AND SUM(score) > 250.0",
@@ -2595,9 +2022,8 @@ fn test_group_by_agg_first_with_having() {
          COUNT(*) = 5: {mixed_pairs:?}"
     );
 
-    // Case 4: COUNT(DISTINCT) in HAVING (issue #195's own repro shape). Every
-    // group has exactly 5 distinct `name` values, so `> 4` keeps all 4 groups
-    // and `> 5` keeps none — the pair that proves the HAVING was applied.
+    // Case 4: every group has 5 distinct names, so `> 4` keeps all groups and `> 5` keeps
+    // none, proving the HAVING was applied rather than dropped.
     let distinct_sql = format!(
         "SELECT MOD(id, 4), COUNT(*) FROM {} GROUP BY MOD(id, 4) \
          HAVING COUNT(DISTINCT name) > 4",
@@ -2636,21 +2062,7 @@ fn test_group_by_agg_first_with_having() {
     );
 }
 
-/// Expression-valued multi-key tuple GROUP BY — every key element is itself an
-/// expression (not a bare column): `MOD(id, 4)` and `UPPER(name)`. Verifies
-/// correct per-group counts, that each key's declared type survives instead of
-/// falling back to the VARCHAR(2000000) default, and that the GROUP BY is
-/// pushed down as a grouped partial aggregation.
-///
-/// The two keys are deliberately of DIFFERENT types — key 0 is `MOD(id, 4)`
-/// (DECIMAL) and key 1 is `UPPER(name)` (VARCHAR) — so this test genuinely
-/// exercises per-index, mixed-type independence: a bug that shared one key's
-/// type across both indices would surface here as a wrong column type.
-///
-/// The seeded `name` values (`event-01` … `event-20`) are unique, so each
-/// (`MOD(id,4)`, `UPPER(name)`) pair identifies exactly one row: 20 groups, one
-/// row each. Grouping by `MOD(id, 4)` first buckets the ids, and `UPPER(name)`
-/// (`EVENT-NN`) then distinguishes every row within a bucket.
+/// Scenario: an expression-valued multi-key GROUP BY with mixed key types keeps each key's declared type
 #[test]
 fn test_group_by_expr_multi_key_tuple() {
     setup_e2e();
@@ -2662,17 +2074,11 @@ fn test_group_by_expr_multi_key_tuple() {
         vs_table()
     );
 
-    // Pushdown-occurred assertion: expression-valued multi-key GROUP BY must
-    // be pushed down as grouped partial aggregation.
     assert_group_by_pushed_down(&mut conn, &sql);
 
     let resp = conn.execute(&sql);
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
 
-    // Per-index, mixed-type independence: key 0 (`MOD(id, 4)`) carries DECIMAL
-    // and key 1 (`UPPER(name)`) carries VARCHAR — each key's declared type
-    // survives independently, neither collapsing to the other's type nor to a
-    // fallback.
     for (i, label, expected_type) in [(0, "MOD(id, 4)", "DECIMAL"), (1, "UPPER(name)", "VARCHAR")] {
         let column_type = result_set["columns"][i]["dataType"]["type"]
             .as_str()
@@ -2695,7 +2101,6 @@ fn test_group_by_expr_multi_key_tuple() {
         "expected 20 groups (one per unique name): {cols:?}"
     );
 
-    // Sort (key1, key2, count) triples so the test is robust to row ordering.
     let mut rows: Vec<(i64, String, i64)> = cols[0]
         .iter()
         .zip(cols[1].iter())
@@ -2747,14 +2152,7 @@ fn test_group_by_expr_multi_key_tuple() {
     );
 }
 
-/// Multi-key GROUP BY combined with HAVING and LIMIT — both must apply only in
-/// the outer merge wrapper (never per-shard), so the LIMIT caps the number of
-/// *groups* returned, not rows scanned per shard.
-///
-/// Keys: `MOD(id, 4)` × `MOD(id, 3)` (12 groups; `SUM(score)` per group).
-/// Groups satisfying `HAVING SUM(score) > 100.0`:
-///   (0,2)=140.0  (1,2)=110.0  (2,0)=120.0  (3,1)=130.0
-/// `LIMIT 2` must cap the result to exactly 2 of these 4 qualifying groups.
+/// Scenario: multi-key GROUP BY with HAVING and LIMIT caps the number of groups in the outer merge
 #[test]
 fn test_group_by_multi_key_having_limit() {
     setup_e2e();
@@ -2766,9 +2164,6 @@ fn test_group_by_multi_key_having_limit() {
         vs_table()
     );
 
-    // Pushdown-occurred assertion: multi-key GROUP BY with HAVING and LIMIT
-    // must be pushed down as shard-key fan-out partial aggregation, not the
-    // raw row-scan fallback (HAVING/LIMIT results are correct either way).
     assert_group_by_pushed_down(&mut conn, &sql);
 
     let cols = conn.query_columns(&sql);
@@ -2783,9 +2178,6 @@ fn test_group_by_multi_key_having_limit() {
         "LIMIT 2 must cap the result to exactly 2 groups: {cols:?}"
     );
 
-    // Every returned group must both satisfy HAVING and match one of the
-    // known-qualifying (key1, key2) -> sum pairs (not just an arbitrary
-    // over-threshold value).
     let qualifying: [((i64, i64), f64); 4] = [
         ((0, 2), 140.0),
         ((1, 2), 110.0),
@@ -2817,12 +2209,7 @@ fn test_group_by_multi_key_having_limit() {
     }
 }
 
-/// High-cardinality multi-key GROUP BY completes under the bounded memory
-/// pool — a tuple key (`id`, `MOD(id, 2)`) exercises the same near-unique key
-/// space as the single-key spill test, but through the multi-key GK_0/GK_1
-/// path, proving the bounded-pool/spill backstop is not single-key-only.
-///
-/// 20 distinct (id, MOD(id,2)) groups, each with exactly one row.
+/// Scenario: a high-cardinality multi-key GROUP BY completes under the bounded memory pool
 #[test]
 fn test_high_cardinality_multi_key_group_by_spill() {
     setup_e2e();
@@ -2833,8 +2220,6 @@ fn test_high_cardinality_multi_key_group_by_spill() {
         vs_table()
     );
 
-    // Pushdown-occurred assertion: even the high-cardinality multi-key case
-    // must go through shard-key fan-out partial aggregation.
     assert_group_by_pushed_down(&mut conn, &sql);
 
     let cols = conn.query_columns(&sql);
@@ -2850,7 +2235,6 @@ fn test_high_cardinality_multi_key_group_by_spill() {
         cols[0].len()
     );
 
-    // Every group must have exactly one row (id is unique).
     for (i, v) in cols[2].iter().enumerate() {
         let count = parse_int(v);
         assert_eq!(
@@ -2861,7 +2245,6 @@ fn test_high_cardinality_multi_key_group_by_spill() {
         );
     }
 
-    // IDs must be 1..20 in order, and MOD(id,2) must be consistent with id.
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     let mods: Vec<i64> = cols[1].iter().map(parse_int).collect();
     for (pos, (&id, &m)) in ids.iter().zip(mods.iter()).enumerate() {
@@ -2879,36 +2262,12 @@ fn test_high_cardinality_multi_key_group_by_spill() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Plan `fix-scalar-over-aggregate-grouped-pushdown` (#82) — single-table
-// scalar-over-aggregate GROUP BY E2E tests
-//
-// `fact_lineitem` (seeded by `seed_events`, see `common/seed.rs`): 20 rows
-// across 2 files, `L_RETURNFLAG` alternating "R"/"N" (row 1 = "R", so 10 R
-// rows + 10 N rows), `L_QUANTITY` and `L_EXTENDEDPRICE` deterministic per row.
-//
-// Before the fix, a single-table grouped select list containing a scalar
-// function wrapping aggregates (e.g. `ROUND(100.0 * SUM(CASE …)/COUNT(*), 2)`)
-// made `detect_group_by_aggregates` decline the whole request, falling through
-// to a bare raw row-scan that hard-fails with SQL state 04000 ("Expected
-// number of columns is N but pushdown query has M"). These tests exercise
-// that exact shape end-to-end through the VS and check the result against a
-// native (non-virtual) ground-truth table built from the same source columns.
-// ---------------------------------------------------------------------------
+// Single-table scalar-over-aggregate GROUP BY (#82), checked against a native
+// ground-truth table built from the same `fact_lineitem` columns.
 
-/// Native (non-virtual) table the ground truth is materialized into — see
-/// [`ensure_ground_truth_lineitem_table`]. Named distinctly from
-/// `e2e_join_test.rs`'s own ground-truth table (same schema, different test
-/// binary) to keep the two files' fixtures unambiguous.
+/// Named distinctly from `e2e_join_test.rs`'s ground-truth table to keep fixtures unambiguous.
 const GROUND_TRUTH_LINEITEM_SCAN_TABLE: &str = "GROUND_TRUTH_LINEITEM_SCAN";
 
-/// Materialize the `fact_lineitem` columns the scalar-over-aggregate ground
-/// truth needs into a NATIVE Exasol table (in the same schema as the adapter
-/// scripts), via a plain projection over the virtual `fact_lineitem` table.
-///
-/// `CREATE OR REPLACE TABLE` is idempotent, so both tests below can safely
-/// share and re-run this under the suite's `--test-threads=1` serial
-/// execution.
 fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
     conn.execute(&format!(
         "CREATE OR REPLACE TABLE {SCHEMA_NAME}.{GROUND_TRUTH_LINEITEM_SCAN_TABLE} AS \
@@ -2917,16 +2276,11 @@ fn ensure_ground_truth_lineitem_table(conn: &mut ExaConn) {
     ));
 }
 
-/// #82's exact select list: a plain group key, two plain aggregates, and a
-/// scalar function (`ROUND`) wrapping a `SUM(CASE …)` and a `COUNT(*)`.
 fn scalar_over_aggregate_round_select_list() -> &'static str {
     "L_RETURNFLAG, SUM(L_QUANTITY), AVG(L_EXTENDEDPRICE), \
      ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG='R' THEN 1 ELSE 0 END)/COUNT(*), 2)"
 }
 
-/// Collects the distinct `{i}` suffixes following `marker` in `haystack` (e.g.
-/// every distinct index `i` in occurrences of `"PARTIAL_count_{i}"`), without
-/// pulling in a regex dependency for a single fixed-prefix scan.
 fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::BTreeSet<String> {
     let mut indices = std::collections::BTreeSet::new();
     let mut rest = haystack;
@@ -2941,13 +2295,7 @@ fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::
     indices
 }
 
-/// #82's query — a single-table grouped select list with a scalar function
-/// (`ROUND`) wrapping a `SUM(CASE …)` and a `COUNT(*)` — runs green through
-/// the VS (no `04000` column-count-mismatch hard-fail) and pushes down as the
-/// merged grouped partial/merge wrapper (`assert_group_by_pushed_down`: no
-/// `SELECT * FROM (…)` row-scan wrapper), matching the same select list
-/// evaluated over a native (non-virtual) copy of the same `fact_lineitem`
-/// columns.
+/// Scenario: a single-table grouped select list with ROUND over aggregates pushes down as the grouped merge wrapper and is correct (#82)
 #[test]
 fn test_group_by_scalar_over_aggregate_round() {
     setup_e2e();
@@ -2959,9 +2307,6 @@ fn test_group_by_scalar_over_aggregate_round() {
         vs_lineitem_table()
     );
 
-    // Pushdown-occurred assertion: the scalar-over-aggregate item must not
-    // send the grouped path down the bare-row-scan fallback (the pre-fix
-    // 04000 bug) — it must be the merged grouped partial/merge wrapper.
     assert_group_by_pushed_down(&mut conn, &sql);
 
     let actual = conn.query_columns(&sql);
@@ -3024,12 +2369,7 @@ fn test_group_by_scalar_over_aggregate_round() {
     }
 }
 
-/// A grouped select list carrying BOTH a bare `COUNT(*)` and a scalar function
-/// wrapping a `COUNT(*)` (`ROUND(100.0 * SUM(CASE …)/COUNT(*), 2)`) must
-/// decompose the shared `COUNT(*)` into exactly ONE deduplicated partial
-/// column (one `PARTIAL_count_{i}` index across the whole pushed SQL) rather
-/// than one partial column per occurrence — and must still compute the
-/// correct result, matching the native ground truth.
+/// Scenario: a bare COUNT(*) and a scalar-wrapped COUNT(*) share one deduplicated partial column
 #[test]
 fn test_group_by_shared_inner_aggregate_dedup() {
     setup_e2e();
@@ -3114,14 +2454,7 @@ fn test_group_by_shared_inner_aggregate_dedup() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Task 2.14 — multi-table VS tests
-// ---------------------------------------------------------------------------
-
-/// Create VS with NAMESPACE enumerates all tables in the namespace.
-///
-/// Asserts that both `EVENTS` and `LABELS` appear in `SYS.EXA_ALL_TABLES` for
-/// the virtual schema — one Exasol virtual table per Iceberg table in the namespace.
+/// Scenario: create VS with NAMESPACE enumerates every table in the namespace
 #[test]
 fn e2e_create_vs_enumerates_namespace_tables() {
     setup_e2e();
@@ -3149,11 +2482,7 @@ fn e2e_create_vs_enumerates_namespace_tables() {
     );
 }
 
-/// Pushdown derives the scanned Iceberg table from involvedTables[0].name.
-///
-/// Queries the second table (LABELS) directly and asserts correct rows are
-/// returned — proving that pushdown looked up the Iceberg identifier from
-/// TABLE_MAP using the Exasol virtual table name.
+/// Scenario: pushdown resolves the scanned Iceberg table from TABLE_MAP by the virtual table name
 #[test]
 fn e2e_pushdown_scans_table_from_involved_tables() {
     setup_e2e();
@@ -3171,7 +2500,6 @@ fn e2e_pushdown_scans_table_from_involved_tables() {
         cols[0].len()
     );
 
-    // Verify id=1 maps to "label-01".
     let first_id = cols[0][0]
         .as_i64()
         .or_else(|| cols[0][0].as_str().and_then(|s| s.parse().ok()))
@@ -3189,37 +2517,18 @@ fn e2e_pushdown_scans_table_from_involved_tables() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Group E — Iceberg file-pruning E2E tests (tasks 5.2 + 5.3)
-//
-// Seed recap (regions table, 3 files):
-//   north   → ids 1..=5    (5 rows per file, partition value "north")
-//   central → ids 6..=10   (5 rows per file, partition value "central")
-//   south   → ids 11..=15  (5 rows per file, partition value "south")
-//
-// The VS exposes the table as MY_LAKEHOUSE.REGIONS (Exasol-uppercased).
-// ---------------------------------------------------------------------------
+// Iceberg file-pruning E2E tests over the partitioned `regions` table.
 
-/// Helper: virtual schema name for the partitioned regions table.
 fn vs_regions_table() -> String {
     format!("{VS_NAME}.{}", E2E_PART_TABLE.to_uppercase())
 }
 
-/// Task 5.2 — Partition filter prunes and returns correct rows.
-///
-/// Asserts:
-/// - `SELECT id FROM {VS}.REGIONS WHERE region = 'north'` returns exactly ids 1..=5
-///   (5 rows, matching PART_NORTH_IDS) — correct rows, partition pruning applied.
-/// - `SELECT id FROM {VS}.REGIONS WHERE region = 'central'` returns exactly ids 6..=10
-///   (5 rows, matching PART_CENTRAL_IDS) — a second partition value to increase
-///   confidence that the filter is correct, not just returning all rows.
-/// - Correctness is the primary assertion; file-count pruning is asserted in 5.3.
+/// Scenario: a partition filter prunes and returns the correct rows
 #[test]
 fn e2e_partition_filter_prunes_and_returns_correct_rows() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // --- north partition: ids 1..=5 ---
     let north_sql = format!(
         "SELECT id FROM {} WHERE {} = '{}' ORDER BY id",
         vs_regions_table(),
@@ -3255,7 +2564,6 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
         "north partition ids must be exactly {expected_north:?}, got {north_ids:?}"
     );
 
-    // --- central partition: ids 6..=10 ---
     let central_sql = format!(
         "SELECT id FROM {} WHERE {} = '{}' ORDER BY id",
         vs_regions_table(),
@@ -3287,16 +2595,13 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
         "central partition ids must be exactly {expected_central:?}, got {central_ids:?}"
     );
 
-    // --- total row count sanity: filtering all partitions yields the full table ---
     let total = conn.query_row_count(&format!("SELECT id FROM {}", vs_regions_table()));
     assert_eq!(
         total, PART_TOTAL_ROWS as i64,
         "REGIONS total row count must be {PART_TOTAL_ROWS} (all 3 partitions), got {total}"
     );
 
-    // --- LIKE correctness: untranslatable predicate → DataFusion applies it, correct count ---
-    // ponytail: LIKE is not pushed to Iceberg (untranslatable); DataFusion applies the full
-    // filter as correctness backstop. Verifies the untranslatable-conjunct path.
+    // LIKE is not pushed to Iceberg; DataFusion applies the full filter as a backstop.
     let like_count = conn.query_row_count(&format!(
         "SELECT id FROM {} WHERE {} LIKE 'nor%'",
         vs_regions_table(),
@@ -3309,17 +2614,7 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
     );
 }
 
-/// Adapter-level file-count pruning, asserted by calling the format-reader
-/// seam directly (bypassing Exasol) with and without a filter and comparing
-/// the resolved file counts against the unfiltered snapshot. Both pruning
-/// paths the plan claims are exercised against the seeded `regions` table (3
-/// files, one per partition, disjoint id ranges):
-///
-/// 1. Partition pruning (`region = 'north'`): Iceberg identity-partition pruning
-///    eliminates the central and south files → 1 file.
-/// 2. Per-file min/max range pruning (`id <= 5`): files whose id min > 5
-///    (central: min=6, south: min=11) are eliminated by
-///    `InclusiveMetricsEvaluator` → 1 file (north only, ids 1..=5).
+/// Scenario: partition pruning and per-file min/max range pruning each resolve the regions table to one file
 #[test]
 fn e2e_range_filter_prunes_by_file_bounds() {
     setup_e2e();
@@ -3334,16 +2629,12 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         .build()
         .expect("tokio runtime for file-count pruning test");
 
-    // One `CatalogSession` built once and reused across all three pruning calls
-    // below, mirroring the single-session-per-query contract the format-reader
-    // seam now requires (see `adapter/mod.rs`'s hoisted enumeration session and
-    // `pushdown/mod.rs`'s `handle_pushdown`). The reader built from it is reused
-    // identically: it carries no per-call state, so a fresh `resolve_scan` call
-    // per filter is the same seam every pushdown request resolves through.
+    // One session reused across the pruning calls, mirroring the single-session-per-query
+    // contract of the format-reader seam.
     let session = rt
         .block_on(async { CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds).await })
         .expect("CatalogSession::resolve must succeed");
-    // `allow_http = true`: the local stack's MinIO is plain HTTP.
+    // The local stack's MinIO is plain HTTP.
     let connection = ConnectionStorage {
         storage: &storage,
         creds: &creds,
@@ -3358,7 +2649,6 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     )
     .expect("format_reader must succeed");
 
-    // --- baseline: no filter → 3 data files (one per partition) ---
     let all_files = rt
         .block_on(reader.resolve_scan(None))
         .expect("resolve_scan (no filter) must succeed")
@@ -3370,8 +2660,6 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         all_files.len()
     );
 
-    // --- partition pruning: region = 'north' → exactly 1 file ---
-    // Filter JSON shape mirrors the Exasol pushdown format the translator expects.
     // Column names are Exasol-uppercase; the translator resolves them case-insensitively.
     let partition_filter = serde_json::json!({
         "type": "predicate_equal",
@@ -3395,12 +2683,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         all_files.len()
     );
 
-    // --- per-file min/max range pruning: id <= 5 → files with min(id) > 5 are pruned ---
-    // The regions table has disjoint id ranges per file:
-    //   north   id 1..=5  (max=5)
-    //   central id 6..=10 (min=6 > 5 → pruned)
-    //   south   id 11..=15(min=11 > 5 → pruned)
-    // With Iceberg's InclusiveMetricsEvaluator, `id <= 5` prunes files where min(id) > 5.
+    // Iceberg's InclusiveMetricsEvaluator prunes files whose min(id) > 5.
     let range_filter = serde_json::json!({
         "type": "predicate_lessequal",
         "left": {"type": "column", "name": "ID"},
@@ -3410,8 +2693,6 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         .block_on(reader.resolve_scan(Some(&range_filter)))
         .expect("resolve_scan (range filter) must succeed")
         .files;
-    // Only the north file (ids 1..=5) overlaps `id <= 5`; central (min=6) and
-    // south (min=11) are pruned by their per-file min/max bounds.
     assert_eq!(
         pruned_range.len(),
         1,
@@ -3420,17 +2701,12 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     );
 }
 
-/// Exasol-side JOIN across two virtual tables returns correct joined rows.
-///
-/// Joins EVENTS and LABELS on `id` and asserts the result contains the
-/// expected id and label values — proving both tables are independently
-/// scanned by pushdown and joined by Exasol.
+/// Scenario: an Exasol-side JOIN across two virtual tables returns the correct joined rows
 #[test]
 fn e2e_pushdown_resolves_files_once_multi_table() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // JOIN events and labels on id; ORDER BY id for determinism.
     let sql = format!(
         "SELECT a.id, b.label FROM {events} a \
          JOIN {labels} b ON a.id = b.id \
@@ -3448,7 +2724,6 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
         cols[0].len()
     );
 
-    // Verify each id maps to the expected label.
     for (i, (id_val, label_val)) in cols[0].iter().zip(cols[1].iter()).enumerate() {
         let expected_id = (i + 1) as i64;
         let id = id_val
@@ -3471,40 +2746,18 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Regression: nested aggregate over a grouped sub-select (issue #52).
-//
-// Exasol rewrites `COUNT(*) FROM (SELECT k, COUNT(*) FROM t GROUP BY k) sub`
-// into a single flat pushdown request: `aggregationType: "group_by"` with a
-// literal-only `selectList` (a `literal_null` "count the groups" placeholder,
-// since the outer query needs neither the group key nor the inner COUNT(*)
-// value). Before the fix, the adapter rendered that literal placeholder as a
-// bare `NULL` projection column, producing scan SQL that referenced a
-// phantom `"NULL"` identifier and crashing with `F-UDF-CL-RUST-9001: ...
-// Schema error: No field named "NULL"`. The fix (pushdown.rs
-// `detect_group_by_aggregates`) preserves the GROUP BY so the scan still
-// returns one row per distinct group; Exasol's outer COUNT(*) then counts
-// those group rows correctly.
-// ---------------------------------------------------------------------------
+// #52: Exasol flattens `COUNT(*) FROM (SELECT k, COUNT(*) ... GROUP BY k)` into one
+// group_by request with a literal-only select list; the scan must keep the GROUP BY
+// so Exasol's outer COUNT(*) counts group rows.
 
-/// End-to-end nested aggregate over a grouped sub-select returns the correct
-/// outer count — including the duplicate-key case that discriminates a
-/// correct grouped-scan fix from an unsafe row-scan fallback.
-///
-/// `events.id` is unique, so `GROUP BY id` alone cannot tell a correct fix
-/// apart from a fallback that returns one row per source row (both
-/// coincidentally yield 20 on this table). `GROUP BY MOD(id, 4)` is the
-/// discriminating case: 20 seeded rows (id 0..19) fall into exactly 4
-/// distinct `MOD(id, 4)` buckets, so the outer `COUNT(*)` must be 4. A
-/// row-scan fallback would instead return the raw row count (20).
+/// Scenario: COUNT(*) over a grouped sub-select counts groups, not source rows (#52)
 #[test]
 fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
     setup_e2e();
     let mut conn = exa_conn();
 
-    // Duplicate-key case — the actual regression guard. Must be 4 (distinct
-    // MOD(id, 4) groups), NOT 20 (which a row-scan fallback would wrongly
-    // return since it doesn't re-group).
+    // Must be 4, not the 20 a row-scan fallback would return; `GROUP BY id` alone cannot
+    // tell the two apart.
     let sql_duplicate_keys = format!(
         "SELECT COUNT(*) FROM (SELECT MOD(id, 4) AS k, COUNT(*) AS cnt FROM {} GROUP BY MOD(id, 4)) t",
         vs_table()
@@ -3528,9 +2781,6 @@ fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
          instead of a correctly preserved grouped scan"
     );
 
-    // Unique-key smoke case from the plan (kept as an additional assertion,
-    // not a substitute for the duplicate-key case above): every id is
-    // distinct, so the outer COUNT(*) over `GROUP BY id` must equal 20.
     let sql_unique_key = format!(
         "SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {} GROUP BY id) t",
         vs_table()
@@ -3544,32 +2794,11 @@ fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// #191 — ORDER BY ... LIMIT n OFFSET m regression coverage
-// ---------------------------------------------------------------------------
-//
-// Before this fix, `LIMIT_WITH_OFFSET` was unadvertised: Exasol stripped the
-// `offset` from every pushdown request and applied neither bound itself, so
-// every one of these shapes silently returned ranks 1..n instead of the
-// requested (m+1)..(m+n) window. `render_limit_offset` (`support.rs`) is now
-// the single seam all three reachable wrapper sites route through; these
-// tests exercise each site end to end, plus the two shapes the design
-// declares permanently unreachable with a non-zero offset (S3, S4/S5), whose
-// `debug_assert!` guards compile out of the release-profile `.so` and so have
-// no live backstop other than these two canaries.
+// ORDER BY ... LIMIT n OFFSET m coverage (#191) for each wrapper site routed through
+// `render_limit_offset`, plus canaries for the two shapes whose `debug_assert!` guards
+// compile out of the release `.so`.
 
-/// The issue's literal repro: `ORDER BY score DESC LIMIT 12 OFFSET 3` over a
-/// PROJECTED sort key (`score` is in the select list). A non-zero offset
-/// always declines the per-shard bounded top-N (`detect_topn`'s guard is now
-/// a non-zero-offset test, not a presence test), so this renders on the
-/// declined row-scan wrapper (S1, `topn.rs`): `... GROUP BY shard_key)) ORDER
-/// BY "SCORE" DESC NULLS FIRST LIMIT 12 OFFSET 3`, live-verified via
-/// `EXPLAIN VIRTUAL` during this task.
-///
-/// Seeded data: `score = 5.0 * id` for id in 1..=20, so the ranks by score
-/// DESC are exactly ids 20,19,...,1 in order. Ranks 4-15 (LIMIT 12 OFFSET 3)
-/// are ids 17,16,...,6 — NOT ids 20..=9 (ranks 1-12), which is the #191 bug:
-/// silent collapse to OFFSET 0.
+/// Scenario: ORDER BY a projected key with LIMIT 12 OFFSET 3 returns the shifted window on the row-scan wrapper (#191)
 #[test]
 fn ordered_limit_offset_returns_shifted_window() {
     setup_e2e();
@@ -3608,16 +2837,7 @@ fn ordered_limit_offset_returns_shifted_window() {
     }
 }
 
-/// Same declined-row-scan-wrapper site (S1) as
-/// [`ordered_limit_offset_returns_shifted_window`], but with an UNPROJECTED
-/// sort key: `score` drives the ORDER BY but is not in the select list. This
-/// is the shape `add-topn-pushdown` (#225/#189) and `fix/198-orderby-expr-hidden-col`
-/// hardened against leaking a hidden internal sort column into the wrapper's
-/// select list; this test pins that the OFFSET renders correctly on top of
-/// that fix, not just on the simpler projected-sort-key case above.
-///
-/// `LIMIT 5 OFFSET 2` over score DESC ranks: rank 1-2 are ids 20,19; ranks 3-7
-/// (the requested window) are ids 18,17,16,15,14.
+/// Scenario: ORDER BY an unprojected key with LIMIT 5 OFFSET 2 returns the shifted window without leaking the sort column
 #[test]
 fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
     setup_e2e();
@@ -3646,15 +2866,7 @@ fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
     );
 }
 
-/// The grouped merge wrapper (S2, `grouped_agg.rs`) renders the request's
-/// OFFSET alongside its LIMIT: `GROUP BY MOD(id,4) ORDER BY 1 LIMIT 2 OFFSET
-/// 1`.
-///
-/// Seeded ids 1..=20 cycle `MOD(id,4)` through 1,2,3,0 repeating, so all four
-/// groups (k=0,1,2,3) have exactly 5 members each. Ranked by k ascending,
-/// `LIMIT 2 OFFSET 1` must return groups ranked 2-3 (k=1, k=2), NOT the
-/// groups ranked 1-2 (k=0, k=1) that the pre-fix silent-OFFSET-0 collapse
-/// would have produced.
+/// Scenario: the grouped merge wrapper applies LIMIT 2 OFFSET 1 to the ranked groups
 #[test]
 fn grouped_order_by_limit_offset_returns_shifted_groups() {
     setup_e2e();
@@ -3666,12 +2878,6 @@ fn grouped_order_by_limit_offset_returns_shifted_groups() {
         vs_table()
     );
 
-    // Pin the render site: the same `group_keys` + `PARTIAL_` markers
-    // `assert_group_by_pushed_down` uses to evidence the grouped
-    // partial-aggregate builder (S2, `grouped_agg.rs`), not the qualified
-    // single-table wrapper (S6, which has no `group_keys`/`PARTIAL_` — see
-    // `qualified_wrapper_limit_offset_returns_shifted_window`'s `LHS_T0`
-    // check), plus the shifted-window shape itself.
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed_sql.contains("group_keys") && pushed_sql.contains("PARTIAL_"),
@@ -3707,15 +2913,7 @@ fn grouped_order_by_limit_offset_returns_shifted_groups() {
     );
 }
 
-/// The qualified single-table wrapper (S6, `joins/sql_builders.rs`) renders
-/// the request's OFFSET, exercised via its `GROUP BY` + `COUNT(DISTINCT)`
-/// entry point — capture row 8 in the plan (`GROUP BY MOD(id,4)` with
-/// `COUNT(DISTINCT id)`, `ORDER BY 1 LIMIT 2 OFFSET 1`).
-///
-/// Same seeded groups as
-/// [`grouped_order_by_limit_offset_returns_shifted_groups`] (k=0..3, 5
-/// members each, all distinct ids so `COUNT(DISTINCT id)` == `COUNT(*)` per
-/// group): the shifted window must return groups ranked 2-3 (k=1, k=2).
+/// Scenario: the qualified single-table wrapper applies LIMIT 2 OFFSET 1 with COUNT(DISTINCT)
 #[test]
 fn qualified_wrapper_limit_offset_returns_shifted_window() {
     setup_e2e();
@@ -3727,12 +2925,6 @@ fn qualified_wrapper_limit_offset_returns_shifted_window() {
         vs_table()
     );
 
-    // Pin the render site: `LHS_T0` is the qualified single-table wrapper's
-    // (S6, `joins/sql_builders.rs`) own aliasing scheme, the same marker used
-    // at `unmatched_pushed_sql.contains("LHS_T0")` above — distinct from the
-    // plain grouped-merge builder (S2), which never aliases `LHS_T0` and
-    // instead carries `group_keys`/`PARTIAL_` (see
-    // `grouped_order_by_limit_offset_returns_shifted_groups`).
     let pushed_sql = explain_virtual_sql(&mut conn, &sql);
     assert!(
         pushed_sql.contains("LHS_T0"),
@@ -3770,20 +2962,7 @@ fn qualified_wrapper_limit_offset_returns_shifted_window() {
     );
 }
 
-/// Fact 6 canary (S4, S5 — grammar assertion). Exasol's grammar ties OFFSET
-/// to a non-aggregated select: `OFFSET` on an ungrouped aggregated select
-/// (`SELECT COUNT(*) ... ORDER BY 1 LIMIT 5 OFFSET 2`, no `GROUP BY`) is
-/// rejected by Exasol itself, BEFORE the adapter is ever consulted — this is
-/// the live, release-mode backstop for the `debug_assert!`s at the two
-/// one-row merge builders (`build_aggregate_scan_sql`,
-/// `build_count_distinct_scan_sql`, both in `support.rs`), which compile out
-/// of the release-profile `.so` and so guard nothing there. A future Exasol
-/// build that relaxes this grammar rule must fail this test rather than
-/// silently return the single aggregate row where an offset should apply.
-///
-/// Live-verified: Exasol's WebSocket response for this shape is
-/// `{"status":"error","exception":{"sqlCode":"42000","text":"OFFSET not
-/// allowed in aggregated selects ..."}}`.
+/// Scenario: Exasol rejects OFFSET on an ungrouped aggregated select before the adapter is consulted (42000)
 #[test]
 fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     setup_e2e();
@@ -3814,27 +2993,7 @@ fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     );
 }
 
-/// Fact 5 canary (S3 — unrenderable-ordering invariant). `HASH_MD5(id)` is an
-/// ordering Exasol cannot delegate to the adapter: for this shape Exasol
-/// pushes NEITHER `orderBy` NOR `limit` at all (live-verified via `EXPLAIN
-/// VIRTUAL`: the returned scan spec carries no `order_by` field and the
-/// pushed SQL carries no `LIMIT`/`OFFSET` token) and windows the result
-/// itself. This is the live backstop for the invariant `extract_offset(req) >
-/// 0 IMPLIES order_by_present(req)` that `build_row_scan_sql`'s
-/// `debug_assert!` (S3, `support.rs`) states but cannot enforce in the
-/// release-profile `.so`: if a future Exasol build ever pushed a bare `limit`
-/// with no `orderBy` for this shape, S3 would render ` LIMIT 5` with no
-/// ORDER BY and no OFFSET, silently reopening #191.
-///
-/// The VS-side query and a single-node native reference (no VS involved,
-/// `ORDER BY HASH_MD5(id) LIMIT 5 OFFSET 2` over a literal 1..=20 values
-/// list) must return the SAME 5 ids in the SAME order. The reference casts
-/// each literal to `DECIMAL(20,0)` — the VS's own `ID` column type (Arrow
-/// `Int64` maps to `DECIMAL(20,0)`, see this project's type-mapping table) —
-/// because `HASH_MD5` hashes the value's on-the-wire representation, so an
-/// uncast literal (which Exasol infers as a narrower `DECIMAL`) hashes
-/// differently and would produce a different (wrong) reference ordering;
-/// this was confirmed live during this task.
+/// Scenario: an unrenderable ordering (HASH_MD5) with OFFSET is windowed by Exasol and matches a native reference
 #[test]
 fn unrenderable_ordering_with_offset_matches_single_node() {
     setup_e2e();
@@ -3851,12 +3010,7 @@ fn unrenderable_ordering_with_offset_matches_single_node() {
         "HASH_MD5(id) is an unrenderable ordering: the adapter's scan spec \
          must carry no 'order_by' field, got:\n{pushed_sql}"
     );
-    // The precise field-shaped marker, not a bare `contains("LIMIT")` — as in
-    // `ordered_topn_pushes_down_matches_single_node` and
-    // `order_by_without_limit_falls_back_correctly`, `explain_virtual_sql`
-    // echoes Exasol's own incoming `pushdownRequest`, which can carry a
-    // literal "LIMIT" token unrelated to the adapter's own scan spec, so a
-    // raw substring search would false-positive regardless of this shape.
+    // Field-shaped marker: Exasol's echoed request can carry an unrelated "LIMIT" token.
     assert!(
         !pushed_sql.contains("\"limit\":"),
         "HASH_MD5(id) is an unrenderable ordering: Exasol withholds the \
@@ -3869,6 +3023,8 @@ fn unrenderable_ordering_with_offset_matches_single_node() {
     let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
     assert_eq!(ids.len(), 5, "expected exactly 5 ids: {ids:?}");
 
+    // HASH_MD5 hashes the value's representation, so literals must be cast to the VS's
+    // `DECIMAL(20,0)` id type or the reference ordering differs.
     let native_sql = "SELECT CAST(id AS DECIMAL(20,0)) AS id FROM (VALUES \
          (1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11),(12),(13),(14),(15),\
          (16),(17),(18),(19),(20)) AS t(id) \
@@ -3884,21 +3040,15 @@ fn unrenderable_ordering_with_offset_matches_single_node() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Single-group scalar-over-aggregate decomposition (#194, #188)
-// ---------------------------------------------------------------------------
+// Single-group scalar-over-aggregate decomposition (#194, #188).
 
-/// Native (non-virtual) copy of the `fact_lineitem` columns the single-group
-/// scalar-over-aggregate oracles read. Carries `L_ORDERKEY` as well, so the
-/// all-files-pruned predicate is expressible against both surfaces.
+/// Carries `L_ORDERKEY` so the all-files-pruned predicate is expressible on both surfaces.
 const GROUND_TRUTH_SINGLE_GROUP_TABLE: &str = "GT_SINGLE_GROUP_LINEITEM";
 
 fn single_group_ground_truth_table() -> String {
     format!("{SCHEMA_NAME}.{GROUND_TRUTH_SINGLE_GROUP_TABLE}")
 }
 
-/// `CREATE OR REPLACE TABLE` is idempotent, so every test below can safely
-/// re-run this under the suite's serial (`--test-threads=1`) execution.
 fn ensure_single_group_ground_truth_table(conn: &mut ExaConn) {
     conn.execute(&format!(
         "CREATE OR REPLACE TABLE {} AS \
@@ -3908,10 +3058,8 @@ fn ensure_single_group_ground_truth_table(conn: &mut ExaConn) {
     ));
 }
 
-/// The generated scan-driving SQL alone (`EXPLAIN VIRTUAL`'s `PUSHDOWN_SQL`
-/// column), without Exasol's echoed request JSON — the only surface on which a
-/// scan-spec field assertion is meaningful, since the echoed request repeats the
-/// user's own select list and would satisfy a naive substring probe.
+/// Excludes Exasol's echoed request JSON, which repeats the user's select list and would
+/// satisfy a naive substring probe.
 fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
@@ -3923,10 +3071,7 @@ fn explain_virtual_pushdown_sql(conn: &mut ExaConn, query_sql: &str) -> String {
         .join(" ")
 }
 
-/// Run `select_list` (plus any trailing clause) over the virtual `fact_lineitem`
-/// AND over its native oracle copy, then assert the virtual result is exactly
-/// ONE row — the merged single-group row, never one row per shard, which is the
-/// #194 symptom — whose every column equals the oracle's.
+/// The virtual result must be exactly one merged row, never one row per shard (#194).
 fn assert_single_group_matches_native_oracle(conn: &mut ExaConn, select_list: &str, tail: &str) {
     ensure_single_group_ground_truth_table(conn);
 
@@ -3971,12 +3116,7 @@ fn assert_single_group_matches_native_oracle(conn: &mut ExaConn, select_list: &s
     }
 }
 
-/// Issue #194: `SELECT ROUND(SUM(<col>), 2)` over a sharded virtual table
-/// returned one unmerged partial row PER SHARD, because the scalar-wrapped
-/// aggregate was not a top-level `function_aggregate` and so was pushed as a
-/// per-shard projection expression instead of being decomposed. It now pushes
-/// down as a single-group partial aggregate and merges to exactly one row equal
-/// to the native-schema oracle.
+/// Scenario: ROUND(SUM(col)) over a sharded table merges to one row equal to the native oracle (#194)
 #[test]
 fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
     setup_e2e();
@@ -3988,14 +3128,7 @@ fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, "");
 }
 
-/// Issue #188: `SELECT ROUND(VARIANCE(<col>), 4)` hard-failed with
-/// `Invalid function 'variance'` — the aggregate name reached DataFusion inside
-/// a per-shard projection expression. Resolving it through the shared `AggKind`
-/// tables means only sufficient statistics cross the scan boundary, so the query
-/// now succeeds and matches the native oracle.
-///
-/// The bare `VARIANCE` and the `VAR_SAMP` spelling are asserted alongside it:
-/// both already matched the oracle before this change and must keep doing so.
+/// Scenario: ROUND(VARIANCE(col)), VARIANCE and VAR_SAMP succeed and match the native oracle (#188)
 #[test]
 fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
     setup_e2e();
@@ -4010,10 +3143,7 @@ fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, "ROUND(VAR_SAMP(L_EXTENDEDPRICE), 4)", "");
 }
 
-/// A `COUNT(*)` shared between a top-level aggregate item and the inner
-/// aggregates of a scalar-over-aggregate item collapses into ONE partial column:
-/// the scan spec carries the count plan once and both merge items read the same
-/// `PARTIAL_count_0`.
+/// Scenario: a COUNT(*) shared by a plain and a scalar-over-aggregate item collapses into one partial column
 #[test]
 fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
     setup_e2e();
@@ -4037,9 +3167,7 @@ fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, "");
 }
 
-/// Plain aggregates and scalar-over-aggregate items interleave in `selectList`
-/// order, each cast to its OWN declared type — so no column is transposed and no
-/// item inherits a neighbour's type.
+/// Scenario: interleaved plain and scalar-over-aggregate items keep select-list order and their own types
 #[test]
 fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
     setup_e2e();
@@ -4053,9 +3181,7 @@ fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, "");
 }
 
-/// A predicate that prunes every data file still yields the one-row single-group
-/// shape for a scalar-over-aggregate select list: the count item is `0` and the
-/// scalar-wrapped SUM is NULL, matching single-node semantics over zero rows.
+/// Scenario: an all-files-pruned predicate still yields one row with count 0 and a NULL scalar-wrapped SUM
 #[test]
 fn e2e_single_group_scalar_over_aggregate_all_files_pruned_returns_one_row() {
     setup_e2e();
@@ -4075,10 +3201,7 @@ fn e2e_single_group_scalar_over_aggregate_all_files_pruned_returns_one_row() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, tail);
 }
 
-/// Plan-shape proof for #194: the decomposed request pushes the aggregates into
-/// the scan spec's `aggregates` field, leaves `projection` empty, and carries no
-/// per-shard projection expression at all — an aggregate must never reach
-/// DataFusion as an expression.
+/// Scenario: the decomposed request pushes aggregates into `aggregates`, with an empty projection and no projection expression (#194)
 #[test]
 fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection() {
     setup_e2e();
@@ -4107,12 +3230,7 @@ fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection
     );
 }
 
-/// `L_ORDERKEY/L_LINENUMBER` at `L_ORDERKEY=7, L_LINENUMBER=2` (both mapped to
-/// `DECIMAL(20,0)`) against a native oracle over the same two data points.
-/// Native Exasol's `/` is `FN_FLOAT_DIV`, always true float division:
-/// `7/2` = `3.5`. Pre-fix, the DataFusion dialect rendered `FLOAT_DIV` as a
-/// bare `/`, which DataFusion type-coerces to truncating `Int64/Int64`
-/// division, so the pushed-down value comes back `3.0` instead (#186).
+/// Scenario: integer `/` pushes down as float division, 7/2 = 3.5 (#186)
 #[test]
 fn e2e_float_div_int_over_int_matches_native_oracle() {
     setup_e2e();
@@ -4143,10 +3261,7 @@ fn e2e_float_div_int_over_int_matches_native_oracle() {
     );
 }
 
-/// The translator's own output, not planning's user-side-CAST proxy: a bare
-/// `L_ORDERKEY / L_LINENUMBER` select-list item pushes down as a checked
-/// division call with a DOUBLE PRECISION emit type (#186 / #370 fix,
-/// `vs-expression`'s DataFusion-dialect `FLOAT_DIV` arm).
+/// Scenario: a bare column division pushes down as a checked division with a DOUBLE emit type (#186, #370)
 #[test]
 fn e2e_float_div_pushes_checked_division_call_projection() {
     setup_e2e();
@@ -4174,13 +3289,7 @@ fn e2e_float_div_pushes_checked_division_call_projection() {
     );
 }
 
-/// The SQL state Exasol surfaced for a query that MUST fail with the checked
-/// division's own division-by-zero message.
-///
-/// Recorded live (#370 fix): a `UdfError::User` from the scan UDF reaches the
-/// client as [`UDF_ERROR_SQL_CODE`], carrying the UDF's message text. Asserting
-/// the message rather than the state is what makes the assertion meaningful —
-/// the state is the same for every UDF-raised error, the message is not.
+/// The state is the same for every UDF-raised error, so the message is what is asserted.
 fn division_by_zero_failure_sql_code(conn: &mut ExaConn, sql: &str) -> String {
     let resp = conn.try_execute(sql);
 
@@ -4209,18 +3318,10 @@ fn division_by_zero_failure_sql_code(conn: &mut ExaConn, sql: &str) -> String {
         .to_string()
 }
 
-/// SQL state a scan-UDF `UdfError::User` reaches the client under. Recorded
-/// from a live run, not assumed: Exasol reports every UDF-raised error under
-/// its own generic state rather than forwarding native Exasol's `22012`
-/// ("division by zero"), which no UDF can produce.
+/// Exasol reports every UDF-raised error under this generic state, not native `22012`.
 const UDF_ERROR_SQL_CODE: &str = "22002";
 
-/// A projected `x/0` fails the query with the checked division's own
-/// division-by-zero message. Pre-fix it failed too, but for the wrong reason
-/// and only here: DataFusion produced `+Inf` and Exasol's emit boundary
-/// rejected it at `22002` ("numeric value out of range: value inf"), which is
-/// why the identical division inside a filter predicate silently changed the
-/// row count instead of failing (#370).
+/// Scenario: a projected x/0 fails with the checked division's own division-by-zero message (#370)
 #[test]
 fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
     setup_e2e();
@@ -4239,11 +3340,7 @@ fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
     );
 }
 
-/// A projected `0/0` now fails with the SAME division-by-zero message a
-/// non-zero numerator gets, instead of succeeding with the silent NULL #246's
-/// raw-scan NaN-at-emit gap returned. The checked division sees the zero
-/// divisor and raises before any value can reach the emit boundary, so the
-/// projection path and the predicate path no longer disagree.
+/// Scenario: a projected 0/0 fails with the same division-by-zero message instead of a silent NULL
 #[test]
 fn e2e_zero_div_zero_projected_fails_with_division_by_zero() {
     setup_e2e();
@@ -4311,14 +3408,7 @@ fn e2e_float_div_filter_row_count_matches_native_oracle() {
     );
 }
 
-/// The 20-row `L_ORDERKEY` (1..=10) × `L_LINENUMBER` (1..=2) cross product the
-/// `fact_lineitem` fixture seeds, as an inline-literal subquery Exasol
-/// evaluates natively.
-///
-/// `LHVS.GT_LINEITEM_SCAN` does not exist in this harness, so the native oracle
-/// is built the way every other `float_div` oracle in this file builds one:
-/// from literals describing exactly the rows the pushed filter runs over. An
-/// oracle over a different row set would prove nothing about a row count.
+/// Built from literals describing exactly the rows the pushed filter runs over.
 fn native_lineitem_oracle() -> String {
     let rows: Vec<String> = (1..=FACT_ORDERS_ROWS)
         .flat_map(|orderkey| {
@@ -4330,12 +3420,8 @@ fn native_lineitem_oracle() -> String {
     format!("({})", rows.join(" UNION ALL "))
 }
 
-/// The ScanSpec's rendered `filter` value, with its JSON escaping undone.
-///
-/// Reading the filter FIELD rather than the whole pushed text is what makes a
-/// predicate-position assertion meaningful: the function name also appears in
-/// Exasol's echoed pushdown request, so a bare substring probe would pass while
-/// the predicate stayed Exasol-side and never reached the scan.
+/// Reads the filter field, not the whole pushed text: the function name also appears in
+/// Exasol's echoed request.
 fn pushed_scan_filter(pushed: &str) -> String {
     const KEY: &str = r#""filter":""#;
     let start = pushed
@@ -4343,8 +3429,8 @@ fn pushed_scan_filter(pushed: &str) -> String {
         .unwrap_or_else(|| panic!("the pushed scan spec must carry a filter:\n{pushed}"))
         + KEY.len();
     let body = &pushed[start..];
-    // The value is a JSON string inside a single-quoted SQL literal, so every
-    // identifier quote inside it is escaped; it ends at the first unescaped one.
+    // The value is a JSON string inside a single-quoted SQL literal, so identifier quotes
+    // are escaped; it ends at the first unescaped one.
     let bytes = body.as_bytes();
     let mut end = 0;
     while end < bytes.len() && !(bytes[end] == b'"' && (end == 0 || bytes[end - 1] != b'\\')) {
@@ -4353,14 +3439,8 @@ fn pushed_scan_filter(pushed: &str) -> String {
     body[..end].replace("\\\"", "\"")
 }
 
-/// Assert the checked division reached the scan in PREDICATE position.
-///
-/// Two facts are needed, not one: the ScanSpec's own `filter` must hold the
-/// call, and its `projection` must be the bare column the query selects — so
-/// the call cannot be a select-list expression that merely looks like a pushed
-/// predicate. The comparison's own rendering is deliberately not asserted here:
-/// Exasol normalises `0 > <expr>` to `<expr> < 0`, and the test's subject is
-/// the position, not Exasol's canonicalisation.
+/// The `projection` must be the bare selected column, so the call cannot be a select-list
+/// expression. Exasol normalises `0 > <expr>` to `<expr> < 0`, so the comparison is not asserted.
 fn assert_checked_division_reached_the_pushed_filter(pushed: &str) {
     let filter = pushed_scan_filter(pushed);
     assert!(
@@ -4375,15 +3455,7 @@ fn assert_checked_division_reached_the_pushed_filter(pushed: &str) {
     );
 }
 
-/// Issue #370's own defect: a division by zero inside a pushed FILTER predicate
-/// must fail the query, not change the row count.
-///
-/// Covers all four shapes #370 measured, because each failed differently
-/// pre-fix: `x/0` matched all 20 rows for `> 0` and none for `< 0` (DataFusion's
-/// `+Inf` compares greater than every finite value), and `0/0` matched none for
-/// `> 0` and all 20 for `< 0` (a `NaN` comparison is false, so the negated
-/// predicate kept every row). Two opposite wrong answers from one bug, neither
-/// of them an error.
+/// Scenario: a division by zero in a pushed filter fails the query instead of changing the row count, for all four #370 shapes
 #[test]
 fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
     setup_e2e();
@@ -4412,15 +3484,7 @@ fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
     }
 }
 
-/// A NULL divisor in a pushed predicate is NOT a division by zero: the row
-/// carries no value to divide, the comparison over a NULL quotient is unknown,
-/// and the query returns no rows without failing.
-///
-/// This is the case a naive zero-divisor guard gets wrong. NULL is derived with
-/// `NULLIF(L_LINENUMBER - L_LINENUMBER, 0)`, which is NULL for every fixture
-/// row — so if the checked division raised on a NULL operand, this query would
-/// fail rather than return nothing, and every NULL-divisor query in production
-/// would start failing too.
+/// Scenario: a NULL divisor in a pushed predicate returns no rows without raising
 #[test]
 fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
     setup_e2e();
@@ -4435,8 +3499,6 @@ fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
     let pushed = explain_virtual_pushdown_sql(&mut conn, &sql);
     assert_checked_division_reached_the_pushed_filter(&pushed);
 
-    // `query_row_count` asserts the statement succeeded, so reaching a row
-    // count at all is what proves a NULL divisor does not raise.
     let rows = conn.query_row_count(&sql);
     assert_eq!(
         rows, 0,
@@ -4444,38 +3506,7 @@ fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
     );
 }
 
-/// The GUARDED shape task 1.2 measured live, in BOTH conjunct orders, against
-/// the native oracle — the one shape where a query that succeeds today can
-/// start failing, so its outcome is measured rather than assumed.
-///
-/// Divisor `(L_LINENUMBER - 1)` is zero on exactly half the 20-row fixture
-/// (`L_LINENUMBER = 1`), unlike the identically-zero `(L_LINENUMBER -
-/// L_LINENUMBER)` divisor the tests above use, so the guard
-/// `(L_LINENUMBER - 1) <> 0` really removes rows rather than being a no-op.
-///
-/// Native Exasol returns 10 rows WITHOUT raising in BOTH conjunct orders: its
-/// own guard protects its division regardless of textual order. The pushed
-/// scan does NOT match that in both orders, and the divergence is
-/// order-dependent exactly as the spec predicts:
-///
-/// * GUARD FIRST — 10 rows, no error. Parity with native Exasol. The
-///   protection comes from the Parquet ROW FILTER, which evaluates the pushed
-///   conjuncts in textual order and narrows the row selection as it goes, so
-///   the division never sees a zero divisor. It does NOT come from
-///   `check_short_circuit`, which at this fixture's 0.5 true ratio (above
-///   `PRE_SELECTION_THRESHOLD = 0.2`) would evaluate the division over the full
-///   batch and raise. The textual conjunct order itself holds because
-///   `datafusion.execution.parquet.reorder_filters` defaults to `false` and
-///   `session_config_for_spec` leaves the key unset. Enabling it sorts the
-///   split conjuncts by referenced-column size, which puts the one-column guard
-///   ahead of the two-column division in BOTH orders and flips the
-///   `DIVISION FIRST` raise assertion below.
-/// * DIVISION FIRST — raises. The division is the first row-filter conjunct, so
-///   it evaluates over every row including the ten with a zero divisor, and
-///   nothing has excluded them yet. This is the OVER-RAISE direction of tracked
-///   exception #392: a query native Exasol answers can fail here. The scan
-///   never returns rows that disagree with Exasol, which is the invariant the
-///   fix protects; only the error-raising diverges.
+/// Scenario: a zero-guarded division matches native Exasol guard-first and over-raises division-first (#392)
 #[test]
 fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
     setup_e2e();
@@ -4536,6 +3567,8 @@ fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
          before the division is evaluated"
     );
 
+    // Holds while `datafusion.execution.parquet.reorder_filters` stays false: enabling it
+    // sorts the one-column guard ahead of the division in both orders.
     let division_first_code = division_by_zero_failure_sql_code(
         &mut conn,
         &format!(
@@ -4552,14 +3585,7 @@ fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
     );
 }
 
-/// A division by zero inside a pushed AGGREGATE argument fails the query with
-/// the same division-by-zero message, rather than reaching `arrow_value_at`'s
-/// separate `is_nan()` check at the partial-aggregate emit boundary.
-///
-/// The aggregate paths splice the rendered argument into their own SQL
-/// (`build_partial_agg_sql_filtered` / `build_grouped_partial_agg_sql`), so
-/// registering the function on the one session builder is what makes them raise
-/// identically to the raw-row path.
+/// Scenario: a division by zero in a pushed aggregate argument fails with the division-by-zero message
 #[test]
 fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
     setup_e2e();
@@ -4590,14 +3616,7 @@ fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
     );
 }
 
-/// Regression test for #202. Exasol's `GREATEST`/`LEAST` return NULL if ANY
-/// argument is NULL; the unfixed DataFusion-dialect rendering skipped NULLs
-/// instead. NULL is derived via `NULLIF(MOD(id, 5), 0)` (as
-/// `test_group_by_null_key_grouping` does — the seed fixture has no nullable
-/// column): NULL for `id` in {5, 10, 15, 20}, `id % 5` otherwise.
-///
-/// Pre-fix values: the predicate query returned `0` rows (not `4`); the value
-/// query returned each row's own `id` (never NULL) at the four multiples of 5.
+/// Scenario: GREATEST/LEAST return NULL when any argument is NULL, as in Exasol (#202)
 #[test]
 fn test_greatest_least_propagate_null_argument() {
     setup_e2e();
@@ -4659,24 +3678,7 @@ fn test_greatest_least_propagate_null_argument() {
     );
 }
 
-/// Regression test for #374. Exasol's `||`/`CONCAT` treat a NULL operand as
-/// an empty string rather than propagating NULL (an all-NULL/all-empty
-/// result is still NULL, since Exasol's VARCHAR domain has no empty-string
-/// value) — verified live against a real Exasol instance. The unfixed
-/// DataFusion-dialect rendering emitted chained `||` instead, which
-/// propagates NULL. NULL is derived via `NULLIF(name, name)` over the seed
-/// fixture's non-nullable `name` column (`event-01`..`event-20`) — the shape
-/// issue #374 reproduced against TPC-H, and the technique
-/// `test_greatest_least_propagate_null_argument` already uses for the same
-/// reason.
-///
-/// Pre-fix values: the VALUE query returned NULL for every row (not
-/// `event-01-suffix`..`event-03-suffix`); the FILTER query counted `0` rows
-/// (not `20`). The all-NULL FILTER query counts `20` under both the pre-fix
-/// chained `||` and the fixed `nullif(concat(...), '')` rendering — it does
-/// not discriminate pre-fix from post-fix, but instead discriminates the
-/// `nullif`-wrapped rendering from a bare `concat(...)` (which would render
-/// the empty string for two NULL operands and count `0`, not `20`).
+/// Scenario: `||`/CONCAT treat a NULL operand as an empty string, as in Exasol (#374)
 #[test]
 fn test_concat_null_operand_concatenates_non_null_parts() {
     setup_e2e();
@@ -4724,6 +3726,7 @@ fn test_concat_null_operand_concatenates_non_null_parts() {
          rendering of CONCAT, not a bare concat or chained ||, got:\n{filter_pushed}"
     );
 
+    // Exasol's VARCHAR domain has no empty string, so an all-NULL CONCAT is NULL.
     let all_null_filter_sql = format!(
         "SELECT COUNT(*) FROM {} WHERE (NULLIF(name, name) || NULLIF(name, name)) IS NULL",
         vs_table()

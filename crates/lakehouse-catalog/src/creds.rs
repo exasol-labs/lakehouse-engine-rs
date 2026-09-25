@@ -218,15 +218,9 @@ impl StorageCreds {
         }
     }
 
-    /// Resolves an unstated `path_style` to `false`.
-    ///
-    /// This is the one selector both the adapter-side (`ConnectionCreds`-derived)
-    /// and scan-side (`from_json`-derived) readers call, so resolving here — not in
-    /// `from_json` — guarantees they can never disagree. A parse-time default would
-    /// also destroy the tri-state the vended-credentials path needs to distinguish
-    /// "the operator said nothing" from "the operator said false", since the vended
-    /// resolution must not silently override a response's `s3.path-style-access`
-    /// on a CONNECTION that stated no preference at all.
+    /// Resolves an unstated `path_style` to `false` here, not in `from_json`: the
+    /// vended path needs the unstated tri-state so it does not override a
+    /// response's `s3.path-style-access`.
     pub fn backend(&self, allow_http: bool) -> StorageBackend {
         let azure_cred = match (self.account_key.as_deref(), self.sas_token.as_deref()) {
             (Some(account_key), None) => Some(AdlsCred::AccountKey(account_key.to_string())),

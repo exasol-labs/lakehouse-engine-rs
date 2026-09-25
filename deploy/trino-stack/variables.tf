@@ -49,7 +49,6 @@ variable "ttl_days" {
   description = "Sets exa:ExpiryDate = created + ttl_days (housekeeping signal; not auto-enforced). Short default: this is a benchmark box, tear it down when done."
 }
 
-# --- exa:* tag values -------------------------------------------------------
 variable "department" {
   type    = string
   default = "ENG"

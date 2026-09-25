@@ -2,8 +2,7 @@ mod phase_telemetry_tests {
     use super::super::*;
     use std::thread::sleep;
 
-    /// Telemetry is silent at the production default level and any level below
-    /// DEBUG; enabled at DEBUG and TRACE.
+    /// Scenario: telemetry is silent below DEBUG and enabled at DEBUG and TRACE.
     #[test]
     fn telemetry_enabled_only_at_debug_or_more_verbose() {
         assert!(!telemetry_enabled(tracing::Level::ERROR));
@@ -13,17 +12,13 @@ mod phase_telemetry_tests {
         assert!(telemetry_enabled(tracing::Level::TRACE));
     }
 
-    /// The three phases are accumulated distinctly and their sum reconstructs
-    /// the scan-body wall-clock within a small tolerance. Import and emit are
-    /// attributed to separate accumulators (a read-bound scan vs an emit-bound
-    /// scan are distinguishable).
+    /// Scenario: import and emit accumulate distinctly and the phases sum to the scan-body wall-clock.
     #[test]
     fn phases_accumulate_distinctly_and_sum_to_body() {
         let mut t = PhaseTimers::start();
-        sleep(Duration::from_millis(20)); // startup work
+        sleep(Duration::from_millis(20));
         t.seal_startup();
 
-        // Two batches: import then emit each.
         for _ in 0..2 {
             t.import_started();
             sleep(Duration::from_millis(10));
@@ -39,16 +34,13 @@ mod phase_telemetry_tests {
         let emit = t.emit();
         let body = t.body_elapsed();
 
-        // Distinct attribution: import (~20ms total) clearly exceeds emit (~10ms).
         assert!(import > emit, "import {import:?} must exceed emit {emit:?}");
         assert!(
             startup >= Duration::from_millis(18),
             "startup must capture the ~20ms pre-fetch work, got {startup:?}"
         );
 
-        // Sum reconstructs the body within measurement error (sleeps overshoot,
-        // and a few hundred microseconds of un-timed glue may exist between the
-        // last emit and reading body). Allow a generous absolute tolerance.
+        // Sleeps overshoot and un-timed glue exists between the last emit and reading body.
         let summed = startup + import + emit;
         let diff = body.saturating_sub(summed);
         assert!(
@@ -57,8 +49,7 @@ mod phase_telemetry_tests {
         );
     }
 
-    /// `seal_startup` is idempotent: a second call does not overwrite the first
-    /// startup measurement (so re-entering the loop body cannot corrupt it).
+    /// Scenario: a second `seal_startup` call does not overwrite the first measurement.
     #[test]
     fn seal_startup_is_idempotent() {
         let mut t = PhaseTimers::start();
@@ -70,8 +61,7 @@ mod phase_telemetry_tests {
         assert_eq!(first, t.startup(), "second seal_startup must be a no-op");
     }
 
-    /// The telemetry record carries the three phase durations and the body
-    /// wall-clock, tagged with the pid, on one greppable line.
+    /// Scenario: the telemetry record carries the pid, three phases, and body time on one line.
     #[test]
     fn telemetry_record_carries_three_phases_and_pid() {
         let mut t = PhaseTimers::start();
@@ -102,13 +92,9 @@ mod phase_telemetry_tests {
         assert!(!rec.contains('\n'), "must be a single line: {rec}");
     }
 
-    /// A telemetry-file write to an impossible path is swallowed — best-effort,
-    /// never panics or errors (the property that keeps a sink failure from
-    /// failing the scan).
+    /// Scenario: a telemetry write to an impossible path is swallowed without panicking.
     #[test]
     fn write_telemetry_file_swallows_failure() {
-        // Append to a path under a non-existent directory: the open fails and
-        // the function returns normally without panicking.
         append_record(
             "/nonexistent-dir-lakehouse/telemetry.log",
             "LHTELEM pid=0 phase_startup_ms=0\n",
@@ -119,9 +105,7 @@ mod phase_telemetry_tests {
 mod debug_checkpoint_tests {
     use super::super::*;
 
-    /// The per-process debug path is `/tmp/lakehouse_udf_debug.<pid>.log` and
-    /// carries THIS process's pid — so concurrent shard VMs (distinct pids) each
-    /// get a distinct file and never interleave lines.
+    /// Scenario: the per-process debug path carries this process's pid.
     #[test]
     fn debug_log_path_is_per_pid() {
         let path = debug_log_path();
@@ -133,25 +117,14 @@ mod debug_checkpoint_tests {
         );
     }
 
-    /// `current_rss_bytes` reads a plausible non-zero RSS from /proc/self/statm
-    /// on Linux (the SLC target). On a platform without procfs it returns 0
-    /// rather than panicking — the checkpoint line still renders.
+    /// Scenario: `current_rss_bytes` never panics, returning 0 without procfs.
     #[test]
     fn current_rss_is_readable_or_zero() {
         let rss = current_rss_bytes();
-        // The test process itself is resident, so on Linux this is > 0; we only
-        // assert it does not panic and is a sane u64 (always true). On non-Linux
-        // it is 0. Either way the function is total.
         let _ = rss;
     }
 
-    /// One formatted checkpoint line carries every field the live triage needs:
-    /// the LHDBG tag, a sequence number, pid, thread identity, the running row
-    /// count, an rss_mb field, and the message — all on a single line.
-    ///
-    /// Verified by formatting the same way `debug_checkpoint` does (the write
-    /// itself targets a fixed /tmp path shared with the live UDF, so the unit
-    /// test asserts the record SHAPE rather than touching that shared file).
+    /// Scenario: one checkpoint line carries the LHDBG tag, seq, pid, thread, rows, rss_mb, and message.
     #[test]
     fn checkpoint_line_contains_required_fields() {
         debug_set_rows(12_345);
@@ -183,11 +156,7 @@ mod debug_checkpoint_tests {
         assert!(!line.contains('\n'), "must be one line");
     }
 
-    /// The sequence counter is monotonic and unique under concurrent threads —
-    /// the property that lets the LAST line before death localize the crash even
-    /// when multiple DataFusion/Tokio worker threads emit checkpoints in one VM.
-    /// `fetch_add` is atomic, so N threads each taking K sequence numbers yield
-    /// N×K distinct values with no duplicates and no torn reads.
+    /// Scenario: the sequence counter yields unique values under concurrent threads.
     #[test]
     fn sequence_counter_is_unique_under_concurrency() {
         use std::collections::HashSet;
@@ -211,7 +180,6 @@ mod debug_checkpoint_tests {
         for h in handles {
             h.join().unwrap();
         }
-        // 8 threads × 1000 = 8000 fetch_adds → 8000 distinct sequence values.
         assert_eq!(
             seen.lock().unwrap().len(),
             8000,
@@ -224,10 +192,8 @@ mod panic_hook_tests {
     use super::super::*;
     use std::sync::Mutex;
 
-    // The panic hook is process-wide shared state. Any test that swaps the hook
-    // (take_hook / set_hook) must hold this lock for the whole swap-act-restore
-    // window, or a concurrently running test's take_hook can capture the wrong
-    // hook and corrupt the chain. Serializes only the hook-mutating tests.
+    // Hook-swapping tests must hold this for the whole swap-act-restore window, or a concurrent
+    // test's take_hook can capture the wrong hook and corrupt the chain.
     static HOOK_LOCK: Mutex<()> = Mutex::new(());
 
     fn unique_path(tag: &str) -> std::path::PathBuf {
@@ -241,8 +207,7 @@ mod panic_hook_tests {
         p
     }
 
-    /// The formatted record carries every diagnostic field the live triage needs:
-    /// pid, thread identity, location, the panic payload, and a backtrace.
+    /// Scenario: the panic record carries pid, thread, location, payload, and backtrace.
     #[test]
     fn format_record_contains_required_fields() {
         let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -280,8 +245,7 @@ mod panic_hook_tests {
         );
     }
 
-    /// `append_record` creates the file and appends (does not truncate) so
-    /// multiple panics accumulate.
+    /// Scenario: `append_record` appends rather than truncates, so panics accumulate.
     #[test]
     fn append_record_creates_and_appends() {
         let path = unique_path("append");
@@ -300,8 +264,7 @@ mod panic_hook_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// `panic_payload_message` extracts `&str` and `String` payloads and falls
-    /// back for non-string payloads. Verified via catch_unwind hook capture.
+    /// Scenario: `panic_payload_message` extracts `&str` and `String` payloads and falls back otherwise.
     #[test]
     fn payload_message_extracts_str_and_string() {
         let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -335,12 +298,7 @@ mod panic_hook_tests {
         );
     }
 
-    /// A hook installed via `std::panic::set_hook` fires on a panic raised on a
-    /// SPAWNED thread, not only the main thread — the core property the
-    /// worker-thread crash relies on. The hook here writes a record to a temp
-    /// file from the panicking worker; the test asserts the record persisted,
-    /// proving the same `append_record` path used by `install_panic_hook` runs
-    /// for a non-main thread's panic.
+    /// Scenario: a process-wide hook fires and persists a record for a panic on a spawned thread.
     #[test]
     fn hook_fires_on_spawned_worker_thread_panic() {
         let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -355,9 +313,7 @@ mod panic_hook_tests {
             append_record(&hook_path, &record);
         }));
 
-        // Panic on a freshly spawned (non-main) thread. The spawned thread's
-        // panic unwinds and the join returns Err, but the process-wide hook must
-        // have already run on that worker thread.
+        // The join returns Err, but the hook must already have run on the worker thread.
         let handle = std::thread::Builder::new()
             .name("scan-worker-probe".to_string())
             .spawn(|| panic!("worker thread boom"))

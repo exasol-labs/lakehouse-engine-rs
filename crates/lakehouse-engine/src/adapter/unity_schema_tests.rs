@@ -1,17 +1,5 @@
-//! Engine-level createVirtualSchema tests for the native Unity Catalog kind
-//! (`CATALOG_KIND=UNITY_CATALOG`).
-//!
-//! Each test drives the real adapter listing pipeline through `dispatch` against
-//! an in-process mock Unity Catalog REST server, so the constructed
-//! `UnityCatalogSession` issues genuine HTTP to the mock. That makes assertions
-//! about request shape — e.g. "no per-table get-table call" — real observations
-//! of the true client, not properties of a stub.
-//!
-//! Runtime note: `handle_create_virtual_schema` builds its own current-thread
-//! runtime and `block_on`s it, so these are plain `#[test]`s (a `#[tokio::test]`
-//! would panic on the nested `block_on`). The mock runs on a separate
-//! multi-thread runtime whose worker threads serve HTTP while the test thread is
-//! parked in dispatch's current-thread runtime.
+//! Plain `#[test]`s: `handle_create_virtual_schema` `block_on`s its own current-thread runtime,
+//! so a `#[tokio::test]` would panic; the mock serves HTTP from a separate multi-thread runtime.
 
 use super::*;
 
@@ -22,35 +10,28 @@ use tokio::net::TcpListener;
 
 const NAMESPACE: &str = "sales_catalog.public";
 
-/// One request the mock served, reduced to what the assertions need: the HTTP
-/// method and the request target (path plus query string).
 struct RecordedRequest {
     method: String,
     target: String,
 }
 
 impl RecordedRequest {
-    /// The path portion of the target, before any query string.
     fn path(&self) -> &str {
         self.target.split('?').next().unwrap_or(&self.target)
     }
 
-    /// A single-table load `GET /tables/{full_name}` — a path segment sits after
-    /// `tables`, distinguishing it from the list sweep `GET /tables?...`.
+    /// A path segment after `tables` distinguishes a single-table load from the list sweep.
     fn is_get_table_call(&self) -> bool {
         self.path().contains("/tables/")
     }
 
-    /// The paginated list sweep `GET /tables` — the path ends at `tables`.
     fn is_list_tables_call(&self) -> bool {
         self.method == "GET" && self.path().ends_with("/tables")
     }
 }
 
-/// An in-process mock Unity Catalog REST server. It records every request and
-/// answers each from a caller-supplied responder, closing the connection per
-/// request so the pooled `reqwest` client opens a fresh one and a single accept
-/// loop serves the whole sequential stream in order.
+/// Closes the connection per request so the pooled `reqwest` client reconnects and a single
+/// accept loop serves the sequential stream in order.
 struct MockUnityCatalog {
     base_url: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -139,10 +120,6 @@ fn parse_request(raw: &str) -> RecordedRequest {
     }
 }
 
-/// A `TestContext` whose registered `uc_conn` CONNECTION resolves to a
-/// caller-chosen address and credential JSON. The listing tests use an
-/// empty-object (no-auth) password; the unreachable test uses a PAT so there
-/// is a real secret to prove absent.
 fn unity_conn_ctx(address: impl Into<String>, password: impl Into<String>) -> TestContext {
     TestContext::scalar(vec![]).with_connection(
         "uc_conn",
@@ -167,7 +144,6 @@ fn create_vs_request() -> Json {
 }
 
 fn create_vs_over(mock: &MockUnityCatalog) -> Result<Json, UdfError> {
-    // Empty-object password: a valid no-auth Unity Catalog CONNECTION.
     let mut ctx = unity_conn_ctx(mock.base_url.clone(), "{}");
     dispatch(&mut ctx, &create_vs_request())
 }
@@ -184,8 +160,7 @@ fn table_entry(name: &str, columns: Vec<Json>) -> Json {
     table_entry_typed(name, "MANAGED", columns)
 }
 
-/// A VIEW list entry: columns but no `storage_location` and a null
-/// `data_source_format`, exactly as the `GET /tables` sweep returns a view.
+/// The sweep returns a view with no `storage_location` and a null `data_source_format`.
 fn view_entry(name: &str, columns: Vec<Json>) -> Json {
     json!({
         "name": name,
@@ -195,9 +170,7 @@ fn view_entry(name: &str, columns: Vec<Json>) -> Json {
     })
 }
 
-/// A MANAGED or EXTERNAL Delta base table list entry — the wire shape of both a
-/// plain base table and a shallow clone, since Unity Catalog carries no separate
-/// clone marker.
+/// Also the wire shape of a shallow clone: Unity Catalog carries no clone marker.
 fn table_entry_typed(name: &str, table_type: &str, columns: Vec<Json>) -> Json {
     json!({
         "name": name,
@@ -208,7 +181,6 @@ fn table_entry_typed(name: &str, table_type: &str, columns: Vec<Json>) -> Json {
     })
 }
 
-/// A MANAGED base table list entry whose `data_source_format` is not `DELTA`.
 fn non_delta_table_entry(name: &str, columns: Vec<Json>) -> Json {
     json!({
         "name": name,
@@ -219,7 +191,6 @@ fn non_delta_table_entry(name: &str, columns: Vec<Json>) -> Json {
     })
 }
 
-/// A list entry whose `table_type` is neither a base table nor a VIEW.
 fn other_type_entry(name: &str, columns: Vec<Json>) -> Json {
     json!({
         "name": name,
@@ -236,8 +207,7 @@ fn tables_page(entries: Vec<Json>, next_page_token: Option<&str>) -> String {
     page.to_string()
 }
 
-/// Fail loudly if the pipeline ever issues a per-table get-table: the listing
-/// path must source columns from the list sweep alone.
+/// The listing path must source columns from the list sweep alone.
 fn unexpected_get_table() -> (u16, String) {
     (
         500,
@@ -266,7 +236,6 @@ fn string_data_type() -> Json {
     json!({ "type": "varchar", "size": 2000000 })
 }
 
-/// The Exasol-name → Unity-identifier map recorded in the response adapterNotes.
 fn table_map(response: &Json) -> serde_json::Map<String, Json> {
     let notes_str = response["schemaMetadata"]["adapterNotes"]
         .as_str()
@@ -278,9 +247,7 @@ fn table_map(response: &Json) -> serde_json::Map<String, Json> {
         .clone()
 }
 
-/// createVirtualSchema under the Unity kind returns one virtual table per table
-/// the `GET /tables` sweep reports, with names uppercased through the shared
-/// case-fold and columns mapped from the inline sweep — no per-table get-table.
+/// Scenario: the Unity kind lists one virtual table per swept table, with no per-table get-table.
 #[test]
 fn enumerates_unity_namespace_tables() {
     let mock = MockUnityCatalog::start(|req| {
@@ -316,13 +283,10 @@ fn enumerates_unity_namespace_tables() {
     assert_eq!(columns[1]["name"], "CUSTOMER_NAME");
     assert_eq!(columns[1]["dataType"], string_data_type());
 
-    // Columns came from the list sweep alone — the Delta log was never read.
     assert_eq!(mock.get_table_call_count(), 0);
 }
 
-/// The listing path issues only paginated `GET /tables` requests and zero
-/// `GET /tables/{full_name}` requests, and the get-table count stays zero across
-/// pages regardless of how many tables the sweep returns.
+/// Scenario: listing issues only paginated `GET /tables` requests, never a per-table get-table.
 #[test]
 fn listing_issues_no_per_table_get_table_call() {
     let mock = MockUnityCatalog::start(|req| {
@@ -475,9 +439,7 @@ fn excluding_every_entry_yields_an_empty_but_successful_schema() {
     assert_eq!(mock.get_table_call_count(), 0);
 }
 
-/// adapterNotes.TABLE_MAP maps each uppercased Exasol name to its original-cased
-/// `catalog.schema.table` identifier; two identifiers that flatten to the same
-/// Exasol name are rejected with an error naming the colliding name.
+/// Scenario: TABLE_MAP maps each Exasol name to its identifier; a flatten collision is rejected.
 #[test]
 fn records_table_map_and_rejects_collision() {
     let happy = MockUnityCatalog::start(|req| {
@@ -524,12 +486,10 @@ fn records_table_map_and_rejects_collision() {
     );
 }
 
-/// createVirtualSchema against an unreachable Unity Catalog fails with a clear
-/// namespace-listing error that leaks no credential value.
+/// Scenario: an unreachable Unity Catalog fails with a listing error that leaks no credential.
 #[test]
 fn unreachable_unity_catalog_is_credential_safe_error() {
-    // Bind then drop a loopback socket to obtain a port nothing listens on, so the
-    // connect attempt is refused rather than hanging.
+    // A bound-then-dropped port refuses the connect rather than hanging.
     let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe socket");
     let port = probe.local_addr().unwrap().port();
     drop(probe);

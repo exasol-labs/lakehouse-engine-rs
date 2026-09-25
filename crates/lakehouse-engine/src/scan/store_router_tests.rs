@@ -16,8 +16,7 @@ fn entry(path: &str) -> FileEntry {
     FileEntry::new(path, 1)
 }
 
-/// One side's routing coordinates. `RoutedSide::new` reads `label`, `files`,
-/// and `table_root` only — never the backend — so every side here shares one.
+/// `RoutedSide::new` never reads the backend, so every side here shares one.
 fn scan_side<'a>(label: &'static str, files: &'a [FileEntry], table_root: &'a str) -> ScanSide<'a> {
     static UNREAD_BACKEND: LazyLock<StorageBackend> =
         LazyLock::new(|| StorageBackend::S3(StorageProps::default()));
@@ -40,15 +39,12 @@ fn entry_with_delete(path: &str, delete: &str) -> FileEntry {
     )
 }
 
-/// The owned-path set a side is expected to hold, built from LITERAL object-store
-/// paths rather than through `store_path`, so an expectation cannot agree with a
-/// broken resolution rule by sharing it.
+/// Built from literal paths, not `store_path`, so an expectation cannot share a broken resolution rule.
 fn owned_paths(paths: &[&str]) -> HashSet<ObjectStorePath> {
     paths.iter().map(|p| ObjectStorePath::from(*p)).collect()
 }
 
-/// An in-memory store holding `label` as the payload of every path in `paths`,
-/// so a value read back through the router names the side that served it.
+/// Every path holds `label` as payload, so a value read through the router names its serving side.
 async fn store_labelled(label: &str, paths: &[&str]) -> Arc<dyn ObjectStore> {
     let store = InMemory::new();
     for path in paths {
@@ -79,8 +75,7 @@ fn dimension_side(store: Arc<dyn ObjectStore>) -> RoutedSide {
     .expect("dimension side")
 }
 
-/// A fact-first router whose two sides BOTH hold `paths`, so a misroute returns
-/// the other side's payload instead of failing to find anything.
+/// Both sides hold `paths`, so a misroute returns the other side's payload instead of not-found.
 async fn router_over_both_sides(paths: &[&str]) -> PrefixRoutingObjectStore {
     PrefixRoutingObjectStore::new(vec![
         fact_side(store_labelled(FACT_LABEL, paths).await),
@@ -88,9 +83,7 @@ async fn router_over_both_sides(paths: &[&str]) -> PrefixRoutingObjectStore {
     ])
 }
 
-/// A fact-first router whose two sides each hold one marker object BELOW
-/// `prefix`, named after that side, so a routed listing's own result names the
-/// side that served it.
+/// Each side holds one marker below `prefix` named after itself, so a listing names its serving side.
 async fn router_with_listing_markers_below(prefix: &str) -> PrefixRoutingObjectStore {
     let fact_marker = format!("{prefix}/{FACT_LABEL}");
     let dimension_marker = format!("{prefix}/{DIM_LABEL}");
@@ -180,9 +173,7 @@ async fn each_sides_own_enumerated_file_path_routes_to_that_side() {
     assert_eq!(text_at(&router, DIM_FILE).await, DIM_LABEL);
 }
 
-/// A Delta `add.path` is logged percent-encoded (RFC 2396); the router must key
-/// ownership by the DECODED object-store path, since that is the key the store
-/// actually holds.
+/// Scenario: a percent-encoded Delta `add.path` is keyed by its decoded object-store path.
 #[test]
 fn store_path_decodes_a_percent_encoded_entry_path() {
     let path =
@@ -214,8 +205,7 @@ async fn an_out_of_tree_positional_delete_file_routes_to_its_data_files_side() {
     assert_eq!(text_at(&router, OUT_OF_TREE_DELETE).await, FACT_LABEL);
 }
 
-/// A mechanism naming no object-store path of its own — a Delta deletion vector —
-/// contributes nothing to the owned-path set: only the data file's own path is owned.
+/// Scenario: a deletion vector contributes no owned path; only the data file's path is owned.
 #[tokio::test]
 async fn a_deletion_vector_contributes_no_owned_path() {
     let files = [FileEntry::with_deletes(
@@ -245,11 +235,7 @@ async fn a_deletion_vector_contributes_no_owned_path() {
     );
 }
 
-/// "Delete-file relative and absolute paths resolve like data-file paths"
-/// (`datafusion-scan/scan-execution-file-metadata`): the ownership construction
-/// resolves each delete FILE path through the same table-root rule as the data
-/// file it hangs off — a relative path joins onto the root, an already-absolute
-/// path passes through unchanged, and an empty root joins nothing.
+/// Scenario: delete-file relative and absolute paths resolve like data-file paths.
 #[test]
 fn delete_file_paths_resolve_against_the_table_root_like_data_file_paths() {
     let rooted = [
@@ -325,8 +311,7 @@ async fn nested_side_roots_route_by_the_longest_matching_root() {
     const UNDER_BOTH_ROOTS: &str = "wh/dim/data/unlisted.parquet";
     const UNDER_THE_OUTER_ROOT_ONLY: &str = "wh/other/unlisted.parquet";
     let seeded = [UNDER_BOTH_ROOTS, UNDER_THE_OUTER_ROOT_ONLY];
-    // The fact side comes FIRST and holds the SHORTER root, so a
-    // first-match-wins root rule would claim both paths for it.
+    // Fact comes first with the shorter root, so a first-match-wins rule would claim both paths.
     let router = PrefixRoutingObjectStore::new(vec![
         RoutedSide::new(
             &scan_side(
@@ -360,8 +345,7 @@ async fn a_path_both_sides_enumerate_routes_to_the_earlier_fact_side() {
     ]);
 
     assert_eq!(text_at(&fact_first, SHARED).await, FACT_LABEL);
-    // Reversed, the dimension side wins — so both sides really do own the path
-    // and the tie is broken by the sides' order alone.
+    // Reversed, the dimension side wins: the tie is broken by side order alone.
     assert_eq!(text_at(&dimension_first, SHARED).await, DIM_LABEL);
 }
 

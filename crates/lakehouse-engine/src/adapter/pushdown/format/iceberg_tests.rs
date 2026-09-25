@@ -3,8 +3,7 @@ use super::*;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend};
 
-/// Credentials whose SigV4 mode makes the `loadTable` GET the only request the
-/// resolution issues, so a single-shot loopback catalog answers the whole run.
+/// SigV4 mode makes `loadTable` the only request, so a single-shot loopback catalog suffices.
 fn one_request_sigv4_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "123456789012".into(),
@@ -27,13 +26,8 @@ fn one_request_sigv4_creds() -> ConnectionCreds {
     }
 }
 
-/// A `loadTable` response for a table with a location, a two-field schema, a
-/// name-mapping property, and NO snapshot.
-///
-/// The absent snapshot is what keeps this a unit test: `TableScanBuilder::build`
-/// answers an empty `TableScan` when `current_snapshot()` is `None`, so the
-/// resolution returns its schema, root, and name mapping without reading a single
-/// object from the store the location names.
+/// No snapshot: `TableScanBuilder::build` then answers an empty scan, so resolution reads
+/// no object from the store.
 fn name_mapped_load_table_body() -> String {
     serde_json::json!({
         "metadata-location": "s3://bucket/db/t/metadata/v1.json",
@@ -68,15 +62,7 @@ fn name_mapped_load_table_body() -> String {
     .to_string()
 }
 
-/// Scenario: Iceberg planning is byte-identical through the new seam — the
-/// reader now OWNS resolution outright.
-///
-/// Driven once through the reader against a loopback catalog serving a
-/// two-field, name-mapped, snapshotless table, this asserts the reader
-/// resolves the fixture's files, table root, effective storage,
-/// field-id-bound logical schema, and name mapping, and adds no partition
-/// columns. `dispatch_golden_tests.rs` is where encoding byte-identity itself
-/// is pinned.
+/// Scenario: The Iceberg reader owns resolution and adds no partition columns
 #[tokio::test]
 async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
     let creds = one_request_sigv4_creds();
@@ -148,12 +134,7 @@ async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Fail-loud on unsupported delete/data mechanisms (manifest level)
-// ---------------------------------------------------------------------------
-
-/// The two mechanisms this engine CAN apply — a Parquet data file and a
-/// Parquet positional-delete file — classify as supported (`Ok`).
+/// Scenario: Parquet data and Parquet positional-delete files classify as supported
 #[test]
 fn classify_accepts_parquet_data_and_parquet_positional_delete() {
     assert!(
@@ -166,7 +147,7 @@ fn classify_accepts_parquet_data_and_parquet_positional_delete() {
     );
 }
 
-/// Equality deletes fail loud regardless of file format.
+/// Scenario: Equality deletes fail loud regardless of file format
 #[test]
 fn classify_rejects_equality_deletes() {
     for fmt in [
@@ -182,10 +163,7 @@ fn classify_rejects_equality_deletes() {
     }
 }
 
-/// A position delete stored as a Puffin blob is a v3 deletion vector — the
-/// exact case indistinguishable from a Parquet positional delete once
-/// `plan_files` has dropped the format discriminator, so it MUST be caught at
-/// the manifest level.
+/// Scenario: A Puffin position delete (v3 deletion vector) is rejected at manifest level
 #[test]
 fn classify_rejects_puffin_deletion_vector() {
     assert_eq!(
@@ -195,7 +173,7 @@ fn classify_rejects_puffin_deletion_vector() {
     );
 }
 
-/// ORC/Avro data and delete files fail loud.
+/// Scenario: ORC and Avro data and delete files fail loud
 #[test]
 fn classify_rejects_orc_and_avro_data_and_delete_files() {
     assert_eq!(
@@ -216,8 +194,7 @@ fn classify_rejects_orc_and_avro_data_and_delete_files() {
     );
 }
 
-/// The fail-loud error names the mechanism, names the table, and leaks no
-/// credential (defensively redacted).
+/// Scenario: The unsupported-delete error names mechanism and table and leaks no credential
 #[test]
 fn unsupported_delete_error_names_mechanism_and_redacts() {
     let err = unsupported_delete_error(
@@ -236,7 +213,6 @@ fn unsupported_delete_error_names_mechanism_and_redacts() {
         msg.contains("db.mor_dv_table"),
         "error must name the offending table: {msg}"
     );
-    // No credential label may survive the defensive redaction.
     assert!(
         !msg.contains("access_key"),
         "must not leak access_key: {msg}"
@@ -247,16 +223,7 @@ fn unsupported_delete_error_names_mechanism_and_redacts() {
     );
 }
 
-/// A manifest-read error that echoes Azure static credentials verbatim has
-/// BOTH literal values stripped — not merely their labels.
-///
-/// The two credentials fail the label heuristic in different ways, so each
-/// independently requires the value-based pass:
-///   - the account key is echoed bare inside a string-to-sign, with no
-///     recognizable label anywhere near it;
-///   - the SAS token carries its OWN `sig=` label, so a label-only pass
-///     rewrites the middle of the token and leaves its permission and expiry
-///     fields verbatim.
+/// Scenario: Manifest-read errors redact the literal Azure account key and SAS token values
 #[test]
 fn manifest_read_errors_redact_the_literal_azure_secret_values() {
     let account_key = "Zm9vYmFyYmF6cXV1eGNvcmdlc2VjcmV0QUNDT1VOVEtFWT09";
@@ -294,10 +261,7 @@ fn manifest_read_errors_redact_the_literal_azure_secret_values() {
     );
 }
 
-/// `iceberg_delete_mechanism` maps the iceberg task-level content type onto the
-/// mechanism honestly: position → positional, equality → equality, and the `Data`
-/// sentinel (which never appears in a task's delete list) → the non-positional
-/// mechanism the scan's read-time backstop rejects rather than applies.
+/// Scenario: Task-level delete content types map to mechanisms, the Data sentinel to a non-positional one
 #[test]
 fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
     use iceberg::spec::DataContentType;
@@ -325,16 +289,7 @@ fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Iceberg `schema.name-mapping.default` parsing
-// ---------------------------------------------------------------------------
-
-/// A representative `schema.name-mapping.default` payload — mirroring the
-/// Iceberg spec's own example shape — flattens to one `NameMappingEntry` per
-/// TOP-LEVEL name. Multi-name entries expand to one entry per name (Avro field
-/// aliases); an entry's nested `fields` children are excluded, but the entry's
-/// OWN top-level name(s) are still included; an entry with no `field-id` at
-/// all (schema-only, not present in imported files) is fully excluded.
+/// Scenario: Name mapping flattens top-level entries per name, excluding nested and id-less entries
 #[test]
 fn resolves_name_mapping_flat_entries_once() {
     let raw = r#"
@@ -376,9 +331,7 @@ fn resolves_name_mapping_flat_entries_once() {
     );
 }
 
-/// An absent `schema.name-mapping.default` property (`None`) yields an empty
-/// mapping, not an error — a table with no name-mapping is the common,
-/// fully-supported case.
+/// Scenario: An absent name-mapping property yields an empty mapping
 #[test]
 fn absent_name_mapping_is_empty() {
     assert_eq!(
@@ -387,8 +340,7 @@ fn absent_name_mapping_is_empty() {
     );
 }
 
-/// A present-but-malformed `schema.name-mapping.default` value fails loud with
-/// a clean, credential-free plan-time error that names the offending property.
+/// Scenario: A malformed name-mapping property fails with a clean, credential-free error
 #[test]
 fn malformed_name_mapping_errors_cleanly() {
     let err = parse_name_mapping(Some("{ not valid json mapping shape"))
@@ -408,12 +360,7 @@ fn malformed_name_mapping_errors_cleanly() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Effective storage: vended vs. static, and the empty-location guard
-// ---------------------------------------------------------------------------
-
-/// A `loadTable` response body with `location` present but empty — an omitted
-/// key fails deserialization earlier and never reaches the guard under test.
+/// `location` present but empty: an omitted key fails deserialization before the guard.
 fn load_table_body_with_empty_location() -> String {
     serde_json::json!({
         "metadata-location": "s3://bucket/db/t/metadata/v1.json",
@@ -465,17 +412,13 @@ async fn effective_storage_from_loopback_catalog(
         .map(|resolved| resolved.effective_storage)
 }
 
-/// Drive the reader against a single-shot loopback catalog that answers
-/// `loadTable` with an empty table location.
 async fn resolve_against_locationless_catalog(creds: &ConnectionCreds) -> Result<(), UdfError> {
     effective_storage_from_loopback_catalog(creds, load_table_body_with_empty_location())
         .await
         .map(|_| ())
 }
 
-/// A `loadTable` response with an empty table `location` is rejected as a
-/// `UdfError::User`, with the identical message whether or not vended credentials
-/// are requested.
+/// Scenario: An empty table location errors identically on vended and static paths
 #[tokio::test]
 async fn absent_table_location_errors_on_both_vended_and_static_paths() {
     let static_creds = one_request_sigv4_creds();
@@ -525,9 +468,7 @@ async fn absent_table_location_errors_on_both_vended_and_static_paths() {
     );
 }
 
-/// The store address the CONNECTION configures, and the DIFFERENT one the catalog
-/// vends for the very same table. Every value is distinct, so which source placed
-/// the resolved store is readable off the resolved value alone.
+/// All values distinct, so which source placed the resolved store is readable off the result.
 const CONNECTION_ENDPOINT: &str = "https://connection-store.example.com";
 const CONNECTION_REGION: &str = "eu-central-1";
 const VENDED_ENDPOINT: &str = "https://vended-store.example.com";
@@ -536,13 +477,8 @@ const VENDED_ACCESS_KEY: &str = "vended-access-key";
 const VENDED_SECRET_KEY: &str = "vended-secret-key";
 const VENDED_SESSION_TOKEN: &str = "vended-session-token";
 
-/// A `loadTable` response vending a complete S3 credential set AND a store address
-/// of its own, for a table whose metadata carries NO snapshot.
-///
-/// The absent snapshot is what keeps this a pure unit test: `TableScanBuilder::build`
-/// answers an empty `TableScan` when `current_snapshot()` is `None`, so the reader
-/// reaches its effective-storage decision and returns without reading a single
-/// object from the store that address names.
+/// No snapshot, so the reader returns after its effective-storage decision without reading
+/// from the vended store.
 fn load_table_body_vending_its_own_store_address() -> String {
     serde_json::json!({
         "metadata-location": "s3://bucket/db/t/metadata/v1.json",
@@ -573,15 +509,7 @@ fn load_table_body_vending_its_own_store_address() -> String {
     .to_string()
 }
 
-/// Under vending, a CONNECTION-configured `endpoint` and `region` place the store
-/// while the credentials still come from the catalog alone.
-///
-/// This is the only test at the layer that PERFORMS the split: the reader is what
-/// narrows the CONNECTION down to a `StaticStoreAddress` before handing it to the
-/// vended selector. Both vended E2E fixtures carry CONNECTIONs with an empty
-/// `endpoint` and `region`, so neither can tell an address that came from the
-/// CONNECTION from one that came from nowhere — substituting
-/// `&StaticStoreAddress::default()` at that call site fails HERE and nowhere else.
+/// Scenario: Vended addressing prefers the CONNECTION endpoint and region, credentials stay vended
 #[tokio::test]
 async fn vended_addressing_prefers_the_connection_endpoint_and_region() {
     let mut creds = one_request_sigv4_creds();
@@ -841,10 +769,7 @@ fn a_decimal_precision_widening_history_plans_normally() {
         .expect("a decimal precision widening must plan normally");
 }
 
-/// A `loadTable` response for a table whose schema history records `event_day`
-/// as `date` in an earlier schema and `timestamp` in the current one, with NO
-/// snapshot — so a wiring test that reaches this refusal proves `resolve_scan`
-/// invokes it, without needing a live manifest read to fail on.
+/// No snapshot, so reaching the refusal proves `resolve_scan` invokes it without a manifest read.
 fn load_table_body_with_promoted_date_column() -> String {
     serde_json::json!({
         "metadata-location": "s3://bucket/db/t/metadata/v1.json",
@@ -922,9 +847,7 @@ fn assert_promotion_refusal_names_table_column_and_issue(err: UdfError) {
     );
 }
 
-/// `resolve_scan` — the real plan-time entry point, not the isolated
-/// `refuse_date_promotion` unit — refuses an unfiltered (`SELECT *`) request
-/// against a table carrying a recorded `date` -> `timestamp` promotion.
+/// Scenario: resolve_scan refuses a promoted date table for an unfiltered request
 #[tokio::test]
 async fn resolve_scan_refuses_a_promoted_date_table_for_an_unfiltered_request() {
     let err = resolve_promoted_date_table(None)
@@ -934,9 +857,7 @@ async fn resolve_scan_refuses_a_promoted_date_table_for_an_unfiltered_request() 
     assert_promotion_refusal_names_table_column_and_issue(err);
 }
 
-/// The same refusal fires identically when the request carries a filter,
-/// because the manifest bounds-decode gap it stands in front of occurs during
-/// manifest deserialization rather than during predicate pruning.
+/// Scenario: resolve_scan refuses a promoted date table for a filtered request
 #[tokio::test]
 async fn resolve_scan_refuses_a_promoted_date_table_for_a_filtered_request() {
     let filter = serde_json::json!({"op": "eq", "column": "id", "value": 1});
@@ -949,10 +870,6 @@ async fn resolve_scan_refuses_a_promoted_date_table_for_a_filtered_request() {
     assert_promotion_refusal_names_table_column_and_issue(err);
 }
 
-/// A `loadTable` response whose schema history records the three promotions this
-/// engine reads — `amount` `int` -> `long`, `reading` `float` -> `double`,
-/// `price` `decimal(10,2)` -> `decimal(20,2)` — each keeping its field id, with
-/// NO snapshot so the resolution reaches its schema without a manifest read.
 fn load_table_body_with_readable_promotions() -> String {
     serde_json::json!({
         "metadata-location": "s3://bucket/db/t/metadata/v1.json",
@@ -987,10 +904,7 @@ fn load_table_body_with_readable_promotions() -> String {
     .to_string()
 }
 
-/// Scenario: a promotion this engine reads resolves through the shared
-/// relaxation cast — the logical schema is built from the table's CURRENT
-/// schema, so each promoted column carries the PROMOTED type against its
-/// original field id rather than the type schema 0 declared.
+/// Scenario: A readable Iceberg promotion carries the current type against its original field id
 #[tokio::test]
 async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_type() {
     let creds = one_request_sigv4_creds();

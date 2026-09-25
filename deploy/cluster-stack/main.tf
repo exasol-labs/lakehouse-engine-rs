@@ -5,11 +5,9 @@ locals {
   subnet_id   = data.terraform_remote_state.data.outputs.subnet_id
   ssm_root    = "/spot-strata/cluster/${var.env_name}"
 
-  # Ingress allowlist: explicit var, else this machine's public IP /32 (resolved at apply).
   my_ip_cidr      = "${chomp(data.http.my_ip.response_body)}/32"
   effective_cidrs = length(var.allowed_cidrs) > 0 ? var.allowed_cidrs : [local.my_ip_cidr]
 
-  # Exasol SG ports (verified against etc/exasol-sec-group.png).
   mgmt_ports   = [22, 20002, 20003] # SSH, container ssh, confd
   client_ports = [8563, 8443, 2581] # DB, Admin UI, BucketFS
 }
@@ -27,7 +25,6 @@ data "aws_ami" "ubuntu" {
   }
 }
 
-# --- Security group ---------------------------------------------------------
 resource "aws_security_group" "exasol" {
   name        = "${local.prefix}-sg"
   description = "Exasol cluster ${var.env_name}"
@@ -46,7 +43,6 @@ resource "aws_security_group_rule" "ingress" {
   description       = "port ${each.value} from allowlist"
 }
 
-# Inter-node: all traffic within the SG.
 resource "aws_security_group_rule" "internode" {
   type              = "ingress"
   from_port         = 0
@@ -67,7 +63,6 @@ resource "aws_security_group_rule" "egress" {
   description       = "all egress"
 }
 
-# --- Nodes (node_count active + reserve_nodes) ------------------------------
 resource "aws_instance" "node" {
   count                       = local.total_nodes
   ami                         = data.aws_ami.ubuntu.id
@@ -94,7 +89,6 @@ resource "aws_instance" "node" {
   tags = { Name = "${local.prefix}-n1${count.index + 1}" }
 }
 
-# --- Passwords -> SSM SecureString ------------------------------------------
 resource "random_password" "db" {
   length  = 20
   special = false

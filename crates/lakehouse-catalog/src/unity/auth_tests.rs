@@ -1,8 +1,3 @@
-//! Tests for the Unity Catalog authentication strategy: PAT verbatim bearer,
-//! OAuth machine-to-machine mint/cache/refresh, the no-auth mode, and the
-//! credential-safe grant failure. Grants are served by an in-process mock; the
-//! refresh test drives an injected clock so it needs no real clock or sleep.
-
 use super::*;
 use crate::test_support::base_creds;
 use crate::unity::mock_server::spawn;
@@ -108,8 +103,6 @@ async fn oauth_token_is_cached_and_refreshed_before_expiry() {
     })
     .await;
 
-    // A clock the test advances by hand, so caching and refresh are observed
-    // without a real clock or a sleep.
     let ticks = Arc::new(Mutex::new(Instant::now()));
     let clock_ticks = ticks.clone();
     let source = OAuthTokenSource {
@@ -134,7 +127,7 @@ async fn oauth_token_is_cached_and_refreshed_before_expiry() {
         "no second grant while the cached token is still valid"
     );
 
-    // Expiry is 120s and the refresh skew is 60s, so the refresh point is +60s.
+    // Expiry 120s minus 60s skew: refresh point is +60s.
     *ticks.lock().unwrap() += Duration::from_secs(61);
     let refreshed = source.bearer().await.expect("refresh mint");
     assert_eq!(
@@ -147,9 +140,6 @@ async fn oauth_token_is_cached_and_refreshed_before_expiry() {
 
 #[tokio::test]
 async fn oauth_grant_missing_expires_in_is_a_clear_error() {
-    // A token endpoint that omits expires_in gives the cache no lifetime: the
-    // grant must fail loudly rather than mint a token that re-grants on every
-    // request.
     let server = spawn(|_req| {
         (
             200,
@@ -217,7 +207,6 @@ async fn oauth_grant_zero_expires_in_is_a_clear_error() {
 #[tokio::test]
 async fn unauthenticated_mode_sends_no_authorization_header() {
     let server = spawn(|_req| (200, r#"{"tables":[]}"#.to_string())).await;
-    // base_creds() supplies neither a token nor OAuth client credentials.
     let session = UnityCatalogSession::new(&server.base_url, base_creds());
 
     session
@@ -269,11 +258,7 @@ async fn failed_oauth_grant_is_credential_safe_error() {
     );
 }
 
-/// Scenario: `token` supplied alongside a complete `client_id`/`client_secret`
-/// pair is a shape `validate_creds` rejects (rule 6) before any catalog
-/// session exists — `supplied_catalog_auth` classifies it `Unauthenticated`,
-/// so `resolve_unity_auth` must resolve to `UnityAuth::None`. Synchronous and
-/// infallible, so no network fixture is needed.
+/// Scenario: a `token` plus a full client-credentials pair resolves to `UnityAuth::None`
 #[test]
 fn resolve_unity_auth_is_unauthenticated_for_the_validation_rejected_shape() {
     let client = reqwest::Client::new();

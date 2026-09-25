@@ -1,25 +1,7 @@
-//! Which object-storage backend a scan reads its data files through, and the
-//! credentials for it.
-//!
-//! [`StorageBackend`] is declared here, in the crate that PRODUCES storage
-//! credentials — a `loadTable` response vends them — so one type backs one serde
-//! wire contract for every consumer downstream.
-//!
-//! This module is also the single owner of the mapping from a backend's
-//! credentials to iceberg's storage config keys: [`StorageBackend::catalog_storage_props`]
-//! is the one place those keys are named, and both the REST-catalog props map and
-//! the `FileIO` are configured from it, so neither can drift from the other.
-//!
-//! It is, third, the single home for vended-storage POLICY and CONSTRUCTION: the
-//! `abfs://` and plaintext-endpoint consent gates, the CONNECTION-wins
-//! store-address rule, and the two `StorageBackend` constructions both catalog
-//! kinds share. It lives here because this enum's own module already owns which
-//! module may name a variant, so the Iceberg and Unity Catalog vended selectors
-//! fork only on how a value is read off the wire, never on what makes it
-//! acceptable.
-//!
-//! Credential values NEVER appear in any returned error;
-//! [`StorageBackend::secret_values`] is what the redaction sites strip against.
+//! Object-storage backend and credentials. Sole owner of the iceberg storage config
+//! keys ([`StorageBackend::catalog_storage_props`]) and of the vended-storage policy
+//! both catalog kinds share, so neither can drift. Credential values never appear in
+//! a returned error.
 
 use crate::{ConnectionCreds, StorageProps};
 use exasol_udf_sdk::error::UdfError;
@@ -32,25 +14,12 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-/// Exactly one Azure ADLS Gen2 credential — a shared account key or an inline
-/// shared-access-signature (SAS) token, never both and never neither.
-///
-/// A two-`Option` shape would let both be set at once, and `object_store`'s
-/// `MicrosoftAzureBuilder::build()` silently prefers the access key over the SAS
-/// when both are present — resolving that contradiction without telling anyone.
-/// This enum makes the ambiguous shape unrepresentable instead: `validate_creds`
-/// is then the one place a caller supplying both is told so, rather than the
-/// object-store builder picking silently.
-///
-/// `snake_case` variant keys match the outer [`StorageBackend`]'s lowercase wire
-/// convention and the `account_key`/`sas_token` vocabulary already used by the
-/// CONNECTION string and `adls.*` iceberg config keys.
+/// An enum rather than two `Option`s: `MicrosoftAzureBuilder::build()` silently prefers
+/// the account key when both are set.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdlsCred {
-    /// A shared storage-account key.
     AccountKey(String),
-    /// An inline shared-access-signature token.
     Sas(String),
 }
 
@@ -63,37 +32,16 @@ impl std::fmt::Debug for AdlsCred {
     }
 }
 
-/// The object-storage backend a scan reads its data files through, carrying that
-/// backend's connection properties and credentials.
-///
-/// Externally tagged (serde's default) with a lowercase variant key, so an S3
-/// backend is `{"s3": {…}}` on the wire. Externally tagged rather than untagged
-/// because this is a credentials path: untagged selects a variant by trial
-/// deserialization, which resolves a malformed or ambiguous payload to whichever
-/// variant happens to parse instead of rejecting it.
-///
-/// Wrapping [`StorageProps`] rather than inlining its fields keeps that struct —
-/// its `Default`, its `secret_values`, and its serde field contract — the single
-/// S3 credential type, so an added backend is a new variant beside it rather than
-/// an edit to it. `Adls` has no equivalent pre-existing struct to protect, so it
-/// carries its two fields inline instead of wrapping a symmetry-only type.
+/// Externally tagged (`{"s3": {…}}`), never untagged: trial deserialization would
+/// resolve a malformed credentials payload to whichever variant happens to parse.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum StorageBackend {
-    /// S3-compatible object storage (AWS S3, MinIO).
     S3(StorageProps),
-    /// Azure Data Lake Storage Gen2, reached via `abfss://`.
     Adls {
-        /// Configures the iceberg `FileIO` manifest-read path via
-        /// [`Self::catalog_storage_props`] — an `account_name` that disagrees
-        /// with the credential's actual account surfaces as an auth failure
-        /// there, at plan time (manifest read), before any scan runs. The
-        /// DataFusion scan path does NOT read this field — it derives the
-        /// account from the host of the side's own file URIs via
-        /// `MicrosoftAzureBuilder::with_url`
-        /// (`crates/lakehouse-engine/src/scan/object_store.rs`) instead.
+        /// Used only by the iceberg `FileIO` manifest-read path; the DataFusion scan
+        /// derives the account from each file URI's host instead.
         account_name: String,
-        /// Exactly one Azure credential for that account.
         cred: AdlsCred,
     },
 }
@@ -112,10 +60,7 @@ impl std::fmt::Debug for StorageBackend {
 }
 
 impl StorageBackend {
-    /// The non-empty secret values this backend's credentials contain.
-    ///
-    /// Used for value-based error redaction: any error string containing one of
-    /// these literal values has it stripped before the error is surfaced.
+    /// Non-empty secret values, for value-based error redaction.
     pub fn secret_values(&self) -> Vec<&str> {
         match self {
             Self::S3(storage) => storage.secret_values(),
@@ -133,12 +78,6 @@ impl StorageBackend {
         }
     }
 
-    /// This backend's iceberg storage config keys, as the props map both the REST
-    /// catalog `load` call and [`Self::file_io`] are configured from.
-    ///
-    /// Crate-private because naming an iceberg config key is this module's
-    /// decision alone: a caller outside the crate holding the map could re-derive
-    /// the same keys and drift from it.
     pub(crate) fn catalog_storage_props(&self) -> HashMap<String, String> {
         let mut props = HashMap::new();
         match self {
@@ -177,11 +116,6 @@ impl StorageBackend {
         props
     }
 
-    /// A `FileIO` the iceberg `Table` reads manifest files through, configured
-    /// from this backend's credentials.
-    ///
-    /// Used by the signed path to give the `Table` a way to read manifest files
-    /// after we have fetched and deserialized the `LoadTableResult`.
     pub fn file_io(&self) -> iceberg::io::FileIO {
         let factory = match self {
             Self::S3(_) => OpenDalStorageFactory::S3 {
@@ -194,7 +128,7 @@ impl StorageBackend {
             .build()
     }
 
-    /// Exhaustively matched so a new backend is a build failure here; Azure accepts only `abfss`, never plaintext `abfs`.
+    /// Azure accepts only `abfss`, never plaintext `abfs`.
     pub fn addresses_scheme(&self, scheme: &str) -> bool {
         match self {
             Self::S3(_) => matches!(scheme, "s3" | "s3a"),
@@ -203,19 +137,12 @@ impl StorageBackend {
     }
 }
 
-/// The storage-backend KIND a vended table location's URI scheme selects — the
-/// single scheme-to-variant-kind classification both vended selectors share. It
-/// names ONLY which kind the scheme selects and constructs no [`StorageBackend`],
-/// so each vended selector builds its own variant from its own credential family.
 pub(crate) enum VendedBackendKind {
     S3,
     Adls,
 }
 
-/// Classify a vended table location's (already-lowercased) URI scheme into the
-/// storage-backend kind it selects, or `None` when the scheme names no supported
-/// backend: `s3`/`s3a` select S3 and `abfs`/`abfss` select ADLS, in this one home
-/// rather than duplicated across the vended selectors.
+/// Expects an already-lowercased scheme.
 pub(crate) fn classify_vended_scheme(scheme: &str) -> Option<VendedBackendKind> {
     match scheme {
         "s3" | "s3a" => Some(VendedBackendKind::S3),
@@ -224,18 +151,15 @@ pub(crate) fn classify_vended_scheme(scheme: &str) -> Option<VendedBackendKind> 
     }
 }
 
-/// The URI scheme of a vended table location, lowercased per RFC 3986 §3.1, or
-/// empty when the location carries none.
+/// Lowercased per RFC 3986 §3.1; empty when the location carries none.
 pub fn scheme_of(location: &str) -> String {
     location
         .split_once("://")
         .map_or(String::new(), |(scheme, _)| scheme.to_ascii_lowercase())
 }
 
-/// The storage host of a table location: its authority segment, read after any
-/// `<container>@` userinfo. For ADLS that is the `<account>.dfs.core.windows.net`
-/// the vended SAS keys are suffixed with, so one reading serves both the SAS
-/// selection and the account name.
+/// The authority after any `<container>@` userinfo; for ADLS, the host vended SAS keys
+/// are suffixed with.
 pub(crate) fn location_host(location: &str) -> &str {
     let after_scheme = location
         .split_once("://")
@@ -248,21 +172,8 @@ pub(crate) fn location_host(location: &str) -> &str {
         .map_or(authority, |(_, host)| host)
 }
 
-/// The ADLS account name the storage host of `location` names: the first
-/// dot-separated label of [`location_host`]'s result for it, the `<account>` of
-/// `<account>.dfs.core.windows.net`. The host is derived here rather than taken
-/// as a second argument, so it cannot be paired with a location it was not read
-/// from — a refusal always names a host the location actually has. Both vended
-/// selectors read the account name from the same host their SAS selection
-/// matched, so a disagreeing account name can never desynchronise from the SAS
-/// it travels with, and share this one refusal text, which names neither catalog
-/// kind.
-///
-/// The label is read from the host byte-exactly, never case-folded: the
-/// downstream `adls.account-name` wrong-account guard compares it byte-for-byte
-/// against the account parsed out of each file URI
-/// (`iceberg-storage-opendal-0.10.0/src/azdls.rs:165`), so case-folding it here
-/// would fire that guard on the very locations it was derived from.
+/// Never case-folded: iceberg-storage-opendal's `adls.account-name` guard compares it
+/// byte-for-byte against the account parsed from each file URI.
 fn adls_account_name(location: &str) -> Result<&str, UdfError> {
     let host = location_host(location);
     host.split('.')
@@ -277,17 +188,8 @@ fn adls_account_name(location: &str) -> Result<&str, UdfError> {
         })
 }
 
-/// The store address a vended resolution may take from the CONNECTION: an S3
-/// endpoint, a region, and an optional path-style addressing preference.
-///
-/// Under vending the catalog's response is the sole source of CREDENTIALS, while
-/// ADDRESSING may still come from the CONNECTION. Handing the selectors
-/// `&ConnectionCreds` to express that would put every static credential back
-/// within their reach, so the parameter is narrowed to a type that CANNOT carry
-/// one. Its fields are private, which leaves [`Default`] and the single
-/// [`From<&ConnectionCreds>`] conversion below as the only constructions
-/// reachable outside this module — widening what crosses over is then an edit to
-/// that one conversion rather than a field a distant call site can set.
+/// The CONNECTION addressing a vended resolution may use. Deliberately cannot carry a
+/// credential, so static keys never reach the vended path.
 #[derive(Debug, Default)]
 pub struct StaticStoreAddress {
     endpoint: String,
@@ -296,18 +198,14 @@ pub struct StaticStoreAddress {
 }
 
 impl StaticStoreAddress {
-    /// The CONNECTION's S3 endpoint, empty when it configured none.
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
 
-    /// The CONNECTION's S3 region, empty when it configured none.
     pub fn region(&self) -> &str {
         &self.region
     }
 
-    /// The CONNECTION's stated path-style preference, `None` when it configured
-    /// none.
     pub fn path_style(&self) -> Option<bool> {
         self.path_style
     }
@@ -323,16 +221,7 @@ impl From<&ConnectionCreds> for StaticStoreAddress {
     }
 }
 
-/// The S3 credential and address values a vended response yields, in the neutral
-/// shape both catalog kinds reduce to before the shared policy runs.
-///
-/// The two wire shapes genuinely differ — a flat map of Iceberg REST config keys,
-/// and Unity Catalog's typed `aws_temp_credentials` — but what makes the
-/// resulting values acceptable does not, so the fork stops at this type.
-/// `path_style` is an `Option` because "the response stated no
-/// `s3.path-style-access`" is a third state the derivation branches on, distinct
-/// from a stated `false`. Carries live credentials, so it deliberately derives no
-/// `Debug`.
+/// Carries live credentials, so it deliberately derives no `Debug`.
 pub(crate) struct VendedS3 {
     pub(crate) access_key: String,
     pub(crate) secret_key: String,
@@ -342,29 +231,10 @@ pub(crate) struct VendedS3 {
     pub(crate) path_style: Option<bool>,
 }
 
-/// The S3 backend a vended credential family describes for `location`, addressed
-/// by the CONNECTION-wins rule and refused when the resolved endpoint names
-/// plaintext transport the operator has not consented to.
-///
-/// Credentials come from `vended` ALONE; only the ADDRESS may cross over from the
-/// CONNECTION, independently per field. The gate reads the RESOLVED endpoint
-/// rather than the vended one because either source can name plaintext transport,
-/// and the one that wins the address rule is the one the scan actually reads
-/// through.
-///
-/// An address that resolves both fields empty is a SUCCESS, not a refusal: AWS's
-/// default credential and region chain places the store from the ambient
-/// environment at read time, and a real Databricks AWS response vends a key pair
-/// with no endpoint and no region at all — rejecting it at plan time would refuse
-/// a legal table.
-///
-/// `path_style` resolves a three-step chain: the CONNECTION's stated value wins
-/// when set, else the value the vended response states, else a last-resort
-/// derivation from whether an endpoint resolved at all. The derivation exists
-/// because `register_side_store` treats `path_style` as the gate on whether
-/// `endpoint` reaches `AmazonS3Builder` — an endpoint beside `path_style: false`
-/// would be silently dropped for a virtual-hosted host derived from the region,
-/// which is the wrong store rather than a plan-time error.
+/// The plaintext gate reads the RESOLVED endpoint, since either source can name one.
+/// An empty endpoint and region is valid: Databricks vends neither, and AWS's default
+/// chain places the store. `path_style` falls back to "an endpoint resolved" because
+/// `register_side_store` drops the endpoint when `path_style` is false.
 pub(crate) fn s3_backend(
     vended: VendedS3,
     location: &str,
@@ -410,13 +280,8 @@ fn resolved_address_field(connection: &str, vended: Option<&str>) -> String {
     vended.unwrap_or_default().to_string()
 }
 
-/// The ADLS backend a vended SAS describes for `location`, refused when the
-/// location names plaintext transport the operator has not consented to.
-///
-/// The gate lives inside the construction rather than at the scheme
-/// classification so that reaching a backend is what enforces it: a selector
-/// that classifies and then constructs cannot end up ungated by omitting a match
-/// arm, which is exactly how the two selectors drifted apart.
+/// The `abfs://` gate lives in the construction so no selector can reach a backend
+/// ungated.
 pub(crate) fn adls_backend(
     sas: String,
     location: &str,

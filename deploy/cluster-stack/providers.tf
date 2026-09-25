@@ -6,8 +6,7 @@ terraform {
     http   = { source = "hashicorp/http", version = "~> 3.4" }
   }
 
-  # Shared S3 state (was local backend, see data-stack/providers.tf for why). Bucket/key/region come
-  # from `tofu init -backend-config=backend.hcl` (gitignored), not hardcoded here.
+  # Bucket/key/region come from `tofu init -backend-config=backend.hcl` (gitignored).
   backend "s3" {}
 }
 
@@ -23,8 +22,8 @@ locals {
     "exa:DataClassification" = var.data_classification
     "exa:AutoShutdown"       = "true"
   }
-  # CreatedDate/ExpiryDate are recommended for temp resources; include only when created_date is set
-  # (keeps default_tags plan-known -> avoids the tags_all "inconsistent final plan" provider bug).
+  # Only set when created_date is given: keeps default_tags plan-known, avoiding the provider's
+  # tags_all "inconsistent final plan" bug.
   date_tags = var.created_date != "" ? {
     "exa:CreatedDate" = var.created_date
     "exa:ExpiryDate"  = formatdate("YYYY-MM-DD", timeadd("${var.created_date}T00:00:00Z", "${var.ttl_days * 24}h"))
@@ -40,8 +39,6 @@ provider "aws" {
   }
 }
 
-# Read the persistent data-stack outputs (same VPC/subnet so cluster sits next to S3/Glue).
-# var.tofu_state_bucket comes from terraform.tfvars (gitignored) — not hardcoded (see backend above).
 data "terraform_remote_state" "data" {
   backend = "s3"
   config = {
