@@ -700,10 +700,9 @@ struct BroadcastWindowPlacement {
 
 /// Decide where `window`'s row bound lands: the join block (per shard), the
 /// outer merge, an outer wrapper over the merged fan-out, or nowhere at all.
-/// Returns `None` for [`JoinWindowPlan::ExasolPostProcessed`], and also for an
-/// [`JoinWindowPlan::Ordered`] whose sort key is absent from `projection` (an
-/// unprojected key has nothing to bind to — see `bound_sort_key`). Both cases
-/// are the caller's signal to fall through to the N-scan wrapper.
+/// Returns `None` for [`JoinWindowPlan::ExasolPostProcessed`] or an
+/// [`JoinWindowPlan::Ordered`] key absent from `projection` — both signal the
+/// caller to fall through to the N-scan wrapper.
 ///
 /// Whatever lands in the join block lands only AFTER the node-local join, never
 /// on a side's scanned input, for the reason stated once in
