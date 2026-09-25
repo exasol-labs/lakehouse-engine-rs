@@ -213,13 +213,9 @@ impl CatalogClient for UnityCatalogSession {
                     namespace: namespace.clone(),
                     name: info.name.clone(),
                 };
-                let skip_reason =
-                    delta_base_skip_reason(&info.table_type, info.data_source_format.as_deref());
-                match skip_reason {
-                    Some(reason) => skipped.push(SkippedTable { ident, reason }),
-                    // An admitted entry passed the DELTA admission filter above,
-                    // so the tag restates that outcome rather than re-deciding it.
-                    None => tables.push(neutral_table(ident, info, TableFormat::Delta)),
+                match admission(&info.table_type, info.data_source_format.as_deref()) {
+                    Err(reason) => skipped.push(SkippedTable { ident, reason }),
+                    Ok(format) => tables.push(neutral_table(ident, info, format)),
                 }
             }
             Ok(CatalogListing { tables, skipped })
@@ -259,22 +255,28 @@ fn full_name(ident: &CatalogTableIdent) -> String {
     parts.join(".")
 }
 
-/// Convert one deserialized Unity Catalog table entry into the neutral shape,
-/// carrying the requested identifier, the neutral table type, the storage
-/// location (absent when the entry omits it, as a view does), the `format` its
-/// CALLER decided, its credential-vending key, and its columns in declared
-/// position order — each column left unmapped, since the engine owns the single
-/// Exasol type-mapping home.
+/// Convert one Unity Catalog table entry into the neutral shape. Columns stay
+/// unmapped: the engine owns Exasol type mapping.
 ///
-/// The format tag is a parameter rather than derived here because the two callers
-/// reach it differently and only one of them can fail: the listing has already
-/// admitted Delta base tables only, while the single-table load must MAP the
-/// reported value and refuse one it cannot name (see [`neutral_table_format`]).
+/// `format` is a parameter because only the single-table load can fail to map it
+/// (see [`neutral_table_format`]); the listing has already admitted it.
 ///
 /// An empty OR whitespace-only vending key projects to an ABSENT one, so a caller
 /// that requires one fails naming the table rather than requesting credentials
 /// against an empty scope.
 fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat) -> CatalogTable {
+    let mut indexed: Vec<(u32, String)> = info
+        .columns
+        .iter()
+        .filter_map(|column| {
+            column
+                .partition_index
+                .map(|index| (index, column.name.clone()))
+        })
+        .collect();
+    indexed.sort_by_key(|(index, _)| *index);
+    let partition_columns = indexed.into_iter().map(|(_, name)| name).collect();
+
     CatalogTable {
         ident,
         table_type: neutral_table_type(&info.table_type),
@@ -283,6 +285,7 @@ fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat)
             .filter(|location| !location.is_empty()),
         format,
         vended_credential_key: info.table_id.filter(|key| !key.trim().is_empty()),
+        partition_columns,
         columns: info.columns.into_iter().map(neutral_column).collect(),
     }
 }
@@ -294,6 +297,7 @@ fn neutral_column(column: ColumnInfo) -> CatalogColumn {
             type_name: column.type_name,
             precision: column.type_precision.unwrap_or(0),
             scale: column.type_scale.unwrap_or(0),
+            type_json: column.type_json,
         },
     }
 }
@@ -310,10 +314,7 @@ fn neutral_table_type(raw: &str) -> CatalogTableType {
     }
 }
 
-/// The `data_source_format` Delta tables report, compared case-sensitively
-/// against the uppercase vocabulary Unity Catalog emits. The listing admits ONLY
-/// this value; the single-table load, which applies no admission filter, also
-/// matches it to map the reported format.
+/// Compared case-sensitively (Unity Catalog emits uppercase); admitted at listing and load.
 const DELTA_DATA_SOURCE_FORMAT: &str = "DELTA";
 
 /// The `data_source_format` of a Unity Catalog UniForm table, compared
@@ -322,47 +323,54 @@ const DELTA_DATA_SOURCE_FORMAT: &str = "DELTA";
 /// it.
 const ICEBERG_DATA_SOURCE_FORMAT: &str = "ICEBERG";
 
+/// Compared case-sensitively; admitted at listing and load.
+const PARQUET_DATA_SOURCE_FORMAT: &str = "PARQUET";
+
 /// How a missing or null `data_source_format` is named in a skip reason or a
 /// format refusal.
 const ABSENT_DATA_SOURCE_FORMAT: &str = "absent";
 
-/// Why a listed entry is not a Delta base table, or `None` when it is one: an
-/// entry is admitted iff its neutral type is a base table AND its
-/// `data_source_format` is exactly `DELTA`. A disqualifying type is reported
-/// ahead of the format, so a view — which carries no format — is reported by its
-/// `table_type`. Takes the raw wire `table_type` rather than the already-lossy
-/// neutral kind, so the returned detail names the offending wire value verbatim
-/// and this module keeps a single home for Unity's `table_type` vocabulary.
-fn delta_base_skip_reason(
+/// Admits a base table whose format is `DELTA` or `PARQUET`. Takes the raw wire
+/// `table_type` so a refusal names the wire value.
+fn admission(
     raw_table_type: &str,
     data_source_format: Option<&str>,
-) -> Option<SkipReason> {
+) -> Result<TableFormat, SkipReason> {
     let detail = match neutral_table_type(raw_table_type) {
-        CatalogTableType::Table if data_source_format == Some(DELTA_DATA_SOURCE_FORMAT) => {
-            return None;
-        }
-        CatalogTableType::Table => format!(
-            "data_source_format={}",
-            data_source_format.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
-        ),
+        CatalogTableType::Table => match format_of(data_source_format) {
+            Some(format @ (TableFormat::Delta | TableFormat::Parquet)) => return Ok(format),
+            _ => format!(
+                "data_source_format={}",
+                data_source_format.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
+            ),
+        },
         _ => format!("table_type={raw_table_type}"),
     };
-    Some(SkipReason::NotDeltaBaseTable { detail })
+    Err(SkipReason::NotDeltaBaseTable { detail })
 }
 
 fn neutral_table_format(
     data_source_format: Option<&str>,
     table: &str,
 ) -> Result<TableFormat, UdfError> {
-    match data_source_format.filter(|format| !format.trim().is_empty()) {
-        Some(DELTA_DATA_SOURCE_FORMAT) => Ok(TableFormat::Delta),
-        Some(ICEBERG_DATA_SOURCE_FORMAT) => Ok(TableFormat::Iceberg),
-        unrecognized => Err(UdfError::User(format!(
+    format_of(data_source_format).ok_or_else(|| {
+        UdfError::User(format!(
             "Unity Catalog table {table} reports data_source_format={}, which names no table \
-             format this engine can plan (expected {DELTA_DATA_SOURCE_FORMAT} or \
-             {ICEBERG_DATA_SOURCE_FORMAT})",
-            unrecognized.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
-        ))),
+             format this engine can plan (expected {DELTA_DATA_SOURCE_FORMAT}, \
+             {ICEBERG_DATA_SOURCE_FORMAT}, or {PARQUET_DATA_SOURCE_FORMAT})",
+            data_source_format
+                .filter(|format| !format.trim().is_empty())
+                .unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
+        ))
+    })
+}
+
+fn format_of(data_source_format: Option<&str>) -> Option<TableFormat> {
+    match data_source_format? {
+        DELTA_DATA_SOURCE_FORMAT => Some(TableFormat::Delta),
+        ICEBERG_DATA_SOURCE_FORMAT => Some(TableFormat::Iceberg),
+        PARQUET_DATA_SOURCE_FORMAT => Some(TableFormat::Parquet),
+        _ => None,
     }
 }
 
@@ -418,7 +426,7 @@ struct TableInfo {
 
 /// One column entry, carrying the FULL parameterized Unity Catalog Spark type: the
 /// type name plus the `DECIMAL(p, s)` precision and scale, absent (and read as 0)
-/// for a type taking none.
+/// for a type taking none. `partition_index` is its 0-based partition-column position.
 #[derive(Deserialize)]
 struct ColumnInfo {
     name: String,
@@ -427,6 +435,10 @@ struct ColumnInfo {
     type_precision: Option<u32>,
     #[serde(default)]
     type_scale: Option<u32>,
+    #[serde(default)]
+    type_json: Option<String>,
+    #[serde(default)]
+    partition_index: Option<u32>,
 }
 
 #[cfg(test)]

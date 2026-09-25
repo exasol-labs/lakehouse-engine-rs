@@ -8,6 +8,7 @@ use object_store::memory::InMemory;
 use object_store::path::Path as StorePath;
 use object_store::{ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 pub(crate) fn nullable(name: &str, data_type: DataType) -> Field {
@@ -59,4 +60,11 @@ pub(crate) fn directory_options(
         merge_mode,
         hive_partitioning,
     }
+}
+
+pub(crate) fn values(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
+    pairs
+        .iter()
+        .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
+        .collect()
 }

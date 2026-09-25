@@ -2,7 +2,7 @@
 //! directly at a chosen object key (no catalog table, snapshot, or Iceberg field-id
 //! metadata), unlike every other fixture, which goes through `seed.rs`'s iceberg-rust
 //! writer stack.
-#![cfg(any(feature = "exasol-e2e", feature = "azure-e2e"))]
+#![cfg(any(feature = "exasol-e2e", feature = "azure-e2e", feature = "unity-e2e"))]
 
 use super::e2e_harness::{local_stack_s3_store, split_s3_bucket_and_key};
 

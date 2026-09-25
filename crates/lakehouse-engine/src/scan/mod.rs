@@ -65,7 +65,7 @@ pub use partial_agg::{build_grouped_partial_agg_sql, build_partial_agg_sql_filte
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
-mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "type_relaxation_tests.rs"]

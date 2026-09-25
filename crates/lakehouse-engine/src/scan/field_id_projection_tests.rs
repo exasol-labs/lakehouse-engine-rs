@@ -5,6 +5,8 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column, Literal};
 
+const TABLE_ROOT: &str = "s3://warehouse/sales/";
+
 /// A field tagged with its field-id (`PARQUET:field_id`).
 fn field_with_id(name: &str, dt: DataType, nullable: bool, id: i32) -> Field {
     Field::new(name, dt, nullable).with_metadata(HashMap::from([(
@@ -84,10 +86,17 @@ fn rewrite_with(
     resolution: FieldIdResolution,
     column: Column,
 ) -> datafusion::error::Result<Arc<dyn PhysicalExpr>> {
-    let adapter = FieldIdExprAdapterFactory { resolution }
+    let adapter = factory(resolution)
         .create(logical, physical)
         .expect("adapter creation");
     adapter.rewrite(Arc::new(column))
+}
+
+fn factory(resolution: FieldIdResolution) -> FieldIdExprAdapterFactory {
+    FieldIdExprAdapterFactory {
+        resolution,
+        table_root: TABLE_ROOT.to_string(),
+    }
 }
 
 /// The reconstructed `ScalarValue` from a `Literal`, for asserting the
@@ -837,12 +846,10 @@ fn default_fill_decision_is_per_file() {
         field_with_id("id", DataType::Int64, false, 1),
         field_with_id("added", DataType::Utf8, true, 9),
     ]));
-    let factory = FieldIdExprAdapterFactory {
-        resolution: resolution_with_defaults(&[(
-            "added",
-            ScalarValue::Utf8(Some("D".to_string())),
-        )]),
-    };
+    let factory = factory(resolution_with_defaults(&[(
+        "added",
+        ScalarValue::Utf8(Some("D".to_string())),
+    )]));
 
     // File B: the added column IS present — binds its real value.
     let physical_present = Arc::new(Schema::new(vec![
@@ -1785,4 +1792,289 @@ fn identity_binding_spans_files_with_different_column_sets() {
         Some(1),
         "`id` binds to its own name in the second file too, whose column set differs"
     );
+}
+
+fn int64_schema(names: &[&str]) -> SchemaRef {
+    Arc::new(Schema::new(
+        names
+            .iter()
+            .map(|name| field_no_id(name, DataType::Int64, true))
+            .collect::<Vec<_>>(),
+    ))
+}
+
+/// Scenario: An identity-bound field binds a file column whose name differs only in letter case
+#[tokio::test]
+async fn identity_bound_field_reads_a_case_folded_file_column_rows() {
+    use crate::scan::spec::LogicalField;
+    use crate::scan::test_support::{run_scan, write_parquet};
+    use arrow::array::{ArrayRef, Int64Array};
+
+    let dir = std::env::temp_dir().join(format!("lh_case_fold_rows_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let int64s = |values: &[i64]| Arc::new(Int64Array::from(values.to_vec())) as ArrayRef;
+    let folded = write_parquet(
+        &dir.join("folded.parquet"),
+        vec![("customerid", int64s(&[1, 2]))],
+    );
+    let exact = write_parquet(
+        &dir.join("exact.parquet"),
+        vec![
+            ("CUSTOMERID", int64s(&[-3, -4])),
+            ("CustomerId", int64s(&[3, 4])),
+        ],
+    );
+
+    let mut spec = minimal_spec();
+    spec.files = [folded, exact]
+        .into_iter()
+        .map(|url| FileEntry::new(url.clone(), local_file_size(&url)))
+        .collect();
+    spec.common.logical_schema = vec![LogicalField {
+        field_id: None,
+        name: "CustomerId".to_string(),
+        arrow_type: "int64".to_string(),
+        nullable: true,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    }];
+    spec.common.projection = vec!["CUSTOMERID".into()];
+
+    let batches = run_scan(&spec).await;
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut got: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            let values = batch.column(0).as_any().downcast_ref::<Int64Array>();
+            values.expect("CustomerId is Int64").values().to_vec()
+        })
+        .collect();
+    got.sort();
+    assert_eq!(
+        got,
+        vec![1, 2, 3, 4],
+        "`customerid` must bind by the fold, and an exact `CustomerId` over `CUSTOMERID`"
+    );
+}
+
+/// Scenario: An ambiguous case fold fails the query loud, in either direction
+#[test]
+fn an_ambiguous_case_folded_match_fails_naming_every_candidate() {
+    for (logical, physical) in [
+        (&["CustomerId"][..], &["customerid", "CUSTOMERID"][..]),
+        (&["Amount", "AMOUNT"], &["amount"]),
+    ] {
+        let message = factory(bare_resolution())
+            .create(int64_schema(logical), int64_schema(physical))
+            .expect_err("an ambiguous fold must fail the file rather than bind one candidate")
+            .to_string();
+        for name in logical.iter().chain(physical) {
+            assert!(
+                message.contains(name),
+                "the failure must name `{name}`, got: {message}"
+            );
+        }
+    }
+}
+
+/// Scenario: The case fold is scoped to identity-bound fields and applies uniformly across formats
+#[test]
+fn field_id_and_declared_physical_name_bindings_stay_case_exact() {
+    let logical = Schema::new(vec![
+        field_with_id("Rating", DataType::Int64, true, 2),
+        field_with_id("Score", DataType::Int64, true, 3),
+        field_no_id("Total", DataType::Int64, true),
+    ]);
+    let physical = int64_schema(&["rating", "SCORE_V1", "COL-A", "total"]);
+    let resolution = FieldIdResolution {
+        declared_physical_names: HashMap::from([("col-a".to_string(), "Total".to_string())]),
+        ..resolution_with_mapping(&[("score_v1", 3)])
+    };
+
+    let binding = bind_columns(&logical, &physical, &resolution);
+
+    assert!(
+        binding.bound_logical_names.is_empty(),
+        "the physical-name fallback, the name mapping, and a declared physical name must each \
+         require an exact match, case included, got: {:?}",
+        binding.bound_logical_names
+    );
+}
+
+/// Scenario: A physical type outside the admitted set is refused before any cast
+#[test]
+fn each_physical_type_is_admitted_or_refused_under_its_declared_type() {
+    use crate::scan::spec::NestedMembers;
+    use DataType::*;
+    use arrow::datatypes::IntervalUnit::MonthDayNano;
+    use arrow::datatypes::TimeUnit::{Microsecond, Millisecond, Nanosecond, Second};
+
+    let naive = |unit| Timestamp(unit, None);
+    let zoned = |unit, zone: &str| Timestamp(unit, Some(zone.into()));
+    let dictionary = |value| Dictionary(Box::new(Int32), Box::new(value));
+    let nested = || FieldIdResolution {
+        nested_members: HashMap::from([(
+            "c".to_string(),
+            NestedMembers::Struct {
+                fields: vec![nested_by_physical_name("street", "street")],
+            },
+        )]),
+        ..bare_resolution()
+    };
+
+    let mut cases = vec![
+        (naive(Millisecond), naive(Microsecond), true),
+        (naive(Second), naive(Nanosecond), true),
+        (zoned(Microsecond, "UTC"), naive(Microsecond), true),
+        (zoned(Millisecond, "+00:00"), naive(Microsecond), true),
+        (naive(Microsecond), zoned(Microsecond, "UTC"), true),
+        (zoned(Millisecond, "CET"), zoned(Microsecond, "UTC"), true),
+        (naive(Nanosecond), naive(Microsecond), false),
+        (zoned(Nanosecond, "UTC"), zoned(Microsecond, "UTC"), false),
+        (zoned(Microsecond, "CET"), naive(Microsecond), false),
+        (zoned(Millisecond, "+02:00"), naive(Microsecond), false),
+        (Utf8, LargeUtf8, true),
+        (dictionary(Utf8), Utf8, true),
+        (dictionary(Int32), Int64, true),
+        (dictionary(Int64), Int32, false),
+        (dictionary(Utf8), Int64, false),
+    ];
+    cases.extend(
+        [
+            LargeUtf8,
+            Utf8View,
+            Binary,
+            LargeBinary,
+            BinaryView,
+            Time32(Millisecond),
+            Time64(Microsecond),
+            Duration(Second),
+            Interval(MonthDayNano),
+            Decimal128(38, 2),
+            Decimal256(40, 2),
+        ]
+        .map(|physical| (physical, Utf8, true)),
+    );
+    cases.extend(
+        [Int64, Float64, Boolean, Date32, Decimal128(10, 2)]
+            .map(|physical| (physical, Utf8, false)),
+    );
+    cases.extend(
+        [Int64, Float64, Date32, naive(Microsecond), Utf8].map(|logical| (Null, logical, true)),
+    );
+
+    for (physical, logical, admitted) in cases {
+        assert_admission(bare_resolution(), physical, logical, admitted);
+    }
+    assert_admission(nested(), Int64, Utf8, false);
+    assert_admission(nested(), Utf8, Utf8, true);
+}
+
+fn assert_admission(
+    resolution: FieldIdResolution,
+    physical: DataType,
+    logical: DataType,
+    admitted: bool,
+) {
+    let result = rewrite_with(
+        Arc::new(Schema::new(vec![field_no_id("c", logical.clone(), true)])),
+        Arc::new(Schema::new(vec![field_no_id("c", physical.clone(), true)])),
+        resolution,
+        Column::new("c", 0),
+    );
+    match (result, admitted) {
+        (Ok(_), true) => {}
+        (Err(error), true) => panic!("{physical} must be read under a declared {logical}: {error}"),
+        (Ok(expr), false) => panic!("{physical} under a declared {logical} bound as {expr}"),
+        (Err(error), false) => {
+            let message = error.to_string();
+            for needle in [
+                TABLE_ROOT,
+                "'c'",
+                &physical.to_string(),
+                &logical.to_string(),
+            ] {
+                assert!(
+                    message.contains(needle),
+                    "the refusal of {physical} under {logical} must name `{needle}`: {message}"
+                );
+            }
+        }
+    }
+}
+
+/// Scenario: A refused pair fails only a query that reads it, for every format, with no credential in the error
+#[test]
+fn the_refusal_holds_under_every_binding_key() {
+    let schema = |name: &str, dt: DataType, id: Option<i32>| {
+        let field = match id {
+            Some(id) => field_with_id(name, dt, true, id),
+            None => field_no_id(name, dt, true),
+        };
+        Arc::new(Schema::new(vec![field]))
+    };
+    let mapping = resolution_with_mapping(&[("amt", 5)]);
+    let declared = resolution_with_declared_names(&[("col-a", "amount")]);
+    for (key, logical_id, physical_name, physical_id, resolution) in [
+        ("field-id", Some(5), "amt", Some(5), bare_resolution()),
+        ("mapping", Some(5), "amt", None, mapping),
+        ("declared", None, "col-a", None, declared),
+        ("identity", None, "amount", None, bare_resolution()),
+        ("case fold", None, "AMOUNT", None, bare_resolution()),
+    ] {
+        let message = rewrite_with(
+            schema("amount", DataType::Int32, logical_id),
+            schema(physical_name, DataType::Float64, physical_id),
+            resolution,
+            Column::new("amount", 0),
+        )
+        .expect_err("a Float64 file column must never be cast to a declared Int32")
+        .to_string();
+        assert!(
+            ["'amount'", "Float64", "Int32"]
+                .iter()
+                .all(|needle| message.contains(needle)),
+            "the {key} binding must refuse the pair naming the column and both types, got: {message}"
+        );
+    }
+}
+
+/// Scenario: A refused pair fails only a query that reads it, for every format, with no credential in the error
+#[test]
+fn a_refused_column_fails_only_a_rewrite_that_references_it() {
+    use datafusion::physical_expr::expressions::IsNullExpr;
+
+    let schema = |price: DataType| {
+        Arc::new(Schema::new(vec![
+            field_no_id("id", DataType::Int64, true),
+            field_no_id("price", price, true),
+        ]))
+    };
+    let adapter = factory(bare_resolution())
+        .create(schema(DataType::Float32), schema(DataType::Float64))
+        .expect("a refused column must not fail a file whose other columns a query reads");
+
+    let id = adapter
+        .rewrite(Arc::new(Column::new("id", 0)))
+        .expect("a column the file admits must still bind");
+    assert_eq!(bound_physical_index(&id), Some(0));
+
+    let price = || Arc::new(Column::new("price", 1)) as Arc<dyn PhysicalExpr>;
+    for (shape, expr) in [
+        ("projection", price()),
+        (
+            "filter",
+            Arc::new(IsNullExpr::new(price())) as Arc<dyn PhysicalExpr>,
+        ),
+    ] {
+        let message = adapter
+            .rewrite(expr)
+            .expect_err("a reference to the refused column must fail")
+            .to_string();
+        assert!(
+            message.contains("'price'") && message.contains(TABLE_ROOT),
+            "the {shape} reference must fail naming the column and the table, got: {message}"
+        );
+    }
 }

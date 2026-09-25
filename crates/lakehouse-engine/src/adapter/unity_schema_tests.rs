@@ -367,15 +367,22 @@ fn listing_issues_no_per_table_get_table_call() {
 }
 
 #[test]
-fn lists_managed_external_and_shallow_clone_delta_tables() {
+fn lists_managed_external_shallow_clone_and_parquet_base_tables() {
     let mock = MockUnityCatalog::start(|req| {
         if req.is_get_table_call() {
             return unexpected_get_table();
         }
+        let mut raw_events = table_entry_typed(
+            "raw_events",
+            "EXTERNAL",
+            vec![long_col("id"), string_col("region")],
+        );
+        raw_events["data_source_format"] = json!("PARQUET");
         let entries = vec![
             table_entry_typed("orders", "MANAGED", vec![long_col("id")]),
             table_entry_typed("customers", "EXTERNAL", vec![long_col("id")]),
             table_entry_typed("orders_clone", "MANAGED", vec![long_col("id")]),
+            raw_events,
         ];
         (200, tables_page(entries, None))
     });
@@ -388,17 +395,25 @@ fn lists_managed_external_and_shallow_clone_delta_tables() {
         .collect();
     assert_eq!(
         names.len(),
-        3,
-        "MANAGED, EXTERNAL, and shallow-clone-shaped Delta tables are all listed"
+        4,
+        "MANAGED, EXTERNAL, shallow-clone-shaped Delta and PARQUET base tables are all listed"
     );
     assert!(names.contains(&"ORDERS"));
     assert!(names.contains(&"CUSTOMERS"));
     assert!(names.contains(&"ORDERS_CLONE"));
+    assert_eq!(
+        table_named(&response, "RAW_EVENTS")["columns"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 
     let map = table_map(&response);
     assert!(map.contains_key("ORDERS"));
     assert!(map.contains_key("CUSTOMERS"));
     assert!(map.contains_key("ORDERS_CLONE"));
+    assert!(map.contains_key("RAW_EVENTS"));
 
     assert_eq!(mock.get_table_call_count(), 0);
 }
