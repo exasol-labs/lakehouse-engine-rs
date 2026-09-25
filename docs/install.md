@@ -32,8 +32,6 @@ example is a network with no path to GitHub.
 - `jq`, but only if you use `--deployment` to target an Exasol Personal deployment. It parses the
   deployment descriptor (`deployment.json`) to resolve connection details and backend. SaaS and
   BucketFS targets don't need it.
-- The `exasol` launcher CLI, but only for a local Exasol Personal deployment (2.3 or later). The
-  Rust SLC goes in through `exasol slc custom`, which the launcher alone can run.
 
 ## Install with one command
 
@@ -91,22 +89,11 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
 | bash -s -- --deployment my-local-db
 ```
 
-- A **local** deployment (running on this machine) needs Exasol Personal 2.3 or later; earlier
-  versions are not supported. It has no BucketFS HTTP endpoint, so the script works through the
-  deployment directory instead:
-  - It writes the engine `.so` to
-    `local/runtime/exa/bucketfs/bfsdefault/<bucket>/udf/liblakehouse_engine.so`. Creating a
-    directory there creates the bucket, and UDFs read it at
-    `/buckets/bfsdefault/<bucket>/udf/liblakehouse_engine.so`, the same layout as any BucketFS
-    target. `--bfs-bucket` picks the bucket (default `default`); the other `--bfs-*` flags do not
-    apply.
-  - It installs the Rust SLC with `exasol slc custom install` (or `update` when a `RUST` custom
-    SLC already exists). The launcher registers the `RUST` language itself and restarts the
-    database.
-
-  This path needs the `exasol` launcher CLI on PATH. Architecture auto-detects from the host's
-  `uname -m` unless you pass `--arch` explicitly. Personal-local on Apple Silicon auto-detects as
-  `aarch64`.
+- A **local** deployment (Exasol Personal 2.3+, running on this machine) has no BucketFS HTTP
+  endpoint, so the script writes the engine into the deployment's BucketFS directory and installs
+  the SLC with `exasol slc custom`. This needs the `exasol` CLI on PATH. Architecture
+  auto-detects from the host's `uname -m` unless you pass `--arch` explicitly — Personal-local on
+  Apple Silicon auto-detects as `aarch64`.
 - A **cloud** deployment (backend other than `local`) uses the existing BucketFS HTTP upload path
   and needs `--bfs-write-password`, since Exasol Personal provisions no BucketFS password for you:
 
@@ -141,7 +128,7 @@ in-place language-list update. Run it again on a prior install to upgrade it.
 | `--profile <name>` | An `exapump` named profile. One of three connectivity flags. Give exactly one. |
 | `--dsn <dsn>` | A direct `exapump` DSN. You can set `EXAPUMP_DSN` instead. |
 | `--host <host:port> --user <u> --password <p>` | A direct connection. `--host` must include the port. There is no separate `--port` flag. |
-| `--deployment <name>` | Target an Exasol Personal deployment by name. Resolves connection from `~/.exasol/personal/deployments/<name>/`. Cannot be combined with `--profile`, `--dsn`, `--host`, or `--account-id`/`--database-id`. Requires `jq`, and the `exasol` launcher CLI for a local deployment (Exasol Personal 2.3+). |
+| `--deployment <name>` | Target an Exasol Personal deployment by name. Resolves connection from `~/.exasol/personal/deployments/<name>/`. Cannot be combined with `--profile`, `--dsn`, `--host`, or `--account-id`/`--database-id`. Requires `jq`. |
 | `--account-id <id>` | SaaS target only. SaaS account ID, from the SaaS web console. |
 | `--database-id <id>` | SaaS target only. SaaS database ID, from the SaaS web console. |
 | `--staging` | SaaS target only. Targets `cloud-staging.exasol.com` instead of `cloud.exasol.com`. |
