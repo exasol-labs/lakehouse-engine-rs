@@ -230,9 +230,7 @@ fn non_delta_table_entry(name: &str, columns: Vec<Json>) -> Json {
     })
 }
 
-/// A MANAGED base table list entry whose `data_source_format` this engine can
-/// never plan, unlike `ICEBERG`, which is at least a format the engine can plan
-/// for a different catalog kind.
+/// A MANAGED base table list entry whose `data_source_format` no catalog kind can plan.
 fn csv_table_entry(name: &str, columns: Vec<Json>) -> Json {
     json!({
         "name": name,

@@ -1054,9 +1054,8 @@ fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     );
 }
 
-/// Under `MERGE_SCHEMA = 'FALSE'`, `WIDENED.QTY` declares the NARROW type sampled from the
-/// first-listed file; a column both files share still reads every row, while `PRICE`, which the
-/// wide file stores wider than declared, is refused even though its values fit.
+/// Under `MERGE_SCHEMA = 'FALSE'` the first file's narrow types are declared, so `PRICE`,
+/// stored wider in the other file, is refused even though its values fit.
 #[test]
 fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_column() {
     setup();

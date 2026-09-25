@@ -130,10 +130,8 @@ pub async fn resolve_parquet_directory(
     })
 }
 
-/// The listing answer for a caller whose catalog already declares the schema and partition
-/// columns: the same data files [`resolve_parquet_directory`] selects, with no footer read.
-/// Each file's values are keyed by the caller's declared column spelling and filled from the
-/// deepest matching path segment under an uppercase fold; `keep` runs on those values.
+/// [`resolve_parquet_directory`]'s file selection for a caller declaring its own schema and
+/// partition columns, with no footer read. Values come from the deepest case-folded path match.
 pub async fn list_parquet_files(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,

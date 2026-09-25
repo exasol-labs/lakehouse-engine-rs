@@ -17,8 +17,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// A closed port: any credential request the reader issued would fail loudly with a
-/// transport error, which is distinguishable from every refusal asserted here.
+/// A credential request here fails with a transport error, distinct from every asserted refusal.
 const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
 
 const TABLE_NAME: &str = "cat.sch.sales";
@@ -32,7 +31,6 @@ const TABLE_ROOT: &str = "s3://bucket/unity/sales";
 /// No Parquet reader parses this, so a plan-time footer read would fail the resolution.
 const UNREADABLE_BODY: &str = "not a parquet file";
 
-/// The static storage credential a forbidden fallback would silently reach for.
 const STATIC_SECRET: &str = "minioadmin";
 
 const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
@@ -55,7 +53,7 @@ fn catalog_column_with(name: &str, type_json: Option<String>) -> CatalogColumn {
     }
 }
 
-/// A column the catalog declares NOT NULL, whose `type_json` names it as the catalog does.
+/// Declared NOT NULL.
 fn catalog_column(name: &str, spark_type: Json) -> CatalogColumn {
     catalog_column_with(name, Some(spark_field_json(name, spark_type)))
 }
@@ -105,7 +103,6 @@ async fn served_storage(keys: &[&str]) -> StorageBackend {
     .await
 }
 
-/// Resolve `table`'s scan through the static credential against `storage`.
 async fn resolve_with(
     table: &CatalogTable,
     storage: &StorageBackend,
@@ -567,7 +564,6 @@ async fn only_string_partition_columns_prune_files() {
     }
 }
 
-/// Resolve with vending toggled against a store nothing serves, answering the refusal.
 async fn storage_refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
     let creds = ConnectionCreds {
         use_vended_credentials,

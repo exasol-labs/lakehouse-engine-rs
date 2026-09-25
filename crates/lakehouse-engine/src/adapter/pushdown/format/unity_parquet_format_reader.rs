@@ -25,18 +25,14 @@ use crate::scan::{build_table_root_store, store_root_url};
 #[path = "unity_parquet_format_reader_tests.rs"]
 mod tests;
 
-/// The Unity Catalog Parquet table reader: the catalog is the schema authority, and the files
-/// supply only the listing and the partition values. Each column's `type_json` is the Spark
-/// `StructField` JSON the Delta log also records, so the Delta reader's classifier types it and
-/// no third Spark-type mapping can drift from the other two. No footer is read at plan time.
+/// The catalog is the schema authority; files supply only the listing and partition values.
+/// `type_json` goes through the Delta classifier so Spark-type mapping lives in one place.
 pub(super) struct UnityParquetFormatReader<'a> {
     storage: UnityTableStorage<'a>,
     table: &'a CatalogTable,
 }
 
 impl<'a> UnityParquetFormatReader<'a> {
-    /// `connection` is the CONNECTION's static storage decision, see
-    /// [`UnityTableStorage::new`].
     pub(super) fn new(
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
@@ -72,9 +68,8 @@ impl<'a> UnityParquetFormatReader<'a> {
 }
 
 impl FormatReader for UnityParquetFormatReader<'_> {
-    /// Prunes files only by predicates on `string` partition columns: the partition predicate
-    /// compares values as strings, and string order is not the order of an integer, date, or
-    /// timestamp column. Every other predicate still applies above the scan.
+    /// Prunes only on `string` partition columns, since the partition predicate compares as
+    /// strings; every other predicate still applies above the scan.
     fn resolve_scan<'a>(
         &'a self,
         filter_json: Option<&'a Json>,
@@ -101,7 +96,6 @@ impl FormatReader for UnityParquetFormatReader<'_> {
     }
 }
 
-/// The catalog-declared schema a Unity Parquet scan binds against.
 struct CatalogSchema {
     logical_schema: Vec<LogicalField>,
     partition_columns: Vec<String>,

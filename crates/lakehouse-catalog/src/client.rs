@@ -43,8 +43,7 @@ pub enum ColumnSourceType {
     Iceberg(iceberg::spec::Type),
     /// A Unity Catalog Spark type, fully parameterized: `precision` and `scale`
     /// carry the `DECIMAL(p, s)` arguments and are `0` for a type taking none.
-    /// `type_json` is the column's Spark `StructField` JSON representation,
-    /// absent when the catalog did not report one.
+    /// `type_json` is the column's Spark `StructField` JSON, if reported.
     Unity {
         type_name: String,
         precision: u32,
@@ -94,9 +93,7 @@ pub struct CatalogTable {
     /// one fails naming the table rather than requesting against an empty scope.
     /// An empty or whitespace-only key is treated the same as an absent one.
     pub vended_credential_key: Option<String>,
-    /// Names of the columns the catalog declares as partition columns, in the
-    /// catalog's own order. Empty for a catalog kind that does not declare
-    /// partition columns itself.
+    /// Catalog-declared partition columns in catalog order; empty if the kind declares none.
     pub partition_columns: Vec<String>,
     pub columns: Vec<CatalogColumn>,
 }

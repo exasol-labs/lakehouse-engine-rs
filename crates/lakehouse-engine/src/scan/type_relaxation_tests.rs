@@ -293,8 +293,6 @@ async fn try_run_scan(spec: &ScanSpec) -> datafusion::error::Result<Vec<RecordBa
     df.collect().await
 }
 
-/// Scan one file per case, each storing `val` at a physical type its declared logical tag does
-/// not admit, and assert every scan fails naming the table root, the column, and both types.
 async fn assert_every_scan_is_refused(test_dir: &str, cases: Vec<(&str, ArrayRef, &str)>) {
     let dir = std::env::temp_dir().join(format!("{test_dir}_{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");

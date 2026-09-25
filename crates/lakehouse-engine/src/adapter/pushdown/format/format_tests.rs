@@ -49,13 +49,7 @@ fn unity_table(format: TableFormat) -> CatalogTable {
     }
 }
 
-/// Scenario: The format reader is selected at one site and refuses a mismatched
-/// pairing.
-///
-/// A Unity Catalog table whose loaded metadata reports Iceberg is refused by name,
-/// naming the reported format — never routed into a reader of another format,
-/// where it would surface as a missing log or a wrong schema instead of a format
-/// refusal.
+/// Scenario: The format reader is selected at one site and refuses a mismatched pairing
 #[test]
 fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     let creds = offline_sigv4_creds();

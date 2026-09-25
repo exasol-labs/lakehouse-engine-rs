@@ -255,17 +255,11 @@ fn full_name(ident: &CatalogTableIdent) -> String {
     parts.join(".")
 }
 
-/// Convert one deserialized Unity Catalog table entry into the neutral shape,
-/// carrying the requested identifier, the neutral table type, the storage
-/// location (absent when the entry omits it, as a view does), the `format` its
-/// CALLER decided, its credential-vending key, its partition columns ordered by
-/// `partition_index`, and its columns in declared position order — each column
-/// left unmapped, since the engine owns the single Exasol type-mapping home.
+/// Convert one Unity Catalog table entry into the neutral shape. Columns stay
+/// unmapped: the engine owns Exasol type mapping.
 ///
-/// The format tag is a parameter rather than derived here because the two callers
-/// reach it differently and only one of them can fail: the listing has already
-/// admitted a table by format, while the single-table load must MAP the
-/// reported value and refuse one it cannot name (see [`neutral_table_format`]).
+/// `format` is a parameter because only the single-table load can fail to map it
+/// (see [`neutral_table_format`]); the listing has already admitted it.
 ///
 /// An empty OR whitespace-only vending key projects to an ABSENT one, so a caller
 /// that requires one fails naming the table rather than requesting credentials
@@ -322,9 +316,7 @@ fn neutral_table_type(raw: &str) -> CatalogTableType {
     }
 }
 
-/// The `data_source_format` Delta tables report, compared case-sensitively
-/// against the uppercase vocabulary Unity Catalog emits. Admitted at both
-/// listing and single-table load.
+/// Compared case-sensitively (Unity Catalog emits uppercase); admitted at listing and load.
 const DELTA_DATA_SOURCE_FORMAT: &str = "DELTA";
 
 /// The `data_source_format` of a Unity Catalog UniForm table, compared
@@ -333,19 +325,15 @@ const DELTA_DATA_SOURCE_FORMAT: &str = "DELTA";
 /// it.
 const ICEBERG_DATA_SOURCE_FORMAT: &str = "ICEBERG";
 
-/// The `data_source_format` a Unity Catalog Parquet base table reports, compared
-/// case-sensitively against the same uppercase vocabulary. Admitted at both
-/// listing and single-table load.
+/// Compared case-sensitively; admitted at listing and load.
 const PARQUET_DATA_SOURCE_FORMAT: &str = "PARQUET";
 
 /// How a missing or null `data_source_format` is named in a skip reason or a
 /// format refusal.
 const ABSENT_DATA_SOURCE_FORMAT: &str = "absent";
 
-/// The admitted `TableFormat` for a listed entry, or why it is not one: admitted
-/// iff the neutral type is a base table and `data_source_format` is `DELTA` or
-/// `PARQUET`. Takes the raw wire `table_type` (not the neutral kind) so a
-/// refusal names the actual wire value.
+/// Admits a base table whose format is `DELTA` or `PARQUET`. Takes the raw wire
+/// `table_type` so a refusal names the wire value.
 fn admission(
     raw_table_type: &str,
     data_source_format: Option<&str>,
@@ -433,9 +421,7 @@ struct TableInfo {
 
 /// One column entry, carrying the FULL parameterized Unity Catalog Spark type: the
 /// type name plus the `DECIMAL(p, s)` precision and scale, absent (and read as 0)
-/// for a type taking none. `type_json` is the column's Spark `StructField` JSON
-/// representation and `partition_index` its 0-based position among the table's
-/// partition columns, both absent for a column the catalog reports neither for.
+/// for a type taking none. `partition_index` is its 0-based partition-column position.
 #[derive(Deserialize)]
 
 struct ColumnInfo {

@@ -2005,8 +2005,6 @@ fn field_id_and_declared_physical_name_bindings_stay_case_exact() {
     );
 }
 
-/// Rewrite the identity-bound column `c` of a file storing `physical` under a table declaring
-/// `logical`.
 fn rewrite_pair(
     physical: DataType,
     logical: DataType,
@@ -2024,7 +2022,6 @@ fn assert_admitted(physical: DataType, logical: DataType) {
     }
 }
 
-/// Asserts the refusal names the table's storage location, the column, and both types.
 fn assert_refused(physical: DataType, logical: DataType) {
     let message = match rewrite_pair(physical.clone(), logical.clone()) {
         Ok(expr) => panic!("a file storing {physical} under a declared {logical} bound as {expr}"),

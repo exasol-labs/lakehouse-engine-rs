@@ -11,15 +11,11 @@ use crate::adapter::tables::catalog_identifier_string;
 #[path = "unity_table_storage_tests.rs"]
 mod tests;
 
-/// The Unity Catalog credential-vending operation a plan-time read asks for.
-/// Planning never writes, and a write-scoped credential would grant the scan more
-/// than it needs.
+/// Planning never writes, so it asks for a read-scoped credential.
 const READ_OPERATION: &str = "READ";
 
-/// One Unity Catalog table's storage decision: its checked table root and the
-/// backend its files are read through. The single owner of that decision across
-/// every format Unity Catalog hosts, so the no-fallback vending rule can't drift
-/// between readers; scoped to this table's key, so it can't be hoisted to a shared caller.
+/// One Unity table's checked root and read backend: the single owner of the no-fallback
+/// vending rule across every Unity-hosted format.
 pub(super) struct UnityTableStorage<'a> {
     session: &'a UnityCatalogSession,
     table: &'a CatalogTable,
@@ -29,9 +25,6 @@ pub(super) struct UnityTableStorage<'a> {
 }
 
 impl<'a> UnityTableStorage<'a> {
-    /// `connection` is the CONNECTION's static storage decision: its static storage
-    /// backend and resolved credentials, plus the resolved `ALLOW_HTTP` property,
-    /// which under vending is the operator's consent gate for plaintext transport.
     pub(super) fn new(
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
@@ -46,17 +39,14 @@ impl<'a> UnityTableStorage<'a> {
         }
     }
 
-    /// This table's catalog-reported storage location and the backend its files are
-    /// read THROUGH, the location checked before any credential is decided.
     pub(super) async fn resolve(&self) -> Result<(&'a str, StorageBackend), UdfError> {
         let table_root = self.checked_table_root()?;
         let effective_storage = self.effective_storage(table_root).await?;
         Ok((table_root, effective_storage))
     }
 
-    /// This table's own catalog-reported storage location, checked before the
-    /// vended/static split and before any object-storage access — neither the
-    /// catalog URI nor the CONNECTION endpoint may substitute for one left empty.
+    /// Checked before any credential or storage access; neither the catalog URI nor the
+    /// CONNECTION endpoint may substitute for an empty location.
     fn checked_table_root(&self) -> Result<&'a str, UdfError> {
         match self.table.storage_location.as_deref() {
             Some(location) if !location.trim().is_empty() => Ok(location),
@@ -69,9 +59,8 @@ impl<'a> UnityTableStorage<'a> {
         }
     }
 
-    /// The vended backend under vending, the CONNECTION's static one otherwise.
-    /// A table with no vending key (empty counts as none) fails rather than
-    /// falling back to a credential the operator didn't select for it.
+    /// Under vending, a table with no (or an empty) vending key fails rather than falling
+    /// back to the static credential.
     async fn effective_storage(&self, table_root: &str) -> Result<StorageBackend, UdfError> {
         if !self.creds.use_vended_credentials {
             return Ok(self.storage.clone());
@@ -109,10 +98,7 @@ impl<'a> UnityTableStorage<'a> {
     }
 }
 
-/// Re-raise `error` with every value in `secrets` masked. Collapses onto
-/// [`UdfError::User`] since every error reaching here is a plan-time refusal a
-/// user must read, and masking through `Display` leaves no payload a future
-/// SDK variant could smuggle a secret through unmasked.
+/// Re-raise `error` as [`UdfError::User`] with every value in `secrets` masked.
 pub(super) fn redacted(error: UdfError, secrets: &[&str]) -> UdfError {
     UdfError::User(redact_error_text(&error.to_string(), secrets))
 }

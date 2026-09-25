@@ -125,10 +125,9 @@ impl std::fmt::Display for AmbiguousFold {
     }
 }
 
-/// Add the uppercase fold for identity-bound fields, as Spark resolves Parquet columns by
-/// default (`spark.sql.caseSensitive=false`). Only fields the exact steps left unclaimed
-/// take part, so an exact match always wins; a fold group with more than one field on
-/// either side binds nothing and is returned as ambiguous.
+/// Bind still-unclaimed identity fields by uppercase fold, as Spark does by default
+/// (`spark.sql.caseSensitive=false`). A fold group with several fields on either side
+/// binds nothing and is returned as ambiguous.
 fn claim_by_case_fold(
     physical: &arrow::datatypes::Schema,
     logical: &[BindingKeys<'_>],
@@ -546,7 +545,7 @@ fn downcast_array<'a, T: Array + 'static>(
 #[derive(Debug)]
 pub(crate) struct FieldIdExprAdapterFactory {
     pub(crate) resolution: FieldIdResolution,
-    /// The table's storage location, named by every per-file binding failure.
+    /// Named by every per-file binding failure.
     pub(crate) table_root: String,
 }
 
@@ -582,8 +581,6 @@ pub(crate) struct FieldIdResolution {
 }
 
 impl FieldIdResolution {
-    /// The binding tables `logical_schema` and `name_mapping` imply, or the reason an
-    /// encoded `initial-default` does not reconstruct.
     pub(crate) fn for_logical_schema(
         logical_schema: &[crate::scan::spec::LogicalField],
         name_mapping: &[NameMappingEntry],
@@ -695,8 +692,7 @@ struct FieldIdExprAdapter {
     /// Iceberg `initial-default`; a present field-id is never an entry, so a
     /// real-value binding is never overridden.
     absent_default_by_index: HashMap<usize, ScalarValue>,
-    /// The bound columns of THIS file whose file type their declared type does not admit,
-    /// keyed by LOGICAL column index like `absent_default_by_index`.
+    /// This file's bound columns whose type is not admitted, keyed by logical index.
     refused_by_index: HashMap<usize, RefusedColumn>,
     table_root: String,
     /// The nested columns of THIS file, keyed by PHYSICAL column index — the index
@@ -902,8 +898,7 @@ struct ColumnBinding {
 }
 
 impl ColumnBinding {
-    /// Fail this file when a letter-case fold left a binding undecidable. Checked at
-    /// adapter creation, not per rewrite: the file then has no trustworthy binding at all.
+    /// Checked at adapter creation, not per rewrite: an ambiguous fold leaves no binding trustworthy.
     fn ensure_unambiguous(&self, table_root: &str) -> datafusion::error::Result<()> {
         match self.ambiguous_folds.as_slice() {
             [] => Ok(()),
@@ -919,9 +914,7 @@ impl ColumnBinding {
         }
     }
 
-    /// Every bound column whose file type its declared type does not [`admits`], keyed
-    /// by LOGICAL column index. A column rendered to JSON is excluded, since rendering
-    /// — not a cast — adapts it.
+    /// Keyed by logical index; JSON-rendered columns are excluded since no cast adapts them.
     fn refused_columns(&self, logical: &arrow::datatypes::Schema) -> HashMap<usize, RefusedColumn> {
         logical
             .fields()
@@ -1015,8 +1008,7 @@ impl ColumnBinding {
     }
 }
 
-/// A bound column whose file type its declared type does not admit, kept per file so that
-/// only a query reading the column fails.
+/// Kept per file so that only a query reading the column fails.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RefusedColumn {
     name: String,
@@ -1036,8 +1028,7 @@ impl RefusedColumn {
 
 /// Whether a file column stored as `physical` may be cast to its declared `logical` type:
 /// identity or a supported widening ([`widen`]), a timestamp whose instant the cast keeps,
-/// a text rendering of a type Exasol cannot represent, or an all-NULL column, whose cast
-/// changes no value. Nothing else reaches the cast.
+/// a text rendering of a type Exasol cannot represent, or an all-NULL column.
 fn admits(physical: &DataType, logical: &DataType) -> bool {
     physical == &DataType::Null
         || widen(physical, logical).as_ref() == Some(logical)

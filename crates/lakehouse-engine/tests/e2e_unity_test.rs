@@ -80,8 +80,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "SALES_PARQUET",
 ];
 
-/// Outside the `s3://warehouse/delta/` prefix `scripts/unity/seed.sh` gives the Delta
-/// fixtures, so the two fixture families never collide.
+/// Outside the Delta fixtures' `s3://warehouse/delta/` prefix, so they never collide.
 const SALES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/sales_parquet";
 
 /// Unity Catalog REST host port (host-side). `LH_UNITY_PORT`, default 18080.
@@ -175,9 +174,6 @@ fn sales_parquet_batch(ids: &[i64], amounts: &[f64]) -> RecordBatch {
     .expect("sales_parquet batch construction is infallible")
 }
 
-/// Writes the three `sales_parquet` files the Background fixture describes:
-/// two rows under `year=2024/region=eu/`, one under `year=2024/region=us/`,
-/// and one under `year=2025/region=eu/`.
 fn write_sales_parquet_fixture() {
     write_parquet_fixture(
         &format!("{SALES_PARQUET_LOCATION}/year=2024/region=eu/p1.parquet"),
@@ -193,15 +189,12 @@ fn write_sales_parquet_fixture() {
     );
 }
 
-/// The Spark `StructField` JSON a Unity Catalog column's `type_json` carries,
-/// serialized to a string — the same shape `UnityParquetFormatReader` parses.
 fn spark_type_json(name: &str, spark_type: &str) -> String {
     serde_json::json!({"name": name, "type": spark_type, "nullable": true, "metadata": {}})
         .to_string()
 }
 
-/// Registered in-process, unlike the Delta fixtures `scripts/unity/seed.sh` registers,
-/// because this fixture's bytes are also written in-process.
+/// Registered in-process because its bytes are written in-process.
 fn register_sales_parquet_table() {
     let base = format!("{}/api/2.1/unity-catalog", unity_catalog_url());
     let table_path = format!("{base}/tables/{UNITY_NAMESPACE}.sales_parquet");
@@ -480,9 +473,7 @@ fn delta_e2e_table(name: &str) -> CatalogTableIdent {
     }
 }
 
-/// Resolve `table_name`'s scan through the `FormatReader` seam (Delta or Unity
-/// Parquet, via `format_reader`) against the live Unity Catalog server.
-/// `handle_pushdown` is never reached here.
+/// Resolve `table_name`'s scan via `format_reader` against the live Unity Catalog, bypassing `handle_pushdown`.
 async fn resolve_unity_scan(
     table_name: &str,
     use_vended_credentials: bool,
@@ -1903,8 +1894,7 @@ fn unity_parquet_table_is_listed_with_its_declared_columns() {
     assert_col_type(&cols, "REGION", "VARCHAR(2000000)");
 }
 
-/// Scenario: A Unity Parquet table returns its rows and partition values end
-/// to end.
+/// Scenario: A Unity Parquet table returns its rows and partition values end to end.
 #[test]
 fn unity_parquet_table_returns_its_rows_and_partition_values() {
     setup();
@@ -1955,10 +1945,7 @@ fn unity_parquet_table_returns_its_rows_and_partition_values() {
     );
 }
 
-/// Scenario: a Unity Parquet table's scan resolves identically under vended
-/// and static credentials (mirrors the Delta version; `effective_storage`
-/// itself is not compared, since the two runs read through different
-/// credentials by design).
+/// Scenario: a Unity Parquet table's scan resolves identically under vended and static credentials
 #[test]
 fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     setup();

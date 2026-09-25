@@ -21,17 +21,13 @@ mod tests;
 /// The Delta table reader: one Unity Catalog table's transaction log resolved into
 /// the scan the pushdown layer plans against.
 ///
-/// The log is read through the backend [`UnityTableStorage`] decides for this
-/// table, so the credential and the file list are one indivisible step. The
-/// effective backend leaves with the resolved scan precisely because the scan side
-/// must read the files through the same backend the log was read through.
+/// The effective backend leaves with the resolved scan: the scan must read files
+/// through the same backend the log was read through.
 pub(super) struct DeltaFormatReader<'a> {
     storage: UnityTableStorage<'a>,
 }
 
 impl<'a> DeltaFormatReader<'a> {
-    /// `connection` is the CONNECTION's static storage decision, see
-    /// [`UnityTableStorage::new`].
     pub(super) fn new(
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
@@ -129,9 +125,7 @@ fn read_delta_log(
     Ok((files, logical_schema, partition_columns, refused_columns))
 }
 
-/// Refuses the whole table when no column is mappable: `raw_scan` registers `logical_schema` as
-/// the table's own schema, and an empty one cannot be scanned. A table with at least one mappable
-/// column is left alone. `table_kind` is the label that starts the refusal text.
+/// Refuses the table when no column is mappable: `raw_scan` cannot scan an empty schema.
 pub(super) fn ensure_table_has_a_mappable_column(
     logical_schema: &[LogicalField],
     refused_columns: &[RefusedColumn],

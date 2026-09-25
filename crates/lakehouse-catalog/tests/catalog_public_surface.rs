@@ -159,10 +159,7 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
-/// Scenario: the shared trait and its catalog-neutral metadata types are
-/// constructible from outside the crate, with every `CatalogTable`/`CatalogColumn`
-/// field named explicitly — a narrowed field is a build failure here, not a
-/// silent gap — while the Unity Catalog wire types stay hidden.
+/// Scenario: the shared trait and neutral types are constructible outside the crate; Unity wire types stay hidden.
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     let ident = CatalogTableIdent {

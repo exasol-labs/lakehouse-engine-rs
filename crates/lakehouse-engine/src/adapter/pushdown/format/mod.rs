@@ -109,8 +109,7 @@ pub enum ScanSource<'a> {
         session: &'a CatalogSession,
         catalog_props: &'a CatalogProps,
     },
-    /// A table in a Unity Catalog, paired with the metadata that catalog loaded for
-    /// it — whose format tag [`format_reader`] matches to select the reader.
+    /// A Unity Catalog table and the metadata the catalog loaded for it.
     Unity {
         session: &'a UnityCatalogSession,
         table: &'a CatalogTable,
@@ -140,14 +139,9 @@ pub struct ConnectionStorage<'a> {
 
 /// The reader that plans `source`'s scan.
 ///
-/// The ONE site that matches a [`ScanSource`], so a fourth table format or a fourth
-/// catalog kind is a compile error here rather than a silent fall-through. It
-/// matches the source rather than the catalog kind, which is what leaves that
-/// enum's frozen match-site baseline intact.
-///
-/// The Unity Catalog source's format tag is matched HERE because the single-table
-/// load applies no listing filter: a table routed into another format's reader
-/// would surface as a missing log or a wrong schema instead of a format refusal.
+/// The one site matching a [`ScanSource`], so a new format or catalog kind is a
+/// compile error here. The Unity format tag is matched here because the single-table
+/// load applies no listing filter.
 ///
 /// `connection` is the CONNECTION's static storage decision this source reads
 /// through: the static storage backend, resolved credentials, and the resolved

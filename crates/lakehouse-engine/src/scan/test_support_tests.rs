@@ -37,8 +37,7 @@ pub(super) fn local_file_size(file_url: &str) -> u64 {
     std::fs::metadata(path).expect("stat local parquet").len()
 }
 
-/// The logical file schema and column-binding adapter factory the raw scan installs for an
-/// unpartitioned table declaring `logical_schema` with no name mapping.
+/// What the raw scan installs for an unpartitioned table with no name mapping.
 pub(crate) fn column_binding_for(
     logical_schema: &[LogicalField],
     table_root: &str,
