@@ -298,11 +298,10 @@ path exactly as they already are for Iceberg.
 
 * *GIVEN* a `ScanSource` whose variant pairs one resolved session with the table it reads
 * *WHEN* the adapter selects the format reader for that source
-* *THEN* the adapter SHALL match `ScanSource` EXHAUSTIVELY at exactly ONE site, which returns a boxed `FormatReader`, so adding a FOURTH table format or a FOURTH catalog kind is a compile error at that site rather than a silent fall-through, SUPERSEDING the recorded THIRD form of this clause, which issue #407's direct-storage variant discharged by being the third
-* *AND* the Unity Catalog variant SHALL check the loaded table's FORMAT tag and SHALL return a `UdfError` naming the table and the reported format when it is not Delta, because Unity Catalog can report a non-Delta format and misrouting one into the Delta reader would surface a log-not-found error instead of a clear format refusal
-* *AND* that check MUST NOT be replaced by an assumption that the Unity Catalog listing filter already excluded non-Delta tables, because the single-table load applies no listing filter
-* *AND* that check SHALL keep refusing a table whose reported format is the Parquet tag the direct-storage kind produces, so a table of the third format routed into the Delta reader is refused by the guard that already exists rather than by a new one
-* *AND* the selection site MUST NOT match `CatalogKind`, so the permitted-site set of `vs-adapter/catalog-kind-selection` — the enum with its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site — stays intact and gains no file
+* *THEN* the adapter SHALL match `ScanSource` EXHAUSTIVELY at exactly ONE site, which returns a boxed `FormatReader`, so adding a FOURTH table format or a FOURTH catalog kind is a compile error at that site rather than a silent fall-through
+* *AND* the Unity Catalog variant SHALL match the loaded table's FORMAT tag exhaustively: the Delta tag selects the Delta reader, the Parquet tag selects the Unity Parquet reader of `vs-adapter/unity-parquet-table-planning`, and the Iceberg tag returns a `UdfError` naming the table and the reported format, because a table routed into another format's reader surfaces a missing log or a wrong schema instead of a clear format refusal
+* *AND* that match MUST NOT be replaced by an assumption that the Unity Catalog listing filter already excluded a format, because the single-table load applies no listing filter
+* *AND* the selection site MUST NOT match `CatalogKind`, so the permitted-site set of `vs-adapter/catalog-kind-selection` (the enum with its resolver, the catalog-client construction site, credential validation, and the pushdown scan-source construction site) stays intact and gains no file
 
 ### Scenario: Iceberg planning is byte-identical through the new seam
 

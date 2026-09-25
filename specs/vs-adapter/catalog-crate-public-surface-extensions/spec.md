@@ -12,6 +12,10 @@ this feature owns the running history of what gets ADDED to that `pub` set and w
 explicit reviewed edit to the crate's reachability probe at
 `crates/lakehouse-catalog/tests/catalog_public_surface.rs`.
 
+The Unity Parquet table-planning addition (`add-unity-parquet-table-routing`, issue #409) is
+recorded in `vs-adapter/catalog-crate-public-surface-extensions-unity-parquet`, split out once this
+feature's own scenario count crossed the same threshold.
+
 ## Background
 
 * This delta (plan `add-native-unity-catalog-client`, issue #318) adds a shared `CatalogClient` trait and its catalog-neutral metadata types to the crate surface, so the engine holds ONE operation surface for every catalog kind. It SUPERSEDES the recorded "exactly these items SHALL be `pub`" enumeration in two directions: it ADMITS the trait, the neutral types, and the two client types the engine constructs, and it DEMOTES `list_namespace_tables` to crate-private now that the Iceberg client is its only caller. The Unity Catalog wire types stay crate-private, because the engine consumes only the neutral shape. The reachability probe is edited to name every added item and to assert both demotions, and the one-way dependency stays intact.

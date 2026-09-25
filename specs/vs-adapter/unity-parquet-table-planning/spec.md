@@ -32,7 +32,7 @@ Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the 
 * *WHEN* the reader resolves that table's scan
 * *THEN* the reader SHALL build one logical field per catalog column, in the catalog's declared column order, named by the column's Unity Catalog `name` exactly as declared
 * *AND* the reader SHALL classify each column's `type_json` through the SAME Spark-type classification the Delta reader applies to a Delta schema (`vs-adapter/delta-type-mapping`), under no column mapping, so a native type keeps its own Arrow tag, a `struct`, `array`, or `map` column carries the string tag plus the nested descriptor the JSON renderer reads, and a `binary` or `variant` column is refused by name
-* *AND* every logical field SHALL carry NEITHER a field-id NOR a declared physical name, so the scan binds it through the identity binding, which binds `customerid` to `CustomerId` because the names differ only in letter case (`datafusion-scan/scan-execution-field-id-projection`)
+* *AND* every logical field SHALL carry NEITHER a field-id NOR a declared physical name, so the scan binds it through the identity binding, which binds `customerid` to `CustomerId` because the names differ only in letter case (`datafusion-scan/scan-execution-column-case-fold`)
 
 ### Scenario: A Unity Parquet column with no usable type descriptor is refused, and nullability always follows the file
 
