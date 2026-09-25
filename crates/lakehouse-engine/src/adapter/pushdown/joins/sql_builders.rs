@@ -698,25 +698,9 @@ struct BroadcastWindowPlacement {
     wrapper: Option<(Vec<ParsedSortKey>, Option<u64>, u64)>,
 }
 
-/// Decide where `window`'s row bound lands: the join block (per shard), the
-/// outer merge, an outer wrapper over the merged fan-out, or nowhere at all.
-/// Returns `None` for [`JoinWindowPlan::ExasolPostProcessed`] or an
-/// [`JoinWindowPlan::Ordered`] key absent from `projection` — both signal the
-/// caller to fall through to the N-scan wrapper.
-///
-/// Whatever lands in the join block lands only AFTER the node-local join, never
-/// on a side's scanned input, for the reason stated once in
-/// [`JoinSpec::post_join_limit`]. An unordered cap ([`JoinWindowPlan::BareLimit`])
-/// composes per shard, so it rides in the join block AND on the outer merge. An
-/// ordered window ([`JoinWindowPlan::Ordered`]) always rides on an outer wrapper
-/// over the merged fan-out, because only the wrapper sees the global rank. A
-/// zero-offset `ORDER BY … LIMIT n` also puts the same sort keys and `n` in the
-/// join block (`post_join_order_by` + `post_join_limit`), so each shard keeps its
-/// own top-`n` joined rows and the wrapper merges and re-cuts the global top-`n`.
-/// The merge itself carries no `LIMIT`, because a cut before the wrapper's sort
-/// keeps arbitrary rows. Every other ordered shape leaves every shard uncapped
-/// and unsorted: a per-shard `OFFSET` would skip each shard's own first rows,
-/// and an ordering with no `LIMIT` bounds nothing.
+/// Decides where `window`'s row bound lands: the join block, the outer merge,
+/// an outer wrapper, or nowhere. `None` means fall through to the N-scan
+/// wrapper — either the window itself, or an `Ordered` key absent from `projection`.
 fn place_broadcast_window(
     window: JoinWindowPlan,
     projection: &[ProjectionItem],
