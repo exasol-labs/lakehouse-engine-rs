@@ -29,7 +29,8 @@ FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 NETWORK="${LH_NETWORK:-lakehouse-engine}"        # base compose sets name: lakehouse-engine
-MC_IMAGE="quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z"
+# pgsty/mc mirrors mc — see docker-compose.yml's `minio` service comment.
+MC_IMAGE="pgsty/mc:RELEASE.2026-09-16T00-00-00Z"
 export UC_BASE="http://localhost:${LH_UNITY_PORT:-18080}/api/2.1/unity-catalog"
 export UC_CATALOG="unity"
 export UC_SCHEMA="delta_e2e"

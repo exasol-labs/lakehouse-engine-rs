@@ -147,7 +147,8 @@ services:
   # `lakekeeper` user below, so returned session creds are capped at the
   # `warehouse` bucket. One-shot; idempotent on re-`up`.
   minio-lakekeeper-init:
-    image: quay.io/minio/mc:RELEASE.2025-08-13T08-35-41Z
+    # pgsty/mc mirrors mc — see docker-compose.yml's `minio` service comment.
+    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
       minio:
         condition: service_healthy
