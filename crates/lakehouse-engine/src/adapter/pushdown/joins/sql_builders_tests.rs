@@ -2144,10 +2144,11 @@ fn broadcast_carries_each_sides_own_storage() {
 }
 
 /// The one-file-per-side broadcast fixture the window tests share: LINEITEM (fact)
-/// ⋈ ORDERS (dimension), projecting `L_ORDERKEY` alone. A single fact file means a
-/// single shard, so the fan-out is the from-less scalar call — any ` FROM (` in a
-/// result is therefore the ordering wrapper's and nothing else.
-fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
+/// ⋈ ORDERS (dimension), joined on `L_ORDERKEY = O_ORDERKEY`. A single fact file
+/// means a single shard, so the fan-out is the from-less scalar call — any ` FROM (`
+/// in a result is therefore the ordering wrapper's and nothing else. `projection`
+/// is a `(column, Exasol type)` pair per projected column, in order.
+fn broadcast_sql_projecting(projection: &[(&str, &str)], window: JoinWindowPlan) -> Option<String> {
     let sides = JoinSides {
         fact: resolved_side("LINEITEM", vec![("s3://w/l-0.parquet", 1000)]),
         dimension: resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 10)]),
@@ -2156,8 +2157,14 @@ fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
     let rendered = RenderedJoinPushdown {
         condition: r#"("L_ORDERKEY" = "O_ORDERKEY")"#.to_string(),
         filter: None,
-        projection: vec![ProjectionItem::Column("L_ORDERKEY".to_string())],
-        projection_types: vec!["DECIMAL(20,0)".to_string()],
+        projection: projection
+            .iter()
+            .map(|(column, _)| ProjectionItem::Column((*column).to_string()))
+            .collect(),
+        projection_types: projection
+            .iter()
+            .map(|(_, exasol_type)| (*exasol_type).to_string())
+            .collect(),
     };
     build_broadcast_join_sql(
         &sides,
@@ -2168,6 +2175,10 @@ fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
         "DISTRIBUTE",
     )
     .expect("selecting the wire storage must succeed")
+}
+
+fn broadcast_window_sql(window: JoinWindowPlan) -> Option<String> {
+    broadcast_sql_projecting(&[("L_ORDERKEY", "DECIMAL(20,0)")], window)
 }
 
 fn broadcast_common_blob(sql: &str) -> Json {
@@ -2182,21 +2193,26 @@ fn ascending_key(column: &str) -> ParsedSortKey {
     })
 }
 
-/// Every ordered-window test asserts this: an ordered window is global, so nothing
-/// may truncate or sort a shard's own output before the wrapper does.
+/// Every ordered-window test with a non-zero offset or no `LIMIT` asserts this: that
+/// window cannot bound a shard, so nothing may truncate or sort a shard's own output
+/// before the wrapper does.
 fn assert_shards_carry_no_window(sql: &str) {
     let common = broadcast_common_blob(sql);
     assert!(
         common.get("limit").is_none(),
-        "an ordered shard must stay uncapped: {common}"
+        "a non-zero-offset or unlimited ordered shard must stay uncapped: {common}"
     );
     assert!(
         common.get("order_by").is_none(),
-        "an ordered shard must stay unsorted: {common}"
+        "a non-zero-offset or unlimited ordered shard must stay unsorted: {common}"
     );
     assert!(
         common["join"].get("post_join_limit").is_none(),
-        "an ordered shard must carry no post-join cap: {common}"
+        "a non-zero-offset or unlimited ordered shard must carry no post-join cap: {common}"
+    );
+    assert!(
+        common["join"].get("post_join_order_by").is_none(),
+        "a non-zero-offset or unlimited ordered shard must carry no post-join ordering: {common}"
     );
 }
 
@@ -2238,10 +2254,11 @@ fn broadcast_bare_limit_caps_each_shard_and_the_merge() {
     );
 }
 
-/// An ordered window cannot compose per shard, so the shards stay unbounded and
-/// unsorted and the whole window rides on ONE outer wrapper over the merged fan-out.
+/// A zero-offset `ORDER BY … LIMIT n` bounds each shard to its own post-join
+/// top-n: the join block carries the sort keys and the cap (issue #309), and the
+/// wrapper still carries the global ordering and window over the merged fan-out.
 #[test]
-fn broadcast_ordered_wraps_fan_out_and_leaves_shards_unbounded() {
+fn broadcast_ordered_zero_offset_limit_bounds_each_shard_to_its_top_n() {
     let sql = broadcast_window_sql(JoinWindowPlan::Ordered {
         keys: vec![ascending_key("L_ORDERKEY")],
         limit: Some(5),
@@ -2249,11 +2266,110 @@ fn broadcast_ordered_wraps_fan_out_and_leaves_shards_unbounded() {
     })
     .expect("a projected bare-column ordering stays broadcast-eligible");
 
-    assert!(
-        sql.starts_with(r#"SELECT "L_ORDERKEY" FROM (SELECT SCAN("#),
-        "the wrapper names only the visible columns over the fan-out: {sql}"
+    let common = broadcast_common_blob(&sql);
+    assert_eq!(
+        common["join"]["post_join_order_by"],
+        serde_json::json!([{"column": "L_ORDERKEY", "ascending": true, "nulls_last": true}]),
+        "the join block must carry the sort key with its flags: {common}"
     );
-    assert_shards_carry_no_window(&sql);
+    assert_eq!(
+        common["join"]["post_join_limit"],
+        serde_json::json!(5),
+        "the join block must carry the per-shard cap: {common}"
+    );
+    assert!(
+        common.get("limit").is_none(),
+        "a per-shard cap must never become a scan-side limit: {common}"
+    );
+    assert!(
+        common.get("order_by").is_none(),
+        "a per-shard ordering must never become a scan-side order_by: {common}"
+    );
+
+    assert!(
+        sql.ends_with(r#") ORDER BY "L_ORDERKEY" ASC NULLS LAST LIMIT 5"#),
+        "the wrapper must still carry the global ordering and window: {sql}"
+    );
+    assert_eq!(
+        sql.matches(" LIMIT ").count(),
+        1,
+        "the merge carries no LIMIT of its own, only the wrapper's: {sql}"
+    );
+}
+
+/// A sort key may come from either side of the join: the broadcast projection
+/// determines eligibility, not which table the column belongs to. Both keys ride
+/// in the join block, in pushed order, each with its own direction and NULL
+/// placement.
+#[test]
+fn broadcast_ordered_bounds_shards_with_keys_from_either_side() {
+    let sql = broadcast_sql_projecting(
+        &[("L_ORDERKEY", "DECIMAL(20,0)"), ("O_ORDERDATE", "DATE")],
+        JoinWindowPlan::Ordered {
+            keys: vec![
+                ParsedSortKey::Column(SortKey {
+                    column: "O_ORDERDATE".to_string(),
+                    ascending: false,
+                    nulls_last: false,
+                }),
+                ascending_key("L_ORDERKEY"),
+            ],
+            limit: Some(5),
+            offset: 0,
+        },
+    )
+    .expect("both keys are members of the broadcast projection");
+
+    let common = broadcast_common_blob(&sql);
+    assert_eq!(
+        common["join"]["post_join_order_by"],
+        serde_json::json!([
+            {"column": "O_ORDERDATE", "ascending": false, "nulls_last": false},
+            {"column": "L_ORDERKEY", "ascending": true, "nulls_last": true},
+        ]),
+        "the join block must carry both keys, in pushed order, each with its own flags: {common}"
+    );
+}
+
+/// A `limit.offset` key present and equal to zero must classify and render
+/// identically to the key being absent altogether: eligibility for the bounded
+/// per-shard path is a non-zero test on the offset, never a key-presence test.
+#[test]
+fn broadcast_zero_offset_request_takes_the_bounded_path() {
+    let order_by = serde_json::json!([
+        {"expression": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+         "isAscending": true, "nullsLast": false},
+    ]);
+
+    let mut zero_offset = join_request(Json::Null, equi_condition());
+    zero_offset["pushdownRequest"]["orderBy"] = order_by.clone();
+    zero_offset["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 5, "offset": 0});
+
+    let mut no_offset_key = join_request(Json::Null, equi_condition());
+    no_offset_key["pushdownRequest"]["orderBy"] = order_by;
+    no_offset_key["pushdownRequest"]["limit"] = serde_json::json!({"numElements": 5});
+
+    let build = |request: &Json| {
+        broadcast_sql_projecting(
+            &[("O_ORDERDATE", "DATE")],
+            classify_join_window(&pd(request)),
+        )
+        .expect("the ordered key is a member of the broadcast projection")
+    };
+
+    let sql_zero_offset = build(&zero_offset);
+    let sql_no_offset_key = build(&no_offset_key);
+
+    assert_eq!(
+        sql_zero_offset, sql_no_offset_key,
+        "a present zero offset must classify and render identically to an absent offset key"
+    );
+    assert!(
+        broadcast_common_blob(&sql_zero_offset)["join"]
+            .get("post_join_order_by")
+            .is_some(),
+        "the bounded path must carry a post-join ordering: {sql_zero_offset}"
+    );
 }
 
 /// A bare `ORDER BY` renders the wrapper's ordering and nothing after it.

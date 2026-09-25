@@ -49,9 +49,9 @@ $(VS_SO): $(VS_SRCS)
 	  --user $(shell id -u):$(shell id -g) \
 	  -e HOME=/tmp \
 	  $(UDF_BUILDER_IMAGE) \
-	  cargo build --release -p lakehouse-engine
-	cargo install cargo-exasol-udf --version "=$(SLC_VERSION)" --locked --quiet
-	cargo exasol-udf validate $@
+	  sh -c 'cargo build --release -p lakehouse-engine \
+	    && cargo install cargo-exasol-udf --version "=$(SLC_VERSION)" --locked --quiet --root target/udf-tools \
+	    && PATH="$$PWD/target/udf-tools/bin:$$PATH" cargo exasol-udf validate $@'
 
 # Alias: build the .so if out of date.
 cross-udf-build: $(VS_SO)
