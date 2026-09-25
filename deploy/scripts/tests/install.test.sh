@@ -489,6 +489,9 @@ write_local_deployment_fixture() {
   printf '{"backend":"local","connection":{"host":"127.0.0.1","dbPort":8563,"username":"sys","shellSupported":true}}\n' \
     > "$dir/deployment.json"
   printf '{"dbPassword":"fixture-secret"}\n' > "$dir/secrets.json"
+  mkdir -p "$dir/local/runtime/exa"
+  printf '/exa/slc __builtin__ slc /exa/slc dDE= P\n/exa/bucketfs/bfsdefault/default bfsdefault default /buckets/bfsdefault/default - P\n' \
+    > "$dir/local/runtime/exa/bucketfs.conf"
 }
 
 write_local_deployment_fixture_custom_connection() {
@@ -548,6 +551,7 @@ reset_env() {
   unset EXAPUMP_SMOKE_MODE EXAPUMP_ALTER_FAIL EXAPUMP_DDL_FAIL EXAPUMP_SCRIPT_LANGUAGES EXAPUMP_SL_EMPTY 2>/dev/null || true
   unset EXAPUMP_BFS_CP_FAIL EXAPUMP_BFS_LS_FAIL EXAPUMP_BFS_LS_AUTH_FAIL EXAPUMP_BFS_NEVER_LIST EXAPUMP_BFS_LS_DELAY EXAPUMP_BFS_TOPLEVEL_LS_DELAY 2>/dev/null || true
   unset EXASOL_LIST_FAIL EXASOL_RUST_INSTALLED EXASOL_CUSTOM_FAIL STUB_EXASOL_SOURCE_COPY 2>/dev/null || true
+  unset PERSONAL_BUCKET_TRIES PERSONAL_BUCKET_POLL_SECONDS 2>/dev/null || true
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
   unset BUCKETFS_REACHABLE_TRIES BUCKETFS_REACHABLE_POLL_SECONDS 2>/dev/null || true
@@ -2414,7 +2418,7 @@ makefile_slc_url_arch_aware() {
 }
 
 # ============================================================================
-# Scenario: a local deployment selects the launcher transport
+# Scenario: a local deployment selects the launcher transport and the standard BucketFS layout
 deployment_local_selects_launcher() {
   echo "== deployment_local_selects_launcher =="
   local dir out
@@ -2423,48 +2427,28 @@ deployment_local_selects_launcher() {
 
   out="$(
     source "$INSTALLER"
-    PATH="$STUBDIR:$ORIG_PATH"
     DEPLOYMENT_ROOT="$(dirname "$dir")"
     TARGET_MODE="bucketfs"
     ARG_PROFILE=""; ARG_DSN=""
     ARG_ARCH="x86_64"; ARG_ARCH_SET=1
     ARG_DEPLOYMENT="$(basename "$dir")"
+    ARG_BFS_BUCKET="mybucket"; ARG_BFS_BUCKET_SET=1
     resolve_deployment_transport 2>&1
     printf 'rc=%s transport=%s host=%s user=%s password=%s\n' \
       "$?" "$DEPLOYMENT_TRANSPORT" "$ARG_HOST" "$ARG_USER" "$ARG_PASSWORD"
     resolve_target_layout
-    printf 'udf_object=%s\n' "$TARGET_SO_UDF_OBJECT"
+    printf 'udf_object=%s bucket_dir=%s\n' "$TARGET_SO_UDF_OBJECT" "$(personal_bucket_dir)"
   )"
   assert_contains "launcher deployment: resolves successfully" "$out" "rc=0"
   assert_contains "launcher deployment: selects the launcher transport" "$out" "transport=launcher"
   assert_contains "launcher deployment: connection resolves from the descriptor" "$out" "host=127.0.0.1:8563 user=sys password=fixture-secret"
-  assert_contains "launcher deployment: scripts load the .so from inside the SLC rootfs" "$out" "udf_object=/udf/liblakehouse_engine.so"
+  assert_contains "launcher deployment: scripts load the .so from the chosen bucket" "$out" \
+    "udf_object=buckets/bfsdefault/mybucket/udf/liblakehouse_engine.so"
+  assert_contains "launcher deployment: the bucket is a directory under local/runtime/exa/bucketfs" "$out" \
+    "bucket_dir=$dir/local/runtime/exa/bucketfs/bfsdefault/mybucket"
 }
 
-# Scenario: --skip-slc is rejected on the launcher transport
-deployment_launcher_rejects_skip_slc() {
-  echo "== deployment_launcher_rejects_skip_slc =="
-  local dir out rc
-  dir="$(mktemp -d "$SANDBOX/dep-launcher-skip.XXXXXX")"
-  write_local_deployment_fixture "$dir"
-
-  out="$(
-    source "$INSTALLER"
-    PATH="$STUBDIR:$ORIG_PATH"
-    DEPLOYMENT_ROOT="$(dirname "$dir")"
-    TARGET_MODE="bucketfs"
-    ARG_PROFILE=""; ARG_DSN=""
-    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
-    ARG_SKIP_SLC=1
-    ARG_DEPLOYMENT="$(basename "$dir")"
-    resolve_deployment_transport 2>&1
-  )"
-  rc=$?
-  assert_rc_nonzero "launcher --skip-slc: nonzero exit" "$rc"
-  assert_contains "launcher --skip-slc: error names --skip-slc" "$out" "--skip-slc"
-}
-
-# Scenario: a local deployment rejects BucketFS-only flags
+# Scenario: a local deployment rejects BucketFS HTTP flags and unsafe bucket names
 deployment_local_rejects_bfs_flags() {
   echo "== deployment_local_rejects_bfs_flags =="
   local dir out rc
@@ -2478,12 +2462,26 @@ deployment_local_rejects_bfs_flags() {
     ARG_PROFILE=""; ARG_DSN=""
     ARG_ARCH="x86_64"; ARG_ARCH_SET=1
     ARG_DEPLOYMENT="$(basename "$dir")"
-    ARG_BFS_BUCKET="other"; ARG_BFS_BUCKET_SET=1
+    ARG_BFS_HOST="h.example"
     resolve_deployment_transport 2>&1
   )"
   rc=$?
-  assert_rc_nonzero "local deployment with --bfs-bucket: nonzero exit" "$rc"
-  assert_contains "local deployment with --bfs-bucket: error names the flag" "$out" "--bfs-bucket"
+  assert_rc_nonzero "local deployment with --bfs-host: nonzero exit" "$rc"
+  assert_contains "local deployment with --bfs-host: error names the flag" "$out" "--bfs-host"
+
+  out="$(
+    source "$INSTALLER"
+    DEPLOYMENT_ROOT="$(dirname "$dir")"
+    TARGET_MODE="bucketfs"
+    ARG_PROFILE=""; ARG_DSN=""
+    ARG_ARCH="x86_64"; ARG_ARCH_SET=1
+    ARG_DEPLOYMENT="$(basename "$dir")"
+    ARG_BFS_BUCKET=".."; ARG_BFS_BUCKET_SET=1
+    resolve_deployment_transport 2>&1
+  )"
+  rc=$?
+  assert_rc_nonzero "local deployment with --bfs-bucket ..: nonzero exit" "$rc"
+  assert_contains "local deployment with --bfs-bucket ..: error names --bfs-bucket" "$out" "--bfs-bucket"
 }
 
 # Scenario: a local deployment requires the exasol launcher CLI
@@ -2515,31 +2513,41 @@ run_launcher_deployment() {
   : > "$STUB_LOG"
   saved_home="$HOME"
   export HOME="$fake_home"
-  run_file --deployment "$dep_name" --arch aarch64
+  run_file --deployment "$dep_name" --arch aarch64 "${LAUNCHER_EXTRA_ARGS[@]+"${LAUNCHER_EXTRA_ARGS[@]}"}"
   export HOME="$saved_home"
   LAUNCHER_DEP_DIR="$fake_home/.exasol/personal/deployments/$dep_name"
 }
 
-# Scenario: a fresh launcher install bundles the engine into the SLC and installs it via exasol slc custom install
-deployment_launcher_installs_bundled_slc() {
-  echo "== deployment_launcher_installs_bundled_slc =="
+# Scenario: a launcher install installs the plain SLC via exasol slc custom and writes the .so into BucketFS
+deployment_launcher_installs_slc_and_engine() {
+  echo "== deployment_launcher_installs_slc_and_engine =="
   reset_env
+  LAUNCHER_EXTRA_ARGS=()
   run_launcher_deployment
   assert_rc_zero "launcher install: the install succeeds end to end" "$LAST_RC"
   local log; log="$(log_content)"
-  assert_contains "launcher install: installs the RUST custom SLC against the deployment dir" "$log" \
+  assert_contains "launcher install: installs the RUST custom SLC from the downloaded SLC tarball" "$log" \
     "exasol slc custom install --alias RUST --language rust --source "
+  assert_contains "launcher install: the SLC source is the SLC release tarball itself" "$log" "/rustslc.tar.gz --auto-approve"
   assert_contains "launcher install: targets the deployment directory explicitly" "$log" \
     "--auto-approve --deployment-dir $LAUNCHER_DEP_DIR"
-  assert_contains "launcher install: scripts point at the in-rootfs .so" "$log" \
-    "%udf_object /udf/liblakehouse_engine.so"
+  assert_contains "launcher install: scripts point at the BucketFS .so" "$log" \
+    "%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so"
   assert_contains "launcher install: aarch64 SLC asset is downloaded" "$log" "lc-rust-0.21.0-aarch64.tar.gz"
   assert_not_contains "launcher install: the launcher owns SCRIPT_LANGUAGES" "$log" "ALTER SYSTEM SET SCRIPT_LANGUAGES"
   assert_not_contains "launcher install: no BucketFS HTTP call" "$log" "exapump bucketfs"
   assert_contains "launcher install: the version smoke test runs" "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
-  local listing; listing="$(tar -tzf "$STUB_EXASOL_SOURCE_COPY" 2>&1)"
-  assert_contains "launcher install: the bundle keeps the SLC's own entries" "$listing" "udf/liblakehouse_engine.so"
-  assert_contains "launcher install: the bundle carries the engine .so at ./udf/" "$listing" "./udf/liblakehouse_engine.so"
+  local so="$LAUNCHER_DEP_DIR/local/runtime/exa/bucketfs/bfsdefault/default/udf/liblakehouse_engine.so"
+  if cmp -s "$so" "$SANDBOX/fixture-good/udf/liblakehouse_engine.so"; then
+    pass "launcher install: the engine .so lands in the deployment's BucketFS directory"
+  else
+    fail "launcher install: the engine .so lands in the deployment's BucketFS directory" "missing or different: $so"
+  fi
+  if [[ -e "$so.partial" ]]; then
+    fail "launcher install: no partial file is left behind" "found $so.partial"
+  else
+    pass "launcher install: no partial file is left behind"
+  fi
 }
 
 # Scenario: an already-installed RUST custom SLC is replaced via exasol slc custom update
@@ -2547,6 +2555,7 @@ deployment_launcher_updates_existing_slc() {
   echo "== deployment_launcher_updates_existing_slc =="
   reset_env
   export EXASOL_RUST_INSTALLED=1
+  LAUNCHER_EXTRA_ARGS=()
   run_launcher_deployment
   assert_rc_zero "launcher update: the install succeeds end to end" "$LAST_RC"
   local log; log="$(log_content)"
@@ -2554,11 +2563,30 @@ deployment_launcher_updates_existing_slc() {
   assert_not_contains "launcher update: does not re-install" "$log" "exasol slc custom install"
 }
 
-# Scenario: launcher failures stop the install with the launcher's own message
+# Scenario: --skip-slc on a local deployment replaces only the engine .so
+deployment_launcher_skip_slc_installs_engine_only() {
+  echo "== deployment_launcher_skip_slc_installs_engine_only =="
+  reset_env
+  LAUNCHER_EXTRA_ARGS=(--skip-slc)
+  run_launcher_deployment
+  assert_rc_zero "launcher --skip-slc: the install succeeds end to end" "$LAST_RC"
+  local log; log="$(log_content)"
+  assert_not_contains "launcher --skip-slc: no SLC is installed or updated" "$log" "exasol slc custom"
+  assert_not_contains "launcher --skip-slc: no SLC is downloaded" "$log" "lc-rust-"
+  assert_contains "launcher --skip-slc: scripts are still created" "$log" "%udf_object buckets/bfsdefault/default/udf/liblakehouse_engine.so"
+  if [[ -s "$LAUNCHER_DEP_DIR/local/runtime/exa/bucketfs/bfsdefault/default/udf/liblakehouse_engine.so" ]]; then
+    pass "launcher --skip-slc: the engine .so is still written"
+  else
+    fail "launcher --skip-slc: the engine .so is still written"
+  fi
+}
+
+# Scenario: launcher and bucket-registration failures stop the install with an actionable message
 deployment_launcher_failures_are_actionable() {
   echo "== deployment_launcher_failures_are_actionable =="
   reset_env
   export EXASOL_LIST_FAIL=1
+  LAUNCHER_EXTRA_ARGS=()
   run_launcher_deployment
   assert_rc_nonzero "launcher preflight failure: nonzero exit" "$LAST_RC"
   assert_contains "launcher preflight failure: surfaces the launcher message" "$LAST_OUT" "deployment is not running"
@@ -2570,6 +2598,14 @@ deployment_launcher_failures_are_actionable() {
   assert_rc_nonzero "launcher install failure: nonzero exit" "$LAST_RC"
   assert_contains "launcher install failure: surfaces the launcher message" "$LAST_OUT" "custom SLC import failed"
   assert_not_contains "launcher install failure: no scripts are created" "$(log_content)" "CREATE OR REPLACE RUST"
+
+  reset_env
+  export PERSONAL_BUCKET_TRIES=2 PERSONAL_BUCKET_POLL_SECONDS=0
+  LAUNCHER_EXTRA_ARGS=(--bfs-bucket unregistered)
+  run_launcher_deployment
+  assert_rc_nonzero "unregistered bucket: nonzero exit" "$LAST_RC"
+  assert_contains "unregistered bucket: error names the bucket" "$LAST_OUT" "bfsdefault/unregistered"
+  assert_not_contains "unregistered bucket: no scripts are created" "$(log_content)" "CREATE OR REPLACE RUST"
 }
 
 main() {
@@ -2643,8 +2679,8 @@ main() {
   deployment_local_selects_launcher
   deployment_local_rejects_bfs_flags
   deployment_local_requires_exasol_cli
-  deployment_launcher_rejects_skip_slc
-  deployment_launcher_installs_bundled_slc
+  deployment_launcher_installs_slc_and_engine
+  deployment_launcher_skip_slc_installs_engine_only
   deployment_launcher_updates_existing_slc
   deployment_launcher_failures_are_actionable
 

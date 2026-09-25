@@ -92,16 +92,21 @@ curl -fsSL -H "Accept: application/vnd.github.raw" \
 ```
 
 - A **local** deployment (running on this machine) needs Exasol Personal 2.3 or later; earlier
-  versions are not supported. It has no BucketFS HTTP endpoint, and UDFs cannot see files dropped
-  into the deployment's shared BucketFS directory. The script therefore appends the engine `.so`
-  to the Rust SLC tarball at `udf/liblakehouse_engine.so` and installs the bundle with
-  `exasol slc custom install` (or `update` when a `RUST` custom SLC already exists). The scripts
-  load the `.so` from its in-container path, `%udf_object /udf/liblakehouse_engine.so`. The
-  launcher registers the `RUST` language itself and restarts the database. This path needs the
-  `exasol` launcher CLI on PATH. It rejects `--skip-slc`, because every engine install
-  re-installs the SLC, and the `--bfs-*` flags, because no BucketFS upload happens. Architecture
-  auto-detects from the host's `uname -m` unless you pass `--arch` explicitly. Personal-local on
-  Apple Silicon auto-detects as `aarch64`.
+  versions are not supported. It has no BucketFS HTTP endpoint, so the script works through the
+  deployment directory instead:
+  - It writes the engine `.so` to
+    `local/runtime/exa/bucketfs/bfsdefault/<bucket>/udf/liblakehouse_engine.so`. Creating a
+    directory there creates the bucket, and UDFs read it at
+    `/buckets/bfsdefault/<bucket>/udf/liblakehouse_engine.so`, the same layout as any BucketFS
+    target. `--bfs-bucket` picks the bucket (default `default`); the other `--bfs-*` flags do not
+    apply.
+  - It installs the Rust SLC with `exasol slc custom install` (or `update` when a `RUST` custom
+    SLC already exists). The launcher registers the `RUST` language itself and restarts the
+    database. `--skip-slc` skips this step, so an engine-only upgrade needs no restart.
+
+  This path needs the `exasol` launcher CLI on PATH. Architecture auto-detects from the host's
+  `uname -m` unless you pass `--arch` explicitly. Personal-local on Apple Silicon auto-detects as
+  `aarch64`.
 - A **cloud** deployment (backend other than `local`) uses the existing BucketFS HTTP upload path
   and needs `--bfs-write-password`, since Exasol Personal provisions no BucketFS password for you:
 

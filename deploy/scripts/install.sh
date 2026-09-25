@@ -53,13 +53,14 @@ PERSONAL_DB_USER_DEFAULT="sys"
 # BUCKETFS_REACHABLE_POLL_SECONDS=0 exercises the exact same production code path fast.
 BUCKETFS_REACHABLE_TRIES="${BUCKETFS_REACHABLE_TRIES:-30}"
 BUCKETFS_REACHABLE_POLL_SECONDS="${BUCKETFS_REACHABLE_POLL_SECONDS:-2}"
-# Exasol Personal (2.3+) local deployments publish no BucketFS endpoint and hide the shared
-# BucketFS directory from UDFs, so the SLC goes in through `exasol slc custom install|update` and
-# the engine .so rides inside the SLC's own rootfs, addressed by its in-container path.
+# Exasol Personal (2.3+) local deployments publish no BucketFS HTTP endpoint. The SLC goes in
+# through `exasol slc custom install|update`; the engine .so is written into the deployment's
+# host-side BucketFS directory, where creating <service>/<bucket>/ creates that bucket.
 LAUNCHER_SLC_ALIAS="RUST"
 LAUNCHER_SLC_LANGUAGE="rust"
-LAUNCHER_SO_ROOTFS_DIR="udf"
-LAUNCHER_SO_UDF_OBJECT="/$LAUNCHER_SO_ROOTFS_DIR/liblakehouse_engine.so"
+PERSONAL_EXA_RELATIVE_PATH="local/runtime/exa"
+PERSONAL_BUCKET_TRIES="${PERSONAL_BUCKET_TRIES:-30}"
+PERSONAL_BUCKET_POLL_SECONDS="${PERSONAL_BUCKET_POLL_SECONDS:-1}"
 
 # --- Global state (defaults; parse_args re-seeds arg-derived ones) -----------
 ARG_ACCOUNT_ID=""
@@ -470,9 +471,9 @@ Both modes:
                             -aarch64-suffixed release assets
   --deployment <name>       target an Exasol Personal deployment by name, resolving connection and
                             backend from $HOME/.exasol/personal/deployments/<name>/deployment.json;
-                            local backend installs through the `exasol` launcher's
-                            `slc custom install|update` with the engine bundled into the SLC
-                            (Exasol Personal 2.3+; --skip-slc and --bfs-* unsupported there);
+                            local backend (Exasol Personal 2.3+) installs the SLC through the
+                            `exasol` launcher's `slc custom install|update` and writes the engine
+                            into the deployment's BucketFS directory (only --bfs-bucket applies);
                             cloud backend falls through to the BucketFS HTTP path above
                             (--bfs-write-password required for cloud)
   --help                    show this help
@@ -688,24 +689,23 @@ resolve_deployment_transport() {
   fi
 
   DEPLOYMENT_TRANSPORT="launcher"
-  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
-    err "--skip-slc is not supported for a local Exasol Personal deployment: the engine .so is installed inside the Rust SLC via 'exasol slc custom', so installing the engine always re-installs the SLC."
-    return 1
-  fi
   local bfs_flags_given=""
   [[ -n "$ARG_BFS_HOST" ]] && bfs_flags_given="$bfs_flags_given --bfs-host"
   [[ -n "$ARG_BFS_PORT" ]] && bfs_flags_given="$bfs_flags_given --bfs-port"
-  [[ "$ARG_BFS_BUCKET_SET" -eq 1 ]] && bfs_flags_given="$bfs_flags_given --bfs-bucket"
   [[ -n "$ARG_BFS_WRITE_PASSWORD" ]] && bfs_flags_given="$bfs_flags_given --bfs-write-password"
   if [[ -n "$bfs_flags_given" ]]; then
-    err "BucketFS-only flag(s)$bfs_flags_given were given, but deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND', which is installed through 'exasol slc custom', not BucketFS. Drop the BucketFS flag(s)."
+    err "BucketFS HTTP flag(s)$bfs_flags_given were given, but deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND', which has no BucketFS HTTP endpoint: the engine is written straight into its BucketFS directory. Drop the flag(s); only --bfs-bucket applies."
+    return 1
+  fi
+  if [[ ! "$ARG_BFS_BUCKET" =~ ^[A-Za-z0-9._-]+$ || "$ARG_BFS_BUCKET" == "." || "$ARG_BFS_BUCKET" == ".." ]]; then
+    err "--bfs-bucket '$ARG_BFS_BUCKET' is not a valid bucket name: it names a directory under the deployment's BucketFS directory, so it must match [A-Za-z0-9._-]+ and not be '.' or '..'."
     return 1
   fi
   resolve_deployment_connection "$DEPLOYMENT_DIR" "$PERSONAL_DB_HOST_DEFAULT" || return 1
   if [[ "$ARG_ARCH_SET" -eq 0 ]]; then
     ARG_ARCH="$(detect_host_arch)" || return 1
   fi
-  log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND': installing $ARG_ARCH artifacts through 'exasol slc custom' with the engine bundled into the Rust SLC."
+  log "Deployment '$ARG_DEPLOYMENT' has backend '$LOCAL_BACKEND': installing $ARG_ARCH artifacts through 'exasol slc custom' and the deployment's BucketFS directory."
   return 0
 }
 
@@ -740,9 +740,6 @@ resolve_target_layout() {
       TARGET_RUST_LANG_SEGMENT="RUST=localzmq+protobuf:///$BFS_SERVICE/$ARG_BFS_BUCKET/slc/lakehouse-rustslc?lang=rust#buckets/$BFS_SERVICE/$ARG_BFS_BUCKET/slc/lakehouse-rustslc/exaudf/exaudfclient"
       TARGET_SLC_BFS_PATH="$BFS_SLC_PATH"
       TARGET_ENGINE_BFS_PATH="$BFS_ENGINE_SO_PATH"
-      if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
-        TARGET_SO_UDF_OBJECT="$LAUNCHER_SO_UDF_OBJECT"
-      fi
       ;;
     saas|*)
       TARGET_SO_UDF_OBJECT="$ENGINE_SO_PATH"
@@ -798,7 +795,6 @@ check_prereqs() {
   fi
   if [[ "$DEPLOYMENT_TRANSPORT" == "launcher" ]]; then
     have_cmd exasol || { err "required tool 'exasol' (the Exasol Personal launcher CLI) not found on PATH. A local Exasol Personal deployment is installed through 'exasol slc custom'."; ok=0; }
-    have_cmd gzip || { err "required tool 'gzip' not found on PATH. It repacks the Rust SLC with the engine .so bundled inside. Install it via your OS package manager."; ok=0; }
   fi
   [[ "$ok" -eq 1 ]]
 }
@@ -1161,46 +1157,67 @@ launcher_slc_action() {
   if [[ "$installed" -gt 0 ]]; then printf 'update\n'; else printf 'install\n'; fi
 }
 
-# Appends ./udf/liblakehouse_engine.so to the SLC tarball rather than extracting and repacking
-# it: a Linux rootfs does not survive a round trip through a case-insensitive macOS filesystem.
-bundle_engine_into_slc() {
-  local slc_tarball="$1" so_path="$2" dest="$3" stage="$WORKDIR/bundle-stage" plain="$WORKDIR/bundle.tar" out
-  if ! out="$(mkdir -p "$stage/$LAUNCHER_SO_ROOTFS_DIR" 2>&1 && cp "$so_path" "$stage$LAUNCHER_SO_UDF_OBJECT" 2>&1 && chmod 0755 "$stage/$LAUNCHER_SO_ROOTFS_DIR" && chmod 0644 "$stage$LAUNCHER_SO_UDF_OBJECT")"; then
-    err "could not stage the engine .so for bundling into the Rust SLC: $out"
+personal_bucket_dir() {
+  printf '%s\n' "$DEPLOYMENT_DIR/$PERSONAL_EXA_RELATIVE_PATH/bucketfs/$BFS_SERVICE/$ARG_BFS_BUCKET"
+}
+
+# Replaced via rename so a UDF VM that already mapped the old .so never reads a half-written file.
+install_engine_so_into_bucket() {
+  local so_path="$1" dest dest_dir out
+  dest_dir="$(personal_bucket_dir)/${TARGET_ENGINE_BFS_PATH%/*}"
+  dest="$(personal_bucket_dir)/$TARGET_ENGINE_BFS_PATH"
+  if ! out="$(mkdir -p "$dest_dir" 2>&1 && cp "$so_path" "$dest.partial" 2>&1 && chmod 0644 "$dest.partial" 2>&1 && mv -f "$dest.partial" "$dest" 2>&1)"; then
+    rm -f "$dest.partial"
+    err "could not write the engine .so to '$dest': $out"
     return 1
   fi
-  if ! out="$(gzip -dc "$slc_tarball" 2>&1 >"$plain")"; then
-    err "could not decompress the Rust SLC archive '$slc_tarball': $out"
-    return 1
-  fi
-  if ! out="$(COPYFILE_DISABLE=1 tar --no-xattrs -rf "$plain" -C "$stage" "./$LAUNCHER_SO_ROOTFS_DIR" 2>&1)"; then
-    err "could not append the engine .so to the Rust SLC archive: $out"
-    return 1
-  fi
-  if ! out="$(gzip -c "$plain" 2>&1 >"$dest")"; then
-    err "could not recompress the bundled Rust SLC archive: $out"
-    return 1
-  fi
-  rm -f "$plain"
+  log "Wrote the engine .so to $dest."
   return 0
 }
 
+# The engine registers a newly created bucket directory in bucketfs.conf within seconds; scripts
+# created before that point cannot resolve their /buckets path.
+wait_for_personal_bucket() {
+  local conf="$DEPLOYMENT_DIR/$PERSONAL_EXA_RELATIVE_PATH/bucketfs.conf" i=1 path service bucket rest
+  while [[ "$i" -le "$PERSONAL_BUCKET_TRIES" ]]; do
+    if [[ -r "$conf" ]]; then
+      while read -r path service bucket rest || [[ -n "$path" ]]; do
+        if [[ "$service" == "$BFS_SERVICE" && "$bucket" == "$ARG_BFS_BUCKET" ]]; then
+          return 0
+        fi
+      done <"$conf"
+    fi
+    if [[ "$i" -lt "$PERSONAL_BUCKET_TRIES" ]]; then
+      sleep "$PERSONAL_BUCKET_POLL_SECONDS"
+    fi
+    i=$((i + 1))
+  done
+  err "the database did not register BucketFS bucket '$BFS_SERVICE/$ARG_BFS_BUCKET' in '$conf' after $PERSONAL_BUCKET_TRIES checks. Check that deployment '$ARG_DEPLOYMENT' is running ('exasol status')."
+  return 1
+}
+
 deploy_personal_launcher() {
-  local so_path bundle="$WORKDIR/rustslc-with-engine.tar.gz" action out
-  log "Installing Rust SLC $RESOLVED_SLC_VERSION with lakehouse-engine $RESOLVED_ENGINE_VERSION bundled, via 'exasol slc custom' ..."
-  download_slc || return 1
+  local so_path action out
+  log "Installing lakehouse-engine $RESOLVED_ENGINE_VERSION into the deployment's BucketFS directory ..."
   download_engine || return 1
   if ! so_path="$(extract_engine_so "$WORKDIR/$ENGINE_ASSET" "$WORKDIR/extracted")"; then
     return 1
   fi
-  bundle_engine_into_slc "$WORKDIR/rustslc.tar.gz" "$so_path" "$bundle" || return 1
-  action="$(launcher_slc_action)" || return 1
-  log "Running 'exasol slc custom $action --alias $LAUNCHER_SLC_ALIAS' (restarts the database) ..."
-  if ! out="$(exasol_launcher slc custom "$action" --alias "$LAUNCHER_SLC_ALIAS" \
-      --language "$LAUNCHER_SLC_LANGUAGE" --source "$bundle" --auto-approve 2>&1)"; then
-    err "'exasol slc custom $action' failed for deployment '$ARG_DEPLOYMENT'. exasol said: $out"
-    return 1
+  install_engine_so_into_bucket "$so_path" || return 1
+
+  if [[ "$ARG_SKIP_SLC" -eq 1 ]]; then
+    log "Skipping SLC install (--skip-slc)."
+  else
+    download_slc || return 1
+    action="$(launcher_slc_action)" || return 1
+    log "Running 'exasol slc custom $action --alias $LAUNCHER_SLC_ALIAS' for Rust SLC $RESOLVED_SLC_VERSION (restarts the database) ..."
+    if ! out="$(exasol_launcher slc custom "$action" --alias "$LAUNCHER_SLC_ALIAS" \
+        --language "$LAUNCHER_SLC_LANGUAGE" --source "$WORKDIR/rustslc.tar.gz" --auto-approve 2>&1)"; then
+      err "'exasol slc custom $action' failed for deployment '$ARG_DEPLOYMENT'. exasol said: $out"
+      return 1
+    fi
   fi
+  wait_for_personal_bucket || return 1
   create_engine_scripts || return 1
   return 0
 }
