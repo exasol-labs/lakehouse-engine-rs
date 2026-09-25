@@ -467,8 +467,8 @@ Both modes:
                             language-container-rs's own latest release)
   --skip-slc                do not download, upload or register the Rust SLC; install the engine
                             against the SLC already registered on the database
-  --arch <x86_64|aarch64>   target CPU architecture (default: x86_64); selects unsuffixed vs
-                            -aarch64-suffixed release assets
+  --arch <x86_64|aarch64>   target CPU architecture (default: x86_64, or the host's for a local
+                            --deployment); selects unsuffixed vs -aarch64-suffixed release assets
   --deployment <name>       target an Exasol Personal deployment by name, resolving connection and
                             backend from $HOME/.exasol/personal/deployments/<name>/deployment.json;
                             local backend (Exasol Personal 2.3+) writes into the deployment's
