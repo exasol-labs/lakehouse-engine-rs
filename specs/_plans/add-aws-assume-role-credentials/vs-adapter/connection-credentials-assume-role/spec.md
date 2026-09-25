@@ -11,7 +11,6 @@ Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `
 * **STS endpoint and signing region.** The STS region is the SigV4 signing region `vs-adapter/connection-credentials-sigv4` resolves: the region a standard AWS Glue endpoint names, else the stated `region`. The endpoint is `aws_sts_endpoint` when stated, else `https://sts.<region>.amazonaws.com` for a resolved region, else the global `https://sts.amazonaws.com`. A request with no resolved region is signed for `us-east-1`. A China-region CONNECTION states `aws_sts_endpoint`, because the AWS STS endpoint table lists China endpoints under `.amazonaws.com.cn`.
 * **The storage credential source has one precedence.** Three sources exist: the assumed role, credentials the catalog vends, and the CONNECTION's own static credentials. The assumed role wins, then vending, then the CONNECTION. `use_vended_credentials` therefore has no effect on a CONNECTION that names a role.
 * **Omitting the access-delegation header is spec-compliant.** The Iceberg REST OpenAPI (`open-api/rest-catalog-open-api.yaml`, main) marks `X-Iceberg-Access-Delegation` `required: false` and describes it as an "Optional signal to the server that the client supports delegated access".
-* **The session lasts the STS default of 3600 seconds.** The request states no `DurationSeconds`.
 
 ## Scenarios
 

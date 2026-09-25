@@ -2,7 +2,7 @@
 
 ## Summary
 
-A CONNECTION can name an AWS IAM role that the adapter assumes with one signed STS `AssumeRole` call per request (issue #139). The session credentials replace the static key pair for SigV4 catalog signing and S3 storage, and reach the scan only inside the sealed envelope.
+A CONNECTION can name an AWS IAM role that the adapter assumes with one signed STS `AssumeRole` call per request (issue #139). The session credentials replace the static key pair for SigV4 catalog signing and S3 storage, and reach the scan only inside the sealed envelope. MinIO cannot model role assumption natively — its `AssumeRole` ignores `RoleArn` and inherits the caller's policy — so the local suite proves both spike scenarios (base identity denied, role identity allowed) against an STS stub instead.
 
 ## Design
 
@@ -82,6 +82,10 @@ ResolvedConnectionConfig { creds: effective, storage: storage_block(effective) }
 | Signed Query-API GET plus `quick-xml` (decision-log [3]) | `aws-sdk-sts`, `reqsign`, POST, JSON, a substring parser | Zero new packages. It reuses `sign_request`. Entity-correct parsing. |
 | `aws_sts_endpoint` override, regional default (decision-log [4]) | No override; reuse the S3 `endpoint` | Covers the E2E stub, VPC endpoints, and China. AWS recommends regional endpoints. |
 | Local STS stub plus opt-in real-AWS suite (decision-log [10]) | MinIO's AssumeRole, LocalStack, moto, a manual check | MinIO ignores `RoleArn`. The stub automates both spike scenarios. |
+
+### Spec Delta Prose
+
+A spec Background or Scenario states the resulting behavior as if it had always been the rule, never as a transition. No bullet in a § Features delta may narrate "previously X, now Y" or "SUPERSEDING/SUPERSEDES the recorded clause that …, because …" — a reader of the merged spec should not see history, only current state. That narration belongs in this plan.md, and may repeat, more briefly, in decision-log.md — never in a spec.md. Where a delta must tell `/speq:record` which recorded clause it replaces, name the clause by its exact heading and let the DELTA marker do the rest; the replacement does not need explaining inline. Keep this in mind when finishing or reviewing this plan's own deltas and at record time — general bloat aside, this specific narrative habit is how the permanent library accumulates SUPERSEDES chains across plans (already present in `pushdown-planning-cloud-credentials/spec.md`).
 
 ## Features
 
@@ -213,7 +217,7 @@ ResolvedConnectionConfig { creds: effective, storage: storage_block(effective) }
   - Attach `aws_iam_policy.engine_reader` to the role.
   - Add SSM parameters, outputs, and a `terraform.tfvars.example` placeholder.
   - Run `tofu validate` and `tofu fmt -check`.
-- [ ] 4.2 Add two assume-role tests to `crates/lakehouse-engine/tests/cloud_e2e_test.rs`, with their own environment struct. Skip with a message naming the absent variable. Document the four variables in the module doc and in `deploy/README.md`, read from SSM.
+- [ ] 4.2 Add two assume-role tests to `crates/lakehouse-engine/tests/cloud_e2e_test.rs`, with their own environment struct. Skip with a message naming the absent variable. Document the four variables in the module doc and in `deploy/README.md`, read from SSM. This plan's headline path is real AWS STS and Glue accepting the engine's signed requests; the PR is not marked ready until the § Checklist "Cloud assume-role" row has run with the variables exported and reported 2 passed, 0 skipped.
 
 ### E. Documentation
 
@@ -222,6 +226,8 @@ ResolvedConnectionConfig { creds: effective, storage: storage_block(effective) }
   - Document the endpoint and region rule, `ALLOW_HTTP` for an `http` STS endpoint, and the China override.
   - Document the precedence over vending and the 3600-second session.
   - Add an AWS Glue assume-role example CONNECTION: the ticket's example plus `region`.
+  - State that MinIO's `AssumeRole` ignores `RoleArn` and inherits the caller's policy, so role assumption needs an AWS-compatible STS endpoint; a MinIO-backed `aws_sts_endpoint` does not apply the named role.
+  - State that a failed STS request is not retried, so `Throttling` and 5xx responses under concurrent load surface as failed queries rather than a transient retry.
 - [ ] 5.2 Update `docs/security.md`. State that the sealed envelope also carries assumed-role session credentials. State that the base identity needs only `sts:AssumeRole`.
 - [ ] 5.3 Update `specs/mission.md`. Add an AWS STS row to § External Dependencies. Name STS role assumption in the `lakehouse-catalog` project-structure line.
 
@@ -304,3 +310,4 @@ ResolvedConnectionConfig { creds: effective, storage: storage_block(effective) }
 | Format | `cargo fmt --check` | No changes |
 | Dependencies | `cargo deny check` | Exit 0 |
 | Lockfile | `git diff Cargo.lock` | No new `[[package]]` entry |
+| Cloud assume-role | `cargo test -p lakehouse-engine --features cloud-e2e --test cloud_e2e_test cloud_assume_role -- --test-threads=1` with the four assume-role SSM variables exported | 2 passed, 0 skipped — the PR is not marked ready until this row has passed once |

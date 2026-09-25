@@ -85,7 +85,7 @@
 - **Decision:** `RoleSessionName` is the constant `lakehouse-engine`. The request omits `DurationSeconds`, so the session lasts the STS default of 3600 seconds. The client times out after 30 seconds and does not retry.
 - **Alternatives:** (a) Configurable session name and duration. Rejected: no stated need. (b) A duration above one hour. Rejected: a value above the role's maximum fails the call, and role chaining caps sessions at one hour. (c) Retries. Rejected: a failure is a configuration defect in the common case, and a fast named error serves the operator better.
 - **Rationale:** `lakehouse-engine` matches the `RoleSessionName` pattern `[\w+=,.@-]*` and identifies the engine in CloudTrail. The existing catalog client sets no timeout. The new call gets one, so an unreachable STS endpoint fails in bounded time rather than stalling the adapter.
-- **Consequences:** A query whose scan phase ends more than one hour after planning fails with the store's expired-token error, as a vended credential does. `docs/catalogs.md` states this limit.
+- **Consequences:** A query whose scan phase ends more than one hour after planning fails with the store's expired-token error, as a vended credential does. `docs/catalogs.md` states this limit. STS `Throttling` and 5xx responses are also not retried: a concurrent workload that drives one STS call per `createVirtualSchema`/`refresh`/`setProperties`/pushdown into throttling surfaces as failed user queries rather than a transient retry. This is an accepted limitation, not an oversight; task 5.1 states it in `docs/catalogs.md` so an operator sizing a role CONNECTION for concurrent load knows the failure mode. No follow-up issue: no reporter has hit it, and adding a bounded retry has no stated need yet.
 - **Promotes to ADR:** no
 
 ### [8] `pushdown-planning-cloud-credentials` is scoped by its description, other specs by scenario edits
@@ -125,6 +125,36 @@
 
 - **Finding:** The `pushdown-planning-cloud-credentials` description scoped every scenario to a CONNECTION that names no role. That scope also removed § "SigV4/Glue derives the catalogs/{account-id} REST prefix on every catalog request" for the ticket's own role CONNECTION shape. Scenario-level retrieval does not print the description, so the scope was also invisible to a reader of one scenario.
 - **Direction change:** The description excepts the prefix scenario. `connection-credentials-assume-role` § "Session credentials sign every SigV4 catalog request" gains a step that requires the same prefix, unchanged by the role. Task 1.7's `assumed_session_signs_load_table_and_namespace_enumeration` asserts the `catalogs/<warehouse>` path segment, and § Scenario Coverage maps it to the prefix scenario. Decision [8] states the exception and gains a Consequences line on scenario-level retrieval.
+- **Promotes to ADR:** no
+
+### [plan-review] The connection-credentials-assume-role Background repeated the session-lifetime fact
+
+- **Finding:** Background bullet 4 already states `DurationSeconds defaults to 3600`. Bullet 8 restated the same 3600-second lifetime and the THEN step's own "MUST NOT carry `DurationSeconds`" clause, adding no information the reader did not already have. Left unfixed since round 1, the same class of repetition PR #422 and PR #424 review flagged in shipped specs and ADRs ("restates the other spec, the scenarios, or the decision log").
+- **Direction change:** Background bullet 8 is deleted from `vs-adapter/connection-credentials-assume-role/spec.md`. Bullet 4 and the request-shape scenario's THEN step remain the sole statements of the fact.
+- **Promotes to ADR:** no
+
+### [plan-review] STS throttling was rejected as a retry case with no accepted-limitation record
+
+- **Finding:** Decision [7] rejects retries because "a failure is a configuration defect in the common case," but STS `Throttling` and 5xx responses are transient, not configuration defects, and every `createVirtualSchema`/`refresh`/`setProperties`/pushdown now makes one STS call. Nothing recorded this as an accepted limitation or told an operator about the failure mode, so the plan could ship without the gap being visible anywhere — the same scope-accuracy concern PR #424 review raised about stating a delivered guarantee precisely (there, the TopK/HashJoinExec placement scope).
+- **Direction change:** Decision [7] Consequences now states the limitation explicitly and points to task 5.1's `docs/catalogs.md` documentation of it, rather than adding a retry (no reporter has hit this yet; retries stay a follow-up if one does).
+- **Promotes to ADR:** no
+
+### [plan-review] The MinIO spike answer was not stated where an operator or requester would read it
+
+- **Finding:** The ticket's "Check this if it works with MinIO" note is read in decision [10] as regression safety, but the plan's own evidence answers it negatively — MinIO's `AssumeRole` ignores `RoleArn` and inherits the caller's policy. Neither plan.md § Summary nor task 5.1's documentation said so, so the requester could not confirm the spike closed and an operator pointing `aws_sts_endpoint` at MinIO would get silent base-identity access instead of the named role.
+- **Direction change:** plan.md § Summary states the spike answer. Task 5.1 gains a `docs/catalogs.md` line stating MinIO's `AssumeRole` ignores `RoleArn`.
+- **Promotes to ADR:** no
+
+### [plan-review] The headline cloud-AWS path had no Checklist gate
+
+- **Finding:** `cloud_assume_role_reaches_glue_and_s3_through_the_role` is the only check that real AWS STS and Glue accept the engine's signed requests, and it skips cleanly without four SSM variables and a manual `tofu apply`. § Checklist had no row for it, so the plan could reach PASS and ship without that path ever running against AWS — the same "does the delivered guarantee actually run" concern PR #424 review raised.
+- **Direction change:** § Checklist gains a "Cloud assume-role" row requiring 2 passed, 0 skipped. Task 4.2 states the PR is not marked ready until that row has passed once.
+- **Promotes to ADR:** no
+
+### [plan-review] Three deltas narrated the change instead of stating the resulting state
+
+- **Finding:** `connection-credentials`, `rest-catalog-oauth-auth`, and `storage-backend-enum` each carried a "SUPERSEDING/SUPERSEDES the recorded clause that …, because …" clause inside a scenario's THEN step — history the merged spec would carry forward forever, not the current rule. `pushdown-planning-cloud-credentials/spec.md` already accumulates nine such clauses from prior plans, and PR #422's own cleanup commit had to collapse a Background bloated the same way.
+- **Direction change:** All three clauses are rewritten to state only the resulting behavior; the storage-backend-enum clause keeps its normative content (the join planner MUST NOT reject differing-backend sides) without narrating that a guard was deleted. plan.md gains a "Spec Delta Prose" principle governing this for the rest of the plan's authoring and for `/speq:record`.
 - **Promotes to ADR:** no
 
 ### [plan-review] The assume-role E2E Background held design rationale and an untested stub signature check
