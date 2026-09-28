@@ -10,7 +10,6 @@ locals {
   ssm_root       = "/spot-strata/${var.env_name}"
 }
 
-# --- Network: VPC + public subnet + IGW + S3 gateway endpoint --------------
 resource "aws_vpc" "this" {
   cidr_block           = var.vpc_cidr
   enable_dns_support   = true
@@ -44,7 +43,7 @@ resource "aws_route_table_association" "public" {
   route_table_id = aws_route_table.public.id
 }
 
-# Free gateway endpoint => EC2<->S3 stays on the AWS backbone (no NAT, no transfer cost).
+# Gateway endpoint keeps EC2<->S3 traffic off NAT (no transfer cost).
 resource "aws_vpc_endpoint" "s3" {
   vpc_id            = aws_vpc.this.id
   service_name      = "com.amazonaws.${var.region}.s3"
@@ -53,7 +52,6 @@ resource "aws_vpc_endpoint" "s3" {
   tags              = { Name = "${local.prefix}-s3-endpoint" }
 }
 
-# --- S3 warehouse bucket ----------------------------------------------------
 resource "aws_s3_bucket" "warehouse" {
   bucket = local.bucket
   tags   = { Name = local.bucket }
@@ -67,7 +65,6 @@ resource "aws_s3_bucket_public_access_block" "warehouse" {
   restrict_public_buckets = true
 }
 
-# --- Glue Iceberg databases (tables created by gen_load.py) -----------------
 resource "aws_glue_catalog_database" "tpch" {
   name         = var.tpch_db_name
   location_uri = "s3://${aws_s3_bucket.warehouse.bucket}/${var.tpch_db_name}.db"
@@ -83,7 +80,6 @@ resource "aws_glue_catalog_database" "erp" {
   location_uri = "s3://${aws_s3_bucket.warehouse.bucket}/${var.erp_db_name}.db"
 }
 
-# --- Athena (benchmark consumer of the same Glue catalog) -------------------
 resource "aws_athena_workgroup" "perf" {
   name = "${local.prefix}-athena"
   configuration {
@@ -96,7 +92,6 @@ resource "aws_athena_workgroup" "perf" {
   tags = { Name = "${local.prefix}-athena" }
 }
 
-# --- engine-reader IAM user (creds embedded in the Exasol CONNECTION) -------
 resource "aws_iam_user" "engine_reader" {
   name = "${local.prefix}-engine-reader"
   tags = { Name = "${local.prefix}-engine-reader" }
@@ -140,7 +135,6 @@ resource "aws_iam_access_key" "engine_reader" {
   user = aws_iam_user.engine_reader.name
 }
 
-# --- SSM parameters (single source of truth for secrets.sh + bench) ---------
 resource "aws_ssm_parameter" "engine_access_key_id" {
   name  = "${local.ssm_root}/engine/access_key_id"
   type  = "SecureString"
@@ -195,7 +189,6 @@ resource "aws_ssm_parameter" "erp_namespace" {
   value = var.erp_db_name
 }
 
-# --- Temporary data-gen EC2 (count gated; self-terminates) ------------------
 data "aws_ami" "ubuntu" {
   count       = var.run_data_gen ? 1 : 0
   most_recent = true
@@ -260,7 +253,7 @@ resource "aws_iam_instance_profile" "datagen" {
   role  = aws_iam_role.datagen[0].name
 }
 
-# Upload the generator to S3 so user-data fetches it (avoids the 16 KB user-data limit).
+# Fetched by user-data from S3 to stay under the 16 KB user-data limit.
 resource "aws_s3_object" "gen_load" {
   count  = var.run_data_gen ? 1 : 0
   bucket = aws_s3_bucket.warehouse.id
@@ -309,11 +302,6 @@ resource "aws_instance" "datagen" {
   tags = { Name = "${local.prefix}-datagen" }
 }
 
-# --- Spark benchmark (EMR Serverless application, opt-in) -------------------
-# Gated by enable_emr_serverless (default false): the application resource itself is billed only
-# while a job runs (no idle EC2/EBS to reserve or leak), so it's kept as a persistent-but-free
-# catalog-adjacent resource here rather than a separate ephemeral stack — but still off by default
-# so nothing exists unless explicitly opted in.
 resource "aws_iam_role" "emr_serverless_job" {
   count = var.enable_emr_serverless ? 1 : 0
   name  = "${local.prefix}-emr-serverless-job-role"
@@ -350,9 +338,7 @@ resource "aws_iam_role_policy" "emr_serverless_job" {
         Resource = "*"
       },
       {
-        # Needed by make_deletes_remote.py (the one-time delete-authoring job): it CTAS-copies the
-        # tpch tables into a NEW tpch_deletes Glue database, which requires create/update, not just
-        # the read-only access the original (read-only spark_queries.py comparison job) needed.
+        # make_deletes_remote.py CTAS-copies tpch into a new tpch_deletes database.
         Sid    = "GlueWriteForDeleteAuthoring"
         Effect = "Allow"
         Action = [
@@ -371,8 +357,7 @@ resource "aws_iam_role_policy" "emr_serverless_job" {
         Resource = [aws_s3_bucket.warehouse.arn, "${aws_s3_bucket.warehouse.arn}/*"]
       },
       {
-        # Same rationale as GlueWriteForDeleteAuthoring: the CTAS+DELETE writes new Parquet data
-        # files, manifests, and metadata.json under the warehouse bucket for the tpch_deletes tables.
+        # make_deletes_remote.py writes the tpch_deletes data and metadata files.
         Sid      = "S3WriteForDeleteAuthoring"
         Effect   = "Allow"
         Action   = ["s3:PutObject", "s3:DeleteObject"]
@@ -423,8 +408,6 @@ resource "aws_s3_object" "spark_queries" {
   etag   = filemd5("${path.module}/../scripts/spark_queries.py")
 }
 
-# One-time delete-prep entrypoint (deploy/scripts/make-deletes-remote.sh submits this). Under the same
-# scripts/ prefix the job role's S3ScriptRead statement already covers — no IAM change needed.
 resource "aws_s3_object" "make_deletes_remote" {
   count  = var.enable_emr_serverless ? 1 : 0
   bucket = aws_s3_bucket.warehouse.id

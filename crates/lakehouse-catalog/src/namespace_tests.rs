@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::*;
 
-/// Scenario: single-level namespace — returns (NamespaceIdent::new("mydb"), "mytable").
 #[test]
 fn parse_table_ident_splits_namespace_table() {
     let (ns, tbl) = parse_table_ident("mydb.mytable").unwrap();
@@ -17,7 +16,6 @@ fn parse_table_ident_errors_on_no_dot() {
 }
 
 /// Scenario: Pushdown resolves multi-level namespace identifiers into the iceberg TableIdent.
-/// "prod.finance.orders" → NamespaceIdent(["prod","finance"]), "orders".
 #[test]
 fn parse_table_ident_handles_multilevel_namespace() {
     let (ns, tbl) = parse_table_ident("prod.finance.orders").unwrap();
@@ -29,7 +27,6 @@ fn parse_table_ident_handles_multilevel_namespace() {
     );
     assert_eq!(tbl, "orders", "table name is the trailing segment");
 
-    // Three-level namespace + table.
     let (ns3, tbl3) = parse_table_ident("prod.finance.eu.orders").unwrap();
     let levels3: &[String] = &ns3;
     assert_eq!(
@@ -40,9 +37,6 @@ fn parse_table_ident_handles_multilevel_namespace() {
     assert_eq!(tbl3, "orders");
 }
 
-/// Scenario: an empty configured namespace is rejected by `NamespaceIdent::from_vec`
-/// before any catalog request is issued — the error names the (empty) configured
-/// namespace, not the underlying iceberg wording alone.
 #[tokio::test]
 async fn list_namespace_tables_rejects_empty_namespace() {
     let storage = static_backend();
@@ -58,17 +52,6 @@ async fn list_namespace_tables_rejects_empty_namespace() {
     );
 }
 
-/// Scenario: end-to-end — `list_namespace_tables`'s SigV4 enumeration path
-/// (`list_in_namespace_signed` / `build_list_tables_url`) signs its
-/// `list_tables` request against the derived `catalogs/{account-id}` prefix,
-/// not the bare warehouse. This path bypasses `resolve_load_table_prefix`
-/// entirely (it is `create-virtual-schema`'s namespace-enumeration path), so
-/// it needs its own proof that `glue_catalog_prefix` reached it too.
-///
-/// `list_in_namespace_signed` issues the `list_tables` GET first; the
-/// follow-up `list_namespaces?parent=` (child-namespace recursion) then sees
-/// `EMPTY_LISTING`'s empty `namespaces` and stops, matching AWS Glue's flat
-/// catalog. The first captured request head is therefore the `list_tables` one.
 #[tokio::test]
 async fn list_tables_signed_url_carries_catalogs_prefix() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
@@ -102,14 +85,8 @@ async fn list_tables_signed_url_carries_catalogs_prefix() {
     );
 }
 
-/// A reply both enumeration requests parse: an empty `list_tables` page and an
-/// empty `list_namespaces` page, so the enumeration stops after one level.
 const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
 
-/// Scenario: A standard AWS Glue endpoint signs the catalog request even when
-/// the CONNECTION states a different region — every namespace-enumeration
-/// request is signed for the resolved region handed to the enumeration, never
-/// for the stated `creds.region`.
 #[tokio::test]
 async fn signed_enumeration_is_signed_for_the_resolved_region() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
@@ -143,9 +120,6 @@ async fn signed_enumeration_is_signed_for_the_resolved_region() {
     }
 }
 
-/// Scenario: the signed enumeration refuses, before sending any request, when
-/// neither the stated region nor the catalog URI supplies a signing region —
-/// with an error naming `region`.
 #[tokio::test]
 async fn signed_enumeration_refuses_without_signing_region() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;

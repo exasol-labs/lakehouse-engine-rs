@@ -1,23 +1,7 @@
 #!/usr/bin/env bash
-# Parallelism-factor oversubscription sweep (add-arithmetic-aggregate-pushdown-and-
-# benchmark-suite, task 3.1; NOT a spec feature — same convention as sweep.sh).
-#
-# Hypothesis under test: each join-leg shard scan is single-threaded
-# (df_threads_per_udf=1) and its ctx.emit_batch is a synchronous ZMQ MT_EMIT
-# send-then-ack round-trip. At the shipped BENCH_PARALLELISM_FACTOR=8, this
-# 2-node/8-core-per-node cluster gets G=16 shards = exactly 1 shard/core — no
-# second shard queued up to keep a core busy while the first blocks on its emit
-# ack. Oversubscribing (factor=16 -> G=32 = 2 shards/core, factor=24 -> G=48 =
-# 3 shards/core) might hide that stall. UNVERIFIED going in; see
-# crates/lakehouse-engine/src/adapter/mod.rs (resolve_parallelism_factor) and
-# specs/_plans/add-arithmetic-aggregate-pushdown-and-benchmark-suite/decision-log.md.
-#
-# Reuses sweep.sh's driver shape (config rows run via `env KNOB=val ./bench/run.sh`,
-# output filtered into a report) but sweeps a single knob and narrows the captured
-# output to the queries this hypothesis is about: Q2/Q3/Q5 (raw-emit-heavy joins)
-# plus Q9b (non-join wide-projection regression check — oversubscription must not
-# make it worse). Reuses staged .so+SLC (BENCH_SKIP_UPLOAD=1 recommended, same as
-# sweep.sh) to avoid redundant BucketFS uploads across sweep rows.
+# PARALLELISM_FACTOR oversubscription sweep: can more shards per core hide the synchronous
+# MT_EMIT ack stall of single-threaded shard scans? Captures Q2/Q3/Q5 (emit-heavy joins) and Q9b
+# (regression check). BENCH_SKIP_UPLOAD=1 recommended.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 mkdir -p bench/reports
@@ -30,8 +14,6 @@ configs=(
   "pf24           24"
 )
 extract_target_queries() {
-  # Prints only the "### Q2/Q3/Q5/Q9b ..." header + its "elapsed:" line, skipping
-  # the CSV result body in between and every other query's header/elapsed pair.
   awk '
     /^### Q2 |^### Q3 |^### Q5 |^### Q9b / { print; keep=1; next }
     keep && /^elapsed:/ { print; keep=0; next }

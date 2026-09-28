@@ -1,5 +1,3 @@
-//! Parses and validates the `DIRECT_STORAGE` virtual-schema properties: `NAMESPACE`,
-//! `MERGE_SCHEMA`, `HIVE_PARTITIONING`. Read only under `CatalogKind::DirectStorage`.
 use crate::adapter::parquet_directory::{DirectoryOptions, MergeMode};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
@@ -7,7 +5,6 @@ use serde_json::Value as Json;
 const PROP_MERGE_SCHEMA: &str = "MERGE_SCHEMA";
 const PROP_HIVE_PARTITIONING: &str = "HIVE_PARTITIONING";
 
-/// The resolved direct-storage properties for one virtual schema.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirectStorageProperties {
     /// CONNECTION address joined with `NAMESPACE` (exactly one `/`), or the CONNECTION address

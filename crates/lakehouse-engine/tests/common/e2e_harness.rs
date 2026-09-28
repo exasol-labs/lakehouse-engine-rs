@@ -1,13 +1,5 @@
-//! Shared provisioning harness for the `exasol-e2e` integration-test binaries.
-//!
-//! Every `exasol-e2e` binary under `tests/` re-declared the same connection
-//! constants, SLC install, schema/script DDL, Virtual Schema creation, and
-//! catalog-inspection helpers. They are defined once here and `use`d by each
-//! binary; per-binary variation (VS names, namespaces, extra VS properties,
-//! seeding, `OnceLock` orchestration) stays local to each binary.
-//!
-//! Fail-loud, never-skip is preserved: the helpers panic (never return `Err`)
-//! when the local stack is unavailable, per project rules.
+//! Shared provisioning for the `exasol-e2e` binaries. Helpers panic, never skip,
+//! when the local stack is unavailable.
 
 use super::exasol_ws::ExaConn;
 use super::seed::{E2E_DIM_TABLE, E2E_FACT_TABLE};
@@ -25,40 +17,22 @@ use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, Stor
 use std::collections::HashMap;
 use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Shared connection / provisioning constants (byte-identical across every
-// `exasol-e2e` binary). Per-binary values that legitimately diverge — the VS
-// name and the catalog CONNECTION name — are NOT here: the VS name stays a
-// file-local constant, and the CONNECTION name is a `VsProps` field.
-// ---------------------------------------------------------------------------
-
-/// `sys` password for the local Exasol Docker container.
 pub const SYS_PASSWORD: &str = "exasol";
-/// Schema hosting the adapter/scan/distributor scripts.
 pub const SCHEMA_NAME: &str = "LHVS";
-/// RUST ADAPTER SCRIPT name.
 pub const ADAPTER_SCRIPT_NAME: &str = "LAKEHOUSE_ADAPTER";
-/// RUST SCALAR scan-UDF script name.
 pub const SCAN_SCRIPT_NAME: &str = "LAKEHOUSE_SCAN";
-/// LUA SET passthrough distributor doing the cross-node `GROUP BY shard_key`
-/// fan-out. Not a Rust entry point — created by plain DDL, no `.so` involved.
+/// Plain LUA DDL, not a Rust entry point: does the cross-node `GROUP BY shard_key` fan-out.
 pub const DISTRIBUTOR_SCRIPT_NAME: &str = "LAKEHOUSE_DISTRIBUTE_FILES";
 
-/// RUST SCALAR version-query script name.
 pub const VERSION_SCRIPT_NAME: &str = "LAKEHOUSE_VERSION";
-/// BucketFS path for the `.so` (as PUT target).
 pub const SO_BUCKETFS_PUT_PATH: &str = "/default/udf/liblakehouse_engine.so";
-/// BucketFS path for the `.so` as referenced in `%udf_object` (no leading `/`).
+/// No leading `/`, as `%udf_object` requires.
 pub const SO_UDF_OBJECT_PATH: &str = "buckets/bfsdefault/default/udf/liblakehouse_engine.so";
-/// BucketFS path for the SLC tarball.
 pub const SLC_BUCKETFS_PUT_PATH: &str = "/default/slc/lakehouse-rustslc.tar.gz";
-/// SLC version to download: the version of the `exasol-udf-sdk` this harness
-/// links, since the `.so` only loads against a matching SLC fingerprint.
+/// The `.so` only loads against an SLC with a matching SDK fingerprint.
 pub const SLC_VERSION: &str = sdk_version_from_fingerprint();
 
-/// Const-evaluates the version field of `EXA_SDK_FINGERPRINT`
-/// (`"{sdk_version}:{rustc_hash}\0"`); `const` so `SLC_VERSION` stays a
-/// `&'static str` usable in inline format captures.
+/// `const` so `SLC_VERSION` stays a `&'static str` usable in inline format captures.
 const fn sdk_version_from_fingerprint() -> &'static str {
     let bytes = exasol_udf_sdk::abi::EXA_SDK_FINGERPRINT.as_bytes();
     let mut end = 0;
@@ -71,21 +45,12 @@ const fn sdk_version_from_fingerprint() -> &'static str {
         Err(_) => panic!("SDK fingerprint version field is not UTF-8"),
     }
 }
-/// Language alias for the SLC.
+
 pub const LANG_ALIAS: &str = "RUST";
 
-/// Default catalog CONNECTION name; `VsProps::with_catalog_conn_name` overrides
-/// it (only the refresh binary does, with `REFRESH_CATALOG_CREDS`).
 pub const DEFAULT_CATALOG_CONN_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 
-// ---------------------------------------------------------------------------
-// Provisioning helpers (byte-identical merges)
-// ---------------------------------------------------------------------------
-
-/// Download SLC `SLC_VERSION`, upload it to BucketFS, and register the RUST
-/// language alias, replacing any existing `RUST=` entry so the alias points at
-/// the freshly-uploaded SLC. This Exasol is dedicated to lakehouse-engine, so a
-/// clean replacement is correct.
+/// Replaces any existing `RUST=` entry; this Exasol is dedicated to lakehouse-engine.
 pub fn install_slc() {
     let slc_url = format!(
         "https://github.com/exasol-labs/language-container-rs/releases/download/v{SLC_VERSION}/lc-rust-{SLC_VERSION}.tar.gz"
@@ -148,21 +113,16 @@ pub fn install_slc() {
     ));
 }
 
-/// Upload the built `.so` to its BucketFS path (`SO_BUCKETFS_PUT_PATH`).
 pub fn upload_so() {
     let so_path = lakehouse_engine_so_path();
     upload_to_bucketfs(&so_path, SO_BUCKETFS_PUT_PATH);
 }
 
-/// Open an Exasol connection using `sys` credentials.
 pub fn exa_conn() -> ExaConn {
     ExaConn::connect(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
 }
 
-/// Create the dedicated schema, RUST adapter script, RUST scan SCALAR script,
-/// RUST version-query SCALAR script, and the LUA SET passthrough distributor.
-/// All idempotent (`CREATE OR REPLACE`), so concurrent recreation across
-/// binaries is harmless.
+/// All `CREATE OR REPLACE`, so concurrent recreation across binaries is harmless.
 pub fn create_schema_and_scripts(conn: &mut ExaConn) {
     conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {SCHEMA_NAME}"));
     conn.execute(&format!(
@@ -194,14 +154,6 @@ end
     ));
 }
 
-// ---------------------------------------------------------------------------
-// Virtual Schema creation — one `VsProps`-parameterized helper collapsing the
-// five per-binary `create_virtual_schema` signatures.
-// ---------------------------------------------------------------------------
-
-/// Parameters for `create_virtual_schema`, collapsing the five per-binary
-/// signatures into one. Build with `VsProps::new(vs_name, namespace)` and layer
-/// the optional properties via the `with_*` setters.
 pub struct VsProps<'a> {
     vs_name: &'a str,
     namespace: &'a str,
@@ -214,8 +166,6 @@ pub struct VsProps<'a> {
 }
 
 impl<'a> VsProps<'a> {
-    /// Base properties: a VS named `vs_name` over Iceberg `namespace`, using the
-    /// default catalog CONNECTION and no optional VS properties.
     pub fn new(vs_name: &'a str, namespace: &'a str) -> Self {
         Self {
             vs_name,
@@ -229,70 +179,45 @@ impl<'a> VsProps<'a> {
         }
     }
 
-    /// Set the `PARALLELISM_FACTOR` VS property.
     pub fn with_parallelism_factor(mut self, factor: usize) -> Self {
         self.parallelism_factor = Some(factor);
         self
     }
 
-    /// Set the `JOIN_BROADCAST_MAX_BYTES` VS property.
     pub fn with_join_broadcast_max_bytes(mut self, bytes: &'a str) -> Self {
         self.join_broadcast_max_bytes = Some(bytes);
         self
     }
 
-    /// Override the catalog CONNECTION name (default `LAKEHOUSE_CATALOG_CREDS`).
     pub fn with_catalog_conn_name(mut self, name: &'a str) -> Self {
         self.catalog_conn_name = name;
         self
     }
 
-    /// Set the `CATALOG_KIND` VS property (e.g. `"DIRECT_STORAGE"`).
     pub fn with_catalog_kind(mut self, kind: &'a str) -> Self {
         self.catalog_kind = Some(kind);
         self
     }
 
-    /// Set the `MERGE_SCHEMA` VS property (e.g. `"FALSE"`).
     pub fn with_merge_schema(mut self, merge_schema: &'a str) -> Self {
         self.merge_schema = Some(merge_schema);
         self
     }
 
-    /// Set the `HIVE_PARTITIONING` VS property (e.g. `"FALSE"`).
     pub fn with_hive_partitioning(mut self, hive_partitioning: &'a str) -> Self {
         self.hive_partitioning = Some(hive_partitioning);
         self
     }
 }
 
-/// Create (or replace) a Virtual Schema from `props`.
-///
-/// Re-issues the idempotent `CREATE OR REPLACE CONNECTION` for the catalog
-/// credentials (harmless to repeat, and folds the join binary's separate
-/// `create_connection`), drops any existing VS, then emits `CREATE VIRTUAL
-/// SCHEMA` with the base properties plus the optional `PARALLELISM_FACTOR` /
-/// `JOIN_BROADCAST_MAX_BYTES` / `CATALOG_KIND` / `MERGE_SCHEMA` clauses when
-/// set. VS properties use docker-network-internal URLs because the adapter
-/// UDF runs inside the Exasol container.
+/// VS properties use docker-network-internal URLs because the adapter UDF runs inside
+/// the Exasol container.
 pub fn create_virtual_schema(conn: &mut ExaConn, props: &VsProps) {
     let password = local_stack_connection_password();
     let catalog_uri = iceberg_catalog_url_internal();
     create_virtual_schema_with_password(conn, props, &catalog_uri, &password);
 }
 
-/// Create (or replace) a Virtual Schema from `props` against an explicit
-/// `catalog_uri` and CONNECTION `password`, instead of the local Docker
-/// stack's default (MinIO + unauthenticated Iceberg REST fixture).
-///
-/// Lets a caller targeting a different catalog (e.g. an OIDC-secured
-/// Lakekeeper warehouse) supply its own CONNECTION password, warehouse name
-/// (carried on `password.warehouse`), and namespace (`props.namespace`)
-/// without re-declaring the shared schema/script/SLC provisioning in
-/// `create_schema_and_scripts` — only the CONNECTION password and VS
-/// properties vary per catalog. An empty `props.namespace` omits `NAMESPACE`
-/// entirely — Exasol rejects `NAMESPACE = ''`.
-/// A `\n  KEY = 'value'` CREATE VIRTUAL SCHEMA clause when `value` is present, or empty when not.
 fn optional_clause(key: &str, value: Option<impl std::fmt::Display>) -> String {
     value
         .map(|v| format!("\n  {key} = '{v}'"))
@@ -309,8 +234,6 @@ pub fn create_virtual_schema_with_password(
     conn.execute(&create_vs_sql);
 }
 
-/// `create_virtual_schema_with_password`, but returns the raw `CREATE VIRTUAL SCHEMA`
-/// response instead of panicking on an error — for tests asserting a rejection.
 pub fn try_create_virtual_schema_with_password(
     conn: &mut ExaConn,
     props: &VsProps,
@@ -321,8 +244,6 @@ pub fn try_create_virtual_schema_with_password(
     conn.try_execute(&create_vs_sql)
 }
 
-/// Creates the CONNECTION, grants it, drops any existing VS, and returns the
-/// `CREATE VIRTUAL SCHEMA` statement for `props`.
 fn prepare_create_virtual_schema(
     conn: &mut ExaConn,
     props: &VsProps,
@@ -345,6 +266,7 @@ fn prepare_create_virtual_schema(
     let catalog_kind_clause = optional_clause("CATALOG_KIND", props.catalog_kind);
     let merge_schema_clause = optional_clause("MERGE_SCHEMA", props.merge_schema);
     let hive_partitioning_clause = optional_clause("HIVE_PARTITIONING", props.hive_partitioning);
+    // Exasol rejects `NAMESPACE = ''`.
     let namespace_clause = if props.namespace.is_empty() {
         String::new()
     } else {
@@ -382,12 +304,6 @@ pub fn grant_connection_access_to_vs_owner(conn: &mut ExaConn, conn_name: &str) 
     }
 }
 
-// ---------------------------------------------------------------------------
-// Query / result helpers
-// ---------------------------------------------------------------------------
-
-/// Run `EXPLAIN VIRTUAL <query_sql>` and flatten the pushed SQL (the generated
-/// scan-driving plan plus Exasol's echoed pushdown request) into one string.
 pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
     let result_set = &resp["responseData"]["results"][0]["resultSet"];
@@ -399,8 +315,8 @@ pub fn explain_virtual_sql(conn: &mut ExaConn, query_sql: &str) -> String {
         .join(" ")
 }
 
-/// Returns the `PUSHDOWN_SQL` cell of `EXPLAIN VIRTUAL`'s single 4-cell row — the complete,
-/// directly submittable adapter-generated statement, unlike `explain_virtual_sql`'s joined blob.
+/// The complete, directly submittable adapter-generated statement, unlike
+/// `explain_virtual_sql`'s joined blob.
 pub fn isolated_pushdown_statement(conn: &mut ExaConn, query_sql: &str) -> String {
     const PUSHDOWN_SQL_COLUMN: usize = 1;
     let resp = conn.execute(&format!("EXPLAIN VIRTUAL {query_sql}"));
@@ -424,29 +340,18 @@ pub fn isolated_pushdown_statement(conn: &mut ExaConn, query_sql: &str) -> Strin
         .to_string()
 }
 
-/// Parse a JSON result value as `f64`, accepting both numeric and
-/// string-encoded numbers (Exasol renders large DECIMALs as strings).
 pub fn parse_numeric(v: &serde_json::Value) -> f64 {
     v.as_f64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| panic!("expected numeric value, got: {v:?}"))
 }
 
-/// Parse a JSON result value as `i64`, accepting both numeric and
-/// string-encoded integers.
 pub fn parse_int(v: &serde_json::Value) -> i64 {
     v.as_i64()
         .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
         .unwrap_or_else(|| panic!("expected integer value, got: {v:?}"))
 }
 
-// ---------------------------------------------------------------------------
-// Adapter-level catalog inspection helpers (host-visible URLs) — used by tests
-// that call the format-reader seam directly rather than going through Exasol.
-// ---------------------------------------------------------------------------
-
-/// `ConnectionCreds` for the host-visible local Docker stack (MinIO + Iceberg
-/// REST catalog).
 pub fn local_stack_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "s3://warehouse/".to_string(),
@@ -469,7 +374,6 @@ pub fn local_stack_creds() -> ConnectionCreds {
     }
 }
 
-/// `StorageBackend` for the host-visible local Docker stack.
 pub fn local_stack_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: minio_url(),
@@ -481,7 +385,6 @@ pub fn local_stack_storage() -> StorageBackend {
     })
 }
 
-/// Split an `s3://<bucket>/<key>` (or `s3a://`) URI into its bucket and key.
 pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {
     let without_scheme = uri
         .strip_prefix("s3://")
@@ -492,7 +395,6 @@ pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {
         .unwrap_or_else(|| panic!("expected a <bucket>/<key> URI, got: {uri}"))
 }
 
-/// S3 object store for `bucket` via the shared [`local_stack_storage`] backend.
 pub fn local_stack_s3_store(bucket: &str) -> object_store::aws::AmazonS3 {
     let StorageBackend::S3(storage) = local_stack_storage() else {
         panic!("local_stack_storage() must be S3 to build a MinIO object store")
@@ -509,7 +411,6 @@ pub fn local_stack_s3_store(bucket: &str) -> object_store::aws::AmazonS3 {
         .unwrap_or_else(|e| panic!("configure MinIO object store for bucket '{bucket}': {e}"))
 }
 
-/// `CatalogProps` for the host-visible local Docker stack, for `table`.
 pub fn local_stack_catalog(table: &str) -> CatalogProps {
     CatalogProps {
         warehouse: "s3://warehouse/".to_string(),
@@ -517,14 +418,8 @@ pub fn local_stack_catalog(table: &str) -> CatalogProps {
     }
 }
 
-/// Resolve a fixture table's current data files directly from the Iceberg REST
-/// catalog, bypassing Exasol — the same format-reader seam the adapter uses.
-/// The resolved scan returns each `FileEntry` with an ABSOLUTE data-file URI,
-/// so the returned paths can be opened as-is.
-///
-/// Async (runtime-agnostic): callers drive it with whatever runtime they hold
-/// (e.g. `rt.block_on(resolve_fixture_files(NAMESPACE, table))`). `namespace` is
-/// passed explicitly rather than closed over a module constant.
+/// Resolves through the same format-reader seam the adapter uses, bypassing Exasol.
+/// Each `FileEntry` carries an absolute data-file URI.
 pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntry> {
     let catalog_uri = iceberg_catalog_url();
     let catalog_props = local_stack_catalog(&format!("{namespace}.{table}"));
@@ -534,7 +429,6 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
         .await
         .unwrap_or_else(|e| panic!("CatalogSession::resolve({table}) must succeed: {e}"));
 
-    // `allow_http = true` mirrors every VS this harness creates: MinIO over plain HTTP.
     let connection = ConnectionStorage {
         storage: &storage,
         creds: &creds,
@@ -555,28 +449,18 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
     resolved.files
 }
 
-// ---------------------------------------------------------------------------
-// Two-table broadcast-join helpers, promoted from `e2e_join_test.rs` — shared
-// by that suite and any other binary exercising the fact/dim broadcast join
-// (e.g. `e2e_lakekeeper_test.rs`'s vended-credential reproduction).
-// ---------------------------------------------------------------------------
-
-/// WHERE-clause lower bound applied to `O_ORDERDATE` in the join queries. Chosen
-/// to straddle both fact-side data files (orders 1..=5 vs 6..=10), so the
-/// broadcast fan-out's per-shard join results must merge across a shard boundary.
+/// Straddles both fact-side data files, so per-shard join results must merge across a
+/// shard boundary.
 pub const ORDERDATE_LOWER_BOUND: &str = "2024-01-05";
 
-/// The dimension table's fully qualified, uppercase Exasol name under `vs_name`.
 pub fn vs_dim_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_DIM_TABLE.to_uppercase())
 }
 
-/// The fact table's fully qualified, uppercase Exasol name under `vs_name`.
 pub fn vs_fact_table(vs_name: &str) -> String {
     format!("{vs_name}.{}", E2E_FACT_TABLE.to_uppercase())
 }
 
-/// The `SELECT C_NAME, O_ORDERDATE FROM fact JOIN dim ...` query for one VS.
 pub fn join_query(vs_name: &str) -> String {
     format!(
         "SELECT c.C_NAME, o.O_ORDERDATE FROM {} o \
@@ -587,45 +471,29 @@ pub fn join_query(vs_name: &str) -> String {
     )
 }
 
-/// Whether the pushed SQL carries a broadcast join: the fact-side ScanSpec's
-/// common blob embeds a `"join"` block (dimension file list + condition), joined
-/// node-locally in one DataFusion session. The lowercase compact `"join":{` token
-/// is unique to the generated ScanSpec JSON — Exasol's pretty-printed echoed
-/// request uses `"type" : "join"` / `"join_type"`, and the capability list uses
-/// uppercase `"JOIN"`, so neither collides.
+/// The compact lowercase `"join":{` token is unique to the generated ScanSpec JSON:
+/// Exasol's echoed request uses `"type" : "join"` and capabilities use `"JOIN"`.
 pub fn has_broadcast_join_block(pushed_sql: &str) -> bool {
     pushed_sql.contains("\"join\":{")
 }
 
-/// Whether the pushed SQL is the deterministic two-table unaccelerated fallback:
-/// each side its own sharded fan-out, wrapped in an Exasol-executed `INNER JOIN`
-/// with the unified renderer's `LHS_T0`/`LHS_T1` aliases (the two-table case is
-/// simply N = 2 of the single N-scan wrapper; see `has_n_scan_wrapper`). These
-/// aliases appear only in this generated wrapper, never in a native retry or the
-/// broadcast path.
+/// The `LHS_T*` aliases appear only in the generated N-scan wrapper, never in a native
+/// retry or the broadcast path.
 pub fn has_two_scan_wrapper(pushed_sql: &str) -> bool {
     has_n_scan_wrapper(pushed_sql, 2)
 }
 
-/// Whether the pushed SQL is the N-scan unaccelerated wrapper for exactly `n`
-/// base tables: `n` distinct `LHS_T0..LHS_T{n-1}` fan-out aliases, and no
-/// `LHS_T{n}` (so a 3-table wrapper is never mistaken for a 4-table one). These
-/// aliases (`JoinLegs::leg_alias`) are unique to the N-scan wrapper's
-/// generated SQL — never present in a native retry or a broadcast join.
+/// Also requires no `LHS_T{n}`, so a 3-table wrapper is never mistaken for a 4-table one.
 pub fn has_n_scan_wrapper(pushed_sql: &str, n: usize) -> bool {
     (0..n).all(|i| pushed_sql.contains(&format!(r#"AS "LHS_T{i}""#)))
         && !pushed_sql.contains(&format!(r#"AS "LHS_T{n}""#))
 }
 
-/// Fetch the join result as a sorted `Vec<(C_NAME, O_ORDERDATE)>` for
-/// order-independent multiset comparison.
 pub fn fetch_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
     let cols = conn.query_columns(&join_query(vs_name));
     columns_to_sorted_pairs(&cols)
 }
 
-/// Zip exactly two result columns into row pairs, sorted for order-independent
-/// multiset comparison. Panics if `cols` does not carry exactly 2 columns.
 pub fn columns_to_sorted_pairs(cols: &[Vec<serde_json::Value>]) -> Vec<(String, String)> {
     assert_eq!(
         cols.len(),
@@ -642,19 +510,14 @@ pub fn columns_to_sorted_pairs(cols: &[Vec<serde_json::Value>]) -> Vec<(String, 
     rows
 }
 
-/// A JSON string yields its unquoted contents; any other JSON value yields its
-/// `to_string()` form.
 pub fn value_to_string(v: &serde_json::Value) -> String {
     v.as_str()
         .map(str::to_string)
         .unwrap_or_else(|| v.to_string())
 }
 
-/// Compute the expected join result INDEPENDENTLY of the join pushdown: read both
-/// tables un-joined through the VS and join them in-process. This is the ground
-/// truth both the broadcast and fallback join results must match. Delegates to
-/// [`expected_join_rows_with_fact_where`] with this module's fixed `O_ORDERDATE`
-/// bound.
+/// Ground truth independent of join pushdown: both tables read un-joined through the VS
+/// and joined in-process.
 pub fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {
     expected_join_rows_with_fact_where(
         conn,
@@ -663,13 +526,8 @@ pub fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, Str
     )
 }
 
-/// Compute the expected join result for an arbitrary side-local `fact_orders`
-/// WHERE clause, INDEPENDENTLY of the join pushdown under test: apply the SAME
-/// clause through the single-table WHERE surface (an already-correct, previously
-/// verified render path unrelated to the join sites this plan wires), then join
-/// the filtered fact rows against `dim_customer` in-process. Generalizes
-/// [`expected_join_rows`]'s fixed bound to an arbitrary caller-supplied predicate,
-/// reused by the join-filter-type-coercion tests.
+/// Applies `fact_where` through the single-table WHERE path, independent of the join
+/// pushdown under test.
 pub fn expected_join_rows_with_fact_where(
     conn: &mut ExaConn,
     vs_name: &str,

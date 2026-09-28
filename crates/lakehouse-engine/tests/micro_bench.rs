@@ -1,33 +1,6 @@
-//! Synthetic micro-benchmarks (plan task 5.1 / 5.2 / 5.3) — NO spec.
-//!
-//! Two paths are isolated so end-to-end throughput can later be attributed:
-//!
-//! - **5.1 emit-only** — the work the scan does BEFORE the SDK boundary on every
-//!   batch: `coerce_batch_to_exa_types` (the real coercion the emit loop runs) +
-//!   Arrow IPC serialization via `StreamWriter`. This is exactly what
-//!   `ctx.emit_batch(&batch)` does internally (`record_batch_to_ipc`, SDK
-//!   `context.rs`) before any bytes cross the `.so`. It does NOT include the ZMQ
-//!   `MT_EMIT` round-trip to the engine — `emit_batch` only exists inside the UDF
-//!   runtime and cannot be called from a host benchmark. So 5.1 measures
-//!   build+coerce+serialize, the pre-SDK emit cost; the round-trip is measured
-//!   end-to-end on the cluster (tasks 6/7).
-//!
-//! - **5.2 scan-only** — Iceberg/Parquet → DataFusion stream, drained WITHOUT
-//!   emitting. Reuses the production seams `session_config_for_spec` +
-//!   `build_raw_scan_physical_plan` against a self-contained local Parquet file
-//!   (no MinIO/S3 dependency), then `execute_stream` + drain. Isolates
-//!   read+decode throughput from send-back.
-//!
-//! Run (host debug/bench build — never rebuilds the cdylib `.so`):
-//!
-//! ```bash
-//! # full numbers (ignored by default so `cargo test` stays fast):
-//! cargo test -p lakehouse-engine --test micro_bench -- --ignored --nocapture
-//! # release-opt numbers (goes to target/release/deps, NOT the cdylib):
-//! cargo test -p lakehouse-engine --test micro_bench --release -- --ignored --nocapture
-//! # smoke checks only (CI): assert each path yields a positive GB/sec
-//! cargo test -p lakehouse-engine --test micro_bench
-//! ```
+//! Host micro-benchmarks isolating the pre-SDK emit cost (coerce + Arrow IPC, excluding the
+//! `MT_EMIT` round-trip, which only exists inside the UDF runtime) and local scan+decode.
+//! Full numbers: `cargo test -p lakehouse-engine --test micro_bench -- --ignored --nocapture`.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -48,8 +21,6 @@ use lakehouse_engine::scan::spec::{
 use lakehouse_engine::scan::{build_raw_scan_physical_plan, session_config_for_spec};
 use parquet::arrow::ArrowWriter;
 
-/// The declared output columns for a batch, as `UdfContext::output_column`
-/// reports the call site's `EMITS` list to the emit loop.
 fn declared(names: &[&str], types: &[ExaType]) -> Vec<ColumnInfo> {
     names
         .iter()
@@ -71,9 +42,6 @@ fn numeric(precision: u32, scale: u32) -> ExaType {
 
 const GB: f64 = 1_000_000_000.0;
 
-/// Resident set size in bytes from `/proc/self/statm` (best-effort, 0 if unreadable).
-/// Mirrors `scan::diagnostics::current_rss_bytes` (which is private); 3 lines is
-/// lazier than widening the crate's public surface for a benchmark.
 fn rss_bytes() -> u64 {
     const PAGE: u64 = 4096;
     std::fs::read_to_string("/proc/self/statm")
@@ -87,12 +55,7 @@ fn rss_bytes() -> u64 {
         .unwrap_or(0)
 }
 
-// ------------------------------------------------------------------ 5.1 emit -
-
-/// Serialize one RecordBatch to Arrow IPC stream bytes — byte-for-byte what the
-/// SDK's `record_batch_to_ipc` (exasol-udf-sdk `context.rs`) does inside
-/// `emit_batch` before the bytes cross the `.so` boundary: a fresh `StreamWriter`,
-/// one `write`, then `finish`.
+/// Mirrors the SDK's `record_batch_to_ipc` inside `emit_batch`.
 fn record_batch_to_ipc(batch: &RecordBatch) -> Vec<u8> {
     let mut buf = Vec::new();
     let mut w = arrow::ipc::writer::StreamWriter::try_new(&mut buf, &batch.schema())
@@ -102,13 +65,10 @@ fn record_batch_to_ipc(batch: &RecordBatch) -> Vec<u8> {
     buf
 }
 
-/// One emit-path measurement: coerce + IPC-serialize `batch` `iters` times.
-/// Returns (rows/sec, in-memory GB/sec, ipc-out GB/sec, ipc bytes).
 fn bench_emit_path(name: &str, batch: &RecordBatch, declared: &[ColumnInfo], iters: usize) {
     let rows = batch.num_rows();
     let in_mem_bytes = batch.get_array_memory_size();
 
-    // Warmup (also fills the JIT/branch predictors and validates coercion).
     let warm = coerce_batch_to_exa_types(batch.clone(), declared).expect("coerce");
     let ipc_bytes = record_batch_to_ipc(&warm).len();
 
@@ -141,8 +101,6 @@ fn bench_emit_path(name: &str, batch: &RecordBatch, declared: &[ColumnInfo], ite
     );
 }
 
-/// Build a single-column batch of `n` rows for the named primitive schema, with
-/// the Exasol EMITS type string the production emit loop would coerce against.
 fn primitive_batch(kind: &str, n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
     let (field, col, exa): (Field, ArrayRef, ExaType) = match kind {
         "BIGINT" => (
@@ -187,8 +145,6 @@ fn primitive_batch(kind: &str, n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
     (batch, declared(&["c"], &[exa]))
 }
 
-/// A TPC-H `lineitem`-shaped mixed batch (the "production" schema): the column
-/// types a real lineitem scan emits, so 5.1 measures a realistic mixed row.
 fn lineitem_batch(n: usize) -> (RecordBatch, Vec<ColumnInfo>) {
     let fields = vec![
         Field::new("l_orderkey", DataType::Int64, false),
@@ -276,8 +232,6 @@ fn bench_emit_only() {
     bench_emit_path("lineitem", &li, &exa, iters);
 }
 
-/// Smoke check (runnable in CI): the emit path produces a positive GB/sec on a
-/// tiny input. Fails if coercion or IPC serialization regresses to zero/panic.
 #[test]
 fn emit_path_smoke_positive_throughput() {
     let (batch, exa) = lineitem_batch(1000);
@@ -291,16 +245,10 @@ fn emit_path_smoke_positive_throughput() {
     assert!(gb_per_s > 0.0, "emit path GB/sec must be positive");
 }
 
-// ------------------------------------------------------------------ 5.2 scan -
-
-/// Write a TPC-H lineitem-shaped local Parquet file of `n` rows; return its
-/// file:// URL and on-disk byte size.
 fn write_lineitem_parquet(path: &std::path::Path, n: usize) -> (String, u64) {
     let (batch, _exa) = lineitem_batch(n);
     let file = std::fs::File::create(path).expect("create parquet");
-    // Default writer props: real-world compression so bytes-on-disk is realistic.
     let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
-    // Write in batch-sized chunks so the file has multiple row groups.
     let chunk = 50_000usize;
     let mut offset = 0;
     while offset < n {
@@ -338,8 +286,6 @@ fn scan_spec(file_url: String) -> ScanSpec {
     }
 }
 
-/// Build the production raw-scan plan over the registered local Parquet and drain
-/// the stream WITHOUT emitting. Returns (rows, decoded in-memory bytes).
 async fn drain_scan(file_url: &str) -> (u64, u64) {
     let spec = scan_spec(file_url.to_string());
     let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
@@ -386,7 +332,6 @@ fn bench_scan_only() {
         n.div_ceil(50_000),
     );
 
-    // Warmup (page cache + plan build).
     let _ = rt.block_on(drain_scan(&url));
 
     let rss_before = rss_bytes();
@@ -414,8 +359,6 @@ fn bench_scan_only() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Smoke check (runnable in CI): the scan path reads+decodes a tiny local Parquet
-/// and yields positive throughput. Fails if the plan-build or drain regresses.
 #[test]
 fn scan_path_smoke_positive_throughput() {
     let rt = tokio::runtime::Builder::new_current_thread()

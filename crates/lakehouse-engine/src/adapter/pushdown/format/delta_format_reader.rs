@@ -21,9 +21,6 @@ use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField};
 #[path = "delta_format_reader_tests.rs"]
 mod tests;
 
-/// The Delta table reader: one Unity Catalog table's transaction log resolved into
-/// the scan the pushdown layer plans against.
-///
 /// The effective backend leaves with the resolved scan: the scan must read files
 /// through the same backend the log was read through.
 pub(super) struct DeltaFormatReader<'a> {
@@ -43,15 +40,9 @@ impl<'a> DeltaFormatReader<'a> {
 }
 
 impl FormatReader for DeltaFormatReader<'_> {
-    /// Forwards `filter_json` to [`read_delta_log`], which builds a `delta_kernel`
-    /// predicate from it and applies it during log replay to prune files by partition
-    /// value and per-file statistics before scanning.
-    ///
-    /// `name_mapping` is always empty: a column binding by physical name declares that
-    /// name on its own [`LogicalField`], which the scan-side binding consults BEFORE
-    /// any table-level mapping. An Iceberg-shaped name mapping here could therefore
-    /// never be reached, and would be a second home for one decision, free to drift
-    /// from it.
+    /// `name_mapping` is always empty: a physical-name binding lives on its own
+    /// [`LogicalField`], which the scan side consults before any table-level mapping, so a
+    /// mapping here would be unreachable and a second home for the same decision.
     fn resolve_scan<'a>(
         &'a self,
         filter_json: Option<&'a Json>,
@@ -76,9 +67,6 @@ impl FormatReader for DeltaFormatReader<'_> {
     }
 }
 
-/// The four values a Delta log read contributes to a [`ResolvedScan`]: the active
-/// data files, the logical schema, the table's ordered partition columns, and the
-/// columns the schema step declined to map.
 type DeltaLogContents = (
     Vec<FileEntry>,
     Vec<LogicalField>,
@@ -86,18 +74,10 @@ type DeltaLogContents = (
     Vec<RefusedColumn>,
 );
 
-/// Read `table_root`'s Delta log through a store built from `storage`, answering the
-/// active file list, the logical schema, the table's ordered partition columns, and
-/// the columns the schema step declined to map.
+/// Blocks: `delta_kernel`'s read path is synchronous and drives its own runtime.
 ///
-/// Blocks: `delta_kernel`'s read path is synchronous and drives its own runtime on its
-/// own thread, so this stalls only the caller's own executor, which has nothing else
-/// to make progress on while the log is being read.
-///
-/// Every error is redacted here rather than where it was raised: the replay and schema
-/// steps know nothing about credentials by design, and this is the layer that made the
-/// credential decision and therefore knows the value set an object-store error could
-/// echo back.
+/// Errors are redacted here because this layer made the credential decision and knows
+/// which secrets an object-store error could echo; replay and schema know none.
 fn read_delta_log(
     storage: &StorageBackend,
     table_root: &str,

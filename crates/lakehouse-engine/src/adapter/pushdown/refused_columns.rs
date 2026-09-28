@@ -1,6 +1,3 @@
-//! The refused-column gate: refuses a pushdown request that reads or emits a
-//! column the table's format reader declined to map to an Arrow tag.
-
 use std::collections::HashSet;
 
 use exasol_udf_sdk::error::UdfError;
@@ -10,24 +7,14 @@ use super::RefusedColumn;
 use super::support::collect_all_column_names;
 use crate::scan::spec::ProjectionItem;
 
-/// Refuses `request` when it reads or emits any column in `refused`, naming
-/// every one it touches and the reason that column's reader gave.
+/// Columns are collected by one blind recursive walk over the whole `request`,
+/// so a later pushdown capability is gated automatically; pass the OUTERMOST
+/// request value.
 ///
-/// The columns a request touches are collected by ONE blind recursive walk over
-/// the whole `request` rather than from an enumeration of clauses, so a pushdown
-/// capability added later — a new predicate shape, a new aggregate-argument
-/// position — is gated the day it lands instead of routing a refused column
-/// straight past this check. Pass the OUTERMOST request value for that reason.
-///
-/// `emitted_projection` is `Some` only for a projection the request genuinely
-/// emits without naming its columns anywhere — a `SELECT *`, which the walk alone
-/// would miss. A WIDENED projection is `None`: that one is a synthetic full-row
-/// placeholder `build_dispatch_sql` never reads (an aggregate's own referenced
-/// columns live in its `arguments`, which the walk already reaches), so unioning
-/// it would refuse every aggregate query over a table carrying a refused column,
-/// `COUNT(*)` included. One argument rather than a projection plus a widening
-/// flag, so the combination that re-introduces that over-refusal cannot be
-/// expressed at a call site.
+/// `emitted_projection` is `Some` only for a `SELECT *` projection, which the walk
+/// would miss. A widened aggregate projection must be `None`: it is a synthetic
+/// placeholder, and unioning it would refuse every aggregate (even `COUNT(*)`)
+/// over a table with a refused column.
 pub(super) fn ensure_no_refused_column_referenced(
     request: &Json,
     emitted_projection: Option<&[ProjectionItem]>,
@@ -49,12 +36,6 @@ pub(super) fn ensure_no_refused_column_referenced(
     ensure_no_touched_column_is_refused(&touched, refused)
 }
 
-/// Refuses when `touched` names any column in `refused`, in ONE error carrying
-/// each matched column's own reason in schema order.
-///
-/// Split from the request walk above so a caller holding a NARROWER touched set —
-/// the join path, which charges each column reference to the side that must answer
-/// for it — refuses through the same matching rule and the same message.
 pub(super) fn ensure_no_touched_column_is_refused(
     touched: &HashSet<String>,
     refused: &[RefusedColumn],

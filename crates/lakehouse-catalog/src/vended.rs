@@ -1,11 +1,5 @@
-//! Iceberg REST vended-storage resolution: derive a table's effective scan
-//! storage from what its `loadTable` response vends for that table's own
-//! location, taking no CONNECTION-supplied credential — only the store address
-//! may cross over.
-//!
-//! [`resolve_vended_storage`] is the whole public surface; everything below it is a
-//! private step. This module reads the Iceberg REST wire shape and nothing else:
-//! what makes the values it reads acceptable is the shared policy in `storage`.
+//! Iceberg REST vended-storage resolution. Only the store address may cross over from
+//! the CONNECTION, never a credential; acceptance policy lives in `storage`.
 
 use crate::StorageBackend;
 use crate::storage::{
@@ -16,25 +10,15 @@ use exasol_udf_sdk::error::UdfError;
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-/// Vended ADLS SAS keys are host-suffixed (`adls.sas-token.<host>`) — the iceberg Java
-/// `AzureProperties` convention, not a key the Iceberg REST spec enumerates. The reader
-/// downstream understands only the flat `adls.sas-token`, so the suffix is recovered
-/// here and travels no further.
+/// Host-suffixed per the iceberg Java `AzureProperties` convention, not the Iceberg REST
+/// spec; downstream readers only understand the flat `adls.sas-token`.
 const VENDED_SAS_TOKEN_KEY_PREFIX: &str = "adls.sas-token.";
 
-/// The effective scan storage for the table `anchor` locates, built from what
-/// `result` vends for that location.
-///
-/// `anchor` must be the table's OWN location — the same value
-/// `storage_credentials[*].prefix` is matched against — so that a catalog URI is
-/// refused as an unsupported scheme rather than silently falling through to the
-/// flat `config` map.
-///
-/// CREDENTIALS come from the response alone — `address` is narrowed to a type that
-/// cannot carry one, so no static key can reach this path. ADDRESSING is the one
-/// thing that may cross over: an `endpoint` or `region` the CONNECTION configures
-/// wins over the vended value, independently per field, and an address neither side
-/// supplies is left for AWS's own default chain to place.
+/// `anchor` must be the table's OWN location (what `storage_credentials[*].prefix` is
+/// matched against), so a catalog URI is refused rather than falling through to the
+/// flat `config` map. Credentials come from the response alone; a CONNECTION
+/// `endpoint`/`region` wins per field, and an address neither side supplies is left to
+/// AWS's default chain.
 pub fn resolve_vended_storage(
     result: &iceberg_catalog_rest::LoadTableResult,
     anchor: &str,
@@ -60,19 +44,9 @@ pub fn resolve_vended_storage(
     }
 }
 
-/// The one credential source that applies to `location`, per the Iceberg REST
-/// spec: the `storage_credentials` entry whose non-empty `prefix` is the longest
-/// prefix of `location`, else the flat `config` map.
-///
-/// Selecting once and reading all six vended values from the result is what makes
-/// a matched entry authoritative for the whole credential set: a key the entry
-/// omits reads as absent rather than falling back to the flat map, so the two
-/// sources never mix.
-///
-/// Both sides are compared with the SCHEME lowercased, because
-/// [`resolve_vended_storage`] accepts a case-variant anchor scheme (RFC 3986 §3.1) —
-/// so a response spelling `location` and a `prefix` scheme differently would
-/// otherwise miss the entry and silently read the flat map instead.
+/// Per the Iceberg REST spec: the longest non-empty matching `prefix` entry, else the
+/// flat `config` map. A matched entry is authoritative for the whole set; the two
+/// sources never mix. Schemes are compared lowercased (RFC 3986 §3.1).
 fn select_credential_source<'a>(
     result: &'a iceberg_catalog_rest::LoadTableResult,
     location: &str,
@@ -93,10 +67,7 @@ fn select_credential_source<'a>(
         .map_or(&result.config, |entry| &entry.config)
 }
 
-/// `uri` with its URI scheme lowercased and everything after `://` verbatim. Only the
-/// scheme is folded: RFC 3986 §3.1 makes it case-insensitive, while a bucket, container,
-/// or object key is case-sensitive — two S3 buckets differing only in case are two
-/// buckets.
+/// Only the scheme is folded (RFC 3986 §3.1); buckets and keys are case-sensitive.
 fn lowercase_scheme(uri: &str) -> Cow<'_, str> {
     match uri.split_once("://") {
         Some((scheme, rest)) if scheme.bytes().any(|byte| byte.is_ascii_uppercase()) => {
@@ -106,11 +77,6 @@ fn lowercase_scheme(uri: &str) -> Cow<'_, str> {
     }
 }
 
-/// The neutral S3 values the selected credential source vends.
-///
-/// The key pair is required: with no static payload underneath, a source that omits
-/// it satisfies nothing. Every ADDRESSING value is optional here, because what
-/// places the store is the shared address rule rather than this response alone.
 fn iceberg_vended_s3(vended: &HashMap<String, String>, anchor: &str) -> Result<VendedS3, UdfError> {
     Ok(VendedS3 {
         access_key: required_vended_value(vended, "s3.access-key-id", anchor)?,
@@ -123,9 +89,6 @@ fn iceberg_vended_s3(vended: &HashMap<String, String>, anchor: &str) -> Result<V
     })
 }
 
-/// A vended value the resolved backend cannot be built without, reported when the
-/// selected source omits it or spells it empty rather than substituted from static
-/// config.
 fn required_vended_value(
     vended: &HashMap<String, String>,
     key: &str,
@@ -139,10 +102,8 @@ fn required_vended_value(
     })
 }
 
-/// The vended SAS for the anchor's own storage host, read from the host-suffixed key
-/// the catalog minted it under, matched case-insensitively per RFC 3986 §3.2.2 and
-/// broken toward the smallest key when only case-variant spellings are vended. A SAS
-/// is account-scoped, so one minted for another host is as unusable as none.
+/// Host matched case-insensitively (RFC 3986 §3.2.2), ties broken toward the smallest
+/// key. A SAS is account-scoped, so one for another host is as unusable as none.
 fn iceberg_vended_sas(vended: &HashMap<String, String>, anchor: &str) -> Result<String, UdfError> {
     let host = location_host(anchor);
     vended_config_value(vended, &format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{host}"))
