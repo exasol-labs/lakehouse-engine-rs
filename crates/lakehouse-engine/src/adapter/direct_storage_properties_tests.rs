@@ -154,8 +154,6 @@ fn join_storage_path_returns_the_base_alone_when_the_segment_is_absent() {
     );
 }
 
-/// A CONNECTION address may end in any number of separators; the join strips them all before
-/// appending one, so enumeration and pushdown can't list a table from two different prefixes.
 #[test]
 fn a_base_path_with_repeated_trailing_separators_joins_to_one_separator() {
     for base in [

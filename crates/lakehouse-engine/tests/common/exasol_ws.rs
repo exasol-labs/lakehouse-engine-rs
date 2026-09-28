@@ -1,8 +1,4 @@
-//! Minimal Exasol WebSocket SQL client for E2E tests.
-//!
-//! Mirrors the sibling project's tests/common/exasol_ws.rs but is self-contained.
-//! Implements just enough of the Exasol WebSocket API v3 to authenticate,
-//! execute SQL, and fetch scalar / multi-row results.
+//! Minimal Exasol WebSocket API v3 client for E2E tests.
 
 use base64::{Engine as _, engine::general_purpose::STANDARD as B64};
 use native_tls::TlsConnector;
@@ -15,10 +11,8 @@ use std::net::TcpStream;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, client_tls_with_config};
 
-/// Per-`fetch` byte budget used by `fetch_result_columns`. Exasol treats `numBytes`
-/// as a soft budget and always returns whole rows, so this bounds a response's size
-/// without bounding the result set: the read loop issues as many `fetch` calls as
-/// the advertised row count requires.
+/// Exasol treats `numBytes` as a soft budget and returns whole rows, so this bounds one
+/// response's size, not the result set.
 const DEFAULT_FETCH_NUM_BYTES: u64 = 67_108_864;
 
 pub struct ExaConn {
@@ -28,16 +22,12 @@ pub struct ExaConn {
 }
 
 impl ExaConn {
-    /// Connect and authenticate to Exasol via WebSocket (TLS, self-signed cert accepted).
-    ///
-    /// `execute()` failures include the SQL statement and the Exasol response body for
-    /// debuggability. Use `connect_redacting` when the SQL may carry credentials.
     pub fn connect(host: &str, port: u16, user: &str, password: &str) -> Self {
         Self::connect_inner(host, port, user, password, false)
     }
 
-    /// Connect in redacting mode: `execute()` failures omit the SQL statement and the
-    /// Exasol response body so credential-bearing DDL cannot leak into test output.
+    /// `execute()` failures omit the SQL and the Exasol response so credential-bearing DDL
+    /// cannot leak into test output.
     pub fn connect_redacting(host: &str, port: u16, user: &str, password: &str) -> Self {
         Self::connect_inner(host, port, user, password, true)
     }
@@ -55,7 +45,6 @@ impl ExaConn {
         let (mut ws, _) = client_tls_with_config(url.as_str(), tcp, None, Some(connector))
             .expect("WebSocket TLS handshake with Exasol");
 
-        // Step 1: initiate login to get server's RSA public key.
         ws.send(Message::Text(
             r#"{"command":"login","protocolVersion":3}"#.to_string().into(),
         ))
@@ -70,7 +59,6 @@ impl ExaConn {
             .as_str()
             .expect("publicKeyPem in login response");
 
-        // Step 2: encrypt password and complete login.
         let enc_password = encrypt_password(password, pem);
         let creds = json!({
             "command": "login",
@@ -99,7 +87,6 @@ impl ExaConn {
         }
     }
 
-    /// Execute SQL; panics on error. Returns the raw JSON response.
     pub fn execute(&mut self, sql: &str) -> Value {
         let cmd = json!({
             "command": "execute",
@@ -111,8 +98,7 @@ impl ExaConn {
             .expect("send execute");
         let resp = Self::read_json(&mut self.ws);
         if self.redact_sql {
-            // Redacting mode: the SQL may carry credentials (SigV4, vended keys) and the
-            // Exasol error response may echo them back, so surface neither.
+            // The Exasol error response may echo credentials from the SQL back.
             assert_eq!(
                 resp["status"].as_str(),
                 Some("ok"),
@@ -128,7 +114,6 @@ impl ExaConn {
         resp
     }
 
-    /// Execute SQL; returns the raw response WITHOUT asserting status == ok.
     pub fn try_execute(&mut self, sql: &str) -> Value {
         let cmd = json!({
             "command": "execute",
@@ -141,29 +126,15 @@ impl ExaConn {
         Self::read_json(&mut self.ws)
     }
 
-    /// Declares a row cap that truncates the delivered result set at the statement level.
-    ///
-    /// NOT inert on the adapter exchange: on a real query execution a declared cap reaches the
-    /// adapter as a pushdown `limit` (confirmed live by #314 — directly capturing the adapter's
-    /// incoming request; `EXPLAIN VIRTUAL` is a separate exchange that never carries a
-    /// cap-derived limit, so it cannot observe this — a blind spot in the capture tooling, not
-    /// in the adapter). The adapter still withholds it from underneath an aggregate (outer
-    /// `LIMIT` only, no scan-spec limit), so aggregate values stay correct under a cap.
-    ///
-    /// Declare a cap only for a test whose assertion is about result-set truncation at
-    /// row-delivery time, or for `e2e_capture_pushdown`'s `CAPTURE_RESULT_SET_MAX_ROWS`
-    /// capped-versus-uncapped comparison. A test asserting pushdown or plan shape must NOT
-    /// declare one — it would silently alter the plan under test.
+    /// A declared cap reaches the adapter as a pushdown `limit` on real execution (#314),
+    /// though `EXPLAIN VIRTUAL` never shows it. A test asserting pushdown or plan shape
+    /// must not declare one: it would silently alter the plan under test.
     pub fn capped_result_sets(mut self, max_rows: u32) -> Self {
         self.result_set_max_rows = max_rows;
         self
     }
 
-    /// Execute SQL and return first column of first row as i64.
-    ///
-    /// A `DECIMAL` result comes back as a JSON string (e.g. `"3"`), not a JSON
-    /// number, so fall back to parsing a string — same tolerant approach as
-    /// `parse_int` in the E2E test files.
+    /// A `DECIMAL` result comes back as a JSON string, so a string is parsed too.
     pub fn query_scalar_i64(&mut self, sql: &str) -> i64 {
         let resp = self.execute(sql);
         let value = &resp["responseData"]["results"][0]["resultSet"]["data"][0][0];
@@ -173,7 +144,6 @@ impl ExaConn {
             .unwrap_or_else(|| panic!("expected i64 scalar from:\n{sql}\n\nResponse: {resp}"))
     }
 
-    /// Execute SQL and return row count from the result set metadata.
     pub fn query_row_count(&mut self, sql: &str) -> i64 {
         let resp = self.execute(sql);
         resp["responseData"]["results"][0]["resultSet"]["numRows"]
@@ -181,31 +151,20 @@ impl ExaConn {
             .unwrap_or_else(|| panic!("expected numRows from:\n{sql}\n\nResponse: {resp}"))
     }
 
-    /// Execute SQL and return all data as column-major Vec<Vec<Value>>.
-    ///
-    /// Fetches from a result set handle if necessary (large result sets); a zero-row
-    /// result still yields one empty column per declared column.
+    /// A zero-row result still yields one empty column per declared column.
     pub fn query_columns(&mut self, sql: &str) -> Vec<Vec<Value>> {
         let resp = self.execute(sql);
         let result_set = &resp["responseData"]["results"][0]["resultSet"];
         self.fetch_result_columns(result_set)
     }
 
-    /// Fetch all data from a result set (inline or via handle), column-major.
     pub fn fetch_result_columns(&mut self, result_set: &Value) -> Vec<Vec<Value>> {
         self.fetch_result_columns_with_num_bytes(result_set, DEFAULT_FETCH_NUM_BYTES)
             .0
     }
 
-    /// Fetch a result set to completion with an explicit per-response byte budget,
-    /// returning the columns and how many `fetch` responses were consumed (an inline
-    /// result set consumes none).
-    ///
-    /// A `fetch` returns only as many rows as fit the budget, so one response is not
-    /// the result set. Every way of reading short — a truncated read, a response that
-    /// carries no rows while rows remain, a response whose payload is missing or
-    /// changes shape mid-read — panics naming the outstanding count, because a short
-    /// read that returns quietly makes an E2E assertion pass against a prefix.
+    /// Returns the columns and the number of `fetch` responses consumed. Any short read
+    /// panics, because a quietly short read lets an assertion pass against a prefix.
     pub fn fetch_result_columns_with_num_bytes(
         &mut self,
         result_set: &Value,

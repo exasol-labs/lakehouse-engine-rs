@@ -1,9 +1,6 @@
-//! Asserts the workspace's build and suite-wiring conventions; no live service is needed.
-//! `CLAUDE.md` is embedded at compile time, while `Makefile`, `.github/workflows/ci.yml`,
-//! and the fixture scripts are read from the workspace at runtime.
+//! Asserts the workspace's build and suite-wiring conventions from `CLAUDE.md` (embedded at
+//! compile time) against `Makefile`/`.github/workflows/ci.yml` (read at runtime); no live service needed.
 
-/// Workspace build-convention documentation, embedded at compile time.
-/// Path is relative to this source file: crates/lakehouse-engine/tests -> workspace root.
 const WORKSPACE_CLAUDE_MD: &str = include_str!("../../../CLAUDE.md");
 
 /// Scenario: Host release build of the .so is rejected by convention.

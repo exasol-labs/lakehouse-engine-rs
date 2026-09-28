@@ -1,11 +1,5 @@
 #!/usr/bin/env bash
-# Stand up (or update) the ephemeral Trino cluster for a named env (coordinator + workers, sized to
-# match Exasol test1's node type/count — see deploy/trino-stack/variables.tf), then wait for the
-# coordinator to answer /v1/info AND for every worker to register with it. Cost-safety: this is the
-# ONLY thing that creates the Trino EC2 nodes — never run implicitly by data-stack/cluster-stack/
-# bench scripts. Tear it down with trino-down.sh IMMEDIATELY after the benchmark run — it costs
-# real money while running (2x r8i.2xlarge by default, not a single small box).
-#
+# Costs real money while running: tear down with trino-down.sh right after the benchmark.
 #   AWS_PROFILE=spot-strata-deployer ./trino-up.sh <env_name>
 set -euo pipefail
 
@@ -27,9 +21,7 @@ for _ in $(seq 1 60); do
   sleep 5
 done
 
-# /v1/node requires a user-identifying header even with no auth configured, and (found
-# live-verifying) only lists nodes reached via the announcement/discovery protocol — the
-# coordinator doesn't appear in its own list, so the target is workers only (node_count - 1).
+# /v1/node needs a user header even without auth, and omits the coordinator itself.
 WORKER_TARGET=$((NODE_COUNT - 1))
 echo "==> Waiting for all $WORKER_TARGET worker(s) to register with the coordinator"
 for _ in $(seq 1 60); do

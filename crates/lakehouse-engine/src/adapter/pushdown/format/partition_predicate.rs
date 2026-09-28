@@ -6,9 +6,6 @@ use super::filter_json::{
     subject_column,
 };
 
-/// Decides, from one file's partition values alone, whether any of its rows can satisfy a
-/// pushdown filter.
-///
 /// A file is kept iff TRUE is reachable at the root; an untranslatable node reaches every truth
 /// value, so it can only widen the kept set. Strings compare in codepoint order, as Exasol does.
 pub(super) struct PartitionPredicate {
@@ -23,8 +20,7 @@ impl PartitionPredicate {
         }
     }
 
-    /// Whether any row of the file carrying `partition_values` can satisfy the filter. Column
-    /// names match partition keys case-insensitively (uppercase fold).
+    /// Column names match partition keys case-insensitively (uppercase fold).
     pub(super) fn keeps(&self, partition_values: &BTreeMap<String, Option<String>>) -> bool {
         self.root.reachable(partition_values).can_be_true
     }

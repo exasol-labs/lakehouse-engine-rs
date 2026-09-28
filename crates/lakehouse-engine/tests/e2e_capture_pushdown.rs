@@ -1,20 +1,7 @@
-//! Ad-hoc pushdown-payload capture tool — NOT part of `make test-e2e`.
-//!
-//! This repo has no reusable way to inspect what a given SQL statement pushes
-//! down through the Virtual Schema, short of a throwaway instrumentation spike
-//! (see commit c827d1a) redone from scratch each time. This binary is the
-//! reusable replacement: it stands up the shared E2E fixture (`typed_distinct_probe`,
-//! which carries VARCHAR/DATE/TIMESTAMP/DECIMAL/DOUBLE/BOOLEAN/INTEGER columns —
-//! see `common::seed::E2E_TYPED_TABLE`) against the local Docker stack, then runs
-//! a caller-supplied SQL statement through `EXPLAIN VIRTUAL` (showing the SQL the
-//! adapter generates, including the literal scan-spec JSON passed to the scan UDF)
-//! and, separately, for real (showing the actual runtime error/result).
-//!
-//! Usage: see `scripts/capture-pushdown-payload.sh` / `docs/debugging-pushdown.md`.
-//! Driven by env vars so future issues on this stack (#211, #212, #210, #209) can
-//! reuse it without editing this file: required `CAPTURE_SQL` names the statement to
-//! capture, and optional `CAPTURE_RESULT_SET_MAX_ROWS` declares a row cap on the
-//! capture connection (unset means no declared cap).
+//! Ad-hoc pushdown-payload capture tool, not part of `make test-e2e`. Runs
+//! `CAPTURE_SQL` through `EXPLAIN VIRTUAL` and for real; optional
+//! `CAPTURE_RESULT_SET_MAX_ROWS` caps the connection. Usage: see
+//! `scripts/capture-pushdown-payload.sh`.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;

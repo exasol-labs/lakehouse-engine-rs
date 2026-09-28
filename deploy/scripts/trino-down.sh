@@ -1,7 +1,4 @@
 #!/usr/bin/env bash
-# Destroy the Trino benchmark cluster for a named env (coordinator + all workers; data-stack / S3
-# / Glue / the Exasol test1 cluster all untouched).
-#
 #   AWS_PROFILE=spot-strata-deployer ./trino-down.sh <env_name>
 set -euo pipefail
 

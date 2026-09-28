@@ -1,13 +1,5 @@
 #!/usr/bin/env bash
-# Stand up (or update) the ephemeral Lakekeeper catalog for a named env (postgres + keycloak +
-# lakekeeper, one EC2 box), wait for it to answer its health endpoint, then register every
-# TPC-H table already cataloged in the data-stack's Glue database into it by reference — no data
-# rewrite, no separate warehouse credential to set up by hand. Cost-safety: this is the ONLY thing
-# that creates the Lakekeeper EC2 box — never run implicitly by data-stack/cluster-stack/trino-
-# stack/bench scripts. Tear it down with lakekeeper-down.sh once the benchmark or demo is done —
-# it costs real money while running.
-#
-#   AWS_PROFILE=spot-strata-deployer ./lakekeeper-up.sh <env_name>
+# Usage: AWS_PROFILE=spot-strata-deployer ./lakekeeper-up.sh <env_name>
 set -euo pipefail
 
 ENV="${1:?usage: lakekeeper-up.sh <env_name>}"
@@ -16,9 +8,7 @@ STACK="$HERE/../lakekeeper-stack"
 
 cd "$STACK"
 
-# Armed before `tofu apply` runs: a failure partway through apply (timeouts, quota errors) can
-# still have created billable resources, so the warning must cover that case too, not just a
-# later failure once the box is known to exist.
+# Armed before `tofu apply`: a partial apply can already have created billable resources.
 warn_still_billing_on_nonzero_exit() {
   local rc=$?
   [ "$rc" -eq 0 ] || echo "NOTE: the Lakekeeper EC2 box for $ENV may exist and be BILLING. Destroy it: $HERE/lakekeeper-down.sh $ENV" >&2
@@ -37,10 +27,7 @@ LK_WAREHOUSE="$(tofu output -raw warehouse_name)"
 LK_CATALOG_URI="$(tofu output -raw catalog_uri_public)"
 LK_TOKEN_URI="$(tofu output -raw token_uri_public)"
 LK_CLIENT_ID="$(tofu output -raw oidc_client_id)"
-# The data-stack's own SSM root, re-published by this stack from the data-stack remote state it
-# already reads. Never composed from $ENV: that is the LAKEKEEPER env name, while the data-stack
-# defaults its own to "data" — composing it sends every source read at a root no stack owns, and
-# only after tofu apply above has already created the billable box.
+# Never composed from $ENV: the data-stack uses its own env name ("data").
 DATA_SSM="$(tofu output -raw data_ssm_root)"
 
 HEALTH_URL="http://$PUBLIC_HOST:$LAKEKEEPER_PORT/health"
@@ -54,31 +41,24 @@ curl -sf "$HEALTH_URL" >/dev/null 2>&1 || {
   exit 1
 }
 
-# --- Read SSM SecureStrings for this box ---------------------------------------------------------
 ssm() { aws ssm get-parameter --with-decryption --name "$1" --query 'Parameter.Value' --output text; }
 
 LK_CLIENT_SECRET="$(ssm "$LK_SSM/oauth2/client_secret")"
 LK_ACCESS_KEY_ID="$(ssm "$LK_SSM/storage/access_key_id")"
 LK_SECRET_ACCESS_KEY="$(ssm "$LK_SSM/storage/secret_access_key")"
 
-# --- Source: the data-stack's SecureStrings, under the root published above -----------------------
 DATA_REGION="$(ssm "$DATA_SSM/region")"
 DATA_BUCKET="$(ssm "$DATA_SSM/bucket")"
 
-# One Glue database per source namespace, each registered into Lakekeeper under the same name it
-# already has in Glue (so bench/run.sh's NAMESPACE default and this repo's demo tooling resolve
-# unchanged under either catalog). Add a name here once its Glue database + SSM namespace param
-# exist (see deploy/data-stack/main.tf) — lakekeeper-provision.sh itself is namespace-agnostic.
+# Each Glue database keeps its name in Lakekeeper, so bench/run.sh's NAMESPACE resolves under
+# either catalog.
 SOURCE_NAMESPACES=("tpch" "erp")
 
 for ns in "${SOURCE_NAMESPACES[@]}"; do
   DATA_NAMESPACE="$(ssm "$DATA_SSM/namespace/$ns")"
 
-  # lakekeeper-provision.sh enforces that a warehouse's storage profile matches the derived S3
-  # key prefix of the tables being registered into it (a real constraint, hit live: tpch lives
-  # under tpch.db, erp under erp.db — one warehouse's storage profile can't cover both). tpch
-  # keeps the plain $LK_WAREHOUSE name so existing bench defaults/secrets.sh output don't change;
-  # every other namespace gets its own warehouse, suffixed by name.
+  # A warehouse's storage profile must match its tables' S3 key prefix, and each namespace has its
+  # own prefix, so each gets its own warehouse. tpch keeps the unsuffixed name bench defaults use.
   if [[ "$ns" == "tpch" ]]; then
     NS_WAREHOUSE="$LK_WAREHOUSE"
   else
@@ -86,8 +66,6 @@ for ns in "${SOURCE_NAMESPACES[@]}"; do
   fi
   echo "==> Provisioning Lakekeeper (warehouse '$NS_WAREHOUSE', namespace '$DATA_NAMESPACE') from Glue database '$DATA_NAMESPACE' in bucket '$DATA_BUCKET'"
 
-  # Maps this environment onto lakekeeper-provision.sh's LK_SOURCE_*/LK_TARGET_* contract — the
-  # operator sets none of these by hand. LK_SOURCE_KIND defaults to 'glue'.
   export LK_SOURCE_REGION="$DATA_REGION"
   export LK_SOURCE_DATABASE="$DATA_NAMESPACE"
   export LK_TARGET_CATALOG_URI="$LK_CATALOG_URI"

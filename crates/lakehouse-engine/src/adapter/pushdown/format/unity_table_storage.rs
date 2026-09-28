@@ -98,7 +98,8 @@ impl<'a> UnityTableStorage<'a> {
     }
 }
 
-/// Re-raise `error` as [`UdfError::User`] with every value in `secrets` masked.
+/// Collapses to [`UdfError::User`] via `Display`, so the variant prefix survives while no
+/// future variant payload can carry a secret unmasked.
 pub(super) fn redacted(error: UdfError, secrets: &[&str]) -> UdfError {
     UdfError::User(redact_error_text(&error.to_string(), secrets))
 }

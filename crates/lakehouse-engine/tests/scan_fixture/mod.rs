@@ -29,13 +29,8 @@ use exasol_udf_sdk::test_support::TestContext;
 use exasol_udf_sdk::value::{ColumnInfo, ExaType, Value};
 use std::io::Cursor;
 
-/// The declared output columns of a scan call, one per generated `EMITS` item,
-/// in the shape `UdfContext::output_column` reports them.
-///
-/// `typ` is the authority the emit boundary reads; `type_name` carries the
-/// Exasol spelling of that variant purely so a failing assertion is readable.
-/// The two integer bins render at the widest declaration that bins to them,
-/// because `ExaType` does not carry the declared precision.
+/// `type_name` is only for readable assertion failures; the emit boundary reads `typ`.
+/// Integer bins render at their widest declaration since `ExaType` has no precision.
 pub fn output_columns(types: &[ExaType]) -> Vec<ColumnInfo> {
     types
         .iter()
@@ -51,13 +46,10 @@ pub fn output_columns(types: &[ExaType]) -> Vec<ColumnInfo> {
         .collect()
 }
 
-/// The `ExaType` Exasol reports for a `VARCHAR(2000000)` declaration.
 pub fn varchar() -> ExaType {
     ExaType::String { size: 2_000_000 }
 }
 
-/// The `ExaType` Exasol reports for a `DECIMAL(precision, scale)` declaration
-/// it binned to NUMERIC rather than to one of the two integer bins.
 pub fn decimal(precision: u32, scale: u32) -> ExaType {
     ExaType::Numeric { precision, scale }
 }
@@ -98,18 +90,10 @@ fn declared_scale(typ: &ExaType) -> Option<u32> {
     }
 }
 
-/// Wraps [`TestContext`] and overrides [`UdfContext::emit_record_batch_ipc`] to
-/// decode Arrow IPC bytes into captured `RecordBatch` values.
-///
-/// `TestContext` leaves `emit_record_batch_ipc` at the trait default, which
-/// returns `UdfError::Unimplemented`. The raw scan path emits through that
-/// method (via the `EmitBatch::emit_batch` blanket), so scan integration tests
-/// need this wrapper to capture the emitted batches. Every other `UdfContext`
-/// method delegates to the inner `TestContext`.
+/// `TestContext` leaves `emit_record_batch_ipc` unimplemented; this captures the raw scan's
+/// IPC emits as decoded batches.
 pub struct BatchCapturingCtx {
     inner: TestContext,
-    /// One entry per `emit_record_batch_ipc` call; each entry holds the batches
-    /// decoded from that call's IPC payload.
     calls: Vec<Vec<RecordBatch>>,
 }
 
@@ -121,29 +105,22 @@ impl BatchCapturingCtx {
         }
     }
 
-    /// A capturing context whose call site declared `types` as its `EMITS` list,
-    /// so the emit boundary reads those columns back through `output_column`.
     pub fn declaring(inner: TestContext, types: &[ExaType]) -> Self {
         Self::new(inner.with_output_columns(output_columns(types)))
     }
 
-    /// All decoded batches across every `emit_record_batch_ipc` call, flattened.
     pub fn batches(&self) -> Vec<&RecordBatch> {
         self.calls.iter().flat_map(|c| c.iter()).collect()
     }
 
-    /// All decoded batches across every `emit_record_batch_ipc` call, flattened
-    /// and consumed.
     pub fn into_batches(self) -> Vec<RecordBatch> {
         self.calls.into_iter().flatten().collect()
     }
 
-    /// Number of `emit_record_batch_ipc` calls received.
     pub fn call_count(&self) -> usize {
         self.calls.len()
     }
 
-    /// Total row count across all decoded batches in all calls.
     pub fn total_rows(&self) -> u64 {
         self.calls
             .iter()

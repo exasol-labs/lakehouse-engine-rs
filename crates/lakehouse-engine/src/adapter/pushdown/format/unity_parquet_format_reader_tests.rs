@@ -173,8 +173,6 @@ async fn files_are_listed_through_the_seam_and_no_footer_is_read() {
     assert_eq!(scan.effective_storage, storage);
 }
 
-/// Scenario: The logical schema is the catalog's declared column list
-/// Scenario: A Unity Parquet column with no usable type descriptor is refused, and nullability always follows the file
 #[tokio::test]
 async fn logical_schema_is_the_catalog_column_list_and_undescribed_columns_are_refused() {
     let mut table = sales_table(&[("id", "long"), ("payload", "binary")], &[]);
@@ -209,8 +207,6 @@ async fn logical_schema_is_the_catalog_column_list_and_undescribed_columns_are_r
     );
 }
 
-/// Scenario: A table whose every column is refused is refused as a whole, exactly as a Delta table is
-/// Scenario: A partition column the type classification refuses fails the plan
 #[tokio::test]
 async fn an_unplannable_catalog_schema_fails_the_plan() {
     let mut no_mappable = sales_table(&[("payload", "binary")], &[]);
@@ -245,8 +241,6 @@ async fn an_unplannable_catalog_schema_fails_the_plan() {
     }
 }
 
-/// Scenario: A data-file column whose name differs only in letter case binds to its catalog column
-/// Scenario: The scan applies its shared cast and admission rules, unchanged, to a Unity Parquet column
 #[tokio::test]
 async fn file_columns_bind_under_the_case_fold_and_the_shared_cast_rules() {
     let table = sales_table(&[("CustomerId", "long"), ("amount", "integer")], &[]);
@@ -338,8 +332,6 @@ async fn only_string_partition_columns_prune_files() {
     }
 }
 
-/// Scenario: Storage is resolved through the table's own catalog exactly as for a Delta table
-/// Scenario: An empty storage location is refused with one text under both credential modes
 #[tokio::test]
 async fn storage_is_resolved_through_the_shared_unity_path() {
     let no_location = CatalogTable {
