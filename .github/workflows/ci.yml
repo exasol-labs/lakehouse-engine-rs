@@ -546,7 +546,7 @@ jobs:
             docker compose logs minio-init
             exit 1
           fi
-          docker compose up -d --wait exasol minio iceberg-rest
+          docker compose up -d --wait exasol minio iceberg-rest sts-stub
 
           # spark-iceberg-fixtures is a second one-shot job (same rationale as
           # minio-init above): it authors the positional-delete E2E fixtures
@@ -755,7 +755,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait minio exasol unitycatalog
+          $COMPOSE up -d --wait minio exasol unitycatalog sts-stub
 
       - name: Seed Unity Catalog fixtures
         run: ./scripts/unity/seed.sh

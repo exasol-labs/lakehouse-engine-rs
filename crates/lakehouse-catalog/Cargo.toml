@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-catalog"
-version = "0.4.0"
+version = "0.5.0"
 edition = "2024"
 license.workspace = true
 
@@ -28,6 +28,9 @@ aws-smithy-runtime-api = { workspace = true }
 
 # Async reqwest client for signed catalog/storage requests.
 reqwest = { workspace = true }
+
+# AWS STS AssumeRole response parsing.
+quick-xml = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

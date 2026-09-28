@@ -48,6 +48,9 @@ fn debug_redacts_every_secret_bearing_field() {
         account_name: Some("acct".into()),
         account_key: Some("akey".into()),
         sas_token: Some("sv=…&sig=sas".into()),
+        aws_assume_role_arn: Some("arn:aws:iam::123456789012:role/reader".into()),
+        aws_external_id: Some("ext-id-secret".into()),
+        aws_sts_endpoint: Some("https://sts.eu-west-1.amazonaws.com".into()),
     };
     let debug = format!("{creds:?}");
     for secret in [
@@ -58,6 +61,7 @@ fn debug_redacts_every_secret_bearing_field() {
         "csecret",
         "akey",
         "sv=…&sig=sas",
+        "ext-id-secret",
     ] {
         assert!(!debug.contains(secret), "{secret} leaked: {debug}");
     }
@@ -98,6 +102,56 @@ fn debug_redacts_every_secret_bearing_field() {
             assert!(!text.contains(s), "{label} leaked {s}: {text}");
         }
     }
+}
+
+/// Scenario: the credential set's `Debug` rendering prints `aws_external_id` as redacted, beside the role and STS endpoint it names.
+#[test]
+fn connection_creds_debug_redacts_the_external_id() {
+    const EXTERNAL_ID: &str = "external-id-sentinel";
+    const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
+    const STS_ENDPOINT: &str = "https://sts.eu-west-1.amazonaws.com";
+    let stated = ConnectionCreds {
+        aws_assume_role_arn: Some(ROLE_ARN.into()),
+        aws_external_id: Some(EXTERNAL_ID.into()),
+        aws_sts_endpoint: Some(STS_ENDPOINT.into()),
+        ..crate::test_support::creds_no_auth()
+    };
+
+    let debug = format!("{stated:?}");
+
+    assert!(!debug.contains(EXTERNAL_ID), "external id leaked: {debug}");
+    assert!(
+        debug.contains(r#"aws_external_id: Some("[redacted]")"#),
+        "a stated external id must render as redacted: {debug}"
+    );
+    assert!(
+        debug.contains(ROLE_ARN),
+        "the role ARN is not a secret: {debug}"
+    );
+    assert!(
+        debug.contains(STS_ENDPOINT),
+        "the STS endpoint is not a secret: {debug}"
+    );
+
+    let absent = format!("{:?}", crate::test_support::creds_no_auth());
+    assert!(
+        absent.contains("aws_external_id: None"),
+        "an absent external id must render as None: {absent}"
+    );
+}
+
+/// Scenario: a set names a role only through a non-empty `aws_assume_role_arn`; unset or empty names none.
+#[test]
+fn assume_role_arn_names_a_role_only_when_non_empty() {
+    const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
+    let with_arn = |arn: Option<&str>| ConnectionCreds {
+        aws_assume_role_arn: arn.map(String::from),
+        ..crate::test_support::creds_no_auth()
+    };
+
+    assert_eq!(with_arn(Some(ROLE_ARN)).assume_role_arn(), Some(ROLE_ARN));
+    assert_eq!(with_arn(Some("")).assume_role_arn(), None);
+    assert_eq!(with_arn(None).assume_role_arn(), None);
 }
 
 const TOKEN: &str = "static-bearer-token";

@@ -34,7 +34,7 @@ use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use lakehouse_catalog::{
     CatalogClient, CatalogListing, CatalogTableIdent, IcebergRestCatalogClient, SkipReason,
-    SkippedTable, UnityCatalogSession,
+    SkippedTable, UnityCatalogSession, resolve_aws_identity,
 };
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
@@ -145,10 +145,11 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
         }
         Some("dropVirtualSchema") => Ok(json!({"type": "dropVirtualSchema"})),
         Some("pushdown") => {
-            // Resolve credentials synchronously before entering the async runtime:
-            // ctx.connection(), reached via resolve_connection_config, is a
-            // connect-back round-trip that may block on the UDF host, so it must
-            // not run inside the tokio runtime built below.
+            // Resolve credentials outside the async block: ctx.connection(),
+            // reached via resolve_connection_config, is a connect-back round-trip
+            // that may block on the UDF host, so it must not run inside
+            // rt.block_on; resolve_connection_config reads it before blocking on
+            // `rt` for the AWS identity.
             //
             // ctx.script_schema() and cluster_nodes_from_context(ctx) are captured
             // here too, but for a different reason — they are plain handshake-
@@ -157,15 +158,15 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
             // and of a dependency on the UDF delivery mechanism. script_schema is
             // the schema that qualifies the scan/distributor/merge UDF names in the
             // generated pushdown SQL.
-            let props = get_properties(request);
-            let config = resolve_connection_config(ctx, &props)?;
-            let script_schema = ctx.script_schema();
-            let cluster_nodes = cluster_nodes_from_context(ctx);
-
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
+            let props = get_properties(request);
+            let config = resolve_connection_config(ctx, &props, &rt)?;
+            let script_schema = ctx.script_schema();
+            let cluster_nodes = cluster_nodes_from_context(ctx);
+
             rt.block_on(async {
                 handle_pushdown_request(request, &config, &script_schema, cluster_nodes).await
             })
@@ -180,7 +181,8 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
 /// The catalog/storage configuration resolved from the `CATALOG_CONNECTION`
 /// object, bundled because [`resolve_connection_config`]'s callers thread every
 /// field on to [`TableScanResolver::for_request`] and [`ConnectionStorage`]
-/// without inspecting them individually.
+/// without inspecting them individually. `creds` and `storage` carry the AWS
+/// identity the request acts as: a named role's session, not the stated key pair.
 pub struct ResolvedConnectionConfig {
     pub(crate) catalog_uri: String,
     pub(crate) storage: StorageBackend,
@@ -191,22 +193,17 @@ pub struct ResolvedConnectionConfig {
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 
-/// Resolve the catalog/storage configuration from the `CATALOG_CONNECTION` object.
+/// Resolve the catalog/storage configuration from the `CATALOG_CONNECTION`
+/// object, as the AWS identity the request acts as.
 ///
-/// Shared by the createVirtualSchema and pushdown entry points. `ctx.connection()`
-/// is synchronous and must be called before entering any async runtime.
-/// Table identity is no longer fixed at config-resolution time; callers build
-/// `CatalogProps` with the specific per-table identifier when known.
-///
-/// `allow_http`, needed by both storage selectors (`storage_block` bakes it into
-/// the static S3 payload, the vended selector uses it as its plaintext-transport
-/// consent gate), and `catalog_kind`, reused by the create path instead of
-/// resolving `CATALOG_KIND` a second time for client construction, ride on the
-/// returned [`ResolvedConnectionConfig`] alongside the rest of the resolved
-/// configuration.
+/// Both entry points call it, so neither reaches the catalog or storage before a
+/// named role is assumed. `ctx.connection()`, validation, and the sealing key read
+/// the CONNECTION as stated, outside any `rt.block_on`; `rt` then assumes the role
+/// once per request and `storage` is built from the resulting session.
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
+    rt: &tokio::runtime::Runtime,
 ) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = catalog_kind::resolve_catalog_kind(props)?;
     let connection_name = nonempty_str(props, PROP_CATALOG_CONNECTION)
@@ -215,11 +212,19 @@ fn resolve_connection_config(
     let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let storage = storage_block(&resolved.creds, allow_http);
+    let stated_storage = storage_block(&resolved.creds, allow_http);
+    let creds = rt
+        .block_on(resolve_aws_identity(
+            resolved.creds,
+            &resolved.uri,
+            allow_http,
+        ))
+        .map_err(|e| redact_error(&stated_storage, e))?;
+    let storage = storage_block(&creds, allow_http);
     Ok(ResolvedConnectionConfig {
         catalog_uri: resolved.uri,
         storage,
-        creds: resolved.creds,
+        creds,
         allow_http,
         catalog_kind: kind,
         connection_name: connection_name.to_string(),
@@ -239,10 +244,15 @@ fn handle_create_virtual_schema(
     } else {
         get_properties(request)
     };
-    // `allow_http` is discarded here: schema enumeration reaches no vended selector,
-    // and `storage_block` already baked it into `storage`. `catalog_kind` is the
-    // single `CATALOG_KIND` parse, reused below for `construct_catalog_client`.
-    let config = resolve_connection_config(ctx, &props)?;
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
+    // `allow_http` is not read past this point: schema enumeration reaches no
+    // vended selector, and `storage_block` already baked it into `storage`.
+    // `catalog_kind` is the single `CATALOG_KIND` parse, reused below for
+    // `construct_catalog_client`.
+    let config = resolve_connection_config(ctx, &props, &rt)?;
 
     // `NAMESPACE` is optional under direct storage: its CONNECTION address alone already denotes a complete storage subtree.
     let configured_ns: Vec<String> = match config.catalog_kind {
@@ -275,11 +285,6 @@ fn handle_create_virtual_schema(
     // the conservative maximal per-node fan-out keeps the AUTO connection budget
     // from oversubscribing a node even at the configured shard-fan-out ceiling.
     let s3_max_connections = resolve_s3_max_connections(&props, nr_of_cores, parallelism_factor);
-
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
 
     // The ONLY site that matches `CatalogKind`; after it the listing pipeline is
     // identical for all three kinds and never asks which catalog it holds.

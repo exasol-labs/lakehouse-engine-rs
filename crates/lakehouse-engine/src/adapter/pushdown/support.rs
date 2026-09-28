@@ -1575,6 +1575,10 @@ pub(super) fn cast_to_declared_type(expr: &str, declared: Option<&str>) -> Strin
     }
 }
 
+/// The scan-spec storage block: a CONNECTION reference only when the scan UDF can
+/// re-derive `effective` from the CONNECTION it reads, i.e. when the set neither
+/// vends nor names a role, and otherwise `effective` sealed under the CONNECTION's
+/// key, because a vended or assumed-role credential is not what the CONNECTION states.
 pub(super) fn scan_storage_for(
     creds: &ConnectionCreds,
     connection_name: &str,
@@ -1582,7 +1586,7 @@ pub(super) fn scan_storage_for(
     effective: &StorageBackend,
     sealing_key: Option<&SealedStorageKey>,
 ) -> Result<ScanStorage, UdfError> {
-    if !creds.use_vended_credentials {
+    if !creds.use_vended_credentials && creds.assume_role_arn().is_none() {
         return Ok(ScanStorage::Connection {
             name: connection_name.to_string(),
             allow_http,

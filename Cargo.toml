@@ -99,3 +99,7 @@ aws-smithy-runtime-api = { version = "1", features = ["client"] }
 # Async HTTP client for the catalog's self-issued signed `loadTable` GET. The
 # engine's test harness adds `features = ["blocking"]` on top for its own use.
 reqwest = { version = "0.12" }
+
+# Parses AWS STS `AssumeRole` XML responses in lakehouse-catalog; already resolved
+# to 0.39.4 with serde through object_store, so it adds no package to the lockfile.
+quick-xml = { version = "0.39", features = ["serialize"] }

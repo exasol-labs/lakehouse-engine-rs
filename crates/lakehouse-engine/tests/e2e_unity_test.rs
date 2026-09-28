@@ -36,8 +36,10 @@ use common::e2e_harness::{
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::write_parquet_fixture;
 use common::stack::{
-    self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
-    local_stack_connection_password, wait_for_exasol, wait_for_minio, wait_for_url,
+    self, ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
+    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, build_create_connection_sql, exasol_host,
+    exasol_sql_port, local_stack_connection_password, wait_for_exasol, wait_for_minio,
+    wait_for_url,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -115,6 +117,7 @@ fn setup() {
         wait_for_exasol();
         wait_for_minio();
         wait_for_unity_catalog();
+        stack::wait_for_sts_stub();
 
         // Shared-harness provisioning (SLC + .so + scripts) — REUSED, never
         // redeclared, so the adapter script DDL is byte-identical to every other
@@ -127,6 +130,7 @@ fn setup() {
         seed_sales_parquet_table();
 
         create_unity_virtual_schema(&mut conn);
+        create_unity_role_virtual_schema(&mut conn);
     });
 }
 
@@ -151,6 +155,43 @@ fn create_unity_virtual_schema(conn: &mut ExaConn) {
         r#"CREATE VIRTUAL SCHEMA {VS_NAME}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION = '{CONN_NAME}'
+  CATALOG_KIND       = 'UNITY_CATALOG'
+  NAMESPACE  = '{UNITY_NAMESPACE}'
+  ALLOW_HTTP         = 'true'"#
+    ));
+}
+
+/// A second Virtual Schema over the SAME seeded `unity.delta_e2e` namespace.
+const VS_ROLE_NAME: &str = "UNITY_DELTA_ROLE_VS";
+/// Catalog CONNECTION carrying the assume-role identity instead of static keys.
+const CONN_ROLE_NAME: &str = "UNITY_ROLE_CATALOG_CREDS";
+
+/// Create a second Unity Catalog virtual schema over the SAME seeded
+/// `unity.delta_e2e` namespace, through a CONNECTION that does not set
+/// `use_vended_credentials` and instead names the assume-role identity: the
+/// base user's key pair (MinIO denies it every S3 request on its own), the
+/// role, its external id, and the local `sts-stub` as `aws_sts_endpoint`.
+fn create_unity_role_virtual_schema(conn: &mut ExaConn) {
+    let password = CatalogConnectionPassword {
+        access_key: ASSUME_ROLE_BASE_ACCESS_KEY.to_string(),
+        secret_key: ASSUME_ROLE_BASE_SECRET_KEY.to_string(),
+        aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
+        aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
+        aws_sts_endpoint: Some(stack::sts_stub_url_internal()),
+        ..local_stack_connection_password()
+    };
+    let create_conn_sql =
+        build_create_connection_sql(CONN_ROLE_NAME, UNITY_CATALOG_URI_INTERNAL, &password);
+    conn.execute(&create_conn_sql);
+
+    let _ = conn.try_execute(&format!(
+        "DROP VIRTUAL SCHEMA IF EXISTS {VS_ROLE_NAME} CASCADE"
+    ));
+
+    conn.execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {VS_ROLE_NAME}
+USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
+  CATALOG_CONNECTION = '{CONN_ROLE_NAME}'
   CATALOG_KIND       = 'UNITY_CATALOG'
   NAMESPACE  = '{UNITY_NAMESPACE}'
   ALLOW_HTTP         = 'true'"#
@@ -427,6 +468,9 @@ fn delta_creds(use_vended_credentials: bool) -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        aws_assume_role_arn: None,
+        aws_external_id: None,
+        aws_sts_endpoint: None,
     }
 }
 
@@ -759,6 +803,38 @@ fn unity_delta_delete_free_table_returns_its_rows() {
     assert!(
         cols.iter().all(|col| col.iter().all(|v| !v.is_null())),
         "a delete-free table's rows must carry real column values, not NULL: {cols:?}"
+    );
+}
+
+/// Scenario: A Unity Catalog CONNECTION with static keys naming the role reads a Delta table through the session.
+#[test]
+fn unity_role_connection_reads_a_delta_table_through_the_session() {
+    setup();
+    let before = stack::sts_stub_request_count();
+    let mut conn = exa_conn();
+
+    let role_table = format!("{VS_ROLE_NAME}.MULTI_PART_STATS");
+    let count = conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {role_table}"));
+    assert_eq!(
+        count, 5,
+        "multi_part_stats' five active data files hold five rows in total"
+    );
+
+    let cols = conn.query_columns(&format!("SELECT ID, \"VALUE\" FROM {role_table}"));
+    assert_eq!(cols.len(), 2, "expected ID, VALUE columns: {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        5,
+        "SELECT must return the same 5 rows COUNT(*) reports: {cols:?}"
+    );
+    assert!(
+        cols.iter().all(|col| col.iter().all(|v| !v.is_null())),
+        "a delete-free table's rows must carry real column values, not NULL: {cols:?}"
+    );
+
+    assert!(
+        stack::sts_stub_request_count() > before,
+        "the role query must send at least one AssumeRole request"
     );
 }
 

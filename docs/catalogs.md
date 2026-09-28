@@ -43,6 +43,9 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 | `access_key` | yes, unless `use_sigv4` or vended credentials | S3 access key |
 | `secret_key` | yes, unless `use_sigv4` or vended credentials | S3 secret key |
 | `session_token` | no | STS session token |
+| `aws_assume_role_arn` | no | AWS IAM role ARN to assume via STS `AssumeRole`, using this CONNECTION's own `access_key`/`secret_key` (plus `session_token`, if stated) as the base identity that signs the `AssumeRole` request. The returned session credentials then replace `access_key`, `secret_key`, and `session_token` everywhere those fields are read: SigV4 catalog signing, and non-vended S3 storage |
+| `aws_external_id` | no; requires `aws_assume_role_arn` | `ExternalId` sent with the `AssumeRole` request, for a role whose trust policy requires one |
+| `aws_sts_endpoint` | no; requires `aws_assume_role_arn` | STS endpoint override — for example a China-partition, VPC-interface, or local-stack endpoint. Defaults to `https://sts.<region>.amazonaws.com` for the resolved signing region, else the global `https://sts.amazonaws.com` |
 | `path_style` | required if `endpoint` is set and vending is off; otherwise no, default `false` | Path-style S3 addressing: `true` for MinIO or Ceph, `false` for real AWS S3 (virtual-hosted, the default) |
 | `use_sigv4` | no, default `false` | SigV4-sign the catalog REST requests (AWS Glue) |
 | `use_vended_credentials` | no, default `false` | Request short-lived S3 credentials from the `load_table` call of the catalog (Glue, Lakekeeper) |
@@ -61,6 +64,71 @@ An unstated `path_style` resolves to `false` on a non-vended CONNECTION, which d
 Credential values never appear in error messages, logs, or debug output. The per-query scan spec carries a REFERENCE to the CONNECTION (its name) for a static credential, and an AES-GCM-sealed envelope for a vended one — no credential value travels in the scan spec itself. The adapter never stores them in Virtual Schema properties. See [Security](security.md) for the CONNECTION-access privilege model this relies on, and for exactly what a `SELECT`-only Virtual Schema user can and cannot read back.
 
 The Virtual Schema then names the CONNECTION. [Install: Point the VS at your data](install.md#point-the-vs-at-your-data) and [Tuning](tuning.md) document its properties: `CATALOG_KIND`, `NAMESPACE`, `ALLOW_HTTP`, and the tuning properties. This page repeats only the properties that every recipe needs.
+
+### Assuming an AWS IAM role
+
+A CONNECTION can name an AWS IAM role instead of using its static key pair directly. Set
+`aws_assume_role_arn` to the role ARN; `access_key` and `secret_key` (plus `session_token`, if
+stated) remain required as the **base identity** that signs the STS `AssumeRole` call — the adapter
+reads no ambient AWS credential (no environment variable, instance profile, or web-identity token)
+for this. `aws_external_id` and `aws_sts_endpoint` are each accepted only alongside
+`aws_assume_role_arn`; stating either one without a role is a rejected CONNECTION naming the field.
+
+The session credentials `AssumeRole` returns then replace `access_key`, `secret_key`, and
+`session_token` everywhere those fields are read: they sign SigV4 catalog requests (Glue), and they
+are the storage credential for non-vended S3 access. A role leaves credential vending unchanged —
+with `use_vended_credentials` on, storage is still resolved by vending (the `load_table` response
+under Iceberg REST, or Unity Catalog temporary table credentials under `CATALOG_KIND =
+'UNITY_CATALOG'`), exactly as for the same CONNECTION without a role; the session credentials sign
+only the catalog requests in that case. The adapter sends exactly one `AssumeRole` call per request
+— whatever the shard count — and does not renew the session mid-query; the STS session lasts a fixed
+3600 seconds (`DurationSeconds` is not configurable).
+
+**Endpoint and region.** The STS endpoint is `aws_sts_endpoint` when stated, else
+`https://sts.<region>.amazonaws.com` for the signing region (the same region
+[SigV4 catalog signing](#aws-glue-iceberg-rest-sigv4) resolves — a standard AWS Glue endpoint's own
+region, else the stated `region`), else the global `https://sts.amazonaws.com` when no region
+resolves. Sending the `AssumeRole` request to a plaintext `http://` `aws_sts_endpoint` requires
+`ALLOW_HTTP = 'true'` on the Virtual Schema, because the response carries the session secret — it is
+otherwise a rejected CONNECTION. A **China-region** deployment must state `aws_sts_endpoint`
+explicitly: AWS's China STS endpoints live under `.amazonaws.com.cn`, which the default resolution
+does not construct.
+
+**MinIO cannot honor a named role.** MinIO's own `AssumeRole` implementation ignores `RoleArn` and
+mints a session under the caller's own policy. Pointing `aws_sts_endpoint` at a MinIO instance does
+not apply the named role — it authenticates as whichever MinIO user signed the request. Role
+assumption needs a genuinely AWS-compatible STS endpoint (real AWS STS, or a compatible stub) to have
+any effect.
+
+**A failed `AssumeRole` is not retried.** A `Throttling` or 5xx response from STS fails that request
+immediately rather than being retried — under concurrent load (many queries assuming the same role
+at once), a rate-limited STS call surfaces as a failed query, not a transient, self-healing retry.
+
+```sql
+CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
+  TO 'https://glue.us-east-1.amazonaws.com/iceberg'
+  USER ''
+  IDENTIFIED BY '{
+    "warehouse":           "123456789012",
+    "region":              "us-east-1",
+    "access_key":          "AKIA...",
+    "secret_key":          "...",
+    "use_sigv4":           true,
+    "aws_assume_role_arn": "arn:aws:iam::123456789012:role/lakehouse-role",
+    "aws_external_id":     "..."
+  }';
+
+CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
+USING LHVS.LAKEHOUSE_ADAPTER WITH
+  CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
+  NAMESPACE          = 'default';
+```
+
+`access_key` and `secret_key` above are the base identity's own key pair — the one that holds only
+`sts:AssumeRole` permission on the named role — not the role's credentials. `aws_external_id` is
+optional; omit it for a role whose trust policy requires none. `region` is stated explicitly, as
+every recipe on this page recommends, since it also places the S3 store independently of whatever
+region signs the catalog request.
 
 ## Local / generic Iceberg REST (no auth)
 

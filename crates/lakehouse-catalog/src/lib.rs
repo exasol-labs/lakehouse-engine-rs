@@ -1,6 +1,6 @@
 //! Iceberg REST catalog access: session resolution, authentication, namespace
 //! enumeration, vended-storage-credential resolution, SigV4 request signing,
-//! credential redaction, the four shared credential types (`CatalogProps`,
+//! AWS STS role assumption, credential redaction, the four shared credential types (`CatalogProps`,
 //! `ConnectionCreds`, `StorageCreds`, `StorageProps`), and the `StorageBackend`
 //! that selects which object storage a scan reads through.
 
@@ -13,6 +13,7 @@ mod redaction;
 mod session;
 mod sigv4;
 mod storage;
+mod sts;
 mod unity;
 mod vended;
 
@@ -30,6 +31,7 @@ pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{CatalogSession, load_table_any_auth};
 pub use storage::{AdlsCred, StaticStoreAddress, StorageBackend, scheme_of};
+pub use sts::resolve_aws_identity;
 
 pub use vended::resolve_vended_storage;
 

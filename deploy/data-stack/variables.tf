@@ -109,6 +109,23 @@ variable "erp_invoices" {
   description = "Row count for the erp.invoices bronze table."
 }
 
+# --- Assume-role base identity (issue #139: STS AssumeRole credentials) ----
+variable "assume_role_external_id" {
+  type        = string
+  sensitive   = true
+  description = "STS ExternalId the assume-role trust policy requires. Not defaulted so it never lands in git — set it in terraform.tfvars (gitignored)."
+
+  validation {
+    condition = (
+      length(var.assume_role_external_id) >= 2
+      && length(var.assume_role_external_id) <= 1224
+      && can(regex("^[\\w+=,.@:/-]+$", var.assume_role_external_id))
+      && !startswith(var.assume_role_external_id, "CHANGE-ME")
+    )
+    error_message = "assume_role_external_id must be a real STS ExternalId (2-1224 characters of [A-Za-z0-9_+=,.@:/-]), not the terraform.tfvars.example placeholder."
+  }
+}
+
 # --- Spark benchmark (EMR Serverless, opt-in) ------------------------------
 variable "enable_emr_serverless" {
   type        = bool

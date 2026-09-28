@@ -20,6 +20,12 @@ pub struct ConnectionCreds {
     pub account_name: Option<String>,
     pub account_key: Option<String>,
     pub sas_token: Option<String>,
+    /// IAM role [`crate::resolve_aws_identity`] assumes, signed by this set's key pair; unset or empty means the set acts as its own key pair.
+    pub aws_assume_role_arn: Option<String>,
+    /// STS `ExternalId` sent with the `AssumeRole` call; `Debug` redacts it because a trust policy treats it as a shared value.
+    pub aws_external_id: Option<String>,
+    /// STS endpoint override; unset resolves to the signing region's regional endpoint, else the global one.
+    pub aws_sts_endpoint: Option<String>,
 }
 
 impl std::fmt::Debug for ConnectionCreds {
@@ -51,6 +57,12 @@ impl std::fmt::Debug for ConnectionCreds {
                 &self.account_key.as_ref().map(|_| "[redacted]"),
             )
             .field("sas_token", &self.sas_token.as_ref().map(|_| "[redacted]"))
+            .field("aws_assume_role_arn", &self.aws_assume_role_arn)
+            .field(
+                "aws_external_id",
+                &self.aws_external_id.as_ref().map(|_| "[redacted]"),
+            )
+            .field("aws_sts_endpoint", &self.aws_sts_endpoint)
             .finish()
     }
 }
@@ -65,6 +77,12 @@ pub(crate) enum SuppliedCatalogAuth<'a> {
 }
 
 impl ConnectionCreds {
+    /// The IAM role this set names for STS `AssumeRole`, or `None` when
+    /// `aws_assume_role_arn` is unset or empty; the one definition every consumer reads.
+    pub fn assume_role_arn(&self) -> Option<&str> {
+        non_empty(&self.aws_assume_role_arn)
+    }
+
     pub fn has_catalog_auth(&self) -> bool {
         self.token.is_some() || self.client_id.is_some() || self.client_secret.is_some()
     }

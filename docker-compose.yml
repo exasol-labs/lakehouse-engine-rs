@@ -4,7 +4,7 @@
 # internal ports (8563/2581/9000/9001/8181) and the docker-network service
 # names (exasol/minio/iceberg-rest) are unchanged, so a UDF inside Exasol still
 # reaches MinIO at http://minio:9000 and the catalog at http://iceberg-rest:8181.
-#   Host defaults:  Exasol SQL 28563 · BucketFS 22581 · MinIO 19000/19001 · REST 18181
+#   Host defaults:  Exasol SQL 28563 · BucketFS 22581 · MinIO 19000/19001 · REST 18181 · STS stub 19090
 
 services:
   minio:
@@ -37,12 +37,38 @@ services:
     depends_on:
       minio:
         condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/warehouse &&
-      echo 'bucket ready'
-      "
+    # Literal block (was a folded `>` string): the assume-role provisioning
+    # below writes an inline policy JSON, whose double quotes would otherwise
+    # collide with the folded form's own quoting.
+    #
+    # Two MinIO users model the two ends of role assumption (spike #139): the
+    # base identity carries no policy, so MinIO denies it every S3 request —
+    # only `sts-stub`'s AssumeRole (never MinIO's own, which ignores RoleArn)
+    # turns it into the role identity, which reads `warehouse`.
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        mc alias set local http://minio:9000 minioadmin minioadmin
+        mc mb --ignore-existing local/warehouse
+        mc admin user add local lhassumebase lhassumebasesecret123
+        cat > /tmp/warehouse-read.json <<'POLICY'
+        {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Action": ["s3:GetObject", "s3:ListBucket", "s3:GetBucketLocation"],
+              "Resource": ["arn:aws:s3:::warehouse", "arn:aws:s3:::warehouse/*"]
+            }
+          ]
+        }
+        POLICY
+        mc admin policy create local warehouse-read /tmp/warehouse-read.json
+        mc admin user add local lhassumerole lhassumerolesecret123
+        mc admin policy attach local warehouse-read --user lhassumerole
+        echo 'bucket and assume-role users ready'
     # "no" (was on-failure): this is a one-shot job, not a long-running
     # service — it either succeeds or it doesn't, there's nothing to restart.
     # (`docker compose up --wait` doesn't reliably support one-shot containers
@@ -79,6 +105,48 @@ services:
     networks:
       lakehouse:
         ipv4_address: 10.84.0.11
+
+  # Local AWS STS `AssumeRole` stub (spike #139, assume-role-e2e): MinIO cannot
+  # model role assumption itself (its own AssumeRole ignores RoleArn and
+  # inherits the caller's policy), so this stands in for sts.amazonaws.com.
+  # Verifies the caller's SigV4 signature independently of the engine's own
+  # signer, checks RoleArn/ExternalId, then mints a real MinIO session as the
+  # role user (see scripts/sts-stub/sts_stub.py). Python standard library
+  # only — the pinned base image needs nothing installed.
+  sts-stub:
+    image: python:3.12-slim
+    depends_on:
+      minio:
+        condition: service_healthy
+    volumes:
+      - ./scripts/sts-stub:/sts-stub:ro
+    environment:
+      STS_STUB_PORT: "8080"
+      STS_STUB_BASE_ACCESS_KEY: lhassumebase
+      STS_STUB_BASE_SECRET_KEY: lhassumebasesecret123
+      STS_STUB_ROLE_ARN: "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo"
+      STS_STUB_EXTERNAL_ID: "lh+ext=id/2026:demo@example"
+      STS_STUB_MINIO_ENDPOINT: "http://minio:9000"
+      STS_STUB_ROLE_ACCESS_KEY: lhassumerole
+      STS_STUB_ROLE_SECRET_KEY: lhassumerolesecret123
+    command: ["python3", "/sts-stub/sts_stub.py"]
+    ports:
+      - "${LH_STS_STUB_PORT:-19090}:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python3",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=3)",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+    networks:
+      lakehouse:
+        ipv4_address: 10.84.0.12
 
   # Positional-delete fixtures (Apache Spark, Iceberg Spark runtime). One-shot
   # job — mirrors minio-init: not a long-running service, just Spark's
@@ -142,17 +210,19 @@ services:
     # connection props http://minio:9000 and http://iceberg-rest:8181 resolve from
     # inside the UDF with NO manual patch. The static IPs match minio/iceberg-rest.
     # extra_hosts also sets the same entries at the Docker layer (intent + the brief
-    # window before exaconf runs).
+    # window before exaconf runs). sts-stub is the same story: the assume-role
+    # CONNECTION's aws_sts_endpoint names it by service name too.
     extra_hosts:
       - "minio:10.84.0.10"
       - "iceberg-rest:10.84.0.11"
+      - "sts-stub:10.84.0.12"
     entrypoint:
       - /bin/bash
       - -c
       - |
         ( while true; do
             if [ -f /etc/hosts ] && ! grep -qE '(^|[[:space:]])minio([[:space:]]|$)' /etc/hosts; then
-              printf '10.84.0.10 minio\n10.84.0.11 iceberg-rest\n' >> /etc/hosts
+              printf '10.84.0.10 minio\n10.84.0.11 iceberg-rest\n10.84.0.12 sts-stub\n' >> /etc/hosts
             fi
             sleep 2
           done ) &

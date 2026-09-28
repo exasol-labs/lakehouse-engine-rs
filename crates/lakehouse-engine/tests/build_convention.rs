@@ -1,18 +1,12 @@
-//! Pure convention test (no I/O): asserts the build documentation states that a
-//! host `cargo build --release` of the UDF crate produces an artifact that
-//! cannot be loaded inside Exasol.
-//!
-//! Covers packaging/single-so-two-entry-points scenario:
-//! "Host release build of the .so is rejected by convention" — the documentation
-//! MUST state that host `cargo build --release` produces an unloadable artifact.
-//!
-//! The documentation is embedded at compile time via `include_str!`, so this is
-//! a pure test: it reads no files at runtime and needs no live services.
+//! Asserts the workspace's build and suite-wiring conventions; no live service is needed.
+//! `CLAUDE.md` is embedded at compile time, while `Makefile`, `.github/workflows/ci.yml`,
+//! and the fixture scripts are read from the workspace at runtime.
 
 /// Workspace build-convention documentation, embedded at compile time.
 /// Path is relative to this source file: crates/lakehouse-engine/tests -> workspace root.
 const WORKSPACE_CLAUDE_MD: &str = include_str!("../../../CLAUDE.md");
 
+/// Scenario: Host release build of the .so is rejected by convention.
 #[test]
 fn host_release_build_documented_unloadable() {
     let doc = WORKSPACE_CLAUDE_MD.to_lowercase();
@@ -33,29 +27,19 @@ fn host_release_build_documented_unloadable() {
 
 #[test]
 fn the_type_relaxation_suite_and_fixture_are_wired_into_run_fixtures_and_make_test_e2e() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-
-    let run_fixtures =
-        std::fs::read_to_string(workspace_root.join("scripts/spark-fixtures/run_fixtures.sh"))
-            .expect("scripts/spark-fixtures/run_fixtures.sh must be readable");
+    let run_fixtures = workspace_file("scripts/spark-fixtures/run_fixtures.sh");
     assert!(
         run_fixtures.contains("create_iceberg_type_promotion_fixture.sql"),
         "run_fixtures.sh must invoke create_iceberg_type_promotion_fixture.sql"
     );
 
-    let makefile = std::fs::read_to_string(workspace_root.join("Makefile"))
-        .expect("Makefile must be readable");
-    let mut lines = makefile.lines();
-    let recipe_line = lines
-        .find(|line| line.starts_with("test-e2e:"))
-        .and_then(|_| lines.next())
-        .expect("Makefile must have a test-e2e target followed by a recipe line");
+    let recipe = makefile_recipe(&workspace_file("Makefile"), "test-e2e:");
     assert!(
-        recipe_line.contains("--test e2e_type_relaxation_test"),
+        recipe.contains("--test e2e_type_relaxation_test"),
         "test-e2e target must run --test e2e_type_relaxation_test"
     );
-    let fixture_sql =
-        workspace_root.join("scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql");
+    let fixture_sql = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql");
     assert!(
         fixture_sql.exists(),
         "scripts/spark-fixtures/create_iceberg_type_promotion_fixture.sql must exist on disk"
@@ -64,17 +48,63 @@ fn the_type_relaxation_suite_and_fixture_are_wired_into_run_fixtures_and_make_te
 
 #[test]
 fn make_test_e2e_runs_the_direct_storage_binary() {
-    let workspace_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let makefile = std::fs::read_to_string(workspace_root.join("Makefile"))
-        .expect("Makefile must be readable");
-    let mut lines = makefile.lines();
-    let recipe_line = lines
-        .find(|line| line.starts_with("test-e2e:"))
-        .and_then(|_| lines.next())
-        .expect("Makefile must have a test-e2e target followed by a recipe line");
+    let recipe = makefile_recipe(&workspace_file("Makefile"), "test-e2e:");
 
     assert!(
-        recipe_line.contains("--test e2e_direct_storage_test"),
+        recipe.contains("--test e2e_direct_storage_test"),
         "test-e2e target must run --test e2e_direct_storage_test"
+    );
+}
+
+#[test]
+fn make_test_e2e_runs_the_assume_role_binary() {
+    let recipe = makefile_recipe(&workspace_file("Makefile"), "test-e2e:");
+
+    assert!(
+        recipe.contains("--test e2e_assume_role_test"),
+        "test-e2e target must run --test e2e_assume_role_test"
+    );
+}
+
+fn workspace_file(relative: &str) -> String {
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(relative);
+    std::fs::read_to_string(path).unwrap_or_else(|_| panic!("{relative} must be readable"))
+}
+
+fn makefile_recipe(makefile: &str, target_line_prefix: &str) -> String {
+    let mut lines = makefile
+        .lines()
+        .skip_while(|line| !line.starts_with(target_line_prefix));
+    lines.next().expect("target line must exist");
+    lines
+        .take_while(|line| line.starts_with('\t'))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[test]
+fn ci_e2e_job_waits_for_the_sts_stub() {
+    let ci_workflow = workspace_file(".github/workflows/ci.yml");
+
+    assert!(
+        ci_workflow.contains("docker compose up -d --wait exasol minio iceberg-rest sts-stub"),
+        "the e2e job's stack bring-up must wait on sts-stub alongside exasol/minio/iceberg-rest"
+    );
+}
+
+#[test]
+fn unity_up_and_the_e2e_unity_job_start_the_sts_stub() {
+    let unity_up_recipe = makefile_recipe(&workspace_file("Makefile"), "unity-up:");
+    assert!(
+        unity_up_recipe.contains("sts-stub"),
+        "the unity-up target must start sts-stub: {unity_up_recipe}"
+    );
+
+    let ci_workflow = workspace_file(".github/workflows/ci.yml");
+    assert!(
+        ci_workflow.contains("$COMPOSE up -d --wait minio exasol unitycatalog sts-stub"),
+        "the e2e-unity job's stack bring-up must wait on sts-stub alongside minio/exasol/unitycatalog"
     );
 }

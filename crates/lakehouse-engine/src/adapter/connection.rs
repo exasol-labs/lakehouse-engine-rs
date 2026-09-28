@@ -19,11 +19,11 @@ use super::nonempty_str;
 /// The four S3 fields (`endpoint`, `region`, `access_key`, `secret_key`) are
 /// optional at the base level; they are orthogonal to catalog authentication and
 /// credential vending. `access_key` and `secret_key` become required whenever
-/// `use_sigv4` is enabled. `region` becomes required only when `use_sigv4` is
-/// enabled AND the CONNECTION's address is not a standard AWS Glue endpoint of
-/// the form `https://glue.<region>.amazonaws.com` — such an endpoint supplies
-/// its own SigV4 signing region (see `ConnectionCreds::sigv4_signing_region`
-/// and `read_connection`).
+/// `use_sigv4` is enabled or `aws_assume_role_arn` is named. `region` becomes
+/// required only when `use_sigv4` is enabled AND the CONNECTION's address is not
+/// a standard AWS Glue endpoint of the form `https://glue.<region>.amazonaws.com`
+/// — such an endpoint supplies its own SigV4 signing region (see
+/// `ConnectionCreds::sigv4_signing_region` and `read_connection`).
 pub const REQUIRED_KEY: &str = "warehouse";
 
 /// Parsed credential fields from a CONNECTION password JSON object, declared once
@@ -101,6 +101,7 @@ fn validate_creds(
 ) -> Result<(), UdfError> {
     validate_kind_preconditions(name, creds, kind, address)?;
     validate_azure_storage_creds(name, creds)?;
+    validate_assume_role_creds(name, creds)?;
     validate_sigv4_creds(name, creds, address)?;
     validate_exclusive_catalog_auth_creds(name, creds)?;
     validate_oauth2_creds(name, creds)?;
@@ -231,6 +232,44 @@ fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(
              CONNECTION requires account_name and exactly one of account_key and sas_token: {}",
             azure_fields.join(", "),
             defects.join("; ")
+        )));
+    }
+    Ok(())
+}
+
+/// Runs before the SigV4 check so a role CONNECTION missing its key pair is told
+/// that the role needs it, not only that SigV4 does.
+fn validate_assume_role_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    let names_role = creds.assume_role_arn().is_some();
+    let orphaned: Vec<&str> = [
+        ("aws_external_id", creds.aws_external_id.is_some()),
+        ("aws_sts_endpoint", creds.aws_sts_endpoint.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, present)| (present && !names_role).then_some(field))
+    .collect();
+    if !orphaned.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies field(s) {} without aws_assume_role_arn; they \
+             configure AWS IAM role assumption, so each requires aws_assume_role_arn",
+            orphaned.join(", ")
+        )));
+    }
+
+    let missing: Vec<&str> = [
+        ("access_key", creds.access_key.is_empty()),
+        ("secret_key", creds.secret_key.is_empty()),
+    ]
+    .into_iter()
+    .filter_map(|(field, absent)| (absent && names_role).then_some(field))
+    .collect();
+    if !missing.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' names aws_assume_role_arn but is missing field(s) {}; the \
+             role is assumed with the CONNECTION's own access_key and secret_key, and no \
+             ambient AWS credential, such as an environment variable or an instance \
+             profile, is read",
+            missing.join(", ")
         )));
     }
     Ok(())
@@ -383,6 +422,9 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
         account_name,
         account_key,
         sas_token,
+        aws_assume_role_arn: nonempty_str(json, "aws_assume_role_arn").map(|s| s.to_string()),
+        aws_external_id: nonempty_str(json, "aws_external_id").map(|s| s.to_string()),
+        aws_sts_endpoint: nonempty_str(json, "aws_sts_endpoint").map(|s| s.to_string()),
     }
 }
 

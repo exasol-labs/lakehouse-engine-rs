@@ -88,6 +88,9 @@ pub(super) fn unauthenticated_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        aws_assume_role_arn: None,
+        aws_external_id: None,
+        aws_sts_endpoint: None,
     }
 }
 
@@ -233,6 +236,22 @@ pub(super) async fn object_endpoint(
     bucket: &str,
     objects: Vec<(String, String)>,
 ) -> StorageBackend {
+    binary_object_endpoint(
+        bucket,
+        objects
+            .into_iter()
+            .map(|(key, body)| (key, body.into_bytes()))
+            .collect(),
+    )
+    .await
+}
+
+/// [`object_endpoint`] over binary bodies, answering a ranged GET with `206` and the
+/// requested slice, as a Parquet footer read issues it.
+pub(super) async fn binary_object_endpoint(
+    bucket: &str,
+    objects: Vec<(String, Vec<u8>)>,
+) -> StorageBackend {
     let objects = Arc::new(objects);
     let bucket = Arc::new(bucket.to_string());
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
@@ -258,9 +277,10 @@ pub(super) async fn object_endpoint(
                     .to_string();
                 let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
                 let response = if query.contains("list-type=2") {
-                    ok_response(
+                    object_response(
                         "application/xml",
-                        &list_bucket_result(&bucket, query, &objects),
+                        list_bucket_result(&bucket, query, &objects).as_bytes(),
+                        None,
                     )
                 } else {
                     let key = path
@@ -270,7 +290,10 @@ pub(super) async fn object_endpoint(
                         .iter()
                         .find(|(served, _)| key.as_deref() == Some(served.as_str()))
                     {
-                        Some((_, body)) => ok_response("application/octet-stream", body),
+                        Some((_, body)) => {
+                            let range = requested_range(&raw, body.len());
+                            object_response("application/octet-stream", body, range)
+                        }
                         None => {
                             let error =
                                 r#"<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>"#;
@@ -279,10 +302,11 @@ pub(super) async fn object_endpoint(
                                  Content-Length: {}\r\nConnection: close\r\n\r\n{error}",
                                 error.len()
                             )
+                            .into_bytes()
                         }
                     }
                 };
-                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.write_all(&response).await;
             });
         }
     });
@@ -298,19 +322,51 @@ pub(super) async fn object_endpoint(
     })
 }
 
-fn ok_response(content_type: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         ETag: \"e{}\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
-         Accept-Ranges: bytes\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
+/// A `200` carrying `body`, or a `206` carrying its inclusive `range` slice.
+fn object_response(content_type: &str, body: &[u8], range: Option<(usize, usize)>) -> Vec<u8> {
+    let (status, slice, content_range) = match range {
+        Some((start, end)) => (
+            "206 Partial Content",
+            &body[start..=end],
+            format!("Content-Range: bytes {start}-{end}/{}\r\n", body.len()),
+        ),
+        None => ("200 OK", body, String::new()),
+    };
+    let mut response = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
+         {content_range}ETag: \"e{}\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
+         Accept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+        slice.len(),
         body.len()
     )
+    .into_bytes();
+    response.extend_from_slice(slice);
+    response
+}
+
+/// The inclusive byte range a `Range: bytes=…` request header asks of a `len`-byte body.
+fn requested_range(head: &str, len: usize) -> Option<(usize, usize)> {
+    let spec = head.lines().skip(1).find_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        if !name.trim().eq_ignore_ascii_case("range") {
+            return None;
+        }
+        value.trim().strip_prefix("bytes=")
+    })?;
+    let (start, end) = spec.split_once('-')?;
+    let last = len.checked_sub(1)?;
+    let range = match (start.parse::<usize>().ok(), end.parse::<usize>().ok()) {
+        (Some(start), Some(end)) => (start, end.min(last)),
+        (Some(start), None) => (start, last),
+        (None, Some(suffix)) => (len.saturating_sub(suffix), last),
+        (None, None) => return None,
+    };
+    (range.0 <= range.1).then_some(range)
 }
 
 /// The `ListObjectsV2` answer for the listing `query`, over every served key under
 /// its `prefix` that sorts after its `start-after` marker.
-fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -> String {
+fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, Vec<u8>)]) -> String {
     let param = |key: &str| {
         url::form_urlencoded::parse(query.as_bytes())
             .find(|(name, _)| name == key)

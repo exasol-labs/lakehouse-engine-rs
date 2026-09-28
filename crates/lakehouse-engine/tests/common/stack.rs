@@ -75,6 +75,50 @@ pub fn minio_url_internal() -> String {
     std::env::var("MINIO_URL_INTERNAL").unwrap_or_else(|_| "http://minio:9000".to_string())
 }
 
+/// `sts-stub` host port. `LH_STS_STUB_PORT`, default 19090.
+pub fn sts_stub_port() -> u16 {
+    port_from_env("LH_STS_STUB_PORT", 19090)
+}
+
+/// Base URL of the local STS stub as seen from the test process (host-side).
+pub fn sts_stub_url() -> String {
+    std::env::var("STS_STUB_URL")
+        .unwrap_or_else(|_| format!("http://localhost:{}", sts_stub_port()))
+}
+
+/// The STS stub's `aws_sts_endpoint` as reached from inside the Exasol UDF
+/// (Docker network) — what a role CONNECTION's password names.
+pub fn sts_stub_url_internal() -> String {
+    std::env::var("STS_STUB_URL_INTERNAL").unwrap_or_else(|_| "http://sts-stub:8080".to_string())
+}
+
+// The assume-role stub identity, mirroring docker-compose.yml's `minio-init` (the
+// base user with no bucket policy) and `sts-stub` (the role and the external id it
+// requires) services. The external id deliberately holds `+`, `=`, `/`, `:`, and `@`.
+pub const ASSUME_ROLE_BASE_ACCESS_KEY: &str = "lhassumebase";
+pub const ASSUME_ROLE_BASE_SECRET_KEY: &str = "lhassumebasesecret123";
+pub const ASSUME_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo";
+pub const ASSUME_ROLE_EXTERNAL_ID: &str = "lh+ext=id/2026:demo@example";
+
+/// Number of `AssumeRole` attempts the stub has recorded so far
+/// (`GET /__requests`), so a test can assert it grew after a role query.
+pub fn sts_stub_request_count() -> u64 {
+    let url = format!("{}/__requests", sts_stub_url());
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .expect("build HTTP client");
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .unwrap_or_else(|e| panic!("GET {url}: {e}"))
+        .json()
+        .unwrap_or_else(|e| panic!("parse {url} response as JSON: {e}"));
+    body["count"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{url} response carries no numeric 'count': {body}"))
+}
+
 /// The Exasol container name (for `docker exec` credential extraction).
 ///
 /// Resolution order:
@@ -200,6 +244,13 @@ pub fn wait_for_iceberg_catalog() {
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
+/// Assert the STS stub is reachable; panic if not — the assume-role suite
+/// FAILS, not skips, like every other local Docker E2E dependency.
+pub fn wait_for_sts_stub() {
+    let url = format!("{}/health", sts_stub_url());
+    wait_for_url(&url, DEFAULT_TIMEOUT);
+}
+
 /// Upload a file to BucketFS via HTTPS PUT.
 ///
 /// The file surfaces inside the DB at `/buckets/bfsdefault/default/<name>`.
@@ -321,6 +372,12 @@ pub struct CatalogConnectionPassword {
     pub account_name: Option<String>,
     /// Azure storage account key (ADLS static credential). Absent when not supplied.
     pub account_key: Option<String>,
+    /// AWS IAM role to assume before signing catalog/storage requests. Absent when not supplied.
+    pub aws_assume_role_arn: Option<String>,
+    /// STS `ExternalId` for the assumed role. Requires `aws_assume_role_arn`. Absent when not supplied.
+    pub aws_external_id: Option<String>,
+    /// STS endpoint override (e.g. the local `sts-stub`). Requires `aws_assume_role_arn`. Absent when not supplied.
+    pub aws_sts_endpoint: Option<String>,
 }
 
 impl CatalogConnectionPassword {
@@ -361,6 +418,15 @@ impl CatalogConnectionPassword {
         }
         if let Some(account_key) = &self.account_key {
             obj["account_key"] = serde_json::Value::String(account_key.clone());
+        }
+        if let Some(role_arn) = &self.aws_assume_role_arn {
+            obj["aws_assume_role_arn"] = serde_json::Value::String(role_arn.clone());
+        }
+        if let Some(external_id) = &self.aws_external_id {
+            obj["aws_external_id"] = serde_json::Value::String(external_id.clone());
+        }
+        if let Some(sts_endpoint) = &self.aws_sts_endpoint {
+            obj["aws_sts_endpoint"] = serde_json::Value::String(sts_endpoint.clone());
         }
         // Escape single quotes for safe SQL embedding (SQL string literal).
         obj.to_string().replace('\'', "''")
@@ -453,6 +519,9 @@ mod catalog_connection_password_tests {
             "scope",
             "account_name",
             "account_key",
+            "aws_assume_role_arn",
+            "aws_external_id",
+            "aws_sts_endpoint",
         ] {
             assert!(
                 parsed.get(key).is_none(),
@@ -504,5 +573,25 @@ mod catalog_connection_password_tests {
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["account_name"], "mystorageacct");
         assert_eq!(parsed["account_key"], "base64-encoded-key");
+    }
+
+    #[test]
+    fn serializes_assume_role_fields_when_present() {
+        let password = CatalogConnectionPassword {
+            aws_assume_role_arn: Some(
+                "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo".to_string(),
+            ),
+            aws_external_id: Some("lh+ext=id/2026:demo@example".to_string()),
+            aws_sts_endpoint: Some("http://sts-stub:8080".to_string()),
+            ..base_password()
+        };
+        let json_str = password.to_sql_password_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            parsed["aws_assume_role_arn"],
+            "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo"
+        );
+        assert_eq!(parsed["aws_external_id"], "lh+ext=id/2026:demo@example");
+        assert_eq!(parsed["aws_sts_endpoint"], "http://sts-stub:8080");
     }
 }

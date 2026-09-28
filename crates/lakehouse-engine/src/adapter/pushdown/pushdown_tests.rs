@@ -20,6 +20,18 @@ const VENDED_SK: &str = "VENDED_SK_SENTINEL";
 const VENDED_TOK: &str = "VENDED_TOKEN_SENTINEL";
 const VENDED_REGION: &str = "eu-west-2";
 
+/// Auth field NAMES as JSON keys, matched as `"<field>":` to avoid false positives
+/// from legitimate substrings (e.g. `"session_token"` contains `"token"`). `scope`
+/// is too short and appears in storage endpoint strings, so it is not listed.
+const CATALOG_AUTH_KEYS: [&str; 6] = [
+    "\"token\":",
+    "\"credential\":",
+    "\"client_id\":",
+    "\"client_secret\":",
+    "\"oauth2_server_uri\":",
+    "\"oauth2-server-uri\":",
+];
+
 /// Scenario: Catalog auth props are never placed in any scan spec, even when
 /// `use_vended_credentials` is enabled and vended creds are in the storage.
 ///
@@ -53,19 +65,7 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
 
     let json = spec.to_json();
 
-    // Auth field NAMES must never appear as JSON keys in the serialized spec.
-    // Check for the exact key pattern `"<field>":` to avoid false-positives
-    // from legitimate substrings (e.g. `"session_token"` contains `"token"`).
-    for field in [
-        "\"token\":",
-        "\"credential\":",
-        "\"client_id\":",
-        "\"client_secret\":",
-        "\"oauth2_server_uri\":",
-        "\"oauth2-server-uri\":",
-        // scope is too short and appears in storage endpoint strings, so it
-        // is checked by key name only, above, not by a sentinel value.
-    ] {
+    for field in CATALOG_AUTH_KEYS {
         assert!(
             !json.contains(field),
             "ScanSpec JSON must not carry auth field key '{field}': {json}"
@@ -80,6 +80,53 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
     assert!(
         json.contains(VENDED_TOK),
         "vended session_token must be in storage: {json}"
+    );
+}
+
+/// Scenario: Catalog auth props are never placed in a role CONNECTION's scan spec, whose session storage travels only sealed.
+#[test]
+fn catalog_auth_secrets_never_in_a_role_scan_spec() {
+    const CATALOG_TOKEN: &str = "ROLE_CATALOG_TOKEN_SENTINEL";
+    let role_creds = ConnectionCreds {
+        access_key: SENTINEL_ACCESS_KEY.into(),
+        secret_key: SENTINEL_SECRET_KEY.into(),
+        session_token: Some(SENTINEL_SESSION_TOKEN.into()),
+        token: Some(CATALOG_TOKEN.into()),
+        aws_assume_role_arn: Some("arn:aws:iam::123456789012:role/lakehouse-reader".into()),
+        ..unauthenticated_creds()
+    };
+    let session_storage = crate::adapter::connection::storage_block(&role_creds, true);
+    let role_spec = ScanSpec {
+        common: CommonScanSpec {
+            projection: vec!["ID".into()],
+            storage: scan_storage_for(
+                &role_creds,
+                TEST_CONNECTION_NAME,
+                true,
+                &session_storage,
+                Some(&test_sealing_key()),
+            )
+            .expect("a role CONNECTION carries key material"),
+            ..Default::default()
+        },
+        files: vec![FileEntry::new(
+            "s3://warehouse/db/events/part-00000.parquet",
+            1,
+        )],
+    };
+    let role_json = role_spec.to_json();
+    for field in CATALOG_AUTH_KEYS {
+        assert!(!role_json.contains(field), "{field} in: {role_json}");
+    }
+    assert!(!role_json.contains(CATALOG_TOKEN), "{role_json}");
+    assert_no_sentinel_secret_leaked(&role_json);
+    let ScanStorage::Sealed { payload, .. } = &role_spec.common.storage else {
+        panic!("a role storage block must be sealed: {role_json}");
+    };
+    assert_eq!(
+        crate::scan::sealed::unseal_storage(payload, &test_sealing_key()).unwrap(),
+        session_storage,
+        "the envelope carries storage material only"
     );
 }
 
@@ -2114,6 +2161,9 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         account_name: None,
         account_key: None,
         sas_token: None,
+        aws_assume_role_arn: None,
+        aws_external_id: None,
+        aws_sts_endpoint: None,
     };
 
     let catalog = CatalogProps {
@@ -3385,6 +3435,8 @@ const SENTINEL_CONNECTION_NAME: &str = "SENTINEL_SCAN_STORAGE_CONNECTION";
 const SENTINEL_ACCESS_KEY: &str = "SENTINEL_ACCESS_KEY_VALUE";
 const SENTINEL_SECRET_KEY: &str = "SENTINEL_SECRET_KEY_VALUE";
 const SENTINEL_SESSION_TOKEN: &str = "SENTINEL_SESSION_TOKEN_VALUE";
+const SENTINEL_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/sentinel-role";
+const SENTINEL_EXTERNAL_ID: &str = "SENTINEL_EXTERNAL_ID_VALUE";
 const SENTINEL_PASSWORD: &str = r#"{"warehouse":"wh","secret_key":"SENTINEL_SECRET_KEY_VALUE"}"#;
 
 fn assert_no_sentinel_secret_leaked(text: &str) {
@@ -3521,4 +3573,106 @@ fn no_connection_credential_reaches_the_generated_sql() {
     };
     assert_eq!(&unseal_storage(payload, &key).unwrap(), &vended_effective);
     assert_no_sentinel_secret_leaked(&vended_sql);
+
+    let role_creds = ConnectionCreds {
+        aws_assume_role_arn: Some(SENTINEL_ROLE_ARN.into()),
+        aws_external_id: Some(SENTINEL_EXTERNAL_ID.into()),
+        ..sentinel_creds(false)
+    };
+    let role_effective = sentinel_effective_backend(&role_creds);
+    let role_storage = scan_storage_for(
+        &role_creds,
+        SENTINEL_CONNECTION_NAME,
+        true,
+        &role_effective,
+        Some(&key),
+    )
+    .expect("role selection");
+    let role_sql = dispatch_result_for_body(row_scan_body(), Vec::new(), &role_storage)
+        .expect("role dispatch");
+    assert!(role_sql.contains("\"sealed\":{\"name\":"), "{role_sql}");
+    assert!(!role_sql.contains("\"connection\":{"), "{role_sql}");
+    let common: Json = serde_json::from_str(common_arg_literal(&role_sql)).unwrap();
+    let selected: ScanStorage = serde_json::from_value(common["storage"].clone()).unwrap();
+    let ScanStorage::Sealed { payload, .. } = &selected else {
+        panic!("expected Sealed, got {selected:?}");
+    };
+    assert_eq!(&unseal_storage(payload, &key).unwrap(), &role_effective);
+    assert_no_sentinel_secret_leaked(&role_sql);
+    assert!(!role_sql.contains(SENTINEL_EXTERNAL_ID), "{role_sql}");
+}
+
+/// Scenario: a direct-storage pushdown through a role CONNECTION carries its storage block only inside the sealed envelope, never a CONNECTION reference.
+#[tokio::test]
+async fn a_direct_storage_role_connection_seals_its_storage_block() {
+    use crate::adapter::tests::parquet_fixture::{nullable, parquet_bytes};
+    use arrow::datatypes::DataType;
+
+    let StorageBackend::S3(served) = binary_object_endpoint(
+        "warehouse",
+        vec![(
+            "events/part-0.parquet".to_string(),
+            parquet_bytes(vec![nullable("ID", DataType::Int64)], 1),
+        )],
+    )
+    .await
+    else {
+        panic!("the object endpoint answers as S3 storage");
+    };
+    let creds = ConnectionCreds {
+        endpoint: served.endpoint,
+        region: "us-east-1".into(),
+        access_key: SENTINEL_ACCESS_KEY.into(),
+        secret_key: SENTINEL_SECRET_KEY.into(),
+        session_token: Some(SENTINEL_SESSION_TOKEN.into()),
+        path_style: Some(true),
+        aws_assume_role_arn: Some(SENTINEL_ROLE_ARN.into()),
+        aws_external_id: Some(SENTINEL_EXTERNAL_ID.into()),
+        ..Default::default()
+    };
+    let conn = ResolvedConnectionConfig {
+        catalog_uri: "s3://warehouse".to_string(),
+        storage: crate::adapter::connection::storage_block(&creds, true),
+        creds,
+        allow_http: true,
+        catalog_kind: CatalogKind::DirectStorage,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
+    };
+    let request = serde_json::json!({
+        "involvedTables": [{
+            "name": "EVENTS",
+            "columns": [{"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
+        }],
+        "pushdownRequest": {
+            "type": "select",
+            "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+            "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
+        },
+    });
+    let catalog = CatalogProps {
+        warehouse: String::new(),
+        table: "events".into(),
+    };
+
+    let result = handle_pushdown(
+        &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
+    )
+    .await
+    .expect("a direct-storage table with one data file plans a scan");
+    let sql = result["sql"].as_str().expect("the response carries SQL");
+
+    let common: Json = serde_json::from_str(common_arg_literal(sql)).unwrap();
+    let selected: ScanStorage = serde_json::from_value(common["storage"].clone()).unwrap();
+    let ScanStorage::Sealed { name, payload } = &selected else {
+        panic!("a role CONNECTION's direct-storage block must be sealed, got {selected:?}");
+    };
+    assert_eq!(name, TEST_CONNECTION_NAME);
+    assert_eq!(
+        &unseal_storage(payload, &test_sealing_key()).unwrap(),
+        &conn.storage
+    );
+    assert!(!sql.contains("\"connection\":{"), "{sql}");
+    assert_no_sentinel_secret_leaked(sql);
+    assert!(!sql.contains(SENTINEL_EXTERNAL_ID), "{sql}");
 }

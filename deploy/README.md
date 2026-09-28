@@ -59,6 +59,31 @@ data-transfer cost. The only standing cost is S3 storage, about 110 GiB for the 
 > the 80 GB label). Row-count ratios (10:20:30:40:80) are exact. Bump the targets or the
 > calibration sample for precise on-disk sizes.
 
+### Cloud assume-role E2E (opt-in, issue #139)
+
+`data-stack` also provisions an assume-role base IAM user (granted only `sts:AssumeRole`, via
+`aws_iam_user_policy.assume_role_base_can_assume`) and a role
+(`aws_iam_role.assume_role_target`) whose trust policy requires the `assume_role_external_id`
+`terraform.tfvars` value and which carries the same `engine_reader` Glue/S3 read policy. Both
+land in SSM under `${ssm_root}/assume_role/*`:
+
+| SSM parameter | Env var (`cloud_e2e_test.rs`) |
+|---|---|
+| `${ssm_root}/assume_role/base_access_key_id` | `ASSUME_ROLE_BASE_ACCESS_KEY_ID` |
+| `${ssm_root}/assume_role/base_secret_access_key` | `ASSUME_ROLE_BASE_SECRET_ACCESS_KEY` |
+| `${ssm_root}/assume_role/role_arn` | `AWS_ASSUME_ROLE_ARN` |
+| `${ssm_root}/assume_role/external_id` | `AWS_EXTERNAL_ID` |
+
+`crates/lakehouse-engine/tests/cloud_e2e_test.rs`'s `cloud_assume_role_reaches_glue_and_s3_through_the_role`
+and `cloud_assume_role_base_identity_alone_is_denied` tests read these four variables (fetch each
+with `aws ssm get-parameter --with-decryption`), on top of the Glue variables (`GLUE_CATALOG_URI`,
+`GLUE_WAREHOUSE`, `GLUE_TABLE`, `AWS_REGION`, `EXASOL_HOST`, `LH_EXASOL_PASSWORD`) the other cloud
+tests already need. Any one absent and both tests skip, naming it:
+
+```bash
+cargo test -p lakehouse-engine --features cloud-e2e --test cloud_e2e_test cloud_assume_role -- --test-threads=1
+```
+
 ## 2. Test cluster (ephemeral — per benchmark)
 
 ```bash

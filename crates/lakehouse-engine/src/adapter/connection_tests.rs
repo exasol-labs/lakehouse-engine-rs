@@ -1669,3 +1669,224 @@ fn direct_storage_accepts_matching_scheme_and_credential_shape() {
     read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
         .expect("an abfss:// address with Azure-shaped credentials must be accepted");
 }
+
+// ---------------------------------------------------------------------------
+// AWS IAM role assumption fields
+// ---------------------------------------------------------------------------
+
+const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
+const EXTERNAL_ID: &str = "EXTERNAL_ID_SENTINEL";
+const BASE_SECRET: &str = "BASE_SECRET_SENTINEL";
+
+/// A role CONNECTION carrying the base key pair, extended by `extra` fields.
+fn role_password(extra: serde_json::Value) -> String {
+    let mut password = serde_json::json!({
+        "warehouse": "wh",
+        "region": "us-east-1",
+        "access_key": "AKIABASEIDENTITY",
+        "secret_key": BASE_SECRET,
+        "aws_assume_role_arn": ROLE_ARN,
+    });
+    password
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    password.to_string()
+}
+
+/// Scenario: the three role fields are parsed as strings, an empty string is absent, and `Debug` redacts the external id.
+#[test]
+fn assume_role_fields_are_parsed_and_an_empty_string_is_absent() {
+    let stated = role_password(serde_json::json!({
+        "aws_external_id": EXTERNAL_ID,
+        "aws_sts_endpoint": "https://sts.eu-west-1.amazonaws.com",
+    }));
+    let resolved = read_connection(
+        &with_conn("http://catalog.example.com", &stated),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect("a role CONNECTION with the base key pair must be accepted");
+    assert_eq!(
+        resolved.creds.aws_assume_role_arn.as_deref(),
+        Some(ROLE_ARN)
+    );
+    assert_eq!(resolved.creds.aws_external_id.as_deref(), Some(EXTERNAL_ID));
+    assert_eq!(
+        resolved.creds.aws_sts_endpoint.as_deref(),
+        Some("https://sts.eu-west-1.amazonaws.com")
+    );
+    let rendered = format!("{resolved:?}");
+    assert!(!rendered.contains(EXTERNAL_ID), "{rendered}");
+
+    let empty = serde_json::json!({
+        "warehouse": "wh",
+        "aws_assume_role_arn": "",
+        "aws_external_id": "",
+        "aws_sts_endpoint": "",
+    })
+    .to_string();
+    let resolved = read_connection(
+        &with_conn("http://catalog.example.com", &empty),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect("empty role fields are absent, so they neither require a role nor a key pair");
+    assert_eq!(resolved.creds.aws_assume_role_arn, None);
+    assert_eq!(resolved.creds.aws_external_id, None);
+    assert_eq!(resolved.creds.aws_sts_endpoint, None);
+}
+
+/// Scenario: an external id without a role is rejected, naming `aws_external_id` and the role it requires, with no credential value.
+#[test]
+fn external_id_without_a_role_is_rejected() {
+    let password = serde_json::json!({
+        "warehouse": "wh",
+        "secret_key": BASE_SECRET,
+        "aws_external_id": EXTERNAL_ID,
+    })
+    .to_string();
+
+    let err = read_connection(
+        &with_conn("http://catalog.example.com", &password),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect_err("an external id without a role must be rejected")
+    .to_string();
+
+    assert!(
+        err.contains("aws_external_id"),
+        "must name the field: {err}"
+    );
+    assert!(
+        err.contains("requires aws_assume_role_arn") || err.contains("require aws_assume_role_arn"),
+        "must state the role it requires: {err}"
+    );
+    assert!(!err.contains(EXTERNAL_ID), "{err}");
+    assert!(!err.contains(BASE_SECRET), "{err}");
+}
+
+/// Scenario: a role alone and a role with an external id are both accepted.
+#[test]
+fn a_role_without_an_external_id_is_accepted() {
+    for extra in [
+        serde_json::json!({}),
+        serde_json::json!({ "aws_external_id": EXTERNAL_ID }),
+    ] {
+        let password = role_password(extra.clone());
+        read_connection(
+            &with_conn("http://catalog.example.com", &password),
+            Some("MY_CONN"),
+            CatalogKind::IcebergRest,
+        )
+        .unwrap_or_else(|err| panic!("a role CONNECTION with {extra} must be accepted: {err}"));
+    }
+}
+
+/// Scenario: a role CONNECTION omitting the base key pair is rejected, naming each omitted field and the no-ambient-credential rule, ahead of the SigV4 check.
+#[test]
+fn assume_role_requires_the_base_key_pair_and_reads_no_ambient_credential() {
+    for use_sigv4 in [false, true] {
+        for omitted in [
+            vec!["access_key"],
+            vec!["secret_key"],
+            vec!["access_key", "secret_key"],
+        ] {
+            let mut password: serde_json::Value = serde_json::from_str(&role_password(
+                serde_json::json!({ "use_sigv4": use_sigv4 }),
+            ))
+            .unwrap();
+            for field in &omitted {
+                password.as_object_mut().unwrap().remove(*field);
+            }
+
+            let err = read_connection(
+                &with_conn("http://catalog.example.com", &password.to_string()),
+                Some("MY_CONN"),
+                CatalogKind::IcebergRest,
+            )
+            .expect_err("a role CONNECTION without the base key pair must be rejected")
+            .to_string();
+
+            assert!(
+                err.contains(&format!("missing field(s) {};", omitted.join(", "))),
+                "must name exactly the omitted field(s) {omitted:?} (use_sigv4={use_sigv4}): {err}"
+            );
+            assert!(
+                err.contains("the CONNECTION's own access_key and secret_key"),
+                "must state which identity assumes the role: {err}"
+            );
+            assert!(
+                err.contains("no ambient AWS credential")
+                    && err.contains("environment variable")
+                    && err.contains("instance profile"),
+                "must state that no ambient credential is read: {err}"
+            );
+            assert!(!err.contains(BASE_SECRET), "{err}");
+        }
+    }
+}
+
+/// Scenario: an STS endpoint override without a role is rejected, naming `aws_sts_endpoint` and the role it requires.
+#[test]
+fn sts_endpoint_without_a_role_is_rejected() {
+    let password = serde_json::json!({
+        "warehouse": "wh",
+        "secret_key": BASE_SECRET,
+        "aws_sts_endpoint": "http://sts-stub:8080",
+    })
+    .to_string();
+
+    let err = read_connection(
+        &with_conn("http://catalog.example.com", &password),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect_err("an STS endpoint without a role must be rejected")
+    .to_string();
+
+    assert!(
+        err.contains("aws_sts_endpoint"),
+        "must name the field: {err}"
+    );
+    assert!(
+        err.contains("requires aws_assume_role_arn") || err.contains("require aws_assume_role_arn"),
+        "must state the role it requires: {err}"
+    );
+    assert!(!err.contains(BASE_SECRET), "{err}");
+}
+
+/// Scenario: the unchanged `path_style` guard skips a role CONNECTION that vends and still rejects one that does not.
+#[test]
+fn the_path_style_guard_skips_a_role_with_vending() {
+    let endpoint_without_path_style = |use_vended_credentials: bool| {
+        role_password(serde_json::json!({
+            "endpoint": "http://s3.example.com",
+            "use_vended_credentials": use_vended_credentials,
+        }))
+    };
+
+    read_connection(
+        &with_conn(
+            "http://catalog.example.com",
+            &endpoint_without_path_style(true),
+        ),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect("a vending role CONNECTION must skip the path_style guard");
+
+    let err = read_connection(
+        &with_conn(
+            "http://catalog.example.com",
+            &endpoint_without_path_style(false),
+        ),
+        Some("MY_CONN"),
+        CatalogKind::IcebergRest,
+    )
+    .expect_err("a non-vending role CONNECTION must still hit the path_style guard")
+    .to_string();
+    assert!(err.contains("path_style"), "{err}");
+    assert!(!err.contains(BASE_SECRET), "{err}");
+}

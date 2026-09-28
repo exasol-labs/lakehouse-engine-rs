@@ -1,7 +1,7 @@
 use super::super::scalar_over_agg::cast_merge_items;
 use super::super::test_support::*;
 use super::*;
-use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey};
+use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey, StorageProps};
 use vs_expression::render_df_filter_safe;
 
 /// `walk_column_nodes` fires its callback exactly once per `column` node
@@ -5206,4 +5206,143 @@ fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
         "must project the single rendered expression, not the full base row: {items:?}"
     );
     assert!(matches!(items[0], ProjectionItem::Expr { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// scan_storage_for: the wire variant under vending and an assumed role
+// ---------------------------------------------------------------------------
+
+const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
+const SESSION_AK: &str = "ASIASESSIONKEYSENTINEL";
+const SESSION_SK: &str = "SESSION_SECRET_SENTINEL";
+const SESSION_TOKEN: &str = "SESSION_TOKEN_SENTINEL";
+
+/// The credential set a request acts as once `resolve_aws_identity` has run: the
+/// session key triple, with the role and `use_vended_credentials` as stated.
+fn effective_creds(names_role: bool, use_vended_credentials: bool) -> ConnectionCreds {
+    ConnectionCreds {
+        access_key: SESSION_AK.into(),
+        secret_key: SESSION_SK.into(),
+        session_token: Some(SESSION_TOKEN.into()),
+        use_vended_credentials,
+        aws_assume_role_arn: names_role.then(|| ROLE_ARN.to_string()),
+        ..unauthenticated_creds()
+    }
+}
+
+fn select(creds: &ConnectionCreds, effective: &StorageBackend) -> Result<ScanStorage, UdfError> {
+    scan_storage_for(
+        creds,
+        TEST_CONNECTION_NAME,
+        true,
+        effective,
+        Some(&test_sealing_key()),
+    )
+}
+
+fn sealed_payload(selected: ScanStorage) -> String {
+    match selected {
+        ScanStorage::Sealed { name, payload } => {
+            assert_eq!(name, TEST_CONNECTION_NAME);
+            payload
+        }
+        other => panic!("expected the sealed variant, got {other:?}"),
+    }
+}
+
+/// Scenario: the CONNECTION reference is selected only when the set neither vends nor names a role; otherwise the block is sealed, or refused without key material.
+#[test]
+fn scan_storage_variant_follows_vending_and_the_role() {
+    for (names_role, vending) in [(false, false), (true, false), (false, true), (true, true)] {
+        let creds = effective_creds(names_role, vending);
+        let selected = select(
+            &creds,
+            &crate::adapter::connection::storage_block(&creds, true),
+        )
+        .expect("key material is present");
+        match (&selected, names_role || vending) {
+            (ScanStorage::Connection { name, allow_http }, false) => {
+                assert_eq!(name, TEST_CONNECTION_NAME);
+                assert!(*allow_http);
+            }
+            (ScanStorage::Sealed { .. }, true) => {}
+            (other, _) => panic!("role={names_role} vending={vending} selected {other:?}"),
+        }
+    }
+
+    for (names_role, vending) in [(false, true), (true, false), (true, true)] {
+        let creds = effective_creds(names_role, vending);
+        let err = scan_storage_for(
+            &creds,
+            TEST_CONNECTION_NAME,
+            true,
+            &crate::adapter::connection::storage_block(&creds, true),
+            None,
+        )
+        .expect_err("a credential the CONNECTION does not state is refused without key material");
+        let message = err.to_string();
+        for secret in [SESSION_SK, SESSION_TOKEN] {
+            assert!(!message.contains(secret), "{message}");
+        }
+    }
+}
+
+/// Scenario: a role CONNECTION that does not vend seals its session backend, which unseals field-for-field; one that vends seals the vended backend instead.
+#[test]
+fn a_role_storage_block_is_sealed_and_unseals_to_the_session_backend() {
+    let creds = effective_creds(true, false);
+    let session_backend = crate::adapter::connection::storage_block(&creds, true);
+    let payload = sealed_payload(select(&creds, &session_backend).expect("seal the session"));
+    for secret in [SESSION_AK, SESSION_SK, SESSION_TOKEN] {
+        assert!(!payload.contains(secret), "{payload}");
+    }
+    let opened = crate::scan::sealed::unseal_storage(&payload, &test_sealing_key())
+        .expect("the envelope opens under the CONNECTION's key");
+    assert_eq!(opened, session_backend);
+    let StorageBackend::S3(props) = &opened else {
+        panic!("a key-pair CONNECTION seals S3 storage, got {opened:?}");
+    };
+    assert_eq!(props.access_key, SESSION_AK);
+    assert_eq!(props.secret_key, SESSION_SK);
+    assert_eq!(props.session_token.as_deref(), Some(SESSION_TOKEN));
+    assert_eq!(props.endpoint, "http://minio:9000");
+    assert_eq!(props.region, "us-east-1");
+    assert!(props.path_style);
+
+    let vended = StorageBackend::S3(StorageProps {
+        endpoint: "https://s3.eu-west-2.amazonaws.com".into(),
+        region: "eu-west-2".into(),
+        access_key: "VENDED_AK_SENTINEL".into(),
+        secret_key: "VENDED_SK_SENTINEL".into(),
+        session_token: Some("VENDED_TOKEN_SENTINEL".into()),
+        ..Default::default()
+    });
+    let payload =
+        sealed_payload(select(&effective_creds(true, true), &vended).expect("seal vended storage"));
+    assert_eq!(
+        crate::scan::sealed::unseal_storage(&payload, &test_sealing_key())
+            .expect("the envelope opens under the CONNECTION's key"),
+        vended,
+        "a vending role CONNECTION seals the vended backend, not the session"
+    );
+}
+
+/// Scenario: an empty `aws_assume_role_arn` names no role, so a non-vending set is referenced by CONNECTION name, not sealed.
+#[test]
+fn an_empty_role_arn_without_vending_selects_the_connection_reference() {
+    let creds = ConnectionCreds {
+        aws_assume_role_arn: Some(String::new()),
+        ..effective_creds(false, false)
+    };
+
+    let selected = select(
+        &creds,
+        &crate::adapter::connection::storage_block(&creds, true),
+    )
+    .expect("a set naming no role needs no sealing key");
+
+    assert!(
+        matches!(&selected, ScanStorage::Connection { name, allow_http: true } if name == TEST_CONNECTION_NAME),
+        "an empty role ARN must select the CONNECTION reference, got {selected:?}"
+    );
 }

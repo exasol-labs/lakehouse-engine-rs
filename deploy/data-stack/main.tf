@@ -140,6 +140,55 @@ resource "aws_iam_access_key" "engine_reader" {
   user = aws_iam_user.engine_reader.name
 }
 
+# --- Assume-role base identity + role (issue #139: STS AssumeRole creds) ----
+# The base user can do nothing but assume the role below; Glue/S3 read only
+# reaches it through the role's own engine_reader policy attachment.
+resource "aws_iam_user" "assume_role_base" {
+  name = "${local.prefix}-assume-role-base"
+  tags = { Name = "${local.prefix}-assume-role-base" }
+}
+
+resource "aws_iam_access_key" "assume_role_base" {
+  user = aws_iam_user.assume_role_base.name
+}
+
+resource "aws_iam_user_policy" "assume_role_base_can_assume" {
+  name = "${local.prefix}-assume-role-base-policy"
+  user = aws_iam_user.assume_role_base.name
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Sid      = "AssumeRoleOnly"
+      Effect   = "Allow"
+      Action   = "sts:AssumeRole"
+      Resource = aws_iam_role.assume_role_target.arn
+    }]
+  })
+}
+
+resource "aws_iam_role" "assume_role_target" {
+  name = "${local.prefix}-assume-role-target"
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [{
+      Effect    = "Allow"
+      Principal = { AWS = aws_iam_user.assume_role_base.arn }
+      Action    = "sts:AssumeRole"
+      Condition = {
+        StringEquals = {
+          "sts:ExternalId" = var.assume_role_external_id
+        }
+      }
+    }]
+  })
+  tags = { Name = "${local.prefix}-assume-role-target" }
+}
+
+resource "aws_iam_role_policy_attachment" "assume_role_target_engine_reader" {
+  role       = aws_iam_role.assume_role_target.name
+  policy_arn = aws_iam_policy.engine_reader.arn
+}
+
 # --- SSM parameters (single source of truth for secrets.sh + bench) ---------
 resource "aws_ssm_parameter" "engine_access_key_id" {
   name  = "${local.ssm_root}/engine/access_key_id"
@@ -193,6 +242,30 @@ resource "aws_ssm_parameter" "erp_namespace" {
   name  = "${local.ssm_root}/namespace/erp"
   type  = "String"
   value = var.erp_db_name
+}
+
+resource "aws_ssm_parameter" "assume_role_base_access_key_id" {
+  name  = "${local.ssm_root}/assume_role/base_access_key_id"
+  type  = "SecureString"
+  value = aws_iam_access_key.assume_role_base.id
+}
+
+resource "aws_ssm_parameter" "assume_role_base_secret_access_key" {
+  name  = "${local.ssm_root}/assume_role/base_secret_access_key"
+  type  = "SecureString"
+  value = aws_iam_access_key.assume_role_base.secret
+}
+
+resource "aws_ssm_parameter" "assume_role_arn" {
+  name  = "${local.ssm_root}/assume_role/role_arn"
+  type  = "String"
+  value = aws_iam_role.assume_role_target.arn
+}
+
+resource "aws_ssm_parameter" "assume_role_external_id" {
+  name  = "${local.ssm_root}/assume_role/external_id"
+  type  = "SecureString"
+  value = var.assume_role_external_id
 }
 
 # --- Temporary data-gen EC2 (count gated; self-terminates) ------------------

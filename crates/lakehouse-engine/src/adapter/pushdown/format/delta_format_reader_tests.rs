@@ -33,6 +33,9 @@ fn creds(use_vended_credentials: bool) -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        aws_assume_role_arn: None,
+        aws_external_id: None,
+        aws_sts_endpoint: None,
     }
 }
 
@@ -56,12 +59,19 @@ fn delta_table(
 
 /// Resolve one table's scan and answer the user-error message it fails with.
 async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
-    let creds = creds(use_vended_credentials);
+    refusal_as(table, &creds(use_vended_credentials), &sample_storage()).await
+}
+
+/// [`refusal`] for the effective credential set `creds`, whose static storage is `storage`.
+async fn refusal_as(
+    table: &CatalogTable,
+    creds: &ConnectionCreds,
+    storage: &StorageBackend,
+) -> String {
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
-    let storage = sample_storage();
     let connection = ConnectionStorage {
-        storage: &storage,
-        creds: &creds,
+        storage,
+        creds,
         allow_http: true,
     };
     let reader = DeltaFormatReader::new(&session, table, &connection);
@@ -85,14 +95,33 @@ async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
 /// would have built that store and failed on the transaction log, so a message naming
 /// the log — or one carrying the static credential — is the observable signature of the
 /// fallback this refusal exists to prevent.
+///
+/// A role CONNECTION that vends takes the same vended path: its session is only the
+/// effective static credential, so the refusal must not fall back to it either.
 #[tokio::test]
 async fn vending_without_a_vending_key_errors_and_never_falls_back_to_static() {
+    const SESSION_SECRET: &str = "SESSION_SECRET_SENTINEL";
+    const SESSION_TOKEN: &str = "SESSION_TOKEN_SENTINEL";
+    let role = ConnectionCreds {
+        access_key: "ASIASESSIONKEYSENTINEL".into(),
+        secret_key: SESSION_SECRET.into(),
+        session_token: Some(SESSION_TOKEN.into()),
+        aws_assume_role_arn: Some("arn:aws:iam::123456789012:role/lakehouse-reader".into()),
+        ..creds(true)
+    };
+    let role_storage = crate::adapter::connection::storage_block(&role, true);
+
     for absent_key in [None, Some("")] {
-        let message = refusal(
-            &delta_table(Some("s3://bucket/cat/sch/orders"), absent_key),
-            true,
-        )
-        .await;
+        let table = delta_table(Some("s3://bucket/cat/sch/orders"), absent_key);
+        let role_message = refusal_as(&table, &role, &role_storage).await;
+        let message = refusal(&table, true).await;
+        assert_eq!(
+            role_message, message,
+            "a role must leave the vended path's refusal unchanged"
+        );
+        for secret in [SESSION_SECRET, SESSION_TOKEN] {
+            assert!(!role_message.contains(secret), "{role_message}");
+        }
 
         assert!(
             message.contains(TABLE_NAME),

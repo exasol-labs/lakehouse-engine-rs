@@ -125,7 +125,7 @@ lakehouse-engine/
 ├── specs/                  # mission.md and spec library (speq)
 ├── crates/
 │   ├── lakehouse-engine/   # Iceberg + Delta file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
-│   ├── lakehouse-catalog/  # Iceberg REST + Unity Catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
+│   ├── lakehouse-catalog/  # Iceberg REST + Unity Catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing, AWS STS role assumption
 │   └── vs-expression/      # expression-translation crate, shared with the sibling project
 ├── Cargo.toml      # workspace manifest
 └── Makefile        # cross-udf-build, test-e2e
@@ -173,6 +173,7 @@ simultaneously. No state survives query completion.
 | Unity Catalog | Table version / log replay, file list resolution for Delta tables | No Delta/Unity query can be planned or executed |
 | Databricks (Iceberg REST or Unity Catalog) | Databricks-managed table access via either catalog kind | Databricks queries fail on both catalog-kind routes; the non-Databricks Iceberg REST catalog and Unity Catalog dependencies above are unaffected |
 | Object storage (S3-compatible) | Parquet file data | Scans fail / stall; this is a measured bottleneck risk |
+| AWS STS | Session credentials for a CONNECTION that names an IAM role (`aws_assume_role_arn`) | No STS `AssumeRole` call succeeds; every request through that CONNECTION fails rather than falling back to its static base key pair |
 | Exasol cluster + Rust SLC (BucketFS) | UDF execution substrate | No execution; the substrate under test |
 
 > Catalog and object-storage access is authenticated (REST-catalog OAuth2/bearer credentials;

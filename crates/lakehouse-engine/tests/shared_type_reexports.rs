@@ -68,6 +68,9 @@ fn reexported_paths_resolve_to_the_catalog_crate_types() {
         account_name: None,
         account_key: None,
         sas_token: None,
+        aws_assume_role_arn: None,
+        aws_external_id: None,
+        aws_sts_endpoint: None,
     };
     accepts_catalog_crate_connection_creds(creds);
 
