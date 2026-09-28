@@ -21,10 +21,10 @@ same live Exasol suite every other read path is gated by.
   fixture test asserts the written file's PHYSICAL Parquet encoding from its own footer. A read
   test therefore cannot pass vacuously against a file whose types were silently normalized.
 * Under `MERGE_SCHEMA = 'FALSE'` the declared type comes from ONE sampled footer. A file whose
-  physical column is WIDER than the declaration is read through a NARROWING cast. DataFusion's
-  read-side cast uses `safe: false`, so an out-of-range value produces a clean error rather than a
-  wrong value. That is the cost of the mode. The suite pins it rather than leaving it to be
-  discovered.
+  physical column is WIDER than the declaration fails every query that reads the column, because
+  the scan refuses a physical type outside identity and the supported widening set
+  (`datafusion-scan/type-relaxation`). That is the cost of the mode. The suite pins it rather than
+  leaving it to be discovered.
 * A fixture whose scenario requires a FAILED enumeration MUST sit under a base path no passing
   scenario shares. Enumeration walks EVERY first-level directory of the base path, so one
   unfoldable directory fails every virtual schema created over that root. The incompatible-pair
@@ -103,8 +103,13 @@ same live Exasol suite every other read path is gated by.
 * *WHEN* an Exasol user reads the declared column types and then queries the table
 * *THEN* the virtual schema SHALL declare the NARROW Exasol type resolved from that single sampled footer, so the mode is observable in the declaration
 * *AND* the pushdown plan for a query over that table SHALL carry the SAME narrow logical type, which is what proves the mode reached the plan path and not only the refresh path
-* *AND* a query whose rows all fit the narrow type SHALL return every row of BOTH files, so the mode narrows the declaration rather than the file set
-* *AND* a row of the WIDE file whose value does not fit the narrow declared type SHALL surface a clean error rather than a silently wrong or NULL value, because the narrowing cast the mode implies is strict
+
+### Scenario: MERGE_SCHEMA FALSE narrows the declaration, not the file set
+
+* *GIVEN* the same `widened/` fixture and the same `MERGE_SCHEMA = 'FALSE'` virtual schema
+* *WHEN* an Exasol user queries a column every file shares versus a column a WIDE file stores wider than the narrow declaration
+* *THEN* a query over the shared-type column SHALL return every row of BOTH files, so the mode narrows the declaration rather than the file set
+* *AND* a query over the wider column SHALL fail with an error naming the column and both types, whether or not the wide file's values fit the narrow type, because the scan refuses that pair rather than narrowing it
 
 ### Scenario: A Delta table directory read as raw Parquet returns its tombstoned rows
 

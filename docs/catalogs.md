@@ -4,7 +4,7 @@
 
 # Catalogs
 
-The adapter reaches a catalog through one of two catalog kinds, selected by the VS property `CATALOG_KIND`: an **Iceberg REST catalog** for Iceberg tables (the default — select it by leaving `CATALOG_KIND` absent; the literal `'ICEBERG_REST'` is not a recognized value), or a **native Unity Catalog** (`CATALOG_KIND = 'UNITY_CATALOG'`) for Delta tables. Each kind has its own REST client. Within the Iceberg REST kind, every backend is the SAME client; the backends differ only by the auth mode that you turn on in the CONNECTION password JSON. Three Iceberg REST auth modes exist:
+The adapter reaches a catalog through one of two catalog kinds, selected by the VS property `CATALOG_KIND`: an **Iceberg REST catalog** for Iceberg tables (the default — select it by leaving `CATALOG_KIND` absent; the literal `'ICEBERG_REST'` is not a recognized value), or a **native Unity Catalog** (`CATALOG_KIND = 'UNITY_CATALOG'`) for Delta and Parquet tables. Each kind has its own REST client. Within the Iceberg REST kind, every backend is the SAME client; the backends differ only by the auth mode that you turn on in the CONNECTION password JSON. Three Iceberg REST auth modes exist:
 
 - no auth, for a local stack
 - AWS SigV4, for Glue
@@ -12,7 +12,7 @@ The adapter reaches a catalog through one of two catalog kinds, selected by the 
 
 Lakekeeper is a concrete instance of the last mode. The native Unity Catalog kind reuses the same
 `token` / `client_id`+`client_secret` catalog-auth fields (Databricks OAuth machine-to-machine, in
-that case) but never SigV4 — see [Unity Catalog](#unity-catalog-delta-tables) below.
+that case) but never SigV4 — see [Unity Catalog](#unity-catalog-delta-and-parquet-tables) below.
 
 Find the row that matches your catalog. Then copy its recipe.
 
@@ -24,7 +24,7 @@ Find the row that matches your catalog. Then copy its recipe.
 | [AWS Glue Iceberg REST](#aws-glue-iceberg-rest-sigv4) | Iceberg REST | SigV4 | Supported |
 | [Generic REST with token / OAuth2](#generic-rest-with-static-token-or-oauth2) | Iceberg REST | bearer token or OAuth2 | Supported |
 | [Lakekeeper](#lakekeeper-oidc-via-keycloak--minio) | Iceberg REST | OAuth2 client-credentials (OIDC) | Supported |
-| [Unity Catalog (Delta tables)](#unity-catalog-delta-tables) | Unity Catalog | none, PAT, or Databricks OAuth M2M | Supported |
+| [Unity Catalog (Delta and Parquet tables)](#unity-catalog-delta-and-parquet-tables) | Unity Catalog | none, PAT, or Databricks OAuth M2M | Supported |
 | [Direct storage (raw Parquet, no catalog)](#direct-storage-raw-parquet-no-catalog) | Direct storage | none (storage credentials only) | Supported |
 
 The steps here cover only the catalog CONNECTION and the Virtual Schema. They are the
@@ -211,13 +211,13 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
 
 Create the Virtual Schema exactly as in the static example above. Use the same `NAMESPACE` and `ALLOW_HTTP`, and name the vended CONNECTION.
 
-## Unity Catalog (Delta tables)
+## Unity Catalog (Delta and Parquet tables)
 
 Set `CATALOG_KIND = 'UNITY_CATALOG'` to reach a **native** Unity Catalog — self-hosted OSS or
 Databricks-managed — instead of an Iceberg REST catalog. This is a genuinely different catalog
 client, not another Iceberg REST auth mode: it enumerates `catalog.schema` and returns one virtual
-table per **Delta base table** (a `MANAGED` or `EXTERNAL` table whose `data_source_format` is
-`DELTA`; views and non-Delta tables are excluded and warned). `NAMESPACE` is the `catalog.schema` to
+table per **base table** (a `MANAGED` or `EXTERNAL` table whose `data_source_format` is `DELTA` or
+`PARQUET`; views and tables in any other format are excluded and warned). `NAMESPACE` is the `catalog.schema` to
 expose, and `warehouse` is not required — a native Unity Catalog is addressed by
 `catalog.schema.table`, with no separate warehouse identifier. `TO` is the bare Unity Catalog REST
 address; the adapter derives the `/api/2.1/unity-catalog` path itself.
@@ -226,6 +226,33 @@ Catalog authentication reuses the generic REST fields above — `token` for a st
 `client_id`/`client_secret` for OAuth2 client credentials — but never `use_sigv4`, which this kind
 rejects. Object storage can be static S3 credentials or `use_vended_credentials`, exactly as the
 other recipes.
+
+**Parquet tables.** A `PARQUET` table is planned from its catalog entry. Its files supply only the
+file list and the partition values. Its storage is resolved exactly as for a Delta table, static or
+vended.
+
+- The columns and their types are the catalog's own declaration, read from each column's
+  `type_json`. A `struct`, `array`, or `map` column surfaces as JSON `VARCHAR(2000000)`. A `binary`
+  or `variant` column, or one with no readable `type_json`, is refused by name, as for a Delta table.
+  Every column is nullable, so a file that lacks a column reads NULL for it.
+- The partition columns are the columns the catalog declares with a `partition_index`, in that
+  order. Each file's values come from the `key=value` directory segments of its own path, matched
+  to a partition column ignoring letter case. A `__HIVE_DEFAULT_PARTITION__` or empty value, or a
+  missing segment, reads NULL. A segment naming no partition column is a plain directory. A value
+  that the column's type cannot represent fails the query, naming the column, the type, and the value.
+- A table with Databricks partition metadata logging enabled is still read from its directories.
+  The reader does not consult the partitions that log registers.
+- A data file needs the `.parquet` suffix. Every such object under the table's storage location is
+  read, at any depth, unless a path segment starts with `_` or `.`.
+- No Parquet footer is read at plan time, and only a predicate on a `STRING` partition column
+  prunes files. A predicate on any other column, an `INT` or `DATE` partition column included,
+  narrows the rows returned but not the files read.
+- A data-file column binds to the catalog column whose name it matches ignoring letter case. A
+  data-file type outside identity and the supported widening set (integer, floating-point, decimal,
+  and date widening, a timestamp stored at the same or a coarser unit, and a binary value under a
+  `STRING` column) fails every query that reads that column. The error names the column, both
+  types, and the table's storage location. A column a file stores with the Parquet `UNKNOWN`
+  (all-NULL) type reads as NULL under every catalog type.
 
 > A Databricks-managed Delta table is also reachable through the **Iceberg REST** kind, via its
 > UniForm Iceberg metadata — use the AWS Glue or generic-REST recipes above for that route instead.
@@ -325,7 +352,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 | Property | Default | Meaning |
 |---|---|---|
 | `NAMESPACE` | absent (the CONNECTION address alone is the base path) | Narrows discovery to a subtree: joined onto the CONNECTION address with a single `/` to form the storage base path. Not a `catalog.schema` reference — there is no catalog to resolve it against |
-| `MERGE_SCHEMA` | `TRUE` | `TRUE` reads every listed file's footer and folds them into one declared schema (widening a narrower numeric/date type into a wider one, unioning columns present in only some files). `FALSE` samples only the lexicographically first file's footer and declares that schema alone — cheaper, but a column or a wider type that only a later file carries is invisible, and a row that does not fit the sampled type fails at read time rather than at `CREATE VIRTUAL SCHEMA` time. `FALSE` takes the partition keys from the sampled file's path alone too, so it requires every file to share one partition layout: a key only other files carry is ignored, and a file lacking a sampled key reads NULL for it |
+| `MERGE_SCHEMA` | `TRUE` | `TRUE` reads every listed file's footer and folds them into one declared schema (widening a narrower numeric/date type into a wider one, unioning columns present in only some files). `FALSE` samples only the lexicographically first file's footer and declares that schema alone — cheaper, but a column or a wider type that only a later file carries is invisible, and a file whose column type is wider than the sampled type fails every query that reads the column, even when its values fit (a narrower one is read widened). `FALSE` takes the partition keys from the sampled file's path alone too, so it requires every file to share one partition layout: a key only other files carry is ignored, and a file lacking a sampled key reads NULL for it |
 | `HIVE_PARTITIONING` | `TRUE` | `TRUE` declares each `key=value` directory segment below a table's root as a `VARCHAR` partition column and prunes files on it when a query is planned (see *Partition columns* below). `FALSE` reads such segments as plain directories: no partition column and no pruning |
 
 An unparseable `MERGE_SCHEMA` or `HIVE_PARTITIONING` value is rejected rather than defaulted, since a
@@ -385,7 +412,8 @@ folding schemas cover integer, float, and date widening, but carry no timestamp-
 Two files that declare the same column as `TIMESTAMP` at different units (for example microsecond in
 one file, nanosecond in another) fail to fold under the default `MERGE_SCHEMA = 'TRUE'`. Set
 `MERGE_SCHEMA = 'FALSE'` to work around it — the sampled file's declared unit then wins, and a file
-whose column does not fit that declared width fails at read time instead.
+is read only when its unit equals the sampled unit or is coarser. A file at a finer unit fails every
+query that reads the column.
 
 ## Addressing
 

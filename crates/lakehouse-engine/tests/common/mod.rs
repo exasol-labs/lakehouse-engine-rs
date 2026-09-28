@@ -39,7 +39,7 @@ pub mod int96_fixtures;
 pub mod lakekeeper;
 #[cfg(feature = "exasol-e2e")]
 pub mod pos_delete_fixtures;
-#[cfg(any(feature = "exasol-e2e", feature = "azure-e2e"))]
+#[cfg(any(feature = "exasol-e2e", feature = "azure-e2e", feature = "unity-e2e"))]
 pub mod raw_parquet;
 #[cfg(any(
     feature = "exasol-e2e",

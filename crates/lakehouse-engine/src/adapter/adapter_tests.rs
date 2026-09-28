@@ -1635,6 +1635,7 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
             storage_location: Some("s3://warehouse/orders".to_string()),
             format: TableFormat::Iceberg,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
             columns: vec![
                 CatalogColumn {
                     name: "order_id".to_string(),

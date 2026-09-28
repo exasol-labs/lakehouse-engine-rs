@@ -76,7 +76,7 @@ impl FormatReader for ParquetFormatReader<'_> {
 }
 
 /// Size comes from the listing response (no extra HEAD or Parquet read); path is encoded relative to the table root, or as an absolute URI if outside it.
-fn file_entry(file: ParquetFile, prefix: &StorePath, store_root: &str) -> FileEntry {
+pub(super) fn file_entry(file: ParquetFile, prefix: &StorePath, store_root: &str) -> FileEntry {
     let len_hint = file.path.as_ref().len();
     let relative = file
         .path

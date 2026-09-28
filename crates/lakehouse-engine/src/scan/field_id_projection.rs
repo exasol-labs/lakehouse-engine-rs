@@ -9,8 +9,8 @@
 //! id) against a physical field's embedded `PARQUET:field_id`; by a declared
 //! physical name (Delta `name` column mapping) against the physical column's own
 //! name; or by identity (Delta `none` column mapping) against the logical name
-//! itself. Iceberg additionally falls back to `schema.name-mapping.default` and
-//! then to the physical name.
+//! itself, then its uppercase fold. Iceberg additionally falls back to
+//! `schema.name-mapping.default` and then to the physical name.
 //!
 //! A NESTED logical field declares that same choice for each of its own members
 //! ([`NestedMembers`]), and [`resolve_nested_field`] recurses the one binding pass
@@ -20,7 +20,8 @@
 use crate::scan::raw_scan::NESTED_JSON_RENDER_UDF_NAME;
 use crate::scan::render_nested_column_as_json;
 use crate::scan::spec::{NameMappingEntry, NestedField, NestedMembers};
-use crate::types::mapping::needs_nested_json_rendering;
+use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
+use crate::types::widening::widen;
 use arrow::array::{
     Array, ArrayRef, FixedSizeListArray, LargeListArray, ListArray, MapArray, RecordBatch,
     StructArray, new_null_array,
@@ -64,6 +65,12 @@ struct BindingKeys<'a> {
     physical_name: Option<&'a str>,
 }
 
+impl BindingKeys<'_> {
+    fn binds_by_identity(&self) -> bool {
+        self.field_id.is_none() && self.physical_name.is_none()
+    }
+}
+
 /// The physical side of one claim attempt: the facts [`claim_logical`] reads about
 /// the physical field being matched against a logical field's [`BindingKeys`].
 struct PhysicalKeys<'a> {
@@ -91,6 +98,86 @@ fn claim_logical(physical: PhysicalKeys<'_>, logical: &[BindingKeys<'_>]) -> Opt
             None => physical.mapped_field_id.and_then(with_field_id),
         })
         .or_else(|| logical.iter().position(|keys| keys.name == physical.name))
+}
+
+/// Table and file columns equal only ignoring letter case, with no exact match to decide.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AmbiguousFold {
+    logical: Vec<String>,
+    physical: Vec<String>,
+}
+
+impl std::fmt::Display for AmbiguousFold {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let quoted = |names: &[String]| {
+            names
+                .iter()
+                .map(|name| format!("'{name}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        write!(
+            f,
+            "table columns {} and file columns {} are equal only ignoring letter case",
+            quoted(&self.logical),
+            quoted(&self.physical)
+        )
+    }
+}
+
+/// Bind still-unclaimed identity fields by uppercase fold, as Spark does by default
+/// (`spark.sql.caseSensitive=false`). A fold group with several fields on either side
+/// binds nothing and is returned as ambiguous.
+fn claim_by_case_fold(
+    physical: &arrow::datatypes::Schema,
+    logical: &[BindingKeys<'_>],
+    exact: &[Option<usize>],
+) -> (Vec<Option<usize>>, Vec<AmbiguousFold>) {
+    use std::collections::{BTreeMap, HashSet};
+
+    if exact.iter().all(Option::is_some) || !logical.iter().any(BindingKeys::binds_by_identity) {
+        return (exact.to_vec(), Vec::new());
+    }
+    let exactly_claimed: HashSet<usize> = exact.iter().flatten().copied().collect();
+    let mut groups: BTreeMap<String, (Vec<usize>, Vec<usize>)> = BTreeMap::new();
+    for (index, field) in physical.fields().iter().enumerate() {
+        if exact[index].is_none() {
+            groups
+                .entry(field.name().to_uppercase())
+                .or_default()
+                .0
+                .push(index);
+        }
+    }
+    for (index, keys) in logical.iter().enumerate() {
+        if keys.binds_by_identity() && !exactly_claimed.contains(&index) {
+            groups
+                .entry(keys.name.to_uppercase())
+                .or_default()
+                .1
+                .push(index);
+        }
+    }
+
+    let mut claims = exact.to_vec();
+    let mut ambiguous = Vec::new();
+    for (physical_indices, logical_indices) in groups.into_values() {
+        match (physical_indices.as_slice(), logical_indices.as_slice()) {
+            ([], _) | (_, []) => {}
+            ([physical_index], [logical_index]) => claims[*physical_index] = Some(*logical_index),
+            _ => ambiguous.push(AmbiguousFold {
+                logical: logical_indices
+                    .iter()
+                    .map(|index| logical[*index].name.to_string())
+                    .collect(),
+                physical: physical_indices
+                    .iter()
+                    .map(|index| physical.field(*index).name().clone())
+                    .collect(),
+            }),
+        }
+    }
+    (claims, ambiguous)
 }
 
 /// One file's resolution of one nested column onto the nested tree the table
@@ -141,10 +228,10 @@ struct StructSlot {
 /// members reordered into logical order, an unclaimed physical member dropped, and a
 /// logical field this file's struct does not carry null-filled.
 ///
-/// A struct member is claimed by [`claim_logical`], the same order [`bind_columns`]
-/// applies to a top-level column. The `schema.name-mapping.default` fallback is not
-/// reachable at depth: its nested entries go unparsed (issue #28), so no nested
-/// member can carry a mapped field-id for step 3 to match.
+/// A struct member is claimed by [`claim_logical`] in the same order as a
+/// top-level column, minus the letter-case fold. `schema.name-mapping.default`
+/// is unreachable at depth — its nested entries go unparsed (issue #28) — so no
+/// nested member can carry a mapped field-id.
 ///
 /// A list's element and a map's key and value are POSITIONAL — one child slot each —
 /// so they resolve by recursion alone, with no name or id to match, and only when the
@@ -434,7 +521,7 @@ fn downcast_array<'a, T: Array + 'static>(
 ///    were claimed by (see [`bind_columns`] for the field-id / declared-physical-name
 ///    / name-mapping / identity resolution order). The default then resolves each
 ///    logical column to the correct physical index and reuses its own behavior for
-///    the rest — nullable-missing → NULL literal, type divergence → cast,
+///    the rest — nullable-missing → NULL literal, an admitted type divergence → cast,
 ///    required-missing → error. Every binding strategy therefore shares ONE set of
 ///    adaptation semantics rather than getting a thinner path of its own.
 /// 2. Rename the default's OUTPUT columns back to the real physical names (at
@@ -461,6 +548,8 @@ fn downcast_array<'a, T: Array + 'static>(
 #[derive(Debug)]
 pub(crate) struct FieldIdExprAdapterFactory {
     pub(crate) resolution: FieldIdResolution,
+    /// Named by every per-file binding failure.
+    pub(crate) table_root: String,
 }
 
 /// Per-query column-binding metadata for one scan side (fact or dimension),
@@ -494,6 +583,20 @@ pub(crate) struct FieldIdResolution {
     pub(crate) nested_members: HashMap<String, NestedMembers>,
 }
 
+impl FieldIdResolution {
+    pub(crate) fn for_logical_schema(
+        logical_schema: &[crate::scan::spec::LogicalField],
+        name_mapping: &[NameMappingEntry],
+    ) -> Result<Self, String> {
+        Ok(Self {
+            name_mapping: name_mapping.to_vec(),
+            declared_physical_names: index_declared_physical_names(logical_schema),
+            defaults: reconstruct_initial_defaults(logical_schema)?,
+            nested_members: index_nested_members(logical_schema),
+        })
+    }
+}
+
 impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
     fn create(
         &self,
@@ -510,6 +613,7 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
             &physical_file_schema,
             &self.resolution,
         );
+        binding.ensure_unambiguous(&self.table_root)?;
 
         // The absent-with-default fill map is PER FILE: a logical column that NO
         // physical field of THIS file claimed and that carries a reconstructed
@@ -540,12 +644,18 @@ impl PhysicalExprAdapterFactory for FieldIdExprAdapterFactory {
         let delegate_logical =
             delegate_logical_schema(&logical_file_schema, &delegate_physical, &nested);
 
+        // DataFusion hands `create` the whole table file schema, not only the columns a
+        // query reads, so a refused column fails only the rewrite that references it.
+        let refused_by_index = binding.refused_columns(&logical_file_schema);
+
         let inner =
             DefaultPhysicalExprAdapterFactory.create(delegate_logical, delegate_physical)?;
         Ok(Arc::new(FieldIdExprAdapter {
             inner,
             physical_file_schema,
             absent_default_by_index,
+            refused_by_index,
+            table_root: self.table_root.clone(),
             nested,
         }))
     }
@@ -585,6 +695,9 @@ struct FieldIdExprAdapter {
     /// Iceberg `initial-default`; a present field-id is never an entry, so a
     /// real-value binding is never overridden.
     absent_default_by_index: HashMap<usize, ScalarValue>,
+    /// This file's bound columns whose type is not admitted, keyed by logical index.
+    refused_by_index: HashMap<usize, RefusedColumn>,
+    table_root: String,
     /// The nested columns of THIS file, keyed by PHYSICAL column index — the index
     /// every `Column` the delegate emits carries — each with the resolution that
     /// restructures the file's array to the table's logical member names.
@@ -600,6 +713,18 @@ impl PhysicalExprAdapter for FieldIdExprAdapter {
             Transformed, TransformedResult, TreeNode, TreeNodeRecursion,
         };
         use datafusion::physical_expr::expressions::{Column, Literal};
+
+        if !self.refused_by_index.is_empty() {
+            expr.apply(|node| {
+                match node
+                    .downcast_ref::<Column>()
+                    .and_then(|column| self.refused_by_index.get(&column.index()))
+                {
+                    Some(refused) => Err(refused.refusal(&self.table_root)),
+                    None => Ok(TreeNodeRecursion::Continue),
+                }
+            })?;
+        }
 
         // Intercept the absent-with-default case BEFORE delegating: the default
         // adapter NULL-fills a nullable-absent field and ERRORS on a
@@ -773,9 +898,60 @@ struct ColumnBinding {
     /// column whose logical field declares a nested member tree. Empty for a table
     /// with no list, struct, or map column.
     nested: HashMap<String, NestedResolution>,
+    /// Letter-case fold groups that bound nothing because more than one spelling competed.
+    ambiguous_folds: Vec<AmbiguousFold>,
 }
 
 impl ColumnBinding {
+    /// Checked at adapter creation, not per rewrite: an ambiguous fold leaves no binding trustworthy.
+    fn ensure_unambiguous(&self, table_root: &str) -> datafusion::error::Result<()> {
+        match self.ambiguous_folds.as_slice() {
+            [] => Ok(()),
+            folds => Err(DataFusionError::Execution(format!(
+                "cannot bind the columns of a data file of the table at '{table_root}' by letter \
+                 case: {}, so none of them binds",
+                folds
+                    .iter()
+                    .map(AmbiguousFold::to_string)
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ))),
+        }
+    }
+
+    /// Keyed by logical index; JSON-rendered columns are excluded since no cast adapts them.
+    fn refused_columns(&self, logical: &arrow::datatypes::Schema) -> HashMap<usize, RefusedColumn> {
+        let mut physical_by_name: HashMap<&str, &arrow::datatypes::Field> = HashMap::new();
+        for field in self.renamed_physical.fields() {
+            physical_by_name
+                .entry(field.name().as_str())
+                .or_insert(field.as_ref());
+        }
+        logical
+            .fields()
+            .iter()
+            .enumerate()
+            .filter(|(_, field)| {
+                !self.nested.get(field.name()).is_some_and(|resolution| {
+                    needs_nested_json_rendering(resolution.resolved_field().data_type())
+                })
+            })
+            .filter_map(|(index, field)| {
+                let physical = physical_by_name.get(field.name().as_str())?;
+                (!admits(physical.data_type(), field.data_type())).then(|| {
+                    (
+                        index,
+                        RefusedColumn {
+                            name: field.name().clone(),
+                            logical: field.data_type().clone(),
+                            physical: physical.data_type().clone(),
+                        },
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// Every nested column of this file, keyed by its PHYSICAL index — the columns
     /// [`FieldIdExprAdapter`] renders to JSON and the delegate must therefore never
     /// cast — each carrying the resolution that restructures it to the table's
@@ -787,8 +963,8 @@ impl ColumnBinding {
     /// no column can be rendered while a pushdown DataFusion approves against the
     /// `Utf8` logical schema — and then drops against the physical nested schema,
     /// returning every row — stays on for its table. A physically nested column
-    /// declaring no tree is therefore left to the delegate, which has no
-    /// struct-to-text kernel and fails loudly rather than silently losing a predicate.
+    /// declaring no tree is therefore refused by [`Self::refused_columns`] and fails
+    /// loudly rather than silently losing a predicate.
     ///
     /// A tree the file's own type contradicts resolves VERBATIM to that type, and a
     /// verbatim primitive is left to the delegate too: the JSON encoder would quote
@@ -843,6 +1019,65 @@ impl ColumnBinding {
     }
 }
 
+/// Kept per file so that only a query reading the column fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RefusedColumn {
+    name: String,
+    logical: DataType,
+    physical: DataType,
+}
+
+impl RefusedColumn {
+    fn refusal(&self, table_root: &str) -> DataFusionError {
+        DataFusionError::Execution(format!(
+            "cannot read column '{}' of the table at '{table_root}': a data file stores it as {}, \
+             which its declared type {} does not admit, so it is refused rather than cast",
+            self.name, self.physical, self.logical
+        ))
+    }
+}
+
+/// Whether a file column stored as `physical` may be cast to its declared `logical` type:
+/// identity or a supported widening ([`widen`]), a timestamp whose instant the cast keeps,
+/// a text rendering of a type Exasol cannot represent, or an all-NULL column.
+fn admits(physical: &DataType, logical: &DataType) -> bool {
+    physical == &DataType::Null
+        || widen(physical, logical).as_ref() == Some(logical)
+        || admits_timestamp(physical, logical)
+        || admits_as_text(physical, logical)
+        || matches!(physical, DataType::Dictionary(_, value) if admits(value, logical))
+}
+
+fn admits_timestamp(physical: &DataType, logical: &DataType) -> bool {
+    let (
+        DataType::Timestamp(physical_unit, physical_zone),
+        DataType::Timestamp(logical_unit, logical_zone),
+    ) = (physical, logical)
+    else {
+        return false;
+    };
+    let shifts_instant = logical_zone.is_none()
+        && physical_zone
+            .as_deref()
+            .is_some_and(|zone| !matches!(zone, "UTC" | "+00:00"));
+    physical_unit <= logical_unit && !shifts_instant
+}
+
+fn admits_as_text(physical: &DataType, logical: &DataType) -> bool {
+    is_string(logical)
+        && (is_string(physical)
+            || (!physical.is_nested()
+                && !matches!(physical, DataType::Dictionary(..))
+                && needs_json_fallback(physical)))
+}
+
+fn is_string(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+    )
+}
+
 /// The logical schema the delegate adapts TO, with each nested column's field taken
 /// WHOLE from `delegate_physical` — name, type, nullability, and metadata together.
 ///
@@ -893,8 +1128,9 @@ fn delegate_logical_schema(
 ///
 /// [`claim_logical`] decides which logical field claims a physical one — by embedded
 /// field-id, by declared physical name, by `schema.name-mapping.default`, or by
-/// identity, first match wins. An unclaimed physical field keeps its own name and is
-/// simply never referenced: that is how a dropped column falls away.
+/// identity, first match wins — and [`claim_by_case_fold`] then settles what only an
+/// identity field's letter case kept apart. An unclaimed physical field keeps its own
+/// name and is simply never referenced: that is how a dropped column falls away.
 ///
 /// A claimed field whose logical field declares a nested member tree is ALSO resolved
 /// member-by-member by [`resolve_nested_field`], so the file's own member names,
@@ -942,20 +1178,30 @@ fn bind_columns(
         .map(|entry| (entry.name.as_str(), entry.field_id))
         .collect();
 
-    let mut nested: HashMap<String, NestedResolution> = HashMap::new();
-    let renamed_fields: Vec<arrow::datatypes::FieldRef> = physical
+    let exact: Vec<Option<usize>> = physical
         .fields()
         .iter()
         .map(|physical_field| {
             let physical_name = physical_field.name().as_str();
-            let claimed = claim_logical(
+            claim_logical(
                 PhysicalKeys {
                     name: physical_name,
                     embedded_id: field_id_of(physical_field),
                     mapped_field_id: field_id_by_physical_name.get(physical_name).copied(),
                 },
                 &keys,
-            );
+            )
+        })
+        .collect();
+    let (claims, ambiguous_folds) = claim_by_case_fold(physical, &keys, &exact);
+
+    let mut nested: HashMap<String, NestedResolution> = HashMap::new();
+    let renamed_fields: Vec<arrow::datatypes::FieldRef> = physical
+        .fields()
+        .iter()
+        .zip(claims)
+        .map(|(physical_field, claimed)| {
+            let physical_name = physical_field.name().as_str();
             let Some(logical_name) = claimed.map(|index| keys[index].name) else {
                 return Arc::clone(physical_field);
             };
@@ -991,6 +1237,7 @@ fn bind_columns(
         )),
         bound_logical_names,
         nested,
+        ambiguous_folds,
     }
 }
 
@@ -1101,7 +1348,7 @@ pub(crate) fn reconstruct_initial_default(
 /// one binding strategy only, and a column index is not stable under projection.
 /// Fields with no `initial_default` contribute no entry; a reconstruction failure
 /// aborts with a clean `Err` (never a panic).
-pub(super) fn reconstruct_initial_defaults(
+fn reconstruct_initial_defaults(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> Result<HashMap<String, ScalarValue>, String> {
     logical_schema
@@ -1123,7 +1370,7 @@ pub(super) fn reconstruct_initial_defaults(
 /// A field that binds by field-id or by identity declares no physical name and
 /// contributes no entry, so the index is empty for every Iceberg table and step 2
 /// is then a no-op.
-pub(super) fn index_declared_physical_names(
+fn index_declared_physical_names(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> HashMap<String, String> {
     logical_schema
@@ -1144,7 +1391,7 @@ pub(super) fn index_declared_physical_names(
 /// A primitive column declares no tree and contributes no entry, so the index is
 /// empty for a table with no list, struct, or map column and the nested resolution is
 /// then reached for no column at all.
-pub(super) fn index_nested_members(
+fn index_nested_members(
     logical_schema: &[crate::scan::spec::LogicalField],
 ) -> HashMap<String, NestedMembers> {
     logical_schema

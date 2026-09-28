@@ -951,6 +951,7 @@ impl TableProvider for PositionalDeleteScanTable {
         let expr_adapter = self.use_field_id_adapter.then(|| {
             Arc::new(FieldIdExprAdapterFactory {
                 resolution: self.field_id_resolution.clone(),
+                table_root: self.table_root.clone(),
             }) as Arc<_>
         });
 

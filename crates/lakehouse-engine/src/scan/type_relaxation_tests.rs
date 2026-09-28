@@ -1,16 +1,14 @@
-use crate::scan::raw_scan::{build_scan_sql, register_files};
-use crate::scan::session_config_for_spec;
-use crate::scan::spec::{FileEntry, LogicalField, ScanSpec};
-use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
+use crate::scan::spec::{FileEntry, LogicalField};
+use crate::scan::test_support::{
+    local_file_size, minimal_spec, run_scan, try_run_scan, write_parquet,
+};
+use crate::types::mapping::arrow_type_from_tag;
 use arrow::array::{
     Array, ArrayRef, Date32Array, Decimal128Array, Float32Array, Float64Array, Int8Array,
-    Int16Array, Int32Array, Int64Array, TimestampMicrosecondArray,
+    Int16Array, Int32Array, Int64Array, StringArray, TimestampMicrosecondArray,
 };
 use arrow::compute::can_cast_types;
-use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
-use arrow::record_batch::RecordBatch;
-use datafusion::execution::context::SessionContext;
-use parquet::arrow::ArrowWriter;
+use arrow::datatypes::{DataType, TimeUnit};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -259,24 +257,6 @@ fn logical_field(name: &str, arrow_type: &str) -> LogicalField {
     }
 }
 
-fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> String {
-    let schema = Arc::new(Schema::new(
-        columns
-            .iter()
-            .map(|(name, array)| Field::new(*name, array.data_type().clone(), false))
-            .collect::<Vec<_>>(),
-    ));
-    let arrays: Vec<ArrayRef> = columns.into_iter().map(|(_, array)| array).collect();
-    let file = std::fs::File::create(path).expect("create parquet file");
-    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None).expect("arrow writer");
-    let batch = RecordBatch::try_new(schema, arrays).expect("record batch");
-    writer.write(&batch).expect("write batch");
-    writer.close().expect("close writer");
-    url::Url::from_file_path(path)
-        .expect("absolute path")
-        .to_string()
-}
-
 /// The Arrow types a written fixture file actually carries. A Parquet round-trip that silently
 /// widened the narrow column would leave the read assertions proving nothing about relaxation.
 fn parquet_column_types(path: &Path) -> Vec<DataType> {
@@ -291,20 +271,55 @@ fn parquet_column_types(path: &Path) -> Vec<DataType> {
         .collect()
 }
 
-/// Drive the exact production scan path — `register_files` then `build_scan_sql` — so the cast under
-/// test is the one `FieldIdExprAdapterFactory` delegates to, not one the test performs.
-async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
-    let ctx = SessionContext::new_with_config(session_config_for_spec(spec));
-    register_files(&ctx, "scan_target", spec, &inline_resolved(spec))
-        .await
-        .expect("register_files must succeed with a logical schema");
-    let sql = build_scan_sql(&ctx, "scan_target", spec)
-        .await
-        .expect("build_scan_sql");
-    let df = ctx.sql(&sql).await.expect("plan scan SQL");
-    df.collect()
-        .await
-        .expect("scan must read the assigned files")
+// Scenario Coverage (type-relaxation): A physical type outside identity and the supported set is
+// refused before any cast
+// Scenario Coverage (type-relaxation): A narrow physical column binds to the current wider logical
+// type and is cast per file
+#[tokio::test]
+async fn a_physical_type_outside_identity_and_the_supported_set_is_refused_before_any_cast() {
+    let dir = std::env::temp_dir().join(format!("lh_type_refusal_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let table_root = url::Url::from_directory_path(&dir)
+        .expect("absolute directory")
+        .to_string();
+    let cases: Vec<(ArrayRef, &str)> = vec![
+        (Arc::new(Float64Array::from(vec![1.7])), "int32"),
+        (
+            Arc::new(TimestampMicrosecondArray::from(vec![0i64])),
+            "date32",
+        ),
+        (Arc::new(StringArray::from(vec!["1"])), "int64"),
+        (Arc::new(Int64Array::from(vec![1i64])), "utf8"),
+        (Arc::new(Int64Array::from(vec![1i64, 40])), "int32"),
+        (Arc::new(Float64Array::from(vec![3.5f64])), "float32"),
+    ];
+
+    for (index, (physical, logical_tag)) in cases.into_iter().enumerate() {
+        let path = dir.join(format!("refused_{index}.parquet"));
+        let file_url = write_parquet(&path, vec![("val", physical)]);
+        let mut spec = minimal_spec();
+        spec.common.table_root = table_root.clone();
+        spec.files = vec![FileEntry::new(file_url.clone(), local_file_size(&file_url))];
+        spec.common.logical_schema = vec![logical_field("val", logical_tag)];
+        spec.common.projection = vec!["VAL".into()];
+
+        let physical_type = parquet_column_types(&path)[0].to_string();
+        let message = try_run_scan(&spec)
+            .await
+            .expect_err("the scan must refuse the pair rather than cast it")
+            .to_string();
+        for needle in [
+            table_root.clone(),
+            "'val'".to_string(),
+            physical_type,
+            arrow_type_from_tag(logical_tag).to_string(),
+        ] {
+            assert!(
+                message.contains(&needle),
+                "the refusal must name `{needle}`, got: {message}"
+            );
+        }
+    }
 }
 
 // Scenario Coverage (type-relaxation): Every supported relaxation pair is proven castable rather

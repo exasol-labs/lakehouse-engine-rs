@@ -91,7 +91,12 @@ pub async fn resolve_parquet_directory(
     let kept: Vec<(&RawFile, BTreeMap<String, Option<String>>)> = raw_files
         .iter()
         .filter_map(|raw| {
-            let filled = fill_partition_values(&raw.partition_segments, &declared_keys);
+            let filled = fill_partition_values(
+                &raw.partition_segments,
+                &declared_keys,
+                &declared_keys,
+                |candidate, key| candidate == key,
+            );
             keep(&filled).then_some((raw, filled))
         })
         .collect();
@@ -128,6 +133,43 @@ pub async fn resolve_parquet_directory(
         schema: schema_with_partition_columns(folded_fields, &declared_keys),
         partition_columns: declared_keys,
     })
+}
+
+/// [`resolve_parquet_directory`]'s file selection for a caller declaring its own schema and
+/// partition columns, with no footer read. Values come from the deepest case-folded path match.
+pub async fn list_parquet_files(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &StorePath,
+    partition_columns: &[String],
+    keep: &PartitionKeepPredicate,
+) -> Result<Vec<ParquetFile>, UdfError> {
+    let raw_files = list_data_files(store, prefix, true).await?;
+    let folded_columns: Vec<String> = partition_columns
+        .iter()
+        .map(|column| column.to_uppercase())
+        .collect();
+    Ok(raw_files
+        .into_iter()
+        .filter_map(|raw| {
+            let partition_values = fill_partition_values(
+                &raw.partition_segments,
+                partition_columns,
+                &folded_columns,
+                |candidate, folded| {
+                    candidate
+                        .chars()
+                        .flat_map(char::to_uppercase)
+                        .eq(folded.chars())
+                },
+            );
+            keep(&partition_values).then_some(ParquetFile {
+                path: raw.path,
+                size: raw.size,
+                partition_values,
+                footer: None,
+            })
+        })
+        .collect())
 }
 
 /// A listed file with its own raw partition segments, before filling against the declared keys.
@@ -195,23 +237,14 @@ fn data_file_segments(location: &StorePath, prefix: &StorePath) -> Option<Vec<St
     Some(segments)
 }
 
-/// A key repeated within one path takes its deepest value but keeps its first position.
+/// Every `key=value` segment in path order, repeats included; the fill step picks the deepest.
 fn parse_partition_segments(directories: &[String]) -> Vec<(String, Option<String>)> {
-    let mut ordered: Vec<(String, Option<String>)> = Vec::new();
-    for segment in directories {
-        let Some((key, value)) = segment.split_once('=') else {
-            continue;
-        };
-        if key.is_empty() {
-            continue;
-        }
-        let decoded = decode_partition_value(value);
-        match ordered.iter_mut().find(|(existing, _)| existing == key) {
-            Some((_, existing_value)) => *existing_value = decoded,
-            None => ordered.push((key.to_string(), decoded)),
-        }
-    }
-    ordered
+    directories
+        .iter()
+        .filter_map(|segment| segment.split_once('='))
+        .filter(|(key, _)| !key.is_empty())
+        .map(|(key, value)| (key.to_string(), decode_partition_value(value)))
+        .collect()
 }
 
 fn decode_partition_value(raw: &str) -> Option<String> {
@@ -273,13 +306,16 @@ fn uppercase_index<'a>(keys: impl Iterator<Item = &'a str>) -> HashMap<String, &
 fn fill_partition_values(
     raw: &[(String, Option<String>)],
     declared_keys: &[String],
+    match_keys: &[String],
+    key_matches: impl Fn(&str, &str) -> bool,
 ) -> BTreeMap<String, Option<String>> {
     declared_keys
         .iter()
-        .map(|key| {
+        .zip(match_keys)
+        .map(|(key, match_key)| {
             let value = raw
                 .iter()
-                .find(|(candidate, _)| candidate == key)
+                .rfind(|(candidate, _)| key_matches(candidate, match_key))
                 .and_then(|(_, value)| value.clone());
             (key.clone(), value)
         })

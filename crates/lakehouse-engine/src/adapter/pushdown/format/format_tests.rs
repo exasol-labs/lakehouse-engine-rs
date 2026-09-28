@@ -44,26 +44,21 @@ fn unity_table(format: TableFormat) -> CatalogTable {
         storage_location: Some("s3://bucket/cat/sch/orders".into()),
         format,
         vended_credential_key: Some("table-id-1".into()),
+        partition_columns: Vec::new(),
         columns: Vec::new(),
     }
 }
 
-/// Scenario: The format reader is selected at one site and refuses a mismatched
-/// pairing.
-///
-/// A Unity Catalog table whose loaded metadata reports a non-Delta format is
-/// refused by name, naming the reported format — never routed into the Delta
-/// reader, where it would surface as a missing transaction log instead of a
-/// format refusal.
+/// Scenario: The format reader is selected at one site and refuses a mismatched pairing
 #[test]
-fn format_reader_refuses_a_non_delta_table_under_the_unity_source() {
+fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     let creds = offline_sigv4_creds();
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
     let table = unity_table(TableFormat::Iceberg);
     let storage = sample_storage();
 
     let err = format_reader(
-        ScanSource::UnityDelta {
+        ScanSource::Unity {
             session: &session,
             table: &table,
         },
@@ -102,26 +97,28 @@ fn format_reader_refuses_a_non_delta_table_under_the_unity_source() {
 fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_the_catalog() {
     let creds = offline_sigv4_creds();
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
-    let table = unity_table(TableFormat::Delta);
     let storage = sample_storage();
 
-    let selected = format_reader(
-        ScanSource::UnityDelta {
-            session: &session,
-            table: &table,
-        },
-        &ConnectionStorage {
-            storage: &storage,
-            creds: &creds,
-            allow_http: true,
-        },
-    );
+    for format in [TableFormat::Delta, TableFormat::Parquet] {
+        let table = unity_table(format);
+        let selected = format_reader(
+            ScanSource::Unity {
+                session: &session,
+                table: &table,
+            },
+            &ConnectionStorage {
+                storage: &storage,
+                creds: &creds,
+                allow_http: true,
+            },
+        );
 
-    assert!(
-        selected.is_ok(),
-        "a Unity Catalog table reporting Delta must select its reader without issuing a \
-         request"
-    );
+        assert!(
+            selected.is_ok(),
+            "a Unity Catalog table reporting {format:?} must select its reader without issuing \
+             a request"
+        );
+    }
 }
 
 /// Scenario: The format reader is selected at one site and refuses a mismatched
@@ -189,4 +186,51 @@ fn third_scan_source_selects_the_parquet_reader() {
         selected.is_ok(),
         "a raw Parquet directory must select its reader without reading anything"
     );
+}
+
+// Scenario Coverage (delta-type-mapping): A Delta table with no mappable column is refused as a
+// whole
+#[test]
+fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {
+    let refused = |column_name: &str, reason: &str| RefusedColumn {
+        column_name: column_name.to_string(),
+        reason: reason.to_string(),
+    };
+    let refused_columns = vec![
+        refused("binary_col", "binary is refused, see #351"),
+        refused("variant_col", "variant renders no meaningful value"),
+    ];
+    let id = LogicalField {
+        field_id: None,
+        name: "id".to_string(),
+        arrow_type: "int64".to_string(),
+        nullable: false,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    };
+
+    ensure_table_has_a_mappable_column(&[id], &refused_columns[..1], "Delta")
+        .expect("a table with a mappable column must not be refused as a whole");
+    ensure_table_has_a_mappable_column(&[], &[], "Delta")
+        .expect("an empty schema with nothing refused must not be refused as a whole");
+    let error = ensure_table_has_a_mappable_column(&[], &refused_columns, "Delta")
+        .expect_err("a table with zero mappable columns must be refused as a whole");
+
+    let message = match error {
+        UdfError::User(message) => message,
+        other => panic!("every refusal must be a user error, got {other:?}"),
+    };
+    assert!(
+        message.starts_with("Delta table has no mappable column; every column is refused: "),
+        "message was: {message}"
+    );
+    for fragment in [
+        "binary_col",
+        "binary is refused, see #351",
+        "variant_col",
+        "variant renders no meaningful value",
+    ] {
+        assert!(message.contains(fragment), "message was: {message}");
+    }
 }

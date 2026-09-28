@@ -11,7 +11,7 @@
 //! scenarios below issue real queries through Exasol and assert the rows they
 //! return. `unity_delta_planning_agrees_under_vended_and_static_credentials`
 //! separately exercises Delta table PLANNING directly through the seam
-//! (`format_reader`/`ScanSource::UnityDelta`), bypassing `handle_pushdown`
+//! (`format_reader`/`ScanSource::Unity`), bypassing `handle_pushdown`
 //! entirely.
 //!
 //! All tests share one Exasol (one virtual schema), so they must run serially
@@ -34,6 +34,7 @@ use common::e2e_harness::{
     parse_int, parse_numeric, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
+use common::raw_parquet::write_parquet_fixture;
 use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
     local_stack_connection_password, wait_for_exasol, wait_for_minio, wait_for_url,
@@ -49,7 +50,10 @@ use lakehouse_engine::adapter::pushdown::{
 };
 use lakehouse_engine::scan::spec::{DeleteMechanism, FileEntry};
 
-use std::sync::OnceLock;
+use arrow::array::{Float64Array, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 /// Virtual Schema over the seeded `unity.delta_e2e` namespace.
@@ -63,7 +67,7 @@ const UNITY_CATALOG_URI_INTERNAL: &str = "http://unitycatalog:8080";
 
 const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// The eight seeded fixture tables, as their flatten-and-uppercase Exasol names.
+/// The nine seeded fixture tables, as their flatten-and-uppercase Exasol names.
 const EXPECTED_TABLES: &[&str] = &[
     "TABLE_WITH_DV",
     "CM_NAME_MODE",
@@ -73,7 +77,11 @@ const EXPECTED_TABLES: &[&str] = &[
     "STATS_ALL_TYPES",
     "UNSHREDDED_VARIANT",
     "TYPE_WIDENING",
+    "SALES_PARQUET",
 ];
+
+/// Outside the Delta fixtures' `s3://warehouse/delta/` prefix, so they never collide.
+const SALES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/sales_parquet";
 
 /// Unity Catalog REST host port (host-side). `LH_UNITY_PORT`, default 18080.
 fn unity_port() -> u16 {
@@ -116,6 +124,8 @@ fn setup() {
         let mut conn = exa_conn();
         create_schema_and_scripts(&mut conn);
 
+        seed_sales_parquet_table();
+
         create_unity_virtual_schema(&mut conn);
     });
 }
@@ -147,6 +157,73 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     ));
 }
 
+/// Writes the in-file columns (`year`/`region` are partition directories) and registers the
+/// table in-process, since its bytes are written in-process.
+fn seed_sales_parquet_table() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("amount", DataType::Float64, false),
+    ]));
+    let files: [(&str, &[i64], &[f64]); 3] = [
+        ("year=2024/region=eu/p1.parquet", &[1, 2], &[100.0, 200.0]),
+        ("year=2024/region=us/p2.parquet", &[3], &[300.0]),
+        ("year=2025/region=eu/p3.parquet", &[4], &[400.0]),
+    ];
+    for (file, ids, amounts) in files {
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(ids.to_vec())),
+                Arc::new(Float64Array::from(amounts.to_vec())),
+            ],
+        )
+        .expect("sales_parquet batch");
+        write_parquet_fixture(&format!("{SALES_PARQUET_LOCATION}/{file}"), batch);
+    }
+
+    let base = format!("{}/api/2.1/unity-catalog", unity_catalog_url());
+    let client = reqwest::blocking::Client::new();
+    let delete = client
+        .delete(format!("{base}/tables/{UNITY_NAMESPACE}.sales_parquet"))
+        .send()
+        .expect("DELETE sales_parquet");
+    assert!(
+        delete.status().is_success() || delete.status() == reqwest::StatusCode::NOT_FOUND,
+        "DELETE sales_parquet returned {}",
+        delete.status()
+    );
+
+    let (catalog_name, schema_name) = UNITY_NAMESPACE.split_once('.').expect("<catalog>.<schema>");
+    let column = |position: usize, name: &str, type_text: &str, type_name: &str| {
+        let type_json =
+            serde_json::json!({"name": name, "type": type_text, "nullable": true, "metadata": {}});
+        serde_json::json!({
+            "name": name, "type_text": type_text, "type_name": type_name,
+            "type_json": type_json.to_string(), "position": position, "nullable": true
+        })
+    };
+    let mut year = column(2, "year", "integer", "INT");
+    year["partition_index"] = 0.into();
+    let mut region = column(3, "region", "string", "STRING");
+    region["partition_index"] = 1.into();
+    let response = client
+        .post(format!("{base}/tables"))
+        .json(&serde_json::json!({
+            "name": "sales_parquet", "catalog_name": catalog_name, "schema_name": schema_name,
+            "table_type": "EXTERNAL", "data_source_format": "PARQUET",
+            "storage_location": SALES_PARQUET_LOCATION,
+            "columns": [column(0, "id", "long", "LONG"), column(1, "amount", "double", "DOUBLE"), year, region]
+        }))
+        .send()
+        .expect("POST sales_parquet");
+    let status = response.status();
+    assert!(
+        status.is_success(),
+        "POST sales_parquet failed: {status}: {}",
+        response.text().unwrap_or_default()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Result helpers.
 // ---------------------------------------------------------------------------
@@ -166,11 +243,12 @@ fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
 }
 
 /// The `(COLUMN_NAME, COLUMN_TYPE)` pairs declared for `table` under `vs_name`,
-/// both uppercased.
+/// both uppercased, in declared column order.
 fn column_types(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<(String, String)> {
     let cols = conn.query_columns(&format!(
         "SELECT COLUMN_NAME, COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
-         WHERE COLUMN_SCHEMA = '{vs_name}' AND COLUMN_TABLE = '{table}'"
+         WHERE COLUMN_SCHEMA = '{vs_name}' AND COLUMN_TABLE = '{table}' \
+         ORDER BY COLUMN_ORDINAL_POSITION"
     ));
     if cols.len() < 2 {
         return Vec::new();
@@ -365,13 +443,8 @@ fn delta_e2e_table(name: &str) -> CatalogTableIdent {
     }
 }
 
-/// Resolve `table_name`'s Delta scan through the `FormatReader` seam: load the
-/// table's metadata from the live Unity Catalog server, select the Delta reader
-/// via `format_reader`, and resolve its scan. `use_vended_credentials` selects
-/// which of the two credential modes the request exercises; `filter` forwards
-/// an optional pushdown filter to `resolve_scan`; `handle_pushdown` is never
-/// reached, matching this plan's scope.
-async fn resolve_delta_scan(
+/// Resolve `table_name`'s scan via `format_reader` against the live Unity Catalog, bypassing `handle_pushdown`.
+async fn resolve_unity_scan(
     table_name: &str,
     use_vended_credentials: bool,
     filter: Option<&serde_json::Value>,
@@ -385,7 +458,7 @@ async fn resolve_delta_scan(
     let storage = delta_static_storage();
 
     let reader = format_reader(
-        ScanSource::UnityDelta {
+        ScanSource::Unity {
             session: &session,
             table: &table,
         },
@@ -479,8 +552,8 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     wait_for_unity_catalog();
 
     let rt = rt();
-    let vended = rt.block_on(resolve_delta_scan("basic_partitioned", true, None));
-    let static_creds = rt.block_on(resolve_delta_scan("basic_partitioned", false, None));
+    let vended = rt.block_on(resolve_unity_scan("basic_partitioned", true, None));
+    let static_creds = rt.block_on(resolve_unity_scan("basic_partitioned", false, None));
 
     assert!(
         !vended.files.is_empty(),
@@ -518,7 +591,7 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
          {letters:?}"
     );
 
-    let dv_scan = rt.block_on(resolve_delta_scan("table_with_dv", true, None));
+    let dv_scan = rt.block_on(resolve_unity_scan("table_with_dv", true, None));
     assert_eq!(
         dv_scan.files.len(),
         1,
@@ -544,7 +617,7 @@ fn unity_delta_filters_prune_the_resolved_file_list() {
 
     let rt = rt();
 
-    let all_partitioned = rt.block_on(resolve_delta_scan("basic_partitioned", true, None));
+    let all_partitioned = rt.block_on(resolve_unity_scan("basic_partitioned", true, None));
     assert_eq!(
         all_partitioned.files.len(),
         6,
@@ -556,7 +629,7 @@ fn unity_delta_filters_prune_the_resolved_file_list() {
         "left": {"type": "column", "name": "LETTER"},
         "right": {"type": "literal_string", "value": "a"}
     });
-    let pruned_partitioned = rt.block_on(resolve_delta_scan(
+    let pruned_partitioned = rt.block_on(resolve_unity_scan(
         "basic_partitioned",
         true,
         Some(&letter_filter),
@@ -568,7 +641,7 @@ fn unity_delta_filters_prune_the_resolved_file_list() {
         pruned_partitioned.files
     );
 
-    let all_stats = rt.block_on(resolve_delta_scan("multi_part_stats", true, None));
+    let all_stats = rt.block_on(resolve_unity_scan("multi_part_stats", true, None));
     assert_eq!(
         all_stats.files.len(),
         5,
@@ -580,7 +653,7 @@ fn unity_delta_filters_prune_the_resolved_file_list() {
         "left": {"type": "column", "name": "ID"},
         "right": {"type": "literal_exactnumeric", "value": "2"}
     });
-    let pruned_stats = rt.block_on(resolve_delta_scan(
+    let pruned_stats = rt.block_on(resolve_unity_scan(
         "multi_part_stats",
         true,
         Some(&id_filter),
@@ -1758,4 +1831,80 @@ fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf()
          gathered across every shard fragment and every echoed copy of the pushed SQL, \
          got {embedded_files:?}: {pushed}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Unity Parquet table coverage.
+// ---------------------------------------------------------------------------
+
+/// Scenario: A Unity Parquet table appears in the createVirtualSchema listing.
+/// Scenario: A Unity Parquet table returns its rows and partition values end to end.
+#[test]
+fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
+    setup();
+    let mut conn = exa_conn();
+
+    assert!(
+        enumerated_table_names(&mut conn, VS_NAME).contains(&"SALES_PARQUET".to_string()),
+        "createVirtualSchema must enumerate 'sales_parquet'"
+    );
+    let cols = column_types(&mut conn, VS_NAME, "SALES_PARQUET");
+    let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        ["ID", "AMOUNT", "YEAR", "REGION"],
+        "Parquet columns must precede partition columns, in declared order"
+    );
+    assert_col_type(&cols, "ID", "DECIMAL(20,0)");
+    assert_col_type(&cols, "AMOUNT", "DOUBLE");
+    assert_col_type(&cols, "YEAR", "DECIMAL(10,0)");
+    assert_col_type(&cols, "REGION", "VARCHAR(2000000)");
+
+    let cols = conn.query_columns(&format!(
+        "SELECT ID, AMOUNT, \"YEAR\", REGION FROM {} ORDER BY ID",
+        table_ref("SALES_PARQUET")
+    ));
+    let rows: Vec<(i64, f64, i64, String)> = (0..cols[0].len())
+        .map(|row| {
+            (
+                parse_int(&cols[0][row]),
+                parse_numeric(&cols[1][row]),
+                parse_int(&cols[2][row]),
+                value_to_string(&cols[3][row]),
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows,
+        vec![
+            (1, 100.0, 2024, "eu".to_string()),
+            (2, 200.0, 2024, "eu".to_string()),
+            (3, 300.0, 2024, "us".to_string()),
+            (4, 400.0, 2025, "eu".to_string()),
+        ],
+        "each row must carry its own file's YEAR and REGION directory values"
+    );
+
+    let filtered = conn.query_scalar_i64(&format!(
+        "SELECT COUNT(*) FROM {} WHERE REGION = 'eu' AND \"YEAR\" = 2024",
+        table_ref("SALES_PARQUET")
+    ));
+    assert_eq!(
+        filtered, 2,
+        "a partition-column filter must match exactly year=2024/region=eu"
+    );
+}
+
+/// Scenario: a Unity Parquet table's scan resolves identically under vended and static credentials
+#[test]
+fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
+    setup();
+
+    let rt = rt();
+    let vended = rt.block_on(resolve_unity_scan("sales_parquet", true, None));
+    let static_creds = rt.block_on(resolve_unity_scan("sales_parquet", false, None));
+
+    assert_eq!(vended.table_root, static_creds.table_root);
+    assert_eq!(vended.files, static_creds.files);
+    assert_eq!(vended.files.len(), 3, "{:?}", vended.files);
 }

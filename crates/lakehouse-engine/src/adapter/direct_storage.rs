@@ -110,6 +110,7 @@ impl CatalogClient for DirectStorageCatalogClient {
                     storage_location: Some(join_storage_path(&self.base_path, Some(&name))),
                     format: TableFormat::Parquet,
                     vended_credential_key: None,
+                    partition_columns: Vec::new(),
                     columns,
                 });
             }
