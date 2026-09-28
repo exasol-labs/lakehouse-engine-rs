@@ -260,7 +260,6 @@ pub(super) fn two_scan_tuning() -> JoinScanRequestConfig<'static> {
     }
 }
 
-/// Scenario: A non-empty schema qualifies the UDF name; empty or absent falls back to the bare name
 #[test]
 fn qualify_udf_uses_schema_and_falls_back_when_empty() {
     assert_eq!(qualify_udf(Some("schema"), "UDF"), "\"schema\".UDF");
@@ -337,7 +336,6 @@ fn delta_join_request_over(
     })
 }
 
-/// Scenario: A refused column reached through a join leg is refused ahead of the empty-side return
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
     let catalog = unity_delta_catalog().await;
@@ -372,7 +370,6 @@ async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
     assert_refuses_binary_col(error);
 }
 
-/// Scenario: A refused column on one join side does not refuse a same-named mappable column on the other
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable_column_on_the_other()
  {
@@ -415,7 +412,6 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
         .expect("a select list naming only the mappable side's column must plan");
 }
 
-/// Scenario: An unqualified column reference is charged to every join side
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
     let catalog = unity_delta_catalog().await;
@@ -431,7 +427,6 @@ async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
     assert_refuses_binary_col(error);
 }
 
-/// Scenario: A SELECT * join is refused by the side declaring the refused column
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_select_star_join_is_refused_by_the_side_declaring_the_refused_column() {
     let catalog = unity_delta_catalog().await;
@@ -538,7 +533,6 @@ async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend 
     .await
 }
 
-/// Scenario: Each Delta join leg prunes by its own side-local predicate
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     let catalog = unity_delta_catalog().await;
@@ -694,7 +688,6 @@ async fn delta_n_scan_pushdown(
     .await
 }
 
-/// Scenario: Join legs resolve concurrently rather than sequentially
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_legs_resolve_concurrently_in_leg_index_order() {
     let catalog = RendezvousCatalog::spawn(2).await;
@@ -717,7 +710,6 @@ async fn join_legs_resolve_concurrently_in_leg_index_order() {
     );
 }
 
-/// Scenario: Resolved join sides stay in leg-index order, not completion order
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn resolved_join_sides_stay_in_leg_index_order() {
     let catalog = unity_delta_catalog().await;

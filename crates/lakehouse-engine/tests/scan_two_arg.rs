@@ -209,7 +209,6 @@ fn spec_for_files(files: Vec<FileEntry>) -> ScanSpec {
     }
 }
 
-/// Scenario: the two-argument path emits rows identical to the single-argument path
 #[test]
 fn scan_registers_only_assigned_files_two_arg() {
     let dir = std::env::temp_dir().join(format!("lh_two_arg_{}", std::process::id()));
@@ -258,7 +257,6 @@ fn scan_registers_only_assigned_files_two_arg() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a SQL NULL in either argument is a user error
 #[test]
 fn two_arg_null_in_either_argument_is_user_error() {
     let files_json = ScanSpec::files_json(&[FileEntry::new("s3://w/f0.parquet", 0)]);
@@ -279,7 +277,6 @@ fn two_arg_null_in_either_argument_is_user_error() {
     );
 }
 
-/// Scenario: only the assigned file is scanned; an unassigned sibling file never leaks in
 #[test]
 fn scan_registers_assigned_files_via_parquet_provider() {
     let dir = std::env::temp_dir().join(format!("lh_provider_{}", std::process::id()));
@@ -315,7 +312,6 @@ fn scan_registers_assigned_files_via_parquet_provider() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: positional-delete refs survive the two-argument split and are enforced
 #[test]
 fn spec_reconstitutes_with_delete_entries() {
     let dir = std::env::temp_dir().join(format!("lh_recon_del_{}", std::process::id()));

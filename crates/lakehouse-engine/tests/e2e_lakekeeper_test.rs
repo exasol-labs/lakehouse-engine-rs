@@ -164,7 +164,6 @@ fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
         .collect()
 }
 
-/// Scenario: setup bootstraps Lakekeeper and a virtual schema exists over each warehouse
 #[test]
 fn lakekeeper_bootstrap_and_warehouses_provision() {
     setup();
@@ -183,7 +182,6 @@ fn lakekeeper_bootstrap_and_warehouses_provision() {
     }
 }
 
-/// Scenario: createVirtualSchema enumerates the seeded table via the built-in OAuth2 client
 #[test]
 fn lakekeeper_create_virtual_schema_lists_tables_over_oidc() {
     setup();
@@ -198,7 +196,6 @@ fn lakekeeper_create_virtual_schema_lists_tables_over_oidc() {
     );
 }
 
-/// Scenario: projection + filter + LIMIT over the static-credential warehouse returns correct rows
 #[test]
 fn lakekeeper_static_creds_projection_filter_limit() {
     setup();
@@ -248,7 +245,6 @@ fn lakekeeper_static_creds_projection_filter_limit() {
     );
 }
 
-/// Scenario: a vended-credential scan with no static storage field returns the static warehouse's rows
 // With no static credential or store address to fall back on, rows can only come
 // through the vended-credentials delegation.
 #[test]
@@ -310,7 +306,6 @@ fn lakekeeper_vended_creds_projection_filter() {
     );
 }
 
-/// Scenario: a readiness wait against an unreachable stack panics rather than skipping
 #[test]
 fn lakekeeper_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| {
@@ -323,7 +318,6 @@ fn lakekeeper_suite_fails_when_stack_unavailable() {
     );
 }
 
-/// Scenario: both virtual schemas use the shared harness's adapter and scan scripts
 #[test]
 fn lakekeeper_binary_uses_shared_harness_provisioning() {
     setup();
@@ -373,7 +367,6 @@ fn lakekeeper_binary_uses_shared_harness_provisioning() {
     }
 }
 
-/// Scenario: the OAuth2 path resolves tables under the `/catalog` base path
 #[test]
 fn lakekeeper_oauth_prefix_under_base_path_resolves() {
     setup();
@@ -406,7 +399,6 @@ fn lakekeeper_oauth_prefix_under_base_path_resolves() {
     assert_eq!(parse_int(&cols[0][0]), 7, "resolved row must be id=7");
 }
 
-/// Scenario: a failing credential-bearing CONNECTION DDL leaks neither SQL text nor credentials
 #[test]
 fn lakekeeper_credentials_never_appear_in_output() {
     const SENTINEL_CLIENT_SECRET: &str = "LK_DUMMY_CLIENT_SECRET_SENTINEL";
@@ -584,7 +576,6 @@ async fn first_parquet_under(
     panic!("no .parquet data file under {key_prefix}: the star-schema seed must have written one")
 }
 
-/// Scenario: fact_orders' vended credential is denied reading dim_customer's data file (#294)
 // An ALLOWED cross read means this fixture cannot reproduce #294 and a green join
 // test would prove only carriage. The own-credential control read rules out a
 // broken probe. No credential value may reach output.
@@ -674,7 +665,6 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
     });
 }
 
-/// Scenario: a broadcast join over per-table-scoped vended credentials returns correct rows (#294)
 #[test]
 fn lakekeeper_vended_broadcast_join_result_correct() {
     setup();

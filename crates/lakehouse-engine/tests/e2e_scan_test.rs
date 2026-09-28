@@ -89,7 +89,6 @@ fn vs_fact_table() -> String {
     format!("{VS_NAME}.{}", E2E_FACT_TABLE.to_uppercase())
 }
 
-/// Scenario: projection + filter + LIMIT returns the correct projected, filtered, capped rows
 #[test]
 fn e2e_projection_filter_limit_returns_correct_rows() {
     setup_e2e();
@@ -209,7 +208,6 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
     );
 }
 
-/// Scenario: create VS maps the Iceberg table schema to Exasol types
 #[test]
 fn create_vs_maps_iceberg_schema() {
     setup_e2e();
@@ -252,7 +250,7 @@ fn create_vs_maps_iceberg_schema() {
     }
 }
 
-/// Scenario: a filter predicate restricts the emitted rows
+/// Scenario: Filter predicate restricts the emitted rows
 #[test]
 fn scan_filter_restricts_rows() {
     setup_e2e();
@@ -266,7 +264,6 @@ fn scan_filter_restricts_rows() {
     );
 }
 
-/// Scenario: LIMIT caps the rows emitted by the scan
 #[test]
 fn scan_limit_caps_rows() {
     setup_e2e();
@@ -279,7 +276,6 @@ fn scan_limit_caps_rows() {
     );
 }
 
-/// Scenario: adapter and scan entry points resolve from the same uploaded .so
 #[test]
 fn both_scripts_resolve_one_artifact() {
     setup_e2e();
@@ -311,7 +307,6 @@ fn both_scripts_resolve_one_artifact() {
     );
 }
 
-/// Scenario: full projection with date and timestamp columns round-trips correctly
 #[test]
 fn mixed_column_parquet_round_trips() {
     setup_e2e();
@@ -352,7 +347,6 @@ fn mixed_column_parquet_round_trips() {
     assert!(!cols[4][0].is_null(), "event_ts must not be null");
 }
 
-/// Scenario: CREATE VS with an unreachable catalog errors clearly without leaking credentials
 #[test]
 fn create_vs_unreachable_catalog_errors_no_secret() {
     setup_e2e();
@@ -394,7 +388,6 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     );
 }
 
-/// Scenario: a CONNECTION with both a static token and a complete OAuth2 pair is rejected through the deployed .so
 #[test]
 fn create_vs_ambiguous_catalog_auth_errors_no_secret() {
     setup_e2e();
@@ -445,7 +438,6 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     );
 }
 
-/// Scenario: querying a table absent from TABLE_MAP errors clearly instead of scanning another table
 #[test]
 fn scan_unknown_virtual_table_errors() {
     setup_e2e();
@@ -459,7 +451,6 @@ fn scan_unknown_virtual_table_errors() {
     );
 }
 
-/// Scenario: a renamed column resolves by Iceberg field-id across pre- and post-rename files in one shard
 #[test]
 fn e2e_renamed_column_resolves_by_field_id() {
     setup_e2e();
@@ -521,7 +512,6 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     }
 }
 
-/// Scenario: added columns return their initial-default for a pre-add file and real values for a post-add file
 #[test]
 fn e2e_added_columns_initial_default_fill_all_types() {
     setup_e2e();
@@ -618,7 +608,6 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
     }
 }
 
-/// Scenario: connecting to an unreachable Exasol panics rather than returning Ok
 #[test]
 fn e2e_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| ExaConn::connect("192.0.2.1", 8563, "sys", "exasol"));
@@ -628,7 +617,6 @@ fn e2e_fails_when_stack_unavailable() {
     );
 }
 
-/// Scenario: the scan emits node-local partial aggregates instead of raw rows
 #[test]
 fn scan_emits_partial_aggregate_row() {
     setup_e2e();
@@ -644,7 +632,6 @@ fn scan_emits_partial_aggregate_row() {
     assert_eq!(count, 20, "COUNT(*) should return 20 for the seeded table");
 }
 
-/// Scenario: partial COUNT/SUM/MIN/MAX merge to the correct scalars
 #[test]
 fn partial_count_sum_min_max_merge_ready() {
     setup_e2e();
@@ -691,7 +678,6 @@ fn partial_count_sum_min_max_merge_ready() {
     );
 }
 
-/// Scenario: AVG is emitted as a partial sum and count and merges correctly, with and without a filter
 #[test]
 fn partial_avg_emits_sum_count_pair() {
     setup_e2e();
@@ -723,7 +709,6 @@ fn partial_avg_emits_sum_count_pair() {
     );
 }
 
-/// Scenario: AVG/STDDEV over BIGINT and DECIMAL columns match the seed-derived oracle (#399)
 #[test]
 fn partial_avg_stddev_over_non_double_columns() {
     setup_e2e();
@@ -780,7 +765,6 @@ fn assert_single_group_aggregate_pushed_down(conn: &mut ExaConn, query_sql: &str
     );
 }
 
-/// Scenario: a single-group aggregate's common scan spec carries an empty projection (#145)
 #[test]
 fn single_group_aggregate_scan_spec_projection_is_empty() {
     setup_e2e();
@@ -806,7 +790,6 @@ fn single_group_aggregate_scan_spec_projection_is_empty() {
     }
 }
 
-/// Scenario: SUM(LENGTH(col)) is pushed down as node-local partial aggregation
 #[test]
 fn sum_length_expression_argument_pushed_down() {
     setup_e2e();
@@ -828,7 +811,6 @@ fn sum_length_expression_argument_pushed_down() {
     );
 }
 
-/// Scenario: SUM(id * score) with an NQ1-shaped filter straddling both shards merges to the single-scan value
 #[test]
 fn sum_two_column_product_pushes_down_matches_single_node() {
     setup_e2e();
@@ -872,7 +854,6 @@ fn sum_two_column_product_pushes_down_matches_single_node() {
     );
 }
 
-/// Scenario: an untranslatable aggregate argument (BIT_AND) declines aggregate pushdown and the row-scan fallback is correct
 #[test]
 fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
     setup_e2e();
@@ -900,7 +881,6 @@ fn untranslatable_aggregate_argument_falls_back_to_row_scan() {
     );
 }
 
-/// Scenario: ORDER BY score DESC LIMIT 12 straddling both files pushes a per-shard top-N and matches a single full scan
 #[test]
 fn ordered_topn_pushes_down_matches_single_node() {
     setup_e2e();
@@ -959,7 +939,6 @@ fn ordered_topn_pushes_down_matches_single_node() {
     }
 }
 
-/// Scenario: ORDER BY without LIMIT declines top-N pushdown and Exasol re-sorts the rows itself
 #[test]
 fn order_by_without_limit_falls_back_correctly() {
     setup_e2e();
@@ -1000,7 +979,6 @@ fn order_by_without_limit_falls_back_correctly() {
     );
 }
 
-/// Scenario: adapterNotes carry PARALLELISM_FACTOR but no NR_OF_CORES or CLUSTER_NODES
 #[test]
 fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     setup_e2e();
@@ -1047,7 +1025,6 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     );
 }
 
-/// Scenario: the adapter VM's core count comes from the Exasol container's CPU set, not the host
 #[test]
 fn adapter_detects_container_cpuset() {
     setup_e2e();
@@ -1141,7 +1118,6 @@ fn exasol_container_cpuset_cores() -> usize {
         .sum()
 }
 
-/// Scenario: with no node count in adapterNotes, a multi-file scan still emits the shard fan-out
 #[test]
 fn pushdown_shards_from_handshake_node_count_without_note() {
     setup_e2e();
@@ -1162,7 +1138,6 @@ fn pushdown_shards_from_handshake_node_count_without_note() {
     );
 }
 
-/// Scenario: COUNT(col) pushdown returns the correct non-null row count, with and without a filter
 #[test]
 fn aggregate_count_col_returns_correct_value() {
     setup_e2e();
@@ -1289,7 +1264,6 @@ fn aggregate_count_col_returns_correct_value() {
     }
 }
 
-/// Scenario: a declined outer join re-pushes plain single-table scans carrying the alias filter (#193)
 #[test]
 fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
     setup_e2e();
@@ -1318,7 +1292,6 @@ fn e2e_declined_outer_join_repushes_aliased_single_table_scan() {
     );
 }
 
-/// Scenario: the fan-out path returns every row exactly once, with no gaps or duplicates
 #[test]
 fn multi_shard_row_query_matches_single_shard() {
     setup_e2e();
@@ -1351,7 +1324,6 @@ fn multi_shard_row_query_matches_single_shard() {
     }
 }
 
-/// Scenario: a multi-file scan with the `(path, size)` + `table_root` payload scans every file exactly once with correct values
 #[test]
 fn scan_registers_assigned_files_with_path_size_payload() {
     setup_e2e();
@@ -1447,7 +1419,6 @@ fn assert_group_by_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     );
 }
 
-/// Scenario: a decomposed GROUP BY query's common scan spec carries an empty projection (#145)
 #[test]
 fn grouped_aggregate_scan_spec_projection_is_empty() {
     setup_e2e();
@@ -1469,7 +1440,6 @@ fn grouped_aggregate_scan_spec_projection_is_empty() {
     );
 }
 
-/// Scenario: GROUP BY MOD(id, 4) returns correct per-group COUNT(*) and SUM(score)
 #[test]
 fn test_group_by_sum_count() {
     setup_e2e();
@@ -1508,7 +1478,6 @@ fn test_group_by_sum_count() {
     );
 }
 
-/// Scenario: two GROUP BY keys with a WHERE filter return correct per-group row counts
 #[test]
 fn test_group_by_multi_key_with_filter() {
     setup_e2e();
@@ -1542,7 +1511,6 @@ fn test_group_by_multi_key_with_filter() {
     }
 }
 
-/// Scenario: GROUP BY a CAST(score / 25.0 AS DECIMAL(4,0)) expression key returns correct per-group counts
 #[test]
 fn test_group_by_expression_key() {
     setup_e2e();
@@ -1586,7 +1554,6 @@ fn test_group_by_expression_key() {
     );
 }
 
-/// Scenario: AVG(score) per group is correct for groups with unequal row counts
 #[test]
 fn test_group_by_avg_correctness() {
     setup_e2e();
@@ -1624,7 +1591,6 @@ fn test_group_by_avg_correctness() {
     }
 }
 
-/// Scenario: GROUP BY a near-unique column completes under the memory-pool and spill backstop
 #[test]
 fn test_high_cardinality_group_by_spill() {
     setup_e2e();
@@ -1663,7 +1629,6 @@ fn test_high_cardinality_group_by_spill() {
     }
 }
 
-/// Scenario: EXPLAIN VIRTUAL shows the shard_key fan-out and no IPROC()
 #[test]
 fn test_shard_key_fanout_explain() {
     setup_e2e();
@@ -1698,7 +1663,6 @@ fn test_shard_key_fanout_explain() {
     );
 }
 
-/// Scenario: NULL group keys produced by NULLIF are grouped together consistently
 #[test]
 fn test_group_by_null_key_grouping() {
     setup_e2e();
@@ -1754,7 +1718,6 @@ fn test_group_by_null_key_grouping() {
     );
 }
 
-/// Scenario: an aggregate before the group key in the select list keeps its column position (#33)
 #[test]
 fn test_group_by_agg_before_key() {
     setup_e2e();
@@ -1795,7 +1758,6 @@ fn test_group_by_agg_before_key() {
     );
 }
 
-/// Scenario: an interleaved key, aggregate, key select list is reassembled positionally
 #[test]
 fn test_group_by_interleaved_multi_key() {
     setup_e2e();
@@ -1853,7 +1815,6 @@ fn test_group_by_interleaved_multi_key() {
     );
 }
 
-/// Scenario: an expression group key after an aggregate keeps its resolved DECIMAL type, not VARCHAR
 #[test]
 fn test_group_by_expr_key_after_agg() {
     setup_e2e();
@@ -1903,7 +1864,6 @@ fn test_group_by_expr_key_after_agg() {
     );
 }
 
-/// Scenario: aggregate-first GROUP BY with matched, unmatched, mixed-junction, and COUNT(DISTINCT) HAVING shapes (#195)
 #[test]
 fn test_group_by_agg_first_with_having() {
     setup_e2e();
@@ -2062,7 +2022,6 @@ fn test_group_by_agg_first_with_having() {
     );
 }
 
-/// Scenario: an expression-valued multi-key GROUP BY with mixed key types keeps each key's declared type
 #[test]
 fn test_group_by_expr_multi_key_tuple() {
     setup_e2e();
@@ -2152,7 +2111,6 @@ fn test_group_by_expr_multi_key_tuple() {
     );
 }
 
-/// Scenario: multi-key GROUP BY with HAVING and LIMIT caps the number of groups in the outer merge
 #[test]
 fn test_group_by_multi_key_having_limit() {
     setup_e2e();
@@ -2209,7 +2167,7 @@ fn test_group_by_multi_key_having_limit() {
     }
 }
 
-/// Scenario: a high-cardinality multi-key GROUP BY completes under the bounded memory pool
+/// Scenario: High-cardinality multi-key grouped scan completes under the bounded memory pool
 #[test]
 fn test_high_cardinality_multi_key_group_by_spill() {
     setup_e2e();
@@ -2295,7 +2253,6 @@ fn distinct_numeric_suffixes(haystack: &str, marker: &str) -> std::collections::
     indices
 }
 
-/// Scenario: a single-table grouped select list with ROUND over aggregates pushes down as the grouped merge wrapper and is correct (#82)
 #[test]
 fn test_group_by_scalar_over_aggregate_round() {
     setup_e2e();
@@ -2369,7 +2326,6 @@ fn test_group_by_scalar_over_aggregate_round() {
     }
 }
 
-/// Scenario: a bare COUNT(*) and a scalar-wrapped COUNT(*) share one deduplicated partial column
 #[test]
 fn test_group_by_shared_inner_aggregate_dedup() {
     setup_e2e();
@@ -2454,7 +2410,6 @@ fn test_group_by_shared_inner_aggregate_dedup() {
     }
 }
 
-/// Scenario: create VS with NAMESPACE enumerates every table in the namespace
 #[test]
 fn e2e_create_vs_enumerates_namespace_tables() {
     setup_e2e();
@@ -2482,7 +2437,6 @@ fn e2e_create_vs_enumerates_namespace_tables() {
     );
 }
 
-/// Scenario: pushdown resolves the scanned Iceberg table from TABLE_MAP by the virtual table name
 #[test]
 fn e2e_pushdown_scans_table_from_involved_tables() {
     setup_e2e();
@@ -2523,7 +2477,6 @@ fn vs_regions_table() -> String {
     format!("{VS_NAME}.{}", E2E_PART_TABLE.to_uppercase())
 }
 
-/// Scenario: a partition filter prunes and returns the correct rows
 #[test]
 fn e2e_partition_filter_prunes_and_returns_correct_rows() {
     setup_e2e();
@@ -2614,7 +2567,6 @@ fn e2e_partition_filter_prunes_and_returns_correct_rows() {
     );
 }
 
-/// Scenario: partition pruning and per-file min/max range pruning each resolve the regions table to one file
 #[test]
 fn e2e_range_filter_prunes_by_file_bounds() {
     setup_e2e();
@@ -2701,7 +2653,6 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     );
 }
 
-/// Scenario: an Exasol-side JOIN across two virtual tables returns the correct joined rows
 #[test]
 fn e2e_pushdown_resolves_files_once_multi_table() {
     setup_e2e();
@@ -2750,7 +2701,6 @@ fn e2e_pushdown_resolves_files_once_multi_table() {
 // group_by request with a literal-only select list; the scan must keep the GROUP BY
 // so Exasol's outer COUNT(*) counts group rows.
 
-/// Scenario: COUNT(*) over a grouped sub-select counts groups, not source rows (#52)
 #[test]
 fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
     setup_e2e();
@@ -2798,7 +2748,6 @@ fn e2e_nested_aggregate_over_grouped_subselect_returns_correct_count() {
 // `render_limit_offset`, plus canaries for the two shapes whose `debug_assert!` guards
 // compile out of the release `.so`.
 
-/// Scenario: ORDER BY a projected key with LIMIT 12 OFFSET 3 returns the shifted window on the row-scan wrapper (#191)
 #[test]
 fn ordered_limit_offset_returns_shifted_window() {
     setup_e2e();
@@ -2837,7 +2786,6 @@ fn ordered_limit_offset_returns_shifted_window() {
     }
 }
 
-/// Scenario: ORDER BY an unprojected key with LIMIT 5 OFFSET 2 returns the shifted window without leaking the sort column
 #[test]
 fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
     setup_e2e();
@@ -2866,7 +2814,6 @@ fn ordered_limit_offset_unprojected_sort_key_returns_shifted_window() {
     );
 }
 
-/// Scenario: the grouped merge wrapper applies LIMIT 2 OFFSET 1 to the ranked groups
 #[test]
 fn grouped_order_by_limit_offset_returns_shifted_groups() {
     setup_e2e();
@@ -2913,7 +2860,6 @@ fn grouped_order_by_limit_offset_returns_shifted_groups() {
     );
 }
 
-/// Scenario: the qualified single-table wrapper applies LIMIT 2 OFFSET 1 with COUNT(DISTINCT)
 #[test]
 fn qualified_wrapper_limit_offset_returns_shifted_window() {
     setup_e2e();
@@ -2962,7 +2908,6 @@ fn qualified_wrapper_limit_offset_returns_shifted_window() {
     );
 }
 
-/// Scenario: Exasol rejects OFFSET on an ungrouped aggregated select before the adapter is consulted (42000)
 #[test]
 fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     setup_e2e();
@@ -2993,7 +2938,6 @@ fn offset_on_single_group_aggregate_is_rejected_by_exasol() {
     );
 }
 
-/// Scenario: an unrenderable ordering (HASH_MD5) with OFFSET is windowed by Exasol and matches a native reference
 #[test]
 fn unrenderable_ordering_with_offset_matches_single_node() {
     setup_e2e();
@@ -3116,7 +3060,6 @@ fn assert_single_group_matches_native_oracle(conn: &mut ExaConn, select_list: &s
     }
 }
 
-/// Scenario: ROUND(SUM(col)) over a sharded table merges to one row equal to the native oracle (#194)
 #[test]
 fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
     setup_e2e();
@@ -3128,7 +3071,6 @@ fn e2e_single_group_scalar_over_aggregate_round_sum_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, "");
 }
 
-/// Scenario: ROUND(VARIANCE(col)), VARIANCE and VAR_SAMP succeed and match the native oracle (#188)
 #[test]
 fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
     setup_e2e();
@@ -3143,7 +3085,6 @@ fn e2e_single_group_scalar_over_variance_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, "ROUND(VAR_SAMP(L_EXTENDEDPRICE), 4)", "");
 }
 
-/// Scenario: a COUNT(*) shared by a plain and a scalar-over-aggregate item collapses into one partial column
 #[test]
 fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
     setup_e2e();
@@ -3167,7 +3108,6 @@ fn e2e_single_group_scalar_over_aggregate_shared_count_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, "");
 }
 
-/// Scenario: interleaved plain and scalar-over-aggregate items keep select-list order and their own types
 #[test]
 fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
     setup_e2e();
@@ -3181,7 +3121,6 @@ fn e2e_single_group_scalar_over_aggregate_interleaved_matches_native_oracle() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, "");
 }
 
-/// Scenario: an all-files-pruned predicate still yields one row with count 0 and a NULL scalar-wrapped SUM
 #[test]
 fn e2e_single_group_scalar_over_aggregate_all_files_pruned_returns_one_row() {
     setup_e2e();
@@ -3201,7 +3140,6 @@ fn e2e_single_group_scalar_over_aggregate_all_files_pruned_returns_one_row() {
     assert_single_group_matches_native_oracle(&mut conn, select_list, tail);
 }
 
-/// Scenario: the decomposed request pushes aggregates into `aggregates`, with an empty projection and no projection expression (#194)
 #[test]
 fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection() {
     setup_e2e();
@@ -3230,7 +3168,6 @@ fn e2e_single_group_scalar_over_aggregate_explain_virtual_shows_empty_projection
     );
 }
 
-/// Scenario: integer `/` pushes down as float division, 7/2 = 3.5 (#186)
 #[test]
 fn e2e_float_div_int_over_int_matches_native_oracle() {
     setup_e2e();
@@ -3261,7 +3198,6 @@ fn e2e_float_div_int_over_int_matches_native_oracle() {
     );
 }
 
-/// Scenario: a bare column division pushes down as a checked division with a DOUBLE emit type (#186, #370)
 #[test]
 fn e2e_float_div_pushes_checked_division_call_projection() {
     setup_e2e();
@@ -3321,7 +3257,6 @@ fn division_by_zero_failure_sql_code(conn: &mut ExaConn, sql: &str) -> String {
 /// Exasol reports every UDF-raised error under this generic state, not native `22012`.
 const UDF_ERROR_SQL_CODE: &str = "22002";
 
-/// Scenario: a projected x/0 fails with the checked division's own division-by-zero message (#370)
 #[test]
 fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
     setup_e2e();
@@ -3340,7 +3275,6 @@ fn e2e_float_div_by_zero_projected_fails_with_division_by_zero() {
     );
 }
 
-/// Scenario: a projected 0/0 fails with the same division-by-zero message instead of a silent NULL
 #[test]
 fn e2e_zero_div_zero_projected_fails_with_division_by_zero() {
     setup_e2e();
@@ -3455,7 +3389,6 @@ fn assert_checked_division_reached_the_pushed_filter(pushed: &str) {
     );
 }
 
-/// Scenario: a division by zero in a pushed filter fails the query instead of changing the row count, for all four #370 shapes
 #[test]
 fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
     setup_e2e();
@@ -3484,7 +3417,6 @@ fn e2e_float_div_by_zero_in_filter_fails_like_native_exasol() {
     }
 }
 
-/// Scenario: a NULL divisor in a pushed predicate returns no rows without raising
 #[test]
 fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
     setup_e2e();
@@ -3506,7 +3438,6 @@ fn e2e_float_div_null_divisor_in_filter_returns_no_rows() {
     );
 }
 
-/// Scenario: a zero-guarded division matches native Exasol guard-first and over-raises division-first (#392)
 #[test]
 fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
     setup_e2e();
@@ -3585,7 +3516,6 @@ fn e2e_float_div_guarded_by_a_non_zero_conjunct_matches_the_measured_outcome() {
     );
 }
 
-/// Scenario: a division by zero in a pushed aggregate argument fails with the division-by-zero message
 #[test]
 fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
     setup_e2e();
@@ -3616,7 +3546,6 @@ fn e2e_float_div_by_zero_in_aggregate_argument_fails() {
     );
 }
 
-/// Scenario: GREATEST/LEAST return NULL when any argument is NULL, as in Exasol (#202)
 #[test]
 fn test_greatest_least_propagate_null_argument() {
     setup_e2e();
@@ -3678,7 +3607,6 @@ fn test_greatest_least_propagate_null_argument() {
     );
 }
 
-/// Scenario: `||`/CONCAT treat a NULL operand as an empty string, as in Exasol (#374)
 #[test]
 fn test_concat_null_operand_concatenates_non_null_parts() {
     setup_e2e();

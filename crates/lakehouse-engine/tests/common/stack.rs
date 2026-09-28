@@ -376,7 +376,6 @@ mod catalog_connection_password_tests {
         }
     }
 
-    /// Scenario: token auth serializes alone, since `validate_creds` rejects token plus OAuth2
     #[test]
     fn serializes_token_auth_field_when_present() {
         let password = CatalogConnectionPassword {
@@ -388,7 +387,6 @@ mod catalog_connection_password_tests {
         assert_eq!(parsed["token"], "bearer-token");
     }
 
-    /// Scenario: OAuth2 auth serializes alone, since `validate_creds` rejects token plus OAuth2
     #[test]
     fn serializes_oauth2_auth_fields_when_present() {
         let password = CatalogConnectionPassword {

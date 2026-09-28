@@ -8,7 +8,6 @@ type CatalogClientConstruction = fn(
     &Json,
 ) -> Result<Box<dyn CatalogClient>, UdfError>;
 
-/// Scenario: the listing pipeline's signature names neither `CatalogKind` nor a `CatalogClient`.
 #[test]
 fn construction_site_is_exhaustive_and_fallible_for_three_kinds() {
     let _pipeline: fn(
@@ -19,7 +18,6 @@ fn construction_site_is_exhaustive_and_fallible_for_three_kinds() {
     let _constructor: CatalogClientConstruction = construct_catalog_client;
 }
 
-/// Scenario: both catalog kinds resolve their tables through the one shared listing pipeline.
 #[test]
 fn both_kinds_share_one_listing_pipeline() {
     use iceberg::spec::{PrimitiveType, Type};
@@ -94,7 +92,6 @@ fn both_kinds_share_one_listing_pipeline() {
     );
 }
 
-/// Scenario: the listing pipeline declares a timestamp column at the precision it is handed.
 #[test]
 fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
     use iceberg::spec::{PrimitiveType, Type};

@@ -2,7 +2,6 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
-/// Scenario: under-root delete-file paths relativize like the data path; others stay absolute
 #[test]
 fn delete_file_paths_use_relative_absolute_encoding() {
     let root = "s3://warehouse/db/table";
@@ -36,7 +35,6 @@ fn delete_file_paths_use_relative_absolute_encoding() {
     );
 }
 
-/// Scenario: a Delta deletion vector's path_or_inline_dv survives relativization untouched
 #[test]
 fn relativization_leaves_a_deletion_vectors_path_or_inline_dv_untouched() {
     let root = "s3://warehouse/db/table";
@@ -95,7 +93,6 @@ fn reconstruct_abs_uri_mirror(entry_path: &str, table_root: &str) -> String {
     format!("{root}/{rel}")
 }
 
-/// Scenario: a path sharing the root only as a bare string prefix is not relativized
 #[test]
 fn sibling_prefix_paths_are_not_relativized() {
     let root = "s3://w/db/events";
@@ -136,7 +133,6 @@ fn sibling_prefix_paths_are_not_relativized() {
     }
 }
 
-/// Scenario: an abfss:// path with userinfo round-trips losslessly through relativization
 #[test]
 fn abfss_paths_relativize_and_reconstruct_losslessly() {
     let root = "abfss://container@account.dfs.core.windows.net/db/table";

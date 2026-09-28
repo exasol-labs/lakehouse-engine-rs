@@ -392,7 +392,6 @@ fn non_utf8_map_keys_stringify_into_object_names() {
     );
 }
 
-/// Scenario: a map key type no Arrow cast turns into text is refused by name.
 #[test]
 fn a_map_key_type_no_cast_reaches_utf8_is_refused_by_name() {
     let keys = FixedSizeBinaryArray::try_from_iter([[0u8, 1u8]].into_iter())
@@ -413,7 +412,6 @@ fn a_map_key_type_no_cast_reaches_utf8_is_refused_by_name() {
     );
 }
 
-/// Scenario: a non-nested column is refused by the nested renderer.
 #[test]
 fn a_non_nested_column_is_refused_by_the_nested_renderer() {
     let column: ArrayRef = Arc::new(Int32Array::from(vec![1, 2]));
@@ -427,7 +425,6 @@ fn a_non_nested_column_is_refused_by_the_nested_renderer() {
     );
 }
 
-/// Scenario: a map with a null key is refused with a clean error naming the cause.
 #[test]
 fn a_map_column_with_a_null_key_is_refused_with_a_clean_error() {
     let keys = StringArray::from(vec![None, Some("b")]);

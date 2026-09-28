@@ -10,14 +10,12 @@ fn has_disallowed_join_capability(cap_strs: &[&str]) -> bool {
     })
 }
 
-/// Scenario: capability advertisement cannot consult the catalog kind.
 #[test]
 fn capabilities_are_assembled_without_the_catalog_kind() {
     let _capabilities: &[&str] = CAPABILITIES;
     let _response_builder: fn() -> Json = get_capabilities_response;
 }
 
-/// Scenario: adapter advertises GROUP BY column/expression/tuple, backed by multi-key detection.
 #[test]
 fn reports_group_by_capabilities() {
     let resp = get_capabilities_response();
@@ -75,7 +73,6 @@ fn reports_group_by_capabilities() {
     );
 }
 
-/// Scenario: adapter reports the full audited capability set.
 #[test]
 fn reports_audited_capability_set() {
     let resp = get_capabilities_response();
@@ -341,7 +338,6 @@ fn reports_audited_capability_set() {
     }
 }
 
-/// Scenario: adapter advertises both bare-column and expression ORDER BY sort keys.
 #[test]
 fn advertises_order_by_column_and_expression() {
     let resp = get_capabilities_response();
@@ -443,7 +439,6 @@ fn reports_supported_aggregate_capabilities() {
     assert!(cap_strs.contains(&"LIMIT"));
 }
 
-/// Scenario: adapter advertises `FN_AGG_COUNT_DISTINCT` for single-group COUNT(DISTINCT).
 #[test]
 fn capabilities_advertise_count_distinct() {
     let resp = get_capabilities_response();
@@ -460,7 +455,6 @@ fn capabilities_advertise_count_distinct() {
     );
 }
 
-/// Scenario: advertising `FN_CAST`, `FN_NEG`, and `FN_WEEK` adds no join capability.
 #[test]
 fn cast_neg_week_introduce_no_join_capability() {
     let resp = get_capabilities_response();
@@ -479,7 +473,6 @@ fn cast_neg_week_introduce_no_join_capability() {
     );
 }
 
-/// Scenario: adapter advertises inner equi-join capabilities and no other join shape.
 #[test]
 fn advertises_inner_equi_join_capabilities() {
     let resp = get_capabilities_response();
@@ -512,7 +505,6 @@ fn advertises_inner_equi_join_capabilities() {
     );
 }
 
-/// Scenario: the capability set includes inner equi-join alongside existing pushdowns.
 #[test]
 fn reports_capabilities_includes_inner_join() {
     let resp = get_capabilities_response();

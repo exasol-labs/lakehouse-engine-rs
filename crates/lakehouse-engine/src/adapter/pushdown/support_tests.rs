@@ -4,7 +4,6 @@ use super::*;
 use crate::scan::spec::{AggKind, DeleteMechanism, ScanStorage, SortKey};
 use vs_expression::render_df_filter_safe;
 
-/// Scenario: `walk_column_nodes` fires once per nested `column` node and never for other nodes.
 #[test]
 fn walk_column_nodes_visits_every_nested_column_node_once() {
     let expr = serde_json::json!({
@@ -50,7 +49,6 @@ fn walk_column_nodes_visits_every_nested_column_node_once() {
     );
 }
 
-/// Scenario: `walk_column_nodes` is a no-op on null, scalar, and empty-object roots, which callers pass unguarded.
 #[test]
 fn walk_column_nodes_never_invokes_callback_for_a_non_container_root() {
     let mut invocations: usize = 0;
@@ -66,7 +64,6 @@ fn walk_column_nodes_never_invokes_callback_for_a_non_container_root() {
     );
 }
 
-/// Scenario: `strip_table_alias` removes every nested `tableAlias` key, keeping `tableName` and `name` (#193).
 #[test]
 fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
     let expr = serde_json::json!({
@@ -95,7 +92,6 @@ fn strip_table_alias_removes_alias_preserves_table_name_and_name_recursively() {
     );
 }
 
-/// Scenario: A predicate the DataFusion dialect can express answers `true`.
 #[test]
 fn datafusion_renderable_true_for_a_rendering_predicate() {
     let expr = serde_json::json!({
@@ -107,7 +103,6 @@ fn datafusion_renderable_true_for_a_rendering_predicate() {
     assert!(datafusion_renderable(&expr));
 }
 
-/// Scenario: `SECOND(ts, 3)`, a DataFusion arity refusal Exasol renders, answers `false`.
 #[test]
 fn datafusion_renderable_false_for_second_with_precision_arity_decline() {
     let expr = serde_json::json!({
@@ -122,7 +117,6 @@ fn datafusion_renderable_false_for_second_with_precision_arity_decline() {
     assert!(!datafusion_renderable(&expr));
 }
 
-/// Scenario: A trivially true `TRUE` literal answers `true`, so omitting it is a no-op.
 #[test]
 fn datafusion_renderable_true_for_trivially_true_literal() {
     let expr = serde_json::json!({"type": "literal_bool", "value": true});
@@ -130,7 +124,6 @@ fn datafusion_renderable_true_for_trivially_true_literal() {
     assert!(datafusion_renderable(&expr));
 }
 
-/// Scenario: `strip_table_alias` does not flip the decline/accept answer, or a conjunct would be silently dropped.
 #[test]
 fn datafusion_renderable_answer_unchanged_by_strip_table_alias() {
     let with_alias = serde_json::json!({
@@ -184,7 +177,6 @@ fn delete_spec_template() -> ScanSpec {
     }
 }
 
-/// Scenario: Positional deletes reach the per-shard spec at both file and partition granularity.
 #[test]
 fn adapter_preserves_positional_deletes_into_scan_spec() {
     let file_gran = vec![FileEntry::with_deletes(
@@ -213,7 +205,6 @@ fn adapter_preserves_positional_deletes_into_scan_spec() {
     assert_eq!(back2[1].deletes[0].object_store_path(), Some(shared));
 }
 
-/// Scenario: A delete-carrying entry serializes its content type; a delete-free entry stays `[path, size]`.
 #[test]
 fn delete_file_entry_carries_content_type_and_delete_free_stays_compact() {
     let with_del = vec![FileEntry::with_deletes(
@@ -240,7 +231,6 @@ fn delete_file_entry_carries_content_type_and_delete_free_stays_compact() {
     );
 }
 
-/// Scenario: Delete refs ride only in the per-shard files argument, never the common blob.
 #[test]
 fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
     let spec_template = delete_spec_template();
@@ -275,7 +265,6 @@ fn adapter_carries_delete_refs_per_shard_minimal_common_spec() {
     );
 }
 
-/// Scenario: The fan-out nests the distributor under an ungrouped scalar scan, splicing the common blob once.
 #[test]
 fn fan_out_primitive_wraps_distributor_in_ungrouped_scalar_scan() {
     let spec = delete_spec_template();
@@ -316,7 +305,6 @@ fn fan_out_primitive_wraps_distributor_in_ungrouped_scalar_scan() {
     );
 }
 
-/// Scenario: A single-shard plan is a from-less scalar scan on literals, with no distributor.
 #[test]
 fn single_shard_short_circuits_distributor_fromless() {
     let spec = delete_spec_template();
@@ -344,7 +332,6 @@ fn single_shard_short_circuits_distributor_fromless() {
     );
 }
 
-/// Scenario: Shard count oversubscribes the cluster and is capped at 300.
 #[test]
 fn shard_count_oversubscribes_and_caps_at_300() {
     assert_eq!(shard_count(10, 50, 500), 300, "must be capped at 300");
@@ -367,7 +354,6 @@ fn shard_count_clamped_to_file_count_no_empty_shards() {
     assert_eq!(shard_count(5, 0, 100), 1, "zero factor must clamp to 1");
 }
 
-/// Scenario: The table root rides once in the common blob and file sizes ride in the shard payloads.
 #[test]
 fn pushdown_carries_table_root_and_sizes_in_common_and_shards() {
     let root = "s3://warehouse/db/events";
@@ -399,7 +385,6 @@ fn pushdown_carries_table_root_and_sizes_in_common_and_shards() {
     );
 }
 
-/// Scenario: The table root is stripped from under-root paths and appears exactly once.
 #[test]
 fn table_root_stripped_from_under_root_paths_and_carried_once() {
     let root = "s3://warehouse/db/events";
@@ -430,7 +415,6 @@ fn table_root_stripped_from_under_root_paths_and_carried_once() {
     );
 }
 
-/// Scenario: A data-file path outside the table root keeps its full absolute URI.
 #[test]
 fn path_not_under_root_stays_absolute() {
     let root = "s3://warehouse/db/events";
@@ -462,7 +446,6 @@ fn path_not_under_root_stays_absolute() {
     );
 }
 
-/// Scenario: A multi-shard fan-out carries the root once and `[[path,size],...]` per shard.
 #[test]
 fn fan_out_carries_root_once_and_path_size_tuples_per_shard() {
     let root = "s3://warehouse/db/events";
@@ -564,7 +547,6 @@ fn projection_carried_in_common_literal_and_emits() {
     );
 }
 
-/// Scenario: A filter predicate is pushed into the scan spec or kept out of it, never mistranslated
 #[test]
 fn pushdown_translates_or_omits_predicate() {
     let translatable = serde_json::json!({
@@ -621,7 +603,6 @@ fn pushdown_translates_or_omits_predicate() {
     );
 }
 
-/// Scenario: LIMIT is pushed into the scan spec and also appears at Exasol level
 #[test]
 fn row_scan_limit_in_common_arg() {
     let sql = build_sql_for_fixture(
@@ -653,7 +634,6 @@ fn limit_extracted_from_pushdown_request() {
     assert_eq!(extract_limit(&req2), Some(42));
 }
 
-/// Scenario: `extract_offset` is 0 when `offset` is absent, as Exasol sends for `OFFSET 0`, else the value.
 #[test]
 fn offset_extracted_from_pushdown_request() {
     assert_eq!(extract_offset(&serde_json::json!({})), 0);
@@ -668,7 +648,6 @@ fn offset_extracted_from_pushdown_request() {
     );
 }
 
-/// Scenario: `render_limit_offset` with offset 0 renders exactly ` LIMIT {n}`.
 #[test]
 fn render_limit_offset_covers_absent_zero_and_nonzero_offset() {
     assert_eq!(render_limit_offset(None, 0), "");
@@ -689,7 +668,6 @@ fn sql_string_literal_escapes_quotes() {
     assert_eq!(lit, "'it''s a test'");
 }
 
-/// Scenario: An untranslatable scalar plus COUNT(*) falls back to the deduplicated base columns.
 #[test]
 fn extract_projection_fallback_is_duplicate_free() {
     let request = serde_json::json!({
@@ -734,7 +712,6 @@ fn extract_projection_fallback_is_duplicate_free() {
     );
 }
 
-/// Scenario: An aggregate select list yields a spec carrying the aggregate plans plus the filter.
 #[test]
 fn aggregate_query_builds_partial_agg_spec() {
     let agg_plans = vec![
@@ -802,7 +779,6 @@ fn aggregate_query_builds_partial_agg_spec() {
     assert!(sql.contains(SCAN_UDF_NAME));
 }
 
-/// Scenario: A multi-shard fan-out serializes the common blob once and only file lists per shard.
 #[test]
 fn fan_out_serializes_common_once_files_per_shard() {
     let files = vec![
@@ -872,7 +848,6 @@ fn fan_out_serializes_common_once_files_per_shard() {
     );
 }
 
-/// Scenario: `s3_max_connections` rides once in the common blob and is never dropped.
 #[test]
 fn common_spec_carries_s3_max_connections_exactly_once() {
     let files = vec![
@@ -958,7 +933,6 @@ fn build_agg_sql(
     )
 }
 
-/// Scenario: The aggregate merge renders `LIMIT n` on the wrapper, so `LIMIT 0` returns zero rows (#198).
 #[test]
 fn aggregate_merge_renders_request_limit_when_some() {
     let plans = vec![AggregatePlan {
@@ -995,7 +969,6 @@ fn aggregate_merge_renders_request_limit_when_some() {
     );
 }
 
-/// Scenario: The aggregate wrapper merges per-shard COUNT/SUM/MIN/MAX partials in order.
 #[test]
 fn aggregate_wrapper_merges_partials() {
     let plans = vec![
@@ -1081,7 +1054,6 @@ fn aggregate_wrapper_merges_partials() {
     );
 }
 
-/// Scenario: The single-group merge SELECT sits directly over the scalar scan, with no `SELECT *` wrapper.
 #[test]
 fn aggregate_merge_over_scalar_scan_no_wrapper() {
     let plans = vec![
@@ -1116,7 +1088,6 @@ fn aggregate_merge_over_scalar_scan_no_wrapper() {
     );
 }
 
-/// Scenario: A single-shard aggregate merges directly over a from-less scalar scan.
 #[test]
 fn aggregate_single_shard_merge_over_fromless_scalar_scan() {
     let plans = vec![AggregatePlan {
@@ -1140,7 +1111,6 @@ fn aggregate_single_shard_merge_over_fromless_scalar_scan() {
     );
 }
 
-/// Scenario: The caller's merge SELECT is spliced verbatim; `aggregate_types` only drives `EMITS`.
 #[test]
 fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
     let plans = vec![AggregatePlan {
@@ -1182,7 +1152,6 @@ fn aggregate_merge_splices_caller_select_items_and_types_emits_per_plan() {
     );
 }
 
-/// Scenario: The AVG merge divides the merged sum by `NULLIF(SUM(cnt), 0)`.
 #[test]
 fn avg_wrapper_divides_sum_by_count_guarded() {
     let plans = vec![AggregatePlan {
@@ -1227,7 +1196,6 @@ fn avg_wrapper_divides_sum_by_count_guarded() {
     );
 }
 
-/// Scenario: A single-shard aggregate still gets an outer merge wrapper.
 #[test]
 fn single_shard_aggregate_still_uses_merge_wrapper() {
     let plans = vec![
@@ -1278,7 +1246,6 @@ fn count_distinct_base_spec() -> ScanSpec {
     }
 }
 
-/// Scenario: A lone single-group `COUNT(DISTINCT col)` wraps its DISTINCT fan-out in a native `COUNT(DISTINCT "V")`.
 #[test]
 fn count_distinct_wrapper_uses_native_count_distinct() {
     let base_spec = count_distinct_base_spec();
@@ -1327,7 +1294,6 @@ fn count_distinct_wrapper_uses_native_count_distinct() {
     );
 }
 
-/// Scenario: Multiple or mixed COUNT(DISTINCT) aggregates route to the qualified wrapper, not a distinct fan-out.
 #[test]
 fn multi_count_distinct_declines_to_qualified_wrapper() {
     use super::super::joins::{
@@ -1425,7 +1391,6 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     );
 }
 
-/// Scenario: LIMIT/OFFSET/ORDER BY never leak into a distinct fan-out, only onto the outer wrapper.
 #[test]
 fn count_distinct_fan_out_omits_limit_offset_order_by() {
     // Real callers pass `limit: None, order_by: []`; the builder must strip them regardless.
@@ -1484,7 +1449,6 @@ fn count_distinct_fan_out_omits_limit_offset_order_by() {
     assert_only_outer_limit_no_order_by(&sql1, "Case 1");
 }
 
-/// Scenario: A multi-shard row scan with LIMIT appends LIMIT to the outer SQL.
 #[test]
 fn multi_shard_row_scan_appends_outer_limit() {
     let files = vec![
@@ -1513,7 +1477,6 @@ fn multi_shard_row_scan_appends_outer_limit() {
     );
 }
 
-/// Scenario: A multi-shard row scan is an outer ungrouped scalar scan over the distributor, with no `SELECT *` wrapper.
 #[test]
 fn pushdown_builds_scalar_scan_driving_sql() {
     let sql = build_sql_for_fixture_n(
@@ -1542,7 +1505,6 @@ fn pushdown_builds_scalar_scan_driving_sql() {
     );
 }
 
-/// Scenario: LIMIT attaches directly to the outer scalar select, after the distributor subquery.
 #[test]
 fn limit_attaches_directly_to_outer_scalar_select() {
     let sql = build_sql_for_fixture_n(
@@ -1571,7 +1533,6 @@ fn limit_attaches_directly_to_outer_scalar_select() {
     );
 }
 
-/// Scenario: A single-shard scan is `{udf}('<common>', '<files>')` with each literal once.
 #[test]
 fn single_shard_two_arg_common_and_files_once() {
     let files = vec![
@@ -1633,7 +1594,6 @@ fn single_shard_two_arg_common_and_files_once() {
     );
 }
 
-/// Scenario: Files partition into G balanced, disjoint shards covering every file, none empty.
 #[test]
 fn partition_files_g_shards_balanced_disjoint_full_coverage() {
     use std::collections::HashSet;
@@ -1665,7 +1625,6 @@ fn partition_files_g_shards_balanced_disjoint_full_coverage() {
     );
 }
 
-/// Scenario: Multi-shard row-scan SQL uses GROUP BY shard_key, never IPROC().
 #[test]
 fn scan_driving_sql_groups_by_shard_key_not_iproc() {
     let files: Vec<(String, u64)> = (0..3)
@@ -1706,7 +1665,6 @@ fn scan_driving_sql_groups_by_shard_key_not_iproc() {
     );
 }
 
-/// Scenario: A single shard collapses to one invocation, with no VALUES or GROUP BY.
 #[test]
 fn single_shard_collapses_to_single_invocation() {
     let files = vec![("s3://warehouse/f0.parquet".to_string(), 500u64)];
@@ -1749,7 +1707,6 @@ fn single_shard_collapses_to_single_invocation() {
     );
 }
 
-/// Scenario: A select-list `function_scalar` renders into the projection and EMITS clause.
 #[test]
 fn selectlist_scalar_expression_rendered_in_emits() {
     let upper_expr = serde_json::json!({
@@ -1784,7 +1741,6 @@ fn selectlist_scalar_expression_rendered_in_emits() {
     assert_eq!(proj_types[0], "VARCHAR(2000000)");
 }
 
-/// Scenario: A select-list `function_scalar_cast` renders as a `ProjectionItem::Expr` (#136).
 #[test]
 fn selectlist_cast_node_rendered_in_emits() {
     let cast_expr = serde_json::json!({
@@ -1823,7 +1779,6 @@ fn selectlist_cast_node_rendered_in_emits() {
     );
 }
 
-/// Scenario: A select-list `function_scalar_extract` renders as a `ProjectionItem::Expr` (#136).
 #[test]
 fn selectlist_extract_node_rendered_in_emits() {
     let extract_expr = serde_json::json!({
@@ -1862,7 +1817,6 @@ fn selectlist_extract_node_rendered_in_emits() {
     );
 }
 
-/// Scenario: A select-list `function_scalar_case` renders as a `ProjectionItem::Expr` (#136).
 #[test]
 fn selectlist_case_node_rendered_in_emits() {
     let case_expr = serde_json::json!({
@@ -1908,7 +1862,6 @@ fn selectlist_case_node_rendered_in_emits() {
     );
 }
 
-/// Scenario: A CAST to an unsupported target type still falls back to the full base row.
 #[test]
 fn selectlist_untranslatable_cast_falls_back_to_full_row() {
     let cast_expr = serde_json::json!({
@@ -1941,7 +1894,6 @@ fn selectlist_untranslatable_cast_falls_back_to_full_row() {
     assert_eq!(proj_types, vec!["DECIMAL(10,0)", "VARCHAR(100)"]);
 }
 
-/// Scenario: A single projected literal renders to one positional `Expr` item (#190).
 #[test]
 fn selectlist_literal_rendered_as_positional_expr() {
     let literal = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
@@ -1971,7 +1923,6 @@ fn selectlist_literal_rendered_as_positional_expr() {
     assert_eq!(proj_types[0], "DECIMAL(18,0)");
 }
 
-/// Scenario: `SELECT 1, name, 1` keeps three items with distinct EMITS identifiers (#190).
 #[test]
 fn selectlist_duplicate_literals_keep_distinct_positions() {
     let literal = serde_json::json!({"type": "literal_exactnumeric", "value": 1});
@@ -2024,7 +1975,6 @@ fn selectlist_duplicate_literals_keep_distinct_positions() {
     assert_ne!(ident_1, ident_2);
 }
 
-/// Scenario: A bare literal select-list item projects exactly one column (#190).
 #[test]
 fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
     let literal = serde_json::json!({"type": "literal_string", "value": "x"});
@@ -2049,7 +1999,6 @@ fn selectlist_bare_literal_does_not_fall_back_to_full_row() {
     );
 }
 
-/// Scenario: A `TIMESTAMP WITH LOCAL TIME ZONE` literal widens the projection, since Exasol rejects it in EMITS (#218).
 #[test]
 fn selectlist_tstz_literal_widens_via_emits_type_gate() {
     let literal = serde_json::json!({
@@ -2090,7 +2039,6 @@ fn selectlist_tstz_literal_widens_via_emits_type_gate() {
     assert_eq!(proj_types, vec!["DECIMAL(10,0)", "VARCHAR(100)"]);
 }
 
-/// Scenario: The real wire name `literal_timestamputc` also widens the projection (#242).
 #[test]
 fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
     let literal = serde_json::json!({
@@ -2132,7 +2080,6 @@ fn selectlist_real_wire_name_tstz_literal_widens_and_routes() {
     assert_eq!(proj_types, vec!["DECIMAL(10,0)", "VARCHAR(100)"]);
 }
 
-/// Scenario: A plain `TIMESTAMP` literal renders as a positional `Expr`, never matched as a prefix.
 #[test]
 fn selectlist_plain_timestamp_literal_rendered_as_expr() {
     let literal = serde_json::json!({
@@ -2164,7 +2111,6 @@ fn selectlist_plain_timestamp_literal_rendered_as_expr() {
     assert_eq!(proj_types[0], "TIMESTAMP");
 }
 
-/// Scenario: A select-list `CAST(<col> AS CHAR(20))` projects with a `CHAR(20)` EMITS type (#192).
 #[test]
 fn project_columns_emits_char_type_for_cast_to_char_item() {
     let cast_item = serde_json::json!({
@@ -2215,7 +2161,6 @@ fn project_columns_emits_char_type_for_cast_to_char_item() {
     );
 }
 
-/// Scenario: An untranslatable select-list item falls back to the bare column.
 #[test]
 fn selectlist_untranslatable_item_falls_back_to_column() {
     let bad_expr = serde_json::json!({
@@ -2307,7 +2252,6 @@ fn like_guard_varchar_subject_unchanged() {
     );
 }
 
-/// Scenario: LIKE on a genuine CHAR column pushes down unchanged.
 #[test]
 fn like_guard_char_subject_unchanged() {
     let filter = serde_json::json!({
@@ -2371,7 +2315,6 @@ fn like_guard_decimal_subject_declines() {
     );
 }
 
-/// Scenario: `apply_type_rewrites` declines a `predicate_like` over a DECIMAL column.
 #[test]
 fn type_rewrite_pipeline_runs_like_guard() {
     let filter = serde_json::json!({
@@ -2388,7 +2331,6 @@ fn type_rewrite_pipeline_runs_like_guard() {
     );
 }
 
-/// Scenario: LIKE on an integer column, which arrives as `DECIMAL(20,0)`, declines the whole filter.
 #[test]
 fn like_guard_integer_subject_declines() {
     let filter = serde_json::json!({
@@ -2405,7 +2347,6 @@ fn like_guard_integer_subject_declines() {
     );
 }
 
-/// Scenario: LIKE on a non-column subject is left untouched, regardless of `col_types`.
 #[test]
 fn like_guard_non_column_subject_untouched() {
     let filter = serde_json::json!({
@@ -2427,7 +2368,6 @@ fn like_guard_non_column_subject_untouched() {
     );
 }
 
-/// Scenario: LIKE on a bare column missing from `col_types` declines the whole filter.
 #[test]
 fn like_guard_unresolvable_column_declines() {
     let filter = serde_json::json!({
@@ -2518,7 +2458,6 @@ fn declined_filter_wrapper_sql(filter: &Json, col_types: &[(String, String)]) ->
     .expect("the wrapper must render the declined predicate")
 }
 
-/// Scenario: A nested non-string LIKE's whole enclosing filter is applied in the wrapper's `WHERE`.
 #[test]
 fn nested_like_decline_routes_to_wrapper_where() {
     let filter = serde_json::json!({
@@ -2553,7 +2492,6 @@ fn nested_like_decline_routes_to_wrapper_where() {
     );
 }
 
-/// Scenario: A declined integer-column LIKE is applied by the adapter in the wrapper.
 #[test]
 fn declined_like_on_integer_column_routes_to_wrapper_where() {
     let filter = serde_json::json!({
@@ -2571,7 +2509,6 @@ fn declined_like_on_integer_column_routes_to_wrapper_where() {
     );
 }
 
-/// Scenario: A fail-safe decline on an unresolvable subject type still self-applies in the wrapper.
 #[test]
 fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
     let filter = serde_json::json!({
@@ -2590,7 +2527,6 @@ fn declined_like_on_unresolvable_column_routes_to_wrapper_where() {
     );
 }
 
-/// Scenario: REGEXP_LIKE on a DATE column pushes down wrapped in CAST-to-VARCHAR.
 #[test]
 fn like_guard_regexp_date_subject_wraps_cast() {
     let column = serde_json::json!({"type": "column", "name": "signup_date"});
@@ -2619,7 +2555,6 @@ fn like_guard_regexp_date_subject_wraps_cast() {
     );
 }
 
-/// Scenario: A DECIMAL LIKE under `predicate_not` declines the whole filter.
 #[test]
 fn like_guard_not_wrapped_decimal_declines() {
     let filter = serde_json::json!({
@@ -2639,7 +2574,6 @@ fn like_guard_not_wrapped_decimal_declines() {
     );
 }
 
-/// Scenario: A DECIMAL LIKE inside a CASE WHEN condition declines the whole filter (#207).
 #[test]
 fn like_guard_decimal_inside_case_declines() {
     let filter = serde_json::json!({
@@ -2667,7 +2601,6 @@ fn like_guard_decimal_inside_case_declines() {
     );
 }
 
-/// Scenario: A DATE LIKE inside a CASE WHEN condition is rewrapped in place, CASE preserved (#207).
 #[test]
 fn like_guard_date_inside_case_wraps_cast() {
     let column = serde_json::json!({"type": "column", "name": "signup_date"});
@@ -2713,7 +2646,6 @@ fn like_guard_date_inside_case_wraps_cast() {
     );
 }
 
-/// Scenario: A VARCHAR LIKE inside a CASE WHEN condition returns the input tree unchanged.
 #[test]
 fn like_guard_varchar_inside_case_unchanged() {
     let filter = serde_json::json!({
@@ -2742,7 +2674,6 @@ fn like_guard_varchar_inside_case_unchanged() {
     );
 }
 
-/// Scenario: `rewrite_expr_tree` hands `f` a node whose curated children are already rewritten.
 #[test]
 fn expr_tree_applies_f_to_children_before_their_parent() {
     let tree = serde_json::json!({
@@ -2768,7 +2699,6 @@ fn expr_tree_applies_f_to_children_before_their_parent() {
     );
 }
 
-/// Scenario: A `None` from `f` at any depth declines the whole tree.
 #[test]
 fn expr_tree_decline_deep_in_the_tree_propagates_to_the_root() {
     let tree = serde_json::json!({
@@ -2792,7 +2722,6 @@ fn expr_tree_decline_deep_in_the_tree_propagates_to_the_root() {
     );
 }
 
-/// Scenario: Only curated fields in their grammar shapes are descended; `dataType` and `name` never are.
 #[test]
 fn expr_tree_recurses_only_into_curated_fields_of_the_expected_shape() {
     let tree = serde_json::json!({
@@ -2835,7 +2764,6 @@ fn expr_tree_recurses_only_into_curated_fields_of_the_expected_shape() {
     );
 }
 
-/// Scenario: A non-object node reaches `f` too, with no leaf early-return.
 #[test]
 fn expr_tree_applies_f_to_a_non_object_node() {
     for leaf in [
@@ -2877,7 +2805,6 @@ fn cast_to(target: &str, arg: Json) -> Json {
     })
 }
 
-/// Scenario: A non-object node is returned unchanged.
 #[test]
 fn decimal_rewrite_passes_through_non_object_node() {
     let col_types = decimal_rewrite_col_types();
@@ -2895,7 +2822,6 @@ fn decimal_rewrite_passes_through_non_object_node() {
     }
 }
 
-/// Scenario: `CAST(<decimal column> AS VARCHAR)` is replaced by a trimming `decimal_to_varchar_exasol` node.
 #[test]
 fn rewrite_cast_decimal_to_varchar_replaces_whole_node() {
     let node = cast_to("VARCHAR", decimal_column());
@@ -2919,7 +2845,6 @@ fn rewrite_cast_decimal_to_varchar_replaces_whole_node() {
     );
 }
 
-/// Scenario: `CAST(<decimal column> AS CHAR)` is also replaced.
 #[test]
 fn rewrite_cast_decimal_to_char_replaces_whole_node() {
     let node = cast_to("CHAR", decimal_column());
@@ -2931,7 +2856,6 @@ fn rewrite_cast_decimal_to_char_replaces_whole_node() {
     );
 }
 
-/// Scenario: The live nested-CONCAT shape wraps each decimal argument and preserves its structure.
 #[test]
 fn rewrite_nested_concat_wraps_only_inner_decimal() {
     let node = serde_json::json!({
@@ -2981,7 +2905,6 @@ fn rewrite_nested_concat_wraps_only_inner_decimal() {
     );
 }
 
-/// Scenario: `CONCAT(NAME, C_DECIMAL_A)` wraps only the DECIMAL column.
 #[test]
 fn rewrite_concat_wraps_only_decimal_leaves_varchar() {
     let node = serde_json::json!({
@@ -3006,7 +2929,6 @@ fn rewrite_concat_wraps_only_decimal_leaves_varchar() {
     );
 }
 
-/// Scenario: `LENGTH(<decimal column>)` wraps its argument.
 #[test]
 fn rewrite_length_wraps_decimal_argument() {
     let node = serde_json::json!({
@@ -3023,7 +2945,6 @@ fn rewrite_length_wraps_decimal_argument() {
     );
 }
 
-/// Scenario: A non-DECIMAL bare column argument to CAST, CONCAT, or LENGTH is unchanged.
 #[test]
 fn rewrite_non_decimal_argument_unchanged() {
     let col_types = decimal_rewrite_col_types();
@@ -3050,7 +2971,6 @@ fn rewrite_non_decimal_argument_unchanged() {
     );
 }
 
-/// Scenario: A computed-expression stringifier argument is left unchanged, a tracked exception (#223).
 #[test]
 fn rewrite_computed_expression_argument_unchanged() {
     let computed = serde_json::json!({
@@ -3079,7 +2999,6 @@ fn rewrite_computed_expression_argument_unchanged() {
     );
 }
 
-/// Scenario: A DECIMAL column in a non-stringifying context is not wrapped.
 #[test]
 fn rewrite_non_stringifying_context_unchanged() {
     let col_types = decimal_rewrite_col_types();
@@ -3103,7 +3022,6 @@ fn rewrite_non_stringifying_context_unchanged() {
     );
 }
 
-/// Scenario: A DECIMAL stringification reachable only through a CASE THEN branch is wrapped.
 #[test]
 fn rewrite_reaches_decimal_inside_case_then_branch() {
     let node = serde_json::json!({
@@ -3144,7 +3062,6 @@ fn rewrite_reaches_decimal_inside_case_then_branch() {
     );
 }
 
-/// Scenario: A select-list `CAST(c_decimal_a AS VARCHAR(20))` projects one trimmed `Expr` at its declared type.
 #[test]
 fn selectlist_decimal_cast_routed_not_full_row_fallback() {
     let pushdown_req = serde_json::json!({
@@ -3173,7 +3090,6 @@ fn selectlist_decimal_cast_routed_not_full_row_fallback() {
     );
 }
 
-/// Scenario: The nested-CONCAT select-list item wraps `C_DECIMAL_A`'s CAST in the trim form.
 #[test]
 fn selectlist_nested_concat_decimal_arg_rewritten() {
     let item = serde_json::json!({
@@ -3212,7 +3128,6 @@ fn selectlist_nested_concat_decimal_arg_rewritten() {
     );
 }
 
-/// Scenario: A select-list `LENGTH(c_decimal_a)` renders a trim-wrapped `character_length(...)`.
 #[test]
 fn selectlist_length_decimal_arg_rewritten() {
     let item = serde_json::json!({
@@ -3243,7 +3158,6 @@ fn selectlist_length_decimal_arg_rewritten() {
     );
 }
 
-/// Scenario: A select-list CAST of a VARCHAR column renders a plain CAST, with no trim.
 #[test]
 fn stringify_nondecimal_column_unchanged() {
     let pushdown_req = serde_json::json!({
@@ -3267,7 +3181,6 @@ fn stringify_nondecimal_column_unchanged() {
     );
 }
 
-/// Scenario: A select-list `CAST(c_decimal_a * 2 AS VARCHAR)` renders untrimmed (#223).
 #[test]
 fn stringify_computed_decimal_arg_untouched() {
     let computed = serde_json::json!({
@@ -3300,7 +3213,6 @@ fn stringify_computed_decimal_arg_untouched() {
     );
 }
 
-/// Scenario: `UPPER(c_decimal_a)` projects a single trimmed expression at its declared type.
 #[test]
 fn selectlist_upper_decimal_arg_coerced_not_full_row() {
     let item = string_fn("UPPER", vec![decimal_column()]);
@@ -3330,7 +3242,6 @@ fn selectlist_upper_decimal_arg_coerced_not_full_row() {
     );
 }
 
-/// Scenario: `LOWER(c_date)` projects a single expression containing `CAST("D" AS VARCHAR)`.
 #[test]
 fn selectlist_lower_date_arg_cast_to_varchar() {
     let item = string_fn("LOWER", vec![column("d")]);
@@ -3355,7 +3266,6 @@ fn selectlist_lower_date_arg_cast_to_varchar() {
     );
 }
 
-/// Scenario: `UPPER(c_double)` degrades to the full base row with no error.
 #[test]
 fn selectlist_string_fn_over_double_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
@@ -3384,7 +3294,6 @@ fn selectlist_string_fn_over_double_falls_back_to_full_row() {
     assert_eq!(types, expected_types);
 }
 
-/// Scenario: `INSTR(c_decimal_a, '.')` coerces the column argument and leaves the literal.
 #[test]
 fn selectlist_instr_decimal_arg_coerces_first_position_only() {
     let item = string_fn(
@@ -3419,7 +3328,6 @@ fn selectlist_instr_decimal_arg_coerces_first_position_only() {
     );
 }
 
-/// Scenario: A three-argument `INSTR` degrades to the full base row rather than a truncated `strpos` (#228).
 #[test]
 fn selectlist_instr_with_start_position_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
@@ -3453,7 +3361,6 @@ fn selectlist_instr_with_start_position_falls_back_to_full_row() {
     );
 }
 
-/// Scenario: Each whitelisted select-list predicate node renders as a positional `Expr` (#196).
 #[test]
 fn selectlist_predicate_node_projects_as_expr() {
     let cases: Vec<(&str, serde_json::Value, &str)> = vec![
@@ -3545,7 +3452,6 @@ fn selectlist_predicate_node_projects_as_expr() {
     }
 }
 
-/// Scenario: A `function_aggregate` select-list item still widens, so it reaches the aggregate planner (#196).
 #[test]
 fn selectlist_function_aggregate_still_widens_to_full_row() {
     let item = serde_json::json!({
@@ -3584,7 +3490,6 @@ fn selectlist_function_aggregate_still_widens_to_full_row() {
     assert_eq!(types, expected_types);
 }
 
-/// Scenario: A select-list `predicate_like` over a DATE rewraps the subject as `CAST("D" AS VARCHAR)` (#219).
 #[test]
 fn selectlist_like_over_date_projects_cast_expr() {
     let item = serde_json::json!({
@@ -3618,7 +3523,6 @@ fn selectlist_like_over_date_projects_cast_expr() {
     assert_eq!(types, vec!["BOOLEAN".to_string()]);
 }
 
-/// Scenario: A select-list LIKE over a non-string or unresolved subject widens to the full base row, never `Err`.
 #[test]
 fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
@@ -3711,7 +3615,6 @@ fn selectlist_like_over_non_string_subject_falls_back_to_full_row() {
     }
 }
 
-/// Scenario: A select-list LIKE over a DECIMAL nested in a CASE still widens to the full base row.
 #[test]
 fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
     let col_types = decimal_rewrite_col_types();
@@ -3758,7 +3661,6 @@ fn selectlist_like_inside_case_over_decimal_falls_back_to_full_row() {
     assert_eq!(types, expected_types);
 }
 
-/// Scenario: Every argument of the pure string functions is a string position at every arity.
 #[test]
 fn string_position_args_coerces_every_argument_of_all_string_functions() {
     for name in ["CONCAT", "TRIM", "LTRIM", "RTRIM", "REPLACE", "TRANSLATE"] {
@@ -3780,7 +3682,6 @@ fn string_position_args_coerces_every_argument_of_all_string_functions() {
     }
 }
 
-/// Scenario: Only the first argument of these functions is a string position.
 #[test]
 fn string_position_args_coerces_first_argument_only() {
     for name in [
@@ -3807,7 +3708,6 @@ fn string_position_args_coerces_first_argument_only() {
     }
 }
 
-/// Scenario: `LPAD`/`RPAD` exclude the length argument but coerce the pad string.
 #[test]
 fn string_position_args_excludes_numeric_arguments() {
     for name in ["LPAD", "RPAD"] {
@@ -3824,7 +3724,6 @@ fn string_position_args_excludes_numeric_arguments() {
     }
 }
 
-/// Scenario: `CHR`/`UNICODECHR` and non-string functions are not governed.
 #[test]
 fn string_position_args_not_governed_for_chr_and_non_string_functions() {
     for name in ["CHR", "UNICODECHR", "ABS", "CASE"] {
@@ -3838,7 +3737,6 @@ fn string_position_args_not_governed_for_chr_and_non_string_functions() {
     }
 }
 
-/// Scenario: A lowercase function name resolves identically.
 #[test]
 fn string_position_args_matches_lowercase_function_name() {
     assert_eq!(
@@ -3857,7 +3755,6 @@ fn string_position_args_matches_lowercase_function_name() {
     );
 }
 
-/// Scenario: No returned index addresses past the end of the argument list.
 #[test]
 fn string_position_args_never_returns_out_of_range_index() {
     let governed = [
@@ -3898,7 +3795,6 @@ fn string_position_args_never_returns_out_of_range_index() {
     }
 }
 
-/// Scenario: `INSTR`/`LOCATE` beyond two arguments decline on arity alone (#228).
 #[test]
 fn string_position_args_declines_instr_locate_beyond_two_args() {
     assert_eq!(
@@ -3957,7 +3853,6 @@ fn equals(left: Json, right: Json) -> Json {
     serde_json::json!({"type": "predicate_equal", "left": left, "right": right})
 }
 
-/// Scenario: A non-object node passes through.
 #[test]
 fn string_fn_guard_passes_through_non_object_node() {
     let col_types = decimal_rewrite_col_types();
@@ -3996,7 +3891,6 @@ fn string_fn_guard_leaves_varchar_argument_unchanged() {
     );
 }
 
-/// Scenario: A string-position DECIMAL column argument renders through Exasol's trimmed form.
 #[test]
 fn string_fn_guard_wraps_decimal_argument_in_trim() {
     let col_types = decimal_rewrite_col_types();
@@ -4035,7 +3929,6 @@ fn string_fn_guard_wraps_decimal_argument_in_trim() {
     );
 }
 
-/// Scenario: A string-position DATE argument is wrapped in `CAST(<col> AS VARCHAR)`, matching Exasol's date format.
 #[test]
 fn string_fn_guard_casts_date_argument_to_varchar() {
     let col_types = decimal_rewrite_col_types();
@@ -4046,7 +3939,6 @@ fn string_fn_guard_casts_date_argument_to_varchar() {
     );
 }
 
-/// Scenario: BOOLEAN, DOUBLE, and TIMESTAMP arguments decline, since their text forms differ between engines.
 #[test]
 fn string_fn_guard_declines_boolean_double_and_timestamp_arguments() {
     let col_types = decimal_rewrite_col_types();
@@ -4061,7 +3953,7 @@ fn string_fn_guard_declines_boolean_double_and_timestamp_arguments() {
     }
 }
 
-/// Scenario: A string-position argument whose column does not resolve declines fail-safe.
+/// Scenario: A string-position argument whose column name does not resolve declines fail-safe
 #[test]
 fn string_fn_guard_declines_unresolved_column_name() {
     let col_types = decimal_rewrite_col_types();
@@ -4072,7 +3964,6 @@ fn string_fn_guard_declines_unresolved_column_name() {
     );
 }
 
-/// Scenario: A `column` node with no `name` field declines fail-safe.
 #[test]
 fn string_fn_guard_declines_nameless_column_node() {
     let col_types = decimal_rewrite_col_types();
@@ -4084,7 +3975,6 @@ fn string_fn_guard_declines_nameless_column_node() {
     );
 }
 
-/// Scenario: The guard reaches a string function nested under a comparison predicate (#210).
 #[test]
 fn string_fn_guard_reaches_function_under_comparison_predicate() {
     let col_types = decimal_rewrite_col_types();
@@ -4102,7 +3992,6 @@ fn string_fn_guard_reaches_function_under_comparison_predicate() {
     );
 }
 
-/// Scenario: A decline anywhere in the tree propagates to the root.
 #[test]
 fn string_fn_guard_nested_decline_propagates_to_root() {
     let col_types = decimal_rewrite_col_types();
@@ -4126,7 +4015,6 @@ fn string_fn_guard_nested_decline_propagates_to_root() {
     );
 }
 
-/// Scenario: Only string-position indices are coerced; numeric positions stay untouched.
 #[test]
 fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
     let col_types = decimal_rewrite_col_types();
@@ -4188,7 +4076,6 @@ fn string_fn_guard_leaves_numeric_position_arguments_untouched() {
     );
 }
 
-/// Scenario: `INSTR` and `LOCATE` coerce both of their two arguments.
 #[test]
 fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
     let col_types = decimal_rewrite_col_types();
@@ -4218,7 +4105,6 @@ fn string_fn_guard_coerces_both_instr_and_locate_arguments() {
     );
 }
 
-/// Scenario: `INSTR`/`LOCATE` beyond two arguments decline through the guard even over VARCHAR (#228).
 #[test]
 fn string_fn_guard_declines_instr_locate_beyond_two_args() {
     let col_types = decimal_rewrite_col_types();
@@ -4253,7 +4139,6 @@ fn string_fn_guard_declines_instr_locate_beyond_two_args() {
     );
 }
 
-/// Scenario: `CHR`/`UNICODECHR` arguments are neither coerced nor declined, but their children are recursed.
 #[test]
 fn string_fn_guard_excludes_chr_and_unicodechr() {
     let col_types = decimal_rewrite_col_types();
@@ -4279,7 +4164,6 @@ fn string_fn_guard_excludes_chr_and_unicodechr() {
     );
 }
 
-/// Scenario: A column name in any letter case resolves.
 #[test]
 fn string_fn_guard_resolves_case_mismatched_column_name() {
     let col_types = decimal_rewrite_col_types();
@@ -4291,7 +4175,6 @@ fn string_fn_guard_resolves_case_mismatched_column_name() {
     );
 }
 
-/// Scenario: The `col_types` lookup folds with full-Unicode `to_uppercase`, missing an ASCII-folded list.
 #[test]
 fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
     let node = column("STRAßE");
@@ -4310,7 +4193,6 @@ fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
     );
 }
 
-/// Scenario: A non-bare-column string-position argument is left unchanged and does not decline (#223).
 #[test]
 fn string_fn_guard_leaves_computed_argument_unchanged() {
     let col_types = decimal_rewrite_col_types();
@@ -4342,7 +4224,6 @@ fn string_fn_guard_leaves_computed_argument_unchanged() {
     );
 }
 
-/// Scenario: An inner string function's argument is coerced before the outer function's check.
 #[test]
 fn string_fn_guard_coerces_inner_nested_string_function() {
     let col_types = decimal_rewrite_col_types();
@@ -4357,7 +4238,6 @@ fn string_fn_guard_coerces_inner_nested_string_function() {
     );
 }
 
-/// Scenario: `cast_to_declared_type` casts only when a non-default declared type is present.
 #[test]
 fn cast_to_declared_type_skips_the_varchar_default_and_absent_type() {
     assert_eq!(
@@ -4394,7 +4274,6 @@ fn assert_widens_to_full_base_row(select_item: Json, declared_type: Json, why: &
     assert_eq!(types, expected_types, "EMITS types must be the base row's");
 }
 
-/// Scenario: An aggregate nested under a pushable select-list node widens, or shards return unmerged partials (#194).
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_scalar_item() {
     let select_item = serde_json::json!({
@@ -4413,7 +4292,6 @@ fn project_columns_widens_on_aggregate_nested_in_scalar_item() {
     );
 }
 
-/// Scenario: A top-level aggregate select item widens byte-identically.
 #[test]
 fn project_columns_top_level_aggregate_widening_is_unchanged_by_the_subtree_probe() {
     let select_item = agg_item("SUM", Some("c_decimal_a"), false);
@@ -4425,7 +4303,6 @@ fn project_columns_top_level_aggregate_widening_is_unchanged_by_the_subtree_prob
     );
 }
 
-/// Scenario: A `function_scalar_cast` wrapping a nested aggregate widens.
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_function_scalar_cast_item() {
     let select_item = serde_json::json!({
@@ -4442,7 +4319,6 @@ fn project_columns_widens_on_aggregate_nested_in_function_scalar_cast_item() {
     );
 }
 
-/// Scenario: A `function_scalar_case` with a nested aggregate in a THEN branch widens.
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
     let select_item = serde_json::json!({
@@ -4466,7 +4342,6 @@ fn project_columns_widens_on_aggregate_nested_in_function_scalar_case_item() {
     );
 }
 
-/// Scenario: A nested aggregate under an arithmetic `function_scalar` widens.
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_arithmetic_node() {
     let select_item = serde_json::json!({
@@ -4485,7 +4360,6 @@ fn project_columns_widens_on_aggregate_nested_in_arithmetic_node() {
     );
 }
 
-/// Scenario: A nested aggregate under a predicate node widens.
 #[test]
 fn project_columns_widens_on_aggregate_nested_in_predicate_node() {
     let select_item = serde_json::json!({
@@ -4501,7 +4375,6 @@ fn project_columns_widens_on_aggregate_nested_in_predicate_node() {
     );
 }
 
-/// Scenario: A scalar item with no nested aggregate does not widen.
 #[test]
 fn project_columns_does_not_widen_when_select_item_has_no_nested_aggregate() {
     let col_types = decimal_rewrite_col_types();

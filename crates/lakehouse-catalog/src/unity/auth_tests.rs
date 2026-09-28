@@ -258,7 +258,6 @@ async fn failed_oauth_grant_is_credential_safe_error() {
     );
 }
 
-/// Scenario: a `token` plus a full client-credentials pair resolves to `UnityAuth::None`
 #[test]
 fn resolve_unity_auth_is_unauthenticated_for_the_validation_rejected_shape() {
     let client = reqwest::Client::new();

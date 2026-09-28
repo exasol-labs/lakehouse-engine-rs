@@ -512,7 +512,6 @@ fn scan_footer_refetch_is_observable_when_the_cache_evicts() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: the invocation-start reset keeps a pooled process from reporting an earlier invocation's footers
 #[test]
 fn scan_dispatch_resets_the_footer_record_between_invocations() {
     let _serialized = serialize_footer_record();

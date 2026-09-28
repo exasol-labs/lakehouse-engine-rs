@@ -419,7 +419,6 @@ async fn posts_temporary_table_credentials() {
     );
 }
 
-/// Scenario: admitted tables carry their own format tag, vending key, and partition columns; VIEW and ICEBERG skip
 #[tokio::test]
 async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     let body = r#"{"tables":[
@@ -497,7 +496,6 @@ async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     );
 }
 
-/// Scenario: load returns the format tag, vending key, partition columns, and columns in declared order
 #[tokio::test]
 async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered_columns() {
     let server = spawn(|_req| (200, single_table_body())).await;
@@ -526,7 +524,6 @@ async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered
     );
 }
 
-/// Scenario: a table reporting uppercase `ICEBERG` or `PARQUET` loads under its own tag
 #[tokio::test]
 async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags() {
     for (raw_format, expected) in [
@@ -546,7 +543,6 @@ async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags
     }
 }
 
-/// Scenario: an absent or unrecognized `data_source_format` is refused, never defaulted to Delta
 #[tokio::test]
 async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     for (raw_format_member, expected_value) in [
@@ -581,7 +577,6 @@ async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     }
 }
 
-/// Scenario: the format refusal never carries the resolved bearer
 #[tokio::test]
 async fn load_table_format_refusal_carries_no_credential() {
     let body = table_body_with_raw_format(r#""data_source_format":"CSV","#);
@@ -604,7 +599,6 @@ async fn load_table_format_refusal_carries_no_credential() {
     );
 }
 
-/// Scenario: a whitespace-only `table_id` projects to an absent vending key via `load_table`
 #[tokio::test]
 async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     let body = r#"{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"   ","columns":[]}"#.to_string();
@@ -622,7 +616,6 @@ async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     );
 }
 
-/// Scenario: a missing, null, or empty `table_id` projects to an absent vending key
 #[test]
 fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
     for raw_key_member in ["", r#""table_id":null,"#, r#""table_id":"","#] {
@@ -640,7 +633,6 @@ fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
     }
 }
 
-/// Scenario: a disqualifying `table_type` wins over the format; only exact uppercase `DELTA` or `PARQUET` is admitted
 #[test]
 fn admission_admits_delta_and_parquet_base_tables_and_names_every_refusal() {
     let skip = |detail: &str| {

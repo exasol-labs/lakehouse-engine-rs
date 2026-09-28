@@ -67,7 +67,6 @@ async fn fetch_object_bytes(uri: &str) -> bytes::Bytes {
         .unwrap_or_else(|e| panic!("read bytes of {uri}: {e}"))
 }
 
-/// Scenario: the committed fixture's timestamp column is physically INT96
 #[test]
 fn e2e_int96_fixture_present_and_int96_encoded() {
     setup();
@@ -115,7 +114,6 @@ fn e2e_int96_fixture_present_and_int96_encoded() {
     );
 }
 
-/// Scenario: a far-future INT96 timestamp scans without nanosecond overflow (#143)
 #[test]
 fn e2e_int96_far_future_timestamp_scans_without_overflow() {
     setup_full_stack();

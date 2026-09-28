@@ -86,7 +86,6 @@ fn assert_clean_refusal<T>(result: Result<T, UdfError>, context: &str) -> String
     err
 }
 
-/// Scenario: each storage kind resolves its sidecar path exactly once (relative, absolute, inline).
 #[test]
 fn sidecar_path_is_resolved_once_for_each_storage_kind() {
     let uuid_relative = resolve(DeltaDeletionVectorStorage::UuidRelative, LOGGED_PATH).unwrap();
@@ -112,7 +111,6 @@ fn sidecar_path_is_resolved_once_for_each_storage_kind() {
     );
 }
 
-/// Scenario: the storage shim serves prefetched bytes and refuses every other operation without panicking.
 #[test]
 fn storage_shim_serves_prefetched_bytes_and_refuses_every_other_operation() {
     let served = Url::parse(SIDECAR_URL).unwrap();
@@ -171,7 +169,6 @@ fn storage_shim_serves_prefetched_bytes_and_refuses_every_other_operation() {
     );
 }
 
-/// Scenario: an inline vector decodes from its payload without any fetched body.
 #[test]
 fn inline_vector_decodes_from_its_payload_without_any_prefetched_bytes() {
     let inline = resolve(DeltaDeletionVectorStorage::Inline, INLINE_PAYLOAD)
@@ -185,7 +182,6 @@ fn inline_vector_decodes_from_its_payload_without_any_prefetched_bytes() {
     );
 }
 
-/// Scenario: every untrustworthy container fails as an error value before any row is emitted, never a panic.
 #[test]
 fn untrusted_deletion_vector_containers_fail_loud_without_panicking() {
     assert_clean_refusal(
@@ -219,7 +215,6 @@ fn untrusted_deletion_vector_containers_fail_loud_without_panicking() {
     );
 }
 
-/// Scenario: a descriptor the Delta protocol forbids is refused at resolution, before any fetch.
 #[test]
 fn descriptors_the_protocol_forbids_are_refused_before_any_fetch() {
     for payload in ["", "0", "01234"] {
@@ -261,7 +256,6 @@ fn descriptors_the_protocol_forbids_are_refused_before_any_fetch() {
     );
 }
 
-/// Scenario: a decoded set contradicting the declared cardinality fails the scan.
 #[test]
 fn decoded_set_disagreeing_with_the_declared_cardinality_fails_the_scan() {
     let overstated = DeletionVector::resolve(

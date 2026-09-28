@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::*;
 
-/// Scenario: Unsigned catalog path is unchanged when SigV4 is disabled.
 #[test]
 fn disabled_sigv4_produces_no_auth_header_in_request() {
     let client = reqwest::Client::new();
@@ -20,7 +19,6 @@ fn disabled_sigv4_produces_no_auth_header_in_request() {
     );
 }
 
-/// Scenario: Signing keys must not appear in any error output from sign_request.
 #[test]
 fn signed_request_does_not_leak_keys_in_headers() {
     let secret = "wJalrXUtnFEMI_EXAMPLE_KEY";
@@ -81,7 +79,6 @@ fn bearer_token_attached_to_load_table_request() {
     );
 }
 
-/// Scenario: A no-auth catalog request carries no Authorization header.
 #[test]
 fn no_auth_load_table_sends_no_authorization() {
     let client = reqwest::Client::new();
@@ -101,7 +98,6 @@ fn no_auth_load_table_sends_no_authorization() {
     );
 }
 
-/// Scenario: A catalog error carries the `catalog returned HTTP <status>: ` prefix the not-found classifier keys on.
 #[tokio::test]
 async fn catalog_error_message_uses_http_status_prefix() {
     use std::net::SocketAddr;
@@ -146,7 +142,6 @@ async fn catalog_error_message_uses_http_status_prefix() {
     );
 }
 
-/// Scenario: A SigV4 `loadTable` request is signed for the carried region, not `creds.region`.
 #[tokio::test]
 async fn sigv4_request_is_signed_for_the_carried_region() {
     let (catalog_uri, heads) = spawn_recording_catalog("{}").await;
@@ -176,7 +171,6 @@ async fn sigv4_request_is_signed_for_the_carried_region() {
     );
 }
 
-/// Scenario: A `loadTable` error redacts both the static client secret and the live bearer token.
 #[tokio::test]
 async fn load_table_error_redacts_session_bearer_and_static_secrets() {
     use std::net::SocketAddr;

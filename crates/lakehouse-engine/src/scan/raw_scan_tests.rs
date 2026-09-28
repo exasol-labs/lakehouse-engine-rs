@@ -2,7 +2,6 @@ use super::*;
 use crate::scan::session_config_for_spec;
 use crate::scan::test_support::{inline_resolved, local_file_size, minimal_spec};
 
-/// Scenario: the shared INT96 `ParquetFormat` helper coerces to microseconds as UTC.
 #[test]
 fn both_parquet_format_sites_coerce_int96_us_utc() {
     let format = int96_coerced_parquet_format();
@@ -18,7 +17,6 @@ fn both_parquet_format_sites_coerce_int96_us_utc() {
     );
 }
 
-/// Scenario: a nested-carrying table reads without row-filter pushdown, keeping INT96 coercion and pruning.
 #[test]
 fn a_nested_carrying_table_reads_without_row_filter_pushdown() {
     use crate::scan::spec::NestedMembers;
@@ -64,7 +62,6 @@ fn a_nested_carrying_table_reads_without_row_filter_pushdown() {
     }
 }
 
-/// Scenario: the session withholds `pushdown_filters` only for a scan rendering nested JSON on either side.
 #[test]
 fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
     use crate::scan::spec::{JoinSpec, JoinType, LogicalField, NestedMembers};
@@ -125,7 +122,6 @@ fn the_session_withholds_pushdown_only_for_a_scan_that_renders_nested_json() {
     );
 }
 
-/// Scenario: `s3_max_connections: 0` clamps to one permit instead of deadlocking.
 #[test]
 fn delete_path_read_limiter_clamps_zero_connections_to_one() {
     let mut spec = minimal_spec();
@@ -197,7 +193,6 @@ async fn register_files_falls_back_without_logical_schema() {
     );
 }
 
-/// Scenario: a logical schema of identity-bound fields still installs the binding adapter.
 #[tokio::test]
 async fn a_logical_schema_of_identity_fields_still_installs_the_binding_adapter() {
     use crate::scan::spec::LogicalField;
@@ -427,7 +422,6 @@ async fn ordered_scan_sql_preserves_desc_and_null_placement() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: the uppercase-alias wrapper resolves against a registered logical schema.
 #[tokio::test]
 async fn build_scan_sql_aliases_over_logical_schema() {
     use crate::scan::spec::LogicalField;
@@ -477,7 +471,6 @@ async fn build_scan_sql_aliases_over_logical_schema() {
     );
 }
 
-/// Scenario: a bare column plus a CAST of the same column does not trip the duplicate-name check (#136).
 #[tokio::test]
 async fn build_scan_sql_disambiguates_column_and_cast_of_same_column() {
     use crate::scan::spec::ProjectionItem;
@@ -655,7 +648,6 @@ async fn a_list_column_tagged_utf8_is_json_rendered_by_the_field_id_expression_a
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: struct and map columns render as JSON through the Parquet opener.
 #[tokio::test]
 async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
@@ -827,7 +819,6 @@ async fn struct_and_map_columns_render_as_json_through_the_parquet_opener() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: the legacy path routes a nested column through the shared JSON encoder.
 #[tokio::test]
 async fn build_scan_sql_diverts_a_nested_column_to_the_json_render_function() {
     use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder};
@@ -893,7 +884,6 @@ async fn build_scan_sql_diverts_a_nested_column_to_the_json_render_function() {
     );
 }
 
-/// Scenario: a non-nested incompatible column keeps `CAST(col AS VARCHAR)`.
 #[tokio::test]
 async fn build_scan_sql_keeps_a_non_nested_incompatible_column_cast_unchanged() {
     use arrow::array::BinaryArray;

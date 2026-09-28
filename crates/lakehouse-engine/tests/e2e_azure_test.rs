@@ -374,7 +374,6 @@ fn write_azure_parquet_fixture(
     });
 }
 
-/// Scenario: both ADLS credential arms, static account key and vended SAS, scan correctly end to end
 #[test]
 fn azure_static_and_vended_creds_end_to_end() {
     // Vended-arm assertions run first so a static-arm regression cannot mask the
@@ -576,7 +575,6 @@ fn direct_storage_over_adls_returns_correct_rows(conn: &mut ExaConn, fixture: &A
     );
 }
 
-/// Scenario: the container guard deletes its container while unwinding from a panic inside `rt.block_on`
 #[test]
 fn azure_container_guard_deletes_on_panic() {
     // `FutureExt::catch_unwind`, not `std::panic::catch_unwind`: a nested
@@ -619,7 +617,6 @@ fn azure_container_guard_deletes_on_panic() {
     );
 }
 
-/// Scenario: a readiness wait against an unreachable stack fails rather than skips
 #[test]
 fn azure_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| {
@@ -631,7 +628,6 @@ fn azure_suite_fails_when_stack_unavailable() {
     );
 }
 
-/// Scenario: a failing credential-bearing Azure CONNECTION DDL leaks neither the SQL nor credentials
 #[test]
 fn azure_credentials_never_appear_in_output() {
     const SENTINEL_ACCOUNT_NAME: &str = "azdummyaccountnamesentinel";
@@ -682,7 +678,6 @@ const WORKSPACE_GITIGNORE: &str = include_str!("../../../.gitignore");
 
 const TEST_ENV_EXAMPLE: &str = include_str!("../../../test.env.example");
 
-/// Scenario: `test.env` is gitignored and `test.env.example` carries only placeholders
 #[test]
 fn azure_local_credential_file_is_gitignored() {
     assert!(
@@ -709,7 +704,6 @@ fn azure_local_credential_file_is_gitignored() {
 
 const WORKSPACE_MAKEFILE: &str = include_str!("../../../Makefile");
 
-/// Scenario: `make test-e2e-azure` rebuilds the .so and runs the suite serially
 #[test]
 fn azure_make_target_rebuilds_so_and_runs_serially() {
     let target_start = WORKSPACE_MAKEFILE

@@ -138,7 +138,6 @@ fn leaf_scan_projected_columns(plan: &Arc<dyn ExecutionPlan>) -> BTreeSet<String
         .collect()
 }
 
-/// Scenario: `SUM(score)` over a three-column table physically reads only `score`
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn single_group_agg_scan_prunes_to_referenced_columns() {
     let dir = std::env::temp_dir().join(format!("lh_agg_prune_single_{}", std::process::id()));
@@ -173,7 +172,6 @@ async fn single_group_agg_scan_prunes_to_referenced_columns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: `GROUP BY region, SUM(score)` physically reads only `region` and `score`
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn grouped_agg_scan_prunes_to_referenced_columns() {
     let dir = std::env::temp_dir().join(format!("lh_agg_prune_grouped_{}", std::process::id()));

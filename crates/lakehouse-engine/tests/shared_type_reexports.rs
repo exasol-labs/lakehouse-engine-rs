@@ -55,7 +55,6 @@ fn reexported_paths_resolve_to_the_catalog_crate_types() {
     accepts_catalog_crate_adls_cred(adls_cred);
 }
 
-/// Scenario: `StorageProps` serializes byte-for-byte to the golden wire encoding
 #[test]
 fn storage_props_wire_encoding_unchanged() {
     let storage = StorageProps {
@@ -72,7 +71,6 @@ fn storage_props_wire_encoding_unchanged() {
     assert_eq!(serde_json::to_string(&storage).unwrap(), golden);
 }
 
-/// Scenario: `StorageBackend::S3` round-trips under an externally-tagged `{"s3": {...}}` key
 #[test]
 fn storage_backend_wire_encoding_tags_the_s3_payload() {
     use lakehouse_engine::scan::spec::StorageBackend;

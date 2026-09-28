@@ -383,7 +383,6 @@ async fn predicate_over_a_rendered_nested_column_is_applied_not_dropped() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: no pruning stage drops a row group holding a rendered nested-column match
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn statistics_pruning_cannot_drop_a_row_group_holding_a_rendered_nested_match() {
     // The primitive predicate at the end proves statistics pruning is enabled, so the

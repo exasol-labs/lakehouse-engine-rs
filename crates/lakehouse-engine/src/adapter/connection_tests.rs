@@ -147,7 +147,6 @@ fn legacy_full_static_s3_password_still_accepted() {
     assert_eq!(creds.secret_key, "SECRET");
 }
 
-/// Scenario: a warehouse-only password defaults every S3 and auth field to absent, flags false.
 #[test]
 fn optional_fields_default() {
     let warehouse_only = serde_json::json!({ "warehouse": "wh" }).to_string();
@@ -229,7 +228,6 @@ const AZURE_ACCOUNT_KEY: &str = "azure-shared-key-must-never-leak";
 const AZURE_SAS: &str = "sv=2024-01-01&sig=azure-sas-signature-must-never-leak";
 const S3_SECRET: &str = "s3-secret-must-never-leak";
 
-/// Scenario: the account-key shape selects `AdlsCred::AccountKey` and leaves `sas_token` absent.
 #[test]
 fn account_key_creds_select_the_adls_backend() {
     let password = serde_json::json!({
@@ -257,7 +255,6 @@ fn account_key_creds_select_the_adls_backend() {
     );
 }
 
-/// Scenario: the SAS-token shape selects ADLS; `allow_http` leaves the Azure payload unchanged.
 #[test]
 fn sas_token_creds_select_the_adls_backend() {
     let password = serde_json::json!({
@@ -281,7 +278,6 @@ fn sas_token_creds_select_the_adls_backend() {
     );
 }
 
-/// Scenario: an Azure CONNECTION needs account_name and exactly one of account_key/sas_token.
 #[test]
 fn azure_creds_require_account_name_and_exactly_one_credential() {
     let shapes = [
@@ -321,7 +317,6 @@ fn azure_creds_require_account_name_and_exactly_one_credential() {
     }
 }
 
-/// Scenario: mixed Azure and S3 fields are rejected, naming every field and echoing no value.
 #[test]
 fn mixed_azure_and_s3_credential_fields_are_rejected() {
     let password = serde_json::json!({
@@ -352,7 +347,6 @@ fn mixed_azure_and_s3_credential_fields_are_rejected() {
     assert!(!err.contains(S3_SECRET), "{err}");
 }
 
-/// Scenario: a CONNECTION naming no Azure field selects S3, with or without vending.
 #[test]
 fn absent_optional_fields_default_and_still_select_s3() {
     for use_vended_credentials in [false, true] {
@@ -380,7 +374,6 @@ fn absent_optional_fields_default_and_still_select_s3() {
     }
 }
 
-/// Scenario: both readers derive an equal backend from a password omitting `path_style`.
 #[test]
 fn both_readers_derive_an_equal_backend_from_a_password_omitting_path_style() {
     let password = serde_json::json!({
@@ -409,7 +402,6 @@ fn both_readers_derive_an_equal_backend_from_a_password_omitting_path_style() {
     );
 }
 
-/// Scenario: a non-vended endpoint without a stated `path_style` is rejected, naming the field.
 #[test]
 fn endpoint_without_a_stated_path_style_is_rejected_naming_the_field() {
     let password = serde_json::json!({
@@ -427,7 +419,6 @@ fn endpoint_without_a_stated_path_style_is_rejected_naming_the_field() {
     assert!(err.to_string().contains("path_style"), "{err}");
 }
 
-/// Scenario: either explicit `path_style` beside an endpoint is accepted.
 #[test]
 fn an_explicit_path_style_beside_an_endpoint_is_accepted_under_either_value() {
     for path_style in [true, false] {
@@ -448,7 +439,6 @@ fn an_explicit_path_style_beside_an_endpoint_is_accepted_under_either_value() {
     }
 }
 
-/// Scenario: the `path_style` guard does not fire without an endpoint or under vending.
 #[test]
 fn the_path_style_guard_does_not_fire_without_an_endpoint_or_under_vending() {
     let no_endpoint = serde_json::json!({ "warehouse": "wh" }).to_string();
@@ -470,7 +460,6 @@ fn the_path_style_guard_does_not_fire_without_an_endpoint_or_under_vending() {
         .expect("an endpoint under vending must not trigger the path_style guard");
 }
 
-/// Scenario: the `path_style` rejection names no credential value.
 #[test]
 fn the_path_style_rejection_names_no_credential_value() {
     let password = serde_json::json!({
@@ -490,7 +479,6 @@ fn the_path_style_rejection_names_no_credential_value() {
     assert!(!err.contains("SECRET_SENTINEL"), "{err}");
 }
 
-/// Scenario: static storage fields with vending are accepted and unused; other guards still fire.
 #[test]
 fn static_storage_fields_with_vending_are_accepted_and_unused() {
     let s3_password = serde_json::json!({
@@ -562,7 +550,6 @@ fn static_storage_fields_with_vending_are_accepted_and_unused() {
     assert!(!err.contains(S3_SECRET), "{err}");
 }
 
-/// Scenario: `storage_block` falls through to S3 for an unvalidated Azure shape, never panicking.
 #[test]
 fn storage_block_falls_through_to_s3_for_an_unvalidated_azure_shape() {
     let both_credentials = parse_creds(&serde_json::json!({
@@ -773,7 +760,7 @@ fn s3_fields_optional_when_not_sigv4() {
     read_connection(&ctx2, Some("MY_CONN"), CatalogKind::IcebergRest).unwrap();
 }
 
-/// Scenario: with SigV4 enabled, access_key, secret_key, and a signing region are required.
+/// Scenario: When SigV4 is enabled, access_key, secret_key, and a signing region are required
 #[test]
 fn sigv4_requires_access_secret_region() {
     let make_pw = |fields: serde_json::Value| {
@@ -869,7 +856,6 @@ fn sigv4_requires_access_secret_region() {
         .expect("endpoint is optional under SigV4; must not be rejected");
 }
 
-/// Scenario: a standard Glue endpoint supplies the SigV4 region; `region` itself stays empty.
 #[test]
 fn sigv4_region_derived_from_standard_glue_endpoint_is_accepted() {
     let pw = serde_json::json!({
@@ -888,7 +874,6 @@ fn sigv4_region_derived_from_standard_glue_endpoint_is_accepted() {
     assert_eq!(StaticStoreAddress::from(&resolved.creds).region(), "");
 }
 
-/// Scenario: a static bearer token is exposed on the creds and redacted in Debug.
 #[test]
 fn token_exposed_on_creds() {
     let pw = serde_json::json!({
@@ -916,7 +901,6 @@ fn token_exposed_on_creds() {
     );
 }
 
-/// Scenario: OAuth2 client credentials are exposed on the creds; the secret is redacted in Debug.
 #[test]
 fn oauth_client_creds_exposed_on_creds() {
     let pw = serde_json::json!({
@@ -998,7 +982,6 @@ fn incomplete_oauth_rejected_no_leak() {
     );
 }
 
-/// Scenario: a token beside a complete client_id/client_secret pair is rejected under both kinds.
 #[test]
 fn token_with_complete_oauth_pair_is_rejected_under_both_kinds() {
     let pw = serde_json::json!({
@@ -1112,7 +1095,6 @@ fn sigv4_and_catalog_auth_mutually_exclusive() {
     );
 }
 
-/// Scenario: under Unity Catalog, `warehouse` is optional and SigV4 is rejected.
 #[test]
 fn unity_kind_validation_skips_warehouse_and_rejects_sigv4() {
     let no_warehouse = serde_json::json!({ "token": "tok" }).to_string();
@@ -1149,7 +1131,6 @@ fn unity_kind_validation_skips_warehouse_and_rejects_sigv4() {
     );
 }
 
-/// Scenario: under Iceberg REST, a missing `warehouse` is still rejected.
 #[test]
 fn iceberg_kind_validation_still_requires_warehouse() {
     let no_warehouse = serde_json::json!({
@@ -1166,7 +1147,6 @@ fn iceberg_kind_validation_still_requires_warehouse() {
     );
 }
 
-/// Scenario: the same CONNECTION validates differently by `CatalogKind`.
 #[test]
 fn validation_is_parameterized_by_catalog_kind() {
     let no_warehouse = serde_json::json!({ "token": "tok" }).to_string();
@@ -1199,7 +1179,6 @@ fn validation_is_parameterized_by_catalog_kind() {
     );
 }
 
-/// Scenario: a Unity CONNECTION reuses the existing auth fields; a no-auth one is accepted.
 #[test]
 fn unity_connection_reuses_existing_auth_fields() {
     let oauth = serde_json::json!({

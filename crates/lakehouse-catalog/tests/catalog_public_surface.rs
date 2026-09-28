@@ -73,7 +73,6 @@ fn declares(source: &str, declaration: &str) -> bool {
     })
 }
 
-/// Scenario: Vended-storage mechanism steps are never declared public
 #[test]
 fn demoted_and_deleted_functions_are_not_declared_public() {
     for (name, source) in CATALOG_SOURCES {
@@ -95,7 +94,6 @@ fn demoted_and_deleted_functions_are_not_declared_public() {
     }
 }
 
-/// Scenario: StorageBackend's secret_values and file_io are callable from outside the crate
 #[test]
 fn storage_backend_secret_values_and_file_io_are_reachable() {
     let backend = StorageBackend::S3(StorageProps::default());
@@ -103,7 +101,6 @@ fn storage_backend_secret_values_and_file_io_are_reachable() {
     let _: iceberg::io::FileIO = backend.file_io();
 }
 
-/// Scenario: Both catalog clients are usable as Box<dyn CatalogClient>
 #[test]
 fn both_clients_are_catalog_client_trait_objects() {
     let iceberg: Box<dyn CatalogClient> = Box::new(IcebergRestCatalogClient::new(
@@ -118,7 +115,6 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
-/// Scenario: Neutral catalog types are constructible outside the crate while Unity wire types stay hidden
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
     let ident = CatalogTableIdent {
@@ -186,7 +182,6 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
     }
 }
 
-/// Scenario: The direct-storage neutral variants are reachable from outside the crate
 #[test]
 fn added_neutral_variants_are_reachable_from_outside_the_crate() {
     assert_eq!(TableFormat::Parquet, TableFormat::Parquet);
@@ -225,7 +220,6 @@ fn added_neutral_variants_are_reachable_from_outside_the_crate() {
     assert_eq!(listing.skipped[0].reason, SkipReason::NoDataFile);
 }
 
-/// Scenario: Raw Unity wire fields do not appear in the neutral types
 #[test]
 fn raw_unity_wire_fields_do_not_appear_in_the_neutral_types() {
     let neutral = production_code(source("client.rs"));
@@ -240,7 +234,6 @@ fn raw_unity_wire_fields_do_not_appear_in_the_neutral_types() {
     }
 }
 
-/// Scenario: list_namespace_tables stays crate-private and is not re-exported
 #[test]
 fn list_namespace_tables_is_no_longer_public() {
     let namespace = source("namespace.rs");
@@ -260,7 +253,6 @@ fn list_namespace_tables_is_no_longer_public() {
     );
 }
 
-/// Scenario: ConnectionCreds::sigv4_signing_region is callable from outside the crate
 #[test]
 fn connection_creds_sigv4_signing_region_is_reachable() {
     let creds = ConnectionCreds {
@@ -274,7 +266,6 @@ fn connection_creds_sigv4_signing_region_is_reachable() {
     assert_eq!(region.as_deref(), Some("eu-west-1"));
 }
 
-/// Scenario: The native Unity Catalog public items are reachable from outside the crate
 #[test]
 fn unity_catalog_public_items_are_reachable() {
     let _session = UnityCatalogSession::new("http://unity", connection_creds());
@@ -320,7 +311,6 @@ fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {
     }
 }
 
-/// Scenario: resolve_vended_storage takes only a credential-free store address, never a backend
 #[test]
 fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() {
     let result = minimal_load_table_result(vec![
@@ -347,7 +337,6 @@ fn resolve_vended_storage_is_the_only_vended_entry_point_and_takes_no_backend() 
     assert_static_store_address_declares_no_credential_field();
 }
 
-/// Scenario: resolve_uc_vended_storage takes only a credential-free store address
 #[test]
 fn resolve_uc_vended_storage_signature_takes_only_a_credential_free_store_address() {
     let vended = TemporaryTableCredentials {
@@ -438,7 +427,6 @@ fn enum_variant_names<'a>(source: &'a str, enum_name: &str) -> Vec<&'a str> {
     variant_names
 }
 
-/// Scenario: storage.rs constructs every StorageBackend variant
 #[test]
 fn shared_vended_home_constructs_every_storage_backend_variant() {
     let storage = source("storage.rs");
@@ -455,7 +443,6 @@ fn shared_vended_home_constructs_every_storage_backend_variant() {
     }
 }
 
-/// Scenario: Each vended selector dispatches on every VendedBackendKind
 #[test]
 fn each_vended_selector_dispatches_every_vended_backend_kind() {
     let kinds = enum_variant_names(source("storage.rs"), "VendedBackendKind");
@@ -474,7 +461,6 @@ fn each_vended_selector_dispatches_every_vended_backend_kind() {
     }
 }
 
-/// Scenario: VendedBackendKind and StorageBackend declare the same variant set
 #[test]
 fn vended_kind_and_storage_backend_variant_sets_are_equal() {
     let storage = source("storage.rs");
@@ -538,7 +524,6 @@ fn assert_static_store_address_declares_no_credential_field() {
     }
 }
 
-/// Scenario: StaticStoreAddress is reachable via Default and From<&ConnectionCreds> and declares no credential field
 #[test]
 fn static_store_address_is_reachable_and_declares_no_credential_field() {
     let unset = StaticStoreAddress::default();
@@ -555,7 +540,6 @@ fn static_store_address_is_reachable_and_declares_no_credential_field() {
     assert_static_store_address_declares_no_credential_field();
 }
 
-/// Scenario: Shared vended policy steps stay crate-private (`scheme_of` is reused by the engine)
 #[test]
 fn shared_vended_policy_steps_are_not_public() {
     const SHARED_STEPS: [(&str, &str); 5] = [
@@ -587,7 +571,6 @@ fn shared_vended_policy_steps_are_not_public() {
     }
 }
 
-/// Scenario: StaticStoreAddress fields stay non-public
 #[test]
 fn static_store_address_fields_are_not_public() {
     for declaration in static_store_address_field_declarations() {

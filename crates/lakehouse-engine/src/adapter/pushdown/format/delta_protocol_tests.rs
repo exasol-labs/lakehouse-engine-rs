@@ -94,7 +94,6 @@ fn both_type_widening_variants_are_allow_listed_and_pass_the_gate() {
         .expect("typeWidening-preview is on the allow-list");
 }
 
-/// Scenario: A legacy protocol with no reader-feature list passes the gate
 #[test]
 fn a_legacy_protocol_table_with_no_reader_feature_list_passes_the_gate() {
     ensure_readable(1, None).expect("min_reader_version 1 with no reader features is readable");
@@ -127,7 +126,6 @@ fn the_readable_version_range_is_inclusive_at_both_ends() {
     ensure_readable(3, Some(&[])).expect("reader version 3 is the readable range's upper bound");
 }
 
-/// Scenario: Every allow-listed reader feature together still passes the gate
 #[test]
 fn all_seven_allow_listed_reader_features_pass_including_both_type_widening_names() {
     let features = [

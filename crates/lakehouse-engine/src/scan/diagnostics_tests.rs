@@ -2,7 +2,6 @@ mod phase_telemetry_tests {
     use super::super::*;
     use std::thread::sleep;
 
-    /// Scenario: telemetry is silent below DEBUG and enabled at DEBUG and TRACE.
     #[test]
     fn telemetry_enabled_only_at_debug_or_more_verbose() {
         assert!(!telemetry_enabled(tracing::Level::ERROR));
@@ -12,7 +11,6 @@ mod phase_telemetry_tests {
         assert!(telemetry_enabled(tracing::Level::TRACE));
     }
 
-    /// Scenario: import and emit accumulate distinctly and the phases sum to the scan-body wall-clock.
     #[test]
     fn phases_accumulate_distinctly_and_sum_to_body() {
         let mut t = PhaseTimers::start();
@@ -49,7 +47,6 @@ mod phase_telemetry_tests {
         );
     }
 
-    /// Scenario: a second `seal_startup` call does not overwrite the first measurement.
     #[test]
     fn seal_startup_is_idempotent() {
         let mut t = PhaseTimers::start();
@@ -61,7 +58,6 @@ mod phase_telemetry_tests {
         assert_eq!(first, t.startup(), "second seal_startup must be a no-op");
     }
 
-    /// Scenario: the telemetry record carries the pid, three phases, and body time on one line.
     #[test]
     fn telemetry_record_carries_three_phases_and_pid() {
         let mut t = PhaseTimers::start();
@@ -92,7 +88,6 @@ mod phase_telemetry_tests {
         assert!(!rec.contains('\n'), "must be a single line: {rec}");
     }
 
-    /// Scenario: a telemetry write to an impossible path is swallowed without panicking.
     #[test]
     fn write_telemetry_file_swallows_failure() {
         append_record(
@@ -105,7 +100,6 @@ mod phase_telemetry_tests {
 mod debug_checkpoint_tests {
     use super::super::*;
 
-    /// Scenario: the per-process debug path carries this process's pid.
     #[test]
     fn debug_log_path_is_per_pid() {
         let path = debug_log_path();
@@ -117,14 +111,12 @@ mod debug_checkpoint_tests {
         );
     }
 
-    /// Scenario: `current_rss_bytes` never panics, returning 0 without procfs.
     #[test]
     fn current_rss_is_readable_or_zero() {
         let rss = current_rss_bytes();
         let _ = rss;
     }
 
-    /// Scenario: one checkpoint line carries the LHDBG tag, seq, pid, thread, rows, rss_mb, and message.
     #[test]
     fn checkpoint_line_contains_required_fields() {
         debug_set_rows(12_345);
@@ -156,7 +148,6 @@ mod debug_checkpoint_tests {
         assert!(!line.contains('\n'), "must be one line");
     }
 
-    /// Scenario: the sequence counter yields unique values under concurrent threads.
     #[test]
     fn sequence_counter_is_unique_under_concurrency() {
         use std::collections::HashSet;
@@ -207,7 +198,6 @@ mod panic_hook_tests {
         p
     }
 
-    /// Scenario: the panic record carries pid, thread, location, payload, and backtrace.
     #[test]
     fn format_record_contains_required_fields() {
         let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -245,7 +235,6 @@ mod panic_hook_tests {
         );
     }
 
-    /// Scenario: `append_record` appends rather than truncates, so panics accumulate.
     #[test]
     fn append_record_creates_and_appends() {
         let path = unique_path("append");
@@ -264,7 +253,6 @@ mod panic_hook_tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// Scenario: `panic_payload_message` extracts `&str` and `String` payloads and falls back otherwise.
     #[test]
     fn payload_message_extracts_str_and_string() {
         let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -298,7 +286,6 @@ mod panic_hook_tests {
         );
     }
 
-    /// Scenario: a process-wide hook fires and persists a record for a panic on a spawned thread.
     #[test]
     fn hook_fires_on_spawned_worker_thread_panic() {
         let _guard = HOOK_LOCK.lock().unwrap_or_else(|e| e.into_inner());

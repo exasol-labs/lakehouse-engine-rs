@@ -220,7 +220,6 @@ fn assert_col_type(cols: &[(String, String)], column: &str, expected: &str) {
     );
 }
 
-/// Scenario: createVirtualSchema enumerates every fixture table with Exasol-mapped column types
 #[test]
 fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
     setup();
@@ -243,7 +242,6 @@ fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
     assert_col_type(&stats_cols, "ARRAY_COL", "VARCHAR(2000000)");
 }
 
-/// Scenario: a readiness wait against an unreachable stack panics rather than skipping
 #[test]
 fn unity_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| {
@@ -259,7 +257,6 @@ fn unity_suite_fails_when_stack_unavailable() {
     );
 }
 
-/// Scenario: a failing token-bearing CONNECTION DDL leaks neither the SQL text nor the token
 #[test]
 fn unity_credentials_never_appear_in_output() {
     const SENTINEL_TOKEN: &str = "UC_DUMMY_BEARER_TOKEN_SENTINEL";
@@ -410,7 +407,6 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
-/// Scenario: Delta planning agrees under vended and static credentials
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     wait_for_minio();
@@ -960,7 +956,7 @@ fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     );
 }
 
-/// Scenario: a type-widened Delta table returns its wider types across the widening boundary
+/// Scenario: A type-widened Delta table returns its current wider types across the widening boundary
 #[test]
 fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
     setup();
@@ -1141,7 +1137,7 @@ const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LO
      TIMESTAMP_COL, TIMESTAMP_NTZ_COL, STRING_COL, DECIMAL_COL, BOOLEAN_COL, ARRAY_COL, \
      MAP_COL, NESTED_STRUCT";
 
-/// Scenario: a Delta table spanning varied types returns the expected Exasol types and values
+/// Scenario: A Delta table's varied types return their expected Exasol types and values
 #[test]
 fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     setup();
@@ -1285,7 +1281,6 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     );
 }
 
-/// Scenario: Delta timestamp columns declare exactly the engine-gated precision
 #[test]
 fn unity_delta_timestamp_columns_declare_the_exact_gated_precision() {
     setup();
@@ -1321,7 +1316,6 @@ fn unity_delta_timestamp_columns_declare_the_exact_gated_precision() {
     );
 }
 
-/// Scenario: a Delta column this engine cannot render refuses only the queries naming it (#351)
 #[test]
 fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
     setup();
@@ -1575,7 +1569,6 @@ fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf()
     );
 }
 
-/// Scenario: a Unity Parquet table is listed and returns its rows and partition values
 #[test]
 fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
     setup();

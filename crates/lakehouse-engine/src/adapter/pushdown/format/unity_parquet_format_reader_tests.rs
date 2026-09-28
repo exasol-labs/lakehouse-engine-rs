@@ -173,7 +173,6 @@ async fn files_are_listed_through_the_seam_and_no_footer_is_read() {
     assert_eq!(scan.effective_storage, storage);
 }
 
-/// Scenario: The logical schema is the catalog's column list; an undescribed column is refused and nullability follows the file
 #[tokio::test]
 async fn logical_schema_is_the_catalog_column_list_and_undescribed_columns_are_refused() {
     let mut table = sales_table(&[("id", "long"), ("payload", "binary")], &[]);
@@ -208,7 +207,6 @@ async fn logical_schema_is_the_catalog_column_list_and_undescribed_columns_are_r
     );
 }
 
-/// Scenario: A table whose every column is refused, or whose partition column is refused, fails the plan
 #[tokio::test]
 async fn an_unplannable_catalog_schema_fails_the_plan() {
     let mut no_mappable = sales_table(&[("payload", "binary")], &[]);
@@ -243,7 +241,6 @@ async fn an_unplannable_catalog_schema_fails_the_plan() {
     }
 }
 
-/// Scenario: A file column differing only in letter case binds to its catalog column under the shared cast rules
 #[tokio::test]
 async fn file_columns_bind_under_the_case_fold_and_the_shared_cast_rules() {
     let table = sales_table(&[("CustomerId", "long"), ("amount", "integer")], &[]);
@@ -335,7 +332,6 @@ async fn only_string_partition_columns_prune_files() {
     }
 }
 
-/// Scenario: Storage resolves through the table's own catalog, and an empty location is refused identically in both modes
 #[tokio::test]
 async fn storage_is_resolved_through_the_shared_unity_path() {
     let no_location = CatalogTable {

@@ -11,7 +11,6 @@ use crate::scan::raw_scan::register_nested_json_render_udf;
 use crate::scan::spec::{JoinSpec, JoinType, SortKey};
 use crate::scan::test_support::minimal_spec;
 
-/// Scenario: a non-nested incompatible join column keeps `CAST(col AS VARCHAR)`.
 #[test]
 fn render_join_select_item_keeps_a_non_nested_incompatible_column_cast_unchanged() {
     let combined = vec![("PAYLOAD".to_string(), arrow::datatypes::DataType::Binary)];
@@ -22,7 +21,6 @@ fn render_join_select_item_keeps_a_non_nested_incompatible_column_cast_unchanged
     assert_eq!(rendered, "CAST(\"PAYLOAD\" AS VARCHAR)");
 }
 
-/// Scenario: a nested join column routes through the shared JSON render function.
 #[test]
 fn render_join_select_item_diverts_a_nested_column_to_the_json_render_function() {
     let list_type = arrow::datatypes::DataType::List(std::sync::Arc::new(
@@ -40,7 +38,6 @@ fn render_join_select_item_diverts_a_nested_column_to_the_json_render_function()
     );
 }
 
-/// Scenario: a nested column on the legacy broadcast join path renders as strict JSON.
 #[tokio::test]
 async fn build_join_sql_renders_a_nested_column_as_valid_json_end_to_end() {
     let mut tags_builder = ListBuilder::new(StringBuilder::new());
@@ -143,7 +140,6 @@ async fn run_join_sql(ctx: &SessionContext, spec: &ScanSpec) -> Vec<RecordBatch>
         .expect("collect")
 }
 
-/// Scenario: A post-join cap without an ordering renders no `ORDER BY`
 #[tokio::test]
 async fn build_join_sql_renders_no_order_by_without_a_post_join_ordering() {
     let ctx = join_session(fact_batch_with(
@@ -170,7 +166,6 @@ async fn build_join_sql_renders_no_order_by_without_a_post_join_ordering() {
     );
 }
 
-/// Scenario: A key emitted as JSON text ranks by that text, not its native value
 #[tokio::test]
 async fn build_join_sql_ranks_a_json_rendered_key_by_its_emitted_text() {
     let mut rank_key = ListBuilder::new(Int64Builder::new());
@@ -197,7 +192,6 @@ async fn build_join_sql_ranks_a_json_rendered_key_by_its_emitted_text() {
     assert_eq!(values, vec![Some("[10]")]);
 }
 
-/// Scenario: A `NaN` float key ranks as the NULL `emit_batch` emits for it (#246)
 #[tokio::test]
 async fn build_join_sql_ranks_a_nan_float_key_as_null() {
     let ctx = join_session(fact_batch_with(
@@ -222,7 +216,6 @@ async fn build_join_sql_ranks_a_nan_float_key_as_null() {
     assert_eq!(values, vec![Some(1.0)]);
 }
 
-/// Scenario: A `CAST(... AS VARCHAR)` fallback key ranks by its emitted text
 #[tokio::test]
 async fn build_join_sql_ranks_a_cast_fallback_key_by_its_emitted_text() {
     let ctx = join_session(fact_batch_with(

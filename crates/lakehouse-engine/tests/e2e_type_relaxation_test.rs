@@ -80,7 +80,6 @@ fn find_column(schema: &parquet::schema::types::SchemaDescriptor, column: &str) 
         .clone()
 }
 
-/// Scenario: the pre-promotion data file is still physically narrow
 #[test]
 fn e2e_type_promotion_pre_promotion_data_file_is_physically_narrow() {
     setup();
@@ -192,7 +191,6 @@ fn e2e_type_promotion_pre_promotion_data_file_is_physically_narrow() {
     );
 }
 
-/// Scenario: rows from both physical layouts return at the promoted types
 #[test]
 fn iceberg_type_promotion_returns_both_layouts_at_the_promoted_types() {
     setup_full_stack();

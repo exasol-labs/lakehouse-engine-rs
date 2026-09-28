@@ -130,7 +130,6 @@ fn int64_column<'a>(batch: &'a RecordBatch, name: &str) -> &'a Int64Array {
         .expect("int64 column")
 }
 
-/// Scenario: a declared `physical_name` binds its column and wins over a `name_mapping` entry for another field
 #[test]
 fn declared_physical_name_binds_the_renamed_physical_column() {
     let dir = std::env::temp_dir().join(format!(
@@ -220,7 +219,6 @@ fn declared_physical_name_binds_the_renamed_physical_column() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: identity-bound fields bind by name and keep NULL-fill, default, and required-error semantics
 #[test]
 fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
     let dir =
@@ -327,7 +325,6 @@ fn identity_bound_fields_bind_by_name_and_keep_the_default_fill_semantics() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: nested list/struct columns render as JSON while a primitive column in the same scan passes through
 #[test]
 fn mixed_column_parquet_file_emits_json_for_populated_list_and_struct() {
     use arrow::array::{ArrayRef, ListBuilder, StringArray, StringBuilder, StructArray};

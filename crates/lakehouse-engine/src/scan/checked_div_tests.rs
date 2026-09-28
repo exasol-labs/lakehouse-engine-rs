@@ -77,7 +77,6 @@ fn invoke_with_argument_count(arguments: Vec<ArrayRef>) -> Result<ColumnarValue,
     udf.invoke_with_args(args)
 }
 
-/// Scenario: every Iceberg/Delta operand pairing divides as DOUBLE; `Int64 / Int64` must not truncate (#186).
 #[test]
 fn checked_float_div_divides_every_operand_pairing_as_double() {
     let pairings: Vec<(&str, ArrayRef, ArrayRef)> = vec![
@@ -130,7 +129,6 @@ fn checked_float_div_divides_every_operand_pairing_as_double() {
     }
 }
 
-/// Scenario: a NULL in either operand yields NULL with no error, including NULL over zero.
 #[test]
 fn checked_float_div_propagates_null_in_either_operand() {
     let left = float64(vec![None, Some(7.0), None, Some(7.0)]);
@@ -151,7 +149,6 @@ fn checked_float_div_propagates_null_in_either_operand() {
     );
 }
 
-/// Scenario: a zero divisor raises a division-by-zero error instead of returning `+Inf` (#370).
 #[test]
 fn checked_float_div_raises_on_a_zero_divisor() {
     let message = raised(float64(vec![Some(7.0)]), float64(vec![Some(0.0)])).to_string();
@@ -167,7 +164,6 @@ fn checked_float_div_raises_on_a_zero_divisor() {
     );
 }
 
-/// Scenario: `0 / 0` raises the same division-by-zero message instead of a silent NULL (#246).
 #[test]
 fn checked_float_div_raises_on_zero_over_zero() {
     let message = raised(float64(vec![Some(0.0)]), float64(vec![Some(0.0)])).to_string();
@@ -178,7 +174,6 @@ fn checked_float_div_raises_on_zero_over_zero() {
     );
 }
 
-/// Scenario: a `-0.0` divisor is a division by zero, not an overflow.
 #[test]
 fn checked_float_div_treats_negative_zero_as_zero() {
     let message = raised(float64(vec![Some(7.0)]), float64(vec![Some(-0.0)])).to_string();
@@ -189,7 +184,6 @@ fn checked_float_div_treats_negative_zero_as_zero() {
     );
 }
 
-/// Scenario: an overflow to `+Inf` raises as an out-of-range value, not a division by zero.
 #[test]
 fn checked_float_div_raises_on_an_overflow_to_infinity() {
     let message = raised(float64(vec![Some(1e300)]), float64(vec![Some(1e-300)])).to_string();
@@ -206,7 +200,6 @@ fn checked_float_div_raises_on_an_overflow_to_infinity() {
     );
 }
 
-/// Scenario: a stored `NaN` operand raises as out-of-range, the deliberate trade-off recorded in #393.
 #[test]
 fn checked_float_div_raises_on_a_stored_non_finite_operand() {
     let message = raised(float64(vec![Some(f64::NAN)]), float64(vec![Some(2.0)])).to_string();
@@ -217,7 +210,6 @@ fn checked_float_div_raises_on_a_stored_non_finite_operand() {
     );
 }
 
-/// Scenario: a stored non-finite numerator over a zero divisor reports a division by zero.
 #[test]
 fn checked_float_div_reports_a_stored_non_finite_numerator_over_a_zero_divisor_as_a_zero_divisor() {
     let message = raised(float64(vec![Some(f64::NAN)]), float64(vec![Some(0.0)])).to_string();
@@ -234,7 +226,6 @@ fn checked_float_div_reports_a_stored_non_finite_numerator_over_a_zero_divisor_a
     );
 }
 
-/// Scenario: an empty batch returns no rows rather than an error.
 #[test]
 fn checked_float_div_returns_no_rows_for_an_empty_batch() {
     let quotient = divide(float64(vec![]), float64(vec![])).expect("an empty batch must not raise");
@@ -247,7 +238,6 @@ fn checked_float_div_returns_no_rows_for_an_empty_batch() {
     );
 }
 
-/// Scenario: a two-literal division plans and raises from the stream, the same route a column takes.
 #[tokio::test]
 async fn checked_float_div_over_two_literals_surfaces_a_division_by_zero_message() {
     let ctx = SessionContext::new();
@@ -279,7 +269,6 @@ async fn checked_float_div_over_two_literals_surfaces_a_division_by_zero_message
     );
 }
 
-/// Scenario: the session records the failure as a typed value, surviving the row filter's flattening.
 #[tokio::test]
 async fn checked_float_div_records_its_failure_on_the_session() {
     let ctx = SessionContext::new();
@@ -308,7 +297,6 @@ async fn checked_float_div_records_its_failure_on_the_session() {
     );
 }
 
-/// Scenario: a successful division records no session failure.
 #[tokio::test]
 async fn a_successful_checked_division_records_no_session_failure() {
     let ctx = SessionContext::new();
@@ -328,7 +316,6 @@ async fn a_successful_checked_division_records_no_session_failure() {
     );
 }
 
-/// Scenario: a second session records no failure from the first (no cached UDF instance).
 #[tokio::test]
 async fn a_second_session_records_no_failure_from_the_first() {
     let divided = SessionContext::new();
@@ -360,7 +347,6 @@ async fn a_second_session_records_no_failure_from_the_first() {
     );
 }
 
-/// Scenario: the arity guard refuses any argument count other than two.
 #[test]
 fn checked_float_div_refuses_an_argument_count_other_than_two() {
     let too_few = vec![float64(vec![Some(7.0)])];

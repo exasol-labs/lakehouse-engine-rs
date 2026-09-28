@@ -225,7 +225,6 @@ fn column_mapping_mode_is_reported_from_the_tables_metadata() {
     }
 }
 
-/// Scenario: A legacy reader version table passes the gate and keeps its column-mapping mode
 #[test]
 fn a_legacy_reader_version_table_passes_the_gate_and_keeps_its_column_mapping_mode() {
     let snapshot = DeltaSnapshot::open(local_store(), &fixture_root("cdf-column-mapping-id-mode"))
@@ -234,7 +233,6 @@ fn a_legacy_reader_version_table_passes_the_gate_and_keeps_its_column_mapping_mo
     assert_eq!(snapshot.column_mapping_mode(), ColumnMappingMode::Id);
 }
 
-/// Scenario: Replay returns only the files active at the current version
 #[test]
 fn replay_returns_only_the_files_active_at_the_current_version() {
     let files = replay_fixture("cdf-column-mapping-name-mode");
@@ -289,7 +287,6 @@ fn replay_carries_each_active_files_path_verbatim_and_its_size() {
     );
 }
 
-/// Scenario: Replay carries partition values and an explicit NULL for the default partition
 #[test]
 fn replay_carries_partition_values_and_an_explicit_null() {
     let files = replay_fixture("basic_partitioned");
@@ -337,7 +334,6 @@ fn replay_carries_no_partition_value_for_an_unpartitioned_table() {
     );
 }
 
-/// Scenario: Replay carries a re-added file's deletion vector exactly once
 #[test]
 fn replay_carries_a_readded_files_deletion_vector_exactly_once() {
     let files = replay_fixture("table-with-dv-small");
@@ -753,7 +749,6 @@ fn an_unsupported_recorded_type_change_refuses_only_its_own_column() {
     }
 }
 
-/// Scenario: A vendored fixture declaring a reader feature outside the allow-list is refused
 #[test]
 fn a_vendored_fixture_declaring_a_reader_feature_outside_the_allow_list_is_refused() {
     let table = "unshredded-variant";
@@ -873,7 +868,6 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
-/// Scenario: A void column reads as all-NULL under name column mapping
 #[test]
 fn a_void_column_reads_as_all_null_under_name_column_mapping() {
     use super::super::delta_schema::build_delta_table_schema;
@@ -1155,7 +1149,6 @@ async fn a_partly_untranslatable_conjunction_still_prunes_by_its_translatable_ha
     assert_eq!(paths, vec!["part-1.parquet"]);
 }
 
-/// Scenario: Pruning stays live under name and id column mapping
 #[test]
 fn pruning_under_column_mapping_records_its_observed_behavior() {
     let name_mode_all = replay_fixture("cdf-column-mapping-name-mode");

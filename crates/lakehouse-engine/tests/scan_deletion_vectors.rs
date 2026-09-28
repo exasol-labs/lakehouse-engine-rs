@@ -217,7 +217,7 @@ fn total_rows(batches: &[RecordBatch]) -> usize {
     batches.iter().map(|b| b.num_rows()).sum()
 }
 
-/// Scenario: a UUID-relative deletion vector removes exactly its flagged row positions
+/// Scenario: A UUID-relative deletion vector removes exactly its flagged rows
 #[test]
 fn uuid_relative_deletion_vector_removes_its_flagged_rows() {
     let dir = temp_dir("uuid_relative");
@@ -241,7 +241,6 @@ fn uuid_relative_deletion_vector_removes_its_flagged_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: an inline deletion vector is decoded from its own payload with no sidecar read
 #[test]
 fn inline_deletion_vector_decodes_without_object_store_access() {
     let dir = temp_dir("inline");
@@ -273,7 +272,6 @@ fn inline_deletion_vector_decodes_without_object_store_access() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: an absolute-path deletion vector is read verbatim, never joined onto `table_root`
 #[test]
 fn absolute_path_deletion_vector_is_read_verbatim() {
     let dir = temp_dir("absolute_path");
@@ -299,7 +297,7 @@ fn absolute_path_deletion_vector_is_read_verbatim() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a deletion-vector sidecar shared by several data files is fetched once per shard
+/// Scenario: A deletion-vector file shared by several data files is fetched once per shard
 #[test]
 fn shared_deletion_vector_file_is_fetched_once_per_shard() {
     let dir = temp_dir("shared_sidecar");
@@ -348,7 +346,6 @@ fn shared_deletion_vector_file_is_fetched_once_per_shard() {
 const DV_READ_DELAY: Duration = Duration::from_millis(50);
 const DV_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Scenario: concurrent sidecar reads peak at exactly the connection budget
 #[test]
 fn deletion_vector_reads_stay_within_the_connection_budget() {
     const BUDGET: usize = 3;
@@ -486,7 +483,7 @@ fn deletion_vectors_compose_with_projection_filter_limit_and_aggregation() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a Delta data file with no deletion vector scans unchanged
+/// Scenario: A Delta data file carrying no deletion vector scans unchanged
 #[test]
 fn delta_file_without_a_deletion_vector_scans_unchanged() {
     let dir = temp_dir("delete_free");
@@ -549,7 +546,6 @@ fn write_iceberg_data_parquet(dir: &Path, relative: &str, values: &[i32]) -> Str
     file_url(&path)
 }
 
-/// Scenario: a shard mixing an Iceberg positional delete and a Delta deletion vector applies both
 #[test]
 fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
     let dir = temp_dir("mixed_shard");
@@ -620,7 +616,6 @@ fn mixed_iceberg_and_delta_shard_shares_one_position_map_and_limiter() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: an untrustworthy deletion-vector container is rejected cleanly, never a panic or silent rows
 #[test]
 fn malformed_deletion_vector_containers_fail_the_scan_without_panicking() {
     let sidecar_bytes = std::fs::read(fixture_dir().join(FIXTURE_SIDECAR_NAME)).unwrap();

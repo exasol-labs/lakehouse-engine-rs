@@ -9,13 +9,11 @@ use super::super::test_support::*;
 use super::*;
 use crate::scan::spec::{CommonScanSpec, ScanStorage};
 
-/// Scenario: An absent scale defaults to `0`, so `DECIMAL(10)` widens to `DECIMAL(36,0)`.
 #[test]
 fn sum_emit_type_absent_scale_widens_to_a_scale_zero_decimal() {
     assert_eq!(sum_emit_type("DECIMAL(10)"), "DECIMAL(36,0)");
 }
 
-/// Scenario: A non-canonical scale text re-emerges canonically or falls back, never echoed raw.
 #[test]
 fn sum_emit_type_never_echoes_a_non_canonical_scale_text() {
     // `None` = the parser rejects the text, so the answer is the numeric fallback.
@@ -45,7 +43,6 @@ fn sum_emit_type_never_echoes_a_non_canonical_scale_text() {
     }
 }
 
-/// Scenario: Every precision `parse_decimal_args` rejects declines to the numeric fallback.
 #[test]
 fn sum_emit_type_declines_every_precision_the_parser_rejects() {
     for rejected_precision in ["300", "256", "-1", "X", "", " "] {
@@ -58,7 +55,6 @@ fn sum_emit_type_declines_every_precision_the_parser_rejects() {
     }
 }
 
-/// Scenario: A grouped merge CAST to CHAR renders the length-qualified `CHAR(20) ASCII` Exasol parses (#192).
 #[test]
 fn scalar_over_merge_casts_to_exasol_char_target() {
     let sum_node = serde_json::json!({
@@ -88,7 +84,6 @@ fn scalar_over_merge_casts_to_exasol_char_target() {
     );
 }
 
-/// Scenario: A nested CAST to CHAR renders `CHAR(20) ASCII` at both levels (#192).
 #[test]
 fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     let sum_node = serde_json::json!({
@@ -120,7 +115,6 @@ fn scalar_over_merge_nested_char_cast_renders_char_at_both_levels() {
     );
 }
 
-/// Scenario: A GROUP BY request carrying COUNT(DISTINCT) declines to row scanning.
 #[test]
 fn grouped_count_distinct_falls_back_to_row_scan() {
     let req = serde_json::json!({
@@ -141,7 +135,6 @@ fn grouped_count_distinct_falls_back_to_row_scan() {
     );
 }
 
-/// Scenario: MIN/MAX over a DATE column emits DATE, not DOUBLE PRECISION.
 #[test]
 fn partial_emits_min_max_preserve_date_timestamp_type() {
     let plans = vec![
@@ -173,7 +166,6 @@ fn partial_emits_min_max_preserve_date_timestamp_type() {
     );
 }
 
-/// Scenario: SUM over a DECIMAL(20,0) column emits DECIMAL(36,0), not DOUBLE.
 #[test]
 fn partial_emits_sum_integer_stays_decimal() {
     let plans = vec![AggregatePlan {
@@ -195,7 +187,6 @@ fn partial_emits_sum_integer_stays_decimal() {
     );
 }
 
-/// Scenario: SUM over a DOUBLE PRECISION column stays DOUBLE PRECISION.
 #[test]
 fn partial_emits_sum_double_stays_double() {
     let plans = vec![AggregatePlan {
@@ -212,7 +203,6 @@ fn partial_emits_sum_double_stays_double() {
     );
 }
 
-/// Scenario: SUM over a VARCHAR or DATE column fails `validate_agg_col_types`.
 #[test]
 fn aggregate_falls_back_to_row_scan_for_sum_of_non_numeric() {
     let col_types_varchar = vec![("NAME".to_string(), "VARCHAR(2000000)".to_string())];
@@ -238,7 +228,6 @@ fn aggregate_falls_back_to_row_scan_for_sum_of_non_numeric() {
     );
 }
 
-/// Scenario: A grouped SUM over VARCHAR falls back to row scan instead of an opaque UDF error.
 #[test]
 fn grouped_aggregate_sum_over_varchar_falls_back_via_type_validation() {
     let req = serde_json::json!({
@@ -354,7 +343,6 @@ fn decimal_type(precision: u64, scale: u64) -> serde_json::Value {
     serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
 }
 
-/// Scenario: A column reference in GROUP BY renders to a quoted identifier.
 #[test]
 fn detect_group_by_aggregates_column_key() {
     let req = make_group_by_request(
@@ -392,7 +380,6 @@ fn grouped_spec(result: &GroupedAggregateDetection) -> ScanSpec {
     }
 }
 
-/// Scenario: A grouped ORDER BY without LIMIT renders a positional final ORDER BY, sorting typed output.
 #[test]
 fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     let mut req = make_group_by_request_with_types(
@@ -441,7 +428,6 @@ fn grouped_order_by_no_limit_renders_explicit_merge_order_by() {
     assert!(!sql.contains("LIMIT"), "no LIMIT requested: {sql}");
 }
 
-/// Scenario: An ORDER BY on a detected aggregate resolves to its merged expression (#198).
 #[test]
 fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
     let mut req = make_group_by_request_with_types(
@@ -477,7 +463,6 @@ fn grouped_order_by_select_list_aggregate_renders_merged_partial() {
     );
 }
 
-/// Scenario: An ORDER BY on an undetected aggregate is `Unresolvable`, routing to a wrapper (#198).
 #[test]
 fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
     let mut req = make_group_by_request_with_types(
@@ -503,7 +488,6 @@ fn grouped_order_by_aggregate_absent_from_plans_is_unresolvable() {
     );
 }
 
-/// Scenario: A scalar expression in GROUP BY renders via `render_expression`.
 #[test]
 fn detect_group_by_aggregates_expression_key() {
     let req = make_group_by_request(
@@ -526,7 +510,6 @@ fn detect_group_by_aggregates_expression_key() {
     assert_eq!(plans[0].kind, AggKind::Sum);
 }
 
-/// Scenario: An unsupported GROUP BY expression makes detection return None.
 #[test]
 fn detect_group_by_unsupported_expression_falls_back() {
     let req = make_group_by_request(
@@ -539,7 +522,6 @@ fn detect_group_by_unsupported_expression_falls_back() {
     );
 }
 
-/// Scenario: A non-aggregate, non-column select-list item causes fallback.
 #[test]
 fn detect_group_by_mixed_select_falls_back() {
     let req = make_group_by_request(
@@ -555,7 +537,6 @@ fn detect_group_by_mixed_select_falls_back() {
     );
 }
 
-/// Scenario: A `literal_null`-only grouped select list keeps its GROUP BY, never a row-scan fallback (#52).
 #[test]
 fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     let req = serde_json::json!({
@@ -633,7 +614,6 @@ fn composed_nested_aggregate_request_does_not_reference_phantom_column() {
     );
 }
 
-/// Scenario: A `literal_bool` placeholder in a grouped select list does not abort detection (#52).
 #[test]
 fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
     let req = make_group_by_request_with_types(
@@ -666,7 +646,6 @@ fn literal_bool_selectlist_item_classifies_as_constant_not_group_key() {
     );
 }
 
-/// Scenario: An aggregate before the group key keeps its original select-list ordinal (#33).
 #[test]
 fn detect_group_by_aggregates_preserves_select_list_order() {
     let req = make_group_by_request(
@@ -693,7 +672,6 @@ fn detect_group_by_aggregates_preserves_select_list_order() {
     );
 }
 
-/// Scenario: Interleaved multi-key GROUP BY items keep their own ordinals and key slots.
 #[test]
 fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
     let req = make_group_by_request(
@@ -731,7 +709,6 @@ fn detect_group_by_aggregates_interleaved_multi_key_preserves_order() {
     );
 }
 
-/// Scenario: An expression group key after an aggregate keeps its original ordinal.
 #[test]
 fn detect_group_by_aggregates_expr_key_after_agg_preserves_order() {
     let req = make_group_by_request(
@@ -756,7 +733,6 @@ fn detect_group_by_aggregates_expr_key_after_agg_preserves_order() {
     );
 }
 
-/// Scenario: HAVING does not change aggregate-first select-list classification.
 #[test]
 fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
     let req = serde_json::json!({
@@ -787,7 +763,6 @@ fn detect_group_by_aggregates_aggregate_first_with_having_preserves_order() {
     );
 }
 
-/// Scenario: All-expression multi-key GROUP BY renders each key; one untranslatable key declines all.
 #[test]
 fn detect_group_by_all_expression_multi_key() {
     let req = make_group_by_request(
@@ -946,7 +921,6 @@ fn build_grouped_agg_sql(
     )
 }
 
-/// Scenario: Grouped SQL fans out via GROUP BY shard_key, one common blob and one files literal per shard.
 #[test]
 fn grouped_fan_out_common_once_files_per_shard() {
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
@@ -994,7 +968,6 @@ fn grouped_fan_out_common_once_files_per_shard() {
     }
 }
 
-/// Scenario: The shard_key GROUP BY sits inside the distributor; the outer wrapper re-groups on GK_*.
 #[test]
 fn grouped_group_by_shard_key_inside_distributor() {
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
@@ -1034,7 +1007,6 @@ fn grouped_group_by_shard_key_inside_distributor() {
     );
 }
 
-/// Scenario: Single-shard grouped SQL re-groups over a from-less scan, with no distributor.
 #[test]
 fn grouped_single_shard_short_circuits_distributor() {
     let sql = build_grouped_agg_sql(
@@ -1062,7 +1034,6 @@ fn grouped_single_shard_short_circuits_distributor() {
     );
 }
 
-/// Scenario: A grouped LIMIT applies only on the outer wrapper, never in the shard blob.
 #[test]
 fn grouped_common_blob_has_no_limit() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
@@ -1114,7 +1085,6 @@ fn grouped_common_blob_has_no_limit() {
     );
 }
 
-/// Scenario: A grouped offset renders only on the outer wrapper, never in the shared blob.
 #[test]
 fn grouped_merge_offset_never_reaches_per_shard_spec() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
@@ -1166,7 +1136,6 @@ fn grouped_merge_offset_never_reaches_per_shard_spec() {
     );
 }
 
-/// Scenario: A zero offset renders exactly ` LIMIT {n}` with no OFFSET token (#191).
 #[test]
 fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
     let files = vec![("s3://w/f0.parquet".to_string(), 200u64)];
@@ -1217,7 +1186,6 @@ fn grouped_merge_zero_offset_is_byte_identical_to_bare_limit() {
     );
 }
 
-/// Scenario: The grouped merge renders `GROUP BY … ORDER BY … LIMIT n OFFSET m` in that order (#191).
 #[test]
 fn grouped_merge_renders_limit_offset_in_clause_order() {
     let mut req = make_group_by_request_with_types(
@@ -1267,7 +1235,6 @@ fn grouped_merge_renders_limit_offset_in_clause_order() {
     );
 }
 
-/// Scenario: The grouped wrapper re-groups partial results per user group key.
 #[test]
 fn grouped_aggregate_wrapper_sql_groups_by_user_key_cols() {
     let files: Vec<String> = (0..2).map(|i| format!("s3://w/f{i}.parquet")).collect();
@@ -1396,7 +1363,6 @@ fn build_grouped_agg_sql_with_select_items(
     )
 }
 
-/// Scenario: The outer SELECT follows select-list order, merged SUM before the cast key (#33).
 #[test]
 fn grouped_wrapper_agg_before_key_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
@@ -1436,7 +1402,6 @@ fn grouped_wrapper_agg_before_key_ordering() {
     );
 }
 
-/// Scenario: Interleaved multi-key outer SELECT order is [key0, aggregate, key1].
 #[test]
 fn grouped_wrapper_interleaved_multi_key_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
@@ -1484,7 +1449,6 @@ fn grouped_wrapper_interleaved_multi_key_ordering() {
     );
 }
 
-/// Scenario: An expression key after an aggregate keeps its declared DECIMAL type, not VARCHAR (#33).
 #[test]
 fn grouped_wrapper_expr_key_after_agg_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
@@ -1520,7 +1484,6 @@ fn grouped_wrapper_expr_key_after_agg_ordering() {
     );
 }
 
-/// Scenario: Aggregate-first GROUP BY with HAVING keeps select-list order and appends HAVING after GROUP BY.
 #[test]
 fn grouped_wrapper_agg_first_with_having_ordering() {
     let sql = build_grouped_agg_sql_with_select_items(
@@ -1639,7 +1602,6 @@ fn build_grouped_from_detection(req: &serde_json::Value) -> String {
     )
 }
 
-/// Scenario: A scalar-over-aggregate folds its inner aggregates into the plan list, deduping COUNT(*) (#82).
 #[test]
 fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
     let req = make_group_by_request_with_types(
@@ -1706,7 +1668,6 @@ fn grouped_scalar_over_aggregate_detects_and_dedups_inner_aggregates() {
     );
 }
 
-/// Scenario: The wrapper renders a scalar-over-aggregate over merged partials with no source column.
 #[test]
 fn grouped_scalar_over_aggregate_renders_merged_partials() {
     let req = make_group_by_request_with_types(
@@ -1755,7 +1716,6 @@ fn grouped_scalar_over_aggregate_renders_merged_partials() {
     );
 }
 
-/// Scenario: A scalar-over-aggregate before the key keeps select-list order and its declared cast.
 #[test]
 fn grouped_scalar_over_aggregate_preserves_selectlist_order() {
     let req = make_group_by_request_with_types(
@@ -1794,7 +1754,6 @@ fn grouped_scalar_over_aggregate_preserves_selectlist_order() {
     );
 }
 
-/// Scenario: A scalar over COUNT(DISTINCT) routes to the qualified wrapper, not a bare row scan.
 #[test]
 fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     let pushdown_req = serde_json::json!({
@@ -1875,7 +1834,6 @@ fn grouped_undecomposable_falls_back_to_qualified_wrapper() {
     );
 }
 
-/// Scenario: A HAVING aggregate renders against the merged partial, not the source column (#33).
 #[test]
 fn render_having_over_merge_rewrites_aggregate_to_partial() {
     let having = serde_json::json!({
@@ -1900,7 +1858,6 @@ fn render_having_over_merge_rewrites_aggregate_to_partial() {
     );
 }
 
-/// Scenario: The #33 HAVING wrapper carries the merged HAVING and no source `SCORE` reference.
 #[test]
 fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     let req = make_group_by_request_with_types(
@@ -1964,7 +1921,6 @@ fn grouped_wrapper_having_over_aggregate_uses_merge_expression() {
     );
 }
 
-/// Scenario: A HAVING on an unplanned aggregate returns None so the request routes to a wrapper.
 #[test]
 fn render_having_over_merge_declines_unknown_aggregate() {
     let having = serde_json::json!({
@@ -1983,7 +1939,6 @@ fn render_having_over_merge_declines_unknown_aggregate() {
     );
 }
 
-/// Scenario: Detection output feeds the SQL builder and the wrapper follows select-list order (#33).
 #[test]
 fn grouped_wrapper_outer_select_follows_select_list_order() {
     let req = make_group_by_request_with_types(
@@ -2040,7 +1995,6 @@ fn grouped_wrapper_outer_select_follows_select_list_order() {
     );
 }
 
-/// Scenario: Multi-key HAVING and LIMIT render only in the outer wrapper, never per shard.
 #[test]
 fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     let req = make_group_by_request_with_types(
@@ -2143,7 +2097,6 @@ fn grouped_wrapper_multi_key_having_and_limit_outer_only() {
     );
 }
 
-/// Scenario: An expression key resolves its declared type by index, not by rendered-string match.
 #[test]
 fn group_key_type_resolved_by_index_not_string_match() {
     let req = serde_json::json!({
@@ -2172,7 +2125,6 @@ fn group_key_type_resolved_by_index_not_string_match() {
     );
 }
 
-/// Scenario: Mixed-type multi-key GROUP BY resolves each key's own declared type.
 #[test]
 fn group_key_types_multi_key_mixed_types() {
     let req = make_group_by_request_with_types(
@@ -2208,7 +2160,6 @@ fn group_key_types_multi_key_mixed_types() {
     );
 }
 
-/// Scenario: An equal-length CASE group key resolves to `CHAR(3) ASCII`, as Exasol declares it (#192).
 #[test]
 fn group_key_exasol_types_resolves_char_case_key() {
     let case_key = serde_json::json!({
@@ -2246,7 +2197,6 @@ fn group_key_exasol_types_resolves_char_case_key() {
     );
 }
 
-/// Scenario: A VARCHAR-declared group key keeps resolving to `VARCHAR(10)`.
 #[test]
 fn group_key_exasol_types_resolves_varchar_key_unchanged() {
     let req = make_group_by_request_with_types(
@@ -2271,7 +2221,6 @@ fn group_key_exasol_types_resolves_varchar_key_unchanged() {
     );
 }
 
-/// Scenario: An unprojected group key reads its declared CHAR type from its `groupBy` node (#192).
 #[test]
 fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
     let req = make_group_by_request_with_types(
@@ -2300,7 +2249,6 @@ fn group_key_exasol_types_resolves_char_type_for_unprojected_group_key() {
     );
 }
 
-/// Scenario: An unprojected VARCHAR group key resolves VARCHAR, never a padded CHAR width.
 #[test]
 fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
     let req = make_group_by_request_with_types(
@@ -2320,7 +2268,6 @@ fn group_key_exasol_types_resolves_varchar_type_for_unprojected_group_key() {
     );
 }
 
-/// Scenario: A projected key's `selectListDataTypes` entry wins over its `groupBy` type.
 #[test]
 fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
     let req = make_group_by_request_with_types(
@@ -2340,7 +2287,6 @@ fn group_key_exasol_types_prefers_select_list_type_over_group_by_type() {
     );
 }
 
-/// Scenario: A bare string-literal select item renders `CAST('X' AS CHAR(1) ASCII)` (#192).
 #[test]
 fn constant_projection_casts_literal_to_char() {
     let req = make_group_by_request_with_types(
@@ -2372,7 +2318,6 @@ fn constant_projection_casts_literal_to_char() {
     );
 }
 
-/// Scenario: `MIN(CAST(<col> AS CHAR(20)))` emits and merges as `CHAR(20)`, not VARCHAR.
 #[test]
 fn min_over_char_expression_declares_char_partial_and_merge_cast() {
     let cast_arg = serde_json::json!({
@@ -2417,7 +2362,6 @@ fn min_over_char_expression_declares_char_partial_and_merge_cast() {
     );
 }
 
-/// Scenario: A missing or non-"group_by" aggregationType returns None.
 #[test]
 fn detect_group_by_aggregates_no_group_by_type_returns_none() {
     let req1 = serde_json::json!({
@@ -2433,7 +2377,6 @@ fn detect_group_by_aggregates_no_group_by_type_returns_none() {
     assert!(detect_group_by_aggregates(&req2).is_none());
 }
 
-/// Scenario: An empty groupBy array returns None.
 #[test]
 fn detect_group_by_aggregates_empty_group_by_returns_none() {
     let req = serde_json::json!({
@@ -2444,7 +2387,6 @@ fn detect_group_by_aggregates_empty_group_by_returns_none() {
     assert!(detect_group_by_aggregates(&req).is_none());
 }
 
-/// Scenario: `partial_emits_items` produces 3 columns for stat aggregates.
 #[test]
 fn stat_aggregate_emits_three_partial_columns() {
     for kind in &[
@@ -2480,7 +2422,6 @@ fn stat_aggregate_emits_three_partial_columns() {
     }
 }
 
-/// Scenario: The scan's partial SELECT and the `EMITS` clause name the same partial columns in order.
 #[test]
 fn scan_select_list_and_emits_agree_per_agg_kind() {
     /// Both sides terminate the name with a double quote.
@@ -2541,7 +2482,6 @@ fn scan_select_list_and_emits_agree_per_agg_kind() {
     );
 }
 
-/// Scenario: The VAR_POP merge guards the count with NULLIF and does not divide by N-1.
 #[test]
 fn var_pop_merge_formula_divides_by_n() {
     let plans = vec![AggregatePlan {
@@ -2560,7 +2500,6 @@ fn var_pop_merge_formula_divides_by_n() {
     );
 }
 
-/// Scenario: The VAR_SAMP merge divides by N-1 and maps N<=1 to NULL.
 #[test]
 fn var_samp_merge_formula_divides_by_n_minus_1() {
     let plans = vec![AggregatePlan {
@@ -2579,7 +2518,6 @@ fn var_samp_merge_formula_divides_by_n_minus_1() {
     );
 }
 
-/// Scenario: The STDDEV_POP merge wraps the variance in SQRT.
 #[test]
 fn stddev_pop_merge_formula_uses_sqrt() {
     let plans = vec![AggregatePlan {
@@ -2595,7 +2533,6 @@ fn stddev_pop_merge_formula_uses_sqrt() {
     );
 }
 
-/// Scenario: The STDDEV_SAMP merge wraps the sample variance in SQRT.
 #[test]
 fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
     let plans = vec![AggregatePlan {
@@ -2615,7 +2552,6 @@ fn stddev_samp_merge_formula_uses_sqrt_and_n_minus_1() {
     );
 }
 
-/// Scenario: The STDDEV_POP merge passes NULL through for N=0.
 #[test]
 fn stddev_pop_merge_null_passthrough_for_n_zero() {
     let plans = vec![AggregatePlan {
@@ -2635,7 +2571,6 @@ fn stddev_pop_merge_null_passthrough_for_n_zero() {
     );
 }
 
-/// Scenario: The STDDEV_SAMP merge passes NULL through for N=0 and N=1.
 #[test]
 fn stddev_samp_merge_null_passthrough_for_n_zero_and_n_one() {
     let plans = vec![AggregatePlan {
@@ -2655,7 +2590,6 @@ fn stddev_samp_merge_null_passthrough_for_n_zero_and_n_one() {
     );
 }
 
-/// Scenario: HAVING renders after GROUP BY in the outer wrapper.
 #[test]
 fn having_clause_appears_in_outer_wrapper_only() {
     let having_filter = Some(r#"(SUM("AMOUNT") > 100)"#.to_string());
@@ -2724,7 +2658,6 @@ fn expected_pad(fragment: &str, width: u32) -> String {
     )
 }
 
-/// Scenario: A CHAR(20) group key is blank-padded so trailing-blank variants form one group (#192).
 #[test]
 fn char_declared_group_key_is_blank_padded_to_its_declared_width() {
     let fragment = r#"CAST("NAME" AS VARCHAR)"#.to_string();
@@ -2740,7 +2673,6 @@ fn char_declared_group_key_is_blank_padded_to_its_declared_width() {
     );
 }
 
-/// Scenario: The pad width parses from inside the parentheses, so `CHAR(3) ASCII` still pads.
 #[test]
 fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
     let fragment = "CASE WHEN \"C_DECIMAL_A\" < 0 THEN 'NEG' ELSE 'POS' END".to_string();
@@ -2758,7 +2690,6 @@ fn ascii_suffixed_char_group_key_width_is_parsed_before_the_suffix() {
     );
 }
 
-/// Scenario: An over-length value passes through untruncated, since `rpad` would merge it into a wrong group.
 #[test]
 fn char_pad_leaves_an_over_length_value_unmodified() {
     let fragment = r#""NAME""#.to_string();
@@ -2789,7 +2720,6 @@ fn char_pad_leaves_an_over_length_value_unmodified() {
     }
 }
 
-/// Scenario: A VARCHAR group key is untouched, proving a prefix rather than substring match.
 #[test]
 fn varchar_declared_group_key_is_left_unpadded() {
     let keys = vec![r#""REGION""#.to_string()];
@@ -2802,7 +2732,6 @@ fn varchar_declared_group_key_is_left_unpadded() {
     );
 }
 
-/// Scenario: A mixed VARCHAR + CHAR multi-key GROUP BY pads only the CHAR slot at its own width.
 #[test]
 fn multi_key_pad_applies_only_to_the_char_slot() {
     let keys = vec![
@@ -2822,7 +2751,6 @@ fn multi_key_pad_applies_only_to_the_char_slot() {
     );
 }
 
-/// Scenario: The padded fragment plans and evaluates in DataFusion with the #192 semantics.
 #[tokio::test]
 async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
     use arrow::array::{Array, Int64Array, StringArray};
@@ -2912,7 +2840,6 @@ async fn padded_group_key_merges_trailing_blank_variants_without_truncating() {
     );
 }
 
-/// Scenario: A CASE fragment nests inside the pad splice and still parses in DataFusion.
 #[tokio::test]
 async fn padded_case_fragment_plans_and_evaluates_in_datafusion() {
     use arrow::array::StringArray;
@@ -2951,7 +2878,6 @@ async fn padded_case_fragment_plans_and_evaluates_in_datafusion() {
     );
 }
 
-/// Scenario: A grouped statistical aggregate over an expression argument declines to the wrapper.
 #[test]
 fn grouped_stat_aggregate_over_expression_argument_declines() {
     let req = make_group_by_request_with_types(
@@ -2969,7 +2895,6 @@ fn grouped_stat_aggregate_over_expression_argument_declines() {
     );
 }
 
-/// Scenario: A grouped `SQRT(STDDEV(<expr>))` declines to the qualified single-table wrapper.
 #[test]
 fn scalar_over_stat_aggregate_with_expression_argument_declines() {
     let sqrt_over_stat = serde_json::json!({
@@ -2994,7 +2919,6 @@ fn scalar_over_stat_aggregate_with_expression_argument_declines() {
     );
 }
 
-/// Scenario: A HAVING over a statistical aggregate of an expression does not render over the merge.
 #[test]
 fn having_over_stat_aggregate_with_expression_argument_declines() {
     let having = serde_json::json!({

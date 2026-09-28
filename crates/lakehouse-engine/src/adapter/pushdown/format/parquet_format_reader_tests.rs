@@ -229,7 +229,6 @@ async fn file_entry_paths_round_trip_to_the_listed_object() {
     );
 }
 
-/// Scenario: The merge mode narrows which footers are read, never which files are scanned
 #[tokio::test]
 async fn plan_reads_selected_footers_and_lists_every_file() {
     let store = two_depth_directory().await;
@@ -436,7 +435,6 @@ async fn a_nested_column_declares_the_string_tag_and_an_identity_bound_descripto
     );
 }
 
-/// Scenario: A directory holding no data file resolves an empty scan, not an error
 #[tokio::test]
 async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
     let store =
@@ -449,7 +447,6 @@ async fn a_directory_holding_no_data_file_resolves_an_empty_scan() {
     assert_eq!(scan.table_root, TABLE_ROOT);
 }
 
-/// Scenario: Planning renders the same normalized timestamptz tag as enumeration
 #[tokio::test]
 async fn a_non_utc_timezone_column_plans_at_its_normalized_tag() {
     let store = store_holding(&[(

@@ -49,7 +49,6 @@ fn signed_request_carries_sigv4_header() {
     );
 }
 
-/// Scenario: The secret key does not appear in any signed request header.
 #[test]
 fn secret_key_absent_from_signed_headers() {
     let secret = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY";
@@ -78,7 +77,6 @@ fn secret_key_absent_from_signed_headers() {
     }
 }
 
-/// Scenario: The `Credentials` `Debug` impl redacts `secret_access_key`.
 #[test]
 fn credentials_debug_redacts_secret() {
     let creds = Credentials::new(
@@ -99,7 +97,6 @@ fn credentials_debug_redacts_secret() {
     );
 }
 
-/// Scenario: Unsigned catalog path is unchanged when SigV4 is disabled.
 #[test]
 fn disabled_sigv4_produces_unsigned_request() {
     let client = reqwest::Client::new();
@@ -221,7 +218,6 @@ fn standard_glue_endpoint_region_signs_even_when_a_different_region_is_stated() 
     );
 }
 
-/// Scenario: No address form outside the standard Glue shape supplies a signing region on its own.
 #[test]
 fn non_standard_addresses_supply_no_signing_region() {
     let creds = creds_stating_region("");
@@ -235,7 +231,6 @@ fn non_standard_addresses_supply_no_signing_region() {
     }
 }
 
-/// Scenario: A non-standard address signs with the stated `region`.
 #[test]
 fn stated_region_signs_for_a_non_standard_address() {
     let creds = creds_stating_region("us-gov-west-1");
@@ -249,7 +244,6 @@ fn stated_region_signs_for_a_non_standard_address() {
     }
 }
 
-/// Scenario: The signing-region refusal carries neither a credential value nor the catalog URI.
 #[test]
 fn required_signing_region_refuses_without_a_signing_region() {
     let creds = ConnectionCreds {

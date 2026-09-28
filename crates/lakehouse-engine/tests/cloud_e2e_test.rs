@@ -305,7 +305,6 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
     ));
 }
 
-/// Scenario: the cloud suite skips cleanly with no network call when any required env var is absent
 #[test]
 fn cloud_test_skips_when_creds_absent() {
     let required = [
@@ -340,7 +339,6 @@ fn cloud_test_skips_when_creds_absent() {
     println!("cloud_test_skips_when_creds_absent: skip path verified (no network call)");
 }
 
-/// Scenario: a Glue-backed VS answers a projection and a COUNT(*) query
 #[test]
 fn cloud_smoke_projection_filter_query() {
     let env = match CloudEnv::from_env() {
@@ -399,7 +397,6 @@ fn cloud_smoke_projection_filter_query() {
     println!("cloud_smoke_projection_filter_query: COUNT(*) = {total}");
 }
 
-/// Scenario: a region-less Glue CONNECTION lists the table, signing with the region derived from the standard Glue endpoint
 #[test]
 fn cloud_sigv4_region_derived_from_glue_endpoint_lists_table() {
     let env = match CloudEnv::from_env() {
@@ -463,7 +460,6 @@ fn cloud_sigv4_region_derived_from_glue_endpoint_lists_table() {
     );
 }
 
-/// Scenario: a grouped COUNT over the Glue table sums to the total row count (timing is reported, not asserted)
 #[test]
 fn cloud_perf_grouped_aggregate_smoke() {
     let env = match CloudEnv::from_env() {
@@ -543,7 +539,6 @@ fn cloud_perf_grouped_aggregate_smoke() {
     println!("cloud_perf_grouped_aggregate_smoke: {group_count} groups, {elapsed:.2?} wall-clock");
 }
 
-/// Scenario: a scan reads Glue data files via vended credentials
 #[test]
 fn cloud_scan_reads_with_vended_credentials() {
     let env = match CloudEnv::from_env() {
@@ -629,7 +624,6 @@ fn presence_label(present: bool) -> &'static str {
     if present { "VENDED" } else { "ABSENT" }
 }
 
-/// Scenario: Glue vends a usable S3 key pair for the table's own location
 #[test]
 fn cloud_glue_vends_the_s3_key_pair_for_the_table_location() {
     // Reads the `loadTable` response directly: the vended CONNECTION also carries
@@ -716,7 +710,6 @@ fn cloud_glue_vends_the_s3_key_pair_for_the_table_location() {
     );
 }
 
-/// Scenario: a token- or OAuth2-authenticated REST catalog resolves files and the VS returns rows
 #[test]
 fn catalog_token_oauth_auth_resolves_files_e2e() {
     let env = match CatalogAuthEnv::from_env() {
@@ -787,7 +780,6 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
     );
 }
 
-/// Scenario: a failing credential-bearing DDL on a redacting connection surfaces neither the SQL nor credentials
 #[test]
 fn cloud_redacting_conn_omits_credentials_on_failure() {
     // Fake sentinels, safe to surface in assertion messages.

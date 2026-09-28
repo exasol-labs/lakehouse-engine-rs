@@ -62,7 +62,6 @@ fn name_mapped_load_table_body() -> String {
     .to_string()
 }
 
-/// Scenario: The Iceberg reader owns resolution and adds no partition columns
 #[tokio::test]
 async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
     let creds = one_request_sigv4_creds();
@@ -134,7 +133,6 @@ async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
     );
 }
 
-/// Scenario: Parquet data and Parquet positional-delete files classify as supported
 #[test]
 fn classify_accepts_parquet_data_and_parquet_positional_delete() {
     assert!(
@@ -147,7 +145,6 @@ fn classify_accepts_parquet_data_and_parquet_positional_delete() {
     );
 }
 
-/// Scenario: Equality deletes fail loud regardless of file format
 #[test]
 fn classify_rejects_equality_deletes() {
     for fmt in [
@@ -163,7 +160,6 @@ fn classify_rejects_equality_deletes() {
     }
 }
 
-/// Scenario: A Puffin position delete (v3 deletion vector) is rejected at manifest level
 #[test]
 fn classify_rejects_puffin_deletion_vector() {
     assert_eq!(
@@ -173,7 +169,6 @@ fn classify_rejects_puffin_deletion_vector() {
     );
 }
 
-/// Scenario: ORC and Avro data and delete files fail loud
 #[test]
 fn classify_rejects_orc_and_avro_data_and_delete_files() {
     assert_eq!(
@@ -194,7 +189,6 @@ fn classify_rejects_orc_and_avro_data_and_delete_files() {
     );
 }
 
-/// Scenario: The unsupported-delete error names mechanism and table and leaks no credential
 #[test]
 fn unsupported_delete_error_names_mechanism_and_redacts() {
     let err = unsupported_delete_error(
@@ -223,7 +217,6 @@ fn unsupported_delete_error_names_mechanism_and_redacts() {
     );
 }
 
-/// Scenario: Manifest-read errors redact the literal Azure account key and SAS token values
 #[test]
 fn manifest_read_errors_redact_the_literal_azure_secret_values() {
     let account_key = "Zm9vYmFyYmF6cXV1eGNvcmdlc2VjcmV0QUNDT1VOVEtFWT09";
@@ -261,7 +254,6 @@ fn manifest_read_errors_redact_the_literal_azure_secret_values() {
     );
 }
 
-/// Scenario: Task-level delete content types map to mechanisms, the Data sentinel to a non-positional one
 #[test]
 fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
     use iceberg::spec::DataContentType;
@@ -289,7 +281,6 @@ fn iceberg_delete_mechanism_maps_position_equality_and_the_data_sentinel() {
     );
 }
 
-/// Scenario: Name mapping flattens top-level entries per name, excluding nested and id-less entries
 #[test]
 fn resolves_name_mapping_flat_entries_once() {
     let raw = r#"
@@ -331,7 +322,6 @@ fn resolves_name_mapping_flat_entries_once() {
     );
 }
 
-/// Scenario: An absent name-mapping property yields an empty mapping
 #[test]
 fn absent_name_mapping_is_empty() {
     assert_eq!(
@@ -340,7 +330,6 @@ fn absent_name_mapping_is_empty() {
     );
 }
 
-/// Scenario: A malformed name-mapping property fails with a clean, credential-free error
 #[test]
 fn malformed_name_mapping_errors_cleanly() {
     let err = parse_name_mapping(Some("{ not valid json mapping shape"))
@@ -418,7 +407,6 @@ async fn resolve_against_locationless_catalog(creds: &ConnectionCreds) -> Result
         .map(|_| ())
 }
 
-/// Scenario: An empty table location errors identically on vended and static paths
 #[tokio::test]
 async fn absent_table_location_errors_on_both_vended_and_static_paths() {
     let static_creds = one_request_sigv4_creds();
@@ -509,7 +497,6 @@ fn load_table_body_vending_its_own_store_address() -> String {
     .to_string()
 }
 
-/// Scenario: Vended addressing prefers the CONNECTION endpoint and region, credentials stay vended
 #[tokio::test]
 async fn vended_addressing_prefers_the_connection_endpoint_and_region() {
     let mut creds = one_request_sigv4_creds();
@@ -847,7 +834,6 @@ fn assert_promotion_refusal_names_table_column_and_issue(err: UdfError) {
     );
 }
 
-/// Scenario: resolve_scan refuses a promoted date table for an unfiltered request
 #[tokio::test]
 async fn resolve_scan_refuses_a_promoted_date_table_for_an_unfiltered_request() {
     let err = resolve_promoted_date_table(None)
@@ -857,7 +843,6 @@ async fn resolve_scan_refuses_a_promoted_date_table_for_an_unfiltered_request() 
     assert_promotion_refusal_names_table_column_and_issue(err);
 }
 
-/// Scenario: resolve_scan refuses a promoted date table for a filtered request
 #[tokio::test]
 async fn resolve_scan_refuses_a_promoted_date_table_for_a_filtered_request() {
     let filter = serde_json::json!({"op": "eq", "column": "id", "value": 1});
@@ -904,7 +889,6 @@ fn load_table_body_with_readable_promotions() -> String {
     .to_string()
 }
 
-/// Scenario: A readable Iceberg promotion carries the current type against its original field id
 #[tokio::test]
 async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_type() {
     let creds = one_request_sigv4_creds();

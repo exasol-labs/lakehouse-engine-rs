@@ -165,7 +165,6 @@ fn assert_refused(message: &str, anchor: &str, named: &[&str]) {
     assert_names_no_credential_value(message);
 }
 
-/// Scenario: storage_credentials entry with the matching prefix provides vended creds.
 #[test]
 fn vended_storage_prefers_storage_credentials_over_flat_config() {
     let result = make_load_table_result(
@@ -199,7 +198,6 @@ fn vended_storage_prefers_storage_credentials_over_flat_config() {
     assert_eq!(merged.session_token.as_deref(), Some("VENDED_TOK"));
 }
 
-/// Scenario: longest prefix wins when multiple storage_credentials entries match.
 #[test]
 fn vended_storage_longest_matching_prefix_wins() {
     let result = make_load_table_result(
@@ -246,7 +244,6 @@ fn vended_storage_longest_matching_prefix_wins() {
     assert_eq!(merged.secret_key, "LONG_SK");
 }
 
-/// Scenario: a case-variant scheme still selects the matching `storage_credentials` entry (RFC 3986 §3.1).
 #[test]
 fn vended_storage_matches_a_prefix_across_a_case_variant_scheme() {
     let result = make_load_table_result(
@@ -279,7 +276,6 @@ fn vended_storage_matches_a_prefix_across_a_case_variant_scheme() {
     assert_eq!(merged.secret_key, VENDED_SK);
 }
 
-/// Scenario: falls back to flat config when no storage_credentials prefix matches.
 #[test]
 fn vended_storage_falls_back_to_flat_config() {
     let result = make_load_table_result(
@@ -308,7 +304,6 @@ fn vended_storage_falls_back_to_flat_config() {
     assert_eq!(merged.secret_key, "CONFIG_SK");
 }
 
-/// Scenario: falls back to flat config when storage_credentials is absent.
 #[test]
 fn vended_storage_uses_flat_config_when_no_storage_credentials() {
     let result = make_load_table_result(
@@ -333,7 +328,6 @@ fn vended_storage_uses_flat_config_when_no_storage_credentials() {
     assert_eq!(merged.session_token.as_deref(), Some("CONFIG_TOK"));
 }
 
-/// Scenario: the anchor is the S3 table location; an HTTPS catalog URI is refused, never a flat-config fallback.
 #[test]
 fn vended_storage_anchor_is_the_s3_table_location() {
     let result = make_load_table_result(
@@ -375,7 +369,6 @@ fn vended_storage_anchor_is_the_s3_table_location() {
     );
 }
 
-/// Scenario: under vending the resolved storage is the vended credential set alone.
 #[test]
 fn vended_creds_are_the_sole_storage_source_in_spec() {
     let result = make_load_table_result(
@@ -410,7 +403,6 @@ fn vended_creds_are_the_sole_storage_source_in_spec() {
     );
 }
 
-/// Scenario: once vending is requested, an empty vended key is a missing credential, not a licence to read the static one.
 #[test]
 fn empty_vended_key_pair_is_a_missing_credential_not_a_licence_to_read_static() {
     let result = make_load_table_result(
@@ -432,7 +424,6 @@ fn empty_vended_key_pair_is_a_missing_credential_not_a_licence_to_read_static() 
     assert_names_no_credential_value(&message);
 }
 
-/// Scenario: the vended `s3.session-token` is the resolved session token.
 #[test]
 fn vended_storage_adopts_the_vended_session_token() {
     let result = make_load_table_result(
@@ -459,7 +450,6 @@ fn vended_storage_adopts_the_vended_session_token() {
     );
 }
 
-/// Scenario: the flat config's vended `s3.endpoint` and `s3.path-style-access` are adopted (Lakekeeper + MinIO).
 #[test]
 fn vended_storage_adopts_endpoint_and_path_style_from_flat_config() {
     let result = make_load_table_result(
@@ -483,7 +473,6 @@ fn vended_storage_adopts_endpoint_and_path_style_from_flat_config() {
     assert!(merged.path_style);
 }
 
-/// Scenario: the endpoint is read from the matching `storage_credentials` entry over the flat config.
 #[test]
 fn vended_storage_adopts_endpoint_from_storage_credentials() {
     let result = make_load_table_result(
@@ -591,7 +580,6 @@ fn oauth2_path_extracts_vended_credentials() {
     assert_ne!(merged.secret_key, CLIENT_SECRET);
 }
 
-/// Scenario: with no CONNECTION address, the vended values place the store, and a response placing none still resolves.
 #[test]
 fn empty_connection_address_adopts_the_vended_transport_values_and_a_response_placing_none_still_resolves()
  {
@@ -660,7 +648,6 @@ fn empty_connection_address_adopts_the_vended_transport_values_and_a_response_pl
     );
 }
 
-/// Scenario: the `X-Iceberg-Access-Delegation` header is sent when vending is enabled and absent when it is not.
 #[test]
 fn vended_request_sends_access_delegation_header() {
     let client = reqwest::Client::new();
@@ -695,7 +682,6 @@ fn vended_request_sends_access_delegation_header() {
     );
 }
 
-/// Scenario: vended STS values are stripped from error messages.
 #[test]
 fn vended_sts_values_not_in_error_messages() {
     let vended_secrets = [VENDED_AK, VENDED_SK, VENDED_TOK];
@@ -710,7 +696,6 @@ fn vended_sts_values_not_in_error_messages() {
     }
 }
 
-/// Scenario: an empty vended `s3.access-key-id` is a missing credential.
 #[test]
 fn resolve_vended_storage_empty_access_key_is_a_missing_credential() {
     let result = make_load_table_result(
@@ -733,7 +718,6 @@ fn resolve_vended_storage_empty_access_key_is_a_missing_credential() {
     assert_names_no_credential_value(&message);
 }
 
-/// Scenario: an empty vended `s3.secret-access-key` is a missing credential.
 #[test]
 fn resolve_vended_storage_empty_secret_key_is_a_missing_credential() {
     let result = make_load_table_result(
@@ -756,7 +740,6 @@ fn resolve_vended_storage_empty_secret_key_is_a_missing_credential() {
     assert_names_no_credential_value(&message);
 }
 
-/// Scenario: an absent or empty vended `s3.session-token` resolves to `None`.
 #[test]
 fn resolve_vended_storage_absent_session_token_is_absent() {
     let result_absent = make_load_table_result(
@@ -801,7 +784,6 @@ fn resolve_vended_storage_absent_session_token_is_absent() {
     );
 }
 
-/// Scenario: an unparseable `s3.path-style-access` falls to the endpoint-coupled default (false with no endpoint).
 #[test]
 fn resolve_vended_storage_unparseable_path_style_without_an_endpoint_is_false() {
     let result = make_load_table_result(
@@ -827,7 +809,6 @@ fn resolve_vended_storage_unparseable_path_style_without_an_endpoint_is_false() 
     );
 }
 
-/// Scenario: a vended `s3.endpoint` with no `s3.path-style-access` resolves `path_style: true`.
 #[test]
 fn vended_endpoint_without_path_style_stays_reachable_by_the_scan() {
     let result = make_load_table_result(
@@ -853,7 +834,6 @@ fn vended_endpoint_without_path_style_stays_reachable_by_the_scan() {
     );
 }
 
-/// Scenario: a stated `s3.path-style-access` wins over the endpoint-coupled default.
 #[test]
 fn vended_explicit_path_style_false_wins_over_the_endpoint_coupled_default() {
     let result = make_load_table_result(
@@ -874,7 +854,6 @@ fn vended_explicit_path_style_false_wins_over_the_endpoint_coupled_default() {
     );
 }
 
-/// Scenario: a matched `storage_credentials` entry omitting a key never falls back to the flat `config` for it.
 #[test]
 fn resolve_vended_storage_matched_entry_missing_key_does_not_fall_back_to_config() {
     let result = make_load_table_result(
@@ -902,7 +881,6 @@ fn resolve_vended_storage_matched_entry_missing_key_does_not_fall_back_to_config
     assert_names_no_credential_value(&message);
 }
 
-/// Scenario: `allow_http` comes from the operator's `ALLOW_HTTP`, never the vended result, and gates a vended plaintext endpoint.
 #[test]
 fn resolve_vended_storage_allow_http_comes_from_the_threaded_parameter() {
     let result = vended_result_flat_config();
@@ -955,7 +933,6 @@ fn resolve_vended_storage_allow_http_comes_from_the_threaded_parameter() {
     assert_names_no_credential_value(&message);
 }
 
-/// Scenario: the credential source is selected once and feeds all six vended reads.
 #[test]
 fn resolve_vended_storage_selects_credential_source_once_for_all_six_values() {
     let result = make_load_table_result(
@@ -1006,7 +983,6 @@ fn resolve_vended_storage_selects_credential_source_once_for_all_six_values() {
     );
 }
 
-/// Scenario: the resolved backend variant follows the anchor's URI scheme, case-insensitively.
 #[test]
 fn vended_backend_variant_comes_from_the_anchor_scheme() {
     let s3_result = make_load_table_result(
@@ -1071,7 +1047,6 @@ fn vended_backend_variant_comes_from_the_anchor_scheme() {
     );
 }
 
-/// Scenario: an anchor with no scheme, or an unsupported one, is refused.
 #[test]
 fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other() {
     let result = vended_result_flat_config();
@@ -1089,7 +1064,6 @@ fn vended_backend_variant_comes_from_the_anchor_scheme_and_refuses_every_other()
     }
 }
 
-/// Scenario: an unsatisfied vended request is a refusal naming what was missing, never a static fallback.
 #[test]
 fn unsatisfied_vended_request_errors_without_static_fallback() {
     let s3_anchor = "s3://bucket/db/t";
@@ -1183,7 +1157,6 @@ fn unsatisfied_vended_request_errors_without_static_fallback() {
     );
 }
 
-/// Scenario: the missing-SAS refusal still names the storage host after redaction truncates the `adls.sas-token.<host>` label.
 #[test]
 fn adls_missing_sas_refusal_names_the_host_after_redaction() {
     let result = adls_vended_result(&[(OTHER_ADLS_HOST, OTHER_HOST_SAS)]);
@@ -1205,7 +1178,6 @@ fn adls_missing_sas_refusal_names_the_host_after_redaction() {
     );
 }
 
-/// Scenario: the SAS for the anchor's own host is selected and the account name is read from that same host.
 #[test]
 fn vended_adls_sas_is_selected_by_anchor_host_with_derived_account_name() {
     let result = adls_vended_result(&[
@@ -1231,7 +1203,6 @@ fn vended_adls_sas_is_selected_by_anchor_host_with_derived_account_name() {
     );
 }
 
-/// Scenario: an `abfss://<container>@<host>/…` location reads its host after the container userinfo.
 #[test]
 fn vended_adls_reads_the_host_after_the_container_userinfo() {
     let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
@@ -1259,7 +1230,6 @@ fn vended_adls_reads_the_host_after_the_container_userinfo() {
     );
 }
 
-/// Scenario: the SAS host match is case-insensitive while `account_name` stays verbatim.
 #[test]
 fn vended_adls_sas_host_match_is_case_insensitive() {
     let result = adls_vended_result(&[(ADLS_HOST, VENDED_SAS)]);
@@ -1293,7 +1263,6 @@ fn vended_adls_sas_host_match_is_case_insensitive() {
     );
 }
 
-/// Scenario: an exact-case host spelling wins over a case-variant one.
 #[test]
 fn vended_adls_sas_prefers_the_exact_host_spelling() {
     let result = adls_vended_result(&[
@@ -1312,7 +1281,6 @@ fn vended_adls_sas_prefers_the_exact_host_spelling() {
     }
 }
 
-/// Scenario: among case-variant host spellings only, the smallest key wins deterministically.
 #[test]
 fn vended_adls_sas_case_variant_spellings_resolve_deterministically() {
     const SMALLEST_KEY_SAS: &str = "SMALLEST_KEY_SAS_SENTINEL";
@@ -1351,7 +1319,6 @@ fn vended_adls_sas_case_variant_spellings_resolve_deterministically() {
     }
 }
 
-/// Scenario: an anchor whose storage host carries no leading label is refused.
 #[test]
 fn vended_adls_account_name_requires_a_labelled_host() {
     for (anchor, unlabelled_host) in [
@@ -1369,7 +1336,6 @@ fn vended_adls_account_name_requires_a_labelled_host() {
     }
 }
 
-/// Scenario: the vended ADLS backend holds the SAS, never a vended `adls.account-key`.
 #[test]
 fn vended_adls_backend_holds_the_sas_state_never_the_account_key_state() {
     let sas_key = format!("{VENDED_SAS_TOKEN_KEY_PREFIX}{ADLS_HOST}");

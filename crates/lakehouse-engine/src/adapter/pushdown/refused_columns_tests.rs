@@ -263,7 +263,6 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
     );
 }
 
-/// Scenario: in the stats_all_types shape only binary_col refuses requests
 #[test]
 fn only_binary_col_refuses_requests_in_the_stats_all_types_shape() {
     let refused = [refused_column("binary_col", BINARY_REASON)];

@@ -159,7 +159,6 @@ fn assert_pushed_to_scan_udf(conn: &mut ExaConn, sql: &str, shape: &str) {
     );
 }
 
-/// Scenario: microsecond-distinct timestamps round-trip at the version-gated declared precision
 #[test]
 fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     setup();
@@ -231,7 +230,6 @@ fn rendered_nanos(nanos: i64) -> String {
         .to_string()
 }
 
-/// Scenario: `CAST(ts_ns AS TIMESTAMP(9))` emits nanoseconds and keeps every seeded digit
 #[test]
 fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     setup();
@@ -283,7 +281,6 @@ fn cast_to_timestamp9_emits_nanoseconds_and_keeps_every_seeded_digit() {
     );
 }
 
-/// Scenario: `CAST(ts AS TIMESTAMP(3))` emits milliseconds and the seeded pairs collapse
 #[test]
 fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     setup();
@@ -338,7 +335,6 @@ fn cast_to_timestamp3_emits_milliseconds_and_collapses_the_seeded_pairs() {
     );
 }
 
-/// Scenario: a declined `CAST(ts AS TIMESTAMP(2))` is computed natively by Exasol in the wrapper
 #[test]
 fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
     setup();
@@ -394,7 +390,6 @@ fn declined_cast_to_timestamp2_is_computed_natively_by_exasol_in_the_wrapper() {
     );
 }
 
-/// Scenario: an Iceberg `timestamp_ns` column is declared and retained per engine arm
 #[test]
 fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
     setup();

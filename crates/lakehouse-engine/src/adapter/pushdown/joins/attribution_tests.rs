@@ -46,7 +46,6 @@ fn two_table_legs() -> JoinLegs {
     JoinLegs::from_leaves(&[leaf("CUSTOMER", Some("C")), leaf("ORDERS", Some("O"))])
 }
 
-/// Scenario: Self-joined table occurrences are told apart by their aliases
 #[test]
 fn exact_table_name_and_alias_pair_selects_its_own_leg() {
     let legs = self_join_legs();
@@ -58,7 +57,6 @@ fn exact_table_name_and_alias_pair_selects_its_own_leg() {
     assert_eq!(second, ColumnLeg::Leg(1));
 }
 
-/// Scenario: An absent alias is a distinct leg key
 #[test]
 fn absent_alias_is_a_distinct_leg_key() {
     let legs = JoinLegs::from_leaves(&[leaf("FACT_ORDERS", None), leaf("FACT_ORDERS", Some("B"))]);
@@ -70,7 +68,6 @@ fn absent_alias_is_a_distinct_leg_key() {
     assert_eq!(aliased, ColumnLeg::Leg(1));
 }
 
-/// Scenario: A table name naming exactly one leg resolves without consulting an alias
 #[test]
 fn single_leg_table_name_resolves_without_consulting_an_alias() {
     let legs = two_table_legs();
@@ -82,7 +79,6 @@ fn single_leg_table_name_resolves_without_consulting_an_alias() {
     assert_eq!(foreign_alias, ColumnLeg::Leg(1));
 }
 
-/// Scenario: Alias matching is verbatim, not case-folded
 #[test]
 fn alias_matching_is_verbatim_not_case_folded() {
     let legs = JoinLegs::from_leaves(&[
@@ -97,7 +93,6 @@ fn alias_matching_is_verbatim_not_case_folded() {
     assert_eq!(folded, ColumnLeg::Unattributable);
 }
 
-/// Scenario: A column of an undeclared table, or with no tableName, is left unqualified
 #[test]
 fn column_of_a_table_no_leg_declares_is_left_unqualified() {
     let legs = self_join_legs();
@@ -113,7 +108,6 @@ fn column_of_a_table_no_leg_declares_is_left_unqualified() {
     );
 }
 
-/// Scenario: An unattributable column is reported, never resolved to an arbitrary leg
 #[test]
 fn unattributable_column_is_reported_rather_than_resolved() {
     let legs = self_join_legs();
@@ -125,7 +119,6 @@ fn unattributable_column_is_reported_rather_than_resolved() {
     assert_eq!(unknown_alias, ColumnLeg::Unattributable);
 }
 
-/// Scenario: Each self-join occurrence is qualified with its own leg alias
 #[test]
 fn qualify_tags_each_self_join_occurrence_with_its_own_leg_alias() {
     let legs = self_join_legs();
@@ -146,7 +139,6 @@ fn qualify_tags_each_self_join_occurrence_with_its_own_leg_alias() {
     );
 }
 
-/// Scenario: Qualification overwrites the request alias and leaves the input untouched
 #[test]
 fn qualify_overwrites_the_request_alias_and_leaves_the_input_untouched() {
     let legs = two_table_legs();
@@ -158,7 +150,6 @@ fn qualify_overwrites_the_request_alias_and_leaves_the_input_untouched() {
     assert_eq!(expr["tableAlias"], Json::String("O".into()));
 }
 
-/// Scenario: Qualification reaches columns nested in arrays and function nodes
 #[test]
 fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
     let legs = self_join_legs();
@@ -176,7 +167,6 @@ fn qualify_reaches_columns_nested_in_arrays_and_function_nodes() {
     );
 }
 
-/// Scenario: Qualification fails on an unattributable column, naming it
 #[test]
 fn qualify_fails_on_an_unattributable_column_naming_it() {
     let legs = self_join_legs();
@@ -192,7 +182,6 @@ fn qualify_fails_on_an_unattributable_column_naming_it() {
     assert!(message.contains("FACT_ORDERS"), "{message}");
 }
 
-/// Scenario: A cross-leg condition references every leg it touches
 #[test]
 fn legs_referenced_reports_every_leg_a_tree_touches() {
     let legs = self_join_legs();
@@ -208,7 +197,6 @@ fn legs_referenced_reports_every_leg_a_tree_touches() {
     assert!(referenced.any_column);
 }
 
-/// Scenario: A column no leg key matches flags the tree as unattributed
 #[test]
 fn legs_referenced_flags_an_unattributed_column() {
     let legs = self_join_legs();
@@ -221,7 +209,6 @@ fn legs_referenced_flags_an_unattributed_column() {
     assert!(referenced.legs.is_empty());
 }
 
-/// Scenario: A literal-only expression is flagged column-free, not unattributed
 #[test]
 fn legs_referenced_flags_a_column_free_expression() {
     let legs = self_join_legs();
@@ -233,7 +220,6 @@ fn legs_referenced_flags_a_column_free_expression() {
     assert!(referenced.legs.is_empty());
 }
 
-/// Scenario: A cross-leg condition attaches at the highest leg it references
 #[test]
 fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
     let legs = JoinLegs::from_leaves(&[
@@ -249,7 +235,6 @@ fn attachment_leg_is_the_highest_leg_a_cross_leg_condition_references() {
     assert_eq!(legs.attachment_leg(&condition), Some(2));
 }
 
-/// Scenario: A single-leg condition attaches at its own leg, never the first
 #[test]
 fn attachment_leg_is_the_only_leg_a_single_leg_condition_references() {
     let legs = self_join_legs();
@@ -258,7 +243,6 @@ fn attachment_leg_is_the_only_leg_a_single_leg_condition_references() {
     assert_eq!(legs.attachment_leg(&condition), Some(1));
 }
 
-/// Scenario: A column-free condition has no attachment leg
 #[test]
 fn attachment_leg_is_none_for_a_column_free_condition() {
     let legs = self_join_legs();
@@ -266,7 +250,6 @@ fn attachment_leg_is_none_for_a_column_free_condition() {
     assert_eq!(legs.attachment_leg(&equal(literal(1), literal(1))), None);
 }
 
-/// Scenario: A condition with any unattributed column has no attachment leg
 #[test]
 fn attachment_leg_is_none_when_any_column_is_unattributed() {
     let legs = self_join_legs();
@@ -278,7 +261,6 @@ fn attachment_leg_is_none_when_any_column_is_unattributed() {
     assert_eq!(legs.attachment_leg(&condition), None);
 }
 
-/// Scenario: A conjunct on one self-join occurrence is local to that leg only
 #[test]
 fn conjunct_leg_is_the_single_leg_every_column_resolves_to() {
     let legs = self_join_legs();
@@ -287,7 +269,6 @@ fn conjunct_leg_is_the_single_leg_every_column_resolves_to() {
     assert_eq!(legs.conjunct_leg(&conjunct), Some(1));
 }
 
-/// Scenario: Cross-leg, unattributed, and column-free conjuncts are local to no leg
 #[test]
 fn conjunct_leg_is_none_for_a_cross_leg_unattributed_or_column_free_conjunct() {
     let legs = self_join_legs();
@@ -304,7 +285,6 @@ fn conjunct_leg_is_none_for_a_cross_leg_unattributed_or_column_free_conjunct() {
     assert_eq!(legs.conjunct_leg(&equal(literal(1), literal(1))), None);
 }
 
-/// Scenario: The single-scan binding maps every involved table onto leg zero
 #[test]
 fn single_scan_binding_maps_every_involved_table_onto_leg_zero() {
     let request = serde_json::json!({
@@ -326,7 +306,6 @@ fn single_scan_binding_maps_every_involved_table_onto_leg_zero() {
     assert_eq!(qualified["tableAlias"], Json::String("LHS_T0".into()));
 }
 
-/// Scenario: A repeated involved table still collapses onto leg zero
 #[test]
 fn repeated_involved_table_still_collapses_onto_leg_zero() {
     let request = serde_json::json!({
@@ -339,7 +318,6 @@ fn repeated_involved_table_still_collapses_onto_leg_zero() {
     assert_eq!(resolved, ColumnLeg::Leg(0));
 }
 
-/// Scenario: A request without involvedTables qualifies nothing
 #[test]
 fn single_scan_binding_without_involved_tables_qualifies_nothing() {
     let legs = JoinLegs::for_single_scan(&serde_json::json!({}));
@@ -349,7 +327,6 @@ fn single_scan_binding_without_involved_tables_qualifies_nothing() {
     assert_eq!(legs.qualify(&expr).expect("no leg is not a failure"), expr);
 }
 
-/// Scenario: Leg aliases are LHS_T{index} in FROM-tree traversal order
 #[test]
 fn leg_alias_is_the_wrapper_subquery_alias_of_that_leg() {
     let legs = JoinLegs::from_leaves(&[

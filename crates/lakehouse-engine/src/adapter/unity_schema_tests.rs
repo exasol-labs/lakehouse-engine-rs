@@ -247,7 +247,6 @@ fn table_map(response: &Json) -> serde_json::Map<String, Json> {
         .clone()
 }
 
-/// Scenario: the Unity kind lists one virtual table per swept table, with no per-table get-table.
 #[test]
 fn enumerates_unity_namespace_tables() {
     let mock = MockUnityCatalog::start(|req| {
@@ -286,7 +285,6 @@ fn enumerates_unity_namespace_tables() {
     assert_eq!(mock.get_table_call_count(), 0);
 }
 
-/// Scenario: listing issues only paginated `GET /tables` requests, never a per-table get-table.
 #[test]
 fn listing_issues_no_per_table_get_table_call() {
     let mock = MockUnityCatalog::start(|req| {
@@ -454,7 +452,6 @@ fn excluding_every_entry_yields_an_empty_but_successful_schema() {
     assert_eq!(mock.get_table_call_count(), 0);
 }
 
-/// Scenario: TABLE_MAP maps each Exasol name to its identifier; a flatten collision is rejected.
 #[test]
 fn records_table_map_and_rejects_collision() {
     let happy = MockUnityCatalog::start(|req| {
@@ -501,7 +498,6 @@ fn records_table_map_and_rejects_collision() {
     );
 }
 
-/// Scenario: an unreachable Unity Catalog fails with a listing error that leaks no credential.
 #[test]
 fn unreachable_unity_catalog_is_credential_safe_error() {
     // A bound-then-dropped port refuses the connect rather than hanging.

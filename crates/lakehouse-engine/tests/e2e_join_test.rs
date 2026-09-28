@@ -103,7 +103,6 @@ fn expected_join_rows_by_orderdate_desc(
     rows
 }
 
-/// Scenario: a broadcast-eligible join is pushed as a single scan-UDF broadcast fan-out
 #[test]
 fn e2e_broadcast_join_pushdown_shape() {
     setup_e2e();
@@ -122,7 +121,6 @@ fn e2e_broadcast_join_pushdown_shape() {
     );
 }
 
-/// Scenario: the broadcast join matches the join computed from the un-joined tables
 #[test]
 fn e2e_broadcast_join_result_correct() {
     setup_e2e();
@@ -144,7 +142,6 @@ fn e2e_broadcast_join_result_correct() {
     );
 }
 
-/// Scenario: a bare LIMIT over a broadcast-eligible join stays broadcast and returns exactly n join rows
 #[test]
 fn e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates() {
     setup_e2e();
@@ -186,7 +183,6 @@ fn e2e_broadcast_join_bare_limit_stays_broadcast_and_truncates() {
     }
 }
 
-/// Scenario: ORDER BY … LIMIT over a broadcast join returns the exact top-N via an outer wrapper
 #[test]
 fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
     setup_e2e();
@@ -232,7 +228,6 @@ fn e2e_broadcast_join_order_by_limit_stays_broadcast_and_top_n_correct() {
     );
 }
 
-/// Scenario: division by zero in a broadcast join's fact-leg filter fails the query from inside the broadcast plan (#370)
 #[test]
 fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
     setup_e2e();
@@ -278,7 +273,6 @@ fn e2e_broadcast_join_float_div_by_zero_in_fact_leg_filter_fails() {
     );
 }
 
-/// Scenario: a bare ORDER BY and ORDER BY … LIMIT … OFFSET over the join stay broadcast
 #[test]
 fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
     setup_e2e();
@@ -350,7 +344,6 @@ fn e2e_broadcast_join_order_by_without_limit_and_with_offset_stay_broadcast() {
     );
 }
 
-/// Scenario: A broadcast per-shard top-N ranks an empty-string key as NULL, like the two-scan wrapper (#309)
 #[test]
 fn e2e_broadcast_join_top_n_ranks_empty_string_as_null() {
     setup_e2e();
@@ -410,7 +403,6 @@ fn e2e_broadcast_join_top_n_ranks_empty_string_as_null() {
     }
 }
 
-/// Scenario: A broadcast top-N keeps the single-node label sequence across a cross-shard tie
 #[test]
 fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
     setup_e2e();
@@ -459,7 +451,6 @@ fn e2e_broadcast_join_top_n_keeps_the_single_node_sort_keys_across_a_tie() {
     );
 }
 
-/// Scenario: an aggregate over the join falls back to two-scan, and Exasol rejects LIMIT … OFFSET without ORDER BY before pushdown
 #[test]
 fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
     setup_e2e();
@@ -498,7 +489,6 @@ fn e2e_join_offset_and_aggregate_shapes_still_use_two_scan_fallback() {
     );
 }
 
-/// Scenario: above the broadcast threshold the join uses the two-scan `LHS_T0`/`LHS_T1` wrapper
 #[test]
 fn e2e_above_threshold_unaccelerated_fallback_shape() {
     setup_e2e();
@@ -517,7 +507,6 @@ fn e2e_above_threshold_unaccelerated_fallback_shape() {
     );
 }
 
-/// Scenario: the above-threshold fallback returns the same result as the broadcast path
 #[test]
 fn e2e_above_threshold_result_matches_broadcast() {
     setup_e2e();
@@ -549,7 +538,6 @@ fn aggregate_join_query(vs_name: &str) -> String {
     )
 }
 
-/// Scenario: an aggregate over a join routes to the two-scan wrapper even on the broadcast-eligible VS
 #[test]
 fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
     setup_e2e();
@@ -572,7 +560,6 @@ fn e2e_aggregate_over_join_uses_two_scan_wrapper() {
     );
 }
 
-/// Scenario: an aggregate over a join equals the same aggregate over the fact table on both VSs
 #[test]
 fn e2e_aggregate_over_join_result_correct() {
     setup_e2e();
@@ -767,7 +754,6 @@ fn expected_four_table_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<Vec<S
     rows
 }
 
-/// Scenario: a three-table join succeeds via the N-scan wrapper and matches the independently computed result (#76)
 #[test]
 fn e2e_three_table_join_result_correct() {
     setup_e2e();
@@ -806,7 +792,6 @@ fn e2e_three_table_join_result_correct() {
     );
 }
 
-/// Scenario: a four-table join succeeds via the N-scan wrapper and matches the independently computed result
 #[test]
 fn e2e_four_table_join_result_correct() {
     setup_e2e();
@@ -915,7 +900,6 @@ fn fetch_scalar_over_aggregate_rows(conn: &mut ExaConn, query_sql: &str) -> Vec<
     fetch_rows_as_vecs(&cols)
 }
 
-/// Scenario: a scalar over aggregates in a grouped two-table join select list is rendered via the N-scan wrapper and correct
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
     setup_e2e();
@@ -952,7 +936,6 @@ fn e2e_scalar_over_aggregate_grouped_join_result_correct() {
     );
 }
 
-/// Scenario: a scalar over aggregates in a grouped three-table join select list is rendered via the N-scan wrapper and correct
 #[test]
 fn e2e_scalar_over_aggregate_grouped_join_n_table_result_correct() {
     setup_e2e();
@@ -1040,7 +1023,6 @@ fn expected_full_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, St
     rows
 }
 
-/// Scenario: a declined side-local conjunct declines the broadcast plan and falls back to the N-scan wrapper with correct rows
 #[test]
 fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
     setup_e2e();
@@ -1082,7 +1064,6 @@ fn e2e_broadcast_declined_filter_falls_back_to_n_scan_and_filters() {
     );
 }
 
-/// Scenario: an always-false declined conjunct returns no rows, proving it is self-applied rather than dropped
 #[test]
 fn e2e_broadcast_declined_filter_excludes_rows() {
     setup_e2e();
@@ -1162,7 +1143,6 @@ fn expected_three_table_join_rows_with_orderdate_filter(
     rows
 }
 
-/// Scenario: mixed rendering and declined conjuncts split between the leg filter and the outer wrapper WHERE
 #[test]
 fn e2e_n_scan_declined_side_local_conjunct_applied_in_outer_where() {
     setup_e2e();
@@ -1246,7 +1226,6 @@ fn like_on_orderdate_join_query(vs_name: &str) -> String {
     )
 }
 
-/// Scenario: LIKE over a DECIMAL column declines the broadcast plan and is self-applied in the wrapper WHERE
 #[test]
 fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
     setup_e2e();
@@ -1289,7 +1268,6 @@ fn e2e_broadcast_like_on_decimal_column_falls_back_and_filters() {
     );
 }
 
-/// Scenario: LIKE over a DATE column keeps the broadcast plan with a CAST-rewritten filter
 #[test]
 fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
     setup_e2e();
@@ -1325,7 +1303,6 @@ fn e2e_broadcast_like_on_date_column_stays_broadcast_and_filters() {
     );
 }
 
-/// Scenario: on the forced-fallback VS, LIKE over a DECIMAL column is screened out of its leg and applied only in the wrapper WHERE
 #[test]
 fn e2e_n_scan_like_on_decimal_side_column_applied_in_outer_where() {
     setup_e2e();
@@ -1363,7 +1340,6 @@ fn e2e_n_scan_like_on_decimal_side_column_applied_in_outer_where() {
     );
 }
 
-/// Scenario: a three-argument INSTR in a join filter declines and Exasol evaluates it natively (#228)
 #[test]
 fn e2e_join_instr_with_start_position_returns_native_result() {
     setup_e2e();
@@ -1438,7 +1414,6 @@ fn expected_orderdate_text(order_key: usize) -> String {
         .to_string()
 }
 
-/// Scenario: a DECIMAL-stringifying join filter matches Exasol's trimmed LENGTH semantics on both join surfaces (#223)
 #[test]
 fn e2e_join_decimal_stringification_matches_native_at_both_surfaces() {
     setup_e2e();
@@ -1502,7 +1477,6 @@ fn fetch_order_rows(conn: &mut ExaConn) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Scenario: a two-leg self-join on the unique key matches each row only to itself (#361)
 #[test]
 fn e2e_self_join_on_primitive_column_matches_single_node() {
     setup_e2e();
@@ -1544,7 +1518,6 @@ fn e2e_self_join_on_primitive_column_matches_single_node() {
     );
 }
 
-/// Scenario: a self-join with one unaliased occurrence resolves to two distinct legs (#361)
 #[test]
 fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
     setup_e2e();
@@ -1598,7 +1571,6 @@ fn e2e_self_join_with_one_unaliased_occurrence_matches_single_node() {
     );
 }
 
-/// Scenario: a three-leg self-join attaches each condition to its own join point (#361)
 #[test]
 fn e2e_three_leg_self_join_matches_single_node() {
     setup_e2e();
@@ -1642,7 +1614,6 @@ fn e2e_three_leg_self_join_matches_single_node() {
     );
 }
 
-/// Scenario: a WHERE conjunct on one self-join alias is pushed only into that occurrence's leg (#361)
 #[test]
 fn e2e_self_join_with_one_sided_filter_matches_single_node() {
     setup_e2e();
@@ -1694,7 +1665,6 @@ fn e2e_self_join_with_one_sided_filter_matches_single_node() {
     );
 }
 
-/// Scenario: an ungrouped scalar over an aggregate on a broadcast-eligible join routes to the N-scan wrapper and returns one row
 #[test]
 fn e2e_scalar_over_aggregate_ungrouped_join_matches_native_oracle() {
     setup_e2e();

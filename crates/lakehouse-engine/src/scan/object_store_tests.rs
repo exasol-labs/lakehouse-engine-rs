@@ -117,7 +117,6 @@ impl RecordingEndpoint {
     }
 }
 
-/// Scenario: a positive memory limit sizes the pool at fraction × (limit − overhead).
 #[test]
 fn session_context_sizes_pool_from_ctx_limit() {
     let limit: u64 = 2 * 1024 * 1024 * 1024;
@@ -136,7 +135,6 @@ fn session_context_sizes_pool_from_ctx_limit() {
     }
 }
 
-/// Scenario: a zero memory limit uses the default pool budget.
 #[test]
 fn session_context_uses_default_budget_on_zero_limit() {
     let spec = minimal_spec();
@@ -150,7 +148,6 @@ fn session_context_uses_default_budget_on_zero_limit() {
     }
 }
 
-/// Scenario: non-default fraction and overhead in the spec flow through to pool sizing.
 #[test]
 fn memory_budget_round_trips_into_scan_spec() {
     let mut spec = minimal_spec();
@@ -175,7 +172,6 @@ fn memory_budget_round_trips_into_scan_spec() {
     );
 }
 
-/// Scenario: the connection budget becomes the per-host warm-connection-pool ceiling.
 #[test]
 fn client_options_carry_connection_budget() {
     let opts = client_options_for(32);
@@ -186,7 +182,6 @@ fn client_options_carry_connection_budget() {
     );
 }
 
-/// Scenario: a zero budget clamps to at least 1.
 #[test]
 fn client_options_clamp_budget_to_at_least_one() {
     let opts = client_options_for(0);
@@ -197,7 +192,6 @@ fn client_options_clamp_budget_to_at_least_one() {
     );
 }
 
-/// Scenario: every side's store gets the whole-spec connection budget, never a per-side share.
 #[test]
 fn each_side_store_gets_the_full_connection_budget() {
     // Non-default: the shared fixture uses 8.
@@ -239,7 +233,6 @@ fn each_side_store_gets_the_full_connection_budget() {
     }
 }
 
-/// Scenario: `build_table_root_store` returns the unwrapped store; `build_side_store` wraps the same store.
 #[test]
 fn the_table_root_store_is_the_unwrapped_store_a_scan_side_wraps() {
     let spec = minimal_spec();
@@ -265,7 +258,6 @@ fn the_table_root_store_is_the_unwrapped_store_a_scan_side_wraps() {
     );
 }
 
-/// Scenario: `build_session_context` registers the checked division under vs-expression's exported name.
 #[test]
 fn build_session_context_registers_the_checked_float_div_function() {
     let spec = minimal_spec();
@@ -291,7 +283,6 @@ fn build_session_context_registers_the_checked_float_div_function() {
     );
 }
 
-/// Scenario: two sides in distinct buckets each get their own registered store.
 #[test]
 fn join_sides_in_two_buckets_register_two_stores() {
     let spec = spec_with_join(
@@ -309,7 +300,6 @@ fn join_sides_in_two_buckets_register_two_stores() {
     }
 }
 
-/// Scenario: an `s3a://` side registers under its own `s3a://` registry URL.
 #[test]
 fn an_s3a_scheme_side_registers_a_store_under_its_own_key() {
     let mut spec = minimal_spec();
@@ -365,7 +355,6 @@ fn adls_spec_with_join(fact_root: &str, dim_root: &str, cred: AdlsCred) -> ScanS
     spec
 }
 
-/// Scenario: DataFusion's registry drops the container, so `get_store` succeeds for any container of the host.
 #[test]
 fn an_azure_side_registers_under_a_container_qualified_url_the_registry_key_drops() {
     let spec = adls_spec(
@@ -403,7 +392,6 @@ fn an_azure_side_registers_under_a_container_qualified_url_the_registry_key_drop
     );
 }
 
-/// Scenario: two sides in the same container register one routing store.
 #[test]
 fn azure_sides_in_one_container_share_one_routing_store() {
     let spec = adls_spec_with_join(
@@ -434,7 +422,6 @@ fn azure_sides_in_one_container_share_one_routing_store() {
     }
 }
 
-/// Scenario: two sides in different storage accounts each register their own store.
 #[test]
 fn azure_sides_in_different_accounts_register_two_stores() {
     let spec = adls_spec_with_join(
@@ -459,7 +446,6 @@ fn azure_sides_in_different_accounts_register_two_stores() {
     }
 }
 
-/// Scenario: an `s3://` fact side and an `abfss://` dimension side each register their own store.
 #[test]
 fn sides_on_different_backends_each_register_their_own_store() {
     const DIM_ROOT: &str = "abfss://dims@acct.dfs.core.windows.net/db/dim";
@@ -489,7 +475,6 @@ fn sides_on_different_backends_each_register_their_own_store() {
     );
 }
 
-/// Scenario: an `abfs://` side registers a store like `abfss://`.
 #[test]
 fn an_abfs_scheme_side_registers_a_store_under_its_own_key() {
     let spec = adls_spec(
@@ -510,7 +495,6 @@ fn an_abfs_scheme_side_registers_a_store_under_its_own_key() {
     );
 }
 
-/// Scenario: an unrecognised Azure host fails loud at `build()` with no credential in the error.
 #[test]
 fn an_unrecognised_azure_host_is_rejected_redacted() {
     let secret = "static-account-key";
@@ -531,7 +515,6 @@ fn an_unrecognised_azure_host_is_rejected_redacted() {
     );
 }
 
-/// Scenario: an empty dimension file list registers only the fact side.
 #[test]
 fn join_with_empty_dimension_file_list_registers_only_the_fact_side() {
     let spec = spec_with_join("s3://dim-bucket/db/dim", Vec::new());
@@ -549,7 +532,6 @@ fn join_with_empty_dimension_file_list_registers_only_the_fact_side() {
     );
 }
 
-/// Scenario: a same-bucket join registers one routing store holding an inner store per side.
 #[test]
 fn a_shared_bucket_join_registers_one_routing_store_over_both_sides() {
     let spec = spec_with_join(
@@ -577,7 +559,6 @@ fn a_shared_bucket_join_registers_one_routing_store_over_both_sides() {
     }
 }
 
-/// Scenario: each side of a shared-bucket join answers HEADs from its own size index.
 #[tokio::test]
 async fn shared_bucket_join_answers_each_sides_head_from_that_sides_index() {
     use ::object_store::ObjectStoreExt;
@@ -617,7 +598,6 @@ async fn shared_bucket_join_answers_each_sides_head_from_that_sides_index() {
     }
 }
 
-/// Scenario: each side's size index holds exactly its own files.
 #[test]
 fn each_side_size_index_holds_only_its_own_files() {
     let mut spec = spec_with_join(
@@ -657,7 +637,6 @@ fn each_side_size_index_holds_only_its_own_files() {
     }
 }
 
-/// Scenario: a spec without a join registers the plain spec-sized store answering HEADs without I/O.
 #[tokio::test]
 async fn a_spec_without_a_join_registers_one_sized_store_over_its_own_files() {
     use ::object_store::ObjectStoreExt;
@@ -701,7 +680,6 @@ async fn a_spec_without_a_join_registers_one_sized_store_over_its_own_files() {
     }
 }
 
-/// Scenario: a path neither side owns is refused naming the path and both sides, without credentials.
 #[tokio::test]
 async fn an_unroutable_path_is_refused_naming_no_credential() {
     use ::object_store::ObjectStoreExt;
@@ -748,7 +726,6 @@ async fn an_unroutable_path_is_refused_naming_no_credential() {
     }
 }
 
-/// Scenario: a delete file under a different store root is rejected naming "delete file".
 #[test]
 fn a_delete_file_under_a_different_root_is_rejected() {
     let files = vec![FileEntry::with_deletes(
@@ -769,7 +746,6 @@ fn a_delete_file_under_a_different_root_is_rejected() {
     );
 }
 
-/// Scenario: a deletion vector is never checked against the side's store root.
 #[test]
 fn a_deletion_vector_is_not_checked_against_the_object_store_root() {
     let files = vec![FileEntry::with_deletes(
@@ -788,7 +764,6 @@ fn a_deletion_vector_is_not_checked_against_the_object_store_root() {
         .expect("a deletion vector must not be checked against the object-store root");
 }
 
-/// Scenario: each side's inner store is built from that side's own backend (observed via endpoint reached).
 #[tokio::test]
 async fn each_side_inner_store_is_built_from_its_own_backend() {
     use ::object_store::ObjectStoreExt;
@@ -855,7 +830,6 @@ async fn each_side_inner_store_is_built_from_its_own_backend() {
     }
 }
 
-/// Scenario: the size index is keyed by the `ListingTableUrl` prefix for relative and absolute entries.
 #[test]
 fn size_index_keys_by_listing_url_prefix() {
     let mut spec = minimal_spec();
@@ -876,7 +850,6 @@ fn size_index_keys_by_listing_url_prefix() {
     assert_eq!(rel_url.prefix(), &rel_key);
 }
 
-/// Scenario: an Adls size-index key is relative to the container-scoped store root.
 #[test]
 fn spec_size_index_keys_an_abfss_file_without_its_container() {
     let mut spec = adls_spec(
@@ -900,7 +873,6 @@ fn spec_size_index_keys_an_abfss_file_without_its_container() {
     assert_eq!(url.prefix(), &key);
 }
 
-/// Scenario: the store URL derives from the first file's reconstructed absolute URI.
 #[test]
 fn side_store_url_returns_the_same_url_for_s3_as_the_deleted_bucket_derivation() {
     let rel = vec![FileEntry::new("data/part-0.parquet", 1)];
@@ -916,7 +888,6 @@ fn side_store_url_returns_the_same_url_for_s3_as_the_deleted_bucket_derivation()
     );
 }
 
-/// Scenario: the store URL keeps the file's own scheme (e.g. `s3a`), matching DataFusion's lookup.
 #[test]
 fn side_store_url_preserves_the_s3a_scheme_so_the_key_matches_the_lookup() {
     let files = vec![FileEntry::new("data/part-0.parquet", 1)];
@@ -939,7 +910,6 @@ fn side_store_url_preserves_the_s3a_scheme_so_the_key_matches_the_lookup() {
     );
 }
 
-/// Scenario: two `abfss://` sides in different containers of one account are rejected; same container or different accounts pass.
 #[test]
 fn validate_sides_share_one_store_rejects_two_containers_in_one_account() {
     let colliding = abfss_spec(
@@ -966,7 +936,6 @@ fn validate_sides_share_one_store_rejects_two_containers_in_one_account() {
     .expect("sides in different storage accounts must be accepted");
 }
 
-/// Scenario: the container-collision precondition never fires on S3.
 #[test]
 fn validate_sides_share_one_store_accepts_every_s3_spec_shape() {
     let dim_files = vec![FileEntry::new("data/dim-0.parquet", 64)];
@@ -990,7 +959,6 @@ fn validate_sides_share_one_store_accepts_every_s3_spec_shape() {
     }
 }
 
-/// Scenario: the wrapper answers HEAD from the size index and delegates unknown paths and data reads.
 #[tokio::test]
 async fn sized_store_serves_head_from_index_and_delegates_otherwise() {
     use ::object_store::ObjectStoreExt;
@@ -1031,7 +999,6 @@ async fn sized_store_serves_head_from_index_and_delegates_otherwise() {
     );
 }
 
-/// Scenario: a direct-storage store is wrapped in a LimitStore, not SpecSizedObjectStore.
 #[test]
 fn build_admission_limited_store_wraps_the_s3_backend_in_a_limit_store() {
     let backend = s3_backend("http://s3.example.com", "secret");

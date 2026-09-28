@@ -154,7 +154,6 @@ fn join_storage_path_returns_the_base_alone_when_the_segment_is_absent() {
     );
 }
 
-/// Scenario: a base path with repeated trailing separators joins to exactly one separator.
 #[test]
 fn a_base_path_with_repeated_trailing_separators_joins_to_one_separator() {
     for base in [

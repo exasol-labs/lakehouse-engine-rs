@@ -11,7 +11,6 @@ const VENDED_SK: &str = "VENDED_SK_SENTINEL";
 const VENDED_TOK: &str = "VENDED_TOKEN_SENTINEL";
 const VENDED_REGION: &str = "eu-west-2";
 
-/// Scenario: Catalog auth props are never placed in any scan spec, even with vended credentials.
 #[test]
 fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
     let vended_storage = StorageBackend::S3(StorageProps {
@@ -64,7 +63,7 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
     );
 }
 
-/// Scenario: A grouped scan spec carries the group keys' rendered SQL fragments.
+/// Scenario: Grouped scan spec carries group-key rendered SQL fragments
 #[test]
 fn grouped_scan_spec_carries_group_keys() {
     let group_keys = vec!["\"REGION\"".to_string(), "YEAR(\"TS\")".to_string()];
@@ -87,7 +86,6 @@ fn grouped_scan_spec_carries_group_keys() {
     assert_eq!(keys, group_keys, "group_keys must survive spec round-trip");
 }
 
-/// Scenario: A LIKE-only filter still yields a DataFusion filter but no Iceberg pruning predicate.
 #[test]
 fn like_filter_yields_df_string_and_no_iceberg_predicate() {
     use crate::adapter::iceberg_predicate::to_iceberg_predicate;
@@ -123,7 +121,6 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
     );
 }
 
-/// Scenario: `LENGTH(<DECIMAL>) > 5` renders the Exasol trim form exactly once through the WHERE pipeline (#211).
 #[test]
 fn where_filter_decimal_stringification_rewritten_to_trim() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -155,7 +152,6 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
     );
 }
 
-/// Scenario: A DECIMAL column in a non-stringifying WHERE context stays a bare column reference.
 #[test]
 fn filter_decimal_comparison_not_rewritten() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -180,7 +176,6 @@ fn filter_decimal_comparison_not_rewritten() {
     );
 }
 
-/// Scenario: `UPPER(c_decimal_a) = 'X'` coerces the DECIMAL argument to the trimmed text form (#210).
 #[test]
 fn where_filter_string_fn_under_comparison_predicate_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -206,7 +201,6 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
     );
 }
 
-/// Scenario: `UPPER(c_double) = 'X'` keeps the predicate out of the scan spec (#210).
 #[test]
 fn where_filter_string_fn_over_double_declines() {
     let col_types = vec![("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string())];
@@ -231,7 +225,6 @@ fn where_filter_string_fn_over_double_declines() {
     );
 }
 
-/// Scenario: A DECIMAL argument nested inside a LIKE subject's `UPPER` is coerced (#210).
 #[test]
 fn where_filter_upper_decimal_inside_like_subject_coerced() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
@@ -258,7 +251,6 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
     );
 }
 
-/// Scenario: A DECIMAL LIKE nested inside a CASE under `predicate_equal` declines the filter (#207).
 #[test]
 fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     let col_types = vec![("AMOUNT".to_string(), "DECIMAL(9,2)".to_string())];
@@ -294,7 +286,6 @@ fn where_filter_like_decimal_inside_case_declines_whole_filter() {
     );
 }
 
-/// Scenario: Catalog auth props and the whole catalog block are never placed in any scan spec.
 #[test]
 fn scan_spec_carries_no_catalog_block() {
     const TOKEN_SENTINEL: &str = "TOKEN_SENTINEL_VALUE";
@@ -361,7 +352,6 @@ fn scan_spec_carries_no_catalog_block() {
     );
 }
 
-/// Scenario: A pushdown scan spec's `logical_schema` carries field-ids, names, and nullability.
 #[test]
 fn pushdown_carries_logical_schema_in_common_arg() {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -453,7 +443,6 @@ fn pushdown_carries_logical_schema_in_common_arg() {
     );
 }
 
-/// Scenario: Primitive required and nullable fields carry their Iceberg `initial-default` as raw scalar text.
 #[test]
 fn build_logical_schema_encodes_primitive_initial_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -497,7 +486,6 @@ fn build_logical_schema_encodes_primitive_initial_default() {
     );
 }
 
-/// Scenario: A field with no `initial-default` encodes no default.
 #[test]
 fn build_logical_schema_omits_default_for_no_default_field() {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -522,7 +510,6 @@ fn build_logical_schema_omits_default_for_no_default_field() {
     );
 }
 
-/// Scenario: A decimal outside Exasol's domain maps to `utf8` and encodes no default, or its mantissa would leak.
 #[test]
 fn build_logical_schema_omits_default_for_decimal_outside_exasol_domain() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -574,7 +561,6 @@ fn build_logical_schema_omits_default_for_decimal_outside_exasol_domain() {
     }
 }
 
-/// Scenario: A struct `initial-default` encodes no default, a deliberate Exasol no-struct trade-off.
 #[test]
 fn build_logical_schema_omits_non_primitive_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Type};
@@ -608,7 +594,6 @@ fn build_logical_schema_omits_non_primitive_default() {
     );
 }
 
-/// Scenario: A field carrying only a `write-default` encodes no default.
 #[test]
 fn build_logical_schema_ignores_write_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -632,7 +617,6 @@ fn build_logical_schema_ignores_write_default() {
     );
 }
 
-/// Scenario: A serialized encoded default carries no storage credential.
 #[test]
 fn build_logical_schema_default_encoding_is_credential_free() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
@@ -659,7 +643,6 @@ fn build_logical_schema_default_encoding_is_credential_free() {
     }
 }
 
-/// Scenario: A default-less schema round-trips unchanged and older specs deserialize identically.
 #[test]
 fn build_logical_schema_default_less_spec_round_trips_unchanged() {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
@@ -849,7 +832,6 @@ fn dispatch_sql_for_body(pushdown_req_body: Json) -> String {
         .to_string()
 }
 
-/// Scenario: A declined WHERE filter routes every dispatch shape to the wrapper, applied exactly once.
 #[test]
 fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
     let declined = declined_like_on_decimal();
@@ -912,7 +894,7 @@ fn declined_filter_routes_every_dispatch_shape_to_qualified_wrapper() {
     }
 }
 
-/// Scenario: A trivially true filter is omitted with no wrapper.
+/// Scenario: A trivially-true filter is still omitted with no wrapper
 #[test]
 fn trivially_true_filter_omitted_without_wrapper() {
     let trivially_true = serde_json::json!({"type": "literal_bool", "value": true});
@@ -938,7 +920,6 @@ fn trivially_true_filter_omitted_without_wrapper() {
     );
 }
 
-/// Scenario: A `SELECT *` request with a declined filter projects the full base row, not only filter columns.
 #[test]
 fn declined_filter_with_absent_select_list_projects_full_row() {
     let sql = dispatch_sql_for_body(serde_json::json!({
@@ -958,7 +939,6 @@ fn declined_filter_with_absent_select_list_projects_full_row() {
     );
 }
 
-/// Scenario: A declined filter beside a real select list keeps referenced-column narrowing (#160).
 #[test]
 fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
     let sql = dispatch_sql_for_body(serde_json::json!({
@@ -986,7 +966,6 @@ fn declined_filter_with_a_real_select_list_keeps_the_narrowing() {
     );
 }
 
-/// Scenario: A single-group scalar over an aggregate renders once over the merged partial (#194).
 #[test]
 fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     let sql = dispatch_sql_for_body(serde_json::json!({
@@ -1012,7 +991,6 @@ fn single_group_scalar_over_aggregate_renders_the_scalar_over_the_merge() {
     );
 }
 
-/// Scenario: A DataFusion render decline leaves Iceberg manifest pruning on the original tree.
 #[test]
 fn iceberg_pruning_input_unchanged_when_df_render_declines() {
     use crate::adapter::iceberg_predicate::to_iceberg_predicate;
@@ -1095,7 +1073,6 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
     );
 }
 
-/// Scenario: A literal-only select list hides its unprojected sort key in the scan and keeps arity 1 (#225, #189).
 #[test]
 fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     let request = guard_events_request(serde_json::json!({
@@ -1139,7 +1116,6 @@ fn declined_order_by_appends_unprojected_sort_key_as_hidden_column() {
     );
 }
 
-/// Scenario: A bare-column select list ordered by an unprojected column emits it hidden, keeping arity 1 (#225, #189).
 #[test]
 fn declined_order_by_wrapper_selects_only_original_select_list() {
     let request = guard_events_request(serde_json::json!({
@@ -1181,7 +1157,6 @@ fn declined_order_by_wrapper_selects_only_original_select_list() {
     );
 }
 
-/// Scenario: Hidden sort-key columns are appended at most once.
 #[test]
 fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
     let sort_key = |name: &str| {
@@ -1230,7 +1205,6 @@ fn declined_order_by_dedupes_repeated_and_projected_sort_keys() {
     );
 }
 
-/// Scenario: When every sort key is already projected, the extension is inert and the top-N matches.
 #[test]
 fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     let request = guard_events_request(serde_json::json!({
@@ -1289,7 +1263,6 @@ fn declined_order_by_all_keys_projected_leaves_projection_untouched() {
     );
 }
 
-/// Scenario: A non-zero offset renders only on the declined wrapper, never ahead of it (#191).
 #[test]
 fn nonzero_offset_nulls_the_effective_limit() {
     let request = guard_events_request(serde_json::json!({
@@ -1342,7 +1315,6 @@ fn nonzero_offset_nulls_the_effective_limit() {
     );
 }
 
-/// Scenario: The projection extension runs after `detect_topn`, so a matchable top-N still declines.
 #[test]
 fn declined_order_by_extension_runs_after_topn_detection() {
     let request = guard_events_request(serde_json::json!({
@@ -1398,7 +1370,7 @@ fn declined_order_by_extension_runs_after_topn_detection() {
     );
 }
 
-/// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe (#198).
+/// Scenario: An ORDER BY the adapter cannot bound as a top-N remains correctness-safe
 #[test]
 fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     let unrenderable_expression = serde_json::json!({
@@ -1499,7 +1471,6 @@ fn declined_order_by_renders_every_reachable_ordering_or_declines() {
     );
 }
 
-/// Scenario: A lone COUNT(DISTINCT) with both orderBy and LIMIT renders the LIMIT on the wrapper (#191).
 #[test]
 fn lone_count_distinct_with_order_by_still_renders_limit() {
     let request = guard_events_request(serde_json::json!({
@@ -1580,7 +1551,6 @@ fn widening_arity_coincidence_projection() -> (Vec<ProjectionItem>, Vec<String>)
     )
 }
 
-/// Scenario: A widened projection routes to the wrapper even when its column count matches the select list (#196, #234).
 #[test]
 fn dispatch_widened_projection_at_matching_arity_routes_to_wrapper() {
     let request = widening_arity_coincidence_request();
@@ -1613,7 +1583,6 @@ fn dispatch_widened_projection_at_matching_arity_routes_to_wrapper() {
     );
 }
 
-/// Scenario: The same projection with the widening flag clear stays on the scan path.
 #[test]
 fn dispatch_non_widened_projection_at_matching_arity_takes_scan_path() {
     let request = widening_arity_coincidence_request();
@@ -1650,7 +1619,6 @@ fn timestamp_cast_select_request(precision: u64) -> Json {
     })
 }
 
-/// Scenario: A CAST to `TIMESTAMP(2)`, which DataFusion cannot parse, routes to the wrapper (#405).
 #[test]
 fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(2));
@@ -1673,7 +1641,6 @@ fn declined_timestamp_precision_cast_routes_to_qualified_wrapper() {
     );
 }
 
-/// Scenario: A CAST to `TIMESTAMP(6)`, which DataFusion parses, stays on the scan path.
 #[test]
 fn accepted_timestamp_precision_cast_takes_scan_path() {
     let sql = dispatch_sql_for_body(timestamp_cast_select_request(6));
@@ -1688,7 +1655,6 @@ fn accepted_timestamp_precision_cast_takes_scan_path() {
     );
 }
 
-/// Scenario: A malformed identifier fails validation before the OAuth2 grant touches the network.
 #[tokio::test]
 
 async fn malformed_table_ident_fails_before_any_catalog_contact() {
@@ -2455,7 +2421,6 @@ fn embedded_group_keys(fragments: &[String]) -> String {
     format!(r#""group_keys":[{}]"#, encoded.join(",")).replace('\'', "''")
 }
 
-/// Scenario: The grouped dispatcher blank-pads a CHAR(20) key for DataFusion and casts it back on merge (#192).
 #[test]
 fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     let request = char_grouped_request(
@@ -2488,7 +2453,6 @@ fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     );
 }
 
-/// Scenario: An unprojected CHAR key is also padded, since no outer CAST would surface a mismatch (#192).
 #[test]
 fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     let request = unprojected_char_grouped_request(char_cast_key(20, "UTF8"));
@@ -2513,7 +2477,6 @@ fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
     );
 }
 
-/// Scenario: An unprojected VARCHAR `groupBy` key reaches the scan spec unpadded.
 #[test]
 fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = unprojected_char_grouped_request(serde_json::json!({
@@ -2544,7 +2507,6 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     );
 }
 
-/// Scenario: The pad width survives the ` ASCII` character-set suffix (#192).
 #[test]
 fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
     let request = char_grouped_request(
@@ -2577,7 +2539,6 @@ fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
     );
 }
 
-/// Scenario: A VARCHAR group key reaches the scan spec with no blank padding.
 #[test]
 fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     let request = char_grouped_request(
@@ -2605,7 +2566,6 @@ fn grouped_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
     );
 }
 
-/// Scenario: An ORDER BY on a CHAR group key still resolves against the unpadded key.
 #[test]
 fn order_by_on_a_char_declared_group_key_still_resolves_to_its_output_ordinal() {
     let request = char_grouped_request(

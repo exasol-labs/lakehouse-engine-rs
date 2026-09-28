@@ -188,7 +188,6 @@ async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table
     }
 }
 
-/// Scenario: a table added after CREATE becomes queryable only after REFRESH (#147)
 #[test]
 fn refresh_reenumerates_namespace() {
     setup_e2e();
@@ -241,7 +240,6 @@ fn refresh_reenumerates_namespace() {
     );
 }
 
-/// Scenario: a column added after CREATE becomes selectable (NULL for existing rows) after REFRESH
 #[test]
 fn refresh_reflects_added_table_and_column_change() {
     setup_e2e();
@@ -296,7 +294,6 @@ fn refresh_reflects_added_table_and_column_change() {
     );
 }
 
-/// Scenario: SET NAMESPACE re-targets the VS and fully rebuilds the table map
 #[test]
 fn set_properties_retargets_namespace() {
     setup_e2e();
@@ -372,7 +369,6 @@ fn set_properties_retargets_namespace() {
     );
 }
 
-/// Scenario: REFRESH against an unreachable catalog errors without leaking credentials
 #[test]
 fn refresh_unreachable_catalog_redacts_credentials() {
     setup_e2e();
@@ -443,7 +439,6 @@ fn refresh_unreachable_catalog_redacts_credentials() {
     conn.execute(&create_conn_sql);
 }
 
-/// Scenario: REFRESH TABLES naming one table still refreshes the whole namespace
 #[test]
 fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
     setup_e2e();
@@ -527,7 +522,6 @@ fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
     );
 }
 
-/// Scenario: a flatten-name collision surfaced by REFRESH returns the same error as CREATE
 #[test]
 fn refresh_flatten_collision_returns_same_error_as_create() {
     setup_e2e();

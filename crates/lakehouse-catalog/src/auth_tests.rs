@@ -39,7 +39,6 @@ fn build_rest_catalog_sets_token_prop() {
     );
 }
 
-/// Scenario: An empty-string token is treated as absent and injects no auth prop.
 #[test]
 fn build_rest_catalog_empty_token_injects_nothing() {
     let mut creds = base_creds();
@@ -150,7 +149,6 @@ fn build_rest_catalog_no_auth_props_when_no_auth() {
     }
 }
 
-/// Scenario: The client-credentials grant POSTs its form fields and returns the `access_token`.
 #[tokio::test]
 async fn oauth2_grant_built_from_client_credentials() {
     use std::net::SocketAddr;
@@ -207,7 +205,6 @@ async fn oauth2_grant_built_from_client_credentials() {
     );
 }
 
-/// Scenario: The grant refuses the token-plus-pair shape `validate_creds` rule 6 rejects.
 #[tokio::test]
 async fn oauth2_grant_errors_for_the_validation_rejected_shape() {
     let mut creds = creds_no_auth();
@@ -234,7 +231,6 @@ async fn oauth2_grant_errors_for_the_validation_rejected_shape() {
     );
 }
 
-/// Scenario: `redact_catalog_auth_error` strips `client_id`, `oauth2_server_uri`, and `scope`.
 #[test]
 fn redact_catalog_auth_error_strips_client_id_oauth_uri_scope() {
     const CLIENT_ID_SENTINEL: &str = "MY_CLIENT_ID_SENTINEL";
@@ -294,7 +290,6 @@ fn auth_error_sites_apply_the_value_pass_first() {
     );
 }
 
-/// Scenario: `resolve_catalog_auth` selects exactly one strategy per non-network credential shape.
 #[tokio::test]
 async fn resolve_catalog_auth_selects_one_strategy_per_non_network_shape() {
     let client = reqwest::Client::new();
@@ -339,7 +334,6 @@ fn sigv4_creds_stating_region(region: &str) -> ConnectionCreds {
     creds
 }
 
-/// Scenario: SigV4 auth is refused when neither the stated region nor the catalog URI supplies one.
 #[tokio::test]
 async fn sigv4_auth_refuses_without_signing_region() {
     let client = reqwest::Client::new();
@@ -354,7 +348,6 @@ async fn sigv4_auth_refuses_without_signing_region() {
     assert_eq!(msg, crate::sigv4::MISSING_SIGNING_REGION);
 }
 
-/// Scenario: The validation-rejected token-plus-pair shape resolves to `CatalogAuth::None` without a grant.
 #[tokio::test]
 async fn resolve_catalog_auth_is_unauthenticated_for_the_validation_rejected_shape() {
     let client = reqwest::Client::new();
@@ -375,7 +368,6 @@ async fn resolve_catalog_auth_is_unauthenticated_for_the_validation_rejected_sha
     );
 }
 
-/// Scenario: The validation-rejected token-plus-pair shape injects no REST-catalog auth prop.
 #[test]
 fn inject_catalog_auth_props_injects_nothing_for_the_validation_rejected_shape() {
     let mut creds = creds_no_auth();

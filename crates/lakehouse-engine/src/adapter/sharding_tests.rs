@@ -1,7 +1,6 @@
 use super::*;
 use std::collections::HashSet;
 
-/// Scenario: G shards are byte-balanced (max minus min cumulative size < largest file size).
 #[test]
 fn partition_by_bytes_balances_cumulative_size() {
     let files: Vec<(String, u64)> = vec![
@@ -44,7 +43,6 @@ fn partition_by_bytes_balances_cumulative_size() {
     );
 }
 
-/// Scenario: All files appear exactly once across the shards (disjoint + full coverage).
 #[test]
 fn partition_by_bytes_disjoint_full_coverage() {
     let files: Vec<(String, u64)> = (0..10)
@@ -63,7 +61,6 @@ fn partition_by_bytes_disjoint_full_coverage() {
     );
 }
 
-/// Scenario: Files with size 0 are treated as size 1 and are never skipped.
 #[test]
 fn partition_by_bytes_zero_size_treated_as_one_never_skipped() {
     let files: Vec<(String, u64)> = vec![
@@ -89,7 +86,6 @@ fn partition_by_bytes_zero_size_treated_as_one_never_skipped() {
     );
 }
 
-/// Scenario: When G >= file_count, each file gets its own shard.
 #[test]
 fn partition_by_bytes_one_file_per_shard_when_g_exceeds_count() {
     let files: Vec<(String, u64)> = vec![
@@ -109,7 +105,6 @@ fn partition_by_bytes_one_file_per_shard_when_g_exceeds_count() {
     }
 }
 
-/// Scenario: each shard entry carries its original size, including `0` for a 0-byte file.
 #[test]
 fn partition_by_bytes_propagates_size_into_shards() {
     let files: Vec<(String, u64)> = vec![

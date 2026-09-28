@@ -75,7 +75,6 @@ async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
     }
 }
 
-/// Scenario: Vending without a catalog vending key errors and never falls back to the static credential
 #[tokio::test]
 async fn vending_without_a_vending_key_errors_and_never_falls_back_to_static() {
     for absent_key in [None, Some("")] {
@@ -105,7 +104,7 @@ async fn vending_without_a_vending_key_errors_and_never_falls_back_to_static() {
     }
 }
 
-/// Scenario: An empty table storage location is rejected identically before any object-store access
+/// Scenario: An empty table storage location is rejected before any object-store access
 #[tokio::test]
 async fn empty_storage_location_errors_identically_under_both_credential_modes() {
     let mut messages = Vec::new();
@@ -142,7 +141,6 @@ async fn empty_storage_location_errors_identically_under_both_credential_modes()
 
 const DELTA_TABLE_ROOT: &str = "s3://bucket/cat/sch/orders";
 
-/// Scenario: A failed log read through the static credential reports no credential value
 #[tokio::test]
 async fn a_failed_log_read_reports_no_static_credential_value() {
     let creds = creds(false);

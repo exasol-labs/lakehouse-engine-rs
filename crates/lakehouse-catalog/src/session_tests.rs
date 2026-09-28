@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::*;
 
-/// Scenario: build_load_table_url produces `{uri}/v1/{prefix}/namespaces/{ns}/tables/{table}`
 #[test]
 fn build_load_table_url_with_warehouse_prefix() {
     let url = build_load_table_url(
@@ -17,7 +16,6 @@ fn build_load_table_url_with_warehouse_prefix() {
     );
 }
 
-/// Scenario: build_load_table_url omits the warehouse prefix when empty.
 #[test]
 fn build_load_table_url_without_warehouse() {
     let url = build_load_table_url("https://rest.example.com", "", "db", "events");
@@ -27,7 +25,6 @@ fn build_load_table_url_without_warehouse() {
     );
 }
 
-/// Scenario: build_load_table_url inserts the prefix verbatim, leaving `:` and `/` unencoded
 #[test]
 fn build_load_table_url_inserts_prefix_verbatim_without_encoding() {
     let prefix = "raw:prefix/extra";
@@ -46,7 +43,6 @@ fn build_load_table_url_inserts_prefix_verbatim_without_encoding() {
     );
 }
 
-/// Scenario: glue_catalog_prefix derives the `catalogs/{warehouse}` segment
 #[test]
 fn glue_catalog_prefix_derives_catalogs_segment() {
     assert_eq!(
@@ -56,7 +52,6 @@ fn glue_catalog_prefix_derives_catalogs_segment() {
     );
 }
 
-/// Scenario: the derived Glue `catalogs/{account-id}` prefix lands in the loadTable URL
 #[test]
 fn build_load_table_url_glue_carries_catalogs_prefix() {
     let prefix = glue_catalog_prefix("123456789012");
@@ -73,7 +68,6 @@ fn build_load_table_url_glue_carries_catalogs_prefix() {
     );
 }
 
-/// Scenario: `overrides.prefix` wins over `defaults.prefix`
 #[test]
 fn prefix_from_config_prefers_overrides() {
     let config = serde_json::json!({
@@ -83,7 +77,6 @@ fn prefix_from_config_prefers_overrides() {
     assert_eq!(prefix_from_config(&config), "over-prefix");
 }
 
-/// Scenario: with no `overrides.prefix`, Lakekeeper's `defaults.prefix` is used
 #[test]
 fn prefix_from_config_falls_back_to_defaults() {
     let config = serde_json::json!({
@@ -97,7 +90,6 @@ fn prefix_from_config_falls_back_to_defaults() {
     );
 }
 
-/// Scenario: an absent or empty prefix in both maps resolves to empty
 #[test]
 fn prefix_from_config_empty_when_absent() {
     assert_eq!(prefix_from_config(&serde_json::json!({})), "");
@@ -111,7 +103,6 @@ fn prefix_from_config_empty_when_absent() {
     );
 }
 
-/// Scenario: SigV4 skips `/v1/config` and returns `catalogs/{warehouse}` despite a server prefix
 #[tokio::test]
 async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     use std::net::SocketAddr;
@@ -162,7 +153,6 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     );
 }
 
-/// Scenario: a non-SigV4 path uses the `overrides.prefix` served by `/v1/config`
 #[tokio::test]
 async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
     use std::net::SocketAddr;
@@ -203,7 +193,6 @@ async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
     );
 }
 
-/// Scenario: a non-SigV4 config body with no prefix resolves to empty, never the warehouse
 #[tokio::test]
 async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
     use std::net::SocketAddr;
@@ -256,7 +245,6 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
     );
 }
 
-/// Scenario: `CatalogSession::resolve` on SigV4 needs no network and keeps `catalog_uri` verbatim
 #[tokio::test]
 async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
     let catalog_uri = "https://glue.us-east-1.amazonaws.com/iceberg";

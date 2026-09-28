@@ -78,7 +78,6 @@ fn vs_char_pad_table() -> String {
     format!("{VS_NAME}.{}", E2E_CHAR_PAD_TABLE.to_uppercase())
 }
 
-/// Scenario: a live getCapabilities round-trip advertises JOIN, JOIN_TYPE_INNER and JOIN_CONDITION_EQUI
 #[test]
 fn e2e_advertises_inner_equi_join_capability() {
     setup_e2e();
@@ -109,7 +108,6 @@ fn e2e_advertises_inner_equi_join_capability() {
     );
 }
 
-/// Scenario: a live getCapabilities round-trip advertises FN_AGG_COUNT_DISTINCT and AGGREGATE_SINGLE_GROUP (#56)
 #[test]
 fn advertises_count_distinct_capability() {
     setup_e2e();
@@ -133,7 +131,6 @@ fn advertises_count_distinct_capability() {
     );
 }
 
-/// Scenario: ABS(score - 50.0) < 20.0 in a WHERE filter pushes down and returns ids 7..=13
 #[test]
 fn e2e_math_functions_in_filter() {
     setup_e2e();
@@ -173,7 +170,6 @@ fn e2e_math_functions_in_filter() {
     }
 }
 
-/// Scenario: LOWER(name) LIKE 'event-1%' in a WHERE filter pushes down and returns ids 10..=19
 #[test]
 fn e2e_string_functions_in_filter() {
     setup_e2e();
@@ -214,7 +210,6 @@ fn e2e_string_functions_in_filter() {
     }
 }
 
-/// Scenario: EXTRACT(DAY FROM event_date) > 10 in a WHERE filter pushes down and returns ids 11..=20
 #[test]
 fn e2e_date_functions_in_filter() {
     setup_e2e();
@@ -249,7 +244,6 @@ fn e2e_date_functions_in_filter() {
     }
 }
 
-/// Scenario: REGEXP_LIKE(name, 'event-0[0-9]') in a WHERE filter pushes down and returns ids 1..=9
 #[test]
 fn e2e_regexp_like_in_filter() {
     setup_e2e();
@@ -290,7 +284,6 @@ fn e2e_regexp_like_in_filter() {
     }
 }
 
-/// Scenario: scalar expressions in the SELECT list push down and return correct values
 #[test]
 fn e2e_selectlist_expression_pushdown() {
     setup_e2e();
@@ -339,7 +332,6 @@ fn has_expr_after_projection(pushed_sql: &str) -> bool {
         .is_some()
 }
 
-/// Scenario: IN, BETWEEN, IS NULL, IS NOT NULL and <> select-list items push down as positional expressions (#196)
 #[test]
 fn e2e_selectlist_predicate_projection_pushdown() {
     setup_e2e();
@@ -640,7 +632,6 @@ fn assert_typed_probe_prefix(cols: &[Vec<serde_json::Value>], i: usize) {
     }
 }
 
-/// Scenario: a 10-item select list ending in a BETWEEN over a 10-column table projects positionally without widening (#196, #234)
 #[test]
 fn e2e_selectlist_between_at_matching_arity_projects_as_expr() {
     setup_e2e();
@@ -678,7 +669,6 @@ fn e2e_selectlist_between_at_matching_arity_projects_as_expr() {
     );
 }
 
-/// Scenario: a LENGTH(DOUBLE) widening at the coincidental arity, and over a table of different arity with ORDER BY, returns correct rows (#196, #234)
 #[test]
 fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
     setup_e2e();
@@ -765,7 +755,6 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
     }
 }
 
-/// Scenario: projected literal select-list items, including a duplicated literal, keep their arity and values (#190)
 #[test]
 fn e2e_selectlist_literal_projection_pushdown() {
     setup_e2e();
@@ -840,7 +829,6 @@ fn e2e_selectlist_literal_projection_pushdown() {
     }
 }
 
-/// Scenario: COUNT(*) over a LIMIT-bearing derived table does not fail with a column-count mismatch (#205)
 #[test]
 fn e2e_count_star_over_limited_subselect_pushdown() {
     setup_e2e();
@@ -879,7 +867,6 @@ fn e2e_count_star_over_limited_subselect_pushdown() {
     );
 }
 
-/// Scenario: an all-files-pruned predicate still accepts repeated literals plus a real column (#190)
 #[test]
 fn e2e_all_files_pruned_literal_projection_empty_shape() {
     setup_e2e();
@@ -925,7 +912,6 @@ fn session_utc_offset_seconds(conn: &mut ExaConn) -> f64 {
     )
 }
 
-/// Scenario: a projected CURRENT_TIMESTAMP/SYSTIMESTAMP matches Exasol's native session-local value (#238)
 #[test]
 fn e2e_now_family_projection_matches_native_session_local_value() {
     setup_e2e();
@@ -958,7 +944,6 @@ fn e2e_now_family_projection_matches_native_session_local_value() {
     }
 }
 
-/// Scenario: a projected TIMESTAMP WITH LOCAL TIME ZONE constant returns the exact session-local value, also with all files pruned (#218)
 #[test]
 fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
     setup_e2e();
@@ -1021,7 +1006,6 @@ fn e2e_projected_tstz_literal_matches_native_and_pruned_scan_succeeds() {
     );
 }
 
-/// Scenario: HAVING COUNT(*) > 3 applies to the merged result, keeping groups whose per-shard counts are at most 3
 #[test]
 fn e2e_having_clause_pushdown() {
     setup_e2e();
@@ -1057,7 +1041,6 @@ fn e2e_having_clause_pushdown() {
     );
 }
 
-/// Scenario: STDDEV/VARIANCE and their POP variants merge to the single-node result within tolerance
 #[test]
 fn e2e_stddev_variance_pushdown() {
     setup_e2e();
@@ -1111,7 +1094,6 @@ fn e2e_stddev_variance_pushdown() {
     );
 }
 
-/// Scenario: STDDEV(score + id) declines decomposition and Exasol computes the correct sample standard deviation (#179)
 #[test]
 fn e2e_stddev_over_expression_falls_back_and_returns_correct_value() {
     setup_e2e();
@@ -1173,7 +1155,6 @@ fn sample_stddev(values: &[f64]) -> f64 {
     (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / (n - 1.0)).sqrt()
 }
 
-/// Scenario: grouped STDDEV(score + id) declines decomposition and returns each group's correct sample standard deviation (#179)
 #[test]
 fn e2e_grouped_stddev_over_expression_falls_back_and_returns_correct_value() {
     const GROUP_MODULUS: i64 = 4;
@@ -1268,7 +1249,6 @@ fn assert_filter_pushed_down(conn: &mut ExaConn, query_sql: &str) {
     );
 }
 
-/// Scenario: CAST(id AS VARCHAR(2000000)) = '15' in a WHERE filter pushes down and returns id 15 (#104)
 #[test]
 fn e2e_cast_in_filter() {
     setup_e2e();
@@ -1301,7 +1281,6 @@ fn e2e_cast_in_filter() {
     );
 }
 
-/// Scenario: -score < -50.0 in a WHERE filter pushes down and returns ids 11..=20 (#105)
 #[test]
 fn e2e_unary_minus_in_filter() {
     setup_e2e();
@@ -1339,7 +1318,6 @@ fn e2e_unary_minus_in_filter() {
     }
 }
 
-/// Scenario: WEEK(event_date) = 2 in a WHERE filter pushes down and returns ISO week 2, ids 8..=14 (#107)
 #[test]
 fn e2e_week_in_filter() {
     setup_e2e();
@@ -1387,7 +1365,6 @@ fn assert_select_pushed_down(conn: &mut ExaConn, query_sql: &str, fragment: &str
     );
 }
 
-/// Scenario: DAYS_BETWEEN pushes down with Exasol's sign convention, earlier first argument yields -9
 #[test]
 fn e2e_days_between_matches_exasol() {
     setup_e2e();
@@ -1407,7 +1384,6 @@ fn e2e_days_between_matches_exasol() {
     );
 }
 
-/// Scenario: HOURS/MINUTES/SECONDS_BETWEEN push down and match Exasol's fractional values over a 2.5-hour gap
 #[test]
 fn e2e_time_between_matches_exasol() {
     setup_e2e();
@@ -1443,7 +1419,6 @@ fn e2e_time_between_matches_exasol() {
     );
 }
 
-/// Scenario: CAST, EXTRACT and CASE together in the SELECT list push down with correct values (#136)
 #[test]
 fn e2e_selectlist_cast_extract_case_pushdown() {
     setup_e2e();
@@ -1496,7 +1471,6 @@ fn e2e_selectlist_cast_extract_case_pushdown() {
     }
 }
 
-/// Scenario: ORDER BY a column outside the select list pushes down via a hidden sort column that drives the order (#225)
 #[test]
 fn e2e_order_by_unprojected_column_bare_projection() {
     setup_e2e();
@@ -1555,7 +1529,6 @@ fn e2e_order_by_unprojected_column_bare_projection() {
     }
 }
 
-/// Scenario: ORDER BY a column referenced only inside a projected expression pushes down correctly (#225)
 #[test]
 fn e2e_order_by_column_referenced_only_in_projected_expression() {
     setup_e2e();
@@ -1632,7 +1605,6 @@ fn exasol_trim_decimal_string(unscaled: i128, scale: u32) -> String {
     out
 }
 
-/// Scenario: the `exasol_trim_decimal_string` oracle matches Exasol's trimming rule for every `c_decimal_a` value
 #[test]
 fn exasol_trim_decimal_string_matches_documented_values() {
     assert_eq!(exasol_trim_decimal_string(1050, 2), "10.5");
@@ -1643,7 +1615,6 @@ fn exasol_trim_decimal_string_matches_documented_values() {
     assert_eq!(exasol_trim_decimal_string(6000, 2), "60");
 }
 
-/// Scenario: CAST(c_decimal_a AS VARCHAR(20)) trims trailing scale zeros like native Exasol (#211)
 #[test]
 fn e2e_decimal_cast_trims_trailing_zeros() {
     setup_e2e();
@@ -1670,7 +1641,6 @@ fn e2e_decimal_cast_trims_trailing_zeros() {
     }
 }
 
-/// Scenario: projecting one column while ordering by a different unprojected column pushes down correctly (#189)
 #[test]
 fn e2e_issue_189_shape_equivalent_local_verification() {
     setup_e2e();
@@ -1707,7 +1677,6 @@ fn e2e_issue_189_shape_equivalent_local_verification() {
     }
 }
 
-/// Scenario: CONCAT over a DECIMAL operand trims trailing scale zeros like native Exasol (#211)
 #[test]
 fn e2e_decimal_concat_trims_trailing_zeros() {
     setup_e2e();
@@ -1734,7 +1703,6 @@ fn e2e_decimal_concat_trims_trailing_zeros() {
     }
 }
 
-/// Scenario: LENGTH(c_decimal_a) reflects the trimmed string's length (#211)
 #[test]
 fn e2e_decimal_length_reflects_trimmed_string() {
     setup_e2e();
@@ -1760,7 +1728,6 @@ fn e2e_decimal_length_reflects_trimmed_string() {
     }
 }
 
-/// Scenario: COUNT(*) WHERE LENGTH(c_decimal_a) > N matches Exasol's trimmed LENGTH semantics per row and in aggregate (#211)
 #[test]
 fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
     setup_e2e();
@@ -1841,7 +1808,6 @@ fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
 // DataFusion refuses. VARCHAR/CHAR pass through, DATE is CAST to VARCHAR, DECIMAL uses
 // the trimmed rendering, and other types decline to native Exasol.
 
-/// Scenario: UPPER(c_varchar) still pushes down through the VARCHAR passthrough (#210)
 #[test]
 fn e2e_upper_varchar_pushdown() {
     setup_e2e();
@@ -1868,7 +1834,6 @@ fn e2e_upper_varchar_pushdown() {
     );
 }
 
-/// Scenario: UPPER over a DECIMAL(20,0) column returns the plain digit string (#210)
 #[test]
 fn e2e_upper_id_trims_to_plain_integer_string() {
     setup_e2e();
@@ -1888,7 +1853,6 @@ fn e2e_upper_id_trims_to_plain_integer_string() {
     );
 }
 
-/// Scenario: LTRIM(c_decimal_a) returns the Exasol-trimmed decimal string (#210)
 #[test]
 fn e2e_ltrim_decimal_trims_trailing_zeros() {
     setup_e2e();
@@ -1928,7 +1892,6 @@ fn e2e_ltrim_decimal_trims_trailing_zeros() {
     }
 }
 
-/// Scenario: LOWER(c_date) returns Exasol's default YYYY-MM-DD rendering (#210)
 #[test]
 fn e2e_lower_date_formats_as_iso() {
     setup_e2e();
@@ -1951,7 +1914,6 @@ fn e2e_lower_date_formats_as_iso() {
     );
 }
 
-/// Scenario: INSTR(c_decimal_a, '.') returns the position within the trimmed decimal string (#210)
 #[test]
 fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
     setup_e2e();
@@ -1995,7 +1957,6 @@ fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
 // Each result is compared with an in-session native oracle over a bare literal, so a
 // regressed guard either hard-fails or returns DataFusion's divergent formatting.
 
-/// Scenario: UPPER(c_double) declines pushdown and matches a native DOUBLE oracle (#210)
 #[test]
 fn e2e_upper_double_declines_to_native_oracle() {
     setup_e2e();
@@ -2029,7 +1990,6 @@ fn e2e_upper_double_declines_to_native_oracle() {
     );
 }
 
-/// Scenario: UPPER(c_ts) declines pushdown and matches a native oracle cast to the engine's timestamp precision (#210)
 #[test]
 fn e2e_upper_timestamp_declines_to_native_oracle() {
     setup_e2e();
@@ -2063,7 +2023,6 @@ fn e2e_upper_timestamp_declines_to_native_oracle() {
     );
 }
 
-/// Scenario: UPPER(c_bool) declines pushdown and matches a native BOOLEAN oracle (#210)
 #[test]
 fn e2e_upper_boolean_declines_to_native_oracle() {
     setup_e2e();
@@ -2146,7 +2105,6 @@ fn e2e_substr_left_pushdown() {
 // INSTR/LOCATE beyond 2 arguments always decline: the renderer drops extra arguments
 // (#228), which would silently return a wrong position.
 
-/// Scenario: select-list INSTR with a start position declines to native Exasol instead of truncating (#228)
 #[test]
 fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
     setup_e2e();
@@ -2174,7 +2132,6 @@ fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
     );
 }
 
-/// Scenario: WHERE-clause INSTR with a start position declines to native Exasol instead of truncating (#228)
 #[test]
 fn e2e_instr_arity_decline_where_matches_native_oracle() {
     setup_e2e();
@@ -2256,7 +2213,6 @@ fn int_set(values: &[serde_json::Value]) -> std::collections::HashSet<i64> {
     values.iter().map(parse_int).collect()
 }
 
-/// Scenario: row scan with an expression sort key absent from the select list leaks no HIDDEN_COL and orders correctly (#198)
 #[test]
 fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
     setup_e2e();
@@ -2346,7 +2302,6 @@ fn e2e_order_by_expression_not_selected_leaks_no_hidden_column() {
     );
 }
 
-/// Scenario: a group-key-only select list ordered by an unselected aggregate with LIMIT returns the correct group set (#198)
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
     setup_e2e();
@@ -2386,7 +2341,6 @@ fn e2e_grouped_order_by_aggregate_not_selected_top_n_groups_limit_applies() {
     );
 }
 
-/// Scenario: an unselected aggregate sort key leaks no HIDDEN_COL beside another selected aggregate, and a selected sort key keeps the partial/merge path (#198)
 #[test]
 fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
     setup_e2e();
@@ -2460,7 +2414,6 @@ fn e2e_grouped_order_by_aggregate_not_selected_leaks_no_hidden_column() {
     }
 }
 
-/// Scenario: a sort expression that is also a select-list item survives under its own name
 #[test]
 fn e2e_order_by_expression_also_selected_control() {
     setup_e2e();
@@ -2516,7 +2469,6 @@ fn e2e_order_by_expression_also_selected_control() {
     );
 }
 
-/// Scenario: multi-COUNT(DISTINCT) with an aggregate ORDER BY routes to the qualified wrapper and returns a correct, leak-free result
 #[test]
 fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
     setup_e2e();
@@ -2551,7 +2503,6 @@ fn e2e_multi_count_distinct_order_by_expression_renders_on_wrapper() {
     assert_eq!(parse_int(&cols[1][0]), 12, "COUNT(DISTINCT id) must be 12");
 }
 
-/// Scenario: LIMIT 0 over a one-row aggregate returns zero rows, truncated by Exasol itself
 #[test]
 fn e2e_order_by_aggregate_with_limit_zero_returns_no_rows() {
     setup_e2e();
@@ -2663,7 +2614,6 @@ fn grouped_by_label<T>(
         .collect()
 }
 
-/// Scenario: COUNT(DISTINCT SIGN(c_price - 3)) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_count_distinct_sign_matches_native_oracle() {
     setup_e2e();
@@ -2694,7 +2644,6 @@ fn e2e_count_distinct_sign_matches_native_oracle() {
     );
 }
 
-/// Scenario: COUNT(DISTINCT YEAR(...)) and COUNT(DISTINCT WEEK(...)) compile and match native oracles (#209)
 #[test]
 fn e2e_count_distinct_date_field_matches_native_oracle() {
     setup_e2e();
@@ -2742,7 +2691,6 @@ fn e2e_count_distinct_date_field_matches_native_oracle() {
     );
 }
 
-/// Scenario: COUNT(DISTINCT HOURS_BETWEEN(...)) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_count_distinct_hours_between_matches_native_oracle() {
     setup_e2e();
@@ -2772,7 +2720,6 @@ fn e2e_count_distinct_hours_between_matches_native_oracle() {
     );
 }
 
-/// Scenario: COUNT(DISTINCT INSTR(c_varchar, 'a')) still matches the native oracle after the dialect rework (#210)
 #[test]
 fn e2e_count_distinct_instr_matches_native_oracle() {
     setup_e2e();
@@ -2803,7 +2750,6 @@ fn e2e_count_distinct_instr_matches_native_oracle() {
     );
 }
 
-/// Scenario: grouped SIGN(SUM(c_price) - 10) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_grouped_scalar_over_aggregate_sign_matches_native_oracle() {
     setup_e2e();
@@ -2845,7 +2791,6 @@ fn e2e_grouped_scalar_over_aggregate_sign_matches_native_oracle() {
     );
 }
 
-/// Scenario: grouped YEAR(MIN(c_ts)) compiles and matches the native oracle, including a NULL group (#209)
 #[test]
 fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
     setup_e2e();
@@ -2892,7 +2837,6 @@ fn e2e_grouped_scalar_over_aggregate_year_matches_native_oracle() {
     );
 }
 
-/// Scenario: a select-list REGEXP_LIKE inside COUNT(DISTINCT ...) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_count_distinct_regexp_like_matches_native_oracle() {
     setup_e2e();
@@ -2924,7 +2868,6 @@ fn e2e_count_distinct_regexp_like_matches_native_oracle() {
     );
 }
 
-/// Scenario: a CASE with a TIMESTAMP literal comparison inside COUNT(DISTINCT ...) compiles and matches the native oracle (#209)
 #[test]
 fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
     setup_e2e();
@@ -2965,7 +2908,6 @@ fn e2e_count_distinct_timestamp_literal_matches_native_oracle() {
     );
 }
 
-/// Scenario: a select-list SYSTIMESTAMP is statement-constant across shards and matches Exasol's DBTIMEZONE clock
 #[test]
 fn e2e_now_family_matches_native_oracle() {
     setup_e2e();
@@ -3038,7 +2980,6 @@ fn e2e_now_family_matches_native_oracle() {
 // Declined-filter self-apply (#279): a WHERE predicate the adapter cannot push into the
 // scan must be applied in its own Exasol-dialect SQL, since Exasol never re-applies it.
 
-/// Scenario: a declined SECOND(c_ts, 3) filter is applied in the wrapper WHERE and returns 0 rows
 #[test]
 fn e2e_declined_filter_second_arity_returns_filtered_rows() {
     setup_e2e();
@@ -3068,7 +3009,6 @@ fn e2e_declined_filter_second_arity_returns_filtered_rows() {
     );
 }
 
-/// Scenario: a declined LIKE over a DECIMAL column is self-applied and returns ids 1, 5, 7
 #[test]
 fn e2e_declined_filter_like_on_decimal_returns_filtered_rows() {
     setup_e2e();
@@ -3089,7 +3029,6 @@ fn e2e_declined_filter_like_on_decimal_returns_filtered_rows() {
     );
 }
 
-/// Scenario: a declined three-argument INSTR filter is self-applied instead of truncated to strpos
 #[test]
 fn e2e_declined_filter_instr_three_arg_returns_filtered_rows() {
     setup_e2e();
@@ -3110,7 +3049,6 @@ fn e2e_declined_filter_instr_three_arg_returns_filtered_rows() {
     );
 }
 
-/// Scenario: a declined filter applies before aggregation, so COUNT(*) is 3, not 12
 #[test]
 fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
     setup_e2e();
@@ -3127,7 +3065,6 @@ fn e2e_declined_filter_under_aggregate_filters_before_aggregating() {
     );
 }
 
-/// Scenario: a declined filter applies before ORDER BY … LIMIT truncation
 #[test]
 fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     setup_e2e();
@@ -3148,7 +3085,6 @@ fn e2e_declined_filter_under_order_by_limit_filters_before_truncating() {
     );
 }
 
-/// Scenario: SELECT * over a declined filter returns the full base row with no column-count error
 #[test]
 fn e2e_declined_filter_select_star_returns_full_row_shape() {
     setup_e2e();
@@ -3179,7 +3115,6 @@ fn e2e_declined_filter_select_star_returns_full_row_shape() {
     );
 }
 
-/// Scenario: a CAST to HASHTYPE refused by both dialects fails with a clean error that leaks no credentials
 #[test]
 fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
     setup_e2e();
@@ -3210,7 +3145,6 @@ fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
 
 // #192: CHAR-declared pushdown shapes.
 
-/// Scenario: equal-length CASE keys, CAST AS CHAR(20) and literal GROUP BY keys return correct rows, VARCHAR control unaffected (#192)
 #[test]
 fn char_declared_pushdown_shapes_match_native() {
     setup_e2e();
@@ -3321,7 +3255,6 @@ fn char_declared_pushdown_shapes_match_native() {
     }
 }
 
-/// Scenario: a CHAR(30) cast blank-pads 'ab' and 'ab   ' into one GROUP BY group
 #[test]
 fn char_group_key_merges_trailing_space_variants_like_native() {
     setup_e2e();
@@ -3393,7 +3326,6 @@ fn char_group_key_merges_trailing_space_variants_like_native() {
     );
 }
 
-/// Scenario: an over-length value under a CHAR(20) group key raises a truncation error (22002) instead of merging
 #[test]
 fn over_length_char_group_key_raises_truncation_error_like_native() {
     setup_e2e();
@@ -3432,7 +3364,6 @@ fn over_length_char_group_key_raises_truncation_error_like_native() {
     );
 }
 
-/// Scenario: an over-length value projected through CAST AS CHAR(20) fails with a truncation error at the emit boundary
 #[test]
 fn over_length_char_projection_fails_cleanly() {
     setup_e2e();
@@ -3471,7 +3402,6 @@ fn over_length_char_projection_fails_cleanly() {
     );
 }
 
-/// Scenario: C_DECIMAL_A/7 pushes down as full float division, matching the native oracle (#186)
 #[test]
 fn e2e_float_div_decimal_over_int_matches_native_oracle() {
     setup_e2e();
@@ -3496,7 +3426,6 @@ fn e2e_float_div_decimal_over_int_matches_native_oracle() {
     );
 }
 
-/// Scenario: C_DECIMAL_A/C_DECIMAL_B pushes down as full float division, matching the native oracle (#186)
 #[test]
 fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
     setup_e2e();

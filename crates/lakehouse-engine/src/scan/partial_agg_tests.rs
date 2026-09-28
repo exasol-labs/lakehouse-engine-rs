@@ -69,7 +69,6 @@ fn all_agg_kinds_plans() -> Vec<AggregatePlan> {
     ]
 }
 
-/// Scenario: single-group partial-aggregate SQL over every AggKind matches the golden byte for byte.
 #[test]
 fn partial_agg_sql_all_agg_kinds_matches_golden() {
     let actual = build_partial_agg_sql(&all_agg_kinds_plans(), "aliased");
@@ -77,7 +76,6 @@ fn partial_agg_sql_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: grouped partial-aggregate SQL over every AggKind matches the golden byte for byte.
 #[test]
 fn grouped_partial_agg_sql_all_agg_kinds_matches_golden() {
     let actual = build_grouped_partial_agg_sql(
@@ -116,7 +114,6 @@ fn sample_plans_count_sum_min_max() -> Vec<AggregatePlan> {
     ]
 }
 
-/// Scenario: COUNT(*), SUM, MIN, MAX each yield one column in order.
 #[test]
 fn partial_agg_sql_count_star_uses_count_star() {
     let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
@@ -130,7 +127,6 @@ fn partial_agg_sql_count_star_uses_count_star() {
     );
 }
 
-/// Scenario: a COUNT(col) plan uses COUNT("COL"), not COUNT(*).
 #[test]
 fn partial_agg_sql_count_col_uses_count_col() {
     let plans = vec![AggregatePlan {
@@ -153,7 +149,6 @@ fn partial_agg_sql_count_col_uses_count_col() {
     );
 }
 
-/// Scenario: a SUM plan uses SUM("COL") at index 1.
 #[test]
 fn partial_agg_sql_sum_uses_sum_col() {
     let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
@@ -163,7 +158,6 @@ fn partial_agg_sql_sum_uses_sum_col() {
     );
 }
 
-/// Scenario: MIN/MAX plans use MIN/MAX("COL").
 #[test]
 fn partial_agg_sql_min_max_use_min_max_col() {
     let sql = build_partial_agg_sql(&sample_plans_count_sum_min_max(), "aliased");
@@ -177,7 +171,6 @@ fn partial_agg_sql_min_max_use_min_max_col() {
     );
 }
 
-/// Scenario: an AVG plan emits two columns, sum then count.
 #[test]
 fn partial_agg_sql_avg_emits_sum_count_pair() {
     let plans = vec![AggregatePlan {
@@ -200,7 +193,6 @@ fn partial_agg_sql_avg_emits_sum_count_pair() {
     );
 }
 
-/// Scenario: each plan item is indexed by its position in the aggregates vec, AVG's pair sharing one index.
 #[test]
 fn partial_agg_sql_mixed_column_order_and_indices() {
     let plans = vec![
@@ -233,7 +225,6 @@ fn partial_agg_sql_mixed_column_order_and_indices() {
     );
 }
 
-/// Scenario: a present filter is applied.
 #[test]
 fn partial_agg_sql_applies_filter() {
     let plans = vec![AggregatePlan {
@@ -252,7 +243,6 @@ fn partial_agg_sql_applies_filter() {
     );
 }
 
-/// Scenario: no filter yields no WHERE clause.
 #[test]
 fn partial_agg_sql_no_filter_no_where() {
     let plans = vec![AggregatePlan {
@@ -267,7 +257,6 @@ fn partial_agg_sql_no_filter_no_where() {
     );
 }
 
-/// Scenario: a rendered expression argument is substituted verbatim while a bare column stays quoted.
 #[test]
 fn partial_sql_uses_rendered_expression_argument() {
     let plans = vec![
@@ -308,7 +297,6 @@ fn partial_sql_uses_rendered_expression_argument() {
     );
 }
 
-/// Scenario: a single group key with COUNT(*) appears in the SELECT.
 #[test]
 fn grouped_partial_agg_sql_single_key_count() {
     let plans = vec![AggregatePlan {
@@ -329,7 +317,6 @@ fn grouped_partial_agg_sql_single_key_count() {
     assert!(sql.contains("GROUP BY"), "must have GROUP BY clause: {sql}");
 }
 
-/// Scenario: group keys precede partial aggregate columns in the SELECT list.
 #[test]
 fn grouped_partial_agg_sql_layout_matches_emits() {
     let plans = vec![
@@ -369,7 +356,6 @@ fn grouped_partial_agg_sql_layout_matches_emits() {
     );
 }
 
-/// Scenario: no LIMIT is ever added to a grouped partial aggregate.
 #[test]
 fn grouped_partial_agg_sql_no_limit() {
     let plans = vec![AggregatePlan {
@@ -384,7 +370,6 @@ fn grouped_partial_agg_sql_no_limit() {
     );
 }
 
-/// Scenario: expression group keys are inserted verbatim into SELECT and GROUP BY.
 #[test]
 fn grouped_partial_agg_sql_expression_key_verbatim() {
     let plans = vec![AggregatePlan {
@@ -409,7 +394,6 @@ fn grouped_partial_agg_sql_expression_key_verbatim() {
     );
 }
 
-/// Scenario: a stat aggregate emits COUNT(col), SUM(col), SUM(col*col) at index 0.
 #[test]
 fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
     for kind in &[
@@ -447,7 +431,6 @@ fn partial_agg_sql_stat_emits_cnt_sum_sumsq() {
     }
 }
 
-/// Scenario: a stat aggregate's null fallback row is cnt=0 (as `Value::Numeric`), sum=NULL, sumsq=NULL.
 #[test]
 fn stat_aggregate_null_fallback_row_has_three_values() {
     use exasol_udf_sdk::value::{Decimal, Value};
@@ -485,7 +468,6 @@ fn stat_aggregate_null_fallback_row_has_three_values() {
     }
 }
 
-/// Scenario: an empty shard's fallback row carries each counter's zero at its declared variant, NULL elsewhere.
 #[test]
 fn null_partial_row_conforms_to_declared_output_columns() {
     use exasol_udf_sdk::value::{Decimal, Value};
@@ -525,7 +507,6 @@ fn null_partial_row_conforms_to_declared_output_columns() {
     );
 }
 
-/// Scenario: a declared list not covering the fallback row fails naming both counts.
 #[test]
 fn null_partial_row_fails_when_the_declared_list_is_short() {
     let plans = vec![
@@ -550,7 +531,6 @@ fn null_partial_row_fails_when_the_declared_list_is_short() {
     );
 }
 
-/// Scenario: a counter declared a type no row count can inhabit fails naming the column.
 #[test]
 fn null_partial_row_fails_when_a_counter_is_declared_non_numeric() {
     let plans = vec![AggregatePlan {
@@ -567,7 +547,6 @@ fn null_partial_row_fails_when_a_counter_is_declared_non_numeric() {
     );
 }
 
-/// Scenario: a stat aggregate at index 1 uses PARTIAL_stat_*_1 names.
 #[test]
 fn stat_aggregate_index_follows_plan_order() {
     let plans = vec![
@@ -598,7 +577,6 @@ fn stat_aggregate_index_follows_plan_order() {
     );
 }
 
-/// Scenario: ResourcesExhausted on the partial-aggregate paths surfaces as memory exhaustion without credentials.
 #[test]
 fn resources_exhausted_on_partial_aggregate_path_surfaces_as_memory_error() {
     use crate::scan::emit::classify_scan_error;
@@ -670,7 +648,6 @@ fn one_row_batch(columns: Vec<(&str, ArrayRef)>) -> RecordBatch {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).expect("partial batch")
 }
 
-/// Scenario: each partial-aggregate cell is coerced to its declared column's Arrow type.
 #[test]
 fn partial_cells_conform_to_declared_output_columns() {
     use exasol_udf_sdk::value::Value;
@@ -802,7 +779,6 @@ fn partial_cells_conform_to_declared_output_columns() {
     );
 }
 
-/// Scenario: a MIN/MAX cell over TIMESTAMP(9) keeps all nine digits in its `Value::Timestamp`.
 #[test]
 fn partial_agg_minmax_over_a_nanosecond_timestamp_keeps_every_digit() {
     use arrow::array::TimestampNanosecondArray;
@@ -853,7 +829,6 @@ fn partial_agg_minmax_over_a_nanosecond_timestamp_keeps_every_digit() {
     );
 }
 
-/// Scenario: an out-of-range partial-aggregate `Numeric` column fails naming it.
 #[test]
 fn partial_agg_fails_on_numeric_with_out_of_range_payload() {
     let drifted = vec![
@@ -880,7 +855,6 @@ fn partial_agg_fails_on_numeric_with_out_of_range_payload() {
     }
 }
 
-/// Scenario: a partial-aggregate value its declared column cannot represent fails naming the column.
 #[test]
 fn partial_agg_fails_when_a_value_does_not_fit_its_declared_target() {
     // 10^36 needs 37 digits: one more than DECIMAL(36,2) holds.
@@ -906,7 +880,6 @@ fn partial_agg_fails_when_a_value_does_not_fit_its_declared_target() {
     );
 }
 
-/// Scenario: the grouped path coerces only the partial-aggregate columns, never group keys.
 #[test]
 fn grouped_coercion_leaves_the_group_key_columns_untouched() {
     use arrow::array::Date32Array;
@@ -934,7 +907,6 @@ fn grouped_coercion_leaves_the_group_key_columns_untouched() {
     );
 }
 
-/// Scenario: a declared list not covering the produced partial row fails the call.
 #[test]
 fn partial_agg_fails_when_the_declared_column_count_disagrees() {
     let batch = one_row_batch(vec![

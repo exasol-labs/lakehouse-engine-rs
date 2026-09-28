@@ -308,7 +308,6 @@ fn renders_arithmetic_mul() {
     assert_eq!(render_expression(&expr).unwrap(), r#"("A" * 2)"#);
 }
 
-/// Scenario: the legacy node name `MUL` is not recognized; Exasol only emits `MULT`.
 #[test]
 fn legacy_mul_name_is_not_recognized() {
     let expr = json!({
@@ -325,7 +324,6 @@ fn legacy_mul_name_is_not_recognized() {
     );
 }
 
-/// Scenario: the two-column product `L_EXTENDEDPRICE * L_DISCOUNT` renders.
 #[test]
 fn renders_two_column_arithmetic_product() {
     let expr = json!({
@@ -342,7 +340,6 @@ fn renders_two_column_arithmetic_product() {
     );
 }
 
-/// Scenario: arithmetic node names equal the advertised `FN_` capability names minus the prefix.
 #[test]
 fn arithmetic_operator_set_matches_advertised_capabilities() {
     let arithmetic = [
@@ -1724,7 +1721,6 @@ fn renders_nullifzero_zeroifnull() {
     assert_eq!(render_expression(&expr2).unwrap(), r#"coalesce("V", 0)"#);
 }
 
-/// Scenario: the NULLIF(MOD(id,5),0) group key renders, so the grouped-aggregate path handles it.
 #[test]
 fn renders_nullif_of_mod() {
     let expr = json!({
@@ -1748,7 +1744,6 @@ fn renders_nullif_of_mod() {
     );
 }
 
-/// Scenario: Exasol's simple-CASE expansion of NULLIF(MOD(id,5),0) renders as a group key.
 #[test]
 fn renders_simple_case_from_nullif_expansion() {
     let mod_node = json!({
@@ -1775,7 +1770,6 @@ fn renders_simple_case_from_nullif_expansion() {
     );
 }
 
-/// Scenario: a searched CASE (no `basis`) renders its WHEN arguments as predicates.
 #[test]
 fn renders_searched_case_without_basis() {
     let expr = json!({
@@ -1797,7 +1791,6 @@ fn renders_searched_case_without_basis() {
     );
 }
 
-/// Scenario: a CASE without ELSE has exactly one result per WHEN.
 #[test]
 fn renders_case_without_else() {
     let expr = json!({
@@ -2115,7 +2108,6 @@ fn between_fns_reject_wrong_arity() {
     }
 }
 
-/// Scenario: a 2-argument `SECOND(ts, 3)` declines in DataFusion but renders verbatim in Exasol.
 #[test]
 fn second_with_precision_declines_for_datafusion_renders_for_exasol() {
     let expr = json!({
@@ -2533,7 +2525,6 @@ fn renders_cast_char_exasol_dialect_includes_length() {
     );
 }
 
-/// Scenario: the same CHAR node renders bare `VARCHAR` in DataFusion and `CHAR(n)` in Exasol (#192).
 #[test]
 fn cast_char_target_diverges_between_dialects() {
     let expr = json!({
@@ -2551,7 +2542,6 @@ fn cast_char_target_diverges_between_dialects() {
     );
 }
 
-/// Scenario: a size-less VARCHAR target renders `VARCHAR(2000000)` in the Exasol dialect.
 #[test]
 fn renders_cast_varchar_exasol_dialect_without_size_falls_back() {
     let expr = json!({
@@ -2565,7 +2555,6 @@ fn renders_cast_varchar_exasol_dialect_without_size_falls_back() {
     );
 }
 
-/// Scenario: a size-less CHAR target renders `VARCHAR(2000000)` rather than inventing a CHAR width.
 #[test]
 fn renders_cast_char_exasol_dialect_without_size_falls_back_to_varchar_default() {
     let expr = json!({
@@ -3009,7 +2998,6 @@ fn renders_between_family_verbatim_in_exasol_dialect() {
     }
 }
 
-/// Scenario: every declared name has a fixture, and each `VerbatimCall` renders its derived `<NAME>(<args>)` form over dialect-invariant arguments.
 #[test]
 fn exasol_dialect_renders_declared_verbatim_surface() {
     struct ScalarFixture {
@@ -3388,7 +3376,6 @@ fn arithmetic_operators_render_identically_in_both_dialects() {
     );
 }
 
-/// Scenario: FLOAT_DIV renders the checked-division call only in the DataFusion dialect.
 #[test]
 fn float_div_renders_checked_division_call_only_in_the_datafusion_dialect() {
     let float_div = json!({

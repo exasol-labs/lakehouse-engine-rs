@@ -105,7 +105,6 @@ fn incompatible_types_map_to_varchar_json() {
     assert!(!needs_json_fallback(&DataType::Decimal128(36, 6)));
 }
 
-/// Scenario: Incompatible Arrow types are serialized to JSON VARCHAR; only nested types take JSON document rendering
 #[test]
 fn nested_and_non_nested_incompatible_halves_are_owned_by_one_predicate_each() {
     let list_of_int = DataType::List(std::sync::Arc::new(arrow::datatypes::Field::new(
@@ -170,7 +169,6 @@ fn nested_and_non_nested_incompatible_halves_are_owned_by_one_predicate_each() {
     assert!(!needs_json_fallback(&DataType::Boolean));
 }
 
-/// Scenario: The Delta type mapping's castability claims hold against `arrow-cast` directly
 #[test]
 fn arrow_castability_to_utf8_pins_the_three_delta_type_sets() {
     use arrow::compute::can_cast_types;
@@ -229,7 +227,6 @@ fn arrow_castability_to_utf8_pins_the_three_delta_type_sets() {
     assert!(!can_cast_types(&list_of_struct, &DataType::Utf8));
 }
 
-/// Scenario: `arrow-cast`'s `List(Utf8) → Utf8` kernel renders display text, not JSON
 #[test]
 
 fn list_to_utf8_cast_kernel_renders_display_text_not_json() {
@@ -285,7 +282,6 @@ fn varchar_type_string_alone_does_not_decide_the_json_fallback() {
     );
 }
 
-/// Scenario: Each Iceberg primitive maps to its Exasol type; complex types map to VARCHAR(2000000)
 #[test]
 fn iceberg_types_map_to_exasol_type() {
     let ts_precision = EngineTimestampSupport::MillisecondOnly;
@@ -375,7 +371,6 @@ fn iceberg_types_map_to_exasol_type() {
     );
 }
 
-/// Scenario: `exasol_type_to_arrow` reproduces Exasol's DECIMAL→ExaType precision binning
 #[test]
 fn exasol_type_to_arrow_reproduces_decimal_precision_binning() {
     let cases: &[(&str, DataType)] = &[
@@ -410,7 +405,6 @@ fn exasol_type_to_arrow_reproduces_decimal_precision_binning() {
     }
 }
 
-/// Scenario: A `TIMESTAMP(p)` EMITS string maps back to the Arrow unit of that precision
 #[test]
 fn exasol_type_to_arrow_parses_timestamp_precision() {
     let cases = [
@@ -428,7 +422,6 @@ fn exasol_type_to_arrow_parses_timestamp_precision() {
     }
 }
 
-/// Scenario: A scale-0 DECIMAL with precision 10..=18 maps to Arrow `Int64`, not `Decimal128`
 #[test]
 fn exasol_type_to_arrow_count_star_decimal_is_int64() {
     assert_eq!(exasol_type_to_arrow("DECIMAL(10,0)"), Some(DataType::Int64));
@@ -436,7 +429,6 @@ fn exasol_type_to_arrow_count_star_decimal_is_int64() {
     assert_eq!(exasol_type_to_arrow("DECIMAL(9,0)"), Some(DataType::Int32));
 }
 
-/// Scenario: String-family and unknown declared types return `None`
 #[test]
 fn exasol_type_to_arrow_returns_none_for_string_family() {
     assert_eq!(exasol_type_to_arrow("VARCHAR(2000000)"), None);
@@ -446,7 +438,6 @@ fn exasol_type_to_arrow_returns_none_for_string_family() {
     assert_eq!(exasol_type_to_arrow("HASHTYPE"), None);
 }
 
-/// Scenario: parsing is case-insensitive and whitespace-tolerant.
 #[test]
 fn exasol_type_to_arrow_is_case_and_whitespace_insensitive() {
     assert_eq!(
@@ -460,7 +451,6 @@ fn exasol_type_to_arrow_is_case_and_whitespace_insensitive() {
     assert_eq!(exasol_type_to_arrow("DECIMAL(9)"), Some(DataType::Int32));
 }
 
-/// Scenario: `iceberg_type_to_arrow` maps every Iceberg type family to its Arrow equivalent
 #[test]
 fn iceberg_type_to_arrow_maps_all_families() {
     use arrow::datatypes::TimeUnit;
@@ -611,7 +601,6 @@ fn iceberg_type_to_arrow_maps_all_families() {
     );
 }
 
-/// Scenario: Each mapping category's declared Exasol type agrees with its `needs_json_fallback` flag
 #[test]
 fn numeric_family_types_and_fallback_flags() {
     let cases: &[(DataType, &str, bool)] = &[
@@ -689,7 +678,6 @@ fn exasol_type_to_json_roundtrip() {
     assert_eq!(dec["scale"].as_u64().unwrap(), 4);
 }
 
-/// Scenario: `exasol_type_to_json` renders a scale-less `DECIMAL(p)` as a decimal object of scale 0
 #[test]
 fn exasol_type_to_json_absent_decimal_scale_becomes_scale_zero_decimal() {
     assert_eq!(
@@ -698,7 +686,6 @@ fn exasol_type_to_json_absent_decimal_scale_becomes_scale_zero_decimal() {
     );
 }
 
-/// Scenario: A DECIMAL argument outside the `u8`/`i8` range falls through to the VARCHAR object
 #[test]
 fn exasol_type_to_json_out_of_range_decimal_args_become_varchar() {
     assert_eq!(
@@ -711,7 +698,6 @@ fn exasol_type_to_json_out_of_range_decimal_args_become_varchar() {
     );
 }
 
-/// Scenario: A negative DECIMAL scale serializes as a signed JSON number
 #[test]
 fn exasol_type_to_json_negative_decimal_scale_stays_signed() {
     assert_eq!(
@@ -720,7 +706,6 @@ fn exasol_type_to_json_negative_decimal_scale_stays_signed() {
     );
 }
 
-/// Scenario: Three-argument and empty DECIMAL argument lists fall through to VARCHAR
 #[test]
 fn exasol_type_to_json_malformed_decimal_arg_lists_stay_varchar() {
     for malformed in ["DECIMAL(10,2,3)", "DECIMAL()"] {
@@ -744,7 +729,6 @@ fn exasol_type_to_json_timestamp_with_local_time_zone() {
     assert_eq!(ts, serde_json::json!({"type": "timestamp"}));
 }
 
-/// Scenario: `exasol_type_from_json` reads `withLocalTimeZone` back as TIMESTAMP WITH LOCAL TIME ZONE
 #[test]
 fn exasol_type_from_json_reads_with_local_time_zone_flag() {
     let tstz = serde_json::json!({"type": "timestamp", "withLocalTimeZone": true});
@@ -757,7 +741,6 @@ fn exasol_type_from_json_reads_with_local_time_zone_flag() {
     assert_eq!(exasol_type_from_json(&ts), "TIMESTAMP");
 }
 
-/// Scenario: `exasol_type_from_json` renders `fractionalSecondsPrecision` as `TIMESTAMP(p)`, with `withLocalTimeZone` taking precedence
 #[test]
 fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
     let ts0 = serde_json::json!({"type": "timestamp", "fractionalSecondsPrecision": 0});
@@ -783,7 +766,6 @@ fn exasol_type_from_json_reads_timestamp_fractional_seconds_precision() {
     );
 }
 
-/// Scenario: `exasol_type_from_json` appends ` ASCII` for an ASCII `characterSet`
 #[test]
 fn exasol_type_from_json_propagates_ascii_character_set() {
     let ascii = serde_json::json!({"type": "VARCHAR", "size": 4, "characterSet": "ASCII"});
@@ -793,14 +775,12 @@ fn exasol_type_from_json_propagates_ascii_character_set() {
     assert_eq!(exasol_type_from_json(&no_charset), "VARCHAR(4)");
 }
 
-/// Scenario: A CHAR dataType renders as `CHAR(n)`, not `VARCHAR(n)` (#192)
 #[test]
 fn exasol_type_from_json_renders_char_type() {
     let ascii = serde_json::json!({"type": "CHAR", "size": 3, "characterSet": "ASCII"});
     assert_eq!(exasol_type_from_json(&ascii), "CHAR(3) ASCII");
 }
 
-/// Scenario: The CHAR arm appends ` ASCII` only for an ASCII `characterSet`
 #[test]
 fn exasol_type_from_json_propagates_char_ascii_character_set() {
     let utf8 = serde_json::json!({"type": "CHAR", "size": 20, "characterSet": "UTF8"});
@@ -810,21 +790,18 @@ fn exasol_type_from_json_propagates_char_ascii_character_set() {
     assert_eq!(exasol_type_from_json(&no_charset), "CHAR(20)");
 }
 
-/// Scenario: The CHAR arm caps `size` at Exasol's 2,000-character maximum
 #[test]
 fn exasol_type_from_json_caps_char_size_at_exasol_maximum() {
     let oversized = serde_json::json!({"type": "CHAR", "size": 9999});
     assert_eq!(exasol_type_from_json(&oversized), "CHAR(2000)");
 }
 
-/// Scenario: A CHAR dataType without `size` falls back to VARCHAR(2000000), not CHAR(2000)
 #[test]
 fn exasol_type_from_json_char_without_size_falls_back_to_unknown_width() {
     let no_size = serde_json::json!({"type": "CHAR"});
     assert_eq!(exasol_type_from_json(&no_size), "VARCHAR(2000000)");
 }
 
-/// Scenario: One classifier names the Exasol type-string families the pushdown guards branch on, including a bare `DECIMAL`
 #[test]
 fn classify_exa_type_matches_pushdown_guard_predicates() {
     assert_eq!(
@@ -842,7 +819,6 @@ fn classify_exa_type_matches_pushdown_guard_predicates() {
     assert_eq!(classify_exa_type("DOUBLE PRECISION"), ExaTypeClass::Other);
 }
 
-/// Scenario: Both an Iceberg-sourced and a Unity-sourced column map through the single `ColumnSourceType` match
 #[test]
 fn column_source_type_maps_to_exasol_in_one_home() {
     assert_eq!(
@@ -866,7 +842,6 @@ fn column_source_type_maps_to_exasol_in_one_home() {
     );
 }
 
-/// Scenario: A Parquet-sourced column's declared type and its Arrow tag never drift apart — both routes share the one parser.
 #[test]
 fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_type() {
     for (tag, expected) in [
@@ -900,7 +875,6 @@ fn parquet_column_source_type_reads_its_tag_in_lockstep_with_arrow_to_exasol_typ
     }
 }
 
-/// Scenario: An unparseable Arrow tag still resolves — falls through to the JSON VARCHAR fallback.
 #[test]
 fn parquet_column_source_type_with_an_unparseable_tag_resolves_to_varchar_json() {
     assert_eq!(
@@ -912,7 +886,6 @@ fn parquet_column_source_type_with_an_unparseable_tag_resolves_to_varchar_json()
     );
 }
 
-/// Scenario: Every admitted Arrow type round-trips through its tag; a tz-aware timestamp comes back labelled `"UTC"`
 #[test]
 fn every_admitted_arrow_type_round_trips_through_its_tag() {
     use arrow::datatypes::TimeUnit;
@@ -954,7 +927,6 @@ fn every_admitted_arrow_type_round_trips_through_its_tag() {
     }
 }
 
-/// Scenario: A refused Arrow type still renders/parses via the `"utf8"` fallback tag.
 #[test]
 fn refused_arrow_types_fall_back_to_the_utf8_tag() {
     for dt in [
@@ -968,7 +940,6 @@ fn refused_arrow_types_fall_back_to_the_utf8_tag() {
     }
 }
 
-/// Scenario: Unity Catalog Spark column types map to Exasol types
 #[test]
 fn unity_spark_types_map_to_exasol() {
     let cases = [
@@ -1001,7 +972,6 @@ fn unity_spark_types_map_to_exasol() {
     }
 }
 
-/// Scenario: An incompatible Unity Catalog column type and an out-of-range DECIMAL both fall back to VARCHAR
 #[test]
 fn incompatible_unity_types_declared_varchar() {
     let ts_precision = EngineTimestampSupport::MillisecondOnly;
@@ -1069,7 +1039,6 @@ fn incompatible_unity_types_declared_varchar() {
     );
 }
 
-/// Scenario: A catalog-declared DECIMAL outside Exasol's domain falls back to VARCHAR identically for both catalog kinds
 #[test]
 fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
     let cases = [
@@ -1116,7 +1085,6 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
     }
 }
 
-/// Scenario: The Iceberg primitive mappings are exhaustive matches, so a new `PrimitiveType` variant breaks the build
 #[test]
 fn iceberg_primitive_mappings_are_exhaustive_so_a_new_variant_breaks_the_build() {
     let every_variant = [
@@ -1195,7 +1163,6 @@ fn expected_mapping(pt: &PrimitiveType) -> (&'static str, DataType) {
     }
 }
 
-/// Scenario: The engine version picks the timestamp declaration for a microsecond source
 #[test]
 fn database_version_leading_component_selects_the_declared_timestamp_precision() {
     use EngineTimestampSupport::{DeclaredPrecision, MillisecondOnly};
@@ -1220,7 +1187,6 @@ fn database_version_leading_component_selects_the_declared_timestamp_precision()
     }
 }
 
-/// Scenario: An empty or unparseable version takes the 2025.x arm
 #[test]
 fn unreadable_database_version_declares_the_source_width_unclamped() {
     for version in ["", "v2025.2.1", "unknown", ".2.1", "8x.1.0", " "] {
@@ -1245,7 +1211,6 @@ fn unreadable_database_version_declares_the_source_width_unclamped() {
     }
 }
 
-/// Scenario: An Iceberg `timestamp` and a Delta `TIMESTAMP` are declared at the same resolved precision
 #[test]
 fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
     let cases = [
@@ -1287,7 +1252,6 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
     }
 }
 
-/// Scenario: Each Iceberg timestamp variant is declared at its own width, and all take bare `TIMESTAMP` when clamped
 #[test]
 fn every_iceberg_timestamp_variant_declares_its_own_source_width() {
     let cases = [
@@ -1310,7 +1274,6 @@ fn every_iceberg_timestamp_variant_declares_its_own_source_width() {
     }
 }
 
-/// Scenario: A declared precision resolves to the coarsest width not coarser than it, floored at millisecond
 #[test]
 fn declared_digits_resolve_to_the_arrow_unit_of_their_source_width() {
     let cases = [
@@ -1334,7 +1297,6 @@ fn declared_digits_resolve_to_the_arrow_unit_of_their_source_width() {
     }
 }
 
-/// Scenario: `exasol_type_to_arrow` takes no `TimestampPrecision`; the function-pointer binding is the assertion
 #[test]
 fn arrow_input_resolver_stays_outside_the_timestamp_version_gate() {
     let _ungated: fn(&DataType) -> String = arrow_to_exasol_type;
@@ -1352,7 +1314,6 @@ fn arrow_input_resolver_stays_outside_the_timestamp_version_gate() {
     );
 }
 
-/// Scenario: `TIMESTAMP(p)` renders as a timestamp dataType with `fractionalSecondsPrecision`; a malformed `p` falls through to VARCHAR
 #[test]
 fn exasol_type_to_json_renders_timestamp_fractional_seconds_precision() {
     assert_eq!(

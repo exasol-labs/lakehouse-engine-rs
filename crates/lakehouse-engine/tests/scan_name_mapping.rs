@@ -171,7 +171,6 @@ fn id_to_new_col(batches: &[RecordBatch]) -> HashMap<i64, Option<i64>> {
     out
 }
 
-/// Scenario: `name_mapping` resolves a renamed column that has no embedded field-id
 #[test]
 fn name_mapping_resolves_no_field_id_column() {
     let dir = std::env::temp_dir().join(format!("lh_name_mapping_{}", std::process::id()));
@@ -207,7 +206,6 @@ fn name_mapping_resolves_no_field_id_column() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: with an empty `name_mapping`, a column whose physical name matches binds by identity
 #[test]
 fn empty_name_mapping_preserves_physical_name_binding() {
     let dir = std::env::temp_dir().join(format!("lh_name_mapping_empty_{}", std::process::id()));

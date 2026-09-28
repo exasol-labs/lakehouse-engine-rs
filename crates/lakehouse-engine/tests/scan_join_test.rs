@@ -542,7 +542,6 @@ fn each_join_side_materializes_its_own_partition_columns() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: LIMIT bounds the JOINED output, never the scanned input.
 #[test]
 fn join_limit_bounds_joined_output_not_scanned_input() {
     let dir = std::env::temp_dir().join(format!("lh_join_limit_bound_{}", std::process::id()));
@@ -591,7 +590,6 @@ fn join_limit_bounds_joined_output_not_scanned_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: A post-join ordering and cap bound each join shard to its own top-N
 #[test]
 fn join_order_by_limit_emits_bounded_top_n_after_join() {
     let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n");
@@ -606,7 +604,6 @@ fn join_order_by_limit_emits_bounded_top_n_after_join() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: The post-join ordering and cap plan as one TopK above the join
 #[test]
 fn join_order_by_limit_plans_as_topk_above_join() {
     let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n_plan");
@@ -862,7 +859,6 @@ fn logical_field(field_id: i32, name: &str, arrow_type: &str) -> LogicalField {
     }
 }
 
-/// Scenario: A dimension-side read failure never surfaces the dimension side's credential.
 #[test]
 fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
     // The marker proves the refusal body reached the message, so the secret beside it would

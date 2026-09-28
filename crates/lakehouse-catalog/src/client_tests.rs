@@ -347,7 +347,6 @@ fn oauth_creds() -> ConnectionCreds {
     creds
 }
 
-/// Scenario: An empty identifier batch builds no session, proven against an unreachable catalog.
 #[tokio::test]
 async fn empty_namespace_builds_no_session_and_no_grant() {
     let client =
@@ -365,7 +364,6 @@ async fn empty_namespace_builds_no_session_and_no_grant() {
     assert!(listing.skipped.is_empty(), "an empty batch skips nothing");
 }
 
-/// Scenario: Listing an empty namespace costs only the enumeration's own OAuth grant.
 #[tokio::test]
 async fn list_tables_over_empty_namespace_lists_nothing() {
     let (uri, log) = spawn_mock_catalog(&["sales"], &[], &[], &[]).await;
@@ -385,7 +383,6 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
     );
 }
 
-/// Scenario: Listing three tables costs two OAuth grants, one for enumeration and one for the load batch.
 #[tokio::test]
 async fn enumeration_builds_exactly_one_session() {
     let (uri, log) =
@@ -415,7 +412,6 @@ async fn enumeration_builds_exactly_one_session() {
     );
 }
 
-/// Scenario: The Iceberg REST client tags every table Iceberg with no vending key.
 #[tokio::test]
 async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
     let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders", "customers"], &[], &[]).await;
@@ -448,7 +444,6 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
     }
 }
 
-/// Scenario: A table answering HTTP 404 on load is reported skipped without aborting the batch.
 #[tokio::test]
 async fn unloadable_table_is_reported_skipped_not_failed() {
     let (uri, _log) =
@@ -482,7 +477,6 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
     );
 }
 
-/// Scenario: A non-404 `loadTable` failure aborts the whole enumeration.
 #[tokio::test]
 async fn non_404_load_failure_aborts_the_batch() {
     let (uri, _log) =

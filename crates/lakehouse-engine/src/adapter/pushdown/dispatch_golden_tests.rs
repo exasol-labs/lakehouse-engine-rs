@@ -354,7 +354,6 @@ fn empty_sql(request: &Json, proj_cols: &[ProjectionItem], proj_types: &[String]
         .to_string()
 }
 
-/// Scenario: grouped-aggregate dispatch SQL matches its golden
 #[test]
 fn grouped_aggregate_matches_golden() {
     let actual = dispatch_sql(
@@ -368,7 +367,6 @@ fn grouped_aggregate_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: group-by fallback dispatch SQL matches its golden
 #[test]
 fn group_by_fallback_matches_golden() {
     let actual = dispatch_sql(
@@ -382,7 +380,6 @@ fn group_by_fallback_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: lone COUNT(DISTINCT) dispatch SQL matches its golden
 #[test]
 fn lone_count_distinct_matches_golden() {
     let actual = dispatch_sql(
@@ -396,7 +393,6 @@ fn lone_count_distinct_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: multi/mixed COUNT(DISTINCT) decline dispatch SQL matches its golden
 #[test]
 fn multi_count_distinct_decline_matches_golden() {
     let actual = dispatch_sql(
@@ -410,7 +406,6 @@ fn multi_count_distinct_decline_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: single-group row-scan dispatch SQL matches its golden
 #[test]
 fn single_group_row_scan_matches_golden() {
     let (proj_cols, proj_types) = row_scan_projection();
@@ -425,7 +420,6 @@ fn single_group_row_scan_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: a declined nested aggregate widens to the qualified wrapper (#194)
 #[test]
 fn nested_aggregate_decline_matches_qualified_wrapper_golden() {
     let actual = dispatch_sql_widened(&nested_aggregate_decline_request());
@@ -433,7 +427,6 @@ fn nested_aggregate_decline_matches_qualified_wrapper_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: a lone scalar-over-aggregate item matches its golden
 #[test]
 fn single_group_scalar_over_aggregate_matches_golden() {
     let actual = dispatch_sql(
@@ -447,7 +440,6 @@ fn single_group_scalar_over_aggregate_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: a nested COUNT(*) dedups against the bare COUNT(*) partial column
 #[test]
 fn single_group_scalar_over_aggregate_dedup_matches_golden() {
     let actual = dispatch_sql(
@@ -462,7 +454,6 @@ fn single_group_scalar_over_aggregate_dedup_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: interleaved scalar-over-aggregate items keep selectList order and own casts
 #[test]
 fn single_group_scalar_over_aggregate_interleaved_matches_golden() {
     let actual = dispatch_sql(
@@ -477,7 +468,6 @@ fn single_group_scalar_over_aggregate_interleaved_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: a scalar-wrapped statistical aggregate matches its golden
 #[test]
 fn single_group_scalar_over_variance_matches_golden() {
     let actual = dispatch_sql(
@@ -491,7 +481,6 @@ fn single_group_scalar_over_variance_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: empty grouped result SQL matches its golden
 #[test]
 fn empty_grouped_matches_golden() {
     let actual = empty_sql(&grouped_request(), &[], &[]);
@@ -499,7 +488,6 @@ fn empty_grouped_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: empty GroupByWrapper result SQL matches its golden
 #[test]
 fn empty_group_by_wrapper_matches_golden() {
     let actual = empty_sql(&group_by_fallback_request(), &[], &[]);
@@ -507,7 +495,6 @@ fn empty_group_by_wrapper_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: an empty unmergeable HAVING routes to GroupByWrapper (#195)
 #[test]
 fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
     let request = unmergeable_having_request();
@@ -524,7 +511,6 @@ fn empty_unmergeable_having_matches_group_by_wrapper_golden() {
     );
 }
 
-/// Scenario: empty single-group aggregate result SQL matches its golden
 #[test]
 fn empty_single_group_agg_matches_golden() {
     let actual = empty_sql(&single_group_agg_request(), &[], &[]);
@@ -532,7 +518,6 @@ fn empty_single_group_agg_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: empty row-scan result SQL matches its golden
 #[test]
 fn empty_row_scan_matches_golden() {
     let (proj_cols, proj_types) = row_scan_projection();
@@ -541,7 +526,6 @@ fn empty_row_scan_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: an empty scalar-over-aggregate row casts NULL to the item's declared type
 #[test]
 fn empty_single_group_scalar_over_aggregate_matches_golden() {
     let actual = empty_sql(&single_group_scalar_over_aggregate_request(), &[], &[]);
@@ -572,7 +556,6 @@ fn aliased_grouped_request() -> Json {
     }))
 }
 
-/// Scenario: an aliased single-table GROUP BY renders bare column names (#193)
 #[test]
 fn aliased_single_table_group_by_renders_bare_group_key_and_select_expr() {
     let request = aliased_grouped_request();
@@ -634,7 +617,6 @@ fn aliased_multi_count_distinct_decline_request() -> Json {
     }))
 }
 
-/// Scenario: the multi-COUNT(DISTINCT) fallback qualifies every column as LHS_T0 regardless of alias
 #[test]
 fn aliased_multi_count_distinct_fallback_qualifies_lhs_t0_regardless_of_alias_presence() {
     let request = aliased_multi_count_distinct_decline_request();
@@ -764,7 +746,6 @@ fn dispatch_sql_with_col_types(request: &Json, col_types: Vec<(String, String)>)
     )
 }
 
-/// Scenario: single-group all-agg-kinds dispatch SQL matches its golden
 #[test]
 fn single_group_all_agg_kinds_matches_golden() {
     let actual = dispatch_sql_with_col_types(
@@ -775,7 +756,6 @@ fn single_group_all_agg_kinds_matches_golden() {
     assert_eq!(actual, expected);
 }
 
-/// Scenario: grouped all-agg-kinds dispatch SQL matches its golden
 #[test]
 fn grouped_all_agg_kinds_matches_golden() {
     let actual =
@@ -898,7 +878,6 @@ fn join_scan_tuning() -> JoinScanRequestConfig<'static> {
     }
 }
 
-/// Scenario: a filterless request emits unchanged SQL at the single-table, broadcast, and N-scan sites
 #[test]
 fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     let (proj_cols, proj_types) = row_scan_projection();
@@ -951,7 +930,6 @@ fn filterless_request_emits_unchanged_sql_at_all_three_sites() {
     );
 }
 
-/// Scenario: a rendering filter emits unchanged, wrapper-free SQL at all three sites
 #[test]
 fn rendering_filter_emits_unchanged_wrapper_free_scan() {
     let (proj_cols, proj_types) = row_scan_projection();

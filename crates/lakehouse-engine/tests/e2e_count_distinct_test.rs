@@ -141,7 +141,6 @@ fn assert_count_distinct_fan_out_pushed_down(conn: &mut ExaConn, query_sql: &str
     );
 }
 
-/// Scenario: COUNT(DISTINCT) dedups across shards, excludes NULLs, and returns 0 for empty and all-NULL sets
 #[test]
 fn count_distinct_dedups_across_shards_excludes_nulls_empty() {
     setup_e2e();
@@ -185,7 +184,6 @@ fn count_distinct_dedups_across_shards_excludes_nulls_empty() {
     );
 }
 
-/// Scenario: a high-cardinality single-shard COUNT(DISTINCT) completes with the exact count (#146)
 #[test]
 fn high_cardinality_count_distinct_completes() {
     setup_e2e();
@@ -207,7 +205,6 @@ fn high_cardinality_count_distinct_completes() {
     );
 }
 
-/// Scenario: the harness reads a handle-backed result set to completion, not just its first fetch
 #[test]
 fn harness_reads_high_cardinality_result_set_to_completion() {
     // At the default 64 MiB budget the whole scan fits in one response, so a
@@ -240,7 +237,6 @@ fn harness_reads_high_cardinality_result_set_to_completion() {
     );
 }
 
-/// Scenario: the Q9b multi-COUNT(DISTINCT) shape routes to the qualified wrapper and matches single-node results
 #[test]
 fn q9b_multi_count_distinct_matches_single_node() {
     setup_e2e();
@@ -288,7 +284,6 @@ fn q9b_multi_count_distinct_matches_single_node() {
     );
 }
 
-/// Scenario: a lone COUNT(DISTINCT <string expression>) routes to the qualified wrapper and matches single-node results
 #[test]
 fn count_distinct_string_expression_argument_matches_single_node() {
     setup_e2e();
@@ -321,7 +316,6 @@ fn count_distinct_string_expression_argument_matches_single_node() {
     );
 }
 
-/// Scenario: an expression-argument COUNT(DISTINCT) combined with other aggregates matches single-node results in the wrapper
 #[test]
 fn count_distinct_expression_arg_combined_matches_single_node() {
     setup_e2e();
@@ -370,7 +364,6 @@ fn count_distinct_expression_arg_combined_matches_single_node() {
     );
 }
 
-/// Scenario: bare-column COUNT(DISTINCT) matches single-node results for every scan-reachable Exasol type
 #[test]
 fn count_distinct_bare_column_type_matrix_matches_single_node() {
     // CHAR is absent: no Iceberg type maps to Exasol CHAR, so a bare CHAR column is
@@ -400,7 +393,6 @@ fn count_distinct_bare_column_type_matrix_matches_single_node() {
     }
 }
 
-/// Scenario: expression-argument COUNT(DISTINCT) via the wrapper dedups natively without string-cast collisions
 #[test]
 fn count_distinct_expression_arg_via_wrapper_matches_single_node() {
     setup_e2e();
@@ -470,7 +462,6 @@ fn count_distinct_expression_arg_via_wrapper_matches_single_node() {
     );
 }
 
-/// Scenario: an expression-argument COUNT(DISTINCT) over empty, all-NULL, and all-pruned inputs returns a single 0
 #[test]
 fn count_distinct_expression_arg_empty_returns_zero() {
     setup_e2e();
@@ -509,7 +500,6 @@ fn count_distinct_expression_arg_empty_returns_zero() {
     }
 }
 
-/// Scenario: COUNT(DISTINCT) over an all-files-pruned predicate returns a single 0 row (#57)
 #[test]
 fn count_distinct_all_files_pruned_returns_zero() {
     setup_e2e();
@@ -529,7 +519,6 @@ fn count_distinct_all_files_pruned_returns_zero() {
     );
 }
 
-/// Scenario: SUM over an all-files-pruned predicate returns a single NULL row (#57)
 #[test]
 fn sum_all_files_pruned_returns_null() {
     setup_e2e();
@@ -546,7 +535,6 @@ fn sum_all_files_pruned_returns_null() {
     );
 }
 
-/// Scenario: a grouped aggregate over an all-files-pruned predicate returns zero rows (#57)
 #[test]
 fn grouped_aggregate_all_files_pruned_returns_no_rows() {
     setup_e2e();
@@ -566,7 +554,6 @@ fn grouped_aggregate_all_files_pruned_returns_no_rows() {
 
 const GROUND_TRUTH_DISTINCT_TABLE: &str = "GT_DISTINCT_PROBE";
 
-/// Scenario: a scalar-wrapped COUNT(DISTINCT) routes to the wrapper and matches the native oracle
 #[test]
 fn e2e_scalar_wrapped_count_distinct_routes_to_wrapper_and_matches_native_oracle() {
     setup_e2e();

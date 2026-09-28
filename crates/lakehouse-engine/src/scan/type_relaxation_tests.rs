@@ -77,7 +77,6 @@ fn arrow_castability_pins_every_supported_relaxation_pair() {
     }
 }
 
-/// Scenario: long -> double is absent from the supported relaxation set.
 #[test]
 fn long_to_double_is_absent_from_the_supported_relaxation_set() {
     assert!(
@@ -263,7 +262,6 @@ fn parquet_column_types(path: &Path) -> Vec<DataType> {
         .collect()
 }
 
-/// Scenario: a physical type outside identity and the supported set is refused before any cast.
 #[tokio::test]
 async fn a_physical_type_outside_identity_and_the_supported_set_is_refused_before_any_cast() {
     let dir = std::env::temp_dir().join(format!("lh_type_refusal_{}", std::process::id()));
@@ -311,7 +309,6 @@ async fn a_physical_type_outside_identity_and_the_supported_set_is_refused_befor
     }
 }
 
-/// Scenario: every supported relaxation pair reads its real values from a narrow Parquet file.
 #[tokio::test]
 async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_parquet_file() {
     let cases = supported_relaxation_reads();

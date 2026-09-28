@@ -140,7 +140,6 @@ fn lineitem_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
-/// Scenario: Sort flags parse off an expression `orderBy` element, which still yields no `SortKey`.
 #[test]
 fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
     let expression_element = serde_json::json!({
@@ -180,7 +179,6 @@ fn parse_sort_flags_reads_direction_and_nulls_without_column_gate() {
     }
 }
 
-/// Scenario: A matched top-N sorts and limits both the outer merge and every shard's common blob.
 #[test]
 fn ordered_topn_emits_per_shard_and_outer_order_by() {
     let request = nq4_request();
@@ -207,7 +205,6 @@ fn ordered_topn_emits_per_shard_and_outer_order_by() {
     );
 }
 
-/// Scenario: A non-zero offset renders only on the wrapper, since a per-shard OFFSET does not compose (#191).
 #[test]
 fn nonzero_offset_declines_bounded_topn() {
     let mut request = nq4_request();
@@ -249,7 +246,6 @@ fn nonzero_offset_declines_bounded_topn() {
     );
 }
 
-/// Scenario: `offset: 0` matches the bounded top-N exactly like an absent `offset`.
 #[test]
 fn zero_offset_still_matches_bounded_topn_byte_identically() {
     let baseline = nq4_request();
@@ -295,7 +291,6 @@ fn zero_offset_still_matches_bounded_topn_byte_identically() {
     );
 }
 
-/// Scenario: An unprojected sort key is hidden in the scan and sorted only by the wrapper (#225, #189).
 #[test]
 fn order_by_present_without_topn_match_withholds_per_shard_limit() {
     let request = serde_json::json!({
@@ -418,7 +413,6 @@ fn abs_of(column: &str) -> Json {
     ]})
 }
 
-/// Scenario: A declined expression sort key renders in the Exasol dialect on the wrapper (#198, #209).
 #[test]
 fn declined_order_by_expression_appends_referenced_columns_as_hidden() {
     let request = lineitem_order_by_request(
@@ -459,7 +453,6 @@ fn declined_order_by_expression_appends_referenced_columns_as_hidden() {
     );
 }
 
-/// Scenario: Two expression sort keys render in order and append each referenced column at most once.
 #[test]
 fn declined_order_by_two_expression_keys_renders_both_and_leaks_none() {
     let sum_expr = serde_json::json!({"type": "function_scalar", "name": "ADD", "arguments": [
@@ -501,7 +494,6 @@ fn declined_order_by_two_expression_keys_renders_both_and_leaks_none() {
     );
 }
 
-/// Scenario: An expression sort key over a projected column still declines the top-N (#198).
 #[test]
 fn expression_sort_key_declines_bounded_topn_and_takes_declined_path() {
     let request = lineitem_order_by_request(
@@ -549,7 +541,6 @@ fn expression_sort_key_declines_bounded_topn_and_takes_declined_path() {
     );
 }
 
-/// Scenario: Every non-NQ4 ordered shape declines the top-N.
 #[test]
 fn unsupported_order_by_shape_declines_topn() {
     let projected = vec![
@@ -634,7 +625,6 @@ fn unsupported_order_by_shape_declines_topn() {
     );
 }
 
-/// Scenario: A JSON-fallback sort key declines, since shards sort native values but Exasol merges strings.
 #[test]
 fn json_fallback_typed_sort_key_declines_topn() {
     let projected = vec![
@@ -701,7 +691,6 @@ fn json_fallback_typed_sort_key_declines_topn() {
     );
 }
 
-/// Scenario: An ORDER BY without LIMIT declines the top-N and is sorted by the wrapper.
 #[test]
 fn unbounded_order_by_falls_back_correctness_safe() {
     let mut request = nq4_request();
@@ -726,7 +715,6 @@ fn unbounded_order_by_falls_back_correctness_safe() {
     );
 }
 
-/// Scenario: A declined projected-key ORDER BY without LIMIT keeps the common blob clean.
 #[test]
 fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
     let request = serde_json::json!({
@@ -776,7 +764,6 @@ fn row_scan_decline_order_by_no_limit_wraps_outer_order_by() {
     );
 }
 
-/// Scenario: An ordered single-group aggregate applies `LIMIT 0` on the merge, never per shard (#198).
 #[test]
 fn aggregate_merge_renders_request_limit_zero_through_plan_composition() {
     let request = serde_json::json!({

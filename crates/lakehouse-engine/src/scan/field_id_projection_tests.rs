@@ -104,7 +104,6 @@ fn bound_physical_index(expr: &Arc<dyn PhysicalExpr>) -> Option<usize> {
         })
 }
 
-/// Scenario: a renamed column binds to the physical column by field-id, not by name.
 #[test]
 fn resolves_renamed_column_by_field_id() {
     let logical = Arc::new(Schema::new(vec![
@@ -125,7 +124,6 @@ fn resolves_renamed_column_by_field_id() {
     assert_eq!(col.index(), 1, "must bind to physical field-id-2 slot");
 }
 
-/// Scenario: a type divergence under one field-id is wrapped in a cast.
 #[test]
 fn casts_on_type_divergence_by_field_id() {
     let logical = Arc::new(Schema::new(vec![field_with_id(
@@ -152,7 +150,6 @@ fn casts_on_type_divergence_by_field_id() {
     assert_eq!(inner.index(), 0, "cast must wrap the field-id-5 slot");
 }
 
-/// Scenario: a dropped physical column is unreferenced while kept columns still bind.
 #[test]
 fn ignores_dropped_physical_column() {
     let logical = Arc::new(Schema::new(vec![field_with_id(
@@ -173,7 +170,6 @@ fn ignores_dropped_physical_column() {
     assert_eq!(col.index(), 0);
 }
 
-/// Scenario: the logical Arrow schema carries field-ids, reconstructed types, and declared nullability.
 #[test]
 fn builds_logical_arrow_schema_with_field_ids() {
     use super::{build_logical_arrow_schema, field_id_of};
@@ -270,7 +266,6 @@ fn identity_bound_logical_field_carries_no_parquet_field_id_metadata() {
     }
 }
 
-/// Scenario: a physical field without an embedded id binds via a matching name-mapping entry.
 #[test]
 fn name_mapping_resolves_no_field_id_column() {
     let logical = Schema::new(vec![
@@ -301,7 +296,6 @@ fn name_mapping_resolves_no_field_id_column() {
     );
 }
 
-/// Scenario: an embedded field-id wins over a conflicting name-mapping entry.
 #[test]
 fn embedded_field_id_wins_over_name_mapping() {
     let logical = Schema::new(vec![
@@ -323,7 +317,6 @@ fn embedded_field_id_wins_over_name_mapping() {
     );
 }
 
-/// Scenario: without name-mapping the physical name is kept, and a matching one counts as bound.
 #[test]
 fn no_name_mapping_falls_back_to_physical_name() {
     let logical = Schema::new(vec![
@@ -349,7 +342,6 @@ fn no_name_mapping_falls_back_to_physical_name() {
     );
 }
 
-/// Scenario: name-mapping entries not covering a field leave its physical name unchanged.
 #[test]
 fn uncovered_name_mapping_falls_back_to_physical_name() {
     let logical = Schema::new(vec![
@@ -375,7 +367,6 @@ fn uncovered_name_mapping_falls_back_to_physical_name() {
     );
 }
 
-/// Scenario: an embedded field-id absent from the logical schema does not fall through to name-mapping.
 #[test]
 fn embedded_field_id_absent_from_logical_schema_skips_name_mapping() {
     let logical = Schema::new(vec![
@@ -428,7 +419,6 @@ fn declared_physical_name_wins_over_a_covering_name_mapping_entry() {
     );
 }
 
-/// Scenario: a declared physical name claims a field whose embedded id no logical field declares.
 #[test]
 fn declared_physical_name_claims_a_field_whose_embedded_id_is_unknown() {
     let logical = Schema::new(vec![field_no_id("amount", DataType::Int64, true)]);
@@ -448,7 +438,6 @@ fn declared_physical_name_claims_a_field_whose_embedded_id_is_unknown() {
     assert!(binding.bound_logical_names.contains("amount"));
 }
 
-/// Scenario: an identity-bound field binds when present and stays unbound when absent.
 #[test]
 fn identity_bound_fields_bind_by_their_own_name() {
     let logical = Schema::new(vec![
@@ -475,7 +464,6 @@ fn identity_bound_fields_bind_by_their_own_name() {
     );
 }
 
-/// Scenario: field-id resolution falls back to physical name when a file field carries no field-id.
 #[test]
 fn field_id_adapter_falls_back_to_name_without_field_id() {
     let logical = Arc::new(Schema::new(vec![
@@ -504,7 +492,6 @@ fn field_id_adapter_falls_back_to_name_without_field_id() {
     );
 }
 
-/// Scenario: added nullable column absent from an older file is NULL-filled.
 #[test]
 fn field_id_adapter_null_fills_added_nullable_column() {
     let logical = Arc::new(Schema::new(vec![
@@ -525,7 +512,6 @@ fn field_id_adapter_null_fills_added_nullable_column() {
     assert_eq!(*lit.value(), ScalarValue::Utf8(None));
 }
 
-/// Scenario: added required column missing from an older file errors cleanly.
 #[test]
 fn field_id_adapter_errors_on_missing_required_column() {
     let logical = Arc::new(Schema::new(vec![
@@ -548,7 +534,6 @@ fn field_id_adapter_errors_on_missing_required_column() {
     );
 }
 
-/// Scenario: an absent field with an `initial-default` emits it, whether required or nullable.
 #[test]
 fn absent_field_with_initial_default_emits_default_literal() {
     let logical = Arc::new(Schema::new(vec![
@@ -595,7 +580,6 @@ fn absent_field_with_initial_default_emits_default_literal() {
     );
 }
 
-/// Scenario: an absent nullable field without its own default NULL-fills, ignoring unrelated defaults.
 #[test]
 fn absent_nullable_without_default_is_null_filled() {
     let logical = Arc::new(Schema::new(vec![
@@ -625,7 +609,6 @@ fn absent_nullable_without_default_is_null_filled() {
     );
 }
 
-/// Scenario: an absent required field without a default errors naming the column.
 #[test]
 fn absent_required_without_default_errors_cleanly() {
     let logical = Arc::new(Schema::new(vec![
@@ -652,7 +635,6 @@ fn absent_required_without_default_errors_cleanly() {
     );
 }
 
-/// Scenario: a present field is never defaulted, via any of the four claiming paths.
 #[test]
 fn present_field_binds_real_value_not_default() {
     let logical = Arc::new(Schema::new(vec![
@@ -744,7 +726,6 @@ fn present_field_binds_real_value_not_default() {
     );
 }
 
-/// Scenario: one factory binds a real value for a file with the field and the default for one without.
 #[test]
 fn default_fill_decision_is_per_file() {
     let logical = Arc::new(Schema::new(vec![
@@ -902,7 +883,6 @@ async fn field_id_adapter_reads_renamed_column_rows() {
     );
 }
 
-/// Scenario: one shard over pre- and post-rename files binds each file's field-id-2 column.
 #[tokio::test]
 async fn field_id_adapter_reads_divergent_layouts_across_files() {
     use super::super::raw_scan::{build_scan_sql, register_files};
@@ -1025,7 +1005,6 @@ async fn field_id_adapter_reads_divergent_layouts_across_files() {
     );
 }
 
-/// Scenario: every primitive `initial-default` survives the scan-spec round-trip; a struct default encodes none.
 #[test]
 fn initial_default_round_trips_across_full_type_vocabulary() {
     use crate::scan::spec::LogicalField;
@@ -1176,7 +1155,6 @@ fn struct_member_names(data_type: &DataType) -> Vec<&str> {
     }
 }
 
-/// Scenario: nested members resolve onto the logical tree by the top-level binding order.
 #[test]
 fn nested_fields_resolve_to_logical_names_across_binding_keys() {
     use crate::scan::render_nested_column_as_json;
@@ -1333,7 +1311,6 @@ fn nested_fields_resolve_to_logical_names_across_binding_keys() {
     assert_eq!(rendered("attrs", &attrs_physical), r#"{"a":{"amount":5}}"#);
 }
 
-/// Scenario: a nested column absent from the file NULL-fills through the delegate's absent-column path.
 #[test]
 fn nested_column_absent_from_a_file_null_fills_as_the_logical_utf8() {
     use crate::scan::spec::NestedMembers;
@@ -1368,7 +1345,6 @@ fn nested_column_absent_from_a_file_null_fills_as_the_logical_utf8() {
     );
 }
 
-/// Scenario: a nested column reaches `Utf8` by JSON rendering, never by a cast.
 #[test]
 fn nested_physical_column_bypasses_the_cast_and_yields_utf8() {
     use crate::scan::spec::NestedMembers;
@@ -1476,7 +1452,6 @@ fn nested_physical_column_bypasses_the_cast_and_yields_utf8() {
     );
 }
 
-/// Scenario: a nested column declaring no member tree is left to the delegate, which fails loudly.
 #[test]
 fn a_nested_physical_column_with_no_descriptor_fails_the_cast_rather_than_rendering() {
     use arrow::array::{ArrayRef, StringArray, StructArray};
@@ -1507,7 +1482,6 @@ fn a_nested_physical_column_with_no_descriptor_fails_the_cast_rather_than_render
     );
 }
 
-/// Scenario: a diverted column always comes with withheld Parquet row-filter pushdown.
 #[test]
 fn a_binding_that_diverts_a_column_always_withholds_row_filter_pushdown() {
     use crate::scan::raw_scan::scan_table_parquet_format;
@@ -1557,7 +1531,6 @@ fn a_binding_that_diverts_a_column_always_withholds_row_filter_pushdown() {
     );
 }
 
-/// Scenario: files with different column sets bind by name only, never by ordinal field-id.
 #[test]
 fn identity_binding_spans_files_with_different_column_sets() {
     let logical = Schema::new(vec![

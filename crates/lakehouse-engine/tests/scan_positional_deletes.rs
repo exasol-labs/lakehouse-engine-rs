@@ -254,7 +254,6 @@ fn temp_dir(tag: &str) -> std::path::PathBuf {
     dir
 }
 
-/// Scenario: a file-granularity positional-delete file removes exactly its flagged positions
 #[test]
 fn scan_applies_file_granularity_positional_deletes() {
     let dir = temp_dir("file_gran");
@@ -282,7 +281,6 @@ fn scan_applies_file_granularity_positional_deletes() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a partition-granularity delete file applies to each data file only by `file_path`
 #[test]
 fn scan_filters_partition_delete_by_file_path() {
     let dir = temp_dir("partition_gran");
@@ -320,7 +318,6 @@ fn scan_filters_partition_delete_by_file_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: multiple positional-delete files on one data file are unioned
 #[test]
 fn scan_unions_multiple_delete_files() {
     let dir = temp_dir("union");
@@ -358,7 +355,6 @@ fn scan_unions_multiple_delete_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a delete file flagging every row yields zero rows for that file
 #[test]
 fn scan_fully_deleted_file_yields_no_rows() {
     let dir = temp_dir("fully_deleted");
@@ -392,7 +388,6 @@ fn scan_fully_deleted_file_yields_no_rows() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: positional deletes compose with filter pushdown + row-group pruning and with LIMIT
 #[test]
 fn scan_deletes_compose_with_pushdown_and_pruning() {
     let dir = temp_dir("compose");
@@ -428,7 +423,6 @@ fn scan_deletes_compose_with_pushdown_and_pruning() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: an equality delete is rejected with a mechanism-naming error before the file is opened
 #[test]
 fn scan_rejects_unapplicable_delete_file() {
     let dir = temp_dir("unapplicable");
@@ -461,7 +455,6 @@ fn scan_rejects_unapplicable_delete_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a Puffin deletion vector is rejected with a mechanism-naming error before opening
 #[test]
 fn scan_rejects_puffin_deletion_vector() {
     let dir = temp_dir("puffin_dv");
@@ -494,7 +487,6 @@ fn scan_rejects_puffin_deletion_vector() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a negative positional-delete `pos` is rejected rather than wrapping to a huge index
 #[test]
 fn scan_rejects_negative_positional_delete() {
     let dir = temp_dir("neg_pos");
@@ -524,7 +516,6 @@ fn scan_rejects_negative_positional_delete() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a spec whose files span more than one object-store root is rejected at registration
 #[test]
 fn scan_rejects_mixed_object_store_roots() {
     let dir = temp_dir("mixed_roots");
@@ -548,7 +539,6 @@ fn scan_rejects_mixed_object_store_roots() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a data file with no delete files scans unchanged
 #[test]
 fn scan_delete_free_file_unchanged() {
     let dir = temp_dir("delete_free");
@@ -686,7 +676,6 @@ impl ObjectStore for TrackingStore {
     }
 }
 
-/// Scenario: delete files are read through the same registered (credentialed) store as data files
 #[test]
 fn scan_reads_delete_files_with_vended_credentials() {
     let dir = temp_dir("vended_creds");
@@ -769,7 +758,6 @@ fn run_scan_tracked(
     (rows, gets)
 }
 
-/// Scenario: a delete file shared by two data files is read once per shard
 #[test]
 fn scan_reads_shared_delete_file_once_per_shard() {
     // One Parquet open issues several range GETs, so this compares against a one-referencer
@@ -854,7 +842,6 @@ fn tracking_store_with_probe(needles: Vec<String>) -> (Arc<TrackingStore>, Arc<A
     (store, peak)
 }
 
-/// Scenario: concurrent delete-file reads peak at exactly the connection budget
 #[test]
 fn scan_delete_reads_bounded_by_connection_budget() {
     const BUDGET: usize = 3;
@@ -900,7 +887,6 @@ fn scan_delete_reads_bounded_by_connection_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a connection budget of 1 serializes delete-file reads
 #[test]
 fn scan_delete_reads_serial_when_budget_is_one() {
     const UNIQUE_DELETES: usize = 4;
@@ -979,7 +965,6 @@ fn write_keyed_parquet(
         .to_string()
 }
 
-/// Scenario: both join sides' delete-file reads share one connection budget
 #[test]
 fn scan_delete_reads_bounded_across_join_sides() {
     // N=3 with 2 delete files per side: a per-side semaphore would peak at 4. Delete positions
@@ -1247,7 +1232,6 @@ fn one_row_group_per_file_entries(files: [&str; 3], rows_per_file: usize) -> Vec
     entries
 }
 
-/// Scenario: delete-file row groups for unassigned data files are pruned by `file_path` stats
 #[test]
 fn scan_prunes_delete_row_groups_by_file_path() {
     // Large enough that row-group data dwarfs the footer bytes the counter also captures.
@@ -1345,7 +1329,6 @@ fn scan_prunes_delete_row_groups_by_file_path() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: truncated `file_path` statistics never prune the assigned file's own row group
 #[test]
 fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     const ROWS_PER_FILE: usize = 20;
@@ -1407,7 +1390,6 @@ fn scan_prunes_delete_row_groups_with_truncated_statistics() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: delete-file row groups without `file_path` statistics are all decoded, never pruned
 #[test]
 fn scan_decodes_all_row_groups_when_file_path_statistics_absent() {
     const ROWS_PER_FILE: usize = 100;
@@ -1486,7 +1468,6 @@ fn leaf_file_scan_config(
     file_scan_config.clone()
 }
 
-/// Scenario: concurrent footer fetches peak at exactly the connection budget
 #[test]
 fn scan_footer_fetches_bounded_by_connection_budget() {
     // The plan is built but never executed: execute-time reads of the needled data files hold no
@@ -1571,7 +1552,6 @@ fn scan_footer_fetches_bounded_by_connection_budget() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a mixed shard fetches footers only for delete-carrying files, once each
 #[test]
 fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
     // The plan is never executed so execute-time reads do not contaminate the counts.
@@ -1680,7 +1660,6 @@ fn scan_mixed_shard_fetches_footers_only_for_delete_carrying_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: both join sides' footer fetches share one connection budget
 #[test]
 fn scan_footer_fetches_bounded_across_join_sides() {
     // N=3 with 2 files per side: a per-side semaphore would peak at 4, sequential planning at 2.

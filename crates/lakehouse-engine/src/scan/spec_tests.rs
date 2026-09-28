@@ -1,6 +1,5 @@
 use super::*;
 
-/// Scenario: a `://`-bearing entry is absolute and passes through unchanged.
 #[test]
 fn reconstruct_absolute_entry_passes_through() {
     assert_eq!(
@@ -16,7 +15,6 @@ fn reconstruct_absolute_entry_passes_through() {
     );
 }
 
-/// Scenario: a relative entry joins onto the root with exactly one separator.
 #[test]
 fn reconstruct_relative_entry_normalizes_single_separator() {
     let expected = "s3://bucket/db/table/data/f.parquet";
@@ -69,7 +67,6 @@ fn s3_props(storage: &ScanStorage) -> &StorageProps {
     props
 }
 
-/// Scenario: `CommonScanSpec::default()` matches serde's field-absent defaults except `s3_max_connections`.
 #[test]
 fn default_matches_serde_absent_except_s3_max_connections() {
     let minimal = r#"{"projection":[],"storage":{"inline":{"s3":{"endpoint":"","region":"","access_key":"","secret_key":""}}}}"#;
@@ -92,7 +89,6 @@ fn default_matches_serde_absent_except_s3_max_connections() {
     assert_eq!(from_absent.s3_max_connections, DEFAULT_S3_MAX_CONNECTIONS);
 }
 
-/// Scenario: a scan spec round-trips through the `Value::String` boundary with credentials intact.
 #[test]
 fn scan_spec_round_trips_through_value_boundary() {
     let spec = sample_spec();
@@ -153,7 +149,6 @@ fn optional_fields_omitted_when_none() {
     );
 }
 
-/// Scenario: the common blob carries no EMITS-type key, and a legacy blob declaring one is inert (#399).
 #[test]
 fn common_blob_carries_no_emit_type_key() {
     let row_spec = sample_spec();
@@ -184,7 +179,6 @@ fn common_blob_carries_no_emit_type_key() {
     );
 }
 
-/// Scenario: an aggregate plan round-trips through JSON and is absent from row-scan specs.
 #[test]
 fn aggregate_plan_round_trips_and_absent_from_row_scan() {
     let row_spec = sample_spec();
@@ -250,7 +244,6 @@ fn aggregate_plan_round_trips_and_absent_from_row_scan() {
     assert_eq!(plans[5].column.as_deref(), Some("AMOUNT"));
 }
 
-/// Scenario: `AggregatePlan.arg_expr` round-trips and is omitted from JSON when `None`.
 #[test]
 fn arg_expr_round_trips_and_omitted_when_none() {
     let mut agg_spec = sample_spec();
@@ -315,7 +308,6 @@ fn arg_expr_round_trips_and_omitted_when_none() {
     );
 }
 
-/// Scenario: every `AggKind`'s partial column set matches literal expected arity and order.
 #[test]
 fn partial_columns_arity_per_agg_kind() {
     assert_eq!(AggKind::Count.partial_columns().len(), 1);
@@ -364,7 +356,6 @@ fn partial_columns_arity_per_agg_kind() {
     }
 }
 
-/// Scenario: `is_counter()` holds for exactly the four counter columns.
 #[test]
 fn is_counter_marks_the_four_count_columns() {
     for col in [
@@ -387,7 +378,6 @@ fn is_counter_marks_the_four_count_columns() {
     }
 }
 
-/// Scenario: `partial_column_name` renders `PARTIAL_<role>_<ordinal>` for all ten partial columns.
 #[test]
 fn partial_column_name_renders_role_and_ordinal() {
     assert_eq!(
@@ -432,7 +422,6 @@ fn partial_column_name_renders_role_and_ordinal() {
     );
 }
 
-/// Scenario: `SortKey::render_ordered` delegates to the free `render_ordered` on every flag combination.
 #[test]
 fn render_ordered_free_fn_and_method_are_one_implementation() {
     for (ascending, nulls_last, expected_suffix) in [
@@ -476,7 +465,6 @@ fn render_ordered_free_fn_and_method_are_one_implementation() {
     );
 }
 
-/// Scenario: `order_by` round-trips, is omitted when empty, and defaults to empty on a legacy payload.
 #[test]
 fn order_by_round_trips_and_defaults_to_empty() {
     let row_spec = sample_spec();
@@ -545,7 +533,6 @@ fn order_by_round_trips_and_defaults_to_empty() {
     );
 }
 
-/// Scenario: `group_keys` round-trips through JSON and is absent from row-scan specs.
 #[test]
 fn group_keys_round_trips_and_absent_from_row_scan() {
     let row_spec = sample_spec();
@@ -585,7 +572,6 @@ fn bad_json_error_does_not_leak_credentials() {
     assert!(err.contains("scan spec deserialization failed"));
 }
 
-/// Scenario: `logical_schema` round-trips and defaults to empty on a legacy payload.
 #[test]
 fn logical_schema_round_trips_and_defaults_to_empty() {
     let mut spec = sample_spec();
@@ -679,7 +665,6 @@ fn logical_schema_round_trips_and_defaults_to_empty() {
     );
 }
 
-/// Scenario: `name_mapping` round-trips and defaults to empty on a legacy payload.
 #[test]
 fn name_mapping_round_trips_and_defaults_to_empty() {
     let mut spec = sample_spec();
@@ -728,7 +713,6 @@ fn name_mapping_round_trips_and_defaults_to_empty() {
     );
 }
 
-/// Scenario: the threading fields round-trip and default to 1 when absent.
 #[test]
 fn scan_spec_threading_fields_round_trip_and_default_to_one() {
     let mut spec = sample_spec();
@@ -770,7 +754,6 @@ fn scan_spec_threading_fields_round_trip_and_default_to_one() {
     );
 }
 
-/// Scenario: `df_batch_size` round-trips and defaults to 8192 on a legacy payload.
 #[test]
 fn df_batch_size_round_trips_and_defaults() {
     let mut spec = sample_spec();
@@ -799,7 +782,6 @@ fn df_batch_size_round_trips_and_defaults() {
     );
 }
 
-/// Scenario: `memory_pool_fraction` and `instance_overhead_mb` round-trip and default to 0.6 / 200.
 #[test]
 fn scan_spec_memory_fields_round_trip_and_default() {
     let mut spec = sample_spec();
@@ -832,7 +814,6 @@ fn scan_spec_memory_fields_round_trip_and_default() {
     );
 }
 
-/// Scenario: `s3_max_connections` round-trips and defaults to the built-in budget when absent.
 #[test]
 fn s3_max_connections_round_trips_and_defaults() {
     let mut spec = sample_spec();
@@ -888,7 +869,6 @@ fn s3_max_connections_round_trips_and_defaults() {
     );
 }
 
-/// Scenario: the common blob carries `table_root` but no `files`, and `from_parts_json` reconstitutes the original.
 #[test]
 fn from_parts_reconstitutes_files_tuples_and_table_root() {
     let original = sample_spec();
@@ -933,7 +913,6 @@ fn from_parts_reconstitutes_files_tuples_and_table_root() {
     assert_eq!(via_struct, original);
 }
 
-/// Scenario: malformed common or files JSON produces errors that never echo the raw input.
 #[test]
 fn malformed_common_or_files_json_does_not_leak_credentials() {
     let garbled_common =
@@ -962,7 +941,6 @@ fn malformed_common_or_files_json_does_not_leak_credentials() {
     assert!(!combined.contains("TOPSECRET"));
 }
 
-/// Scenario: `table_root` round-trips, and a legacy payload without it defaults to empty (all paths absolute).
 #[test]
 fn legacy_empty_root_treats_paths_as_absolute() {
     let spec = sample_spec();
@@ -1019,7 +997,6 @@ fn legacy_empty_root_treats_paths_as_absolute() {
     assert_eq!(reconstituted.common.table_root, "");
 }
 
-/// Scenario: `catalog` appears in no serialized JSON.
 #[test]
 fn catalog_absent_from_all_serialized_json() {
     let spec = sample_spec();
@@ -1035,7 +1012,6 @@ fn catalog_absent_from_all_serialized_json() {
     );
 }
 
-/// Scenario: a spec without a join block omits `join`, and a legacy payload defaults it to `None`.
 #[test]
 fn absent_join_block_round_trips_unchanged() {
     let spec = sample_spec();
@@ -1073,7 +1049,6 @@ fn absent_join_block_round_trips_unchanged() {
     );
 }
 
-/// Scenario: a legacy `[path, size]` file entry reconstitutes with empty `deletes`.
 #[test]
 fn legacy_file_entry_reconstitutes_empty_deletes() {
     let legacy_json = r#"{
@@ -1145,7 +1120,6 @@ fn legacy_file_entry_reconstitutes_empty_deletes() {
     ));
 }
 
-/// Scenario: a join block rides in the common blob and round-trips through split and merge.
 #[test]
 fn join_block_round_trips_through_split_and_merge() {
     let mut spec = sample_spec();
@@ -1250,7 +1224,6 @@ fn sample_join_spec(storage: ScanStorage) -> JoinSpec {
     }
 }
 
-/// Scenario: a join block without `post_join_limit` loads as `None`, and a set cap survives the split.
 #[test]
 fn join_spec_omitting_post_join_limit_deserializes_to_none() {
     let mut spec = sample_spec();
@@ -1275,7 +1248,6 @@ fn join_spec_omitting_post_join_limit_deserializes_to_none() {
     );
 }
 
-/// Scenario: a join block without `post_join_order_by` loads as empty, and a set ordering survives the split.
 #[test]
 fn join_spec_omitting_post_join_order_by_deserializes_to_empty() {
     let mut spec = sample_spec();
@@ -1314,7 +1286,6 @@ fn join_spec_omitting_post_join_order_by_deserializes_to_empty() {
     );
 }
 
-/// Scenario: `JoinSpec::partition_columns` defaults to empty and keeps Iceberg join JSON byte-identical.
 #[test]
 fn join_spec_partition_columns_defaults_to_empty_and_iceberg_json_is_byte_identical() {
     let storage = StorageBackend::S3(StorageProps {
@@ -1370,7 +1341,6 @@ fn join_storage_is_a_required_key() {
     );
 }
 
-/// Scenario: the common blob and files wire stay byte-identical to strings captured before `#[serde(flatten)]`.
 #[test]
 fn common_blob_wire_is_byte_stable() {
     let spec = sample_spec();
@@ -1519,7 +1489,6 @@ fn every_file_entry_combination() -> Vec<FileEntry> {
     entries
 }
 
-/// Scenario: a logical field carries at most one binding key and emits no JSON for an absent one.
 #[test]
 fn a_logical_field_carries_at_most_one_binding_key_and_emits_no_key_for_the_other() {
     let field_of = |field_id, physical_name| LogicalField {
@@ -1562,7 +1531,6 @@ fn a_logical_field_carries_at_most_one_binding_key_and_emits_no_key_for_the_othe
     }
 }
 
-/// Scenario: `partition_columns` round-trips in order and defaults to empty.
 #[test]
 fn partition_columns_round_trip_in_order_and_default_to_empty() {
     let mut spec = sample_spec();
@@ -1590,7 +1558,6 @@ fn partition_columns_round_trip_in_order_and_default_to_empty() {
     );
 }
 
-/// Scenario: neutral fields round-trip losslessly both ways and leave Iceberg encodings byte-identical.
 #[test]
 fn neutral_fields_round_trip_losslessly_and_leave_iceberg_encodings_byte_identical() {
     // Re-serializing must reproduce the same bytes, so no field is dropped on the next pass.
@@ -1667,7 +1634,6 @@ fn neutral_fields_round_trip_losslessly_and_leave_iceberg_encodings_byte_identic
     );
 }
 
-/// Scenario: a partitioned file entry is a JSON object, leaving the tuple forms and their precedence untouched.
 #[test]
 fn a_partitioned_file_entry_is_a_json_object_leaving_the_tuple_forms_untouched() {
     let mixed = r#"[
@@ -1711,7 +1677,6 @@ fn a_partitioned_file_entry_is_a_json_object_leaving_the_tuple_forms_untouched()
     );
 }
 
-/// Scenario: an explicit NULL partition value stays distinct from an absent column, with deterministic key order.
 #[test]
 fn partition_values_distinguish_an_explicit_null_from_an_absent_column() {
     let json = r#"[{"path":"f.parquet","size":1,"partition_values":{"region":null}}]"#;
@@ -1749,7 +1714,6 @@ fn partition_values_distinguish_an_explicit_null_from_an_absent_column() {
     );
 }
 
-/// Scenario: a deletion-vector storage kind outside the closed set is refused without echoing the input.
 #[test]
 fn deletion_vector_storage_kind_outside_the_closed_set_is_refused() {
     let json = r#"[["f.parquet",1,[{"storage":"puffin","path_or_inline_dv":"x","size_in_bytes":1,"cardinality":1}]]]"#;
@@ -1767,7 +1731,6 @@ fn deletion_vector_storage_kind_outside_the_closed_set_is_refused() {
     );
 }
 
-/// Scenario: an entry mixing a deletion vector with an Iceberg delete reference is refused, identified by index.
 #[test]
 fn a_file_entry_mixing_a_deletion_vector_with_an_iceberg_delete_reference_is_refused() {
     let json = r#"[
@@ -1799,7 +1762,6 @@ fn a_file_entry_mixing_a_deletion_vector_with_an_iceberg_delete_reference_is_ref
     );
 }
 
-/// Scenario: a delete list holding only one mechanism kind is accepted.
 #[test]
 fn a_delete_list_holding_one_mechanism_kind_is_accepted() {
     let iceberg_only = r#"[["f.parquet",1,[
@@ -1831,7 +1793,6 @@ fn a_delete_list_holding_one_mechanism_kind_is_accepted() {
     );
 }
 
-/// Scenario: every delete mechanism serializes its own self-describing form, Iceberg keeping its key order.
 #[test]
 fn every_delete_mechanism_serializes_its_own_self_describing_form() {
     let cases = [
@@ -1874,7 +1835,6 @@ fn every_delete_mechanism_serializes_its_own_self_describing_form() {
     }
 }
 
-/// Scenario: only a delete-file mechanism exposes an object-store path; a deletion vector exposes none.
 #[test]
 fn only_a_delete_file_mechanism_exposes_an_object_store_path() {
     assert_eq!(
@@ -1908,7 +1868,6 @@ fn only_a_delete_file_mechanism_exposes_an_object_store_path() {
     );
 }
 
-/// Scenario: an Iceberg delete content type outside the closed set is refused.
 #[test]
 fn an_iceberg_delete_content_type_outside_the_closed_set_is_refused() {
     let json =
@@ -1927,7 +1886,6 @@ fn an_iceberg_delete_content_type_outside_the_closed_set_is_refused() {
     );
 }
 
-/// Scenario: a partitioned scan spec carries no catalog identifier.
 #[test]
 fn a_partitioned_scan_spec_carries_no_catalog_identifier() {
     let mut spec = sample_spec();
@@ -1947,7 +1905,6 @@ fn a_partitioned_scan_spec_carries_no_catalog_identifier() {
     }
 }
 
-/// Scenario: a deletion-vector descriptor is carried verbatim with every member.
 #[test]
 fn deletion_vector_is_carried_verbatim_with_every_member() {
     let entry = FileEntry::with_deletes(
@@ -1984,7 +1941,6 @@ fn deletion_vector_is_carried_verbatim_with_every_member() {
     );
 }
 
-/// Scenario: a logical field authored before the nested descriptor deserializes unchanged.
 #[test]
 fn a_logical_field_authored_before_the_nested_descriptor_deserializes_unchanged() {
     let old_shape = r#"{"field_id":7,"name":"REGION","arrow_type":"utf8","nullable":true}"#;
@@ -2007,7 +1963,6 @@ fn a_logical_field_authored_before_the_nested_descriptor_deserializes_unchanged(
     );
 }
 
-/// Scenario: a primitive logical field serializes no nested key.
 #[test]
 fn a_primitive_logical_field_serializes_no_nested_key() {
     let primitive = LogicalField {
@@ -2026,7 +1981,6 @@ fn a_primitive_logical_field_serializes_no_nested_key() {
     );
 }
 
-/// Scenario: a nested descriptor round-trips every container kind at depth with the same binding key.
 #[test]
 fn a_nested_descriptor_round_trips_every_container_kind_at_depth() {
     let list_of_struct = NestedMembers::List {

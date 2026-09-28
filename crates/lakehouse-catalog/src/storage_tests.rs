@@ -101,7 +101,6 @@ fn addresses_scheme_rejects_an_unrelated_scheme_for_either_backend() {
     assert!(!adls.addresses_scheme("gs"));
 }
 
-/// Scenario: A present-but-empty session token is still emitted, unlike empty connection fields
 #[test]
 fn catalog_storage_props_emits_a_present_but_empty_session_token() {
     let backend = StorageBackend::S3(StorageProps {
@@ -171,7 +170,6 @@ fn s3_round_trips_through_its_tagged_encoding() {
     );
 }
 
-/// Scenario: Untagged, unknown, wrong-case, or mismatched variant payloads are rejected
 #[test]
 fn only_matching_lowercase_variant_keys_decode() {
     for payload in [
@@ -266,7 +264,6 @@ fn adls_secret_values_are_the_one_credential_and_omit_an_empty_one() {
     );
 }
 
-/// Scenario: AdlsCred never prints its secret via Debug, standalone or inside StorageBackend
 #[test]
 fn adls_cred_is_redacted_in_debug_output() {
     let account_key = AdlsCred::AccountKey("azure-static-key-secret".into());
@@ -343,7 +340,6 @@ fn location_host_reads_the_authority_when_there_is_no_userinfo() {
     assert_eq!(location_host("s3://bucket/db/t"), "bucket");
 }
 
-/// Scenario: An ADLS `<container>@` segment is userinfo, not part of the host
 #[test]
 fn location_host_reads_the_host_after_the_container_userinfo() {
     let host = "myacct.dfs.core.windows.net";
@@ -363,7 +359,6 @@ fn adls_account_name_reads_the_hosts_leading_label() {
     );
 }
 
-/// Scenario: A storage host with no leading label yields a catalog-neutral refusal
 #[test]
 fn adls_account_name_errs_when_the_host_has_no_leading_label() {
     for location in [
@@ -400,7 +395,6 @@ fn user_message(error: UdfError) -> String {
     }
 }
 
-/// Scenario: `abfs://` requires ALLOW_HTTP consent; `abfss://` is never gated
 #[test]
 fn adls_backend_gates_abfs_on_allow_http_and_never_gates_abfss() {
     let plaintext = format!("abfs://mycontainer@{ADLS_HOST}/db/t");
@@ -482,7 +476,6 @@ fn vended_s3(endpoint: Option<&str>, region: Option<&str>, path_style: Option<bo
     }
 }
 
-/// Scenario: The plaintext gate reads the resolved endpoint, case-insensitively, including a CONNECTION-supplied one
 #[test]
 fn s3_backend_gates_a_plaintext_endpoint_the_connection_supplied() {
     let plaintext = "http://minio:9000";
@@ -539,7 +532,6 @@ fn s3_backend_gates_a_plaintext_endpoint_the_connection_supplied() {
     );
 }
 
-/// Scenario: Endpoint and region resolve independently, CONNECTION first, then vended
 #[test]
 fn store_address_resolves_endpoint_and_region_independently_with_the_connection_winning() {
     let connection_endpoint = "https://connection.endpoint.invalid";
@@ -600,7 +592,6 @@ fn store_address_resolves_endpoint_and_region_independently_with_the_connection_
     }
 }
 
-/// Scenario: A store address empty on both sides resolves (Databricks AWS vends no address)
 #[test]
 fn a_both_empty_store_address_resolves_rather_than_refusing() {
     let props = s3_payload(
@@ -623,7 +614,6 @@ fn a_both_empty_store_address_resolves_rather_than_refusing() {
     );
 }
 
-/// Scenario: A stated vended path_style wins; otherwise it follows whether an endpoint resolved
 #[test]
 fn path_style_composes_the_vended_override_with_the_resolved_endpoint() {
     let endpoint = "https://minio.invalid";

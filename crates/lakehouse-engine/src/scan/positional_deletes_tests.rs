@@ -41,7 +41,6 @@ fn get_test_schema_descr() -> SchemaDescPtr {
     Arc::new(SchemaDescriptor::new(Arc::new(schema)))
 }
 
-/// Scenario: the vendored row-selection matches apache/iceberg-rust's own oracle test (tag `v0.10.0`).
 #[test]
 fn build_deletes_row_selection_matches_upstream() {
     let schema_descr = get_test_schema_descr();
@@ -118,7 +117,6 @@ fn build_deletes_row_selection_matches_upstream() {
     assert_eq!(result, expected);
 }
 
-/// Scenario: the per-row-group access plan recombines losslessly to the whole-file selection.
 #[test]
 fn access_plan_round_trips_to_whole_file_selection() {
     use datafusion::datasource::physical_plan::parquet::RowGroupAccess;
@@ -151,7 +149,6 @@ fn access_plan_round_trips_to_whole_file_selection() {
     assert_eq!(recombined, whole);
 }
 
-/// Scenario: a fully-deleted file yields an access plan skipping all rows.
 #[test]
 fn access_plan_fully_deleted_file_selects_no_rows() {
     let schema_descr = get_test_schema_descr();
@@ -171,7 +168,6 @@ fn access_plan_fully_deleted_file_selects_no_rows() {
     );
 }
 
-/// Scenario: a partition-granularity delete file is bucketed by `file_path`, restricted to assigned files.
 #[test]
 fn reads_and_filters_delete_positions_by_file_path() {
     use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -246,7 +242,6 @@ fn reads_and_filters_delete_positions_by_file_path() {
     );
 }
 
-/// Scenario: only positional-delete files and deletion vectors pass the backstop; other mechanisms are refused cleanly.
 #[test]
 fn only_iceberg_equality_and_puffin_delete_mechanisms_are_refused() {
     const SECRET: &str = "SECRETKEY";
@@ -350,7 +345,6 @@ fn row_group_with_file_path_stats(
     build_test_row_group_meta(schema_descr.clone(), vec![col0, col1], 4, 0)
 }
 
-/// Scenario: a row group is pruned only when every assigned path sorts outside `[min, max]`.
 #[test]
 fn pruning_is_range_based() {
     let rg = row_group_with_file_path_stats(
@@ -388,7 +382,6 @@ fn pruning_is_range_based() {
     );
 }
 
-/// Scenario: a row group with absent or unset statistics is always decoded.
 #[test]
 fn absent_statistics_are_never_pruned() {
     let assigned = HashSet::from(["s3://b/data/f1.parquet".to_string()]);
@@ -406,7 +399,6 @@ fn absent_statistics_are_never_pruned() {
     );
 }
 
-/// Scenario: truncated `[min, max]` bounds bracketing longer real paths still decode.
 #[test]
 fn truncated_bounds_keep_range_valid() {
     let rg = row_group_with_file_path_stats(
@@ -421,7 +413,6 @@ fn truncated_bounds_keep_range_valid() {
     );
 }
 
-/// Scenario: a pruned multi-row-group delete-file read equals an unpruned one.
 #[test]
 fn reads_multi_row_group_delete_file_correctly() {
     use arrow::array::{Int64Array, RecordBatch, StringArray};
@@ -587,7 +578,6 @@ fn logged_deletion_vector() -> DeleteMechanism {
     }
 }
 
-/// Scenario: mixed positional deletes and deletion vectors merge into one map; a shared sidecar is fetched once.
 #[test]
 fn both_delete_mechanisms_converge_on_one_position_map() {
     use object_store::memory::InMemory;
@@ -676,7 +666,6 @@ fn both_delete_mechanisms_converge_on_one_position_map() {
     );
 }
 
-/// Scenario: an unapplicable mechanism anywhere fails the shard before any fetch.
 #[test]
 fn an_unapplicable_mechanism_fails_the_shard_before_any_read() {
     use object_store::ObjectStore;
@@ -853,7 +842,6 @@ fn memory_session() -> datafusion::execution::session_state::SessionState {
     ctx.state()
 }
 
-/// Scenario: the registered schema stays in declared order despite the `file ++ partition` scan order.
 #[test]
 fn the_provider_reports_the_declared_schema_while_scanning_the_split_one() {
     let declared = partitioned_declared_schema();
@@ -884,7 +872,6 @@ fn the_provider_reports_the_declared_schema_while_scanning_the_split_one() {
     );
 }
 
-/// Scenario: each file carries its own partition value, typed and aligned with `table_partition_cols`.
 #[test]
 fn each_partitioned_file_carries_its_own_logged_partition_values() {
     let table = scan_table_partitioned_by(
@@ -926,7 +913,6 @@ fn each_partitioned_file_carries_its_own_logged_partition_values() {
     );
 }
 
-/// Scenario: an unpartitioned scan attaches no partition values.
 #[test]
 fn an_unpartitioned_scan_attaches_no_partition_values() {
     let table = scan_table_over(
@@ -946,7 +932,6 @@ fn an_unpartitioned_scan_attaches_no_partition_values() {
     assert!(files[0].partition_values.is_empty());
 }
 
-/// Scenario: an unrepresentable partition value fails the scan before any object-store read.
 #[test]
 fn an_unrepresentable_partition_value_fails_the_scan() {
     let table = scan_table_partitioned_by(

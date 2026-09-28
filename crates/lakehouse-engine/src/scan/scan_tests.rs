@@ -1,7 +1,6 @@
 use super::test_support::minimal_spec;
 use super::*;
 
-/// Scenario: session_config_for_spec applies df_batch_size and clamps sub-1 values to 1.
 #[test]
 fn session_config_applies_batch_size_and_clamps_floor() {
     let mut spec = minimal_spec();
@@ -22,7 +21,6 @@ fn session_config_applies_batch_size_and_clamps_floor() {
     );
 }
 
-/// Scenario: scan enables Parquet row-group and page pruning.
 #[test]
 fn session_config_enables_parquet_pruning_flags() {
     let config = session_config_for_spec(&minimal_spec());
@@ -41,7 +39,6 @@ fn session_config_enables_parquet_pruning_flags() {
     );
 }
 
-/// Scenario: SessionConfig applies target_partitions from the spec.
 #[test]
 fn session_config_uses_spec_target_partitions() {
     let mut spec = minimal_spec();
@@ -54,7 +51,6 @@ fn session_config_uses_spec_target_partitions() {
     );
 }
 
-/// Scenario: df_threads_per_udf == 1 selects the current-thread runtime.
 #[test]
 fn runtime_is_current_thread_when_threads_is_one() {
     let rt = build_scan_runtime(1).expect("runtime must build");
@@ -65,7 +61,6 @@ fn runtime_is_current_thread_when_threads_is_one() {
     );
 }
 
-/// Scenario: df_threads_per_udf > 1 selects the multi-thread runtime.
 #[test]
 fn runtime_is_multi_thread_when_threads_exceeds_one() {
     let rt = build_scan_runtime(4).expect("runtime must build");
@@ -76,7 +71,6 @@ fn runtime_is_multi_thread_when_threads_exceeds_one() {
     );
 }
 
-/// Scenario: a multi-thread runtime with live detached tasks is torn down deterministically.
 #[test]
 fn run_on_runtime_tears_down_multi_thread_runtime_with_live_background_task() {
     use std::sync::Arc;

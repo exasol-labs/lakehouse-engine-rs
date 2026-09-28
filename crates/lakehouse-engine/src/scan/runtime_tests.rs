@@ -1,7 +1,6 @@
 use super::*;
 use datafusion::execution::memory_pool::MemoryConsumer;
 
-/// Scenario: a positive memory limit sizes the pool to fraction × (limit − overhead).
 #[test]
 fn build_runtime_env_sizes_pool_from_net_budget() {
     let limit: u64 = 4096 * 1024 * 1024;
@@ -22,7 +21,6 @@ fn build_runtime_env_sizes_pool_from_net_budget() {
     );
 }
 
-/// Scenario: overhead ≥ limit clamps the pool to MIN_POOL_FLOOR_BYTES.
 #[test]
 fn build_runtime_env_clamps_to_floor_when_overhead_exceeds_limit() {
     let limit: u64 = 100 * 1024 * 1024;
@@ -42,7 +40,6 @@ fn build_runtime_env_clamps_to_floor_when_overhead_exceeds_limit() {
     );
 }
 
-/// Scenario: a zero memory limit uses the default budget, ignoring fraction and overhead.
 #[test]
 fn build_runtime_env_uses_default_budget_on_zero_limit() {
     let env = build_runtime_env(0, 0.6, 0, SpillMode::NoDisk).unwrap();
@@ -59,7 +56,6 @@ fn build_runtime_env_uses_default_budget_on_zero_limit() {
     );
 }
 
-/// Scenario: SpillMode::Disk selects FairSpillPool.
 #[test]
 fn build_runtime_env_uses_fair_spill_pool_when_disk() {
     let tmp = std::env::temp_dir();
@@ -71,7 +67,6 @@ fn build_runtime_env_uses_fair_spill_pool_when_disk() {
     );
 }
 
-/// Scenario: SpillMode::NoDisk selects GreedyMemoryPool.
 #[test]
 fn build_runtime_env_uses_greedy_pool_when_no_disk() {
     let env = build_runtime_env(0, 0.6, 0, SpillMode::NoDisk).unwrap();

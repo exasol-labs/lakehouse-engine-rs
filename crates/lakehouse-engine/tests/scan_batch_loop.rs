@@ -297,7 +297,6 @@ fn run_all_rows(specs: &[ScanSpec], emits: &[ExaType], built: &AtomicUsize) -> V
         .collect()
 }
 
-/// Scenario: N per-row calls emit the union of every shard, not just the first row's
 #[test]
 fn per_row_calls_emit_union_of_all_shards() {
     let dir = std::env::temp_dir().join(format!("lh_perrow_multi_{}", std::process::id()));
@@ -329,7 +328,6 @@ fn per_row_calls_emit_union_of_all_shards() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: each per-row call builds and tears down its own runtime
 #[test]
 fn run_scan_one_builds_and_tears_down_runtime_per_call() {
     let dir = std::env::temp_dir().join(format!("lh_perrow_rt_{}", std::process::id()));
@@ -360,7 +358,6 @@ fn run_scan_one_builds_and_tears_down_runtime_per_call() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a single per-row call is byte-identical to the direct raw-scan path
 #[test]
 fn single_row_call_is_byte_identical_to_direct_raw_scan() {
     let dir = std::env::temp_dir().join(format!("lh_perrow_single_{}", std::process::id()));
@@ -404,7 +401,6 @@ fn single_row_call_is_byte_identical_to_direct_raw_scan() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a `distinct: true` row scan streams one row per shard-local distinct value
 #[test]
 fn distinct_row_scan_streams_one_row_per_distinct_value() {
     let dir = std::env::temp_dir().join(format!("lh_distinct_row_scan_{}", std::process::id()));
@@ -432,7 +428,6 @@ fn distinct_row_scan_streams_one_row_per_distinct_value() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: every emitted column carries the Arrow type its declared `EMITS` type requires
 #[test]
 fn raw_scan_coerces_every_column_to_its_declared_output_type() {
     let dir = std::env::temp_dir().join(format!("lh_emit_coercion_{}", std::process::id()));
@@ -470,7 +465,6 @@ fn raw_scan_coerces_every_column_to_its_declared_output_type() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a nested column rendered to JSON upstream crosses the emit coercion unchanged
 #[test]
 fn rendered_nested_column_passes_the_emit_coercion_unchanged() {
     let dir = std::env::temp_dir().join(format!("lh_emit_nested_{}", std::process::id()));

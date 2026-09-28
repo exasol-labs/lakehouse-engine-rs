@@ -979,7 +979,6 @@ async fn a_prefix_holding_no_data_file_answers_an_empty_list_and_schema() {
     );
 }
 
-/// Scenario: the store prefix is the percent-decoded path below the store root
 #[test]
 fn the_store_prefix_is_the_percent_decoded_path_below_the_store_root() {
     for (uri, expected) in [

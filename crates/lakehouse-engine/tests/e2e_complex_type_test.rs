@@ -336,7 +336,6 @@ fn nested_columns_push_down_as_the_declared_varchar_in_every_shape() {
     assert_pushed_to_scan_udf(&mut conn, &upper_sql, "the select-list UPPER(TAGS)");
 }
 
-/// Scenario: A self-join on a nested JSON-rendered column pairs each row only with itself (#361)
 #[test]
 fn e2e_self_join_on_nested_json_column_matches_single_node() {
     setup();

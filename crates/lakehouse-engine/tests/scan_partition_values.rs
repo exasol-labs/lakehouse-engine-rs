@@ -241,7 +241,6 @@ fn letter_number_rows(batches: &[RecordBatch]) -> Vec<(Option<String>, i64)> {
     out
 }
 
-/// Scenario: a partition column absent from every data file is materialized from each file's own logged value
 #[test]
 fn absent_partition_column_is_materialized_per_file() {
     let dir = temp_dir("absent_per_file");
@@ -270,7 +269,6 @@ fn absent_partition_column_is_materialized_per_file() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: absent and empty-string logged partition values both materialize SQL NULL
 #[test]
 fn absent_and_empty_partition_values_materialize_null() {
     let dir = temp_dir("absent_and_empty");
@@ -338,7 +336,6 @@ fn spec_with_flag(files: Vec<FileEntry>, table_root: &str) -> ScanSpec {
     }
 }
 
-/// Scenario: a logged partition value converts to its declared type or is refused cleanly
 #[test]
 fn partition_values_convert_to_their_declared_type_or_fail_cleanly() {
     let dir = temp_dir("type_conversion");
@@ -454,7 +451,6 @@ fn one_off_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
-/// Scenario: the logged partition value wins over a physical column of the same name
 #[test]
 fn logged_partition_value_wins_over_a_physical_partition_column() {
     let dir = temp_dir("logged_wins");
@@ -506,7 +502,6 @@ fn logged_partition_value_wins_over_a_physical_partition_column() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a materialized partition column serves projection, filter pushdown, and GROUP BY
 #[test]
 fn materialized_partition_column_serves_projection_filter_and_group_by() {
     let dir = temp_dir("proj_filter_group");
@@ -631,7 +626,6 @@ fn unpartitioned_logical_schema() -> Vec<LogicalField> {
     ]
 }
 
-/// Scenario: a scan with no partition columns keeps its file schema and plan shape unchanged
 #[test]
 fn scan_without_partition_columns_is_byte_identical() {
     let dir = temp_dir("unpartitioned");

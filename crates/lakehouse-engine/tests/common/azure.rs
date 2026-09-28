@@ -404,7 +404,6 @@ mod azure_error_classification_tests {
     use azure_core::http::StatusCode;
     use azure_storage_blob::models::StorageErrorCode;
 
-    /// Scenario: a failure without a service response, including an HTTP error with no raw response, carries no Azure error code
     #[test]
     fn failure_without_a_service_response_carries_no_error_code() {
         let failures = [
@@ -436,7 +435,6 @@ mod azure_error_classification_tests {
         }
     }
 
-    /// Scenario: delete keys only on `ContainerNotFound` and create only on `ContainerAlreadyExists`
     #[test]
     fn container_guard_keys_each_spec_clause_on_exactly_one_code() {
         let unmapped = StorageErrorCode::UnknownValue("SomethingNew".to_string());

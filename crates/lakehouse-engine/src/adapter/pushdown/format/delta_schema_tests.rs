@@ -113,7 +113,6 @@ fn refusal_message(column_name: &str, data_type: DataType) -> String {
     refused_columns[0].reason.clone()
 }
 
-/// Scenario: Each column-mapping mode selects its own binding key
 #[test]
 fn each_column_mapping_mode_selects_its_own_binding_key() {
     let schema = StructType::try_new([
@@ -138,7 +137,6 @@ fn each_column_mapping_mode_selects_its_own_binding_key() {
     assert_eq!(binding_keys(&none_mode), "a=identity, b=identity");
 }
 
-/// Scenario: Name-mode fixture columns bind by their declared physical name
 #[test]
 fn name_mode_fixture_columns_bind_by_their_declared_physical_name() {
     let schema = parse_schema(CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA);
@@ -162,7 +160,6 @@ fn name_mode_fixture_columns_bind_by_their_declared_physical_name() {
     assert_eq!(logical_fields[2].arrow_type, "float64");
 }
 
-/// Scenario: None mode ignores a residual column-mapping annotation
 #[test]
 fn none_mode_ignores_a_residual_column_mapping_annotation() {
     let schema = StructType::try_new([
@@ -181,7 +178,6 @@ fn none_mode_ignores_a_residual_column_mapping_annotation() {
     );
 }
 
-/// Scenario: A mapped-mode column without a column-mapping id is refused naming the column
 #[test]
 fn id_mode_column_without_a_column_mapping_id_is_refused_naming_the_column() {
     let unannotated_id = StructField::not_null("b", DataType::INTEGER).with_metadata([(
@@ -207,7 +203,6 @@ fn id_mode_column_without_a_column_mapping_id_is_refused_naming_the_column() {
     }
 }
 
-/// Scenario: A column-mapping id outside i32 is refused naming the column
 #[test]
 fn id_mode_column_with_an_out_of_range_column_mapping_id_is_refused_naming_the_column() {
     let oversized = i64::from(i32::MAX) + 1;
@@ -228,7 +223,6 @@ fn id_mode_column_with_an_out_of_range_column_mapping_id_is_refused_naming_the_c
     );
 }
 
-/// Scenario: A mapped-mode column without a usable physical name is refused naming the column
 #[test]
 fn id_mode_column_without_a_physical_name_is_refused_naming_the_column() {
     let absent = vec![("delta.columnMapping.id", MetadataValue::Number(1))];
@@ -256,7 +250,6 @@ fn id_mode_column_without_a_physical_name_is_refused_naming_the_column() {
     }
 }
 
-/// Scenario: A refused column's binding key is never looked up, even when it would fail
 #[test]
 fn a_refused_columns_binding_key_is_never_looked_up_even_when_it_would_itself_fail() {
     let mappable = mapped_field("id", 1, "col-id");
@@ -407,7 +400,6 @@ fn nullability_is_carried_from_the_delta_schema() {
     assert!(!logical_fields[1].nullable);
 }
 
-/// Scenario: A container of renderable members is tagged utf8 at every depth and position
 #[test]
 fn containers_classify_recursively_by_renderability() {
     let schema = StructType::try_new([
@@ -577,7 +569,6 @@ fn refused_set_is_binary_variant_and_containers_of_them() {
     }
 }
 
-/// Scenario: A refused container's nested binding key is never looked up
 #[test]
 fn a_refused_containers_nested_binding_key_is_never_looked_up() {
     let refused_member_beside_an_unannotated_one = annotated(
@@ -609,7 +600,6 @@ fn a_refused_containers_nested_binding_key_is_never_looked_up() {
     );
 }
 
-/// Scenario: A field with no type-changes metadata parses to an empty list
 #[test]
 fn a_field_with_no_type_changes_metadata_parses_to_an_empty_list() {
     let field = StructField::not_null("plain", DataType::INTEGER);
@@ -619,7 +609,6 @@ fn a_field_with_no_type_changes_metadata_parses_to_an_empty_list() {
     assert!(changes.is_empty());
 }
 
-/// Scenario: A field with other metadata but no type-changes key parses to an empty list
 #[test]
 fn a_field_with_other_metadata_but_no_type_changes_key_parses_to_an_empty_list() {
     let field = mapped_field("a", 1, "col-a");
@@ -629,7 +618,6 @@ fn a_field_with_other_metadata_but_no_type_changes_key_parses_to_an_empty_list()
     assert!(changes.is_empty());
 }
 
-/// Scenario: The superseded tableVersion key is ignored rather than refused
 #[test]
 fn parses_fromtype_totype_ignoring_the_superseded_tableversion_key() {
     let field = StructField::nullable("byte_long", DataType::LONG).with_metadata([(
@@ -646,7 +634,6 @@ fn parses_fromtype_totype_ignoring_the_superseded_tableversion_key() {
     assert_eq!(changes[0].to_type, "long");
 }
 
-/// Scenario: An entry's optional fieldPath is retained for the refusal to report
 #[test]
 fn parses_multiple_entries_and_retains_an_optional_field_path() {
     let field = StructField::nullable("m", DataType::STRING).with_metadata([(
@@ -789,13 +776,11 @@ fn every_pair_the_protocol_lists_is_supported() {
     );
 }
 
-/// Scenario: long to double is refused because the protocol omits it, though arrow-cast performs it
 #[test]
 fn long_to_double_is_refused_because_the_protocol_omits_it() {
     assert!(!is_supported_type_change(&type_change("long", "double")));
 }
 
-/// Scenario: A decimal target is checked as k1 >= k2 >= 0, not as precision and scale both growing
 #[test]
 fn a_decimal_target_is_checked_as_k1_ge_k2_ge_0_not_as_precision_and_scale_both_growing() {
     assert!(!is_supported_type_change(&type_change(
@@ -822,7 +807,6 @@ fn a_decimal_target_narrowing_precision_or_scale_is_refused() {
     }
 }
 
-/// Scenario: An integral source is checked against the protocol's INT32 and INT64 decimal bases
 #[test]
 fn an_integral_source_is_checked_against_the_protocols_int32_and_int64_decimal_bases() {
     for (from_type, to_type) in [
@@ -857,7 +841,6 @@ fn a_narrowing_or_unrelated_pair_is_refused() {
     }
 }
 
-/// Scenario: A type name that is not a Delta primitive is refused
 #[test]
 fn a_type_name_that_is_not_a_delta_primitive_is_refused() {
     for (from_type, to_type) in [
@@ -874,7 +857,6 @@ fn a_type_name_that_is_not_a_delta_primitive_is_refused() {
     }
 }
 
-/// Scenario: An entry carrying a fieldPath is validated by its pair alone
 #[test]
 fn an_entry_carrying_a_field_path_is_validated_by_its_pair_alone() {
     let supported = type_change_at("byte", "long", "value");
@@ -933,7 +915,6 @@ fn a_field_whose_recorded_type_changes_are_all_supported_plans_normally() {
     assert_eq!(logical_fields[0].name, "value");
 }
 
-/// Scenario: Nested type changes are validated and refuse with a composed path
 #[test]
 fn nested_type_changes_are_validated_and_refuse_with_a_composed_path() {
     let long_to_double = || serde_json::json!([{"fromType": "long", "toType": "double"}]);
@@ -1001,7 +982,6 @@ fn nested_type_changes_are_validated_and_refuse_with_a_composed_path() {
     }
 }
 
-/// Scenario: A top-level entry's own fieldPath is reported below the column
 #[test]
 fn a_top_level_entrys_own_field_path_is_reported_below_the_column() {
     let schema = StructType::try_new([with_type_changes(
@@ -1021,7 +1001,6 @@ fn a_top_level_entrys_own_field_path_is_reported_below_the_column() {
     );
 }
 
-/// Scenario: A nested annotation is supported or malformed by the same rules as a top-level one
 #[test]
 fn a_nested_annotation_is_supported_or_malformed_by_the_same_rules_as_a_top_level_one() {
     let supported = StructType::try_new([StructField::nullable(
@@ -1101,7 +1080,6 @@ fn nested_descriptor_carries_logical_names_and_mode_selected_binding_keys() {
     }
 }
 
-/// Scenario: Positional members carry no name and a primitive column carries no descriptor
 #[test]
 fn positional_members_carry_no_name_and_a_primitive_column_carries_no_descriptor() {
     let schema = StructType::try_new([
@@ -1157,7 +1135,6 @@ fn positional_members_carry_no_name_and_a_primitive_column_carries_no_descriptor
     );
 }
 
-/// Scenario: A nested field missing its mode's annotation is refused naming its path
 #[test]
 fn a_nested_field_missing_its_modes_annotation_is_refused_naming_its_path() {
     let schema = StructType::try_new([annotated(

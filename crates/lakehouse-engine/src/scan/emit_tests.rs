@@ -146,7 +146,6 @@ fn make_batch(values: &[i32]) -> RecordBatch {
     RecordBatch::try_new(schema, vec![arr]).unwrap()
 }
 
-/// Scenario: emit_stream emits one Arrow IPC batch per RecordBatch — no Vec<Value> intermediate.
 #[tokio::test]
 async fn emits_batch_by_batch_without_materializing() {
     let input_batches = vec![
@@ -202,7 +201,6 @@ async fn emits_batch_by_batch_without_materializing() {
     }
 }
 
-/// Scenario: ResourcesExhausted, direct or Context/External-wrapped, surfaces as memory exhaustion without credentials.
 #[tokio::test]
 async fn resources_exhausted_surfaces_as_memory_error_not_storage_error() {
     let secret = "AKIAIOSFODNN7EXAMPLE";
@@ -273,7 +271,6 @@ async fn resources_exhausted_surfaces_as_memory_error_not_storage_error() {
     );
 }
 
-/// Scenario: a checked-division failure in any wrapping surfaces as the arithmetic error, without storage framing.
 #[test]
 fn classify_scan_error_names_a_checked_division_failure_without_the_storage_prefix() {
     let zero_divisor = || CheckedFloatDivError::ZeroDivisor {
@@ -315,7 +312,6 @@ fn classify_scan_error_names_a_checked_division_failure_without_the_storage_pref
     }
 }
 
-/// Scenario: an overflow keeps its own wording through the classifier.
 #[test]
 fn classify_scan_error_keeps_an_out_of_range_division_distinct_from_a_zero_divisor() {
     let overflow = DataFusionError::External(Box::new(CheckedFloatDivError::NonFiniteResult {
@@ -340,7 +336,6 @@ fn classify_scan_error_keeps_an_out_of_range_division_distinct_from_a_zero_divis
     );
 }
 
-/// Scenario: a credential value in `secrets` never reaches a checked-division message.
 #[test]
 fn classify_scan_error_redacts_secrets_from_a_checked_division_failure() {
     let secret = "AKIAIOSFODNN7EXAMPLE";
@@ -368,7 +363,6 @@ fn classify_scan_error_redacts_secrets_from_a_checked_division_failure() {
     );
 }
 
-/// Scenario: every `ExaType` variant resolves to the Arrow type `emit_batch`'s strict IPC feed accepts.
 #[test]
 fn coerce_maps_every_exa_type_variant_to_its_arrow_target() {
     use arrow::datatypes::TimeUnit;
@@ -399,7 +393,6 @@ fn coerce_maps_every_exa_type_variant_to_its_arrow_target() {
     }
 }
 
-/// Scenario: a declared `TIMESTAMP(p)` resolves to the Arrow unit of that precision, never `Utf8`.
 #[test]
 fn exa_type_timestamp_maps_to_the_arrow_unit_of_its_declared_precision() {
     use arrow::datatypes::TimeUnit;
@@ -426,7 +419,6 @@ fn exa_type_timestamp_maps_to_the_arrow_unit_of_its_declared_precision() {
     }
 }
 
-/// Scenario: a nanosecond column declared `TIMESTAMP(9)` keeps all nine digits through `coerce_column`.
 #[test]
 fn nanosecond_column_declared_timestamp_9_keeps_every_digit() {
     let instant = chrono::NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -450,7 +442,6 @@ fn nanosecond_column_declared_timestamp_9_keeps_every_digit() {
     assert_eq!(values.value(0), nanos);
 }
 
-/// Scenario: `coerce_batch_to_exa_types` casts every column to its declared ExaType's Arrow type.
 #[test]
 fn coerce_batch_casts_every_column_to_declared_exatype() {
     use arrow::array::{
@@ -571,7 +562,6 @@ fn coerce_batch_casts_every_column_to_declared_exatype() {
     assert_eq!(c1.value(2), 9);
 }
 
-/// Scenario: a UTC `Timestamp(Microsecond, Some("UTC"))` declared TIMESTAMP loses its zone with the instant unchanged (#118).
 #[test]
 fn coerce_timestamptz_column_to_plain_timestamp_preserves_utc() {
     use arrow::array::{Array, TimestampMicrosecondArray};
@@ -620,7 +610,6 @@ fn coerce_timestamptz_column_to_plain_timestamp_preserves_utc() {
     }
 }
 
-/// Scenario: emit_stream coerces each column to its declared EMITS ExaType before emit_batch.
 #[tokio::test]
 async fn emit_stream_coerces_columns_to_declared_exatypes_before_emit_batch() {
     use arrow::array::{Int64Array, StringArray, StringViewArray};
@@ -796,7 +785,6 @@ fn a_relaxed_column_coerces_to_its_declared_exatype_without_a_relaxation_branch(
     );
 }
 
-/// Scenario: a division whose type the error chain lost replaces the flattened storage-read framing (#370).
 #[tokio::test]
 async fn reframe_checked_division_names_a_failure_the_error_chain_lost() {
     let session = session_with_a_raised_division().await;
@@ -838,7 +826,6 @@ async fn reframe_checked_division_names_a_failure_the_error_chain_lost() {
     );
 }
 
-/// Scenario: a storage failure alongside a recorded division is replaced by it (accepted masking trade-off).
 #[tokio::test]
 async fn reframe_checked_division_replaces_a_generic_storage_failure_with_the_division() {
     let session = session_with_a_raised_division().await;
@@ -868,7 +855,6 @@ async fn reframe_checked_division_replaces_a_generic_storage_failure_with_the_di
     );
 }
 
-/// Scenario: a session whose division never raised leaves an unrelated failure untouched.
 #[test]
 fn reframe_checked_division_leaves_an_unrelated_failure_untouched() {
     let session = SessionContext::new();
@@ -907,7 +893,6 @@ async fn session_with_a_raised_division() -> SessionContext {
     session
 }
 
-/// Scenario: a scan that divided by zero and exhausted memory reports both, division first.
 #[tokio::test]
 async fn reframe_checked_division_keeps_a_concurrent_memory_exhaustion_failure_visible() {
     let session = session_with_a_raised_division().await;
@@ -939,7 +924,6 @@ async fn reframe_checked_division_keeps_a_concurrent_memory_exhaustion_failure_v
     );
 }
 
-/// Scenario: the appended memory-exhaustion text is redacted with the full dimension-inclusive secret set.
 #[tokio::test]
 async fn reframe_checked_division_redacts_secrets_from_the_appended_failure() {
     const DIMENSION_SIDE_TOKEN: &str = "tw1l1ght-vended-token";
@@ -976,7 +960,6 @@ async fn reframe_checked_division_redacts_secrets_from_the_appended_failure() {
     );
 }
 
-/// Scenario: a declared column count disagreeing with the batch fails naming both counts, emitting nothing.
 #[tokio::test]
 async fn emit_stream_fails_when_declared_column_count_disagrees() {
     let cases: Vec<(&str, Vec<(&str, ExaType)>)> = vec![
@@ -1010,7 +993,6 @@ async fn emit_stream_fails_when_declared_column_count_disagrees() {
     }
 }
 
-/// Scenario: an erroring `output_column(i)` fails the call naming `i`.
 #[tokio::test]
 async fn emit_stream_fails_when_a_declared_column_cannot_be_read() {
     // Arity 2 but only column 0 available: a truncated declaration.
@@ -1033,7 +1015,6 @@ async fn emit_stream_fails_when_a_declared_column_cannot_be_read() {
     );
 }
 
-/// Scenario: a `Numeric` column outside `Decimal128`'s range fails naming the column, never `Utf8`.
 #[tokio::test]
 async fn emit_stream_fails_on_numeric_with_out_of_range_payload() {
     let cases: Vec<(&str, ExaType)> = vec![
@@ -1064,7 +1045,6 @@ async fn emit_stream_fails_on_numeric_with_out_of_range_payload() {
     }
 }
 
-/// Scenario: NUMERIC drift through `target_arrow_type` never yields `Utf8`.
 #[test]
 fn a_drifted_numeric_never_resolves_to_the_string_target() {
     let drifted = vec![numeric(39, 0), numeric(10, 12)];
@@ -1078,7 +1058,6 @@ fn a_drifted_numeric_never_resolves_to_the_string_target() {
     }
 }
 
-/// Scenario: a value the declared target cannot represent fails naming the column; nothing is emitted.
 #[tokio::test]
 async fn coerce_fails_when_a_value_does_not_fit_its_declared_target() {
     use arrow::array::Decimal128Array;

@@ -215,7 +215,6 @@ fn classify_declines_a_node_with_no_nested_aggregate() {
     );
 }
 
-/// Scenario: classification is structural, so a bare aggregate is its own single plan
 #[test]
 fn classify_accepts_a_bare_aggregate_as_its_own_single_plan() {
     let plans = classify_scalar_over_aggregate(&agg("SUM", "X", false))
@@ -243,7 +242,6 @@ fn classify_declines_a_residual_column_outside_the_aggregate() {
     assert!(classify_scalar_over_aggregate(&node).is_none());
 }
 
-/// Scenario: render substitutes the caller's merged expressions by plan slot
 #[test]
 fn render_substitutes_the_callers_merged_expressions_by_plan_slot() {
     let node = round_of(sum_over_count(), 2);
@@ -292,7 +290,6 @@ fn render_declines_when_the_merged_list_is_shorter_than_the_matched_slot() {
     );
 }
 
-/// Scenario: fold and render yield identical SQL for grouped and single-group starting plan lists
 #[test]
 fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
     let node = round_of(sum_over_count(), 2);

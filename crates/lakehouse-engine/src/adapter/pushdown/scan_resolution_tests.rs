@@ -50,7 +50,6 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
     );
 }
 
-/// Scenario: a recorded identifier splits into namespace segments and table name; a bare one is refused
 #[test]
 fn a_recorded_identifier_recovers_its_namespace_segments_and_table_name() {
     let three_level = unity_table_ident("cat.sch.orders").expect("a three-level identifier");
@@ -72,7 +71,6 @@ fn a_recorded_identifier_recovers_its_namespace_segments_and_table_name() {
     );
 }
 
-/// Scenario: an identifier naming no table is refused before any catalog request
 #[tokio::test]
 async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalog_request() {
     let catalog = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
@@ -107,7 +105,6 @@ async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalo
     );
 }
 
-/// Scenario: a malformed identifier on any join leg is refused before any catalog request
 #[tokio::test]
 async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_catalog_request() {
     let catalog = iceberg_catalog().await;
@@ -140,7 +137,6 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_ca
     );
 }
 
-/// Scenario: an Iceberg identifier resolves through the Iceberg reader with no partition columns
 #[tokio::test]
 async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_partition_columns() {
     let catalog = iceberg_catalog().await;
@@ -219,7 +215,7 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     );
 }
 
-/// Scenario: one Unity Catalog session per request serves every table the request resolves
+/// Scenario: One catalog session per request serves every table the request resolves
 #[tokio::test]
 async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
     const SECOND_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.customers";
@@ -294,7 +290,6 @@ fn direct_storage_backend(endpoint: &str) -> StorageBackend {
     })
 }
 
-/// Scenario: a direct-storage store is built once and each leg lists only its own table root
 #[tokio::test]
 async fn one_session_or_store_per_request_serves_every_leg() {
     let endpoint = empty_s3_endpoint().await;
@@ -347,7 +342,6 @@ async fn one_session_or_store_per_request_serves_every_leg() {
     );
 }
 
-/// Scenario: a direct-storage identifier naming no first-level directory is refused before listing
 #[tokio::test]
 async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused() {
     let endpoint = empty_s3_endpoint().await;
@@ -386,7 +380,6 @@ async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused(
     );
 }
 
-/// Scenario: the pushdown table root equals the discovery-composed storage location
 #[tokio::test]
 async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location() {
     let endpoint = empty_s3_endpoint().await;
@@ -425,7 +418,6 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
     );
 }
 
-/// Scenario: every catalog kind resolves a request session of its own
 #[tokio::test]
 async fn request_session_has_one_variant_per_kind() {
     let iceberg = iceberg_catalog().await;

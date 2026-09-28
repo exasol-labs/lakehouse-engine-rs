@@ -63,7 +63,6 @@ fn decimal_type(precision: u32, scale: u32) -> serde_json::Value {
     serde_json::json!({"type": "decimal", "precision": precision, "scale": scale})
 }
 
-/// Scenario: a single-group scalar-over-aggregate item is accepted while undecomposable shapes still decline
 #[test]
 fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecomposable() {
     let req = serde_json::json!({
@@ -150,7 +149,6 @@ fn detect_aggregates_accepts_scalar_over_aggregate_and_still_declines_undecompos
     );
 }
 
-/// Scenario: a scalar-over-aggregate item carries its own select-list ordinal and declared type
 #[test]
 fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types() {
     let req = serde_json::json!({
@@ -187,7 +185,6 @@ fn single_group_scalar_over_aggregate_preserves_selectlist_order_and_item_types(
     assert_eq!(ordinary_plans(&items).len(), 2);
 }
 
-/// Scenario: a scalar-over-aggregate item without a declared type defaults to VARCHAR(2000000)
 #[test]
 fn single_group_scalar_over_aggregate_defaults_declared_type_when_absent() {
     let req = serde_json::json!({
@@ -201,7 +198,6 @@ fn single_group_scalar_over_aggregate_defaults_declared_type_when_absent() {
     ));
 }
 
-/// Scenario: inner aggregates shared across the select list collapse into one partial column
 #[test]
 fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
     let req = serde_json::json!({
@@ -237,7 +233,6 @@ fn single_group_scalar_over_aggregate_dedups_shared_inner_aggregates() {
     assert_eq!(plans[1].column.as_deref(), Some("L_QUANTITY"));
 }
 
-/// Scenario: a lone scalar-over-aggregate item folds its nested plans in encounter order
 #[test]
 fn single_group_scalar_over_aggregate_folds_nested_plans_in_encounter_order() {
     let req = serde_json::json!({
@@ -257,7 +252,6 @@ fn single_group_scalar_over_aggregate_folds_nested_plans_in_encounter_order() {
     assert_eq!(plans[1].kind, AggKind::Count);
 }
 
-/// Scenario: select lists without nested aggregates fold one plan per ordinary aggregate item
 #[test]
 fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
     let req = serde_json::json!({
@@ -275,7 +269,6 @@ fn ordinary_plans_unchanged_for_bare_aggregate_select_lists() {
     assert_eq!(plans[2].kind, AggKind::Min);
 }
 
-/// Scenario: COUNT(*) translates to Count with no column
 #[test]
 fn detect_count_star_produces_count_no_column() {
     let req = serde_json::json!({
@@ -287,7 +280,6 @@ fn detect_count_star_produces_count_no_column() {
     assert!(agg_of(&plans[0]).column.is_none());
 }
 
-/// Scenario: COUNT(col) translates to CountCol with the column name
 #[test]
 fn detect_count_col_produces_count_col() {
     let req = serde_json::json!({
@@ -298,7 +290,6 @@ fn detect_count_col_produces_count_col() {
     assert_eq!(agg_of(&plans[0]).column.as_deref(), Some("AMOUNT"));
 }
 
-/// Scenario: SUM/MIN/MAX/AVG each translate to the right kind and column
 #[test]
 fn detect_sum_min_max_avg_produce_correct_plans() {
     let req = serde_json::json!({
@@ -320,7 +311,6 @@ fn detect_sum_min_max_avg_produce_correct_plans() {
     assert_eq!(agg_of(&plans[3]).column.as_deref(), Some("SCORE"));
 }
 
-/// Scenario: a non-empty GROUP BY falls back
 #[test]
 fn detect_aggregates_falls_back_on_group_by() {
     let req = serde_json::json!({
@@ -333,7 +323,6 @@ fn detect_aggregates_falls_back_on_group_by() {
     );
 }
 
-/// Scenario: a non-COUNT DISTINCT aggregate falls back
 #[test]
 fn detect_aggregates_falls_back_on_distinct() {
     let req = serde_json::json!({
@@ -345,7 +334,6 @@ fn detect_aggregates_falls_back_on_distinct() {
     );
 }
 
-/// Scenario: an unsupported aggregate function falls back to a row scan
 #[test]
 fn detect_aggregates_falls_back_on_unsupported_function() {
     let req = serde_json::json!({
@@ -360,7 +348,6 @@ fn detect_aggregates_falls_back_on_unsupported_function() {
     );
 }
 
-/// Scenario: a plain column select item falls back
 #[test]
 fn detect_aggregates_falls_back_on_column_select() {
     let req = serde_json::json!({
@@ -374,14 +361,12 @@ fn detect_aggregates_falls_back_on_column_select() {
     );
 }
 
-/// Scenario: an empty select list yields None
 #[test]
 fn detect_aggregates_returns_none_for_empty_select_list() {
     let req = serde_json::json!({ "selectList": [] });
     assert!(detect_aggregates(&req).is_none());
 }
 
-/// Scenario: bare-column aggregates keep the fast path with no arg_expr
 #[test]
 fn bare_column_aggregates_unchanged_regression() {
     let req = serde_json::json!({
@@ -423,7 +408,6 @@ fn bare_column_aggregates_unchanged_regression() {
     assert_eq!(emits, vec![r#""PARTIAL_sum_0" DECIMAL(36,0)"#.to_string()]);
 }
 
-/// Scenario: an expression argument goes in arg_expr and partial types derive from the declared type
 #[test]
 fn expression_arg_partial_and_merge_types_from_declared_type() {
     let req = serde_json::json!({
@@ -482,7 +466,6 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
     );
 }
 
-/// Scenario: SUM of a DECIMAL(15,2) product is sized from its declared DECIMAL(36,4), not the operands
 #[test]
 fn decimal_product_sum_partial_widens_to_decimal_36() {
     let req = serde_json::json!({
@@ -526,7 +509,6 @@ fn decimal_product_sum_partial_widens_to_decimal_36() {
     assert!(validate_agg_col_types(&plans, &col_types));
 }
 
-/// Scenario: an unrenderable aggregate argument declines the whole aggregate pushdown
 #[test]
 fn unrenderable_agg_arg_falls_back_to_row_scan() {
     let unknown = serde_json::json!({
@@ -552,7 +534,6 @@ fn unrenderable_agg_arg_falls_back_to_row_scan() {
     );
 }
 
-/// Scenario: single-group COUNT(DISTINCT) becomes a DISTINCT row-scan descriptor, not an ordinary plan
 #[test]
 fn count_distinct_builds_distinct_row_scan_spec() {
     let req = serde_json::json!({
@@ -581,7 +562,6 @@ fn count_distinct_builds_distinct_row_scan_spec() {
     );
 }
 
-/// Scenario: only a lone COUNT(DISTINCT) fans out; multi or mixed distinct shapes decline
 #[test]
 fn multi_count_distinct_declines_to_qualified_wrapper() {
     let lone = serde_json::json!({
@@ -618,7 +598,6 @@ fn multi_count_distinct_declines_to_qualified_wrapper() {
     );
 }
 
-/// Scenario: a lone COUNT(DISTINCT <expression>) declines the fan-out to the qualified wrapper
 #[test]
 fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
     let expr = serde_json::json!({
@@ -656,7 +635,6 @@ fn lone_expression_count_distinct_declines_fan_out_to_wrapper() {
     );
 }
 
-/// Scenario: non-decomposable aggregates fall back to a row scan
 #[test]
 fn non_decomposable_aggregate_falls_back_to_row_scan() {
     for name in &[
@@ -682,7 +660,6 @@ fn non_decomposable_aggregate_falls_back_to_row_scan() {
     );
 }
 
-/// Scenario: parse_agg_item returns a stat plan for STDDEV/VARIANCE family names
 #[test]
 fn parse_agg_item_recognises_stat_functions() {
     for (name, expected_kind) in &[
@@ -705,7 +682,6 @@ fn parse_agg_item_recognises_stat_functions() {
     }
 }
 
-/// Scenario: a statistical aggregate over an expression argument declines
 #[test]
 fn stat_aggregate_over_expression_argument_declines() {
     for arg in [length_expr("SCORE"), mult_expr("SCORE", "ID")] {
@@ -722,7 +698,6 @@ fn stat_aggregate_over_expression_argument_declines() {
     }
 }
 
-/// Scenario: a statistical aggregate over a bare column still decomposes
 #[test]
 fn stat_aggregate_over_bare_column_still_parses() {
     let plan = parse_agg_item(&agg_item("STDDEV", Some("SCORE"), false))
@@ -849,7 +824,6 @@ fn single_group_plan_types_skips_distinct_items() {
     );
 }
 
-/// Scenario: a nested-only expression-argument MIN emits a numeric partial column
 #[test]
 fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
     let req = serde_json::json!({
@@ -873,7 +847,6 @@ fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
     );
 }
 
-/// Scenario: the merge SELECT wraps the scalar structure around the merged partial (#194)
 #[test]
 fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
     let req = serde_json::json!({
@@ -892,7 +865,6 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
     );
 }
 
-/// Scenario: an interleaved merge SELECT keeps selectList order with per-item casts
 #[test]
 fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
     let req = serde_json::json!({
@@ -924,7 +896,6 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
     );
 }
 
-/// Scenario: a slot without a usable declared type emits an uncast merge expression
 #[test]
 fn merge_select_leaves_items_uncast_without_a_declared_type() {
     let req = serde_json::json!({
@@ -946,7 +917,6 @@ fn merge_select_leaves_items_uncast_without_a_declared_type() {
     );
 }
 
-/// Scenario: a merge SELECT over a list holding a COUNT(DISTINCT) declines
 #[test]
 fn merge_select_declines_a_list_holding_a_distinct_item() {
     let req = serde_json::json!({
@@ -967,7 +937,6 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
     );
 }
 
-/// Scenario: a merge SELECT declines when the scalar structure fails to render
 #[test]
 fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
     let node = serde_json::json!({
@@ -990,7 +959,6 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
     );
 }
 
-/// Scenario: duplicate bare aggregates share one slot but keep one merge item each (#190)
 #[test]
 fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
     let req = serde_json::json!({

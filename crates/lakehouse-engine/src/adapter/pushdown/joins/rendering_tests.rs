@@ -44,7 +44,6 @@ fn self_join_legs() -> JoinLegs {
     ])
 }
 
-/// Scenario: Disjoint column names pass the guard
 #[test]
 fn disjoint_schema_guard_passes_for_disjoint_column_names() {
     let request = join_request(Json::Null, equi_condition());
@@ -56,7 +55,6 @@ fn disjoint_schema_guard_passes_for_disjoint_column_names() {
     );
 }
 
-/// Scenario: An overlapping column name fails the guard and declines without error
 #[test]
 fn overlapping_column_name_fails_guard_and_declines_without_error() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -86,7 +84,6 @@ fn overlapping_column_name_fails_guard_and_declines_without_error() {
     );
 }
 
-/// Scenario: The join condition renders via the reused translator
 #[test]
 fn join_condition_renders_via_translator() {
     assert_eq!(
@@ -103,7 +100,6 @@ fn join_condition_renders_via_translator() {
     assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
 }
 
-/// Scenario: A WHERE filter spanning both sides renders against the combined schema
 #[test]
 fn join_where_filter_spanning_both_sides_renders() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -140,7 +136,6 @@ fn join_where_filter_spanning_both_sides_renders() {
     );
 }
 
-/// Scenario: Each projected column carries its owning side's Exasol type
 #[test]
 fn join_projection_emits_attribute_each_side_owning_type() {
     let request = join_request(Json::Null, equi_condition());
@@ -163,7 +158,6 @@ fn join_projection_emits_attribute_each_side_owning_type() {
     );
 }
 
-/// Scenario: A join-list CAST resolves to an Expr projection, not the full-row fallback (#136)
 #[test]
 fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -193,7 +187,6 @@ fn join_projection_resolves_cast_node_to_expr_not_full_row_fallback() {
     );
 }
 
-/// Scenario: String-function coercion and arity declines reach the join projection (#210, #228)
 #[test]
 fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     let request = join_request(Json::Null, equi_condition());
@@ -250,7 +243,6 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     );
 }
 
-/// Scenario: The LIKE subject type guard reaches the join select list (#219)
 #[test]
 fn join_projection_like_guard_reaches_join_select_list() {
     let request = join_request(Json::Null, equi_condition());
@@ -320,7 +312,6 @@ fn join_projection_like_guard_reaches_join_select_list() {
     );
 }
 
-/// Scenario: A single-leg conjunct is attributed to its owning leg only
 #[test]
 fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
     let filter = serde_json::json!({
@@ -355,7 +346,6 @@ fn leg_local_filter_attributes_conjuncts_to_owning_leg() {
     );
 }
 
-/// Scenario: Cross-leg and leg-spanning OR conjuncts are withheld from every leg
 #[test]
 fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     let filter = serde_json::json!({
@@ -415,7 +405,6 @@ fn leg_local_filter_withholds_cross_leg_and_or_conjuncts() {
     assert!(leg_local_filter(&one_side_or, &legs, 1).is_none());
 }
 
-/// Scenario: A single non-AND conjunct is attributed to its owning leg
 #[test]
 fn leg_local_filter_handles_a_single_conjunct() {
     let single = serde_json::json!({
@@ -428,7 +417,6 @@ fn leg_local_filter_handles_a_single_conjunct() {
     assert!(leg_local_filter(&single, &legs, 1).is_none());
 }
 
-/// Scenario: A shared column name is attributed by leg, not by name
 #[test]
 fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
     let filter = serde_json::json!({
@@ -463,7 +451,6 @@ fn leg_local_filter_attributes_shared_column_by_leg_not_name() {
     );
 }
 
-/// Scenario: A self-join occurrence's conjunct reaches only its own leg (#361)
 #[test]
 fn leg_local_conjunct_reaches_only_its_own_occurrence_leg() {
     let filter = serde_json::json!({
@@ -535,7 +522,6 @@ fn orders_local_rendering_and_declined_filter() -> Json {
     })
 }
 
-/// Scenario: A DataFusion-declined side-local conjunct partitions to the residual
 #[test]
 fn declined_side_local_conjunct_partitions_to_residual() {
     let filter = orders_local_rendering_and_declined_filter();
@@ -569,7 +555,6 @@ fn declined_side_local_conjunct_partitions_to_residual() {
     );
 }
 
-/// Scenario: A DataFusion-renderable side-local conjunct still reaches its leg
 #[test]
 fn rendering_side_local_conjunct_still_reaches_its_leg() {
     let filter = orders_local_rendering_and_declined_filter();
@@ -587,7 +572,6 @@ fn rendering_side_local_conjunct_still_reaches_its_leg() {
     );
 }
 
-/// Scenario: Manifest-pruning input is unscreened when the DataFusion render declines
 #[test]
 fn join_side_pruning_input_unchanged_when_df_render_declines() {
     let filter = orders_local_rendering_and_declined_filter();
@@ -653,7 +637,6 @@ fn conjunct_count(filter: Option<&Json>) -> usize {
     })
 }
 
-/// Scenario: An all-accepted side-local set reaches the leg rewritten
 #[test]
 fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
     let filter = and_of(vec![
@@ -680,7 +663,6 @@ fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
     );
 }
 
-/// Scenario: A fully declined side-local set goes to the outer wrapper raw
 #[test]
 fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     let decimal_like = like_over("O_CUSTKEY", "ORDERS", "1%");
@@ -707,7 +689,6 @@ fn type_screened_leg_filter_declines_whole_set_when_no_conjunct_survives() {
     );
 }
 
-/// Scenario: The type-screen partition is total and fails closed
 #[test]
 fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
     let date_like = like_over("O_ORDERDATE", "ORDERS", "1995%");
@@ -763,7 +744,6 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
     );
 }
 
-/// Scenario: A type-accepted but unrenderable rewrite lands raw in the declined half
 #[test]
 fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
     let col_types = customer_col_types();
@@ -804,7 +784,6 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
     );
 }
 
-/// Scenario: Each N-scan side is type-screened against its own column types
 #[test]
 fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
     let request = serde_json::json!({
@@ -847,7 +826,6 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
     );
 }
 
-/// Scenario: Leg columns narrow to those the wrapper references, in full-column order
 #[test]
 fn referenced_leg_columns_narrows_to_used_columns() {
     let pushdown_req = serde_json::json!({
@@ -881,7 +859,6 @@ fn referenced_leg_columns_narrows_to_used_columns() {
     );
 }
 
-/// Scenario: An absent select list keeps every leg column
 #[test]
 fn referenced_leg_columns_keeps_all_when_select_list_absent() {
     let condition = serde_json::json!({
@@ -906,7 +883,6 @@ fn referenced_leg_columns_keeps_all_when_select_list_absent() {
     );
 }
 
-/// Scenario: An empty narrowing keeps the full column set, never a zero-column leg
 #[test]
 fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
     let pushdown_req = serde_json::json!({
@@ -931,7 +907,6 @@ fn referenced_leg_columns_keeps_all_when_narrowing_empty() {
     );
 }
 
-/// Scenario: The column collectors keep their divergent Unicode vs ASCII case folding
 #[test]
 fn column_collectors_keep_divergent_case_folding() {
     let expr = serde_json::json!({
@@ -959,7 +934,6 @@ fn column_collectors_keep_divergent_case_folding() {
     );
 }
 
-/// Scenario: A fan-out pushes its side-local filter bare (alias stripped) into the common blob
 #[test]
 fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
     let side = resolved_side("ORDERS", vec![("s3://w/o-0.parquet", 100)]);
@@ -1002,7 +976,6 @@ fn side_fan_out_pushes_bare_side_local_filter_into_common_blob() {
     );
 }
 
-/// Scenario: A multi-shard leg routes through the distributor and scalar scan, no wrapper
 #[test]
 fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
     let side = resolved_side(
@@ -1033,7 +1006,6 @@ fn side_fan_out_routes_through_distributor_scalar_scan_no_wrapper() {
     );
 }
 
-/// Scenario: The broadcast fact side uses the distributor and scalar scan
 #[test]
 fn broadcast_fact_side_uses_distributor_scalar_scan() {
     let fact = resolved_side(
@@ -1082,7 +1054,6 @@ fn broadcast_fact_side_uses_distributor_scalar_scan() {
     );
 }
 
-/// Scenario: Broadcast rendering strips the native tableAlias from the filter
 #[test]
 fn render_broadcast_join_strips_native_table_alias_from_filter() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -1106,7 +1077,6 @@ fn render_broadcast_join_strips_native_table_alias_from_filter() {
     );
 }
 
-/// Scenario: Broadcast rendering strips the native tableAlias from the condition
 #[test]
 fn render_broadcast_join_strips_native_table_alias_from_condition() {
     let condition = serde_json::json!({
@@ -1122,7 +1092,6 @@ fn render_broadcast_join_strips_native_table_alias_from_condition() {
     assert_eq!(rendered.condition, r#"("C_CUSTKEY" = "O_CUSTKEY")"#);
 }
 
-/// Scenario: Broadcast rendering strips the native tableAlias from projections
 #[test]
 fn render_broadcast_join_strips_native_table_alias_from_projection() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -1145,7 +1114,6 @@ fn render_broadcast_join_strips_native_table_alias_from_projection() {
     }
 }
 
-/// Scenario: The unified wrapper prunes and narrows each leg
 #[test]
 fn unified_join_prunes_and_narrows_each_leg() {
     let request = serde_json::json!({

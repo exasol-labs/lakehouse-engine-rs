@@ -35,7 +35,6 @@ fn single_col_batch(name: &str, col: Arc<dyn Array>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![col]).unwrap()
 }
 
-/// Scenario: Arrow columns map to the correct Value variants; null → Value::Null.
 #[test]
 fn arrow_columns_map_to_value_variants() {
     let mut b = BooleanBuilder::new();
@@ -122,7 +121,6 @@ fn arrow_columns_map_to_value_variants() {
     }
 }
 
-/// Scenario: Int64 and in-range UInt32/UInt64 yield Value::Int64; UInt64 above i64::MAX yields Numeric scale 0.
 #[test]
 fn int64_uint32_uint64_convert_identically_through_flat_arms() {
     let mut i64b = Int64Builder::new();
@@ -153,7 +151,6 @@ fn int64_uint32_uint64_convert_identically_through_flat_arms() {
     }
 }
 
-/// Scenario: a NaN from out-of-domain math raises a domain error instead of becoming Value::Null (#199).
 #[test]
 fn nan_double_and_float_are_domain_errors() {
     let mut f64b = Float64Builder::new();
@@ -175,7 +172,6 @@ fn nan_double_and_float_are_domain_errors() {
     );
 }
 
-/// Scenario: incompatible columns (list/struct/map/binary) emit Value::String JSON.
 #[test]
 fn incompatible_columns_emit_json_strings() {
     let bin_arr = BinaryArray::from_vec(vec![b"abc".as_ref()]);
@@ -226,7 +222,6 @@ fn incompatible_columns_emit_json_strings() {
     );
 }
 
-/// Scenario: a tz-aware Iceberg timestamptz column converts to the correct UTC instant.
 #[test]
 fn tz_aware_timestamp_converts_to_utc_instant_value() {
     let epoch_micros: i64 = 1_704_067_200_000_000;
@@ -240,7 +235,6 @@ fn tz_aware_timestamp_converts_to_utc_instant_value() {
     assert_eq!(rows[0][0], Value::Timestamp(expected));
 }
 
-/// Scenario: a `Timestamp(Nanosecond, _)` cell keeps all nine fractional digits.
 #[test]
 fn nanosecond_timestamp_keeps_every_fractional_digit() {
     let instant = NaiveDate::from_ymd_opt(2024, 1, 1)
@@ -254,7 +248,6 @@ fn nanosecond_timestamp_keeps_every_fractional_digit() {
     assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
 }
 
-/// Scenario: a pre-epoch cell keeps its sub-second digits (the split floors, not truncates).
 #[test]
 fn pre_epoch_nanosecond_timestamp_keeps_every_fractional_digit() {
     let instant = NaiveDate::from_ymd_opt(1969, 12, 31)
@@ -268,7 +261,6 @@ fn pre_epoch_nanosecond_timestamp_keeps_every_fractional_digit() {
     assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
 }
 
-/// Scenario: an instant outside an `i64` nanosecond count's 1677-2262 range still converts.
 #[test]
 fn timestamp_outside_the_nanosecond_epoch_range_still_converts() {
     let instant = NaiveDate::from_ymd_opt(1500, 3, 17)
@@ -284,7 +276,6 @@ fn timestamp_outside_the_nanosecond_epoch_range_still_converts() {
     assert_eq!(batch_to_rows(&batch)[0][0], Value::Timestamp(instant));
 }
 
-/// Scenario: an instant `chrono::NaiveDateTime` cannot represent fails naming the Arrow unit.
 #[test]
 fn timestamp_outside_the_representable_range_fails_the_conversion() {
     let arr = TimestampSecondArray::from(vec![Some(i64::MAX)]);

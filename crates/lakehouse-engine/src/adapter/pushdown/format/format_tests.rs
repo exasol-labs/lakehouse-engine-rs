@@ -46,7 +46,6 @@ fn unity_table(format: TableFormat) -> CatalogTable {
     }
 }
 
-/// Scenario: A Unity Catalog table reporting the Iceberg format is refused by name, never routed to a Unity reader
 #[test]
 fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     let creds = offline_sigv4_creds();
@@ -82,7 +81,6 @@ fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     );
 }
 
-/// Scenario: A Unity Catalog Delta table selects its reader without contacting the catalog
 #[test]
 fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_the_catalog() {
     let creds = offline_sigv4_creds();
@@ -111,7 +109,6 @@ fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_t
     }
 }
 
-/// Scenario: An Iceberg REST source selects its reader without contacting the catalog
 #[tokio::test]
 async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog() {
     let creds = offline_sigv4_creds();
@@ -142,7 +139,6 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
     );
 }
 
-/// Scenario: A raw Parquet directory selects its reader without touching the store
 #[test]
 fn third_scan_source_selects_the_parquet_reader() {
     let creds = offline_sigv4_creds();
@@ -172,7 +168,7 @@ fn third_scan_source_selects_the_parquet_reader() {
     );
 }
 
-/// Scenario: A table with no mappable column is refused as a whole
+/// Scenario: A Delta table with no mappable column is refused as a whole
 #[test]
 fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {
     let refused = |column_name: &str, reason: &str| RefusedColumn {

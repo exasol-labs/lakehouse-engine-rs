@@ -542,7 +542,6 @@ fn rows_of(batches: &[RecordBatch]) -> Vec<(i64, String)> {
     out
 }
 
-/// Scenario: a spec-supplied file size serves the per-file HEAD with no store request and identical rows
 #[test]
 fn scan_uses_spec_size_and_issues_no_head() {
     let dir = std::env::temp_dir().join(format!("lh_no_head_{}", std::process::id()));
@@ -609,7 +608,6 @@ fn scan_uses_spec_size_and_issues_no_head() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a relative entry joined onto `table_root` resolves to the same file as the absolute entry
 #[test]
 fn relative_and_absolute_entries_resolve_to_same_files() {
     let dir = std::env::temp_dir().join(format!("lh_rel_abs_{}", std::process::id()));
@@ -655,7 +653,6 @@ fn relative_and_absolute_entries_resolve_to_same_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: a delete-carrying scan issues no HEAD for its positional-delete file
 #[test]
 fn scan_issues_no_head_for_delete_files() {
     let dir = std::env::temp_dir().join(format!("lh_no_head_del_{}", std::process::id()));
@@ -708,7 +705,6 @@ fn scan_issues_no_head_for_delete_files() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: attaching a positional-delete file adds no GET against the data file's own footer
 #[test]
 fn scan_reads_footer_via_range_get_once() {
     let dir = std::env::temp_dir().join(format!("lh_footer_once_{}", std::process::id()));
@@ -794,7 +790,6 @@ fn scan_reads_footer_via_range_get_once() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: plan construction fetches a delete-carrying data file's footer with one bounded suffix GET
 #[test]
 fn scan_access_plan_footer_fetch_is_one_range_get() {
     // More than one request means Phase B lost the metadata size hint or `PageIndexPolicy::Skip`.
@@ -883,7 +878,6 @@ fn scan_access_plan_footer_fetch_is_one_range_get() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Scenario: footer reuse holds at shard scale with the metadata cache near its eviction limit (#165)
 #[test]
 fn scan_footer_reuse_holds_at_shard_scale() {
     // The fixture is calibrated (decision-log [6]) so 22 footers of 64 columns × 64 row groups

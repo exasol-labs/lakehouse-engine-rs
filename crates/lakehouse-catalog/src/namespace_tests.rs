@@ -1,7 +1,6 @@
 use super::*;
 use crate::test_support::*;
 
-/// Scenario: A single-level identifier splits into its namespace and table.
 #[test]
 fn parse_table_ident_splits_namespace_table() {
     let (ns, tbl) = parse_table_ident("mydb.mytable").unwrap();
@@ -38,7 +37,6 @@ fn parse_table_ident_handles_multilevel_namespace() {
     assert_eq!(tbl3, "orders");
 }
 
-/// Scenario: An empty configured namespace is rejected before any catalog request.
 #[tokio::test]
 async fn list_namespace_tables_rejects_empty_namespace() {
     let storage = static_backend();
@@ -54,7 +52,6 @@ async fn list_namespace_tables_rejects_empty_namespace() {
     );
 }
 
-/// Scenario: The SigV4 enumeration signs `list_tables` against the derived `catalogs/{account-id}` prefix.
 #[tokio::test]
 async fn list_tables_signed_url_carries_catalogs_prefix() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
@@ -90,7 +87,6 @@ async fn list_tables_signed_url_carries_catalogs_prefix() {
 
 const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
 
-/// Scenario: Every enumeration request is signed for the resolved region, not the stated one.
 #[tokio::test]
 async fn signed_enumeration_is_signed_for_the_resolved_region() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;
@@ -124,7 +120,6 @@ async fn signed_enumeration_is_signed_for_the_resolved_region() {
     }
 }
 
-/// Scenario: The signed enumeration refuses without a signing region before sending any request.
 #[tokio::test]
 async fn signed_enumeration_refuses_without_signing_region() {
     let (catalog_uri, heads) = spawn_recording_catalog(EMPTY_LISTING).await;

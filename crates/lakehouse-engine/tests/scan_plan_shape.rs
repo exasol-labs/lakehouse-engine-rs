@@ -170,7 +170,6 @@ fn write_local_parquet_with_score(dir: &std::path::Path) -> String {
         .to_string()
 }
 
-/// Scenario: a projection mixing a bare column with expressions splices expressions verbatim and quotes the column
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_scan_projects_mixed_column_and_expression_items() {
     let dir = std::env::temp_dir().join(format!("lh_mixed_proj_{}", std::process::id()));
@@ -343,7 +342,6 @@ fn aggregate_spec(aggregates: Vec<lakehouse_engine::scan::spec::AggregatePlan>) 
     }
 }
 
-/// Scenario: `SUM(col * col)` pushes down as a partial/merge aggregate sized from the declared type
 #[test]
 fn sum_two_column_product_emits_aggregates_not_raw_scan() {
     let req = serde_json::json!({
@@ -465,7 +463,6 @@ fn row_scan_fans_out_via_nested_distributor_over_scalar_scan() {
     );
 }
 
-/// Scenario: ordered top-N attaches ORDER BY … LIMIT to the outer scalar select, after the fan-out
 #[test]
 fn topn_order_by_limit_attaches_to_outer_scalar_select() {
     let proj = vec![ProjectionItem::Column("L_EXTENDEDPRICE".into())];
@@ -699,7 +696,6 @@ fn sum_row_groups_pruned(plan: &dyn ExecutionPlan) -> usize {
     total
 }
 
-/// Scenario: a delete-carrying scan stays single-partition and still prunes row groups with an access plan attached
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn raw_plan_lean_and_prunes_with_access_plan() {
     // Uses `register_files`: `register_parquet` never attaches a base `ParquetAccessPlan`.

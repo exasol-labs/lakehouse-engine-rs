@@ -27,7 +27,6 @@ fn dispatch_unknown_type_errors() {
     assert!(err.to_string().contains("unsupported"));
 }
 
-/// Scenario: `refresh` and `setProperties` route to schema creation, never `unsupported`.
 #[test]
 fn refresh_and_set_properties_dispatched_not_unsupported() {
     for req_type in ["refresh", "setProperties"] {
@@ -44,7 +43,6 @@ fn refresh_and_set_properties_dispatched_not_unsupported() {
     }
 }
 
-/// Scenario: the response `type` mirrors the request `type` (Exasol VS protocol requirement).
 #[test]
 fn build_schema_response_type_mirrors_request() {
     let schema_metadata = serde_json::json!({"tables": [], "adapterNotes": "{}"});
@@ -59,7 +57,6 @@ fn build_schema_response_type_mirrors_request() {
     }
 }
 
-/// Scenario: `requestedTables` is echoed verbatim when present and absent otherwise.
 #[test]
 fn build_schema_response_echoes_requested_tables_present_and_absent() {
     let schema_metadata = serde_json::json!({"tables": [], "adapterNotes": "{}"});
@@ -83,7 +80,6 @@ fn build_schema_response_echoes_requested_tables_present_and_absent() {
     );
 }
 
-/// Scenario: in `merge_set_properties` request values win and an explicit `null` unsets.
 #[test]
 fn merge_set_properties_new_wins_and_null_unsets() {
     let req = serde_json::json!({
@@ -134,7 +130,6 @@ fn s3_style_password() -> String {
     .to_string()
 }
 
-/// Scenario: null-unsetting `NAMESPACE` via `setProperties` fails the required-property check.
 #[test]
 fn set_properties_null_unset_required_property_errors_not_panic() {
     let req = serde_json::json!({
@@ -166,7 +161,6 @@ fn set_properties_null_unset_required_property_errors_not_panic() {
     );
 }
 
-/// Scenario: the removed `ICEBERG_NAMESPACE` alias does not satisfy `NAMESPACE`.
 #[test]
 fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
     let req = serde_json::json!({
@@ -195,7 +189,6 @@ fn create_virtual_schema_rejects_old_namespace_alias_without_replacement() {
     );
 }
 
-/// Scenario: `NAMESPACE` is required for catalog kinds but optional under `DIRECT_STORAGE`.
 #[test]
 fn namespace_is_required_for_catalog_kinds_only() {
     let catalog_req = serde_json::json!({
@@ -248,7 +241,6 @@ fn namespace_is_required_for_catalog_kinds_only() {
 // A closed local port: connection refused, no DNS, no hang, so resolution fails fast.
 const CLOSED_PORT_ADDRESS: &str = "http://127.0.0.1:1";
 
-/// Scenario: a Unity-kind pushdown reaches the Unity Catalog load-table call.
 #[test]
 
 fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
@@ -308,7 +300,6 @@ fn cluster_nodes_from_context_passes_through_reported_node_count() {
     );
 }
 
-/// Scenario: adapterNotes absent, unparseable, or empty yields no note.
 #[test]
 fn adapter_note_absent_or_unparseable_yields_none() {
     let bare = serde_json::json!({"type": "pushdown"});
@@ -327,7 +318,6 @@ fn adapter_note_absent_or_unparseable_yields_none() {
     assert!(adapter_note(&empty, NOTE_PARALLELISM_FACTOR).is_none());
 }
 
-/// Scenario: `build_adapter_notes` merges into, rather than clobbers, existing notes.
 #[test]
 fn build_adapter_notes_merges_existing() {
     let req = serde_json::json!({
@@ -363,7 +353,6 @@ fn build_adapter_notes_merges_existing() {
     );
 }
 
-/// Scenario: adapterNotes carry no CLUSTER_NODES key.
 #[test]
 fn adapter_notes_omit_cluster_nodes() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
@@ -393,7 +382,6 @@ fn adapter_notes_omit_cluster_nodes() {
     );
 }
 
-/// Scenario: refresh rebuilds TABLE_MAP from the fresh listing and preserves unrelated notes.
 #[test]
 fn refresh_rebuilds_table_map_preserves_notes() {
     let req = serde_json::json!({
@@ -449,7 +437,6 @@ fn refresh_rebuilds_table_map_preserves_notes() {
     );
 }
 
-/// Scenario: createVirtualSchema records the parallelism factor in adapterNotes.
 #[test]
 fn create_vs_records_parallelism_factor() {
     let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "4" });
@@ -494,7 +481,6 @@ fn create_vs_records_parallelism_factor() {
     );
 }
 
-/// Scenario: PARALLELISM_FACTOR round-trips through adapterNotes.
 #[test]
 fn adapter_notes_carry_parallelism_factor() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
@@ -524,7 +510,6 @@ fn adapter_notes_carry_parallelism_factor() {
     );
 }
 
-/// Scenario: the core count comes from available_parallelism() and is positive.
 #[test]
 fn core_count_comes_from_available_parallelism() {
     let nr_of_cores = resolve_nr_of_cores();
@@ -534,7 +519,6 @@ fn core_count_comes_from_available_parallelism() {
     );
 }
 
-/// Scenario: an undetectable core count defaults to 1, matching a genuine single-core node.
 #[test]
 fn core_count_defaults_to_one_when_detection_fails() {
     let detection_failed = Err(std::io::Error::other("platform reports no core count"));
@@ -545,7 +529,6 @@ fn core_count_defaults_to_one_when_detection_fails() {
     );
 }
 
-/// Scenario: a detected multi-core count is used, not collapsed to the single-core fallback.
 #[test]
 fn core_count_uses_the_detected_count_when_detection_succeeds() {
     let detected = Ok(std::num::NonZeroUsize::new(12).unwrap());
@@ -557,7 +540,6 @@ fn core_count_uses_the_detected_count_when_detection_succeeds() {
     );
 }
 
-/// Scenario: Default parallelism factor equals nr_of_cores × 2 when cores > 4.
 #[test]
 fn default_parallelism_factor_is_cores_times_two() {
     let props = serde_json::json!({});
@@ -568,7 +550,6 @@ fn default_parallelism_factor_is_cores_times_two() {
     );
 }
 
-/// Scenario: the default parallelism factor floors at DEFAULT_PARALLELISM_FACTOR.
 #[test]
 fn default_parallelism_factor_floors_at_eight() {
     let props = serde_json::json!({});
@@ -585,7 +566,6 @@ fn default_parallelism_factor_floors_at_eight() {
     );
 }
 
-/// Scenario: An explicit PARALLELISM_FACTOR property overrides the default formula.
 #[test]
 fn explicit_parallelism_factor_overrides_default() {
     let props = serde_json::json!({ PROP_PARALLELISM_FACTOR: "5" });
@@ -596,7 +576,6 @@ fn explicit_parallelism_factor_overrides_default() {
     );
 }
 
-/// Scenario: DF_TARGET_PARTITIONS defaults to 1 when absent/zero/invalid with unknown cores.
 #[test]
 fn df_target_partitions_defaults_to_one() {
     let absent = serde_json::json!({});
@@ -621,7 +600,6 @@ fn df_target_partitions_defaults_to_one() {
     );
 }
 
-/// Scenario: An explicit positive DATAFUSION_TARGET_PARTITIONS property is used as-is.
 #[test]
 fn df_target_partitions_uses_supplied_value() {
     let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "4" });
@@ -651,7 +629,6 @@ fn df_target_partitions_uses_supplied_value() {
     );
 }
 
-/// Scenario: DATAFUSION_BATCH_SIZE flows create → adapterNote → pushdown, clamping zero to 1.
 #[test]
 fn df_batch_size_uses_supplied_value() {
     let props = serde_json::json!({ PROP_DF_BATCH_SIZE: "4096" });
@@ -699,7 +676,6 @@ fn df_batch_size_uses_supplied_value() {
     );
 }
 
-/// Scenario: DF_THREADS_PER_UDF defaults to 1 when absent/zero/invalid with unknown cores.
 #[test]
 fn df_threads_per_udf_defaults_to_one() {
     let absent = serde_json::json!({});
@@ -724,7 +700,6 @@ fn df_threads_per_udf_defaults_to_one() {
     );
 }
 
-/// Scenario: An explicit positive DATAFUSION_THREADS_PER_UDF property is used as-is.
 #[test]
 fn df_threads_per_udf_uses_supplied_value() {
     let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
@@ -754,7 +729,6 @@ fn df_threads_per_udf_uses_supplied_value() {
     );
 }
 
-/// Scenario: resolve_memory_pool_fraction defaults/validates.
 #[test]
 fn resolve_memory_pool_fraction_defaults_and_validates() {
     let absent = serde_json::json!({});
@@ -800,7 +774,6 @@ fn resolve_memory_pool_fraction_defaults_and_validates() {
     );
 }
 
-/// Scenario: resolve_instance_overhead_mb defaults/validates.
 #[test]
 fn resolve_instance_overhead_mb_defaults_and_validates() {
     let absent = serde_json::json!({});
@@ -839,7 +812,6 @@ fn resolve_instance_overhead_mb_defaults_and_validates() {
     );
 }
 
-/// Scenario: resolve_join_broadcast_max_bytes defaults/validates.
 #[test]
 fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
     let absent = serde_json::json!({});
@@ -889,7 +861,6 @@ fn resolve_join_broadcast_max_bytes_defaults_and_validates() {
     );
 }
 
-/// Scenario: JOIN_BROADCAST_MAX_BYTES round-trips through build_adapter_notes → adapter_note.
 #[test]
 fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
@@ -919,7 +890,6 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
     );
 }
 
-/// Scenario: MEMORY_POOL_FRACTION and INSTANCE_OVERHEAD_MB round-trip through adapterNotes.
 #[test]
 fn memory_budget_params_round_trip_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
@@ -954,7 +924,6 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
     );
 }
 
-/// Scenario: an explicit DATAFUSION_TARGET_PARTITIONS wins over the cores-driven default.
 #[test]
 fn df_target_partitions_explicit_wins() {
     let props = serde_json::json!({ PROP_DF_TARGET_PARTITIONS: "3" });
@@ -965,7 +934,6 @@ fn df_target_partitions_explicit_wins() {
     );
 }
 
-/// Scenario: absent DATAFUSION_TARGET_PARTITIONS with 8 cores defaults to 8.
 #[test]
 fn df_target_partitions_defaults_to_nr_of_cores() {
     let props = serde_json::json!({});
@@ -976,7 +944,6 @@ fn df_target_partitions_defaults_to_nr_of_cores() {
     );
 }
 
-/// Scenario: absent DATAFUSION_TARGET_PARTITIONS with 1 core defaults to 1.
 #[test]
 fn df_target_partitions_one_core_defaults_to_1() {
     let props = serde_json::json!({});
@@ -987,7 +954,6 @@ fn df_target_partitions_one_core_defaults_to_1() {
     );
 }
 
-/// Scenario: an explicit DATAFUSION_THREADS_PER_UDF wins over the cores-driven default.
 #[test]
 fn df_threads_per_udf_explicit_wins() {
     let props = serde_json::json!({ PROP_DF_THREADS_PER_UDF: "2" });
@@ -998,7 +964,6 @@ fn df_threads_per_udf_explicit_wins() {
     );
 }
 
-/// Scenario: absent DATAFUSION_THREADS_PER_UDF with 8 cores defaults to 8.
 #[test]
 fn df_threads_per_udf_defaults_to_nr_of_cores() {
     let props = serde_json::json!({});
@@ -1009,7 +974,6 @@ fn df_threads_per_udf_defaults_to_nr_of_cores() {
     );
 }
 
-/// Scenario: absent DATAFUSION_THREADS_PER_UDF with 1 core defaults to 1.
 #[test]
 fn df_threads_per_udf_one_core_defaults_to_1() {
     let props = serde_json::json!({});
@@ -1020,7 +984,6 @@ fn df_threads_per_udf_one_core_defaults_to_1() {
     );
 }
 
-/// Scenario: DATAFUSION_THREADING_MODE parses case-insensitively; other values resolve to AUTO.
 #[test]
 fn threading_mode_parses_case_insensitively() {
     assert_eq!(
@@ -1040,7 +1003,6 @@ fn threading_mode_parses_case_insensitively() {
     );
 }
 
-/// Scenario: threading mode defaults to AUTO and the resolved mode is recorded in adapterNotes.
 #[test]
 fn threading_mode_defaults_to_auto() {
     assert_eq!(
@@ -1082,7 +1044,6 @@ fn threading_mode_defaults_to_auto() {
     );
 }
 
-/// Scenario: AUTO derives threads with instances × threads ≤ cores, partitions in lockstep.
 #[test]
 fn auto_mode_derives_non_oversubscribing_threads() {
     let (target_partitions, threads) =
@@ -1112,7 +1073,6 @@ fn auto_mode_derives_non_oversubscribing_threads() {
     assert_eq!(tp_ignored, 4, "AUTO ignores supplied target partitions");
 }
 
-/// Scenario: AUTO mode yields one thread and one partition on a one-core node.
 #[test]
 fn auto_mode_yields_one_thread_on_one_core() {
     let (target_partitions, threads) =
@@ -1121,7 +1081,6 @@ fn auto_mode_yields_one_thread_on_one_core() {
     assert_eq!(target_partitions, 1, "one core → 1 target partition");
 }
 
-/// Scenario: FIXED mode uses supplied values verbatim, else max(nr_of_cores, 1) per field.
 #[test]
 fn fixed_mode_uses_supplied_values() {
     let props = serde_json::json!({
@@ -1141,7 +1100,6 @@ fn fixed_mode_uses_supplied_values() {
     assert_eq!(th_z, 1, "absent threads, cores=0 → 1");
 }
 
-/// Scenario: TABLE_MAP round-trips through build_adapter_notes → read_table_map.
 #[test]
 fn table_map_round_trips_through_adapter_notes() {
     let table_map = vec![
@@ -1185,7 +1143,6 @@ fn table_map_round_trips_through_adapter_notes() {
     assert_eq!(recovered.len(), 2, "map must have exactly two entries");
 }
 
-/// Scenario: TABLE_MAP is stored as a nested JSON object, not a string.
 #[test]
 fn table_map_stored_as_nested_json_object() {
     let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
@@ -1217,7 +1174,6 @@ fn table_map_stored_as_nested_json_object() {
     );
 }
 
-/// Scenario: TABLE_MAP merges with existing adapterNotes entries.
 #[test]
 fn table_map_merges_with_existing_notes() {
     let req = serde_json::json!({
@@ -1250,7 +1206,6 @@ fn table_map_merges_with_existing_notes() {
     assert!(parsed[NOTE_TABLE_MAP].is_object());
 }
 
-/// Scenario: read_table_map returns an empty map when TABLE_MAP is absent.
 #[test]
 fn read_table_map_absent_returns_empty() {
     let req = serde_json::json!({"type": "pushdown"});
@@ -1293,7 +1248,6 @@ fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &st
     })
 }
 
-/// Scenario: a pushdown naming an unknown virtual table errors naming it.
 #[test]
 fn pushdown_unknown_involved_table_errors() {
     let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
@@ -1306,7 +1260,6 @@ fn pushdown_unknown_involved_table_errors() {
     );
 }
 
-/// Scenario: TABLE_MAP lookup resolves a known virtual table.
 #[test]
 fn pushdown_known_involved_table_resolves_identifier() {
     let table_map = vec![("ORDERS".to_string(), "prod.finance.orders".to_string())];
@@ -1319,7 +1272,6 @@ fn pushdown_known_involved_table_resolves_identifier() {
     );
 }
 
-/// Scenario: a direct-storage TABLE_MAP entry is the bare directory name and round-trips.
 #[test]
 fn table_map_records_the_bare_directory_name_and_round_trips() {
     let idents = vec![
@@ -1357,7 +1309,6 @@ fn cat_ident(ns: &[&str], name: &str) -> CatalogTableIdent {
     }
 }
 
-/// Scenario: multi-level flattening is deterministic and a collision names the Exasol table.
 #[test]
 fn flatten_multilevel_namespace_and_detect_collision() {
     let configured_ns = vec!["prod".to_string(), "finance".to_string()];
@@ -1394,7 +1345,6 @@ fn flatten_multilevel_namespace_and_detect_collision() {
     );
 }
 
-/// Scenario: createVirtualSchema records TABLE_MAP in adapterNotes, preserving foreign notes.
 #[test]
 fn create_vs_records_table_map_in_adapter_notes() {
     let configured_ns = vec!["prod".to_string(), "finance".to_string()];
@@ -1448,7 +1398,6 @@ fn create_vs_records_table_map_in_adapter_notes() {
     );
 }
 
-/// Scenario: Iceberg listing output is unchanged behind `CatalogClient`, incl. the `ß` fold.
 #[test]
 fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     use iceberg::spec::{PrimitiveType, Type};
@@ -1521,7 +1470,6 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     );
 }
 
-/// Scenario: both skip-warning lines are pinned: the Iceberg line and the Unity detail line.
 #[test]
 fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
     assert_eq!(
@@ -1542,7 +1490,6 @@ fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
     );
 }
 
-/// Scenario: an explicit S3_MAX_CONNECTIONS overrides the AUTO derivation.
 #[test]
 fn resolve_s3_max_connections_fixed_value_wins() {
     let props = serde_json::json!({ PROP_S3_MAX_CONNECTIONS: "64" });
@@ -1558,7 +1505,6 @@ fn resolve_s3_max_connections_fixed_value_wins() {
     );
 }
 
-/// Scenario: AUTO sizes the budget so the per-node aggregate tracks nr_of_cores × multiplier.
 #[test]
 fn resolve_s3_max_connections_auto_scales_with_cores() {
     let absent = serde_json::json!({});
@@ -1603,7 +1549,6 @@ fn resolve_s3_max_connections_auto_scales_with_cores() {
     );
 }
 
-/// Scenario: AUTO on one core yields one thread's connection share, never zero.
 #[test]
 fn resolve_s3_max_connections_auto_one_core_yields_one_threads_share() {
     let absent = serde_json::json!({});

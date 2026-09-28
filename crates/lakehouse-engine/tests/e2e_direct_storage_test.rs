@@ -739,7 +739,6 @@ fn declared_columns(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<Strin
     )
 }
 
-/// Scenario: the raw Parquet fixture is physically the types it declares
 #[test]
 fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
     setup();
@@ -791,7 +790,6 @@ fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
     assert_eq!(physical("SCORE").to_string(), "DOUBLE");
 }
 
-/// Scenario: `events/` declares the Arrow-to-Exasol mapping and returns both files' rows
 #[test]
 fn events_directory_declares_and_returns_mixed_types_across_both_files() {
     setup();
@@ -829,7 +827,6 @@ fn events_directory_declares_and_returns_mixed_types_across_both_files() {
     assert_eq!(parse_int(&non_null_count[0][0]), 5);
 }
 
-/// Scenario: nested subdirectories union into one table with zero partition columns
 #[test]
 fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
     setup();
@@ -855,7 +852,6 @@ fn nested_directory_unions_subdirectory_files_with_zero_partition_columns() {
     assert_eq!(value_to_string(&cols[1][1]), "from-b");
 }
 
-/// Scenario: struct, list, and map columns declare `VARCHAR(2000000)` and render as JSON
 #[test]
 fn complex_directory_declares_varchar_and_returns_parseable_json() {
     setup();
@@ -907,7 +903,6 @@ fn complex_directory_declares_varchar_and_returns_parseable_json() {
     assert!(cols[3][1].is_null(), "ATTRS row 1 must be SQL NULL");
 }
 
-/// Scenario: a loose file and a data-file-less directory serve no table
 #[test]
 fn loose_file_and_empty_directory_serve_no_table() {
     setup();
@@ -918,7 +913,6 @@ fn loose_file_and_empty_directory_serve_no_table() {
     assert!(tables.contains(&"EVENTS".to_string()));
 }
 
-/// Scenario: widened columns declare the wider type and every row reads back
 #[test]
 fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
     setup();
@@ -946,7 +940,6 @@ fn widened_columns_declare_the_wider_type_and_every_row_reads_back() {
     }
 }
 
-/// Scenario: a column missing from one file is declared and reads NULL there
 #[test]
 fn missing_column_declares_the_union_and_nulls_the_absent_column() {
     setup();
@@ -966,7 +959,6 @@ fn missing_column_declares_the_union_and_nulls_the_absent_column() {
     assert_eq!(parse_int(&cols[0][2]), 3);
 }
 
-/// Scenario: an incompatible column pair fails CREATE VIRTUAL SCHEMA naming the column and both files
 #[test]
 fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     setup();
@@ -986,7 +978,6 @@ fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     );
 }
 
-/// Scenario: `MERGE_SCHEMA = 'FALSE'` declares the narrow sampled type and refuses a wider file column
 #[test]
 fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_column() {
     setup();
@@ -1034,7 +1025,6 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_
     );
 }
 
-/// Scenario: a value outside the stale narrow declaration surfaces a clean error
 #[test]
 fn stale_declaration_decides_the_emitted_width() {
     setup();
@@ -1051,7 +1041,6 @@ fn stale_declaration_decides_the_emitted_width() {
     );
 }
 
-/// Scenario: a Delta directory read as raw Parquet deliberately returns tombstoned rows
 #[test]
 fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
     setup();
@@ -1070,7 +1059,6 @@ fn delta_directory_read_as_raw_parquet_returns_tombstoned_rows() {
     );
 }
 
-/// Scenario: only first-level directories with a data file become tables and `NAMESPACE` narrows to a subtree
 #[test]
 fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtree() {
     setup();
@@ -1113,7 +1101,6 @@ fn discovery_scopes_to_first_level_directories_and_namespace_narrows_to_a_subtre
     );
 }
 
-/// Scenario: malformed CONNECTIONs are rejected at CREATE VIRTUAL SCHEMA without leaking credentials
 #[test]
 fn malformed_connections_are_rejected_at_create_virtual_schema() {
     setup();
@@ -1219,7 +1206,6 @@ fn malformed_connections_are_rejected_at_create_virtual_schema() {
     rejection_message(&resp, "an unparseable MERGE_SCHEMA value");
 }
 
-/// Scenario: projection, filter, and `LIMIT` reach the scan spec
 #[test]
 fn projection_filter_and_limit_reach_the_scan() {
     setup();
@@ -1251,7 +1237,6 @@ fn projection_filter_and_limit_reach_the_scan() {
     );
 }
 
-/// Scenario: single-group and `GROUP BY` aggregates match the unpushed answer
 #[test]
 fn group_by_aggregate_matches_the_unpushed_answer() {
     setup();
@@ -1293,7 +1278,6 @@ fn group_by_aggregate_matches_the_unpushed_answer() {
     }
 }
 
-/// Scenario: a two-table inner equi-join matches the unpushed answer in one pushdown request
 #[test]
 fn two_table_join_matches_the_unpushed_answer_in_one_request() {
     setup();
@@ -1360,7 +1344,6 @@ fn int_column(cells: &[Json]) -> Vec<i64> {
     ids
 }
 
-/// Scenario: hive segments declare trailing `VARCHAR` partition columns with decoded values
 #[test]
 fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
     setup();
@@ -1420,7 +1403,6 @@ fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
     assert_eq!(regions, ["a/b"], "a partition value must percent-decode");
 }
 
-/// Scenario: a mixed layout unions partition keys and nulls the missing key
 #[test]
 fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
     setup();
@@ -1459,7 +1441,6 @@ fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
     );
 }
 
-/// Scenario: a partition key colliding with a Parquet column overrides it
 #[test]
 fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     setup();
@@ -1501,7 +1482,6 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
     );
 }
 
-/// Scenario: a colliding column in a file with no matching segment fails CREATE VIRTUAL SCHEMA
 #[test]
 fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
     setup();
@@ -1549,7 +1529,6 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
     );
 }
 
-/// Scenario: `HIVE_PARTITIONING = 'FALSE'` declares no partition columns and prunes no file
 #[test]
 fn hive_partitioning_false_declares_no_partition_columns() {
     setup();
@@ -1575,7 +1554,6 @@ fn hive_partitioning_false_declares_no_partition_columns() {
     assert_eq!(parse_int(&count[0][0]), 4, "no SALES file may be pruned");
 }
 
-/// Scenario: a partition filter prunes the resolved file list
 #[test]
 fn partition_filter_prunes_the_resolved_file_list() {
     setup();
@@ -1603,7 +1581,6 @@ fn partition_filter_prunes_the_resolved_file_list() {
     }
 }
 
-/// Scenario: a column only pruned files carry reads NULL
 #[test]
 fn a_column_only_pruned_files_carry_reads_null() {
     setup();
@@ -1660,7 +1637,6 @@ fn returned_regions(conn: &mut ExaConn, predicate: &str) -> BTreeSet<String> {
     )
 }
 
-/// Scenario: range pruning matches Exasol's native `VARCHAR` ordering
 #[test]
 fn range_pruning_matches_exasols_native_varchar_ordering() {
     setup();
@@ -1718,7 +1694,6 @@ fn range_pruning_matches_exasols_native_varchar_ordering() {
     );
 }
 
-/// Scenario: a partition predicate no file satisfies returns zero rows without error
 #[test]
 fn zero_matching_files_prune_to_zero_rows_without_error() {
     setup();

@@ -48,7 +48,6 @@ fn typed_table() -> String {
     format!("{VS_NAME}.{}", E2E_TYPED_TABLE.to_uppercase())
 }
 
-/// Scenario: an undeclared-cap connection pushes no `limit` and returns every row
 #[test]
 fn undeclared_cap_pushes_no_limit() {
     setup_e2e();
@@ -71,7 +70,6 @@ fn undeclared_cap_pushes_no_limit() {
     );
 }
 
-/// Scenario: a declared row cap truncates the delivered row count
 // Only the delivered count is asserted: `EXPLAIN VIRTUAL` never carries a
 // cap-derived pushdown `limit`, so it cannot observe one.
 #[test]

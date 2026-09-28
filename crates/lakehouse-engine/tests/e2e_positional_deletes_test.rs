@@ -77,7 +77,6 @@ fn ids_column(cols: &[Vec<serde_json::Value>]) -> Vec<i64> {
     cols[0].iter().map(parse_int).collect()
 }
 
-/// Scenario: the file-granularity fixture commits one positional-delete file per data file
 // #345: iceberg-rust's `DeleteFileIndex` ignores `referenced_data_file`, so each
 // data file resolves BOTH delete files. Once fixed upstream, tighten to exactly
 // one delete file per data file.
@@ -144,7 +143,6 @@ fn fixture_spark_file_granularity_delete_table() {
     }
 }
 
-/// Scenario: the partition-granularity fixture commits one positional-delete file per partition
 #[test]
 fn fixture_spark_partition_granularity_delete_table() {
     setup_e2e();
@@ -206,7 +204,6 @@ fn fixture_spark_partition_granularity_delete_table() {
     }
 }
 
-/// Scenario: a file-granularity delete table returns exactly the post-delete rows
 #[test]
 fn e2e_file_granularity_returns_post_delete_rows() {
     setup_e2e();
@@ -244,7 +241,6 @@ fn e2e_file_granularity_returns_post_delete_rows() {
     }
 }
 
-/// Scenario: a partition-granularity delete table returns exactly the post-delete rows
 #[test]
 fn e2e_partition_granularity_returns_post_delete_rows() {
     setup_e2e();
@@ -275,7 +271,6 @@ fn e2e_partition_granularity_returns_post_delete_rows() {
     );
 }
 
-/// Scenario: each partition-scoped delete file applies only to its own partition
 #[test]
 fn e2e_partition_delete_spans_multiple_partitions() {
     setup_e2e();
@@ -324,7 +319,6 @@ fn e2e_partition_delete_spans_multiple_partitions() {
     );
 }
 
-/// Scenario: the post-delete result is identical under same-shard and split-shard placement
 #[test]
 fn e2e_partition_delete_invariant_across_fanout() {
     setup_e2e();
@@ -417,7 +411,7 @@ fn e2e_partition_delete_invariant_across_fanout() {
     );
 }
 
-/// Scenario: deletes compose with projection, filter, and LIMIT
+/// Scenario: End-to-end deletes compose with projection, filter, and LIMIT
 #[test]
 fn e2e_deletes_with_projection_filter_limit() {
     setup_e2e();
@@ -463,7 +457,6 @@ fn e2e_deletes_with_projection_filter_limit() {
     }
 }
 
-/// Scenario: deletes compose with single-group and GROUP BY aggregates
 #[test]
 fn e2e_deletes_with_single_and_grouped_agg() {
     setup_e2e();
@@ -526,7 +519,6 @@ fn e2e_deletes_with_single_and_grouped_agg() {
     );
 }
 
-/// Scenario: an unsupported delete mechanism fails at plan time with a clean error
 // Equality deletes have no E2E fixture (only Flink writes them); they share the
 // same plan-time gate, covered by `classify_manifest_file`'s unit tests.
 // #12: once iceberg-rust reads v3 deletion vectors, this fixture becomes readable
@@ -580,7 +572,6 @@ fn e2e_unsupported_delete_fails_loud() {
     );
 }
 
-/// Scenario: a delete-free table's filter, LIMIT, and aggregate results are unchanged
 #[test]
 fn e2e_delete_free_table_no_regression() {
     setup_e2e();
@@ -622,7 +613,6 @@ fn e2e_delete_free_table_no_regression() {
     );
 }
 
-/// Scenario: connecting to an unreachable host panics rather than skipping
 #[test]
 fn positional_delete_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| ExaConn::connect("192.0.2.1", 8563, "sys", "exasol"));

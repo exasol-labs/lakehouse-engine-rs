@@ -6,7 +6,6 @@ use super::super::tests::{
 use super::*;
 use crate::adapter::pushdown::test_support::*;
 
-/// Scenario: A two-table inner equi-join is detected with both identifiers from TABLE_MAP
 #[test]
 fn genuine_inner_equi_join_is_detected_with_both_idents() {
     let request = join_request(Json::Null, equi_condition());
@@ -26,7 +25,6 @@ fn genuine_inner_equi_join_is_detected_with_both_idents() {
     }
 }
 
-/// Scenario: A request with no from field is not a join
 #[test]
 fn plain_single_table_request_is_not_a_join() {
     let request = nq4_request();
@@ -34,7 +32,6 @@ fn plain_single_table_request_is_not_a_join() {
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
-/// Scenario: A from clause that is a plain table reference is not a join
 #[test]
 fn from_table_node_is_not_a_join() {
     let mut request = nq4_request();
@@ -43,7 +40,6 @@ fn from_table_node_is_not_a_join() {
     assert_eq!(shape, JoinShape::NotAJoin);
 }
 
-/// Scenario: Outer joins are ineligible
 #[test]
 fn outer_join_is_ineligible() {
     for outer in ["left_outer", "right_outer", "full_outer"] {
@@ -57,7 +53,6 @@ fn outer_join_is_ineligible() {
     }
 }
 
-/// Scenario: A non-equi two-table inner join is served by the unified fallback
 #[test]
 fn non_equi_two_table_join_is_served_by_unified_fallback() {
     let condition = serde_json::json!({
@@ -75,7 +70,6 @@ fn non_equi_two_table_join_is_served_by_unified_fallback() {
     }
 }
 
-/// Scenario: A three-table inner join is the unified Join shape
 #[test]
 fn three_table_inner_join_is_unified_join() {
     let request = three_table_join_request();
@@ -96,7 +90,6 @@ fn three_table_inner_join_is_unified_join() {
     }
 }
 
-/// Scenario: A non-inner join node anywhere in the tree is ineligible
 #[test]
 fn non_inner_node_in_join_tree_is_ineligible() {
     let mut request = three_table_join_request();
@@ -108,7 +101,6 @@ fn non_inner_node_in_join_tree_is_ineligible() {
     );
 }
 
-/// Scenario: A multi-table leaf absent from TABLE_MAP is a hard error
 #[test]
 fn multi_table_leaf_absent_from_table_map_is_err() {
     let mut request = three_table_join_request();
@@ -124,7 +116,6 @@ fn multi_table_leaf_absent_from_table_map_is_err() {
     );
 }
 
-/// Scenario: A four-table inner join is the unified Join shape
 #[test]
 fn four_table_inner_join_is_unified_join() {
     let request = nq3_join_request();
@@ -148,7 +139,6 @@ fn four_table_inner_join_is_unified_join() {
     }
 }
 
-/// Scenario: Detection follows the from tree, not the involvedTables count
 #[test]
 fn detect_join_follows_from_tree_not_involved_tables_count() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -165,7 +155,6 @@ fn detect_join_follows_from_tree_not_involved_tables_count() {
     }
 }
 
-/// Scenario: A join whose table is absent from TABLE_MAP is a hard error, not a decline
 #[test]
 fn join_with_unmapped_table_is_an_error() {
     let mut request = join_request(Json::Null, equi_condition());
@@ -186,7 +175,6 @@ fn leaf_keys(join: &DetectedJoin) -> Vec<(&str, Option<&str>)> {
         .collect()
 }
 
-/// Scenario: A two-leg self-join's leaves carry their own aliases
 #[test]
 fn two_leg_self_join_leaves_carry_their_own_aliases() {
     let request = self_join_request(&[Some("A"), Some("B")]);
@@ -202,7 +190,6 @@ fn two_leg_self_join_leaves_carry_their_own_aliases() {
     );
 }
 
-/// Scenario: An unaliased self-join leg collects None and stays distinct
 #[test]
 fn unaliased_self_join_leg_collects_none_and_stays_distinct() {
     let request = self_join_request(&[None, Some("B")]);
@@ -213,7 +200,6 @@ fn unaliased_self_join_leg_collects_none_and_stays_distinct() {
     assert_ne!(keys[0], keys[1], "the two legs must remain distinguishable");
 }
 
-/// Scenario: A mixed-case leaf alias is retained verbatim
 #[test]
 fn mixed_case_leaf_alias_is_retained_verbatim() {
     let request = self_join_request(&[Some("myAlias"), Some("B")]);
@@ -222,7 +208,6 @@ fn mixed_case_leaf_alias_is_retained_verbatim() {
     assert_eq!(join.tables[0].table_alias.as_deref(), Some("myAlias"));
 }
 
-/// Scenario: A three-leg left-deep self-join collects one aliased leaf per occurrence
 #[test]
 fn three_leg_left_deep_self_join_collects_one_aliased_leaf_per_occurrence() {
     let request = self_join_request(&[Some("A"), Some("B"), Some("C")]);
@@ -239,7 +224,6 @@ fn three_leg_left_deep_self_join_collects_one_aliased_leaf_per_occurrence() {
     assert_eq!(join.conditions.len(), 2, "N-1 conditions for N=3 legs");
 }
 
-/// Scenario: An unaliased two-table join's leaves carry no alias
 #[test]
 fn unaliased_two_table_join_leaves_carry_no_alias() {
     let request = join_request(Json::Null, equi_condition());
@@ -250,7 +234,6 @@ fn unaliased_two_table_join_leaves_carry_no_alias() {
 
 const BROADCAST_MAX: u64 = 134_217_728;
 
-/// Scenario: A side's total bytes is the saturating sum of its file sizes
 #[test]
 fn resolved_side_sums_file_bytes_saturating() {
     assert_eq!(
@@ -264,7 +247,6 @@ fn resolved_side_sums_file_bytes_saturating() {
     );
 }
 
-/// Scenario: The smaller left side is the dimension and carries its resolved payload
 #[test]
 fn dimension_is_left_when_left_side_is_smaller() {
     let customer = resolved_side("CUSTOMER", vec![("c1", 1_000)]);
@@ -287,7 +269,6 @@ fn dimension_is_left_when_left_side_is_smaller() {
     assert_eq!(sides.dimension.effective_storage, sample_storage());
 }
 
-/// Scenario: Selection is by byte size, not FROM-clause position
 #[test]
 fn dimension_is_right_when_right_side_is_smaller() {
     let orders = resolved_side("ORDERS", vec![("o1", 50_000), ("o2", 50_000)]);
@@ -300,7 +281,6 @@ fn dimension_is_right_when_right_side_is_smaller() {
     assert!(sides.broadcast_eligible);
 }
 
-/// Scenario: A dimension over the threshold is not broadcast-eligible
 #[test]
 fn dimension_over_threshold_is_not_broadcast_eligible() {
     let part = resolved_side("PART", vec![("p1", 200)]);
@@ -318,7 +298,6 @@ fn dimension_over_threshold_is_not_broadcast_eligible() {
     );
 }
 
-/// Scenario: The broadcast threshold boundary is inclusive
 #[test]
 fn threshold_boundary_is_inclusive() {
     let at = select_broadcast_sides(
@@ -342,7 +321,6 @@ fn threshold_boundary_is_inclusive() {
     );
 }
 
-/// Scenario: An empty side is the eligible dimension
 #[test]
 fn empty_side_is_the_eligible_dimension() {
     let empty = resolved_side("EMPTYDIM", vec![]);
@@ -355,7 +333,6 @@ fn empty_side_is_the_eligible_dimension() {
     assert!(sides.broadcast_eligible);
 }
 
-/// Scenario: An exact byte-size tie breaks to the first argument
 #[test]
 fn equal_size_tie_breaks_to_first_argument() {
     let a = resolved_side("SELF_A", vec![("s", 4_242)]);
@@ -367,7 +344,6 @@ fn equal_size_tie_breaks_to_first_argument() {
     assert_eq!(sides.dimension.total_bytes, sides.fact.total_bytes);
 }
 
-/// Scenario: A self-join is never broadcast-eligible
 #[test]
 fn self_join_is_never_broadcast_eligible() {
     let request = self_join_request(&[Some("A"), Some("B")]);

@@ -173,7 +173,6 @@ async fn each_sides_own_enumerated_file_path_routes_to_that_side() {
     assert_eq!(text_at(&router, DIM_FILE).await, DIM_LABEL);
 }
 
-/// Scenario: a percent-encoded Delta `add.path` is keyed by its decoded object-store path.
 #[test]
 fn store_path_decodes_a_percent_encoded_entry_path() {
     let path =
@@ -205,7 +204,6 @@ async fn an_out_of_tree_positional_delete_file_routes_to_its_data_files_side() {
     assert_eq!(text_at(&router, OUT_OF_TREE_DELETE).await, FACT_LABEL);
 }
 
-/// Scenario: a deletion vector contributes no owned path; only the data file's path is owned.
 #[tokio::test]
 async fn a_deletion_vector_contributes_no_owned_path() {
     let files = [FileEntry::with_deletes(

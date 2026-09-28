@@ -15,7 +15,6 @@ fn empty_file_list_returns_empty_select() {
     assert!(sql.contains("CAST(NULL AS DECIMAL(20,0))"));
 }
 
-/// Scenario: repeated literals in a pruned projection keep unique EMITS aliases (#190)
 #[test]
 fn empty_pushdown_sql_repeated_literals_unique_aliases() {
     let proj_cols: Vec<ProjectionItem> = vec![
@@ -54,7 +53,6 @@ fn empty_pushdown_sql_repeated_literals_unique_aliases() {
     );
 }
 
-/// Scenario: a single-group empty result is one row of per-AggKind literals cast to declared types
 #[test]
 fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
     let items = vec![
@@ -92,7 +90,6 @@ fn empty_agg_sql_emits_zero_and_null_row_cast_to_declared_types() {
     );
 }
 
-/// Scenario: a ScalarOverAggregate item does not shift a later item's declared-type lookup
 #[test]
 fn empty_agg_sql_scalar_over_aggregate_item_does_not_shift_a_later_bare_aggregate_type() {
     let items = vec![
@@ -121,7 +118,6 @@ fn empty_agg_sql_scalar_over_aggregate_item_does_not_shift_a_later_bare_aggregat
     );
 }
 
-/// Scenario: COUNT(DISTINCT) over zero files yields a plain 0 row with no fan-out or merge
 #[test]
 fn empty_agg_sql_count_distinct_emits_zero_no_merge_udf() {
     let items = vec![SingleGroupItem::Distinct(DistinctCount {
@@ -158,7 +154,6 @@ fn round_of(inner: Json, digits: i64) -> Json {
     })
 }
 
-/// Scenario: a scalar-over-aggregate empty row substitutes each nested aggregate's typed zero-row literal
 #[test]
 fn empty_single_group_scalar_over_aggregate_emits_one_typed_row() {
     let items = vec![
@@ -194,7 +189,6 @@ fn empty_single_group_scalar_over_aggregate_emits_one_typed_row() {
     );
 }
 
-/// Scenario: an absent nested aggregate with no argument column is typed DOUBLE PRECISION
 #[test]
 fn empty_single_group_scalar_over_expression_aggregate_types_its_null() {
     let items = vec![SingleGroupItem::ScalarOverAggregate {
@@ -221,7 +215,6 @@ fn sum_of_length(col: &str) -> Json {
     })
 }
 
-/// Scenario: an empty multi- or mixed-distinct single-group request keeps the N-aggregate-column shape (#57)
 #[test]
 fn empty_case_2_3_matches_non_empty_aggregate_shape() {
     fn count_top_level_cols(select_span: &str) -> usize {
@@ -309,7 +302,6 @@ fn empty_case_2_3_matches_non_empty_aggregate_shape() {
     );
 }
 
-/// Scenario: every non-COUNT AggKind maps to the NULL empty literal
 #[test]
 fn empty_agg_literal_maps_non_count_kinds_to_null() {
     for kind in [
@@ -337,7 +329,6 @@ fn empty_agg_literal_maps_non_count_kinds_to_null() {
     }
 }
 
-/// Scenario: a grouped empty result is zero rows of one typed NULL per output column in select-list order
 #[test]
 fn empty_grouped_sql_emits_zero_rows_in_grouped_shape() {
     let select_items = vec![
@@ -377,7 +368,6 @@ fn empty_grouped_sql_emits_zero_rows_in_grouped_shape() {
     );
 }
 
-/// Scenario: a grouped Constant item reuses its rendered projection verbatim in select-list order
 #[test]
 fn empty_grouped_sql_includes_constant_projection_column() {
     let select_items = vec![
@@ -414,7 +404,6 @@ fn empty_grouped_sql_includes_constant_projection_column() {
     );
 }
 
-/// Scenario: empty-result dispatch priority mirrors the non-empty path
 #[test]
 fn empty_result_sql_dispatches_by_plan_shape() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
@@ -480,7 +469,6 @@ fn empty_result_sql_dispatches_by_plan_shape() {
     );
 }
 
-/// Scenario: an empty non-numeric grouped aggregate mirrors the wrapper's selectList-typed shape
 #[test]
 fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
@@ -513,7 +501,6 @@ fn empty_files_grouped_non_numeric_aggregate_uses_selectlist_shape() {
     );
 }
 
-/// Scenario: an empty non-numeric grouped aggregate with HAVING mirrors the wrapper's shape, not an Err
 #[test]
 fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
     let proj: Vec<ProjectionItem> = vec!["ID".into(), "NAME".into()];
@@ -547,7 +534,6 @@ fn empty_files_grouped_non_numeric_aggregate_with_having_yields_typed_empty() {
     );
 }
 
-/// Scenario: an empty widened row scan mirrors the wrapper's selectList-typed shape (#196)
 #[test]
 fn empty_result_sql_widened_row_scan_uses_select_list_types() {
     let pushdown_req = serde_json::json!({
