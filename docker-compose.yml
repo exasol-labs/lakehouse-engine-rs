@@ -1,15 +1,9 @@
-# ponytail: Dedicated host ports so this stack coexists with the sibling stacks
-# (sibling stack: 8563/2581/9000; lc-rs: 18563/12581). All host ports are
-# env-overridable so the E2E suite can always pick free ports; the container-
-# internal ports (8563/2581/9000/9001/8181) and the docker-network service
-# names (exasol/minio/iceberg-rest) are unchanged, so a UDF inside Exasol still
-# reaches MinIO at http://minio:9000 and the catalog at http://iceberg-rest:8181.
-#   Host defaults:  Exasol SQL 28563 · BucketFS 22581 · MinIO 19000/19001 · REST 18181
+# Host ports are env-overridable and distinct from sibling stacks; in-network
+# service names and ports are fixed (UDFs reach http://minio:9000 etc.).
 
 services:
   minio:
-    # quay.io/minio and Docker Hub's minio/minio now require a subscription;
-    # pgsty/silo is a public, protocol-compatible MinIO fork.
+    # Public, protocol-compatible MinIO fork (upstream images need a subscription).
     image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
     environment:
       MINIO_ROOT_USER: minioadmin
@@ -32,7 +26,6 @@ services:
         ipv4_address: 10.84.0.10
 
   minio-init:
-    # pgsty/mc mirrors mc — see the `minio` service comment above.
     image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
     depends_on:
       minio:
@@ -43,19 +36,12 @@ services:
       mc mb --ignore-existing local/warehouse &&
       echo 'bucket ready'
       "
-    # "no" (was on-failure): this is a one-shot job, not a long-running
-    # service — it either succeeds or it doesn't, there's nothing to restart.
-    # (`docker compose up --wait` doesn't reliably support one-shot containers
-    # regardless of restart policy — see the CI workflow's two-phase bring-up
-    # for the actual fix: `docker wait` this container instead of including it
-    # in the --wait set.)
+    # One-shot: `docker wait` it rather than including it in an `up --wait` set.
     restart: "no"
     networks:
       - lakehouse
 
   iceberg-rest:
-    # Pinned (was :latest) — an unpinned tag on a core E2E dependency is a
-    # silent-CI-break risk; 1.10.1 is Apache Iceberg's current stable release.
     image: apache/iceberg-rest-fixture:1.10.1
     depends_on:
       minio:
@@ -80,14 +66,7 @@ services:
       lakehouse:
         ipv4_address: 10.84.0.11
 
-  # Positional-delete fixtures (Apache Spark, Iceberg Spark runtime). One-shot
-  # job — mirrors minio-init: not a long-running service, just Spark's
-  # merge-on-read write path exercised once at stack bring-up to author
-  # Iceberg positional-delete fixtures that iceberg-rust cannot write itself
-  # (see scripts/spark-fixtures/run_fixtures.sh for the upstream-tracking
-  # comment + drop condition, apache/iceberg-rust#340). Joined to the SAME
-  # shared REST catalog + MinIO the rest of the stack uses, so the VS
-  # resolves the fixtures through its normal catalog path.
+  # One-shot: Spark authors fixtures iceberg-rust cannot write (apache/iceberg-rust#340).
   spark-iceberg-fixtures:
     image: apache/spark:3.5.7
     depends_on:
@@ -95,11 +74,7 @@ services:
         condition: service_healthy
       iceberg-rest:
         condition: service_healthy
-    # S3FileIO uses the AWS SDK v2, whose DefaultAwsRegionProviderChain fails
-    # the write with "Unable to load region from any of the providers" unless a
-    # region is supplied — even against MinIO, where the region is otherwise
-    # irrelevant. Mirror the iceberg-rest service (which sets the same var); the
-    # SDK's SystemSettingsRegionProvider reads AWS_REGION from the environment.
+    # AWS SDK v2 fails writes without a region, even against MinIO.
     environment:
       AWS_REGION: us-east-1
     volumes:
@@ -107,8 +82,6 @@ services:
     entrypoint:
       - /bin/bash
       - /fixtures/run_fixtures.sh
-    # "no" (same rationale as minio-init): a one-shot fixture job, not a
-    # long-running service.
     restart: "no"
     networks:
       - lakehouse
@@ -116,33 +89,19 @@ services:
   exasol:
     image: "${EXASOL_IMAGE:-docker.io/exasol/docker-db:2025.1.16}"
     privileged: true
-    # Pin to a CPU set, not a CFS bandwidth quota (`cpus:`): the UDF sandbox
-    # mounts no cgroup filesystem, so only a CPU affinity limit is visible to
-    # the adapter VM's core-count detection (issue #421). Host must have at
-    # least as many CPUs as this set names.
+    # A CPU set, not `cpus:`: the UDF sandbox has no cgroup fs, so only
+    # affinity is visible to core-count detection (#421).
     cpuset: "${LH_EXASOL_CPUSET:-0-3}"
-    # 2g (was 1g): the UDF script VM needs far more than Docker's 64 MB
-    # default once it actually spawns a UDF sandbox — which this stack's E2E
-    # suite does (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN), unlike sibling stacks
-    # that only run the DB uncapped without exercising the sandbox.
+    # UDF sandboxes need far more than Docker's 64 MB default.
     shm_size: "2g"
-    # No `environment:` block: exadt init-sc reads no EXA_* config vars. The DB
-    # runs at the image defaults (MemSize 2 GiB/node, SYS password `exasol`);
-    # both are only changeable via init-sc flags/--config or a seeded /exa/etc/EXAConf.
+    # init-sc reads no EXA_* env vars; DB runs at image defaults (SYS password `exasol`).
     volumes:
       - exa-data:/exa
     ports:
       - "${LH_EXASOL_PORT:-28563}:8563"
       - "${LH_BUCKETFS_PORT:-22581}:2581"
-    # Exasol's exaconf REGENERATES /etc/resolv.conf (→ 8.8.8.8) and /etc/hosts on
-    # startup, wiping the entries Docker injects via extra_hosts — so docker-network
-    # service-name DNS does not resolve from inside the UDF. The entrypoint wrapper
-    # below restores the two static-IP host entries AFTER exaconf has written
-    # /etc/hosts (a background loop that re-adds them if missing), so the VS
-    # connection props http://minio:9000 and http://iceberg-rest:8181 resolve from
-    # inside the UDF with NO manual patch. The static IPs match minio/iceberg-rest.
-    # extra_hosts also sets the same entries at the Docker layer (intent + the brief
-    # window before exaconf runs).
+    # exaconf rewrites /etc/hosts and /etc/resolv.conf on startup, wiping
+    # extra_hosts, so the entrypoint loop re-adds the static service entries.
     extra_hosts:
       - "minio:10.84.0.10"
       - "iceberg-rest:10.84.0.11"
@@ -173,9 +132,7 @@ volumes:
 
 networks:
   lakehouse:
-    # Project-unique name + a dedicated subnet outside Docker's common 172.x
-    # auto-pool, so this stack never collides with a generically-named
-    # `lakehouse` network or the 172.21.x range a sibling stack might use.
+    # Unique name and subnet outside Docker's 172.x pool to avoid sibling-stack collisions.
     name: lakehouse-engine
     ipam:
       config:

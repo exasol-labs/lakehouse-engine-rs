@@ -6,9 +6,7 @@ fn declared_schema(fields: Vec<Field>) -> SchemaRef {
     Arc::new(Schema::new(fields))
 }
 
-/// `a` (Int32), `p` (Utf8), `b` (Int64) with `p` declared as the partition column:
-/// a partition column sitting BETWEEN two file columns, which is what makes the
-/// declared order differ from `file ++ partition` order.
+/// `p` sits between two file columns, so declared order differs from `file ++ partition` order.
 fn split_with_middle_partition() -> PartitionedScanSchema {
     PartitionedScanSchema::split(
         declared_schema(vec![

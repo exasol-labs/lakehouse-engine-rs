@@ -8,20 +8,14 @@ use super::filter_json::{
     subject_column,
 };
 
-/// Translate an Exasol pushdown filter JSON node into a Delta pruning
-/// predicate against the given schema.
-///
-/// `None` means "no constraint — pass all files, never no files": the caller
-/// must treat an untranslatable node as widening the surviving file set, not
-/// as narrowing it.
+/// `None` means no constraint (pass all files, never none): an untranslatable node must
+/// widen the surviving file set, never narrow it.
 pub(crate) fn to_delta_predicate(filter_json: &Json, schema: &StructType) -> Option<Predicate> {
     translate_node(filter_json, schema).map(|translated| translated.predicate)
 }
 
-/// A translated predicate paired with whether its whole subtree translated
-/// exactly. Only an exact translation may be negated: `NOT` turns a widened
-/// child — one whose subtree dropped a node — into a narrowing one, pruning
-/// files that still hold matching rows.
+/// Only an exact translation may be negated: `NOT` over a widened child would narrow it,
+/// pruning files that still hold matching rows.
 #[derive(Debug, PartialEq)]
 struct Translated {
     predicate: Predicate,
@@ -79,11 +73,8 @@ fn translate_node(filter_json: &Json, schema: &StructType) -> Option<Translated>
     }
 }
 
-/// Combine the translated conjuncts of an AND, dropping the untranslatable
-/// ones: fewer constraints only widen the surviving file set.
-///
-/// `None` when nothing survives — `Predicate::and_from([])` would normalize to
-/// literal `true`.
+/// Untranslatable conjuncts are dropped (fewer constraints only widen). `None` when nothing
+/// survives, since `Predicate::and_from([])` normalizes to literal `true`.
 fn fold_and(children: impl Iterator<Item = Option<Translated>>) -> Option<Translated> {
     let mut predicates = Vec::new();
     let mut exact = true;
@@ -105,12 +96,8 @@ fn fold_and(children: impl Iterator<Item = Option<Translated>>) -> Option<Transl
     })
 }
 
-/// Combine the translated disjuncts of an OR, forfeiting the whole disjunction
-/// as soon as one is untranslatable: a dropped disjunct would narrow the
-/// surviving file set below what the request implies.
-///
-/// The empty list is guarded on its own — `Predicate::or_from([])` would
-/// normalize to literal `false` and prune every file.
+/// One untranslatable disjunct forfeits the whole OR, since dropping it would narrow the
+/// file set. Empty is guarded: `Predicate::or_from([])` normalizes to `false` and prunes all.
 fn fold_or(children: impl Iterator<Item = Option<Translated>>) -> Option<Translated> {
     let translated: Vec<Translated> = children.collect::<Option<_>>()?;
     if translated.is_empty() {
@@ -136,12 +123,7 @@ fn resolve_column<'s>(
     }
 }
 
-/// Build a `Scalar` for a filter-JSON literal node, typed from the resolved
-/// column's `PrimitiveType`.
-///
-/// `None` on any pair the column's type cannot represent, and on an empty
-/// string, for which the kernel's parser answers a null scalar that constrains
-/// nothing.
+/// `None` on an empty string: the kernel parses it to a null scalar that constrains nothing.
 fn literal_to_scalar(lit: &Json, prim: &PrimitiveType) -> Option<Scalar> {
     let kind = lit.get("type")?.as_str()?;
     let value = lit.get("value")?;
@@ -223,12 +205,8 @@ fn parse_f64(value: &Json) -> Option<f64> {
     }
 }
 
-/// Build a decimal `Scalar` rescaled to the column's own scale.
-///
-/// The kernel's `parse_scalar` demands the literal already carry exactly the
-/// column's scale, which a request literal does not, so the digits are rescaled
-/// here; a literal finer than the column's scale yields `None` rather than a
-/// rounded bound.
+/// The kernel's `parse_scalar` demands the column's exact scale, so digits are rescaled
+/// here; a literal finer than the column's scale yields `None`, never a rounded bound.
 fn parse_decimal(value: &Json, dtype: DecimalType) -> Option<Scalar> {
     let raw = match value {
         Json::Number(n) => n.to_string(),
@@ -289,12 +267,7 @@ fn translate_comparison(
     Some(Translated::exact(predicate))
 }
 
-/// Desugar `IN (..)` into an OR-chain of equalities, since the kernel prunes
-/// nothing for a native IN predicate here.
-///
-/// One untranslatable element forfeits the whole node, exactly as for a
-/// hand-written OR: keeping the remaining equalities would prune files that
-/// the dropped element could still match.
+/// Desugared into ORed equalities because the kernel prunes nothing for a native IN.
 fn translate_in(node: &Json, schema: &StructType) -> Option<Translated> {
     let (col_name, args) = in_operands(node)?;
     let (field_name, prim) = resolve_column(col_name, schema)?;
@@ -307,9 +280,7 @@ fn translate_in(node: &Json, schema: &StructType) -> Option<Translated> {
     }))
 }
 
-/// BETWEEN: desugar to `col >= low AND col <= high`.
-/// Either bound alone is still implied by BETWEEN, so a failing bound is
-/// dropped under the implicit AND (sound: drops one conjunct, widens set).
+/// Either bound alone is implied by BETWEEN, so an untranslatable bound is dropped.
 fn translate_between(node: &Json, schema: &StructType) -> Option<Translated> {
     let (col_name, low, high) = between_operands(node)?;
     let (field_name, prim) = resolve_column(col_name, schema)?;

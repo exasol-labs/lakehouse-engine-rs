@@ -1,5 +1,5 @@
-//! Delta reader-protocol gate: refuses a table whose reader protocol version or
-//! reader-feature set this engine does not implement, before any log replay.
+//! Refuses a Delta table whose reader protocol version or reader features this engine
+//! does not implement, before any log replay.
 
 use delta_kernel::table_features::{
     MAX_VALID_READER_VERSION, MIN_VALID_RW_VERSION, TABLE_FEATURES_MIN_READER_VERSION, TableFeature,
@@ -17,8 +17,8 @@ pub(crate) fn ensure_readable(
     }
     let features = match reader_features {
         Some(features) => features,
-        // The protocol makes the array mandatory at reader version 3, so an absent list there is a
-        // malformed protocol action; default-deny refuses it instead of reading it as feature-free.
+        // The protocol makes the array mandatory at reader version 3; default-deny refuses an
+        // absent one rather than treating it as feature-free.
         None if min_reader_version == TABLE_FEATURES_MIN_READER_VERSION => {
             return Err(UdfError::User(format!(
                 "Delta table declares min_reader_version {TABLE_FEATURES_MIN_READER_VERSION} but carries no readerFeatures list, which the Delta protocol requires at that version"

@@ -1,15 +1,4 @@
-//! Packaging integration test: the single built `.so` exports EXACTLY the three
-//! UDF entry point symbols (the VS adapter, the DataFusion scan SCALAR EMIT UDF,
-//! and the version query SCALAR RETURNS UDF) and nothing more.
-//!
-//! Covers packaging/single-so-two-entry-points scenario:
-//! "One crate exports the adapter, scan, and version entry points" — the `.so`
-//! SHALL export those three entry-point symbols and MUST export no fourth.
-//!
-//! Gated under `exasol-e2e` because it inspects the containerized release
-//! artifact, which `make test-e2e` guarantees is freshly built (it depends on
-//! `cross-udf-build`). When run, it FAILS loudly if the `.so` is missing —
-//! it never silently skips.
+//! Gated under `exasol-e2e`: it inspects the release `.so` that `make test-e2e` builds first.
 #![cfg(feature = "exasol-e2e")]
 
 use std::path::PathBuf;

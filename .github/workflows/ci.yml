@@ -6,17 +6,13 @@ on:
     tags: ["v*"]
   pull_request:
     branches: [main]
-    # ready_for_review so CI fires when a draft is marked ready (the draft
-    # guard on the root jobs skips draft-PR runs).
+    # ready_for_review: draft PRs are skipped, so fire when one is marked ready.
     types: [opened, synchronize, reopened, ready_for_review]
-  # Merge queue: required checks MUST run on merge_group or queued PRs hang
-  # forever waiting for a status that never reports.
+  # Required checks MUST run on merge_group or queued PRs hang forever.
   merge_group:
   workflow_dispatch:
 
-# Cancel a superseded run when a PR branch gets a new push (saves CI minutes,
-# avoids two runs racing on the same branch's cache). Never cancel a main-push
-# or tag-push run mid-flight — release() depends on that exact run's e2e job.
+# Never cancel main/tag runs: `release` depends on that exact run's e2e jobs.
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.ref != 'refs/heads/main' && !startsWith(github.ref, 'refs/tags/') }}
@@ -27,20 +23,14 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
-  # ── the real release artifact ─────────────────────────────────────────────
-  # Built the same way a developer does: inside rust:1.94-trixie (glibc
-  # 2.41), matching the SLC. Never `cargo build --release` on the runner
-  # directly — the SDK fingerprint embeds the rustc hash, so a host-built
-  # .so is rejected by the SLC at load time.
+  # Built inside rust:1.94-trixie, never on the runner: the SDK fingerprint
+  # embeds the rustc hash, so a host-built .so is rejected by the SLC.
   build-so:
     name: Build release .so (Docker, ${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    # Skip draft PRs; still run on push/merge_group (where pull_request is null).
-    # e2e / e2e-lakekeeper / e2e-unity / e2e-azure cascade-skip via `needs: [build-so]`.
+    # Skips draft PRs; the e2e jobs cascade-skip via `needs: [build-so]`.
     if: github.event_name != 'pull_request' || github.event.pull_request.draft == false
-    # Observed cold-cache duration: ~33 min (full DataFusion/Arrow/Iceberg
-    # release build). 60 min is a safety backstop against a genuine hang, not
-    # a tight budget.
+    # Cold build ~33 min; this is a hang backstop, not a budget.
     timeout-minutes: 60
     strategy:
       fail-fast: false
@@ -53,28 +43,10 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      # This build runs INSIDE rust:1.94-trixie with its cargo home at
-      # /usr/local/cargo, so Swatinem/rust-cache (host-side, prunes via the host
-      # cargo) can't manage it — we stay on actions/cache.
-      #
-      # UDF_CARGO_VOL defaults to a *named* Docker volume in the Makefile
-      # (fine on a persistent dev machine); override it to a host path here so
-      # actions/cache can persist the Docker-side cargo registry across runs.
-      # Also cache target/ itself (compiled artifacts) — caching only the
-      # registry saves download time but not compile time, since the .so's
-      # own target/ dir is otherwise empty on every fresh checkout. Cargo's
-      # fingerprint check falls back to content hashes (not just mtimes) when
-      # deciding what's stale, so it tolerates checkout resetting mtimes.
-      #
-      # restore-keys is what keeps a Cargo.lock bump from triggering a full
-      # ~33-min cold build: on a lockfile change the exact key misses, but the
-      # `docker-cargo-<arch>-` prefix restores the most recent prior cache, so
-      # cargo recompiles only the changed crates instead of the whole dep graph.
-      #
-      # Split restore/save so only main writes. Caches are branch-scoped, so PR
-      # branches were each minting an exact-key copy — 12 of them, 7.5 GB
-      # against a 10 GB quota — even though the `docker-cargo-` prefix fallback
-      # already makes main's entry usable from any branch.
+      # actions/cache, not rust-cache: the build runs inside the container,
+      # whose cargo home rust-cache can't manage. UDF_CARGO_VOL is a host path
+      # so the registry persists. Only main saves, to stay within the 10 GB quota;
+      # the prefix restore-key serves main's entry to every branch.
       - name: Restore Docker-side cargo registry and target/
         id: docker-cache
         uses: actions/cache/restore@v6
@@ -82,12 +54,7 @@ jobs:
           path: |
             ~/.cargo-docker-registry
             target/
-          # .cargo/config.toml is in the key for the same reason rust-cache
-          # hashes it (see that file): a future [profile.release] edit there
-          # would change every release fingerprint without moving Cargo.lock —
-          # exact hit, save skipped, permanently poisoned. The prefix fallback
-          # keeps unrelated (e.g. dev-profile) edits warm; cost is one
-          # redundant re-save on main per config edit.
+          # .cargo/config.toml: a profile edit must rotate the key (see that file).
           key: docker-cargo-${{ matrix.arch }}-${{ hashFiles('**/Cargo.lock', '.cargo/config.toml') }}
           restore-keys: |
             docker-cargo-${{ matrix.arch }}-
@@ -95,16 +62,10 @@ jobs:
       - name: Build liblakehouse_engine.so
         run: make cross-udf-build UDF_CARGO_VOL="$HOME/.cargo-docker-registry"
 
-      # `docker run` writes into both the bind-mounted registry and target/ as
-      # root (the container's default user), so actions/cache's post-job tar
-      # (running as the runner user) can't read those files back out —
-      # observed as "Cannot open: Permission denied" / cache save failing
-      # silently.
+      # The container writes as root; the cache save runs as the runner user.
       - name: Fix Docker-side build output ownership
         run: sudo chown -R "$(id -u):$(id -g)" "$HOME/.cargo-docker-registry" target/
 
-      # Main only (see the restore step), and only on an exact-key miss — keys
-      # are immutable, so re-saving a hit is a wasted multi-GB upload.
       - name: Save Docker-side cargo registry and target/
         if: github.ref == 'refs/heads/main' && steps.docker-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
@@ -120,23 +81,9 @@ jobs:
           name: lakehouse-engine-so-${{ matrix.arch }}
           path: target/release/liblakehouse_engine.so
 
-  # ── fan-out: build-host / lint / unit-tests / licenses, all at t=0 ───────
-  # Nothing here waits on build-so (different toolchain: host vs the
-  # rust:1.94-trixie container). `build-host` writes the `workspace-rlib`
-  # cache that `lint` and the three e2e jobs read; `unit-tests` writes the
-  # separate `llvm-cov` namespace (see both jobs' cache steps).
-  #
-  # SOLE writer of the `workspace-rlib` cache, for `lint` and the three e2e
-  # jobs. `unit-tests` can no longer be: `cargo llvm-cov` builds into
-  # target/llvm-cov-target and cleans every workspace member on every run.
-  #
-  # No `needs` anywhere in this fan-out, so readers restore BEFORE this job's
-  # post-step saves — it serves the NEXT main run, exactly as `unit-tests`
-  # did.
-  #
+  # SOLE writer of the `workspace-rlib` cache read by `lint` and the e2e jobs.
   # MUST stay `cargo test`-shaped: clippy would save an .rmeta-only dep tree
-  # and every reader needing codegen would rebuild. `--no-run` because
-  # `unit-tests` is the test gate.
+  # and every reader needing codegen would rebuild.
   build-host:
     name: Build Host Workspace
     runs-on: ubuntu-latest
@@ -146,13 +93,9 @@ jobs:
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
-      # Required: this job is a rust-cache writer (#133 — see `lint`).
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # rust-cache, not actions/cache: it PRUNES target/ before saving.
-      # Profile edits are keyed via .cargo/config.toml (see that file).
-      # save-if gates writes to main against the repo's 10 GB quota.
       - name: Cache cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -173,28 +116,16 @@ jobs:
         with:
           components: clippy, rustfmt
 
-      # dtolnay/rust-toolchain's `components:` doesn't reliably provision
-      # rustfmt/clippy for every toolchain snapshot (observed: "'cargo-fmt' is
-      # not installed for the toolchain '1.94-x86_64-unknown-linux-gnu'") —
-      # same fix exasol-labs/language-container-rs's CI already needed.
+      # `components:` above doesn't reliably provision these on every snapshot.
       - name: Ensure rustfmt/clippy available on 1.94
         run: rustup component add rustfmt clippy --toolchain 1.94
 
-      # rust-cache keys on every installed toolchain's `rustc -vV`, including
-      # the runner image's preinstalled stable Rust — which drifts across the
-      # heterogeneous hosted-runner image pool and has nothing to do with this
-      # repo's pinned 1.94 (rust-toolchain.toml). A writer/reader landing on
-      # different preinstalled versions silently diverges the cache key and
-      # forces a full cold recompile in every reader job (#133). Drop
-      # everything but 1.94 so the key only reflects the toolchain actually
-      # used to compile.
+      # rust-cache keys on every installed toolchain, and the runner's
+      # preinstalled Rust drifts across images, diverging writer/reader keys (#133).
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # Read-only restore of the cache `build-host` writes; save-if:false so
-      # readers never race to save their own copy. Keep the inputs identical
-      # across every workspace-rlib rust-cache step — a divergence leaves
-      # readers permanently cold (#133).
+      # Keep inputs identical across every workspace-rlib step, or readers stay cold (#133).
       - name: Restore cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -207,14 +138,9 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-  # The test gate, and the only job that executes the suite. Produces the
-  # lcov report the `sonar` job uploads.
   unit-tests:
     name: Unit Tests
     runs-on: ubuntu-latest
-    # Backstop, not a budget: the cold cost is dominated by the
-    # UNinstrumented dependency tree (~12 min, #133) — cargo-llvm-cov
-    # instruments workspace members only.
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
@@ -224,30 +150,15 @@ jobs:
         with:
           components: llvm-tools-preview
 
-      # `components:` above is not reliable on this toolchain snapshot — same
-      # workaround the `lint` job carries for rustfmt/clippy.
       - name: Ensure llvm-tools-preview available on 1.94
         run: rustup component add llvm-tools-preview --toolchain 1.94
 
-      # Still a rust-cache writer, just in another namespace (#133 — see `lint`).
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # SOLE writer of the llvm-cov namespace. The DISTINCT shared-key is the
-      # only thing separating this tree from workspace-rlib: the coverage
-      # environment lives on cargo-llvm-cov's child process and never reaches
-      # the key, which rust-cache hashes from its OWN env at restore time.
-      #
-      # rust-cache, not actions/cache: it hashes every toolchain's `rustc -vV`
-      # into the key (a hand-rolled Cargo.lock key would hit exactly on a
-      # toolchain bump, reject every artifact, and skip the save — poisoned
-      # with no prefix-rotation escape); it recurses into the nested
-      # target/llvm-cov-target when pruning, so the tree can't grow
-      # monotonically; and it caches ~/.cargo/registry + git.
-      #
-      # cache-on-failure: this writer IS the test gate, so without it a red
-      # test discards a dependency build that compiled fine and the next PR
-      # pays a cold instrumented build inside a required check.
+      # The distinct shared-key is the only thing separating this tree from
+      # workspace-rlib: the coverage env never reaches rust-cache's key.
+      # cache-on-failure: a red test must not discard a good dependency build.
       - name: Cache cargo & instrumented build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -255,28 +166,18 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-on-failure: "true"
 
-      # Version-pinned like cargo-deny/cargo-about, and load-bearing: the "no
-      # lcov post-processing needed" conclusion rests on 0.8.7's DEFAULT
-      # --ignore-filename-regex set, which already excludes *_tests.rs.
+      # Pin is load-bearing: 0.8.7's default --ignore-filename-regex excludes *_tests.rs.
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-llvm-cov@0.8.7
 
-      # Keep flag-identical to the Makefile's `coverage` target; this step is
-      # the authority. exasol-e2e, cloud-e2e, lakekeeper-e2e, azure-e2e and
-      # unity-e2e are opt-in features, off by default, so this compiles none of
-      # them and never touches a live stack or a cloud account.
-      #
-      # Doctests are NOT run (`--doctests` is unstable); zero cost today since
-      # no crate has an executable doc test.
+      # Keep flag-identical to the Makefile's `coverage` target; this step is the authority.
       - name: Run unit tests with coverage
         run: cargo llvm-cov --workspace --lcov --output-path lcov-unit.info
 
-      # No `if: always()`: cargo llvm-cov exits non-zero and writes no report
-      # when a test fails, so an always-run upload would add a second red step
-      # burying the real one. `--ignore-run-fail` is not the fix — it exits 0
-      # on test failure and would silently disable the gate.
+      # No `if: always()`: a failed run writes no report. Don't use
+      # `--ignore-run-fail` either — it would silently disable the gate.
       - name: Upload coverage report
         uses: actions/upload-artifact@v7
         with:
@@ -285,32 +186,20 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
-  # ── coverage + static analysis to SonarQube Cloud ────────────────────────
-  # Deliberately NOT in `release`'s or the e2e jobs' `needs`, so a Sonar
-  # outage cannot block the release path.
-  #
-  # RUNNER COUPLING: cargo-llvm-cov emits ABSOLUTE `SF:` paths, so coverage
-  # resolves across the job boundary only because `unit-tests` and this job
-  # are both bare ubuntu-latest runners with an identical $GITHUB_WORKSPACE.
-  # Moving `unit-tests` into a container or onto a self-hosted runner makes
-  # Sonar report 0% coverage with only a warning; the fix would be
-  # `sed -i "s|$GITHUB_WORKSPACE/||g" lcov-unit.info` before upload.
+  # Deliberately not in `release`'s needs, so a Sonar outage can't block releases.
+  # lcov `SF:` paths are absolute: `unit-tests` must share this job's
+  # $GITHUB_WORKSPACE, or Sonar silently reports 0% coverage.
   sonar:
     name: Sonar Analysis
     runs-on: ubuntu-latest
     needs: [unit-tests]
-    # Fork PRs receive no repository secrets, so an unguarded scan fails on an
-    # empty token. merge_group is skipped too: it would analyse a throwaway
-    # gh-readonly-queue/* branch and put a third-party service inside the
-    # merge path (sonar.qualitygate.wait=true). Revisit only if
-    # `Sonar Analysis` becomes a required check.
+    # Fork PRs get no secrets; merge_group would put Sonar inside the merge path.
     if: >-
       github.event_name != 'merge_group' &&
       (github.event_name != 'pull_request' ||
        github.event.pull_request.head.repo.full_name == github.repository)
     steps:
-      # fetch-depth: 0 — shallow clones degrade Sonar's blame-based issue
-      # assignment.
+      # Shallow clones degrade Sonar's blame-based issue assignment.
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -338,9 +227,7 @@ jobs:
       - name: Drop the runner's preinstalled Rust (stabilize cache key)
         run: rustup toolchain list | awk '{print $1}' | grep -v '1\.94' | xargs -r -n1 rustup toolchain uninstall
 
-      # No arch input needed: rust-cache embeds the platform (Linux-arm64) and
-      # the toolchain hash in the key on its own, and it ignores `key:` whenever
-      # `shared-key` is set — don't add one back.
+      # rust-cache embeds the platform in the key and ignores `key:` with `shared-key`.
       - name: Cache cargo & build artifacts
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
@@ -359,27 +246,17 @@ jobs:
       - name: Install Rust 1.94
         uses: dtolnay/rust-toolchain@8fae6aadcd3e1a6f3fcb446ce7f9438c9d1349f1 # 1.94 branch (toolchain 1.94.0 baked into action.yml)
 
-      # Deliberately NOT caching ~/.cargo/registry: it saved ~9s on a sub-minute
-      # job while holding 2 GB of the repo's 10 GB quota and evicting caches
-      # that matter. Without it `cargo deny`'s `cargo metadata` re-downloads the
-      # index and this job grows to ~2–3 min — off the critical path, so leave
-      # it. Don't "fix" this back.
+      # Deliberately uncached: a registry cache costs 2 GB of the 10 GB quota for ~9s.
       - name: Install cargo-deny
         uses: taiki-e/install-action@16b05812d776ae1dfaabc8277e421fb6d2506419 # v2.82.7
         with:
           tool: cargo-deny@0.19.9
 
-      # MIT-compliance gate: every third-party dependency must carry a license
-      # from deny.toml's allow-list; keep that list in sync with about.toml's
-      # `accepted` list (both files cross-reference each other).
       - name: Check licenses and advisories
         run: cargo deny check licenses advisories
 
-  # ── install script: static checks + stubbed unit tests, no network ──────
-  # deploy/scripts/install.sh is fetched straight off `main` by every user's
-  # `curl | bash` one-liner (see docs/install.md) — there is no release gate
-  # between a merge and that fetch, so this job (and install-script-e2e below)
-  # must both be required checks AND block `release` (see release.needs).
+  # install.sh is fetched straight off `main` by the curl|bash one-liner, so
+  # this job and install-script-e2e must be required checks AND gate `release`.
   install-script:
     name: Install Script
     runs-on: ubuntu-latest
@@ -392,19 +269,8 @@ jobs:
       - name: Unit tests (stubbed exapump/curl, no network)
         run: make test-install
 
-  # ── install script: real end-to-end run against a live BucketFS Exasol ──
-  # Proves the BucketFS target (Exasol AsApp/Docker/on-premise all speak the same
-  # BucketFS HTTP interface) against a REAL Exasol, using a REAL prior
-  # release fetched through the authenticated GitHub API, on a runner with NO
-  # install.sh prereq preinstalled (not even exapump) — exactly what a
-  # user's one-liner does. Does not depend on build-so / this PR's own .so:
-  # this job tests the INSTALLER's mechanics (exapump auto-install, bucketfs
-  # upload, DDL, SCRIPT_LANGUAGES registration, version smoke test), not
-  # query correctness — that's already covered by `e2e` / `e2e-lakekeeper`.
-  # ponytail: only the `exasol` compose service is started (no MinIO/Iceberg
-  # REST/Spark fixtures) — this job never queries a Virtual Schema, so it
-  # doesn't need catalog/object-storage services. SaaS mode has no CI job:
-  # it needs a real SaaS tenant + PAT that CI doesn't have (tracked in #252).
+  # Tests the installer against a real prior release on a runner with no
+  # prereqs preinstalled, not this PR's .so. SaaS mode has no CI job (#252).
   install-script-e2e:
     name: Install Script E2E (BucketFS)
     runs-on: ubuntu-latest
@@ -415,9 +281,8 @@ jobs:
       - name: Pull Exasol image
         run: docker compose pull --quiet exasol
 
-      # Same root cause and fix as the `e2e` job: register_slc/create_engine_scripts and the
-      # version smoke test spawn real Exasol UDF sandboxes (LAKEHOUSE_ADAPTER / LAKEHOUSE_SCAN /
-      # LAKEHOUSE_VERSION).
+      # See .github/actions/e2e-setup: the SLC install and LAKEHOUSE_VERSION smoke test
+      # spawn UDF sandboxes, which need this on Ubuntu 24.04.
       - name: Allow unprivileged user namespaces (Exasol UDF sandbox)
         run: |
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
@@ -426,26 +291,8 @@ jobs:
       - name: Start stack (Exasol only)
         run: docker compose up -d --wait exasol
 
-      # Deliberately NO "install exapump" step here: this runner starts with none of
-      # install.sh's prereqs beyond curl (already on ubuntu-latest), so this is the one job that
-      # actually proves the curl|bash one-liner's auto-install of exapump (see ensure_exapump in
-      # install.sh) rather than assuming it. Direct --host/--user/--password + --bfs-* flags are
-      # used instead of --profile since creating an exapump profile would itself require exapump
-      # already installed. Same BucketFS write-password extraction the Makefile's
-      # install-slc/bucketfs-upload-so targets already use — read straight out of EXAConf, no
-      # manual secret.
-      #
-      # No exapump profile is seeded here (there used to be a throwaway-profile workaround for
-      # exasol-labs/exapump#46 -- `exapump bucketfs` had no fully profile-less mode, so a
-      # --host/--dsn run with no --profile and zero ~/.exapump/config.toml bailed with "No
-      # profiles found in config"). Fixed upstream in exapump 0.13.0
-      # (exasol-labs/exapump@cf3fe92, exasol-labs/exapump#47): override-only invocations now
-      # build the connection from BfsConnection::with_defaults instead of requiring a profile.
-      # ensure_exapump's `curl .../install.sh | sh` always installs whatever is currently
-      # tagged latest, so this job (and every real one-liner user) gets 0.13.0+ automatically.
-      # exapump_bfs_flags now carries --bfs-validate-certificate false itself for non-profile
-      # connectivity modes (the new defaults-only path has certificate validation ON, and this
-      # container's BucketFS endpoint is self-signed) -- see install.sh.
+      # Deliberately no exapump install or profile: this proves install.sh's
+      # auto-install, and a profile would need exapump already installed.
       - name: Run install.sh (BucketFS target, exapump not preinstalled)
         run: |
           BFSPASS=$(docker exec lakehouse-engine-rs-exasol-1 bash -c \
@@ -465,29 +312,15 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  # ── viability gate: full local Exasol + MinIO + Iceberg-REST stack ───────
-  # Matrixed over both supported Exasol major versions. The 2025.x leg keeps
-  # the exact check name `E2E` — it's a required check in main's branch
-  # protection ruleset, and GitHub auto-suffixes an unmatrixed job name with
-  # the matrix values unless the name itself is templated from the matrix, so
-  # `name:` is driven from `matrix.check_name` rather than left as a bare
-  # string. The 8.29.x leg's check name is new and NOT yet in the ruleset
-  # (separate manual ops step) — tracked in #364.
+  # `name:` comes from the matrix so the 2025.x leg keeps the exact required
+  # check name `E2E`. The 8.29.x leg is not yet in the ruleset (#364).
   e2e:
     name: ${{ matrix.check_name }}
     runs-on: ubuntu-latest
-    # build-so only — its .so artifact is all this job consumes. NOT also
-    # depending on lint/unit-tests/licenses trades away ~18 min of fail-fast
-    # serialization: all three are separately-required checks (ruleset + merge
-    # queue), so any red one blocks the merge on its own — e2e needn't wait on
-    # them to keep broken code off main.
-    # Trade: a PR with a clippy error still burns a full E2E run; revert by
-    # re-adding to `needs`. `release` lists them explicitly so main still can't
-    # ship broken.
+    # build-so only: lint/unit-tests/licenses are separately required, and
+    # `release` lists them explicitly.
     needs: [build-so]
     strategy:
-      # Independent legs (different Exasol major versions) — one failing
-      # shouldn't cancel the other before it reports.
       fail-fast: false
       matrix:
         include:
@@ -497,49 +330,24 @@ jobs:
           - image: exasol/docker-db:8.29.13
             check_name: E2E (8.29.x)
             log_artifact: exa-logs-8x
-    # Observed 16-20 min end-to-end historically, but pre-test setup (disk
-    # cleanup + image loads) has grown slower as the hosted runner image
-    # bundles more pre-installed content to prune through — one run burned
-    # ~22 min on setup alone and got killed mid-suite at the old 30 min cap.
-    # 45 min is a safety backstop against a genuine hang, not a tight budget
-    # (same rationale as build-so's timeout).
     timeout-minutes: 45
     env:
-      # Selects the matrix leg's Exasol image; docker-compose.yml's exasol
-      # service reads this with a 2025.1.16 fallback.
       EXASOL_IMAGE: ${{ matrix.image }}
-      # Caps the Exasol container the same way the other E2E jobs do. Hosted
-      # runners have more than 2 vCPUs, so this also satisfies
-      # `adapter_detects_container_cpuset`'s precondition that the container's
-      # CPU set names strictly fewer CPUs than the runner has.
+      # `adapter_detects_container_cpuset` needs fewer CPUs than the runner has.
       LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
 
-      # No tarball cache here (tried it, dropped it): restoring a GHA cache
-      # tarball and `docker load`-ing it is a wash against a direct registry
-      # pull — same order of magnitude either way — but caching forced these
-      # into per-image sequential steps. `docker compose pull` fetches every
-      # service's image (Exasol, MinIO, Iceberg REST, Spark, minio-init's mc)
-      # concurrently, so the pulls overlap instead of queueing one after another.
-      # --quiet: without it, compose interleaves a live-updating progress bar
-      # per image per layer, which flattens into a huge wall of duplicate
-      # lines in the non-interactive CI log. Errors and image names still print.
       - name: Pull stack images
         run: docker compose pull --quiet
 
-      # Two-phase: `docker compose up --wait` doesn't reliably support a
-      # one-shot container (minio-init) in the same wait set as long-running
-      # services — even a clean exit(0) trips it into exit code 1 (confirmed:
-      # every service was healthy, --wait still failed). `docker wait` the
-      # init job to completion first, then --wait only the services that stay
-      # running.
+      # `up --wait` fails on a one-shot container even after a clean exit, so
+      # one-shot jobs are `docker wait`-ed first.
       - name: Start stack (Exasol + MinIO + Iceberg REST)
         run: |
           docker compose up -d minio-init
-          # `docker wait` itself always exits 0 (it successfully waited); the
-          # container's actual exit code is its stdout — check it explicitly.
+          # `docker wait` prints the container's exit code; it always exits 0 itself.
           INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-init-1)
           if [ "$INIT_EXIT" != "0" ]; then
             echo "::error::minio-init exited $INIT_EXIT (bucket creation failed)"
@@ -548,10 +356,6 @@ jobs:
           fi
           docker compose up -d --wait exasol minio iceberg-rest
 
-          # spark-iceberg-fixtures is a second one-shot job (same rationale as
-          # minio-init above): it authors the positional-delete E2E fixtures
-          # by running Apache Spark once, then exits — so it's waited on with
-          # `docker wait`, not folded into the --wait set above.
           docker compose up -d spark-iceberg-fixtures
           SPARK_FIXTURES_EXIT=$(docker wait lakehouse-engine-rs-spark-iceberg-fixtures-1)
           if [ "$SPARK_FIXTURES_EXIT" != "0" ]; then
@@ -560,14 +364,10 @@ jobs:
             exit 1
           fi
 
-      # SLC download, BucketFS upload, and VS creation all happen in-process
-      # inside the Rust test harness (crates/lakehouse-engine/tests/e2e_scan_test.rs
-      # setup_e2e), so no separate install-slc/exapump step is needed here.
       - name: Run E2E suite
         run: make test-e2e
 
-      # A UDF sandbox crash produces zero-byte DB-side logs; the real reason
-      # only shows up in the host kernel ring buffer (dmesg), which needs sudo.
+      # A UDF sandbox crash leaves empty DB-side logs; the reason is only in host dmesg.
       - name: Dump Exasol logs on failure
         if: failure()
         run: |
@@ -588,8 +388,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          # Per-leg name: upload-artifact@v7 rejects a name reused within one
-          # run, and both matrix legs execute this step in the same run.
+          # upload-artifact@v7 rejects a name reused within one run.
           name: ${{ matrix.log_artifact }}
           path: exa-logs/
           if-no-files-found: ignore
@@ -598,30 +397,12 @@ jobs:
         if: always()
         run: docker compose down -v
 
-  # ── second viability gate: Lakekeeper (OIDC/Keycloak + MinIO STS) overlay ─
-  # Mirrors the `e2e` job's setup steps; the compose overlay adds Keycloak +
-  # Lakekeeper + its Postgres backend on top of the base stack (reuses base
-  # `minio` and `exasol`). Independent of `e2e` (same upstream `needs`, no
-  # dependency between the two) so they run in parallel; gates `release`
-  # alongside `e2e` (see the `release` job's `needs`).
   e2e-lakekeeper:
     name: E2E (Lakekeeper)
     runs-on: ubuntu-latest
-    # See `e2e`'s identical `needs` and its rationale.
     needs: [build-so]
-    # This stack's own healthchecks (docker-compose.lakekeeper.yml) already
-    # bound each service's time-to-healthy (interval × retries + start_period);
-    # this is the wall-clock backstop for the whole job, same rationale as
-    # `e2e`'s timeout-minutes — a hang here should surface as a clear CI
-    # failure, not a long silent one. The Lakekeeper stack has one fewer
-    # one-shot fixture job than `e2e` (no Spark fixtures), so 45 min matches
-    # `e2e`'s budget rather than needing more.
     timeout-minutes: 45
     env:
-      # Caps the Exasol container the same way the `e2e` job does, but with no
-      # runtime measurement step: this job's test binary carries no
-      # container-affinity assertion, so the CPU set only has to fit a hosted
-      # runner.
       LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
@@ -630,15 +411,7 @@ jobs:
       - name: Pull stack images
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml pull --quiet
 
-      # Four-phase bring-up, same rationale as the `e2e` job's two-phase one:
-      # `docker compose up --wait` doesn't reliably support a one-shot
-      # container in the same wait set as long-running services, so every
-      # one-shot job here (minio-init, minio-lakekeeper-init,
-      # lakekeeper-migrate) is `docker wait`-ed to completion individually
-      # before the long-running services are brought up with `--wait`. By the
-      # time the last phase runs, lakekeeper-migrate has already completed, so
-      # `lakekeeper`'s `service_completed_successfully` dependency on it is
-      # already satisfied — only the still-running services need `--wait`.
+      # One-shot jobs are `docker wait`-ed first (see `e2e`).
       - name: Start stack (Exasol + MinIO + Keycloak + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
@@ -672,8 +445,6 @@ jobs:
       - name: Run Lakekeeper E2E suite
         run: make test-e2e-lakekeeper
 
-      # Same rationale as the `e2e` job's identical step: a UDF sandbox crash
-      # only shows up in the host kernel ring buffer, not DB-side logs.
       - name: Dump Lakekeeper stack logs on failure
         if: failure()
         run: |
@@ -709,25 +480,13 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml down -v
 
-  # ── third viability gate: native Unity Catalog OSS ────────────────────────
-  # The overlay adds only `unitycatalog` plus an `exasol` `extra_hosts`
-  # override on top of the base stack, and reuses base `minio`. Independent
-  # of `e2e` and `e2e-lakekeeper` (same `needs`, no dependency between them)
-  # so all three run in parallel; gates `release`.
-  #
-  # Not yet in `main`'s ruleset required checks — tracked in #336.
+  # Not yet a required check (#336).
   e2e-unity:
     name: E2E (Unity)
     runs-on: ubuntu-latest
-    # See `e2e`'s identical `needs` and its rationale.
     needs: [build-so]
-    # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`.
     timeout-minutes: 45
     env:
-      # Caps the Exasol container the same way the `e2e` job does, but with no
-      # runtime measurement step: this job's test binary carries no
-      # container-affinity assertion, so the CPU set only has to fit a hosted
-      # runner.
       LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
@@ -736,13 +495,7 @@ jobs:
       - name: Pull stack images
         run: docker compose -f docker-compose.yml -f docker-compose.unity.yml pull --quiet
 
-      # Two-phase bring-up, same rationale as `e2e-lakekeeper`'s (see that
-      # job's own comment above its bring-up step): `docker compose up --wait`
-      # doesn't reliably hold a one-shot container in the same wait set as
-      # long-running services. Specific to this job: `minio-init` runs first
-      # because `scripts/unity/seed.sh` requires the `warehouse` bucket, and
-      # its exit code is checked because the Makefile's `unity-up` target does
-      # not check it.
+      # One-shot jobs are `docker wait`-ed first (see `e2e`); seed.sh needs the bucket.
       - name: Start stack (Exasol + MinIO + Unity Catalog)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.unity.yml"
@@ -760,15 +513,11 @@ jobs:
       - name: Seed Unity Catalog fixtures
         run: ./scripts/unity/seed.sh
 
-      # MUST stay flag-identical to the Makefile's `test-e2e-unity` target's
-      # cargo line; this step is the authority. `make test-e2e-unity` is not
-      # used because it calls `$(MAKE) unity-up`, re-running the bring-up the
-      # two steps above just performed.
+      # Flag-identical to the Makefile's `test-e2e-unity` (which would re-run
+      # the bring-up); this step is the authority.
       - name: Run Unity Catalog E2E suite
         run: cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
 
-      # Same rationale as the `e2e` job's identical step: a UDF sandbox crash
-      # only shows up in the host kernel ring buffer, not DB-side logs.
       - name: Dump Unity stack logs on failure
         if: failure()
         run: |
@@ -804,53 +553,27 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.unity.yml down -v
 
-  # ── fourth viability gate: REAL Azure ADLS Gen2 storage, local catalog ───
-  # No local ADLS Gen2 substitute exists (Azurite's `dfs` endpoint is
-  # incomplete), so this suite runs against a real Azure account; catalog
-  # (Lakekeeper), OIDC (Keycloak), and Exasol stay local Docker, same overlay
-  # as `e2e-lakekeeper`.
-  #
-  # Requires five repository secrets/vars (fails loudly naming any missing):
-  #   vars.AZURE_STORAGE_ACCOUNT_NAME     data path, not a secret
-  #   secrets.AZURE_STORAGE_ACCOUNT_KEY   the credential UNDER TEST
-  #   secrets.AZURE_TENANT_ID / AZURE_CLIENT_ID / AZURE_CLIENT_SECRET
-  #     service principal for container lifecycle only, never the scan itself
-  # The service principal needs exactly Storage Blob Data Contributor — a
-  # data-actions-only role 403s on container create/delete. Use a dedicated
-  # test-only storage account.
-  #
-  # Not in `release`'s `needs`: a live third-party account there would let an
-  # Azure incident or rotated secret block every release.
+  # Real Azure account: Azurite's `dfs` endpoint is incomplete. The service
+  # principal (container lifecycle only) needs Storage Blob Data Contributor;
+  # a data-actions-only role 403s on container create/delete.
+  # Not in `release`'s needs, so an Azure outage can't block releases.
   e2e-azure:
     name: E2E (Azure)
     runs-on: ubuntu-latest
-    # See `e2e`'s identical `needs` and its rationale.
     needs: [build-so]
-    # Same backstop-not-budget rationale as `e2e` / `e2e-lakekeeper`; the extra
-    # cost here is real-cloud round-trips, not extra local services.
     timeout-minutes: 45
     env:
-      # Caps the Exasol container the same way the `e2e` job does, but with no
-      # runtime measurement step: this job's test binary carries no
-      # container-affinity assertion, so the CPU set only has to fit a hosted
-      # runner.
       LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
 
-      # Only the services this suite starts, unlike `e2e-lakekeeper`'s bare
-      # `pull`: the Spark fixture and Iceberg-REST images are multi-GB and this
-      # job never runs either. Anything missed would still be pulled by `up`.
       - name: Pull stack images
         run: |
           docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
             -f docker-compose.lakekeeper.azure.yml \
             pull --quiet exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
 
-      # Two-phase bring-up, same pattern as `e2e-lakekeeper`. Skips `minio-init` /
-      # `minio-lakekeeper-init` (S3 bucket + STS setup this ADLS suite doesn't
-      # use) and `minio` itself — docker-compose.lakekeeper.azure.yml.
       - name: Start stack (Exasol + Keycloak + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml"
@@ -865,8 +588,6 @@ jobs:
 
           $COMPOSE up -d --wait exasol keycloak lakekeeper-db lakekeeper
 
-      # The five credential variables are scoped to THIS step only — no later
-      # step (log dumping, artifact upload) has any use for them.
       - name: Run Azure E2E suite
         env:
           AZURE_STORAGE_ACCOUNT_NAME: ${{ vars.AZURE_STORAGE_ACCOUNT_NAME }}
@@ -876,8 +597,6 @@ jobs:
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
         run: make test-e2e-azure
 
-      # Same rationale as the `e2e` job's identical step: a UDF sandbox crash
-      # only shows up in the host kernel ring buffer, not DB-side logs.
       - name: Dump Azure stack logs on failure
         if: failure()
         run: |
@@ -901,8 +620,6 @@ jobs:
           rm -rf exa-logs-azure && mkdir -p exa-logs-azure
           $COMPOSE cp exasol:/exa/logs exa-logs-azure/ 2>/dev/null || true
 
-      # Distinct artifact name: upload-artifact@v7 rejects a name already used by
-      # another job in the same run (`e2e` / `e2e-lakekeeper` own the other two).
       - name: Upload Azure Exasol logs
         if: failure()
         uses: actions/upload-artifact@v7
@@ -915,29 +632,12 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml down -v
 
-  # ── release: main-push-with-version-bump, or a direct tag push ──────────
   release:
     name: Release
     runs-on: ubuntu-latest
-    # lint/unit-tests/licenses listed EXPLICITLY, not inherited: they used to
-    # gate this transitively through `e2e`'s `needs`. Now that e2e only needs
-    # build-so, a main push with failing tests would otherwise mint a tag +
-    # Release. No latency cost — the e2e jobs dominate the chain. install-script
-    # and install-script-e2e are listed for the same reason: install.sh is
-    # served straight off `main` (see its own job comment), so a broken script
-    # on `main` must never reach a release-gated push either.
-    #
-    # `e2e-unity` gates releases: its stack is entirely local containers on a
-    # pinned image. `e2e-azure` is deliberately absent instead: a live
-    # third-party account there would let an outage or a rotated secret block
-    # every release.
-    #
-    # `arm64` DOES gate releases, unlike `e2e-azure`: it is a GitHub-hosted
-    # runner with no third-party dependency, so it carries none of that
-    # availability risk — and it is the ONLY architecture-specific test signal
-    # covering the `lakehouse-engine-aarch64.tar.gz` asset this job publishes
-    # (aarch64 E2E is a deliberate non-goal). Without it the second
-    # architecture would ship on strictly weaker gating than the first.
+    # lint/unit-tests/licenses must be listed explicitly: e2e only needs build-so.
+    # `e2e-azure` is deliberately absent (third-party outage risk); `arm64` is
+    # the only test signal for the aarch64 asset.
     needs: [e2e, e2e-lakekeeper, e2e-unity, lint, unit-tests, arm64, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -954,11 +654,6 @@ jobs:
           echo "version=$VER" >> "$GITHUB_OUTPUT"
           echo "tag=v$VER" >> "$GITHUB_OUTPUT"
 
-      # Verify the version trail, not just tag-existence: find the highest
-      # existing vX.Y.Z tag and confirm this version is strictly greater
-      # (semver). Stricter than an existence-only check, which would silently
-      # let through a version edited downward or left unchanged as long as
-      # that exact tag string didn't already exist.
       - name: Determine highest existing release tag
         id: prior
         run: |
@@ -973,16 +668,11 @@ jobs:
           TAG: ${{ steps.version.outputs.tag }}
           HIGHEST: ${{ steps.prior.outputs.highest }}
         run: |
-          # ponytail: numeric X.Y.Z only (no pre-release/build metadata) — this
-          # project's versions are plain semver, so a full semver comparator
-          # would be pure ceremony here.
+          # Numeric X.Y.Z only; no pre-release/build metadata.
           is_greater() {
             [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)" = "$1" ]
           }
           if [[ "$GITHUB_REF" == refs/tags/* ]]; then
-            # Tag-push path: the tag already exists by definition. Still
-            # reject a regressed/duplicate version (e.g. an accidental re-tag
-            # of an old release).
             if is_greater "$VERSION" "$HIGHEST" || [ "$VERSION" = "$HIGHEST" ]; then
               echo "release=true" >> "$GITHUB_OUTPUT"
               echo "Tag push for $TAG (version $VERSION) — releasing."
@@ -992,7 +682,6 @@ jobs:
               exit 1
             fi
           else
-            # Main-push path: release only on a genuine forward version bump.
             if git rev-parse "$TAG" >/dev/null 2>&1; then
               echo "release=false" >> "$GITHUB_OUTPUT"
               echo "Tag $TAG already exists — version not bumped; nothing to release."
@@ -1020,11 +709,8 @@ jobs:
           name: lakehouse-engine-so-aarch64
           path: artifacts/aarch64
 
-      # Manual-install users (e.g. Exasol SaaS, no BucketFS network access)
-      # download this straight off the release page and PUT/UI-upload it
-      # as-is — no local build, no repackaging. The `udf/` layout is what
-      # BucketFS extracts the tarball into; chmod before archiving so the
-      # extracted .so is already executable.
+      # Uploaded to BucketFS as-is by manual installs: the `udf/` layout and
+      # mode 755 must survive extraction.
       - name: Package release tarballs
         if: steps.gate.outputs.release == 'true'
         run: |
@@ -1059,10 +745,6 @@ jobs:
         with:
           tool: cargo-about@0.9.0
 
-      # Third-party notices for the crate graph shipped in the .so. Never
-      # committed (see .gitignore) — generated fresh for each release, kept in
-      # sync with deny.toml's allow-list via the cross-referencing comments in
-      # about.toml.
       - name: Generate third-party notices
         if: steps.gate.outputs.release == 'true'
         run: |
@@ -1085,11 +767,8 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: ${{ steps.version.outputs.tag }}
           generate_release_notes: true
-          # deploy/scripts/install.sh is deliberately NOT listed here. Users
-          # fetch it from the contents API on `main` (docs/install.md), and
-          # `?ref=<tag>` on that same API already covers pinning — a release
-          # asset would instead freeze installer bugs into every past release
-          # forever. Don't "fix" this by adding it back.
+          # install.sh deliberately not attached: users fetch it from `main`
+          # (`?ref=<tag>` pins); an asset would freeze installer bugs forever.
           files: |
             lakehouse-engine.tar.gz
             lakehouse-engine-aarch64.tar.gz

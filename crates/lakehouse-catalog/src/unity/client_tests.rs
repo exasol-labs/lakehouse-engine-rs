@@ -1,7 +1,3 @@
-//! Contract tests for the native Unity Catalog REST client: listing, single-table
-//! load, pagination, credential-safe failures, and the OSS/Databricks request
-//! shape. Every request is served by an in-process mock; no live network.
-
 use super::*;
 use crate::test_support::base_creds;
 use crate::unity::mock_server::spawn;
@@ -10,9 +6,7 @@ use exasol_udf_sdk::error::UdfError;
 
 const PAT_SENTINEL: &str = "PAT_SECRET_SENTINEL_VALUE";
 
-/// A single-table wire body whose `data_source_format` member is the given raw
-/// JSON fragment — `"data_source_format":"CSV",`, `"data_source_format":null,`,
-/// or `""` for a body that omits the member entirely.
+/// `raw_format_member` is a JSON fragment with trailing comma, or `""` to omit it.
 fn table_body_with_raw_format(raw_format_member: &str) -> String {
     format!(
         r#"{{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED",{raw_format_member}"storage_location":"s3://bucket/orders","table_id":"uuid-1","columns":[]}}"#
@@ -312,8 +306,7 @@ async fn follows_pagination_across_pages() {
 
 #[tokio::test]
 async fn request_failure_is_credential_safe_error() {
-    // The mock echoes the bearer it received into its error body, so the test
-    // proves the token is stripped from the surfaced error.
+    // The mock echoes the received bearer into its error body.
     let server = spawn(|req| {
         (
             500,
@@ -352,7 +345,6 @@ async fn identical_request_shape_oss_and_databricks() {
     let oss = spawn(|_req| (200, empty_tables_body())).await;
     let databricks = spawn(|_req| (200, empty_tables_body())).await;
 
-    // OSS with auth disabled; Databricks-managed reached with a PAT.
     let oss_session = UnityCatalogSession::new(&oss.base_url, base_creds());
     let mut databricks_creds = base_creds();
     databricks_creds.token = Some("dbx-pat".to_string());
@@ -427,8 +419,6 @@ async fn posts_temporary_table_credentials() {
     );
 }
 
-/// Scenario: The client lists tables in a configured catalog and schema
-/// Scenario: The client admits a Parquet base table and reports its partition columns
 #[tokio::test]
 async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     let body = r#"{"tables":[
@@ -506,7 +496,6 @@ async fn list_tables_tags_each_admitted_table_by_its_own_format() {
     );
 }
 
-/// Scenario: The client retrieves a table's metadata including its columns
 #[tokio::test]
 async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered_columns() {
     let server = spawn(|_req| (200, single_table_body())).await;
@@ -535,7 +524,6 @@ async fn load_table_returns_format_tag_vending_key_partition_columns_and_ordered
     );
 }
 
-/// Scenario: The single-table load maps an uppercase Parquet format to the Parquet tag
 #[tokio::test]
 async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags() {
     for (raw_format, expected) in [
@@ -555,9 +543,6 @@ async fn load_table_maps_the_uppercase_iceberg_and_parquet_formats_to_their_tags
     }
 }
 
-/// The load applies no admission filter, so an absent or unrecognized
-/// `data_source_format` is a refusal naming the table and the value — never a tag
-/// defaulted to Delta, which would route the table into the Delta log reader.
 #[tokio::test]
 async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     for (raw_format_member, expected_value) in [
@@ -592,8 +577,6 @@ async fn load_table_refuses_an_absent_or_unrecognized_data_source_format() {
     }
 }
 
-/// The format refusal carries the table's identity and the reported format value
-/// only — never the resolved bearer the request was sent with.
 #[tokio::test]
 async fn load_table_format_refusal_carries_no_credential() {
     let body = table_body_with_raw_format(r#""data_source_format":"CSV","#);
@@ -616,9 +599,6 @@ async fn load_table_format_refusal_carries_no_credential() {
     );
 }
 
-/// A whitespace-only `table_id` is not a catalog-assigned key: it must project to
-/// an absent vending key through the public `load_table` path, matching the
-/// crate's own published guarantee that an empty-or-whitespace key is absent.
 #[tokio::test]
 async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     let body = r#"{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"   ","columns":[]}"#.to_string();
@@ -636,9 +616,6 @@ async fn a_whitespace_only_table_id_projects_to_an_absent_vending_key() {
     );
 }
 
-/// An entry carrying no key — or an empty one — projects to an ABSENT key, so a
-/// caller that requires one fails naming the table instead of requesting
-/// credentials against an empty scope.
 #[test]
 fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
     for raw_key_member in ["", r#""table_id":null,"#, r#""table_id":"","#] {
@@ -656,8 +633,6 @@ fn neutral_table_reports_an_absent_vending_key_rather_than_an_empty_one() {
     }
 }
 
-/// A disqualifying `table_type` wins over the format and is named by its raw spelling; a
-/// format is admitted only as exact uppercase `DELTA` or `PARQUET`, else named verbatim.
 #[test]
 fn admission_admits_delta_and_parquet_base_tables_and_names_every_refusal() {
     let skip = |detail: &str| {

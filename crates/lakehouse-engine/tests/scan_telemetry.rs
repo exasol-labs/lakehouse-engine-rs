@@ -1,16 +1,3 @@
-//! Integration tests for Task 4 — on-demand phase telemetry.
-//!
-//! Drives the production raw-scan streaming + telemetry path
-//! (`run_raw_scan_with_session`) against a local Parquet file with a fake
-//! `UdfContext` whose debug level is settable, and observes the per-process
-//! telemetry file. Covers the four spec scenarios:
-//!   * silent at the default (`info`) level;
-//!   * three phase durations reported when enabled (`debug`);
-//!   * import vs emit attributed to distinct accumulators;
-//!   * a telemetry-sink failure never fails the scan.
-//!
-//! Host-runnable: no S3 / MinIO stack — the scan registers a `file://` Parquet.
-
 mod scan_fixture;
 
 use std::sync::{Arc, Mutex, MutexGuard};
@@ -30,17 +17,13 @@ use lakehouse_engine::scan::spec::{
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
 
-/// The per-process telemetry file is keyed by PID and therefore shared by every
-/// test in this binary. Serialize the telemetry tests so one test's file writes
-/// never race another's assertions.
+/// The telemetry file is keyed by PID, so it is shared by every test in this binary.
 static TELEMETRY_LOCK: Mutex<()> = Mutex::new(());
 
 fn lock() -> MutexGuard<'static, ()> {
     TELEMETRY_LOCK.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Write a local Parquet file with `rows` rows across small row groups (so the
-/// scan produces several batches) and return its `file://` URL.
 fn write_local_parquet(dir: &std::path::Path, rows: i64, row_group: usize) -> String {
     let schema = Arc::new(Schema::new(vec![
         Field::new("id", DataType::Int64, false),
@@ -91,9 +74,6 @@ fn scan_spec(file_url: String) -> ScanSpec {
     }
 }
 
-/// Run one raw scan to completion with the given debug level; returns the fake
-/// context (carrying the captured emit counts). Registers a fresh session per
-/// run so the local Parquet path is exercised exactly as production would.
 async fn run_scan(spec: &ScanSpec, level: tracing::Level) -> scan_fixture::BatchCapturingCtx {
     let mut ctx = scan_fixture::BatchCapturingCtx::declaring(
         TestContext::scalar(vec![Value::String(spec.to_json())]).with_debug_level(level),
@@ -113,7 +93,6 @@ async fn run_scan(spec: &ScanSpec, level: tracing::Level) -> scan_fixture::Batch
     ctx
 }
 
-/// Read all `LHTELEM` lines currently in the per-process telemetry file.
 fn telemetry_lines() -> Vec<String> {
     match std::fs::read_to_string(telemetry_file_path()) {
         Ok(s) => s
@@ -136,13 +115,7 @@ fn parse_phase_ms(line: &str, key: &str) -> f64 {
         .unwrap_or_else(|| panic!("line missing {key}: {line}"))
 }
 
-/// Drive an async test body to completion on a fresh multi-thread runtime.
-///
-/// The tests are plain `#[test]` fns (not `#[tokio::test]`) so the serialization
-/// guard is held across this synchronous `block_on` rather than across an
-/// `.await` — the per-process telemetry file is shared by PID, so the tests must
-/// not interleave, but holding a std `Mutex` across an await point is a footgun
-/// (and a clippy lint). Holding it across a blocking `block_on` is clean.
+/// Plain `#[test]` + `block_on` so the std `Mutex` guard is never held across an `.await`.
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
@@ -162,9 +135,7 @@ fn telemetry_silent_at_default_level() {
     clear_telemetry_file();
     let ctx = block_on(run_scan(&spec, tracing::Level::INFO));
 
-    // Scan still produced output...
     assert_eq!(ctx.total_rows(), 200, "all rows must be emitted");
-    // ...but no telemetry line was written at the default level.
     assert!(
         telemetry_lines().is_empty(),
         "no telemetry must be emitted at the default (info) level"
@@ -197,16 +168,13 @@ fn telemetry_reports_three_phases_when_enabled() {
         "must carry pid: {line}"
     );
 
-    // All three phases plus the reconstructed body wall-clock are present.
     let startup = parse_phase_ms(line, "phase_startup_ms=");
     let import = parse_phase_ms(line, "phase_import_ms=");
     let emit = parse_phase_ms(line, "phase_emit_ms=");
     let body = parse_phase_ms(line, "body_ms=");
 
     assert!(startup >= 0.0 && import >= 0.0 && emit >= 0.0 && body >= 0.0);
-    // The three phases account for the scan-body wall-clock within measurement
-    // error (no phase silently omitted). Allow a generous tolerance for the
-    // small un-timed glue between phases.
+    // Tolerance covers the un-timed glue between phases.
     let summed = startup + import + emit;
     assert!(
         (body - summed).abs() < 5.0 || summed <= body,
@@ -221,8 +189,6 @@ fn telemetry_attributes_import_separately_from_emit() {
     let _g = lock();
     let dir = std::env::temp_dir().join(format!("lh_telem_split_{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    // Many small row groups → many batches → both import and emit accumulate
-    // across multiple iterations, so they are independently observable.
     let spec = scan_spec(write_local_parquet(&dir, 1000, 32));
 
     clear_telemetry_file();
@@ -233,17 +199,12 @@ fn telemetry_attributes_import_separately_from_emit() {
     assert_eq!(lines.len(), 1, "one telemetry record, got {lines:?}");
     let line = &lines[0];
 
-    // Import and emit are reported as DISTINCT durations (separate keys), so a
-    // benchmark can tell a read-bound scan from an emit-bound one. Both keys
-    // must be present and parse independently.
     let import = parse_phase_ms(line, "phase_import_ms=");
     let emit = parse_phase_ms(line, "phase_emit_ms=");
     assert!(
         line.contains("phase_import_ms=") && line.contains("phase_emit_ms="),
         "import and emit must be reported as distinct fields: {line}"
     );
-    // They are independent accumulators: at least one phase recorded measurable
-    // time over 1000 rows / many batches, and the two values are tracked apart.
     assert!(
         import + emit > 0.0,
         "import+emit must capture measurable streaming time: import={import} emit={emit}"
@@ -259,9 +220,7 @@ fn telemetry_failure_never_fails_scan() {
     std::fs::create_dir_all(&dir).unwrap();
     let spec = scan_spec(write_local_parquet(&dir, 200, 64));
 
-    // Make the telemetry SINK unwritable: pre-create the telemetry file path as
-    // a DIRECTORY, so the best-effort append open() fails. The scan must still
-    // complete and return its result, never surfacing the sink failure.
+    // A directory at the telemetry path makes the append open() fail.
     clear_telemetry_file();
     let sink_path = telemetry_file_path();
     std::fs::create_dir_all(&sink_path).expect("occupy telemetry path with a directory");
@@ -287,8 +246,6 @@ fn telemetry_failure_never_fails_scan() {
     );
     assert_eq!(ctx.total_rows(), 200, "all rows must still be emitted");
 
-    // No LHTELEM line could have been appended (the sink is a directory), and
-    // the scan was unaffected.
     let _ = std::fs::remove_dir(&sink_path);
     let _ = std::fs::remove_dir_all(&dir);
 }

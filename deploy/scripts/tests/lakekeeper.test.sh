@@ -1,23 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2030,SC2031
-# Offline, stubbed-PATH test harness for the AWS Lakekeeper stack (deploy/lakekeeper-stack/*) and
-# its provisioning scripts (deploy/scripts/lakekeeper-provision.sh, secrets.sh). Follows
-# deploy/scripts/tests/install.test.sh's structure and pass/fail/assert_* helpers.
-#
-# Runs with NO Docker and NO network. `tofu`, `aws`, `ssh`, `curl`, and `jq` are all stubbed on a
-# temporary PATH, recording every argv (and, for curl's request bodies, the body itself) to a log.
-# The `jq` stub is a RECORDING WRAPPER ONLY: it logs its own argv, then execs the REAL jq by
-# absolute path, so body construction inside the scripts under test still works while jq's own
-# command line becomes assertable. The harness's OWN assertions call the real jq by absolute path
-# ($REAL_JQ) so they are never served by the stub.
-#
-# This is the offline complement to lakekeeper-local.test.sh (live Docker integration, task 5.2) --
-# it never touches Docker or a real Lakekeeper/Keycloak server. Where lakekeeper-local.test.sh
-# drives the real HTTP flow, this harness stubs every external call and asserts the SHAPE of what
-# the scripts would have sent -- the request bodies, the credential-hygiene invariants, and the
-# static .tf declarations -- which is what replaces compile-time checking for bash (plan.md
-# Consequences: "no compile-time type or JSON-shape checking").
-#
+# Offline (no Docker, no network): tofu, aws, ssh, curl, and jq are stubbed on PATH and record
+# their argv. The jq stub logs then execs the real jq; assertions use $REAL_JQ directly.
 # Run: bash deploy/scripts/tests/lakekeeper.test.sh
 
 set -uo pipefail
@@ -27,8 +11,7 @@ DS="$(cd "$HERE/.." && pwd)"
 LKS="$(cd "$DS/../lakekeeper-stack" && pwd)"
 ORIG_PATH="$PATH"
 BASH_BIN="$(command -v bash)"
-# Exported so the tofu stub — written from a quoted heredoc, so nothing is interpolated into it —
-# can reach the REAL jq at run time instead of the recording wrapper on the stubbed PATH.
+# Exported for the tofu stub, whose quoted heredoc cannot interpolate it.
 export REAL_JQ
 REAL_JQ="$(command -v jq)"
 
@@ -57,10 +40,6 @@ assert_rc_zero()     { if [[ "$2" -eq 0 ]]; then pass "$1"; else fail "$1" "expe
 assert_rc_nonzero()  { if [[ "$2" -ne 0 ]]; then pass "$1"; else fail "$1" "expected nonzero rc got $2"; fi; }
 assert_gt_zero()     { if [[ "$2" -gt 0 ]]; then pass "$1"; else fail "$1" "expected a count above zero, got $2"; fi; }
 
-# Asserts the first $STUB_LOG line matching `before` really precedes the first matching `after`.
-# Order is itself the claim wherever one recorded call is only correct because another already
-# happened -- a provisioning call issued before the box answers its health endpoint, or a workspace
-# deleted before the destroy that empties it, both still leave every individual line in the log.
 assert_log_order() { # desc before_regex after_regex
   local desc="$1" first second
   first="$(grep -nE "$2" "$STUB_LOG" | head -1 | cut -d: -f1)"
@@ -72,7 +51,6 @@ assert_log_order() { # desc before_regex after_regex
   fi
 }
 
-# Runs the REAL jq (never the recording stub) as the ground truth for a JSON-shape assertion.
 assert_jq() { # desc json filter
   local desc="$1" json="$2" filter="$3"
   if printf '%s' "$json" | "$REAL_JQ" -e "$filter" >/dev/null 2>&1; then
@@ -81,8 +59,6 @@ assert_jq() { # desc json filter
     fail "$desc" "jq -e '$filter' failed against: $json"
   fi
 }
-
-# --- sandbox + stubs ---------------------------------------------------------
 
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
@@ -100,7 +76,6 @@ REGISTER_STATE_DIR="$SANDBOX/register-state"
 mkdir -p "$REGISTER_STATE_DIR"
 export STUB_REGISTER_STATE="$REGISTER_STATE_DIR"
 
-# --- jq: recording wrapper, delegates to the REAL jq by absolute path -------------------------
 write_jq_stub() {
   cat > "$1/jq" <<STUBEOF
 #!/usr/bin/env bash
@@ -110,10 +85,6 @@ STUBEOF
   chmod +x "$1/jq"
 }
 
-# --- aws: glue get-tables / s3 cp / ssm get-parameter -----------------------------------------
-# Generic enough for all three call sites this plan touches: lakekeeper-provision.sh's glue
-# source producer, lakekeeper-userdata.sh.tftpl's realm-export fetch + SSM secret reads, and
-# secrets.sh's SSM reads.
 write_aws_stub() {
   cat > "$1/aws" <<'STUBEOF'
 #!/usr/bin/env bash
@@ -162,13 +133,7 @@ STUBEOF
   chmod +x "$1/aws"
 }
 
-# --- curl: IMDSv2 + Lakekeeper/Keycloak REST + management API ---------------------------------
-# `-o <file> -w '%{http_code}'` calls (every curl_bearer_status call in lakekeeper-provision.sh)
-# write the canned body to the file and print only the status; a call with no `-o` (oauth2_token,
-# the IMDSv2 probes) gets the body printed straight to stdout, matching real curl's own behavior
-# for each shape. Any `--data @<path>` argument's file content is captured to $BODY_LOG, tagged by
-# URL, before this stub answers -- that is how the harness's own assertions see the exact REQUEST
-# BODIES the scripts under test constructed.
+# `--data @<path>` bodies are captured to $BODY_LOG, tagged by URL.
 write_curl_stub() {
   cat > "$1/curl" <<STUBEOF
 #!/usr/bin/env bash
@@ -283,7 +248,6 @@ STUBEOF
   chmod +x "$1/curl"
 }
 
-# --- ssh: secrets.sh's BucketFS write-password read -----------------------------------------
 write_ssh_stub() {
   cat > "$1/ssh" <<'STUBEOF'
 #!/usr/bin/env bash
@@ -293,13 +257,8 @@ STUBEOF
   chmod +x "$1/ssh"
 }
 
-# --- tofu: workspace select/new/delete, output -json / -raw, apply, destroy --------------------
-# Every invocation is recorded as `tofu[<cwd basename>] <argv>`. The cwd is part of the record
-# because which STACK DIRECTORY an apply or a destroy ran in is the assertion that keeps
-# lakekeeper-up.sh / lakekeeper-down.sh from touching data-stack, cluster-stack or trino-stack;
-# the argv alone never carries it. `output -raw <name>` is served from the same fixture JSON as
-# `output -json` and FAILS on an unpublished name, so a test that asks for an output the stack
-# does not declare breaks loudly instead of handing the script under test an empty string.
+# Records the cwd so tests can assert which stack an apply/destroy ran in. `output -raw` fails on
+# an unpublished name rather than returning an empty string.
 write_tofu_stub() {
   cat > "$1/tofu" <<'STUBEOF'
 #!/usr/bin/env bash
@@ -341,7 +300,6 @@ STUBEOF
   chmod +x "$1/tofu"
 }
 
-# --- no-op stubs for the userdata script's OS-level calls (apt-get, systemctl, docker) --------
 write_noop_stub() { # dir name
   cat > "$1/$2" <<STUBEOF
 #!/usr/bin/env bash
@@ -379,10 +337,6 @@ reset_env() {
         STUB_LAKEKEEPER_OUTPUT_JSON STUB_BFS_ENC 2>/dev/null || true
   RUN_PATH="$STUBDIR:$ORIG_PATH"
 }
-
-# ============================================================================
-# Group 1: static .tf source assertions (ingress, IAM, OIDC, SSM types)
-# ============================================================================
 
 ssm_param_type() { # name -> the type value ("String"/"SecureString") of that resource block
   local pname="$1"
@@ -444,13 +398,7 @@ test_oidc_two_vantages_declared() {
     'catalog_uri_private = "http://${aws_instance.lakekeeper.private_ip}:8181/catalog"'
 }
 
-# ============================================================================
-# Group 2: rendered user-data (lakekeeper-userdata.sh.tftpl actually executed)
-# ============================================================================
-
-# Renders the tftpl the way OpenTofu's templatefile() would (single-$ interpolation of the named
-# vars, $${...} unescaped to a literal ${...}), then sandboxes its two hardcoded absolute paths
-# (the tee log target and WORKDIR) so running it never touches the real filesystem outside $SANDBOX.
+# Mimics templatefile(), then redirects the template's hardcoded absolute paths into $SANDBOX.
 render_userdata() {
   local out="$1"
   sed \
@@ -523,10 +471,6 @@ test_rendered_userdata_declares_both_issuer_uris_and_ssm_sourced_admin_password(
   assert_contains "userdata: reads keycloak_admin_password from this stack's own SSM root" "$log" \
     "--name /spot-strata/lakekeeper/testenv/keycloak_admin_password"
 }
-
-# ============================================================================
-# Group 3: lakekeeper-provision.sh -- request bodies, register outcomes, hygiene
-# ============================================================================
 
 setup_provision_env() {
   export LK_SOURCE_KIND=glue
@@ -644,9 +588,6 @@ test_no_secret_in_recorded_argv_or_output_and_no_set_x() {
   assert_not_contains "hygiene: the secret-access-key canary never appears in any stubbed command's argv" \
     "$log" "CANARY-SECRET-ACCESS-KEY"
 
-  # argv is only half the exposure the scenario names: a credential the script never puts on a
-  # command line can still reach an operator's terminal, a CI log, or a pasted error report through
-  # the script's OWN stdout/stderr, so the same canaries are checked against the captured run output.
   assert_not_contains "hygiene: the client-secret canary never reaches the run's own output" \
     "$LAST_OUT" "CANARY-CLIENT-SECRET-VALUE"
   assert_not_contains "hygiene: the access-key-id canary never reaches the run's own output" \
@@ -654,9 +595,7 @@ test_no_secret_in_recorded_argv_or_output_and_no_set_x() {
   assert_not_contains "hygiene: the secret-access-key canary never reaches the run's own output" \
     "$LAST_OUT" "CANARY-SECRET-ACCESS-KEY"
 
-  # A recorded jq argv entry can itself span multiple lines (the warehouse-body filter is a
-  # multi-line program text), so these checks scan the WHOLE log rather than a '^jq '-anchored
-  # line filter, which would silently miss anything past a jq entry's first line.
+  # A jq argv entry can span multiple lines, so scan the whole log, not '^jq ' lines.
   assert_contains "hygiene: the warehouse-body jq call reads the access key id from jq's environment" \
     "$log" "env.LK_TARGET_ACCESS_KEY_ID"
   assert_contains "hygiene: the warehouse-body jq call reads the secret access key from jq's environment" \
@@ -669,17 +608,12 @@ test_no_secret_in_recorded_argv_or_output_and_no_set_x() {
   assert_not_contains "hygiene: no --argjson token names the secret access key field" "$log" \
     "--argjson secret_access_key"
 
-  # Shell tracing would defeat every assertion above at once by echoing each expanded command,
-  # credential-bearing ones included, so the source-text ban belongs with the canaries it protects.
   local src; src="$(cat "$PROVISION")"
   assert_not_contains "hygiene: no set -x anywhere in the provisioning script" "$src" "set -x"
 }
 
-# The run-site-agnostic half of the same credential story (plan.md § Scenario Coverage,
-# "Provisioning runs unchanged from an operator's laptop and from an EC2 box"): naming no profile is
-# what lets the AWS CLI resolve a laptop's environment and an EC2 instance profile through the same
-# chain, and passing --region explicitly is what stops the EC2 box -- which has no ~/.aws/config --
-# from resolving a different region than the laptop did.
+# No --profile lets a laptop and an EC2 instance profile share one credential chain; an explicit
+# --region is needed because the EC2 box has no ~/.aws/config.
 test_provision_uses_only_the_aws_credential_chain_and_an_explicit_region() {
   echo "== test_provision_uses_only_the_aws_credential_chain_and_an_explicit_region =="
   reset_env
@@ -689,8 +623,7 @@ test_provision_uses_only_the_aws_credential_chain_and_an_explicit_region() {
 
   local aws_lines aws_count
   aws_lines="$(grep '^aws ' "$STUB_LOG" || true)"
-  # Without this the two checks below pass vacuously: a run that never reached the AWS CLI at all
-  # records no line carrying --profile and no line missing --region.
+  # Guards the two checks below against passing vacuously.
   aws_count="$(grep -c '^aws ' "$STUB_LOG" || true)"
   assert_gt_zero "credential chain: the run actually invoked the AWS CLI" "${aws_count:-0}"
   assert_not_contains "credential chain: no aws call passes --profile" "$aws_lines" "--profile"
@@ -864,10 +797,7 @@ test_provision_derives_the_parent_prefix_from_table_locations_at_different_depth
   echo "== test_provision_derives_the_parent_prefix_from_table_locations_at_different_depths =="
   reset_env
   setup_provision_env
-  # partsupp (deeper) listed FIRST so the assertion cannot pass merely because the first entry's
-  # own ancestor already happens to equal the final answer -- it forces the shorten-to-parent walk
-  # in derive_bucket_and_prefix to actually shorten "tpch.db/nested" down to "tpch.db" once the
-  # shallower "part" entry is read.
+  # The deeper table is listed first so the prefix walk must actually shorten.
   export STUB_GLUE_TABLES_JSON='[{"name":"partsupp","metadata_location":"s3://stub-bucket/tpch.db/nested/partsupp/metadata/001.json"},{"name":"part","metadata_location":"s3://stub-bucket/tpch.db/part/metadata/001.json"}]'
   run_provision --source-only
   assert_rc_zero "different depths: source-only still succeeds" "$LAST_RC"
@@ -885,10 +815,6 @@ test_provision_derives_the_key_prefix_from_a_single_source_table() {
   assert_jq "single table: key_prefix is the table's own parent directory" "$LAST_OUT" \
     '.key_prefix == "tpch.db"'
 }
-
-# ============================================================================
-# Group 4: secrets.sh -- generated bench/.env, credential hygiene
-# ============================================================================
 
 SECRETS_SANDBOX="$SANDBOX/secrets-sandbox"
 mkdir -p "$SECRETS_SANDBOX/deploy/scripts" "$SECRETS_SANDBOX/deploy/cluster-stack" \
@@ -909,11 +835,7 @@ cat > "$CLUSTER_OUTPUT_JSON_FILE" <<'JSON'
 }
 JSON
 
-# data_ssm_root deliberately does NOT contain the env name: the data-stack defaults env_name to
-# "data" and deploy/README.md applies it with no override, so a run for Lakekeeper env "testenv"
-# still reads /spot-strata/data/*. Composing the root from the Lakekeeper env name instead of
-# reading this output is the defect test_up_reads_the_data_stack_ssm_root_from_the_stack_output
-# guards, and it can only fail after the billable EC2 box already exists.
+# data_ssm_root deliberately omits the Lakekeeper env name: the data-stack uses its own ("data").
 LK_OUTPUT_JSON_FILE="$SANDBOX/lk-output.json"
 cat > "$LK_OUTPUT_JSON_FILE" <<'JSON'
 {
@@ -1000,29 +922,16 @@ test_secrets_credential_hygiene() {
     "$log" "$STUB_BFS_PLAIN"
 }
 
-# ============================================================================
-# Group 5: lakekeeper-up.sh / lakekeeper-down.sh -- stack scope, ordering, SSM roots
-# ============================================================================
-
 UP="$DS/lakekeeper-up.sh"
 DOWN="$DS/lakekeeper-down.sh"
 
-# Everything lakekeeper-up.sh needs from beyond its own argv: this stack's OpenTofu outputs, and a
-# list-warehouse read-back agreeing with the bucket/prefix the stubbed Glue source derives. No LK_*
-# variable is exported here on purpose -- that lakekeeper-up.sh derives the whole
-# lakekeeper-provision.sh contract from stack outputs and SSM alone, with nothing operator-set, is
-# part of what these tests assert.
+# No LK_* variable is exported on purpose: lakekeeper-up.sh must derive them all itself.
 setup_up_env() {
   export STUB_LAKEKEEPER_OUTPUT_JSON="$LK_OUTPUT_JSON_FILE"
   local warehouse
   warehouse="$("$REAL_JQ" -r '.warehouse_name.value' "$LK_OUTPUT_JSON_FILE")"
   export STUB_LIST_WAREHOUSE_BODY
-  # lakekeeper-up.sh registers both "tpch" (the base warehouse) and "erp" (its own,
-  # namespace-suffixed warehouse — a warehouse's storage profile is 1:1 with a source prefix, so
-  # erp can't share tpch's). Both are pre-registered here already, sharing the same key-prefix,
-  # because the offline Glue-tables stub always derives "tpch.db" regardless of
-  # LK_SOURCE_DATABASE; a real create-vs-mismatch check for a namespace's OWN warehouse is covered
-  # by the provision-level tests below, not these outer up-orchestration ones.
+  # Both warehouses share "tpch.db" because the Glue stub always derives it.
   STUB_LIST_WAREHOUSE_BODY="$("$REAL_JQ" -n -c --arg name "$warehouse" --arg erp_name "${warehouse}-erp" \
     '{warehouses:[{name: $name, "storage-profile": {bucket: "stub-bucket", "key-prefix": "tpch.db"}},
                    {name: $erp_name, "storage-profile": {bucket: "stub-bucket", "key-prefix": "tpch.db"}}]}')"
@@ -1069,9 +978,6 @@ test_up_applies_only_this_stack_and_waits_for_health() {
   apply_lines="$(grep -E '^tofu\[[^]]*\] apply( |$)' "$STUB_LOG" || true)"
   apply_count="$(printf '%s\n' "$apply_lines" | grep -c . || true)"
   assert_eq "up: exactly one tofu apply is recorded for the whole run" "1" "${apply_count:-0}"
-  # Scoping is the cost-relevant claim: data-stack, cluster-stack and trino-stack all carry
-  # long-lived or far more expensive resources, and an apply in any of them would be recorded here
-  # under that directory's own name.
   foreign_applies="$(printf '%s\n' "$apply_lines" | grep -v '^tofu\[lakekeeper-stack\]' | grep -v '^$' || true)"
   assert_eq "up: no tofu apply runs in any stack directory but lakekeeper-stack" "" "$foreign_applies"
   assert_contains "up: the apply pins the env name given on argv" "$apply_lines" "-var env_name=testenv"
@@ -1101,17 +1007,12 @@ test_down_destroys_only_the_lakekeeper_workspace() {
   assert_contains "down: the destroy targets the env given on argv" "$destroy_lines" "-var env_name=testenv"
   assert_not_contains "down: teardown never applies anything" "$(cat "$STUB_LOG")" "] apply"
 
-  # The workspace is released only AFTER the destroy: deleting it first would strand every resource
-  # the state file names, leaving a billing box no script can reach any more.
+  # Deleting the workspace first would strand the still-billing resources.
   assert_log_order "down: the workspace is left before it is deleted" \
     '^tofu\[lakekeeper-stack\] destroy' '^tofu\[lakekeeper-stack\] workspace select default'
   assert_log_order "down: the named workspace is deleted only after the destroy" \
     '^tofu\[lakekeeper-stack\] destroy' '^tofu\[lakekeeper-stack\] workspace delete testenv'
 }
-
-# ============================================================================
-# Run
-# ============================================================================
 
 main() {
   test_stack_declares_a_distinct_iam_user_with_an_attached_managed_policy

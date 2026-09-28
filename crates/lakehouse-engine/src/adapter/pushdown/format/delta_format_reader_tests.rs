@@ -5,13 +5,12 @@ use crate::adapter::pushdown::test_support::{
 };
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, ConnectionCreds, TableFormat};
 
-/// A closed port: any credential request the reader issued would fail loudly with a
-/// transport error, which is distinguishable from every refusal asserted here.
+/// Closed port: a stray credential request fails with a transport error, distinguishable
+/// from every refusal asserted here.
 const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
 
 const TABLE_NAME: &str = "cat.sch.orders";
 
-/// The static storage credential a forbidden fallback would silently reach for.
 const STATIC_SECRET: &str = "minioadmin";
 
 fn creds(use_vended_credentials: bool) -> ConnectionCreds {
@@ -54,7 +53,6 @@ fn delta_table(
     }
 }
 
-/// Resolve one table's scan and answer the user-error message it fails with.
 async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
     let creds = creds(use_vended_credentials);
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
@@ -77,14 +75,6 @@ async fn refusal(table: &CatalogTable, use_vended_credentials: bool) -> String {
     }
 }
 
-/// Scenario: Delta planning resolves its storage credential through the table's own
-/// catalog.
-///
-/// With vending enabled and no catalog-assigned vending key, resolution fails naming
-/// the table. It MUST NOT reach the CONNECTION's static credential instead: a fallback
-/// would have built that store and failed on the transaction log, so a message naming
-/// the log — or one carrying the static credential — is the observable signature of the
-/// fallback this refusal exists to prevent.
 #[tokio::test]
 async fn vending_without_a_vending_key_errors_and_never_falls_back_to_static() {
     for absent_key in [None, Some("")] {
@@ -114,13 +104,7 @@ async fn vending_without_a_vending_key_errors_and_never_falls_back_to_static() {
     }
 }
 
-/// Scenario: An empty table storage location is rejected before any object-store
-/// access.
-///
-/// The location check runs before the vended/static split, so every combination of
-/// credential mode and vending key reports the IDENTICAL text. A check placed after
-/// the split would answer the vending-key refusal, or a transport error from the
-/// credential request, for the vending-enabled rows.
+/// Scenario: An empty table storage location is rejected before any object-store access
 #[tokio::test]
 async fn empty_storage_location_errors_identically_under_both_credential_modes() {
     let mut messages = Vec::new();
@@ -157,14 +141,6 @@ async fn empty_storage_location_errors_identically_under_both_credential_modes()
 
 const DELTA_TABLE_ROOT: &str = "s3://bucket/cat/sch/orders";
 
-/// Scenario: Delta planning resolves its storage credential through the table's own
-/// catalog.
-///
-/// The static-credential half, driven to the point where the log is actually read: the
-/// storage location and the credential decision both succeed, so this is the one test
-/// that enters `read_delta_log` and fails inside it. The refusal must name the table
-/// root it could not read and carry NEITHER static credential value, which is the
-/// redaction this layer owns rather than a message that never held a secret.
 #[tokio::test]
 async fn a_failed_log_read_reports_no_static_credential_value() {
     let creds = creds(false);

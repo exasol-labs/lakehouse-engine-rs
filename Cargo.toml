@@ -1,76 +1,44 @@
 [workspace]
 members = ["crates/lakehouse-engine", "crates/lakehouse-catalog", "crates/vs-expression"]
-# The UDF crate is a cdylib that MUST be compiled inside rust:1.94-trixie
-# (glibc 2.41) via `make cross-udf-build`. A bare host `cargo build
-# --release` must never emit the .so — the SDK fingerprint embeds the rustc
-# hash, so a host-built .so is rejected by the SLC at load time.
-#
-# There is no root package here (greenfield PoC, UDF-only); default-members is
-# left unset so `cargo build` at the workspace root is a no-op by default and
-# individual crates must be addressed with `-p`.
+# Build the UDF .so only via `make cross-udf-build` (rust:1.94-trixie): the SDK
+# fingerprint embeds the rustc hash, so a host-built .so is rejected at load.
 resolver = "2"
 
-# No [profile.*] here — it lives in .cargo/config.toml so CI's cache key tracks
-# it (rationale there; upstream Swatinem/rust-cache#268).
+# No [profile.*] here — see .cargo/config.toml.
 
 [workspace.package]
 license = "MIT"
 
-# Shared single-version pins. Member crates reference these with
-# `{ workspace = true }`, optionally adding per-crate features.
-#
-# CAUTION: nothing in this file enters CI's cache key (same #268 blind spot as
-# profiles). Version bumps are covered indirectly via Cargo.lock, but a
-# `features`/`default-features` edit that doesn't move the lockfile rotates
-# nothing and poisons the cache permanently. Prefer declaring features on the
-# member crate — member manifests ARE hashed. If you change one here and CI
-# starts recompiling every run, bust the cache by hand: bump the `shared-key`
-# suffix (e.g. `workspace-rlib` → `workspace-rlib2`) on EVERY rust-cache step of
-# a namespace at once — a partial bump leaves that namespace's readers
-# permanently cold (#133). Three namespaces exist since #313 split the writer:
-#   workspace-rlib  — ci.yml's `build-host` (writer) + `lint`, and
-#                     .github/actions/e2e-setup/action.yml (not in ci.yml)
-#   llvm-cov        — ci.yml's `unit-tests`, a required status check
-#   workspace-arm64 — ci.yml's `arm64` job
+# CAUTION: this file never enters CI's cache key (rust-cache#268). A
+# `features` edit that doesn't move Cargo.lock poisons the cache; prefer
+# declaring features on the member crate. To bust it, bump the `shared-key`
+# suffix on EVERY rust-cache step of that namespace at once (#133):
+#   workspace-rlib  — ci.yml `build-host` + `lint`, and .github/actions/e2e-setup
+#   llvm-cov        — ci.yml `unit-tests`
+#   workspace-arm64 — ci.yml `arm64`
 [workspace.dependencies]
 
-# Arrow ecosystem: pin to 58 to match datafusion 54's arrow requirement.
+# Must match datafusion's arrow major.
 arrow   = { version = "58", default-features = false }
 parquet = { version = "58", features = ["async"] }
 
-# DataFusion 54.1.0 co-resolves on arrow ^58.3.0.
 datafusion = { version = "54.1", default-features = false, features = ["parquet", "sql"] }
 
-# S3-compatible object store (MinIO); datafusion 54 requires ^0.13.2.
 object_store = { version = "0.13.2", features = ["aws"] }
 
-# Roaring bitmaps for the positional-delete set (RoaringTreemap). Pinned to the
-# same 0.11 line iceberg 0.10.0 already resolves transitively, so the scan
-# UDF's vendored `build_deletes_row_selection` consumes the identical type.
+# Same line iceberg resolves, so the vendored `build_deletes_row_selection` shares its type.
 roaring = { version = "0.11" }
 
-# Iceberg REST catalog.
-# Pinned to the crates.io 0.10.0 release. iceberg 0.10.0 links arrow 58
-# internally, the same tree as datafusion/exasol-udf-sdk below — the workspace
-# is a single arrow-58 tree end to end.
-# iceberg's transitive dep fastnum tracks rustc; 0.7.5+ requires rustc 1.94,
-# which this workspace builds on (see rust-toolchain.toml), so fastnum is no
-# longer lock-pinned.
+# Must link the same arrow major as datafusion/exasol-udf-sdk.
 iceberg = "0.10.0"
 iceberg-catalog-rest = "0.10.0"
-# iceberg core ships only Local/Memory StorageFactory impls (iceberg::io); S3
-# support lives in this separate crate and a StorageFactory registration is
-# still mandatory for RestCatalog. The S3 (MinIO) factory lives here; its
-# config keys (s3.endpoint, s3.region, s3.access-key-id, ...) are passed in
-# the same props map handed to RestCatalogBuilder::load.
+# RestCatalog requires a StorageFactory; iceberg core ships no S3 one.
 iceberg-storage-opendal = { version = "0.10.0", default-features = false, features = ["opendal-s3"] }
 
-# Async runtime: tokio current-thread is sufficient for blocking UDF entry
-# points; full feature set available behind the exasol-e2e feature.
 tokio = { version = "1", features = ["rt", "macros"] }
 
 # Also the SLC version (fingerprint must match). `make install-slc` and
-# deploy/scripts/install.sh both scrape this line, so keep `version` inline.
+# deploy/scripts/install.sh scrape this line, so keep `version` inline.
 exasol-udf-sdk    = { version = "0.30.0", features = ["emit-arrow"] }
 exasol-udf-macros = { version = "0.30.0" }
 
@@ -82,20 +50,10 @@ anyhow     = { version = "1" }
 chrono  = { version = "0.4" }
 futures = { version = "0.3" }
 url     = { version = "2" }
-# Percent-decodes Hive partition-directory values and percent-encodes direct-storage FileEntry
-# paths; already resolved to 2.3.2 transitively through url and object_store.
 percent-encoding = { version = "2" }
 
-# AWS SigV4 signing for the Glue REST catalog: lakehouse-catalog signs every
-# catalog request it issues on that path.
-# MSRV 1.91.1 — compatible with rustc 1.94 that builds the UDF .so.
 aws-sigv4              = { version = "1.4", default-features = true }
 aws-credential-types   = { version = "1.2" }
-# A direct dependency of aws-sigv4 (for Identity), declared explicitly so the
-# `use aws_smithy_runtime_api::client::identity::Identity` import resolves without
-# relying on a transitive re-export.
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 
-# Async HTTP client for the catalog's self-issued signed `loadTable` GET. The
-# engine's test harness adds `features = ["blocking"]` on top for its own use.
 reqwest = { version = "0.12" }

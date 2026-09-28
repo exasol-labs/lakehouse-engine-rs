@@ -12,21 +12,18 @@ exasol-udf-sdk = { workspace = true }
 
 iceberg                 = { workspace = true }
 iceberg-catalog-rest    = { workspace = true }
-# `opendal-azdls`: ADLS Gen2 backend for the `OpenDalStorageFactory` FileIO
-# registration in `storage.rs`/`session.rs`; unions with the workspace `opendal-s3`.
+# `opendal-azdls`: ADLS Gen2 FileIO backend, in addition to the workspace `opendal-s3`.
 iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 
 serde      = { workspace = true }
 serde_json = { workspace = true }
 url        = { workspace = true }
 
-# SigV4 signing for Glue REST catalog requests.
-# MSRV 1.91.1 — compatible with rustc 1.94 that builds the UDF .so.
+# MSRV 1.91.1: must stay buildable by the rustc 1.94 UDF builder.
 aws-sigv4              = { workspace = true }
 aws-credential-types   = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 
-# Async reqwest client for signed catalog/storage requests.
 reqwest = { workspace = true }
 
 [dev-dependencies]

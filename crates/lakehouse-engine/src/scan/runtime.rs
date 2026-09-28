@@ -1,64 +1,31 @@
-/// DataFusion `RuntimeEnv` sizing and `/tmp` spill probe.
-///
-/// Sizes the DataFusion memory pool from the per-instance memory limit reported
-/// by UDF metadata and optionally enables spill-to-disk when `/tmp` is real
-/// (non-tmpfs) disk with sufficient free space.
 use datafusion::execution::disk_manager::{DiskManagerBuilder, DiskManagerMode};
 use datafusion::execution::memory_pool::{FairSpillPool, GreedyMemoryPool};
 use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use std::path::PathBuf;
 use std::sync::Arc;
 
-/// Conservative default pool budget when the per-instance limit is unknown (0 sentinel).
-/// 1 GiB keeps a single shard comfortable without risking OOM on a low-memory node.
+/// Pool budget when the per-instance limit is unknown (0 sentinel).
 pub(crate) const DEFAULT_BUDGET_BYTES: u64 = 1024 * 1024 * 1024;
 
-/// Minimum DataFusion memory pool budget (256 MiB).
-///
-/// Guards against degenerate inputs where `overhead_bytes ≥ memory_limit_bytes` causes
-/// `net` to collapse toward zero and `fraction × net` to become near-zero. The floor
-/// ensures a usable pool so the session context still builds and a scan can run.
+/// Keeps the pool usable when `overhead_bytes ≥ memory_limit_bytes` collapses `net` toward zero.
 pub(crate) const MIN_POOL_FLOOR_BYTES: u64 = 256 * 1024 * 1024;
 
-/// Whether `/tmp` is usable as a spill directory.
 #[derive(Debug, Clone)]
 pub enum SpillMode {
-    /// `/tmp` is real disk with at least `MIN_FREE_BYTES` free.
     Disk(PathBuf),
-    /// `/tmp` is tmpfs, or free space is insufficient; no spill.
     NoDisk,
 }
 
-/// Probe whether `/tmp` is real (non-tmpfs) disk with sufficient free space.
-///
-/// Strategy (dependency-free):
-/// 1. Parse `/proc/mounts` for the filesystem type of `/tmp`.  If the type is
-///    `tmpfs` → `NoDisk`.
-/// 2. Write a 1-byte probe file under `/tmp` and immediately remove it to verify
-///    the directory is writable at all (e.g., not `noexec` or read-only).
-/// 3. Estimate free space by reading `f_bavail × f_frsize` via a minimal
-///    `statvfs(2)` syscall using only `libc`-free std primitives:
-///    since std does not expose statvfs, fall back to assuming disk space is
-///    sufficient when step 1 confirmed the fs is not tmpfs and step 2 succeeded.
-///    The write-probe itself is the free-space gate: it succeeds ↔ the OS can
-///    accept at least one new file, which is a valid (if conservative) indicator
-///    of write-readiness.
-///
-/// Returns `Disk(PathBuf::from("/tmp"))` or `NoDisk`.
-// Spill is opportunistic — if the probe fails or the mounts file is unreadable
-// we conservatively return NoDisk rather than risk surprises.
+/// Returns `NoDisk` when `/tmp` is tmpfs or not writable. std exposes no `statvfs`, so a
+/// successful write probe stands in for the free-space check; a full disk later surfaces as a
+/// clean spill IO error rather than wrong results.
 pub fn probe_tmp_spill() -> SpillMode {
     let tmp = PathBuf::from("/tmp");
 
-    // Step 1: check /proc/mounts for a tmpfs entry on /tmp.
     if is_tmpfs(&tmp) {
         return SpillMode::NoDisk;
     }
 
-    // Step 2 + 3: write-probe — if we can create and unlink a file, the FS is
-    // writable. We treat this as "sufficient free space" (any disk with a full
-    // partition would fail here before a real spill, and the spill itself would
-    // surface a meaningful IO error rather than silently corrupt results).
     if write_probe_succeeds(&tmp) {
         SpillMode::Disk(tmp)
     } else {
@@ -66,15 +33,10 @@ pub fn probe_tmp_spill() -> SpillMode {
     }
 }
 
-/// Return `true` if `/tmp` is listed as `tmpfs` in `/proc/mounts`.
-///
-/// Reads `/proc/mounts` line by line; a line has the form:
-/// `<device> <mountpoint> <fstype> <options> <dump> <pass>`
-/// We look for lines where `<mountpoint>` is exactly `/tmp` and `<fstype>` is `tmpfs`.
+/// Matches `/proc/mounts` lines `<device> <mountpoint> <fstype> ...` with mountpoint `/tmp`.
 fn is_tmpfs(tmp: &std::path::Path) -> bool {
     let Ok(contents) = std::fs::read_to_string("/proc/mounts") else {
-        // Unreadable — assume not tmpfs (safe: worst case we try to spill and
-        // hit an error at spill time, which surfaces a clean DataFusion error).
+        // Worst case a spill attempt later fails with a clean DataFusion error.
         return false;
     };
     let tmp_str = tmp.to_string_lossy();
@@ -90,23 +52,16 @@ fn is_tmpfs(tmp: &std::path::Path) -> bool {
     false
 }
 
-/// Return `true` if a temporary file can be created and immediately removed under `dir`.
 fn write_probe_succeeds(dir: &std::path::Path) -> bool {
     let probe_path = dir.join(".lakehouse_spill_probe");
-    // Write 1 byte; ignore the result — success means the directory is writable.
     let ok = std::fs::write(&probe_path, b"x").is_ok();
-    // Best-effort cleanup; ignore unlink errors.
     let _ = std::fs::remove_file(&probe_path);
     ok
 }
 
-/// Build a `RuntimeEnv` sized from the per-instance memory limit.
-///
-/// - `memory_limit_bytes == 0` (unknown / unavailable sentinel) → default 1024 MB pool;
-///   `fraction` and `overhead_bytes` are ignored.
-/// - `memory_limit_bytes  > 0` → `net = limit − overhead` (saturating); `budget = max(net × fraction, MIN_POOL_FLOOR_BYTES)`.
-/// - `Disk(path)` → `FairSpillPool` + `DiskManager` rooted at `path` (spill-to-disk path).
-/// - `NoDisk`     → `GreedyMemoryPool` (returns `ResourcesExhausted` when budget exceeded).
+/// `memory_limit_bytes == 0` means unknown: use `DEFAULT_BUDGET_BYTES`, ignoring `fraction` and
+/// `overhead_bytes`. Otherwise `budget = max((limit − overhead) × fraction, MIN_POOL_FLOOR_BYTES)`.
+/// `NoDisk` uses `GreedyMemoryPool`, which returns `ResourcesExhausted` past the budget.
 pub fn build_runtime_env(
     memory_limit_bytes: u64,
     fraction: f64,
@@ -120,8 +75,7 @@ pub fn build_runtime_env(
         ((net as f64 * fraction) as u64).max(MIN_POOL_FLOOR_BYTES)
     };
 
-    // usize cast: safe on 64-bit Linux (budget ≤ memory_limit_bytes ≤ u64::MAX, and
-    // usize == u64 on 64-bit targets; Exasol UDFs run exclusively on 64-bit Linux).
+    // Exasol UDFs run only on 64-bit Linux, where usize == u64.
     let budget_usize = budget as usize;
 
     let builder = match spill {

@@ -1,8 +1,3 @@
-# Ephemeral Lakekeeper catalog (Postgres + Keycloak + Lakekeeper serve, single EC2 box) layered on
-# the persistent data-stack, benchmarked/demoed against the SAME Glue-cataloged S3 TPC-H data via
-# register-table (no data rewrite). Cost-safety: applied/destroyed explicitly per run
-# (deploy/scripts/lakekeeper-up.sh / lakekeeper-down.sh) — never touched by data-stack,
-# cluster-stack, or trino-stack applies, so nothing here runs unless someone asks for it.
 data "aws_caller_identity" "current" {}
 
 locals {
@@ -14,25 +9,20 @@ locals {
   account_id = data.aws_caller_identity.current.account_id
   ssm_root   = "/spot-strata/lakekeeper/${var.env_name}"
 
-  # Single-node appliance (Postgres + Keycloak + Lakekeeper) — not the box under performance
-  # measurement, so it does not need to match an Exasol/Trino node's shape like those stacks do.
   instance_type = "t3.large"
 
-  # Pinned container images (Dependencies section) — matches docker-compose.lakekeeper.yml's
-  # defaults exactly, so the AWS box runs the same versions the local stack is verified against.
+  # Must match docker-compose.lakekeeper.yml's defaults.
   postgres_image   = "postgres:17"
   keycloak_image   = "quay.io/keycloak/keycloak:26.0.7"
   lakekeeper_image = "quay.io/lakekeeper/catalog:v0.13.1"
 
   warehouse_name = "${local.prefix}-warehouse"
 
-  # Ingress allowlist: explicit var, else this machine's public IP /32 (resolved at apply).
   my_ip_cidr      = "${chomp(data.http.my_ip.response_body)}/32"
   effective_cidrs = length(var.allowed_cidrs) > 0 ? var.allowed_cidrs : [local.my_ip_cidr]
 
-  # Two URI vantages (decision [7]): a same-VPC client (the Exasol UDF) uses the PRIVATE IP; the
-  # operator's laptop (lakekeeper-up.sh, lakekeeper-provision.sh) uses the PUBLIC IP. Keycloak
-  # stamps `iss` from the request host, so both issuers must be accepted (task 1.5).
+  # In-VPC clients (the Exasol UDF) use the private IP, the operator's laptop the public IP.
+  # Keycloak stamps `iss` from the request host, so both issuers must be accepted.
   catalog_uri_public  = "http://${aws_instance.lakekeeper.public_ip}:8181/catalog"
   catalog_uri_private = "http://${aws_instance.lakekeeper.private_ip}:8181/catalog"
   token_uri_public    = "http://${aws_instance.lakekeeper.public_ip}:8080/realms/${local.oidc_realm}/protocol/openid-connect/token"
@@ -56,7 +46,6 @@ data "aws_vpc" "this" {
   id = local.vpc_id
 }
 
-# --- Security group ---------------------------------------------------------
 resource "aws_security_group" "lakekeeper" {
   name        = "${local.prefix}-sg"
   description = "Lakekeeper catalog ${var.env_name}"
@@ -74,9 +63,7 @@ resource "aws_security_group_rule" "ssh" {
   description       = "SSH from allowlist"
 }
 
-# 8181 (Lakekeeper) and 8080 (Keycloak) additionally need the whole VPC CIDR, not just the
-# operator's IP: the Exasol UDF's OAuth2 token request and Iceberg REST scan calls execute FROM
-# the cluster nodes (same VPC/subnet as this stack), not from the operator's machine.
+# The Exasol UDF's token and Iceberg REST calls originate from the cluster nodes in this VPC.
 resource "aws_security_group_rule" "catalog_ports" {
   for_each          = toset(["8181", "8080"])
   type              = "ingress"
@@ -98,11 +85,8 @@ resource "aws_security_group_rule" "egress" {
   description       = "all egress"
 }
 
-# --- Keycloak realm export, delivered via S3 (EC2 user-data is capped at 16 KB; the export is
-# 21 KB). The key sits under a dedicated top-level `lakekeeper/` prefix, never under the `tpch.db/`
-# data prefix data-stack/main.tf:71-74 sets as the Glue database's location_uri, so this object
-# cannot land inside the warehouse prefix the provisioning script later derives from the table
-# locations and Lakekeeper's creation probe asserts on (decision [8]).
+# Delivered via S3 because the 21 KB export exceeds the 16 KB user-data cap. Kept outside the
+# `tpch.db/` prefix so it cannot land inside the warehouse prefix derived from table locations.
 resource "aws_s3_object" "keycloak_realm" {
   provider = aws.no_default_tags
   bucket   = local.bucket
@@ -111,7 +95,6 @@ resource "aws_s3_object" "keycloak_realm" {
   etag     = filemd5("${path.module}/../../scripts/keycloak-realm-iceberg.json")
 }
 
-# --- IAM: instance role for the box's own boot script -----------------------
 resource "aws_iam_role" "lakekeeper" {
   name = "${local.prefix}-role"
   assume_role_policy = jsonencode({
@@ -138,9 +121,6 @@ resource "aws_iam_role_policy" "lakekeeper_boot" {
         Resource = ["${local.bucket_arn}/${aws_s3_object.keycloak_realm.key}"]
       },
       {
-        # Task 1.5's compose file substitutes the Keycloak bootstrap admin password and the
-        # Lakekeeper metadata-encryption key this stack generates below, in place of the local
-        # stack's insecure literals — read back from this stack's own SSM root at boot.
         Sid      = "OwnSecretsRead"
         Effect   = "Allow"
         Action   = ["ssm:GetParameter", "ssm:GetParameters"]
@@ -161,11 +141,8 @@ resource "aws_iam_instance_profile" "lakekeeper" {
   role = aws_iam_role.lakekeeper.name
 }
 
-# --- IAM: dedicated write-capable storage user for the Lakekeeper warehouse -
-# Separate from the data-stack `engine-reader` user, whose policy grants read-only S3 access
-# (decision [6]). Lakekeeper validates a warehouse's storage access at creation by writing,
-# reading back, and deleting a probe object, so it needs a credential with put/delete/list, which
-# the read-only query-path credential cannot provide.
+# Separate from the read-only engine-reader: Lakekeeper validates a new warehouse by writing,
+# reading back, and deleting a probe object.
 resource "aws_iam_user" "lakekeeper_storage" {
   name = "${local.prefix}-storage"
   tags = { Name = "${local.prefix}-storage" }
@@ -177,10 +154,7 @@ resource "aws_iam_policy" "lakekeeper_storage" {
     Version = "2012-10-17"
     Statement = [
       {
-        # Bucket-wide write+delete is a NAMED, ACCEPTED RISK (decision [6] / spec "The catalog's
-        # storage credential is separate..."): the warehouse key prefix is derived by the
-        # provisioning script from the source tables AFTER this stack is applied, so this
-        # apply-time policy cannot name the prefix it will cover.
+        # Accepted risk: bucket-wide, because the warehouse prefix is only derived after apply.
         Sid      = "WarehouseStorageReadWrite"
         Effect   = "Allow"
         Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:GetBucketLocation"]
@@ -190,9 +164,7 @@ resource "aws_iam_policy" "lakekeeper_storage" {
   })
 }
 
-# aws_iam_user_policy (inline) MUST NOT be used: deploy/iam/deployer-policy.json grants no
-# iam:PutUserPolicy, so an inline policy would fail with AccessDenied at apply time after the EC2
-# instance is already billing.
+# Not an inline aws_iam_user_policy: the deployer policy grants no iam:PutUserPolicy.
 resource "aws_iam_user_policy_attachment" "lakekeeper_storage" {
   user       = aws_iam_user.lakekeeper_storage.name
   policy_arn = aws_iam_policy.lakekeeper_storage.arn
@@ -202,9 +174,7 @@ resource "aws_iam_access_key" "lakekeeper_storage" {
   user = aws_iam_user.lakekeeper_storage.name
 }
 
-# --- Generated passwords -> SSM SecureString --------------------------------
-# MUST NOT be the local compose file's literal `admin` / `This-is-NOT-Secure!`
-# (docker-compose.lakekeeper.yml:44-45,96,111) — this box carries a public IP.
+# Generated rather than the local compose file's insecure literals: this box has a public IP.
 resource "random_password" "db" {
   length  = 20
   special = false
@@ -218,7 +188,6 @@ resource "random_password" "keycloak_admin" {
   special = false
 }
 
-# --- EC2 instance ------------------------------------------------------------
 resource "aws_instance" "lakekeeper" {
   ami                         = data.aws_ami.ubuntu.id
   instance_type               = local.instance_type
@@ -234,9 +203,7 @@ resource "aws_instance" "lakekeeper" {
     delete_on_termination = true
   }
 
-  # No aws_eip: task 1.4's boot script discovers the instance's own private and public IPv4
-  # addresses via IMDSv2 and substitutes both into the compose file itself, so no Terraform
-  # attribute of this same resource needs to appear in its own user-data.
+  # The boot script discovers its own IPs via IMDSv2, so no aws_eip is needed.
   user_data = templatefile("${path.module}/lakekeeper-userdata.sh.tftpl", {
     region           = var.region
     bucket           = local.bucket
@@ -252,9 +219,7 @@ resource "aws_instance" "lakekeeper" {
   tags = { Name = local.prefix }
 }
 
-# --- SSM parameters (single source of truth for lakekeeper-up.sh, secrets.sh, and an in-VPC
-# lakekeeper-provision.sh caller holding no OpenTofu workspace state; decision [23]) -------------
-# SecureString: values a caller must never see in plaintext outside an authenticated read.
+# SSM lets an in-VPC caller with no OpenTofu state assemble a complete LK_TARGET_* environment.
 resource "aws_ssm_parameter" "db_password" {
   name  = "${local.ssm_root}/db_password"
   type  = "SecureString"
@@ -285,17 +250,13 @@ resource "aws_ssm_parameter" "storage_secret_access_key" {
   value = aws_iam_access_key.lakekeeper_storage.secret
 }
 
-# Copied verbatim from scripts/keycloak-realm-iceberg.json (locals.tf), never regenerated — that
-# file stays the client secret's single owner (decision [2] / spec "Keycloak issues tokens...").
 resource "aws_ssm_parameter" "oauth2_client_secret" {
   name  = "${local.ssm_root}/oauth2/client_secret"
   type  = "SecureString"
   value = local.oidc_client_secret
 }
 
-# Plain String: a URI, a warehouse name, and a public OAuth2 client id are not secrets. Published
-# so an in-VPC caller holding no OpenTofu workspace state can assemble a complete LK_TARGET_*
-# environment from SSM alone. These MUST NOT diverge from outputs.tf (task 1.3).
+# Must not diverge from outputs.tf.
 resource "aws_ssm_parameter" "warehouse_name" {
   name  = "${local.ssm_root}/warehouse_name"
   type  = "String"
