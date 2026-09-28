@@ -986,9 +986,9 @@ fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     );
 }
 
-/// Scenario: `MERGE_SCHEMA = 'FALSE'` declares the sampled narrow type and a fitting projection reads all rows
+/// Scenario: `MERGE_SCHEMA = 'FALSE'` declares the narrow sampled type and refuses a wider file column
 #[test]
-fn merge_schema_false_declares_the_narrow_sampled_type_and_reads_the_fitting_projection() {
+fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_column() {
     setup();
     let mut conn = exa_conn();
 
@@ -999,18 +999,39 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_reads_the_fitting_pro
     );
 
     let cols = conn.query_columns(&format!(
-        "SELECT ID, PRICE FROM {} ORDER BY ID",
+        "SELECT ID FROM {} ORDER BY ID",
+        vs_table(VS_DIRECT_NARROW, "WIDENED")
+    ));
+    let ids: Vec<i64> = cols[0].iter().map(parse_int).collect();
+    assert_eq!(
+        ids,
+        vec![1, 2, 3, 4],
+        "a column both files store at the declared type must return both files' rows"
+    );
+
+    let resp = conn.try_execute(&format!(
+        "SELECT ID, PRICE FROM {}",
         vs_table(VS_DIRECT_NARROW, "WIDENED")
     ));
     assert_eq!(
-        cols[0].len(),
-        4,
-        "a fitting projection must still return both files' rows"
+        resp["status"].as_str(),
+        Some("error"),
+        "a PRICE file column wider than the declared type must be refused, not narrowed: {resp}"
     );
-    let expected_price = [1.5f64, 2.5, 3.5, 4.5];
-    for row in 0..4 {
-        assert!((parse_numeric(&cols[1][row]) - expected_price[row]).abs() < 1e-6);
-    }
+    let msg = resp["exception"]["text"].as_str().unwrap_or("");
+    assert_mentions(
+        msg,
+        &[
+            "PRICE",
+            "Float64",
+            "Float32",
+            &format!("{BASE_DIRECT}widened"),
+        ],
+    );
+    assert!(
+        !msg.contains("minioadmin"),
+        "error must not leak credential values: {msg}"
+    );
 }
 
 /// Scenario: a value outside the stale narrow declaration surfaces a clean error

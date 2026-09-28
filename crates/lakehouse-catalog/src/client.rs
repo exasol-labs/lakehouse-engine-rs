@@ -38,6 +38,7 @@ pub enum ColumnSourceType {
         type_name: String,
         precision: u32,
         scale: u32,
+        type_json: Option<String>,
     },
     /// A scan-spec type tag, not an Arrow `DataType`: this crate must not depend on `arrow`.
     Parquet(String),
@@ -68,6 +69,8 @@ pub struct CatalogTable {
     /// never parsed. Absent when the catalog vends without a per-table scope; an
     /// empty or whitespace-only key counts as absent.
     pub vended_credential_key: Option<String>,
+    /// Catalog-declared partition columns in catalog order; empty if the kind declares none.
+    pub partition_columns: Vec<String>,
     pub columns: Vec<CatalogColumn>,
 }
 
@@ -186,6 +189,7 @@ impl IcebergRestCatalogClient {
             storage_location: Some(storage_location),
             format: TableFormat::Iceberg,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
             columns,
         })
     }

@@ -1,9 +1,9 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    delta_commit_zero_key, delta_object_endpoint, sample_storage,
+    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, closed_port_storage, delta_commit_zero_key,
+    delta_object_endpoint, sample_storage,
 };
-use crate::scan::spec::StorageProps;
-use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, TableFormat};
+use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, ConnectionCreds, TableFormat};
 
 /// Closed port: a stray credential request fails with a transport error, distinguishable
 /// from every refusal asserted here.
@@ -48,6 +48,7 @@ fn delta_table(
         storage_location: storage_location.map(str::to_string),
         format: TableFormat::Delta,
         vended_credential_key: vended_credential_key.map(str::to_string),
+        partition_columns: Vec::new(),
         columns: Vec::new(),
     }
 }
@@ -139,58 +140,7 @@ async fn empty_storage_location_errors_identically_under_both_credential_modes()
     );
 }
 
-const CLOSED_PORT_ENDPOINT: &str = "http://127.0.0.1:1";
-
-const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
-const SENTINEL_SECRET_KEY: &str = "sentinel-secret-value-0002";
-
 const DELTA_TABLE_ROOT: &str = "s3://bucket/cat/sch/orders";
-
-/// `path_style` is required: without it `object_store` ignores the endpoint and derives a
-/// real AWS host from the region.
-fn closed_port_storage() -> StorageBackend {
-    StorageBackend::S3(StorageProps {
-        endpoint: CLOSED_PORT_ENDPOINT.into(),
-        region: "us-east-1".into(),
-        access_key: SENTINEL_ACCESS_KEY.into(),
-        secret_key: SENTINEL_SECRET_KEY.into(),
-        allow_http: true,
-        path_style: true,
-        ..Default::default()
-    })
-}
-
-/// Scenario: Redaction masks every effective-storage secret and leaves the rest readable
-#[test]
-fn redacted_masks_every_effective_storage_secret_in_a_raised_error() {
-    let secrets = [SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY];
-    let raised = UdfError::User(format!(
-        "failed to resolve the current Delta version for table root '{DELTA_TABLE_ROOT}': \
-         signature mismatch for {SENTINEL_ACCESS_KEY} signed with {SENTINEL_SECRET_KEY}"
-    ));
-
-    let message = match redacted(raised, &secrets) {
-        UdfError::User(message) => message,
-        other => panic!("redaction must answer a user error, got {other:?}"),
-    };
-
-    assert!(
-        !message.contains(SENTINEL_ACCESS_KEY),
-        "the access key must not survive redaction: {message}"
-    );
-    assert!(
-        !message.contains(SENTINEL_SECRET_KEY),
-        "the secret key must not survive redaction: {message}"
-    );
-    assert!(
-        message.starts_with("failed to resolve the current Delta version"),
-        "the non-secret text must survive verbatim: {message}"
-    );
-    assert!(
-        message.contains(DELTA_TABLE_ROOT),
-        "the table root the read failed on must survive: {message}"
-    );
-}
 
 /// Scenario: A failed log read through the static credential reports no credential value
 #[tokio::test]
@@ -227,65 +177,6 @@ async fn a_failed_log_read_reports_no_static_credential_value() {
         !message.contains(SENTINEL_SECRET_KEY),
         "no error may carry the secret key it read through: {message}"
     );
-}
-
-fn refused(column_name: &str, reason: &str) -> RefusedColumn {
-    RefusedColumn {
-        column_name: column_name.to_string(),
-        reason: reason.to_string(),
-    }
-}
-
-/// Scenario: A Delta table with no mappable column is refused as a whole
-#[test]
-fn a_table_whose_every_column_is_refused_is_refused_as_a_whole() {
-    let refused_columns = vec![
-        refused("binary_col", "binary is refused, see #351"),
-        refused("variant_col", "variant renders no meaningful value"),
-    ];
-
-    let error = ensure_table_has_a_mappable_column(&[], &refused_columns)
-        .expect_err("a table with zero mappable columns must be refused as a whole");
-
-    let message = match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    };
-    assert!(message.contains("binary_col"), "message was: {message}");
-    assert!(
-        message.contains("binary is refused, see #351"),
-        "message was: {message}"
-    );
-    assert!(message.contains("variant_col"), "message was: {message}");
-    assert!(
-        message.contains("variant renders no meaningful value"),
-        "message was: {message}"
-    );
-}
-
-/// Scenario: A table with at least one mappable column stays queryable
-#[test]
-fn a_table_with_at_least_one_mappable_column_is_not_refused_as_a_whole() {
-    let logical_schema = vec![LogicalField {
-        field_id: None,
-        name: "id".to_string(),
-        arrow_type: "int64".to_string(),
-        nullable: false,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }];
-    let refused_columns = vec![refused("binary_col", "binary is refused, see #351")];
-
-    ensure_table_has_a_mappable_column(&logical_schema, &refused_columns)
-        .expect("a table with a mappable column must not be refused as a whole");
-}
-
-/// Scenario: A table with no columns and no refusals is not refused as a whole
-#[test]
-fn a_table_with_no_columns_and_no_refusals_is_not_refused_as_a_whole() {
-    ensure_table_has_a_mappable_column(&[], &[])
-        .expect("an empty schema with nothing refused must not be refused as a whole");
 }
 
 const PRUNING_FIXTURE_TABLE: &str = "letter_partitioned";

@@ -858,6 +858,7 @@ fn column_source_type_maps_to_exasol_in_one_home() {
                 type_name: "LONG".to_string(),
                 precision: 0,
                 scale: 0,
+                type_json: None,
             },
             EngineTimestampSupport::MillisecondOnly,
         ),
@@ -990,6 +991,7 @@ fn unity_spark_types_map_to_exasol() {
             type_name: type_name.to_string(),
             precision,
             scale,
+            type_json: None,
         };
         assert_eq!(
             column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly),
@@ -1008,6 +1010,7 @@ fn incompatible_unity_types_declared_varchar() {
             type_name: type_name.to_string(),
             precision: 0,
             scale: 0,
+            type_json: None,
         };
         assert_eq!(
             column_source_type_to_exasol(&source, ts_precision),
@@ -1022,6 +1025,7 @@ fn incompatible_unity_types_declared_varchar() {
                 type_name: "DECIMAL".to_string(),
                 precision: 38,
                 scale: 10,
+                type_json: None,
             },
             ts_precision
         ),
@@ -1033,6 +1037,7 @@ fn incompatible_unity_types_declared_varchar() {
                 type_name: "DECIMAL".to_string(),
                 precision: 18,
                 scale: 37,
+                type_json: None,
             },
             ts_precision
         ),
@@ -1044,6 +1049,7 @@ fn incompatible_unity_types_declared_varchar() {
                 type_name: "DECIMAL".to_string(),
                 precision: 0,
                 scale: 0,
+                type_json: None,
             },
             ts_precision
         ),
@@ -1055,6 +1061,7 @@ fn incompatible_unity_types_declared_varchar() {
                 type_name: "DECIMAL".to_string(),
                 precision: 5,
                 scale: 10,
+                type_json: None,
             },
             ts_precision
         ),
@@ -1090,6 +1097,7 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
                 type_name: "DECIMAL".to_string(),
                 precision,
                 scale,
+                type_json: None,
             },
             EngineTimestampSupport::MillisecondOnly,
         );
@@ -1256,6 +1264,7 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
                     type_name: "TIMESTAMP".to_string(),
                     precision: 0,
                     scale: 0,
+                    type_json: None,
                 },
                 engine,
             ),
@@ -1268,6 +1277,7 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
                     type_name: "TIMESTAMP_NTZ".to_string(),
                     precision: 0,
                     scale: 0,
+                    type_json: None,
                 },
                 engine,
             ),

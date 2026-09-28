@@ -356,10 +356,15 @@ pub struct JoinSpec {
 
     /// Applied AFTER the node-local join and its `WHERE`, never to either side's scan, which
     /// would drop rows the join or filter keeps. Not [`CommonScanSpec::limit`], which caps the
-    /// scan. Only unordered caps are pushed: each shard may truncate at `n` and the merge again;
-    /// an ordered window rides on the adapter's outer wrapper instead.
+    /// scan. Alone it answers an unordered `LIMIT n`; paired with [`Self::post_join_order_by`]
+    /// each shard keeps its top-`n` and the adapter's outer wrapper cuts the global top-`n`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub post_join_limit: Option<u64>,
+
+    /// Set only together with `post_join_limit`. Each key ranks by the value the scan emits for
+    /// that column, so the shard's cut agrees with the adapter's merge ranking.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub post_join_order_by: Vec<SortKey>,
 
     /// Empty on every Iceberg join spec, and absent from JSON when empty so the Iceberg
     /// encoding stays byte-identical.

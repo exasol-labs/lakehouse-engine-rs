@@ -128,7 +128,7 @@ impl<'a> TableScanResolver<'a> {
                     .load_table(&unity_table_ident(table_identifier)?)
                     .await?;
                 let reader = format_reader(
-                    ScanSource::UnityDelta {
+                    ScanSource::Unity {
                         session: session.as_ref(),
                         table: &table,
                     },

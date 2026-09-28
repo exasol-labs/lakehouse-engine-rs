@@ -288,8 +288,8 @@ pub(in super::super) enum JoinWindowPlan {
     Unbounded,
     /// The cap composes: each shard truncates at `n` and the merge truncates again.
     BareLimit(u64),
-    /// Served by an outer wrapper over the merged fan-out; a per-shard `OFFSET` would skip
-    /// each shard's own first rows.
+    /// [`place_broadcast_window`] decides whether this lands on the join block, an outer
+    /// wrapper, or both.
     Ordered {
         keys: Vec<ParsedSortKey>,
         limit: Option<u64>,

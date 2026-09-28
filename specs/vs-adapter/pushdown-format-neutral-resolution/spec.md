@@ -69,7 +69,7 @@ this feature. Only file resolution differs per format.
 
 * *GIVEN* a pushdown request under the Unity Catalog kind whose involved virtual table name maps,
   through the identifier recorded at create time, to a three-level Unity Catalog identifier
-* *WHEN* the adapter resolves that identifier into the table the Delta reader plans
+* *WHEN* the adapter resolves that identifier into the table its format reader plans
 * *THEN* the adapter SHALL recover the catalog table identifier's namespace segments and table name
   from the recorded identifier and SHALL load exactly that table from the Unity Catalog
 * *AND* the loaded table SHALL be the one whose catalog-reported full name equals the recorded
@@ -131,11 +131,11 @@ this feature. Only file resolution differs per format.
 ### Scenario: A table the reader cannot plan fails the query loud at plan time
 
 * *GIVEN* a pushdown request under the Unity Catalog kind naming a table whose Delta schema declares a
-  type this engine does not map, and a second request naming a table the catalog reports in a non-Delta
-  format
+  type this engine does not map, and a second request naming a table the catalog reports in a format
+  no Unity Catalog reader plans, such as `ICEBERG`
 * *WHEN* the adapter plans each request
-* *THEN* the adapter SHALL return the reader's own clean plan-time error — naming the column and its
-  Delta type, or naming the table and its reported format — and MUST NOT return a scan-driving SQL
+* *THEN* the adapter SHALL return the reader's own clean plan-time error, naming the column and its
+  Delta type or naming the table and its reported format, and MUST NOT return a scan-driving SQL
   response
 * *AND* the adapter MUST NOT fall back to the Iceberg resolution path, emit a partial file list, or
   return rows, because a table that cannot be planned has no correct partial answer

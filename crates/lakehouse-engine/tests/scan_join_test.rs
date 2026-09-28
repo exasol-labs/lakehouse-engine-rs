@@ -8,14 +8,15 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::joins::HashJoinExec;
+use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{ExecutionPlan, displayable};
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::test_support::{EmitPolicy, TestContext};
 use exasol_udf_sdk::value::{ExaType, Value};
 use lakehouse_engine::scan::diagnostics::PhaseTimers;
 use lakehouse_engine::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, LogicalField, ScanSpec, ScanStorage, SortKey,
     StorageBackend, StorageProps,
 };
 use lakehouse_engine::scan::{
@@ -96,6 +97,28 @@ fn write_customer(dir: &std::path::Path) -> (String, u64) {
     sized(file_url(&path))
 }
 
+/// Custkey 10's empty name is emitted as `""`, which Exasol receives as NULL.
+fn write_customer_with_blank_names(dir: &std::path::Path) -> (String, u64) {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("c_custkey", DataType::Int64, false),
+        Field::new("c_name", DataType::Utf8, false),
+    ]));
+    let path = dir.join("customer_blank_names.parquet");
+    let file = std::fs::File::create(&path).expect("create customer parquet");
+    let mut writer = ArrowWriter::try_new(file, schema.clone(), None).expect("arrow writer");
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![10i64, 20, 30])),
+            Arc::new(StringArray::from(vec!["", "Bob", "Carol"])),
+        ],
+    )
+    .expect("customer batch");
+    writer.write(&batch).expect("write customer");
+    writer.close().expect("close customer");
+    sized(file_url(&path))
+}
+
 /// The first two rows match no dimension row, so a pre-join `LIMIT 2` would emit zero rows.
 fn write_orders_leading_unmatched(dir: &std::path::Path) -> (String, u64) {
     let schema = Arc::new(Schema::new(vec![
@@ -159,6 +182,7 @@ fn join_spec(
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: limit,
+                post_join_order_by: Vec::new(),
                 partition_columns: Vec::new(),
                 storage: ScanStorage::Inline(dim_storage()),
             }),
@@ -190,6 +214,74 @@ fn run_join(spec: &ScanSpec, emits: &[ExaType]) -> Vec<RecordBatch> {
         .expect("join scan must succeed");
         ctx.into_batches()
     })
+}
+
+fn ordered_join_spec(
+    fact: (String, u64),
+    dim: (String, u64),
+    order_by: Vec<SortKey>,
+    limit: u64,
+) -> ScanSpec {
+    let mut spec = join_spec(
+        vec![fact],
+        vec![dim],
+        vec!["O_ORDERKEY", "C_NAME"],
+        None,
+        Some(limit),
+    );
+    spec.common
+        .join
+        .as_mut()
+        .expect("join_spec carries a join block")
+        .post_join_order_by = order_by;
+    spec
+}
+
+fn ordered_top_n_join_fixture(dir_tag: &str) -> (std::path::PathBuf, ScanSpec) {
+    let dir = std::env::temp_dir().join(format!("{dir_tag}_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let orders = write_orders(&dir);
+    let customer = write_customer(&dir);
+
+    let mut spec = ordered_join_spec(
+        orders,
+        customer,
+        vec![
+            sort_key("C_NAME", false, false),
+            sort_key("O_ORDERKEY", true, true),
+        ],
+        2,
+    );
+    spec.common.order_by = vec![sort_key("O_ORDERKEY", true, true)];
+    (dir, spec)
+}
+
+fn sort_key(column: &str, ascending: bool, nulls_last: bool) -> SortKey {
+    SortKey {
+        column: column.into(),
+        ascending,
+        nulls_last,
+    }
+}
+
+fn orderkey_name_rows(batches: &[RecordBatch]) -> Vec<(i64, String)> {
+    let mut rows = Vec::new();
+    for batch in batches {
+        let keys = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("O_ORDERKEY must be Int64");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("C_NAME must be Utf8");
+        for i in 0..batch.num_rows() {
+            rows.push((keys.value(i), names.value(i).to_string()));
+        }
+    }
+    rows
 }
 
 /// Scenario: Scan reconstitutes a join scan spec carrying two file lists.
@@ -395,6 +487,7 @@ fn each_join_side_materializes_its_own_partition_columns() {
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: None,
+                post_join_order_by: Vec::new(),
                 partition_columns: vec!["c_country".to_string()],
                 storage: ScanStorage::Inline(dim_storage()),
             }),
@@ -498,6 +591,104 @@ fn join_limit_bounds_joined_output_not_scanned_input() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Scenario: A post-join ordering and cap bound each join shard to its own top-N
+#[test]
+fn join_order_by_limit_emits_bounded_top_n_after_join() {
+    let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n");
+
+    let batches = run_join(&spec, &[ExaType::Int64, scan_fixture::varchar()]);
+    assert_eq!(
+        orderkey_name_rows(&batches),
+        vec![(3, "Carol".to_string()), (2, "Bob".to_string())],
+        "the shard must emit its own top-2 under the join block's ordering"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario: The post-join ordering and cap plan as one TopK above the join
+#[test]
+fn join_order_by_limit_plans_as_topk_above_join() {
+    let (dir, spec) = ordered_top_n_join_fixture("lh_join_top_n_plan");
+
+    let plan = block_on(async {
+        let session = SessionContext::new_with_config(session_config_for_spec(&spec));
+        build_join_physical_plan(&session, &spec, &scan_fixture::resolved_storage(&spec))
+            .await
+            .expect("physical plan must build")
+    });
+    let rendered = displayable(plan.as_ref()).indent(true).to_string();
+    assert!(
+        rendered.contains("TopK(fetch="),
+        "the post-join ordering and cap must plan as a bounded TopK:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("SortExec: expr=["),
+        "the post-join ordering must not plan as an unbounded full sort:\n{rendered}"
+    );
+
+    let hash_join = find_hash_join(&plan).expect("plan must contain a HashJoinExec");
+    let hj_any: &dyn Any = hash_join.as_ref();
+    let hj = hj_any
+        .downcast_ref::<HashJoinExec>()
+        .expect("downcast HashJoinExec");
+    for (side, input) in [("dimension", hj.left()), ("fact", hj.right())] {
+        assert!(
+            has_no_fetch_below(input),
+            "the post-join cap must not appear as a fetch on the {side} input:\n{rendered}"
+        );
+        assert!(
+            has_no_sort_below(input),
+            "the post-join ordering must not appear as a sort on the {side} input:\n{rendered}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Scenario: A join shard ranks each sort key by the value it emits
+#[test]
+fn join_top_n_ranks_an_empty_string_key_as_null() {
+    let dir = std::env::temp_dir().join(format!("lh_join_blank_top_n_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let orders = write_orders(&dir);
+    let customer = write_customer_with_blank_names(&dir);
+    let emits = [ExaType::Int64, scan_fixture::varchar()];
+
+    let cases = [
+        (
+            true,
+            true,
+            vec![(2, "Bob".to_string()), (5, "Bob".to_string())],
+            "under ASC NULLS LAST the empty-name rows rank last, as the NULLs Exasol receives",
+        ),
+        (
+            false,
+            false,
+            vec![(1, String::new()), (4, String::new())],
+            "under DESC NULLS FIRST the empty-name rows rank first, as the NULLs Exasol receives",
+        ),
+    ];
+    for (name_ascending, name_nulls_last, expected, message) in cases {
+        let spec = ordered_join_spec(
+            orders.clone(),
+            customer.clone(),
+            vec![
+                sort_key("C_NAME", name_ascending, name_nulls_last),
+                sort_key("O_ORDERKEY", true, true),
+            ],
+            2,
+        );
+        assert_eq!(
+            orderkey_name_rows(&run_join(&spec, &emits)),
+            expected,
+            "{message}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Scenario: The bounded dimension side is the hash-join build side.
 #[test]
 fn join_build_side_is_dimension() {
@@ -565,6 +756,11 @@ fn find_hash_join(plan: &Arc<dyn ExecutionPlan>) -> Option<Arc<dyn ExecutionPlan
 
 fn has_no_fetch_below(plan: &Arc<dyn ExecutionPlan>) -> bool {
     plan.fetch().is_none() && plan.children().into_iter().all(has_no_fetch_below)
+}
+
+fn has_no_sort_below(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    let any: &dyn Any = plan.as_ref();
+    !any.is::<SortExec>() && plan.children().into_iter().all(has_no_sort_below)
 }
 
 /// Scenario: Scan reports a clear error when an assigned join file is unreadable.
@@ -696,6 +892,7 @@ fn a_dimension_side_read_failure_redacts_the_dimension_sides_credential() {
                 join_type: JoinType::Inner,
                 condition: "\"C_CUSTKEY\" = \"O_CUSTKEY\"".into(),
                 post_join_limit: None,
+                post_join_order_by: Vec::new(),
                 partition_columns: Vec::new(),
                 storage: ScanStorage::Inline(s3_backend(&dim_endpoint, "DIMSECRETVALUE")),
             }),

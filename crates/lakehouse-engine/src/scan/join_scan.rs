@@ -8,7 +8,10 @@ use crate::scan::emit::{classify_scan_error, emit_stream};
 use crate::scan::spec::{ProjectionItem, ScanSpec};
 use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
-use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
+use crate::types::mapping::{
+    ExaTypeClass, arrow_to_exasol_type, classify_exa_type, needs_json_fallback,
+    needs_nested_json_rendering,
+};
 
 use super::raw_scan::{NESTED_JSON_RENDER_UDF_NAME, delete_path_read_limiter, register_file_list};
 use super::sql_support::{build_alias_items, quote_ident};
@@ -99,8 +102,9 @@ async fn register_join_tables(
 
 /// Uppercase aliased sub-SELECTs make the pushed projection, `condition`, and filter resolve
 /// unambiguously against the combined schema. The dimension side is LEFT (the build side).
-/// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit) is applied here,
-/// after the join and its `WHERE`, never to either side's scan.
+/// [`JoinSpec::post_join_order_by`](crate::scan::spec::JoinSpec::post_join_order_by) and
+/// [`JoinSpec::post_join_limit`](crate::scan::spec::JoinSpec::post_join_limit) are applied
+/// here, after the join and its `WHERE`, never to either side's scan.
 async fn build_join_sql(
     ctx: &SessionContext,
     fact_table: &str,
@@ -163,6 +167,16 @@ async fn build_join_sql(
         sql.push_str(filter);
     }
 
+    if !join.post_join_order_by.is_empty() {
+        let elements: Vec<String> = join
+            .post_join_order_by
+            .iter()
+            .map(|key| key.render_ordered(&render_join_sort_target(&key.column, &combined)))
+            .collect();
+        sql.push_str(" ORDER BY ");
+        sql.push_str(&elements.join(", "));
+    }
+
     if let Some(limit) = join.post_join_limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
@@ -191,22 +205,48 @@ fn render_join_select_item(
     match item {
         ProjectionItem::Expr { expr } => expr.clone(),
         ProjectionItem::Column(col_name) => {
-            let upper = col_name.to_uppercase();
-            let data_type = combined
-                .iter()
-                .find(|(name, _)| *name == upper)
-                .map(|(_, dt)| dt.clone());
-            match data_type {
-                Some(dt) if needs_nested_json_rendering(&dt) => {
-                    format!("{NESTED_JSON_RENDER_UDF_NAME}({})", quote_ident(&upper))
+            let ident = quote_ident(&col_name.to_uppercase());
+            match combined_type(col_name, combined) {
+                Some(dt) if needs_nested_json_rendering(dt) => {
+                    format!("{NESTED_JSON_RENDER_UDF_NAME}({ident})")
                 }
-                Some(dt) if needs_json_fallback(&dt) => {
-                    format!("CAST({} AS VARCHAR)", quote_ident(&upper))
-                }
-                _ => quote_ident(&upper),
+                Some(dt) if needs_json_fallback(dt) => format!("CAST({ident} AS VARCHAR)"),
+                _ => ident,
             }
         }
     }
+}
+
+/// Ranks by the value the shard emits, since that is what the Exasol-side wrapper merges and
+/// ranks; ranking anything else can cut a row the wrapper's global top-`n` needs. Exasol's
+/// VARCHAR has no empty string (`''` arrives as NULL), and `emit_batch` emits `NaN` as NULL (#246).
+fn render_join_sort_target(
+    column: &str,
+    combined: &[(String, arrow::datatypes::DataType)],
+) -> String {
+    use arrow::datatypes::DataType;
+
+    let emitted = render_join_select_item(&ProjectionItem::Column(column.to_string()), combined);
+    match combined_type(column, combined) {
+        Some(DataType::Float32 | DataType::Float64) => {
+            format!("CASE WHEN isnan({emitted}) THEN NULL ELSE {emitted} END")
+        }
+        Some(dt) if classify_exa_type(&arrow_to_exasol_type(dt)) == ExaTypeClass::Character => {
+            format!("nullif({emitted}, '')")
+        }
+        _ => emitted,
+    }
+}
+
+fn combined_type<'a>(
+    column: &str,
+    combined: &'a [(String, arrow::datatypes::DataType)],
+) -> Option<&'a arrow::datatypes::DataType> {
+    let upper = column.to_uppercase();
+    combined
+        .iter()
+        .find(|(name, _)| *name == upper)
+        .map(|(_, dt)| dt)
 }
 
 /// Exposed so a host test can assert the dimension side is the hash-join build side.

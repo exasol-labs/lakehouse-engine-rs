@@ -1,6 +1,6 @@
 use crate::adapter::ResolvedConnectionConfig;
 use crate::scan::spec::{
-    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage,
+    CommonScanSpec, FileEntry, JoinSpec, JoinType, ProjectionItem, ScanSpec, ScanStorage, SortKey,
     StorageBackend, render_ordered,
 };
 use exasol_udf_sdk::error::UdfError;
@@ -502,22 +502,74 @@ pub(super) fn build_side_fan_out_sql(
     ))
 }
 
-fn binds_to_projection(key: &ParsedSortKey, projection: &[ProjectionItem]) -> bool {
+fn bound_sort_key(key: &ParsedSortKey, projection: &[ProjectionItem]) -> Option<SortKey> {
     let ParsedSortKey::Column(key) = key else {
-        return false;
+        return None;
     };
     projection
         .iter()
         .any(|item| matches!(item, ProjectionItem::Column(name) if *name == key.column))
+        .then(|| key.clone())
+}
+
+struct BroadcastWindowPlacement {
+    shard_cap: Option<u64>,
+    shard_order_by: Vec<SortKey>,
+    merge_cap: Option<u64>,
+    wrapper: Option<(Vec<ParsedSortKey>, Option<u64>, u64)>,
+}
+
+/// `None` falls through to the N-scan wrapper: the window itself requires it, or an
+/// `Ordered` key is absent from `projection`.
+fn place_broadcast_window(
+    window: JoinWindowPlan,
+    projection: &[ProjectionItem],
+) -> Option<BroadcastWindowPlacement> {
+    match window {
+        JoinWindowPlan::Unbounded => Some(BroadcastWindowPlacement {
+            shard_cap: None,
+            shard_order_by: Vec::new(),
+            merge_cap: None,
+            wrapper: None,
+        }),
+        JoinWindowPlan::BareLimit(n) => Some(BroadcastWindowPlacement {
+            shard_cap: Some(n),
+            shard_order_by: Vec::new(),
+            merge_cap: Some(n),
+            wrapper: None,
+        }),
+        JoinWindowPlan::Ordered {
+            keys,
+            limit,
+            offset,
+        } => {
+            // Only now is there a projection to check: the wrapper's ORDER BY binds against
+            // emitted columns and this path appends no hidden ones.
+            let bound_keys = keys
+                .iter()
+                .map(|key| bound_sort_key(key, projection))
+                .collect::<Option<Vec<SortKey>>>()?;
+            let (shard_cap, shard_order_by) = match (offset, limit) {
+                (0, Some(n)) => (Some(n), bound_keys),
+                _ => (None, Vec::new()),
+            };
+            Some(BroadcastWindowPlacement {
+                shard_cap,
+                shard_order_by,
+                merge_cap: None,
+                wrapper: Some((keys, limit, offset)),
+            })
+        }
+        JoinWindowPlan::ExasolPostProcessed => None,
+    }
 }
 
 /// `None` falls through to the N-scan wrapper, never an error.
 ///
 /// The fact side is sharded; the dimension's full file list rides once in the common blob's
 /// [`JoinSpec`], so every shard joins node-locally with no exchange. Each side carries its
-/// own storage because a vended credential is scoped to its table. The window only ever
-/// applies after the join ([`JoinSpec::post_join_limit`]): an unordered cap composes per
-/// shard, an ordered window rides on an outer wrapper.
+/// own storage because a vended credential is scoped to its table. The window always applies
+/// after the join; [`place_broadcast_window`] decides where it lands.
 pub(in super::super) fn build_broadcast_join_sql(
     sides: &JoinSides,
     rendered: &RenderedJoinPushdown,
@@ -526,25 +578,8 @@ pub(in super::super) fn build_broadcast_join_sql(
     udf_name: &str,
     distribute_udf_name: &str,
 ) -> Result<Option<String>, UdfError> {
-    let (shard_cap, ordering) = match window {
-        JoinWindowPlan::Unbounded => (None, None),
-        JoinWindowPlan::BareLimit(n) => (Some(n), None),
-        JoinWindowPlan::Ordered {
-            keys,
-            limit,
-            offset,
-        } => {
-            // Only now is there a projection to check: the wrapper's ORDER BY binds against emitted
-            // columns and this path appends no hidden ones.
-            if !keys
-                .iter()
-                .all(|key| binds_to_projection(key, &rendered.projection))
-            {
-                return Ok(None);
-            }
-            (None, Some((keys, limit, offset)))
-        }
-        JoinWindowPlan::ExasolPostProcessed => return Ok(None),
+    let Some(placement) = place_broadcast_window(window, &rendered.projection) else {
+        return Ok(None);
     };
 
     let fact = &sides.fact;
@@ -559,7 +594,8 @@ pub(in super::super) fn build_broadcast_join_sql(
         name_mapping: dimension.name_mapping.clone(),
         join_type: JoinType::Inner,
         condition: rendered.condition.clone(),
-        post_join_limit: shard_cap,
+        post_join_limit: placement.shard_cap,
+        post_join_order_by: placement.shard_order_by,
         partition_columns: dimension.partition_columns.clone(),
         storage: scan_storage_for_side(&dimension.effective_storage, inputs)?,
     };
@@ -577,14 +613,14 @@ pub(in super::super) fn build_broadcast_join_sql(
         &shards,
         &rendered.projection,
         &rendered.projection_types,
-        shard_cap,
+        placement.merge_cap,
         &[],
         None,
         udf_name,
         distribute_udf_name,
     );
 
-    let Some((keys, limit, offset)) = ordering else {
+    let Some((keys, limit, offset)) = placement.wrapper else {
         return Ok(Some(fan_out));
     };
     let wrapped = wrap_declined_order_by(

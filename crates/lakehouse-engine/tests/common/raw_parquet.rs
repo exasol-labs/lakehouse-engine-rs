@@ -1,6 +1,6 @@
 //! Raw-Parquet fixture writer: PUTs Parquet bytes at a chosen object key, with no
 //! catalog table, snapshot, or Iceberg field-id metadata.
-#![cfg(any(feature = "exasol-e2e", feature = "azure-e2e"))]
+#![cfg(any(feature = "exasol-e2e", feature = "azure-e2e", feature = "unity-e2e"))]
 
 use super::e2e_harness::{local_stack_s3_store, split_s3_bucket_and_key};
 

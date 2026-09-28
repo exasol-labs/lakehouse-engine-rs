@@ -21,10 +21,7 @@ use crate::scan::storage_ref::ResolvedScanStorage;
 use crate::scan::{diagnostics, emit_phase_telemetry};
 use crate::types::mapping::{needs_json_fallback, needs_nested_json_rendering};
 
-use super::field_id_projection::{
-    FieldIdResolution, build_logical_arrow_schema, index_declared_physical_names,
-    index_nested_members, reconstruct_initial_defaults,
-};
+use super::field_id_projection::{FieldIdResolution, build_logical_arrow_schema};
 use super::object_store::validate_uniform_object_store_files;
 use super::partition_values::PartitionedScanSchema;
 use super::sql_support::{build_alias_items, quote_ident};
@@ -160,13 +157,9 @@ pub(super) async fn register_file_list(
             .map_err(|e| classify_scan_error(e, &secrets))?
     };
 
-    // Built once per registration; a malformed encoded default surfaces as a user error.
-    let field_id_resolution = FieldIdResolution {
-        name_mapping: name_mapping.to_vec(),
-        declared_physical_names: index_declared_physical_names(logical_schema),
-        defaults: reconstruct_initial_defaults(logical_schema).map_err(UdfError::User)?,
-        nested_members: index_nested_members(logical_schema),
-    };
+    // A malformed encoded default surfaces as a user error.
+    let field_id_resolution = FieldIdResolution::for_logical_schema(logical_schema, name_mapping)
+        .map_err(UdfError::User)?;
 
     // Partition columns have no physical counterpart in any data file.
     let schema = PartitionedScanSchema::split(table_schema, partition_columns)

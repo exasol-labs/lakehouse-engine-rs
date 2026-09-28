@@ -131,6 +131,7 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
             type_name: "int".into(),
             precision: 0,
             scale: 0,
+            type_json: Some("{\"type\":\"integer\"}".into()),
         },
     };
     let table = CatalogTable {
@@ -139,6 +140,7 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         storage_location: None,
         format: TableFormat::Delta,
         vended_credential_key: Some("opaque-vending-key".into()),
+        partition_columns: vec!["c".into()],
         columns: vec![column],
     };
     assert_eq!(table.format, TableFormat::Delta);
@@ -211,6 +213,7 @@ fn added_neutral_variants_are_reachable_from_outside_the_crate() {
             storage_location: None,
             format: TableFormat::Parquet,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
             columns: vec![column],
         }],
         skipped: vec![SkippedTable {

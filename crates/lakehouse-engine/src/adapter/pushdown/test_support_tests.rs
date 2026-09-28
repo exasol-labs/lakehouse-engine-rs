@@ -390,6 +390,22 @@ pub(super) fn sample_storage() -> StorageBackend {
     })
 }
 
+pub(super) const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
+pub(super) const SENTINEL_SECRET_KEY: &str = "sentinel-secret-value-0002";
+
+/// Sentinel credentials on a closed loopback port; `path_style` keeps `object_store` off real AWS.
+pub(super) fn closed_port_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: "http://127.0.0.1:1".into(),
+        region: "us-east-1".into(),
+        access_key: SENTINEL_ACCESS_KEY.into(),
+        secret_key: SENTINEL_SECRET_KEY.into(),
+        allow_http: true,
+        path_style: true,
+        ..Default::default()
+    })
+}
+
 /// Mirrors `handle_pushdown`'s post-resolution SQL assembly, single shard.
 pub(super) fn build_sql_for_fixture(
     files: Vec<String>,

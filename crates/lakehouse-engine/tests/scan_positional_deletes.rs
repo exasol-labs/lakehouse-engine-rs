@@ -1042,6 +1042,7 @@ fn scan_delete_reads_bounded_across_join_sides() {
         join_type: JoinType::Inner,
         condition: "\"C_KEY\" = \"O_KEY\"".into(),
         post_join_limit: None,
+        post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage: ScanStorage::Inline(dummy_storage()),
     });
@@ -1745,6 +1746,7 @@ fn scan_footer_fetches_bounded_across_join_sides() {
         join_type: JoinType::Inner,
         condition: "\"C_KEY\" = \"O_KEY\"".into(),
         post_join_limit: None,
+        post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
         storage: ScanStorage::Inline(dummy_storage()),
     });

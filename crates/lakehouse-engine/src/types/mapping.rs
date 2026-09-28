@@ -394,6 +394,7 @@ pub(crate) fn column_source_type_to_exasol(
             type_name,
             precision,
             scale,
+            ..
         } => unity_type_name_to_exasol(
             type_name,
             CatalogDecimal {
