@@ -93,6 +93,19 @@ impl CatalogClient for FixedCatalogClient {
             Ok(table)
         })
     }
+
+    fn load_tables<'a>(
+        &'a self,
+        idents: &'a [CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut listing = CatalogListing::default();
+            for ident in idents {
+                listing.tables.push(self.load_table(ident).await?);
+            }
+            Ok(listing)
+        })
+    }
 }
 
 fn boxed_client() -> Box<dyn CatalogClient> {
@@ -220,10 +233,14 @@ async fn a_unity_decimal_column_carries_its_precision_and_scale() {
 struct RequestLog {
     oauth_grants: usize,
     load_table_names: Vec<String>,
+    load_table_queries: Vec<String>,
+    delegation_headers: usize,
+    in_flight_loads: usize,
+    max_in_flight_loads: usize,
 }
 
-/// Responses close the connection so a single-threaded accept loop serves the
-/// pooled `reqwest` client's sequential requests in order.
+/// Every connection is served concurrently, and each loadTable answer is delayed so
+/// overlapping loads register in `max_in_flight_loads`.
 async fn spawn_mock_catalog(
     namespace: &[&str],
     tables: &[&str],
@@ -238,7 +255,7 @@ async fn spawn_mock_catalog(
     let log = Arc::new(Mutex::new(RequestLog::default()));
     let not_loadable: Vec<String> = not_loadable.iter().map(|s| s.to_string()).collect();
     let server_error: Vec<String> = server_error.iter().map(|s| s.to_string()).collect();
-    let list_tables_body = list_tables_response(namespace, tables);
+    let list_tables_body = list_tables_page(namespace, tables, None);
 
     let server_log = log.clone();
     tokio::spawn(async move {
@@ -246,98 +263,77 @@ async fn spawn_mock_catalog(
             let Ok((mut stream, _)) = listener.accept().await else {
                 break;
             };
-            let mut buf = vec![0u8; 8192];
-            let n = stream.read(&mut buf).await.unwrap_or(0);
-            if n == 0 {
-                continue;
-            }
-            let request = String::from_utf8_lossy(&buf[..n]);
-            let request_line = request.lines().next().unwrap_or("");
-            let mut fields = request_line.split_whitespace();
-            let method = fields.next().unwrap_or("");
-            let path = fields.next().unwrap_or("");
-            let path_no_query = path.split(['?', '#']).next().unwrap_or("");
-
-            let (status, body) = if method == "POST" {
-                server_log.lock().unwrap().oauth_grants += 1;
-                (
-                    "200 OK",
-                    r#"{"access_token":"mock-access-token","token_type":"bearer","expires_in":3600}"#
-                        .to_string(),
-                )
-            } else if path_no_query.ends_with("/v1/config") {
-                ("200 OK", r#"{"overrides":{},"defaults":{}}"#.to_string())
-            } else if path_no_query.ends_with("/namespaces") {
-                ("200 OK", r#"{"namespaces":[]}"#.to_string())
-            } else if path_no_query.ends_with("/tables") {
-                ("200 OK", list_tables_body.clone())
-            } else if let Some(offset) = path_no_query.find("/tables/") {
-                let table = &path_no_query[offset + "/tables/".len()..];
-                server_log
-                    .lock()
-                    .unwrap()
-                    .load_table_names
-                    .push(table.to_string());
-                if server_error.iter().any(|t| t == table) {
-                    ("500 Internal Server Error", String::new())
-                } else if not_loadable.iter().any(|t| t == table) {
-                    (
-                        "404 Not Found",
-                        r#"{"error":"not an iceberg table"}"#.to_string(),
-                    )
-                } else {
-                    ("200 OK", load_table_body(table))
+            let server_log = server_log.clone();
+            let not_loadable = not_loadable.clone();
+            let server_error = server_error.clone();
+            let list_tables_body = list_tables_body.clone();
+            tokio::spawn(async move {
+                let mut buf = vec![0u8; 8192];
+                let n = stream.read(&mut buf).await.unwrap_or(0);
+                if n == 0 {
+                    return;
                 }
-            } else {
-                ("500 Internal Server Error", String::new())
-            };
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let request_line = request.lines().next().unwrap_or("");
+                let mut fields = request_line.split_whitespace();
+                let method = fields.next().unwrap_or("");
+                let path = fields.next().unwrap_or("");
+                let (path_no_query, query) = path.split_once('?').unwrap_or((path, ""));
 
-            let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
+                let (status, body) = if method == "POST" {
+                    server_log.lock().unwrap().oauth_grants += 1;
+                    (
+                        "200 OK",
+                        r#"{"access_token":"mock-access-token","token_type":"bearer","expires_in":3600}"#
+                            .to_string(),
+                    )
+                } else if path_no_query.ends_with("/v1/config") {
+                    ("200 OK", r#"{"overrides":{},"defaults":{}}"#.to_string())
+                } else if path_no_query.ends_with("/namespaces") {
+                    ("200 OK", r#"{"namespaces":[]}"#.to_string())
+                } else if path_no_query.ends_with("/tables") {
+                    ("200 OK", list_tables_body.clone())
+                } else if let Some(offset) = path_no_query.find("/tables/") {
+                    let table = &path_no_query[offset + "/tables/".len()..];
+                    {
+                        let mut log = server_log.lock().unwrap();
+                        log.load_table_names.push(table.to_string());
+                        log.load_table_queries.push(query.to_string());
+                        if request.lines().any(|line| {
+                            line.to_ascii_lowercase()
+                                .starts_with("x-iceberg-access-delegation:")
+                        }) {
+                            log.delegation_headers += 1;
+                        }
+                        log.in_flight_loads += 1;
+                        log.max_in_flight_loads = log.max_in_flight_loads.max(log.in_flight_loads);
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                    server_log.lock().unwrap().in_flight_loads -= 1;
+                    if server_error.iter().any(|t| t == table) {
+                        ("500 Internal Server Error", String::new())
+                    } else if not_loadable.iter().any(|t| t == table) {
+                        (
+                            "404 Not Found",
+                            r#"{"error":"not an iceberg table"}"#.to_string(),
+                        )
+                    } else {
+                        ("200 OK", load_table_body(table))
+                    }
+                } else {
+                    ("500 Internal Server Error", String::new())
+                };
+
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
         }
     });
 
     (uri, log)
-}
-
-fn load_table_body(table: &str) -> String {
-    serde_json::json!({
-        "metadata-location": format!("s3://bucket/{table}/metadata/v1.json"),
-        "metadata": {
-            "format-version": 2,
-            "table-uuid": "00000000-0000-0000-0000-000000000001",
-            "location": format!("s3://bucket/{table}"),
-            "last-sequence-number": 0,
-            "last-updated-ms": 0,
-            "last-column-id": 2,
-            "current-schema-id": 0,
-            "schemas": [{
-                "type": "struct",
-                "schema-id": 0,
-                "fields": [
-                    {"id": 1, "name": "id", "required": true, "type": "long"},
-                    {"id": 2, "name": "name", "required": false, "type": "string"}
-                ]
-            }],
-            "default-spec-id": 0,
-            "partition-specs": [{"spec-id": 0, "fields": []}],
-            "last-partition-id": 0,
-            "sort-orders": [{"order-id": 0, "fields": []}],
-            "default-sort-order-id": 0
-        }
-    })
-    .to_string()
-}
-
-fn list_tables_response(namespace: &[&str], tables: &[&str]) -> String {
-    let identifiers: Vec<serde_json::Value> = tables
-        .iter()
-        .map(|name| serde_json::json!({ "namespace": namespace, "name": name }))
-        .collect();
-    serde_json::json!({ "identifiers": identifiers }).to_string()
 }
 
 fn oauth_creds() -> ConnectionCreds {
@@ -348,12 +344,11 @@ fn oauth_creds() -> ConnectionCreds {
 }
 
 #[tokio::test]
-async fn empty_namespace_builds_no_session_and_no_grant() {
-    let client =
-        IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), static_backend(), oauth_creds());
+async fn empty_load_batch_builds_no_session_and_no_grant() {
+    let client = IcebergRestCatalogClient::new("http://127.0.0.1:1".into(), oauth_creds());
 
     let listing = client
-        .resolve_listing(&[])
+        .load_tables(&[])
         .await
         .expect("an empty ident batch must resolve with no session build and no grant");
 
@@ -367,7 +362,7 @@ async fn empty_namespace_builds_no_session_and_no_grant() {
 #[tokio::test]
 async fn list_tables_over_empty_namespace_lists_nothing() {
     let (uri, log) = spawn_mock_catalog(&["sales"], &[], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), oauth_creds());
+    let client = IcebergRestCatalogClient::new(uri, oauth_creds());
 
     let listing = client
         .list_tables(&["sales".to_string()])
@@ -376,18 +371,14 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
 
     assert!(listing.tables.is_empty());
     assert!(listing.skipped.is_empty());
-    assert_eq!(
-        log.lock().unwrap().oauth_grants,
-        1,
-        "only the enumeration grant; the empty load batch adds no session grant"
-    );
+    assert_eq!(log.lock().unwrap().oauth_grants, 1);
 }
 
 #[tokio::test]
 async fn enumeration_builds_exactly_one_session() {
     let (uri, log) =
         spawn_mock_catalog(&["sales"], &["orders", "customers", "returns"], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), oauth_creds());
+    let client = IcebergRestCatalogClient::new(uri, oauth_creds());
 
     let listing = client
         .list_tables(&["sales".to_string()])
@@ -405,17 +396,85 @@ async fn enumeration_builds_exactly_one_session() {
             table.ident.name
         );
     }
+    let log = log.lock().unwrap();
     assert_eq!(
-        log.lock().unwrap().oauth_grants,
-        2,
-        "one enumeration grant + one load-batch grant (the single reused session); per-table loads would be four"
+        log.oauth_grants, 1,
+        "one session serves the listing and every load; per-table sessions would grant four times"
+    );
+    assert!(
+        log.max_in_flight_loads >= 2,
+        "table loads must overlap, not run one at a time: {}",
+        log.max_in_flight_loads
+    );
+    assert_eq!(
+        log.load_table_queries,
+        vec!["snapshots=refs"; 3],
+        "enumeration reads only the current schema, so it leaves unreferenced snapshots out"
+    );
+}
+
+#[tokio::test]
+async fn enumeration_requests_no_storage_credentials_even_when_vending_is_on() {
+    let (uri, log) = spawn_mock_catalog(&["sales"], &["orders"], &[], &[]).await;
+    let mut creds = creds_no_auth();
+    creds.use_vended_credentials = true;
+    let client = IcebergRestCatalogClient::new(uri, creds);
+
+    client
+        .list_tables(&["sales".to_string()])
+        .await
+        .expect("list_tables failed");
+
+    let log = log.lock().unwrap();
+    assert_eq!(log.load_table_names, vec!["orders"]);
+    assert_eq!(
+        log.delegation_headers, 0,
+        "createVirtualSchema never uses vended credentials, so it must not ask the catalog to mint them"
+    );
+}
+
+#[tokio::test]
+async fn load_tables_resolves_only_the_named_tables_and_skips_a_vanished_one() {
+    let (uri, log) = spawn_mock_catalog(&["sales"], &["orders", "customers"], &["gone"], &[]).await;
+    let client = IcebergRestCatalogClient::new(uri, oauth_creds());
+    let ident = |name: &str| CatalogTableIdent {
+        namespace: vec!["sales".to_string()],
+        name: name.to_string(),
+    };
+
+    let listing = client
+        .load_tables(&[ident("orders"), ident("gone")])
+        .await
+        .expect("load_tables failed");
+
+    assert_eq!(
+        listing
+            .tables
+            .iter()
+            .map(|t| t.ident.name.as_str())
+            .collect::<Vec<_>>(),
+        ["orders"]
+    );
+    assert_eq!(
+        listing.skipped,
+        vec![SkippedTable {
+            ident: ident("gone"),
+            reason: SkipReason::NotLoadableIcebergTable,
+        }]
+    );
+    let log = log.lock().unwrap();
+    assert_eq!(log.oauth_grants, 1);
+    assert_eq!(
+        log.load_table_names,
+        vec!["orders", "gone"],
+        "no listing request precedes the loads"
     );
 }
 
 #[tokio::test]
 async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
     let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders", "customers"], &[], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
     let listing = client
         .list_tables(&["sales".to_string()])
@@ -448,7 +507,7 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
 async fn unloadable_table_is_reported_skipped_not_failed() {
     let (uri, _log) =
         spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &["hive_events"], &[]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
     let listing = client
         .list_tables(&["prod".to_string()])
@@ -478,16 +537,19 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
 }
 
 #[tokio::test]
-async fn non_404_load_failure_aborts_the_batch() {
+async fn non_404_load_failure_aborts_the_batch_naming_the_table() {
     let (uri, _log) =
         spawn_mock_catalog(&["prod"], &["orders", "hive_events"], &[], &["hive_events"]).await;
-    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let client = IcebergRestCatalogClient::new(uri, creds_no_auth());
 
-    let result = client.list_tables(&["prod".to_string()]).await;
+    let err = client
+        .list_tables(&["prod".to_string()])
+        .await
+        .expect_err("a 500 on loadTable is a catalog fault and must abort enumeration");
 
     assert!(
-        result.is_err(),
-        "a 500 on loadTable is a catalog fault and must abort enumeration, \
-         not be routed into a skipped entry: {result:?}"
+        err.to_string()
+            .starts_with("failed to load table 'prod.hive_events': catalog returned HTTP 500"),
+        "{err}"
     );
 }

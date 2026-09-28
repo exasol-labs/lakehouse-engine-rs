@@ -105,7 +105,6 @@ fn storage_backend_secret_values_and_file_io_are_reachable() {
 fn both_clients_are_catalog_client_trait_objects() {
     let iceberg: Box<dyn CatalogClient> = Box::new(IcebergRestCatalogClient::new(
         "http://catalog".into(),
-        StorageBackend::S3(StorageProps::default()),
         connection_creds(),
     ));
     let unity: Box<dyn CatalogClient> =

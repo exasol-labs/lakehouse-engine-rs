@@ -3,6 +3,7 @@
 
 use crate::ConnectionCreds;
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
+use crate::http::execute_with_retry;
 use crate::redaction::redact_secret_values;
 use exasol_udf_sdk::error::UdfError;
 
@@ -54,7 +55,7 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
         CatalogAuth::Bearer(_) | CatalogAuth::None => request,
     };
 
-    let response = client.execute(request).await.map_err(|e| {
+    let response = execute_with_retry(client, request).await.map_err(|e| {
         UdfError::User(format!(
             "catalog request failed: {}",
             redact(&e.to_string())

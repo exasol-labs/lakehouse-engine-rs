@@ -3,6 +3,7 @@
 mod auth;
 mod client;
 mod creds;
+mod http;
 mod iceberg_io;
 mod namespace;
 mod redaction;

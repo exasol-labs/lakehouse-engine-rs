@@ -415,6 +415,21 @@ one file, nanosecond in another) fail to fold under the default `MERGE_SCHEMA = 
 is read only when its unit equals the sampled unit or is coarser. A file at a finer unit fails every
 query that reads the column.
 
+## Enumeration and refresh
+
+`CREATE VIRTUAL SCHEMA`, `ALTER VIRTUAL SCHEMA ... REFRESH`, and `... SET` enumerate the namespace
+on one catalog session: one OAuth2 grant, one `/v1/config` lookup, paginated list requests, and the
+per-table `loadTable` calls up to 8 at a time. An enumeration `loadTable` asks for no storage
+credentials and only the referenced snapshots. Every catalog request has a 10 s connect and 120 s
+request timeout and is retried up to 3 times on a connect failure or an HTTP 429/502/503/504.
+
+`ALTER VIRTUAL SCHEMA <vs> REFRESH TABLES <t1>, <t2>` loads only the named tables when the schema
+already knows them; the other tables keep their columns, and a named table the catalog no longer
+holds is dropped. A name the schema does not know yet falls back to a full refresh.
+
+A table whose columns fold to the same uppercase name (`Id` and `id`) fails `CREATE VIRTUAL SCHEMA`
+and `REFRESH` with an error naming the table: Exasol would otherwise accept the duplicate silently.
+
 ## Addressing
 
 The adapter UDF runs **inside** the Exasol container. Every address in the CONNECTION must resolve from there. Use internal hostnames, for example `iceberg-rest`, `minio`, `lakekeeper`, `keycloak`, or `unitycatalog`. Never use `localhost` or the Docker host gateway. A Databricks-managed Unity Catalog is a public HTTPS endpoint, so it needs no internal hostname — just network egress from the Exasol node.

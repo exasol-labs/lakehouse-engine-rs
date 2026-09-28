@@ -33,6 +33,7 @@ const NS_SETPROPS_A: &str = "e2e_refresh_setprops_a";
 const NS_SETPROPS_B: &str = "e2e_refresh_setprops_b";
 const NS_UNREACHABLE: &str = "e2e_refresh_unreachable";
 const NS_PARTIAL: &str = "e2e_refresh_partial";
+const NS_PARTIAL_DROP: &str = "e2e_refresh_partial_drop";
 const NS_COLLISION: &str = "e2e_refresh_collision";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
@@ -439,8 +440,9 @@ fn refresh_unreachable_catalog_redacts_credentials() {
     conn.execute(&create_conn_sql);
 }
 
+/// Scenario: A partial refresh loads only the requested tables and leaves the others as they were
 #[test]
-fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
+fn refresh_partial_requested_tables_touches_only_those_tables() {
     setup_e2e();
     let rt = rt();
     let catalog_url = iceberg_catalog_url();
@@ -502,23 +504,99 @@ fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
          REFRESH TABLES TABLE_ONE: {cols:?}"
     );
 
-    // Exasol does not scope REFRESH TABLES to requestedTables — verified live.
+    let resp = conn.try_execute(&format!(
+        "SELECT new_col FROM {}",
+        vs_table("REFRESH_PARTIAL_VS", "table_two")
+    ));
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "TABLE_TWO was not requested, so its NEW_COL must stay unknown until a full REFRESH \
+         or one naming it: {resp}"
+    );
     let cols_two = conn.query_columns(&format!(
-        "SELECT id, new_col FROM {}",
+        "SELECT id FROM {}",
         vs_table("REFRESH_PARTIAL_VS", "table_two")
     ));
     assert_eq!(
         cols_two[0].len(),
         1,
-        "TABLE_TWO must still return its one row after a refresh naming only \
-         TABLE_ONE: {cols_two:?}"
+        "TABLE_TWO must still be queryable after a refresh naming only TABLE_ONE: {cols_two:?}"
     );
+
+    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_PARTIAL_VS REFRESH");
+    let cols_two = conn.query_columns(&format!(
+        "SELECT id, new_col FROM {}",
+        vs_table("REFRESH_PARTIAL_VS", "table_two")
+    ));
     assert!(
         cols_two[1][0].is_null(),
-        "TABLE_TWO's NEW_COL must ALSO be visible after REFRESH TABLES \
-         TABLE_ONE — Exasol applies the adapter's full-namespace response to \
-         every table regardless of requestedTables, so a partial refresh has \
-         the same real-world effect as a full REFRESH: {cols_two:?}"
+        "a full REFRESH must pick up TABLE_TWO's NEW_COL: {cols_two:?}"
+    );
+}
+
+/// Scenario: A partial refresh naming a dropped table removes it and keeps the rest
+#[test]
+fn refresh_partial_drops_a_table_the_catalog_no_longer_holds() {
+    setup_e2e();
+    let rt = rt();
+    let catalog_url = iceberg_catalog_url();
+    let catalog = rt
+        .block_on(build_seed_catalog(
+            &catalog_url,
+            "s3://warehouse/",
+            "refresh-partial-drop",
+        ))
+        .expect("build seed catalog");
+    let ns = NamespaceIdent::new(NS_PARTIAL_DROP.to_string());
+
+    rt.block_on(ensure_id_val_table(
+        &catalog,
+        NS_PARTIAL_DROP,
+        "keep_me",
+        1,
+        10.0,
+    ));
+    rt.block_on(ensure_id_val_table(
+        &catalog,
+        NS_PARTIAL_DROP,
+        "drop_me",
+        2,
+        20.0,
+    ));
+
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_PARTIAL_DROP_VS", NS_PARTIAL_DROP);
+    let cols = conn.query_columns(&format!(
+        "SELECT id FROM {}",
+        vs_table("REFRESH_PARTIAL_DROP_VS", "drop_me")
+    ));
+    assert_eq!(
+        cols[0].len(),
+        1,
+        "DROP_ME is queryable before it is dropped"
+    );
+
+    rt.block_on(drop_table_if_exists(&catalog, &ns, "drop_me"));
+    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_PARTIAL_DROP_VS REFRESH TABLES DROP_ME");
+
+    let resp = conn.try_execute(&format!(
+        "SELECT id FROM {}",
+        vs_table("REFRESH_PARTIAL_DROP_VS", "drop_me")
+    ));
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "a requested table the catalog no longer holds must leave the virtual schema: {resp}"
+    );
+    let cols = conn.query_columns(&format!(
+        "SELECT id FROM {}",
+        vs_table("REFRESH_PARTIAL_DROP_VS", "keep_me")
+    ));
+    assert_eq!(
+        cols[0].len(),
+        1,
+        "the unrequested table must stay queryable: {cols:?}"
     );
 }
 

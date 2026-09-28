@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::*;
+use std::time::Duration;
 
 #[test]
 fn build_load_table_url_with_warehouse_prefix() {
@@ -8,6 +9,7 @@ fn build_load_table_url_with_warehouse_prefix() {
         "123456789012",
         "db",
         "events",
+        &[],
     );
     assert_eq!(
         url,
@@ -18,7 +20,7 @@ fn build_load_table_url_with_warehouse_prefix() {
 
 #[test]
 fn build_load_table_url_without_warehouse() {
-    let url = build_load_table_url("https://rest.example.com", "", "db", "events");
+    let url = build_load_table_url("https://rest.example.com", "", "db", "events", &[]);
     assert_eq!(
         url, "https://rest.example.com/v1/namespaces/db/tables/events",
         "URL must omit prefix when warehouse is empty"
@@ -33,6 +35,7 @@ fn build_load_table_url_inserts_prefix_verbatim_without_encoding() {
         prefix,
         "mydb",
         "orders",
+        &[],
     );
     assert_eq!(
         url,
@@ -60,6 +63,7 @@ fn build_load_table_url_glue_carries_catalogs_prefix() {
         &prefix,
         "db",
         "events",
+        &[],
     );
     assert_eq!(
         url,
@@ -139,7 +143,9 @@ async fn sigv4_resolve_prefix_derives_catalogs_segment() {
     };
 
     let client = reqwest::Client::new();
-    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
+    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds)
+        .await
+        .expect("the SigV4 prefix needs no lookup");
 
     assert_eq!(
         result,
@@ -185,7 +191,9 @@ async fn non_sigv4_config_prefix_resolution_uses_config_endpoint() {
 
     let client = reqwest::Client::new();
     let result =
-        resolve_load_table_prefix(&client, &catalog_uri, "original-warehouse", &auth, &creds).await;
+        resolve_load_table_prefix(&client, &catalog_uri, "original-warehouse", &auth, &creds)
+            .await
+            .expect("the config lookup succeeds");
 
     assert_eq!(
         result, resolved_prefix,
@@ -223,7 +231,9 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
     let auth = CatalogAuth::None;
 
     let client = reqwest::Client::new();
-    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds).await;
+    let result = resolve_load_table_prefix(&client, &catalog_uri, warehouse, &auth, &creds)
+        .await
+        .expect("the config lookup succeeds");
 
     assert_eq!(
         result, "",
@@ -234,7 +244,7 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
         "warehouse must NOT be used as the URL prefix for non-SigV4 no-override path"
     );
 
-    let url = build_load_table_url(&catalog_uri, &result, "e2e_lakehouse", "events");
+    let url = build_load_table_url(&catalog_uri, &result, "e2e_lakehouse", "events", &[]);
     assert!(
         url.contains("/v1/namespaces/e2e_lakehouse/tables/events"),
         "URL must not contain a warehouse path segment: {url}"
@@ -270,5 +280,87 @@ async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
     assert_eq!(
         session.catalog_uri, catalog_uri,
         "catalog_uri must be carried verbatim"
+    );
+}
+
+#[test]
+fn build_rest_url_encodes_the_query_and_trims_the_base() {
+    let url = build_rest_url(
+        "http://catalog/",
+        "p",
+        "namespaces",
+        &[("parent", "db\u{1f}a"), ("pageToken", "T 1")],
+    );
+    assert_eq!(
+        url,
+        "http://catalog/v1/p/namespaces?parent=db%1Fa&pageToken=T+1"
+    );
+    assert_eq!(
+        build_rest_url("http://catalog", "", "config", &[]),
+        "http://catalog/v1/config"
+    );
+}
+
+#[tokio::test]
+async fn resolve_fails_when_the_config_lookup_fails() {
+    let catalog = spawn_routing_catalog(Vec::new(), Duration::ZERO).await;
+
+    let err = CatalogSession::resolve(&catalog.base_uri, "wh", &creds_no_auth())
+        .await
+        .err()
+        .expect("a failed config lookup must not yield a guessed prefix");
+
+    assert!(
+        err.to_string()
+            .contains("failed to read the catalog config"),
+        "{err}"
+    );
+}
+
+#[tokio::test]
+async fn listings_follow_pagination_and_encode_the_parent() {
+    let catalog = spawn_routing_catalog(
+        vec![
+            ("/v1/config?warehouse=wh", vec![(200, "{}".into())]),
+            (
+                "/v1/namespaces/db%1Fa/tables",
+                vec![(200, list_tables_page(&["db", "a"], &["t1"], Some("P2")))],
+            ),
+            (
+                "/v1/namespaces/db%1Fa/tables?pageToken=P2",
+                vec![(200, list_tables_page(&["db", "a"], &["t2"], None))],
+            ),
+            (
+                "/v1/namespaces?parent=db%1Fa",
+                vec![(200, list_namespaces_page(&[&["db", "a", "x"]], Some("N2")))],
+            ),
+            (
+                "/v1/namespaces?parent=db%1Fa&pageToken=N2",
+                vec![(200, list_namespaces_page(&[&["db", "a", "y"]], None))],
+            ),
+        ],
+        Duration::ZERO,
+    )
+    .await;
+    let creds = creds_no_auth();
+    let session = CatalogSession::resolve(&catalog.base_uri, "wh", &creds)
+        .await
+        .expect("session resolves");
+    let ns = NamespaceIdent::from_vec(vec!["db".into(), "a".into()]).unwrap();
+
+    let tables = session.list_tables(&ns, &creds).await.expect("tables list");
+    let children = session
+        .list_namespaces(&ns, &creds)
+        .await
+        .expect("namespaces list");
+
+    assert_eq!(
+        tables.iter().map(|t| t.name.as_str()).collect::<Vec<_>>(),
+        ["t1", "t2"],
+        "a second page must not be dropped"
+    );
+    assert_eq!(
+        children.iter().map(|c| c.join(".")).collect::<Vec<_>>(),
+        ["db.a.x", "db.a.y"]
     );
 }

@@ -150,3 +150,44 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
         assert_eq!(columns[1]["dataType"], expected, "delta on {engine:?}");
     }
 }
+
+#[test]
+fn two_columns_folding_to_one_name_are_refused_naming_the_table() {
+    use iceberg::spec::{PrimitiveType, Type};
+    use lakehouse_catalog::{
+        CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
+    };
+
+    let column = |name: &str| CatalogColumn {
+        name: name.to_string(),
+        source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+    };
+    let listing = CatalogListing {
+        tables: vec![CatalogTable {
+            ident: CatalogTableIdent {
+                namespace: vec!["sales".to_string()],
+                name: "orders".to_string(),
+            },
+            table_type: CatalogTableType::Table,
+            storage_location: None,
+            format: TableFormat::Iceberg,
+            vended_credential_key: None,
+            partition_columns: Vec::new(),
+            columns: vec![column("Id"), column("total"), column("id")],
+        }],
+        skipped: Vec::new(),
+    };
+
+    let err = build_listing_virtual_tables(
+        &["sales".to_string()],
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .expect_err("Exasol accepts a duplicate column silently, so the adapter must refuse it");
+
+    assert_eq!(
+        err.to_string(),
+        "table 'sales.orders': columns 'Id' and 'id' are the same name once uppercased ('ID'), \
+         so the declaration would advertise a duplicate column"
+    );
+}

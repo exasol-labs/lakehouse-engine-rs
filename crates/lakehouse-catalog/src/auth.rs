@@ -3,48 +3,10 @@
 
 use crate::ConnectionCreds;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
+use crate::http::execute_with_retry;
 use crate::redaction::redact_error_text;
 use crate::sigv4::required_signing_region;
 use exasol_udf_sdk::error::UdfError;
-use std::collections::HashMap;
-
-/// Fixed by `iceberg-catalog-rest` 0.10.0, which exports no constants for them.
-pub(crate) const REST_CATALOG_PROP_TOKEN: &str = "token";
-pub(crate) const REST_CATALOG_PROP_CREDENTIAL: &str = "credential";
-pub(crate) const REST_CATALOG_PROP_OAUTH2_SERVER_URI: &str = "oauth2-server-uri";
-pub(crate) const REST_CATALOG_PROP_SCOPE: &str = "scope";
-
-/// Token and client-credentials never co-occur: `validate_creds` rule 6 rejects a
-/// CONNECTION supplying both.
-pub(crate) fn inject_catalog_auth_props(
-    props: &mut HashMap<String, String>,
-    creds: &ConnectionCreds,
-) {
-    match creds.supplied_catalog_auth() {
-        SuppliedCatalogAuth::Unauthenticated => {}
-        SuppliedCatalogAuth::StaticToken(token) => {
-            props.insert(REST_CATALOG_PROP_TOKEN.to_string(), token.to_string());
-        }
-        SuppliedCatalogAuth::ClientCredentials {
-            client_id,
-            client_secret,
-        } => {
-            props.insert(
-                REST_CATALOG_PROP_CREDENTIAL.to_string(),
-                format!("{client_id}:{client_secret}"),
-            );
-            if let Some(uri) = non_empty(&creds.oauth2_server_uri) {
-                props.insert(
-                    REST_CATALOG_PROP_OAUTH2_SERVER_URI.to_string(),
-                    uri.to_string(),
-                );
-            }
-            if let Some(scope) = non_empty(&creds.scope) {
-                props.insert(REST_CATALOG_PROP_SCOPE.to_string(), scope.to_string());
-            }
-        }
-    }
-}
 
 /// Strips the literal auth values too, so a value echoed without a recognizable
 /// label cannot leak.
@@ -118,18 +80,19 @@ async fn oauth2_client_credentials_grant(
         form.push(("scope", scope));
     }
 
-    let response = client
+    let failed = |e: reqwest::Error| {
+        UdfError::User(format!(
+            "OAuth2 token request failed: {}",
+            redact_secret(&e.to_string())
+        ))
+    };
+    let request = client
         .post(&token_url)
         .header("accept", "application/json")
         .form(&form)
-        .send()
-        .await
-        .map_err(|e| {
-            UdfError::User(format!(
-                "OAuth2 token request failed: {}",
-                redact_secret(&e.to_string())
-            ))
-        })?;
+        .build()
+        .map_err(failed)?;
+    let response = execute_with_retry(client, request).await.map_err(failed)?;
 
     let status = response.status();
     if !status.is_success() {

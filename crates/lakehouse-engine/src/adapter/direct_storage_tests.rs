@@ -71,6 +71,10 @@ impl RecordingStore {
         seen
     }
 
+    fn fetches(&self) -> usize {
+        self.fetched.lock().expect("read log is not poisoned").len()
+    }
+
     fn record(&self, prefix: Option<&StorePath>) {
         self.prefixes
             .lock()
@@ -387,7 +391,51 @@ async fn merge_mode_selects_every_footer_or_exactly_one() {
             expected,
             "{merge_mode:?} must open exactly these footers"
         );
+        assert_eq!(
+            recording.fetches(),
+            expected.len(),
+            "{merge_mode:?}: a footer is read with one ranged GET, not a length probe plus a second GET"
+        );
     }
+}
+
+#[tokio::test]
+async fn load_tables_resolves_only_the_named_directories() {
+    let recording = RecordingStore::wrapping(
+        id_files_at(&["lake/orders/part-0.parquet", "lake/items/part-0.parquet"]).await,
+    );
+    let client = test_client(
+        Arc::clone(&recording) as Arc<dyn ObjectStore>,
+        "s3://bucket/lake",
+        FOLD_NO_HIVE,
+    );
+    let ident = |name: &str| CatalogTableIdent {
+        namespace: Vec::new(),
+        name: name.to_string(),
+    };
+
+    let listing = client
+        .load_tables(&[ident("items"), ident("vanished")])
+        .await
+        .expect("a scoped load succeeds");
+
+    assert_eq!(
+        listing
+            .tables
+            .iter()
+            .map(|t| t.ident.name.as_str())
+            .collect::<Vec<_>>(),
+        ["items"]
+    );
+    assert_eq!(
+        listing.skipped,
+        vec![SkippedTable {
+            ident: ident("vanished"),
+            reason: SkipReason::NoDataFile,
+        }],
+        "a directory that no longer holds a data file is skipped, so Exasol drops it"
+    );
+    assert_eq!(recording.files_fetched(), ["lake/items/part-0.parquet"]);
 }
 
 #[tokio::test]

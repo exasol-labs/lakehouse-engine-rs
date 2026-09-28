@@ -5,11 +5,15 @@ use std::future::Future;
 use std::pin::Pin;
 
 use exasol_udf_sdk::error::UdfError;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use iceberg::TableIdent;
 
 use crate::namespace::list_namespace_tables;
-use crate::session::{CatalogSession, load_table_any_auth};
-use crate::{CatalogProps, ConnectionCreds, StorageBackend};
+use crate::session::{CatalogSession, load_table_schema};
+use crate::{CatalogProps, ConnectionCreds};
+
+/// Per-table catalog loads in flight at once on one shared session.
+pub(crate) const LOAD_CONCURRENCY: usize = 8;
 
 /// Namespace carried as segments, never a joined dotted string: a segment may
 /// itself contain the separator.
@@ -77,6 +81,8 @@ pub struct CatalogTable {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkipReason {
     NotLoadableIcebergTable,
+    /// A table named by a scoped load that the catalog no longer holds.
+    NotFound,
     /// `detail` names the offending value verbatim, e.g. `table_type=VIEW`.
     NotDeltaBaseTable {
         detail: String,
@@ -90,10 +96,30 @@ pub struct SkippedTable {
     pub reason: SkipReason,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub struct CatalogListing {
     pub tables: Vec<CatalogTable>,
     pub skipped: Vec<SkippedTable>,
+}
+
+/// Per-table outcomes in load order: a table, or the reason it was skipped.
+impl Extend<Result<CatalogTable, SkippedTable>> for CatalogListing {
+    fn extend<I: IntoIterator<Item = Result<CatalogTable, SkippedTable>>>(&mut self, iter: I) {
+        for outcome in iter {
+            match outcome {
+                Ok(table) => self.tables.push(table),
+                Err(skipped) => self.skipped.push(skipped),
+            }
+        }
+    }
+}
+
+impl FromIterator<Result<CatalogTable, SkippedTable>> for CatalogListing {
+    fn from_iter<I: IntoIterator<Item = Result<CatalogTable, SkippedTable>>>(iter: I) -> Self {
+        let mut listing = Self::default();
+        listing.extend(iter);
+        listing
+    }
 }
 
 /// Boxed futures instead of `async fn` keep the trait dyn-compatible without an
@@ -109,52 +135,51 @@ pub trait CatalogClient: Send + Sync {
         &self,
         ident: &CatalogTableIdent,
     ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>>;
+
+    /// Only the named tables, under the same skip contract as `list_tables`; one
+    /// the catalog no longer holds is skipped, not an error.
+    fn load_tables<'a>(
+        &'a self,
+        idents: &'a [CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + 'a>>;
 }
 
-/// Builds its [`CatalogSession`] lazily, after enumeration, so an empty namespace
-/// performs no OAuth2 grant.
 pub struct IcebergRestCatalogClient {
     catalog_uri: String,
-    storage: StorageBackend,
     creds: ConnectionCreds,
 }
 
 impl IcebergRestCatalogClient {
-    pub fn new(catalog_uri: String, storage: StorageBackend, creds: ConnectionCreds) -> Self {
-        Self {
-            catalog_uri,
-            storage,
-            creds,
-        }
+    pub fn new(catalog_uri: String, creds: ConnectionCreds) -> Self {
+        Self { catalog_uri, creds }
     }
 
-    /// One session for the whole batch; none (and no OAuth2 grant) for an empty one.
-    async fn resolve_listing(&self, idents: &[TableIdent]) -> Result<CatalogListing, UdfError> {
-        if idents.is_empty() {
-            return Ok(CatalogListing {
-                tables: Vec::new(),
-                skipped: Vec::new(),
-            });
-        }
+    async fn session(&self) -> Result<CatalogSession, UdfError> {
+        CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds).await
+    }
 
-        let session =
-            CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds).await?;
-
-        let mut tables = Vec::with_capacity(idents.len());
-        let mut skipped = Vec::new();
-        for table_ident in idents {
-            let ident = neutral_ident(table_ident);
-            match self.load_on_session(&session, &ident).await {
-                Ok(table) => tables.push(table),
-                Err(err) if is_not_loadable_iceberg_table(&err) => skipped.push(SkippedTable {
-                    ident,
-                    reason: SkipReason::NotLoadableIcebergTable,
-                }),
-                Err(err) => return Err(err),
-            }
-        }
-
-        Ok(CatalogListing { tables, skipped })
+    async fn resolve_listing(
+        &self,
+        session: &CatalogSession,
+        idents: Vec<CatalogTableIdent>,
+    ) -> Result<CatalogListing, UdfError> {
+        stream::iter(idents)
+            .map(|ident| async move {
+                match self.load_on_session(session, &ident).await {
+                    Ok(table) => Ok(Ok(table)),
+                    Err(err) if is_not_loadable_iceberg_table(&err) => Ok(Err(SkippedTable {
+                        ident,
+                        reason: SkipReason::NotLoadableIcebergTable,
+                    })),
+                    Err(err) => Err(UdfError::User(format!(
+                        "failed to load table '{}': {err}",
+                        dotted_identifier(&ident)
+                    ))),
+                }
+            })
+            .buffered(LOAD_CONCURRENCY)
+            .try_collect()
+            .await
     }
 
     /// Column names keep their original case; the engine owns case folding. No
@@ -168,7 +193,7 @@ impl IcebergRestCatalogClient {
             warehouse: self.creds.warehouse.clone(),
             table: dotted_identifier(ident),
         };
-        let result = load_table_any_auth(session, &catalog, &self.creds).await?;
+        let result = load_table_schema(session, &catalog, &self.creds).await?;
 
         let storage_location = result.metadata.location().to_string();
         let columns = result
@@ -202,10 +227,10 @@ impl CatalogClient for IcebergRestCatalogClient {
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
         let namespace = namespace.to_vec();
         Box::pin(async move {
-            let idents =
-                list_namespace_tables(&self.catalog_uri, &namespace, &self.storage, &self.creds)
-                    .await?;
-            self.resolve_listing(&idents).await
+            let session = self.session().await?;
+            let idents = list_namespace_tables(&session, &namespace, &self.creds).await?;
+            self.resolve_listing(&session, idents.iter().map(neutral_ident).collect())
+                .await
         })
     }
 
@@ -215,10 +240,21 @@ impl CatalogClient for IcebergRestCatalogClient {
     ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
         let ident = ident.clone();
         Box::pin(async move {
-            let session =
-                CatalogSession::resolve(&self.catalog_uri, &self.creds.warehouse, &self.creds)
-                    .await?;
+            let session = self.session().await?;
             self.load_on_session(&session, &ident).await
+        })
+    }
+
+    fn load_tables<'a>(
+        &'a self,
+        idents: &'a [CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + 'a>> {
+        Box::pin(async move {
+            if idents.is_empty() {
+                return Ok(CatalogListing::default());
+            }
+            let session = self.session().await?;
+            self.resolve_listing(&session, idents.to_vec()).await
         })
     }
 }

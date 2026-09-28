@@ -382,6 +382,91 @@ fn adapter_notes_omit_cluster_nodes() {
     );
 }
 
+fn refresh_request(requested: Option<serde_json::Value>) -> serde_json::Value {
+    let mut request = serde_json::json!({
+        "type": "refresh",
+        "schemaMetadataInfo": {
+            "adapterNotes": serde_json::json!({
+                "TABLE_MAP": {"ORDERS": "sales.orders", "EU__ITEMS": "sales.eu.items"},
+            })
+            .to_string(),
+        },
+    });
+    if let Some(requested) = requested {
+        request["requestedTables"] = requested;
+    }
+    request
+}
+
+#[test]
+fn scoped_refresh_loads_only_requested_tables_known_to_the_table_map() {
+    let request = refresh_request(Some(serde_json::json!(["EU__ITEMS", "ORDERS"])));
+    let table_map = read_table_map(&request);
+
+    let scoped = scoped_refresh(&request, &table_map).expect("every name is in TABLE_MAP");
+
+    assert_eq!(scoped.names, ["EU__ITEMS", "ORDERS"]);
+    assert_eq!(
+        scoped.idents,
+        [
+            CatalogTableIdent {
+                namespace: vec!["sales".into(), "eu".into()],
+                name: "items".into(),
+            },
+            CatalogTableIdent {
+                namespace: vec!["sales".into()],
+                name: "orders".into(),
+            },
+        ]
+    );
+}
+
+#[test]
+fn refresh_falls_back_to_full_enumeration_unless_every_requested_name_is_known() {
+    let unknown = refresh_request(Some(serde_json::json!(["ORDERS", "NEW_ONE"])));
+    let table_map = read_table_map(&unknown);
+    assert!(
+        scoped_refresh(&unknown, &table_map).is_none(),
+        "a name outside TABLE_MAP may be a table added since creation"
+    );
+
+    let full = refresh_request(None);
+    assert!(scoped_refresh(&full, &table_map).is_none());
+
+    let empty = refresh_request(Some(serde_json::json!([])));
+    assert!(scoped_refresh(&empty, &table_map).is_none());
+
+    let mut create = refresh_request(Some(serde_json::json!(["ORDERS"])));
+    create["type"] = "createVirtualSchema".into();
+    assert!(scoped_refresh(&create, &table_map).is_none());
+}
+
+#[test]
+fn scoped_table_map_replaces_requested_entries_and_drops_vanished_ones() {
+    let persisted: HashMap<String, String> = [
+        ("ORDERS", "sales.orders"),
+        ("GONE", "sales.gone"),
+        ("KEPT", "sales.kept"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    let requested = ["ORDERS".to_string(), "GONE".to_string()];
+    let refreshed = vec![("ORDERS".to_string(), "sales.orders".to_string())];
+
+    let mut merged = scoped_table_map(persisted, &requested, refreshed);
+    merged.sort();
+
+    assert_eq!(
+        merged,
+        [
+            ("KEPT".to_string(), "sales.kept".to_string()),
+            ("ORDERS".to_string(), "sales.orders".to_string()),
+        ],
+        "an unrequested table keeps its entry; a requested table the load skipped loses it"
+    );
+}
+
 #[test]
 fn refresh_rebuilds_table_map_preserves_notes() {
     let req = serde_json::json!({

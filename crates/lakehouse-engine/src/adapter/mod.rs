@@ -20,7 +20,9 @@ use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
 use crate::adapter::pushdown::handle_pushdown;
-use crate::adapter::tables::{catalog_identifier_string, flatten_table_name};
+use crate::adapter::tables::{
+    catalog_identifier_string, flatten_table_name, parse_catalog_identifier,
+};
 use crate::scan::sealed::SealedStorageKey;
 use crate::scan::spec::DEFAULT_S3_MAX_CONNECTIONS;
 use crate::scan::spec::StorageBackend;
@@ -35,7 +37,7 @@ use lakehouse_catalog::{
     SkippedTable, UnityCatalogSession,
 };
 use serde_json::{Value as Json, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 
 const PROP_NAMESPACE: &str = "NAMESPACE";
@@ -207,15 +209,25 @@ fn handle_create_virtual_schema(
         &props,
     )
     .map_err(|e| redact_error(&config.storage, e))?;
+    let persisted_table_map = read_table_map(request);
+    let scoped = scoped_refresh(request, &persisted_table_map);
     let listing = rt
-        .block_on(async { client.list_tables(&configured_ns).await })
+        .block_on(async {
+            match &scoped {
+                Some(refresh) => client.load_tables(&refresh.idents).await,
+                None => client.list_tables(&configured_ns).await,
+            }
+        })
         .map_err(|e| redact_error(&config.storage, e))?;
 
     let engine_timestamps = EngineTimestampSupport::from_database_version(&ctx.database_version());
 
-    let (tables_json, table_map, skipped) =
+    let (tables_json, mut table_map, skipped) =
         build_listing_virtual_tables(&configured_ns, &listing, engine_timestamps)
             .map_err(|e| redact_error(&config.storage, e))?;
+    if let Some(refresh) = &scoped {
+        table_map = scoped_table_map(persisted_table_map, &refresh.names, table_map);
+    }
 
     for entry in &skipped {
         udf_log!(ctx, warn, "{}", skip_warning(entry));
@@ -243,10 +255,55 @@ fn handle_create_virtual_schema(
     Ok(build_schema_response(request, schema_metadata))
 }
 
+struct ScopedRefresh {
+    names: Vec<String>,
+    idents: Vec<CatalogTableIdent>,
+}
+
+/// `Some` only for a `refresh` whose every `requestedTables` name is in the persisted `TABLE_MAP`:
+/// an unknown name may be a table added since creation, which only a full enumeration finds.
+fn scoped_refresh(request: &Json, table_map: &HashMap<String, String>) -> Option<ScopedRefresh> {
+    if request.get("type").and_then(Json::as_str) != Some("refresh") {
+        return None;
+    }
+    let requested = request.get("requestedTables")?.as_array()?;
+    if requested.is_empty() {
+        return None;
+    }
+    let names: Vec<String> = requested
+        .iter()
+        .map(|name| name.as_str().map(str::to_string))
+        .collect::<Option<_>>()?;
+    let idents = names
+        .iter()
+        .map(|name| table_map.get(name).map(|id| parse_catalog_identifier(id)))
+        .collect::<Option<_>>()?;
+    Some(ScopedRefresh { names, idents })
+}
+
+/// A requested table the scoped load dropped leaves the map, so a name Exasol no longer holds
+/// cannot resolve at pushdown.
+fn scoped_table_map(
+    persisted: HashMap<String, String>,
+    requested: &[String],
+    refreshed: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    let requested: HashSet<&str> = requested.iter().map(String::as_str).collect();
+    persisted
+        .into_iter()
+        .filter(|(name, _)| !requested.contains(name.as_str()))
+        .chain(refreshed)
+        .collect()
+}
+
 fn skip_warning(entry: &SkippedTable) -> String {
     match &entry.reason {
         SkipReason::NotLoadableIcebergTable => format!(
             "createVirtualSchema: skipping non-Iceberg table '{}' (catalog reported it is not a loadable Iceberg table)",
+            catalog_identifier_string(&entry.ident)
+        ),
+        SkipReason::NotFound => format!(
+            "refresh: dropping table '{}' (the catalog no longer holds it)",
             catalog_identifier_string(&entry.ident)
         ),
         SkipReason::NotDeltaBaseTable { detail } => format!(
@@ -450,11 +507,7 @@ fn construct_catalog_client(
     props: &Json,
 ) -> Result<Box<dyn CatalogClient>, UdfError> {
     match kind {
-        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(
-            catalog_uri,
-            storage,
-            creds,
-        ))),
+        CatalogKind::IcebergRest => Ok(Box::new(IcebergRestCatalogClient::new(catalog_uri, creds))),
         CatalogKind::UnityCatalogNative => {
             Ok(Box::new(UnityCatalogSession::new(&catalog_uri, creds)))
         }
@@ -473,8 +526,8 @@ fn construct_catalog_client(
     }
 }
 
-/// The full-Unicode `to_uppercase` fold is a deliberate Exasol-target trade-off: `ß` expands to
-/// `SS`, so two columns differing only in that expansion collapse to one name with no check.
+/// Exasol accepts a duplicate column name in a declaration without complaint (verified live), so
+/// two columns folding to one name are refused here.
 fn build_listing_virtual_tables(
     configured_ns: &[String],
     listing: &CatalogListing,
@@ -485,19 +538,26 @@ fn build_listing_virtual_tables(
 
     for table in &listing.tables {
         let exasol_name = flatten_table_name(configured_ns, &table.ident);
-        let columns: Vec<Json> = table
-            .columns
-            .iter()
-            .map(|col| {
-                json!({
-                    "name": col.name.to_uppercase(),
-                    "dataType": exasol_type_to_json(&column_source_type_to_exasol(
-                        &col.source_type,
-                        engine_timestamps,
-                    )),
-                })
-            })
-            .collect();
+        let mut columns: Vec<Json> = Vec::with_capacity(table.columns.len());
+        let mut declared: HashMap<String, &str> = HashMap::new();
+        for col in &table.columns {
+            let name = col.name.to_uppercase();
+            if let Some(prior) = declared.insert(name.clone(), &col.name) {
+                return Err(UdfError::User(format!(
+                    "table '{}': columns '{prior}' and '{}' are the same name once uppercased \
+                     ('{name}'), so the declaration would advertise a duplicate column",
+                    catalog_identifier_string(&table.ident),
+                    col.name
+                )));
+            }
+            columns.push(json!({
+                "name": name,
+                "dataType": exasol_type_to_json(&column_source_type_to_exasol(
+                    &col.source_type,
+                    engine_timestamps,
+                )),
+            }));
+        }
         tables_json.push(json!({
             "name": exasol_name,
             "columns": columns,

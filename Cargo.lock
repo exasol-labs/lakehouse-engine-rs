@@ -3167,12 +3167,13 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-catalog"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "aws-credential-types",
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "exasol-udf-sdk",
+ "futures",
  "iceberg",
  "iceberg-catalog-rest",
  "iceberg-storage-opendal",
@@ -3185,7 +3186,7 @@ dependencies = [
 
 [[package]]
 name = "lakehouse-engine"
-version = "0.50.0"
+version = "0.50.1"
 dependencies = [
  "aes-gcm",
  "anyhow",

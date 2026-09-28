@@ -15,6 +15,9 @@ use std::sync::Arc;
 
 const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
+/// Fetched with the footer's trailing 8 bytes so a footer up to this size costs one GET, not two.
+const FOOTER_SIZE_HINT: usize = 64 * 1024;
+
 /// Which files' footers are folded and whose paths declare the partition keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MergeMode {
@@ -331,7 +334,9 @@ async fn read_footer(
     path: &StorePath,
     size: u64,
 ) -> Result<ArrowReaderMetadata, UdfError> {
-    let mut reader = ParquetObjectReader::new(store, path.clone()).with_file_size(size);
+    let mut reader = ParquetObjectReader::new(store, path.clone())
+        .with_file_size(size)
+        .with_footer_size_hint(FOOTER_SIZE_HINT);
     ArrowReaderMetadata::load_async(&mut reader, ArrowReaderOptions::new())
         .await
         .map_err(|e| {

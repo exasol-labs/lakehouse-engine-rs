@@ -2,6 +2,7 @@ use crate::adapter::direct_storage_properties::join_storage_path;
 use crate::adapter::parquet_directory::{
     DirectoryOptions, resolve_parquet_directory, store_prefix,
 };
+use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::StorageBackend;
 use crate::types::mapping::{arrow_type_to_tag, needs_json_fallback};
 use arrow::datatypes::DataType;
@@ -53,6 +54,40 @@ impl DirectStorageCatalogClient {
     }
 }
 
+impl DirectStorageCatalogClient {
+    /// Each directory is reduced to its table as soon as its footers are folded, so no
+    /// directory's parsed footers outlive its own resolution.
+    async fn load_directories(&self, names: Vec<String>) -> Result<CatalogListing, UdfError> {
+        let loaded = try_join_all(names.into_iter().map(|name| async move {
+            let table_prefix = self.prefix.clone().join(name.as_str());
+            let directory =
+                resolve_parquet_directory(&self.store, &table_prefix, self.options, &|_| true)
+                    .await?;
+            let ident = CatalogTableIdent {
+                namespace: Vec::new(),
+                name: name.clone(),
+            };
+            if directory.files.is_empty() {
+                return Ok(Err(SkippedTable {
+                    ident,
+                    reason: SkipReason::NoDataFile,
+                }));
+            }
+            Ok::<_, UdfError>(Ok(CatalogTable {
+                ident,
+                table_type: CatalogTableType::Table,
+                storage_location: Some(join_storage_path(&self.base_path, Some(&name))),
+                format: TableFormat::Parquet,
+                vended_credential_key: None,
+                partition_columns: Vec::new(),
+                columns: resolve_columns(&directory.schema),
+            }))
+        }))
+        .await?;
+        Ok(loaded.into_iter().collect())
+    }
+}
+
 impl CatalogClient for DirectStorageCatalogClient {
     /// Each first-level directory under the base path is a table with an empty namespace;
     /// `namespace` is unread since the base path already encodes `CATALOG_CONNECTION` + `NAMESPACE`.
@@ -73,42 +108,7 @@ impl CatalogClient for DirectStorageCatalogClient {
                 .filter_map(|p| p.filename().map(str::to_string))
                 .collect();
             names.sort();
-
-            let directories = try_join_all(names.iter().map(|name| {
-                let table_prefix = self.prefix.clone().join(name.as_str());
-                async move {
-                    resolve_parquet_directory(&self.store, &table_prefix, self.options, &|_| true)
-                        .await
-                }
-            }))
-            .await?;
-
-            let mut tables = Vec::with_capacity(names.len());
-            let mut skipped = Vec::new();
-            for (name, directory) in names.into_iter().zip(directories) {
-                let ident = CatalogTableIdent {
-                    namespace: Vec::new(),
-                    name: name.clone(),
-                };
-                if directory.files.is_empty() {
-                    skipped.push(SkippedTable {
-                        ident,
-                        reason: SkipReason::NoDataFile,
-                    });
-                    continue;
-                }
-                let columns = resolve_columns(&directory.schema);
-                tables.push(CatalogTable {
-                    ident,
-                    table_type: CatalogTableType::Table,
-                    storage_location: Some(join_storage_path(&self.base_path, Some(&name))),
-                    format: TableFormat::Parquet,
-                    vended_credential_key: None,
-                    partition_columns: Vec::new(),
-                    columns,
-                });
-            }
-            Ok(CatalogListing { tables, skipped })
+            self.load_directories(names).await
         })
     }
 
@@ -126,6 +126,13 @@ impl CatalogClient for DirectStorageCatalogClient {
                  from its composed root instead"
             )))
         })
+    }
+
+    fn load_tables<'a>(
+        &'a self,
+        idents: &'a [CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + 'a>> {
+        Box::pin(self.load_directories(idents.iter().map(catalog_identifier_string).collect()))
     }
 }
 

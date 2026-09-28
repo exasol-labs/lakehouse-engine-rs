@@ -17,12 +17,25 @@ pub fn flatten_table_name(configured_ns: &[String], ident: &CatalogTableIdent) -
     parts.join("__").to_uppercase()
 }
 
-/// The `TABLE_MAP` value, parsed back by `parse_table_ident`.
+/// The `TABLE_MAP` value, parsed back by `parse_catalog_identifier`.
 pub fn catalog_identifier_string(ident: &CatalogTableIdent) -> String {
     let ns: &[String] = &ident.namespace;
     let mut parts: Vec<&str> = ns.iter().map(|s| s.as_str()).collect();
     parts.push(&ident.name);
     parts.join(".")
+}
+
+/// A value without a `.` is a direct-storage table, whose namespace is empty.
+pub fn parse_catalog_identifier(identifier: &str) -> CatalogTableIdent {
+    let (namespace, name) = identifier.rsplit_once('.').unwrap_or(("", identifier));
+    CatalogTableIdent {
+        namespace: namespace
+            .split('.')
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        name: name.to_string(),
+    }
 }
 
 #[cfg(test)]

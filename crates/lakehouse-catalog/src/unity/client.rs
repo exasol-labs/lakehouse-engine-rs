@@ -2,9 +2,12 @@ use std::future::Future;
 use std::pin::Pin;
 
 use exasol_udf_sdk::error::UdfError;
+use futures::stream::{self, StreamExt, TryStreamExt};
 use serde::Deserialize;
 use serde::de::DeserializeOwned;
 
+use crate::client::LOAD_CONCURRENCY;
+use crate::http::{build_client, execute_with_retry};
 use crate::redaction::redact_error_text;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
@@ -28,7 +31,7 @@ pub struct UnityCatalogSession {
 impl UnityCatalogSession {
     /// Issues no request: an OAuth grant, if any, is deferred to the first request.
     pub fn new(address: &str, creds: ConnectionCreds) -> Self {
-        let client = reqwest::Client::new();
+        let client = build_client();
         let base_url = format!("{}{UNITY_REST_BASE_PATH}", address.trim_end_matches('/'));
         let auth = resolve_unity_auth(&client, address, &creds);
         Self {
@@ -132,12 +135,16 @@ impl UnityCatalogSession {
             }
             redact_error_text(msg, &secrets)
         };
-        let response = builder.send().await.map_err(|e| {
+        let failed = |e: reqwest::Error| {
             UdfError::User(format!(
                 "Unity Catalog {kind} request failed: {}",
                 redact(&e.to_string())
             ))
-        })?;
+        };
+        let request = builder.build().map_err(failed)?;
+        let response = execute_with_retry(&self.client, request)
+            .await
+            .map_err(failed)?;
         let status = response.status();
         if !status.is_success() {
             let body = response
@@ -196,6 +203,49 @@ impl CatalogClient for UnityCatalogSession {
             Ok(neutral_table(ident, info, format))
         })
     }
+
+    fn load_tables<'a>(
+        &'a self,
+        idents: &'a [CatalogTableIdent],
+    ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + 'a>> {
+        Box::pin(async move {
+            stream::iter(idents.to_vec())
+                .map(|ident| self.load_admitted(ident))
+                .buffered(LOAD_CONCURRENCY)
+                .try_collect()
+                .await
+        })
+    }
+}
+
+impl UnityCatalogSession {
+    async fn load_admitted(
+        &self,
+        ident: CatalogTableIdent,
+    ) -> Result<Result<CatalogTable, SkippedTable>, UdfError> {
+        let info = match self.get_table_info(&full_name(&ident)).await {
+            Ok(info) => info,
+            Err(err) if is_not_found(&err) => {
+                return Ok(Err(SkippedTable {
+                    ident,
+                    reason: SkipReason::NotFound,
+                }));
+            }
+            Err(err) => return Err(err),
+        };
+        Ok(
+            match admission(&info.table_type, info.data_source_format.as_deref()) {
+                Err(reason) => Err(SkippedTable { ident, reason }),
+                Ok(format) => Ok(neutral_table(ident, info, format)),
+            },
+        )
+    }
+}
+
+/// Matches the prefix `send_json` mints, including `": "`, so a body merely
+/// containing `404` cannot false-match.
+fn is_not_found(err: &UdfError) -> bool {
+    matches!(err, UdfError::User(msg) if msg.starts_with("Unity Catalog load table request failed with HTTP 404: "))
 }
 
 fn unity_namespace(namespace: &[String]) -> Result<(&str, &str), UdfError> {

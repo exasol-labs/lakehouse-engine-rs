@@ -87,3 +87,23 @@ fn identifier_string_preserves_mixed_case() {
     let ident = make_ident(vec!["Prod", "Finance"], "Orders");
     assert_eq!(catalog_identifier_string(&ident), "Prod.Finance.Orders");
 }
+
+#[test]
+fn identifier_string_round_trips_through_parse_catalog_identifier() {
+    for ident in [
+        make_ident(vec![], "orders"),
+        make_ident(vec![], "sales.2024"),
+        make_ident(vec!["sales"], "orders"),
+        make_ident(vec!["prod", "finance", "eu"], "orders"),
+    ] {
+        let parsed = parse_catalog_identifier(&catalog_identifier_string(&ident));
+        assert_eq!(
+            catalog_identifier_string(&parsed),
+            catalog_identifier_string(&ident)
+        );
+    }
+    assert_eq!(
+        parse_catalog_identifier("orders"),
+        make_ident(vec![], "orders")
+    );
+}
