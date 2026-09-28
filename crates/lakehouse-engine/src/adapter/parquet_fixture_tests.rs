@@ -1,5 +1,3 @@
-//! Parquet-directory fixtures shared by the direct-storage test modules.
-
 use crate::adapter::parquet_directory::{DirectoryOptions, MergeMode};
 use arrow::array::{ArrayRef, new_empty_array, new_null_array};
 use arrow::datatypes::{DataType, Field, Schema};

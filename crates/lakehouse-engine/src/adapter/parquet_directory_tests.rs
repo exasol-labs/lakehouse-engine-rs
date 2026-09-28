@@ -145,7 +145,6 @@ async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<ReversedListingStore> {
     ReversedListingStore::wrapping(in_memory_store(&rooted).await)
 }
 
-/// [`store_holding`] with the same bytes at every key.
 async fn store_with(keys: &[&str], data: &[u8]) -> Arc<ReversedListingStore> {
     let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data)).collect();
     store_holding(&objects).await
@@ -980,8 +979,6 @@ async fn a_prefix_holding_no_data_file_answers_an_empty_list_and_schema() {
     );
 }
 
-/// Percent-DECODED, since an object store addresses a key by its decoded name; an `abfss://`
-/// URI's userinfo (the container) is the store's own scope, not part of the key.
 #[test]
 fn the_store_prefix_is_the_percent_decoded_path_below_the_store_root() {
     for (uri, expected) in [

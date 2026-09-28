@@ -1,14 +1,7 @@
-//! Declared-output-column fixtures shared by the `scan` module's sibling
-//! `_tests.rs` files, so one `EMITS` declaration is modelled one way.
-
 use exasol_udf_sdk::value::{ColumnInfo, ExaType};
 
-/// The declared output columns a call site with this `EMITS` list produces.
-///
-/// `typ` is the authority the emit boundary reads; `size`, `precision` and
-/// `scale` are populated from that variant's own payload so the fixture cannot
-/// describe a declaration the database would never report, and `name` is the
-/// caller's so a failing assertion names the column under test.
+/// `size`, `precision` and `scale` derive from `typ`'s payload so the fixture cannot
+/// describe a declaration the database would never report.
 pub(in crate::scan) fn declared(types: &[(&str, ExaType)]) -> Vec<ColumnInfo> {
     types
         .iter()
@@ -23,7 +16,6 @@ pub(in crate::scan) fn declared(types: &[(&str, ExaType)]) -> Vec<ColumnInfo> {
         .collect()
 }
 
-/// `VARCHAR(2000000)` as the database reports it.
 pub(in crate::scan) fn varchar() -> ExaType {
     ExaType::String { size: 2_000_000 }
 }

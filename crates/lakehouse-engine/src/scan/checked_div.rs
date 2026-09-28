@@ -1,14 +1,7 @@
-//! Checked float division: the scalar function every DataFusion-dialect
-//! `FLOAT_DIV` node renders as, so a division by zero fails the query at the
-//! point of division instead of silently changing a pushed filter's row count
-//! (#370).
-//!
-//! `crates/vs-expression` names the function and this module implements it; the
-//! only thing tying the two together is [`CHECKED_FLOAT_DIV_FN`], whose doc
-//! comment states the contract below. The check is safe precisely because it
-//! sees only the two operands of a division the pushdown itself synthesised —
-//! unlike `convert::arrow_value_at`'s `is_nan()` guard, which sees a value read
-//! from a column and cannot tell a computed non-finite from a stored one.
+//! The scalar function every DataFusion-dialect `FLOAT_DIV` renders as, so division by zero
+//! fails the query instead of silently changing a pushed filter's row count (#370). Safe because
+//! it sees only operands of a division the pushdown synthesised, unlike `arrow_value_at`'s
+//! `is_nan()` guard, which cannot tell a computed non-finite from a stored one.
 
 use arrow::array::{Array, AsArray, Float64Array};
 use arrow::buffer::NullBuffer;
@@ -26,29 +19,16 @@ use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 use vs_expression::CHECKED_FLOAT_DIV_FN;
 
-/// Value written into a NULL row's slot of the result's values buffer. Arrow
-/// keeps that buffer at full length behind the null mask, and nothing reads a
-/// slot the mask marks absent.
+/// Arrow keeps the values buffer full-length behind the null mask; nothing reads this slot.
 const NULL_ROW_FILLER: f64 = 0.0;
 
-/// A checked division that refused to produce a value Exasol cannot represent.
-///
-/// Carried on the DataFusion error chain inside `DataFusionError::External`, so
-/// [`crate::scan::emit::classify_scan_error`] recognises the failure BY TYPE
-/// through [`find_checked_float_div_error`] rather than by matching text in a
-/// message. The two variants stay distinct because a support case needs to tell
-/// a zero divisor from an overflow. [`checked_quotient`] classifies on the
-/// divisor, so `ZeroDivisor` is raised whenever the divisor is zero, including
-/// when the numerator is a non-finite value read from the source table.
-/// `NonFiniteResult` covers a non-finite result under a NON-ZERO divisor only:
-/// an overflow between two finite operands, or a non-finite operand read from
-/// the source table and divided by something other than zero.
+/// Recognised BY TYPE via [`find_checked_float_div_error`], never by message text. `ZeroDivisor`
+/// wins whenever the divisor is zero; `NonFiniteResult` covers any other non-finite quotient.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) enum CheckedFloatDivError {
-    /// The divisor was zero, of either sign — IEEE-754 `-0.0` equals `0.0`.
+    /// Either sign: IEEE-754 `-0.0` equals `0.0`.
     ZeroDivisor { numerator: f64, divisor: f64 },
-    /// The quotient was `±Inf` or `NaN` for some other reason: an overflow from
-    /// two finite operands, or a non-finite operand read from the source table.
+    /// An overflow from two finite operands, or a non-finite operand read from the table.
     NonFiniteResult {
         numerator: f64,
         divisor: f64,
@@ -81,14 +61,8 @@ impl fmt::Display for CheckedFloatDivError {
 
 impl Error for CheckedFloatDivError {}
 
-/// Find a checked-division failure anywhere on `error`'s source chain.
-///
-/// The chain's shape is this module's secret, not the caller's: DataFusion
-/// wraps a scalar function's error in `External`, and the layers above may wrap
-/// that again in `Context`, in `ArrowError::ExternalError`, or in an `Arc`.
-/// Walking `Error::source` and downcasting at every level recognises the failure
-/// through all of them, so no caller ever has to match message text — the
-/// coupling that would break on any wording change.
+/// DataFusion may wrap the error in `External`, `Context`, `ArrowError::ExternalError`, or an
+/// `Arc`; walking `Error::source` recognises it through all of them.
 pub(super) fn find_checked_float_div_error(
     error: &DataFusionError,
 ) -> Option<&CheckedFloatDivError> {
@@ -101,28 +75,16 @@ pub(super) fn find_checked_float_div_error(
     }
 }
 
-/// The first checked-division failure of one scan session.
-///
-/// DataFusion's Parquet row filter flattens ANY predicate error into
-/// `ArrowError::ComputeError(format!("Error evaluating filter predicate:
-/// {e:?}"))` (`datafusion-datasource-parquet` 54.1, `row_filter.rs`), which
-/// destroys the error's type — and a filter predicate is issue #370's own
-/// route. So for the very case the checked division exists to fix, the value
-/// cannot reach the classifier along the error chain, and recovering it from the
-/// flattened text would be exactly the message-matching coupling the spec
-/// forbids. The failure is recorded here as a typed value instead.
-///
-/// Scoped to the session that registered the function, which is one scan
-/// invocation, so no failure can survive into another. A recorded failure means
-/// the division DID raise during this scan, so naming it is never a false
-/// report even when another partition's error happened to surface first.
+/// DataFusion's Parquet row filter flattens any predicate error into
+/// `ArrowError::ComputeError(format!("Error evaluating filter predicate: {e:?}"))`
+/// (`datafusion-datasource-parquet` 54.1, `row_filter.rs`), destroying the type on exactly the
+/// #370 route, so the failure is also recorded here as a typed value. Scoped to one session,
+/// i.e. one scan invocation.
 #[derive(Debug, Default)]
 struct RaisedFailure(OnceLock<CheckedFloatDivError>);
 
 impl RaisedFailure {
-    /// Keep the FIRST failure. DataFusion evaluates partitions concurrently and
-    /// only one of their errors reaches the caller, but every checked-division
-    /// failure of one query names the same defect in the same query.
+    /// Partitions run concurrently but every failure names the same defect, so the first suffices.
     fn record(&self, failure: CheckedFloatDivError) {
         let _ = self.0.set(failure);
     }
@@ -132,13 +94,7 @@ impl RaisedFailure {
     }
 }
 
-/// The checked-division failure `session` recorded, if its checked division
-/// raised during this scan.
-///
-/// The lookup goes through the session's own function registry, so the recorded
-/// value is reached BY TYPE — never by matching text in a message — even on the
-/// route that flattened the error. See [`RaisedFailure`] for why that route
-/// exists.
+/// Reached by type through the session's function registry; see [`RaisedFailure`].
 pub(super) fn session_checked_float_div_failure(
     session: &SessionContext,
 ) -> Option<CheckedFloatDivError> {
@@ -150,18 +106,10 @@ pub(super) fn session_checked_float_div_failure(
         .recorded()
 }
 
-/// [`ScalarUDFImpl`] for [`CHECKED_FLOAT_DIV_FN`]: divides two operands as
-/// `DOUBLE` and raises rather than returning a value Exasol cannot represent.
-///
-/// Accepts any two argument types (`Signature::any`) and casts both to
-/// `Float64` itself, because the pairing a pushed `FLOAT_DIV` really sees varies
-/// with the source table's column types — an Iceberg `long` arrives as
-/// `Decimal128(20, 0)` on one side and an `Int64` literal on the other.
-/// Declared `Immutable` so DataFusion treats two evaluations over equal input as
-/// equal, which keeps the expression eligible for the same plan-level handling
-/// any other scalar expression receives — including the Parquet row filter,
-/// where a guard conjunct evaluated ahead of the division is what keeps a
-/// guarded division from raising.
+/// `Signature::any` with a self-cast to `Float64`, because pushed operand types vary (an Iceberg
+/// `long` arrives as `Decimal128(20, 0)` against an `Int64` literal). `Immutable` keeps it
+/// eligible for the Parquet row filter, where a guard conjunct evaluated first stops a guarded
+/// division from raising.
 #[derive(Debug)]
 struct CheckedFloatDivUdf {
     signature: Signature,
@@ -177,9 +125,7 @@ impl CheckedFloatDivUdf {
     }
 }
 
-/// Identity is the function's signature alone. Two registrations of this
-/// function are the same function to DataFusion's plan comparison; the recorded
-/// failure is one session's state, not part of what the function IS.
+/// The recorded failure is session state, not identity, so it is excluded from plan comparison.
 impl PartialEq for CheckedFloatDivUdf {
     fn eq(&self, other: &Self) -> bool {
         self.signature == other.signature
@@ -234,24 +180,14 @@ impl ScalarUDFImpl for CheckedFloatDivUdf {
     }
 }
 
-/// One operand widened to a `Float64` column of `rows` rows.
-///
-/// Reproduces Exasol's `FN_FLOAT_DIV`, which is always true float division
-/// typed `DOUBLE`: widening before dividing is what stops an `Int64 / Int64`
-/// pairing truncating the way DataFusion's own `/` operator does (#186). A
-/// scalar argument expands to the batch's row count here, so the division below
-/// sees two equal-length columns whichever side was a literal.
+/// Exasol's `FN_FLOAT_DIV` is always DOUBLE division; widening first avoids DataFusion's
+/// truncating `Int64 / Int64` (#186).
 fn as_float64(value: &ColumnarValue, rows: usize) -> Result<Float64Array, DataFusionError> {
     let widened = arrow::compute::cast(&value.to_array(rows)?, &DataType::Float64)?;
     Ok(widened.as_primitive::<Float64Type>().clone())
 }
 
-/// Divide one batch, raising on the first row whose quotient is not finite.
-///
-/// A row `nulls` marks absent is skipped without dividing, so a NULL numerator
-/// over a zero divisor yields NULL rather than raising: a NULL row carries no
-/// value to divide. Both slices come from arrays of the batch's row count, the
-/// contract DataFusion holds for every argument of a scalar function.
+/// A NULL row is skipped without dividing, so NULL over zero yields NULL rather than raising.
 fn divide_checked(
     left: &[f64],
     right: &[f64],
@@ -268,14 +204,9 @@ fn divide_checked(
     Ok(quotients)
 }
 
-/// One row's quotient, or the reason it has no representable value.
-///
-/// Exasol admits no non-finite `DOUBLE` — it rejects `CAST('inf' AS DOUBLE)` at
-/// `22018` and `1E400` at `22003` — so no non-finite quotient is ever a correct
-/// answer, whether it came from a zero divisor or from an overflow between two
-/// finite operands. `divisor == 0.0` classifies the cause AFTER the finiteness
-/// test rather than before it, which is also what makes `-0.0` a division by
-/// zero: IEEE-754 compares it equal to `0.0`.
+/// Exasol admits no non-finite DOUBLE (rejects `CAST('inf' AS DOUBLE)` at `22018`, `1E400` at
+/// `22003`), so no non-finite quotient is ever correct. Checking `divisor == 0.0` after the
+/// finiteness test also classifies `-0.0` as zero.
 fn checked_quotient(numerator: f64, divisor: f64) -> Result<f64, CheckedFloatDivError> {
     let quotient = numerator / divisor;
     if quotient.is_finite() {
@@ -291,17 +222,8 @@ fn checked_quotient(numerator: f64, divisor: f64) -> Result<f64, CheckedFloatDiv
     })
 }
 
-/// Register [`CHECKED_FLOAT_DIV_FN`] on `ctx` so rendered SQL text can call it.
-///
-/// Called ONCE per session, from
-/// [`build_session_context`](crate::scan::object_store::build_session_context),
-/// unconditionally and without inspecting whether the spec's SQL contains a
-/// division: the raw-row path, the broadcast-join path, and both
-/// partial-aggregate paths splice the same rendered filter, projection,
-/// `ORDER BY`, `GROUP BY`, and aggregate-argument strings, so one registration
-/// there reaches every pushed expression the scan can evaluate. A spec with no
-/// division is unaffected — the registration adds one entry to the session's
-/// function registry and changes no generated SQL, plan shape, or result.
+/// Registered unconditionally once per session: every scan path splices the same rendered
+/// expressions, and a spec with no division is unaffected.
 pub(super) fn register_checked_float_div_udf(ctx: &SessionContext) {
     ctx.register_udf(ScalarUDF::from(CheckedFloatDivUdf::new()));
 }

@@ -1,25 +1,19 @@
 SHELL := /bin/bash
 
 EXASOL_IMAGE     ?= exasol/docker-db:2025.1.16
-# The docker-db image has no password env var; this is the image's built-in SYS default,
-# used only to build DSNs below.
+# The docker-db image's built-in SYS default; it has no password env var.
 EXASOL_SYS_PASSWORD ?= exasol
 
 export EXASOL_IMAGE
 export EXASOL_SYS_PASSWORD
 
-# Absolute path of this repository root.
 LAKEHOUSE_ENGINE_DIR := $(abspath $(dir $(lastword $(MAKEFILE_LIST))))
 
-# Rust builder image — MUST match the SLC toolchain and glibc (Trixie = 2.41).
-# Never run `cargo build --release` on the host — the SDK fingerprint embeds
-# the rustc hash, so a host-built .so is rejected by the SLC at load time.
+# MUST match the SLC toolchain and glibc (Trixie = 2.41): the SDK fingerprint
+# embeds the rustc hash, so a host-built .so is rejected by the SLC at load time.
 UDF_BUILDER_IMAGE ?= rust:1.94-trixie
 
-# --- UDF .so artifact --------------------------------------------------------
-# Real-file target: `make` rebuilds ONLY when crate sources, manifest, or the
-# workspace lock change (mtime check). E2E targets depend on it so tests never
-# run against a stale binary — and an unchanged crate is a sub-second no-op.
+# Real-file target so E2E targets never run against a stale binary.
 VS_SO   := target/release/liblakehouse_engine.so
 VS_SRCS := $(shell find crates/lakehouse-engine/src crates/lakehouse-catalog/src crates/vs-expression/src -name '*.rs') \
            crates/lakehouse-engine/Cargo.toml \
@@ -29,16 +23,11 @@ VS_SRCS := $(shell find crates/lakehouse-engine/src crates/lakehouse-catalog/src
            .cargo/config.toml \
            Cargo.lock
 
-# Persistent cargo registry volume — downloads happen once, not on every docker
-# run. If all crates are re-downloaded the volume was dropped; it repopulates on
-# the next build.
 UDF_CARGO_VOL ?= lakehouse-engine-rs-udf-cargo-registry
 
-# Runs as the host UID:GID so target/release/** lands host-owned, not root-owned
-# (root-owned artifacts break a plain host `cargo clean`). The registry volume
-# outlives this recipe and may carry root-owned content from before this fix
-# (or from the image's own default ownership on first use) — normalize it to
-# the host user before the real build, regardless of the volume's history.
+# Runs as the host UID:GID so target/release/** is host-owned (root-owned
+# artifacts break a host `cargo clean`). The registry volume may hold root-owned
+# content, so it is chowned to the host user first.
 $(VS_SO): $(VS_SRCS)
 	docker run --rm -v $(UDF_CARGO_VOL):/usr/local/cargo/registry \
 	  $(UDF_BUILDER_IMAGE) chown -R $(shell id -u):$(shell id -g) /usr/local/cargo/registry
@@ -53,17 +42,13 @@ $(VS_SO): $(VS_SRCS)
 	    && cargo install cargo-exasol-udf --version "=$(SLC_VERSION)" --locked --quiet --root target/udf-tools \
 	    && PATH="$$PWD/target/udf-tools/bin:$$PATH" cargo exasol-udf validate $@'
 
-# Alias: build the .so if out of date.
 cross-udf-build: $(VS_SO)
 
 test:
 	cargo test
 
-# Host ports of the dedicated lakehouse-engine compose stack. Overridable so the
-# suite can always pick free ports; defaults match docker-compose.yml.
-# Exasol host. Defaults to localhost (Docker stack); the bench script
-# overrides it to target a remote cluster. install-slc / bucketfs-upload-so use
-# it so the same targets work against Docker and remote Exasol.
+# Port defaults match docker-compose.yml; bench/run.sh overrides EXASOL_HOST to
+# target a remote cluster.
 EXASOL_HOST      ?= localhost
 LH_EXASOL_PORT   ?= 28563
 LH_BUCKETFS_PORT ?= 22581
@@ -75,57 +60,28 @@ export LH_BUCKETFS_PORT
 export LH_MINIO_PORT
 export LH_REST_PORT
 
-# E2E tests require a live Exasol + MinIO + Iceberg REST catalog stack.
-# They FAIL (not skip) when the stack is unavailable. All tests share one VS,
-# so the binary runs serially (--test-threads=1).
+# E2E suites FAIL (not skip) when their stack is unavailable, and run serially
+# because all tests share one VS.
 test-e2e: cross-udf-build
 	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test --test e2e_credential_exposure_test --test e2e_version_udf_test --test e2e_emit_declaration_test --test e2e_direct_storage_test -- --test-threads=1
 
-# Lakekeeper E2E tests require a live Exasol + MinIO + Lakekeeper + Keycloak
-# stack — bring it up first with the `docker-compose.lakekeeper.yml` overlay:
+# Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
 #     minio exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
-# They FAIL (not skip) when the stack is unavailable — same contract as
-# test-e2e. All tests share one VS, so the binary runs serially
-# (--test-threads=1).
 test-e2e-lakekeeper: cross-udf-build
 	cargo test --features lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
-# Azure E2E tests require a live Exasol + Lakekeeper + Keycloak stack — bring
-# it up with the `docker-compose.lakekeeper.yml` + `docker-compose.lakekeeper.azure.yml`
-# overlays:
+# Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
 #     -f docker-compose.lakekeeper.azure.yml up -d --wait \
 #     exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
-# Also requires real Azure Blob Storage credentials. Credentials come from a
-# gitignored ./test.env (see test.env.example) when present, or from the
-# environment otherwise (e.g. CI secrets). They FAIL (not
-# skip) when unavailable — same contract as test-e2e. All tests share one VS,
-# so the binary runs serially (--test-threads=1).
-#
-# The `if [ -f ./test.env ]; ...; fi; cargo test ...` sourcing and the cargo
-# invocation MUST stay on a single recipe line: make runs each recipe line in
-# its own shell, so splitting them would discard every sourced variable before
-# cargo starts, making a missing-credential failure look like a recipe bug.
+# plus real Azure Blob Storage credentials from ./test.env or the environment.
+# Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-azure: cross-udf-build
 	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --features azure-e2e --test e2e_azure_test -- --test-threads=1
 
-# Install and register the Rust SLC (SLC_VERSION) into Exasol under the RUST alias.
-#
-# This Exasol is the dedicated lakehouse-engine stack (the sibling stack
-# is stopped), so we register the canonical RUST alias cleanly. The Rust E2E
-# harness performs the same install in-process via `setup_e2e`; this target is
-# the equivalent manual / convenience path.
-#
-# Steps:
-#   1. Download lc-rust-$(SLC_VERSION).tar.gz from GitHub releases.
-#   2. Upload it to BucketFS at /default/slc/lakehouse-rustslc.tar.gz.
-#   3. ALTER SYSTEM SET SCRIPT_LANGUAGES = '... RUST=...' (replacing any
-#      pre-existing RUST= entry).
-#
-# BucketFS write password is extracted at runtime from EXAConf.
-# Set BUCKETFS_WRITE_PASS env var to skip the docker-exec extraction.
-# Derived from the workspace `exasol-udf-sdk` pin; override on the command line.
+# Manual equivalent of the E2E harness's in-process `setup_e2e` SLC install.
+# Set BUCKETFS_WRITE_PASS to skip extracting it from EXAConf via docker exec.
 SLC_VERSION ?= $(shell sed -n 's/^exasol-udf-sdk[[:space:]]*=.*version[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' Cargo.toml)
 ARCH ?= x86_64
 ARCH_NORMALIZED := $(if $(filter arm64,$(ARCH)),aarch64,$(ARCH))
@@ -139,8 +95,7 @@ endif
 SLC_RELEASE_URL ?= https://github.com/exasol-labs/language-container-rs/releases/download/v$(SLC_VERSION)/lc-rust-$(SLC_VERSION)$(SLC_ARCH_SUFFIX).tar.gz
 EXASOL_CONTAINER ?= lakehouse-engine-rs-exasol-1
 
-# The single owner of how the SLC version is read out of the workspace manifest;
-# bench/run.sh consumes this rather than re-encoding the expression.
+# Single owner of the SLC version expression; bench/run.sh consumes it.
 print-slc-version:
 	@echo $(SLC_VERSION)
 
@@ -177,9 +132,7 @@ install-slc:
 	  -d "exasol://sys:$(EXASOL_SYS_PASSWORD)@$(EXASOL_HOST):$(LH_EXASOL_PORT)?validateservercertificate=0"
 	@echo "=== install-slc: done ==="
 
-# Upload the compiled .so to BucketFS.
-# The .so is uploaded to /default/udf/liblakehouse_engine.so and is referenced
-# from the CREATE SCRIPT body via %udf_object.
+# Referenced from the CREATE SCRIPT body via %udf_object.
 SO_BUCKETFS_PATH := /default/udf/liblakehouse_engine.so
 
 bucketfs-upload-so: $(VS_SO)
@@ -206,54 +159,32 @@ fmt:
 lint:
 	cargo clippy --all-targets
 
-# Local reproduction of CI's coverage gate. MUST stay flag-identical to the
-# `cargo llvm-cov` step in ci.yml's unit-tests job, which is the authority — a
-# target that drifts reports a number the Quality Gate does not. Deliberately
-# NOT a prerequisite of `test`: llvm-cov relinks every workspace target on each
-# run, and link time dominates this workspace (.cargo/config.toml).
-#
-# Prereqs (CI installs both):
-#   cargo install cargo-llvm-cov --version 0.8.7
-#   rustup component add llvm-tools-preview
+# MUST stay flag-identical to the `cargo llvm-cov` step in ci.yml's unit-tests
+# job, which is the authority. Not a prerequisite of `test`: llvm-cov relinks
+# every target and link time dominates this workspace.
+# Prereqs: cargo install cargo-llvm-cov --version 0.8.7; rustup component add llvm-tools-preview
 coverage:
 	cargo llvm-cov --workspace --lcov --output-path lcov-unit.info
 
-# Pure-bash unit tests for deploy/scripts/install.sh. Stubs exapump and curl on
-# a temp PATH — no live Exasol, no network. CI's install-script job runs this;
-# install-script-e2e (docker-based, real Exasol) is separate and lives only in
-# ci.yml, since it needs a live compose stack this target does not bring up.
 test-install:
 	bash deploy/scripts/tests/install.test.sh
 
-# Optional: gated on shellcheck being present locally so it's not a hard
-# prereq for `make`. CI's install-script job runs shellcheck unconditionally.
 lint-install:
 	@command -v shellcheck >/dev/null 2>&1 \
 	  && shellcheck -s bash deploy/scripts/install.sh deploy/scripts/tests/install.test.sh \
 	  || echo "shellcheck not installed locally — skipping (CI enforces it)"
 
-# Offline stubbed-PATH harness for the AWS Lakekeeper catalog deliverables (deploy/lakekeeper-stack/,
-# lakekeeper-provision.sh, lakekeeper-up.sh, lakekeeper-down.sh). Stubs tofu/aws/ssh/curl/jq on a
-# temp PATH and asserts recorded arguments, rendered template contents, credential hygiene, and
-# every emitted JSON request body — no live AWS, no network. Mirrors test-install's pattern
-# (deploy/scripts/tests/install.test.sh) for the same shell-deliverable regression-coverage reason.
-# NOT wired into CI: unlike install.sh (fetched straight off main by every user's curl|bash
-# one-liner), these scripts have no such exposure and no workflow gates any of the four existing
-# deploy/ stacks — see plan.md task 5.3 (specs/_recorded or specs/_plans/add-lakekeeper-aws-perf-catalog).
+# Not wired into CI: unlike install.sh (fetched off main by users' curl|bash
+# one-liner), these deploy/ scripts have no such exposure.
 test-lakekeeper-scripts:
 	bash deploy/scripts/tests/lakekeeper.test.sh
 
-# Local Docker integration verification: drives the real lakekeeper-provision.sh twice against the
-# docker-compose.lakekeeper.yml stack (postgres + keycloak + lakekeeper), asserting idempotent
-# bootstrap/warehouse creation and register-by-reference round-trips. FAILS (not skips) when that
-# stack is down — bring it up first:
+# FAILS (not skips) when the stack is down. Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
 #     minio keycloak lakekeeper-db lakekeeper-migrate lakekeeper
 test-lakekeeper-local:
 	bash deploy/scripts/tests/lakekeeper-local.test.sh
 
-# Optional: gated on shellcheck being present locally, same as lint-install. Not run by any CI
-# job (see test-lakekeeper-scripts above) — this is a local pre-commit check only.
 lint-lakekeeper-scripts:
 	@if command -v shellcheck >/dev/null 2>&1; then \
 	  shellcheck -s bash deploy/scripts/lakekeeper-provision.sh deploy/scripts/lakekeeper-up.sh \
@@ -262,23 +193,13 @@ lint-lakekeeper-scripts:
 	  echo "shellcheck not installed locally — skipping (no CI job runs it for these scripts)"; \
 	fi
 
-# Manually-invoked live benchmark: docker (self-contained local stack) or remote
-# (real AWS S3 + Glue Iceberg TPC-H + external Exasol cluster). Builds the
-# working-tree .so, then runs bench/run.sh, which reads config from a gitignored
-# bench/.env (see bench/.env.example). NOT part of CI — test-e2e stays the path.
+# Reads a gitignored bench/.env (see bench/.env.example); a stray one silently
+# targets a remote cluster.
 bench: cross-udf-build
 	./bench/run.sh
 
-# Native Unity Catalog + Delta fixture harness (spike #325 — gates #318-#322).
-# Brings up MinIO + Unity Catalog OSS via the docker-compose.unity.yml overlay,
-# then seeds the vendored Delta fixtures (deletion vector + column mapping) onto
-# MinIO and registers them in Unity Catalog. FAILS (not skips) if the stack or
-# seed cannot come up. `exasol` is included so the UDF can reach the
-# `unitycatalog` service name over the docker network (extra_hosts loop in the
-# overlay).
-#   Read path proven by the spike: UC resolve -> UC vend a real MinIO STS session ->
-#   delta-kernel-rs reads from MinIO with a CLIENT-SIDE endpoint override
-#   (UC OSS has no S3-endpoint config, upstream #43). See SPIKE_UC_DELTA_HARNESS.md.
+# `exasol` is included so the UDF can reach the `unitycatalog` service name over
+# the docker network (extra_hosts in the overlay).
 unity-up:
 	docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
 	  minio exasol unitycatalog
@@ -288,13 +209,8 @@ unity-up:
 unity-down:
 	docker compose -f docker-compose.yml -f docker-compose.unity.yml down -v
 
-# Native Unity Catalog E2E — brings up the #325 harness then runs the UC
-# createVirtualSchema listing suite. Mirrors test-e2e: the .so is rebuilt if
-# stale, and the suite FAILS (not skips) when the stack is unavailable. All
-# tests share one VS, so the binary runs serially (--test-threads=1).
-# The cargo line MUST stay flag-identical to the `Run Unity Catalog E2E
-# suite` step in ci.yml's e2e-unity job, which is the authority — a target
-# that drifts runs a command the CI gate does not.
+# The cargo line MUST stay flag-identical to the `Run Unity Catalog E2E suite`
+# step in ci.yml's e2e-unity job, which is the authority.
 test-e2e-unity: cross-udf-build
 	$(MAKE) unity-up
 	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1

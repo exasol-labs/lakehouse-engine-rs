@@ -16,7 +16,7 @@ job execution role — no static keys.
 
   spark-submit make_deletes_remote.py <warehouse_s3_uri> [source_ns=tpch] [target_ns=tpch_deletes]
 
-DELETE LOGIC IS A DELIBERATE DUPLICATION OF scripts/spark-fixtures/create_tpch_deletes.sql (task A.1).
+DELETE LOGIC IS A DELIBERATE DUPLICATION OF scripts/spark-fixtures/create_tpch_deletes.sql.
 That .sql file is the single source of truth for the docker-mode caller (bench/make_deletes_docker.sh),
 but an EMR Serverless job runs from a lone S3 entrypoint with no access to other repo files at
 runtime, so the CREATE+DELETE pairs are reimplemented here natively. The two MUST be kept in
@@ -29,12 +29,10 @@ import sys
 
 from pyspark.sql import SparkSession
 
-# The remote Iceberg catalog is always `glue` here (createVirtualSchema wiring + spark_queries.py).
 CATALOG = "glue"
 
-# (table, surrogate_key) — MUST match create_tpch_deletes.sql exactly (see module docstring).
-# LINEITEM is keyed on l_orderkey (NOT l_linenumber) so its position deletes spread across all of
-# LINEITEM's data files; PARTSUPP on ps_partkey deletes all suppliers for ~5% of parts (uniform ~5%).
+# MUST match create_tpch_deletes.sql. lineitem is keyed on l_orderkey so its position deletes spread
+# across all data files.
 TABLES = [
     ("region", "r_regionkey"),
     ("nation", "n_nationkey"),
@@ -46,9 +44,7 @@ TABLES = [
     ("lineitem", "l_orderkey"),
 ]
 
-# format-version=2 + merge-on-read is what makes `DELETE FROM` commit Parquet POSITION deletes (the
-# read path this benchmark exercises); copy-on-write would rewrite data files instead. Verbatim from
-# create_tpch_deletes.sql's TBLPROPERTIES.
+# Merge-on-read makes `DELETE FROM` commit position deletes; copy-on-write would rewrite data files.
 TBLPROPERTIES = (
     "'format-version'='2',"
     "'write.delete.mode'='merge-on-read',"
@@ -84,8 +80,7 @@ def main():
 
     print(f"authoring {CATALOG}.{target_ns} from {CATALOG}.{source_ns} (5% MOR position-deletes)", flush=True)
 
-    # Idempotency: this is a one-time job and the SQL has no DROP (fails loudly on a dirty target), so
-    # skip cleanly if every target table is already present rather than double-CTAS / double-DELETE.
+    # Re-running would double-DELETE and break the 5% contract.
     already = existing_target_tables(spark, target_ns)
     if all(t in already for t, _ in TABLES):
         print(f"SKIP: {CATALOG}.{target_ns} already has all {len(TABLES)} tables — nothing to do", flush=True)

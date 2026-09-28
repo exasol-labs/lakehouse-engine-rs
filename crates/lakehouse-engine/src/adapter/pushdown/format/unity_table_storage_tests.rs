@@ -1,7 +1,6 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY};
 
-/// Every effective-storage secret is masked, and only the secrets are.
 #[test]
 fn redacted_masks_every_effective_storage_secret_in_a_raised_error() {
     let readable = "failed to resolve the current Delta version for table root \

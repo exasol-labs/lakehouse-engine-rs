@@ -1,5 +1,4 @@
-//! Compile-time reachability probe for the `scan` module's public surface,
-//! from an external-crate vantage.
+//! Compile-time reachability probe for the `scan` module's public surface.
 #![allow(unused_imports)]
 
 use lakehouse_engine::scan::spec::StorageBackend;

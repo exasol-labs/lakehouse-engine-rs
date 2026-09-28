@@ -1,22 +1,6 @@
-//! TPC-H data loader for the live benchmark (NOT part of `make test-e2e`).
-//!
-//! Generates the 8 TPC-H tables with the `tpchgen` **core** row generators and
-//! builds workspace **arrow-58** `RecordBatch`es from the rows by hand (one column
-//! builder per field), then writes them into the local Docker Iceberg REST catalog
-//! (MinIO-backed), reusing the proven write path in `common::seed`
-//! (`build_seed_catalog` + `create_and_append_files`). Run by `bench/run.sh` in
-//! docker mode:
-//!
-//!   cargo test --features exasol-e2e --test tpch_loader -- --nocapture
-//!
-//! `tpchgen-arrow` is intentionally NOT used: it has no arrow-58 release
-//! (2.0.2→arrow 57, 3.0.0→arrow 59), whereas iceberg 0.10's writer expects
-//! arrow-58 batches. `tpchgen` core has zero dependencies (no arrow), so building
-//! the columns by hand keeps the whole dev graph on a single arrow-58 tree.
-//!
-//! Idempotent: a table that already has data files is skipped. Scale factor via
-//! `TPCH_SCALE` (default 0.3, ~300MB); target namespace via `NAMESPACE`
-//! (default `tpch`). Catalog/MinIO host-side URLs come from `common::stack`.
+//! TPC-H data loader for the live benchmark (not part of `make test-e2e`); run by
+//! `bench/run.sh`. Columns are built by hand from `tpchgen` core because `tpchgen-arrow`
+//! has no arrow-58 release. Idempotent: tables that already have data files are skipped.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;
@@ -38,29 +22,20 @@ use tpchgen::generators::{
     Supplier, SupplierGenerator,
 };
 
-// TPC-H money/quantity columns are all Decimal(15,2), matching the fixed scale the
-// generator emits. Kept as named constants so every column builder agrees.
 const TPCH_DECIMAL_PRECISION: u8 = 15;
 const TPCH_DECIMAL_SCALE: i8 = 2;
 
-/// Arrow `Decimal128(15,2)` column from an iterator of `TPCHDecimal` (stored as an
-/// i64 with 2 implied decimal places → i128 unscaled value, same as tpchgen-arrow).
 fn decimal_col(values: impl Iterator<Item = TPCHDecimal>) -> Decimal128Array {
     Decimal128Array::from_iter_values(values.map(|v| v.into_inner() as i128))
         .with_precision_and_scale(TPCH_DECIMAL_PRECISION, TPCH_DECIMAL_SCALE)
         .expect("Decimal(15,2) is within Decimal128 range")
 }
 
-/// Arrow `Date32` column (days since the Unix epoch) from an iterator of `TPCHDate`.
 fn date_col(values: impl Iterator<Item = TPCHDate>) -> Date32Array {
     Date32Array::from_iter_values(values.map(|d| d.to_unix_epoch()))
 }
 
-/// Arrow `Utf8` column from an iterator of any `Display` value. The generator's
-/// string fields are a mix of `&str` and small display wrappers (part/brand/clerk
-/// names, phone numbers, …); formatting each via `Display` reproduces exactly the
-/// bytes tpchgen-arrow wrote, now as `Utf8` (the string type iceberg 0.10's writer
-/// accepts, same as the other seed tables) instead of `Utf8View`.
+/// `Utf8`, not `Utf8View`: iceberg's writer accepts only `Utf8`.
 fn text_col<T: std::fmt::Display>(values: impl Iterator<Item = T>) -> StringArray {
     StringArray::from_iter_values(values.map(|v| v.to_string()))
 }
@@ -339,8 +314,7 @@ fn lineitem_schema() -> SchemaRef {
 }
 
 fn build_lineitem_batch(rows: &[LineItem<'_>]) -> RecordBatch {
-    // l_quantity is generated as a plain i64; tpchgen-arrow scales it to
-    // Decimal(15,2) as `(q as i128) * 100`, so 17 → 17.00. Reproduce that exactly.
+    // l_quantity is a plain integer; scale it to Decimal(15,2) as tpchgen-arrow does.
     let l_quantity =
         Decimal128Array::from_iter_values(rows.iter().map(|r| (r.l_quantity as i128) * 100))
             .with_precision_and_scale(TPCH_DECIMAL_PRECISION, TPCH_DECIMAL_SCALE)
@@ -378,8 +352,6 @@ fn build_lineitem_batch(rows: &[LineItem<'_>]) -> RecordBatch {
     .expect("lineitem RecordBatch construction is infallible")
 }
 
-/// Map an Arrow data type to the Iceberg primitive type (covers the TPC-H column
-/// types: integer keys, strings, dates, decimals, doubles).
 fn arrow_to_iceberg_type(dt: &DataType) -> Result<Type> {
     let p = match dt {
         DataType::Boolean => PrimitiveType::Boolean,
@@ -387,9 +359,6 @@ fn arrow_to_iceberg_type(dt: &DataType) -> Result<Type> {
         DataType::Int64 => PrimitiveType::Long,
         DataType::Float32 => PrimitiveType::Float,
         DataType::Float64 => PrimitiveType::Double,
-        // The loader builds string columns as Utf8 (the type iceberg's Parquet
-        // writer accepts); LargeUtf8/Utf8View are accepted too and recorded as
-        // Iceberg String.
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => PrimitiveType::String,
         DataType::Date32 => PrimitiveType::Date,
         DataType::Decimal128(precision, scale) => PrimitiveType::Decimal {
@@ -401,7 +370,6 @@ fn arrow_to_iceberg_type(dt: &DataType) -> Result<Type> {
     Ok(Type::Primitive(p))
 }
 
-/// Derive an Iceberg schema from an Arrow schema, assigning field IDs by position.
 fn arrow_schema_to_iceberg(schema: &ArrowSchema) -> Result<IcebergSchema> {
     let fields = schema
         .fields()
@@ -433,9 +401,7 @@ async fn load_tpch() -> Result<()> {
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.3);
     let namespace = std::env::var("NAMESPACE").unwrap_or_else(|_| "tpch".to_string());
-    // Number of Parquet files for the big tables (lineitem, orders). >1 makes the
-    // adapter's GROUP BY shard_key fan-out (one shard per file) observable. Small
-    // tables stay single-file. tpchgen's (scale, part, N) yields N disjoint parts.
+    // Files for lineitem/orders; >1 makes the shard_key fan-out observable.
     let files: i32 = std::env::var("TPCH_FILES")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -450,11 +416,7 @@ async fn load_tpch() -> Result<()> {
         "Loading TPC-H (SF={scale}, big tables in {files} files) into '{namespace}' at {catalog_url}"
     );
 
-    // Each TPC-H table: build N disjoint generator parts (one part per file),
-    // batch each part's rows into arrow-58 RecordBatches by hand, derive the
-    // Iceberg schema from the (static) Arrow schema, and create + append each part
-    // as its own data file (idempotent). A macro because the 8 generator/row types
-    // are distinct (no common trait object) and each has its own column builder.
+    // A macro because the 8 generator/row types share no common trait.
     macro_rules! load_table {
         ($gen:ty, $build:path, $schema:path, $name:literal, $nfiles:expr) => {{
             let n: i32 = $nfiles;

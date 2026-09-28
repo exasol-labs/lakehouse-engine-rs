@@ -66,7 +66,6 @@ variable "exasol_image_tag" {
   description = "c4 play target (@<tag>)."
 }
 
-# --- exa:* tag values -------------------------------------------------------
 variable "department" {
   type    = string
   default = "ENG"

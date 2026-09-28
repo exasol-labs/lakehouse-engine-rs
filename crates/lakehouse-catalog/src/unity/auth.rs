@@ -1,12 +1,5 @@
-//! The authentication strategy a `UnityCatalogSession` applies to every Unity
-//! Catalog REST request: a static personal-access-token bearer, a Databricks
-//! OAuth machine-to-machine client-credentials grant with a minted/cached/
-//! refreshed bearer, or no authentication for an OSS server whose auth is off.
-//!
-//! Every mode terminates in an `Authorization: Bearer` header or no header, so
-//! only a token's origin and lifecycle differ. The resolved bearer, the OAuth
-//! client secret, and the minted access token NEVER appear in any returned
-//! error: every grant error site strips them.
+//! The resolved bearer, the OAuth client secret, and the minted access token
+//! must never appear in any returned error.
 
 use crate::ConnectionCreds;
 use crate::creds::{SuppliedCatalogAuth, non_empty};
@@ -16,16 +9,12 @@ use serde::Deserialize;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Refresh a minted OAuth token this many seconds before its stated expiry, so a
-/// request never carries a bearer that expires in flight. The grant returns no
-/// refresh token, so the only renewal is a fresh mint.
+/// Refresh this early so a bearer never expires in flight; the grant returns no
+/// refresh token, so renewal is a fresh mint.
 const OAUTH_REFRESH_SKEW_SECS: u64 = 60;
 
-/// The default OAuth scope for the Databricks client-credentials grant.
 const OAUTH_DEFAULT_SCOPE: &str = "all-apis";
 
-/// How a request is authenticated: no header, a static PAT bearer, or an OAuth
-/// machine-to-machine bearer minted and cached by [`OAuthTokenSource`].
 pub(crate) enum UnityAuth {
     None,
     Pat(String),
@@ -33,10 +22,8 @@ pub(crate) enum UnityAuth {
 }
 
 impl UnityAuth {
-    /// Apply the resolved strategy to `builder`, returning the request builder
-    /// and the bearer token it now carries (if any), so the caller can strip that
-    /// live token from any error it surfaces even when the token was minted and
-    /// is not present in the CONNECTION credentials.
+    /// Also returns the bearer so callers can redact a minted token that is not
+    /// in the CONNECTION credentials.
     pub(crate) async fn apply(
         &self,
         builder: reqwest::RequestBuilder,
@@ -52,20 +39,15 @@ impl UnityAuth {
     }
 }
 
-/// A minted bearer and the instant at which it should be refreshed (its stated
-/// expiry minus the skew), so the hot path is a single instant comparison.
 struct CachedToken {
     token: String,
     refresh_at: Instant,
 }
 
-/// The monotonic clock the token cache reads, injected so the refresh decision is
-/// testable without a real clock.
+/// Injected so the refresh decision is testable without a real clock.
 type Clock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
-/// Mints, caches, and refreshes an OAuth machine-to-machine bearer via the
-/// client-credentials grant. One source per session, so a whole enumeration reuses
-/// a single minted token rather than re-granting per request.
+/// One source per session, so a whole enumeration reuses one minted token.
 pub(crate) struct OAuthTokenSource {
     client: reqwest::Client,
     token_url: String,
@@ -77,12 +59,9 @@ pub(crate) struct OAuthTokenSource {
 }
 
 impl OAuthTokenSource {
-    /// Return a valid bearer: reuse the cached token while it is still fresh, and
-    /// mint a new one once the cached token has reached its refresh point.
     pub(crate) async fn bearer(&self) -> Result<String, UdfError> {
         {
-            // The guard is released before any `.await`, so the returned future
-            // stays `Send` across the mint.
+            // Guard dropped before `.await` so the future stays `Send`.
             let cache = self.cache.lock().unwrap();
             if let Some(cached) = cache.as_ref()
                 && (self.clock)() < cached.refresh_at
@@ -100,10 +79,6 @@ impl OAuthTokenSource {
         Ok(token)
     }
 
-    /// Perform the client-credentials grant and return the minted token and its
-    /// `expires_in` seconds. HTTP Basic `client_id:client_secret`, body
-    /// `grant_type=client_credentials&scope=<scope>`. The client secret and any
-    /// partial token material are stripped from every returned error.
     async fn mint(&self) -> Result<(String, u64), UdfError> {
         let redact = |msg: &str| redact_error_text(msg, &[self.client_secret.as_str()]);
         let form = [
@@ -147,10 +122,7 @@ impl OAuthTokenSource {
                 "Unity Catalog OAuth client-credentials grant returned no access_token".into(),
             ));
         }
-        // An absent or zero `expires_in` gives the cache no lifetime to reason
-        // about: refreshing at `now` would re-mint on every request. Reject it as
-        // a grant error, mirroring the empty-`access_token` guard above, rather
-        // than silently defeating the cache.
+        // A zero/absent lifetime would re-mint on every request.
         let expires_in = parsed.expires_in.filter(|&secs| secs > 0).ok_or_else(|| {
             UdfError::User(
                 "Unity Catalog OAuth client-credentials grant returned no usable expires_in".into(),
@@ -167,12 +139,8 @@ struct OAuthTokenResponse {
     expires_in: Option<u64>,
 }
 
-/// Resolve the authentication strategy from the CONNECTION credentials: the
-/// mode is selected by [`ConnectionCreds::supplied_catalog_auth`], never
-/// re-derived here.
-///
 /// Synchronous by design: the OAuth grant is deferred to the first request, so
-/// building a session issues no request and an empty enumeration mints no token.
+/// building a session issues no request.
 pub(crate) fn resolve_unity_auth(
     client: &reqwest::Client,
     address: &str,

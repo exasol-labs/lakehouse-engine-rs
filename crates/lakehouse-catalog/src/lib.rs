@@ -1,8 +1,4 @@
-//! Iceberg REST catalog access: session resolution, authentication, namespace
-//! enumeration, vended-storage-credential resolution, SigV4 request signing,
-//! credential redaction, the four shared credential types (`CatalogProps`,
-//! `ConnectionCreds`, `StorageCreds`, `StorageProps`), and the `StorageBackend`
-//! that selects which object storage a scan reads through.
+//! Iceberg REST and Unity Catalog access for the lakehouse engine.
 
 mod auth;
 mod client;

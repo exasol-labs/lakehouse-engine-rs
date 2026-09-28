@@ -1,8 +1,6 @@
 use super::super::test_support::*;
 use super::*;
 
-/// The fixed column universe every classifier case validates against: one
-/// numeric DECIMAL, one non-numeric VARCHAR, one DECIMAL id.
 fn col_types() -> Vec<(String, String)> {
     vec![
         ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
@@ -11,8 +9,6 @@ fn col_types() -> Vec<(String, String)> {
     ]
 }
 
-/// A GROUP BY over a NUMERIC aggregate (`SUM(AMOUNT)`) classifies as the
-/// decomposable grouped shape, carrying no HAVING.
 #[test]
 fn grouped_numeric_aggregate_classifies_as_grouped() {
     let req = serde_json::json!({
@@ -34,9 +30,6 @@ fn grouped_numeric_aggregate_classifies_as_grouped() {
     );
 }
 
-/// A GROUP BY over a NON-numeric aggregate (`SUM(NAME)`, VARCHAR) with NO HAVING
-/// fails the numeric gate and falls through to the qualified wrapper — never a
-/// grouped decomposition, never a bare row scan.
 #[test]
 fn grouped_non_numeric_without_having_falls_through_to_wrapper() {
     let req = serde_json::json!({
@@ -54,10 +47,6 @@ fn grouped_non_numeric_without_having_falls_through_to_wrapper() {
     );
 }
 
-/// A GROUP BY over a NON-numeric aggregate that ALSO carries a HAVING no
-/// longer hard-errors: the gate failure falls through to the qualified
-/// wrapper exactly like its no-HAVING sibling above, because the wrapper
-/// renders the HAVING natively rather than dropping it.
 #[test]
 fn grouped_non_numeric_with_having_falls_through_to_wrapper() {
     let req = serde_json::json!({
@@ -76,10 +65,6 @@ fn grouped_non_numeric_with_having_falls_through_to_wrapper() {
     );
 }
 
-/// A HAVING referencing an aggregate absent from the select list
-/// (`SUM(AMOUNT)` when only `COUNT(*)` was projected) cannot render over
-/// the merge, so the classifier falls through to the wrapper rather than
-/// erroring or committing to `Grouped` (issue #195).
 #[test]
 fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
     let req = serde_json::json!({
@@ -102,10 +87,6 @@ fn grouped_having_unmatched_aggregate_falls_through_to_wrapper() {
     );
 }
 
-/// A mixed AND junction where one child matches a select-list plan
-/// (`COUNT(*) > 0`) and one does not (`SUM(AMOUNT) > 10`) must route to
-/// the wrapper as a whole — a partially-matching junction never renders a
-/// partial HAVING.
 #[test]
 fn grouped_having_mixed_junction_falls_through_to_wrapper() {
     let req = serde_json::json!({
@@ -138,12 +119,6 @@ fn grouped_having_mixed_junction_falls_through_to_wrapper() {
     );
 }
 
-/// A HAVING whose aggregate IS present in the select list still decomposes:
-/// the classifier returns `Grouped` with the ALREADY-RENDERED merge SQL
-/// (`PARTIAL_sum_0`), not the raw source-column reference. This must fail
-/// on an implementation that routes every HAVING-carrying grouped request
-/// to the wrapper — a bare `matches!(shape, Grouped { .. })` would not
-/// catch that regression, since the field type changed to `Option<String>`.
 #[test]
 fn grouped_having_fully_matched_stays_grouped() {
     let req = serde_json::json!({
@@ -177,10 +152,6 @@ fn grouped_having_fully_matched_stays_grouped() {
     }
 }
 
-/// A `COUNT(DISTINCT ID)` in the HAVING is the third route to the same
-/// `None`: `parse_agg_item` rejects `distinct: true` unconditionally, so
-/// `render_having_over_merge`'s internal `parse_agg_item(node)?`
-/// short-circuits before any plan lookup. Falls through to the wrapper.
 #[test]
 fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
     let req = serde_json::json!({
@@ -203,13 +174,6 @@ fn grouped_having_distinct_aggregate_falls_through_to_wrapper() {
     );
 }
 
-/// Issue #198's own grouped repro — a GROUP-KEY-ONLY select list ordered by an
-/// aggregate absent from it, plus a `LIMIT` (`SELECT c_nationkey FROM CUSTOMER
-/// GROUP BY c_nationkey ORDER BY SUM(c_acctbal) DESC LIMIT 5`) — reaches the
-/// wrapper through an EMPTY aggregate-plan list: its lone select item classifies
-/// as a group key, so grouped detection succeeds with zero plans, the numeric
-/// gate passes vacuously, and the sort key then resolves against zero plans. It
-/// is NOT filtered out ahead of detection, and it MUST NOT error.
 #[test]
 fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only() {
     let req = serde_json::json!({
@@ -238,9 +202,6 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
     );
 }
 
-/// The same unresolvable outcome from the OTHER direction: the select list
-/// carries a DIFFERENT aggregate (`COUNT(*)`), so the plan list is NON-empty and
-/// the sort key simply matches none of it. Same route, different plan-list state.
 #[test]
 fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper() {
     let req = serde_json::json!({
@@ -272,10 +233,6 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
     );
 }
 
-/// A RESOLVABLE grouped `ORDER BY` still decomposes, and the classifier carries
-/// the already-rendered clause on the shape — the dispatcher no longer resolves
-/// it, so a classifier that always returned `None` here would silently drop
-/// every grouped ordering.
 #[test]
 fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
     let req = serde_json::json!({
@@ -302,8 +259,6 @@ fn grouped_order_by_group_key_classifies_grouped_with_resolved_clause() {
     }
 }
 
-/// A single-group NUMERIC aggregate (no GROUP BY) classifies as single-group,
-/// carrying its resolved items in select-list order.
 #[test]
 fn single_group_numeric_aggregate_classifies_as_single_group() {
     let req = serde_json::json!({
@@ -316,8 +271,6 @@ fn single_group_numeric_aggregate_classifies_as_single_group() {
     }
 }
 
-/// A single-group `COUNT(DISTINCT ID)` classifies as single-group (the non-empty
-/// renderer decides the lone-fan-out vs wrapper sub-split, not the classifier).
 #[test]
 fn single_group_count_distinct_classifies_as_single_group() {
     let req = serde_json::json!({
@@ -330,7 +283,6 @@ fn single_group_count_distinct_classifies_as_single_group() {
     );
 }
 
-/// A plain projection (no aggregate, no GROUP BY) classifies as a row scan.
 #[test]
 fn plain_projection_classifies_as_row_scan() {
     let req = serde_json::json!({
@@ -346,8 +298,6 @@ fn plain_projection_classifies_as_row_scan() {
     );
 }
 
-/// A NON-numeric single-group aggregate (`SUM(NAME)`, VARCHAR, no GROUP BY) fails
-/// the numeric gate and demotes to a row scan (same gate as the grouped tier).
 #[test]
 fn non_numeric_single_group_aggregate_demotes_to_row_scan() {
     let req = serde_json::json!({

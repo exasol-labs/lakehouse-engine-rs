@@ -13,7 +13,6 @@ use parquet::arrow::ArrowWriter;
 use std::path::Path;
 use std::sync::Arc;
 
-/// Write one single-batch Parquet file of non-nullable columns, returning its `file://` URL.
 pub(super) fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> String {
     let schema = Arc::new(Schema::new(
         columns
@@ -32,7 +31,6 @@ pub(super) fn write_parquet(path: &Path, columns: Vec<(&str, ArrayRef)>) -> Stri
         .to_string()
 }
 
-/// Drive the production scan path (`register_files` then `build_scan_sql`) over `spec`.
 pub(super) async fn run_scan(spec: &ScanSpec) -> Vec<RecordBatch> {
     try_run_scan(spec)
         .await

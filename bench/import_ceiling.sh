@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
-# Task 9: IMPORT FROM PARQUET goal-ceiling benchmark (NOT a spec feature).
-# Exasol's native MPP Parquet reader vs the VS UDF path, same lineitem files,
-# same far-VPC S3. Two comparisons:
-#   scan-only    — COUNT(*) over both forces a full read with ~no output, so the
-#                  delta is the UDF-layer overhead on top of the shared S3 read cost.
-#   data-intensive — full-materialization of every lineitem row/column into a real
-#                  Exasol table: native IMPORT INTO vs the VS `CREATE TABLE AS
-#                  SELECT *` (emit path). This is the apples-to-apples data-transfer
-#                  ceiling: both land identical data, so the delta is the UDF emit +
-#                  Arrow->Value overhead vs the native loader.
+# Native IMPORT FROM PARQUET vs the VS UDF path over the same lineitem files:
+#   scan-only      — COUNT(*) on both; the delta is the UDF-layer overhead on the shared S3 read.
+#   data-intensive — full materialization into an Exasol table (IMPORT INTO vs VS CTAS); the
+#                    delta is the UDF emit overhead vs the native loader.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 [ -f bench/.env ] && { set -a; . bench/.env; set +a; }
@@ -16,25 +10,18 @@ DSN="exasol://sys:${EXASOL_SYS_PASSWORD}@${EXASOL_HOST}:${LH_EXASOL_PORT:-8563}?
 ENDPOINT="${AWS_S3_ENDPOINT:-https://s3.${AWS_REGION}.amazonaws.com}"
 REPORT="${1:-/tmp/lh-import-ceiling.txt}"
 : > "$REPORT"
-# Same FAILED convention as bench/run.sh: without this the script always exits 0 (last command is
-# a plain echo) regardless of internal query failures, so a caller chaining this in
-# (bench-remote.sh's BENCH_RUN_CEILING) has no way to detect a fully-broken run.
 FAILED=0
 
-# lineitem data files from the newest resolved scan spec. Since the scan-spec-files-payload
-# change, the report embeds a table_root ("s3://bucket/.../lineitem") and per-file paths
-# RELATIVE to it ("data/<file>.parquet") rather than full per-file s3:// URLs, so reconstruct
-# them by joining the two (both are still there, just no longer pre-joined).
+# The newest bench report embeds the lineitem table_root and table-relative file paths.
 SRC_REPORT="$(ls -t bench/reports/bench-report-*.txt | head -1)"
 TABLE_ROOT="$(grep -oE 's3://[^"]*/lineitem' "$SRC_REPORT" | sort -u | head -1)"
 [ -n "$TABLE_ROOT" ] || { echo "ERROR: no lineitem table_root in ${SRC_REPORT:-<none>} (run make bench first)"; exit 1; }
 mapfile -t RELFILES < <(grep -oE 'data/[0-9a-f-]+\.parquet' "$SRC_REPORT" | sort -u)
 [ "${#RELFILES[@]}" -gt 0 ] || { echo "ERROR: no lineitem parquet files in ${SRC_REPORT}"; exit 1; }
 mapfile -t URLS < <(for f in "${RELFILES[@]}"; do printf '%s/%s\n' "$TABLE_ROOT" "$f"; done)
-# Bucket is DERIVED from the resolved paths, never hardcoded: the VS reads these exact
-# URLs, so IMPORT must target the same bucket or HeadObject ACCESS_DENIEs on a stale one.
+# IMPORT must target the bucket the VS reads, or HeadObject is ACCESS_DENIED on a stale one.
 BUCKET="$(printf '%s' "${URLS[0]}" | sed -E 's#^s3://([^/]+)/.*#\1#')"
-mapfile -t FILES < <(printf '%s\n' "${URLS[@]}" | sed -E 's#^s3://[^/]+/##')  # bucket-relative
+mapfile -t FILES < <(printf '%s\n' "${URLS[@]}" | sed -E 's#^s3://[^/]+/##')
 echo "files=${#FILES[@]} bucket=${BUCKET} endpoint=${ENDPOINT}" | tee -a "$REPORT"
 FILE_CLAUSES=""
 for f in "${FILES[@]}"; do FILE_CLAUSES="${FILE_CLAUSES} FILE '${f//\'/\'\'}'"; done
@@ -66,9 +53,6 @@ for i in 1 2 3; do run_timed "import_all_run$i" "SELECT COUNT(*) FROM (${IMPORT_
 echo "=== VS path: COUNT(*) FROM TPCH.LINEITEM, 3x ===" | tee -a "$REPORT"
 for i in 1 2 3; do run_timed "vs_count_run$i" "SELECT COUNT(*) FROM TPCH.LINEITEM"; done
 
-# ---- data-intensive: full materialization into real tables -------------------
-# Times a statement (no result-set count to parse), then reports the target
-# table's row count so both paths are asserted to land identical data.
 run_timed_load() {  # label  target_table  sql
   local label="$1" tbl="$2" sql="$3" t0 t1 out rc el cnt
   t0=$(date +%s.%N)
@@ -78,9 +62,6 @@ run_timed_load() {  # label  target_table  sql
   if [ $rc -ne 0 ]; then echo "  $label: FAILED rc=$rc :: $(printf '%s' "$out" | tail -2 | tr '\n' ' ')" | tee -a "$REPORT"; FAILED=1; return; fi
   cnt=$(printf '%s' "SELECT COUNT(*) FROM ${tbl}" | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')
   local rps; rps=$(awk "BEGIN{if(${el:-0}+0>0) printf \"%.0f\", ${cnt:-0}/${el}; else print \"n/a\"}")
-  # RAW_OBJECT_SIZE (bytes) from Exasol's own system view — the same "database raw size" metric
-  # the license cap (see run_timed_load's FAILED path elsewhere in this repo) already tracks, so
-  # it's a real, queryable per-table data-volume figure, not an estimate.
   local schema="${tbl%%.*}" tblname="${tbl##*.}" raw_bytes mb mbps
   raw_bytes=$(printf '%s' "SELECT RAW_OBJECT_SIZE FROM EXA_ALL_OBJECT_SIZES WHERE ROOT_NAME='${schema}' AND OBJECT_NAME='${tblname}'" \
     | exapump sql -d "$DSN" -f csv 2>/dev/null | tail -n +2 | head -1 | tr -d '"[:space:]')

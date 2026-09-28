@@ -3,8 +3,7 @@ use super::*;
 use crate::adapter::parquet_directory::MergeMode;
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType};
 
-/// Credentials whose SigV4 mode lets `CatalogSession::resolve` build a session
-/// without contacting a catalog, so selection is exercised against a closed port.
+/// SigV4 mode lets `CatalogSession::resolve` build a session without contacting a catalog.
 fn offline_sigv4_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "123456789012".into(),
@@ -27,13 +26,11 @@ fn offline_sigv4_creds() -> ConnectionCreds {
     }
 }
 
-/// A closed port: any request selection issued would fail loudly rather than
-/// silently succeed against a real catalog.
+/// Closed port: any request selection issued would fail loudly.
 const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
 
 const TABLE_NAME: &str = "cat.sch.orders";
 
-/// One loaded Unity Catalog table reporting `format`.
 fn unity_table(format: TableFormat) -> CatalogTable {
     CatalogTable {
         ident: CatalogTableIdent {
@@ -49,7 +46,6 @@ fn unity_table(format: TableFormat) -> CatalogTable {
     }
 }
 
-/// Scenario: The format reader is selected at one site and refuses a mismatched pairing
 #[test]
 fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     let creds = offline_sigv4_creds();
@@ -85,14 +81,6 @@ fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     );
 }
 
-/// Scenario: The format reader is selected at one site and refuses a mismatched
-/// pairing.
-///
-/// A Unity Catalog table reporting Delta passes the format check and selects its
-/// reader — the refusal above is scoped to the mismatch and does not reject the
-/// format this source exists to select. Selection issues no request: the catalog
-/// URI names a closed port, so a selection site that resolved the table's log or
-/// its credential over the network could not answer `Ok` here.
 #[test]
 fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_the_catalog() {
     let creds = offline_sigv4_creds();
@@ -121,12 +109,6 @@ fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_t
     }
 }
 
-/// Scenario: The format reader is selected at one site and refuses a mismatched
-/// pairing.
-///
-/// An Iceberg REST source selects its reader with no catalog request: the
-/// catalog URI names a closed port, so a selection site that resolved anything
-/// over the network could not answer `Ok` here.
 #[tokio::test]
 async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog() {
     let creds = offline_sigv4_creds();
@@ -157,8 +139,6 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
     );
 }
 
-// Selecting the reader must not touch the store: it holds no object, so listing or
-// footer-parsing here would fail.
 #[test]
 fn third_scan_source_selects_the_parquet_reader() {
     let creds = offline_sigv4_creds();
@@ -188,8 +168,7 @@ fn third_scan_source_selects_the_parquet_reader() {
     );
 }
 
-// Scenario Coverage (delta-type-mapping): A Delta table with no mappable column is refused as a
-// whole
+/// Scenario: A Delta table with no mappable column is refused as a whole
 #[test]
 fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {
     let refused = |column_name: &str, reason: &str| RefusedColumn {

@@ -1,27 +1,17 @@
 #!/usr/bin/env bash
-# Competitive engine comparison: AWS Athena vs the lakehouse engine, over the SAME Glue Iceberg
-# TPC-H tables. NOT a spec feature — manually invoked, like the rest of bench/. No new infra: the
-# Athena workgroup already exists in deploy/data-stack (`tofu output athena_workgroup`).
-#
-# Query text is the Presto/Trino dialect of bench/run.sh's Q1-Q9b — table names lowercase
-# (Glue/DuckDB dbgen writes lowercase TPC-H columns/tables). Reused verbatim by trino_compare.sh
-# and deploy/scripts/spark_queries.py; keep all three in sync if you edit one.
-#
-#   AWS_PROFILE=spot-strata-deployer ATHENA_WORKGROUP=spot-strata-test1-athena ./athena_compare.sh
-# No -e: run_timed must survive a failing query and report it as FAILED rather than aborting the
-# whole comparison — same convention as bench/import_ceiling.sh.
+# AWS Athena vs the lakehouse engine over the same Glue Iceberg TPC-H tables.
+# Query text is the Presto dialect of bench/run.sh's queries (lowercase names); keep in sync with
+# bench/trino_compare.sh and deploy/scripts/spark_queries.py.
+#   AWS_PROFILE=... ATHENA_WORKGROUP=... ./athena_compare.sh
+# No -e: a failing query is reported as FAILED instead of aborting the comparison.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 [ -f bench/.env ] && { set -a; . bench/.env; set +a; }
-# bench/.env's AWS_ACCESS_KEY_ID/SECRET are the scoped engine-reader creds (Glue+S3 read only,
-# for the Exasol CONNECTION) — they have no athena:* permissions. Unset them so the `aws` CLI
-# falls back to AWS_PROFILE / the default credential chain (the operator's own broader identity).
+# bench/.env's creds are the scoped engine reader without athena:* permissions; fall back to the
+# operator's own credential chain.
 unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN
 
 : "${ATHENA_WORKGROUP:?set ATHENA_WORKGROUP (deploy/data-stack: tofu output athena_workgroup)}"
-# BENCH_WITH_DELETES (same flag as bench/run.sh): explicit ATHENA_DATABASE override always wins;
-# otherwise "tpch" (baseline) or "tpch_deletes" (the Glue database
-# deploy/scripts/make-deletes-remote.sh authors) when the flag is on.
 WITH_DELETES="${BENCH_WITH_DELETES:-0}"
 if [ -z "${ATHENA_DATABASE:-}" ]; then
   ATHENA_DATABASE="tpch"
@@ -52,8 +42,6 @@ Q4="SELECT l_returnflag, l_linestatus, SUM(l_quantity) AS sum_qty, SUM(l_extende
 FROM lineitem WHERE l_shipdate <= DATE '1998-09-01'
 GROUP BY l_returnflag, l_linestatus ORDER BY l_returnflag, l_linestatus"
 
-# Q5-Q9b probe specific pushdown strengths/weaknesses beyond Q1-Q4 — identical SQL (dialect-
-# adjusted) in bench/run.sh, bench/trino_compare.sh, deploy/scripts/spark_queries.py.
 Q5="SELECT o.o_orderpriority, COUNT(*) AS cnt, SUM(l.l_extendedprice) AS revenue
 FROM orders o JOIN lineitem l ON o.o_orderkey = l.l_orderkey
 GROUP BY o.o_orderpriority ORDER BY o.o_orderpriority"
@@ -78,9 +66,6 @@ Q9B="SELECT COUNT(*),
        SUM(length(l_comment))
 FROM lineitem"
 
-# NQ1-NQ5 close the arithmetic-aggregate-pushdown gap + probe LIKE/IN filters, ORDER BY+LIMIT, a
-# 4-way join, and GROUP BY+HAVING — identical SQL (dialect-adjusted) in bench/run.sh,
-# bench/trino_compare.sh, deploy/scripts/spark_queries.py.
 NQ1="SELECT SUM(l_extendedprice * l_discount) AS revenue FROM lineitem
 WHERE l_shipdate >= DATE '1994-01-01' AND l_shipdate < DATE '1995-01-01'
   AND l_discount BETWEEN 0.05 AND 0.07 AND l_quantity < 24"
@@ -117,7 +102,7 @@ run_timed() {  # name sql
   if [ "$status" != "SUCCEEDED" ]; then
     echo "  $name: FAILED status=$status qid=$qid" | tee -a "$REPORT"; return
   fi
-  # Engine-only execution time (excludes queue/planning wait) — the apples-to-apples figure.
+  # Engine-only time excludes queue/planning wait, for an apples-to-apples figure.
   ms="$(aws athena get-query-execution --query-execution-id "$qid" \
     --query 'QueryExecution.Statistics.EngineExecutionTimeInMillis' --output text)"
   el="$(awk "BEGIN{printf \"%.2f\", ${ms}/1000}")"

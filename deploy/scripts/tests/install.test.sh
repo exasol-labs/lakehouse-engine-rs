@@ -1,16 +1,7 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC1090,SC2030,SC2031,SC2034
-# SC1090: $INSTALLER is a computed-but-stable path; shellcheck can't trace symbols across it, hence
-#   the SC2034 "unused" false positives below on vars only read inside the sourced file.
-# SC2030/SC2031: PATH/env changes are deliberately scoped to a subshell per test run, by design.
-# Test harness for deploy/scripts/install.sh. Plain bash, no framework, no jq.
-#
-# It stubs exapump/curl as fake executables on a temp PATH (recording their argv to a log
-# and returning canned output per scenario), sources the installer's pure functions directly for
-# unit checks, and drives the full installer through BOTH a saved-file invocation and the
-# stdin-piped `cat install.sh | bash -s -- ...` form. Covers every scenario in
-# specs/_plans/change-saas-install-github-token/packaging/saas-install-script/spec.md.
-#
+# SC1090/SC2034: symbols cross the sourced $INSTALLER, which shellcheck cannot trace.
+# SC2030/SC2031: PATH/env changes are scoped to a subshell per test run.
 # Run: bash deploy/scripts/tests/install.test.sh
 
 set -uo pipefail
@@ -44,7 +35,6 @@ count_occurrences() { # needle haystack -> count
   printf '%s' "$c"
 }
 
-# --- sandbox + stubs ---------------------------------------------------------
 SANDBOX="$(mktemp -d)"
 trap 'rm -rf "$SANDBOX"' EXIT
 
@@ -71,12 +61,8 @@ command -v python3 >/dev/null 2>&1 || {
   exit 1
 }
 
-# Runs install.sh under a real pseudo-terminal (both stdin and stdout), so ensure_exapump's
-# `[[ -t 0 && -t 1 ]]` interactive-prompt branch actually triggers -- every other invocation style
-# in this file (run_file, direct sourcing, command substitution) makes stdout a pipe, which is
-# exactly why that branch would otherwise go completely untested. Waits for the "[Y/n]" prompt
-# text to appear before writing $2, so this can't race a slow prompt. Sets LAST_OUT/LAST_RC like
-# the other run_* helpers.
+# A real pty is the only way to reach ensure_exapump's interactive branch; every other runner
+# makes stdout a pipe.
 run_with_pty() {
   local reply="$1"; shift
   local py_out py_out_file="$SANDBOX/pty.out"
@@ -424,17 +410,11 @@ STUB
 write_exapump_stub "$STUBDIR"
 write_curl_stub "$STUBDIR"
 write_exasol_stub "$STUBDIR"
-# missing-curl dir: exapump only (no curl)
 write_exapump_stub "$MISSING_CURL_DIR"
-# missing-exapump dir: curl only (no exapump)
 write_curl_stub "$MISSING_EXAPUMP_DIR"
 
-# autoinstall-exapump dir: curl only (no exapump), plus real bash+sh so the fetched exapump
-# "installer" (env+bash-shebang curl stub piped into a real sh) actually runs, unlike the
-# maximally-bare MISSING_* dirs above whose whole point is that NOTHING beyond the probed tool
-# works. AUTOINSTALL_TARGET_DIR simulates exapump's own install.sh already having dropped a
-# working binary at $EXAPUMP_INSTALL_DIR in a prior process -- ensure_exapump's job here is only
-# to notice it and prepend it to PATH.
+# Unlike the bare MISSING_* dirs, this has real bash+sh so the fetched installer runs.
+# AUTOINSTALL_TARGET_DIR stands in for where exapump's installer already dropped the binary.
 write_curl_stub "$AUTOINSTALL_DIR"
 ln -sf "$BASH_BIN" "$AUTOINSTALL_DIR/bash"
 _p="$(command -v sh 2>/dev/null)" && ln -sf "$_p" "$AUTOINSTALL_DIR/sh"
@@ -465,9 +445,6 @@ bfs_write_password = "BFSWRITEPW789"
 bfs_bucket = "custom"
 TOML
 
-# --- engine-archive fixtures --------------------------------------------------
-# GOOD: contains udf/liblakehouse_engine.so, the member the BucketFS target extracts and uploads.
-# BAD:  a well-formed .tar.gz WITHOUT that member, to prove extract_engine_so names what is absent.
 mkdir -p "$SANDBOX/fixture-good/udf" "$SANDBOX/fixture-bad/other"
 printf 'fake-elf-bytes\n' > "$SANDBOX/fixture-good/udf/liblakehouse_engine.so"
 printf 'unrelated\n' > "$SANDBOX/fixture-bad/other/readme.txt"
@@ -476,8 +453,7 @@ ENGINE_TARBALL_BAD="$SANDBOX/engine-bad.tar.gz"
 tar -czf "$ENGINE_TARBALL_GOOD" -C "$SANDBOX/fixture-good" udf
 tar -czf "$ENGINE_TARBALL_BAD" -C "$SANDBOX/fixture-bad" other
 
-# The release tag the curl stub serves as `releases/latest`, and the tag the exapump stub derives
-# its reported version from. Exported, not plain: both stubs run as separate processes on RUN_PATH.
+# Exported: the stubs run as separate processes.
 export STUB_DEFAULT_ENGINE_TAG="v0.26.3"
 
 write_local_deployment_fixture() {
@@ -526,14 +502,11 @@ chmod +x "$UNAME_PPC64LE_DIR/uname"
 NO_JQ_DIR="$SANDBOX/no-jq"
 mkdir -p "$NO_JQ_DIR"
 
-# --- a PATH with no `tar` -----------------------------------------------------
-# A symlink farm holding exactly the external commands install.sh needs, minus tar. Used as the
-# WHOLE PATH so `command -v tar` genuinely fails while everything else still works.
+# Used as the whole PATH: every command install.sh needs except tar.
 NOTAR_DIR="$SANDBOX/no-tar"
 mkdir -p "$NOTAR_DIR"
 write_exapump_stub "$NOTAR_DIR"
 write_curl_stub "$NOTAR_DIR"
-# `bash` is in the farm because the stubs' `#!/usr/bin/env bash` shebang resolves it through PATH.
 for _c in bash env mktemp mv rm cat tr cut mkdir sleep; do
   _p="$(command -v "$_c" 2>/dev/null)" && ln -sf "$_p" "$NOTAR_DIR/$_c"
 done
@@ -541,7 +514,6 @@ unset _c _p
 
 STUB_BFS_STATE="$SANDBOX/bfs-state.txt"
 export STUB_BFS_STATE
-
 
 reset_env() {
   unset GH_ENGINE_TAG GH_SLC_TAG GH_ASSET_MISSING GH_ASSET_TARBALL 2>/dev/null || true
@@ -552,7 +524,6 @@ reset_env() {
   unset CURL_POST_FAIL CURL_POST_URL_ESCAPED CURL_PUT_TRANSPORT_FAIL CURL_PUT_HTTP_CODE CURL_PUT_BODY CURL_LIST_MISSING CURL_LIST_SUFFIX_ONLY CURL_DB_UNREACHABLE 2>/dev/null || true
   unset EXAPUMP_DSN STUB_REPORT_STDIN EXAPUMP_AUTOINSTALL_FAIL EXAPUMP_INSTALL_DIR 2>/dev/null || true
   unset BUCKETFS_REACHABLE_TRIES BUCKETFS_REACHABLE_POLL_SECONDS 2>/dev/null || true
-  # Sandboxed exapump config so profile-mode runs never touch the real ~/.exapump/config.toml.
   export EXAPUMP_CONFIG="$EXAPUMP_CONFIG_FIXTURE"
   RUN_PATH="$STUBDIR:$ORIG_PATH"
   : > "$STUB_LOG"
@@ -566,14 +537,11 @@ run_file() {
 }
 
 run_stdin() {
-  # shellcheck disable=SC2002  # deliberate: this models the real `curl | bash` one-liner as a
-  # PIPE, not a redirect -- a redirect would still feed stdin correctly, but it would not be
-  # testing the pipe shape the docs actually tell users to run.
+  # shellcheck disable=SC2002  # models the documented `curl | bash` pipe shape, not a redirect.
   LAST_OUT="$( cat "$INSTALLER" | ( export PATH="$RUN_PATH"; exec "$BASH_BIN" -s -- "$@" ) 2>&1 )"
   LAST_RC=$?
 }
 
-# File-mode run whose OWN stdin carries a payload; used to prove subprocesses read /dev/null.
 run_file_with_stdin() {
   local payload="$1"; shift
   LAST_OUT="$( printf '%s' "$payload" | ( export PATH="$RUN_PATH"; exec "$BASH_BIN" "$INSTALLER" "$@" ) 2>&1 )"
@@ -582,24 +550,16 @@ run_file_with_stdin() {
 
 log_content() { printf '%s' "$(<"$STUB_LOG")"; }
 
-# Common valid arguments for a happy-path run (profile connectivity mode).
 HAPPY_ARGS=(--account-id ACC1 --database-id DB1 --profile staging)
-
-# BucketFS-target happy path: no SaaS ids at all, and a profile that carries bfs_write_password.
 BFS_HAPPY_ARGS=(--profile bfsprofile)
 
 BFS_RUST_SEGMENT="RUST=localzmq+protobuf:///bfsdefault/default/slc/lakehouse-rustslc?lang=rust#buckets/bfsdefault/default/slc/lakehouse-rustslc/exaudf/exaudfclient"
 BFS_SO_UDF_OBJECT="buckets/bfsdefault/default/udf/liblakehouse_engine.so"
 
-# Runs the installer against the BucketFS target with a real engine-archive fixture in place.
 run_file_bfs() {
   export GH_ASSET_TARBALL="$ENGINE_TARBALL_GOOD"
   run_file "$@"
 }
-
-# ============================================================================
-# Scenario tests
-# ============================================================================
 
 test_missing_prereq_fails_fast() {
   echo "== test_missing_prereq_fails_fast =="
@@ -610,10 +570,6 @@ test_missing_prereq_fails_fast() {
   assert_contains "missing curl: names curl" "$LAST_OUT" "curl"
   assert_contains "missing curl: gives install URL" "$LAST_OUT" "https://curl.se"
   assert_eq "missing curl: no network/SQL call made" "" "$(log_content)"
-
-  # A missing exapump is no longer a fail-fast prereq: ensure_exapump auto-installs it, so a
-  # network call IS made and expected. That full scenario (fetch success/failure, auto-install
-  # success/failure) is covered by test_exapump_auto_install; nothing belongs here for it anymore.
 }
 
 test_exapump_auto_install() {
@@ -941,12 +897,7 @@ test_version_resolution_default_and_override() {
 
 test_slc_version_defaults_to_engine_pin_not_slc_latest() {
   echo "== test_slc_version_defaults_to_engine_pin_not_slc_latest =="
-  # Regression test for #305: language-container-rs published v0.21.1 with no matching
-  # lakehouse-engine-rs release, and the installer's old default (query language-container-rs's
-  # own "latest" release) resolved v0.21.1 as the SLC version even though the latest ENGINE
-  # release was still built and fingerprinted against v0.21.0 -- a guaranteed fingerprint
-  # mismatch. The default must track the engine release's own exasol-udf-sdk pin instead, even
-  # when the two repos' "latest" releases disagree.
+  # #305: the SLC repo's latest release can be ahead of the engine's exasol-udf-sdk pin.
   reset_env
   local out
   out="$(
@@ -1011,7 +962,6 @@ test_script_languages_replace_rust_idempotent() {
   assert_eq "replace: in place, non-RUST unchanged" \
     "PYTHON3=p $RUST_SEGMENT JAVA=j" "$out"
   assert_eq "replace: exactly one RUST entry" "1" "$(count_occurrences 'RUST=' "$out")"
-  # Idempotency: feeding the result back yields an identical value.
   out2="$( source "$INSTALLER"; compute_script_languages "$out" "$RUST_SEGMENT" )"
   assert_eq "replace: idempotent re-run" "$out" "$out2"
   assert_eq "replace: still exactly one RUST entry" "1" "$(count_occurrences 'RUST=' "$out2")"
@@ -1019,9 +969,7 @@ test_script_languages_replace_rust_idempotent() {
 
 test_empty_script_languages_read_hard_fails() {
   echo "== test_empty_script_languages_read_hard_fails =="
-  # A successful read (exit 0) that yields an empty/unparseable SCRIPT_LANGUAGES value must be
-  # treated as an anomaly and HARD-FAIL, never silently proceed: computing from "" would drop
-  # every pre-existing language, and issuing ALTER SYSTEM SET would wipe them.
+  # Proceeding from an empty value would wipe every existing language via ALTER SYSTEM SET.
   reset_env
   export EXAPUMP_SL_EMPTY=1
   run_file "${HAPPY_ARGS[@]}"
@@ -1052,15 +1000,8 @@ test_presigned_upload_dance() {
 
 test_presigned_url_json_unescaping() {
   echo "== test_presigned_url_json_unescaping =="
-  # Direct unit test: some SaaS-backend JSON encoders (notably Go's encoding/json, which
-  # HTML-escapes '&', '<', '>' by default) return the presigned URL with its '&'
-  # query-parameter separators as the 6-character numeric escape rather than a literal '&'.
-  # extract_json_string_field must un-escape that back to a real '&', or every parameter after
-  # the first collapses into the previous one's value -- exactly the live failure mode seen
-  # against Exasol SaaS staging (HTTP 400 AuthorizationQueryParametersError on the PUT).
   local raw escaped_url
-  # shellcheck disable=SC1003  # each '\' argument is a literal one-character backslash string,
-  # not an escape attempt -- %s substitutes it to build a literal "&" in the fixture JSON.
+  # shellcheck disable=SC1003  # each '\' argument is a literal backslash, not an escape attempt.
   raw="$(printf '{"url":"https://bucket.s3.amazonaws.com/key?X-Amz-Algorithm=AWS4-HMAC-SHA256%su0026X-Amz-Credential=abc%su0026X-Amz-Signature=xyz"}' '\' '\')"
   escaped_url="$(
     export PATH="$STUBDIR:$ORIG_PATH"
@@ -1071,9 +1012,6 @@ test_presigned_url_json_unescaping() {
     "https://bucket.s3.amazonaws.com/key?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=abc&X-Amz-Signature=xyz" \
     "$escaped_url"
 
-  # Integration: the full installer must still succeed end-to-end when the SaaS files POST
-  # response itself carries an escaped presigned URL, and the PUT curl invocation actually
-  # logged must carry the real, un-escaped '&'-joined query string.
   reset_env
   export CURL_POST_URL_ESCAPED=1
   run_file "${HAPPY_ARGS[@]}"
@@ -1106,7 +1044,6 @@ test_release_asset_download_via_rest() {
   assert_contains "asset download: error names the asset" "$out" "lakehouse-engine.tar.gz"
 }
 
-
 test_saas_verify_listed_quoted_match() {
   echo "== test_saas_verify_listed_quoted_match =="
   reset_env
@@ -1131,7 +1068,6 @@ test_saas_verify_listed_quoted_match() {
 
 test_four_scripts_ddl_saas_path_types() {
   echo "== test_four_scripts_ddl_saas_path_types =="
-  # Unit: DDL string shapes.
   local scan dist adapter version schema
   scan="$( source "$INSTALLER"; ddl_scan LHVS /buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so )"
   assert_contains "scan is RUST SCALAR" "$scan" "RUST SCALAR SCRIPT"
@@ -1147,7 +1083,6 @@ test_four_scripts_ddl_saas_path_types() {
   assert_not_contains "version is never EMITS" "$version" "EMITS"
   assert_contains "version references the same %udf_object path" "$version" "/buckets/uploads/default/lakehouse-engine/udf/liblakehouse_engine.so"
 
-  # Integration: all four scripts are actually created + CREATE SCHEMA IF NOT EXISTS.
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "ddl: install succeeds" "$LAST_RC"
@@ -1170,8 +1105,7 @@ test_version_smoke_pass_and_fail() {
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "smoke pass: install succeeds" "$LAST_RC"
   assert_contains "smoke pass: reported passed" "$LAST_OUT" "Version smoke test passed"
-  # Also proves STUB_DEFAULT_ENGINE_TAG reaches the stub processes: without the export both the
-  # served tag and the reported version go empty, and the two would still agree.
+  # Without the export both sides would be empty and still agree.
   assert_contains "smoke pass: names the version the served release tag resolves to" \
     "$LAST_OUT" "LAKEHOUSE_VERSION() reports ${STUB_DEFAULT_ENGINE_TAG#v}"
 
@@ -1198,16 +1132,13 @@ test_version_smoke_pass_and_fail() {
   assert_rc_nonzero "smoke other-error: nonzero exit" "$LAST_RC"
   assert_contains "smoke other-error: surfaces the underlying database error" "$LAST_OUT" "connection to database lost"
 
-  # A query that succeeds but yields no data line: the reported value is empty and must still be
-  # rendered visibly in the failure message.
   reset_env
   export EXAPUMP_SMOKE_MODE=empty-version
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_nonzero "smoke empty-version: nonzero exit" "$LAST_RC"
   assert_contains "smoke empty-version: renders the empty reported value as a placeholder" "$LAST_OUT" "<empty>"
 
-  # A verdict matching no arm must abort: an unmatched `case` evaluates to 0, and the `esac` is
-  # run_smoke_test's last statement, so falling through would report an unverified install as good.
+  # An unmatched `case` returns 0, so a fall-through would report an unverified install as good.
   reset_env
   local out rc
   # shellcheck disable=SC2317,SC2329  # both overrides are reached indirectly, from the sourced run_smoke_test
@@ -1230,8 +1161,6 @@ test_version_smoke_query_and_extraction() {
   assert_eq "version_smoke_sql: aliased single-column projection over the schema's version script" \
     "SELECT LHVS.LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION" "$sql"
 
-  # A version value begins with a digit, so the extractor must NOT drop digit-leading lines the way
-  # extract_query_value does -- it drops the row-count footer by its own suffix instead.
   value="$( source "$INSTALLER"; extract_version_value "0.45.0" )"
   assert_eq "extract_version_value: a bare version value survives" "0.45.0" "$value"
 
@@ -1247,7 +1176,6 @@ test_version_smoke_query_and_extraction() {
   value="$( source "$INSTALLER"; extract_version_value "$(printf 'Error: connection to database lost\n')" )"
   assert_eq "extract_version_value: an error line yields no value" "" "$value"
 
-  # Integration: the verification issues the aliased version query and no scan call.
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "version query: install succeeds" "$LAST_RC"
@@ -1268,8 +1196,7 @@ test_docs_describe_version_verification() {
   assert_contains "docs: the by-hand check is the version query" "$doc" "SELECT LHVS.LAKEHOUSE_VERSION();"
   assert_not_contains "docs: no placeholder scan call is presented as a check" "$doc" "LAKEHOUSE_SCAN('x', 'y')"
 
-  # ci.yml uses the bare word "fingerprint" for the unrelated SDK and build-cache fingerprints, so
-  # only the exact phrase names the removed verification.
+  # ci.yml uses bare "fingerprint" for unrelated things, hence the exact phrase.
   ci="$(<"$REPO_ROOT/.github/workflows/ci.yml")"
   assert_not_contains "ci.yml: no job comment still names a fingerprint smoke test" "$ci" "fingerprint smoke test"
   assert_contains "ci.yml: the install-script-e2e job names the version entry point" "$ci" "LAKEHOUSE_VERSION"
@@ -1291,21 +1218,18 @@ test_stops_at_product_prints_template() {
 
 test_target_base_default_and_override() {
   echo "== test_target_base_default_and_override =="
-  # Unit
   local prod staging
   prod="$( source "$INSTALLER"; ARG_STAGING=0; resolve_saas_base )"
   staging="$( source "$INSTALLER"; ARG_STAGING=1; resolve_saas_base )"
   assert_eq "base: default is production" "https://cloud.exasol.com" "$prod"
   assert_eq "base: --staging selects staging" "https://cloud-staging.exasol.com" "$staging"
 
-  # Integration: default target
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   local log; log="$(log_content)"
   assert_contains "base: prod REST calls hit cloud.exasol.com" "$log" "https://cloud.exasol.com/api/v1"
   assert_not_contains "base: prod run never hits staging" "$log" "cloud-staging.exasol.com"
 
-  # Integration: staging target
   reset_env
   run_file --account-id ACC1 --database-id DB1 --profile staging --staging
   log="$(log_content)"
@@ -1314,7 +1238,6 @@ test_target_base_default_and_override() {
 
 test_external_failure_actionable() {
   echo "== test_external_failure_actionable =="
-  # DB reachability 404
   reset_env
   export CURL_DB_UNREACHABLE=1
   run_file "${HAPPY_ARGS[@]}"
@@ -1322,7 +1245,6 @@ test_external_failure_actionable() {
   assert_contains "db 404: names the reachability step" "$LAST_OUT" "not reachable"
   assert_not_contains "db 404: no success reported" "$LAST_OUT" "query-ready"
 
-  # Presigned upload failure (POST for the presigned URL fails)
   reset_env
   export CURL_POST_FAIL=1
   run_file "${HAPPY_ARGS[@]}"
@@ -1330,9 +1252,6 @@ test_external_failure_actionable() {
   assert_contains "upload fail: names upload step" "$LAST_OUT" "upload"
   assert_contains "upload fail: surfaces curl's own diagnostic" "$LAST_OUT" "POST failed"
 
-  # Presigned upload failure (PUT never completes -- transport error, no HTTP response at all):
-  # curl's own stderr must surface in the error message rather than being discarded, since it is
-  # the only source of the actual cause (DNS, TLS, connection refused, ...).
   reset_env
   export CURL_PUT_TRANSPORT_FAIL=1
   run_file "${HAPPY_ARGS[@]}"
@@ -1340,10 +1259,6 @@ test_external_failure_actionable() {
   assert_contains "put transport fail: names upload step" "$LAST_OUT" "upload"
   assert_contains "put transport fail: surfaces curl's own diagnostic" "$LAST_OUT" "PUT transport failed"
 
-  # Presigned upload failure (PUT completes but the host rejects it, e.g. HTTP 400/403): the
-  # response BODY -- not just the status code -- must surface, since the storage host's own
-  # error detail is the only way to tell a signature mismatch from an expired URL from anything
-  # else. This is the exact shape hit live against Exasol SaaS staging (HTTP 400).
   reset_env
   export CURL_PUT_HTTP_CODE=400
   export CURL_PUT_BODY='<Error><Code>InvalidArgument</Code><Message>bad request</Message></Error>'
@@ -1353,14 +1268,12 @@ test_external_failure_actionable() {
   assert_contains "put http fail: reports the HTTP status" "$LAST_OUT" "400"
   assert_contains "put http fail: surfaces the response body detail" "$LAST_OUT" "InvalidArgument"
 
-  # exapump ALTER SYSTEM privilege failure
   reset_env
   export EXAPUMP_ALTER_FAIL=1
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_nonzero "alter fail: nonzero exit" "$LAST_RC"
   assert_contains "alter fail: mentions admin/privilege" "$LAST_OUT" "privilege"
 
-  # Credential safety: PAT and password never printed (host mode, failing run + success run).
   reset_env
   export CURL_DB_UNREACHABLE=1
   run_file --account-id ACC1 --database-id DB1 --host myhost:8563 --user myuser --password SECRETPW456
@@ -1373,8 +1286,6 @@ test_external_failure_actionable() {
   assert_not_contains "creds: PAT absent from success output" "$LAST_OUT" "SECRETPAT123"
   assert_not_contains "creds: password absent from success output" "$LAST_OUT" "SECRETPW456"
 
-  # Credential safety: the profile-fixture password never printed (profile mode, success run).
-  # HAPPY_ARGS uses --profile staging, whose fixture password is SECRETPAT123.
   reset_env
   run_file "${HAPPY_ARGS[@]}"
   assert_rc_zero "creds: profile-mode install succeeds" "$LAST_RC"
@@ -1389,17 +1300,12 @@ test_stdin_piped_invocation_no_body_consumption() {
   assert_contains "stdin-piped: reaches the smoke-test pass" "$LAST_OUT" "Version smoke test passed"
   assert_contains "stdin-piped: reaches the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   local log; log="$(log_content)"
-  # If any subprocess had consumed the piped body, execution would truncate before these.
   assert_contains "stdin-piped: GitHub release resolved (releases/latest reached)" "$log" "releases/latest"
   assert_contains "stdin-piped: release asset downloaded (releases/download)" "$log" "releases/download/"
   assert_contains "stdin-piped: SLC uploaded (body not truncated early)" "$log" "/files/rustslc.tar.gz"
   assert_contains "stdin-piped: three scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "stdin-piped: smoke-test SQL executed (reached end)" "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
 
-  # Per-subprocess proof that stdin is redirected from /dev/null: run in file mode with a sentinel
-  # payload on the installer's OWN stdin, and make every stub report if it read any stdin. A
-  # correctly-redirected subprocess reads /dev/null (nothing); a single missing </dev/null would
-  # let a subprocess read the installer's stdin and leak the sentinel.
   reset_env
   export STUB_REPORT_STDIN=1
   run_file_with_stdin "SENTINEL_STDIN_PAYLOAD_9c3f"$'\n' "${HAPPY_ARGS[@]}"
@@ -1407,10 +1313,6 @@ test_stdin_piped_invocation_no_body_consumption() {
   assert_not_contains "stdin-redirect: no subprocess reported inherited stdin" "$(log_content)" "STDIN_LEAK"
   assert_not_contains "stdin-redirect: sentinel never reached any subprocess" "$(log_content)" "SENTINEL_STDIN_PAYLOAD_9c3f"
 }
-
-# ============================================================================
-# BucketFS target mode
-# ============================================================================
 
 test_resolve_target_mode_bucketfs_autodetect() {
   echo "== test_resolve_target_mode_bucketfs_autodetect =="
@@ -1424,7 +1326,6 @@ test_resolve_target_mode_bucketfs_autodetect() {
   mode="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; resolve_target_mode )"
   assert_eq "autodetect: both SaaS ids still resolve to saas" "saas" "$mode"
 
-  # Exactly-one-set stays an error in both directions (unchanged behaviour).
   out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=""; resolve_target_mode 2>&1 )"
   rc=$?
   assert_rc_nonzero "autodetect: exactly one id is still an error, never bucketfs" "$rc"
@@ -1462,7 +1363,6 @@ test_target_flag_conflict_detection() {
   assert_rc_nonzero "--target: an unknown value is rejected" "$rc"
   assert_contains "--target: unknown value lists the two valid ones" "$out" "'saas' or 'bucketfs'"
 
-  # End to end through parse_args: the flag is accepted and takes a value.
   reset_env
   run_file --target saas "${HAPPY_ARGS[@]}"
   assert_rc_zero "--target saas: full saas run still succeeds" "$LAST_RC"
@@ -1472,8 +1372,6 @@ test_target_flag_conflict_detection() {
   assert_rc_nonzero "--target bucketfs against SaaS ids: full run refuses" "$LAST_RC"
   assert_eq "--target conflict: no network call made" "" "$(log_content)"
 
-  # --staging only means anything on a SaaS run; giving it with no SaaS ids is a mistake, not a
-  # silently-ignored no-op.
   out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=""; ARG_DATABASE_ID=""; ARG_STAGING=1; resolve_target_mode 2>&1 )"
   rc=$?
   assert_rc_nonzero "--staging with no SaaS ids: nonzero" "$rc"
@@ -1485,8 +1383,6 @@ test_target_flag_conflict_detection() {
   assert_rc_nonzero "--staging against a full bucketfs run: refuses" "$LAST_RC"
   assert_eq "--staging conflict: no network call made" "" "$(log_content)"
 
-  # Any --bfs-* flag only means anything on a BucketFS run; giving one alongside both SaaS ids is
-  # a mistake, not a silently-ignored no-op.
   out="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; ARG_BFS_HOST=somehost; resolve_target_mode 2>&1 )"
   rc=$?
   assert_rc_nonzero "--bfs-host with both SaaS ids: nonzero" "$rc"
@@ -1498,7 +1394,6 @@ test_target_flag_conflict_detection() {
   assert_rc_nonzero "--bfs-bucket with both SaaS ids: nonzero" "$rc"
   assert_contains "--bfs-bucket with both SaaS ids: names --bfs-bucket" "$out" "--bfs-bucket"
 
-  # A --bfs-bucket left at its unset default must NOT be mistaken for an explicit flag.
   mode="$( source "$INSTALLER"; ARG_ACCOUNT_ID=ACC1; ARG_DATABASE_ID=DB1; resolve_target_mode )"
   rc=$?
   assert_rc_zero "saas with untouched --bfs-bucket default: still passes" "$rc"
@@ -1528,9 +1423,6 @@ test_resolve_target_layout_bucketfs_values() {
   assert_eq "layout bucketfs: engine upload path is bucket-relative" \
     "udf/liblakehouse_engine.so" "$engine"
 
-  # --bfs-bucket propagates into every place the BUCKET NAME belongs: the %udf_object path and both
-  # halves of the RUST alias. It must NOT appear in the exapump upload paths -- exapump selects the
-  # bucket via --bfs-bucket and prefixes it onto the path itself.
   so="$( source "$INSTALLER"; TARGET_MODE=bucketfs; ARG_BFS_BUCKET=other; resolve_target_layout; printf '%s' "$TARGET_SO_UDF_OBJECT" )"
   assert_eq "layout --bfs-bucket other: %udf_object carries the bucket" \
     "buckets/bfsdefault/other/udf/liblakehouse_engine.so" "$so"
@@ -1544,7 +1436,6 @@ test_resolve_target_layout_bucketfs_values() {
   assert_eq "layout --bfs-bucket other: SLC upload path stays bucket-relative" \
     "slc/lakehouse-rustslc.tar.gz" "$slc"
 
-  # SaaS mode leaves the BucketFS-only globals empty.
   slc="$( source "$INSTALLER"; TARGET_MODE=saas; resolve_target_layout; printf '%s' "$TARGET_SLC_BFS_PATH" )"
   assert_eq "layout saas: no SLC BucketFS path" "" "$slc"
   engine="$( source "$INSTALLER"; TARGET_MODE=saas; resolve_target_layout; printf '%s' "$TARGET_ENGINE_BFS_PATH" )"
@@ -1555,11 +1446,6 @@ test_exapump_bfs_flags() {
   echo "== test_exapump_bfs_flags =="
   local flags
 
-  # The bucket is ALWAYS emitted, even at its "default" default -- never left to exapump's own
-  # bucket resolution, so a stray default profile in ~/.exapump/config.toml can't diverge from the
-  # bucket path this script assumes when building TARGET_SO_UDF_OBJECT/TARGET_RUST_LANG_SEGMENT.
-  # Profile mode: --bfs-validate-certificate is never added here (see the dsn/host block below) --
-  # the profile's own bfs_validate_certificate/validate_certificate field governs instead.
   flags="$( source "$INSTALLER"; CONNECTIVITY_MODE=profile; exapump_bfs_flags )"
   assert_eq "bfs flags: nothing given -> only the resolved default bucket is emitted" "--bfs-bucket default" "$flags"
 
@@ -1569,11 +1455,6 @@ test_exapump_bfs_flags() {
   flags="$( source "$INSTALLER"; CONNECTIVITY_MODE=profile; ARG_BFS_BUCKET=other; ARG_BFS_BUCKET_SET=1; exapump_bfs_flags )"
   assert_eq "bfs flags: an explicit --bfs-bucket is echoed back" "--bfs-bucket other" "$flags"
 
-  # dsn/host connectivity mode passes no --profile to `exapump bucketfs` (see exapump_bucketfs),
-  # so exapump >=0.13.0 builds the connection purely from these overrides plus its own BucketFS
-  # defaults -- certificate validation ON. --bfs-validate-certificate false is added here,
-  # unconditionally, for the same self-signed-cert reason the SQL DSN always carries
-  # validateservercertificate=0 in host mode (exasol-labs/exapump#46).
   flags="$(
     source "$INSTALLER"
     CONNECTIVITY_MODE=host
@@ -1598,9 +1479,6 @@ test_resolve_bfs_bucket_from_profile() {
   echo "== test_resolve_bfs_bucket_from_profile =="
   local bucket
 
-  # Profile names a non-default bucket, user gave no --bfs-bucket: must adopt the profile's
-  # bucket, so TARGET_SO_UDF_OBJECT/TARGET_RUST_LANG_SEGMENT (built from ARG_BFS_BUCKET) end up
-  # pointing at the SAME bucket exapump itself will upload into.
   bucket="$(
     source "$INSTALLER"
     TARGET_MODE=bucketfs; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile-custom-bucket
@@ -1610,7 +1488,6 @@ test_resolve_bfs_bucket_from_profile() {
   )"
   assert_eq "bucket drift: adopts the profile's bfs_bucket when none was given explicitly" "custom" "$bucket"
 
-  # An explicit --bfs-bucket always wins, even if the profile names a different one.
   bucket="$(
     source "$INSTALLER"
     TARGET_MODE=bucketfs; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile-custom-bucket
@@ -1621,7 +1498,6 @@ test_resolve_bfs_bucket_from_profile() {
   )"
   assert_eq "bucket drift: an explicit --bfs-bucket is never overridden by the profile" "explicit" "$bucket"
 
-  # A profile with no bfs_bucket field at all: default is left untouched.
   bucket="$(
     source "$INSTALLER"
     TARGET_MODE=bucketfs; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile
@@ -1631,7 +1507,6 @@ test_resolve_bfs_bucket_from_profile() {
   )"
   assert_eq "bucket drift: no-op when the profile has no bfs_bucket field" "default" "$bucket"
 
-  # saas mode / dsn / host connectivity: always a no-op, regardless of profile content.
   bucket="$(
     source "$INSTALLER"
     TARGET_MODE=saas; CONNECTIVITY_MODE=profile; ARG_PROFILE=bfsprofile-custom-bucket
@@ -1649,7 +1524,6 @@ test_resolve_bfs_bucket_from_profile() {
   )"
   assert_eq "bucket drift: no-op in dsn connectivity mode (no profile to read)" "default" "$bucket"
 
-  # End-to-end proof: after resolution, resolve_target_layout builds paths in the ADOPTED bucket.
   local so
   so="$(
     source "$INSTALLER"
@@ -1665,7 +1539,6 @@ test_resolve_bfs_bucket_from_profile() {
 
 test_bucketfs_upload_argv_shape() {
   echo "== test_bucketfs_upload_argv_shape =="
-  # profile mode: --profile is present, and only the explicitly-given --bfs-* overrides follow.
   reset_env
   local rc
   rc="$(
@@ -1680,7 +1553,6 @@ test_bucketfs_upload_argv_shape() {
     "exapump bucketfs cp /tmp/local.so udf/liblakehouse_engine.so --profile bfsprofile"
   assert_not_contains "upload argv profile: never a raw curl PUT" "$log" "curl"
 
-  # dsn mode: no --profile at all; the required explicit --bfs-* overrides carry the connection.
   reset_env
   rc="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE
@@ -1717,8 +1589,6 @@ test_bucketfs_upload_failure_surfaces_stderr() {
 test_bucketfs_verify_listed_and_wait() {
   echo "== test_bucketfs_verify_listed_and_wait =="
   reset_env
-  # Whole-token match: a stored 'liblakehouse_engine.so.bak' must not satisfy a check for
-  # 'liblakehouse_engine.so'.
   printf 'udf/liblakehouse_engine.so.bak\n' > "$STUB_BFS_STATE"
   local answer
   answer="$(
@@ -1738,7 +1608,6 @@ test_bucketfs_verify_listed_and_wait() {
   )"
   assert_eq "verify listed: an exact entry verifies" "yes" "$answer"
 
-  # Retry-then-hit: the first two listings find nothing (async unpack), the third succeeds.
   reset_env
   printf 'slc/lakehouse-rustslc.tar.gz\n' > "$STUB_BFS_STATE"
   local out rc
@@ -1754,7 +1623,6 @@ test_bucketfs_verify_listed_and_wait() {
   assert_eq "wait for path: took exactly 3 ls attempts (2 misses + 1 hit)" \
     "3" "$(count_occurrences 'exapump bucketfs ls' "$(log_content)")"
 
-  # Retry-then-fail: names the path and the try count, never hangs.
   reset_env
   out="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_NEVER_LIST=1
@@ -1774,9 +1642,6 @@ test_bucketfs_reachable_preflight() {
   echo "== test_bucketfs_reachable_preflight =="
   reset_env
   export EXAPUMP_BFS_LS_FAIL=1
-  # Overrides the real ~60s (30 tries x 2s) production budget down to 3 tries x 0s: this exercises
-  # the actual full-script code path (not a direct function call), so it needs the real thing to
-  # stay fast rather than a shortcut.
   export BUCKETFS_REACHABLE_TRIES=3 BUCKETFS_REACHABLE_POLL_SECONDS=0
   run_file_bfs "${BFS_HAPPY_ARGS[@]}"
   assert_rc_nonzero "bfs preflight: unreachable bucket exits nonzero" "$LAST_RC"
@@ -1787,8 +1652,6 @@ test_bucketfs_reachable_preflight() {
   local log; log="$(log_content)"
   assert_not_contains "bfs preflight: fails before any release download" "$log" "releases/"
 
-  # Permanent errors (a bad password, here) are NOT retried: one attempt, immediate failure --
-  # unlike a not-yet-up BucketFS, more retries can never fix a wrong credential.
   reset_env
   export EXAPUMP_BFS_LS_AUTH_FAIL=1
   export BUCKETFS_REACHABLE_TRIES=30 BUCKETFS_REACHABLE_POLL_SECONDS=0
@@ -1800,9 +1663,6 @@ test_bucketfs_reachable_preflight() {
   assert_eq "bfs preflight: exactly one ls attempt, no retries wasted on a permanent error" \
     "1" "$(count_occurrences 'exapump bucketfs ls' "$log")"
 
-  # Retry-then-hit: BucketFS's HTTP endpoint isn't up on the first two probes (a startup-ordering
-  # race against the DB's own SQL-port readiness check), the third succeeds. Direct call with
-  # sleep_seconds=0, same as the bucketfs_wait_for_path tests above, so this stays fast.
   local out rc
   reset_env
   out="$(
@@ -1816,7 +1676,6 @@ test_bucketfs_reachable_preflight() {
   assert_eq "bfs preflight: took exactly 3 ls attempts (2 misses + 1 hit)" \
     "3" "$(count_occurrences 'exapump bucketfs ls' "$(log_content)")"
 
-  # Retry-then-fail: names the try count, never hangs.
   reset_env
   out="$(
     export PATH="$STUBDIR:$ORIG_PATH" STUB_LOG STUB_BFS_STATE EXAPUMP_BFS_LS_FAIL=1
@@ -1833,7 +1692,6 @@ test_bucketfs_reachable_preflight() {
 
 test_validate_bucketfs_required_before_any_call() {
   echo "== test_validate_bucketfs_required_before_any_call =="
-  # profile mode, profile has no bfs_write_password and none was passed.
   reset_env
   run_file_bfs --profile staging
   assert_rc_nonzero "bfs required: missing write password exits nonzero" "$LAST_RC"
@@ -1842,12 +1700,10 @@ test_validate_bucketfs_required_before_any_call() {
   assert_contains "bfs required: names the profile section" "$LAST_OUT" "[staging]"
   assert_eq "bfs required: fails BEFORE any curl/exapump call is made" "" "$(log_content)"
 
-  # profile mode with the password supplied directly still proceeds even if the profile lacks it.
   reset_env
   run_file_bfs --profile staging --bfs-write-password BFSWRITEPW789
   assert_rc_zero "bfs required: an explicit --bfs-write-password satisfies profile mode" "$LAST_RC"
 
-  # dsn mode: no profile to fall back on, so BOTH --bfs-host and --bfs-write-password are required.
   reset_env
   run_file_bfs --dsn "exasol://user:SECRETPAT123@dsnhost:8563"
   assert_rc_nonzero "bfs required dsn: nonzero" "$LAST_RC"
@@ -1860,7 +1716,6 @@ test_validate_bucketfs_required_before_any_call() {
   run_file_bfs --dsn "exasol://user:SECRETPAT123@dsnhost:8563" --bfs-host bfshost --bfs-write-password BFSWRITEPW789
   assert_rc_zero "bfs required dsn: both flags given proceeds to success" "$LAST_RC"
 
-  # host mode: same requirement.
   reset_env
   run_file_bfs --host myhost:8563 --user u --password p
   assert_rc_nonzero "bfs required host: nonzero" "$LAST_RC"
@@ -1902,35 +1757,24 @@ test_bucketfs_full_run_artifact_shapes() {
   assert_contains "bfs run: reaches the smoke-test pass" "$LAST_OUT" "Version smoke test passed"
   assert_contains "bfs run: reaches the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
   local log; log="$(log_content)"
-
-  # The SLC goes up as a TARBALL (BucketFS must auto-extract it).
   assert_contains "bfs run: SLC uploaded as a tarball to the bucket-relative slc/ path" "$log" \
     "bucketfs cp "
   assert_contains "bfs run: SLC destination is slc/lakehouse-rustslc.tar.gz" "$log" \
     "rustslc.tar.gz slc/lakehouse-rustslc.tar.gz"
-
-  # The ENGINE goes up as a BARE .so, extracted locally first -- never the tarball.
   assert_contains "bfs run: engine uploaded as the extracted bare .so" "$log" \
     "extracted/udf/liblakehouse_engine.so udf/liblakehouse_engine.so"
   assert_not_contains "bfs run: the engine TARBALL is never uploaded to BucketFS" "$log" \
     "lakehouse-engine.tar.gz udf/"
-
-  # Nothing SaaS is touched at all.
   assert_not_contains "bfs run: never contacts the SaaS control plane" "$log" "cloud.exasol.com"
   assert_not_contains "bfs run: never calls the SaaS accounts API" "$log" "/api/v1/accounts"
   assert_not_contains "bfs run: no presigned POST dance" "$log" "-X POST"
   assert_not_contains "bfs run: no raw HTTP PUT upload" "$log" "--upload-file"
-
-  # DDL and SCRIPT_LANGUAGES use the generic bfsdefault layout.
   assert_contains "bfs run: %udf_object uses the bfsdefault .so path" "$log" "$BFS_SO_UDF_OBJECT"
   assert_contains "bfs run: ALTER SYSTEM registers the bfsdefault RUST alias" "$log" "$BFS_RUST_SEGMENT"
   assert_contains "bfs run: three scripts created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
-
-  # Both uploads are verified through a listing before the run proceeds.
   assert_contains "bfs run: verifies the SLC path by listing" "$log" "exapump bucketfs ls slc"
   assert_contains "bfs run: verifies the engine path by listing" "$log" "exapump bucketfs ls udf"
 
-  # --bfs-bucket propagates end to end.
   reset_env
   run_file_bfs "${BFS_HAPPY_ARGS[@]}" --bfs-bucket other
   assert_rc_zero "bfs run --bfs-bucket other: install succeeds" "$LAST_RC"
@@ -1970,8 +1814,6 @@ test_tar_required_only_in_bucketfs_mode() {
 
 test_skip_slc_gating() {
   echo "== test_skip_slc_gating =="
-  # BucketFS mode (the newer, riskier path): --skip-slc drops the SLC download, the SLC upload and
-  # the ALTER SYSTEM, but leaves the engine install, the DDL and the smoke test untouched.
   reset_env
   run_file_bfs "${BFS_HAPPY_ARGS[@]}" --skip-slc
   assert_rc_zero "skip-slc bfs: install still succeeds" "$LAST_RC"
@@ -1981,15 +1823,12 @@ test_skip_slc_gating() {
   assert_not_contains "skip-slc bfs: SLC asset never downloaded" "$log" "language-container-rs/releases/tags"
   assert_not_contains "skip-slc bfs: SCRIPT_LANGUAGES never read" "$log" "SELECT SYSTEM_VALUE FROM EXA_PARAMETERS"
   assert_not_contains "skip-slc bfs: ALTER SYSTEM never issued" "$log" "ALTER SYSTEM SET SCRIPT_LANGUAGES"
-  # ... while everything downstream of the SLC still runs.
   assert_contains "skip-slc bfs: engine .so still uploaded" "$log" "extracted/udf/liblakehouse_engine.so udf/liblakehouse_engine.so"
   assert_contains "skip-slc bfs: DDL still created" "$log" "LHVS.LAKEHOUSE_DISTRIBUTE_FILES"
   assert_contains "skip-slc bfs: smoke test still run" "$log" "LAKEHOUSE_VERSION() AS LAKEHOUSE_ENGINE_VERSION"
   assert_contains "skip-slc bfs: still prints the next-step template" "$LAST_OUT" "CREATE VIRTUAL SCHEMA"
-  # The SLC VERSION is still resolved and reported, so the user can see what the DB must already have.
   assert_contains "skip-slc bfs: SLC version still reported" "$LAST_OUT" "Resolved language-container (SLC) version"
 
-  # SaaS mode gates on the same flag.
   reset_env
   run_file "${HAPPY_ARGS[@]}" --skip-slc
   assert_rc_zero "skip-slc saas: install still succeeds" "$LAST_RC"
@@ -1997,7 +1836,6 @@ test_skip_slc_gating() {
   assert_not_contains "skip-slc saas: SLC never uploaded" "$log" "/files/rustslc.tar.gz"
   assert_contains "skip-slc saas: engine still uploaded" "$log" "/files/lakehouse-engine.tar.gz"
 
-  # Default (no --skip-slc) still does the whole thing.
   reset_env
   run_file_bfs "${BFS_HAPPY_ARGS[@]}"
   assert_rc_zero "default: install succeeds" "$LAST_RC"
@@ -2414,7 +2252,6 @@ makefile_slc_url_arch_aware() {
     "$MAKE_OUT" "releases/download"
 }
 
-# ============================================================================
 # Scenario: a local deployment selects the launcher transport and the standard BucketFS layout
 deployment_local_selects_launcher() {
   echo "== deployment_local_selects_launcher =="
@@ -2507,7 +2344,6 @@ deployment_local_requires_exasol_cli() {
   return 0
 }
 
-# Drives main() through the launcher transport under a sandboxed HOME.
 run_launcher_deployment() {
   local fake_home dep_name="personal-23" saved_home
   fake_home="$(mktemp -d "$SANDBOX/dep-home-launcher.XXXXXX")"

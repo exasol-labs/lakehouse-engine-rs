@@ -25,13 +25,15 @@ Project mission in: @specs/mission.md
 
 ## Code comment style
 
-- **Default to no comments.** Only keep essential, concise comments for a non-obvious
-  "why", never to explain how the code got this way — that belongs in the commit message.
-- **A doc comment on a test names the scenario in one line** (`/// Scenario: <fact>`),
-  matching the convention already used across `*_tests.rs` files. It does not repeat the
-  scenario title as a second, separately-quoted sentence.
-- Before committing, scan new/changed comments for ones exceeding roughly 4-5 lines or
-  restating the same idea twice, and trim them.
+- **No comment unless it states a non-obvious "why"** (an invariant, an external-system quirk, a
+  spec or issue constraint). Never restate what the code does, narrate history, or add
+  section banners/dividers. History belongs in the commit message.
+- **Keep it to 1–2 lines.** Anything longer is a spec or ADR; cite it (`(#309)`, spec path) instead.
+- **The test name is the scenario.** Add a `/// Scenario: <spec scenario title>` line only when
+  the test implements a spec scenario, quoting its title verbatim so it can be traced. Use at
+  most one per test, and never add a `// Scenario Coverage` comment.
+- **Comments must stay true.** When you change behavior, rename, or move code, update or delete
+  the comments that describe it in the same change.
 
 ## Unit test layout
 
