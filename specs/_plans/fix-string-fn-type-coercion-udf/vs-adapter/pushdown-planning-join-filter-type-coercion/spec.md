@@ -6,11 +6,12 @@ Unchanged by this plan, and reproduced here only because the delta validator req
 ## Background
 
 * This feature adds NO guard and NO type dispatch. It wires the two join sites to
-  `apply_type_rewrites` — the one ordered pipeline (`like_subject_type_guard`, then the
-  string-conversion decline check) owned by
+  `apply_type_rewrites` — the one ordered pipeline (`like_subject_type_guard`, its only pass since
+  issue #227) owned by
   `vs-adapter/pushdown-planning-string-fn-type-coercion-composition` — so every guard decision,
-  dispatch table, and traversal is inherited verbatim from the single-table WHERE surface
-  (issue #215).
+  dispatch table, and traversal is inherited verbatim from the single-table WHERE surface. Issue
+  #215; issue #223's slice 2 ("broadcast-join per-leg FILTER path") closes with it, and issue #227
+  closes #223's slices 1 (computed-expression arguments) and 3 (GROUP-BY-only keys).
 * The broadcast site reuses `classify_where_filter`, already the SOLE owner of the
   "rewrite, then decide scan-spec filter vs. self-apply" classification for the single-table path,
   rather than re-deriving that sequence at a second site.
@@ -31,12 +32,13 @@ Unchanged by this plan, and reproduced here only because the delta validator req
 * Every decline is therefore SAFE rather than silently lossy, which is what unblocks shipping the
   decline arm at all: before the self-application mechanism existed, a declined join filter was
   omitted from the emitted SQL and applied nowhere, returning extra rows.
-* The `NLS_DATE_FORMAT` tracked exception (#216) on the DATE conversions and the DECIMAL trim (#211)
-  hold at both join surfaces, because both surfaces render through the same `exa_to_varchar`
-  wrapping as the single-table surface.
-* An `INSTR`/`LOCATE` call beyond two arguments is a DataFusion-dialect render error, so at both
-  join surfaces it takes the unrenderable-filter outcome and returns the native Exasol result
-  (issue #228, step 1).
+* The session-setting tracked exception (#216) on text conversion and the DECIMAL trim (#211)
+  apply unchanged at both join surfaces: both render through the same `exa_to_varchar` wrapping
+  as the single-table surface, so the same accepted trade-offs carry over. Neither is a new exception.
+* An `INSTR`/`LOCATE` call beyond two arguments is a DataFusion-dialect render error (issue #228,
+  step 1), so at both join surfaces it takes the unrenderable-filter outcome and returns the native
+  Exasol result instead of a silently truncated position. It does NOT close #228, whose faithful
+  three- and four-argument rendering stays open.
 * Both join sites receive an already alias-stripped tree, because `handle_pushdown` strips every
   `tableAlias` from the whole pushdown request at one chokepoint before any downstream render
   (issue #193). The guards match a `column` node's `name` alone, so stripping neither helps nor
@@ -57,8 +59,8 @@ Unchanged by this plan, and reproduced here only because the delta validator req
   whose conjunct name does not collide.
 * This feature covers the join WHERE-filter surfaces ONLY. The join SELECT-list projection is a
   separate, already-correct surface: the broadcast join reaches `project_columns` through
-  `extract_join_projection`, so it runs the same pipeline, and its decline widens the projection to
-  the disjoint union of every involved table's columns.
+  `extract_join_projection`, so it has run the pipeline since #211/#210/#207 and its decline widens
+  the projection to the disjoint union of every involved table's columns.
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios

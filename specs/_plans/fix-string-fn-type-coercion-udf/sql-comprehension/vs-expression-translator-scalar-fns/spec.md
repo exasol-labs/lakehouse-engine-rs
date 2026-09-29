@@ -15,6 +15,6 @@ Unchanged by this plan, and reproduced here only because the delta validator req
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL render the node as the corresponding DataFusion SQL function applied to its rendered arguments in order, using these name mappings: `SUBSTR`→`substr`, `LENGTH`→`character_length`, `OCTET_LENGTH`→`octet_length`, `INSTR`/`LOCATE`→`strpos` (with operands ordered string-then-substring per DataFusion `strpos(string, substring)`), `UNICODE`→`ascii`, `UNICODECHR`→`chr`, and all other listed names lower-cased to their identically-named DataFusion function
 * *AND* each argument SHALL be rendered recursively by the translator, and each string-converted argument SHALL render per `sql-comprehension/vs-expression-translator-string-conversion`
-* *AND* `LOCATE`/`INSTR` argument reordering MUST preserve the Exasol semantics of "position of substring within string", and an `INSTR` or `LOCATE` call carrying more than two arguments SHALL be a render error per the same feature
+* *AND* `LOCATE`/`INSTR` argument reordering MUST preserve the Exasol semantics of "position of substring within string", and an `INSTR` or `LOCATE` call carrying more than two arguments SHALL be a render error per the same feature, while a two-argument call keeps its `strpos` rendering
 * *AND* `CONCAT` SHALL be rendered by its own dedicated per-dialect rule, specified in `sql-comprehension/vs-expression-translator-concat`, not by this name-mapping table
 <!-- /DELTA:CHANGED -->

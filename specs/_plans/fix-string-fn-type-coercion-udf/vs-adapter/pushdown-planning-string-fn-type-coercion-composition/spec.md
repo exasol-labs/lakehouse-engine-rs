@@ -1,22 +1,20 @@
 <!-- DELTA:CHANGED -->
 # Feature: Pushdown Planning — Type-Rewrite Pipeline Composition
 
-Verifies that the two passes of the type-rewrite pipeline compose with the renderer's
-`exa_to_varchar` wrapping (`sql-comprehension/vs-expression-translator-string-conversion`), so each
-string conversion happens exactly once. The passes are `like_subject_type_guard`
-(`vs-adapter/pushdown-planning-like-type-coercion`) and the string-conversion decline check
-(`vs-adapter/pushdown-planning-string-fn-type-coercion`).
+Verifies that the type-rewrite pipeline's one pass, `like_subject_type_guard`
+(`vs-adapter/pushdown-planning-like-type-coercion`), composes with the renderer's `exa_to_varchar`
+wrapping (`sql-comprehension/vs-expression-translator-string-conversion`), so each string
+conversion happens exactly once.
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->
 ## Background
 
-* `apply_type_rewrites` in `pushdown/support.rs` owns the pass order: `like_subject_type_guard`,
-  then the decline check. Both passes are private to `support`. Rendering stays a separate step at
-  the call site.
+* `apply_type_rewrites` in `pushdown/support.rs` runs one pass, `like_subject_type_guard`, which is
+  private to `support`. Rendering stays a separate step at the call site.
 * `like_subject_type_guard` rewraps a DATE `LIKE` subject as a `function_scalar_cast` to
   `{"type":"VARCHAR"}`. The renderer treats that node as a string CAST and wraps its source.
-* Neither pass wraps a string-converted argument. The renderer alone applies `exa_to_varchar`, so
+* No adapter pass wraps a string-converted argument. The renderer alone applies `exa_to_varchar`, so
   the adapter cannot produce a double conversion.
 <!-- /DELTA:CHANGED -->
 
@@ -35,12 +33,11 @@ string conversion happens exactly once. The passes are `like_subject_type_guard`
 <!-- /DELTA:REMOVED -->
 
 <!-- DELTA:NEW -->
-### Scenario: The LIKE subject guard and the string-conversion check compose without double conversion
+### Scenario: The LIKE subject guard and the renderer's conversion compose without double conversion
 
-* *GIVEN* `pushdown` filters processed by `apply_type_rewrites` and then rendered by `render_df_filter_safe` — `c_date LIKE '2024%'`, `LENGTH(c_decimal_a) > 5`, and `UPPER(c_decimal_a) LIKE '1%'`
+* *GIVEN* `pushdown` filters processed by `apply_type_rewrites` and then rendered by `render_df_filter_safe`: `c_date LIKE '2024%'`, `LENGTH(c_decimal_a) > 5`, and `UPPER(c_decimal_a) LIKE '1%'`
 * *WHEN* the adapter builds the single-table DataFusion scan-spec filter
-* *THEN* the DATE subject SHALL render as `CAST(exa_to_varchar("C_DATE") AS VARCHAR)`, one conversion, which the decline check accepts because the CAST's source is a DATE column
-* *AND* `LENGTH(c_decimal_a) > 5` SHALL render exactly one `exa_to_varchar` wrapper, around the bare column
+* *THEN* the DATE subject SHALL render as `CAST(exa_to_varchar("C_DATE") AS VARCHAR)`, and `LENGTH(c_decimal_a) > 5` SHALL render exactly one `exa_to_varchar` call, around the bare column
 * *AND* for `UPPER(c_decimal_a) LIKE '1%'` the LIKE guard SHALL leave the node unchanged, because its subject is not a bare column, while the renderer wraps the DECIMAL argument of `UPPER`
 * *AND* the test SHALL call `apply_type_rewrites` itself rather than a re-derived pass sequence
 <!-- /DELTA:NEW -->
