@@ -100,7 +100,7 @@ Every query is executed independently, starts from source metadata, and leaves n
 > standalone `crates/vs-expression` expression-translation crate is designed to be shared with
 > the sibling project and will migrate to a monorepo layout when the projects converge. `crates/lakehouse-catalog`
 > (Iceberg REST + Unity Catalog access) is a workspace-internal split from `crates/lakehouse-engine`, not a
-> sibling-shared crate — both still build into the one `.so` that carries both UDF entry points.
+> sibling-shared crate — both build into the one `.so` that carries all three UDF entry points.
 
 ## Commands
 
@@ -131,9 +131,9 @@ lakehouse-engine/
 └── Makefile        # cross-udf-build, test-e2e
 ```
 
-One `.so` still carries all three entry points (VS adapter + DataFusion scan UDF + version query UDF): `lakehouse-catalog`
-compiles into `lakehouse-engine`'s cdylib as a workspace dependency, so the crate split changes only
-the source layout, not the UDF packaging model.
+One `.so` carries all three entry points (VS adapter + DataFusion scan UDF + version query UDF):
+`lakehouse-catalog` and `vs-expression` compile into `lakehouse-engine`'s cdylib as workspace
+dependencies, so the crate layout does not affect UDF packaging.
 
 ## Architecture
 
