@@ -209,8 +209,7 @@ before changing the shard count or fan-out shape.
 
 - **`ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS = '<host>:<port>'`** redirects the UDF VM's fd1/fd2 to a
   listener (`nc -l`), capturing runtime tracing + startup/abort output the Rust SLC otherwise
-  discards. (Exasol's docs show `SET SESSION SCRIPT OUTPUT ADDRESS`; this cluster rejects that
-  form.) The listener must be reachable FROM the cluster nodes (a jumphost/private IP; a NAT'd
+  discards. The listener must be reachable FROM the cluster nodes (a jumphost/private IP; a NAT'd
   local client cannot receive the connect-back).
 - **`%udf_debug_level debug|info|warn|error`** in the script source (same channel as `%udf_object`)
   sets verbosity; at `debug` the SLC auto-emits per-VM-tagged (`pid`/`node_id`/`session_id`/`vm_id`)
