@@ -13,7 +13,7 @@ use common::seed::{
     seed_complex_types_probe, seed_typed_distinct_probe,
 };
 use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
+    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 use serde_json::json;
 use std::sync::OnceLock;
@@ -25,7 +25,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_iceberg_catalog();
 
         let rt = tokio::runtime::Builder::new_current_thread()

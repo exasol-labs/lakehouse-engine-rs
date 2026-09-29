@@ -1,6 +1,6 @@
 # Overlay on docker-compose.yml:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     minio exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     seaweedfs exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
 # OpenFGA is omitted: the suite tests authentication only, so Lakekeeper runs
 # with the default `allowall` authz backend.
 
@@ -92,34 +92,13 @@ services:
         condition: service_healthy
       keycloak:
         condition: service_healthy
-      minio:
+      seaweedfs:
         condition: service_healthy
     ports:
       - "${LH_LAKEKEEPER_PORT:-28181}:8181"
     networks:
       lakehouse:
         ipv4_address: 10.84.0.32
-
-  # MinIO scopes STS-vended creds by the caller's policy, so Lakekeeper's
-  # dedicated user caps vended sessions at the `warehouse` bucket.
-  minio-lakekeeper-init:
-    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      set -e;
-      mc alias set local http://minio:9000 minioadmin minioadmin;
-      printf '%s' '{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:ListBucket\",\"s3:GetBucketLocation\"],\"Resource\":[\"arn:aws:s3:::warehouse\",\"arn:aws:s3:::warehouse/*\"]}]}' > /tmp/lakekeeper-warehouse-policy.json;
-      mc admin policy create local lakekeeper-warehouse /tmp/lakekeeper-warehouse-policy.json || mc admin policy add local lakekeeper-warehouse /tmp/lakekeeper-warehouse-policy.json || true;
-      mc admin user add local lakekeeper lakekeeper-secret-key || true;
-      mc admin policy attach local lakekeeper-warehouse --user lakekeeper || mc admin policy set local lakekeeper-warehouse user=lakekeeper || true;
-      echo 'minio lakekeeper STS user + policy ready'
-      "
-    restart: "no"
-    networks:
-      - lakehouse
 
   # Re-declares the base /etc/hosts loop to add keycloak and lakekeeper.
   exasol:
@@ -132,7 +111,7 @@ services:
       - |
         ( while true; do
             if [ -f /etc/hosts ]; then
-              grep -qE '(^|[[:space:]])minio([[:space:]]|$)' /etc/hosts || printf '10.84.0.10 minio\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts || printf '10.84.0.10 seaweedfs\n' >> /etc/hosts
               grep -qE '(^|[[:space:]])iceberg-rest([[:space:]]|$)' /etc/hosts || printf '10.84.0.11 iceberg-rest\n' >> /etc/hosts
               grep -qE '(^|[[:space:]])keycloak([[:space:]]|$)' /etc/hosts || printf '10.84.0.30 keycloak\n' >> /etc/hosts
               grep -qE '(^|[[:space:]])lakekeeper([[:space:]]|$)' /etc/hosts || printf '10.84.0.32 lakekeeper\n' >> /etc/hosts

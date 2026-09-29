@@ -1,4 +1,4 @@
-//! Iceberg table seeder for lakehouse-engine E2E tests (REST catalog over MinIO).
+//! Iceberg table seeder for lakehouse-engine E2E tests (REST catalog over SeaweedFS).
 //!
 //! Complex columns are writable: `seed_complex_types_probe` builds its Arrow batch from
 //! `schema_to_arrow_schema` after `create_table`, so nested field-ids match the ones
@@ -96,11 +96,11 @@ pub async fn seed_events(catalog_url: &str, warehouse: &str) -> Result<SeedHandl
     Ok(events_handle)
 }
 
-/// `Default` is the static MinIO baseline.
+/// `Default` is the static SeaweedFS baseline.
 #[derive(Clone, Default)]
 pub enum SeedStorage {
     #[default]
-    Minio,
+    SeaweedFs,
     /// Never the container-lifecycle service principal, or seeding would succeed without
     /// exercising the account-key path.
     Adls {
@@ -109,7 +109,7 @@ pub enum SeedStorage {
     },
 }
 
-/// A non-empty `token` is sent as a static bearer credential. `Minio` storage forces
+/// A non-empty `token` is sent as a static bearer credential. `SeaweedFs` storage forces
 /// static S3 credentials over whatever the catalog vends; `Adls` overrides nothing,
 /// since a `sas-enabled: false` warehouse vends no credentials.
 #[derive(Clone, Default)]
@@ -123,10 +123,10 @@ const REST_CATALOG_PROP_TOKEN: &str = "token";
 
 fn seed_storage_config() -> (String, String, String, String, bool) {
     (
-        super::stack::minio_url(),
+        super::stack::seaweedfs_url(),
         "us-east-1".to_string(),
-        "minioadmin".to_string(),
-        "minioadmin".to_string(),
+        "lhadmin".to_string(),
+        "lhadminsecret123".to_string(),
         true,
     )
 }
@@ -168,7 +168,7 @@ fn seed_catalog_props(
     );
 
     match &auth.storage {
-        SeedStorage::Minio => {
+        SeedStorage::SeaweedFs => {
             let (endpoint, region, access_key, secret_key, path_style) = seed_storage_config();
             props.insert(S3_ENDPOINT.to_string(), endpoint);
             props.insert(S3_REGION.to_string(), region);
@@ -211,9 +211,9 @@ pub async fn build_seed_catalog_with_auth(
     let storage_factory: Arc<dyn StorageFactory> = match &auth.storage {
         // Force static S3 credentials: iceberg-catalog-rest merges each table's vended config
         // over the static props, so writes to Lakekeeper's `sts-enabled` warehouse would sign
-        // with the vended session token, which MinIO rejects (`InvalidTokenId`). A custom
+        // with the vended session token, which SeaweedFS rejects. A custom
         // credential loader replaces the config-derived credentials in opendal's S3 backend.
-        SeedStorage::Minio => {
+        SeedStorage::SeaweedFs => {
             let (_, _, access_key, secret_key, _) = seed_storage_config();
             Arc::new(OpenDalStorageFactory::S3 {
                 customized_credential_load: Some(CustomAwsCredentialLoader::new(
@@ -3103,7 +3103,7 @@ mod seed_catalog_props_tests {
     }
 
     #[test]
-    fn default_auth_uses_static_minio_and_injects_no_catalog_auth() {
+    fn default_auth_uses_static_seaweedfs_and_injects_no_catalog_auth() {
         let props = seed_catalog_props("http://lk:8181/catalog", "wh", &SeedCatalogAuth::default());
 
         assert_eq!(
@@ -3111,13 +3111,13 @@ mod seed_catalog_props_tests {
             Some("http://lk:8181/catalog")
         );
         assert_eq!(get(&props, REST_CATALOG_PROP_WAREHOUSE), Some("wh"));
-        assert_eq!(get(&props, S3_ACCESS_KEY_ID), Some("minioadmin"));
-        assert_eq!(get(&props, S3_SECRET_ACCESS_KEY), Some("minioadmin"));
+        assert_eq!(get(&props, S3_ACCESS_KEY_ID), Some("lhadmin"));
+        assert_eq!(get(&props, S3_SECRET_ACCESS_KEY), Some("lhadminsecret123"));
         assert_eq!(get(&props, S3_REGION), Some("us-east-1"));
         assert_eq!(get(&props, S3_PATH_STYLE_ACCESS), Some("true"));
         assert!(
             !props[S3_ENDPOINT].is_empty(),
-            "S3 endpoint must default to the host MinIO URL"
+            "S3 endpoint must default to the host SeaweedFS URL"
         );
         assert!(get(&props, "credential").is_none());
         assert!(get(&props, "oauth2-server-uri").is_none());
@@ -3145,7 +3145,7 @@ mod seed_catalog_props_tests {
         assert_eq!(get(&props, "token"), Some("bearer-xyz"));
 
         // `azdls_config_parse` silently discards `s3.*` properties, so a stray one would leak
-        // MinIO admin credentials into an Azure run invisibly.
+        // SeaweedFS admin credentials into an Azure run invisibly.
         for s3_prop in [
             S3_ENDPOINT,
             S3_REGION,

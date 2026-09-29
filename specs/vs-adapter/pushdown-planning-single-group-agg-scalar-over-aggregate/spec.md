@@ -147,7 +147,7 @@ the scalar-wrapper shape.
 
 ### Scenario: Single-group select item that is a scalar function wrapping aggregates is decomposed into partial columns and one merged row
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO whose data files partition into two or more shards
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS whose data files partition into two or more shards
 * *AND* an ungrouped single-table `pushdown` request (no `groupBy`) whose select list contains a select item that is a scalar function wrapping one or more aggregates — for example `ROUND(SUM(L_QUANTITY), 2)`
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL classify that item as a scalar-over-aggregate single-group item rather than declining to a row scan, and SHALL decompose every `function_aggregate` nested inside it into the same partial `AggregatePlan` list it builds for a top-level aggregate, so each inner aggregate contributes the `PARTIAL_*` columns the scan UDF emits once per shard

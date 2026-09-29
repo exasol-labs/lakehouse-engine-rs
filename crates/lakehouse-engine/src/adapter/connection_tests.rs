@@ -1617,7 +1617,7 @@ fn sts_endpoint_without_a_role_is_rejected() {
     let password = serde_json::json!({
         "warehouse": "wh",
         "secret_key": BASE_SECRET,
-        "aws_sts_endpoint": "http://sts-stub:8080",
+        "aws_sts_endpoint": "http://minio:9000",
     })
     .to_string();
 

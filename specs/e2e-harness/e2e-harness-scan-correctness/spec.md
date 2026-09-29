@@ -33,7 +33,7 @@ the Exasol-version CI gate.
 
 ### Scenario: End-to-end projection + filter + LIMIT query returns correct rows
 
-* *GIVEN* the Docker stack is running with a seeded Iceberg table in the REST catalog over MinIO
+* *GIVEN* the Docker stack is running with a seeded Iceberg table in the REST catalog over SeaweedFS
 * *AND* the Rust SLC and the `.so` are installed and the virtual schema is created
 * *WHEN* a user runs `SELECT <subset of columns> FROM <vs>.<table> WHERE <predicate> LIMIT <n>`
 * *THEN* the query SHALL return exactly the rows that satisfy the predicate, capped at `n`, projected to the selected columns
@@ -49,12 +49,12 @@ the Exasol-version CI gate.
 
 ### Scenario: End-to-end filtered query over a partitioned table returns correct rows with file pruning
 
-* *GIVEN* the Docker stack is running with a seeded **partitioned** Iceberg table in the REST catalog over MinIO, whose data files are distributed across partition values
+* *GIVEN* the Docker stack is running with a seeded **partitioned** Iceberg table in the REST catalog over SeaweedFS, whose data files are distributed across partition values
 * *AND* the lakehouse VS adapter and scan UDF are installed
 * *WHEN* a `SELECT` with a `WHERE` predicate on the partition column (and a second predicate on a value column) is issued against the virtual schema
 * *THEN* the returned rows SHALL exactly match the seeded source rows satisfying the predicate, and SHALL be identical to the same query run with Iceberg pruning unable to apply (predicate forced untranslatable)
 * *AND* where the harness can observe it (Iceberg `plan_files` output during file resolution), the resolved file list SHALL contain fewer files than the unpruned snapshot file count
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: An Iceberg table's list, struct, and map columns return valid JSON end to end
 
@@ -72,7 +72,7 @@ the Exasol-version CI gate.
 
 ### Scenario: Microsecond-distinct Iceberg timestamps round-trip at the declared precision
 
-* *GIVEN* a live Exasol instance, MinIO, and an Iceberg REST catalog
+* *GIVEN* a live Exasol instance, SeaweedFS, and an Iceberg REST catalog
 * *AND* an Iceberg table seeded into its OWN namespace — invisible to every other suite's `createVirtualSchema` enumeration — carrying an `id` column, a `timestamp` column, and a `timestamptz` column, each timestamp column holding FOUR values that differ ONLY below millisecond resolution: `2024-01-01 00:00:00.000001`, `.000002`, `.123456`, and `.123457`, every one of whose fourth fractional digit is below 5 so truncation and round-to-nearest agree at millisecond resolution
 * *AND* a virtual schema created over that namespace through a real `createVirtualSchema`
 * *AND* the running engine's own version, read from the LIVE session and mapped to an expected precision by a test-owned table that MUST NOT call the production version rule it exists to check

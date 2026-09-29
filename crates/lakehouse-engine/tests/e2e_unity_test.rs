@@ -1,6 +1,6 @@
 //! All tests share one virtual schema, so they must run serially (`--test-threads=1`).
 //! The OSS Unity Catalog server has authorization disabled and vends no S3 endpoint, so the
-//! CONNECTION carries no catalog-auth field but does carry MinIO's endpoint and static keys.
+//! CONNECTION carries no catalog-auth field but does carry SeaweedFS's endpoint and static keys.
 #![cfg(feature = "unity-e2e")]
 
 mod common;
@@ -15,7 +15,7 @@ use common::raw_parquet::write_parquet_fixture;
 use common::stack::{
     self, ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
     ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, build_create_connection_sql, exasol_host,
-    exasol_sql_port, local_stack_connection_password, wait_for_exasol, wait_for_minio,
+    exasol_sql_port, local_stack_connection_password, wait_for_exasol, wait_for_seaweedfs,
     wait_for_url,
 };
 use common::timestamp_precision::expected_timestamp_precision;
@@ -78,9 +78,8 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_unity_catalog();
-        stack::wait_for_sts_stub();
 
         install_slc();
         upload_so();
@@ -118,15 +117,15 @@ const VS_ROLE_NAME: &str = "UNITY_DELTA_ROLE_VS";
 const CONN_ROLE_NAME: &str = "UNITY_ROLE_CATALOG_CREDS";
 
 /// A CONNECTION with no `use_vended_credentials` that instead names the
-/// assume-role identity: the base key pair (denied on its own), the role,
-/// its external id, and the local `sts-stub` as `aws_sts_endpoint`.
+/// assume-role identity: the base key pair, the role,
+/// its external id, and SeaweedFS's own STS as `aws_sts_endpoint`.
 fn create_unity_role_virtual_schema(conn: &mut ExaConn) {
     let password = CatalogConnectionPassword {
         access_key: ASSUME_ROLE_BASE_ACCESS_KEY.to_string(),
         secret_key: ASSUME_ROLE_BASE_SECRET_KEY.to_string(),
         aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
         aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
-        aws_sts_endpoint: Some(stack::sts_stub_url_internal()),
+        aws_sts_endpoint: Some(stack::seaweedfs_url_internal()),
         ..local_stack_connection_password()
     };
     let create_conn_sql =
@@ -347,10 +346,10 @@ fn unity_catalog_url() -> String {
 fn delta_creds(use_vended_credentials: bool) -> ConnectionCreds {
     ConnectionCreds {
         warehouse: String::new(),
-        endpoint: stack::minio_url(),
+        endpoint: stack::seaweedfs_url(),
         region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
+        access_key: "lhadmin".to_string(),
+        secret_key: "lhadminsecret123".to_string(),
         session_token: None,
         path_style: Some(true),
         use_sigv4: false,
@@ -451,7 +450,7 @@ fn rt() -> tokio::runtime::Runtime {
 
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
-    wait_for_minio();
+    wait_for_seaweedfs();
     wait_for_unity_catalog();
 
     let rt = rt();
@@ -515,7 +514,7 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
 /// Scenario: Pruning reaches every request shape and changes no result end to end
 #[test]
 fn unity_delta_filters_prune_the_resolved_file_list() {
-    wait_for_minio();
+    wait_for_seaweedfs();
     wait_for_unity_catalog();
 
     let rt = rt();
@@ -652,7 +651,6 @@ fn unity_delta_delete_free_table_returns_its_rows() {
 #[test]
 fn unity_role_connection_reads_a_delta_table_through_the_session() {
     setup();
-    let before = stack::sts_stub_request_count();
     let mut conn = exa_conn();
 
     let role_table = format!("{VS_ROLE_NAME}.MULTI_PART_STATS");
@@ -672,11 +670,6 @@ fn unity_role_connection_reads_a_delta_table_through_the_session() {
     assert!(
         cols.iter().all(|col| col.iter().all(|v| !v.is_null())),
         "a delete-free table's rows must carry real column values, not NULL: {cols:?}"
-    );
-
-    assert!(
-        stack::sts_stub_request_count() > before,
-        "the role query must send at least one AssumeRole request"
     );
 }
 
@@ -1018,7 +1011,7 @@ fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
          type-mapping error: {msg}"
     );
     assert!(
-        !msg.to_lowercase().contains("minioadmin"),
+        !msg.to_lowercase().contains("lhadminsecret123"),
         "{table}'s error text must not contain a credential value: {msg}"
     );
 
@@ -1201,7 +1194,7 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
              types: {msg}"
         );
         assert!(
-            !msg.to_lowercase().contains("minioadmin"),
+            !msg.to_lowercase().contains("lhadminsecret123"),
             "{column}'s error text must not contain a credential value: {msg}"
         );
     }

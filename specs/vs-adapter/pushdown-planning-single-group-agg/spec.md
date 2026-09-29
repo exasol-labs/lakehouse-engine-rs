@@ -67,7 +67,7 @@ select item that is a scalar function wrapping aggregates.
 
 ### Scenario: Aggregate query is translated into a partial-aggregate scan spec
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a query whose select list is one or more supported aggregate functions over the whole table, each either a bare aggregate or a scalar function wrapping aggregates (see `vs-adapter/pushdown-planning-single-group-agg-scalar-over-aggregate`)
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL recognise the request as an aggregate query and resolve the data-file list exactly once

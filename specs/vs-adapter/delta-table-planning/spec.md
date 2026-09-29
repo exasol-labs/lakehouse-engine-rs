@@ -51,7 +51,7 @@ path exactly as they already are for Iceberg.
   plan maps only the Delta primitive types that already have an Arrow type tag and refuses the rest
   at plan time, so an unmapped type is an error rather than a wrong value.
 * **The log-replay step takes an INJECTED object store**, so it is exercised offline against the
-  vendored fixtures over `file://` as well as over MinIO through the live stack. Building the store
+  vendored fixtures over `file://` as well as over SeaweedFS through the live stack. Building the store
   is the reader's, not the replay step's.
 * Every error surfaced by this feature is a `UdfError`, never a panic, because a panic inside a UDF
   is an abnormal VM exit that makes the engine SIGKILL every sibling VM of the statement part. No

@@ -34,7 +34,3 @@ bench/.cache/
 # Generated third-party notices (embeds full license texts; regenerated at
 # release time via `cargo about generate`, never committed)
 THIRD-PARTY-LICENSES.md
-
-# Python bytecode cache (scripts/sts-stub/)
-__pycache__/
-*.pyc

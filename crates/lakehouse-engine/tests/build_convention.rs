@@ -80,28 +80,3 @@ fn makefile_recipe(makefile: &str, target_line_prefix: &str) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-
-#[test]
-fn ci_e2e_job_waits_for_the_sts_stub() {
-    let ci_workflow = workspace_file(".github/workflows/ci.yml");
-
-    assert!(
-        ci_workflow.contains("docker compose up -d --wait exasol minio iceberg-rest sts-stub"),
-        "the e2e job's stack bring-up must wait on sts-stub alongside exasol/minio/iceberg-rest"
-    );
-}
-
-#[test]
-fn unity_up_and_the_e2e_unity_job_start_the_sts_stub() {
-    let unity_up_recipe = makefile_recipe(&workspace_file("Makefile"), "unity-up:");
-    assert!(
-        unity_up_recipe.contains("sts-stub"),
-        "the unity-up target must start sts-stub: {unity_up_recipe}"
-    );
-
-    let ci_workflow = workspace_file(".github/workflows/ci.yml");
-    assert!(
-        ci_workflow.contains("$COMPOSE up -d --wait minio exasol unitycatalog sts-stub"),
-        "the e2e-unity job's stack bring-up must wait on sts-stub alongside minio/exasol/unitycatalog"
-    );
-}

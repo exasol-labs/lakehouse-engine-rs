@@ -26,8 +26,8 @@ aws-smithy-runtime-api = { workspace = true }
 
 reqwest = { workspace = true }
 
-# AWS STS AssumeRole response parsing.
-quick-xml = { workspace = true }
+# AWS STS AssumeRole.
+aws-sdk-sts = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

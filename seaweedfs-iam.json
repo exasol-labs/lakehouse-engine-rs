@@ -1,0 +1,140 @@
+{
+  "identities": [
+    {
+      "name": "lhadmin",
+      "credentials": [
+        {
+          "accessKey": "lhadmin",
+          "secretKey": "lhadminsecret123"
+        }
+      ],
+      "actions": [
+        "Admin",
+        "Read",
+        "Write",
+        "List",
+        "Tagging"
+      ]
+    },
+    {
+      "name": "lhassumebase",
+      "credentials": [
+        {
+          "accessKey": "lhassumebase",
+          "secretKey": "lhassumebasesecret123"
+        }
+      ],
+      "actions": []
+    },
+    {
+      "name": "lakekeeper",
+      "credentials": [
+        {
+          "accessKey": "lakekeeper",
+          "secretKey": "lakekeeper-secret-key"
+        }
+      ],
+      "actions": [
+        "Read:warehouse",
+        "Write:warehouse",
+        "List:warehouse"
+      ]
+    }
+  ],
+  "sts": {
+    "issuer": "seaweedfs-sts",
+    "signingKey": "bGFrZWhvdXNlLWVuZ2luZS1sb2NhbC1zdHMtc2lnbmluZy1rZXk=",
+    "tokenDuration": "1h",
+    "maxSessionLength": "12h"
+  },
+  "policy": {
+    "defaultEffect": "Deny",
+    "storeType": "memory"
+  },
+  "policies": [
+    {
+      "name": "WarehouseRead",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "s3:GetObject",
+              "s3:ListBucket",
+              "s3:GetBucketLocation"
+            ],
+            "Resource": [
+              "arn:aws:s3:::warehouse",
+              "arn:aws:s3:::warehouse/*"
+            ]
+          }
+        ]
+      },
+      "content": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:ListBucket\",\"s3:GetBucketLocation\"],\"Resource\":[\"arn:aws:s3:::warehouse\",\"arn:aws:s3:::warehouse/*\"]}]}"
+    },
+    {
+      "name": "WarehouseReadWrite",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "s3:GetObject",
+              "s3:PutObject",
+              "s3:DeleteObject",
+              "s3:ListBucket",
+              "s3:GetBucketLocation"
+            ],
+            "Resource": [
+              "arn:aws:s3:::warehouse",
+              "arn:aws:s3:::warehouse/*"
+            ]
+          }
+        ]
+      },
+      "content": "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Effect\":\"Allow\",\"Action\":[\"s3:GetObject\",\"s3:PutObject\",\"s3:DeleteObject\",\"s3:ListBucket\",\"s3:GetBucketLocation\"],\"Resource\":[\"arn:aws:s3:::warehouse\",\"arn:aws:s3:::warehouse/*\"]}]}"
+    }
+  ],
+  "roles": [
+    {
+      "roleName": "LakehouseReader",
+      "roleArn": "arn:aws:iam::000000000000:role/LakehouseReader",
+      "trustPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "sts:AssumeRole",
+            "Principal": {
+              "AWS": "arn:aws:iam::000000000000:user/lhassumebase"
+            }
+          }
+        ]
+      },
+      "attachedPolicies": [
+        "WarehouseRead"
+      ]
+    },
+    {
+      "roleName": "LakekeeperVended",
+      "roleArn": "arn:aws:iam::000000000000:role/LakekeeperVended",
+      "trustPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": "sts:AssumeRole",
+            "Principal": {
+              "AWS": "arn:aws:iam::000000000000:user/lakekeeper"
+            }
+          }
+        ]
+      },
+      "attachedPolicies": [
+        "WarehouseReadWrite"
+      ]
+    }
+  ]
+}

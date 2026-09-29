@@ -65,7 +65,7 @@ build_conn_password_lakekeeper() {
 
 # Mirrors stack.rs::local_stack_connection_password.
 build_conn_password_local() {
-  printf '%s' '{"warehouse":"s3://warehouse/","endpoint":"http://minio:9000","region":"us-east-1","access_key":"minioadmin","secret_key":"minioadmin","path_style":true,"use_sigv4":false,"use_vended_credentials":false}'
+  printf '%s' '{"warehouse":"s3://warehouse/","endpoint":"http://seaweedfs:8333","region":"us-east-1","access_key":"lhadmin","secret_key":"lhadminsecret123","path_style":true,"use_sigv4":false,"use_vended_credentials":false}'
 }
 
 # Remote target only: the docker catalog is neither Glue nor Lakekeeper, so a field there would
@@ -274,7 +274,7 @@ case "$TARGET" in
     CONN_PW="$(build_conn_password_local)"
     VS_EXTRA_PROPS="$(build_vs_extra_props true "${BENCH_PARALLELISM_FACTOR:-8}")"
     PROFILE_ON=0
-    echo "== docker: bringing up local stack (minio, iceberg-rest, exasol) =="
+    echo "== docker: bringing up local stack (seaweedfs, iceberg-rest, exasol) =="
     docker compose up -d
     ;;
   remote)
@@ -361,7 +361,7 @@ echo "== building working-tree .so (no-op if fresh) =="
 make cross-udf-build
 
 if [ "$TARGET" = "docker" ]; then
-  wait_http "http://localhost:${LH_MINIO_PORT:-19000}/minio/health/live" "MinIO"
+  wait_http "http://localhost:${LH_SEAWEEDFS_PORT:-19000}/status" "SeaweedFS"
   wait_http "http://localhost:${LH_REST_PORT:-18181}/v1/config" "Iceberg REST"
   wait_exasol
   echo "== loading TPC-H (SF=${TPCH_SCALE}, big tables in ${TPCH_FILES:-4} files) into namespace '${NAMESPACE}' =="

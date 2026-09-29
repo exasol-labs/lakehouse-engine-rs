@@ -1108,3 +1108,59 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
 
     println!("cloud_assume_role_base_identity_alone_is_denied: denied as expected");
 }
+
+/// Cloud assume-role E2E (issue #139): real AWS STS enforces the role's `sts:ExternalId`
+/// condition, which the local SeaweedFS stack does not evaluate. Shares the environment of
+/// `cloud_assume_role_reaches_glue_and_s3_through_the_role`.
+#[test]
+fn cloud_assume_role_wrong_external_id_is_denied() {
+    let env = match AssumeRoleCloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!("SKIPPED: cloud_assume_role_wrong_external_id_is_denied — env vars absent");
+            return;
+        }
+    };
+    const WRONG_EXTERNAL_ID: &str = "wrong-external-id";
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+
+    let conn_name = "GLUE_CATALOG_CREDS_ASSUME_ROLE_BAD_EXTERNAL_ID";
+    let password = CatalogConnectionPassword {
+        aws_external_id: Some(WRONG_EXTERNAL_ID.to_string()),
+        ..env.catalog_connection_password_role()
+    };
+    conn.execute(&build_create_connection_sql(
+        conn_name,
+        &env.glue_catalog_uri,
+        &password,
+    ));
+
+    let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE_BAD_EXTERNAL_ID");
+    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
+    let result = conn.try_execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {vs_name}
+USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
+  CATALOG_CONNECTION = '{conn_name}'
+  NAMESPACE  = '{}'"#,
+        glue_namespace(&env.glue_table)
+    ));
+
+    assert_eq!(
+        result["status"].as_str(),
+        Some("error"),
+        "a wrong external id must fail CREATE VIRTUAL SCHEMA: {result}"
+    );
+    let msg = result["exception"]["text"].as_str().unwrap_or("");
+    assert!(msg.contains("AccessDenied"), "{msg}");
+    assert!(
+        !msg.contains(WRONG_EXTERNAL_ID) && !msg.contains(&env.base_secret_access_key),
+        "credential or external id leaked: {msg}"
+    );
+}

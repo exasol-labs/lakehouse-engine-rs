@@ -7,7 +7,7 @@ Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `
 * **Three optional CONNECTION password fields.** `aws_assume_role_arn` names the role. `aws_external_id` is the `ExternalId` sent for a role whose trust policy requires one. `aws_sts_endpoint` overrides the STS endpoint. Each is a string, and an empty string is absent, per the parsing rule of `vs-adapter/connection-credentials`.
 * **The base identity is the CONNECTION's own key pair.** `access_key`, `secret_key`, and an optional `session_token` sign the `AssumeRole` request. No ambient AWS credential is read: no environment variable, instance profile, or web-identity token. This keeps the explicit-CONNECTION credential model.
 * **The STS request shape follows the AWS STS API reference (`API_AssumeRole`).** `RoleArn` is "Required: Yes". `RoleSessionName` is "Required: Yes", with "Minimum length of 2. Maximum length of 64" and pattern `[\w+=,.@-]*`. `ExternalId` is "Required: No", described as "A unique identifier that might be required when you assume a role in another account", with pattern `[\w+=,.@:\/-]*`. `DurationSeconds` defaults to `3600`. The sample response carries `AssumeRoleResponse/AssumeRoleResult/Credentials` with `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`, under namespace `https://sts.amazonaws.com/doc/2011-06-15/`.
-* **STS endpoint and signing region.** The STS region is the SigV4 signing region `vs-adapter/connection-credentials-sigv4` resolves: the region a standard AWS Glue endpoint names, else the stated `region`. The endpoint is `aws_sts_endpoint` when stated, else `https://sts.<region>.amazonaws.com` for a resolved region, else the global `https://sts.amazonaws.com`. A request with no resolved region is signed for `us-east-1`. A China-region CONNECTION states `aws_sts_endpoint`, because the AWS STS endpoint table lists China endpoints under `.amazonaws.com.cn`.
+* **STS endpoint and signing region.** The STS region is the SigV4 signing region `vs-adapter/connection-credentials-sigv4` resolves: the region a standard AWS Glue endpoint names, else the stated `region`. The endpoint is `aws_sts_endpoint` when stated, else the regional endpoint the official AWS SDK for Rust STS client resolves for that region. A request with no resolved region uses `us-east-1`. A China-region CONNECTION states `aws_sts_endpoint`, because the AWS STS endpoint table lists China endpoints under `.amazonaws.com.cn`.
 
 ## Scenarios
 
@@ -47,9 +47,9 @@ Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `
 
 * *GIVEN* a CONNECTION that names a role and carries the base key pair
 * *WHEN* the adapter sends the `AssumeRole` request
-* *THEN* the request SHALL be an HTTP `GET` whose query carries `Action=AssumeRole`, `Version=2011-06-15`, `RoleArn`, and `RoleSessionName=lakehouse-engine`, SHALL carry `ExternalId` exactly when the CONNECTION states `aws_external_id`, and MUST NOT carry `DurationSeconds`
-* *AND* the request SHALL be SigV4-signed for the service `sts` and the STS region of § Background, with the base `access_key` and `secret_key`, and with the base `session_token` as `x-amz-security-token` when the CONNECTION states one
-* *AND* every character the `ExternalId` pattern admits (`+`, `=`, `,`, `.`, `@`, `:`, `/`, `-`, and word characters) SHALL be encoded identically in the sent query and in the signed canonical query, so STS recomputes the same signature
+* *THEN* the call SHALL be made through the official `aws-sdk-sts` client, never a hand-written STS request, signer, or response parser, so the wire protocol, SigV4 signing, and response parsing are the SDK's
+* *AND* the call SHALL pass `RoleArn`, `RoleSessionName=lakehouse-engine`, and `ExternalId` exactly when the CONNECTION states `aws_external_id`, and MUST NOT pass `DurationSeconds`
+* *AND* the client SHALL use the base `access_key`, `secret_key`, and stated `session_token` as its only credentials, the STS region of § Background, and no retry
 
 ### Scenario: The STS endpoint is resolved from the CONNECTION and gated on plaintext consent
 

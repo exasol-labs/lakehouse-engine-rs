@@ -344,17 +344,9 @@ jobs:
 
       # `up --wait` fails on a one-shot container even after a clean exit, so
       # one-shot jobs are `docker wait`-ed first.
-      - name: Start stack (Exasol + MinIO + Iceberg REST)
+      - name: Start stack (Exasol + SeaweedFS + Iceberg REST)
         run: |
-          docker compose up -d minio-init
-          # `docker wait` prints the container's exit code; it always exits 0 itself.
-          INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-init-1)
-          if [ "$INIT_EXIT" != "0" ]; then
-            echo "::error::minio-init exited $INIT_EXIT (bucket creation failed)"
-            docker compose logs minio-init
-            exit 1
-          fi
-          docker compose up -d --wait exasol minio iceberg-rest sts-stub
+          docker compose up -d --wait exasol seaweedfs iceberg-rest
 
           docker compose up -d spark-iceberg-fixtures
           SPARK_FIXTURES_EXIT=$(docker wait lakehouse-engine-rs-spark-iceberg-fixtures-1)
@@ -412,25 +404,9 @@ jobs:
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml pull --quiet
 
       # One-shot jobs are `docker wait`-ed first (see `e2e`).
-      - name: Start stack (Exasol + MinIO + Keycloak + Lakekeeper)
+      - name: Start stack (Exasol + SeaweedFS + Keycloak + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
-
-          $COMPOSE up -d minio-init
-          INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-init-1)
-          if [ "$INIT_EXIT" != "0" ]; then
-            echo "::error::minio-init exited $INIT_EXIT (bucket creation failed)"
-            $COMPOSE logs minio-init
-            exit 1
-          fi
-
-          $COMPOSE up -d minio-lakekeeper-init
-          STS_INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-lakekeeper-init-1)
-          if [ "$STS_INIT_EXIT" != "0" ]; then
-            echo "::error::minio-lakekeeper-init exited $STS_INIT_EXIT (STS user/policy setup failed)"
-            $COMPOSE logs minio-lakekeeper-init
-            exit 1
-          fi
 
           $COMPOSE up -d lakekeeper-migrate
           MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-lakekeeper-migrate-1)
@@ -440,7 +416,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol minio keycloak lakekeeper-db lakekeeper
+          $COMPOSE up -d --wait exasol seaweedfs keycloak lakekeeper-db lakekeeper
 
       - name: Run Lakekeeper E2E suite
         run: make test-e2e-lakekeeper
@@ -495,20 +471,12 @@ jobs:
       - name: Pull stack images
         run: docker compose -f docker-compose.yml -f docker-compose.unity.yml pull --quiet
 
-      # One-shot jobs are `docker wait`-ed first (see `e2e`); seed.sh needs the bucket.
-      - name: Start stack (Exasol + MinIO + Unity Catalog)
+      # One-shot jobs are `docker wait`-ed first (see `e2e`).
+      - name: Start stack (Exasol + SeaweedFS + Unity Catalog)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.unity.yml"
 
-          $COMPOSE up -d minio-init
-          INIT_EXIT=$(docker wait lakehouse-engine-rs-minio-init-1)
-          if [ "$INIT_EXIT" != "0" ]; then
-            echo "::error::minio-init exited $INIT_EXIT (bucket creation failed)"
-            $COMPOSE logs minio-init
-            exit 1
-          fi
-
-          $COMPOSE up -d --wait minio exasol unitycatalog sts-stub
+          $COMPOSE up -d --wait seaweedfs exasol unitycatalog
 
       - name: Seed Unity Catalog fixtures
         run: ./scripts/unity/seed.sh
@@ -529,12 +497,10 @@ jobs:
           sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
           echo "--- last 40 kernel lines (fallback) ---"
           sudo dmesg --ctime | tail -40 || true
-          echo "=== minio-init logs ==="
-          $COMPOSE logs minio-init | tail -100 || true
           echo "=== unitycatalog logs ==="
           $COMPOSE logs unitycatalog | tail -100 || true
-          echo "=== minio logs ==="
-          $COMPOSE logs minio | tail -100 || true
+          echo "=== seaweedfs logs ==="
+          $COMPOSE logs seaweedfs | tail -100 || true
           echo "=== exasql crash logs ==="
           $COMPOSE exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
           echo "=== collecting /exa/logs tree for artifact ==="

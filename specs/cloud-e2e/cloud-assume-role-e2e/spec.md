@@ -23,3 +23,10 @@ An opt-in end-to-end test that proves a real AWS STS accepts the engine's signed
 * *WHEN* the test creates a virtual schema through a SigV4 CONNECTION carrying the base key pair and `region` and naming no role
 * *THEN* `CREATE VIRTUAL SCHEMA` SHALL fail, because Glue denies the base identity
 * *AND* the test SHALL skip under the same absent-variable condition, and its output MUST NOT contain any credential value
+
+### Scenario: A wrong external id is denied by STS
+
+* *GIVEN* the environment of § "An assume-role CONNECTION reaches Glue and S3 through the assumed role"
+* *WHEN* the test creates a virtual schema through a SigV4 CONNECTION carrying the base key pair, the role, and an `aws_external_id` the role's trust policy does not accept
+* *THEN* `CREATE VIRTUAL SCHEMA` SHALL fail with an error naming the STS `AccessDenied` code, which proves that real AWS STS enforces `sts:ExternalId`, the one condition the local SeaweedFS stack (`cloud-e2e/assume-role-e2e`) does not evaluate
+* *AND* the test SHALL skip under the same absent-variable condition, and its output MUST NOT contain any credential value or the rejected external id

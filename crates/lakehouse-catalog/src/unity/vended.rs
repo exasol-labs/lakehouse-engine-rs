@@ -23,7 +23,7 @@ pub struct TemporaryTableCredentials {
     pub gcp_oauth_token: Option<GcpOauthToken>,
 }
 
-/// `endpoint` is vended only by OSS/MinIO deployments; absent means the AWS default.
+/// `endpoint` is vended only by OSS/SeaweedFS deployments; absent means the AWS default.
 #[derive(Clone, Deserialize)]
 pub struct AwsTempCredentials {
     pub access_key_id: String,

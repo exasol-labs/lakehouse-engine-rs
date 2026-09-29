@@ -5,7 +5,7 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 ## Background
 
 * SigV4 signing and credential vending are opt-in per CONNECTION (`use_sigv4`,
-  `use_vended_credentials`); both default to false so existing MinIO/REST stacks
+  `use_vended_credentials`); both default to false so existing SeaweedFS/REST stacks
   behave exactly as before.
 * On the SigV4/Glue path the adapter derives the REST catalog prefix `catalogs/{warehouse}`
   by unconditionally prepending `catalogs/` to the configured bare-account-id `warehouse`,
@@ -130,7 +130,7 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 
 ### Scenario: Unsigned catalog path is unchanged when SigV4 and vending are both disabled
 
-* *GIVEN* a virtual schema whose CONNECTION credentials omit `use_sigv4` or set it to false AND omit `use_vended_credentials` or set it to false (the existing MinIO / local REST case)
+* *GIVEN* a virtual schema whose CONNECTION credentials omit `use_sigv4` or set it to false AND omit `use_vended_credentials` or set it to false (the existing SeaweedFS / local REST case)
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL resolve the file list with unsigned catalog requests exactly as before
 * *AND* the adapter MUST NOT read any vended credentials from the `loadTable` response

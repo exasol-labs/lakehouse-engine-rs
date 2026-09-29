@@ -52,12 +52,12 @@ test:
 EXASOL_HOST      ?= localhost
 LH_EXASOL_PORT   ?= 28563
 LH_BUCKETFS_PORT ?= 22581
-LH_MINIO_PORT    ?= 19000
+LH_SEAWEEDFS_PORT    ?= 19000
 LH_REST_PORT     ?= 18181
 
 export LH_EXASOL_PORT
 export LH_BUCKETFS_PORT
-export LH_MINIO_PORT
+export LH_SEAWEEDFS_PORT
 export LH_REST_PORT
 
 # E2E suites FAIL (not skip) when their stack is unavailable, and run serially
@@ -67,7 +67,7 @@ test-e2e: cross-udf-build
 
 # Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     minio exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     seaweedfs exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
 test-e2e-lakekeeper: cross-udf-build
 	cargo test --features lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
@@ -181,7 +181,7 @@ test-lakekeeper-scripts:
 
 # FAILS (not skips) when the stack is down. Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     minio keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     seaweedfs keycloak lakekeeper-db lakekeeper-migrate lakekeeper
 test-lakekeeper-local:
 	bash deploy/scripts/tests/lakekeeper-local.test.sh
 
@@ -202,8 +202,7 @@ bench: cross-udf-build
 # the docker network (extra_hosts in the overlay).
 unity-up:
 	docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
-	  minio exasol unitycatalog sts-stub
-	docker compose -f docker-compose.yml up -d minio-init
+	  seaweedfs exasol unitycatalog
 	./scripts/unity/seed.sh
 
 unity-down:

@@ -1,22 +1,22 @@
 //! AWS STS `AssumeRole`: turns a credential set that names an IAM role into
 //! the session identity a request acts as.
 //!
-//! Owns the whole STS protocol: the endpoint and signing-region rule, the
-//! Query-API `GET` and its percent-encoding, SigV4 signing for service `sts`,
-//! the request timeout, the XML response, and the redaction of every error.
+//! The wire protocol, SigV4 signing, and endpoint resolution belong to the
+//! official `aws-sdk-sts` client. This module owns only the `aws_sts_endpoint`
+//! consent rule, the request timeout, and the redaction of every error.
 
 use crate::ConnectionCreds;
 use crate::creds::non_empty;
 use crate::redaction::redact_error_text;
-use crate::sigv4::sign_request;
+use aws_sdk_sts::config::{
+    BehaviorVersion, Credentials, Region, retry::RetryConfig, timeout::TimeoutConfig,
+};
+use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
 use exasol_udf_sdk::error::UdfError;
-use serde::Deserialize;
 use std::time::Duration;
 
 const STS_TIMEOUT: Duration = Duration::from_secs(30);
-const API_VERSION: &str = "2011-06-15";
 const ROLE_SESSION_NAME: &str = "lakehouse-engine";
-const GLOBAL_ENDPOINT: &str = "https://sts.amazonaws.com";
 const UNRESOLVED_SIGNING_REGION: &str = "us-east-1";
 
 /// The credential set a request acts as: `creds` unchanged, with no request,
@@ -47,11 +47,14 @@ pub(crate) async fn resolve_aws_identity_within(
         return Ok(creds);
     };
     let redacted = |msg: String| UdfError::User(redact_error_text(&msg, &base_secrets(&creds)));
-    let endpoint = StsEndpoint {
-        timeout,
-        ..StsEndpoint::resolve(&creds, catalog_uri, allow_http).map_err(redacted)?
-    };
-    let session = assume_role(&creds, role_arn, &endpoint)
+    let endpoint = non_empty(&creds.aws_sts_endpoint)
+        .map(|stated| stated_endpoint(stated, allow_http))
+        .transpose()
+        .map_err(redacted)?;
+    let region = creds
+        .sigv4_signing_region(catalog_uri)
+        .unwrap_or_else(|| UNRESOLVED_SIGNING_REGION.to_string());
+    let session = assume_role(&creds, role_arn, endpoint, region, timeout)
         .await
         .map_err(redacted)?;
     Ok(ConnectionCreds {
@@ -73,80 +76,79 @@ fn base_secrets(creds: &ConnectionCreds) -> Vec<&str> {
     .collect()
 }
 
+struct SessionCredentials {
+    access_key: String,
+    secret_key: String,
+    session_token: String,
+}
+
 async fn assume_role(
     creds: &ConnectionCreds,
     role_arn: &str,
-    endpoint: &StsEndpoint,
-) -> Result<SessionCredentials, String> {
-    let failure = |reason: String| {
-        format!(
-            "AWS STS AssumeRole of role '{role_arn}' at {} failed: {reason}",
-            endpoint.host()
-        )
-    };
-    let describe =
-        |error: reqwest::Error| failure(describe_transport_error(error, endpoint.timeout));
-
-    let client = reqwest::Client::builder()
-        .timeout(endpoint.timeout)
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .map_err(describe)?;
-    let mut url = endpoint.url.clone();
-    url.set_query(Some(&assume_role_query(
-        role_arn,
-        non_empty(&creds.aws_external_id),
-    )));
-    let request = client.get(url).build().map_err(describe)?;
-    let signed = sign_request(
-        request,
-        &creds.access_key,
-        &creds.secret_key,
-        non_empty(&creds.session_token),
-        &endpoint.region,
-        "sts",
-    )
-    .map_err(|e| failure(format!("the request could not be signed: {e}")))?;
-
-    let response = client.execute(signed).await.map_err(describe)?;
-    let status = response.status();
-    let body = response.text().await.map_err(describe)?;
-    if !status.is_success() {
-        return Err(failure(describe_rejection(status, &body)));
-    }
-    session_credentials(&body).map_err(failure)
-}
-
-struct StsEndpoint {
-    url: url::Url,
+    endpoint: Option<url::Url>,
     region: String,
     timeout: Duration,
+) -> Result<SessionCredentials, String> {
+    let target = endpoint
+        .as_ref()
+        .map_or_else(|| "the regional STS endpoint".to_string(), endpoint_host);
+    let failure = |reason: String| {
+        format!("AWS STS AssumeRole of role '{role_arn}' at {target} failed: {reason}")
+    };
+
+    let base = Credentials::new(
+        &creds.access_key,
+        &creds.secret_key,
+        non_empty(&creds.session_token).map(str::to_string),
+        None,
+        "lakehouse-connection",
+    );
+    let mut config = aws_sdk_sts::Config::builder()
+        .behavior_version(BehaviorVersion::latest())
+        .region(Region::new(region))
+        .credentials_provider(base)
+        .retry_config(RetryConfig::disabled())
+        .timeout_config(TimeoutConfig::builder().operation_timeout(timeout).build());
+    if let Some(endpoint) = endpoint {
+        config = config.endpoint_url(endpoint);
+    }
+    let client = aws_sdk_sts::Client::from_conf(config.build());
+
+    let output = client
+        .assume_role()
+        .role_arn(role_arn)
+        .role_session_name(ROLE_SESSION_NAME)
+        .set_external_id(non_empty(&creds.aws_external_id).map(str::to_string))
+        .send()
+        .await
+        .map_err(|error| failure(describe_error(&error, timeout)))?;
+
+    let session = output
+        .credentials()
+        .ok_or_else(|| failure("the STS response carries no Credentials".into()))?;
+    for (element, value) in [
+        ("AccessKeyId", session.access_key_id()),
+        ("SecretAccessKey", session.secret_access_key()),
+        ("SessionToken", session.session_token()),
+    ] {
+        if value.trim().is_empty() {
+            return Err(failure(format!(
+                "the STS response carries no Credentials/{element}"
+            )));
+        }
+    }
+    Ok(SessionCredentials {
+        access_key: session.access_key_id().trim().to_string(),
+        secret_key: session.secret_access_key().trim().to_string(),
+        session_token: session.session_token().trim().to_string(),
+    })
 }
 
-impl StsEndpoint {
-    fn resolve(
-        creds: &ConnectionCreds,
-        catalog_uri: &str,
-        allow_http: bool,
-    ) -> Result<Self, String> {
-        let region = creds.sigv4_signing_region(catalog_uri);
-        let url = match non_empty(&creds.aws_sts_endpoint) {
-            Some(stated) => stated_endpoint(stated, allow_http)?,
-            None => default_endpoint(region.as_deref())?,
-        };
-        Ok(Self {
-            url,
-            region: region.unwrap_or_else(|| UNRESOLVED_SIGNING_REGION.to_string()),
-            timeout: STS_TIMEOUT,
-        })
-    }
-
-    fn host(&self) -> String {
-        let host = self.url.host_str().unwrap_or_default();
-        match self.url.port() {
-            Some(port) => format!("{host}:{port}"),
-            None => host.to_string(),
-        }
+fn endpoint_host(url: &url::Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
     }
 }
 
@@ -167,55 +169,38 @@ fn stated_endpoint(stated: &str, allow_http: bool) -> Result<url::Url, String> {
     }
 }
 
-fn default_endpoint(region: Option<&str>) -> Result<url::Url, String> {
-    let mut url = url::Url::parse(GLOBAL_ENDPOINT).expect("the global STS endpoint is a URL");
-    if let Some(region) = region {
-        url.set_host(Some(&format!("sts.{region}.amazonaws.com")))
-            .map_err(|_| {
-                format!(
-                    "region '{region}' does not form a valid STS endpoint host; state \
-                     aws_sts_endpoint instead"
-                )
-            })?;
-    }
-    Ok(url)
-}
-
-fn assume_role_query(role_arn: &str, external_id: Option<&str>) -> String {
-    [
-        ("Action", "AssumeRole"),
-        ("Version", API_VERSION),
-        ("RoleArn", role_arn),
-        ("RoleSessionName", ROLE_SESSION_NAME),
-    ]
-    .into_iter()
-    .chain(external_id.map(|id| ("ExternalId", id)))
-    .map(|(key, value)| format!("{}={}", encode_rfc3986(key), encode_rfc3986(value)))
-    .collect::<Vec<_>>()
-    .join("&")
-}
-
-/// SigV4's canonical query encoding, so the sent query is byte-identical to the
-/// one aws-sigv4 signs and STS recomputes: only RFC 3986 unreserved bytes stay literal.
-fn encode_rfc3986(value: &str) -> String {
-    let mut encoded = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
-            encoded.push(char::from(byte));
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
+/// Built from STS's own status, code, and message only: the SDK's `Debug` and
+/// `DisplayErrorContext` renderings embed the raw response and would echo its body.
+fn describe_error<E, R>(error: &SdkError<E, R>, timeout: Duration) -> String
+where
+    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
+    R: ResponseStatus,
+{
+    match error {
+        SdkError::TimeoutError(_) => format!("the request timed out after {timeout:?}"),
+        SdkError::DispatchFailure(failure) => failure
+            .as_connector_error()
+            .map_or_else(|| "the request could not be sent".to_string(), |e| chain(e)),
+        SdkError::ConstructionFailure(_) => "the request could not be built".to_string(),
+        SdkError::ResponseError(context) => format!(
+            "STS returned HTTP {} with an unreadable response",
+            context.raw().status_code()
+        ),
+        SdkError::ServiceError(context) => {
+            let mut description = format!("STS returned HTTP {}", context.raw().status_code());
+            let meta = context.err().meta();
+            for part in [meta.code(), meta.message()].into_iter().flatten() {
+                description.push_str(&format!(": {}", part.trim()));
+            }
+            description
         }
+        _ => "the request failed".to_string(),
     }
-    encoded
 }
 
-fn describe_transport_error(error: reqwest::Error, timeout: Duration) -> String {
-    if error.is_timeout() {
-        return format!("the request timed out after {timeout:?}");
-    }
-    let error = error.without_url();
+fn chain(error: &dyn std::error::Error) -> String {
     let mut description = error.to_string();
-    let mut cause = std::error::Error::source(&error);
+    let mut cause = error.source();
     while let Some(source) = cause {
         description.push_str(&format!(": {source}"));
         cause = source.source();
@@ -223,87 +208,14 @@ fn describe_transport_error(error: reqwest::Error, timeout: Duration) -> String 
     description
 }
 
-fn describe_rejection(status: reqwest::StatusCode, body: &str) -> String {
-    let mut description = format!("STS returned HTTP {}", status.as_u16());
-    if let Ok(StsDocument::ErrorResponse(response)) = quick_xml::de::from_str(body) {
-        let detail = response.error.unwrap_or_default();
-        for part in [detail.code, detail.message].into_iter().flatten() {
-            let part = part.trim();
-            if !part.is_empty() {
-                description.push_str(&format!(": {part}"));
-            }
-        }
+trait ResponseStatus {
+    fn status_code(&self) -> u16;
+}
+
+impl ResponseStatus for aws_sdk_sts::config::http::HttpResponse {
+    fn status_code(&self) -> u16 {
+        self.status().as_u16()
     }
-    description
-}
-
-fn session_credentials(body: &str) -> Result<SessionCredentials, String> {
-    let Ok(StsDocument::AssumeRoleResponse(response)) = quick_xml::de::from_str(body) else {
-        return Err("the STS response is not a well-formed AssumeRoleResponse document".into());
-    };
-    let credentials = response
-        .assume_role_result
-        .and_then(|result| result.credentials)
-        .unwrap_or_default();
-    Ok(SessionCredentials {
-        access_key: required_element(credentials.access_key_id, "AccessKeyId")?,
-        secret_key: required_element(credentials.secret_access_key, "SecretAccessKey")?,
-        session_token: required_element(credentials.session_token, "SessionToken")?,
-    })
-}
-
-fn required_element(value: Option<String>, element: &str) -> Result<String, String> {
-    value
-        .map(|text| text.trim().to_string())
-        .filter(|text| !text.is_empty())
-        .ok_or_else(|| {
-            format!("the STS AssumeRoleResponse carries no AssumeRoleResult/Credentials/{element}")
-        })
-}
-
-struct SessionCredentials {
-    access_key: String,
-    secret_key: String,
-    session_token: String,
-}
-
-#[derive(Deserialize)]
-enum StsDocument {
-    AssumeRoleResponse(AssumeRoleResponse),
-    ErrorResponse(ErrorResponse),
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct AssumeRoleResponse {
-    assume_role_result: Option<AssumeRoleResult>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct AssumeRoleResult {
-    credentials: Option<CredentialsElement>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct CredentialsElement {
-    access_key_id: Option<String>,
-    secret_access_key: Option<String>,
-    session_token: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ErrorResponse {
-    error: Option<ErrorElement>,
-}
-
-#[derive(Default, Deserialize)]
-#[serde(rename_all = "PascalCase")]
-struct ErrorElement {
-    code: Option<String>,
-    message: Option<String>,
 }
 
 #[cfg(test)]

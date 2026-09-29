@@ -10,7 +10,7 @@ use common::seed::{build_seed_catalog, rest_replace_current_schema};
 use common::stack::{
     CatalogConnectionPassword, build_create_connection_sql, iceberg_catalog_url,
     iceberg_catalog_url_internal, local_stack_connection_password, wait_for_exasol,
-    wait_for_iceberg_catalog, wait_for_minio,
+    wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 
 use arrow::array::{Float64Array, Int64Array, RecordBatch};
@@ -40,7 +40,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_iceberg_catalog();
 
         install_slc();

@@ -11,7 +11,7 @@ use common::seed::{
     order_date_days, order_totalprice_unscaled, seed_events,
 };
 use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
+    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 
 use std::collections::HashMap;
@@ -27,7 +27,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_iceberg_catalog();
 
         let rt = tokio::runtime::Builder::new_current_thread()

@@ -113,7 +113,7 @@ delete-file references, and logical schema feed the scan-driving SQL.
 
 ### Scenario: Pushdown resolves the file list once and builds a scan-driving query
 
-* *GIVEN* a virtual schema over a namespace whose tables are backed by MinIO
+* *GIVEN* a virtual schema over a namespace whose tables are backed by SeaweedFS
 * *AND* a query that projects a subset of columns from one of those tables
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL determine the target Iceberg table from the schema-metadata mapping, resolve that table's Iceberg snapshot, data-file list, and each file's byte size exactly once, and at that same seam extract the table's current Iceberg schema (from `current_schema()`) into a logical schema carrying, per column, its `field_id`, current name, Arrow type, and nullability
@@ -131,7 +131,7 @@ delete-file references, and logical schema feed the scan-driving SQL.
 
 ### Scenario: Positional-delete file references are carried in the per-shard files argument
 
-* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by MinIO, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity)
+* *GIVEN* a virtual schema over an Iceberg merge-on-read table backed by SeaweedFS, where `plan_files` associates each data file with its applicable Parquet positional-delete files (at `file` or `partition` granularity)
 * *WHEN* Exasol sends the corresponding pushdown request
 * *THEN* the adapter SHALL resolve the data-file list, each file's byte size, and each file's associated positional-delete files exactly once, at the same resolve-once seam, and MUST NOT require the scan UDF to discover delete files itself
 * *AND* the adapter SHALL carry each data file's associated positional-delete file references (path, byte size, delete content type) in the per-shard files argument alongside the data-file entry, keeping the wire surface minimal — no serialized Iceberg schema and no bound predicate are added for delete support

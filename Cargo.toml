@@ -58,6 +58,5 @@ aws-smithy-runtime-api = { version = "1", features = ["client"] }
 
 reqwest = { version = "0.12" }
 
-# Parses AWS STS `AssumeRole` XML responses in lakehouse-catalog; already resolved
-# to 0.39.4 with serde through object_store, so it adds no package to the lockfile.
-quick-xml = { version = "0.39", features = ["serialize"] }
+# Official AWS STS client: owns the AssumeRole wire protocol, signing, and endpoint rules.
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }

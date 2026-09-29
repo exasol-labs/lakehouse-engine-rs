@@ -31,8 +31,8 @@ pub fn bucketfs_port() -> u16 {
     port_from_env("LH_BUCKETFS_PORT", 22581)
 }
 
-pub fn minio_port() -> u16 {
-    port_from_env("LH_MINIO_PORT", 19000)
+pub fn seaweedfs_port() -> u16 {
+    port_from_env("LH_SEAWEEDFS_PORT", 19000)
 }
 
 pub fn rest_port() -> u16 {
@@ -44,8 +44,9 @@ pub fn iceberg_catalog_url() -> String {
         .unwrap_or_else(|_| format!("http://localhost:{}", rest_port()))
 }
 
-pub fn minio_url() -> String {
-    std::env::var("MINIO_URL").unwrap_or_else(|_| format!("http://localhost:{}", minio_port()))
+pub fn seaweedfs_url() -> String {
+    std::env::var("SEAWEEDFS_URL")
+        .unwrap_or_else(|_| format!("http://localhost:{}", seaweedfs_port()))
 }
 
 /// The UDF runs inside the Exasol container, so it needs the in-network address, not the
@@ -55,53 +56,19 @@ pub fn iceberg_catalog_url_internal() -> String {
         .unwrap_or_else(|_| "http://iceberg-rest:8181".to_string())
 }
 
-pub fn minio_url_internal() -> String {
-    std::env::var("MINIO_URL_INTERNAL").unwrap_or_else(|_| "http://minio:9000".to_string())
+pub fn seaweedfs_url_internal() -> String {
+    std::env::var("SEAWEEDFS_URL_INTERNAL").unwrap_or_else(|_| "http://seaweedfs:8333".to_string())
 }
 
-/// `sts-stub` host port. `LH_STS_STUB_PORT`, default 19090.
-pub fn sts_stub_port() -> u16 {
-    port_from_env("LH_STS_STUB_PORT", 19090)
-}
-
-/// Base URL of the local STS stub as seen from the test process (host-side).
-pub fn sts_stub_url() -> String {
-    std::env::var("STS_STUB_URL")
-        .unwrap_or_else(|_| format!("http://localhost:{}", sts_stub_port()))
-}
-
-/// The STS stub's `aws_sts_endpoint` as reached from inside the Exasol UDF
-/// (Docker network) — what a role CONNECTION's password names.
-pub fn sts_stub_url_internal() -> String {
-    std::env::var("STS_STUB_URL_INTERNAL").unwrap_or_else(|_| "http://sts-stub:8080".to_string())
-}
-
-// The assume-role stub identity, mirroring docker-compose.yml's `minio-init` (the
-// base user with no bucket policy) and `sts-stub` (the role and the external id it
-// requires) services. The external id deliberately holds `+`, `=`, `/`, `:`, and `@`.
+// The assume-role identity, mirroring `seaweedfs-iam.json`: a base user with no S3 access
+// that the `LakehouseReader` role's trust policy admits. SeaweedFS does not evaluate
+// `sts:ExternalId`, so the external id (deliberately holding `+`, `=`, `/`, `:`, `@`) only
+// exercises the encoding path; its enforcement is covered by the cloud E2E.
 pub const ASSUME_ROLE_BASE_ACCESS_KEY: &str = "lhassumebase";
 pub const ASSUME_ROLE_BASE_SECRET_KEY: &str = "lhassumebasesecret123";
-pub const ASSUME_ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo";
+pub const ASSUME_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/LakehouseReader";
+pub const ASSUME_ROLE_UNKNOWN_ARN: &str = "arn:aws:iam::000000000000:role/NoSuchRole";
 pub const ASSUME_ROLE_EXTERNAL_ID: &str = "lh+ext=id/2026:demo@example";
-
-/// Number of `AssumeRole` attempts the stub has recorded so far
-/// (`GET /__requests`), so a test can assert it grew after a role query.
-pub fn sts_stub_request_count() -> u64 {
-    let url = format!("{}/__requests", sts_stub_url());
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .expect("build HTTP client");
-    let body: serde_json::Value = client
-        .get(&url)
-        .send()
-        .unwrap_or_else(|e| panic!("GET {url}: {e}"))
-        .json()
-        .unwrap_or_else(|e| panic!("parse {url} response as JSON: {e}"));
-    body["count"]
-        .as_u64()
-        .unwrap_or_else(|| panic!("{url} response carries no numeric 'count': {body}"))
-}
 
 /// Prefers `EXASOL_CONTAINER`, then the compose-labelled container publishing this
 /// stack's SQL port, then a directory-derived default.
@@ -200,20 +167,13 @@ pub fn wait_for_exasol() {
     }
 }
 
-pub fn wait_for_minio() {
-    let url = format!("{}/minio/health/live", minio_url());
+pub fn wait_for_seaweedfs() {
+    let url = format!("{}/status", seaweedfs_url());
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
 pub fn wait_for_iceberg_catalog() {
     let url = format!("{}/v1/config", iceberg_catalog_url());
-    wait_for_url(&url, DEFAULT_TIMEOUT);
-}
-
-/// Assert the STS stub is reachable; panic if not — the assume-role suite
-/// FAILS, not skips, like every other local Docker E2E dependency.
-pub fn wait_for_sts_stub() {
-    let url = format!("{}/health", sts_stub_url());
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
@@ -288,7 +248,7 @@ pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
         .join("target/release/liblakehouse_engine.so")
 }
 
-/// `path_style` defaults to `false`; MinIO callers must set it explicitly.
+/// `path_style` defaults to `false`; SeaweedFS callers must set it explicitly.
 #[derive(Default)]
 pub struct CatalogConnectionPassword {
     pub warehouse: String,
@@ -311,7 +271,7 @@ pub struct CatalogConnectionPassword {
     pub aws_assume_role_arn: Option<String>,
     /// STS `ExternalId` for the assumed role. Requires `aws_assume_role_arn`. Absent when not supplied.
     pub aws_external_id: Option<String>,
-    /// STS endpoint override (e.g. the local `sts-stub`). Requires `aws_assume_role_arn`. Absent when not supplied.
+    /// STS endpoint override (e.g. the local SeaweedFS STS). Requires `aws_assume_role_arn`. Absent when not supplied.
     pub aws_sts_endpoint: Option<String>,
 }
 
@@ -386,10 +346,10 @@ pub fn build_create_connection_sql(
 pub fn local_stack_connection_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
-        endpoint: minio_url_internal(),
+        endpoint: seaweedfs_url_internal(),
         region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
+        access_key: "lhadmin".to_string(),
+        secret_key: "lhadminsecret123".to_string(),
         session_token: None,
         path_style: true,
         use_sigv4: false,
@@ -413,10 +373,10 @@ mod catalog_connection_password_tests {
     fn base_password() -> CatalogConnectionPassword {
         CatalogConnectionPassword {
             warehouse: "s3://warehouse/".to_string(),
-            endpoint: "http://minio:9000".to_string(),
+            endpoint: "http://seaweedfs:8333".to_string(),
             region: "us-east-1".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key: "lhadmin".to_string(),
+            secret_key: "lhadminsecret123".to_string(),
             path_style: true,
             ..Default::default()
         }
@@ -493,7 +453,7 @@ mod catalog_connection_password_tests {
                 "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo".to_string(),
             ),
             aws_external_id: Some("lh+ext=id/2026:demo@example".to_string()),
-            aws_sts_endpoint: Some("http://sts-stub:8080".to_string()),
+            aws_sts_endpoint: Some("http://seaweedfs:8333".to_string()),
             ..base_password()
         };
         let json_str = password.to_sql_password_json();
@@ -503,6 +463,6 @@ mod catalog_connection_password_tests {
             "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo"
         );
         assert_eq!(parsed["aws_external_id"], "lh+ext=id/2026:demo@example");
-        assert_eq!(parsed["aws_sts_endpoint"], "http://sts-stub:8080");
+        assert_eq!(parsed["aws_sts_endpoint"], "http://seaweedfs:8333");
     }
 }

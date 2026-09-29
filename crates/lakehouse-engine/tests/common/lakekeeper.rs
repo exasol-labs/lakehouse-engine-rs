@@ -13,13 +13,14 @@ const KEYCLOAK_REALM: &str = "iceberg";
 const OAUTH_CLIENT_ID: &str = "lakehouse";
 const OAUTH_CLIENT_SECRET: &str = "lakehouse-engine-secret";
 const WAREHOUSE_BUCKET: &str = "warehouse";
-/// MinIO ignores the region, but the Lakekeeper storage profile requires one.
+/// SeaweedFS ignores the region, but the Lakekeeper storage profile requires one.
 const S3_REGION: &str = "us-east-1";
-const STATIC_ACCESS_KEY: &str = "minioadmin";
-const STATIC_SECRET_KEY: &str = "minioadmin";
-/// Scoped MinIO user, used with `sts-enabled:true`.
+const STATIC_ACCESS_KEY: &str = "lhadmin";
+const STATIC_SECRET_KEY: &str = "lhadminsecret123";
+/// Scoped SeaweedFS user, used with `sts-enabled:true`.
 const VENDED_ACCESS_KEY: &str = "lakekeeper";
 const VENDED_SECRET_KEY: &str = "lakekeeper-secret-key";
+const VENDED_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/LakekeeperVended";
 
 pub const WAREHOUSE_STATIC: &str = "lakehouse_static";
 pub const WAREHOUSE_VENDED: &str = "lakehouse_vended";
@@ -174,8 +175,7 @@ impl WarehouseProfile {
         }
     }
 
-    /// `sts-role-arn` is omitted: MinIO ignores it and scopes the vended session by this
-    /// user's policy.
+    /// The vended session is scoped by the `LakekeeperVended` role (`seaweedfs-iam.json`).
     pub fn vended() -> Self {
         WarehouseProfile {
             name: WAREHOUSE_VENDED,
@@ -248,11 +248,12 @@ pub fn lakekeeper_create_warehouse(profile: &WarehouseProfile) {
     let storage_profile = serde_json::json!({
         "type": "s3",
         "bucket": WAREHOUSE_BUCKET,
-        "endpoint": stack::minio_url_internal(),
+        "endpoint": stack::seaweedfs_url_internal(),
         "region": S3_REGION,
         "path-style-access": true,
         "flavor": "s3-compat",
         "sts-enabled": profile.vended,
+        "sts-role-arn": profile.vended.then_some(VENDED_ROLE_ARN),
         "key-prefix": profile.name,
     });
     let storage_credential = serde_json::json!({
@@ -335,7 +336,7 @@ pub fn lakekeeper_connection_password(
         warehouse: warehouse_name.to_string(),
         use_vended_credentials: vended,
         // Stated explicitly because the CONNECTION's value wins over the vended response, which
-        // can state (or default to) virtual-hosted-style that MinIO cannot serve.
+        // can state (or default to) virtual-hosted-style that SeaweedFS cannot serve.
         path_style: true,
         client_id: Some(OAUTH_CLIENT_ID.to_string()),
         client_secret: Some(OAUTH_CLIENT_SECRET.to_string()),
@@ -348,7 +349,7 @@ pub fn lakekeeper_connection_password(
     }
 
     CatalogConnectionPassword {
-        endpoint: stack::minio_url_internal(),
+        endpoint: stack::seaweedfs_url_internal(),
         region: S3_REGION.to_string(),
         access_key: STATIC_ACCESS_KEY.to_string(),
         secret_key: STATIC_SECRET_KEY.to_string(),
@@ -457,7 +458,7 @@ mod tests {
             pw.oauth2_server_uri.as_deref(),
             Some("http://keycloak:8080/realms/iceberg/protocol/openid-connect/token")
         );
-        assert_eq!(pw.endpoint, "http://minio:9000");
+        assert_eq!(pw.endpoint, "http://seaweedfs:8333");
         assert_eq!(pw.region, S3_REGION);
         assert_eq!(pw.access_key, STATIC_ACCESS_KEY);
         assert_eq!(pw.secret_key, STATIC_SECRET_KEY);

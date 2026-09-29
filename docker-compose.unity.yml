@@ -1,20 +1,20 @@
 # Overlay on docker-compose.yml:
 #   docker compose -f docker-compose.yml -f docker-compose.unity.yml up -d --wait \
-#     minio exasol unitycatalog
+#     seaweedfs exasol unitycatalog
 #   ./scripts/unity/seed.sh
 # UC OSS 0.5.x has no S3 endpoint override (upstream #43), so the engine's
-# ObjectStore injects the MinIO endpoint for vended credentials itself.
+# ObjectStore injects the SeaweedFS endpoint for vended credentials itself.
 
 services:
   unitycatalog:
     image: "${LH_UNITY_IMAGE:-unitycatalog/unitycatalog:v0.5.0}"
     depends_on:
-      minio:
+      seaweedfs:
         condition: service_healthy
     # Workdir is /home/unitycatalog (not /opt as some docs state); no default server.properties.
     volumes:
       - ./scripts/unity/server.properties:/home/unitycatalog/etc/conf/server.properties:ro
-    # The MinIO STS session seed.sh mints and injects. Pass-through form on
+    # The SeaweedFS STS session seed.sh mints and injects. Pass-through form on
     # purpose: a present-but-empty key would send UC to a real
     # sts.amazonaws.com AssumeRole with the host's ambient AWS credentials.
     environment:
@@ -42,17 +42,15 @@ services:
   exasol:
     extra_hosts:
       - "unitycatalog:10.84.0.50"
-      - "sts-stub:10.84.0.12"
     entrypoint:
       - /bin/bash
       - -c
       - |
         ( while true; do
             if [ -f /etc/hosts ]; then
-              grep -qE '(^|[[:space:]])minio([[:space:]]|$)' /etc/hosts || printf '10.84.0.10 minio\n' >> /etc/hosts
+              grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts || printf '10.84.0.10 seaweedfs\n' >> /etc/hosts
               grep -qE '(^|[[:space:]])iceberg-rest([[:space:]]|$)' /etc/hosts || printf '10.84.0.11 iceberg-rest\n' >> /etc/hosts
               grep -qE '(^|[[:space:]])unitycatalog([[:space:]]|$)' /etc/hosts || printf '10.84.0.50 unitycatalog\n' >> /etc/hosts
-              grep -qE '(^|[[:space:]])sts-stub([[:space:]]|$)' /etc/hosts || printf '10.84.0.12 sts-stub\n' >> /etc/hosts
             fi
             sleep 2
           done ) &

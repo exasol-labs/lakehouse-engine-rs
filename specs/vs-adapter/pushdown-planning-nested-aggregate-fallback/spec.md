@@ -22,7 +22,7 @@ Exasol applies the outer computation itself.
 
 ### Scenario: Composed pushdown request never renders a scan spec that references a non-source column
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a user query whose pushdown request composes an outer aggregate over an inner grouped-aggregate sub-select — e.g. `SELECT COUNT(*) FROM (SELECT L_ORDERKEY, COUNT(*) AS cnt FROM {vs_table} GROUP BY L_ORDERKEY) t` — so that some `selectList`, `groupBy`, or `filter` node does not resolve to a plain column of the involved source table's current Iceberg schema
 * *WHEN* Exasol sends the corresponding `pushdown` request and the adapter builds the scan spec and the scan-driving SQL
 * *THEN* every column reference in the per-shard scan-driving SQL the adapter emits SHALL name a column present in the involved table's resolved logical schema (or an aggregate/group-key expression rendered from one), and the adapter MUST NOT emit a scan spec whose rendered SQL references a phantom identifier such as `NULL` that is absent from the source schema

@@ -23,7 +23,7 @@ Find the row that matches your catalog. Then copy its recipe.
 | [Local / generic Iceberg REST (no auth)](#local--generic-iceberg-rest-no-auth) | Iceberg REST | none | Supported |
 | [AWS Glue Iceberg REST](#aws-glue-iceberg-rest-sigv4) | Iceberg REST | SigV4 | Supported |
 | [Generic REST with token / OAuth2](#generic-rest-with-static-token-or-oauth2) | Iceberg REST | bearer token or OAuth2 | Supported |
-| [Lakekeeper](#lakekeeper-oidc-via-keycloak--minio) | Iceberg REST | OAuth2 client-credentials (OIDC) | Supported |
+| [Lakekeeper](#lakekeeper-oidc-via-keycloak--seaweedfs) | Iceberg REST | OAuth2 client-credentials (OIDC) | Supported |
 | [Unity Catalog (Delta and Parquet tables)](#unity-catalog-delta-and-parquet-tables) | Unity Catalog | none, PAT, or Databricks OAuth M2M | Supported |
 | [Direct storage (raw Parquet, no catalog)](#direct-storage-raw-parquet-no-catalog) | Direct storage | none (storage credentials only) | Supported |
 
@@ -37,7 +37,7 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 
 | JSON field | Required | Meaning |
 |---|---|---|
-| `warehouse` | yes under `ICEBERG_REST`; not used under `UNITY_CATALOG` | Catalog routing identifier — an AWS account id under Glue, a warehouse **name** under Lakekeeper, or whatever identifier a generic Iceberg REST catalog registered — never read as a storage location, so a URI-shaped value (as the bundled `iceberg-rest`/MinIO stack below uses) is still only an identifier. A native Unity Catalog is addressed by `catalog.schema.table` instead, so this field is not required (or read) under `CATALOG_KIND = 'UNITY_CATALOG'` |
+| `warehouse` | yes under `ICEBERG_REST`; not used under `UNITY_CATALOG` | Catalog routing identifier — an AWS account id under Glue, a warehouse **name** under Lakekeeper, or whatever identifier a generic Iceberg REST catalog registered — never read as a storage location, so a URI-shaped value (as the bundled `iceberg-rest`/SeaweedFS stack below uses) is still only an identifier. A native Unity Catalog is addressed by `catalog.schema.table` instead, so this field is not required (or read) under `CATALOG_KIND = 'UNITY_CATALOG'` |
 | `endpoint` | yes, unless `use_sigv4` or vended credentials | S3 endpoint URL |
 | `region` | yes, unless `use_sigv4` and the address is a standard AWS Glue endpoint (`https://glue.<region>.amazonaws.com`), or vended credentials | S3 region — also the SigV4 signing region unless a standard Glue endpoint supplies its own; state it whenever a scan reads with static S3 keys |
 | `access_key` | yes, unless `use_sigv4` or vended credentials | S3 access key |
@@ -45,8 +45,8 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 | `session_token` | no | STS session token |
 | `aws_assume_role_arn` | no | AWS IAM role ARN to assume via STS `AssumeRole`, using this CONNECTION's own `access_key`/`secret_key` (plus `session_token`, if stated) as the base identity that signs the `AssumeRole` request. The returned session credentials then replace `access_key`, `secret_key`, and `session_token` everywhere those fields are read: SigV4 catalog signing, and non-vended S3 storage |
 | `aws_external_id` | no; requires `aws_assume_role_arn` | `ExternalId` sent with the `AssumeRole` request, for a role whose trust policy requires one |
-| `aws_sts_endpoint` | no; requires `aws_assume_role_arn` | STS endpoint override — for example a China-partition, VPC-interface, or local-stack endpoint. Defaults to `https://sts.<region>.amazonaws.com` for the resolved signing region, else the global `https://sts.amazonaws.com` |
-| `path_style` | required if `endpoint` is set and vending is off; otherwise no, default `false` | Path-style S3 addressing: `true` for MinIO or Ceph, `false` for real AWS S3 (virtual-hosted, the default) |
+| `aws_sts_endpoint` | no; requires `aws_assume_role_arn` | STS endpoint override — for example a China-partition, VPC-interface, or local-stack endpoint. Defaults to the regional endpoint (`https://sts.<region>.amazonaws.com`) for the resolved signing region, else `us-east-1` |
+| `path_style` | required if `endpoint` is set and vending is off; otherwise no, default `false` | Path-style S3 addressing: `true` for SeaweedFS or Ceph, `false` for real AWS S3 (virtual-hosted, the default) |
 | `use_sigv4` | no, default `false` | SigV4-sign the catalog REST requests (AWS Glue) |
 | `use_vended_credentials` | no, default `false` | Request short-lived S3 credentials from the `load_table` call of the catalog (Glue, Lakekeeper) |
 | `token` | no | Static bearer token for generic REST catalog auth |
@@ -59,7 +59,7 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 
 With `CATALOG_KIND` absent (Iceberg REST, the default), `warehouse` is always required. If you turn `use_sigv4` on, `access_key` and `secret_key` become required, and `region` becomes required too unless the CONNECTION's address is a standard, commercial AWS Glue endpoint of the form `https://glue.<region>.amazonaws.com` — such an endpoint supplies its own SigV4 signing region. These fields sign the catalog request, and `endpoint` stays optional. `region` also places the S3 store independently of whatever region signs the catalog request, so state it whenever a scan reads data with static S3 keys, even against a standard Glue endpoint. If you turn `use_vended_credentials` on without SigV4, you can omit all static S3 fields. The catalog then vends short-lived credentials from `load_table`. Under `CATALOG_KIND = 'UNITY_CATALOG'`, the same static-vs-vended S3 field choice applies, but `warehouse` is never required.
 
-An unstated `path_style` resolves to `false` on a non-vended CONNECTION, which discards `endpoint` and derives a virtual-hosted AWS host from `region` instead. If you configure a non-vended `endpoint` (MinIO, Ceph, or any other self-hosted S3-compatible store), you must state `path_style` explicitly — the adapter rejects a CONNECTION that sets `endpoint` without it. On a vended CONNECTION (`use_vended_credentials` on, or a catalog that vends storage credentials automatically), a stated `path_style` wins over the value the catalog response vends; omit the field there to keep the vended value.
+An unstated `path_style` resolves to `false` on a non-vended CONNECTION, which discards `endpoint` and derives a virtual-hosted AWS host from `region` instead. If you configure a non-vended `endpoint` (SeaweedFS, Ceph, or any other self-hosted S3-compatible store), you must state `path_style` explicitly — the adapter rejects a CONNECTION that sets `endpoint` without it. On a vended CONNECTION (`use_vended_credentials` on, or a catalog that vends storage credentials automatically), a stated `path_style` wins over the value the catalog response vends; omit the field there to keep the vended value.
 
 Credential values never appear in error messages, logs, or debug output. The per-query scan spec carries a REFERENCE to the CONNECTION (its name) for a static credential, and an AES-GCM-sealed envelope for a vended one — no credential value travels in the scan spec itself. The adapter never stores them in Virtual Schema properties. See [Security](security.md) for the CONNECTION-access privilege model this relies on, and for exactly what a `SELECT`-only Virtual Schema user can and cannot read back.
 
@@ -87,18 +87,17 @@ only the catalog requests in that case. The adapter sends exactly one `AssumeRol
 **Endpoint and region.** The STS endpoint is `aws_sts_endpoint` when stated, else
 `https://sts.<region>.amazonaws.com` for the signing region (the same region
 [SigV4 catalog signing](#aws-glue-iceberg-rest-sigv4) resolves — a standard AWS Glue endpoint's own
-region, else the stated `region`), else the global `https://sts.amazonaws.com` when no region
+region, else the stated `region`), else the `us-east-1` regional endpoint when no region
 resolves. Sending the `AssumeRole` request to a plaintext `http://` `aws_sts_endpoint` requires
 `ALLOW_HTTP = 'true'` on the Virtual Schema, because the response carries the session secret — it is
 otherwise a rejected CONNECTION. A **China-region** deployment must state `aws_sts_endpoint`
 explicitly: AWS's China STS endpoints live under `.amazonaws.com.cn`, which the default resolution
 does not construct.
 
-**MinIO cannot honor a named role.** MinIO's own `AssumeRole` implementation ignores `RoleArn` and
-mints a session under the caller's own policy. Pointing `aws_sts_endpoint` at a MinIO instance does
-not apply the named role — it authenticates as whichever MinIO user signed the request. Role
-assumption needs a genuinely AWS-compatible STS endpoint (real AWS STS, or a compatible stub) to have
-any effect.
+**Local testing with SeaweedFS.** SeaweedFS 4.44 or later serves a real `AssumeRole` endpoint: it evaluates the
+role's trust policy and scopes the session to the role's attached policies, so `aws_sts_endpoint` can point at
+it (the bundled Docker stack does, see `seaweedfs-iam.json`). It does not evaluate the `sts:ExternalId`
+condition key, so `aws_external_id` is sent but never enforced there. External-id enforcement needs real AWS STS.
 
 **A failed `AssumeRole` is not retried.** A `Throttling` or 5xx response from STS fails that request
 immediately rather than being retried — under concurrent load (many queries assuming the same role
@@ -132,7 +131,7 @@ region signs the catalog request.
 
 ## Local / generic Iceberg REST (no auth)
 
-Use this recipe for the bundled Docker stack or any plain, unauthenticated Iceberg REST catalog. It uses static S3 credentials, `path_style: true` for MinIO, and no catalog auth.
+Use this recipe for the bundled Docker stack or any plain, unauthenticated Iceberg REST catalog. It uses static S3 credentials, `path_style: true` for SeaweedFS, and no catalog auth.
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
@@ -140,10 +139,10 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
   USER ''
   IDENTIFIED BY '{
     "warehouse":  "s3://warehouse/",
-    "endpoint":   "http://minio:9000",
+    "endpoint":   "http://seaweedfs:8333",
     "region":     "us-east-1",
-    "access_key": "minioadmin",
-    "secret_key": "minioadmin",
+    "access_key": "lhadmin",
+    "secret_key": "lhadminsecret123",
     "path_style": true
   }';
 
@@ -154,7 +153,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
   ALLOW_HTTP         = 'true';
 ```
 
-`ALLOW_HTTP = 'true'` is required here because both the catalog and MinIO use plain HTTP. Use internal hostnames (`iceberg-rest`, `minio`) that resolve from inside the Exasol container. Never use `localhost`.
+`ALLOW_HTTP = 'true'` is required here because both the catalog and SeaweedFS use plain HTTP. Use internal hostnames (`iceberg-rest`, `seaweedfs`) that resolve from inside the Exasol container. Never use `localhost`.
 
 ## AWS Glue Iceberg REST (SigV4)
 
@@ -222,16 +221,16 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 
 If the catalog or its storage uses plain HTTP, add `ALLOW_HTTP = 'true'`. If not, omit this property.
 
-## Lakekeeper (OIDC via Keycloak + MinIO)
+## Lakekeeper (OIDC via Keycloak + SeaweedFS)
 
-[Lakekeeper](https://github.com/lakekeeper/lakekeeper) is a widely used open-source Iceberg REST catalog. It needs no new adapter code and no new CONNECTION field. The adapter reaches it through the same OAuth2 client-credentials fields as the generic recipe above: `client_id`, `client_secret`, and `oauth2_server_uri`. Lakekeeper authenticates against **Keycloak** and uses **MinIO** for S3 storage. Keycloak is the documented reference IdP of Lakekeeper, and any OIDC-compatible IdP works the same way. Two things are specific to Lakekeeper:
+[Lakekeeper](https://github.com/lakekeeper/lakekeeper) is a widely used open-source Iceberg REST catalog. It needs no new adapter code and no new CONNECTION field. The adapter reaches it through the same OAuth2 client-credentials fields as the generic recipe above: `client_id`, `client_secret`, and `oauth2_server_uri`. Lakekeeper authenticates against **Keycloak** and uses **SeaweedFS** for S3 storage. Keycloak is the documented reference IdP of Lakekeeper, and any OIDC-compatible IdP works the same way. Two things are specific to Lakekeeper:
 
 - **Base path.** Lakekeeper serves its REST API under the `/catalog` base path, so `TO` must include it, for example `http://lakekeeper:8181/catalog`. The adapter negotiates this base path automatically from the `GET /v1/config?warehouse=` response of the catalog. No other configuration is necessary.
 - **Warehouse is a name, not a path.** Lakekeeper supports many warehouses. `warehouse` is the warehouse **name** that you register with the management API of Lakekeeper, for example `lakehouse_static`. It is not an `s3://` location. The `warehouse` field of Glue uses the same shape with an account id.
 
 The adapter supports both credential modes below. They differ only in the Lakekeeper warehouse and the CONNECTION fields that you use.
 
-**Static credentials** (`sts-enabled: false` on the Lakekeeper warehouse). The adapter reads MinIO directly with the static key pair, like any other backend:
+**Static credentials** (`sts-enabled: false` on the Lakekeeper warehouse). The adapter reads SeaweedFS directly with the static key pair, like any other backend:
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
@@ -242,10 +241,10 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
     "client_id":         "lakehouse",
     "client_secret":     "<secret>",
     "oauth2_server_uri": "http://keycloak:8080/realms/iceberg/protocol/openid-connect/token",
-    "endpoint":          "http://minio:9000",
+    "endpoint":          "http://seaweedfs:8333",
     "region":            "us-east-1",
-    "access_key":        "minioadmin",
-    "secret_key":        "minioadmin",
+    "access_key":        "lhadmin",
+    "secret_key":        "lhadminsecret123",
     "path_style":        true
   }';
 
@@ -262,7 +261,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 - Add `"use_vended_credentials": true`.
 - Remove the static S3 fields `endpoint`, `region`, `access_key`, and `secret_key`.
 
-The adapter then requests short-lived credentials from the `load_table` response of Lakekeeper. In this stack these credentials are MinIO STS AssumeRole credentials, scoped to the bucket of the warehouse.
+The adapter then requests short-lived credentials from the `load_table` response of Lakekeeper. In this stack these credentials are SeaweedFS STS AssumeRole credentials, scoped to the bucket of the warehouse.
 
 ```sql
 CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
@@ -328,7 +327,7 @@ vended.
 > vectors); pick one deliberately rather than mixing them for the same table.
 
 **Self-hosted / OSS, no catalog auth** (matches the bundled Docker stack, whose Unity Catalog server
-has auth disabled and whose Delta files sit in the same MinIO bucket the Iceberg recipes use; the
+has auth disabled and whose Delta files sit in the same SeaweedFS bucket the Iceberg recipes use; the
 stack's seed script registers its fixture tables under the `unity.delta_e2e` catalog/schema):
 
 ```sql
@@ -336,10 +335,10 @@ CREATE OR REPLACE CONNECTION UNITY_CATALOG_CREDS
   TO 'http://unitycatalog:8080'
   USER ''
   IDENTIFIED BY '{
-    "endpoint":   "http://minio:9000",
+    "endpoint":   "http://seaweedfs:8333",
     "region":     "us-east-1",
-    "access_key": "minioadmin",
-    "secret_key": "minioadmin",
+    "access_key": "lhadmin",
+    "secret_key": "lhadminsecret123",
     "path_style": true
   }';
 
@@ -401,10 +400,10 @@ CREATE OR REPLACE CONNECTION DIRECT_STORAGE_CREDS
   TO 's3://warehouse/events'
   USER ''
   IDENTIFIED BY '{
-    "endpoint":   "http://minio:9000",
+    "endpoint":   "http://seaweedfs:8333",
     "region":     "us-east-1",
-    "access_key": "minioadmin",
-    "secret_key": "minioadmin",
+    "access_key": "lhadmin",
+    "secret_key": "lhadminsecret123",
     "path_style": true
   }';
 
@@ -485,4 +484,4 @@ query that reads the column.
 
 ## Addressing
 
-The adapter UDF runs **inside** the Exasol container. Every address in the CONNECTION must resolve from there. Use internal hostnames, for example `iceberg-rest`, `minio`, `lakekeeper`, `keycloak`, or `unitycatalog`. Never use `localhost` or the Docker host gateway. A Databricks-managed Unity Catalog is a public HTTPS endpoint, so it needs no internal hostname — just network egress from the Exasol node.
+The adapter UDF runs **inside** the Exasol container. Every address in the CONNECTION must resolve from there. Use internal hostnames, for example `iceberg-rest`, `seaweedfs`, `lakekeeper`, `keycloak`, or `unitycatalog`. Never use `localhost` or the Docker host gateway. A Databricks-managed Unity Catalog is a public HTTPS endpoint, so it needs no internal hostname — just network egress from the Exasol node.

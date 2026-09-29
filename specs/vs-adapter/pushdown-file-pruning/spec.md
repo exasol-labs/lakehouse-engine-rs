@@ -38,7 +38,7 @@ the engine cannot apply.
 
 ### Scenario: Equality on a partition column prunes data files
 
-* *GIVEN* a virtual schema over a partitioned Iceberg table backed by MinIO whose data files are distributed across partition values
+* *GIVEN* a virtual schema over a partitioned Iceberg table backed by SeaweedFS whose data files are distributed across partition values
 * *AND* a query with a `WHERE partition_col = <value>` predicate over a column the adapter can translate
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL set an `iceberg::expr::Predicate` equality term on the table scan before calling `plan_files`

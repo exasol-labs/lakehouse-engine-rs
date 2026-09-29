@@ -79,7 +79,7 @@ shared-harness provisioning, and DDL-failure output redaction.
   `sas-enabled: false` and `<container>-vended` with `sas-enabled: true` — each with
   `key-prefix` equal to its own warehouse name, so neither prefix is a prefix of the
   other. This is the topology `lakekeeper-e2e/lakekeeper-e2e-harness` already runs over
-  its one shared MinIO `warehouse` bucket. One container halves the live-Azure
+  its one shared SeaweedFS `warehouse` bucket. One container halves the live-Azure
   provisioning cost of a second credential arm and keeps the orphan surface at one
   resource — and that is all it buys. It does not make the cross-arm row comparison
   stronger: the two arms are seeded independently into two disjoint `key-prefix`es, so
@@ -122,7 +122,7 @@ shared-harness provisioning, and DDL-failure output redaction.
   suite's passing run is the only thing that does.
 * **Seeding a `sas-enabled: true` warehouse needs no defence against its own vended
   credential, by key shape rather than by flag.** `RestCatalog::load_file_io` merges
-  a table's `loadTable` `config` OVER the builder props, which is why the MinIO arm
+  a table's `loadTable` `config` OVER the builder props, which is why the SeaweedFS arm
   installs a static credential loader to stop vended STS keys reaching its seed
   writes. The ADLS arm needs no equivalent: Lakekeeper vends the host-suffixed
   `adls.sas-token.<host>`, while iceberg-rust reads only the flat `adls.sas-token`

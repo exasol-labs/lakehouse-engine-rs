@@ -1635,7 +1635,7 @@ const ACCESS_DENIED_RESPONSE: &str = r#"<ErrorResponse xmlns="https://sts.amazon
 const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
 
 /// A loopback server standing in for both AWS STS and the catalog: an
-/// `Action=AssumeRole` request is answered with `sts`, every other request with
+/// STS-signed request is answered with `sts`, every other request with
 /// `catalog`, and each request head is recorded in arrival order.
 ///
 /// It runs on a runtime of its own because `dispatch` blocks on its own
@@ -1714,8 +1714,7 @@ impl StsAndCatalog {
 
 fn is_assume_role(head: &str) -> bool {
     head.lines()
-        .next()
-        .is_some_and(|line| line.contains("Action=AssumeRole"))
+        .any(|line| line.to_ascii_lowercase().contains("/sts/aws4_request"))
 }
 
 fn authorization(head: &str) -> &str {

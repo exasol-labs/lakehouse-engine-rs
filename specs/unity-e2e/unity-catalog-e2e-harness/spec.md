@@ -1,12 +1,12 @@
 # Feature: Unity Catalog E2E Harness
 
-End-to-end coverage of the Virtual Schema against a native Unity Catalog OSS server backed by MinIO
+End-to-end coverage of the Virtual Schema against a native Unity Catalog OSS server backed by SeaweedFS
 and seeded with the vendored Delta fixtures, run through the shared harness so the script DDL is
 byte-identical to every other E2E binary. The suite fails, never skips, when the stack is unavailable.
 
 ## Background
 
-The suite runs against the #325 fixture harness: the `docker-compose.unity.yml` overlay stands up MinIO plus an OSS Unity Catalog server whose authentication is disabled, and `make unity-up` seeds the vendored Delta fixtures onto MinIO and registers them in Unity Catalog under the `unity.delta_e2e` catalog and schema. The UDF reaches Unity Catalog at `http://unitycatalog:8080` over the docker network. The CONNECTION address is that Unity Catalog host and its password supplies no auth field, because the OSS server needs none. The suite provisions the adapter script through the shared harness definition so the script DDL is byte-identical to every other E2E binary. The suite's column assertion presumes the OSS #325 fixture's `GET /tables` returns each table's `columns[]` inline by default; because that inline-columns behavior was verified live only against Databricks (`demo_sales_catalog.sales`), the implementation SHALL confirm it against the running `make unity-up` fixture before authoring the column assertion rather than assume OSS parity, so a missing inline `columns[]` on the OSS list endpoint surfaces as a caught precondition rather than a red suite with no code bug.
+The suite runs against the #325 fixture harness: the `docker-compose.unity.yml` overlay stands up SeaweedFS plus an OSS Unity Catalog server whose authentication is disabled, and `make unity-up` seeds the vendored Delta fixtures onto SeaweedFS and registers them in Unity Catalog under the `unity.delta_e2e` catalog and schema. The UDF reaches Unity Catalog at `http://unitycatalog:8080` over the docker network. The CONNECTION address is that Unity Catalog host and its password supplies no auth field, because the OSS server needs none. The suite provisions the adapter script through the shared harness definition so the script DDL is byte-identical to every other E2E binary. The suite's column assertion presumes the OSS #325 fixture's `GET /tables` returns each table's `columns[]` inline by default; because that inline-columns behavior was verified live only against Databricks (`demo_sales_catalog.sales`), the implementation SHALL confirm it against the running `make unity-up` fixture before authoring the column assertion rather than assume OSS parity, so a missing inline `columns[]` on the OSS list endpoint surfaces as a caught precondition rather than a red suite with no code bug.
 
 * **This delta is issue #320 and lifts the suite's scan-execution ceiling.** The suite stopped at
   catalog metadata and plan-time scan resolution before; it now issues real queries through Exasol and
@@ -55,7 +55,7 @@ The suite runs against the #325 fixture harness: the `docker-compose.unity.yml` 
 
 * *GIVEN* the `docker-compose.unity.yml` overlay and the `make unity-up` target
 * *WHEN* the harness provisions the stack before any test
-* *THEN* the harness SHALL bring up MinIO and the OSS Unity Catalog server and seed the vendored Delta fixtures under the `unity.delta_e2e` catalog and schema
+* *THEN* the harness SHALL bring up SeaweedFS and the OSS Unity Catalog server and seed the vendored Delta fixtures under the `unity.delta_e2e` catalog and schema
 * *AND* the seed SHALL be idempotent and SHALL abort non-zero on any failure, so a partially-seeded stack fails the suite rather than yielding a partial listing
 
 ### Scenario: Create virtual schema over a Unity Catalog namespace lists the fixture tables and columns
@@ -67,31 +67,31 @@ The suite runs against the #325 fixture harness: the `docker-compose.unity.yml` 
 * *AND* the suite SHALL assert the presence of a representative fixture table and its column set, so a regression in enumeration or column mapping fails the suite
 * *AND* this scenario SHALL keep issuing no scan-driving query of its own, SUPERSEDING the recorded clause that bounded the WHOLE SUITE to no scan execution: the scenarios below now run real queries, so what this scenario asserts is enumeration alone rather than the suite's ceiling
 
-### Scenario: The suite resolves a seeded Delta table's scan spec over MinIO under both credential modes
+### Scenario: The suite resolves a seeded Delta table's scan spec over SeaweedFS under both credential modes
 
-* *GIVEN* a running Unity Catalog stack seeded with the vendored Delta fixtures on MinIO, and the
+* *GIVEN* a running Unity Catalog stack seeded with the vendored Delta fixtures on SeaweedFS, and the
   partitioned fixture registered as `unity.delta_e2e.basic_partitioned`
 * *WHEN* the suite resolves that table's scan through the Delta format reader, once with
-  `use_vended_credentials` enabled and once with the CONNECTION's static MinIO credentials
+  `use_vended_credentials` enabled and once with the CONNECTION's static SeaweedFS credentials
 * *THEN* BOTH runs SHALL return the same file list, the same per-file partition values, and the same
   table root, so the credential mode changes how object storage is reached and nothing about what is
   resolved
 * *AND* the vended run SHALL request temporary table credentials from the Unity Catalog server scoped
-  to that table's catalog-assigned vending key, and SHALL read `_delta_log` from MinIO with the
+  to that table's catalog-assigned vending key, and SHALL read `_delta_log` from SeaweedFS with the
   credentials that response returns
-* *AND* the suite SHALL inject the MinIO endpoint client-side, because the OSS Unity Catalog server
+* *AND* the suite SHALL inject the SeaweedFS endpoint client-side, because the OSS Unity Catalog server
   performs no server-side S3 access and vends no endpoint
 * *AND* the suite SHALL assert the resolved file count and the set of partition values, so a
   regression in catalog resolution, credential vending, or log replay over S3 fails the suite
 * *AND* the suite SHALL additionally resolve the deletion-vector fixture registered as
   `unity.delta_e2e.table_with_dv` and assert its single active data file carries a deletion-vector
   reference, so the DV reference survives the whole live chain rather than only the offline replay test
-* *AND* the suite MUST fail (not skip) when the Unity Catalog server or MinIO is unreachable
+* *AND* the suite MUST fail (not skip) when the Unity Catalog server or SeaweedFS is unreachable
 * *AND* no vended or static credential value SHALL appear in any assertion message or test output
 
 ### Scenario: The Unity Catalog E2E suite fails when the stack is unavailable
 
-* *GIVEN* the Unity Catalog server, MinIO, or Exasol service is not reachable
+* *GIVEN* the Unity Catalog server, SeaweedFS, or Exasol service is not reachable
 * *WHEN* the `unity-e2e` suite runs
 * *THEN* the suite SHALL fail
 * *AND* the suite MUST NOT report the affected tests as skipped or passed
@@ -105,9 +105,9 @@ The suite runs against the #325 fixture harness: the `docker-compose.unity.yml` 
 
 ### Scenario: The suite's virtual schema carries the storage credentials a UDF-side scan needs
 
-* *GIVEN* the seeded fixtures on MinIO and an OSS Unity Catalog server that vends no object-storage endpoint
+* *GIVEN* the seeded fixtures on SeaweedFS and an OSS Unity Catalog server that vends no object-storage endpoint
 * *WHEN* the suite creates the virtual schema the query scenarios below run against
-* *THEN* that virtual schema's CONNECTION SHALL supply the MinIO endpoint and static storage credentials, so the scan UDF running inside Exasol reaches MinIO with a credential resolved from the CONNECTION rather than from a test-process injection
+* *THEN* that virtual schema's CONNECTION SHALL supply the SeaweedFS endpoint and static storage credentials, so the scan UDF running inside Exasol reaches SeaweedFS with a credential resolved from the CONNECTION rather than from a test-process injection
 * *AND* the suite SHALL provision the scan UDF script through the SAME shared harness definition every other E2E binary uses, so the scan script DDL is byte-identical across suites
 * *AND* adding those credentials MUST NOT change the enumeration scenario's result, because listing reads catalog metadata and no object storage
 * *AND* the vended-versus-static planning scenario SHALL keep running unchanged, so credential vending stays covered where the OSS server can serve it

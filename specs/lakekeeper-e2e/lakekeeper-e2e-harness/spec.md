@@ -1,8 +1,8 @@
-# Feature: Lakekeeper E2E Harness (OIDC + MinIO)
+# Feature: Lakekeeper E2E Harness (OIDC + SeaweedFS)
 
 End-to-end test suite that verifies the lakehouse VS query path against a
 Lakekeeper Iceberg REST catalog — the open-source, OpenID-secured, multi-warehouse
-Rust catalog — backed by MinIO object storage, proving real interoperability rather
+Rust catalog — backed by SeaweedFS object storage, proving real interoperability rather
 than a connectivity smoke test. The suite authenticates to the catalog with the
 engine's existing OAuth2 client-credentials CONNECTION fields (an external Keycloak
 IdP issues the token), resolves tables through Lakekeeper's per-warehouse
@@ -13,7 +13,7 @@ own `lakekeeper-e2e` cargo feature.
 
 ## Background
 
-* Every scenario runs against a local Docker stack of Exasol, MinIO, Lakekeeper, a
+* Every scenario runs against a local Docker stack of Exasol, SeaweedFS, Lakekeeper, a
   PostgreSQL metadata database, and a Keycloak IdP, and MUST fail (never skip) when
   the stack is unavailable — the same fail-loud discipline as `e2e-harness/e2e-harness`,
   and the opposite of `e2e-harness/cloud-e2e-harness`.
@@ -35,7 +35,7 @@ own `lakekeeper-e2e` cargo feature.
   both authenticated with a Keycloak-issued bearer token. The harness performs these
   steps in-process, mirroring how the baseline harness performs SLC install and VS
   creation in Rust.
-* The `sts-enabled` warehouse requires MinIO's STS AssumeRole endpoint enabled and an
+* The `sts-enabled` warehouse requires SeaweedFS's STS AssumeRole endpoint enabled and an
   IAM policy/role Lakekeeper assumes to vend short-lived credentials scoped to the
   warehouse bucket. The stack configures this deterministically, so the
   vended-credential path is a hard pass/fail requirement, not best-effort. Both the
@@ -47,21 +47,21 @@ own `lakekeeper-e2e` cargo feature.
   reuses the shared `common/e2e_harness` definition per `e2e-harness/e2e-harness`;
   only the CONNECTION password, warehouse-name, and namespace vary per binary.
 * VS properties use docker-network-internal URLs (catalog `http://lakekeeper:8181/catalog`,
-  MinIO `http://minio:9000`, token endpoint on the Keycloak service) because the
+  SeaweedFS `http://seaweedfs:8333`, token endpoint on the Keycloak service) because the
   adapter UDF runs inside the Exasol container.
 * **This delta promotes an existing assertion from a stronger-than-necessary proof to the required shape, and changes no fixture, no warehouse, and no query.** It implements issue #276, slice D of six (A-F). `vs-adapter/pushdown-planning-cloud-credentials` now derives the effective scan storage SOLELY from the `loadTable` response when `use_vended_credentials` is true.
 * **This suite is the characterization gate that makes the strict rule safe, and it needs no behavioural change to be one.** The vended CONNECTION already supplies an empty `endpoint`, `region`, `access_key`, and `secret_key` and a false `path_style`, so there was never a static value for the shipped preservation rule to backfill and the strict rule is a NO-OP for this path. That is the evidence the rule is compatible with a live vended stack rather than only with unit fixtures.
-* **Lakekeeper's live vended config supplies the store address, live-verified.** It carries `s3.endpoint` (`http://minio:9000/`) and `s3.path-style-access` (`true`), so this path satisfies the strict rule's "a vended payload must name a region or an endpoint" requirement through the endpoint and needs no vended `client.region`.
-* **`ALLOW_HTTP` stays the operator's consent gate for the vended plain-HTTP endpoint, and this suite already sets it.** The harness emits `ALLOW_HTTP = 'true'` (`crates/lakehouse-engine/tests/common/e2e_harness.rs:270`) and Lakekeeper vends a plain-`http://` MinIO endpoint, so the vended endpoint is honoured and the scan reaches MinIO. Deriving the permission from the vended endpoint's scheme instead was rejected as a security regression: it would let a catalog downgrade the transport with no operator control (see `vs-adapter/pushdown-planning-cloud-credentials`). This suite is consequently the positive case for the consent gate — vended plain-HTTP endpoint plus `ALLOW_HTTP = 'true'` reads successfully.
+* **Lakekeeper's live vended config supplies the store address, live-verified.** It carries `s3.endpoint` (`http://seaweedfs:8333/`) and `s3.path-style-access` (`true`), so this path satisfies the strict rule's "a vended payload must name a region or an endpoint" requirement through the endpoint and needs no vended `client.region`.
+* **`ALLOW_HTTP` stays the operator's consent gate for the vended plain-HTTP endpoint, and this suite already sets it.** The harness emits `ALLOW_HTTP = 'true'` (`crates/lakehouse-engine/tests/common/e2e_harness.rs:270`) and Lakekeeper vends a plain-`http://` SeaweedFS endpoint, so the vended endpoint is honoured and the scan reaches SeaweedFS. Deriving the permission from the vended endpoint's scheme instead was rejected as a security regression: it would let a catalog downgrade the transport with no operator control (see `vs-adapter/pushdown-planning-cloud-credentials`). This suite is consequently the positive case for the consent gate — vended plain-HTTP endpoint plus `ALLOW_HTTP = 'true'` reads successfully.
 * **This delta adds the two-table vended broadcast-join coverage issue #294 needs, in ONE warehouse.** Two warehouses would be untestable for a join: two warehouses mean two virtual schemas and two adapters, and Exasol never hands either adapter a join to push down. The fixture is therefore two tables in the `lakehouse_vended` warehouse (`sts-enabled: true`), whose per-table vended credentials the adapter resolves independently.
 * **The suite currently seeds ONE table (`events`) per warehouse, so a second table is the fixture work.** `seed_star_schema` is the existing purpose-built broadcast-join fixture — `dim_customer` (5 rows, 1 file) and `fact_orders` (10 rows, 2 files), with deliberately disjoint `C_*` / `O_*` column prefixes so the adapter's disjoint-column guard admits bare-name broadcast rendering. It is unusable against Lakekeeper only because it builds its catalog through the UNAUTHENTICATED seed wrapper; an authenticated variant is the whole change. `events` and `labels` share an `id` column and would trip the disjoint-column guard, so they cannot substitute.
-* **The vended MinIO user's own IAM policy is BUCKET-scoped, so the fixture needs no policy change.** `minio-lakekeeper-init` attaches a policy allowing `s3:GetObject`/`PutObject`/`DeleteObject`/`ListBucket`/`GetBucketLocation` on `arn:aws:s3:::warehouse` and `arn:aws:s3:::warehouse/*`. Both warehouses are rooted in that one bucket and separated by a per-warehouse `key-prefix`, so a second table under `lakehouse_vended` is already covered.
+* **The vended role's IAM policy is BUCKET-scoped, so the fixture needs no policy change.** `seaweedfs-iam.json` defines the `lakekeeper` user, whose trust policy admits it to the `LakekeeperVended` role, and attaches a policy allowing `s3:GetObject`/`PutObject`/`DeleteObject`/`ListBucket`/`GetBucketLocation` on `arn:aws:s3:::warehouse` and `arn:aws:s3:::warehouse/*`. Both warehouses are rooted in that one bucket and separated by a per-warehouse `key-prefix`, so a second table under `lakehouse_vended` is already covered.
 * **Whether this fixture can reproduce the #294 DEFECT — as opposed to proving the FIX carries per-side credentials — is an open empirical question this suite answers, not an assumption.** The two sides' vended credential VALUES already differ today, because `resolve_vended_storage` runs per side and each call mints its own STS session. Value divergence is enough to test the carriage fix. It is NOT enough to reproduce the defect: if both sessions grant whole-bucket access, reading the dimension side through the fact side's credential simply succeeds. A failing pre-fix repro requires the two sessions' SCOPE to diverge, so the fact side's credential is genuinely DENIED on the dimension side's prefix.
 * **The default broadcast threshold already makes this join broadcast-eligible.** Both virtual schemas are created without `JOIN_BROADCAST_MAX_BYTES`, so both run at the 128 MiB default, and `dim_customer`'s single small file is far below it — it becomes the dimension side with no per-test configuration.
 * **The shared test harness declares no row cap by default, and this suite's connection must stay uncapped — not because a cap is inert, but because it is not.** The shared WebSocket test client (`crates/lakehouse-engine/tests/common/exasol_ws.rs`) sends Exasol's own documented default — `0`, no limit — unless a call site declares a cap through `ExaConn::capped_result_sets(n)`. A declared `resultSetMaxRows` cap DOES reach the adapter as a pushdown `limit` on a real query execution, confirmed by directly capturing the adapter's incoming request (bypassing `EXPLAIN VIRTUAL`, which is a separate exchange that cannot observe this) across all seven statement shapes measured, including the broadcast-eligible inner equi-join. Since issue #307 a pushed `limit` no longer disqualifies broadcast for a join: a bare `LIMIT` and a bare-projected-column `ORDER BY` both stay on the broadcast path, and only the four surviving forcing conditions (an aggregate select item, a non-empty `GROUP BY`, `aggregationType = "group_by"`, or a non-null `HAVING`), a `limit` offset with no `orderBy`, and an unrenderable or unprojected sort key fall back to the unaccelerated two-scan (`LHS_T0`/`LHS_T1`) wrapper (`vs-adapter/pushdown-planning-join`). This suite's own connection never calls `capped_result_sets`, so its broadcast join test is unaffected in practice — but that is because the connection stays uncapped by choice, not because the mechanism doesn't exist. See `docs/debugging-pushdown.md`'s measured shape matrix for the full comparison, including the broadcast-join row. Verifying the broadcast path at row-fetch time and not only at `EXPLAIN VIRTUAL` time is still valuable as a genuine end-to-end check — it confirms the joined rows actually come back through the broadcast plan, not merely that the plan was selected.
 
 * **This delta restates ONE clause's reason and is issue #330.** `vs-adapter/pushdown-planning-cloud-credentials` now resolves the vended store address from the CONNECTION when the CONNECTION states one and from the `loadTable` response otherwise, so "the vended endpoint reaches the store" is no longer true unconditionally — it is true HERE because this suite's vended CONNECTION carries an empty `endpoint` and an empty `region`.
-* **SUPERSEDES the strict-address-rule justification.** The recorded bullet read: "Lakekeeper's live vended config supplies the store address, live-verified. It carries `s3.endpoint` (`http://minio:9000/`) and `s3.path-style-access` (`true`), so this path satisfies the strict rule's 'a vended payload must name a region or an endpoint' requirement through the endpoint and needs no vended `client.region`." The live-verified FACTS stand. The requirement they satisfied no longer exists: an empty vended address is now legal. What the fixture now demonstrates is the OTHER half of the precedence rule — vended addressing filling in while the CONNECTION is silent.
+* **SUPERSEDES the strict-address-rule justification.** The recorded bullet read: "Lakekeeper's live vended config supplies the store address, live-verified. It carries `s3.endpoint` (`http://seaweedfs:8333/`) and `s3.path-style-access` (`true`), so this path satisfies the strict rule's 'a vended payload must name a region or an endpoint' requirement through the endpoint and needs no vended `client.region`." The live-verified FACTS stand. The requirement they satisfied no longer exists: an empty vended address is now legal. What the fixture now demonstrates is the OTHER half of the precedence rule — vended addressing filling in while the CONNECTION is silent.
 * **The suite's existing empty-CONNECTION assertion becomes the guard that keeps this scenario meaningful**, so it is promoted from a delegation proof to the precondition of the precedence case under test. Without it, a CONNECTION `endpoint` would win and the scan would prove nothing about the vended one.
 * This suite is a declared characterization gate for the change: it is the only in-repo suite that reads a real vended payload end to end, and it MUST pass unedited except for the assertion promoted above.
 * **This delta is issue #135. It amends TWO scenarios and adds no fixture, no warehouse, and no version gate.** The Lakekeeper bootstrap, the OAuth2 catalog auth, the static and vended warehouses, the broadcast-join assertions, and the scope-divergence observation are all UNCHANGED.
@@ -70,14 +70,14 @@ own `lakekeeper-e2e` cargo feature.
 
 ## Scenarios
 
-### Scenario: Harness bootstraps Lakekeeper and creates the MinIO-backed warehouses
+### Scenario: Harness bootstraps Lakekeeper and creates the SeaweedFS-backed warehouses
 
-* *GIVEN* a running stack with Lakekeeper, its PostgreSQL metadata database, MinIO, and Keycloak healthy
-* *AND* MinIO configured with its STS AssumeRole endpoint enabled and an IAM policy/role granting read access to the warehouse bucket, so Lakekeeper can vend short-lived credentials
+* *GIVEN* a running stack with Lakekeeper, its PostgreSQL metadata database, SeaweedFS, and Keycloak healthy
+* *AND* SeaweedFS configured with its STS AssumeRole endpoint enabled and an IAM policy/role granting read access to the warehouse bucket, so Lakekeeper can vend short-lived credentials
 * *WHEN* the harness provisions the catalog before any query
 * *THEN* the harness SHALL obtain a bearer token from Keycloak via the OAuth2 client-credentials grant and authenticate every management-API request with it
-* *AND* the harness SHALL `POST /management/v1/bootstrap` once and then `POST /management/v1/warehouse` for each test warehouse, each with an `s3` storage profile whose `flavor` is `s3-compat`, `endpoint` is the internal MinIO URL, `path-style-access` is true, and `region`/`bucket` match the MinIO stack
-* *AND* the harness SHALL create one warehouse with S3 access delegation disabled (`sts-enabled` and `remote-signing-enabled` false) for the static-credential path and one warehouse with `sts-enabled` true — referencing the MinIO STS role — for the vended-credential path
+* *AND* the harness SHALL `POST /management/v1/bootstrap` once and then `POST /management/v1/warehouse` for each test warehouse, each with an `s3` storage profile whose `flavor` is `s3-compat`, `endpoint` is the internal SeaweedFS URL, `path-style-access` is true, and `region`/`bucket` match the SeaweedFS stack
+* *AND* the harness SHALL create one warehouse with S3 access delegation disabled (`sts-enabled` and `remote-signing-enabled` false) for the static-credential path and one warehouse with `sts-enabled` true — referencing the SeaweedFS STS role — for the vended-credential path
 * *AND* no client secret or bearer token value SHALL appear in test output
 
 ### Scenario: createVirtualSchema enumerates Lakekeeper tables over OAuth2 client-credentials auth
@@ -90,7 +90,7 @@ own `lakekeeper-e2e` cargo feature.
 
 ### Scenario: End-to-end scan over a static-credential Lakekeeper warehouse returns correct rows
 
-* *GIVEN* a virtual schema over a seeded Iceberg table in the delegation-disabled Lakekeeper warehouse, whose CONNECTION supplies OAuth2 catalog auth and static MinIO `access_key`/`secret_key` with `use_vended_credentials` false
+* *GIVEN* a virtual schema over a seeded Iceberg table in the delegation-disabled Lakekeeper warehouse, whose CONNECTION supplies OAuth2 catalog auth and static SeaweedFS `access_key`/`secret_key` with `use_vended_credentials` false
 * *WHEN* a user runs `SELECT <subset of columns> FROM <vs>.<table> WHERE <predicate> LIMIT <n>`
 * *THEN* the query SHALL return exactly the rows that satisfy the predicate, capped at `n`, projected to the selected columns
 * *AND* the returned values SHALL match the seeded source data
@@ -104,7 +104,7 @@ own `lakekeeper-e2e` cargo feature.
 * *AND* the adapter SHALL take the store's endpoint and path-style flag from that same vended response BECAUSE the CONNECTION states no `endpoint` and no `region`, so this scenario is the positive case for vended addressing filling in while the CONNECTION is silent — SUPERSEDING the recorded clause that framed it as the adapter reading no CONNECTION storage field at all
 * *AND* the test SHALL assert the vended CONNECTION carries an empty `access_key`, `secret_key`, `endpoint`, and `region`, because that empty shape is now the PRECONDITION of the precedence case under test as well as the delegation proof: a non-empty CONNECTION `endpoint` would win over the vended one and the scan would evidence nothing about vended addressing
 * *AND* the adapter SHALL honour that vended plain-`http://` endpoint because the harness sets `ALLOW_HTTP = 'true'`, so this scenario is the positive case for the operator-consent gate on plaintext transport
-* *AND* the scan SHALL read the MinIO data files using the vended credentials and return rows identical to the same query run over the static-credential warehouse
+* *AND* the scan SHALL read the SeaweedFS data files using the vended credentials and return rows identical to the same query run over the static-credential warehouse
 * *AND* no vended or static credential value SHALL appear in any test output, no STATIC CONNECTION credential value SHALL appear in any returned SQL string, and no VENDED credential value SHALL appear there in PLAINTEXT — the vended credential travels only as the sealed envelope's ciphertext, issue [#378](https://github.com/exasol-labs/lakehouse-engine-rs/issues/378), closed by this plan — SUPERSEDING the recorded clause whose returned-SQL half was FALSE before this plan
 * *AND* the test MUST fail (not skip) when the Docker stack is unavailable
 
@@ -121,7 +121,7 @@ own `lakekeeper-e2e` cargo feature.
 * *AND* the shared `common/e2e_harness` module defining the SLC install, the `.so` upload, and the script creation
 * *WHEN* the binary's setup provisions the lakehouse VS scan path
 * *THEN* the binary SHALL install `LAKEHOUSE_SCAN`, `LAKEHOUSE_DISTRIBUTE_FILES`, and the adapter script from that shared definition, so the script DDL is byte-identical to every other E2E binary
-* *AND* the Lakekeeper-specific CONNECTION password (OAuth2 client-credentials plus warehouse-name and MinIO endpoint), the warehouse-name, and the namespace SHALL be supplied as explicit parameters rather than by re-declaring the provisioning logic
+* *AND* the Lakekeeper-specific CONNECTION password (OAuth2 client-credentials plus warehouse-name and SeaweedFS endpoint), the warehouse-name, and the namespace SHALL be supplied as explicit parameters rather than by re-declaring the provisioning logic
 * *AND* an end-to-end query through the Lakekeeper virtual schema SHALL return results identical to the single-node DataFusion equivalent
 
 ### Scenario: A two-table broadcast join over a vended-credential warehouse returns correct rows
