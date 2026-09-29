@@ -6,9 +6,9 @@ Project mission in: @specs/mission.md
 
 ## Feature tracking
 
-- **New features are tracked as GitHub issues** (`gh issue create`) before/at the start of
-  work, in addition to speq spec deltas. Reference the issue in the implementing commit
-  (`Closes #<n>`) so the work and its tracking stay linked.
+- **New features are tracked as GitHub issues**, in addition to speq spec deltas. A human opens
+  the issue; agents don't create one. Reference it in the implementing commit (`Closes #<n>`) so
+  the work and its tracking stay linked; if no issue exists yet, ask for one instead of filing it.
 
 ## Code navigation & editing
 
@@ -76,25 +76,20 @@ the node, in place, for querying Iceberg / Databricks from Exasol SQL.
 
 ## Iceberg and Delta Lake specification compliance
 
-Any feature planned via `/speq:plan` that touches scanning, pushdown, or schema/type handling MUST
-be checked against the Apache Iceberg table spec (https://iceberg.apache.org/spec/) during
-planning — quote the relevant normative section, don't rely on memory. A known deviation from the
-spec must either be fixed in the same plan or recorded as an explicit, accurately-scoped tracked
-exception — a GitHub issue cited inline in the spec (see the `(#27)` pattern in
-`specs/datafusion-scan/scan-execution-field-id-projection/spec.md`); it must never be a silent gap.
-A deviation driven by an Exasol target-type limitation (e.g. no struct/list/map types) is not a
-gap for either the Iceberg or the Delta spec — but it must still be named as a deliberate
-trade-off in the spec, not left unstated.
+A plan that touches scanning, pushdown, or schema/type handling MUST be checked against the
+governing spec during planning: the Apache Iceberg table spec (https://iceberg.apache.org/spec/)
+or the Delta Lake protocol (https://github.com/delta-io/delta/blob/master/PROTOCOL.md). Quote the
+relevant normative section (e.g. `§ Reader Requirements for Type Widening`); don't rely on memory.
+Each known deviation is either fixed in the same plan or written into the spec delta as an
+explicit, accurately-scoped exception; it must never be a silent gap. A deviation driven by an
+Exasol target-type limitation (e.g. no struct/list/map types) is not a spec gap, but the spec
+still names it as a deliberate trade-off.
 
-The same obligation applies to Delta: any feature planned via `/speq:plan` that touches Delta
-scanning, pushdown, or schema/type handling MUST be checked against the Delta Lake protocol
-(https://github.com/delta-io/delta/blob/master/PROTOCOL.md) during planning — quote the relevant normative section
-(e.g. `§ Reader Requirements for Type Widening`), don't rely on memory. A known deviation from the
-protocol must either be fixed in the same plan or recorded as an explicit, accurately-scoped
-tracked exception — a GitHub issue cited inline in the spec, same convention as the Iceberg rule
-above (see `specs/datafusion-scan/type-relaxation/spec.md` and
-`specs/vs-adapter/delta-reader-feature-gating/spec.md` for the citation format); it must never be
-a silent gap.
+Planning never opens GitHub issues; a human decides what gets one. Cite an existing issue when
+one covers the deviation (format: `(#83)` in
+`specs/datafusion-scan/scan-execution-field-id-projection/spec.md`). Otherwise mark it `(#TBD)`
+and list it as an open question: in the interview for `/speq:plan`, in a PR comment for
+`/speq:plan-pr`.
 
 ## Exasol / tooling
 
@@ -140,7 +135,7 @@ DataFusion scan — omitting it returns wrong rows, not a safely-deferred check.
   Every query starts from source metadata.
 - **Resolve metadata once per query**, in the VS layer — never once per node. The VS passes each UDF
   an explicit assigned file list (a projection- + predicate-carrying scan spec); the UDF never
-  discovers files itself. This seam is what later enables multi-node file sharding.
+  discovers files itself. This seam is what enables multi-node file sharding.
 - **File-level work assignment, no overlap** — a node scans only its assigned files.
 - **`ScanSpec` is format-neutral.** Every field on `ScanSpec`, `FileEntry`, and `LogicalField` must
   serve any table format — Iceberg, Delta, Hive, or future ones. When a new format or feature needs
@@ -160,8 +155,8 @@ before changing the shard count or fan-out shape.
   multiplexed onto that pool.
 - **Avoid `GROUP BY IPROC()` for parallelism.** `IPROC()` = node number, `NPROC()` = node count.
   `GROUP BY IPROC()` yields exactly one group per node → caps parallelism at the node count and
-  leaves a node's other cores idle. Use it only for the NPROC node-count capture, never to shard
-  scan work.
+  leaves a node's other cores idle. Never shard scan work on it; the shard-count node count comes
+  from `ctx.node_count()`.
 - **Oversubscribe via `GROUP BY shard_key`.** Compute `G = node_count × parallelism_factor` and cap
   G at **300** (Exasol's `max_dynamic_group_count` default). At/below 300 Exasol distributes groups
   **round-robin** (balanced) across nodes; above it Exasol **hash-partitions** them (unbalanced) —
@@ -198,8 +193,8 @@ before changing the shard count or fan-out shape.
   send-then-wait-for-ack round-trip over the SLC's ZMQ REQ socket; a large emit = hundreds of
   round-trips, each subject to the SLC's socket timeouts. Under load the engine can take >1 s to
   ack. A short, no-retry receive/send timeout treated as fatal breaks the REQ/REP lockstep on a
-  slow-but-alive ack → abnormal VM exit → SIGKILL fan-out. SLCs ≥ 0.19.1 retry transient `EAGAIN`
-  instead, so on a current SLC this is not the cause of a volume- or load-correlated crash.
+  slow-but-alive ack → abnormal VM exit → SIGKILL fan-out. The SLC retries transient `EAGAIN`, so
+  this is not the cause of a volume- or load-correlated crash.
 - **SLC/`.so` fingerprint must match exactly.** The SDK fingerprint (`{exasol-udf-sdk
   version}:{rustc_hash}`) is checked at UDF load; e.g. a 0.19.1 SLC rejects a 0.19.0-SDK `.so` with
   a fingerprint-mismatch error. Keep the SLC and the consumer crate's `exasol-udf-sdk` version in
@@ -209,9 +204,8 @@ before changing the shard count or fan-out shape.
 
 - **`ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS = '<host>:<port>'`** redirects the UDF VM's fd1/fd2 to a
   listener (`nc -l`), capturing runtime tracing + startup/abort output the Rust SLC otherwise
-  discards. (The docs' `SET SESSION SCRIPT OUTPUT ADDRESS` form was REJECTED on this cluster — use
-  the `ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS` form.) The listener must be reachable FROM the
-  cluster nodes (a jumphost/private IP; a NAT'd local client cannot receive the connect-back).
+  discards. The listener must be reachable FROM the cluster nodes (a jumphost/private IP; a NAT'd
+  local client cannot receive the connect-back).
 - **`%udf_debug_level debug|info|warn|error`** in the script source (same channel as `%udf_object`)
   sets verbosity; at `debug` the SLC auto-emits per-VM-tagged (`pid`/`node_id`/`session_id`/`vm_id`)
   emit/flush + RSS telemetry with NO UDF code. `udf_log!(ctx, level, …)` + `ctx.debug_level()` emit
@@ -223,8 +217,7 @@ before changing the shard count or fan-out shape.
 ## DataFusion streaming
 
 - Stream the DataFusion result: fetch one Arrow `RecordBatch` at a time, emit it, then **drop the
-  batch before fetching the next**. Architect rule: "du musst resultset in batches lesen und dann
-  gleich emitten".
+  batch before fetching the next**.
 - **Raw scan path**: call `ctx.emit_batch(&batch)` — no `Vec<Value>` intermediate; the SDK
   serializes the batch to Arrow IPC bytes inside the UDF crate.
 - **Partial-aggregate path**: convert the single summary row to `Vec<Value>` and call `ctx.emit`.
@@ -291,8 +284,8 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   `crates/lakehouse-catalog` (Iceberg REST + Unity Catalog access — `CatalogSession`, auth, namespace
   enumeration, vended-storage resolution, SigV4 signing) and `crates/vs-expression` (SQL expression
   translation). Both compile into the engine's cdylib, so one `.so` exports **all three** entry
-  points (VS adapter + DataFusion scan UDF + version query UDF) — `language-container-rs` 0.14.0
-  supports multiple entry points per `.so`.
+  points (VS adapter + DataFusion scan UDF + version query UDF); the Rust SLC supports multiple
+  entry points per `.so`.
 - SDK: `exasol-udf-sdk` + `exasol-udf-macros`, pinned **only** in `[workspace.dependencies]` of the
   root `Cargo.toml`. `connect-back` is **always-on** (not a feature flag).
   Enable `emit-arrow` to unlock `ctx.emit_batch`.
@@ -311,7 +304,7 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   Do not revert to a local backend: local backend + gitignored state means the state lives only on
   whichever machine/worktree last ran `tofu apply`; dropping that worktree (this workspace's
   `<repo>-<number>` convention makes worktrees routinely disposable) loses the only copy while the
-  real, billing AWS resources keep running. Read PR #398 (#397) before touching backend config.
+  real, billing AWS resources keep running.
 - Select the per-`env_name` workspace (e.g. `demo`) with
   `tofu workspace select "$ENV" || tofu workspace new "$ENV"`; the S3 backend supports workspaces.
 - Each stack needs a local `terraform.tfvars` (gitignored, copied from that stack's

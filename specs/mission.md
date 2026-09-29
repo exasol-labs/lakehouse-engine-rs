@@ -155,9 +155,9 @@ simultaneously. No state survives query completion.
 ## Constraints
 
 - **Technical**: UDFs are stateless and disposable — no caching, no metadata persistence, no
-  cross-call state. The `.so` is built in glibc 2.41 to match the SLC; only SDK `Value` types cross
-  the UDF boundary (never Arrow types). Read DataFusion result batches and `ctx.emit` them
-  incrementally; never materialize the whole result set. Metadata must be resolved once per query,
+  cross-call state. The `.so` is built in glibc 2.41 to match the SLC; Arrow types never cross
+  the `.so` boundary (only SDK `Value`s or Arrow IPC bytes via `ctx.emit_batch`). Emit DataFusion
+  result batches incrementally; never materialize the whole result set. Metadata must be resolved once per query,
   not once per node. All DSN/connection strings include `validateservercertificate=0`.
 - **Usable engine**: correctness and safety guards are first-class requirements. The engine is designed to be operated, not just measured. Execution is bounded: the scan UDF sizes its DataFusion memory pool from the per-instance memory limit and either spills to disk (when `/tmp` is real disk) so high-cardinality grouped queries complete, or returns a clean `ResourcesExhausted` error rather than OOM-crashing — layered on oversubscribed sharding that shrinks per-instance footprint and the engine's own 80% concurrency throttle.
 - **Performance**: Must be faster than single-node DataFusion and scale with added Exasol nodes, with
