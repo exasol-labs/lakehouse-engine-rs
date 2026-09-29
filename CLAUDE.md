@@ -6,9 +6,9 @@ Project mission in: @specs/mission.md
 
 ## Feature tracking
 
-- **New features are tracked as GitHub issues** (`gh issue create`) before/at the start of
-  work, in addition to speq spec deltas. Reference the issue in the implementing commit
-  (`Closes #<n>`) so the work and its tracking stay linked.
+- **New features are tracked as GitHub issues**, in addition to speq spec deltas. A human opens
+  the issue; agents don't create one. Reference it in the implementing commit (`Closes #<n>`) so
+  the work and its tracking stay linked; if no issue exists yet, ask for one instead of filing it.
 
 ## Code navigation & editing
 
@@ -76,25 +76,20 @@ the node, in place, for querying Iceberg / Databricks from Exasol SQL.
 
 ## Iceberg and Delta Lake specification compliance
 
-Any feature planned via `/speq:plan` that touches scanning, pushdown, or schema/type handling MUST
-be checked against the Apache Iceberg table spec (https://iceberg.apache.org/spec/) during
-planning — quote the relevant normative section, don't rely on memory. A known deviation from the
-spec must either be fixed in the same plan or recorded as an explicit, accurately-scoped tracked
-exception — a GitHub issue cited inline in the spec (see the `(#83)` pattern in
-`specs/datafusion-scan/scan-execution-field-id-projection/spec.md`); it must never be a silent gap.
-A deviation driven by an Exasol target-type limitation (e.g. no struct/list/map types) is not a
-gap for either the Iceberg or the Delta spec — but it must still be named as a deliberate
-trade-off in the spec, not left unstated.
+A plan that touches scanning, pushdown, or schema/type handling MUST be checked against the
+governing spec during planning: the Apache Iceberg table spec (https://iceberg.apache.org/spec/)
+or the Delta Lake protocol (https://github.com/delta-io/delta/blob/master/PROTOCOL.md). Quote the
+relevant normative section (e.g. `§ Reader Requirements for Type Widening`); don't rely on memory.
+Each known deviation is either fixed in the same plan or written into the spec delta as an
+explicit, accurately-scoped exception; it must never be a silent gap. A deviation driven by an
+Exasol target-type limitation (e.g. no struct/list/map types) is not a spec gap, but the spec
+still names it as a deliberate trade-off.
 
-The same obligation applies to Delta: any feature planned via `/speq:plan` that touches Delta
-scanning, pushdown, or schema/type handling MUST be checked against the Delta Lake protocol
-(https://github.com/delta-io/delta/blob/master/PROTOCOL.md) during planning — quote the relevant normative section
-(e.g. `§ Reader Requirements for Type Widening`), don't rely on memory. A known deviation from the
-protocol must either be fixed in the same plan or recorded as an explicit, accurately-scoped
-tracked exception — a GitHub issue cited inline in the spec, same convention as the Iceberg rule
-above (see `specs/datafusion-scan/type-relaxation/spec.md` and
-`specs/vs-adapter/delta-reader-feature-gating/spec.md` for the citation format); it must never be
-a silent gap.
+Planning never opens GitHub issues; a human decides what gets one. Cite an existing issue when
+one covers the deviation (format: `(#83)` in
+`specs/datafusion-scan/scan-execution-field-id-projection/spec.md`). Otherwise mark it `(#TBD)`
+and list it as an open question: in the interview for `/speq:plan`, in a PR comment for
+`/speq:plan-pr`.
 
 ## Exasol / tooling
 
