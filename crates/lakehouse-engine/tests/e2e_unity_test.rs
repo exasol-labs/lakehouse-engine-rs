@@ -645,7 +645,7 @@ fn unity_delta_delete_free_table_returns_its_rows() {
     );
 }
 
-/// Scenario: a Unity Catalog CONNECTION with static keys naming the role reads a Delta table through the session
+/// Scenario: A Unity Catalog CONNECTION with static keys naming the role reads a Delta table through the session
 #[test]
 fn unity_role_connection_reads_a_delta_table_through_the_session() {
     setup();
