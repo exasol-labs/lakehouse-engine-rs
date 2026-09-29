@@ -20,8 +20,7 @@ Project mission in: @specs/mission.md
   remain fine for non-code files (docs, specs, config) or a file already fully read
   into context this session.
 - If Serena's tools are not yet loaded this session, load them and call
-  `initial_instructions` before the first code read/grep/edit — don't default to
-  built-in tools out of habit.
+  `initial_instructions` before the first code read/grep/edit.
 
 ## Code comment style
 
@@ -116,11 +115,9 @@ DataFusion scan — omitting it returns wrong rows, not a safely-deferred check.
 - A reported bug MUST be reproduced locally against the Docker Exasol container before it is
   fixed. Do not trust an issue's claimed repro, a capability list, or code inspection alone —
   run the query.
-- A claimed SQL capability gap or limitation MUST be verified against a live Exasol system
-  (`EXPLAIN VIRTUAL`, an actual pushed query, or an E2E test), not assumed from documentation,
-  memory, or a capability registry (`capabilities.rs`) alone.
-- No assumptions about SQL capabilities, syntax, or pushdown reachability without checking them
-  against a running Exasol instance.
+- A claim about SQL capabilities, syntax, or pushdown reachability MUST be verified against a live
+  Exasol system (`EXPLAIN VIRTUAL`, an actual pushed query, or an E2E test), not assumed from
+  documentation, memory, or a capability registry (`capabilities.rs`) alone.
 
 ## Bench harness gotchas
 
@@ -183,7 +180,7 @@ before changing the shard count or fan-out shape.
   (`EMIT_BUFFER_LIMIT_BYTES`) — 4 *million* bytes, NOT 4 MiB. Do not send a message per call.
 - **Always flush at end of `run()`**, even if the threshold was not reached.
 - A single row > threshold is still sent as one `MT_EMIT` (only the 2 GB per-value limit remains).
-- **Raw-scan path uses `ctx.emit_batch(&RecordBatch)`** (SDK 0.19.0, `emit-arrow` feature). The SDK
+- **Raw-scan path uses `ctx.emit_batch(&RecordBatch)`** (`emit-arrow` feature). The SDK
   serializes the batch to Arrow IPC bytes internally; only bytes cross the `.so` boundary, not Arrow
   types. Partial-aggregate single-row emits still use `ctx.emit` with `Value` types.
 
@@ -201,15 +198,14 @@ before changing the shard count or fan-out shape.
   send-then-wait-for-ack round-trip over the SLC's ZMQ REQ socket; a large emit = hundreds of
   round-trips, each subject to the SLC's socket timeouts. Under load the engine can take >1 s to
   ack. A short, no-retry receive/send timeout treated as fatal breaks the REQ/REP lockstep on a
-  slow-but-alive ack → abnormal VM exit → SIGKILL fan-out. **Fixed in lc-rs 0.19.1** by retrying
-  transient `EAGAIN` rather than treating the timeout as fatal. Was volume- and load-correlated and
-  intermittent.
+  slow-but-alive ack → abnormal VM exit → SIGKILL fan-out. SLCs ≥ 0.19.1 retry transient `EAGAIN`
+  instead, so on a current SLC this is not the cause of a volume- or load-correlated crash.
 - **SLC/`.so` fingerprint must match exactly.** The SDK fingerprint (`{exasol-udf-sdk
   version}:{rustc_hash}`) is checked at UDF load; e.g. a 0.19.1 SLC rejects a 0.19.0-SDK `.so` with
   a fingerprint-mismatch error. Keep the SLC and the consumer crate's `exasol-udf-sdk` version in
   lockstep, built with the same rustc (the `rust:1.94-trixie` SLC builder).
 
-## Live debugging (lc-rs 0.19.0 debug surface)
+## Live debugging (SLC debug surface)
 
 - **`ALTER SESSION SET SCRIPT_OUTPUT_ADDRESS = '<host>:<port>'`** redirects the UDF VM's fd1/fd2 to a
   listener (`nc -l`), capturing runtime tracing + startup/abort output the Rust SLC otherwise
@@ -290,15 +286,15 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
 - Build the UDF `.so` only inside `rust:1.94-trixie` (glibc 2.41, matches the SLC) via
   `make cross-udf-build`. **Never `cargo build --release` on the host** — it writes a
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
-- Two library crates, one `.so`: `crates/lakehouse-engine` (Iceberg + Delta file planning, scan-spec
+- Three library crates, one `.so`: `crates/lakehouse-engine` (Iceberg + Delta file planning, scan-spec
   wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan) depends on
   `crates/lakehouse-catalog` (Iceberg REST + Unity Catalog access — `CatalogSession`, auth, namespace
-  enumeration, vended-storage resolution, SigV4 signing). The catalog crate compiles into the
-  engine's cdylib, so one `.so` still exports **all three** entry points (VS adapter + DataFusion
-  scan UDF + version query UDF) — `language-container-rs` 0.14.0 supports multiple entry points
-  per `.so`.
+  enumeration, vended-storage resolution, SigV4 signing) and `crates/vs-expression` (SQL expression
+  translation). Both compile into the engine's cdylib, so one `.so` exports **all three** entry
+  points (VS adapter + DataFusion scan UDF + version query UDF) — `language-container-rs` 0.14.0
+  supports multiple entry points per `.so`.
 - SDK: `exasol-udf-sdk` + `exasol-udf-macros`, pinned **only** in `[workspace.dependencies]` of the
-  root `Cargo.toml`. Since 0.18.0, `connect-back` is **always-on** (no longer a feature flag).
+  root `Cargo.toml`. `connect-back` is **always-on** (not a feature flag).
   Enable `emit-arrow` to unlock `ctx.emit_batch`.
 
 ## Deployment state
@@ -315,10 +311,9 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   Do not revert to a local backend: local backend + gitignored state means the state lives only on
   whichever machine/worktree last ran `tofu apply`; dropping that worktree (this workspace's
   `<repo>-<number>` convention makes worktrees routinely disposable) loses the only copy while the
-  real, billing AWS resources keep running. Hit live 2026-09-11, fixed in PR #398 (issue #397) —
-  see that PR before touching backend config again.
-- `tofu workspace select "$ENV" || tofu workspace new "$ENV"` (per `env_name`, e.g. `demo`) still
-  works exactly as before — the S3 backend supports workspaces the same way local did.
+  real, billing AWS resources keep running. Read PR #398 (#397) before touching backend config.
+- Select the per-`env_name` workspace (e.g. `demo`) with
+  `tofu workspace select "$ENV" || tofu workspace new "$ENV"`; the S3 backend supports workspaces.
 - Each stack needs a local `terraform.tfvars` (gitignored, copied from that stack's
   `terraform.tfvars.example`) before `plan`/`apply`. **`data-stack`'s must set
   `enable_emr_serverless = true`** — the variable defaults to `false`, and a bare `tofu
