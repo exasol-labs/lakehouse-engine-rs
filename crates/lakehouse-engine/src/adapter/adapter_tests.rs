@@ -1600,10 +1600,6 @@ fn resolved_config_carries_the_catalog_connection_name() {
     assert_eq!(config.connection_name, "MY_CONN");
 }
 
-// ---------------------------------------------------------------------------
-// AWS IAM role assumption at the adapter entry points
-// ---------------------------------------------------------------------------
-
 const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
 const BASE_AK: &str = "AKIABASEIDENTITY";
 const BASE_SK: &str = "BASE_SECRET_SENTINEL";
@@ -1850,7 +1846,7 @@ fn assert_no_credential_value(message: &str) {
     }
 }
 
-/// Scenario: a role CONNECTION costs exactly one AssumeRole per create and per two-table join pushdown, sent before any catalog request, whose session signs every catalog request.
+/// Scenario: The adapter assumes the role once per request and substitutes the session
 #[test]
 fn assume_role_sends_one_sts_request_per_create_and_per_join_pushdown() {
     let create = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (200, EMPTY_LISTING));
@@ -1883,7 +1879,6 @@ fn assume_role_sends_one_sts_request_per_create_and_per_join_pushdown() {
     assert_no_credential_value(&err.to_string());
 }
 
-/// Scenario: a CONNECTION naming no role reaches the catalog as its stated key pair and sends no STS request, at either entry point.
 #[test]
 fn a_connection_without_a_role_sends_no_sts_request() {
     let create_stub = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (200, EMPTY_LISTING));
@@ -1900,7 +1895,7 @@ fn a_connection_without_a_role_sends_no_sts_request() {
     assert_signed_by_the_stated_key_pair(&join_stub);
 }
 
-/// Scenario: an STS denial fails the request with a credential-safe user error naming the role, and no catalog request is sent with the base identity instead.
+/// Scenario: A failed AssumeRole is a credential-safe error
 #[test]
 fn an_sts_denial_fails_the_request_before_any_catalog_request() {
     for request in [role_create_request(), role_join_pushdown_request()] {
@@ -1926,7 +1921,6 @@ fn an_sts_denial_fails_the_request_before_any_catalog_request() {
     }
 }
 
-/// Scenario: validation and the sealing key read the CONNECTION as stated, while the resolved credentials and storage carry the session and keep every other field.
 #[test]
 fn validation_and_sealing_key_read_the_stated_credentials() {
     use crate::scan::sealed::{derive_sealed_storage_key, seal_storage, unseal_storage};

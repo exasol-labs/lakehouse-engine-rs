@@ -22,9 +22,7 @@ pub(crate) fn base_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
-        aws_assume_role_arn: None,
-        aws_external_id: None,
-        aws_sts_endpoint: None,
+        ..Default::default()
     }
 }
 
@@ -75,9 +73,7 @@ pub(crate) fn creds_no_auth() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
-        aws_assume_role_arn: None,
-        aws_external_id: None,
-        aws_sts_endpoint: None,
+        ..Default::default()
     }
 }
 
@@ -147,8 +143,6 @@ pub(crate) fn authorization_header(head: &str) -> Option<&str> {
 
 /// The value of header `name` in a recorded request head, matched
 /// case-insensitively, or `None` when the request did not carry it.
-///
-/// Consumers: `session`, `sts`.
 pub(crate) fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
     head.lines().skip(1).find_map(|line| {
         let (header, value) = line.split_once(':')?;
@@ -157,18 +151,12 @@ pub(crate) fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// The session credentials [`ASSUME_ROLE_RESPONSE`] carries.
-///
-/// Consumers: `session`, `sts`.
 pub(crate) const SESSION_AK: &str = "ASIASESSIONKEYSENTINEL";
-/// Consumers: `session`, `sts`.
 pub(crate) const SESSION_SK: &str = "session-secret-access-key-sentinel";
-/// Consumers: `session`, `sts`.
 pub(crate) const SESSION_TOKEN: &str = "session-token-sentinel";
 
 /// A well-formed AWS STS `AssumeRoleResponse` carrying [`SESSION_AK`],
 /// [`SESSION_SK`], and [`SESSION_TOKEN`], in the sample response's shape and namespace.
-///
-/// Consumers: `session`, `sts`.
 pub(crate) const ASSUME_ROLE_RESPONSE: &str = r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
   <AssumeRoleResult>
     <AssumedRoleUser>

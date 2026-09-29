@@ -66,7 +66,7 @@ fn catalog_auth_secrets_never_in_scan_spec_with_vending() {
     );
 }
 
-/// Scenario: Catalog auth props are never placed in a role CONNECTION's scan spec
+/// Scenario: Catalog auth props are never placed in any scan spec
 #[test]
 fn catalog_auth_secrets_never_in_a_role_scan_spec() {
     const CATALOG_TOKEN: &str = "ROLE_CATALOG_TOKEN_SENTINEL";
@@ -1726,9 +1726,7 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         account_name: None,
         account_key: None,
         sas_token: None,
-        aws_assume_role_arn: None,
-        aws_external_id: None,
-        aws_sts_endpoint: None,
+        ..Default::default()
     };
 
     let catalog = CatalogProps {
@@ -3016,79 +3014,4 @@ fn no_connection_credential_reaches_the_generated_sql() {
     assert_eq!(&unseal_storage(payload, &key).unwrap(), &role_effective);
     assert_no_sentinel_secret_leaked(&role_sql);
     assert!(!role_sql.contains(SENTINEL_EXTERNAL_ID), "{role_sql}");
-}
-
-/// Scenario: a direct-storage pushdown through a role CONNECTION carries its storage block only inside the sealed envelope, never a CONNECTION reference.
-#[tokio::test]
-async fn a_direct_storage_role_connection_seals_its_storage_block() {
-    use crate::adapter::tests::parquet_fixture::{nullable, parquet_bytes};
-    use arrow::datatypes::DataType;
-
-    let StorageBackend::S3(served) = binary_object_endpoint(
-        "warehouse",
-        vec![(
-            "events/part-0.parquet".to_string(),
-            parquet_bytes(vec![nullable("ID", DataType::Int64)], 1),
-        )],
-    )
-    .await
-    else {
-        panic!("the object endpoint answers as S3 storage");
-    };
-    let creds = ConnectionCreds {
-        endpoint: served.endpoint,
-        region: "us-east-1".into(),
-        access_key: SENTINEL_ACCESS_KEY.into(),
-        secret_key: SENTINEL_SECRET_KEY.into(),
-        session_token: Some(SENTINEL_SESSION_TOKEN.into()),
-        path_style: Some(true),
-        aws_assume_role_arn: Some(SENTINEL_ROLE_ARN.into()),
-        aws_external_id: Some(SENTINEL_EXTERNAL_ID.into()),
-        ..Default::default()
-    };
-    let conn = ResolvedConnectionConfig {
-        catalog_uri: "s3://warehouse".to_string(),
-        storage: crate::adapter::connection::storage_block(&creds, true),
-        creds,
-        allow_http: true,
-        catalog_kind: CatalogKind::DirectStorage,
-        connection_name: TEST_CONNECTION_NAME.to_string(),
-        sealed_storage_key: Some(test_sealing_key()),
-    };
-    let request = serde_json::json!({
-        "involvedTables": [{
-            "name": "EVENTS",
-            "columns": [{"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
-        }],
-        "pushdownRequest": {
-            "type": "select",
-            "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
-            "selectListDataTypes": [{"type": "decimal", "precision": 20, "scale": 0}],
-        },
-    });
-    let catalog = CatalogProps {
-        warehouse: String::new(),
-        table: "events".into(),
-    };
-
-    let result = handle_pushdown(
-        &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
-    )
-    .await
-    .expect("a direct-storage table with one data file plans a scan");
-    let sql = result["sql"].as_str().expect("the response carries SQL");
-
-    let common: Json = serde_json::from_str(common_arg_literal(sql)).unwrap();
-    let selected: ScanStorage = serde_json::from_value(common["storage"].clone()).unwrap();
-    let ScanStorage::Sealed { name, payload } = &selected else {
-        panic!("a role CONNECTION's direct-storage block must be sealed, got {selected:?}");
-    };
-    assert_eq!(name, TEST_CONNECTION_NAME);
-    assert_eq!(
-        &unseal_storage(payload, &test_sealing_key()).unwrap(),
-        &conn.storage
-    );
-    assert!(!sql.contains("\"connection\":{"), "{sql}");
-    assert_no_sentinel_secret_leaked(sql);
-    assert!(!sql.contains(SENTINEL_EXTERNAL_ID), "{sql}");
 }

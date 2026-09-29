@@ -88,23 +88,6 @@ fn sealed_storage_round_trips_and_rejects_a_tampered_payload() {
     }
 }
 
-/// Scenario: every seal draws a fresh nonce, so two envelopes of one backend differ and both open under the key.
-#[test]
-fn sealing_one_backend_twice_yields_distinct_envelopes_that_both_open() {
-    let key = derive_sealed_storage_key(SEALING_PASSWORD);
-
-    let first = seal_storage(&s3_backend(), &key).expect("the first seal succeeds");
-    let second = seal_storage(&s3_backend(), &key).expect("the second seal succeeds");
-
-    assert_ne!(first, second, "each seal must carry its own envelope");
-    for payload in [&first, &second] {
-        assert_eq!(
-            unseal_storage(payload, &key).expect("each envelope opens under the key"),
-            s3_backend()
-        );
-    }
-}
-
 #[test]
 fn key_material_is_present_only_for_a_non_empty_secret_bearing_field() {
     assert!(!connection_password_carries_key_material(

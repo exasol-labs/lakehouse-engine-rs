@@ -11,8 +11,6 @@ use lakehouse_catalog::{StorageCreds, scheme_of};
 use super::catalog_kind::CatalogKind;
 use super::nonempty_str;
 
-/// The only unconditionally-required field in the CONNECTION password JSON;
-/// `access_key`/`secret_key` become required under `use_sigv4` or a named role.
 pub const REQUIRED_KEY: &str = "warehouse";
 
 pub use lakehouse_catalog::ConnectionCreds;
@@ -218,39 +216,41 @@ fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(
 /// Runs before the SigV4 check so a role CONNECTION missing its key pair is told
 /// that the role needs it, not only that SigV4 does.
 fn validate_assume_role_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
-    let names_role = creds.assume_role_arn().is_some();
-    let orphaned: Vec<&str> = [
-        ("aws_external_id", creds.aws_external_id.is_some()),
-        ("aws_sts_endpoint", creds.aws_sts_endpoint.is_some()),
-    ]
-    .into_iter()
-    .filter_map(|(field, present)| (present && !names_role).then_some(field))
-    .collect();
-    if !orphaned.is_empty() {
+    if creds.assume_role_arn().is_none() {
+        let orphaned = flagged_fields(&[
+            ("aws_external_id", creds.aws_external_id.is_some()),
+            ("aws_sts_endpoint", creds.aws_sts_endpoint.is_some()),
+        ]);
+        if orphaned.is_empty() {
+            return Ok(());
+        }
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' supplies field(s) {} without aws_assume_role_arn; they \
              configure AWS IAM role assumption, so each requires aws_assume_role_arn",
             orphaned.join(", ")
         )));
     }
-
-    let missing: Vec<&str> = [
+    let missing = flagged_fields(&[
         ("access_key", creds.access_key.is_empty()),
         ("secret_key", creds.secret_key.is_empty()),
-    ]
-    .into_iter()
-    .filter_map(|(field, absent)| (absent && names_role).then_some(field))
-    .collect();
-    if !missing.is_empty() {
-        return Err(UdfError::User(format!(
-            "CONNECTION '{name}' names aws_assume_role_arn but is missing field(s) {}; the \
-             role is assumed with the CONNECTION's own access_key and secret_key, and no \
-             ambient AWS credential, such as an environment variable or an instance \
-             profile, is read",
-            missing.join(", ")
-        )));
+    ]);
+    if missing.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    Err(UdfError::User(format!(
+        "CONNECTION '{name}' names aws_assume_role_arn but is missing field(s) {}; the \
+         role is assumed with the CONNECTION's own access_key and secret_key, and no \
+         ambient AWS credential, such as an environment variable or an instance \
+         profile, is read",
+        missing.join(", ")
+    )))
+}
+
+fn flagged_fields<'a>(flags: &[(&'a str, bool)]) -> Vec<&'a str> {
+    flags
+        .iter()
+        .filter_map(|&(field, flag)| flag.then_some(field))
+        .collect()
 }
 
 fn validate_sigv4_creds(

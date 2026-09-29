@@ -20,11 +20,11 @@ pub struct ConnectionCreds {
     pub account_name: Option<String>,
     pub account_key: Option<String>,
     pub sas_token: Option<String>,
-    /// IAM role [`crate::resolve_aws_identity`] assumes, signed by this set's key pair; unset or empty means the set acts as its own key pair.
+    /// IAM role to assume via STS.
     pub aws_assume_role_arn: Option<String>,
-    /// STS `ExternalId` sent with the `AssumeRole` call; `Debug` redacts it because a trust policy treats it as a shared value.
+    /// STS `ExternalId`; redacted in `Debug`.
     pub aws_external_id: Option<String>,
-    /// STS endpoint override; unset resolves to the signing region's regional endpoint, else the global one.
+    /// STS endpoint override.
     pub aws_sts_endpoint: Option<String>,
 }
 

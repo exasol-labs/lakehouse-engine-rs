@@ -32,9 +32,7 @@ fn creds(use_vended_credentials: bool) -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
-        aws_assume_role_arn: None,
-        aws_external_id: None,
-        aws_sts_endpoint: None,
+        ..Default::default()
     }
 }
 

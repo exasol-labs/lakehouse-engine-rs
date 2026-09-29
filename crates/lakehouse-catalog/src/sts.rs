@@ -1,9 +1,4 @@
-//! AWS STS `AssumeRole`: turns a credential set that names an IAM role into
-//! the session identity a request acts as.
-//!
-//! The wire protocol, SigV4 signing, and endpoint resolution belong to the
-//! official `aws-sdk-sts` client. This module owns only the `aws_sts_endpoint`
-//! consent rule, the request timeout, and the redaction of every error.
+//! Redaction and the `aws_sts_endpoint` consent rule wrap the official `aws-sdk-sts` client.
 
 use crate::ConnectionCreds;
 use crate::creds::non_empty;
@@ -19,16 +14,8 @@ const STS_TIMEOUT: Duration = Duration::from_secs(30);
 const ROLE_SESSION_NAME: &str = "lakehouse-engine";
 const UNRESOLVED_SIGNING_REGION: &str = "us-east-1";
 
-/// The credential set a request acts as: `creds` unchanged, with no request,
-/// when it names no `aws_assume_role_arn`; otherwise `creds` with only
-/// `access_key`, `secret_key`, and `session_token` replaced by the session one
-/// STS `AssumeRole` call returns, signed by the stated base key pair.
-/// `catalog_uri` selects the signing region, and `allow_http` consents to a
-/// plaintext `aws_sts_endpoint`.
-///
-/// The substitution is safe because no reader after validation wants the base
-/// identity: SigV4 signing and static storage read the key triple, and vending
-/// never does. Errors are `UdfError::User` and carry no credential or query.
+/// Substituting the session key triple is safe: no reader after validation wants the base
+/// identity. Errors carry no credential or query.
 pub async fn resolve_aws_identity(
     creds: ConnectionCreds,
     catalog_uri: &str,

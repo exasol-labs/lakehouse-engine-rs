@@ -38,7 +38,7 @@ A reader with only `SELECT` on the virtual schema still sees, in the plan text: 
 
 A vended credential has no CONNECTION name to reference. It travels as AES-256-GCM ciphertext (HKDF-SHA256 key from the CONNECTION password, fresh 96-bit nonce). Vending without key material is refused at plan time.
 
-The same sealed envelope also carries an assumed-role CONNECTION's storage credential: the STS `AssumeRole` session's `access_key`, `secret_key`, and `session_token`, sealed exactly as a vended credential is, one envelope per join side. A role CONNECTION's static base key pair (`access_key`/`secret_key`, the identity that signs the `AssumeRole` call) never travels in the scan spec — only the resulting session credentials do, and only inside the sealed envelope. The base identity itself needs only `sts:AssumeRole` permission on the named role; it needs no direct Glue or S3 permission of its own.
+An assumed-role CONNECTION's session credentials travel sealed in the same envelope, like vended ones. The base key pair that signs `AssumeRole` never enters the scan spec.
 
 ## Rotation
 

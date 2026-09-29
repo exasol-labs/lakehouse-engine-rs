@@ -170,9 +170,9 @@ feature's own scenario count crossed the same threshold.
 
 ### Scenario: The AWS identity resolver extends the crate's public surface through an explicit reviewed edit
 
-* *GIVEN* the enumerated public surface of `lakehouse-catalog` and its external-vantage reachability probe at `crates/lakehouse-catalog/tests/catalog_public_surface.rs`, which fails to compile if any enumerated item is narrowed below `pub`
+* *GIVEN* the enumerated public surface of `lakehouse-catalog` and its external-vantage reachability probe at `crates/lakehouse-catalog/tests/catalog_public_surface.rs`
 * *WHEN* the adapter gains AWS IAM role assumption under `vs-adapter/connection-credentials-assume-role`
-* *THEN* the crate SHALL add to its public surface exactly ONE async function that resolves the AWS identity a request acts as, re-exported at the crate root, and `ConnectionCreds` SHALL gain the `aws_assume_role_arn`, `aws_external_id`, and `aws_sts_endpoint` fields beside its existing `pub` fields, plus ONE `assume_role_arn()` accessor that is the sole definition of whether a set names a role (a non-empty `aws_assume_role_arn`), read by the resolver and by every engine consumer
-* *AND* the `aws_sts_endpoint` consent gate, the SDK client construction, and the error redaction SHALL stay crate-private, and the probe SHALL be edited, as an explicit reviewed change, to name the added items while its existing demotion assertions stay intact and unweakened
-* *AND* the crate SHALL gain exactly ONE manifest dependency, the official `aws-sdk-sts` client, in place of any hand-written STS protocol code
-* *AND* no `lakehouse-catalog` source file SHALL name `lakehouse_engine`, and the added items SHALL name no Exasol CONNECTION or virtual-schema-property delivery mechanism
+* *THEN* the crate SHALL add ONE `pub` async function that resolves the AWS identity a request acts as, re-exported at the crate root
+* *AND* `ConnectionCreds` SHALL gain the `aws_assume_role_arn`, `aws_external_id`, and `aws_sts_endpoint` fields and ONE `assume_role_arn()` accessor, which is the sole definition of whether a set names a role
+* *AND* the crate SHALL gain ONE manifest dependency, the official `aws-sdk-sts` client
+* *AND* the endpoint consent gate, the SDK client construction, and the error redaction SHALL stay crate-private

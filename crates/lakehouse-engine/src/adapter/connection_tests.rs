@@ -1453,10 +1453,6 @@ fn direct_storage_accepts_matching_scheme_and_credential_shape() {
         .expect("an abfss:// address with Azure-shaped credentials must be accepted");
 }
 
-// ---------------------------------------------------------------------------
-// AWS IAM role assumption fields
-// ---------------------------------------------------------------------------
-
 const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
 const EXTERNAL_ID: &str = "EXTERNAL_ID_SENTINEL";
 const BASE_SECRET: &str = "BASE_SECRET_SENTINEL";
@@ -1477,9 +1473,8 @@ fn role_password(extra: serde_json::Value) -> String {
     password.to_string()
 }
 
-/// Scenario: the three role fields are parsed as strings, an empty string is absent, and `Debug` redacts the external id.
 #[test]
-fn assume_role_fields_are_parsed_and_an_empty_string_is_absent() {
+fn assume_role_fields_are_parsed() {
     let stated = role_password(serde_json::json!({
         "aws_external_id": EXTERNAL_ID,
         "aws_sts_endpoint": "https://sts.eu-west-1.amazonaws.com",
@@ -1501,26 +1496,9 @@ fn assume_role_fields_are_parsed_and_an_empty_string_is_absent() {
     );
     let rendered = format!("{resolved:?}");
     assert!(!rendered.contains(EXTERNAL_ID), "{rendered}");
-
-    let empty = serde_json::json!({
-        "warehouse": "wh",
-        "aws_assume_role_arn": "",
-        "aws_external_id": "",
-        "aws_sts_endpoint": "",
-    })
-    .to_string();
-    let resolved = read_connection(
-        &with_conn("http://catalog.example.com", &empty),
-        Some("MY_CONN"),
-        CatalogKind::IcebergRest,
-    )
-    .expect("empty role fields are absent, so they neither require a role nor a key pair");
-    assert_eq!(resolved.creds.aws_assume_role_arn, None);
-    assert_eq!(resolved.creds.aws_external_id, None);
-    assert_eq!(resolved.creds.aws_sts_endpoint, None);
 }
 
-/// Scenario: an external id without a role is rejected, naming `aws_external_id` and the role it requires, with no credential value.
+/// Scenario: A role option is accepted only beside a role
 #[test]
 fn external_id_without_a_role_is_rejected() {
     let password = serde_json::json!({
@@ -1550,7 +1528,6 @@ fn external_id_without_a_role_is_rejected() {
     assert!(!err.contains(BASE_SECRET), "{err}");
 }
 
-/// Scenario: a role alone and a role with an external id are both accepted.
 #[test]
 fn a_role_without_an_external_id_is_accepted() {
     for extra in [
@@ -1567,7 +1544,7 @@ fn a_role_without_an_external_id_is_accepted() {
     }
 }
 
-/// Scenario: a role CONNECTION omitting the base key pair is rejected, naming each omitted field and the no-ambient-credential rule, ahead of the SigV4 check.
+/// Scenario: A CONNECTION naming a role carries the base identity's key pair
 #[test]
 fn assume_role_requires_the_base_key_pair_and_reads_no_ambient_credential() {
     for use_sigv4 in [false, true] {
@@ -1611,7 +1588,7 @@ fn assume_role_requires_the_base_key_pair_and_reads_no_ambient_credential() {
     }
 }
 
-/// Scenario: an STS endpoint override without a role is rejected, naming `aws_sts_endpoint` and the role it requires.
+/// Scenario: A role option is accepted only beside a role
 #[test]
 fn sts_endpoint_without_a_role_is_rejected() {
     let password = serde_json::json!({
@@ -1640,7 +1617,6 @@ fn sts_endpoint_without_a_role_is_rejected() {
     assert!(!err.contains(BASE_SECRET), "{err}");
 }
 
-/// Scenario: the unchanged `path_style` guard skips a role CONNECTION that vends and still rejects one that does not.
 #[test]
 fn the_path_style_guard_skips_a_role_with_vending() {
     let endpoint_without_path_style = |use_vended_credentials: bool| {

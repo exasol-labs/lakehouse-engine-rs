@@ -1,23 +1,24 @@
 # Feature: Connection-Object Credential Source: AWS IAM Role Assumption
 
-Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `AssumeRole`. A base identity that holds only `sts:AssumeRole` permission then reaches Glue and S3 as that role. The role's short-lived session credentials replace the CONNECTION's static key pair wherever that pair is read: SigV4 catalog signing, and object storage when the CONNECTION does not vend. A role leaves credential vending unchanged. A role CONNECTION's storage credential reaches the scan UDF only inside the sealed envelope. Tracked by issue [#139](https://github.com/exasol-labs/lakehouse-engine-rs/issues/139).
+Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `AssumeRole`. A base identity that holds only `sts:AssumeRole` permission then reaches Glue and S3 as that role. Tracked by issue [#139](https://github.com/exasol-labs/lakehouse-engine-rs/issues/139).
 
 ## Background
 
-* **Three optional CONNECTION password fields.** `aws_assume_role_arn` names the role. `aws_external_id` is the `ExternalId` sent for a role whose trust policy requires one. `aws_sts_endpoint` overrides the STS endpoint. Each is a string, and an empty string is absent, per the parsing rule of `vs-adapter/connection-credentials`.
-* **The base identity is the CONNECTION's own key pair.** `access_key`, `secret_key`, and an optional `session_token` sign the `AssumeRole` request. No ambient AWS credential is read: no environment variable, instance profile, or web-identity token. This keeps the explicit-CONNECTION credential model.
-* **The STS request shape follows the AWS STS API reference (`API_AssumeRole`).** `RoleArn` is "Required: Yes". `RoleSessionName` is "Required: Yes", with "Minimum length of 2. Maximum length of 64" and pattern `[\w+=,.@-]*`. `ExternalId` is "Required: No", described as "A unique identifier that might be required when you assume a role in another account", with pattern `[\w+=,.@:\/-]*`. `DurationSeconds` defaults to `3600`. The sample response carries `AssumeRoleResponse/AssumeRoleResult/Credentials` with `AccessKeyId`, `SecretAccessKey`, `SessionToken`, and `Expiration`, under namespace `https://sts.amazonaws.com/doc/2011-06-15/`.
-* **STS endpoint and signing region.** The STS region is the SigV4 signing region `vs-adapter/connection-credentials-sigv4` resolves: the region a standard AWS Glue endpoint names, else the stated `region`. The endpoint is `aws_sts_endpoint` when stated, else the regional endpoint the official AWS SDK for Rust STS client resolves for that region. A request with no resolved region uses `us-east-1`. A China-region CONNECTION states `aws_sts_endpoint`, because the AWS STS endpoint table lists China endpoints under `.amazonaws.com.cn`.
+* **Three optional CONNECTION password fields.** `aws_assume_role_arn` names the role. `aws_external_id` is the optional `ExternalId` for a role whose trust policy requires one. `aws_sts_endpoint` overrides the STS endpoint. An empty string is absent, per `vs-adapter/connection-credentials`.
+* **The base identity is the CONNECTION's own key pair.** `access_key`, `secret_key`, and an optional `session_token` sign the request. No ambient AWS credential is read: no environment variable, instance profile, or web-identity token.
+* **The official `aws-sdk-sts` client owns the wire protocol.** It owns request encoding, SigV4 signing, response parsing, endpoint resolution, and retries. The engine owns only the fields above, the fixed session name `lakehouse-engine`, the plaintext-endpoint gate, and the session's use.
+* **STS region.** The region is the SigV4 signing region of `vs-adapter/connection-credentials-sigv4`, else `us-east-1`. Without `aws_sts_endpoint`, the SDK resolves the regional endpoint. A China-region CONNECTION states `aws_sts_endpoint`, because the AWS STS endpoint table lists China endpoints under `.amazonaws.com.cn`.
+* **The session replaces the key pair only where the pair is read.** Those reads are SigV4 catalog signing and non-vended object storage.
 
 ## Scenarios
 
-### Scenario: An external id is accepted only beside a role
+### Scenario: A role option is accepted only beside a role
 
-* *GIVEN* a CONNECTION whose JSON password supplies `aws_external_id` as a non-empty string and omits `aws_assume_role_arn`
+* *GIVEN* a CONNECTION that supplies `aws_external_id` or `aws_sts_endpoint` and omits `aws_assume_role_arn`
 * *WHEN* the adapter resolves the connection
-* *THEN* the adapter SHALL return an error naming `aws_external_id` and stating that it requires `aws_assume_role_arn`
-* *AND* the adapter SHALL accept a CONNECTION that supplies neither field, `aws_assume_role_arn` alone, or both, when it has no other defect
-* *AND* the error MUST NOT contain any supplied credential value, including the external id
+* *THEN* the adapter SHALL return an error naming each supplied field and stating that it requires `aws_assume_role_arn`
+* *AND* the adapter SHALL accept a CONNECTION that supplies none of the three fields, the role alone, or the role with either option
+* *AND* the error MUST NOT contain any supplied credential value
 * *AND* the credential set's `Debug` rendering SHALL print `aws_external_id` as redacted
 
 ### Scenario: A CONNECTION naming a role carries the base identity's key pair
@@ -25,54 +26,75 @@ Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `
 * *GIVEN* a CONNECTION that supplies `aws_assume_role_arn` and omits `access_key`, `secret_key`, or both
 * *WHEN* the adapter resolves the connection
 * *THEN* the adapter SHALL return an error naming each omitted field and stating that the role is assumed with the CONNECTION's own `access_key` and `secret_key`
-* *AND* the error SHALL state that no ambient AWS credential, such as an environment variable or an instance profile, is read
 * *AND* the error MUST NOT contain any supplied credential value
 
-### Scenario: An STS endpoint override is accepted only beside a role
-
-* *GIVEN* a CONNECTION that supplies `aws_sts_endpoint` and omits `aws_assume_role_arn`
-* *WHEN* the adapter resolves the connection
-* *THEN* the adapter SHALL return an error naming `aws_sts_endpoint` and stating that it requires `aws_assume_role_arn`
-* *AND* the error MUST NOT contain any supplied credential value
-
-### Scenario: The adapter assumes the role exactly once per request, before any catalog or storage access
+### Scenario: The adapter assumes the role once per request and substitutes the session
 
 * *GIVEN* a CONNECTION that names a role and carries the base key pair
 * *WHEN* the adapter handles one `createVirtualSchema`, `refresh`, `setProperties`, or `pushdown` request through that CONNECTION
-* *THEN* the adapter SHALL send exactly ONE STS `AssumeRole` request before its first catalog or object-storage request, and SHALL use that one session for every table the request resolves, including every side of a join
-* *AND* the adapter MUST NOT reuse a session across two requests, because the adapter keeps no state between requests
-* *AND* a CONNECTION that names no role SHALL cause no STS request
+* *THEN* the adapter SHALL send exactly ONE `AssumeRole` call before its first catalog or object-storage request, and SHALL use that session for every table the request resolves, including every side of a join
+* *AND* ONE `lakehouse-catalog` function SHALL return the credential set with `access_key`, `secret_key`, and `session_token` replaced by the session's and every other field unchanged, so the catalog session, the format readers, the direct-storage store, and error redaction read the session without naming the role
+* *AND* the acceptance validation and the sealing key SHALL be computed from the CONNECTION as stated, before the replacement
+* *AND* a CONNECTION that names no role SHALL cause no STS call, and the adapter MUST NOT reuse a session across requests
 
-### Scenario: The AssumeRole request carries the role, the external id, and the base identity's signature
+### Scenario: The AssumeRole call carries the role, the external id, and the fixed session name
 
 * *GIVEN* a CONNECTION that names a role and carries the base key pair
-* *WHEN* the adapter sends the `AssumeRole` request
-* *THEN* the call SHALL be made through the official `aws-sdk-sts` client, never a hand-written STS request, signer, or response parser, so the wire protocol, SigV4 signing, and response parsing are the SDK's
-* *AND* the call SHALL pass `RoleArn`, `RoleSessionName=lakehouse-engine`, and `ExternalId` exactly when the CONNECTION states `aws_external_id`, and MUST NOT pass `DurationSeconds`
-* *AND* the client SHALL use the base `access_key`, `secret_key`, and stated `session_token` as its only credentials, the STS region of § Background, and no retry
+* *WHEN* the adapter calls `AssumeRole`
+* *THEN* the call SHALL pass `RoleArn`, `RoleSessionName=lakehouse-engine`, and `ExternalId` exactly when the CONNECTION states `aws_external_id`
+* *AND* the call MUST NOT pass `DurationSeconds`
+* *AND* the call SHALL time out after 30 seconds with an error naming the STS endpoint host
 
-### Scenario: The STS endpoint is resolved from the CONNECTION and gated on plaintext consent
+### Scenario: A plaintext STS endpoint requires ALLOW_HTTP
 
-* *GIVEN* a CONNECTION that names a role
+* *GIVEN* a CONNECTION that names a role and states an `http://` `aws_sts_endpoint`
 * *WHEN* the adapter resolves the STS endpoint
-* *THEN* the adapter SHALL use the endpoint and signing region § Background resolves
-* *AND* the adapter SHALL send the request to an `http://` `aws_sts_endpoint` only when the `ALLOW_HTTP` virtual-schema property is true, and otherwise SHALL return an error naming `aws_sts_endpoint` and `ALLOW_HTTP`, because the response carries the session secret
+* *THEN* the adapter SHALL call the endpoint only when the `ALLOW_HTTP` virtual-schema property is true, because the response carries the session secret
+* *AND* otherwise the adapter SHALL return an error naming `aws_sts_endpoint` and `ALLOW_HTTP`
 * *AND* an `aws_sts_endpoint` whose scheme is neither `http` nor `https` SHALL be an error naming `aws_sts_endpoint`
-* *AND* the request SHALL time out after 30 seconds with an error naming the STS endpoint host
 
-### Scenario: The AssumeRole response yields the session credentials
+### Scenario: An incomplete Credentials result is rejected
 
-* *GIVEN* an STS response with a 2xx status whose body is an `AssumeRoleResponse` document
+* *GIVEN* a successful STS response whose `Credentials` are absent, or whose `AccessKeyId`, `SecretAccessKey`, or `SessionToken` is empty
 * *WHEN* the adapter reads the response
-* *THEN* the adapter SHALL take `AccessKeyId`, `SecretAccessKey`, and `SessionToken` from `AssumeRoleResult/Credentials`, each with surrounding whitespace removed and XML entity references decoded
-* *AND* an absent or empty one of those three elements SHALL be an error naming the element, and the adapter MUST NOT fall back to the base identity
-* *AND* a body that is not a well-formed `AssumeRoleResponse` document SHALL be an error stating so, and MUST NOT contain the body text, because the body can carry a secret
+* *THEN* the adapter SHALL return an error naming the missing element
+* *AND* the adapter MUST NOT fall back to the base identity
 
-### Scenario: A failed AssumeRole is a clear, credential-safe error
+### Scenario: A failed AssumeRole is a credential-safe error
 
-* *GIVEN* an STS response with a non-2xx status, an unreachable STS endpoint, or a timed-out request
+* *GIVEN* an STS error response, an unreachable STS endpoint, or a timed-out call
 * *WHEN* the adapter handles the request that needed the session
-* *THEN* the adapter SHALL fail that request with a `UdfError::User` naming the role ARN and the STS endpoint host, plus the HTTP status, the STS `Error/Code`, and the STS `Error/Message` whenever the response carries them
+* *THEN* the adapter SHALL fail that request with an error naming the role ARN and the STS endpoint host, plus the HTTP status, the STS error code, and the STS error message whenever the response carries them
 * *AND* the adapter MUST NOT send any catalog or object-storage request with the base identity instead
-* *AND* the error MUST NOT contain the base `secret_key`, the base `session_token`, the external id, any returned credential, or the request URL's query string, which carries the external id
-* *AND* the error MUST be returned as a `Result` and never raised as a panic, because a panic inside a UDF is an abnormal VM exit
+* *AND* the error MUST NOT contain the base `secret_key`, the base `session_token`, the external id, or any returned credential
+
+### Scenario: Session credentials sign every SigV4 catalog request
+
+* *GIVEN* a CONNECTION that sets `use_sigv4` to true and names a role, whether or not it sets `use_vended_credentials`
+* *WHEN* the adapter issues its SigV4-signed catalog requests, covering namespace enumeration and `loadTable`
+* *THEN* each request SHALL be signed with the session `AccessKeyId` and `SecretAccessKey` and SHALL carry the session `SessionToken` as `x-amz-security-token`
+* *AND* no catalog request SHALL be signed with the base key pair
+* *AND* the signing region and the catalog prefix SHALL be those of `vs-adapter/connection-credentials-sigv4` and `vs-adapter/pushdown-planning-cloud-credentials`, unchanged by the role
+
+### Scenario: Session credentials are the storage credential when the CONNECTION does not vend
+
+* *GIVEN* a CONNECTION that names a role and does not set `use_vended_credentials`, under the Iceberg REST, Unity Catalog, or direct-storage catalog kind
+* *WHEN* the adapter reads object storage at plan time and the scan UDF reads data files
+* *THEN* every read SHALL use the session credentials as the S3 access key, secret key, and session token, with `endpoint`, `region`, and `path_style` resolved from the CONNECTION as for a CONNECTION that names no role
+* *AND* no object-storage read SHALL use the base key pair
+
+### Scenario: A role leaves credential vending unchanged
+
+* *GIVEN* a CONNECTION that names a role and sets `use_vended_credentials` to true
+* *WHEN* the adapter resolves a table's storage
+* *THEN* the adapter SHALL resolve that storage through credential vending exactly as without the role, including the `X-Iceberg-Access-Delegation` header on `loadTable` and Unity Catalog temporary table credentials for a Delta table
+* *AND* no object-storage read SHALL use the session credentials, which sign only the SigV4 catalog requests
+* *AND* the `path_style` guard of `vs-adapter/connection-credentials` SHALL skip this CONNECTION, as it skips every CONNECTION that vends
+
+### Scenario: The scan receives the session credentials only inside the sealed envelope
+
+* *GIVEN* a `pushdown` request through a CONNECTION that names a role and does not set `use_vended_credentials`
+* *WHEN* the adapter builds the scan-spec storage block
+* *THEN* the block SHALL carry the session credentials ONLY inside the sealed envelope of `vs-adapter/scan-spec-credential-reference`, one envelope per join side, and MUST NOT carry a bare CONNECTION reference
+* *AND* the scan UDF SHALL read the session from that envelope and MUST NOT call STS, so a query costs one `AssumeRole` call whatever its shard count
+* *AND* neither the session credentials, the base `secret_key`, nor the external id SHALL appear in plaintext in the returned SQL

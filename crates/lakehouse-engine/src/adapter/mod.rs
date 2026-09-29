@@ -102,13 +102,8 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
         }
         Some("dropVirtualSchema") => Ok(json!({"type": "dropVirtualSchema"})),
         Some("pushdown") => {
-            // ctx.connection(), reached via resolve_connection_config, is a blocking
-            // connect-back round-trip, so rt must exist before it runs and before it
-            // blocks on `rt` again to resolve the AWS identity.
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
+            // Built first because `resolve_connection_config` blocks on it to assume the role.
+            let rt = build_runtime()?;
             let props = get_properties(request);
             let config = resolve_connection_config(ctx, &props, &rt)?;
             let script_schema = ctx.script_schema();
@@ -137,6 +132,13 @@ pub struct ResolvedConnectionConfig {
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
 }
 
+fn build_runtime() -> Result<tokio::runtime::Runtime, UdfError> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))
+}
+
 /// Both entry points call this, so neither reaches the catalog or storage before
 /// a named role is assumed; `rt` then assumes the role once per request.
 fn resolve_connection_config(
@@ -151,14 +153,11 @@ fn resolve_connection_config(
     let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
-    let stated_storage = storage_block(&resolved.creds, allow_http);
-    let creds = rt
-        .block_on(resolve_aws_identity(
-            resolved.creds,
-            &resolved.uri,
-            allow_http,
-        ))
-        .map_err(|e| redact_error(&stated_storage, e))?;
+    let creds = rt.block_on(resolve_aws_identity(
+        resolved.creds,
+        &resolved.uri,
+        allow_http,
+    ))?;
     let storage = storage_block(&creds, allow_http);
     Ok(ResolvedConnectionConfig {
         catalog_uri: resolved.uri,
@@ -181,10 +180,7 @@ fn handle_create_virtual_schema(
     } else {
         get_properties(request)
     };
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|e| UdfError::User(format!("failed to build tokio runtime: {e}")))?;
+    let rt = build_runtime()?;
     let config = resolve_connection_config(ctx, &props, &rt)?;
 
     // Optional under direct storage: the CONNECTION address alone denotes the storage subtree.
@@ -211,8 +207,6 @@ fn handle_create_virtual_schema(
     let join_broadcast_max_bytes = resolve_join_broadcast_max_bytes(&props);
     let s3_max_connections = resolve_s3_max_connections(&props, nr_of_cores, parallelism_factor);
 
-    // The ONLY site that matches `CatalogKind`; after it the listing pipeline is
-    // identical for all three kinds and never asks which catalog it holds.
     let client = construct_catalog_client(
         config.catalog_kind,
         config.catalog_uri,

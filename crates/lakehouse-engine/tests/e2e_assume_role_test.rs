@@ -105,10 +105,6 @@ fn direct_batch(ids: &[i64]) -> RecordBatch {
         .expect("build direct-storage fixture batch")
 }
 
-// ---------------------------------------------------------------------------
-// One-time setup: seed fixtures, provision every Virtual Schema.
-// ---------------------------------------------------------------------------
-
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
@@ -159,10 +155,6 @@ fn setup() {
         );
     });
 }
-
-// ---------------------------------------------------------------------------
-// Scenarios
-// ---------------------------------------------------------------------------
 
 #[test]
 fn the_base_identity_alone_is_denied_the_warehouse_bucket() {
@@ -318,10 +310,7 @@ fn a_wrong_base_secret_fails_create_with_http_403() {
 #[test]
 fn direct_storage_role_connection_lists_and_reads_through_the_session() {
     setup();
-    // Setup's own `create_virtual_schema_with_password` for VS_DIRECT already
-    // proves the CREATE-time listing succeeded (DIRECT_STORAGE lists the
-    // bucket at create time; it would have panicked under the base identity
-    // alone). This asserts the read path too.
+    // CREATE already listed the bucket under the session; this asserts the read path.
     assert_eq!(
         exa_conn().query_row_count(&format!("SELECT * FROM {VS_DIRECT}.ROWS")),
         3

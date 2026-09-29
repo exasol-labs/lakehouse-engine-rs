@@ -134,7 +134,7 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL resolve the file list with unsigned catalog requests exactly as before
 * *AND* the adapter MUST NOT read any vended credentials from the `loadTable` response
-* *AND* the shard-invariant common scan-spec argument SHALL carry a REFERENCE to the CONNECTION that supplies the static `access_key`, `secret_key`, and optional `session_token`, rather than those values — SUPERSEDING the recorded clause that required each per-shard scan-spec storage block to carry them, which described the exposure of issue #135
+* *AND* the shard-invariant common scan-spec argument SHALL carry a REFERENCE to the CONNECTION that supplies the static `access_key`, `secret_key`, and optional `session_token`, rather than those values (issue #135), unless the CONNECTION names `aws_assume_role_arn`, whose block is SEALED instead (`vs-adapter/scan-spec-credential-reference`)
 * *AND* the referenced credentials SHALL be resolved by the scan UDF under `vs-adapter/scan-spec-credential-reference`, so the credential set reaching object storage is field-for-field what the CONNECTION supplies
 * *AND* the generated scan-driving SQL SHALL be identical in shape to the pre-feature behaviour, changing only the content of the `storage` block of the common argument
 
@@ -246,7 +246,7 @@ Resolves cloud credentials once in the pushdown planning layer: signs catalog re
 
 * *GIVEN* a virtual schema whose CONNECTION credentials omit `use_vended_credentials` or set it to false
 * *WHEN* Exasol sends the `pushdown` request
-* *THEN* the adapter SHALL place a REFERENCE to the CONNECTION into each scan spec storage block, and MUST NOT place the static `access_key`, `secret_key`, or `session_token` value there — SUPERSEDING the recorded clause that required those values in the block
+* *THEN* the adapter SHALL place a REFERENCE to the CONNECTION into each scan spec storage block, and MUST NOT place the static `access_key`, `secret_key`, or `session_token` value there, unless the CONNECTION names `aws_assume_role_arn`, whose block is SEALED instead (`vs-adapter/scan-spec-credential-reference`)
 * *AND* the adapter MUST NOT attempt to read vended credentials from the `loadTable` response on any catalog-auth mode
 * *AND* the credentials the scan reads SHALL be the CONNECTION's own, so this scenario's observable storage behaviour is unchanged and only the transport of the credential changes
 

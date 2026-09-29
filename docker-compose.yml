@@ -1,6 +1,5 @@
 # Host ports are env-overridable and distinct from sibling stacks; in-network
 # service names and ports are fixed (UDFs reach http://seaweedfs:8333 etc.).
-#   Host defaults: Exasol SQL 28563 · BucketFS 22581 · SeaweedFS S3 19000 · REST 18181
 
 services:
   seaweedfs:

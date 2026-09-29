@@ -55,7 +55,7 @@ fn assert_same_creds(actual: &ConnectionCreds, expected: &ConnectionCreds) {
     assert_eq!(redacted(actual), redacted(expected));
 }
 
-/// Scenario: a plaintext STS endpoint is used only with ALLOW_HTTP, and a non-http(s) endpoint is refused, both before any request.
+/// Scenario: A plaintext STS endpoint requires ALLOW_HTTP
 #[tokio::test]
 async fn plaintext_sts_endpoint_requires_allow_http() {
     let (sts, heads) = spawn_recording_sts(200, ASSUME_ROLE_RESPONSE).await;
@@ -89,7 +89,6 @@ async fn plaintext_sts_endpoint_requires_allow_http() {
     }
 }
 
-/// Scenario: an unanswered AssumeRole times out after the client timeout, naming the STS endpoint host; production waits 30 seconds.
 #[tokio::test]
 async fn sts_request_times_out_naming_the_endpoint_host() {
     let silent = TcpListener::bind("127.0.0.1:0").await.expect("bind");
@@ -111,7 +110,6 @@ async fn sts_request_times_out_naming_the_endpoint_host() {
     drop(silent);
 }
 
-/// Scenario: a credential set naming no role is returned unchanged, with no STS request and no endpoint gate.
 #[tokio::test]
 async fn no_role_identity_is_returned_unchanged_without_a_request() {
     let (sts, heads) = spawn_recording_sts(200, ASSUME_ROLE_RESPONSE).await;
@@ -134,7 +132,6 @@ async fn no_role_identity_is_returned_unchanged_without_a_request() {
     );
 }
 
-/// Scenario: the resolved identity replaces only the access key, secret key, and session token; the role and vending flag survive.
 #[tokio::test]
 async fn resolved_identity_replaces_only_the_key_triple() {
     let (sts, _heads) = spawn_recording_sts(200, ASSUME_ROLE_RESPONSE).await;
@@ -161,7 +158,7 @@ async fn resolved_identity_replaces_only_the_key_triple() {
     assert_same_creds(&resolved, &expected);
 }
 
-/// Scenario: a denied, refused, or timed-out AssumeRole names the role and the STS host, carries STS's code and message, and no credential or query.
+/// Scenario: A failed AssumeRole is a credential-safe error
 #[tokio::test]
 async fn assume_role_failure_is_credential_safe_for_denial_refusal_and_timeout() {
     let denial = format!(

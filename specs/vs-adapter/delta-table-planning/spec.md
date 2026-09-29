@@ -276,7 +276,7 @@ path exactly as they already are for Iceberg.
   fallback would read object storage with a credential the operator did not select for this table
 * *AND* with vending disabled the reader SHALL use the CONNECTION's static storage backend unchanged
 * *AND* the reader SHALL return the EFFECTIVE storage backend alongside the file list, and the
-  shard-invariant common spec SHALL carry that backend SEALED (the AES-GCM envelope of `vs-adapter/scan-spec-credential-reference`) under vending and a REFERENCE to the CONNECTION that supplied it with vending disabled, both of which the scan UDF resolves to a field-for-field equal backend under that same feature
+  shard-invariant common spec SHALL carry that backend SEALED (the AES-GCM envelope of `vs-adapter/scan-spec-credential-reference`) under vending or when the CONNECTION names `aws_assume_role_arn`, and a REFERENCE to the CONNECTION that supplied it otherwise, both of which the scan UDF resolves to a field-for-field equal backend under that same feature
 * *AND* every error the reader surfaces from this point on SHALL be redacted against the effective
   storage's secret values, and MUST NOT contain any vended or static credential value
 

@@ -161,9 +161,7 @@ impl CloudEnv {
             account_name: password.account_name,
             account_key: password.account_key,
             sas_token: None,
-            aws_assume_role_arn: None,
-            aws_external_id: None,
-            aws_sts_endpoint: None,
+            ..Default::default()
         }
     }
 }

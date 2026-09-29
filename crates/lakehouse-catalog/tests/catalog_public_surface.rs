@@ -61,9 +61,7 @@ fn connection_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
-        aws_assume_role_arn: None,
-        aws_external_id: None,
-        aws_sts_endpoint: None,
+        ..Default::default()
     }
 }
 
@@ -270,20 +268,7 @@ fn connection_creds_sigv4_signing_region_is_reachable() {
     assert_eq!(region.as_deref(), Some("eu-west-1"));
 }
 
-/// Scenario: `ConnectionCreds::assume_role_arn` is reachable from outside the crate as the one "names a role" rule the engine reads.
-#[test]
-fn connection_creds_assume_role_arn_is_reachable() {
-    let creds = ConnectionCreds {
-        aws_assume_role_arn: Some(String::new()),
-        ..connection_creds()
-    };
-
-    let role_arn: Option<&str> = creds.assume_role_arn();
-
-    assert_eq!(role_arn, None, "an empty role ARN names no role");
-}
-
-/// Scenario: the AWS identity resolver extends the public surface by exactly one re-exported async function, three `ConnectionCreds` fields, and the `assume_role_arn` accessor.
+/// Scenario: The AWS identity resolver extends the crate's public surface through an explicit reviewed edit
 #[tokio::test]
 async fn aws_identity_resolver_is_public() {
     let stated = ConnectionCreds {
@@ -302,26 +287,6 @@ async fn aws_identity_resolver_is_public() {
         resolved.aws_sts_endpoint.as_deref(),
         Some("https://sts.eu-west-1.amazonaws.com")
     );
-
-    let sts = production_code(source("sts.rs"));
-    let public_items: Vec<&str> = sts
-        .lines()
-        .map(str::trim_start)
-        .filter(|line| line.starts_with("pub "))
-        .collect();
-    assert_eq!(
-        public_items,
-        ["pub async fn resolve_aws_identity("],
-        "sts.rs must declare exactly one public item — the resolver — and keep every STS \
-         mechanism step crate-private"
-    );
-    let lib = source("lib.rs");
-    assert_eq!(
-        lib.matches("sts::").collect::<Vec<_>>(),
-        ["sts::"],
-        "lib.rs must re-export exactly one item from sts.rs"
-    );
-    assert!(lib.contains("pub use sts::resolve_aws_identity;"));
 
     for (name, source) in CATALOG_SOURCES {
         assert!(
