@@ -180,7 +180,7 @@ SELECT SUM(L_QUANTITY) FROM ${VS}.LINEITEM;
 
 ### Q9b - wide projection + expression aggregates + COUNT(DISTINCT)
 
-All 16 lineitem columns, expression-argument aggregates, and COUNT(DISTINCT) pushdown in one query.
+All 16 lineitem columns, expression-argument aggregates, and COUNT(DISTINCT) in one query; the mixed distinct/ordinary aggregate list routes to the qualified single-table wrapper over a sharded raw scan.
 
 ```sql
 SELECT COUNT(*),

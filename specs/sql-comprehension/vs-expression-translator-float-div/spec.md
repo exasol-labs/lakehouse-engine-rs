@@ -48,7 +48,7 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   `0.000102474999897525`. Decimal/decimal is only accidentally correct when both operands carry so
   few significant digits that `Decimal128(_,6)` loses none.
 * **The translator cannot fix this by inspecting operand types — it has none.**
-  `crates/vs-expression` stays "a pure, stateless, sibling-shared JSON-to-SQL translator with no
+  `crates/vs-expression` stays "a pure, stateless JSON-to-SQL translator with no
   column-type context" (see `sql-comprehension/vs-expression-translator-scalar-ops`), and decision
   `016-add-fn-div-pushdown` records that "the arithmetic operator arm renders operands via recursive
   calls into opaque SQL strings without inspecting their types". An UNCONDITIONAL cast of the left
