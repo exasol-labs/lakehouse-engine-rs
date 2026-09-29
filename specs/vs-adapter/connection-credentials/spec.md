@@ -9,6 +9,8 @@ and the Unity Catalog reuse of these auth fields is specified by the sibling fea
 `connection-credentials-unity-catalog`. The AWS Glue SigV4 catalog-signing requirement —
 `access_key`, `secret_key`, a signing region, and the standard-AWS-Glue-endpoint region
 derivation — is specified by the sibling feature `connection-credentials-sigv4`.
+The sibling feature `connection-credentials-assume-role` specifies AWS IAM role assumption:
+`aws_assume_role_arn`, `aws_external_id`, and `aws_sts_endpoint`.
 
 ## Background
 
