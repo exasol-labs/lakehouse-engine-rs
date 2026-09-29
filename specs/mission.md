@@ -95,12 +95,10 @@ Every query is executed independently, starts from source metadata, and leaves n
 | Build | `rust:1.94-trixie` (glibc 2.41) in Docker | Builds `.so` matching the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
 
-> Sibling projects: the sibling project (VS adapter + UDF conventions) and `language-container-rs` (the Rust
-> SLC and UDF runtime). This engine shares their UDF programming model and build/E2E workflow. The
-> standalone `crates/vs-expression` expression-translation crate is designed to be shared with
-> the sibling project and will migrate to a monorepo layout when the projects converge. `crates/lakehouse-catalog`
-> (Iceberg REST + Unity Catalog access) is a workspace-internal split from `crates/lakehouse-engine`, not a
-> sibling-shared crate — both build into the one `.so` that carries all three UDF entry points.
+> The Rust SLC and UDF runtime come from `language-container-rs`; this engine follows its UDF
+> programming model and build/E2E workflow. `crates/vs-expression` (expression translation) and
+> `crates/lakehouse-catalog` (Iceberg REST + Unity Catalog access) are workspace-internal splits from
+> `crates/lakehouse-engine`; all three build into the one `.so` that carries all three UDF entry points.
 
 ## Commands
 
@@ -126,7 +124,7 @@ lakehouse-engine/
 ├── crates/
 │   ├── lakehouse-engine/   # Iceberg + Delta file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
 │   ├── lakehouse-catalog/  # Iceberg REST + Unity Catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
-│   └── vs-expression/      # expression-translation crate, shared with the sibling project
+│   └── vs-expression/      # expression-translation crate
 ├── Cargo.toml      # workspace manifest
 └── Makefile        # cross-udf-build, test-e2e
 ```
