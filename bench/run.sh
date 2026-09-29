@@ -644,7 +644,7 @@ pushdown_check "filter + GROUP BY agg" \
 pushdown_check "filter (IN / OR / comparison)" \
   "SELECT COUNT(*) FROM ${VS}.LINEITEM WHERE L_SHIPMODE IN ('AIR','RAIL') AND (L_RETURNFLAG = 'R' OR L_QUANTITY > 45)" \
   "filter" "AIR"
-pushdown_check "Q9b mixed expression + COUNT(DISTINCT) aggregate pushdown" \
+pushdown_check "Q9b mixed expression + COUNT(DISTINCT) qualified single-table wrapper" \
   "SELECT COUNT(*),
           SUM(L_ORDERKEY), SUM(L_PARTKEY), SUM(L_SUPPKEY), SUM(L_LINENUMBER),
           SUM(L_QUANTITY), SUM(L_EXTENDEDPRICE), SUM(L_DISCOUNT), SUM(L_TAX),
@@ -653,7 +653,7 @@ pushdown_check "Q9b mixed expression + COUNT(DISTINCT) aggregate pushdown" \
           COUNT(DISTINCT L_SHIPINSTRUCT), COUNT(DISTINCT L_SHIPMODE),
           SUM(LENGTH(L_COMMENT))
    FROM ${VS}.LINEITEM" \
-  "aggregates" "countdistinct" "arg_expr"
+  "LHS_T0" "COUNT(DISTINCT" "shard_key"
 pushdown_check "NQ1 arithmetic aggregate pushdown (SUM(L_EXTENDEDPRICE * L_DISCOUNT))" \
   "SELECT SUM(L_EXTENDEDPRICE * L_DISCOUNT) AS revenue FROM ${VS}.LINEITEM
    WHERE L_SHIPDATE >= DATE '1994-01-01' AND L_SHIPDATE < DATE '1995-01-01'
