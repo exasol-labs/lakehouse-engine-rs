@@ -95,12 +95,10 @@ Every query is executed independently, starts from source metadata, and leaves n
 | Build | `rust:1.94-trixie` (glibc 2.41) in Docker | Builds `.so` matching the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
 
-> Sibling projects: the sibling project (VS adapter + UDF conventions) and `language-container-rs` (the Rust
-> SLC and UDF runtime). This engine shares their UDF programming model and build/E2E workflow. The
-> standalone `crates/vs-expression` expression-translation crate is designed to be shared with
-> the sibling project and will migrate to a monorepo layout when the projects converge. `crates/lakehouse-catalog`
-> (Iceberg REST + Unity Catalog access) is a workspace-internal split from `crates/lakehouse-engine`, not a
-> sibling-shared crate — both still build into the one `.so` that carries both UDF entry points.
+> The Rust SLC and UDF runtime come from `language-container-rs`; this engine follows its UDF
+> programming model and build/E2E workflow. `crates/vs-expression` (expression translation) and
+> `crates/lakehouse-catalog` (Iceberg REST + Unity Catalog access) are workspace-internal splits from
+> `crates/lakehouse-engine`; all three build into the one `.so` that carries all three UDF entry points.
 
 ## Commands
 
@@ -126,14 +124,14 @@ lakehouse-engine/
 ├── crates/
 │   ├── lakehouse-engine/   # Iceberg + Delta file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
 │   ├── lakehouse-catalog/  # Iceberg REST + Unity Catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
-│   └── vs-expression/      # expression-translation crate, shared with the sibling project
+│   └── vs-expression/      # expression-translation crate
 ├── Cargo.toml      # workspace manifest
 └── Makefile        # cross-udf-build, test-e2e
 ```
 
-One `.so` still carries all three entry points (VS adapter + DataFusion scan UDF + version query UDF): `lakehouse-catalog`
-compiles into `lakehouse-engine`'s cdylib as a workspace dependency, so the crate split changes only
-the source layout, not the UDF packaging model.
+One `.so` carries all three entry points (VS adapter + DataFusion scan UDF + version query UDF):
+`lakehouse-catalog` and `vs-expression` compile into `lakehouse-engine`'s cdylib as workspace
+dependencies, so the crate layout does not affect UDF packaging.
 
 ## Architecture
 
@@ -157,9 +155,9 @@ simultaneously. No state survives query completion.
 ## Constraints
 
 - **Technical**: UDFs are stateless and disposable — no caching, no metadata persistence, no
-  cross-call state. The `.so` is built in glibc 2.41 to match the SLC; only SDK `Value` types cross
-  the UDF boundary (never Arrow types). Read DataFusion result batches and `ctx.emit` them
-  incrementally; never materialize the whole result set. Metadata must be resolved once per query,
+  cross-call state. The `.so` is built in glibc 2.41 to match the SLC; Arrow types never cross
+  the `.so` boundary (only SDK `Value`s or Arrow IPC bytes via `ctx.emit_batch`). Emit DataFusion
+  result batches incrementally; never materialize the whole result set. Metadata must be resolved once per query,
   not once per node. All DSN/connection strings include `validateservercertificate=0`.
 - **Usable engine**: correctness and safety guards are first-class requirements. The engine is designed to be operated, not just measured. Execution is bounded: the scan UDF sizes its DataFusion memory pool from the per-instance memory limit and either spills to disk (when `/tmp` is real disk) so high-cardinality grouped queries complete, or returns a clean `ResourcesExhausted` error rather than OOM-crashing — layered on oversubscribed sharding that shrinks per-instance footprint and the engine's own 80% concurrency throttle.
 - **Performance**: Must be faster than single-node DataFusion and scale with added Exasol nodes, with
