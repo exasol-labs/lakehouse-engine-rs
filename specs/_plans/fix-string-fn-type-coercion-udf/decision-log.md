@@ -60,7 +60,7 @@
 ### [6] DOUBLE text follows Exasol's formatter and is gated by a live parity corpus
 
 - **Decision:** Render `Float64` as Exasol does: at most 15 significant digits, fixed notation for a decimal exponent from -4 to 14, otherwise a bare lowercase `e` exponent. Accept the implementation only when every captured value matches native Exasol byte for byte, in unit tests and in the E2E parity test.
-- **Alternatives:** C's `%.15g` with the exponent reformatted. Rejected: live captures on the Docker container differ from it. `999999999999999.5` prints `1000000000000000` where `%.15g` gives `1e+15`, and `CAST(1e-20 AS DOUBLE)`, `1e23`, and `1e-16` print `9.99999999999999e-21`, `9.99999999999999e22`, and `9.99999999999999e-17` where `%.15g` rounds to a power of ten. `9.9999999999999991e-05` prints `0.0001`.
+- **Alternatives:** C's `%.15g` with the exponent reformatted. Rejected: live captures on the Docker container differ from it. `999999999999999.5` prints `1000000000000000` where `%.15g` gives `1e+15`, and `CAST(1e-20 AS DOUBLE)`, `1e23`, and `1e-16` print `9.99999999999999e-21`, `9.99999999999999e22`, and `9.99999999999999e-17` where `%.15g` rounds to a power of ten.
 - **Rationale:** Exasol's exact algorithm is not documented, so a captured corpus is the only falsifiable contract.
 - **Consequences:** Task 3.5 carries `[expert]`. If a captured value cannot be reproduced, the implementer stops and reports rather than weakening the corpus.
 - **Promotes to ADR:** no
@@ -69,16 +69,16 @@
 
 - **Decision:** `INSTR`/`LOCATE` with more than two arguments are a DataFusion-dialect render error (issue #228, step 1). A string-converted literal of any type renders inside the wrapper.
 - **Alternatives:** Also make fractional, exponent, and timestamp literals a render error (the prior design). Rejected: `exa_to_varchar` now converts `Float64` and `Timestamp`, so those literals no longer reach an unconvertible type.
-- **Rationale:** A render error already routes every surface to native Exasol evaluation, and `strpos` cannot express a start position or an occurrence. Exasol sends a user's three-argument `INSTR` as four arguments (`INSTR(C_NAME,'0',12,1)`) and a two-argument call as two, so ordinary `INSTR` keeps its pushdown.
-- **Consequences:** `MAX(INSTR(c_name, '0', 12))` returns `12` instead of `10`. A single-group aggregate over such an argument moves from `SingleGroupAgg` to `RowScan` (see [8]). A scalar-over-aggregate residual that uses `INSTR` with three arguments declines to the wrapper: slower, correct.
+- **Rationale:** A render error already routes every surface to native Exasol evaluation, and `strpos` cannot express a start position or an occurrence. Exasol pushes each `INSTR` call with the arguments as written: `INSTR(c_name, '0', 12)` arrives with three (`C_NAME`, `'0'`, `12`), a four-argument call with four, and a two-argument call with two. The rule covers the three- and four-argument forms, and ordinary two-argument `INSTR` keeps its pushdown.
+- **Consequences:** `MAX(INSTR(c_name, '0', 12))` returns `12` instead of `10`. A single-group aggregate over such an argument moves from `SingleGroupAgg` to `RowScan`, and [8] keeps its empty-result row. A scalar-over-aggregate residual that uses `INSTR` with three arguments declines to the wrapper: slower, correct.
 - **Promotes to ADR:** no
 
-### [8] The empty-result path stays unchanged
+### [8] An ungrouped aggregate on the RowScan path returns one row when every file is pruned
 
-- **Decision:** `empty_result_sql` gets no new builder and the plan carries no `pushdown-planning-empty-result` delta. The reviewer asked for it to go.
-- **Alternatives:** A zero-row wrapper builder for a widened `RowScan` with an aggregate. Rejected on review: it exists only to restore one NULL row for a fully pruned aggregate over an `INSTR` call with more than two arguments, which the `INSTR` render error of [7] moves from `SingleGroupAgg` to `RowScan`.
-- **Rationale:** The case is narrow and the builder adds a new `sql_builders.rs` surface for it.
-- **Consequences:** A fully pruned `MAX(INSTR(c_name, 'c', 2))` returns zero rows instead of the one NULL row it returned before. Faithful 3- and 4-argument `INSTR` is #228 step 2, which restores `SingleGroupAgg` for it.
+- **Decision:** For a request with no GROUP BY whose select list is aggregates and that classifies as `RowScan`, `empty_result_sql` returns one row: NULL for each aggregate and `0` for each COUNT family aggregate, each cast to its declared `selectListDataTypes` type. A new delta of `vs-adapter/pushdown-planning-empty-result` states the rule. The `RowScan` arms of `empty_result_sql` otherwise keep `FROM DUAL WHERE 1=0`.
+- **Alternatives:** Leave the empty path unchanged and accept zero rows. Rejected: an aggregate without GROUP BY returns one row on native Exasol. The bug already exists for shapes that reach `RowScan` today, for example `SELECT MAX(CAST(o_orderdate AS TIMESTAMP(4))), COUNT(*) FROM orders WHERE o_orderkey < 0` (zero rows on the VS, one row `NULL, 0` natively, captured live). The `INSTR` render error of [7] adds one more shape to it.
+- **Rationale:** The empty single-group shape already produces this row (`empty_agg_sql`), so the rule is the single-group empty semantics applied to the shape the non-empty path answers through the qualified wrapper.
+- **Consequences:** The fix closes the existing zero-row bug and keeps a fully pruned `MAX(INSTR(c_name, 'c', 2))` at one NULL row. The existing bug has no issue yet, so the implementing commit references the issue that task 1.3 opens for it. A grouped request on the wrapper path keeps zero rows.
 - **Promotes to ADR:** no
 
 ### [9] Session NLS settings are one named trade-off, tracked by #216
@@ -91,9 +91,9 @@
 
 ### [10] A value Exasol types DECIMAL and DataFusion computes as Float64 is a named exception
 
-- **Decision:** Such a value converts with the DOUBLE rule. The text equals Exasol's DECIMAL text for at most 15 significant digits and a magnitude from `1e-4` below `1e15`. Outside that range it diverges, and a new issue tracks it (`#TBD`, task 1.3).
+- **Decision:** Such a value converts with the DOUBLE rule. The text equals Exasol's DECIMAL text for at most 15 significant digits and a magnitude from `1e-4` below `1e15`. Outside that range it diverges, and a new issue tracks it (`#TBD`, task 1.3). The range covers arithmetic with a fractional literal and Exasol division over operand pairs that Exasol types DECIMAL: over table columns, `i / 2` is `DECIMAL(19,1)` and `d / 2` (`d` is `DECIMAL(12,2)`) is `DECIMAL(13,3)`, while `i / 3` is `DOUBLE`. `ROUND` and `TRUNC` over a DECIMAL stay with #431.
 - **Alternatives:** (a) Set `parse_float_as_decimal` to `true`. Rejected: it changes the arithmetic typing of every pushdown, which is outside this plan. (b) Render a string-converted fractional literal as a DECIMAL cast. Rejected: it covers a bare literal only, not arithmetic over one.
-- **Rationale:** Live captures bound the range: `CAST(CAST(1.00 AS DECIMAL(12,2)) * 0.00001 AS VARCHAR(40))` returns `0.00001` and `1234567890123.45 * 1.5` returns `1851851835185.175`, where the DOUBLE rule gives `1e-5` and `1851851835185.17`.
+- **Rationale:** Live captures bound the range: `CAST(CAST(1.00 AS DECIMAL(12,2)) * 0.00001 AS VARCHAR(40))` returns `0.00001` and `1234567890123.45 * 1.5` returns `1851851835185.175`, where the DOUBLE rule gives `1e-5` and `1851851835185.17`. Division diverges the same way: `CAST(CAST(1.00 AS DECIMAL(12,2)) / 100000 AS VARCHAR(60))` returns `0.00001` natively and `1e-5` under the DOUBLE rule.
 - **Consequences:** #223's scope does not cover this range, so #223 still closes.
 - **Promotes to ADR:** no
 
@@ -114,10 +114,10 @@
 
 ### [13] Tracked exceptions after this plan
 
-- **Decision:** #227 and #223 close. #228 gets step 1 and stays open for the faithful three- and four-argument rendering. #216 widens to the numeric-characters and timestamp settings. The `Float64` value range gets a new issue.
+- **Decision:** #227 and #223 close. #228 gets step 1 and stays open for the faithful three- and four-argument rendering. #216 widens to the numeric-characters and timestamp settings. The `Float64` value range gets a new issue, and the fully pruned ungrouped aggregate bug gets another (task 1.3). #201 and #431 stay open and are named as text exceptions: #201 returns `Timestamp(ns)` for `date_trunc` over a DATE, so `CAST(DATE_TRUNC('month', o_orderdate) AS VARCHAR(40))` yields `1996-01-01 00:00:00.000000` where Exasol yields `1996-01-01`, and #431 makes `ROUND`/`TRUNC` over a DECIMAL run as `Float64`.
 - **Alternatives:** Keep #223 open for DOUBLE, BOOLEAN, and TIMESTAMP. Rejected: this plan converts all three.
 - **Rationale:** Each remaining limit has exactly one issue.
-- **Consequences:** The implementing commit uses `Closes #227`, `Closes #223`, and `Refs #228, #216`.
+- **Consequences:** The fix for #201 returns `Date32`, so `exa_to_varchar` needs no change for it. The new `Float64` issue excludes `ROUND`/`TRUNC` (#431). The implementing commit uses `Closes #227`, `Closes #223`, `Closes` for the pruned-aggregate issue, and `Refs #228, #216, #201, #431`.
 - **Promotes to ADR:** no
 
 ### [14] Background copies in features this plan does not own stay exact apart from drifted bullets

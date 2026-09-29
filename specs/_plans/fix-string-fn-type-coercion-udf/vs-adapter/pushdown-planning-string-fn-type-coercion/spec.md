@@ -28,8 +28,9 @@ down (issues #210 and #227).
   the Exasol dialect.
 * Once Exasol delegates an advertised string function or `FN_CAST`, it never re-applies it, so
   every shape routed to a wrapper is applied by the adapter's own wrapper SQL.
-* The Iceberg and Delta spec check, the session-setting exception #216, and the `Float64` value
-  range exception #TBD are recorded in `datafusion-scan/scan-execution-exa-to-varchar`.
+* The Iceberg and Delta spec check are recorded in `datafusion-scan/scan-execution-exa-to-varchar`,
+  with the text exceptions: the session-setting exception #216, the `Float64` value range exception
+  #TBD, `date_trunc` over a DATE (#201), and `ROUND`/`TRUNC` over a DECIMAL (#431).
 <!-- /DELTA:CHANGED -->
 
 ## Scenarios
@@ -142,7 +143,7 @@ down (issues #210 and #227).
 <!-- DELTA:NEW -->
 ### Scenario: An INSTR or LOCATE call beyond two arguments reaches native Exasol evaluation on every surface
 
-* *GIVEN* a `pushdown` request carrying `INSTR(a, b, start)`, `INSTR(a, b, start, occurrence)`, or `LOCATE(a, b, start)` over any argument types in the WHERE filter, the select list, a GROUP BY key, or an aggregate argument, for example `MAX(INSTR(c_name, '0', 12))`, which Exasol sends as `INSTR(C_NAME,'0',12,1)`
+* *GIVEN* a `pushdown` request carrying `INSTR(a, b, start)`, `INSTR(a, b, start, occurrence)`, or `LOCATE(a, b, start)` over any argument types in the WHERE filter, the select list, a GROUP BY key, or an aggregate argument, for example `MAX(INSTR(c_name, '0', 12))`, which Exasol sends with the arguments as written (`C_NAME`, `'0'`, `12`)
 * *WHEN* the adapter builds the pushdown
 * *THEN* the DataFusion-dialect render error SHALL route each surface to its existing fallback, and the returned value SHALL equal native Exasol evaluation: on TPC-H SF100, `MAX(INSTR(c_name, '0', 12))` returns `12`, where the aggregate path pushed `strpos` without the start position and returned `10` before this change (issue #227)
 * *AND* a two-argument `INSTR` or `LOCATE` SHALL keep its pushdown
@@ -174,5 +175,5 @@ down (issues #210 and #227).
 * *GIVEN* a `pushdown` request whose string-converted argument is a computed expression rather than a bare column, for example `UPPER(c_decimal_a * 2)`, `UPPER(c_double * 2)`, or `CAST(ROUND(c_acctbal / 3, 2) AS VARCHAR(40))`
 * *WHEN* the adapter builds the pushdown
 * *THEN* the adapter SHALL push the expression down unchanged, and `exa_to_varchar` SHALL convert its result exactly as it converts a column of the same Arrow type
-* *AND* the returned value SHALL equal native Exasol evaluation, apart from the `Float64` value range that `datafusion-scan/scan-execution-exa-to-varchar` names as the tracked exception #TBD
+* *AND* the returned value SHALL equal native Exasol evaluation, apart from the `Float64` value range that `datafusion-scan/scan-execution-exa-to-varchar` names as the tracked exception #TBD, and the #201 and #431 text exceptions it records
 <!-- /DELTA:NEW -->

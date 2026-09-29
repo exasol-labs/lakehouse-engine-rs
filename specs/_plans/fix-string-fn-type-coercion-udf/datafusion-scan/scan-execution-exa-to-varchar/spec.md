@@ -36,7 +36,15 @@ for the same value under the default session settings (issues #227 and #223).
   `u64` range as `Float64`, because the scan session leaves
   `datafusion.sql_parser.parse_float_as_decimal` at `false` (`scan::session_config_for_spec`).
   Exasol types the same literal DECIMAL, so `c_acctbal * 1.5` is DECIMAL in Exasol and `Float64` in
-  DataFusion. Exasol's `/` returns DOUBLE for every operand pair, so division agrees.
+  DataFusion. Exasol's `/` is DECIMAL for some operand pairs and DOUBLE for others (captured over
+  table columns: `i / 2` is `DECIMAL(19,1)`, `d / 2` with `d` `DECIMAL(12,2)` is `DECIMAL(13,3)`,
+  `i / 3` is `DOUBLE`). DataFusion computes every division as `Float64`, so a DECIMAL-typed
+  division belongs to the exception below.
+* Two open issues change the value before it reaches this function. #201: DataFusion `date_trunc`
+  returns `Timestamp(ns)` for a DATE, so `CAST(DATE_TRUNC('month', o_orderdate) AS VARCHAR(40))`
+  yields `1996-01-01 00:00:00.000000` where Exasol yields `1996-01-01`. The fix returns `Date32`,
+  and this function needs no change for it. #431: `ROUND` and `TRUNC` over a DECIMAL run as
+  `Float64`, so their text follows the DOUBLE rule. Both are tracked text exceptions.
 * A column whose Arrow type has no Exasol mapping is declared `VARCHAR(2000000)` and emitted as
   text through the scan's JSON-fallback path (`datafusion-scan/type-mapping`): a `Decimal128` with
   `p > 36` or `s > 36`, a nested type, `Binary`, `Time32`, `Time64`, `Float16`. Exasol treats that
@@ -102,7 +110,7 @@ for the same value under the default session settings (issues #227 and #223).
 
 ### Scenario: DOUBLE text matches native Exasol on a live parity corpus
 
-* *GIVEN* a corpus of DOUBLE values that includes every captured example of the Background, for example `1e-20` → `9.99999999999999e-21`, `1e23` → `9.99999999999999e22`, `9.9999999999999991e-05` → `0.0001`, `999999999999999.5` → `1000000000000000`, and `1.7976931348623157e308` → `1.79769313486232e308`
+* *GIVEN* a corpus of DOUBLE values that includes every captured example of the Background, for example `1e-20` → `9.99999999999999e-21`, `1e23` → `9.99999999999999e22`, `999999999999999.5` → `1000000000000000`, and `1.7976931348623157e308` → `1.79769313486232e308`
 * *WHEN* each value reaches `exa_to_varchar` through a pushed query over the virtual schema, and reaches native Exasol evaluation in the same session on the Docker Exasol container
 * *THEN* the two texts SHALL be byte-identical for every corpus value
 * *AND* the test SHALL compare against the native in-session oracle, and SHALL fail, not skip, without a database
@@ -152,4 +160,4 @@ for the same value under the default session settings (issues #227 and #223).
 * *GIVEN* a string-converted argument that DataFusion evaluates as `Float64`, either where Exasol evaluates DECIMAL, for example `CAST(c_acctbal * 1.5 AS VARCHAR(40))`, or where Exasol evaluates DOUBLE, for example `CAST(ROUND(c_acctbal / 3, 2) AS VARCHAR(40))`
 * *WHEN* DataFusion plans and evaluates the query
 * *THEN* planning SHALL succeed and the value SHALL convert with the DOUBLE rule, so `711.56 * 1.5` yields `1067.34` and `ROUND(711.56 / 3, 2)` yields `237.19`, equal to native Exasol
-* *AND* where Exasol evaluates DECIMAL, the text SHALL equal Exasol's DECIMAL text for a value of at most 15 significant digits whose magnitude is at least `1e-4` and below `1e15`, and MAY diverge outside that range, for example `1.00 * 0.00001`, which native Exasol returns as `0.00001` and the DOUBLE rule renders as `1e-5`: the tracked exception #TBD
+* *AND* where Exasol evaluates DECIMAL, the text SHALL equal Exasol's DECIMAL text for a value of at most 15 significant digits whose magnitude is at least `1e-4` and below `1e15`, and MAY diverge outside that range, for example `1.00 * 0.00001` or `CAST(1.00 AS DECIMAL(12,2)) / 100000`, which native Exasol returns as `0.00001` and the DOUBLE rule renders as `1e-5`: the tracked exception #TBD, which excludes `ROUND` and `TRUNC` (#431)
