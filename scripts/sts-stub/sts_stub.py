@@ -297,8 +297,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def main():
-    server = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
-    server.serve_forever()
+    # NOSONAR python:S5332: local-only test double; the stub asserts SigV4, not transport security.
+    http.server.ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever()  # NOSONAR
 
 
 if __name__ == "__main__":
