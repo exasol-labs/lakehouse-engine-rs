@@ -3,9 +3,7 @@
 use crate::ConnectionCreds;
 use crate::creds::non_empty;
 use crate::redaction::redact_error_text;
-use aws_sdk_sts::config::{
-    BehaviorVersion, Credentials, Region, retry::RetryConfig, timeout::TimeoutConfig,
-};
+use aws_sdk_sts::config::{BehaviorVersion, Credentials, Region, timeout::TimeoutConfig};
 use aws_sdk_sts::error::{ProvideErrorMetadata, SdkError};
 use exasol_udf_sdk::error::UdfError;
 use std::time::Duration;
@@ -94,7 +92,6 @@ async fn assume_role(
         .behavior_version(BehaviorVersion::latest())
         .region(Region::new(region))
         .credentials_provider(base)
-        .retry_config(RetryConfig::disabled())
         .timeout_config(TimeoutConfig::builder().operation_timeout(timeout).build());
     if let Some(endpoint) = endpoint {
         config = config.endpoint_url(endpoint);
