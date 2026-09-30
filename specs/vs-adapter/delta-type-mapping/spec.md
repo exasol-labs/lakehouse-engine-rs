@@ -36,12 +36,11 @@ faithfully and refused when it cannot — never described by a tag that returns 
 * **`binary` stays refused at EVERY depth, and that is a deliberate scope boundary rather than a
   correctness claim.** The JSON encoder renders a `Binary` member as a quoted lowercase hexadecimal
   string — faithful, and the same convention the Iceberg spec's Appendix D gives `binary` and `fixed` —
-  so a nested `binary` is NOT the lossy `Utf8` cast this feature refuses it for. Admitting it would
+  so a nested `binary` does NOT lack the faithful rendering that a top-level one lacks. Admitting it would
   nonetheless change Binary's reach, which issue #351 owns and issue #350 is scoped out of. So
   `array<binary>` stays refused exactly as recorded, and `struct` and `map` containing a `binary`
-  member JOIN it. The asymmetry is named rather than hidden: an ICEBERG table's nested `binary` IS
-  rendered as hexadecimal, because the Iceberg format reader refuses no type at all — a pre-existing
-  structural difference this delta does not introduce and does not close.
+  member JOIN it. An Iceberg table's `binary`, `fixed(L)`, and `uuid` are refused at every depth by
+  the same rule, per `vs-adapter/binary-column-refusal`.
 * **`variant` stays refused at every depth for its own recorded reason** — an opaque
   `(metadata BINARY, value BINARY)` pair whose rendering would be a meaningless blob, not the value —
   which the JSON encoder does not change.
@@ -85,7 +84,8 @@ faithfully and refused when it cannot — never described by a tag that returns 
   `datafusion-scan/nested-json-rendering`. The struct/map unreachability this feature previously
   documented for BOTH formats is resolved for both by that feature, so the recorded asymmetry
   (*"that asymmetry is deliberate — this plan does not change Iceberg behavior — and issue #350 owns
-  unifying both formats"*) is discharged for struct and map, and survives only for `binary`.
+  unifying both formats"*) is discharged for struct and map, and `vs-adapter/binary-column-refusal`
+  discharges it for `binary`.
 * **The Delta Lake protocol specification (`delta-io/delta`, `PROTOCOL.md`, `master`) states two
   reader obligations, and this feature owns the second.** § Reader Requirements for Type Widening:
   *"Readers must allow reading data files written before the table underwent any supported type
@@ -179,10 +179,10 @@ surface this feature maps, quoted from its § Schema Serialization Format:
   ever reaches the JSON path, on EITHER table format. Every existing test asserting that fallback uses
   a zero-field struct, which sidesteps the cast. Issue #350 owns designing real JSON rendering for
   struct and map on both formats and removing Delta's refusal once it lands.
-* **`binary` is castable but LOSSY, which is worse than uncastable.**
-  `can_cast_types(Binary, Utf8)` is `true`, and the cast replaces every byte sequence that is not
-  valid UTF-8 with NULL. That is silent data corruption — precisely the failure mode issue #322
-  exists to prevent — so `binary` is refused rather than tagged `utf8`. Issue #350 covers it.
+* **`binary` has no faithful text rendering, so it is refused rather than tagged `utf8`.**
+  `can_cast_types(Binary, Utf8)` is `true`, but a byte sequence that is not valid UTF-8 has no text
+  value. A `utf8`-tagged column over such bytes fails the whole query (sqlCode 22002,
+  `emit_batch: IPC read: Invalid UTF8 sequence`, measured live). Issue #351 owns a rendering.
 * **`byte` and `short` reuse the existing `int32` tag rather than adding `int8`/`int16` tags.** The
   compact tag vocabulary shared by `arrow_type_to_tag`/`arrow_type_from_tag` in
   `crates/lakehouse-engine/src/types/mapping.rs` has no `int8` or `int16` entry, and Exasol's own
@@ -198,9 +198,9 @@ surface this feature maps, quoted from its § Schema Serialization Format:
 * **A refused column is ABSENT from the logical schema, which is the defense-in-depth half of the
   scoping decision.** The adapter gate below produces the clear message; the absence guarantees that
   if the gate ever misses a path, the scan fails with a DataFusion "no field named" error rather than
-  emitting a silently-NULLed `binary` column. A tag-and-hope design has no such backstop.
-* The Iceberg format reader returns an EMPTY refused-column list, because it maps every Iceberg type
-  and refuses none.
+  emitting a `binary` column under a text tag. A tag-and-hope design has no such backstop.
+* The Iceberg format reader refuses a declared `binary`, `fixed(L)`, or `uuid` column per
+  `vs-adapter/binary-column-refusal`, and maps every other Iceberg type.
 * **Type classification runs BEFORE the column-mapping binding key.** A column this feature refuses is
   never checked for its `delta.columnMapping.*` annotation, so a table is refused for a column's TYPE
   rather than for an annotation on a column the engine will not read.
@@ -301,7 +301,7 @@ surface this feature maps, quoted from its § Schema Serialization Format:
 * *WHEN* the Delta format reader resolves that table's scan
 * *THEN* the reader SHALL emit NO logical field for that column, SHALL record the column's name and a refusal reason naming its Delta type, and MUST NOT emit a logical field whose Arrow tag widens, narrows, or otherwise misdescribes the column
 * *AND* `struct` and `map` MUST NOT appear in this set on their own account, and their recorded refusal reasons — *"which arrow-cast reports no cast to text for"* — SHALL be DELETED rather than retained, because the reason no longer describes anything the engine does
-* *AND* the refusal reason SHALL name the ACTUAL cause per type: `binary` because casting it to text replaces every non-UTF-8 byte sequence with NULL; `variant` because its on-disk form is an opaque `(metadata BINARY, value BINARY)` pair in a Delta-specific binary encoding whose Arrow form is a struct, so a rendering would be a meaningless blob rather than the value; and a container by naming its own declared type, the PATH of the offending member, and that member's reason
+* *AND* the refusal reason SHALL name the ACTUAL cause per type: `binary` by its declared type, because binary has no faithful text rendering until issue #351 (`vs-adapter/binary-column-refusal`); `variant` because its on-disk form is an opaque `(metadata BINARY, value BINARY)` pair in a Delta-specific binary encoding whose Arrow form is a struct, so a rendering would be a meaningless blob rather than the value; and a container by naming its own declared type, the PATH of the offending member, and that member's reason
 * *AND* ONE composer SHALL build every container refusal — for an `array`'s element, a `struct`'s field, and a `map`'s key or value alike — replacing the recorded array-only composer, so nesting adds no message layer per kind and no operator is told the column has a member's type
 * *AND* the `binary` reason SHALL cite issue #351 and MUST NOT cite issue #350, because #350 closes with this plan and a closed issue cited in a shipped error text reads as an unfixed gap with no owner
 * *AND* `binary` SHALL stay refused at EVERY nesting depth even though the JSON encoder renders a `Binary` member as faithful lowercase hexadecimal, because widening Binary's reach is issue #351's scope and not this plan's

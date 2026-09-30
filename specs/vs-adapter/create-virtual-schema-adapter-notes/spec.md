@@ -1,6 +1,6 @@
 # Feature: Create Virtual Schema — AdapterNotes
 
-Records the resource budgets and the Exasol-name to Iceberg-identifier map in the `createVirtualSchema` response `adapterNotes`. Later pushdowns read these back to bound each scan UDF instance's CPU and memory usage and to recover the scanned Iceberg table from the involved virtual table name. `adapterNotes` carries only values a pushdown cannot recompute. Two counts are excluded. Every pushdown reads the cluster node count from its own UDF handshake. No pushdown reads the per-node core count at all, so the adapter uses it as a derivation input and discards it.
+Records the resource budgets, the Exasol-name to Iceberg-identifier map, and the skipped-table list in the `createVirtualSchema` response `adapterNotes`. Later pushdowns read the budgets and the map back to bound each scan UDF instance's CPU and memory usage and to recover the scanned Iceberg table from the involved virtual table name. `adapterNotes` carries only values a pushdown cannot recompute, plus the skipped-table list, which no pushdown reads. Two counts are excluded. Every pushdown reads the cluster node count from its own UDF handshake. No pushdown reads the per-node core count at all, so the adapter uses it as a derivation input and discards it.
 
 ## Background
 
@@ -8,7 +8,16 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
   metadata that every VS request already carries, so each `pushdown` reads it directly
   from `UdfContext::node_count()` instead of from a persisted note (see
   `vs-adapter/pushdown-planning`). `adapterNotes` is reserved for values derived at
-  create time that a pushdown cannot recompute, such as `TABLE_MAP`.
+  create time that a pushdown cannot recompute, such as `TABLE_MAP`, and for one
+  diagnostic entry.
+* `SKIPPED_TABLES` is that one write-only diagnostic entry. It records the tables the
+  listing skipped, so a user reads each skip reason from
+  `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES`. No pushdown reads it.
+* Exasol rejects an `adapterNotes` value longer than 2,000,000 characters, the declared
+  `ADAPTER_NOTES` size, with sqlCode `04000` on both CREATE and REFRESH, and keeps the
+  previous stored value (measured live on Exasol 2025.1.16). The adapter therefore caps
+  `SKIPPED_TABLES` by serialized byte length and records the dropped count as
+  `SKIPPED_TABLES_OMITTED`. `TABLE_MAP` is not capped.
 * The per-node core count is NOT recorded in `adapterNotes` either, and for a stronger
   reason than the node count: no pushdown reads it back. The adapter resolves it,
   feeds it into the parallelism-factor, DataFusion-threading, and connection-concurrency
@@ -107,3 +116,37 @@ Records the resource budgets and the Exasol-name to Iceberg-identifier map in th
 * *WHEN* the test reads the `DF_THREADS_PER_UDF` entry from that schema's `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` row
 * *THEN* the recorded value SHALL equal the number of CPUs in the affinity set read back from the container, which evidences that the adapter VM reads the container's affinity set rather than the unavailable fallback of `1` or the host's unconstrained core count
 * *AND* the test MUST FAIL rather than skip when the value differs, because auto-detection is the only source of the core count and a skipped check would leave that source unevidenced, and MUST FAIL naming the unmet precondition rather than report a pass when the container's affinity set is not strictly smaller than the test host's core count, so a non-discriminating configuration records no false evidence
+
+### Scenario: Every skipped table is recorded with its reason under every catalog kind
+
+* *GIVEN* one listing per catalog kind that skips entries: Iceberg REST (a table whose `loadTable` returns 404), Unity Catalog (a view), direct storage (a directory holding no data file), and Glue (an ORC table and a partition-projection table)
+* *WHEN* createVirtualSchema or a refresh completes
+* *THEN* adapterNotes SHALL carry a `SKIPPED_TABLES` entry holding a JSON array with one object per skipped entry, in listing order, whose `table` is the catalog identifier and whose `reason` states why the entry was skipped
+* *AND* the `reason` SHALL be `catalog reported it is not a loadable Iceberg table` for Iceberg REST and `holds no data file` for direct storage, and SHALL name the catalog value that decided the skip, such as `table_type=VIEW`, for Unity Catalog and Glue
+* *AND* the adapter SHALL write one warning line per skip that states the same reason
+* *AND* no reason SHALL contain a credential value
+
+### Scenario: A listing with no skip records an empty list that replaces the previous one
+
+* *GIVEN* a virtual schema whose adapterNotes hold a `SKIPPED_TABLES` array of two entries, and a refresh whose listing skips no entry
+* *WHEN* the refresh completes
+* *THEN* `SKIPPED_TABLES` SHALL be an empty array
+* *AND* every other adapterNotes entry SHALL hold the value the refresh derives for it, whatever `SKIPPED_TABLES` holds
+
+### Scenario: A namespace whose every table is skipped still creates an empty virtual schema
+
+* *GIVEN* a namespace whose every entry the listing skips
+* *WHEN* createVirtualSchema runs
+* *THEN* createVirtualSchema SHALL succeed with no table and an empty `TABLE_MAP`, per `vs-adapter/create-virtual-schema`
+* *AND* `SKIPPED_TABLES` SHALL hold every skipped entry
+* *AND* the adapter MUST NOT fail createVirtualSchema because every entry was skipped
+
+### Scenario: A skipped-table list too long for adapterNotes is capped to the longest prefix that fits
+
+* *GIVEN* a listing that skips so many entries that the serialized adapterNotes would exceed 2,000,000 bytes
+* *WHEN* createVirtualSchema or a refresh completes
+* *THEN* `SKIPPED_TABLES` SHALL hold the longest prefix of the skipped entries, in listing order, for which the serialized adapterNotes, `SKIPPED_TABLES_OMITTED` included, stays within 2,000,000 bytes
+* *AND* adapterNotes SHALL carry `SKIPPED_TABLES_OMITTED`, a string holding the number of entries the prefix drops
+* *AND* createVirtualSchema and refresh MUST NOT fail because the list exceeds the limit
+* *AND* a listing whose every entry fits SHALL carry no `SKIPPED_TABLES_OMITTED`, and a refresh SHALL remove one that a previous run recorded
+* *AND* the adapter SHALL still write one warning line per skip, including each dropped entry

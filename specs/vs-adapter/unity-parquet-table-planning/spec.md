@@ -72,15 +72,6 @@ Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the 
 * *AND* the reader SHALL read partition values from the directories under the storage location even when partition metadata logging is enabled, so the reader does not consult the partitions that log registers
 * *AND* a partition column that the classification refuses SHALL fail the plan with an error naming the column, because the scan cannot materialize a partition column absent from the logical schema
 
-### Scenario: A predicate on a string partition column prunes files and no other predicate does
-
-* *GIVEN* the partitioned table above, and three queries carrying `region = 'eu'`, `year = 2024`, and `region = 'eu' OR amount > 10`
-* *WHEN* the reader resolves each query's scan
-* *THEN* the `region = 'eu'` query SHALL resolve only the `region=eu` files, evaluated by the partition predicate of `vs-adapter/direct-storage-hive-partitioning` under its string comparison rules
-* *AND* the reader SHALL present to that predicate ONLY the partition columns whose declared Spark type is `string`, so the `year = 2024` query and every predicate on a non-string partition column keep every file, because the predicate compares values as strings and string order is not the order of an integer, date, or timestamp column
-* *AND* the `OR` query SHALL keep every file, because its non-partition branch can be TRUE for any file
-* *AND* each query SHALL return the same rows as the same query without pruning, because the full predicate still applies above the scan
-
 ### Scenario: Storage is resolved through the table's own catalog exactly as for a Delta table
 
 * *GIVEN* a Unity Parquet table and a CONNECTION that either enables `use_vended_credentials` or supplies static storage credentials
@@ -88,3 +79,11 @@ Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the 
 * *THEN* the reader SHALL resolve its storage through the SAME component the Delta reader uses, so the empty-location refusal, the per-table `READ`-scoped vend against the table's own vending key, the refusal without a static fallback when no vending key is reported, the static backend when vending is disabled, and the shared vended-storage policy all apply unchanged (`vs-adapter/delta-table-planning`, `vs-adapter/unity-catalog-vended-credentials`)
 * *AND* the reader SHALL list the files through an object store built from that effective storage, and SHALL return that effective storage, which the shard-invariant common spec carries sealed under vending and as a CONNECTION reference otherwise
 * *AND* every error the reader surfaces SHALL be redacted against the effective storage's secret values, and MUST NOT contain any vended or static credential value
+
+### Scenario: A predicate on a partition column prunes files under the column's declared type
+
+* *GIVEN* a Unity Parquet table partitioned by `year` (`INT`, `partition_index` 0) and `region` (`STRING`, `partition_index` 1), holding files under `year=2024/region=eu/`, `year=2024/region=us/`, and `year=2025/region=eu/`, and three queries carrying `region = 'eu'`, `year = 2024`, and `region = 'eu' OR amount > 10`
+* *WHEN* the reader resolves each query's scan
+* *THEN* the `region = 'eu'` query SHALL resolve only the `region=eu` files, and the `year = 2024` query only the `year=2024` files, evaluated by the shared predicate of `vs-adapter/partition-predicate-declared-types` under each partition column's declared type
+* *AND* the `OR` query SHALL keep every file, because its non-partition branch can be TRUE for any file
+* *AND* each query SHALL return the same rows as the same query without pruning, because the full predicate still applies above the scan
