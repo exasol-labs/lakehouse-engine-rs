@@ -10,10 +10,12 @@ use object_store::path::Path as StorePath;
 use serde_json::Value as Json;
 use std::collections::HashSet;
 
+use super::delta_schema::binary_cause;
 use super::partition_predicate::PartitionPredicate;
-use super::{FormatReader, ResolvedScan};
+use super::{FormatReader, RefusedColumn, ResolvedScan, ensure_table_has_a_mappable_column};
 use crate::adapter::parquet_directory::{
-    DirectoryOptions, ParquetDirectory, ParquetFile, resolve_parquet_directory, store_prefix,
+    BinaryColumn, DirectoryOptions, NESTED_ENUM_TYPE, ParquetDirectory, ParquetFile,
+    resolve_parquet_directory, store_prefix,
 };
 use crate::scan::spec::{FileEntry, LogicalField, NestedField, NestedMembers};
 use crate::scan::{encode_file_path, store_root_url};
@@ -44,21 +46,19 @@ impl FormatReader for ParquetFormatReader<'_> {
         Box::pin(async move {
             let store_root = store_root_url(self.table_root)?;
             let prefix = store_prefix(self.table_root)?;
-            let predicate = PartitionPredicate::from_filter(filter_json);
+            let predicate = PartitionPredicate::from_filter(filter_json, &[]);
             let ParquetDirectory {
                 files,
                 schema,
                 partition_columns,
+                binary_columns,
             } = resolve_parquet_directory(self.store, &prefix, self.options, &move |values| {
                 predicate.keeps(values)
             })
             .await?;
 
-            let mut logical = logical_schema(&schema);
-            logical.extend(logical_schema(&Schema::new(absent_declared_fields(
-                self.declared_columns,
-                &schema,
-            ))));
+            let (logical, refused_columns) =
+                plannable_schema(&schema, self.declared_columns, &binary_columns)?;
             Ok(ResolvedScan {
                 files: files
                     .into_iter()
@@ -69,7 +69,7 @@ impl FormatReader for ParquetFormatReader<'_> {
                 table_root: self.table_root.to_string(),
                 name_mapping: Vec::new(),
                 partition_columns,
-                refused_columns: Vec::new(),
+                refused_columns,
             })
         })
     }
@@ -93,6 +93,49 @@ pub(super) fn file_entry(file: ParquetFile, prefix: &StorePath, store_root: &str
         size: file.size,
         deletes: Vec::new(),
         partition_values: file.partition_values,
+    }
+}
+
+/// Refused columns are dropped only after the absent declared columns are added, so a refused
+/// column's own listed declaration never re-adds it as a NULL column.
+fn plannable_schema(
+    schema: &Schema,
+    declared_columns: &[(String, String)],
+    binary_columns: &[BinaryColumn],
+) -> Result<(Vec<LogicalField>, Vec<RefusedColumn>), UdfError> {
+    let refused_columns: Vec<RefusedColumn> = binary_columns.iter().map(binary_refusal).collect();
+    let mut logical = logical_schema(schema);
+    logical.extend(logical_schema(&Schema::new(absent_declared_fields(
+        declared_columns,
+        schema,
+    ))));
+    logical.retain(|field| {
+        refused_columns
+            .iter()
+            .all(|refused| refused.column_name != field.name)
+    });
+    ensure_table_has_a_mappable_column(&logical, &refused_columns, "Direct storage")?;
+    Ok((logical, refused_columns))
+}
+
+fn binary_refusal(column: &BinaryColumn) -> RefusedColumn {
+    let subject = match &column.member_path {
+        Some(member_path) => {
+            format!(
+                "Parquet column '{}', whose member '{member_path}'",
+                column.column
+            )
+        }
+        None => format!("Parquet column '{}'", column.column),
+    };
+    let text_scope = if column.declared == NESTED_ENUM_TYPE {
+        "; a Parquet ENUM is read as text only as a top-level, non-repeated column"
+    } else {
+        ""
+    };
+    RefusedColumn {
+        column_name: column.column.clone(),
+        reason: format!("{subject} {}{text_scope}", binary_cause(&column.declared)),
     }
 }
 

@@ -49,6 +49,7 @@ fn delta_table(
         format: TableFormat::Delta,
         vended_credential_key: vended_credential_key.map(str::to_string),
         partition_columns: Vec::new(),
+        metadata_location: None,
         columns: Vec::new(),
     }
 }

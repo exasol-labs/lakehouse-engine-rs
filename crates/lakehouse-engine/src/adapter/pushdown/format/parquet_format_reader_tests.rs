@@ -1,9 +1,11 @@
 use super::*;
-use crate::adapter::parquet_directory::MergeMode;
+use crate::adapter::parquet_directory::{
+    FilePattern, MergeMode, list_location_files, raw_location_prefix,
+};
 use crate::adapter::pushdown::test_support::filter_json::{column, compare, equal, number, string};
 use crate::adapter::pushdown::test_support::sample_storage;
 use crate::adapter::tests::parquet_fixture::{
-    directory_options, in_memory_store, nullable, parquet_bytes,
+    directory_options, in_memory_store, nullable, parquet_bytes, parquet_footer_bytes,
 };
 use crate::scan::spec::reconstruct_abs_uri;
 use arrow::datatypes::Fields;
@@ -229,6 +231,56 @@ async fn file_entry_paths_round_trip_to_the_listed_object() {
     );
 }
 
+/// Scenario: A catalog-registered location is listed by its raw object key
+#[tokio::test]
+async fn a_raw_key_file_path_resolves_back_to_its_object_key() {
+    let table_root = "s3://bucket/tbl";
+    let inside = "tbl/p_str=a b%2Fc/f1";
+    let outside = "elsewhere/p_str=a b%2Fc/f1";
+    let store = in_memory_store(&[(inside, NOT_PARQUET), (outside, NOT_PARQUET)]).await
+        as Arc<dyn ObjectStore>;
+    let (store_root, table_prefix) =
+        raw_location_prefix(table_root).expect("the table location names a raw key");
+
+    for key in [inside, outside] {
+        let (partition_location, _) = key.rsplit_once('/').expect("the key has a directory");
+        let (_, partition_prefix) =
+            raw_location_prefix(&format!("s3://bucket/{partition_location}"))
+                .expect("the partition location names a raw key");
+        let [listed] =
+            list_location_files(&store, &partition_prefix, FilePattern::ANY_DIRECT_CHILD)
+                .await
+                .expect("the partition location lists")
+                .try_into()
+                .unwrap_or_else(|files: Vec<_>| {
+                    panic!("one file under '{key}', got {}", files.len())
+                });
+
+        let entry = file_entry(
+            ParquetFile {
+                path: listed.path,
+                size: listed.size,
+                partition_values: BTreeMap::new(),
+                footer: None,
+            },
+            &table_prefix,
+            &store_root,
+        );
+        let uri = reconstruct_abs_uri(&entry.path, table_root);
+        let scanned = ListingTableUrl::parse(&uri)
+            .unwrap_or_else(|e| panic!("the scan parses the entry URI '{uri}': {e}"))
+            .prefix()
+            .clone();
+
+        assert_eq!(
+            scanned,
+            StorePath::parse(key).expect("the fixture key is a valid store path"),
+            "'{}' must resolve to the listed object '{key}'",
+            entry.path
+        );
+    }
+}
+
 #[tokio::test]
 async fn plan_reads_selected_footers_and_lists_every_file() {
     let store = two_depth_directory().await;
@@ -316,6 +368,46 @@ async fn a_partition_filter_prunes_files_before_their_footers_are_read() {
         assert_eq!(scan.partition_columns, vec!["year".to_string()]);
         assert_eq!(column_names(&scan), columns_after, "{filter}");
     }
+}
+
+/// Scenario: Direct storage passes every partition column to the one predicate as a string
+#[tokio::test]
+async fn a_numeric_literal_prunes_no_direct_storage_file() {
+    let data = parquet(vec![nullable("id", DataType::Int64)]);
+    let store = store_holding(&[
+        ("direct/events/year=2024/p1.parquet", &data),
+        ("direct/events/year=2025/p2.parquet", &data),
+    ])
+    .await;
+
+    let numeric = compare("predicate_equal", column("YEAR"), number("2024"));
+    let unpruned = resolve(&store, MergeMode::FoldEveryFile, Some(&numeric)).await;
+    let pruned = resolve(
+        &store,
+        MergeMode::FoldEveryFile,
+        Some(&equal("YEAR", "2024")),
+    )
+    .await;
+
+    assert_eq!(
+        file_paths(&unpruned),
+        vec!["year=2024/p1.parquet", "year=2025/p2.parquet"],
+        "a numeric literal against a string partition column prunes no file"
+    );
+    assert_eq!(
+        unpruned
+            .logical_schema
+            .iter()
+            .find(|field| field.name == "year")
+            .map(|field| field.arrow_type.as_str()),
+        Some("utf8"),
+        "direct storage declares its partition column a string"
+    );
+    assert_eq!(
+        file_paths(&pruned),
+        vec!["year=2024/p1.parquet"],
+        "a string literal still prunes through the same predicate"
+    );
 }
 
 #[tokio::test]
@@ -467,4 +559,167 @@ async fn a_non_utc_timezone_column_plans_at_its_normalized_tag() {
         scan.logical_schema[0].arrow_type, "timestamptz_us",
         "the plan path renders the tz-aware tag, the same one enumeration declares"
     );
+}
+
+async fn resolve_footer(
+    message: &str,
+    declared_columns: &[(String, String)],
+) -> Result<ResolvedScan, UdfError> {
+    let store = store_holding(&[(
+        "direct/events/part-0.parquet",
+        &parquet_footer_bytes(message),
+    )])
+    .await;
+    try_resolve(
+        &store,
+        directory_options(MergeMode::FoldEveryFile, true),
+        None,
+        declared_columns,
+    )
+    .await
+}
+
+fn refused(column: &str, member_path: Option<&str>, declared: &str) -> RefusedColumn {
+    let subject = match member_path {
+        Some(member_path) => format!("Parquet column '{column}', whose member '{member_path}'"),
+        None => format!("Parquet column '{column}'"),
+    };
+    RefusedColumn {
+        column_name: column.to_string(),
+        reason: format!("{subject} {}", binary_cause(declared)),
+    }
+}
+
+/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
+#[tokio::test]
+async fn unannotated_bson_and_geospatial_byte_arrays_are_refused_naming_their_type() {
+    let varchar = "VARCHAR(2000000) UTF8";
+    let listed = declared(&[
+        ("ID", "DECIMAL(10,0)"),
+        ("LEGACY_NAME", varchar),
+        ("NAME", varchar),
+        ("S", varchar),
+        ("DOC", varchar),
+        ("SHAPE", varchar),
+        ("AREA", varchar),
+    ]);
+
+    let scan = resolve_footer(
+        "message events {
+            OPTIONAL INT32 id;
+            OPTIONAL BYTE_ARRAY legacy_name;
+            OPTIONAL BYTE_ARRAY name (STRING);
+            OPTIONAL GROUP s {
+                OPTIONAL BYTE_ARRAY raw;
+            }
+            OPTIONAL BYTE_ARRAY doc (BSON);
+            OPTIONAL BYTE_ARRAY shape (GEOMETRY);
+            OPTIONAL BYTE_ARRAY area (GEOGRAPHY);
+        }",
+        &listed,
+    )
+    .await
+    .expect("a directory with a mappable column plans, refusing only its binary columns");
+
+    assert_eq!(
+        column_names(&scan),
+        vec!["id", "name"],
+        "a refused column is dropped, and its listed declaration never re-adds it as a NULL column"
+    );
+    assert_eq!(
+        scan.refused_columns,
+        vec![
+            refused("legacy_name", None, "binary"),
+            refused("s", Some("s.raw"), "binary"),
+            refused("doc", None, "bson"),
+            refused("shape", None, "geometry"),
+            refused("area", None, "geography"),
+        ]
+    );
+}
+
+/// Scenario: A direct-storage ENUM column reads as text
+#[tokio::test]
+async fn an_enum_column_reads_as_text_and_a_nested_enum_member_is_refused() {
+    let scan = resolve_footer(
+        "message events {
+            OPTIONAL INT32 id;
+            OPTIONAL BYTE_ARRAY kind (ENUM);
+            OPTIONAL GROUP s {
+                OPTIONAL BYTE_ARRAY k (ENUM);
+            }
+        }",
+        &[],
+    )
+    .await
+    .expect("the ENUM column is mappable");
+
+    assert_eq!(column_names(&scan), vec!["id", "kind"]);
+    assert_eq!(
+        scan.logical_schema[1].arrow_type, "utf8",
+        "a top-level ENUM is read as its UTF-8 text"
+    );
+    let nested = refused("s", Some("s.k"), "enum");
+    assert_eq!(
+        scan.refused_columns,
+        vec![RefusedColumn {
+            reason: format!(
+                "{}; a Parquet ENUM is read as text only as a top-level, non-repeated column",
+                nested.reason
+            ),
+            ..nested
+        }],
+        "the nested ENUM member is refused, stating where an ENUM does read as text"
+    );
+}
+
+/// Scenario: A direct-storage UUID or unannotated fixed-length column is refused
+#[tokio::test]
+async fn uuid_and_unannotated_fixed_len_columns_are_refused_naming_their_type() {
+    let scan = resolve_footer(
+        "message events {
+            OPTIONAL INT32 id;
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) uid (UUID);
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) digest;
+        }",
+        &[],
+    )
+    .await
+    .expect("the id column is mappable");
+
+    assert_eq!(column_names(&scan), vec!["id"]);
+    assert_eq!(
+        scan.refused_columns,
+        vec![
+            refused("uid", None, "uuid"),
+            refused("digest", None, "fixed(16)"),
+        ]
+    );
+}
+
+/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
+#[tokio::test]
+async fn a_directory_whose_every_column_is_binary_is_refused_as_a_whole() {
+    let error = resolve_footer(
+        "message events {
+            OPTIONAL BYTE_ARRAY payload;
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) uid (UUID);
+        }",
+        &[],
+    )
+    .await
+    .expect_err("a directory with no mappable column cannot be scanned");
+
+    let message = error.to_string();
+    for fragment in [
+        "Direct storage table has no mappable column",
+        "'payload'",
+        "'uid'",
+        "#351",
+    ] {
+        assert!(
+            message.contains(fragment),
+            "'{fragment}' missing from: {message}"
+        );
+    }
 }

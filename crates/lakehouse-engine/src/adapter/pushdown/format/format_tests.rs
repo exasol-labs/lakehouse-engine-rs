@@ -1,7 +1,7 @@
-use super::super::test_support::sample_storage;
+use super::super::test_support::{object_endpoint, sample_storage};
 use super::*;
 use crate::adapter::parquet_directory::MergeMode;
-use lakehouse_catalog::{CatalogTableIdent, CatalogTableType};
+use lakehouse_catalog::{CatalogColumn, CatalogTableIdent, CatalogTableType, ColumnSourceType};
 
 /// SigV4 mode lets `CatalogSession::resolve` build a session without contacting a catalog.
 fn offline_sigv4_creds() -> ConnectionCreds {
@@ -42,6 +42,7 @@ fn unity_table(format: TableFormat) -> CatalogTable {
         format,
         vended_credential_key: Some("table-id-1".into()),
         partition_columns: Vec::new(),
+        metadata_location: None,
         columns: Vec::new(),
     }
 }
@@ -166,6 +167,108 @@ fn third_scan_source_selects_the_parquet_reader() {
         selected.is_ok(),
         "a raw Parquet directory must select its reader without reading anything"
     );
+}
+
+fn glue_table(format: TableFormat) -> CatalogTable {
+    CatalogTable {
+        ident: CatalogTableIdent {
+            namespace: vec!["sales".into()],
+            name: "orders".into(),
+        },
+        table_type: CatalogTableType::Table,
+        storage_location: Some("s3://bucket/sales/orders".into()),
+        format,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        metadata_location: Some("s3://bucket/sales/orders/metadata/v1.json".into()),
+        columns: vec![CatalogColumn {
+            name: "id".into(),
+            source_type: ColumnSourceType::Glue {
+                hive_type: "int".into(),
+            },
+        }],
+    }
+}
+
+fn offline_glue_session() -> GlueCatalogSession {
+    GlueCatalogSession::new(UNREACHABLE_CATALOG, sample_storage(), offline_sigv4_creds())
+        .expect("the CONNECTION region signs the session without a request")
+}
+
+/// Scenario: A Glue Parquet table is planned by the shared catalog-declared Parquet reader
+#[tokio::test]
+async fn format_reader_selects_readers_for_a_glue_table_by_format_without_contacting_the_catalog() {
+    let creds = offline_sigv4_creds();
+    let session = offline_glue_session();
+    let storage = object_endpoint(
+        "bucket",
+        vec![("sales/orders/part-0".to_string(), "rows".to_string())],
+    )
+    .await;
+
+    for format in [TableFormat::Iceberg, TableFormat::Parquet] {
+        let table = glue_table(format);
+        let reader = format_reader(
+            ScanSource::Glue {
+                session: &session,
+                table: &table,
+            },
+            &ConnectionStorage {
+                storage: &storage,
+                creds: &creds,
+                allow_http: true,
+            },
+        )
+        .expect("a Glue table must select its reader without issuing a request");
+
+        let resolved = reader.resolve_scan(None).await;
+
+        match format {
+            TableFormat::Parquet => {
+                let scan = resolved.expect("the Parquet reader lists the table location");
+                let paths: Vec<&str> = scan.files.iter().map(|file| file.path.as_str()).collect();
+                assert_eq!(paths, vec!["part-0"]);
+            }
+            _ => {
+                let error = resolved
+                    .expect_err("the Iceberg reader reads the metadata file, which is absent")
+                    .to_string();
+                assert!(
+                    error.contains("s3://bucket/sales/orders/metadata/v1.json"),
+                    "{error}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn format_reader_refuses_a_delta_table_under_the_glue_source() {
+    let creds = offline_sigv4_creds();
+    let session = offline_glue_session();
+    let table = glue_table(TableFormat::Delta);
+    let storage = sample_storage();
+
+    let err = format_reader(
+        ScanSource::Glue {
+            session: &session,
+            table: &table,
+        },
+        &ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    )
+    .err()
+    .expect("no Glue reader plans a Delta table");
+
+    let message = match err {
+        UdfError::User(message) => message,
+        other => panic!("a mismatched pairing must fail as a user error, got {other:?}"),
+    };
+    assert!(message.contains("sales.orders"), "{message}");
+    assert!(message.contains("Delta"), "{message}");
 }
 
 /// Scenario: A Delta table with no mappable column is refused as a whole

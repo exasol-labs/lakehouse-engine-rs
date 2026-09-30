@@ -10,6 +10,21 @@ use tokio::net::TcpListener;
 pub(super) struct RecordingCatalog {
     pub(super) uri: String,
     targets: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<String>>>,
+}
+
+fn request_is_complete(raw: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(raw);
+    let Some((head, body)) = text.split_once("\r\n\r\n") else {
+        return false;
+    };
+    let content_length = head
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    body.len() >= content_length
 }
 
 impl RecordingCatalog {
@@ -24,18 +39,39 @@ impl RecordingCatalog {
         );
         let targets: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
+        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+
         let recorded = targets.clone();
+        let recorded_bodies = bodies.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                let mut raw_bytes = Vec::new();
                 let mut buf = vec![0u8; 8192];
-                let read = stream.read(&mut buf).await.unwrap_or(0);
-                if read == 0 {
+                loop {
+                    let read = stream.read(&mut buf).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    raw_bytes.extend_from_slice(&buf[..read]);
+                    if request_is_complete(&raw_bytes) {
+                        break;
+                    }
+                }
+                if raw_bytes.is_empty() {
                     continue;
                 }
-                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
+                let raw = String::from_utf8_lossy(&raw_bytes).to_string();
                 let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
+                let request_body = raw
+                    .split_once("\r\n\r\n")
+                    .map_or("", |(_, body)| body)
+                    .to_string();
                 let (status, body) = responder(&target);
                 recorded.lock().expect("recorded targets").push(target);
+                recorded_bodies
+                    .lock()
+                    .expect("recorded bodies")
+                    .push(request_body);
                 let reason = if (200..300).contains(&status) {
                     "OK"
                 } else {
@@ -50,7 +86,15 @@ impl RecordingCatalog {
             }
         });
 
-        Self { uri, targets }
+        Self {
+            uri,
+            targets,
+            bodies,
+        }
+    }
+
+    pub(super) fn bodies(&self) -> Vec<String> {
+        self.bodies.lock().expect("recorded bodies").clone()
     }
 
     pub(super) fn targets(&self) -> Vec<String> {
@@ -113,6 +157,39 @@ pub(super) fn snapshotless_load_table_body(location: &str) -> String {
         }
     })
     .to_string()
+}
+
+pub(super) fn load_table_body_with_columns(
+    fields: serde_json::Value,
+    last_column_id: i32,
+) -> String {
+    serde_json::json!({
+        "metadata-location": "s3://bucket/db/t/metadata/v1.json",
+        "metadata": {
+            "format-version": 2,
+            "table-uuid": "00000000-0000-0000-0000-000000000007",
+            "location": "s3://bucket/db/t",
+            "last-sequence-number": 0,
+            "last-updated-ms": 0,
+            "last-column-id": last_column_id,
+            "current-schema-id": 0,
+            "schemas": [{"type": "struct", "schema-id": 0, "fields": fields}],
+            "default-spec-id": 0,
+            "partition-specs": [{"spec-id": 0, "fields": []}],
+            "last-partition-id": 0,
+            "sort-orders": [{"order-id": 0, "fields": []}],
+            "default-sort-order-id": 0,
+            "snapshots": []
+        }
+    })
+    .to_string()
+}
+
+pub(super) fn user_message(error: UdfError) -> String {
+    match error {
+        UdfError::User(message) => message,
+        other => panic!("expected UdfError::User, got {other:?}"),
+    }
 }
 
 /// No storage location, so the Delta reader refuses before reaching any object store.
@@ -259,6 +336,103 @@ pub(super) async fn object_endpoint(
     })
 }
 
+pub(super) struct GlueEndpoint {
+    pub(super) address: String,
+    requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+}
+
+impl GlueEndpoint {
+    pub(super) async fn spawn<F>(responder: F) -> Self
+    where
+        F: Fn(&str) -> serde_json::Value + Send + Sync + 'static,
+    {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let address = format!("http://{}", listener.local_addr().expect("local_addr"));
+        let requests: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
+        let responder = Arc::new(responder);
+
+        let recorded = requests.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (recorded, responder) = (recorded.clone(), responder.clone());
+                tokio::spawn(async move {
+                    let Some((Some(operation), body)) = read_glue_request(&mut stream).await else {
+                        return;
+                    };
+                    let response = responder(&operation).to_string();
+                    recorded
+                        .lock()
+                        .expect("recorded requests")
+                        .push((operation, body));
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.1\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(response.as_bytes()).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+
+        Self { address, requests }
+    }
+
+    pub(super) fn bodies_of(&self, operation: &str) -> Vec<serde_json::Value> {
+        self.requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .filter(|(recorded, _)| recorded == operation)
+            .map(|(_, body)| body.clone())
+            .collect()
+    }
+}
+
+/// Reads the whole request, body included: closing a socket with unread bytes resets it
+/// before the client reads the response.
+async fn read_glue_request(
+    stream: &mut tokio::net::TcpStream,
+) -> Option<(Option<String>, serde_json::Value)> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
+        }
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&chunk[..read]);
+    };
+    let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
+    let header = |name: &str| {
+        head.split("\r\n")
+            .filter_map(|line| line.split_once(':'))
+            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.trim().to_string())
+    };
+    let content_length: usize = header("content-length")
+        .and_then(|length| length.parse().ok())
+        .unwrap_or(0);
+    let mut body = raw[head_end + 4..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    let operation = header("x-amz-target")
+        .and_then(|target| target.strip_prefix("AWSGlue.").map(str::to_string));
+    Some((
+        operation,
+        serde_json::from_slice(&body).expect("a Glue request body is JSON"),
+    ))
+}
+
 fn ok_response(content_type: &str, body: &str) -> String {
     format!(
         "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
@@ -269,6 +443,8 @@ fn ok_response(content_type: &str, body: &str) -> String {
     )
 }
 
+/// Honors `delimiter` as S3 does: a key with the delimiter below `prefix` rolls up into its
+/// common prefix, so a delimiter listing returns only the prefix's direct children as objects.
 fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -> String {
     let param = |key: &str| {
         url::form_urlencoded::parse(query.as_bytes())
@@ -276,26 +452,39 @@ fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -
             .map(|(_, value)| value.into_owned())
             .unwrap_or_default()
     };
-    let (prefix, after) = (param("prefix"), param("start-after"));
-    let contents: String = objects
+    let (prefix, after, delimiter) = (param("prefix"), param("start-after"), param("delimiter"));
+    let mut contents = String::new();
+    let mut common_prefixes = std::collections::BTreeSet::new();
+    for (key, body) in objects
         .iter()
         .filter(|(key, _)| key.starts_with(&prefix) && key > &after)
-        .map(|(key, body)| {
-            format!(
+    {
+        let rolled_up = (!delimiter.is_empty())
+            .then(|| key[prefix.len()..].find(&delimiter))
+            .flatten();
+        match rolled_up {
+            Some(end) => {
+                common_prefixes.insert(key[..prefix.len() + end + delimiter.len()].to_string());
+            }
+            None => contents.push_str(&format!(
                 "<Contents><Key>{key}</Key>\
                  <LastModified>2024-01-01T00:00:00.000Z</LastModified>\
                  <ETag>&quot;e{}&quot;</ETag><Size>{}</Size>\
                  <StorageClass>STANDARD</StorageClass></Contents>",
                 body.len(),
                 body.len()
-            )
-        })
+            )),
+        }
+    }
+    let common_prefixes: String = common_prefixes
+        .iter()
+        .map(|common| format!("<CommonPrefixes><Prefix>{common}</Prefix></CommonPrefixes>"))
         .collect();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
          <Name>{bucket}</Name><Prefix>{prefix}</Prefix><MaxKeys>1000</MaxKeys>\
-         <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+         <IsTruncated>false</IsTruncated>{contents}{common_prefixes}</ListBucketResult>"
     )
 }
 

@@ -9,13 +9,39 @@ type CatalogClientConstruction = fn(
 ) -> Result<Box<dyn CatalogClient>, UdfError>;
 
 #[test]
-fn construction_site_is_exhaustive_and_fallible_for_three_kinds() {
+fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
     let _pipeline: fn(
         &[String],
         &CatalogListing,
         EngineTimestampSupport,
     ) -> Result<VirtualTables, UdfError> = build_listing_virtual_tables;
     let _constructor: CatalogClientConstruction = construct_catalog_client;
+
+    let glue_creds = |region: &str| ConnectionCreds {
+        region: region.to_string(),
+        access_key: "AKID".to_string(),
+        secret_key: "SECRET".to_string(),
+        use_sigv4: true,
+        ..ConnectionCreds::default()
+    };
+    let construct = |address: &str, creds: ConnectionCreds| {
+        let storage = connection::storage_block(&creds, false);
+        construct_catalog_client(
+            CatalogKind::Glue,
+            address.to_string(),
+            storage,
+            creds,
+            &json!({}),
+        )
+    };
+
+    assert!(construct("https://glue.us-east-1.amazonaws.com", glue_creds("")).is_ok());
+    assert!(construct("https://glue.example.test", glue_creds("eu-west-1")).is_ok());
+    let err = construct("https://glue.example.test", glue_creds(""))
+        .err()
+        .expect("a Glue address with no region must fail construction")
+        .to_string();
+    assert!(!err.contains("SECRET"), "{err}");
 }
 
 #[test]
@@ -38,6 +64,7 @@ fn both_kinds_share_one_listing_pipeline() {
             format,
             vended_credential_key: None,
             partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![CatalogColumn {
                 name: "order_id".to_string(),
                 source_type,
@@ -111,6 +138,7 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
             format: TableFormat::Iceberg,
             vended_credential_key: None,
             partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![
                 CatalogColumn {
                     name: "ts".to_string(),

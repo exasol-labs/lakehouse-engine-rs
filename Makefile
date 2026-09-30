@@ -63,7 +63,7 @@ export LH_REST_PORT
 # E2E suites FAIL (not skip) when their stack is unavailable, and run serially
 # because all tests share one VS.
 test-e2e: cross-udf-build
-	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test --test e2e_credential_exposure_test --test e2e_version_udf_test --test e2e_emit_declaration_test --test e2e_direct_storage_test -- --test-threads=1
+	cargo test --features exasol-e2e --test e2e_scan_test --test e2e_capability_test --test e2e_count_distinct_test --test e2e_join_test --test e2e_positional_deletes_test --test e2e_int96_timestamp_test --test e2e_refresh_test --test e2e_non_ascii_identifier_test --test e2e_harness_row_cap_test --test e2e_type_relaxation_test --test e2e_complex_type_test --test e2e_timestamp_precision_test --test e2e_credential_exposure_test --test e2e_version_udf_test --test e2e_emit_declaration_test --test e2e_direct_storage_test --test e2e_type_matrix_test -- --test-threads=1
 
 # Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
@@ -79,6 +79,12 @@ test-e2e-lakekeeper: cross-udf-build
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-azure: cross-udf-build
 	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --features azure-e2e --test e2e_azure_test -- --test-threads=1
+
+# Requires: docker compose up -d --wait exasol
+# plus a real AWS Glue Data Catalog and S3 fixture bucket (GLUE_* in ./test.env or the environment).
+# Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
+test-e2e-glue: cross-udf-build
+	if [ -f ./test.env ]; then set -a; . ./test.env; set +a; fi; cargo test --features glue-e2e --test e2e_glue_test -- --test-threads=1
 
 # Manual equivalent of the E2E harness's in-process `setup_e2e` SLC install.
 # Set BUCKETFS_WRITE_PASS to skip extracting it from EXAConf via docker exec.
@@ -215,4 +221,4 @@ test-e2e-unity: cross-udf-build
 	$(MAKE) unity-up
 	cargo test -p lakehouse-engine --features unity-e2e --test e2e_unity_test -- --test-threads=1
 
-.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure install-slc print-slc-version bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts
+.PHONY: cross-udf-build test test-e2e test-e2e-lakekeeper test-e2e-azure test-e2e-glue install-slc print-slc-version bucketfs-upload-so fmt lint coverage bench test-install lint-install unity-up unity-down test-e2e-unity test-lakekeeper-scripts test-lakekeeper-local lint-lakekeeper-scripts

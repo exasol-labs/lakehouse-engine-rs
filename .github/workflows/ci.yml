@@ -632,12 +632,69 @@ jobs:
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml down -v
 
+  # Real AWS Glue Data Catalog and S3 fixture bucket; the key's IAM policy is in
+  # test.env.example. Not in `release`'s needs, so an AWS outage or a rotated key
+  # can't block releases. A fork PR receives no secrets and fails loudly.
+  e2e-glue:
+    name: E2E (Glue)
+    runs-on: ubuntu-latest
+    needs: [build-so]
+    timeout-minutes: 45
+    env:
+      LH_EXASOL_CPUSET: "0-1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/e2e-setup
+
+      - name: Pull stack images
+        run: docker compose pull --quiet exasol
+
+      - name: Start stack (Exasol)
+        run: docker compose up -d --wait exasol
+
+      - name: Run Glue E2E suite
+        env:
+          GLUE_ACCESS_KEY_ID: ${{ secrets.GLUE_ACCESS_KEY_ID }}
+          GLUE_SECRET_ACCESS_KEY: ${{ secrets.GLUE_SECRET_ACCESS_KEY }}
+          GLUE_REGION: ${{ vars.GLUE_REGION }}
+          GLUE_FIXTURE_BUCKET: ${{ vars.GLUE_FIXTURE_BUCKET }}
+        run: make test-e2e-glue
+
+      # A UDF sandbox crash leaves empty DB-side logs; the reason is only in host dmesg.
+      - name: Dump Glue stack logs on failure
+        if: failure()
+        run: |
+          echo "=== container stats / host free ==="
+          docker compose ps || true
+          free -m || true
+          echo "=== HOST kernel ring buffer (sudo) ==="
+          sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
+          echo "--- last 40 kernel lines (fallback) ---"
+          sudo dmesg --ctime | tail -40 || true
+          echo "=== exasql crash logs ==="
+          docker compose exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
+          echo "=== collecting /exa/logs tree for artifact ==="
+          rm -rf exa-logs-glue && mkdir -p exa-logs-glue
+          docker compose cp exasol:/exa/logs exa-logs-glue/ 2>/dev/null || true
+
+      - name: Upload Glue Exasol logs
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: exa-logs-glue
+          path: exa-logs-glue/
+          if-no-files-found: ignore
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
+
   release:
     name: Release
     runs-on: ubuntu-latest
     # lint/unit-tests/licenses must be listed explicitly: e2e only needs build-so.
-    # `e2e-azure` is deliberately absent (third-party outage risk); `arm64` is
-    # the only test signal for the aarch64 asset.
+    # `e2e-azure` and `e2e-glue` are deliberately absent (third-party outage risk);
+    # `arm64` is the only test signal for the aarch64 asset.
     needs: [e2e, e2e-lakekeeper, e2e-unity, lint, unit-tests, arm64, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:

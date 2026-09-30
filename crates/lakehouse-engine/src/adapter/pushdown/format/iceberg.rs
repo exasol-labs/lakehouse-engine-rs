@@ -3,14 +3,21 @@ use std::pin::Pin;
 
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
-use iceberg::TableIdent;
+use iceberg::spec::TableMetadata;
+use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_catalog::{
-    CatalogProps, CatalogSession, StaticStoreAddress, load_table_any_auth, parse_table_ident,
-    redact_credentials, redact_error_text, resolve_vended_storage,
+    CatalogProps, CatalogSession, CatalogTable, StaticStoreAddress, StorageBackend,
+    load_table_any_auth, parse_table_ident, redact_credentials, redact_error_text,
+    resolve_vended_storage,
 };
 use serde_json::Value as Json;
 
-use super::{ConnectionStorage, FormatReader, ResolvedScan};
+use super::delta_schema::binary_cause;
+use super::{
+    ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan,
+    ensure_table_has_a_mappable_column,
+};
+use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{
     DeleteMechanism, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
 };
@@ -20,116 +27,234 @@ use crate::scan::spec::{
 mod tests;
 
 pub(super) struct IcebergFormatReader<'a> {
-    pub(super) session: &'a CatalogSession,
-    pub(super) catalog_props: &'a CatalogProps,
+    pub(super) metadata: IcebergMetadataSource<'a>,
     pub(super) connection: ConnectionStorage<'a>,
 }
 
+/// Where an Iceberg table's current metadata comes from. Every source's metadata passes the same
+/// checks and the same planner, so every Iceberg reader rule applies to every source.
+pub(super) enum IcebergMetadataSource<'a> {
+    /// An Iceberg REST `loadTable`, whose response may also vend the table's credential.
+    RestLoadTable {
+        session: &'a CatalogSession,
+        catalog_props: &'a CatalogProps,
+    },
+    /// A metastore's pointer to the current `metadata.json` (Iceberg § Metastore Tables), read
+    /// once through the CONNECTION's static storage.
+    MetadataFile { table: &'a CatalogTable },
+}
+
+/// A table's identity and its metadata once it passed the pre-storage checks, with the storage
+/// its files are read through.
+struct CheckedMetadata {
+    table_name: String,
+    table_ident: TableIdent,
+    metadata: TableMetadata,
+    metadata_location: Option<String>,
+    table_root: String,
+    effective_storage: StorageBackend,
+}
+
 impl FormatReader for IcebergFormatReader<'_> {
-    /// Vended-credential extraction is gated solely on `creds.use_vended_credentials`,
-    /// orthogonal to the catalog-auth mode. Credentials stay vended-only (a missing vended
-    /// credential errors rather than falling back to the static one), while the CONNECTION's
-    /// `endpoint` and `region` may override vended addressing via [`StaticStoreAddress`], which
-    /// cannot carry a credential.
-    ///
-    /// Errors are redacted against the effective storage's secrets, since its `file_io` is
-    /// what talks to object storage.
     fn resolve_scan<'a>(
         &'a self,
         filter_json: Option<&'a Json>,
     ) -> Pin<Box<dyn Future<Output = Result<ResolvedScan, UdfError>> + Send + 'a>> {
-        let ConnectionStorage {
-            storage,
-            creds,
-            allow_http,
-        } = self.connection;
         Box::pin(async move {
-            let result = load_table_any_auth(self.session, self.catalog_props, creds).await?;
-
-            // Decided from schema history alone, before any manifest is read, so filtered and
-            // unfiltered requests are refused identically.
-            refuse_date_promotion(&result.metadata, &self.catalog_props.table)?;
-
-            // The anchor is the table's own location: what vended `prefix`es match against.
-            // The REST URI names no object store and `warehouse` is only a routing identifier.
-            let table_location = result.metadata.location();
-            if table_location.is_empty() {
-                return Err(UdfError::User(format!(
-                    "the loadTable response for table '{}' carries an EMPTY table \
-                     `location`; the catalog `warehouse` is a routing identifier, not a \
-                     table location, and is not a valid substitute",
-                    self.catalog_props.table
-                )));
-            }
-            let table_root = table_location.to_string();
-            let effective_storage = if creds.use_vended_credentials {
-                resolve_vended_storage(
-                    &result,
-                    table_location,
-                    allow_http,
-                    &StaticStoreAddress::from(creds),
-                )?
-            } else {
-                storage.clone()
+            let checked = match self.metadata {
+                IcebergMetadataSource::RestLoadTable {
+                    session,
+                    catalog_props,
+                } => rest_metadata(session, catalog_props, &self.connection).await?,
+                IcebergMetadataSource::MetadataFile { table } => {
+                    file_metadata(table, self.connection.storage).await?
+                }
             };
-            let secrets = effective_storage.secret_values();
-
-            let (namespace, table_name) = parse_table_ident(&self.catalog_props.table)?;
-            let table_ident = TableIdent::new(namespace, table_name);
-            let file_io = effective_storage.file_io();
-            let runtime = iceberg::Runtime::try_current().map_err(|e| {
-                UdfError::User(format!(
-                    "failed to build Iceberg table: {}",
-                    redact_error_text(&e.to_string(), &secrets)
-                ))
-            })?;
-            let table_builder = iceberg::table::Table::builder()
-                .identifier(table_ident)
-                .file_io(file_io)
-                .runtime(runtime)
-                .metadata(result.metadata);
-            let table = if let Some(loc) = result.metadata_location {
-                table_builder.metadata_location(loc).build()
-            } else {
-                table_builder.build()
-            }
-            .map_err(|e| {
-                UdfError::User(format!(
-                    "failed to build Iceberg table: {}",
-                    redact_error_text(&e.to_string(), &secrets)
-                ))
-            })?;
-
-            let logical_schema = build_logical_schema(table.metadata().current_schema());
-
-            // Absent ⇒ empty; malformed ⇒ plan-time error.
-            let name_mapping = parse_name_mapping(
-                table
-                    .metadata()
-                    .properties()
-                    .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
-                    .map(String::as_str),
-            )?;
-
-            // Must run before `plan_files_from_table`, which drops the information needed to tell
-            // a Puffin deletion vector from a Parquet positional delete.
-            ensure_supported_delete_mechanisms(&table, &self.catalog_props.table, &secrets).await?;
-
-            let files =
-                plan_files_from_table(table, &self.catalog_props.table, filter_json, &secrets)
-                    .await?;
-
-            Ok(ResolvedScan {
-                files,
-                effective_storage,
-                logical_schema,
-                table_root,
-                name_mapping,
-                partition_columns: Vec::new(),
-                refused_columns: Vec::new(),
-            })
+            plan_checked_table(checked, filter_json).await
         })
     }
+}
+
+/// Vended-credential extraction is gated solely on `creds.use_vended_credentials`, orthogonal to
+/// the catalog-auth mode. Credentials stay vended-only (a missing vended credential errors rather
+/// than falling back to the static one), while the CONNECTION's `endpoint` and `region` may
+/// override vended addressing via [`StaticStoreAddress`], which cannot carry a credential.
+async fn rest_metadata(
+    session: &CatalogSession,
+    catalog_props: &CatalogProps,
+    connection: &ConnectionStorage<'_>,
+) -> Result<CheckedMetadata, UdfError> {
+    let ConnectionStorage {
+        storage,
+        creds,
+        allow_http,
+    } = *connection;
+    let table_name = &catalog_props.table;
+    let result = load_table_any_auth(session, catalog_props, creds).await?;
+    // The REST URI names no object store and `warehouse` is only a routing identifier.
+    let table_root = checked_table_root(&result.metadata, table_name, || {
+        UdfError::User(format!(
+            "the loadTable response for table '{table_name}' carries an EMPTY table \
+             `location`; the catalog `warehouse` is a routing identifier, not a \
+             table location, and is not a valid substitute"
+        ))
+    })?;
+    let effective_storage = if creds.use_vended_credentials {
+        resolve_vended_storage(
+            &result,
+            &table_root,
+            allow_http,
+            &StaticStoreAddress::from(creds),
+        )?
+    } else {
+        storage.clone()
+    };
+    let (namespace, name) = parse_table_ident(table_name)?;
+    Ok(CheckedMetadata {
+        table_name: table_name.clone(),
+        table_ident: TableIdent::new(namespace, name),
+        metadata: result.metadata,
+        metadata_location: result.metadata_location,
+        table_root,
+        effective_storage,
+    })
+}
+
+/// A metadata file vends no credential, so the table is read through the static storage.
+async fn file_metadata(
+    table: &CatalogTable,
+    storage: &StorageBackend,
+) -> Result<CheckedMetadata, UdfError> {
+    let table_name = catalog_identifier_string(&table.ident);
+    let location = table
+        .metadata_location
+        .as_deref()
+        .filter(|location| !location.trim().is_empty())
+        .ok_or_else(|| {
+            UdfError::User(format!(
+                "Iceberg table '{table_name}' names no current metadata file, so its snapshot \
+                 is unknown"
+            ))
+        })?;
+    let metadata = read_metadata_file(storage, location, &table_name).await?;
+    let table_root = checked_table_root(&metadata, &table_name, || {
+        UdfError::User(format!(
+            "the Iceberg metadata file '{location}' of table '{table_name}' carries an EMPTY \
+             table `location`; the catalog's storage location is not a valid substitute, \
+             because the metadata file is the table's authority"
+        ))
+    })?;
+    let namespace = NamespaceIdent::from_vec(table.ident.namespace.clone())
+        .map_err(|error| UdfError::User(format!("invalid namespace in '{table_name}': {error}")))?;
+    Ok(CheckedMetadata {
+        table_ident: TableIdent::new(namespace, table.ident.name.clone()),
+        metadata,
+        metadata_location: Some(location.to_string()),
+        table_root,
+        effective_storage: storage.clone(),
+        table_name,
+    })
+}
+
+/// Every source's metadata passes these, in this order, before any storage decision. The anchor
+/// is the table's own location: what vended `prefix`es match against.
+fn checked_table_root(
+    metadata: &TableMetadata,
+    table_name: &str,
+    empty_location: impl FnOnce() -> UdfError,
+) -> Result<String, UdfError> {
+    // Decided from schema history alone, before any manifest is read, so filtered and
+    // unfiltered requests are refused identically.
+    refuse_date_promotion(metadata, table_name)?;
+    let location = metadata.location();
+    if location.is_empty() {
+        return Err(empty_location());
+    }
+    Ok(location.to_string())
+}
+
+async fn read_metadata_file(
+    storage: &StorageBackend,
+    location: &str,
+    table_name: &str,
+) -> Result<TableMetadata, UdfError> {
+    TableMetadata::read_from(&storage.file_io(), location)
+        .await
+        .map_err(|error| {
+            let message = format!(
+                "failed to read the Iceberg metadata file '{location}' of table '{table_name}': \
+                 {error}"
+            );
+            UdfError::User(redact_error_text(&message, &storage.secret_values()))
+        })
+}
+
+/// The one Iceberg planner. Errors are redacted against the effective storage's secrets, since
+/// its `file_io` is what talks to object storage.
+async fn plan_checked_table(
+    checked: CheckedMetadata,
+    filter_json: Option<&Json>,
+) -> Result<ResolvedScan, UdfError> {
+    let CheckedMetadata {
+        table_name,
+        table_ident,
+        metadata,
+        metadata_location,
+        table_root,
+        effective_storage,
+    } = checked;
+    let secrets = effective_storage.secret_values();
+
+    let file_io = effective_storage.file_io();
+    let runtime = iceberg::Runtime::try_current().map_err(|e| {
+        UdfError::User(format!(
+            "failed to build Iceberg table: {}",
+            redact_error_text(&e.to_string(), &secrets)
+        ))
+    })?;
+    let table_builder = iceberg::table::Table::builder()
+        .identifier(table_ident)
+        .file_io(file_io)
+        .runtime(runtime)
+        .metadata(metadata);
+    let table = if let Some(loc) = metadata_location {
+        table_builder.metadata_location(loc).build()
+    } else {
+        table_builder.build()
+    }
+    .map_err(|e| {
+        UdfError::User(format!(
+            "failed to build Iceberg table: {}",
+            redact_error_text(&e.to_string(), &secrets)
+        ))
+    })?;
+
+    let (logical_schema, refused_columns) = plannable_schema(table.metadata().current_schema())?;
+
+    // Absent ⇒ empty; malformed ⇒ plan-time error.
+    let name_mapping = parse_name_mapping(
+        table
+            .metadata()
+            .properties()
+            .get(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING)
+            .map(String::as_str),
+    )?;
+
+    // Must run before `plan_files_from_table`, which drops the information needed to tell
+    // a Puffin deletion vector from a Parquet positional delete.
+    ensure_supported_delete_mechanisms(&table, &table_name, &secrets).await?;
+
+    let files = plan_files_from_table(table, &table_name, filter_json, &secrets).await?;
+
+    Ok(ResolvedScan {
+        files,
+        effective_storage,
+        logical_schema,
+        table_root,
+        name_mapping,
+        partition_columns: Vec::new(),
+        refused_columns,
+    })
 }
 
 /// Only top-level entries with a `field-id` are flattened; id-less entries exist only in
@@ -425,6 +550,84 @@ async fn plan_files_from_table(
             )
         })
         .collect())
+}
+
+/// Refuses every `binary`, `fixed(L)`, and `uuid` column at any depth until #351; the listing
+/// still declares them, so only a request reading one fails.
+fn plannable_schema(
+    schema: &iceberg::spec::Schema,
+) -> Result<(Vec<LogicalField>, Vec<RefusedColumn>), UdfError> {
+    let refused_columns: Vec<RefusedColumn> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .filter_map(|field| binary_refusal(field))
+        .collect();
+    let logical_schema: Vec<LogicalField> = build_logical_schema(schema)
+        .into_iter()
+        .filter(|field| {
+            refused_columns
+                .iter()
+                .all(|refused| refused.column_name != field.name)
+        })
+        .collect();
+    ensure_table_has_a_mappable_column(&logical_schema, &refused_columns, "Iceberg")?;
+    Ok((logical_schema, refused_columns))
+}
+
+fn binary_refusal(field: &iceberg::spec::NestedField) -> Option<RefusedColumn> {
+    let (path, declared) = first_binary_member(&field.field_type, &field.name)?;
+    let subject = if field.field_type.is_primitive() {
+        format!("Iceberg column '{}'", field.name)
+    } else {
+        format!("Iceberg column '{}', whose member '{path}'", field.name)
+    };
+    Some(RefusedColumn {
+        column_name: field.name.clone(),
+        reason: format!("{subject} {}", binary_cause(&declared)),
+    })
+}
+
+fn first_binary_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {
+    use iceberg::spec::Type;
+
+    match field_type {
+        Type::Primitive(primitive) => {
+            declared_binary_type(primitive).map(|declared| (path.to_string(), declared))
+        }
+        Type::Struct(members) => members.fields().iter().find_map(|member| {
+            first_binary_member(&member.field_type, &format!("{path}.{}", member.name))
+        }),
+        Type::List(list) => {
+            first_binary_member(&list.element_field.field_type, &format!("{path}.element"))
+        }
+        Type::Map(map) => first_binary_member(&map.key_field.field_type, &format!("{path}.key"))
+            .or_else(|| first_binary_member(&map.value_field.field_type, &format!("{path}.value"))),
+    }
+}
+
+/// Exhaustive, so a new Iceberg primitive must be classified before the build passes.
+fn declared_binary_type(primitive: &iceberg::spec::PrimitiveType) -> Option<String> {
+    use iceberg::spec::PrimitiveType::*;
+
+    match primitive {
+        Binary => Some("binary".to_string()),
+        Fixed(length) => Some(format!("fixed({length})")),
+        Uuid => Some("uuid".to_string()),
+        Boolean
+        | Int
+        | Long
+        | Float
+        | Double
+        | Decimal { .. }
+        | Date
+        | Time
+        | Timestamp
+        | Timestamptz
+        | TimestampNs
+        | TimestamptzNs
+        | String => None,
+    }
 }
 
 pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {

@@ -353,7 +353,7 @@ where
     Ok(wrote_any)
 }
 
-async fn write_one_file_append(
+pub async fn write_one_file_append(
     catalog: &impl Catalog,
     table: &Table,
     table_name: &str,

@@ -31,8 +31,8 @@ use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
 use exasol_udf_sdk::udf_log;
 use lakehouse_catalog::{
-    CatalogClient, CatalogListing, CatalogTableIdent, IcebergRestCatalogClient, SkipReason,
-    SkippedTable, UnityCatalogSession,
+    CatalogClient, CatalogListing, CatalogTableIdent, GlueCatalogSession, IcebergRestCatalogClient,
+    SkipReason, SkippedTable, UnityCatalogSession,
 };
 use serde_json::{Value as Json, json};
 use std::collections::HashMap;
@@ -80,6 +80,10 @@ const NOTE_S3_MAX_CONNECTIONS: &str = "S3_MAX_CONNECTIONS";
 /// thread keep the NIC busy, and idle pooled connections are far cheaper than threads.
 const S3_CONNECTIONS_PER_THREAD: usize = 4;
 const NOTE_TABLE_MAP: &str = "TABLE_MAP";
+const NOTE_SKIPPED_TABLES: &str = "SKIPPED_TABLES";
+const NOTE_SKIPPED_TABLES_OMITTED: &str = "SKIPPED_TABLES_OMITTED";
+/// Exasol rejects a longer adapterNotes with sqlCode 04000 on CREATE and REFRESH (measured live).
+const ADAPTER_NOTES_MAX_BYTES: usize = 2_000_000;
 
 pub fn adapter_call(ctx: &mut dyn UdfContext, json_arg: &str) -> Result<String, UdfError> {
     let request: Json = serde_json::from_str(json_arg)
@@ -173,7 +177,7 @@ fn handle_create_virtual_schema(
     // Optional under direct storage: the CONNECTION address alone denotes the storage subtree.
     let configured_ns: Vec<String> = match config.catalog_kind {
         CatalogKind::DirectStorage => Vec::new(),
-        _ => {
+        CatalogKind::IcebergRest | CatalogKind::UnityCatalogNative | CatalogKind::Glue => {
             let namespace = nonempty_str(&props, PROP_NAMESPACE).ok_or_else(|| {
                 UdfError::User(format!("property '{PROP_NAMESPACE}' is required"))
             })?;
@@ -233,6 +237,7 @@ fn handle_create_virtual_schema(
         s3_max_connections,
         join_broadcast_max_bytes,
         &table_map,
+        &skipped,
     );
 
     let schema_metadata = json!({
@@ -243,22 +248,30 @@ fn handle_create_virtual_schema(
     Ok(build_schema_response(request, schema_metadata))
 }
 
-fn skip_warning(entry: &SkippedTable) -> String {
+fn skip_reason(entry: &SkippedTable) -> String {
     match &entry.reason {
-        SkipReason::NotLoadableIcebergTable => format!(
-            "createVirtualSchema: skipping non-Iceberg table '{}' (catalog reported it is not a loadable Iceberg table)",
-            catalog_identifier_string(&entry.ident)
-        ),
-        SkipReason::NotDeltaBaseTable { detail } => format!(
-            "createVirtualSchema: skipping non-Delta-base entry '{}' ({})",
-            catalog_identifier_string(&entry.ident),
-            detail
-        ),
-        SkipReason::NoDataFile => format!(
-            "createVirtualSchema: skipping directory '{}' (holds no data file)",
-            catalog_identifier_string(&entry.ident)
-        ),
+        SkipReason::NotLoadableIcebergTable => {
+            "catalog reported it is not a loadable Iceberg table".to_string()
+        }
+        SkipReason::NotDeltaBaseTable { detail } | SkipReason::NotPlannableGlueTable { detail } => {
+            detail.clone()
+        }
+        SkipReason::NoDataFile => "holds no data file".to_string(),
     }
+}
+
+fn skip_warning(entry: &SkippedTable) -> String {
+    let skipped_kind = match &entry.reason {
+        SkipReason::NotLoadableIcebergTable => "non-Iceberg table",
+        SkipReason::NotDeltaBaseTable { .. } => "non-Delta-base entry",
+        SkipReason::NoDataFile => "directory",
+        SkipReason::NotPlannableGlueTable { .. } => "Glue table",
+    };
+    format!(
+        "createVirtualSchema: skipping {skipped_kind} '{}' ({})",
+        catalog_identifier_string(&entry.ident),
+        skip_reason(entry)
+    )
 }
 
 /// `requestedTables` is echoed only because the protocol requires mirroring request fields;
@@ -470,6 +483,11 @@ fn construct_catalog_client(
             )?;
             Ok(Box::new(client))
         }
+        CatalogKind::Glue => Ok(Box::new(GlueCatalogSession::new(
+            &catalog_uri,
+            storage,
+            creds,
+        )?)),
     }
 }
 
@@ -545,6 +563,7 @@ fn build_adapter_notes(
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
     table_map: &[(String, String)],
+    skipped: &[SkippedTable],
 ) -> Json {
     let mut notes = parse_adapter_notes(request);
     notes.insert(
@@ -588,7 +607,61 @@ fn build_adapter_notes(
         .map(|(k, v)| (k.clone(), Json::String(v.clone())))
         .collect();
     notes.insert(NOTE_TABLE_MAP.to_string(), Json::Object(map_obj));
+    insert_skipped_tables(&mut notes, skipped);
     Json::String(Json::Object(notes).to_string())
+}
+
+fn insert_skipped_tables(notes: &mut serde_json::Map<String, Json>, skipped: &[SkippedTable]) {
+    let entries: Vec<Json> = skipped
+        .iter()
+        .map(|entry| {
+            json!({
+                "table": catalog_identifier_string(&entry.ident),
+                "reason": skip_reason(entry),
+            })
+        })
+        .collect();
+    notes.insert(NOTE_SKIPPED_TABLES.to_string(), Json::Array(Vec::new()));
+    notes.remove(NOTE_SKIPPED_TABLES_OMITTED);
+    let base_len = Json::Object(notes.clone()).to_string().len();
+    let (kept, omitted) = fit_skipped_tables(entries, base_len);
+    notes.insert(NOTE_SKIPPED_TABLES.to_string(), Json::Array(kept));
+    if omitted > 0 {
+        notes.insert(
+            NOTE_SKIPPED_TABLES_OMITTED.to_string(),
+            Json::String(omitted.to_string()),
+        );
+    }
+}
+
+/// Keeps the longest listing-order prefix of `entries` whose notes stay within
+/// [`ADAPTER_NOTES_MAX_BYTES`]; `base_len` is the notes length holding an empty list.
+fn fit_skipped_tables(entries: Vec<Json>, base_len: usize) -> (Vec<Json>, usize) {
+    let total = entries.len();
+    let mut used = base_len + omitted_entry_len(total);
+    let mut kept: Vec<Json> = Vec::new();
+    for entry in entries {
+        let separator = usize::from(!kept.is_empty());
+        let cost = separator + entry.to_string().len();
+        let after = used + cost - omitted_entry_len(total - kept.len())
+            + omitted_entry_len(total - kept.len() - 1);
+        if after > ADAPTER_NOTES_MAX_BYTES {
+            break;
+        }
+        used = after;
+        kept.push(entry);
+    }
+    let omitted = total - kept.len();
+    (kept, omitted)
+}
+
+/// Serialized length of the `SKIPPED_TABLES_OMITTED` entry, leading comma included.
+fn omitted_entry_len(omitted: usize) -> usize {
+    if omitted == 0 {
+        return 0;
+    }
+    let entry = json!({ NOTE_SKIPPED_TABLES_OMITTED: omitted.to_string() }).to_string();
+    entry.len() - "{}".len() + ",".len()
 }
 
 fn resolve_parallelism_factor(props: &Json, nr_of_cores: u32) -> usize {

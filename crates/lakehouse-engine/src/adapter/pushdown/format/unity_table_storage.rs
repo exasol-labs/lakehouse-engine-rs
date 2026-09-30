@@ -4,7 +4,7 @@ use lakehouse_catalog::{
     redact_error_text, resolve_uc_vended_storage,
 };
 
-use super::ConnectionStorage;
+use super::{ConnectionStorage, checked_storage_location};
 use crate::adapter::tables::catalog_identifier_string;
 
 #[cfg(test)]
@@ -40,23 +40,9 @@ impl<'a> UnityTableStorage<'a> {
     }
 
     pub(super) async fn resolve(&self) -> Result<(&'a str, StorageBackend), UdfError> {
-        let table_root = self.checked_table_root()?;
+        let table_root = checked_storage_location(self.table, "Unity Catalog")?;
         let effective_storage = self.effective_storage(table_root).await?;
         Ok((table_root, effective_storage))
-    }
-
-    /// Checked before any credential or storage access; neither the catalog URI nor the
-    /// CONNECTION endpoint may substitute for an empty location.
-    fn checked_table_root(&self) -> Result<&'a str, UdfError> {
-        match self.table.storage_location.as_deref() {
-            Some(location) if !location.trim().is_empty() => Ok(location),
-            _ => Err(UdfError::User(format!(
-                "the Unity Catalog metadata for table {} carries an EMPTY storage location; \
-                 the catalog URI and the CONNECTION endpoint name no table location and are \
-                 not valid substitutes",
-                self.table_name()
-            ))),
-        }
     }
 
     /// Under vending, a table with no (or an empty) vending key fails rather than falling

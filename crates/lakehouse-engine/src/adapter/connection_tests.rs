@@ -1452,3 +1452,113 @@ fn direct_storage_accepts_matching_scheme_and_credential_shape() {
     read_connection(&ctx, Some("MY_CONN"), CatalogKind::DirectStorage)
         .expect("an abfss:// address with Azure-shaped credentials must be accepted");
 }
+
+const GLUE_ADDRESS: &str = "https://glue.us-east-1.amazonaws.com";
+
+fn glue_password(extra: serde_json::Value) -> String {
+    let mut password = serde_json::json!({
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+    });
+    password
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    password.to_string()
+}
+
+fn glue_error(extra: serde_json::Value) -> String {
+    let ctx = with_conn(GLUE_ADDRESS, &glue_password(extra));
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
+        .unwrap_err()
+        .to_string()
+}
+
+/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
+#[test]
+fn glue_connection_implies_sigv4_and_makes_warehouse_optional() {
+    let ctx = with_conn(GLUE_ADDRESS, &glue_password(serde_json::json!({})));
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
+        .expect("a Glue CONNECTION with only region and keys must be accepted");
+    assert!(resolved.creds.use_sigv4);
+    assert!(resolved.creds.warehouse.is_empty());
+
+    let ctx = with_conn(
+        GLUE_ADDRESS,
+        &glue_password(serde_json::json!({ "warehouse": "123456789012", "use_sigv4": true })),
+    );
+    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
+        .expect("a warehouse is the optional Glue CatalogId");
+    assert!(resolved.creds.use_sigv4);
+    assert_eq!(resolved.creds.warehouse, "123456789012");
+}
+
+/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
+#[test]
+fn glue_connection_rejects_explicit_sigv4_false() {
+    let msg = glue_error(serde_json::json!({ "use_sigv4": false }));
+
+    assert!(msg.contains("always signs with AWS SigV4"), "{msg}");
+    assert!(!msg.contains("SECRET"), "{msg}");
+}
+
+/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
+#[test]
+fn glue_connection_rejects_vending_and_catalog_auth_fields() {
+    let msg = glue_error(serde_json::json!({ "use_vended_credentials": true }));
+    assert!(msg.contains("no native credential vending"), "{msg}");
+
+    let msg = glue_error(serde_json::json!({
+        "token": "TOKEN_VALUE",
+        "client_id": "CLIENT_ID_VALUE",
+        "client_secret": "CLIENT_SECRET_VALUE",
+        "oauth2_server_uri": "https://idp.example.com/token",
+        "scope": "SCOPE_VALUE",
+    }));
+    for field in [
+        "token",
+        "client_id",
+        "client_secret",
+        "oauth2_server_uri",
+        "scope",
+    ] {
+        assert!(msg.contains(field), "error must name {field}: {msg}");
+    }
+    for value in [
+        "TOKEN_VALUE",
+        "CLIENT_ID_VALUE",
+        "CLIENT_SECRET_VALUE",
+        "SCOPE_VALUE",
+        "SECRET\"",
+    ] {
+        assert!(!msg.contains(value), "error must not leak {value}: {msg}");
+    }
+
+    let msg = glue_error(serde_json::json!({ "client_id": "CLIENT_ID_VALUE" }));
+    assert!(msg.contains("client_id"), "{msg}");
+    assert!(!msg.contains("CLIENT_ID_VALUE"), "{msg}");
+}
+
+/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
+#[test]
+fn glue_connection_requires_the_sigv4_fields() {
+    let password = serde_json::json!({ "region": "us-east-1", "access_key": "AKID" }).to_string();
+    let ctx = with_conn(GLUE_ADDRESS, &password);
+
+    let msg = read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
+        .unwrap_err()
+        .to_string();
+
+    assert!(msg.contains("secret_key"), "{msg}");
+}
+
+/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
+#[test]
+fn a_glue_connection_without_a_region_signs_for_the_standard_address_region() {
+    let password = serde_json::json!({ "access_key": "AKID", "secret_key": "SECRET" }).to_string();
+    let ctx = with_conn(GLUE_ADDRESS, &password);
+
+    read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
+        .expect("the standard Glue address supplies the signing region");
+}

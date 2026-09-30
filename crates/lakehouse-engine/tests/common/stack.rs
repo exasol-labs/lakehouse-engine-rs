@@ -3,7 +3,8 @@
     feature = "cloud-e2e",
     feature = "lakekeeper-e2e",
     feature = "azure-e2e",
-    feature = "unity-e2e"
+    feature = "unity-e2e",
+    feature = "glue-e2e"
 ))]
 
 use std::time::{Duration, Instant};
@@ -226,7 +227,8 @@ pub fn upload_to_bucketfs(local_path: &std::path::Path, bucketfs_path: &str) {
     feature = "exasol-e2e",
     feature = "lakekeeper-e2e",
     feature = "azure-e2e",
-    feature = "unity-e2e"
+    feature = "unity-e2e",
+    feature = "glue-e2e"
 ))]
 pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
     let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -315,7 +317,8 @@ pub fn build_create_connection_sql(
     feature = "exasol-e2e",
     feature = "lakekeeper-e2e",
     feature = "azure-e2e",
-    feature = "unity-e2e"
+    feature = "unity-e2e",
+    feature = "glue-e2e"
 ))]
 pub fn local_stack_connection_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {

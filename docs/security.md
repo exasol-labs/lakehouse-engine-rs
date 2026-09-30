@@ -38,6 +38,14 @@ A reader with only `SELECT` on the virtual schema still sees, in the plan text: 
 
 A vended credential has no CONNECTION name to reference. It travels as AES-256-GCM ciphertext (HKDF-SHA256 key from the CONNECTION password, fresh 96-bit nonce). Vending without key material is refused at plan time.
 
+## AWS Glue credentials and Lake Formation
+
+The Glue kind (`CATALOG_KIND = 'GLUE'`) reads with the static IAM credentials of the CONNECTION. The same `access_key`, `secret_key`, and optional `session_token` sign the Glue requests and read S3. The adapter reads no credential from the environment, a profile file, or instance metadata. The scan spec carries the CONNECTION name, never a credential value.
+
+The adapter evaluates no Lake Formation grant. It uses no Lake Formation credential vending. The Glue kind rejects `use_vended_credentials`. A querying user sees every table, partition, and object that the IAM policy of the CONNECTION's credentials allows. Lake Formation column filters, row filters, and cell filters do not apply. Grant the credentials only the IAM actions that the [Glue section of Catalogs](catalogs.md#aws-glue-data-catalog-catalog_kind--glue) lists.
+
+A cross-account `CatalogId` and assume-role credentials are untested (#TBD).
+
 ## Rotation
 
 Every query re-resolves the CONNECTION — no cache, no restart. Use `ALTER CONNECTION` (preserves grants). Sealed envelopes of in-flight vended queries fail the AEAD open — rotate when no vended query is in flight.

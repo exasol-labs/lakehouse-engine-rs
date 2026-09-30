@@ -2060,6 +2060,128 @@ fn assert_refuses_binary_col(error: UdfError) {
     );
 }
 
+fn binary_iceberg_table_body() -> String {
+    load_table_body_with_columns(
+        serde_json::json!([
+            {"id": 1, "name": "id", "required": false, "type": "int"},
+            {"id": 2, "name": "b", "required": false, "type": "binary"},
+            {"id": 3, "name": "f", "required": false, "type": "fixed[16]"},
+            {"id": 4, "name": "u", "required": false, "type": "uuid"},
+            {"id": 5, "name": "s", "required": false, "type": {"type": "struct", "fields": [
+                {"id": 6, "name": "x", "required": false, "type": "binary"}
+            ]}}
+        ]),
+        6,
+    )
+}
+
+fn binary_iceberg_table_request(pushdown_request: Json) -> Json {
+    let varchar = serde_json::json!({"type": "varchar", "size": 2000000});
+    serde_json::json!({
+        "involvedTables": [{
+            "name": "T",
+            "columns": [
+                {"name": "ID", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
+                {"name": "B", "dataType": varchar},
+                {"name": "F", "dataType": varchar},
+                {"name": "U", "dataType": varchar},
+                {"name": "S", "dataType": varchar},
+            ],
+        }],
+        "pushdownRequest": pushdown_request,
+    })
+}
+
+fn binary_iceberg_column(name: &str) -> Json {
+    serde_json::json!({"type": "column", "name": name, "tableName": "T"})
+}
+
+async fn binary_iceberg_pushdown(pushdown_request: Json) -> Result<Json, UdfError> {
+    let catalog = RecordingCatalog::spawn(|target| {
+        if target.starts_with("/v1/config") {
+            (200, "{}".to_string())
+        } else {
+            (200, binary_iceberg_table_body())
+        }
+    })
+    .await;
+    seam_handle_pushdown(
+        &binary_iceberg_table_request(pushdown_request),
+        &catalog.uri,
+        &CatalogProps {
+            warehouse: "wh".into(),
+            table: "db.t".into(),
+        },
+        CatalogKind::IcebergRest,
+        &unauthenticated_creds(),
+    )
+    .await
+}
+
+/// Scenario: A binary column is refused on every catalog-declared format at every depth
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_binary_column_refuses_only_the_requests_that_read_it_on_iceberg() {
+    let count_star = serde_json::json!({"type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false});
+    for admitted in [
+        serde_json::json!({"type": "select", "selectList": [binary_iceberg_column("ID")]}),
+        serde_json::json!({"type": "select", "selectList": [count_star]}),
+    ] {
+        binary_iceberg_pushdown(admitted.clone())
+            .await
+            .unwrap_or_else(|e| {
+                panic!("{admitted}: a request reading no binary column plans: {e}")
+            });
+    }
+
+    let filter_on_b = serde_json::json!({
+        "type": "predicate_is_not_null",
+        "expression": binary_iceberg_column("B"),
+    });
+    for (refused, fragments) in [
+        (
+            serde_json::json!({"type": "select", "selectList": [binary_iceberg_column("B")]}),
+            vec!["'b'", "type 'binary'", "#351"],
+        ),
+        (
+            serde_json::json!({"type": "select", "selectList": [binary_iceberg_column("F")]}),
+            vec!["'f'", "type 'fixed(16)'", "#351"],
+        ),
+        (
+            serde_json::json!({"type": "select", "selectList": [binary_iceberg_column("U")]}),
+            vec!["'u'", "type 'uuid'", "#351"],
+        ),
+        (
+            serde_json::json!({"type": "select", "selectList": [binary_iceberg_column("S")]}),
+            vec!["'s'", "member 's.x'", "type 'binary'", "#351"],
+        ),
+        (
+            serde_json::json!({"type": "select"}),
+            vec!["'b'", "'f'", "'u'", "'s'", "#351"],
+        ),
+        (
+            serde_json::json!({
+                "type": "select",
+                "selectList": [binary_iceberg_column("ID")],
+                "filter": filter_on_b,
+            }),
+            vec!["'b'", "type 'binary'", "#351"],
+        ),
+    ] {
+        let message = match binary_iceberg_pushdown(refused.clone()).await {
+            Err(UdfError::User(message)) => message,
+            other => {
+                panic!("{refused}: a request reading a binary column is refused, got {other:?}")
+            }
+        };
+        for fragment in fragments {
+            assert!(
+                message.contains(fragment),
+                "{refused}: '{fragment}' missing from: {message}"
+            );
+        }
+    }
+}
+
 async fn refused_protocol_table_storage() -> crate::scan::spec::StorageBackend {
     delta_object_endpoint(vec![(
         delta_commit_zero_key("orders"),

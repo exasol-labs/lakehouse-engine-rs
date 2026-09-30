@@ -1,5 +1,6 @@
 use super::*;
 use crate::adapter::pushdown::test_support::filter_json::*;
+use arrow::datatypes::TimeUnit;
 use serde_json::json;
 
 /// A filter no partition column can decide.
@@ -12,7 +13,15 @@ fn file_with(key: &str, value: Option<&str>) -> BTreeMap<String, Option<String>>
 }
 
 fn kept(filter: &Json, files: &[BTreeMap<String, Option<String>>]) -> Vec<bool> {
-    let predicate = PartitionPredicate::from_filter(Some(filter));
+    kept_under(filter, &[], files)
+}
+
+fn kept_under(
+    filter: &Json,
+    declared: &[(String, DataType)],
+    files: &[BTreeMap<String, Option<String>>],
+) -> Vec<bool> {
+    let predicate = PartitionPredicate::from_filter(Some(filter), declared);
     files.iter().map(|values| predicate.keeps(values)).collect()
 }
 
@@ -266,7 +275,7 @@ fn a_non_partition_node_never_prunes() {
         );
     }
 
-    let unfiltered = PartitionPredicate::from_filter(None);
+    let unfiltered = PartitionPredicate::from_filter(None, &[]);
     assert!(
         files.iter().all(|values| unfiltered.keeps(values)),
         "an absent filter keeps every file"
@@ -293,4 +302,255 @@ fn a_filter_column_resolves_to_a_partition_key_by_its_uppercase_fold() {
         [true, false],
         "the fold is Unicode uppercasing, the one the declaration uses"
     );
+}
+
+type FileValues = BTreeMap<String, Option<String>>;
+
+fn literal(kind: &str, value: Json) -> Json {
+    json!({"type": kind, "value": value})
+}
+
+fn date(value: &str) -> Json {
+    literal("literal_date", json!(value))
+}
+
+fn timestamp(value: &str) -> Json {
+    literal("literal_timestamp", json!(value))
+}
+
+fn typed_columns() -> Vec<(String, DataType)> {
+    [
+        ("year", DataType::Int32),
+        ("day", DataType::Date32),
+        ("amount", DataType::Decimal128(10, 2)),
+        ("ts", DataType::Timestamp(TimeUnit::Microsecond, None)),
+        ("region", DataType::Utf8),
+        ("active", DataType::Boolean),
+        ("ratio", DataType::Float64),
+        ("ts_ms", DataType::Timestamp(TimeUnit::Millisecond, None)),
+        ("tiny", DataType::Int8),
+        ("payload", DataType::Binary),
+    ]
+    .into_iter()
+    .map(|(name, data_type)| (name.to_string(), data_type))
+    .collect()
+}
+
+fn two_files(key: &str, first: &str, second: &str) -> [FileValues; 2] {
+    [file_with(key, Some(first)), file_with(key, Some(second))]
+}
+
+/// Scenario: A partition value compares under its column's declared type
+#[test]
+fn partition_values_compare_under_their_declared_type() {
+    let declared = typed_columns();
+    let cases: Vec<(&str, Json, [FileValues; 2])> = vec![
+        (
+            "year < 10 orders integers numerically, where a string order ranks '10' first",
+            compare("predicate_less", column("YEAR"), number("10")),
+            two_files("year", "9", "10"),
+        ),
+        (
+            "10 > year flips to year < 10",
+            compare("predicate_greater", number("10"), column("YEAR")),
+            two_files("year", "9", "10"),
+        ),
+        (
+            "an integer IN list",
+            in_list("YEAR", vec![number("9"), number("11")]),
+            two_files("year", "9", "10"),
+        ),
+        (
+            "day = DATE '2024-03-01'",
+            compare("predicate_equal", column("DAY"), date("2024-03-01")),
+            two_files("day", "2024-03-01", "2024-02-29"),
+        ),
+        (
+            "a date BETWEEN",
+            between("DAY", date("2024-02-01"), date("2024-02-29")),
+            two_files("day", "2024-02-29", "2024-03-01"),
+        ),
+        (
+            "amount >= 1.50",
+            compare("predicate_greaterequal", column("AMOUNT"), number("1.50")),
+            two_files("amount", "1.5", "1.49"),
+        ),
+        (
+            "an integral literal on a decimal column",
+            compare("predicate_greater", column("AMOUNT"), number("2")),
+            two_files("amount", "10.00", "1.99"),
+        ),
+        (
+            "ts < TIMESTAMP '2024-03-01 00:00:00'",
+            compare(
+                "predicate_less",
+                column("TS"),
+                timestamp("2024-03-01 00:00:00"),
+            ),
+            two_files("ts", "2024-02-29 23:59:59.999999", "2024-03-01 00:00:00"),
+        ),
+        (
+            "region = 'eu' in codepoint order",
+            equal("REGION", "eu"),
+            two_files("region", "eu", "us"),
+        ),
+        (
+            "active = TRUE",
+            compare(
+                "predicate_equal",
+                column("ACTIVE"),
+                literal("literal_bool", json!(true)),
+            ),
+            two_files("active", "true", "false"),
+        ),
+    ];
+
+    for (label, filter, files) in cases {
+        assert_eq!(
+            kept_under(&filter, &declared, &files),
+            [true, false],
+            "{label}: kept per file"
+        );
+    }
+    assert_eq!(
+        kept_under(
+            &compare("predicate_less", column("YEAR"), number("10")),
+            &declared,
+            &[file_with("year", None)],
+        ),
+        [false],
+        "a NULL value compares NULL under every declared type"
+    );
+}
+
+/// Scenario: A comparison the declared type cannot decide exactly keeps the file
+#[test]
+fn an_undecidable_comparison_keeps_the_file() {
+    let declared = typed_columns();
+    let every_file = [true, true];
+    let cases: Vec<(&str, Json, [FileValues; 2], [bool; 2])> = vec![
+        (
+            "a string literal on an integer column",
+            equal("YEAR", "2024"),
+            two_files("year", "2024", "2025"),
+            every_file,
+        ),
+        (
+            "a fractional literal on an integer column, which truncation would decide",
+            compare("predicate_equal", column("YEAR"), number("2024.5")),
+            two_files("year", "2024", "2025"),
+            every_file,
+        ),
+        (
+            "an integer literal outside the column's range, which wrapping would decide",
+            compare("predicate_equal", column("TINY"), number("300")),
+            two_files("tiny", "44", "45"),
+            every_file,
+        ),
+        (
+            "a literal finer than the decimal scale, which rounding would decide",
+            compare("predicate_equal", column("AMOUNT"), number("1.555")),
+            two_files("amount", "1.55", "1.56"),
+            every_file,
+        ),
+        (
+            "a timestamp literal finer than the column's unit, which truncation would decide",
+            compare(
+                "predicate_less",
+                column("TS_MS"),
+                timestamp("2024-03-01 00:00:00.000500"),
+            ),
+            two_files("ts_ms", "2024-03-01 00:00:00", "2024-03-01 00:00:00.001"),
+            every_file,
+        ),
+        (
+            "a comparison on a float column",
+            compare("predicate_greater", column("RATIO"), number("1.0")),
+            two_files("ratio", "0.5", "2.0"),
+            every_file,
+        ),
+        (
+            "a double literal on an integer column",
+            compare(
+                "predicate_equal",
+                column("YEAR"),
+                literal("literal_double", json!("2024")),
+            ),
+            two_files("year", "2024", "2025"),
+            every_file,
+        ),
+        (
+            "a timestamp literal on a date column",
+            compare(
+                "predicate_equal",
+                column("DAY"),
+                timestamp("2024-03-01 00:00:00"),
+            ),
+            two_files("day", "2024-03-01", "2024-03-02"),
+            every_file,
+        ),
+        (
+            "a date literal on a timestamp column",
+            compare("predicate_equal", column("TS"), date("2024-03-01")),
+            two_files("ts", "2024-03-01 00:00:00", "2024-03-02 00:00:00"),
+            every_file,
+        ),
+        (
+            "a UTC timestamp literal on a timestamp column",
+            compare(
+                "predicate_equal",
+                column("TS"),
+                literal("literal_timestamp_utc", json!("2024-03-01 00:00:00")),
+            ),
+            two_files("ts", "2024-03-01 00:00:00", "2024-03-02 00:00:00"),
+            every_file,
+        ),
+        (
+            "a string literal on a boolean column",
+            equal("ACTIVE", "true"),
+            two_files("active", "true", "false"),
+            every_file,
+        ),
+        (
+            "a string literal on a column of another declared type",
+            equal("PAYLOAD", "x"),
+            two_files("payload", "x", "y"),
+            every_file,
+        ),
+        (
+            "a value the declared type cannot convert keeps its file for the scan to fail",
+            compare("predicate_equal", column("YEAR"), number("2024")),
+            two_files("year", "abc", "2025"),
+            [true, false],
+        ),
+    ];
+
+    for (label, filter, files, expected) in cases {
+        assert_eq!(
+            kept_under(&filter, &declared, &files),
+            expected,
+            "{label}: kept per file"
+        );
+    }
+}
+
+#[test]
+fn an_empty_partition_value_is_null_as_the_scan_reads_it() {
+    let files = [file_with("year", Some(""))];
+    for (declared, bound) in [(Vec::new(), string("9")), (typed_columns(), number("9"))] {
+        assert_eq!(
+            kept_under(&is_null("YEAR"), &declared, &files),
+            [true],
+            "IS NULL holds for an empty value under {declared:?}"
+        );
+        assert_eq!(
+            kept_under(
+                &compare("predicate_less", column("YEAR"), bound),
+                &declared,
+                &files,
+            ),
+            [false],
+            "a comparison against an empty value is NULL, never TRUE, under {declared:?}"
+        );
+    }
 }

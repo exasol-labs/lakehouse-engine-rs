@@ -242,6 +242,7 @@ fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat)
         vended_credential_key: info.table_id.filter(|key| !key.trim().is_empty()),
         partition_columns,
         columns: info.columns.into_iter().map(neutral_column).collect(),
+        metadata_location: None,
     }
 }
 

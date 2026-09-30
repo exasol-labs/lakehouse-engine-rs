@@ -1039,6 +1039,71 @@ fn incompatible_unity_types_declared_varchar() {
     );
 }
 
+/// Scenario: The listing declares each Glue column through the Spark listing mapping
+#[test]
+fn glue_columns_declare_the_spark_listing_type() {
+    let cases = [
+        ("tinyint", "DECIMAL(3,0)"),
+        ("smallint", "DECIMAL(5,0)"),
+        ("int", "DECIMAL(10,0)"),
+        ("integer", "DECIMAL(10,0)"),
+        ("bigint", "DECIMAL(20,0)"),
+        ("float", "DOUBLE PRECISION"),
+        ("double", "DOUBLE PRECISION"),
+        ("boolean", "BOOLEAN"),
+        ("string", "VARCHAR(2000000)"),
+        ("varchar(10)", "VARCHAR(2000000)"),
+        ("char(5)", "VARCHAR(2000000)"),
+        ("date", "DATE"),
+        ("timestamp", "TIMESTAMP(6)"),
+        ("decimal", "DECIMAL(10,0)"),
+        ("decimal(10,2)", "DECIMAL(10,2)"),
+        ("DECIMAL( 38 , 10 )", "VARCHAR(2000000)"),
+        ("array<int>", "VARCHAR(2000000)"),
+        ("map<varchar(1),int>", "VARCHAR(2000000)"),
+        ("struct<x:int,y:string>", "VARCHAR(2000000)"),
+        ("array<struct<a:decimal(5,2)>>", "VARCHAR(2000000)"),
+        ("binary", "VARCHAR(2000000)"),
+        ("struct<b:binary>", "VARCHAR(2000000)"),
+        ("uniontype<int,string>", "VARCHAR(2000000)"),
+        ("interval_day_time", "VARCHAR(2000000)"),
+        ("map<int>", "VARCHAR(2000000)"),
+        ("", "VARCHAR(2000000)"),
+    ];
+
+    for (hive_type, expected) in cases {
+        let source = ColumnSourceType::Glue {
+            hive_type: hive_type.to_string(),
+        };
+        let declared =
+            column_source_type_to_exasol(&source, EngineTimestampSupport::DeclaredPrecision);
+        assert_eq!(declared, expected, "hive type {hive_type:?}");
+    }
+}
+
+#[test]
+fn a_glue_timestamp_declares_the_engine_timestamp_type_like_unity() {
+    let glue = ColumnSourceType::Glue {
+        hive_type: "timestamp".to_string(),
+    };
+    let unity = ColumnSourceType::Unity {
+        type_name: "TIMESTAMP_NTZ".to_string(),
+        precision: 0,
+        scale: 0,
+        type_json: None,
+    };
+    for engine in [
+        EngineTimestampSupport::MillisecondOnly,
+        EngineTimestampSupport::DeclaredPrecision,
+    ] {
+        assert_eq!(
+            column_source_type_to_exasol(&glue, engine),
+            column_source_type_to_exasol(&unity, engine),
+            "{engine:?}"
+        );
+    }
+}
+
 #[test]
 fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
     let cases = [

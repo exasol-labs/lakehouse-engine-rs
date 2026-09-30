@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
-    CatalogClient, CatalogProps, CatalogSession, CatalogTableIdent, UnityCatalogSession,
-    parse_table_ident,
+    CatalogClient, CatalogProps, CatalogSession, CatalogTableIdent, GlueCatalogSession,
+    UnityCatalogSession, parse_table_ident,
 };
 use object_store::ObjectStore;
 use serde_json::Value as Json;
@@ -32,6 +32,7 @@ pub(super) struct TableScanResolver<'a> {
 enum RequestSession {
     Iceberg(CatalogSession),
     Unity(Box<UnityCatalogSession>),
+    Glue(Box<GlueCatalogSession>),
     DirectStorage {
         store: Arc<dyn ObjectStore>,
         base_path: String,
@@ -74,6 +75,16 @@ impl<'a> TableScanResolver<'a> {
                     catalog_uri,
                     connection.creds.clone(),
                 )))
+            }
+            CatalogKind::Glue => {
+                for identifier in table_identifiers {
+                    glue_table_ident(identifier)?;
+                }
+                RequestSession::Glue(Box::new(GlueCatalogSession::new(
+                    catalog_uri,
+                    connection.storage.clone(),
+                    connection.creds.clone(),
+                )?))
             }
             CatalogKind::DirectStorage => {
                 for identifier in table_identifiers {
@@ -129,6 +140,19 @@ impl<'a> TableScanResolver<'a> {
                     .await?;
                 let reader = format_reader(
                     ScanSource::Unity {
+                        session: session.as_ref(),
+                        table: &table,
+                    },
+                    &self.connection,
+                )?;
+                reader.resolve_scan(filter_json).await
+            }
+            RequestSession::Glue(session) => {
+                let table = session
+                    .load_table_for_planning(&glue_table_ident(table_identifier)?)
+                    .await?;
+                let reader = format_reader(
+                    ScanSource::Glue {
                         session: session.as_ref(),
                         table: &table,
                     },
@@ -201,4 +225,21 @@ fn unity_table_ident(table_identifier: &str) -> Result<CatalogTableIdent, UdfErr
         namespace: namespace.split('.').map(String::from).collect(),
         name: name.to_string(),
     })
+}
+
+/// Split at the first dot: a Glue identifier is `database.table`, and a database name holds no dot.
+fn glue_table_ident(table_identifier: &str) -> Result<CatalogTableIdent, UdfError> {
+    match table_identifier.split_once('.') {
+        Some((database, name)) if !database.trim().is_empty() && !name.trim().is_empty() => {
+            Ok(CatalogTableIdent {
+                namespace: vec![database.to_string()],
+                name: name.to_string(),
+            })
+        }
+        _ => Err(UdfError::User(format!(
+            "pushdown: the recorded catalog identifier '{table_identifier}' names no Glue table \
+             — a Glue table is addressed as 'database.table'; drop and recreate the virtual \
+             schema"
+        ))),
+    }
 }

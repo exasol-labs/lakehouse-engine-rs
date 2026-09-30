@@ -3,6 +3,7 @@
 mod auth;
 mod client;
 mod creds;
+mod glue;
 mod iceberg_io;
 mod namespace;
 mod redaction;
@@ -17,11 +18,12 @@ mod vended;
 mod test_support;
 
 pub use client::{
-    CatalogClient, CatalogColumn, CatalogListing, CatalogTable, CatalogTableIdent,
-    CatalogTableType, ColumnSourceType, IcebergRestCatalogClient, SkipReason, SkippedTable,
-    TableFormat,
+    CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
+    CatalogTableIdent, CatalogTableType, ColumnSourceType, IcebergRestCatalogClient, SkipReason,
+    SkippedTable, TableFormat,
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
+pub use glue::GlueCatalogSession;
 pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{CatalogSession, load_table_any_auth};

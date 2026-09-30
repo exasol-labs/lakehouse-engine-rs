@@ -1,0 +1,132 @@
+name: Glue Orphan Fixture Sweep
+
+# See specs/glue-e2e/glue-orphan-sweep/spec.md.
+
+on:
+  schedule:
+    # Scheduled runs have no dry_run input, so they always delete.
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Preview candidates without deleting them"
+        type: boolean
+        default: true
+        required: false
+
+jobs:
+  sweep:
+    name: Sweep orphaned Glue fixtures
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Sweep orphaned Glue databases and S3 objects
+        env:
+          GLUE_REGION: ${{ vars.GLUE_REGION }}
+          GLUE_FIXTURE_BUCKET: ${{ vars.GLUE_FIXTURE_BUCKET }}
+          GLUE_ACCESS_KEY_ID: ${{ secrets.GLUE_ACCESS_KEY_ID }}
+          GLUE_SECRET_ACCESS_KEY: ${{ secrets.GLUE_SECRET_ACCESS_KEY }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          missing=0
+          for var in GLUE_ACCESS_KEY_ID GLUE_SECRET_ACCESS_KEY GLUE_REGION GLUE_FIXTURE_BUCKET; do
+            if [ -z "${!var+set}" ]; then
+              echo "the glue-orphan-sweep workflow requires environment variable $var, which is not set" >&2
+              missing=1
+            elif [ -z "${!var}" ]; then
+              echo "the glue-orphan-sweep workflow requires environment variable $var, which is set but empty" >&2
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            exit 1
+          fi
+
+          # set -x stays off so the secret never reaches the log.
+          export AWS_ACCESS_KEY_ID="$GLUE_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$GLUE_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="$GLUE_REGION"
+          export AWS_PAGER=""
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "DRY-RUN: listing stale lh_e2e_ databases and lh_e2e/ objects (older than 24h); nothing will be deleted."
+          else
+            echo "Sweeping stale lh_e2e_ databases and lh_e2e/ objects (older than 24h)."
+          fi
+
+          # JMESPath can't compare dates, so compute the cutoff in bash.
+          CUTOFF=$(date -u -d '24 hours ago' +%s)
+
+          # Captured to a variable (not a pipe) so the aws exit status reaches the explicit || handler.
+          databases=$(aws glue get-databases \
+            --query "DatabaseList[?starts_with(Name, 'lh_e2e_')].[Name, CreateTime]" \
+            --output text) || { echo "aws glue get-databases failed" >&2; exit 1; }
+
+          db_candidates=0
+          if [ -n "$databases" ]; then
+            while IFS=$'\t' read -r name created; do
+              if [ -z "$name" ]; then
+                continue
+              fi
+              created_epoch=$(date -u -d "$created" +%s)
+              if [ "$created_epoch" -lt "$CUTOFF" ]; then
+                db_candidates=$((db_candidates + 1))
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "  would delete database: $name (created=$created)"
+                else
+                  echo "  deleting database: $name (created=$created)"
+                  aws glue delete-database --name "$name" \
+                    || { echo "aws glue delete-database failed for $name" >&2; exit 1; }
+                fi
+              fi
+            done <<< "$databases"
+          fi
+
+          objects=$(aws s3api list-objects-v2 \
+            --bucket "$GLUE_FIXTURE_BUCKET" \
+            --prefix lh_e2e/ \
+            --query "Contents[].[Key, LastModified]" \
+            --output text) || { echo "aws s3api list-objects-v2 failed" >&2; exit 1; }
+
+          stale_keys=()
+          if [ -n "$objects" ] && [ "$objects" != "None" ]; then
+            while IFS=$'\t' read -r key modified; do
+              if [ -z "$key" ]; then
+                continue
+              fi
+              modified_epoch=$(date -u -d "$modified" +%s)
+              if [ "$modified_epoch" -lt "$CUTOFF" ]; then
+                stale_keys+=("$key")
+                if [ "$DRY_RUN" = "true" ]; then
+                  echo "  would delete object: $key (last_modified=$modified)"
+                else
+                  echo "  deleting object: $key (last_modified=$modified)"
+                fi
+              fi
+            done <<< "$objects"
+          fi
+
+          obj_candidates=${#stale_keys[@]}
+          if [ "$DRY_RUN" != "true" ] && [ "$obj_candidates" -gt 0 ]; then
+            # delete-objects accepts at most 1000 keys per call.
+            for ((i = 0; i < obj_candidates; i += 1000)); do
+              payload=$(printf '%s\n' "${stale_keys[@]:i:1000}" \
+                | jq -R . \
+                | jq -s '{Objects: map({Key: .}), Quiet: true}')
+              result=$(aws s3api delete-objects \
+                --bucket "$GLUE_FIXTURE_BUCKET" \
+                --delete "$payload") || { echo "aws s3api delete-objects failed" >&2; exit 1; }
+              if [ -n "$result" ] && [ "$(echo "$result" | jq '(.Errors // []) | length')" -ne 0 ]; then
+                echo "aws s3api delete-objects reported errors: $(echo "$result" | jq -c '.Errors')" >&2
+                exit 1
+              fi
+            done
+          fi
+
+          if [ "$DRY_RUN" = "true" ]; then
+            echo "DRY-RUN complete: $db_candidates database(s) and $obj_candidates object(s) would be deleted."
+          else
+            echo "Sweep complete: $db_candidates database(s) and $obj_candidates object(s) deleted."
+          fi

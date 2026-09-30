@@ -17,6 +17,7 @@ impl FixedCatalogClient {
             format: TableFormat::Iceberg,
             vended_credential_key: None,
             partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![CatalogColumn {
                 name: "order_id".to_string(),
                 source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
@@ -35,6 +36,7 @@ impl FixedCatalogClient {
             format: TableFormat::Delta,
             vended_credential_key: Some("payments-uuid".to_string()),
             partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![CatalogColumn {
                 name: "total".to_string(),
                 source_type: ColumnSourceType::Unity {
@@ -212,6 +214,9 @@ async fn a_unity_decimal_column_carries_its_precision_and_scale() {
         ColumnSourceType::Iceberg(ty) => panic!("expected a Unity source type, got iceberg {ty}"),
         ColumnSourceType::Parquet(tag) => {
             panic!("expected a Unity source type, got a Parquet tag {tag}")
+        }
+        ColumnSourceType::Glue { hive_type } => {
+            panic!("expected a Unity source type, got a Glue type {hive_type}")
         }
     }
 }
@@ -442,6 +447,44 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
             table.ident.name
         );
     }
+}
+
+#[tokio::test]
+async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
+    let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders"], &[], &[]).await;
+    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let ident = CatalogTableIdent {
+        namespace: vec!["sales".to_string()],
+        name: "orders".to_string(),
+    };
+
+    let listing = client
+        .list_tables(&["sales".to_string()])
+        .await
+        .expect("list_tables failed");
+    let loaded = client.load_table(&ident).await.expect("load_table failed");
+
+    let expected = CatalogTable {
+        ident,
+        table_type: CatalogTableType::Table,
+        storage_location: Some("s3://bucket/orders".to_string()),
+        format: TableFormat::Iceberg,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        columns: vec![
+            CatalogColumn {
+                name: "id".to_string(),
+                source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+            },
+            CatalogColumn {
+                name: "name".to_string(),
+                source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::String)),
+            },
+        ],
+        metadata_location: None,
+    };
+    assert_eq!(listing.tables, vec![expected.clone()]);
+    assert_eq!(loaded, expected);
 }
 
 #[tokio::test]

@@ -1,7 +1,12 @@
-use super::super::super::test_support::{RecordingCatalog, sample_storage};
+use super::super::super::test_support::{
+    RecordingCatalog, load_table_body_with_columns, object_endpoint, sample_storage, user_message,
+};
 use super::*;
 use iceberg::spec::{DataContentType, DataFileFormat};
-use lakehouse_catalog::{ConnectionCreds, StorageBackend};
+use lakehouse_catalog::{
+    CatalogColumn, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
+    StorageBackend, TableFormat,
+};
 
 /// SigV4 mode makes `loadTable` the only request, so a single-shot loopback catalog suffices.
 fn one_request_sigv4_creds() -> ConnectionCreds {
@@ -77,8 +82,10 @@ async fn iceberg_reader_owns_resolution_and_keeps_its_encoding() {
         .await
         .expect("the SigV4 path resolves a session without contacting the catalog");
     let reader = IcebergFormatReader {
-        session: &session,
-        catalog_props: &catalog_props,
+        metadata: IcebergMetadataSource::RestLoadTable {
+            session: &session,
+            catalog_props: &catalog_props,
+        },
         connection: ConnectionStorage {
             storage: &storage,
             creds: &creds,
@@ -386,8 +393,10 @@ async fn effective_storage_from_loopback_catalog(
     };
     let storage = sample_storage();
     let reader = IcebergFormatReader {
-        session: &session,
-        catalog_props: &catalog_props,
+        metadata: IcebergMetadataSource::RestLoadTable {
+            session: &session,
+            catalog_props: &catalog_props,
+        },
         connection: ConnectionStorage {
             storage: &storage,
             creds,
@@ -803,8 +812,10 @@ async fn resolve_promoted_date_table(filter_json: Option<&Json>) -> Result<Resol
         .await
         .expect("the SigV4 path resolves a session without contacting the catalog");
     let reader = IcebergFormatReader {
-        session: &session,
-        catalog_props: &catalog_props,
+        metadata: IcebergMetadataSource::RestLoadTable {
+            session: &session,
+            catalog_props: &catalog_props,
+        },
         connection: ConnectionStorage {
             storage: &storage,
             creds: &creds,
@@ -855,6 +866,156 @@ async fn resolve_scan_refuses_a_promoted_date_table_for_a_filtered_request() {
     assert_promotion_refusal_names_table_column_and_issue(err);
 }
 
+fn glue_iceberg_table(name: &str, metadata_location: Option<&str>) -> CatalogTable {
+    CatalogTable {
+        ident: CatalogTableIdent {
+            namespace: vec!["db".into()],
+            name: name.into(),
+        },
+        table_type: CatalogTableType::Table,
+        storage_location: Some(format!("s3://bucket/glue-declared/{name}")),
+        format: TableFormat::Iceberg,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        columns: vec![CatalogColumn {
+            name: "glue_only".into(),
+            source_type: ColumnSourceType::Glue {
+                hive_type: "binary".into(),
+            },
+        }],
+        metadata_location: metadata_location.map(str::to_string),
+    }
+}
+
+async fn resolve_metadata_file(
+    table: &CatalogTable,
+    storage: &StorageBackend,
+) -> Result<ResolvedScan, UdfError> {
+    let creds = one_request_sigv4_creds();
+    IcebergFormatReader {
+        metadata: IcebergMetadataSource::MetadataFile { table },
+        connection: ConnectionStorage {
+            storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    }
+    .resolve_scan(None)
+    .await
+}
+
+fn metadata_of(load_table_body: &str) -> String {
+    let body: Json = serde_json::from_str(load_table_body).expect("a loadTable body");
+    body["metadata"].to_string()
+}
+
+/// Scenario: A Glue Iceberg table is planned from its metadata location by the one Iceberg planner
+#[tokio::test]
+async fn a_glue_iceberg_table_is_planned_from_its_metadata_file() {
+    let storage = object_endpoint(
+        "bucket",
+        vec![(
+            "db/t/metadata/v1.json".into(),
+            metadata_of(&name_mapped_load_table_body()),
+        )],
+    )
+    .await;
+    let creds = one_request_sigv4_creds();
+    let body = name_mapped_load_table_body();
+    let catalog = RecordingCatalog::spawn(move |_target| (200, body.clone())).await;
+    let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, &creds)
+        .await
+        .expect("the SigV4 path resolves a session without contacting the catalog");
+    let catalog_props = CatalogProps {
+        warehouse: creds.warehouse.clone(),
+        table: "db.t".into(),
+    };
+    let from_rest = IcebergFormatReader {
+        metadata: IcebergMetadataSource::RestLoadTable {
+            session: &session,
+            catalog_props: &catalog_props,
+        },
+        connection: ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    }
+    .resolve_scan(None)
+    .await
+    .expect("the REST planner resolves the table");
+
+    let from_file = resolve_metadata_file(
+        &glue_iceberg_table("t", Some("s3://bucket/db/t/metadata/v1.json")),
+        &storage,
+    )
+    .await
+    .expect("the metadata file plans the table");
+
+    assert_eq!(
+        from_file, from_rest,
+        "the one Iceberg planner plans the same metadata alike from either source"
+    );
+    assert_eq!(from_file.table_root, "s3://bucket/db/t");
+    assert!(
+        from_file
+            .logical_schema
+            .iter()
+            .all(|field| field.name != "glue_only")
+            && from_file.refused_columns.is_empty(),
+        "the metadata file, not Glue's column copy, is the schema authority"
+    );
+}
+
+#[tokio::test]
+async fn the_date_promotion_refusal_applies_to_a_metadata_file_table() {
+    let storage = object_endpoint(
+        "bucket",
+        vec![(
+            "db/promoted/metadata/v1.json".into(),
+            metadata_of(&load_table_body_with_promoted_date_column()),
+        )],
+    )
+    .await;
+
+    let promoted = resolve_metadata_file(
+        &glue_iceberg_table("promoted", Some("s3://bucket/db/promoted/metadata/v1.json")),
+        &storage,
+    )
+    .await
+    .expect_err("the date-promotion refusal applies to a metadata-file table");
+
+    assert_promotion_refusal_names_table_column_and_issue(promoted);
+}
+
+#[tokio::test]
+async fn an_unreadable_or_unset_metadata_location_fails_naming_the_table() {
+    let storage = object_endpoint("bucket", Vec::new()).await;
+
+    let missing = user_message(
+        resolve_metadata_file(
+            &glue_iceberg_table("gone", Some("s3://bucket/db/gone/metadata/v9.json")),
+            &storage,
+        )
+        .await
+        .expect_err("an unreadable metadata file fails the plan"),
+    );
+    let unset = user_message(
+        resolve_metadata_file(&glue_iceberg_table("unset", None), &storage)
+            .await
+            .expect_err("a table without a metadata location fails the plan"),
+    );
+
+    assert!(
+        missing.contains("db.gone") && missing.contains("s3://bucket/db/gone/metadata/v9.json"),
+        "{missing}"
+    );
+    assert!(unset.contains("db.unset"), "{unset}");
+    for message in [&missing, &unset] {
+        assert!(!message.contains("minioadmin"), "{message}");
+    }
+}
+
 fn load_table_body_with_readable_promotions() -> String {
     serde_json::json!({
         "metadata-location": "s3://bucket/db/t/metadata/v1.json",
@@ -903,8 +1064,10 @@ async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_typ
         .await
         .expect("the SigV4 path resolves a session without contacting the catalog");
     let reader = IcebergFormatReader {
-        session: &session,
-        catalog_props: &catalog_props,
+        metadata: IcebergMetadataSource::RestLoadTable {
+            session: &session,
+            catalog_props: &catalog_props,
+        },
         connection: ConnectionStorage {
             storage: &storage,
             creds: &creds,
@@ -954,6 +1117,117 @@ async fn a_readable_iceberg_promotion_plans_normally_and_carries_the_current_typ
         "a promotion this engine reads refuses no column: {:?}",
         resolved.refused_columns
     );
+}
+
+async fn resolve_table_with_columns(
+    fields: Json,
+    last_column_id: i32,
+) -> Result<ResolvedScan, UdfError> {
+    let creds = one_request_sigv4_creds();
+    let storage = sample_storage();
+    let catalog_props = CatalogProps {
+        warehouse: creds.warehouse.clone(),
+        table: "db.t".into(),
+    };
+    let body = load_table_body_with_columns(fields, last_column_id);
+    let catalog = RecordingCatalog::spawn(move |_target| (200, body.clone())).await;
+    let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, &creds)
+        .await
+        .expect("the SigV4 path resolves a session without contacting the catalog");
+    IcebergFormatReader {
+        metadata: IcebergMetadataSource::RestLoadTable {
+            session: &session,
+            catalog_props: &catalog_props,
+        },
+        connection: ConnectionStorage {
+            storage: &storage,
+            creds: &creds,
+            allow_http: true,
+        },
+    }
+    .resolve_scan(None)
+    .await
+}
+
+/// Scenario: A binary column is refused on every catalog-declared format at every depth
+#[tokio::test]
+async fn iceberg_binary_fixed_and_uuid_columns_are_refused() {
+    let fields = serde_json::json!([
+        {"id": 1, "name": "id", "required": false, "type": "int"},
+        {"id": 2, "name": "b", "required": false, "type": "binary"},
+        {"id": 3, "name": "f", "required": false, "type": "fixed[16]"},
+        {"id": 4, "name": "u", "required": false, "type": "uuid"},
+        {"id": 5, "name": "s", "required": false, "type": {"type": "struct", "fields": [
+            {"id": 6, "name": "ok", "required": false, "type": "string"},
+            {"id": 7, "name": "x", "required": false, "type": "binary"}
+        ]}},
+        {"id": 8, "name": "l", "required": false, "type": {
+            "type": "list", "element-id": 9, "element": "fixed[4]", "element-required": false
+        }},
+        {"id": 10, "name": "m", "required": false, "type": {
+            "type": "map", "key-id": 11, "key": "string",
+            "value-id": 12, "value": "uuid", "value-required": false
+        }},
+        {"id": 13, "name": "name", "required": false, "type": "string"}
+    ]);
+
+    let resolved = resolve_table_with_columns(fields, 13)
+        .await
+        .expect("a table with a mappable column plans, refusing only its binary columns");
+
+    assert_eq!(
+        resolved
+            .logical_schema
+            .iter()
+            .map(|field| (field.name.as_str(), field.field_id))
+            .collect::<Vec<_>>(),
+        vec![("id", Some(1)), ("name", Some(13))],
+        "every refused column is dropped from the logical schema, and nothing else"
+    );
+    let refused = |column: &str, member: Option<&str>, declared: &str| RefusedColumn {
+        column_name: column.to_string(),
+        reason: match member {
+            Some(member) => format!(
+                "Iceberg column '{column}', whose member '{member}' {}",
+                binary_cause(declared)
+            ),
+            None => format!("Iceberg column '{column}' {}", binary_cause(declared)),
+        },
+    };
+    assert_eq!(
+        resolved.refused_columns,
+        vec![
+            refused("b", None, "binary"),
+            refused("f", None, "fixed(16)"),
+            refused("u", None, "uuid"),
+            refused("s", Some("s.x"), "binary"),
+            refused("l", Some("l.element"), "fixed(4)"),
+            refused("m", Some("m.value"), "uuid"),
+        ],
+        "each binary column is refused by name, naming its declared type, its member path, and \
+         issue #351"
+    );
+}
+
+/// Scenario: A binary column is refused on every catalog-declared format at every depth
+#[tokio::test]
+async fn an_iceberg_table_whose_every_column_is_binary_is_refused_as_a_whole() {
+    let fields = serde_json::json!([
+        {"id": 1, "name": "b", "required": false, "type": "binary"},
+        {"id": 2, "name": "u", "required": false, "type": "uuid"}
+    ]);
+
+    let error = resolve_table_with_columns(fields, 2)
+        .await
+        .expect_err("a table with no mappable column cannot be scanned");
+
+    let message = error.to_string();
+    for fragment in ["Iceberg table has no mappable column", "'b'", "'u'", "#351"] {
+        assert!(
+            message.contains(fragment),
+            "'{fragment}' missing from: {message}"
+        );
+    }
 }
 
 #[test]

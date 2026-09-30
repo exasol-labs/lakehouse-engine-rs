@@ -338,6 +338,7 @@ fn build_adapter_notes_merges_existing() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &[],
+        &[],
     );
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -367,6 +368,7 @@ fn adapter_notes_omit_cluster_nodes() {
         DEFAULT_INSTANCE_OVERHEAD_MB,
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &[],
         &[],
     );
     let parsed: serde_json::Value =
@@ -408,6 +410,7 @@ fn refresh_rebuilds_table_map_preserves_notes() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &fresh_table_map,
+        &[],
     );
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -456,6 +459,7 @@ fn create_vs_records_parallelism_factor() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &[],
+        &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
     let parsed: serde_json::Value =
@@ -495,6 +499,7 @@ fn adapter_notes_carry_parallelism_factor() {
         DEFAULT_INSTANCE_OVERHEAD_MB,
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &[],
         &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -619,6 +624,7 @@ fn df_target_partitions_uses_supplied_value() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &[],
+        &[],
     );
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -661,6 +667,7 @@ fn df_batch_size_uses_supplied_value() {
         DEFAULT_INSTANCE_OVERHEAD_MB,
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &[],
         &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -718,6 +725,7 @@ fn df_threads_per_udf_uses_supplied_value() {
         DEFAULT_INSTANCE_OVERHEAD_MB,
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &[],
         &[],
     );
     let parsed: serde_json::Value =
@@ -876,6 +884,7 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
         DEFAULT_S3_MAX_CONNECTIONS,
         67_108_864,
         &[],
+        &[],
     );
 
     let pushdown_req = serde_json::json!({
@@ -904,6 +913,7 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
         256,
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &[],
         &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1034,6 +1044,7 @@ fn threading_mode_defaults_to_auto() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &[],
+        &[],
     );
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -1122,6 +1133,7 @@ fn table_map_round_trips_through_adapter_notes() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &table_map,
+        &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
@@ -1159,6 +1171,7 @@ fn table_map_stored_as_nested_json_object() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &table_map,
+        &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
     let parsed: serde_json::Value =
@@ -1194,6 +1207,7 @@ fn table_map_merges_with_existing_notes() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &[("T".to_string(), "ns.t".to_string())],
+        &[],
     );
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
@@ -1239,6 +1253,7 @@ fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &st
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         table_map,
+        &[],
     );
     let notes_str = notes.as_str().unwrap().to_string();
     serde_json::json!({
@@ -1372,6 +1387,7 @@ fn create_vs_records_table_map_in_adapter_notes() {
         DEFAULT_S3_MAX_CONNECTIONS,
         DEFAULT_JOIN_BROADCAST_MAX_BYTES,
         &table_map,
+        &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
     let parsed: serde_json::Value =
@@ -1414,6 +1430,7 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
             format: TableFormat::Iceberg,
             vended_credential_key: None,
             partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![
                 CatalogColumn {
                     name: "order_id".to_string(),
@@ -1488,6 +1505,240 @@ fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
         }),
         "createVirtualSchema: skipping non-Delta-base entry 'prod.finance.orders_summary' (table_type=VIEW)"
     );
+}
+
+#[test]
+fn skip_warning_renders_the_glue_detail_line() {
+    assert_eq!(
+        skip_warning(&SkippedTable {
+            ident: cat_ident(&["sales"], "orders_orc"),
+            reason: SkipReason::NotPlannableGlueTable {
+                detail: "InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat".to_string(),
+            },
+        }),
+        "createVirtualSchema: skipping Glue table 'sales.orders_orc' (InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat)"
+    );
+}
+
+fn skipped_entry(table: &str, reason: SkipReason) -> SkippedTable {
+    SkippedTable {
+        ident: cat_ident(&["sales"], table),
+        reason,
+    }
+}
+
+fn notes_with_skipped(
+    request: &Json,
+    table_map: &[(String, String)],
+    skipped: &[SkippedTable],
+) -> Json {
+    let notes = build_adapter_notes(
+        request,
+        DEFAULT_PARALLELISM_FACTOR,
+        ThreadingMode::Auto,
+        DEFAULT_DF_TARGET_PARTITIONS,
+        DEFAULT_DF_THREADS_PER_UDF,
+        DEFAULT_DF_BATCH_SIZE,
+        DEFAULT_MEMORY_POOL_FRACTION,
+        DEFAULT_INSTANCE_OVERHEAD_MB,
+        DEFAULT_S3_MAX_CONNECTIONS,
+        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        table_map,
+        skipped,
+    );
+    serde_json::from_str(notes.as_str().unwrap()).expect("adapterNotes is a JSON string")
+}
+
+/// Scenario: Every skipped table is recorded with its reason under every catalog kind
+#[test]
+fn skipped_tables_are_recorded_with_reasons_for_every_kind() {
+    let skipped = vec![
+        skipped_entry("hive_events", SkipReason::NotLoadableIcebergTable),
+        skipped_entry(
+            "summary",
+            SkipReason::NotDeltaBaseTable {
+                detail: "table_type=VIEW".to_string(),
+            },
+        ),
+        skipped_entry("empty_dir", SkipReason::NoDataFile),
+        skipped_entry(
+            "orders_orc",
+            SkipReason::NotPlannableGlueTable {
+                detail: "InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat".to_string(),
+            },
+        ),
+        skipped_entry(
+            "projected",
+            SkipReason::NotPlannableGlueTable {
+                detail: "projection.enabled=true".to_string(),
+            },
+        ),
+    ];
+
+    let parsed = notes_with_skipped(&json!({"type": "createVirtualSchema"}), &[], &skipped);
+
+    let recorded = parsed["SKIPPED_TABLES"].as_array().expect("an array");
+    let expected = [
+        (
+            "sales.hive_events",
+            "catalog reported it is not a loadable Iceberg table",
+        ),
+        ("sales.summary", "table_type=VIEW"),
+        ("sales.empty_dir", "holds no data file"),
+        (
+            "sales.orders_orc",
+            "InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",
+        ),
+        ("sales.projected", "projection.enabled=true"),
+    ];
+    assert_eq!(recorded.len(), expected.len());
+    for ((table, reason), (entry, source)) in expected.iter().zip(recorded.iter().zip(&skipped)) {
+        assert_eq!(entry, &json!({"table": table, "reason": reason}));
+        assert!(
+            skip_warning(source).contains(&format!("({reason})")),
+            "the warning line must state the same reason as the note"
+        );
+    }
+}
+
+/// Scenario: A listing with no skip records an empty list that replaces the previous one
+#[test]
+fn a_listing_without_skips_records_an_empty_list_replacing_the_previous() {
+    let request = json!({
+        "type": "refresh",
+        "schemaMetadataInfo": {
+            "adapterNotes": json!({
+                "SKIPPED_TABLES": [
+                    {"table": "sales.a", "reason": "holds no data file"},
+                    {"table": "sales.b", "reason": "holds no data file"},
+                ],
+                "TABLE_MAP": {"STALE": "sales.stale"},
+            })
+            .to_string()
+        },
+    });
+    let table_map = vec![("FRESH".to_string(), "sales.fresh".to_string())];
+
+    let parsed = notes_with_skipped(&request, &table_map, &[]);
+
+    assert_eq!(parsed["SKIPPED_TABLES"], json!([]));
+    assert_eq!(parsed["TABLE_MAP"], json!({"FRESH": "sales.fresh"}));
+}
+
+/// Scenario: A namespace whose every table is skipped still creates an empty virtual schema
+#[test]
+fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
+    let listing = CatalogListing {
+        tables: Vec::new(),
+        skipped: vec![
+            skipped_entry("a", SkipReason::NoDataFile),
+            skipped_entry("b", SkipReason::NotLoadableIcebergTable),
+        ],
+    };
+
+    let (tables_json, table_map, skipped) = build_listing_virtual_tables(
+        &["sales".to_string()],
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .expect("an all-skipped namespace must not fail the listing");
+    let parsed = notes_with_skipped(
+        &json!({"type": "createVirtualSchema"}),
+        &table_map,
+        &skipped,
+    );
+
+    assert!(tables_json.is_empty());
+    assert_eq!(parsed["TABLE_MAP"], json!({}));
+    assert_eq!(parsed["SKIPPED_TABLES"].as_array().unwrap().len(), 2);
+}
+
+/// Scenario: A skipped-table list too long for adapterNotes is capped to the longest prefix that fits
+#[test]
+fn an_oversized_skipped_list_is_capped_to_the_longest_prefix_that_fits_the_exasol_limit() {
+    for filler in ["0", "é"] {
+        let total = 15_000;
+        let skipped: Vec<SkippedTable> = (0..total)
+            .map(|i| {
+                skipped_entry(
+                    &format!("{i:0>80}{}", filler.repeat(40)),
+                    SkipReason::NoDataFile,
+                )
+            })
+            .collect();
+
+        let notes = build_adapter_notes(
+            &json!({"type": "createVirtualSchema"}),
+            DEFAULT_PARALLELISM_FACTOR,
+            ThreadingMode::Auto,
+            DEFAULT_DF_TARGET_PARTITIONS,
+            DEFAULT_DF_THREADS_PER_UDF,
+            DEFAULT_DF_BATCH_SIZE,
+            DEFAULT_MEMORY_POOL_FRACTION,
+            DEFAULT_INSTANCE_OVERHEAD_MB,
+            DEFAULT_S3_MAX_CONNECTIONS,
+            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            &[],
+            &skipped,
+        );
+        let text = notes.as_str().expect("adapterNotes is a JSON string");
+        let parsed: Json = serde_json::from_str(text).expect("valid JSON");
+
+        let recorded = parsed["SKIPPED_TABLES"].as_array().expect("an array");
+        let kept = recorded.len();
+        assert!(kept > 0 && kept < total, "{filler}: kept {kept} of {total}");
+        assert!(
+            text.len() <= ADAPTER_NOTES_MAX_BYTES,
+            "{filler}: {} bytes",
+            text.len()
+        );
+        assert_eq!(
+            parsed["SKIPPED_TABLES_OMITTED"],
+            json!((total - kept).to_string())
+        );
+        for (entry, source) in recorded.iter().zip(&skipped) {
+            assert_eq!(entry["table"], catalog_identifier_string(&source.ident));
+        }
+        let mut one_more = parsed.clone();
+        one_more["SKIPPED_TABLES"]
+            .as_array_mut()
+            .expect("an array")
+            .push(json!({
+                "table": catalog_identifier_string(&skipped[kept].ident),
+                "reason": skip_reason(&skipped[kept]),
+            }));
+        let still_omitted = total - kept - 1;
+        if still_omitted == 0 {
+            one_more
+                .as_object_mut()
+                .expect("an object")
+                .remove("SKIPPED_TABLES_OMITTED");
+        } else {
+            one_more["SKIPPED_TABLES_OMITTED"] = json!(still_omitted.to_string());
+        }
+        let with_one_more = one_more.to_string().len();
+        assert!(
+            with_one_more > ADAPTER_NOTES_MAX_BYTES,
+            "{filler}: one more entry would still fit ({with_one_more} bytes)"
+        );
+    }
+}
+
+/// Scenario: A skipped-table list too long for adapterNotes is capped to the longest prefix that fits
+#[test]
+fn a_skipped_list_that_fits_keeps_every_entry_and_drops_a_stale_omitted_count() {
+    let request = json!({
+        "type": "refresh",
+        "schemaMetadataInfo": {
+            "adapterNotes": json!({ "SKIPPED_TABLES_OMITTED": "7" }).to_string()
+        },
+    });
+    let skipped = vec![skipped_entry("a", SkipReason::NoDataFile)];
+
+    let parsed = notes_with_skipped(&request, &[], &skipped);
+
+    assert_eq!(parsed["SKIPPED_TABLES"].as_array().unwrap().len(), 1);
+    assert!(parsed.get("SKIPPED_TABLES_OMITTED").is_none());
 }
 
 #[test]

@@ -1,7 +1,10 @@
 //! Arrow-to-Exasol type mapping shared by `createVirtualSchema` and the scan's Arrow→Value
 //! conversion. Pure: no I/O.
 use arrow::datatypes::{DataType, TimeUnit};
+use delta_kernel::schema::{DataType as SparkType, PrimitiveType as SparkPrimitive};
 use lakehouse_catalog::ColumnSourceType;
+
+use super::hive_type::parse_hive_type;
 use serde_json::{Value as Json, json};
 
 /// Returns `"VARCHAR(2000000)"` for every incompatible Arrow type rather than erroring;
@@ -404,7 +407,55 @@ pub(crate) fn column_source_type_to_exasol(
             engine,
         ),
         ColumnSourceType::Parquet(tag) => arrow_to_exasol_type(&arrow_type_from_tag(tag)),
+        ColumnSourceType::Glue { hive_type } => hive_type_to_exasol(hive_type, engine),
     }
+}
+
+/// Declares a Glue column as the Unity listing declares the same Spark type; a nested or
+/// unparseable type declares VARCHAR(2000000), so a column type never fails the listing.
+fn hive_type_to_exasol(hive_type: &str, engine: EngineTimestampSupport) -> String {
+    match parse_hive_type(hive_type) {
+        Ok(SparkType::Primitive(primitive)) => {
+            let (type_name, decimal) = spark_primitive_type_name(&primitive);
+            unity_type_name_to_exasol(type_name, decimal, engine)
+        }
+        _ => "VARCHAR(2000000)".to_string(),
+    }
+}
+
+fn spark_primitive_type_name(primitive: &SparkPrimitive) -> (&'static str, CatalogDecimal) {
+    let type_name = match primitive {
+        SparkPrimitive::Decimal(decimal) => {
+            return (
+                "DECIMAL",
+                CatalogDecimal {
+                    precision: decimal.precision().into(),
+                    scale: decimal.scale().into(),
+                },
+            );
+        }
+        SparkPrimitive::Byte => "BYTE",
+        SparkPrimitive::Short => "SHORT",
+        SparkPrimitive::Integer => "INT",
+        SparkPrimitive::Long => "LONG",
+        SparkPrimitive::Float => "FLOAT",
+        SparkPrimitive::Double => "DOUBLE",
+        SparkPrimitive::Boolean => "BOOLEAN",
+        SparkPrimitive::String => "STRING",
+        SparkPrimitive::Date => "DATE",
+        SparkPrimitive::Timestamp => "TIMESTAMP",
+        SparkPrimitive::TimestampNtz => "TIMESTAMP_NTZ",
+        SparkPrimitive::Binary => "BINARY",
+        SparkPrimitive::Void => "VOID",
+        SparkPrimitive::IntervalYearMonth | SparkPrimitive::IntervalDayTime => "INTERVAL",
+    };
+    (
+        type_name,
+        CatalogDecimal {
+            precision: 0,
+            scale: 0,
+        },
+    )
 }
 
 /// Unmappable Spark types fall back to VARCHAR(2000000) rather than failing enumeration.
