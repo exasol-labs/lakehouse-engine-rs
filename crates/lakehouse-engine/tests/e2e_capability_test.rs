@@ -3890,8 +3890,10 @@ fn assert_scan_spec_carries_exa_to_varchar(conn: &mut ExaConn, sql: &str) {
     );
 }
 
-/// The spec's captured DOUBLE texts, each with the text Exasol produced live.
-const DOUBLE_PARITY_CORPUS: [(f64, &str); 27] = [
+/// The spec's captured DOUBLE texts, each with the text Exasol produced live. `1e-14` is
+/// omitted: Exasol parses that literal to either neighbouring double depending on the runner;
+/// `double_text_tests.rs` pins its text on both sides.
+const DOUBLE_PARITY_CORPUS: [(f64, &str); 26] = [
     (0.5, "0.5"),
     (-0.5, "-0.5"),
     (5.0, "5"),
@@ -3911,7 +3913,6 @@ const DOUBLE_PARITY_CORPUS: [(f64, &str); 27] = [
     (1e-16, "9.99999999999999e-17"),
     (999_999_999_999_999.5, "1000000000000000"),
     (f64::MAX, "1.79769313486232e308"),
-    (1e-14, "1e-14"),
     (1e89, "1e89"),
     (1e-300, "1e-300"),
     (1e300, "1e300"),
