@@ -16,7 +16,7 @@ use common::seed::{
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
 };
-use common::timestamp_precision::expected_timestamp_precision;
+use common::timestamp_precision::{expected_timestamp_precision, live_engine_version};
 
 use std::sync::OnceLock;
 
@@ -3816,6 +3816,17 @@ fn e2e_max_instr_with_start_position_matches_native() {
 fn e2e_ungrouped_aggregate_all_files_pruned_returns_one_row() {
     setup_e2e();
     let mut conn = exa_conn();
+
+    // Exasol 8.x rejects TIMESTAMP(p) (0A000), so this RowScan shape cannot occur there; the
+    // INSTR variant below covers the scenario on every engine.
+    if live_engine_version(&mut conn)
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major < 2025)
+    {
+        return;
+    }
 
     let oracle_sql = format!(
         "SELECT MAX(CAST(C_TS AS TIMESTAMP(4))), COUNT(*) FROM \
