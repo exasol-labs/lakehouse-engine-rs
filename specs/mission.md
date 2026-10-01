@@ -50,11 +50,14 @@ Exasol SQL at cluster scale, with no copy, no caching, and no separate query sta
 6. **Correct read path** — applies Iceberg positional/row-level deletes and Delta deletion vectors
    (`datafusion-scan/scan-execution-delta-deletion-vectors`) at scan time, so results reflect
    current table state rather than raw Parquet file content.
-7. **Iceberg and Unity Catalog access** — query Apache Iceberg tables through an Iceberg REST
+7. **Iceberg, Unity Catalog, and AWS Glue access** — query Apache Iceberg tables through an Iceberg REST
    catalog and Delta tables through a Unity Catalog, Databricks-managed or self-hosted OSS, through
    the same engine. A Databricks-managed table is reached by one of two routes, chosen by the
    configured `CATALOG_KIND`: Iceberg REST via `iceberg-rust`, or native Unity Catalog via
-   `delta-kernel-rs`.
+   `delta-kernel-rs`. `CATALOG_KIND = 'GLUE'` reads the AWS Glue Data Catalog through its native API.
+   An Iceberg table plans from the metadata file Glue points to. A Hive Parquet table plans from its
+   registered partitions. The adapter signs every Glue request with AWS SigV4. It reads storage with
+   the CONNECTION's static credentials, because the Glue kind has no credential vending.
 8. **Bounded, self-throttling execution** — the scan UDF sizes its DataFusion memory pool from the per-instance memory limit reported in UDF metadata (a fraction of it, leaving headroom below the engine's 80% concurrency-stall threshold) and adds a spill backstop: when `/tmp` is real disk it spills (queries complete at any group cardinality); when it is not, a bounded pool returns a clean `ResourcesExhausted` error instead of OOM-crashing. Oversubscribed work-unit sharding (`GROUP BY shard_key`, G = node_count × parallelism_factor capped at 300) shrinks each instance's footprint and lets the engine multiplex shard groups onto each node's core pool. Bounding is not only UDF-side: the scan entry point emits as a SCALAR (not SET) script, so Exasol streams each shard's output rather than materializing the raw-row result into growing temp-DB RAM — keeping engine-side scan-output memory constant regardless of scanned data volume.
 
 ## Out of Scope
@@ -90,14 +93,14 @@ Every query is executed independently, starts from source metadata, and leaves n
 |-------|------------|---------|
 | Language | Rust (edition 2024) | UDF + VS adapter implementation |
 | Query engine | DataFusion + Arrow/Parquet 58 | Node-local vectorized scan & pushdown execution |
-| Lakehouse | `iceberg-rust` (Iceberg REST catalog, incl. Databricks-managed Iceberg) + `delta-kernel-rs` 0.26 (Delta tables via native Unity Catalog) | Snapshot discovery, file resolution, table registration |
+| Lakehouse | `iceberg-rust` (Iceberg REST catalog, incl. Databricks-managed Iceberg) + `delta-kernel-rs` 0.26 (Delta tables via native Unity Catalog) + `aws-sdk-glue` (AWS Glue Data Catalog: Iceberg and Hive Parquet tables) | Snapshot discovery, file resolution, table registration |
 | UDF runtime | `exasol-udf-sdk` 0.30.0 (connect-back), `exasol-udf-macros`; language-container-rs Rust SLC | Rust UDF ABI, `ctx.emit`, connect-back SQL session |
 | Build | `rust:1.94-trixie` (glibc 2.41) in Docker | Builds `.so` matching the SLC; never built on host |
 | Testing | `cargo test`; E2E against a local Exasol Docker container | Unit + cluster behavior validation |
 
 > The Rust SLC and UDF runtime come from `language-container-rs`; this engine follows its UDF
 > programming model and build/E2E workflow. `crates/vs-expression` (expression translation) and
-> `crates/lakehouse-catalog` (Iceberg REST + Unity Catalog access) are workspace-internal splits from
+> `crates/lakehouse-catalog` (Iceberg REST, Unity Catalog, and AWS Glue access) are workspace-internal splits from
 > `crates/lakehouse-engine`; all three build into the one `.so` that carries all three UDF entry points.
 
 ## Commands
@@ -123,7 +126,7 @@ lakehouse-engine/
 ├── specs/                  # mission.md and spec library (speq)
 ├── crates/
 │   ├── lakehouse-engine/   # Iceberg + Delta file planning, scan-spec wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan
-│   ├── lakehouse-catalog/  # Iceberg REST + Unity Catalog access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
+│   ├── lakehouse-catalog/  # Iceberg REST, Unity Catalog, and AWS Glue access: CatalogSession, auth, namespace enumeration, vended-storage resolution, SigV4 signing
 │   └── vs-expression/      # expression-translation crate
 ├── Cargo.toml      # workspace manifest
 └── Makefile        # cross-udf-build, test-e2e
@@ -169,10 +172,11 @@ simultaneously. No state survives query completion.
 |---------|---------|----------------|
 | Iceberg REST catalog | Snapshot discovery, file list resolution for Iceberg tables | No Iceberg query can be planned or executed |
 | Unity Catalog | Table version / log replay, file list resolution for Delta tables | No Delta/Unity query can be planned or executed |
+| AWS Glue Data Catalog | Table listing and routing, Iceberg metadata location, Hive Parquet partition list | No `GLUE`-kind query can be planned or executed |
 | Databricks (Iceberg REST or Unity Catalog) | Databricks-managed table access via either catalog kind | Databricks queries fail on both catalog-kind routes; the non-Databricks Iceberg REST catalog and Unity Catalog dependencies above are unaffected |
 | Object storage (S3-compatible) | Parquet file data | Scans fail / stall; this is a measured bottleneck risk |
 | Exasol cluster + Rust SLC (BucketFS) | UDF execution substrate | No execution; the substrate under test |
 
-> Catalog and object-storage access is authenticated (REST-catalog OAuth2/bearer credentials;
+> Catalog and object-storage access is authenticated (REST-catalog OAuth2/bearer credentials; AWS SigV4 for Glue;
 > cloud-native credential mechanisms such as vended/STS credentials for object storage) — an auth
 > failure has the same failure impact as the underlying dependency being unavailable.

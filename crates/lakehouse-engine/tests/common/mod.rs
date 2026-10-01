@@ -13,6 +13,8 @@
 
 #[cfg(feature = "azure-e2e")]
 pub mod azure;
+#[cfg(any(feature = "azure-e2e", feature = "glue-e2e"))]
+pub mod cloud_fixture;
 #[cfg(any(
     feature = "exasol-e2e",
     feature = "lakekeeper-e2e",

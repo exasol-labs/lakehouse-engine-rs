@@ -1,7 +1,6 @@
 use std::collections::BTreeMap;
 
 use super::*;
-use crate::TableFormat;
 
 const ORC_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
 const TABLE: &str = "sales.events";
@@ -50,7 +49,6 @@ fn partitions_carry_glue_values_the_default_partition_as_null_and_their_own_form
                     ("p_str", Some("a")),
                 ]),
                 location: "s3://bucket/events/p_int=7/p_date=2024-07-07/p_str=z".to_string(),
-                format: Some(TableFormat::Parquet),
                 input_format: PARQUET_INPUT_FORMAT.to_string(),
             },
         ),
@@ -67,7 +65,6 @@ fn partitions_carry_glue_values_the_default_partition_as_null_and_their_own_form
                     ("p_str", Some("b")),
                 ]),
                 location: "s3://bucket/events/p_int=__HIVE_DEFAULT_PARTITION__".to_string(),
-                format: Some(TableFormat::Parquet),
                 input_format: PARQUET_INPUT_FORMAT.to_string(),
             },
         ),
@@ -84,7 +81,6 @@ fn partitions_carry_glue_values_the_default_partition_as_null_and_their_own_form
                     ("p_str", Some("c")),
                 ]),
                 location: "s3://other/elsewhere".to_string(),
-                format: Some(TableFormat::Parquet),
                 input_format: PARQUET_INPUT_FORMAT.to_string(),
             },
         ),
@@ -101,14 +97,19 @@ fn partitions_carry_glue_values_the_default_partition_as_null_and_their_own_form
                     ("p_str", Some("z")),
                 ]),
                 location: "s3://bucket/events/p_int=9".to_string(),
-                format: None,
                 input_format: ORC_INPUT_FORMAT.to_string(),
             },
         ),
     ];
 
     for (glue, expected) in cases {
-        assert_eq!(neutral(&glue), Ok(expected));
+        let neutral = neutral(&glue).expect("a well-formed partition converts");
+        assert_eq!(
+            neutral.is_parquet(),
+            neutral.input_format == PARQUET_INPUT_FORMAT,
+            "only the mapred Parquet input format reads as Parquet"
+        );
+        assert_eq!(neutral, expected);
     }
 }
 

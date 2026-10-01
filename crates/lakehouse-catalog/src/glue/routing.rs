@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 
-use crate::TableFormat;
-
-pub(super) const PARQUET_INPUT_FORMAT: &str =
+pub(crate) const PARQUET_INPUT_FORMAT: &str =
     "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat";
 
 const VIEW_TABLE_TYPE: &str = "VIRTUAL_VIEW";
@@ -39,10 +37,6 @@ pub(super) fn route(
     }
 }
 
-pub(super) fn format_of_input_format(input_format: &str) -> Option<TableFormat> {
-    (input_format == PARQUET_INPUT_FORMAT).then_some(TableFormat::Parquet)
-}
-
 fn iceberg_route(table_type: &str, metadata_location: Option<&str>) -> Route {
     match metadata_location.filter(|location| !location.trim().is_empty()) {
         Some(location) => Route::Iceberg {
@@ -56,7 +50,7 @@ fn iceberg_route(table_type: &str, metadata_location: Option<&str>) -> Route {
 }
 
 fn hive_route(input_format: Option<&str>, projection_enabled: Option<&str>) -> Route {
-    let Some(TableFormat::Parquet) = input_format.and_then(format_of_input_format) else {
+    if input_format != Some(PARQUET_INPUT_FORMAT) {
         return Route::Skip(format!("InputFormat={}", input_format.unwrap_or("absent")));
     };
     match projection_enabled {

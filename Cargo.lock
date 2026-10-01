@@ -3320,7 +3320,6 @@ dependencies = [
  "exasol-udf-macros",
  "exasol-udf-sdk",
  "futures",
- "glob",
  "hkdf",
  "iceberg",
  "iceberg-catalog-rest",

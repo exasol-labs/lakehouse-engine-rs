@@ -35,36 +35,16 @@ pub struct DirectoryOptions {
 /// Decides whether to keep a file, given its filled partition values; runs before any footer read.
 pub type PartitionKeepPredicate = dyn Fn(&BTreeMap<String, Option<String>>) -> bool + Send + Sync;
 
-/// Which listed objects are data files: a glob over the path below the listed prefix, whose `*`
-/// never crosses a `/`. Internal, so no virtual-schema property can set it.
+/// Which listed objects below the prefix are data files. Internal, so no virtual-schema property
+/// can set it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FilePattern(&'static str);
-
-impl FilePattern {
+pub enum FilePattern {
     /// Direct storage and Unity Parquet read Spark- and Hive-written `.parquet` trees.
-    pub const PARQUET_AT_ANY_DEPTH: Self = Self("**/*.parquet");
+    ParquetAtAnyDepth,
     /// A Glue partition location's data files: Trino writes extensionless ones, and a nested
     /// partition location must not be read twice.
-    pub const ANY_DIRECT_CHILD: Self = Self("*");
-
-    /// Without a `**` segment only the prefix's direct children can match, so a delimiter listing
-    /// fetches no object below a subdirectory.
-    fn lists_recursively(self) -> bool {
-        self.0.split('/').any(|segment| segment == "**")
-    }
-
-    fn matcher(self) -> Result<glob::Pattern, UdfError> {
-        glob::Pattern::new(self.0).map_err(|error| {
-            UdfError::User(format!("invalid data-file pattern '{}': {error}", self.0))
-        })
-    }
+    AnyDirectChild,
 }
-
-const FILE_PATTERN_OPTIONS: glob::MatchOptions = glob::MatchOptions {
-    case_sensitive: true,
-    require_literal_separator: true,
-    require_literal_leading_dot: false,
-};
 
 /// An object the plain listing step keeps as a data file.
 pub struct ListedFile {
@@ -121,9 +101,8 @@ pub fn store_prefix(uri: &str) -> Result<StorePath, UdfError> {
         .map_err(|e| UdfError::User(format!("invalid storage path in '{uri}': {e}")))
 }
 
-/// A catalog-registered location as its store root and raw object key. Unlike [`store_prefix`],
-/// the key is never percent-decoded, because a Glue location names the literal key; `s3a` reads as
-/// `s3`.
+/// A Glue location names the literal object key, so unlike [`store_prefix`] the key is never
+/// percent-decoded; `s3a` reads as `s3`.
 pub fn raw_location_prefix(location: &str) -> Result<(String, StorePath), UdfError> {
     let refused =
         |cause: String| UdfError::User(format!("invalid storage location '{location}': {cause}"));
@@ -265,7 +244,7 @@ async fn list_data_files(
     prefix: &StorePath,
     hive_partitioning: bool,
 ) -> Result<Vec<RawFile>, UdfError> {
-    let listed = list_location_files(store, prefix, FilePattern::PARQUET_AT_ANY_DEPTH).await?;
+    let listed = list_location_files(store, prefix, FilePattern::ParquetAtAnyDepth).await?;
     Ok(listed
         .into_iter()
         .map(|file| RawFile {
@@ -280,22 +259,20 @@ async fn list_data_files(
         .collect())
 }
 
-/// The data files below `prefix` that `pattern` selects, sorted by path. Under every pattern, an
-/// object with a segment below the prefix starting with `_` or `.`, or holding zero bytes (a
-/// Hadoop `_$folder$` marker or an empty file), is never a data file.
+/// Sorted by path. A segment below the prefix starting with `_` or `.`, or a zero-byte object (a
+/// Hadoop `_$folder$` marker), is never a data file.
 pub async fn list_location_files(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,
     pattern: FilePattern,
 ) -> Result<Vec<ListedFile>, UdfError> {
-    let matcher = pattern.matcher()?;
-    let listed: Vec<object_store::ObjectMeta> = if pattern.lists_recursively() {
-        store.list(Some(prefix)).try_collect().await
-    } else {
-        store
+    // A delimiter listing fetches no object below a subdirectory.
+    let listed: Vec<object_store::ObjectMeta> = match pattern {
+        FilePattern::ParquetAtAnyDepth => store.list(Some(prefix)).try_collect().await,
+        FilePattern::AnyDirectChild => store
             .list_with_delimiter(Some(prefix))
             .await
-            .map(|listing| listing.objects)
+            .map(|listing| listing.objects),
     }
     .map_err(|e| UdfError::User(format!("failed to list '{prefix}': {e}")))?;
 
@@ -303,8 +280,11 @@ pub async fn list_location_files(
         .into_iter()
         .filter(|meta| meta.size > 0)
         .filter(|meta| {
-            data_file_segments(&meta.location, prefix).is_some_and(|segments| {
-                matcher.matches_with(&segments.join("/"), FILE_PATTERN_OPTIONS)
+            data_file_segments(&meta.location, prefix).is_some_and(|segments| match pattern {
+                FilePattern::ParquetAtAnyDepth => segments
+                    .last()
+                    .is_some_and(|name| name.ends_with(".parquet")),
+                FilePattern::AnyDirectChild => segments.len() == 1,
             })
         })
         .map(|meta| ListedFile {

@@ -13,20 +13,6 @@ pub(super) struct RecordingCatalog {
     bodies: Arc<Mutex<Vec<String>>>,
 }
 
-fn request_is_complete(raw: &[u8]) -> bool {
-    let text = String::from_utf8_lossy(raw);
-    let Some((head, body)) = text.split_once("\r\n\r\n") else {
-        return false;
-    };
-    let content_length = head
-        .lines()
-        .filter_map(|line| line.split_once(':'))
-        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .and_then(|(_, value)| value.trim().parse::<usize>().ok())
-        .unwrap_or(0);
-    body.len() >= content_length
-}
-
 impl RecordingCatalog {
     pub(super) async fn spawn<F>(responder: F) -> Self
     where
@@ -45,27 +31,11 @@ impl RecordingCatalog {
         let recorded_bodies = bodies.clone();
         tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                let mut raw_bytes = Vec::new();
-                let mut buf = vec![0u8; 8192];
-                loop {
-                    let read = stream.read(&mut buf).await.unwrap_or(0);
-                    if read == 0 {
-                        break;
-                    }
-                    raw_bytes.extend_from_slice(&buf[..read]);
-                    if request_is_complete(&raw_bytes) {
-                        break;
-                    }
-                }
-                if raw_bytes.is_empty() {
+                let Some((head, request_body)) = read_http_request(&mut stream).await else {
                     continue;
-                }
-                let raw = String::from_utf8_lossy(&raw_bytes).to_string();
-                let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
-                let request_body = raw
-                    .split_once("\r\n\r\n")
-                    .map_or("", |(_, body)| body)
-                    .to_string();
+                };
+                let target = head.split_whitespace().nth(1).unwrap_or("").to_string();
+                let request_body = String::from_utf8_lossy(&request_body).into_owned();
                 let (status, body) = responder(&target);
                 recorded.lock().expect("recorded targets").push(target);
                 recorded_bodies
@@ -356,9 +326,17 @@ impl GlueEndpoint {
             while let Ok((mut stream, _)) = listener.accept().await {
                 let (recorded, responder) = (recorded.clone(), responder.clone());
                 tokio::spawn(async move {
-                    let Some((Some(operation), body)) = read_glue_request(&mut stream).await else {
+                    let Some((head, body)) = read_http_request(&mut stream).await else {
                         return;
                     };
+                    let Some(operation) = header(&head, "x-amz-target")
+                        .and_then(|target| target.strip_prefix("AWSGlue."))
+                        .map(str::to_string)
+                    else {
+                        return;
+                    };
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&body).expect("a Glue request body is JSON");
                     let response = responder(&operation).to_string();
                     recorded
                         .lock()
@@ -390,11 +368,9 @@ impl GlueEndpoint {
     }
 }
 
-/// Reads the whole request, body included: closing a socket with unread bytes resets it
-/// before the client reads the response.
-async fn read_glue_request(
-    stream: &mut tokio::net::TcpStream,
-) -> Option<(Option<String>, serde_json::Value)> {
+/// The request head and its whole body: closing a socket with unread bytes resets it before the
+/// client reads the response.
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
     let mut raw = Vec::new();
     let mut chunk = [0u8; 4096];
     let head_end = loop {
@@ -408,13 +384,7 @@ async fn read_glue_request(
         raw.extend_from_slice(&chunk[..read]);
     };
     let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
-    let header = |name: &str| {
-        head.split("\r\n")
-            .filter_map(|line| line.split_once(':'))
-            .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
-            .map(|(_, value)| value.trim().to_string())
-    };
-    let content_length: usize = header("content-length")
+    let content_length: usize = header(&head, "content-length")
         .and_then(|length| length.parse().ok())
         .unwrap_or(0);
     let mut body = raw[head_end + 4..].to_vec();
@@ -425,12 +395,14 @@ async fn read_glue_request(
         }
         body.extend_from_slice(&chunk[..read]);
     }
-    let operation = header("x-amz-target")
-        .and_then(|target| target.strip_prefix("AWSGlue.").map(str::to_string));
-    Some((
-        operation,
-        serde_json::from_slice(&body).expect("a Glue request body is JSON"),
-    ))
+    Some((head, body))
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
 }
 
 fn ok_response(content_type: &str, body: &str) -> String {

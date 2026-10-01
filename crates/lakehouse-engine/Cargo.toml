@@ -67,7 +67,6 @@ chrono  = { workspace = true }
 futures = { workspace = true }
 url     = { workspace = true }
 percent-encoding = { workspace = true }
-glob    = { workspace = true }
 
 # default-features off so no subscriber machinery enters the .so.
 tracing = { version = "0.1", default-features = false }

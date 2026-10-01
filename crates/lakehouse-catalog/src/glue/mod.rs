@@ -5,6 +5,7 @@ mod sdk;
 mod source;
 
 pub use client::GlueCatalogSession;
+pub(crate) use routing::PARQUET_INPUT_FORMAT;
 
 /// Glue records a directory location with a trailing `/`; the neutral types carry none.
 fn trim_location(location: &str) -> &str {

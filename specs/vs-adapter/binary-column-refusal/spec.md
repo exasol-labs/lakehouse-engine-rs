@@ -19,7 +19,7 @@ Refuses at plan time every column whose type is binary, on every source and at e
 
 * *GIVEN* an Iceberg table with columns `id int`, `b binary`, `f fixed(16)`, `u uuid`, and `s struct<x: binary>`, and a Delta, a Unity Parquet, and a Glue Parquet table each with an `id` and a `binary` column
 * *WHEN* the pushdown plans, for each table, a `SELECT` of each binary column, a `SELECT *`, a filter on a binary column, `SELECT id`, and `SELECT COUNT(*)`
-* *THEN* every request that reads or emits a binary column, or a column containing a binary member, SHALL fail at plan time with a reason naming the column, its declared type (`binary`, `fixed(16)`, or `uuid`), and issue #351
+* *THEN* every request that reads or emits a binary column, or a column containing a binary member, SHALL fail at plan time with a reason naming the column, the binary member when the column nests one, its declared type (`binary`, `fixed(16)`, or `uuid`), and issue #351
 * *AND* `SELECT id` and `SELECT COUNT(*)` SHALL succeed on every table
 * *AND* a table whose every column is refused SHALL be refused as a whole
 

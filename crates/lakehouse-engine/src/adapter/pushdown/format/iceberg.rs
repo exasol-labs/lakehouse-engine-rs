@@ -12,10 +12,9 @@ use lakehouse_catalog::{
 };
 use serde_json::Value as Json;
 
-use super::delta_schema::binary_cause;
 use super::{
-    ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan,
-    ensure_table_has_a_mappable_column,
+    ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan, binary_refusal,
+    without_refused_columns,
 };
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{
@@ -552,8 +551,7 @@ async fn plan_files_from_table(
         .collect())
 }
 
-/// Refuses every `binary`, `fixed(L)`, and `uuid` column at any depth until #351; the listing
-/// still declares them, so only a request reading one fails.
+/// Refuses every `binary`, `fixed(L)`, and `uuid` column at any depth until #351.
 fn plannable_schema(
     schema: &iceberg::spec::Schema,
 ) -> Result<(Vec<LogicalField>, Vec<RefusedColumn>), UdfError> {
@@ -561,31 +559,20 @@ fn plannable_schema(
         .as_struct()
         .fields()
         .iter()
-        .filter_map(|field| binary_refusal(field))
-        .collect();
-    let logical_schema: Vec<LogicalField> = build_logical_schema(schema)
-        .into_iter()
-        .filter(|field| {
-            refused_columns
-                .iter()
-                .all(|refused| refused.column_name != field.name)
+        .filter_map(|field| {
+            let (path, declared) = first_binary_member(&field.field_type, &field.name)?;
+            let member_path = (!field.field_type.is_primitive()).then_some(path.as_str());
+            Some(binary_refusal(
+                "Iceberg",
+                &field.name,
+                member_path,
+                &declared,
+            ))
         })
         .collect();
-    ensure_table_has_a_mappable_column(&logical_schema, &refused_columns, "Iceberg")?;
+    let logical_schema =
+        without_refused_columns(build_logical_schema(schema), &refused_columns, "Iceberg")?;
     Ok((logical_schema, refused_columns))
-}
-
-fn binary_refusal(field: &iceberg::spec::NestedField) -> Option<RefusedColumn> {
-    let (path, declared) = first_binary_member(&field.field_type, &field.name)?;
-    let subject = if field.field_type.is_primitive() {
-        format!("Iceberg column '{}'", field.name)
-    } else {
-        format!("Iceberg column '{}', whose member '{path}'", field.name)
-    };
-    Some(RefusedColumn {
-        column_name: field.name.clone(),
-        reason: format!("{subject} {}", binary_cause(&declared)),
-    })
 }
 
 fn first_binary_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {

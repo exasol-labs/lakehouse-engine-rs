@@ -1,6 +1,7 @@
 use super::super::super::test_support::{
     RecordingCatalog, load_table_body_with_columns, object_endpoint, sample_storage, user_message,
 };
+use super::super::binary_cause;
 use super::*;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{

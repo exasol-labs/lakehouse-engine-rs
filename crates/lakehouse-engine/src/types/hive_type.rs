@@ -1,8 +1,7 @@
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
-/// Parses a Glue `Column.Type` Hive type string into the Spark type that the one
-/// Spark-type classifier types (`vs-adapter/glue-hive-type-mapping`). Keywords ignore
-/// letter case, every nested member is nullable, and the error quotes the type string.
+/// Into the Spark type the one Spark-type classifier types (`vs-adapter/glue-hive-type-mapping`);
+/// every nested member is nullable.
 pub(crate) fn parse_hive_type(hive_type: &str) -> Result<DataType, String> {
     let mut cursor = Cursor {
         rest: hive_type,

@@ -62,7 +62,7 @@ the same seam for the file list alone.
 ### Scenario: Data files are listed recursively in a deterministic order
 
 * *GIVEN* a storage prefix holding `p1.parquet`, `a/p2.parquet`, `a/b/p3.parquet`, `_SUCCESS`, `_metadata`, `p1.parquet.crc`, `_staging/p4.parquet`, and `.hidden/p5.parquet`
-* *WHEN* the seam lists that prefix's data files under the `**/*.parquet` file pattern
+* *WHEN* the seam lists that prefix's data files under the Parquet-at-any-depth file pattern
 * *THEN* it SHALL return `p1.parquet`, `a/p2.parquet`, and `a/b/p3.parquet`, recursing to unlimited depth, so a plain subdirectory contributes files rather than being skipped or becoming its own unit
 * *AND* it SHALL return ONLY objects whose name ends in `.parquet`, so `_SUCCESS`, `_metadata`, and `p1.parquet.crc` are excluded by that rule alone
 * *AND* it SHALL exclude every object any of whose path segments below the prefix begins with `_` or `.`, so `_staging/p4.parquet` and `.hidden/p5.parquet` are excluded even though their file names qualify
@@ -151,12 +151,12 @@ the same seam for the file list alone.
 ### Scenario: The file pattern selects the listing depth and the file-name rule
 
 * *GIVEN* a storage prefix holding `a.parquet`, `b` (no extension), `sub/c.parquet`, `sub/d`, `_SUCCESS`, `.hidden`, and a zero-length object `e.parquet`
-* *WHEN* the seam lists that prefix under the file patterns `**/*.parquet`, `*.parquet`, and `*`
-* *THEN* `**/*.parquet` SHALL return `a.parquet` and `sub/c.parquet`
-* *AND* `*.parquet` SHALL return `a.parquet` alone, and `*` SHALL return `a.parquet` and `b`
-* *AND* a pattern without a `**` segment SHALL list only the direct children of the prefix through a delimiter listing, so no object below a subdirectory is fetched
-* *AND* under every pattern, an object with a segment below the prefix that begins with `_` or `.`, and a zero-length object, SHALL NOT be a data file
-* *AND* the pattern SHALL be an internal parameter: direct storage and Unity Parquet pass `**/*.parquet`, Glue passes `*`, and no virtual-schema property sets it
+* *WHEN* the seam lists that prefix under each of its two file patterns, Parquet-at-any-depth and any-direct-child
+* *THEN* Parquet-at-any-depth SHALL return `a.parquet` and `sub/c.parquet`, objects at any depth whose name ends in `.parquet`
+* *AND* any-direct-child SHALL return `a.parquet` and `b`, the prefix's direct children of any name
+* *AND* any-direct-child SHALL list through a delimiter listing, so no object below a subdirectory is fetched
+* *AND* under both patterns, an object with a segment below the prefix that begins with `_` or `.`, and a zero-length object, SHALL NOT be a data file
+* *AND* the pattern SHALL be an internal parameter: direct storage and Unity Parquet pass Parquet-at-any-depth, Glue passes any-direct-child, and no virtual-schema property sets it
 
 ### Scenario: A catalog-registered location is listed by its raw object key
 

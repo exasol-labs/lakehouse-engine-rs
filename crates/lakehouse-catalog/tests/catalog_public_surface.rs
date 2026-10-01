@@ -305,13 +305,9 @@ fn glue_additions_are_reachable_from_outside_the_crate() {
             ("p_str".to_string(), None),
         ]),
         location: "s3://bucket/t/p_int=1".into(),
-        format: Some(TableFormat::Parquet),
         input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat".into(),
     };
-    assert_eq!(partition.values.get("p_str"), Some(&None));
-    assert_eq!(partition.location, "s3://bucket/t/p_int=1");
-    assert_eq!(partition.format, Some(TableFormat::Parquet));
-    assert!(partition.input_format.ends_with("MapredParquetInputFormat"));
+    assert!(partition.is_parquet());
 
     let column = CatalogColumn {
         name: "payload".into(),
@@ -319,16 +315,11 @@ fn glue_additions_are_reachable_from_outside_the_crate() {
             hive_type: "struct<x:int>".into(),
         },
     };
-    match &column.source_type {
-        ColumnSourceType::Glue { hive_type } => assert_eq!(hive_type, "struct<x:int>"),
-        other => panic!("expected a Glue source type, got {other:?}"),
-    }
-
     let ident = CatalogTableIdent {
         namespace: vec!["sales".into()],
         name: "orders".into(),
     };
-    let table = CatalogTable {
+    let _ = CatalogTable {
         ident: ident.clone(),
         table_type: CatalogTableType::Table,
         storage_location: Some("s3://bucket/orders".into()),
@@ -338,49 +329,40 @@ fn glue_additions_are_reachable_from_outside_the_crate() {
         columns: vec![column],
         metadata_location: Some("s3://bucket/orders/metadata/00001.metadata.json".into()),
     };
-    assert_eq!(
-        table.metadata_location.as_deref(),
-        Some("s3://bucket/orders/metadata/00001.metadata.json")
-    );
-
-    let skipped = SkippedTable {
+    let _ = SkippedTable {
         ident,
         reason: SkipReason::NotPlannableGlueTable {
             detail: "table_type=delta".into(),
         },
     };
-    match &skipped.reason {
-        SkipReason::NotPlannableGlueTable { detail } => assert_eq!(detail, "table_type=delta"),
-        other => panic!("expected a Glue skip reason, got {other:?}"),
-    }
 }
 
 /// Scenario: No AWS SDK type crosses the crate boundary
 #[test]
 fn glue_session_is_reachable_through_neutral_types_only() {
-    let construct: fn(
-        &str,
-        StorageBackend,
-        ConnectionCreds,
-    ) -> Result<GlueCatalogSession, UdfError> = GlueCatalogSession::new;
-    let session = construct(
-        "https://glue.eu-west-1.amazonaws.com",
-        StorageBackend::S3(StorageProps::default()),
-        connection_creds(),
-    )
-    .expect("the Glue endpoint names its signing region");
+    let _: fn(&str, StorageBackend, ConnectionCreds) -> Result<GlueCatalogSession, UdfError> =
+        GlueCatalogSession::new;
+    let session = glue_session();
     let ident = CatalogTableIdent {
         namespace: vec!["sales".into()],
         name: "orders".into(),
     };
-    let partition_columns = vec!["p_int".to_string()];
+    let table = CatalogTable {
+        ident: ident.clone(),
+        table_type: CatalogTableType::Table,
+        storage_location: Some("s3://bucket/orders".into()),
+        format: TableFormat::Parquet,
+        vended_credential_key: None,
+        partition_columns: vec!["p_int".to_string()],
+        columns: Vec::new(),
+        metadata_location: None,
+    };
 
     let planning_load = async {
         let _: Result<CatalogTable, UdfError> = session.load_table_for_planning(&ident).await;
     };
     let partitions = async {
-        let _: Result<Vec<CatalogPartition>, UdfError> =
-            session.partitions(&ident, &partition_columns).await;
+        let _: Result<Vec<CatalogPartition>, UdfError> = session.partitions(&table).await;
     };
     let listing = async {
         let _: Result<CatalogListing, UdfError> = session.list_tables(&ident.namespace).await;

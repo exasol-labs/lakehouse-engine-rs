@@ -10,9 +10,8 @@ use object_store::path::Path as StorePath;
 use serde_json::Value as Json;
 use std::collections::HashSet;
 
-use super::delta_schema::binary_cause;
 use super::partition_predicate::PartitionPredicate;
-use super::{FormatReader, RefusedColumn, ResolvedScan, ensure_table_has_a_mappable_column};
+use super::{FormatReader, RefusedColumn, ResolvedScan, binary_refusal, without_refused_columns};
 use crate::adapter::parquet_directory::{
     BinaryColumn, DirectoryOptions, NESTED_ENUM_TYPE, ParquetDirectory, ParquetFile,
     resolve_parquet_directory, store_prefix,
@@ -103,40 +102,29 @@ fn plannable_schema(
     declared_columns: &[(String, String)],
     binary_columns: &[BinaryColumn],
 ) -> Result<(Vec<LogicalField>, Vec<RefusedColumn>), UdfError> {
-    let refused_columns: Vec<RefusedColumn> = binary_columns.iter().map(binary_refusal).collect();
+    let refused_columns: Vec<RefusedColumn> = binary_columns.iter().map(parquet_refusal).collect();
     let mut logical = logical_schema(schema);
     logical.extend(logical_schema(&Schema::new(absent_declared_fields(
         declared_columns,
         schema,
     ))));
-    logical.retain(|field| {
-        refused_columns
-            .iter()
-            .all(|refused| refused.column_name != field.name)
-    });
-    ensure_table_has_a_mappable_column(&logical, &refused_columns, "Direct storage")?;
+    let logical = without_refused_columns(logical, &refused_columns, "Direct storage")?;
     Ok((logical, refused_columns))
 }
 
-fn binary_refusal(column: &BinaryColumn) -> RefusedColumn {
-    let subject = match &column.member_path {
-        Some(member_path) => {
-            format!(
-                "Parquet column '{}', whose member '{member_path}'",
-                column.column
-            )
-        }
-        None => format!("Parquet column '{}'", column.column),
-    };
-    let text_scope = if column.declared == NESTED_ENUM_TYPE {
-        "; a Parquet ENUM is read as text only as a top-level, non-repeated column"
-    } else {
-        ""
-    };
-    RefusedColumn {
-        column_name: column.column.clone(),
-        reason: format!("{subject} {}{text_scope}", binary_cause(&column.declared)),
+fn parquet_refusal(column: &BinaryColumn) -> RefusedColumn {
+    let mut refusal = binary_refusal(
+        "Parquet",
+        &column.column,
+        column.member_path.as_deref(),
+        &column.declared,
+    );
+    if column.declared == NESTED_ENUM_TYPE {
+        refusal
+            .reason
+            .push_str("; a Parquet ENUM is read as text only as a top-level, non-repeated column");
     }
+    refusal
 }
 
 /// Declared columns absent from `schema` (uppercase fold), typed as declared; they read NULL.

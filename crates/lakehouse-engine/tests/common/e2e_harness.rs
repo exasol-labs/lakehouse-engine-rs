@@ -516,6 +516,18 @@ pub fn value_to_string(v: &serde_json::Value) -> String {
         .unwrap_or_else(|| v.to_string())
 }
 
+pub fn nullable_text(v: &serde_json::Value) -> Option<String> {
+    (!v.is_null()).then(|| value_to_string(v))
+}
+
+pub fn text_column(column: &[serde_json::Value]) -> Vec<Option<String>> {
+    column.iter().map(nullable_text).collect()
+}
+
+pub fn int_column(column: &[serde_json::Value]) -> Vec<i64> {
+    column.iter().map(parse_int).collect()
+}
+
 /// `(COLUMN_NAME, COLUMN_TYPE)` of one virtual table in column order, the type with its
 /// whitespace and character-set suffix removed, so `VARCHAR(2000000) UTF8` reads `VARCHAR(2000000)`.
 pub fn declared_types(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<(String, String)> {
@@ -593,12 +605,7 @@ pub fn assert_text_columns<const ROWS: usize>(
     let observed: Vec<Vec<Option<String>>> = conn
         .query_columns(sql)
         .iter()
-        .map(|column| {
-            column
-                .iter()
-                .map(|v| (!v.is_null()).then(|| value_to_string(v)))
-                .collect()
-        })
+        .map(|column| text_column(column))
         .collect();
     let expected: Vec<Vec<Option<String>>> = expected
         .iter()

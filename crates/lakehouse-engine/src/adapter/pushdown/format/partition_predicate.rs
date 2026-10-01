@@ -245,9 +245,8 @@ fn translate_is_null(node: &Json) -> Option<Node> {
     })
 }
 
-/// Only the literal kind Exasol pairs with the declared type converts, and only when the type
-/// holds it exactly: a rounded literal could prune a file holding a matching row. A string
-/// literal must be non-empty, since Exasol reads `''` as NULL.
+/// Converts only exactly, since a rounded literal could prune a file holding a matching row, and
+/// never an empty string literal, which Exasol reads as NULL.
 fn literal_under(literal: &Json, declared: &DataType) -> Option<ScalarValue> {
     let kind = literal.get("type")?.as_str()?;
     let value = literal.get("value")?;

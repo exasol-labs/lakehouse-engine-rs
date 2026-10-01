@@ -18,17 +18,15 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 * *WHEN* the pushdown resolves the table
 * *THEN* the adapter SHALL load the table with `GetTable` and read that metadata file once, through the CONNECTION's static storage
 * *AND* the adapter SHALL plan the table with the SAME Iceberg planner that plans an Iceberg REST table, so delete handling, the date-promotion refusal, the name mapping, and file pruning apply to it as to an Iceberg REST table
-* *AND* the metadata file SHALL be the schema authority, and the adapter MUST NOT read the table's Glue columns
+* *AND* the metadata file SHALL be the schema authority, per `vs-adapter/glue-catalog-client`
 
 ### Scenario: A Glue Parquet table is planned by the shared catalog-declared Parquet reader
 
 * *GIVEN* a Glue Parquet table and a Unity Parquet table
 * *WHEN* the pushdown resolves each table
-* *THEN* ONE reader SHALL plan both tables, and SHALL differ between them only in its type source (the Glue Hive type string or the Unity `type_json`) and its file source (the registered partitions or the table directory)
-* *AND* the Glue table's logical schema SHALL be its Glue columns in declared order, each typed per `vs-adapter/glue-hive-type-mapping` and declared nullable
-* *AND* no logical field SHALL carry a field-id or a declared physical name, so each binds a file column by name, ignoring letter case
+* *THEN* ONE reader SHALL plan both tables, and SHALL differ between them only in its type source (the Glue Hive type string per `vs-adapter/glue-hive-type-mapping`, or the Unity `type_json`), its file source (the registered partitions or the table directory), and its storage (the CONNECTION's static storage, or the Unity storage resolution)
+* *AND* the Glue table's logical schema SHALL follow the logical-schema rules of `vs-adapter/unity-parquet-table-planning` over its Glue columns: declared column order, NULLABLE fields, no field-id or declared physical name, the case-fold binding, and no footer read at plan time
 * *AND* a partition key that a data file also stores as a column SHALL read the partition value
-* *AND* the reader SHALL read no footer at plan time, and SHALL read storage through the CONNECTION's static storage
 
 ### Scenario: Each kept partition's location is listed and its files carry the partition's Glue values
 
@@ -51,7 +49,7 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 
 * *GIVEN* a partition location holding `20240101_abc` (no extension), `part-0.snappy.parquet`, `_SUCCESS`, `.hidden`, a zero-length object, and `nested/x.parquet`, and an unpartitioned Glue table whose location holds the same objects
 * *WHEN* the pushdown resolves each table
-* *THEN* the reader SHALL read `20240101_abc` and `part-0.snappy.parquet` and no other object, through the seam's `*` file pattern
+* *THEN* the reader SHALL read `20240101_abc` and `part-0.snappy.parquet` and no other object, through the seam's any-direct-child file pattern
 * *AND* the reader SHALL list the unpartitioned table's location under the same pattern
 
 ### Scenario: A partition predicate prunes partitions before their locations are listed

@@ -1,3 +1,4 @@
+use super::super::binary_cause;
 use super::*;
 use crate::adapter::parquet_directory::{
     FilePattern, MergeMode, list_location_files, raw_location_prefix,
@@ -247,14 +248,11 @@ async fn a_raw_key_file_path_resolves_back_to_its_object_key() {
         let (_, partition_prefix) =
             raw_location_prefix(&format!("s3://bucket/{partition_location}"))
                 .expect("the partition location names a raw key");
-        let [listed] =
-            list_location_files(&store, &partition_prefix, FilePattern::ANY_DIRECT_CHILD)
-                .await
-                .expect("the partition location lists")
-                .try_into()
-                .unwrap_or_else(|files: Vec<_>| {
-                    panic!("one file under '{key}', got {}", files.len())
-                });
+        let [listed] = list_location_files(&store, &partition_prefix, FilePattern::AnyDirectChild)
+            .await
+            .expect("the partition location lists")
+            .try_into()
+            .unwrap_or_else(|files: Vec<_>| panic!("one file under '{key}', got {}", files.len()));
 
         let entry = file_entry(
             ParquetFile {

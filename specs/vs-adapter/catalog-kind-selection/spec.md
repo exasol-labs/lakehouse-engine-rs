@@ -37,7 +37,6 @@ The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRes
 * *THEN* the adapter SHALL match `CatalogKind` EXHAUSTIVELY at exactly ONE construction site, which returns a `Result` holding a boxed `CatalogClient`, so a new catalog kind is a compile error at that site
 * *AND* every later createVirtualSchema step (enumerating the namespace, flattening and case-folding names, mapping column types, building `TABLE_MAP`, recording skipped tables, and assembling the response) SHALL run ONE pipeline that reads the boxed client through the trait and MUST NOT match `CatalogKind`
 * *AND* the only other production sites permitted to take `CatalogKind` as an input SHALL be credential validation, which takes it as an explicit parameter, and the pushdown scan-source construction site, which matches it EXHAUSTIVELY and yields the per-request resolver every request shape resolves through
-* *AND* the permitted set SHALL be exactly the four production files the Background names, held by EXHAUSTIVE matching plus review rather than by a source-level probe
 * *AND* the pushdown resolver's private already-resolved-session enum SHALL carry one variant per catalog kind, matched exhaustively wherever it is read, and MUST NOT name a `CatalogKind` variant
 * *AND* the direct-storage client and the Glue client SHALL each be usable as a boxed `CatalogClient` from that one construction site
 * *AND* the compile-time signature probe pinning the construction site SHALL stay in step with its signature through explicit reviewed edits

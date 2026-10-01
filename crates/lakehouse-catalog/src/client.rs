@@ -89,9 +89,14 @@ pub struct CatalogTable {
 pub struct CatalogPartition {
     pub values: BTreeMap<String, Option<String>>,
     pub location: String,
-    /// Absent when `input_format` names no format this engine reads.
-    pub format: Option<TableFormat>,
     pub input_format: String,
+}
+
+impl CatalogPartition {
+    /// The only input format this engine reads.
+    pub fn is_parquet(&self) -> bool {
+        self.input_format == crate::glue::PARQUET_INPUT_FORMAT
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]

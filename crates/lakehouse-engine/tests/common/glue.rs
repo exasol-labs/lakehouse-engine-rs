@@ -1,6 +1,9 @@
 //! AWS Glue E2E harness: every `GlueRun` owns one Glue database and one S3 prefix and deletes
 //! both when it drops, so two concurrent runs never share a fixture (`glue-e2e/glue-e2e-harness`).
 
+use super::cloud_fixture::{
+    derive_run_segment, per_run_segment, require_var, run_teardown_off_runtime,
+};
 use super::raw_parquet::encode_parquet;
 use super::seed::{
     all_types_ids, all_types_validity, binary_values, boolean_values, date_values,
@@ -22,7 +25,7 @@ use aws_sdk_glue::error::{DisplayErrorContext, ProvideErrorMetadata};
 use aws_sdk_glue::types::{
     Column, DatabaseInput, PartitionInput, SerDeInfo, StorageDescriptor, TableInput,
 };
-use futures::TryStreamExt;
+use futures::{StreamExt, TryStreamExt, stream};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_REGION,
@@ -38,7 +41,6 @@ use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const ACCESS_KEY_ID_VAR: &str = "GLUE_ACCESS_KEY_ID";
 pub const SECRET_ACCESS_KEY_VAR: &str = "GLUE_SECRET_ACCESS_KEY";
@@ -79,7 +81,7 @@ impl GlueEnv {
     /// Takes the lookup as a parameter so a probe can substitute sentinel values without
     /// mutating the shared process environment.
     pub fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Self {
-        let read = |name: &str| require_var(name, lookup(name).as_deref());
+        let read = |name: &str| require_var("glue-e2e", name, lookup(name).as_deref());
         Self {
             access_key_id: read(ACCESS_KEY_ID_VAR),
             secret_access_key: read(SECRET_ACCESS_KEY_VAR),
@@ -101,7 +103,16 @@ impl GlueEnv {
         text.replace(&self.secret_access_key, REDACTED)
     }
 
-    /// Rebuilt per use, never cached: an SDK client's connection pool runs on the runtime that
+    /// Panics with the redacted error chain, which may echo a request carrying the secret.
+    #[track_caller]
+    pub fn expect<T>(&self, result: Result<T>, label: &str) -> T {
+        match result {
+            Ok(value) => value,
+            Err(error) => panic!("{}", self.redact(&format!("{label}: {error:#}"))),
+        }
+    }
+
+    /// Never cached on `GlueEnv`: an SDK client's connection pool runs on the runtime that
     /// created it, and `GlueRun`'s teardown runs on a runtime of its own.
     pub fn glue_client(&self) -> aws_sdk_glue::Client {
         let config = aws_sdk_glue::Config::builder()
@@ -149,7 +160,7 @@ impl GlueEnv {
 
     pub async fn object_keys(&self, prefix: &str) -> Result<Vec<String>> {
         Ok(self
-            .objects_under(prefix)
+            .objects_under(&self.fixture_store()?, prefix)
             .await?
             .into_iter()
             .map(|object| object.to_string())
@@ -158,8 +169,7 @@ impl GlueEnv {
 
     /// The listed paths themselves, never keys rebuilt from their text: `Path::from` would
     /// percent-encode the `%` of a raw key such as `p_str=a b%2Fc`.
-    async fn objects_under(&self, prefix: &str) -> Result<Vec<ObjectStorePath>> {
-        let store = self.fixture_store()?;
+    async fn objects_under(&self, store: &AmazonS3, prefix: &str) -> Result<Vec<ObjectStorePath>> {
         let objects: Vec<_> = store
             .list(Some(&ObjectStorePath::from(prefix)))
             .try_collect()
@@ -178,60 +188,17 @@ impl GlueEnv {
     }
 }
 
-/// Takes `value` as a parameter so the panic path is testable without mutating the shared
-/// process environment. Panics name only the variable, never the value.
-fn require_var(name: &str, value: Option<&str>) -> String {
-    let Some(value) = value else {
-        panic!("the glue-e2e suite requires environment variable {name}, which is not set");
-    };
-    let value = value.trim();
-    assert!(
-        !value.is_empty(),
-        "the glue-e2e suite requires environment variable {name}, which is set but empty"
-    );
-    value.to_string()
-}
-
-pub fn per_run_id() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before the UNIX epoch")
-        .as_millis();
-    derive_run_id(&std::env::var("USER").unwrap_or_default(), millis)
-}
+/// Leaves room for `DATABASE_PREFIX`, which already ends in `_`.
+const RUN_ID_LEN: usize = MAX_DATABASE_NAME_LEN - DATABASE_PREFIX.len();
 
 /// Athena and Hive accept only lowercase letters, digits, and `_` in a database name, so the
 /// user segment is folded into that alphabet within Glue's length limit.
-fn derive_run_id(user: &str, millis: u128) -> String {
-    let suffix = millis.to_string();
-    let separator = 1;
-    let budget =
-        MAX_DATABASE_NAME_LEN.saturating_sub(DATABASE_PREFIX.len() + separator + suffix.len());
-    let user_segment = sanitize_segment(user, budget);
-    if user_segment.is_empty() {
-        suffix
-    } else {
-        format!("{user_segment}_{suffix}")
-    }
+pub fn per_run_id() -> String {
+    per_run_segment('_', RUN_ID_LEN)
 }
 
-fn sanitize_segment(raw: &str, max_len: usize) -> String {
-    let mut segment = String::new();
-    for character in raw.chars() {
-        let legal = if character.is_ascii_alphanumeric() {
-            character.to_ascii_lowercase()
-        } else {
-            '_'
-        };
-        if legal == '_' && segment.ends_with('_') {
-            continue;
-        }
-        if segment.len() == max_len {
-            break;
-        }
-        segment.push(legal);
-    }
-    segment.trim_matches('_').to_string()
+fn derive_run_id(user: &str, millis: u128) -> String {
+    derive_run_segment(user, millis, '_', RUN_ID_LEN)
 }
 
 pub fn database_name(run_id: &str) -> String {
@@ -294,29 +261,9 @@ impl GlueRun {
             self.object_prefix()
         )
     }
-
-    pub async fn put_object(&self, relative_key: &str, bytes: bytes::Bytes) -> Result<()> {
-        let key = format!("{}{relative_key}", self.object_prefix());
-        let path = ObjectStorePath::parse(&key)
-            .with_context(|| format!("fixture key {key} is not a valid object path"))?;
-        self.env
-            .fixture_store()?
-            .put(&path, PutPayload::from(bytes))
-            .await
-            .map_err(|error| {
-                anyhow!(
-                    self.env
-                        .redact(&format!("PUT {}: {error}", self.uri(relative_key)))
-                )
-            })?;
-        Ok(())
-    }
 }
 
 impl Drop for GlueRun {
-    /// `Drop` can fire inside a caller's `block_on`, where driving the deletes on that runtime
-    /// would panic, so they run on their own thread and runtime. Nothing here panics, so an
-    /// unwinding test keeps its own failure.
     fn drop(&mut self) {
         let env = self.env.clone();
         let database = self.database();
@@ -325,33 +272,10 @@ impl Drop for GlueRun {
             "Glue database {database} and S3 prefix s3://{}/{prefix}",
             env.fixture_bucket
         );
-        let teardown_resources = resources.clone();
-
-        // `thread::spawn` panics when the OS refuses a thread, which would abort an unwinding test.
-        let teardown = std::thread::Builder::new()
-            .name("glue-run-teardown".to_string())
-            .spawn(move || {
-                match tokio::runtime::Builder::new_current_thread()
-                    // Not `enable_all`: it silently skips IO when tokio's `net` feature is off.
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                {
-                    Ok(runtime) => runtime.block_on(delete_run_resources(&env, &database, &prefix)),
-                    Err(error) => vec![format!(
-                        "{teardown_resources}: build the teardown runtime: {error}"
-                    )],
-                }
-            });
-
-        let leaks = match teardown {
-            Ok(handle) => handle
-                .join()
-                .unwrap_or_else(|_| vec![format!("{resources}: the teardown thread panicked")]),
-            Err(error) => vec![format!(
-                "{resources}: the teardown thread could not be spawned: {error}"
-            )],
-        };
+        let leaks = run_teardown_off_runtime("glue-run-teardown", async move {
+            delete_run_resources(&env, &database, &prefix).await
+        })
+        .unwrap_or_else(|failure| vec![format!("{resources}: {failure}")]);
         for leak in leaks {
             eprintln!("LEAKED {}", self.env.redact(&leak));
         }
@@ -434,13 +358,18 @@ async fn database_table_names(
 
 async fn delete_prefix(env: &GlueEnv, prefix: &str) -> Result<()> {
     let store = env.fixture_store()?;
-    for object in env.objects_under(prefix).await? {
-        store
-            .delete(&object)
-            .await
-            .map_err(|error| anyhow!(env.redact(&format!("DELETE {object}: {error}"))))?;
-    }
-    let remaining = env.objects_under(prefix).await?;
+    let objects = env.objects_under(&store, prefix).await?;
+    store
+        .delete_stream(stream::iter(objects.into_iter().map(Ok)).boxed())
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|error| {
+            anyhow!(env.redact(&format!(
+                "DELETE under s3://{}/{prefix}: {error}",
+                env.fixture_bucket
+            )))
+        })?;
+    let remaining = env.objects_under(&store, prefix).await?;
     if !remaining.is_empty() {
         bail!("{} object(s) remain after the delete", remaining.len());
     }
@@ -652,64 +581,49 @@ pub const HIVE_TYPE_COLUMNS: &[HiveTypeColumn] = &[
     hive("h_empty_type", "", None),
 ];
 
+/// A row's partition values are those of the `PARTITIONS` entry whose file holds its id.
 pub struct PartitionedRow {
     pub id: i64,
     pub v: &'static str,
-    pub p_int: i32,
-    pub p_date: &'static str,
-    pub p_str: Option<&'static str>,
+}
+
+impl PartitionedRow {
+    fn partition(&self) -> &'static FixturePartition {
+        let partitions: &'static [FixturePartition] = &PARTITIONS;
+        partitions
+            .iter()
+            .find(|partition| {
+                partition
+                    .files
+                    .iter()
+                    .any(|file| file.ids.contains(&self.id))
+            })
+            .unwrap_or_else(|| panic!("row {} is in no PARTITIONS file", self.id))
+    }
+
+    pub fn p_int(&self) -> i64 {
+        self.partition().values[0]
+            .parse()
+            .expect("a fixture p_int is an integer")
+    }
+
+    pub fn p_date(&self) -> &'static str {
+        self.partition().values[1]
+    }
+
+    pub fn p_str(&self) -> Option<&'static str> {
+        Some(self.partition().values[2]).filter(|value| *value != HIVE_DEFAULT_PARTITION)
+    }
 }
 
 pub const PARTITIONED_ROWS: [PartitionedRow; 7] = [
-    PartitionedRow {
-        id: 1,
-        v: "a",
-        p_int: 1,
-        p_date: "2024-01-01",
-        p_str: Some("alpha"),
-    },
-    PartitionedRow {
-        id: 2,
-        v: "b",
-        p_int: 1,
-        p_date: "2024-01-01",
-        p_str: Some("alpha"),
-    },
-    PartitionedRow {
-        id: 3,
-        v: "c",
-        p_int: 1,
-        p_date: "2024-01-01",
-        p_str: Some("alpha"),
-    },
-    PartitionedRow {
-        id: 4,
-        v: "d",
-        p_int: 1,
-        p_date: "2024-01-02",
-        p_str: None,
-    },
-    PartitionedRow {
-        id: 5,
-        v: "e",
-        p_int: 2,
-        p_date: "2024-01-01",
-        p_str: Some("a b/c"),
-    },
-    PartitionedRow {
-        id: 6,
-        v: "f",
-        p_int: 3,
-        p_date: "2024-02-01",
-        p_str: Some("outside"),
-    },
-    PartitionedRow {
-        id: 7,
-        v: "g",
-        p_int: 4,
-        p_date: "2024-02-02",
-        p_str: Some("s3a"),
-    },
+    PartitionedRow { id: 1, v: "a" },
+    PartitionedRow { id: 2, v: "b" },
+    PartitionedRow { id: 3, v: "c" },
+    PartitionedRow { id: 4, v: "d" },
+    PartitionedRow { id: 5, v: "e" },
+    PartitionedRow { id: 6, v: "f" },
+    PartitionedRow { id: 7, v: "g" },
 ];
 
 /// Where a partition's registered location points. `OutsideTable` is relative to the run
@@ -854,20 +768,53 @@ pub fn glue_connection_password(env: &GlueEnv) -> CatalogConnectionPassword {
     }
 }
 
-impl GlueRun {
-    pub async fn create_table(&self, input: TableInput) -> Result<()> {
+/// One Glue client and S3 store for a whole registration, which runs on a single runtime.
+struct FixtureWriter<'a> {
+    run: &'a GlueRun,
+    glue: aws_sdk_glue::Client,
+    store: AmazonS3,
+}
+
+impl<'a> FixtureWriter<'a> {
+    fn new(run: &'a GlueRun) -> Result<Self> {
+        Ok(Self {
+            run,
+            glue: run.env.glue_client(),
+            store: run.env.fixture_store()?,
+        })
+    }
+
+    async fn put_object(&self, relative_key: &str, bytes: bytes::Bytes) -> Result<()> {
+        let key = format!("{}{relative_key}", self.run.object_prefix());
+        let path = ObjectStorePath::parse(&key)
+            .with_context(|| format!("fixture key {key} is not a valid object path"))?;
+        self.store
+            .put(&path, PutPayload::from(bytes))
+            .await
+            .map_err(|error| {
+                anyhow!(
+                    self.run
+                        .env
+                        .redact(&format!("PUT {}: {error}", self.run.uri(relative_key)))
+                )
+            })?;
+        Ok(())
+    }
+
+    async fn create_table(&self, input: TableInput) -> Result<()> {
         let name = input.name().to_string();
-        self.env
-            .glue_client()
+        let database = self.run.database();
+        self.glue
             .create_table()
-            .database_name(self.database())
+            .database_name(&database)
             .table_input(input)
             .send()
             .await
             .map_err(|error| {
                 anyhow!(
-                    self.env
-                        .glue_failure(&format!("CreateTable {}.{name}", self.database()), &error)
+                    self.run
+                        .env
+                        .glue_failure(&format!("CreateTable {database}.{name}"), &error)
                 )
             })?;
         Ok(())
@@ -876,25 +823,25 @@ impl GlueRun {
     /// `BatchCreatePartition` reports a rejected partition in its response, not as an error,
     /// so a partial registration fails here instead of silently shrinking the fixture.
     async fn create_partitions(&self, table: &str, inputs: Vec<PartitionInput>) -> Result<()> {
+        let database = self.run.database();
         let output = self
-            .env
-            .glue_client()
+            .glue
             .batch_create_partition()
-            .database_name(self.database())
+            .database_name(&database)
             .table_name(table)
             .set_partition_input_list(Some(inputs))
             .send()
             .await
             .map_err(|error| {
-                anyhow!(self.env.glue_failure(
-                    &format!("BatchCreatePartition {}.{table}", self.database()),
-                    &error
-                ))
+                anyhow!(
+                    self.run
+                        .env
+                        .glue_failure(&format!("BatchCreatePartition {database}.{table}"), &error)
+                )
             })?;
         if !output.errors().is_empty() {
-            bail!(self.env.redact(&format!(
-                "BatchCreatePartition {}.{table} rejected {} partition(s): {:?}",
-                self.database(),
+            bail!(self.run.env.redact(&format!(
+                "BatchCreatePartition {database}.{table} rejected {} partition(s): {:?}",
                 output.errors().len(),
                 output.errors()
             )));
@@ -905,24 +852,28 @@ impl GlueRun {
 
 /// Registers the whole fixture set of `glue-e2e/glue-e2e-harness` in the run's database.
 pub async fn register_fixture_set(run: &GlueRun) -> Result<()> {
-    register_iceberg_orders(run).await?;
-    register_all_types(run).await?;
-    register_binary_values(run).await?;
-    register_partitioned(run).await?;
-    register_metadata_only_tables(run).await
+    let writer = FixtureWriter::new(run)?;
+    register_iceberg_orders(&writer).await?;
+    register_all_types(&writer).await?;
+    register_binary_values(&writer).await?;
+    register_partitioned(&writer).await?;
+    register_metadata_only_tables(&writer).await
 }
 
 /// One object and one Parquet table: enough for a teardown to have something of each kind.
 pub async fn register_probe_table(run: &GlueRun) -> Result<()> {
-    run.put_object("probe/20240101_000000_00001_probe", orders_file_bytes()?)
+    let writer = FixtureWriter::new(run)?;
+    writer
+        .put_object("probe/20240101_000000_00001_probe", orders_file_bytes()?)
         .await?;
-    run.create_table(parquet_table(
-        "probe",
-        &run.uri("probe/"),
-        vec![hive_column("order_id", "bigint")?],
-        Vec::new(),
-    )?)
-    .await
+    writer
+        .create_table(parquet_table(
+            "probe",
+            &run.uri("probe/"),
+            vec![hive_column("order_id", "bigint")?],
+            Vec::new(),
+        )?)
+        .await
 }
 
 fn hive_column(name: &str, hive_type: &str) -> Result<Column> {
@@ -1034,7 +985,8 @@ fn orders_file_bytes() -> Result<bytes::Bytes> {
 
 /// `iceberg-rust` writes the table through its memory catalog on S3 `FileIO`; Glue then holds
 /// only the pointer to the resulting `metadata.json`, as an Athena registration does.
-async fn register_iceberg_orders(run: &GlueRun) -> Result<()> {
+async fn register_iceberg_orders(writer: &FixtureWriter<'_>) -> Result<()> {
+    let run = writer.run;
     let env = run.env();
     let props = HashMap::from([
         (MEMORY_CATALOG_WAREHOUSE.to_string(), run.uri("iceberg")),
@@ -1103,7 +1055,7 @@ async fn register_iceberg_orders(run: &GlueRun) -> Result<()> {
         )
         .build()
         .context("describe the iceberg_orders registration")?;
-    run.create_table(input).await
+    writer.create_table(input).await
 }
 
 fn h_struct_xy_data() -> ArrayRef {
@@ -1144,7 +1096,8 @@ fn h_array_struct_data() -> ArrayRef {
 
 /// `all_types` declares every `HIVE_TYPE_COLUMNS` type; its one extensionless data file holds
 /// a value for each column a reader can bind.
-async fn register_all_types(run: &GlueRun) -> Result<()> {
+async fn register_all_types(writer: &FixtureWriter<'_>) -> Result<()> {
+    let run = writer.run;
     let mut columns = vec![hive_column("id", "bigint")?];
     let mut fields = vec![Field::new("id", DataType::Int64, false)];
     let mut arrays = vec![all_types_ids()];
@@ -1160,49 +1113,55 @@ async fn register_all_types(run: &GlueRun) -> Result<()> {
     let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays)
         .context("build the Glue all_types batch")?;
 
-    run.put_object(
-        &format!("{ALL_TYPES}/20240115_000000_00001_{ALL_TYPES}"),
-        encode_parquet(&batch),
-    )
-    .await?;
-    run.put_object(
-        &format!("{ALL_TYPES}/{SUCCESS_MARKER}"),
-        bytes::Bytes::new(),
-    )
-    .await?;
-    run.create_table(parquet_table(
-        ALL_TYPES,
-        &run.uri(&format!("{ALL_TYPES}/")),
-        columns,
-        Vec::new(),
-    )?)
-    .await
+    writer
+        .put_object(
+            &format!("{ALL_TYPES}/20240115_000000_00001_{ALL_TYPES}"),
+            encode_parquet(&batch),
+        )
+        .await?;
+    writer
+        .put_object(
+            &format!("{ALL_TYPES}/{SUCCESS_MARKER}"),
+            bytes::Bytes::new(),
+        )
+        .await?;
+    writer
+        .create_table(parquet_table(
+            ALL_TYPES,
+            &run.uri(&format!("{ALL_TYPES}/")),
+            columns,
+            Vec::new(),
+        )?)
+        .await
 }
 
 /// `binary_values` declares `c_bytes string` over a `BYTE_ARRAY` with no annotation and no
 /// embedded Arrow schema whose bytes are not valid UTF-8.
-async fn register_binary_values(run: &GlueRun) -> Result<()> {
+async fn register_binary_values(writer: &FixtureWriter<'_>) -> Result<()> {
+    let run = writer.run;
     let bytes = non_utf8_parquet(
         "message binary_values {
             REQUIRED INT64 id;
             OPTIONAL BYTE_ARRAY c_bytes;
         }",
     );
-    run.put_object(
-        &format!("{BINARY_VALUES}/20240115_000000_00001_{BINARY_VALUES}"),
-        bytes,
-    )
-    .await?;
-    run.create_table(parquet_table(
-        BINARY_VALUES,
-        &run.uri(&format!("{BINARY_VALUES}/")),
-        vec![
-            hive_column("id", "bigint")?,
-            hive_column("c_bytes", "string")?,
-        ],
-        Vec::new(),
-    )?)
-    .await
+    writer
+        .put_object(
+            &format!("{BINARY_VALUES}/20240115_000000_00001_{BINARY_VALUES}"),
+            bytes,
+        )
+        .await?;
+    writer
+        .create_table(parquet_table(
+            BINARY_VALUES,
+            &run.uri(&format!("{BINARY_VALUES}/")),
+            vec![
+                hive_column("id", "bigint")?,
+                hive_column("c_bytes", "string")?,
+            ],
+            Vec::new(),
+        )?)
+        .await
 }
 
 fn partition_file_bytes(ids: &[i64]) -> Result<bytes::Bytes> {
@@ -1225,16 +1184,18 @@ fn partition_file_bytes(ids: &[i64]) -> Result<bytes::Bytes> {
     Ok(encode_parquet(&batch))
 }
 
-async fn register_partitioned(run: &GlueRun) -> Result<()> {
+async fn register_partitioned(writer: &FixtureWriter<'_>) -> Result<()> {
+    let run = writer.run;
     let mut inputs = Vec::with_capacity(PARTITIONS.len());
     for partition in &PARTITIONS {
         let key = partition.place.relative_key();
         for file in partition.files {
-            run.put_object(
-                &format!("{key}{}", file.name),
-                partition_file_bytes(file.ids)?,
-            )
-            .await?;
+            writer
+                .put_object(
+                    &format!("{key}{}", file.name),
+                    partition_file_bytes(file.ids)?,
+                )
+                .await?;
         }
         inputs.push(
             PartitionInput::builder()
@@ -1254,25 +1215,28 @@ async fn register_partitioned(run: &GlueRun) -> Result<()> {
         );
     }
     let first_key = PARTITIONS[0].place.relative_key();
-    run.put_object(&format!("{first_key}{SUCCESS_MARKER}"), bytes::Bytes::new())
+    writer
+        .put_object(&format!("{first_key}{SUCCESS_MARKER}"), bytes::Bytes::new())
         .await?;
 
     let partition_keys = PARTITION_KEYS
         .iter()
         .map(|(name, hive_type)| hive_column(name, hive_type))
         .collect::<Result<Vec<_>>>()?;
-    run.create_table(parquet_table(
-        PARTITIONED,
-        &run.uri(&format!("{PARTITIONED}/")),
-        vec![hive_column("id", "bigint")?, hive_column("v", "string")?],
-        partition_keys,
-    )?)
-    .await?;
-    run.create_partitions(PARTITIONED, inputs).await
+    writer
+        .create_table(parquet_table(
+            PARTITIONED,
+            &run.uri(&format!("{PARTITIONED}/")),
+            vec![hive_column("id", "bigint")?, hive_column("v", "string")?],
+            partition_keys,
+        )?)
+        .await?;
+    writer.create_partitions(PARTITIONED, inputs).await
 }
 
 /// None of these gets a data file: the listing must skip each on its metadata alone.
-async fn register_metadata_only_tables(run: &GlueRun) -> Result<()> {
+async fn register_metadata_only_tables(writer: &FixtureWriter<'_>) -> Result<()> {
+    let run = writer.run;
     let id_column = || hive_column("id", "bigint");
 
     let projected = TableInput::builder()
@@ -1325,18 +1289,17 @@ async fn register_metadata_only_tables(run: &GlueRun) -> Result<()> {
         .context("describe the delta_table registration")?;
 
     for input in [projected, view, orc, delta] {
-        run.create_table(input).await?;
+        writer.create_table(input).await?;
     }
     Ok(())
 }
 
-#[cfg(test)]
 mod glue_naming_and_variable_tests {
+    use super::super::cloud_fixture::panic_message;
     use super::{
         ACCESS_KEY_ID_VAR, DATABASE_PREFIX, FIXTURE_BUCKET_VAR, GlueEnv, MAX_DATABASE_NAME_LEN,
         REGION_VAR, SECRET_ACCESS_KEY_VAR, database_name, derive_run_id,
     };
-    use std::panic;
 
     const FIXED_MILLIS: u128 = 1_762_000_000_000;
 
@@ -1346,12 +1309,6 @@ mod glue_naming_and_variable_tests {
         (REGION_VAR, "eu-sentinel-1"),
         (FIXTURE_BUCKET_VAR, "bucket-sentinel"),
     ];
-
-    fn panic_message(body: impl FnOnce() + panic::UnwindSafe) -> String {
-        let payload = panic::catch_unwind(body).expect_err("expected the variable read to panic");
-        super::super::stack::panic_payload_message(&*payload)
-            .expect("panic payload was neither String nor &str")
-    }
 
     fn assert_legal_database_name(name: &str, user: &str) {
         assert!(

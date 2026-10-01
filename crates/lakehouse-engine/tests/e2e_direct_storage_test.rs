@@ -7,8 +7,8 @@ mod common;
 use common::e2e_harness::{
     VARCHAR_JSON, VsProps, assert_query_fails, assert_text_columns, create_schema_and_scripts,
     create_virtual_schema_with_password, declared_type, declared_types, exa_conn,
-    explain_virtual_sql, install_slc, local_stack_storage, pairs, parse_int, parse_numeric,
-    try_create_virtual_schema_with_password, upload_so, value_to_string,
+    explain_virtual_sql, install_slc, local_stack_storage, nullable_text, pairs, parse_int,
+    parse_numeric, try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{
@@ -1584,10 +1584,6 @@ fn two_table_join_matches_the_unpushed_answer_in_one_request() {
 
 const SALES_2026_FILE: &str = "year=2026/month=09/p1.parquet";
 
-fn nullable_string(value: &Json) -> Option<String> {
-    (!value.is_null()).then(|| value_to_string(value))
-}
-
 fn int_column(cells: &[Json]) -> Vec<i64> {
     let mut ids: Vec<i64> = cells.iter().map(parse_int).collect();
     ids.sort();
@@ -1622,8 +1618,8 @@ fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
         .map(|row| {
             (
                 parse_int(&cols[0][row]),
-                nullable_string(&cols[1][row]),
-                nullable_string(&cols[2][row]),
+                nullable_text(&cols[1][row]),
+                nullable_text(&cols[2][row]),
             )
         })
         .collect();
@@ -1667,7 +1663,7 @@ fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
         vs_table(VS_DIRECT, "MIXED")
     ));
     let rows: Vec<(i64, Option<String>)> = (0..cols[0].len())
-        .map(|row| (parse_int(&cols[0][row]), nullable_string(&cols[1][row])))
+        .map(|row| (parse_int(&cols[0][row]), nullable_text(&cols[1][row])))
         .collect();
     assert_eq!(
         rows,

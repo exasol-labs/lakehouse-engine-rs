@@ -29,7 +29,7 @@ Reads the AWS Glue Data Catalog API for the `GLUE` catalog kind. The client list
 * *GIVEN* an admitted Iceberg table whose `Parameters.metadata_location` names its `metadata.json`, and whose Glue columns carry Hive type strings with `iceberg.field.id` parameters
 * *WHEN* the client lists the database, and separately loads the table for a pushdown
 * *THEN* the listing SHALL read that metadata file through the CONNECTION's storage and SHALL take the columns from its current schema
-* *AND* the client MUST NOT read the table's Glue columns
+* *AND* the client MUST NOT read the table's Glue columns in either case
 * *AND* the neutral table SHALL carry the metadata location in both cases
 * *AND* the load for a pushdown MUST NOT read the metadata file, because the Iceberg planner reads it (`vs-adapter/glue-table-planning`)
 * *AND* an Iceberg table with an absent or empty `metadata_location` SHALL be a skip naming that parameter
@@ -53,6 +53,7 @@ Reads the AWS Glue Data Catalog API for the `GLUE` catalog kind. The client list
 * *AND* each partition's format SHALL come from its own `InputFormat`, falling back to the table's when the partition declares none, so the ORC partition reports that it is not Parquet and names its input format
 * *AND* each location SHALL be returned verbatim apart from a removed trailing `/`
 * *AND* a partition whose value count differs from the partition-key count SHALL fail with an error naming the partition's location
+* *AND* an unpartitioned table, which registers no partition in Glue, SHALL read as ONE Parquet partition at the table's own location, with no value and no `GetPartitions` call
 
 ### Scenario: Every listing follows its continuation tokens and stops on an empty page
 

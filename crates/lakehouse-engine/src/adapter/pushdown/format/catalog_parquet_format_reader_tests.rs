@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use super::super::ConnectionStorage;
 use super::super::delta_schema::build_delta_table_schema;
 use super::*;
@@ -6,7 +8,7 @@ use crate::adapter::pushdown::test_support::filter_json::{
 };
 use crate::adapter::pushdown::test_support::{
     GlueEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, closed_port_storage, object_endpoint,
-    sample_storage, unauthenticated_creds,
+    sample_storage, unauthenticated_creds, user_message,
 };
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
 use crate::scan::spec::reconstruct_abs_uri;
@@ -135,10 +137,7 @@ async fn resolve_with(
 }
 
 fn user_outcome(outcome: Result<ResolvedScan, UdfError>) -> Result<ResolvedScan, String> {
-    outcome.map_err(|error| match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    })
+    outcome.map_err(user_message)
 }
 
 async fn resolve(table: &CatalogTable, keys: &[&str]) -> ResolvedScan {
@@ -449,21 +448,11 @@ fn decimal(precision: u8, scale: u8) -> DeltaType {
 /// Scenario: Every Hive primitive type maps to its Spark type
 #[test]
 fn glue_columns_are_classified_by_the_spark_type_classifier() {
+    // The parser's full type table is in `types/hive_type_tests.rs`; this proves the composition.
     let columns = [
-        ("c_tinyint", "tinyint", DeltaType::BYTE),
-        ("c_smallint", "smallint", DeltaType::SHORT),
         ("c_int", "int", DeltaType::INTEGER),
-        ("c_integer", "integer", DeltaType::INTEGER),
-        ("c_bigint", "bigint", DeltaType::LONG),
-        ("c_float", "float", DeltaType::FLOAT),
-        ("c_double", "double", DeltaType::DOUBLE),
-        ("c_boolean", "boolean", DeltaType::BOOLEAN),
-        ("c_string", "string", DeltaType::STRING),
         ("c_varchar", "varchar(10)", DeltaType::STRING),
-        ("c_char", "char(5)", DeltaType::STRING),
-        ("c_date", "date", DeltaType::DATE),
         ("c_timestamp", "timestamp", DeltaType::TIMESTAMP_NTZ),
-        ("c_decimal", "decimal", decimal(10, 0)),
         ("c_decimal_10_2", "decimal(10,2)", decimal(10, 2)),
         ("c_decimal_38_10", "DECIMAL( 38 , 10 )", decimal(38, 10)),
     ];
@@ -506,11 +495,6 @@ fn glue_nested_columns_carry_the_string_tag_and_a_nested_descriptor() {
     };
     let columns = [
         (
-            "c_array",
-            "array<int>",
-            DeltaType::Array(Box::new(ArrayType::new(DeltaType::INTEGER, true))),
-        ),
-        (
             "c_map",
             "map<varchar(1),int>",
             DeltaType::Map(Box::new(MapType::new(
@@ -518,14 +502,6 @@ fn glue_nested_columns_carry_the_string_tag_and_a_nested_descriptor() {
                 DeltaType::INTEGER,
                 true,
             ))),
-        ),
-        (
-            "c_struct",
-            "struct<x:int,y:string>",
-            nullable_struct(vec![
-                StructField::nullable("x", DeltaType::INTEGER),
-                StructField::nullable("y", DeltaType::STRING),
-            ]),
         ),
         (
             "c_array_of_struct",
@@ -991,7 +967,6 @@ fn partition(
             .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
             .collect(),
         location: location.to_string(),
-        format: (input_format == PARQUET_INPUT_FORMAT).then_some(TableFormat::Parquet),
         input_format: input_format.to_string(),
     }
 }

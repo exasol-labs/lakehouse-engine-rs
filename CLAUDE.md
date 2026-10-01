@@ -281,11 +281,11 @@ Exasol surface Parquet vectors, lists, and structs — they arrive as queryable 
   host-glibc `.so` that fails to load in Exasol. Host `cargo test` (debug) is fine.
 - Three library crates, one `.so`: `crates/lakehouse-engine` (Iceberg + Delta file planning, scan-spec
   wire format, Exasol CONNECTION parsing, VS adapter, DataFusion-in-UDF scan) depends on
-  `crates/lakehouse-catalog` (Iceberg REST + Unity Catalog access — `CatalogSession`, auth, namespace
-  enumeration, vended-storage resolution, SigV4 signing) and `crates/vs-expression` (SQL expression
-  translation). Both compile into the engine's cdylib, so one `.so` exports **all three** entry
-  points (VS adapter + DataFusion scan UDF + version query UDF); the Rust SLC supports multiple
-  entry points per `.so`.
+  `crates/lakehouse-catalog` (Iceberg REST, Unity Catalog, and AWS Glue access — `CatalogSession`,
+  `GlueCatalogSession`, auth, namespace enumeration, vended-storage resolution, SigV4 signing) and
+  `crates/vs-expression` (SQL expression translation). Both compile into the engine's cdylib, so one
+  `.so` exports **all three** entry points (VS adapter + DataFusion scan UDF + version query UDF);
+  the Rust SLC supports multiple entry points per `.so`.
 - SDK: `exasol-udf-sdk` + `exasol-udf-macros`, pinned **only** in `[workspace.dependencies]` of the
   root `Cargo.toml`. `connect-back` is **always-on** (not a feature flag).
   Enable `emit-arrow` to unlock `ctx.emit_batch`.

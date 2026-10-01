@@ -623,7 +623,7 @@ fn insert_skipped_tables(notes: &mut serde_json::Map<String, Json>, skipped: &[S
         .collect();
     notes.insert(NOTE_SKIPPED_TABLES.to_string(), Json::Array(Vec::new()));
     notes.remove(NOTE_SKIPPED_TABLES_OMITTED);
-    let base_len = Json::Object(notes.clone()).to_string().len();
+    let base_len = serde_json::to_string(&*notes).map_or(0, |text| text.len());
     let (kept, omitted) = fit_skipped_tables(entries, base_len);
     notes.insert(NOTE_SKIPPED_TABLES.to_string(), Json::Array(kept));
     if omitted > 0 {
@@ -636,23 +636,20 @@ fn insert_skipped_tables(notes: &mut serde_json::Map<String, Json>, skipped: &[S
 
 /// Keeps the longest listing-order prefix of `entries` whose notes stay within
 /// [`ADAPTER_NOTES_MAX_BYTES`]; `base_len` is the notes length holding an empty list.
-fn fit_skipped_tables(entries: Vec<Json>, base_len: usize) -> (Vec<Json>, usize) {
+fn fit_skipped_tables(mut entries: Vec<Json>, base_len: usize) -> (Vec<Json>, usize) {
     let total = entries.len();
-    let mut used = base_len + omitted_entry_len(total);
-    let mut kept: Vec<Json> = Vec::new();
-    for entry in entries {
-        let separator = usize::from(!kept.is_empty());
-        let cost = separator + entry.to_string().len();
-        let after = used + cost - omitted_entry_len(total - kept.len())
-            + omitted_entry_len(total - kept.len() - 1);
-        if after > ADAPTER_NOTES_MAX_BYTES {
+    let notes_len =
+        |kept: usize, kept_len: usize| base_len + kept_len + omitted_entry_len(total - kept);
+    let (mut kept, mut kept_len) = (0, 0);
+    for entry in &entries {
+        let next_len = kept_len + usize::from(kept > 0) + entry.to_string().len();
+        if notes_len(kept + 1, next_len) > ADAPTER_NOTES_MAX_BYTES {
             break;
         }
-        used = after;
-        kept.push(entry);
+        (kept, kept_len) = (kept + 1, next_len);
     }
-    let omitted = total - kept.len();
-    (kept, omitted)
+    entries.truncate(kept);
+    (entries, total - kept)
 }
 
 /// Serialized length of the `SKIPPED_TABLES_OMITTED` entry, leading comma included.

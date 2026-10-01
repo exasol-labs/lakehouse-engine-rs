@@ -1,7 +1,5 @@
-//! E2E tests of `CATALOG_KIND = 'GLUE'` against a real AWS Glue Data Catalog and S3 bucket, with
-//! a local Exasol. Each test provisions its own `GlueRun`, whose `Drop` removes the run's
-//! database and prefix when the test returns or panics. Tests run with `--test-threads=1`
-//! because they share one Exasol provisioning and one virtual schema name.
+//! `CATALOG_KIND = 'GLUE'` against real AWS Glue and S3 with a local Exasol. Run with
+//! `--test-threads=1`: the tests share one Exasol provisioning and one virtual schema name.
 #![cfg(feature = "glue-e2e")]
 
 mod common;
@@ -9,7 +7,8 @@ mod common;
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, assert_query_fails,
     assert_text_columns, create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql,
-    install_slc, pairs, parse_int, query_error, upload_so, value_to_string,
+    install_slc, int_column, pairs, parse_int, query_error, text_column, upload_so,
+    value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::glue::{
@@ -63,18 +62,11 @@ impl GlueFixture {
     /// leaves no resource.
     fn register(env: GlueEnv) -> Self {
         let rt = runtime();
-        let run = rt
-            .block_on(GlueRun::create(&env))
-            .unwrap_or_else(|e| panic!("{}", env.redact(&format!("create the Glue run: {e:#}"))));
-        rt.block_on(register_fixture_set(&run)).unwrap_or_else(|e| {
-            panic!(
-                "{}",
-                env.redact(&format!(
-                    "register the fixture set in {}: {e:#}",
-                    run.database()
-                ))
-            )
-        });
+        let run = env.expect(rt.block_on(GlueRun::create(&env)), "create the Glue run");
+        env.expect(
+            rt.block_on(register_fixture_set(&run)),
+            &format!("register the fixture set in {}", run.database()),
+        );
         Self { run }
     }
 
@@ -128,17 +120,6 @@ fn create_glue_virtual_schema(env: &GlueEnv, namespace: &str) {
     );
 }
 
-fn int_column(column: &[Value]) -> Vec<i64> {
-    column.iter().map(parse_int).collect()
-}
-
-fn text_column(column: &[Value]) -> Vec<Option<String>> {
-    column
-        .iter()
-        .map(|value| (!value.is_null()).then(|| value_to_string(value)))
-        .collect()
-}
-
 fn partition_files(p_int: &str) -> Vec<&'static str> {
     PARTITIONS
         .iter()
@@ -175,13 +156,15 @@ fn glue_run_resources_are_removed_when_the_scope_ends_including_on_panic() {
     let env = GlueEnv::from_environment();
     let rt = runtime();
     let assert_removed = |database: &str, prefix: &str, how: &str| {
-        let exists = rt
-            .block_on(env.database_exists(database))
-            .unwrap_or_else(|e| panic!("{}", env.redact(&format!("check {database}: {e:#}"))));
+        let exists = env.expect(
+            rt.block_on(env.database_exists(database)),
+            &format!("check {database}"),
+        );
         assert!(!exists, "{how}: Glue database {database} must be deleted");
-        let left = rt
-            .block_on(env.object_keys(prefix))
-            .unwrap_or_else(|e| panic!("{}", env.redact(&format!("list {prefix}: {e:#}"))));
+        let left = env.expect(
+            rt.block_on(env.object_keys(prefix)),
+            &format!("list {prefix}"),
+        );
         assert!(
             left.is_empty(),
             "{how}: every object under {prefix} must be deleted, found {left:?}"
@@ -189,27 +172,25 @@ fn glue_run_resources_are_removed_when_the_scope_ends_including_on_panic() {
     };
 
     let (database, prefix) = {
-        let run = rt
-            .block_on(GlueRun::create(&env))
-            .unwrap_or_else(|e| panic!("{}", env.redact(&format!("create a run: {e:#}"))));
-        rt.block_on(register_probe_table(&run))
-            .unwrap_or_else(|e| panic!("{}", env.redact(&format!("register the probe: {e:#}"))));
+        let run = env.expect(rt.block_on(GlueRun::create(&env)), "create a run");
+        env.expect(
+            rt.block_on(register_probe_table(&run)),
+            "register the probe",
+        );
         assert!(
-            rt.block_on(env.database_exists(&run.database()))
-                .unwrap_or_else(|e| panic!(
-                    "{}",
-                    env.redact(&format!("check {}: {e:#}", run.database()))
-                )),
+            env.expect(
+                rt.block_on(env.database_exists(&run.database())),
+                &format!("check {}", run.database()),
+            ),
             "the run's database {} must exist while the run is in scope",
             run.database()
         );
         assert!(
-            !rt.block_on(env.object_keys(&run.object_prefix()))
-                .unwrap_or_else(|e| panic!(
-                    "{}",
-                    env.redact(&format!("list {}: {e:#}", run.object_prefix()))
-                ))
-                .is_empty(),
+            !env.expect(
+                rt.block_on(env.object_keys(&run.object_prefix())),
+                &format!("list {}", run.object_prefix()),
+            )
+            .is_empty(),
             "the probe must have written an object under {}",
             run.object_prefix()
         );
@@ -220,12 +201,8 @@ fn glue_run_resources_are_removed_when_the_scope_ends_including_on_panic() {
     let created = Mutex::new(None);
     let outcome = rt.block_on(
         AssertUnwindSafe(async {
-            let run = GlueRun::create(&env)
-                .await
-                .unwrap_or_else(|e| panic!("{}", env.redact(&format!("create a run: {e:#}"))));
-            register_probe_table(&run).await.unwrap_or_else(|e| {
-                panic!("{}", env.redact(&format!("register the probe: {e:#}")))
-            });
+            let run = env.expect(GlueRun::create(&env).await, "create a run");
+            env.expect(register_probe_table(&run).await, "register the probe");
             *created.lock().expect("the name slot is never poisoned") =
                 Some((run.database(), run.object_prefix()));
             panic!("deliberate panic to exercise the run's Drop while unwinding inside block_on");
@@ -303,9 +280,10 @@ fn glue_fixture_set_registers_every_case() {
     let metadata_key = metadata_location
         .strip_prefix(&format!("s3://{}/", env.fixture_bucket))
         .expect("the metadata file lives in the fixture bucket");
-    let objects = rt
-        .block_on(env.object_keys(&run.object_prefix()))
-        .unwrap_or_else(|e| panic!("{}", env.redact(&format!("list the run prefix: {e:#}"))));
+    let objects = env.expect(
+        rt.block_on(env.object_keys(&run.object_prefix())),
+        "list the run prefix",
+    );
     assert!(
         metadata_key.ends_with(".metadata.json") && objects.iter().any(|key| key == metadata_key),
         "metadata_location {metadata_location} must name a metadata file iceberg-rust wrote"
@@ -603,7 +581,7 @@ fn glue_partition_cases_return_their_glue_values() {
         int_column(&rows[2]),
         PARTITIONED_ROWS
             .iter()
-            .map(|r| i64::from(r.p_int))
+            .map(|r| r.p_int())
             .collect::<Vec<_>>(),
         "P_INT comes from each partition's Glue values"
     );
@@ -611,14 +589,14 @@ fn glue_partition_cases_return_their_glue_values() {
         text_column(&rows[3]),
         PARTITIONED_ROWS
             .iter()
-            .map(|r| Some(r.p_date.to_string()))
+            .map(|r| Some(r.p_date().to_string()))
             .collect::<Vec<_>>()
     );
     assert_eq!(
         text_column(&rows[4]),
         PARTITIONED_ROWS
             .iter()
-            .map(|r| r.p_str.map(str::to_string))
+            .map(|r| r.p_str().map(str::to_string))
             .collect::<Vec<_>>(),
         "the default partition reads NULL, a b/c reads decoded, and the out-of-root and s3a:// \
          partitions read their Glue values, never a value parsed from a path"

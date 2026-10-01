@@ -1,6 +1,6 @@
 use crate::CatalogPartition;
 
-use super::routing::{PARQUET_INPUT_FORMAT, format_of_input_format};
+use super::routing::PARQUET_INPUT_FORMAT;
 use super::source::GluePartition;
 use super::trim_location;
 
@@ -43,7 +43,6 @@ pub(super) fn neutral_partition(
             .zip(values.iter().map(|value| partition_value(value)))
             .collect(),
         location: trim_location(location).to_string(),
-        format: format_of_input_format(input_format),
         input_format: input_format.to_string(),
     })
 }

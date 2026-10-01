@@ -1,4 +1,3 @@
-use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -10,7 +9,7 @@ use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
 use lakehouse_catalog::{
     CatalogColumn, CatalogPartition, CatalogTable, ColumnSourceType, GlueCatalogSession,
-    StorageBackend, TableFormat,
+    StorageBackend,
 };
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
@@ -38,9 +37,8 @@ use crate::types::mapping::arrow_type_from_tag;
 #[path = "catalog_parquet_format_reader_tests.rs"]
 mod tests;
 
-/// Plans a catalog-declared Parquet table: the catalog is the schema authority, files supply
-/// only the listing and partition values. Every Spark type goes through the Delta classifier,
-/// so Spark-type mapping lives in one place (`vs-adapter/glue-table-planning`).
+/// The catalog is the schema authority; files supply only the listing and partition values. Every
+/// Spark type goes through the one Delta classifier (`vs-adapter/glue-table-planning`).
 pub(super) struct CatalogParquetFormatReader<'a> {
     pub(super) table: &'a CatalogTable,
     pub(super) files: ParquetFileSource<'a>,
@@ -116,7 +114,7 @@ async fn plan_glue_table(
     let secrets = storage.secret_values();
     let planned = async {
         let table_root = scan_table_root(location)?;
-        let partitions = glue_partitions(session, table, location).await?;
+        let partitions = session.partitions(table).await?;
         let store =
             build_table_root_store(storage, &table_root, DEFAULT_S3_MAX_CONNECTIONS, &secrets)?;
         let files = plan_glue_partitions(&store, location, partitions, keep).await?;
@@ -130,26 +128,6 @@ async fn plan_glue_table(
     })
 }
 
-/// An unpartitioned table is one partition at its own location, which routing admitted as
-/// Parquet.
-async fn glue_partitions(
-    session: &GlueCatalogSession,
-    table: &CatalogTable,
-    location: &str,
-) -> Result<Vec<CatalogPartition>, UdfError> {
-    if table.partition_columns.is_empty() {
-        return Ok(vec![CatalogPartition {
-            values: BTreeMap::new(),
-            location: location.to_string(),
-            format: Some(TableFormat::Parquet),
-            input_format: String::new(),
-        }]);
-    }
-    session
-        .partitions(&table.ident, &table.partition_columns)
-        .await
-}
-
 /// The scan parses its table root as a URL, so the raw key's `%`, `#`, and `?` are escaped, and
 /// `s3a` reads as `s3` so every file of the table addresses one store.
 fn scan_table_root(location: &str) -> Result<String, UdfError> {
@@ -160,9 +138,8 @@ fn scan_table_root(location: &str) -> Result<String, UdfError> {
     ))
 }
 
-/// Lists each kept partition's location by its raw key under the `*` pattern, so a nested
-/// partition location is never read twice, and gives each file its partition's Glue values,
-/// never a value parsed from its path. A file outside `table_location` keeps an absolute path.
+/// Only direct children are listed, so a nested partition location is never read twice. Values
+/// are Glue's, never parsed from the path; a file outside `table_location` keeps an absolute path.
 async fn plan_glue_partitions(
     store: &Arc<dyn ObjectStore>,
     table_location: &str,
@@ -184,7 +161,7 @@ async fn plan_glue_partitions(
     let (store_root, table_prefix) = (store_root.as_str(), &table_prefix);
     let listed: Vec<Vec<FileEntry>> = stream::iter(kept)
         .map(|(prefix, values)| async move {
-            let files = list_location_files(store, &prefix, FilePattern::ANY_DIRECT_CHILD).await?;
+            let files = list_location_files(store, &prefix, FilePattern::AnyDirectChild).await?;
             Ok::<_, UdfError>(
                 files
                     .into_iter()
@@ -200,7 +177,7 @@ async fn plan_glue_partitions(
                     .collect(),
             )
         })
-        .buffered(DEFAULT_S3_MAX_CONNECTIONS)
+        .buffer_unordered(DEFAULT_S3_MAX_CONNECTIONS)
         .try_collect()
         .await?;
 
@@ -228,7 +205,7 @@ fn readable_partition_prefix(
             partition.location
         ))
     };
-    if partition.format != Some(TableFormat::Parquet) {
+    if !partition.is_parquet() {
         return Err(refused(format!(
             "its input format '{}' is not Parquet",
             partition.input_format

@@ -68,6 +68,47 @@ fn ensure_table_has_a_mappable_column(
     )))
 }
 
+/// Shared by every source, so each binary refusal reads alike
+/// (`vs-adapter/binary-column-refusal`).
+fn binary_cause(declared: &str) -> String {
+    format!(
+        "has type '{declared}', which this engine refuses: rendering binary data is tracked as \
+         issue #351"
+    )
+}
+
+/// `member_path` is `None` when the column's own type is the binary one.
+fn binary_refusal(
+    label: &str,
+    column: &str,
+    member_path: Option<&str>,
+    declared: &str,
+) -> RefusedColumn {
+    let subject = match member_path {
+        Some(member_path) => format!("{label} column '{column}', whose member '{member_path}'"),
+        None => format!("{label} column '{column}'"),
+    };
+    RefusedColumn {
+        column_name: column.to_string(),
+        reason: format!("{subject} {}", binary_cause(declared)),
+    }
+}
+
+/// The listing still declares a refused column, so only a request reading one fails.
+fn without_refused_columns(
+    mut logical_schema: Vec<LogicalField>,
+    refused_columns: &[RefusedColumn],
+    table_kind: &str,
+) -> Result<Vec<LogicalField>, UdfError> {
+    logical_schema.retain(|field| {
+        refused_columns
+            .iter()
+            .all(|refused| refused.column_name != field.name)
+    });
+    ensure_table_has_a_mappable_column(&logical_schema, refused_columns, table_kind)?;
+    Ok(logical_schema)
+}
+
 /// Checked before any credential or storage access; neither the catalog URI nor the
 /// CONNECTION endpoint may substitute for an empty location.
 fn checked_storage_location<'t>(

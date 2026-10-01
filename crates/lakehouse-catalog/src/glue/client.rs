@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -5,7 +6,7 @@ use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
 
 use crate::client::{dotted_identifier, iceberg_catalog_table};
-use crate::redaction::redact_secret_values;
+use crate::redaction::redact_error_text;
 use crate::sigv4::required_signing_region;
 use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
@@ -14,7 +15,7 @@ use crate::{
 };
 
 use super::partitions::neutral_partition;
-use super::routing::{Route, route};
+use super::routing::{PARQUET_INPUT_FORMAT, Route, route};
 use super::sdk::SdkGlueSource;
 use super::source::{GlueColumn, GlueFailure, GlueSource, GlueTable};
 use super::trim_location;
@@ -57,22 +58,35 @@ impl GlueCatalogSession {
         planning_table(ident, &table)
     }
 
-    /// The registered partitions of a Parquet table, each value keyed by the matching entry
-    /// of `partition_columns`, the table's partition keys in Glue order.
+    /// The registered partitions of a Parquet table, each value keyed by its partition column.
+    /// An unpartitioned table registers none, so it reads as one partition at its own location.
     pub async fn partitions(
         &self,
-        ident: &CatalogTableIdent,
-        partition_columns: &[String],
+        table: &CatalogTable,
     ) -> Result<Vec<CatalogPartition>, UdfError> {
+        let ident = &table.ident;
+        if table.partition_columns.is_empty() {
+            let location = table.storage_location.clone().ok_or_else(|| {
+                UdfError::User(format!(
+                    "Glue table '{}' declares no storage location",
+                    dotted_identifier(ident)
+                ))
+            })?;
+            return Ok(vec![CatalogPartition {
+                values: BTreeMap::new(),
+                location,
+                input_format: PARQUET_INPUT_FORMAT.to_string(),
+            }]);
+        }
         let database = glue_database(&ident.namespace)?;
-        let table = dotted_identifier(ident);
+        let name = dotted_identifier(ident);
         self.source
             .partitions(database, &ident.name)
             .await
             .map_err(|failure| self.glue_error("GetPartitions", &table_subject(ident), &failure))?
             .iter()
             .map(|partition| {
-                neutral_partition(&table, partition_columns, partition)
+                neutral_partition(&name, &table.partition_columns, partition)
                     .map_err(|message| UdfError::User(self.redact(&message)))
             })
             .collect()
@@ -133,7 +147,7 @@ impl GlueCatalogSession {
 
     fn redact(&self, text: &str) -> String {
         let secrets: Vec<&str> = self.secrets.iter().map(String::as_str).collect();
-        redact_secret_values(text, &secrets)
+        redact_error_text(text, &secrets)
     }
 }
 

@@ -7,7 +7,7 @@ use exasol_udf_sdk::error::UdfError;
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
 use crate::types::mapping::exasol_representable_catalog_decimal;
 
-use super::RefusedColumn;
+use super::{RefusedColumn, binary_cause};
 
 #[cfg(test)]
 #[path = "delta_schema_tests.rs"]
@@ -381,15 +381,6 @@ fn refused_container_member(
         "{label} column '{}' has type '{}', whose member '{member_path}' {cause}",
         column.name(),
         column.data_type(),
-    )
-}
-
-/// Shared by every source, so each binary refusal reads alike
-/// (`vs-adapter/binary-column-refusal`).
-pub(super) fn binary_cause(declared: &str) -> String {
-    format!(
-        "has type '{declared}', which this engine refuses: rendering binary data is tracked as \
-         issue #351"
     )
 }
 

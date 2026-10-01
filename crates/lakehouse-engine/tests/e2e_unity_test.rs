@@ -171,9 +171,8 @@ fn struct_type(members: &[(&str, &str)]) -> Json {
     json!({"type": "struct", "fields": fields})
 }
 
-/// Each column is its name, its Spark type (the `type` of the `StructField` JSON the reader
-/// reads), and its Unity Catalog `type_name`; `partitions` lists the partition columns in
-/// order. Replaces any earlier registration, so a changed fixture never meets a stale one.
+/// A column's Spark type is the `type` of the `StructField` JSON the reader reads. Replaces any
+/// earlier registration, so a changed fixture never meets a stale one.
 fn register_unity_table(
     name: &str,
     format: &str,

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex};
 
 use iceberg::spec::{PrimitiveType, TableMetadata, Type};
@@ -390,16 +390,57 @@ async fn a_partition_that_does_not_match_the_keys_fails_naming_its_location() {
 
     let message = user_message(
         session(fake)
-            .partitions(
-                &ident("events"),
-                &["p_int".to_string(), "p_str".to_string()],
-            )
+            .partitions(&parquet_table(&["p_int", "p_str"]))
             .await
             .expect_err("one value for two keys fails"),
     );
 
     assert!(message.contains("p_int=1"), "{message}");
     assert_no_credential(&message);
+}
+
+#[tokio::test]
+async fn an_unpartitioned_table_reads_as_one_parquet_partition_at_its_location() {
+    let calls = Arc::default();
+    let session = session(FakeGlue {
+        calls: Arc::clone(&calls),
+        ..FakeGlue::default()
+    });
+
+    let partitions = session
+        .partitions(&parquet_table(&[]))
+        .await
+        .expect("an unpartitioned table needs no GetPartitions");
+
+    assert_eq!(
+        partitions,
+        [CatalogPartition {
+            values: BTreeMap::new(),
+            location: "s3://bucket/events".to_string(),
+            input_format: PARQUET_INPUT_FORMAT.to_string(),
+        }]
+    );
+    assert!(partitions[0].is_parquet());
+    assert!(
+        calls.lock().expect("calls").is_empty(),
+        "no Glue call is issued"
+    );
+}
+
+fn parquet_table(partition_columns: &[&str]) -> CatalogTable {
+    CatalogTable {
+        ident: ident("events"),
+        table_type: CatalogTableType::Table,
+        storage_location: Some("s3://bucket/events".to_string()),
+        format: TableFormat::Parquet,
+        vended_credential_key: None,
+        partition_columns: partition_columns
+            .iter()
+            .map(|column| column.to_string())
+            .collect(),
+        columns: Vec::new(),
+        metadata_location: None,
+    }
 }
 
 /// Scenario: A Glue NAMESPACE names exactly one database

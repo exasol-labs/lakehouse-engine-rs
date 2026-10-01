@@ -144,13 +144,3 @@ fn route_skips_a_projection_enabled_parquet_table_stating_it_would_read_no_rows(
         Route::Parquet
     );
 }
-
-#[test]
-fn input_format_names_the_parquet_format_only_for_the_mapred_parquet_input_format() {
-    assert_eq!(
-        format_of_input_format(PARQUET_INPUT_FORMAT),
-        Some(TableFormat::Parquet)
-    );
-    assert_eq!(format_of_input_format(ORC_INPUT_FORMAT), None);
-    assert_eq!(format_of_input_format(""), None);
-}

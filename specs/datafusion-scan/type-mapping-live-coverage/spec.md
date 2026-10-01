@@ -27,14 +27,14 @@ Proves the type mapping against a live Exasol on every source technology. Each t
 * *WHEN* `e2e_direct_storage_test` checks both tables through its direct-storage virtual schema
 * *THEN* each integer column SHALL declare the `DECIMAL(p,0)` of `datafusion-scan/type-mapping` and return its values, `Float32` SHALL declare `DOUBLE`, and `INT96` SHALL declare `TIMESTAMP(3)`
 * *AND* `LargeUtf8` and `ENUM` SHALL return their text, and the decimals that exceed Exasol's `DECIMAL` domain and the time, duration, and interval columns SHALL declare `VARCHAR(2000000)` and return their text
-* *AND* every binary, fixed-length, `UUID`, `BSON`, and unannotated `BYTE_ARRAY` column, and both struct columns, SHALL declare `VARCHAR(2000000)` and fail at plan time naming the type, the member for a struct, and issue #351, per `vs-adapter/binary-column-refusal`
+* *AND* every binary, fixed-length, `UUID`, `BSON`, and unannotated `BYTE_ARRAY` column, and both struct columns, SHALL declare `VARCHAR(2000000)` and fail at plan time per `vs-adapter/binary-column-refusal`
 
 ### Scenario: Every Iceberg type declares and returns its mapped value through the Iceberg REST catalog
 
 * *GIVEN* the Iceberg tables the suite seeds in its REST catalog namespace: `all_types`, with an `int`, `float`, `decimal(10,2)`, `decimal(38,10)`, `boolean`, `time`, `timestamptz`, `timestamp_ns`, `binary`, `fixed(16)`, `uuid`, and `struct<x: binary>` column, and `binary_values`, whose `string` column holds bytes that are not valid UTF-8
 * *WHEN* `e2e_scan_test` checks both tables through its Iceberg REST virtual schema
 * *THEN* `int`, `float`, `decimal(10,2)`, and `boolean` SHALL declare `DECIMAL(10,0)`, `DOUBLE`, `DECIMAL(10,2)`, and `BOOLEAN`, `decimal(38,10)` and `time` SHALL declare `VARCHAR(2000000)`, and `timestamptz` and `timestamp_ns` SHALL declare their gated precision, each returning its values
-* *AND* `binary`, `fixed(16)`, `uuid`, and the struct column SHALL declare `VARCHAR(2000000)` and fail at plan time naming the type, the member for the struct, and issue #351
+* *AND* `binary`, `fixed(16)`, `uuid`, and the struct column SHALL declare `VARCHAR(2000000)` and fail at plan time per `vs-adapter/binary-column-refusal`
 * *AND* reading the `binary_values` column SHALL fail the query, naming the invalid UTF-8 data
 * *AND* the `events` table SHALL declare `ID DECIMAL(20,0)`, `NAME VARCHAR(2000000)`, `SCORE DOUBLE`, `EVENT_DATE DATE`, and `EVENT_TS` at its gated precision, exactly, and return its values
 
@@ -43,7 +43,7 @@ Proves the type mapping against a live Exasol on every source technology. Each t
 * *GIVEN* the Delta table `delta_extra_types`, registered in Unity Catalog, whose one-commit log declares a `decimal(38,10)` and a `struct<x: binary>` column
 * *WHEN* `e2e_unity_test` checks it through its Unity Catalog virtual schema
 * *THEN* `decimal(38,10)` SHALL declare `VARCHAR(2000000)` and return its text
-* *AND* the struct column SHALL declare `VARCHAR(2000000)` and fail at plan time naming the column, the member, the type `binary`, and issue #351
+* *AND* the struct column SHALL declare `VARCHAR(2000000)` and fail at plan time per `vs-adapter/binary-column-refusal`
 
 ### Scenario: Every Spark type a Unity Parquet table declares returns its mapped value
 
@@ -57,7 +57,7 @@ Proves the type mapping against a live Exasol on every source technology. Each t
 
 * *GIVEN* the Glue Parquet table `all_types`, which declares every Hive type of `vs-adapter/glue-hive-type-mapping`, and the table `binary_values`, which declares `c_bytes string` over a `BYTE_ARRAY` with no annotation whose bytes are not valid UTF-8
 * *WHEN* `e2e_glue_test` checks both tables through its Glue virtual schema
-* *THEN* each scalar Hive type SHALL declare its Exasol type and return its values, `timestamp` at its gated precision, and a `string` column over an unannotated `BYTE_ARRAY` SHALL return its text
+* *THEN* each scalar Hive type SHALL declare its Exasol type and return its values, `timestamp` at its gated precision, and a `string` column over an unannotated `BYTE_ARRAY` SHALL return its text per `vs-adapter/binary-column-refusal`
 * *AND* each `array`, `map`, and `struct` column SHALL return the JSON document of `datafusion-scan/nested-json-rendering`
-* *AND* `binary` and `struct<b:binary>` SHALL fail at plan time naming the type, the member for the struct, and issue #351, and `uniontype`, `interval_day_time`, a malformed type, and an empty type SHALL fail at plan time naming the Hive type
-* *AND* reading the `binary_values` column SHALL fail the query, naming the invalid UTF-8 sequence
+* *AND* the `binary`, `struct<b:binary>`, `uniontype`, `interval_day_time`, malformed, and empty-type columns SHALL fail at plan time per `vs-adapter/glue-hive-type-mapping`
+* *AND* reading the `binary_values` column SHALL fail the query per `vs-adapter/binary-column-refusal`, naming the invalid UTF-8 sequence

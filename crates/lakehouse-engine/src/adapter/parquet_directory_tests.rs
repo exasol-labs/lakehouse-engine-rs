@@ -1042,11 +1042,10 @@ async fn file_pattern_selects_listing_depth_and_file_name_rule() {
 
     for (pattern, expected) in [
         (
-            FilePattern::PARQUET_AT_ANY_DEPTH,
+            FilePattern::ParquetAtAnyDepth,
             vec!["a.parquet", "sub/c.parquet"],
         ),
-        (FilePattern("*.parquet"), vec!["a.parquet"]),
-        (FilePattern::ANY_DIRECT_CHILD, vec!["a.parquet", "b"]),
+        (FilePattern::AnyDirectChild, vec!["a.parquet", "b"]),
     ] {
         let files = list_location_files(&store, &root(), pattern)
             .await
@@ -1071,9 +1070,9 @@ async fn file_pattern_selects_listing_depth_and_file_name_rule() {
         vec![
             format!("recursive {TABLE_ROOT}"),
             format!("delimited {TABLE_ROOT}"),
-            format!("delimited {TABLE_ROOT}"),
         ],
-        "only a '**' pattern lists recursively; any other lists the direct children alone"
+        "only the any-depth pattern lists recursively; the direct-child one lists the direct \
+         children alone"
     );
     assert!(
         probe.reads().is_empty(),
@@ -1092,7 +1091,7 @@ async fn a_raw_key_location_is_listed_without_percent_decoding() {
 
     let (store_root, prefix) =
         raw_location_prefix(location).expect("an S3 location names a store root and a key");
-    let files = list_location_files(&store, &prefix, FilePattern::ANY_DIRECT_CHILD)
+    let files = list_location_files(&store, &prefix, FilePattern::AnyDirectChild)
         .await
         .expect("the raw key lists");
 
