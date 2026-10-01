@@ -348,9 +348,6 @@ const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
 /// Curated deliberately; see [`rewrite_expr_tree`].
 const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
 
-/// Post-order is load-bearing: Exasol encodes `a||b||c` as `CONCAT(a, CONCAT(b, c))`,
-/// so only a check that sees rewritten children reaches nested occurrences.
-///
 /// `f` returning `None` declines the whole tree; the caller must self-apply it.
 /// `guard_like_subject` (via `like_subject_type_guard`) is the one type-aware `f`.
 ///
@@ -424,8 +421,7 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
             out["expression"] = wrap_cast_to_varchar(subject);
             Some(out)
         }
-        // Other types' string forms diverge between engines, so decline rather than risk
-        // a wrong or hard-failing cast (decision-log [2]).
+        // Every other family declines to native evaluation (#207).
         Some(ExaTypeClass::Decimal | ExaTypeClass::Other) | None => None,
     }
 }

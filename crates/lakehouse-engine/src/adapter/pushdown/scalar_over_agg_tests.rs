@@ -383,6 +383,7 @@ fn probe_col_types() -> Vec<(String, String)> {
         ("C_DATE", "DATE"),
         ("C_TS", "TIMESTAMP(6)"),
         ("C_BOOL", "BOOLEAN"),
+        ("C_TSTZ", "TIMESTAMP WITH LOCAL TIME ZONE"),
     ]
     .iter()
     .map(|(name, ty)| (name.to_string(), ty.to_string()))
@@ -477,6 +478,22 @@ fn nested_min_max_over_a_character_argument_takes_a_character_partial_type() {
             scalar("NULLIF", vec![column("C_CHAR"), string_literal("x")]),
             "CHAR(3) ASCII",
         ),
+        (
+            scalar(
+                "CASE",
+                vec![
+                    predicate("predicate_equal", column("ID"), column("ID")),
+                    column("ID"),
+                    column("C_VARCHAR"),
+                ],
+            ),
+            "VARCHAR(2000000) UTF8",
+        ),
+        (string_literal("a"), "VARCHAR(2000000)"),
+        (
+            scalar("LEAST", vec![column("C_CHAR"), column("C_CHAR")]),
+            "CHAR(3) ASCII",
+        ),
     ];
     for (arg, expected) in cases {
         for kind in ["MAX", "MIN"] {
@@ -518,6 +535,26 @@ fn nested_min_max_over_a_temporal_or_boolean_argument_takes_that_partial_type() 
             "BOOLEAN",
         ),
         (column("C_BOOL"), "BOOLEAN"),
+        (
+            serde_json::json!({"type": "literal_date", "value": "2024-01-01"}),
+            "DATE",
+        ),
+        (
+            serde_json::json!({"type": "literal_timestamp", "value": "2024-01-01 00:00:00"}),
+            "TIMESTAMP",
+        ),
+        (
+            serde_json::json!({"type": "literal_bool", "value": true}),
+            "BOOLEAN",
+        ),
+        (
+            scalar(
+                "REGEXP_LIKE",
+                vec![column("C_VARCHAR"), string_literal("a")],
+            ),
+            "BOOLEAN",
+        ),
+        (scalar("ROUND", vec![column("C_TS")]), "TIMESTAMP(6)"),
     ];
     for (arg, expected) in cases {
         assert_eq!(
@@ -546,6 +583,11 @@ fn nested_aggregate_keeps_the_numeric_default_when_its_argument_is_numeric_or_un
         agg_over("MAX", scalar("ABS", vec![column("UNKNOWN_COLUMN")])),
         agg_over("SUM", scalar("UPPER", vec![column("ID")])),
         agg_over("AVG", column("C_DATE")),
+        agg_over("MAX", column("C_TSTZ")),
+        agg_over(
+            "MAX",
+            scalar("GREATEST", vec![column("C_DATE"), column("C_TS")]),
+        ),
     ];
     for aggregate in cases {
         assert_eq!(
@@ -561,14 +603,14 @@ fn fold_nested_types_a_new_slot_with_its_partial_type() {
     let mut plans = Vec::new();
     let mut types = Vec::new();
 
-    let slot = fold_nested_aggregate_plan(
+    fold_nested_aggregate_plan(
         &mut plans,
         &mut types,
         plan_of(&agg("MAX", "X", false)),
         "VARCHAR(2000000)".to_string(),
     );
 
-    assert_eq!(slot, 0);
+    assert_eq!(plans.len(), 1);
     assert_eq!(types, vec!["VARCHAR(2000000)".to_string()]);
 }
 
@@ -583,14 +625,14 @@ fn fold_nested_never_overwrites_an_existing_slot_type() {
         Some("VARCHAR(20)".to_string()),
     );
 
-    let slot = fold_nested_aggregate_plan(
+    fold_nested_aggregate_plan(
         &mut plans,
         &mut types,
         plan_of(&agg("MAX", "X", false)),
         "VARCHAR(2000000)".to_string(),
     );
 
-    assert_eq!(slot, 0);
+    assert_eq!(plans.len(), 1);
     assert_eq!(
         types,
         vec!["VARCHAR(20)".to_string()],

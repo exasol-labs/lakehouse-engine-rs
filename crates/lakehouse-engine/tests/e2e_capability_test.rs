@@ -4123,11 +4123,6 @@ fn e2e_grouped_string_conversion_repros_carry_exa_to_varchar_in_the_scan_spec() 
         ),
         format!("SELECT UPPER(C_DOUBLE), COUNT(*) FROM {typed} GROUP BY UPPER(C_DOUBLE)"),
     ] {
-        let explained = explain_virtual_sql(&mut conn, &sql);
-        assert!(
-            explained.contains("exa_to_varchar("),
-            "the grouped scan spec must carry exa_to_varchar( for:\n{sql}\n{explained}"
-        );
-        eprintln!("EXPLAIN VIRTUAL evidence: exa_to_varchar( present for: {sql}");
+        assert_scan_spec_carries_exa_to_varchar(&mut conn, &sql);
     }
 }

@@ -2,9 +2,9 @@
 //! planners. This module names neither planner, so the two cannot drift apart.
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
-use crate::types::mapping::exasol_type_from_json;
+use crate::types::mapping::{ExaTypeClass, classify_exa_type, exasol_type_from_json};
 use serde_json::Value as Json;
-use vs_expression::{render_expression, render_expression_exasol};
+use vs_expression::{render_expression, render_expression_exasol, scalar_fn_returns_character};
 
 use super::support::{cast_to_declared_type, quote_ident};
 
@@ -48,10 +48,9 @@ pub(super) fn fold_nested_aggregate_plan(
     plan_types: &mut Vec<String>,
     plan: AggregatePlan,
     partial_type: String,
-) -> usize {
-    match plans.iter().position(|p| *p == plan) {
-        Some(slot) => slot,
-        None => fold_aggregate_plan(plans, plan_types, plan, Some(partial_type)),
+) {
+    if !plans.contains(&plan) {
+        fold_aggregate_plan(plans, plan_types, plan, Some(partial_type));
     }
 }
 
@@ -185,6 +184,10 @@ fn cast_target_type(node: &Json) -> Option<String> {
 }
 
 fn scalar_function_type(node: &Json, col_types: &[(String, String)]) -> Option<String> {
+    let name = node.get("name").and_then(|n| n.as_str())?.to_uppercase();
+    if scalar_fn_returns_character(&name) {
+        return Some(CHARACTER_PARTIAL_TYPE.to_string());
+    }
     let args = node_arguments(node);
     let operand_type = |index: usize| {
         args.get(index)
@@ -192,15 +195,7 @@ fn scalar_function_type(node: &Json, col_types: &[(String, String)]) -> Option<S
     };
     let temporal_operand_type =
         |index: usize| operand_type(index).filter(|ty| is_temporal_type(ty));
-    match node
-        .get("name")
-        .and_then(|n| n.as_str())?
-        .to_uppercase()
-        .as_str()
-    {
-        "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "REPEAT"
-        | "REVERSE" | "LPAD" | "RPAD" | "CHR" | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE"
-        | "UNICODECHR" | "CONCAT" => Some(CHARACTER_PARTIAL_TYPE.to_string()),
+    match name.as_str() {
         "REGEXP_LIKE" => Some("BOOLEAN".to_string()),
         "TO_DATE" => Some("DATE".to_string()),
         "TO_TIMESTAMP" => Some("TIMESTAMP".to_string()),
@@ -242,7 +237,7 @@ fn unified_type<'a>(
 }
 
 fn is_character_type(ty: &str) -> bool {
-    ty.starts_with("VARCHAR") || ty.starts_with("CHAR")
+    classify_exa_type(ty) == ExaTypeClass::Character
 }
 
 fn is_temporal_type(ty: &str) -> bool {

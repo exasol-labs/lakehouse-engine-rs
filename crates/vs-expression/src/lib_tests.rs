@@ -3468,17 +3468,8 @@ fn bool_predicate() -> Json {
 fn string_converted_argument_table_matches_exasol_conversion_positions() {
     let every_argument = ["CONCAT", "TRIM", "LTRIM", "RTRIM", "REPLACE", "TRANSLATE"];
     for name in every_argument {
-        for arity in 1..=4 {
-            for index in 0..arity {
-                assert!(
-                    is_string_converted_arg(name, index, arity),
-                    "{name} index {index} of {arity}"
-                );
-            }
-            assert!(
-                !is_string_converted_arg(name, arity, arity),
-                "{name} beyond"
-            );
+        for index in 0..4 {
+            assert!(is_string_converted_arg(name, index), "{name} index {index}");
         }
     }
 
@@ -3497,29 +3488,27 @@ fn string_converted_argument_table_matches_exasol_conversion_positions() {
         "RIGHT",
     ];
     for name in first_only {
-        assert!(is_string_converted_arg(name, 0, 3), "{name} index 0");
-        assert!(!is_string_converted_arg(name, 1, 3), "{name} index 1");
-        assert!(!is_string_converted_arg(name, 2, 3), "{name} index 2");
+        assert!(is_string_converted_arg(name, 0), "{name} index 0");
+        assert!(!is_string_converted_arg(name, 1), "{name} index 1");
+        assert!(!is_string_converted_arg(name, 2), "{name} index 2");
     }
 
     for name in ["INSTR", "LOCATE"] {
-        assert!(is_string_converted_arg(name, 0, 2), "{name} index 0");
-        assert!(is_string_converted_arg(name, 1, 2), "{name} index 1");
-        assert!(!is_string_converted_arg(name, 2, 3), "{name} index 2");
+        assert!(is_string_converted_arg(name, 0), "{name} index 0");
+        assert!(is_string_converted_arg(name, 1), "{name} index 1");
+        assert!(!is_string_converted_arg(name, 2), "{name} index 2");
     }
 
     for name in ["LPAD", "RPAD"] {
-        assert!(is_string_converted_arg(name, 0, 2), "{name}/2 index 0");
-        assert!(!is_string_converted_arg(name, 1, 2), "{name}/2 index 1");
-        assert!(is_string_converted_arg(name, 0, 3), "{name}/3 index 0");
-        assert!(!is_string_converted_arg(name, 1, 3), "{name}/3 index 1");
-        assert!(is_string_converted_arg(name, 2, 3), "{name}/3 index 2");
+        assert!(is_string_converted_arg(name, 0), "{name} index 0");
+        assert!(!is_string_converted_arg(name, 1), "{name} index 1");
+        assert!(is_string_converted_arg(name, 2), "{name} index 2");
     }
 
     for name in ["CHR", "UNICODECHR", "ABS", "NULLIF", "ROUND", "GREATEST"] {
         for index in 0..3 {
             assert!(
-                !is_string_converted_arg(name, index, 3),
+                !is_string_converted_arg(name, index),
                 "{name} index {index}"
             );
         }
@@ -3897,37 +3886,95 @@ fn exasol_dialect_never_renders_exa_to_varchar() {
     );
 }
 
+/// Declared names whose result is not always character: numeric, temporal, boolean, or
+/// operand-dependent (CAST, CASE, NULLIF, GREATEST, LEAST, ROUND, TRUNC).
+const NON_CHARACTER_RESULT_FNS: &[&str] = &[
+    "ADD",
+    "SUB",
+    "MULT",
+    "FLOAT_DIV",
+    "NEG",
+    "CAST",
+    "REGEXP_LIKE",
+    "MOD",
+    "CASE",
+    "ABS",
+    "FLOOR",
+    "CEIL",
+    "SQRT",
+    "EXP",
+    "LN",
+    "SIGN",
+    "DEGREES",
+    "RADIANS",
+    "SIN",
+    "COS",
+    "TAN",
+    "ASIN",
+    "ACOS",
+    "ATAN",
+    "SINH",
+    "COSH",
+    "TANH",
+    "COT",
+    "ROUND",
+    "TRUNC",
+    "LOG",
+    "POWER",
+    "ATAN2",
+    "ASCII",
+    "LENGTH",
+    "OCTET_LENGTH",
+    "UNICODE",
+    "INSTR",
+    "LOCATE",
+    "GREATEST",
+    "LEAST",
+    "NULLIF",
+    "NULLIFZERO",
+    "ZEROIFNULL",
+    "YEAR",
+    "MONTH",
+    "DAY",
+    "HOUR",
+    "MINUTE",
+    "SECOND",
+    "WEEK",
+    "DATE_TRUNC",
+    "TO_DATE",
+    "TO_TIMESTAMP",
+    "DAYS_BETWEEN",
+    "HOURS_BETWEEN",
+    "MINUTES_BETWEEN",
+    "SECONDS_BETWEEN",
+];
+
 #[test]
-fn exasol_dialect_keeps_boolean_case_rewrite_for_string_casts() {
-    let node = str_cast(bool_predicate(), json!({"type": "VARCHAR", "size": 5}));
-    assert_eq!(
-        render_expression_exasol(&node).unwrap(),
-        r#"(CASE ("C_ACCTBAL" > 0) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
+fn every_translated_scalar_fn_has_a_classified_result_family() {
+    for (name, _) in TRANSLATED_SCALAR_FNS {
+        assert_ne!(
+            scalar_fn_returns_character(name),
+            NON_CHARACTER_RESULT_FNS.contains(name),
+            "{name} must be classified exactly once: as returning character, or in \
+             NON_CHARACTER_RESULT_FNS"
+        );
+    }
+    let undeclared: Vec<&str> = CHARACTER_RESULT_FNS
+        .iter()
+        .chain(NON_CHARACTER_RESULT_FNS)
+        .copied()
+        .filter(|name| declared_scalar_fn(name).is_none())
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "both result-family lists must name only declared functions; undeclared: {undeclared:?}"
     );
 }
 
 #[test]
-fn datafusion_dialect_renders_no_boolean_case_rewrite() {
-    let cast = str_cast(bool_predicate(), json!({"type": "VARCHAR", "size": 5}));
-    let concat = str_call("CONCAT", vec![bool_predicate(), str_col("a")]);
-    for node in [cast, concat] {
-        let rendered = render_expression(&node).unwrap();
-        assert!(!rendered.contains("CASE"), "{rendered}");
-    }
-}
-
-#[test]
-fn string_converted_nodes_render_deterministically() {
-    let nodes = [
-        str_call("UPPER", vec![str_col("c_custkey")]),
-        str_call("CONCAT", vec![str_col("a"), bool_predicate()]),
-        str_call("INSTR", vec![str_col("a"), str_col("b")]),
-        str_cast(str_col("c_acctbal"), json!({"type": "VARCHAR", "size": 20})),
-    ];
-    for node in &nodes {
-        let first = render_expression(node).unwrap();
-        for _ in 0..3 {
-            assert_eq!(render_expression(node).unwrap(), first, "{node}");
-        }
-    }
+fn scalar_fn_returns_character_ignores_case_and_rejects_undeclared_names() {
+    assert!(scalar_fn_returns_character("upper"));
+    assert!(scalar_fn_returns_character("Concat"));
+    assert!(!scalar_fn_returns_character("length"));
+    assert!(!scalar_fn_returns_character("NOT_A_FUNCTION"));
 }

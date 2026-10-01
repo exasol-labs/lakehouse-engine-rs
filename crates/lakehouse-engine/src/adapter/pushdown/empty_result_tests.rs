@@ -790,6 +790,63 @@ fn empty_row_scan_ungrouped_aggregate_returns_one_row() {
     }
 }
 
+fn not_a_function_of_count_star() -> Json {
+    serde_json::json!({
+        "type": "function_scalar",
+        "name": "NOT_A_FUNCTION",
+        "arguments": [agg_item("COUNT", None, false)],
+    })
+}
+
+fn row_scan_empty_result(request: &Json) -> Result<Json, UdfError> {
+    let pushdown_req = pd(request);
+    let col_types = super::super::support::extract_all_column_types(request);
+    assert!(
+        matches!(
+            classify_request_shape(&pushdown_req, &col_types),
+            RequestShape::RowScan
+        ),
+        "the fixture must reach the RowScan arm: {request}"
+    );
+    empty_result_sql(&pushdown_req, &[], &[], true, &col_types)
+}
+
+#[test]
+fn empty_row_scan_ungrouped_aggregate_with_unrenderable_item_errors() {
+    let request = customer_request(serde_json::json!({
+        "aggregationType": "single_group",
+        "selectList": [not_a_function_of_count_star()],
+    }));
+
+    let result = row_scan_empty_result(&request);
+
+    assert!(
+        matches!(&result, Err(UdfError::User(msg)) if msg.contains("select-list item 0")),
+        "an unrenderable item must error, never fall back to a zero-row result: {result:?}"
+    );
+}
+
+#[test]
+fn empty_row_scan_ungrouped_aggregate_with_unrenderable_having_errors() {
+    let request = customer_request(serde_json::json!({
+        "aggregationType": "single_group",
+        "selectList": [agg_item_expr("MAX", instr_of_c_name_from_2(), false)],
+        "selectListDataTypes": [declared_decimal(18, 0)],
+        "having": {
+            "type": "predicate_less",
+            "left": {"type": "literal_exactnumeric", "value": "5"},
+            "right": not_a_function_of_count_star(),
+        },
+    }));
+
+    let result = row_scan_empty_result(&request);
+
+    assert!(
+        matches!(&result, Err(UdfError::User(msg)) if msg.contains("HAVING")),
+        "an unrenderable HAVING must error, never fall back to a zero-row result: {result:?}"
+    );
+}
+
 #[test]
 fn empty_row_scan_ungrouped_aggregate_keeps_having() {
     let request = customer_request(serde_json::json!({

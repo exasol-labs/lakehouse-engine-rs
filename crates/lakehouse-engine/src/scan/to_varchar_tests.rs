@@ -106,6 +106,32 @@ fn invoke(arguments: Vec<ArrayRef>) -> Result<ArrayRef> {
     udf.invoke_with_args(args)?.to_array(rows)
 }
 
+#[test]
+fn exa_to_varchar_return_field_keeps_string_nullability_and_marks_conversions_nullable() {
+    let udf = ScalarUDF::from(ExaToVarcharUdf::new());
+    let return_field_for = |argument: Field| {
+        udf.return_field_from_args(ReturnFieldArgs {
+            arg_fields: &[Arc::new(argument)],
+            scalar_arguments: &[None],
+        })
+        .expect("one argument must yield a return field")
+    };
+
+    let string = return_field_for(Field::new("a", DataType::Utf8, false));
+    assert_eq!(string.data_type(), &DataType::Utf8);
+    assert!(
+        !string.is_nullable(),
+        "a non-nullable string argument must stay non-nullable, since simplify returns it as is"
+    );
+
+    let integer = return_field_for(Field::new("a", DataType::Int64, false));
+    assert_eq!(integer.data_type(), &DataType::Utf8);
+    assert!(
+        integer.is_nullable(),
+        "a converted argument must be nullable, since a conversion can yield NULL"
+    );
+}
+
 async fn optimized_plan(ctx: &SessionContext, sql: &str) -> String {
     ctx.sql(sql)
         .await
@@ -507,8 +533,6 @@ async fn exa_to_varchar_matches_scan_emit_text_for_json_fallback_types() {
     );
 }
 
-/// Issue #200: BOOLEAN-to-string renders Exasol's `TRUE`/`FALSE`, not DataFusion's lowercase. The
-/// tests execute the real `render_expression` output so renderer and result cannot drift.
 fn context_with_acctbal() -> SessionContext {
     session_with(vec![
         (

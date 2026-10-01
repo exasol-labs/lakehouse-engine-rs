@@ -786,6 +786,41 @@ fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
 }
 
 #[test]
+fn single_group_nested_min_max_never_overrides_a_top_level_declared_type() {
+    let max_upper = || agg_item_expr("MAX", upper_c_custkey(), false);
+    let varchar_20 = serde_json::json!({"type": "VARCHAR", "size": 20, "characterSet": "UTF8"});
+    let orders = [
+        (
+            serde_json::json!([max_upper(), length_of(max_upper())]),
+            serde_json::json!([varchar_20, decimal_type(18, 0)]),
+        ),
+        (
+            serde_json::json!([length_of(max_upper()), max_upper()]),
+            serde_json::json!([decimal_type(18, 0), varchar_20]),
+        ),
+    ];
+    for (select_list, declared) in orders {
+        let request = customer_request(serde_json::json!({
+            "aggregationType": "single_group",
+            "selectList": select_list,
+            "selectListDataTypes": declared,
+        }));
+        let items = detect_aggregates(&pd(&request)).expect("MAX and LENGTH(MAX) must detect");
+
+        assert_eq!(
+            single_group_plan_types(
+                &pd(&request),
+                &items,
+                &super::super::support::extract_all_column_types(&request),
+            ),
+            vec!["VARCHAR(20)".to_string()],
+            "the top-level MAX's declared type must win over its nested occurrence: {}",
+            request["pushdownRequest"]["selectList"]
+        );
+    }
+}
+
+#[test]
 fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
     let req = serde_json::json!({
         "selectList": [

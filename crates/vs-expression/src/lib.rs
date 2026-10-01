@@ -124,6 +124,36 @@ fn declared_scalar_fn(name: &str) -> Option<ExasolForm> {
         .map(|(_, form)| *form)
 }
 
+const CHARACTER_RESULT_FNS: &[&str] = &[
+    "LOWER",
+    "UPPER",
+    "SUBSTR",
+    "TRIM",
+    "LTRIM",
+    "RTRIM",
+    "REPLACE",
+    "REPEAT",
+    "REVERSE",
+    "LPAD",
+    "RPAD",
+    "CHR",
+    "INITCAP",
+    "LEFT",
+    "RIGHT",
+    "TRANSLATE",
+    "UNICODECHR",
+    "CONCAT",
+];
+
+/// Whether translated scalar function `fn_name` (any case) returns character text whatever
+/// its argument types. The adapter types a nested MIN/MAX partial from this, so every
+/// `TRANSLATED_SCALAR_FNS` row needs a classification (#227).
+pub fn scalar_fn_returns_character(fn_name: &str) -> bool {
+    CHARACTER_RESULT_FNS
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(fn_name))
+}
+
 fn sql_escape(s: &str) -> String {
     s.replace('\'', "''")
 }
@@ -242,13 +272,10 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
         .collect()
 }
 
-/// Whether Exasol converts argument `index` of `fn_name` (upper-case, `arg_count`
-/// arguments) to text before it evaluates the call (#227). The renderer wraps these
-/// arguments syntactically, because it knows no column types.
-fn is_string_converted_arg(fn_name: &str, index: usize, arg_count: usize) -> bool {
-    if index >= arg_count {
-        return false;
-    }
+/// Whether Exasol converts argument `index` of `fn_name` (upper-case) to text before it
+/// evaluates the call (#227). The renderer wraps these arguments syntactically, because it
+/// knows no column types.
+fn is_string_converted_arg(fn_name: &str, index: usize) -> bool {
     match fn_name {
         "CONCAT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "TRANSLATE" => true,
         "LOWER" | "UPPER" | "ASCII" | "INITCAP" | "REVERSE" | "LENGTH" | "OCTET_LENGTH"
@@ -270,20 +297,13 @@ fn wrap_exa_to_varchar(sql: &str) -> String {
     format!("{EXA_TO_VARCHAR_FN}({sql})")
 }
 
-/// [`render_args`] for a string function: the DataFusion dialect wraps each
-/// string-converted argument, and the Exasol dialect renders them unchanged since
-/// Exasol converts them itself.
-fn render_string_fn_args(
-    fn_name: &str,
-    args: &[Json],
-    dialect: Dialect,
-) -> Result<Vec<String>, UdfError> {
-    let mut rendered = render_args(args, dialect)?;
-    if dialect == Dialect::DataFusion {
-        for (index, sql) in rendered.iter_mut().enumerate() {
-            if is_string_converted_arg(fn_name, index, args.len()) {
-                *sql = wrap_exa_to_varchar(sql);
-            }
+/// The DataFusion-dialect arguments of a string function; the Exasol dialect renders these
+/// calls verbatim at the `VerbatimCall` gate.
+fn render_string_fn_args(fn_name: &str, args: &[Json]) -> Result<Vec<String>, UdfError> {
+    let mut rendered = render_args(args, Dialect::DataFusion)?;
+    for (index, sql) in rendered.iter_mut().enumerate() {
+        if is_string_converted_arg(fn_name, index) {
+            *sql = wrap_exa_to_varchar(sql);
         }
     }
     Ok(rendered)
@@ -887,9 +907,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                                 UdfError::User("CONCAT argument rendered to null".into())
                             })?;
                             Ok(match dialect {
-                                Dialect::DataFusion
-                                    if is_string_converted_arg("CONCAT", index, args.len()) =>
-                                {
+                                Dialect::DataFusion if is_string_converted_arg("CONCAT", index) => {
                                     wrap_exa_to_varchar(&r)
                                 }
                                 Dialect::DataFusion => r,
@@ -931,7 +949,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                             &lower
                         }
                     };
-                    let rendered = render_string_fn_args(&fn_name, args, dialect)?;
+                    let rendered = render_string_fn_args(&fn_name, args)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
                 // DataFusion dialect only: INSTR(s, sub) and LOCATE(sub, s) both map to
@@ -947,7 +965,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                             args.len()
                         )));
                     }
-                    let rendered = render_string_fn_args(&fn_name, args, dialect)?;
+                    let rendered = render_string_fn_args(&fn_name, args)?;
                     let (string, substr) = if fn_name == "INSTR" {
                         (&rendered[0], &rendered[1])
                     } else {

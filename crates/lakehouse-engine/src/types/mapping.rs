@@ -432,7 +432,8 @@ fn unity_type_name_to_exasol(
     }
 }
 
-/// Coarse Exasol type-string family; `guard_like_subject` is its one consumer.
+/// Coarse Exasol type-string family, branched on by `guard_like_subject` (`adapter/pushdown/support.rs`),
+/// the emitted-column `nullif` guard (`scan/join_scan.rs`), and nested MIN/MAX typing (`scalar_over_agg.rs`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExaTypeClass {
     Character,
@@ -441,8 +442,9 @@ pub enum ExaTypeClass {
     Other,
 }
 
-/// Sole consumer: `guard_like_subject` in `adapter/pushdown/support.rs`. Matches the
-/// `"DECIMAL"` prefix, not `"DECIMAL("`, so a bare `DECIMAL` also classifies as Decimal.
+/// Consumers: `guard_like_subject` (`adapter/pushdown/support.rs`), `scan/join_scan.rs`, and
+/// `scalar_over_agg.rs`. Matches the `"DECIMAL"` prefix, not `"DECIMAL("`, so a bare `DECIMAL` also
+/// classifies as Decimal.
 pub fn classify_exa_type(type_str: &str) -> ExaTypeClass {
     if type_str.starts_with("VARCHAR") || type_str.starts_with("CHAR") {
         ExaTypeClass::Character
