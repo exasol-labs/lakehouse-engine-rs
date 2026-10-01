@@ -471,7 +471,7 @@ fn coerce_batch_casts_every_column_to_declared_exatype() {
             .unwrap(),
     );
     let date: Arc<dyn arrow::array::Array> = Arc::new(Date32Array::from(vec![0, 1, 2]));
-    // The shape `decimal_to_varchar_exasol`'s `regexp_replace(...)` chain produces (#211).
+    // The Utf8View shape a DataFusion string function such as `regexp_replace` produces.
     let utf8view_to_varchar: Arc<dyn arrow::array::Array> =
         Arc::new(StringViewArray::from(vec!["a", "b", "c"]));
     let utf8view_to_char: Arc<dyn arrow::array::Array> =

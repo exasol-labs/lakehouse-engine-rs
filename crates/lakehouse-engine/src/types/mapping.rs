@@ -432,6 +432,7 @@ fn unity_type_name_to_exasol(
     }
 }
 
+/// Coarse Exasol type-string family; `guard_like_subject` is its one consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExaTypeClass {
     Character,
@@ -440,8 +441,8 @@ pub enum ExaTypeClass {
     Other,
 }
 
-/// Matches the `"DECIMAL"` prefix, not `"DECIMAL("`, so a bare `DECIMAL` also classifies as
-/// Decimal.
+/// Sole consumer: `guard_like_subject` in `adapter/pushdown/support.rs`. Matches the
+/// `"DECIMAL"` prefix, not `"DECIMAL("`, so a bare `DECIMAL` also classifies as Decimal.
 pub fn classify_exa_type(type_str: &str) -> ExaTypeClass {
     if type_str.starts_with("VARCHAR") || type_str.starts_with("CHAR") {
         ExaTypeClass::Character

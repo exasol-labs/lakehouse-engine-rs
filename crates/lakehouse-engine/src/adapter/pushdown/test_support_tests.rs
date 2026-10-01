@@ -613,6 +613,142 @@ pub(super) fn agg_item_expr(
     })
 }
 
+/// The DataFusion text of `UPPER(c_custkey)`, which every #227 surface must match on.
+pub(super) const UPPER_C_CUSTKEY_SQL: &str = r#"upper(exa_to_varchar("C_CUSTKEY"))"#;
+
+pub(super) fn upper_c_custkey() -> Json {
+    serde_json::json!({
+        "type": "function_scalar",
+        "name": "UPPER",
+        "arguments": [{"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}],
+    })
+}
+
+/// `MAX(UPPER(c_custkey)) || '-' || MIN(UPPER(c_custkey))` in the nested-CONCAT form
+/// Exasol sends for `a || b || c`.
+pub(super) fn concat_max_dash_min_of_upper_c_custkey() -> Json {
+    serde_json::json!({
+        "type": "function_scalar",
+        "name": "CONCAT",
+        "arguments": [
+            agg_item_expr("MAX", upper_c_custkey(), false),
+            {
+                "type": "function_scalar",
+                "name": "CONCAT",
+                "arguments": [
+                    {"type": "literal_string", "value": "-"},
+                    agg_item_expr("MIN", upper_c_custkey(), false),
+                ],
+            },
+        ],
+    })
+}
+
+/// The #227 repro table: an integer key, a name, and a `DECIMAL(12,2)` balance.
+pub(super) fn customer_request(mut pushdown_request: Json) -> Json {
+    pushdown_request["type"] = serde_json::json!("select");
+    pushdown_request["from"] = serde_json::json!({"type": "table", "name": "CUSTOMER"});
+    serde_json::json!({
+        "involvedTables": [{
+            "name": "CUSTOMER",
+            "columns": [
+                {"name": "C_CUSTKEY", "dataType": {"type": "DECIMAL", "precision": 20, "scale": 0}},
+                {"name": "C_NAME", "dataType": {"type": "VARCHAR", "size": 25, "characterSet": "UTF8"}},
+                {"name": "C_ACCTBAL", "dataType": {"type": "DECIMAL", "precision": 12, "scale": 2}},
+            ],
+        }],
+        "pushdownRequest": pushdown_request,
+    })
+}
+
+/// Mirrors `handle_pushdown` after file resolution, with one file left to scan.
+pub(super) fn dispatch_sql_with_files(request: &Json) -> String {
+    let pushdown_req = strip_table_alias(&pd(request));
+    let (proj_cols, proj_types, projection_widened) =
+        extract_projection(request, &pushdown_req).expect("the fixture must project");
+    let col_types = extract_all_column_types(request);
+    let (filter, declined_filter) = classify_where_filter(
+        pushdown_req.get("filter").filter(|f| !f.is_null()),
+        &col_types,
+    );
+    let result = build_dispatch_sql(
+        request,
+        &pushdown_req,
+        proj_cols,
+        proj_types,
+        projection_widened,
+        col_types,
+        filter,
+        declined_filter,
+        extract_limit(&pushdown_req),
+        order_by_present(&pushdown_req),
+        &[vec![FileEntry::new("data/part-0.parquet", 1_000)]],
+        "s3://warehouse/db/customer".to_string(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        &sample_scan_storage(),
+        SCAN_UDF_NAME,
+        DISTRIBUTE_FILES_UDF_NAME,
+        4,
+        8192,
+        2,
+        0.6,
+        200,
+        8,
+    )
+    .expect("the fixture must dispatch");
+    result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field")
+        .to_string()
+}
+
+/// Mirrors `handle_pushdown` when plan-time pruning leaves no file.
+pub(super) fn dispatch_sql_all_files_pruned(request: &Json) -> String {
+    let pushdown_req = strip_table_alias(&pd(request));
+    let (proj_cols, proj_types, projection_widened) =
+        extract_projection(request, &pushdown_req).expect("the fixture must project");
+    let col_types = extract_all_column_types(request);
+    let result = empty_result_sql(
+        &pushdown_req,
+        &proj_cols,
+        &proj_types,
+        projection_widened,
+        &col_types,
+    )
+    .expect("the empty result must build");
+    result["sql"]
+        .as_str()
+        .expect("pushdown response must carry a sql field")
+        .to_string()
+}
+
+/// Drops every SQL string literal, so a search skips the scan-spec JSON a wrapper passes
+/// to the scan UDF and sees only the SQL Exasol itself parses.
+pub(super) fn sql_outside_string_literals(sql: &str) -> String {
+    let mut outside = String::with_capacity(sql.len());
+    let mut in_literal = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match (in_literal, ch) {
+            (false, '\'') => in_literal = true,
+            (true, '\'') if chars.peek() == Some(&'\'') => {
+                chars.next();
+            }
+            (true, '\'') => in_literal = false,
+            (false, other) => outside.push(other),
+            (true, _) => {}
+        }
+    }
+    outside
+}
+
+/// The scan-spec JSON of the first scan-UDF call in a pushdown SQL.
+pub(super) fn scan_spec_json(sql: &str) -> Json {
+    serde_json::from_str(common_arg_literal(sql)).expect("the scan spec literal must be JSON")
+}
+
 pub(crate) mod filter_json {
     use serde_json::{Value as Json, json};
 

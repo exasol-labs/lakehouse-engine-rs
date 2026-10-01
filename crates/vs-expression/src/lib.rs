@@ -148,8 +148,9 @@ fn is_empty_opt(value: Option<&str>) -> bool {
     matches!(value, None | Some(""))
 }
 
-/// Detects a boolean operand converted to string (CAST or `||`), which must render
-/// Exasol's `TRUE`/`FALSE` casing rather than DataFusion's lowercase cast (#200).
+/// Detects a boolean operand converted to string (CAST or `||`) in the Exasol dialect,
+/// where it renders Exasol's `TRUE`/`FALSE` casing (#200). The DataFusion dialect
+/// converts it through `exa_to_varchar` instead.
 fn is_boolean_producing(kind: &str) -> bool {
     matches!(
         kind,
@@ -241,6 +242,53 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
         .collect()
 }
 
+/// Whether Exasol converts argument `index` of `fn_name` (upper-case, `arg_count`
+/// arguments) to text before it evaluates the call (#227). The renderer wraps these
+/// arguments syntactically, because it knows no column types.
+fn is_string_converted_arg(fn_name: &str, index: usize, arg_count: usize) -> bool {
+    if index >= arg_count {
+        return false;
+    }
+    match fn_name {
+        "CONCAT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "TRANSLATE" => true,
+        "LOWER" | "UPPER" | "ASCII" | "INITCAP" | "REVERSE" | "LENGTH" | "OCTET_LENGTH"
+        | "UNICODE" | "SUBSTR" | "REPEAT" | "LEFT" | "RIGHT" => index == 0,
+        "LPAD" | "RPAD" => index == 0 || index == 2,
+        "INSTR" | "LOCATE" => index < 2,
+        _ => false,
+    }
+}
+
+fn is_string_cast_target(data_type: &Json) -> bool {
+    data_type
+        .get("type")
+        .and_then(|t| t.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("VARCHAR") || t.eq_ignore_ascii_case("CHAR"))
+}
+
+fn wrap_exa_to_varchar(sql: &str) -> String {
+    format!("{EXA_TO_VARCHAR_FN}({sql})")
+}
+
+/// [`render_args`] for a string function: the DataFusion dialect wraps each
+/// string-converted argument, and the Exasol dialect renders them unchanged since
+/// Exasol converts them itself.
+fn render_string_fn_args(
+    fn_name: &str,
+    args: &[Json],
+    dialect: Dialect,
+) -> Result<Vec<String>, UdfError> {
+    let mut rendered = render_args(args, dialect)?;
+    if dialect == Dialect::DataFusion {
+        for (index, sql) in rendered.iter_mut().enumerate() {
+            if is_string_converted_arg(fn_name, index, args.len()) {
+                *sql = wrap_exa_to_varchar(sql);
+            }
+        }
+    }
+    Ok(rendered)
+}
+
 const DOUBLE_TYPE: &str = "DOUBLE";
 
 fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfError> {
@@ -322,20 +370,19 @@ fn render_cast_target(data_type: &Json, dialect: Dialect) -> Result<String, UdfE
     }
 }
 
-/// Reproduces Exasol's shortest-form DECIMAL->string conversion. The caller MUST
-/// have confirmed `expr_sql` is DECIMAL-typed: it blindly strips zeros after a `.`.
-fn format_decimal_exasol_style(expr_sql: &str) -> String {
-    format!(
-        "regexp_replace(regexp_replace(CAST({expr_sql} AS VARCHAR), '(\\.[0-9]*[1-9])0+$', '\\1'), '\\.0+$', '')"
-    )
-}
-
 /// The scalar UDF the DataFusion dialect renders `FLOAT_DIV` as (#370), registered
 /// by `lakehouse-engine`. It MUST take two arguments coerced to `Float64` (Exasol's
 /// `FN_FLOAT_DIV` is always float division), return `Float64`, propagate `NULL`, and
 /// error on any other non-finite result, so division by zero fails in a filter
 /// exactly as in a projection.
 pub const CHECKED_FLOAT_DIV_FN: &str = "vs_checked_float_div";
+
+/// The scalar UDF the DataFusion dialect wraps every string-converted argument in (#227),
+/// registered by `lakehouse-engine`. It MUST take one argument of any type and return
+/// Exasol's text for it, because Exasol converts a non-string argument to text before a
+/// string function or string CAST and DataFusion does not. It MUST be the identity on a
+/// string argument, so a VARCHAR plan is unchanged. The Exasol dialect never renders it.
+pub const EXA_TO_VARCHAR_FN: &str = "exa_to_varchar";
 
 fn render_cast(
     args: Option<&Vec<Json>>,
@@ -351,20 +398,21 @@ fn render_cast(
     let data_type = data_type.ok_or_else(|| UdfError::User("CAST missing 'dataType'".into()))?;
     let target_type = render_cast_target(data_type, dialect)?;
 
-    let target_is_string = matches!(
-        data_type
-            .get("type")
-            .and_then(|t| t.as_str())
-            .map(str::to_uppercase)
-            .as_deref(),
-        Some("VARCHAR") | Some("CHAR")
-    );
-    let source_is_boolean = args[0]
-        .get("type")
-        .and_then(|t| t.as_str())
-        .is_some_and(is_boolean_producing);
-    if target_is_string && source_is_boolean {
-        return Ok(Some(render_bool_to_string_case(&inner)));
+    if is_string_cast_target(data_type) {
+        return Ok(Some(match dialect {
+            Dialect::DataFusion => {
+                format!("CAST({} AS {target_type})", wrap_exa_to_varchar(&inner))
+            }
+            Dialect::Exasol
+                if args[0]
+                    .get("type")
+                    .and_then(|t| t.as_str())
+                    .is_some_and(is_boolean_producing) =>
+            {
+                render_bool_to_string_case(&inner)
+            }
+            Dialect::Exasol => format!("CAST({inner} AS {target_type})"),
+        }));
     }
 
     Ok(Some(format!("CAST({inner} AS {target_type})")))
@@ -660,25 +708,6 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             let args = value("arguments").and_then(|a| a.as_array());
             render_cast(args, value("dataType"), dialect)
         }
-        // Adapter-synthesized, never sent by Exasol (#211): the adapter has confirmed
-        // the argument is a DECIMAL column being stringified.
-        "decimal_to_varchar_exasol" => {
-            let args = value("arguments")
-                .and_then(|a| a.as_array())
-                .ok_or_else(|| {
-                    UdfError::User("decimal_to_varchar_exasol missing 'arguments'".into())
-                })?;
-            if args.len() != 1 {
-                return Err(UdfError::User(format!(
-                    "decimal_to_varchar_exasol requires exactly 1 argument, got {}",
-                    args.len()
-                )));
-            }
-            let inner = render_expression_inner(&args[0], dialect)?.ok_or_else(|| {
-                UdfError::User("decimal_to_varchar_exasol argument is null".into())
-            })?;
-            Ok(Some(format_decimal_exasol_style(&inner)))
-        }
         "function_scalar" => {
             let fn_name = value("name")
                 .and_then(|n| n.as_str())
@@ -840,7 +869,7 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     }))
                 }
                 // DataFusion's `concat` never collapses an all-empty result to NULL
-                // as Exasol's `||` does (#374); boolean operands need Exasol casing (#200).
+                // as Exasol's `||` does (#374).
                 "CONCAT" => {
                     let args = args.ok_or_else(|| {
                         UdfError::User("function_scalar CONCAT missing 'arguments'".into())
@@ -852,18 +881,27 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     }
                     let rendered = args
                         .iter()
-                        .map(|arg| {
+                        .enumerate()
+                        .map(|(index, arg)| {
                             let r = render_expression_inner(arg, dialect)?.ok_or_else(|| {
                                 UdfError::User("CONCAT argument rendered to null".into())
                             })?;
-                            let is_bool = arg
-                                .get("type")
-                                .and_then(|t| t.as_str())
-                                .is_some_and(is_boolean_producing);
-                            Ok(if is_bool {
-                                render_bool_to_string_case(&r)
-                            } else {
-                                r
+                            Ok(match dialect {
+                                Dialect::DataFusion
+                                    if is_string_converted_arg("CONCAT", index, args.len()) =>
+                                {
+                                    wrap_exa_to_varchar(&r)
+                                }
+                                Dialect::DataFusion => r,
+                                Dialect::Exasol
+                                    if arg
+                                        .get("type")
+                                        .and_then(|t| t.as_str())
+                                        .is_some_and(is_boolean_producing) =>
+                                {
+                                    render_bool_to_string_case(&r)
+                                }
+                                Dialect::Exasol => r,
                             })
                         })
                         .collect::<Result<Vec<String>, UdfError>>()?;
@@ -893,41 +931,28 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                             &lower
                         }
                     };
-                    let rendered = render_args(args, dialect)?;
+                    let rendered = render_string_fn_args(&fn_name, args, dialect)?;
                     Ok(Some(format!("{df_name}({})", rendered.join(", "))))
                 }
                 // DataFusion dialect only: INSTR(s, sub) and LOCATE(sub, s) both map to
-                // strpos(s, sub).
-                "INSTR" => {
+                // strpos(s, sub). `strpos` has no start or occurrence, so a longer call is
+                // declined rather than rendered wrongly (#228).
+                "INSTR" | "LOCATE" => {
                     let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar INSTR missing 'arguments'".into())
+                        UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
                     })?;
-                    if args.len() < 2 {
+                    if args.len() != 2 {
                         return Err(UdfError::User(format!(
-                            "function_scalar INSTR requires 2 arguments, got {}",
+                            "function_scalar {fn_name} requires 2 arguments in the DataFusion dialect, got {}",
                             args.len()
                         )));
                     }
-                    let string = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("INSTR string arg is null".into()))?;
-                    let substr = render_expression_inner(&args[1], dialect)?
-                        .ok_or_else(|| UdfError::User("INSTR substring arg is null".into()))?;
-                    Ok(Some(format!("strpos({string}, {substr})")))
-                }
-                "LOCATE" => {
-                    let args = args.ok_or_else(|| {
-                        UdfError::User("function_scalar LOCATE missing 'arguments'".into())
-                    })?;
-                    if args.len() < 2 {
-                        return Err(UdfError::User(format!(
-                            "function_scalar LOCATE requires 2 arguments, got {}",
-                            args.len()
-                        )));
-                    }
-                    let substr = render_expression_inner(&args[0], dialect)?
-                        .ok_or_else(|| UdfError::User("LOCATE substring arg is null".into()))?;
-                    let string = render_expression_inner(&args[1], dialect)?
-                        .ok_or_else(|| UdfError::User("LOCATE string arg is null".into()))?;
+                    let rendered = render_string_fn_args(&fn_name, args, dialect)?;
+                    let (string, substr) = if fn_name == "INSTR" {
+                        (&rendered[0], &rendered[1])
+                    } else {
+                        (&rendered[1], &rendered[0])
+                    };
                     Ok(Some(format!("strpos({string}, {substr})")))
                 }
                 // Arguments interleave [cond, result, ...], with a trailing ELSE on an

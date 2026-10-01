@@ -2,19 +2,23 @@
 //! planners. This module names neither planner, so the two cannot drift apart.
 
 use crate::scan::spec::{AggKind, AggregatePlan, PartialAggColumn, partial_column_name};
+use crate::types::mapping::exasol_type_from_json;
 use serde_json::Value as Json;
 use vs_expression::{render_expression, render_expression_exasol};
 
 use super::support::{cast_to_declared_type, quote_ident};
 
-/// Declared type of a plan slot reached only through a nested aggregate. Numeric,
-/// not `VARCHAR`, because the per-plan type also types the scan's `EMITS`: a
-/// character type would make an expression-argument MIN/MAX lexicographic.
+/// Declared type of a nested-only plan slot whose argument is numeric or untyped.
+/// Numeric, not `VARCHAR`, because the per-plan type also types the scan's `EMITS`: a
+/// character type would make a numeric expression-argument MIN/MAX lexicographic.
 pub(super) const NESTED_AGGREGATE_PLAN_TYPE: &str = "DOUBLE PRECISION";
+
+/// A character value with no declared length.
+const CHARACTER_PARTIAL_TYPE: &str = "VARCHAR(2000000)";
 
 /// Deduplicates by `AggregatePlan` equality so an aggregate used bare and nested
 /// collapses to one `PARTIAL_*` column (decision-log [4]). A `Some` declared type
-/// always overwrites a slot a nested occurrence created with the default.
+/// always overwrites a slot a nested occurrence created.
 pub(super) fn fold_aggregate_plan(
     plans: &mut Vec<AggregatePlan>,
     plan_types: &mut Vec<String>,
@@ -34,6 +38,20 @@ pub(super) fn fold_aggregate_plan(
             plan_types.push(declared.unwrap_or_else(|| NESTED_AGGREGATE_PLAN_TYPE.to_string()));
             slot
         }
+    }
+}
+
+/// A nested occurrence types only a slot it creates, so it never overwrites the
+/// declared type of a top-level occurrence, whichever comes first.
+pub(super) fn fold_nested_aggregate_plan(
+    plans: &mut Vec<AggregatePlan>,
+    plan_types: &mut Vec<String>,
+    plan: AggregatePlan,
+    partial_type: String,
+) -> usize {
+    match plans.iter().position(|p| *p == plan) {
+        Some(slot) => slot,
+        None => fold_aggregate_plan(plans, plan_types, plan, Some(partial_type)),
     }
 }
 
@@ -90,7 +108,7 @@ pub(super) fn sentinelize_aggregates(
     }
 }
 
-pub(super) fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<AggregatePlan>> {
+fn decomposable_aggregates(node: &Json) -> Option<Vec<Json>> {
     let mut aggregates = Vec::new();
     let mut residual_column = false;
     let sentinel_tree = sentinelize_aggregates(node, &mut aggregates, &mut residual_column);
@@ -98,7 +116,143 @@ pub(super) fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<Aggregat
         return None;
     }
     render_expression(&sentinel_tree).ok()?;
-    aggregates.iter().map(parse_agg_item).collect()
+    Some(aggregates)
+}
+
+pub(super) fn classify_scalar_over_aggregate(node: &Json) -> Option<Vec<AggregatePlan>> {
+    decomposable_aggregates(node)?
+        .iter()
+        .map(parse_agg_item)
+        .collect()
+}
+
+/// [`classify_scalar_over_aggregate`] with each nested plan paired with the type its
+/// partial is emitted as when no top-level occurrence declares one.
+pub(super) fn classify_typed_scalar_over_aggregate(
+    node: &Json,
+    col_types: &[(String, String)],
+) -> Option<Vec<(AggregatePlan, String)>> {
+    decomposable_aggregates(node)?
+        .iter()
+        .map(|agg| Some((parse_agg_item(agg)?, nested_partial_type(agg, col_types))))
+        .collect()
+}
+
+/// A MIN/MAX partial carries its argument's own type, so a character, temporal, or
+/// boolean argument must not take the numeric default: the merge would compare text
+/// as numbers, or fail to cast the value (#227). Every other kind's partial is numeric.
+fn nested_partial_type(aggregate: &Json, col_types: &[(String, String)]) -> String {
+    let is_min_max = aggregate
+        .get("name")
+        .and_then(|n| n.as_str())
+        .is_some_and(|n| n.eq_ignore_ascii_case("MIN") || n.eq_ignore_ascii_case("MAX"));
+    node_arguments(aggregate)
+        .first()
+        .filter(|_| is_min_max)
+        .and_then(|arg| non_numeric_type(arg, col_types))
+        .unwrap_or_else(|| NESTED_AGGREGATE_PLAN_TYPE.to_string())
+}
+
+fn node_arguments(node: &Json) -> &[Json] {
+    node.get("arguments")
+        .and_then(|a| a.as_array())
+        .map_or(&[], Vec::as_slice)
+}
+
+/// `None` for a numeric expression or one whose type the node does not determine,
+/// either of which keeps the numeric default.
+fn non_numeric_type(node: &Json, col_types: &[(String, String)]) -> Option<String> {
+    match node.get("type").and_then(|t| t.as_str())? {
+        "column" => {
+            let name = node.get("name").and_then(|n| n.as_str())?.to_uppercase();
+            let (_, ty) = col_types.iter().find(|(n, _)| *n == name)?;
+            Some(ty.clone()).filter(|ty| is_non_numeric_partial_type(ty))
+        }
+        "function_scalar_cast" => cast_target_type(node),
+        "literal_string" => Some(CHARACTER_PARTIAL_TYPE.to_string()),
+        "literal_date" => Some("DATE".to_string()),
+        "literal_timestamp" => Some("TIMESTAMP".to_string()),
+        "literal_bool" => Some("BOOLEAN".to_string()),
+        kind if kind.starts_with("predicate_") => Some("BOOLEAN".to_string()),
+        "function_scalar_case" => unified_type(node.get("results")?.as_array()?, col_types),
+        "function_scalar" => scalar_function_type(node, col_types),
+        _ => None,
+    }
+}
+
+fn cast_target_type(node: &Json) -> Option<String> {
+    Some(exasol_type_from_json(node.get("dataType")?)).filter(|ty| is_non_numeric_partial_type(ty))
+}
+
+fn scalar_function_type(node: &Json, col_types: &[(String, String)]) -> Option<String> {
+    let args = node_arguments(node);
+    let operand_type = |index: usize| {
+        args.get(index)
+            .and_then(|arg| non_numeric_type(arg, col_types))
+    };
+    let temporal_operand_type =
+        |index: usize| operand_type(index).filter(|ty| is_temporal_type(ty));
+    match node
+        .get("name")
+        .and_then(|n| n.as_str())?
+        .to_uppercase()
+        .as_str()
+    {
+        "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "REPEAT"
+        | "REVERSE" | "LPAD" | "RPAD" | "CHR" | "INITCAP" | "LEFT" | "RIGHT" | "TRANSLATE"
+        | "UNICODECHR" | "CONCAT" => Some(CHARACTER_PARTIAL_TYPE.to_string()),
+        "REGEXP_LIKE" => Some("BOOLEAN".to_string()),
+        "TO_DATE" => Some("DATE".to_string()),
+        "TO_TIMESTAMP" => Some("TIMESTAMP".to_string()),
+        "CAST" => cast_target_type(node),
+        "NULLIF" => operand_type(0),
+        "DATE_TRUNC" => temporal_operand_type(1),
+        "ROUND" | "TRUNC" => temporal_operand_type(0),
+        "GREATEST" | "LEAST" => unified_type(args, col_types),
+        // Arguments interleave [cond, result, ...] with an optional trailing ELSE.
+        "CASE" => {
+            let trailing_else = args.last().filter(|_| args.len() % 2 == 1);
+            unified_type(
+                args.iter().skip(1).step_by(2).chain(trailing_else),
+                col_types,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Branches of differing character types take the unbounded character type, since
+/// Exasol widens them to one; any other disagreement is left undetermined.
+fn unified_type<'a>(
+    operands: impl IntoIterator<Item = &'a Json>,
+    col_types: &[(String, String)],
+) -> Option<String> {
+    let types: Vec<String> = operands
+        .into_iter()
+        .filter_map(|operand| non_numeric_type(operand, col_types))
+        .collect();
+    let first = types.first()?;
+    if types.iter().all(|ty| ty == first) {
+        return Some(first.clone());
+    }
+    types
+        .iter()
+        .any(|ty| is_character_type(ty))
+        .then(|| CHARACTER_PARTIAL_TYPE.to_string())
+}
+
+fn is_character_type(ty: &str) -> bool {
+    ty.starts_with("VARCHAR") || ty.starts_with("CHAR")
+}
+
+fn is_temporal_type(ty: &str) -> bool {
+    ty == "DATE" || ty.starts_with("TIMESTAMP")
+}
+
+/// Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as an `EMITS` type (sqlCode 22002).
+fn is_non_numeric_partial_type(ty: &str) -> bool {
+    (is_character_type(ty) || is_temporal_type(ty) || ty == "BOOLEAN")
+        && ty != "TIMESTAMP WITH LOCAL TIME ZONE"
 }
 
 /// Reuses the `vs-expression` translator by substitution (sentinel columns, then

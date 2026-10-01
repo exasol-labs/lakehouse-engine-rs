@@ -122,7 +122,7 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
 }
 
 #[test]
-fn where_filter_decimal_stringification_rewritten_to_trim() {
+fn where_filter_decimal_stringification_wraps_exa_to_varchar_once() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
     let filter_json = serde_json::json!({
         "type": "predicate_greater",
@@ -139,16 +139,9 @@ fn where_filter_decimal_stringification_rewritten_to_trim() {
         .and_then(|f| render_df_filter_safe(&f))
         .expect("LENGTH(decimal) > 5 must render to a DataFusion filter");
 
-    let trim_wrapper = "regexp_replace(regexp_replace(CAST(";
     assert_eq!(
-        rendered.matches(trim_wrapper).count(),
-        1,
-        "the rewritten filter must carry the Exasol decimal-trim form EXACTLY ONCE \
-             (string-fn guard wraps it, decimal rewrite must then no-op): {rendered}"
-    );
-    assert!(
-        !rendered.contains(r#"character_length("C_DECIMAL_A")"#),
-        "the filter must NOT stringify the bare decimal column untrimmed: {rendered}"
+        rendered, r#"(character_length(exa_to_varchar("C_DECIMAL_A")) > 5)"#,
+        "the renderer must wrap the DECIMAL argument in exactly one conversion"
     );
 }
 
@@ -171,13 +164,13 @@ fn filter_decimal_comparison_not_rewritten() {
         "a DECIMAL column in a comparison must stay a bare, unwrapped column reference: {rendered}"
     );
     assert!(
-        !rendered.contains("regexp_replace"),
-        "a non-stringifying filter context must not be trimmed: {rendered}"
+        !rendered.contains("exa_to_varchar"),
+        "a non-stringifying filter context must not be converted: {rendered}"
     );
 }
 
 #[test]
-fn where_filter_string_fn_under_comparison_predicate_coerced() {
+fn where_filter_string_fn_under_comparison_predicate_wraps_argument() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
     let filter_json = serde_json::json!({
         "type": "predicate_equal",
@@ -194,15 +187,15 @@ fn where_filter_string_fn_under_comparison_predicate_coerced() {
         .and_then(|f| render_df_filter_safe(&f))
         .expect("UPPER(decimal) = 'X' must render to a DataFusion filter");
 
-    assert!(
-        rendered.contains("regexp_replace(regexp_replace(CAST("),
-        "the DECIMAL argument nested under predicate_equal's left must be coerced \
-             into the Exasol decimal-trim form: {rendered}"
+    assert_eq!(
+        rendered, r#"(upper(exa_to_varchar("C_DECIMAL_A")) = 'X')"#,
+        "the DECIMAL argument nested under predicate_equal's left must be wrapped"
     );
 }
 
+/// Scenario: A DOUBLE, BOOLEAN, or TIMESTAMP column argument pushes down with Exasol's text
 #[test]
-fn where_filter_string_fn_over_double_declines() {
+fn where_filter_upper_double_pushes_into_scan_spec() {
     let col_types = vec![("C_DOUBLE_A".to_string(), "DOUBLE PRECISION".to_string())];
     let filter_json = serde_json::json!({
         "type": "predicate_equal",
@@ -218,15 +211,15 @@ fn where_filter_string_fn_over_double_declines() {
         .and_then(|f| apply_type_rewrites(f, &col_types))
         .and_then(|f| render_df_filter_safe(&f));
 
-    assert!(
-        rendered.is_none(),
-        "UPPER over a DOUBLE PRECISION column must decline the whole filter, \
-             not push a possibly-wrong text comparison: {rendered:?}"
+    assert_eq!(
+        rendered.as_deref(),
+        Some(r#"(upper(exa_to_varchar("C_DOUBLE_A")) = 'X')"#),
+        "UPPER over a DOUBLE PRECISION column must push the conversion into the scan"
     );
 }
 
 #[test]
-fn where_filter_upper_decimal_inside_like_subject_coerced() {
+fn where_filter_upper_decimal_inside_like_subject_wraps_argument() {
     let col_types = vec![("C_DECIMAL_A".to_string(), "DECIMAL(10,2)".to_string())];
     let filter_json = serde_json::json!({
         "type": "predicate_like",
@@ -243,11 +236,41 @@ fn where_filter_upper_decimal_inside_like_subject_coerced() {
         .and_then(|f| render_df_filter_safe(&f))
         .expect("UPPER(decimal) LIKE '1%' must render to a DataFusion filter");
 
+    assert_eq!(
+        rendered, r#"(upper(exa_to_varchar("C_DECIMAL_A")) LIKE '1%')"#,
+        "guard_like_subject leaves this non-bare-column subject untouched; the renderer wraps \
+             the DECIMAL argument"
+    );
+}
+
+/// Scenario: An INSTR or LOCATE call beyond two arguments reaches native Exasol evaluation on every surface
+#[test]
+fn where_filter_instr_beyond_two_args_self_applies() {
+    let col_types = vec![("NAME".to_string(), "VARCHAR(100)".to_string())];
+    let filter = serde_json::json!({
+        "type": "predicate_greater",
+        "left": {
+            "type": "function_scalar",
+            "name": "INSTR",
+            "arguments": [
+                {"type": "column", "name": "name"},
+                {"type": "literal_string", "value": "b"},
+                {"type": "literal_exactnumeric", "value": 3}
+            ]
+        },
+        "right": {"type": "literal_exactnumeric", "value": 0}
+    });
+
+    let (scan_filter, declined) = classify_where_filter(Some(&filter), &col_types);
+
     assert!(
-        rendered.contains("regexp_replace(regexp_replace(CAST("),
-        "the DECIMAL argument nested inside the LIKE subject's UPPER call must be \
-             coerced into the Exasol decimal-trim form, even though guard_like_subject \
-             itself leaves this non-bare-column LIKE subject untouched: {rendered}"
+        scan_filter.is_none(),
+        "a DataFusion render error must keep the predicate out of the scan: {scan_filter:?}"
+    );
+    assert_eq!(
+        declined,
+        Some(&filter),
+        "the predicate must reach the wrapper RAW, so Exasol's own INSTR evaluates it"
     );
 }
 
@@ -1013,8 +1036,8 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         ])
         .build()
         .unwrap();
-    // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; `LENGTH(amount) > 5`
-    // is rewritten, so the equality assertion distinguishes original from rewritten.
+    // `SECOND(ts, 3)` is a DataFusion arity decline Exasol renders; the DATE `LIKE` is
+    // rewritten, so the equality assertion distinguishes original from rewritten.
     let filter = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
@@ -1032,18 +1055,16 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
                 "right": {"type": "literal_exactnumeric", "value": 1},
             },
             {
-                "type": "predicate_greater",
-                "left": {"type": "function_scalar", "name": "LENGTH", "arguments": [
-                    {"type": "column", "name": "amount"},
-                ]},
-                "right": {"type": "literal_exactnumeric", "value": 5},
+                "type": "predicate_like",
+                "expression": {"type": "column", "name": "dt"},
+                "pattern": {"type": "literal_string", "value": "2024%"},
             },
         ],
     });
     let col_types = vec![
         ("ID".to_string(), "DECIMAL(20,0)".to_string()),
         ("TS".to_string(), "TIMESTAMP".to_string()),
-        ("AMOUNT".to_string(), "DECIMAL(18,2)".to_string()),
+        ("DT".to_string(), "DATE".to_string()),
     ];
     assert_ne!(
         apply_type_rewrites(&filter, &col_types).as_ref(),
@@ -2438,7 +2459,7 @@ fn grouped_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
         Vec::new(),
     );
 
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
+    let fragment = r#"CAST(exa_to_varchar("NAME") AS VARCHAR)"#;
     let padded = format!(
         "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
              ELSE {fragment} END"
@@ -2466,7 +2487,7 @@ fn unprojected_char_declared_group_key_reaches_the_scan_spec_blank_padded() {
         Vec::new(),
     );
 
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
+    let fragment = r#"CAST(exa_to_varchar("NAME") AS VARCHAR)"#;
     let padded = format!(
         "CASE WHEN character_length({fragment}) < 20 THEN rpad({fragment}, 20) \
              ELSE {fragment} END"
@@ -2497,7 +2518,7 @@ fn unprojected_varchar_declared_group_key_reaches_the_scan_spec_unpadded() {
 
     assert!(
         sql.contains(&embedded_group_keys(&[
-            r#"CAST("NAME" AS VARCHAR)"#.to_string()
+            r#"CAST(exa_to_varchar("NAME") AS VARCHAR)"#.to_string()
         ])),
         "an unprojected VARCHAR-declared group key must reach the scan unpadded: {sql}"
     );
@@ -2524,7 +2545,7 @@ fn grouped_ascii_char_group_key_is_padded_to_its_declared_width() {
         Vec::new(),
     );
 
-    let fragment = r#"CAST("NAME" AS VARCHAR)"#;
+    let fragment = r#"CAST(exa_to_varchar("NAME") AS VARCHAR)"#;
     let padded = format!(
         "CASE WHEN character_length({fragment}) < 3 THEN rpad({fragment}, 3) \
              ELSE {fragment} END"

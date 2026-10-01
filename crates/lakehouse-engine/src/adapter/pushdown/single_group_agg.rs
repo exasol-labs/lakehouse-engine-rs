@@ -3,8 +3,8 @@ use serde_json::Value as Json;
 
 use super::scalar_over_agg::{
     NESTED_AGGREGATE_PLAN_TYPE, arg_column_or_expr, cast_merge_items,
-    classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items, parse_agg_item,
-    render_scalar_over_merge,
+    classify_scalar_over_aggregate, classify_typed_scalar_over_aggregate, fold_aggregate_plan,
+    merge_select_items, parse_agg_item, render_scalar_over_merge,
 };
 use super::support::{cast_to_declared_type, declared_select_type};
 
@@ -94,11 +94,31 @@ pub fn ordinary_plans(items: &[SingleGroupItem]) -> Vec<AggregatePlan> {
 }
 
 /// Aligned 1:1 with `ordinary_plans(items)`. This list also types the scan's
-/// `EMITS`, so a slot reached only through a nested aggregate takes
-/// [`NESTED_AGGREGATE_PLAN_TYPE`] rather than the `VARCHAR(2000000)` default.
-pub fn single_group_plan_types(pushdown_req: &Json, items: &[SingleGroupItem]) -> Vec<String> {
+/// `EMITS`, so a slot reached only through a nested aggregate takes its partial type
+/// from `col_types` and its argument, never the `VARCHAR(2000000)` default. A
+/// top-level occurrence's declared type wins.
+pub fn single_group_plan_types(
+    pushdown_req: &Json,
+    items: &[SingleGroupItem],
+    col_types: &[(String, String)],
+) -> Vec<String> {
     let plans = ordinary_plans(items);
     let mut plan_types = vec![NESTED_AGGREGATE_PLAN_TYPE.to_string(); plans.len()];
+
+    let nested = items
+        .iter()
+        .filter_map(|item| match item {
+            SingleGroupItem::ScalarOverAggregate { node, .. } => {
+                classify_typed_scalar_over_aggregate(node, col_types)
+            }
+            SingleGroupItem::Aggregate(_) | SingleGroupItem::Distinct(_) => None,
+        })
+        .flatten();
+    for (plan, partial_type) in nested {
+        if let Some(slot) = plans.iter().position(|p| *p == plan) {
+            plan_types[slot] = partial_type;
+        }
+    }
 
     for (select_index, item) in items.iter().enumerate() {
         if let SingleGroupItem::Aggregate(plan) = item {

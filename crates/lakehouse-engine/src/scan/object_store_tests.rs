@@ -8,6 +8,7 @@ use ::object_store::ClientConfigKey;
 use arrow::datatypes::DataType;
 use datafusion::execution::FunctionRegistry;
 use datafusion::execution::memory_pool::MemoryLimit;
+use datafusion::logical_expr::Volatility;
 
 fn bucket_url(bucket: &str) -> Url {
     Url::parse(&format!("s3://{bucket}")).expect("bucket URL must parse")
@@ -280,6 +281,29 @@ fn build_session_context_registers_the_checked_float_div_function() {
         DataType::Float64,
         "the registered function must return DOUBLE, so the renderer needs no \
          CAST of its own around the call"
+    );
+}
+
+/// Scenario: The scan session registers exa_to_varchar for every scan spec
+#[test]
+fn build_session_context_registers_the_exa_to_varchar_function() {
+    let spec = minimal_spec();
+
+    let ctx = build_session_context(&spec, &inline_resolved(&spec), 0).expect("build must succeed");
+
+    let registered = ctx
+        .state()
+        .udf(vs_expression::EXA_TO_VARCHAR_FN)
+        .unwrap_or_else(|e| {
+            panic!(
+                "a session built for a spec must resolve {}: {e}",
+                vs_expression::EXA_TO_VARCHAR_FN
+            )
+        });
+    assert_eq!(
+        registered.signature().volatility,
+        Volatility::Immutable,
+        "the conversion must stay eligible for the Parquet row filter"
     );
 }
 

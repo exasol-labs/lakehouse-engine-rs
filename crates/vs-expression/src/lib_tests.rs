@@ -621,7 +621,10 @@ fn renders_cast_varchar() {
         "arguments": [{"type": "column", "name": "x"}],
         "dataType": {"type": "VARCHAR", "size": 100}
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"CAST(exa_to_varchar("X") AS VARCHAR)"#
+    );
 }
 
 #[test]
@@ -668,7 +671,10 @@ fn renders_cast_char_as_datafusion_varchar() {
         "arguments": [{"type": "column", "name": "x"}],
         "dataType": {"type": "CHAR", "size": 3, "characterSet": "ASCII"}
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"CAST(exa_to_varchar("X") AS VARCHAR)"#
+    );
 }
 
 #[test]
@@ -686,7 +692,7 @@ fn renders_cast_char_as_exasol_char() {
 }
 
 #[test]
-fn renders_cast_bool_to_varchar_as_exasol_case_uppercase() {
+fn renders_cast_bool_to_varchar_as_exasol_case_uppercase_in_exasol_dialect() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
@@ -698,13 +704,17 @@ fn renders_cast_bool_to_varchar_as_exasol_case_uppercase() {
         "dataType": {"type": "VARCHAR", "size": 10}
     });
     assert_eq!(
-        render_expression(&expr).unwrap(),
+        render_expression_exasol(&expr).unwrap(),
         r#"(CASE ("C_ACCTBAL" > 0) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
+    );
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"CAST(exa_to_varchar(("C_ACCTBAL" > 0)) AS VARCHAR)"#
     );
 }
 
 #[test]
-fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
+fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source_in_exasol_dialect() {
     let expr = json!({
         "type": "function_scalar_cast",
         "name": "CAST",
@@ -715,8 +725,12 @@ fn renders_cast_bool_to_varchar_uses_case_for_any_predicate_source() {
         "dataType": {"type": "VARCHAR", "size": 10}
     });
     assert_eq!(
-        render_expression(&expr).unwrap(),
+        render_expression_exasol(&expr).unwrap(),
         r#"(CASE ("X" IS NULL) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
+    );
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"CAST(exa_to_varchar(("X" IS NULL)) AS VARCHAR)"#
     );
 }
 
@@ -845,50 +859,9 @@ fn renders_cast_nested_function_scalar_defensive() {
         "arguments": [{"type": "column", "name": "x"}],
         "dataType": {"type": "VARCHAR", "size": 100}
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"CAST("X" AS VARCHAR)"#);
-}
-
-#[test]
-fn renders_decimal_to_varchar_exasol() {
-    let expr = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [{"type": "column", "name": "c_decimal_a"}]
-    });
-    let expected = format_decimal_exasol_style(r#""C_DECIMAL_A""#);
-    assert_eq!(render_expression(&expr).unwrap(), expected);
-    assert_eq!(render_expression_safe(&expr).unwrap(), expected);
-}
-
-#[test]
-fn decimal_to_varchar_exasol_wrong_arity_errors() {
-    let no_args = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": []
-    });
-    let two_args = json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [
-            {"type": "column", "name": "c_decimal_a"},
-            {"type": "column", "name": "c_decimal_b"}
-        ]
-    });
-    for expr in [&no_args, &two_args] {
-        assert!(
-            render_expression(expr).is_err(),
-            "decimal_to_varchar_exasol with non-unary arguments must raise: {expr}"
-        );
-        assert!(
-            render_expression_safe(expr).is_none(),
-            "decimal_to_varchar_exasol with non-unary arguments must be None in safe mode: {expr}"
-        );
-    }
-}
-
-#[test]
-fn format_decimal_exasol_style_renders_exact_regex_sql() {
     assert_eq!(
-        format_decimal_exasol_style("some_col"),
-        r#"regexp_replace(regexp_replace(CAST(some_col AS VARCHAR), '(\.[0-9]*[1-9])0+$', '\1'), '\.0+$', '')"#
+        render_expression(&expr).unwrap(),
+        r#"CAST(exa_to_varchar("X") AS VARCHAR)"#
     );
 }
 
@@ -1259,9 +1232,14 @@ fn renders_string_scalar_functions() {
             "arguments": [{"type": "column", "name": "s"}]
         });
         let sql = render_expression(&expr).unwrap();
+        let expected_arg = if name == "CHR" {
+            r#""S""#
+        } else {
+            r#"exa_to_varchar("S")"#
+        };
         assert_eq!(
             sql,
-            format!(r#"{}("S")"#, name.to_lowercase()),
+            format!("{}({expected_arg})", name.to_lowercase()),
             "failed for {name}"
         );
     }
@@ -1273,7 +1251,7 @@ fn renders_string_scalar_functions() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"character_length("S")"#
+        r#"character_length(exa_to_varchar("S"))"#
     );
 
     let expr = json!({
@@ -1281,14 +1259,20 @@ fn renders_string_scalar_functions() {
         "name": "OCTET_LENGTH",
         "arguments": [{"type": "column", "name": "s"}]
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"octet_length("S")"#);
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"octet_length(exa_to_varchar("S"))"#
+    );
 
     let expr = json!({
         "type": "function_scalar",
         "name": "UNICODE",
         "arguments": [{"type": "column", "name": "s"}]
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"ascii("S")"#);
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"ascii(exa_to_varchar("S"))"#
+    );
 
     let expr = json!({
         "type": "function_scalar",
@@ -1306,7 +1290,10 @@ fn renders_string_scalar_functions() {
             {"type": "literal_exactnumeric", "value": 3}
         ]
     });
-    assert_eq!(render_expression(&expr).unwrap(), r#"substr("S", 1, 3)"#);
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        r#"substr(exa_to_varchar("S"), 1, 3)"#
+    );
 
     let expr = json!({
         "type": "function_scalar",
@@ -1316,7 +1303,10 @@ fn renders_string_scalar_functions() {
             {"type": "literal_string", "value": "ll"}
         ]
     });
-    assert_eq!(render_expression(&expr).unwrap(), "strpos('hello', 'll')");
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        "strpos(exa_to_varchar('hello'), exa_to_varchar('ll'))"
+    );
 
     let expr = json!({
         "type": "function_scalar",
@@ -1326,7 +1316,10 @@ fn renders_string_scalar_functions() {
             {"type": "literal_string", "value": "hello"}
         ]
     });
-    assert_eq!(render_expression(&expr).unwrap(), "strpos('hello', 'll')");
+    assert_eq!(
+        render_expression(&expr).unwrap(),
+        "strpos(exa_to_varchar('hello'), exa_to_varchar('ll'))"
+    );
 }
 
 #[test]
@@ -1341,7 +1334,7 @@ fn renders_concat_as_nullif_wrapped_concat_call() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"nullif(concat("S", ''), '')"#
+        r#"nullif(concat(exa_to_varchar("S"), exa_to_varchar('')), '')"#
     );
 
     let expr = json!({
@@ -1355,12 +1348,12 @@ fn renders_concat_as_nullif_wrapped_concat_call() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"nullif(concat("A", "B", "C"), '')"#
+        r#"nullif(concat(exa_to_varchar("A"), exa_to_varchar("B"), exa_to_varchar("C")), '')"#
     );
 }
 
 #[test]
-fn renders_concat_bool_operand_as_exasol_case() {
+fn renders_concat_bool_operand_through_exa_to_varchar() {
     let expr = json!({
         "type": "function_scalar",
         "name": "CONCAT",
@@ -1373,7 +1366,7 @@ fn renders_concat_bool_operand_as_exasol_case() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"nullif(concat((CASE ("ACTIVE" = TRUE) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END), ''), '')"#
+        r#"nullif(concat(exa_to_varchar(("ACTIVE" = TRUE)), exa_to_varchar('')), '')"#
     );
 }
 
@@ -1436,7 +1429,7 @@ fn renders_nested_concat_wrapper_per_level() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"nullif(concat(nullif(concat("A", "B"), ''), "C"), '')"#
+        r#"nullif(concat(exa_to_varchar(nullif(concat(exa_to_varchar("A"), exa_to_varchar("B")), '')), exa_to_varchar("C")), '')"#
     );
     assert_eq!(
         render_expression_exasol(&expr).unwrap(),
@@ -1453,7 +1446,7 @@ fn renders_concat_single_argument() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"nullif(concat("S"), '')"#
+        r#"nullif(concat(exa_to_varchar("S")), '')"#
     );
     assert_eq!(render_expression_exasol(&expr).unwrap(), r#"("S")"#);
 }
@@ -2534,7 +2527,7 @@ fn cast_char_target_diverges_between_dialects() {
     });
     assert_eq!(
         render_expression(&expr).unwrap(),
-        r#"CAST("C_VARCHAR" AS VARCHAR)"#
+        r#"CAST(exa_to_varchar("C_VARCHAR") AS VARCHAR)"#
     );
     assert_eq!(
         render_expression_exasol(&expr).unwrap(),
@@ -2700,10 +2693,15 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
             format!(r#"{exasol_name}("S")"#),
             "the Exasol dialect must render {exasol_name} verbatim"
         );
+        let df_arg = if exasol_name.ends_with("CHR") {
+            r#""S""#
+        } else {
+            r#"exa_to_varchar("S")"#
+        };
         assert_eq!(
             render_expression(&expr).unwrap(),
-            format!(r#"{df_name}("S")"#),
-            "the DataFusion dialect must stay unchanged for {exasol_name}"
+            format!("{df_name}({df_arg})"),
+            "the DataFusion dialect must wrap only string-converted arguments for {exasol_name}"
         );
     }
 
@@ -2720,13 +2718,16 @@ fn renders_string_family_verbatim_in_exasol_dialect() {
         render_expression_exasol(&substr).unwrap(),
         r#"SUBSTR("S", 1, 3)"#
     );
-    assert_eq!(render_expression(&substr).unwrap(), r#"substr("S", 1, 3)"#);
+    assert_eq!(
+        render_expression(&substr).unwrap(),
+        r#"substr(exa_to_varchar("S"), 1, 3)"#
+    );
 }
 
 #[test]
 fn renders_instr_locate_verbatim_with_start_arg_in_exasol_dialect() {
-    // The DataFusion dialect's strpos drops a third (start) argument, a known limitation of
-    // that rendering.
+    // The DataFusion dialect declines a start argument; see
+    // `instr_and_locate_beyond_two_args_are_a_datafusion_render_error`.
     let instr = json!({
         "type": "function_scalar",
         "name": "INSTR",
@@ -2740,7 +2741,7 @@ fn renders_instr_locate_verbatim_with_start_arg_in_exasol_dialect() {
         render_expression_exasol(&instr).unwrap(),
         "INSTR('hello', 'l', 3)"
     );
-    assert_eq!(render_expression(&instr).unwrap(), "strpos('hello', 'l')");
+    assert!(render_expression(&instr).is_err());
 
     let locate = json!({
         "type": "function_scalar",
@@ -2755,7 +2756,7 @@ fn renders_instr_locate_verbatim_with_start_arg_in_exasol_dialect() {
         render_expression_exasol(&locate).unwrap(),
         "LOCATE('l', 'hello', 3)"
     );
-    assert_eq!(render_expression(&locate).unwrap(), "strpos('hello', 'l')");
+    assert!(render_expression(&locate).is_err());
 }
 
 #[test]
@@ -3266,7 +3267,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
                 "dataType": {"type": "VARCHAR", "size": 50}
             }),
             r#"CAST("V" AS VARCHAR(50))"#,
-            r#"CAST("V" AS VARCHAR)"#,
+            r#"CAST(exa_to_varchar("V") AS VARCHAR)"#,
         ),
         (
             json!({
@@ -3323,6 +3324,7 @@ fn exasol_dialect_renders_declared_verbatim_surface() {
             "nullif(",
             "coalesce(",
             CHECKED_FLOAT_DIV_FN,
+            EXA_TO_VARCHAR_FN,
         ] {
             assert!(
                 !rendered.contains(token),
@@ -3437,4 +3439,495 @@ fn exasol_df_filter_suppresses_trivially_true() {
 
     let null_filter = json!({"type": "literal_null"});
     assert!(render_df_filter_exasol_safe(&null_filter).is_none());
+}
+
+fn str_col(name: &str) -> Json {
+    json!({"type": "column", "name": name})
+}
+
+fn str_call(name: &str, args: Vec<Json>) -> Json {
+    json!({"type": "function_scalar", "name": name, "arguments": args})
+}
+
+fn str_cast(source: Json, data_type: Json) -> Json {
+    json!({
+        "type": "function_scalar_cast", "name": "CAST",
+        "arguments": [source], "dataType": data_type
+    })
+}
+
+fn bool_predicate() -> Json {
+    json!({
+        "type": "predicate_greater",
+        "left": str_col("c_acctbal"),
+        "right": {"type": "literal_exactnumeric", "value": 0}
+    })
+}
+
+#[test]
+fn string_converted_argument_table_matches_exasol_conversion_positions() {
+    let every_argument = ["CONCAT", "TRIM", "LTRIM", "RTRIM", "REPLACE", "TRANSLATE"];
+    for name in every_argument {
+        for arity in 1..=4 {
+            for index in 0..arity {
+                assert!(
+                    is_string_converted_arg(name, index, arity),
+                    "{name} index {index} of {arity}"
+                );
+            }
+            assert!(
+                !is_string_converted_arg(name, arity, arity),
+                "{name} beyond"
+            );
+        }
+    }
+
+    let first_only = [
+        "LOWER",
+        "UPPER",
+        "ASCII",
+        "INITCAP",
+        "REVERSE",
+        "LENGTH",
+        "OCTET_LENGTH",
+        "UNICODE",
+        "SUBSTR",
+        "REPEAT",
+        "LEFT",
+        "RIGHT",
+    ];
+    for name in first_only {
+        assert!(is_string_converted_arg(name, 0, 3), "{name} index 0");
+        assert!(!is_string_converted_arg(name, 1, 3), "{name} index 1");
+        assert!(!is_string_converted_arg(name, 2, 3), "{name} index 2");
+    }
+
+    for name in ["INSTR", "LOCATE"] {
+        assert!(is_string_converted_arg(name, 0, 2), "{name} index 0");
+        assert!(is_string_converted_arg(name, 1, 2), "{name} index 1");
+        assert!(!is_string_converted_arg(name, 2, 3), "{name} index 2");
+    }
+
+    for name in ["LPAD", "RPAD"] {
+        assert!(is_string_converted_arg(name, 0, 2), "{name}/2 index 0");
+        assert!(!is_string_converted_arg(name, 1, 2), "{name}/2 index 1");
+        assert!(is_string_converted_arg(name, 0, 3), "{name}/3 index 0");
+        assert!(!is_string_converted_arg(name, 1, 3), "{name}/3 index 1");
+        assert!(is_string_converted_arg(name, 2, 3), "{name}/3 index 2");
+    }
+
+    for name in ["CHR", "UNICODECHR", "ABS", "NULLIF", "ROUND", "GREATEST"] {
+        for index in 0..3 {
+            assert!(
+                !is_string_converted_arg(name, index, 3),
+                "{name} index {index}"
+            );
+        }
+    }
+}
+
+#[test]
+fn string_cast_targets_are_varchar_and_char_in_any_case() {
+    for ty in ["VARCHAR", "CHAR", "varchar", "Char"] {
+        assert!(
+            is_string_cast_target(&json!({"type": ty, "size": 5})),
+            "{ty}"
+        );
+    }
+    for ty in ["DECIMAL", "DOUBLE", "BOOLEAN", "DATE", "TIMESTAMP"] {
+        assert!(!is_string_cast_target(&json!({"type": ty})), "{ty}");
+    }
+    assert!(!is_string_cast_target(&json!({})));
+}
+
+#[test]
+fn string_converted_function_args_render_through_exa_to_varchar() {
+    let fixtures: Vec<(Json, &str)> = vec![
+        (
+            str_call("UPPER", vec![str_col("c_custkey")]),
+            r#"upper(exa_to_varchar("C_CUSTKEY"))"#,
+        ),
+        (
+            str_call(
+                "SUBSTR",
+                vec![
+                    str_col("c_name"),
+                    json!({"type": "literal_exactnumeric", "value": 2}),
+                    json!({"type": "literal_exactnumeric", "value": 3}),
+                ],
+            ),
+            r#"substr(exa_to_varchar("C_NAME"), 2, 3)"#,
+        ),
+        (
+            str_call(
+                "LPAD",
+                vec![
+                    str_col("c_name"),
+                    json!({"type": "literal_exactnumeric", "value": 10}),
+                    str_col("c_pad"),
+                ],
+            ),
+            r#"lpad(exa_to_varchar("C_NAME"), 10, exa_to_varchar("C_PAD"))"#,
+        ),
+        (
+            str_call(
+                "LPAD",
+                vec![
+                    str_col("c_name"),
+                    json!({"type": "literal_exactnumeric", "value": 10}),
+                ],
+            ),
+            r#"lpad(exa_to_varchar("C_NAME"), 10)"#,
+        ),
+        (
+            str_call(
+                "RPAD",
+                vec![
+                    str_col("c_name"),
+                    json!({"type": "literal_exactnumeric", "value": 10}),
+                ],
+            ),
+            r#"rpad(exa_to_varchar("C_NAME"), 10)"#,
+        ),
+        (
+            str_call(
+                "RPAD",
+                vec![
+                    str_col("c_name"),
+                    json!({"type": "literal_exactnumeric", "value": 10}),
+                    str_col("c_pad"),
+                ],
+            ),
+            r#"rpad(exa_to_varchar("C_NAME"), 10, exa_to_varchar("C_PAD"))"#,
+        ),
+        (
+            str_call(
+                "UPPER",
+                vec![json!({"type": "literal_bool", "value": true})],
+            ),
+            "upper(exa_to_varchar(TRUE))",
+        ),
+        (
+            str_call("LOWER", vec![bool_predicate()]),
+            r#"lower(exa_to_varchar(("C_ACCTBAL" > 0)))"#,
+        ),
+        (
+            str_call("LENGTH", vec![str_col("c_custkey")]),
+            r#"character_length(exa_to_varchar("C_CUSTKEY"))"#,
+        ),
+        (
+            str_call("UNICODE", vec![str_col("c_custkey")]),
+            r#"ascii(exa_to_varchar("C_CUSTKEY"))"#,
+        ),
+        (
+            str_call("REPLACE", vec![str_col("a"), str_col("b"), str_col("c")]),
+            r#"replace(exa_to_varchar("A"), exa_to_varchar("B"), exa_to_varchar("C"))"#,
+        ),
+        (
+            str_call("TRANSLATE", vec![str_col("a"), str_col("b"), str_col("c")]),
+            r#"translate(exa_to_varchar("A"), exa_to_varchar("B"), exa_to_varchar("C"))"#,
+        ),
+        (
+            str_call("TRIM", vec![str_col("a"), str_col("b")]),
+            r#"trim(exa_to_varchar("A"), exa_to_varchar("B"))"#,
+        ),
+        (
+            str_call("LTRIM", vec![str_col("a")]),
+            r#"ltrim(exa_to_varchar("A"))"#,
+        ),
+        (
+            str_call("RTRIM", vec![str_col("a")]),
+            r#"rtrim(exa_to_varchar("A"))"#,
+        ),
+        (
+            str_call("ASCII", vec![str_col("a")]),
+            r#"ascii(exa_to_varchar("A"))"#,
+        ),
+        (
+            str_call("INITCAP", vec![str_col("a")]),
+            r#"initcap(exa_to_varchar("A"))"#,
+        ),
+        (
+            str_call("REVERSE", vec![str_col("a")]),
+            r#"reverse(exa_to_varchar("A"))"#,
+        ),
+        (
+            str_call("OCTET_LENGTH", vec![str_col("a")]),
+            r#"octet_length(exa_to_varchar("A"))"#,
+        ),
+        (
+            str_call(
+                "REPEAT",
+                vec![
+                    str_col("a"),
+                    json!({"type": "literal_exactnumeric", "value": 2}),
+                ],
+            ),
+            r#"repeat(exa_to_varchar("A"), 2)"#,
+        ),
+        (
+            str_call(
+                "LEFT",
+                vec![
+                    str_col("a"),
+                    json!({"type": "literal_exactnumeric", "value": 2}),
+                ],
+            ),
+            r#"left(exa_to_varchar("A"), 2)"#,
+        ),
+        (
+            str_call(
+                "RIGHT",
+                vec![
+                    str_col("a"),
+                    json!({"type": "literal_exactnumeric", "value": 2}),
+                ],
+            ),
+            r#"right(exa_to_varchar("A"), 2)"#,
+        ),
+        (
+            str_call("INSTR", vec![str_col("c_name"), str_col("c_sub")]),
+            r#"strpos(exa_to_varchar("C_NAME"), exa_to_varchar("C_SUB"))"#,
+        ),
+        (
+            str_call("LOCATE", vec![str_col("c_sub"), str_col("c_name")]),
+            r#"strpos(exa_to_varchar("C_NAME"), exa_to_varchar("C_SUB"))"#,
+        ),
+        (
+            str_call("CONCAT", vec![str_col("a"), bool_predicate(), str_col("c")]),
+            r#"nullif(concat(exa_to_varchar("A"), exa_to_varchar(("C_ACCTBAL" > 0)), exa_to_varchar("C")), '')"#,
+        ),
+        (
+            str_call("CONCAT", vec![str_col("a")]),
+            r#"nullif(concat(exa_to_varchar("A")), '')"#,
+        ),
+        (
+            str_call("UPPER", vec![str_call("LOWER", vec![str_col("c_custkey")])]),
+            r#"upper(exa_to_varchar(lower(exa_to_varchar("C_CUSTKEY"))))"#,
+        ),
+    ];
+    for (node, expected) in &fixtures {
+        assert_eq!(render_expression(node).unwrap(), *expected, "{node}");
+        assert_eq!(render_expression_safe(node).as_deref(), Some(*expected));
+        assert_eq!(
+            render_expression(node).unwrap(),
+            render_expression(node).unwrap(),
+            "rendering the same node twice must be byte-identical: {node}"
+        );
+    }
+}
+
+#[test]
+fn values_outside_string_converted_positions_render_unwrapped() {
+    let unwrapped = [
+        (str_call("CHR", vec![str_col("n")]), r#"chr("N")"#),
+        (str_call("UNICODECHR", vec![str_col("n")]), r#"chr("N")"#),
+        (
+            str_call(
+                "SUBSTR",
+                vec![
+                    str_col("s"),
+                    str_col("start"),
+                    json!({"type": "literal_exactnumeric", "value": 3}),
+                ],
+            ),
+            r#"substr(exa_to_varchar("S"), "START", 3)"#,
+        ),
+        (str_call("ABS", vec![str_col("n")]), r#"abs("N")"#),
+        (
+            json!({
+                "type": "predicate_equal",
+                "left": str_col("a"),
+                "right": json!({"type": "literal_string", "value": "x"})
+            }),
+            r#"("A" = 'x')"#,
+        ),
+        (
+            str_call("NULLIF", vec![str_col("a"), str_col("b")]),
+            r#"nullif("A", "B")"#,
+        ),
+    ];
+    for (node, expected) in unwrapped {
+        assert_eq!(render_expression(&node).unwrap(), expected, "{node}");
+    }
+}
+
+#[test]
+fn string_cast_renders_as_cast_of_exa_to_varchar() {
+    let sources = [
+        (str_col("c_acctbal"), r#""C_ACCTBAL""#),
+        (str_col("c_custkey"), r#""C_CUSTKEY""#),
+        (bool_predicate(), r#"("C_ACCTBAL" > 0)"#),
+        (json!({"type": "literal_bool", "value": true}), "TRUE"),
+    ];
+    let targets = [
+        json!({"type": "VARCHAR", "size": 20}),
+        json!({"type": "CHAR", "size": 10, "characterSet": "ASCII"}),
+        json!({"type": "varchar", "size": 20}),
+    ];
+    for (source, rendered) in &sources {
+        for target in &targets {
+            let expected = format!("CAST(exa_to_varchar({rendered}) AS VARCHAR)");
+            let node = str_cast(source.clone(), target.clone());
+            assert_eq!(render_expression(&node).unwrap(), expected, "{node}");
+            assert_eq!(
+                render_expression_safe(&node).as_deref(),
+                Some(expected.as_str())
+            );
+            let defensive = json!({
+                "type": "function_scalar", "name": "CAST",
+                "arguments": [source], "dataType": target
+            });
+            assert_eq!(
+                render_expression(&defensive).unwrap(),
+                expected,
+                "{defensive}"
+            );
+        }
+    }
+}
+
+#[test]
+fn non_string_cast_renders_without_a_wrapper() {
+    let targets = [
+        (
+            json!({"type": "DECIMAL", "precision": 10, "scale": 2}),
+            "DECIMAL(10,2)",
+        ),
+        (json!({"type": "DOUBLE"}), "DOUBLE"),
+        (json!({"type": "BOOLEAN"}), "BOOLEAN"),
+        (json!({"type": "DATE"}), "DATE"),
+    ];
+    for (target, rendered_target) in targets {
+        let node = str_cast(str_col("c_varchar"), target);
+        assert_eq!(
+            render_expression(&node).unwrap(),
+            format!(r#"CAST("C_VARCHAR" AS {rendered_target})"#)
+        );
+    }
+}
+
+#[test]
+fn instr_and_locate_beyond_two_args_are_a_datafusion_render_error() {
+    let start = json!({"type": "literal_exactnumeric", "value": 3});
+    let occurrence = json!({"type": "literal_exactnumeric", "value": 1});
+    let nodes = [
+        str_call("INSTR", vec![str_col("a"), str_col("b"), start.clone()]),
+        str_call(
+            "INSTR",
+            vec![
+                str_col("a"),
+                str_col("b"),
+                start.clone(),
+                occurrence.clone(),
+            ],
+        ),
+        str_call("LOCATE", vec![str_col("b"), str_col("a"), start.clone()]),
+        str_call(
+            "LOCATE",
+            vec![str_col("b"), str_col("a"), start, occurrence],
+        ),
+    ];
+    for node in &nodes {
+        assert!(render_expression(node).is_err(), "raising mode: {node}");
+        assert!(render_expression_safe(node).is_none(), "safe mode: {node}");
+        assert!(render_df_filter_safe(node).is_none(), "filter mode: {node}");
+        assert!(
+            render_expression_exasol(node).is_ok(),
+            "the Exasol dialect renders the call verbatim: {node}"
+        );
+    }
+
+    let two_args = str_call("INSTR", vec![str_col("a"), str_col("b")]);
+    assert_eq!(
+        render_expression(&two_args).unwrap(),
+        r#"strpos(exa_to_varchar("A"), exa_to_varchar("B"))"#
+    );
+}
+
+#[test]
+fn exasol_dialect_never_renders_exa_to_varchar() {
+    let mut trees = vec![
+        str_cast(str_col("c_acctbal"), json!({"type": "VARCHAR", "size": 20})),
+        str_cast(bool_predicate(), json!({"type": "CHAR", "size": 5})),
+        str_call("CONCAT", vec![str_col("a"), bool_predicate()]),
+        str_call("INSTR", vec![str_col("a"), str_col("b")]),
+        str_call("INSTR", vec![str_col("a"), str_col("b"), str_col("s")]),
+        str_call("LOCATE", vec![str_col("b"), str_col("a"), str_col("s")]),
+        str_call("LPAD", vec![str_col("a"), str_col("n"), str_col("p")]),
+        str_call(
+            "UPPER",
+            vec![json!({"type": "literal_bool", "value": true})],
+        ),
+        str_call("UPPER", vec![str_call("LOWER", vec![str_col("a")])]),
+    ];
+    for (name, _) in TRANSLATED_SCALAR_FNS {
+        trees.push(str_call(name, vec![str_col("a"), str_col("b")]));
+    }
+    let filter = json!({
+        "type": "predicate_equal",
+        "left": str_call("UPPER", vec![str_col("c_custkey")]),
+        "right": {"type": "literal_string", "value": "5"}
+    });
+    trees.push(filter.clone());
+
+    for tree in &trees {
+        for rendered in [
+            render_expression_exasol(tree).ok(),
+            render_expression_exasol_safe(tree),
+            render_df_filter_exasol_safe(tree),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                !rendered.contains(EXA_TO_VARCHAR_FN),
+                "Exasol dialect rendered `{EXA_TO_VARCHAR_FN}` for {tree}: {rendered}"
+            );
+        }
+    }
+    assert_eq!(
+        render_expression_exasol(&filter).unwrap(),
+        r#"(UPPER("C_CUSTKEY") = '5')"#
+    );
+    assert!(
+        render_expression(&filter)
+            .unwrap()
+            .contains(EXA_TO_VARCHAR_FN)
+    );
+}
+
+#[test]
+fn exasol_dialect_keeps_boolean_case_rewrite_for_string_casts() {
+    let node = str_cast(bool_predicate(), json!({"type": "VARCHAR", "size": 5}));
+    assert_eq!(
+        render_expression_exasol(&node).unwrap(),
+        r#"(CASE ("C_ACCTBAL" > 0) WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)"#
+    );
+}
+
+#[test]
+fn datafusion_dialect_renders_no_boolean_case_rewrite() {
+    let cast = str_cast(bool_predicate(), json!({"type": "VARCHAR", "size": 5}));
+    let concat = str_call("CONCAT", vec![bool_predicate(), str_col("a")]);
+    for node in [cast, concat] {
+        let rendered = render_expression(&node).unwrap();
+        assert!(!rendered.contains("CASE"), "{rendered}");
+    }
+}
+
+#[test]
+fn string_converted_nodes_render_deterministically() {
+    let nodes = [
+        str_call("UPPER", vec![str_col("c_custkey")]),
+        str_call("CONCAT", vec![str_col("a"), bool_predicate()]),
+        str_call("INSTR", vec![str_col("a"), str_col("b")]),
+        str_cast(str_col("c_acctbal"), json!({"type": "VARCHAR", "size": 20})),
+    ];
+    for node in &nodes {
+        let first = render_expression(node).unwrap();
+        for _ in 0..3 {
+            assert_eq!(render_expression(node).unwrap(), first, "{node}");
+        }
+    }
 }

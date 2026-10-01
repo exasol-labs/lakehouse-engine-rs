@@ -421,7 +421,7 @@ fn expression_arg_partial_and_merge_types_from_declared_type() {
     );
     assert_eq!(
         agg_of(&plans[0]).arg_expr.as_deref(),
-        Some(r#"character_length("L_COMMENT")"#),
+        Some(r#"character_length(exa_to_varchar("L_COMMENT"))"#),
         "the rendered DataFusion fragment must be carried in arg_expr"
     );
 
@@ -558,7 +558,7 @@ fn count_distinct_builds_distinct_row_scan_spec() {
     assert!(dc_expr.column.is_none());
     assert_eq!(
         dc_expr.arg_expr.as_deref(),
-        Some(r#"character_length("L_COMMENT")"#)
+        Some(r#"character_length(exa_to_varchar("L_COMMENT"))"#)
     );
 }
 
@@ -710,7 +710,10 @@ fn stat_aggregate_over_bare_column_still_parses() {
 #[test]
 fn single_group_plan_types_returns_empty_vec_for_no_items() {
     let req = serde_json::json!({});
-    assert_eq!(single_group_plan_types(&req, &[]), Vec::<String>::new());
+    assert_eq!(
+        single_group_plan_types(&req, &[], &[]),
+        Vec::<String>::new()
+    );
 }
 
 #[test]
@@ -725,7 +728,7 @@ fn single_group_plan_types_aligns_with_bare_aggregate_select_list() {
     });
     let items = detect_aggregates(&req).expect("a bare aggregate list must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(&req, &items, &[]),
         vec![
             "DECIMAL(36,2)".to_string(),
             "DECIMAL(18,0)".to_string(),
@@ -748,7 +751,7 @@ fn single_group_plan_types_defaults_when_reached_only_through_scalar_wrapper() {
     });
     let items = detect_aggregates(&req).expect("ROUND(SUM/COUNT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(&req, &items, &[]),
         vec![
             "DOUBLE PRECISION".to_string(),
             "DOUBLE PRECISION".to_string()
@@ -775,7 +778,7 @@ fn single_group_plan_types_prefers_top_level_declared_type_for_shared_slot() {
     });
     let items = detect_aggregates(&req).expect("COUNT(*) + ROUND(SUM/COUNT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(&req, &items, &[]),
         vec!["DECIMAL(18,0)".to_string(), "DOUBLE PRECISION".to_string()],
         "slot 0 (COUNT) takes its bare declared type; slot 1 (SUM) has no top-level \
          occurrence and keeps the nested-only numeric default"
@@ -800,7 +803,7 @@ fn single_group_plan_types_resolves_both_ends_of_an_interleaved_list() {
     });
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(&req, &items, &[]),
         vec!["DECIMAL(36,2)".to_string(), "DECIMAL(18,0)".to_string()],
         "slot 0 (SUM) takes ordinal 0's type; slot 1 (COUNT) takes ordinal 2's type, \
          never ordinal 1's scalar-item type"
@@ -818,7 +821,7 @@ fn single_group_plan_types_skips_distinct_items() {
     });
     let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
     assert_eq!(
-        single_group_plan_types(&req, &items),
+        single_group_plan_types(&req, &items, &[]),
         vec!["DECIMAL(36,2)".to_string()],
         "the COUNT(DISTINCT) item contributes no ordinary-aggregate slot"
     );
@@ -839,7 +842,7 @@ fn nested_only_expression_argument_min_emits_a_numeric_partial_column() {
     });
     let items = detect_aggregates(&req).expect("ROUND(MIN(A * B), 2) must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &[]);
     assert_eq!(
         partial_emits_items(&plans, &[], &plan_types),
         vec![r#""PARTIAL_min_0" DOUBLE PRECISION"#.to_string()],
@@ -855,7 +858,7 @@ fn merge_select_wraps_scalar_structure_around_the_merged_partial() {
     });
     let items = detect_aggregates(&req).expect("ROUND(SUM(col), 2) must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &[]);
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
@@ -883,7 +886,7 @@ fn merge_select_interleaves_items_in_selectlist_order_with_per_item_casts() {
     });
     let items = detect_aggregates(&req).expect("an interleaved list must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &[]);
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
@@ -906,7 +909,7 @@ fn merge_select_leaves_items_uncast_without_a_declared_type() {
     });
     let items = detect_aggregates(&req).expect("must decompose without declared types");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &[]);
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
@@ -928,7 +931,7 @@ fn merge_select_declines_a_list_holding_a_distinct_item() {
     });
     let items = detect_aggregates(&req).expect("SUM + COUNT(DISTINCT) must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &[]);
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
@@ -949,7 +952,7 @@ fn merge_select_declines_when_the_scalar_structure_fails_to_render() {
         declared_type: "DECIMAL(18,0)".to_string(),
     }];
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&serde_json::json!({}), &items);
+    let plan_types = single_group_plan_types(&serde_json::json!({}), &items, &[]);
 
     assert_eq!(
         single_group_merge_select(&items, &plans, &plan_types),
@@ -970,7 +973,7 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
     });
     let items = detect_aggregates(&req).expect("a duplicated aggregate must decompose");
     let plans = ordinary_plans(&items);
-    let plan_types = single_group_plan_types(&req, &items);
+    let plan_types = single_group_plan_types(&req, &items, &[]);
     assert_eq!(plans.len(), 1, "one partial column for both occurrences");
 
     assert_eq!(
@@ -979,5 +982,177 @@ fn merge_select_emits_one_item_per_selectlist_item_for_duplicate_aggregates() {
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
             r#"CAST(SUM("PARTIAL_sum_0") AS DECIMAL(36,2))"#.to_string(),
         ])
+    );
+}
+
+fn single_group_over_customer(select_list: serde_json::Value) -> serde_json::Value {
+    let declared: Vec<serde_json::Value> = select_list
+        .as_array()
+        .expect("select list must be an array")
+        .iter()
+        .map(|_| serde_json::json!({"type": "DECIMAL", "precision": 18, "scale": 0}))
+        .collect();
+    customer_request(serde_json::json!({
+        "aggregationType": "single_group",
+        "selectList": select_list,
+        "selectListDataTypes": declared,
+    }))
+}
+
+fn length_of(node: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({"type": "function_scalar", "name": "LENGTH", "arguments": [node]})
+}
+
+fn is_single_group_shape(request: &serde_json::Value) -> bool {
+    matches!(
+        super::super::request_shape::classify_request_shape(
+            &pd(request),
+            &super::super::support::extract_all_column_types(request),
+        ),
+        super::super::request_shape::RequestShape::SingleGroupAgg { .. }
+    )
+}
+
+/// Scenario: One node renders one text on every DataFusion surface
+#[test]
+fn aggregate_over_string_fn_of_integer_decomposes() {
+    let request = single_group_over_customer(serde_json::json!([
+        agg_item_expr("MAX", upper_c_custkey(), false),
+        agg_item_expr("COUNT", upper_c_custkey(), false),
+    ]));
+
+    let items = detect_aggregates(&pd(&request)).expect("the string-fn arguments must detect");
+    let converted = Some(UPPER_C_CUSTKEY_SQL.to_string());
+    assert_eq!(
+        items,
+        vec![
+            SingleGroupItem::Aggregate(AggregatePlan {
+                kind: AggKind::Max,
+                column: None,
+                arg_expr: converted.clone(),
+            }),
+            SingleGroupItem::Aggregate(AggregatePlan {
+                kind: AggKind::CountCol,
+                column: None,
+                arg_expr: converted,
+            }),
+        ]
+    );
+    assert!(
+        is_single_group_shape(&request),
+        "the request must decompose into the single-group partial/merge scan"
+    );
+    let sql = dispatch_sql_with_files(&request);
+    let aggregates = &scan_spec_json(&sql)["aggregates"];
+    for slot in 0..2 {
+        assert_eq!(
+            aggregates[slot]["arg_expr"],
+            serde_json::json!(UPPER_C_CUSTKEY_SQL),
+            "aggregate {slot} must convert inside the scan: {sql}"
+        );
+    }
+}
+
+/// Scenario: One node renders one text on every DataFusion surface
+#[test]
+fn count_distinct_over_string_fn_carries_wrapped_arg() {
+    let request = single_group_over_customer(serde_json::json!([agg_item_expr(
+        "COUNT",
+        upper_c_custkey(),
+        true
+    )]));
+
+    let items = detect_aggregates(&pd(&request)).expect("the distinct count must detect");
+    assert_eq!(
+        items,
+        vec![SingleGroupItem::Distinct(DistinctCount {
+            column: None,
+            arg_expr: Some(UPPER_C_CUSTKEY_SQL.to_string()),
+        })]
+    );
+    assert!(is_single_group_shape(&request));
+    // An expression argument is not a lone bare-column distinct, so Exasol counts it natively.
+    let sql = dispatch_sql_with_files(&request);
+    assert_eq!(
+        outer_select_list(&sql),
+        r#"COUNT(DISTINCT UPPER("LHS_T0"."C_CUSTKEY"))"#,
+        "the qualified wrapper must count the Exasol-dialect expression: {sql}"
+    );
+    assert!(
+        !sql.contains("exa_to_varchar"),
+        "neither the wrapper nor its bare-column fan-out converts: {sql}"
+    );
+}
+
+/// Scenario: One node renders one text on every DataFusion surface
+#[test]
+fn single_group_scalar_over_string_fn_aggregate_decomposes() {
+    let request = single_group_over_customer(serde_json::json!([length_of(agg_item_expr(
+        "MAX",
+        upper_c_custkey(),
+        false
+    ))]));
+
+    let items = detect_aggregates(&pd(&request)).expect("the scalar over MAX must detect");
+    assert!(matches!(
+        items.as_slice(),
+        [SingleGroupItem::ScalarOverAggregate { .. }]
+    ));
+    assert_eq!(
+        ordinary_plans(&items),
+        vec![AggregatePlan {
+            kind: AggKind::Max,
+            column: None,
+            arg_expr: Some(UPPER_C_CUSTKEY_SQL.to_string()),
+        }],
+        "the nested aggregate's plan must carry the converted argument"
+    );
+    assert!(is_single_group_shape(&request));
+    let sql = dispatch_sql_with_files(&request);
+    assert_eq!(
+        scan_spec_json(&sql)["aggregates"][0]["arg_expr"],
+        serde_json::json!(UPPER_C_CUSTKEY_SQL),
+        "the conversion must stay inside the scan: {sql}"
+    );
+    assert_eq!(
+        outer_select_list(&sql),
+        r#"CAST(LENGTH(MAX("PARTIAL_max_0")) AS DECIMAL(18,0))"#,
+        "the scalar must render over the merged partial in the Exasol dialect: {sql}"
+    );
+}
+
+/// Scenario: One node renders one text on every DataFusion surface
+#[test]
+fn single_group_merge_wrapper_sql_for_string_fn_aggregate_has_no_exa_to_varchar() {
+    let request = single_group_over_customer(serde_json::json!([
+        agg_item_expr("MAX", upper_c_custkey(), false),
+        length_of(agg_item_expr("MIN", upper_c_custkey(), false)),
+    ]));
+
+    let sql = dispatch_sql_with_files(&request);
+    assert!(
+        common_arg_literal(&sql).contains("exa_to_varchar"),
+        "the fixture must carry the conversion inside the scan spec: {sql}"
+    );
+    assert!(
+        !sql_outside_string_literals(&sql).contains("exa_to_varchar"),
+        "the merge wrapper Exasol parses must not name exa_to_varchar: {sql}"
+    );
+}
+
+#[test]
+fn single_group_scalar_over_min_max_of_string_fn_emits_character_partials() {
+    let request = customer_request(serde_json::json!({
+        "aggregationType": "single_group",
+        "selectList": [concat_max_dash_min_of_upper_c_custkey()],
+        "selectListDataTypes": [{"type": "VARCHAR", "size": 43, "characterSet": "UTF8"}],
+    }));
+
+    let sql = dispatch_sql_with_files(&request);
+
+    assert_eq!(
+        emits_clause(&sql),
+        r#""PARTIAL_max_0" VARCHAR(2000000), "PARTIAL_min_1" VARCHAR(2000000)"#,
+        "text partials declared numeric would merge as numbers across shards: {sql}"
     );
 }

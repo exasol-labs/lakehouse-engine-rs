@@ -463,9 +463,10 @@ fn empty_result_sql_dispatches_by_plan_shape() {
         .as_str()
         .unwrap()
         .to_string();
-    assert!(
-        row_sql.contains("CAST(NULL AS DECIMAL(20,0))") && row_sql.contains(&quote_ident("ID")),
-        "non-numeric single-group aggregate must fall through to the row-scan shape: {row_sql}"
+    assert_eq!(
+        row_sql,
+        r#"SELECT CAST(SUM("NAME") AS DECIMAL(36,2)) FROM (SELECT CAST(NULL AS VARCHAR(2000000)) AS "NAME" FROM DUAL WHERE 1=0)"#,
+        "a non-numeric aggregate demoted to the row scan must still return its one row"
     );
 }
 
@@ -582,5 +583,252 @@ fn empty_result_sql_widened_row_scan_uses_select_list_types() {
             .unwrap(),
         "the non-widened path must stay byte-identical to the full-row empty \
          shape: {not_widened}"
+    );
+}
+
+fn declared_varchar(size: u64) -> Json {
+    serde_json::json!({"type": "VARCHAR", "size": size, "characterSet": "UTF8"})
+}
+
+fn declared_decimal(precision: u64, scale: u64) -> Json {
+    serde_json::json!({"type": "DECIMAL", "precision": precision, "scale": scale})
+}
+
+fn length_of(node: Json) -> Json {
+    serde_json::json!({"type": "function_scalar", "name": "LENGTH", "arguments": [node]})
+}
+
+/// Scenario: One node renders one text on every DataFusion surface
+#[test]
+fn empty_path_resolves_same_shape_for_string_fn_aggregates() {
+    let max_upper = || agg_item_expr("MAX", upper_c_custkey(), false);
+    let name = serde_json::json!({"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"});
+    let cases = [
+        (
+            serde_json::json!({
+                "aggregationType": "group_by",
+                "groupBy": [upper_c_custkey()],
+                "selectList": [upper_c_custkey(), agg_item("COUNT", None, false)],
+                "selectListDataTypes": [declared_varchar(20), declared_decimal(18, 0)],
+            }),
+            "SELECT CAST(NULL AS VARCHAR(20)), CAST(NULL AS DECIMAL(18,0)) FROM DUAL WHERE 1=0",
+        ),
+        (
+            serde_json::json!({
+                "aggregationType": "group_by",
+                "groupBy": [upper_c_custkey()],
+                "selectList": [agg_item("COUNT", None, false)],
+                "selectListDataTypes": [declared_decimal(18, 0)],
+            }),
+            "SELECT CAST(NULL AS DECIMAL(18,0)) FROM DUAL WHERE 1=0",
+        ),
+        (
+            serde_json::json!({
+                "aggregationType": "group_by",
+                "groupBy": [upper_c_custkey()],
+                "selectList": [upper_c_custkey(), max_upper()],
+                "selectListDataTypes": [declared_varchar(20), declared_varchar(20)],
+                "having": {
+                    "type": "predicate_less",
+                    "left": {"type": "literal_string", "value": "5"},
+                    "right": max_upper(),
+                },
+                "orderBy": [{
+                    "type": "order_by_element",
+                    "expression": upper_c_custkey(),
+                    "isAscending": true,
+                    "nullsLast": true,
+                }],
+            }),
+            "SELECT CAST(NULL AS VARCHAR(20)), CAST(NULL AS VARCHAR(20)) FROM DUAL WHERE 1=0",
+        ),
+        (
+            serde_json::json!({
+                "aggregationType": "group_by",
+                "groupBy": [name.clone()],
+                "selectList": [name, length_of(max_upper())],
+                "selectListDataTypes": [declared_varchar(25), declared_decimal(18, 0)],
+            }),
+            "SELECT CAST(NULL AS VARCHAR(25)), CAST(NULL AS DECIMAL(18,0)) FROM DUAL WHERE 1=0",
+        ),
+        (
+            serde_json::json!({
+                "aggregationType": "single_group",
+                "selectList": [max_upper(), agg_item_expr("COUNT", upper_c_custkey(), false)],
+                "selectListDataTypes": [declared_varchar(20), declared_decimal(18, 0)],
+            }),
+            "SELECT CAST(NULL AS VARCHAR(20)), CAST(0 AS DECIMAL(18,0)) FROM DUAL",
+        ),
+        (
+            serde_json::json!({
+                "aggregationType": "single_group",
+                "selectList": [agg_item_expr("COUNT", upper_c_custkey(), true)],
+                "selectListDataTypes": [declared_decimal(18, 0)],
+            }),
+            "SELECT CAST(0 AS DECIMAL(18,0)) FROM DUAL",
+        ),
+        (
+            serde_json::json!({
+                "aggregationType": "single_group",
+                "selectList": [length_of(max_upper())],
+                "selectListDataTypes": [declared_decimal(18, 0)],
+            }),
+            "SELECT CAST(LENGTH(CAST(NULL AS VARCHAR(2000000))) AS DECIMAL(18,0)) FROM DUAL",
+        ),
+    ];
+
+    for (pushdown_request, expected) in cases {
+        let request = customer_request(pushdown_request);
+        assert_eq!(
+            dispatch_sql_all_files_pruned(&request),
+            expected,
+            "the empty path must resolve the shape its non-empty path commits to: {request}"
+        );
+    }
+}
+
+fn instr_of_c_name_from_2() -> Json {
+    serde_json::json!({
+        "type": "function_scalar",
+        "name": "INSTR",
+        "arguments": [
+            {"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"},
+            {"type": "literal_string", "value": "c"},
+            {"type": "literal_exactnumeric", "value": "2"},
+        ],
+    })
+}
+
+fn orders_request(pushdown_request: Json) -> Json {
+    serde_json::json!({
+        "involvedTables": [{
+            "name": "ORDERS",
+            "columns": [
+                {"name": "O_ORDERKEY", "dataType": declared_decimal(20, 0)},
+                {"name": "O_ORDERDATE", "dataType": {"type": "DATE"}},
+            ],
+        }],
+        "pushdownRequest": pushdown_request,
+    })
+}
+
+fn classifies_as_widened_row_scan(request: &Json) -> bool {
+    let pushdown_req = pd(request);
+    let col_types = super::super::support::extract_all_column_types(request);
+    let (_, _, projection_widened) =
+        super::super::support::extract_projection(request, &pushdown_req)
+            .expect("the fixture must project");
+    projection_widened
+        && matches!(
+            classify_request_shape(&pushdown_req, &col_types),
+            RequestShape::RowScan
+        )
+}
+
+/// Scenario: An ungrouped aggregate on the row-scan path with all files pruned returns one row
+#[test]
+fn empty_row_scan_ungrouped_aggregate_returns_one_row() {
+    let max_instr = customer_request(serde_json::json!({
+        "aggregationType": "single_group",
+        "selectList": [agg_item_expr("MAX", instr_of_c_name_from_2(), false)],
+        "selectListDataTypes": [declared_decimal(18, 0)],
+    }));
+    let max_timestamp_and_count = orders_request(serde_json::json!({
+        "type": "select",
+        "from": {"type": "table", "name": "ORDERS"},
+        "aggregationType": "single_group",
+        "selectList": [
+            agg_item_expr(
+                "MAX",
+                serde_json::json!({
+                    "type": "function_scalar_cast",
+                    "dataType": {"type": "TIMESTAMP", "fractionalSecondsPrecision": 4},
+                    "arguments": [{"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"}],
+                }),
+                false,
+            ),
+            agg_item("COUNT", None, false),
+        ],
+        "selectListDataTypes": [
+            {"type": "TIMESTAMP", "fractionalSecondsPrecision": 4},
+            declared_decimal(18, 0),
+        ],
+        "filter": {
+            "type": "predicate_less",
+            "left": {"type": "column", "name": "O_ORDERKEY", "tableName": "ORDERS"},
+            "right": {"type": "literal_exactnumeric", "value": "0"},
+        },
+    }));
+    let cases = [
+        (
+            &max_instr,
+            "SELECT CAST(MAX(INSTR(\"C_NAME\", 'c', 2)) AS DECIMAL(18,0)) \
+             FROM (SELECT CAST(NULL AS DECIMAL(20,0)) AS \"C_CUSTKEY\", \
+             CAST(NULL AS VARCHAR(25)) AS \"C_NAME\", \
+             CAST(NULL AS DECIMAL(12,2)) AS \"C_ACCTBAL\" FROM DUAL WHERE 1=0)",
+        ),
+        (
+            &max_timestamp_and_count,
+            "SELECT CAST(MAX(CAST(\"O_ORDERDATE\" AS TIMESTAMP(4))) AS TIMESTAMP(4)), \
+             CAST(COUNT(*) AS DECIMAL(18,0)) \
+             FROM (SELECT CAST(NULL AS DECIMAL(20,0)) AS \"O_ORDERKEY\", \
+             CAST(NULL AS DATE) AS \"O_ORDERDATE\" FROM DUAL WHERE 1=0)",
+        ),
+    ];
+
+    for (request, expected) in cases {
+        assert!(
+            classifies_as_widened_row_scan(request),
+            "the fixture must reach the widened RowScan arm: {request}"
+        );
+        assert_eq!(
+            dispatch_sql_all_files_pruned(request),
+            expected,
+            "Exasol must aggregate the select list over a typed zero-row relation, which \
+             yields one row: NULL per aggregate, 0 per COUNT"
+        );
+    }
+}
+
+#[test]
+fn empty_row_scan_ungrouped_aggregate_keeps_having() {
+    let request = customer_request(serde_json::json!({
+        "aggregationType": "single_group",
+        "selectList": [agg_item_expr("MAX", instr_of_c_name_from_2(), false)],
+        "selectListDataTypes": [declared_decimal(18, 0)],
+        "having": {
+            "type": "predicate_less",
+            "left": {"type": "literal_exactnumeric", "value": "5"},
+            "right": agg_item("COUNT", None, false),
+        },
+    }));
+
+    let sql = dispatch_sql_all_files_pruned(&request);
+    assert!(
+        sql.ends_with(" FROM DUAL WHERE 1=0) HAVING (5 < COUNT(*))"),
+        "the one row must still pass the request's HAVING, as it does natively: {sql}"
+    );
+}
+
+/// Scenario: An ungrouped aggregate on the row-scan path with all files pruned returns one row
+#[test]
+fn empty_row_scan_without_aggregate_keeps_zero_rows() {
+    let widened = customer_request(serde_json::json!({
+        "selectList": [instr_of_c_name_from_2()],
+        "selectListDataTypes": [declared_decimal(18, 0)],
+    }));
+    assert!(classifies_as_widened_row_scan(&widened));
+    assert_eq!(
+        dispatch_sql_all_files_pruned(&widened),
+        "SELECT CAST(NULL AS DECIMAL(18,0)) FROM DUAL WHERE 1=0"
+    );
+
+    let projected = customer_request(serde_json::json!({
+        "selectList": [{"type": "column", "name": "C_NAME", "tableName": "CUSTOMER"}],
+        "selectListDataTypes": [declared_varchar(25)],
+    }));
+    assert_eq!(
+        dispatch_sql_all_files_pruned(&projected),
+        r#"SELECT CAST(NULL AS VARCHAR(25)) AS "C_NAME" FROM DUAL WHERE 1=0"#
     );
 }

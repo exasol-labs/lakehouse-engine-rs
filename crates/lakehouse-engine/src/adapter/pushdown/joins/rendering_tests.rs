@@ -212,10 +212,9 @@ fn join_projection_string_fn_coerces_decimal_and_declines_unrenderable_arity() {
     let ProjectionItem::Expr { expr } = &projection[0] else {
         panic!("must be a rendered expression, not a bare column: {projection:?}");
     };
-    assert!(
-        expr.contains(r#"upper(regexp_replace(regexp_replace(CAST("C_CUSTKEY" AS VARCHAR)"#),
-        "UPPER's DECIMAL argument must render through the trimmed decimal-to-string \
-         form: {expr}"
+    assert_eq!(
+        expr, r#"upper(exa_to_varchar("C_CUSTKEY"))"#,
+        "UPPER's DECIMAL argument must render through the renderer's conversion"
     );
 
     let mut decline_request = request.clone();
@@ -609,10 +608,6 @@ fn join_side_pruning_input_unchanged_when_df_render_declines() {
     );
 }
 
-fn customer_col_types() -> Vec<(String, String)> {
-    involved_table_columns(&join_request(Json::Null, equi_condition()), "CUSTOMER")
-}
-
 fn orders_col_types() -> Vec<(String, String)> {
     involved_table_columns(&join_request(Json::Null, equi_condition()), "ORDERS")
 }
@@ -658,7 +653,8 @@ fn type_screened_leg_filter_pushes_whole_accepted_set_rewritten() {
     );
     let rendered = render_df_filter_safe(&leg).expect("the rewritten set must render");
     assert!(
-        rendered.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && rendered.contains("LIKE"),
+        rendered.contains(r#"CAST(exa_to_varchar("O_ORDERDATE") AS VARCHAR)"#)
+            && rendered.contains("LIKE"),
         "the DATE LIKE subject must reach the leg CAST to VARCHAR, not bare: {rendered}"
     );
 }
@@ -733,7 +729,8 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
     let leg_sql = render_df_filter_safe(&leg.expect("the two accepted conjuncts form a leg"))
         .expect("the rewritten accepted set must render for DataFusion");
     assert!(
-        leg_sql.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && !leg_sql.contains("O_CUSTKEY"),
+        leg_sql.contains(r#"CAST(exa_to_varchar("O_ORDERDATE") AS VARCHAR)"#)
+            && !leg_sql.contains("O_CUSTKEY"),
         "one type-declining conjunct must not forfeit its side's other pushable \
          conjuncts: {leg_sql}"
     );
@@ -746,24 +743,20 @@ fn type_screened_leg_filter_partition_is_total_and_fails_closed() {
 
 #[test]
 fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
-    let col_types = customer_col_types();
+    let col_types = orders_col_types();
     let filter = serde_json::json!({
-        "type": "predicate_greater",
-        "left": {"type": "function_scalar", "name": "SECOND", "arguments": [
-            {"type": "function_scalar_cast", "name": "CAST",
-             "dataType": {"type": "VARCHAR", "size": 40},
-             "arguments": [
-                 {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"}]},
-            {"type": "literal_exactnumeric", "value": 3}
-        ]},
-        "right": {"type": "literal_exactnumeric", "value": 1}
+        "type": "predicate_or",
+        "expressions": [
+            like_over("O_ORDERDATE", "ORDERS", "1995%"),
+            orders_local_declined_conjunct(),
+        ]
     });
 
     let rewritten = apply_type_rewrites(&filter, &col_types)
         .expect("precondition: the type pipeline ACCEPTS this tree");
-    assert!(
-        rewritten.to_string().contains("decimal_to_varchar_exasol"),
-        "precondition: the pipeline REWRITES the DECIMAL stringification: {rewritten}"
+    assert_ne!(
+        rewritten, filter,
+        "precondition: the pipeline REWRITES the DATE LIKE subject"
     );
     assert!(
         !datafusion_renderable(&rewritten),
@@ -779,8 +772,7 @@ fn type_screened_leg_filter_declines_type_accepted_but_unrenderable_rewrite() {
     assert_eq!(
         declined,
         Some(filter),
-        "it must reach the outer wrapper RAW — with the plain CAST, not the \
-         DataFusion-only rewrite the Exasol dialect has no node for"
+        "it must reach the outer wrapper RAW, without the DataFusion-only rewrite"
     );
 }
 
@@ -804,7 +796,7 @@ fn type_screened_leg_filter_uses_owning_side_types_for_shared_column_name() {
     )
     .expect("the CAST-rewrapped LIKE renders for DataFusion");
     assert!(
-        date_sql.contains(r#"CAST("SHARED_KEY" AS VARCHAR)"#),
+        date_sql.contains(r#"CAST(exa_to_varchar("SHARED_KEY") AS VARCHAR)"#),
         "the DATE side must push the CAST-rewritten LIKE into its leg: {date_sql}"
     );
     assert!(

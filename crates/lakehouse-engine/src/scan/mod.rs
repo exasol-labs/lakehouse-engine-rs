@@ -26,6 +26,8 @@ pub use sql_support::build_alias_items;
 
 mod checked_div;
 
+mod to_varchar;
+
 mod object_store;
 pub(crate) use self::object_store::{
     build_admission_limited_store, build_table_root_store, store_root_url,

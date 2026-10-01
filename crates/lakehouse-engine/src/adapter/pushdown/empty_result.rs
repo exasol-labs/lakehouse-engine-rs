@@ -2,13 +2,16 @@ use crate::scan::spec::{AggKind, AggregatePlan, ProjectionItem};
 use crate::types::mapping::exasol_type_from_json;
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
+use vs_expression::render_expression_exasol;
 
 use super::GroupedSelectItem;
 use super::grouped_agg::{group_key_exasol_types, select_item_index};
 use super::request_shape::{RequestShape, classify_request_shape};
-use super::scalar_over_agg::{classify_scalar_over_aggregate, render_scalar_over_merge};
+use super::scalar_over_agg::{classify_typed_scalar_over_aggregate, render_scalar_over_merge};
 use super::single_group_agg::SingleGroupItem;
-use super::support::{cast_to_declared_type, declared_select_type, emits_ident};
+use super::support::{
+    cast_to_declared_type, contains_aggregate_node, declared_select_type, emits_ident, quote_ident,
+};
 
 /// Routes through the same [`classify_request_shape`] as the non-empty dispatcher,
 /// so empty and non-empty positional column shapes cannot diverge.
@@ -42,13 +45,53 @@ pub(super) fn empty_result_sql(
         RequestShape::SingleGroupAgg { items } => {
             Ok(empty_agg_sql(&items, pushdown_req, col_types))
         }
-        // Widened projection: same reasoning as the `GroupByWrapper` arm (#196).
-        RequestShape::RowScan if projection_widened => {
-            Ok(empty_select_list_typed_sql(pushdown_req)
-                .unwrap_or_else(|| empty_pushdown_sql(proj_cols, proj_types)))
-        }
-        RequestShape::RowScan => Ok(empty_pushdown_sql(proj_cols, proj_types)),
+        RequestShape::RowScan => match empty_ungrouped_aggregate_sql(pushdown_req, col_types) {
+            Some(sql) => Ok(sql),
+            // Widened projection: same reasoning as the `GroupByWrapper` arm (#196).
+            None if projection_widened => Ok(empty_select_list_typed_sql(pushdown_req)
+                .unwrap_or_else(|| empty_pushdown_sql(proj_cols, proj_types))),
+            None => Ok(empty_pushdown_sql(proj_cols, proj_types)),
+        },
     }
+}
+
+/// Exasol evaluates the unparsed aggregates over a typed zero-row relation, as the qualified
+/// wrapper does over the fan-out: one row unless HAVING rejects it (decision-log [8]).
+fn empty_ungrouped_aggregate_sql(
+    pushdown_req: &Json,
+    col_types: &[(String, String)],
+) -> Option<Json> {
+    let grouped = pushdown_req
+        .get("groupBy")
+        .and_then(|v| v.as_array())
+        .is_some_and(|keys| !keys.is_empty());
+    let list = pushdown_req.get("selectList").and_then(|v| v.as_array())?;
+    if grouped || col_types.is_empty() || !list.iter().any(contains_aggregate_node) {
+        return None;
+    }
+    let items = list
+        .iter()
+        .enumerate()
+        .map(|(i, item)| {
+            let sql = render_expression_exasol(item).ok()?;
+            let declared = declared_select_type(pushdown_req, i);
+            Some(cast_to_declared_type(&sql, Some(declared.as_str())))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let having = match pushdown_req.get("having").filter(|h| !h.is_null()) {
+        Some(node) => format!(" HAVING {}", render_expression_exasol(node).ok()?),
+        None => String::new(),
+    };
+    let columns: Vec<String> = col_types
+        .iter()
+        .map(|(name, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(name)))
+        .collect();
+    let sql = format!(
+        "SELECT {} FROM (SELECT {} FROM DUAL WHERE 1=0){having}",
+        items.join(", "),
+        columns.join(", ")
+    );
+    Some(serde_json::json!({"type": "pushdown", "sql": sql}))
 }
 
 fn empty_select_list_typed_sql(pushdown_req: &Json) -> Option<Json> {
@@ -81,7 +124,11 @@ fn empty_agg_literal(kind: &AggKind) -> &'static str {
 
 /// The type exists only to make the enclosing scalar's argument well-typed; the
 /// value is NULL either way.
-fn nested_absent_agg_type(plan: &AggregatePlan, col_types: &[(String, String)]) -> String {
+fn nested_absent_agg_type(
+    plan: &AggregatePlan,
+    partial_type: String,
+    col_types: &[(String, String)],
+) -> String {
     plan.column
         .as_deref()
         .and_then(|column| {
@@ -90,21 +137,25 @@ fn nested_absent_agg_type(plan: &AggregatePlan, col_types: &[(String, String)]) 
                 .find(|(name, _)| name == column)
                 .map(|(_, ty)| ty.clone())
         })
-        .unwrap_or_else(|| "DOUBLE PRECISION".to_string())
+        .unwrap_or(partial_type)
 }
 
 /// Exasol rejects an untyped `NULL` scalar-function argument (`ROUND(NULL, 2)` fails
 /// with SQL state `0A000`), so an absent nested aggregate is substituted as a typed null.
 fn empty_scalar_over_aggregate_literal(node: &Json, col_types: &[(String, String)]) -> String {
-    let plans = classify_scalar_over_aggregate(node)
+    let typed = classify_typed_scalar_over_aggregate(node, col_types)
         .expect("a SingleGroupItem::ScalarOverAggregate node was already classified at detection");
-    let zeros: Vec<String> = plans
+    let zeros: Vec<String> = typed
         .iter()
-        .map(|plan| match empty_agg_literal(&plan.kind) {
-            "NULL" => format!("CAST(NULL AS {})", nested_absent_agg_type(plan, col_types)),
+        .map(|(plan, partial_type)| match empty_agg_literal(&plan.kind) {
+            "NULL" => format!(
+                "CAST(NULL AS {})",
+                nested_absent_agg_type(plan, partial_type.clone(), col_types)
+            ),
             zero => zero.to_string(),
         })
         .collect();
+    let plans: Vec<AggregatePlan> = typed.into_iter().map(|(plan, _)| plan).collect();
     render_scalar_over_merge(node, &plans, &zeros)
         .expect("a classified scalar-over-aggregate node must render over its own zero values")
 }

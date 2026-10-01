@@ -226,7 +226,8 @@ fn broadcast_keeps_plan_and_casts_like_over_date_side_column() {
         .filter
         .expect("the rewritten LIKE must still render as a scan-spec filter");
     assert!(
-        filter.contains(r#"CAST("O_ORDERDATE" AS VARCHAR)"#) && filter.contains("LIKE"),
+        filter.contains(r#"CAST(exa_to_varchar("O_ORDERDATE") AS VARCHAR)"#)
+            && filter.contains("LIKE"),
         "the DATE subject must be rewrapped in CAST-to-VARCHAR form before the \
          LIKE: {filter}"
     );
@@ -1126,7 +1127,8 @@ fn n_scan_date_like_side_local_conjunct_reaches_leg_as_cast() {
     let (legs, outer) = n_scan_legs_and_outer_where(&request);
 
     assert!(
-        legs.contains(r#"CAST(\"O_ORDERDATE\" AS VARCHAR)"#) && legs.contains("LIKE"),
+        legs.contains(r#"CAST(exa_to_varchar(\"O_ORDERDATE\") AS VARCHAR)"#)
+            && legs.contains("LIKE"),
         "the DATE LIKE subject must reach its leg CAST to VARCHAR: {legs}"
     );
     assert!(
@@ -1154,7 +1156,7 @@ fn n_scan_type_accepted_side_local_conjunct_still_pushes_when_a_sibling_declines
         "exactly the type-accepted LIKE may reach the legs: {legs}"
     );
     assert!(
-        legs.contains(r#"CAST(\"O_ORDERDATE\" AS VARCHAR)"#),
+        legs.contains(r#"CAST(exa_to_varchar(\"O_ORDERDATE\") AS VARCHAR)"#),
         "and it must arrive rewritten: {legs}"
     );
     assert_eq!(
@@ -1201,7 +1203,8 @@ fn n_scan_leg_residual_partition_is_total_and_disjoint_with_type_screen() {
         "conjunct 1 must not be double-applied in the outer WHERE: {outer}"
     );
     assert_eq!(
-        legs.matches(r#"CAST(\"O_ORDERDATE\" AS VARCHAR)"#).count(),
+        legs.matches(r#"CAST(exa_to_varchar(\"O_ORDERDATE\") AS VARCHAR)"#)
+            .count(),
         1,
         "conjunct 2 belongs to the ORDERS leg, rewritten, exactly once: {legs}"
     );
@@ -1258,7 +1261,7 @@ fn join_like_over_varchar_side_column_pushes_down_unchanged() {
 }
 
 #[test]
-fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
+fn join_decimal_stringification_wraps_exa_to_varchar_at_both_join_sites() {
     let mut request = join_request(Json::Null, equi_condition());
     request["involvedTables"][1]["columns"]
         .as_array_mut()
@@ -1278,8 +1281,6 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
     request["pushdownRequest"]["filter"] = filter;
     let detected = detected_join(&request);
 
-    let trim_wrapper = "regexp_replace(regexp_replace(CAST(";
-
     let rendered = render_broadcast_join(&request, &pd(&request), &detected)
         .expect("LENGTH(DECIMAL) > 3 must not error")
         .expect("a renderable decimal-stringification rewrite must keep the broadcast plan");
@@ -1287,15 +1288,49 @@ fn join_decimal_stringification_renders_trimmed_at_both_join_sites() {
         .filter
         .expect("the rewritten filter must still render as a scan-spec filter");
     assert!(
-        filter.contains(trim_wrapper),
-        "the broadcast filter must carry the decimal_to_varchar_exasol trim \
-         form: {filter}"
+        filter.contains(r#"character_length(exa_to_varchar("O_TOTALPRICE"))"#),
+        "the broadcast filter must wrap the DECIMAL argument in exa_to_varchar: {filter}"
     );
 
     let (legs, _outer) = n_scan_legs_and_outer_where(&request);
     assert!(
-        legs.contains(trim_wrapper),
-        "the ORDERS fan-out leg must carry the same trim form: {legs}"
+        legs.contains(r#"character_length(exa_to_varchar(\"O_TOTALPRICE\"))"#),
+        "the ORDERS fan-out leg must carry the same conversion: {legs}"
+    );
+}
+
+/// Scenario: A join filter with no type-rewrite trigger emits byte-identical SQL
+#[test]
+fn join_filter_without_string_conversion_trigger_emits_byte_identical_sql() {
+    let filter = serde_json::json!({
+        "type": "predicate_and",
+        "expressions": [
+            {
+                "type": "predicate_greater",
+                "left": {"type": "column", "name": "O_ORDERDATE", "tableName": "ORDERS"},
+                "right": {"type": "literal_string", "value": "1995-01-01"}
+            },
+            like_over("C_NAME", "CUSTOMER", "acme%"),
+        ]
+    });
+    let request = n_scan_request_with_filter(filter.clone());
+    let detected = detected_join(&request);
+
+    let rendered = render_broadcast_join(&request, &pd(&request), &detected)
+        .expect("a trigger-free filter must not error")
+        .expect("a trigger-free filter must keep the broadcast plan");
+    let expected = render_df_filter_safe(&strip_table_alias(&filter))
+        .expect("the request's own filter tree must render");
+    assert_eq!(
+        rendered.filter.as_deref(),
+        Some(expected.as_str()),
+        "the broadcast filter must equal the rendering of the request's own filter tree"
+    );
+
+    let (legs, outer) = n_scan_legs_and_outer_where(&request);
+    assert!(
+        !legs.contains("exa_to_varchar") && outer.is_empty(),
+        "no leg may carry a conversion and nothing may reach the outer WHERE: {legs}{outer}"
     );
 }
 

@@ -189,7 +189,7 @@ fn unresolvable_grouped_order_by_classifies_group_by_wrapper_incl_group_key_only
         "limit": 5,
     });
     assert!(
-        detect_group_by_aggregates(&req)
+        detect_group_by_aggregates(&req, &[])
             .expect("a group-key-only select list still detects as grouped")
             .plans
             .is_empty(),
@@ -219,7 +219,7 @@ fn unresolvable_grouped_order_by_with_nonempty_plans_classifies_group_by_wrapper
         }],
     });
     assert_eq!(
-        detect_group_by_aggregates(&req)
+        detect_group_by_aggregates(&req, &[])
             .expect("grouped aggregate")
             .plans
             .len(),
@@ -307,5 +307,68 @@ fn non_numeric_single_group_aggregate_demotes_to_row_scan() {
     assert!(
         matches!(shape, RequestShape::RowScan),
         "a non-numeric single-group aggregate demotes to a row scan: {shape:?}"
+    );
+}
+
+fn instr_of_name(extra_args: &[serde_json::Value]) -> serde_json::Value {
+    let mut arguments = vec![
+        serde_json::json!({"type": "column", "name": "NAME"}),
+        serde_json::json!({"type": "literal_string", "value": "c"}),
+    ];
+    arguments.extend_from_slice(extra_args);
+    serde_json::json!({"type": "function_scalar", "name": "INSTR", "arguments": arguments})
+}
+
+/// Scenario: An INSTR or LOCATE call beyond two arguments reaches native Exasol evaluation on every surface
+#[test]
+fn instr_beyond_two_args_routes_grouped_and_single_group_to_wrapper() {
+    let start = serde_json::json!({"type": "literal_exactnumeric", "value": "2"});
+    let occurrence = serde_json::json!({"type": "literal_exactnumeric", "value": "1"});
+    for instr in [
+        instr_of_name(std::slice::from_ref(&start)),
+        instr_of_name(&[start.clone(), occurrence.clone()]),
+    ] {
+        let as_group_key = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [instr.clone()],
+            "selectList": [instr.clone(), agg_item("SUM", Some("ID"), false)],
+        });
+        let as_grouped_aggregate_arg = serde_json::json!({
+            "aggregationType": "group_by",
+            "groupBy": [{"type": "column", "name": "NAME"}],
+            "selectList": [
+                {"type": "column", "name": "NAME"},
+                agg_item_expr("MAX", instr.clone(), false),
+            ],
+        });
+        let as_single_group_aggregate_arg = serde_json::json!({
+            "aggregationType": "single_group",
+            "selectList": [agg_item_expr("MAX", instr.clone(), false)],
+        });
+
+        for grouped in [&as_group_key, &as_grouped_aggregate_arg] {
+            let shape = classify_request_shape(grouped, &col_types());
+            assert!(
+                matches!(shape, RequestShape::GroupByWrapper),
+                "a grouped {instr} must reach native evaluation: {shape:?}"
+            );
+        }
+        let shape = classify_request_shape(&as_single_group_aggregate_arg, &col_types());
+        assert!(
+            matches!(shape, RequestShape::RowScan),
+            "a single-group aggregate over {instr} must reach native evaluation: {shape:?}"
+        );
+    }
+
+    let two_arg = serde_json::json!({
+        "aggregationType": "single_group",
+        "selectList": [agg_item_expr("MAX", instr_of_name(&[]), false)],
+    });
+    assert!(
+        matches!(
+            classify_request_shape(&two_arg, &col_types()),
+            RequestShape::SingleGroupAgg { .. }
+        ),
+        "a two-argument INSTR keeps its pushdown"
     );
 }
