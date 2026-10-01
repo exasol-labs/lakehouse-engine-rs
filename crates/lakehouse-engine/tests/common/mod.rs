@@ -40,6 +40,7 @@ pub mod lakekeeper;
 pub mod pos_delete_fixtures;
 #[cfg(any(
     feature = "exasol-e2e",
+    feature = "lakekeeper-e2e",
     feature = "azure-e2e",
     feature = "unity-e2e",
     feature = "glue-e2e"
@@ -54,9 +55,7 @@ pub mod raw_parquet;
 ))]
 pub mod seed;
 pub mod stack;
-#[cfg(any(feature = "exasol-e2e", feature = "unity-e2e"))]
+#[cfg(any(feature = "exasol-e2e", feature = "unity-e2e", feature = "glue-e2e"))]
 pub mod timestamp_precision;
-#[cfg(any(feature = "exasol-e2e", feature = "glue-e2e"))]
-pub mod type_matrix;
 #[cfg(feature = "exasol-e2e")]
 pub mod type_promotion_fixtures;

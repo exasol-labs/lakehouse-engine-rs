@@ -51,17 +51,6 @@ fn served_table() -> String {
     E2E_COMPLEX_TABLE.to_uppercase()
 }
 
-fn declared_type(conn: &mut ExaConn, table: &str, column: &str) -> String {
-    let ty = conn.query_columns(&format!(
-        "SELECT COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
-         WHERE COLUMN_SCHEMA='{VS_NAME}' AND COLUMN_TABLE='{table}' AND COLUMN_NAME='{column}'"
-    ))[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("{column} has no declared type"))
-        .to_string();
-    ty.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
 fn assert_rendered(cell: &serde_json::Value, expected: Option<serde_json::Value>, context: &str) {
     match (cell, expected) {
         (serde_json::Value::Null, None) => {}
@@ -83,10 +72,10 @@ fn iceberg_nested_columns_return_valid_json_end_to_end() {
     let qualified = format!("{VS_NAME}.{table}");
 
     for column in ["TAGS", "NUMS", "ADDR", "ATTRS", "INT_MAP", "ITEMS"] {
-        assert!(
-            declared_type(&mut conn, &table, column).starts_with("VARCHAR(2000000)"),
-            "{column} must be declared VARCHAR(2000000), got {}",
-            declared_type(&mut conn, &table, column)
+        assert_eq!(
+            declared_type(&mut conn, VS_NAME, &table, column),
+            VARCHAR_JSON,
+            "{column} must be declared VARCHAR(2000000)"
         );
     }
 

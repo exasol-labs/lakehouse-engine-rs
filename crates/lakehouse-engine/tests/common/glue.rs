@@ -2,19 +2,20 @@
 //! both when it drops, so two concurrent runs never share a fixture (`glue-e2e/glue-e2e-harness`).
 
 use super::raw_parquet::encode_parquet;
-use super::seed::write_one_file_append;
-use super::stack::CatalogConnectionPassword;
-use super::type_matrix::{
-    Cell, ExpectedColumn, IDS, MatrixTable, Outcome, Source, VARCHAR, glue_all_types_columns,
-    rows_of, unannotated_binary_values_bytes,
+use super::seed::{
+    all_types_ids, all_types_validity, binary_values, boolean_values, date_values,
+    decimal_10_2_values, decimal_38_10_values, float32_values, int_list_values, int8_values,
+    int16_values, int32_values, non_utf8_parquet, string_int_map_values, text_values,
+    timestamp_values, write_one_file_append,
 };
+use super::stack::CatalogConnectionPassword;
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::array::{
-    ArrayRef, Date32Array, Decimal128Array, Int32Array, Int64Array, ListArray, MapArray,
-    RecordBatch, StringArray, StructArray,
+    ArrayRef, BinaryArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
+    ListArray, RecordBatch, StringArray, StructArray,
 };
-use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::buffer::OffsetBuffer;
 use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
 use aws_sdk_glue::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_glue::error::{DisplayErrorContext, ProvideErrorMetadata};
@@ -458,8 +459,8 @@ const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
 const VIRTUAL_VIEW: &str = "VIRTUAL_VIEW";
 
 pub const ICEBERG_ORDERS: &str = "iceberg_orders";
-pub const ALL_TYPES: &str = MatrixTable::AllTypes.name();
-pub const BINARY_VALUES: &str = MatrixTable::BinaryValues.name();
+pub const ALL_TYPES: &str = "all_types";
+pub const BINARY_VALUES: &str = "binary_values";
 pub const PARTITIONED: &str = "partitioned";
 pub const PROJECTED: &str = "projected";
 pub const A_VIEW: &str = "a_view";
@@ -533,155 +534,122 @@ pub const ORDERS: [Order; 5] = [
     },
 ];
 
-/// The Hive types of `vs-adapter/glue-hive-type-mapping` that no matrix row declares, carried
-/// by `all_types` next to the matrix columns.
+/// One `all_types` column per Hive type of `vs-adapter/glue-hive-type-mapping`; `data` is
+/// `None` for a column the data file leaves out, because the reader refuses it at plan time.
 pub struct HiveTypeColumn {
+    pub column: &'static str,
     pub hive_type: &'static str,
-    pub expected: ExpectedColumn,
     pub data: Option<HiveColumnData>,
 }
 
-type HiveColumnData = fn() -> Result<(DataType, ArrayRef)>;
+type HiveColumnData = fn() -> ArrayRef;
+
+const fn hive(
+    column: &'static str,
+    hive_type: &'static str,
+    data: Option<HiveColumnData>,
+) -> HiveTypeColumn {
+    HiveTypeColumn {
+        column,
+        hive_type,
+        data,
+    }
+}
 
 pub const HIVE_TYPE_COLUMNS: &[HiveTypeColumn] = &[
-    HiveTypeColumn {
-        hive_type: "integer",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_integer",
-            exasol_type: "DECIMAL(10,0)",
-            outcome: Outcome::Values([Some("7"), Some("-7"), None]),
-        },
-        data: Some(h_integer_data),
-    },
-    HiveTypeColumn {
-        hive_type: "varchar(10)",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_varchar",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Values([Some("short"), Some("text"), None]),
-        },
-        data: Some(h_varchar_data),
-    },
-    HiveTypeColumn {
-        hive_type: "char(5)",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_char",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Values([Some("abcde"), Some("fghij"), None]),
-        },
-        data: Some(h_char_data),
-    },
-    HiveTypeColumn {
-        hive_type: "decimal",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_decimal",
-            exasol_type: "DECIMAL(10,0)",
-            outcome: Outcome::Values([Some("42"), Some("-42"), None]),
-        },
-        data: Some(h_decimal_data),
-    },
-    HiveTypeColumn {
-        hive_type: "DECIMAL( 38 , 10 )",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_decimal_spaced",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Values([
-                Some("1234567890123456789012345678.9012345678"),
-                Some("-0.0000000005"),
+    hive("h_tinyint", "tinyint", Some(int8_values)),
+    hive("h_smallint", "smallint", Some(int16_values)),
+    hive("h_int", "int", Some(int32_values)),
+    hive(
+        "h_integer",
+        "integer",
+        Some(|| Arc::new(Int32Array::from(vec![Some(7), Some(-7), None]))),
+    ),
+    hive(
+        "h_bigint",
+        "bigint",
+        Some(|| Arc::new(Int64Array::from(vec![Some(i64::MAX), Some(i64::MIN), None]))),
+    ),
+    hive("h_float", "float", Some(float32_values)),
+    hive(
+        "h_double",
+        "double",
+        Some(|| Arc::new(Float64Array::from(vec![Some(2.5), Some(-0.125), None]))),
+    ),
+    hive("h_boolean", "boolean", Some(boolean_values)),
+    hive("h_string", "string", Some(text_values)),
+    // A legacy writer's string: a `BYTE_ARRAY` without the string annotation.
+    hive(
+        "h_string_over_binary",
+        "string",
+        Some(|| {
+            Arc::new(BinaryArray::from_opt_vec(vec![
+                Some(b"legacy-a".as_slice()),
+                Some(b"legacy-b".as_slice()),
                 None,
-            ]),
-        },
-        data: Some(h_decimal_spaced_data),
-    },
-    HiveTypeColumn {
-        hive_type: "map<varchar(1),int>",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_map_varchar",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Values([Some("{\"a\":1}"), Some("{}"), None]),
-        },
-        data: Some(h_map_varchar_data),
-    },
-    HiveTypeColumn {
-        hive_type: "struct<x:int,y:string>",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_struct_xy",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Values([
-                Some("{\"x\":1,\"y\":\"p\"}"),
-                Some("{\"x\":2,\"y\":null}"),
-                None,
-            ]),
-        },
-        data: Some(h_struct_xy_data),
-    },
-    HiveTypeColumn {
-        hive_type: "array<struct<a:decimal(5,2)>>",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_array_struct",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Values([Some("[{\"a\":1.25}]"), Some("[]"), None]),
-        },
-        data: Some(h_array_struct_data),
-    },
-    HiveTypeColumn {
-        hive_type: "struct<b:binary>",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_struct_binary",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Refused(&["member 'h_struct_binary.b'", "type 'binary'", "#351"]),
-        },
-        data: None,
-    },
-    HiveTypeColumn {
-        hive_type: "uniontype<int,string>",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_uniontype",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Refused(&["Hive type 'uniontype<int,string>'"]),
-        },
-        data: None,
-    },
-    HiveTypeColumn {
-        hive_type: "interval_day_time",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_interval",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Refused(&["Hive type 'interval_day_time'"]),
-        },
-        data: None,
-    },
-    HiveTypeColumn {
-        hive_type: "map<int>",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_malformed_map",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Refused(&["Hive type 'map<int>'"]),
-        },
-        data: None,
-    },
-    HiveTypeColumn {
-        hive_type: "",
-        expected: ExpectedColumn {
-            table: ALL_TYPES,
-            column: "h_empty_type",
-            exasol_type: VARCHAR,
-            outcome: Outcome::Refused(&["Hive type ''"]),
-        },
-        data: None,
-    },
+            ]))
+        }),
+    ),
+    hive(
+        "h_varchar",
+        "varchar(10)",
+        Some(|| Arc::new(StringArray::from(vec![Some("short"), Some("text"), None]))),
+    ),
+    hive(
+        "h_char",
+        "char(5)",
+        Some(|| Arc::new(StringArray::from(vec![Some("abcde"), Some("fghij"), None]))),
+    ),
+    hive("h_decimal_10_2", "decimal(10,2)", Some(decimal_10_2_values)),
+    hive(
+        "h_decimal",
+        "decimal",
+        Some(|| {
+            Arc::new(
+                Decimal128Array::from(vec![Some(42), Some(-42), None])
+                    .with_precision_and_scale(10, 0)
+                    .expect("Decimal128(10,0)"),
+            )
+        }),
+    ),
+    hive(
+        "h_decimal_spaced",
+        "DECIMAL( 38 , 10 )",
+        Some(decimal_38_10_values),
+    ),
+    hive("h_date", "date", Some(date_values)),
+    hive("h_timestamp", "timestamp", Some(|| timestamp_values(None))),
+    hive(
+        "h_binary",
+        "binary",
+        Some(|| binary_values(&DataType::Binary)),
+    ),
+    hive("h_array_int", "array<int>", Some(int_list_values)),
+    hive(
+        "h_array_struct",
+        "array<struct<a:decimal(5,2)>>",
+        Some(h_array_struct_data),
+    ),
+    hive(
+        "h_map_string",
+        "map<string,int>",
+        Some(|| string_int_map_values(vec!["k1", "k2"], vec![1, 2], [2, 0, 0])),
+    ),
+    hive(
+        "h_map_varchar",
+        "map<varchar(1),int>",
+        Some(|| string_int_map_values(vec!["a"], vec![1], [1, 0, 0])),
+    ),
+    hive(
+        "h_struct_xy",
+        "struct<x:int,y:string>",
+        Some(h_struct_xy_data),
+    ),
+    hive("h_struct_binary", "struct<b:binary>", None),
+    hive("h_uniontype", "uniontype<int,string>", None),
+    hive("h_interval", "interval_day_time", None),
+    hive("h_malformed_map", "map<int>", None),
+    hive("h_empty_type", "", None),
 ];
 
 pub struct PartitionedRow {
@@ -1138,145 +1106,54 @@ async fn register_iceberg_orders(run: &GlueRun) -> Result<()> {
     run.create_table(input).await
 }
 
-fn three_row_validity() -> Option<NullBuffer> {
-    Some(NullBuffer::from(vec![true, true, false]))
-}
-
-fn h_integer_data() -> Result<(DataType, ArrayRef)> {
-    Ok((
-        DataType::Int32,
-        Arc::new(Int32Array::from(vec![Some(7), Some(-7), None])),
-    ))
-}
-
-fn h_varchar_data() -> Result<(DataType, ArrayRef)> {
-    Ok((
-        DataType::Utf8,
-        Arc::new(StringArray::from(vec![Some("short"), Some("text"), None])),
-    ))
-}
-
-fn h_char_data() -> Result<(DataType, ArrayRef)> {
-    Ok((
-        DataType::Utf8,
-        Arc::new(StringArray::from(vec![Some("abcde"), Some("fghij"), None])),
-    ))
-}
-
-fn h_decimal_data() -> Result<(DataType, ArrayRef)> {
-    Ok((
-        DataType::Decimal128(10, 0),
-        Arc::new(
-            Decimal128Array::from(vec![Some(42), Some(-42), None])
-                .with_precision_and_scale(10, 0)?,
-        ),
-    ))
-}
-
-fn h_decimal_spaced_data() -> Result<(DataType, ArrayRef)> {
-    Ok((
-        DataType::Decimal128(38, 10),
-        Arc::new(
-            Decimal128Array::from(vec![
-                Some(12_345_678_901_234_567_890_123_456_789_012_345_678_i128),
-                Some(-5),
-                None,
-            ])
-            .with_precision_and_scale(38, 10)?,
-        ),
-    ))
-}
-
-fn h_map_varchar_data() -> Result<(DataType, ArrayRef)> {
-    let entry_fields = Fields::from(vec![
-        Field::new("key", DataType::Utf8, false),
-        Field::new("value", DataType::Int32, true),
-    ]);
-    let entries_field = Arc::new(Field::new(
-        "key_value",
-        DataType::Struct(entry_fields.clone()),
-        false,
-    ));
-    let entries = StructArray::try_new(
-        entry_fields,
-        vec![
-            Arc::new(StringArray::from(vec!["a"])) as ArrayRef,
-            Arc::new(Int32Array::from(vec![1])),
-        ],
-        None,
-    )?;
-    Ok((
-        DataType::Map(Arc::clone(&entries_field), false),
-        Arc::new(MapArray::try_new(
-            entries_field,
-            OffsetBuffer::from_lengths([1, 0, 0]),
-            entries,
-            three_row_validity(),
-            false,
-        )?),
-    ))
-}
-
-fn h_struct_xy_data() -> Result<(DataType, ArrayRef)> {
+fn h_struct_xy_data() -> ArrayRef {
     let fields = Fields::from(vec![
         Field::new("x", DataType::Int32, true),
         Field::new("y", DataType::Utf8, true),
     ]);
-    Ok((
-        DataType::Struct(fields.clone()),
-        Arc::new(StructArray::try_new(
+    Arc::new(
+        StructArray::try_new(
             fields,
             vec![
                 Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
                 Arc::new(StringArray::from(vec![Some("p"), None, None])),
             ],
-            three_row_validity(),
-        )?),
-    ))
+            all_types_validity(),
+        )
+        .expect("struct<x:int,y:string>"),
+    )
 }
 
-fn h_array_struct_data() -> Result<(DataType, ArrayRef)> {
+fn h_array_struct_data() -> ArrayRef {
     let member_fields = Fields::from(vec![Field::new("a", DataType::Decimal128(5, 2), true)]);
-    let element = Arc::new(Field::new(
-        "element",
-        DataType::Struct(member_fields.clone()),
-        true,
-    ));
-    let members = StructArray::try_new(
-        member_fields,
-        vec![
-            Arc::new(Decimal128Array::from(vec![125]).with_precision_and_scale(5, 2)?) as ArrayRef,
-        ],
-        None,
-    )?;
-    Ok((
-        DataType::List(Arc::clone(&element)),
-        Arc::new(ListArray::try_new(
-            element,
+    let decimals = Decimal128Array::from(vec![125])
+        .with_precision_and_scale(5, 2)
+        .expect("Decimal128(5,2)");
+    let members = StructArray::try_new(member_fields.clone(), vec![Arc::new(decimals)], None)
+        .expect("struct<a:decimal(5,2)>");
+    Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("element", DataType::Struct(member_fields), true)),
             OffsetBuffer::from_lengths([1, 0, 0]),
             Arc::new(members),
-            three_row_validity(),
-        )?),
-    ))
+            all_types_validity(),
+        )
+        .expect("array<struct<a:decimal(5,2)>>"),
+    )
 }
 
-/// `all_types` declares every Glue matrix column and every `HIVE_TYPE_COLUMNS` type; its one
-/// extensionless data file holds a value for each column a reader can bind.
+/// `all_types` declares every `HIVE_TYPE_COLUMNS` type; its one extensionless data file holds
+/// a value for each column a reader can bind.
 async fn register_all_types(run: &GlueRun) -> Result<()> {
     let mut columns = vec![hive_column("id", "bigint")?];
     let mut fields = vec![Field::new("id", DataType::Int64, false)];
-    let mut arrays: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(IDS.to_vec()))];
-    for (column, hive_type, field, values) in glue_all_types_columns() {
-        columns.push(hive_column(column, hive_type)?);
-        fields.push(field);
-        arrays.push(values);
-    }
+    let mut arrays = vec![all_types_ids()];
     for hive_type_column in HIVE_TYPE_COLUMNS {
-        let column = hive_type_column.expected.column;
+        let column = hive_type_column.column;
         columns.push(hive_column(column, hive_type_column.hive_type)?);
         if let Some(data) = hive_type_column.data {
-            let (data_type, values) = data()?;
-            fields.push(Field::new(column, data_type, true));
+            let values = data();
+            fields.push(Field::new(column, values.data_type().clone(), true));
             arrays.push(values);
         }
     }
@@ -1302,23 +1179,27 @@ async fn register_all_types(run: &GlueRun) -> Result<()> {
     .await
 }
 
+/// `binary_values` declares `c_bytes string` over a `BYTE_ARRAY` with no annotation and no
+/// embedded Arrow schema whose bytes are not valid UTF-8.
 async fn register_binary_values(run: &GlueRun) -> Result<()> {
-    let mut columns = vec![hive_column("id", "bigint")?];
-    for matrix_row in rows_of(Source::Glue, MatrixTable::BinaryValues) {
-        let Cell::Written { source_type, .. } = matrix_row.glue else {
-            unreachable!("rows_of returns written cells only")
-        };
-        columns.push(hive_column(matrix_row.column, source_type)?);
-    }
+    let bytes = non_utf8_parquet(
+        "message binary_values {
+            REQUIRED INT64 id;
+            OPTIONAL BYTE_ARRAY c_bytes;
+        }",
+    );
     run.put_object(
         &format!("{BINARY_VALUES}/20240115_000000_00001_{BINARY_VALUES}"),
-        unannotated_binary_values_bytes(),
+        bytes,
     )
     .await?;
     run.create_table(parquet_table(
         BINARY_VALUES,
         &run.uri(&format!("{BINARY_VALUES}/")),
-        columns,
+        vec![
+            hive_column("id", "bigint")?,
+            hive_column("c_bytes", "string")?,
+        ],
         Vec::new(),
     )?)
     .await

@@ -53,17 +53,6 @@ fn served_table() -> String {
     E2E_TSPRECISION_TABLE.to_uppercase()
 }
 
-fn declared_type(conn: &mut ExaConn, table: &str, column: &str) -> String {
-    let ty = conn.query_columns(&format!(
-        "SELECT COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
-         WHERE COLUMN_SCHEMA='{VS_NAME}' AND COLUMN_TABLE='{table}' AND COLUMN_NAME='{column}'"
-    ))[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("{column} has no declared type"))
-        .to_string();
-    ty.chars().filter(|c| !c.is_whitespace()).collect()
-}
-
 /// Clamped at six: the seeded values carry no finer digit.
 fn retained_at(micros: i64, precision: u32) -> i64 {
     let step = 10i64.pow(6 - precision.min(6));
@@ -171,7 +160,7 @@ fn iceberg_microsecond_timestamps_round_trip_at_the_declared_precision() {
     let tstz_column = TSPRECISION_COL_TSTZ.to_uppercase();
 
     for column in [&ts_column, &tstz_column] {
-        let declared = declared_type(&mut conn, &table, column);
+        let declared = declared_type(&mut conn, VS_NAME, &table, column);
         assert_eq!(
             declared, expected.declared_column_type,
             "{column} must be declared {} on this engine, got {declared}",
@@ -403,7 +392,7 @@ fn iceberg_nanosecond_source_column_is_declared_and_retained_per_engine_arm() {
         (ExpectedTimestampPrecision::MILLISECOND, 1)
     };
 
-    let declared = declared_type(&mut conn, &table, &ts_ns_column);
+    let declared = declared_type(&mut conn, VS_NAME, &table, &ts_ns_column);
     assert_eq!(
         declared, expected.declared_column_type,
         "an Iceberg timestamp_ns column must be declared {} on this engine, got {declared}",

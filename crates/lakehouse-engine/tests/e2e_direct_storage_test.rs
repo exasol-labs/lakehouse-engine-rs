@@ -5,12 +5,20 @@
 mod common;
 
 use common::e2e_harness::{
-    VsProps, create_schema_and_scripts, create_virtual_schema_with_password, exa_conn,
-    explain_virtual_sql, install_slc, local_stack_storage, parse_int, parse_numeric,
+    VARCHAR_JSON, VsProps, assert_query_fails, assert_text_columns, create_schema_and_scripts,
+    create_virtual_schema_with_password, declared_type, declared_types, exa_conn,
+    explain_virtual_sql, install_slc, local_stack_storage, pairs, parse_int, parse_numeric,
     try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
-use common::raw_parquet::write_parquet_fixture;
+use common::raw_parquet::{
+    encode_parquet_message, put_fixture_object, write_parquet_column, write_parquet_fixture,
+};
+use common::seed::{
+    ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_TIME_MICROS, all_types_ids, binary_values,
+    decimal_38_10_values, fixed_16_values, float32_values, int8_values, int16_values, int32_values,
+    struct_binary_values, text_values, time64_values,
+};
 use common::stack::{
     CatalogConnectionPassword, minio_url_internal, wait_for_exasol, wait_for_minio,
 };
@@ -18,16 +26,23 @@ use common::stack::{
 use lakehouse_engine::scan::spec::StorageBackend;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array,
-    Int32Array, Int64Array, ListBuilder, MapArray, StringArray, StringBuilder, StructArray,
-    TimestampMicrosecondArray,
+    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+    DurationMicrosecondArray, Float32Array, Float64Array, Int32Array, Int64Array,
+    IntervalDayTimeArray, ListBuilder, MapArray, StringArray, StringBuilder, StructArray,
+    Time32MillisecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array,
+    UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
-use arrow::datatypes::{DataType, Field, Fields, Schema, TimeUnit};
+use arrow::compute::cast;
+use arrow::datatypes::{DataType, Field, Fields, IntervalDayTime, Schema, TimeUnit, i256};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectStorePath;
-use object_store::{ObjectStoreExt, PutPayload};
+use parquet::data_type::{
+    ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type, Int96, Int96Type,
+};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use serde_json::Value as Json;
 
@@ -419,6 +434,149 @@ fn complex_batch() -> RecordBatch {
     .expect("complex batch construction is infallible")
 }
 
+/// The Arrow types `events` and `complex` do not carry.
+fn all_types_batch() -> RecordBatch {
+    let time_of_day_millis = (ALL_TYPES_TIME_MICROS / 1_000_000 * 1_000) as i32;
+    let decimal256 = Decimal256Array::from(vec![
+        Some(i256::from_i128(1234)),
+        Some(i256::from_i128(-5)),
+        None,
+    ])
+    .with_precision_and_scale(50, 2)
+    .expect("Decimal256(50,2)");
+    RecordBatch::try_from_iter_with_nullable(vec![
+        ("id", all_types_ids(), false),
+        ("c_int8", int8_values(), true),
+        ("c_int16", int16_values(), true),
+        ("c_int32", int32_values(), true),
+        (
+            "c_uint8",
+            Arc::new(UInt8Array::from(vec![Some(255), Some(0), None])) as ArrayRef,
+            true,
+        ),
+        (
+            "c_uint16",
+            Arc::new(UInt16Array::from(vec![Some(65_535), Some(0), None])),
+            true,
+        ),
+        (
+            "c_uint32",
+            Arc::new(UInt32Array::from(vec![Some(u32::MAX), Some(0), None])),
+            true,
+        ),
+        (
+            "c_uint64",
+            Arc::new(UInt64Array::from(vec![Some(u64::MAX), Some(0), None])),
+            true,
+        ),
+        ("c_float32", float32_values(), true),
+        (
+            "c_largeutf8",
+            cast(&text_values(), &DataType::LargeUtf8).expect("LargeUtf8"),
+            true,
+        ),
+        ("c_decimal128_38_10", decimal_38_10_values(), true),
+        ("c_decimal256_50_2", Arc::new(decimal256), true),
+        (
+            "c_time32",
+            Arc::new(Time32MillisecondArray::from(vec![
+                Some(time_of_day_millis),
+                Some(0),
+                None,
+            ])),
+            true,
+        ),
+        ("c_time64", time64_values(), true),
+        (
+            "c_duration",
+            Arc::new(DurationMicrosecondArray::from(vec![
+                Some(1_500_000),
+                Some(0),
+                None,
+            ])),
+            true,
+        ),
+        (
+            "c_interval",
+            Arc::new(IntervalDayTimeArray::from(vec![
+                Some(IntervalDayTime::new(1, 2000)),
+                Some(IntervalDayTime::new(0, 0)),
+                None,
+            ])),
+            true,
+        ),
+        ("c_binary", binary_values(&DataType::Binary), true),
+        ("c_largebinary", binary_values(&DataType::LargeBinary), true),
+        ("c_fixedsizebinary", fixed_16_values(), true),
+        ("c_struct_binary", struct_binary_values(None), true),
+    ])
+    .expect("all_types batch")
+}
+
+/// Types only a Parquet logical-type annotation, or its absence, can declare, written with
+/// no embedded Arrow schema so the reader sees the annotation alone.
+fn annotated_types_bytes() -> Bytes {
+    encode_parquet_message(
+        "message annotated_types {
+            REQUIRED INT64 id;
+            OPTIONAL BYTE_ARRAY c_enum (ENUM);
+            OPTIONAL BYTE_ARRAY c_bson (BSON);
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) c_uuid (UUID);
+            OPTIONAL INT96 c_int96;
+            OPTIONAL BYTE_ARRAY c_byte_array;
+            OPTIONAL GROUP c_struct_enum {
+                OPTIONAL BYTE_ARRAY k (ENUM);
+            }
+        }",
+        |row_group| {
+            let present = Some([1, 1, 0].as_slice());
+            write_parquet_column::<_, Int64Type>(row_group, &ALL_TYPES_IDS, None);
+            write_parquet_column::<_, ByteArrayType>(
+                row_group,
+                &[ByteArray::from("red"), ByteArray::from("green")],
+                present,
+            );
+            write_parquet_column::<_, ByteArrayType>(
+                row_group,
+                &[
+                    ByteArray::from(vec![5, 0, 0, 0, 0]),
+                    ByteArray::from(vec![5, 0, 0, 0, 0]),
+                ],
+                present,
+            );
+            write_parquet_column::<_, FixedLenByteArrayType>(
+                row_group,
+                &[
+                    FixedLenByteArray::from(vec![0x55; 16]),
+                    FixedLenByteArray::from(vec![0x11; 16]),
+                ],
+                present,
+            );
+            let julian_unix_epoch: u32 = 2_440_588;
+            let nanos_of_day: u64 = (10 * 3600 + 30 * 60 + 45) * 1_000_000_000;
+            let mut timestamp = Int96::new();
+            timestamp.set_data(
+                nanos_of_day as u32,
+                (nanos_of_day >> 32) as u32,
+                julian_unix_epoch + ALL_TYPES_DATE_DAYS as u32,
+            );
+            let mut epoch = Int96::new();
+            epoch.set_data(0, 0, julian_unix_epoch);
+            write_parquet_column::<_, Int96Type>(row_group, &[timestamp, epoch], present);
+            write_parquet_column::<_, ByteArrayType>(
+                row_group,
+                &[ByteArray::from("legacy-a"), ByteArray::from("legacy-b")],
+                present,
+            );
+            write_parquet_column::<_, ByteArrayType>(
+                row_group,
+                &[ByteArray::from("blue"), ByteArray::from("amber")],
+                Some(&[2, 2, 0]),
+            );
+        },
+    )
+}
+
 fn sales_batch(ids: &[i64]) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![
         Field::new("ID", DataType::Int64, false),
@@ -483,36 +641,6 @@ fn stored_k_batch(id: i64, stored_k: i64) -> RecordBatch {
     .expect("stored-K batch construction is infallible")
 }
 
-fn put_raw_bytes(uri: &str, bytes: Vec<u8>) {
-    let without_scheme = uri.strip_prefix("s3://").expect("uri must be s3://...");
-    let (bucket, key) = without_scheme
-        .split_once('/')
-        .expect("uri must have a <bucket>/<key> form");
-    let StorageBackend::S3(storage) = local_stack_storage() else {
-        panic!("local_stack_storage() must be S3")
-    };
-    let store = AmazonS3Builder::new()
-        .with_bucket_name(bucket)
-        .with_region(&storage.region)
-        .with_access_key_id(&storage.access_key)
-        .with_secret_access_key(&storage.secret_key)
-        .with_endpoint(&storage.endpoint)
-        .with_allow_http(storage.allow_http)
-        .with_virtual_hosted_style_request(!storage.path_style)
-        .build()
-        .unwrap_or_else(|e| panic!("configure MinIO object store for {uri}: {e}"));
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
-    rt.block_on(async {
-        store
-            .put(&ObjectStorePath::from(key), PutPayload::from(bytes))
-            .await
-            .unwrap_or_else(|e| panic!("PUT {uri}: {e}"));
-    });
-}
-
 fn write_delta_caveat_fixture() {
     let base = format!("{BASE_DIRECT}delta_caveat");
     write_parquet_fixture(&format!("{base}/file1.parquet"), discovery_id_batch(10));
@@ -529,13 +657,13 @@ fn write_delta_caveat_fixture() {
     );
     let version1 = r#"{"remove":{"path":"file2.parquet","deletionTimestamp":0,"dataChange":true}}"#;
 
-    put_raw_bytes(
+    put_fixture_object(
         &format!("{base}/_delta_log/00000000000000000000.json"),
-        version0.as_bytes().to_vec(),
+        version0.into(),
     );
-    put_raw_bytes(
+    put_fixture_object(
         &format!("{base}/_delta_log/00000000000000000001.json"),
-        version1.as_bytes().to_vec(),
+        version1.into(),
     );
 }
 
@@ -580,6 +708,15 @@ fn write_all_fixtures() {
     write_parquet_fixture(
         &format!("{BASE_DIRECT}complex/file1.parquet"),
         complex_batch(),
+    );
+
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}all_types/file1.parquet"),
+        all_types_batch(),
+    );
+    put_fixture_object(
+        &format!("{BASE_DIRECT}annotated_types/file1.parquet"),
+        annotated_types_bytes(),
     );
 
     write_parquet_fixture(
@@ -682,17 +819,6 @@ fn write_all_fixtures() {
         &format!("{BASE_DISCOVERY}notes.parquet"),
         discovery_id_batch(0),
     );
-}
-
-fn declared_type(conn: &mut ExaConn, vs_name: &str, table: &str, column: &str) -> String {
-    let ty = conn.query_columns(&format!(
-        "SELECT COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
-         WHERE COLUMN_SCHEMA='{vs_name}' AND COLUMN_TABLE='{table}' AND COLUMN_NAME='{column}'"
-    ))[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("{vs_name}.{table}.{column} has no declared type"))
-        .to_string();
-    ty.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
 /// Prefix match tolerates Exasol's `COLUMN_TYPE` rendering (charset suffix,
@@ -901,6 +1027,130 @@ fn complex_directory_declares_varchar_and_returns_parseable_json() {
     assert!(cols[1][1].is_null(), "TAGS row 1 must be SQL NULL");
     assert!(cols[2][1].is_null(), "ADDRESS row 1 must be SQL NULL");
     assert!(cols[3][1].is_null(), "ATTRS row 1 must be SQL NULL");
+}
+
+/// Scenario: Every type a Parquet file can carry declares and returns its mapped value on direct storage
+#[test]
+fn all_types_directories_declare_and_return_their_mapped_values() {
+    setup();
+    let mut conn = exa_conn();
+
+    assert_eq!(
+        declared_types(&mut conn, VS_DIRECT, "ALL_TYPES"),
+        pairs(&[
+            ("ID", "DECIMAL(20,0)"),
+            ("C_INT8", "DECIMAL(3,0)"),
+            ("C_INT16", "DECIMAL(5,0)"),
+            ("C_INT32", "DECIMAL(10,0)"),
+            ("C_UINT8", "DECIMAL(3,0)"),
+            ("C_UINT16", "DECIMAL(5,0)"),
+            ("C_UINT32", "DECIMAL(20,0)"),
+            ("C_UINT64", "DECIMAL(20,0)"),
+            ("C_FLOAT32", "DOUBLE"),
+            ("C_LARGEUTF8", VARCHAR_JSON),
+            ("C_DECIMAL128_38_10", VARCHAR_JSON),
+            ("C_DECIMAL256_50_2", VARCHAR_JSON),
+            ("C_TIME32", VARCHAR_JSON),
+            ("C_TIME64", VARCHAR_JSON),
+            ("C_DURATION", VARCHAR_JSON),
+            ("C_INTERVAL", VARCHAR_JSON),
+            ("C_BINARY", VARCHAR_JSON),
+            ("C_LARGEBINARY", VARCHAR_JSON),
+            ("C_FIXEDSIZEBINARY", VARCHAR_JSON),
+            ("C_STRUCT_BINARY", VARCHAR_JSON),
+        ])
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!(
+            "SELECT ID, C_INT8, C_INT16, C_INT32, C_UINT8, C_UINT16, C_UINT32, C_UINT64, \
+             C_FLOAT32, C_LARGEUTF8, C_DECIMAL128_38_10, C_DECIMAL256_50_2, C_TIME32, C_TIME64, \
+             C_DURATION, C_INTERVAL FROM {} ORDER BY ID",
+            vs_table(VS_DIRECT, "ALL_TYPES")
+        ),
+        &[
+            [Some("1"), Some("2"), Some("3")],
+            [Some("127"), Some("-128"), None],
+            [Some("32767"), Some("-32768"), None],
+            [Some("2147483647"), Some("-2147483648"), None],
+            [Some("255"), Some("0"), None],
+            [Some("65535"), Some("0"), None],
+            [Some("4294967295"), Some("0"), None],
+            [Some("18446744073709551615"), Some("0"), None],
+            [Some("1.5"), Some("-0.25"), None],
+            [Some("h\u{e9}llo"), Some("w\u{f6}rld"), None],
+            [
+                Some("1234567890123456789012345678.9012345678"),
+                Some("-0.0000000005"),
+                None,
+            ],
+            [Some("12.34"), Some("-0.05"), None],
+            [Some("12:34:56"), Some("00:00:00"), None],
+            [Some("12:34:56.123456"), Some("00:00:00"), None],
+            [
+                Some("0 days 0 hours 0 mins 1.500000 secs"),
+                Some("0 days 0 hours 0 mins 0.000000 secs"),
+                None,
+            ],
+            [Some("1 days 2.000 secs"), Some("0 secs"), None],
+        ],
+    );
+
+    assert_eq!(
+        declared_types(&mut conn, VS_DIRECT, "ANNOTATED_TYPES"),
+        pairs(&[
+            ("ID", "DECIMAL(20,0)"),
+            ("C_ENUM", VARCHAR_JSON),
+            ("C_BSON", VARCHAR_JSON),
+            ("C_UUID", VARCHAR_JSON),
+            ("C_INT96", "TIMESTAMP(3)"),
+            ("C_BYTE_ARRAY", VARCHAR_JSON),
+            ("C_STRUCT_ENUM", VARCHAR_JSON),
+        ])
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!(
+            "SELECT ID, C_ENUM, C_INT96 FROM {} ORDER BY ID",
+            vs_table(VS_DIRECT, "ANNOTATED_TYPES")
+        ),
+        &[
+            [Some("1"), Some("2"), Some("3")],
+            [Some("red"), Some("green"), None],
+            [
+                Some("2024-01-15 10:30:45.000000"),
+                Some("1970-01-01 00:00:00.000000"),
+                None,
+            ],
+        ],
+    );
+
+    let binary: &[&str] = &["type 'binary'", "#351"];
+    for (table, column, fragments) in [
+        ("ALL_TYPES", "C_BINARY", binary),
+        ("ALL_TYPES", "C_LARGEBINARY", binary),
+        (
+            "ALL_TYPES",
+            "C_FIXEDSIZEBINARY",
+            &["type 'fixed(16)'", "#351"],
+        ),
+        (
+            "ALL_TYPES",
+            "C_STRUCT_BINARY",
+            &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
+        ),
+        ("ANNOTATED_TYPES", "C_BSON", &["type 'bson'", "#351"]),
+        ("ANNOTATED_TYPES", "C_UUID", &["type 'uuid'", "#351"]),
+        ("ANNOTATED_TYPES", "C_BYTE_ARRAY", binary),
+        (
+            "ANNOTATED_TYPES",
+            "C_STRUCT_ENUM",
+            &["member 'c_struct_enum.k'", "type 'enum'", "#351"],
+        ),
+    ] {
+        let sql = format!("SELECT {column} FROM {}", vs_table(VS_DIRECT, table));
+        assert_query_fails(&mut conn, &sql, fragments);
+    }
 }
 
 #[test]

@@ -1,10 +1,8 @@
 mod client;
 mod partitions;
 mod routing;
-
-#[cfg(test)]
-#[path = "mock_glue_tests.rs"]
-mod mock_glue;
+mod sdk;
+mod source;
 
 pub use client::GlueCatalogSession;
 

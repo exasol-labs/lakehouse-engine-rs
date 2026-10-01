@@ -37,17 +37,17 @@ Glue Parquet tables use the Unity Parquet reader. The reader is generalized over
 
 ### Context
 
-A UDF must sign only with the identity of its CONNECTION. Environment, profile, and instance-metadata credentials would silently change that identity.
+The Glue client needs SigV4 signing, retry, error-code parsing, and clock-skew correction, and the `.so` should link one TLS stack.
 
 ### Decision
 
-The client uses `aws-sdk-glue` with default features off, explicit CONNECTION credentials, and no ambient credential chain. The SDK features `rustls` and `legacy-https-client` stay off. `reqwest` moves to rustls with native roots, so the `.so` links no OpenSSL.
+The client uses `aws-sdk-glue` with default features off. The SDK features `rustls` and `legacy-https-client` stay off. `reqwest` moves to rustls with native roots, so the `.so` links no OpenSSL.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| `aws-sdk-glue` with explicit credentials | ✓ Chosen: it gives retry, error-code parsing, and clock-skew correction without an ambient credential chain |
+| `aws-sdk-glue` | ✓ Chosen: it gives retry, error-code parsing, and clock-skew correction |
 | A hand-written client on `reqwest` plus `sigv4.rs` | ✗ Rejected: it lacks retry, error-code parsing, and clock-skew correction |
 | `iceberg-catalog-glue` | ✗ Rejected: it requires `aws-config` and loads only Iceberg tables |
 

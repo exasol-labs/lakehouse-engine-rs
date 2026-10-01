@@ -24,7 +24,7 @@ Runs the `GLUE` catalog kind end to end against a real AWS Glue Data Catalog and
 * *GIVEN* a provisioned run
 * *WHEN* the harness registers its fixtures
 * *THEN* the harness SHALL register an Iceberg table written by `iceberg-rust` and registered with `table_type` `ICEBERG` and its `metadata_location`
-* *AND* the harness SHALL register the unpartitioned Hive Parquet tables `all_types` and `binary_values` of `datafusion-scan/type-mapping-live-matrix`, typed by Hive type strings, whose data files have no file extension, and `all_types` SHALL carry every Hive type of `vs-adapter/glue-hive-type-mapping`
+* *AND* the harness SHALL register the unpartitioned Hive Parquet tables `all_types` and `binary_values` of `datafusion-scan/type-mapping-live-coverage`, typed by Hive type strings, whose data files have no file extension, and `all_types` SHALL carry every Hive type of `vs-adapter/glue-hive-type-mapping`
 * *AND* the harness SHALL register a Hive Parquet table partitioned by `int`, `date`, and `string` keys, with a NULL partition, a partition whose value is `a b/c`, a partition outside the table location, a partition addressed with `s3a://`, and an ORC partition
 * *AND* the harness SHALL register a partition-projection table, a view, an ORC table, and an Athena-style Delta table, and SHALL write no data file for the ORC partition, the view, the ORC table, or the Delta table
 
@@ -39,7 +39,7 @@ Runs the `GLUE` catalog kind end to end against a real AWS Glue Data Catalog and
 
 * *GIVEN* the same virtual schema
 * *WHEN* the suite queries each table
-* *THEN* the Iceberg table SHALL return its rows, and every `all_types` and `binary_values` column SHALL match its row of `datafusion-scan/type-mapping-live-matrix`
+* *THEN* the Iceberg table SHALL return its rows
 * *AND* projection, filter, and LIMIT pushdown SHALL return the same rows as the unpushed query
 * *AND* the NULL, `a b/c`, out-of-root, and `s3a://` partitions SHALL return their rows with their Glue values
 * *AND* a query that reads the ORC partition SHALL fail naming it

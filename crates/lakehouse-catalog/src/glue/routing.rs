@@ -23,13 +23,13 @@ pub(super) enum Route {
 /// registration that names its format in `table_type` may carry any descriptor.
 pub(super) fn route(
     table_type: Option<&str>,
-    parameters: Option<&HashMap<String, String>>,
+    parameters: &HashMap<String, String>,
     input_format: Option<&str>,
 ) -> Route {
     if let Some(view) = table_type.filter(|kind| kind.eq_ignore_ascii_case(VIEW_TABLE_TYPE)) {
         return Route::Skip(format!("TableType={view}"));
     }
-    let parameter = |key: &str| parameters.and_then(|all| all.get(key)).map(String::as_str);
+    let parameter = |key: &str| parameters.get(key).map(String::as_str);
     match parameter(TABLE_TYPE_PARAMETER) {
         Some(kind) if kind.eq_ignore_ascii_case(ICEBERG_TABLE_TYPE) => {
             iceberg_route(kind, parameter(METADATA_LOCATION_PARAMETER))

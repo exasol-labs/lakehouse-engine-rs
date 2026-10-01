@@ -5,6 +5,8 @@ Reads the AWS Glue Data Catalog API for the `GLUE` catalog kind. The client list
 ## Background
 
 * The client calls `GetTables`, `GetTable`, and `GetPartitions`. The CONNECTION address is the endpoint. The signing region is the region `vs-adapter/connection-credentials-sigv4` resolves.
+* The client requests partitions with `ExcludeColumnSchema` set, because the reader reads only values, locations, and formats.
+* The client calls Glue through `aws-sdk-glue`, which retries throttling and transient errors, parses the service error code, and corrects its signing time from the service time before it retries (ADR 097). Service behavior is verified against real Glue by `glue-e2e/glue-e2e-harness`.
 * AWS Glue API, `CatalogId`: "If none is provided, the AWS account ID is used by default." Glue rejects an empty value with `400 InvalidInputException "CatalogId ID cannot be empty."` (verified live, #410).
 * Glue returns service errors as HTTP 400 with a JSON body whose `__type` names the error, also for a missing table or database (`EntityNotFoundException`, verified live, #410).
 * AWS Glue API, `GetPartitions` response `NextToken`: "A continuation token, if the returned list of partitions does not include the last one." Glue returned a non-null `NextToken` after the last page (verified live, #410).
@@ -14,7 +16,7 @@ Reads the AWS Glue Data Catalog API for the `GLUE` catalog kind. The client list
 
 ### Scenario: The client routes a table by its declared table type before its storage descriptor
 
-* *GIVEN* a Glue database holding an Iceberg table (`Parameters.table_type` `ICEBERG`), a second one with `table_type` `iceberg`, an Athena Delta table (`table_type` `delta`, `SequenceFileInputFormat`), a Hive Parquet table (no `table_type`, `MapredParquetInputFormat`), Hive ORC, text, JSON, and Avro tables, a symlink table (`SymlinkTextInputFormat` with `ParquetHiveSerDe`), and a view (`TableType` `VIRTUAL_VIEW`)
+* *GIVEN* a Glue database holding an Iceberg table (`Parameters.table_type` `ICEBERG`), a second one with `table_type` `iceberg`, an Athena Delta table (`table_type` `delta`, `SequenceFileInputFormat`), a Hive Parquet table (no `table_type`, `MapredParquetInputFormat`), Hive ORC and text tables, a symlink table (`SymlinkTextInputFormat` with `ParquetHiveSerDe`), and a view (`TableType` `VIRTUAL_VIEW`)
 * *WHEN* the client lists the database
 * *THEN* the client SHALL admit both Iceberg tables with the Iceberg format tag, comparing `table_type` case-insensitively
 * *AND* a present `table_type` other than `ICEBERG` SHALL be a skip naming that value, and MUST NOT fall through to the storage-descriptor check
@@ -54,48 +56,52 @@ Reads the AWS Glue Data Catalog API for the `GLUE` catalog kind. The client list
 
 ### Scenario: Every listing follows its continuation tokens and stops on an empty page
 
-* *GIVEN* `GetTables` and `GetPartitions` results split across pages, where the last non-empty page carries a non-null `NextToken` and the following page is empty
-* *WHEN* the client lists tables or partitions
-* *THEN* the client SHALL request the next page while the response carries a non-empty `NextToken` and a non-empty result list
+* *GIVEN* a `GetTables` or `GetPartitions` page that is short, empty, or carries an absent, empty, or non-empty `NextToken`
+* *WHEN* the client decides whether to request the next page
+* *THEN* the client SHALL request the next page only when the page is non-empty and carries a non-empty `NextToken`
 * *AND* the client SHALL stop on an absent or empty `NextToken` or on an empty page, and MUST NOT stop on a page shorter than the maximum page size
-* *AND* the client SHALL request partitions with `ExcludeColumnSchema` set, because the reader reads only values, locations, and formats
 
-### Scenario: The CatalogId is sent only when the CONNECTION names one, and the NAMESPACE names one database
+### Scenario: The CatalogId is sent only when the CONNECTION names one
 
-* *GIVEN* one CONNECTION without `warehouse` and one with `warehouse` `123456789012`, and the NAMESPACE values `sales` and `sales.eu`
+* *GIVEN* one CONNECTION without `warehouse`, one whose `warehouse` is only whitespace, and one with `warehouse` `123456789012`
+* *WHEN* the client builds its Glue requests
+* *THEN* the client SHALL set `CatalogId` `123456789012` for the third CONNECTION
+* *AND* the client MUST NOT set a `CatalogId` for the first two, never an empty string
+
+### Scenario: A Glue NAMESPACE names exactly one database
+
+* *GIVEN* the NAMESPACE values `sales.eu`, an empty NAMESPACE, and an empty database name
 * *WHEN* the client lists the namespace
-* *THEN* the client SHALL send `CatalogId` `123456789012` for the second CONNECTION and MUST NOT send a `CatalogId` for the first, never an empty string
-* *AND* `sales` SHALL name the Glue database
-* *AND* `sales.eu` SHALL fail with an error stating that a Glue NAMESPACE names exactly one database
+* *THEN* the listing SHALL fail with an error stating that a Glue NAMESPACE names exactly one database
+* *AND* the client MUST NOT call Glue
 
 ### Scenario: Service errors are classified by their error code, not their HTTP status
 
-* *GIVEN* Glue answers `400 EntityNotFoundException` for a missing database, the same for a missing table, `400 AccessDeniedException`, and `400 InvalidInputException`
-* *WHEN* the client handles each answer
+* *GIVEN* Glue service errors `400 EntityNotFoundException`, `AccessDeniedException` with HTTP 400 and with HTTP 404, `400 InvalidInputException`, and an HTTP 503 without an error code
+* *WHEN* the client classifies each service error
 * *THEN* the client SHALL classify each error by the service error code, and MUST NOT classify it by the HTTP status
-* *AND* a missing database or table SHALL fail with an error naming it and stating that it does not exist
-* *AND* every error SHALL name the Glue operation, the error code, and the service message
+* *AND* `EntityNotFoundException` SHALL classify as a missing database or table
+* *AND* an error without a code SHALL keep its HTTP status
+
+### Scenario: A failed Glue call names the operation, the subject, and the cause
+
+* *GIVEN* a Glue call that fails for a missing database, a service error code, an HTTP status without a code, an elapsed operation timeout, or a request failure, with a service message that echoes the CONNECTION's credentials
+* *WHEN* the listing fails
+* *THEN* the error SHALL name the Glue operation and the database or table it addressed
+* *AND* a missing database or table SHALL be stated not to exist, a service error SHALL name its code and message, an uncoded error SHALL name its HTTP status, and a timeout SHALL name the 30 second deadline
 * *AND* no error SHALL contain a credential value
 
-### Scenario: Throttling and server errors are retried within a bounded time
+### Scenario: Every Glue call retries within a bounded time
 
-* *GIVEN* a Glue endpoint that answers `ThrottlingException` or HTTP 503 twice and then succeeds, and a second endpoint that answers `ThrottlingException` to every attempt
-* *WHEN* the client calls each endpoint
-* *THEN* the client SHALL retry with exponential backoff and jitter, up to 5 attempts per call, so the first call succeeds
-* *AND* each call SHALL succeed or fail within 30 seconds, retries included, because it runs inside a pushdown
-* *AND* the second call SHALL fail with an error naming the operation and `ThrottlingException`
+* *GIVEN* the client's Glue configuration
+* *WHEN* the client calls Glue
+* *THEN* the client SHALL use the SDK's standard retry mode, which backs off exponentially with jitter, with up to 5 attempts per call
+* *AND* each call SHALL carry a 30 second operation timeout, retries included, because it runs inside a pushdown
 
 ### Scenario: A clock-skew signing failure names the clock
 
-* *GIVEN* a Glue endpoint that rejects every signature because the request time differs from the service time
-* *WHEN* the client calls it
-* *THEN* the client SHALL correct its signing time from the service time and retry, as the SDK does
-* *AND* a rejection that persists SHALL fail with an error stating that the Exasol node's clock differs from AWS time
+* *GIVEN* a signing-time rejection that persists after the SDK's corrected retries: `RequestTimeTooSkewed`, `RequestExpired`, or an `InvalidSignatureException` whose message starts with `Signature expired` or `Signature not yet current`
+* *WHEN* the client classifies the rejection and words its error
+* *THEN* the error SHALL state that the Exasol node's clock differs from AWS time
 * *AND* that error MUST NOT read as a credential error
-
-### Scenario: The client signs only with the CONNECTION's credentials
-
-* *GIVEN* environment variables `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, and `AWS_REGION` naming another identity and region, and an AWS profile file
-* *WHEN* the client signs a request
-* *THEN* the client SHALL sign with the CONNECTION's `access_key`, `secret_key`, and optional `session_token`, for the resolved signing region
-* *AND* the client MUST NOT read a credential or a region from the environment, a profile file, or instance metadata
+* *AND* an `InvalidSignatureException` for a mismatched signature MUST NOT be classified as a clock error

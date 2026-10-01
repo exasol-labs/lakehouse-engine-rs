@@ -7,8 +7,9 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, create_schema_and_scripts, exa_conn,
-    explain_virtual_sql, install_slc, parse_int, upload_so, value_to_string,
+    ADAPTER_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, assert_query_fails,
+    assert_text_columns, create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql,
+    install_slc, pairs, parse_int, query_error, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::glue::{
@@ -19,10 +20,7 @@ use common::glue::{
     glue_connection_password, metadata_only_keys, register_fixture_set, register_probe_table,
 };
 use common::stack::{build_create_connection_sql, panic_payload_message, wait_for_exasol};
-use common::type_matrix::{
-    Cell, MatrixCheck, MatrixTable, Source, VARCHAR, assert_no_mismatches, declared_types,
-    matrix_mismatches, rows_of,
-};
+use common::timestamp_precision::expected_timestamp_precision;
 
 use futures::FutureExt;
 use serde_json::Value;
@@ -130,19 +128,6 @@ fn create_glue_virtual_schema(env: &GlueEnv, namespace: &str) {
     );
 }
 
-fn query_error(conn: &mut ExaConn, sql: &str) -> String {
-    let response = conn.try_execute(sql);
-    assert_ne!(
-        response["status"].as_str(),
-        Some("ok"),
-        "expected the query to fail: {sql}"
-    );
-    response["exception"]["text"]
-        .as_str()
-        .unwrap_or("")
-        .to_string()
-}
-
 fn int_column(column: &[Value]) -> Vec<i64> {
     column.iter().map(parse_int).collect()
 }
@@ -151,33 +136,6 @@ fn text_column(column: &[Value]) -> Vec<Option<String>> {
     column
         .iter()
         .map(|value| (!value.is_null()).then(|| value_to_string(value)))
-        .collect()
-}
-
-fn ordered_column_types(conn: &mut ExaConn, table: &str) -> Vec<(String, String)> {
-    let declared = declared_types(conn, VS);
-    let names = conn.query_columns(&format!(
-        "SELECT COLUMN_NAME FROM SYS.EXA_ALL_COLUMNS WHERE COLUMN_SCHEMA = '{VS}' \
-         AND COLUMN_TABLE = '{}' ORDER BY COLUMN_ORDINAL_POSITION",
-        table.to_uppercase()
-    ));
-    names[0]
-        .iter()
-        .map(value_to_string)
-        .map(|name| {
-            let declared = declared
-                .get(&(table.to_uppercase(), name.clone()))
-                .cloned()
-                .unwrap_or_else(|| format!("<{name} has no declared type>"));
-            (name, declared)
-        })
-        .collect()
-}
-
-fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
-    expected
-        .iter()
-        .map(|(name, declared)| (name.to_string(), declared.to_string()))
         .collect()
 }
 
@@ -362,24 +320,14 @@ fn glue_fixture_set_registers_every_case() {
             .map(|c| (c.name().to_string(), c.r#type().unwrap_or("").to_string()))
             .collect()
     };
-    let mut hive_types = vec![("id".to_string(), "bigint".to_string())];
-    for matrix_row in rows_of(Source::Glue, MatrixTable::AllTypes) {
-        let Cell::Written { source_type, .. } = matrix_row.glue else {
-            unreachable!("rows_of returns written cells only")
-        };
-        hive_types.push((matrix_row.column.to_string(), source_type.to_string()));
-    }
-    for column in HIVE_TYPE_COLUMNS {
-        hive_types.push((
-            column.expected.column.to_string(),
-            column.hive_type.to_string(),
-        ));
-    }
+    let hive_types: Vec<(String, String)> = std::iter::once(("id", "bigint"))
+        .chain(HIVE_TYPE_COLUMNS.iter().map(|c| (c.column, c.hive_type)))
+        .map(|(name, hive_type)| (name.to_string(), hive_type.to_string()))
+        .collect();
     assert_eq!(
         declared(ALL_TYPES),
         hive_types,
-        "all_types must declare each Glue matrix column and every Hive type of \
-         vs-adapter/glue-hive-type-mapping"
+        "all_types must declare every Hive type of vs-adapter/glue-hive-type-mapping"
     );
     assert_eq!(
         declared(BINARY_VALUES),
@@ -508,41 +456,26 @@ fn glue_listing_includes_routed_tables_and_records_every_skip() {
     );
 
     assert_eq!(
-        ordered_column_types(&mut conn, ICEBERG_ORDERS),
+        declared_types(&mut conn, VS, ICEBERG_ORDERS),
         pairs(&[
             ("ORDER_ID", "DECIMAL(20,0)"),
-            ("CUSTOMER", VARCHAR),
+            ("CUSTOMER", VARCHAR_JSON),
             ("AMOUNT", "DECIMAL(10,2)"),
             ("ORDER_DATE", "DATE"),
         ]),
         "the Iceberg columns come from metadata.json, never Glue's {STALE_GLUE_COLUMN} copy"
     );
     assert_eq!(
-        ordered_column_types(&mut conn, PARTITIONED),
+        declared_types(&mut conn, VS, PARTITIONED),
         pairs(&[
             ("ID", "DECIMAL(20,0)"),
-            ("V", VARCHAR),
+            ("V", VARCHAR_JSON),
             ("P_INT", "DECIMAL(10,0)"),
             ("P_DATE", "DATE"),
-            ("P_STR", VARCHAR),
+            ("P_STR", VARCHAR_JSON),
         ]),
         "a Parquet table declares its storage columns, then its partition keys"
     );
-    let declared = declared_types(&mut conn, VS);
-    for column in HIVE_TYPE_COLUMNS {
-        let key = (
-            ALL_TYPES.to_uppercase(),
-            column.expected.column.to_uppercase(),
-        );
-        assert_eq!(
-            declared.get(&key).map(String::as_str),
-            Some(column.expected.exasol_type),
-            "Hive type {:?} of {} declares the Spark listing type",
-            column.hive_type,
-            column.expected.column
-        );
-    }
-
     let notes = conn.query_columns(&format!(
         "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{VS}'"
     ));
@@ -643,13 +576,6 @@ fn glue_queries_return_expected_rows_through_pushdown() {
         "SELECT ID FROM {partitioned} WHERE P_INT < 9 ORDER BY ID LIMIT 3"
     ));
     assert_eq!(int_column(&limited[0]), [1, 2, 3]);
-
-    let mut check = MatrixCheck::new(&mut conn, VS, "Glue Hive types");
-    check.check_ids(ALL_TYPES);
-    for column in HIVE_TYPE_COLUMNS {
-        check.check_column(&column.expected);
-    }
-    assert_no_mismatches(check.into_mismatches());
 }
 
 /// Scenario: Each kept partition's location is listed and its files carry the partition's Glue values
@@ -780,11 +706,120 @@ fn glue_partition_predicate_reduces_the_scan_file_list() {
     assert_eq!(int_column(&limited[0]), [5]);
 }
 
-/// Scenario: Every mapped type declares and returns as its matrix row states on each Parquet-file source
+/// Scenario: Every Hive type declares and returns its mapped value on a Glue Parquet table
 #[test]
-fn glue_type_matrix_matches_every_row() {
-    let _fixture = GlueFixture::provision();
-    assert_no_mismatches(matrix_mismatches(&mut exa_conn(), Source::Glue, VS));
+fn glue_all_types_declare_and_return_their_mapped_values() {
+    let fixture = GlueFixture::provision();
+    let mut conn = exa_conn();
+    let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
+    let all_types = fixture.table(ALL_TYPES);
+
+    let expected_types = [
+        ("ID", "DECIMAL(20,0)"),
+        ("H_TINYINT", "DECIMAL(3,0)"),
+        ("H_SMALLINT", "DECIMAL(5,0)"),
+        ("H_INT", "DECIMAL(10,0)"),
+        ("H_INTEGER", "DECIMAL(10,0)"),
+        ("H_BIGINT", "DECIMAL(20,0)"),
+        ("H_FLOAT", "DOUBLE"),
+        ("H_DOUBLE", "DOUBLE"),
+        ("H_BOOLEAN", "BOOLEAN"),
+        ("H_STRING", VARCHAR_JSON),
+        ("H_STRING_OVER_BINARY", VARCHAR_JSON),
+        ("H_VARCHAR", VARCHAR_JSON),
+        ("H_CHAR", VARCHAR_JSON),
+        ("H_DECIMAL_10_2", "DECIMAL(10,2)"),
+        ("H_DECIMAL", "DECIMAL(10,0)"),
+        ("H_DECIMAL_SPACED", VARCHAR_JSON),
+        ("H_DATE", "DATE"),
+        ("H_TIMESTAMP", timestamp),
+        ("H_BINARY", VARCHAR_JSON),
+        ("H_ARRAY_INT", VARCHAR_JSON),
+        ("H_ARRAY_STRUCT", VARCHAR_JSON),
+        ("H_MAP_STRING", VARCHAR_JSON),
+        ("H_MAP_VARCHAR", VARCHAR_JSON),
+        ("H_STRUCT_XY", VARCHAR_JSON),
+        ("H_STRUCT_BINARY", VARCHAR_JSON),
+        ("H_UNIONTYPE", VARCHAR_JSON),
+        ("H_INTERVAL", VARCHAR_JSON),
+        ("H_MALFORMED_MAP", VARCHAR_JSON),
+        ("H_EMPTY_TYPE", VARCHAR_JSON),
+    ];
+    assert_eq!(
+        declared_types(&mut conn, VS, ALL_TYPES),
+        pairs(&expected_types)
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!(
+            "SELECT ID, H_TINYINT, H_SMALLINT, H_INT, H_INTEGER, H_BIGINT, H_FLOAT, H_DOUBLE, \
+             H_BOOLEAN, H_STRING, H_STRING_OVER_BINARY, H_VARCHAR, H_CHAR, H_DECIMAL_10_2, \
+             H_DECIMAL, H_DECIMAL_SPACED, H_DATE, H_TIMESTAMP, H_ARRAY_INT, H_ARRAY_STRUCT, \
+             H_MAP_STRING, H_MAP_VARCHAR, H_STRUCT_XY FROM {all_types} ORDER BY ID"
+        ),
+        &[
+            [Some("1"), Some("2"), Some("3")],
+            [Some("127"), Some("-128"), None],
+            [Some("32767"), Some("-32768"), None],
+            [Some("2147483647"), Some("-2147483648"), None],
+            [Some("7"), Some("-7"), None],
+            [
+                Some("9223372036854775807"),
+                Some("-9223372036854775808"),
+                None,
+            ],
+            [Some("1.5"), Some("-0.25"), None],
+            [Some("2.5"), Some("-0.125"), None],
+            [Some("true"), Some("false"), None],
+            [Some("h\u{e9}llo"), Some("w\u{f6}rld"), None],
+            [Some("legacy-a"), Some("legacy-b"), None],
+            [Some("short"), Some("text"), None],
+            [Some("abcde"), Some("fghij"), None],
+            [Some("12.34"), Some("-0.05"), None],
+            [Some("42"), Some("-42"), None],
+            [
+                Some("1234567890123456789012345678.9012345678"),
+                Some("-0.0000000005"),
+                None,
+            ],
+            [Some("2024-01-15"), Some("1970-01-01"), None],
+            [
+                Some("2024-01-15 10:30:45.123000"),
+                Some("1970-01-01 00:00:00.000000"),
+                None,
+            ],
+            [Some("[1,2]"), Some("[]"), None],
+            [Some("[{\"a\":1.25}]"), Some("[]"), None],
+            [Some("{\"k1\":1,\"k2\":2}"), Some("{}"), None],
+            [Some("{\"a\":1}"), Some("{}"), None],
+            [
+                Some("{\"x\":1,\"y\":\"p\"}"),
+                Some("{\"x\":2,\"y\":null}"),
+                None,
+            ],
+        ],
+    );
+    for (column, fragments) in [
+        ("H_BINARY", &["type 'binary'", "#351"][..]),
+        (
+            "H_STRUCT_BINARY",
+            &["member 'h_struct_binary.b'", "type 'binary'", "#351"],
+        ),
+        ("H_UNIONTYPE", &["Hive type 'uniontype<int,string>'"]),
+        ("H_INTERVAL", &["Hive type 'interval_day_time'"]),
+        ("H_MALFORMED_MAP", &["Hive type 'map<int>'"]),
+        ("H_EMPTY_TYPE", &["Hive type ''"]),
+    ] {
+        let sql = format!("SELECT {column} FROM {all_types}");
+        assert_query_fails(&mut conn, &sql, fragments);
+    }
+
+    assert_eq!(
+        declared_types(&mut conn, VS, BINARY_VALUES),
+        pairs(&[("ID", "DECIMAL(20,0)"), ("C_BYTES", VARCHAR_JSON)])
+    );
+    let sql = format!("SELECT C_BYTES FROM {}", fixture.table(BINARY_VALUES));
+    assert_query_fails(&mut conn, &sql, &["Invalid UTF8 sequence"]);
 }
 
 /// Scenario: The suite fails, never skips, when a variable or the stack is missing

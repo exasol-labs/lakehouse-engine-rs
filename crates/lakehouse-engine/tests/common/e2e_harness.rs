@@ -516,6 +516,97 @@ pub fn value_to_string(v: &serde_json::Value) -> String {
         .unwrap_or_else(|| v.to_string())
 }
 
+/// `(COLUMN_NAME, COLUMN_TYPE)` of one virtual table in column order, the type with its
+/// whitespace and character-set suffix removed, so `VARCHAR(2000000) UTF8` reads `VARCHAR(2000000)`.
+pub fn declared_types(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<(String, String)> {
+    let columns = conn.query_columns(&format!(
+        "SELECT COLUMN_NAME, COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
+         WHERE COLUMN_SCHEMA = '{vs_name}' AND COLUMN_TABLE = '{}' \
+         ORDER BY COLUMN_ORDINAL_POSITION",
+        table.to_uppercase()
+    ));
+    let [names, types] = columns.as_slice() else {
+        return Vec::new();
+    };
+    names
+        .iter()
+        .zip(types)
+        .map(|(name, declared)| {
+            let declared: String = value_to_string(declared)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect();
+            let declared = declared
+                .strip_suffix("UTF8")
+                .or_else(|| declared.strip_suffix("ASCII"))
+                .unwrap_or(&declared)
+                .to_string();
+            (value_to_string(name), declared)
+        })
+        .collect()
+}
+
+pub fn declared_type(conn: &mut ExaConn, vs_name: &str, table: &str, column: &str) -> String {
+    declared_types(conn, vs_name, table)
+        .into_iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(column))
+        .map(|(_, declared)| declared)
+        .unwrap_or_else(|| panic!("{vs_name}.{table}.{column} has no declared type"))
+}
+
+pub const VARCHAR_JSON: &str = "VARCHAR(2000000)";
+
+pub fn pairs(expected: &[(&str, &str)]) -> Vec<(String, String)> {
+    expected
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect()
+}
+
+pub fn query_error(conn: &mut ExaConn, sql: &str) -> String {
+    let response = conn.try_execute(sql);
+    assert_ne!(
+        response["status"].as_str(),
+        Some("ok"),
+        "expected the query to fail: {sql}"
+    );
+    response["exception"]["text"]
+        .as_str()
+        .unwrap_or("")
+        .to_string()
+}
+
+pub fn assert_query_fails(conn: &mut ExaConn, sql: &str, fragments: &[&str]) {
+    let error = query_error(conn, sql);
+    assert!(
+        fragments.iter().all(|f| error.contains(f)),
+        "{sql} must fail naming {fragments:?}: {error}"
+    );
+}
+
+/// Compares each result column of `sql`, as text with NULL as `None`, with `expected`.
+pub fn assert_text_columns<const ROWS: usize>(
+    conn: &mut ExaConn,
+    sql: &str,
+    expected: &[[Option<&str>; ROWS]],
+) {
+    let observed: Vec<Vec<Option<String>>> = conn
+        .query_columns(sql)
+        .iter()
+        .map(|column| {
+            column
+                .iter()
+                .map(|v| (!v.is_null()).then(|| value_to_string(v)))
+                .collect()
+        })
+        .collect();
+    let expected: Vec<Vec<Option<String>>> = expected
+        .iter()
+        .map(|column| column.iter().map(|v| v.map(str::to_string)).collect())
+        .collect();
+    assert_eq!(observed, expected, "{sql}");
+}
+
 /// Ground truth independent of join pushdown: both tables read un-joined through the VS
 /// and joined in-process.
 pub fn expected_join_rows(conn: &mut ExaConn, vs_name: &str) -> Vec<(String, String)> {

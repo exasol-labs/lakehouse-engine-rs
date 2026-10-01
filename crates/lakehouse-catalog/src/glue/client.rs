@@ -1,15 +1,8 @@
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 
-use aws_sdk_glue::config::retry::RetryConfig;
-use aws_sdk_glue::config::timeout::TimeoutConfig;
-use aws_sdk_glue::config::{BehaviorVersion, Credentials, Region};
-use aws_sdk_glue::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
-use aws_sdk_glue::types::{Column, Table};
 use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
-use iceberg::spec::TableMetadata;
 
 use crate::client::{dotted_identifier, iceberg_catalog_table};
 use crate::redaction::redact_secret_values;
@@ -22,21 +15,15 @@ use crate::{
 
 use super::partitions::neutral_partition;
 use super::routing::{Route, route};
+use super::sdk::SdkGlueSource;
+use super::source::{GlueColumn, GlueFailure, GlueSource, GlueTable};
 use super::trim_location;
 
-pub(super) const MAX_ATTEMPTS: u32 = 5;
-/// Bounds each call, retries included, because it runs inside a pushdown.
-pub(super) const OPERATION_TIMEOUT: Duration = Duration::from_secs(30);
 const METADATA_READ_CONCURRENCY: usize = 16;
-const CREDENTIALS_PROVIDER: &str = "exasol-connection";
-const NOT_FOUND_CODE: &str = "EntityNotFoundException";
 
-/// Glue Data Catalog metadata as neutral tables and partitions. It signs only with the
-/// CONNECTION's static key, never an environment, profile, or instance-metadata identity.
+/// Glue Data Catalog metadata as neutral tables and partitions.
 pub struct GlueCatalogSession {
-    client: aws_sdk_glue::Client,
-    storage: StorageBackend,
-    catalog_id: Option<String>,
+    source: Box<dyn GlueSource>,
     secrets: Vec<String>,
 }
 
@@ -48,15 +35,6 @@ impl GlueCatalogSession {
         creds: ConnectionCreds,
     ) -> Result<Self, UdfError> {
         let region = required_signing_region(&creds, address)?;
-        let config = glue_config(address, &creds, region).build();
-        Ok(Self::from_config(config, storage, &creds))
-    }
-
-    fn from_config(
-        config: aws_sdk_glue::Config,
-        storage: StorageBackend,
-        creds: &ConnectionCreds,
-    ) -> Self {
         let secrets = [&creds.access_key, &creds.secret_key]
             .into_iter()
             .chain(creds.session_token.as_ref())
@@ -64,35 +42,19 @@ impl GlueCatalogSession {
             .chain(storage.secret_values().into_iter().map(str::to_string))
             .filter(|secret| !secret.is_empty())
             .collect();
-        Self {
-            client: aws_sdk_glue::Client::from_conf(config),
-            catalog_id: Some(creds.warehouse.clone()).filter(|id| !id.trim().is_empty()),
-            storage,
+        Ok(Self {
+            source: Box::new(SdkGlueSource::new(address, storage, &creds, region)),
             secrets,
-        }
+        })
     }
 
-    /// The table as a pushdown plans it, from `GetTable` alone: an Iceberg table carries its
-    /// metadata location and no column, because the Iceberg planner reads the metadata file.
+    /// The table as a pushdown plans it, from `GetTable` alone, without reading a metadata file.
     pub async fn load_table_for_planning(
         &self,
         ident: &CatalogTableIdent,
     ) -> Result<CatalogTable, UdfError> {
         let table = self.get_table(ident).await?;
-        match route_of(&table) {
-            Route::Iceberg { metadata_location } => Ok(CatalogTable {
-                ident: ident.clone(),
-                table_type: CatalogTableType::Table,
-                storage_location: table_location(&table),
-                format: TableFormat::Iceberg,
-                vended_credential_key: None,
-                partition_columns: Vec::new(),
-                columns: Vec::new(),
-                metadata_location: Some(metadata_location),
-            }),
-            Route::Parquet => Ok(parquet_table(ident.clone(), &table)),
-            Route::Skip(detail) => Err(not_plannable(ident, &detail)),
-        }
+        planning_table(ident, &table)
     }
 
     /// The registered partitions of a Parquet table, each value keyed by the matching entry
@@ -104,78 +66,32 @@ impl GlueCatalogSession {
     ) -> Result<Vec<CatalogPartition>, UdfError> {
         let database = glue_database(&ident.namespace)?;
         let table = dotted_identifier(ident);
-        let mut partitions = Vec::new();
-        let mut token = None;
-        loop {
-            let page = self
-                .client
-                .get_partitions()
-                .set_catalog_id(self.catalog_id.clone())
-                .database_name(database)
-                .table_name(&ident.name)
-                .exclude_column_schema(true)
-                .set_next_token(token.take())
-                .send()
-                .await
-                .map_err(|error| self.glue_error("GetPartitions", &table_subject(ident), error))?;
-            token = next_page_token(page.next_token(), page.partitions().len());
-            for partition in page.partitions() {
-                let neutral = neutral_partition(&table, partition_columns, partition)
-                    .map_err(|message| UdfError::User(self.redact(&message)))?;
-                partitions.push(neutral);
-            }
-            if token.is_none() {
-                return Ok(partitions);
-            }
-        }
-    }
-
-    async fn database_tables(&self, database: &str) -> Result<Vec<Table>, UdfError> {
-        let mut tables = Vec::new();
-        let mut token = None;
-        loop {
-            let page = self
-                .client
-                .get_tables()
-                .set_catalog_id(self.catalog_id.clone())
-                .database_name(database)
-                .set_next_token(token.take())
-                .send()
-                .await
-                .map_err(|error| {
-                    self.glue_error("GetTables", &format!("database '{database}'"), error)
-                })?;
-            token = next_page_token(page.next_token(), page.table_list().len());
-            tables.extend(page.table_list.unwrap_or_default());
-            if token.is_none() {
-                return Ok(tables);
-            }
-        }
-    }
-
-    async fn get_table(&self, ident: &CatalogTableIdent) -> Result<Table, UdfError> {
-        let database = glue_database(&ident.namespace)?;
-        let output = self
-            .client
-            .get_table()
-            .set_catalog_id(self.catalog_id.clone())
-            .database_name(database)
-            .name(&ident.name)
-            .send()
+        self.source
+            .partitions(database, &ident.name)
             .await
-            .map_err(|error| self.glue_error("GetTable", &table_subject(ident), error))?;
-        output.table.ok_or_else(|| {
-            UdfError::User(format!(
-                "Glue GetTable returned no table for {}",
-                table_subject(ident)
-            ))
-        })
+            .map_err(|failure| self.glue_error("GetPartitions", &table_subject(ident), &failure))?
+            .iter()
+            .map(|partition| {
+                neutral_partition(&table, partition_columns, partition)
+                    .map_err(|message| UdfError::User(self.redact(&message)))
+            })
+            .collect()
+    }
+
+    async fn get_table(&self, ident: &CatalogTableIdent) -> Result<GlueTable, UdfError> {
+        let database = glue_database(&ident.namespace)?;
+        let subject = table_subject(ident);
+        self.source
+            .table(database, &ident.name)
+            .await
+            .map_err(|failure| self.glue_error("GetTable", &subject, &failure))?
+            .ok_or_else(|| UdfError::User(format!("Glue GetTable returned no table for {subject}")))
     }
 
     async fn listing_table(
         &self,
         ident: CatalogTableIdent,
-        table: Table,
+        table: GlueTable,
         route: Route,
     ) -> Result<CatalogTable, UdfError> {
         match route {
@@ -193,7 +109,9 @@ impl GlueCatalogSession {
         ident: CatalogTableIdent,
         metadata_location: String,
     ) -> Result<CatalogTable, UdfError> {
-        let metadata = TableMetadata::read_from(&self.storage.file_io(), &metadata_location)
+        let metadata = self
+            .source
+            .iceberg_metadata(&metadata_location)
             .await
             .map_err(|error| {
                 UdfError::User(self.redact(&format!(
@@ -209,28 +127,8 @@ impl GlueCatalogSession {
         ))
     }
 
-    fn glue_error<E>(&self, operation: &str, subject: &str, error: SdkError<E>) -> UdfError
-    where
-        E: ProvideErrorMetadata + std::error::Error + 'static,
-    {
-        let text = match &error {
-            SdkError::ServiceError(context) => service_error_text(
-                operation,
-                subject,
-                context.err(),
-                context.raw().status().as_u16(),
-            ),
-            SdkError::TimeoutError(_) => format!(
-                "Glue {operation} for {subject} did not complete within {} seconds, retries \
-                 included",
-                OPERATION_TIMEOUT.as_secs()
-            ),
-            other => format!(
-                "Glue {operation} request for {subject} failed: {}",
-                DisplayErrorContext(other)
-            ),
-        };
-        UdfError::User(self.redact(&text))
+    fn glue_error(&self, operation: &str, subject: &str, failure: &GlueFailure) -> UdfError {
+        UdfError::User(self.redact(&failure.text(operation, subject)))
     }
 
     fn redact(&self, text: &str) -> String {
@@ -247,12 +145,15 @@ impl CatalogClient for GlueCatalogSession {
         let namespace = namespace.to_vec();
         Box::pin(async move {
             let database = glue_database(&namespace)?;
+            let tables = self.source.tables(database).await.map_err(|failure| {
+                self.glue_error("GetTables", &format!("database '{database}'"), &failure)
+            })?;
             let mut admitted = Vec::new();
             let mut skipped = Vec::new();
-            for table in self.database_tables(database).await? {
+            for table in tables {
                 let ident = CatalogTableIdent {
                     namespace: namespace.clone(),
-                    name: table.name().to_string(),
+                    name: table.name.clone(),
                 };
                 match route_of(&table) {
                     Route::Skip(detail) => skipped.push(SkippedTable {
@@ -283,34 +184,6 @@ impl CatalogClient for GlueCatalogSession {
     }
 }
 
-fn glue_config(
-    address: &str,
-    creds: &ConnectionCreds,
-    region: String,
-) -> aws_sdk_glue::config::Builder {
-    aws_sdk_glue::Config::builder()
-        .behavior_version(BehaviorVersion::latest())
-        .credentials_provider(Credentials::new(
-            creds.access_key.clone(),
-            creds.secret_key.clone(),
-            creds.session_token.clone(),
-            None,
-            CREDENTIALS_PROVIDER,
-        ))
-        .region(Region::new(region))
-        .endpoint_url(address)
-        .retry_config(glue_retry_config())
-        .timeout_config(
-            TimeoutConfig::builder()
-                .operation_timeout(OPERATION_TIMEOUT)
-                .build(),
-        )
-}
-
-fn glue_retry_config() -> RetryConfig {
-    RetryConfig::standard().with_max_attempts(MAX_ATTEMPTS)
-}
-
 fn glue_database(namespace: &[String]) -> Result<&str, UdfError> {
     match namespace {
         [database] if !database.is_empty() => Ok(database),
@@ -332,94 +205,70 @@ fn not_plannable(ident: &CatalogTableIdent, detail: &str) -> UdfError {
     ))
 }
 
-/// Glue can return a non-null token after the last page, so an empty page also ends a listing.
-fn next_page_token(token: Option<&str>, page_len: usize) -> Option<String> {
-    if page_len == 0 {
-        return None;
-    }
-    token.filter(|token| !token.is_empty()).map(str::to_string)
-}
-
-fn route_of(table: &Table) -> Route {
+fn route_of(table: &GlueTable) -> Route {
     route(
-        table.table_type(),
-        table.parameters(),
-        table
-            .storage_descriptor()
-            .and_then(|descriptor| descriptor.input_format()),
+        table.table_type.as_deref(),
+        &table.parameters,
+        table.input_format.as_deref(),
     )
 }
 
-fn table_location(table: &Table) -> Option<String> {
+/// An Iceberg table carries its metadata location and no column, because the Iceberg
+/// planner reads the metadata file.
+fn planning_table(ident: &CatalogTableIdent, table: &GlueTable) -> Result<CatalogTable, UdfError> {
+    match route_of(table) {
+        Route::Iceberg { metadata_location } => Ok(CatalogTable {
+            ident: ident.clone(),
+            table_type: CatalogTableType::Table,
+            storage_location: table_location(table),
+            format: TableFormat::Iceberg,
+            vended_credential_key: None,
+            partition_columns: Vec::new(),
+            columns: Vec::new(),
+            metadata_location: Some(metadata_location),
+        }),
+        Route::Parquet => Ok(parquet_table(ident.clone(), table)),
+        Route::Skip(detail) => Err(not_plannable(ident, &detail)),
+    }
+}
+
+fn table_location(table: &GlueTable) -> Option<String> {
     table
-        .storage_descriptor()
-        .and_then(|descriptor| descriptor.location())
+        .location
+        .as_deref()
         .filter(|location| !location.is_empty())
         .map(|location| trim_location(location).to_string())
 }
 
-fn parquet_table(ident: CatalogTableIdent, table: &Table) -> CatalogTable {
-    let partition_keys = table.partition_keys();
-    let storage_columns = table
-        .storage_descriptor()
-        .map(|descriptor| descriptor.columns())
-        .unwrap_or_default();
+fn parquet_table(ident: CatalogTableIdent, table: &GlueTable) -> CatalogTable {
     CatalogTable {
         ident,
         table_type: CatalogTableType::Table,
         storage_location: table_location(table),
         format: TableFormat::Parquet,
         vended_credential_key: None,
-        partition_columns: partition_keys
+        partition_columns: table
+            .partition_keys
             .iter()
-            .map(|key| key.name().to_string())
+            .map(|key| key.name.clone())
             .collect(),
-        columns: storage_columns
+        columns: table
+            .columns
             .iter()
-            .chain(partition_keys)
-            .map(glue_column)
+            .chain(&table.partition_keys)
+            .map(catalog_column)
             .collect(),
         metadata_location: None,
     }
 }
 
-fn glue_column(column: &Column) -> CatalogColumn {
+fn catalog_column(column: &GlueColumn) -> CatalogColumn {
     CatalogColumn {
-        name: column.name().to_string(),
+        name: column.name.clone(),
         source_type: ColumnSourceType::Glue {
-            hive_type: column.r#type().unwrap_or_default().to_string(),
+            hive_type: column.hive_type.clone(),
         },
     }
-}
-
-fn service_error_text(
-    operation: &str,
-    subject: &str,
-    error: &impl ProvideErrorMetadata,
-    status: u16,
-) -> String {
-    let message = error.message().unwrap_or("(no message)");
-    match error.code() {
-        Some(NOT_FOUND_CODE) => format!(
-            "Glue {operation} failed: {subject} does not exist ({NOT_FOUND_CODE}: {message})"
-        ),
-        Some(code) if is_signing_time_rejection(code, message) => format!(
-            "Glue {operation} failed for {subject}: the Exasol node's clock differs from AWS \
-             time, so AWS rejected the request's signing time; synchronize the node's clock \
-             ({code}: {message})"
-        ),
-        Some(code) => format!("Glue {operation} failed for {subject}: {code}: {message}"),
-        None => format!("Glue {operation} failed for {subject}: HTTP {status}: {message}"),
-    }
-}
-
-/// AWS's own codes and texts for a signature outside its time window. One that reaches here
-/// survived the SDK's skew-corrected retries.
-fn is_signing_time_rejection(code: &str, message: &str) -> bool {
-    matches!(code, "RequestTimeTooSkewed" | "RequestExpired")
-        || (code == "InvalidSignatureException"
-            && (message.starts_with("Signature expired")
-                || message.starts_with("Signature not yet current")))
 }
 
 #[cfg(test)]

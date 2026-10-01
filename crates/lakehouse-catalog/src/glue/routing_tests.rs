@@ -21,7 +21,7 @@ fn route_admits_an_iceberg_table_type_case_insensitively_with_its_metadata_locat
         let parameters = params(&[("table_type", table_type), ("metadata_location", METADATA)]);
 
         assert_eq!(
-            route(Some("EXTERNAL_TABLE"), Some(&parameters), None),
+            route(Some("EXTERNAL_TABLE"), &parameters, None),
             Route::Iceberg {
                 metadata_location: METADATA.to_string()
             },
@@ -37,7 +37,7 @@ fn route_skips_an_iceberg_table_without_a_metadata_location_naming_the_parameter
         params(&[("table_type", "ICEBERG"), ("metadata_location", "")]),
         params(&[("table_type", "ICEBERG"), ("metadata_location", "  ")]),
     ] {
-        let Route::Skip(detail) = route(Some("EXTERNAL_TABLE"), Some(&parameters), None) else {
+        let Route::Skip(detail) = route(Some("EXTERNAL_TABLE"), &parameters, None) else {
             panic!("an Iceberg table without metadata_location must be skipped: {parameters:?}");
         };
         assert!(detail.contains("metadata_location"), "{detail}");
@@ -51,7 +51,7 @@ fn route_skips_a_present_non_iceberg_table_type_before_reading_the_input_format(
     assert_eq!(
         route(
             Some("EXTERNAL_TABLE"),
-            Some(&athena_delta),
+            &athena_delta,
             Some(PARQUET_INPUT_FORMAT)
         ),
         skip("table_type=delta"),
@@ -60,7 +60,7 @@ fn route_skips_a_present_non_iceberg_table_type_before_reading_the_input_format(
     assert_eq!(
         route(
             Some("EXTERNAL_TABLE"),
-            Some(&athena_delta),
+            &athena_delta,
             Some("org.apache.hadoop.mapred.SequenceFileInputFormat")
         ),
         skip("table_type=delta")
@@ -70,11 +70,15 @@ fn route_skips_a_present_non_iceberg_table_type_before_reading_the_input_format(
 #[test]
 fn route_admits_a_hive_table_only_for_the_mapred_parquet_input_format() {
     assert_eq!(
-        route(Some("EXTERNAL_TABLE"), None, Some(PARQUET_INPUT_FORMAT)),
+        route(
+            Some("EXTERNAL_TABLE"),
+            &params(&[]),
+            Some(PARQUET_INPUT_FORMAT)
+        ),
         Route::Parquet
     );
     assert_eq!(
-        route(None, Some(&params(&[])), Some(PARQUET_INPUT_FORMAT)),
+        route(None, &params(&[]), Some(PARQUET_INPUT_FORMAT)),
         Route::Parquet
     );
 }
@@ -89,12 +93,12 @@ fn route_skips_every_other_input_format_naming_it() {
         "org.apache.hadoop.hive.ql.io.parquet.mapredparquetinputformat",
     ] {
         assert_eq!(
-            route(Some("EXTERNAL_TABLE"), None, Some(input_format)),
+            route(Some("EXTERNAL_TABLE"), &params(&[]), Some(input_format)),
             skip(&format!("InputFormat={input_format}"))
         );
     }
     assert_eq!(
-        route(Some("EXTERNAL_TABLE"), None, None),
+        route(Some("EXTERNAL_TABLE"), &params(&[]), None),
         skip("InputFormat=absent")
     );
 }
@@ -105,11 +109,11 @@ fn route_skips_a_view_naming_its_table_type_before_any_parameter() {
 
     for table_type in ["VIRTUAL_VIEW", "virtual_view"] {
         assert_eq!(
-            route(Some(table_type), None, None),
+            route(Some(table_type), &params(&[]), None),
             skip(&format!("TableType={table_type}"))
         );
         assert_eq!(
-            route(Some(table_type), Some(&iceberg), Some(PARQUET_INPUT_FORMAT)),
+            route(Some(table_type), &iceberg, Some(PARQUET_INPUT_FORMAT)),
             skip(&format!("TableType={table_type}"))
         );
     }
@@ -122,7 +126,7 @@ fn route_skips_a_projection_enabled_parquet_table_stating_it_would_read_no_rows(
 
         let Route::Skip(detail) = route(
             Some("EXTERNAL_TABLE"),
-            Some(&parameters),
+            &parameters,
             Some(PARQUET_INPUT_FORMAT),
         ) else {
             panic!("projection.enabled={enabled} must skip");
@@ -134,7 +138,7 @@ fn route_skips_a_projection_enabled_parquet_table_stating_it_would_read_no_rows(
     assert_eq!(
         route(
             Some("EXTERNAL_TABLE"),
-            Some(&params(&[("projection.enabled", "false")])),
+            &params(&[("projection.enabled", "false")]),
             Some(PARQUET_INPUT_FORMAT)
         ),
         Route::Parquet

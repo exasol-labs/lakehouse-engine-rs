@@ -1,8 +1,7 @@
-use aws_sdk_glue::types::Partition;
-
 use crate::CatalogPartition;
 
 use super::routing::{PARQUET_INPUT_FORMAT, format_of_input_format};
+use super::source::GluePartition;
 use super::trim_location;
 
 /// Hive's literal for a NULL partition value.
@@ -13,12 +12,12 @@ const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 pub(super) fn neutral_partition(
     table: &str,
     partition_keys: &[String],
-    partition: &Partition,
+    partition: &GluePartition,
 ) -> Result<CatalogPartition, String> {
-    let descriptor = partition.storage_descriptor();
-    let values = partition.values();
-    let location = descriptor
-        .and_then(|descriptor| descriptor.location())
+    let values = &partition.values;
+    let location = partition
+        .location
+        .as_deref()
         .filter(|location| !location.is_empty())
         .ok_or_else(|| {
             format!("Glue partition {values:?} of table '{table}' declares no storage location")
@@ -31,8 +30,9 @@ pub(super) fn neutral_partition(
             partition_keys.len()
         ));
     }
-    let input_format = descriptor
-        .and_then(|descriptor| descriptor.input_format())
+    let input_format = partition
+        .input_format
+        .as_deref()
         .filter(|input_format| !input_format.is_empty())
         .unwrap_or(PARQUET_INPUT_FORMAT);
 
@@ -51,3 +51,7 @@ pub(super) fn neutral_partition(
 fn partition_value(raw: &str) -> Option<String> {
     (raw != HIVE_DEFAULT_PARTITION).then(|| raw.to_string())
 }
+
+#[cfg(test)]
+#[path = "partitions_tests.rs"]
+mod tests;
