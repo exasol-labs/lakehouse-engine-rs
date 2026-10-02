@@ -11,10 +11,27 @@ catalog backed by SeaweedFS object storage. Unchanged by this plan. This section
 ## Scenarios
 
 <!-- DELTA:NEW -->
-### Scenario: The allowall suite runs on the allowall authorizer
+### Scenario: The Lakekeeper stack enforces permissions
 
-* *GIVEN* the stack started from `docker-compose.yml` and `docker-compose.lakekeeper.yml` only
+* *GIVEN* the stack started from `docker-compose.yml` and `docker-compose.lakekeeper.yml`
 * *WHEN* the harness provisions the catalog
-* *THEN* `GET /management/v1/info` SHALL report `authz-backend` as `allow-all`
-* *AND* the suite SHALL fail, not skip, when it reports any other backend, so a stack carrying the OpenFGA overlay of `lakekeeper-e2e/lakekeeper-authz-contract` never runs this suite unnoticed
+* *THEN* Lakekeeper SHALL enforce permissions through OpenFGA, so a principal without a grant on a table is denied it
+* *AND* the suite SHALL fail, not skip, when the stack reports any other authorization backend
+<!-- /DELTA:NEW -->
+
+<!-- DELTA:NEW -->
+### Scenario: Two principals hold different table grants
+
+* *GIVEN* the provisioned fixture, two tables in one warehouse and two principals
+* *WHEN* the harness asks Lakekeeper, as the operator, whether each principal may read each table
+* *THEN* the first principal SHALL be allowed the first table and denied the second
+* *AND* the second principal SHALL be allowed the second table and denied the first
+<!-- /DELTA:NEW -->
+
+<!-- DELTA:NEW -->
+### Scenario: The existing Lakekeeper scenarios pass with permissions enforced
+
+* *GIVEN* the permission-enforcing stack
+* *WHEN* the existing scenarios of this suite run
+* *THEN* each SHALL pass unchanged, so enforcing permissions does not alter the static-credential, vended-credential, or join results
 <!-- /DELTA:NEW -->
