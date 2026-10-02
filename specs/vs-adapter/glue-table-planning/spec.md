@@ -8,7 +8,7 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 * Glue records a partition location as a raw S3 key (verified live, #410). `vs-adapter/parquet-directory-seam` owns the raw-key listing rule.
 * Trino writes unbucketed Hive Parquet data files with no file extension (verified live, #410).
 * Every pushdown re-reads the Glue metadata: one `GetTable`, the paginated `GetPartitions`, and one LIST per kept partition. The adapter caches nothing.
-* The adapter reads storage with the CONNECTION's static credentials.
+* The adapter reads storage with the CONNECTION's static credentials, or with the session of the role the CONNECTION names, per `vs-adapter/connection-credentials-assume-role`.
 
 ## Scenarios
 

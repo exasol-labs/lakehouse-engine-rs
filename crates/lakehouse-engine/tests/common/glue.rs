@@ -49,6 +49,10 @@ pub const ACCESS_KEY_ID_VAR: &str = "GLUE_ACCESS_KEY_ID";
 pub const SECRET_ACCESS_KEY_VAR: &str = "GLUE_SECRET_ACCESS_KEY";
 pub const REGION_VAR: &str = "GLUE_REGION";
 pub const FIXTURE_BUCKET_VAR: &str = "GLUE_FIXTURE_BUCKET";
+pub const ASSUME_ROLE_BASE_ACCESS_KEY_ID_VAR: &str = "GLUE_ASSUME_ROLE_BASE_ACCESS_KEY_ID";
+pub const ASSUME_ROLE_BASE_SECRET_ACCESS_KEY_VAR: &str = "GLUE_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY";
+pub const ASSUME_ROLE_ARN_VAR: &str = "GLUE_ASSUME_ROLE_ARN";
+pub const ASSUME_ROLE_EXTERNAL_ID_VAR: &str = "GLUE_ASSUME_ROLE_EXTERNAL_ID";
 
 /// Glue's database-name length limit.
 const MAX_DATABASE_NAME_LEN: usize = 255;
@@ -71,6 +75,11 @@ pub struct GlueEnv {
     secret_access_key: String,
     pub region: String,
     pub fixture_bucket: String,
+    /// Holds only `sts:AssumeRole` on `assume_role_arn`, so it reaches Glue and S3 only as the role.
+    pub assume_role_base_access_key_id: String,
+    assume_role_base_secret_access_key: String,
+    pub assume_role_arn: String,
+    assume_role_external_id: String,
 }
 
 impl GlueEnv {
@@ -89,6 +98,10 @@ impl GlueEnv {
             secret_access_key: read(SECRET_ACCESS_KEY_VAR),
             region: read(REGION_VAR),
             fixture_bucket: read(FIXTURE_BUCKET_VAR),
+            assume_role_base_access_key_id: read(ASSUME_ROLE_BASE_ACCESS_KEY_ID_VAR),
+            assume_role_base_secret_access_key: read(ASSUME_ROLE_BASE_SECRET_ACCESS_KEY_VAR),
+            assume_role_arn: read(ASSUME_ROLE_ARN_VAR),
+            assume_role_external_id: read(ASSUME_ROLE_EXTERNAL_ID_VAR),
         }
     }
 
@@ -102,7 +115,14 @@ impl GlueEnv {
     }
 
     pub fn redact(&self, text: &str) -> String {
-        redact_error_text(text, &[&self.secret_access_key])
+        redact_error_text(
+            text,
+            &[
+                &self.secret_access_key,
+                &self.assume_role_base_secret_access_key,
+                &self.assume_role_external_id,
+            ],
+        )
     }
 
     /// Panics with the redacted error chain, which may echo a request carrying the secret.
@@ -775,6 +795,24 @@ pub fn glue_connection_password(env: &GlueEnv) -> CatalogConnectionPassword {
     }
 }
 
+/// The base identity names the role, so the adapter reaches Glue and S3 only as the role.
+pub fn glue_assume_role_connection_password(env: &GlueEnv) -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        aws_assume_role_arn: Some(env.assume_role_arn.clone()),
+        aws_external_id: Some(env.assume_role_external_id.clone()),
+        ..glue_base_identity_connection_password(env)
+    }
+}
+
+/// The base identity without its role, which Glue denies.
+pub fn glue_base_identity_connection_password(env: &GlueEnv) -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        access_key: env.assume_role_base_access_key_id.clone(),
+        secret_key: env.assume_role_base_secret_access_key.clone(),
+        ..glue_connection_password(env)
+    }
+}
+
 /// One Glue client and S3 store for a whole registration, which runs on a single runtime.
 struct FixtureWriter<'a> {
     run: &'a GlueRun,
@@ -1268,17 +1306,29 @@ async fn register_metadata_only_tables(writer: &FixtureWriter<'_>) -> Result<()>
 mod glue_naming_and_variable_tests {
     use super::super::cloud_fixture::panic_message;
     use super::{
-        ACCESS_KEY_ID_VAR, DATABASE_PREFIX, FIXTURE_BUCKET_VAR, GlueEnv, MAX_DATABASE_NAME_LEN,
-        REGION_VAR, SECRET_ACCESS_KEY_VAR, database_name, derive_run_id,
+        ACCESS_KEY_ID_VAR, ASSUME_ROLE_ARN_VAR, ASSUME_ROLE_BASE_ACCESS_KEY_ID_VAR,
+        ASSUME_ROLE_BASE_SECRET_ACCESS_KEY_VAR, ASSUME_ROLE_EXTERNAL_ID_VAR, DATABASE_PREFIX,
+        FIXTURE_BUCKET_VAR, GlueEnv, MAX_DATABASE_NAME_LEN, REGION_VAR, SECRET_ACCESS_KEY_VAR,
+        database_name, derive_run_id,
     };
 
     const FIXED_MILLIS: u128 = 1_762_000_000_000;
 
-    const VALUES: [(&str, &str); 4] = [
+    const VALUES: [(&str, &str); 8] = [
         (ACCESS_KEY_ID_VAR, "AKIAACCESSKEYSENTINEL"),
         (SECRET_ACCESS_KEY_VAR, "secret/access+key/sentinel"),
         (REGION_VAR, "eu-sentinel-1"),
         (FIXTURE_BUCKET_VAR, "bucket-sentinel"),
+        (ASSUME_ROLE_BASE_ACCESS_KEY_ID_VAR, "AKIABASEKEYSENTINEL"),
+        (
+            ASSUME_ROLE_BASE_SECRET_ACCESS_KEY_VAR,
+            "base/secret+key/sentinel",
+        ),
+        (
+            ASSUME_ROLE_ARN_VAR,
+            "arn:aws:iam::000000000000:role/sentinel",
+        ),
+        (ASSUME_ROLE_EXTERNAL_ID_VAR, "external-id-sentinel"),
     ];
 
     fn value_of(name: &str) -> Option<String> {
@@ -1325,7 +1375,7 @@ mod glue_naming_and_variable_tests {
 
     /// Scenario: The suite fails, never skips, when a variable or the stack is missing
     #[test]
-    fn glue_env_reads_all_four_variables_up_front() {
+    fn glue_env_reads_all_eight_variables_up_front() {
         let env = GlueEnv::from_lookup(value_of);
         assert_eq!(
             [
@@ -1333,6 +1383,10 @@ mod glue_naming_and_variable_tests {
                 env.secret_access_key(),
                 env.region.as_str(),
                 env.fixture_bucket.as_str(),
+                env.assume_role_base_access_key_id.as_str(),
+                env.assume_role_base_secret_access_key.as_str(),
+                env.assume_role_arn.as_str(),
+                env.assume_role_external_id.as_str(),
             ],
             VALUES.map(|(_, value)| value)
         );
@@ -1351,6 +1405,22 @@ mod glue_naming_and_variable_tests {
                     "the panic for a missing {missing} must echo no variable value, got: {message}"
                 );
             }
+        }
+    }
+
+    /// Scenario: No credential value appears in output
+    #[test]
+    fn glue_env_redacts_both_secret_keys_and_the_external_id() {
+        let env = GlueEnv::from_lookup(value_of);
+        let redacted = env.redact(&VALUES.map(|(_, value)| value).join(" "));
+        for secret in [
+            SECRET_ACCESS_KEY_VAR,
+            ASSUME_ROLE_BASE_SECRET_ACCESS_KEY_VAR,
+            ASSUME_ROLE_EXTERNAL_ID_VAR,
+        ]
+        .map(|name| value_of(name).unwrap())
+        {
+            assert!(!redacted.contains(&secret), "{secret} leaked: {redacted}");
         }
     }
 }

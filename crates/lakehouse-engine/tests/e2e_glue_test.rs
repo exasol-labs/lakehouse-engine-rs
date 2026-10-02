@@ -14,8 +14,9 @@ use common::exasol_ws::ExaConn;
 use common::glue::{
     ACCESS_KEY_ID_VAR, ALL_TYPES, BINARY_VALUES, GlueEnv, GlueRun, ICEBERG_ORDERS,
     ORC_INPUT_FORMAT, ORDERS, PARTITIONED, PARTITIONS, ROUTED_TABLES, SECRET_ACCESS_KEY_VAR,
-    SKIPPED_TABLES, STALE_GLUE_COLUMN, SUCCESS_MARKER, glue_connection_password,
-    metadata_only_keys, partitioned_rows, register_fixture_set, register_probe_table,
+    SKIPPED_TABLES, STALE_GLUE_COLUMN, SUCCESS_MARKER, glue_assume_role_connection_password,
+    glue_base_identity_connection_password, glue_connection_password, metadata_only_keys,
+    partitioned_rows, register_fixture_set, register_probe_table,
 };
 use common::seed::{
     ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
@@ -37,10 +38,14 @@ use std::sync::{Mutex, OnceLock};
 
 const VS: &str = "GLUE_LAKEHOUSE";
 const CONN: &str = "GLUE_E2E_CREDS";
+const ROLE_VS: &str = "GLUE_LAKEHOUSE_ROLE";
+const ROLE_CONN: &str = "GLUE_E2E_ROLE_CREDS";
+const BASE_VS: &str = "GLUE_LAKEHOUSE_BASE";
+const BASE_CONN: &str = "GLUE_E2E_BASE_CREDS";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
-/// MinIO and the Iceberg REST fixture are deliberately not awaited: this suite's storage and
+/// SeaweedFS and the Iceberg REST fixture are deliberately not awaited: this suite's storage and
 /// catalog are AWS.
 fn setup() {
     SETUP_DONE.get_or_init(|| {
@@ -211,7 +216,7 @@ type ReadOnlyCheck = fn(&GlueRun, &mut ExaConn);
 #[test]
 fn glue_read_only_checks_pass_against_one_provisioned_fixture() {
     let run = provision();
-    let checks: [(&str, ReadOnlyCheck); 6] = [
+    let checks: [(&str, ReadOnlyCheck); 7] = [
         (
             "listing",
             check_listing_includes_routed_tables_and_records_every_skip,
@@ -232,6 +237,10 @@ fn glue_read_only_checks_pass_against_one_provisioned_fixture() {
         (
             "all types",
             check_all_types_declare_and_return_their_mapped_values,
+        ),
+        (
+            "assume role",
+            check_assume_role_connection_reads_through_the_role,
         ),
     ];
     let failed: Vec<&str> = checks
@@ -612,6 +621,71 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
     );
     let sql = format!("SELECT C_BYTES FROM {}", vs_table(BINARY_VALUES));
     assert_query_fails(conn, &sql, &["Invalid UTF8 sequence"]);
+}
+
+/// Scenario: An assume-role CONNECTION reads through the role and its base identity alone is denied
+fn check_assume_role_connection_reads_through_the_role(run: &GlueRun, conn: &mut ExaConn) {
+    let env = run.env();
+    let database = run.database();
+    let response = try_create_virtual_schema_with_password(
+        &mut redacting_conn(),
+        &glue_vs_props(ROLE_VS, ROLE_CONN, &database),
+        &env.glue_endpoint(),
+        &glue_assume_role_connection_password(env),
+    );
+    assert_eq!(
+        response["status"].as_str(),
+        Some("ok"),
+        "CREATE VIRTUAL SCHEMA {ROLE_VS} through the role failed: {}",
+        env.redact(&response["exception"].to_string())
+    );
+
+    let orders = conn.query_columns(&format!(
+        "SELECT ORDER_ID FROM {ROLE_VS}.{} ORDER BY ORDER_ID",
+        ICEBERG_ORDERS.to_uppercase()
+    ));
+    assert_eq!(
+        int_column(&orders[0]),
+        ORDERS.iter().map(|o| o.order_id).collect::<Vec<_>>(),
+        "the Iceberg table reads through the role's session"
+    );
+    let partitioned = conn.query_columns(&format!(
+        "SELECT ID FROM {ROLE_VS}.{} WHERE P_INT < 9 ORDER BY ID LIMIT 3",
+        PARTITIONED.to_uppercase()
+    ));
+    assert_eq!(
+        int_column(&partitioned[0]),
+        [1, 2, 3],
+        "the partitioned Parquet table reads through the role's sealed session"
+    );
+
+    let response = try_create_virtual_schema_with_password(
+        &mut redacting_conn(),
+        &glue_vs_props(BASE_VS, BASE_CONN, &database),
+        &env.glue_endpoint(),
+        &glue_base_identity_connection_password(env),
+    );
+    let error = value_to_string(&response["exception"]["text"]);
+    let mut cleanup = redacting_conn();
+    for (vs, connection) in [(ROLE_VS, ROLE_CONN), (BASE_VS, BASE_CONN)] {
+        let _ = cleanup.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
+        let _ = cleanup.try_execute(&format!("DROP CONNECTION IF EXISTS {connection}"));
+    }
+    assert_ne!(
+        response["status"].as_str(),
+        Some("ok"),
+        "Glue must deny the base identity without its role"
+    );
+    assert!(
+        error.contains("AccessDenied"),
+        "the denial must come from Glue: {}",
+        env.redact(&error)
+    );
+    assert_eq!(
+        env.redact(&error),
+        error,
+        "the denial must contain no credential value"
+    );
 }
 
 /// Scenario: The suite fails, never skips, when a variable or the stack is missing

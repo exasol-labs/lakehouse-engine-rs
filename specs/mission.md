@@ -57,7 +57,8 @@ Exasol SQL at cluster scale, with no copy, no caching, and no separate query sta
    `delta-kernel-rs`. `CATALOG_KIND = 'GLUE'` reads the AWS Glue Data Catalog through its native API.
    An Iceberg table plans from the metadata file Glue points to. A Hive Parquet table plans from its
    registered partitions. The adapter signs every Glue request with AWS SigV4. It reads storage with
-   the CONNECTION's static credentials, because the Glue kind has no credential vending.
+   the CONNECTION's static credentials, or the session of the AWS IAM role the CONNECTION names,
+   because the Glue kind has no credential vending.
 8. **Bounded, self-throttling execution** — the scan UDF sizes its DataFusion memory pool from the per-instance memory limit reported in UDF metadata (a fraction of it, leaving headroom below the engine's 80% concurrency-stall threshold) and adds a spill backstop: when `/tmp` is real disk it spills (queries complete at any group cardinality); when it is not, a bounded pool returns a clean `ResourcesExhausted` error instead of OOM-crashing. Oversubscribed work-unit sharding (`GROUP BY shard_key`, G = node_count × parallelism_factor capped at 300) shrinks each instance's footprint and lets the engine multiplex shard groups onto each node's core pool. Bounding is not only UDF-side: the scan entry point emits as a SCALAR (not SET) script, so Exasol streams each shard's output rather than materializing the raw-row result into growing temp-DB RAM — keeping engine-side scan-output memory constant regardless of scanned data volume.
 
 ## Out of Scope

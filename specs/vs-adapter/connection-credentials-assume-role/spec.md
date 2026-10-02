@@ -8,7 +8,8 @@ Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `
 * **The base identity is the CONNECTION's own key pair.** `access_key`, `secret_key`, and an optional `session_token` sign the request. No ambient AWS credential is read: no environment variable, instance profile, or web-identity token.
 * **The official `aws-sdk-sts` client owns the wire protocol.** It owns request encoding, SigV4 signing, response parsing, endpoint resolution, and retries. The engine owns only the fields above, the fixed session name `lakehouse-engine`, the plaintext-endpoint gate, and the session's use.
 * **STS region.** The region is the SigV4 signing region of `vs-adapter/connection-credentials-sigv4`, else `us-east-1`. Without `aws_sts_endpoint`, the SDK resolves the regional endpoint. A China-region CONNECTION states `aws_sts_endpoint`, because the AWS STS endpoint table lists China endpoints under `.amazonaws.com.cn`.
-* **The session replaces the key pair only where the pair is read.** Those reads are SigV4 catalog signing and non-vended object storage.
+* **The session replaces the key pair only where the pair is read.** Those reads are SigV4 catalog signing, the native Glue API requests of the `GLUE` catalog kind, and non-vended object storage.
+* **A cross-account Glue `CatalogId` is an untested exception (#TBD).** A `GLUE` CONNECTION whose `warehouse` names another account's `CatalogId` sends that id unchanged, but no test covers it. The supported way to read another account's Glue catalog is a role in that account with `warehouse` omitted, so Glue resolves the role's own account.
 
 ## Scenarios
 
@@ -78,10 +79,25 @@ Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `
 
 ### Scenario: Session credentials are the storage credential when the CONNECTION does not vend
 
-* *GIVEN* a CONNECTION that names a role and does not set `use_vended_credentials`, under the Iceberg REST, Unity Catalog, or direct-storage catalog kind
+* *GIVEN* a CONNECTION that names a role and does not set `use_vended_credentials`, under the Iceberg REST, Unity Catalog, Glue, or direct-storage catalog kind
 * *WHEN* the adapter reads object storage at plan time and the scan UDF reads data files
 * *THEN* every read SHALL use the session credentials as the S3 access key, secret key, and session token, with `endpoint`, `region`, and `path_style` resolved from the CONNECTION as for a CONNECTION that names no role
 * *AND* no object-storage read SHALL use the base key pair
+
+### Scenario: A Glue CONNECTION may name a role
+
+* *GIVEN* a CONNECTION under the `GLUE` catalog kind that supplies `aws_assume_role_arn` beside the base key pair, optionally with `aws_external_id` or `aws_sts_endpoint`
+* *WHEN* the adapter resolves the connection
+* *THEN* the adapter SHALL accept it under the Glue validation of `vs-adapter/catalog-kind-selection`, and SHALL derive its sealing key, so the scan can receive the session
+* *AND* under the `GLUE` kind, `aws_external_id` or `aws_sts_endpoint` without `aws_assume_role_arn` SHALL be rejected as for every other kind
+
+### Scenario: Session credentials sign every native Glue request
+
+* *GIVEN* a CONNECTION under the `GLUE` catalog kind that names a role
+* *WHEN* the adapter calls `GetTables`, `GetTable`, and `GetPartitions`, and reads an Iceberg metadata file that Glue points to
+* *THEN* each Glue request SHALL be signed with the session credentials, and the metadata file SHALL be read with them as the storage credential
+* *AND* the Glue signing region SHALL be the region STS was called for, so one region serves both
+* *AND* a `GLUE` CONNECTION that omits `warehouse` SHALL send no `CatalogId`, so Glue resolves the role's account
 
 ### Scenario: A role leaves credential vending unchanged
 

@@ -538,6 +538,10 @@ jobs:
           GLUE_SECRET_ACCESS_KEY: ${{ secrets.GLUE_SECRET_ACCESS_KEY }}
           GLUE_REGION: ${{ vars.GLUE_REGION }}
           GLUE_FIXTURE_BUCKET: ${{ vars.GLUE_FIXTURE_BUCKET }}
+          GLUE_ASSUME_ROLE_BASE_ACCESS_KEY_ID: ${{ secrets.GLUE_ASSUME_ROLE_BASE_ACCESS_KEY_ID }}
+          GLUE_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY: ${{ secrets.GLUE_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY }}
+          GLUE_ASSUME_ROLE_ARN: ${{ vars.GLUE_ASSUME_ROLE_ARN }}
+          GLUE_ASSUME_ROLE_EXTERNAL_ID: ${{ secrets.GLUE_ASSUME_ROLE_EXTERNAL_ID }}
         run: make test-e2e-glue
 
       - name: Dump Glue stack logs on failure

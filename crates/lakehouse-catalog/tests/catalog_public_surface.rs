@@ -14,8 +14,8 @@ use lakehouse_catalog::{
     PartitionFormat, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend, StorageCreds,
     StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
     catalog_identifier_string, load_table_any_auth, parse_glue_table_ident, parse_table_ident,
-    read_iceberg_metadata_file, redact_credentials, redact_secret_values,
-    resolve_aws_identity, resolve_uc_vended_storage, resolve_vended_storage,
+    read_iceberg_metadata_file, redact_credentials, redact_secret_values, resolve_aws_identity,
+    resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 const CATALOG_SOURCES: &[(&str, &str)] = &[

@@ -1563,6 +1563,42 @@ fn a_glue_connection_without_a_region_signs_for_the_standard_address_region() {
         .expect("the standard Glue address supplies the signing region");
 }
 
+/// Scenario: A Glue CONNECTION may name a role
+#[test]
+fn a_glue_connection_accepts_a_role_and_its_options() {
+    let password = glue_password(serde_json::json!({
+        "aws_assume_role_arn": "arn:aws:iam::123456789012:role/lakehouse-reader",
+        "aws_external_id": "EXTERNAL_ID_VALUE",
+        "aws_sts_endpoint": "https://sts.us-east-1.amazonaws.com",
+    }));
+    let resolved = read_connection(
+        &with_conn(GLUE_ADDRESS, &password),
+        Some("MY_CONN"),
+        CatalogKind::Glue,
+    )
+    .expect("a Glue CONNECTION naming a role must be accepted");
+
+    assert_eq!(
+        resolved.creds.assume_role_arn(),
+        Some("arn:aws:iam::123456789012:role/lakehouse-reader")
+    );
+    assert!(resolved.creds.use_sigv4);
+    assert!(
+        resolved.sealed_storage_key.is_some(),
+        "the session must be sealable for the scan"
+    );
+}
+
+/// Scenario: A Glue CONNECTION may name a role
+#[test]
+fn a_glue_connection_rejects_role_options_without_a_role() {
+    let msg = glue_error(serde_json::json!({ "aws_external_id": "EXTERNAL_ID_VALUE" }));
+
+    assert!(msg.contains("aws_external_id"), "{msg}");
+    assert!(msg.contains("aws_assume_role_arn"), "{msg}");
+    assert!(!msg.contains("EXTERNAL_ID_VALUE"), "{msg}");
+}
+
 const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
 const EXTERNAL_ID: &str = "EXTERNAL_ID_SENTINEL";
 const BASE_SECRET: &str = "BASE_SECRET_SENTINEL";

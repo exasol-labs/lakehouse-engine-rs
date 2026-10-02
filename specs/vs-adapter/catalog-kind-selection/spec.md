@@ -100,5 +100,5 @@ The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRes
 * *AND* the adapter SHALL reject `use_vended_credentials` true with an error stating that the Glue kind has no native credential vending
 * *AND* the adapter SHALL reject every supplied token or OAuth2 field with one error naming each supplied field
 * *AND* the SigV4 required-fields rule of `vs-adapter/connection-credentials-sigv4` SHALL apply, so the error names the missing `secret_key`, and a standard `https://glue.<region>.amazonaws.com` address supplies the signing region
-* *AND* `region`, `access_key`, `secret_key`, `session_token`, `endpoint`, and `path_style` SHALL keep their meaning, so the same keys sign the Glue and the S3 requests
+* *AND* `region`, `access_key`, `secret_key`, `session_token`, `endpoint`, and `path_style` SHALL keep their meaning, so the same keys sign the Glue and the S3 requests, unless the CONNECTION names a role, in which case the role's session replaces those keys for both, per `vs-adapter/connection-credentials-assume-role`
 * *AND* no error message SHALL contain a credential value

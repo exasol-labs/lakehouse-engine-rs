@@ -29,7 +29,7 @@ Find the row that matches your catalog. Then copy its recipe.
 |---|---|---|---|
 | [Local / generic Iceberg REST (no auth)](#local--generic-iceberg-rest-no-auth) | Iceberg REST | none | Supported |
 | [AWS Glue Iceberg REST](#aws-glue-iceberg-rest-sigv4) | Iceberg REST | SigV4 | Supported |
-| [AWS Glue Data Catalog (Iceberg and Hive Parquet tables)](#aws-glue-data-catalog-catalog_kind--glue) | Glue | SigV4 with static IAM credentials | Supported |
+| [AWS Glue Data Catalog (Iceberg and Hive Parquet tables)](#aws-glue-data-catalog-catalog_kind--glue) | Glue | SigV4 with static IAM credentials or an assumed IAM role | Supported |
 | [Generic REST with token / OAuth2](#generic-rest-with-static-token-or-oauth2) | Iceberg REST | bearer token or OAuth2 | Supported |
 | [Lakekeeper](#lakekeeper-oidc-via-keycloak--seaweedfs) | Iceberg REST | OAuth2 client-credentials (OIDC) | Supported |
 | [Unity Catalog (Delta and Parquet tables)](#unity-catalog-delta-and-parquet-tables) | Unity Catalog | none, PAT, or Databricks OAuth M2M | Supported |
