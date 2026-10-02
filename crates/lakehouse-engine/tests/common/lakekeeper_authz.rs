@@ -1,10 +1,9 @@
 //! Permission fixture for the Lakekeeper `lakekeeper-e2e` suite: OpenFGA-backed grants for
-//! three test principals, `batch-check` calls, and the fixture codec.
+//! three test principals, `batch-check` calls, and the fixture normalizer.
 //! Helpers panic, never skip, and never put a secret or token in a panic message.
 #![cfg(feature = "lakekeeper-e2e")]
 
 use std::collections::BTreeMap;
-use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use base64::Engine;
@@ -20,6 +19,8 @@ pub const AUTHZ_NAMESPACE: &str = "authz";
 pub const TABLE_ALPHA: &str = "authz_alpha";
 pub const TABLE_BETA: &str = "authz_beta";
 pub const TABLE_MISSING: &str = "authz_missing";
+
+const ERROR_ID_PREFIX: &str = "Error ID: ";
 
 /// The id every batch check carries, so a denied and a missing table answer identically.
 pub const CHECK_ID: &str = "read-data";
@@ -207,18 +208,45 @@ impl AuthzFixture {
             .unwrap_or_else(|| panic!("'{table}' is not a fixture table"))
     }
 
-    pub fn substitutions(&self) -> Substitutions {
-        let mut pairs = vec![
-            ("<warehouse-id>".to_string(), self.warehouse_id.clone()),
-            ("<namespace-id>".to_string(), self.namespace_id.clone()),
-        ];
+    fn placeholders(&self) -> Vec<(String, &str)> {
+        let mut pairs = vec![("<warehouse-id>".to_string(), self.warehouse_id.as_str())];
         for (table, id) in &self.table_ids {
-            pairs.push((format!("<table-id:{table}>"), id.clone()));
+            pairs.push((format!("<table-id:{table}>"), id));
         }
         for (client_id, id) in &self.principal_ids {
-            pairs.push((format!("<principal:{client_id}>"), id.clone()));
+            pairs.push((format!("<principal:{client_id}>"), id));
         }
-        Substitutions::new(pairs)
+        pairs
+    }
+
+    /// Turns a fixture document (`{case, caller, request, response}`) into its committed form:
+    /// the live warehouse, table and principal ids and the `Error ID:` value become placeholders.
+    pub fn normalize(&self, live: &Value) -> Value {
+        let mut text = live.to_string();
+        for (placeholder, id) in self.placeholders() {
+            text = text.replace(id, &placeholder);
+        }
+        let mut document: Value =
+            serde_json::from_str(&text).expect("a substituted JSON document stays valid JSON");
+        let stack = document.pointer_mut("/response/body/error/stack");
+        for line in stack.and_then(Value::as_array_mut).into_iter().flatten() {
+            if line
+                .as_str()
+                .is_some_and(|l| l.starts_with(ERROR_ID_PREFIX))
+            {
+                *line = json!(format!("{ERROR_ID_PREFIX}<error-id>"));
+            }
+        }
+        document
+    }
+
+    pub fn carries_secret_or_live_id(&self, text: &str) -> bool {
+        let secrets = PRINCIPALS.iter().map(|p| p.client_secret);
+        let live_ids = self.placeholders().into_iter().map(|(_, id)| id);
+        secrets
+            .chain(live_ids)
+            .chain(["eyJ"])
+            .any(|forbidden| text.contains(forbidden))
     }
 
     pub fn read_check(&self, principal: &Principal, table: &str) -> Value {
@@ -305,9 +333,9 @@ impl AuthzFixture {
         }
     }
 
-    /// Replaces the checker's grants with exactly `grants`; a no-op when it already holds them.
-    pub fn set_checker_assignments(&self, grants: &[Grant]) {
-        let user_id = self.principal_id(&CHECKER);
+    /// Replaces the principal's grants with exactly `grants`; a no-op when it already holds them.
+    pub fn set_assignments(&self, principal: &Principal, grants: &[Grant]) {
+        let user_id = self.principal_id(principal);
         for scope in ALL_SCOPES {
             let wanted: Vec<&str> = grants
                 .iter()
@@ -402,7 +430,8 @@ fn ensure_table(warehouse_id: &str, table: &str) -> String {
         .to_string()
 }
 
-fn provision_authz_fixture() -> AuthzFixture {
+/// Not cached: every call re-reconciles the grants. Prefer `ensure_authz_fixture`.
+pub fn provision_authz_fixture() -> AuthzFixture {
     lakekeeper::lakekeeper_create_warehouse(&WarehouseProfile::authz());
     let warehouse_id = warehouse_id_by_name(WAREHOUSE_AUTHZ);
 
@@ -428,14 +457,14 @@ fn provision_authz_fixture() -> AuthzFixture {
         scope: Scope::Table(table),
         relation: "select",
     };
-    fixture.ensure_grant(fixture.principal_id(&READER_A), select(TABLE_ALPHA));
-    fixture.ensure_grant(fixture.principal_id(&READER_B), select(TABLE_BETA));
+    fixture.set_assignments(&READER_A, &[select(TABLE_ALPHA)]);
+    fixture.set_assignments(&READER_B, &[select(TABLE_BETA)]);
     fixture
 }
 
 /// Idempotent: warehouse `lakehouse_authz`, namespace `authz`, tables `authz_alpha` and
-/// `authz_beta`, and `select` on the first for reader A and on the second for reader B.
-/// The server must already be bootstrapped.
+/// `authz_beta`, and exactly `select` on the first for reader A and on the second for reader B;
+/// any other grant of either reader is removed. The server must already be bootstrapped.
 pub fn ensure_authz_fixture() -> &'static AuthzFixture {
     static FIXTURE: OnceLock<AuthzFixture> = OnceLock::new();
     FIXTURE.get_or_init(provision_authz_fixture)
@@ -452,171 +481,6 @@ pub fn post_batch_check(caller_token: &str, request: &Value) -> Exchange {
 
 pub fn batch_check(caller_token: &str, checks: &[Value]) -> Exchange {
     post_batch_check(caller_token, &batch_check_request(checks))
-}
-
-/// Maps between live ids and the placeholders a committed fixture carries.
-pub struct Substitutions {
-    pairs: Vec<(String, String)>,
-}
-
-const ERROR_ID_PREFIX: &str = "Error ID: ";
-const UUID_LEN: usize = 36;
-
-impl Substitutions {
-    /// Each pair is `(placeholder, live value)`.
-    pub fn new(pairs: Vec<(String, String)>) -> Self {
-        Substitutions { pairs }
-    }
-
-    pub fn normalize(&self, live: &Value) -> Value {
-        let mut text = live.to_string();
-        for (placeholder, live_value) in &self.pairs {
-            text = text.replace(live_value, placeholder);
-        }
-        reparse(&replace_error_ids(&text))
-    }
-
-    fn live_values(&self) -> impl Iterator<Item = &str> {
-        self.pairs.iter().map(|(_, live)| live.as_str())
-    }
-}
-
-fn reparse(text: &str) -> Value {
-    serde_json::from_str(text).expect("a substituted JSON document stays valid JSON")
-}
-
-/// Lakekeeper stamps a fresh `Error ID: <uuid>` on every error.
-fn replace_error_ids(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(at) = rest.find(ERROR_ID_PREFIX) {
-        let after = at + ERROR_ID_PREFIX.len();
-        out.push_str(&rest[..after]);
-        let id = rest.get(after..after + UUID_LEN);
-        if id.is_some_and(|id| id.chars().all(|c| c.is_ascii_hexdigit() || c == '-')) {
-            out.push_str("<error-id>");
-            rest = &rest[after + UUID_LEN..];
-        } else {
-            rest = &rest[after..];
-        }
-    }
-    out.push_str(rest);
-    out
-}
-
-/// `None` when `live` and `fixture` agree on keys and JSON value types at every depth, and
-/// on `status`, every `allowed`, and `error.type` and `error.code`. Message text may differ.
-/// `live` and `fixture` are `Exchange::to_value` documents (`{status, body}`); `status` is
-/// compared exactly only at the root.
-pub fn shape_mismatch(live: &Value, fixture: &Value) -> Option<String> {
-    shape_diff(live, fixture, "$")
-}
-
-fn value_type(value: &Value) -> &'static str {
-    match value {
-        Value::Null => "null",
-        Value::Bool(_) => "bool",
-        Value::Number(_) => "number",
-        Value::String(_) => "string",
-        Value::Array(_) => "array",
-        Value::Object(_) => "object",
-    }
-}
-
-fn is_exact_path(path: &str) -> bool {
-    path == "$.status"
-        || path.ends_with(".allowed")
-        || path.ends_with(".error.type")
-        || path.ends_with(".error.code")
-}
-
-fn shape_diff(live: &Value, fixture: &Value, path: &str) -> Option<String> {
-    match (live, fixture) {
-        (Value::Object(l), Value::Object(f)) => {
-            let live_keys: Vec<&String> = l.keys().collect();
-            let fixture_keys: Vec<&String> = f.keys().collect();
-            if live_keys != fixture_keys {
-                return Some(format!(
-                    "{path}: keys differ, live {live_keys:?} vs fixture {fixture_keys:?}"
-                ));
-            }
-            f.iter()
-                .find_map(|(key, fv)| shape_diff(&l[key], fv, &format!("{path}.{key}")))
-        }
-        (Value::Array(l), Value::Array(f)) => {
-            if l.len() != f.len() {
-                return Some(format!(
-                    "{path}: array length {} vs fixture {}",
-                    l.len(),
-                    f.len()
-                ));
-            }
-            l.iter()
-                .zip(f)
-                .find_map(|(lv, fv)| shape_diff(lv, fv, &format!("{path}[]")))
-        }
-        _ => {
-            if value_type(live) != value_type(fixture) {
-                return Some(format!(
-                    "{path}: type {} vs fixture {}",
-                    value_type(live),
-                    value_type(fixture)
-                ));
-            }
-            (is_exact_path(path) && live != fixture)
-                .then(|| format!("{path}: value {live} vs fixture {fixture}"))
-        }
-    }
-}
-
-/// Everything a committed fixture must not carry: client secrets, a token prefix, live ids.
-pub fn fixture_leaks(text: &str, substitutions: &Substitutions) -> Vec<String> {
-    let mut leaks = Vec::new();
-    for principal in PRINCIPALS {
-        if text.contains(principal.client_secret) {
-            leaks.push(format!("the secret of '{}'", principal.client_id));
-        }
-    }
-    if text.contains("eyJ") {
-        leaks.push("a token prefix".to_string());
-    }
-    for live in substitutions.live_values() {
-        if text.contains(live) {
-            leaks.push(format!("the live value '{live}'"));
-        }
-    }
-    leaks
-}
-
-pub const CAPTURE_VARIABLE: &str = "LH_LAKEKEEPER_FIXTURE_CAPTURE";
-
-pub fn capture_requested() -> bool {
-    std::env::var(CAPTURE_VARIABLE).is_ok_and(|v| v == "1")
-}
-
-fn fixture_path(case: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../lakehouse-catalog/tests/fixtures/lakekeeper/batch-check")
-        .join(format!("{case}.json"))
-}
-
-pub fn write_fixture(case: &str, fixture: &Value) {
-    let path = fixture_path(case);
-    std::fs::create_dir_all(path.parent().expect("fixture directory"))
-        .unwrap_or_else(|e| panic!("create fixture directory for '{case}': {e}"));
-    let text = serde_json::to_string_pretty(fixture).expect("fixture serializes") + "\n";
-    std::fs::write(&path, text).unwrap_or_else(|e| panic!("write fixture {}: {e}", path.display()));
-}
-
-pub fn read_fixture_text(case: &str) -> String {
-    let path = fixture_path(case);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| {
-        panic!(
-            "fixture {} is missing ({e}); capture it with \
-             `{CAPTURE_VARIABLE}=1 make test-e2e-lakekeeper`",
-            path.display()
-        )
-    })
 }
 
 #[cfg(test)]

@@ -29,24 +29,23 @@ Live ids change with every stack, so a file holds placeholders in their place.
 | Placeholder | Stands for |
 |-------------|------------|
 | `<warehouse-id>` | the id of warehouse `lakehouse_authz` |
-| `<namespace-id>` | the id of namespace `authz` |
 | `<table-id:authz_alpha>` | the table id of that table (also `authz_beta`) |
 | `<principal:lakehouse-reader-a>` | the Lakekeeper user id of that Keycloak client (also `-reader-b`, `-checker`, and `lakehouse`) |
 | `<error-id>` | the value after `Error ID: ` in an error stack |
 
-## Capture and drift check
+## Drift check and regeneration
 
 `authz_batch_check_fixtures_match_live_contract` in
-`crates/lakehouse-engine/tests/e2e_lakekeeper_test.rs` compares each live exchange with its file. It
-requires the same request, the same keys and JSON value types at every depth, and the same `status`,
-`allowed`, `error.type`, and `error.code`. Message text may differ. It also fails when a file holds a
-client secret, a token prefix, or a live id.
+`crates/lakehouse-engine/tests/e2e_lakekeeper_test.rs` normalizes each live exchange (the known live
+warehouse, table and principal ids and the `Error ID:` value become the placeholders above) and compares
+it with its file on the request, `status`, `results`, `error.type`, and `error.code`. Message text may
+differ. It also fails when a file holds a client secret, a token prefix, or a live id.
 
 ```bash
 LH_LAKEKEEPER_FIXTURE_CAPTURE=1 make test-e2e-lakekeeper
 ```
 
-rewrites the files from the live stack instead of comparing. A second capture changes nothing.
+writes the normalized live exchanges over the files instead of comparing. A second run changes nothing.
 
 ## Findings for #415
 
@@ -63,21 +62,27 @@ by hand against OpenFGA `v1.14.2` during implementation.
   Asserted by `authz_batch_check_fixtures_match_live_contract`.
 - The management API is mounted at the server root, beside the catalog path: from the catalog URI
   `http://host:port/catalog`, `http://host:port/management/v1/info` answers 200. Asserted by
-  `authz_management_api_is_mounted_beside_catalog_path`.
+  `authz_management_api_is_mounted_beside_catalog_path_on_local_topology`, which covers the unprefixed
+  local topology only.
 - Lakekeeper builds both bases from the same base URL, and `x-forwarded-prefix` moves them together.
-  Planning probe 2026-09-30, not suite-asserted. Re-run: the catalog base in `/catalog/v1/config`
-  (`overrides.uri`) moved to `/lk/catalog` under `x-forwarded-prefix: /lk`; the management base was
-  not re-checked. The routes stay at the root, so a gateway that rewrites paths is the case that
-  breaks deriving the management base from the catalog URI. No config value names the management API.
+  This comes from Lakekeeper source analysis (v0.13.1) and is not suite-asserted. A planning probe
+  2026-09-30, re-run, saw the catalog base in `/catalog/v1/config` (`overrides.uri`) move to
+  `/lk/catalog` under `x-forwarded-prefix: /lk`; the management base was not re-checked live. The
+  routes stay at the root, so a gateway that rewrites paths is the case that breaks deriving the
+  management base from the catalog URI. No config value names the management API, so #415 still needs
+  an explicit management-base property for path-rewriting gateways.
 
 ### Principal ids
 
-- A user id is `oidc~<sub>`, the primary provider's id and the token subject. On Keycloak a
-  client-credentials token has no `oid`, so `sub` is an opaque UUID; `preferred_username`
-  (`service-account-<client-id>`) plays no part. Asserted by
-  `authz_principal_id_is_idp_prefix_and_token_subject`.
+- A direct client-credentials login has the user id `oidc~<sub>`, the primary provider's id and the
+  token subject. On Keycloak such a token has no `oid`, so `sub` is an opaque UUID;
+  `preferred_username` (`service-account-<client-id>`) plays no part. Asserted by
+  `authz_direct_login_principal_id_is_idp_prefix_and_token_subject`.
 - A grant to a never-registered id (`oidc~template-user@corp`) takes effect, and a check for that id
-  answers `allowed: true`. Asserted by `authz_principal_id_is_idp_prefix_and_token_subject`.
+  answers `allowed: true`. Asserted by `authz_direct_login_principal_id_is_idp_prefix_and_token_subject`.
+- Not proven, open question for #415 (#TBD): that the id produced from an Exasol user through #415's
+  proposed `USER_MAPPING` template matches an existing grant. The suite proves the id of a direct login
+  and that Lakekeeper accepts an arbitrary grant id, not what a template yields for a given Exasol user.
 - `LAKEKEEPER__OPENID_SUBJECT_CLAIM=preferred_username` changes the id to
   `oidc~service-account-<client-id>`. Planning probe 2026-09-30, not suite-asserted. Re-run.
 - A malformed identity (`alice`) answers 422 with a plain-text body naming the expected format
