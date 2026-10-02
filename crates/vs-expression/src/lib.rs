@@ -124,34 +124,87 @@ fn declared_scalar_fn(name: &str) -> Option<ExasolForm> {
         .map(|(_, form)| *form)
 }
 
-const CHARACTER_RESULT_FNS: &[&str] = &[
-    "LOWER",
-    "UPPER",
-    "SUBSTR",
-    "TRIM",
-    "LTRIM",
-    "RTRIM",
-    "REPLACE",
-    "REPEAT",
-    "REVERSE",
-    "LPAD",
-    "RPAD",
-    "CHR",
-    "INITCAP",
-    "LEFT",
-    "RIGHT",
-    "TRANSLATE",
-    "UNICODECHR",
-    "CONCAT",
+/// Which arguments Exasol converts to text before evaluating the call (#227).
+#[derive(Clone, Copy)]
+enum ConvertedArgs {
+    None,
+    All,
+    First,
+    FirstAndThird,
+    FirstTwo,
+}
+
+impl ConvertedArgs {
+    fn includes(self, index: usize) -> bool {
+        match self {
+            Self::None => false,
+            Self::All => true,
+            Self::First => index == 0,
+            Self::FirstAndThird => index == 0 || index == 2,
+            Self::FirstTwo => index < 2,
+        }
+    }
+}
+
+/// The one declaration of a string function's argument conversion and result family;
+/// every name must also be a `TRANSLATED_SCALAR_FNS` row. A declared function absent here
+/// converts no argument and returns a non-character result.
+struct StringFnRule {
+    name: &'static str,
+    converted: ConvertedArgs,
+    character_result: bool,
+}
+
+const fn rule(
+    name: &'static str,
+    converted: ConvertedArgs,
+    character_result: bool,
+) -> StringFnRule {
+    StringFnRule {
+        name,
+        converted,
+        character_result,
+    }
+}
+
+const STRING_FN_RULES: &[StringFnRule] = &[
+    rule("CONCAT", ConvertedArgs::All, true),
+    rule("TRIM", ConvertedArgs::All, true),
+    rule("LTRIM", ConvertedArgs::All, true),
+    rule("RTRIM", ConvertedArgs::All, true),
+    rule("REPLACE", ConvertedArgs::All, true),
+    rule("TRANSLATE", ConvertedArgs::All, true),
+    rule("LOWER", ConvertedArgs::First, true),
+    rule("UPPER", ConvertedArgs::First, true),
+    rule("INITCAP", ConvertedArgs::First, true),
+    rule("REVERSE", ConvertedArgs::First, true),
+    rule("SUBSTR", ConvertedArgs::First, true),
+    rule("REPEAT", ConvertedArgs::First, true),
+    rule("LEFT", ConvertedArgs::First, true),
+    rule("RIGHT", ConvertedArgs::First, true),
+    rule("LPAD", ConvertedArgs::FirstAndThird, true),
+    rule("RPAD", ConvertedArgs::FirstAndThird, true),
+    rule("CHR", ConvertedArgs::None, true),
+    rule("UNICODECHR", ConvertedArgs::None, true),
+    rule("ASCII", ConvertedArgs::First, false),
+    rule("LENGTH", ConvertedArgs::First, false),
+    rule("OCTET_LENGTH", ConvertedArgs::First, false),
+    rule("UNICODE", ConvertedArgs::First, false),
+    rule("INSTR", ConvertedArgs::FirstTwo, false),
+    rule("LOCATE", ConvertedArgs::FirstTwo, false),
 ];
+
+fn string_fn_rule(fn_name: &str) -> Option<&'static StringFnRule> {
+    STRING_FN_RULES
+        .iter()
+        .find(|rule| rule.name.eq_ignore_ascii_case(fn_name))
+}
 
 /// Whether translated scalar function `fn_name` (any case) returns character text whatever
 /// its argument types. The adapter types a nested MIN/MAX partial from this, so every
-/// `TRANSLATED_SCALAR_FNS` row needs a classification (#227).
+/// `TRANSLATED_SCALAR_FNS` row is classified by [`STRING_FN_RULES`] (#227).
 pub fn scalar_fn_returns_character(fn_name: &str) -> bool {
-    CHARACTER_RESULT_FNS
-        .iter()
-        .any(|name| name.eq_ignore_ascii_case(fn_name))
+    string_fn_rule(fn_name).is_some_and(|rule| rule.character_result)
 }
 
 fn sql_escape(s: &str) -> String {
@@ -276,14 +329,7 @@ fn render_args(args: &[Json], dialect: Dialect) -> Result<Vec<String>, UdfError>
 /// evaluates the call (#227). The renderer wraps these arguments syntactically, because it
 /// knows no column types.
 fn is_string_converted_arg(fn_name: &str, index: usize) -> bool {
-    match fn_name {
-        "CONCAT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "TRANSLATE" => true,
-        "LOWER" | "UPPER" | "ASCII" | "INITCAP" | "REVERSE" | "LENGTH" | "OCTET_LENGTH"
-        | "UNICODE" | "SUBSTR" | "REPEAT" | "LEFT" | "RIGHT" => index == 0,
-        "LPAD" | "RPAD" => index == 0 || index == 2,
-        "INSTR" | "LOCATE" => index < 2,
-        _ => false,
-    }
+    string_fn_rule(fn_name).is_some_and(|rule| rule.converted.includes(index))
 }
 
 fn is_string_cast_target(data_type: &Json) -> bool {

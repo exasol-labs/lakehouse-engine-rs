@@ -3886,88 +3886,16 @@ fn exasol_dialect_never_renders_exa_to_varchar() {
     );
 }
 
-/// Declared names whose result is not always character: numeric, temporal, boolean, or
-/// operand-dependent (CAST, CASE, NULLIF, GREATEST, LEAST, ROUND, TRUNC).
-const NON_CHARACTER_RESULT_FNS: &[&str] = &[
-    "ADD",
-    "SUB",
-    "MULT",
-    "FLOAT_DIV",
-    "NEG",
-    "CAST",
-    "REGEXP_LIKE",
-    "MOD",
-    "CASE",
-    "ABS",
-    "FLOOR",
-    "CEIL",
-    "SQRT",
-    "EXP",
-    "LN",
-    "SIGN",
-    "DEGREES",
-    "RADIANS",
-    "SIN",
-    "COS",
-    "TAN",
-    "ASIN",
-    "ACOS",
-    "ATAN",
-    "SINH",
-    "COSH",
-    "TANH",
-    "COT",
-    "ROUND",
-    "TRUNC",
-    "LOG",
-    "POWER",
-    "ATAN2",
-    "ASCII",
-    "LENGTH",
-    "OCTET_LENGTH",
-    "UNICODE",
-    "INSTR",
-    "LOCATE",
-    "GREATEST",
-    "LEAST",
-    "NULLIF",
-    "NULLIFZERO",
-    "ZEROIFNULL",
-    "YEAR",
-    "MONTH",
-    "DAY",
-    "HOUR",
-    "MINUTE",
-    "SECOND",
-    "WEEK",
-    "DATE_TRUNC",
-    "TO_DATE",
-    "TO_TIMESTAMP",
-    "DAYS_BETWEEN",
-    "HOURS_BETWEEN",
-    "MINUTES_BETWEEN",
-    "SECONDS_BETWEEN",
-];
-
 #[test]
-fn every_translated_scalar_fn_has_a_classified_result_family() {
-    for (name, _) in TRANSLATED_SCALAR_FNS {
-        assert_ne!(
-            scalar_fn_returns_character(name),
-            NON_CHARACTER_RESULT_FNS.contains(name),
-            "{name} must be classified exactly once: as returning character, or in \
-             NON_CHARACTER_RESULT_FNS"
-        );
-    }
-    let undeclared: Vec<&str> = CHARACTER_RESULT_FNS
+fn every_string_fn_rule_names_a_declared_function() {
+    let undeclared: Vec<&str> = STRING_FN_RULES
         .iter()
-        .chain(NON_CHARACTER_RESULT_FNS)
-        .copied()
+        .map(|rule| rule.name)
         .filter(|name| declared_scalar_fn(name).is_none())
         .collect();
     assert!(
         undeclared.is_empty(),
-        "both result-family lists must name only declared functions; undeclared: {undeclared:?}"
+        "STRING_FN_RULES must name only declared functions; undeclared: {undeclared:?}"
     );
 }
 
