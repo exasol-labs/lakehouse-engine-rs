@@ -464,7 +464,7 @@ pub fn provision_authz_fixture() -> AuthzFixture {
 
 /// Idempotent: warehouse `lakehouse_authz`, namespace `authz`, tables `authz_alpha` and
 /// `authz_beta`, and exactly `select` on the first for reader A and on the second for reader B;
-/// any other grant of either reader is removed. The server must already be bootstrapped.
+/// any other grant of either reader in the fixture's enumerated scopes is removed. The server must already be bootstrapped.
 pub fn ensure_authz_fixture() -> &'static AuthzFixture {
     static FIXTURE: OnceLock<AuthzFixture> = OnceLock::new();
     FIXTURE.get_or_init(provision_authz_fixture)

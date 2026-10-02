@@ -772,7 +772,7 @@ fn authz_fixture_provisioning_removes_a_stale_reader_grant() {
 }
 
 /// Proves only a direct client-credentials login. It does NOT prove that the id #415's
-/// `USER_MAPPING` template derives from an Exasol user matches an existing grant (#TBD).
+/// `USER_MAPPING` template derives from an Exasol user matches an existing grant (#415).
 #[test]
 fn authz_direct_login_principal_id_is_idp_prefix_and_token_subject() {
     let fixture = authz_fixture();
@@ -964,8 +964,13 @@ fn authz_batch_check_fixtures_match_live_contract() {
     for case in &FIXTURE_CASES {
         let live = normalized_exchange(fixture, case);
         let path = fixture_path(case.name);
-        if std::env::var_os(CAPTURE_VARIABLE).is_some() {
+        if std::env::var(CAPTURE_VARIABLE).as_deref() == Ok("1") {
             let text = serde_json::to_string_pretty(&live).expect("fixture serializes") + "\n";
+            assert!(
+                !fixture.carries_secret_or_live_id(&text),
+                "captured fixture '{}' carries a secret, a token, or a live id",
+                case.name
+            );
             std::fs::write(&path, text).unwrap_or_else(|e| panic!("write {path}: {e}"));
             continue;
         }

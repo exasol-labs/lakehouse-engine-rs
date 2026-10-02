@@ -80,7 +80,7 @@ by hand against OpenFGA `v1.14.2` during implementation.
   `authz_direct_login_principal_id_is_idp_prefix_and_token_subject`.
 - A grant to a never-registered id (`oidc~template-user@corp`) takes effect, and a check for that id
   answers `allowed: true`. Asserted by `authz_direct_login_principal_id_is_idp_prefix_and_token_subject`.
-- Not proven, open question for #415 (#TBD): that the id produced from an Exasol user through #415's
+- Not proven, requirement moved to #415: that the id produced from an Exasol user through #415's
   proposed `USER_MAPPING` template matches an existing grant. The suite proves the id of a direct login
   and that Lakekeeper accepts an arbitrary grant id, not what a template yields for a given Exasol user.
 - `LAKEKEEPER__OPENID_SUBJECT_CLAIM=preferred_username` changes the id to
