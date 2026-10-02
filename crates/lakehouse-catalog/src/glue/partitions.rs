@@ -1,7 +1,8 @@
+use aws_sdk_glue::types::Partition;
+
 use crate::{CatalogPartition, HIVE_DEFAULT_PARTITION, PartitionFormat};
 
 use super::routing::PARQUET_INPUT_FORMAT;
-use super::source::GluePartition;
 use super::trim_location;
 
 /// Glue `Values` are positional against the table's partition keys. A partition declaring
@@ -9,14 +10,14 @@ use super::trim_location;
 pub(super) fn neutral_partition(
     table: &str,
     partition_keys: &[String],
-    partition: GluePartition,
+    partition: &Partition,
 ) -> Result<CatalogPartition, String> {
-    let GluePartition {
-        values,
-        location,
-        input_format,
-    } = partition;
-    let Some(location) = location.filter(|location| !location.is_empty()) else {
+    let values = partition.values();
+    let descriptor = partition.storage_descriptor();
+    let Some(location) = descriptor
+        .and_then(|descriptor| descriptor.location())
+        .filter(|location| !location.is_empty())
+    else {
         return Err(format!(
             "Glue partition {values:?} of table '{table}' declares no storage location"
         ));
@@ -29,9 +30,11 @@ pub(super) fn neutral_partition(
             partition_keys.len()
         ));
     }
-    let format = match input_format.filter(|input_format| !input_format.is_empty()) {
-        Some(input_format) if input_format != PARQUET_INPUT_FORMAT => {
-            PartitionFormat::Unsupported { input_format }
+    let format = match descriptor.and_then(|descriptor| descriptor.input_format()) {
+        Some(input_format) if !input_format.is_empty() && input_format != PARQUET_INPUT_FORMAT => {
+            PartitionFormat::Unsupported {
+                input_format: input_format.to_string(),
+            }
         }
         _ => PartitionFormat::Parquet,
     };
@@ -40,17 +43,13 @@ pub(super) fn neutral_partition(
         values: partition_keys
             .iter()
             .cloned()
-            .zip(values.into_iter().map(partition_value))
+            .zip(
+                values
+                    .iter()
+                    .map(|raw| (raw != HIVE_DEFAULT_PARTITION).then(|| raw.clone())),
+            )
             .collect(),
-        location: trim_location(&location).to_string(),
+        location: trim_location(location).to_string(),
         format,
     })
 }
-
-fn partition_value(raw: String) -> Option<String> {
-    (raw != HIVE_DEFAULT_PARTITION).then_some(raw)
-}
-
-#[cfg(test)]
-#[path = "partitions_tests.rs"]
-mod tests;

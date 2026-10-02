@@ -78,41 +78,44 @@ pub(crate) fn creds_no_auth() -> ConnectionCreds {
     }
 }
 
-/// Answers every request with HTTP 200 and `body`, recording each request head in order.
+/// Answers every request with HTTP 200 and `body`, recording each request in order.
 pub(crate) async fn spawn_recording_catalog(
     body: &'static str,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
-    spawn_recording_server(200, "application/json", body.into()).await
+    spawn_server("application/json", move |_| (200, body.into())).await
 }
 
-/// Answers every request with HTTP `status` and the XML `body`, recording each request head as [`spawn_recording_catalog`] does.
+/// Answers every request with HTTP `status` and the XML `body`, recording each request in order.
 pub(crate) async fn spawn_recording_sts(
     status: u16,
     body: impl Into<String>,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
-    spawn_recording_server(status, "text/xml", body.into()).await
+    let body = body.into();
+    spawn_server("text/xml", move |_| (status, body.clone())).await
 }
 
-async fn spawn_recording_server(
-    status: u16,
+/// Answers each request, head and body, with the status and body `respond` returns for it,
+/// recording each request in order.
+pub(crate) async fn spawn_server(
     content_type: &'static str,
-    body: String,
+    respond: impl Fn(&str) -> (u16, String) + Send + 'static,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a loopback port");
     let base_uri = format!("http://{}", listener.local_addr().expect("local_addr"));
-    let heads = Arc::new(Mutex::new(Vec::new()));
-    let recorded = heads.clone();
-    let reason = reqwest::StatusCode::from_u16(status)
-        .ok()
-        .and_then(|code| code.canonical_reason())
-        .unwrap_or("Stub");
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
 
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
-            let head = read_request_head(&mut stream).await;
-            recorded.lock().unwrap().push(head);
+            let request = read_request(&mut stream).await;
+            let (status, body) = respond(&request);
+            recorded.lock().unwrap().push(request);
+            let reason = reqwest::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|code| code.canonical_reason())
+                .unwrap_or("Stub");
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
                  Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -122,33 +125,50 @@ async fn spawn_recording_server(
         }
     });
 
-    (base_uri, heads)
+    (base_uri, requests)
 }
 
-async fn read_request_head(stream: &mut TcpStream) -> String {
-    let mut head = Vec::new();
+async fn read_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
     let mut chunk = [0u8; 1024];
-    while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+    loop {
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&request[..end]);
+            let length =
+                header_value(&head, "content-length").map_or(0, |n| n.parse().unwrap_or(0));
+            if request.len() >= end + 4 + length {
+                break;
+            }
+        }
         let read = stream.read(&mut chunk).await.unwrap_or(0);
         if read == 0 {
             break;
         }
-        head.extend_from_slice(&chunk[..read]);
+        request.extend_from_slice(&chunk[..read]);
     }
-    String::from_utf8_lossy(&head).into_owned()
+    String::from_utf8_lossy(&request).into_owned()
 }
 
 pub(crate) fn authorization_header(head: &str) -> Option<&str> {
     header_value(head, "authorization")
 }
 
-/// The value of header `name` in a recorded request head, matched
+/// The value of header `name` in a recorded request, matched
 /// case-insensitively, or `None` when the request did not carry it.
-pub(crate) fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
-    head.lines().skip(1).find_map(|line| {
-        let (header, value) = line.split_once(':')?;
-        header.eq_ignore_ascii_case(name).then(|| value.trim())
-    })
+pub(crate) fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+}
+
+/// The body of a recorded request.
+pub(crate) fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
 }
 
 /// The session credentials [`ASSUME_ROLE_RESPONSE`] carries.

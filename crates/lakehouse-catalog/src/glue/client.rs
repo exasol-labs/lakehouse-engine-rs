@@ -2,6 +2,8 @@ use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use aws_sdk_glue::error::{ProvideErrorMetadata, SdkError};
+use aws_sdk_glue::types::{Column, Table};
 use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
 
@@ -12,19 +14,21 @@ use crate::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
     CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds, PartitionFormat,
     SkipReason, SkippedTable, StorageBackend, TableFormat, catalog_identifier_string,
+    read_iceberg_metadata_file,
 };
 
 use super::partitions::neutral_partition;
 use super::routing::{Route, route};
-use super::sdk::SdkGlueSource;
-use super::source::{GlueColumn, GlueFailure, GlueSource, GlueTable};
+use super::sdk::{catalog_id, error_text, glue_client, next_page_token};
 use super::trim_location;
 
 const METADATA_READ_CONCURRENCY: usize = 16;
 
 /// Glue Data Catalog metadata as neutral tables and partitions.
 pub struct GlueCatalogSession {
-    source: Box<dyn GlueSource>,
+    client: aws_sdk_glue::Client,
+    storage: StorageBackend,
+    catalog_id: Option<String>,
     secrets: Vec<String>,
 }
 
@@ -43,18 +47,11 @@ impl GlueCatalogSession {
             .map(str::to_string)
             .collect();
         Ok(Self {
-            source: Box::new(SdkGlueSource::new(address, storage, &creds, region)),
+            client: glue_client(address, &creds, region),
+            storage,
+            catalog_id: catalog_id(&creds.warehouse),
             secrets,
         })
-    }
-
-    /// The table as a pushdown plans it, from `GetTable` alone: an Iceberg table carries its
-    /// metadata location and no column, because the Iceberg planner reads the metadata file.
-    pub async fn load_table_for_planning(
-        &self,
-        ident: &CatalogTableIdent,
-    ) -> Result<CatalogTable, UdfError> {
-        self.load(ident, false).await
     }
 
     /// The registered partitions of a Parquet table, each value keyed by its partition column.
@@ -79,77 +76,73 @@ impl GlueCatalogSession {
         }
         let database = glue_database(&ident.namespace)?;
         let name = catalog_identifier_string(ident);
-        self.source
-            .partitions(database, &ident.name)
-            .await
-            .map_err(|failure| self.glue_error("GetPartitions", &table_subject(ident), &failure))?
-            .into_iter()
-            .map(|partition| {
-                neutral_partition(&name, &table.partition_columns, partition)
-                    .map_err(|message| UdfError::User(self.redact(&message)))
-            })
-            .collect()
-    }
-
-    async fn get_table(&self, ident: &CatalogTableIdent) -> Result<GlueTable, UdfError> {
-        let database = glue_database(&ident.namespace)?;
-        let subject = table_subject(ident);
-        self.source
-            .table(database, &ident.name)
-            .await
-            .map_err(|failure| self.glue_error("GetTable", &subject, &failure))?
-            .ok_or_else(|| UdfError::User(format!("Glue GetTable returned no table for {subject}")))
-    }
-
-    async fn load(
-        &self,
-        ident: &CatalogTableIdent,
-        read_metadata: bool,
-    ) -> Result<CatalogTable, UdfError> {
-        let table = self.get_table(ident).await?;
-        let route = route_of(&table);
-        self.neutral_table(ident.clone(), table, route, read_metadata)
-            .await
-    }
-
-    /// `read_metadata` decides whether an Iceberg table takes its columns from its metadata file.
-    async fn neutral_table(
-        &self,
-        ident: CatalogTableIdent,
-        table: GlueTable,
-        route: Route,
-        read_metadata: bool,
-    ) -> Result<CatalogTable, UdfError> {
-        match route {
-            Route::Iceberg { metadata_location } if read_metadata => {
-                self.iceberg_table(ident, metadata_location).await
+        let mut partitions = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self
+                .client
+                .get_partitions()
+                .set_catalog_id(self.catalog_id.clone())
+                .database_name(database)
+                .table_name(&ident.name)
+                .exclude_column_schema(true)
+                .set_next_token(token.take())
+                .send()
+                .await
+                .map_err(|error| self.glue_error("GetPartitions", &table_subject(ident), &error))?;
+            for partition in page.partitions() {
+                partitions.push(
+                    neutral_partition(&name, &table.partition_columns, partition)
+                        .map_err(|message| UdfError::User(self.redact(&message)))?,
+                );
             }
-            Route::Iceberg { metadata_location } => Ok(CatalogTable {
-                ident,
-                table_type: CatalogTableType::Table,
-                storage_location: table_location(&table),
-                format: TableFormat::Iceberg,
-                vended_credential_key: None,
-                partition_columns: Vec::new(),
-                columns: Vec::new(),
-                metadata_location: Some(metadata_location),
-            }),
-            Route::Parquet => Ok(parquet_table(ident, &table)),
-            Route::Skip(detail) => Err(not_plannable(&ident, &detail)),
+            token = next_page_token(page.next_token(), page.partitions().len());
+            if token.is_none() {
+                return Ok(partitions);
+            }
+        }
+    }
+
+    async fn tables(&self, database: &str) -> Result<Vec<Table>, UdfError> {
+        let mut tables = Vec::new();
+        let mut token = None;
+        loop {
+            let page = self
+                .client
+                .get_tables()
+                .set_catalog_id(self.catalog_id.clone())
+                .database_name(database)
+                .set_next_token(token.take())
+                .send()
+                .await
+                .map_err(|error| {
+                    self.glue_error("GetTables", &format!("database '{database}'"), &error)
+                })?;
+            token = next_page_token(page.next_token(), page.table_list().len());
+            tables.extend(page.table_list.unwrap_or_default());
+            if token.is_none() {
+                return Ok(tables);
+            }
         }
     }
 
     /// `metadata.json` is the schema authority; Glue's Hive-string column copies are ignored.
-    async fn iceberg_table(
+    async fn listed_table(
         &self,
         ident: CatalogTableIdent,
-        metadata_location: String,
+        table: Table,
+        route: Route,
     ) -> Result<CatalogTable, UdfError> {
-        let metadata = self
-            .source
-            .iceberg_metadata(&metadata_location, &catalog_identifier_string(&ident))
-            .await
-            .map_err(|error| UdfError::User(self.redact(&error.to_string())))?;
+        let Route::Iceberg { metadata_location } = route else {
+            return planned_table(ident, &table, route);
+        };
+        let metadata = read_iceberg_metadata_file(
+            &self.storage,
+            &metadata_location,
+            &catalog_identifier_string(&ident),
+        )
+        .await
+        .map_err(|error| UdfError::User(self.redact(&error.to_string())))?;
         Ok(iceberg_catalog_table(
             ident,
             &metadata,
@@ -157,8 +150,13 @@ impl GlueCatalogSession {
         ))
     }
 
-    fn glue_error(&self, operation: &str, subject: &str, failure: &GlueFailure) -> UdfError {
-        UdfError::User(self.redact(&failure.text(operation, subject)))
+    fn glue_error<E: ProvideErrorMetadata>(
+        &self,
+        operation: &str,
+        subject: &str,
+        error: &SdkError<E>,
+    ) -> UdfError {
+        UdfError::User(self.redact(&error_text(error, operation, subject)))
     }
 
     fn redact(&self, text: &str) -> String {
@@ -175,22 +173,19 @@ impl CatalogClient for GlueCatalogSession {
         let namespace = namespace.to_vec();
         Box::pin(async move {
             let database = glue_database(&namespace)?;
-            let tables = self.source.tables(database).await.map_err(|failure| {
-                self.glue_error("GetTables", &format!("database '{database}'"), &failure)
-            })?;
             let mut admitted = Vec::new();
             let mut skipped = Vec::new();
-            for table in tables {
+            for table in self.tables(database).await? {
                 let ident = CatalogTableIdent {
                     namespace: namespace.clone(),
-                    name: table.name.clone(),
+                    name: table.name().to_string(),
                 };
                 match route_of(&table) {
                     Route::Skip(detail) => skipped.push(SkippedTable {
                         ident,
                         reason: SkipReason::NotPlannableGlueTable { detail },
                     }),
-                    route => admitted.push(self.neutral_table(ident, table, route, true)),
+                    route => admitted.push(self.listed_table(ident, table, route)),
                 }
             }
             let tables = stream::iter(admitted)
@@ -201,12 +196,32 @@ impl CatalogClient for GlueCatalogSession {
         })
     }
 
+    /// The table as a pushdown plans it, from `GetTable` alone: an Iceberg table carries its
+    /// metadata location and no column, because the Iceberg planner reads the metadata file.
     fn load_table(
         &self,
         ident: &CatalogTableIdent,
     ) -> Pin<Box<dyn Future<Output = Result<CatalogTable, UdfError>> + Send + '_>> {
         let ident = ident.clone();
-        Box::pin(async move { self.load(&ident, true).await })
+        Box::pin(async move {
+            let database = glue_database(&ident.namespace)?;
+            let subject = table_subject(&ident);
+            let table = self
+                .client
+                .get_table()
+                .set_catalog_id(self.catalog_id.clone())
+                .database_name(database)
+                .name(&ident.name)
+                .send()
+                .await
+                .map_err(|error| self.glue_error("GetTable", &subject, &error))?
+                .table
+                .ok_or_else(|| {
+                    UdfError::User(format!("Glue GetTable returned no table for {subject}"))
+                })?;
+            let route = route_of(&table);
+            planned_table(ident, &table, route)
+        })
     }
 }
 
@@ -241,58 +256,65 @@ fn table_subject(ident: &CatalogTableIdent) -> String {
     format!("table '{}'", catalog_identifier_string(ident))
 }
 
-fn not_plannable(ident: &CatalogTableIdent, detail: &str) -> UdfError {
-    UdfError::User(format!(
-        "Glue table '{}' cannot be planned: {detail}",
-        catalog_identifier_string(ident)
-    ))
-}
-
-fn route_of(table: &GlueTable) -> Route {
+fn route_of(table: &Table) -> Route {
     route(
-        table.table_type.as_deref(),
-        &table.parameters,
-        table.input_format.as_deref(),
+        table.table_type(),
+        table.parameters().unwrap_or(&Default::default()),
+        table
+            .storage_descriptor()
+            .and_then(|descriptor| descriptor.input_format()),
     )
 }
 
-fn table_location(table: &GlueTable) -> Option<String> {
-    table
-        .location
-        .as_deref()
-        .filter(|location| !location.is_empty())
-        .map(|location| trim_location(location).to_string())
-}
-
-fn parquet_table(ident: CatalogTableIdent, table: &GlueTable) -> CatalogTable {
-    CatalogTable {
+fn planned_table(
+    ident: CatalogTableIdent,
+    table: &Table,
+    route: Route,
+) -> Result<CatalogTable, UdfError> {
+    let descriptor = table.storage_descriptor();
+    let (format, metadata_location, columns, partition_keys): (_, _, &[Column], &[Column]) =
+        match route {
+            Route::Iceberg { metadata_location } => {
+                (TableFormat::Iceberg, Some(metadata_location), &[], &[])
+            }
+            Route::Parquet => (
+                TableFormat::Parquet,
+                None,
+                descriptor.map_or(&[], |descriptor| descriptor.columns()),
+                table.partition_keys(),
+            ),
+            Route::Skip(detail) => {
+                return Err(UdfError::User(format!(
+                    "Glue table '{}' cannot be planned: {detail}",
+                    catalog_identifier_string(&ident)
+                )));
+            }
+        };
+    Ok(CatalogTable {
         ident,
         table_type: CatalogTableType::Table,
-        storage_location: table_location(table),
-        format: TableFormat::Parquet,
+        storage_location: descriptor
+            .and_then(|descriptor| descriptor.location())
+            .filter(|location| !location.is_empty())
+            .map(|location| trim_location(location).to_string()),
+        format,
         vended_credential_key: None,
-        partition_columns: table
-            .partition_keys
+        partition_columns: partition_keys
             .iter()
-            .map(|key| key.name.clone())
+            .map(|key| key.name().to_string())
             .collect(),
-        columns: table
-            .columns
+        columns: columns
             .iter()
-            .chain(&table.partition_keys)
-            .map(catalog_column)
+            .chain(partition_keys)
+            .map(|column| CatalogColumn {
+                name: column.name().to_string(),
+                source_type: ColumnSourceType::Glue {
+                    hive_type: column.r#type().unwrap_or_default().to_string(),
+                },
+            })
             .collect(),
-        metadata_location: None,
-    }
-}
-
-fn catalog_column(column: &GlueColumn) -> CatalogColumn {
-    CatalogColumn {
-        name: column.name.clone(),
-        source_type: ColumnSourceType::Glue {
-            hive_type: column.hive_type.clone(),
-        },
-    }
+        metadata_location,
+    })
 }
 
 #[cfg(test)]

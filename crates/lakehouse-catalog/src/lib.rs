@@ -1,6 +1,7 @@
 //! Iceberg REST and Unity Catalog access for the lakehouse engine, including AWS STS role assumption.
 
 mod auth;
+mod aws_error;
 mod client;
 mod creds;
 mod glue;

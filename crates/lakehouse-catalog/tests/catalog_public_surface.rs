@@ -316,20 +316,19 @@ fn unity_catalog_public_items_are_reachable() {
     );
 }
 
-fn glue_session() -> GlueCatalogSession {
-    GlueCatalogSession::new(
+/// Scenario: The Glue client and its neutral additions extend the crate's public surface through an explicit reviewed edit
+/// Scenario: No AWS SDK type crosses the crate boundary
+#[test]
+fn glue_additions_are_reachable_through_neutral_types_only() {
+    let new: fn(&str, StorageBackend, ConnectionCreds) -> Result<GlueCatalogSession, UdfError> =
+        GlueCatalogSession::new;
+    let storage = StorageBackend::S3(StorageProps::default());
+    let session = new(
         "https://glue.eu-west-1.amazonaws.com",
-        StorageBackend::S3(StorageProps::default()),
+        storage.clone(),
         connection_creds(),
     )
-    .expect("the Glue endpoint names its signing region")
-}
-
-/// Scenario: The Glue client and its neutral additions extend the crate's public surface through an explicit reviewed edit
-#[test]
-fn glue_additions_are_reachable_from_outside_the_crate() {
-    let client: Box<dyn CatalogClient> = Box::new(glue_session());
-    drop(client);
+    .expect("the Glue endpoint names its signing region");
 
     let partition = CatalogPartition {
         values: BTreeMap::from([
@@ -344,51 +343,6 @@ fn glue_additions_are_reachable_from_outside_the_crate() {
     assert_ne!(partition.format, PartitionFormat::Parquet);
     assert_eq!(HIVE_DEFAULT_PARTITION, "__HIVE_DEFAULT_PARTITION__");
 
-    let column = CatalogColumn {
-        name: "payload".into(),
-        source_type: ColumnSourceType::Glue {
-            hive_type: "struct<x:int>".into(),
-        },
-    };
-    let ident = CatalogTableIdent {
-        namespace: vec!["sales".into()],
-        name: "orders".into(),
-    };
-    let _ = CatalogTable {
-        ident: ident.clone(),
-        table_type: CatalogTableType::Table,
-        storage_location: Some("s3://bucket/orders".into()),
-        format: TableFormat::Iceberg,
-        vended_credential_key: None,
-        partition_columns: Vec::new(),
-        columns: vec![column],
-        metadata_location: Some("s3://bucket/orders/metadata/00001.metadata.json".into()),
-    };
-    assert_eq!(catalog_identifier_string(&ident), "sales.orders");
-    assert_eq!(
-        parse_glue_table_ident("sales.orders").expect("one database, one table"),
-        ident
-    );
-    let storage = StorageBackend::S3(StorageProps::default());
-    let _metadata = read_iceberg_metadata_file(
-        &storage,
-        "s3://bucket/orders/metadata/00001.metadata.json",
-        "sales.orders",
-    );
-    let _ = SkippedTable {
-        ident,
-        reason: SkipReason::NotPlannableGlueTable {
-            detail: "table_type=delta".into(),
-        },
-    };
-}
-
-/// Scenario: No AWS SDK type crosses the crate boundary
-#[test]
-fn glue_session_is_reachable_through_neutral_types_only() {
-    let _: fn(&str, StorageBackend, ConnectionCreds) -> Result<GlueCatalogSession, UdfError> =
-        GlueCatalogSession::new;
-    let session = glue_session();
     let ident = CatalogTableIdent {
         namespace: vec!["sales".into()],
         name: "orders".into(),
@@ -397,15 +351,36 @@ fn glue_session_is_reachable_through_neutral_types_only() {
         ident: ident.clone(),
         table_type: CatalogTableType::Table,
         storage_location: Some("s3://bucket/orders".into()),
-        format: TableFormat::Parquet,
+        format: TableFormat::Iceberg,
         vended_credential_key: None,
         partition_columns: vec!["p_int".to_string()],
-        columns: Vec::new(),
-        metadata_location: None,
+        columns: vec![CatalogColumn {
+            name: "payload".into(),
+            source_type: ColumnSourceType::Glue {
+                hive_type: "struct<x:int>".into(),
+            },
+        }],
+        metadata_location: Some("s3://bucket/orders/metadata/00001.metadata.json".into()),
+    };
+    assert_eq!(catalog_identifier_string(&ident), "sales.orders");
+    assert_eq!(
+        parse_glue_table_ident("sales.orders").expect("one database, one table"),
+        ident
+    );
+    let _metadata = read_iceberg_metadata_file(
+        &storage,
+        "s3://bucket/orders/metadata/00001.metadata.json",
+        "sales.orders",
+    );
+    let _ = SkippedTable {
+        ident: ident.clone(),
+        reason: SkipReason::NotPlannableGlueTable {
+            detail: "table_type=delta".into(),
+        },
     };
 
-    let planning_load = async {
-        let _: Result<CatalogTable, UdfError> = session.load_table_for_planning(&ident).await;
+    let load = async {
+        let _: Result<CatalogTable, UdfError> = session.load_table(&ident).await;
     };
     let partitions = async {
         let _: Result<Vec<CatalogPartition>, UdfError> = session.partitions(&table).await;
@@ -413,8 +388,8 @@ fn glue_session_is_reachable_through_neutral_types_only() {
     let listing = async {
         let _: Result<CatalogListing, UdfError> = session.list_tables(&ident.namespace).await;
     };
-
-    drop((planning_load, partitions, listing));
+    drop((load, partitions, listing));
+    let _: Box<dyn CatalogClient> = Box::new(session);
 }
 
 fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {

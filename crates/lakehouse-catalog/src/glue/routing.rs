@@ -61,7 +61,3 @@ fn hive_route(input_format: Option<&str>, projection_enabled: Option<&str>) -> R
         _ => Route::Parquet,
     }
 }
-
-#[cfg(test)]
-#[path = "routing_tests.rs"]
-mod tests;

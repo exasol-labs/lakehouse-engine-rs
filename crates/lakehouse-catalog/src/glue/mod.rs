@@ -2,7 +2,6 @@ mod client;
 mod partitions;
 mod routing;
 mod sdk;
-mod source;
 
 pub use client::{GlueCatalogSession, parse_glue_table_ident};
 

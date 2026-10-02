@@ -149,7 +149,7 @@ impl<'a> TableScanResolver<'a> {
             }
             RequestSession::Glue(session) => {
                 let table = session
-                    .load_table_for_planning(&parse_glue_table_ident(table_identifier)?)
+                    .load_table(&parse_glue_table_ident(table_identifier)?)
                     .await?;
                 let reader = format_reader(
                     ScanSource::Glue {
