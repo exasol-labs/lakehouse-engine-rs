@@ -597,19 +597,12 @@ pub fn assert_query_fails(conn: &mut ExaConn, sql: &str, fragments: &[&str]) {
     );
 }
 
-/// Each `(column, fragments)` reads alone from `table` and must fail naming every fragment.
-pub fn assert_columns_refused(conn: &mut ExaConn, table: &str, refusals: &[(&str, &[&str])]) {
-    for (column, fragments) in refusals {
-        assert_query_fails(conn, &format!("SELECT {column} FROM {table}"), fragments);
-    }
-}
-
 /// Compares each result column of `sql`, as text with NULL as `None`, with `expected`.
-pub fn assert_text_columns<const ROWS: usize>(
-    conn: &mut ExaConn,
-    sql: &str,
-    expected: &[[Option<&str>; ROWS]],
-) {
+pub fn assert_text_columns<C, S>(conn: &mut ExaConn, sql: &str, expected: &[C])
+where
+    C: AsRef<[Option<S>]>,
+    S: AsRef<str>,
+{
     let observed: Vec<Vec<Option<String>>> = conn
         .query_columns(sql)
         .iter()
@@ -617,9 +610,97 @@ pub fn assert_text_columns<const ROWS: usize>(
         .collect();
     let expected: Vec<Vec<Option<String>>> = expected
         .iter()
-        .map(|column| column.iter().map(|v| v.map(str::to_string)).collect())
+        .map(|column| {
+            column
+                .as_ref()
+                .iter()
+                .map(|v| v.as_ref().map(|s| s.as_ref().to_string()))
+                .collect()
+        })
         .collect();
     assert_eq!(observed, expected, "{sql}");
+}
+
+/// One column of an all-types table: its exact declared type and what reading it yields.
+pub struct TypeCase<'a> {
+    column: &'a str,
+    declared: &'a str,
+    outcome: TypeOutcome<'a>,
+}
+
+enum TypeOutcome<'a> {
+    Text([Option<&'a str>; 3]),
+    Refused(&'a [&'a str]),
+}
+
+/// A column whose three `ID`-ordered values read as `values`, as text with NULL as `None`.
+pub fn reads<'a>(column: &'a str, declared: &'a str, values: [Option<&'a str>; 3]) -> TypeCase<'a> {
+    TypeCase {
+        column,
+        declared,
+        outcome: TypeOutcome::Text(values),
+    }
+}
+
+/// A column that, read alone, fails naming every fragment.
+pub fn refuses<'a>(column: &'a str, declared: &'a str, fragments: &'a [&'a str]) -> TypeCase<'a> {
+    TypeCase {
+        column,
+        declared,
+        outcome: TypeOutcome::Refused(fragments),
+    }
+}
+
+/// The `type-mapping-live-coverage` check: `cases` lists every column in declared order, the
+/// readable ones are read by one `SELECT ID, ... ORDER BY ID`, and each refused one alone.
+pub fn assert_type_matrix(conn: &mut ExaConn, vs_name: &str, table: &str, cases: &[TypeCase]) {
+    let declared: Vec<(&str, &str)> = cases.iter().map(|c| (c.column, c.declared)).collect();
+    assert_eq!(
+        declared_types(conn, vs_name, table),
+        pairs(&declared),
+        "{vs_name}.{table} declared types"
+    );
+    let qualified = format!("{vs_name}.{}", table.to_uppercase());
+    let (columns, values): (Vec<&str>, Vec<[Option<&str>; 3]>) = cases
+        .iter()
+        .filter_map(|c| match c.outcome {
+            TypeOutcome::Text(values) => Some((c.column, values)),
+            TypeOutcome::Refused(_) => None,
+        })
+        .unzip();
+    assert_text_columns(
+        conn,
+        &format!("SELECT {} FROM {qualified} ORDER BY ID", columns.join(", ")),
+        &values,
+    );
+    for case in cases {
+        if let TypeOutcome::Refused(fragments) = case.outcome {
+            assert_query_fails(
+                conn,
+                &format!("SELECT {} FROM {qualified}", case.column),
+                fragments,
+            );
+        }
+    }
+}
+
+/// `binary_values` declares `C_BYTES` as text over bytes that are not valid UTF-8, so reading
+/// it fails naming `fragment`.
+pub fn assert_binary_values_refused(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    table: &str,
+    fragment: &str,
+) {
+    assert_eq!(
+        declared_types(conn, vs_name, table),
+        pairs(&[("ID", "DECIMAL(20,0)"), ("C_BYTES", VARCHAR_JSON)])
+    );
+    assert_query_fails(
+        conn,
+        &format!("SELECT C_BYTES FROM {vs_name}.{}", table.to_uppercase()),
+        &[fragment],
+    );
 }
 
 /// Ground truth independent of join pushdown: both tables read un-joined through the VS

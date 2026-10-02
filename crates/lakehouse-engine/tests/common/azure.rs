@@ -215,53 +215,27 @@ mod azure_naming_tests {
 
     const FIXED_MILLIS: u128 = 1_762_000_000_000;
 
-    fn assert_legal_container_name(name: &str, user: &str) {
-        assert!(
-            (MIN_CONTAINER_NAME_LEN..=MAX_CONTAINER_NAME_LEN).contains(&name.len()),
-            "user {user:?}: name {name:?} must be {MIN_CONTAINER_NAME_LEN} to \
-             {MAX_CONTAINER_NAME_LEN} characters, got {}",
-            name.len()
-        );
-        assert!(
-            name.chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-            "user {user:?}: name {name:?} must contain only lowercase letters, digits and hyphens"
-        );
-        assert!(
-            !name.contains("--"),
-            "user {user:?}: name {name:?} must not contain consecutive hyphens"
-        );
-        assert!(
-            !name.starts_with('-') && !name.ends_with('-'),
-            "user {user:?}: name {name:?} must not begin or end with a hyphen"
-        );
-        assert!(
-            name.starts_with(CONTAINER_NAME_PREFIX),
-            "user {user:?}: name {name:?} must keep the {CONTAINER_NAME_PREFIX} prefix"
-        );
-        assert!(
-            name.ends_with(&FIXED_MILLIS.to_string()),
-            "user {user:?}: name {name:?} must keep the millisecond suffix"
-        );
-    }
-
+    /// The segment's alphabet and separators are `cloud_fixture`'s; this checks the prefix join
+    /// and Azure's length range.
     #[test]
     fn container_name_is_azure_and_lakekeeper_legal() {
         let ninety_chars = "A".repeat(90);
-        let truncated_at_a_hyphen = format!("{}.tail", "a".repeat(39));
-
-        for user in [
-            "",
-            "-",
-            "---",
-            "Antoni.Reus",
-            "a..b",
-            "ÜBER_user",
-            "9",
-            ninety_chars.as_str(),
-            truncated_at_a_hyphen.as_str(),
-        ] {
-            assert_legal_container_name(&derive_container_name(user, FIXED_MILLIS), user);
+        for user in ["", "ÜBER_user", ninety_chars.as_str()] {
+            let name = derive_container_name(user, FIXED_MILLIS);
+            assert!(
+                (MIN_CONTAINER_NAME_LEN..=MAX_CONTAINER_NAME_LEN).contains(&name.len()),
+                "user {user:?}: name {name:?} must be {MIN_CONTAINER_NAME_LEN} to \
+                 {MAX_CONTAINER_NAME_LEN} characters"
+            );
+            assert!(
+                name.starts_with(&format!("{CONTAINER_NAME_PREFIX}-"))
+                    && !name.contains("--")
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "user {user:?}: name {name:?} must join the {CONTAINER_NAME_PREFIX} prefix by one \
+                 hyphen and hold only [a-z0-9-]"
+            );
         }
 
         assert_eq!(

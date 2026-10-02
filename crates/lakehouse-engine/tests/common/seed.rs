@@ -27,9 +27,9 @@ use iceberg::io::{
     S3_REGION, S3_SECRET_ACCESS_KEY, StorageFactory,
 };
 use iceberg::spec::{
-    DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, ListType, Literal, MapType,
-    NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Struct, StructType,
-    Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ListType, Literal,
+    MapType, NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Struct,
+    StructType, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -399,7 +399,14 @@ pub async fn write_one_file_append(
         writer.write(batch).await.context("write Arrow batch")?;
     }
     let data_files = writer.close().await.context("close data file writer")?;
+    commit_data_files(catalog, table, data_files).await
+}
 
+pub async fn commit_data_files(
+    catalog: &impl Catalog,
+    table: &Table,
+    data_files: Vec<DataFile>,
+) -> Result<()> {
     let tx = Transaction::new(table);
     let action = tx.fast_append().add_data_files(data_files);
     let tx = action.apply(tx).context("apply fast-append action")?;
@@ -635,13 +642,7 @@ async fn write_one_data_file<C: Catalog>(
         .iter()
         .map(|df| df.file_path().to_string())
         .collect();
-
-    let tx = Transaction::new(table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action.apply(tx).context("apply fast-append action")?;
-    tx.commit(catalog)
-        .await
-        .context("commit Iceberg snapshot")?;
+    commit_data_files(catalog, table, data_files).await?;
 
     paths
         .into_iter()
@@ -836,15 +837,9 @@ async fn write_one_labels_data_file<C: Catalog>(
         .iter()
         .map(|df| df.file_path().to_string())
         .collect();
-
-    let tx = Transaction::new(table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action
-        .apply(tx)
-        .context("apply labels fast-append action")?;
-    tx.commit(catalog)
+    commit_data_files(catalog, table, data_files)
         .await
-        .context("commit labels Iceberg snapshot")?;
+        .context("commit the labels data files")?;
 
     Ok(paths)
 }
@@ -1354,17 +1349,9 @@ async fn write_one_partitioned_file<C: Catalog>(
         .close()
         .await
         .context("close regions data file writer")?;
-
-    let tx = Transaction::new(table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action
-        .apply(tx)
-        .context("apply regions fast-append action")?;
-    tx.commit(catalog)
+    commit_data_files(catalog, table, data_files)
         .await
-        .context("commit regions Iceberg snapshot")?;
-
-    Ok(())
+        .context("commit the regions data files")
 }
 
 // iceberg-rust 0.10 has no schema-evolution API, so the rename (#26) is applied via a
@@ -2859,16 +2846,9 @@ async fn write_complex_types_and_commit<C: Catalog>(catalog: &C, table: Table) -
         .close()
         .await
         .context("close complex-types data file writer")?;
-
-    let tx = Transaction::new(&table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action
-        .apply(tx)
-        .context("apply complex-types fast-append action")?;
-    tx.commit(catalog)
+    commit_data_files(catalog, &table, data_files)
         .await
-        .context("commit complex-types Iceberg snapshot")?;
-    Ok(())
+        .context("commit the complex-types data files")
 }
 
 /// Decoded straight into the created table's Arrow schema, so nested fields already
@@ -3107,10 +3087,10 @@ pub const E2E_BINARY_VALUES_TABLE: &str = "binary_values";
 /// NULL in every other column. The value builders below are shared by those fixtures.
 pub const ALL_TYPES_IDS: [i64; 3] = [1, 2, 3];
 /// Millisecond-exact, so it reads the same at every gated `TIMESTAMP` precision.
-pub const ALL_TYPES_TIMESTAMP_MICROS: i64 = 1_705_314_645_123_000;
+const ALL_TYPES_TIMESTAMP_MICROS: i64 = 1_705_314_645_123_000;
 pub const ALL_TYPES_TIME_MICROS: i64 = (12 * 3600 + 34 * 60 + 56) * 1_000_000 + 123_456;
 pub const ALL_TYPES_DATE_DAYS: i32 = 19_737;
-pub const NON_UTF8_BYTES: [&[u8]; 2] = [&[0xFF, 0xFE, 0x00, 0x80], &[0xC3, 0x28]];
+const NON_UTF8_BYTES: [&[u8]; 2] = [&[0xFF, 0xFE, 0x00, 0x80], &[0xC3, 0x28]];
 
 pub fn all_types_validity() -> Option<NullBuffer> {
     Some(NullBuffer::from(vec![true, true, false]))
@@ -3509,16 +3489,9 @@ async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
         .partition_spec_id(table.metadata().default_partition_spec_id())
         .build()
         .context("describe binary_values data file")?;
-    let tx = Transaction::new(&table);
-    let tx = tx
-        .fast_append()
-        .add_data_files(vec![data_file])
-        .apply(tx)
-        .context("apply binary_values fast-append")?;
-    tx.commit(catalog)
+    commit_data_files(catalog, &table, vec![data_file])
         .await
-        .context("commit binary_values data file")?;
-    Ok(())
+        .context("commit binary_values data file")
 }
 
 #[cfg(test)]

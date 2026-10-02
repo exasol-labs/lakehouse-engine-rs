@@ -5,10 +5,10 @@
 mod common;
 
 use common::e2e_harness::{
-    VARCHAR_JSON, VsProps, assert_columns_refused, assert_text_columns, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_type, declared_types, exa_conn,
-    explain_virtual_sql, install_slc, local_stack_storage, nullable_text, pairs, parse_int,
-    parse_numeric, try_create_virtual_schema_with_password, upload_so, value_to_string,
+    VARCHAR_JSON, VsProps, assert_type_matrix, create_schema_and_scripts,
+    create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql, install_slc,
+    local_stack_storage, nullable_text, parse_int, parse_numeric, reads, refuses,
+    try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{
@@ -16,10 +16,10 @@ use common::raw_parquet::{
 };
 use common::seed::{
     ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_IDS_TEXT, ALL_TYPES_TIME_MICROS,
-    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
-    INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIME64_VALUES_TEXT, all_types_ids, binary_values,
-    decimal_38_10_values, fixed_16_values, float32_values, int8_values, int16_values, int32_values,
-    struct_binary_values, text_values, time64_values,
+    DECIMAL_10_2_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT8_VALUES_TEXT,
+    INT16_VALUES_TEXT, INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIME64_VALUES_TEXT, all_types_ids,
+    binary_values, decimal_38_10_values, fixed_16_values, float32_values, int8_values,
+    int16_values, int32_values, struct_binary_values, text_values, time64_values,
 };
 use common::stack::{
     CatalogConnectionPassword, seaweedfs_url_internal, wait_for_exasol, wait_for_seaweedfs,
@@ -823,23 +823,6 @@ fn write_all_fixtures() {
     );
 }
 
-/// Prefix match tolerates Exasol's `COLUMN_TYPE` rendering (charset suffix,
-/// `DOUBLE PRECISION` -> `DOUBLE`, substituted `TIMESTAMP` precision).
-fn assert_declared_type(
-    conn: &mut ExaConn,
-    vs_name: &str,
-    table: &str,
-    column: &str,
-    expected: &str,
-) {
-    let actual = declared_type(conn, vs_name, table, column);
-    let expected_stripped: String = expected.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(
-        actual.starts_with(&expected_stripped),
-        "{vs_name}.{table}.{column}: expected Exasol type starting {expected}, got {actual}"
-    );
-}
-
 fn string_column<C: FromIterator<String>>(conn: &mut ExaConn, sql: &str) -> C {
     conn.query_columns(sql)[0]
         .iter()
@@ -923,13 +906,25 @@ fn events_directory_declares_and_returns_mixed_types_across_both_files() {
     setup();
     let mut conn = exa_conn();
 
-    assert_declared_type(&mut conn, VS_DIRECT, "EVENTS", "EVENT_ID", "DECIMAL(20,0)");
-    assert_declared_type(&mut conn, VS_DIRECT, "EVENTS", "NAME", "VARCHAR(2000000)");
-    assert_declared_type(&mut conn, VS_DIRECT, "EVENTS", "EVENT_DATE", "DATE");
-    assert_declared_type(&mut conn, VS_DIRECT, "EVENTS", "EVENT_TS", "TIMESTAMP");
-    assert_declared_type(&mut conn, VS_DIRECT, "EVENTS", "AMOUNT", "DECIMAL(10,2)");
-    assert_declared_type(&mut conn, VS_DIRECT, "EVENTS", "IS_ACTIVE", "BOOLEAN");
-    assert_declared_type(&mut conn, VS_DIRECT, "EVENTS", "SCORE", "DOUBLE");
+    for (column, expected) in [
+        ("EVENT_ID", "DECIMAL(20,0)"),
+        ("NAME", VARCHAR_JSON),
+        ("EVENT_DATE", "DATE"),
+        ("AMOUNT", "DECIMAL(10,2)"),
+        ("IS_ACTIVE", "BOOLEAN"),
+        ("SCORE", "DOUBLE"),
+    ] {
+        assert_eq!(
+            declared_type(&mut conn, VS_DIRECT, "EVENTS", column),
+            expected,
+            "EVENTS.{column}"
+        );
+    }
+    let event_ts = declared_type(&mut conn, VS_DIRECT, "EVENTS", "EVENT_TS");
+    assert!(
+        event_ts.starts_with("TIMESTAMP"),
+        "EVENTS.EVENT_TS must declare a TIMESTAMP of the engine's precision, got {event_ts}"
+    );
 
     let cols = conn.query_columns(&format!(
         "SELECT EVENT_ID, NAME, IS_ACTIVE, SCORE FROM {} ORDER BY EVENT_ID",
@@ -1037,115 +1032,92 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
     setup();
     let mut conn = exa_conn();
 
-    assert_eq!(
-        declared_types(&mut conn, VS_DIRECT, "ALL_TYPES"),
-        pairs(&[
-            ("ID", "DECIMAL(20,0)"),
-            ("C_INT8", "DECIMAL(3,0)"),
-            ("C_INT16", "DECIMAL(5,0)"),
-            ("C_INT32", "DECIMAL(10,0)"),
-            ("C_UINT8", "DECIMAL(3,0)"),
-            ("C_UINT16", "DECIMAL(5,0)"),
-            ("C_UINT32", "DECIMAL(20,0)"),
-            ("C_UINT64", "DECIMAL(20,0)"),
-            ("C_FLOAT32", "DOUBLE"),
-            ("C_LARGEUTF8", VARCHAR_JSON),
-            ("C_DECIMAL128_38_10", VARCHAR_JSON),
-            ("C_DECIMAL256_50_2", VARCHAR_JSON),
-            ("C_TIME32", VARCHAR_JSON),
-            ("C_TIME64", VARCHAR_JSON),
-            ("C_DURATION", VARCHAR_JSON),
-            ("C_INTERVAL", VARCHAR_JSON),
-            ("C_BINARY", VARCHAR_JSON),
-            ("C_LARGEBINARY", VARCHAR_JSON),
-            ("C_FIXEDSIZEBINARY", VARCHAR_JSON),
-            ("C_STRUCT_BINARY", VARCHAR_JSON),
-        ])
-    );
-    assert_text_columns(
-        &mut conn,
-        &format!(
-            "SELECT ID, C_INT8, C_INT16, C_INT32, C_UINT8, C_UINT16, C_UINT32, C_UINT64, \
-             C_FLOAT32, C_LARGEUTF8, C_DECIMAL128_38_10, C_DECIMAL256_50_2, C_TIME32, C_TIME64, \
-             C_DURATION, C_INTERVAL FROM {} ORDER BY ID",
-            vs_table(VS_DIRECT, "ALL_TYPES")
-        ),
-        &[
-            ALL_TYPES_IDS_TEXT,
-            INT8_VALUES_TEXT,
-            INT16_VALUES_TEXT,
-            INT32_VALUES_TEXT,
-            [Some("255"), Some("0"), None],
-            [Some("65535"), Some("0"), None],
-            [Some("4294967295"), Some("0"), None],
-            [Some("18446744073709551615"), Some("0"), None],
-            FLOAT32_VALUES_TEXT,
-            TEXT_VALUES_TEXT,
-            DECIMAL_38_10_VALUES_TEXT,
-            [Some("12.34"), Some("-0.05"), None],
-            [Some("12:34:56"), Some("00:00:00"), None],
-            TIME64_VALUES_TEXT,
-            [
-                Some("0 days 0 hours 0 mins 1.500000 secs"),
-                Some("0 days 0 hours 0 mins 0.000000 secs"),
-                None,
-            ],
-            [Some("1 days 2.000 secs"), Some("0 secs"), None],
-        ],
-    );
-
-    assert_eq!(
-        declared_types(&mut conn, VS_DIRECT, "ANNOTATED_TYPES"),
-        pairs(&[
-            ("ID", "DECIMAL(20,0)"),
-            ("C_ENUM", VARCHAR_JSON),
-            ("C_BSON", VARCHAR_JSON),
-            ("C_UUID", VARCHAR_JSON),
-            ("C_INT96", "TIMESTAMP(3)"),
-            ("C_BYTE_ARRAY", VARCHAR_JSON),
-            ("C_STRUCT_ENUM", VARCHAR_JSON),
-        ])
-    );
-    assert_text_columns(
-        &mut conn,
-        &format!(
-            "SELECT ID, C_ENUM, C_INT96 FROM {} ORDER BY ID",
-            vs_table(VS_DIRECT, "ANNOTATED_TYPES")
-        ),
-        &[
-            ALL_TYPES_IDS_TEXT,
-            [Some("red"), Some("green"), None],
-            [
-                Some("2024-01-15 10:30:45.000000"),
-                Some("1970-01-01 00:00:00.000000"),
-                None,
-            ],
-        ],
-    );
-
     let binary: &[&str] = &["type 'binary'", "#351"];
-    assert_columns_refused(
+    assert_type_matrix(
         &mut conn,
-        &vs_table(VS_DIRECT, "ALL_TYPES"),
+        VS_DIRECT,
+        "ALL_TYPES",
         &[
-            ("C_BINARY", binary),
-            ("C_LARGEBINARY", binary),
-            ("C_FIXEDSIZEBINARY", &["type 'fixed(16)'", "#351"]),
-            (
+            reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
+            reads("C_INT8", "DECIMAL(3,0)", INT8_VALUES_TEXT),
+            reads("C_INT16", "DECIMAL(5,0)", INT16_VALUES_TEXT),
+            reads("C_INT32", "DECIMAL(10,0)", INT32_VALUES_TEXT),
+            reads("C_UINT8", "DECIMAL(3,0)", [Some("255"), Some("0"), None]),
+            reads("C_UINT16", "DECIMAL(5,0)", [Some("65535"), Some("0"), None]),
+            reads(
+                "C_UINT32",
+                "DECIMAL(20,0)",
+                [Some("4294967295"), Some("0"), None],
+            ),
+            reads(
+                "C_UINT64",
+                "DECIMAL(20,0)",
+                [Some("18446744073709551615"), Some("0"), None],
+            ),
+            reads("C_FLOAT32", "DOUBLE", FLOAT32_VALUES_TEXT),
+            reads("C_LARGEUTF8", VARCHAR_JSON, TEXT_VALUES_TEXT),
+            reads(
+                "C_DECIMAL128_38_10",
+                VARCHAR_JSON,
+                DECIMAL_38_10_VALUES_TEXT,
+            ),
+            reads("C_DECIMAL256_50_2", VARCHAR_JSON, DECIMAL_10_2_VALUES_TEXT),
+            reads(
+                "C_TIME32",
+                VARCHAR_JSON,
+                [Some("12:34:56"), Some("00:00:00"), None],
+            ),
+            reads("C_TIME64", VARCHAR_JSON, TIME64_VALUES_TEXT),
+            reads(
+                "C_DURATION",
+                VARCHAR_JSON,
+                [
+                    Some("0 days 0 hours 0 mins 1.500000 secs"),
+                    Some("0 days 0 hours 0 mins 0.000000 secs"),
+                    None,
+                ],
+            ),
+            reads(
+                "C_INTERVAL",
+                VARCHAR_JSON,
+                [Some("1 days 2.000 secs"), Some("0 secs"), None],
+            ),
+            refuses("C_BINARY", VARCHAR_JSON, binary),
+            refuses("C_LARGEBINARY", VARCHAR_JSON, binary),
+            refuses(
+                "C_FIXEDSIZEBINARY",
+                VARCHAR_JSON,
+                &["type 'fixed(16)'", "#351"],
+            ),
+            refuses(
                 "C_STRUCT_BINARY",
+                VARCHAR_JSON,
                 &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
             ),
         ],
     );
-    assert_columns_refused(
+    assert_type_matrix(
         &mut conn,
-        &vs_table(VS_DIRECT, "ANNOTATED_TYPES"),
+        VS_DIRECT,
+        "ANNOTATED_TYPES",
         &[
-            ("C_BSON", &["type 'bson'", "#351"]),
-            ("C_UUID", &["type 'uuid'", "#351"]),
-            ("C_BYTE_ARRAY", binary),
-            (
+            reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
+            reads("C_ENUM", VARCHAR_JSON, [Some("red"), Some("green"), None]),
+            refuses("C_BSON", VARCHAR_JSON, &["type 'bson'", "#351"]),
+            refuses("C_UUID", VARCHAR_JSON, &["type 'uuid'", "#351"]),
+            reads(
+                "C_INT96",
+                "TIMESTAMP(3)",
+                [
+                    Some("2024-01-15 10:30:45.000000"),
+                    Some("1970-01-01 00:00:00.000000"),
+                    None,
+                ],
+            ),
+            refuses("C_BYTE_ARRAY", VARCHAR_JSON, binary),
+            refuses(
                 "C_STRUCT_ENUM",
+                VARCHAR_JSON,
                 &["member 'c_struct_enum.k'", "type 'enum'", "#351"],
             ),
         ],
@@ -1583,7 +1555,7 @@ fn two_table_join_matches_the_unpushed_answer_in_one_request() {
 
 const SALES_2026_FILE: &str = "year=2026/month=09/p1.parquet";
 
-fn int_column(cells: &[Json]) -> Vec<i64> {
+fn sorted_int_column(cells: &[Json]) -> Vec<i64> {
     let mut ids: Vec<i64> = cells.iter().map(parse_int).collect();
     ids.sort();
     ids
@@ -1600,12 +1572,9 @@ fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
         "partition columns must follow the folded Parquet columns"
     );
     for partition_column in ["YEAR", "MONTH"] {
-        assert_declared_type(
-            &mut conn,
-            VS_DIRECT,
-            "SALES",
-            partition_column,
-            "VARCHAR(2000000)",
+        assert_eq!(
+            declared_type(&mut conn, VS_DIRECT, "SALES", partition_column),
+            VARCHAR_JSON
         );
     }
 
@@ -1634,12 +1603,9 @@ fn hive_segments_declare_varchar_partition_columns_with_decoded_values() {
         "each row must carry its own file's partition values"
     );
 
-    assert_declared_type(
-        &mut conn,
-        VS_DIRECT,
-        "ENCODED",
-        "REGION",
-        "VARCHAR(2000000)",
+    assert_eq!(
+        declared_type(&mut conn, VS_DIRECT, "ENCODED", "REGION"),
+        VARCHAR_JSON
     );
     let regions: Vec<String> = string_column(
         &mut conn,
@@ -1680,7 +1646,7 @@ fn mixed_layout_unions_partition_keys_and_nulls_the_missing_key() {
         vs_table(VS_DIRECT_NARROW, "MIXED")
     ));
     assert_eq!(
-        int_column(&narrow[0]),
+        sorted_int_column(&narrow[0]),
         [1, 2],
         "an ignored key must neither fail the query nor drop a row"
     );
@@ -1696,12 +1662,9 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
         ["ID", "K"],
         "K must be declared exactly once, as the partition column"
     );
-    assert_declared_type(
-        &mut conn,
-        VS_DIRECT,
-        "COLLISION_OVERRIDE",
-        "K",
-        "VARCHAR(2000000)",
+    assert_eq!(
+        declared_type(&mut conn, VS_DIRECT, "COLLISION_OVERRIDE", "K"),
+        VARCHAR_JSON
     );
     let values: Vec<String> = string_column(
         &mut conn,
@@ -1721,7 +1684,7 @@ fn partition_key_colliding_with_a_parquet_column_overrides_it() {
         vs_table(VS_HIVE_OFF, "COLLISION_OVERRIDE")
     ));
     assert_eq!(
-        int_column(&stored[0]),
+        sorted_int_column(&stored[0]),
         [99],
         "with hive partitioning off, K must read the file's own stored value"
     );
@@ -1768,7 +1731,7 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
         vs_table(VS_COLLISION_MISSING_HIVE_OFF, "COLLISION_MISSING_SEGMENT")
     ));
     assert_eq!(
-        int_column(&stored[0]),
+        sorted_int_column(&stored[0]),
         [42, 99],
         "with hive partitioning off, every file must read its own stored K"
     );
@@ -1822,7 +1785,7 @@ fn partition_filter_prunes_the_resolved_file_list() {
         }
 
         let rows = conn.query_columns(&sql);
-        assert_eq!(int_column(&rows[0]), [1, 2], "{predicate}");
+        assert_eq!(sorted_int_column(&rows[0]), [1, 2], "{predicate}");
     }
 }
 
@@ -1842,7 +1805,7 @@ fn a_column_only_pruned_files_carry_reads_null() {
     );
 
     let cols = conn.query_columns(&sql);
-    assert_eq!(int_column(&cols[0]), [3]);
+    assert_eq!(sorted_int_column(&cols[0]), [3]);
     assert!(
         cols[1][0].is_null(),
         "DISCOUNT must read NULL from a file lacking it"

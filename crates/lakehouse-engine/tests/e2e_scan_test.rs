@@ -259,67 +259,35 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
     } else {
         ExpectedTimestampPrecision::MILLISECOND.declared_column_type
     };
-    let table = format!("{VS_NAME}.{}", E2E_ALL_TYPES_TABLE.to_uppercase());
-
-    assert_eq!(
-        declared_types(&mut conn, VS_NAME, E2E_ALL_TYPES_TABLE),
-        pairs(&[
-            ("ID", "DECIMAL(20,0)"),
-            ("C_INT", "DECIMAL(10,0)"),
-            ("C_FLOAT", "DOUBLE"),
-            ("C_DECIMAL_10_2", "DECIMAL(10,2)"),
-            ("C_DECIMAL_38_10", VARCHAR_JSON),
-            ("C_BOOLEAN", "BOOLEAN"),
-            ("C_TIME", VARCHAR_JSON),
-            ("C_TIMESTAMPTZ", timestamp),
-            ("C_TIMESTAMP_NS", timestamp_ns),
-            ("C_BINARY", VARCHAR_JSON),
-            ("C_FIXED", VARCHAR_JSON),
-            ("C_UUID", VARCHAR_JSON),
-            ("C_STRUCT_BINARY", VARCHAR_JSON),
-        ])
-    );
-    assert_text_columns(
+    assert_type_matrix(
         &mut conn,
-        &format!(
-            "SELECT ID, C_INT, C_FLOAT, C_DECIMAL_10_2, C_DECIMAL_38_10, C_BOOLEAN, C_TIME, \
-             C_TIMESTAMPTZ, C_TIMESTAMP_NS FROM {table} ORDER BY ID"
-        ),
+        VS_NAME,
+        E2E_ALL_TYPES_TABLE,
         &[
-            ALL_TYPES_IDS_TEXT,
-            INT32_VALUES_TEXT,
-            FLOAT32_VALUES_TEXT,
-            DECIMAL_10_2_VALUES_TEXT,
-            DECIMAL_38_10_VALUES_TEXT,
-            BOOLEAN_VALUES_TEXT,
-            TIME64_VALUES_TEXT,
-            TIMESTAMP_VALUES_TEXT,
-            TIMESTAMP_VALUES_TEXT,
-        ],
-    );
-    assert_columns_refused(
-        &mut conn,
-        &table,
-        &[
-            ("C_BINARY", &["type 'binary'", "#351"][..]),
-            ("C_FIXED", &["type 'fixed(16)'", "#351"]),
-            ("C_UUID", &["type 'uuid'", "#351"]),
-            (
+            reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
+            reads("C_INT", "DECIMAL(10,0)", INT32_VALUES_TEXT),
+            reads("C_FLOAT", "DOUBLE", FLOAT32_VALUES_TEXT),
+            reads("C_DECIMAL_10_2", "DECIMAL(10,2)", DECIMAL_10_2_VALUES_TEXT),
+            reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
+            reads("C_BOOLEAN", "BOOLEAN", BOOLEAN_VALUES_TEXT),
+            reads("C_TIME", VARCHAR_JSON, TIME64_VALUES_TEXT),
+            reads("C_TIMESTAMPTZ", timestamp, TIMESTAMP_VALUES_TEXT),
+            reads("C_TIMESTAMP_NS", timestamp_ns, TIMESTAMP_VALUES_TEXT),
+            refuses("C_BINARY", VARCHAR_JSON, &["type 'binary'", "#351"]),
+            refuses("C_FIXED", VARCHAR_JSON, &["type 'fixed(16)'", "#351"]),
+            refuses("C_UUID", VARCHAR_JSON, &["type 'uuid'", "#351"]),
+            refuses(
                 "C_STRUCT_BINARY",
+                VARCHAR_JSON,
                 &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
             ),
         ],
     );
-
-    let binary_values = format!("{VS_NAME}.{}", E2E_BINARY_VALUES_TABLE.to_uppercase());
-    assert_eq!(
-        declared_types(&mut conn, VS_NAME, E2E_BINARY_VALUES_TABLE),
-        pairs(&[("ID", "DECIMAL(20,0)"), ("C_BYTES", VARCHAR_JSON)])
-    );
-    assert_query_fails(
+    assert_binary_values_refused(
         &mut conn,
-        &format!("SELECT C_BYTES FROM {binary_values}"),
-        &["non UTF-8 data"],
+        VS_NAME,
+        E2E_BINARY_VALUES_TABLE,
+        "non UTF-8 data",
     );
 }
 
