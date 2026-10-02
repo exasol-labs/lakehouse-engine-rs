@@ -2,18 +2,20 @@
 //! dropping its `lib.rs` re-export, fails to compile.
 #![allow(unused_imports)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
 use iceberg_catalog_rest::{LoadTableResult, StorageCredential};
 use lakehouse_catalog::{
-    AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogProps, CatalogSession,
-    CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
-    IcebergRestCatalogClient, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend,
-    StorageCreds, StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
-    load_table_any_auth, parse_table_ident, redact_credentials, redact_secret_values,
-    resolve_aws_identity, resolve_uc_vended_storage, resolve_vended_storage,
+    AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogProps,
+    CatalogSession, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType,
+    ConnectionCreds, GlueCatalogSession, HIVE_DEFAULT_PARTITION, IcebergRestCatalogClient,
+    PartitionFormat, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend, StorageCreds,
+    StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
+    catalog_identifier_string, load_table_any_auth, parse_glue_table_ident, parse_table_ident,
+    read_iceberg_metadata_file, redact_credentials, redact_secret_values, resolve_aws_identity,
+    resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 const CATALOG_SOURCES: &[(&str, &str)] = &[
@@ -139,6 +141,7 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         format: TableFormat::Delta,
         vended_credential_key: Some("opaque-vending-key".into()),
         partition_columns: vec!["c".into()],
+        metadata_location: None,
         columns: vec![column],
     };
     assert_eq!(table.format, TableFormat::Delta);
@@ -211,6 +214,7 @@ fn added_neutral_variants_are_reachable_from_outside_the_crate() {
             format: TableFormat::Parquet,
             vended_credential_key: None,
             partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![column],
         }],
         skipped: vec![SkippedTable {
@@ -310,6 +314,82 @@ fn unity_catalog_public_items_are_reachable() {
         true,
         &StaticStoreAddress::default(),
     );
+}
+
+/// Scenario: The Glue client and its neutral additions extend the crate's public surface through an explicit reviewed edit
+/// Scenario: No AWS SDK type crosses the crate boundary
+#[test]
+fn glue_additions_are_reachable_through_neutral_types_only() {
+    let new: fn(&str, StorageBackend, ConnectionCreds) -> Result<GlueCatalogSession, UdfError> =
+        GlueCatalogSession::new;
+    let storage = StorageBackend::S3(StorageProps::default());
+    let session = new(
+        "https://glue.eu-west-1.amazonaws.com",
+        storage.clone(),
+        connection_creds(),
+    )
+    .expect("the Glue endpoint names its signing region");
+
+    let partition = CatalogPartition {
+        values: BTreeMap::from([
+            ("p_int".to_string(), Some("1".to_string())),
+            ("p_str".to_string(), None),
+        ]),
+        location: "s3://bucket/t/p_int=1".into(),
+        format: PartitionFormat::Unsupported {
+            input_format: "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat".into(),
+        },
+    };
+    assert_ne!(partition.format, PartitionFormat::Parquet);
+    assert_eq!(HIVE_DEFAULT_PARTITION, "__HIVE_DEFAULT_PARTITION__");
+
+    let ident = CatalogTableIdent {
+        namespace: vec!["sales".into()],
+        name: "orders".into(),
+    };
+    let table = CatalogTable {
+        ident: ident.clone(),
+        table_type: CatalogTableType::Table,
+        storage_location: Some("s3://bucket/orders".into()),
+        format: TableFormat::Iceberg,
+        vended_credential_key: None,
+        partition_columns: vec!["p_int".to_string()],
+        columns: vec![CatalogColumn {
+            name: "payload".into(),
+            source_type: ColumnSourceType::Glue {
+                hive_type: "struct<x:int>".into(),
+            },
+        }],
+        metadata_location: Some("s3://bucket/orders/metadata/00001.metadata.json".into()),
+    };
+    assert_eq!(catalog_identifier_string(&ident), "sales.orders");
+    assert_eq!(
+        parse_glue_table_ident("sales.orders").expect("one database, one table"),
+        ident
+    );
+    let _metadata = read_iceberg_metadata_file(
+        &storage,
+        "s3://bucket/orders/metadata/00001.metadata.json",
+        "sales.orders",
+    );
+    let _ = SkippedTable {
+        ident: ident.clone(),
+        reason: SkipReason::NotPlannableGlueTable {
+            detail: "table_type=delta".into(),
+        },
+    };
+
+    let load = async {
+        let _: Result<CatalogTable, UdfError> = session.load_table(&ident).await;
+    };
+    let partitions = async {
+        let _: Result<Vec<CatalogPartition>, UdfError> = session.partitions(&table).await;
+    };
+    let listing = async {
+        let _: Result<CatalogListing, UdfError> = session.list_tables(&ident.namespace).await;
+    };
+    drop((load, partitions, listing));
+    let _: Box<dyn CatalogClient> = Box::new(session);
 }
 
 fn minimal_load_table_result(config: Vec<(&str, &str)>) -> LoadTableResult {

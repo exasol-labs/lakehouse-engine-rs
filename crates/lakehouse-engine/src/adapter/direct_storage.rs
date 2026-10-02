@@ -105,6 +105,7 @@ impl CatalogClient for DirectStorageCatalogClient {
                     format: TableFormat::Parquet,
                     vended_credential_key: None,
                     partition_columns: Vec::new(),
+                    metadata_location: None,
                     columns,
                 });
             }

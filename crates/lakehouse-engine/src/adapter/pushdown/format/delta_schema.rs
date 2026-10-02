@@ -7,7 +7,7 @@ use exasol_udf_sdk::error::UdfError;
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
 use crate::types::mapping::exasol_representable_catalog_decimal;
 
-use super::RefusedColumn;
+use super::{RefusedColumn, binary_cause};
 
 #[cfg(test)]
 #[path = "delta_schema_tests.rs"]
@@ -41,6 +41,17 @@ pub(super) fn build_delta_table_schema(
     column_mapping_mode: ColumnMappingMode,
     partition_columns: Vec<String>,
 ) -> Result<DeltaTableSchema, UdfError> {
+    classify_spark_schema(schema, column_mapping_mode, partition_columns, "Delta")
+}
+
+/// [`build_delta_table_schema`] for any source declaring Spark types; `label` names the source
+/// in each refusal reason (`"<label> column '<name>' ..."`), and changes no mapping.
+pub(super) fn classify_spark_schema(
+    schema: &StructType,
+    column_mapping_mode: ColumnMappingMode,
+    partition_columns: Vec<String>,
+    label: &str,
+) -> Result<DeltaTableSchema, UdfError> {
     let mut logical_fields = Vec::with_capacity(schema.num_fields());
     let mut refused_columns = Vec::new();
 
@@ -48,7 +59,7 @@ pub(super) fn build_delta_table_schema(
         match walk_field(field, &FieldPath::column(field.name()), column_mapping_mode)? {
             Walked::Refused(refusal) => refused_columns.push(RefusedColumn {
                 column_name: field.name().clone(),
-                reason: refusal.stated_for(field),
+                reason: refusal.stated_for(field, label),
             }),
             Walked::Mapped(MappedField {
                 arrow_type,
@@ -177,10 +188,10 @@ struct Refusal {
 }
 
 impl Refusal {
-    fn stated_for(&self, column: &StructField) -> String {
+    fn stated_for(&self, column: &StructField, label: &str) -> String {
         match &self.member_path {
-            Some(member_path) => refused_container_member(column, member_path, &self.cause),
-            None => refused_column(column, &self.cause),
+            Some(member_path) => refused_container_member(column, member_path, &self.cause, label),
+            None => refused_column(column, &self.cause, label),
         }
     }
 }
@@ -331,7 +342,7 @@ fn walk_primitive(primitive: &PrimitiveType, path: &FieldPath) -> Walked<MappedT
                 tagged("utf8")
             }
         }
-        Binary => refused_type(path, binary_cause()),
+        Binary => refused_type(path, binary_cause("binary")),
     }
 }
 
@@ -356,23 +367,21 @@ fn refused_type(path: &FieldPath, cause: String) -> Walked<MappedType> {
     })
 }
 
-fn refused_column(column: &StructField, cause: &str) -> String {
-    format!("Delta column '{}' {cause}", column.name())
+fn refused_column(column: &StructField, cause: &str, label: &str) -> String {
+    format!("{label} column '{}' {cause}", column.name())
 }
 
-fn refused_container_member(column: &StructField, member_path: &str, cause: &str) -> String {
+fn refused_container_member(
+    column: &StructField,
+    member_path: &str,
+    cause: &str,
+    label: &str,
+) -> String {
     format!(
-        "Delta column '{}' has type '{}', whose member '{member_path}' {cause}",
+        "{label} column '{}' has type '{}', whose member '{member_path}' {cause}",
         column.name(),
         column.data_type(),
     )
-}
-
-fn binary_cause() -> String {
-    "has type 'binary', which this engine refuses rather than casting to text: the cast replaces \
-     every byte sequence that is not valid UTF-8 with NULL, silently corrupting the value; JSON \
-     rendering for binary is tracked as issue #351"
-        .to_string()
 }
 
 fn variant_cause() -> String {

@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 #[path = "parquet_fixture_tests.rs"]
 pub(super) mod parquet_fixture;
+#[path = "recording_store_tests.rs"]
+pub(super) mod recording_store;
 
 #[test]
 fn dispatch_get_capabilities() {
@@ -319,6 +321,33 @@ fn adapter_note_absent_or_unparseable_yields_none() {
     assert!(adapter_note(&empty, NOTE_PARALLELISM_FACTOR).is_none());
 }
 
+impl Default for super::TuningNotes {
+    fn default() -> Self {
+        Self {
+            parallelism_factor: DEFAULT_PARALLELISM_FACTOR,
+            df_threading_mode: ThreadingMode::Auto,
+            df_target_partitions: DEFAULT_DF_TARGET_PARTITIONS,
+            df_threads_per_udf: DEFAULT_DF_THREADS_PER_UDF,
+            df_batch_size: DEFAULT_DF_BATCH_SIZE,
+            memory_pool_fraction: DEFAULT_MEMORY_POOL_FRACTION,
+            instance_overhead_mb: DEFAULT_INSTANCE_OVERHEAD_MB,
+            s3_max_connections: DEFAULT_S3_MAX_CONNECTIONS,
+            join_broadcast_max_bytes: DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        }
+    }
+}
+
+fn parsed_notes(
+    request: &Json,
+    tuning: &TuningNotes,
+    table_map: &[(String, String)],
+    skipped: &[SkippedTable],
+) -> Json {
+    let notes = build_adapter_notes(request, tuning, table_map, skipped);
+    serde_json::from_str(notes.as_str().expect("adapterNotes is a JSON string"))
+        .expect("adapterNotes is valid JSON")
+}
+
 #[test]
 fn build_adapter_notes_merges_existing() {
     let req = serde_json::json!({
@@ -327,21 +356,7 @@ fn build_adapter_notes_merges_existing() {
             "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
         },
     });
-    let notes = build_adapter_notes(
-        &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &[],
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+    let parsed = parsed_notes(&req, &TuningNotes::default(), &[], &[]);
     assert_eq!(
         parsed["OTHER_KEY"].as_str(),
         Some("keep-me"),
@@ -357,21 +372,7 @@ fn build_adapter_notes_merges_existing() {
 #[test]
 fn adapter_notes_omit_cluster_nodes() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &request,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &[],
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &[], &[]);
     assert!(
         parsed.get("CLUSTER_NODES").is_none(),
         "a freshly built createVirtualSchema response must carry no CLUSTER_NODES key"
@@ -397,21 +398,7 @@ fn refresh_rebuilds_table_map_preserves_notes() {
     });
 
     let fresh_table_map = vec![("NEW_TABLE".to_string(), "ns.new_table".to_string())];
-    let notes = build_adapter_notes(
-        &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &fresh_table_map,
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+    let parsed = parsed_notes(&req, &TuningNotes::default(), &fresh_table_map, &[]);
 
     assert_eq!(
         parsed["OTHER_KEY"].as_str(),
@@ -445,22 +432,15 @@ fn create_vs_records_parallelism_factor() {
     assert_eq!(factor, 4, "factor must be read from the property");
 
     let request = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
+    let parsed = parsed_notes(
         &request,
-        factor,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            parallelism_factor: factor,
+            ..TuningNotes::default()
+        },
+        &[],
         &[],
     );
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
     assert_eq!(
         parsed[NOTE_PARALLELISM_FACTOR].as_str(),
         Some("4"),
@@ -487,15 +467,11 @@ fn adapter_notes_carry_parallelism_factor() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        12,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            parallelism_factor: 12,
+            ..TuningNotes::default()
+        },
+        &[],
         &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -608,21 +584,15 @@ fn df_target_partitions_uses_supplied_value() {
     assert_eq!(val, 4, "explicit value must be returned");
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
+    let parsed = parsed_notes(
         &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        val,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            df_target_partitions: val,
+            ..TuningNotes::default()
+        },
+        &[],
         &[],
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert_eq!(
         parsed[NOTE_DF_TARGET_PARTITIONS].as_str(),
         Some("4"),
@@ -653,15 +623,11 @@ fn df_batch_size_uses_supplied_value() {
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        val,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            df_batch_size: val,
+            ..TuningNotes::default()
+        },
+        &[],
         &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -708,21 +674,15 @@ fn df_threads_per_udf_uses_supplied_value() {
     assert_eq!(val, 2, "explicit value must be returned");
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
+    let parsed = parsed_notes(
         &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        val,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            df_threads_per_udf: val,
+            ..TuningNotes::default()
+        },
+        &[],
         &[],
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert_eq!(
         parsed[NOTE_DF_THREADS_PER_UDF].as_str(),
         Some("2"),
@@ -867,15 +827,11 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        67_108_864,
+        &TuningNotes {
+            join_broadcast_max_bytes: 67_108_864,
+            ..TuningNotes::default()
+        },
+        &[],
         &[],
     );
 
@@ -896,15 +852,12 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        0.5,
-        256,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            memory_pool_fraction: 0.5,
+            instance_overhead_mb: 256,
+            ..TuningNotes::default()
+        },
+        &[],
         &[],
     );
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
@@ -1023,21 +976,7 @@ fn threading_mode_defaults_to_auto() {
     );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &[],
-    );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+    let parsed = parsed_notes(&req, &TuningNotes::default(), &[], &[]);
     assert_eq!(
         parsed[NOTE_DF_THREADING_MODE].as_str(),
         Some("AUTO"),
@@ -1111,19 +1050,7 @@ fn table_map_round_trips_through_adapter_notes() {
         ),
     ];
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &table_map,
-    );
+    let notes = build_adapter_notes(&create_req, &TuningNotes::default(), &table_map, &[]);
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
     let pushdown_req = serde_json::json!({
@@ -1148,22 +1075,7 @@ fn table_map_round_trips_through_adapter_notes() {
 fn table_map_stored_as_nested_json_object() {
     let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &table_map,
-    );
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
+    let parsed = parsed_notes(&create_req, &TuningNotes::default(), &table_map, &[]);
     assert!(
         parsed[NOTE_TABLE_MAP].is_object(),
         "TABLE_MAP must be a nested JSON object: {parsed}"
@@ -1183,21 +1095,12 @@ fn table_map_merges_with_existing_notes() {
             "adapterNotes": "{\"CLUSTER_NODES\":\"5\",\"OTHER\":\"preserved\"}"
         },
     });
-    let notes = build_adapter_notes(
+    let parsed = parsed_notes(
         &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes::default(),
         &[("T".to_string(), "ns.t".to_string())],
+        &[],
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert_eq!(parsed["OTHER"].as_str(), Some("preserved"));
     assert_eq!(
         parsed["CLUSTER_NODES"].as_str(),
@@ -1228,19 +1131,7 @@ fn read_table_map_absent_returns_empty() {
 
 fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &str) -> Json {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        table_map,
-    );
+    let notes = build_adapter_notes(&create_req, &TuningNotes::default(), table_map, &[]);
     let notes_str = notes.as_str().unwrap().to_string();
     serde_json::json!({
         "type": "pushdown",
@@ -1361,22 +1252,7 @@ fn create_vs_records_table_map_in_adapter_notes() {
             "adapterNotes": "{\"CLUSTER_NODES\":\"3\"}"
         }
     });
-    let notes = build_adapter_notes(
-        &request,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &table_map,
-    );
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &table_map, &[]);
 
     let table_map_obj = parsed[NOTE_TABLE_MAP]
         .as_object()
@@ -1415,6 +1291,7 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
             format: TableFormat::Iceberg,
             vended_credential_key: None,
             partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![
                 CatalogColumn {
                     name: "order_id".to_string(),
@@ -1471,24 +1348,206 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     );
 }
 
+fn skipped_entry(table: &str, reason: SkipReason) -> SkippedTable {
+    SkippedTable {
+        ident: cat_ident(&["sales"], table),
+        reason,
+    }
+}
+
+/// Scenario: Every skipped table is recorded with its reason under every catalog kind
 #[test]
-fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
-    assert_eq!(
-        skip_warning(&SkippedTable {
-            ident: cat_ident(&["prod", "finance"], "hive_events"),
-            reason: SkipReason::NotLoadableIcebergTable,
-        }),
-        "createVirtualSchema: skipping non-Iceberg table 'prod.finance.hive_events' (catalog reported it is not a loadable Iceberg table)"
-    );
-    assert_eq!(
-        skip_warning(&SkippedTable {
-            ident: cat_ident(&["prod", "finance"], "orders_summary"),
-            reason: SkipReason::NotDeltaBaseTable {
+fn skipped_tables_are_recorded_with_reasons_for_every_kind() {
+    let skipped = vec![
+        skipped_entry("hive_events", SkipReason::NotLoadableIcebergTable),
+        skipped_entry(
+            "summary",
+            SkipReason::NotDeltaBaseTable {
                 detail: "table_type=VIEW".to_string(),
             },
-        }),
-        "createVirtualSchema: skipping non-Delta-base entry 'prod.finance.orders_summary' (table_type=VIEW)"
+        ),
+        skipped_entry("empty_dir", SkipReason::NoDataFile),
+        skipped_entry(
+            "orders_orc",
+            SkipReason::NotPlannableGlueTable {
+                detail: "InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat".to_string(),
+            },
+        ),
+        skipped_entry(
+            "projected",
+            SkipReason::NotPlannableGlueTable {
+                detail: "projection.enabled=true".to_string(),
+            },
+        ),
+    ];
+
+    let parsed = parsed_notes(
+        &json!({"type": "createVirtualSchema"}),
+        &TuningNotes::default(),
+        &[],
+        &skipped,
     );
+
+    let recorded = parsed["SKIPPED_TABLES"].as_array().expect("an array");
+    let expected = [
+        (
+            "sales.hive_events",
+            "non-Iceberg table",
+            "catalog reported it is not a loadable Iceberg table",
+        ),
+        ("sales.summary", "non-Delta-base entry", "table_type=VIEW"),
+        ("sales.empty_dir", "directory", "holds no data file"),
+        (
+            "sales.orders_orc",
+            "Glue table",
+            "InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",
+        ),
+        ("sales.projected", "Glue table", "projection.enabled=true"),
+    ];
+    assert_eq!(recorded.len(), expected.len());
+    for ((table, kind, reason), (entry, source)) in
+        expected.iter().zip(recorded.iter().zip(&skipped))
+    {
+        assert_eq!(entry, &json!({"table": table, "reason": reason}));
+        assert_eq!(
+            skip_warning(source),
+            format!("createVirtualSchema: skipping {kind} '{table}' ({reason})"),
+            "the warning line must state the same reason as the note"
+        );
+    }
+}
+
+/// Scenario: A listing with no skip records an empty list that replaces the previous one
+#[test]
+fn a_listing_without_skips_records_an_empty_list_replacing_the_previous() {
+    let request = json!({
+        "type": "refresh",
+        "schemaMetadataInfo": {
+            "adapterNotes": json!({
+                "SKIPPED_TABLES": [
+                    {"table": "sales.a", "reason": "holds no data file"},
+                    {"table": "sales.b", "reason": "holds no data file"},
+                ],
+                "TABLE_MAP": {"STALE": "sales.stale"},
+            })
+            .to_string()
+        },
+    });
+    let table_map = vec![("FRESH".to_string(), "sales.fresh".to_string())];
+
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &table_map, &[]);
+
+    assert_eq!(parsed["SKIPPED_TABLES"], json!([]));
+    assert_eq!(parsed["TABLE_MAP"], json!({"FRESH": "sales.fresh"}));
+}
+
+/// Scenario: A namespace whose every table is skipped still creates an empty virtual schema
+#[test]
+fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
+    let listing = CatalogListing {
+        tables: Vec::new(),
+        skipped: vec![
+            skipped_entry("a", SkipReason::NoDataFile),
+            skipped_entry("b", SkipReason::NotLoadableIcebergTable),
+        ],
+    };
+
+    let (tables_json, table_map, skipped) = build_listing_virtual_tables(
+        &["sales".to_string()],
+        &listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .expect("an all-skipped namespace must not fail the listing");
+    let parsed = parsed_notes(
+        &json!({"type": "createVirtualSchema"}),
+        &TuningNotes::default(),
+        &table_map,
+        &skipped,
+    );
+
+    assert!(tables_json.is_empty());
+    assert_eq!(parsed["TABLE_MAP"], json!({}));
+    assert_eq!(parsed["SKIPPED_TABLES"].as_array().unwrap().len(), 2);
+}
+
+/// Scenario: A skipped-table list too long for adapterNotes is capped to the longest prefix that fits
+#[test]
+fn an_oversized_skipped_list_is_capped_to_the_longest_prefix_that_fits_the_exasol_limit() {
+    for filler in ["0", "é"] {
+        let total = 15_000;
+        let skipped: Vec<SkippedTable> = (0..total)
+            .map(|i| {
+                skipped_entry(
+                    &format!("{i:0>80}{}", filler.repeat(40)),
+                    SkipReason::NoDataFile,
+                )
+            })
+            .collect();
+
+        let notes = build_adapter_notes(
+            &json!({"type": "createVirtualSchema"}),
+            &TuningNotes::default(),
+            &[],
+            &skipped,
+        );
+        let text = notes.as_str().expect("adapterNotes is a JSON string");
+        let parsed: Json = serde_json::from_str(text).expect("valid JSON");
+
+        let recorded = parsed["SKIPPED_TABLES"].as_array().expect("an array");
+        let kept = recorded.len();
+        assert!(kept > 0 && kept < total, "{filler}: kept {kept} of {total}");
+        assert!(
+            text.len() <= ADAPTER_NOTES_MAX_BYTES,
+            "{filler}: {} bytes",
+            text.len()
+        );
+        assert_eq!(
+            parsed["SKIPPED_TABLES_OMITTED"],
+            json!((total - kept).to_string())
+        );
+        for (entry, source) in recorded.iter().zip(&skipped) {
+            assert_eq!(entry["table"], catalog_identifier_string(&source.ident));
+        }
+        let mut one_more = parsed.clone();
+        one_more["SKIPPED_TABLES"]
+            .as_array_mut()
+            .expect("an array")
+            .push(json!({
+                "table": catalog_identifier_string(&skipped[kept].ident),
+                "reason": skip_kind_and_reason(&skipped[kept]).1,
+            }));
+        let still_omitted = total - kept - 1;
+        if still_omitted == 0 {
+            one_more
+                .as_object_mut()
+                .expect("an object")
+                .remove("SKIPPED_TABLES_OMITTED");
+        } else {
+            one_more["SKIPPED_TABLES_OMITTED"] = json!(still_omitted.to_string());
+        }
+        let with_one_more = one_more.to_string().len();
+        assert!(
+            with_one_more > ADAPTER_NOTES_MAX_BYTES,
+            "{filler}: one more entry would still fit ({with_one_more} bytes)"
+        );
+    }
+}
+
+/// Scenario: A skipped-table list too long for adapterNotes is capped to the longest prefix that fits
+#[test]
+fn a_skipped_list_that_fits_keeps_every_entry_and_drops_a_stale_omitted_count() {
+    let request = json!({
+        "type": "refresh",
+        "schemaMetadataInfo": {
+            "adapterNotes": json!({ "SKIPPED_TABLES_OMITTED": "7" }).to_string()
+        },
+    });
+    let skipped = vec![skipped_entry("a", SkipReason::NoDataFile)];
+
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &[], &skipped);
+
+    assert_eq!(parsed["SKIPPED_TABLES"].as_array().unwrap().len(), 1);
+    assert!(parsed.get("SKIPPED_TABLES_OMITTED").is_none());
 }
 
 #[test]

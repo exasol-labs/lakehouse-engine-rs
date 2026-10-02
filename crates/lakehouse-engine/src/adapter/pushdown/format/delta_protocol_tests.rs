@@ -1,13 +1,7 @@
 use delta_kernel::table_features::TableFeature;
 
 use super::*;
-
-fn user_message(err: UdfError) -> String {
-    match err {
-        UdfError::User(message) => message,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    }
-}
+use crate::adapter::pushdown::test_support::user_message;
 
 /// Scenario: A reader feature outside the allow-list refuses the table before any log replay
 #[test]

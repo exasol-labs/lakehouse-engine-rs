@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
-    CatalogClient, CatalogProps, CatalogSession, CatalogTableIdent, UnityCatalogSession,
-    parse_table_ident,
+    CatalogClient, CatalogProps, CatalogSession, CatalogTableIdent, GlueCatalogSession,
+    UnityCatalogSession, parse_glue_table_ident, parse_table_ident,
 };
 use object_store::ObjectStore;
 use serde_json::Value as Json;
@@ -32,6 +32,7 @@ pub(super) struct TableScanResolver<'a> {
 enum RequestSession {
     Iceberg(CatalogSession),
     Unity(Box<UnityCatalogSession>),
+    Glue(Box<GlueCatalogSession>),
     DirectStorage {
         store: Arc<dyn ObjectStore>,
         base_path: String,
@@ -74,6 +75,16 @@ impl<'a> TableScanResolver<'a> {
                     catalog_uri,
                     connection.creds.clone(),
                 )))
+            }
+            CatalogKind::Glue => {
+                for identifier in table_identifiers {
+                    parse_glue_table_ident(identifier)?;
+                }
+                RequestSession::Glue(Box::new(GlueCatalogSession::new(
+                    catalog_uri,
+                    connection.storage.clone(),
+                    connection.creds.clone(),
+                )?))
             }
             CatalogKind::DirectStorage => {
                 for identifier in table_identifiers {
@@ -129,6 +140,19 @@ impl<'a> TableScanResolver<'a> {
                     .await?;
                 let reader = format_reader(
                     ScanSource::Unity {
+                        session: session.as_ref(),
+                        table: &table,
+                    },
+                    &self.connection,
+                )?;
+                reader.resolve_scan(filter_json).await
+            }
+            RequestSession::Glue(session) => {
+                let table = session
+                    .load_table(&parse_glue_table_ident(table_identifier)?)
+                    .await?;
+                let reader = format_reader(
+                    ScanSource::Glue {
                         session: session.as_ref(),
                         table: &table,
                     },

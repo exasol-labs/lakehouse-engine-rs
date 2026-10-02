@@ -1,129 +1,16 @@
 use super::*;
 use crate::adapter::tests::parquet_fixture::{
-    directory_options, in_memory_store, nullable, parquet_bytes, values,
+    directory_options, in_memory_store, nullable, parquet_bytes, parquet_footer_bytes,
+    parquet_schema_footer_bytes, values,
 };
+use crate::adapter::tests::recording_store::RecordingStore;
 use crate::types::mapping::arrow_to_exasol_type;
 use arrow::datatypes::{Fields, TimeUnit};
-use futures::StreamExt;
-use object_store::{ObjectMeta, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStoreExt, PutPayload};
 
 /// The prefix every fixture is written under, so a test also pins that objects OUTSIDE it are
 /// never listed.
 const TABLE_ROOT: &str = "warehouse/direct/events";
-
-/// Hands back the inner store's listing REVERSED (so a test can't pass by luck against
-/// [`InMemory`](object_store::memory::InMemory)'s already-sorted order) and records every read,
-/// HEAD vs. GET distinctly.
-#[derive(Debug)]
-struct ReversedListingStore {
-    inner: Arc<dyn ObjectStore>,
-    reads: Arc<std::sync::Mutex<Vec<String>>>,
-}
-
-impl ReversedListingStore {
-    fn wrapping(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            reads: Arc::new(std::sync::Mutex::new(Vec::new())),
-        })
-    }
-
-    fn reads(&self) -> Vec<String> {
-        self.reads.lock().expect("read log is not poisoned").clone()
-    }
-
-    fn files_read(&self) -> Vec<String> {
-        let mut paths: Vec<String> = self
-            .reads()
-            .into_iter()
-            .filter_map(|read| read.strip_prefix("get ").map(str::to_string))
-            .collect();
-        paths.sort();
-        paths.dedup();
-        paths
-    }
-}
-
-impl std::fmt::Display for ReversedListingStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ReversedListingStore({})", self.inner)
-    }
-}
-
-#[async_trait::async_trait]
-impl ObjectStore for ReversedListingStore {
-    async fn put_opts(
-        &self,
-        location: &StorePath,
-        payload: PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &StorePath,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &StorePath,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        let verb = if options.head { "head" } else { "get" };
-        self.reads
-            .lock()
-            .expect("read log is not poisoned")
-            .push(format!("{verb} {location}"));
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: futures::stream::BoxStream<'static, object_store::Result<StorePath>>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<StorePath>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&StorePath>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        let inner = Arc::clone(&self.inner);
-        let prefix = prefix.cloned();
-        futures::stream::once(async move {
-            match inner.list(prefix.as_ref()).try_collect::<Vec<_>>().await {
-                Ok(mut metas) => {
-                    metas.reverse();
-                    metas.into_iter().map(Ok).collect::<Vec<_>>()
-                }
-                Err(error) => vec![Err(error)],
-            }
-        })
-        .flat_map(futures::stream::iter)
-        .boxed()
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&StorePath>,
-    ) -> object_store::Result<object_store::ListResult> {
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &StorePath,
-        to: &StorePath,
-        options: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
-}
 
 fn under_root(key: &str) -> String {
     format!("{TABLE_ROOT}/{key}")
@@ -135,23 +22,23 @@ fn rooted(keys: &[&str]) -> Vec<String> {
 
 /// A store holding each object at its key below [`TABLE_ROOT`], seen through the reversing,
 /// read-recording decorator.
-async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<ReversedListingStore> {
+async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<RecordingStore> {
     let keys: Vec<String> = objects.iter().map(|(key, _)| under_root(key)).collect();
     let rooted: Vec<(&str, &[u8])> = keys
         .iter()
         .zip(objects)
         .map(|(key, (_, bytes))| (key.as_str(), *bytes))
         .collect();
-    ReversedListingStore::wrapping(in_memory_store(&rooted).await)
+    RecordingStore::reversing(in_memory_store(&rooted).await)
 }
 
-async fn store_with(keys: &[&str], data: &[u8]) -> Arc<ReversedListingStore> {
+async fn store_with(keys: &[&str], data: &[u8]) -> Arc<RecordingStore> {
     let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data)).collect();
     store_holding(&objects).await
 }
 
 async fn resolve(
-    probe: &Arc<ReversedListingStore>,
+    probe: &Arc<RecordingStore>,
     merge_mode: MergeMode,
     keep: &PartitionKeepPredicate,
 ) -> Result<ParquetDirectory, UdfError> {
@@ -1003,6 +890,128 @@ fn the_store_prefix_is_the_percent_decoded_path_below_the_store_root() {
     );
 }
 
+/// Scenario: The file pattern selects the listing depth and the file-name rule
+#[tokio::test]
+async fn file_pattern_selects_listing_depth_and_file_name_rule() {
+    let body: &[u8] = b"a non-empty object";
+    let probe = store_holding(&[
+        ("a.parquet", body),
+        ("b", body),
+        ("sub/c.parquet", body),
+        ("sub/d", body),
+        ("_SUCCESS", body),
+        (".hidden", body),
+        ("e.parquet", b""),
+    ])
+    .await;
+    let store = Arc::clone(&probe) as Arc<dyn ObjectStore>;
+
+    for (pattern, expected) in [
+        (
+            FilePattern::ParquetAtAnyDepth,
+            vec!["a.parquet", "sub/c.parquet"],
+        ),
+        (FilePattern::AnyDirectChild, vec!["a.parquet", "b"]),
+    ] {
+        let files = list_location_files(&store, &root(), pattern)
+            .await
+            .unwrap_or_else(|e| panic!("the prefix lists under {pattern:?}: {e}"));
+
+        assert_eq!(
+            files
+                .iter()
+                .map(|file| file.path.as_ref().to_string())
+                .collect::<Vec<_>>(),
+            rooted(&expected),
+            "{pattern:?}: a '_' or '.' segment and a zero-length object are never data files, \
+             and the order does not depend on the store's own listing order"
+        );
+        assert!(
+            files.iter().all(|file| file.size == body.len() as u64),
+            "{pattern:?}: each size is carried from the listing response"
+        );
+    }
+    assert_eq!(
+        probe.listings(),
+        vec![
+            format!("recursive {TABLE_ROOT}"),
+            format!("delimited {TABLE_ROOT}"),
+        ],
+        "only the any-depth pattern lists recursively; the direct-child one lists the direct \
+         children alone"
+    );
+    assert!(
+        probe.reads().is_empty(),
+        "the listing reads no object: {:?}",
+        probe.reads()
+    );
+}
+
+/// Scenario: A catalog-registered location is listed by its raw object key
+#[tokio::test]
+async fn a_raw_key_location_is_listed_without_percent_decoding() {
+    let location = "s3://bucket/tbl/p_str=a b%2Fc/";
+    let body: &[u8] = b"a non-empty object";
+    let store = in_memory_store(&[("tbl/p_str=a b%2Fc/f1", body), ("tbl/p_str=a b/c/f2", body)])
+        .await as Arc<dyn ObjectStore>;
+
+    let (store_root, prefix) =
+        raw_location_prefix(location).expect("an S3 location names a store root and a key");
+    let files = list_location_files(&store, &prefix, FilePattern::AnyDirectChild)
+        .await
+        .expect("the raw key lists");
+
+    assert_eq!(
+        (store_root.as_str(), prefix.as_ref()),
+        ("s3://bucket", "tbl/p_str=a b%2Fc"),
+        "the key is taken verbatim, with no percent-decoding"
+    );
+    assert_eq!(
+        files
+            .iter()
+            .map(|file| file.path.as_ref().to_string())
+            .collect::<Vec<_>>(),
+        vec!["tbl/p_str=a b%2Fc/f1"],
+        "the literal key lists, never the key its decoding would name"
+    );
+    assert_eq!(
+        store_prefix(location)
+            .expect("the location also parses as a URL")
+            .as_ref(),
+        "tbl/p_str=a b/c",
+        "a direct-storage or Unity storage URI is still decoded as a URL"
+    );
+    for (other, expected_root, expected_key) in [
+        ("s3a://bucket/tbl/", "s3://bucket", "tbl"),
+        ("S3://bucket/tbl", "s3://bucket", "tbl"),
+        ("s3://bucket", "s3://bucket", ""),
+        ("s3://bucket/", "s3://bucket", ""),
+        ("s3://bucket/a#b/c?d", "s3://bucket", "a#b/c?d"),
+    ] {
+        let (root, key) =
+            raw_location_prefix(other).unwrap_or_else(|e| panic!("'{other}' names a key: {e}"));
+        assert_eq!(
+            (root.as_str(), key.as_ref()),
+            (expected_root, expected_key),
+            "for '{other}'"
+        );
+    }
+}
+
+#[test]
+fn a_location_naming_no_scheme_bucket_or_valid_key_is_refused_naming_it() {
+    for (location, cause) in [
+        ("bucket/tbl", "no scheme"),
+        ("://bucket/tbl", "no scheme"),
+        ("s3:///tbl", "no bucket"),
+        ("s3://bucket/tbl//part", "empty path segment"),
+    ] {
+        let error = raw_location_prefix(location)
+            .expect_err("a location that names no raw key must be refused");
+        assert_mentions(&error, &[location, cause]);
+    }
+}
+
 /// Scenario: The listing answer serves a caller that declares its own partition columns
 #[tokio::test]
 async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_footer() {
@@ -1073,5 +1082,238 @@ async fn listing_answer_fills_caller_declared_partition_columns_and_reads_no_foo
             .collect::<Vec<_>>(),
         rooted(&["year=2024/region=eu/a.parquet"]),
         "the keep predicate runs on the filled values before the files are returned"
+    );
+}
+
+fn binary_column(column: &str, member_path: Option<&str>, declared: &str) -> BinaryColumn {
+    BinaryColumn {
+        column: column.to_string(),
+        member_path: member_path.map(str::to_string),
+        declared: declared.to_string(),
+        nested_enum: declared == "enum",
+    }
+}
+
+/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
+#[tokio::test]
+async fn every_footer_leaf_is_classified_by_its_parquet_annotation() {
+    let footer = parquet_footer_bytes(
+        "message classified {
+            OPTIONAL INT32 id;
+            OPTIONAL BYTE_ARRAY name (STRING);
+            OPTIONAL BYTE_ARRAY legacy_utf8 (UTF8);
+            OPTIONAL BYTE_ARRAY doc_json (JSON);
+            OPTIONAL BYTE_ARRAY kind (ENUM);
+            OPTIONAL BYTE_ARRAY price (DECIMAL(10,2));
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (8) amount (DECIMAL(18,2));
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (2) half (FLOAT16);
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (12) span (INTERVAL);
+            OPTIONAL BYTE_ARRAY legacy_name;
+            OPTIONAL BYTE_ARRAY doc_bson (BSON);
+            OPTIONAL BYTE_ARRAY shape (GEOMETRY);
+            OPTIONAL BYTE_ARRAY area (GEOGRAPHY);
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (16) uid (UUID);
+            OPTIONAL FIXED_LEN_BYTE_ARRAY (20) digest;
+            OPTIONAL GROUP s {
+                OPTIONAL BYTE_ARRAY ok (STRING);
+                OPTIONAL BYTE_ARRAY k (ENUM);
+                OPTIONAL BYTE_ARRAY raw;
+            }
+            OPTIONAL GROUP texts (LIST) {
+                REPEATED GROUP list {
+                    OPTIONAL BYTE_ARRAY element (STRING);
+                }
+            }
+            OPTIONAL GROUP l (LIST) {
+                REPEATED GROUP list {
+                    OPTIONAL BYTE_ARRAY element;
+                }
+            }
+            OPTIONAL GROUP m (MAP) {
+                REPEATED GROUP key_value {
+                    REQUIRED BYTE_ARRAY key (STRING);
+                    OPTIONAL FIXED_LEN_BYTE_ARRAY (4) value;
+                }
+            }
+            REPEATED BYTE_ARRAY tags (ENUM);
+        }",
+    );
+    let probe = store_holding(&[("a.parquet", &footer)]).await;
+
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
+        .await
+        .expect("every annotation of the fixture folds to an Arrow type");
+
+    assert_eq!(
+        directory.binary_columns,
+        vec![
+            binary_column("legacy_name", None, "binary"),
+            binary_column("doc_bson", None, "bson"),
+            binary_column("shape", None, "geometry"),
+            binary_column("area", None, "geography"),
+            binary_column("uid", None, "uuid"),
+            binary_column("digest", None, "fixed(20)"),
+            binary_column("s", Some("s.k"), "enum"),
+            binary_column("l", Some("l.list.element"), "binary"),
+            binary_column("m", Some("m.key_value.value"), "fixed(4)"),
+            binary_column("tags", None, "enum"),
+        ],
+        "a STRING, JSON, top-level ENUM, DECIMAL, FLOAT16, or INTERVAL leaf is not binary; every \
+         other byte-array leaf is, named in the file's terms, with the column's first such member"
+    );
+    assert_eq!(
+        directory.schema.fields().len(),
+        20,
+        "classifying the leaves drops no column from the folded schema"
+    );
+}
+
+/// Scenario: A direct-storage ENUM column reads as text
+#[tokio::test]
+async fn a_converted_type_decides_a_leaf_that_carries_no_logical_type() {
+    use parquet::basic::Repetition;
+    use parquet::schema::types::Type as SchemaType;
+
+    let leaf = |name: &'static str, physical: PhysicalType, converted: ConvertedType| {
+        SchemaType::primitive_type_builder(name, physical)
+            .with_repetition(Repetition::OPTIONAL)
+            .with_converted_type(converted)
+    };
+    let fields = vec![
+        leaf("kind", PhysicalType::BYTE_ARRAY, ConvertedType::ENUM).build(),
+        leaf("doc_bson", PhysicalType::BYTE_ARRAY, ConvertedType::BSON).build(),
+        leaf("doc_json", PhysicalType::BYTE_ARRAY, ConvertedType::JSON).build(),
+        leaf("price", PhysicalType::BYTE_ARRAY, ConvertedType::DECIMAL)
+            .with_precision(10)
+            .with_scale(2)
+            .build(),
+        leaf(
+            "amount",
+            PhysicalType::FIXED_LEN_BYTE_ARRAY,
+            ConvertedType::DECIMAL,
+        )
+        .with_length(8)
+        .with_precision(18)
+        .with_scale(2)
+        .build(),
+        SchemaType::group_type_builder("s")
+            .with_repetition(Repetition::OPTIONAL)
+            .with_fields(vec![Arc::new(
+                leaf("k", PhysicalType::BYTE_ARRAY, ConvertedType::ENUM)
+                    .build()
+                    .expect("a converted ENUM byte array is valid"),
+            )])
+            .build(),
+    ];
+    let schema = SchemaType::group_type_builder("converted")
+        .with_fields(
+            fields
+                .into_iter()
+                .map(|field| Arc::new(field.expect("each fixture leaf is a valid Parquet type")))
+                .collect(),
+        )
+        .build()
+        .expect("the fixture schema is valid");
+    let footer = parquet_schema_footer_bytes(schema);
+    let probe = store_holding(&[("a.parquet", &footer)]).await;
+
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
+        .await
+        .expect("every converted type of the fixture folds to an Arrow type");
+
+    assert_eq!(
+        directory.binary_columns,
+        vec![
+            binary_column("doc_bson", None, "bson"),
+            binary_column("s", Some("s.k"), "enum"),
+        ],
+        "a legacy writer's converted type classifies the leaf exactly as its logical type would"
+    );
+}
+
+/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
+#[tokio::test]
+async fn an_embedded_arrow_schema_binary_leaf_declares_binary() {
+    let probe = store_holding(&[(
+        "a.parquet",
+        &parquet_bytes(
+            vec![
+                nullable("id", DataType::Int32),
+                nullable("text", DataType::Utf8View),
+                nullable("large", DataType::LargeBinary),
+                nullable("view", DataType::BinaryView),
+            ],
+            1,
+        ),
+    )])
+    .await;
+
+    let directory = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
+        .await
+        .expect("the Arrow-written file folds");
+
+    assert_eq!(
+        column_types(&directory.schema),
+        vec![
+            ("id".to_string(), DataType::Int32),
+            ("text".to_string(), DataType::Utf8View),
+            ("large".to_string(), DataType::LargeBinary),
+            ("view".to_string(), DataType::BinaryView),
+        ],
+        "the embedded Arrow schema still folds each column to its own Arrow type"
+    );
+    assert_eq!(
+        directory.binary_columns,
+        vec![
+            binary_column("large", None, "binary"),
+            binary_column("view", None, "binary"),
+        ],
+        "the Parquet leaf under an Arrow LargeBinary or BinaryView is an unannotated BYTE_ARRAY"
+    );
+}
+
+/// Scenario: A direct-storage unannotated BYTE_ARRAY column is refused
+#[tokio::test]
+async fn each_column_keeps_the_first_binary_leaf_any_read_footer_declares() {
+    let first = parquet_footer_bytes(
+        "message first {
+            OPTIONAL INT32 id;
+            OPTIONAL BYTE_ARRAY payload;
+            OPTIONAL BYTE_ARRAY region;
+        }",
+    );
+    let second = parquet_footer_bytes(
+        "message second {
+            OPTIONAL INT32 id;
+            OPTIONAL BYTE_ARRAY payload (BSON);
+            OPTIONAL BYTE_ARRAY extra (GEOMETRY);
+        }",
+    );
+    let probe = store_holding(&[
+        ("region=eu/a.parquet", &first),
+        ("region=us/b.parquet", &second),
+    ])
+    .await;
+
+    let folded = resolve(&probe, MergeMode::FoldEveryFile, &|_| true)
+        .await
+        .expect("both footers fold");
+    let sampled = resolve(&probe, MergeMode::SampleOneFile, &|_| true)
+        .await
+        .expect("the first footer folds");
+
+    assert_eq!(
+        folded.binary_columns,
+        vec![
+            binary_column("payload", None, "binary"),
+            binary_column("extra", None, "geometry"),
+        ],
+        "the first listed file names a column's type, a later file adds its own columns, and a \
+         stored column dropped for a partition key is never refused"
+    );
+    assert_eq!(
+        sampled.binary_columns,
+        vec![binary_column("payload", None, "binary")],
+        "sampling one footer classifies that footer alone"
     );
 }

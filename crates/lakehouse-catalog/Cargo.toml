@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-catalog"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 license.workspace = true
 
@@ -15,14 +15,16 @@ iceberg-catalog-rest    = { workspace = true }
 # `opendal-azdls`: ADLS Gen2 FileIO backend, in addition to the workspace `opendal-s3`.
 iceberg-storage-opendal = { workspace = true, features = ["opendal-azdls"] }
 
+futures    = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 url        = { workspace = true }
 
-# MSRV 1.91.1: must stay buildable by the rustc 1.94 UDF builder.
+# MSRV 1.94.1 (aws-sdk-glue, aws-smithy-runtime-api): must stay buildable by the rust:1.94-trixie UDF builder.
 aws-sigv4              = { workspace = true }
 aws-credential-types   = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
+aws-sdk-glue           = { workspace = true }
 
 reqwest = { workspace = true }
 

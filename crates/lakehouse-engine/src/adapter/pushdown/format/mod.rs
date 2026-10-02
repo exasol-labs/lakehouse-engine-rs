@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
-    CatalogProps, CatalogSession, CatalogTable, ConnectionCreds, StorageBackend, TableFormat,
-    UnityCatalogSession,
+    CatalogProps, CatalogSession, CatalogTable, ConnectionCreds, GlueCatalogSession,
+    StorageBackend, TableFormat, UnityCatalogSession,
 };
 use object_store::ObjectStore;
 use serde_json::Value as Json;
@@ -17,6 +17,7 @@ use crate::adapter::parquet_directory::DirectoryOptions;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry};
 
+mod catalog_parquet_format_reader;
 mod delta_format_reader;
 mod delta_predicate;
 mod delta_protocol;
@@ -26,15 +27,15 @@ mod filter_json;
 mod iceberg;
 mod parquet_format_reader;
 mod partition_predicate;
-mod unity_parquet_format_reader;
 mod unity_table_storage;
 
+use catalog_parquet_format_reader::{CatalogParquetFormatReader, ParquetFileSource};
 use delta_format_reader::DeltaFormatReader;
-use iceberg::IcebergFormatReader;
 #[cfg(test)]
 pub(crate) use iceberg::build_logical_schema;
+use iceberg::{IcebergFormatReader, IcebergMetadataSource};
 use parquet_format_reader::ParquetFormatReader;
-use unity_parquet_format_reader::UnityParquetFormatReader;
+use unity_table_storage::UnityTableStorage;
 
 #[cfg(test)]
 #[path = "format_tests.rs"]
@@ -67,6 +68,63 @@ fn ensure_table_has_a_mappable_column(
     )))
 }
 
+/// Shared by every source, so each binary refusal reads alike
+/// (`vs-adapter/binary-column-refusal`).
+fn binary_cause(declared: &str) -> String {
+    format!(
+        "has type '{declared}', which this engine refuses: rendering binary data is tracked as \
+         issue #351"
+    )
+}
+
+/// `member_path` is `None` when the column's own type is the binary one.
+pub(super) fn binary_refusal(
+    label: &str,
+    column: &str,
+    member_path: Option<&str>,
+    declared: &str,
+) -> RefusedColumn {
+    let subject = match member_path {
+        Some(member_path) => format!("{label} column '{column}', whose member '{member_path}'"),
+        None => format!("{label} column '{column}'"),
+    };
+    RefusedColumn {
+        column_name: column.to_string(),
+        reason: format!("{subject} {}", binary_cause(declared)),
+    }
+}
+
+/// The listing still declares a refused column, so only a request reading one fails.
+fn without_refused_columns(
+    mut logical_schema: Vec<LogicalField>,
+    refused_columns: &[RefusedColumn],
+    table_kind: &str,
+) -> Result<Vec<LogicalField>, UdfError> {
+    logical_schema.retain(|field| {
+        refused_columns
+            .iter()
+            .all(|refused| refused.column_name != field.name)
+    });
+    ensure_table_has_a_mappable_column(&logical_schema, refused_columns, table_kind)?;
+    Ok(logical_schema)
+}
+
+/// Checked before any credential or storage access; neither the catalog URI nor the
+/// CONNECTION endpoint may substitute for an empty location.
+fn checked_storage_location<'t>(
+    table: &'t CatalogTable,
+    catalog: &str,
+) -> Result<&'t str, UdfError> {
+    match table.storage_location.as_deref() {
+        Some(location) if !location.trim().is_empty() => Ok(location),
+        _ => Err(UdfError::User(format!(
+            "the {catalog} metadata for table {} carries an EMPTY storage location; the catalog \
+             URI and the CONNECTION endpoint name no table location and are not valid substitutes",
+            catalog_identifier_string(&table.ident)
+        ))),
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedScan {
     pub files: Vec<FileEntry>,
@@ -94,7 +152,7 @@ pub trait FormatReader: Send + Sync {
 }
 
 /// Deliberately not the catalog kind: it carries an already-resolved session (and, for
-/// Unity, the loaded table), so format selection needs no second kind match site.
+/// Unity and Glue, the loaded table), so format selection needs no second kind match site.
 pub enum ScanSource<'a> {
     Iceberg {
         session: &'a CatalogSession,
@@ -102,6 +160,10 @@ pub enum ScanSource<'a> {
     },
     Unity {
         session: &'a UnityCatalogSession,
+        table: &'a CatalogTable,
+    },
+    Glue {
+        session: &'a GlueCatalogSession,
         table: &'a CatalogTable,
     },
     /// `declared_columns` is the request's `(Exasol name, Exasol type)` declaration, so a column
@@ -123,7 +185,7 @@ pub struct ConnectionStorage<'a> {
 }
 
 /// The one site matching a [`ScanSource`], so a new format or catalog kind is a compile
-/// error here. The Unity format tag is checked here because the single-table load applies
+/// error here. A catalog's format tag is checked here because the single-table load applies
 /// no listing filter.
 pub fn format_reader<'a>(
     source: ScanSource<'a>,
@@ -134,18 +196,41 @@ pub fn format_reader<'a>(
             session,
             catalog_props,
         } => Ok(Box::new(IcebergFormatReader {
-            session,
-            catalog_props,
+            metadata: IcebergMetadataSource::RestLoadTable {
+                session,
+                catalog_props,
+            },
             connection: *connection,
         })),
         ScanSource::Unity { session, table } => match table.format {
             TableFormat::Delta => Ok(Box::new(DeltaFormatReader::new(session, table, connection))),
-            TableFormat::Parquet => Ok(Box::new(UnityParquetFormatReader::new(
-                session, table, connection,
-            ))),
+            TableFormat::Parquet => Ok(Box::new(CatalogParquetFormatReader {
+                table,
+                files: ParquetFileSource::TableDirectory(UnityTableStorage::new(
+                    session, table, connection,
+                )),
+            })),
             TableFormat::Iceberg => Err(UdfError::User(format!(
                 "Unity Catalog table {} reports the {:?} table format, which no Unity Catalog \
                  reader plans",
+                catalog_identifier_string(&table.ident),
+                table.format
+            ))),
+        },
+        ScanSource::Glue { session, table } => match table.format {
+            TableFormat::Iceberg => Ok(Box::new(IcebergFormatReader {
+                metadata: IcebergMetadataSource::MetadataFile { table },
+                connection: *connection,
+            })),
+            TableFormat::Parquet => Ok(Box::new(CatalogParquetFormatReader {
+                table,
+                files: ParquetFileSource::GluePartitions {
+                    session,
+                    storage: connection.storage,
+                },
+            })),
+            TableFormat::Delta => Err(UdfError::User(format!(
+                "Glue table {} reports the {:?} table format, which no Glue reader plans",
                 catalog_identifier_string(&table.ident),
                 table.format
             ))),

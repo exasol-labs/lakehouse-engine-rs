@@ -1,6 +1,7 @@
 //! Redaction and the `aws_sts_endpoint` consent rule wrap the official `aws-sdk-sts` client.
 
 use crate::ConnectionCreds;
+use crate::aws_error::{SdkFailure, sdk_failure};
 use crate::creds::non_empty;
 use crate::redaction::redact_error_text;
 use aws_sdk_sts::config::{BehaviorVersion, Credentials, Region, timeout::TimeoutConfig};
@@ -153,52 +154,21 @@ fn stated_endpoint(stated: &str, allow_http: bool) -> Result<url::Url, String> {
     }
 }
 
-/// Built from STS's own status, code, and message only: the SDK's `Debug` and
-/// `DisplayErrorContext` renderings embed the raw response and would echo its body.
-fn describe_error<E, R>(error: &SdkError<E, R>, timeout: Duration) -> String
-where
-    E: std::error::Error + ProvideErrorMetadata + Send + Sync + 'static,
-    R: ResponseStatus,
-{
-    match error {
-        SdkError::TimeoutError(_) => format!("the request timed out after {timeout:?}"),
-        SdkError::DispatchFailure(failure) => failure
-            .as_connector_error()
-            .map_or_else(|| "the request could not be sent".to_string(), |e| chain(e)),
-        SdkError::ConstructionFailure(_) => "the request could not be built".to_string(),
-        SdkError::ResponseError(context) => format!(
-            "STS returned HTTP {} with an unreadable response",
-            context.raw().status_code()
-        ),
-        SdkError::ServiceError(context) => {
-            let mut description = format!("STS returned HTTP {}", context.raw().status_code());
-            let meta = context.err().meta();
-            for part in [meta.code(), meta.message()].into_iter().flatten() {
+fn describe_error<E: ProvideErrorMetadata>(error: &SdkError<E>, timeout: Duration) -> String {
+    match sdk_failure(error, "STS") {
+        SdkFailure::Service {
+            status,
+            code,
+            message,
+        } => {
+            let mut description = format!("STS returned HTTP {status}");
+            for part in [code, message].into_iter().flatten() {
                 description.push_str(&format!(": {}", part.trim()));
             }
             description
         }
-        _ => "the request failed".to_string(),
-    }
-}
-
-fn chain(error: &dyn std::error::Error) -> String {
-    let mut description = error.to_string();
-    let mut cause = error.source();
-    while let Some(source) = cause {
-        description.push_str(&format!(": {source}"));
-        cause = source.source();
-    }
-    description
-}
-
-trait ResponseStatus {
-    fn status_code(&self) -> u16;
-}
-
-impl ResponseStatus for aws_sdk_sts::config::http::HttpResponse {
-    fn status_code(&self) -> u16 {
-        self.status().as_u16()
+        SdkFailure::TimedOut => format!("the request timed out after {timeout:?}"),
+        SdkFailure::Request(detail) => detail,
     }
 }
 

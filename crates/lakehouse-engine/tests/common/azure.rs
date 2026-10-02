@@ -2,7 +2,9 @@
 //! under test (reaches the Exasol CONNECTION); the tenant/client/secret triple only
 //! lets the harness create and delete its own container.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use super::cloud_fixture::{
+    derive_run_segment, per_run_segment, require_var, run_teardown_off_runtime,
+};
 
 use anyhow::{Context, Result, bail};
 use azure_core::credentials::Secret;
@@ -43,63 +45,26 @@ fn client_secret() -> String {
 }
 
 fn read_var(name: &str) -> String {
-    require_var(name, std::env::var(name).ok().as_deref())
+    require_var("azure-e2e", name, std::env::var(name).ok().as_deref())
 }
 
-/// Takes `value` as a parameter so the panic path is testable without mutating the
-/// shared process environment. Panics name only the variable, never the value.
-fn require_var(name: &str, value: Option<&str>) -> String {
-    let Some(value) = value else {
-        panic!("the azure-e2e suite requires environment variable {name}, which is not set");
-    };
-    let value = value.trim();
-    assert!(
-        !value.is_empty(),
-        "the azure-e2e suite requires environment variable {name}, which is set but empty"
-    );
-    value.to_string()
-}
-
-pub fn per_run_container_name() -> String {
-    let millis = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("system clock is before the UNIX epoch")
-        .as_millis();
-    derive_container_name(&std::env::var("USER").unwrap_or_default(), millis)
-}
+/// Leaves room for `CONTAINER_NAME_PREFIX` and the hyphen after it.
+const RUN_SEGMENT_LEN: usize = MAX_CONTAINER_NAME_LEN - CONTAINER_NAME_PREFIX.len() - 1;
 
 /// Lakekeeper rejects a name outside 3-63 chars of `[a-z0-9-]` with no
 /// consecutive/leading/trailing hyphens at warehouse creation, so it is enforced here.
-fn derive_container_name(user: &str, millis: u128) -> String {
-    let suffix = millis.to_string();
-    let hyphens = 2;
-    let budget =
-        MAX_CONTAINER_NAME_LEN.saturating_sub(CONTAINER_NAME_PREFIX.len() + hyphens + suffix.len());
-    let user_segment = sanitize_segment(user, budget);
-    if user_segment.is_empty() {
-        format!("{CONTAINER_NAME_PREFIX}-{suffix}")
-    } else {
-        format!("{CONTAINER_NAME_PREFIX}-{user_segment}-{suffix}")
-    }
+pub fn per_run_container_name() -> String {
+    format!(
+        "{CONTAINER_NAME_PREFIX}-{}",
+        per_run_segment('-', RUN_SEGMENT_LEN)
+    )
 }
 
-fn sanitize_segment(raw: &str, max_len: usize) -> String {
-    let mut segment = String::new();
-    for character in raw.chars() {
-        let legal = if character.is_ascii_alphanumeric() {
-            character.to_ascii_lowercase()
-        } else {
-            '-'
-        };
-        if legal == '-' && segment.ends_with('-') {
-            continue;
-        }
-        if segment.len() == max_len {
-            break;
-        }
-        segment.push(legal);
-    }
-    segment.trim_matches('-').to_string()
+fn derive_container_name(user: &str, millis: u128) -> String {
+    format!(
+        "{CONTAINER_NAME_PREFIX}-{}",
+        derive_run_segment(user, millis, '-', RUN_SEGMENT_LEN)
+    )
 }
 
 /// Plain owned data so a clone can cross into the teardown thread (`spawn` needs `'static`).
@@ -222,43 +187,16 @@ impl AzureContainer {
 }
 
 impl Drop for AzureContainer {
-    /// `Drop` fires inside the fixture's `block_on`; driving the delete on that runtime
-    /// would panic ("Cannot start a runtime from within a runtime"), so it runs on its own
-    /// thread and runtime. Nothing here panics, so an unwinding test keeps its failure.
     fn drop(&mut self) {
         let container_name = self.access.container_name.clone();
         let access = self.access.clone();
-
-        // `thread::spawn` panics when the OS refuses a thread, which would abort an unwinding test.
-        let teardown = std::thread::Builder::new()
-            .name("azure-container-teardown".to_string())
-            .spawn(move || {
-                tokio::runtime::Builder::new_current_thread()
-                    // Not `enable_all`: it silently skips IO when tokio's `net` feature is off.
-                    .enable_io()
-                    .enable_time()
-                    .build()
-                    .context("build the container-teardown runtime")?
-                    .block_on(access.delete())
-            });
-
-        let joined = match teardown {
-            Ok(handle) => handle.join(),
-            Err(error) => {
-                eprintln!(
-                    "LEAKED Azure container {container_name}: its teardown thread could not be \
-                     spawned: {error}"
-                );
-                return;
-            }
-        };
-
-        match joined {
+        match run_teardown_off_runtime(
+            "azure-container-teardown",
+            async move { access.delete().await },
+        ) {
             Ok(Ok(())) => {}
             Ok(Err(error)) => eprintln!("LEAKED Azure container {container_name}: {error:#}"),
-            Err(_) => {
-                eprintln!("LEAKED Azure container {container_name}: its teardown thread panicked")
-            }
+            Err(failure) => eprintln!("LEAKED Azure container {container_name}: {failure}"),
         }
     }
 }
@@ -269,135 +207,45 @@ pub async fn container_exists(container_name: &str) -> Result<bool> {
     Ok(client.exists().await?)
 }
 
-#[cfg(test)]
-mod azure_credentials_and_naming_tests {
+mod azure_naming_tests {
     use super::{
         CONTAINER_NAME_PREFIX, MAX_CONTAINER_NAME_LEN, MIN_CONTAINER_NAME_LEN,
-        derive_container_name, require_var,
+        derive_container_name,
     };
-    use std::panic;
 
     const FIXED_MILLIS: u128 = 1_762_000_000_000;
 
-    fn panic_message(body: impl FnOnce() + panic::UnwindSafe) -> String {
-        let payload = panic::catch_unwind(body).expect_err("expected require_var to panic");
-        super::super::stack::panic_payload_message(&*payload)
-            .expect("panic payload was neither String nor &str")
-    }
-
-    fn assert_legal_container_name(name: &str, user: &str) {
-        assert!(
-            (MIN_CONTAINER_NAME_LEN..=MAX_CONTAINER_NAME_LEN).contains(&name.len()),
-            "user {user:?}: name {name:?} must be {MIN_CONTAINER_NAME_LEN} to \
-             {MAX_CONTAINER_NAME_LEN} characters, got {}",
-            name.len()
-        );
-        assert!(
-            name.chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
-            "user {user:?}: name {name:?} must contain only lowercase letters, digits and hyphens"
-        );
-        assert!(
-            !name.contains("--"),
-            "user {user:?}: name {name:?} must not contain consecutive hyphens"
-        );
-        assert!(
-            !name.starts_with('-') && !name.ends_with('-'),
-            "user {user:?}: name {name:?} must not begin or end with a hyphen"
-        );
-        assert!(
-            name.starts_with(CONTAINER_NAME_PREFIX),
-            "user {user:?}: name {name:?} must keep the {CONTAINER_NAME_PREFIX} prefix"
-        );
-        assert!(
-            name.ends_with(&FIXED_MILLIS.to_string()),
-            "user {user:?}: name {name:?} must keep the millisecond suffix"
-        );
-    }
-
+    /// The segment's alphabet and separators are `cloud_fixture`'s; this checks the prefix join
+    /// and Azure's length range.
     #[test]
     fn container_name_is_azure_and_lakekeeper_legal() {
         let ninety_chars = "A".repeat(90);
-        let truncated_at_a_hyphen = format!("{}.tail", "a".repeat(39));
-
-        for user in [
-            "",
-            "-",
-            "---",
-            "Antoni.Reus",
-            "a..b",
-            "ÜBER_user",
-            "9",
-            ninety_chars.as_str(),
-            truncated_at_a_hyphen.as_str(),
-        ] {
-            assert_legal_container_name(&derive_container_name(user, FIXED_MILLIS), user);
+        for user in ["", "ÜBER_user", ninety_chars.as_str()] {
+            let name = derive_container_name(user, FIXED_MILLIS);
+            assert!(
+                (MIN_CONTAINER_NAME_LEN..=MAX_CONTAINER_NAME_LEN).contains(&name.len()),
+                "user {user:?}: name {name:?} must be {MIN_CONTAINER_NAME_LEN} to \
+                 {MAX_CONTAINER_NAME_LEN} characters"
+            );
+            assert!(
+                name.starts_with(&format!("{CONTAINER_NAME_PREFIX}-"))
+                    && !name.contains("--")
+                    && name
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'),
+                "user {user:?}: name {name:?} must join the {CONTAINER_NAME_PREFIX} prefix by one \
+                 hyphen and hold only [a-z0-9-]"
+            );
         }
 
-        assert_eq!(
-            derive_container_name("", FIXED_MILLIS),
-            format!("lhrs-e2e-{FIXED_MILLIS}"),
-            "an empty user leaves no segment rather than a double hyphen"
-        );
-        assert_eq!(
-            derive_container_name("---", FIXED_MILLIS),
-            format!("lhrs-e2e-{FIXED_MILLIS}"),
-            "a user of only punctuation leaves no segment"
-        );
-        assert_eq!(
-            derive_container_name("Antoni.Reus", FIXED_MILLIS),
-            format!("lhrs-e2e-antoni-reus-{FIXED_MILLIS}")
-        );
-        assert_eq!(
-            derive_container_name("a..b", FIXED_MILLIS),
-            format!("lhrs-e2e-a-b-{FIXED_MILLIS}"),
-            "consecutive illegal characters collapse to one hyphen"
-        );
-        assert_eq!(
-            derive_container_name("ÜBER_user", FIXED_MILLIS),
-            format!("lhrs-e2e-ber-user-{FIXED_MILLIS}"),
-            "a multi-byte character maps to one hyphen, trimmed at the segment start"
-        );
-        assert_eq!(
-            derive_container_name(&truncated_at_a_hyphen, FIXED_MILLIS),
-            format!("lhrs-e2e-{}-{FIXED_MILLIS}", "a".repeat(39)),
-            "truncation on a hyphen drops it instead of leaving a trailing one"
-        );
         assert_eq!(
             derive_container_name(&ninety_chars, FIXED_MILLIS).len(),
             MAX_CONTAINER_NAME_LEN,
             "an over-long user is truncated to exactly the remaining budget"
         );
     }
-
-    #[test]
-    fn missing_credential_variable_fails_loud() {
-        for absent in [None, Some(""), Some("   ")] {
-            let message = panic_message(|| {
-                require_var("AZURE_CLIENT_SECRET", absent);
-            });
-            assert!(
-                message.contains("AZURE_CLIENT_SECRET"),
-                "panic for {absent:?} must name the variable, got: {message}"
-            );
-            assert!(
-                !message.contains("   "),
-                "panic for {absent:?} must not echo the value, got: {message}"
-            );
-        }
-    }
-
-    #[test]
-    fn present_credential_variable_is_read_without_surrounding_whitespace() {
-        assert_eq!(
-            require_var("AZURE_STORAGE_ACCOUNT_KEY", Some(" a2V5\n")),
-            "a2V5",
-            "a value sourced from test.env or a CI secret may carry a line ending"
-        );
-    }
 }
 
-#[cfg(test)]
 mod azure_error_classification_tests {
     use super::{azure_failure, delete_reached_desired_state, is_name_collision};
     use azure_core::error::ErrorKind;

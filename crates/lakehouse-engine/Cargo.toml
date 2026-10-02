@@ -1,6 +1,6 @@
 [package]
 name = "lakehouse-engine"
-version = "0.51.0"
+version = "0.52.0"
 edition = "2024"
 license.workspace = true
 
@@ -18,6 +18,8 @@ lakekeeper-e2e = []
 azure-e2e = []
 # Requires a live Exasol + SeaweedFS + Unity Catalog OSS stack; same FAIL contract as exasol-e2e.
 unity-e2e = []
+# Requires real AWS Glue + S3; same FAIL contract as exasol-e2e.
+glue-e2e = []
 
 [dependencies]
 exasol-udf-sdk    = { workspace = true }
@@ -98,3 +100,4 @@ native-tls          = "0.2"
 rsa                 = { version = "0.9", features = ["sha2", "pkcs5"] }
 futures             = { workspace = true }
 anyhow              = { workspace = true }
+aws-sdk-glue        = { workspace = true }

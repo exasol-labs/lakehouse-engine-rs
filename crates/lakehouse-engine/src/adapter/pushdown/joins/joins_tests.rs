@@ -269,14 +269,12 @@ fn qualify_udf_uses_schema_and_falls_back_when_empty() {
 
 #[test]
 fn golden_ineligible_decline_message_unchanged() {
-    let not_inner = match ineligible_join_decline(IneligibleJoinReason::NotInnerJoinType) {
-        UdfError::User(msg) => msg,
-        other => panic!("expected User decline, got {other:?}"),
-    };
-    let unsupported = match ineligible_join_decline(IneligibleJoinReason::UnsupportedShape) {
-        UdfError::User(msg) => msg,
-        other => panic!("expected User decline, got {other:?}"),
-    };
+    let not_inner = user_message(ineligible_join_decline(
+        IneligibleJoinReason::NotInnerJoinType,
+    ));
+    let unsupported = user_message(ineligible_join_decline(
+        IneligibleJoinReason::UnsupportedShape,
+    ));
     assert_eq!(
         not_inner,
         "join pushdown declined: the join is not an inner join; the adapter cannot render this join shape, so this is a hard error, not a native re-plan"
@@ -453,18 +451,6 @@ async fn two_delta_legs_one_refusing_binary_col() -> StorageBackend {
         ),
     ])
     .await
-}
-
-fn assert_refuses_binary_col(error: UdfError) {
-    let message = match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    };
-    assert!(
-        message.contains("binary_col") && message.contains("#351"),
-        "the refusal must be the gate's own message, naming the column and its reason: \
-         {message}"
-    );
 }
 
 /// Two `add` files, so a local partition equality has one file to keep and one to prune.

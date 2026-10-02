@@ -2231,12 +2231,6 @@ fn golden_grouped_qualified_fallback_sql_unchanged() {
 
 #[test]
 fn golden_n_scan_render_decline_messages_unchanged() {
-    fn user_message(err: UdfError) -> String {
-        match err {
-            UdfError::User(msg) => msg,
-            other => panic!("expected a User decline, got {other:?}"),
-        }
-    }
     let unrenderable = || serde_json::json!({"type": "totally_unsupported_node_type"});
     let legs = legs_from_leaves(Vec::new());
 

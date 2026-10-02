@@ -4,10 +4,17 @@
 
 # Catalogs
 
-The adapter reaches a catalog through one of two catalog kinds, selected by the VS property `CATALOG_KIND`: an **Iceberg REST catalog** for Iceberg tables (the default — select it by leaving `CATALOG_KIND` absent; the literal `'ICEBERG_REST'` is not a recognized value), or a **native Unity Catalog** (`CATALOG_KIND = 'UNITY_CATALOG'`) for Delta and Parquet tables. Each kind has its own REST client. Within the Iceberg REST kind, every backend is the SAME client; the backends differ only by the auth mode that you turn on in the CONNECTION password JSON. Three Iceberg REST auth modes exist:
+The adapter reaches a catalog through one of four catalog kinds, selected by the VS property `CATALOG_KIND`:
+
+- An **Iceberg REST catalog** for Iceberg tables. This is the default. Select it by leaving `CATALOG_KIND` absent. The literal `'ICEBERG_REST'` is not a recognized value.
+- A **native Unity Catalog** (`CATALOG_KIND = 'UNITY_CATALOG'`) for Delta and Parquet tables.
+- The **AWS Glue Data Catalog** (`CATALOG_KIND = 'GLUE'`) for Iceberg and Hive Parquet tables.
+- **Direct storage** (`CATALOG_KIND = 'DIRECT_STORAGE'`) for raw Parquet files with no catalog.
+
+Each catalog kind has its own client. Within the Iceberg REST kind, every backend is the SAME client; the backends differ only by the auth mode that you turn on in the CONNECTION password JSON. Three Iceberg REST auth modes exist:
 
 - no auth, for a local stack
-- AWS SigV4, for Glue
+- AWS SigV4, for the Glue Iceberg REST endpoint
 - a static bearer token or OAuth2 client credentials, for a generic secured REST catalog
 
 Lakekeeper is a concrete instance of the last mode. The native Unity Catalog kind reuses the same
@@ -22,6 +29,7 @@ Find the row that matches your catalog. Then copy its recipe.
 |---|---|---|---|
 | [Local / generic Iceberg REST (no auth)](#local--generic-iceberg-rest-no-auth) | Iceberg REST | none | Supported |
 | [AWS Glue Iceberg REST](#aws-glue-iceberg-rest-sigv4) | Iceberg REST | SigV4 | Supported |
+| [AWS Glue Data Catalog (Iceberg and Hive Parquet tables)](#aws-glue-data-catalog-catalog_kind--glue) | Glue | SigV4 with static IAM credentials or an assumed IAM role | Supported |
 | [Generic REST with token / OAuth2](#generic-rest-with-static-token-or-oauth2) | Iceberg REST | bearer token or OAuth2 | Supported |
 | [Lakekeeper](#lakekeeper-oidc-via-keycloak--seaweedfs) | Iceberg REST | OAuth2 client-credentials (OIDC) | Supported |
 | [Unity Catalog (Delta and Parquet tables)](#unity-catalog-delta-and-parquet-tables) | Unity Catalog | none, PAT, or Databricks OAuth M2M | Supported |
@@ -37,7 +45,7 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 
 | JSON field | Required | Meaning |
 |---|---|---|
-| `warehouse` | yes under `ICEBERG_REST`; not used under `UNITY_CATALOG` | Catalog routing identifier — an AWS account id under Glue, a warehouse **name** under Lakekeeper, or whatever identifier a generic Iceberg REST catalog registered — never read as a storage location, so a URI-shaped value (as the bundled `iceberg-rest`/SeaweedFS stack below uses) is still only an identifier. A native Unity Catalog is addressed by `catalog.schema.table` instead, so this field is not required (or read) under `CATALOG_KIND = 'UNITY_CATALOG'` |
+| `warehouse` | yes under `ICEBERG_REST`; optional under `GLUE`; not used under `UNITY_CATALOG` | Catalog routing identifier — an AWS account id under Glue, a warehouse **name** under Lakekeeper, or whatever identifier a generic Iceberg REST catalog registered — never read as a storage location, so a URI-shaped value (as the bundled `iceberg-rest`/MinIO stack below uses) is still only an identifier. A native Unity Catalog is addressed by `catalog.schema.table` instead, so this field is not required (or read) under `CATALOG_KIND = 'UNITY_CATALOG'`. Under `CATALOG_KIND = 'GLUE'` it is the optional Glue `CatalogId` (an AWS account id) |
 | `endpoint` | yes, unless `use_sigv4` or vended credentials | S3 endpoint URL |
 | `region` | yes, unless `use_sigv4` and the address is a standard AWS Glue endpoint (`https://glue.<region>.amazonaws.com`), or vended credentials | S3 region — also the SigV4 signing region unless a standard Glue endpoint supplies its own; state it whenever a scan reads with static S3 keys |
 | `access_key` | yes, unless `use_sigv4` or vended credentials | S3 access key |
@@ -47,13 +55,13 @@ The catalog URI goes in the `TO` clause of the CONNECTION. Every credential fiel
 | `aws_external_id` | no; requires `aws_assume_role_arn` | `ExternalId` for a role whose trust policy requires one |
 | `aws_sts_endpoint` | no; requires `aws_assume_role_arn` | STS endpoint override; see [Assuming an AWS IAM role](#assuming-an-aws-iam-role) |
 | `path_style` | required if `endpoint` is set and vending is off; otherwise no, default `false` | Path-style S3 addressing: `true` for SeaweedFS or Ceph, `false` for real AWS S3 (virtual-hosted, the default) |
-| `use_sigv4` | no, default `false` | SigV4-sign the catalog REST requests (AWS Glue) |
-| `use_vended_credentials` | no, default `false` | Request short-lived S3 credentials from the `load_table` call of the catalog (Glue, Lakekeeper) |
-| `token` | no | Static bearer token for generic REST catalog auth |
-| `client_id` | no | OAuth2 client id. Must appear together with `client_secret` |
-| `client_secret` | no | OAuth2 client secret. Must appear together with `client_id` |
-| `oauth2_server_uri` | no | OAuth2 token endpoint override |
-| `scope` | no | OAuth2 scope string |
+| `use_sigv4` | no, default `false`; implied under `GLUE` | SigV4-sign the catalog REST requests (AWS Glue). The `GLUE` kind always signs, and it rejects `false` |
+| `use_vended_credentials` | no, default `false`; rejected under `GLUE` | Request short-lived S3 credentials from the `load_table` call of the catalog (Glue Iceberg REST, Lakekeeper) |
+| `token` | no; rejected under `GLUE` | Static bearer token for generic REST catalog auth |
+| `client_id` | no; rejected under `GLUE` | OAuth2 client id. Must appear together with `client_secret` |
+| `client_secret` | no; rejected under `GLUE` | OAuth2 client secret. Must appear together with `client_id` |
+| `oauth2_server_uri` | no; rejected under `GLUE` | OAuth2 token endpoint override |
+| `scope` | no; rejected under `GLUE` | OAuth2 scope string |
 
 **Mutual exclusivity:** you cannot combine `use_sigv4` with `token`, `client_id`, or `client_secret`. The adapter rejects a CONNECTION that sets both. SigV4 signs the catalog requests itself. A separate catalog token or OAuth2 flow conflicts with it. `use_sigv4` is rejected outright under `CATALOG_KIND = 'UNITY_CATALOG'` — a native Unity Catalog authenticates with a bearer token or Databricks OAuth, never AWS SigV4.
 
@@ -75,7 +83,8 @@ for this. `aws_external_id` and `aws_sts_endpoint` are each accepted only alongs
 `aws_assume_role_arn`; stating either one without a role is a rejected CONNECTION naming the field.
 
 The session credentials `AssumeRole` returns then replace `access_key`, `secret_key`, and
-`session_token` everywhere those fields are read: they sign SigV4 catalog requests (Glue), and they
+`session_token` everywhere those fields are read: they sign SigV4 catalog requests (Glue Iceberg REST
+and the native `CATALOG_KIND = 'GLUE'`), and they
 are the storage credential for non-vended S3 access. A role leaves credential vending unchanged —
 with `use_vended_credentials` on, storage is still resolved by vending (the `load_table` response
 under Iceberg REST, or Unity Catalog temporary table credentials under `CATALOG_KIND =
@@ -293,7 +302,8 @@ vended.
 
 - The columns and their types are the catalog's own declaration, read from each column's
   `type_json`. A `struct`, `array`, or `map` column surfaces as JSON `VARCHAR(2000000)`. A `binary`
-  or `variant` column, or one with no readable `type_json`, is refused by name, as for a Delta table.
+  or `variant` column, or one with no readable `type_json`, is refused by name, as for a Delta table
+  (see [Binary columns](#binary-columns)).
   Every column is nullable, so a file that lacks a column reads NULL for it.
 - The partition columns are the columns the catalog declares with a `partition_index`, in that
   order. Each file's values come from the `key=value` directory segments of its own path, matched
@@ -303,10 +313,14 @@ vended.
 - A table with Databricks partition metadata logging enabled is still read from its directories.
   The reader does not consult the partitions that log registers.
 - A data file needs the `.parquet` suffix. Every such object under the table's storage location is
-  read, at any depth, unless a path segment starts with `_` or `.`.
-- No Parquet footer is read at plan time, and only a predicate on a `STRING` partition column
-  prunes files. A predicate on any other column, an `INT` or `DATE` partition column included,
-  narrows the rows returned but not the files read.
+  read, at any depth, unless a path segment starts with `_` or `.`. A zero-length object is never
+  a data file.
+- No Parquet footer is read at plan time. A predicate on a partition column prunes files under the
+  column's declared type. String, integer, decimal, date, timestamp, and boolean partition columns
+  compare in their own type, so `year < 10` keeps `year=9` and prunes `year=10`. A partition
+  column of any other declared type prunes no file. A literal of another type than the column's, or
+  one the type cannot represent exactly, also prunes no file. A predicate on a data column narrows
+  the rows returned but not the files read.
 - A data-file column binds to the catalog column whose name it matches ignoring letter case. A
   data-file type outside identity and the supported widening set (integer, floating-point, decimal,
   and date widening, a timestamp stored at the same or a coarser unit, and a binary value under a
@@ -368,6 +382,106 @@ access token, replace `token` with `client_id` and `client_secret`; the adapter 
 bearer itself, minting again a minute ahead of its stated expiry, and defaults `oauth2_server_uri`
 to `{catalog-uri}/oidc/v1/token` and `scope` to `all-apis` when you omit them.
 
+## AWS Glue Data Catalog (`CATALOG_KIND = 'GLUE'`)
+
+Set `CATALOG_KIND = 'GLUE'` to read the AWS Glue Data Catalog through its native API. The adapter calls `GetTables`, `GetTable`, and `GetPartitions`. It does not use the Glue Iceberg REST endpoint. One Glue database is one virtual schema. The kind reads Iceberg tables and Hive Parquet tables.
+
+The [AWS Glue Iceberg REST](#aws-glue-iceberg-rest-sigv4) recipe above is a different route. It reads Iceberg tables only. A CONNECTION that addresses the Glue Iceberg REST endpoint resolves the Iceberg REST kind unless `CATALOG_KIND = 'GLUE'` is set.
+
+**CONNECTION shape.** `TO` is the Glue endpoint. A standard `https://glue.<region>.amazonaws.com` address supplies the SigV4 signing region. Any other address needs a stated `region`. The password carries static IAM credentials. The same `access_key`, `secret_key`, and optional `session_token` sign the Glue requests and read S3. With `aws_assume_role_arn`, the role's session replaces them for both (see [Assuming an AWS IAM role](#assuming-an-aws-iam-role)). State `region` so the S3 store is placed. `warehouse` is optional and names the Glue `CatalogId`. If you omit it, Glue uses the AWS account of the credentials, which is the role's account when a role is assumed. The account id below is a placeholder.
+
+```sql
+CREATE OR REPLACE CONNECTION GLUE_CATALOG_CREDS
+  TO 'https://glue.us-east-1.amazonaws.com'
+  USER ''
+  IDENTIFIED BY '{
+    "region":     "us-east-1",
+    "access_key": "AKIA...",
+    "secret_key": "..."
+  }';
+
+CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
+USING LHVS.LAKEHOUSE_ADAPTER WITH
+  CATALOG_CONNECTION = 'GLUE_CATALOG_CREDS'
+  CATALOG_KIND       = 'GLUE'
+  NAMESPACE          = 'sales';
+```
+
+- `NAMESPACE` names exactly one Glue database. A value such as `sales.eu` fails.
+- The adapter rejects `use_sigv4` set to `false`. The Glue kind always signs with AWS SigV4.
+- The adapter rejects `use_vended_credentials` set to `true`. The Glue kind has no native credential vending.
+- The adapter rejects `token`, `client_id`, `client_secret`, `oauth2_server_uri`, and `scope`. One error names every supplied field.
+- The adapter signs only with the CONNECTION's credentials, or the session of the role it names. It reads no credential or region from the environment, a profile file, or instance metadata.
+
+**Required IAM actions.** The credentials, or the assumed role, need these actions:
+
+- `glue:GetTables`
+- `glue:GetTable`
+- `glue:GetPartitions`
+- `s3:ListBucket` on the table buckets
+- `s3:GetObject` on the table objects
+
+**Table routing.** The adapter routes each Glue table by its declared table type before it reads the storage descriptor. A skipped table appears in `SKIPPED_TABLES` with the Glue value that decided the skip (see [Reading SKIPPED_TABLES](#reading-skipped_tables)).
+
+| Glue table | Result |
+|---|---|
+| `Parameters.table_type` is `ICEBERG` (any letter case) with a non-empty `metadata_location` | Read as an Iceberg table |
+| `table_type` is `ICEBERG` with an absent or empty `metadata_location` | Skipped |
+| Any other `table_type`, for example `delta` | Skipped, naming the value |
+| No `table_type`, and `InputFormat` is `org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat` | Read as a Parquet table |
+| Parquet table with `Parameters."projection.enabled"` set to `true` | Skipped: partition projection registers no partition in Glue, so a read would return zero rows |
+| No `table_type`, and any other `InputFormat` (ORC, text, JSON, Avro, symlink) | Skipped, naming the input format |
+| `TableType` is `VIRTUAL_VIEW` | Skipped |
+
+**Iceberg tables.** The adapter reads the current `metadata.json` that `Parameters.metadata_location` names, through the CONNECTION's static S3 credentials. The metadata file is the schema authority. The adapter never reads the Glue columns of an Iceberg table. The same Iceberg planner plans the table as plans an Iceberg REST table, so delete handling, name mapping, and file pruning apply. `metadata_location` names the same snapshot as a REST `loadTable`. A metadata file the adapter cannot read fails the listing and names the table.
+
+**Parquet tables.** The Glue columns, in declared order, followed by the partition keys, are the table's columns. Each column is nullable. The adapter reads no Parquet footer at plan time. A data file column binds to the Glue column whose name it matches ignoring letter case. A partition key that a data file also stores as a column reads the partition value.
+
+| Hive type in Glue | Exasol type |
+|---|---|
+| `tinyint`, `smallint`, `int` or `integer`, `bigint` | `DECIMAL(3,0)`, `DECIMAL(5,0)`, `DECIMAL(10,0)`, `DECIMAL(20,0)` |
+| `float`, `double` | `DOUBLE PRECISION` |
+| `boolean` | `BOOLEAN` |
+| `string`, `varchar(n)`, `char(n)` | `VARCHAR(2000000)` |
+| `date` | `DATE` |
+| `timestamp` | The catalog-declared timestamp type: `TIMESTAMP(6)` on Exasol 2025.x and later, bare `TIMESTAMP` on 8.x |
+| `decimal(p,s)`, or `decimal` for `decimal(10,0)` | `DECIMAL(p,s)`, or `VARCHAR(2000000)` when the precision or scale is outside Exasol's `DECIMAL` domain |
+| `array<...>`, `map<...>`, `struct<...>` | JSON `VARCHAR(2000000)` |
+| `binary`, an unrecognized type, or a malformed type string | Declared `VARCHAR(2000000)`, and refused when a query reads it |
+
+A refused column fails only the queries that read or emit it. The refusal reason quotes the Hive type string. A table whose every column is refused is refused as a whole. A `binary` column, or a nested type with a `binary` member, follows the rule in [Binary columns](#binary-columns).
+
+**Partition values.** The adapter takes each partition's values from `GetPartitions`, in the order of the table's partition keys. It never parses a value from the location path. The Hive literal `__HIVE_DEFAULT_PARTITION__` reads NULL. A partition whose value count differs from the partition-key count fails the query and names the partition's location. Every query reads the Glue metadata again. It issues one `GetTable`, the paginated `GetPartitions`, and one object listing per kept partition. The adapter caches nothing.
+
+**Data files.** The adapter lists each kept partition's location by its raw object key, without percent-decoding. A value `a b/c` is stored at the literal key `p_str=a b%2Fc/`, and the listing finds it. An unpartitioned table is listed at its table location. The file rule is the any-direct-child pattern:
+
+- A data file is a direct child of the location, with any name. Trino writes files without an extension, so a `.parquet` suffix is not required.
+- An object below a subdirectory is not read.
+- An object whose name starts with `_` or `.`, such as `_SUCCESS`, is not read.
+- A zero-length object is not read.
+- A partition outside the table location in the same bucket is read, and its files carry absolute paths. The scheme `s3a://` addresses the same store as `s3://`.
+
+**Partition pruning.** The adapter prunes partitions on their Glue values before it lists their locations. The shared partition predicate compares each value under the partition key's declared type. String, integer, decimal, date, timestamp, and boolean keys compare in their own type. A key of any other type, a literal of another type than the key's, and a literal the type cannot represent exactly prune nothing. The adapter does not send the predicate to Glue in the `Expression` of `GetPartitions`. The full predicate still applies above the scan, so pruned and unpruned queries return the same rows.
+
+**Failures.** A kept partition that the adapter cannot read faithfully fails the query. The error names the partition's values and location and states the cause. The adapter never skips such a partition, because a skipped partition returns wrong rows.
+
+- A kept partition with an ORC input format fails with `its input format '...' is not Parquet`.
+- A kept partition in a bucket other than the table's bucket fails and names both buckets.
+- A pruned partition never fails the query, because it contributes no row.
+- A table dropped from Glue after the virtual schema was created fails and states that it does not exist.
+- A table re-registered in an unsupported format fails with the reason its listing would skip it.
+- Glue errors name the operation, the service error code, and the service message. `EntityNotFoundException` names the missing database or table.
+- The adapter retries throttling and server errors up to 5 attempts per call, and each call ends within 30 seconds.
+- If the signing time differs from the AWS time, the error states that the clock of the Exasol node differs from AWS time.
+
+**Scoped exceptions.** These Glue cases are deliberate limits:
+
+- A Hive table with partition projection is skipped, because Glue registers no partition for it.
+- Every binary type is refused (see [Binary columns](#binary-columns)).
+- An ORC, Delta (Athena), text, JSON, Avro, or symlink table is skipped.
+- A `warehouse` that names another account's `CatalogId` is untested (#TBD). To read another account's catalog, assume a role in that account and omit `warehouse`.
+- Lake Formation grants are not evaluated (see [Security](security.md#aws-glue-credentials-and-lake-formation)).
+
 ## Direct storage (raw Parquet, no catalog)
 
 Set `CATALOG_KIND = 'DIRECT_STORAGE'` to read a plain directory tree of Parquet files with **no
@@ -377,6 +491,9 @@ found anywhere below it, at any depth, is that table's data. A path segment that
 `.` (for example `_delta_log/`, `_SUCCESS`, `.spark-staging`) is excluded from both directory
 discovery and file eligibility, so a loose file directly under the base path serves no table, and a
 directory with no eligible file is skipped rather than served empty.
+
+The file rule is the `**/*.parquet` pattern. An object whose name lacks the `.parquet` suffix is
+never read. A zero-length object is never a data file, even with the suffix.
 
 **CONNECTION shape.** The address is the storage base path itself — an `s3://`/`s3a://` bucket
 prefix, or an `abfss://<container>@<account>.dfs.core.windows.net/<prefix>` container prefix — not a
@@ -474,6 +591,45 @@ one file, nanosecond in another) fail to fold under the default `MERGE_SCHEMA = 
 `MERGE_SCHEMA = 'FALSE'` to work around it — the sampled file's declared unit then wins, and a file
 is read only when its unit equals the sampled unit or is coarser. A file at a finer unit fails every
 query that reads the column.
+
+## Binary columns
+
+Every binary type is refused on every source until issue #351 defines a faithful rendering for binary. The listing still declares the column as `VARCHAR(2000000)`, so the virtual table lists every column. A query that reads or emits a refused column fails at plan time. The error names the column, its declared type, and #351. A query that reads other columns still succeeds, and so does `SELECT COUNT(*)`. A table whose every column is refused is refused as a whole.
+
+| Source | Refused types |
+|---|---|
+| Iceberg REST and Glue Iceberg | `binary`, `fixed(L)`, and `uuid`, at any depth |
+| Delta, Unity Catalog, and Glue Parquet | `binary` |
+| Direct storage | An unannotated `BYTE_ARRAY` (`binary`), an unannotated `FIXED_LEN_BYTE_ARRAY` (`fixed(L)`), `UUID` (`uuid`), `BSON` (`bson`), `GEOMETRY` (`geometry`), and `GEOGRAPHY` (`geography`) |
+
+A catalog-declared source decides by the declared type. A Glue column declared `string` over a data file that stores a `BYTE_ARRAY` without the string annotation reads as text. A value that is not valid UTF-8 fails the query.
+
+Direct storage declares no table type, so it decides by what each Parquet file declares. A top-level Parquet `ENUM` column reads as text. A nested `ENUM` member is refused (#TBD).
+
+Two cases break a query that worked before:
+
+- An Iceberg `binary` column that holds UTF-8 text is now refused.
+- A direct-storage column that a legacy writer such as Impala or Hive stored as an unannotated `BYTE_ARRAY` string is now refused. Rewrite the file with the Parquet `STRING` annotation to read it.
+
+## Reading SKIPPED_TABLES
+
+Every catalog kind records the entries its listing skips. The adapter writes one warning line per skip. It also stores the skips in the `SKIPPED_TABLES` entry of the virtual schema's adapter notes. Read them with:
+
+```sql
+SELECT ADAPTER_NOTES FROM EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = 'MY_LAKEHOUSE';
+```
+
+`ADAPTER_NOTES` holds a JSON object. Its `SKIPPED_TABLES` value is an array with one object per skipped entry, in listing order. `table` is the catalog identifier. `reason` states why the entry was skipped.
+
+| Catalog kind | `reason` |
+|---|---|
+| Iceberg REST | `catalog reported it is not a loadable Iceberg table` |
+| Unity Catalog and Glue | The catalog value that decided the skip, for example `table_type=VIEW` or `InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat` |
+| Direct storage | `holds no data file` |
+
+A listing that skips nothing records an empty array, and a refresh replaces the previous array. A namespace whose every entry is skipped still creates an empty virtual schema.
+
+Exasol rejects an `ADAPTER_NOTES` value longer than 2,000,000 bytes. The adapter therefore keeps the longest prefix of `SKIPPED_TABLES`, in listing order, that fits. It records the number of dropped entries in `SKIPPED_TABLES_OMITTED`, a string. The entry exists only when the count is above zero, and a refresh removes it once every skip fits. The warning lines still name every skip. The cap never applies to `TABLE_MAP`.
 
 ## Addressing
 

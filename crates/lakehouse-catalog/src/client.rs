@@ -1,11 +1,13 @@
 //! The one operation surface the engine uses to reach any catalog kind, and the
 //! catalog-neutral metadata types it returns.
 
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
 use exasol_udf_sdk::error::UdfError;
 use iceberg::TableIdent;
+use iceberg::spec::TableMetadata;
 
 use crate::namespace::list_namespace_tables;
 use crate::session::{CatalogSession, load_table_any_auth};
@@ -42,6 +44,10 @@ pub enum ColumnSourceType {
     },
     /// A scan-spec type tag, not an Arrow `DataType`: this crate must not depend on `arrow`.
     Parquet(String),
+    /// The Glue `Column.Type` string verbatim; only the engine parses it.
+    Glue {
+        hive_type: String,
+    },
 }
 
 /// Closed on purpose: a catalog value outside the set is refused where it is read.
@@ -72,7 +78,32 @@ pub struct CatalogTable {
     /// Catalog-declared partition columns in catalog order; empty if the kind declares none.
     pub partition_columns: Vec<String>,
     pub columns: Vec<CatalogColumn>,
+    /// The current Iceberg `metadata.json` a metastore catalog points to; absent for a
+    /// catalog that serves Iceberg metadata itself, and for every other format.
+    pub metadata_location: Option<String>,
 }
+
+/// One catalog-registered partition. Its values come from the catalog, never from its
+/// location path; an absent value is the catalog's NULL partition value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CatalogPartition {
+    pub values: BTreeMap<String, Option<String>>,
+    pub location: String,
+    pub format: PartitionFormat,
+}
+
+/// A partition's file format, decided once by the catalog client.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionFormat {
+    Parquet,
+    /// A format this engine does not read, named by the input format the catalog declares.
+    Unsupported {
+        input_format: String,
+    },
+}
+
+/// Hive's literal for a NULL partition value, in a partition's catalog values and its path.
+pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkipReason {
@@ -82,6 +113,10 @@ pub enum SkipReason {
         detail: String,
     },
     NoDataFile,
+    /// `detail` names the Glue value that decided the skip, e.g. `table_type=delta`.
+    NotPlannableGlueTable {
+        detail: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -157,8 +192,8 @@ impl IcebergRestCatalogClient {
         Ok(CatalogListing { tables, skipped })
     }
 
-    /// Column names keep their original case; the engine owns case folding. No
-    /// credential key: this catalog vends credentials inline with table metadata.
+    /// No metadata location: this catalog serves the metadata itself, with any vended
+    /// credentials inline.
     async fn load_on_session(
         &self,
         session: &CatalogSession,
@@ -166,32 +201,10 @@ impl IcebergRestCatalogClient {
     ) -> Result<CatalogTable, UdfError> {
         let catalog = CatalogProps {
             warehouse: self.creds.warehouse.clone(),
-            table: dotted_identifier(ident),
+            table: catalog_identifier_string(ident),
         };
         let result = load_table_any_auth(session, &catalog, &self.creds).await?;
-
-        let storage_location = result.metadata.location().to_string();
-        let columns = result
-            .metadata
-            .current_schema()
-            .as_struct()
-            .fields()
-            .iter()
-            .map(|field| CatalogColumn {
-                name: field.name.clone(),
-                source_type: ColumnSourceType::Iceberg(field.field_type.as_ref().clone()),
-            })
-            .collect();
-
-        Ok(CatalogTable {
-            ident: ident.clone(),
-            table_type: CatalogTableType::Table,
-            storage_location: Some(storage_location),
-            format: TableFormat::Iceberg,
-            vended_credential_key: None,
-            partition_columns: Vec::new(),
-            columns,
-        })
+        Ok(iceberg_catalog_table(ident.clone(), &result.metadata, None))
     }
 }
 
@@ -223,6 +236,36 @@ impl CatalogClient for IcebergRestCatalogClient {
     }
 }
 
+/// The one Iceberg-metadata projection every catalog kind shares. Column names keep their
+/// original case; the engine owns case folding.
+pub(crate) fn iceberg_catalog_table(
+    ident: CatalogTableIdent,
+    metadata: &TableMetadata,
+    metadata_location: Option<String>,
+) -> CatalogTable {
+    let columns = metadata
+        .current_schema()
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| CatalogColumn {
+            name: field.name.clone(),
+            source_type: ColumnSourceType::Iceberg(field.field_type.as_ref().clone()),
+        })
+        .collect();
+
+    CatalogTable {
+        ident,
+        table_type: CatalogTableType::Table,
+        storage_location: Some(metadata.location().to_string()),
+        format: TableFormat::Iceberg,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        columns,
+        metadata_location,
+    }
+}
+
 fn neutral_ident(ident: &TableIdent) -> CatalogTableIdent {
     CatalogTableIdent {
         namespace: ident.namespace.as_ref().to_vec(),
@@ -230,8 +273,9 @@ fn neutral_ident(ident: &TableIdent) -> CatalogTableIdent {
     }
 }
 
-/// A segment carrying a dot does not round-trip, so this join is the last step.
-fn dotted_identifier(ident: &CatalogTableIdent) -> String {
+/// The dotted `TABLE_MAP` value, parsed back by `parse_table_ident`. A segment carrying a dot
+/// does not round-trip, so this join is the last step.
+pub fn catalog_identifier_string(ident: &CatalogTableIdent) -> String {
     let mut parts: Vec<&str> = ident.namespace.iter().map(String::as_str).collect();
     parts.push(&ident.name);
     parts.join(".")

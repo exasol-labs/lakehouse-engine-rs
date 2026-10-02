@@ -1,51 +1,16 @@
 # Feature: Catalog Kind Selection
 
-Selects which catalog kind a virtual schema resolves against from the `CATALOG_KIND` virtual-schema property, and CONSTRUCTS the matching catalog client. The three kinds are the existing Iceberg REST catalog, a native Unity Catalog, and direct storage with no catalog service. The kind decides only which client is built. Every createVirtualSchema listing operation then runs through the shared `CatalogClient` trait on one pipeline. The property is a createVirtualSchema adapter property read from the request's plain VS properties, not a field inside the CONNECTION password JSON. When the property is absent the adapter resolves Iceberg REST, so every pre-existing virtual schema keeps its current behavior with no configuration change.
+Selects which catalog kind a virtual schema resolves against from the `CATALOG_KIND` virtual-schema property, and CONSTRUCTS the matching catalog client. The four kinds are the Iceberg REST catalog, a native Unity Catalog, direct storage with no catalog service, and the native AWS Glue Data Catalog. The kind decides only which client is built. Every createVirtualSchema listing operation then runs through the shared `CatalogClient` trait on one pipeline. The property is a createVirtualSchema adapter property read from the request's plain VS properties, not a field inside the CONNECTION password JSON. When the property is absent the adapter resolves Iceberg REST, so every pre-existing virtual schema keeps its current behavior with no configuration change.
 
 ## Background
 
-The catalog kind is a `CatalogKind` enum with exactly three variants: `IcebergRest`, `UnityCatalogNative`, and `DirectStorage`. The variant IS the catalog kind. The kind is matched EXHAUSTIVELY at a small, enumerated set of construction sites, so adding a fourth kind is a build failure there rather than a silent fall-through. No listing or pushdown operation re-matches it per request shape. The `CATALOG_KIND` property value is compared case-insensitively. `CatalogKind` is an adapter-layer type in `crates/lakehouse-engine`, read from an Exasol virtual-schema property. The `lakehouse-catalog` crate must not name that delivery mechanism. Credential validation is one further place the kind is an input. It takes the kind as an explicit parameter rather than re-deriving it.
+The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRest`, `UnityCatalogNative`, `DirectStorage`, and `Glue`. The variant IS the catalog kind. The `CATALOG_KIND` property value is compared case-insensitively. `CatalogKind` is an adapter-layer type in `crates/lakehouse-engine`, read from an Exasol virtual-schema property. The `lakehouse-catalog` crate must not name that delivery mechanism. Credential validation takes the kind as an explicit parameter rather than re-deriving it.
 
-* **This delta is issue #320.** It replaces the pushdown-time refusal with pushdown-time resolution.
-  The kind's role does not widen. The refusal site becomes a construction site, so the count of
-  production sites permitted to name a variant is unchanged.
-* Every createVirtualSchema rule is unchanged by this delta: kind resolution, case-insensitive
-  comparison, credential validation, and the unrecognized-value rejection.
-* **This delta is issue #407 and adds the THIRD variant, `DirectStorage`.** It supersedes the
-  recorded two-variant enumeration above and the recorded accepted-value list of the
-  unrecognized-value scenario. It adds NO construction site and REMOVES none: the third variant is
-  matched at exactly the four files the recorded set already enumerates.
-* The direct-storage client implements `CatalogClient` but is declared in `lakehouse-engine`, not in
-  `lakehouse-catalog`. `vs-adapter/direct-storage-table-discovery` owns that placement and its
-  reason. Nothing in this feature changes: the catalog-client construction site still matches the
-  kind exhaustively and still returns a boxed `CatalogClient`.
-* The literal `ICEBERG_REST` stays an UNRECOGNIZED value. Iceberg REST is selected by leaving
-  `CATALOG_KIND` absent, so the accepted non-absent values are exactly `UNITY_CATALOG` and
-  `DIRECT_STORAGE`.
-* **The recorded source-level probe was never built, and this delta does NOT build it.** The clause
-  below has required since issue #318 that a probe assert `CatalogKind`'s variant names appear in no
-  production module outside an enumerated set. What exists today is a COMPILE-TIME SIGNATURE probe
-  (`catalog_client_tests.rs`). Its own doc comment states that it "does not (and cannot) prove the
-  kind is matched nowhere else". No allowlist constant exists anywhere in the workspace. The probe
-  the clause describes can only be a test that reads production source text and matches variant
-  names in it. This project does not accept a structural invariant enforced that way. The clause is
-  therefore superseded by a statement of what holds the invariant instead. Recording a probe that
-  nobody will build is worse than recording that the invariant rests on exhaustive matches and
-  review.
-* **The enumerated sites are FOUR files**: the enum and its resolver (`adapter/catalog_kind.rs`),
-  the catalog-client construction site (`adapter/mod.rs`), credential validation
-  (`adapter/connection.rs`), and the pushdown scan-source construction site
-  (`adapter/pushdown/scan_resolution.rs`). The recorded clause's set is unchanged in extent. Only
-  its granularity is stated.
-* **What DOES hold the invariant is compile-time.** Each of the three matching sites is exhaustive,
-  so a fourth variant is a build failure at every one of them. Nothing silently falls through. A
-  fifth site added later is visible in review as a new `CatalogKind` import. That is a weaker
-  guarantee than the recorded clause promised. This delta states it as such.
-* **`RequestSession` is not a second `CatalogKind` match.** The pushdown path's resolver carries an
-  already-resolved session in a private enum that mirrors the kind, matched exhaustively when a
-  table resolves. A third kind adds a third variant there. That addition is a compile error rather
-  than a fall-through. The enum names no `CatalogKind` variant, so the permitted-site list is
-  unaffected.
+* The accepted non-absent values are exactly `UNITY_CATALOG`, `DIRECT_STORAGE`, and `GLUE`. The literal `ICEBERG_REST` stays an UNRECOGNIZED value, because Iceberg REST is selected by leaving `CATALOG_KIND` absent.
+* The production files permitted to name a `CatalogKind` variant are FOUR: the enum and its resolver (`adapter/catalog_kind.rs`), the catalog-client construction site (`adapter/mod.rs`), credential validation (`adapter/connection.rs`), and the pushdown scan-source construction site (`adapter/pushdown/scan_resolution.rs`).
+* Exhaustive matching and review hold that set. Every match on the kind is exhaustive, so a new variant is a build failure at each site. No source-level probe exists, because this project does not accept a probe that reads production source text. A fifth site added later is visible in review as a new `CatalogKind` import.
+* The direct-storage client implements `CatalogClient` but is declared in `lakehouse-engine`, not in `lakehouse-catalog`. `vs-adapter/direct-storage-table-discovery` owns that placement. The Glue client is declared in `lakehouse-catalog` (`vs-adapter/glue-catalog-client`).
+* `RequestSession` is not a second `CatalogKind` match. The pushdown resolver carries an already-resolved session in a private enum with one variant per kind, matched exhaustively when a table resolves. That enum names no `CatalogKind` variant.
 
 ## Scenarios
 
@@ -54,9 +19,8 @@ The catalog kind is a `CatalogKind` enum with exactly three variants: `IcebergRe
 * *GIVEN* a createVirtualSchema or pushdown request whose plain VS properties do not include `CATALOG_KIND`
 * *WHEN* the adapter resolves the catalog kind
 * *THEN* the adapter SHALL resolve `CatalogKind::IcebergRest` and construct the Iceberg REST catalog client, and MUST NOT read `CATALOG_KIND` from the CONNECTION password JSON
-* *AND* the adapter SHALL produce output BEHAVIOR-IDENTICAL to the pre-feature output for the same request: the resolved catalog URI, resolved credentials, enumerated tables, declared column names and Exasol types, `TABLE_MAP`, skipped-table warnings, per-shard scan specs, generated SQL, and error messages are all byte-identical. The listing CODE PATH is refactored behind the shared `CatalogClient` trait rather than left untouched, so the guarantee is behavioral, not code-level
-* *AND* enumerating a namespace that contains no table SHALL still build NO resolution-phase `CatalogSession` and perform NO resolution-phase OAuth2 grant; the namespace-enumeration `RestCatalog` retains its OWN grant, so under the OAuth2 client-credentials mode an empty namespace still costs exactly ONE grant (the enumeration grant, unavoidable because the catalog must be contacted to discover the namespace is empty) and under the no-auth and static-token modes ZERO — byte-identical to before this feature (see `vs-adapter/pushdown-catalog-session`). A virtual schema over an empty namespace whose credentials would fail a grant therefore keeps succeeding exactly as it does today ONLY in the no-auth and static-token modes; under OAuth2 it still performs — and can still fail on — the enumeration grant, exactly as it did before this feature. Enumerating a namespace with at least one table SHALL build EXACTLY ONE resolution `CatalogSession` for the whole enumeration, so no request performs more OAuth2 grants or `/v1/config` lookups than before this feature
-* *AND* the Iceberg REST scan and pushdown path SHALL be untouched: it continues to resolve files through the existing catalog session and Iceberg-native table metadata, and does NOT go through the `CatalogClient` trait in this plan
+* *AND* enumerating a namespace that contains no table SHALL build NO resolution-phase `CatalogSession` and perform NO resolution-phase OAuth2 grant. The namespace-enumeration `RestCatalog` keeps its OWN grant, so an empty namespace costs exactly ONE grant under the OAuth2 client-credentials mode and ZERO under the no-auth and static-token modes (see `vs-adapter/pushdown-catalog-session`). The enumeration grant is unavoidable, because only a catalog call can show that the namespace is empty. A virtual schema over an empty namespace whose credentials would fail a grant therefore succeeds ONLY in the no-auth and static-token modes, and under OAuth2 it can fail on the enumeration grant. Enumerating a namespace with at least one table SHALL build EXACTLY ONE resolution `CatalogSession` for the whole enumeration, so the resolution phase runs at most one OAuth2 grant and one `/v1/config` lookup
+* *AND* the Iceberg REST scan and pushdown path SHALL resolve files through the request's catalog session and the Iceberg-native table metadata, and SHALL NOT go through the `CatalogClient` trait
 
 ### Scenario: CATALOG_KIND naming Unity Catalog resolves the native Unity Catalog kind
 
@@ -68,19 +32,14 @@ The catalog kind is a `CatalogKind` enum with exactly three variants: `IcebergRe
 
 ### Scenario: The catalog kind is matched at one construction site and nowhere else
 
-* *GIVEN* the resolved `CatalogKind` and the shared `CatalogClient` trait all three catalog kinds implement
+* *GIVEN* the resolved `CatalogKind` and the shared `CatalogClient` trait every catalog kind implements
 * *WHEN* the adapter handles a createVirtualSchema request under any kind
-* *THEN* the adapter SHALL match `CatalogKind` EXHAUSTIVELY at exactly ONE construction site, which returns a boxed `CatalogClient`, so a fourth catalog kind is a compile error at that site
-* *AND* every subsequent createVirtualSchema step — enumerating the namespace, flattening and case-folding names, mapping column types, building `TABLE_MAP`, and assembling the response — SHALL run ONE pipeline that reads the boxed client through the trait and MUST NOT name or match `CatalogKind`, so a listing change lands once rather than once per kind
-* *AND* the ONLY other production sites permitted to take `CatalogKind` as an input SHALL be credential validation, which takes it as an explicit parameter (see the Connection-Object Credential Source feature), and the pushdown path's per-request scan-source construction site, which SUPERSEDES the pushdown refusal in this list because `vs-adapter/pushdown-format-neutral-resolution` replaces that refusal with a resolution seam; no other production module SHALL match on the enum
-* *AND* the pushdown scan-source construction site SHALL match the kind EXHAUSTIVELY and SHALL yield the per-request resolver every request shape resolves through, so the site count is unchanged and pushdown gains no per-shape fork
-* *AND* the permitted set SHALL be exactly four production files of `lakehouse-engine` — the enum's own declaration with `resolve_catalog_kind` (`adapter/catalog_kind.rs`), the catalog-client construction site (`adapter/mod.rs`), credential validation (`adapter/connection.rs`), and the pushdown scan-source construction site (`adapter/pushdown/scan_resolution.rs`) — and no other production module SHALL name a `CatalogKind` variant
-* *AND* that set SHALL be held by EXHAUSTIVE matching plus review rather than by a source-level probe, SUPERSEDING the recorded clause that a source-level probe SHALL assert it: no such probe exists, the only probe that could assert it reads production source text to match variant names, and this project does not accept a structural invariant enforced that way
-* *AND* each of the three matching sites SHALL be EXHAUSTIVE, so a fourth catalog kind is a build failure at every one of them rather than a silent fall-through, which is the guarantee this feature actually carries
-* *AND* this weakening SHALL be recorded rather than left implicit, because a reader who finds no probe would otherwise read its absence as an oversight and rebuild the one this clause declines
-* *AND* the pushdown resolver's private already-resolved-session enum SHALL gain a third variant matched exhaustively wherever it is read, so a third kind is a compile error there too, and that enum MUST NOT name a `CatalogKind` variant, so it adds no allowlisted file
-* *AND* the direct-storage client SHALL be usable as a boxed `CatalogClient` from that one construction site even though it is declared in `lakehouse-engine` rather than in `lakehouse-catalog`, so the construction site's shape is unchanged apart from becoming fallible
-* *AND* the construction site SHALL return a `Result`, because building the direct-storage client opens an object store over the CONNECTION address and that can fail, and the compile-time signature probe pinning that site SHALL be updated to the new signature as an explicit reviewed edit
+* *THEN* the adapter SHALL match `CatalogKind` EXHAUSTIVELY at exactly ONE construction site, which returns a `Result` holding a boxed `CatalogClient`, so a new catalog kind is a compile error at that site
+* *AND* every later createVirtualSchema step (enumerating the namespace, flattening and case-folding names, mapping column types, building `TABLE_MAP`, recording skipped tables, and assembling the response) SHALL run ONE pipeline that reads the boxed client through the trait and MUST NOT match `CatalogKind`
+* *AND* the only other production sites permitted to take `CatalogKind` as an input SHALL be credential validation, which takes it as an explicit parameter, and the pushdown scan-source construction site, which matches it EXHAUSTIVELY and yields the per-request resolver every request shape resolves through
+* *AND* the pushdown resolver's private already-resolved-session enum SHALL carry one variant per catalog kind, matched exhaustively wherever it is read, and MUST NOT name a `CatalogKind` variant
+* *AND* the direct-storage client and the Glue client SHALL each be usable as a boxed `CatalogClient` from that one construction site
+* *AND* the compile-time signature probe pinning the construction site SHALL stay in step with its signature through explicit reviewed edits
 
 ### Scenario: Unity Catalog validation does not require a warehouse and rejects SigV4
 
@@ -92,17 +51,18 @@ The catalog kind is a `CatalogKind` enum with exactly three variants: `IcebergRe
 
 ### Scenario: Iceberg REST validation is unchanged under the default catalog kind
 
-* *GIVEN* a createVirtualSchema request resolving `CatalogKind::IcebergRest` — whether by an absent `CATALOG_KIND` or an explicit Iceberg-REST value — whose CONNECTION JSON password omits `warehouse`
+* *GIVEN* a createVirtualSchema request resolving `CatalogKind::IcebergRest` through an absent `CATALOG_KIND`, whose CONNECTION JSON password omits `warehouse`
 * *WHEN* the adapter resolves and validates the connection under the Iceberg REST kind
 * *THEN* the adapter SHALL return the same missing-`warehouse` error it returned before this feature, so the Iceberg REST credential contract is unchanged
 * *AND* every Iceberg REST validation rule — the Azure/S3 mutual exclusion, the Azure-shape rules, the SigV4-versus-catalog-auth exclusion, the SigV4 required-fields rule, and the OAuth2 completeness rule — SHALL apply exactly as before
 
 ### Scenario: An unrecognized CATALOG_KIND value is rejected with a clear error
 
-* *GIVEN* a createVirtualSchema request whose plain VS properties include `CATALOG_KIND` set to a value that names none of the Iceberg REST kind, the Unity Catalog kind, and the direct-storage kind
+* *GIVEN* a createVirtualSchema request whose plain VS properties include `CATALOG_KIND` set to a value that names none of the Unity Catalog kind, the direct-storage kind, and the Glue kind
 * *WHEN* the adapter resolves the catalog kind
-* *THEN* the adapter SHALL return an error naming the unrecognized value and ALL THREE accepted catalog-kind spellings, SUPERSEDING the recorded two-value list
+* *THEN* the adapter SHALL return an error naming the unrecognized value and every accepted choice: absent for Iceberg REST, `UNITY_CATALOG`, `DIRECT_STORAGE`, and `GLUE`
 * *AND* the error SHALL state that the Iceberg REST kind is selected by leaving `CATALOG_KIND` absent, so an operator who reads the error learns why the literal `ICEBERG_REST` is rejected rather than retrying it
+* *AND* the adapter SHALL resolve the kind BEFORE it reads the CONNECTION, on createVirtualSchema and pushdown requests alike, so an unrecognized value fails without a connect-back round trip
 * *AND* the adapter MUST NOT fall back to a default catalog kind, because silently defaulting an unrecognized kind would resolve a misconfigured virtual schema against the wrong catalog
 * *AND* the error message MUST NOT contain any credential value
 
@@ -112,7 +72,6 @@ The catalog kind is a `CatalogKind` enum with exactly three variants: `IcebergRe
 * *WHEN* the adapter handles the pushdown request
 * *THEN* the adapter SHALL resolve the request through the Unity Catalog scan source and the Delta format reader, and SHALL return a scan-driving SQL response, SUPERSEDING the recorded refusal that Unity Catalog scan execution is not yet supported
 * *AND* the adapter MUST NOT resolve the request through the Iceberg REST file-resolution path, because a Unity Catalog table is a Delta table the Iceberg path cannot read
-* *AND* the adapter SHALL keep resolving the catalog kind BEFORE it reads the CONNECTION, so an unrecognized `CATALOG_KIND` still fails without a connect-back round-trip
 * *AND* a pushdown request whose Delta table cannot be planned SHALL fail with the reader's own plan-time error rather than a kind-level refusal, so an unreadable table and an unsupported catalog kind are distinguishable
 * *AND* no error message on any of these paths SHALL contain a credential value
 
@@ -121,7 +80,25 @@ The catalog kind is a `CatalogKind` enum with exactly three variants: `IcebergRe
 * *GIVEN* a createVirtualSchema or pushdown request whose plain VS properties include `CATALOG_KIND` set to `DIRECT_STORAGE` in any letter case
 * *WHEN* the adapter resolves the catalog kind
 * *THEN* the adapter SHALL resolve `CatalogKind::DirectStorage`
-* *AND* the adapter SHALL construct the direct-storage catalog client rather than the Iceberg REST or the native Unity Catalog client, and SHALL then run the SAME listing pipeline it runs for the other two kinds
+* *AND* the adapter SHALL construct the direct-storage catalog client rather than the Iceberg REST or the native Unity Catalog client, and SHALL then run the SAME listing pipeline it runs for the other kinds
 * *AND* the adapter SHALL compare the property value case-insensitively, so `direct_storage`, `Direct_Storage`, and `DIRECT_STORAGE` all resolve the same kind
-* *AND* the adapter SHALL resolve the kind BEFORE it reads the CONNECTION, unchanged, so an unrecognized `CATALOG_KIND` still fails without a connect-back round-trip
 * *AND* the resolution SHALL contact no catalog service, because this kind has none: the client reads the object store named by the CONNECTION address directly
+
+### Scenario: CATALOG_KIND naming Glue resolves the native Glue kind
+
+* *GIVEN* a createVirtualSchema or pushdown request whose plain VS properties include `CATALOG_KIND` set to `GLUE` in any letter case
+* *WHEN* the adapter resolves the catalog kind
+* *THEN* the adapter SHALL resolve `CatalogKind::Glue`
+* *AND* the adapter SHALL construct the Glue catalog client and SHALL run the SAME listing pipeline it runs for the other kinds
+
+### Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
+
+* *GIVEN* CONNECTIONs under the Glue kind: one supplying only `region`, `access_key`, and `secret_key`, one that also supplies `warehouse`, one setting `use_sigv4` to false, one setting `use_vended_credentials` to true, one supplying `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope`, and one omitting `secret_key`
+* *WHEN* the adapter validates each connection
+* *THEN* the adapter SHALL accept the first two, treating SigV4 signing as enabled and `warehouse` as the optional Glue `CatalogId`
+* *AND* the adapter SHALL reject `use_sigv4` false with an error stating that the Glue kind always signs with AWS SigV4
+* *AND* the adapter SHALL reject `use_vended_credentials` true with an error stating that the Glue kind has no native credential vending
+* *AND* the adapter SHALL reject every supplied token or OAuth2 field with one error naming each supplied field
+* *AND* the SigV4 required-fields rule of `vs-adapter/connection-credentials-sigv4` SHALL apply, so the error names the missing `secret_key`, and a standard `https://glue.<region>.amazonaws.com` address supplies the signing region
+* *AND* `region`, `access_key`, `secret_key`, `session_token`, `endpoint`, and `path_style` SHALL keep their meaning, so the same keys sign the Glue and the S3 requests, unless the CONNECTION names a role, in which case the role's session replaces those keys for both, per `vs-adapter/connection-credentials-assume-role`
+* *AND* no error message SHALL contain a credential value

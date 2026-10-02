@@ -58,7 +58,7 @@ pub fn read_connection(
         )));
     }
 
-    let creds = parse_creds(&json);
+    let creds = parse_kind_creds(name, &json, kind)?;
     validate_creds(name, &creds, kind, &uri)?;
     let sealed_storage_key = connection_password_carries_key_material(&creds)
         .then(|| derive_sealed_storage_key(&conn.password));
@@ -67,6 +67,24 @@ pub fn read_connection(
         creds,
         sealed_storage_key,
     })
+}
+
+fn parse_kind_creds(
+    name: &str,
+    json: &serde_json::Value,
+    kind: CatalogKind,
+) -> Result<ConnectionCreds, UdfError> {
+    let mut creds = parse_creds(json);
+    if kind == CatalogKind::Glue {
+        if json.get("use_sigv4").and_then(|v| v.as_bool()) == Some(false) {
+            return Err(UdfError::User(format!(
+                "CONNECTION '{name}' sets use_sigv4 to false, but the Glue catalog kind always \
+                 signs with AWS SigV4; remove use_sigv4"
+            )));
+        }
+        creds.use_sigv4 = true;
+    }
+    Ok(creds)
 }
 
 fn validate_creds(
@@ -111,6 +129,25 @@ fn validate_kind_preconditions(
         CatalogKind::DirectStorage => {
             validate_direct_storage_preconditions(name, creds, address)?;
         }
+        CatalogKind::Glue => validate_glue_preconditions(name, creds)?,
+    }
+    Ok(())
+}
+
+fn validate_glue_preconditions(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    if creds.use_vended_credentials {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' sets use_vended_credentials, but the Glue catalog kind has no \
+             native credential vending; remove it and supply storage credentials"
+        )));
+    }
+    let rejected = supplied_catalog_auth_fields(creds);
+    if !rejected.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies field(s) {} but the Glue catalog kind signs with AWS \
+             SigV4 and uses no token or OAuth2 authentication; remove them",
+            rejected.join(", ")
+        )));
     }
     Ok(())
 }
@@ -127,19 +164,17 @@ fn validate_direct_storage_preconditions(
     }
 
     // Catalog-auth fields are meaningless under direct storage; reject rather than ignore them.
-    let rejected: Vec<&str> = [
-        ("warehouse", !creds.warehouse.is_empty()),
-        ("token", creds.token.is_some()),
-        ("client_id", creds.client_id.is_some()),
-        ("client_secret", creds.client_secret.is_some()),
-        ("oauth2_server_uri", creds.oauth2_server_uri.is_some()),
-        ("scope", creds.scope.is_some()),
-        ("use_sigv4", creds.use_sigv4),
-        ("use_vended_credentials", creds.use_vended_credentials),
-    ]
-    .into_iter()
-    .filter_map(|(field, present)| present.then_some(field))
-    .collect();
+    let mut rejected: Vec<&str> = Vec::new();
+    if !creds.warehouse.is_empty() {
+        rejected.push("warehouse");
+    }
+    rejected.extend(supplied_catalog_auth_fields(creds));
+    if creds.use_sigv4 {
+        rejected.push("use_sigv4");
+    }
+    if creds.use_vended_credentials {
+        rejected.push("use_vended_credentials");
+    }
     if !rejected.is_empty() {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' supplies field(s) {} but the direct-storage catalog kind \
@@ -337,6 +372,19 @@ fn supplied_azure_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
         ("account_name", creds.account_name.is_some()),
         ("account_key", creds.account_key.is_some()),
         ("sas_token", creds.sas_token.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, supplied)| supplied.then_some(field))
+    .collect()
+}
+
+fn supplied_catalog_auth_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
+    [
+        ("token", creds.token.is_some()),
+        ("client_id", creds.client_id.is_some()),
+        ("client_secret", creds.client_secret.is_some()),
+        ("oauth2_server_uri", creds.oauth2_server_uri.is_some()),
+        ("scope", creds.scope.is_some()),
     ]
     .into_iter()
     .filter_map(|(field, supplied)| supplied.then_some(field))

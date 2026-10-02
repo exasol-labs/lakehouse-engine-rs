@@ -7,12 +7,18 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::raw_parquet::{encode_parquet_message, write_parquet_column};
+
 use anyhow::{Context, Result};
+
 use arrow::array::{
-    BooleanArray, Date32Array, Decimal128Array, Float32Array, Float64Array, Int32Array, Int64Array,
-    RecordBatch, StringArray, TimestampMicrosecondArray, TimestampNanosecondArray,
+    ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
+    ListArray, MapArray, RecordBatch, StringArray, StructArray, Time64MicrosecondArray,
+    TimestampMicrosecondArray, TimestampNanosecondArray,
 };
-use arrow::datatypes::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+use arrow::buffer::{NullBuffer, OffsetBuffer};
+use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use arrow::json::ReaderBuilder;
 use futures::TryStreamExt;
 use iceberg::arrow::schema_to_arrow_schema;
@@ -21,9 +27,9 @@ use iceberg::io::{
     S3_REGION, S3_SECRET_ACCESS_KEY, StorageFactory,
 };
 use iceberg::spec::{
-    DataFileFormat, FormatVersion, ListType, Literal, MapType, NestedField, PrimitiveType,
-    Schema as IcebergSchema, Struct, StructType, Transform, Type, UnboundPartitionField,
-    UnboundPartitionSpec,
+    DataContentType, DataFile, DataFileBuilder, DataFileFormat, FormatVersion, ListType, Literal,
+    MapType, NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Struct,
+    StructType, Transform, Type, UnboundPartitionField, UnboundPartitionSpec,
 };
 use iceberg::table::Table;
 use iceberg::transaction::{ApplyTransactionAction, Transaction};
@@ -44,6 +50,7 @@ use iceberg_storage_opendal::{
     AwsCredential, CustomAwsCredentialLoader, OpenDalStorageFactory, ProvideCredential,
 };
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
+use parquet::data_type::{ByteArray, ByteArrayType, Int64Type};
 use parquet::file::properties::WriterProperties;
 use reqsign_core::{Context as ReqsignContext, Result as ReqsignResult};
 use serde_json::json;
@@ -353,7 +360,7 @@ where
     Ok(wrote_any)
 }
 
-async fn write_one_file_append(
+pub async fn write_one_file_append(
     catalog: &impl Catalog,
     table: &Table,
     table_name: &str,
@@ -392,7 +399,14 @@ async fn write_one_file_append(
         writer.write(batch).await.context("write Arrow batch")?;
     }
     let data_files = writer.close().await.context("close data file writer")?;
+    commit_data_files(catalog, table, data_files).await
+}
 
+pub async fn commit_data_files(
+    catalog: &impl Catalog,
+    table: &Table,
+    data_files: Vec<DataFile>,
+) -> Result<()> {
     let tx = Transaction::new(table);
     let action = tx.fast_append().add_data_files(data_files);
     let tx = action.apply(tx).context("apply fast-append action")?;
@@ -628,13 +642,7 @@ async fn write_one_data_file<C: Catalog>(
         .iter()
         .map(|df| df.file_path().to_string())
         .collect();
-
-    let tx = Transaction::new(table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action.apply(tx).context("apply fast-append action")?;
-    tx.commit(catalog)
-        .await
-        .context("commit Iceberg snapshot")?;
+    commit_data_files(catalog, table, data_files).await?;
 
     paths
         .into_iter()
@@ -829,15 +837,9 @@ async fn write_one_labels_data_file<C: Catalog>(
         .iter()
         .map(|df| df.file_path().to_string())
         .collect();
-
-    let tx = Transaction::new(table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action
-        .apply(tx)
-        .context("apply labels fast-append action")?;
-    tx.commit(catalog)
+    commit_data_files(catalog, table, data_files)
         .await
-        .context("commit labels Iceberg snapshot")?;
+        .context("commit the labels data files")?;
 
     Ok(paths)
 }
@@ -1347,17 +1349,9 @@ async fn write_one_partitioned_file<C: Catalog>(
         .close()
         .await
         .context("close regions data file writer")?;
-
-    let tx = Transaction::new(table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action
-        .apply(tx)
-        .context("apply regions fast-append action")?;
-    tx.commit(catalog)
+    commit_data_files(catalog, table, data_files)
         .await
-        .context("commit regions Iceberg snapshot")?;
-
-    Ok(())
+        .context("commit the regions data files")
 }
 
 // iceberg-rust 0.10 has no schema-evolution API, so the rename (#26) is applied via a
@@ -2852,16 +2846,9 @@ async fn write_complex_types_and_commit<C: Catalog>(catalog: &C, table: Table) -
         .close()
         .await
         .context("close complex-types data file writer")?;
-
-    let tx = Transaction::new(&table);
-    let action = tx.fast_append().add_data_files(data_files);
-    let tx = action
-        .apply(tx)
-        .context("apply complex-types fast-append action")?;
-    tx.commit(catalog)
+    commit_data_files(catalog, &table, data_files)
         .await
-        .context("commit complex-types Iceberg snapshot")?;
-    Ok(())
+        .context("commit the complex-types data files")
 }
 
 /// Decoded straight into the created table's Arrow schema, so nested fields already
@@ -3088,6 +3075,423 @@ fn make_timestamp_precision_probe_batch() -> RecordBatch {
         ],
     )
     .expect("timestamp precision probe RecordBatch construction is infallible")
+}
+
+/// The Iceberg types no other `E2E_NAMESPACE` table carries; `events` holds `long`, `string`,
+/// `double`, `date`, and `timestamp`, and `complex_types_probe` the nested types.
+pub const E2E_ALL_TYPES_TABLE: &str = "all_types";
+/// One `string` column whose data file holds bytes that are not valid UTF-8.
+pub const E2E_BINARY_VALUES_TABLE: &str = "binary_values";
+
+/// Every all-types fixture, on every source, holds these ids: two rows of values, then a row
+/// NULL in every other column. The value builders below are shared by those fixtures.
+pub const ALL_TYPES_IDS: [i64; 3] = [1, 2, 3];
+/// Millisecond-exact, so it reads the same at every gated `TIMESTAMP` precision.
+const ALL_TYPES_TIMESTAMP_MICROS: i64 = 1_705_314_645_123_000;
+pub const ALL_TYPES_TIME_MICROS: i64 = (12 * 3600 + 34 * 60 + 56) * 1_000_000 + 123_456;
+pub const ALL_TYPES_DATE_DAYS: i32 = 19_737;
+const NON_UTF8_BYTES: [&[u8]; 2] = [&[0xFF, 0xFE, 0x00, 0x80], &[0xC3, 0x28]];
+
+pub fn all_types_validity() -> Option<NullBuffer> {
+    Some(NullBuffer::from(vec![true, true, false]))
+}
+
+/// Each `*_TEXT` is how Exasol returns its builder's three rows as text, NULL as `None`.
+pub const ALL_TYPES_IDS_TEXT: [Option<&str>; 3] = [Some("1"), Some("2"), Some("3")];
+
+pub fn all_types_ids() -> ArrayRef {
+    Arc::new(Int64Array::from(ALL_TYPES_IDS.to_vec()))
+}
+
+pub const INT8_VALUES_TEXT: [Option<&str>; 3] = [Some("127"), Some("-128"), None];
+
+pub fn int8_values() -> ArrayRef {
+    Arc::new(Int8Array::from(vec![Some(127), Some(-128), None]))
+}
+
+pub const INT16_VALUES_TEXT: [Option<&str>; 3] = [Some("32767"), Some("-32768"), None];
+
+pub fn int16_values() -> ArrayRef {
+    Arc::new(Int16Array::from(vec![Some(32_767), Some(-32_768), None]))
+}
+
+pub const INT32_VALUES_TEXT: [Option<&str>; 3] = [Some("2147483647"), Some("-2147483648"), None];
+
+pub fn int32_values() -> ArrayRef {
+    Arc::new(Int32Array::from(vec![Some(i32::MAX), Some(i32::MIN), None]))
+}
+
+pub const FLOAT32_VALUES_TEXT: [Option<&str>; 3] = [Some("1.5"), Some("-0.25"), None];
+
+pub fn float32_values() -> ArrayRef {
+    Arc::new(Float32Array::from(vec![Some(1.5), Some(-0.25), None]))
+}
+
+pub const BOOLEAN_VALUES_TEXT: [Option<&str>; 3] = [Some("true"), Some("false"), None];
+
+pub fn boolean_values() -> ArrayRef {
+    Arc::new(BooleanArray::from(vec![Some(true), Some(false), None]))
+}
+
+pub const TEXT_VALUES_TEXT: [Option<&str>; 3] = [Some("h\u{e9}llo"), Some("w\u{f6}rld"), None];
+
+pub fn text_values() -> ArrayRef {
+    Arc::new(StringArray::from(vec![
+        Some("h\u{e9}llo"),
+        Some("w\u{f6}rld"),
+        None,
+    ]))
+}
+
+pub const DECIMAL_10_2_VALUES_TEXT: [Option<&str>; 3] = [Some("12.34"), Some("-0.05"), None];
+
+pub fn decimal_10_2_values() -> ArrayRef {
+    decimal_values(1234, 10, 2)
+}
+
+pub const DECIMAL_38_10_VALUES_TEXT: [Option<&str>; 3] = [
+    Some("1234567890123456789012345678.9012345678"),
+    Some("-0.0000000005"),
+    None,
+];
+
+pub fn decimal_38_10_values() -> ArrayRef {
+    decimal_values(12_345_678_901_234_567_890_123_456_789_012_345_678, 38, 10)
+}
+
+fn decimal_values(first: i128, precision: u8, scale: i8) -> ArrayRef {
+    Arc::new(
+        Decimal128Array::from(vec![Some(first), Some(-5), None])
+            .with_precision_and_scale(precision, scale)
+            .expect("valid decimal precision and scale"),
+    )
+}
+
+pub const DATE_VALUES_TEXT: [Option<&str>; 3] = [Some("2024-01-15"), Some("1970-01-01"), None];
+
+pub fn date_values() -> ArrayRef {
+    Arc::new(Date32Array::from(vec![
+        Some(ALL_TYPES_DATE_DAYS),
+        Some(0),
+        None,
+    ]))
+}
+
+pub const TIMESTAMP_VALUES_TEXT: [Option<&str>; 3] = [
+    Some("2024-01-15 10:30:45.123000"),
+    Some("1970-01-01 00:00:00.000000"),
+    None,
+];
+
+pub fn timestamp_values(timezone: Option<&str>) -> ArrayRef {
+    let values =
+        TimestampMicrosecondArray::from(vec![Some(ALL_TYPES_TIMESTAMP_MICROS), Some(0), None]);
+    match timezone {
+        Some(timezone) => Arc::new(values.with_timezone(timezone)),
+        None => Arc::new(values),
+    }
+}
+
+pub const TIME64_VALUES_TEXT: [Option<&str>; 3] = [Some("12:34:56.123456"), Some("00:00:00"), None];
+
+pub fn time64_values() -> ArrayRef {
+    Arc::new(Time64MicrosecondArray::from(vec![
+        Some(ALL_TYPES_TIME_MICROS),
+        Some(0),
+        None,
+    ]))
+}
+
+/// `LargeBinary` is what `iceberg-rust` maps an Iceberg `binary` to; every other source writes `Binary`.
+pub fn binary_values(data_type: &DataType) -> ArrayRef {
+    let values = vec![Some(b"ab".as_slice()), Some(b"".as_slice()), None];
+    match data_type {
+        DataType::LargeBinary => Arc::new(LargeBinaryArray::from_opt_vec(values)),
+        _ => Arc::new(BinaryArray::from_opt_vec(values)),
+    }
+}
+
+pub fn fixed_16_values() -> ArrayRef {
+    Arc::new(
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+            vec![Some([0x55; 16]), Some([0x11; 16]), None].into_iter(),
+            16,
+        )
+        .expect("FixedSizeBinary(16)"),
+    )
+}
+
+/// `struct<x: binary>`; `members` carries an Iceberg table's field id when it has one.
+pub fn struct_binary_values(members: Option<&Fields>) -> ArrayRef {
+    let members = members
+        .cloned()
+        .unwrap_or_else(|| Fields::from(vec![Field::new("x", DataType::Binary, true)]));
+    let values = binary_values(members[0].data_type());
+    Arc::new(
+        StructArray::try_new(members, vec![values], all_types_validity())
+            .expect("struct<x: binary>"),
+    )
+}
+
+/// `struct<{int_member}: int, {string_member}: string>` holding `(1, first_string)`,
+/// `(2, NULL)`, then a NULL struct.
+pub fn int_string_struct_values(
+    int_member: &str,
+    string_member: &str,
+    first_string: &str,
+) -> ArrayRef {
+    let members = Fields::from(vec![
+        Field::new(int_member, DataType::Int32, true),
+        Field::new(string_member, DataType::Utf8, true),
+    ]);
+    Arc::new(
+        StructArray::try_new(
+            members,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some(first_string), None, None])),
+            ],
+            all_types_validity(),
+        )
+        .expect("struct<int, string>"),
+    )
+}
+
+pub const INT_LIST_VALUES_TEXT: [Option<&str>; 3] = [Some("[1,2]"), Some("[]"), None];
+
+/// Hive and Spark name a list member `element`.
+pub fn int_list_values() -> ArrayRef {
+    Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("element", DataType::Int32, true)),
+            OffsetBuffer::from_lengths([2, 0, 0]),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            all_types_validity(),
+        )
+        .expect("list<int>"),
+    )
+}
+
+/// `map<string, int>` named as Hive and Spark name a map's entries: `key_value`, `key`, `value`.
+pub fn string_int_map_values(keys: Vec<&str>, values: Vec<i32>, lengths: [usize; 3]) -> ArrayRef {
+    let entry_fields = Fields::from(vec![
+        Field::new("key", DataType::Utf8, false),
+        Field::new("value", DataType::Int32, true),
+    ]);
+    let entries = StructArray::try_new(
+        entry_fields.clone(),
+        vec![
+            Arc::new(StringArray::from(keys)) as ArrayRef,
+            Arc::new(Int32Array::from(values)),
+        ],
+        None,
+    )
+    .expect("map entries");
+    Arc::new(
+        MapArray::try_new(
+            Arc::new(Field::new(
+                "key_value",
+                DataType::Struct(entry_fields),
+                false,
+            )),
+            OffsetBuffer::from_lengths(lengths),
+            entries,
+            all_types_validity(),
+            false,
+        )
+        .expect("map<string, int>"),
+    )
+}
+
+/// `binary_values`' data file: `message` declares `id` and one `BYTE_ARRAY` column `c_bytes`,
+/// which holds `NON_UTF8_BYTES`.
+pub fn non_utf8_parquet(message: &str) -> bytes::Bytes {
+    encode_parquet_message(message, |row_group| {
+        write_parquet_column::<_, Int64Type>(row_group, &ALL_TYPES_IDS, None);
+        let values = NON_UTF8_BYTES.map(|bytes| ByteArray::from(bytes.to_vec()));
+        write_parquet_column::<_, ByteArrayType>(row_group, &values, Some(&[1, 1, 0]));
+    })
+}
+
+/// Field ids follow the REST catalog's fresh assignment, every top-level field before the
+/// nested member, so the stored schema matches this one and a reseed reuses the table.
+fn all_types_iceberg_schema() -> Result<IcebergSchema> {
+    let column = |id: i32, name: &str, ty: PrimitiveType| -> NestedFieldRef {
+        NestedField::optional(id, name, Type::Primitive(ty)).into()
+    };
+    let decimal = |precision, scale| PrimitiveType::Decimal { precision, scale };
+    IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            column(2, "c_int", PrimitiveType::Int),
+            column(3, "c_float", PrimitiveType::Float),
+            column(4, "c_decimal_10_2", decimal(10, 2)),
+            column(5, "c_decimal_38_10", decimal(38, 10)),
+            column(6, "c_boolean", PrimitiveType::Boolean),
+            column(7, "c_time", PrimitiveType::Time),
+            column(8, "c_timestamptz", PrimitiveType::Timestamptz),
+            column(9, "c_timestamp_ns", PrimitiveType::TimestampNs),
+            column(10, "c_binary", PrimitiveType::Binary),
+            column(11, "c_fixed", PrimitiveType::Fixed(16)),
+            column(12, "c_uuid", PrimitiveType::Uuid),
+            NestedField::optional(
+                13,
+                "c_struct_binary",
+                Type::Struct(StructType::new(vec![column(
+                    14,
+                    "x",
+                    PrimitiveType::Binary,
+                )])),
+            )
+            .into(),
+        ])
+        .build()
+        .context("build all_types Iceberg schema")
+}
+
+/// Built against the created table's Arrow schema, so the nested member carries the field
+/// id the catalog stored and each binary column the Arrow type `iceberg-rust` writes.
+fn all_types_batch(table: &Table) -> Result<RecordBatch> {
+    let schema = Arc::new(
+        schema_to_arrow_schema(table.metadata().current_schema())
+            .context("derive all_types Arrow schema")?,
+    );
+    let columns: Vec<ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|field| -> Result<ArrayRef> {
+            Ok(match (field.name().as_str(), field.data_type()) {
+                ("id", _) => all_types_ids(),
+                ("c_int", _) => int32_values(),
+                ("c_float", _) => float32_values(),
+                ("c_decimal_10_2", _) => decimal_10_2_values(),
+                ("c_decimal_38_10", _) => decimal_38_10_values(),
+                ("c_boolean", _) => boolean_values(),
+                ("c_time", _) => time64_values(),
+                ("c_timestamptz", _) => timestamp_values(Some("+00:00")),
+                ("c_timestamp_ns", _) => Arc::new(TimestampNanosecondArray::from(vec![
+                    Some(ALL_TYPES_TIMESTAMP_MICROS * 1_000),
+                    Some(0),
+                    None,
+                ])),
+                ("c_binary", data_type) => binary_values(data_type),
+                ("c_fixed" | "c_uuid", _) => fixed_16_values(),
+                ("c_struct_binary", DataType::Struct(members)) => {
+                    struct_binary_values(Some(members))
+                }
+                (other, _) => anyhow::bail!("all_types has no values for column {other}"),
+            })
+        })
+        .collect::<Result<_>>()?;
+    RecordBatch::try_new(schema, columns).context("build all_types batch")
+}
+
+/// Creates the table when absent or stale, and returns it when it holds no data yet.
+async fn empty_table_to_fill(
+    catalog: &impl Catalog,
+    table_name: &str,
+    schema: IcebergSchema,
+    properties: HashMap<String, String>,
+) -> Result<Option<Table>> {
+    create_and_append_files_with_properties(
+        catalog,
+        E2E_NAMESPACE,
+        table_name,
+        schema,
+        properties,
+        std::iter::empty::<Vec<RecordBatch>>(),
+    )
+    .await
+    .with_context(|| format!("create {table_name}"))?;
+    let ident = TableIdent::new(
+        NamespaceIdent::new(E2E_NAMESPACE.to_string()),
+        table_name.to_string(),
+    );
+    let table = catalog
+        .load_table(&ident)
+        .await
+        .with_context(|| format!("load {table_name}"))?;
+    let empty = collect_current_snapshot_paths(&table).await?.is_empty();
+    Ok(empty.then_some(table))
+}
+
+/// Seeds `all_types` and `binary_values` in `E2E_NAMESPACE`.
+pub async fn seed_all_types(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog =
+        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-all-types").await?;
+    let format_v3 = HashMap::from([(
+        ICEBERG_FORMAT_VERSION_PROPERTY.to_string(),
+        ICEBERG_FORMAT_VERSION_3.to_string(),
+    )]);
+    if let Some(table) = empty_table_to_fill(
+        &catalog,
+        E2E_ALL_TYPES_TABLE,
+        all_types_iceberg_schema()?,
+        format_v3,
+    )
+    .await?
+    {
+        write_one_file_append(
+            &catalog,
+            &table,
+            E2E_ALL_TYPES_TABLE,
+            [all_types_batch(&table)?],
+        )
+        .await
+        .context("append all_types")?;
+    }
+    seed_binary_values(&catalog).await
+}
+
+/// `iceberg-rust` refuses to write a `string` that is not valid UTF-8, so the data file is
+/// written with `parquet` directly and committed as an existing data file.
+async fn seed_binary_values(catalog: &impl Catalog) -> Result<()> {
+    let schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(2, "c_bytes", Type::Primitive(PrimitiveType::String)).into(),
+        ])
+        .build()
+        .context("build binary_values Iceberg schema")?;
+    let Some(table) =
+        empty_table_to_fill(catalog, E2E_BINARY_VALUES_TABLE, schema, HashMap::new()).await?
+    else {
+        return Ok(());
+    };
+
+    let bytes = non_utf8_parquet(
+        "message binary_values {
+            REQUIRED INT64 id = 1;
+            OPTIONAL BYTE_ARRAY c_bytes (STRING) = 2;
+        }",
+    );
+    let path = format!(
+        "{}/data/{E2E_BINARY_VALUES_TABLE}-{}.parquet",
+        table.metadata().location(),
+        uuid_suffix()
+    );
+    let file_size = bytes.len() as u64;
+    table
+        .file_io()
+        .new_output(&path)
+        .context("open binary_values data file")?
+        .write(bytes)
+        .await
+        .context("write binary_values data file")?;
+    let data_file = DataFileBuilder::default()
+        .content(DataContentType::Data)
+        .file_path(path)
+        .file_format(DataFileFormat::Parquet)
+        .record_count(3)
+        .file_size_in_bytes(file_size)
+        .partition_spec_id(table.metadata().default_partition_spec_id())
+        .build()
+        .context("describe binary_values data file")?;
+    commit_data_files(catalog, &table, vec![data_file])
+        .await
+        .context("commit binary_values data file")
 }
 
 #[cfg(test)]

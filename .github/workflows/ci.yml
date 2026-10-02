@@ -359,31 +359,12 @@ jobs:
       - name: Run E2E suite
         run: make test-e2e
 
-      # A UDF sandbox crash leaves empty DB-side logs; the reason is only in host dmesg.
       - name: Dump Exasol logs on failure
         if: failure()
-        run: |
-          echo "=== container stats / host free ==="
-          docker compose ps || true
-          free -m || true
-          echo "=== HOST kernel ring buffer (sudo) ==="
-          sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
-          echo "--- last 40 kernel lines (fallback) ---"
-          sudo dmesg --ctime | tail -40 || true
-          echo "=== exasql crash logs ==="
-          docker compose exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
-          echo "=== collecting /exa/logs tree for artifact ==="
-          rm -rf exa-logs && mkdir -p exa-logs
-          docker compose cp exasol:/exa/logs exa-logs/ 2>/dev/null || true
-
-      - name: Upload Exasol logs
-        if: failure()
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/dump-exasol-logs
         with:
           # upload-artifact@v7 rejects a name reused within one run.
-          name: ${{ matrix.log_artifact }}
-          path: exa-logs/
-          if-no-files-found: ignore
+          artifact-name: ${{ matrix.log_artifact }}
 
       - name: Stop stack
         if: always()
@@ -431,38 +412,11 @@ jobs:
 
       - name: Dump Lakekeeper stack logs on failure
         if: failure()
-        run: |
-          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
-          echo "=== container stats / host free ==="
-          $COMPOSE ps || true
-          free -m || true
-          echo "=== HOST kernel ring buffer (sudo) ==="
-          sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
-          echo "--- last 40 kernel lines (fallback) ---"
-          sudo dmesg --ctime | tail -40 || true
-          echo "=== keycloak logs ==="
-          $COMPOSE logs keycloak | tail -100 || true
-          echo "=== openfga-migrate logs ==="
-          $COMPOSE logs openfga-migrate | tail -100 || true
-          echo "=== openfga logs ==="
-          $COMPOSE logs openfga | tail -100 || true
-          echo "=== lakekeeper-migrate logs ==="
-          $COMPOSE logs lakekeeper-migrate | tail -100 || true
-          echo "=== lakekeeper logs ==="
-          $COMPOSE logs lakekeeper | tail -100 || true
-          echo "=== exasql crash logs ==="
-          $COMPOSE exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
-          echo "=== collecting /exa/logs tree for artifact ==="
-          rm -rf exa-logs-lakekeeper && mkdir -p exa-logs-lakekeeper
-          $COMPOSE cp exasol:/exa/logs exa-logs-lakekeeper/ 2>/dev/null || true
-
-      - name: Upload Lakekeeper Exasol logs
-        if: failure()
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/dump-exasol-logs
         with:
-          name: exa-logs-lakekeeper
-          path: exa-logs-lakekeeper/
-          if-no-files-found: ignore
+          compose: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml
+          services: keycloak openfga-migrate openfga lakekeeper-migrate lakekeeper
+          artifact-name: exa-logs-lakekeeper
 
       - name: Stop stack
         if: always()
@@ -500,32 +454,11 @@ jobs:
 
       - name: Dump Unity stack logs on failure
         if: failure()
-        run: |
-          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.unity.yml"
-          echo "=== container stats / host free ==="
-          $COMPOSE ps || true
-          free -m || true
-          echo "=== HOST kernel ring buffer (sudo) ==="
-          sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
-          echo "--- last 40 kernel lines (fallback) ---"
-          sudo dmesg --ctime | tail -40 || true
-          echo "=== unitycatalog logs ==="
-          $COMPOSE logs unitycatalog | tail -100 || true
-          echo "=== seaweedfs logs ==="
-          $COMPOSE logs seaweedfs | tail -100 || true
-          echo "=== exasql crash logs ==="
-          $COMPOSE exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
-          echo "=== collecting /exa/logs tree for artifact ==="
-          rm -rf exa-logs-unity && mkdir -p exa-logs-unity
-          $COMPOSE cp exasol:/exa/logs exa-logs-unity/ 2>/dev/null || true
-
-      - name: Upload Unity Exasol logs
-        if: failure()
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/dump-exasol-logs
         with:
-          name: exa-logs-unity
-          path: exa-logs-unity/
-          if-no-files-found: ignore
+          compose: docker compose -f docker-compose.yml -f docker-compose.unity.yml
+          services: unitycatalog seaweedfs
+          artifact-name: exa-logs-unity
 
       - name: Stop stack
         if: always()
@@ -585,49 +518,64 @@ jobs:
 
       - name: Dump Azure stack logs on failure
         if: failure()
-        run: |
-          COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml"
-          echo "=== container stats / host free ==="
-          $COMPOSE ps || true
-          free -m || true
-          echo "=== HOST kernel ring buffer (sudo) ==="
-          sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
-          echo "--- last 40 kernel lines (fallback) ---"
-          sudo dmesg --ctime | tail -40 || true
-          echo "=== keycloak logs ==="
-          $COMPOSE logs keycloak | tail -100 || true
-          echo "=== openfga-migrate logs ==="
-          $COMPOSE logs openfga-migrate | tail -100 || true
-          echo "=== openfga logs ==="
-          $COMPOSE logs openfga | tail -100 || true
-          echo "=== lakekeeper-migrate logs ==="
-          $COMPOSE logs lakekeeper-migrate | tail -100 || true
-          echo "=== lakekeeper logs ==="
-          $COMPOSE logs lakekeeper | tail -100 || true
-          echo "=== exasql crash logs ==="
-          $COMPOSE exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
-          echo "=== collecting /exa/logs tree for artifact ==="
-          rm -rf exa-logs-azure && mkdir -p exa-logs-azure
-          $COMPOSE cp exasol:/exa/logs exa-logs-azure/ 2>/dev/null || true
-
-      - name: Upload Azure Exasol logs
-        if: failure()
-        uses: actions/upload-artifact@v7
+        uses: ./.github/actions/dump-exasol-logs
         with:
-          name: exa-logs-azure
-          path: exa-logs-azure/
-          if-no-files-found: ignore
+          compose: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml
+          services: keycloak openfga-migrate openfga lakekeeper-migrate lakekeeper
+          artifact-name: exa-logs-azure
 
       - name: Stop stack
         if: always()
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml down -v
 
+  # Real AWS Glue Data Catalog and S3 fixture bucket; the key's IAM policy is in
+  # test.env.example. Not in `release`'s needs, so an AWS outage or a rotated key
+  # can't block releases. A fork PR receives no secrets and fails loudly.
+  e2e-glue:
+    name: E2E (Glue)
+    runs-on: ubuntu-latest
+    needs: [build-so]
+    timeout-minutes: 45
+    env:
+      LH_EXASOL_CPUSET: "0-1"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: ./.github/actions/e2e-setup
+
+      - name: Pull stack images
+        run: docker compose pull --quiet exasol
+
+      - name: Start stack (Exasol)
+        run: docker compose up -d --wait exasol
+
+      - name: Run Glue E2E suite
+        env:
+          GLUE_ACCESS_KEY_ID: ${{ secrets.GLUE_ACCESS_KEY_ID }}
+          GLUE_SECRET_ACCESS_KEY: ${{ secrets.GLUE_SECRET_ACCESS_KEY }}
+          GLUE_REGION: ${{ vars.GLUE_REGION }}
+          GLUE_FIXTURE_BUCKET: ${{ vars.GLUE_FIXTURE_BUCKET }}
+          GLUE_ASSUME_ROLE_BASE_ACCESS_KEY_ID: ${{ secrets.GLUE_ASSUME_ROLE_BASE_ACCESS_KEY_ID }}
+          GLUE_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY: ${{ secrets.GLUE_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY }}
+          GLUE_ASSUME_ROLE_ARN: ${{ vars.GLUE_ASSUME_ROLE_ARN }}
+          GLUE_ASSUME_ROLE_EXTERNAL_ID: ${{ secrets.GLUE_ASSUME_ROLE_EXTERNAL_ID }}
+        run: make test-e2e-glue
+
+      - name: Dump Glue stack logs on failure
+        if: failure()
+        uses: ./.github/actions/dump-exasol-logs
+        with:
+          artifact-name: exa-logs-glue
+
+      - name: Stop stack
+        if: always()
+        run: docker compose down -v
+
   release:
     name: Release
     runs-on: ubuntu-latest
     # lint/unit-tests/licenses must be listed explicitly: e2e only needs build-so.
-    # `e2e-azure` is deliberately absent (third-party outage risk); `arm64` is
-    # the only test signal for the aarch64 asset.
+    # `e2e-azure` and `e2e-glue` are deliberately absent (third-party outage risk);
+    # `arm64` is the only test signal for the aarch64 asset.
     needs: [e2e, e2e-lakekeeper, e2e-unity, lint, unit-tests, arm64, licenses, install-script, install-script-e2e]
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || startsWith(github.ref, 'refs/tags/v')
     permissions:

@@ -1965,10 +1965,6 @@ fn refused_column_table_request_with_filter(select_list: Json, filter: Json) -> 
     }))
 }
 
-fn refused_column_table_select_star_request() -> Json {
-    refused_column_table(serde_json::json!({"type": "select"}))
-}
-
 fn refused_column_table(pushdown_request: Json) -> Json {
     serde_json::json!({
         "involvedTables": [{
@@ -2029,86 +2025,128 @@ async fn a_refused_column_is_refused_before_the_zero_active_files_early_return()
     .await
     .expect_err("a request emitting the refused column must be refused, never answered empty");
 
-    let message = match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    };
+    let message = user_message(error);
     assert!(
         message.contains("binary_col") && message.contains("#351"),
         "the refusal must be the gate's own message, naming the column and its reason: \
          {message}"
     );
+}
+
+/// Each format's binary table `T`: the mappable `ID` and `B binary`, plus on Iceberg `F fixed(16)`,
+/// `U uuid`, and `S struct<x: binary>`.
+async fn binary_table_pushdown(iceberg: bool, pushdown_request: Json) -> Result<Json, UdfError> {
+    let names: &[&str] = if iceberg {
+        &["ID", "B", "F", "U", "S"]
+    } else {
+        &["ID", "B"]
+    };
+    let columns: Vec<Json> = names
+        .iter()
+        .map(|name| {
+            let data_type = match *name {
+                "ID" => serde_json::json!({"type": "decimal", "precision": 10, "scale": 0}),
+                _ => serde_json::json!({"type": "varchar", "size": 2000000}),
+            };
+            serde_json::json!({"name": name, "dataType": data_type})
+        })
+        .collect();
+    let request = serde_json::json!({
+        "involvedTables": [{"name": "T", "columns": columns}],
+        "pushdownRequest": pushdown_request,
+    });
+    if !iceberg {
+        let catalog = unity_delta_catalog().await;
+        let storage = delta_object_endpoint(vec![(
+            delta_commit_zero_key("t"),
+            fileless_delta_commit("t", &[("id", "integer"), ("b", "binary")]),
+        )])
+        .await;
+        return delta_pushdown(&request, &catalog.uri, storage, "cat.sch.t").await;
+    }
+    let catalog = RecordingCatalog::spawn(|target| {
+        if target.starts_with("/v1/config") {
+            (200, "{}".to_string())
+        } else {
+            let fields = binary_iceberg_fields();
+            (
+                200,
+                load_table_body_with_columns(fields, BINARY_ICEBERG_LAST_COLUMN_ID),
+            )
+        }
+    })
+    .await;
+    seam_handle_pushdown(
+        &request,
+        &catalog.uri,
+        &CatalogProps {
+            warehouse: "wh".into(),
+            table: "db.t".into(),
+        },
+        CatalogKind::IcebergRest,
+        &unauthenticated_creds(),
+    )
+    .await
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
+/// Scenario: A binary column is refused on every catalog-declared format at every depth
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refused_delta_column_refuses_only_the_requests_that_reference_it() {
-    let catalog = unity_delta_catalog().await;
-    let storage = refused_column_table_storage().await;
+async fn a_binary_column_refuses_only_the_requests_that_read_it_on_every_catalog_format() {
+    let column = |name: &str| serde_json::json!({"type": "column", "name": name, "tableName": "T"});
+    let select = |item: Json| serde_json::json!({"type": "select", "selectList": [item]});
+    let select_star = serde_json::json!({"type": "select"});
+    let count_star = serde_json::json!({
+        "type": "function_aggregate", "name": "COUNT", "arguments": [], "distinct": false,
+    });
+    let filter_on_b = serde_json::json!({
+        "type": "select",
+        "selectList": [column("ID")],
+        "filter": {"type": "predicate_is_not_null", "expression": column("B")},
+    });
+    let binary_b = vec!["'b'", "type 'binary'", "#351"];
 
-    delta_pushdown(
-        &refused_column_table_request(serde_json::json!([column_item("INT_COL")])),
-        &catalog.uri,
-        storage.clone(),
-        "cat.sch.orders",
-    )
-    .await
-    .expect("a projection naming only the mappable column must plan");
+    for iceberg in [false, true] {
+        for admitted in [select(column("ID")), select(count_star.clone())] {
+            binary_table_pushdown(iceberg, admitted.clone())
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{admitted}: a request reading no binary column plans: {e}")
+                });
+        }
 
-    let projection_error = delta_pushdown(
-        &refused_column_table_request(serde_json::json!([column_item("BINARY_COL")])),
-        &catalog.uri,
-        storage.clone(),
-        "cat.sch.orders",
-    )
-    .await
-    .expect_err("a projection naming the refused column must be refused");
-    assert_refuses_binary_col(projection_error);
-
-    let where_error = delta_pushdown(
-        &refused_column_table_request_with_filter(
-            serde_json::json!([column_item("INT_COL")]),
-            serde_json::json!({
-                "type": "predicate_equal",
-                "left": column_item("BINARY_COL"),
-                "right": {"type": "literal_string", "value": "x"},
-            }),
-        ),
-        &catalog.uri,
-        storage.clone(),
-        "cat.sch.orders",
-    )
-    .await
-    .expect_err(
-        "a WHERE filter referencing the refused column must be refused even though \
-         the select list names only the mappable column",
-    );
-    assert_refuses_binary_col(where_error);
-
-    let select_star_error = delta_pushdown(
-        &refused_column_table_select_star_request(),
-        &catalog.uri,
-        storage,
-        "cat.sch.orders",
-    )
-    .await
-    .expect_err(
-        "SELECT * widens to the full base row, so a refused column anywhere in the \
-         table must refuse it too",
-    );
-    assert_refuses_binary_col(select_star_error);
-}
-
-fn assert_refuses_binary_col(error: UdfError) {
-    let message = match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    };
-    assert!(
-        message.contains("binary_col") && message.contains("#351"),
-        "the refusal must be the gate's own message, naming the column and its reason: \
-         {message}"
-    );
+        let mut refused = vec![
+            (select(column("B")), binary_b.clone()),
+            (filter_on_b.clone(), binary_b.clone()),
+            (select_star.clone(), vec!["'b'", "#351"]),
+        ];
+        if iceberg {
+            refused.extend([
+                (select(column("F")), vec!["'f'", "type 'fixed(16)'", "#351"]),
+                (select(column("U")), vec!["'u'", "type 'uuid'", "#351"]),
+                (
+                    select(column("S")),
+                    vec!["'s'", "member 's.x'", "type 'binary'", "#351"],
+                ),
+                (select_star.clone(), vec!["'f'", "'u'", "'s'"]),
+            ]);
+        }
+        for (request, fragments) in refused {
+            let message = user_message(
+                binary_table_pushdown(iceberg, request.clone())
+                    .await
+                    .expect_err(&format!(
+                        "{request}: a request reading a binary column is refused"
+                    )),
+            );
+            for fragment in fragments {
+                assert!(
+                    message.contains(fragment),
+                    "{request}: '{fragment}' missing from: {message}"
+                );
+            }
+        }
+    }
 }
 
 async fn refused_protocol_table_storage() -> crate::scan::spec::StorageBackend {
@@ -2143,10 +2181,7 @@ async fn a_unity_catalog_pushdown_gates_the_delta_protocol_and_refuses_per_colum
     .await
     .expect_err("a reader feature outside the allow-list must refuse before any column gate");
 
-    let message = match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    };
+    let message = user_message(error);
     assert!(
         message.contains("variantType"),
         "the refusal must be the protocol gate's own message, naming the unsupported feature: \

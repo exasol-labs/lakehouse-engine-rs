@@ -2,6 +2,7 @@ use delta_kernel::schema::{ArrayType, MapType, MetadataValue, StructField, Struc
 use delta_kernel::table_features::ColumnMappingMode;
 
 use super::*;
+use crate::adapter::pushdown::test_support::user_message;
 
 const CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-80396d42-d765-483e-b86e-7ac1e13ef88c"}},{"name":"name","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"col-ed3e45cf-632b-4a07-bb22-d9f4693bbaa1"}},{"name":"value","type":"double","nullable":true,"metadata":{"delta.columnMapping.id":3,"delta.columnMapping.physicalName":"col-95e13b58-72f1-4d26-8390-49469180a8a2"}}]}"#;
 
@@ -13,13 +14,6 @@ const INNER_DOUBLE_PHYSICAL_NAME: &str = "col-92dcf16d-d249-48a9-afb8-93deeaf7ce
 
 fn parse_schema(json: &str) -> StructType {
     serde_json::from_str(json).expect("fixture schemaString must parse as a Delta StructType")
-}
-
-fn user_message(err: UdfError) -> String {
-    match err {
-        UdfError::User(message) => message,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    }
 }
 
 fn annotated(field: StructField, id: i64, physical_name: &str) -> StructField {
@@ -567,6 +561,62 @@ fn refused_set_is_binary_variant_and_containers_of_them() {
         assert!(!message.contains("#350"), "message was: {message}");
         assert!(!message.contains("#322"), "message was: {message}");
     }
+}
+
+#[test]
+fn binary_cause_names_the_declared_type_and_issue_351() {
+    for declared in ["binary", "fixed(16)", "uuid", "bson", "enum"] {
+        assert_eq!(
+            binary_cause(declared),
+            format!(
+                "has type '{declared}', which this engine refuses: rendering binary data is \
+                 tracked as issue #351"
+            ),
+        );
+    }
+    assert!(
+        refusal_message("col", DataType::BINARY).ends_with(&binary_cause("binary")),
+        "a Delta binary column's reason is the one shared cause, naming 'binary'"
+    );
+}
+
+#[test]
+fn a_refusal_names_its_column_under_the_classifying_sources_label() {
+    let schema = StructType::try_new([
+        StructField::nullable("id", DataType::LONG),
+        StructField::nullable("b", DataType::BINARY),
+        StructField::nullable(
+            "s",
+            struct_of([StructField::nullable("x", DataType::BINARY)]),
+        ),
+    ])
+    .unwrap();
+
+    let (delta_fields, _, delta_refusals) =
+        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
+    let (glue_fields, _, glue_refusals) =
+        classify_spark_schema(&schema, ColumnMappingMode::None, Vec::new(), "Glue").unwrap();
+
+    assert_eq!(glue_fields, delta_fields, "the label changes no mapping");
+    let reasons = |refusals: &[RefusedColumn]| -> Vec<String> {
+        refusals
+            .iter()
+            .map(|refused| refused.reason.clone())
+            .collect()
+    };
+    assert_eq!(
+        reasons(&glue_refusals),
+        reasons(&delta_refusals)
+            .iter()
+            .map(|reason| reason.replacen("Delta column", "Glue column", 1))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        reasons(&delta_refusals)
+            .iter()
+            .all(|reason| reason.starts_with("Delta column '")),
+        "build_delta_table_schema keeps the Delta label: {delta_refusals:?}"
+    );
 }
 
 #[test]

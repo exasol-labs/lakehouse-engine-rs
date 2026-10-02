@@ -7,19 +7,24 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    DIM_CUSTOMER_ROWS, E2E_DIM_TABLE, E2E_EVO_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE,
-    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE,
-    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
-    EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, LINEITEM_ROWS, LINES_PER_ORDER,
-    PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE, PART_TOTAL_ROWS,
-    PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS,
+    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
+    DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE, E2E_DIM_TABLE, E2E_EVO_TABLE,
+    E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
+    E2E_TYPED_TABLE, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE,
+    EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT,
+    INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
+    PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
     TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
-    seed_events, seed_renamed_column, seed_typed_distinct_probe, typed_decimal_a_avg_stddev,
-    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
+    seed_all_types, seed_events, seed_renamed_column, seed_typed_distinct_probe,
+    typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use common::stack::{
     build_create_connection_sql, exasol_container, iceberg_catalog_url, wait_for_exasol,
     wait_for_iceberg_catalog, wait_for_seaweedfs,
+};
+use common::timestamp_precision::{
+    ExpectedTimestampPrecision, engine_honors_declared_precision, expected_timestamp_precision,
 };
 
 use lakehouse_catalog::CatalogSession;
@@ -52,6 +57,9 @@ fn setup_e2e() {
             seed_typed_distinct_probe(&iceberg_catalog_url(), "s3://warehouse/")
                 .await
                 .expect("seed Iceberg typed_distinct_probe table");
+            seed_all_types(&iceberg_catalog_url(), "s3://warehouse/")
+                .await
+                .expect("seed Iceberg all_types and binary_values tables");
         });
 
         install_slc();
@@ -212,42 +220,75 @@ fn e2e_projection_filter_limit_returns_correct_rows() {
 fn create_vs_maps_iceberg_schema() {
     setup_e2e();
     let mut conn = exa_conn();
+    let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
 
-    let sql = format!("DESCRIBE {}", vs_table());
-    let resp = conn.execute(&sql);
-    let result_set = &resp["responseData"]["results"][0]["resultSet"];
-    let cols = conn.fetch_result_columns(result_set);
+    assert_eq!(
+        declared_types(&mut conn, VS_NAME, E2E_TABLE),
+        pairs(&[
+            ("ID", "DECIMAL(20,0)"),
+            ("NAME", VARCHAR_JSON),
+            ("SCORE", "DOUBLE"),
+            ("EVENT_DATE", "DATE"),
+            ("EVENT_TS", timestamp),
+        ])
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!(
+            "SELECT ID, NAME, SCORE, EVENT_DATE, EVENT_TS FROM {} WHERE ID = 2",
+            vs_table()
+        ),
+        &[
+            [Some("2")],
+            [Some("event-02")],
+            [Some("10.0")],
+            [Some("2024-01-02")],
+            [Some("2024-01-01 01:00:00.000000")],
+        ],
+    );
+}
 
-    let names = &cols[0];
-    let types = &cols[1];
-    assert!(!names.is_empty(), "DESCRIBE returned no columns");
-
-    let expected = [
-        ("ID", "DECIMAL"),
-        ("NAME", "VARCHAR"),
-        ("SCORE", "DOUBLE"),
-        ("EVENT_DATE", "DATE"),
-        ("EVENT_TS", "TIMESTAMP"),
-    ];
-    for (expected_name, expected_type_prefix) in expected {
-        let pos = names
-            .iter()
-            .position(|n| {
-                n.as_str()
-                    .map(|s| s.eq_ignore_ascii_case(expected_name))
-                    .unwrap_or(false)
-            })
-            .unwrap_or_else(|| {
-                panic!("column {expected_name} not found in DESCRIBE output: {names:?}")
-            });
-        let ty = types[pos]
-            .as_str()
-            .unwrap_or_else(|| panic!("type at position {pos} is not a string: {:?}", types[pos]));
-        assert!(
-            ty.to_uppercase().contains(expected_type_prefix),
-            "column {expected_name}: expected type containing '{expected_type_prefix}', got '{ty}'"
-        );
-    }
+/// Scenario: Every Iceberg type declares and returns its mapped value through the Iceberg REST catalog
+#[test]
+fn iceberg_all_types_declare_and_return_their_mapped_values() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
+    let timestamp_ns = if engine_honors_declared_precision(&mut conn) {
+        ExpectedTimestampPrecision::NANOSECOND.declared_column_type
+    } else {
+        ExpectedTimestampPrecision::MILLISECOND.declared_column_type
+    };
+    assert_type_matrix(
+        &mut conn,
+        VS_NAME,
+        E2E_ALL_TYPES_TABLE,
+        &[
+            reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
+            reads("C_INT", "DECIMAL(10,0)", INT32_VALUES_TEXT),
+            reads("C_FLOAT", "DOUBLE", FLOAT32_VALUES_TEXT),
+            reads("C_DECIMAL_10_2", "DECIMAL(10,2)", DECIMAL_10_2_VALUES_TEXT),
+            reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
+            reads("C_BOOLEAN", "BOOLEAN", BOOLEAN_VALUES_TEXT),
+            reads("C_TIME", VARCHAR_JSON, TIME64_VALUES_TEXT),
+            reads("C_TIMESTAMPTZ", timestamp, TIMESTAMP_VALUES_TEXT),
+            reads("C_TIMESTAMP_NS", timestamp_ns, TIMESTAMP_VALUES_TEXT),
+            refuses("C_BINARY", VARCHAR_JSON, &["type 'binary'", "#351"]),
+            refuses("C_FIXED", VARCHAR_JSON, &["type 'fixed(16)'", "#351"]),
+            refuses("C_UUID", VARCHAR_JSON, &["type 'uuid'", "#351"]),
+            refuses(
+                "C_STRUCT_BINARY",
+                VARCHAR_JSON,
+                &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
+            ),
+        ],
+    );
+    assert_binary_values_refused(
+        &mut conn,
+        VS_NAME,
+        E2E_BINARY_VALUES_TABLE,
+        "non UTF-8 data",
+    );
 }
 
 /// Scenario: Filter predicate restricts the emitted rows

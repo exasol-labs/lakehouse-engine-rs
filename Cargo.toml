@@ -52,11 +52,12 @@ futures = { version = "0.3" }
 url     = { version = "2" }
 percent-encoding = { version = "2" }
 
-aws-sigv4              = { version = "1.4", default-features = true }
-aws-credential-types   = { version = "1.2" }
-aws-smithy-runtime-api = { version = "1", features = ["client"] }
+aws-sigv4              = { version = "1.6", default-features = true }
+aws-credential-types   = { version = "1.3" }
+aws-smithy-runtime-api = { version = "1.18", features = ["client"] }
+aws-sdk-glue           = { version = "1.170", default-features = false, features = ["behavior-version-latest", "default-https-client", "rt-tokio"] }
 
-reqwest = { version = "0.12" }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots", "http2"] }
 
 # Official AWS STS client: owns the AssumeRole wire protocol, signing, and endpoint rules.
 aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }

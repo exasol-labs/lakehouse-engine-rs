@@ -6,12 +6,21 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, create_schema_and_scripts,
-    exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, install_slc,
-    parse_int, parse_numeric, upload_so, value_to_string,
+    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON,
+    assert_type_matrix, create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql,
+    has_broadcast_join_block, has_two_scan_wrapper, install_slc, pairs, parse_int, parse_numeric,
+    reads, refuses, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
-use common::raw_parquet::write_parquet_fixture;
+use common::raw_parquet::{encode_parquet, put_fixture_object, write_parquet_fixture};
+use common::seed::{
+    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
+    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT,
+    INT16_VALUES_TEXT, INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, all_types_ids,
+    binary_values, boolean_values, date_values, decimal_10_2_values, decimal_38_10_values,
+    float32_values, int_list_values, int_string_struct_values, int8_values, int16_values,
+    int32_values, string_int_map_values, struct_binary_values, text_values, timestamp_values,
+};
 use common::stack::{
     self, ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
     ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, build_create_connection_sql, exasol_host,
@@ -32,6 +41,7 @@ use lakehouse_engine::scan::spec::{DeleteMechanism, FileEntry};
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use serde_json::{Value as Json, json};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -52,10 +62,14 @@ const EXPECTED_TABLES: &[&str] = &[
     "UNSHREDDED_VARIANT",
     "TYPE_WIDENING",
     "SALES_PARQUET",
+    "ALL_TYPES_PARQUET",
+    "DELTA_EXTRA_TYPES",
 ];
 
 /// Outside the Delta fixtures' `s3://warehouse/delta/` prefix, so they never collide.
 const SALES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/sales_parquet";
+const ALL_TYPES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/all_types_parquet";
+const DELTA_EXTRA_TYPES_LOCATION: &str = "s3://warehouse/unity_delta/delta_extra_types";
 
 fn unity_port() -> u16 {
     std::env::var("LH_UNITY_PORT")
@@ -87,6 +101,8 @@ fn setup() {
         create_schema_and_scripts(&mut conn);
 
         seed_sales_parquet_table();
+        seed_all_types_parquet_table();
+        seed_delta_extra_types_table();
 
         create_unity_virtual_schema(&mut conn);
         create_unity_role_virtual_schema(&mut conn);
@@ -169,46 +185,253 @@ fn seed_sales_parquet_table() {
         write_parquet_fixture(&format!("{SALES_PARQUET_LOCATION}/{file}"), batch);
     }
 
+    register_unity_table(
+        "sales_parquet",
+        "PARQUET",
+        SALES_PARQUET_LOCATION,
+        &[
+            ("id", json!("long"), "LONG"),
+            ("amount", json!("double"), "DOUBLE"),
+            ("year", json!("integer"), "INT"),
+            ("region", json!("string"), "STRING"),
+        ],
+        &["year", "region"],
+    );
+}
+
+fn spark_field(name: &str, spark_type: &Json) -> Json {
+    json!({"name": name, "type": spark_type, "nullable": true, "metadata": {}})
+}
+
+fn struct_type(members: &[(&str, &str)]) -> Json {
+    let fields: Vec<Json> = members
+        .iter()
+        .map(|(name, member_type)| spark_field(name, &json!(member_type)))
+        .collect();
+    json!({"type": "struct", "fields": fields})
+}
+
+/// A column's Spark type is the `type` of the `StructField` JSON the reader reads. Replaces any
+/// earlier registration, so a changed fixture never meets a stale one.
+fn register_unity_table(
+    name: &str,
+    format: &str,
+    location: &str,
+    columns: &[(&str, Json, &str)],
+    partitions: &[&str],
+) {
+    let columns: Vec<Json> = columns
+        .iter()
+        .enumerate()
+        .map(|(position, (column, spark_type, type_name))| {
+            let type_text = spark_type
+                .as_str()
+                .or(spark_type["type"].as_str())
+                .unwrap_or_default();
+            let mut entry = json!({
+                "name": column, "type_text": type_text, "type_name": type_name,
+                "type_json": spark_field(column, spark_type).to_string(),
+                "position": position, "nullable": true
+            });
+            if let Some(index) = partitions.iter().position(|p| p == column) {
+                entry["partition_index"] = index.into();
+            }
+            // The listing reads a decimal's precision and scale here, as a real UC reports them.
+            if let Some((precision, scale)) = type_text
+                .strip_prefix("decimal(")
+                .and_then(|rest| rest.strip_suffix(')'))
+                .and_then(|rest| rest.split_once(','))
+            {
+                entry["type_precision"] = precision.parse::<u32>().expect("precision").into();
+                entry["type_scale"] = scale.parse::<u32>().expect("scale").into();
+            }
+            entry
+        })
+        .collect();
+
     let base = format!("{}/api/2.1/unity-catalog", unity_catalog_url());
     let client = reqwest::blocking::Client::new();
     let delete = client
-        .delete(format!("{base}/tables/{UNITY_NAMESPACE}.sales_parquet"))
+        .delete(format!("{base}/tables/{UNITY_NAMESPACE}.{name}"))
         .send()
-        .expect("DELETE sales_parquet");
+        .unwrap_or_else(|e| panic!("DELETE {name}: {e}"));
     assert!(
         delete.status().is_success() || delete.status() == reqwest::StatusCode::NOT_FOUND,
-        "DELETE sales_parquet returned {}",
+        "DELETE {name} returned {}",
         delete.status()
     );
 
     let (catalog_name, schema_name) = UNITY_NAMESPACE.split_once('.').expect("<catalog>.<schema>");
-    let column = |position: usize, name: &str, type_text: &str, type_name: &str| {
-        let type_json =
-            serde_json::json!({"name": name, "type": type_text, "nullable": true, "metadata": {}});
-        serde_json::json!({
-            "name": name, "type_text": type_text, "type_name": type_name,
-            "type_json": type_json.to_string(), "position": position, "nullable": true
-        })
-    };
-    let mut year = column(2, "year", "integer", "INT");
-    year["partition_index"] = 0.into();
-    let mut region = column(3, "region", "string", "STRING");
-    region["partition_index"] = 1.into();
     let response = client
         .post(format!("{base}/tables"))
-        .json(&serde_json::json!({
-            "name": "sales_parquet", "catalog_name": catalog_name, "schema_name": schema_name,
-            "table_type": "EXTERNAL", "data_source_format": "PARQUET",
-            "storage_location": SALES_PARQUET_LOCATION,
-            "columns": [column(0, "id", "long", "LONG"), column(1, "amount", "double", "DOUBLE"), year, region]
+        .json(&json!({
+            "name": name, "catalog_name": catalog_name, "schema_name": schema_name,
+            "table_type": "EXTERNAL", "data_source_format": format,
+            "storage_location": location, "columns": columns
         }))
         .send()
-        .expect("POST sales_parquet");
+        .unwrap_or_else(|e| panic!("POST {name}: {e}"));
     let status = response.status();
     assert!(
         status.is_success(),
-        "POST sales_parquet failed: {status}: {}",
+        "POST {name} failed: {status}: {}",
         response.text().unwrap_or_default()
+    );
+}
+
+/// Every Spark type a Unity Parquet table can declare, except the `long` and `double` that
+/// `sales_parquet` carries; `c_variant` has no data, because the reader refuses it at plan time.
+fn seed_all_types_parquet_table() {
+    let columns = [
+        ("id", Some(all_types_ids()), json!("long"), "LONG"),
+        ("c_byte", Some(int8_values()), json!("byte"), "BYTE"),
+        ("c_short", Some(int16_values()), json!("short"), "SHORT"),
+        ("c_int", Some(int32_values()), json!("integer"), "INT"),
+        ("c_float", Some(float32_values()), json!("float"), "FLOAT"),
+        (
+            "c_boolean",
+            Some(boolean_values()),
+            json!("boolean"),
+            "BOOLEAN",
+        ),
+        ("c_string", Some(text_values()), json!("string"), "STRING"),
+        (
+            "c_decimal_10_2",
+            Some(decimal_10_2_values()),
+            json!("decimal(10,2)"),
+            "DECIMAL",
+        ),
+        (
+            "c_decimal_38_10",
+            Some(decimal_38_10_values()),
+            json!("decimal(38,10)"),
+            "DECIMAL",
+        ),
+        ("c_date", Some(date_values()), json!("date"), "DATE"),
+        (
+            "c_timestamp",
+            Some(timestamp_values(Some("UTC"))),
+            json!("timestamp"),
+            "TIMESTAMP",
+        ),
+        (
+            "c_timestamp_ntz",
+            Some(timestamp_values(None)),
+            json!("timestamp_ntz"),
+            "TIMESTAMP_NTZ",
+        ),
+        (
+            "c_binary",
+            Some(binary_values(&DataType::Binary)),
+            json!("binary"),
+            "BINARY",
+        ),
+        (
+            "c_array",
+            Some(int_list_values()),
+            json!({"type": "array", "elementType": "integer", "containsNull": true}),
+            "ARRAY",
+        ),
+        (
+            "c_map",
+            Some(string_int_map_values(
+                vec!["k1", "k2"],
+                vec![1, 2],
+                [2, 0, 0],
+            )),
+            json!({
+                "type": "map", "keyType": "string", "valueType": "integer",
+                "valueContainsNull": true
+            }),
+            "MAP",
+        ),
+        (
+            "c_struct",
+            Some(int_string_struct_values("a", "b", "x")),
+            struct_type(&[("a", "integer"), ("b", "string")]),
+            "STRUCT",
+        ),
+        (
+            "c_struct_binary",
+            Some(struct_binary_values(None)),
+            struct_type(&[("x", "binary")]),
+            "STRUCT",
+        ),
+        ("c_variant", None, json!("variant"), "VARIANT"),
+    ];
+    let batch =
+        RecordBatch::try_from_iter_with_nullable(columns.iter().filter_map(
+            |(name, data, _, _)| data.clone().map(|data| (*name, data, *name != "id")),
+        ))
+        .expect("all_types_parquet batch");
+    write_parquet_fixture(
+        &format!("{ALL_TYPES_PARQUET_LOCATION}/part-00000.parquet"),
+        batch,
+    );
+
+    let registered: Vec<_> = columns
+        .into_iter()
+        .map(|(name, _, spark_type, type_name)| (name, spark_type, type_name))
+        .collect();
+    register_unity_table(
+        "all_types_parquet",
+        "PARQUET",
+        ALL_TYPES_PARQUET_LOCATION,
+        &registered,
+        &[],
+    );
+}
+
+/// The Delta types `stats_all_types` lacks: a decimal wider than Exasol's 36 digits and a
+/// binary struct member. A one-commit log over one data file, with no reader feature.
+fn seed_delta_extra_types_table() {
+    let batch = RecordBatch::try_from_iter_with_nullable(vec![
+        ("id", all_types_ids(), false),
+        ("c_decimal_38_10", decimal_38_10_values(), true),
+        ("c_struct_binary", struct_binary_values(None), true),
+    ])
+    .expect("delta_extra_types batch");
+    let data_file = encode_parquet(&batch);
+    let data_file_size = data_file.len();
+    put_fixture_object(
+        &format!("{DELTA_EXTRA_TYPES_LOCATION}/part-00000.parquet"),
+        data_file,
+    );
+
+    let columns = [
+        ("id", json!("long"), "LONG"),
+        ("c_decimal_38_10", json!("decimal(38,10)"), "DECIMAL"),
+        ("c_struct_binary", struct_type(&[("x", "binary")]), "STRUCT"),
+    ];
+    let fields: Vec<Json> = columns
+        .iter()
+        .map(|(name, spark_type, _)| spark_field(name, spark_type))
+        .collect();
+    let schema = json!({"type": "struct", "fields": fields});
+    let log = [
+        json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+        json!({"metaData": {
+            "id": "delta-extra-types", "format": {"provider": "parquet", "options": {}},
+            "schemaString": schema.to_string(), "partitionColumns": [], "configuration": {},
+            "createdTime": 0
+        }}),
+        json!({"add": {
+            "path": "part-00000.parquet", "partitionValues": {}, "size": data_file_size,
+            "modificationTime": 0, "dataChange": true, "stats": "{\"numRecords\":3}"
+        }}),
+    ]
+    .map(|action| action.to_string())
+    .join("\n");
+    put_fixture_object(
+        &format!("{DELTA_EXTRA_TYPES_LOCATION}/_delta_log/00000000000000000000.json"),
+        log.into(),
+    );
+    register_unity_table(
+        "delta_extra_types",
+        "DELTA",
+        DELTA_EXTRA_TYPES_LOCATION,
+        &columns,
+        &[],
     );
 }
 
@@ -225,37 +448,12 @@ fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn column_types(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<(String, String)> {
-    let cols = conn.query_columns(&format!(
-        "SELECT COLUMN_NAME, COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
-         WHERE COLUMN_SCHEMA = '{vs_name}' AND COLUMN_TABLE = '{table}' \
-         ORDER BY COLUMN_ORDINAL_POSITION"
-    ));
-    if cols.len() < 2 {
-        return Vec::new();
-    }
-    cols[0]
-        .iter()
-        .zip(cols[1].iter())
-        .filter_map(|(name, ty)| Some((name.as_str()?.to_uppercase(), ty.as_str()?.to_uppercase())))
-        .collect()
-}
-
-/// Prefix match tolerates `COLUMN_TYPE` rendering: a `VARCHAR ... UTF8` suffix, the
-/// `DOUBLE PRECISION` alias.
 fn assert_col_type(cols: &[(String, String)], column: &str, expected: &str) {
-    let actual = cols
+    let (_, actual) = cols
         .iter()
         .find(|(name, _)| name == column)
         .unwrap_or_else(|| panic!("column {column} not declared; got {cols:?}"));
-    let strip = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-    let actual_ty = strip(&actual.1);
-    let expected_ty = strip(expected);
-    assert!(
-        actual_ty.starts_with(&expected_ty),
-        "column {column}: expected Exasol type starting {expected}, got {}",
-        actual.1
-    );
+    assert_eq!(actual, expected, "column {column}");
 }
 
 #[test]
@@ -271,12 +469,12 @@ fn unity_create_virtual_schema_lists_fixture_tables_and_columns() {
         );
     }
 
-    let cm_cols = column_types(&mut conn, VS_NAME, "CM_NAME_MODE");
+    let cm_cols = declared_types(&mut conn, VS_NAME, "CM_NAME_MODE");
     assert_col_type(&cm_cols, "ID", "DECIMAL(20,0)");
     assert_col_type(&cm_cols, "NAME", "VARCHAR(2000000)");
     assert_col_type(&cm_cols, "VALUE", "DOUBLE");
 
-    let stats_cols = column_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
+    let stats_cols = declared_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
     assert_col_type(&stats_cols, "ARRAY_COL", "VARCHAR(2000000)");
 }
 
@@ -1035,7 +1233,8 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
          data files: {count}"
     );
 
-    let cols = column_types(&mut conn, VS_NAME, "TYPE_WIDENING");
+    let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
+    let cols = declared_types(&mut conn, VS_NAME, "TYPE_WIDENING");
     for (column, expected) in [
         ("BYTE_LONG", "DECIMAL(20,0)"),
         ("INT_LONG", "DECIMAL(20,0)"),
@@ -1047,7 +1246,7 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
         ("DECIMAL_DECIMAL_GREATER_SCALE", "DECIMAL(20,5)"),
         ("INT_DECIMAL", "DECIMAL(11,1)"),
         ("LONG_DECIMAL", "DECIMAL(21,1)"),
-        ("DATE_TIMESTAMP_NTZ", "TIMESTAMP"),
+        ("DATE_TIMESTAMP_NTZ", timestamp),
     ] {
         assert_col_type(&cols, column, expected);
     }
@@ -1215,7 +1414,8 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
         "stats_all_types must carry exactly 4 rows: {count}"
     );
 
-    let cols = column_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
+    let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
+    let cols = declared_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
     for (column, expected) in [
         ("BYTE_COL", "DECIMAL(3,0)"),
         ("SHORT_COL", "DECIMAL(5,0)"),
@@ -1224,8 +1424,8 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
         ("FLOAT_COL", "DOUBLE"),
         ("DOUBLE_COL", "DOUBLE"),
         ("DATE_COL", "DATE"),
-        ("TIMESTAMP_COL", "TIMESTAMP"),
-        ("TIMESTAMP_NTZ_COL", "TIMESTAMP"),
+        ("TIMESTAMP_COL", timestamp),
+        ("TIMESTAMP_NTZ_COL", timestamp),
         ("STRING_COL", "VARCHAR(2000000)"),
         ("DECIMAL_COL", "DECIMAL(10,2)"),
         ("BOOLEAN_COL", "BOOLEAN"),
@@ -1346,40 +1546,29 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     );
 }
 
+/// Scenario: Every Delta type declares and returns its mapped value through Unity Catalog
 #[test]
-fn unity_delta_timestamp_columns_declare_the_exact_gated_precision() {
+fn unity_delta_extra_types_declare_and_return_their_mapped_values() {
     setup();
     let mut conn = exa_conn();
-
-    let declared_column_type = expected_timestamp_precision(&mut conn).declared_column_type;
-
-    let stats_cols = column_types(&mut conn, VS_NAME, "STATS_ALL_TYPES");
-    for column in ["TIMESTAMP_COL", "TIMESTAMP_NTZ_COL"] {
-        let raw = &stats_cols
-            .iter()
-            .find(|(name, _)| name == column)
-            .unwrap_or_else(|| panic!("column {column} not declared; got {stats_cols:?}"))
-            .1;
-        let actual: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
-        assert_eq!(
-            actual, declared_column_type,
-            "{column} must declare exactly {declared_column_type}, got {actual}"
-        );
-    }
-
-    let widening_cols = column_types(&mut conn, VS_NAME, "TYPE_WIDENING");
-    let column = "DATE_TIMESTAMP_NTZ";
-    let raw = &widening_cols
-        .iter()
-        .find(|(name, _)| name == column)
-        .unwrap_or_else(|| panic!("column {column} not declared; got {widening_cols:?}"))
-        .1;
-    let actual: String = raw.chars().filter(|c| !c.is_whitespace()).collect();
-    assert_eq!(
-        actual, declared_column_type,
-        "{column} must declare exactly {declared_column_type}, got {actual}"
+    assert_type_matrix(
+        &mut conn,
+        VS_NAME,
+        "DELTA_EXTRA_TYPES",
+        &[
+            reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
+            reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
+            refuses("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_REFUSAL),
+        ],
     );
 }
+
+const STRUCT_BINARY_REFUSAL: &[&str] = &[
+    "column 'c_struct_binary'",
+    "member 'c_struct_binary.x'",
+    "type 'binary'",
+    "#351",
+];
 
 #[test]
 fn unity_delta_refused_column_refuses_only_the_queries_naming_it() {
@@ -1643,17 +1832,16 @@ fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
         enumerated_table_names(&mut conn, VS_NAME).contains(&"SALES_PARQUET".to_string()),
         "createVirtualSchema must enumerate 'sales_parquet'"
     );
-    let cols = column_types(&mut conn, VS_NAME, "SALES_PARQUET");
-    let names: Vec<&str> = cols.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(
-        names,
-        ["ID", "AMOUNT", "YEAR", "REGION"],
+        declared_types(&mut conn, VS_NAME, "SALES_PARQUET"),
+        pairs(&[
+            ("ID", "DECIMAL(20,0)"),
+            ("AMOUNT", "DOUBLE"),
+            ("YEAR", "DECIMAL(10,0)"),
+            ("REGION", VARCHAR_JSON),
+        ]),
         "Parquet columns must precede partition columns, in declared order"
     );
-    assert_col_type(&cols, "ID", "DECIMAL(20,0)");
-    assert_col_type(&cols, "AMOUNT", "DOUBLE");
-    assert_col_type(&cols, "YEAR", "DECIMAL(10,0)");
-    assert_col_type(&cols, "REGION", "VARCHAR(2000000)");
 
     let cols = conn.query_columns(&format!(
         "SELECT ID, AMOUNT, \"YEAR\", REGION FROM {} ORDER BY ID",
@@ -1687,6 +1875,59 @@ fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
     assert_eq!(
         filtered, 2,
         "a partition-column filter must match exactly year=2024/region=eu"
+    );
+}
+
+/// Scenario: Every Spark type a Unity Parquet table declares returns its mapped value
+#[test]
+fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
+    setup();
+    let mut conn = exa_conn();
+    let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
+    assert_type_matrix(
+        &mut conn,
+        VS_NAME,
+        "ALL_TYPES_PARQUET",
+        &[
+            reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
+            reads("C_BYTE", "DECIMAL(3,0)", INT8_VALUES_TEXT),
+            reads("C_SHORT", "DECIMAL(5,0)", INT16_VALUES_TEXT),
+            reads("C_INT", "DECIMAL(10,0)", INT32_VALUES_TEXT),
+            reads("C_FLOAT", "DOUBLE", FLOAT32_VALUES_TEXT),
+            reads("C_BOOLEAN", "BOOLEAN", BOOLEAN_VALUES_TEXT),
+            reads("C_STRING", VARCHAR_JSON, TEXT_VALUES_TEXT),
+            reads("C_DECIMAL_10_2", "DECIMAL(10,2)", DECIMAL_10_2_VALUES_TEXT),
+            reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
+            reads("C_DATE", "DATE", DATE_VALUES_TEXT),
+            reads("C_TIMESTAMP", timestamp, TIMESTAMP_VALUES_TEXT),
+            reads("C_TIMESTAMP_NTZ", timestamp, TIMESTAMP_VALUES_TEXT),
+            refuses(
+                "C_BINARY",
+                VARCHAR_JSON,
+                &["column 'c_binary'", "type 'binary'", "#351"],
+            ),
+            reads("C_ARRAY", VARCHAR_JSON, INT_LIST_VALUES_TEXT),
+            reads(
+                "C_MAP",
+                VARCHAR_JSON,
+                [Some(r#"{"k1":1,"k2":2}"#), Some("{}"), None],
+            ),
+            reads(
+                "C_STRUCT",
+                VARCHAR_JSON,
+                [
+                    Some(r#"{"a":1,"b":"x"}"#),
+                    Some(r#"{"a":2,"b":null}"#),
+                    None,
+                ],
+            ),
+            refuses("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_REFUSAL),
+            refuses(
+                "C_VARIANT",
+                VARCHAR_JSON,
+                &["column 'c_variant'", "type 'variant'"],
+            ),
+        ],
     );
 }
 

@@ -108,10 +108,31 @@ impl ConnectionCreds {
             | (Some(_), Some(_), Some(_)) => SuppliedCatalogAuth::Unauthenticated,
         }
     }
+
+    pub(crate) fn key_secret_values(&self) -> Vec<&str> {
+        key_secrets(
+            &self.access_key,
+            &self.secret_key,
+            self.session_token.as_deref(),
+        )
+    }
 }
 
 pub(crate) fn non_empty(field: &Option<String>) -> Option<&str> {
     field.as_deref().filter(|value| !value.is_empty())
+}
+
+/// The non-empty access key, secret key, and session token, in that order.
+fn key_secrets<'a>(
+    access_key: &'a str,
+    secret_key: &'a str,
+    session_token: Option<&'a str>,
+) -> Vec<&'a str> {
+    [access_key, secret_key]
+        .into_iter()
+        .chain(session_token)
+        .filter(|secret| !secret.is_empty())
+        .collect()
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -165,18 +186,11 @@ impl Default for StorageProps {
 
 impl StorageProps {
     pub fn secret_values(&self) -> Vec<&str> {
-        let mut secrets = Vec::new();
-        for candidate in [self.access_key.as_str(), self.secret_key.as_str()] {
-            if !candidate.is_empty() {
-                secrets.push(candidate);
-            }
-        }
-        if let Some(token) = self.session_token.as_deref()
-            && !token.is_empty()
-        {
-            secrets.push(token);
-        }
-        secrets
+        key_secrets(
+            &self.access_key,
+            &self.secret_key,
+            self.session_token.as_deref(),
+        )
     }
 }
 

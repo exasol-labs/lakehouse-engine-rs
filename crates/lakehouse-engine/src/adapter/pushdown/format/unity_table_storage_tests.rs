@@ -1,5 +1,7 @@
 use super::*;
-use crate::adapter::pushdown::test_support::{SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY};
+use crate::adapter::pushdown::test_support::{
+    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, user_message,
+};
 
 #[test]
 fn redacted_masks_every_effective_storage_secret_in_a_raised_error() {
@@ -9,10 +11,10 @@ fn redacted_masks_every_effective_storage_secret_in_a_raised_error() {
         "{readable}{SENTINEL_ACCESS_KEY} signed with {SENTINEL_SECRET_KEY}"
     ));
 
-    let message = match redacted(raised, &[SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY]) {
-        UdfError::User(message) => message,
-        other => panic!("redaction must answer a user error, got {other:?}"),
-    };
+    let message = user_message(redacted(
+        raised,
+        &[SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY],
+    ));
 
     assert!(message.starts_with(readable), "{message}");
     assert!(

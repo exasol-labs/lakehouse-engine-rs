@@ -1,4 +1,7 @@
 use super::*;
+use crate::tests::hive_type_cases::{
+    JSON_TEXT, UNRECOGNIZED_HIVE_TYPES, binary_hive_types, nested_hive_types, primitive_hive_types,
+};
 use arrow::datatypes::DataType;
 use iceberg::spec::{PrimitiveType, Type};
 use lakehouse_catalog::ColumnSourceType;
@@ -1037,6 +1040,45 @@ fn incompatible_unity_types_declared_varchar() {
         ),
         "VARCHAR(2000000)"
     );
+}
+
+/// Scenario: The listing declares each Glue column through the Spark listing mapping
+#[test]
+fn glue_columns_declare_the_spark_listing_type() {
+    let primitives = primitive_hive_types().map(|(hive_type, _, declared)| (hive_type, declared));
+    let json_text = nested_hive_types()
+        .map(|(hive_type, _)| hive_type)
+        .into_iter()
+        .chain(binary_hive_types().map(|(hive_type, _)| hive_type))
+        .chain(UNRECOGNIZED_HIVE_TYPES)
+        .map(|hive_type| (hive_type, JSON_TEXT));
+    let glue = |hive_type: &str| ColumnSourceType::Glue {
+        hive_type: hive_type.to_string(),
+    };
+
+    for (hive_type, expected) in primitives.into_iter().chain(json_text) {
+        let declared = column_source_type_to_exasol(
+            &glue(hive_type),
+            EngineTimestampSupport::DeclaredPrecision,
+        );
+        assert_eq!(declared, expected, "hive type {hive_type:?}");
+    }
+    let unity_timestamp = ColumnSourceType::Unity {
+        type_name: "TIMESTAMP_NTZ".to_string(),
+        precision: 0,
+        scale: 0,
+        type_json: None,
+    };
+    for engine in [
+        EngineTimestampSupport::MillisecondOnly,
+        EngineTimestampSupport::DeclaredPrecision,
+    ] {
+        assert_eq!(
+            column_source_type_to_exasol(&glue("timestamp"), engine),
+            column_source_type_to_exasol(&unity_timestamp, engine),
+            "a Glue timestamp declares the engine's timestamp type as Unity does: {engine:?}"
+        );
+    }
 }
 
 #[test]

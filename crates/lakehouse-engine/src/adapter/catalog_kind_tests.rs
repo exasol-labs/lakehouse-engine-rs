@@ -43,6 +43,19 @@ fn direct_storage_value_resolves_direct_storage_kind() {
     }
 }
 
+/// Scenario: CATALOG_KIND naming Glue resolves the native Glue kind
+#[test]
+fn glue_catalog_kind_resolves_case_insensitively() {
+    for value in ["GLUE", "glue", "Glue"] {
+        let props = json!({ "CATALOG_KIND": value });
+
+        let kind = resolve_catalog_kind(&props)
+            .unwrap_or_else(|err| panic!("'{value}' must resolve, got error: {err}"));
+
+        assert_eq!(kind, CatalogKind::Glue, "'{value}' must resolve to Glue");
+    }
+}
+
 #[test]
 fn unrecognized_catalog_kind_is_rejected() {
     let props = json!({ "CATALOG_KIND": "SNOWFLAKE" });
@@ -62,6 +75,10 @@ fn unrecognized_catalog_kind_is_rejected() {
     assert!(
         message.contains(CATALOG_KIND_DIRECT_STORAGE),
         "expected the error to name the accepted direct-storage value, got: {message}"
+    );
+    assert!(
+        message.contains(CATALOG_KIND_GLUE),
+        "expected the error to name the accepted Glue value, got: {message}"
     );
     assert!(
         message.to_lowercase().contains("absent") && message.to_lowercase().contains("iceberg"),

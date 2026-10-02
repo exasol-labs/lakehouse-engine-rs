@@ -1,24 +1,28 @@
 # Feature: Parquet Directory Seam
 
 Answers "what are the data files under this storage prefix, what are their partition values, and
-what is their combined schema" in ONE place, from an object store, a prefix, and two layout
-switches. Table enumeration and query planning therefore read the same files, declare the same
-partition columns, and fold the same footers. The two callers cannot disagree about a table's
-columns. A caller whose catalog already declares the schema and the partition columns asks the
-same seam for the file list alone.
+what is their combined schema" in ONE place, from an object store, a prefix, a file pattern, and
+two layout switches. Table enumeration and query planning therefore read the same files, declare
+the same partition columns, and fold the same footers. The two callers cannot disagree about a
+table's columns. A caller whose catalog already declares the schema and the partition columns asks
+the same seam for the file list alone.
 
 ## Background
 
 * The seam names NO catalog kind, NO table format, and NO Exasol virtual-schema property. It takes
-  an object store, a prefix, a merge mode, a partitioning switch, and a file-keep predicate over
-  partition values. Any later consumer that needs "the Parquet files under this prefix and their
-  schema" calls it directly.
+  an object store, a prefix, a file pattern, a merge mode, a partitioning switch, and a file-keep
+  predicate over partition values. Any later consumer that needs "the Parquet files under this
+  prefix and their schema" calls it directly.
 * It answers TWO questions. The schema-resolving answer serves direct-storage table enumeration,
   which maps the folded schema to the neutral catalog columns the listing pipeline declares, and
   direct-storage query planning, which maps it to the scan spec's logical fields. One
   implementation is what keeps `MERGE_SCHEMA` and `HIVE_PARTITIONING` from needing a second policy
-  per path. The listing answer serves the Unity Catalog Parquet reader
-  (`vs-adapter/unity-parquet-table-planning`), whose catalog declares the schema.
+  per path. The listing answer serves the catalog-declared Parquet reader
+  (`vs-adapter/unity-parquet-table-planning`, `vs-adapter/glue-table-planning`), whose catalog
+  declares the schema.
+* The plain listing step, which applies the file pattern and the fixed hidden-segment rule, is
+  separate from the folder-name partition inference layered on it. The Glue reader uses the plain
+  step alone, because Glue supplies each partition's values.
 * The widening rules the fold applies are NOT new. `datafusion-scan/type-relaxation` already owns
   the set of physical-to-logical pairs this engine casts at scan time. That set is proven castable
   pair by pair and grounded in the Apache Iceberg and Delta promotion tables. The fold picks the
@@ -58,7 +62,7 @@ same seam for the file list alone.
 ### Scenario: Data files are listed recursively in a deterministic order
 
 * *GIVEN* a storage prefix holding `p1.parquet`, `a/p2.parquet`, `a/b/p3.parquet`, `_SUCCESS`, `_metadata`, `p1.parquet.crc`, `_staging/p4.parquet`, and `.hidden/p5.parquet`
-* *WHEN* the seam lists that prefix's data files
+* *WHEN* the seam lists that prefix's data files under the Parquet-at-any-depth file pattern
 * *THEN* it SHALL return `p1.parquet`, `a/p2.parquet`, and `a/b/p3.parquet`, recursing to unlimited depth, so a plain subdirectory contributes files rather than being skipped or becoming its own unit
 * *AND* it SHALL return ONLY objects whose name ends in `.parquet`, so `_SUCCESS`, `_metadata`, and `p1.parquet.crc` are excluded by that rule alone
 * *AND* it SHALL exclude every object any of whose path segments below the prefix begins with `_` or `.`, so `_staging/p4.parquet` and `.hidden/p5.parquet` are excluded even though their file names qualify
@@ -143,3 +147,21 @@ same seam for the file list alone.
 * *WHEN* the caller asks the seam for that prefix's files against its declared columns
 * *THEN* the seam SHALL read NO footer, fold NO schema, and declare NO partition column from the paths, because the caller owns the schema, and the file-keep predicate SHALL run on the filled values before the files are returned, exactly as it does for the schema-resolving answer
 * *AND* the listing answer SHALL share the listing, the data-file rule, the segment parser, and the value decoding with the schema-resolving answer, so the two answers cannot disagree about which objects are data files or how a segment value decodes
+
+### Scenario: The file pattern selects the listing depth and the file-name rule
+
+* *GIVEN* a storage prefix holding `a.parquet`, `b` (no extension), `sub/c.parquet`, `sub/d`, `_SUCCESS`, `.hidden`, and a zero-length object `e.parquet`
+* *WHEN* the seam lists that prefix under each of its two file patterns, Parquet-at-any-depth and any-direct-child
+* *THEN* Parquet-at-any-depth SHALL return `a.parquet` and `sub/c.parquet`, objects at any depth whose name ends in `.parquet`
+* *AND* any-direct-child SHALL return `a.parquet` and `b`, the prefix's direct children of any name
+* *AND* any-direct-child SHALL list through a delimiter listing, so no object below a subdirectory is fetched
+* *AND* under both patterns, an object with a segment below the prefix that begins with `_` or `.`, and a zero-length object, SHALL NOT be a data file
+* *AND* the pattern SHALL be an internal parameter: direct storage and Unity Parquet pass Parquet-at-any-depth, Glue passes any-direct-child, and no virtual-schema property sets it
+
+### Scenario: A catalog-registered location is listed by its raw object key
+
+* *GIVEN* the Glue location `s3://bucket/tbl/p_str=a b%2Fc/` and an object stored at the literal key `tbl/p_str=a b%2Fc/f1`
+* *WHEN* the seam derives the store prefix of that location as a raw key and lists it
+* *THEN* the prefix SHALL be `tbl/p_str=a b%2Fc`, taken verbatim without percent-decoding, so the listing returns `f1`
+* *AND* the path the seam returns for `f1` SHALL resolve back to the same object key through the scan's path reconstruction
+* *AND* the seam SHALL decode a direct-storage or Unity Parquet storage URI as a URL

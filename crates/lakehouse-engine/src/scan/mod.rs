@@ -42,6 +42,7 @@ mod store_router;
 mod deletion_vectors;
 
 mod partition_values;
+pub(crate) use partition_values::{non_null_partition_value, partition_scalar};
 
 mod raw_scan;
 pub use raw_scan::{

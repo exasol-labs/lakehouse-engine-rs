@@ -13,9 +13,9 @@ for it instead of failing the scan or returning Arrow display text.
   DataFusion's physical-expression adapter validates physical-against-logical castability at file
   open, BEFORE any per-value JSON conversion runs … Neither ever reaches the JSON path, on EITHER
   table format."* This feature builds the encoder and routes both formats through it.
-* **Binary is OUT OF SCOPE and its behavior MUST NOT change.** Issue #351 owns Binary's JSON
-  validity. A top-level Delta `binary` column stays refused and a top-level Iceberg binary column
-  keeps its `CAST(col AS VARCHAR)` display-text path, unchanged by this feature.
+* **Binary rendering is out of scope (#351).** Issue #351 owns Binary's JSON validity. Every binary
+  column, and every column with a binary member, is refused at plan time on every source per
+  `vs-adapter/binary-column-refusal`.
 * **Only a list of PRIMITIVES survives today; a list of structs fails like a struct.** Measured live
   against Exasol over a seeded Iceberg table: `list<string>` and `list<int>` return display text, while
   `list<struct<a: int>>` fails with the same physical-to-logical cast error as a bare struct, because
@@ -27,12 +27,11 @@ for it instead of failing the scan or returning Arrow display text.
   `["a", null]` returns `[a, ]` (5 chars), `[null, 5]` returns `[, 5]` (5 chars), an empty list returns
   `[]`, and a NULL list returns SQL NULL. So the current text is invalid JSON in the unquoted-string
   case AND ambiguous between a null element and an empty string.
-* **The same defect surfaces at two different layers per format, and only the Delta one is a clean
-  refusal.** On the Delta path the adapter refuses the column at PLAN time through its refused-column
-  list. On the Iceberg path `adapter/pushdown/format/iceberg.rs` hardcodes an EMPTY refused-column
-  list, so nothing is refused and the failure lands at SCAN time as
+* **The defect this feature removes surfaced at a different layer per format.** On the Delta path
+  the adapter refused a nested column at PLAN time through its refused-column list. On the Iceberg
+  path the failure landed at SCAN time as
   `scan failed: assigned data could not be read: Execution error: Cannot cast column …`. This feature
-  removes the cause, so both surfaces go away; it does not add an Iceberg refusal mechanism.
+  removes the cause, so both surfaces go away. It adds no Iceberg refusal for a nested column.
 * **The JSON shape is chosen for Exasol SQL ergonomics, not from the Iceberg spec's Appendix D.**
   The Apache Iceberg table spec's § JSON single-value serialization
   (https://iceberg.apache.org/spec/#json-single-value-serialization) does prescribe a JSON shape per

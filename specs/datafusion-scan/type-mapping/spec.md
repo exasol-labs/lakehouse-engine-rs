@@ -4,7 +4,7 @@ Defines the single authoritative mapping from DataFusion/Arrow column types to E
 SQL types, and the companion Iceberg-to-Arrow mapping used to build the logical schema
 the scan registers, so that every column an Iceberg table exposes is queryable through
 Exasol. Types Exasol supports natively map directly; types Exasol cannot represent
-(vectors, lists, structs, maps, binary, and out-of-range decimals) are serialized to
+(vectors, lists, structs, maps, and out-of-range decimals) are serialized to
 JSON strings and surfaced as `VARCHAR`. The same mapping governs the `createVirtualSchema`
 schema declaration, the Arrow-to-Value conversion in the scan, and the logical schema
 carried into the scan spec, keeping declared and emitted types in agreement.
@@ -14,10 +14,11 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 * **This delta is issue #350.** It splits the recorded "incompatible Arrow types" set in two,
   because the two halves now reach Exasol by different mechanisms: List, LargeList, FixedSizeList,
   Struct, and Map are rendered as real JSON by `datafusion-scan/nested-json-rendering`, while every
-  other member of the set — Binary, LargeBinary, FixedSizeBinary, Union, Duration, Time32, Time64,
-  Interval, Decimal256, and an out-of-range `Decimal128` — keeps its recorded `CAST(col AS VARCHAR)`
-  Arrow-display path, byte-identical, with Binary's JSON validity owned by issue #351. Every declared
-  EXASOL type is unchanged: all of them were and remain `VARCHAR(2000000)`.
+  other member of the set — Union, Duration, Time32, Time64, Interval, Decimal256, and an
+  out-of-range `Decimal128` — keeps its recorded `CAST(col AS VARCHAR)` Arrow-display path,
+  byte-identical. A Binary, LargeBinary, or FixedSizeBinary column is refused at plan time on
+  every source per `vs-adapter/binary-column-refusal` (#351).
+  Every declared EXASOL type is unchanged: all of them were and remain `VARCHAR(2000000)`.
 * **`iceberg_type_to_arrow` is deliberately NOT made recursive, and that is the load-bearing design
   decision of issue #350.** A column's LOGICAL Arrow type stays `Utf8` for every list, struct, and
   map, so the JSON string is the column's type everywhere the type is read: in the registered
@@ -39,8 +40,9 @@ carried into the scan spec, keeping declared and emitted types in agreement.
   renderer needs to resolve names, and the column's type remains `Utf8`. `datafusion-scan/nested-json-rendering`
   owns what the renderer does with it; the tag vocabulary this feature owns gains no entry.
 * **The JSON-rendered nested set needs its OWN predicate, because `needs_json_fallback` is too
-  broad.** `needs_json_fallback` is also true for `Binary` and an out-of-range `Decimal128`, both of
-  which must keep the `CAST(col AS VARCHAR)` path this delta leaves untouched. A single predicate
+  broad.** `needs_json_fallback` is also true for `Binary` and an out-of-range `Decimal128`. An
+  out-of-range `Decimal128` keeps the `CAST(col AS VARCHAR)` path this delta leaves untouched, and
+  a `Binary` column is refused before it, per `vs-adapter/binary-column-refusal`. A single predicate
   owning the five nested Arrow variants is therefore added beside it rather than folded into it, and
   the two answer different questions: "does this type need serializing at all" versus "is this type
   rendered by the JSON encoder".
@@ -65,7 +67,7 @@ carried into the scan spec, keeping declared and emitted types in agreement.
   the scan UDF's Arrow `RecordBatch` → SDK `Value` conversion (Arrow value →
   `Value` variant), and the logical schema carried into the scan spec (Iceberg type →
   Arrow `DataType`).
-* Complex Arrow/Iceberg types (list, struct, map, binary) and out-of-range decimals map
+* Complex Arrow/Iceberg types (list, struct, map) and out-of-range decimals map
   to a string-family type surfaced as JSON `VARCHAR`.
 * Compatible Arrow types map directly:
 
@@ -84,9 +86,10 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 
 * Incompatible Arrow types — List, LargeList, FixedSizeList, Struct, Map, Union, Binary,
   LargeBinary, FixedSizeBinary, Duration, Time32, Time64, Interval, Decimal256 — have no
-  Exasol equivalent. They are serialized to a JSON string in the scan UDF (via DataFusion
-  `CAST(col AS VARCHAR)` / `arrow_cast`) before conversion to `Value::String`, and
-  declared as VARCHAR(2000000) in the schema response.
+  Exasol equivalent and are declared as VARCHAR(2000000) in the schema response. Each one
+  except Binary, LargeBinary, and FixedSizeBinary is serialized to a JSON string in the scan
+  UDF (via DataFusion `CAST(col AS VARCHAR)` / `arrow_cast`) before conversion to
+  `Value::String`. A binary column is refused at plan time per `vs-adapter/binary-column-refusal`.
 * An Arrow null maps to `Value::Null` regardless of column type.
 * **Split, issue #359: the timestamp-precision version gate moved to
   `datafusion-scan/type-mapping-timestamp-precision`.** This feature's scenario count crossed this
@@ -127,10 +130,11 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 * *WHEN* the type is resolved for the Exasol schema and a value of it is converted
 * *THEN* the resolver SHALL declare the column as `VARCHAR(2000000)` for EVERY member of both halves, unchanged by this delta
 * *AND* a NESTED column's value SHALL be rendered as a valid JSON document per `datafusion-scan/nested-json-rendering`, which owns that contract
-* *AND* a NON-NESTED column's value SHALL keep its recorded `CAST(col AS VARCHAR)` Arrow-display rendering byte-identical, and this feature MUST NOT claim strict JSON conformance for it — Binary's JSON validity is issue #351
+* *AND* a NON-NESTED column's value, other than a `Binary`, `LargeBinary`, or `FixedSizeBinary` one, SHALL keep its recorded `CAST(col AS VARCHAR)` Arrow-display rendering byte-identical, and this feature MUST NOT claim strict JSON conformance for it
+* *AND* every request that reads or emits a `Binary`, `LargeBinary`, or `FixedSizeBinary` column SHALL be refused at plan time per `vs-adapter/binary-column-refusal` until issue #351 defines a rendering for binary
 * *AND* the converter MUST NOT emit any array, list, struct, or map `Value` for either half
 * *AND* exactly ONE predicate in `crates/lakehouse-engine/src/types/mapping.rs` SHALL own the NESTED half's arm list, and every consumer SHALL read its answer from that predicate rather than re-matching on `DataType`, so no second copy can classify a type into the wrong half
-* *AND* that predicate MUST NOT be `needs_json_fallback`, and `needs_json_fallback` SHALL keep its recorded `fn(&DataType) -> bool` signature and its recorded answer for every input, so its four existing call sites are unchanged: a `Binary` and an out-of-range `Decimal128` column SHALL stay in the CAST path that the nested predicate diverts columns away from
+* *AND* that predicate MUST NOT be `needs_json_fallback`, and `needs_json_fallback` SHALL keep its recorded `fn(&DataType) -> bool` signature and its recorded answer for every input, so its four existing call sites are unchanged: an out-of-range `Decimal128` column SHALL stay in the CAST path that the nested predicate diverts columns away from
 
 ### Scenario: A mixed-column Parquet file round-trips through schema mapping and scan
 

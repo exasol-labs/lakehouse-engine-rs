@@ -5,15 +5,16 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use futures::future::try_join_all;
+use lakehouse_catalog::HIVE_DEFAULT_PARTITION;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetObjectReader;
+use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
 use parquet::file::metadata::ParquetMetaData;
+use parquet::schema::types::ColumnDescriptor;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-
-const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
 /// Which files' footers are folded and whose paths declare the partition keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +33,40 @@ pub struct DirectoryOptions {
 
 /// Decides whether to keep a file, given its filled partition values; runs before any footer read.
 pub type PartitionKeepPredicate = dyn Fn(&BTreeMap<String, Option<String>>) -> bool + Send + Sync;
+
+/// Which listed objects below the prefix are data files. Internal, so no virtual-schema property
+/// can set it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilePattern {
+    /// Direct storage and Unity Parquet read Spark- and Hive-written `.parquet` trees.
+    ParquetAtAnyDepth,
+    /// A Glue partition location's data files: Trino writes extensionless ones, and a nested
+    /// partition location must not be read twice.
+    AnyDirectChild,
+}
+
+/// An object the plain listing step keeps as a data file.
+pub struct ListedFile {
+    pub path: StorePath,
+    /// Carried from the listing response, so no consumer issues an object-store HEAD for it.
+    pub size: u64,
+    /// Every `key=value` directory segment below the listed prefix, in path order.
+    partition_segments: Vec<(String, Option<String>)>,
+}
+
+impl ListedFile {
+    pub fn with_partition_values(
+        self,
+        partition_values: BTreeMap<String, Option<String>>,
+    ) -> ParquetFile {
+        ParquetFile {
+            path: self.path,
+            size: self.size,
+            partition_values,
+            footer: None,
+        }
+    }
+}
 
 pub struct ParquetFile {
     pub path: StorePath,
@@ -52,6 +87,23 @@ pub struct ParquetDirectory {
     pub schema: SchemaRef,
     /// The declared partition-key names, in the order appended to `schema`.
     pub partition_columns: Vec<String>,
+    /// In `schema` order; the listing still declares these columns, only a read refuses them.
+    pub binary_columns: Vec<BinaryColumn>,
+}
+
+/// Read from the footer's annotations, not the folded Arrow type: `parquet` folds an unannotated
+/// `BYTE_ARRAY` and an `ENUM` one alike to `Binary` (`vs-adapter/binary-column-refusal`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BinaryColumn {
+    pub column: String,
+    /// The member's Parquet column path, `None` when the column's own leaf is binary.
+    pub member_path: Option<String>,
+    /// In the file's own terms: `binary`, `fixed(L)`, `uuid`, `bson`, `geometry`, `geography`,
+    /// or `enum`.
+    pub declared: String,
+    /// An `ENUM` leaf below the top level or under a repeated one, which only a top-level
+    /// cast reads as text.
+    pub nested_enum: bool,
 }
 
 /// The store-relative prefix a storage URI names (pairs with [`crate::scan::store_root_url`]).
@@ -62,6 +114,27 @@ pub fn store_prefix(uri: &str) -> Result<StorePath, UdfError> {
         .map_err(|e| UdfError::User(format!("invalid storage URI '{uri}': {e}")))?;
     StorePath::from_url_path(url.path())
         .map_err(|e| UdfError::User(format!("invalid storage path in '{uri}': {e}")))
+}
+
+/// A Glue location names the literal object key, so unlike [`store_prefix`] the key is never
+/// percent-decoded; `s3a` reads as `s3`.
+pub fn raw_location_prefix(location: &str) -> Result<(String, StorePath), UdfError> {
+    let refused =
+        |cause: String| UdfError::User(format!("invalid storage location '{location}': {cause}"));
+    let (scheme, rest) = location
+        .split_once("://")
+        .filter(|(scheme, _)| !scheme.is_empty())
+        .ok_or_else(|| refused("it names no scheme".to_string()))?;
+    let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
+    if bucket.is_empty() {
+        return Err(refused("it names no bucket".to_string()));
+    }
+    let scheme = match scheme.to_ascii_lowercase().as_str() {
+        "s3a" => "s3".to_string(),
+        other => other.to_string(),
+    };
+    let prefix = StorePath::parse(key).map_err(|error| refused(error.to_string()))?;
+    Ok((format!("{scheme}://{bucket}"), prefix))
 }
 
 /// A prefix holding no data file returns an empty file list and schema; whether that counts as a
@@ -85,7 +158,7 @@ pub async fn resolve_parquet_directory(
     // dropped for the key.
     let key_columns = uppercase_index(raw_files.iter().flat_map(segment_keys));
 
-    let kept: Vec<(&RawFile, BTreeMap<String, Option<String>>)> = raw_files
+    let kept: Vec<(&ListedFile, BTreeMap<String, Option<String>>)> = raw_files
         .iter()
         .filter_map(|raw| {
             let filled = fill_partition_values(
@@ -97,7 +170,7 @@ pub async fn resolve_parquet_directory(
             keep(&filled).then_some((raw, filled))
         })
         .collect();
-    let sources: Vec<&RawFile> = match options.merge_mode {
+    let sources: Vec<&ListedFile> = match options.merge_mode {
         MergeMode::FoldEveryFile => kept.iter().map(|(raw, _)| *raw).collect(),
         MergeMode::SampleOneFile => sampled.iter().collect(),
     };
@@ -111,6 +184,7 @@ pub async fn resolve_parquet_directory(
     .await?;
 
     let folded_fields = fold_schemas(&sources, &read, &key_columns)?;
+    let binary_columns = binary_columns(&read, &folded_fields);
     let footers: HashMap<&StorePath, &Arc<ParquetMetaData>> = sources
         .iter()
         .zip(&read)
@@ -129,6 +203,7 @@ pub async fn resolve_parquet_directory(
         files,
         schema: schema_with_partition_columns(folded_fields, &declared_keys),
         partition_columns: declared_keys,
+        binary_columns,
     })
 }
 
@@ -159,23 +234,12 @@ pub async fn list_parquet_files(
                         .eq(folded.chars())
                 },
             );
-            keep(&partition_values).then_some(ParquetFile {
-                path: raw.path,
-                size: raw.size,
-                partition_values,
-                footer: None,
-            })
+            keep(&partition_values).then(|| raw.with_partition_values(partition_values))
         })
         .collect())
 }
 
-struct RawFile {
-    path: StorePath,
-    size: u64,
-    partition_segments: Vec<(String, Option<String>)>,
-}
-
-fn segment_keys(raw: &RawFile) -> impl Iterator<Item = &str> {
+fn segment_keys(raw: &ListedFile) -> impl Iterator<Item = &str> {
     raw.partition_segments.iter().map(|(key, _)| key.as_str())
 }
 
@@ -183,27 +247,48 @@ async fn list_data_files(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,
     hive_partitioning: bool,
-) -> Result<Vec<RawFile>, UdfError> {
-    let listed: Vec<object_store::ObjectMeta> = store
-        .list(Some(prefix))
-        .try_collect()
-        .await
-        .map_err(|e| UdfError::User(format!("failed to list '{prefix}': {e}")))?;
+) -> Result<Vec<ListedFile>, UdfError> {
+    let mut files = list_location_files(store, prefix, FilePattern::ParquetAtAnyDepth).await?;
+    if !hive_partitioning {
+        for file in &mut files {
+            file.partition_segments.clear();
+        }
+    }
+    Ok(files)
+}
 
-    let mut files: Vec<RawFile> = listed
+/// Sorted by path. A segment below the prefix starting with `_` or `.`, or a zero-byte object (a
+/// Hadoop `_$folder$` marker), is never a data file.
+pub async fn list_location_files(
+    store: &Arc<dyn ObjectStore>,
+    prefix: &StorePath,
+    pattern: FilePattern,
+) -> Result<Vec<ListedFile>, UdfError> {
+    // A delimiter listing fetches no object below a subdirectory.
+    let listed: Vec<object_store::ObjectMeta> = match pattern {
+        FilePattern::ParquetAtAnyDepth => store.list(Some(prefix)).try_collect().await,
+        FilePattern::AnyDirectChild => store
+            .list_with_delimiter(Some(prefix))
+            .await
+            .map(|listing| listing.objects),
+    }
+    .map_err(|e| UdfError::User(format!("failed to list '{prefix}': {e}")))?;
+
+    let mut files: Vec<ListedFile> = listed
         .into_iter()
+        .filter(|meta| meta.size > 0)
         .filter_map(|meta| {
-            let segments = data_file_segments(&meta.location, prefix)?;
-            let partition_segments = if hive_partitioning {
-                let (_, directories) = segments.split_last()?;
-                parse_partition_segments(directories)
-            } else {
-                Vec::new()
+            let mut segments = data_file_segments(&meta.location, prefix)?;
+            let name = segments.pop()?;
+            let is_data_file = match pattern {
+                FilePattern::ParquetAtAnyDepth => name.ends_with(".parquet"),
+                // The delimiter listing returns direct children only.
+                FilePattern::AnyDirectChild => true,
             };
-            Some(RawFile {
+            is_data_file.then(|| ListedFile {
                 path: meta.location,
                 size: meta.size,
-                partition_segments,
+                partition_segments: parse_partition_segments(&segments),
             })
         })
         .collect();
@@ -213,20 +298,15 @@ async fn list_data_files(
     Ok(files)
 }
 
-/// A data file's name ends in `.parquet` and no segment below the prefix starts with `_` or `.`,
-/// which excludes hidden/staging directories regardless of their own names.
 fn data_file_segments(location: &StorePath, prefix: &StorePath) -> Option<Vec<String>> {
     let segments: Vec<String> = location
         .prefix_match(prefix)?
         .map(|part| part.as_ref().to_string())
         .collect();
-    let name = segments.last()?;
-    if !name.ends_with(".parquet") {
-        return None;
-    }
-    if segments
-        .iter()
-        .any(|segment| segment.starts_with('_') || segment.starts_with('.'))
+    if segments.is_empty()
+        || segments
+            .iter()
+            .any(|segment| segment.starts_with('_') || segment.starts_with('.'))
     {
         return None;
     }
@@ -257,7 +337,7 @@ fn decode_partition_value(raw: &str) -> Option<String> {
 
 /// The distinct keys `scope`'s paths carry, in first-seen order; two spellings of one uppercased
 /// name are an error.
-fn declared_partition_keys(scope: &[RawFile]) -> Result<Vec<String>, UdfError> {
+fn declared_partition_keys(scope: &[ListedFile]) -> Result<Vec<String>, UdfError> {
     let mut keys: Vec<String> = Vec::new();
     let mut seen_spellings: HashSet<&str> = HashSet::new();
     let mut by_uppercase: HashMap<String, (&str, &StorePath)> = HashMap::new();
@@ -352,7 +432,7 @@ struct FoldedColumn {
 /// A stored column named like a partition key (`key_columns`, keyed uppercase) is dropped in favor
 /// of the key; a read file that stores the column but lacks the key's segment is an error.
 fn fold_schemas(
-    sources: &[&RawFile],
+    sources: &[&ListedFile],
     read: &[ArrowReaderMetadata],
     key_columns: &HashMap<String, &str>,
 ) -> Result<Vec<Field>, UdfError> {
@@ -399,6 +479,90 @@ fn fold_schemas(
         .into_iter()
         .map(|column| Field::new(column.name, column.data_type, true))
         .collect())
+}
+
+/// Only columns of `folded` count, so a stored column dropped for a partition key is never
+/// refused; the first listed file's leaf names a column's type.
+fn binary_columns(read: &[ArrowReaderMetadata], folded: &[Field]) -> Vec<BinaryColumn> {
+    let mut first_by_column: HashMap<String, BinaryColumn> = HashMap::new();
+    for metadata in read {
+        for leaf in metadata.metadata().file_metadata().schema_descr().columns() {
+            let parts = leaf.path().parts();
+            let is_top_level_scalar = parts.len() == 1 && leaf.max_rep_level() == 0;
+            let (declared, nested_enum) = match classify_leaf(leaf) {
+                LeafKind::Readable => continue,
+                LeafKind::Enum if is_top_level_scalar => continue,
+                LeafKind::Enum => ("enum".to_string(), true),
+                LeafKind::Binary(declared) => (declared, false),
+            };
+            first_by_column
+                .entry(parts[0].clone())
+                .or_insert_with(|| BinaryColumn {
+                    column: parts[0].clone(),
+                    member_path: (parts.len() > 1).then(|| leaf.path().string()),
+                    declared,
+                    nested_enum,
+                });
+        }
+    }
+    folded
+        .iter()
+        .filter_map(|field| first_by_column.remove(field.name()))
+        .collect()
+}
+
+enum LeafKind {
+    Readable,
+    /// Text per Parquet LogicalTypes § ENUM, but folded to Arrow `Binary`, so only the top-level
+    /// cast reads it as text; the JSON renderer would print a member's bytes as hexadecimal.
+    Enum,
+    Binary(String),
+}
+
+/// Mirrors `parquet` 58's `from_byte_array` and `from_fixed_len_byte_array`: the logical type
+/// decides, and the converted type only when a file carries no logical type.
+fn classify_leaf(leaf: &ColumnDescriptor) -> LeafKind {
+    let binary = |declared: &str| LeafKind::Binary(declared.to_string());
+    match (
+        leaf.physical_type(),
+        leaf.logical_type_ref(),
+        leaf.converted_type(),
+    ) {
+        (_, Some(LogicalType::Unknown), _) => LeafKind::Readable,
+        (PhysicalType::BYTE_ARRAY, Some(logical), _) => match logical {
+            LogicalType::String | LogicalType::Json | LogicalType::Decimal { .. } => {
+                LeafKind::Readable
+            }
+            LogicalType::Enum => LeafKind::Enum,
+            LogicalType::Bson => binary("bson"),
+            LogicalType::Geometry { .. } => binary("geometry"),
+            LogicalType::Geography { .. } => binary("geography"),
+            _ => binary("binary"),
+        },
+        (PhysicalType::BYTE_ARRAY, None, converted) => match converted {
+            ConvertedType::UTF8 | ConvertedType::JSON | ConvertedType::DECIMAL => {
+                LeafKind::Readable
+            }
+            ConvertedType::ENUM => LeafKind::Enum,
+            ConvertedType::BSON => binary("bson"),
+            _ => binary("binary"),
+        },
+        (
+            PhysicalType::FIXED_LEN_BYTE_ARRAY,
+            Some(LogicalType::Decimal { .. } | LogicalType::Float16),
+            _,
+        )
+        | (
+            PhysicalType::FIXED_LEN_BYTE_ARRAY,
+            None,
+            ConvertedType::DECIMAL | ConvertedType::INTERVAL,
+        ) => LeafKind::Readable,
+        (PhysicalType::FIXED_LEN_BYTE_ARRAY, Some(LogicalType::Uuid), _) => binary("uuid"),
+        (PhysicalType::FIXED_LEN_BYTE_ARRAY, _, _) => {
+            LeafKind::Binary(format!("fixed({})", leaf.type_length()))
+        }
+        _ => LeafKind::Readable,
+    }
 }
 
 fn schema_with_partition_columns(mut fields: Vec<Field>, declared_keys: &[String]) -> SchemaRef {
