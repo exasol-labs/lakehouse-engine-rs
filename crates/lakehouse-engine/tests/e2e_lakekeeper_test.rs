@@ -21,6 +21,11 @@ use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
     self, WAREHOUSE_STATIC, WAREHOUSE_VENDED, WarehouseProfile, lakekeeper_connection_password,
 };
+use common::lakekeeper_authz::{
+    AuthzFixture, CHECK_ID, CHECKER, Grant, OPERATOR, Principal, READER_A, READER_B, Scope,
+    TABLE_ALPHA, TABLE_BETA, TABLE_MISSING, batch_check, batch_check_request, ensure_authz_fixture,
+    jwt_claims, lakekeeper_server_info, post_batch_check, provision_authz_fixture, whoami_id,
+};
 use common::seed::{
     E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15,
     SEED_TOTAL_ROWS, SeedCatalogAuth, seed_events_table_with_auth, seed_star_schema_with_auth,
@@ -38,6 +43,7 @@ use lakehouse_catalog::{
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectStorePath;
 use object_store::{ObjectStore, ObjectStoreExt};
+use serde_json::Value;
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -48,10 +54,6 @@ const CONN_STATIC: &str = "LK_STATIC_CATALOG_CREDS";
 const CONN_VENDED: &str = "LK_VENDED_CATALOG_CREDS";
 
 const LAKEKEEPER_CATALOG_URI_INTERNAL: &str = "http://lakekeeper:8181/catalog";
-
-fn lakekeeper_catalog_url_host() -> String {
-    format!("http://localhost:{}/catalog", lakekeeper::lakekeeper_port())
-}
 
 fn vs_static_table() -> String {
     format!("{VS_STATIC}.{}", E2E_TABLE.to_uppercase())
@@ -79,7 +81,7 @@ fn setup() {
             .enable_all()
             .build()
             .expect("tokio runtime");
-        let host_catalog = lakekeeper_catalog_url_host();
+        let host_catalog = lakekeeper::catalog_uri_host();
         for warehouse in [WAREHOUSE_STATIC, WAREHOUSE_VENDED] {
             let token = lakekeeper::keycloak_client_credentials_token();
             let auth = SeedCatalogAuth {
@@ -597,7 +599,7 @@ fn lakekeeper_vended_credentials_are_scoped_per_table() {
 
     rt.block_on(async {
         let session =
-            CatalogSession::resolve(&lakekeeper_catalog_url_host(), WAREHOUSE_VENDED, &creds)
+            CatalogSession::resolve(&lakekeeper::catalog_uri_host(), WAREHOUSE_VENDED, &creds)
                 .await
                 .unwrap_or_else(|e| {
                     panic!("CatalogSession::resolve against Lakekeeper must succeed: {e}")
@@ -694,4 +696,310 @@ fn lakekeeper_vended_broadcast_join_result_correct() {
         "broadcast join result over the vended-credential warehouse must equal the \
          independently computed join.\nactual:   {actual:?}\nexpected: {expected:?}"
     );
+}
+
+const OPENFGA_BACKEND: &str = "openfga";
+
+fn authz_fixture() -> &'static AuthzFixture {
+    setup();
+    ensure_authz_fixture()
+}
+
+fn grant(scope: Scope, relation: &'static str) -> Grant {
+    Grant { scope, relation }
+}
+
+fn operator_allows(fixture: &AuthzFixture, principal: &Principal, table: &str) -> bool {
+    let checks = [fixture.read_check(principal, table)];
+    batch_check(&OPERATOR.token(), &checks).allowed(CHECK_ID)
+}
+
+#[test]
+fn lakekeeper_stack_enforces_permissions() {
+    setup();
+    let info = lakekeeper_server_info();
+    let backend = info["authz-backend"].as_str().unwrap_or("<none reported>");
+    assert_eq!(
+        backend, OPENFGA_BACKEND,
+        "Lakekeeper reports authz-backend '{backend}'; the stack must run \
+         LAKEKEEPER__AUTHZ_BACKEND={OPENFGA_BACKEND} (recreate it with `down -v` after the switch)"
+    );
+    let fixture = authz_fixture();
+    assert!(
+        !operator_allows(fixture, &READER_A, TABLE_BETA),
+        "a principal without a grant on {TABLE_BETA} must be denied it"
+    );
+}
+
+#[test]
+fn lakekeeper_two_principals_hold_different_table_grants() {
+    let fixture = authz_fixture();
+    let checks = [
+        fixture.read_check_for_user("a-alpha", fixture.principal_id(&READER_A), TABLE_ALPHA),
+        fixture.read_check_for_user("a-beta", fixture.principal_id(&READER_A), TABLE_BETA),
+        fixture.read_check_for_user("b-alpha", fixture.principal_id(&READER_B), TABLE_ALPHA),
+        fixture.read_check_for_user("b-beta", fixture.principal_id(&READER_B), TABLE_BETA),
+    ];
+
+    let answer = batch_check(&OPERATOR.token(), &checks);
+
+    assert_eq!(answer.status, 200, "{}", answer.body);
+    assert!(answer.allowed("a-alpha"), "reader A must be allowed alpha");
+    assert!(!answer.allowed("a-beta"), "reader A must be denied beta");
+    assert!(!answer.allowed("b-alpha"), "reader B must be denied alpha");
+    assert!(answer.allowed("b-beta"), "reader B must be allowed beta");
+}
+
+#[test]
+fn authz_fixture_provisioning_removes_a_stale_reader_grant() {
+    let fixture = authz_fixture();
+    fixture.ensure_grant(
+        fixture.principal_id(&READER_A),
+        grant(Scope::Table(TABLE_BETA), "select"),
+    );
+    assert!(
+        operator_allows(fixture, &READER_A, TABLE_BETA),
+        "precondition: the stale grant takes effect"
+    );
+
+    let reprovisioned = provision_authz_fixture();
+
+    assert!(
+        !operator_allows(&reprovisioned, &READER_A, TABLE_BETA),
+        "provisioning must remove a grant the fixture does not name"
+    );
+    assert!(operator_allows(&reprovisioned, &READER_A, TABLE_ALPHA));
+}
+
+/// Proves only a direct client-credentials login. It does NOT prove that the id #415's
+/// `USER_MAPPING` template derives from an Exasol user matches an existing grant (#415).
+#[test]
+fn authz_direct_login_principal_id_is_idp_prefix_and_token_subject() {
+    let fixture = authz_fixture();
+    let claims = jwt_claims(&READER_A.token());
+    let sub = claims["sub"].as_str().expect("token carries a sub claim");
+
+    assert_eq!(whoami_id(&READER_A), format!("oidc~{sub}"));
+    let groups: Vec<usize> = sub.split('-').map(str::len).collect();
+    assert_eq!(groups, [8, 4, 4, 4, 12], "sub is not a UUID: {sub}");
+    assert!(sub.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+
+    let unregistered = "oidc~template-user@corp";
+    fixture.ensure_grant(unregistered, grant(Scope::Table(TABLE_ALPHA), "select"));
+    let checks = [fixture.read_check_for_user(CHECK_ID, unregistered, TABLE_ALPHA)];
+    assert!(
+        batch_check(&OPERATOR.token(), &checks).allowed(CHECK_ID),
+        "an id that never logged in must still be grantable and allowed"
+    );
+}
+
+#[test]
+fn authz_check_for_another_identity_is_forbidden_without_grant_management() {
+    let fixture = authz_fixture();
+    let holdings: [(&str, Vec<Grant>); 3] = [
+        ("no assignment", vec![]),
+        ("server admin only", vec![grant(Scope::Server, "admin")]),
+        (
+            "warehouse select only",
+            vec![grant(Scope::Warehouse, "select")],
+        ),
+    ];
+
+    for (label, grants) in holdings {
+        fixture.set_assignments(&CHECKER, &grants);
+        let checks = [fixture.read_check(&READER_A, TABLE_ALPHA)];
+
+        let answer = batch_check(&CHECKER.token(), &checks);
+
+        assert_eq!(answer.status, 403, "checker with {label}: {}", answer.body);
+        assert_eq!(
+            answer.error_type(),
+            Some("CannotInspectPermissions"),
+            "checker with {label}: {}",
+            answer.body
+        );
+        assert!(
+            answer.body.get("results").is_none(),
+            "checker with {label} must get no per-check results: {}",
+            answer.body
+        );
+    }
+    fixture.set_assignments(&CHECKER, &[]);
+}
+
+#[test]
+fn authz_warehouse_manage_grants_allows_checking_another_identity() {
+    let fixture = authz_fixture();
+    fixture.set_assignments(&CHECKER, &[grant(Scope::Warehouse, "manage_grants")]);
+    let checks = [
+        fixture.read_check_for_user("a-alpha", fixture.principal_id(&READER_A), TABLE_ALPHA),
+        fixture.read_check_for_user("a-beta", fixture.principal_id(&READER_A), TABLE_BETA),
+        fixture.read_check_for_user("a-missing", fixture.principal_id(&READER_A), TABLE_MISSING),
+    ];
+
+    let by_checker = batch_check(&CHECKER.token(), &checks);
+    let by_operator = batch_check(&OPERATOR.token(), &checks);
+    fixture.set_assignments(&CHECKER, &[]);
+
+    assert_eq!(by_checker.status, 200, "{}", by_checker.body);
+    assert_eq!(
+        by_checker.body, by_operator.body,
+        "warehouse manage_grants must answer exactly as the operator does"
+    );
+}
+
+/// Checks the unprefixed local topology only; a path-rewriting gateway is not covered.
+#[test]
+fn authz_management_api_is_mounted_beside_catalog_path_on_local_topology() {
+    setup();
+    let catalog_uri = lakekeeper::catalog_uri_host();
+    let root = catalog_uri
+        .strip_suffix("/catalog")
+        .unwrap_or_else(|| panic!("catalog URI {catalog_uri} does not end in /catalog"));
+    let client = lakekeeper::http_client();
+    let token = lakekeeper::keycloak_client_credentials_token();
+
+    let management_url = format!("{root}/management/v1/info");
+    let config_url = format!("{catalog_uri}/v1/config?warehouse={WAREHOUSE_STATIC}");
+
+    let management = client
+        .get(&management_url)
+        .bearer_auth(&token)
+        .send()
+        .unwrap_or_else(|e| panic!("GET {management_url} failed to send: {e}"));
+    let catalog = client
+        .get(&config_url)
+        .bearer_auth(&token)
+        .send()
+        .unwrap_or_else(|e| panic!("GET {config_url} failed to send: {e}"));
+
+    assert_eq!(
+        management.status().as_u16(),
+        200,
+        "management API must sit at the root beside {catalog_uri}"
+    );
+    assert_eq!(
+        catalog.status().as_u16(),
+        200,
+        "GET {config_url} must answer 200"
+    );
+}
+
+struct FixtureCase {
+    name: &'static str,
+    caller: &'static Principal,
+    identity: &'static Principal,
+    table: &'static str,
+}
+
+const ALLOWED_CASE: FixtureCase = FixtureCase {
+    name: "allowed",
+    caller: &OPERATOR,
+    identity: &READER_A,
+    table: TABLE_ALPHA,
+};
+const DENIED_CASE: FixtureCase = FixtureCase {
+    name: "denied",
+    caller: &OPERATOR,
+    identity: &READER_A,
+    table: TABLE_BETA,
+};
+const MISSING_CASE: FixtureCase = FixtureCase {
+    name: "missing",
+    caller: &OPERATOR,
+    identity: &READER_A,
+    table: TABLE_MISSING,
+};
+const CANNOT_INSPECT_CASE: FixtureCase = FixtureCase {
+    name: "cannot-inspect",
+    caller: &READER_B,
+    identity: &READER_A,
+    table: TABLE_ALPHA,
+};
+
+const FIXTURE_CASES: [FixtureCase; 4] =
+    [ALLOWED_CASE, DENIED_CASE, MISSING_CASE, CANNOT_INSPECT_CASE];
+
+const CAPTURE_VARIABLE: &str = "LH_LAKEKEEPER_FIXTURE_CAPTURE";
+
+fn fixture_path(case: &str) -> String {
+    format!(
+        "{}/../lakehouse-catalog/tests/fixtures/lakekeeper/batch-check/{case}.json",
+        env!("CARGO_MANIFEST_DIR")
+    )
+}
+
+fn normalized_exchange(fixture: &AuthzFixture, case: &FixtureCase) -> Value {
+    let request = batch_check_request(&[fixture.read_check(case.identity, case.table)]);
+    let answer = post_batch_check(&case.caller.token(), &request);
+    fixture.normalize(&serde_json::json!({
+        "case": case.name,
+        "caller": case.caller.client_id,
+        "request": request,
+        "response": answer.to_value(),
+    }))
+}
+
+/// The fields #415 depends on; message text may differ between Lakekeeper builds.
+fn contract(document: &Value) -> Value {
+    let response = &document["response"];
+    serde_json::json!({
+        "request": document["request"],
+        "status": response["status"],
+        "results": response["body"]["results"],
+        "error.type": response["body"]["error"]["type"],
+        "error.code": response["body"]["error"]["code"],
+    })
+}
+
+#[test]
+fn authz_batch_check_fixtures_match_live_contract() {
+    let fixture = authz_fixture();
+
+    for case in &FIXTURE_CASES {
+        let live = normalized_exchange(fixture, case);
+        let path = fixture_path(case.name);
+        if std::env::var(CAPTURE_VARIABLE).as_deref() == Ok("1") {
+            let text = serde_json::to_string_pretty(&live).expect("fixture serializes") + "\n";
+            assert!(
+                !fixture.carries_secret_or_live_id(&text),
+                "captured fixture '{}' carries a secret, a token, or a live id",
+                case.name
+            );
+            std::fs::write(&path, text).unwrap_or_else(|e| panic!("write {path}: {e}"));
+            continue;
+        }
+
+        let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("fixture {path} is unreadable ({e}); regenerate with {CAPTURE_VARIABLE}=1")
+        });
+        assert!(
+            !fixture.carries_secret_or_live_id(&text),
+            "fixture '{}' carries a secret, a token, or a live id",
+            case.name
+        );
+        let recorded: Value = serde_json::from_str(&text)
+            .unwrap_or_else(|e| panic!("fixture '{}' is not JSON: {e}", case.name));
+        assert_eq!(
+            contract(&live),
+            contract(&recorded),
+            "fixture '{}' no longer matches Lakekeeper",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn authz_denied_and_missing_tables_answer_identically() {
+    let fixture = authz_fixture();
+    let answer = |table| {
+        let checks = [fixture.read_check(&READER_A, table)];
+        batch_check(&OPERATOR.token(), &checks)
+    };
+
+    let (denied, missing) = (answer(TABLE_BETA), answer(TABLE_MISSING));
+
+    assert_eq!(denied.status, 200, "{}", denied.body);
+    assert!(!denied.allowed(CHECK_ID));
+    assert_eq!(denied.body, missing.body);
 }

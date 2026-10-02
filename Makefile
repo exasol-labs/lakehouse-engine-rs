@@ -67,14 +67,14 @@ test-e2e: cross-udf-build
 
 # Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 test-e2e-lakekeeper: cross-udf-build
 	cargo test --features lakekeeper-e2e --test e2e_lakekeeper_test -- --test-threads=1
 
 # Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
 #     -f docker-compose.lakekeeper.azure.yml up -d --wait \
-#     exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 # plus real Azure Blob Storage credentials from ./test.env or the environment.
 # Sourcing and cargo MUST stay on one recipe line: each line runs in its own shell.
 test-e2e-azure: cross-udf-build
@@ -181,7 +181,7 @@ test-lakekeeper-scripts:
 
 # FAILS (not skips) when the stack is down. Requires:
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     seaweedfs keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 test-lakekeeper-local:
 	bash deploy/scripts/tests/lakekeeper-local.test.sh
 

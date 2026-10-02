@@ -192,8 +192,9 @@ cd ../.. && bench/spark_compare.sh
 
 A second, opt-in Iceberg REST catalog for the `remote` bench target and for live demos, selected
 by `BENCH_CATALOG=lakekeeper` (default `glue`). `deploy/lakekeeper-stack/` layers on the
-persistent `data-stack` and stands up one EC2 box running PostgreSQL, Keycloak, and Lakekeeper —
-the same service set as `docker-compose.lakekeeper.yml`. `deploy/scripts/lakekeeper-provision.sh`
+persistent `data-stack` and stands up one EC2 box running PostgreSQL, Keycloak, and Lakekeeper on
+the `allowall` authorization backend. Unlike `docker-compose.lakekeeper.yml`, it runs no OpenFGA, so it
+enforces no permissions. `deploy/scripts/lakekeeper-provision.sh`
 then registers every already-cataloged TPC-H Iceberg table into it by reference — no data
 rewrite, no second physical copy. With `BENCH_CATALOG` unset, Glue is unaffected: every required
 variable, catalog URI, CONNECTION password, virtual-schema property, query set, and row count
