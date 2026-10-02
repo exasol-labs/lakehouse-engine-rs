@@ -1,0 +1,38 @@
+{
+  "caller": "lakehouse",
+  "case": "missing",
+  "request": {
+    "checks": [
+      {
+        "id": "read-data",
+        "identity": {
+          "user": "<principal:lakehouse-reader-a>"
+        },
+        "operation": {
+          "table": {
+            "action": {
+              "action": "read_data"
+            },
+            "namespace": [
+              "authz"
+            ],
+            "table": "authz_missing",
+            "warehouse-id": "<warehouse-id>"
+          }
+        }
+      }
+    ],
+    "error-on-not-found": false
+  },
+  "response": {
+    "body": {
+      "results": [
+        {
+          "allowed": false,
+          "id": "read-data"
+        }
+      ]
+    },
+    "status": 200
+  }
+}

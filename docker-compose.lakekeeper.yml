@@ -1,8 +1,13 @@
-# Overlay on docker-compose.yml:
+# Overlay on docker-compose.yml. Lakekeeper enforces permissions through OpenFGA
+# (LAKEKEEPER__AUTHZ_BACKEND=openfga). One-shots run first and in this order, because
+# `lakekeeper migrate` writes the authorization model into OpenFGA:
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up openfga-migrate
+#   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up lakekeeper-migrate
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
-# OpenFGA is omitted: the suite tests authentication only, so Lakekeeper runs
-# with the default `allowall` authz backend.
+#     seaweedfs exasol keycloak lakekeeper-db openfga-db openfga lakekeeper
+# Lakekeeper does not rebuild ownership or grants when its authz backend changes after
+# bootstrap, so a stack persisted from the earlier `allowall` overlay needs
+# `docker compose ... down -v` once.
 
 services:
   keycloak:
@@ -51,6 +56,58 @@ services:
       lakehouse:
         ipv4_address: 10.84.0.31
 
+  openfga-db:
+    image: "${LH_OPENFGA_DB_IMAGE:-postgres:17}"
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=openfga
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -p 5432 -d openfga"]
+      interval: 2s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+    networks:
+      lakehouse:
+        ipv4_address: 10.84.0.33
+
+  openfga-migrate:
+    image: "${LH_OPENFGA_IMAGE:-openfga/openfga:v1.14.2}"
+    command: ["migrate"]
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://postgres:postgres@openfga-db:5432/openfga?sslmode=disable
+    restart: "no"
+    depends_on:
+      openfga-db:
+        condition: service_healthy
+    networks:
+      - lakehouse
+
+  openfga:
+    image: "${LH_OPENFGA_IMAGE:-openfga/openfga:v1.14.2}"
+    command: ["run"]
+    environment:
+      - OPENFGA_DATASTORE_ENGINE=postgres
+      - OPENFGA_DATASTORE_URI=postgres://postgres:postgres@openfga-db:5432/openfga?sslmode=disable
+      - OPENFGA_AUTHN_METHOD=none
+      - OPENFGA_PLAYGROUND_ENABLED=false
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/grpc_health_probe", "-addr=openfga:8081"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 5s
+    depends_on:
+      openfga-migrate:
+        condition: service_completed_successfully
+      openfga-db:
+        condition: service_healthy
+    networks:
+      lakehouse:
+        ipv4_address: 10.84.0.34
+
   lakekeeper-migrate:
     image: "${LH_LAKEKEEPER_IMAGE:-quay.io/lakekeeper/catalog:v0.13.1}"
     entrypoint: ["/home/nonroot/lakekeeper", "migrate"]
@@ -58,10 +115,14 @@ services:
       - LAKEKEEPER__PG_ENCRYPTION_KEY=This-is-NOT-Secure!
       - LAKEKEEPER__PG_DATABASE_URL_READ=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
       - LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://postgres:postgres@lakekeeper-db:5432/postgres
+      - LAKEKEEPER__AUTHZ_BACKEND=openfga
+      - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
       - RUST_LOG=info
     restart: "no"
     depends_on:
       lakekeeper-db:
+        condition: service_healthy
+      openfga:
         condition: service_healthy
     networks:
       - lakehouse
@@ -77,6 +138,8 @@ services:
       - LAKEKEEPER__OPENID_PROVIDER_URI=http://keycloak:8080/realms/iceberg
       - "LAKEKEEPER__OPENID_ADDITIONAL_ISSUERS=http://localhost:${LH_KEYCLOAK_PORT:-28080}/realms/iceberg"
       - LAKEKEEPER__OPENID_AUDIENCE=lakekeeper
+      - LAKEKEEPER__AUTHZ_BACKEND=openfga
+      - LAKEKEEPER__OPENFGA__ENDPOINT=http://openfga:8081
       - RUST_LOG=info,lakekeeper=info
     # Distroless image: no curl/wget.
     healthcheck:
@@ -91,6 +154,8 @@ services:
       lakekeeper-db:
         condition: service_healthy
       keycloak:
+        condition: service_healthy
+      openfga:
         condition: service_healthy
       seaweedfs:
         condition: service_healthy

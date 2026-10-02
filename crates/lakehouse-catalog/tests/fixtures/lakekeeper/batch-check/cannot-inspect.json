@@ -1,0 +1,40 @@
+{
+  "caller": "lakehouse-reader-b",
+  "case": "cannot-inspect",
+  "request": {
+    "checks": [
+      {
+        "id": "read-data",
+        "identity": {
+          "user": "<principal:lakehouse-reader-a>"
+        },
+        "operation": {
+          "table": {
+            "action": {
+              "action": "read_data"
+            },
+            "namespace": [
+              "authz"
+            ],
+            "table": "authz_alpha",
+            "warehouse-id": "<warehouse-id>"
+          }
+        }
+      }
+    ],
+    "error-on-not-found": false
+  },
+  "response": {
+    "body": {
+      "error": {
+        "code": 403,
+        "message": "Not allowed to inspect permissions for object lakekeeper_table:<warehouse-id>/<table-id:authz_alpha>",
+        "stack": [
+          "Error ID: <error-id>"
+        ],
+        "type": "CannotInspectPermissions"
+      }
+    },
+    "status": 403
+  }
+}

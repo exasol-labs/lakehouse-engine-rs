@@ -385,9 +385,17 @@ jobs:
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml pull --quiet
 
       # One-shot jobs are `docker wait`-ed first (see `e2e`).
-      - name: Start stack (Exasol + SeaweedFS + Keycloak + Lakekeeper)
+      - name: Start stack (Exasol + SeaweedFS + Keycloak + OpenFGA + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
+
+          $COMPOSE up -d openfga-migrate
+          OPENFGA_MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-openfga-migrate-1)
+          if [ "$OPENFGA_MIGRATE_EXIT" != "0" ]; then
+            echo "::error::openfga-migrate exited $OPENFGA_MIGRATE_EXIT (schema migration failed)"
+            $COMPOSE logs openfga-migrate
+            exit 1
+          fi
 
           $COMPOSE up -d lakekeeper-migrate
           MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-lakekeeper-migrate-1)
@@ -397,7 +405,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol seaweedfs keycloak lakekeeper-db lakekeeper
+          $COMPOSE up -d --wait exasol seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper
 
       - name: Run Lakekeeper E2E suite
         run: make test-e2e-lakekeeper
@@ -407,7 +415,7 @@ jobs:
         uses: ./.github/actions/dump-exasol-logs
         with:
           compose: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml
-          services: keycloak lakekeeper-migrate lakekeeper
+          services: keycloak openfga-migrate openfga lakekeeper-migrate lakekeeper
           artifact-name: exa-logs-lakekeeper
 
       - name: Stop stack
@@ -475,11 +483,19 @@ jobs:
         run: |
           docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
             -f docker-compose.lakekeeper.azure.yml \
-            pull --quiet exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+            pull --quiet exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 
-      - name: Start stack (Exasol + Keycloak + Lakekeeper)
+      - name: Start stack (Exasol + Keycloak + OpenFGA + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml"
+
+          $COMPOSE up -d openfga-migrate
+          OPENFGA_MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-openfga-migrate-1)
+          if [ "$OPENFGA_MIGRATE_EXIT" != "0" ]; then
+            echo "::error::openfga-migrate exited $OPENFGA_MIGRATE_EXIT (schema migration failed)"
+            $COMPOSE logs openfga-migrate
+            exit 1
+          fi
 
           $COMPOSE up -d lakekeeper-migrate
           MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-lakekeeper-migrate-1)
@@ -489,7 +505,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol keycloak lakekeeper-db lakekeeper
+          $COMPOSE up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper
 
       - name: Run Azure E2E suite
         env:
@@ -505,7 +521,7 @@ jobs:
         uses: ./.github/actions/dump-exasol-logs
         with:
           compose: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml
-          services: keycloak lakekeeper-migrate lakekeeper
+          services: keycloak openfga-migrate openfga lakekeeper-migrate lakekeeper
           artifact-name: exa-logs-azure
 
       - name: Stop stack

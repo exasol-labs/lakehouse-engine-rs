@@ -3,7 +3,7 @@
 # than skips when the stack is down.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs iceberg-rest keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 #   bash deploy/scripts/tests/lakekeeper-local.test.sh
 #
 # Source tables live in the iceberg-rest fixture, not Lakekeeper: Lakekeeper rejects overlapping
@@ -83,7 +83,7 @@ require_endpoint() {
     2??) return 0 ;;
   esac
   fatal "$name is not answering at $url (HTTP $status). This test requires the local Docker stack and never skips. Start it with:
-  docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait seaweedfs iceberg-rest keycloak lakekeeper-db lakekeeper-migrate lakekeeper"
+  docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper"
 }
 
 require_stack() {

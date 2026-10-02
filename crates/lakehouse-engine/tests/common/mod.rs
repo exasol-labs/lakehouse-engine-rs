@@ -38,6 +38,8 @@ pub mod glue;
 pub mod int96_fixtures;
 #[cfg(any(feature = "lakekeeper-e2e", feature = "azure-e2e"))]
 pub mod lakekeeper;
+#[cfg(feature = "lakekeeper-e2e")]
+pub mod lakekeeper_authz;
 #[cfg(feature = "exasol-e2e")]
 pub mod pos_delete_fixtures;
 #[cfg(any(
