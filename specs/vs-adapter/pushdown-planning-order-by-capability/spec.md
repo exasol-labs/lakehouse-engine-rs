@@ -105,7 +105,7 @@ single-table and N-scan join wrapper), `vs-adapter/pushdown-planning-single-grou
   there is no deviation to fix and none to track.
 * **Why `LIMIT_WITH_OFFSET` must be advertised (issue #191).** While it is unadvertised,
   Exasol pushes `orderBy` for any ORDER BY query but strips the offset from the request AND
-  applies no offset itself. Verified live against the local Docker stack (Exasol + MinIO +
+  applies no offset itself. Verified live against the local Docker stack (Exasol + SeaweedFS +
   Iceberg REST, seeded `events` table, 20 rows, `score = 5.0 * id`): `SELECT id, score FROM t
   ORDER BY score DESC LIMIT 12 OFFSET 3` pushed `"limit":{"numElements":12}` with NO `offset`
   key, and the query returned ids 20…9 — ranks 1-12 — instead of the correct ids 17…6, ranks

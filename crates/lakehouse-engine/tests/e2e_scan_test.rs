@@ -1,4 +1,4 @@
-//! E2E tests against a live Exasol + MinIO + Iceberg REST stack. They fail, never
+//! E2E tests against a live Exasol + SeaweedFS + Iceberg REST stack. They fail, never
 //! skip, when the stack is unavailable, and share one VS, so run with
 //! `--test-threads=1`.
 #![cfg(feature = "exasol-e2e")]
@@ -19,7 +19,7 @@ use common::seed::{
 };
 use common::stack::{
     build_create_connection_sql, exasol_container, iceberg_catalog_url, wait_for_exasol,
-    wait_for_iceberg_catalog, wait_for_minio,
+    wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 
 use lakehouse_catalog::CatalogSession;
@@ -38,7 +38,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_iceberg_catalog();
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2586,7 +2586,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
     let session = rt
         .block_on(async { CatalogSession::resolve(&catalog_uri, &creds.warehouse, &creds).await })
         .expect("CatalogSession::resolve must succeed");
-    // The local stack's MinIO is plain HTTP.
+    // The local stack's SeaweedFS is plain HTTP.
     let connection = ConnectionStorage {
         storage: &storage,
         creds: &creds,

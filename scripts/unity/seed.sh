@@ -14,89 +14,40 @@ FIXTURES_DIR="$SCRIPT_DIR/fixtures"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 NETWORK="${LH_NETWORK:-lakehouse-engine}"
-MC_IMAGE="pgsty/mc:RELEASE.2026-09-16T00-00-00Z"
+AWS_CLI_IMAGE="amazon/aws-cli:2.27.50"
+S3_ENDPOINT="http://seaweedfs:8333"
 export UC_BASE="http://localhost:${LH_UNITY_PORT:-18080}/api/2.1/unity-catalog"
 export UC_CATALOG="unity"
 export UC_SCHEMA="delta_e2e"
 export UC_PREFIX="delta"
 
-echo "=== unity-seed: uploading Delta fixtures to MinIO (bucket warehouse) ==="
+echo "=== unity-seed: uploading Delta fixtures to SeaweedFS (bucket warehouse) ==="
 docker run --rm --network "$NETWORK" -v "$FIXTURES_DIR":/fx:ro \
-  --entrypoint /bin/sh "$MC_IMAGE" -c '
+  -e AWS_ACCESS_KEY_ID=lhadmin -e AWS_SECRET_ACCESS_KEY=lhadminsecret123 \
+  -e AWS_DEFAULT_REGION=us-east-1 \
+  --entrypoint /bin/sh "$AWS_CLI_IMAGE" -c '
     set -e
-    mc alias set local http://minio:9000 minioadmin minioadmin >/dev/null
     for t in /fx/*/; do
       name=$(basename "$t")
-      mc mirror --overwrite --quiet "$t" "local/warehouse/'"$UC_PREFIX"'/$name/" >/dev/null
+      aws --endpoint-url '"$S3_ENDPOINT"' s3 sync --only-show-errors "$t" "s3://warehouse/'"$UC_PREFIX"'/$name/"
       echo "  uploaded $name"
     done
   '
 
-echo "=== unity-seed: minting the MinIO STS session Unity Catalog vends ==="
+echo "=== unity-seed: minting the SeaweedFS STS session Unity Catalog vends ==="
 # UC OSS 0.5.0 vends for `s3://warehouse` only via its static generator, which
-# is selected by a non-empty `s3.sessionToken.0` and returns it verbatim. MinIO
-# rejects any token that is not a live STS session (403 InvalidTokenId), and UC's
-# own STS generator ignores AWS_ENDPOINT_URL, so a real 7-day MinIO STS session
-# is minted here.
+# is selected by a non-empty `s3.sessionToken.0` and returns it verbatim, and its
+# own STS generator ignores AWS_ENDPOINT_URL. So a real session is minted here by
+# the AWS CLI: the base user assumes the read-only LakehouseReader role
+# (seaweedfs-iam.json), for SeaweedFS's 12-hour maximum.
 STS_TRIPLE=$(
-  MINIO_STS_ENDPOINT="http://localhost:${LH_MINIO_PORT:-19000}" python3 - <<'PY'
-import datetime, hashlib, hmac, os, sys, urllib.error, urllib.request
-import xml.etree.ElementTree as ET
-
-ENDPOINT = os.environ["MINIO_STS_ENDPOINT"]
-KEY = SECRET = "minioadmin"          # base compose's MinIO root credentials
-REGION, SERVICE = "us-east-1", "sts"
-DURATION = "604800"                  # MinIO's AssumeRole maximum: 7 days
-
-host = ENDPOINT.split("://", 1)[1]
-body = ("Action=AssumeRole&Version=2011-06-15"
-        f"&DurationSeconds={DURATION}&RoleSessionName=lakehouse-unity-e2e")
-now = datetime.datetime.now(datetime.timezone.utc)
-stamp, datestamp = now.strftime("%Y%m%dT%H%M%SZ"), now.strftime("%Y%m%d")
-payload_hash = hashlib.sha256(body.encode()).hexdigest()
-
-signed_headers = "content-type;host;x-amz-content-sha256;x-amz-date"
-canonical = (
-    "POST\n/\n\n"
-    f"content-type:application/x-www-form-urlencoded\nhost:{host}\n"
-    f"x-amz-content-sha256:{payload_hash}\nx-amz-date:{stamp}\n"
-    f"\n{signed_headers}\n{payload_hash}"
-)
-scope = f"{datestamp}/{REGION}/{SERVICE}/aws4_request"
-to_sign = (f"AWS4-HMAC-SHA256\n{stamp}\n{scope}\n"
-           f"{hashlib.sha256(canonical.encode()).hexdigest()}")
-
-def sign(k, m):
-    return hmac.new(k, m.encode(), hashlib.sha256).digest()
-
-signing_key = sign(sign(sign(sign(f"AWS4{SECRET}".encode(), datestamp), REGION),
-                        SERVICE), "aws4_request")
-signature = hmac.new(signing_key, to_sign.encode(), hashlib.sha256).hexdigest()
-
-req = urllib.request.Request(
-    ENDPOINT + "/", data=body.encode(), method="POST",
-    headers={"Content-Type": "application/x-www-form-urlencoded", "Host": host,
-             "X-Amz-Content-Sha256": payload_hash, "X-Amz-Date": stamp,
-             "Authorization": (f"AWS4-HMAC-SHA256 Credential={KEY}/{scope}, "
-                               f"SignedHeaders={signed_headers}, Signature={signature}")})
-try:
-    raw = urllib.request.urlopen(req, timeout=30).read()
-except (urllib.error.URLError, OSError) as e:
-    detail = e.read().decode(errors="replace")[:500] if hasattr(e, "read") else e
-    raise SystemExit(f"ERROR minting the MinIO STS session at {ENDPOINT}: {detail}")
-
-ns = {"s": "https://sts.amazonaws.com/doc/2011-06-15/"}
-creds = ET.fromstring(raw).find(".//s:Credentials", ns)
-if creds is None:
-    raise SystemExit("ERROR minting the MinIO STS session: response carried no "
-                     f"Credentials element: {raw.decode(errors='replace')[:500]}")
-triple = [creds.findtext(f"s:{f}", namespaces=ns)
-          for f in ("AccessKeyId", "SecretAccessKey", "SessionToken")]
-if not all(triple):
-    raise SystemExit("ERROR minting the MinIO STS session: incomplete credential triple")
-print(" ".join(triple))
-print(f"  session expires {creds.findtext('s:Expiration', namespaces=ns)}", file=sys.stderr)
-PY
+  docker run --rm --network "$NETWORK" \
+    -e AWS_ACCESS_KEY_ID=lhassumebase -e AWS_SECRET_ACCESS_KEY=lhassumebasesecret123 \
+    -e AWS_DEFAULT_REGION=us-east-1 "$AWS_CLI_IMAGE" \
+    --endpoint-url "$S3_ENDPOINT" sts assume-role \
+    --role-arn arn:aws:iam::000000000000:role/LakehouseReader \
+    --role-session-name lakehouse-unity-e2e --duration-seconds 43200 \
+    --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text
 )
 read -r STS_ACCESS_KEY STS_SECRET_KEY STS_SESSION_TOKEN <<<"$STS_TRIPLE"
 

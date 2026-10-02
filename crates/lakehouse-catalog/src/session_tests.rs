@@ -245,6 +245,113 @@ async fn non_sigv4_no_config_prefix_yields_empty_not_warehouse() {
     );
 }
 
+/// A minimal `LoadTableResult` a `loadTable` GET deserializes.
+const LOAD_TABLE_BODY: &str = r#"{
+  "metadata-location": "s3://warehouse/db/events/metadata/v1.json",
+  "metadata": {
+    "format-version": 2,
+    "table-uuid": "00000000-0000-0000-0000-000000000001",
+    "location": "s3://warehouse/db/events",
+    "last-sequence-number": 0,
+    "last-updated-ms": 0,
+    "last-column-id": 0,
+    "current-schema-id": 0,
+    "schemas": [{"type": "struct", "schema-id": 0, "fields": []}],
+    "default-spec-id": 0,
+    "partition-specs": [{"spec-id": 0, "fields": []}],
+    "last-partition-id": 0,
+    "sort-orders": [{"order-id": 0, "fields": []}],
+    "default-sort-order-id": 0
+  },
+  "config": {}
+}"#;
+
+/// An empty `list_tables` and `list_namespaces` page, ending the enumeration after one level.
+const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
+
+/// Scenario: Session credentials sign every SigV4 catalog request
+#[tokio::test]
+async fn assumed_session_signs_load_table_and_namespace_enumeration() {
+    const WAREHOUSE: &str = "123456789012";
+    const BASE_AK: &str = "AKIABASEIDENTITY";
+
+    for vending in [false, true] {
+        let (sts, _sts_heads) = spawn_recording_sts(200, ASSUME_ROLE_RESPONSE).await;
+        let (load_table_uri, load_table_heads) = spawn_recording_catalog(LOAD_TABLE_BODY).await;
+        let (enumeration_uri, enumeration_heads) = spawn_recording_catalog(EMPTY_LISTING).await;
+        let stated = ConnectionCreds {
+            warehouse: WAREHOUSE.into(),
+            access_key: BASE_AK.into(),
+            use_sigv4: true,
+            use_vended_credentials: vending,
+            aws_assume_role_arn: Some("arn:aws:iam::123456789012:role/lakehouse-reader".into()),
+            aws_sts_endpoint: Some(sts),
+            ..base_creds()
+        };
+
+        let session_creds = crate::resolve_aws_identity(stated, &load_table_uri, true)
+            .await
+            .expect("the stub answers a well-formed AssumeRoleResponse");
+        let session = CatalogSession::resolve(&load_table_uri, WAREHOUSE, &session_creds)
+            .await
+            .expect("a SigV4 session resolves without any network access");
+        let catalog = CatalogProps {
+            warehouse: WAREHOUSE.into(),
+            table: "db.events".into(),
+        };
+        load_table_any_auth(&session, &catalog, &session_creds)
+            .await
+            .expect("the session-signed loadTable must succeed");
+        crate::namespace::list_namespace_tables(
+            &enumeration_uri,
+            &["db".to_string()],
+            &static_backend(),
+            &session_creds,
+        )
+        .await
+        .expect("the session-signed enumeration must succeed");
+
+        let load_table_heads = load_table_heads.lock().unwrap();
+        let [load_table] = load_table_heads.as_slice() else {
+            panic!(
+                "exactly one loadTable request, got {}",
+                load_table_heads.len()
+            );
+        };
+        let enumeration_heads = enumeration_heads.lock().unwrap();
+        assert!(
+            !enumeration_heads.is_empty(),
+            "the enumeration must send a request"
+        );
+        for head in std::iter::once(load_table).chain(enumeration_heads.iter()) {
+            let authorization = authorization_header(head).expect("every request must be signed");
+            assert!(
+                authorization.contains(&format!("Credential={SESSION_AK}/"))
+                    && authorization.contains("/glue/aws4_request"),
+                "signed by the session key for Glue: {authorization}"
+            );
+            assert!(
+                !authorization.contains(BASE_AK),
+                "never signed by the base key pair: {authorization}"
+            );
+            assert_eq!(
+                header_value(head, "x-amz-security-token"),
+                Some(SESSION_TOKEN)
+            );
+            let request_line = head.lines().next().unwrap_or_default();
+            assert!(
+                request_line.contains(&format!("/v1/catalogs/{WAREHOUSE}/")),
+                "the catalogs/<warehouse> prefix is unchanged by the role: {request_line}"
+            );
+        }
+        assert_eq!(
+            header_value(load_table, "x-iceberg-access-delegation"),
+            vending.then_some("vended-credentials"),
+            "a role leaves the access-delegation header to use_vended_credentials={vending}"
+        );
+    }
+}
+
 #[tokio::test]
 async fn catalog_session_resolve_sigv4_no_config_roundtrip() {
     let catalog_uri = "https://glue.us-east-1.amazonaws.com/iceberg";

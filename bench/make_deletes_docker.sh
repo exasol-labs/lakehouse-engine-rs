@@ -50,14 +50,14 @@ SPARK_CONF=(
   --conf spark.sql.catalog.rest_catalog.uri=http://iceberg-rest:8181
   --conf spark.sql.catalog.rest_catalog.warehouse=s3://warehouse/
   --conf spark.sql.catalog.rest_catalog.io-impl=org.apache.iceberg.aws.s3.S3FileIO
-  --conf spark.sql.catalog.rest_catalog.s3.endpoint=http://minio:9000
+  --conf spark.sql.catalog.rest_catalog.s3.endpoint=http://seaweedfs:8333
   --conf spark.sql.catalog.rest_catalog.s3.path-style-access=true
-  --conf spark.sql.catalog.rest_catalog.s3.access-key-id=minioadmin
-  --conf spark.sql.catalog.rest_catalog.s3.secret-access-key=minioadmin
+  --conf spark.sql.catalog.rest_catalog.s3.access-key-id=lhadmin
+  --conf spark.sql.catalog.rest_catalog.s3.secret-access-key=lhadminsecret123
   --conf spark.sql.defaultCatalog=rest_catalog
-  --conf spark.hadoop.fs.s3a.endpoint=http://minio:9000
-  --conf spark.hadoop.fs.s3a.access.key=minioadmin
-  --conf spark.hadoop.fs.s3a.secret.key=minioadmin
+  --conf spark.hadoop.fs.s3a.endpoint=http://seaweedfs:8333
+  --conf spark.hadoop.fs.s3a.access.key=lhadmin
+  --conf spark.hadoop.fs.s3a.secret.key=lhadminsecret123
   --conf spark.hadoop.fs.s3a.path.style.access=true
 )
 

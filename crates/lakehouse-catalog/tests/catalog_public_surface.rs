@@ -13,7 +13,7 @@ use lakehouse_catalog::{
     IcebergRestCatalogClient, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend,
     StorageCreds, StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
     load_table_any_auth, parse_table_ident, redact_credentials, redact_secret_values,
-    resolve_uc_vended_storage, resolve_vended_storage,
+    resolve_aws_identity, resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 const CATALOG_SOURCES: &[(&str, &str)] = &[
@@ -27,6 +27,7 @@ const CATALOG_SOURCES: &[(&str, &str)] = &[
     ("session.rs", include_str!("../src/session.rs")),
     ("sigv4.rs", include_str!("../src/sigv4.rs")),
     ("storage.rs", include_str!("../src/storage.rs")),
+    ("sts.rs", include_str!("../src/sts.rs")),
     ("vended.rs", include_str!("../src/vended.rs")),
     ("unity/mod.rs", include_str!("../src/unity/mod.rs")),
     ("unity/auth.rs", include_str!("../src/unity/auth.rs")),
@@ -60,6 +61,7 @@ fn connection_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
 
@@ -264,6 +266,34 @@ fn connection_creds_sigv4_signing_region_is_reachable() {
         creds.sigv4_signing_region("https://glue.eu-west-1.amazonaws.com/iceberg");
 
     assert_eq!(region.as_deref(), Some("eu-west-1"));
+}
+
+/// Scenario: The AWS identity resolver extends the crate's public surface through an explicit reviewed edit
+#[tokio::test]
+async fn aws_identity_resolver_is_public() {
+    let stated = ConnectionCreds {
+        aws_assume_role_arn: None,
+        aws_external_id: None,
+        aws_sts_endpoint: Some("https://sts.eu-west-1.amazonaws.com".into()),
+        ..connection_creds()
+    };
+
+    let resolved: Result<ConnectionCreds, UdfError> =
+        resolve_aws_identity(stated, "http://catalog", false).await;
+
+    let resolved = resolved.expect("a set naming no role resolves without any STS request");
+    assert_eq!(resolved.access_key, "minioadmin");
+    assert_eq!(
+        resolved.aws_sts_endpoint.as_deref(),
+        Some("https://sts.eu-west-1.amazonaws.com")
+    );
+
+    for (name, source) in CATALOG_SOURCES {
+        assert!(
+            !source.contains("lakehouse_engine"),
+            "{name} must not name the engine crate — the dependency runs engine to catalog only"
+        );
+    }
 }
 
 #[test]

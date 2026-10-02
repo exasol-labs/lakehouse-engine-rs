@@ -1,6 +1,6 @@
 //! All tests share one virtual schema, so they must run serially (`--test-threads=1`).
 //! The OSS Unity Catalog server has authorization disabled and vends no S3 endpoint, so the
-//! CONNECTION carries no catalog-auth field but does carry MinIO's endpoint and static keys.
+//! CONNECTION carries no catalog-auth field but does carry SeaweedFS's endpoint and static keys.
 #![cfg(feature = "unity-e2e")]
 
 mod common;
@@ -13,8 +13,10 @@ use common::e2e_harness::{
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::write_parquet_fixture;
 use common::stack::{
-    self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
-    local_stack_connection_password, wait_for_exasol, wait_for_minio, wait_for_url,
+    self, ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
+    ASSUME_ROLE_EXTERNAL_ID, CatalogConnectionPassword, build_create_connection_sql, exasol_host,
+    exasol_sql_port, local_stack_connection_password, wait_for_exasol, wait_for_seaweedfs,
+    wait_for_url,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -76,7 +78,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_unity_catalog();
 
         install_slc();
@@ -87,6 +89,7 @@ fn setup() {
         seed_sales_parquet_table();
 
         create_unity_virtual_schema(&mut conn);
+        create_unity_role_virtual_schema(&mut conn);
     });
 }
 
@@ -102,6 +105,41 @@ fn create_unity_virtual_schema(conn: &mut ExaConn) {
         r#"CREATE VIRTUAL SCHEMA {VS_NAME}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION = '{CONN_NAME}'
+  CATALOG_KIND       = 'UNITY_CATALOG'
+  NAMESPACE  = '{UNITY_NAMESPACE}'
+  ALLOW_HTTP         = 'true'"#
+    ));
+}
+
+/// A second Virtual Schema over the SAME seeded `unity.delta_e2e` namespace.
+const VS_ROLE_NAME: &str = "UNITY_DELTA_ROLE_VS";
+/// Catalog CONNECTION carrying the assume-role identity instead of static keys.
+const CONN_ROLE_NAME: &str = "UNITY_ROLE_CATALOG_CREDS";
+
+/// A CONNECTION with no `use_vended_credentials` that instead names the
+/// assume-role identity: the base key pair, the role,
+/// its external id, and SeaweedFS's own STS as `aws_sts_endpoint`.
+fn create_unity_role_virtual_schema(conn: &mut ExaConn) {
+    let password = CatalogConnectionPassword {
+        access_key: ASSUME_ROLE_BASE_ACCESS_KEY.to_string(),
+        secret_key: ASSUME_ROLE_BASE_SECRET_KEY.to_string(),
+        aws_assume_role_arn: Some(ASSUME_ROLE_ARN.to_string()),
+        aws_external_id: Some(ASSUME_ROLE_EXTERNAL_ID.to_string()),
+        aws_sts_endpoint: Some(stack::seaweedfs_url_internal()),
+        ..local_stack_connection_password()
+    };
+    let create_conn_sql =
+        build_create_connection_sql(CONN_ROLE_NAME, UNITY_CATALOG_URI_INTERNAL, &password);
+    conn.execute(&create_conn_sql);
+
+    let _ = conn.try_execute(&format!(
+        "DROP VIRTUAL SCHEMA IF EXISTS {VS_ROLE_NAME} CASCADE"
+    ));
+
+    conn.execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {VS_ROLE_NAME}
+USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
+  CATALOG_CONNECTION = '{CONN_ROLE_NAME}'
   CATALOG_KIND       = 'UNITY_CATALOG'
   NAMESPACE  = '{UNITY_NAMESPACE}'
   ALLOW_HTTP         = 'true'"#
@@ -308,10 +346,10 @@ fn unity_catalog_url() -> String {
 fn delta_creds(use_vended_credentials: bool) -> ConnectionCreds {
     ConnectionCreds {
         warehouse: String::new(),
-        endpoint: stack::minio_url(),
+        endpoint: stack::seaweedfs_url(),
         region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
+        access_key: "lhadmin".to_string(),
+        secret_key: "lhadminsecret123".to_string(),
         session_token: None,
         path_style: Some(true),
         use_sigv4: false,
@@ -324,6 +362,7 @@ fn delta_creds(use_vended_credentials: bool) -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
 
@@ -409,7 +448,7 @@ fn rt() -> tokio::runtime::Runtime {
 
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
-    wait_for_minio();
+    wait_for_seaweedfs();
     wait_for_unity_catalog();
 
     let rt = rt();
@@ -473,7 +512,7 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
 /// Scenario: Pruning reaches every request shape and changes no result end to end
 #[test]
 fn unity_delta_filters_prune_the_resolved_file_list() {
-    wait_for_minio();
+    wait_for_seaweedfs();
     wait_for_unity_catalog();
 
     let rt = rt();
@@ -594,6 +633,32 @@ fn unity_delta_delete_free_table_returns_its_rows() {
         "SELECT ID, \"VALUE\" FROM {}",
         table_ref("MULTI_PART_STATS")
     ));
+    assert_eq!(cols.len(), 2, "expected ID, VALUE columns: {cols:?}");
+    assert_eq!(
+        cols[0].len(),
+        5,
+        "SELECT must return the same 5 rows COUNT(*) reports: {cols:?}"
+    );
+    assert!(
+        cols.iter().all(|col| col.iter().all(|v| !v.is_null())),
+        "a delete-free table's rows must carry real column values, not NULL: {cols:?}"
+    );
+}
+
+/// Scenario: A Unity Catalog CONNECTION with static keys naming the role reads a Delta table through the session
+#[test]
+fn unity_role_connection_reads_a_delta_table_through_the_session() {
+    setup();
+    let mut conn = exa_conn();
+
+    let role_table = format!("{VS_ROLE_NAME}.MULTI_PART_STATS");
+    let count = conn.query_scalar_i64(&format!("SELECT COUNT(*) FROM {role_table}"));
+    assert_eq!(
+        count, 5,
+        "multi_part_stats' five active data files hold five rows in total"
+    );
+
+    let cols = conn.query_columns(&format!("SELECT ID, \"VALUE\" FROM {role_table}"));
     assert_eq!(cols.len(), 2, "expected ID, VALUE columns: {cols:?}");
     assert_eq!(
         cols[0].len(),
@@ -944,7 +1009,7 @@ fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
          type-mapping error: {msg}"
     );
     assert!(
-        !msg.to_lowercase().contains("minioadmin"),
+        !msg.to_lowercase().contains("lhadminsecret123"),
         "{table}'s error text must not contain a credential value: {msg}"
     );
 
@@ -1127,7 +1192,7 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
              types: {msg}"
         );
         assert!(
-            !msg.to_lowercase().contains("minioadmin"),
+            !msg.to_lowercase().contains("lhadminsecret123"),
             "{column}'s error text must not contain a credential value: {msg}"
         );
     }

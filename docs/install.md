@@ -176,7 +176,7 @@ creation, and the smoke test.
 ## Point the VS at your data
 
 Two statements finish the install: a catalog `CONNECTION`, then the Virtual Schema over it. The
-following example is a complete local setup with MinIO and an Iceberg REST catalog, run as a DBA.
+following example is a complete local setup with SeaweedFS and an Iceberg REST catalog, run as a DBA.
 A non-DBA needs `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts, plus
 `EXECUTE ON SCRIPT` on all three of `LAKEHOUSE_ADAPTER`, `LAKEHOUSE_SCAN`, and
 `LAKEHOUSE_DISTRIBUTE_FILES`, before `CREATE VIRTUAL SCHEMA` — see [Security](security.md).
@@ -190,10 +190,10 @@ CREATE OR REPLACE CONNECTION LAKEHOUSE_CATALOG_CREDS
   USER ''
   IDENTIFIED BY '{
     "warehouse":  "s3://warehouse/",
-    "endpoint":   "http://minio:9000",
+    "endpoint":   "http://seaweedfs:8333",
     "region":     "us-east-1",
-    "access_key": "minioadmin",
-    "secret_key": "minioadmin",
+    "access_key": "lhadmin",
+    "secret_key": "lhadminsecret123",
     "path_style": true
   }';
 
@@ -205,7 +205,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 ```
 
 `NAMESPACE` exposes **every table in that namespace** as a virtual table. `ALLOW_HTTP =
-'true'` permits plain-HTTP catalog and S3 access. Local MinIO needs this property.
+'true'` permits plain-HTTP catalog and S3 access. Local SeaweedFS needs this property.
 
 - **AWS Glue, Lakekeeper, Unity Catalog (Delta tables), and the full credential-JSON reference** are in [Catalogs](catalogs.md).
 - **Tuning properties** (`PARALLELISM_FACTOR`, memory pool sizing, DataFusion partitions/threads,
@@ -229,11 +229,11 @@ matrix, see [Capabilities](capabilities.md).
 
 The adapter UDF runs **inside** the Exasol container. Every address in the CONNECTION and in the
 VS properties must resolve from there. Use internal hostnames, for example `iceberg-rest` and
-`minio`. Never use `localhost` or the Docker host gateway.
+`seaweedfs`. Never use `localhost` or the Docker host gateway.
 
 ## Local dev stack
 
-For an evaluation or a throwaway environment, use `docker-compose.yml`. It starts Exasol, MinIO,
+For an evaluation or a throwaway environment, use `docker-compose.yml`. It starts Exasol, SeaweedFS,
 and an Iceberg REST catalog:
 
 ```sh
@@ -244,7 +244,7 @@ These are the default host ports. Environment variables override them.
 
 - Exasol SQL `28563`
 - BucketFS `22581`
-- MinIO `19000`
+- SeaweedFS `19000`
 - Iceberg REST `18181`
 
 You can reach this local Exasol from your machine. Install to it with the
@@ -267,7 +267,7 @@ Port overrides (host side). The defaults match `docker-compose.yml`:
 |---|---|---|
 | `LH_EXASOL_PORT` | `28563` | Exasol SQL |
 | `LH_BUCKETFS_PORT` | `22581` | BucketFS |
-| `LH_MINIO_PORT` | `19000` | MinIO S3 |
+| `LH_SEAWEEDFS_PORT` | `19000` | SeaweedFS S3 |
 | `LH_REST_PORT` | `18181` | Iceberg REST |
 
 ---

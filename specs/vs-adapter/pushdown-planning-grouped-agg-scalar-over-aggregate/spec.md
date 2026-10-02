@@ -40,7 +40,7 @@ undecomposable-shape-fallback scenarios shared by every grouped-aggregate pushdo
 
 ### Scenario: Single-table grouped select item that is a scalar function wrapping aggregates is pushed down
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a single-table grouped `pushdown` request (`aggregationType: "group_by"`, non-empty `groupBy`) whose select list contains a select item that is a scalar function wrapping one or more aggregates — e.g. `ROUND(100.0 * SUM(CASE WHEN L_RETURNFLAG = 'R' THEN 1 ELSE 0 END) / COUNT(*), 2)` — alongside a group key `L_RETURNFLAG` and plain aggregates `SUM(L_QUANTITY)` and `AVG(L_EXTENDEDPRICE)`
 * *WHEN* Exasol sends the `pushdown` request
 * *THEN* the adapter SHALL NOT decline the request and SHALL NOT return an error for the scalar-over-aggregate select item

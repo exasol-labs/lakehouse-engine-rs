@@ -1,7 +1,7 @@
 # Feature: End-to-End Harness
 
 End-to-end test suite that exercises the full lakehouse VS query path — from Exasol SQL
-through the adapter and scan UDF to Iceberg Parquet files in MinIO — verifying
+through the adapter and scan UDF to Iceberg Parquet files in SeaweedFS — verifying
 correctness of projection, filter, and Iceberg file-pruning pushdown against a local
 Exasol Docker container. The harness installs `LAKEHOUSE_SCAN` as a SCALAR EMIT script
 and `LAKEHOUSE_DISTRIBUTE_FILES` as a LUA SET distributor script. See
@@ -12,8 +12,8 @@ scenarios.
 
 * **The new binary MUST be added to the `test-e2e` make target.** That target enumerates its test
   binaries explicitly, so a new E2E binary that is not listed never runs in the suite gate.
-* Every E2E scenario runs against a local Exasol Docker container over MinIO and MUST fail (never skip) when the stack is unavailable.
-* All E2E tests run against a local Exasol Docker container with MinIO and the Iceberg REST catalog.
+* Every E2E scenario runs against a local Exasol Docker container over SeaweedFS and MUST fail (never skip) when the stack is unavailable.
+* All E2E tests run against a local Exasol Docker container with SeaweedFS and the Iceberg REST catalog.
 * All DSN/connection strings MUST include `validateservercertificate=0`.
 * See `e2e-harness/e2e-harness-grouped-order` for grouped-aggregate cases that deliberately
   place an aggregate before, between, or after the group keys in the `selectList` — the
@@ -70,7 +70,7 @@ scenarios.
 * *THEN* the harness SHALL create `LAKEHOUSE_SCAN` as a SCALAR SCRIPT (EMITS its dynamic output columns) referencing the uploaded `.so`
 * *AND* the harness SHALL create `LAKEHOUSE_DISTRIBUTE_FILES` as a LUA SET SCRIPT that passes each shard's `files` VARCHAR through unchanged, referencing no `.so`
 * *AND* an end-to-end projection/filter query over the installed scripts SHALL return results identical to the single-node DataFusion equivalent (grouped/nested-aggregate coverage lives in `e2e-harness/e2e-harness-grouped-agg`)
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: Every E2E binary provisions the scan path from one shared harness definition
 
@@ -81,7 +81,7 @@ scenarios.
 * *AND* the shared definition SHALL issue `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` for both scripts to `CURRENT_USER` after the last `CREATE OR REPLACE` of either object (both drop the grant), skipping `SYS` (Exasol refuses it; DBA holds all CONNECTIONs implicitly)
 * *AND* the per-binary Virtual Schema properties that vary (VS name, the namespace property, catalog CONNECTION name, `PARALLELISM_FACTOR`, `JOIN_BROADCAST_MAX_BYTES`, `CATALOG_KIND`, and `MERGE_SCHEMA`) SHALL be supplied as explicit parameters rather than by re-declaring the provisioning logic, SUPERSEDING the recorded list, which named an Iceberg namespace and omitted the two catalog-kind-dependent properties
 * *AND* a parameter a binary does not supply SHALL be OMITTED from the generated `CREATE VIRTUAL SCHEMA` rather than emitted empty, so an Iceberg binary's DDL is byte-identical to the one it generates today and no existing binary's assertions change
-* *AND* an end-to-end query through any binary's Virtual Schema SHALL return results identical to the single-node DataFusion equivalent, and the affected tests MUST fail (not skip) when the Exasol Docker container or MinIO is unavailable
+* *AND* an end-to-end query through any binary's Virtual Schema SHALL return results identical to the single-node DataFusion equivalent, and the affected tests MUST fail (not skip) when the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: A least-privilege user queries the VS and recovers no credential from the plan
 
@@ -99,7 +99,7 @@ scenarios.
 * *THEN* the statement SHALL carry `resultSetMaxRows` `0` — Exasol's own documented "no limit" default
 * *AND* the scan spec the adapter generates for that statement MUST NOT carry a `limit`
 * *AND* the statement SHALL return every seeded row that satisfies it, never a truncated prefix
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: A declared row cap truncates the returned row count
 
@@ -108,7 +108,7 @@ scenarios.
 * *THEN* the cap-declaring connection SHALL return exactly `n` rows
 * *AND* the no-cap connection SHALL return the table's full row count
 * *AND* this scenario SHALL NOT be read as a claim about the pushdown request either connection generates — `EXPLAIN VIRTUAL` cannot observe whether a real execution's request carries a `limit`, since it is a separate exchange from the real statement; see `docs/debugging-pushdown.md` for what is actually known about that request
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: Harness returns every row of a result set larger than one fetch response
 
@@ -117,7 +117,7 @@ scenarios.
 * *THEN* the helper SHALL issue successive `fetch` requests until the rows it has accumulated reach the count the result-set metadata reports in `numRows`
 * *AND* the helper SHALL return exactly that row count
 * *AND* the helper MUST NOT return a silently truncated column set — it SHALL fail loudly if a response returns zero rows while rows remain outstanding
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: The E2E suite gates on both supported Exasol major versions
 
@@ -142,4 +142,4 @@ scenarios.
 * *THEN* the isolated statement SHALL be self-contained and schema-qualified: it SHALL name the scan and distributor scripts under the script schema, and SHALL carry the table root, the projection, the filter, and the per-shard file list as plaintext literals
 * *AND* Exasol SHALL reject the submitted statement with an error naming insufficient privilege to CALL the script, rather than an unresolved object, a syntax fault, or a missing CONNECTION grant, and that error MUST NOT carry the CONNECTION's `access_key` or `secret_key` VALUES
 * *AND* the reader's ordinary virtual-schema query SHALL still return the owner's rows after the rejection, so the denial SHALL be scoped to DIRECT script invocation and SHALL NOT disturb the delegated scan the engine performs for the reader
-* *AND* the test MUST fail (not skip) when the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) when the Exasol Docker container or SeaweedFS is unavailable

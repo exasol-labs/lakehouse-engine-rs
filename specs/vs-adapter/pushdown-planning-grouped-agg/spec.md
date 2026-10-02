@@ -84,7 +84,7 @@ credential-exposure guarantee on this path's generated SQL.
 
 ### Scenario: Grouped aggregate query is detected and translated to a grouped scan spec
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a query whose select list contains supported aggregate functions and a non-empty GROUP BY clause
 * *WHEN* Exasol sends the corresponding `pushdown` request with `aggregationType: "group_by"`
 * *THEN* the adapter SHALL recognise the request as a grouped aggregate query and render each GROUP BY expression node to a DataFusion SQL fragment using the VS expression translator

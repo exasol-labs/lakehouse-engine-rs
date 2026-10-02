@@ -9,6 +9,8 @@ and the Unity Catalog reuse of these auth fields is specified by the sibling fea
 `connection-credentials-unity-catalog`. The AWS Glue SigV4 catalog-signing requirement —
 `access_key`, `secret_key`, a signing region, and the standard-AWS-Glue-endpoint region
 derivation — is specified by the sibling feature `connection-credentials-sigv4`.
+The sibling feature `connection-credentials-assume-role` specifies AWS IAM role assumption:
+`aws_assume_role_arn`, `aws_external_id`, and `aws_sts_endpoint`.
 
 ## Background
 
@@ -105,8 +107,8 @@ path, specified by the sibling feature `connection-credentials-sigv4`. `endpoint
 * *GIVEN* a CONNECTION password that supplies `warehouse` but omits the optional `endpoint`, `region`, `access_key`, `secret_key`, `session_token`, `path_style`, `use_sigv4`, `use_vended_credentials`, `token`, `client_id`, `client_secret`, `oauth2_server_uri`, `scope`, `account_name`, `account_key`, and `sas_token` fields
 * *WHEN* the adapter builds the storage and catalog configuration
 * *THEN* the adapter SHALL treat `endpoint`, `region`, `access_key`, `secret_key`, `session_token`, `token`, `client_id`, `client_secret`, `oauth2_server_uri`, `scope`, `account_name`, `account_key`, and `sas_token` as absent
-* *AND* the adapter SHALL default `use_sigv4` and `use_vended_credentials` to false so existing static-S3 MinIO/REST stacks behave exactly as before
-* *AND* the adapter SHALL treat an omitted `path_style` as UNSTATED rather than as a value, and `storage_block` SHALL resolve an unstated `path_style` to `false`, so a CONNECTION naming a `region` and no `endpoint` addresses its bucket virtual-hosted exactly as an AWS S3 client does — SUPERSEDING the recorded clause "the adapter SHALL apply the supplied `path_style` value (defaulting to a value that preserves existing MinIO behaviour)", whose `true` default is the defect issue [#130](https://github.com/exasol-labs/lakehouse-engine-rs/issues/130) reports
+* *AND* the adapter SHALL default `use_sigv4` and `use_vended_credentials` to false so existing static-S3 SeaweedFS/REST stacks behave exactly as before
+* *AND* the adapter SHALL treat an omitted `path_style` as UNSTATED rather than as a value, and `storage_block` SHALL resolve an unstated `path_style` to `false`, so a CONNECTION naming a `region` and no `endpoint` addresses its bucket virtual-hosted exactly as an AWS S3 client does — SUPERSEDING the recorded clause "the adapter SHALL apply the supplied `path_style` value (defaulting to a value that preserves existing SeaweedFS behaviour)", whose `true` default is the defect issue [#130](https://github.com/exasol-labs/lakehouse-engine-rs/issues/130) reports
 * *AND* a CONNECTION that supplies `path_style` SHALL have that exact value applied on this path, so a path-style store is reached by stating `path_style: true` rather than by relying on a default
 * *AND* the backend `storage_block` builds from this CONNECTION SHALL be the S3 variant, unchanged from before this delta, because S3 stays the no-static-storage-fields default and a CONNECTION that names no Azure field describes no Azure backend
 * *AND* this SHALL hold whether or not `use_vended_credentials` is set, so an existing vended-S3 CONNECTION that supplies no static storage field at all yields exactly the backend it yielded before
@@ -117,7 +119,7 @@ path, specified by the sibling feature `connection-credentials-sigv4`. `endpoint
 * *GIVEN* a CONNECTION whose JSON password supplies a non-empty `warehouse` and a non-empty `endpoint`, omits `path_style`, and omits `use_vended_credentials` or sets it to false
 * *WHEN* the adapter resolves the connection
 * *THEN* the adapter SHALL return an error naming `path_style` and stating that a CONNECTION configuring a store `endpoint` MUST state `path_style`
-* *AND* the error message SHALL state that `true` reaches a path-style store such as MinIO or Ceph and `false` addresses the bucket virtual-hosted, so the operator can choose without reading the source
+* *AND* the error message SHALL state that `true` reaches a path-style store such as SeaweedFS or Ceph and `false` addresses the bucket virtual-hosted, so the operator can choose without reading the source
 * *AND* the adapter SHALL accept the same CONNECTION once it states `path_style`, under EITHER value
 * *AND* the adapter MUST NOT apply this guard when `use_vended_credentials` is true or when the CONNECTION supplies no `endpoint`
 * *AND* the error message MUST NOT contain any supplied credential value

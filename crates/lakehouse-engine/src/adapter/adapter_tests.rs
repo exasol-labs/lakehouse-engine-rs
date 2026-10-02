@@ -1,5 +1,6 @@
 use super::*;
 use exasol_udf_sdk::test_support::{DefaultsCtx, TestContext};
+use std::sync::{Arc, Mutex};
 
 #[path = "parquet_fixture_tests.rs"]
 pub(super) mod parquet_fixture;
@@ -1565,12 +1566,29 @@ fn resolve_s3_max_connections_auto_one_core_yields_one_threads_share() {
 }
 
 fn resolved_for(password: Json) -> ResolvedConnectionConfig {
+    resolve_config_over(
+        "http://catalog.example.com",
+        &password,
+        &serde_json::json!({"CATALOG_CONNECTION": "MY_CONN"}),
+    )
+    .expect("the fixture password must be an acceptable CONNECTION")
+}
+
+/// `resolve_connection_config` over a `MY_CONN` CONNECTION, on a runtime of its own as each entry point builds one.
+fn resolve_config_over(
+    address: &str,
+    password: &Json,
+    props: &Json,
+) -> Result<ResolvedConnectionConfig, UdfError> {
     let ctx = TestContext::scalar(vec![]).with_connection(
         "MY_CONN",
-        password_connection("http://catalog.example.com", password.to_string()),
+        password_connection(address, password.to_string()),
     );
-    resolve_connection_config(&ctx, &serde_json::json!({"CATALOG_CONNECTION": "MY_CONN"}))
-        .expect("the fixture password must be an acceptable CONNECTION")
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build the request runtime");
+    resolve_connection_config(&ctx, props, &rt)
 }
 
 #[test]
@@ -1580,4 +1598,385 @@ fn resolved_config_carries_the_catalog_connection_name() {
         "access_key": "AK", "secret_key": "SK",
     }));
     assert_eq!(config.connection_name, "MY_CONN");
+}
+
+const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
+const BASE_AK: &str = "AKIABASEIDENTITY";
+const BASE_SK: &str = "BASE_SECRET_SENTINEL";
+const EXTERNAL_ID: &str = "EXTERNAL_ID_SENTINEL";
+const SESSION_AK: &str = "ASIASESSIONKEYSENTINEL";
+const SESSION_SK: &str = "SESSION_SECRET_SENTINEL";
+const SESSION_TOKEN: &str = "SESSION_TOKEN_SENTINEL";
+
+const ASSUME_ROLE_RESPONSE: &str = r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleResult>
+    <Credentials>
+      <AccessKeyId>ASIASESSIONKEYSENTINEL</AccessKeyId>
+      <SecretAccessKey>SESSION_SECRET_SENTINEL</SecretAccessKey>
+      <SessionToken>SESSION_TOKEN_SENTINEL</SessionToken>
+      <Expiration>2026-09-28T13:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleResult>
+</AssumeRoleResponse>"#;
+
+const ACCESS_DENIED_RESPONSE: &str = r#"<ErrorResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <Error>
+    <Type>Sender</Type>
+    <Code>AccessDenied</Code>
+    <Message>User is not authorized to perform: sts:AssumeRole</Message>
+  </Error>
+</ErrorResponse>"#;
+
+/// An empty namespace enumeration page, so a create lists zero tables and succeeds.
+const EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
+
+/// A loopback server standing in for both AWS STS and the catalog: an
+/// STS-signed request is answered with `sts`, every other request with
+/// `catalog`, and each request head is recorded in arrival order.
+///
+/// It runs on a runtime of its own because `dispatch` blocks on its own
+/// current-thread runtime, which a `#[tokio::test]` would nest.
+struct StsAndCatalog {
+    uri: String,
+    heads: Arc<Mutex<Vec<String>>>,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl StsAndCatalog {
+    fn start(sts: (u16, &'static str), catalog: (u16, &'static str)) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build the stub runtime");
+        let listener = runtime
+            .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+            .expect("bind a loopback port");
+        let uri = format!("http://{}", listener.local_addr().expect("local_addr"));
+        let heads = Arc::new(Mutex::new(Vec::new()));
+        let recorded = heads.clone();
+        runtime.spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let mut head = Vec::new();
+                let mut chunk = [0u8; 1024];
+                while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let read = stream.read(&mut chunk).await.unwrap_or(0);
+                    if read == 0 {
+                        break;
+                    }
+                    head.extend_from_slice(&chunk[..read]);
+                }
+                let head = String::from_utf8_lossy(&head).into_owned();
+                let (status, body) = if is_assume_role(&head) {
+                    sts
+                } else {
+                    catalog
+                };
+                recorded.lock().unwrap().push(head);
+                let response = format!(
+                    "HTTP/1.1 {status} Stub\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+            }
+        });
+        Self {
+            uri,
+            heads,
+            _runtime: runtime,
+        }
+    }
+
+    fn heads(&self) -> Vec<String> {
+        self.heads.lock().unwrap().clone()
+    }
+
+    fn sts_requests(&self) -> usize {
+        self.heads()
+            .iter()
+            .filter(|head| is_assume_role(head))
+            .count()
+    }
+
+    fn catalog_requests(&self) -> Vec<String> {
+        self.heads()
+            .into_iter()
+            .filter(|head| !is_assume_role(head))
+            .collect()
+    }
+}
+
+fn is_assume_role(head: &str) -> bool {
+    head.lines()
+        .any(|line| line.to_ascii_lowercase().contains("/sts/aws4_request"))
+}
+
+fn authorization(head: &str) -> &str {
+    head.lines()
+        .skip(1)
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("authorization")
+                .then(|| value.trim())
+        })
+        .unwrap_or_default()
+}
+
+/// A SigV4 Glue-style CONNECTION whose catalog is `stub`, naming no role.
+fn sigv4_connection(stub: &StsAndCatalog) -> TestContext {
+    TestContext::scalar(vec![]).with_connection(
+        "MY_CONN",
+        password_connection(&stub.uri, sigv4_password().to_string()),
+    )
+}
+
+/// The same CONNECTION naming a role, with `stub` as its STS endpoint too.
+fn sigv4_role_connection(stub: &StsAndCatalog) -> TestContext {
+    let mut password = sigv4_password();
+    password["aws_assume_role_arn"] = ROLE_ARN.into();
+    password["aws_external_id"] = EXTERNAL_ID.into();
+    password["aws_sts_endpoint"] = stub.uri.clone().into();
+    TestContext::scalar(vec![]).with_connection(
+        "MY_CONN",
+        password_connection(&stub.uri, password.to_string()),
+    )
+}
+
+fn sigv4_password() -> Json {
+    serde_json::json!({
+        "warehouse": "123456789012",
+        "region": "us-east-1",
+        "access_key": BASE_AK,
+        "secret_key": BASE_SK,
+        "use_sigv4": true,
+    })
+}
+
+fn role_create_request() -> Json {
+    serde_json::json!({
+        "type": "createVirtualSchema",
+        "properties": {
+            "CATALOG_CONNECTION": "MY_CONN",
+            "NAMESPACE": "db",
+            "ALLOW_HTTP": "true",
+        },
+    })
+}
+
+fn role_join_pushdown_request() -> Json {
+    serde_json::json!({
+        "type": "pushdown",
+        "properties": { "CATALOG_CONNECTION": "MY_CONN", "ALLOW_HTTP": "true" },
+        "involvedTables": [
+            {"name": "CUSTOMER", "columns": [
+                {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            ]},
+            {"name": "ORDERS", "columns": [
+                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            ]},
+        ],
+        "pushdownRequest": {
+            "type": "select",
+            "from": {
+                "type": "join",
+                "join_type": "inner",
+                "left": {"name": "CUSTOMER", "type": "table"},
+                "right": {"name": "ORDERS", "type": "table"},
+                "condition": {
+                    "type": "predicate_equal",
+                    "left": {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                    "right": {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+                },
+            },
+            "selectList": [
+                {"type": "column", "name": "C_CUSTKEY", "tableName": "CUSTOMER"},
+                {"type": "column", "name": "O_CUSTKEY", "tableName": "ORDERS"},
+            ],
+        },
+        "schemaMetadataInfo": {
+            "adapterNotes": serde_json::json!({
+                "TABLE_MAP": {"CUSTOMER": "db.customer", "ORDERS": "db.orders"}
+            }).to_string(),
+        },
+    })
+}
+
+fn assert_signed_by_the_session(requests: &[String]) {
+    assert!(!requests.is_empty(), "the request must reach the catalog");
+    for head in requests {
+        let authorization = authorization(head);
+        assert!(
+            authorization.contains(&format!("Credential={SESSION_AK}/")),
+            "every catalog request must be signed by the session: {head}"
+        );
+        assert!(
+            !head.contains(BASE_AK),
+            "never by the base key pair: {head}"
+        );
+        assert!(
+            head.to_ascii_lowercase().contains(&format!(
+                "x-amz-security-token: {}",
+                SESSION_TOKEN.to_ascii_lowercase()
+            )),
+            "every catalog request must carry the session token: {head}"
+        );
+    }
+}
+
+fn assert_signed_by_the_stated_key_pair(stub: &StsAndCatalog) {
+    assert_eq!(stub.sts_requests(), 0, "{:?}", stub.heads());
+    let catalog_requests = stub.catalog_requests();
+    assert!(
+        !catalog_requests.is_empty(),
+        "the request must reach the catalog"
+    );
+    for head in &catalog_requests {
+        assert!(
+            authorization(head).contains(&format!("Credential={BASE_AK}/")),
+            "a no-role CONNECTION signs with its stated key pair: {head}"
+        );
+    }
+}
+
+fn assert_no_credential_value(message: &str) {
+    for secret in [BASE_SK, EXTERNAL_ID, SESSION_SK, SESSION_TOKEN] {
+        assert!(!message.contains(secret), "{secret} leaked in: {message}");
+    }
+}
+
+/// Scenario: The adapter assumes the role once per request and substitutes the session
+#[test]
+fn assume_role_sends_one_sts_request_per_create_and_per_join_pushdown() {
+    let create = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (200, EMPTY_LISTING));
+    dispatch(&mut sigv4_role_connection(&create), &role_create_request())
+        .expect("a create over an empty namespace succeeds through the session");
+    assert_eq!(create.sts_requests(), 1, "{:?}", create.heads());
+    assert!(
+        is_assume_role(&create.heads()[0]),
+        "STS must precede the catalog"
+    );
+    assert_signed_by_the_session(&create.catalog_requests());
+
+    let join = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (503, "{}"));
+    let err = dispatch(
+        &mut sigv4_role_connection(&join),
+        &role_join_pushdown_request(),
+    )
+    .expect_err("an unavailable catalog fails the join pushdown");
+    assert_eq!(
+        join.sts_requests(),
+        1,
+        "one session for both legs: {:?}",
+        join.heads()
+    );
+    assert!(
+        is_assume_role(&join.heads()[0]),
+        "STS must precede the catalog"
+    );
+    assert_signed_by_the_session(&join.catalog_requests());
+    assert_no_credential_value(&err.to_string());
+}
+
+#[test]
+fn a_connection_without_a_role_sends_no_sts_request() {
+    let create_stub = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (200, EMPTY_LISTING));
+    dispatch(&mut sigv4_connection(&create_stub), &role_create_request())
+        .expect("a no-role create over an empty namespace succeeds");
+    assert_signed_by_the_stated_key_pair(&create_stub);
+
+    let join_stub = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (503, "{}"));
+    dispatch(
+        &mut sigv4_connection(&join_stub),
+        &role_join_pushdown_request(),
+    )
+    .expect_err("an unavailable catalog fails the join pushdown");
+    assert_signed_by_the_stated_key_pair(&join_stub);
+}
+
+/// Scenario: A failed AssumeRole is a credential-safe error
+#[test]
+fn an_sts_denial_fails_the_request_before_any_catalog_request() {
+    for request in [role_create_request(), role_join_pushdown_request()] {
+        let stub = StsAndCatalog::start((403, ACCESS_DENIED_RESPONSE), (200, EMPTY_LISTING));
+        let err = dispatch(&mut sigv4_role_connection(&stub), &request)
+            .expect_err("an STS denial must fail the request");
+
+        let UdfError::User(message) = &err else {
+            panic!("an STS denial must be a user error, got {err:?}");
+        };
+        assert!(message.contains(ROLE_ARN), "{message}");
+        assert!(
+            message.contains("403") && message.contains("AccessDenied"),
+            "{message}"
+        );
+        assert_no_credential_value(message);
+        assert_eq!(stub.sts_requests(), 1, "{:?}", stub.heads());
+        assert!(
+            stub.catalog_requests().is_empty(),
+            "no catalog request may follow a denied AssumeRole: {:?}",
+            stub.heads()
+        );
+    }
+}
+
+#[test]
+fn validation_and_sealing_key_read_the_stated_credentials() {
+    use crate::scan::sealed::{derive_sealed_storage_key, seal_storage, unseal_storage};
+
+    let stub = StsAndCatalog::start((200, ASSUME_ROLE_RESPONSE), (200, EMPTY_LISTING));
+    let props = serde_json::json!({"CATALOG_CONNECTION": "MY_CONN", "ALLOW_HTTP": "true"});
+    let stated = serde_json::json!({
+        "warehouse": "wh",
+        "region": "us-east-1",
+        "access_key": BASE_AK,
+        "secret_key": BASE_SK,
+        "use_vended_credentials": true,
+        "aws_assume_role_arn": ROLE_ARN,
+        "aws_sts_endpoint": stub.uri,
+    });
+
+    let config = resolve_config_over(&stub.uri, &stated, &props)
+        .expect("a role CONNECTION resolves through the stub's session");
+
+    assert_eq!(stub.sts_requests(), 1, "{:?}", stub.heads());
+    assert_eq!(config.creds.access_key, SESSION_AK);
+    assert_eq!(config.creds.secret_key, SESSION_SK);
+    assert_eq!(config.creds.session_token.as_deref(), Some(SESSION_TOKEN));
+    assert_eq!(config.creds.aws_assume_role_arn.as_deref(), Some(ROLE_ARN));
+    assert!(config.creds.use_vended_credentials);
+    let StorageBackend::S3(storage) = &config.storage else {
+        panic!(
+            "a key-pair CONNECTION resolves S3 storage, got {:?}",
+            config.storage
+        );
+    };
+    assert_eq!(storage.access_key, SESSION_AK);
+    assert_eq!(storage.secret_key, SESSION_SK);
+    assert_eq!(storage.session_token.as_deref(), Some(SESSION_TOKEN));
+
+    let key = config
+        .sealed_storage_key
+        .as_ref()
+        .expect("a role CONNECTION always carries key material");
+    let payload = seal_storage(&config.storage, key).expect("seal the effective storage");
+    assert_eq!(
+        unseal_storage(&payload, &derive_sealed_storage_key(&stated.to_string()))
+            .expect("the key must derive from the stated password"),
+        config.storage
+    );
+
+    let mut keyless = stated.clone();
+    keyless.as_object_mut().unwrap().remove("access_key");
+    let err = resolve_config_over(&stub.uri, &keyless, &props)
+        .err()
+        .expect("a stated role CONNECTION without access_key must be rejected");
+    assert!(err.to_string().contains("access_key"), "{err}");
+    assert_eq!(
+        stub.sts_requests(),
+        1,
+        "a rejected CONNECTION must send no STS request: {:?}",
+        stub.heads()
+    );
 }

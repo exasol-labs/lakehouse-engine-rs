@@ -22,6 +22,7 @@ pub(crate) fn base_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
 
@@ -72,6 +73,7 @@ pub(crate) fn creds_no_auth() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
 
@@ -79,20 +81,40 @@ pub(crate) fn creds_no_auth() -> ConnectionCreds {
 pub(crate) async fn spawn_recording_catalog(
     body: &'static str,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_recording_server(200, "application/json", body.into()).await
+}
+
+/// Answers every request with HTTP `status` and the XML `body`, recording each request head as [`spawn_recording_catalog`] does.
+pub(crate) async fn spawn_recording_sts(
+    status: u16,
+    body: impl Into<String>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_recording_server(status, "text/xml", body.into()).await
+}
+
+async fn spawn_recording_server(
+    status: u16,
+    content_type: &'static str,
+    body: String,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a loopback port");
     let base_uri = format!("http://{}", listener.local_addr().expect("local_addr"));
     let heads = Arc::new(Mutex::new(Vec::new()));
     let recorded = heads.clone();
+    let reason = reqwest::StatusCode::from_u16(status)
+        .ok()
+        .and_then(|code| code.canonical_reason())
+        .unwrap_or("Stub");
 
     tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let head = read_request_head(&mut stream).await;
             recorded.lock().unwrap().push(head);
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\
-                 Connection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len()
             );
             let _ = stream.write_all(response.as_bytes()).await;
@@ -116,9 +138,39 @@ async fn read_request_head(stream: &mut TcpStream) -> String {
 }
 
 pub(crate) fn authorization_header(head: &str) -> Option<&str> {
-    head.lines().find_map(|line| {
-        let (name, value) = line.split_once(':')?;
-        name.eq_ignore_ascii_case("authorization")
-            .then(|| value.trim())
+    header_value(head, "authorization")
+}
+
+/// The value of header `name` in a recorded request head, matched
+/// case-insensitively, or `None` when the request did not carry it.
+pub(crate) fn header_value<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.lines().skip(1).find_map(|line| {
+        let (header, value) = line.split_once(':')?;
+        header.eq_ignore_ascii_case(name).then(|| value.trim())
     })
 }
+
+/// The session credentials [`ASSUME_ROLE_RESPONSE`] carries.
+pub(crate) const SESSION_AK: &str = "ASIASESSIONKEYSENTINEL";
+pub(crate) const SESSION_SK: &str = "session-secret-access-key-sentinel";
+pub(crate) const SESSION_TOKEN: &str = "session-token-sentinel";
+
+/// A well-formed AWS STS `AssumeRoleResponse` carrying [`SESSION_AK`],
+/// [`SESSION_SK`], and [`SESSION_TOKEN`], in the sample response's shape and namespace.
+pub(crate) const ASSUME_ROLE_RESPONSE: &str = r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleResult>
+    <AssumedRoleUser>
+      <Arn>arn:aws:sts::123456789012:assumed-role/lakehouse-reader/lakehouse-engine</Arn>
+      <AssumedRoleId>AROA3XFRBF535PLBIFPI4:lakehouse-engine</AssumedRoleId>
+    </AssumedRoleUser>
+    <Credentials>
+      <AccessKeyId>ASIASESSIONKEYSENTINEL</AccessKeyId>
+      <SecretAccessKey>session-secret-access-key-sentinel</SecretAccessKey>
+      <SessionToken>session-token-sentinel</SessionToken>
+      <Expiration>2026-09-28T13:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleResult>
+  <ResponseMetadata>
+    <RequestId>c6104cbe-af31-11e0-8154-cbc7ccf896c7</RequestId>
+  </ResponseMetadata>
+</AssumeRoleResponse>"#;

@@ -1,6 +1,11 @@
 //! Cloud E2E smoke tests against a real AWS Glue Iceberg REST catalog. Unlike
 //! the local `exasol-e2e` suite, these SKIP when their env vars are absent.
 //! `GLUE_WAREHOUSE` is the AWS account id, not an S3 URI.
+//!
+//! Cloud assume-role E2E (issue #139) additionally needs four variables, read from
+//! SSM under `deploy/data-stack`'s `${ssm_root}/assume_role/*` (see `deploy/README.md`):
+//! `ASSUME_ROLE_BASE_ACCESS_KEY_ID`/`ASSUME_ROLE_BASE_SECRET_ACCESS_KEY` (the base
+//! identity granted only `sts:AssumeRole`), `AWS_ASSUME_ROLE_ARN`, and `AWS_EXTERNAL_ID`.
 #![cfg(feature = "cloud-e2e")]
 
 mod common;
@@ -30,6 +35,11 @@ const ENV_CATALOG_AUTH_CLIENT_SECRET: &str = "CATALOG_AUTH_CLIENT_SECRET";
 const ENV_CATALOG_AUTH_OAUTH2_SERVER_URI: &str = "CATALOG_AUTH_OAUTH2_SERVER_URI";
 const ENV_CATALOG_AUTH_SCOPE: &str = "CATALOG_AUTH_SCOPE";
 
+const ENV_ASSUME_ROLE_BASE_ACCESS_KEY_ID: &str = "ASSUME_ROLE_BASE_ACCESS_KEY_ID";
+const ENV_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY: &str = "ASSUME_ROLE_BASE_SECRET_ACCESS_KEY";
+const ENV_AWS_ASSUME_ROLE_ARN: &str = "AWS_ASSUME_ROLE_ARN";
+const ENV_AWS_EXTERNAL_ID: &str = "AWS_EXTERNAL_ID";
+
 const CLOUD_SCHEMA_NAME: &str = "CLOUD_LHVS";
 const CLOUD_VS_NAME: &str = "CLOUD_LAKEHOUSE";
 const CLOUD_ADAPTER_SCRIPT: &str = "LAKEHOUSE_ADAPTER";
@@ -37,6 +47,8 @@ const CLOUD_CATALOG_CONN: &str = "GLUE_CATALOG_CREDS";
 const CLOUD_CATALOG_CONN_VENDED: &str = "GLUE_CATALOG_CREDS_VENDED";
 const CLOUD_CATALOG_CONN_NO_REGION: &str = "GLUE_CATALOG_CREDS_NO_REGION";
 const CLOUD_CATALOG_CONN_AUTH: &str = "CATALOG_AUTH_CREDS";
+const CLOUD_CATALOG_CONN_ASSUME_ROLE: &str = "GLUE_CATALOG_CREDS_ASSUME_ROLE";
+const CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY: &str = "GLUE_CATALOG_CREDS_ASSUME_ROLE_BASE_ONLY";
 
 struct CloudEnv {
     glue_catalog_uri: String,
@@ -149,6 +161,7 @@ impl CloudEnv {
             account_name: password.account_name,
             account_key: password.account_key,
             sas_token: None,
+            ..Default::default()
         }
     }
 }
@@ -261,6 +274,107 @@ impl CatalogAuthEnv {
         format!(
             "CREATE OR REPLACE CONNECTION {CLOUD_CATALOG_CONN_AUTH} TO '{safe_uri}' USER '' IDENTIFIED BY '{json_pw}'"
         )
+    }
+}
+
+/// Credentials and endpoints for the cloud assume-role E2E tests; a separate
+/// struct from `CloudEnv` because it names a base identity plus a role, never
+/// a static Glue key pair. Gating follows the same convention as `CloudEnv`.
+struct AssumeRoleCloudEnv {
+    glue_catalog_uri: String,
+    glue_warehouse: String,
+    glue_table: String,
+    aws_region: String,
+    base_access_key_id: String,
+    base_secret_access_key: String,
+    assume_role_arn: String,
+    external_id: String,
+    exasol_host: String,
+    exasol_port: u16,
+    exasol_user: String,
+    exasol_password: String,
+}
+
+impl AssumeRoleCloudEnv {
+    /// Returns `None` when any required variable is absent or empty, printing which one.
+    fn from_env() -> Option<Self> {
+        let required = [
+            ENV_GLUE_CATALOG_URI,
+            ENV_GLUE_WAREHOUSE,
+            ENV_GLUE_TABLE,
+            ENV_AWS_REGION,
+            ENV_ASSUME_ROLE_BASE_ACCESS_KEY_ID,
+            ENV_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY,
+            ENV_AWS_ASSUME_ROLE_ARN,
+            ENV_AWS_EXTERNAL_ID,
+            ENV_EXASOL_HOST,
+            ENV_EXASOL_PASSWORD,
+        ];
+        for var in required {
+            match std::env::var(var) {
+                Ok(v) if !v.trim().is_empty() => {}
+                _ => {
+                    println!(
+                        "SKIPPED: cloud assume-role E2E requires env var {var} — set it to enable"
+                    );
+                    return None;
+                }
+            }
+        }
+
+        let exasol_port = std::env::var(ENV_EXASOL_PORT)
+            .ok()
+            .and_then(|s| s.trim().parse::<u16>().ok())
+            .unwrap_or(28563);
+
+        Some(AssumeRoleCloudEnv {
+            glue_catalog_uri: std::env::var(ENV_GLUE_CATALOG_URI).unwrap(),
+            glue_warehouse: std::env::var(ENV_GLUE_WAREHOUSE).unwrap(),
+            glue_table: std::env::var(ENV_GLUE_TABLE).unwrap(),
+            aws_region: std::env::var(ENV_AWS_REGION).unwrap(),
+            base_access_key_id: std::env::var(ENV_ASSUME_ROLE_BASE_ACCESS_KEY_ID).unwrap(),
+            base_secret_access_key: std::env::var(ENV_ASSUME_ROLE_BASE_SECRET_ACCESS_KEY).unwrap(),
+            assume_role_arn: std::env::var(ENV_AWS_ASSUME_ROLE_ARN).unwrap(),
+            external_id: std::env::var(ENV_AWS_EXTERNAL_ID).unwrap(),
+            exasol_host: std::env::var(ENV_EXASOL_HOST).unwrap(),
+            exasol_port,
+            exasol_user: std::env::var(ENV_EXASOL_USER).unwrap_or_else(|_| "sys".to_string()),
+            exasol_password: std::env::var(ENV_EXASOL_PASSWORD).unwrap(),
+        })
+    }
+
+    /// Build a `CatalogConnectionPassword` naming the role and the external id —
+    /// the base key pair alone cannot reach Glue, only the assumed session can.
+    fn catalog_connection_password_role(&self) -> CatalogConnectionPassword {
+        CatalogConnectionPassword {
+            warehouse: self.glue_warehouse.clone(),
+            endpoint: String::new(),
+            region: self.aws_region.clone(),
+            access_key: self.base_access_key_id.clone(),
+            secret_key: self.base_secret_access_key.clone(),
+            path_style: false,
+            use_sigv4: true,
+            use_vended_credentials: false,
+            aws_assume_role_arn: Some(self.assume_role_arn.clone()),
+            aws_external_id: Some(self.external_id.clone()),
+            ..Default::default()
+        }
+    }
+
+    /// Build a `CatalogConnectionPassword` carrying only the base identity —
+    /// no role, no STS call — which Glue denies on its own.
+    fn catalog_connection_password_base_only(&self) -> CatalogConnectionPassword {
+        CatalogConnectionPassword {
+            warehouse: self.glue_warehouse.clone(),
+            endpoint: String::new(),
+            region: self.aws_region.clone(),
+            access_key: self.base_access_key_id.clone(),
+            secret_key: self.base_secret_access_key.clone(),
+            path_style: false,
+            use_sigv4: true,
+            use_vended_credentials: false,
+            ..Default::default()
+        }
     }
 }
 
@@ -856,5 +970,195 @@ fn cloud_redacting_conn_omits_credentials_on_failure() {
 
     println!(
         "cloud_redacting_conn_omits_credentials_on_failure: redaction verified (no SQL, no credentials in failure output)"
+    );
+}
+
+/// Cloud assume-role E2E (issue #139): a SigV4 CONNECTION naming the base
+/// identity, the role, and the external id reaches Glue and S3 through a real
+/// AWS STS `AssumeRole` call — proving STS accepts the engine's signed request
+/// and that Glue/S3 accept the resulting session.
+///
+/// Skips when any of the four assume-role env vars (or the Glue vars this
+/// suite already reads) is absent, naming it. No credential value or the
+/// external id is printed to test output.
+#[test]
+fn cloud_assume_role_reaches_glue_and_s3_through_the_role() {
+    let env = match AssumeRoleCloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!(
+                "SKIPPED: cloud_assume_role_reaches_glue_and_s3_through_the_role — env vars absent"
+            );
+            return;
+        }
+    };
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+
+    let create_conn_sql = build_create_connection_sql(
+        CLOUD_CATALOG_CONN_ASSUME_ROLE,
+        &env.glue_catalog_uri,
+        &env.catalog_connection_password_role(),
+    );
+    conn.execute(&create_conn_sql);
+
+    let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE");
+    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
+    conn.execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {vs_name}
+USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
+  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_ASSUME_ROLE}'
+  NAMESPACE  = '{}'"#,
+        glue_namespace(&env.glue_table)
+    ));
+
+    let table = format!("{vs_name}.{}", vs_table_name(&env.glue_table));
+
+    let all_cols = conn.query_columns(&format!("SELECT * FROM {table} LIMIT 10"));
+    assert!(
+        !all_cols.is_empty(),
+        "query through the assumed role must return at least one column"
+    );
+    let row_count = all_cols[0].len();
+    assert!(
+        row_count > 0,
+        "query through the assumed role must return at least one row"
+    );
+
+    let count_cols = conn.query_columns(&format!("SELECT COUNT(*) FROM {table}"));
+    assert_eq!(count_cols.len(), 1, "COUNT(*) must return one column");
+    let total = count_cols[0][0]
+        .as_i64()
+        .or_else(|| count_cols[0][0].as_str().and_then(|s| s.parse().ok()))
+        .expect("COUNT(*) must be an integer");
+    assert!(
+        total > 0,
+        "COUNT(*) through the assumed role must return a positive row count"
+    );
+
+    println!(
+        "cloud_assume_role_reaches_glue_and_s3_through_the_role: {} columns, {} rows, COUNT(*) = {total}",
+        all_cols.len(),
+        row_count
+    );
+}
+
+/// Cloud assume-role E2E (issue #139): the base identity alone — no role, no
+/// STS call — is denied by Glue. Shares the environment of
+/// `cloud_assume_role_reaches_glue_and_s3_through_the_role`.
+#[test]
+fn cloud_assume_role_base_identity_alone_is_denied() {
+    let env = match AssumeRoleCloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!("SKIPPED: cloud_assume_role_base_identity_alone_is_denied — env vars absent");
+            return;
+        }
+    };
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+
+    let create_conn_sql = build_create_connection_sql(
+        CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY,
+        &env.glue_catalog_uri,
+        &env.catalog_connection_password_base_only(),
+    );
+    conn.execute(&create_conn_sql);
+
+    let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE_BASE_ONLY");
+    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
+    let result = conn.try_execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {vs_name}
+USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
+  CATALOG_CONNECTION = '{CLOUD_CATALOG_CONN_ASSUME_ROLE_BASE_ONLY}'
+  NAMESPACE  = '{}'"#,
+        glue_namespace(&env.glue_table)
+    ));
+
+    assert_eq!(
+        result["status"].as_str(),
+        Some("error"),
+        "the base identity alone must be denied by Glue: {result}"
+    );
+    let msg = result["exception"]["text"].as_str().unwrap_or("");
+    assert!(
+        msg.to_ascii_lowercase().contains("accessdenied"),
+        "Glue must deny the base identity: {msg}"
+    );
+    assert!(
+        !msg.contains(&env.base_secret_access_key),
+        "credential leaked in denial: {msg}"
+    );
+
+    println!("cloud_assume_role_base_identity_alone_is_denied: denied as expected");
+}
+
+/// Cloud assume-role E2E (issue #139): real AWS STS enforces the role's `sts:ExternalId`
+/// condition, which the local SeaweedFS stack does not evaluate. Shares the environment of
+/// `cloud_assume_role_reaches_glue_and_s3_through_the_role`.
+#[test]
+fn cloud_assume_role_wrong_external_id_is_denied() {
+    let env = match AssumeRoleCloudEnv::from_env() {
+        Some(e) => e,
+        None => {
+            println!("SKIPPED: cloud_assume_role_wrong_external_id_is_denied — env vars absent");
+            return;
+        }
+    };
+    const WRONG_EXTERNAL_ID: &str = "wrong-external-id";
+
+    let mut conn = ExaConn::connect_redacting(
+        &env.exasol_host,
+        env.exasol_port,
+        &env.exasol_user,
+        &env.exasol_password,
+    );
+    conn.execute(&format!("CREATE SCHEMA IF NOT EXISTS {CLOUD_SCHEMA_NAME}"));
+
+    let conn_name = "GLUE_CATALOG_CREDS_ASSUME_ROLE_BAD_EXTERNAL_ID";
+    let password = CatalogConnectionPassword {
+        aws_external_id: Some(WRONG_EXTERNAL_ID.to_string()),
+        ..env.catalog_connection_password_role()
+    };
+    conn.execute(&build_create_connection_sql(
+        conn_name,
+        &env.glue_catalog_uri,
+        &password,
+    ));
+
+    let vs_name = format!("{CLOUD_VS_NAME}_ASSUME_ROLE_BAD_EXTERNAL_ID");
+    let _ = conn.try_execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs_name} CASCADE"));
+    let result = conn.try_execute(&format!(
+        r#"CREATE VIRTUAL SCHEMA {vs_name}
+USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
+  CATALOG_CONNECTION = '{conn_name}'
+  NAMESPACE  = '{}'"#,
+        glue_namespace(&env.glue_table)
+    ));
+
+    assert_eq!(
+        result["status"].as_str(),
+        Some("error"),
+        "a wrong external id must fail CREATE VIRTUAL SCHEMA: {result}"
+    );
+    let msg = result["exception"]["text"].as_str().unwrap_or("");
+    assert!(msg.contains("AccessDenied"), "{msg}");
+    assert!(
+        !msg.contains(WRONG_EXTERNAL_ID) && !msg.contains(&env.base_secret_access_key),
+        "credential or external id leaked: {msg}"
     );
 }
