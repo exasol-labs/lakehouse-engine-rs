@@ -286,9 +286,9 @@ impl AuthzFixture {
         }
     }
 
-    fn relations_of(&self, scope: Scope, user_id: &str) -> Vec<String> {
+    fn relations_of(&self, token: &str, scope: Scope, user_id: &str) -> Vec<String> {
         let url = self.assignments_url(scope);
-        let exchange = get(&url, &keycloak_client_credentials_token());
+        let exchange = get(&url, token);
         expect_status(
             &exchange,
             &format!("Lakekeeper GET {url} for user '{user_id}'"),
@@ -303,7 +303,7 @@ impl AuthzFixture {
             .collect()
     }
 
-    fn update_assignments(&self, scope: Scope, user_id: &str, diff: &AssignmentDiff) {
+    fn update_assignments(&self, token: &str, scope: Scope, user_id: &str, diff: &AssignmentDiff) {
         if diff.writes.is_empty() && diff.deletes.is_empty() {
             return;
         }
@@ -313,7 +313,7 @@ impl AuthzFixture {
             "deletes": diff.deletes.iter().map(assignment).collect::<Vec<_>>(),
         });
         let url = self.assignments_url(scope);
-        let exchange = post(&url, &keycloak_client_credentials_token(), &body);
+        let exchange = post(&url, token, &body);
         expect_status(
             &exchange,
             &format!("Lakekeeper POST {url} for user '{user_id}'"),
@@ -323,26 +323,28 @@ impl AuthzFixture {
 
     /// Reads first and writes only the absent grant, so a repeated run changes nothing.
     pub fn ensure_grant(&self, user_id: &str, grant: Grant) {
-        let held = self.relations_of(grant.scope, user_id);
+        let token = keycloak_client_credentials_token();
+        let held = self.relations_of(&token, grant.scope, user_id);
         if !held.iter().any(|r| r == grant.relation) {
             let diff = AssignmentDiff {
                 writes: vec![grant.relation],
                 deletes: vec![],
             };
-            self.update_assignments(grant.scope, user_id, &diff);
+            self.update_assignments(&token, grant.scope, user_id, &diff);
         }
     }
 
     /// Replaces the principal's grants with exactly `grants`; a no-op when it already holds them.
     pub fn set_assignments(&self, principal: &Principal, grants: &[Grant]) {
         let user_id = self.principal_id(principal);
+        let token = keycloak_client_credentials_token();
         for scope in ALL_SCOPES {
             let wanted: Vec<&str> = grants
                 .iter()
                 .filter(|g| g.scope == scope)
                 .map(|g| g.relation)
                 .collect();
-            let held = self.relations_of(scope, user_id);
+            let held = self.relations_of(&token, scope, user_id);
             let deletes: Vec<&str> = held
                 .iter()
                 .map(String::as_str)
@@ -353,7 +355,7 @@ impl AuthzFixture {
                 .copied()
                 .filter(|r| !held.iter().any(|h| h == r))
                 .collect();
-            self.update_assignments(scope, user_id, &AssignmentDiff { writes, deletes });
+            self.update_assignments(&token, scope, user_id, &AssignmentDiff { writes, deletes });
         }
     }
 }
@@ -462,9 +464,7 @@ pub fn provision_authz_fixture() -> AuthzFixture {
     fixture
 }
 
-/// Idempotent: warehouse `lakehouse_authz`, namespace `authz`, tables `authz_alpha` and
-/// `authz_beta`, and exactly `select` on the first for reader A and on the second for reader B;
-/// any other grant of either reader in the fixture's enumerated scopes is removed. The server must already be bootstrapped.
+/// Idempotent; leaves each reader with exactly one table select in the fixture's scopes.
 pub fn ensure_authz_fixture() -> &'static AuthzFixture {
     static FIXTURE: OnceLock<AuthzFixture> = OnceLock::new();
     FIXTURE.get_or_init(provision_authz_fixture)

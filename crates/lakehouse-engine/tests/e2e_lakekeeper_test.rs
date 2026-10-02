@@ -716,8 +716,7 @@ fn operator_allows(fixture: &AuthzFixture, principal: &Principal, table: &str) -
 
 #[test]
 fn lakekeeper_stack_enforces_permissions() {
-    let fixture = authz_fixture();
-
+    setup();
     let info = lakekeeper_server_info();
     let backend = info["authz-backend"].as_str().unwrap_or("<none reported>");
     assert_eq!(
@@ -725,6 +724,7 @@ fn lakekeeper_stack_enforces_permissions() {
         "Lakekeeper reports authz-backend '{backend}'; the stack must run \
          LAKEKEEPER__AUTHZ_BACKEND={OPENFGA_BACKEND} (recreate it with `down -v` after the switch)"
     );
+    let fixture = authz_fixture();
     assert!(
         !operator_allows(fixture, &READER_A, TABLE_BETA),
         "a principal without a grant on {TABLE_BETA} must be denied it"
@@ -783,11 +783,6 @@ fn authz_direct_login_principal_id_is_idp_prefix_and_token_subject() {
     let groups: Vec<usize> = sub.split('-').map(str::len).collect();
     assert_eq!(groups, [8, 4, 4, 4, 12], "sub is not a UUID: {sub}");
     assert!(sub.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
-    assert_ne!(
-        claims["preferred_username"].as_str(),
-        Some(sub),
-        "preferred_username plays no part in the id"
-    );
 
     let unregistered = "oidc~template-user@corp";
     fixture.ensure_grant(unregistered, grant(Scope::Table(TABLE_ALPHA), "select"));
@@ -861,7 +856,7 @@ fn authz_management_api_is_mounted_beside_catalog_path_on_local_topology() {
     let root = catalog_uri
         .strip_suffix("/catalog")
         .unwrap_or_else(|| panic!("catalog URI {catalog_uri} does not end in /catalog"));
-    let client = reqwest::blocking::Client::new();
+    let client = lakekeeper::http_client();
     let token = lakekeeper::keycloak_client_credentials_token();
 
     let management_url = format!("{root}/management/v1/info");

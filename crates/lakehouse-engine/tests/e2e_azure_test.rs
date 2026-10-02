@@ -49,10 +49,6 @@ const CONN_VENDED: &str = "AZ_VENDED_CATALOG_CREDS";
 
 const LAKEKEEPER_CATALOG_URI_INTERNAL: &str = "http://lakekeeper:8181/catalog";
 
-fn lakekeeper_catalog_url_host() -> String {
-    format!("http://localhost:{}/catalog", lakekeeper::lakekeeper_port())
-}
-
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 /// SeaweedFS is deliberately not awaited: this suite's storage is Azure.
@@ -123,7 +119,7 @@ impl AzureFixture {
         let seed_arm = |warehouse: &str| -> Vec<String> {
             let token = lakekeeper::keycloak_client_credentials_token();
             rt.block_on(seed_events_table_with_auth(
-                &lakekeeper_catalog_url_host(),
+                &lakekeeper::catalog_uri_host(),
                 warehouse,
                 SeedCatalogAuth {
                     token: Some(token),

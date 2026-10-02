@@ -65,7 +65,7 @@ pub(super) fn management_base() -> String {
     format!("http://localhost:{}/management/v1", lakekeeper_port())
 }
 
-pub(super) fn http_client() -> reqwest::blocking::Client {
+pub fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
