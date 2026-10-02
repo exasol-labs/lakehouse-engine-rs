@@ -29,8 +29,9 @@ Project mission in: @specs/mission.md
   section banners/dividers. History belongs in the commit message.
 - **Keep it to 1–2 lines.** Anything longer is a spec or ADR; cite it (`(#309)`, spec path) instead.
 - **The test name is the scenario.** Add a `/// Scenario: <spec scenario title>` line only when
-  the test implements a spec scenario, quoting its title verbatim so it can be traced. Use at
-  most one per test, and never add a `// Scenario Coverage` comment.
+  the test implements a spec scenario, quoting its title verbatim so it can be traced. A test
+  that covers several scenarios carries one line per scenario; prefer that to splitting it,
+  especially for E2E tests, which are expensive. Never add a `// Scenario Coverage` comment.
 - **Comments must stay true.** When you change behavior, rename, or move code, update or delete
   the comments that describe it in the same change.
 
