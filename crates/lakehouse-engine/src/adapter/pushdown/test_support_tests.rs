@@ -78,6 +78,7 @@ pub(super) fn unauthenticated_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
 

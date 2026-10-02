@@ -3,7 +3,7 @@
 # than skips when the stack is down.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     minio iceberg-rest keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     seaweedfs iceberg-rest keycloak lakekeeper-db lakekeeper-migrate lakekeeper
 #   bash deploy/scripts/tests/lakekeeper-local.test.sh
 #
 # Source tables live in the iceberg-rest fixture, not Lakekeeper: Lakekeeper rejects overlapping
@@ -35,9 +35,9 @@ TARGET_MANAGEMENT="http://localhost:$LAKEKEEPER_PORT/management/v1"
 WAREHOUSE_BUCKET="warehouse"
 WAREHOUSE_REGION="us-east-1"
 # Dialed by the Lakekeeper container itself, hence the docker-network name.
-WAREHOUSE_S3_ENDPOINT="http://minio:9000"
-WAREHOUSE_ACCESS_KEY_ID="minioadmin"
-WAREHOUSE_SECRET_ACCESS_KEY="minioadmin"
+WAREHOUSE_S3_ENDPOINT="http://seaweedfs:8333"
+WAREHOUSE_ACCESS_KEY_ID="lhadmin"
+WAREHOUSE_SECRET_ACCESS_KEY="lhadminsecret123"
 
 # Unique per run so warehouse names and key prefixes never collide across runs.
 RUN_ID="lktest_$(date +%Y%m%d%H%M%S)_$$"
@@ -83,7 +83,7 @@ require_endpoint() {
     2??) return 0 ;;
   esac
   fatal "$name is not answering at $url (HTTP $status). This test requires the local Docker stack and never skips. Start it with:
-  docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait minio iceberg-rest keycloak lakekeeper-db lakekeeper-migrate lakekeeper"
+  docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait seaweedfs iceberg-rest keycloak lakekeeper-db lakekeeper-migrate lakekeeper"
 }
 
 require_stack() {

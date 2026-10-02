@@ -83,7 +83,7 @@ engine rather than a fixed per-shard serialization cap.
 
 ### Scenario: Single-group COUNT(DISTINCT) is decomposed into a dedicated DISTINCT row-scan fan-out
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a query whose select list is a LONE `COUNT(DISTINCT col)` over the whole table with no GROUP BY, no other select-list item, and a BARE COLUMN argument (Case 1), e.g. `SELECT COUNT(DISTINCT L_SHIPMODE) FROM {vs_table}`
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL recognise the distinct aggregate, resolve the file list once, and build a row-scan-shaped scan spec whose projection is that single bare column with the `distinct` flag set and NULLs excluded
@@ -105,16 +105,16 @@ engine rather than a fixed per-shard serialization cap.
 * *WHEN* `SELECT COUNT(DISTINCT col) FROM {vs_table}` and its zero-match and all-NULL variants are executed end-to-end against the Exasol Docker stack
 * *THEN* the merged count SHALL equal `COUNT(DISTINCT col)` evaluated over all rows on a single node, proving the outer native `COUNT(DISTINCT "V")` deduplicates the shared value ACROSS the shard boundary rather than summing per-shard counts
 * *AND* NULL values SHALL never be counted, and a zero-match or all-NULL result SHALL yield a distinct count of zero, not an error
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: High-cardinality COUNT(DISTINCT) completes past the former per-shard cap
 
-* *GIVEN* an Exasol Docker container with the lakehouse VS adapter and scan UDF installed over MinIO
+* *GIVEN* an Exasol Docker container with the lakehouse VS adapter and scan UDF installed over SeaweedFS
 * *AND* an Iceberg table whose target column holds enough near-unique values per shard that the former per-shard distinct-set serialization would have exceeded its 1,048,576-byte cap
 * *WHEN* `SELECT COUNT(DISTINCT col) FROM {vs_table}` is executed against the virtual schema
 * *THEN* the query SHALL complete and its result MUST equal the same `COUNT(DISTINCT col)` executed on the raw Iceberg data via single-node DataFusion
 * *AND* the scan SHALL NOT abort under any per-shard element or byte cap, because no such cap exists on this path
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: Multiple distinct columns or a distinct mixed with ordinary aggregates decline the fan-out and route to a qualified single-table wrapper
 

@@ -24,7 +24,7 @@ this library's per-spec organization threshold.
 * The virtual schema these scenarios query against is the one
   `unity-e2e/unity-catalog-e2e-harness` § "The suite's virtual schema carries the storage
   credentials a UDF-side scan needs" creates; that scenario's guarantee — a CONNECTION carrying the
-  MinIO endpoint and static storage credentials, provisioned through the shared harness scan-UDF
+  SeaweedFS endpoint and static storage credentials, provisioned through the shared harness scan-UDF
   definition — is a precondition every scenario below relies on.
 * **This delta is issue #322.** It replaces the single "cannot plan" scenario with three, because the
   engine's answer for the two fixtures that scenario covered has split three ways: `type_widening` and
@@ -70,7 +70,7 @@ this library's per-spec organization threshold.
 * *WHEN* the suite issues `SELECT *` and `SELECT COUNT(*)` against that virtual table
 * *THEN* `SELECT COUNT(*)` SHALL return 5 and `SELECT *` SHALL return those 5 rows with their column values, which is this engine's FIRST full round trip over a Delta table
 * *AND* the rows SHALL arrive under the virtual table's declared column names and Exasol types
-* *AND* the suite MUST fail (not skip) when the Unity Catalog server, MinIO, or Exasol is unreachable
+* *AND* the suite MUST fail (not skip) when the Unity Catalog server, SeaweedFS, or Exasol is unreachable
 
 ### Scenario: A Delta table with deletion vectors returns only its live rows
 
@@ -136,7 +136,7 @@ this library's per-spec organization threshold.
 * *AND* the suite SHALL capture the generated pushdown SQL for at least one pruning query and assert it
   drives the scan UDF, so a silent fallback to an unaccelerated wrapper fails the suite rather than
   passing on correct rows
-* *AND* the suite MUST fail (not skip) when the Unity Catalog server, MinIO, or Exasol is unreachable
+* *AND* the suite MUST fail (not skip) when the Unity Catalog server, SeaweedFS, or Exasol is unreachable
 
 > The type-widening, refused-column, varied-types, and timestamp declared-type scenarios live in
 > `unity-e2e/unity-catalog-e2e-harness-delta-types`.

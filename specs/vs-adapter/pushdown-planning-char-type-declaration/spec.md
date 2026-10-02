@@ -174,7 +174,7 @@ over-length truncation error still surfaces instead of being masked by the pad.
 
 ### Scenario: The four #192 query shapes execute end to end
 
-* *GIVEN* the local Exasol, MinIO, and Iceberg REST Docker stack with the seeded Virtual Schema table
+* *GIVEN* the local Exasol, SeaweedFS, and Iceberg REST Docker stack with the seeded Virtual Schema table
 * *WHEN* each of the four shapes is executed through the Virtual Schema — a GROUP BY on an equal-length CASE-of-string-literals expression, a select list containing `CAST(<varchar col> AS CHAR(20))`, a bare string literal used as a GROUP BY key, and a GROUP BY on a genuine VARCHAR column as the control
 * *THEN* each statement SHALL return rows rather than fail with `Data type mismatch ... Expected CHAR(n)`
 * *AND* the `CAST(<varchar col> AS CHAR(20))` shape SHALL return values space-padded to exactly 20 characters

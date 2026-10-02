@@ -6,7 +6,7 @@
 
 mod common;
 use common::e2e_harness::*;
-use common::stack::{wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio};
+use common::stack::{wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs};
 use common::type_promotion_fixtures::{
     DECIMAL_DECIMAL_COLUMN, DECIMAL_DECIMAL_PRE_PROMOTION_PHYSICAL_TYPE, FLOAT_DOUBLE_COLUMN,
     FLOAT_DOUBLE_PRE_PROMOTION_PHYSICAL_TYPE, ICEBERG_TYPE_PROMOTION_TABLE, ID_COLUMN,
@@ -26,7 +26,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_iceberg_catalog();
     });
 }
@@ -62,7 +62,7 @@ async fn fetch_object_bytes(uri: &str) -> bytes::Bytes {
     store
         .get(&ObjectStorePath::from(key))
         .await
-        .unwrap_or_else(|e| panic!("GET {uri} from MinIO: {e}"))
+        .unwrap_or_else(|e| panic!("GET {uri} from SeaweedFS: {e}"))
         .bytes()
         .await
         .unwrap_or_else(|e| panic!("read bytes of {uri}: {e}"))

@@ -1,6 +1,6 @@
 # Feature: Direct-Storage E2E Suite
 
-Proves end to end that a plain directory of Parquet files on MinIO is queryable through the
+Proves end to end that a plain directory of Parquet files on SeaweedFS is queryable through the
 lakehouse Virtual Schema under `CATALOG_KIND = 'DIRECT_STORAGE'`. The fixture set is written by a
 raw Parquet writer rather than by a catalog. The catalog-free read path is therefore gated by the
 same live Exasol suite every other read path is gated by.
@@ -8,7 +8,7 @@ same live Exasol suite every other read path is gated by.
 ## Background
 
 * The suite needs NO new stack and NO new CI job. Direct storage has no catalog service, so the
-  base `docker-compose.yml` already supplies everything the suite reads: MinIO with its single
+  base `docker-compose.yml` already supplies everything the suite reads: SeaweedFS with its single
   `warehouse` bucket, and Exasol. The `iceberg-rest` service is unused.
 * CI's `e2e` job runs `make test-e2e`, so the Makefile's explicit `--test` list is the single
   registration point. A binary missing from that list never runs. The gate is then vacuous.
@@ -16,7 +16,7 @@ same live Exasol suite every other read path is gated by.
   That stack creates a catalog table and commits a snapshot. This suite needs the opposite: Parquet
   bytes put at a chosen object key with no catalog, no snapshot, and no Iceberg field-id metadata.
 * `tests/common/e2e_harness.rs` already exposes `local_stack_storage()`, the S3 backend the E2E
-  stack reads through. The fixture writer reuses it rather than re-declaring MinIO credentials.
+  stack reads through. The fixture writer reuses it rather than re-declaring SeaweedFS credentials.
 * `packaging/iceberg-type-promotion-fixture` records the fixture-shape rule this suite inherits. A
   fixture test asserts the written file's PHYSICAL Parquet encoding from its own footer. A read
   test therefore cannot pass vacuously against a file whose types were silently normalized.
@@ -44,7 +44,7 @@ same live Exasol suite every other read path is gated by.
 * *AND* the EXISTING build-convention guard, which already reads the `Makefile`, locates the `test-e2e` recipe line, and asserts that it names the type-relaxation binary, SHALL be extended to assert that the line names this binary too, so a later edit that drops the binary fails the suite rather than silently retiring it; NO new guard file SHALL be added
 * *AND* the CI workflow, the composite E2E setup action, and `docker-compose.yml` SHALL be UNCHANGED, so the suite adds no stack service and no status check
 * *AND* the binary SHALL provision the scan path through the shared `common::e2e_harness` definition under one `OnceLock`-guarded setup, so its script DDL is byte-identical to every other E2E binary
-* *AND* every test in the binary SHALL FAIL, never skip, when Exasol or MinIO is unreachable, reached through the panicking readiness helpers the shared harness already calls
+* *AND* every test in the binary SHALL FAIL, never skip, when Exasol or SeaweedFS is unreachable, reached through the panicking readiness helpers the shared harness already calls
 
 ### Scenario: A raw-Parquet fixture writer puts data files with no catalog
 
@@ -52,10 +52,10 @@ same live Exasol suite every other read path is gated by.
 * *WHEN* the suite authors a fixture
 * *THEN* a helper module at `crates/lakehouse-engine/tests/common/raw_parquet.rs` SHALL take an object key and a `RecordBatch`, write the batch through an Arrow Parquet writer into an in-memory buffer, and PUT that buffer at that key through an object store, so one call authors one data file
 * *AND* the helper SHALL be declared in `crates/lakehouse-engine/tests/common/mod.rs` beside the other shared helpers, exactly once, so no binary carries its own copy
-* *AND* the helper SHALL derive its object-store credentials from the shared `local_stack_storage()` backend and MUST NOT re-declare the MinIO endpoint, key, or bucket, so the fixture writer and the engine read the same stack by construction
+* *AND* the helper SHALL derive its object-store credentials from the shared `local_stack_storage()` backend and MUST NOT re-declare the SeaweedFS endpoint, key, or bucket, so the fixture writer and the engine read the same stack by construction
 * *AND* the helper MUST NOT create a catalog table, commit a snapshot, write an Iceberg manifest, or attach Iceberg field-id metadata to the Arrow schema, because a fixture carrying any of those would stop testing the raw-Parquet path
 * *AND* a fixture-shape test SHALL assert each written object's PHYSICAL column encoding by reading that object's own Parquet footer back, so a fixture whose types were silently normalized fails here rather than making a read test pass vacuously
-* *AND* fixture authoring SHALL be idempotent across runs, because the MinIO volume outlives one test run
+* *AND* fixture authoring SHALL be idempotent across runs, because the SeaweedFS volume outlives one test run
 
 ### Scenario: A directory of mixed-type Parquet files is declared and queried end to end
 

@@ -48,6 +48,9 @@ fn debug_redacts_every_secret_bearing_field() {
         account_name: Some("acct".into()),
         account_key: Some("akey".into()),
         sas_token: Some("sv=…&sig=sas".into()),
+        aws_assume_role_arn: Some("arn:aws:iam::123456789012:role/reader".into()),
+        aws_external_id: Some("ext-id-secret".into()),
+        aws_sts_endpoint: Some("https://sts.eu-west-1.amazonaws.com".into()),
     };
     let debug = format!("{creds:?}");
     for secret in [
@@ -58,6 +61,7 @@ fn debug_redacts_every_secret_bearing_field() {
         "csecret",
         "akey",
         "sv=…&sig=sas",
+        "ext-id-secret",
     ] {
         assert!(!debug.contains(secret), "{secret} leaked: {debug}");
     }
@@ -98,6 +102,19 @@ fn debug_redacts_every_secret_bearing_field() {
             assert!(!text.contains(s), "{label} leaked {s}: {text}");
         }
     }
+}
+
+#[test]
+fn assume_role_arn_names_a_role_only_when_non_empty() {
+    const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
+    let with_arn = |arn: Option<&str>| ConnectionCreds {
+        aws_assume_role_arn: arn.map(String::from),
+        ..crate::test_support::creds_no_auth()
+    };
+
+    assert_eq!(with_arn(Some(ROLE_ARN)).assume_role_arn(), Some(ROLE_ARN));
+    assert_eq!(with_arn(Some("")).assume_role_arn(), None);
+    assert_eq!(with_arn(None).assume_role_arn(), None);
 }
 
 const TOKEN: &str = "static-bearer-token";

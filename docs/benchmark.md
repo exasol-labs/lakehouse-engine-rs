@@ -35,7 +35,7 @@ make bench                  # build the .so, run the suite, write bench/reports/
 The configuration comes from a gitignored `bench/.env` file. Copy `bench/.env.example` to create it.
 `BENCH_TARGET` selects the mode. The default is `docker`:
 
-- **`docker` (default)** — self-contained. `docker compose up -d` starts MinIO, an Iceberg REST
+- **`docker` (default)** — self-contained. `docker compose up -d` starts SeaweedFS, an Iceberg REST
   catalog, and Exasol. The bench loads TPC-H into the local catalog automatically. This mode needs
   no AWS account and no `.env` file.
 - **`remote`** — runs against a real AWS Glue catalog and an external Exasol cluster. The operator

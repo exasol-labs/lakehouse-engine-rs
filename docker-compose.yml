@@ -1,22 +1,25 @@
 # Host ports are env-overridable and distinct from sibling stacks; in-network
-# service names and ports are fixed (UDFs reach http://minio:9000 etc.).
+# service names and ports are fixed (UDFs reach http://seaweedfs:8333 etc.).
 
 services:
-  minio:
-    # Public, protocol-compatible MinIO fork (upstream images need a subscription).
-    image: pgsty/silo:RELEASE.2026-09-16T00-00-00Z
-    environment:
-      MINIO_ROOT_USER: minioadmin
-      MINIO_ROOT_PASSWORD: minioadmin
-      MINIO_DOMAIN: localhost
-    command: server /data --console-address ":9001"
+  seaweedfs:
+    # Identities, the WarehouseRead policy and the LakehouseReader role live in
+    # seaweedfs-iam.json; >= 4.44 is required for static-user principal ARNs in trust policies.
+    image: chrislusf/seaweedfs:4.48
+    command:
+      - mini
+      - -dir=/data
+      - -bucket=warehouse
+      - -s3.config=/etc/seaweedfs/iam.json
+      - -s3.iam.config=/etc/seaweedfs/iam.json
+      - -s3.iam.readOnly=false
     ports:
-      - "${LH_MINIO_PORT:-19000}:9000"
-      - "${LH_MINIO_CONSOLE_PORT:-19001}:9001"
+      - "${LH_SEAWEEDFS_PORT:-19000}:8333"
     volumes:
-      - minio-data:/data
+      - seaweedfs-data:/data
+      - ./seaweedfs-iam.json:/etc/seaweedfs/iam.json:ro
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      test: ["CMD", "curl", "-f", "http://localhost:8333/status"]
       interval: 10s
       timeout: 5s
       retries: 10
@@ -25,34 +28,18 @@ services:
       lakehouse:
         ipv4_address: 10.84.0.10
 
-  minio-init:
-    image: pgsty/mc:RELEASE.2026-09-16T00-00-00Z
-    depends_on:
-      minio:
-        condition: service_healthy
-    entrypoint: >
-      /bin/sh -c "
-      mc alias set local http://minio:9000 minioadmin minioadmin &&
-      mc mb --ignore-existing local/warehouse &&
-      echo 'bucket ready'
-      "
-    # One-shot: `docker wait` it rather than including it in an `up --wait` set.
-    restart: "no"
-    networks:
-      - lakehouse
-
   iceberg-rest:
     image: apache/iceberg-rest-fixture:1.10.1
     depends_on:
-      minio:
+      seaweedfs:
         condition: service_healthy
     environment:
       CATALOG_WAREHOUSE: s3://warehouse/
       CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
-      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_ENDPOINT: http://seaweedfs:8333
       CATALOG_S3_PATH__STYLE__ACCESS: "true"
-      AWS_ACCESS_KEY_ID: minioadmin
-      AWS_SECRET_ACCESS_KEY: minioadmin
+      AWS_ACCESS_KEY_ID: lhadmin
+      AWS_SECRET_ACCESS_KEY: lhadminsecret123
       AWS_REGION: us-east-1
     ports:
       - "${LH_REST_PORT:-18181}:8181"
@@ -70,11 +57,11 @@ services:
   spark-iceberg-fixtures:
     image: apache/spark:3.5.7
     depends_on:
-      minio:
+      seaweedfs:
         condition: service_healthy
       iceberg-rest:
         condition: service_healthy
-    # AWS SDK v2 fails writes without a region, even against MinIO.
+    # AWS SDK v2 fails writes without a region, even against SeaweedFS.
     environment:
       AWS_REGION: us-east-1
     volumes:
@@ -103,15 +90,15 @@ services:
     # exaconf rewrites /etc/hosts and /etc/resolv.conf on startup, wiping
     # extra_hosts, so the entrypoint loop re-adds the static service entries.
     extra_hosts:
-      - "minio:10.84.0.10"
+      - "seaweedfs:10.84.0.10"
       - "iceberg-rest:10.84.0.11"
     entrypoint:
       - /bin/bash
       - -c
       - |
         ( while true; do
-            if [ -f /etc/hosts ] && ! grep -qE '(^|[[:space:]])minio([[:space:]]|$)' /etc/hosts; then
-              printf '10.84.0.10 minio\n10.84.0.11 iceberg-rest\n' >> /etc/hosts
+            if [ -f /etc/hosts ] && ! grep -qE '(^|[[:space:]])seaweedfs([[:space:]]|$)' /etc/hosts; then
+              printf '10.84.0.10 seaweedfs\n10.84.0.11 iceberg-rest\n' >> /etc/hosts
             fi
             sleep 2
           done ) &
@@ -127,7 +114,7 @@ services:
         ipv4_address: 10.84.0.20
 
 volumes:
-  minio-data:
+  seaweedfs-data:
   exa-data:
 
 networks:

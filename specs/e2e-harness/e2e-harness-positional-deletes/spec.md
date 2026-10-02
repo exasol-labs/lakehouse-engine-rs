@@ -2,7 +2,7 @@
 
 Extends the end-to-end harness (`e2e-harness/e2e-harness`) with a matrix that drives Iceberg
 merge-on-read positional-delete tables through the full lakehouse VS query path — from Exasol SQL
-through the adapter and scan UDF to Iceberg Parquet data + positional-delete files in MinIO —
+through the adapter and scan UDF to Iceberg Parquet data + positional-delete files in SeaweedFS —
 verifying that the post-delete row set is returned, that deletes compose with projection/filter/
 LIMIT/aggregation, that both `file` and `partition` delete granularity work, that a partition-scoped
 delete spanning multiple partitions is applied correctly and its result is invariant to fan-out
@@ -13,9 +13,9 @@ delete mechanisms fail loud.
 
 * All positional-delete tables are produced by the Spark fixtures (see
   `packaging/positional-delete-fixtures`); the harness reads them through the shared REST catalog
-  over MinIO.
+  over SeaweedFS.
 * Every scenario MUST fail (not skip) if the Exasol Docker container, Spark service, REST catalog,
-  or MinIO is unavailable.
+  or SeaweedFS is unavailable.
 * Correctness is asserted against the recorded deleted-row set (equivalently, the single-node
   DataFusion result over the same post-delete data).
 

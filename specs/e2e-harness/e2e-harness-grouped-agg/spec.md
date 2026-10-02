@@ -10,7 +10,7 @@ an aggregate before, between, or after the group keys in the `selectList`.
 
 ## Background
 
-* Every E2E scenario runs against a local Exasol Docker container over MinIO and MUST fail (never skip) when the stack is unavailable.
+* Every E2E scenario runs against a local Exasol Docker container over SeaweedFS and MUST fail (never skip) when the stack is unavailable.
 * See `e2e-harness/e2e-harness` for the core projection/filter/LIMIT and file-pruning E2E scenarios and the harness's script-provisioning scenario.
 
 ## Scenarios
@@ -21,7 +21,7 @@ an aggregate before, between, or after the group keys in the `selectList`.
 * *AND* an Iceberg table populated with rows across multiple distinct group-key values (e.g., region, product category)
 * *WHEN* a grouped aggregate query is executed against the virtual schema (e.g., `SELECT region, SUM(amount) FROM vs.sales GROUP BY region`)
 * *THEN* the result MUST match the same query executed on the raw Iceberg data via DataFusion directly
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable
 
 ### Scenario: End-to-end multi-key GROUP BY with WHERE filter returns correct results
 
@@ -55,9 +55,9 @@ an aggregate before, between, or after the group keys in the `selectList`.
 
 ### Scenario: End-to-end nested aggregate over a grouped sub-select returns the correct outer count
 
-* *GIVEN* an Exasol Docker container with the lakehouse VS adapter and scan UDF installed and a seeded Iceberg table backed by MinIO
+* *GIVEN* an Exasol Docker container with the lakehouse VS adapter and scan UDF installed and a seeded Iceberg table backed by SeaweedFS
 * *AND* a nested-aggregate query matching `bench/run.sh` Q7's shape — an outer `COUNT(*)` over an inner high-cardinality grouped aggregate, e.g. `SELECT COUNT(*) FROM (SELECT id, COUNT(*) AS cnt FROM {vs_table} GROUP BY id) t`
 * *WHEN* the query is executed against the virtual schema
 * *THEN* the query MUST succeed without a `DataFusion SQL error: Schema error: No field named ...` (or any other planning-time pushdown-SQL-generation error) surfaced from the scan UDF
 * *AND* the returned outer `COUNT(*)` MUST equal the number of distinct inner group-key values in the seeded data (equivalently, the single-node DataFusion result for the same nested query)
-* *AND* the test MUST fail (not skip) if the Exasol Docker container or MinIO is unavailable
+* *AND* the test MUST fail (not skip) if the Exasol Docker container or SeaweedFS is unavailable

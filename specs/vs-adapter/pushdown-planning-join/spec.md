@@ -49,7 +49,7 @@ Extends pushdown planning (`vs-adapter/pushdown-planning`) with the broadcast in
 
 ### Scenario: Broadcast-eligible inner equi-join is planned as a broadcast fan-out
 
-* *GIVEN* a virtual schema over a namespace whose tables are backed by MinIO
+* *GIVEN* a virtual schema over a namespace whose tables are backed by SeaweedFS
 * *AND* a `pushdown` request whose `from` clause is a `join` node over exactly two involved tables joined by an equi-condition
 * *AND* the smaller side's table-metadata byte size is at or below the broadcast threshold
 * *WHEN* Exasol sends the `pushdown` request

@@ -11,7 +11,7 @@ Background note below — and is covered instead by unit tests over a synthetic 
 ## Background
 
 * The fixture reuses the existing `spark-iceberg-fixtures` one-shot Compose job and the shared
-  Iceberg REST catalog over MinIO every other E2E table uses — no new dependency, no new service.
+  Iceberg REST catalog over SeaweedFS every other E2E table uses — no new dependency, no new service.
 * `run_fixtures.sh` invokes each `.sql` file by an EXPLICIT `spark-sql -f` line and does NOT glob the
   directory, so a fixture script that is added without its own invocation line is silently never run.
   The same is true of `make test-e2e`, whose `--test` list is explicit: a new E2E binary that is not
@@ -50,14 +50,14 @@ Background note below — and is covered instead by unit tests over a synthetic 
   `seed::E2E_NAMESPACE`), the table name, every column, its source and target type, and every
   inserted row — lives in the Rust test harness and MUST stay in lockstep with the Spark SQL script
   that produces it, exactly as `packaging/int96-timestamp-fixture` requires of its own script.
-* The fixture step MUST fail, not skip, when Spark, the REST catalog, or MinIO is unavailable — the
+* The fixture step MUST fail, not skip, when Spark, the REST catalog, or SeaweedFS is unavailable — the
   same fail-loud contract as every other fixture in this stack.
 
 ## Scenarios
 
 ### Scenario: Spark produces an Iceberg table whose readable promotions span the schema change
 
-* *GIVEN* the E2E stack is running with the shared REST catalog over MinIO and an Apache Spark
+* *GIVEN* the E2E stack is running with the shared REST catalog over SeaweedFS and an Apache Spark
   service with the Iceberg Spark runtime
 * *WHEN* the fixture step creates a format-version-2 Iceberg table carrying an `int` column, a
   `float` column, and a `decimal(10,2)` column, inserts rows into it, promotes the three columns to
@@ -75,7 +75,7 @@ Background note below — and is covered instead by unit tests over a synthetic 
   its row count
 * *AND* the promoted decimal SHALL widen PRECISION ONLY, keeping scale 2 on both sides, because the
   Iceberg spec permits `decimal(P,S)` → `decimal(P',S)` with `P' > P` and no scale change
-* *AND* the fixture step SHALL fail, not skip, if the Spark service, the REST catalog, or MinIO is
+* *AND* the fixture step SHALL fail, not skip, if the Spark service, the REST catalog, or SeaweedFS is
   unavailable
 
 ### Scenario: The new fixture and its suite are wired into the paths that actually run

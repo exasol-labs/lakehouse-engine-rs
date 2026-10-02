@@ -183,7 +183,7 @@ fn build_undecorated_store(
             })?;
 
             // `with_client_options` REPLACES the whole `ClientOptions`, so it must precede
-            // `with_allow_http`; reversed, `allow_http` is silently dropped (breaking MinIO).
+            // `with_allow_http`; reversed, `allow_http` is silently dropped (breaking SeaweedFS).
             let mut builder = AmazonS3Builder::new()
                 .with_bucket_name(bucket)
                 .with_region(&storage.region)

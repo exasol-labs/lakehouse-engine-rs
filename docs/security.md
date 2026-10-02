@@ -38,6 +38,8 @@ A reader with only `SELECT` on the virtual schema still sees, in the plan text: 
 
 A vended credential has no CONNECTION name to reference. It travels as AES-256-GCM ciphertext (HKDF-SHA256 key from the CONNECTION password, fresh 96-bit nonce). Vending without key material is refused at plan time.
 
+An assumed-role CONNECTION's session credentials travel sealed in the same envelope, like vended ones. The base key pair that signs `AssumeRole` never enters the scan spec.
+
 ## Rotation
 
 Every query re-resolves the CONNECTION — no cache, no restart. Use `ALTER CONNECTION` (preserves grants). Sealed envelopes of in-flight vended queries fail the AEAD open — rotate when no vended query is in flight.

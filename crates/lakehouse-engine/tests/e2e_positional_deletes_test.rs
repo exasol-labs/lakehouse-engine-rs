@@ -15,7 +15,7 @@ use common::pos_delete_fixtures::{
 };
 use common::seed::{E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, seed_events};
 use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
+    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 
 use lakehouse_engine::adapter::pushdown::shard_count;
@@ -38,7 +38,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_iceberg_catalog();
 
         let rt = tokio::runtime::Builder::new_current_thread()

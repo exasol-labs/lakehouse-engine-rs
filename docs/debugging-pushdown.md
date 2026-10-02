@@ -25,7 +25,7 @@ Then run the query. Compare the actual result with the result that the scan spec
 
 ## Try it against the bundled local stack first
 
-If you have no Virtual Schema deployed yet, use `scripts/capture-pushdown-payload.sh`. The script runs a query against the bundled local Docker stack (Exasol + MinIO + Iceberg REST) and a small seeded table. It prints the `EXPLAIN VIRTUAL` output and the real result in one step.
+If you have no Virtual Schema deployed yet, use `scripts/capture-pushdown-payload.sh`. The script runs a query against the bundled local Docker stack (Exasol + SeaweedFS + Iceberg REST) and a small seeded table. It prints the `EXPLAIN VIRTUAL` output and the real result in one step.
 
 ```bash
 scripts/capture-pushdown-payload.sh 'SELECT COUNT(*) FROM {table} WHERE c_date LIKE '"'"'2024%'"'"''

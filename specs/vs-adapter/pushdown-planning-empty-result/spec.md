@@ -64,7 +64,7 @@ instead of rejecting it for a column-count/type mismatch.
 
 ### Scenario: Row-scan query with all files pruned returns a typed empty projection
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a plain row-scan query (no aggregate, no GROUP BY) whose WHERE predicate prunes 100% of the table's data files during plan-time file pruning
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL return a `pushdown` response that selects each projected item as `CAST(NULL AS <type>)` and produces zero rows (`WHERE 1=0`)

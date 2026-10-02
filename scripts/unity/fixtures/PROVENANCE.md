@@ -4,7 +4,7 @@ These are prebuilt Delta Lake tables copied verbatim from the **delta-kernel-rs*
 test-data set at tag **v0.26.0** (`kernel/tests/data/`), the same reader chosen
 in spike #317. Apache-2.0 licensed. They are read fixtures — never mutated.
 
-| Directory | Upstream fixture | What it exercises | Serves | Verified read over MinIO |
+| Directory | Upstream fixture | What it exercises | Serves | Verified read over SeaweedFS |
 |---|---|---|---|---|
 | `table-with-dv-small/` | `table-with-dv-small` (dir) | **Deletion vector** applied | #320 | 10 raw → **8** rows (DV) |
 | `cdf-column-mapping-name-mode/` | `cdf-column-mapping-name-mode.tar.zst` | **Column mapping (name)** | #320 | `col-<uuid>` → `[id,name,value]` |
@@ -15,8 +15,8 @@ in spike #317. Apache-2.0 licensed. They are read fixtures — never mutated.
 | `unshredded-variant/` | `unshredded-variant.tar.zst` | **Unsupported reader feature** `variantType-preview` + nested variant/array/struct/map | #322 (fail-loud) | reads in kernel, 102 rows |
 | `type-widening/` | `type-widening` (dir) | **Type widening** `typeWidening-preview` (+`timestampNtz`); numeric/decimal widening, read across the widening boundary | #349 (read), was #322 (fail-loud) | reads in kernel, 2 rows; 11 of 13 columns queryable, `byte_decimal`/`short_decimal` refused per column (outside the protocol's supported list) |
 
-All verified over MinIO/S3 during the spike: `UC resolve → UC vend static creds →
-delta-kernel-rs read with a client-side MinIO endpoint override`.
+All verified over SeaweedFS/S3 during the spike: `UC resolve → UC vend static creds →
+delta-kernel-rs read with a client-side SeaweedFS endpoint override`.
 
 **#322 gating note:** the delta-kernel reader *reads* the "unsupported" tables
 (`variantType`, `typeWidening`, `timestampNtz`) without error — so #322's fail-loud

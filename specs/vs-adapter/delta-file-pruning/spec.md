@@ -243,4 +243,4 @@ predicate stays applied above the scan as the sole source of row-level correctne
 * *AND* the rows each query returns SHALL be identical to the rows the same query returns with pruning inert, so pruning is observable in the plan and invisible in the result
 * *AND* every request shape SHALL prune through the SAME seam, because the format-reader seam forwards the request's filter to the reader for a single-table scan and for each join leg alike (`vs-adapter/pushdown-format-neutral-resolution`), so no shape is left unpruned and none is gated on the table format
 * *AND* a join SHALL prune each side by that side's OWN side-local predicate, and MUST NOT apply one side's predicate to the other's file list
-* *AND* the suite MUST fail (not skip) when the Unity Catalog server, MinIO, or Exasol is unreachable
+* *AND* the suite MUST fail (not skip) when the Unity Catalog server, SeaweedFS, or Exasol is unreachable

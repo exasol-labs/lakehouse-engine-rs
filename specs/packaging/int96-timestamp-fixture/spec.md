@@ -9,7 +9,7 @@ with far-future sentinel values into Iceberg-registered tables; this fixture rep
 ## Background
 
 * The fixture reuses the existing `spark-iceberg-fixtures` one-shot Compose job and the shared
-  Iceberg REST catalog over MinIO every other E2E table uses — no new dependency is introduced.
+  Iceberg REST catalog over SeaweedFS every other E2E table uses — no new dependency is introduced.
 * Iceberg's own Spark writer emits Parquet INT64 timestamps regardless of
   `spark.sql.parquet.outputTimestampType` (verified), so a plain `INSERT INTO <iceberg_table>` does
   NOT produce INT96. INT96 reaches an Iceberg table only when Spark's NATIVE Parquet writer (with
@@ -38,9 +38,9 @@ with far-future sentinel values into Iceberg-registered tables; this fixture rep
 
 ### Scenario: Spark produces an INT96-encoded far-future-timestamp fixture
 
-* *GIVEN* the E2E stack is running with the shared REST catalog over MinIO and an Apache Spark service with the Iceberg Spark runtime
+* *GIVEN* the E2E stack is running with the shared REST catalog over SeaweedFS and an Apache Spark service with the Iceberg Spark runtime
 * *AND* Spark is configured to write Parquet timestamps as INT96 (`spark.sql.parquet.outputTimestampType=INT96`), scoped to this fixture's script
 * *WHEN* the fixture step writes a Spark-native Parquet table holding at least one row whose Iceberg `timestamp` (WITHOUT time zone) column is outside the Arrow nanosecond range (`9999-12-31 23:59:59`) and imports it into an Iceberg table via the Iceberg `add_files` procedure
 * *THEN* the fixture SHALL commit an Iceberg snapshot whose data file encodes the `timestamp` column as Parquet INT96, and a fixture-shape test SHALL assert that physical INT96 encoding directly from the committed data file so a silent INT64 result fails loudly
 * *AND* the fixture SHALL record the exact inserted rows and their timestamp values so a test can assert the scan result
-* *AND* the fixture step SHALL fail, not skip, if the Spark service, the REST catalog, or MinIO is unavailable
+* *AND* the fixture step SHALL fail, not skip, if the Spark service, the REST catalog, or SeaweedFS is unavailable

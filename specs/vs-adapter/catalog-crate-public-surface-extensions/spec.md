@@ -167,3 +167,12 @@ feature's own scenario count crossed the same threshold.
 * *AND* each of the two signing paths SHALL resolve its region through that method once per session or enumeration, and SHALL refuse to sign, returning an error that names `region` and contains no credential value, when the method returns nothing
 * *AND* the method SHALL name no Exasol CONNECTION or virtual-schema-property delivery mechanism, and no `lakehouse-catalog` source file SHALL name `lakehouse_engine`
 * *AND* the probe SHALL call the method, and its existing demotion assertions SHALL remain intact and unweakened
+
+### Scenario: The AWS identity resolver extends the crate's public surface through an explicit reviewed edit
+
+* *GIVEN* the enumerated public surface of `lakehouse-catalog` and its external-vantage reachability probe at `crates/lakehouse-catalog/tests/catalog_public_surface.rs`
+* *WHEN* the adapter gains AWS IAM role assumption under `vs-adapter/connection-credentials-assume-role`
+* *THEN* the crate SHALL add ONE `pub` async function that resolves the AWS identity a request acts as, re-exported at the crate root
+* *AND* `ConnectionCreds` SHALL gain the `aws_assume_role_arn`, `aws_external_id`, and `aws_sts_endpoint` fields and ONE `assume_role_arn()` accessor, which is the sole definition of whether a set names a role
+* *AND* the crate SHALL gain ONE manifest dependency, the official `aws-sdk-sts` client
+* *AND* the endpoint consent gate, the SDK client construction, and the error redaction SHALL stay crate-private

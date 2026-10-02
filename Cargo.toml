@@ -57,3 +57,6 @@ aws-credential-types   = { version = "1.2" }
 aws-smithy-runtime-api = { version = "1", features = ["client"] }
 
 reqwest = { version = "0.12" }
+
+# Official AWS STS client: owns the AssumeRole wire protocol, signing, and endpoint rules.
+aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
