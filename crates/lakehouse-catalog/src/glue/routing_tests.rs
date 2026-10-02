@@ -1,7 +1,7 @@
 use super::*;
 use std::collections::HashMap;
 
-const ORC_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
+use crate::test_support::ORC_INPUT_FORMAT;
 const METADATA: &str = "s3://bucket/orders/metadata/00001-abc.metadata.json";
 
 fn params(pairs: &[(&str, &str)]) -> HashMap<String, String> {

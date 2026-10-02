@@ -25,7 +25,7 @@ Glue Parquet tables use the Unity Parquet reader. The reader is generalized over
 ### Consequences
 
 - The shared partition predicate compares under declared types. Direct storage passes utf8 and keeps string comparison.
-- The shared listing takes a file pattern. Unity and direct storage pass `**/*.parquet`, and Glue passes `*`.
+- The shared listing takes a `FilePattern`. Unity and direct storage pass `ParquetAtAnyDepth`, and Glue passes `AnyDirectChild`.
 - No predicate goes into Glue's `Expression`, because a second translator's error returns wrong rows under full delegation.
 - The plan adds no `ScanSpec`, `FileEntry`, or `LogicalField` field.
 

@@ -1,13 +1,11 @@
 use super::super::super::test_support::{
-    RecordingCatalog, load_table_body_with_columns, object_endpoint, sample_storage, user_message,
+    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields, glue_catalog_table,
+    load_table_body_with_columns, object_endpoint, sample_storage, user_message,
 };
 use super::super::binary_cause;
 use super::*;
 use iceberg::spec::{DataContentType, DataFileFormat};
-use lakehouse_catalog::{
-    CatalogColumn, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
-    StorageBackend, TableFormat,
-};
+use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 
 /// SigV4 mode makes `loadTable` the only request, so a single-shot loopback catalog suffices.
 fn one_request_sigv4_creds() -> ConnectionCreds {
@@ -203,10 +201,7 @@ fn unsupported_delete_error_names_mechanism_and_redacts() {
         UnsupportedDeleteMechanism::DeletionVector,
         "db.mor_dv_table",
     );
-    let msg = match err {
-        UdfError::User(m) => m,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    };
+    let msg = user_message(err);
     assert!(
         msg.contains("Iceberg v3 Puffin deletion vectors"),
         "error must name the mechanism: {msg}"
@@ -343,10 +338,7 @@ fn malformed_name_mapping_errors_cleanly() {
     let err = parse_name_mapping(Some("{ not valid json mapping shape"))
         .expect_err("malformed name-mapping JSON must error");
 
-    let msg = match err {
-        UdfError::User(m) => m,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    };
+    let msg = user_message(err);
     assert!(
         msg.contains(iceberg::spec::DEFAULT_SCHEMA_NAME_MAPPING),
         "error must name the offending property: {msg}"
@@ -430,14 +422,8 @@ async fn absent_table_location_errors_on_both_vended_and_static_paths() {
         .await
         .expect_err("static path must reject a loadTable response with an empty location");
 
-    let vended_message = match vended_err {
-        UdfError::User(m) => m,
-        other => panic!("vended path must fail as a user error, got {other:?}"),
-    };
-    let static_message = match static_err {
-        UdfError::User(m) => m,
-        other => panic!("static path must fail as a user error, got {other:?}"),
-    };
+    let vended_message = user_message(vended_err);
+    let static_message = user_message(static_err);
 
     for (path, message) in [("vended", &vended_message), ("static", &static_message)] {
         assert!(
@@ -593,10 +579,7 @@ fn date_to_timestamp_promotion_is_refused_naming_table_column_both_types_and_the
     let err = refuse_date_promotion(&metadata, "db.promoted")
         .expect_err("a recorded date -> timestamp promotion must be refused");
 
-    let msg = match err {
-        UdfError::User(m) => m,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    };
+    let msg = user_message(err);
     assert!(
         msg.contains("db.promoted"),
         "error must name the table: {msg}"
@@ -640,10 +623,7 @@ fn date_to_timestamp_ns_promotion_is_refused() {
     let err = refuse_date_promotion(&metadata, "db.promoted_ns")
         .expect_err("a recorded date -> timestamp_ns promotion must be refused");
 
-    let msg = match err {
-        UdfError::User(m) => m,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    };
+    let msg = user_message(err);
     assert!(
         msg.contains("'timestamp_ns'"),
         "error must name the current Iceberg type: {msg}"
@@ -702,10 +682,7 @@ fn a_date_promotion_nested_inside_a_struct_is_refused_by_its_full_name() {
     let err = refuse_date_promotion(&metadata, "db.nested")
         .expect_err("a date promotion on a nested field must be refused");
 
-    let msg = match err {
-        UdfError::User(m) => m,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    };
+    let msg = user_message(err);
     assert!(
         msg.contains("payload.stamped"),
         "error must name the nested column by its full path: {msg}"
@@ -828,10 +805,7 @@ async fn resolve_promoted_date_table(filter_json: Option<&Json>) -> Result<Resol
 }
 
 fn assert_promotion_refusal_names_table_column_and_issue(err: UdfError) {
-    let msg = match err {
-        UdfError::User(m) => m,
-        other => panic!("expected UdfError::User, got {other:?}"),
-    };
+    let msg = user_message(err);
     assert!(
         msg.contains("db.promoted"),
         "error must name the table: {msg}"
@@ -869,22 +843,14 @@ async fn resolve_scan_refuses_a_promoted_date_table_for_a_filtered_request() {
 
 fn glue_iceberg_table(name: &str, metadata_location: Option<&str>) -> CatalogTable {
     CatalogTable {
-        ident: CatalogTableIdent {
-            namespace: vec!["db".into()],
-            name: name.into(),
-        },
-        table_type: CatalogTableType::Table,
-        storage_location: Some(format!("s3://bucket/glue-declared/{name}")),
-        format: TableFormat::Iceberg,
-        vended_credential_key: None,
-        partition_columns: Vec::new(),
-        columns: vec![CatalogColumn {
-            name: "glue_only".into(),
-            source_type: ColumnSourceType::Glue {
-                hive_type: "binary".into(),
-            },
-        }],
         metadata_location: metadata_location.map(str::to_string),
+        ..glue_catalog_table(
+            "db",
+            name,
+            TableFormat::Iceberg,
+            &format!("s3://bucket/glue-declared/{name}"),
+            &[("glue_only", "binary")],
+        )
     }
 }
 
@@ -1153,28 +1119,10 @@ async fn resolve_table_with_columns(
 /// Scenario: A binary column is refused on every catalog-declared format at every depth
 #[tokio::test]
 async fn iceberg_binary_fixed_and_uuid_columns_are_refused() {
-    let fields = serde_json::json!([
-        {"id": 1, "name": "id", "required": false, "type": "int"},
-        {"id": 2, "name": "b", "required": false, "type": "binary"},
-        {"id": 3, "name": "f", "required": false, "type": "fixed[16]"},
-        {"id": 4, "name": "u", "required": false, "type": "uuid"},
-        {"id": 5, "name": "s", "required": false, "type": {"type": "struct", "fields": [
-            {"id": 6, "name": "ok", "required": false, "type": "string"},
-            {"id": 7, "name": "x", "required": false, "type": "binary"}
-        ]}},
-        {"id": 8, "name": "l", "required": false, "type": {
-            "type": "list", "element-id": 9, "element": "fixed[4]", "element-required": false
-        }},
-        {"id": 10, "name": "m", "required": false, "type": {
-            "type": "map", "key-id": 11, "key": "string",
-            "value-id": 12, "value": "uuid", "value-required": false
-        }},
-        {"id": 13, "name": "name", "required": false, "type": "string"}
-    ]);
-
-    let resolved = resolve_table_with_columns(fields, 13)
-        .await
-        .expect("a table with a mappable column plans, refusing only its binary columns");
+    let resolved =
+        resolve_table_with_columns(binary_iceberg_fields(), BINARY_ICEBERG_LAST_COLUMN_ID)
+            .await
+            .expect("a table with a mappable column plans, refusing only its binary columns");
 
     assert_eq!(
         resolved

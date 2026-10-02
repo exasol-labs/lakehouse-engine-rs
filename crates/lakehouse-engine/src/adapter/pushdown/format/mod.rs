@@ -78,7 +78,7 @@ fn binary_cause(declared: &str) -> String {
 }
 
 /// `member_path` is `None` when the column's own type is the binary one.
-fn binary_refusal(
+pub(super) fn binary_refusal(
     label: &str,
     column: &str,
     member_path: Option<&str>,

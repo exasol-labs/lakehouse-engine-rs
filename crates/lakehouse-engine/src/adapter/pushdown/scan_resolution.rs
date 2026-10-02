@@ -3,7 +3,7 @@ use std::sync::Arc;
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
     CatalogClient, CatalogProps, CatalogSession, CatalogTableIdent, GlueCatalogSession,
-    UnityCatalogSession, parse_table_ident,
+    UnityCatalogSession, parse_glue_table_ident, parse_table_ident,
 };
 use object_store::ObjectStore;
 use serde_json::Value as Json;
@@ -78,7 +78,7 @@ impl<'a> TableScanResolver<'a> {
             }
             CatalogKind::Glue => {
                 for identifier in table_identifiers {
-                    glue_table_ident(identifier)?;
+                    parse_glue_table_ident(identifier)?;
                 }
                 RequestSession::Glue(Box::new(GlueCatalogSession::new(
                     catalog_uri,
@@ -149,7 +149,7 @@ impl<'a> TableScanResolver<'a> {
             }
             RequestSession::Glue(session) => {
                 let table = session
-                    .load_table_for_planning(&glue_table_ident(table_identifier)?)
+                    .load_table_for_planning(&parse_glue_table_ident(table_identifier)?)
                     .await?;
                 let reader = format_reader(
                     ScanSource::Glue {
@@ -225,21 +225,4 @@ fn unity_table_ident(table_identifier: &str) -> Result<CatalogTableIdent, UdfErr
         namespace: namespace.split('.').map(String::from).collect(),
         name: name.to_string(),
     })
-}
-
-/// Split at the first dot: a Glue identifier is `database.table`, and a database name holds no dot.
-fn glue_table_ident(table_identifier: &str) -> Result<CatalogTableIdent, UdfError> {
-    match table_identifier.split_once('.') {
-        Some((database, name)) if !database.trim().is_empty() && !name.trim().is_empty() => {
-            Ok(CatalogTableIdent {
-                namespace: vec![database.to_string()],
-                name: name.to_string(),
-            })
-        }
-        _ => Err(UdfError::User(format!(
-            "pushdown: the recorded catalog identifier '{table_identifier}' names no Glue table \
-             — a Glue table is addressed as 'database.table'; drop and recreate the virtual \
-             schema"
-        ))),
-    }
 }

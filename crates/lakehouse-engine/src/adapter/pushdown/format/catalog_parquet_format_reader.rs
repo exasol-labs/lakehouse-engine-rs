@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::iter;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -9,7 +10,7 @@ use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
 use lakehouse_catalog::{
     CatalogColumn, CatalogPartition, CatalogTable, ColumnSourceType, GlueCatalogSession,
-    StorageBackend,
+    PartitionFormat, StorageBackend,
 };
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
@@ -24,7 +25,7 @@ use super::{
     ensure_table_has_a_mappable_column,
 };
 use crate::adapter::parquet_directory::{
-    FilePattern, ParquetFile, PartitionKeepPredicate, list_location_files, list_parquet_files,
+    FilePattern, PartitionKeepPredicate, list_location_files, list_parquet_files,
     raw_location_prefix, store_prefix,
 };
 use crate::adapter::tables::catalog_identifier_string;
@@ -79,29 +80,35 @@ impl ParquetFileSource<'_> {
         keep: &PartitionKeepPredicate,
     ) -> Result<PlannedFiles, UdfError> {
         match self {
-            Self::TableDirectory(storage) => {
-                let (table_root, effective_storage) = storage.resolve().await?;
-                let secrets = effective_storage.secret_values();
-                let files = list_table_directory(
-                    table_root,
-                    &effective_storage,
-                    &secrets,
-                    &table.partition_columns,
-                    keep,
-                )
-                .await
-                .map_err(|error| redacted(error, &secrets))?;
-                Ok(PlannedFiles {
-                    table_root: table_root.to_string(),
-                    effective_storage,
-                    files,
-                })
-            }
+            Self::TableDirectory(storage) => plan_table_directory(storage, table, keep).await,
             Self::GluePartitions { session, storage } => {
                 plan_glue_table(session, storage, table, keep).await
             }
         }
     }
+}
+
+async fn plan_table_directory(
+    storage: &UnityTableStorage<'_>,
+    table: &CatalogTable,
+    keep: &PartitionKeepPredicate,
+) -> Result<PlannedFiles, UdfError> {
+    let (table_root, effective_storage) = storage.resolve().await?;
+    let secrets = effective_storage.secret_values();
+    let files = list_table_directory(
+        table_root,
+        &effective_storage,
+        &secrets,
+        &table.partition_columns,
+        keep,
+    )
+    .await
+    .map_err(|error| redacted(error, &secrets))?;
+    Ok(PlannedFiles {
+        table_root: table_root.to_string(),
+        effective_storage,
+        files,
+    })
 }
 
 async fn plan_glue_table(
@@ -113,11 +120,13 @@ async fn plan_glue_table(
     let location = checked_storage_location(table, "Glue")?;
     let secrets = storage.secret_values();
     let planned = async {
-        let table_root = scan_table_root(location)?;
+        let (store_root, table_prefix) = raw_location_prefix(location)?;
+        let table_root = scan_table_root(&store_root, &table_prefix);
         let partitions = session.partitions(table).await?;
         let store =
             build_table_root_store(storage, &table_root, DEFAULT_S3_MAX_CONNECTIONS, &secrets)?;
-        let files = plan_glue_partitions(&store, location, partitions, keep).await?;
+        let files =
+            plan_glue_partitions(&store, &store_root, &table_prefix, partitions, keep).await?;
         Ok((table_root, files))
     };
     let (table_root, files) = planned.await.map_err(|error| redacted(error, &secrets))?;
@@ -130,58 +139,50 @@ async fn plan_glue_table(
 
 /// The scan parses its table root as a URL, so the raw key's `%`, `#`, and `?` are escaped, and
 /// `s3a` reads as `s3` so every file of the table addresses one store.
-fn scan_table_root(location: &str) -> Result<String, UdfError> {
-    let (store_root, prefix) = raw_location_prefix(location)?;
-    Ok(format!(
+fn scan_table_root(store_root: &str, prefix: &StorePath) -> String {
+    format!(
         "{store_root}/{}",
-        encode_file_path(prefix.parts(), location.len())
-    ))
+        encode_file_path(prefix.parts(), prefix.as_ref().len())
+    )
 }
 
 /// Only direct children are listed, so a nested partition location is never read twice. Values
-/// are Glue's, never parsed from the path; a file outside `table_location` keeps an absolute path.
+/// are Glue's, never parsed from the path; a file outside `table_prefix` keeps an absolute path.
 async fn plan_glue_partitions(
     store: &Arc<dyn ObjectStore>,
-    table_location: &str,
+    store_root: &str,
+    table_prefix: &StorePath,
     partitions: Vec<CatalogPartition>,
     keep: &PartitionKeepPredicate,
 ) -> Result<Vec<FileEntry>, UdfError> {
-    let (store_root, table_prefix) = raw_location_prefix(table_location)?;
     let kept = partitions
         .into_iter()
         .filter(|partition| keep(&partition.values))
         .map(|partition| {
             Ok((
-                readable_partition_prefix(&partition, &store_root)?,
+                readable_partition_prefix(&partition, store_root)?,
                 partition.values,
             ))
         })
         .collect::<Result<Vec<_>, UdfError>>()?;
 
-    let (store_root, table_prefix) = (store_root.as_str(), &table_prefix);
-    let listed: Vec<Vec<FileEntry>> = stream::iter(kept)
+    let mut files: Vec<FileEntry> = stream::iter(kept)
         .map(|(prefix, values)| async move {
-            let files = list_location_files(store, &prefix, FilePattern::AnyDirectChild).await?;
+            let listed = list_location_files(store, &prefix, FilePattern::AnyDirectChild).await?;
+            let count = listed.len();
             Ok::<_, UdfError>(
-                files
+                listed
                     .into_iter()
-                    .map(|file| {
-                        let file = ParquetFile {
-                            path: file.path,
-                            size: file.size,
-                            partition_values: values.clone(),
-                            footer: None,
-                        };
-                        file_entry(file, table_prefix, store_root)
+                    .zip(iter::repeat_n(values, count))
+                    .map(|(file, values)| {
+                        file_entry(file.with_partition_values(values), table_prefix, store_root)
                     })
-                    .collect(),
+                    .collect::<Vec<_>>(),
             )
         })
         .buffer_unordered(DEFAULT_S3_MAX_CONNECTIONS)
-        .try_collect()
+        .try_concat()
         .await?;
-
-    let mut files: Vec<FileEntry> = listed.into_iter().flatten().collect();
     files.sort_by(|left, right| left.path.cmp(&right.path));
     Ok(files)
 }
@@ -205,10 +206,9 @@ fn readable_partition_prefix(
             partition.location
         ))
     };
-    if !partition.is_parquet() {
+    if let PartitionFormat::Unsupported { input_format } = &partition.format {
         return Err(refused(format!(
-            "its input format '{}' is not Parquet",
-            partition.input_format
+            "its input format '{input_format}' is not Parquet"
         )));
     }
     let (store_root, prefix) = raw_location_prefix(&partition.location)?;

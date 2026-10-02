@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
+use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
 
 pub(super) type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -68,7 +69,8 @@ pub(super) trait GlueSource: Send + Sync {
     fn iceberg_metadata<'a>(
         &'a self,
         location: &'a str,
-    ) -> SourceFuture<'a, Result<TableMetadata, String>>;
+        table_name: &'a str,
+    ) -> SourceFuture<'a, Result<TableMetadata, UdfError>>;
 }
 
 pub(super) fn classify_service_error(

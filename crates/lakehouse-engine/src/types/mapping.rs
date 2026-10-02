@@ -415,47 +415,9 @@ pub(crate) fn column_source_type_to_exasol(
 /// unparseable type declares VARCHAR(2000000), so a column type never fails the listing.
 fn hive_type_to_exasol(hive_type: &str, engine: EngineTimestampSupport) -> String {
     match parse_hive_type(hive_type) {
-        Ok(SparkType::Primitive(primitive)) => {
-            let (type_name, decimal) = spark_primitive_type_name(&primitive);
-            unity_type_name_to_exasol(type_name, decimal, engine)
-        }
+        Ok(SparkType::Primitive(primitive)) => spark_primitive_to_exasol(&primitive, engine),
         _ => "VARCHAR(2000000)".to_string(),
     }
-}
-
-fn spark_primitive_type_name(primitive: &SparkPrimitive) -> (&'static str, CatalogDecimal) {
-    let type_name = match primitive {
-        SparkPrimitive::Decimal(decimal) => {
-            return (
-                "DECIMAL",
-                CatalogDecimal {
-                    precision: decimal.precision().into(),
-                    scale: decimal.scale().into(),
-                },
-            );
-        }
-        SparkPrimitive::Byte => "BYTE",
-        SparkPrimitive::Short => "SHORT",
-        SparkPrimitive::Integer => "INT",
-        SparkPrimitive::Long => "LONG",
-        SparkPrimitive::Float => "FLOAT",
-        SparkPrimitive::Double => "DOUBLE",
-        SparkPrimitive::Boolean => "BOOLEAN",
-        SparkPrimitive::String => "STRING",
-        SparkPrimitive::Date => "DATE",
-        SparkPrimitive::Timestamp => "TIMESTAMP",
-        SparkPrimitive::TimestampNtz => "TIMESTAMP_NTZ",
-        SparkPrimitive::Binary => "BINARY",
-        SparkPrimitive::Void => "VOID",
-        SparkPrimitive::IntervalYearMonth | SparkPrimitive::IntervalDayTime => "INTERVAL",
-    };
-    (
-        type_name,
-        CatalogDecimal {
-            precision: 0,
-            scale: 0,
-        },
-    )
 }
 
 /// Unmappable Spark types fall back to VARCHAR(2000000) rather than failing enumeration.
@@ -464,22 +426,46 @@ fn unity_type_name_to_exasol(
     decimal: CatalogDecimal,
     engine: EngineTimestampSupport,
 ) -> String {
-    match type_name {
-        "BOOLEAN" => "BOOLEAN".to_string(),
-        "BYTE" => "DECIMAL(3,0)".to_string(),
-        "SHORT" => "DECIMAL(5,0)".to_string(),
-        "INT" => "DECIMAL(10,0)".to_string(),
-        "LONG" => "DECIMAL(20,0)".to_string(),
-        "FLOAT" | "DOUBLE" => "DOUBLE PRECISION".to_string(),
-        "STRING" => "VARCHAR(2000000)".to_string(),
-        "DATE" => "DATE".to_string(),
+    let primitive = match type_name {
+        // Unity reports the precision and scale beside the name, possibly outside Spark's domain.
+        "DECIMAL" => return catalog_decimal_to_exasol(decimal.precision, decimal.scale),
+        "BOOLEAN" => SparkPrimitive::Boolean,
+        "BYTE" => SparkPrimitive::Byte,
+        "SHORT" => SparkPrimitive::Short,
+        "INT" => SparkPrimitive::Integer,
+        "LONG" => SparkPrimitive::Long,
+        "FLOAT" => SparkPrimitive::Float,
+        "DOUBLE" => SparkPrimitive::Double,
+        "DATE" => SparkPrimitive::Date,
+        "TIMESTAMP" => SparkPrimitive::Timestamp,
+        "TIMESTAMP_NTZ" => SparkPrimitive::TimestampNtz,
+        _ => SparkPrimitive::String,
+    };
+    spark_primitive_to_exasol(&primitive, engine)
+}
+
+fn spark_primitive_to_exasol(primitive: &SparkPrimitive, engine: EngineTimestampSupport) -> String {
+    match primitive {
+        SparkPrimitive::Boolean => "BOOLEAN".to_string(),
+        SparkPrimitive::Byte => "DECIMAL(3,0)".to_string(),
+        SparkPrimitive::Short => "DECIMAL(5,0)".to_string(),
+        SparkPrimitive::Integer => "DECIMAL(10,0)".to_string(),
+        SparkPrimitive::Long => "DECIMAL(20,0)".to_string(),
+        SparkPrimitive::Float | SparkPrimitive::Double => "DOUBLE PRECISION".to_string(),
+        SparkPrimitive::Date => "DATE".to_string(),
         // The Delta protocol defines no nanosecond timestamp type.
-        "TIMESTAMP" | "TIMESTAMP_NTZ" => engine
+        SparkPrimitive::Timestamp | SparkPrimitive::TimestampNtz => engine
             .clamp(TimestampPrecision::Microsecond)
             .declaration()
             .to_string(),
-        "DECIMAL" => catalog_decimal_to_exasol(decimal.precision, decimal.scale),
-        _ => "VARCHAR(2000000)".to_string(),
+        SparkPrimitive::Decimal(decimal) => {
+            catalog_decimal_to_exasol(decimal.precision().into(), decimal.scale().into())
+        }
+        SparkPrimitive::String
+        | SparkPrimitive::Binary
+        | SparkPrimitive::Void
+        | SparkPrimitive::IntervalYearMonth
+        | SparkPrimitive::IntervalDayTime => "VARCHAR(2000000)".to_string(),
     }
 }
 

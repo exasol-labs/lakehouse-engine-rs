@@ -13,8 +13,8 @@ use std::collections::HashSet;
 use super::partition_predicate::PartitionPredicate;
 use super::{FormatReader, RefusedColumn, ResolvedScan, binary_refusal, without_refused_columns};
 use crate::adapter::parquet_directory::{
-    BinaryColumn, DirectoryOptions, NESTED_ENUM_TYPE, ParquetDirectory, ParquetFile,
-    resolve_parquet_directory, store_prefix,
+    BinaryColumn, DirectoryOptions, ParquetDirectory, ParquetFile, resolve_parquet_directory,
+    store_prefix,
 };
 use crate::scan::spec::{FileEntry, LogicalField, NestedField, NestedMembers};
 use crate::scan::{encode_file_path, store_root_url};
@@ -119,7 +119,7 @@ fn parquet_refusal(column: &BinaryColumn) -> RefusedColumn {
         column.member_path.as_deref(),
         &column.declared,
     );
-    if column.declared == NESTED_ENUM_TYPE {
+    if column.nested_enum {
         refusal
             .reason
             .push_str("; a Parquet ENUM is read as text only as a top-level, non-repeated column");

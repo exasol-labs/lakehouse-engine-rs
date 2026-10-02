@@ -4,8 +4,9 @@
 //! the real value with no post-scan rewrite.
 
 use crate::scan::spec::FileEntry;
-use arrow::datatypes::{FieldRef, Schema, SchemaRef};
+use arrow::datatypes::{DataType, FieldRef, Schema, SchemaRef};
 use datafusion::datasource::table_schema::TableSchema;
+use datafusion::error::DataFusionError;
 use datafusion::scalar::ScalarValue;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -146,12 +147,8 @@ impl PartitionedScanSchema {
                         field.name()
                     )
                 })?;
-                match logged.as_deref().filter(|value| !value.is_empty()) {
-                    Some(value) => ScalarValue::try_from_string(
-                        value.to_string(),
-                        field.data_type(),
-                    )
-                    .map_err(|e| {
+                match non_null_partition_value(logged.as_deref()) {
+                    Some(value) => partition_scalar(value, field.data_type()).map_err(|e| {
                         format!(
                             "partition value '{value}' for column '{}' is not a valid {} ({e})",
                             field.name(),
@@ -169,6 +166,20 @@ impl PartitionedScanSchema {
             })
             .collect()
     }
+}
+
+/// Absent and empty both read as NULL: Delta logs a NULL partition value as an empty string.
+pub(crate) fn non_null_partition_value(logged: Option<&str>) -> Option<&str> {
+    logged.filter(|value| !value.is_empty())
+}
+
+/// The planning-time partition predicate converts with this too, so it and the scan agree on
+/// every value (`vs-adapter/partition-predicate-declared-types`).
+pub(crate) fn partition_scalar(
+    value: &str,
+    data_type: &DataType,
+) -> Result<ScalarValue, DataFusionError> {
+    ScalarValue::try_from_string(value.to_string(), data_type)
 }
 
 #[cfg(test)]

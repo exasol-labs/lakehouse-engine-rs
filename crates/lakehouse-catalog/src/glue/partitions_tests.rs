@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use super::*;
 
-const ORC_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
+use crate::test_support::ORC_INPUT_FORMAT;
 const TABLE: &str = "sales.events";
 
 fn partition_keys() -> Vec<String> {
@@ -28,7 +28,7 @@ fn values(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<String>> {
         .collect()
 }
 
-fn neutral(partition: &GluePartition) -> Result<CatalogPartition, String> {
+fn neutral(partition: GluePartition) -> Result<CatalogPartition, String> {
     neutral_partition(TABLE, &partition_keys(), partition)
 }
 
@@ -49,7 +49,7 @@ fn partitions_carry_glue_values_the_default_partition_as_null_and_their_own_form
                     ("p_str", Some("a")),
                 ]),
                 location: "s3://bucket/events/p_int=7/p_date=2024-07-07/p_str=z".to_string(),
-                input_format: PARQUET_INPUT_FORMAT.to_string(),
+                format: PartitionFormat::Parquet,
             },
         ),
         (
@@ -65,7 +65,7 @@ fn partitions_carry_glue_values_the_default_partition_as_null_and_their_own_form
                     ("p_str", Some("b")),
                 ]),
                 location: "s3://bucket/events/p_int=__HIVE_DEFAULT_PARTITION__".to_string(),
-                input_format: PARQUET_INPUT_FORMAT.to_string(),
+                format: PartitionFormat::Parquet,
             },
         ),
         (
@@ -81,7 +81,7 @@ fn partitions_carry_glue_values_the_default_partition_as_null_and_their_own_form
                     ("p_str", Some("c")),
                 ]),
                 location: "s3://other/elsewhere".to_string(),
-                input_format: PARQUET_INPUT_FORMAT.to_string(),
+                format: PartitionFormat::Parquet,
             },
         ),
         (
@@ -97,25 +97,24 @@ fn partitions_carry_glue_values_the_default_partition_as_null_and_their_own_form
                     ("p_str", Some("z")),
                 ]),
                 location: "s3://bucket/events/p_int=9".to_string(),
-                input_format: ORC_INPUT_FORMAT.to_string(),
+                format: PartitionFormat::Unsupported {
+                    input_format: ORC_INPUT_FORMAT.to_string(),
+                },
             },
         ),
     ];
 
     for (glue, expected) in cases {
-        let neutral = neutral(&glue).expect("a well-formed partition converts");
         assert_eq!(
-            neutral.is_parquet(),
-            neutral.input_format == PARQUET_INPUT_FORMAT,
-            "only the mapred Parquet input format reads as Parquet"
+            neutral(glue).expect("a well-formed partition converts"),
+            expected
         );
-        assert_eq!(neutral, expected);
     }
 }
 
 #[test]
 fn a_partition_without_a_location_fails_naming_its_values() {
-    let message = neutral(&partition(
+    let message = neutral(partition(
         &["1", "2024-01-01", "a"],
         None,
         Some(PARQUET_INPUT_FORMAT),

@@ -40,7 +40,7 @@ Resolves a Unity Catalog table whose `data_source_format` is `PARQUET` into the 
 * *WHEN* the reader resolves that table's scan
 * *THEN* every logical field SHALL be declared NULLABLE whatever nullability the catalog declares, because a column absent from one data file reads NULL for that file's rows, and a required declaration would fail the scan instead
 * *AND* a column whose `type_json` is absent or does not parse as a Spark field SHALL be refused by name, with a reason naming the missing or unreadable descriptor, rather than typed by a guess
-* *AND* a table whose every column is refused SHALL be refused as a whole, exactly as a Delta table is
+* *AND* a table whose every column is refused SHALL be refused as a whole, per `vs-adapter/delta-type-mapping`
 
 ### Scenario: The scan applies its shared cast and admission rules, unchanged, to a Unity Parquet column
 

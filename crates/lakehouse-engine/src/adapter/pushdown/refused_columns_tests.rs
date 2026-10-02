@@ -1,9 +1,13 @@
 use serde_json::json;
 
 use super::*;
+use crate::adapter::pushdown::format::binary_refusal;
+use crate::adapter::pushdown::test_support::user_message;
 
-const BINARY_REASON: &str = "Delta column 'binary_col' has type 'binary', which this engine \
-     refuses rather than casting to text; JSON rendering for binary is tracked as issue #351";
+fn binary_reason() -> String {
+    binary_refusal("Delta", "binary_col", None, "binary").reason
+}
+
 const VARIANT_REASON: &str = "Delta column 'variant_col' has type 'variant', whose on-disk form is \
      an opaque (metadata, value) binary pair this engine cannot render as a meaningful value";
 
@@ -11,13 +15,6 @@ fn refused_column(column_name: &str, reason: &str) -> RefusedColumn {
     RefusedColumn {
         column_name: column_name.to_string(),
         reason: reason.to_string(),
-    }
-}
-
-fn user_message(err: UdfError) -> String {
-    match err {
-        UdfError::User(message) => message,
-        other => panic!("expected UdfError::User, got {other:?}"),
     }
 }
 
@@ -54,7 +51,7 @@ fn a_request_touching_no_refused_column_is_admitted() {
     let gated = ensure_no_refused_column_referenced(
         &request,
         Some(&projection),
-        &[refused_column("binary_col", BINARY_REASON)],
+        &[refused_column("binary_col", &binary_reason())],
     );
 
     assert!(
@@ -122,13 +119,13 @@ fn a_refused_column_buried_in_a_nested_predicate_is_refused_with_its_reason() {
     let err = ensure_no_refused_column_referenced(
         &request,
         Some(&projection),
-        &[refused_column("binary_col", BINARY_REASON)],
+        &[refused_column("binary_col", &binary_reason())],
     )
     .expect_err("a filter reaching BINARY_COL at any depth must be refused");
 
     let message = user_message(err);
     assert!(
-        message.contains(BINARY_REASON),
+        message.contains(&binary_reason()),
         "refusal must carry the reader's own reason for the column, got: {message}"
     );
 }
@@ -152,13 +149,13 @@ fn a_full_row_projection_refuses_a_column_the_request_json_never_names() {
     let err = ensure_no_refused_column_referenced(
         &request,
         Some(&projection),
-        &[refused_column("binary_col", BINARY_REASON)],
+        &[refused_column("binary_col", &binary_reason())],
     )
     .expect_err("a full-base-row projection emitting BINARY_COL must be refused");
 
     let message = user_message(err);
     assert!(
-        message.contains(BINARY_REASON),
+        message.contains(&binary_reason()),
         "refusal must carry the reader's own reason for the emitted column, got: {message}"
     );
 }
@@ -179,7 +176,7 @@ fn a_widened_projection_from_an_aggregate_select_list_is_not_unioned_into_the_to
     let gated = ensure_no_refused_column_referenced(
         &request,
         None,
-        &[refused_column("binary_col", BINARY_REASON)],
+        &[refused_column("binary_col", &binary_reason())],
     );
 
     assert!(
@@ -209,12 +206,12 @@ fn a_widened_projection_is_still_refused_when_the_request_itself_names_a_refused
     let err = ensure_no_refused_column_referenced(
         &request,
         None,
-        &[refused_column("binary_col", BINARY_REASON)],
+        &[refused_column("binary_col", &binary_reason())],
     )
     .expect_err("an aggregate whose argument names the refused column must be refused");
 
     assert!(
-        user_message(err).contains(BINARY_REASON),
+        user_message(err).contains(&binary_reason()),
         "withholding the widened projection must not withhold the walk's own finding"
     );
 }
@@ -244,7 +241,7 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
         &request,
         Some(&projection),
         &[
-            refused_column("binary_col", BINARY_REASON),
+            refused_column("binary_col", &binary_reason()),
             refused_column("variant_col", VARIANT_REASON),
         ],
     )
@@ -252,7 +249,7 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
 
     let message = user_message(err);
     let binary_position = message
-        .find(BINARY_REASON)
+        .find(&binary_reason())
         .expect("refusal must carry the emitted column's reason");
     let variant_position = message
         .find(VARIANT_REASON)
@@ -265,7 +262,7 @@ fn every_refused_column_a_request_touches_is_named_in_one_error() {
 
 #[test]
 fn only_binary_col_refuses_requests_in_the_stats_all_types_shape() {
-    let refused = [refused_column("binary_col", BINARY_REASON)];
+    let refused = [refused_column("binary_col", &binary_reason())];
     let nested_request = json!({
         "involvedTables": involved_tables(),
         "pushdownRequest": {
@@ -296,7 +293,7 @@ fn only_binary_col_refuses_requests_in_the_stats_all_types_shape() {
 
     let err = ensure_no_refused_column_referenced(&binary_request, None, &refused)
         .expect_err("a request naming BINARY_COL must still be refused");
-    assert!(user_message(err).contains(BINARY_REASON));
+    assert!(user_message(err).contains(&binary_reason()));
 }
 
 /// Scenario: A refused column refuses only the requests that read or emit it
@@ -316,12 +313,12 @@ fn a_lower_cased_column_reference_matches_a_refused_column() {
     let err = ensure_no_refused_column_referenced(
         &request,
         Some(&projection),
-        &[refused_column("binary_col", BINARY_REASON)],
+        &[refused_column("binary_col", &binary_reason())],
     )
     .expect_err("the request's case must not decide whether the gate matches");
 
     assert!(
-        user_message(err).contains(BINARY_REASON),
+        user_message(err).contains(&binary_reason()),
         "a lower-cased reference must match a refused column of the same name"
     );
 }

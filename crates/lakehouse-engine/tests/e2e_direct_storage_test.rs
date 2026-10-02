@@ -5,7 +5,7 @@
 mod common;
 
 use common::e2e_harness::{
-    VARCHAR_JSON, VsProps, assert_query_fails, assert_text_columns, create_schema_and_scripts,
+    VARCHAR_JSON, VsProps, assert_columns_refused, assert_text_columns, create_schema_and_scripts,
     create_virtual_schema_with_password, declared_type, declared_types, exa_conn,
     explain_virtual_sql, install_slc, local_stack_storage, nullable_text, pairs, parse_int,
     parse_numeric, try_create_virtual_schema_with_password, upload_so, value_to_string,
@@ -15,7 +15,9 @@ use common::raw_parquet::{
     encode_parquet_message, put_fixture_object, write_parquet_column, write_parquet_fixture,
 };
 use common::seed::{
-    ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_TIME_MICROS, all_types_ids, binary_values,
+    ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_IDS_TEXT, ALL_TYPES_TIME_MICROS,
+    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
+    INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIME64_VALUES_TEXT, all_types_ids, binary_values,
     decimal_38_10_values, fixed_16_values, float32_values, int8_values, int16_values, int32_values,
     struct_binary_values, text_values, time64_values,
 };
@@ -1069,24 +1071,20 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
             vs_table(VS_DIRECT, "ALL_TYPES")
         ),
         &[
-            [Some("1"), Some("2"), Some("3")],
-            [Some("127"), Some("-128"), None],
-            [Some("32767"), Some("-32768"), None],
-            [Some("2147483647"), Some("-2147483648"), None],
+            ALL_TYPES_IDS_TEXT,
+            INT8_VALUES_TEXT,
+            INT16_VALUES_TEXT,
+            INT32_VALUES_TEXT,
             [Some("255"), Some("0"), None],
             [Some("65535"), Some("0"), None],
             [Some("4294967295"), Some("0"), None],
             [Some("18446744073709551615"), Some("0"), None],
-            [Some("1.5"), Some("-0.25"), None],
-            [Some("h\u{e9}llo"), Some("w\u{f6}rld"), None],
-            [
-                Some("1234567890123456789012345678.9012345678"),
-                Some("-0.0000000005"),
-                None,
-            ],
+            FLOAT32_VALUES_TEXT,
+            TEXT_VALUES_TEXT,
+            DECIMAL_38_10_VALUES_TEXT,
             [Some("12.34"), Some("-0.05"), None],
             [Some("12:34:56"), Some("00:00:00"), None],
-            [Some("12:34:56.123456"), Some("00:00:00"), None],
+            TIME64_VALUES_TEXT,
             [
                 Some("0 days 0 hours 0 mins 1.500000 secs"),
                 Some("0 days 0 hours 0 mins 0.000000 secs"),
@@ -1115,7 +1113,7 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
             vs_table(VS_DIRECT, "ANNOTATED_TYPES")
         ),
         &[
-            [Some("1"), Some("2"), Some("3")],
+            ALL_TYPES_IDS_TEXT,
             [Some("red"), Some("green"), None],
             [
                 Some("2024-01-15 10:30:45.000000"),
@@ -1126,31 +1124,32 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
     );
 
     let binary: &[&str] = &["type 'binary'", "#351"];
-    for (table, column, fragments) in [
-        ("ALL_TYPES", "C_BINARY", binary),
-        ("ALL_TYPES", "C_LARGEBINARY", binary),
-        (
-            "ALL_TYPES",
-            "C_FIXEDSIZEBINARY",
-            &["type 'fixed(16)'", "#351"],
-        ),
-        (
-            "ALL_TYPES",
-            "C_STRUCT_BINARY",
-            &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
-        ),
-        ("ANNOTATED_TYPES", "C_BSON", &["type 'bson'", "#351"]),
-        ("ANNOTATED_TYPES", "C_UUID", &["type 'uuid'", "#351"]),
-        ("ANNOTATED_TYPES", "C_BYTE_ARRAY", binary),
-        (
-            "ANNOTATED_TYPES",
-            "C_STRUCT_ENUM",
-            &["member 'c_struct_enum.k'", "type 'enum'", "#351"],
-        ),
-    ] {
-        let sql = format!("SELECT {column} FROM {}", vs_table(VS_DIRECT, table));
-        assert_query_fails(&mut conn, &sql, fragments);
-    }
+    assert_columns_refused(
+        &mut conn,
+        &vs_table(VS_DIRECT, "ALL_TYPES"),
+        &[
+            ("C_BINARY", binary),
+            ("C_LARGEBINARY", binary),
+            ("C_FIXEDSIZEBINARY", &["type 'fixed(16)'", "#351"]),
+            (
+                "C_STRUCT_BINARY",
+                &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
+            ),
+        ],
+    );
+    assert_columns_refused(
+        &mut conn,
+        &vs_table(VS_DIRECT, "ANNOTATED_TYPES"),
+        &[
+            ("C_BSON", &["type 'bson'", "#351"]),
+            ("C_UUID", &["type 'uuid'", "#351"]),
+            ("C_BYTE_ARRAY", binary),
+            (
+                "C_STRUCT_ENUM",
+                &["member 'c_struct_enum.k'", "type 'enum'", "#351"],
+            ),
+        ],
+    );
 }
 
 #[test]

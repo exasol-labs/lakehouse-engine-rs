@@ -1,7 +1,9 @@
-use super::super::test_support::{object_endpoint, sample_storage};
+use super::super::test_support::{
+    glue_catalog_table, object_endpoint, sample_storage, user_message,
+};
 use super::*;
 use crate::adapter::parquet_directory::MergeMode;
-use lakehouse_catalog::{CatalogColumn, CatalogTableIdent, CatalogTableType, ColumnSourceType};
+use lakehouse_catalog::{CatalogTableIdent, CatalogTableType};
 
 /// SigV4 mode lets `CatalogSession::resolve` build a session without contacting a catalog.
 fn offline_sigv4_creds() -> ConnectionCreds {
@@ -68,10 +70,7 @@ fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
     .err()
     .expect("a Unity Catalog table reporting a non-Delta format must be refused");
 
-    let message = match err {
-        UdfError::User(m) => m,
-        other => panic!("a mismatched pairing must fail as a user error, got {other:?}"),
-    };
+    let message = user_message(err);
     assert!(
         message.contains(TABLE_NAME),
         "the refusal must name the table it refused: {message}"
@@ -171,22 +170,14 @@ fn third_scan_source_selects_the_parquet_reader() {
 
 fn glue_table(format: TableFormat) -> CatalogTable {
     CatalogTable {
-        ident: CatalogTableIdent {
-            namespace: vec!["sales".into()],
-            name: "orders".into(),
-        },
-        table_type: CatalogTableType::Table,
-        storage_location: Some("s3://bucket/sales/orders".into()),
-        format,
-        vended_credential_key: None,
-        partition_columns: Vec::new(),
         metadata_location: Some("s3://bucket/sales/orders/metadata/v1.json".into()),
-        columns: vec![CatalogColumn {
-            name: "id".into(),
-            source_type: ColumnSourceType::Glue {
-                hive_type: "int".into(),
-            },
-        }],
+        ..glue_catalog_table(
+            "sales",
+            "orders",
+            format,
+            "s3://bucket/sales/orders",
+            &[("id", "int")],
+        )
     }
 }
 
@@ -263,10 +254,7 @@ fn format_reader_refuses_a_delta_table_under_the_glue_source() {
     .err()
     .expect("no Glue reader plans a Delta table");
 
-    let message = match err {
-        UdfError::User(message) => message,
-        other => panic!("a mismatched pairing must fail as a user error, got {other:?}"),
-    };
+    let message = user_message(err);
     assert!(message.contains("sales.orders"), "{message}");
     assert!(message.contains("Delta"), "{message}");
 }
@@ -299,10 +287,7 @@ fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {
     let error = ensure_table_has_a_mappable_column(&[], &refused_columns, "Delta")
         .expect_err("a table with zero mappable columns must be refused as a whole");
 
-    let message = match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    };
+    let message = user_message(error);
     assert!(
         message.starts_with("Delta table has no mappable column; every column is refused: "),
         "message was: {message}"

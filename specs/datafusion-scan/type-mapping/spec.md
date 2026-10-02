@@ -17,8 +17,7 @@ carried into the scan spec, keeping declared and emitted types in agreement.
   other member of the set — Union, Duration, Time32, Time64, Interval, Decimal256, and an
   out-of-range `Decimal128` — keeps its recorded `CAST(col AS VARCHAR)` Arrow-display path,
   byte-identical. A Binary, LargeBinary, or FixedSizeBinary column is refused at plan time on
-  every source per `vs-adapter/binary-column-refusal` (#351), which reads a top-level Parquet
-  `ENUM` column as text.
+  every source per `vs-adapter/binary-column-refusal` (#351).
   Every declared EXASOL type is unchanged: all of them were and remain `VARCHAR(2000000)`.
 * **`iceberg_type_to_arrow` is deliberately NOT made recursive, and that is the load-bearing design
   decision of issue #350.** A column's LOGICAL Arrow type stays `Utf8` for every list, struct, and
@@ -132,7 +131,7 @@ carried into the scan spec, keeping declared and emitted types in agreement.
 * *THEN* the resolver SHALL declare the column as `VARCHAR(2000000)` for EVERY member of both halves, unchanged by this delta
 * *AND* a NESTED column's value SHALL be rendered as a valid JSON document per `datafusion-scan/nested-json-rendering`, which owns that contract
 * *AND* a NON-NESTED column's value, other than a `Binary`, `LargeBinary`, or `FixedSizeBinary` one, SHALL keep its recorded `CAST(col AS VARCHAR)` Arrow-display rendering byte-identical, and this feature MUST NOT claim strict JSON conformance for it
-* *AND* every request that reads or emits a `Binary`, `LargeBinary`, or `FixedSizeBinary` column SHALL be refused at plan time per `vs-adapter/binary-column-refusal` until issue #351 defines a rendering for binary, and that feature reads a top-level Parquet `ENUM` column as text
+* *AND* every request that reads or emits a `Binary`, `LargeBinary`, or `FixedSizeBinary` column SHALL be refused at plan time per `vs-adapter/binary-column-refusal` until issue #351 defines a rendering for binary
 * *AND* the converter MUST NOT emit any array, list, struct, or map `Value` for either half
 * *AND* exactly ONE predicate in `crates/lakehouse-engine/src/types/mapping.rs` SHALL own the NESTED half's arm list, and every consumer SHALL read its answer from that predicate rather than re-matching on `DataType`, so no second copy can classify a type into the wrong half
 * *AND* that predicate MUST NOT be `needs_json_fallback`, and `needs_json_fallback` SHALL keep its recorded `fn(&DataType) -> bool` signature and its recorded answer for every input, so its four existing call sites are unchanged: an out-of-range `Decimal128` column SHALL stay in the CAST path that the nested predicate diverts columns away from

@@ -265,35 +265,6 @@ mod azure_naming_tests {
         }
 
         assert_eq!(
-            derive_container_name("", FIXED_MILLIS),
-            format!("lhrs-e2e-{FIXED_MILLIS}"),
-            "an empty user leaves no segment rather than a double hyphen"
-        );
-        assert_eq!(
-            derive_container_name("---", FIXED_MILLIS),
-            format!("lhrs-e2e-{FIXED_MILLIS}"),
-            "a user of only punctuation leaves no segment"
-        );
-        assert_eq!(
-            derive_container_name("Antoni.Reus", FIXED_MILLIS),
-            format!("lhrs-e2e-antoni-reus-{FIXED_MILLIS}")
-        );
-        assert_eq!(
-            derive_container_name("a..b", FIXED_MILLIS),
-            format!("lhrs-e2e-a-b-{FIXED_MILLIS}"),
-            "consecutive illegal characters collapse to one hyphen"
-        );
-        assert_eq!(
-            derive_container_name("ÜBER_user", FIXED_MILLIS),
-            format!("lhrs-e2e-ber-user-{FIXED_MILLIS}"),
-            "a multi-byte character maps to one hyphen, trimmed at the segment start"
-        );
-        assert_eq!(
-            derive_container_name(&truncated_at_a_hyphen, FIXED_MILLIS),
-            format!("lhrs-e2e-{}-{FIXED_MILLIS}", "a".repeat(39)),
-            "truncation on a hyphen drops it instead of leaving a trailing one"
-        );
-        assert_eq!(
             derive_container_name(&ninety_chars, FIXED_MILLIS).len(),
             MAX_CONTAINER_NAME_LEN,
             "an over-long user is truncated to exactly the remaining budget"

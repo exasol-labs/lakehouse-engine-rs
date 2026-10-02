@@ -89,15 +89,21 @@ pub struct CatalogTable {
 pub struct CatalogPartition {
     pub values: BTreeMap<String, Option<String>>,
     pub location: String,
-    pub input_format: String,
+    pub format: PartitionFormat,
 }
 
-impl CatalogPartition {
-    /// The only input format this engine reads.
-    pub fn is_parquet(&self) -> bool {
-        self.input_format == crate::glue::PARQUET_INPUT_FORMAT
-    }
+/// A partition's file format, decided once by the catalog client.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PartitionFormat {
+    Parquet,
+    /// A format this engine does not read, named by the input format the catalog declares.
+    Unsupported {
+        input_format: String,
+    },
 }
+
+/// Hive's literal for a NULL partition value, in a partition's catalog values and its path.
+pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SkipReason {
@@ -195,7 +201,7 @@ impl IcebergRestCatalogClient {
     ) -> Result<CatalogTable, UdfError> {
         let catalog = CatalogProps {
             warehouse: self.creds.warehouse.clone(),
-            table: dotted_identifier(ident),
+            table: catalog_identifier_string(ident),
         };
         let result = load_table_any_auth(session, &catalog, &self.creds).await?;
         Ok(iceberg_catalog_table(ident.clone(), &result.metadata, None))
@@ -267,8 +273,9 @@ fn neutral_ident(ident: &TableIdent) -> CatalogTableIdent {
     }
 }
 
-/// A segment carrying a dot does not round-trip, so this join is the last step.
-pub(crate) fn dotted_identifier(ident: &CatalogTableIdent) -> String {
+/// The dotted `TABLE_MAP` value, parsed back by `parse_table_ident`. A segment carrying a dot
+/// does not round-trip, so this join is the last step.
+pub fn catalog_identifier_string(ident: &CatalogTableIdent) -> String {
     let mut parts: Vec<&str> = ident.namespace.iter().map(String::as_str).collect();
     parts.push(&ident.name);
     parts.join(".")

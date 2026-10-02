@@ -76,20 +76,13 @@ Reads the AWS Glue Data Catalog API for the `GLUE` catalog kind. The client list
 * *THEN* the listing SHALL fail with an error stating that a Glue NAMESPACE names exactly one database
 * *AND* the client MUST NOT call Glue
 
-### Scenario: Service errors are classified by their error code, not their HTTP status
-
-* *GIVEN* Glue service errors `400 EntityNotFoundException`, `AccessDeniedException` with HTTP 400 and with HTTP 404, `400 InvalidInputException`, and an HTTP 503 without an error code
-* *WHEN* the client classifies each service error
-* *THEN* the client SHALL classify each error by the service error code, and MUST NOT classify it by the HTTP status
-* *AND* `EntityNotFoundException` SHALL classify as a missing database or table
-* *AND* an error without a code SHALL keep its HTTP status
-
 ### Scenario: A failed Glue call names the operation, the subject, and the cause
 
-* *GIVEN* a Glue call that fails for a missing database, a service error code, an HTTP status without a code, an elapsed operation timeout, or a request failure, with a service message that echoes the CONNECTION's credentials
-* *WHEN* the listing fails
-* *THEN* the error SHALL name the Glue operation and the database or table it addressed
-* *AND* a missing database or table SHALL be stated not to exist, a service error SHALL name its code and message, an uncoded error SHALL name its HTTP status, and a timeout SHALL name the 30 second deadline
+* *GIVEN* Glue calls that fail with `400 EntityNotFoundException`, `AccessDeniedException` with HTTP 400 and with HTTP 404, `400 InvalidInputException`, an HTTP 503 without an error code, an elapsed operation timeout, or a request failure, with a service message that echoes the CONNECTION's credentials
+* *WHEN* the client classifies each failure and words its error
+* *THEN* the client SHALL classify a service error by its service error code, and MUST NOT classify it by the HTTP status
+* *AND* the error SHALL name the Glue operation and the database or table it addressed
+* *AND* `EntityNotFoundException` SHALL state that the database or table does not exist, another service error SHALL name its code and message, an error without a code SHALL name its HTTP status, and a timeout SHALL name the 30 second deadline
 * *AND* no error SHALL contain a credential value
 
 ### Scenario: Every Glue call retries within a bounded time

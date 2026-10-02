@@ -32,4 +32,3 @@ Prunes the files or partitions of a Parquet table from a pushed filter by compar
 * *GIVEN* a direct-storage table whose folder names carry `year=2024` and `year=2025`
 * *WHEN* the pushdown prunes it for `year = 2024`
 * *THEN* direct storage SHALL declare `year` a string, so the numeric literal prunes no file
-* *AND* the direct-storage, Unity Parquet, and Glue Parquet readers SHALL each call the ONE predicate, and none of them SHALL keep its own partition-value comparison

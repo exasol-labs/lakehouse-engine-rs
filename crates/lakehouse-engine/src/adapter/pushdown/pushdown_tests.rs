@@ -2060,21 +2060,6 @@ fn assert_refuses_binary_col(error: UdfError) {
     );
 }
 
-fn binary_iceberg_table_body() -> String {
-    load_table_body_with_columns(
-        serde_json::json!([
-            {"id": 1, "name": "id", "required": false, "type": "int"},
-            {"id": 2, "name": "b", "required": false, "type": "binary"},
-            {"id": 3, "name": "f", "required": false, "type": "fixed[16]"},
-            {"id": 4, "name": "u", "required": false, "type": "uuid"},
-            {"id": 5, "name": "s", "required": false, "type": {"type": "struct", "fields": [
-                {"id": 6, "name": "x", "required": false, "type": "binary"}
-            ]}}
-        ]),
-        6,
-    )
-}
-
 fn binary_iceberg_table_request(pushdown_request: Json) -> Json {
     let varchar = serde_json::json!({"type": "varchar", "size": 2000000});
     serde_json::json!({
@@ -2101,7 +2086,13 @@ async fn binary_iceberg_pushdown(pushdown_request: Json) -> Result<Json, UdfErro
         if target.starts_with("/v1/config") {
             (200, "{}".to_string())
         } else {
-            (200, binary_iceberg_table_body())
+            (
+                200,
+                load_table_body_with_columns(
+                    binary_iceberg_fields(),
+                    BINARY_ICEBERG_LAST_COLUMN_ID,
+                ),
+            )
         }
     })
     .await;

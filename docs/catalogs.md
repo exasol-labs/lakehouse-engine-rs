@@ -392,7 +392,7 @@ A refused column fails only the queries that read or emit it. The refusal reason
 
 **Partition values.** The adapter takes each partition's values from `GetPartitions`, in the order of the table's partition keys. It never parses a value from the location path. The Hive literal `__HIVE_DEFAULT_PARTITION__` reads NULL. A partition whose value count differs from the partition-key count fails the query and names the partition's location. Every query reads the Glue metadata again. It issues one `GetTable`, the paginated `GetPartitions`, and one object listing per kept partition. The adapter caches nothing.
 
-**Data files.** The adapter lists each kept partition's location by its raw object key, without percent-decoding. A value `a b/c` is stored at the literal key `p_str=a b%2Fc/`, and the listing finds it. An unpartitioned table is listed at its table location. The file rule is the `*` pattern:
+**Data files.** The adapter lists each kept partition's location by its raw object key, without percent-decoding. A value `a b/c` is stored at the literal key `p_str=a b%2Fc/`, and the listing finds it. An unpartitioned table is listed at its table location. The file rule is the any-direct-child pattern:
 
 - A data file is a direct child of the location, with any name. Trino writes files without an extension, so a `.parquet` suffix is not required.
 - An object below a subdirectory is not read.

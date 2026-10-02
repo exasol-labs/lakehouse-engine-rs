@@ -7,8 +7,8 @@ use iceberg::spec::TableMetadata;
 use iceberg::{NamespaceIdent, TableIdent};
 use lakehouse_catalog::{
     CatalogProps, CatalogSession, CatalogTable, StaticStoreAddress, StorageBackend,
-    load_table_any_auth, parse_table_ident, redact_credentials, redact_error_text,
-    resolve_vended_storage,
+    load_table_any_auth, parse_table_ident, read_iceberg_metadata_file, redact_credentials,
+    redact_error_text, resolve_vended_storage,
 };
 use serde_json::Value as Json;
 
@@ -74,10 +74,8 @@ impl FormatReader for IcebergFormatReader<'_> {
     }
 }
 
-/// Vended-credential extraction is gated solely on `creds.use_vended_credentials`, orthogonal to
-/// the catalog-auth mode. Credentials stay vended-only (a missing vended credential errors rather
-/// than falling back to the static one), while the CONNECTION's `endpoint` and `region` may
-/// override vended addressing via [`StaticStoreAddress`], which cannot carry a credential.
+/// Vending is gated on `creds.use_vended_credentials` alone and never falls back to the static
+/// credential; only the CONNECTION's addressing may override it ([`StaticStoreAddress`]).
 async fn rest_metadata(
     session: &CatalogSession,
     catalog_props: &CatalogProps,
@@ -135,7 +133,7 @@ async fn file_metadata(
                  is unknown"
             ))
         })?;
-    let metadata = read_metadata_file(storage, location, &table_name).await?;
+    let metadata = read_iceberg_metadata_file(storage, location, &table_name).await?;
     let table_root = checked_table_root(&metadata, &table_name, || {
         UdfError::User(format!(
             "the Iceberg metadata file '{location}' of table '{table_name}' carries an EMPTY \
@@ -170,22 +168,6 @@ fn checked_table_root(
         return Err(empty_location());
     }
     Ok(location.to_string())
-}
-
-async fn read_metadata_file(
-    storage: &StorageBackend,
-    location: &str,
-    table_name: &str,
-) -> Result<TableMetadata, UdfError> {
-    TableMetadata::read_from(&storage.file_io(), location)
-        .await
-        .map_err(|error| {
-            let message = format!(
-                "failed to read the Iceberg metadata file '{location}' of table '{table_name}': \
-                 {error}"
-            );
-            UdfError::User(redact_error_text(&message, &storage.secret_values()))
-        })
 }
 
 /// The one Iceberg planner. Errors are redacted against the effective storage's secrets, since

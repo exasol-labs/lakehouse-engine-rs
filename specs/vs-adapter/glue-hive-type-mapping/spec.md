@@ -30,7 +30,7 @@ Maps a Glue column's Hive type string to the engine's types. A parser turns the 
 * *WHEN* the pushdown plans the table
 * *THEN* the `binary` and `struct<b:binary>` columns SHALL be refused per `vs-adapter/binary-column-refusal`
 * *AND* every unrecognized or malformed type SHALL refuse its column with a reason quoting the type string
-* *AND* a refused column SHALL fail only the queries that read or emit it, and a table whose every column is refused SHALL be refused as a whole, exactly as for a Delta table
+* *AND* a refused column SHALL fail only the queries that read or emit it, and a table whose every column is refused SHALL be refused as a whole, per `vs-adapter/delta-type-mapping`
 
 ### Scenario: The listing declares each Glue column through the Spark listing mapping
 
@@ -38,4 +38,4 @@ Maps a Glue column's Hive type string to the engine's types. A parser turns the 
 * *WHEN* createVirtualSchema lists the table
 * *THEN* each column SHALL be declared with the Exasol type the Unity Catalog listing declares for the same Spark type, so `tinyint`, `smallint`, `int`, and `bigint` declare `DECIMAL(3,0)`, `DECIMAL(5,0)`, `DECIMAL(10,0)`, and `DECIMAL(20,0)`, `float` and `double` declare `DOUBLE PRECISION`, `date` declares `DATE`, and `decimal(10,2)` declares `DECIMAL(10,2)`
 * *AND* `timestamp` SHALL declare the catalog-declared timestamp type of `datafusion-scan/type-mapping`
-* *AND* every string, nested, binary, unrecognized, or malformed column SHALL declare `VARCHAR(2000000)`, so a column type never fails the listing
+* *AND* every string, nested, unrecognized, or malformed column SHALL declare `VARCHAR(2000000)`, as a binary column does per `vs-adapter/binary-column-refusal`, so a column type never fails the listing

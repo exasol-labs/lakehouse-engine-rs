@@ -318,6 +318,22 @@ fn adapter_note_absent_or_unparseable_yields_none() {
     assert!(adapter_note(&empty, NOTE_PARALLELISM_FACTOR).is_none());
 }
 
+impl Default for super::TuningNotes {
+    fn default() -> Self {
+        Self {
+            parallelism_factor: DEFAULT_PARALLELISM_FACTOR,
+            df_threading_mode: ThreadingMode::Auto,
+            df_target_partitions: DEFAULT_DF_TARGET_PARTITIONS,
+            df_threads_per_udf: DEFAULT_DF_THREADS_PER_UDF,
+            df_batch_size: DEFAULT_DF_BATCH_SIZE,
+            memory_pool_fraction: DEFAULT_MEMORY_POOL_FRACTION,
+            instance_overhead_mb: DEFAULT_INSTANCE_OVERHEAD_MB,
+            s3_max_connections: DEFAULT_S3_MAX_CONNECTIONS,
+            join_broadcast_max_bytes: DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        }
+    }
+}
+
 #[test]
 fn build_adapter_notes_merges_existing() {
     let req = serde_json::json!({
@@ -326,20 +342,7 @@ fn build_adapter_notes_merges_existing() {
             "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
         },
     });
-    let notes = build_adapter_notes(
-        &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &[],
-        &[],
-    );
+    let notes = build_adapter_notes(&req, &TuningNotes::default(), &[], &[]);
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert_eq!(
@@ -357,20 +360,7 @@ fn build_adapter_notes_merges_existing() {
 #[test]
 fn adapter_notes_omit_cluster_nodes() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &request,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &[],
-        &[],
-    );
+    let notes = build_adapter_notes(&request, &TuningNotes::default(), &[], &[]);
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert!(
@@ -398,20 +388,7 @@ fn refresh_rebuilds_table_map_preserves_notes() {
     });
 
     let fresh_table_map = vec![("NEW_TABLE".to_string(), "ns.new_table".to_string())];
-    let notes = build_adapter_notes(
-        &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &fresh_table_map,
-        &[],
-    );
+    let notes = build_adapter_notes(&req, &TuningNotes::default(), &fresh_table_map, &[]);
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
 
@@ -449,15 +426,10 @@ fn create_vs_records_parallelism_factor() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &request,
-        factor,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            parallelism_factor: factor,
+            ..TuningNotes::default()
+        },
         &[],
         &[],
     );
@@ -490,15 +462,10 @@ fn adapter_notes_carry_parallelism_factor() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        12,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            parallelism_factor: 12,
+            ..TuningNotes::default()
+        },
         &[],
         &[],
     );
@@ -614,15 +581,10 @@ fn df_target_partitions_uses_supplied_value() {
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        val,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            df_target_partitions: val,
+            ..TuningNotes::default()
+        },
         &[],
         &[],
     );
@@ -658,15 +620,10 @@ fn df_batch_size_uses_supplied_value() {
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        val,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            df_batch_size: val,
+            ..TuningNotes::default()
+        },
         &[],
         &[],
     );
@@ -716,15 +673,10 @@ fn df_threads_per_udf_uses_supplied_value() {
     let req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        val,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            df_threads_per_udf: val,
+            ..TuningNotes::default()
+        },
         &[],
         &[],
     );
@@ -874,15 +826,10 @@ fn join_broadcast_max_bytes_round_trips_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        67_108_864,
+        &TuningNotes {
+            join_broadcast_max_bytes: 67_108_864,
+            ..TuningNotes::default()
+        },
         &[],
         &[],
     );
@@ -904,15 +851,11 @@ fn memory_budget_params_round_trip_through_adapter_notes() {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
     let notes = build_adapter_notes(
         &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        0.5,
-        256,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes {
+            memory_pool_fraction: 0.5,
+            instance_overhead_mb: 256,
+            ..TuningNotes::default()
+        },
         &[],
         &[],
     );
@@ -1032,20 +975,7 @@ fn threading_mode_defaults_to_auto() {
     );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &[],
-        &[],
-    );
+    let notes = build_adapter_notes(&req, &TuningNotes::default(), &[], &[]);
     let parsed: serde_json::Value =
         serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert_eq!(
@@ -1121,20 +1051,7 @@ fn table_map_round_trips_through_adapter_notes() {
         ),
     ];
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &table_map,
-        &[],
-    );
+    let notes = build_adapter_notes(&create_req, &TuningNotes::default(), &table_map, &[]);
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
 
     let pushdown_req = serde_json::json!({
@@ -1159,20 +1076,7 @@ fn table_map_round_trips_through_adapter_notes() {
 fn table_map_stored_as_nested_json_object() {
     let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &table_map,
-        &[],
-    );
+    let notes = build_adapter_notes(&create_req, &TuningNotes::default(), &table_map, &[]);
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
     let parsed: serde_json::Value =
         serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
@@ -1197,15 +1101,7 @@ fn table_map_merges_with_existing_notes() {
     });
     let notes = build_adapter_notes(
         &req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+        &TuningNotes::default(),
         &[("T".to_string(), "ns.t".to_string())],
         &[],
     );
@@ -1241,20 +1137,7 @@ fn read_table_map_absent_returns_empty() {
 
 fn pushdown_request_with_table_map(table_map: &[(String, String)], involved: &str) -> Json {
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
-        &create_req,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        table_map,
-        &[],
-    );
+    let notes = build_adapter_notes(&create_req, &TuningNotes::default(), table_map, &[]);
     let notes_str = notes.as_str().unwrap().to_string();
     serde_json::json!({
         "type": "pushdown",
@@ -1375,20 +1258,7 @@ fn create_vs_records_table_map_in_adapter_notes() {
             "adapterNotes": "{\"CLUSTER_NODES\":\"3\"}"
         }
     });
-    let notes = build_adapter_notes(
-        &request,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        &table_map,
-        &[],
-    );
+    let notes = build_adapter_notes(&request, &TuningNotes::default(), &table_map, &[]);
     let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
     let parsed: serde_json::Value =
         serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
@@ -1532,20 +1402,7 @@ fn notes_with_skipped(
     table_map: &[(String, String)],
     skipped: &[SkippedTable],
 ) -> Json {
-    let notes = build_adapter_notes(
-        request,
-        DEFAULT_PARALLELISM_FACTOR,
-        ThreadingMode::Auto,
-        DEFAULT_DF_TARGET_PARTITIONS,
-        DEFAULT_DF_THREADS_PER_UDF,
-        DEFAULT_DF_BATCH_SIZE,
-        DEFAULT_MEMORY_POOL_FRACTION,
-        DEFAULT_INSTANCE_OVERHEAD_MB,
-        DEFAULT_S3_MAX_CONNECTIONS,
-        DEFAULT_JOIN_BROADCAST_MAX_BYTES,
-        table_map,
-        skipped,
-    );
+    let notes = build_adapter_notes(request, &TuningNotes::default(), table_map, skipped);
     serde_json::from_str(notes.as_str().unwrap()).expect("adapterNotes is a JSON string")
 }
 
@@ -1669,15 +1526,7 @@ fn an_oversized_skipped_list_is_capped_to_the_longest_prefix_that_fits_the_exaso
 
         let notes = build_adapter_notes(
             &json!({"type": "createVirtualSchema"}),
-            DEFAULT_PARALLELISM_FACTOR,
-            ThreadingMode::Auto,
-            DEFAULT_DF_TARGET_PARTITIONS,
-            DEFAULT_DF_THREADS_PER_UDF,
-            DEFAULT_DF_BATCH_SIZE,
-            DEFAULT_MEMORY_POOL_FRACTION,
-            DEFAULT_INSTANCE_OVERHEAD_MB,
-            DEFAULT_S3_MAX_CONNECTIONS,
-            DEFAULT_JOIN_BROADCAST_MAX_BYTES,
+            &TuningNotes::default(),
             &[],
             &skipped,
         );
@@ -1705,7 +1554,7 @@ fn an_oversized_skipped_list_is_capped_to_the_longest_prefix_that_fits_the_exaso
             .expect("an array")
             .push(json!({
                 "table": catalog_identifier_string(&skipped[kept].ident),
-                "reason": skip_reason(&skipped[kept]),
+                "reason": skip_kind_and_reason(&skipped[kept]).1,
             }));
         let still_omitted = total - kept - 1;
         if still_omitted == 0 {

@@ -3116,29 +3116,44 @@ pub fn all_types_validity() -> Option<NullBuffer> {
     Some(NullBuffer::from(vec![true, true, false]))
 }
 
+/// Each `*_TEXT` is how Exasol returns its builder's three rows as text, NULL as `None`.
+pub const ALL_TYPES_IDS_TEXT: [Option<&str>; 3] = [Some("1"), Some("2"), Some("3")];
+
 pub fn all_types_ids() -> ArrayRef {
     Arc::new(Int64Array::from(ALL_TYPES_IDS.to_vec()))
 }
+
+pub const INT8_VALUES_TEXT: [Option<&str>; 3] = [Some("127"), Some("-128"), None];
 
 pub fn int8_values() -> ArrayRef {
     Arc::new(Int8Array::from(vec![Some(127), Some(-128), None]))
 }
 
+pub const INT16_VALUES_TEXT: [Option<&str>; 3] = [Some("32767"), Some("-32768"), None];
+
 pub fn int16_values() -> ArrayRef {
     Arc::new(Int16Array::from(vec![Some(32_767), Some(-32_768), None]))
 }
+
+pub const INT32_VALUES_TEXT: [Option<&str>; 3] = [Some("2147483647"), Some("-2147483648"), None];
 
 pub fn int32_values() -> ArrayRef {
     Arc::new(Int32Array::from(vec![Some(i32::MAX), Some(i32::MIN), None]))
 }
 
+pub const FLOAT32_VALUES_TEXT: [Option<&str>; 3] = [Some("1.5"), Some("-0.25"), None];
+
 pub fn float32_values() -> ArrayRef {
     Arc::new(Float32Array::from(vec![Some(1.5), Some(-0.25), None]))
 }
 
+pub const BOOLEAN_VALUES_TEXT: [Option<&str>; 3] = [Some("true"), Some("false"), None];
+
 pub fn boolean_values() -> ArrayRef {
     Arc::new(BooleanArray::from(vec![Some(true), Some(false), None]))
 }
+
+pub const TEXT_VALUES_TEXT: [Option<&str>; 3] = [Some("h\u{e9}llo"), Some("w\u{f6}rld"), None];
 
 pub fn text_values() -> ArrayRef {
     Arc::new(StringArray::from(vec![
@@ -3148,9 +3163,17 @@ pub fn text_values() -> ArrayRef {
     ]))
 }
 
+pub const DECIMAL_10_2_VALUES_TEXT: [Option<&str>; 3] = [Some("12.34"), Some("-0.05"), None];
+
 pub fn decimal_10_2_values() -> ArrayRef {
     decimal_values(1234, 10, 2)
 }
+
+pub const DECIMAL_38_10_VALUES_TEXT: [Option<&str>; 3] = [
+    Some("1234567890123456789012345678.9012345678"),
+    Some("-0.0000000005"),
+    None,
+];
 
 pub fn decimal_38_10_values() -> ArrayRef {
     decimal_values(12_345_678_901_234_567_890_123_456_789_012_345_678, 38, 10)
@@ -3164,6 +3187,8 @@ fn decimal_values(first: i128, precision: u8, scale: i8) -> ArrayRef {
     )
 }
 
+pub const DATE_VALUES_TEXT: [Option<&str>; 3] = [Some("2024-01-15"), Some("1970-01-01"), None];
+
 pub fn date_values() -> ArrayRef {
     Arc::new(Date32Array::from(vec![
         Some(ALL_TYPES_DATE_DAYS),
@@ -3171,6 +3196,12 @@ pub fn date_values() -> ArrayRef {
         None,
     ]))
 }
+
+pub const TIMESTAMP_VALUES_TEXT: [Option<&str>; 3] = [
+    Some("2024-01-15 10:30:45.123000"),
+    Some("1970-01-01 00:00:00.000000"),
+    None,
+];
 
 pub fn timestamp_values(timezone: Option<&str>) -> ArrayRef {
     let values =
@@ -3180,6 +3211,8 @@ pub fn timestamp_values(timezone: Option<&str>) -> ArrayRef {
         None => Arc::new(values),
     }
 }
+
+pub const TIME64_VALUES_TEXT: [Option<&str>; 3] = [Some("12:34:56.123456"), Some("00:00:00"), None];
 
 pub fn time64_values() -> ArrayRef {
     Arc::new(Time64MicrosecondArray::from(vec![
@@ -3219,6 +3252,32 @@ pub fn struct_binary_values(members: Option<&Fields>) -> ArrayRef {
             .expect("struct<x: binary>"),
     )
 }
+
+/// `struct<{int_member}: int, {string_member}: string>` holding `(1, first_string)`,
+/// `(2, NULL)`, then a NULL struct.
+pub fn int_string_struct_values(
+    int_member: &str,
+    string_member: &str,
+    first_string: &str,
+) -> ArrayRef {
+    let members = Fields::from(vec![
+        Field::new(int_member, DataType::Int32, true),
+        Field::new(string_member, DataType::Utf8, true),
+    ]);
+    Arc::new(
+        StructArray::try_new(
+            members,
+            vec![
+                Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
+                Arc::new(StringArray::from(vec![Some(first_string), None, None])),
+            ],
+            all_types_validity(),
+        )
+        .expect("struct<int, string>"),
+    )
+}
+
+pub const INT_LIST_VALUES_TEXT: [Option<&str>; 3] = [Some("[1,2]"), Some("[]"), None];
 
 /// Hive and Spark name a list member `element`.
 pub fn int_list_values() -> ArrayRef {

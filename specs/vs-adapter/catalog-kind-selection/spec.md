@@ -51,7 +51,7 @@ The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRes
 
 ### Scenario: Iceberg REST validation is unchanged under the default catalog kind
 
-* *GIVEN* a createVirtualSchema request resolving `CatalogKind::IcebergRest` — whether by an absent `CATALOG_KIND` or an explicit Iceberg-REST value — whose CONNECTION JSON password omits `warehouse`
+* *GIVEN* a createVirtualSchema request resolving `CatalogKind::IcebergRest` through an absent `CATALOG_KIND`, whose CONNECTION JSON password omits `warehouse`
 * *WHEN* the adapter resolves and validates the connection under the Iceberg REST kind
 * *THEN* the adapter SHALL return the same missing-`warehouse` error it returned before this feature, so the Iceberg REST credential contract is unchanged
 * *AND* every Iceberg REST validation rule — the Azure/S3 mutual exclusion, the Azure-shape rules, the SigV4-versus-catalog-auth exclusion, the SigV4 required-fields rule, and the OAuth2 completeness rule — SHALL apply exactly as before
@@ -62,6 +62,7 @@ The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRes
 * *WHEN* the adapter resolves the catalog kind
 * *THEN* the adapter SHALL return an error naming the unrecognized value and every accepted choice: absent for Iceberg REST, `UNITY_CATALOG`, `DIRECT_STORAGE`, and `GLUE`
 * *AND* the error SHALL state that the Iceberg REST kind is selected by leaving `CATALOG_KIND` absent, so an operator who reads the error learns why the literal `ICEBERG_REST` is rejected rather than retrying it
+* *AND* the adapter SHALL resolve the kind BEFORE it reads the CONNECTION, on createVirtualSchema and pushdown requests alike, so an unrecognized value fails without a connect-back round trip
 * *AND* the adapter MUST NOT fall back to a default catalog kind, because silently defaulting an unrecognized kind would resolve a misconfigured virtual schema against the wrong catalog
 * *AND* the error message MUST NOT contain any credential value
 
@@ -71,7 +72,6 @@ The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRes
 * *WHEN* the adapter handles the pushdown request
 * *THEN* the adapter SHALL resolve the request through the Unity Catalog scan source and the Delta format reader, and SHALL return a scan-driving SQL response, SUPERSEDING the recorded refusal that Unity Catalog scan execution is not yet supported
 * *AND* the adapter MUST NOT resolve the request through the Iceberg REST file-resolution path, because a Unity Catalog table is a Delta table the Iceberg path cannot read
-* *AND* the adapter SHALL keep resolving the catalog kind BEFORE it reads the CONNECTION, so an unrecognized `CATALOG_KIND` still fails without a connect-back round-trip
 * *AND* a pushdown request whose Delta table cannot be planned SHALL fail with the reader's own plan-time error rather than a kind-level refusal, so an unreadable table and an unsupported catalog kind are distinguishable
 * *AND* no error message on any of these paths SHALL contain a credential value
 
@@ -80,9 +80,8 @@ The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRes
 * *GIVEN* a createVirtualSchema or pushdown request whose plain VS properties include `CATALOG_KIND` set to `DIRECT_STORAGE` in any letter case
 * *WHEN* the adapter resolves the catalog kind
 * *THEN* the adapter SHALL resolve `CatalogKind::DirectStorage`
-* *AND* the adapter SHALL construct the direct-storage catalog client rather than the Iceberg REST or the native Unity Catalog client, and SHALL then run the SAME listing pipeline it runs for the other two kinds
+* *AND* the adapter SHALL construct the direct-storage catalog client rather than the Iceberg REST or the native Unity Catalog client, and SHALL then run the SAME listing pipeline it runs for the other kinds
 * *AND* the adapter SHALL compare the property value case-insensitively, so `direct_storage`, `Direct_Storage`, and `DIRECT_STORAGE` all resolve the same kind
-* *AND* the adapter SHALL resolve the kind BEFORE it reads the CONNECTION, unchanged, so an unrecognized `CATALOG_KIND` still fails without a connect-back round-trip
 * *AND* the resolution SHALL contact no catalog service, because this kind has none: the client reads the object store named by the CONNECTION address directly
 
 ### Scenario: CATALOG_KIND naming Glue resolves the native Glue kind
@@ -91,8 +90,6 @@ The catalog kind is a `CatalogKind` enum with exactly four variants: `IcebergRes
 * *WHEN* the adapter resolves the catalog kind
 * *THEN* the adapter SHALL resolve `CatalogKind::Glue`
 * *AND* the adapter SHALL construct the Glue catalog client and SHALL run the SAME listing pipeline it runs for the other kinds
-* *AND* the adapter SHALL resolve the kind BEFORE it reads the CONNECTION, so an unrecognized value still fails without a connect-back round trip
-* *AND* a virtual schema without `CATALOG_KIND` whose CONNECTION addresses the Glue Iceberg REST endpoint SHALL resolve the Iceberg REST kind
 
 ### Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
 

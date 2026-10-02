@@ -6,6 +6,7 @@ Runs the `GLUE` catalog kind end to end against a real AWS Glue Data Catalog and
 
 * The suite reads `GLUE_ACCESS_KEY_ID` and `GLUE_SECRET_ACCESS_KEY` (repository secrets) and `GLUE_REGION` and `GLUE_FIXTURE_BUCKET` (repository variables) from the environment or from `./test.env`.
 * The gate mirrors the Azure gate (`azure-e2e/azure-e2e-harness-operations`): a real cloud account, a local Exasol, and no place in `release`'s needs, so an AWS outage or a rotated key cannot block a release.
+* The fixture set: an Iceberg table written by `iceberg-rust` and registered with `table_type` `ICEBERG` and its `metadata_location`; the unpartitioned Hive Parquet tables `all_types` and `binary_values` of `datafusion-scan/type-mapping-live-coverage`, typed by Hive type strings, whose data files have no file extension, with `all_types` carrying every Hive type of `vs-adapter/glue-hive-type-mapping`; a Hive Parquet table partitioned by `int`, `date`, and `string` keys, with a NULL partition, a partition whose value is `a b/c`, a partition outside the table location, a partition addressed with `s3a://`, and an ORC partition; and a partition-projection table, a view, an ORC table, and an Athena-style Delta table.
 
 ## Scenarios
 
@@ -19,21 +20,13 @@ Runs the `GLUE` catalog kind end to end against a real AWS Glue Data Catalog and
 * *AND* a teardown failure SHALL name the leaked database or prefix and MUST NOT panic
 * *AND* CI and a local run SHALL build the fixtures from the same harness code
 
-### Scenario: The fixture set covers every routing, partition, and type case
-
-* *GIVEN* a provisioned run
-* *WHEN* the harness registers its fixtures
-* *THEN* the harness SHALL register an Iceberg table written by `iceberg-rust` and registered with `table_type` `ICEBERG` and its `metadata_location`
-* *AND* the harness SHALL register the unpartitioned Hive Parquet tables `all_types` and `binary_values` of `datafusion-scan/type-mapping-live-coverage`, typed by Hive type strings, whose data files have no file extension, and `all_types` SHALL carry every Hive type of `vs-adapter/glue-hive-type-mapping`
-* *AND* the harness SHALL register a Hive Parquet table partitioned by `int`, `date`, and `string` keys, with a NULL partition, a partition whose value is `a b/c`, a partition outside the table location, a partition addressed with `s3a://`, and an ORC partition
-* *AND* the harness SHALL register a partition-projection table, a view, an ORC table, and an Athena-style Delta table, and SHALL write no data file for the ORC partition, the view, the ORC table, or the Delta table
-
 ### Scenario: The listing includes the routed tables and records every skip
 
 * *GIVEN* the registered fixtures
 * *WHEN* a virtual schema over the run's database is created
 * *THEN* the virtual schema SHALL list the Iceberg table and the Parquet tables with their Exasol column types
 * *AND* `SKIPPED_TABLES` SHALL record the projection table, the view, the ORC table, and the Delta table, each with its reason
+* *AND* the harness SHALL have written no data file for the ORC partition, the projection table, the view, the ORC table, or the Delta table
 
 ### Scenario: Queries through pushdown return the expected rows
 

@@ -14,7 +14,8 @@ Records the reviewed extension of `lakehouse-catalog`'s public surface that lets
 * *GIVEN* the enumerated public surface of `lakehouse-catalog` and the external-vantage reachability probe that fails to compile if an enumerated item is narrowed below `pub`
 * *WHEN* the probe reaches each Glue addition from outside the crate
 * *THEN* the crate SHALL export the Glue catalog session, which implements the shared `CatalogClient` trait and returns a table's partitions
-* *AND* the crate SHALL export a neutral partition type carrying the partition's values keyed by partition column, its location, and its format tag or the input format it declares instead
+* *AND* the crate SHALL export a neutral partition type carrying the partition's values keyed by partition column, its location, and a neutral partition format that is Parquet or names the unsupported input format, together with the Hive default-partition literal that reads NULL
+* *AND* the crate SHALL export the Glue table-identifier parser, the dotted catalog identifier, and the redacting Iceberg metadata-file reader, so the engine reuses them instead of keeping its own copies
 * *AND* the neutral column source type SHALL gain a Glue variant carrying the Hive type string verbatim, and the skip reason SHALL gain a Glue variant carrying the Glue value that decided the skip
 * *AND* the neutral table SHALL gain an optional metadata location, which the Iceberg REST, Unity Catalog, and direct-storage clients SHALL leave absent
 * *AND* the reachability probe SHALL be edited to construct and observe each addition, and that edit MUST NOT add a source-text assertion

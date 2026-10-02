@@ -10,10 +10,12 @@ use iceberg_catalog_rest::{LoadTableResult, StorageCredential};
 use lakehouse_catalog::{
     AdlsCred, CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogProps,
     CatalogSession, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType,
-    ConnectionCreds, GlueCatalogSession, IcebergRestCatalogClient, SkipReason, SkippedTable,
-    StaticStoreAddress, StorageBackend, StorageCreds, StorageProps, TableFormat,
-    TemporaryTableCredentials, UnityCatalogSession, load_table_any_auth, parse_table_ident,
-    redact_credentials, redact_secret_values, resolve_uc_vended_storage, resolve_vended_storage,
+    ConnectionCreds, GlueCatalogSession, HIVE_DEFAULT_PARTITION, IcebergRestCatalogClient,
+    PartitionFormat, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend, StorageCreds,
+    StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
+    catalog_identifier_string, load_table_any_auth, parse_glue_table_ident, parse_table_ident,
+    read_iceberg_metadata_file, redact_credentials, redact_secret_values,
+    resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 const CATALOG_SOURCES: &[(&str, &str)] = &[
@@ -305,9 +307,12 @@ fn glue_additions_are_reachable_from_outside_the_crate() {
             ("p_str".to_string(), None),
         ]),
         location: "s3://bucket/t/p_int=1".into(),
-        input_format: "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat".into(),
+        format: PartitionFormat::Unsupported {
+            input_format: "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat".into(),
+        },
     };
-    assert!(partition.is_parquet());
+    assert_ne!(partition.format, PartitionFormat::Parquet);
+    assert_eq!(HIVE_DEFAULT_PARTITION, "__HIVE_DEFAULT_PARTITION__");
 
     let column = CatalogColumn {
         name: "payload".into(),
@@ -329,6 +334,17 @@ fn glue_additions_are_reachable_from_outside_the_crate() {
         columns: vec![column],
         metadata_location: Some("s3://bucket/orders/metadata/00001.metadata.json".into()),
     };
+    assert_eq!(catalog_identifier_string(&ident), "sales.orders");
+    assert_eq!(
+        parse_glue_table_ident("sales.orders").expect("one database, one table"),
+        ident
+    );
+    let storage = StorageBackend::S3(StorageProps::default());
+    let _metadata = read_iceberg_metadata_file(
+        &storage,
+        "s3://bucket/orders/metadata/00001.metadata.json",
+        "sales.orders",
+    );
     let _ = SkippedTable {
         ident,
         reason: SkipReason::NotPlannableGlueTable {

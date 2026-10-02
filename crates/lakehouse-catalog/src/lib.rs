@@ -19,11 +19,13 @@ mod test_support;
 
 pub use client::{
     CatalogClient, CatalogColumn, CatalogListing, CatalogPartition, CatalogTable,
-    CatalogTableIdent, CatalogTableType, ColumnSourceType, IcebergRestCatalogClient, SkipReason,
-    SkippedTable, TableFormat,
+    CatalogTableIdent, CatalogTableType, ColumnSourceType, HIVE_DEFAULT_PARTITION,
+    IcebergRestCatalogClient, PartitionFormat, SkipReason, SkippedTable, TableFormat,
+    catalog_identifier_string,
 };
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
-pub use glue::GlueCatalogSession;
+pub use glue::{GlueCatalogSession, parse_glue_table_ident};
+pub use iceberg_io::read_iceberg_metadata_file;
 pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{CatalogSession, load_table_any_auth};

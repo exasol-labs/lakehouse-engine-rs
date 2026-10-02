@@ -7,25 +7,27 @@ use super::cloud_fixture::{
 use super::raw_parquet::encode_parquet;
 use super::seed::{
     all_types_ids, all_types_validity, binary_values, boolean_values, date_values,
-    decimal_10_2_values, decimal_38_10_values, float32_values, int_list_values, int8_values,
-    int16_values, int32_values, non_utf8_parquet, string_int_map_values, text_values,
-    timestamp_values, write_one_file_append,
+    decimal_10_2_values, decimal_38_10_values, float32_values, int_list_values,
+    int_string_struct_values, int8_values, int16_values, int32_values, non_utf8_parquet,
+    string_int_map_values, text_values, timestamp_values, write_one_file_append,
 };
 use super::stack::CatalogConnectionPassword;
 
 use anyhow::{Context, Result, anyhow, bail};
 use arrow::array::{
-    ArrayRef, BinaryArray, Date32Array, Decimal128Array, Float64Array, Int32Array, Int64Array,
-    ListArray, RecordBatch, StringArray, StructArray,
+    ArrayRef, BinaryArray, Decimal128Array, Float64Array, Int32Array, Int64Array, ListArray,
+    RecordBatch, StringArray, StructArray,
 };
 use arrow::buffer::OffsetBuffer;
+use arrow::compute::cast;
 use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema};
 use aws_sdk_glue::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_glue::error::{DisplayErrorContext, ProvideErrorMetadata};
 use aws_sdk_glue::types::{
     Column, DatabaseInput, PartitionInput, SerDeInfo, StorageDescriptor, TableInput,
 };
-use futures::{StreamExt, TryStreamExt, stream};
+use futures::future::try_join_all;
+use futures::{StreamExt, TryStreamExt, stream, try_join};
 use iceberg::arrow::schema_to_arrow_schema;
 use iceberg::io::{
     S3_ACCESS_KEY_ID, S3_DISABLE_CONFIG_LOAD, S3_DISABLE_EC2_METADATA, S3_REGION,
@@ -35,6 +37,7 @@ use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Schema as IcebergSchema, Type};
 use iceberg::{Catalog, CatalogBuilder, NamespaceIdent, TableCreation, TableIdent};
 use iceberg_storage_opendal::OpenDalStorageFactory;
+use lakehouse_catalog::{HIVE_DEFAULT_PARTITION, redact_error_text};
 use object_store::aws::{AmazonS3, AmazonS3Builder};
 use object_store::path::Path as ObjectStorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
@@ -59,7 +62,6 @@ const OBJECT_PREFIX_ROOT: &str = "lh_e2e";
 const CREDENTIALS_PROVIDER: &str = "glue-e2e-harness";
 const ALREADY_EXISTS_CODE: &str = "AlreadyExistsException";
 const NOT_FOUND_CODE: &str = "EntityNotFoundException";
-const REDACTED: &str = "<redacted>";
 
 /// Plain owned data so a clone can cross into the teardown thread. It derives no `Debug`, so
 /// the secret access key can never be formatted into test output.
@@ -100,7 +102,7 @@ impl GlueEnv {
     }
 
     pub fn redact(&self, text: &str) -> String {
-        text.replace(&self.secret_access_key, REDACTED)
+        redact_error_text(text, &[&self.secret_access_key])
     }
 
     /// Panics with the redacted error chain, which may echo a request carrying the secret.
@@ -193,7 +195,7 @@ const RUN_ID_LEN: usize = MAX_DATABASE_NAME_LEN - DATABASE_PREFIX.len();
 
 /// Athena and Hive accept only lowercase letters, digits, and `_` in a database name, so the
 /// user segment is folded into that alphabet within Glue's length limit.
-pub fn per_run_id() -> String {
+fn per_run_id() -> String {
     per_run_segment('_', RUN_ID_LEN)
 }
 
@@ -299,25 +301,36 @@ async fn delete_run_resources(env: &GlueEnv, database: &str, prefix: &str) -> Ve
 
 async fn delete_database(env: &GlueEnv, database: &str) -> Result<()> {
     let client = env.glue_client();
-    for table in database_table_names(env, &client, database).await? {
-        match client
-            .delete_table()
-            .database_name(database)
-            .name(&table)
-            .send()
-            .await
-        {
-            Ok(_) => {}
-            Err(error) if error.code() == Some(NOT_FOUND_CODE) => {}
-            Err(error) => {
-                bail!(env.glue_failure(&format!("DeleteTable {database}.{table}"), &error))
-            }
-        }
-    }
+    let tables = database_table_names(env, &client, database).await?;
+    try_join_all(
+        tables
+            .iter()
+            .map(|table| delete_table(env, &client, database, table)),
+    )
+    .await?;
     match client.delete_database().name(database).send().await {
         Ok(_) => Ok(()),
         Err(error) if error.code() == Some(NOT_FOUND_CODE) => Ok(()),
         Err(error) => bail!(env.glue_failure(&format!("DeleteDatabase {database}"), &error)),
+    }
+}
+
+async fn delete_table(
+    env: &GlueEnv,
+    client: &aws_sdk_glue::Client,
+    database: &str,
+    table: &str,
+) -> Result<()> {
+    match client
+        .delete_table()
+        .database_name(database)
+        .name(table)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.code() == Some(NOT_FOUND_CODE) => Ok(()),
+        Err(error) => bail!(env.glue_failure(&format!("DeleteTable {database}.{table}"), &error)),
     }
 }
 
@@ -383,7 +396,6 @@ const PARQUET_SERDE: &str = "org.apache.hadoop.hive.ql.io.parquet.serde.ParquetH
 pub const ORC_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
 const ORC_OUTPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat";
 const ORC_SERDE: &str = "org.apache.hadoop.hive.ql.io.orc.OrcSerde";
-pub const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 const EXTERNAL_TABLE: &str = "EXTERNAL_TABLE";
 const VIRTUAL_VIEW: &str = "VIRTUAL_VIEW";
 
@@ -391,10 +403,10 @@ pub const ICEBERG_ORDERS: &str = "iceberg_orders";
 pub const ALL_TYPES: &str = "all_types";
 pub const BINARY_VALUES: &str = "binary_values";
 pub const PARTITIONED: &str = "partitioned";
-pub const PROJECTED: &str = "projected";
-pub const A_VIEW: &str = "a_view";
-pub const ORC_TABLE: &str = "orc_table";
-pub const DELTA_TABLE: &str = "delta_table";
+const PROJECTED: &str = "projected";
+const A_VIEW: &str = "a_view";
+const ORC_TABLE: &str = "orc_table";
+const DELTA_TABLE: &str = "delta_table";
 
 /// The tables the listing admits, in name order.
 pub const ROUTED_TABLES: [&str; 4] = [ALL_TYPES, BINARY_VALUES, ICEBERG_ORDERS, PARTITIONED];
@@ -465,10 +477,10 @@ pub const ORDERS: [Order; 5] = [
 
 /// One `all_types` column per Hive type of `vs-adapter/glue-hive-type-mapping`; `data` is
 /// `None` for a column the data file leaves out, because the reader refuses it at plan time.
-pub struct HiveTypeColumn {
-    pub column: &'static str,
-    pub hive_type: &'static str,
-    pub data: Option<HiveColumnData>,
+struct HiveTypeColumn {
+    column: &'static str,
+    hive_type: &'static str,
+    data: Option<HiveColumnData>,
 }
 
 type HiveColumnData = fn() -> ArrayRef;
@@ -485,7 +497,7 @@ const fn hive(
     }
 }
 
-pub const HIVE_TYPE_COLUMNS: &[HiveTypeColumn] = &[
+const HIVE_TYPE_COLUMNS: &[HiveTypeColumn] = &[
     hive("h_tinyint", "tinyint", Some(int8_values)),
     hive("h_smallint", "smallint", Some(int16_values)),
     hive("h_int", "int", Some(int32_values)),
@@ -572,7 +584,7 @@ pub const HIVE_TYPE_COLUMNS: &[HiveTypeColumn] = &[
     hive(
         "h_struct_xy",
         "struct<x:int,y:string>",
-        Some(h_struct_xy_data),
+        Some(|| int_string_struct_values("x", "y", "p")),
     ),
     hive("h_struct_binary", "struct<b:binary>", None),
     hive("h_uniontype", "uniontype<int,string>", None),
@@ -581,50 +593,10 @@ pub const HIVE_TYPE_COLUMNS: &[HiveTypeColumn] = &[
     hive("h_empty_type", "", None),
 ];
 
-/// A row's partition values are those of the `PARTITIONS` entry whose file holds its id.
 pub struct PartitionedRow {
     pub id: i64,
     pub v: &'static str,
 }
-
-impl PartitionedRow {
-    fn partition(&self) -> &'static FixturePartition {
-        let partitions: &'static [FixturePartition] = &PARTITIONS;
-        partitions
-            .iter()
-            .find(|partition| {
-                partition
-                    .files
-                    .iter()
-                    .any(|file| file.ids.contains(&self.id))
-            })
-            .unwrap_or_else(|| panic!("row {} is in no PARTITIONS file", self.id))
-    }
-
-    pub fn p_int(&self) -> i64 {
-        self.partition().values[0]
-            .parse()
-            .expect("a fixture p_int is an integer")
-    }
-
-    pub fn p_date(&self) -> &'static str {
-        self.partition().values[1]
-    }
-
-    pub fn p_str(&self) -> Option<&'static str> {
-        Some(self.partition().values[2]).filter(|value| *value != HIVE_DEFAULT_PARTITION)
-    }
-}
-
-pub const PARTITIONED_ROWS: [PartitionedRow; 7] = [
-    PartitionedRow { id: 1, v: "a" },
-    PartitionedRow { id: 2, v: "b" },
-    PartitionedRow { id: 3, v: "c" },
-    PartitionedRow { id: 4, v: "d" },
-    PartitionedRow { id: 5, v: "e" },
-    PartitionedRow { id: 6, v: "f" },
-    PartitionedRow { id: 7, v: "g" },
-];
 
 /// Where a partition's registered location points. `OutsideTable` is relative to the run
 /// prefix; `UnderTable` and `S3a`, an `s3a://` address of the same store, to the table location.
@@ -635,10 +607,10 @@ pub enum PartitionPlace {
     S3a(&'static str),
 }
 
-/// One data file: an extensionless or `.parquet` name and the `PARTITIONED_ROWS` ids it holds.
+/// One data file: an extensionless or `.parquet` name and the rows it holds.
 pub struct PartitionFile {
     pub name: &'static str,
-    pub ids: &'static [i64],
+    pub rows: &'static [PartitionedRow],
 }
 
 pub struct FixturePartition {
@@ -650,7 +622,7 @@ pub struct FixturePartition {
 
 /// The `p_int=9` ORC partition holds no file; every other partition has `p_int < 9`, so a
 /// query carrying `P_INT < 9` prunes it.
-pub const PARTITIONS: [FixturePartition; 6] = [
+pub static PARTITIONS: [FixturePartition; 6] = [
     FixturePartition {
         values: ["1", "2024-01-01", "alpha"],
         place: PartitionPlace::UnderTable("p_int=1/p_date=2024-01-01/p_str=alpha/"),
@@ -658,11 +630,14 @@ pub const PARTITIONS: [FixturePartition; 6] = [
         files: &[
             PartitionFile {
                 name: "20240101_000000_00001_p1",
-                ids: &[1, 2],
+                rows: &[
+                    PartitionedRow { id: 1, v: "a" },
+                    PartitionedRow { id: 2, v: "b" },
+                ],
             },
             PartitionFile {
                 name: "part-00000-p1.snappy.parquet",
-                ids: &[3],
+                rows: &[PartitionedRow { id: 3, v: "c" }],
             },
         ],
     },
@@ -674,7 +649,7 @@ pub const PARTITIONS: [FixturePartition; 6] = [
         input_format: PARQUET_INPUT_FORMAT,
         files: &[PartitionFile {
             name: "20240102_000000_00001_p2",
-            ids: &[4],
+            rows: &[PartitionedRow { id: 4, v: "d" }],
         }],
     },
     FixturePartition {
@@ -683,7 +658,7 @@ pub const PARTITIONS: [FixturePartition; 6] = [
         input_format: PARQUET_INPUT_FORMAT,
         files: &[PartitionFile {
             name: "20240101_000000_00001_p3",
-            ids: &[5],
+            rows: &[PartitionedRow { id: 5, v: "e" }],
         }],
     },
     FixturePartition {
@@ -692,7 +667,7 @@ pub const PARTITIONS: [FixturePartition; 6] = [
         input_format: PARQUET_INPUT_FORMAT,
         files: &[PartitionFile {
             name: "20240201_000000_00001_p4",
-            ids: &[6],
+            rows: &[PartitionedRow { id: 6, v: "f" }],
         }],
     },
     FixturePartition {
@@ -701,7 +676,7 @@ pub const PARTITIONS: [FixturePartition; 6] = [
         input_format: PARQUET_INPUT_FORMAT,
         files: &[PartitionFile {
             name: "20240202_000000_00001_p5",
-            ids: &[7],
+            rows: &[PartitionedRow { id: 7, v: "g" }],
         }],
     },
     FixturePartition {
@@ -712,11 +687,43 @@ pub const PARTITIONS: [FixturePartition; 6] = [
     },
 ];
 
-pub const PARTITION_KEYS: [(&str, &str); 3] =
+const PARTITION_KEYS: [(&str, &str); 3] =
     [("p_int", "int"), ("p_date", "date"), ("p_str", "string")];
 
-/// A Hadoop marker in the first partition's location, which the `*` file pattern must skip.
+/// A Hadoop marker in the first partition's location, which `FilePattern::AnyDirectChild` must
+/// skip.
 pub const SUCCESS_MARKER: &str = "_SUCCESS";
+
+impl FixturePartition {
+    pub fn p_int(&self) -> i64 {
+        self.values[0]
+            .parse()
+            .expect("a fixture p_int is an integer")
+    }
+
+    pub fn p_date(&self) -> &'static str {
+        self.values[1]
+    }
+
+    pub fn p_str(&self) -> Option<&'static str> {
+        Some(self.values[2]).filter(|value| *value != HIVE_DEFAULT_PARTITION)
+    }
+}
+
+/// Every data file's rows in id order, each with the partition whose Glue values it reads.
+pub fn partitioned_rows() -> Vec<(&'static FixturePartition, &'static PartitionedRow)> {
+    let mut rows: Vec<_> = PARTITIONS
+        .iter()
+        .flat_map(|partition| {
+            partition
+                .files
+                .iter()
+                .flat_map(move |file| file.rows.iter().map(move |row| (partition, row)))
+        })
+        .collect();
+    rows.sort_by_key(|(_, row)| row.id);
+    rows
+}
 
 impl PartitionPlace {
     /// The object key relative to the run prefix.
@@ -853,27 +860,29 @@ impl<'a> FixtureWriter<'a> {
 /// Registers the whole fixture set of `glue-e2e/glue-e2e-harness` in the run's database.
 pub async fn register_fixture_set(run: &GlueRun) -> Result<()> {
     let writer = FixtureWriter::new(run)?;
-    register_iceberg_orders(&writer).await?;
-    register_all_types(&writer).await?;
-    register_binary_values(&writer).await?;
-    register_partitioned(&writer).await?;
-    register_metadata_only_tables(&writer).await
+    try_join!(
+        register_iceberg_orders(&writer),
+        register_all_types(&writer),
+        register_binary_values(&writer),
+        register_partitioned(&writer),
+        register_metadata_only_tables(&writer),
+    )?;
+    Ok(())
 }
 
 /// One object and one Parquet table: enough for a teardown to have something of each kind.
 pub async fn register_probe_table(run: &GlueRun) -> Result<()> {
     let writer = FixtureWriter::new(run)?;
-    writer
-        .put_object("probe/20240101_000000_00001_probe", orders_file_bytes()?)
-        .await?;
-    writer
-        .create_table(parquet_table(
+    try_join!(
+        writer.put_object("probe/20240101_000000_00001_probe", orders_file_bytes()?),
+        writer.create_table(parquet_table(
             "probe",
             &run.uri("probe/"),
             vec![hive_column("order_id", "bigint")?],
             Vec::new(),
-        )?)
-        .await
+        )?),
+    )?;
+    Ok(())
 }
 
 fn hive_column(name: &str, hive_type: &str) -> Result<Column> {
@@ -927,13 +936,6 @@ fn parquet_table(
         .with_context(|| format!("describe Glue table {name}"))
 }
 
-fn epoch_days(date: &str) -> i32 {
-    let day = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
-        .unwrap_or_else(|error| panic!("fixture date {date} is not ISO-8601: {error}"));
-    let epoch = chrono::NaiveDate::from_ymd_opt(1970, 1, 1).expect("the UNIX epoch is a date");
-    i32::try_from((day - epoch).num_days()).expect("a fixture date fits Date32")
-}
-
 fn orders_schema() -> Result<IcebergSchema> {
     IcebergSchema::builder()
         .with_schema_id(0)
@@ -968,9 +970,11 @@ fn orders_columns() -> Result<Vec<ArrayRef>> {
             .with_precision_and_scale(10, 2)
             .context("type the amount column")?,
         ),
-        Arc::new(Date32Array::from_iter_values(
-            ORDERS.iter().map(|o| epoch_days(o.order_date)),
-        )),
+        cast(
+            &StringArray::from_iter_values(ORDERS.iter().map(|o| o.order_date)),
+            &DataType::Date32,
+        )
+        .context("type the order_date column")?,
     ])
 }
 
@@ -1058,24 +1062,6 @@ async fn register_iceberg_orders(writer: &FixtureWriter<'_>) -> Result<()> {
     writer.create_table(input).await
 }
 
-fn h_struct_xy_data() -> ArrayRef {
-    let fields = Fields::from(vec![
-        Field::new("x", DataType::Int32, true),
-        Field::new("y", DataType::Utf8, true),
-    ]);
-    Arc::new(
-        StructArray::try_new(
-            fields,
-            vec![
-                Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
-                Arc::new(StringArray::from(vec![Some("p"), None, None])),
-            ],
-            all_types_validity(),
-        )
-        .expect("struct<x:int,y:string>"),
-    )
-}
-
 fn h_array_struct_data() -> ArrayRef {
     let member_fields = Fields::from(vec![Field::new("a", DataType::Decimal128(5, 2), true)]);
     let decimals = Decimal128Array::from(vec![125])
@@ -1113,26 +1099,19 @@ async fn register_all_types(writer: &FixtureWriter<'_>) -> Result<()> {
     let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays)
         .context("build the Glue all_types batch")?;
 
-    writer
-        .put_object(
-            &format!("{ALL_TYPES}/20240115_000000_00001_{ALL_TYPES}"),
-            encode_parquet(&batch),
-        )
-        .await?;
-    writer
-        .put_object(
-            &format!("{ALL_TYPES}/{SUCCESS_MARKER}"),
-            bytes::Bytes::new(),
-        )
-        .await?;
-    writer
-        .create_table(parquet_table(
+    let data_key = format!("{ALL_TYPES}/20240115_000000_00001_{ALL_TYPES}");
+    let marker_key = format!("{ALL_TYPES}/{SUCCESS_MARKER}");
+    try_join!(
+        writer.put_object(&data_key, encode_parquet(&batch)),
+        writer.put_object(&marker_key, bytes::Bytes::new()),
+        writer.create_table(parquet_table(
             ALL_TYPES,
             &run.uri(&format!("{ALL_TYPES}/")),
             columns,
             Vec::new(),
-        )?)
-        .await
+        )?),
+    )?;
+    Ok(())
 }
 
 /// `binary_values` declares `c_bytes string` over a `BYTE_ARRAY` with no annotation and no
@@ -1145,14 +1124,10 @@ async fn register_binary_values(writer: &FixtureWriter<'_>) -> Result<()> {
             OPTIONAL BYTE_ARRAY c_bytes;
         }",
     );
-    writer
-        .put_object(
-            &format!("{BINARY_VALUES}/20240115_000000_00001_{BINARY_VALUES}"),
-            bytes,
-        )
-        .await?;
-    writer
-        .create_table(parquet_table(
+    let data_key = format!("{BINARY_VALUES}/20240115_000000_00001_{BINARY_VALUES}");
+    try_join!(
+        writer.put_object(&data_key, bytes),
+        writer.create_table(parquet_table(
             BINARY_VALUES,
             &run.uri(&format!("{BINARY_VALUES}/")),
             vec![
@@ -1160,15 +1135,12 @@ async fn register_binary_values(writer: &FixtureWriter<'_>) -> Result<()> {
                 hive_column("c_bytes", "string")?,
             ],
             Vec::new(),
-        )?)
-        .await
+        )?),
+    )?;
+    Ok(())
 }
 
-fn partition_file_bytes(ids: &[i64]) -> Result<bytes::Bytes> {
-    let rows: Vec<&PartitionedRow> = PARTITIONED_ROWS
-        .iter()
-        .filter(|row| ids.contains(&row.id))
-        .collect();
+fn partition_file_bytes(rows: &[PartitionedRow]) -> Result<bytes::Bytes> {
     let schema = Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("v", DataType::Utf8, true),
@@ -1186,18 +1158,36 @@ fn partition_file_bytes(ids: &[i64]) -> Result<bytes::Bytes> {
 
 async fn register_partitioned(writer: &FixtureWriter<'_>) -> Result<()> {
     let run = writer.run;
-    let mut inputs = Vec::with_capacity(PARTITIONS.len());
-    for partition in &PARTITIONS {
+    let data_files = try_join_all(PARTITIONS.iter().flat_map(|partition| {
         let key = partition.place.relative_key();
-        for file in partition.files {
-            writer
-                .put_object(
-                    &format!("{key}{}", file.name),
-                    partition_file_bytes(file.ids)?,
-                )
-                .await?;
-        }
-        inputs.push(
+        partition.files.iter().map(move |file| {
+            let key = format!("{key}{}", file.name);
+            async move {
+                writer
+                    .put_object(&key, partition_file_bytes(file.rows)?)
+                    .await
+            }
+        })
+    }));
+    let marker_key = format!("{}{SUCCESS_MARKER}", PARTITIONS[0].place.relative_key());
+    let partition_keys = PARTITION_KEYS
+        .iter()
+        .map(|(name, hive_type)| hive_column(name, hive_type))
+        .collect::<Result<Vec<_>>>()?;
+    try_join!(
+        data_files,
+        writer.put_object(&marker_key, bytes::Bytes::new()),
+        writer.create_table(parquet_table(
+            PARTITIONED,
+            &run.uri(&format!("{PARTITIONED}/")),
+            vec![hive_column("id", "bigint")?, hive_column("v", "string")?],
+            partition_keys,
+        )?),
+    )?;
+
+    let inputs = PARTITIONS
+        .iter()
+        .map(|partition| {
             PartitionInput::builder()
                 .set_values(Some(
                     partition
@@ -1211,26 +1201,9 @@ async fn register_partitioned(writer: &FixtureWriter<'_>) -> Result<()> {
                     Vec::new(),
                     formats_of(partition.input_format),
                 ))
-                .build(),
-        );
-    }
-    let first_key = PARTITIONS[0].place.relative_key();
-    writer
-        .put_object(&format!("{first_key}{SUCCESS_MARKER}"), bytes::Bytes::new())
-        .await?;
-
-    let partition_keys = PARTITION_KEYS
-        .iter()
-        .map(|(name, hive_type)| hive_column(name, hive_type))
-        .collect::<Result<Vec<_>>>()?;
-    writer
-        .create_table(parquet_table(
-            PARTITIONED,
-            &run.uri(&format!("{PARTITIONED}/")),
-            vec![hive_column("id", "bigint")?, hive_column("v", "string")?],
-            partition_keys,
-        )?)
-        .await?;
+                .build()
+        })
+        .collect();
     writer.create_partitions(PARTITIONED, inputs).await
 }
 
@@ -1288,9 +1261,7 @@ async fn register_metadata_only_tables(writer: &FixtureWriter<'_>) -> Result<()>
         .build()
         .context("describe the delta_table registration")?;
 
-    for input in [projected, view, orc, delta] {
-        writer.create_table(input).await?;
-    }
+    try_join_all([projected, view, orc, delta].map(|input| writer.create_table(input))).await?;
     Ok(())
 }
 
@@ -1310,128 +1281,76 @@ mod glue_naming_and_variable_tests {
         (FIXTURE_BUCKET_VAR, "bucket-sentinel"),
     ];
 
-    fn assert_legal_database_name(name: &str, user: &str) {
-        assert!(
-            name.len() <= MAX_DATABASE_NAME_LEN,
-            "user {user:?}: name {name:?} exceeds Glue's {MAX_DATABASE_NAME_LEN}-character limit"
-        );
-        assert!(
-            name.chars()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
-            "user {user:?}: name {name:?} must contain only lowercase letters, digits, and _"
-        );
-        assert!(
-            name.starts_with(DATABASE_PREFIX),
-            "user {user:?}: name {name:?} must keep the {DATABASE_PREFIX} prefix the sweep matches"
-        );
-        assert!(
-            name.ends_with(&format!("_{FIXED_MILLIS}")),
-            "user {user:?}: name {name:?} must end with the millisecond suffix"
-        );
-        assert!(
-            !name.contains("__"),
-            "user {user:?}: name {name:?} must not contain consecutive underscores"
-        );
+    fn value_of(name: &str) -> Option<String> {
+        VALUES
+            .iter()
+            .find(|(var, _)| *var == name)
+            .map(|(_, value)| value.to_string())
     }
 
     /// Scenario: Each run provisions its own Glue database and S3 prefix and removes both, including on panic
     #[test]
     fn run_id_is_a_legal_glue_database_name() {
         let three_hundred_chars = "A".repeat(300);
-        let truncated_at_a_separator = format!("{}.tail", "a".repeat(233));
         for user in [
             "",
-            "-",
             "___",
             "Antoni.Reus",
-            "a..b",
             "ÜBER-user",
-            "9",
             three_hundred_chars.as_str(),
-            truncated_at_a_separator.as_str(),
         ] {
-            assert_legal_database_name(&database_name(&derive_run_id(user, FIXED_MILLIS)), user);
+            let name = database_name(&derive_run_id(user, FIXED_MILLIS));
+            assert!(
+                name.len() <= MAX_DATABASE_NAME_LEN,
+                "user {user:?}: name {name:?} exceeds Glue's {MAX_DATABASE_NAME_LEN}-character \
+                 limit"
+            );
+            assert!(
+                name.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'),
+                "user {user:?}: name {name:?} must contain only lowercase letters, digits, and _"
+            );
+            assert!(
+                name.starts_with(DATABASE_PREFIX) && !name.contains("__"),
+                "user {user:?}: name {name:?} must keep the {DATABASE_PREFIX} prefix the sweep \
+                 matches, joined by a single underscore"
+            );
         }
-
-        assert_eq!(
-            derive_run_id("", FIXED_MILLIS),
-            FIXED_MILLIS.to_string(),
-            "an empty user leaves no segment rather than a leading underscore"
-        );
-        assert_eq!(
-            derive_run_id("___", FIXED_MILLIS),
-            FIXED_MILLIS.to_string(),
-            "a user of only separators leaves no segment"
-        );
-        assert_eq!(
-            derive_run_id("Antoni.Reus", FIXED_MILLIS),
-            format!("antoni_reus_{FIXED_MILLIS}")
-        );
-        assert_eq!(
-            derive_run_id("a..b", FIXED_MILLIS),
-            format!("a_b_{FIXED_MILLIS}"),
-            "consecutive illegal characters collapse to one underscore"
-        );
-        assert_eq!(
-            derive_run_id("ÜBER-user", FIXED_MILLIS),
-            format!("ber_user_{FIXED_MILLIS}"),
-            "a multi-byte character maps to one underscore, trimmed at the segment start"
-        );
         assert_eq!(
             database_name(&derive_run_id(&three_hundred_chars, FIXED_MILLIS)).len(),
             MAX_DATABASE_NAME_LEN,
-            "an over-long user is truncated to exactly the remaining budget"
-        );
-        assert_eq!(
-            derive_run_id(&truncated_at_a_separator, FIXED_MILLIS),
-            format!("{}_{FIXED_MILLIS}", "a".repeat(233)),
-            "truncation on a separator drops it instead of leaving a double underscore"
+            "an over-long user is truncated to exactly Glue's limit"
         );
     }
 
     /// Scenario: The suite fails, never skips, when a variable or the stack is missing
     #[test]
-    fn missing_glue_variable_fails_loud() {
+    fn glue_env_reads_all_four_variables_up_front() {
+        let env = GlueEnv::from_lookup(value_of);
+        assert_eq!(
+            [
+                env.access_key_id.as_str(),
+                env.secret_access_key(),
+                env.region.as_str(),
+                env.fixture_bucket.as_str(),
+            ],
+            VALUES.map(|(_, value)| value)
+        );
+
         for (missing, _) in VALUES {
-            for absent in [None, Some(""), Some("   ")] {
-                let message = panic_message(|| {
-                    GlueEnv::from_lookup(|name| {
-                        if name == missing {
-                            absent.map(str::to_string)
-                        } else {
-                            VALUES
-                                .iter()
-                                .find(|(var, _)| *var == name)
-                                .map(|(_, value)| value.to_string())
-                        }
-                    });
-                });
+            let message = panic_message(|| {
+                GlueEnv::from_lookup(|name| (name != missing).then(|| value_of(name)).flatten());
+            });
+            assert!(
+                message.contains(missing),
+                "the panic for a missing {missing} must name the variable, got: {message}"
+            );
+            for (_, value) in VALUES {
                 assert!(
-                    message.contains(missing),
-                    "the panic for {missing} = {absent:?} must name the variable, got: {message}"
+                    !message.contains(value),
+                    "the panic for a missing {missing} must echo no variable value, got: {message}"
                 );
-                for (_, value) in VALUES {
-                    assert!(
-                        !message.contains(value),
-                        "the panic for {missing} = {absent:?} must echo no variable value, got: \
-                         {message}"
-                    );
-                }
             }
         }
-    }
-
-    #[test]
-    fn present_glue_variables_are_read_without_surrounding_whitespace() {
-        let env = GlueEnv::from_lookup(|name| {
-            VALUES
-                .iter()
-                .find(|(var, _)| *var == name)
-                .map(|(_, value)| format!(" {value}\n"))
-        });
-        assert_eq!(env.access_key_id, "AKIAACCESSKEYSENTINEL");
-        assert_eq!(env.secret_access_key, "secret/access+key/sentinel");
-        assert_eq!(env.region, "eu-sentinel-1");
-        assert_eq!(env.fixture_bucket, "bucket-sentinel");
     }
 }

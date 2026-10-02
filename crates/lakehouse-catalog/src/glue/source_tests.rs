@@ -7,7 +7,7 @@ fn service(code: &str, message: &str) -> GlueFailure {
     }
 }
 
-/// Scenario: Service errors are classified by their error code, not their HTTP status
+/// Scenario: A failed Glue call names the operation, the subject, and the cause
 #[test]
 fn a_service_error_is_classified_by_its_code_never_its_status() {
     let not_found = GlueFailure::NotFound {

@@ -5,6 +5,7 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use exasol_udf_sdk::error::UdfError;
 use futures::TryStreamExt;
 use futures::future::try_join_all;
+use lakehouse_catalog::HIVE_DEFAULT_PARTITION;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
@@ -14,8 +15,6 @@ use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::ColumnDescriptor;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
-
-const HIVE_DEFAULT_PARTITION: &str = "__HIVE_DEFAULT_PARTITION__";
 
 /// Which files' footers are folded and whose paths declare the partition keys.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -51,6 +50,22 @@ pub struct ListedFile {
     pub path: StorePath,
     /// Carried from the listing response, so no consumer issues an object-store HEAD for it.
     pub size: u64,
+    /// Every `key=value` directory segment below the listed prefix, in path order.
+    partition_segments: Vec<(String, Option<String>)>,
+}
+
+impl ListedFile {
+    pub fn with_partition_values(
+        self,
+        partition_values: BTreeMap<String, Option<String>>,
+    ) -> ParquetFile {
+        ParquetFile {
+            path: self.path,
+            size: self.size,
+            partition_values,
+            footer: None,
+        }
+    }
 }
 
 pub struct ParquetFile {
@@ -84,12 +99,12 @@ pub struct BinaryColumn {
     /// The member's Parquet column path, `None` when the column's own leaf is binary.
     pub member_path: Option<String>,
     /// In the file's own terms: `binary`, `fixed(L)`, `uuid`, `bson`, `geometry`, `geography`,
-    /// or [`NESTED_ENUM_TYPE`].
+    /// or `enum`.
     pub declared: String,
+    /// An `ENUM` leaf below the top level or under a repeated one, which only a top-level
+    /// cast reads as text.
+    pub nested_enum: bool,
 }
-
-/// An `ENUM` leaf below the top level or under a repeated one.
-pub const NESTED_ENUM_TYPE: &str = "enum";
 
 /// The store-relative prefix a storage URI names (pairs with [`crate::scan::store_root_url`]).
 /// Derived here once rather than per caller, so enumeration and planning can't disagree and list
@@ -143,7 +158,7 @@ pub async fn resolve_parquet_directory(
     // dropped for the key.
     let key_columns = uppercase_index(raw_files.iter().flat_map(segment_keys));
 
-    let kept: Vec<(&RawFile, BTreeMap<String, Option<String>>)> = raw_files
+    let kept: Vec<(&ListedFile, BTreeMap<String, Option<String>>)> = raw_files
         .iter()
         .filter_map(|raw| {
             let filled = fill_partition_values(
@@ -155,7 +170,7 @@ pub async fn resolve_parquet_directory(
             keep(&filled).then_some((raw, filled))
         })
         .collect();
-    let sources: Vec<&RawFile> = match options.merge_mode {
+    let sources: Vec<&ListedFile> = match options.merge_mode {
         MergeMode::FoldEveryFile => kept.iter().map(|(raw, _)| *raw).collect(),
         MergeMode::SampleOneFile => sampled.iter().collect(),
     };
@@ -219,23 +234,12 @@ pub async fn list_parquet_files(
                         .eq(folded.chars())
                 },
             );
-            keep(&partition_values).then_some(ParquetFile {
-                path: raw.path,
-                size: raw.size,
-                partition_values,
-                footer: None,
-            })
+            keep(&partition_values).then(|| raw.with_partition_values(partition_values))
         })
         .collect())
 }
 
-struct RawFile {
-    path: StorePath,
-    size: u64,
-    partition_segments: Vec<(String, Option<String>)>,
-}
-
-fn segment_keys(raw: &RawFile) -> impl Iterator<Item = &str> {
+fn segment_keys(raw: &ListedFile) -> impl Iterator<Item = &str> {
     raw.partition_segments.iter().map(|(key, _)| key.as_str())
 }
 
@@ -243,20 +247,14 @@ async fn list_data_files(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,
     hive_partitioning: bool,
-) -> Result<Vec<RawFile>, UdfError> {
-    let listed = list_location_files(store, prefix, FilePattern::ParquetAtAnyDepth).await?;
-    Ok(listed
-        .into_iter()
-        .map(|file| RawFile {
-            partition_segments: if hive_partitioning {
-                parse_partition_segments(&directory_segments(&file.path, prefix))
-            } else {
-                Vec::new()
-            },
-            path: file.path,
-            size: file.size,
-        })
-        .collect())
+) -> Result<Vec<ListedFile>, UdfError> {
+    let mut files = list_location_files(store, prefix, FilePattern::ParquetAtAnyDepth).await?;
+    if !hive_partitioning {
+        for file in &mut files {
+            file.partition_segments.clear();
+        }
+    }
+    Ok(files)
 }
 
 /// Sorted by path. A segment below the prefix starting with `_` or `.`, or a zero-byte object (a
@@ -279,17 +277,19 @@ pub async fn list_location_files(
     let mut files: Vec<ListedFile> = listed
         .into_iter()
         .filter(|meta| meta.size > 0)
-        .filter(|meta| {
-            data_file_segments(&meta.location, prefix).is_some_and(|segments| match pattern {
-                FilePattern::ParquetAtAnyDepth => segments
-                    .last()
-                    .is_some_and(|name| name.ends_with(".parquet")),
-                FilePattern::AnyDirectChild => segments.len() == 1,
+        .filter_map(|meta| {
+            let mut segments = data_file_segments(&meta.location, prefix)?;
+            let name = segments.pop()?;
+            let is_data_file = match pattern {
+                FilePattern::ParquetAtAnyDepth => name.ends_with(".parquet"),
+                // The delimiter listing returns direct children only.
+                FilePattern::AnyDirectChild => true,
+            };
+            is_data_file.then(|| ListedFile {
+                path: meta.location,
+                size: meta.size,
+                partition_segments: parse_partition_segments(&segments),
             })
-        })
-        .map(|meta| ListedFile {
-            path: meta.location,
-            size: meta.size,
         })
         .collect();
 
@@ -311,12 +311,6 @@ fn data_file_segments(location: &StorePath, prefix: &StorePath) -> Option<Vec<St
         return None;
     }
     Some(segments)
-}
-
-fn directory_segments(location: &StorePath, prefix: &StorePath) -> Vec<String> {
-    let mut segments = data_file_segments(location, prefix).unwrap_or_default();
-    segments.pop();
-    segments
 }
 
 /// Every `key=value` segment in path order, repeats included; the fill step picks the deepest.
@@ -343,7 +337,7 @@ fn decode_partition_value(raw: &str) -> Option<String> {
 
 /// The distinct keys `scope`'s paths carry, in first-seen order; two spellings of one uppercased
 /// name are an error.
-fn declared_partition_keys(scope: &[RawFile]) -> Result<Vec<String>, UdfError> {
+fn declared_partition_keys(scope: &[ListedFile]) -> Result<Vec<String>, UdfError> {
     let mut keys: Vec<String> = Vec::new();
     let mut seen_spellings: HashSet<&str> = HashSet::new();
     let mut by_uppercase: HashMap<String, (&str, &StorePath)> = HashMap::new();
@@ -438,7 +432,7 @@ struct FoldedColumn {
 /// A stored column named like a partition key (`key_columns`, keyed uppercase) is dropped in favor
 /// of the key; a read file that stores the column but lacks the key's segment is an error.
 fn fold_schemas(
-    sources: &[&RawFile],
+    sources: &[&ListedFile],
     read: &[ArrowReaderMetadata],
     key_columns: &HashMap<String, &str>,
 ) -> Result<Vec<Field>, UdfError> {
@@ -495,11 +489,11 @@ fn binary_columns(read: &[ArrowReaderMetadata], folded: &[Field]) -> Vec<BinaryC
         for leaf in metadata.metadata().file_metadata().schema_descr().columns() {
             let parts = leaf.path().parts();
             let is_top_level_scalar = parts.len() == 1 && leaf.max_rep_level() == 0;
-            let declared = match classify_leaf(leaf) {
+            let (declared, nested_enum) = match classify_leaf(leaf) {
                 LeafKind::Readable => continue,
                 LeafKind::Enum if is_top_level_scalar => continue,
-                LeafKind::Enum => NESTED_ENUM_TYPE.to_string(),
-                LeafKind::Binary(declared) => declared,
+                LeafKind::Enum => ("enum".to_string(), true),
+                LeafKind::Binary(declared) => (declared, false),
             };
             first_by_column
                 .entry(parts[0].clone())
@@ -507,6 +501,7 @@ fn binary_columns(read: &[ArrowReaderMetadata], folded: &[Field]) -> Vec<BinaryC
                     column: parts[0].clone(),
                     member_path: (parts.len() > 1).then(|| leaf.path().string()),
                     declared,
+                    nested_enum,
                 });
         }
     }

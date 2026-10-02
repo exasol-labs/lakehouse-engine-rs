@@ -5,9 +5,10 @@ use aws_sdk_glue::config::timeout::TimeoutConfig;
 use aws_sdk_glue::config::{BehaviorVersion, Credentials, Region};
 use aws_sdk_glue::error::{DisplayErrorContext, ProvideErrorMetadata, SdkError};
 use aws_sdk_glue::types::{Column, Partition, Table};
+use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
 
-use crate::{ConnectionCreds, StorageBackend};
+use crate::{ConnectionCreds, StorageBackend, read_iceberg_metadata_file};
 
 use super::source::{
     GlueColumn, GlueFailure, GluePartition, GlueSource, GlueTable, SourceFuture,
@@ -119,12 +120,13 @@ impl GlueSource for SdkGlueSource {
     fn iceberg_metadata<'a>(
         &'a self,
         location: &'a str,
-    ) -> SourceFuture<'a, Result<TableMetadata, String>> {
-        Box::pin(async move {
-            TableMetadata::read_from(&self.storage.file_io(), location)
-                .await
-                .map_err(|error| error.to_string())
-        })
+        table_name: &'a str,
+    ) -> SourceFuture<'a, Result<TableMetadata, UdfError>> {
+        Box::pin(read_iceberg_metadata_file(
+            &self.storage,
+            location,
+            table_name,
+        ))
     }
 }
 

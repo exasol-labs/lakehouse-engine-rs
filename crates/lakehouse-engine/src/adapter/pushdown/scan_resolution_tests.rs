@@ -1,8 +1,8 @@
 use super::super::test_support::filter_json::equal;
 use super::super::test_support::{
-    ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog, UNITY_TABLE_TARGET,
-    iceberg_catalog, locationless_delta_table_body, object_endpoint, sample_storage,
-    unauthenticated_creds,
+    GlueEndpoint, ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog,
+    UNITY_TABLE_TARGET, iceberg_catalog, locationless_delta_table_body, object_endpoint,
+    sample_storage, unauthenticated_creds,
 };
 use super::*;
 use crate::scan::spec::{StorageBackend, StorageProps};
@@ -53,10 +53,10 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
 /// Scenario: A Glue table resolves from its recorded identifier and fails loud when it is no longer plannable
 #[tokio::test]
 async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
-    let catalog = RecordingCatalog::spawn(|_| {
+    let glue = GlueEndpoint::spawn(|_| {
         (
             400,
-            serde_json::json!({"__type": "EntityNotFoundException", "Message": "gone"}).to_string(),
+            serde_json::json!({"__type": "EntityNotFoundException", "Message": "gone"}),
         )
     })
     .await;
@@ -64,7 +64,7 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
     let storage = sample_storage();
     let resolver = TableScanResolver::for_request(
         CatalogKind::Glue,
-        &catalog.uri,
+        &glue.address,
         ConnectionStorage {
             storage: &storage,
             creds: &creds,
@@ -75,42 +75,21 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
     )
     .await
     .expect("a Glue session is built without contacting the catalog");
-    assert!(catalog.bodies().is_empty());
+    assert!(glue.operations().is_empty());
 
     let err = resolver
         .resolve("sales.orders", None, &[])
         .await
         .expect_err("a dropped Glue table cannot be planned");
 
-    let bodies = catalog.bodies();
-    assert_eq!(bodies.len(), 1, "exactly one GetTable call: {bodies:?}");
-    let request: Json = serde_json::from_str(&bodies[0]).expect("a JSON GetTable body");
+    assert_eq!(glue.operations(), ["GetTable"], "exactly one GetTable call");
+    let request = &glue.bodies_of("GetTable")[0];
     assert_eq!(request["DatabaseName"], "sales");
     assert_eq!(request["Name"], "orders");
     assert!(
         err.to_string().contains("sales.orders"),
         "the error must name the table the recorded identifier recovered: {err}"
     );
-}
-
-#[test]
-fn a_recorded_glue_identifier_splits_at_the_first_dot_and_refuses_an_empty_part() {
-    let ident = glue_table_ident("sales.orders").expect("database.table");
-    assert_eq!(ident.namespace, vec!["sales".to_string()]);
-    assert_eq!(ident.name, "orders");
-
-    let dotted = glue_table_ident("sales.orders.v2").expect("database.table with a dotted table");
-    assert_eq!(dotted.namespace, vec!["sales".to_string()]);
-    assert_eq!(dotted.name, "orders.v2");
-
-    for malformed in ["orders", "sales.", ".orders", " .orders", ""] {
-        let err = glue_table_ident(malformed)
-            .expect_err("an identifier missing its database or table must be refused");
-        assert!(
-            err.to_string().contains("database.table"),
-            "{malformed:?}: {err}"
-        );
-    }
 }
 
 #[test]

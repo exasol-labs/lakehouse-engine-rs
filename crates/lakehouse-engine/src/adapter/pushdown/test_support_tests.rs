@@ -1,77 +1,87 @@
 use super::*;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
+use lakehouse_catalog::{
+    CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
+};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// Every response closes its connection, so one accept loop serves the pooled
-/// client's sequential requests in arrival order.
+type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// Every response closes its connection, so one accept loop serves a pooled client's sequential
+/// requests in arrival order. `responder` maps a request head to a status and body.
+async fn spawn_fake_http_server<F>(
+    content_type: &'static str,
+    responder: F,
+) -> (String, RecordedRequests)
+where
+    F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+    let address = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let requests: RecordedRequests = Arc::default();
+
+    let recorded = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let Some((head, body)) = read_http_request(&mut stream).await else {
+                continue;
+            };
+            let (status, response_body) = responder(&head);
+            recorded
+                .lock()
+                .expect("recorded requests")
+                .push((head, body));
+            let reason = if (200..300).contains(&status) {
+                "OK"
+            } else {
+                "ERROR"
+            };
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+                response_body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+
+    (address, requests)
+}
+
+fn request_target(head: &str) -> &str {
+    head.split_whitespace().nth(1).unwrap_or("")
+}
+
 pub(super) struct RecordingCatalog {
     pub(super) uri: String,
-    targets: Arc<Mutex<Vec<String>>>,
-    bodies: Arc<Mutex<Vec<String>>>,
+    requests: RecordedRequests,
 }
 
 impl RecordingCatalog {
+    /// `responder` maps a request target to a status and body.
     pub(super) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-        let uri = format!(
-            "http://127.0.0.1:{}",
-            listener.local_addr().expect("local_addr").port()
-        );
-        let targets: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let bodies: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let recorded = targets.clone();
-        let recorded_bodies = bodies.clone();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let Some((head, request_body)) = read_http_request(&mut stream).await else {
-                    continue;
-                };
-                let target = head.split_whitespace().nth(1).unwrap_or("").to_string();
-                let request_body = String::from_utf8_lossy(&request_body).into_owned();
-                let (status, body) = responder(&target);
-                recorded.lock().expect("recorded targets").push(target);
-                recorded_bodies
-                    .lock()
-                    .expect("recorded bodies")
-                    .push(request_body);
-                let reason = if (200..300).contains(&status) {
-                    "OK"
-                } else {
-                    "ERROR"
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-
-        Self {
-            uri,
-            targets,
-            bodies,
-        }
-    }
-
-    pub(super) fn bodies(&self) -> Vec<String> {
-        self.bodies.lock().expect("recorded bodies").clone()
+        let (uri, requests) = spawn_fake_http_server("application/json", move |head| {
+            responder(request_target(head))
+        })
+        .await;
+        Self { uri, requests }
     }
 
     pub(super) fn targets(&self) -> Vec<String> {
-        self.targets.lock().expect("recorded targets").clone()
+        self.requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .map(|(head, _)| request_target(head).to_string())
+            .collect()
     }
 }
-
 /// No catalog auth, so a session issues no token-grant request.
 pub(super) fn unauthenticated_creds() -> ConnectionCreds {
     ConnectionCreds {
@@ -155,10 +165,71 @@ pub(super) fn load_table_body_with_columns(
     .to_string()
 }
 
+/// Binary, fixed, and uuid columns at the top level and below a struct, list, and map, between
+/// the mappable `id` and `name`; the last column id is [`BINARY_ICEBERG_LAST_COLUMN_ID`].
+pub(super) fn binary_iceberg_fields() -> serde_json::Value {
+    serde_json::json!([
+        {"id": 1, "name": "id", "required": false, "type": "int"},
+        {"id": 2, "name": "b", "required": false, "type": "binary"},
+        {"id": 3, "name": "f", "required": false, "type": "fixed[16]"},
+        {"id": 4, "name": "u", "required": false, "type": "uuid"},
+        {"id": 5, "name": "s", "required": false, "type": {"type": "struct", "fields": [
+            {"id": 6, "name": "ok", "required": false, "type": "string"},
+            {"id": 7, "name": "x", "required": false, "type": "binary"}
+        ]}},
+        {"id": 8, "name": "l", "required": false, "type": {
+            "type": "list", "element-id": 9, "element": "fixed[4]", "element-required": false
+        }},
+        {"id": 10, "name": "m", "required": false, "type": {
+            "type": "map", "key-id": 11, "key": "string",
+            "value-id": 12, "value": "uuid", "value-required": false
+        }},
+        {"id": 13, "name": "name", "required": false, "type": "string"}
+    ])
+}
+
+pub(super) const BINARY_ICEBERG_LAST_COLUMN_ID: i32 = 13;
+
 pub(super) fn user_message(error: UdfError) -> String {
     match error {
         UdfError::User(message) => message,
         other => panic!("expected UdfError::User, got {other:?}"),
+    }
+}
+
+pub(super) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
+    CatalogColumn {
+        name: name.to_string(),
+        source_type: ColumnSourceType::Glue {
+            hive_type: hive_type.to_string(),
+        },
+    }
+}
+
+/// An unpartitioned Glue table `database.name` with no metadata location; `columns` pairs each
+/// name with its Hive type.
+pub(super) fn glue_catalog_table(
+    database: &str,
+    name: &str,
+    format: TableFormat,
+    location: &str,
+    columns: &[(&str, &str)],
+) -> CatalogTable {
+    CatalogTable {
+        ident: CatalogTableIdent {
+            namespace: vec![database.to_string()],
+            name: name.to_string(),
+        },
+        table_type: CatalogTableType::Table,
+        storage_location: Some(location.to_string()),
+        format,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        metadata_location: None,
+        columns: columns
+            .iter()
+            .map(|(name, hive_type)| glue_column(name, hive_type))
+            .collect(),
     }
 }
 
@@ -308,53 +379,36 @@ pub(super) async fn object_endpoint(
 
 pub(super) struct GlueEndpoint {
     pub(super) address: String,
-    requests: Arc<Mutex<Vec<(String, serde_json::Value)>>>,
+    requests: RecordedRequests,
 }
 
 impl GlueEndpoint {
+    /// `responder` maps a Glue operation name, such as `GetTable`, to a status and JSON body.
     pub(super) async fn spawn<F>(responder: F) -> Self
     where
-        F: Fn(&str) -> serde_json::Value + Send + Sync + 'static,
+        F: Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
     {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-        let address = format!("http://{}", listener.local_addr().expect("local_addr"));
-        let requests: Arc<Mutex<Vec<(String, serde_json::Value)>>> = Arc::default();
-        let responder = Arc::new(responder);
-
-        let recorded = requests.clone();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let (recorded, responder) = (recorded.clone(), responder.clone());
-                tokio::spawn(async move {
-                    let Some((head, body)) = read_http_request(&mut stream).await else {
-                        return;
-                    };
-                    let Some(operation) = header(&head, "x-amz-target")
-                        .and_then(|target| target.strip_prefix("AWSGlue."))
-                        .map(str::to_string)
-                    else {
-                        return;
-                    };
-                    let body: serde_json::Value =
-                        serde_json::from_slice(&body).expect("a Glue request body is JSON");
-                    let response = responder(&operation).to_string();
-                    recorded
-                        .lock()
-                        .expect("recorded requests")
-                        .push((operation, body));
-                    let head = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-amz-json-1.1\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n",
-                        response.len()
-                    );
-                    let _ = stream.write_all(head.as_bytes()).await;
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                });
-            }
-        });
-
+        let (address, requests) = spawn_fake_http_server(
+            "application/x-amz-json-1.1",
+            move |head| match glue_operation(head) {
+                Some(operation) => {
+                    let (status, body) = responder(operation);
+                    (status, body.to_string())
+                }
+                None => (400, String::new()),
+            },
+        )
+        .await;
         Self { address, requests }
+    }
+
+    pub(super) fn operations(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .filter_map(|(head, _)| glue_operation(head).map(str::to_string))
+            .collect()
     }
 
     pub(super) fn bodies_of(&self, operation: &str) -> Vec<serde_json::Value> {
@@ -362,10 +416,14 @@ impl GlueEndpoint {
             .lock()
             .expect("recorded requests")
             .iter()
-            .filter(|(recorded, _)| recorded == operation)
-            .map(|(_, body)| body.clone())
+            .filter(|(head, _)| glue_operation(head) == Some(operation))
+            .map(|(_, body)| serde_json::from_slice(body).expect("a Glue request body is JSON"))
             .collect()
     }
+}
+
+fn glue_operation(head: &str) -> Option<&str> {
+    header(head, "x-amz-target")?.strip_prefix("AWSGlue.")
 }
 
 /// The request head and its whole body: closing a socket with unread bytes resets it before the

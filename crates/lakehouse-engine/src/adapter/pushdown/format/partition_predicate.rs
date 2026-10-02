@@ -4,6 +4,8 @@ use serde_json::Value as Json;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use crate::scan::{non_null_partition_value, partition_scalar};
+
 use super::filter_json::{
     Comparison, between_operands, comparison_operands, in_operands, non_empty_str, operands,
     subject_column,
@@ -129,7 +131,7 @@ fn partition_value<'a>(
     values
         .iter()
         .find(|(key, _)| folds_to(key, column))
-        .map(|(_, value)| value.as_deref().filter(|value| !value.is_empty()))
+        .map(|(_, value)| non_null_partition_value(value.as_deref()))
 }
 
 fn folds_to(key: &str, column: &str) -> bool {
@@ -139,7 +141,14 @@ fn folds_to(key: &str, column: &str) -> bool {
 /// `None` for a value that does not convert, so its file is kept for the scan's own conversion to
 /// fail the query.
 fn typed_ordering(value: &str, literal: &ScalarValue) -> Option<Ordering> {
-    let value = ScalarValue::try_from_string(value.to_string(), &literal.data_type()).ok()?;
+    // A string value converts to itself, so it compares as-is without the conversion's copy.
+    if let ScalarValue::Utf8(Some(literal))
+    | ScalarValue::LargeUtf8(Some(literal))
+    | ScalarValue::Utf8View(Some(literal)) = literal
+    {
+        return Some(value.cmp(literal.as_str()));
+    }
+    let value = partition_scalar(value, &literal.data_type()).ok()?;
     if value.is_null() {
         return None;
     }

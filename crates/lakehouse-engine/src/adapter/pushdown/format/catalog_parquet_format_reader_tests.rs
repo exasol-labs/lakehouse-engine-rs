@@ -7,8 +7,8 @@ use crate::adapter::pushdown::test_support::filter_json::{
     and, column, compare, equal, number, or,
 };
 use crate::adapter::pushdown::test_support::{
-    GlueEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, closed_port_storage, object_endpoint,
-    sample_storage, unauthenticated_creds, user_message,
+    GlueEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, closed_port_storage,
+    glue_catalog_table, object_endpoint, sample_storage, unauthenticated_creds, user_message,
 };
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
 use crate::scan::spec::reconstruct_abs_uri;
@@ -399,31 +399,16 @@ async fn storage_is_resolved_through_the_shared_unity_path() {
 
 const GLUE_TABLE_NAME: &str = "sales.orders";
 
-fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
-    CatalogColumn {
-        name: name.to_string(),
-        source_type: ColumnSourceType::Glue {
-            hive_type: hive_type.to_string(),
-        },
-    }
-}
-
 fn glue_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogTable {
     CatalogTable {
-        ident: CatalogTableIdent {
-            namespace: vec!["sales".into()],
-            name: "orders".into(),
-        },
-        table_type: CatalogTableType::Table,
-        storage_location: Some(GLUE_TABLE_ROOT.to_string()),
-        format: TableFormat::Parquet,
-        vended_credential_key: None,
         partition_columns: partition_columns.iter().map(|c| c.to_string()).collect(),
-        metadata_location: None,
-        columns: columns
-            .iter()
-            .map(|(name, hive_type)| glue_column(name, hive_type))
-            .collect(),
+        ..glue_catalog_table(
+            "sales",
+            "orders",
+            TableFormat::Parquet,
+            GLUE_TABLE_ROOT,
+            columns,
+        )
     }
 }
 
@@ -733,7 +718,10 @@ async fn a_glue_location_reads_direct_children_of_any_name() {
     )
     .await;
     let glue = GlueEndpoint::spawn(|_| {
-        partitions_page(&[(&["1"], "s3://bucket/glue/orders/p=1/", PARQUET_INPUT_FORMAT)])
+        (
+            200,
+            partitions_page(&[(&["1"], "s3://bucket/glue/orders/p=1/", PARQUET_INPUT_FORMAT)]),
+        )
     })
     .await;
     let partitioned_table = glue_table(&[("id", "bigint"), ("p", "int")], &["p"]);
@@ -774,7 +762,7 @@ async fn each_kept_partition_is_listed_and_carries_its_glue_values() {
     ])
     .await;
     let glue = GlueEndpoint::spawn(|_| {
-        partitions_page(&[
+        let page = partitions_page(&[
             (
                 &["__HIVE_DEFAULT_PARTITION__"],
                 "s3://bucket/glue/orders/p_str=__HIVE_DEFAULT_PARTITION__/",
@@ -800,7 +788,8 @@ async fn each_kept_partition_is_listed_and_carries_its_glue_values() {
                 "s3a://bucket/glue/orders/p_str=path_value",
                 PARQUET_INPUT_FORMAT,
             ),
-        ])
+        ]);
+        (200, page)
     })
     .await;
     let table = CatalogTable {
@@ -959,7 +948,7 @@ impl ObjectStore for ListingGauge {
 fn partition(
     values: &[(&str, Option<&str>)],
     location: &str,
-    input_format: &str,
+    format: PartitionFormat,
 ) -> CatalogPartition {
     CatalogPartition {
         values: values
@@ -967,7 +956,7 @@ fn partition(
             .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
             .collect(),
         location: location.to_string(),
-        input_format: input_format.to_string(),
+        format,
     }
 }
 
@@ -993,7 +982,9 @@ async fn planned_keys(
     keep: &PartitionKeepPredicate,
 ) -> Result<Vec<String>, String> {
     let store: Arc<dyn ObjectStore> = store;
-    plan_glue_partitions(&store, GLUE_TABLE_ROOT, partitions, keep)
+    let (store_root, table_prefix) =
+        raw_location_prefix(GLUE_TABLE_ROOT).expect("the Glue table root names a raw key");
+    plan_glue_partitions(&store, &store_root, &table_prefix, partitions, keep)
         .await
         .map(|files| {
             files
@@ -1010,17 +1001,19 @@ async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one
     let parquet = partition(
         &[("p_int", Some("1"))],
         "s3://bucket/glue/orders/p_int=1",
-        PARQUET_INPUT_FORMAT,
+        PartitionFormat::Parquet,
     );
     let orc = partition(
         &[("p_int", Some("9"))],
         "s3://bucket/glue/orders/p_int=9",
-        ORC_INPUT_FORMAT,
+        PartitionFormat::Unsupported {
+            input_format: ORC_INPUT_FORMAT.to_string(),
+        },
     );
     let foreign = partition(
         &[("p_int", Some("5"))],
         "s3://other-bucket/glue/orders/p_int=5",
-        PARQUET_INPUT_FORMAT,
+        PartitionFormat::Parquet,
     );
     let objects: &[(&str, &[u8])] = &[("glue/orders/p_int=1/f", b"rows")];
     let below_five = keep_under(
@@ -1122,7 +1115,7 @@ async fn glue_partitions_are_pruned_on_glue_values_before_listing() {
             .collect::<Vec<_>>(),
     )
     .await;
-    let glue = GlueEndpoint::spawn(move |_| page.clone()).await;
+    let glue = GlueEndpoint::spawn(move |_| (200, page.clone())).await;
     let table = glue_table(
         &[
             ("id", "bigint"),
@@ -1167,7 +1160,7 @@ async fn glue_partitions_are_pruned_on_glue_values_before_listing() {
                     ("p_str", Some(*p_str)),
                 ],
                 &format!("s3://bucket/{}", location(p_str)),
-                PARQUET_INPUT_FORMAT,
+                PartitionFormat::Parquet,
             )
         })
         .collect();
@@ -1207,7 +1200,7 @@ async fn kept_partitions_are_listed_concurrently_within_the_table_store_budget()
             partition(
                 &[("p", Some(value.as_str()))],
                 &format!("s3://bucket/glue/orders/p={index}"),
-                PARQUET_INPUT_FORMAT,
+                PartitionFormat::Parquet,
             )
         })
         .collect();

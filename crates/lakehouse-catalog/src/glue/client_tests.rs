@@ -8,7 +8,7 @@ use crate::glue::routing::PARQUET_INPUT_FORMAT;
 use crate::glue::source::{GluePartition, SourceFuture};
 use crate::{StorageProps, TableFormat};
 
-const ORC_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
+use crate::test_support::ORC_INPUT_FORMAT;
 const ACCESS_KEY: &str = "AKIDGLUECONNECTION01";
 const SECRET_KEY: &str = "GLUE_SECRET_KEY_SENTINEL";
 const SESSION_TOKEN: &str = "GLUE_SESSION_TOKEN_SENTINEL";
@@ -68,16 +68,18 @@ impl GlueSource for FakeGlue {
     fn iceberg_metadata<'a>(
         &'a self,
         location: &'a str,
-    ) -> SourceFuture<'a, Result<TableMetadata, String>> {
+        table_name: &'a str,
+    ) -> SourceFuture<'a, Result<TableMetadata, UdfError>> {
         Box::pin(async move {
             self.calls
                 .lock()
                 .expect("calls")
                 .push(format!("metadata {location}"));
-            self.metadata
-                .get(location)
-                .cloned()
-                .ok_or_else(|| format!("no object at {location} for key {STORAGE_SECRET_KEY}"))
+            self.metadata.get(location).cloned().ok_or_else(|| {
+                UdfError::User(format!(
+                    "no object at {location} of table {table_name} for key {STORAGE_SECRET_KEY}"
+                ))
+            })
         })
     }
 }
@@ -417,10 +419,9 @@ async fn an_unpartitioned_table_reads_as_one_parquet_partition_at_its_location()
         [CatalogPartition {
             values: BTreeMap::new(),
             location: "s3://bucket/events".to_string(),
-            input_format: PARQUET_INPUT_FORMAT.to_string(),
+            format: PartitionFormat::Parquet,
         }]
     );
-    assert!(partitions[0].is_parquet());
     assert!(
         calls.lock().expect("calls").is_empty(),
         "no Glue call is issued"
@@ -564,4 +565,25 @@ fn a_session_without_a_signing_region_is_refused() {
     );
 
     assert!(result.is_err(), "no signing region, no session");
+}
+
+#[test]
+fn a_recorded_glue_identifier_splits_at_the_first_dot_and_refuses_an_empty_part() {
+    let ident = parse_glue_table_ident("sales.orders").expect("database.table");
+    assert_eq!(ident.namespace, vec!["sales".to_string()]);
+    assert_eq!(ident.name, "orders");
+
+    let dotted =
+        parse_glue_table_ident("sales.orders.v2").expect("database.table with a dotted table");
+    assert_eq!(dotted.namespace, vec!["sales".to_string()]);
+    assert_eq!(dotted.name, "orders.v2");
+
+    for malformed in ["orders", "sales.", ".orders", " .orders", ""] {
+        let err = parse_glue_table_ident(malformed)
+            .expect_err("an identifier missing its database or table must be refused");
+        assert!(
+            err.to_string().contains("database.table"),
+            "{malformed:?}: {err}"
+        );
+    }
 }

@@ -7,16 +7,17 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
+    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
     DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE, E2E_DIM_TABLE, E2E_EVO_TABLE,
     E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
     E2E_TYPED_TABLE, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE,
-    EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, LINEITEM_ROWS,
-    LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
-    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
-    SEED_TOTAL_ROWS, TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns,
-    seed_added_columns_initial_default, seed_all_types, seed_events, seed_renamed_column,
-    seed_typed_distinct_probe, typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev,
-    typed_id_avg_stddev,
+    EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT,
+    INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
+    PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
+    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
+    seed_all_types, seed_events, seed_renamed_column, seed_typed_distinct_probe,
+    typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use common::stack::{
     build_create_connection_sql, exasol_container, iceberg_catalog_url, wait_for_exasol,
@@ -285,44 +286,30 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
              C_TIMESTAMPTZ, C_TIMESTAMP_NS FROM {table} ORDER BY ID"
         ),
         &[
-            [Some("1"), Some("2"), Some("3")],
-            [Some("2147483647"), Some("-2147483648"), None],
-            [Some("1.5"), Some("-0.25"), None],
-            [Some("12.34"), Some("-0.05"), None],
-            [
-                Some("1234567890123456789012345678.9012345678"),
-                Some("-0.0000000005"),
-                None,
-            ],
-            [Some("true"), Some("false"), None],
-            [Some("12:34:56.123456"), Some("00:00:00"), None],
-            [
-                Some("2024-01-15 10:30:45.123000"),
-                Some("1970-01-01 00:00:00.000000"),
-                None,
-            ],
-            [
-                Some("2024-01-15 10:30:45.123000"),
-                Some("1970-01-01 00:00:00.000000"),
-                None,
-            ],
+            ALL_TYPES_IDS_TEXT,
+            INT32_VALUES_TEXT,
+            FLOAT32_VALUES_TEXT,
+            DECIMAL_10_2_VALUES_TEXT,
+            DECIMAL_38_10_VALUES_TEXT,
+            BOOLEAN_VALUES_TEXT,
+            TIME64_VALUES_TEXT,
+            TIMESTAMP_VALUES_TEXT,
+            TIMESTAMP_VALUES_TEXT,
         ],
     );
-    for (column, fragments) in [
-        ("C_BINARY", &["type 'binary'", "#351"][..]),
-        ("C_FIXED", &["type 'fixed(16)'", "#351"]),
-        ("C_UUID", &["type 'uuid'", "#351"]),
-        (
-            "C_STRUCT_BINARY",
-            &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
-        ),
-    ] {
-        assert_query_fails(
-            &mut conn,
-            &format!("SELECT {column} FROM {table}"),
-            fragments,
-        );
-    }
+    assert_columns_refused(
+        &mut conn,
+        &table,
+        &[
+            ("C_BINARY", &["type 'binary'", "#351"][..]),
+            ("C_FIXED", &["type 'fixed(16)'", "#351"]),
+            ("C_UUID", &["type 'uuid'", "#351"]),
+            (
+                "C_STRUCT_BINARY",
+                &["member 'c_struct_binary.x'", "type 'binary'", "#351"],
+            ),
+        ],
+    );
 
     let binary_values = format!("{VS_NAME}.{}", E2E_BINARY_VALUES_TABLE.to_uppercase());
     assert_eq!(

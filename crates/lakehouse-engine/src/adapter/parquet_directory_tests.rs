@@ -1224,6 +1224,7 @@ fn binary_column(column: &str, member_path: Option<&str>, declared: &str) -> Bin
         column: column.to_string(),
         member_path: member_path.map(str::to_string),
         declared: declared.to_string(),
+        nested_enum: declared == "enum",
     }
 }
 

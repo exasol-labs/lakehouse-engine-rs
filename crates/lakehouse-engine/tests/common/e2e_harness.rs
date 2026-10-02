@@ -596,6 +596,13 @@ pub fn assert_query_fails(conn: &mut ExaConn, sql: &str, fragments: &[&str]) {
     );
 }
 
+/// Each `(column, fragments)` reads alone from `table` and must fail naming every fragment.
+pub fn assert_columns_refused(conn: &mut ExaConn, table: &str, refusals: &[(&str, &[&str])]) {
+    for (column, fragments) in refusals {
+        assert_query_fails(conn, &format!("SELECT {column} FROM {table}"), fragments);
+    }
+}
+
 /// Compares each result column of `sql`, as text with NULL as `None`, with `expected`.
 pub fn assert_text_columns<const ROWS: usize>(
     conn: &mut ExaConn,

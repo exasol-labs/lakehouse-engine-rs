@@ -7,17 +7,19 @@ mod common;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON,
-    assert_query_fails, assert_text_columns, create_schema_and_scripts, declared_types, exa_conn,
-    explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper, install_slc, pairs,
-    parse_int, parse_numeric, upload_so, value_to_string,
+    assert_columns_refused, assert_query_fails, assert_text_columns, create_schema_and_scripts,
+    declared_types, exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper,
+    install_slc, pairs, parse_int, parse_numeric, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{encode_parquet, put_fixture_object, write_parquet_fixture};
 use common::seed::{
-    all_types_ids, all_types_validity, binary_values, boolean_values, date_values,
-    decimal_10_2_values, decimal_38_10_values, float32_values, int_list_values, int8_values,
-    int16_values, int32_values, string_int_map_values, struct_binary_values, text_values,
-    timestamp_values,
+    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
+    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT,
+    INT16_VALUES_TEXT, INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, all_types_ids,
+    binary_values, boolean_values, date_values, decimal_10_2_values, decimal_38_10_values,
+    float32_values, int_list_values, int_string_struct_values, int8_values, int16_values,
+    int32_values, string_int_map_values, struct_binary_values, text_values, timestamp_values,
 };
 use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
@@ -34,8 +36,8 @@ use lakehouse_engine::adapter::pushdown::{
 };
 use lakehouse_engine::scan::spec::{DeleteMechanism, FileEntry};
 
-use arrow::array::{ArrayRef, Float64Array, Int32Array, Int64Array, StringArray, StructArray};
-use arrow::datatypes::{DataType, Field, Fields, Schema};
+use arrow::array::{Float64Array, Int64Array};
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{Value as Json, json};
 use std::sync::{Arc, OnceLock};
@@ -242,18 +244,6 @@ fn register_unity_table(
 /// Every Spark type a Unity Parquet table can declare, except the `long` and `double` that
 /// `sales_parquet` carries; `c_variant` has no data, because the reader refuses it at plan time.
 fn seed_all_types_parquet_table() {
-    let ab_struct = StructArray::try_new(
-        Fields::from(vec![
-            Field::new("a", DataType::Int32, true),
-            Field::new("b", DataType::Utf8, true),
-        ]),
-        vec![
-            Arc::new(Int32Array::from(vec![Some(1), Some(2), None])) as ArrayRef,
-            Arc::new(StringArray::from(vec![Some("x"), None, None])),
-        ],
-        all_types_validity(),
-    )
-    .expect("c_struct");
     let batch = RecordBatch::try_from_iter_with_nullable(vec![
         ("id", all_types_ids(), false),
         ("c_byte", int8_values(), true),
@@ -274,7 +264,7 @@ fn seed_all_types_parquet_table() {
             string_int_map_values(vec!["k1", "k2"], vec![1, 2], [2, 0, 0]),
             true,
         ),
-        ("c_struct", Arc::new(ab_struct), true),
+        ("c_struct", int_string_struct_values("a", "b", "x"), true),
         ("c_struct_binary", struct_binary_values(None), true),
     ])
     .expect("all_types_parquet batch");
@@ -1883,11 +1873,6 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
             ("C_VARIANT", VARCHAR_JSON),
         ])
     );
-    let timestamps = [
-        Some("2024-01-15 10:30:45.123000"),
-        Some("1970-01-01 00:00:00.000000"),
-        None,
-    ];
     assert_text_columns(
         &mut conn,
         &format!(
@@ -1896,23 +1881,19 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
              FROM {table} ORDER BY ID"
         ),
         &[
-            [Some("1"), Some("2"), Some("3")],
-            [Some("127"), Some("-128"), None],
-            [Some("32767"), Some("-32768"), None],
-            [Some("2147483647"), Some("-2147483648"), None],
-            [Some("1.5"), Some("-0.25"), None],
-            [Some("true"), Some("false"), None],
-            [Some("h\u{e9}llo"), Some("w\u{f6}rld"), None],
-            [Some("12.34"), Some("-0.05"), None],
-            [
-                Some("1234567890123456789012345678.9012345678"),
-                Some("-0.0000000005"),
-                None,
-            ],
-            [Some("2024-01-15"), Some("1970-01-01"), None],
-            timestamps,
-            timestamps,
-            [Some("[1,2]"), Some("[]"), None],
+            ALL_TYPES_IDS_TEXT,
+            INT8_VALUES_TEXT,
+            INT16_VALUES_TEXT,
+            INT32_VALUES_TEXT,
+            FLOAT32_VALUES_TEXT,
+            BOOLEAN_VALUES_TEXT,
+            TEXT_VALUES_TEXT,
+            DECIMAL_10_2_VALUES_TEXT,
+            DECIMAL_38_10_VALUES_TEXT,
+            DATE_VALUES_TEXT,
+            TIMESTAMP_VALUES_TEXT,
+            TIMESTAMP_VALUES_TEXT,
+            INT_LIST_VALUES_TEXT,
             [Some("{\"k1\":1,\"k2\":2}"), Some("{}"), None],
             [
                 Some("{\"a\":1,\"b\":\"x\"}"),
@@ -1921,28 +1902,26 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
             ],
         ],
     );
-    for (column, fragments) in [
-        (
-            "C_BINARY",
-            &["column 'c_binary'", "type 'binary'", "#351"][..],
-        ),
-        (
-            "C_STRUCT_BINARY",
-            &[
-                "column 'c_struct_binary'",
-                "member 'c_struct_binary.x'",
-                "type 'binary'",
-                "#351",
-            ],
-        ),
-        ("C_VARIANT", &["column 'c_variant'", "type 'variant'"]),
-    ] {
-        assert_query_fails(
-            &mut conn,
-            &format!("SELECT {column} FROM {table}"),
-            fragments,
-        );
-    }
+    assert_columns_refused(
+        &mut conn,
+        &table,
+        &[
+            (
+                "C_BINARY",
+                &["column 'c_binary'", "type 'binary'", "#351"][..],
+            ),
+            (
+                "C_STRUCT_BINARY",
+                &[
+                    "column 'c_struct_binary'",
+                    "member 'c_struct_binary.x'",
+                    "type 'binary'",
+                    "#351",
+                ],
+            ),
+            ("C_VARIANT", &["column 'c_variant'", "type 'variant'"]),
+        ],
+    );
 }
 
 /// Scenario: a Unity Parquet table's scan resolves identically under vended and static credentials

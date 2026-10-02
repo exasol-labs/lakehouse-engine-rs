@@ -5,20 +5,27 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, assert_query_fails,
+    SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_columns_refused, assert_query_fails,
     assert_text_columns, create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql,
-    install_slc, int_column, pairs, parse_int, query_error, text_column, upload_so,
-    value_to_string,
+    install_slc, int_column, pairs, parse_int, query_error, text_column,
+    try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::glue::{
-    A_VIEW, ACCESS_KEY_ID_VAR, ALL_TYPES, BINARY_VALUES, DELTA_TABLE, GlueEnv, GlueRun,
-    HIVE_DEFAULT_PARTITION, HIVE_TYPE_COLUMNS, ICEBERG_ORDERS, ORC_INPUT_FORMAT, ORC_TABLE, ORDERS,
-    PARTITION_KEYS, PARTITIONED, PARTITIONED_ROWS, PARTITIONS, PROJECTED, ROUTED_TABLES,
-    SECRET_ACCESS_KEY_VAR, SKIPPED_TABLES, STALE_GLUE_COLUMN, SUCCESS_MARKER,
-    glue_connection_password, metadata_only_keys, register_fixture_set, register_probe_table,
+    ACCESS_KEY_ID_VAR, ALL_TYPES, BINARY_VALUES, GlueEnv, GlueRun, ICEBERG_ORDERS,
+    ORC_INPUT_FORMAT, ORDERS, PARTITIONED, PARTITIONS, ROUTED_TABLES, SECRET_ACCESS_KEY_VAR,
+    SKIPPED_TABLES, STALE_GLUE_COLUMN, SUCCESS_MARKER, glue_connection_password,
+    metadata_only_keys, partitioned_rows, register_fixture_set, register_probe_table,
 };
-use common::stack::{build_create_connection_sql, panic_payload_message, wait_for_exasol};
+use common::seed::{
+    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
+    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT,
+    INT16_VALUES_TEXT, INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
+};
+use common::stack::{
+    build_create_connection_sql, exasol_host, exasol_sql_port, panic_payload_message,
+    wait_for_exasol,
+};
 use common::timestamp_precision::expected_timestamp_precision;
 
 use futures::FutureExt;
@@ -51,72 +58,49 @@ fn runtime() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
-/// Hold as a test-function local: `run`'s `Drop` removes the Glue database and the S3 prefix
-/// on return or panic, which a static would never do.
-struct GlueFixture {
-    run: GlueRun,
+/// The environment is read before anything else, so a missing variable leaves no resource, and
+/// the local Exasol is prepared next, so an unavailable stack creates no cloud resource.
+fn provision() -> GlueRun {
+    let env = GlueEnv::from_environment();
+    setup();
+    let rt = runtime();
+    let run = env.expect(rt.block_on(GlueRun::create(&env)), "create the Glue run");
+    env.expect(
+        rt.block_on(register_fixture_set(&run)),
+        &format!("register the fixture set in {}", run.database()),
+    );
+    create_glue_virtual_schema(&env, &run.database());
+    run
 }
 
-impl GlueFixture {
-    /// Takes the environment its caller read before creating anything, so a missing variable
-    /// leaves no resource.
-    fn register(env: GlueEnv) -> Self {
-        let rt = runtime();
-        let run = env.expect(rt.block_on(GlueRun::create(&env)), "create the Glue run");
-        env.expect(
-            rt.block_on(register_fixture_set(&run)),
-            &format!("register the fixture set in {}", run.database()),
-        );
-        Self { run }
-    }
-
-    /// The local Exasol is prepared first, so an unavailable stack creates no cloud resource.
-    fn provision() -> Self {
-        let env = GlueEnv::from_environment();
-        setup();
-        let fixture = Self::register(env);
-        create_glue_virtual_schema(fixture.run.env(), &fixture.run.database());
-        fixture
-    }
-
-    fn table(&self, name: &str) -> String {
-        format!("{VS}.{}", name.to_uppercase())
-    }
+fn vs_table(name: &str) -> String {
+    format!("{VS}.{}", name.to_uppercase())
 }
 
-/// The Exasol error for credential-bearing DDL may echo the statement, so only its redacted
-/// text reaches the panic.
-fn execute_redacted(conn: &mut ExaConn, env: &GlueEnv, label: &str, sql: &str) {
-    let response = conn.try_execute(sql);
-    if response["status"].as_str() != Some("ok") {
-        panic!(
-            "{}",
-            env.redact(&format!(
-                "{label} failed: {} (sqlCode {})",
-                response["exception"]["text"].as_str().unwrap_or(""),
-                response["exception"]["sqlCode"].as_str().unwrap_or("")
-            ))
-        );
-    }
+fn glue_vs_props<'a>(vs_name: &'a str, conn_name: &'a str, namespace: &'a str) -> VsProps<'a> {
+    VsProps::new(vs_name, namespace)
+        .with_catalog_conn_name(conn_name)
+        .with_catalog_kind("GLUE")
+}
+
+/// A redacting connection, because the Exasol error for credential-bearing DDL may echo the
+/// statement.
+fn redacting_conn() -> ExaConn {
+    ExaConn::connect_redacting(&exasol_host(), exasol_sql_port(), "sys", SYS_PASSWORD)
 }
 
 fn create_glue_virtual_schema(env: &GlueEnv, namespace: &str) {
-    let mut conn = exa_conn();
-    execute_redacted(
-        &mut conn,
-        env,
-        "CREATE CONNECTION",
-        &build_create_connection_sql(CONN, &env.glue_endpoint(), &glue_connection_password(env)),
+    let response = try_create_virtual_schema_with_password(
+        &mut redacting_conn(),
+        &glue_vs_props(VS, CONN, namespace),
+        &env.glue_endpoint(),
+        &glue_connection_password(env),
     );
-    conn.execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {VS} CASCADE"));
-    execute_redacted(
-        &mut conn,
-        env,
-        "CREATE VIRTUAL SCHEMA",
-        &format!(
-            "CREATE VIRTUAL SCHEMA {VS} USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH \
-             CATALOG_CONNECTION = '{CONN}' CATALOG_KIND = 'GLUE' NAMESPACE = '{namespace}'"
-        ),
+    assert_eq!(
+        response["status"].as_str(),
+        Some("ok"),
+        "CREATE VIRTUAL SCHEMA {VS} failed: {}",
+        env.redact(&response["exception"].to_string())
     );
 }
 
@@ -220,208 +204,48 @@ fn glue_run_resources_are_removed_when_the_scope_ends_including_on_panic() {
     assert_removed(&database, &prefix, "a scope that ends in a panic");
 }
 
-#[derive(Debug)]
-struct RegisteredPartition {
-    values: Vec<String>,
-    location: String,
-    input_format: String,
-}
+type ReadOnlyCheck = fn(&GlueRun, &mut ExaConn);
 
-/// Scenario: The fixture set covers every routing, partition, and type case
+/// Every check here only reads the fixture, so one provisioning serves them all. Each check runs
+/// even after another failed, and the panic hook has already printed each failure.
 #[test]
-fn glue_fixture_set_registers_every_case() {
-    let fixture = GlueFixture::register(GlueEnv::from_environment());
-    let (env, run) = (fixture.run.env(), &fixture.run);
-    let rt = runtime();
-    let client = env.glue_client();
-    let database = run.database();
-    let tables = rt
-        .block_on(client.get_tables().database_name(&database).send())
-        .unwrap_or_else(|e| panic!("{}", env.glue_failure(&format!("GetTables {database}"), &e)));
-    let table = |name: &str| {
-        tables
-            .table_list()
-            .iter()
-            .find(|table| table.name() == name)
-            .unwrap_or_else(|| panic!("the fixture set must register table {name}"))
-    };
-    let parameter = |name: &str, key: &str| {
-        table(name)
-            .parameters()
-            .and_then(|parameters| parameters.get(key))
-            .cloned()
-    };
-    let input_format = |name: &str| {
-        table(name)
-            .storage_descriptor()
-            .and_then(|descriptor| descriptor.input_format())
-            .map(str::to_string)
-    };
-
-    let mut names: Vec<&str> = tables.table_list().iter().map(|t| t.name()).collect();
-    names.sort_unstable();
-    let mut expected: Vec<&str> = ROUTED_TABLES
+fn glue_read_only_checks_pass_against_one_provisioned_fixture() {
+    let run = provision();
+    let checks: [(&str, ReadOnlyCheck); 6] = [
+        (
+            "listing",
+            check_listing_includes_routed_tables_and_records_every_skip,
+        ),
+        (
+            "pushdown rows",
+            check_queries_return_expected_rows_through_pushdown,
+        ),
+        (
+            "partition cases",
+            check_partition_cases_return_their_glue_values,
+        ),
+        ("ORC partition", check_orc_partition_fails_loud),
+        (
+            "partition pruning",
+            check_partition_predicate_reduces_the_scan_file_list,
+        ),
+        (
+            "all types",
+            check_all_types_declare_and_return_their_mapped_values,
+        ),
+    ];
+    let failed: Vec<&str> = checks
         .iter()
-        .copied()
-        .chain(SKIPPED_TABLES.iter().map(|(name, _)| *name))
-        .collect();
-    expected.sort_unstable();
-    assert_eq!(
-        names, expected,
-        "the run's database holds exactly the fixture set"
-    );
-
-    assert_eq!(
-        parameter(ICEBERG_ORDERS, "table_type").as_deref(),
-        Some("ICEBERG")
-    );
-    let metadata_location = parameter(ICEBERG_ORDERS, "metadata_location")
-        .expect("iceberg_orders must carry its metadata_location");
-    let metadata_key = metadata_location
-        .strip_prefix(&format!("s3://{}/", env.fixture_bucket))
-        .expect("the metadata file lives in the fixture bucket");
-    let objects = env.expect(
-        rt.block_on(env.object_keys(&run.object_prefix())),
-        "list the run prefix",
-    );
-    assert!(
-        metadata_key.ends_with(".metadata.json") && objects.iter().any(|key| key == metadata_key),
-        "metadata_location {metadata_location} must name a metadata file iceberg-rust wrote"
-    );
-
-    let declared = |name: &str| -> Vec<(String, String)> {
-        table(name)
-            .storage_descriptor()
-            .map(|descriptor| descriptor.columns())
-            .unwrap_or_default()
-            .iter()
-            .map(|c| (c.name().to_string(), c.r#type().unwrap_or("").to_string()))
-            .collect()
-    };
-    let hive_types: Vec<(String, String)> = std::iter::once(("id", "bigint"))
-        .chain(HIVE_TYPE_COLUMNS.iter().map(|c| (c.column, c.hive_type)))
-        .map(|(name, hive_type)| (name.to_string(), hive_type.to_string()))
-        .collect();
-    assert_eq!(
-        declared(ALL_TYPES),
-        hive_types,
-        "all_types must declare every Hive type of vs-adapter/glue-hive-type-mapping"
-    );
-    assert_eq!(
-        declared(BINARY_VALUES),
-        pairs(&[("id", "bigint"), ("c_bytes", "string")])
-    );
-    for name in [ALL_TYPES, BINARY_VALUES] {
-        let data_files: Vec<&String> = objects
-            .iter()
-            .filter(|key| key.starts_with(&format!("{}{name}/", run.object_prefix())))
-            .filter(|key| !key.ends_with(SUCCESS_MARKER))
-            .collect();
-        assert!(
-            !data_files.is_empty()
-                && data_files
-                    .iter()
-                    .all(|key| !key.rsplit('/').next().unwrap_or("").contains('.')),
-            "{name}'s data files must carry no file extension: {data_files:?}"
-        );
-    }
-
-    let partition_keys: Vec<(String, String)> = table(PARTITIONED)
-        .partition_keys()
-        .iter()
-        .map(|c| (c.name().to_string(), c.r#type().unwrap_or("").to_string()))
-        .collect();
-    assert_eq!(partition_keys, pairs(&PARTITION_KEYS));
-    let partitions = rt
-        .block_on(
-            client
-                .get_partitions()
-                .database_name(&database)
-                .table_name(PARTITIONED)
-                .send(),
-        )
-        .unwrap_or_else(|e| {
-            panic!(
-                "{}",
-                env.glue_failure(&format!("GetPartitions {database}.{PARTITIONED}"), &e)
-            )
-        });
-    let registered: Vec<RegisteredPartition> = partitions
-        .partitions()
-        .iter()
-        .map(|partition| {
-            let descriptor = partition.storage_descriptor();
-            RegisteredPartition {
-                values: partition.values().to_vec(),
-                location: descriptor
-                    .and_then(|d| d.location())
-                    .unwrap_or("")
-                    .to_string(),
-                input_format: descriptor
-                    .and_then(|d| d.input_format())
-                    .unwrap_or("")
-                    .to_string(),
-            }
+        .filter(|(_, check)| {
+            std::panic::catch_unwind(AssertUnwindSafe(|| check(&run, &mut exa_conn()))).is_err()
         })
+        .map(|(name, _)| *name)
         .collect();
-    assert_eq!(registered.len(), PARTITIONS.len(), "{registered:?}");
-    let table_location = run.uri(&format!("{PARTITIONED}/"));
-    let has = |check: &dyn Fn(&RegisteredPartition) -> bool, case: &str| {
-        assert!(
-            registered.iter().any(check),
-            "the partitioned table must register {case}: {registered:?}"
-        );
-    };
-    has(
-        &|p| p.values[2] == HIVE_DEFAULT_PARTITION,
-        "a NULL partition",
-    );
-    has(
-        &|p| p.values[2] == "a b/c" && p.location.contains("p_str=a b%2Fc/"),
-        "the value a b/c at its raw key",
-    );
-    has(
-        &|p| p.location.starts_with("s3://") && !p.location.starts_with(&table_location),
-        "a partition outside the table location",
-    );
-    has(&|p| p.location.starts_with("s3a://"), "an s3a:// partition");
-    has(
-        &|p| p.values[0] == "9" && p.input_format == ORC_INPUT_FORMAT,
-        "the p_int=9 ORC partition",
-    );
-    assert!(
-        registered
-            .iter()
-            .filter(|p| p.values[0] != "9")
-            .all(|p| p.values[0].parse::<i32>().is_ok_and(|p_int| p_int < 9)),
-        "every partition but the ORC one must have p_int < 9: {registered:?}"
-    );
-
-    assert_eq!(
-        parameter(PROJECTED, "projection.enabled").as_deref(),
-        Some("true")
-    );
-    assert_eq!(table(A_VIEW).table_type(), Some("VIRTUAL_VIEW"));
-    assert_eq!(input_format(ORC_TABLE).as_deref(), Some(ORC_INPUT_FORMAT));
-    assert_eq!(
-        parameter(DELTA_TABLE, "table_type").as_deref(),
-        Some("DELTA")
-    );
-    for key in metadata_only_keys() {
-        let prefix = format!("{}{key}", run.object_prefix());
-        assert!(
-            !objects.iter().any(|object| object.starts_with(&prefix)),
-            "no data file may exist under the metadata-only location {prefix}"
-        );
-    }
+    assert!(failed.is_empty(), "failed read-only checks: {failed:?}");
 }
 
 /// Scenario: The listing includes the routed tables and records every skip
-#[test]
-fn glue_listing_includes_routed_tables_and_records_every_skip() {
-    let fixture = GlueFixture::provision();
-    let mut conn = exa_conn();
-
+fn check_listing_includes_routed_tables_and_records_every_skip(run: &GlueRun, conn: &mut ExaConn) {
     let listed = conn.query_columns(&format!(
         "SELECT TABLE_NAME FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA = '{VS}' \
          ORDER BY TABLE_NAME"
@@ -434,7 +258,7 @@ fn glue_listing_includes_routed_tables_and_records_every_skip() {
     );
 
     assert_eq!(
-        declared_types(&mut conn, VS, ICEBERG_ORDERS),
+        declared_types(conn, VS, ICEBERG_ORDERS),
         pairs(&[
             ("ORDER_ID", "DECIMAL(20,0)"),
             ("CUSTOMER", VARCHAR_JSON),
@@ -444,7 +268,7 @@ fn glue_listing_includes_routed_tables_and_records_every_skip() {
         "the Iceberg columns come from metadata.json, never Glue's {STALE_GLUE_COLUMN} copy"
     );
     assert_eq!(
-        declared_types(&mut conn, VS, PARTITIONED),
+        declared_types(conn, VS, PARTITIONED),
         pairs(&[
             ("ID", "DECIMAL(20,0)"),
             ("V", VARCHAR_JSON),
@@ -466,7 +290,7 @@ fn glue_listing_includes_routed_tables_and_records_every_skip() {
         .iter()
         .map(|entry| value_to_string(&entry["table"]))
         .collect();
-    let database = fixture.run.database();
+    let database = run.database();
     let expected: BTreeSet<String> = SKIPPED_TABLES
         .iter()
         .map(|(name, _)| format!("{database}.{name}"))
@@ -485,14 +309,25 @@ fn glue_listing_includes_routed_tables_and_records_every_skip() {
             "the skip of {name} must state {reason:?}: {entry}"
         );
     }
+
+    let env = run.env();
+    let objects = env.expect(
+        runtime().block_on(env.object_keys(&run.object_prefix())),
+        "list the run prefix",
+    );
+    for key in metadata_only_keys() {
+        let prefix = format!("{}{key}", run.object_prefix());
+        assert!(
+            !objects.iter().any(|object| object.starts_with(&prefix)),
+            "no data file may exist under the metadata-only location {prefix}, so each skip \
+             rests on metadata alone"
+        );
+    }
 }
 
 /// Scenario: Queries through pushdown return the expected rows
-#[test]
-fn glue_queries_return_expected_rows_through_pushdown() {
-    let fixture = GlueFixture::provision();
-    let mut conn = exa_conn();
-    let orders = fixture.table(ICEBERG_ORDERS);
+fn check_queries_return_expected_rows_through_pushdown(_run: &GlueRun, conn: &mut ExaConn) {
+    let orders = vs_table(ICEBERG_ORDERS);
 
     let full = conn.query_columns(&format!(
         "SELECT ORDER_ID, CUSTOMER, AMOUNT, ORDER_DATE FROM {orders} ORDER BY ORDER_ID"
@@ -538,7 +373,7 @@ fn glue_queries_return_expected_rows_through_pushdown() {
     ));
     assert_eq!(int_column(&limited[0]), unpushed_filtered[..2]);
 
-    let partitioned = fixture.table(PARTITIONED);
+    let partitioned = vs_table(PARTITIONED);
     let full = conn.query_columns(&format!(
         "SELECT ID, V FROM {partitioned} WHERE P_INT < 9 ORDER BY ID"
     ));
@@ -557,46 +392,44 @@ fn glue_queries_return_expected_rows_through_pushdown() {
 }
 
 /// Scenario: Each kept partition's location is listed and its files carry the partition's Glue values
-#[test]
-fn glue_partition_cases_return_their_glue_values() {
-    let fixture = GlueFixture::provision();
-    let mut conn = exa_conn();
-    let partitioned = fixture.table(PARTITIONED);
+fn check_partition_cases_return_their_glue_values(_run: &GlueRun, conn: &mut ExaConn) {
+    let partitioned = vs_table(PARTITIONED);
+    let expected = partitioned_rows();
 
     let rows = conn.query_columns(&format!(
         "SELECT ID, V, P_INT, P_DATE, P_STR FROM {partitioned} WHERE P_INT < 9 ORDER BY ID"
     ));
     assert_eq!(
         int_column(&rows[0]),
-        PARTITIONED_ROWS.iter().map(|r| r.id).collect::<Vec<_>>()
+        expected.iter().map(|(_, row)| row.id).collect::<Vec<_>>()
     );
     assert_eq!(
         text_column(&rows[1]),
-        PARTITIONED_ROWS
+        expected
             .iter()
-            .map(|r| Some(r.v.to_string()))
+            .map(|(_, row)| Some(row.v.to_string()))
             .collect::<Vec<_>>()
     );
     assert_eq!(
         int_column(&rows[2]),
-        PARTITIONED_ROWS
+        expected
             .iter()
-            .map(|r| r.p_int())
+            .map(|(partition, _)| partition.p_int())
             .collect::<Vec<_>>(),
         "P_INT comes from each partition's Glue values"
     );
     assert_eq!(
         text_column(&rows[3]),
-        PARTITIONED_ROWS
+        expected
             .iter()
-            .map(|r| Some(r.p_date().to_string()))
+            .map(|(partition, _)| Some(partition.p_date().to_string()))
             .collect::<Vec<_>>()
     );
     assert_eq!(
         text_column(&rows[4]),
-        PARTITIONED_ROWS
+        expected
             .iter()
-            .map(|r| r.p_str().map(str::to_string))
+            .map(|(partition, _)| partition.p_str().map(str::to_string))
             .collect::<Vec<_>>(),
         "the default partition reads NULL, a b/c reads decoded, and the out-of-root and s3a:// \
          partitions read their Glue values, never a value parsed from a path"
@@ -613,19 +446,16 @@ fn glue_partition_cases_return_their_glue_values() {
 }
 
 /// Scenario: Queries through pushdown return the expected rows
-#[test]
-fn glue_orc_partition_fails_loud() {
-    let fixture = GlueFixture::provision();
-    let mut conn = exa_conn();
+fn check_orc_partition_fails_loud(run: &GlueRun, conn: &mut ExaConn) {
     let orc = PARTITIONS
         .iter()
         .find(|partition| partition.input_format == ORC_INPUT_FORMAT)
         .expect("the fixture set has an ORC partition");
-    let orc_location = orc.place.location(&fixture.run);
+    let orc_location = orc.place.location(run);
 
     let error = query_error(
-        &mut conn,
-        &format!("SELECT COUNT(*) FROM {}", fixture.table(PARTITIONED)),
+        conn,
+        &format!("SELECT COUNT(*) FROM {}", vs_table(PARTITIONED)),
     );
     for fragment in [
         "p_int=9",
@@ -639,34 +469,31 @@ fn glue_orc_partition_fails_loud() {
         );
     }
     assert!(
-        !error.contains(fixture.run.env().secret_access_key()),
+        !error.contains(run.env().secret_access_key()),
         "the failure must not contain the secret access key"
     );
 }
 
 /// Scenario: A partition predicate prunes partitions before their locations are listed
-#[test]
-fn glue_partition_predicate_reduces_the_scan_file_list() {
-    let fixture = GlueFixture::provision();
-    let mut conn = exa_conn();
-    let partitioned = fixture.table(PARTITIONED);
+fn check_partition_predicate_reduces_the_scan_file_list(_run: &GlueRun, conn: &mut ExaConn) {
+    let partitioned = vs_table(PARTITIONED);
     let every_readable: Vec<&str> = every_partition_file();
 
     let pushed = explain_virtual_sql(
-        &mut conn,
+        conn,
         &format!("SELECT COUNT(*) FROM {partitioned} WHERE P_INT < 9"),
     );
     assert_scan_names_only(&pushed, &every_readable, "P_INT < 9");
 
     let pushed = explain_virtual_sql(
-        &mut conn,
+        conn,
         &format!("SELECT COUNT(*) FROM {partitioned} WHERE P_INT = 1"),
     );
     assert_scan_names_only(&pushed, &partition_files("1"), "P_INT = 1");
 
     let predicate = "P_INT = 1 AND P_DATE >= DATE '2024-01-02'";
     let pushed = explain_virtual_sql(
-        &mut conn,
+        conn,
         &format!("SELECT COUNT(*) FROM {partitioned} WHERE {predicate}"),
     );
     assert_scan_names_only(&pushed, &["20240102_000000_00001_p2"], predicate);
@@ -676,8 +503,8 @@ fn glue_partition_predicate_reduces_the_scan_file_list() {
             "SELECT COUNT(*) FROM {partitioned} WHERE {predicate}"
         ))
     };
-    assert_eq!(count(&mut conn, "P_INT = 1"), 4);
-    assert_eq!(count(&mut conn, predicate), 1);
+    assert_eq!(count(conn, "P_INT = 1"), 4);
+    assert_eq!(count(conn, predicate), 1);
     let limited = conn.query_columns(&format!(
         "SELECT ID FROM {partitioned} WHERE P_INT = 2 LIMIT 1"
     ));
@@ -685,12 +512,9 @@ fn glue_partition_predicate_reduces_the_scan_file_list() {
 }
 
 /// Scenario: Every Hive type declares and returns its mapped value on a Glue Parquet table
-#[test]
-fn glue_all_types_declare_and_return_their_mapped_values() {
-    let fixture = GlueFixture::provision();
-    let mut conn = exa_conn();
-    let timestamp = expected_timestamp_precision(&mut conn).declared_column_type;
-    let all_types = fixture.table(ALL_TYPES);
+fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: &mut ExaConn) {
+    let timestamp = expected_timestamp_precision(conn).declared_column_type;
+    let all_types = vs_table(ALL_TYPES);
 
     let expected_types = [
         ("ID", "DECIMAL(20,0)"),
@@ -723,12 +547,9 @@ fn glue_all_types_declare_and_return_their_mapped_values() {
         ("H_MALFORMED_MAP", VARCHAR_JSON),
         ("H_EMPTY_TYPE", VARCHAR_JSON),
     ];
-    assert_eq!(
-        declared_types(&mut conn, VS, ALL_TYPES),
-        pairs(&expected_types)
-    );
+    assert_eq!(declared_types(conn, VS, ALL_TYPES), pairs(&expected_types));
     assert_text_columns(
-        &mut conn,
+        conn,
         &format!(
             "SELECT ID, H_TINYINT, H_SMALLINT, H_INT, H_INTEGER, H_BIGINT, H_FLOAT, H_DOUBLE, \
              H_BOOLEAN, H_STRING, H_STRING_OVER_BINARY, H_VARCHAR, H_CHAR, H_DECIMAL_10_2, \
@@ -736,37 +557,29 @@ fn glue_all_types_declare_and_return_their_mapped_values() {
              H_MAP_STRING, H_MAP_VARCHAR, H_STRUCT_XY FROM {all_types} ORDER BY ID"
         ),
         &[
-            [Some("1"), Some("2"), Some("3")],
-            [Some("127"), Some("-128"), None],
-            [Some("32767"), Some("-32768"), None],
-            [Some("2147483647"), Some("-2147483648"), None],
+            ALL_TYPES_IDS_TEXT,
+            INT8_VALUES_TEXT,
+            INT16_VALUES_TEXT,
+            INT32_VALUES_TEXT,
             [Some("7"), Some("-7"), None],
             [
                 Some("9223372036854775807"),
                 Some("-9223372036854775808"),
                 None,
             ],
-            [Some("1.5"), Some("-0.25"), None],
+            FLOAT32_VALUES_TEXT,
             [Some("2.5"), Some("-0.125"), None],
-            [Some("true"), Some("false"), None],
-            [Some("h\u{e9}llo"), Some("w\u{f6}rld"), None],
+            BOOLEAN_VALUES_TEXT,
+            TEXT_VALUES_TEXT,
             [Some("legacy-a"), Some("legacy-b"), None],
             [Some("short"), Some("text"), None],
             [Some("abcde"), Some("fghij"), None],
-            [Some("12.34"), Some("-0.05"), None],
+            DECIMAL_10_2_VALUES_TEXT,
             [Some("42"), Some("-42"), None],
-            [
-                Some("1234567890123456789012345678.9012345678"),
-                Some("-0.0000000005"),
-                None,
-            ],
-            [Some("2024-01-15"), Some("1970-01-01"), None],
-            [
-                Some("2024-01-15 10:30:45.123000"),
-                Some("1970-01-01 00:00:00.000000"),
-                None,
-            ],
-            [Some("[1,2]"), Some("[]"), None],
+            DECIMAL_38_10_VALUES_TEXT,
+            DATE_VALUES_TEXT,
+            TIMESTAMP_VALUES_TEXT,
+            INT_LIST_VALUES_TEXT,
             [Some("[{\"a\":1.25}]"), Some("[]"), None],
             [Some("{\"k1\":1,\"k2\":2}"), Some("{}"), None],
             [Some("{\"a\":1}"), Some("{}"), None],
@@ -777,27 +590,28 @@ fn glue_all_types_declare_and_return_their_mapped_values() {
             ],
         ],
     );
-    for (column, fragments) in [
-        ("H_BINARY", &["type 'binary'", "#351"][..]),
-        (
-            "H_STRUCT_BINARY",
-            &["member 'h_struct_binary.b'", "type 'binary'", "#351"],
-        ),
-        ("H_UNIONTYPE", &["Hive type 'uniontype<int,string>'"]),
-        ("H_INTERVAL", &["Hive type 'interval_day_time'"]),
-        ("H_MALFORMED_MAP", &["Hive type 'map<int>'"]),
-        ("H_EMPTY_TYPE", &["Hive type ''"]),
-    ] {
-        let sql = format!("SELECT {column} FROM {all_types}");
-        assert_query_fails(&mut conn, &sql, fragments);
-    }
+    assert_columns_refused(
+        conn,
+        &all_types,
+        &[
+            ("H_BINARY", &["type 'binary'", "#351"][..]),
+            (
+                "H_STRUCT_BINARY",
+                &["member 'h_struct_binary.b'", "type 'binary'", "#351"],
+            ),
+            ("H_UNIONTYPE", &["Hive type 'uniontype<int,string>'"]),
+            ("H_INTERVAL", &["Hive type 'interval_day_time'"]),
+            ("H_MALFORMED_MAP", &["Hive type 'map<int>'"]),
+            ("H_EMPTY_TYPE", &["Hive type ''"]),
+        ],
+    );
 
     assert_eq!(
-        declared_types(&mut conn, VS, BINARY_VALUES),
+        declared_types(conn, VS, BINARY_VALUES),
         pairs(&[("ID", "DECIMAL(20,0)"), ("C_BYTES", VARCHAR_JSON)])
     );
-    let sql = format!("SELECT C_BYTES FROM {}", fixture.table(BINARY_VALUES));
-    assert_query_fails(&mut conn, &sql, &["Invalid UTF8 sequence"]);
+    let sql = format!("SELECT C_BYTES FROM {}", vs_table(BINARY_VALUES));
+    assert_query_fails(conn, &sql, &["Invalid UTF8 sequence"]);
 }
 
 /// Scenario: The suite fails, never skips, when a variable or the stack is missing
@@ -828,7 +642,7 @@ fn glue_credentials_never_appear_in_output() {
         other => std::env::var(other).ok(),
     });
     setup();
-    let mut conn = exa_conn();
+    let mut conn = redacting_conn();
     let connection_sql = build_create_connection_sql(
         PROBE_CONN,
         &sentinel_env.glue_endpoint(),
@@ -836,17 +650,14 @@ fn glue_credentials_never_appear_in_output() {
     );
 
     let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        execute_redacted(
-            &mut conn,
-            &sentinel_env,
-            "CREATE CONNECTION",
-            &format!("{connection_sql} THIS_TRAILING_TOKEN_MAKES_THE_STATEMENT_INVALID"),
-        );
+        conn.execute(&format!(
+            "{connection_sql} THIS_TRAILING_TOKEN_MAKES_THE_STATEMENT_INVALID"
+        ));
     }));
     let payload = result.expect_err("the malformed credential-bearing DDL must fail");
     let message = panic_payload_message(&*payload).unwrap_or_default();
     assert!(
-        message.contains("CREATE CONNECTION failed"),
+        message.contains("Exasol execute failed"),
         "the failure must still be reported: {message}"
     );
     assert!(
@@ -854,22 +665,19 @@ fn glue_credentials_never_appear_in_output() {
         "a failed CONNECTION DDL must not echo the secret access key: {message}"
     );
 
-    execute_redacted(
+    let response = try_create_virtual_schema_with_password(
         &mut conn,
-        &sentinel_env,
-        "CREATE CONNECTION",
-        &connection_sql,
-    );
-    conn.execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {PROBE_VS} CASCADE"));
-    let error = query_error(
-        &mut conn,
-        &format!(
-            "CREATE VIRTUAL SCHEMA {PROBE_VS} USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH \
-             CATALOG_CONNECTION = '{PROBE_CONN}' CATALOG_KIND = 'GLUE' \
-             NAMESPACE = 'lh_e2e_redaction_probe'"
-        ),
+        &glue_vs_props(PROBE_VS, PROBE_CONN, "lh_e2e_redaction_probe"),
+        &sentinel_env.glue_endpoint(),
+        &glue_connection_password(&sentinel_env),
     );
     conn.execute(&format!("DROP CONNECTION IF EXISTS {PROBE_CONN}"));
+    assert_ne!(
+        response["status"].as_str(),
+        Some("ok"),
+        "a virtual schema over sentinel credentials must fail"
+    );
+    let error = value_to_string(&response["exception"]["text"]);
     assert!(
         error.contains("Glue"),
         "the adapter must report the rejected Glue call: {}",

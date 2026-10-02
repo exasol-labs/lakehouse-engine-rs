@@ -1,10 +1,11 @@
-//! The authenticated catalog `GET`. Credential values never appear in any
-//! returned error.
+//! The authenticated catalog `GET` and the metastore-pointed metadata-file read. Credential
+//! values never appear in any returned error.
 
-use crate::ConnectionCreds;
 use crate::auth::{CatalogAuth, redact_catalog_auth_error};
-use crate::redaction::redact_secret_values;
+use crate::redaction::{redact_error_text, redact_secret_values};
+use crate::{ConnectionCreds, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
+use iceberg::spec::TableMetadata;
 
 pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
     client: &reqwest::Client,
@@ -80,6 +81,23 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
             redact(&e.to_string())
         ))
     })
+}
+
+/// Reads the `metadata.json` a metastore points to (Iceberg § Metastore Tables) through `storage`.
+pub async fn read_iceberg_metadata_file(
+    storage: &StorageBackend,
+    location: &str,
+    table_name: &str,
+) -> Result<TableMetadata, UdfError> {
+    TableMetadata::read_from(&storage.file_io(), location)
+        .await
+        .map_err(|error| {
+            let message = format!(
+                "failed to read the Iceberg metadata file '{location}' of table '{table_name}': \
+                 {error}"
+            );
+            UdfError::User(redact_error_text(&message, &storage.secret_values()))
+        })
 }
 
 #[cfg(test)]

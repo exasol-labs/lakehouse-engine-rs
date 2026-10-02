@@ -5,7 +5,7 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 ## Background
 
 * Iceberg table spec, § Optimistic Concurrency: "Once a writer has created an update, it commits by swapping the table’s metadata file pointer from the base version to the new version." § Metastore Tables: "The atomic swap needed to commit new versions of table metadata can be implemented by storing a pointer in a metastore or database that is updated with a check-and-put operation". Glue's `Parameters.metadata_location` is that pointer, so it names the snapshot a REST `loadTable` names.
-* Glue records a partition location as a raw S3 key. A partition value `a b/c` is stored at the literal key `…/p_str=a b%2Fc/` (verified live, #410).
+* Glue records a partition location as a raw S3 key (verified live, #410). `vs-adapter/parquet-directory-seam` owns the raw-key listing rule.
 * Trino writes unbucketed Hive Parquet data files with no file extension (verified live, #410).
 * Every pushdown re-reads the Glue metadata: one `GetTable`, the paginated `GetPartitions`, and one LIST per kept partition. The adapter caches nothing.
 * The adapter reads storage with the CONNECTION's static credentials.
@@ -33,7 +33,7 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 * *GIVEN* a partitioned Glue Parquet table whose partitions include a NULL partition, a partition registered at a location with no `key=value` segment, a partition with the value `a b/c`, a partition outside the table location in the same bucket, and a partition addressed with `s3a://`
 * *WHEN* the pushdown resolves the table
 * *THEN* the reader SHALL list each kept partition's location by its raw object key, per `vs-adapter/parquet-directory-seam`
-* *AND* every file SHALL carry its partition's Glue values, NULL for the default partition, and never a value parsed from its path
+* *AND* every file SHALL carry its partition's values as `vs-adapter/glue-catalog-client` returns them, and never a value parsed from its path
 * *AND* a file outside the table location SHALL carry an absolute path, and `s3a://` SHALL address the same store as `s3://`
 * *AND* the reader SHALL list the kept partitions concurrently, bounded by the admission limit of the table's store
 
@@ -47,10 +47,9 @@ Resolves a pushdown over a `GLUE` virtual table into the engine's `ResolvedScan`
 
 ### Scenario: A Glue location's data files are its direct children of any name
 
-* *GIVEN* a partition location holding `20240101_abc` (no extension), `part-0.snappy.parquet`, `_SUCCESS`, `.hidden`, a zero-length object, and `nested/x.parquet`, and an unpartitioned Glue table whose location holds the same objects
+* *GIVEN* a partitioned Glue Parquet table, and an unpartitioned one, whose locations hold an extensionless data file such as `20240101_abc`
 * *WHEN* the pushdown resolves each table
-* *THEN* the reader SHALL read `20240101_abc` and `part-0.snappy.parquet` and no other object, through the seam's any-direct-child file pattern
-* *AND* the reader SHALL list the unpartitioned table's location under the same pattern
+* *THEN* the reader SHALL list each kept partition's location, and the unpartitioned table's location, under the any-direct-child file pattern of `vs-adapter/parquet-directory-seam`, so `20240101_abc` is a data file
 
 ### Scenario: A partition predicate prunes partitions before their locations are listed
 

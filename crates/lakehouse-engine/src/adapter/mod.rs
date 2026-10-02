@@ -225,8 +225,7 @@ fn handle_create_virtual_schema(
         udf_log!(ctx, warn, "{}", skip_warning(entry));
     }
 
-    let adapter_notes = build_adapter_notes(
-        request,
+    let tuning = TuningNotes {
         parallelism_factor,
         df_threading_mode,
         df_target_partitions,
@@ -236,9 +235,8 @@ fn handle_create_virtual_schema(
         instance_overhead_mb,
         s3_max_connections,
         join_broadcast_max_bytes,
-        &table_map,
-        &skipped,
-    );
+    };
+    let adapter_notes = build_adapter_notes(request, &tuning, &table_map, &skipped);
 
     let schema_metadata = json!({
         "tables": tables_json,
@@ -248,29 +246,24 @@ fn handle_create_virtual_schema(
     Ok(build_schema_response(request, schema_metadata))
 }
 
-fn skip_reason(entry: &SkippedTable) -> String {
+/// The warning's noun for the skipped entry, and the reason both the warning and the notes record.
+fn skip_kind_and_reason(entry: &SkippedTable) -> (&'static str, String) {
     match &entry.reason {
-        SkipReason::NotLoadableIcebergTable => {
-            "catalog reported it is not a loadable Iceberg table".to_string()
-        }
-        SkipReason::NotDeltaBaseTable { detail } | SkipReason::NotPlannableGlueTable { detail } => {
-            detail.clone()
-        }
-        SkipReason::NoDataFile => "holds no data file".to_string(),
+        SkipReason::NotLoadableIcebergTable => (
+            "non-Iceberg table",
+            "catalog reported it is not a loadable Iceberg table".to_string(),
+        ),
+        SkipReason::NotDeltaBaseTable { detail } => ("non-Delta-base entry", detail.clone()),
+        SkipReason::NoDataFile => ("directory", "holds no data file".to_string()),
+        SkipReason::NotPlannableGlueTable { detail } => ("Glue table", detail.clone()),
     }
 }
 
 fn skip_warning(entry: &SkippedTable) -> String {
-    let skipped_kind = match &entry.reason {
-        SkipReason::NotLoadableIcebergTable => "non-Iceberg table",
-        SkipReason::NotDeltaBaseTable { .. } => "non-Delta-base entry",
-        SkipReason::NoDataFile => "directory",
-        SkipReason::NotPlannableGlueTable { .. } => "Glue table",
-    };
+    let (skipped_kind, reason) = skip_kind_and_reason(entry);
     format!(
-        "createVirtualSchema: skipping {skipped_kind} '{}' ({})",
+        "createVirtualSchema: skipping {skipped_kind} '{}' ({reason})",
         catalog_identifier_string(&entry.ident),
-        skip_reason(entry)
     )
 }
 
@@ -548,11 +541,8 @@ fn resolve_pushdown_identifier(request: &Json) -> Result<String, UdfError> {
         })
 }
 
-/// Exasol rejects a raw-object adapterNotes, so it is a JSON string; pre-existing notes are merged.
-// Args mirror the notes fields one-to-one; a params struct is boilerplate for one private callee.
-#[allow(clippy::too_many_arguments)]
-fn build_adapter_notes(
-    request: &Json,
+/// The tuning a schema request resolves from its properties; pushdowns read it back from the notes.
+struct TuningNotes {
     parallelism_factor: usize,
     df_threading_mode: ThreadingMode,
     df_target_partitions: usize,
@@ -562,9 +552,26 @@ fn build_adapter_notes(
     instance_overhead_mb: u64,
     s3_max_connections: usize,
     join_broadcast_max_bytes: u64,
+}
+
+/// Exasol rejects a raw-object adapterNotes, so it is a JSON string; pre-existing notes are merged.
+fn build_adapter_notes(
+    request: &Json,
+    tuning: &TuningNotes,
     table_map: &[(String, String)],
     skipped: &[SkippedTable],
 ) -> Json {
+    let &TuningNotes {
+        parallelism_factor,
+        df_threading_mode,
+        df_target_partitions,
+        df_threads_per_udf,
+        df_batch_size,
+        memory_pool_fraction,
+        instance_overhead_mb,
+        s3_max_connections,
+        join_broadcast_max_bytes,
+    } = tuning;
     let mut notes = parse_adapter_notes(request);
     notes.insert(
         NOTE_PARALLELISM_FACTOR.to_string(),
@@ -617,7 +624,7 @@ fn insert_skipped_tables(notes: &mut serde_json::Map<String, Json>, skipped: &[S
         .map(|entry| {
             json!({
                 "table": catalog_identifier_string(&entry.ident),
-                "reason": skip_reason(entry),
+                "reason": skip_kind_and_reason(entry).1,
             })
         })
         .collect();
