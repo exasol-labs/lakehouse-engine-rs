@@ -146,52 +146,67 @@ impl ConvertedArgs {
     }
 }
 
-/// The one declaration of a string function's argument conversion and result family;
-/// every name must also be a `TRANSLATED_SCALAR_FNS` row. A declared function absent here
+/// The one declaration of a string function's argument conversion, result family and
+/// DataFusion-dialect call name; every name must also be a `TRANSLATED_SCALAR_FNS` row.
+/// `df_name` is `None` where the DataFusion rendering is not a plain call (CONCAT, INSTR,
+/// LOCATE have their own arms). A declared function absent here
 /// converts no argument and returns a non-character result.
 struct StringFnRule {
     name: &'static str,
     converted: ConvertedArgs,
     character_result: bool,
+    df_name: Option<&'static str>,
 }
 
 const fn rule(
     name: &'static str,
     converted: ConvertedArgs,
     character_result: bool,
+    df_name: Option<&'static str>,
 ) -> StringFnRule {
     StringFnRule {
         name,
         converted,
         character_result,
+        df_name,
     }
 }
 
 const STRING_FN_RULES: &[StringFnRule] = &[
-    rule("CONCAT", ConvertedArgs::All, true),
-    rule("TRIM", ConvertedArgs::All, true),
-    rule("LTRIM", ConvertedArgs::All, true),
-    rule("RTRIM", ConvertedArgs::All, true),
-    rule("REPLACE", ConvertedArgs::All, true),
-    rule("TRANSLATE", ConvertedArgs::All, true),
-    rule("LOWER", ConvertedArgs::First, true),
-    rule("UPPER", ConvertedArgs::First, true),
-    rule("INITCAP", ConvertedArgs::First, true),
-    rule("REVERSE", ConvertedArgs::First, true),
-    rule("SUBSTR", ConvertedArgs::First, true),
-    rule("REPEAT", ConvertedArgs::First, true),
-    rule("LEFT", ConvertedArgs::First, true),
-    rule("RIGHT", ConvertedArgs::First, true),
-    rule("LPAD", ConvertedArgs::FirstAndThird, true),
-    rule("RPAD", ConvertedArgs::FirstAndThird, true),
-    rule("CHR", ConvertedArgs::None, true),
-    rule("UNICODECHR", ConvertedArgs::None, true),
-    rule("ASCII", ConvertedArgs::First, false),
-    rule("LENGTH", ConvertedArgs::First, false),
-    rule("OCTET_LENGTH", ConvertedArgs::First, false),
-    rule("UNICODE", ConvertedArgs::First, false),
-    rule("INSTR", ConvertedArgs::FirstTwo, false),
-    rule("LOCATE", ConvertedArgs::FirstTwo, false),
+    rule("CONCAT", ConvertedArgs::All, true, None),
+    rule("TRIM", ConvertedArgs::All, true, Some("trim")),
+    rule("LTRIM", ConvertedArgs::All, true, Some("ltrim")),
+    rule("RTRIM", ConvertedArgs::All, true, Some("rtrim")),
+    rule("REPLACE", ConvertedArgs::All, true, Some("replace")),
+    rule("TRANSLATE", ConvertedArgs::All, true, Some("translate")),
+    rule("LOWER", ConvertedArgs::First, true, Some("lower")),
+    rule("UPPER", ConvertedArgs::First, true, Some("upper")),
+    rule("INITCAP", ConvertedArgs::First, true, Some("initcap")),
+    rule("REVERSE", ConvertedArgs::First, true, Some("reverse")),
+    rule("SUBSTR", ConvertedArgs::First, true, Some("substr")),
+    rule("REPEAT", ConvertedArgs::First, true, Some("repeat")),
+    rule("LEFT", ConvertedArgs::First, true, Some("left")),
+    rule("RIGHT", ConvertedArgs::First, true, Some("right")),
+    rule("LPAD", ConvertedArgs::FirstAndThird, true, Some("lpad")),
+    rule("RPAD", ConvertedArgs::FirstAndThird, true, Some("rpad")),
+    rule("CHR", ConvertedArgs::None, true, Some("chr")),
+    rule("UNICODECHR", ConvertedArgs::None, true, Some("chr")),
+    rule("ASCII", ConvertedArgs::First, false, Some("ascii")),
+    rule(
+        "LENGTH",
+        ConvertedArgs::First,
+        false,
+        Some("character_length"),
+    ),
+    rule(
+        "OCTET_LENGTH",
+        ConvertedArgs::First,
+        false,
+        Some("octet_length"),
+    ),
+    rule("UNICODE", ConvertedArgs::First, false, Some("ascii")),
+    rule("INSTR", ConvertedArgs::FirstTwo, false, None),
+    rule("LOCATE", ConvertedArgs::FirstTwo, false, None),
 ];
 
 fn string_fn_rule(fn_name: &str) -> Option<&'static StringFnRule> {
@@ -977,26 +992,17 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
                     }))
                 }
                 // DataFusion dialect only; the Exasol dialect renders these at the gate.
-                "LOWER" | "UPPER" | "SUBSTR" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE"
-                | "REPEAT" | "REVERSE" | "LPAD" | "RPAD" | "ASCII" | "CHR" | "INITCAP" | "LEFT"
-                | "RIGHT" | "TRANSLATE" | "LENGTH" | "OCTET_LENGTH" | "UNICODE" | "UNICODECHR" => {
+                name if string_fn_rule(name).is_some_and(|rule| rule.df_name.is_some()) => {
                     let args = args.ok_or_else(|| {
                         UdfError::User(format!("function_scalar {fn_name} missing 'arguments'"))
                     })?;
-                    let lower;
-                    let df_name = match fn_name.as_str() {
-                        "LENGTH" => "character_length",
-                        "OCTET_LENGTH" => "octet_length",
-                        "UNICODE" => "ascii",
-                        "UNICODECHR" => "chr",
-                        "SUBSTR" => "substr",
-                        other => {
-                            lower = other.to_lowercase();
-                            &lower
-                        }
-                    };
+                    let df_name = string_fn_rule(name).and_then(|rule| rule.df_name);
                     let rendered = render_string_fn_args(&fn_name, args)?;
-                    Ok(Some(format!("{df_name}({})", rendered.join(", "))))
+                    Ok(Some(format!(
+                        "{}({})",
+                        df_name.unwrap_or_default(),
+                        rendered.join(", ")
+                    )))
                 }
                 // DataFusion dialect only: INSTR(s, sub) and LOCATE(sub, s) both map to
                 // strpos(s, sub). `strpos` has no start or occurrence, so a longer call is
