@@ -404,9 +404,17 @@ jobs:
         run: docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml pull --quiet
 
       # One-shot jobs are `docker wait`-ed first (see `e2e`).
-      - name: Start stack (Exasol + SeaweedFS + Keycloak + Lakekeeper)
+      - name: Start stack (Exasol + SeaweedFS + Keycloak + OpenFGA + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml"
+
+          $COMPOSE up -d openfga-migrate
+          OPENFGA_MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-openfga-migrate-1)
+          if [ "$OPENFGA_MIGRATE_EXIT" != "0" ]; then
+            echo "::error::openfga-migrate exited $OPENFGA_MIGRATE_EXIT (schema migration failed)"
+            $COMPOSE logs openfga-migrate
+            exit 1
+          fi
 
           $COMPOSE up -d lakekeeper-migrate
           MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-lakekeeper-migrate-1)
@@ -416,7 +424,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol seaweedfs keycloak lakekeeper-db lakekeeper
+          $COMPOSE up -d --wait exasol seaweedfs keycloak lakekeeper-db openfga-db openfga lakekeeper
 
       - name: Run Lakekeeper E2E suite
         run: make test-e2e-lakekeeper
@@ -434,6 +442,10 @@ jobs:
           sudo dmesg --ctime | tail -40 || true
           echo "=== keycloak logs ==="
           $COMPOSE logs keycloak | tail -100 || true
+          echo "=== openfga-migrate logs ==="
+          $COMPOSE logs openfga-migrate | tail -100 || true
+          echo "=== openfga logs ==="
+          $COMPOSE logs openfga | tail -100 || true
           echo "=== lakekeeper-migrate logs ==="
           $COMPOSE logs lakekeeper-migrate | tail -100 || true
           echo "=== lakekeeper logs ==="
@@ -538,11 +550,19 @@ jobs:
         run: |
           docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
             -f docker-compose.lakekeeper.azure.yml \
-            pull --quiet exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+            pull --quiet exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 
-      - name: Start stack (Exasol + Keycloak + Lakekeeper)
+      - name: Start stack (Exasol + Keycloak + OpenFGA + Lakekeeper)
         run: |
           COMPOSE="docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml -f docker-compose.lakekeeper.azure.yml"
+
+          $COMPOSE up -d openfga-migrate
+          OPENFGA_MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-openfga-migrate-1)
+          if [ "$OPENFGA_MIGRATE_EXIT" != "0" ]; then
+            echo "::error::openfga-migrate exited $OPENFGA_MIGRATE_EXIT (schema migration failed)"
+            $COMPOSE logs openfga-migrate
+            exit 1
+          fi
 
           $COMPOSE up -d lakekeeper-migrate
           MIGRATE_EXIT=$(docker wait lakehouse-engine-rs-lakekeeper-migrate-1)
@@ -552,7 +572,7 @@ jobs:
             exit 1
           fi
 
-          $COMPOSE up -d --wait exasol keycloak lakekeeper-db lakekeeper
+          $COMPOSE up -d --wait exasol keycloak lakekeeper-db openfga-db openfga lakekeeper
 
       - name: Run Azure E2E suite
         env:
@@ -576,6 +596,10 @@ jobs:
           sudo dmesg --ctime | tail -40 || true
           echo "=== keycloak logs ==="
           $COMPOSE logs keycloak | tail -100 || true
+          echo "=== openfga-migrate logs ==="
+          $COMPOSE logs openfga-migrate | tail -100 || true
+          echo "=== openfga logs ==="
+          $COMPOSE logs openfga | tail -100 || true
           echo "=== lakekeeper-migrate logs ==="
           $COMPOSE logs lakekeeper-migrate | tail -100 || true
           echo "=== lakekeeper logs ==="

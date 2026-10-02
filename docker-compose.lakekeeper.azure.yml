@@ -3,7 +3,7 @@
 #
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml \
 #     -f docker-compose.lakekeeper.azure.yml up -d --wait \
-#     exasol keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     exasol keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 #
 # Drops lakekeeper's seaweedfs dependency (storage is ADLS Gen2); `!override` is
 # required because Compose merges depends_on maps by key.
@@ -15,4 +15,6 @@ services:
       lakekeeper-db:
         condition: service_healthy
       keycloak:
+        condition: service_healthy
+      openfga:
         condition: service_healthy

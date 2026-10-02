@@ -10,8 +10,8 @@ use lakehouse_catalog::ConnectionCreds;
 use super::stack::{self, CatalogConnectionPassword, wait_for_url};
 
 const KEYCLOAK_REALM: &str = "iceberg";
-const OAUTH_CLIENT_ID: &str = "lakehouse";
-const OAUTH_CLIENT_SECRET: &str = "lakehouse-engine-secret";
+pub(super) const OAUTH_CLIENT_ID: &str = "lakehouse";
+pub(super) const OAUTH_CLIENT_SECRET: &str = "lakehouse-engine-secret";
 const WAREHOUSE_BUCKET: &str = "warehouse";
 /// SeaweedFS ignores the region, but the Lakekeeper storage profile requires one.
 const S3_REGION: &str = "us-east-1";
@@ -24,6 +24,7 @@ const VENDED_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/LakekeeperVended";
 
 pub const WAREHOUSE_STATIC: &str = "lakehouse_static";
 pub const WAREHOUSE_VENDED: &str = "lakehouse_vended";
+pub const WAREHOUSE_AUTHZ: &str = "lakehouse_authz";
 
 /// Keycloak realm import can be slow on a cold stack.
 const READINESS_TIMEOUT: Duration = Duration::from_secs(120);
@@ -44,6 +45,10 @@ pub fn lakekeeper_port() -> u16 {
     port_from_env("LH_LAKEKEEPER_PORT", 28181)
 }
 
+pub fn catalog_uri_host() -> String {
+    format!("http://localhost:{}/catalog", lakekeeper_port())
+}
+
 fn keycloak_token_endpoint_host() -> String {
     format!(
         "http://localhost:{}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token",
@@ -56,11 +61,11 @@ fn keycloak_token_endpoint_internal() -> String {
     format!("http://keycloak:8080/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token")
 }
 
-fn management_base() -> String {
+pub(super) fn management_base() -> String {
     format!("http://localhost:{}/management/v1", lakekeeper_port())
 }
 
-fn http_client() -> reqwest::blocking::Client {
+pub(super) fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
@@ -84,22 +89,32 @@ pub fn wait_for_lakekeeper() {
 
 /// Host-side provisioning token only; the adapter runs its own grant at query time.
 pub fn keycloak_client_credentials_token() -> String {
+    keycloak_client_credentials_token_for(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET)
+}
+
+/// Token for any realm client, so a test can act as a different principal.
+pub fn keycloak_client_credentials_token_for(client_id: &str, client_secret: &str) -> String {
     let endpoint = keycloak_token_endpoint_host();
     let resp = http_client()
         .post(&endpoint)
         .form(&[
             ("grant_type", "client_credentials"),
-            ("client_id", OAUTH_CLIENT_ID),
-            ("client_secret", OAUTH_CLIENT_SECRET),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
         ])
         .send()
-        .unwrap_or_else(|e| panic!("Keycloak token request to {endpoint} failed to send: {e}"));
+        .unwrap_or_else(|e| {
+            panic!(
+                "Keycloak token request to {endpoint} for client '{client_id}' failed to send: {e}"
+            )
+        });
 
     // On success the response body carries the access token.
     let status = resp.status();
     assert!(
         status.is_success(),
-        "Keycloak token request to {endpoint} returned {status} (expected 2xx)"
+        "Keycloak token request to {endpoint} for client '{client_id}' returned {status} \
+         (expected 2xx)"
     );
 
     let body: serde_json::Value = resp
@@ -112,8 +127,8 @@ pub fn keycloak_client_credentials_token() -> String {
 }
 
 /// Bootstrap is once-per-server and the stack persists across runs, so an
-/// already-bootstrapped server and a `409` both count as success. `is-operator` keeps
-/// full management access under Lakekeeper's default `allowall` authz backend.
+/// already-bootstrapped server and a `409` both count as success. `is-operator` makes the
+/// client the OpenFGA server `operator`, which keeps full management access.
 pub fn lakekeeper_bootstrap() {
     let token = keycloak_client_credentials_token();
     let base = management_base();
@@ -182,6 +197,17 @@ impl WarehouseProfile {
             vended: true,
             access_key: VENDED_ACCESS_KEY,
             secret_key: VENDED_SECRET_KEY,
+        }
+    }
+
+    /// Holds only the metadata-only tables of the permission fixture; static credentials
+    /// suffice because no scan reads it.
+    pub fn authz() -> Self {
+        WarehouseProfile {
+            name: WAREHOUSE_AUTHZ,
+            vended: false,
+            access_key: STATIC_ACCESS_KEY,
+            secret_key: STATIC_SECRET_KEY,
         }
     }
 

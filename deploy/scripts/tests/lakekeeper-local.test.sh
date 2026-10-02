@@ -3,7 +3,7 @@
 # than skips when the stack is down.
 #
 #   docker compose -f docker-compose.yml -f docker-compose.lakekeeper.yml up -d --wait \
-#     seaweedfs iceberg-rest keycloak lakekeeper-db lakekeeper-migrate lakekeeper
+#     seaweedfs iceberg-rest keycloak lakekeeper-db openfga-db openfga openfga-migrate lakekeeper-migrate lakekeeper
 #   bash deploy/scripts/tests/lakekeeper-local.test.sh
 #
 # Source tables live in the iceberg-rest fixture, not Lakekeeper: Lakekeeper rejects overlapping
