@@ -61,6 +61,36 @@ fn empty_ungrouped_aggregate_sql(
     pushdown_req: &Json,
     col_types: &[(String, String)],
 ) -> Result<Option<Json>, UdfError> {
+    if col_types.is_empty() {
+        return Ok(None);
+    }
+    empty_ungrouped_aggregate_over(
+        pushdown_req,
+        &typed_empty_relation(col_types, None),
+        &|node| render_expression_exasol(node),
+    )
+}
+
+/// `SELECT` of typed NULL columns over `DUAL WHERE 1=0`, aliased `AS alias` when given.
+pub(super) fn typed_empty_relation(col_types: &[(String, String)], alias: Option<&str>) -> String {
+    let columns: Vec<String> = col_types
+        .iter()
+        .map(|(name, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(name)))
+        .collect();
+    let relation = format!("(SELECT {} FROM DUAL WHERE 1=0)", columns.join(", "));
+    match alias {
+        Some(alias) => format!("{relation} AS {}", quote_ident(alias)),
+        None => relation,
+    }
+}
+
+/// `from` is the zero-row relation the aggregates run over and `render` the expression
+/// renderer matching its column qualification (bare for a single scan, `LHS_Tn` for a join).
+pub(super) fn empty_ungrouped_aggregate_over(
+    pushdown_req: &Json,
+    from: &str,
+    render: &dyn Fn(&Json) -> Result<String, UdfError>,
+) -> Result<Option<Json>, UdfError> {
     let grouped = pushdown_req
         .get("groupBy")
         .and_then(|v| v.as_array())
@@ -68,14 +98,14 @@ fn empty_ungrouped_aggregate_sql(
     let Some(list) = pushdown_req.get("selectList").and_then(|v| v.as_array()) else {
         return Ok(None);
     };
-    if grouped || col_types.is_empty() || !list.iter().any(contains_aggregate_node) {
+    if grouped || !list.iter().any(contains_aggregate_node) {
         return Ok(None);
     }
     let items = list
         .iter()
         .enumerate()
         .map(|(i, item)| {
-            let sql = render_expression_exasol(item).map_err(|e| {
+            let sql = render(item).map_err(|e| {
                 UdfError::User(format!(
                     "the empty-result aggregate could not render select-list item {i} for Exasol: {e}"
                 ))
@@ -86,7 +116,7 @@ fn empty_ungrouped_aggregate_sql(
         .collect::<Result<Vec<_>, UdfError>>()?;
     let having = match pushdown_req.get("having").filter(|h| !h.is_null()) {
         Some(node) => {
-            let sql = render_expression_exasol(node).map_err(|e| {
+            let sql = render(node).map_err(|e| {
                 UdfError::User(format!(
                     "the empty-result aggregate could not render HAVING for Exasol: {e}"
                 ))
@@ -95,15 +125,7 @@ fn empty_ungrouped_aggregate_sql(
         }
         None => String::new(),
     };
-    let columns: Vec<String> = col_types
-        .iter()
-        .map(|(name, ty)| format!("CAST(NULL AS {ty}) AS {}", quote_ident(name)))
-        .collect();
-    let sql = format!(
-        "SELECT {} FROM (SELECT {} FROM DUAL WHERE 1=0){having}",
-        items.join(", "),
-        columns.join(", ")
-    );
+    let sql = format!("SELECT {} FROM {from}{having}", items.join(", "));
     Ok(Some(serde_json::json!({"type": "pushdown", "sql": sql})))
 }
 

@@ -7,11 +7,15 @@ use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 use vs_expression::{render_df_filter_safe, render_expression_safe};
 
+use super::super::empty_result::{
+    empty_result_sql, empty_ungrouped_aggregate_over, typed_empty_relation,
+};
+use super::super::request_shape::{RequestShape, classify_request_shape};
 use super::super::shard_paths::relativize_shards_to_root;
 use super::super::support::{
     build_scan_driving_sql, classify_where_filter, collect_all_column_names, extract_limit,
-    extract_offset, quote_ident, render_limit_offset, scan_storage_for, shard_count,
-    strip_table_alias,
+    extract_offset, project_columns, quote_ident, render_limit_offset, scan_storage_for,
+    shard_count, strip_table_alias,
 };
 use super::super::topn::{ParsedSortKey, parse_sort_flags, wrap_declined_order_by};
 use super::attribution::{JoinLegs, UnattributableColumn};
@@ -269,6 +273,41 @@ fn outer_wrapper_clauses(
     trailing.push_str(&render_limit_offset(limit, offset));
 
     Ok(OuterWrapperClauses { select, trailing })
+}
+
+/// An ungrouped aggregate over a fully pruned join must still emit its one row, so Exasol
+/// evaluates it over typed zero-row legs under the same `LHS_Tn` aliases as the N-scan wrapper.
+/// Every other shape needs no column references and takes the shared empty-result builder.
+pub(in super::super) fn empty_join_result_sql(
+    pushdown_req: &Json,
+    join: &DetectedJoin,
+    side_columns: &[Vec<(String, String)>],
+) -> Result<Json, UdfError> {
+    let combined = side_columns.concat();
+    if matches!(
+        classify_request_shape(pushdown_req, &combined),
+        RequestShape::RowScan
+    ) {
+        let legs = join.legs();
+        let from = side_columns
+            .iter()
+            .enumerate()
+            .map(|(i, columns)| typed_empty_relation(columns, Some(&legs.leg_alias(i))))
+            .collect::<Vec<_>>()
+            .join(" CROSS JOIN ");
+        let render = |node: &Json| {
+            render_expression_qualified(node, &legs)
+                .map_err(unattributable_decline)?
+                .ok_or_else(|| {
+                    join_render_decline("an expression could not be rendered for the empty join")
+                })
+        };
+        if let Some(sql) = empty_ungrouped_aggregate_over(pushdown_req, &from, &render)? {
+            return Ok(sql);
+        }
+    }
+    let (proj_cols, proj_types, widened) = project_columns(pushdown_req, combined.clone())?;
+    empty_result_sql(pushdown_req, &proj_cols, &proj_types, widened, &combined)
 }
 
 /// The sole unaccelerated fallback: each table scans through its own sharded fan-out, and

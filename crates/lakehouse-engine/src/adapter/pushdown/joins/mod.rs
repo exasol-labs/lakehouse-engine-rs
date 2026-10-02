@@ -6,10 +6,9 @@ use futures::future::try_join_all;
 use serde_json::Value as Json;
 
 use super::ConnectionStorage;
-use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
 use super::scan_resolution::TableScanResolver;
-use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
+use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, quote_ident};
 
 mod attribution;
 mod planning;
@@ -35,7 +34,7 @@ use planning::{
 use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
 // `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
 pub(super) use sql_builders::{
-    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
+    JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql, empty_join_result_sql,
 };
 
 /// The generated SQL runs outside the adapter script's schema, so an unqualified name would
@@ -172,9 +171,7 @@ pub(super) async fn plan_join(
     ensure_no_side_refuses_a_referenced_column(request, pushdown_req, &sides)?;
 
     if sides.iter().any(|s| s.files.is_empty()) {
-        let combined = side_columns.concat();
-        let (proj_cols, proj_types, widened) = project_columns(pushdown_req, combined.clone())?;
-        return empty_result_sql(pushdown_req, &proj_cols, &proj_types, widened, &combined);
+        return empty_join_result_sql(pushdown_req, join, &side_columns);
     }
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);

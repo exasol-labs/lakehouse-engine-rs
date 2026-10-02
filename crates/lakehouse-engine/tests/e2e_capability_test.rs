@@ -1959,101 +1959,45 @@ fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
 // regression either hard-fails or returns DataFusion's divergent formatting.
 
 #[test]
-fn e2e_upper_double_declines_to_native_oracle() {
+fn e2e_upper_converted_args_match_native_oracle() {
     setup_e2e();
     let mut conn = exa_conn();
+    let ts_type = expected_timestamp_precision(&mut conn).declared_column_type;
+    let cases = [
+        ("c_double", "CAST(0.5 AS DOUBLE)".to_string()),
+        (
+            "c_ts",
+            format!("CAST(TIMESTAMP '2024-01-01 00:00:00.100' AS {ts_type})"),
+        ),
+        ("c_bool", "CAST(TRUE AS BOOLEAN)".to_string()),
+    ];
+    for (column, oracle_literal) in cases {
+        let vs_sql = format!(
+            "SELECT UPPER({column}) FROM {} WHERE id = 1",
+            vs_typed_table()
+        );
+        let vs_cols = conn.query_columns(&vs_sql);
+        assert_eq!(
+            vs_cols.len(),
+            1,
+            "expected 1 column (UPPER({column})): {vs_cols:?}"
+        );
+        assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
+        let vs_value = vs_cols[0][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("UPPER({column}) not a string: {:?}", vs_cols[0][0]));
 
-    let vs_sql = format!(
-        "SELECT UPPER(c_double) FROM {} WHERE id = 1",
-        vs_typed_table()
-    );
-    let vs_cols = conn.query_columns(&vs_sql);
-    assert_eq!(
-        vs_cols.len(),
-        1,
-        "expected 1 column (UPPER(c_double)): {vs_cols:?}"
-    );
-    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
-    let vs_value = vs_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("UPPER(c_double) not a string: {:?}", vs_cols[0][0]));
+        let oracle_cols = conn.query_columns(&format!("SELECT UPPER({oracle_literal})"));
+        let oracle_value = oracle_cols[0][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
 
-    let oracle_cols = conn.query_columns("SELECT UPPER(CAST(0.5 AS DOUBLE))");
-    let oracle_value = oracle_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
-
-    assert_eq!(
-        vs_value, oracle_value,
-        "UPPER(c_double) over the VS must match the native Exasol oracle \
-         SELECT UPPER(CAST(0.5 AS DOUBLE)) (declined pushdown falls back to \
-         native evaluation), got vs={vs_value:?} oracle={oracle_value:?}"
-    );
-}
-
-#[test]
-fn e2e_upper_timestamp_declines_to_native_oracle() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    let vs_sql = format!("SELECT UPPER(c_ts) FROM {} WHERE id = 1", vs_typed_table());
-    let vs_cols = conn.query_columns(&vs_sql);
-    assert_eq!(
-        vs_cols.len(),
-        1,
-        "expected 1 column (UPPER(c_ts)): {vs_cols:?}"
-    );
-    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
-    let vs_value = vs_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("UPPER(c_ts) not a string: {:?}", vs_cols[0][0]));
-
-    let declared_column_type = expected_timestamp_precision(&mut conn).declared_column_type;
-    let oracle_sql = format!(
-        "SELECT UPPER(CAST(TIMESTAMP '2024-01-01 00:00:00.100' AS {declared_column_type}))"
-    );
-    let oracle_cols = conn.query_columns(&oracle_sql);
-    let oracle_value = oracle_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
-
-    assert_eq!(
-        vs_value, oracle_value,
-        "UPPER(c_ts) over the VS must match the native Exasol oracle, got \
-         vs={vs_value:?} oracle={oracle_value:?}"
-    );
-}
-
-#[test]
-fn e2e_upper_boolean_declines_to_native_oracle() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    let vs_sql = format!(
-        "SELECT UPPER(c_bool) FROM {} WHERE id = 1",
-        vs_typed_table()
-    );
-    let vs_cols = conn.query_columns(&vs_sql);
-    assert_eq!(
-        vs_cols.len(),
-        1,
-        "expected 1 column (UPPER(c_bool)): {vs_cols:?}"
-    );
-    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
-    let vs_value = vs_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("UPPER(c_bool) not a string: {:?}", vs_cols[0][0]));
-
-    let oracle_cols = conn.query_columns("SELECT UPPER(CAST(TRUE AS BOOLEAN))");
-    let oracle_value = oracle_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
-
-    assert_eq!(
-        vs_value, oracle_value,
-        "UPPER(c_bool) over the VS must match the native Exasol oracle, got \
-         vs={vs_value:?} oracle={oracle_value:?}"
-    );
+        assert_eq!(
+            vs_value, oracle_value,
+            "UPPER({column}) over the VS must match the native Exasol oracle, got \
+             vs={vs_value:?} oracle={oracle_value:?}"
+        );
+    }
 }
 
 #[test]

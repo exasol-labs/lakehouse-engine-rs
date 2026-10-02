@@ -3153,3 +3153,56 @@ fn qualified_wrapper_zero_offset_renders_byte_identical_limit() {
     let zero = seam_trailing(&pushdown_req, &legs).expect("an explicit zero offset must render");
     assert_eq!(zero, bare);
 }
+
+#[test]
+fn fully_pruned_join_aggregate_runs_over_leg_aliased_typed_empty_relations() {
+    let mut request = serde_json::json!({
+        "involvedTables": [
+            {"name": "EVENTS", "columns": [
+                {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}}]},
+            {"name": "LABELS", "columns": [
+                {"name": "ID", "dataType": {"type": "decimal", "precision": 18, "scale": 0}},
+                {"name": "NAME", "dataType": {"type": "varchar", "size": 20}}]},
+        ],
+        "pushdownRequest": {
+            "type": "select",
+            "from": {"type": "join", "join_type": "inner",
+                "left": {"name": "EVENTS", "type": "table"},
+                "right": {"name": "LABELS", "type": "table"},
+                "condition": {"type": "predicate_equal",
+                    "left": {"type": "column", "name": "ID", "tableName": "EVENTS"},
+                    "right": {"type": "column", "name": "ID", "tableName": "LABELS"}}},
+            "selectList": [
+                {"type": "function_aggregate", "name": "MAX", "distinct": false,
+                 "arguments": [{"type": "function_scalar", "name": "INSTR", "arguments": [
+                    {"type": "column", "name": "NAME", "tableName": "LABELS"},
+                    {"type": "literal_string", "value": "x"},
+                    {"type": "literal_exactnumeric", "value": "2"}]}]}],
+            "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
+        },
+        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
+            serde_json::json!({"TABLE_MAP": {"EVENTS": "lh.events", "LABELS": "lh.labels"}})
+                .to_string()},
+    });
+    request["pushdownRequest"]["selectList"][0]["arguments"][0]["arguments"][0]["tableAlias"] =
+        serde_json::json!("B");
+    let detected = detected_join(&request);
+    let side_columns = vec![
+        involved_table_columns(&request, "EVENTS"),
+        involved_table_columns(&request, "LABELS"),
+    ];
+
+    let sql = empty_join_result_sql(&pd(&request), &detected, &side_columns).unwrap()["sql"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert!(
+        sql.contains(r#""LHS_T1"."NAME""#),
+        "the aggregate must reference its leg alias, not the request alias: {sql}"
+    );
+    assert!(
+        sql.contains(r#"AS "LHS_T0""#) && sql.contains(r#"AS "LHS_T1""#),
+        "each leg must be its own aliased typed empty relation: {sql}"
+    );
+}
