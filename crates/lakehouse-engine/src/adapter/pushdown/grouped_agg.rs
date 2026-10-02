@@ -7,8 +7,8 @@ use serde_json::Value as Json;
 use vs_expression::render_expression;
 
 use super::scalar_over_agg::{
-    cast_merge_items, classify_scalar_over_aggregate, fold_aggregate_plan, merge_select_items,
-    parse_agg_item, render_scalar_over_merge,
+    cast_merge_items, classify_typed_scalar_over_aggregate, fold_aggregate_plan,
+    fold_nested_aggregate_plan, merge_select_items, parse_agg_item, render_scalar_over_merge,
 };
 use super::support::{
     build_fan_out_inner, cast_to_declared_type, declared_select_type, render_limit_offset,
@@ -92,8 +92,11 @@ pub(super) fn is_literal_selectlist_item(item_type: &str) -> bool {
 }
 
 /// `None` on any unsupported shape; the caller falls back to single-group detection
-/// or a row scan.
-pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregateDetection> {
+/// or a row scan. `col_types` types the partial of a nested-only MIN/MAX.
+pub fn detect_group_by_aggregates(
+    pushdown_req: &Json,
+    col_types: &[(String, String)],
+) -> Option<GroupedAggregateDetection> {
     if pushdown_req.get("aggregationType").and_then(|v| v.as_str()) != Some("group_by") {
         return None;
     }
@@ -158,9 +161,9 @@ pub fn detect_group_by_aggregates(pushdown_req: &Json) -> Option<GroupedAggregat
                 }
                 // Otherwise a scalar wrapping aggregates; `None` declines the whole grouped
                 // detection, routing to the qualified wrapper (never a bare row scan).
-                let nested = classify_scalar_over_aggregate(item)?;
-                for plan in nested {
-                    fold_aggregate_plan(&mut plans, &mut plan_types, plan, None);
+                let nested = classify_typed_scalar_over_aggregate(item, col_types)?;
+                for (plan, partial_type) in nested {
+                    fold_nested_aggregate_plan(&mut plans, &mut plan_types, plan, partial_type);
                 }
                 select_items.push(GroupedSelectItem::ScalarOverAggregate {
                     select_index,

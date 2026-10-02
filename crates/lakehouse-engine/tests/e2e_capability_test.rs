@@ -9,14 +9,14 @@ use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
     CHAR_PAD_COL, CHAR_PAD_OTHER, CHAR_PAD_OVER_LENGTH, CHAR_PAD_SHORT,
-    CHAR_PAD_SHORT_TRAILING_SPACE, CHAR_PAD_TOTAL_ROWS, E2E_CHAR_PAD_TABLE, E2E_DIM_TABLE,
-    E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE, ExpectedValue, seed_events,
-    seed_typed_distinct_probe,
+    CHAR_PAD_SHORT_TRAILING_SPACE, CHAR_PAD_TOTAL_ROWS, DIM_CUSTOMER_ROWS, E2E_CHAR_PAD_TABLE,
+    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, E2E_TYPED_TABLE, ExpectedValue,
+    seed_events, seed_typed_distinct_probe,
 };
 use common::stack::{
     iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
-use common::timestamp_precision::expected_timestamp_precision;
+use common::timestamp_precision::{expected_timestamp_precision, live_engine_version};
 
 use std::sync::OnceLock;
 
@@ -675,9 +675,11 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
     let mut conn = exa_conn();
 
     {
+        // A three-argument INSTR has no DataFusion rendering, so the projection widens
+        // to the base row (#227).
         let sql = format!(
             "SELECT id, c_decimal_a, c_decimal_b, c_double, c_varchar, c_date, \
-             c_ts, c_bool, c_price, LENGTH(c_double) FROM {} WHERE id <= 3 \
+             c_ts, c_bool, c_price, INSTR(c_double, '5', 2) FROM {} WHERE id <= 3 \
              ORDER BY id",
             vs_typed_table()
         );
@@ -688,18 +690,18 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
         for (i, row) in TYPED_ROWS_1_TO_3.iter().enumerate() {
             assert_typed_probe_prefix(&cols, i);
 
-            // LENGTH over DOUBLE depends on Exasol's implementation-defined DOUBLE-to-VARCHAR
+            // INSTR over DOUBLE depends on Exasol's implementation-defined DOUBLE-to-VARCHAR
             // rendering, so the expectation comes from a native oracle.
             let oracle_sql = match row.double {
-                Some(d) => format!("SELECT LENGTH(CAST({d} AS DOUBLE))"),
-                None => "SELECT LENGTH(CAST(NULL AS DOUBLE))".to_string(),
+                Some(d) => format!("SELECT INSTR(CAST({d} AS DOUBLE), '5', 2)"),
+                None => "SELECT INSTR(CAST(NULL AS DOUBLE), '5', 2)".to_string(),
             };
             let oracle_cols = conn.query_columns(&oracle_sql);
             let oracle_value = &oracle_cols[0][0];
             if oracle_value.is_null() {
                 assert!(
                     cols[9][i].is_null(),
-                    "row {i}: LENGTH(c_double) must be NULL to match the \
+                    "row {i}: INSTR(c_double, '5', 2) must be NULL to match the \
                      native oracle, got {:?}",
                     cols[9][i]
                 );
@@ -707,7 +709,7 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
                 assert_eq!(
                     parse_int(&cols[9][i]),
                     parse_int(oracle_value),
-                    "row {i}: LENGTH(c_double) must match the native oracle"
+                    "row {i}: INSTR(c_double, '5', 2) must match the native oracle"
                 );
             }
         }
@@ -724,7 +726,7 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
     {
         let sql = format!(
             "SELECT id, score, name, event_date, event_ts, id, score, name, \
-             event_date, LENGTH(score) FROM {} WHERE id <= 3 ORDER BY id",
+             event_date, INSTR(score, '5', 2) FROM {} WHERE id <= 3 ORDER BY id",
             vs_table()
         );
         let cols = conn.query_columns(&sql);
@@ -737,12 +739,12 @@ fn e2e_widened_projection_with_declined_order_by_routes_to_wrapper() {
 
             let score = 5.0 * id as f64;
             let oracle_cols =
-                conn.query_columns(&format!("SELECT LENGTH(CAST({score} AS DOUBLE))"));
-            let expected_len = parse_int(&oracle_cols[0][0]);
+                conn.query_columns(&format!("SELECT INSTR(CAST({score} AS DOUBLE), '5', 2)"));
+            let expected_position = parse_int(&oracle_cols[0][0]);
             assert_eq!(
                 parse_int(&cols[9][i]),
-                expected_len,
-                "row {i}: LENGTH(score) must match the native oracle"
+                expected_position,
+                "row {i}: INSTR(score, '5', 2) must match the native oracle"
             );
         }
 
@@ -1564,7 +1566,7 @@ fn e2e_order_by_column_referenced_only_in_projected_expression() {
 
 // Exasol's DECIMAL→VARCHAR conversion trims trailing scale zeros and drops an all-zero
 // fraction (`30.00` → `"30"`) (#211). Expected strings come from an independent Rust
-// oracle, never from the production `format_decimal_exasol_style`.
+// oracle, never from the production `exa_to_varchar`.
 
 const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
     (1, Some(1050)),
@@ -1581,7 +1583,7 @@ const TYPED_DECIMAL_A_UNSCALED: [(i64, Option<i128>); 12] = [
     (12, Some(3000)),
 ];
 
-/// From scratch, not `format_decimal_exasol_style`, so it is an independent oracle.
+/// From scratch, not the production `exa_to_varchar`, so it is an independent oracle.
 fn exasol_trim_decimal_string(unscaled: i128, scale: u32) -> String {
     let negative = unscaled < 0;
     let digits = unscaled.unsigned_abs().to_string();
@@ -1805,8 +1807,7 @@ fn e2e_decimal_length_where_count_matches_trimmed_semantics() {
 }
 
 // String functions over non-string arguments (#210): Exasol converts implicitly, but
-// DataFusion refuses. VARCHAR/CHAR pass through, DATE is CAST to VARCHAR, DECIMAL uses
-// the trimmed rendering, and other types decline to native Exasol.
+// DataFusion refuses, so the renderer wraps each such argument in `exa_to_varchar` (#227).
 
 #[test]
 fn e2e_upper_varchar_pushdown() {
@@ -1953,106 +1954,50 @@ fn e2e_instr_decimal_finds_dot_position_in_trimmed_text() {
     }
 }
 
-// BOOLEAN, DOUBLE and TIMESTAMP string-function arguments decline to native Exasol.
+// BOOLEAN, DOUBLE and TIMESTAMP string-function arguments convert through `exa_to_varchar`.
 // Each result is compared with an in-session native oracle over a bare literal, so a
-// regressed guard either hard-fails or returns DataFusion's divergent formatting.
+// regression either hard-fails or returns DataFusion's divergent formatting.
 
 #[test]
-fn e2e_upper_double_declines_to_native_oracle() {
+fn e2e_upper_converted_args_match_native_oracle() {
     setup_e2e();
     let mut conn = exa_conn();
+    let ts_type = expected_timestamp_precision(&mut conn).declared_column_type;
+    let cases = [
+        ("c_double", "CAST(0.5 AS DOUBLE)".to_string()),
+        (
+            "c_ts",
+            format!("CAST(TIMESTAMP '2024-01-01 00:00:00.100' AS {ts_type})"),
+        ),
+        ("c_bool", "CAST(TRUE AS BOOLEAN)".to_string()),
+    ];
+    for (column, oracle_literal) in cases {
+        let vs_sql = format!(
+            "SELECT UPPER({column}) FROM {} WHERE id = 1",
+            vs_typed_table()
+        );
+        let vs_cols = conn.query_columns(&vs_sql);
+        assert_eq!(
+            vs_cols.len(),
+            1,
+            "expected 1 column (UPPER({column})): {vs_cols:?}"
+        );
+        assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
+        let vs_value = vs_cols[0][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("UPPER({column}) not a string: {:?}", vs_cols[0][0]));
 
-    let vs_sql = format!(
-        "SELECT UPPER(c_double) FROM {} WHERE id = 1",
-        vs_typed_table()
-    );
-    let vs_cols = conn.query_columns(&vs_sql);
-    assert_eq!(
-        vs_cols.len(),
-        1,
-        "expected 1 column (UPPER(c_double)): {vs_cols:?}"
-    );
-    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
-    let vs_value = vs_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("UPPER(c_double) not a string: {:?}", vs_cols[0][0]));
+        let oracle_cols = conn.query_columns(&format!("SELECT UPPER({oracle_literal})"));
+        let oracle_value = oracle_cols[0][0]
+            .as_str()
+            .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
 
-    let oracle_cols = conn.query_columns("SELECT UPPER(CAST(0.5 AS DOUBLE))");
-    let oracle_value = oracle_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
-
-    assert_eq!(
-        vs_value, oracle_value,
-        "UPPER(c_double) over the VS must match the native Exasol oracle \
-         SELECT UPPER(CAST(0.5 AS DOUBLE)) (declined pushdown falls back to \
-         native evaluation), got vs={vs_value:?} oracle={oracle_value:?}"
-    );
-}
-
-#[test]
-fn e2e_upper_timestamp_declines_to_native_oracle() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    let vs_sql = format!("SELECT UPPER(c_ts) FROM {} WHERE id = 1", vs_typed_table());
-    let vs_cols = conn.query_columns(&vs_sql);
-    assert_eq!(
-        vs_cols.len(),
-        1,
-        "expected 1 column (UPPER(c_ts)): {vs_cols:?}"
-    );
-    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
-    let vs_value = vs_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("UPPER(c_ts) not a string: {:?}", vs_cols[0][0]));
-
-    let declared_column_type = expected_timestamp_precision(&mut conn).declared_column_type;
-    let oracle_sql = format!(
-        "SELECT UPPER(CAST(TIMESTAMP '2024-01-01 00:00:00.100' AS {declared_column_type}))"
-    );
-    let oracle_cols = conn.query_columns(&oracle_sql);
-    let oracle_value = oracle_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
-
-    assert_eq!(
-        vs_value, oracle_value,
-        "UPPER(c_ts) over the VS must match the native Exasol oracle, got \
-         vs={vs_value:?} oracle={oracle_value:?}"
-    );
-}
-
-#[test]
-fn e2e_upper_boolean_declines_to_native_oracle() {
-    setup_e2e();
-    let mut conn = exa_conn();
-
-    let vs_sql = format!(
-        "SELECT UPPER(c_bool) FROM {} WHERE id = 1",
-        vs_typed_table()
-    );
-    let vs_cols = conn.query_columns(&vs_sql);
-    assert_eq!(
-        vs_cols.len(),
-        1,
-        "expected 1 column (UPPER(c_bool)): {vs_cols:?}"
-    );
-    assert_eq!(vs_cols[0].len(), 1, "expected 1 row (id=1): {vs_cols:?}");
-    let vs_value = vs_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("UPPER(c_bool) not a string: {:?}", vs_cols[0][0]));
-
-    let oracle_cols = conn.query_columns("SELECT UPPER(CAST(TRUE AS BOOLEAN))");
-    let oracle_value = oracle_cols[0][0]
-        .as_str()
-        .unwrap_or_else(|| panic!("native oracle not a string: {:?}", oracle_cols[0][0]));
-
-    assert_eq!(
-        vs_value, oracle_value,
-        "UPPER(c_bool) over the VS must match the native Exasol oracle, got \
-         vs={vs_value:?} oracle={oracle_value:?}"
-    );
+        assert_eq!(
+            vs_value, oracle_value,
+            "UPPER({column}) over the VS must match the native Exasol oracle, got \
+             vs={vs_value:?} oracle={oracle_value:?}"
+        );
+    }
 }
 
 #[test]
@@ -2102,8 +2047,8 @@ fn e2e_substr_left_pushdown() {
     );
 }
 
-// INSTR/LOCATE beyond 2 arguments always decline: the renderer drops extra arguments
-// (#228), which would silently return a wrong position.
+// INSTR/LOCATE beyond 2 arguments are a DataFusion render error, so they reach native
+// Exasol evaluation (#228); rendering them would silently return a wrong position.
 
 #[test]
 fn e2e_instr_arity_decline_selectlist_matches_native_oracle() {
@@ -3452,4 +3397,688 @@ fn e2e_float_div_decimal_over_decimal_matches_native_oracle() {
          oracle {oracle_value} (decimal/decimal FLOAT_DIV must not truncate \
          to scale 6), got {vs_value}"
     );
+}
+
+// String functions and string CASTs over non-string values on the GROUP BY and
+// aggregate-argument paths (#227). Each oracle is a native Exasol query over inline
+// literals that mirror the seeded tables, so no expected value comes from the engine.
+
+const TYPED_DOUBLE_VALUES: [Option<f64>; 12] = [
+    Some(0.5),
+    Some(1.5),
+    None,
+    Some(2.5),
+    Some(0.5),
+    Some(3.5),
+    Some(0.5),
+    Some(4.5),
+    Some(1.5),
+    None,
+    Some(5.5),
+    Some(2.5),
+];
+
+const TYPED_BOOL_VALUES: [Option<bool>; 12] = [
+    Some(true),
+    Some(true),
+    None,
+    Some(false),
+    Some(true),
+    Some(true),
+    Some(true),
+    Some(false),
+    Some(true),
+    None,
+    Some(true),
+    Some(true),
+];
+
+const TYPED_TS_MILLIS: [Option<i64>; 12] = [
+    Some(100),
+    Some(200),
+    None,
+    Some(300),
+    Some(100),
+    Some(400),
+    Some(100),
+    Some(500),
+    Some(200),
+    None,
+    Some(600),
+    Some(300),
+];
+
+type TextRow = Vec<Option<String>>;
+
+fn native_typed_probe_table() -> String {
+    let selects: Vec<String> = TYPED_DECIMAL_A_UNSCALED
+        .iter()
+        .zip(TYPED_DOUBLE_VALUES)
+        .zip(TYPED_BOOL_VALUES)
+        .zip(TYPED_TS_MILLIS)
+        .map(|((((id, decimal_a), double), boolean), ts_millis)| {
+            let decimal_a = decimal_a.map_or("NULL".to_string(), |u| {
+                format!("{}.{:02}", u / 100, u % 100)
+            });
+            let double = double.map_or("NULL".to_string(), |d| format!("{d:?}"));
+            let boolean = boolean.map_or("NULL".to_string(), |b| b.to_string());
+            let ts = ts_millis.map_or("NULL".to_string(), |ms| {
+                format!("TIMESTAMP '2024-01-01 00:00:00.{ms:03}'")
+            });
+            format!(
+                "SELECT CAST({id} AS DECIMAL(20,0)) AS ID, \
+                 CAST({decimal_a} AS DECIMAL(9,2)) AS C_DECIMAL_A, \
+                 CAST({double} AS DOUBLE) AS C_DOUBLE, \
+                 CAST({boolean} AS BOOLEAN) AS C_BOOL, \
+                 CAST({ts} AS TIMESTAMP(3)) AS C_TS"
+            )
+        })
+        .collect();
+    format!("({})", selects.join(" UNION ALL "))
+}
+
+fn native_dim_customer_table() -> String {
+    let selects: Vec<String> = (1..=DIM_CUSTOMER_ROWS)
+        .map(|k| {
+            format!(
+                "SELECT CAST({k} AS DECIMAL(20,0)) AS C_CUSTKEY, \
+                 CAST('customer-{k:02}' AS VARCHAR(20)) AS C_NAME"
+            )
+        })
+        .collect();
+    format!("({})", selects.join(" UNION ALL "))
+}
+
+fn cell_text(value: &serde_json::Value) -> Option<String> {
+    match value {
+        serde_json::Value::Null => None,
+        serde_json::Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
+fn text_rows(conn: &mut ExaConn, sql: &str) -> Vec<TextRow> {
+    let cols = conn.query_columns(sql);
+    let row_count = cols.first().map_or(0, Vec::len);
+    (0..row_count)
+        .map(|r| cols.iter().map(|c| cell_text(&c[r])).collect())
+        .collect()
+}
+
+fn sorted_text_rows(conn: &mut ExaConn, sql: &str) -> Vec<TextRow> {
+    let mut rows = text_rows(conn, sql);
+    rows.sort();
+    rows
+}
+
+fn text_row(cells: &[Option<&str>]) -> TextRow {
+    cells.iter().map(|c| c.map(str::to_owned)).collect()
+}
+
+#[test]
+fn e2e_group_by_upper_integer_key_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| format!("SELECT UPPER(ID), COUNT(*) FROM {from} GROUP BY UPPER(ID)");
+
+    let oracle = sorted_text_rows(&mut conn, &query(&native_typed_probe_table()));
+    assert_eq!(
+        oracle.len(),
+        12,
+        "native oracle must have 12 groups: {oracle:?}"
+    );
+    assert!(
+        oracle.contains(&text_row(&[Some("10"), Some("1")])),
+        "native oracle must group id 10 under \"10\": {oracle:?}"
+    );
+
+    let vs_sql = query(&vs_typed_table());
+    let vs = sorted_text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "GROUP BY UPPER(ID) over the VS must match the native oracle for:\n{vs_sql}"
+    );
+}
+
+#[test]
+fn e2e_aggregate_over_upper_integer_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| {
+        format!("SELECT MAX(UPPER(ID)), MIN(UPPER(ID)), SUM(LENGTH(UPPER(ID))) FROM {from}")
+    };
+
+    let oracle = text_rows(&mut conn, &query(&native_typed_probe_table()));
+    assert_eq!(
+        oracle,
+        vec![text_row(&[Some("9"), Some("1"), Some("15")])],
+        "native oracle string MAX/MIN of ids 1..=12 is \"9\"/\"1\" and lengths sum to 15"
+    );
+
+    let vs_sql = query(&vs_typed_table());
+    let vs = text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "aggregates over UPPER(ID) over the VS must match the native oracle for:\n{vs_sql}"
+    );
+}
+
+#[test]
+fn e2e_grouped_having_and_order_by_over_upper_integer_push_down() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| {
+        format!(
+            "SELECT UPPER(ID), MAX(UPPER(ID)) FROM {from} GROUP BY UPPER(ID) \
+             HAVING MAX(UPPER(ID)) < '3' ORDER BY UPPER(ID)"
+        )
+    };
+
+    let oracle = text_rows(&mut conn, &query(&native_typed_probe_table()));
+    let oracle_keys: Vec<Option<&str>> = oracle.iter().map(|r| r[0].as_deref()).collect();
+    assert_eq!(
+        oracle_keys,
+        vec![Some("1"), Some("10"), Some("11"), Some("12"), Some("2")],
+        "native oracle orders the text keys below '3' as strings: {oracle:?}"
+    );
+
+    let vs_sql = query(&vs_typed_table());
+    let request = explain_virtual_pushdown_request(&mut conn, &vs_sql);
+    for key in ["groupBy", "having", "orderBy"] {
+        assert!(
+            request.get(key).is_some(),
+            "Exasol must delegate `{key}` for:\n{vs_sql}\n{request:#}"
+        );
+    }
+
+    let vs = text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "grouped HAVING and ORDER BY over UPPER(ID) must match the native oracle for:\n{vs_sql}"
+    );
+}
+
+#[test]
+fn e2e_scalar_over_aggregate_of_upper_integer_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| {
+        format!(
+            "SELECT C_BOOL, MAX(UPPER(ID)) || '-' || MIN(UPPER(ID)) FROM {from} GROUP BY C_BOOL"
+        )
+    };
+
+    let oracle = sorted_text_rows(&mut conn, &query(&native_typed_probe_table()));
+    assert_eq!(
+        oracle,
+        vec![
+            text_row(&[None, Some("3-10")]),
+            text_row(&[Some("false"), Some("8-4")]),
+            text_row(&[Some("true"), Some("9-1")]),
+        ],
+        "native oracle string MAX/MIN of the ids per boolean group"
+    );
+
+    let vs_sql = query(&vs_typed_table());
+    let vs = sorted_text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "a scalar over aggregates of UPPER(ID) must match the native oracle for:\n{vs_sql}"
+    );
+}
+
+/// Scenario: A DECIMAL stringification in a GROUP BY key or an aggregate argument renders the trimmed form
+#[test]
+fn e2e_group_by_decimal_cast_key_trims_like_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| {
+        format!(
+            "SELECT CAST(C_DECIMAL_A AS VARCHAR(20)), COUNT(*) FROM {from} \
+             GROUP BY CAST(C_DECIMAL_A AS VARCHAR(20))"
+        )
+    };
+
+    let oracle = sorted_text_rows(&mut conn, &query(&native_typed_probe_table()));
+    assert!(
+        oracle.contains(&text_row(&[Some("10.5"), Some("3")]))
+            && oracle.contains(&text_row(&[Some("30"), Some("2")])),
+        "native oracle must trim 10.50 to \"10.5\" and 30.00 to \"30\": {oracle:?}"
+    );
+
+    let vs_sql = query(&vs_typed_table());
+    let vs = sorted_text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "GROUP BY CAST(C_DECIMAL_A AS VARCHAR(20)) must trim like native Exasol for:\n{vs_sql}"
+    );
+}
+
+/// Scenario: A DECIMAL stringification in a GROUP BY key or an aggregate argument renders the trimmed form
+#[test]
+fn e2e_max_over_decimal_cast_trims_like_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| {
+        format!(
+            "SELECT MAX(CAST(C_DECIMAL_A AS VARCHAR(20))), \
+             MIN(CAST(C_DECIMAL_A AS VARCHAR(20))) FROM {from}"
+        )
+    };
+
+    let oracle = text_rows(&mut conn, &query(&native_typed_probe_table()));
+    assert_eq!(
+        oracle,
+        vec![text_row(&[Some("60"), Some("10.5")])],
+        "native oracle trims 60.00 to \"60\" and 10.50 to \"10.5\""
+    );
+
+    let vs_sql = query(&vs_typed_table());
+    let vs = text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "MAX/MIN over CAST(C_DECIMAL_A AS VARCHAR(20)) must trim like native Exasol for:\n{vs_sql}"
+    );
+}
+
+#[test]
+fn e2e_group_by_upper_double_key_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| {
+        format!("SELECT UPPER(C_DOUBLE), COUNT(*) FROM {from} GROUP BY UPPER(C_DOUBLE)")
+    };
+
+    let oracle = sorted_text_rows(&mut conn, &query(&native_typed_probe_table()));
+    assert_eq!(
+        oracle.len(),
+        7,
+        "native oracle must have 6 distinct doubles plus the NULL group: {oracle:?}"
+    );
+
+    let vs_sql = query(&vs_typed_table());
+    let vs = sorted_text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "GROUP BY UPPER(C_DOUBLE) over the VS must match the native oracle for:\n{vs_sql}"
+    );
+}
+
+/// Scenario: An INSTR or LOCATE call beyond two arguments reaches native Exasol evaluation on every surface
+#[test]
+fn e2e_instr_three_args_on_grouped_paths_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    for instr in [
+        "INSTR(C_NAME, 'c', 2)",
+        "INSTR(C_NAME, 'c', 2, 1)",
+        "INSTR(C_NAME, 'e', 8)",
+    ] {
+        let query =
+            |from: &str| format!("SELECT {instr}, SUM(C_CUSTKEY) FROM {from} GROUP BY {instr}");
+
+        let oracle = text_rows(&mut conn, &query(&native_dim_customer_table()));
+        assert_eq!(
+            oracle,
+            vec![text_row(&[Some("0"), Some("15")])],
+            "native oracle {instr} finds nothing past the start position"
+        );
+
+        let vs_sql = query(&vs_dim_table());
+        let vs = text_rows(&mut conn, &vs_sql);
+        assert_eq!(
+            vs, oracle,
+            "grouped {instr} over the VS must honour the start position like native \
+             Exasol for:\n{vs_sql}"
+        );
+    }
+}
+
+#[test]
+fn e2e_max_instr_with_start_position_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| format!("SELECT MAX(INSTR(C_NAME, 'c', 2)) FROM {from}");
+
+    let oracle = conn.query_scalar_i64(&query(&native_dim_customer_table()));
+    assert_eq!(
+        oracle, 0,
+        "native oracle MAX(INSTR(C_NAME, 'c', 2)) is 0: the only 'c' is at position 1"
+    );
+
+    let vs_sql = query(&vs_dim_table());
+    let vs = conn.query_scalar_i64(&vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "MAX(INSTR(C_NAME, 'c', 2)) over the VS must honour the start position for:\n{vs_sql}"
+    );
+}
+
+/// Scenario: An ungrouped aggregate on the row-scan path with all files pruned returns one row
+#[test]
+fn e2e_ungrouped_aggregate_all_files_pruned_returns_one_row() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    // Exasol 8.x rejects TIMESTAMP(p) (0A000), so this RowScan shape cannot occur there; the
+    // INSTR variant below covers the scenario on every engine.
+    if live_engine_version(&mut conn)
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok())
+        .is_some_and(|major| major < 2025)
+    {
+        return;
+    }
+
+    let oracle_sql = format!(
+        "SELECT MAX(CAST(C_TS AS TIMESTAMP(4))), COUNT(*) FROM \
+         (SELECT CAST(NULL AS TIMESTAMP) AS C_TS, ID FROM {}) WHERE ID > 1000",
+        native_typed_probe_table()
+    );
+    let oracle = text_rows(&mut conn, &oracle_sql);
+    assert_eq!(
+        oracle,
+        vec![text_row(&[None, Some("0")])],
+        "native oracle: an ungrouped aggregate over no rows is one row (NULL, 0)"
+    );
+
+    let vs_sql = format!(
+        "SELECT MAX(CAST(C_TS AS TIMESTAMP(4))), COUNT(*) FROM {} WHERE ID > 1000",
+        vs_typed_table()
+    );
+    let vs = text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "a fully pruned ungrouped aggregate over the VS must return one row (NULL, 0) \
+         like native Exasol for:\n{vs_sql}"
+    );
+}
+
+#[test]
+fn e2e_pruned_scalar_over_temporal_aggregate_returns_one_null_row() {
+    setup_e2e();
+    let mut conn = exa_conn();
+
+    let oracle_sql = format!(
+        "SELECT YEAR(MAX(CAST(C_TS AS DATE))) FROM \
+         (SELECT CAST(NULL AS TIMESTAMP) AS C_TS, CAST(NULL AS VARCHAR(10)) AS C_VARCHAR \
+          FROM {}) WHERE C_VARCHAR = 'zz'",
+        native_typed_probe_table()
+    );
+    let oracle = text_rows(&mut conn, &oracle_sql);
+    assert_eq!(
+        oracle,
+        vec![text_row(&[None])],
+        "native oracle: a scalar over an aggregate of no rows is one NULL row"
+    );
+
+    let vs_sql = format!(
+        "SELECT YEAR(MAX(CAST(C_TS AS DATE))) FROM {} WHERE C_VARCHAR = 'zz'",
+        vs_typed_table()
+    );
+    let vs = text_rows(&mut conn, &vs_sql);
+    assert_eq!(
+        vs, oracle,
+        "a fully pruned scalar over a temporal aggregate must return one NULL row like \
+         native Exasol for:\n{vs_sql}"
+    );
+}
+
+fn assert_scan_spec_carries_exa_to_varchar(conn: &mut ExaConn, sql: &str) {
+    let explained = explain_virtual_sql(conn, sql);
+    assert!(
+        explained.contains("exa_to_varchar("),
+        "the scan spec must carry exa_to_varchar( for:\n{sql}\n{explained}"
+    );
+}
+
+/// The spec's captured DOUBLE texts, each with the text Exasol produced live. `1e-14` is
+/// omitted: Exasol parses that literal to either neighbouring double depending on the runner;
+/// `double_text_tests.rs` pins its text on both sides.
+const DOUBLE_PARITY_CORPUS: [(f64, &str); 26] = [
+    (0.5, "0.5"),
+    (-0.5, "-0.5"),
+    (5.0, "5"),
+    (1.0 / 3.0, "0.333333333333333"),
+    (711.56 / 3.0, "237.186666666667"),
+    (123_456_789_012_345.6, "123456789012346"),
+    (100_000_000_000_000.0, "100000000000000"),
+    (1e15, "1e15"),
+    (1e20, "1e20"),
+    (0.0001, "0.0001"),
+    (1e-5, "1e-5"),
+    (1.234e-5, "1.234e-5"),
+    (1_234_567_890_123_456.0, "1.23456789012346e15"),
+    (-0.0, "0"),
+    (1e-20, "9.99999999999999e-21"),
+    (1e23, "9.99999999999999e22"),
+    (1e-16, "9.99999999999999e-17"),
+    (999_999_999_999_999.5, "1000000000000000"),
+    (f64::MAX, "1.79769313486232e308"),
+    (1e89, "1e89"),
+    (1e-300, "1e-300"),
+    (1e300, "1e300"),
+    (f64::MIN, "-1.79769313486232e308"),
+    (702_268_084_903_108.5, "702268084903109"),
+    (8_575_990.634_034_805, "8575990.63403481"),
+    (92_754_470_907_676.25, "92754470907676.3"),
+];
+
+/// Scenario: DOUBLE text matches native Exasol on a live parity corpus
+#[test]
+fn e2e_double_text_matches_native_parity_corpus() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    // `C_DOUBLE / C_DOUBLE` is exactly 1.0 on id 1, so each product is the corpus value itself.
+    let select_list: Vec<String> = DOUBLE_PARITY_CORPUS
+        .iter()
+        .map(|(value, _)| format!("CAST(C_DOUBLE / C_DOUBLE * ({value:e}) AS VARCHAR(40))"))
+        .collect();
+    let query = |from: &str| format!("SELECT {} FROM {from} WHERE ID = 1", select_list.join(", "));
+
+    let oracle = text_rows(&mut conn, &query(&native_typed_probe_table()));
+    assert_eq!(oracle.len(), 1, "native oracle must return one row");
+    let vs_sql = query(&vs_typed_table());
+    assert_scan_spec_carries_exa_to_varchar(&mut conn, &vs_sql);
+    let vs = text_rows(&mut conn, &vs_sql);
+    assert_eq!(vs.len(), 1, "the pushed query must return one row");
+
+    for (i, (value, expected)) in DOUBLE_PARITY_CORPUS.iter().enumerate() {
+        assert_eq!(
+            oracle[0][i].as_deref(),
+            Some(*expected),
+            "native oracle text for {value:e}"
+        );
+        assert_eq!(
+            vs[0][i], oracle[0][i],
+            "exa_to_varchar text for {value:e} must equal native Exasol"
+        );
+    }
+}
+
+/// Scenario: A DOUBLE, BOOLEAN, or TIMESTAMP column argument pushes down with Exasol's text
+#[test]
+fn e2e_string_functions_over_double_boolean_timestamp_match_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let double_filter = |from: &str| format!("SELECT ID FROM {from} WHERE UPPER(C_DOUBLE) = '0.5'");
+    let bool_cast = |from: &str| format!("SELECT ID, CAST(C_BOOL AS VARCHAR(5)) FROM {from}");
+    let max_ts = |from: &str| format!("SELECT MAX(CAST(C_TS AS VARCHAR(30))) FROM {from}");
+
+    let oracle = sorted_text_rows(&mut conn, &double_filter(&native_typed_probe_table()));
+    assert_eq!(
+        oracle,
+        vec![
+            text_row(&[Some("1")]),
+            text_row(&[Some("5")]),
+            text_row(&[Some("7")])
+        ],
+        "native oracle: ids whose DOUBLE text is 0.5"
+    );
+    let vs_sql = double_filter(&vs_typed_table());
+    assert_scan_spec_carries_exa_to_varchar(&mut conn, &vs_sql);
+    assert_eq!(
+        sorted_text_rows(&mut conn, &vs_sql),
+        oracle,
+        "WHERE UPPER(C_DOUBLE) = '0.5' must match native Exasol for:\n{vs_sql}"
+    );
+
+    let oracle = sorted_text_rows(&mut conn, &bool_cast(&native_typed_probe_table()));
+    assert!(
+        oracle.contains(&text_row(&[Some("1"), Some("TRUE")]))
+            && oracle.contains(&text_row(&[Some("4"), Some("FALSE")]))
+            && oracle.contains(&text_row(&[Some("3"), None])),
+        "native oracle renders BOOLEAN as TRUE/FALSE and NULL as NULL: {oracle:?}"
+    );
+    let vs_sql = bool_cast(&vs_typed_table());
+    assert_scan_spec_carries_exa_to_varchar(&mut conn, &vs_sql);
+    assert_eq!(
+        sorted_text_rows(&mut conn, &vs_sql),
+        oracle,
+        "CAST(C_BOOL AS VARCHAR(5)) must match native Exasol for:\n{vs_sql}"
+    );
+
+    let oracle = text_rows(&mut conn, &max_ts(&native_typed_probe_table()));
+    assert_eq!(
+        oracle,
+        vec![text_row(&[Some("2024-01-01 00:00:00.600000")])],
+        "native oracle renders a TIMESTAMP with six fraction digits"
+    );
+    let vs_sql = max_ts(&vs_typed_table());
+    assert_scan_spec_carries_exa_to_varchar(&mut conn, &vs_sql);
+    assert_eq!(
+        text_rows(&mut conn, &vs_sql),
+        oracle,
+        "MAX(CAST(C_TS AS VARCHAR(30))) must match native Exasol for:\n{vs_sql}"
+    );
+}
+
+/// Scenario: A value DataFusion computes as Float64 converts with the DOUBLE rule
+#[test]
+fn e2e_computed_float64_string_argument_matches_native() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| {
+        format!(
+            "SELECT ID, CAST(ROUND(C_DECIMAL_A / 3, 2) AS VARCHAR(40)), \
+             CAST(C_DECIMAL_A * 1.5 AS VARCHAR(40)) FROM {from}"
+        )
+    };
+
+    let oracle = sorted_text_rows(&mut conn, &query(&native_typed_probe_table()));
+    assert!(
+        oracle.contains(&text_row(&[Some("6"), Some("13.66"), Some("61.485")])),
+        "native oracle: 40.99 / 3 rounds to 13.66 and 40.99 * 1.5 is 61.485: {oracle:?}"
+    );
+    let vs_sql = query(&vs_typed_table());
+    assert_scan_spec_carries_exa_to_varchar(&mut conn, &vs_sql);
+    assert_eq!(
+        sorted_text_rows(&mut conn, &vs_sql),
+        oracle,
+        "computed Float64 string arguments must match native Exasol for:\n{vs_sql}"
+    );
+}
+
+/// Scenario: Session-dependent text follows the default session settings
+#[test]
+fn e2e_session_nls_settings_affect_only_the_tracked_types() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    conn.execute("ALTER SESSION SET NLS_NUMERIC_CHARACTERS = ',.'");
+    let decimal = |from: &str| {
+        format!("SELECT ID, CAST(C_DECIMAL_A AS VARCHAR(20)) FROM {from} WHERE ID = 1")
+    };
+    let integer_and_boolean = |from: &str| {
+        format!(
+            "SELECT ID, UPPER(ID), CAST(C_BOOL AS VARCHAR(5)) FROM {from} WHERE ID IN (1, 4, 12)"
+        )
+    };
+
+    let native_decimal = text_rows(&mut conn, &decimal(&native_typed_probe_table()));
+    assert_eq!(
+        native_decimal,
+        vec![text_row(&[Some("1"), Some("10,5")])],
+        "native oracle follows NLS_NUMERIC_CHARACTERS for DECIMAL text"
+    );
+    let vs_decimal = text_rows(&mut conn, &decimal(&vs_typed_table()));
+    assert_eq!(
+        vs_decimal,
+        vec![text_row(&[Some("1"), Some("10.5")])],
+        "DECIMAL text keeps the default settings, the tracked exception #216"
+    );
+
+    let oracle = sorted_text_rows(&mut conn, &integer_and_boolean(&native_typed_probe_table()));
+    assert_eq!(
+        oracle.len(),
+        3,
+        "native oracle must return the three ids: {oracle:?}"
+    );
+    let vs_sql = integer_and_boolean(&vs_typed_table());
+    assert_scan_spec_carries_exa_to_varchar(&mut conn, &vs_sql);
+    assert_eq!(
+        sorted_text_rows(&mut conn, &vs_sql),
+        oracle,
+        "integer and BOOLEAN text must match native Exasol under NLS_NUMERIC_CHARACTERS for:\n{vs_sql}"
+    );
+}
+
+/// Scenario: An ungrouped aggregate on the row-scan path with all files pruned returns one row
+#[test]
+fn e2e_max_instr_with_start_position_all_files_pruned_returns_one_null_row() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let query = |from: &str| {
+        format!("SELECT MAX(INSTR(C_NAME, 'c', 2)), COUNT(*) FROM {from} WHERE C_CUSTKEY > 1000")
+    };
+
+    let oracle = text_rows(&mut conn, &query(&native_dim_customer_table()));
+    assert_eq!(
+        oracle,
+        vec![text_row(&[None, Some("0")])],
+        "native oracle: an ungrouped aggregate over no rows is one row (NULL, 0)"
+    );
+
+    let vs_sql = query(&vs_dim_table());
+    let explained = explain_virtual_sql(&mut conn, &vs_sql);
+    assert!(
+        !explained.contains(SCAN_SCRIPT_NAME),
+        "a fully pruned scan must not call {SCAN_SCRIPT_NAME} for:\n{vs_sql}\n{explained}"
+    );
+    assert_eq!(
+        text_rows(&mut conn, &vs_sql),
+        oracle,
+        "a fully pruned MAX(INSTR(.., 2)) over the VS must return one row (NULL, 0) for:\n{vs_sql}"
+    );
+}
+
+#[test]
+fn e2e_grouped_string_conversion_repros_carry_exa_to_varchar_in_the_scan_spec() {
+    setup_e2e();
+    let mut conn = exa_conn();
+    let typed = vs_typed_table();
+
+    for sql in [
+        format!("SELECT UPPER(ID), COUNT(*) FROM {typed} GROUP BY UPPER(ID)"),
+        format!("SELECT MAX(UPPER(ID)), MIN(UPPER(ID)), SUM(LENGTH(UPPER(ID))) FROM {typed}"),
+        format!(
+            "SELECT UPPER(ID), MAX(UPPER(ID)) FROM {typed} GROUP BY UPPER(ID) \
+             HAVING MAX(UPPER(ID)) < '3' ORDER BY UPPER(ID)"
+        ),
+        format!(
+            "SELECT C_BOOL, MAX(UPPER(ID)) || '-' || MIN(UPPER(ID)) FROM {typed} GROUP BY C_BOOL"
+        ),
+        format!(
+            "SELECT CAST(C_DECIMAL_A AS VARCHAR(20)), COUNT(*) FROM {typed} \
+             GROUP BY CAST(C_DECIMAL_A AS VARCHAR(20))"
+        ),
+        format!(
+            "SELECT MAX(CAST(C_DECIMAL_A AS VARCHAR(20))), MIN(CAST(C_DECIMAL_A AS VARCHAR(20))) \
+             FROM {typed}"
+        ),
+        format!("SELECT UPPER(C_DOUBLE), COUNT(*) FROM {typed} GROUP BY UPPER(C_DOUBLE)"),
+    ] {
+        assert_scan_spec_carries_exa_to_varchar(&mut conn, &sql);
+    }
 }

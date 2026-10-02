@@ -348,11 +348,8 @@ const EXPR_ARRAY_FIELDS: [&str; 3] = ["expressions", "arguments", "results"];
 /// Curated deliberately; see [`rewrite_expr_tree`].
 const EXPR_SINGLE_FIELDS: [&str; 5] = ["expression", "pattern", "left", "right", "basis"];
 
-/// Post-order is load-bearing: Exasol encodes `a||b||c` as `CONCAT(a, CONCAT(b, c))`,
-/// so only a check that sees rewritten children reaches nested occurrences, and an
-/// already-coerced inner argument is not re-wrapped.
-///
 /// `f` returning `None` declines the whole tree; the caller must self-apply it.
+/// `guard_like_subject` (via `like_subject_type_guard`) is the one type-aware `f`.
 ///
 /// The child fields are curated rather than walking every map value, so a
 /// `dataType` sub-object or a `name` identifier is never handed to `f`.
@@ -379,9 +376,9 @@ fn rewrite_expr_tree(node: &Json, f: &impl Fn(&Json) -> Option<Json>) -> Option<
 /// Exasol does, and column nodes carry no `dataType`, so this type-aware guard lives
 /// in the adapter, not in `vs-expression` (#207, decision-log [1]).
 ///
-/// For a bare-column subject: string types pass, DATE is wrapped as
-/// `CAST(<col> AS VARCHAR)`, anything else or an unresolved name declines the whole
-/// filter (the caller must self-apply it).
+/// Walks the tree and applies `guard_like_subject` to each LIKE node. For a bare-column
+/// subject: string types pass, DATE is wrapped as `CAST(<col> AS VARCHAR)`, anything
+/// else or an unresolved name declines the whole filter (the caller must self-apply it).
 ///
 /// The DATE cast matches Exasol only under the default `NLS_DATE_FORMAT`; an altered
 /// session format is a tracked exception (#216, decision-log [8]).
@@ -396,8 +393,8 @@ fn like_subject_type_guard(filter: &Json, col_types: &[(String, String)]) -> Opt
 }
 
 /// Folds with the same full-Unicode `to_uppercase` the `col_types` builders use.
-/// Deliberately does not test the node's `type`: callers treat a non-column node as
-/// a pass-through but an unresolved type as a decline.
+/// Deliberately does not test the node's `type`: `guard_like_subject`, its one consumer,
+/// treats a non-column node as a pass-through but an unresolved type as a decline.
 fn column_exa_type<'t>(node: &Json, col_types: &'t [(String, String)]) -> Option<&'t str> {
     let name = node.get("name").and_then(|n| n.as_str())?.to_uppercase();
     col_types
@@ -424,92 +421,12 @@ fn guard_like_subject(like_node: &Json, col_types: &[(String, String)]) -> Optio
             out["expression"] = wrap_cast_to_varchar(subject);
             Some(out)
         }
-        // Other types' string forms diverge between engines, so decline rather than risk
-        // a wrong or hard-failing cast (decision-log [2]).
+        // Every other family declines to native evaluation (#207).
         Some(ExaTypeClass::Decimal | ExaTypeClass::Other) | None => None,
     }
 }
 
-/// Exasol trims trailing DECIMAL scale zeros when stringifying (`2912.00`→`'2912'`);
-/// DataFusion renders the full declared scale, a silent wrong result (#211).
-///
-/// Rewrites only a bare DECIMAL column that is the direct argument of a string
-/// `CAST` (the whole cast is replaced), `CONCAT`, or `LENGTH`. Any other context,
-/// and a computed argument whose type is unresolvable, is left untouched (a tracked
-/// exception in the spec).
-///
-/// The closure never declines, so the `unwrap_or_else` fallback is unreachable.
-fn rewrite_decimal_stringifications(node: &Json, col_types: &[(String, String)]) -> Json {
-    rewrite_expr_tree(node, &|out: &Json| {
-        let node_type = out.get("type").and_then(|t| t.as_str()).unwrap_or("");
-        Some(match node_type {
-            "function_scalar_cast" => {
-                let target_is_string = out
-                    .get("dataType")
-                    .and_then(|d| d.get("type"))
-                    .and_then(|t| t.as_str())
-                    .map(|t| t.to_uppercase())
-                    .is_some_and(|t| t == "VARCHAR" || t == "CHAR");
-                if target_is_string
-                    && let Some(Json::Array(args)) = out.get("arguments")
-                    && let [arg] = args.as_slice()
-                    && is_bare_decimal_column(arg, col_types)
-                {
-                    // Replace the whole cast; do not re-nest inside it.
-                    return Some(wrap_decimal_to_varchar(arg));
-                }
-                out.clone()
-            }
-            "function_scalar" => {
-                let fn_name = out
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_uppercase();
-                let mut out = out.clone();
-                if (fn_name == "CONCAT" || fn_name == "LENGTH")
-                    && let Some(Json::Array(args)) = out.get("arguments")
-                {
-                    let rewritten: Vec<Json> = args
-                        .iter()
-                        .map(|a| {
-                            if is_bare_decimal_column(a, col_types) {
-                                wrap_decimal_to_varchar(a)
-                            } else {
-                                a.clone()
-                            }
-                        })
-                        .collect();
-                    out["arguments"] = Json::Array(rewritten);
-                }
-                out
-            }
-            _ => out.clone(),
-        })
-    })
-    .unwrap_or_else(|| node.clone())
-}
-
-/// Integer columns arrive as `DECIMAL(p,0)`; the trim is a no-op on them.
-fn is_bare_decimal_column(node: &Json, col_types: &[(String, String)]) -> bool {
-    if node.get("type").and_then(|t| t.as_str()) != Some("column") {
-        return false;
-    }
-    matches!(
-        column_exa_type(node, col_types).map(classify_exa_type),
-        Some(ExaTypeClass::Decimal)
-    )
-}
-
-/// Never sent by Exasol; only this rewriter synthesizes it.
-fn wrap_decimal_to_varchar(column: &Json) -> Json {
-    serde_json::json!({
-        "type": "decimal_to_varchar_exasol",
-        "arguments": [column.clone()],
-    })
-}
-
-/// Shared so the LIKE and string-function DATE branches are identical.
+/// Wraps `node` as `CAST(<node> AS VARCHAR)`; `guard_like_subject` is its one consumer.
 fn wrap_cast_to_varchar(node: &Json) -> Json {
     serde_json::json!({
         "type": "function_scalar_cast",
@@ -519,95 +436,15 @@ fn wrap_cast_to_varchar(node: &Json) -> Json {
     })
 }
 
-/// String-typed arguments that Exasol implicitly converts to VARCHAR (#210).
-#[derive(Debug, PartialEq, Eq)]
-enum StringPositionArgs {
-    /// Never declines: `CHR`/`UNICODECHR` take a genuine integer codepoint.
-    NotGoverned,
-    Coerce(Vec<usize>),
-    /// This function at this arity is not rendered faithfully.
-    Decline,
-}
-
-/// Every returned index is `< arg_count`.
-///
-/// `INSTR`/`LOCATE` beyond two arguments must decline: `vs-expression` silently drops
-/// the extra arguments, so coercing would plan a truncated, wrong rendering (#228).
-fn string_position_args(fn_name: &str, arg_count: usize) -> StringPositionArgs {
-    let coerce_in_range = |indices: Vec<usize>| {
-        StringPositionArgs::Coerce(indices.into_iter().filter(|i| *i < arg_count).collect())
-    };
-    match fn_name.to_uppercase().as_str() {
-        "CONCAT" | "TRIM" | "LTRIM" | "RTRIM" | "REPLACE" | "TRANSLATE" => {
-            coerce_in_range((0..arg_count).collect())
-        }
-        "LOWER" | "UPPER" | "ASCII" | "INITCAP" | "REVERSE" | "LENGTH" | "OCTET_LENGTH"
-        | "UNICODE" | "SUBSTR" | "REPEAT" | "LEFT" | "RIGHT" => coerce_in_range(vec![0]),
-        "LPAD" | "RPAD" if arg_count > 2 => coerce_in_range(vec![0, 2]),
-        "LPAD" | "RPAD" => coerce_in_range(vec![0]),
-        "INSTR" | "LOCATE" if arg_count > 2 => StringPositionArgs::Decline,
-        "INSTR" | "LOCATE" => coerce_in_range(vec![0, 1]),
-        _ => StringPositionArgs::NotGoverned,
-    }
-}
-
-/// Exasol implicitly converts numeric or DATE string-function arguments to VARCHAR;
-/// DataFusion fails at plan time (#210). A decline propagates to the whole tree and
-/// must be self-applied by the caller. Must run before
-/// [`rewrite_decimal_stringifications`] so a coerced argument is not double-wrapped.
-fn string_function_arg_type_guard(node: &Json, col_types: &[(String, String)]) -> Option<Json> {
-    rewrite_expr_tree(node, &|out: &Json| {
-        if out.get("type").and_then(|t| t.as_str()) != Some("function_scalar") {
-            return Some(out.clone());
-        }
-        let fn_name = out.get("name").and_then(|n| n.as_str()).unwrap_or("");
-        let arg_count = out
-            .get("arguments")
-            .and_then(|a| a.as_array())
-            .map_or(0, |a| a.len());
-        match string_position_args(fn_name, arg_count) {
-            StringPositionArgs::NotGoverned => Some(out.clone()),
-            // `vs-expression` renders this arity incompletely (#228).
-            StringPositionArgs::Decline => None,
-            StringPositionArgs::Coerce(indices) => {
-                let mut out = out.clone();
-                for i in indices {
-                    let coerced = coerce_string_position_arg(&out["arguments"][i], col_types)?;
-                    out["arguments"][i] = coerced;
-                }
-                Some(out)
-            }
-        }
-    })
-}
-
-/// A non-`column` argument is returned unchanged: its type is unresolvable, a tracked
-/// exception (#223) that must not decline.
-fn coerce_string_position_arg(arg: &Json, col_types: &[(String, String)]) -> Option<Json> {
-    if arg.get("type").and_then(|t| t.as_str()) != Some("column") {
-        return Some(arg.clone());
-    }
-    match column_exa_type(arg, col_types).map(classify_exa_type) {
-        Some(ExaTypeClass::Character) => Some(arg.clone()),
-        Some(ExaTypeClass::Date) => Some(wrap_cast_to_varchar(arg)),
-        Some(ExaTypeClass::Decimal) => Some(wrap_decimal_to_varchar(arg)),
-        // Other types' text forms diverge between engines; a cast would turn a crash into
-        // a wrong answer.
-        Some(ExaTypeClass::Other) | None => None,
-    }
-}
-
-/// Order matters: the string-function guard must precede the decimal rewrite so a
-/// coerced argument is not double-wrapped. `None` means a guard declined.
+/// Runs one pass, `like_subject_type_guard`; `None` means it declined. No pass wraps a
+/// string-converted argument: the expression renderer owns that conversion (#227).
 pub(super) fn apply_type_rewrites(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
-    let expr = like_subject_type_guard(expr, col_types)?;
-    let expr = string_function_arg_type_guard(&expr, col_types)?;
-    Some(rewrite_decimal_stringifications(&expr, col_types))
+    like_subject_type_guard(expr, col_types)
 }
 
 /// Depth-insensitive: a nested aggregate is renderable SQL, so only this probe keeps
 /// it off the per-shard scan.
-fn contains_aggregate_node(node: &Json) -> bool {
+pub(super) fn contains_aggregate_node(node: &Json) -> bool {
     match node {
         Json::Object(map) => {
             map.get("type").and_then(|t| t.as_str()) == Some("function_aggregate")
@@ -618,8 +455,8 @@ fn contains_aggregate_node(node: &Json) -> bool {
     }
 }
 
-/// The sole owner of "a tree the DataFusion scan may be handed". Renderability is
-/// checked on the rewritten tree, since that is what the scan carries; checking the
+/// The sole owner of "a tree the DataFusion scan may be handed": the `guard_like_subject`
+/// rewrite followed by a renderability check. Renderability is checked on the rewritten tree, since that is what the scan carries; checking the
 /// raw tree would let an unrenderable tree be silently dropped, returning wrong rows.
 pub(super) fn type_accepted_rewrite(expr: &Json, col_types: &[(String, String)]) -> Option<Json> {
     apply_type_rewrites(expr, col_types).filter(datafusion_renderable)
@@ -656,7 +493,8 @@ fn is_valid_emits_output_type(ty: &str) -> bool {
 }
 
 /// `all_cols` is the column universe: the first involved table, or the union of both
-/// tables for a broadcast join.
+/// tables for a broadcast join. Each select-list item passes `apply_type_rewrites`, whose
+/// one pass is `guard_like_subject`; a decline widens the projection to the full row.
 ///
 /// The widening flag is returned rather than re-derived downstream by comparing
 /// arities, which coincide when the table width equals the select-list arity
@@ -751,8 +589,6 @@ pub(super) fn project_columns(
                     // `predicate_greater[equal]`: Exasol normalises `a > b` to `b < a`.
                     "function_scalar"
                     | "function_scalar_cast"
-                    // Synthesized from a DECIMAL-to-string cast by the rewrite above (#211).
-                    | "decimal_to_varchar_exasol"
                     | "function_scalar_extract"
                     | "function_scalar_case"
                     | "predicate_equal"
@@ -767,22 +603,20 @@ pub(super) fn project_columns(
                     | "predicate_is_null"
                     | "predicate_is_not_null"
                     | "predicate_notequal"
-                    | "predicate_like_regexp" => {
-                        match render_expression_safe(e) {
-                            Some(sql_frag) => {
-                                let ty = declared_type.clone();
-                                if is_valid_emits_output_type(&ty) {
-                                    names.push(ProjectionItem::Expr { expr: sql_frag });
-                                    types.push(ty);
-                                } else {
-                                    needs_full_fallback = true;
-                                }
-                            }
-                            None => {
+                    | "predicate_like_regexp" => match render_expression_safe(e) {
+                        Some(sql_frag) => {
+                            let ty = declared_type.clone();
+                            if is_valid_emits_output_type(&ty) {
+                                names.push(ProjectionItem::Expr { expr: sql_frag });
+                                types.push(ty);
+                            } else {
                                 needs_full_fallback = true;
                             }
                         }
-                    }
+                        None => {
+                            needs_full_fallback = true;
+                        }
+                    },
                     _ => {
                         needs_full_fallback = true;
                     }

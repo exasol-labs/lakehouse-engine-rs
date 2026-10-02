@@ -431,7 +431,7 @@ pub(crate) fn build_dispatch_sql(
                 );
             }
             let plans = ordinary_plans(&items);
-            let plan_types = single_group_plan_types(pushdown_req, &items);
+            let plan_types = single_group_plan_types(pushdown_req, &items, &col_types);
             // Assembled here because it depends on select-list classification.
             let merge_inputs =
                 single_group_merge_select(&items, &plans, &plan_types).and_then(|merge_select| {

@@ -39,13 +39,14 @@ EMITS boundary; in the VALUE position it is unobservable, because Exasol's VARCH
 represent the `''` that would otherwise be emitted.
 
 **The wrapper also preserves issue #200's NULL-boolean contract, which a bare `concat()` would
-break.** A boolean-producing operand is rewritten to `(CASE <expr> WHEN TRUE THEN 'TRUE' WHEN FALSE
-THEN 'FALSE' ELSE NULL END)` before assembly, so a NULL boolean becomes NULL rather than lowercase
-`true`/`false` or a coerced `'FALSE'`. Under a bare `concat()` that NULL is skipped and the whole
+break.** In the DataFusion dialect a boolean-producing operand reaches `concat()` through `exa_to_varchar`,
+which yields `TRUE`, `FALSE`, or NULL (`datafusion-scan/scan-execution-exa-to-varchar`), so a NULL
+boolean becomes NULL rather than lowercase `true`/`false` or a coerced `'FALSE'`. The Exasol dialect
+keeps its `(CASE <expr> WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)` rewrite. Under a bare `concat()` that NULL is skipped and the whole
 expression becomes `''`; under `nullif(concat(...), '')` it stays NULL. Exasol agrees with the
 latter: `(CAST(NULL AS DOUBLE) > 0) || ''` IS NULL and `(100.0 > 0) || ''` is `TRUE`, both
-captured live. `crates/lakehouse-engine/tests/boolean_to_string_casing_test.rs` asserts exactly
-that NULL label through a real DataFusion `SessionContext`, so it is the structural proof that the
+captured live. `crates/lakehouse-engine/src/scan/to_varchar_tests.rs` asserts exactly
+that NULL label through a real DataFusion `SessionContext` with `exa_to_varchar` registered, so it is the structural proof that the
 wrapper is required rather than decorative.
 
 **Exasol sends `a || b || c` as NESTED `CONCAT` nodes, and the rendering composes under
@@ -57,14 +58,12 @@ what Exasol does. Verified against the pinned DataFusion 54.1.0: the nested rend
 `name || NULLIF(name, name) || '-suffix'` returned the full concatenation, and the all-NULL
 nesting returned NULL.
 
-**Argument-type coercion is unchanged by the operator-to-call switch.** Which argument TYPES reach
-this rendering is owned by `vs-adapter/pushdown-planning-string-fn-type-coercion` (which declines a
-`DOUBLE`, `BOOLEAN`, or `TIMESTAMP` argument to native Exasol evaluation and rewraps a `DATE` one)
-and by `vs-adapter/pushdown-planning-decimal-string-format` (which rewraps a bare DECIMAL column).
-Neither is touched here. For the types that do reach it, `concat()` coerces exactly as `||` did:
-its signature is `Signature::variadic([Utf8View, Utf8, LargeUtf8, Binary])`, and against the pinned
-DataFusion 54.1.0 `concat("ID", '-x')` over an `Int64` column planned and returned `1-x` with no
-coercion error.
+**Each argument reaches `concat()` as text.** Every `CONCAT` argument is string-converted
+(`sql-comprehension/vs-expression-translator-string-conversion`), so in the DataFusion dialect every
+argument renders as `exa_to_varchar(<arg>)` inside the `concat(...)` call. `exa_to_varchar` converts
+every Arrow type to Exasol's text (`datafusion-scan/scan-execution-exa-to-varchar`), which
+`concat()`'s own coercion does not: against the pinned DataFusion 54.1.0 `concat("ID", '-x')` over an
+`Int64` column returned `1-x`, but a DECIMAL keeps its full declared scale.
 
 ## Scenarios
 
@@ -72,16 +71,16 @@ coercion error.
 
 * *GIVEN* a VS expression node of type `function_scalar` named `CONCAT` with one or more arguments — the wire encoding of Exasol's `||` operator
 * *WHEN* `render_expression` processes the node
-* *THEN* the translator SHALL return `nullif(concat(<a1>, <a2>, ...), '')` — REPLACING the recorded `(<a1> || <a2> ...)` chained-operator rendering, which propagates NULL in DataFusion where Exasol treats a NULL operand as the empty string, and so silently returns NULL values and wrong row sets (issue #374)
+* *THEN* the translator SHALL return `nullif(concat(<a1>, <a2>, ...), '')`, where each `<aN>` renders per `sql-comprehension/vs-expression-translator-string-conversion`, and SHALL NOT render DataFusion's `||` operator, which propagates NULL where Exasol treats a NULL operand as the empty string (issue #374)
 * *AND* the `concat(...)` call SHALL carry EVERY argument, in the order received, comma-separated, because DataFusion's `concat` ignores a NULL argument — matching Exasol's `||`, which treats a NULL operand as the empty string
 * *AND* the `nullif(..., '')` wrapper SHALL be emitted for EVERY argument list, because Exasol's VARCHAR domain contains no empty string (`'' IS NULL` is TRUE and `CONCAT(NULL, NULL) IS NULL` is TRUE, both captured live) while DataFusion's `concat` returns a non-NULL `''` for an all-NULL argument list — without the wrapper, `WHERE <concat> IS NULL` matches no row where Exasol matches every row
 * *AND* the wrapper MUST NOT be omitted on the grounds that the VALUE position cannot observe it: the FILTER and GROUP-BY-key positions are evaluated inside DataFusion before any value crosses the EMITS boundary, and issue #200's NULL-boolean group label depends on it
-* *AND* a boolean-producing argument SHALL still be rewritten to `(CASE <arg> WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)` before assembly, BYTE-IDENTICAL to its pre-delta form, so Exasol's `TRUE`/`FALSE` casing survives and a NULL boolean still yields NULL rather than lowercase `true`/`false`, the string `'NULL'`, or a coerced `'FALSE'` (issue #200)
+* *AND* a boolean-producing argument SHALL render as `exa_to_varchar(<arg>)` like every other argument, so Exasol's `TRUE`/`FALSE` casing survives and a NULL boolean still yields NULL rather than lowercase `true`/`false`, the string `'NULL'`, or a coerced `'FALSE'` (issue #200)
 * *AND* each argument SHALL be rendered exactly ONCE and referenced exactly once, so no sub-expression is walked or evaluated twice
 * *AND* a nested `CONCAT` argument SHALL render its own `nullif(concat(...), '')`, because Exasol sends `a || b || c` as nested `CONCAT` nodes (`vs-adapter/pushdown-planning-decimal-string-format`), so that every level reproduces Exasol's own per-level semantics
 * *AND* a single-argument call SHALL render `nullif(concat(<a1>), '')`, which is Exasol's own single-argument behavior — `CONCAT('a')` is `'a'` and a single NULL argument yields NULL, both captured live
 * *AND* a node whose `arguments` key is absent SHALL return an error, and an EMPTY argument list SHALL return an error in raising mode and `None` in the safe variants, in BOTH dialects — REPLACING the recorded absence of any arity floor, which rendered the syntactically invalid `()` in the Exasol dialect and `concat()` in the DataFusion dialect
-* *AND* `render_expression_exasol` SHALL render `(<a1> || <a2> ...)` — chained `||`, parenthesized, with the same per-argument boolean rewrite — BYTE-IDENTICAL to its pre-delta output and carrying NO `nullif`/`concat` wrapper, because Exasol's own `||` already has these semantics; the `ExasolForm::Shaped` declaration is unchanged, so the declaration-driven verbatim sweep test keeps its `("A" || "B")` expectation and stays green with no edit
+* *AND* `render_expression_exasol` SHALL render `(<a1> || <a2> ...)` — chained `||`, parenthesized, with the `(CASE <arg> WHEN TRUE THEN 'TRUE' WHEN FALSE THEN 'FALSE' ELSE NULL END)` rewrite of each boolean-producing argument — BYTE-IDENTICAL to its pre-delta output and carrying NO `nullif`/`concat` wrapper, because Exasol's own `||` already has these semantics; the `ExasolForm::Shaped` declaration is unchanged, so the declaration-driven verbatim sweep test keeps its `("A" || "B")` expectation and stays green with no edit
 * *AND* `capabilities.rs` SHALL keep advertising `FN_CONCAT` unchanged, so the fix restores the semantics at the rendering site rather than withdrawing the pushdown
 
 ### Scenario: A pushed-down CONCAT over a NULL operand concatenates the non-NULL parts on the cluster

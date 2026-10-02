@@ -34,7 +34,7 @@ fn plan_scan_sql(request: &Json, files: Vec<(String, u64)>, cluster_nodes: usize
         .filter(|it| validate_agg_col_types(&ordinary_plans(it), &col_types));
     let merge_inputs = items.as_deref().map(|it| {
         let plans = ordinary_plans(it);
-        let plan_types = single_group_plan_types(&pushdown_req, it);
+        let plan_types = single_group_plan_types(&pushdown_req, it, &[]);
         let merge_select = single_group_merge_select(it, &plans, &plan_types)
             .expect("plan_scan_sql mirrors only fixtures whose merge SELECT assembles in full");
         AggregateMergeInputs::new(plan_types, merge_select, limit)

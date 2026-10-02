@@ -39,7 +39,7 @@ pub(super) fn classify_request_shape(
     pushdown_req: &Json,
     col_types: &[(String, String)],
 ) -> RequestShape {
-    if let Some(detection) = detect_group_by_aggregates(pushdown_req) {
+    if let Some(detection) = detect_group_by_aggregates(pushdown_req, col_types) {
         // A SUM over a non-numeric column would produce an opaque UDF error; demote.
         if validate_agg_col_types(&detection.plans, col_types) {
             // The merge wrapper only has `GK_*`/`PARTIAL_*` columns, so an aggregate absent

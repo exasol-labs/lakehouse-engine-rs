@@ -16,12 +16,12 @@ not have: WHICH column-type universe a surface may screen against.
 ## Background
 
 * This feature adds NO guard and NO type dispatch. It wires the two join sites to
-  `apply_type_rewrites` — the one ordered pipeline (`like_subject_type_guard` →
-  `string_function_arg_type_guard` → `rewrite_decimal_stringifications`) owned by
+  `apply_type_rewrites` — the one ordered pipeline (`like_subject_type_guard`, its only pass since
+  issue #227) owned by
   `vs-adapter/pushdown-planning-string-fn-type-coercion-composition` — so every guard decision,
   dispatch table, and traversal is inherited verbatim from the single-table WHERE surface. Issue
-  #215; issue #223's slice 2 ("broadcast-join per-leg FILTER path") closes with it, while #223's
-  slices 1 (computed-expression arguments) and 3 (GROUP-BY-only keys) remain open.
+  #215; issue #223's slice 2 ("broadcast-join per-leg FILTER path") closes with it, and issue #227
+  closes #223's slices 1 (computed-expression arguments) and 3 (GROUP-BY-only keys).
 * The broadcast site reuses `classify_where_filter`, already the SOLE owner of the
   "rewrite, then decide scan-spec filter vs. self-apply" classification for the single-table path,
   rather than re-deriving that sequence at a second site.
@@ -42,14 +42,13 @@ not have: WHICH column-type universe a surface may screen against.
 * Every decline is therefore SAFE rather than silently lossy, which is what unblocks shipping the
   decline arm at all: before the self-application mechanism existed, a declined join filter was
   omitted from the emitted SQL and applied nowhere, returning extra rows.
-* The `NLS_DATE_FORMAT` tracked exception (#216) on the DATE CAST-to-VARCHAR arm and the
-  DECIMAL-stringification trade-off (#211) apply unchanged at both join surfaces: the same pipeline
-  emits the same nodes, so the same accepted trade-offs carry over. Neither is a new exception.
-* Wiring the pipeline makes `string_function_arg_type_guard`'s `INSTR`/`LOCATE`-beyond-two-arguments
-  decline newly reachable at the join surfaces, replacing a silently truncated position with the
-  native Exasol result. That NARROWS issue #228's exposure to the surfaces still unwired; it does
-  NOT close #228, whose root cause is a rendering defect in `crates/vs-expression` that this feature
-  does not touch.
+* The session-setting tracked exception (#216) on text conversion and the DECIMAL trim (#211)
+  apply unchanged at both join surfaces: both render through the same `exa_to_varchar` wrapping
+  as the single-table surface, so the same accepted trade-offs carry over. Neither is a new exception.
+* An `INSTR`/`LOCATE` call beyond two arguments is a DataFusion-dialect render error (issue #228,
+  step 1), so at both join surfaces it takes the unrenderable-filter outcome and returns the native
+  Exasol result instead of a silently truncated position. It does NOT close #228, whose faithful
+  three- and four-argument rendering stays open.
 * Both join sites receive an already alias-stripped tree, because `handle_pushdown` strips every
   `tableAlias` from the whole pushdown request at one chokepoint before any downstream render
   (issue #193). The guards match a `column` node's `name` alone, so stripping neither helps nor
@@ -129,9 +128,9 @@ not have: WHICH column-type universe a surface may screen against.
 
 ### Scenario: A join filter with no type-rewrite trigger emits byte-identical SQL
 
-* *GIVEN* a broadcast-eligible join request and an N-scan fallback request whose WHERE filters carry no `LIKE` over a non-string column, no governed string function over a non-string argument, no `INSTR`/`LOCATE` beyond two arguments, and no DECIMAL stringification
+* *GIVEN* a broadcast-eligible join request and an N-scan fallback request whose WHERE filters carry no `LIKE` over a non-string column, no string function, and no string CAST
 * *WHEN* the adapter renders each pushdown
-* *THEN* the emitted SQL SHALL be BYTE-IDENTICAL to its pre-change output at both sites, because the type-rewrite pipeline returns an untriggered tree unchanged
+* *THEN* the type-rewrite pipeline SHALL return each filter tree unchanged and the renderer SHALL wrap no argument, so the emitted SQL at both sites SHALL be BYTE-IDENTICAL to the rendering of the request's own filter tree
 * *AND* no existing golden-SQL fixture covering a broadcast join or an N-scan fallback whose filter carries no trigger SHALL change
 * *AND* an ABSENT filter and a TRIVIALLY-TRUE filter SHALL each stay distinguished from a DECLINED one at both join sites, so neither routes to a decline — the distinction owned by `vs-adapter/pushdown-declined-filter-self-apply`
 * *AND* the wiring SHALL add no cost to any join request the adapter can already push

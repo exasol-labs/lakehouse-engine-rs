@@ -349,3 +349,293 @@ fn scalar_over_agg_primitives_serve_both_planners_with_no_planner_dependency() {
          SQL regardless of which planner drives it"
     );
 }
+
+fn column(name: &str) -> Json {
+    serde_json::json!({"type": "column", "name": name})
+}
+
+fn scalar(name: &str, arguments: Vec<Json>) -> Json {
+    serde_json::json!({"type": "function_scalar", "name": name, "arguments": arguments})
+}
+
+fn cast_to(arg: Json, data_type: Json) -> Json {
+    serde_json::json!({"type": "function_scalar_cast", "dataType": data_type, "arguments": [arg]})
+}
+
+fn string_literal(value: &str) -> Json {
+    serde_json::json!({"type": "literal_string", "value": value})
+}
+
+fn predicate(kind: &str, left: Json, right: Json) -> Json {
+    serde_json::json!({"type": kind, "left": left, "right": right})
+}
+
+fn agg_over(name: &str, arg: Json) -> Json {
+    serde_json::json!({"type": "function_aggregate", "name": name, "arguments": [arg]})
+}
+
+fn probe_col_types() -> Vec<(String, String)> {
+    [
+        ("ID", "DECIMAL(20,0)"),
+        ("C_DOUBLE", "DOUBLE PRECISION"),
+        ("C_VARCHAR", "VARCHAR(2000000) UTF8"),
+        ("C_CHAR", "CHAR(3) ASCII"),
+        ("C_DATE", "DATE"),
+        ("C_TS", "TIMESTAMP(6)"),
+        ("C_BOOL", "BOOLEAN"),
+        ("C_TSTZ", "TIMESTAMP WITH LOCAL TIME ZONE"),
+    ]
+    .iter()
+    .map(|(name, ty)| (name.to_string(), ty.to_string()))
+    .collect()
+}
+
+/// The partial type the typed classifier gives the one aggregate `agg`.
+fn partial_type_of(agg: Json) -> String {
+    let typed = classify_typed_scalar_over_aggregate(&round_of(agg, 2), &probe_col_types())
+        .expect("a scalar over one aggregate must classify");
+    assert_eq!(typed.len(), 1, "one nested aggregate: {typed:?}");
+    typed[0].1.clone()
+}
+
+#[test]
+fn typed_classify_pairs_each_nested_plan_with_its_partial_type_in_encounter_order() {
+    let node = binary(
+        "CONCAT",
+        agg_over("MAX", scalar("UPPER", vec![column("ID")])),
+        agg_over("SUM", column("ID")),
+    );
+
+    let typed = classify_typed_scalar_over_aggregate(&node, &probe_col_types())
+        .expect("a CONCAT over two aggregates must classify");
+
+    assert_eq!(
+        typed,
+        vec![
+            (
+                plan_of(&agg_over("MAX", scalar("UPPER", vec![column("ID")]))),
+                "VARCHAR(2000000)".to_string()
+            ),
+            (
+                plan_of(&agg_over("SUM", column("ID"))),
+                "DOUBLE PRECISION".to_string()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn typed_classify_declines_what_the_untyped_classify_declines() {
+    let residual = binary("ADD", agg("SUM", "X", false), column("Y"));
+
+    assert!(classify_typed_scalar_over_aggregate(&residual, &probe_col_types()).is_none());
+}
+
+#[test]
+fn nested_min_max_over_a_character_argument_takes_a_character_partial_type() {
+    let cases = [
+        (scalar("UPPER", vec![column("ID")]), "VARCHAR(2000000)"),
+        (
+            scalar(
+                "SUBSTR",
+                vec![
+                    column("C_VARCHAR"),
+                    serde_json::json!({"type": "literal_exactnumeric", "value": 1}),
+                ],
+            ),
+            "VARCHAR(2000000)",
+        ),
+        (
+            scalar("CONCAT", vec![column("ID"), string_literal("-")]),
+            "VARCHAR(2000000)",
+        ),
+        (
+            cast_to(
+                column("ID"),
+                serde_json::json!({"type": "VARCHAR", "size": 20}),
+            ),
+            "VARCHAR(20)",
+        ),
+        (
+            cast_to(column("ID"), serde_json::json!({"type": "CHAR", "size": 5})),
+            "CHAR(5)",
+        ),
+        (
+            scalar(
+                "CASE",
+                vec![
+                    predicate("predicate_equal", column("ID"), column("ID")),
+                    column("C_VARCHAR"),
+                ],
+            ),
+            "VARCHAR(2000000) UTF8",
+        ),
+        (
+            scalar("GREATEST", vec![column("C_CHAR"), column("C_VARCHAR")]),
+            "VARCHAR(2000000)",
+        ),
+        (
+            scalar("NULLIF", vec![column("C_CHAR"), string_literal("x")]),
+            "CHAR(3) ASCII",
+        ),
+        (
+            scalar(
+                "CASE",
+                vec![
+                    predicate("predicate_equal", column("ID"), column("ID")),
+                    column("ID"),
+                    column("C_VARCHAR"),
+                ],
+            ),
+            "VARCHAR(2000000) UTF8",
+        ),
+        (string_literal("a"), "VARCHAR(2000000)"),
+        (
+            scalar("LEAST", vec![column("C_CHAR"), column("C_CHAR")]),
+            "CHAR(3) ASCII",
+        ),
+    ];
+    for (arg, expected) in cases {
+        for kind in ["MAX", "MIN"] {
+            assert_eq!(
+                partial_type_of(agg_over(kind, arg.clone())),
+                expected,
+                "{kind} over {arg}"
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_min_max_over_a_temporal_or_boolean_argument_takes_that_partial_type() {
+    let date_type = serde_json::json!({"type": "DATE"});
+    let simple_case = serde_json::json!({
+        "type": "function_scalar_case",
+        "arguments": [{"type": "literal_bool", "value": true}],
+        "results": [column("C_TS"), {"type": "literal_null"}],
+    });
+    let cases = [
+        (cast_to(column("C_TS"), date_type), "DATE"),
+        (
+            scalar("DATE_TRUNC", vec![string_literal("month"), column("C_TS")]),
+            "TIMESTAMP(6)",
+        ),
+        (
+            scalar("TO_DATE", vec![column("C_VARCHAR"), string_literal("YYYY")]),
+            "DATE",
+        ),
+        (
+            scalar("TO_TIMESTAMP", vec![column("C_VARCHAR")]),
+            "TIMESTAMP",
+        ),
+        (scalar("TRUNC", vec![column("C_DATE")]), "DATE"),
+        (simple_case, "TIMESTAMP(6)"),
+        (
+            predicate("predicate_greater", column("ID"), column("ID")),
+            "BOOLEAN",
+        ),
+        (column("C_BOOL"), "BOOLEAN"),
+        (
+            serde_json::json!({"type": "literal_date", "value": "2024-01-01"}),
+            "DATE",
+        ),
+        (
+            serde_json::json!({"type": "literal_timestamp", "value": "2024-01-01 00:00:00"}),
+            "TIMESTAMP",
+        ),
+        (
+            serde_json::json!({"type": "literal_bool", "value": true}),
+            "BOOLEAN",
+        ),
+        (
+            scalar(
+                "REGEXP_LIKE",
+                vec![column("C_VARCHAR"), string_literal("a")],
+            ),
+            "BOOLEAN",
+        ),
+        (scalar("ROUND", vec![column("C_TS")]), "TIMESTAMP(6)"),
+    ];
+    for (arg, expected) in cases {
+        assert_eq!(
+            partial_type_of(agg_over("MAX", arg.clone())),
+            expected,
+            "MAX over {arg}"
+        );
+    }
+}
+
+#[test]
+fn nested_aggregate_keeps_the_numeric_default_when_its_argument_is_numeric_or_untyped() {
+    let numeric_default = NESTED_AGGREGATE_PLAN_TYPE;
+    let cases = [
+        agg_over("MAX", binary("ADD", column("ID"), column("ID"))),
+        agg_over("MIN", scalar("ROUND", vec![column("C_DOUBLE")])),
+        agg_over("MAX", scalar("LENGTH", vec![column("C_VARCHAR")])),
+        agg_over(
+            "MAX",
+            cast_to(
+                column("C_VARCHAR"),
+                serde_json::json!({"type": "DECIMAL", "precision": 9, "scale": 2}),
+            ),
+        ),
+        agg_over("MAX", column("UNKNOWN_COLUMN")),
+        agg_over("MAX", scalar("ABS", vec![column("UNKNOWN_COLUMN")])),
+        agg_over("SUM", scalar("UPPER", vec![column("ID")])),
+        agg_over("AVG", column("C_DATE")),
+        agg_over("MAX", column("C_TSTZ")),
+        agg_over(
+            "MAX",
+            scalar("GREATEST", vec![column("C_DATE"), column("C_TS")]),
+        ),
+    ];
+    for aggregate in cases {
+        assert_eq!(
+            partial_type_of(aggregate.clone()),
+            numeric_default,
+            "{aggregate}"
+        );
+    }
+}
+
+#[test]
+fn fold_nested_types_a_new_slot_with_its_partial_type() {
+    let mut plans = Vec::new();
+    let mut types = Vec::new();
+
+    fold_nested_aggregate_plan(
+        &mut plans,
+        &mut types,
+        plan_of(&agg("MAX", "X", false)),
+        "VARCHAR(2000000)".to_string(),
+    );
+
+    assert_eq!(plans.len(), 1);
+    assert_eq!(types, vec!["VARCHAR(2000000)".to_string()]);
+}
+
+#[test]
+fn fold_nested_never_overwrites_an_existing_slot_type() {
+    let mut plans = Vec::new();
+    let mut types = Vec::new();
+    fold_aggregate_plan(
+        &mut plans,
+        &mut types,
+        plan_of(&agg("MAX", "X", false)),
+        Some("VARCHAR(20)".to_string()),
+    );
+
+    fold_nested_aggregate_plan(
+        &mut plans,
+        &mut types,
+        plan_of(&agg("MAX", "X", false)),
+        "VARCHAR(2000000)".to_string(),
+    );
+
+    assert_eq!(plans.len(), 1);
+    assert_eq!(
+        types,
+        vec!["VARCHAR(20)".to_string()],
+        "a declared type from a top-level occurrence must win"
+    );
+}
