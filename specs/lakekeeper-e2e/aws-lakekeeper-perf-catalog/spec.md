@@ -5,7 +5,7 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
 ## Background
 
 * The engine already supports Lakekeeper: Iceberg REST plus OAuth2 client-credentials, documented in
-  `docs/catalogs.md` § "Lakekeeper (OIDC via Keycloak + MinIO)" and exercised by
+  `docs/catalogs.md` § "Lakekeeper (OIDC via Keycloak + SeaweedFS)" and exercised by
   `lakekeeper-e2e/lakekeeper-e2e-harness` against a local Docker stack. This feature adds **no** engine,
   adapter, catalog-crate, CONNECTION-field, or virtual-schema-property change, and adds no Rust code
   of any kind. It is deployment, provisioning, and bench wiring only.
@@ -97,7 +97,7 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
   within a warehouse, and an upstream issue reports `LocationAlreadyTaken` when one table's location
   is a non-slash-delimited prefix of another's — TPC-H's `part` and `partsupp` are exactly that shape.
   A live run settled it with the production location shape rather than a synthetic one. That run's
-  conditions were: Lakekeeper 0.13.1, the local Docker stack, MinIO as the object store — therefore
+  conditions were: Lakekeeper 0.13.1, the local Docker stack, SeaweedFS as the object store — therefore
   the S3-COMPATIBILITY storage flavor with path-style addressing — and the registration order `part`
   then `partsupp`. An Iceberg REST catalog derived `s3://warehouse/tpch_src/part` and
   `s3://warehouse/tpch_src/partsupp` from its own default location rule, a Lakekeeper warehouse was
@@ -131,7 +131,7 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
   `<project>-<env>-lakekeeper` prefix and carrying the same `exa:*` default-tag block every other
   stack in `deploy/` applies
 * *AND* the instance SHALL run four containers from its user-data — PostgreSQL, Keycloak, a run-once
-  Lakekeeper `migrate`, and Lakekeeper `serve` — reading the `data-stack` S3 bucket rather than MinIO
+  Lakekeeper `migrate`, and Lakekeeper `serve` — reading the `data-stack` S3 bucket rather than SeaweedFS
 * *AND* the security group SHALL admit SSH from the operator allowlist ONLY, and SHALL admit the
   Lakekeeper port and the Keycloak port from the operator allowlist AND the VPC CIDR, because the
   Exasol UDF connects from the cluster nodes rather than from the operator's machine
@@ -388,7 +388,7 @@ Adds an opt-in, ephemeral Lakekeeper Iceberg REST catalog to the AWS perf-test e
   data and metadata files, because that is the AWS ordering — the TPC-H data is loaded long before this
   warehouse exists. Only the probe object's own random path is required to be empty after validation;
   the warehouse prefix itself is not. Verified live under these conditions: Lakekeeper 0.13.1, the
-  local Docker stack, MinIO as the object store — therefore the S3-COMPATIBILITY flavor with path-style
+  local Docker stack, SeaweedFS as the object store — therefore the S3-COMPATIBILITY flavor with path-style
   addressing. Creating a warehouse whose key prefix already held two Iceberg tables' data and metadata
   answered HTTP `201`. The AWS S3 flavor with virtual-hosted addressing is NOT covered by that run and
   is first exercised on the real AWS box

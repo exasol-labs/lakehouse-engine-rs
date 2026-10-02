@@ -14,14 +14,7 @@ fi
 
 make cross-udf-build
 
-docker compose up -d minio-init
-init_exit=$(docker wait "$(docker compose ps -q minio-init)")
-if [ "$init_exit" != "0" ]; then
-  echo "minio-init exited $init_exit (bucket creation failed)" >&2
-  docker compose logs minio-init
-  exit 1
-fi
-docker compose up -d --wait exasol minio iceberg-rest
+docker compose up -d --wait exasol seaweedfs iceberg-rest
 
 CAPTURE_SQL="$1" cargo test --features exasol-e2e --test e2e_capture_pushdown \
   -- --nocapture --test-threads=1 capture_pushdown_payload

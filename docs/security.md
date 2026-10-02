@@ -38,13 +38,15 @@ A reader with only `SELECT` on the virtual schema still sees, in the plan text: 
 
 A vended credential has no CONNECTION name to reference. It travels as AES-256-GCM ciphertext (HKDF-SHA256 key from the CONNECTION password, fresh 96-bit nonce). Vending without key material is refused at plan time.
 
+An assumed-role CONNECTION's session credentials travel sealed in the same envelope, like vended ones. The base key pair that signs `AssumeRole` never enters the scan spec.
+
 ## AWS Glue credentials and Lake Formation
 
-The Glue kind (`CATALOG_KIND = 'GLUE'`) reads with the static IAM credentials of the CONNECTION. The same `access_key`, `secret_key`, and optional `session_token` sign the Glue requests and read S3. The adapter reads no credential from the environment, a profile file, or instance metadata. The scan spec carries the CONNECTION name, never a credential value.
+The Glue kind (`CATALOG_KIND = 'GLUE'`) reads with the IAM credentials of the CONNECTION. The same `access_key`, `secret_key`, and optional `session_token` sign the Glue requests and read S3. When the CONNECTION names `aws_assume_role_arn`, the role's session replaces them for both, and the scan spec carries the session sealed. The adapter reads no credential from the environment, a profile file, or instance metadata. Without a role, the scan spec carries the CONNECTION name, never a credential value.
 
-The adapter evaluates no Lake Formation grant. It uses no Lake Formation credential vending. The Glue kind rejects `use_vended_credentials`. A querying user sees every table, partition, and object that the IAM policy of the CONNECTION's credentials allows. Lake Formation column filters, row filters, and cell filters do not apply. Grant the credentials only the IAM actions that the [Glue section of Catalogs](catalogs.md#aws-glue-data-catalog-catalog_kind--glue) lists.
+The adapter evaluates no Lake Formation grant. It uses no Lake Formation credential vending. The Glue kind rejects `use_vended_credentials`. A querying user sees every table, partition, and object that the IAM policy of the CONNECTION's credentials, or of its assumed role, allows. Lake Formation column filters, row filters, and cell filters do not apply. Grant the credentials only the IAM actions that the [Glue section of Catalogs](catalogs.md#aws-glue-data-catalog-catalog_kind--glue) lists.
 
-A cross-account `CatalogId` and assume-role credentials are untested (#TBD).
+A `warehouse` that names another account's `CatalogId` is untested (#TBD). To read another account's catalog, assume a role in that account.
 
 ## Rotation
 

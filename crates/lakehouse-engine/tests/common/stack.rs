@@ -32,8 +32,8 @@ pub fn bucketfs_port() -> u16 {
     port_from_env("LH_BUCKETFS_PORT", 22581)
 }
 
-pub fn minio_port() -> u16 {
-    port_from_env("LH_MINIO_PORT", 19000)
+pub fn seaweedfs_port() -> u16 {
+    port_from_env("LH_SEAWEEDFS_PORT", 19000)
 }
 
 pub fn rest_port() -> u16 {
@@ -45,8 +45,9 @@ pub fn iceberg_catalog_url() -> String {
         .unwrap_or_else(|_| format!("http://localhost:{}", rest_port()))
 }
 
-pub fn minio_url() -> String {
-    std::env::var("MINIO_URL").unwrap_or_else(|_| format!("http://localhost:{}", minio_port()))
+pub fn seaweedfs_url() -> String {
+    std::env::var("SEAWEEDFS_URL")
+        .unwrap_or_else(|_| format!("http://localhost:{}", seaweedfs_port()))
 }
 
 /// The UDF runs inside the Exasol container, so it needs the in-network address, not the
@@ -56,9 +57,19 @@ pub fn iceberg_catalog_url_internal() -> String {
         .unwrap_or_else(|_| "http://iceberg-rest:8181".to_string())
 }
 
-pub fn minio_url_internal() -> String {
-    std::env::var("MINIO_URL_INTERNAL").unwrap_or_else(|_| "http://minio:9000".to_string())
+pub fn seaweedfs_url_internal() -> String {
+    std::env::var("SEAWEEDFS_URL_INTERNAL").unwrap_or_else(|_| "http://seaweedfs:8333".to_string())
 }
+
+// The assume-role identity, mirroring `seaweedfs-iam.json`: a base user with no S3 access
+// that the `LakehouseReader` role's trust policy admits. SeaweedFS does not evaluate
+// `sts:ExternalId`, so the external id (deliberately holding `+`, `=`, `/`, `:`, `@`) only
+// exercises the encoding path; its enforcement is covered by the cloud E2E.
+pub const ASSUME_ROLE_BASE_ACCESS_KEY: &str = "lhassumebase";
+pub const ASSUME_ROLE_BASE_SECRET_KEY: &str = "lhassumebasesecret123";
+pub const ASSUME_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/LakehouseReader";
+pub const ASSUME_ROLE_UNKNOWN_ARN: &str = "arn:aws:iam::000000000000:role/NoSuchRole";
+pub const ASSUME_ROLE_EXTERNAL_ID: &str = "lh+ext=id/2026:demo@example";
 
 /// Prefers `EXASOL_CONTAINER`, then the compose-labelled container publishing this
 /// stack's SQL port, then a directory-derived default.
@@ -157,8 +168,8 @@ pub fn wait_for_exasol() {
     }
 }
 
-pub fn wait_for_minio() {
-    let url = format!("{}/minio/health/live", minio_url());
+pub fn wait_for_seaweedfs() {
+    let url = format!("{}/status", seaweedfs_url());
     wait_for_url(&url, DEFAULT_TIMEOUT);
 }
 
@@ -239,7 +250,7 @@ pub fn lakehouse_engine_so_path() -> std::path::PathBuf {
         .join("target/release/liblakehouse_engine.so")
 }
 
-/// `path_style` defaults to `false`; MinIO callers must set it explicitly.
+/// `path_style` defaults to `false`; SeaweedFS callers must set it explicitly.
 #[derive(Default)]
 pub struct CatalogConnectionPassword {
     pub warehouse: String,
@@ -258,6 +269,12 @@ pub struct CatalogConnectionPassword {
     pub scope: Option<String>,
     pub account_name: Option<String>,
     pub account_key: Option<String>,
+    /// AWS IAM role to assume before signing catalog/storage requests. Absent when not supplied.
+    pub aws_assume_role_arn: Option<String>,
+    /// STS `ExternalId` for the assumed role. Requires `aws_assume_role_arn`. Absent when not supplied.
+    pub aws_external_id: Option<String>,
+    /// STS endpoint override (e.g. the local SeaweedFS STS). Requires `aws_assume_role_arn`. Absent when not supplied.
+    pub aws_sts_endpoint: Option<String>,
 }
 
 impl CatalogConnectionPassword {
@@ -297,6 +314,15 @@ impl CatalogConnectionPassword {
         if let Some(account_key) = &self.account_key {
             obj["account_key"] = serde_json::Value::String(account_key.clone());
         }
+        if let Some(role_arn) = &self.aws_assume_role_arn {
+            obj["aws_assume_role_arn"] = serde_json::Value::String(role_arn.clone());
+        }
+        if let Some(external_id) = &self.aws_external_id {
+            obj["aws_external_id"] = serde_json::Value::String(external_id.clone());
+        }
+        if let Some(sts_endpoint) = &self.aws_sts_endpoint {
+            obj["aws_sts_endpoint"] = serde_json::Value::String(sts_endpoint.clone());
+        }
         obj.to_string().replace('\'', "''")
     }
 }
@@ -323,10 +349,10 @@ pub fn build_create_connection_sql(
 pub fn local_stack_connection_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
         warehouse: "s3://warehouse/".to_string(),
-        endpoint: minio_url_internal(),
+        endpoint: seaweedfs_url_internal(),
         region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
+        access_key: "lhadmin".to_string(),
+        secret_key: "lhadminsecret123".to_string(),
         session_token: None,
         path_style: true,
         use_sigv4: false,
@@ -350,10 +376,10 @@ mod catalog_connection_password_tests {
     fn base_password() -> CatalogConnectionPassword {
         CatalogConnectionPassword {
             warehouse: "s3://warehouse/".to_string(),
-            endpoint: "http://minio:9000".to_string(),
+            endpoint: "http://seaweedfs:8333".to_string(),
             region: "us-east-1".to_string(),
-            access_key: "minioadmin".to_string(),
-            secret_key: "minioadmin".to_string(),
+            access_key: "lhadmin".to_string(),
+            secret_key: "lhadminsecret123".to_string(),
             path_style: true,
             ..Default::default()
         }
@@ -371,6 +397,9 @@ mod catalog_connection_password_tests {
             "scope",
             "account_name",
             "account_key",
+            "aws_assume_role_arn",
+            "aws_external_id",
+            "aws_sts_endpoint",
         ] {
             assert!(
                 parsed.get(key).is_none(),
@@ -418,5 +447,25 @@ mod catalog_connection_password_tests {
         let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(parsed["account_name"], "mystorageacct");
         assert_eq!(parsed["account_key"], "base64-encoded-key");
+    }
+
+    #[test]
+    fn serializes_assume_role_fields_when_present() {
+        let password = CatalogConnectionPassword {
+            aws_assume_role_arn: Some(
+                "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo".to_string(),
+            ),
+            aws_external_id: Some("lh+ext=id/2026:demo@example".to_string()),
+            aws_sts_endpoint: Some("http://seaweedfs:8333".to_string()),
+            ..base_password()
+        };
+        let json_str = password.to_sql_password_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            parsed["aws_assume_role_arn"],
+            "arn:aws:iam::123456789012:role/lakehouse-assume-role-demo"
+        );
+        assert_eq!(parsed["aws_external_id"], "lh+ext=id/2026:demo@example");
+        assert_eq!(parsed["aws_sts_endpoint"], "http://seaweedfs:8333");
     }
 }

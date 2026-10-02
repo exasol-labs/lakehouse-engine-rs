@@ -25,7 +25,7 @@ column to Exasol.
 
 ### Scenario: SUM over a scalar expression argument is pushed down
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a query whose select list is a supported aggregate over a renderable scalar expression, e.g. `SELECT SUM(LENGTH(L_COMMENT)) FROM {vs_table}`
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL render the aggregate's argument expression to a DataFusion SQL fragment via the VS expression translator and carry that fragment (not a bare column identifier) in the aggregate plan
@@ -56,7 +56,7 @@ column to Exasol.
 
 ### Scenario: SUM over a two-column binary-arithmetic argument is pushed down
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a query whose select list is `SUM(col_a OP col_b)` where `OP` is one of `*`, `+`, `-`, `/` and `col_a`, `col_b` are two table columns of compatible numeric types, e.g. `SELECT SUM(L_EXTENDEDPRICE * L_DISCOUNT) AS revenue FROM {vs_table} WHERE L_SHIPDATE >= DATE '1994-01-01' AND L_SHIPDATE < DATE '1995-01-01' AND L_DISCOUNT BETWEEN 0.05 AND 0.07 AND L_QUANTITY < 24`
 * *WHEN* Exasol sends the corresponding `pushdown` request, carrying the binary-arithmetic expression as the aggregate's argument node
 * *THEN* the adapter SHALL render the two-column binary-arithmetic argument to a DataFusion SQL fragment via the VS expression translator and carry that fragment in the aggregate plan, exactly as for a single-column expression argument

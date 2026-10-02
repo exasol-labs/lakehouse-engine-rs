@@ -48,6 +48,7 @@ fn reexported_paths_resolve_to_the_catalog_crate_types() {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     };
     accepts_catalog_crate_connection_creds(creds);
 

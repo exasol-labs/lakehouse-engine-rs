@@ -95,6 +95,7 @@ fn validate_creds(
 ) -> Result<(), UdfError> {
     validate_kind_preconditions(name, creds, kind, address)?;
     validate_azure_storage_creds(name, creds)?;
+    validate_assume_role_creds(name, creds)?;
     validate_sigv4_creds(name, creds, address)?;
     validate_exclusive_catalog_auth_creds(name, creds)?;
     validate_oauth2_creds(name, creds)?;
@@ -245,6 +246,46 @@ fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(
         )));
     }
     Ok(())
+}
+
+/// Runs before the SigV4 check so a role CONNECTION missing its key pair is told
+/// that the role needs it, not only that SigV4 does.
+fn validate_assume_role_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    if creds.assume_role_arn().is_none() {
+        let orphaned = flagged_fields(&[
+            ("aws_external_id", creds.aws_external_id.is_some()),
+            ("aws_sts_endpoint", creds.aws_sts_endpoint.is_some()),
+        ]);
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies field(s) {} without aws_assume_role_arn; they \
+             configure AWS IAM role assumption, so each requires aws_assume_role_arn",
+            orphaned.join(", ")
+        )));
+    }
+    let missing = flagged_fields(&[
+        ("access_key", creds.access_key.is_empty()),
+        ("secret_key", creds.secret_key.is_empty()),
+    ]);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(UdfError::User(format!(
+        "CONNECTION '{name}' names aws_assume_role_arn but is missing field(s) {}; the \
+         role is assumed with the CONNECTION's own access_key and secret_key, and no \
+         ambient AWS credential, such as an environment variable or an instance \
+         profile, is read",
+        missing.join(", ")
+    )))
+}
+
+fn flagged_fields<'a>(flags: &[(&'a str, bool)]) -> Vec<&'a str> {
+    flags
+        .iter()
+        .filter_map(|&(field, flag)| flag.then_some(field))
+        .collect()
 }
 
 fn validate_sigv4_creds(
@@ -399,6 +440,9 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
         account_name,
         account_key,
         sas_token,
+        aws_assume_role_arn: nonempty_str(json, "aws_assume_role_arn").map(|s| s.to_string()),
+        aws_external_id: nonempty_str(json, "aws_external_id").map(|s| s.to_string()),
+        aws_sts_endpoint: nonempty_str(json, "aws_sts_endpoint").map(|s| s.to_string()),
     }
 }
 

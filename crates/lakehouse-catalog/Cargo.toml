@@ -28,5 +28,8 @@ aws-sdk-glue           = { workspace = true }
 
 reqwest = { workspace = true }
 
+# AWS STS AssumeRole.
+aws-sdk-sts = { workspace = true }
+
 [dev-dependencies]
 tokio = { workspace = true }

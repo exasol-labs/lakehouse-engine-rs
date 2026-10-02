@@ -1,4 +1,4 @@
-//! `CATALOG_KIND = 'DIRECT_STORAGE'`: a plain directory of Parquet files on MinIO,
+//! `CATALOG_KIND = 'DIRECT_STORAGE'`: a plain directory of Parquet files on SeaweedFS,
 //! queried with no catalog service. FAILS (never skips) when the stack is unreachable.
 #![cfg(feature = "exasol-e2e")]
 
@@ -22,7 +22,7 @@ use common::seed::{
     struct_binary_values, text_values, time64_values,
 };
 use common::stack::{
-    CatalogConnectionPassword, minio_url_internal, wait_for_exasol, wait_for_minio,
+    CatalogConnectionPassword, seaweedfs_url_internal, wait_for_exasol, wait_for_seaweedfs,
 };
 
 use lakehouse_engine::scan::spec::StorageBackend;
@@ -74,10 +74,10 @@ const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
 /// No `warehouse`: the direct-storage kind rejects that field.
 fn direct_storage_password() -> CatalogConnectionPassword {
     CatalogConnectionPassword {
-        endpoint: minio_url_internal(),
+        endpoint: seaweedfs_url_internal(),
         region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
+        access_key: "lhadmin".to_string(),
+        secret_key: "lhadminsecret123".to_string(),
         path_style: true,
         ..Default::default()
     }
@@ -118,7 +118,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
 
         write_all_fixtures();
 
@@ -883,7 +883,7 @@ fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
         .with_allow_http(storage.allow_http)
         .with_virtual_hosted_style_request(!storage.path_style)
         .build()
-        .expect("configure MinIO object store for the fixture-shape guard");
+        .expect("configure SeaweedFS object store for the fixture-shape guard");
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -1222,7 +1222,7 @@ fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
     let msg = rejection_message(&resp, "the incompatible pair");
     assert_mentions(msg, &["X", "file1.parquet", "file2.parquet"]);
     assert!(
-        !msg.contains("minioadmin"),
+        !msg.contains("lhadminsecret123"),
         "error must not leak credential values: {msg}"
     );
 }
@@ -1269,7 +1269,7 @@ fn merge_schema_false_declares_the_narrow_sampled_type_and_refuses_a_wider_file_
         ],
     );
     assert!(
-        !msg.contains("minioadmin"),
+        !msg.contains("lhadminsecret123"),
         "error must not leak credential values: {msg}"
     );
 }
@@ -1748,7 +1748,7 @@ fn partition_key_collision_with_a_missing_segment_fails_the_refresh() {
         ],
     );
     assert!(
-        !msg.contains("minioadmin"),
+        !msg.contains("lhadminsecret123"),
         "error must not leak credential values: {msg}"
     );
 

@@ -1,4 +1,4 @@
-//! Iceberg REST and Unity Catalog access for the lakehouse engine.
+//! Iceberg REST and Unity Catalog access for the lakehouse engine, including AWS STS role assumption.
 
 mod auth;
 mod client;
@@ -10,6 +10,7 @@ mod redaction;
 mod session;
 mod sigv4;
 mod storage;
+mod sts;
 mod unity;
 mod vended;
 
@@ -30,6 +31,7 @@ pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{CatalogSession, load_table_any_auth};
 pub use storage::{AdlsCred, StaticStoreAddress, StorageBackend, scheme_of};
+pub use sts::resolve_aws_identity;
 
 pub use vended::resolve_vended_storage;
 

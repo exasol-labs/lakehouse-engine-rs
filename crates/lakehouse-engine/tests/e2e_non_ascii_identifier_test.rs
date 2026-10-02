@@ -9,7 +9,7 @@ use common::seed::{
     NONASCII_VALUES, seed_non_ascii_identifier,
 };
 use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
+    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 
 const VS_NAME: &str = "STRASSE_VS";
@@ -19,7 +19,7 @@ const SERVED_NAME: &str = "STRASSE";
 #[test]
 fn non_ascii_table_and_column_stay_queryable() {
     wait_for_exasol();
-    wait_for_minio();
+    wait_for_seaweedfs();
     wait_for_iceberg_catalog();
 
     let rt = tokio::runtime::Builder::new_current_thread()

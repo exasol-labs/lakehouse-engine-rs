@@ -8,7 +8,7 @@ mod common;
 use common::e2e_harness::*;
 use common::seed::{E2E_NAMESPACE, E2E_TYPED_TABLE, seed_typed_distinct_probe};
 use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
+    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 
 const VS_NAME: &str = "MY_LAKEHOUSE";
@@ -20,7 +20,7 @@ fn capture_pushdown_payload() {
     );
 
     wait_for_exasol();
-    wait_for_minio();
+    wait_for_seaweedfs();
     wait_for_iceberg_catalog();
 
     let rt = tokio::runtime::Builder::new_current_thread()

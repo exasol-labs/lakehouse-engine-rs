@@ -6,7 +6,7 @@ use super::seed::{E2E_DIM_TABLE, E2E_FACT_TABLE};
 use super::stack::{
     CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
     exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
-    lakehouse_engine_so_path, local_stack_connection_password, minio_url, upload_to_bucketfs,
+    lakehouse_engine_so_path, local_stack_connection_password, seaweedfs_url, upload_to_bucketfs,
 };
 
 use lakehouse_catalog::CatalogSession;
@@ -355,10 +355,10 @@ pub fn parse_int(v: &serde_json::Value) -> i64 {
 pub fn local_stack_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "s3://warehouse/".to_string(),
-        endpoint: minio_url(),
+        endpoint: seaweedfs_url(),
         region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
+        access_key: "lhadmin".to_string(),
+        secret_key: "lhadminsecret123".to_string(),
         session_token: None,
         path_style: Some(true),
         use_sigv4: false,
@@ -371,15 +371,16 @@ pub fn local_stack_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
 
 pub fn local_stack_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
-        endpoint: minio_url(),
+        endpoint: seaweedfs_url(),
         region: "us-east-1".to_string(),
-        access_key: "minioadmin".to_string(),
-        secret_key: "minioadmin".to_string(),
+        access_key: "lhadmin".to_string(),
+        secret_key: "lhadminsecret123".to_string(),
         allow_http: true,
         ..Default::default()
     })
@@ -397,7 +398,7 @@ pub fn split_s3_bucket_and_key(uri: &str) -> (&str, &str) {
 
 pub fn local_stack_s3_store(bucket: &str) -> object_store::aws::AmazonS3 {
     let StorageBackend::S3(storage) = local_stack_storage() else {
-        panic!("local_stack_storage() must be S3 to build a MinIO object store")
+        panic!("local_stack_storage() must be S3 to build a SeaweedFS object store")
     };
     object_store::aws::AmazonS3Builder::new()
         .with_bucket_name(bucket)
@@ -408,7 +409,7 @@ pub fn local_stack_s3_store(bucket: &str) -> object_store::aws::AmazonS3 {
         .with_allow_http(storage.allow_http)
         .with_virtual_hosted_style_request(!storage.path_style)
         .build()
-        .unwrap_or_else(|e| panic!("configure MinIO object store for bucket '{bucket}': {e}"))
+        .unwrap_or_else(|e| panic!("configure SeaweedFS object store for bucket '{bucket}': {e}"))
 }
 
 pub fn local_stack_catalog(table: &str) -> CatalogProps {

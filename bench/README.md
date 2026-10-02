@@ -14,7 +14,7 @@ make bench                  # build .so → run → write bench/reports/<ts>.txt
 Config comes from a gitignored `bench/.env` (copy `bench/.env.example`).
 `BENCH_TARGET` picks the mode:
 
-- **`docker` (default)** — self-contained. Brings up the local stack (MinIO +
+- **`docker` (default)** — self-contained. Brings up the local stack (SeaweedFS +
   Iceberg REST + Exasol via `docker-compose.yml`), loads TPC-H into the local
   catalog, runs the query set + pushdown checks. No AWS; `.env` optional.
 - **`remote`** — runs against a real AWS catalog (Glue by default, or
@@ -222,7 +222,7 @@ script, translated from `run.sh`'s Q1-Q9b and NQ1-NQ5 — keep all four in sync 
 Two host-runnable micro-benchmarks isolate the two halves of the per-instance
 scan path so end-to-end throughput can be attributed (plan tasks 5.1 / 5.2).
 They live in `crates/lakehouse-engine/tests/micro_bench.rs` (an `#[ignore]`-gated
-test target — no new dependency, no `criterion`) and need neither MinIO nor a
+test target — no new dependency, no `criterion`) and need neither SeaweedFS nor a
 cluster:
 
 - **5.1 emit-only** — the pre-SDK emit work on every batch: `coerce_batch_to_exa_types`

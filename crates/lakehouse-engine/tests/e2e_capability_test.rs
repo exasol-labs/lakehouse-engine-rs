@@ -14,7 +14,7 @@ use common::seed::{
     seed_typed_distinct_probe,
 };
 use common::stack::{
-    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_minio,
+    iceberg_catalog_url, wait_for_exasol, wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 use common::timestamp_precision::expected_timestamp_precision;
 
@@ -32,7 +32,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup_e2e() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         wait_for_iceberg_catalog();
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -3134,7 +3134,7 @@ fn e2e_both_dialects_unrenderable_predicate_errors_without_rows() {
     );
     let msg = resp["exception"]["text"].as_str().unwrap_or("");
     assert!(
-        !msg.contains("minioadmin"),
+        !msg.contains("lhadminsecret123"),
         "adapter error message must not leak storage credentials: {msg}"
     );
     assert!(

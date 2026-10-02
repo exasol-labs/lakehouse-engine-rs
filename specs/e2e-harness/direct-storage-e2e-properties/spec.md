@@ -1,6 +1,6 @@
 # Feature: Direct-Storage E2E Discovery and Properties
 
-Proves live, against Exasol and MinIO, that the direct-storage catalog kind discovers the right
+Proves live, against Exasol and SeaweedFS, that the direct-storage catalog kind discovers the right
 tables and reads its virtual-schema properties as specified. Proves that the kind rejects a
 malformed CONNECTION at `CREATE VIRTUAL SCHEMA` rather than at query time. Proves that the kind
 pushes down the same operations every other catalog kind pushes down.
@@ -42,7 +42,7 @@ pushes down the same operations every other catalog kind pushes down.
 * *AND* `EMPTY` and `HIDDEN_ONLY` SHALL be ABSENT from the served tables, and `CREATE VIRTUAL SCHEMA` SHALL still succeed, so a directory with no visible data file is skipped rather than fatal
 * *AND* no table SHALL be served for `notes.parquet`, so a loose data file under the base path names no table
 * *AND* a `SELECT` over `DEEP` SHALL return that file's rows with its `y=2026` segment as the partition column `Y`, because `HIVE_PARTITIONING` defaults to TRUE
-* *AND* the test MUST fail, not skip, when Exasol or MinIO is unavailable
+* *AND* the test MUST fail, not skip, when Exasol or SeaweedFS is unavailable
 
 ### Scenario: NAMESPACE scopes discovery to a subtree of the CONNECTION address
 
@@ -55,7 +55,7 @@ pushes down the same operations every other catalog kind pushes down.
 
 ### Scenario: A CONNECTION the direct-storage kind cannot accept is rejected at create time
 
-* *GIVEN* a set of CONNECTION objects over the same reachable MinIO endpoint, one carrying a `warehouse` field, one carrying a catalog `token`, one whose address uses the `abfs` scheme while the password carries S3 credentials, one whose address is empty, and one whose password carries Azure credentials while the address uses the `s3` scheme
+* *GIVEN* a set of CONNECTION objects over the same reachable SeaweedFS endpoint, one carrying a `warehouse` field, one carrying a catalog `token`, one whose address uses the `abfs` scheme while the password carries S3 credentials, one whose address is empty, and one whose password carries Azure credentials while the address uses the `s3` scheme
 * *WHEN* an Exasol user runs `CREATE VIRTUAL SCHEMA` with the direct-storage `CATALOG_KIND` against each
 * *THEN* EVERY statement SHALL FAIL at `CREATE VIRTUAL SCHEMA`, not at query time, each with an error naming the offending field or the scheme mismatch
 * *AND* the `abfs` error SHALL name `abfss` as the accepted spelling, so an operator who mistyped the scheme is told the fix

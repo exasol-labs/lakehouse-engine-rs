@@ -1,5 +1,5 @@
 //! E2E tests against a Lakekeeper Iceberg REST catalog, OpenID-secured via
-//! Keycloak and backed by the base stack's MinIO.
+//! Keycloak and backed by the base stack's SeaweedFS.
 //!
 //! Tests share one Exasol with two virtual schemas, so they must run serially
 //! (`--test-threads=1`). They FAIL (never skip) when the stack is unavailable.
@@ -27,7 +27,7 @@ use common::seed::{
 };
 use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
-    wait_for_exasol, wait_for_minio, wait_for_url,
+    wait_for_exasol, wait_for_seaweedfs, wait_for_url,
 };
 
 use futures::TryStreamExt;
@@ -66,7 +66,7 @@ static SETUP_DONE: OnceLock<()> = OnceLock::new();
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
-        wait_for_minio();
+        wait_for_seaweedfs();
         lakekeeper::wait_for_keycloak();
         lakekeeper::wait_for_lakekeeper();
 
@@ -514,7 +514,7 @@ async fn probe_vended_credential(
     )
     .unwrap_or_else(|e| panic!("resolve_vended_storage for {table} ({location}) failed: {e}"));
     let StorageBackend::S3(props) = backend else {
-        panic!("this fixture is MinIO (s3://): {table} ({location}) vended a non-S3 backend");
+        panic!("this fixture is SeaweedFS (s3://): {table} ({location}) vended a non-S3 backend");
     };
 
     assert!(
@@ -535,14 +535,14 @@ async fn probe_vended_credential(
     }
 }
 
-/// Uses the host-mapped MinIO URL: the vended `s3.endpoint` is a Docker-network
+/// Uses the host-mapped SeaweedFS URL: the vended `s3.endpoint` is a Docker-network
 /// address the test process cannot reach.
 fn s3_client_as(probe: &VendedProbe, bucket: &str) -> AmazonS3 {
     let mut builder = AmazonS3Builder::new()
         .with_bucket_name(bucket)
         .with_access_key_id(&probe.access_key)
         .with_secret_access_key(&probe.secret_key)
-        .with_endpoint(stack::minio_url())
+        .with_endpoint(stack::seaweedfs_url())
         .with_allow_http(true)
         .with_virtual_hosted_style_request(false);
     if !probe.region.is_empty() {
@@ -553,7 +553,7 @@ fn s3_client_as(probe: &VendedProbe, bucket: &str) -> AmazonS3 {
     }
     builder
         .build()
-        .unwrap_or_else(|e| panic!("configure a MinIO S3 client for bucket {bucket}: {e}"))
+        .unwrap_or_else(|e| panic!("configure a SeaweedFS S3 client for bucket {bucket}: {e}"))
 }
 
 async fn first_parquet_under(

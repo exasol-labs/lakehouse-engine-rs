@@ -42,7 +42,7 @@ keys.
 
 ### Scenario: Multi-column GROUP BY is pushed down as partial aggregation rather than a raw row scan
 
-* *GIVEN* a virtual schema over an Iceberg table backed by MinIO
+* *GIVEN* a virtual schema over an Iceberg table backed by SeaweedFS
 * *AND* a query grouping by two or more plain columns with a supported aggregate (e.g. `SELECT L_SHIPYEAR, L_RETURNFLAG, SUM(L_QUANTITY) FROM {vs_table} GROUP BY L_SHIPYEAR, L_RETURNFLAG`)
 * *WHEN* Exasol sends the corresponding `pushdown` request with `aggregationType: "group_by"` and a `groupBy` array of length ≥ 2
 * *THEN* the adapter SHALL detect the grouped aggregate, render every group-key element, and build a grouped scan spec carrying all group keys (`GK_0..GK_{n-1}`) and the aggregate plans, exactly as it does for a single-key GROUP BY

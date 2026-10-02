@@ -55,7 +55,7 @@ fn lakekeeper_catalog_url_host() -> String {
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
-/// MinIO is deliberately not awaited: this suite's storage is Azure.
+/// SeaweedFS is deliberately not awaited: this suite's storage is Azure.
 fn setup() {
     SETUP_DONE.get_or_init(|| {
         wait_for_exasol();
