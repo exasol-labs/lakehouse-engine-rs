@@ -3,8 +3,8 @@ use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::tests::parquet_fixture::{
     directory_options, in_memory_store, nullable, parquet_bytes,
 };
+use crate::adapter::tests::recording_store::RecordingStore;
 use arrow::datatypes::{Field, Fields};
-use object_store::PutPayload;
 use object_store::memory::InMemory;
 
 const FOLD_NO_HIVE: DirectoryOptions = DirectoryOptions {
@@ -31,122 +31,6 @@ async fn id_files_at(keys: &[&str]) -> Arc<InMemory> {
     let data = id_file();
     let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data.as_slice())).collect();
     in_memory_store(&objects).await
-}
-
-/// An [`ObjectStore`] decorator recording every `list`/`list_with_delimiter` prefix and `get`
-/// location, so a test can confirm every table reached the SAME store and which footers were read.
-#[derive(Debug)]
-struct RecordingStore {
-    inner: Arc<dyn ObjectStore>,
-    prefixes: std::sync::Mutex<Vec<String>>,
-    fetched: std::sync::Mutex<Vec<String>>,
-}
-
-impl RecordingStore {
-    fn wrapping(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            prefixes: std::sync::Mutex::new(Vec::new()),
-            fetched: std::sync::Mutex::new(Vec::new()),
-        })
-    }
-
-    fn prefixes_seen(&self) -> Vec<String> {
-        self.prefixes
-            .lock()
-            .expect("read log is not poisoned")
-            .clone()
-    }
-
-    /// The DISTINCT object locations any `get` reached, sorted — a footer read costs a variable
-    /// number of ranged requests per file, so only the set of files opened is stable.
-    fn files_fetched(&self) -> Vec<String> {
-        let mut seen = self
-            .fetched
-            .lock()
-            .expect("read log is not poisoned")
-            .clone();
-        seen.sort();
-        seen.dedup();
-        seen
-    }
-
-    fn record(&self, prefix: Option<&StorePath>) {
-        self.prefixes
-            .lock()
-            .expect("read log is not poisoned")
-            .push(prefix.map(ToString::to_string).unwrap_or_default());
-    }
-}
-
-impl std::fmt::Display for RecordingStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "RecordingStore({})", self.inner)
-    }
-}
-
-#[async_trait::async_trait]
-impl ObjectStore for RecordingStore {
-    async fn put_opts(
-        &self,
-        location: &StorePath,
-        payload: PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &StorePath,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &StorePath,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        self.fetched
-            .lock()
-            .expect("read log is not poisoned")
-            .push(location.to_string());
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: futures::stream::BoxStream<'static, object_store::Result<StorePath>>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<StorePath>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&StorePath>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        self.record(prefix);
-        self.inner.list(prefix)
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&StorePath>,
-    ) -> object_store::Result<object_store::ListResult> {
-        self.record(prefix);
-        self.inner.list_with_delimiter(prefix).await
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &StorePath,
-        to: &StorePath,
-        options: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
 }
 
 #[test]
@@ -316,7 +200,7 @@ async fn one_admission_limited_store_serves_the_whole_call() {
     let listing = client.list_tables(&[]).await.expect("enumeration succeeds");
     assert_eq!(listing.tables.len(), 2);
 
-    let prefixes = recording.prefixes_seen();
+    let prefixes = recording.listed_prefixes();
     assert!(
         prefixes.iter().any(|p| p == "lake"),
         "the client's own top-level listing must reach the one recorded store: {prefixes:?}"
@@ -355,7 +239,7 @@ async fn new_derives_the_store_prefix_from_the_base_path() {
         "the base path's own subtree is what the client enumerates"
     );
 
-    let prefixes = recording.prefixes_seen();
+    let prefixes = recording.listed_prefixes();
     assert_eq!(
         prefixes.first().map(String::as_str),
         Some("lake/finance"),
@@ -383,7 +267,7 @@ async fn merge_mode_selects_every_footer_or_exactly_one() {
         assert_eq!(listing.tables.len(), 1, "{merge_mode:?}");
 
         assert_eq!(
-            recording.files_fetched(),
+            recording.files_read(),
             expected,
             "{merge_mode:?} must open exactly these footers"
         );

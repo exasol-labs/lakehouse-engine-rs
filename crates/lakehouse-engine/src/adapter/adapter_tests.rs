@@ -4,6 +4,8 @@ use std::sync::{Arc, Mutex};
 
 #[path = "parquet_fixture_tests.rs"]
 pub(super) mod parquet_fixture;
+#[path = "recording_store_tests.rs"]
+pub(super) mod recording_store;
 
 #[test]
 fn dispatch_get_capabilities() {
@@ -335,6 +337,17 @@ impl Default for super::TuningNotes {
     }
 }
 
+fn parsed_notes(
+    request: &Json,
+    tuning: &TuningNotes,
+    table_map: &[(String, String)],
+    skipped: &[SkippedTable],
+) -> Json {
+    let notes = build_adapter_notes(request, tuning, table_map, skipped);
+    serde_json::from_str(notes.as_str().expect("adapterNotes is a JSON string"))
+        .expect("adapterNotes is valid JSON")
+}
+
 #[test]
 fn build_adapter_notes_merges_existing() {
     let req = serde_json::json!({
@@ -343,9 +356,7 @@ fn build_adapter_notes_merges_existing() {
             "adapterNotes": "{\"OTHER_KEY\":\"keep-me\",\"CLUSTER_NODES\":\"1\"}"
         },
     });
-    let notes = build_adapter_notes(&req, &TuningNotes::default(), &[], &[]);
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+    let parsed = parsed_notes(&req, &TuningNotes::default(), &[], &[]);
     assert_eq!(
         parsed["OTHER_KEY"].as_str(),
         Some("keep-me"),
@@ -361,9 +372,7 @@ fn build_adapter_notes_merges_existing() {
 #[test]
 fn adapter_notes_omit_cluster_nodes() {
     let request = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(&request, &TuningNotes::default(), &[], &[]);
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &[], &[]);
     assert!(
         parsed.get("CLUSTER_NODES").is_none(),
         "a freshly built createVirtualSchema response must carry no CLUSTER_NODES key"
@@ -389,9 +398,7 @@ fn refresh_rebuilds_table_map_preserves_notes() {
     });
 
     let fresh_table_map = vec![("NEW_TABLE".to_string(), "ns.new_table".to_string())];
-    let notes = build_adapter_notes(&req, &TuningNotes::default(), &fresh_table_map, &[]);
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+    let parsed = parsed_notes(&req, &TuningNotes::default(), &fresh_table_map, &[]);
 
     assert_eq!(
         parsed["OTHER_KEY"].as_str(),
@@ -425,7 +432,7 @@ fn create_vs_records_parallelism_factor() {
     assert_eq!(factor, 4, "factor must be read from the property");
 
     let request = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
+    let parsed = parsed_notes(
         &request,
         &TuningNotes {
             parallelism_factor: factor,
@@ -434,9 +441,6 @@ fn create_vs_records_parallelism_factor() {
         &[],
         &[],
     );
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
     assert_eq!(
         parsed[NOTE_PARALLELISM_FACTOR].as_str(),
         Some("4"),
@@ -580,7 +584,7 @@ fn df_target_partitions_uses_supplied_value() {
     assert_eq!(val, 4, "explicit value must be returned");
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
+    let parsed = parsed_notes(
         &req,
         &TuningNotes {
             df_target_partitions: val,
@@ -589,8 +593,6 @@ fn df_target_partitions_uses_supplied_value() {
         &[],
         &[],
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert_eq!(
         parsed[NOTE_DF_TARGET_PARTITIONS].as_str(),
         Some("4"),
@@ -672,7 +674,7 @@ fn df_threads_per_udf_uses_supplied_value() {
     assert_eq!(val, 2, "explicit value must be returned");
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(
+    let parsed = parsed_notes(
         &req,
         &TuningNotes {
             df_threads_per_udf: val,
@@ -681,8 +683,6 @@ fn df_threads_per_udf_uses_supplied_value() {
         &[],
         &[],
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert_eq!(
         parsed[NOTE_DF_THREADS_PER_UDF].as_str(),
         Some("2"),
@@ -976,9 +976,7 @@ fn threading_mode_defaults_to_auto() {
     );
 
     let req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(&req, &TuningNotes::default(), &[], &[]);
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
+    let parsed = parsed_notes(&req, &TuningNotes::default(), &[], &[]);
     assert_eq!(
         parsed[NOTE_DF_THREADING_MODE].as_str(),
         Some("AUTO"),
@@ -1077,10 +1075,7 @@ fn table_map_round_trips_through_adapter_notes() {
 fn table_map_stored_as_nested_json_object() {
     let table_map = vec![("EVENTS".to_string(), "db.events".to_string())];
     let create_req = serde_json::json!({"type": "createVirtualSchema"});
-    let notes = build_adapter_notes(&create_req, &TuningNotes::default(), &table_map, &[]);
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
+    let parsed = parsed_notes(&create_req, &TuningNotes::default(), &table_map, &[]);
     assert!(
         parsed[NOTE_TABLE_MAP].is_object(),
         "TABLE_MAP must be a nested JSON object: {parsed}"
@@ -1100,14 +1095,12 @@ fn table_map_merges_with_existing_notes() {
             "adapterNotes": "{\"CLUSTER_NODES\":\"5\",\"OTHER\":\"preserved\"}"
         },
     });
-    let notes = build_adapter_notes(
+    let parsed = parsed_notes(
         &req,
         &TuningNotes::default(),
         &[("T".to_string(), "ns.t".to_string())],
         &[],
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes.as_str().unwrap()).expect("valid JSON");
     assert_eq!(parsed["OTHER"].as_str(), Some("preserved"));
     assert_eq!(
         parsed["CLUSTER_NODES"].as_str(),
@@ -1259,10 +1252,7 @@ fn create_vs_records_table_map_in_adapter_notes() {
             "adapterNotes": "{\"CLUSTER_NODES\":\"3\"}"
         }
     });
-    let notes = build_adapter_notes(&request, &TuningNotes::default(), &table_map, &[]);
-    let notes_str = notes.as_str().expect("adapterNotes is a JSON string");
-    let parsed: serde_json::Value =
-        serde_json::from_str(notes_str).expect("adapterNotes must be valid JSON");
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &table_map, &[]);
 
     let table_map_obj = parsed[NOTE_TABLE_MAP]
         .as_object()
@@ -1358,53 +1348,11 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
     );
 }
 
-#[test]
-fn skip_warning_renders_the_legacy_iceberg_line_and_the_unity_detail_line() {
-    assert_eq!(
-        skip_warning(&SkippedTable {
-            ident: cat_ident(&["prod", "finance"], "hive_events"),
-            reason: SkipReason::NotLoadableIcebergTable,
-        }),
-        "createVirtualSchema: skipping non-Iceberg table 'prod.finance.hive_events' (catalog reported it is not a loadable Iceberg table)"
-    );
-    assert_eq!(
-        skip_warning(&SkippedTable {
-            ident: cat_ident(&["prod", "finance"], "orders_summary"),
-            reason: SkipReason::NotDeltaBaseTable {
-                detail: "table_type=VIEW".to_string(),
-            },
-        }),
-        "createVirtualSchema: skipping non-Delta-base entry 'prod.finance.orders_summary' (table_type=VIEW)"
-    );
-}
-
-#[test]
-fn skip_warning_renders_the_glue_detail_line() {
-    assert_eq!(
-        skip_warning(&SkippedTable {
-            ident: cat_ident(&["sales"], "orders_orc"),
-            reason: SkipReason::NotPlannableGlueTable {
-                detail: "InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat".to_string(),
-            },
-        }),
-        "createVirtualSchema: skipping Glue table 'sales.orders_orc' (InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat)"
-    );
-}
-
 fn skipped_entry(table: &str, reason: SkipReason) -> SkippedTable {
     SkippedTable {
         ident: cat_ident(&["sales"], table),
         reason,
     }
-}
-
-fn notes_with_skipped(
-    request: &Json,
-    table_map: &[(String, String)],
-    skipped: &[SkippedTable],
-) -> Json {
-    let notes = build_adapter_notes(request, &TuningNotes::default(), table_map, skipped);
-    serde_json::from_str(notes.as_str().unwrap()).expect("adapterNotes is a JSON string")
 }
 
 /// Scenario: Every skipped table is recorded with its reason under every catalog kind
@@ -1433,27 +1381,37 @@ fn skipped_tables_are_recorded_with_reasons_for_every_kind() {
         ),
     ];
 
-    let parsed = notes_with_skipped(&json!({"type": "createVirtualSchema"}), &[], &skipped);
+    let parsed = parsed_notes(
+        &json!({"type": "createVirtualSchema"}),
+        &TuningNotes::default(),
+        &[],
+        &skipped,
+    );
 
     let recorded = parsed["SKIPPED_TABLES"].as_array().expect("an array");
     let expected = [
         (
             "sales.hive_events",
+            "non-Iceberg table",
             "catalog reported it is not a loadable Iceberg table",
         ),
-        ("sales.summary", "table_type=VIEW"),
-        ("sales.empty_dir", "holds no data file"),
+        ("sales.summary", "non-Delta-base entry", "table_type=VIEW"),
+        ("sales.empty_dir", "directory", "holds no data file"),
         (
             "sales.orders_orc",
+            "Glue table",
             "InputFormat=org.apache.hadoop.hive.ql.io.orc.OrcInputFormat",
         ),
-        ("sales.projected", "projection.enabled=true"),
+        ("sales.projected", "Glue table", "projection.enabled=true"),
     ];
     assert_eq!(recorded.len(), expected.len());
-    for ((table, reason), (entry, source)) in expected.iter().zip(recorded.iter().zip(&skipped)) {
+    for ((table, kind, reason), (entry, source)) in
+        expected.iter().zip(recorded.iter().zip(&skipped))
+    {
         assert_eq!(entry, &json!({"table": table, "reason": reason}));
-        assert!(
-            skip_warning(source).contains(&format!("({reason})")),
+        assert_eq!(
+            skip_warning(source),
+            format!("createVirtualSchema: skipping {kind} '{table}' ({reason})"),
             "the warning line must state the same reason as the note"
         );
     }
@@ -1477,7 +1435,7 @@ fn a_listing_without_skips_records_an_empty_list_replacing_the_previous() {
     });
     let table_map = vec![("FRESH".to_string(), "sales.fresh".to_string())];
 
-    let parsed = notes_with_skipped(&request, &table_map, &[]);
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &table_map, &[]);
 
     assert_eq!(parsed["SKIPPED_TABLES"], json!([]));
     assert_eq!(parsed["TABLE_MAP"], json!({"FRESH": "sales.fresh"}));
@@ -1500,8 +1458,9 @@ fn an_all_skipped_namespace_creates_an_empty_schema_recording_every_skip() {
         EngineTimestampSupport::MillisecondOnly,
     )
     .expect("an all-skipped namespace must not fail the listing");
-    let parsed = notes_with_skipped(
+    let parsed = parsed_notes(
         &json!({"type": "createVirtualSchema"}),
+        &TuningNotes::default(),
         &table_map,
         &skipped,
     );
@@ -1585,7 +1544,7 @@ fn a_skipped_list_that_fits_keeps_every_entry_and_drops_a_stale_omitted_count() 
     });
     let skipped = vec![skipped_entry("a", SkipReason::NoDataFile)];
 
-    let parsed = notes_with_skipped(&request, &[], &skipped);
+    let parsed = parsed_notes(&request, &TuningNotes::default(), &[], &skipped);
 
     assert_eq!(parsed["SKIPPED_TABLES"].as_array().unwrap().len(), 1);
     assert!(parsed.get("SKIPPED_TABLES_OMITTED").is_none());

@@ -7,12 +7,17 @@ use crate::adapter::pushdown::test_support::filter_json::{
     and, column, compare, equal, number, or,
 };
 use crate::adapter::pushdown::test_support::{
-    GlueEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, closed_port_storage,
-    glue_catalog_table, object_endpoint, sample_storage, unauthenticated_creds, user_message,
+    GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
+    UNREACHABLE_CATALOG, closed_port_storage, glue_catalog_table, object_endpoint, sample_storage,
+    sigv4_creds, unauthenticated_creds, user_message,
 };
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
+use crate::adapter::tests::recording_store::RecordingStore;
 use crate::scan::spec::reconstruct_abs_uri;
 use crate::scan::test_support::column_binding_for;
+use crate::tests::hive_type_cases::{
+    UNRECOGNIZED_HIVE_TYPES, binary_hive_types, nested_hive_types, primitive_hive_types,
+};
 use arrow::array::{BinaryArray, StringArray};
 use arrow::datatypes::{DataType as ArrowType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -20,20 +25,12 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
-use delta_kernel::schema::{ArrayType, DataType as DeltaType, MapType};
-use futures::stream::BoxStream;
+use delta_kernel::schema::DataType as DeltaType;
 use lakehouse_catalog::{
     CatalogColumn, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
     TableFormat, UnityCatalogSession,
 };
-use object_store::PutPayload;
-use object_store::memory::InMemory;
 use serde_json::json;
-use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
-
-/// A credential request here fails with a transport error, distinct from every asserted refusal.
-const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
 
 const TABLE_NAME: &str = "cat.sch.sales";
 
@@ -96,17 +93,16 @@ fn partitioned_table() -> CatalogTable {
     )
 }
 
-/// `keys` sit below the table prefix; `siblings` are full object keys.
-async fn served_storage(keys: &[&str], siblings: &[&str]) -> StorageBackend {
-    let under_table = keys.iter().map(|key| format!("{TABLE_PREFIX}/{key}"));
-    let objects = under_table.chain(siblings.iter().map(|key| key.to_string()));
-    object_endpoint(
-        "bucket",
-        objects
-            .map(|key| (key, UNREADABLE_BODY.to_string()))
-            .collect(),
-    )
-    .await
+/// Each key holds [`UNREADABLE_BODY`].
+async fn served_storage<K: ToString>(keys: impl IntoIterator<Item = K>) -> ObjectEndpoint {
+    let objects = keys
+        .into_iter()
+        .map(|key| (key.to_string(), UNREADABLE_BODY.to_string()));
+    ObjectEndpoint::spawn("bucket", objects.collect()).await
+}
+
+fn under_table<'k>(keys: &'k [&str]) -> impl Iterator<Item = String> + 'k {
+    keys.iter().map(|key| format!("{TABLE_PREFIX}/{key}"))
 }
 
 async fn resolve_with(
@@ -141,9 +137,14 @@ fn user_outcome(outcome: Result<ResolvedScan, UdfError>) -> Result<ResolvedScan,
 }
 
 async fn resolve(table: &CatalogTable, keys: &[&str]) -> ResolvedScan {
-    resolve_with(table, &served_storage(keys, &[]).await, false, None)
-        .await
-        .expect("the Unity Parquet table resolves")
+    resolve_with(
+        table,
+        &served_storage(under_table(keys)).await.storage,
+        false,
+        None,
+    )
+    .await
+    .expect("the Unity Parquet table resolves")
 }
 
 async fn refusal(table: &CatalogTable, storage: StorageBackend, vended: bool) -> String {
@@ -171,14 +172,16 @@ fn identity_bound(name: &str, arrow_type: &str) -> LogicalField {
 /// Scenario: A Unity Parquet table lists its files through the shared directory seam and reads no footer
 #[tokio::test]
 async fn files_are_listed_through_the_seam_and_no_footer_is_read() {
-    let under_table = [
+    let under_table_keys = [
         "part-0.parquet",
         "a/b/part-2.parquet",
         "_SUCCESS",
         "part-4.snappy",
     ];
     let sibling = format!("{TABLE_PREFIX}_archive/part-9.parquet");
-    let storage = served_storage(&under_table, &[sibling.as_str()]).await;
+    let storage = served_storage(under_table(&under_table_keys).chain([sibling]))
+        .await
+        .storage;
 
     let scan = resolve_with(&id_table(), &storage, false, None)
         .await
@@ -335,7 +338,7 @@ async fn a_partition_predicate_prunes_under_the_declared_type() {
         "year=2024/region=us/b.parquet",
         "year=2025/region=eu/c.parquet",
     ];
-    let storage = served_storage(&every_file, &[]).await;
+    let storage = served_storage(under_table(&every_file)).await.storage;
     let cases = [
         (equal("REGION", "eu"), vec![every_file[0], every_file[2]]),
         (
@@ -412,11 +415,11 @@ fn glue_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogTa
     }
 }
 
-fn delta_classification(columns: &[(&str, DeltaType)]) -> Vec<LogicalField> {
+fn delta_classification(columns: &[(String, DeltaType)]) -> Vec<LogicalField> {
     let schema = StructType::try_new(
         columns
             .iter()
-            .map(|(name, spark_type)| StructField::nullable(*name, spark_type.clone())),
+            .map(|(name, spark_type)| StructField::nullable(name, spark_type.clone())),
     )
     .expect("distinct column names");
     let (logical_schema, _, refused) =
@@ -426,158 +429,98 @@ fn delta_classification(columns: &[(&str, DeltaType)]) -> Vec<LogicalField> {
     logical_schema
 }
 
-fn decimal(precision: u8, scale: u8) -> DeltaType {
-    DeltaType::decimal(precision, scale).expect("a valid Spark decimal")
-}
-
 /// Scenario: Every Hive primitive type maps to its Spark type
+/// Scenario: Nested Hive types parse recursively and render as JSON text
+/// Scenario: A binary, unrecognized, or malformed Hive type refuses only its column
 #[test]
-fn glue_columns_are_classified_by_the_spark_type_classifier() {
-    // The parser's full type table is in `types/hive_type_tests.rs`; this proves the composition.
-    let columns = [
-        ("c_int", "int", DeltaType::INTEGER),
-        ("c_varchar", "varchar(10)", DeltaType::STRING),
-        ("c_timestamp", "timestamp", DeltaType::TIMESTAMP_NTZ),
-        ("c_decimal_10_2", "decimal(10,2)", decimal(10, 2)),
-        ("c_decimal_38_10", "DECIMAL( 38 , 10 )", decimal(38, 10)),
-    ];
-    let table = glue_table(&columns.clone().map(|(name, hive, _)| (name, hive)), &[]);
+fn glue_columns_are_classified_by_the_spark_type_classifier_and_refused_only_by_their_type() {
+    let typed: Vec<(String, &str, DeltaType)> = primitive_hive_types()
+        .map(|(hive_type, spark, _)| (hive_type, spark))
+        .into_iter()
+        .chain(nested_hive_types())
+        .enumerate()
+        .map(|(index, (hive_type, spark))| (format!("c{index}"), hive_type, spark))
+        .collect();
+    let refused_types: Vec<&str> = binary_hive_types()
+        .map(|(hive_type, _)| hive_type)
+        .into_iter()
+        .chain(UNRECOGNIZED_HIVE_TYPES)
+        .collect();
+    let refused_names: Vec<String> = (0..refused_types.len()).map(|i| format!("r{i}")).collect();
+    let columns: Vec<(&str, &str)> = typed
+        .iter()
+        .map(|(name, hive_type, _)| (name.as_str(), *hive_type))
+        .chain(
+            refused_names
+                .iter()
+                .map(String::as_str)
+                .zip(refused_types.clone()),
+        )
+        .collect();
 
-    let schema = catalog_schema(&table, "Glue").expect("every Hive primitive classifies");
+    let Ok(schema) = catalog_schema(&glue_table(&columns, &[]), "Glue") else {
+        panic!("a refused column never fails the table");
+    };
 
-    assert_eq!(
-        schema.logical_schema,
-        delta_classification(&columns.map(|(name, _, spark)| (name, spark)))
-    );
-    assert!(schema.refused_columns.is_empty());
+    let spark: Vec<(String, DeltaType)> = typed
+        .iter()
+        .map(|(name, _, spark)| (name.clone(), spark.clone()))
+        .collect();
+    assert_eq!(schema.logical_schema, delta_classification(&spark));
     assert!(
         schema.logical_schema.iter().all(|field| field.nullable
             && field.field_id.is_none()
             && field.physical_name.is_none())
     );
-    let tag = |name: &str| {
-        schema
-            .logical_schema
-            .iter()
-            .find(|field| field.name == name)
-            .map(|field| field.arrow_type.as_str())
+    let field_of = |hive_type: &str| {
+        let index = typed.iter().position(|(_, typed, _)| *typed == hive_type);
+        &schema.logical_schema[index.expect("a typed fixture column")]
     };
-    assert_eq!(tag("c_decimal_10_2"), Some("decimal128(10,2)"));
+    assert_eq!(field_of("decimal(10,2)").arrow_type, "decimal128(10,2)");
     assert_eq!(
-        tag("c_decimal_38_10"),
-        Some("utf8"),
+        field_of("DECIMAL( 38 , 10 )").arrow_type,
+        "utf8",
         "precision 38 is outside Exasol's DECIMAL domain"
     );
-}
+    for (hive_type, _) in nested_hive_types() {
+        let field = field_of(hive_type);
+        assert!(
+            field.arrow_type == "utf8" && field.nested.is_some(),
+            "{field:?}"
+        );
+    }
 
-/// Scenario: Nested Hive types parse recursively and render as JSON text
-#[test]
-fn glue_nested_columns_carry_the_string_tag_and_a_nested_descriptor() {
-    let nullable_struct = |fields: Vec<StructField>| {
-        DeltaType::Struct(Box::new(
-            StructType::try_new(fields).expect("distinct members"),
-        ))
-    };
-    let columns = [
-        (
-            "c_map",
-            "map<varchar(1),int>",
-            DeltaType::Map(Box::new(MapType::new(
-                DeltaType::STRING,
-                DeltaType::INTEGER,
-                true,
-            ))),
-        ),
-        (
-            "c_array_of_struct",
-            "array<struct<a:decimal(5,2)>>",
-            DeltaType::Array(Box::new(ArrayType::new(
-                nullable_struct(vec![StructField::nullable("a", decimal(5, 2))]),
-                true,
-            ))),
-        ),
-    ];
-    let table = glue_table(&columns.clone().map(|(name, hive, _)| (name, hive)), &[]);
-
-    let schema = catalog_schema(&table, "Glue").expect("every nested Hive type classifies");
-
-    assert_eq!(
-        schema.logical_schema,
-        delta_classification(&columns.map(|(name, _, spark)| (name, spark)))
-    );
-    assert!(
-        schema
-            .logical_schema
-            .iter()
-            .all(|field| field.arrow_type == "utf8" && field.nested.is_some()),
-        "{:?}",
-        schema.logical_schema
-    );
-}
-
-/// Scenario: A binary, unrecognized, or malformed Hive type refuses only its column
-#[test]
-fn binary_unrecognized_and_malformed_glue_types_refuse_only_their_column() {
-    let table = glue_table(
-        &[
-            ("id", "int"),
-            ("b", "binary"),
-            ("s", "struct<b:binary>"),
-            ("u", "uniontype<int,string>"),
-            ("i", "interval_day_time"),
-            ("m", "map<int>"),
-            ("e", ""),
-        ],
-        &[],
-    );
-
-    let schema = catalog_schema(&table, "Glue").expect("a refused column never fails the table");
-
-    assert_eq!(
-        schema
-            .logical_schema
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["id"]
-    );
-    let reasons: Vec<(&str, &str)> = schema
+    let binary = ["has type 'binary'", "#351"].map(str::to_string);
+    let expected_fragments = [
+        binary.to_vec(),
+        [binary.to_vec(), vec!["whose member 'r1.b'".to_string()]].concat(),
+    ]
+    .into_iter()
+    .chain(UNRECOGNIZED_HIVE_TYPES.map(|hive_type| vec![format!(": Hive type '{hive_type}'")]));
+    assert_eq!(schema.refused_columns.len(), refused_types.len());
+    for ((refused, name), fragments) in schema
         .refused_columns
         .iter()
-        .map(|refused| (refused.column_name.as_str(), refused.reason.as_str()))
-        .collect();
-    assert_eq!(
-        reasons.iter().map(|(name, _)| *name).collect::<Vec<_>>(),
-        vec!["b", "s", "u", "i", "m", "e"]
-    );
-    let expected_fragments: [&[&str]; 6] = [
-        &["Glue column 'b'", "has type 'binary'", "#351"],
-        &[
-            "Glue column 's'",
-            "whose member 's.b'",
-            "has type 'binary'",
-            "#351",
-        ],
-        &["Glue column 'u'", "'uniontype<int,string>'"],
-        &["Glue column 'i'", "'interval_day_time'"],
-        &["Glue column 'm'", "'map<int>'"],
-        &["Glue column 'e'", "Hive type ''"],
-    ];
-    for ((name, reason), fragments) in reasons.iter().zip(expected_fragments) {
+        .zip(&refused_names)
+        .zip(expected_fragments)
+    {
+        assert_eq!(&refused.column_name, name);
+        let reason = &refused.reason;
+        assert!(
+            reason.starts_with(&format!("Glue column '{name}'")),
+            "{reason}"
+        );
         for fragment in fragments {
-            assert!(
-                reason.contains(fragment),
-                "{name}: '{fragment}' missing: {reason}"
-            );
+            assert!(reason.contains(&fragment), "'{fragment}' missing: {reason}");
         }
     }
 
     let every_column_refused = glue_table(&[("b", "binary"), ("u", "uniontype<int>")], &[]);
-    let error = match catalog_schema(&every_column_refused, "Glue") {
-        Err(UdfError::User(message)) => message,
-        Err(other) => panic!("a whole-table refusal is a user error, got {other:?}"),
-        Ok(_) => panic!("a table whose every column is refused must be refused as a whole"),
-    };
+    let error = user_message(
+        catalog_schema(&every_column_refused, "Glue")
+            .err()
+            .expect("a table whose every column is refused must be refused as a whole"),
+    );
     assert!(
         error.starts_with("Glue table has no mappable column") && error.contains("'b'"),
         "{error}"
@@ -587,18 +530,6 @@ fn binary_unrecognized_and_malformed_glue_types_refuse_only_their_column() {
 const PARQUET_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat";
 
 const ORC_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
-
-const GLUE_SECRET_KEY: &str = "glue-signing-secret";
-
-fn glue_creds() -> ConnectionCreds {
-    ConnectionCreds {
-        region: "us-east-1".into(),
-        access_key: "glue-signing-access".into(),
-        secret_key: GLUE_SECRET_KEY.into(),
-        use_sigv4: true,
-        ..ConnectionCreds::default()
-    }
-}
 
 fn partitions_page(partitions: &[(&[&str], &str, &str)]) -> Json {
     let partitions: Vec<Json> = partitions
@@ -619,7 +550,7 @@ async fn resolve_glue(
     storage: &StorageBackend,
     filter: Option<&Json>,
 ) -> Result<ResolvedScan, String> {
-    let session = GlueCatalogSession::new(glue_address, storage.clone(), glue_creds())
+    let session = GlueCatalogSession::new(glue_address, storage.clone(), sigv4_creds())
         .expect("the CONNECTION region signs the session");
     let reader = CatalogParquetFormatReader {
         table,
@@ -629,17 +560,6 @@ async fn resolve_glue(
         },
     };
     user_outcome(reader.resolve_scan(filter).await)
-}
-
-async fn glue_storage(objects: &[(&str, &str)]) -> StorageBackend {
-    object_endpoint(
-        "bucket",
-        objects
-            .iter()
-            .map(|(key, body)| (key.to_string(), body.to_string()))
-            .collect(),
-    )
-    .await
 }
 
 fn scanned_key(entry: &FileEntry, table_root: &str) -> String {
@@ -665,7 +585,7 @@ fn scanned_files(scan: &ResolvedScan) -> Vec<(String, BTreeMap<String, Option<St
 /// Scenario: A Glue Parquet table is planned by the shared catalog-declared Parquet reader
 #[tokio::test]
 async fn glue_parquet_table_is_planned_by_the_shared_reader_with_nullable_catalog_columns() {
-    let storage = glue_storage(&[("glue/orders/part-0", UNREADABLE_BODY)]).await;
+    let storage = served_storage(["glue/orders/part-0"]).await.storage;
     let glue = glue_table(&[("id", "bigint"), ("CustomerId", "string")], &[]);
     let unity = sales_table(&[("id", "long"), ("CustomerId", "string")], &[]);
 
@@ -703,20 +623,12 @@ async fn a_glue_location_reads_direct_children_of_any_name() {
             ".hidden",
             "nested/x.parquet",
         ]
-        .map(|name| (format!("{location}/{name}"), UNREADABLE_BODY))
+        .map(|name| (format!("{location}/{name}"), UNREADABLE_BODY.to_string()))
         .into_iter()
-        .chain([(format!("{location}/empty"), "")])
+        .chain([(format!("{location}/empty"), String::new())])
     };
-    let objects: Vec<(String, &str)> = children("glue/orders/p=1")
-        .chain(children("glue/flat"))
-        .collect();
-    let storage = glue_storage(
-        &objects
-            .iter()
-            .map(|(key, body)| (key.as_str(), *body))
-            .collect::<Vec<_>>(),
-    )
-    .await;
+    let objects = children("glue/orders/p=1").chain(children("glue/flat"));
+    let storage = object_endpoint("bucket", objects.collect()).await;
     let glue = GlueEndpoint::spawn(|_| {
         (
             200,
@@ -748,19 +660,18 @@ async fn a_glue_location_reads_direct_children_of_any_name() {
 }
 
 /// Scenario: Each kept partition's location is listed and its files carry the partition's Glue values
+/// Scenario: A catalog-registered location is listed by its raw object key
 #[tokio::test]
 async fn each_kept_partition_is_listed_and_carries_its_glue_values() {
-    let storage = glue_storage(&[
-        (
-            "glue/orders/p_str=__HIVE_DEFAULT_PARTITION__/f",
-            UNREADABLE_BODY,
-        ),
-        ("glue/orders/custom_dir/f", UNREADABLE_BODY),
-        ("glue/orders/p_str=a b%2Fc/f", UNREADABLE_BODY),
-        ("elsewhere/p_str=outside/f", UNREADABLE_BODY),
-        ("glue/orders/p_str=path_value/f", UNREADABLE_BODY),
+    let storage = served_storage([
+        "glue/orders/p_str=__HIVE_DEFAULT_PARTITION__/f",
+        "glue/orders/custom_dir/f",
+        "glue/orders/p_str=a b%2Fc/f",
+        "elsewhere/p_str=a b%2Fc/f",
+        "glue/orders/p_str=path_value/f",
     ])
-    .await;
+    .await
+    .storage;
     let glue = GlueEndpoint::spawn(|_| {
         let page = partitions_page(&[
             (
@@ -780,7 +691,7 @@ async fn each_kept_partition_is_listed_and_carries_its_glue_values() {
             ),
             (
                 &["outside"],
-                "s3://bucket/elsewhere/p_str=outside",
+                "s3://bucket/elsewhere/p_str=a b%2Fc",
                 PARQUET_INPUT_FORMAT,
             ),
             (
@@ -807,7 +718,7 @@ async fn each_kept_partition_is_listed_and_carries_its_glue_values() {
     );
     assert_eq!(scan.partition_columns, vec!["p_str"]);
     let mut expected = vec![
-        ("elsewhere/p_str=outside/f", Some("outside")),
+        ("elsewhere/p_str=a b%2Fc/f", Some("outside")),
         ("glue/orders/custom_dir/f", Some("no_segment")),
         ("glue/orders/p_str=__HIVE_DEFAULT_PARTITION__/f", None),
         ("glue/orders/p_str=a b%2Fc/f", Some("a b/c")),
@@ -847,104 +758,6 @@ async fn each_kept_partition_is_listed_and_carries_its_glue_values() {
     assert_eq!(requests[0]["TableName"], "orders");
 }
 
-#[derive(Debug)]
-struct ListingGauge {
-    inner: Arc<InMemory>,
-    listed: Mutex<Vec<String>>,
-    in_flight: AtomicUsize,
-    peak: AtomicUsize,
-}
-
-impl ListingGauge {
-    async fn over(objects: &[(&str, &[u8])]) -> Arc<Self> {
-        Arc::new(Self {
-            inner: in_memory_store(objects).await,
-            listed: Mutex::default(),
-            in_flight: AtomicUsize::new(0),
-            peak: AtomicUsize::new(0),
-        })
-    }
-
-    fn listed(&self) -> Vec<String> {
-        let mut listed = self.listed.lock().expect("listing log").clone();
-        listed.sort();
-        listed
-    }
-}
-
-impl std::fmt::Display for ListingGauge {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ListingGauge({})", self.inner)
-    }
-}
-
-#[async_trait::async_trait]
-impl ObjectStore for ListingGauge {
-    async fn put_opts(
-        &self,
-        location: &StorePath,
-        payload: PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &StorePath,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &StorePath,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: BoxStream<'static, object_store::Result<StorePath>>,
-    ) -> BoxStream<'static, object_store::Result<StorePath>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        _prefix: Option<&StorePath>,
-    ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
-        panic!("a Glue location is listed only by delimiter, never recursively")
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&StorePath>,
-    ) -> object_store::Result<object_store::ListResult> {
-        self.listed
-            .lock()
-            .expect("listing log")
-            .push(prefix.map(ToString::to_string).unwrap_or_default());
-        let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(now, Ordering::SeqCst);
-        tokio::task::yield_now().await;
-        let listing = self.inner.list_with_delimiter(prefix).await;
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        listing
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &StorePath,
-        to: &StorePath,
-        options: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
-}
-
 fn partition(
     values: &[(&str, Option<&str>)],
     location: &str,
@@ -976,8 +789,16 @@ fn keep_every_partition(_: &BTreeMap<String, Option<String>>) -> bool {
     true
 }
 
+async fn recording_store<K: AsRef<str>>(keys: &[K]) -> Arc<RecordingStore> {
+    let objects: Vec<(&str, &[u8])> = keys
+        .iter()
+        .map(|key| (key.as_ref(), b"rows".as_slice()))
+        .collect();
+    RecordingStore::wrapping(in_memory_store(&objects).await)
+}
+
 async fn planned_keys(
-    store: Arc<ListingGauge>,
+    store: Arc<RecordingStore>,
     partitions: Vec<CatalogPartition>,
     keep: &PartitionKeepPredicate,
 ) -> Result<Vec<String>, String> {
@@ -1015,28 +836,28 @@ async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one
         "s3://other-bucket/glue/orders/p_int=5",
         PartitionFormat::Parquet,
     );
-    let objects: &[(&str, &[u8])] = &[("glue/orders/p_int=1/f", b"rows")];
+    let objects = ["glue/orders/p_int=1/f"];
     let below_five = keep_under(
         &compare("predicate_less", column("P_INT"), number("5")),
         &[("p_int", ArrowType::Int32)],
     );
 
     let kept_orc = planned_keys(
-        ListingGauge::over(objects).await,
+        recording_store(&objects).await,
         vec![parquet.clone(), orc.clone()],
         &keep_every_partition,
     )
     .await
     .expect_err("a kept ORC partition fails the query");
     let kept_foreign = planned_keys(
-        ListingGauge::over(objects).await,
+        recording_store(&objects).await,
         vec![parquet.clone(), foreign.clone()],
         &keep_every_partition,
     )
     .await
     .expect_err("a kept partition in another bucket fails the query");
     let pruned = planned_keys(
-        ListingGauge::over(objects).await,
+        recording_store(&objects).await,
         vec![parquet, orc, foreign],
         &below_five,
     )
@@ -1099,22 +920,13 @@ async fn glue_partitions_are_pruned_on_glue_values_before_listing() {
             .map(|(values, location)| (values.as_slice(), location.as_str(), PARQUET_INPUT_FORMAT))
             .collect::<Vec<_>>(),
     );
-    let keys: Vec<String> = rows
-        .iter()
-        .map(|(_, _, p_str, _)| format!("{}/f", location(p_str)))
-        .collect();
-    let kept_keys: Vec<String> = rows
+    let kept: Vec<String> = rows
         .iter()
         .filter(|(_, _, _, kept)| *kept)
-        .map(|(_, _, p_str, _)| format!("{}/f", location(p_str)))
+        .map(|(_, _, p_str, _)| location(p_str))
         .collect();
-    let storage = glue_storage(
-        &keys
-            .iter()
-            .map(|key| (key.as_str(), UNREADABLE_BODY))
-            .collect::<Vec<_>>(),
-    )
-    .await;
+    let objects =
+        served_storage(rows.map(|(_, _, p_str, _)| format!("{}/f", location(p_str)))).await;
     let glue = GlueEndpoint::spawn(move |_| (200, page.clone())).await;
     let table = glue_table(
         &[
@@ -1126,7 +938,7 @@ async fn glue_partitions_are_pruned_on_glue_values_before_listing() {
         &["p_int", "p_date", "p_str"],
     );
 
-    let scan = resolve_glue(&table, &glue.address, &storage, Some(&filter))
+    let scan = resolve_glue(&table, &glue.address, &objects.storage, Some(&filter))
         .await
         .expect("a filtered Glue table resolves");
 
@@ -1135,50 +947,21 @@ async fn glue_partitions_are_pruned_on_glue_values_before_listing() {
             .into_iter()
             .map(|(key, _)| key)
             .collect::<Vec<_>>(),
-        kept_keys
+        kept.iter()
+            .map(|location| format!("{location}/f"))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        objects.listed_prefixes(),
+        kept.iter()
+            .map(|location| format!("{location}/"))
+            .collect::<Vec<_>>(),
+        "only the kept partitions' locations are listed"
     );
     let requests = glue.bodies_of("GetPartitions");
     assert!(
         requests.iter().all(|body| body.get("Expression").is_none()),
         "the predicate is never sent to Glue: {requests:?}"
-    );
-
-    let gauge = ListingGauge::over(
-        &keys
-            .iter()
-            .map(|key| (key.as_str(), b"rows".as_slice()))
-            .collect::<Vec<_>>(),
-    )
-    .await;
-    let partitions: Vec<CatalogPartition> = rows
-        .iter()
-        .map(|(p_int, p_date, p_str, _)| {
-            partition(
-                &[
-                    ("p_int", Some(*p_int)),
-                    ("p_date", Some(*p_date)),
-                    ("p_str", Some(*p_str)),
-                ],
-                &format!("s3://bucket/{}", location(p_str)),
-                PartitionFormat::Parquet,
-            )
-        })
-        .collect();
-    let keep = keep_under(
-        &filter,
-        &[
-            ("p_int", ArrowType::Int32),
-            ("p_date", ArrowType::Date32),
-            ("p_str", ArrowType::Utf8),
-        ],
-    );
-    planned_keys(gauge.clone(), partitions, &keep)
-        .await
-        .expect("the kept partitions list");
-    assert_eq!(
-        gauge.listed(),
-        vec![location("a"), location("d")],
-        "only the kept partitions' locations are listed"
     );
 }
 
@@ -1187,13 +970,7 @@ async fn kept_partitions_are_listed_concurrently_within_the_table_store_budget()
     let keys: Vec<String> = (0..DEFAULT_S3_MAX_CONNECTIONS * 3)
         .map(|index| format!("glue/orders/p={index}/f"))
         .collect();
-    let gauge = ListingGauge::over(
-        &keys
-            .iter()
-            .map(|key| (key.as_str(), b"rows".as_slice()))
-            .collect::<Vec<_>>(),
-    )
-    .await;
+    let store = recording_store(&keys).await;
     let partitions = (0..keys.len())
         .map(|index| {
             let value = index.to_string();
@@ -1205,15 +982,22 @@ async fn kept_partitions_are_listed_concurrently_within_the_table_store_budget()
         })
         .collect();
 
-    let planned = planned_keys(gauge.clone(), partitions, &keep_every_partition)
+    let planned = planned_keys(store.clone(), partitions, &keep_every_partition)
         .await
         .expect("every partition lists");
 
     assert_eq!(planned.len(), keys.len());
-    let peak = gauge.peak.load(Ordering::SeqCst);
+    let peak = store.peak_delimited_listings();
     assert!(
         (2..=DEFAULT_S3_MAX_CONNECTIONS).contains(&peak),
         "listings overlap within the store's connection budget, peak {peak}"
+    );
+    assert!(
+        store
+            .listings()
+            .iter()
+            .all(|listing| listing.starts_with("delimited ")),
+        "a Glue location is listed only by delimiter, never recursively"
     );
 }
 
@@ -1247,7 +1031,7 @@ async fn glue_planning_failures_name_the_table_and_carry_no_credential() {
             STATIC_SECRET,
             SENTINEL_ACCESS_KEY,
             SENTINEL_SECRET_KEY,
-            GLUE_SECRET_KEY,
+            SIGV4_SECRET_KEY,
         ] {
             assert!(!message.contains(secret), "{message}");
         }
@@ -1257,7 +1041,7 @@ async fn glue_planning_failures_name_the_table_and_carry_no_credential() {
 /// Scenario: A catalog string column over binary file data reads as text
 #[tokio::test]
 async fn a_catalog_string_column_over_unannotated_byte_array_reads_as_text() {
-    let storage = glue_storage(&[("glue/orders/part-0", UNREADABLE_BODY)]).await;
+    let storage = served_storage(["glue/orders/part-0"]).await.storage;
     let table = glue_table(&[("id", "bigint"), ("name", "string")], &[]);
     let scan = resolve_glue(&table, UNREACHABLE_CATALOG, &storage, None)
         .await

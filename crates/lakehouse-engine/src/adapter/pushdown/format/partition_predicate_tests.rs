@@ -427,31 +427,26 @@ fn partition_values_compare_under_their_declared_type() {
 #[test]
 fn an_undecidable_comparison_keeps_the_file() {
     let declared = typed_columns();
-    let every_file = [true, true];
-    let cases: Vec<(&str, Json, [FileValues; 2], [bool; 2])> = vec![
+    let cases: Vec<(&str, Json, [FileValues; 2])> = vec![
         (
             "a string literal on an integer column",
             equal("YEAR", "2024"),
             two_files("year", "2024", "2025"),
-            every_file,
         ),
         (
             "a fractional literal on an integer column, which truncation would decide",
             compare("predicate_equal", column("YEAR"), number("2024.5")),
             two_files("year", "2024", "2025"),
-            every_file,
         ),
         (
             "an integer literal outside the column's range, which wrapping would decide",
             compare("predicate_equal", column("TINY"), number("300")),
             two_files("tiny", "44", "45"),
-            every_file,
         ),
         (
             "a literal finer than the decimal scale, which rounding would decide",
             compare("predicate_equal", column("AMOUNT"), number("1.555")),
             two_files("amount", "1.55", "1.56"),
-            every_file,
         ),
         (
             "a timestamp literal finer than the column's unit, which truncation would decide",
@@ -461,13 +456,11 @@ fn an_undecidable_comparison_keeps_the_file() {
                 timestamp("2024-03-01 00:00:00.000500"),
             ),
             two_files("ts_ms", "2024-03-01 00:00:00", "2024-03-01 00:00:00.001"),
-            every_file,
         ),
         (
             "a comparison on a float column",
             compare("predicate_greater", column("RATIO"), number("1.0")),
             two_files("ratio", "0.5", "2.0"),
-            every_file,
         ),
         (
             "a double literal on an integer column",
@@ -477,7 +470,6 @@ fn an_undecidable_comparison_keeps_the_file() {
                 literal("literal_double", json!("2024")),
             ),
             two_files("year", "2024", "2025"),
-            every_file,
         ),
         (
             "a timestamp literal on a date column",
@@ -487,13 +479,11 @@ fn an_undecidable_comparison_keeps_the_file() {
                 timestamp("2024-03-01 00:00:00"),
             ),
             two_files("day", "2024-03-01", "2024-03-02"),
-            every_file,
         ),
         (
             "a date literal on a timestamp column",
             compare("predicate_equal", column("TS"), date("2024-03-01")),
             two_files("ts", "2024-03-01 00:00:00", "2024-03-02 00:00:00"),
-            every_file,
         ),
         (
             "a UTC timestamp literal on a timestamp column",
@@ -503,35 +493,32 @@ fn an_undecidable_comparison_keeps_the_file() {
                 literal("literal_timestamp_utc", json!("2024-03-01 00:00:00")),
             ),
             two_files("ts", "2024-03-01 00:00:00", "2024-03-02 00:00:00"),
-            every_file,
         ),
         (
             "a string literal on a boolean column",
             equal("ACTIVE", "true"),
             two_files("active", "true", "false"),
-            every_file,
         ),
         (
             "a string literal on a column of another declared type",
             equal("PAYLOAD", "x"),
             two_files("payload", "x", "y"),
-            every_file,
-        ),
-        (
-            "a value the declared type cannot convert keeps its file for the scan to fail",
-            compare("predicate_equal", column("YEAR"), number("2024")),
-            two_files("year", "abc", "2025"),
-            [true, false],
         ),
     ];
 
-    for (label, filter, files, expected) in cases {
+    for (label, filter, files) in cases {
         assert_eq!(
             kept_under(&filter, &declared, &files),
-            expected,
+            [true, true],
             "{label}: kept per file"
         );
     }
+    let year_2024 = compare("predicate_equal", column("YEAR"), number("2024"));
+    assert_eq!(
+        kept_under(&year_2024, &declared, &two_files("year", "abc", "2025")),
+        [true, false],
+        "a value the declared type cannot convert keeps its file for the scan to fail"
+    );
 }
 
 #[test]

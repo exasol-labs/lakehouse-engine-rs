@@ -1,13 +1,9 @@
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, closed_port_storage, delta_commit_zero_key,
-    delta_object_endpoint, sample_storage,
+    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, UNREACHABLE_CATALOG, closed_port_storage,
+    delta_commit_zero_key, delta_object_endpoint, sample_storage, user_message,
 };
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType, ConnectionCreds, TableFormat};
-
-/// Closed port: a stray credential request fails with a transport error, distinguishable
-/// from every refusal asserted here.
-const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
 
 const TABLE_NAME: &str = "cat.sch.orders";
 
@@ -73,15 +69,12 @@ async fn refusal_as(
     };
     let reader = DeltaFormatReader::new(&session, table, &connection);
 
-    let error = reader
-        .resolve_scan(None)
-        .await
-        .expect_err("resolution must fail, never answer a scan");
-
-    match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    }
+    user_message(
+        reader
+            .resolve_scan(None)
+            .await
+            .expect_err("resolution must fail, never answer a scan"),
+    )
 }
 
 /// A role CONNECTION that vends takes the same vended path as a static one; its
@@ -182,14 +175,12 @@ async fn a_failed_log_read_reports_no_static_credential_value() {
     };
     let reader = DeltaFormatReader::new(&session, &table, &connection);
 
-    let error = reader
-        .resolve_scan(None)
-        .await
-        .expect_err("a log read against a closed port must fail, never answer a scan");
-    let message = match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    };
+    let message = user_message(
+        reader
+            .resolve_scan(None)
+            .await
+            .expect_err("a log read against a closed port must fail, never answer a scan"),
+    );
 
     assert!(
         message.contains(DELTA_TABLE_ROOT),

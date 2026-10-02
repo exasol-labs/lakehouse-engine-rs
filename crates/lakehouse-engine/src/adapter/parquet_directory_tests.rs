@@ -3,148 +3,14 @@ use crate::adapter::tests::parquet_fixture::{
     directory_options, in_memory_store, nullable, parquet_bytes, parquet_footer_bytes,
     parquet_schema_footer_bytes, values,
 };
+use crate::adapter::tests::recording_store::RecordingStore;
 use crate::types::mapping::arrow_to_exasol_type;
 use arrow::datatypes::{Fields, TimeUnit};
-use futures::StreamExt;
-use object_store::{ObjectMeta, ObjectStoreExt, PutPayload};
+use object_store::{ObjectStoreExt, PutPayload};
 
 /// The prefix every fixture is written under, so a test also pins that objects OUTSIDE it are
 /// never listed.
 const TABLE_ROOT: &str = "warehouse/direct/events";
-
-/// Hands back the inner store's listing REVERSED (so a test can't pass by luck against
-/// [`InMemory`](object_store::memory::InMemory)'s already-sorted order) and records every read,
-/// HEAD vs. GET distinctly, and every listing, recursive vs. delimited.
-#[derive(Debug)]
-struct ReversedListingStore {
-    inner: Arc<dyn ObjectStore>,
-    reads: Arc<std::sync::Mutex<Vec<String>>>,
-    listings: Arc<std::sync::Mutex<Vec<String>>>,
-}
-
-impl ReversedListingStore {
-    fn wrapping(inner: Arc<dyn ObjectStore>) -> Arc<Self> {
-        Arc::new(Self {
-            inner,
-            reads: Arc::new(std::sync::Mutex::new(Vec::new())),
-            listings: Arc::new(std::sync::Mutex::new(Vec::new())),
-        })
-    }
-
-    fn reads(&self) -> Vec<String> {
-        self.reads.lock().expect("read log is not poisoned").clone()
-    }
-
-    fn listings(&self) -> Vec<String> {
-        self.listings
-            .lock()
-            .expect("listing log is not poisoned")
-            .clone()
-    }
-
-    fn record_listing(&self, kind: &str, prefix: Option<&StorePath>) {
-        self.listings
-            .lock()
-            .expect("listing log is not poisoned")
-            .push(format!("{kind} {}", prefix.map_or("", StorePath::as_ref)));
-    }
-
-    fn files_read(&self) -> Vec<String> {
-        let mut paths: Vec<String> = self
-            .reads()
-            .into_iter()
-            .filter_map(|read| read.strip_prefix("get ").map(str::to_string))
-            .collect();
-        paths.sort();
-        paths.dedup();
-        paths
-    }
-}
-
-impl std::fmt::Display for ReversedListingStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "ReversedListingStore({})", self.inner)
-    }
-}
-
-#[async_trait::async_trait]
-impl ObjectStore for ReversedListingStore {
-    async fn put_opts(
-        &self,
-        location: &StorePath,
-        payload: PutPayload,
-        opts: object_store::PutOptions,
-    ) -> object_store::Result<object_store::PutResult> {
-        self.inner.put_opts(location, payload, opts).await
-    }
-
-    async fn put_multipart_opts(
-        &self,
-        location: &StorePath,
-        opts: object_store::PutMultipartOptions,
-    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
-        self.inner.put_multipart_opts(location, opts).await
-    }
-
-    async fn get_opts(
-        &self,
-        location: &StorePath,
-        options: object_store::GetOptions,
-    ) -> object_store::Result<object_store::GetResult> {
-        let verb = if options.head { "head" } else { "get" };
-        self.reads
-            .lock()
-            .expect("read log is not poisoned")
-            .push(format!("{verb} {location}"));
-        self.inner.get_opts(location, options).await
-    }
-
-    fn delete_stream(
-        &self,
-        locations: futures::stream::BoxStream<'static, object_store::Result<StorePath>>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<StorePath>> {
-        self.inner.delete_stream(locations)
-    }
-
-    fn list(
-        &self,
-        prefix: Option<&StorePath>,
-    ) -> futures::stream::BoxStream<'static, object_store::Result<ObjectMeta>> {
-        self.record_listing("recursive", prefix);
-        let inner = Arc::clone(&self.inner);
-        let prefix = prefix.cloned();
-        futures::stream::once(async move {
-            match inner.list(prefix.as_ref()).try_collect::<Vec<_>>().await {
-                Ok(mut metas) => {
-                    metas.reverse();
-                    metas.into_iter().map(Ok).collect::<Vec<_>>()
-                }
-                Err(error) => vec![Err(error)],
-            }
-        })
-        .flat_map(futures::stream::iter)
-        .boxed()
-    }
-
-    async fn list_with_delimiter(
-        &self,
-        prefix: Option<&StorePath>,
-    ) -> object_store::Result<object_store::ListResult> {
-        self.record_listing("delimited", prefix);
-        let mut listed = self.inner.list_with_delimiter(prefix).await?;
-        listed.objects.reverse();
-        Ok(listed)
-    }
-
-    async fn copy_opts(
-        &self,
-        from: &StorePath,
-        to: &StorePath,
-        options: object_store::CopyOptions,
-    ) -> object_store::Result<()> {
-        self.inner.copy_opts(from, to, options).await
-    }
-}
 
 fn under_root(key: &str) -> String {
     format!("{TABLE_ROOT}/{key}")
@@ -156,23 +22,23 @@ fn rooted(keys: &[&str]) -> Vec<String> {
 
 /// A store holding each object at its key below [`TABLE_ROOT`], seen through the reversing,
 /// read-recording decorator.
-async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<ReversedListingStore> {
+async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<RecordingStore> {
     let keys: Vec<String> = objects.iter().map(|(key, _)| under_root(key)).collect();
     let rooted: Vec<(&str, &[u8])> = keys
         .iter()
         .zip(objects)
         .map(|(key, (_, bytes))| (key.as_str(), *bytes))
         .collect();
-    ReversedListingStore::wrapping(in_memory_store(&rooted).await)
+    RecordingStore::reversing(in_memory_store(&rooted).await)
 }
 
-async fn store_with(keys: &[&str], data: &[u8]) -> Arc<ReversedListingStore> {
+async fn store_with(keys: &[&str], data: &[u8]) -> Arc<RecordingStore> {
     let objects: Vec<(&str, &[u8])> = keys.iter().map(|key| (*key, data)).collect();
     store_holding(&objects).await
 }
 
 async fn resolve(
-    probe: &Arc<ReversedListingStore>,
+    probe: &Arc<RecordingStore>,
     merge_mode: MergeMode,
     keep: &PartitionKeepPredicate,
 ) -> Result<ParquetDirectory, UdfError> {

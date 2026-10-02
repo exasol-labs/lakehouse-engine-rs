@@ -1,36 +1,10 @@
 use super::super::test_support::{
-    glue_catalog_table, object_endpoint, sample_storage, user_message,
+    UNREACHABLE_CATALOG, glue_catalog_table, load_table_body, object_endpoint, sample_storage,
+    sigv4_creds, user_message,
 };
 use super::*;
 use crate::adapter::parquet_directory::MergeMode;
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType};
-
-/// SigV4 mode lets `CatalogSession::resolve` build a session without contacting a catalog.
-fn offline_sigv4_creds() -> ConnectionCreds {
-    ConnectionCreds {
-        warehouse: "123456789012".into(),
-        endpoint: "http://minio:9000".into(),
-        region: "us-east-1".into(),
-        access_key: "signing-access-key".into(),
-        secret_key: "signing-secret-key".into(),
-        session_token: None,
-        path_style: Some(true),
-        use_sigv4: true,
-        use_vended_credentials: false,
-        token: None,
-        client_id: None,
-        client_secret: None,
-        oauth2_server_uri: None,
-        scope: None,
-        account_name: None,
-        account_key: None,
-        sas_token: None,
-        ..Default::default()
-    }
-}
-
-/// Closed port: any request selection issued would fail loudly.
-const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
 
 const TABLE_NAME: &str = "cat.sch.orders";
 
@@ -52,7 +26,7 @@ fn unity_table(format: TableFormat) -> CatalogTable {
 
 #[test]
 fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
-    let creds = offline_sigv4_creds();
+    let creds = sigv4_creds();
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
     let table = unity_table(TableFormat::Iceberg);
     let storage = sample_storage();
@@ -84,7 +58,7 @@ fn format_reader_refuses_an_iceberg_table_under_the_unity_source() {
 
 #[test]
 fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_the_catalog() {
-    let creds = offline_sigv4_creds();
+    let creds = sigv4_creds();
     let session = UnityCatalogSession::new(UNREACHABLE_CATALOG, creds.clone());
     let storage = sample_storage();
 
@@ -112,7 +86,7 @@ fn format_reader_selects_the_delta_reader_for_a_delta_table_without_contacting_t
 
 #[tokio::test]
 async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog() {
-    let creds = offline_sigv4_creds();
+    let creds = sigv4_creds();
     let session = CatalogSession::resolve(UNREACHABLE_CATALOG, &creds.warehouse, &creds)
         .await
         .expect("the SigV4 path resolves a session without contacting the catalog");
@@ -142,7 +116,7 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
 
 #[test]
 fn third_scan_source_selects_the_parquet_reader() {
-    let creds = offline_sigv4_creds();
+    let creds = sigv4_creds();
     let storage = sample_storage();
     let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
@@ -183,22 +157,29 @@ fn glue_table(format: TableFormat) -> CatalogTable {
 }
 
 fn offline_glue_session() -> GlueCatalogSession {
-    GlueCatalogSession::new(UNREACHABLE_CATALOG, sample_storage(), offline_sigv4_creds())
+    GlueCatalogSession::new(UNREACHABLE_CATALOG, sample_storage(), sigv4_creds())
         .expect("the CONNECTION region signs the session without a request")
 }
 
 /// Scenario: A Glue Parquet table is planned by the shared catalog-declared Parquet reader
 #[tokio::test]
 async fn format_reader_selects_readers_for_a_glue_table_by_format_without_contacting_the_catalog() {
-    let creds = offline_sigv4_creds();
+    let creds = sigv4_creds();
     let session = offline_glue_session();
+    let metadata = load_table_body(serde_json::json!({}))["metadata"].to_string();
     let storage = object_endpoint(
         "bucket",
-        vec![("sales/orders/part-0".to_string(), "rows".to_string())],
+        vec![
+            ("sales/orders/part-0".to_string(), "rows".to_string()),
+            ("sales/orders/metadata/v1.json".to_string(), metadata),
+        ],
     )
     .await;
 
-    for format in [TableFormat::Iceberg, TableFormat::Parquet] {
+    for (format, files) in [
+        (TableFormat::Iceberg, vec![]),
+        (TableFormat::Parquet, vec!["part-0"]),
+    ] {
         let table = glue_table(format);
         let reader = format_reader(
             ScanSource::Glue {
@@ -213,30 +194,23 @@ async fn format_reader_selects_readers_for_a_glue_table_by_format_without_contac
         )
         .expect("a Glue table must select its reader without issuing a request");
 
-        let resolved = reader.resolve_scan(None).await;
+        let scan = reader
+            .resolve_scan(None)
+            .await
+            .unwrap_or_else(|error| panic!("{format:?}: the selected reader plans: {error}"));
 
-        match format {
-            TableFormat::Parquet => {
-                let scan = resolved.expect("the Parquet reader lists the table location");
-                let paths: Vec<&str> = scan.files.iter().map(|file| file.path.as_str()).collect();
-                assert_eq!(paths, vec!["part-0"]);
-            }
-            _ => {
-                let error = resolved
-                    .expect_err("the Iceberg reader reads the metadata file, which is absent")
-                    .to_string();
-                assert!(
-                    error.contains("s3://bucket/sales/orders/metadata/v1.json"),
-                    "{error}"
-                );
-            }
-        }
+        let paths: Vec<&str> = scan.files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(
+            paths, files,
+            "{format:?}: only the Parquet reader lists the location's direct children; the \
+             Iceberg reader plans the snapshotless metadata file"
+        );
     }
 }
 
 #[test]
 fn format_reader_refuses_a_delta_table_under_the_glue_source() {
-    let creds = offline_sigv4_creds();
+    let creds = sigv4_creds();
     let session = offline_glue_session();
     let table = glue_table(TableFormat::Delta);
     let storage = sample_storage();

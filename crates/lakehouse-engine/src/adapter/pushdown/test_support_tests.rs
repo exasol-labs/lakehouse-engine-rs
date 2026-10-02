@@ -11,13 +11,11 @@ use tokio::net::TcpListener;
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// Every response closes its connection, so one accept loop serves a pooled client's sequential
-/// requests in arrival order. `responder` maps a request head to a status and body.
-async fn spawn_fake_http_server<F>(
-    content_type: &'static str,
-    responder: F,
-) -> (String, RecordedRequests)
+/// requests in arrival order. `responder` maps a request head to a status, content type, and body;
+/// the validators make a body readable as an object.
+async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
 where
-    F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
+    F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
     let address = format!("http://{}", listener.local_addr().expect("local_addr"));
@@ -29,7 +27,7 @@ where
             let Some((head, body)) = read_http_request(&mut stream).await else {
                 continue;
             };
-            let (status, response_body) = responder(&head);
+            let (status, content_type, response_body) = responder(&head);
             recorded
                 .lock()
                 .expect("recorded requests")
@@ -39,10 +37,12 @@ where
             } else {
                 "ERROR"
             };
+            let length = response_body.len();
             let response = format!(
                 "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
-                 Content-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
-                response_body.len()
+                 Content-Length: {length}\r\nETag: \"e{length}\"\r\n\
+                 Last-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nAccept-Ranges: bytes\r\n\
+                 Connection: close\r\n\r\n{response_body}"
             );
             let _ = stream.write_all(response.as_bytes()).await;
         }
@@ -66,8 +66,9 @@ impl RecordingCatalog {
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
-        let (uri, requests) = spawn_fake_http_server("application/json", move |head| {
-            responder(request_target(head))
+        let (uri, requests) = spawn_fake_http_server(move |head| {
+            let (status, body) = responder(request_target(head));
+            (status, "application/json", body)
         })
         .await;
         Self { uri, requests }
@@ -112,57 +113,70 @@ pub(super) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t";
 
 pub(super) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
 
-/// No snapshot, so the empty scan reads no manifest and resolution stays offline.
-pub(super) fn snapshotless_load_table_body(location: &str) -> String {
-    serde_json::json!({
-        "metadata-location": format!("{location}/metadata/v1.json"),
-        "metadata": {
-            "format-version": 2,
-            "table-uuid": "00000000-0000-0000-0000-000000000003",
-            "location": location,
-            "last-sequence-number": 0,
-            "last-updated-ms": 0,
-            "last-column-id": 1,
-            "current-schema-id": 0,
-            "schemas": [{
-                "type": "struct",
-                "schema-id": 0,
-                "fields": [{"id": 1, "name": "id", "required": false, "type": "long"}]
-            }],
-            "default-spec-id": 0,
-            "partition-specs": [{"spec-id": 0, "fields": []}],
-            "last-partition-id": 0,
-            "sort-orders": [{"order-id": 0, "fields": []}],
-            "default-sort-order-id": 0,
-            "snapshots": []
-        }
-    })
-    .to_string()
+/// SigV4 mode lets `CatalogSession::resolve` build a session without contacting the catalog, so
+/// `loadTable` is a loopback catalog's only request.
+pub(super) fn sigv4_creds() -> ConnectionCreds {
+    ConnectionCreds {
+        warehouse: "123456789012".into(),
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "signing-access-key".into(),
+        secret_key: SIGV4_SECRET_KEY.into(),
+        path_style: Some(true),
+        use_sigv4: true,
+        ..Default::default()
+    }
 }
 
-pub(super) fn load_table_body_with_columns(
-    fields: serde_json::Value,
-    last_column_id: i32,
-) -> String {
+pub(super) const SIGV4_SECRET_KEY: &str = "signing-secret-key";
+
+/// Closed port: a stray request fails with a transport error, distinct from every asserted refusal.
+pub(super) const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
+
+/// A `loadTable` body for a one-column table at `s3://bucket/db/t`, each `metadata` field
+/// replacing its default. No snapshot, so the empty scan reads no manifest and resolution stays
+/// offline.
+pub(super) fn load_table_body(metadata: Json) -> Json {
+    let mut fields = serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "00000000-0000-0000-0000-000000000003",
+        "location": "s3://bucket/db/t",
+        "last-sequence-number": 0,
+        "last-updated-ms": 0,
+        "last-column-id": 1,
+        "current-schema-id": 0,
+        "schemas": [{
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": false, "type": "long"}]
+        }],
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "last-partition-id": 0,
+        "sort-orders": [{"order-id": 0, "fields": []}],
+        "default-sort-order-id": 0,
+        "snapshots": []
+    });
+    let Json::Object(overrides) = metadata else {
+        panic!("the metadata overrides are an object: {metadata}");
+    };
+    fields.as_object_mut().expect("an object").extend(overrides);
+    let location = fields["location"].as_str().unwrap_or_default().to_string();
     serde_json::json!({
-        "metadata-location": "s3://bucket/db/t/metadata/v1.json",
-        "metadata": {
-            "format-version": 2,
-            "table-uuid": "00000000-0000-0000-0000-000000000007",
-            "location": "s3://bucket/db/t",
-            "last-sequence-number": 0,
-            "last-updated-ms": 0,
-            "last-column-id": last_column_id,
-            "current-schema-id": 0,
-            "schemas": [{"type": "struct", "schema-id": 0, "fields": fields}],
-            "default-spec-id": 0,
-            "partition-specs": [{"spec-id": 0, "fields": []}],
-            "last-partition-id": 0,
-            "sort-orders": [{"order-id": 0, "fields": []}],
-            "default-sort-order-id": 0,
-            "snapshots": []
-        }
+        "metadata-location": format!("{location}/metadata/v1.json"),
+        "metadata": fields,
     })
+}
+
+pub(super) fn snapshotless_load_table_body(location: &str) -> String {
+    load_table_body(serde_json::json!({ "location": location })).to_string()
+}
+
+pub(super) fn load_table_body_with_columns(fields: Json, last_column_id: i32) -> String {
+    load_table_body(serde_json::json!({
+        "last-column-id": last_column_id,
+        "schemas": [{"type": "struct", "schema-id": 0, "fields": fields}],
+    }))
     .to_string()
 }
 
@@ -196,6 +210,15 @@ pub(super) fn user_message(error: UdfError) -> String {
         UdfError::User(message) => message,
         other => panic!("expected UdfError::User, got {other:?}"),
     }
+}
+
+pub(super) fn assert_refuses_binary_col(error: UdfError) {
+    let message = user_message(error);
+    assert!(
+        message.contains("binary_col") && message.contains("#351"),
+        "the refusal must be the gate's own message, naming the column and its reason: \
+         {message}"
+    );
 }
 
 pub(super) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
@@ -313,69 +336,77 @@ pub(super) async fn object_endpoint(
     bucket: &str,
     objects: Vec<(String, String)>,
 ) -> StorageBackend {
-    let objects = Arc::new(objects);
-    let bucket = Arc::new(bucket.to_string());
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let port = listener.local_addr().expect("local_addr").port();
+    ObjectEndpoint::spawn(bucket, objects).await.storage
+}
 
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let (objects, bucket) = (objects.clone(), bucket.clone());
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 16384];
-                let read = stream.read(&mut buf).await.unwrap_or(0);
-                if read == 0 {
-                    return;
+/// Serves each `(key, body)` of `bucket` path-style, listing as S3's `ListObjectsV2` does; any
+/// other key is absent.
+pub(super) struct ObjectEndpoint {
+    pub(super) storage: StorageBackend,
+    requests: RecordedRequests,
+}
+
+impl ObjectEndpoint {
+    pub(super) async fn spawn(bucket: &str, objects: Vec<(String, String)>) -> Self {
+        let bucket = bucket.to_string();
+        let (endpoint, requests) = spawn_fake_http_server(move |head| {
+            let target = request_target(head);
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            if query.contains("list-type=2") {
+                let listing = list_bucket_result(&bucket, query, &objects);
+                return (200, "application/xml", listing);
+            }
+            let key = path
+                .strip_prefix(&format!("/{bucket}/"))
+                .map(|key| percent_encoding::percent_decode_str(key).decode_utf8_lossy());
+            match objects
+                .iter()
+                .find(|(served, _)| key.as_deref() == Some(served.as_str()))
+            {
+                Some((_, body)) => (200, "application/octet-stream", body.clone()),
+                None => {
+                    let error = r#"<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>"#;
+                    (404, "application/xml", error.to_string())
                 }
-                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
-                let target = raw
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
-                let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-                let response = if query.contains("list-type=2") {
-                    ok_response(
-                        "application/xml",
-                        &list_bucket_result(&bucket, query, &objects),
-                    )
-                } else {
-                    let key = path
-                        .strip_prefix(&format!("/{bucket}/"))
-                        .map(|key| percent_encoding::percent_decode_str(key).decode_utf8_lossy());
-                    match objects
-                        .iter()
-                        .find(|(served, _)| key.as_deref() == Some(served.as_str()))
-                    {
-                        Some((_, body)) => ok_response("application/octet-stream", body),
-                        None => {
-                            let error =
-                                r#"<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>"#;
-                            format!(
-                                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n\
-                                 Content-Length: {}\r\nConnection: close\r\n\r\n{error}",
-                                error.len()
-                            )
-                        }
-                    }
-                };
-                let _ = stream.write_all(response.as_bytes()).await;
-            });
-        }
-    });
+            }
+        })
+        .await;
+        let storage = StorageBackend::S3(StorageProps {
+            endpoint,
+            region: "us-east-1".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            allow_http: true,
+            path_style: true,
+            ..Default::default()
+        });
+        Self { storage, requests }
+    }
 
-    StorageBackend::S3(StorageProps {
-        endpoint: format!("http://127.0.0.1:{port}"),
-        region: "us-east-1".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
-        allow_http: true,
-        path_style: true,
-        ..Default::default()
-    })
+    /// The prefix of every listing request, sorted.
+    pub(super) fn listed_prefixes(&self) -> Vec<String> {
+        let mut prefixes: Vec<String> = self
+            .requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .filter_map(|(head, _)| {
+                let (_, query) = request_target(head).split_once('?')?;
+                query
+                    .contains("list-type=2")
+                    .then(|| query_param(query, "prefix"))
+            })
+            .collect();
+        prefixes.sort();
+        prefixes
+    }
+}
+
+fn query_param(query: &str, key: &str) -> String {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
 }
 
 pub(super) struct GlueEndpoint {
@@ -389,16 +420,13 @@ impl GlueEndpoint {
     where
         F: Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
     {
-        let (address, requests) = spawn_fake_http_server(
-            "application/x-amz-json-1.1",
-            move |head| match glue_operation(head) {
-                Some(operation) => {
-                    let (status, body) = responder(operation);
-                    (status, body.to_string())
-                }
-                None => (400, String::new()),
-            },
-        )
+        let (address, requests) = spawn_fake_http_server(move |head| {
+            let (status, body) = match glue_operation(head) {
+                Some(operation) => responder(operation),
+                None => (400, serde_json::Value::Null),
+            };
+            (status, "application/x-amz-json-1.1", body.to_string())
+        })
         .await;
         Self { address, requests }
     }
@@ -464,25 +492,10 @@ fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.trim())
 }
 
-fn ok_response(content_type: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         ETag: \"e{}\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
-         Accept-Ranges: bytes\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-        body.len()
-    )
-}
-
 /// Honors `delimiter` as S3 does: a key with the delimiter below `prefix` rolls up into its
 /// common prefix, so a delimiter listing returns only the prefix's direct children as objects.
 fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -> String {
-    let param = |key: &str| {
-        url::form_urlencoded::parse(query.as_bytes())
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.into_owned())
-            .unwrap_or_default()
-    };
+    let param = |key: &str| query_param(query, key);
     let (prefix, after, delimiter) = (param("prefix"), param("start-after"), param("delimiter"));
     let mut contents = String::new();
     let mut common_prefixes = std::collections::BTreeSet::new();

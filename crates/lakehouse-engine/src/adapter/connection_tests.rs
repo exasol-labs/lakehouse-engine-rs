@@ -1455,57 +1455,59 @@ fn direct_storage_accepts_matching_scheme_and_credential_shape() {
 
 const GLUE_ADDRESS: &str = "https://glue.us-east-1.amazonaws.com";
 
+/// `base` with every field of `extra` added or replaced.
+fn password_with(mut base: serde_json::Value, extra: serde_json::Value) -> String {
+    let serde_json::Value::Object(extra) = extra else {
+        panic!("the extra fields are an object: {extra}");
+    };
+    base.as_object_mut().expect("an object").extend(extra);
+    base.to_string()
+}
+
 fn glue_password(extra: serde_json::Value) -> String {
-    let mut password = serde_json::json!({
-        "region": "us-east-1",
-        "access_key": "AKID",
-        "secret_key": "SECRET",
-    });
-    password
-        .as_object_mut()
-        .unwrap()
-        .extend(extra.as_object().unwrap().clone());
-    password.to_string()
+    let base =
+        serde_json::json!({"region": "us-east-1", "access_key": "AKID", "secret_key": "SECRET"});
+    password_with(base, extra)
+}
+
+fn read_glue(password: &str) -> Result<Resolved, UdfError> {
+    read_connection(
+        &with_conn(GLUE_ADDRESS, password),
+        Some("MY_CONN"),
+        CatalogKind::Glue,
+    )
 }
 
 fn glue_error(extra: serde_json::Value) -> String {
-    let ctx = with_conn(GLUE_ADDRESS, &glue_password(extra));
-    read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
-        .unwrap_err()
-        .to_string()
+    read_glue(&glue_password(extra)).unwrap_err().to_string()
 }
 
 /// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
 #[test]
-fn glue_connection_implies_sigv4_and_makes_warehouse_optional() {
-    let ctx = with_conn(GLUE_ADDRESS, &glue_password(serde_json::json!({})));
-    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
+fn glue_connection_implies_sigv4_and_makes_warehouse_and_region_optional() {
+    let resolved = read_glue(&glue_password(serde_json::json!({})))
         .expect("a Glue CONNECTION with only region and keys must be accepted");
     assert!(resolved.creds.use_sigv4);
     assert!(resolved.creds.warehouse.is_empty());
 
-    let ctx = with_conn(
-        GLUE_ADDRESS,
-        &glue_password(serde_json::json!({ "warehouse": "123456789012", "use_sigv4": true })),
-    );
-    let resolved = read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
-        .expect("a warehouse is the optional Glue CatalogId");
+    let catalog_id = serde_json::json!({ "warehouse": "123456789012", "use_sigv4": true });
+    let resolved =
+        read_glue(&glue_password(catalog_id)).expect("a warehouse is the optional Glue CatalogId");
     assert!(resolved.creds.use_sigv4);
     assert_eq!(resolved.creds.warehouse, "123456789012");
+
+    let no_region = serde_json::json!({ "access_key": "AKID", "secret_key": "SECRET" });
+    read_glue(&no_region.to_string())
+        .expect("the standard Glue address supplies the signing region");
 }
 
 /// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
 #[test]
-fn glue_connection_rejects_explicit_sigv4_false() {
+fn glue_connection_rejects_sigv4_false_vending_catalog_auth_and_missing_sigv4_fields() {
     let msg = glue_error(serde_json::json!({ "use_sigv4": false }));
-
     assert!(msg.contains("always signs with AWS SigV4"), "{msg}");
     assert!(!msg.contains("SECRET"), "{msg}");
-}
 
-/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
-#[test]
-fn glue_connection_rejects_vending_and_catalog_auth_fields() {
     let msg = glue_error(serde_json::json!({ "use_vended_credentials": true }));
     assert!(msg.contains("no native credential vending"), "{msg}");
 
@@ -1538,29 +1540,12 @@ fn glue_connection_rejects_vending_and_catalog_auth_fields() {
     let msg = glue_error(serde_json::json!({ "client_id": "CLIENT_ID_VALUE" }));
     assert!(msg.contains("client_id"), "{msg}");
     assert!(!msg.contains("CLIENT_ID_VALUE"), "{msg}");
-}
 
-/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
-#[test]
-fn glue_connection_requires_the_sigv4_fields() {
-    let password = serde_json::json!({ "region": "us-east-1", "access_key": "AKID" }).to_string();
-    let ctx = with_conn(GLUE_ADDRESS, &password);
-
-    let msg = read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
+    let without_secret = serde_json::json!({ "region": "us-east-1", "access_key": "AKID" });
+    let msg = read_glue(&without_secret.to_string())
         .unwrap_err()
         .to_string();
-
     assert!(msg.contains("secret_key"), "{msg}");
-}
-
-/// Scenario: Glue validation implies SigV4 and rejects catalog-auth and vending fields
-#[test]
-fn a_glue_connection_without_a_region_signs_for_the_standard_address_region() {
-    let password = serde_json::json!({ "access_key": "AKID", "secret_key": "SECRET" }).to_string();
-    let ctx = with_conn(GLUE_ADDRESS, &password);
-
-    read_connection(&ctx, Some("MY_CONN"), CatalogKind::Glue)
-        .expect("the standard Glue address supplies the signing region");
 }
 
 /// Scenario: A Glue CONNECTION may name a role
@@ -1571,12 +1556,7 @@ fn a_glue_connection_accepts_a_role_and_its_options() {
         "aws_external_id": "EXTERNAL_ID_VALUE",
         "aws_sts_endpoint": "https://sts.us-east-1.amazonaws.com",
     }));
-    let resolved = read_connection(
-        &with_conn(GLUE_ADDRESS, &password),
-        Some("MY_CONN"),
-        CatalogKind::Glue,
-    )
-    .expect("a Glue CONNECTION naming a role must be accepted");
+    let resolved = read_glue(&password).expect("a Glue CONNECTION naming a role must be accepted");
 
     assert_eq!(
         resolved.creds.assume_role_arn(),
@@ -1589,34 +1569,24 @@ fn a_glue_connection_accepts_a_role_and_its_options() {
     );
 }
 
-/// Scenario: A Glue CONNECTION may name a role
-#[test]
-fn a_glue_connection_rejects_role_options_without_a_role() {
-    let msg = glue_error(serde_json::json!({ "aws_external_id": "EXTERNAL_ID_VALUE" }));
-
-    assert!(msg.contains("aws_external_id"), "{msg}");
-    assert!(msg.contains("aws_assume_role_arn"), "{msg}");
-    assert!(!msg.contains("EXTERNAL_ID_VALUE"), "{msg}");
-}
-
 const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/lakehouse-reader";
 const EXTERNAL_ID: &str = "EXTERNAL_ID_SENTINEL";
 const BASE_SECRET: &str = "BASE_SECRET_SENTINEL";
 
-/// A role CONNECTION carrying the base key pair, extended by `extra` fields.
-fn role_password(extra: serde_json::Value) -> String {
-    let mut password = serde_json::json!({
+fn base_identity() -> serde_json::Value {
+    serde_json::json!({
         "warehouse": "wh",
         "region": "us-east-1",
         "access_key": "AKIABASEIDENTITY",
         "secret_key": BASE_SECRET,
-        "aws_assume_role_arn": ROLE_ARN,
-    });
-    password
-        .as_object_mut()
-        .unwrap()
-        .extend(extra.as_object().unwrap().clone());
-    password.to_string()
+    })
+}
+
+/// A role CONNECTION carrying the base key pair, extended by `extra` fields.
+fn role_password(extra: serde_json::Value) -> String {
+    let mut base = base_identity();
+    base["aws_assume_role_arn"] = ROLE_ARN.into();
+    password_with(base, extra)
 }
 
 #[test]
@@ -1645,33 +1615,34 @@ fn assume_role_fields_are_parsed() {
 }
 
 /// Scenario: A role option is accepted only beside a role
+/// Scenario: A Glue CONNECTION may name a role
 #[test]
-fn external_id_without_a_role_is_rejected() {
-    let password = serde_json::json!({
-        "warehouse": "wh",
-        "secret_key": BASE_SECRET,
-        "aws_external_id": EXTERNAL_ID,
-    })
-    .to_string();
+fn a_role_option_without_a_role_is_rejected_under_every_kind() {
+    for (address, kind) in [
+        ("http://catalog.example.com", CatalogKind::IcebergRest),
+        (GLUE_ADDRESS, CatalogKind::Glue),
+    ] {
+        for (field, value) in [
+            ("aws_external_id", EXTERNAL_ID),
+            ("aws_sts_endpoint", "http://minio:9000"),
+        ] {
+            let password = password_with(base_identity(), serde_json::json!({ field: value }));
+            let err = read_connection(&with_conn(address, &password), Some("MY_CONN"), kind)
+                .expect_err("a role option without a role must be rejected")
+                .to_string();
 
-    let err = read_connection(
-        &with_conn("http://catalog.example.com", &password),
-        Some("MY_CONN"),
-        CatalogKind::IcebergRest,
-    )
-    .expect_err("an external id without a role must be rejected")
-    .to_string();
-
-    assert!(
-        err.contains("aws_external_id"),
-        "must name the field: {err}"
-    );
-    assert!(
-        err.contains("requires aws_assume_role_arn") || err.contains("require aws_assume_role_arn"),
-        "must state the role it requires: {err}"
-    );
-    assert!(!err.contains(EXTERNAL_ID), "{err}");
-    assert!(!err.contains(BASE_SECRET), "{err}");
+            assert!(err.contains(field), "{kind:?}: must name {field}: {err}");
+            assert!(
+                err.contains("requires aws_assume_role_arn")
+                    || err.contains("require aws_assume_role_arn"),
+                "{kind:?}: must state the role it requires: {err}"
+            );
+            assert!(
+                !err.contains(EXTERNAL_ID) && !err.contains(BASE_SECRET),
+                "{kind:?}: {err}"
+            );
+        }
+    }
 }
 
 #[test]
@@ -1732,35 +1703,6 @@ fn assume_role_requires_the_base_key_pair_and_reads_no_ambient_credential() {
             assert!(!err.contains(BASE_SECRET), "{err}");
         }
     }
-}
-
-/// Scenario: A role option is accepted only beside a role
-#[test]
-fn sts_endpoint_without_a_role_is_rejected() {
-    let password = serde_json::json!({
-        "warehouse": "wh",
-        "secret_key": BASE_SECRET,
-        "aws_sts_endpoint": "http://minio:9000",
-    })
-    .to_string();
-
-    let err = read_connection(
-        &with_conn("http://catalog.example.com", &password),
-        Some("MY_CONN"),
-        CatalogKind::IcebergRest,
-    )
-    .expect_err("an STS endpoint without a role must be rejected")
-    .to_string();
-
-    assert!(
-        err.contains("aws_sts_endpoint"),
-        "must name the field: {err}"
-    );
-    assert!(
-        err.contains("requires aws_assume_role_arn") || err.contains("require aws_assume_role_arn"),
-        "must state the role it requires: {err}"
-    );
-    assert!(!err.contains(BASE_SECRET), "{err}");
 }
 
 #[test]
