@@ -8,23 +8,22 @@
 
 ### Context
 
-Issue #330 reported two defects in the vended-storage path: the Unity Catalog vended selector accepted a plaintext `abfs://` location with no operator consent, and the Iceberg vended selector rejected a legal Databricks AWS response that vends short-lived credentials with no endpoint and no region field at all — because the shipped rule required at least one of the two to place the store. Fixing the second defect required deciding, when both the vended response and the CONNECTION carry a non-empty endpoint or region, which one wins.
+The Iceberg vended selector rejected a legal Databricks AWS response that carries credentials but no endpoint or region. Fixing that requires a rule for which source wins when both the vended response and the CONNECTION carry an endpoint or region.
 
 ### Decision
 
-Resolve the vended S3 store address per field, independently: `endpoint` from `ConnectionCreds.endpoint` when non-empty, else the vended `s3.endpoint`, else empty; `region` from `ConnectionCreds.region` when non-empty, else the vended `client.region`, else empty. A backend with both empty is returned successfully and resolves through the AWS default chain. The plaintext-transport consent gate applies to the RESOLVED endpoint regardless of which source supplied it.
+The vended S3 store address is resolved per field. The CONNECTION value wins when non-empty, else the vended value, else empty. A backend with both fields empty is valid and resolves through the AWS default chain. The plaintext-transport consent gate applies to the resolved endpoint, whichever source supplied it.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Resolve `endpoint` and `region` per field, CONNECTION wins when non-empty | ✓ Chosen — an operator who configured a store address means it, and a per-field rule loses no information |
-| Vended-wins-when-present | ✗ Rejected — the interview overruled this reading of the issue's first clause |
-| Whole-source precedence (one source wins both fields together) | ✗ Rejected — a CONNECTION stating only a region beside a response stating only an endpoint would discard one usable value for no reason |
+| Vended value wins when present | Rejected: the interview overruled this reading of the issue |
+| One source wins both fields together | Rejected: discards a usable value when the sources each state only one field |
 
 ### Consequences
 
-Making the consent gate follow the resolved endpoint rather than its origin keeps the rule a statement about the transport the store will actually use, which is the only thing plaintext consent is about. A deployment setting `use_vended_credentials: true` alongside a non-empty CONNECTION `endpoint` or `region` changes behaviour: the CONNECTION value now wins where the vended one used to be discarded.
+The consent gate describes the transport the store will use. A deployment that sets vended credentials plus a non-empty CONNECTION endpoint or region now uses the CONNECTION value, where the vended one used to win.
 
 ## ADR: path_style does not read the CONNECTION, because the field cannot express "unstated"
 
@@ -34,23 +33,22 @@ Making the consent gate follow the resolved endpoint rather than its origin keep
 
 ### Context
 
-The CONNECTION-wins-when-set addressing rule for `endpoint` and `region` left open whether `ConnectionCreds.path_style` should participate the same way, and how it composes with the existing vended-only `s3.path-style-access` override key.
+The CONNECTION-wins rule for endpoint and region left open whether the CONNECTION's `path_style` field participates, and how it composes with the vended `s3.path-style-access` key.
 
 ### Decision
 
-`path_style` = the vended `s3.path-style-access` when the response states a parseable boolean, else whether an endpoint was RESOLVED at all (the CONNECTION's when it won, the vended one otherwise). `ConnectionCreds.path_style` does NOT participate in the CONNECTION-wins rule and is not passed to the vended selectors.
+`path_style` is the vended `s3.path-style-access` value when the response states a parseable boolean, else whether an endpoint was resolved. The CONNECTION's `path_style` does not participate and is not passed to the vended selectors.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Derive `path_style` from the vended value or the resolved-endpoint fallback; exclude `ConnectionCreds.path_style` | ✓ Chosen — the derivation is load-bearing: `register_side_store` treats `path_style` as the gate on whether `endpoint` reaches `AmazonS3Builder` at all |
-| Admit `ConnectionCreds.path_style` under the CONNECTION-wins rule | ✗ Rejected — it is a plain `bool` defaulting to `true` and discards whether the key was present, so it cannot distinguish "the operator set false" from "the operator said nothing"; admitting it would make the vended override unreachable on every CONNECTION that omits the key |
-| Widen `ConnectionCreds.path_style` to `Option<bool>` | ✗ Rejected — ripples into the static `storage_block` path, whose `true` default is shipped behaviour this plan must not change, and into every `ConnectionCreds` literal in the suites, for a knob whose vended derivation already has a correct answer |
+| Apply the CONNECTION-wins rule to `path_style` | Rejected: it is a plain boolean defaulting to true, so it cannot distinguish "set false" from "unset", and the vended override would be unreachable whenever the key is omitted |
+| Widen the CONNECTION field to an optional boolean | Rejected: changes the shipped default on the static storage path and every CONNECTION literal in the tests, for a value the vended derivation already answers |
 
 ### Consequences
 
-The composition question resolves on a type limitation, not a preference, which stops the next reader re-opening it as an oversight. `path_style` keeps its shipped derivation on the vending path; the non-vended `storage_block` path is unaffected.
+The exclusion follows from a type limitation, not a preference. The non-vended static path is unaffected.
 
 ## ADR: Extraction stays forked; policy does not
 
@@ -60,23 +58,22 @@ The composition question resolves on a type limitation, not a preference, which 
 
 ### Context
 
-The Iceberg REST and Unity Catalog vended selectors resolve the same output from different wire inputs. Only scheme classification was shared between them; every policy step after it — the plaintext consent gates and the S3 store-address rule — was copied. The copy stayed consistent in five places and diverged in two: the Unity ADLS arm took no `allow_http` parameter at all, so `abfs://` was always silently accepted over HTTPS, and only the Iceberg selector enforced the store-address rule.
+The Iceberg REST and Unity Catalog vended selectors share only scheme classification. Their copied policy steps diverged in two places: the Unity ADLS arm silently accepted plaintext `abfs://`, and only the Iceberg selector enforced the store-address rule.
 
 ### Decision
 
-Record the principle in the spec library, not only in this plan: a catalog kind MAY fork on HOW a value is read off the wire; it MUST NOT fork on WHAT makes the resulting value acceptable. Consent gates, address rules, and target-variant decisions get exactly one home both kinds call. The per-catalog wire extraction (`select_credential_source` plus flat-map reads for Iceberg REST; typed `TemporaryTableCredentials` field reads for Unity) stays forked because the two wire shapes genuinely differ.
+A catalog kind may fork on how a value is read off the wire. It must not fork on what makes the value acceptable. Consent gates, address rules, and target-variant decisions have one home that both kinds call, and per-catalog wire extraction stays separate.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| One shared home for consent gates, address rules, and target-variant decisions; wire extraction stays per-kind | ✓ Chosen — names the seam so the next divergence is a build or test failure instead of a silent gap |
-| Fix the two defects in place in `unity/vended.rs` | ✗ Rejected — re-copies the gate rather than removing the seam that lost it; defect 1 exists precisely because a copy was incomplete |
-| Unify the wire extraction too, behind a trait | ✗ Rejected as a shallow abstraction — a flat `HashMap` with longest-prefix credential-source selection and a typed three-family response have nothing in common above the neutral values they produce |
+| Fix both defects in place in the Unity selector | Rejected: re-copies the gate instead of removing the seam that lost it |
+| Unify wire extraction behind a trait | Rejected: a flat map and a typed three-family response share nothing above the neutral values they produce |
 
 ### Consequences
 
-The next catalog kind's author reads the rule where it lives rather than re-deriving it. Both defects came from a copy that stayed consistent in five places and diverged in two; naming the seam is what makes the sixth and seventh divergence a build or test failure instead of a silent gap.
+The next catalog kind reads the rule where it lives. A future divergence becomes a build or test failure instead of a silent gap.
 
 ## ADR: Addressing arrives as a capability-narrowed type, and the credential guarantee moves from the signature to a probe
 
@@ -86,23 +83,21 @@ The next catalog kind's author reads the rule where it lives rather than re-deri
 
 ### Context
 
-Before this plan, `resolve_vended_storage` took no `StorageBackend`, `ConnectionCreds`, or other CONNECTION-derived value, so "no CONNECTION storage field is read under vending" was a property of the signature itself. The CONNECTION-wins-when-set addressing decision requires the vended selectors to take a CONNECTION-derived value after all, which would otherwise reopen that guarantee to a silent regression — a vended credential falling back to a static one.
+The vended selectors took no CONNECTION-derived value, so "no CONNECTION storage field is read under vending" held by signature. CONNECTION-wins addressing requires passing a CONNECTION-derived value, which would reopen the risk of a vended credential falling back to a static one.
 
 ### Decision
 
-Add `pub struct StaticStoreAddress` carrying exactly two addressing fields, `endpoint` and `region`, with `Default` and exactly one `impl From<&ConnectionCreds>`, and pass `&StaticStoreAddress` to both vended selectors. Both fields are declared NON-`pub` and read through `pub fn endpoint(&self) -> &str` / `pub fn region(&self) -> &str`, so outside `storage.rs` the type admits only `Default` and that one conversion and a field-by-field literal does not compile. Two source-level probes back it: one asserting the struct's own declaration names no field spelled `access_key`, `secret_key`, `session_token`, `token`, `account_key`, `sas_token`, or `password`, and one asserting the declaration keeps both fields non-`pub`.
+Both vended selectors take a narrow `StaticStoreAddress` type that carries only endpoint and region, with private fields, accessor reads, a default, and one conversion from the CONNECTION credentials. Two source probes assert that the declaration names no credential-like field and keeps both fields private.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| A narrow type with private fields, accessor reads, `Default`, and exactly one conversion, backed by two source probes | ✓ Chosen — the compiler checks every call site in both crates, closing the half a text probe cannot see |
-| Pass `&ConnectionCreds` | ✗ Rejected outright — makes "a vended credential never falls back to a static one" unenforceable, the guarantee the plan must preserve |
-| Pass two bare `&str` parameters | ✗ Rejected — two adjacent same-typed parameters let an endpoint/region transposition compile silently |
-| Build the value at each call site | ✗ Rejected — puts "which CONNECTION fields may cross into vended resolution" in as many places as there are callers |
-| Keep both fields `pub` and enforce the one-construction rule with a source-level probe forbidding a `StaticStoreAddress {` literal outside `storage.rs` | ✗ Rejected — a text probe can only see the sources it enumerates and can be defeated by formatting, and it must carve out `storage.rs` itself, the file whose literals matter least |
+| Pass the full CONNECTION credentials | Rejected: makes the no-static-fallback guarantee unenforceable |
+| Pass two bare string parameters | Rejected: an endpoint/region transposition compiles silently |
+| Build the value at each call site | Rejected: spreads the rule over every caller |
+| Public fields, with a probe forbidding literals outside `storage.rs` | Rejected: a text probe can be defeated by formatting, and the compiler checks every call site |
 
 ### Consequences
 
-The superseded clauses carried the credential guarantee on the signature; superseding them without a replacement mechanism would have left the guarantee as prose. Field privacy closes the "no credential field, no field-by-field construction" half at the compiler; the accessors keep the reading side honest, since `s3_backend` reads the address through them rather than leaving them as dead public surface.
-
+Field privacy makes the compiler enforce the no-credential half of the guarantee, and the accessors keep the read side honest.

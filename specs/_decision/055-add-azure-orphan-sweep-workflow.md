@@ -9,34 +9,19 @@
 
 ### Context
 
-The `azure-e2e` suite's per-run container is deleted by a `Drop` guard that runs
-on normal return and on panic unwind but never on `SIGKILL`, CI cancellation, or
-OOM, so a killed run orphans its container permanently. Azure Blob
-lifecycle-management policies act on blobs, not containers, so no lifecycle rule
-can reclaim an orphan — the finding ADR `azure-e2e-orphan-sweep-out-of-band`
-already recorded. That ADR left the mitigation as an out-of-band sweep "owned
-outside this repository". Issue #291 revisited that placement.
+The Azure E2E container guard does not run on `SIGKILL`, CI cancellation, or OOM, so a killed run orphans its container. Azure lifecycle-management policies cannot delete containers. The superseded ADR left the sweep owned outside this repository, and issue #291 revisited that placement.
 
 ### Decision
 
-Add `.github/workflows/azure-orphan-sweep.yml`, a scheduled (`0 2 * * 1`) plus
-`workflow_dispatch` workflow that reclaims stale `lhrs-e2e-` containers whose
-`last_modified` is older than 24 hours, authenticating with the existing Entra ID
-service principal and never the account key. This supersedes
-`azure-e2e-orphan-sweep-out-of-band`'s placement of the mitigation as tooling
-owned outside this repository; that ADR's finding — a storage-account lifecycle
-rule cannot reclaim a container — stands unchanged.
+A scheduled (weekly) and manually dispatchable GitHub Actions workflow in this repository deletes `lhrs-e2e-` containers last modified more than 24 hours ago. It authenticates with the existing Entra ID service principal, never the account key. The superseded ADR's finding stands: a lifecycle rule cannot reclaim a container.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| In-repo scheduled GitHub Actions workflow | ✓ Chosen — lives beside the suite that leaks the containers, versioned and reviewed in the same repo; no separate Azure resource to provision or own |
-| Azure Function (timer trigger) | ✗ Rejected — a separate cloud resource to provision and own for a low-frequency cleanup |
-| Keep the mitigation owned outside the repository (prior ADR wording) | ✗ Rejected — issue #291 asked exactly this placement question and this plan answers it |
+| Azure Function with a timer trigger | Rejected: a separate cloud resource to provision and own for a low-frequency cleanup |
+| Keep the sweep owned outside the repository | Rejected: issue #291 asked for exactly this placement and this plan answers it |
 
 ### Consequences
 
-The mitigation is now versioned and reviewable in this repository. The
-still-valid finding that a lifecycle rule cannot target a container carries
-forward unchanged from the superseded ADR.
+The mitigation is versioned and reviewed beside the suite that leaks the containers.

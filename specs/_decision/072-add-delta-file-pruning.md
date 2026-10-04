@@ -8,28 +8,21 @@
 
 ### Context
 
-`DeltaFormatReader::resolve_scan` dropped the request filter, so every Delta query read every active
-file. `ScanBuilder::with_predicate` drives both partition pruning and stats-based skipping through one
-private `DataSkippingFilter` pass inside `delta_kernel`, and `scan_metadata()` already returns a
-selection vector `append_active_files` can consume.
+`DeltaFormatReader::resolve_scan` dropped the request filter, so every Delta query read every active file. `delta_kernel` already performs partition pruning and stats-based skipping from a predicate and returns a selection vector.
 
 ### Decision
 
-Build a `delta_kernel::Predicate` and hand it to `ScanBuilder::with_predicate`, then consume the
-selection vector `scan_metadata()` already returns. Compare no bound, parse no stats JSON, and
-post-filter no resolved file list.
+The adapter translates the filter into a `delta_kernel` predicate and consumes the kernel's selection vector. It compares no bounds, parses no stats JSON, and does not post-filter the resolved file list.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Build the kernel predicate, consume the kernel's selection vector | ✓ Chosen — `append_active_files` already honours `selected`, so pruning costs one builder call and no restructuring; mirrors the Iceberg reader's `plan_files` contract |
-| Read `add.stats` directly and filter the constructed `Vec<FileEntry>` | ✗ Rejected — the comparison logic lives in a `pub(crate)` `DataSkippingFilter` that cannot be reached or faithfully reimplemented; a second copy of Delta's bound semantics would drift from the kernel's |
+| Read `add.stats` and filter the file list in the adapter | Rejected: the kernel's comparison logic is unreachable, and a second copy of Delta bound semantics would drift |
 
 ### Consequences
 
-Pruning correctness rides entirely on the kernel's own contract rather than a second, hand-rolled
-bound-comparison implementation. The reader gains a predicate parameter and loses nothing else.
+Pruning correctness rests on the kernel's contract, not a hand-rolled comparison.
 
 ## ADR: Trust Delta's writer-side string-bound invariant, and say so
 
@@ -39,28 +32,21 @@ bound-comparison implementation. The reader gains a predicate parameter and lose
 
 ### Context
 
-Delta protocol's "Per-file Statistics" footnote — "String columns are cut off at a fixed prefix
-length" — reads as though a truncated `maxValues` could fall below the true max, which would make range
-pruning drop real rows. This had to be verified rather than assumed, because it was the one finding
-capable of making the whole feature unsound.
+The Delta protocol says string statistics are cut off at a fixed prefix length. A truncated `maxValues` below the true maximum would make range pruning drop real rows.
 
 ### Decision
 
-Translate comparisons over string data columns and rely on `maxValues` being a true upper bound,
-recording the reliance as a deliberate protocol-trust trade-off in the spec.
+The adapter translates comparisons over string columns and relies on `maxValues` being a true upper bound. The spec records this as a deliberate protocol-trust trade-off.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Translate string comparisons, trust the writer-side bound invariant | ✓ Chosen — delta-spark's `truncateMaxStringAgg` appends a tie-breaker or omits the stat rather than relaxing the bound; `parquet`'s `increment_utf8` upholds the same invariant independently; the kernel's own asymmetric timestamp-only compensation (`adjust_scalar_for_max_stat_truncation`) confirms the string half needs none |
-| Refuse to translate any comparison over a string data column | ✗ Rejected — forfeits real pruning, including `multi_part_stats`'s `value` column, to defend against a writer no shipped implementation matches |
+| Refuse to translate string comparisons | Rejected: forfeits real pruning to defend against a writer that no shipped implementation matches |
 
 ### Consequences
 
-Pruning trusts a writer-side protocol invariant no shipped implementation violates. A writer that
-emitted a bare untagged prefix would defeat this undetectably — a protocol-trust assumption shared by
-every Delta reader, named rather than hidden.
+delta-spark and `parquet` both keep the bound valid, and the kernel compensates only for timestamps. A writer that emitted a bare untagged prefix would defeat pruning undetectably, an assumption every Delta reader shares.
 
 ## ADR: A third independent filter-JSON walker, with the shared IR filed rather than built
 
@@ -70,27 +56,21 @@ every Delta reader, named rather than hidden.
 
 ### Context
 
-Three components already walk the same Exasol filter JSON toward three different outputs: the Iceberg
-translator produces an `iceberg::spec::Predicate`, the DataFusion renderer produces a SQL string via
-`render_df_filter_safe`, and this feature adds a `delta_kernel::Predicate` translator. Their literal
-vocabularies and bound-soundness contracts differ throughout.
+The Iceberg translator and the DataFusion renderer already walk the same Exasol filter JSON, and Delta pruning adds a third walker. Their literal vocabularies and bound-soundness contracts differ.
 
 ### Decision
 
-Write `delta_predicate.rs` as a third independent walker over the same filter JSON, structurally
-mirroring `to_iceberg_predicate`'s node dispatch. Do not extract a shared predicate IR.
+`delta_predicate.rs` is a third independent walker that mirrors the Iceberg translator's node dispatch. No shared predicate IR is extracted.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| A third independent walker, structurally mirroring the Iceberg translator | ✓ Chosen — each walker's literal vocabulary and bound-soundness contract differs (Iceberg's `upper_bounds` carries no truncation caveat, Delta's does), and `render_df_filter_safe` exposes no typed AST to reuse |
-| Extract a shared format-neutral predicate IR consumed by all three | ✗ Rejected — would unify three output types and two literal vocabularies into a fourth vocabulary sized by their union, a large refactor of shipped, tested code justified by no requirement in this plan; filed as a follow-up |
+| Shared format-neutral predicate IR for all three | Rejected: a large refactor of shipped code that no requirement here justifies, filed as a follow-up |
 
 ### Consequences
 
-Three vocabularies stay duplicated rather than unified. The duplication is named explicitly so a third
-format, if one arrives, makes the case for a shared IR rather than re-litigating this decision.
+Three vocabularies stay duplicated. A third format would make the case for a shared IR.
 
 ## ADR: Never construct a false predicate or an empty junction
 
@@ -100,25 +80,18 @@ format, if one arrives, makes the case for a shared IR rather than re-litigating
 
 ### Context
 
-`delta_kernel::Predicate::or_from([])` normalizes an empty disjunction to literal `false`, which would
-prune every file and return no rows — a wrong-results bug wearing the costume of an optimization. The
-exposure is real: the kernel has no usable IN (`eval_pred_in` returns `None` with no override), so every
-IN list desugars to an OR-chain, and an IN list whose elements all fail to convert is exactly the empty
-case.
+The kernel turns an empty disjunction into literal `false`, which prunes every file and returns no rows. The kernel has no usable IN, so every IN list becomes an OR-chain, and an IN list whose elements all fail to convert is the empty case.
 
 ### Decision
 
-Return `None` before any junction constructor sees an empty set, and assert in tests that no input
-produces `Predicate::literal(false)`.
+The translator returns no predicate before any junction constructor sees an empty set. Tests assert that no input produces a literal false predicate.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Explicit early return before every junction constructor, tested directly | ✓ Chosen — closes the exposure at its source and is verifiable independent of the translator's overall structure |
-| Rely on the translator's structure making the empty case unreachable | ✗ Rejected — unreachability by construction is one forgotten early return away from a silent wrong-results bug |
+| Rely on the translator's structure to make the empty case unreachable | Rejected: one forgotten early return from a silent wrong-results bug |
 
 ### Consequences
 
-The empty-junction rule is enforced by an explicit guard and a dedicated test rather than by incidental
-structure, so a future edit to the translator cannot reintroduce the false-predicate hazard unnoticed.
+An explicit guard and a dedicated test prevent a later edit from reintroducing the hazard unnoticed.

@@ -9,29 +9,19 @@
 
 ### Context
 
-Once the LIKE-subject guard is added to the select-list pipeline, its body becomes byte-identical
-to the filter pipeline's — both run the same three passes in the same order. Two names for one
-body is a redundancy nothing enforces; the split's original justification (differing pass lists)
-no longer holds.
+Once the select-list pipeline gains the LIKE-subject guard, both pipelines run the same three passes in the same order, so two functions have one body.
 
 ### Decision
 
-Delete `apply_select_item_type_rewrites` outright and rename `apply_filter_type_rewrites` to
-`pub(super) fn apply_type_rewrites`, so one function serves both render surfaces. The signature
-`(&Json, &[(String, String)]) -> Option<Json>` is unchanged, so every call site is a bare
-identifier swap the compiler verifies.
+One function, `apply_type_rewrites`, serves both render surfaces, and the select-list function is deleted. The signature is unchanged, so each call-site change is a rename the compiler verifies.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Collapse into one function, in this plan, as its last task | ✓ Chosen — the signature-preserving rename buys no safety by deferral, and doing the collapse in the same plan avoids a window where the library defends a redundancy nobody intends to keep |
-| Defer the collapse to its own change | ✗ Rejected — buys no safety (compiler-verified rename), only a second plan/review/PR cycle for a rename over already-correct behavior |
-| Keep `apply_select_item_type_rewrites` as a thin `pub(super)` alias | ✗ Rejected — module-private with one production caller, so no external consumer an alias could protect; a pass-through method with no purpose |
+| Defer the collapse to a later change | Rejected: the rename is compiler-verified, so deferral only adds a plan, review, and PR cycle |
+| Keep the select-list function as an alias | Rejected: the function is module-private with one production caller, so an alias protects nothing |
 
 ### Consequences
 
-One pipeline function now owns the pass order for both render surfaces. The function's doc
-comment states the two decline meanings abstractly rather than by caller name, which is what lets
-it serve both. The narrowing to one `pub(super)` entry point applies uniformly instead of
-differing per surface.
+One function owns the pass order. Its doc comment states the two decline meanings abstractly, not by caller name.

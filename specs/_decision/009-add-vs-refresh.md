@@ -8,26 +8,18 @@
 
 ### Context
 
-The only supported way to re-read the catalog was `DROP ... CASCADE` + `CREATE`, which
-destroys dependent views and grants. The adapter is stateless (mission.md; CLAUDE.md
-"Architecture boundaries" — no caching, no metadata persistence).
+Re-reading the catalog required `DROP ... CASCADE` and `CREATE`, which destroys dependent views and grants. The adapter is stateless, with no caching or metadata persistence.
 
 ### Decision
 
-Route `refresh` and `setProperties` through the existing `handle_create_virtual_schema`
-enumeration: full namespace re-enumeration, `TABLE_MAP` rebuilt from scratch, unrelated
-`adapterNotes` entries preserved.
+`refresh` and `setProperties` run the existing create-virtual-schema enumeration. It re-enumerates the full namespace, rebuilds `TABLE_MAP` from scratch, and preserves unrelated `adapterNotes` entries.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Reuse `handle_create_virtual_schema`'s full enumeration | ✓ Chosen — refresh is "re-run create", matching the DROP+CREATE workaround minus the destruction; no reinvented listing/mapping code |
-| A separate refresh path that diffs prior `TABLE_MAP` against the catalog | ✗ Rejected — diffing introduces cross-request state the stateless architecture forbids |
+| Separate refresh path that diffs the prior `TABLE_MAP` against the catalog | Rejected: needs cross-request state, which the stateless architecture forbids |
 
 ### Consequences
 
-Refresh and setProperties get correctness for free from the already-verified
-`createVirtualSchema` path, at the cost of always paying full-namespace enumeration cost even
-for a single-table `REFRESH TABLES <t>`.
-
+Refresh pays the full-namespace enumeration cost even for a single-table `REFRESH TABLES <t>`.

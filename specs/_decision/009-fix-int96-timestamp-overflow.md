@@ -8,29 +8,19 @@
 
 ### Context
 
-The scan bypasses iceberg-rust's own reader, so a custom `ParquetFormat` never inherits
-iceberg-rust's INT96 fix. With `coerce_int96` unset, arrow-rs decodes any Parquet INT96
-timestamp column as `Timestamp(Nanosecond)`, whose i64 range spans only 1677-09-21 to
-2262-04-11. A far-future INT96 value (e.g. `9999-12-31 23:59:59`, written by legacy tools
-such as Fivetran) overflows at decode time on a plain `SELECT *` (issue #143).
+The scan bypasses the iceberg-rust reader, so it does not inherit that reader's INT96 fix. By default arrow-rs decodes Parquet INT96 as nanosecond timestamps, which cover only 1677 to 2262. A far-future INT96 value such as `9999-12-31 23:59:59` overflows on decode (#143).
 
 ### Decision
 
-Set `coerce_int96 = "us"` and `coerce_int96_tz = "UTC"` on every `ParquetFormat` the scan
-constructs. INT96 timestamp columns decode as `Timestamp(Microsecond, "UTC")`.
+The scan decodes every Parquet INT96 timestamp as microsecond precision in UTC. This matches Iceberg Java and the Iceberg spec's microsecond timestamp types.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| `coerce_int96 = "us"`, `coerce_int96_tz = "UTC"` | ✓ Chosen — matches Iceberg Java's pragmatic default and the Iceberg spec's microsecond `timestamp`/`timestamptz` definitions; an INT96 instant is UTC |
-| `coerce_int96 = "ns"` (arrow-rs default) | ✗ Rejected — the source of the overflow being fixed |
-| A defensive clamp or out-of-range fallback on top of the decode | ✗ Rejected — explicitly declined in the interview; root-cause only |
+| Keep the nanosecond default | Rejected: it causes the overflow |
+| Add a clamp or out-of-range fallback on top of decoding | Rejected: fix the root cause only |
 
 ### Consequences
 
-Far-future INT96 timestamps through year 9999 decode and scan without overflow. INT96's
-sub-microsecond digits are truncated, a named trade-off consistent with Iceberg's
-microsecond `timestamp` model. Values above Exasol's own `TIMESTAMP` maximum (year > 9999)
-remain unscannable, now failing at the Exasol emit boundary instead of at arrow-decode.
-
+INT96 sub-microsecond digits are truncated. Values above year 9999 remain unscannable and now fail at the Exasol emit boundary instead of at decode.

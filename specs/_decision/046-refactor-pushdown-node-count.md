@@ -9,25 +9,22 @@
 
 ### Context
 
-`CLUSTER_NODES` was persisted into `schemaMetadata.adapterNotes` at `createVirtualSchema` and read back at `pushdown`, duplicating one decision — where the node count comes from — across a writer and a reader that agreed only through the untyped string key `"CLUSTER_NODES"`. That is back-door information leakage, and it contradicts the mission's rule that UDFs hold no cross-call state and resolve metadata per query. It also froze the shard fan-out to the node count at `CREATE VIRTUAL SCHEMA` time until an operator ran `REFRESH`.
+`CLUSTER_NODES` was written into `schemaMetadata.adapterNotes` at virtual schema creation and read at pushdown, so a writer and a reader agreed only through an untyped string key. This contradicts the mission rule that UDFs hold no cross-call state and resolve metadata per query, and it froze shard fan-out at the creation-time node count until `REFRESH`.
 
 ### Decision
 
-Adopt as a standing rule: `schemaMetadata.adapterNotes` carries a value only when the value is derived at create time and a pushdown cannot recompute it. `TABLE_MAP` qualifies (recomputing it costs a catalog namespace enumeration per query); handshake metadata never qualifies. `CLUSTER_NODES` is deleted as a write. No in-place migration mechanism is added for a note persisted by a pre-refactor adapter version — an operator upgrading past this change drops and recreates the virtual schema, per architect review (PR #282) — so an inherited `CLUSTER_NODES` entry simply survives the merge like any other foreign key, unread and inert.
+`adapterNotes` holds a value only when it is derived at create time and a pushdown cannot recompute it. `TABLE_MAP` qualifies because recomputing it costs a namespace enumeration per query, and handshake metadata never qualifies. The adapter stops writing `CLUSTER_NODES` and adds no migration. Per architect review (PR #282), an operator upgrading past this change drops and recreates the virtual schema, so an inherited `CLUSTER_NODES` entry stays unread and inert.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Drop only the write and let an inherited key persist unread on pre-refactor schemas | ✓ Chosen — an operator upgrading past this change drops and recreates the virtual schema rather than upgrading in place, so no code needs to reach into and rewrite a schema's persisted state; a merge that leaves a stale, unread foreign key is no different from any other stale metadata the drop-and-recreate step discards |
-| Stop writing `CLUSTER_NODES`; actively remove any inherited key on every response | ✗ Rejected (reversed after initial acceptance, on architect review) — builds and maintains removal machinery, a tracked follow-up issue, and a dedicated manual test gate to solve a problem the operational upgrade path already solves without any code |
-| Treat `adapterNotes` as a general-purpose cache for anything convenient at pushdown time | ✗ Rejected — the de facto status quo that produced `CLUSTER_NODES`, and the next convenient value would follow it in |
+| Actively remove an inherited key on every response | Rejected: needs removal code, a follow-up issue, and a manual test gate for a problem that drop-and-recreate already solves |
+| Use `adapterNotes` as a general cache for anything convenient at pushdown | Rejected: this status quo produced `CLUSTER_NODES` |
 
 ### Consequences
 
-This rule reverses the superseded ADR's decision to record the node count as `CLUSTER_NODES`, while retaining that ADR's `UdfContext::node_count()` source and its `0 => 1` floor. No tombstone constant, no active-removal code path, and no tracked cleanup issue exist for this — a virtual schema created before this change keeps a stale `CLUSTER_NODES` key in its persisted notes indefinitely, unread and harmless, until the schema is dropped and recreated on the new adapter version.
-
-Treat the shift from a create-time-frozen node count to a per-pushdown live one as intended, and state it in `plan.md` § Impact rather than suppressing it.
+The node count now comes live per pushdown instead of frozen at creation, which `plan.md` § Impact states. The superseded ADR's `UdfContext::node_count()` source and `0 => 1` floor stay. No tombstone constant, removal path, or cleanup issue exists.
 
 ## ADR: Capture the Handshake Read in `dispatch`; Pass a Value, Never `ctx`, into Async Planning
 
@@ -37,20 +34,18 @@ Treat the shift from a create-time-frozen node count to a per-pushdown live one 
 
 ### Context
 
-`node_count()` is a synchronous UDF-handshake read that may block on the UDF host, and `handle_pushdown_request` is `async`. `dispatch`'s pushdown arm already captures `ctx.script_schema()` and the resolved CONNECTION credentials before `rt.block_on` for exactly this reason.
+`node_count()` is a synchronous handshake read that may block on the UDF host, and pushdown planning is `async`. `dispatch` already captures the script schema and CONNECTION credentials before `rt.block_on` for this reason.
 
 ### Decision
 
-`dispatch`'s pushdown arm calls `cluster_nodes_from_context(ctx)` before `rt.block_on`, and `handle_pushdown_request` gains a plain `cluster_nodes: usize` parameter instead of reading `ctx` itself.
+`dispatch` reads the node count before `rt.block_on` and passes a plain `usize` into pushdown planning.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Capture in `dispatch`, thread a plain `usize` into async planning | ✓ Chosen — joins the two sibling captures (`script_schema`, CONNECTION config) already established at this boundary, and keeps async planning code free of ambient reads and of any dependency on the UDF delivery mechanism |
-| Pass `&mut dyn UdfContext` into `handle_pushdown_request` and read `node_count()` there | ✗ Rejected — the obvious shortcut, but it re-introduces a synchronous, potentially-blocking handshake read inside the tokio runtime and couples async planning code to the delivery mechanism |
+| Pass the UDF context into planning and read there | Rejected: puts a blocking handshake read inside the tokio runtime and couples planning to the UDF delivery mechanism |
 
 ### Consequences
 
-`cluster_nodes_from_context(ctx: &dyn UdfContext) -> usize` becomes the single owner of the node-count decision, applying the `0 => 1` floor and widening to `usize`. `handle_pushdown_request`'s arity changes, which the compiler enumerates across all 19 `build_adapter_notes`-adjacent call sites during implementation.
-
+`cluster_nodes_from_context` owns the node-count decision, including the `0 => 1` floor. The planning function's arity changes, which the compiler enumerates across 19 call sites.

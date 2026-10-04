@@ -8,33 +8,21 @@
 
 ### Context
 
-An `ORDER BY` on an expression or aggregate absent from the client's select list leaks an
-extra `HIDDEN_COL_n` result column (issue #198), because Exasol silently appends the sort
-key to the pushed `selectList` while `ORDER_BY_EXPRESSION` is unadvertised. Measured on the
-wire: `SELECT id, c_price FROM t ORDER BY ABS(c_price)` (the bug) and `SELECT id, c_price,
-ABS(c_price) AS a FROM t ORDER BY ABS(c_price)` (correct, genuinely selected) push a
-byte-identical `selectList` and yield identical adapter-generated SQL — Exasol picks the
-client-facing column name (`HIDDEN_COL_2` vs `A`) server-side with no signal to the adapter.
-An exhaustive key scan of the raw payload found no disambiguating field.
+While `ORDER_BY_EXPRESSION` is unadvertised, Exasol appends the sort key of an expression `ORDER BY` to the pushed `selectList`, which leaks a `HIDDEN_COL_n` column (issue #198). The payload is byte-identical to a query that genuinely selects that expression, and no field distinguishes the two.
 
 ### Decision
 
-Fix #198 by advertising `ORDER_BY_EXPRESSION`, so Exasol pushes a structured `orderBy`
-element instead of appending the sort key to the `selectList`.
+The adapter advertises `ORDER_BY_EXPRESSION`, so Exasol pushes a structured `orderBy` element.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Advertise `ORDER_BY_EXPRESSION` | ✓ Chosen — the wire payload is byte-identical between the leaking and correct shapes, so advertising is the only mechanism that removes the ambiguity |
-| Detect the trailing appended `selectList` item and strip it | ✗ Rejected — proven impossible, not merely difficult: no test on the payload can be correct for both shapes |
+| Detect and strip the appended select-list item | Rejected: impossible, since no test on the payload is correct for both shapes |
 
 ### Consequences
 
-The adapter gains an obligation to render every ordered shape it can now reach faithfully
-(see the atomicity ADR below), but the leak is closed at the only point that can close it,
-and the fix generalizes to every consumer of a pushed `orderBy`, not just issue #198's own
-repro shapes.
+The adapter must render every ordered shape it can now receive. The fix covers every consumer of a pushed `orderBy`.
 
 ## ADR: Render a declined-path expression ORDER BY over hidden base columns in the Exasol dialect
 
@@ -44,30 +32,21 @@ repro shapes.
 
 ### Context
 
-The declined row-scan wrapper needs to render an expression or aggregate sort key Exasol
-delegates but the adapter cannot bound as a per-shard top-N. Exasol declares a result type
-only for `selectList` items, never for a sort-key expression, so no Exasol EMITS type exists
-for a value the sort expression alone would compute.
+The declined row-scan wrapper must render an expression sort key. Exasol declares result types only for select-list items, so no EMITS type exists for a computed sort expression.
 
 ### Decision
 
-Append the sort expression's referenced BASE columns as hidden scan columns, each carrying
-its declared Exasol type read from `involvedTables[0].columns`, and render the wrapper's
-outer `ORDER BY` as the expression translated to the Exasol dialect over those emitted
-identifiers, so Exasol evaluates the sort expression itself.
+The adapter appends the sort expression's base columns as hidden scan columns, typed from `involvedTables[0].columns`. The wrapper's outer `ORDER BY` renders the expression in the Exasol dialect over those columns, so Exasol evaluates it.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Hidden base columns + Exasol-dialect expression rendering | ✓ Chosen — base columns already carry a declared type from `involvedTables[0].columns`; no type has to be invented |
-| Hidden DataFusion-computed expression column, sorted on its emitted alias | ✗ Rejected — needs a declared EMITS type Exasol never supplies; a wrong guess breaks per-column coercion or corrupts the ranking (e.g. a VARCHAR guess sorts lexicographically) |
+| Hidden DataFusion-computed expression column | Rejected: needs an EMITS type Exasol never supplies, and a wrong guess breaks coercion or ordering (a VARCHAR guess sorts lexicographically) |
 
 ### Consequences
 
-The Exasol-dialect renderer (`crates/vs-expression`), already used by the qualified wrapper
-and the N-scan join wrapper for their own clauses, becomes the single seam every
-Exasol-evaluated `ORDER BY` clause routes through — no second renderer is introduced.
+The Exasol-dialect renderer is the single route for every Exasol-evaluated `ORDER BY` clause, with no second renderer.
 
 ## ADR: A grouped ORDER BY over an aggregate absent from the select list routes to the qualified single-table wrapper
 
@@ -77,29 +56,18 @@ Exasol-evaluated `ORDER BY` clause routes through — no second renderer is intr
 
 ### Context
 
-A grouped `ORDER BY` may sort on an aggregate the select list does not carry (issue #198's
-own "top N groups" repro). The outer merge wrapper's only columns are `GK_*` and
-`PARTIAL_*`; an aggregate absent from the detected select-list plans has no `PARTIAL_*`
-column to merge over, and Exasol declares a result type only for `selectList` items — never
-for an aggregate outside it.
+A grouped `ORDER BY` can sort on an aggregate outside the select list. The merge wrapper has only group-key and partial columns, and Exasol declares no type for that aggregate.
 
 ### Decision
 
-Resolve the aggregate sort key against the detected select-list plans via the existing
-HAVING merge rewriter. A match keeps the partial/merge path; no match routes the request to
-`RequestShape::GroupByWrapper` instead of the prior hard error.
+The adapter resolves the aggregate sort key against the detected select-list plans with the HAVING merge rewriter. A match keeps the partial/merge path, and no match routes to the qualified single-table wrapper, not to an error.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Route an unresolvable aggregate sort key to the qualified single-table wrapper | ✓ Chosen — the wrapper needs no fabricated type at all, and is the recorded issue #195 precedent for the structurally identical unmergeable-HAVING case |
-| Append the missing aggregate as an extra `PARTIAL_*` plan | ✗ Rejected — needs a fabricated Exasol type for a column Exasol never declared one for; risks SUM overflow and precision-driven misordering |
+| Append the aggregate as an extra partial plan | Rejected: needs a fabricated Exasol type and risks SUM overflow and misordering |
 
 ### Consequences
 
-The "top N groups" shape and the different-aggregate-in-select-list shape both get a
-correct bounded answer instead of a hard error, at the cost of losing partial/merge
-decomposition for that one request; a bounded partial/merge variant for the not-selected
-case is tracked as future work (issue #249), named explicitly rather than left an unstated
-gap.
+Such requests return a correct bounded answer but lose partial/merge decomposition. A bounded variant is tracked as issue #249.

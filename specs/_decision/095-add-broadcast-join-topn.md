@@ -8,40 +8,20 @@
 
 ### Context
 
-A per-shard post-join top-N is correct only when each shard's local ordering agrees with the
-Exasol-side wrapper's ranking of the merged rows. Three emitted values differ from the native
-value the shard's own scan reads: a column the JSON rendering or the `CAST(... AS VARCHAR)`
-fallback covers arrives as text, an emitted empty string arrives as NULL because Exasol's
-VARCHAR domain has no empty string (`'' IS NULL` is TRUE, captured live), and an emitted `NaN`
-in a `Float32`/`Float64` column arrives as NULL because the `emit_batch` path returns a silent
-NULL for it (issue #246). If a shard ranked the native value instead, its cut could drop a row
-that the wrapper's global top-N needs, returning wrong rows with no error. `arrow_type_to_tag`
-maps nested and binary types to `utf8`, so the adapter cannot see which keys the scan renders
-as JSON, ruling out a plan-time guard.
+A per-shard post-join top-N is correct only when each shard's ordering agrees with the Exasol wrapper's ranking of the merged rows. Three emitted values differ from the native value the scan reads. JSON or `CAST(... AS VARCHAR)` fallback columns arrive as text. An empty string arrives as NULL, because Exasol's VARCHAR has no empty string. A `NaN` in a `Float32` or `Float64` column arrives as NULL (issue #246). If a shard ranked the native value, its cut could drop a row the wrapper needs, and the query would return wrong rows without error. The adapter cannot see which keys render as JSON, because `arrow_type_to_tag` maps nested and binary types to `utf8`, so a plan-time guard is not possible.
 
 ### Decision
 
-A per-shard sort whose output a merge re-ranks ranks the value the merge sees, and the module
-that renders the emitted value owns that rule. For the join scan, `build_join_sql` renders each
-post-join sort key over the key column's emitted expression, the same `render_join_select_item`
-output the select list uses, wrapped in `nullif(<expr>, '')` for a string key and in
-`CASE WHEN isnan(<expr>) THEN NULL ELSE <expr> END` for a `Float32`/`Float64` key. Direction and
-NULL placement render through `SortKey::render_ordered`, the shared direction/NULL-placement
-seam.
+A per-shard sort whose output a merge re-ranks ranks the value the merge sees, and the module that renders the emitted value owns that rule. For the join scan, `build_join_sql` renders each post-join sort key over the key column's emitted expression, the same one the select list uses. A string key is wrapped in `nullif(<expr>, '')` and a float key in `CASE WHEN isnan(<expr>) THEN NULL ELSE <expr> END`. Direction and NULL placement render through the shared `SortKey::render_ordered`.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Render post-join sort keys by the emitted value, owned by the join scan | ✓ Chosen — matches the wrapper's ranking of the rows it actually receives |
-| Render the keys with `render_order_by_clause`, as the raw scan does | ✗ Rejected — ranks the native value, which diverges from the emitted value the wrapper ranks |
-| A plan-time guard that withholds the per-shard bound for a JSON-fallback key, as `detect_topn` does | ✗ Rejected — `arrow_type_to_tag` collapses nested/binary types to `utf8`, hiding the JSON-rendered keys from the adapter; also leaves the empty-string divergence open |
-| Withhold the per-shard bound for every string key | ✗ Rejected — a string column is a common sort key, and the emitted-value rule serves it correctly |
+| Render keys with `render_order_by_clause`, as the raw scan does | Rejected: ranks the native value, which differs from the one the wrapper ranks |
+| Plan-time guard that withholds the per-shard bound for a JSON-fallback key | Rejected: nested and binary types are hidden behind `utf8`, and the empty-string divergence stays open |
+| Withhold the per-shard bound for every string key | Rejected: string columns are common sort keys, and the emitted-value rule serves them correctly |
 
 ### Consequences
 
-The rule assumes DataFusion's string comparison agrees with Exasol's VARCHAR comparison — verified
-live for partition values (byte/codepoint order, `direct-storage-hive-partitioning/spec.md`), not
-yet for an arbitrary sort key's string value, the same unverified gap the flat-scan top-N path
-carries. A future fix of issue #246's emitted `NaN`, or of the flat-scan ranking divergence, follows
-this rule too.
+The rule assumes DataFusion's string comparison agrees with Exasol's VARCHAR comparison. That is verified live for partition values but not for arbitrary sort keys, the same gap the flat-scan top-N path has. A future fix of issue #246 or of the flat-scan ranking divergence follows this rule too.

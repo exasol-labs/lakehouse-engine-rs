@@ -8,27 +8,18 @@
 
 ### Context
 
-AWS Glue's Iceberg REST catalog requires the REST prefix in the `catalogs/{catalogId}`
-form. The adapter's SigV4 path passed the configured `warehouse` straight through,
-so a bare account id reached Glue unprefixed and Glue returned
-`400 "Prefix must follow the 'catalogs/{catalogId}' format."` (#123).
+AWS Glue's Iceberg REST catalog requires the prefix `catalogs/{catalogId}`. The adapter passed the configured `warehouse` through unchanged, so a bare account id made Glue return a 400 error (#123).
 
 ### Decision
 
-Under SigV4/Glue, derive `catalogs/{warehouse}` from the configured bare account id
-inside the adapter. The user continues to supply the bare account id as `warehouse`
-everywhere — docs, bench config, and deploy config.
+Under SigV4/Glue, the adapter derives `catalogs/{warehouse}` from the bare account id. Users supply the bare account id as `warehouse` everywhere.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Derive the prefix in code from the bare account id | ✓ Chosen — matches standard Iceberg-client behavior; keeps one documented input value correct across code, docs, bench, and deploy |
-| Require users to enter `catalogs/{account-id}` themselves | ✗ Rejected — diverges from every other Iceberg client and this project's own docs; pushes a Glue-proprietary path convention onto the user |
+| Require users to enter `catalogs/{account-id}` | Rejected: diverges from other Iceberg clients and project docs, and exposes a Glue-specific convention |
 
 ### Consequences
 
-A bare AWS account id is the sole correct `warehouse` value across every surface.
-The adapter owns the Glue-proprietary `catalogs/` convention, so docs, bench
-README, and Terraform config no longer need a manual workaround note.
-
+The bare account id is the only correct `warehouse` value on every surface. Docs and deploy config need no workaround note.

@@ -8,33 +8,19 @@
 
 ### Context
 
-`GREATEST`/`LEAST` shared Exasol's name and arity with a DataFusion function of the same name, but
-not its NULL contract: Exasol returns NULL if ANY argument is NULL (captured live on the pinned
-Exasol 2025.2.1 container), while DataFusion's `greatest`/`least` return NULL only if ALL arguments
-are NULL (`datafusion-functions-54.1.0/src/core/greatest.rs:40`, `.../least.rs:40`). The 1:1 name
-mapping the translator used diverged on every pushed-down call over a nullable argument, causing
-issue #202's silent wrong results end-to-end.
+Exasol `GREATEST` and `LEAST` return NULL if any argument is NULL, and DataFusion's functions of the same name return NULL only if all arguments are NULL. The 1:1 name mapping gave silent wrong results over nullable arguments (issue #202). Exasol never re-checks a delegated capability, so a differing rendering returns wrong rows.
 
 ### Decision
 
-When a DataFusion function shares an Exasol function's name and arity but not its NULL contract,
-the DataFusion-dialect rendering wraps the call in whatever SQL reproduces Exasol's contract.
-Withdrawing the capability is not the remedy.
+When a DataFusion function shares an Exasol function's name and arity but not its NULL contract, the DataFusion-dialect rendering wraps the call in SQL that reproduces Exasol's contract. The adapter does not withdraw the capability.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| NULL-guard the DataFusion rendering | ✓ Chosen — fixes the semantics at the source, keeps the pushdown and the projection/filter narrowing it enables, and generalizes the precedent already set for `CONCAT` (issue #200) |
-| Withdraw `FN_GREATEST`/`FN_LEAST` from `capabilities.rs` | ✗ Rejected — forfeits the pushdown and treats a fixable rendering defect as an unfixable capability gap |
-| Register a custom DataFusion UDF with Exasol semantics | ✗ Rejected — adds a scan-side registration and puts the contract in a second place |
+| Withdraw `FN_GREATEST` and `FN_LEAST` from `capabilities.rs` | Rejected: forfeits the pushdown for a fixable rendering defect |
+| Register a custom DataFusion UDF with Exasol semantics | Rejected: adds a scan-side registration and a second home for the contract |
 
 ### Consequences
 
-Exasol delegates an advertised predicate or function shape fully and never independently
-re-checks it, so there is no engine-side safety net once a capability is advertised — an adapter
-that renders different semantics returns wrong rows, not a deferred check. This decision commits
-the adapter to reproducing the target engine's NULL contract for every advertised capability, not
-just `GREATEST`/`LEAST`, making future NULL-semantics divergences (like `CONCAT`'s) a rendering fix
-rather than a capability withdrawal.
-
+The rule covers every advertised capability, so a future NULL divergence, like `CONCAT`'s, is a rendering fix and not a capability withdrawal.
