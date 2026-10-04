@@ -1,8 +1,8 @@
-const WORKSPACE_CLAUDE_MD: &str = include_str!("../../../CLAUDE.md");
+const WORKSPACE_AGENTS_MD: &str = include_str!("../../../AGENTS.md");
 
 #[test]
 fn host_release_build_documented_unloadable() {
-    let doc = WORKSPACE_CLAUDE_MD.to_lowercase();
+    let doc = WORKSPACE_AGENTS_MD.to_lowercase();
 
     assert!(
         doc.contains("cargo build --release"),
