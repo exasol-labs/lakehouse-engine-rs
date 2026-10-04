@@ -1,8 +1,6 @@
 # Project Rules
 
-**Spec-driven project using speq-skill.**
-
-Project mission in: @specs/mission.md
+Spec-driven development with mission in: @specs/mission.md
 
 ## Feature tracking
 
