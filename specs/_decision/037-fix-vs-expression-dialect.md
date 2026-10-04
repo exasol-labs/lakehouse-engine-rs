@@ -105,45 +105,6 @@ feature declines a three-argument `INSTR(s, sub, start)` from the DataFusion sca
 because the Exasol wrapper can still evaluate it verbatim. Applying the same rule to every other
 family keeps one behavior instead of two.
 
-## ADR: A declaration-derived sweep test enforces the rendering rule structurally
-
-**ID:** sweep-test-enforces-declaration-derived-coverage
-**Plan:** fix-vs-expression-dialect
-**Status:** Accepted
-
-### Context
-
-A per-family paired-dialect test only covers arms someone remembered to test — the exact failure
-mode that shipped the `*_BETWEEN` family broken despite per-function E2E parity tests, because
-every one of those tests exercised only the DataFusion path.
-
-### Decision
-
-Add `exasol_dialect_renders_declared_verbatim_surface`, a unit test whose `function_scalar` rows
-are iterated from the crate's one name declaration rather than hand-written. The test fails
-naming any declared name with no fixture, and any fixture whose name is not declared. Six
-constructs outside the `<NAME>(<args>)` shape (operator wire names, `MOD`, `CONCAT`, `CAST`, the
-`REGEXP_LIKE` alternate encoding, `function_scalar` named `CASE`) each assert the expected string
-their fixture declares; every other declared name asserts `<NAME>(<rendered args>)` derived from
-the node's own uppercased name.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Derive sweep rows from the one declaration | ✓ Chosen — coverage is structural: a declared name without a fixture fails by name, and a declaration cannot fall behind the dispatch it gates |
-| Rely on per-family paired-dialect tests alone | ✗ Rejected — only covers arms someone remembered to test |
-| A hand-written deny-list of DataFusion-only tokens as the primary assertion | ✗ Rejected — can only catch arms already known today; "every DataFusion-only token" is an unbounded, untestable set |
-| Keep the table hand-written and assert declared-set membership over its own rows | ✗ Rejected — only checks names someone already listed; a name absent from both the table and the set still passes |
-
-### Consequences
-
-The test enumerates what the crate translates rather than what someone remembered to list, so a
-name cannot be forgotten twice (once from the declaration, once from the sweep). The guarantee is
-bounded and stated precisely: it cannot enforce that every node type outside `function_scalar` has
-a row, because those are matched on the `type` string in the outer walker and are not declared
-anywhere — five such rows stay reviewed, not derived.
-
 ## ADR: One declaration gates the function_scalar dispatch and drives the sweep table
 
 **ID:** declaration-gates-dispatch-and-sweep
@@ -187,6 +148,8 @@ in either dialect, so the author's own test for the new function fails immediate
 the declaration's own branch, which no per-name arm can reach. What remains reviewed rather than
 derived is narrow: the five non-`function_scalar` node types, matched on the `type` string in the
 outer walker.
+
+Add `exasol_dialect_renders_declared_verbatim_surface`, a unit test whose `function_scalar` rows are iterated from the crate's one name declaration rather than hand-written.
 
 ## ADR: Withdraw the four now-family capabilities rather than re-render them
 
@@ -235,43 +198,7 @@ pushdown being given up was producing wrong values, so the cost is a lost wrong 
 a lost correct one. Restoring now-family pushdown with full time-zone fidelity is tracked in issue
 #263, cited in `plan.md` § Non-Goals.
 
-## ADR: Delete the now-family's translator arms rather than leave them unreachable
-
-**ID:** delete-now-family-translations-not-unreachable-arms
-**Plan:** fix-vs-expression-dialect
-**Status:** Accepted
-
-### Context
-
-Once the now-family capabilities are withdrawn (see the withdrawal ADR above), the DataFusion arms
-that rendered `current_date()`/`now()` for these four names become unreachable: every production
-call site of all six translator entry points is fed raw pushdown-request JSON, and every tree
-transformer in the codebase is structure-preserving and cannot introduce a function name — so once
-the capability is gone, nothing can deliver such a node to the arm.
-
-### Decision
-
-Remove `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, and `SYSTIMESTAMP` from the crate's name
-declaration and delete their two DataFusion-dialect rendering arms, so the gate declines all four
-in both dialects with the same `unsupported scalar function: <name>` error every other
-untranslated name produces.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Delete the arms | ✓ Chosen — converts a hypothetical stray node's failure mode from a silently wrong timestamp to a loud decline, and removes dead code the gate already makes unreachable |
-| Keep a `BareKeyword` declared form and withdraw only the capability | ✗ Rejected — the Exasol-dialect rendering would be unreachable the moment the capability is gone, the same situation already ruled against for the `decimal_to_varchar_exasol` node |
-| Declare the four names `Shaped` and keep the existing DataFusion arm, withdrawing only the capability | ✗ Rejected — leaves an advertised-set-exceeds-translated-set inversion inverted the wrong way, and forces the sweep test to assert `current_date()`/`now()` as Exasol-dialect renderings, contradicting the same test's DataFusion-only token deny-list |
-| Leave the arms in place with a comment marking them unreachable | ✗ Rejected — inconsistent with deleting the #210 string guard for the same reason once the gate lands |
-
-### Consequences
-
-`ExasolForm` ships with only two variants, `VerbatimCall` and `Shaped` — no `BareKeyword` variant
-is built. `crates/vs-expression` is a standalone crate shared with a sibling project; this removes
-a translation a future consumer with different clock context might want, but restoring a
-`VerbatimCall` row is a one-line change if that context is ever available, following the same
-precedent ADR `014-add-date-arithmetic-pushdown` already set for `ADD_HOURS`/`ADD_MINUTES`.
+Remove `CURRENT_DATE`, `SYSDATE`, `CURRENT_TIMESTAMP`, and `SYSTIMESTAMP` from the crate's name declaration and delete their two DataFusion-dialect rendering arms, so the gate declines all four in both dialects with the same `unsupported scalar function: <name>` error every other untranslated name produces.
 
 ## ADR: One declared name set closes the gate/dispatch mapping gap review found
 

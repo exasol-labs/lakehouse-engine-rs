@@ -36,37 +36,7 @@ engine perform the cross-shard deduplication with its own spill and resize behav
 The per-shard cap and its serialization code become dead. Distinct cardinality is
 bounded only by Exasol's own distinct-aggregate engine, not by a fixed per-shard budget.
 
-## ADR: Remove AggKind::CountDistinct entirely — reframe as a DISTINCT row-scan
-
-**ID:** count-distinct-remove-aggkind-variant
-**Plan:** `fix-count-distinct-shard-cap`
-**Status:** Accepted
-
-### Context
-
-Once cross-shard dedup becomes Exasol's job (native-merge ADR above), `COUNT(DISTINCT
-col)` no longer needs a per-shard aggregate partial — it needs one row per shard-local
-distinct value, which is structurally a row-scan, not a partial aggregate.
-
-### Decision
-
-Delete the `AggKind::CountDistinct` variant, its `array_agg(DISTINCT)` partial, its
-JSON/cap code, and the `LAKEHOUSE_DISTINCT_MERGE_COUNT` UDF. Detect `COUNT(DISTINCT
-col)` at the same point but emit a row-scan-shaped spec (single-item projection +
-`distinct` flag + NULL-excluding filter), reusing the existing `emit_batch` streaming
-path.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Row-scan + `.distinct()`, reusing existing streaming path | ✓ Chosen — no new wire type or aggregate partial; removes an enum variant, a whole UDF, and its cap/serialization logic |
-| Reinterpret the existing `CountDistinct` variant, keep partial/merge machinery | ✗ Rejected — preserves dead machinery once dedup moves to Exasol |
-
-### Consequences
-
-The codebase shrinks: an enum variant, a whole UDF entry point, and its cap/serialization
-logic disappear, replaced by infrastructure that already exists for row scanning.
+Delete the `AggKind::CountDistinct` variant, its `array_agg(DISTINCT)` partial, its JSON/cap code, and the `LAKEHOUSE_DISTINCT_MERGE_COUNT` UDF.
 
 ## ADR: The count stays byte-exact — approximate distinct is rejected
 

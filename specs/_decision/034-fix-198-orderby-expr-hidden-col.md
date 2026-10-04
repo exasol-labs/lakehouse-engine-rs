@@ -36,39 +36,6 @@ The adapter gains an obligation to render every ordered shape it can now reach f
 and the fix generalizes to every consumer of a pushed `orderBy`, not just issue #198's own
 repro shapes.
 
-## ADR: The capability advertisement and its backing paths land as one atomic change
-
-**ID:** order-by-expression-advertisement-and-backing-paths-atomic
-**Plan:** fix-198-orderby-expr-hidden-col
-**Status:** Accepted
-
-### Context
-
-Advertising `ORDER_BY_EXPRESSION` makes Exasol delegate the ordering and stop re-sorting
-returned rows. Verified live by advertising the capability with no backing path, then
-reverting: the row-scan repro returned rows in raw file order with no error — a silent
-wrong-order regression, strictly worse than the leak — and the grouped repro hard-errored
-on the pre-existing unresolvable-`ORDER BY` decline.
-
-### Decision
-
-No commit may advertise `ORDER_BY_EXPRESSION` before every reachable ordered path — the
-declined row-scan wrapper, the grouped merge, the qualified single-table wrapper, and the
-N-scan join wrapper — renders an expression sort key faithfully or declines with a `User`
-error naming the key.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| One atomic change: advertise only once every backing path exists | ✓ Chosen — measured, not hypothetical; the alternative returns successful-but-wrong results |
-| Advertise first, add rendering paths incrementally across commits | ✗ Rejected — every intermediate commit would ship a silent wrong-order regression strictly worse than the bug it fixes |
-
-### Consequences
-
-The implementation work cannot land incrementally; task group D (advertisement) is
-sequenced last, after every backing path (groups A-C) is in the tree.
-
 ## ADR: Render a declined-path expression ORDER BY over hidden base columns in the Exasol dialect
 
 **ID:** declined-order-by-expression-hidden-base-columns-exasol-dialect

@@ -337,33 +337,6 @@ Shard groups spread round-robin across nodes AND multiplex onto each node's core
 
 ---
 
-## ADR: Cross-Repo Dependency on `language-container-rs:add-memory-limit-metadata`
-
-**ID:** cross-repo-dependency-on-language-container-rs-add-memory-limit-metadata
-**Plan:** `add-group-by-and-sql-comprehension`
-**Status:** Accepted
-
-### Context
-
-ADR-011's memory-pool sizing requires `ctx.memory_limit() -> u64` (bytes; `0` = unbounded/unknown sentinel), an accessor that belongs in the `exasol-udf-sdk` rather than being reimplemented in `lakehouse-engine-rs`. The accessor is added by the sibling-repo plan `language-container-rs:add-memory-limit-metadata`. Until the corresponding `exasol-udf-sdk` release is published, the pool-sizing code falls back to the `0`-sentinel path (1024 MB default budget). The SDK is currently pinned at 0.14.0; the accessor lands in the next release.
-
-### Decision
-
-Consume `UdfContext::memory_limit()` from the published `exasol-udf-sdk` release when it lands; do not reimplement the metadata proto deserialization locally. Until the SDK version carrying the accessor is published, the call site passes the `0` sentinel and the pool-sizing code uses the 1024 MB default. The version bump is a one-line `Cargo.toml` change.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Depend on `language-container-rs:add-memory-limit-metadata` SDK release | ✓ Chosen — single source of truth; avoids divergent wire-protocol decodings across repos |
-| Reimplement the proto deserialization locally | ✗ Rejected — duplicates SDK responsibility; risks drift in the wire-protocol decoding |
-
-### Consequences
-
-The live `ctx.memory_limit()` path is gated on a sibling-repo SDK release. Until that release, the pool-sizing code operates against the 1024 MB default. The dependency is explicit and recorded; the one-line version bump unblocks the live path without touching any scan logic.
-
----
-
 ## ADR: Capability Invariant — Advertise Only What the Engine Can Back Correctly
 
 **ID:** capability-invariant-advertise-only-what-the-engine-can-back-correctly
@@ -389,32 +362,7 @@ Establish the invariant that every name in `CAPABILITIES` must round-trip — ei
 
 The capability list is now a contract: adding a new `FN_*` entry requires a translator arm or aggregate decomposition path to be implemented first. Removing capability names requires confirming the translator arm produces incorrect or no output. Future reviewers have an explicit rule to apply rather than guessing.
 
----
-
-## ADR: Remove FN_PRED_GREATER and FN_PRED_GREATEREQUAL from CAPABILITIES
-
-**ID:** remove-fn-pred-greater-and-fn-pred-greaterequal-from-capabilities
-**Plan:** `add-capability-alignment`
-**Status:** Accepted
-
-### Context
-
-`FN_PRED_GREATER` and `FN_PRED_GREATEREQUAL` were present in the adapter's `CAPABILITIES` list. Verification against `virtual-schema-common-java/doc/development/api/capabilities_list.md` confirmed that neither name exists in Exasol's capability vocabulary. Exasol normalises `a > b` to `b < a` and `a >= b` to `b <= a` before the pushdown request reaches the adapter, so the adapter never receives nodes with these names in practice. Advertising non-existent capability names is misleading dead capability that future reviewers would re-litigate.
-
-### Decision
-
-Delete `FN_PRED_GREATER` and `FN_PRED_GREATEREQUAL` from `CAPABILITIES`. The `predicate_greater` and `predicate_greaterequal` translator arms in `vs-expression` are retained as defensive no-ops (they are never reached in practice but do no harm).
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Remove both names from CAPABILITIES; keep translator arms as defensive no-ops | ✓ Chosen — the names are not in Exasol's vocabulary; advertising them is misleading |
-| Leave them (Exasol ignores unknown names) | ✗ Rejected — future reviewer would re-litigate; inconsistent with the capability invariant (ADR-014) |
-
-### Consequences
-
-The capability list no longer contains names outside Exasol's vocabulary. The translator arms for `predicate_greater(equal)` stay as a safety net for any future Exasol version that might emit them, but are otherwise unreachable.
+Delete `FN_PRED_GREATER` and `FN_PRED_GREATEREQUAL` from `CAPABILITIES`.
 
 ---
 
@@ -557,33 +505,6 @@ Each `ScanSpec` carries the final storage credentials (static or vended). The sc
 
 ---
 
-## ADR: Separate cloud-e2e Cargo Feature with Skip-When-Absent Semantics
-
-**ID:** separate-cloud-e2e-cargo-feature-with-skip-when-absent-semantics
-**Plan:** `add-glue-catalog-sigv4-connection`
-**Status:** Accepted
-
-### Context
-
-The local Docker E2E suite (`exasol-e2e` feature) is designed to FAIL when its Exasol + MinIO + REST stack is down — this is intentional. Adding a cloud smoke/perf test for AWS Glue to the same feature would break that contract, because a cloud account is not always attached in every developer or CI environment.
-
-### Decision
-
-Gate the Glue smoke and performance tests behind a new `cloud-e2e` cargo feature, distinct from `exasol-e2e`. When the AWS credential environment variables are absent, the cloud tests skip (early return, no failure, no network call). The local Docker suite's fail-when-down semantics are unchanged.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| New `cloud-e2e` cargo feature with skip-when-absent | ✓ Chosen — keeps the two harnesses orthogonal; safe to run in CI without cloud creds |
-| Reuse `exasol-e2e` feature | ✗ Rejected — mixing in a skip-when-absent test breaks the local fail-when-down contract |
-
-### Consequences
-
-Developers must explicitly pass `--features cloud-e2e` to run the Glue smoke test. The feature is safe to enable in CI pipelines that inject AWS credentials as secrets and omit them otherwise. The skip path must not attempt any network call so absence of credentials is truly zero-cost.
-
----
-
 ## ADR: Byte-Balanced Sharding via LPT Greedy Assignment
 
 **ID:** byte-balanced-sharding-via-lpt-greedy-assignment
@@ -697,33 +618,7 @@ The new positive-limit formula is `budget = max(fraction × (limit − overhead_
 
 The pool budget is `fraction × (limit − overhead)` for any positive-limit invocation. Subtracting overhead can only lower the budget, so the handbrake invariant (`budget < 0.8 × limit`) is preserved for any non-negative overhead. The formula stays correct as the RSS limit scales. The zero-limit fallback (`DEFAULT_BUDGET_BYTES = 1 GiB`) is unchanged. Both inputs are VS-configurable and default-safe.
 
----
-
-## ADR: Default `INSTANCE_OVERHEAD_MB` to 200 MB
-
-**ID:** default-instance-overhead-mb-to-200-mb
-**Plan:** `change-memory-pool-sizing`
-**Status:** Accepted
-
-### Context
-
-The empirical Rust SLC container overhead at startup (binary + shared libraries + allocator arenas + stacks) is approximately 150 MB. A default for `INSTANCE_OVERHEAD_MB` must be chosen conservatively: under-sizing the overhead causes the pool budget to be too large and risks OOM; over-sizing it merely gives DataFusion a slightly smaller pool.
-
-### Decision
-
-Default `INSTANCE_OVERHEAD_MB` to `200` MB. This adds a ~50 MB cushion over the empirical 150 MB estimate to absorb variance from shared-library versions, allocator arena growth, and stack usage, without materially shrinking the DataFusion pool relative to the pre-change `0.6 × limit` formula.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| 200 MB | ✓ Chosen — 50 MB margin over the empirical estimate; OOM risk lowered without material pool reduction |
-| 150 MB (empirical estimate) | ✗ Rejected — no margin for variance; under-sizing risks OOM, which is strictly worse than a slightly smaller pool |
-| 256 MB | ✗ Rejected — unnecessarily large; shrinks the pool by an extra 56 MB versus 200 MB with no additional safety |
-
-### Consequences
-
-On the default 4096 MB per-instance limit the new budget is `0.6 × (4096 − 200) = 2338 MB`, versus `0.6 × 4096 = 2458 MB` previously — a ~120 MB reduction, well within the engine's `0.8 × 4096 = 3277 MB` handbrake. Operators may tune `INSTANCE_OVERHEAD_MB` via a VS property if their container footprint is measurably different.
+Default `INSTANCE_OVERHEAD_MB` to `200` MB.
 
 ---
 
@@ -945,6 +840,8 @@ A `DATAFUSION_THREADING_MODE` VS property (values `AUTO` or `FIXED`, default `AU
 
 Operators get a safe default (AUTO) that does not oversubscribe a node and a FIXED lever for benchmark sweeps. The UDF layer is unchanged: it consumes `df_threads_per_udf` and `df_target_partitions` as integers regardless of how they were derived. Note: AUTO's anti-oversubscription premise is most valuable for CPU/memory-bound workloads; I/O-bound far-VPC scans can benefit from deliberate oversubscription (see ADR-038).
 
+Keep AUTO as the spec'd general safety default (never oversubscribes a CPU-bound or memory-bound workload).
+
 ---
 
 ## ADR: Telemetry Built on Archived Checkpoint Infrastructure; Default OFF
@@ -998,88 +895,6 @@ Do NOT build the bounded `DF_MAX_BUFFERED_BATCHES` producer/consumer buffer. The
 ### Consequences
 
 The streaming discipline (fetch-one / emit / drop) stays intact. Memory is bounded by the `batch_size` lever. The gate result (ADR-037) confirmed this decision: the scan is overwhelmingly import-bound on the far-VPC path; overlapping a ~2ms emit with a ~650ms import yields essentially zero wall-clock gain.
-
----
-
-## ADR: Scope Split — Engine Features Get Specs; Benchmarks and Sweeps Are Tasks Only
-
-**ID:** scope-split-engine-features-get-specs-benchmarks-and-sweeps-are-tasks-only
-**Plan:** `change-engine-throughput`
-**Status:** Accepted
-
-### Context
-
-The throughput plan combined two kinds of deliverables: (1) engine feature changes with stable behavioral contracts (threading mode, telemetry capability, repartition-free pipeline guarantee, Parquet pruning flag, adapter-notes recording), and (2) benchmark harness, synthetic micro-benchmarks, parameter sweeps, and baseline measurements that measure the engine but are not themselves engine behaviors.
-
-### Decision
-
-Spec deltas cover only engine feature changes (Threading Mode, On-Demand Phase Telemetry, Raw-Scan Pipeline Shape, Parquet Pruning, AdapterNotes recording). The E2E/benchmark harness, synthetic emit/scan benchmarks, parameter sweeps, baseline measurement, and the empirical >1-thread test live in the plan's task list (Tasks 5–9) with no spec scenarios.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Spec engine features only; tasks for benchmark/harness/sweep | ✓ Chosen — specs describe product behavior; measurement tooling evolves faster and is not a behavioral contract |
-| Spec benchmark behavior too | ✗ Rejected — benchmarks measure the engine, they are not engine capabilities; spec should describe behavior under test, not the test rig |
-
-### Consequences
-
-The spec library remains a description of product behavior, not a test harness manifest. Measurement tooling (bench scripts, sweep drivers, report formats) can evolve without requiring spec changes or ADR entries.
-
----
-
-## ADR: AUTO Threading Default Safe but Not Fastest for I/O-Bound Remote Scans; FIXED Recommended
-
-**ID:** auto-threading-default-safe-but-not-fastest-for-i-o-bound-remote-scans-fixed-recommended
-**Plan:** `change-engine-throughput`
-**Status:** Accepted
-
-### Context
-
-The threading sweep on the live AWS Glue cluster (NR_OF_CORES=4, PARALLELISM_FACTOR=8, lineitem ~1.7 GB) produced: 1/1 thread/partition → Q4 12.45s; 2/2 → 10.52s; 4/4 → 8.94s (best); 8/8 → 10.02s. AUTO derives `max(1, floor(4/8)) = 1` for this configuration, which is +39% slower than the optimal 4/4. The root cause: the scan is I/O-bound (S3 across the VPC), so threads overlap S3 read latency rather than competing for CPU — more threads per instance help up to ≈NR_OF_CORES even though `instances × threads` exceeds the VS-reported core count in this regime.
-
-### Decision
-
-Keep AUTO as the spec'd general safety default (never oversubscribes a CPU-bound or memory-bound workload). Document that the measured-optimal config for far-VPC I/O-bound remote scans is `DATAFUSION_THREADING_MODE=FIXED` with `DATAFUSION_THREADS_PER_UDF = DATAFUSION_TARGET_PARTITIONS = NR_OF_CORES`. The bench harness and recommended production config for remote scans use FIXED. A future "I/O-aware AUTO" that deliberately oversubscribes when read-bound is a potential follow-up.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| AUTO safety default + FIXED lever + documented recommendation | ✓ Chosen — principled: safety by default, tunable by measurement; avoids hardcoding oversubscription for all deployments |
-| Change AUTO to always oversubscribe | ✗ Rejected — correct for I/O-bound remote scans, wrong for CPU/memory-bound or local-storage deployments |
-| Remove AUTO, FIXED only | ✗ Rejected — loses the safety invariant for deployments that don't tune |
-
-### Consequences
-
-Operators running far-VPC remote scans should set `DATAFUSION_THREADING_MODE=FIXED` with threads=cores for best throughput. The AUTO default remains correct and safe for all other workload shapes. The empirical result (8 instances × 4 threads = 32 concurrent threads on a 4-core node yields best results) documents that the I/O-bound assumption breaks the core-count anti-oversubscription heuristic.
-
----
-
-## ADR: Throughput Bottleneck Is Far-VPC S3 Read Latency; UDF Engine Is Not the Limiter
-
-**ID:** throughput-bottleneck-is-far-vpc-s3-read-latency-udf-engine-is-not-the-limiter
-**Plan:** `change-engine-throughput`
-**Status:** Accepted
-
-### Context
-
-Live-cluster baseline was ~0.2 GB/s, 5× short of the 1 GB/s target. After delivering all engine-side levers (Parquet `pushdown_filters`, lean repartition-free plan, row-group/page pruning, optimal threading, projection/partial-agg pushdown), the measured improvement was ~30–40% rather than the 5× needed to reach 1 GB/s.
-
-### Decision
-
-The engine-side levers in this plan are delivered and measurably improve throughput, but the ~5× gap is dominated by S3 read latency across the VPC, confirmed three independent ways: (a) phase telemetry: object-storage import ≈650ms vs emit ≈2ms per shard VM — the scan is overwhelmingly import-bound; (b) threading results: throughput improves by overlapping S3 waits, not by adding compute; (c) native Exasol `IMPORT FROM PARQUET` of the same lineitem files reaches the same ~0.17 GB/s ceiling (10.07s wall-clock) — the VS path is competitive or faster via pushdown. Moving S3 into the VPC is the highest-value next throughput lever.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Continue optimizing the UDF engine path | ✗ Rejected — measurement confirms UDF layer is not the limiter; native IMPORT reaches the same ceiling |
-| Move S3 into the VPC (separate future plan) | ✓ Endorsed — the only lever that can close the ~5× gap; removes the dominant latency source |
-
-### Consequences
-
-The throughput plan is complete as an engine-side optimization effort. The next throughput action is the S3-in-VPC plan. The UDF layer overhead (vs native IMPORT) is small enough that the VS path is not the bottleneck. The IMPORT FROM PARQUET benchmark result is recorded as the reference ceiling for future comparison.
 
 ---
 
@@ -1384,32 +1199,7 @@ Extend `detect_group_by_aggregates` to carry each `selectList` item's original i
 
 The outer wrapper SELECT, its cast list, and its GROUP BY list now assemble in the user's `selectList` order for any arrangement of keys and aggregates, matching Exasol's positional `selectListDataTypes` check. The inner fan-out EMITS clause and the scan UDF's per-shard SELECT remain keys-first and unaffected (see ADR-051). A HAVING-over-aggregates rendering gap was discovered during E2E verification and fixed in the same change (HAVING containing an aggregate was silently dropped; now rendered against the merge decomposition, fail-closed to native execution when unrenderable) — not itself promoted to a separate ADR, as it is a direct consequence of the same outer-wrapper assembly path.
 
----
-
-## ADR: Keep the Wire Spec (`ScanSpec` / `AggregatePlan`) and Scan UDF Side Unchanged for Grouped-Aggregate Select-List Ordering
-
-**ID:** keep-the-wire-spec-scanspec-aggregateplan-and-scan-udf-side-unchanged-for-grouped-aggregate-select-list-ordering
-**Plan:** `fix-grouped-agg-select-order`
-**Status:** Accepted
-
-### Context
-
-Fixing the outer-wrapper column transposition (ADR-050) raised the question of whether the wire contract between the adapter and the scan UDF — `ScanSpec.group_keys`, `ScanSpec.aggregates`, the inner fan-out EMITS clause, `build_grouped_partial_agg_sql`, and the scan UDF's emit loop — also needed to carry select-list ordering end-to-end. This was independently re-verified (not taken on faith) against `crates/lakehouse-engine/src/scan/mod.rs`.
-
-### Decision
-
-Do not change `ScanSpec.group_keys` / `ScanSpec.aggregates`, the inner fan-out EMITS clause, `build_grouped_partial_agg_sql`, or the scan UDF's emit loop. Confine the fix entirely to the adapter's outer-merge assembly (ADR-050).
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep the wire spec and scan UDF side keys-first and unchanged | ✓ Chosen — verified `build_grouped_partial_agg_sql` (L390-423) and the emit loop (L344-368) are keys-first on both the DataFusion SELECT and the emit order, matched only against the fan-out EMITS clause and never against the user `selectList` |
-| Add ordering metadata to the wire spec so keys/aggregates interleave end-to-end | ✗ Rejected — the scan side never sees the user's select order; changing the wire shape would be churn with no correctness benefit |
-
-### Consequences
-
-The scan UDF and the wire contract between it and the adapter are untouched by this fix, minimizing the change surface and risk. The inner fan-out and per-shard scan remain self-consistent keys-first structures, matched only against each other.
+Do not change `ScanSpec.group_keys` / `ScanSpec.aggregates`, the inner fan-out EMITS clause, `build_grouped_partial_agg_sql`, or the scan UDF's emit loop.
 
 ---
 
@@ -1611,34 +1401,6 @@ Records that object-store connection concurrency is a first-class tuning axis di
 
 ---
 
-## ADR: Confounded Benchmark Evidence Is Incorporated as Rationale Plus a Named Re-Gate Task, Never Immediate Scope Expansion
-
-**ID:** confounded-benchmark-evidence-is-incorporated-as-rationale-plus-a-named-re-gate-task-never-immediate-scope-expansion
-**Plan:** `add-scan-connection-concurrency`
-**Status:** Accepted
-
-### Context
-
-A 2026-07-01 180M-row / 60-file full-`lineitem` benchmark found native `IMPORT INTO` (~80.4 s) outperforming the VS full-emit `CREATE TABLE AS SELECT *` (~151 s) by ~1.9× — a full raw-row emit workload, differently shaped from the original aggregate-path benchmark. That run recorded the confounded `CLUSTER_NODES=1`, the pre-0.20.1 `ctx.node_count()==0` handshake bug this same plan's dependency bump (Task 1) fixes. It was therefore unknown whether the 151 s/80.4 s gap was under-sharding (would close on the dep bump) or a genuine emit-path bottleneck (e.g. `Int64→Decimal128` coercion).
-
-### Decision
-
-Fold the new evidence into the plan as reinforcing rationale for the existing deliverables, add one named validation task (re-run the 60-file comparison after the dependency bump lands) to isolate the confound, and document the emit-path coercion optimization as evidence-gated deferred work. Do not expand code scope to build the emit-path optimization now.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Rationale + named re-gate task + evidence-gated deferred-work doc | ✓ Chosen — isolates the confound before committing to new scope |
-| Expand this plan to build the emit-path optimization immediately | ✗ Rejected — YAGNI; no confirmed emit-bound root cause, only a confounded measurement |
-| Ignore the new evidence | ✗ Rejected — it materially reshapes the rationale and surfaces a real open question |
-
-### Consequences
-
-Codifies the project rule: new benchmark evidence confounded by an in-flight fix is incorporated as rationale plus a named post-fix re-gate task and evidence-gated deferred-work docs, never as immediate scope expansion, until the confound is isolated.
-
----
-
 ## ADR: Advertise `AGGREGATE_GROUP_BY_TUPLE`, Reversing the Prior Exclusion
 
 **ID:** advertise-aggregate-group-by-tuple-reversing-the-prior-exclusion
@@ -1663,60 +1425,6 @@ Add `AGGREGATE_GROUP_BY_TUPLE` to `CAPABILITIES` so Exasol sends multi-key GROUP
 ### Consequences
 
 A GROUP BY over two or more keys is now pushed down as node-local partial aggregation rather than falling back to a raw row scan, at the cost of the multi-key path needing to be proven correct end-to-end (see ADR-061).
-
----
-
-## ADR: Verify the N-Key Grouped Pushdown Path Before Trusting the Capability Flag
-
-**ID:** verify-the-n-key-grouped-pushdown-path-before-trusting-the-capability-flag
-**Plan:** `fix-multi-column-group-by-pushdown`
-**Status:** Accepted
-
-### Context
-
-Issue #53 explicitly noted that the N≥2 group-key path "has not been verified end-to-end," because Exasol never sent a multi-key pushdown request while `AGGREGATE_GROUP_BY_TUPLE` was absent. Advertising the capability (ADR-060) without first verifying `detect_group_by_aggregates`, `group_key_exasol_types`, and `build_grouped_aggregate_scan_sql` against a real multi-key request risked shipping latent defects — group-key ordering, per-key type resolution, and HAVING/LIMIT interaction were all unproven for N≥2 keys.
-
-### Decision
-
-Treat the capability flip as requiring a verification spike across the detection, per-key type-resolution, and scan-SQL-building code paths, budgeting for real bug fixes rather than assuming a one-line flag change would suffice, and add end-to-end test coverage (including EXPLAIN-based pushdown-occurred assertions) for expression-valued group keys, interleaved key/aggregate ordering, HAVING + LIMIT combined with multi-key grouping, and high-cardinality/spill behavior of the node-local partial aggregate.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Verification spike + full E2E coverage before shipping the flag | ✓ Chosen — proves the multi-key path actually works rather than assuming it does |
-| Ship the flag alone | ✗ Rejected — issue #53 explicitly flagged the N≥2 path as unverified; shipping it blind risks latent multi-key defects |
-
-### Consequences
-
-The multi-key grouped-aggregate path is proven correct (ordering, per-key types, HAVING/LIMIT, spill behavior) before being exposed to Exasol, at the cost of a wider verification/test-authoring scope than a bare capability-flag change.
-
----
-
-## ADR: Fix Scoped to the Constant-Projection-Over-Group-By Shape, Not General Nested/Subquery Aggregate Pushdown
-
-**ID:** fix-scoped-to-the-constant-projection-over-group-by-shape-not-general-nested-subquery-aggregate-pushdown
-**Plan:** `fix-nested-aggregate-pushdown`
-**Status:** Accepted
-
-### Context
-
-Issue #52 reported a crash on `SELECT COUNT(*) FROM (SELECT L_ORDERKEY, COUNT(*) AS cnt FROM t GROUP BY L_ORDERKEY) t2` — an outer aggregate over an inner grouped-aggregate sub-select. `specs/mission.md` lists "Join pushdown, complex query rewrites" as explicitly out of scope, so any fix had to avoid growing pushdown surface area into general subquery/nested-aggregate composition.
-
-### Decision
-
-Bound the fix to making this specific SQL shape correct-or-safe (correct composed pushdown, or fall back to a non-pushed row-scan) rather than building general multi-level nested-aggregate/subquery pushdown composition as a new adapter capability.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Bounded fix: correct-or-safe for this shape only | ✓ Chosen — matches mission's exclusion of complex query rewrites; lower-risk than growing pushdown surface area |
-| Add general subquery-pushdown composition as a new capability | ✗ Rejected — out of scope per mission; unbounded scope growth for a single reported defect |
-
-### Consequences
-
-The adapter gains a targeted guard/fix for the constant-projection-over-`GROUP BY` shape (see ADR-063) without adding a general subquery-composition capability. Other nested/subquery shapes not matching this pattern continue to rely on the existing fallback-to-row-scan behavior, which remains within mission scope.
 
 ---
 
@@ -1858,60 +1566,6 @@ Fix the gap by advertising `FN_ADD`/`FN_SUB`/`FN_MULT`/`FN_FLOAT_DIV` and reconc
 
 ---
 
-## ADR: Arithmetic Operator-Name Reconciliation Is a Hard Live-Verification Gate, Not an Assumption
-
-**ID:** arithmetic-operator-name-reconciliation-is-a-hard-live-verification-gate-not-an-assumption
-**Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
-**Status:** Accepted
-
-### Context
-
-The `crates/vs-expression` translator matched multiplication as `"MUL"`, based on hand-crafted unit-test JSON — never exercised live, because the capability was unadvertised. Exasol's actual capability/name vocabulary uses `FN_MULT`. Shipping the advertise-and-decompose fix on the unverified `"MUL"` assumption risked advertising `FN_MULT` while the translator declined the resulting `"MULT"` node, silently degrading to row-scan fallback with no speedup (correct but pointless).
-
-### Decision
-
-Made live capture of the exact Exasol `function_scalar` name for `+`/`-`/`*`/`/` a hard gate on the capability/translator change (task 1.1), and require the capability set and the translator's matched-name set to stay in lockstep (enforced by a dedicated test).
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Verify live before coding, keep capability set and translator names in lockstep | ✓ Chosen — the whole perf win hinges on the translator recognizing what Exasol actually sends |
-| Trust the existing `"MUL"` unit tests / spec | ✗ Rejected — those tests used hand-crafted JSON never exercised against a live advertised capability, so the assumed name was unverified and plausibly wrong |
-
-### Consequences
-
-Live capture (decision-log finding [7]) was structurally unsatisfiable in the literal "observe the node" sense (Exasol won't emit an unadvertised node), so verification proceeded via the already-advertised `FN_MOD` naming convention (`FN_<X>` → node name `"<X>"`) plus a native-SQL DECIMAL-inference probe — equally strong evidence without a speculative capability deploy. This confirmed `"MUL"` was wrong and pinned the fix to `"MULT"`, with `ADD`/`SUB`/`FLOAT_DIV` already correct.
-
----
-
-## ADR: Parallelism-Factor Sweep Is Evidence-Gated; a Validated No-Op Is an Acceptable Outcome
-
-**ID:** parallelism-factor-sweep-is-evidence-gated-a-validated-no-op-is-an-acceptable-outcome
-**Plan:** `add-arithmetic-aggregate-pushdown-and-benchmark-suite`
-**Status:** Accepted
-
-### Context
-
-A prior diagnostic flagged a possible 10-30% gain from increasing `BENCH_PARALLELISM_FACTOR` (oversubscription hides emit-ack stall), but marked it UNVERIFIED — plausible only if the workload is emit-ack-latency-bound, zero if CPU-decode-bound. `bench/.env` pins the factor at 8, below the code's own `max(cores*2,8)=16` default. Changing a parallelism default without evidence risks regressing non-join queries.
-
-### Decision
-
-Ship the sweep (factor 8/16/24 vs Q2/Q3/Q5 + a Q9b regression check) as an explicit validation task that precedes any default change; only change `bench/.env` / `resolve_parallelism_factor` if the evidence shows a real, repeatable improvement without a Q9b regression, and record the finding either way.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Evidence-gated sweep with a no-op as an acceptable result | ✓ Chosen — avoids shipping a speculative default change that could regress non-join queries |
-| Hardcode `BENCH_PARALLELISM_FACTOR=16` (or change the code default) now | ✗ Rejected — the 10-30% gain was explicitly unverified and the workload's bottleneck (emit-ack vs CPU-decode) was unknown |
-
-### Consequences
-
-The sweep (`bench/parallelism_sweep.sh`), run twice against the live test1 cluster, found pf16 flat (within run-to-run noise, no consistent direction) and pf24 a real, repeatable regression (Q3 and Q9b both worse in both runs) — over-oversubscription adds scheduling overhead that outweighs any stall-hiding benefit. `bench/.env`'s factor of 8 and the code's `resolve_parallelism_factor` default were left unchanged; ruling out this optimization on solid evidence is treated as a valid, durable result, with the sweep tooling itself the lasting artifact.
-
----
-
 ## ADR: Raw-Scan Projection Gets an Explicit `ProjectionItem` Tag Instead of a Syntactic Heuristic
 
 **ID:** raw-scan-projection-gets-an-explicit-projectionitem-tag-instead-of-a-syntactic-heuristic
@@ -1967,33 +1621,6 @@ Advertise `ORDER_BY_COLUMN` and push `ORDER BY <bare projected col(s)> LIMIT n` 
 ### Consequences
 
 NQ4 now flips from lakehouse-engine-rs's largest competitive loss to a win: 12.03s → 2.13s (5.65x), also beating Trino's 4.71s. The new path is a new partial/merge variant sitting alongside the aggregate path, not a new architecture.
-
----
-
-## ADR: Whether the Top-N Change Is Pure Optimization or Also a Latent Correctness Fix Is Gated on Live Capture
-
-**ID:** whether-the-top-n-change-is-pure-optimization-or-also-a-latent-correctness-fix-is-gated-on-live-capture
-**Plan:** `add-topn-pushdown`
-**Status:** Accepted
-
-### Context
-
-Reading the code alone shows `extract_limit` unconditionally reads `pushdownRequest.limit.numElements` and the row-scan branch pushes that limit to every shard via the common spec with no ORDER-BY-awareness — so IF Exasol ever sent a bare `limit` alongside an unpushed `order_by` today, the adapter would silently truncate to an arbitrary per-shard subset. Whether this ever happens in practice is unknown from the code alone.
-
-### Decision
-
-Make a live `EXPLAIN VIRTUAL` capture of the NQ4 shape against test1 (task A1) a hard gate, before writing any code, to determine whether Exasol pushes a bare `limit` for an ORDER BY query it can't also delegate today.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Live-capture gate before coding | ✓ Chosen — the sibling plan's methodology is live-capture-first, and the cost of assuming wrong is a silent correctness bug |
-| Infer "safe" from the correct-but-slow captured NQ4 result and skip verification | ✗ Rejected — the code path shows a real theoretical truncation risk that must be verified, not assumed |
-
-### Consequences
-
-A1 confirmed Exasol structurally withholds `limit` whenever the accompanying `order_by` can't also be delegated — today's code path can never exercise the truncation danger, so this plan is pure optimization, not a bugfix. The defensive invariant (ADR-074) is adopted anyway, because advertising `ORDER_BY_COLUMN` is exactly what starts putting `order_by` + `limit` together in future requests.
 
 ---
 
@@ -2186,33 +1813,6 @@ Pin `iceberg`, `iceberg-catalog-rest`, and `iceberg-storage-opendal` to the git 
 ### Consequences
 
 The dependency pin is immutable and self-documenting; bumping to a later RC or the GA release is an explicit, reviewed edit rather than something that happens automatically on `cargo update`.
-
----
-
-## ADR: Unify the production/iceberg arrow tree on 58; do not bump the workspace arrow major
-
-**ID:** unify-the-production-iceberg-arrow-tree-on-58-do-not-bump-the-workspace-arrow-major
-**Plan:** `change-iceberg-rust-0-10-bump`
-**Status:** Accepted
-
-### Context
-
-iceberg 0.9.1 linked arrow 57, creating a split with the rest of the workspace on arrow 58. Verification against the iceberg 0.10.0-rc.2 tag's `Cargo.toml` confirmed it is on arrow/parquet 58, so the split can be collapsed by the bump alone. A tempting alternative was to instead move the whole workspace to arrow 59 to match `tpchgen-arrow` 3.0.0.
-
-### Decision
-
-Let the bump collapse the production arrow tree onto arrow 58 with no change to the workspace `arrow`, `datafusion`, or SDK pins.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep workspace on arrow 58; let iceberg 0.10 collapse onto it | ✓ Chosen — eliminates the 57/58 split with zero change to datafusion, the SDK, or other pins |
-| Move workspace arrow to 59 (matching tpchgen-arrow 3.0.0) | ✗ Rejected — drags datafusion 54, `exasol-udf-sdk` 0.20.2, and iceberg 0.10 (all arrow-58) off their pinned tree; far larger and out-of-scope |
-
-### Consequences
-
-The arrow-57/58 split that existed solely because of iceberg 0.9.1 is fully eliminated. No other workspace dependency pin needs to move, keeping this a scoped, low-risk bump.
 
 ---
 
@@ -2794,6 +2394,8 @@ Every remaining hard-error decline site in the join/aggregate pushdown path stat
 plainly that it is a hard error with no native retry. The advertised-capability-must-
 render principle applies to all future capability additions, not just joins.
 
+No commit may advertise `ORDER_BY_EXPRESSION` before every reachable ordered path — the declined row-scan wrapper, the grouped merge, the qualified single-table wrapper, and the N-scan join wrapper — renders an expression sort key faithfully or declines with a `User` error naming the key.
+
 ---
 
 ## ADR: Reuse the Iceberg Crate's NameMapping Deserializer
@@ -2865,110 +2467,6 @@ no-mapping and uncovered-field behavior is unchanged.
 
 ---
 
-## ADR: Parse Only Flat/Top-Level Name-Mapping Entries; Defer Nested Struct/Map/List Entries
-
-**ID:** parse-only-flat-top-level-name-mapping-entries-defer-nested-struct-map-list-entries
-**Plan:** `change-name-mapping-fallback`
-**Status:** Accepted
-
-### Context
-
-Iceberg's `schema.name-mapping.default` format supports nested `fields` entries for
-struct/map/list children. This engine's Exasol type mapping flattens all nested Iceberg
-types (struct, map, list) to `VARCHAR(2000000)` via JSON rather than exposing real
-nested columns.
-
-### Decision
-
-Parse only the top-level list of `{names, field-id}` mapping objects; do not recurse
-into nested `fields`. A follow-up GitHub issue (#83, "Support nested/struct entries in
-schema.name-mapping.default parsing") tracks the deferred scope.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Flat/top-level entries only | ✓ Chosen — nested entries would never be consulted since nested Iceberg types are already flattened to VARCHAR-via-JSON; parsing them now is dead capability |
-| Recurse into nested `fields` now | ✗ Rejected — no caller can currently use a nested-column name-mapping resolution |
-
-### Consequences
-
-Name-mapping resolution only ever needs a flat `name → field_id` lookup. Nested
-name-mapping support becomes a distinct, separately scoped feature (#83) if the engine
-later exposes real nested columns.
-
----
-
-## ADR: Malformed schema.name-mapping.default Fails the Query at Plan Time
-
-**ID:** malformed-schema-name-mapping-default-fails-the-query-at-plan-time
-**Plan:** `change-name-mapping-fallback`
-**Status:** Accepted
-
-### Context
-
-`schema.name-mapping.default` is an optional table property; when present it must be
-valid name-mapping JSON. Before this plan, there was no rule for what happens if the
-property is present but malformed.
-
-### Decision
-
-When the property is present but is not valid name-mapping JSON, the VS fails the query
-at plan time with a clean, credential-free error naming the property. When the property
-is absent, the threaded name-mapping is simply empty (no error).
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Fail loud at plan time on a malformed property | ✓ Chosen — consistent with the repo's fail-loud-at-plan-time correctness gates (e.g. `ensure_supported_delete_mechanisms`); a malformed mapping is a real config error and should surface once, off the per-shard hot path |
-| Silently ignore a malformed value and fall through to the physical-name fallback | ✗ Rejected — would silently degrade column binding correctness instead of surfacing a real config error |
-
-### Consequences
-
-A malformed `schema.name-mapping.default` is caught once per query in the VS, before
-any UDF is invoked, and never silently degrades to incorrect column binding.
-
----
-
-## ADR: The Drop+Rename-Into-a-Reused-Name Collision Is Unrelated to Name-Mapping
-
-**ID:** the-drop-rename-into-a-reused-name-collision-is-unrelated-to-name-mapping
-**Plan:** `change-name-mapping-fallback`
-**Status:** Accepted
-
-### Context
-
-A comment in `rename_physical_to_logical` claimed that column-name collisions from
-drop+rename-into-a-reused-name were "out of scope and belong to the name-mapping work
-tracked in issue #28." This premise is wrong: `schema.name-mapping.default` maps
-physical column names as they currently appear in a data file to field-ids — it
-reflects only current-state naming, not history, so it cannot retroactively
-disambiguate a dropped column whose old physical name was later reused by an unrelated
-new column.
-
-### Decision
-
-Correct the `rename_physical_to_logical` comment to state plainly that the
-drop+rename-into-a-reused-name collision is a distinct, still-open concern that
-name-mapping support does NOT resolve. Do not attempt to fix the collision itself, and
-no follow-up issue is filed for it.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Correct the comment to remove the false forward-reference | ✓ Chosen — the repo owner confirmed the original premise was wrong; a false forward-reference misleads future planners |
-| Leave the comment implying #28 resolves it | ✗ Rejected — actively misleading once #28 (this plan) ships without touching the collision case |
-
-### Consequences
-
-Future readers of `rename_physical_to_logical` are not misled into believing
-name-mapping support resolves the drop+rename collision. The collision remains an open,
-untracked concern.
-
----
-
 ## ADR: Author Delete-Bearing Benchmark Tables via Apache Spark `DELETE FROM` on a v2 Merge-on-Read Table
 
 **ID:** author-delete-bearing-benchmark-tables-via-apache-spark-delete-from-on-a-v2-merge-on-read-table
@@ -3004,44 +2502,6 @@ The delete-bearing benchmark variant depends on Spark as an authoring-time tool 
 modes (never at query time — the engine's own merge-on-read read path, already spec'd and
 CI-proven, is what's being measured). `scripts/spark-fixtures/create_tpch_deletes.sql` and
 `deploy/scripts/make_deletes_remote.py` are the two authoring entry points (docker vs. remote).
-
----
-
-## ADR: `deploy/scripts/bench-remote.sh` Wraps the Remote Bench Sequence with an EXIT-Trap Teardown
-
-**ID:** deploy-scripts-bench-remote-sh-wraps-the-remote-bench-sequence-with-an-exit-trap-teardown
-**Plan:** `add-delete-benchmark-flag`
-**Status:** Accepted
-
-### Context
-
-The remote (`test1`) benchmark sequence — `cluster-up.sh` → `secrets.sh` → `make bench` →
-`cluster-down.sh` — was previously run as four manual steps. A live `r8i.2xlarge` × N Exasol
-cluster bills continuously while it exists, and a failure or interrupt partway through the manual
-sequence could leave it running unattended.
-
-### Decision
-
-Add a single `deploy/scripts/bench-remote.sh <env>` wrapper that installs `trap 'cluster-down.sh
-<env>' EXIT` *before* bringing anything up, then runs the four steps in sequence — so teardown
-fires on success, on failure, or on interrupt (Ctrl-C/SIGTERM), and reports the original bench
-exit code rather than swallowing it behind teardown's own result. It forwards any caller-exported
-`BENCH_*`/`LAKEHOUSE_*` env untouched.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| A single wrapper script installing an EXIT trap before bring-up | ✓ Chosen — guarantees teardown runs on every exit path, including mid-sequence failure or an operator's Ctrl-C, which a manual four-command sequence cannot |
-| A Makefile `bench-test1` target | ✗ Rejected — Make cannot cleanly guarantee teardown runs when an earlier recipe line in the same target fails partway through |
-
-### Consequences
-
-`deploy/scripts/bench-remote.sh test1` (optionally prefixed with `BENCH_WITH_DELETES=1`) is now the
-recommended way to run the remote perf test — teardown is guaranteed rather than relying on the
-operator to remember `cluster-down.sh` afterward. The four-step manual sequence still works
-directly for cases needing fine-grained control (e.g. leaving the cluster up between repeated
-`make bench` runs).
 
 ---
 
@@ -3091,48 +2551,7 @@ grouped decline for a genuinely undecomposable shape never emits a
 column-count-mismatched bare row scan — it emits a qualified single-table wrapper with
 the correct column count instead.
 
----
-
-## ADR: Generalize `render_having_over_merge` to Descend Scalars for Select-List Merge Rendering
-
-**ID:** generalize-render-having-over-merge-to-descend-scalars-for-select-list-merge-rendering
-**Plan:** `fix-scalar-over-aggregate-grouped-pushdown`
-**Status:** Accepted
-
-### Context
-
-The existing HAVING merge-rewrite renderer, `render_having_over_merge`, already
-rewrites a top-level `function_aggregate` node to its merged `PARTIAL_*` expression
-matched to the decomposed `AggregatePlan` list. Its gap: `render_having_operand`'s
-catch-all delegated a scalar function or arithmetic node wrapping an aggregate to
-`render_expression`, which renders the nested aggregate verbatim over source columns —
-absent from the outer wrapper — rather than over the merged partials. A grouped
-select-list scalar-over-aggregate item is structurally the same problem: render the
-surrounding scalar/arithmetic structure while rewriting each aggregate leaf to its
-merged `PARTIAL_*` expression.
-
-### Decision
-
-Generalize `render_having_operand` so a `function_scalar`/arithmetic node recurses
-into a merge-aware renderer (`render_scalar_over_merge`) that rewrites every nested
-`function_aggregate` to its merged expression, matched to the `AggregatePlan` list by
-equality (kind + argument), preserving the scalar/arithmetic structure around it. The
-same renderer serves both the grouped select list and HAVING, so a top-level bare
-aggregate and a nested aggregate are rewritten by one consistent path.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Generalize `render_having_over_merge`/`render_having_operand` to descend scalars | ✓ Chosen — one renderer serves both the select list and HAVING, avoiding the two-copy divergence PR #78 diagnosed for the join renderers; fixes a scalar-over-aggregate inside HAVING as a side effect |
-| A new, independent select-list merge renderer parallel to the HAVING one | ✗ Rejected — duplicates the aggregate→merged rewrite logic and risks drift between the two copies |
-
-### Consequences
-
-A scalar function wrapping one or more aggregates, whether in a grouped select list or
-a HAVING clause, is rendered by the same merge-aware path and never references a
-source column absent from the outer wrapper. Top-level and nested aggregate rewriting
-are consistent by construction.
+Generalize `render_having_operand` so a `function_scalar`/arithmetic node recurses into a merge-aware renderer (`render_scalar_over_merge`) that rewrites every nested `function_aggregate` to its merged expression, matched to the `AggregatePlan` list by equality (kind + argument), preserving the scalar/arithmetic structure around it.
 
 ---
 

@@ -106,27 +106,3 @@ Add `pub struct StaticStoreAddress` carrying exactly two addressing fields, `end
 
 The superseded clauses carried the credential guarantee on the signature; superseding them without a replacement mechanism would have left the guarantee as prose. Field privacy closes the "no credential field, no field-by-field construction" half at the compiler; the accessors keep the reading side honest, since `s3_backend` reads the address through them rather than leaving them as dead public surface.
 
-## ADR: The behaviour change is a breaking change and is named as one
-
-**ID:** vended-addressing-precedence-is-breaking-change
-**Plan:** fix-vended-storage-shared-policy
-**Status:** Accepted
-
-### Context
-
-Fixing defect 2 (an empty vended address is now legal) required also deciding a precedence rule between a CONNECTION-configured store address and a vended one. That precedence direction changes behaviour for a deployment that combines `use_vended_credentials: true` with a non-empty CONNECTION `endpoint` or `region` — a configuration no in-repo fixture exercises, since both in-repo vended fixtures carry an empty CONNECTION `endpoint` and `region`.
-
-### Decision
-
-Record in `plan.md` § Impact that a deployment setting `use_vended_credentials: true` alongside a non-empty CONNECTION `endpoint` or `region` changes behaviour: the CONNECTION value now wins where the vended one used to. Also record that the new plaintext gate on a CONNECTION-supplied endpoint tightens an existing path.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Name the precedence change as a breaking change in § Impact and § Migration | ✓ Chosen — the regression is invisible to every in-repo suite, so it must be written down rather than discovered by an operator |
-| Frame the whole change as a bug fix | ✗ Rejected — defect 2's fix is a bug fix, but the precedence direction the interview chose changes a shipped resolution on configurations that work today |
-
-### Consequences
-
-No in-repo suite can observe this transition, so the written record in `plan.md` § Impact and § Migration is the only place an operator or a future reader learns that a stale plaintext CONNECTION endpoint beside a vending-enabled CONNECTION now either wins (under `ALLOW_HTTP = true`) or fails loud at plan time (otherwise) instead of being silently discarded. `e2e-harness/lakekeeper-e2e-harness`'s delta promotes its empty-`endpoint` assertion to a stated precondition for the same reason.

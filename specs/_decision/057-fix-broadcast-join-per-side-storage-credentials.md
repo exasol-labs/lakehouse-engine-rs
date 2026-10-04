@@ -129,31 +129,6 @@ Keep the plan-time comparison scoped to the backend variant and, for ADLS, `acco
 
 The guard's scope is unchanged, but its justification no longer rests on a deferred defect — the per-prefix credential collapse it once deferred is fixed, so the narrow scope is now a statement of what is unserveable, not what is unverified.
 
-## ADR: The reproduction gate is a hard stop, not a fallback ladder
-
-**ID:** join-credential-repro-gate-hard-stop-no-fallback
-**Plan:** fix-broadcast-join-per-side-storage-credentials
-**Status:** Accepted
-
-### Context
-
-Reproducing issue #294 as a genuine read error (not merely as differing credential values) requires two vended credentials whose SCOPE diverges, which is an empirical property of the target catalog/fixture that could not be assumed during planning.
-
-### Decision
-
-The investigation task stops the plan if it shows the two vended credentials do not diverge in scope, and escalates the substitute-proof question to the user rather than choosing a fallback proof strategy itself.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Hard stop and escalate on a non-diverging-scope finding | ✓ Chosen — decided explicitly in the planning interview: a passing join test over two whole-bucket credentials would evidence nothing about the defect, since reading the dimension through the fact's credential would simply succeed both before and after the fix |
-| Pre-declare a fallback — unit-level-only proof of carriage, or a stub catalog vending two prefix-scoped credentials | ✗ Rejected — silently substituting the carriage assertion for the defect reproduction would ship a fix whose proof cannot fail |
-
-### Consequences
-
-A green suite proves the fix corrects the read outcome the defect broke, not merely that the wire format now carries two backends. Any future plan reproducing a credential-scoping defect against a new catalog should apply the same discipline: verify scope divergence before treating a passing test as reproduction.
-
 ## ADR: Strip Exasol's native `tableAlias` in `render_broadcast_join`, render everything bare
 
 **ID:** join-strip-table-alias-render-bare-in-broadcast-renderer

@@ -37,6 +37,8 @@ Every declined predicate must be self-applied in the adapter's own returned SQL;
 a correct outcome once a capability is advertised. This fact becomes the shared justification for
 every other decision in this plan.
 
+Close the question as a negative finding.
+
 ## ADR: The recorded LIKE-guard consequence is corrected, not merely superseded
 
 **ID:** correct-recorded-like-guard-consequence-not-merely-superseded
@@ -238,35 +240,3 @@ select list. That is the route where it matters most: the fan-out carries no fil
 predicate is self-applied in the outer wrapper), so every row of the table crosses the UDF boundary
 and column width is the only remaining lever.
 
-## ADR: A native partial-pushdown acknowledgment mechanism is ruled out, not assumed absent
-
-**ID:** no-native-partial-pushdown-acknowledgment-mechanism-exists
-**Plan:** fix-declined-filter-self-apply
-**Status:** Accepted
-
-### Context
-
-The interview asked whether Exasol's Virtual Schema protocol has any per-query mechanism for the
-adapter to hand a predicate back as unhandled, rather than assuming none exists.
-
-### Decision
-
-Close the question as a negative finding. The documented pushdown response has exactly two fields,
-`type` and `sql`, with one documented note describing `sql`. `PushDownResponse.java` holds a single
-member and `ResponseJsonConverter` serializes those two keys only. The word "residual" and any
-partial-pushdown equivalent appear nowhere in the adapter API reference or the Exasol Virtual
-Schema documentation. The only incomplete-pushdown concept in the protocol runs the other direction,
-Exasol to adapter, as a `SELECT *` request with no select list — documented as an empty
-`selectList`, sent live as an omitted key.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Check the protocol and record a negative finding | ✓ Chosen — an unverified negative is what produced this issue in the first place |
-| Proceed without checking | ✗ Rejected — the interview asked for the check |
-
-### Consequences
-
-Self-application is the only available mechanism for a declined predicate, not merely the chosen
-one — there is no protocol-level alternative to design around in a future plan.

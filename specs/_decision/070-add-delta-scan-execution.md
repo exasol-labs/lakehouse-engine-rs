@@ -102,38 +102,6 @@ A partition column becomes usable as a predicate target and a group key with no 
 and neither of the two touched call sites is currently used elsewhere in this repo, so nothing
 regresses.
 
-## ADR: The partition-materialization feature is named format-neutrally
-
-**ID:** partition-materialization-feature-named-format-neutrally
-**Plan:** `add-delta-scan-execution`
-**Status:** Accepted
-
-### Context
-
-An earlier, stale scaffold directory named the feature `scan-execution-delta-partition-values`. The
-recorded `delta-table-planning` contract already states that the per-file partition-value map is
-the SAME field an Iceberg identity-transform partition value (issue #99) and a future Hive-style
-partition value would populate.
-
-### Decision
-
-The new spec is `datafusion-scan/scan-execution-partition-values`, not a Delta-named feature, and
-its scenarios dispatch on whether `partition_columns` and `partition_values` are populated — never
-on the table format.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| `datafusion-scan/scan-execution-partition-values`, format-neutral | ✓ Chosen — matches the shared field ownership already recorded in `delta-table-planning` |
-| `scan-execution-delta-partition-values`, mirroring the stale scaffold | ✗ Rejected — a Delta-named scan feature would invite a second, format-named home for one decision |
-
-### Consequences
-
-The deletion-vector feature keeps its Delta name for the opposite reason: the container framing and
-the Z85 payload are the Delta protocol's, and an Iceberg Puffin deletion vector is a genuinely
-different mechanism that stays refused.
-
 ## ADR: One per-request scan-source resolver, matching the catalog kind at a single site
 
 **ID:** one-per-request-scan-source-resolver
@@ -200,34 +168,3 @@ split yields no table name.
 catalog kind that addresses a table by something other than that same joined string — the rejected
 alternative becomes the right move only then.
 
-## ADR: Two Delta gaps are named as scoped exceptions rather than closed here
-
-**ID:** two-delta-gaps-named-as-scoped-exceptions
-**Plan:** `add-delta-scan-execution`
-**Status:** Accepted
-
-### Context
-
-Making the Delta path query-reachable changes the risk profile of every already-recorded Delta gap
-from unreachable to reachable. This project's rule requires a known deviation to be either fixed in
-the plan or recorded as an explicit, accurately-scoped tracked exception — never left as a silent
-gap.
-
-### Decision
-
-Record in the spec deltas that (a) a Delta table declaring an unimplemented reader feature is now
-query-reachable and ungated, bounded by issue #322 rather than by a refusal, and (b) filter-based
-Delta file pruning remains issue #321, so a filter narrows rows without narrowing files.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Name both gaps as scoped exceptions in the spec deltas | ✓ Chosen — keeps the shift from unreachable to reachable visible rather than silent |
-| Add reader-feature gating in this plan | ✗ Rejected — the recorded `delta-table-planning` contract states a gate added here would refuse the very deletion-vector and column-mapping fixtures this plan must read, and gating is #322's scope |
-| Say nothing | ✗ Rejected — violates this project's rule that a known deviation must be fixed or explicitly tracked |
-
-### Consequences
-
-Issues #321 and #322 carry forward as the accountable trackers for filter-based file pruning and
-reader-feature gating respectively, rather than this plan silently widening their blast radius.

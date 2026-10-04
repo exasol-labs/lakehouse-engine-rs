@@ -40,6 +40,8 @@ count, and one pooled `reqwest::Client` is shared across every catalog request. 
 `loadTable` GET is preserved because only that response carries per-table vended storage
 credentials.
 
+Record the normative basis, quoted from the Apache Iceberg REST Catalog OpenAPI spec (`apache/iceberg` `open-api/rest-catalog-open-api.yaml`, main): `GET /v1/config` is the route "All REST clients should first call ... to get catalog configuration properties from the server to configure the catalog and its HTTP client," keyed by the `warehouse` parameter.
+
 ## ADR: Session Built Per-Path at the handle_pushdown Seam, Not Once Before detect_join
 
 **ID:** catalog-session-built-per-path-not-before-detect-join
@@ -74,78 +76,3 @@ malformed-table request still issues zero catalog HTTP requests.
 Exactly one path executes per request, so exactly one session is built per query, with no change
 to which requests fail fast without touching the network.
 
-## ADR: CatalogSession Stays Internal; Public resolve_file_list Keeps Its Signature via a Wrapper Plus pub(crate) Core
-
-**ID:** catalog-session-internal-public-wrapper-plus-core
-**Plan:** `refactor-catalog-http-session`
-**Status:** Accepted
-
-### Context
-
-`resolve_file_list` has external callers: the `exasol-e2e` integration tests
-(`tests/common/e2e_harness.rs`, `tests/e2e_scan_test.rs`) call it directly with a `catalog_uri:
-&str` and cannot construct a `pub(crate) CatalogSession`. The public signature must therefore stay
-`catalog_uri: &str`, while join legs still need to share one session across every leg's file
-resolution.
-
-### Decision
-
-Declare `CatalogSession` `pub(crate)` in `credentials.rs` with no re-export via `pushdown/mod.rs`.
-Keep the public `resolve_file_list(catalog_uri: &str, …)` and `resolve_table_schema` signatures
-unchanged. Carry the shared session through a new `pub(crate)` core
-`resolve_file_list_with_session(&CatalogSession, …)`; the public `resolve_file_list` builds a
-single-use session and delegates to it. `plan_join` and `resolve_one_join_side` become
-`pub(crate)`/`pub(super)` internals taking `&CatalogSession`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Public wrapper delegating to a `pub(crate)` session-taking core | ✓ Chosen — keeps the public entry point's name, visibility, AND signature identical; the `exasol-e2e` integration tests compile unedited |
-| Re-export `CatalogSession` on the `crate::adapter::pushdown::<name>` façade and give `resolve_file_list` a `&CatalogSession` parameter | ✗ Rejected — widens the frozen public surface and still forces edits to every external caller |
-| Extract a `lakehouse-catalog` crate exposing a genuinely-`pub` `CatalogSession` | ✗ Rejected — deferred to its own plan (tracked issue #204); drags `ConnectionCreds`/`CatalogProps`/`StorageProps` across a new crate boundary, beyond this refactor's scope |
-
-### Consequences
-
-The `vs-adapter/pushdown-module-structure` reachability probe compiles unchanged with an empty
-diff against its frozen baseline. Session reuse across join legs flows through the `pub(crate)`
-core, not the public entry point. A follow-up crate extraction (issue #204) is needed before
-`CatalogSession` can become genuinely public.
-
-## ADR: Iceberg REST Spec Confirms the Catalog-Scoped Premise
-
-**ID:** iceberg-rest-spec-confirms-catalog-scoped-session
-**Plan:** `refactor-catalog-http-session`
-**Status:** Accepted
-
-### Context
-
-CLAUDE.md requires checking any pushdown-touching plan against the Apache Iceberg table/REST spec
-rather than relying on memory. This refactor's premise — that catalog auth and the `/v1/config`
-prefix are catalog-scoped, not table-scoped — needed normative confirmation before the code change.
-
-### Decision
-
-Record the normative basis, quoted from the Apache Iceberg REST Catalog OpenAPI spec
-(`apache/iceberg` `open-api/rest-catalog-open-api.yaml`, main): `GET /v1/config` is the route "All
-REST clients should first call ... to get catalog configuration properties from the server to
-configure the catalog and its HTTP client," keyed by the `warehouse` parameter. The OAuth2
-`POST /v1/oauth/tokens` client-credentials grant returns a catalog bearer token authenticating
-catalog requests session-wide (the endpoint is marked "DEPRECATED for REMOVAL" in favor of an
-external `oauth2-server-uri`, an existing accommodation rather than a gap introduced here). The
-`loadTable` response, by contrast, "may contain credentials that should be used for subsequent
-requests for the table" — per-table vended `storage_credentials` — so the per-table `loadTable` GET
-must stay.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Quote the normative REST spec sections before implementing | ✓ Chosen — required by CLAUDE.md's Iceberg-compliance rule; confirms the refactor is spec-compliant with no gap |
-| Rely on memory of the spec | ✗ Rejected — prohibited by CLAUDE.md |
-
-### Consequences
-
-The refactor has a cited normative basis: catalog auth and `/v1/config` are computed once per
-query, and the per-table `loadTable` GET is preserved because only it carries per-table vended
-credentials. No spec deviation was introduced or found.

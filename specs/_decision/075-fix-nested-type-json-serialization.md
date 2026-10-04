@@ -106,41 +106,6 @@ stringified key, diverging from Appendix D's shapes.
 The divergence is recorded in the feature's Background with the scoping sentences quoted, per
 CLAUDE.md's rule that a deviation is never a silent gap.
 
-## ADR: Statistics pruning over a rendered nested column requires positive proof, not absence of failure
-
-**ID:** nested-pruning-requires-positive-proof
-**Plan:** `fix-nested-type-json-serialization`
-**Status:** Accepted
-
-### Context
-
-A spike `EXPLAIN ANALYZE` of `WHERE tags = '["hello","world"]'` showed DataFusion DOES construct a
-`pruning_predicate` and a bloom-filter stage over the JSON-rendered column. It pruned nothing in that
-run, but the fixture had ONE row group, which cannot distinguish "statistics unavailable" from
-"statistics available and happened to match". Parquet keeps statistics for a nested column's LEAF
-values, so a min/max of `"hello"`/`"world"` compared against the document `["hello","world"]`
-evaluates `"hello" <= '["hello","world"]'` as FALSE — `[` sorts below `h` — and would prune a row
-group that does contain the match.
-
-### Decision
-
-The plan carries a dedicated task and spec clause requiring a MULTI-row-group Parquet fixture whose
-per-group leaf statistics would falsely exclude the rendered document, and requiring the offending
-pruning stage to be disabled for the column if any stage evaluates it.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Require a multi-row-group fixture that positively proves no row is falsely pruned | ✓ Chosen — row loss from pruning is silent, so absence-of-failure on a single-row-group fixture proves nothing |
-| Accept the spike observation that nothing was pruned and no error occurred | ✗ Rejected — a single-row-group fixture cannot discriminate "statistics unavailable" from "statistics available and happened to match" |
-
-### Consequences
-
-This is the one claim in the plan that a passing observation does not settle by itself — it is the
-one silent-wrong-rows failure mode this design admits, so it gets a dedicated positive-proof
-requirement rather than being inferred from the absence of an observed failure.
-
 ## ADR: Disable Parquet row-filter pushdown rather than decline the predicate to Exasol
 
 **ID:** disable-parquet-row-filter-pushdown-for-nested-column

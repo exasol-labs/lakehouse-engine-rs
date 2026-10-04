@@ -123,33 +123,3 @@ side, fail-safe) before intersecting with that side's own refused list, fixing a
 found in code review: a request-global touched-column set let a refused column named against one
 join side refuse a `SELECT` naming only the other side's identically-named mappable column.
 
-## ADR: Pin the three Delta type-mapping sets to arrow's own castability answer with assertions
-
-**ID:** pin-delta-type-sets-to-arrow-castability-with-assertions
-**Plan:** `add-delta-reader-gating-and-type-mapping`
-**Status:** Accepted
-
-### Context
-
-The native, text-rendered, and refused type sets are each a claim about `arrow-cast`'s
-`can_cast_types` behavior. The existing `convert_tests`/`mapping_tests` assertions passed against a
-convention that does not hold precisely because they used a zero-field struct, which sidesteps the
-field-wise cast check `can_cast_types` performs on a populated struct.
-
-### Decision
-
-A unit test asserts `can_cast_types(physical, Utf8)` directly for a representative of each set:
-`true` for `Binary`, `List(Int32)`, `Interval(YearMonth)`, `Interval(DayTime)`, and an
-out-of-domain `Decimal128`; `false` for a POPULATED `Struct`, a `Map`, and a `List(Struct)`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Assert `can_cast_types` directly against a populated struct and the other representatives | ✓ Chosen — compiles the claim into a test, so an `arrow-cast` upgrade that changes an answer is a test failure, not a silent re-partition |
-| State the castability facts in the spec prose alone | ✗ Rejected — is exactly what let the zero-field-struct blind spot pass unnoticed in the existing suites |
-
-### Consequences
-
-An `arrow-cast` upgrade that changes any of these three sets' membership now fails a test instead of
-silently reclassifying a column's queryability.

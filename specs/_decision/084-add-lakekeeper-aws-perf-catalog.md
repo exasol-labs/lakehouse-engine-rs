@@ -102,57 +102,6 @@ The stack outputs both vantages. The vantage a caller receives is determined by 
 
 Every URI-consuming caller must state its own network location correctly; the script itself carries no location logic and reads `LK_TARGET_*` verbatim, per `lakekeeper-provisioning-script-dual-run-site`.
 
-## ADR: The Lakekeeper idempotency classification is duplicated across bash and Rust, on purpose
-
-**ID:** lakekeeper-idempotency-classification-duplicated-bash-rust
-**Plan:** add-lakekeeper-aws-perf-catalog
-**Status:** Accepted
-
-### Context
-
-`crates/lakehouse-engine/tests/common/lakekeeper.rs` already encodes the bootstrap and warehouse-create idempotency classification rules for Lakekeeper 0.13.1, including the live-observed fact that a duplicate warehouse reports `400` with a storage-profile overlap rather than `409`. The new provisioning tool needs the same classification.
-
-### Decision
-
-`deploy/scripts/lakekeeper-provision.sh` re-derives that classification rather than extracting shared code, and additionally confirms every already-present classification with a storage-profile read-back — a stricter guarantee than the Rust harness's optional helper offers.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Duplicate the classification, cited in both places | ✓ Chosen — a shared implementation is impossible once the caller is bash: the harness is test-only Rust targeting MinIO/ADLS with a blocking client, and no artifact can serve both languages |
-| Extract the classification into shared code the E2E harness also calls | ✗ Rejected — infeasible across the bash/Rust language boundary |
-
-### Consequences
-
-A follow-up issue is scheduled to keep the two copies' classification rules in sync rather than to consolidate them, since consolidation is no longer possible.
-
-## ADR: The `part`/`partsupp` location collision carries no mitigation
-
-**ID:** lakekeeper-part-partsupp-collision-no-mitigation
-**Plan:** add-lakekeeper-aws-perf-catalog
-**Status:** Accepted
-
-### Context
-
-An upstream Lakekeeper issue reports `LocationAlreadyTaken` when one table's location is a non-slash-delimited prefix of another's, and TPC-H's `part`/`partsupp` pair is exactly that shape. A live spike against Lakekeeper 0.13.1 (local Docker, MinIO, S3-compatibility flavor, registration order `part` then `partsupp`) registered both tables successfully with no rejection.
-
-### Decision
-
-No mitigation is carried in the plan — no second warehouse, no per-table warehouse override, no excluded table. All eight TPC-H tables register into one warehouse. The pair is kept as a permanent regression test, registered in both orders since the spike exercised only one.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| No mitigation; keep the pair as a regression test | ✓ Chosen — the live run settled the question with the production location shape, not a synthetic one |
-| A second warehouse for the colliding table | ✗ Rejected — contradicts the single-warehouse `bench/.env` and CONNECTION shape, and is unnecessary for a risk that does not manifest |
-| Exclude the colliding table from the demo set | ✗ Rejected outright — `bench/run.sh` unconditionally checks and joins both tables, so a seven-table registration breaks `make bench` |
-
-### Consequences
-
-A future Lakekeeper version that reintroduces the rejection fails the regression test on a laptop rather than on a billable AWS cluster.
-
 ## ADR: Bucket-wide write is an accepted, named risk; the warehouse is soft-delete and the tool has no destructive path
 
 **ID:** lakekeeper-bucket-wide-write-accepted-risk
@@ -206,33 +155,6 @@ The user required the provisioning script to run "either on the laptop for demo,
 
 An instance profile granting `ssm:GetParameter`, `kms:Decrypt`, `glue:GetTables`, and `s3:GetObject` is a stated prerequisite for the EC2 run site, but no stack or task in this plan creates such a box or profile — it is supplied by the operator, like the laptop itself.
 
-## ADR: Bash loses compile-time JSON checking; three named controls replace it
-
-**ID:** lakekeeper-bash-json-body-construction-controls
-**Plan:** add-lakekeeper-aws-perf-catalog
-**Status:** Accepted
-
-### Context
-
-The Rust design got its wire shapes from `lakehouse-catalog`'s typed request structs, so a malformed JSON key failed to compile. Once provisioning moved to bash (decision `lakekeeper-provisioning-bash-not-rust`), every JSON key is hand-spelled with no compiler backstop.
-
-### Decision
-
-Accept the loss and replace it with three controls: every request body is built with `jq -n` and typed argument flags, never string interpolation or a heredoc; the offline stubbed-PATH harness captures each emitted body and asserts its exact structure with `jq -e` against the v0.13.1 wire shapes; and the local Docker verification sends every body to a real Lakekeeper 0.13.1, which rejects a wrong shape.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| `jq -n` construction + offline shape assertions + live Docker verification | ✓ Chosen — three controls of decreasing but real strength replace the lost compiler guarantee |
-| Build bodies with `printf` and a heredoc | ✗ Rejected — a quote, backslash, or newline in a value silently breaks structure or leaks into an adjacent field |
-| Accept the loss with only a manual AWS verification step | ✗ Rejected — moves the failure onto an already-billing EC2 box |
-| Reintroduce a thin Rust helper for the wire shapes | ✗ Rejected — reintroduces the Rust the user explicitly removed |
-
-### Consequences
-
-Two shapes are spelled out explicitly in the spec because they fail only at runtime otherwise: the soft `delete-profile`'s required `expiration-seconds` field, and the storage credential's canonical `access-key-id`/`secret-access-key` field names (which differ from the aliased spellings the in-repo Rust E2E harness uses).
-
 ## ADR: Credentials reach `curl` through a file descriptor, never through argv
 
 **ID:** lakekeeper-credentials-via-file-descriptor-not-argv
@@ -285,31 +207,9 @@ Provisioning is `deploy/scripts/lakekeeper-provision.sh`, using `curl`, `jq`, an
 
 The `exasol-udf-sdk` boundary seam the Rust design had to accept (a laptop tool linking the UDF runtime's error type) disappears entirely. Three costs are incurred and separately recorded: lost compile-time JSON checking (`lakekeeper-bash-json-body-construction-controls`), lost automatic argv safety (`lakekeeper-credentials-via-file-descriptor-not-argv`), and a source read that can no longer go through the shared Iceberg REST client (`lakekeeper-glue-source-read-aws-cli-normalized-triple`).
 
-## ADR: The Glue source is read with the AWS CLI, behind one normalized triple, with a second reader for local verification
+Accept the loss and replace it with three controls: every request body is built with `jq -n` and typed argument flags, never string interpolation or a heredoc; the offline stubbed-PATH harness captures each emitted body and asserts its exact structure with `jq -e` against the v0.13.1 wire shapes; and the local Docker verification sends every body to a real Lakekeeper 0.13.1, which rejects a wrong shape.
 
-**ID:** lakekeeper-glue-source-read-aws-cli-normalized-triple
-**Plan:** add-lakekeeper-aws-perf-catalog
-**Status:** Accepted
-
-### Context
-
-Once provisioning moved to bash, the source catalog read could no longer go through `lakehouse-catalog`'s Iceberg REST client. `curl --aws-sigv4` against Glue's Iceberg REST endpoint requires `--user <key>:<secret>` and emits no `x-amz-security-token`, so it cannot use the temporary credentials an EC2 instance profile supplies — breaking the dual-run-site requirement outright.
-
-### Decision
-
-The source read normalizes every table to `(name, metadata_location, table_location)`. `LK_SOURCE_KIND=glue` (default, the AWS path) reads it via `aws glue get-tables` plus an `aws s3 cp` of the metadata document. `LK_SOURCE_KIND=rest` reads the same triple from an OAuth2-bearer Iceberg REST `loadTable`, existing so the local Docker verification exercises the identical downstream derivation, warehouse-creation, and registration code.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Two readers behind one normalized triple: `aws glue get-tables` for AWS, REST `loadTable` for local verification | ✓ Chosen — the AWS CLI signs every request through its own credential chain, working unchanged from both run sites, and the REST reader makes the target-side logic verifiable off the billable path |
-| One reader hitting Glue's Iceberg REST endpoint with `curl --aws-sigv4` | ✗ Rejected — cannot carry an instance profile's temporary session token, breaking the dual-run-site requirement |
-| One reader, Glue-only, with no local verification of the target half | ✗ Rejected — the derivation, warehouse-creation, and registration logic would be first exercised on a billable AWS box |
-
-### Consequences
-
-The `glue` reader itself stays unexercised off the manual `--source-only` verification step, which plan.md records as the one open source-side risk closed before the first billable `lakekeeper-up.sh` run.
+The source read normalizes every table to `(name, metadata_location, table_location)`.
 
 ## ADR: Provisioning traffic stays cleartext; the public-vantage exposure is a named, accepted seam
 

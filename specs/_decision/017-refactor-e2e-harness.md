@@ -1,42 +1,5 @@
 # Decisions: refactor-e2e-harness
 
-## ADR: Shared harness module boundary: `common/e2e_harness` + file-local orchestration
-
-**ID:** e2e-harness-shared-module-boundary
-**Plan:** refactor-e2e-harness
-**Status:** Accepted
-
-### Context
-
-The seven `exasol-e2e` test binaries each re-declared the same provisioning boilerplate — 10
-constants, `install_slc`, `exa_conn`, `create_schema_and_scripts`, and five divergent
-`create_virtual_schema` signatures — duplicating roughly 1,000 lines. `install_slc`, `exa_conn`,
-and `create_schema_and_scripts` are byte-identical across binaries; `create_virtual_schema`
-diverges in VS-property sets, Iceberg namespace, and catalog CONNECTION name; setup orchestration
-(waits, seeding, two-tier setup) genuinely differs per binary.
-
-### Decision
-
-Create `common/e2e_harness.rs` (gated `exasol-e2e`) holding the byte-identical constants and
-helpers plus a parameterized `create_virtual_schema(conn, &VsProps)`. Each binary keeps its own
-`OnceLock`, thin `setup_e2e()`/`setup_full_stack()`, VS-name constants, file-specific seeding, and
-assertions.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Shared `common/e2e_harness` module + file-local orchestration | ✓ Chosen — merges the byte-identical helpers while keeping genuinely divergent setup logic local |
-| Move all setup, including per-binary orchestration, into one shared function | ✗ Rejected — setup orchestration differs per binary (int96's two-tier wait, refresh's no-VS-in-setup, differing seed calls) |
-| A `setup.rs` per test type | ✗ Rejected — more files, no gain over one shared module |
-
-### Consequences
-
-Eliminates ~1,000 duplicated lines across the seven binaries while preserving every per-binary
-difference. Future E2E binaries gain shared provisioning by importing `e2e_harness` instead of
-re-declaring it, at the cost of one added indirection (`VsProps`) for callers that need
-non-default VS properties.
-
 ## ADR: Fold `CloudExaConn` into `ExaConn` via an opt-in `redact_sql` flag
 
 **ID:** fold-cloudexaconn-into-exaconn-redact-flag

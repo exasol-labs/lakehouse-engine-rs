@@ -31,38 +31,6 @@ post-filter no resolved file list.
 Pruning correctness rides entirely on the kernel's own contract rather than a second, hand-rolled
 bound-comparison implementation. The reader gains a predicate parameter and loses nothing else.
 
-## ADR: Deleting StatsOptions::none() is the whole configuration change
-
-**ID:** delta-pruning-delete-statsoptions-none-not-replace
-**Plan:** add-delta-file-pruning
-**Status:** Accepted
-
-### Context
-
-The shipped reader built its scan with `.with_stats(StatsOptions::none())`, whose documented contract
-disables all stats work — "no stats output, no internal data skipping (even when a predicate is set)".
-`Scan::skip_stats()` is true for exactly that construction, and `log_replay.rs` disables both partition
-pruning and data-column skipping together on it. Adding a predicate without removing this call would
-ship a silent no-op that every existing test would still pass.
-
-### Decision
-
-Delete the `.with_stats(StatsOptions::none())` call rather than replace it with a named mode, letting
-`ScanBuilder` keep its own default.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Delete the call, let `ScanBuilder::new`'s own default apply | ✓ Chosen — that default already is the mode wanted: internal skipping on, no `stats_parsed` column surfaced |
-| Set `StatsOptions::default()` explicitly | ✗ Rejected — naming a default the kernel already owns pins a value that could drift from the kernel's own default |
-| Set `StatsOptions::all_struct()` | ✗ Rejected — requests a parsed-stats projection the reader never reads, costing metadata bandwidth for nothing |
-
-### Consequences
-
-The single most dangerous line in the plan is a deletion, not an addition — reviewers and future
-readers must recognize that omitting it silently defeats the whole feature.
-
 ## ADR: Trust Delta's writer-side string-bound invariant, and say so
 
 **ID:** delta-pruning-trust-writer-string-bound-invariant

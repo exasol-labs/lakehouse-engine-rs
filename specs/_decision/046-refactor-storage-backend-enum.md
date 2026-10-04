@@ -56,33 +56,6 @@ The backend decision now has two owners instead of one: the enum owns WHICH back
 
 ---
 
-## ADR: Four further live features required a `storage`-value golden carve-out
-
-**ID:** storage-backend-golden-carveout-second-wave
-**Plan:** `refactor-storage-backend-enum`
-**Status:** Accepted
-
-### Context
-
-Plan review (round 1) found that four live features normatively pinned the exact `dispatch_golden` goldens and join golden-SQL assertions this plan edits, requiring them to pass UNEDITED — a requirement the plan's own wire-tag change would break. Only `scan-execution-spec-reconstitution` had been amended to carve out the `storage` value; `catalog-crate-structure`, `pushdown-module-structure`, `pushdown-col-types-consolidation`, and `pushdown-joins-module-structure` had not, and one of those deltas even claimed "every other scenario of this feature is unchanged" while leaving its own byte-identical-SQL clause intact.
-
-### Decision
-
-Each of the four affected features gets a narrow carve-out permitting an edit to the `storage` value ALONE in its byte-identical-output clauses, leaving every other byte of every golden and every non-golden assertion as a live regression gate.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Narrow, per-clause `storage`-value carve-out in each affected feature | ✓ Chosen — keeps the cross-refactor behavior-preservation gate falsifiable rather than retiring it |
-| Leave the clauses as originally written and accept the contradiction | ✗ Rejected — would record the spec library as self-contradictory and silently retire the repo's only cross-refactor gate |
-
-### Consequences
-
-`catalog-crate-structure`'s Background bullet was corrected from claiming two amended clauses to three amended scenarios. All four features gained explicit CHANGED rows and Scenario Coverage rows in `plan.md`. Round 2 of review found five FURTHER live clauses across three features (including one, `pushdown-catalog-session`, with no delta directory at all) that the round-1 fix had missed — the defect class, not just the four named clauses, needed applying, which produced the `pushdown-catalog-session` delta and widened the other two.
-
----
-
 ## ADR: The exhaustive variant-naming owner list is capped at five permitted modules
 
 **ID:** storage-backend-exhaustive-variant-naming-owners

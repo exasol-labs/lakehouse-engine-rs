@@ -115,41 +115,6 @@ table's format is data the engine's dispatch reads. This supersedes the recorded
 `data_source_format` "MUST NOT appear in any neutral type the engine can name" — withholding the
 format would have forced the engine to assume Unity implies Delta rather than check it.
 
-## ADR: `IcebergFormatReader` is a deliberately thin delegator, with the collapse scheduled for #320
-
-**ID:** iceberg-format-reader-thin-delegator-scheduled-collapse
-**Plan:** `add-delta-table-planning`
-**Status:** Accepted
-
-### Context
-
-`resolve_file_list` is shipped, spec-covered, credential-carrying Iceberg planning code reached by
-the single-table pushdown path, every join leg, and external test callers. #319 needed an
-`IcebergFormatReader` behind the new `FormatReader` trait without risking a regression in that
-code or forcing an edit to its callers.
-
-### Decision
-
-`IcebergFormatReader::resolve_scan` calls `resolve_file_list` unchanged and packs its five-tuple
-into `ResolvedScan` with an absent Delta block. `resolve_file_list` keeps its name, `pub`
-visibility, signature, and every call site. Collapsing it into the reader is deferred to #320,
-which removes its direct callers when it routes production pushdown through this seam.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Thin delegating wrapper, collapse deferred to #320 | ✓ Chosen — zero-byte diff on the shipped Iceberg path, with a named, scheduled follow-up |
-| Move `resolve_file_list`'s body into the reader now and delete the free function | ✗ Rejected — relocates ~160 lines of shipped code, edits every join leg and external test caller, and breaches the recorded clause that `resolve_file_list` alone keeps its name and `pub` visibility |
-| Change only its return type to `ResolvedScan` | ✗ Rejected — edits every caller for a cosmetic gain and forfeits the zero-diff guarantee on the shipped path |
-
-### Consequences
-
-A function whose whole body calls another with the same arguments is normally the shallow-module
-red flag this project deletes on sight. It is accepted here only because it buys a zero-byte diff
-on the shipped path and only until #320 removes the direct callers — a scheduled follow-up rather
-than an open-ended one.
-
 ## ADR: Delta log replay takes an injected object store
 
 **ID:** delta-log-replay-injected-object-store

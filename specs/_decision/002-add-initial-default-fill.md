@@ -35,42 +35,6 @@ no default.
 
 ---
 
-## ADR: Read initial-default Once Per Query in the VS Layer
-
-**ID:** read-initial-default-once-per-query-in-the-vs-layer
-**Plan:** `add-initial-default-fill`
-**Status:** Accepted
-
-### Context
-
-The engine resolves Iceberg metadata once per query in the VS planning layer, never per
-UDF invocation, so the UDF never re-reads Iceberg table state. `initial-default` values
-must reach the scan UDF without breaking that boundary or existing scan-spec
-compatibility.
-
-### Decision
-
-`build_logical_schema` — the one VS-layer site that reads the Iceberg current schema —
-reads each field's `NestedField.initial_default` and encodes a primitive default onto a
-new optional `LogicalField.initial_default` field, threaded unchanged through the scan
-spec to the scan UDF.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Encode the default onto an optional `LogicalField` field in the VS layer | ✓ Chosen — preserves the resolve-once-per-query rule; an optional field keeps default-less specs deserializing unchanged, mirroring how name-mapping was added |
-| Read Iceberg metadata inside the UDF | ✗ Rejected — violates the resolve-metadata-once-per-query architecture rule |
-| Add a separate side-channel argument to carry the default | ✗ Rejected — unnecessary; the existing `LogicalField` carrier already threads per-field metadata |
-
-### Consequences
-
-Scan specs written before this feature deserialize unchanged. The scan UDF gains
-`initial-default` fill with no new Iceberg-metadata read path and no per-invocation
-catalog access.
-
----
-
 ## ADR: Encode Only Primitive initial-default Values
 
 **ID:** encode-only-primitive-initial-default-values
@@ -102,40 +66,6 @@ required-absent error.
 The trade-off is named explicitly in the feature spec rather than left as a silent gap.
 No new tracked exception is required — it is an Exasol target-type limitation, not a
 deviation to fix.
-
----
-
-## ADR: Intercept the Absent-Field Case Before Delegating to DefaultPhysicalExprAdapter
-
-**ID:** intercept-absent-field-before-delegating-to-defaultphysicalexpradapter
-**Plan:** `add-initial-default-fill`
-**Status:** Accepted
-
-### Context
-
-`FieldIdExprAdapter` delegates null-fill and required-missing handling to
-`DefaultPhysicalExprAdapter`. That delegate errors immediately on a required-absent
-field, so any post-processing step meant to substitute a default would never run.
-
-### Decision
-
-`FieldIdExprAdapter` computes the per-file set of absent logical field-ids and
-substitutes `Literal(default)` for an absent-with-default field BEFORE delegating. Other
-cases (nullable-no-default, required-no-default) delegate unchanged. The decision is made
-per file, since the adapter is created per file and the same field can be absent in one
-file and present in another within one shard.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Substitute the default before delegation | ✓ Chosen — the only point at which a required-absent field has not yet errored |
-| Post-process the delegated expression to swap NULL literals for defaults | ✗ Rejected — `DefaultPhysicalExprAdapter` errors on a required-absent field before any post-processing could run |
-
-### Consequences
-
-The fill logic lives entirely in `FieldIdExprAdapter`, ahead of the existing delegate,
-with no change to `DefaultPhysicalExprAdapter` itself.
 
 ---
 

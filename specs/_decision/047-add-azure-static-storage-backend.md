@@ -110,28 +110,3 @@ The check can never fire for an S3 spec, since an `s3://` URI carries no userinf
 
 ---
 
-## ADR: `storage_block` stays total — no panic, no `Result`, on the unreachable both-absent Azure state
-
-**ID:** storage-block-total-fallback-no-panic
-**Plan:** `add-azure-static-storage-backend`
-**Status:** Accepted
-
-### Context
-
-`storage_block` selects the Azure branch when an Azure field is present, requiring both an account name and a resolvable `AdlsCred`. `validate_creds` runs before `storage_block` and already rejects every malformed shape, so the both-absent case cannot occur in production. CLAUDE.md records that a panic inside a UDF is an abnormal VM exit, and that the engine SIGKILLs every sibling VM of the statement part when one VM dies abnormally.
-
-### Decision
-
-When the Azure branch's required fields are unexpectedly absent, `storage_block` falls through to the S3 branch rather than panicking; the function's return type stays a plain `StorageBackend`, not a `Result`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Deterministic fall-through to S3 | ✓ Chosen — costs nothing, and a state that cannot occur in production never risks a cluster-wide SIGKILL fan-out from a defensive assertion |
-| `unreachable!()`, justified by `validate_creds` running first | ✗ Rejected — a panic here is an abnormal VM exit; CLAUDE.md records that this kills every sibling VM of the statement part, not just this one |
-| Change the signature to `Result` | ✗ Rejected — pushes a new error path through the one caller for a state that cannot occur |
-
-### Consequences
-
-`storage_block` remains a total function. The unreachable branch is defensive dead code with a guaranteed-safe behavior rather than a landmine, at zero cost to the reachable paths.

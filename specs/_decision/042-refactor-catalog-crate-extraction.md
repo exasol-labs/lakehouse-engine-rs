@@ -27,32 +27,6 @@ Two crates, not three. `StorageProps`, `CatalogProps`, and `ConnectionCreds` are
 
 `StorageProps`, `CatalogProps`, and `ConnectionCreds` split on evidence: `CatalogProps` is mis-homed in `scan/spec.rs` today (no `scan/*.rs` module names it), `ConnectionCreds` appears in 11 planning-layer files and none in `scan/`, and only `StorageProps` has two genuine owners — the catalog produces it, the scan UDF consumes it across the UDF boundary as JSON. Placing each definition with its producer and re-exporting at the consumer's path keeps one definition and zero conversion code, at the cost of a naming smell the crate's own doc comment states outright: an S3 storage config type lives in a crate named "catalog".
 
-## ADR: Issue #214 is absorbed and closed as subsumed, not executed first and not blocked on
-
-**ID:** absorb-214-deliver-vended-consolidation-once-in-final-shape
-**Plan:** refactor-catalog-crate-extraction
-**Status:** Accepted
-
-### Context
-
-Issue #214 (the `resolve_vended_storage` consolidation) had not landed when this plan started: no `resolve_vended_storage` existed in the codebase, and `pushdown/mod.rs` still re-exported `extract_vended_keys` / `merge_vended_into_storage` directly. Issue #204 (this plan) unfreezes the pushdown façade that #214's defining constraint — "zero public-surface change" — depends on, so the two issues' relationship needed an explicit ordering decision.
-
-### Decision
-
-This plan performs the `resolve_vended_storage` consolidation itself, once, directly in its final shape: concept-level, `pub` on `lakehouse-catalog`, with the seven mechanism functions crate-private and the extractors normalized to uniform `Option`. Issue #214 closes as subsumed. The code moves verbatim first (parity gate: the existing suite unedited), then the logic consolidates (parity gate: the six absence/precedence cases).
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Absorb #214, deliver the consolidation once in final shape | ✓ Chosen — one consolidation, one review, one behavior-parity gate, with the same two falsifiable checkpoints a #214-then-#204 ordering would have given, without a throwaway intermediate shape |
-| Block on #214 as an unmet prerequisite | ✗ Rejected — #214's only stated purpose is to prepare #204; blocking produces no work and waits on an issue whose deliverable this plan is about to redraw anyway |
-| Execute #214 verbatim as task 1, then redraw the façade | ✗ Rejected — #214's "zero public-surface change" constraint exists only because the façade is frozen, and #204 unfreezes it in the same change; executing #214 first means building a `pub(super)` shape whose only reason to exist is a constraint this plan deletes, and keeps `extract_vended_keys` / `merge_vended_into_storage` `pub` for one extra commit with no verification benefit |
-
-### Consequences
-
-Issue #214 closes as subsumed rather than shipping its own PR. The risk a single larger change raises is answered by ordering — verbatim move, then consolidate — rather than by splitting into two issues.
-
 ## ADR: The crate boundary is drawn at catalog access, not at Iceberg file planning
 
 **ID:** catalog-crate-boundary-at-access-not-file-planning

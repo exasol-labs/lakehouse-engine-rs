@@ -39,36 +39,5 @@ the SQL surface, but no emitted value changes — the physical UTC-instant is id
 DataFusion's internal timestamp comparisons, date-function evaluation, and predicate
 binding stay timezone-correct because the internal Arrow representation is untouched.
 
-## ADR: Retire the mapping at its source; keep the generic WLTZ codec branches
-
-**ID:** retire-timestamptz-mapping-at-source-keep-generic-wltz-codec-branches
-**Plan:** `fix-timestamptz-mapping`
-**Status:** Accepted
-
-### Context
-
-Beyond the Iceberg-column mapping, the codebase carries generic `TIMESTAMP WITH LOCAL TIME
-ZONE` (WLTZ) codec/translator branches in `exasol_type_to_json`, `exasol_type_from_json`,
-the `exasol_type_to_arrow` WLTZ arm, and the `vs-expression` CAST-target rejection.
-`exasol_type_from_json` is called on expression and select-list dataTypes
-(`adapter/pushdown.rs` lines 3556, 4279, 5658), not only on VS-declared columns.
-
-### Decision
-
 Fix the mapping at its source (`iceberg_primitive_to_exasol`, `arrow_to_exasol_type`).
-Keep the WLTZ branches in `exasol_type_to_json`, `exasol_type_from_json`, the
-`exasol_type_to_arrow` WLTZ arm, and the `vs-expression` CAST-target rejection unchanged.
 
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Retire the mapping at its source; keep the generic WLTZ codec branches | ✓ Chosen — the bug was the Iceberg-column mapping, not the codec; the codec must stay correct for a WLTZ type the user introduces in a CAST/expression |
-| Delete every WLTZ branch as part of "full retirement" | ✗ Rejected — `exasol_type_from_json` is reached by a user `CAST(... AS TIMESTAMP WITH LOCAL TIME ZONE)`; deleting the branch would mis-read a genuine WLTZ type as plain `TIMESTAMP` |
-
-### Consequences
-
-A user-introduced WLTZ CAST or expression continues to translate correctly. The
-Iceberg-timestamptz-derived path no longer feeds any WLTZ string into these branches, so
-`exasol_type_to_json`'s WLTZ arm becomes defensive-only (no live caller from the Iceberg
-column path) but is retained deliberately for codec symmetry.

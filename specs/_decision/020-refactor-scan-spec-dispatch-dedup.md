@@ -41,47 +41,6 @@ trigger for a graph-wide struct-field change — mitigated by routing the task t
 executor with a per-file call-site census and by the golden dispatch-SQL baseline (see the
 companion ADR) as the byte-drift detector.
 
-## ADR: Capture a Golden Dispatch-SQL Baseline Before a Byte-Identical Refactor
-
-**ID:** golden-dispatch-sql-baseline-before-byte-identical-refactor
-**Plan:** `refactor-scan-spec-dispatch-dedup`
-**Status:** Accepted
-
-### Context
-
-The plan asserted the scan-driving SQL and empty-result output stay byte-identical across
-the four-part dedup, but the only pre-existing regression guard was `.contains(...)` and
-`.matches(...).count()` substring tests plus fragment-level `assert_eq!` calls. A regression
-that keeps every checked substring but changes byte layout — a clause reordered by the
-task-5 classifier rewrite, or a field reverting to its serde default in the task-2 flatten —
-would pass every cited test, defeating the plan's own anti-silent-drift premise, concentrated
-in exactly the highest-risk tasks.
-
-### Decision
-
-Before any dedup work, extract the post-resolution dispatch body of `handle_pushdown` into a
-behavior-preserving `pub(crate) fn build_dispatch_sql(..)` offline seam, then capture nine
-committed golden fixtures — five non-empty dispatch shapes through `build_dispatch_sql` and
-four empty shapes through `empty_result_sql` — each asserted with a full-string
-`assert_eq!` against `include_str!`-loaded fixtures. Every subsequent task's byte-identity
-check, and the plan's Verification table, point at this golden comparison instead of at
-substring tests.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Extract an offline dispatch seam and assert nine golden fixtures full-string `assert_eq!` | ✓ Chosen — `handle_pushdown` needs live catalog I/O and the pre-existing leaf-builder tests hand-assemble the spec, bypassing the dispatcher's own construction, so neither discharges the byte-identical bar |
-| Continue relying on `.contains(...)`/`.matches(...).count()` substring tests | ✗ Rejected — provably blind to a moved clause or a reverted serde default, the exact drift this refactor risks |
-
-### Consequences
-
-Every task from the struct flatten through the classifier extraction is checked against a
-byte-for-byte pre-refactor baseline, not convention. This verification discipline — capture a
-golden output baseline from pre-refactor code, then assert full-string byte-equality after
-each change — generalizes to any future byte-identical / pure-refactor plan in this project;
-substring checks cannot discharge a byte-identical acceptance bar.
-
 ## ADR: Shared `RequestShape` Classifier Consumed By Both the Dispatch and Empty-Result Paths
 
 **ID:** shared-request-shape-classifier-dispatch-and-empty-result
@@ -123,3 +82,5 @@ The routing decision is shared by construction: a future rule change (a new aggr
 a new HAVING case) lands once and both paths pick it up identically, closing the exact drift
 class issue #175 named. `RequestShape` is scoped to the pushdown-request routing decision and
 does not overlap the DataFusion physical-plan-shape concept.
+
+Move the HAVING merge-render from `build_dispatch_sql` into `classify_request_shape`, and carry the rendered fragment (or its absence) as part of the returned `RequestShape`.

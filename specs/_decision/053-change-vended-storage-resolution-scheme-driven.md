@@ -145,27 +145,3 @@ A join whose sides all select the same backend is unaffected, keeping its curren
 
 ---
 
-## ADR: Deriving `allow_http` from the vended endpoint was a security regression, reversed
-
-**ID:** allow-http-derivation-from-vended-scheme-reversed-as-regression
-**Plan:** `change-vended-storage-resolution-scheme-driven`
-**Status:** Accepted
-
-### Context
-
-The plan's original design derived `allow_http` from the vended endpoint's own scheme and described that as "strictly narrower" than the shipped behaviour. Plan review verified this false against `crates/lakehouse-engine/src/adapter/mod.rs:190-192`, which defaults `allow_http` to false when `ALLOW_HTTP` is absent — the secure default. Under the shipped rule that default permits plaintext to no endpoint; the derivation would have permitted it to any endpoint a catalog names as `http://`, letting a misconfigured or compromised catalog put vended STS credentials in cleartext with no operator control and no error. The `abfs://` half of the scheme mapping compounded this, since the Azure backend carries no HTTP-scheme knob to gate it at all.
-
-### Decision
-
-Reverse the derivation. `ALLOW_HTTP` is threaded in as its own `bool` parameter — a virtual-schema property, not a CONNECTION field — gating both a vended plain-`http://` endpoint and an `abfs://` anchor, erroring otherwise.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Thread `ALLOW_HTTP` in as its own resolved parameter | ✓ Chosen — restores operator consent as the gate, in both configurations |
-| Derive `allow_http` from the vended endpoint's scheme (original plan) | ✗ Rejected — a security regression in the default configuration; the "strictly narrower" claim held only when `ALLOW_HTTP` was already true |
-
-### Consequences
-
-Every consequence of the original derivation had to be corrected, not only the central decision: the spec Background, the § Test Disposition table, and § Impact all previously described or prescribed the derivation and were rewritten to match the reversal, since a fence left textually intact and factually false is worse on a credentials path than one openly superseded.
