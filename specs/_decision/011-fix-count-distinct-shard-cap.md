@@ -156,10 +156,3 @@ Case 1 applies only to a bare-column argument. A `COUNT(DISTINCT <expression>)`,
 ### Consequences
 
 Every `COUNT(DISTINCT <expression>)` is exact with no cast step. The fan-out value column always carries the column's real Exasol type, and the `VARCHAR(2000000)` arm is removed.
-
-## Follow-up: Exasol-dialect CAST for the qualified wrapper
-
-**Plan:** `fix-count-distinct-shard-cap`
-**Status:** Accepted
-
-The qualified single-table wrapper and the grouped-aggregate outer-merge wrapper render CAST targets in the Exasol dialect: `VARCHAR(n)`, with `CHAR(n)` also mapped to `VARCHAR(n)` using the width Exasol sent. Exasol parses the wrapper SQL, and its `VARCHAR` has no length-less form, so a bare `VARCHAR` is a parse error (`sqlCode 04000`). DataFusion-parsed fragments (scan-spec `filter`, `projection`, `group_keys`, and the broadcast-join condition) keep the bare `VARCHAR`, because datafusion-sql rejects `VARCHAR(n)`. The translator takes a generic dialect parameter, so any later rendering rule that differs by target parser can branch on it.

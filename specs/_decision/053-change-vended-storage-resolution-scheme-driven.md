@@ -52,33 +52,6 @@ The resolved `ALLOW_HTTP` virtual-schema property is passed into `resolve_vended
 
 Passing the value adds a 4-tuple to `resolve_connection_config` (2 call sites) and one boolean to four functions, following the convention for `s3_max_connections` and the DataFusion tuning knobs. Removing `ALLOW_HTTP` from the vended path was a planner decision, not an interview outcome.
 
-## ADR: A vended payload naming neither a region nor an endpoint is an error
-
-**ID:** vended-s3-requires-region-or-endpoint-else-error
-**Plan:** `change-vended-storage-resolution-scheme-driven`
-**Status:** Accepted
-
-### Context
-
-The CONNECTION can no longer backfill an absent vended value, so `client.region` and `s3.endpoint` are the only values that place an S3 store. With both empty, the adapter would silently address an AWS store as a region-less URL.
-
-### Decision
-
-The S3 arm requires a non-empty `client.region` or a non-empty `s3.endpoint`, and otherwise returns a `UdfError::User` naming both keys.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Leave an absent region empty | Rejected: the silent failure this change removes |
-| Require `client.region` always | Rejected: breaks the Lakekeeper vended path, which places its store by endpoint |
-| Condition the rule on `s3.path-style-access` | Rejected: encodes the engine's builder logic in the catalog crate |
-| Error only for an AWS-hosted `s3://` URI | Rejected: needs AWS endpoint conventions in the catalog crate, and a wrong answer fails silently |
-
-### Consequences
-
-The interview did not ask for this rule. It extends its "requested but not satisfied is an error" principle from the keys to the address. Whether AWS Glue's vended response carries `client.region` was unverified at planning time, so task 4.2 (the Glue vended-payload assertions) carries a blocking verification obligation.
-
 ## ADR: Per-side scheme selection needs a plan-time join guard scoped to variant and account, not full backend equality
 
 **ID:** join-backend-guard-scoped-to-variant-and-account

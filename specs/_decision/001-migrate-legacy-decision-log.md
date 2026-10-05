@@ -78,33 +78,6 @@ The catalog round-trip adds latency before the scan runs. The explicit file list
 
 ---
 
-## ADR: Value-Only Boundary with Batch-by-Batch Incremental Emit
-
-**ID:** value-only-boundary-with-batch-by-batch-incremental-emit
-**Plan:** `add-datafusion-iceberg-scan-pushdown`
-**Status:** Accepted
-
-### Context
-
-The scan UDF links its own Arrow copy, so Arrow `TypeId`s differ from those in the SDK or other `.so`s, and passing Arrow types across the `.so` boundary is unsafe. Materializing the full result before emitting risks memory blowups.
-
-### Decision
-
-The UDF converts each Arrow `RecordBatch` to SDK `Value` rows, emits them, and drops the batch before fetching the next. No Arrow type crosses the `.so` boundary.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Collect the full result, then emit | Rejected: violates the streaming constraint and holds two full copies in memory |
-| Pass Arrow types across the `.so` boundary | Rejected: unstable `TypeId` causes undefined behavior |
-
-### Consequences
-
-Peak memory per invocation is one Arrow batch plus one Value row buffer. Implementors must never collect all batches before emitting.
-
----
-
 ## ADR: Single Authoritative DataFusion-to-Exasol Type Mapping with JSON Fallback
 
 **ID:** single-authoritative-datafusion-to-exasol-type-mapping-with-json-fallback
@@ -377,32 +350,6 @@ The wrapper SQL carries three partial columns per statistical aggregate and the 
 
 ---
 
-## ADR: HAVING Applied in the Outer Merge Wrapper Only
-
-**ID:** having-applied-in-the-outer-merge-wrapper-only
-**Plan:** `add-capability-alignment`
-**Status:** Accepted
-
-### Context
-
-Each shard emits one partial row per group, so HAVING must run after the partials merge. Applying it per shard drops groups that clear the threshold only after the merge.
-
-### Decision
-
-The HAVING predicate is rendered by the shared `vs-expression` translator and applied only in the outer wrapper SQL, never in the per-shard scan. A predicate the adapter cannot translate is omitted, and Exasol keeps it as a correctness backstop.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Apply HAVING per shard | Rejected: discards groups that clear the threshold only after the cross-shard merge |
-
-### Consequences
-
-Logic that needs the full group picture goes in the wrapper, not the shard.
-
----
-
 ## ADR: Source Credentials from an Exasol CONNECTION Object (Mirror the Sibling Project's CONNECTION Convention)
 
 **ID:** source-credentials-from-an-exasol-connection-object-mirror-the-sibling-project-s-connection-convention
@@ -427,60 +374,6 @@ The adapter reads the catalog URI and all S3 and signing credentials from the CO
 ### Consequences
 
 `CATALOG_CONNECTION` is required and the plain-property credential path is removed. The `use_sigv4` and `use_vended_credentials` flags default to false, so existing MinIO and REST stacks work with a CONNECTION that omits them.
-
----
-
-## ADR: Self-Issue a SigV4-Signed load_table GET Instead of Using RestCatalogBuilder
-
-**ID:** self-issue-a-sigv4-signed-load-table-get-instead-of-using-restcatalogbuilder
-**Plan:** `add-glue-catalog-sigv4-connection`
-**Status:** Accepted
-
-### Context
-
-Querying AWS Glue's Iceberg REST catalog needs SigV4-signed requests and the vended S3 credentials from the `load_table` response's `storage_credentials` block. The `iceberg-catalog-rest` `RestCatalogBuilder` accepts only a plain `reqwest::Client`, has no per-request signing seam, and drops `storage_credentials`.
-
-### Decision
-
-On the Glue path, the adapter issues the `load_table` GET itself with a SigV4-signing client, deserializes the public `LoadTableResult` type, and reads vended credentials from `storage_credentials` (longest-prefix match, falling back to the flat `config`). The unsigned path keeps using `RestCatalogBuilder`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| `RestCatalogBuilder::with_client` with a plain client | Rejected: no signing seam, and internal dispatch bypasses middleware |
-| Fork `iceberg-catalog-rest` | Rejected: heavier maintenance and divergence from upstream |
-
-### Consequences
-
-The custom path depends on the public `LoadTableResult` type staying stable. It can be removed if the crate adds a signing hook.
-
----
-
-## ADR: Apply Vended Credentials via merge_vended_into_storage in the Planning Layer
-
-**ID:** apply-vended-credentials-via-merge-vended-into-storage-in-the-planning-layer
-**Plan:** `add-glue-catalog-sigv4-connection`
-**Status:** Accepted
-
-### Context
-
-With `use_vended_credentials`, the Glue `load_table` response carries short-lived STS credentials that must replace the static CONNECTION credentials for data-file reads. They must be resolved once per query to keep the stateless-UDF and resolve-once invariants.
-
-### Decision
-
-The planning layer merges the vended keys over the static `access_key`, `secret_key`, and `session_token`, keeping the static `endpoint`, `region`, and `path_style`. It embeds the merged storage block in every per-shard `ScanSpec`, and the scan UDF never contacts the catalog.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Rely on `iceberg-catalog-rest` to apply vended credentials | Rejected: it drops `storage_credentials` |
-| Re-vend per node inside the scan UDF | Rejected: violates resolve-once and adds catalog access to the UDF |
-
-### Consequences
-
-The scan UDF is credential-passive. A query that outlives the STS token lifetime fails, an accepted limit of the resolve-once design.
 
 ---
 
@@ -537,34 +430,6 @@ The adapter reads `NR_OF_CORES` with `SELECT PARAM_VALUE('NR_OF_CORES')` during 
 ### Consequences
 
 The floor of 8 keeps a single-core VM or a failed lookup (0) from collapsing the factor.
-
----
-
-## ADR: Per-Instance CPU Bound via Two Orthogonal VS Properties, Defaulting to 1
-
-**ID:** per-instance-cpu-bound-via-two-orthogonal-vs-properties-defaulting-to-1
-**Plan:** `change-shard-parallelism`
-**Status:** Accepted
-
-### Context
-
-DataFusion defaults `target_partitions` to the host core count. Exasol runs up to `NR_OF_CORES` UDF instances per node, so the thread count reaches about `NR_OF_CORES²` and thrashes the node. Tokio already used a current-thread runtime.
-
-### Decision
-
-Two independent VS properties, `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF`, set DataFusion `target_partitions` and the Tokio worker threads. Both default to 1, so each UDF instance uses one core and the shard fan-out supplies the parallelism. They travel through `adapterNotes` into optional `ScanSpec` fields that default to 1 when absent. The scale-up formula `max(1, floor(NR_OF_CORES / parallelism_factor))` is guidance only.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| One combined parallelism knob | Rejected: partition count and Tokio threads are orthogonal |
-| Leave `target_partitions` at the DataFusion default | Rejected: causes the oversubscription |
-| Derive `target_partitions` from cores in code | Rejected: hides cross-layer coupling and removes operator control |
-
-### Consequences
-
-A node is never oversubscribed by default, and operators can raise both settings. Older serialized specs deserialize unchanged.
 
 ---
 
@@ -938,32 +803,6 @@ Existing static-S3 connections validate as before, and only acceptance widens.
 
 ---
 
-## ADR: When SigV4 Is Enabled, `access_key`/`secret_key`/`region` Are Required (Orthogonal to Vending)
-
-**ID:** when-sigv4-is-enabled-access-key-secret-key-region-are-required-orthogonal-to-vending
-**Plan:** `add-rest-catalog-oauth-auth`
-**Status:** Accepted
-
-### Context
-
-The Glue path signs `load_table` with `access_key`, `secret_key`, and `region` before any vended credentials apply. With base validation reduced to `warehouse` (ADR-042), a `use_sigv4` connection missing them would fail later with an opaque signing error.
-
-### Decision
-
-When `use_sigv4` is true, validation requires non-empty `access_key`, `secret_key`, and `region`, whether or not `use_vended_credentials` is set. The error is credential-safe and names the missing fields. `endpoint` is excluded because the signer does not use it.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Rely on the `warehouse`-only base validation | Rejected: brings back an opaque late signing failure |
-
-### Consequences
-
-Non-SigV4 cases stay as loose as ADR-042 allows.
-
----
-
 ## ADR: Unify Table Loading Behind One Auth-Mode-Agnostic Self-Issued `loadTable` GET
 
 **ID:** unify-table-loading-behind-one-auth-mode-agnostic-self-issued-loadtable-get
@@ -1260,33 +1099,6 @@ The reconstructed path always equals the original data-file URI. The sibling-pre
 
 ---
 
-## ADR: Supply File Sizes via a Spec-Backed `ObjectStore` `head()` Wrapper, Keeping `ListingTable` + Field-ID Adapter
-
-**ID:** supply-file-sizes-via-a-spec-backed-objectstore-head-wrapper-keeping-listingtable-field-id-adapter
-**Plan:** `change-scan-spec-files-payload`
-**Status:** Accepted
-
-### Context
-
-With file sizes in the spec (ADR-053), the UDF no longer needs a per-file object-store `HEAD` (#29). Field-id projection depends on `ListingTable`, which must keep working. In DataFusion 54 with object_store 0.13.2, an exact-file URL calls `store.head()` per path without caching, and `head` is the `ObjectStoreExt` blanket method over `get_opts`. Scan correctness does not use `last_modified`.
-
-### Decision
-
-The `ListingTable` and `FieldIdExprAdapterFactory` wiring stays. The registered `AmazonS3` store is wrapped in an `ObjectStore` that answers the `head: true` case of `get_opts` from the spec size and delegates everything else. The wrapper is registered in the session `ObjectStoreRegistry` under the same URL.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| `PartitionedFile::new(path, size)` with `FileScanConfigBuilder::with_expr_adapter` | Rejected as primary, kept as fallback: viable and keeps field-id projection, but replaces `ListingTable` wholesale |
-| Keep the per-file HEAD | Rejected: it is the bug (#29) |
-
-### Consequences
-
-The scan issues no per-file `HEAD`. The wrapper depends on `head` dispatching through `get_opts`, so an object_store upgrade must re-verify it.
-
----
-
 ## ADR: One `S3_MAX_CONNECTIONS` Knob, Not a Dual Per-File/Per-Node Pair
 
 **ID:** one-s3-max-connections-knob-not-a-dual-per-file-per-node-pair
@@ -1419,59 +1231,6 @@ Expression-argument aggregates use the shard-associative partial and merge plan.
 
 ---
 
-## ADR: COUNT(DISTINCT) Merged by a Scalar UDF Fed via LISTAGG of Per-Shard JSON Arrays
-
-**ID:** count-distinct-merged-by-a-scalar-udf-fed-via-listagg-of-per-shard-json-arrays
-**Plan:** `add-count-distinct-and-expression-aggregate-pushdown`
-**Status:** Accepted
-
-### Context
-
-`COUNT(DISTINCT col)` over the whole table fell back to a raw row scan. Pushing it down needs each shard to compute its local distinct set and the wrapper to union the sets, without shipping raw rows, crossing the `.so` boundary with Arrow types, or building bespoke SQL rewriting, a mission non-goal.
-
-### Decision
-
-A new `AggKind::CountDistinct` computes the local distinct set per shard with `array_agg(DISTINCT col)`, excluding NULLs, and serializes it as one JSON array VARCHAR per shard. The outer wrapper joins the shard partials with Exasol's `LISTAGG` into an array-of-arrays string and passes it to a new scalar entry point, `LAKEHOUSE_DISTINCT_MERGE_COUNT`. That UDF unions the elements and returns the cardinality.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| SET merge UDF with its own grouping protocol | Rejected: adds a grouping protocol and complicates multiple `COUNT(DISTINCT)` columns |
-| Bespoke SQL string-splitting or `CONNECT BY` rewrite | Rejected: complex query rewriting is a non-goal |
-
-### Consequences
-
-Single-group `COUNT(DISTINCT)` pushes down, through a third scalar entry point in the same `.so`. Grouped `COUNT(DISTINCT)` still falls back to row scanning. The merge depends on the `LISTAGG` output ceiling (ADR-066).
-
----
-
-## ADR: Execution-Time Per-Shard Safety Cap for COUNT(DISTINCT), With a Clean Error on Overflow
-
-**ID:** execution-time-per-shard-safety-cap-for-count-distinct-with-a-clean-error-on-overflow
-**Plan:** `add-count-distinct-and-expression-aggregate-pushdown`
-**Status:** Accepted
-
-### Context
-
-A pushed-down `COUNT(DISTINCT)` (ADR-065) on a high-cardinality column can grow an unbounded per-shard set, exhausting memory or exceeding the `VARCHAR(2000000)` wire limit. The mission prefers a clean bounded-resource error to an OOM crash. Iceberg NDV statistics are not reliably available.
-
-### Decision
-
-Each shard enforces a cap of 100,000 distinct elements or 1,048,576 serialized bytes, whichever trips first. On overflow the scan UDF aborts the shard with a clean error naming the column and the cap, and never emits a truncated set. No plan-time NDV decline is the primary mechanism.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Plan-time NDV-based decline to row scan | Rejected as primary: NDV statistics are unreliable, though it may become a secondary optimization |
-
-### Consequences
-
-A high-cardinality `COUNT(DISTINCT)` that used to finish via row scan can now fail the cap with a clean error, an accepted regression. The merge side is bounded by the `LISTAGG` ceiling. Low-cardinality dimension columns are unaffected.
-
----
-
 ## ADR: Two-Column Arithmetic Aggregate Gap Is Fixed by Capability Advertisement, Not New Machinery
 
 **ID:** two-column-arithmetic-aggregate-gap-is-fixed-by-capability-advertisement-not-new-machinery
@@ -1552,32 +1311,6 @@ The adapter advertises `ORDER_BY_COLUMN` and pushes `ORDER BY <bare projected co
 ### Consequences
 
 NQ4 improved from 12.03s to 2.13s, ahead of Trino's 4.71s. The top-N path is a new partial and merge variant beside the aggregate path.
-
----
-
-## ADR: Advertise ORDER_BY_COLUMN Only; ORDER_BY_EXPRESSION and LIMIT_WITH_OFFSET Stay Absent
-
-**ID:** advertise-order-by-column-only-order-by-expression-and-limit-with-offset-stay-absent
-**Plan:** `add-topn-pushdown`
-**Status:** Accepted
-
-### Context
-
-Column sort keys without OFFSET serve NQ4 and the common top-N shape. Expression ordering and OFFSET would add rendering and bounded-sort-with-skip complexity with no evidenced need.
-
-### Decision
-
-The adapter advertises only `ORDER_BY_COLUMN`. `ORDER_BY_EXPRESSION` and `LIMIT_WITH_OFFSET` stay unadvertised, so Exasol never sends a shape the adapter has no path for.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Also advertise expression ordering or OFFSET | Rejected: no evidenced need, and it adds complexity |
-
-### Consequences
-
-The capability surface matches the backing implementation.
 
 ---
 
@@ -2372,33 +2105,6 @@ Fan-out still needs a `GROUP BY shard_key` relation so Exasol distributes shard 
 ### Consequences
 
 The `.so` still exports exactly the adapter, scan, and scalar distinct-merge entry points. The distributor references no `.so` and declares no `%udf_object`, so its footprint is small and independent of data volume.
-
----
-
-## ADR: SCALAR Batching Requires a `while ctx.next()` Scan Loop With Once-Per-Batch Runtime
-
-**ID:** scalar-batching-requires-a-while-ctx-next-scan-loop-with-once-per-batch-runtime
-**Plan:** `change-scan-fanout-to-scalar-emit`
-**Status:** Accepted
-
-### Context
-
-A SCALAR EMIT UDF may receive several input rows in one `run()` call. Reading a single `ctx.next()` processes only the first row and silently drops the rest, which lost 108M of 210M rows in the spike. Building a DataFusion runtime per row races object_store's detached background tasks and repeats setup cost.
-
-### Decision
-
-`run_scan` loops `while ctx.next()` over the batch and scans each row's file list. It builds the DataFusion runtime once from the first row's shard-invariant thread configuration, reuses it for the batch, and tears it down once after the batch is drained, keeping the `run_on_runtime` and `shutdown_timeout` discipline.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Single `ctx.next()` read | Rejected: silently drops every row after the first |
-| Runtime build and teardown per row | Rejected: races object_store's background tasks and repeats setup |
-
-### Consequences
-
-A one-row batch produces the same output as the single-row scan.
 
 ---
 
