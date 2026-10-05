@@ -40,7 +40,7 @@ Refuses a query over a table that the querying Exasol user holds no Lakekeeper g
 ### Scenario: The check is accepted only for an Iceberg REST catalog URI that ends in /catalog
 
 * *GIVEN* a request whose effective properties set `PERMISSION_CHECK = 'LAKEKEEPER'` with a valid `USER_MAPPING`
-* *WHEN* the adapter handles a createVirtualSchema, refresh, setProperties, or pushdown request
+* *WHEN* the adapter handles a createVirtualSchema, refresh, or setProperties request, or a pushdown request whose current user `USER_MAPPING` maps
 * *THEN* under any catalog kind other than Iceberg REST, the adapter SHALL return the error `PERMISSION_CHECK = 'LAKEKEEPER' requires the Iceberg REST catalog kind` before it reads the CONNECTION, also for a virtual schema that carried the property before this feature
 * *AND* under Iceberg REST, the adapter SHALL reject a catalog URI that does not end in `/catalog` before any catalog request, with an error that names the URI and states that the check needs a catalog URI ending in `/catalog`
 * *AND* a createVirtualSchema, refresh, or setProperties request that passes both checks SHALL list the namespace as it does with the check off, and MUST NOT send any management API request
@@ -55,7 +55,7 @@ Refuses a query over a table that the querying Exasol user holds no Lakekeeper g
 
 ### Scenario: A user that USER_MAPPING cannot map is refused before any request
 
-* *GIVEN* a virtual schema with the check on
+* *GIVEN* a virtual schema with the check on and a valid `USER_MAPPING` whose rules do not clash
 * *WHEN* a pushdown request arrives whose current user is absent or empty, matches no rule, or cannot be mapped as Background defines, for example `ALICE` under `EXA_* -> oidc~{*|lower}@corp.net` alone, the delimited user `alice` under `* -> oidc~{*|lower}@corp.net`, or a delimited user name that holds a space
 * *THEN* the adapter SHALL refuse the query with an error that names the user and states that `USER_MAPPING` cannot map it to a Lakekeeper principal
 * *AND* the adapter MUST NOT read the CONNECTION or send any request
@@ -89,7 +89,7 @@ Refuses a query over a table that the querying Exasol user holds no Lakekeeper g
 * *GIVEN* a virtual schema with the check on and a pushdown request
 * *WHEN* the batch-check cannot be sent, answers a non-2xx status, or answers a body that is not a batch-check answer
 * *THEN* the adapter SHALL refuse the query and MUST NOT send any `loadTable` GET, so an answer that it cannot read never counts as allowed
-* *AND* the error SHALL name the batch-check URL and the HTTP status, if any, and for a 404, a 405, or a body that is not a batch-check answer SHALL state that the check needs a Lakekeeper server as the catalog
+* *AND* the error SHALL name the batch-check URL, the HTTP status, if any, and the redacted answer body, if any, so that a 422 names its cause, and for every non-2xx answer other than a 403 `CannotInspectPermissions` and every 2xx body that is not a batch-check answer SHALL state that the check needs a Lakekeeper server as the catalog
 * *AND* for a 403 `CannotInspectPermissions` the error SHALL state that the CONNECTION's identity needs a grant that includes `can_read_assignments`, such as `manage_grants` on the warehouse or the namespace, and a pushdown on the live `lakekeeper-e2e` stack through such a CONNECTION SHALL get that error
 * *AND* no error SHALL contain the CONNECTION's `token`, `client_id`, `client_secret`, `oauth2_server_uri`, or `scope`, or the session's bearer token, even when the answer body echoes them
 

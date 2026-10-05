@@ -36,8 +36,8 @@
 
 - **Decision:** The batch-check names the warehouse by the prefix that the session's `/v1/config` lookup returned, unchanged. The adapter does not detect Lakekeeper before the check. A server that is not Lakekeeper fails the batch-check, and the refusal names the batch-check URL and the HTTP status and says that the catalog must be a Lakekeeper server.
 - **Alternatives:** Accepting only a UUID prefix (the prior design, rejected: Lakekeeper already rejects a bad warehouse id, and the rule added a second error path for one cause). A detection call before the check (rejected: one more request per query, and the failed batch-check already reports the same fact). A management lookup of the warehouse id by name (rejected: one more request). A warehouse-id property (rejected: it can disagree with the warehouse that the session resolves).
-- **Rationale:** A live check on 2026-10-02 against Lakekeeper `v0.13.1` showed `GET /catalog/v1/config?warehouse=lakehouse_authz` answer `defaults.prefix = 5c25f9c4-be40-11f1-a87d-17102559a460`. `/management/v1/warehouse` lists the same id for `lakehouse_authz`. A server without the batch-check route answers 404, 405, or a body that is not JSON.
-- **Consequences:** A failed `/v1/config` lookup leaves the prefix empty (`resolve_load_table_prefix`). The check then fails or denies, and the query is refused.
+- **Rationale:** A live check on 2026-10-02 against Lakekeeper `v0.13.1` showed `GET /catalog/v1/config?warehouse=lakehouse_authz` answer `defaults.prefix = 5c25f9c4-be40-11f1-a87d-17102559a460`. `/management/v1/warehouse` lists the same id for `lakehouse_authz`. A read-only probe on 2026-10-05 recorded two failure answers. The repo's Iceberg REST reference server answered `POST /management/v1/action/batch-check` with 400 `application/json`, a `BadRequestException` "No route for request". Lakekeeper `v0.13.1` answered an empty or non-UUID `warehouse-id` with 422 `text/plain`, a JSON-body deserialization error that names `TabularIdentOrUuid`.
+- **Consequences:** A failed `/v1/config` lookup leaves the prefix empty (`resolve_load_table_prefix`). The check then fails with 422, and the query is refused.
 - **Promotes to ADR:** no
 
 ### [4] The management API URL is derived from a catalog URI that ends in `/catalog`, with no override
@@ -95,4 +95,16 @@
 
 - **Finding:** #415 requires that a crafted user name cannot produce another user's principal. The check delta stated injectivity only in Background, so the injectivity test traced to a scenario that did not state what the test checks.
 - **Direction change:** A scenario step states that two distinct accepted user names never get one principal. Decision [5] carries the rule into the rule-list mapping, and "USER_MAPPING never gives two Exasol users one principal" now holds that step.
+- **Promotes to ADR:** no
+
+### [plan-review] The kind scenario and the unmappable-user scenario demanded different errors for one pushdown
+
+- **Finding:** A pushdown under `GLUE`, or under a catalog URI without `/catalog`, with a valid mapping and an absent current user matched both scenarios. The kind scenario required the kind or URI error. The user scenario required the user error, without a CONNECTION read. The user scenario's GIVEN also overlapped the invalid-property and clash scenarios.
+- **Direction change:** The kind scenario's WHEN covers a pushdown only when `USER_MAPPING` maps its current user. The user scenario's GIVEN requires a valid `USER_MAPPING` whose rules do not clash. Task 2.4 keeps its order: parse the settings, map the user, then resolve the kind and the CONNECTION.
+- **Promotes to ADR:** no
+
+### [plan-review] A non-Lakekeeper server that answers 400 got no Lakekeeper statement
+
+- **Finding:** The failure scenario gave the Lakekeeper statement only to a 404, a 405, or a non-batch-check body. A probe on 2026-10-05 showed that the Iceberg REST reference server answers 400 `BadRequestException`. Lakekeeper answers an empty or non-UUID warehouse id with 422 `text/plain`.
+- **Direction change:** Every non-2xx answer other than a 403 `CannotInspectPermissions`, and every 2xx body that is not a batch-check answer, gets the Lakekeeper statement. Every failure error carries the redacted answer body, so a 422 names its cause. Decision [3] records the two probe results. Task 1.4 covers a 400 and a 422 answer.
 - **Promotes to ADR:** no
