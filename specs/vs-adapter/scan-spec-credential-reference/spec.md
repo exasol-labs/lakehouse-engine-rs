@@ -30,22 +30,29 @@ Replaces the storage credentials the adapter embedded in the scan-driving SQL wi
 ### Scenario: The scan UDF resolves the referenced CONNECTION
 
 * *GIVEN* a scan invocation with a storage reference or sealed envelope
-* *THEN* the UDF calls `ctx.connection()`, deserializes into a STORAGE-ONLY projection (nine fields), and derives the backend through the SAME selector the adapter uses
-* *AND* sealed envelope: derives the key from password BYTES, opens via AEAD; failure produces a named error with no plaintext; unresolvable CONNECTION produces a named error, no inline fallback
+* *WHEN* the scan UDF starts
+* *THEN* the UDF SHALL call `ctx.connection()`, deserialize into a STORAGE-ONLY projection (nine fields), and derive the backend through the SAME selector the adapter uses
+* *AND* for a sealed envelope it SHALL derive the key from password BYTES and open via AEAD
+* *AND* a failed open SHALL produce a named error with no plaintext, and an unresolvable CONNECTION SHALL produce a named error with no inline fallback
 
 ### Scenario: Error redaction reads from resolved credentials, not the wire spec
 
 * *GIVEN* a scan invocation whose storage resolves to a credential-bearing backend
-* *THEN* value-based redaction takes its secret set from RESOLVED backends; the wire wrapper exposes no secret accessor (compile-time); a join's secret set is the UNION of both sides
+* *WHEN* the scan builds an error message
+* *THEN* value-based redaction SHALL take its secret set from RESOLVED backends, and a join's secret set SHALL be the UNION of both sides
+* *AND* the wire wrapper MUST NOT expose a secret accessor (enforced at compile time)
 
 ### Scenario: The generated SQL is asserted credential-free at every builder path
 
 * *GIVEN* every `RequestShape` variant crossed with join/top-N/COUNT(DISTINCT) sub-paths
-* *THEN* under BOTH vending settings: no sentinel credential in the returned SQL STRING; the connection NAME is positively asserted present (static) or the envelope unseals correctly (vended)
-* *AND* the eighteen credential-bearing golden fixtures carry the reference encoding; the six `empty_*` fixtures stay byte-identical
+* *WHEN* the adapter generates the pushdown SQL under BOTH vending settings
+* *THEN* the returned SQL STRING MUST contain no sentinel credential
+* *AND* the connection NAME SHALL be positively asserted present (static) or the envelope SHALL unseal correctly (vended)
+* *AND* the eighteen credential-bearing golden fixtures SHALL carry the reference encoding, and the six `empty_*` fixtures SHALL stay byte-identical
 
 ### Scenario: The scan script requires a script-scoped grant; rotation is observed per shard
 
 * *GIVEN* a deployment with the adapter grant already in place
-* *THEN* the scan script additionally needs `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_SCAN TO <owner>`; a missing grant fails with a named error; no inline fallback
-* *AND* each shard reads the CONNECTION value current at ITS resolution time; a sealed envelope under a rotated password fails AEAD with no plaintext
+* *WHEN* a scan runs
+* *THEN* the scan script SHALL additionally need `GRANT ACCESS ON CONNECTION ... FOR SCRIPT <schema>.LAKEHOUSE_SCAN TO <owner>`, and a missing grant SHALL fail with a named error and no inline fallback
+* *AND* each shard SHALL read the CONNECTION value current at ITS resolution time, and a sealed envelope under a rotated password SHALL fail AEAD with no plaintext

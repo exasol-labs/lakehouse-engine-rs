@@ -100,30 +100,6 @@ The partition functions stay structural. One renderability screen, with exact-co
 
 A condition added to a function with both a pruning and a rendering consumer degrades pruning invisibly. Screen at the consumer, not in the shared classifier.
 
-## ADR: A residual render errors only on the non-suppressing renderer's `None`, never the suppressing one's
-
-**ID:** error-only-on-the-non-suppressing-renders-none
-**Plan:** fix-declined-filter-self-apply
-**Status:** Accepted
-
-### Context
-
-The qualified renderer suppresses a trivially-true result to `None`, as its DataFusion twin does. Erroring on any `None` would turn a correct "no outer WHERE" for a join with a trivially-true conjunct into a client error.
-
-### Decision
-
-The error is gated on the non-suppressing qualified renderer returning `None` for the combined residual tree. Both wrappers distinguish three outcomes (absent, trivially true, unrenderable) and error only on the third.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Error whenever the suppressing renderer returns `None` | Rejected: turns a correct no-op predicate into a hard failure |
-
-### Consequences
-
-A renderer that suppresses a no-op result must never decide unrenderability.
-
 ## ADR: The full-base-row projection is keyed off the absent select list, not off the decline
 
 **ID:** decline-route-projects-the-full-base-row

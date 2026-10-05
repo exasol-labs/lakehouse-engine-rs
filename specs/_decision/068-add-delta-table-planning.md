@@ -78,27 +78,3 @@ A `ScanSource` enum pairs a live catalog session with the table it reads. `forma
 ### Consequences
 
 Listing admission (which entries are Delta base tables) stays owned by the client, while the table format is data the engine reads. This supersedes the clause that the data source format must not appear in any neutral type, because withholding it would force the engine to assume Unity implies Delta.
-
-## ADR: Delta log replay takes an injected object store
-
-**ID:** delta-log-replay-injected-object-store
-**Plan:** `add-delta-table-planning`
-**Status:** Accepted
-
-### Context
-
-Delta log-replay correctness must be verifiable without a live S3 or MinIO stack, while the live `unity-e2e` suite still proves the credentialed S3 path.
-
-### Decision
-
-The replay step takes an object store and a table-root URL and builds no store itself. `DeltaFormatReader` builds the store.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Replay step builds its own store | Rejected: every replay test would need S3 or a mock, and store construction would have two homes |
-
-### Consequences
-
-Replay correctness runs offline against vendored fixtures over a local filesystem store. The live suite covers only catalog resolve, credential vending, and reading `_delta_log` over S3.

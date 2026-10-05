@@ -119,4 +119,6 @@ instead of rejecting it for a column-count/type mismatch.
 ### Scenario: An empty-result plan carries no storage block at all
 
 * *GIVEN* a pushdown request this feature short-circuits to an empty result
-* *THEN* the returned SQL carries no scan-spec storage value — neither a credential nor a connection reference — so the credential-reference guarantee holds unconditionally; the six `empty_*` golden fixtures stay byte-identical
+* *WHEN* the adapter generates the pushdown SQL
+* *THEN* the returned SQL SHALL carry no scan-spec storage value, neither a credential nor a connection reference, so the credential-reference guarantee holds unconditionally
+* *AND* the six `empty_*` golden fixtures SHALL stay byte-identical

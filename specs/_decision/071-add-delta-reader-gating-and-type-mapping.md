@@ -1,31 +1,5 @@
 # Decisions: add-delta-reader-gating-and-type-mapping
 
-## ADR: Refuse struct, map, binary, and variant instead of completing the JSON-`VARCHAR` convention
-
-**ID:** refuse-struct-map-binary-variant-not-json-varchar-convention
-**Plan:** `add-delta-reader-gating-and-type-mapping`
-**Status:** Accepted
-
-### Context
-
-Issue #322 asked to complete the "incompatible Arrow types to JSON `VARCHAR`" convention for Delta `struct`, `map`, `binary`, and `variant`. In `arrow-cast`, `Struct` and `Map` cannot cast to `Utf8`, so DataFusion's castability check rejects them before any per-value JSON conversion on either table format. `Binary` casts but replaces non-UTF-8 bytes with NULL, which is silent corruption.
-
-### Decision
-
-The planner refuses `binary`, `struct`, `map`, and `variant` by name at plan time, each with its own reason. The first three cite issue #350, and `variant` cites its opaque binary encoding. Issue #322 closes without the JSON-`VARCHAR` convention for these types.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Complete the convention as asked | Rejected: unreachable for `struct` and `map`, lossy for `binary` |
-| Implement real JSON rendering in this plan | Rejected: a design problem spanning both formats, filed as #350 |
-| Keep the generic "issue #322" error text | Rejected: #322 is this plan, so the error would read as an unowned gap |
-
-### Consequences
-
-Issue #350 owns real JSON rendering for `struct` and `map` on both formats and the removal of Delta's refusal. Iceberg already maps these to `Utf8`, and the asymmetry is deliberate.
-
 ## ADR: Scope the Delta type refusal to the column, not the table
 
 **ID:** scope-delta-type-refusal-to-column-not-table

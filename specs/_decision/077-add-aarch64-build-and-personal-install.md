@@ -25,31 +25,6 @@ Each architecture builds on its own native GitHub Actions runner, `ubuntu-latest
 
 CI gains a second native build leg at the cost of extra runner minutes.
 
-## ADR: x86_64 unsuffixed, aarch64 suffixed release asset naming
-
-**ID:** aarch64-asset-naming-unsuffixed-x86
-**Plan:** add-aarch64-build-and-personal-install
-**Status:** Accepted
-
-### Context
-
-Existing docs, CI consumers, and the install one-liner reference `lakehouse-engine.tar.gz` without a suffix.
-
-### Decision
-
-The x86_64 tarball keeps the name `lakehouse-engine.tar.gz`, and the aarch64 tarball is `lakehouse-engine-aarch64.tar.gz`. SLC assets follow the same convention.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Suffix both architectures | Rejected: breaks every existing unsuffixed reference |
-| Architecture subdirectories in the release | Rejected: the same break, plus a new release layout |
-
-### Consequences
-
-x86_64 users see no change. The install script's `--arch` flag and suffix helper hide the aarch64 suffix from operators.
-
 ## ADR: `--arch` defaults to x86_64, not auto-detection
 
 **ID:** arch-flag-defaults-x86_64
@@ -73,28 +48,3 @@ The install script runs on an operator's machine, which for SaaS and BucketFS ta
 ### Consequences
 
 Existing x86_64 invocations are unchanged. Inference applies only where host and target match.
-
-## ADR: The arm64 unit-test job gates the release
-
-**ID:** arm64-unit-test-gates-release
-**Plan:** add-aarch64-build-and-personal-install
-**Status:** Accepted
-
-### Context
-
-`e2e-azure` is excluded from the release gate because a live third-party account can fail for unrelated reasons. The `arm64` job runs `cargo test --workspace` on a GitHub-hosted runner with the reliability of `unit-tests`. Because aarch64 E2E is a non-goal, it is the only aarch64-specific signal.
-
-### Decision
-
-`arm64` is in the `release` job's `needs:`, so a failing aarch64 test run blocks the release. The `needs:` comment beside the `e2e-azure` exclusion records the reason.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Leave `arm64` ungated, like `e2e-azure` | Rejected: it is not a flaky third-party dependency, and ungating removes the only aarch64 signal |
-| Gate on an aarch64 E2E job | Rejected: aarch64 E2E is a non-goal because no arm64 `docker-db` image exists |
-
-### Consequences
-
-The aarch64 asset has the same gating strength as x86_64, and the comment stops a later reader from removing the gate.

@@ -24,29 +24,3 @@ The partial-aggregate column contract (how many columns each `AggKind` contribut
 ### Consequences
 
 Extending the contract means adding a case to an exhaustive match, which is a compile error at every renderer.
-
-## ADR: Home the descriptor in scan/spec.rs, and keep that module serde-only
-
-**ID:** partial-column-descriptor-lives-in-scan-spec-serde-only
-**Plan:** refactor-pushdown-agg-dedup
-**Status:** Accepted
-
-### Context
-
-The scan and the adapter both already import `scan::spec`, the wire-format module, which imports only `serde`. The descriptor's empty-shard identity could be an SDK `Value` or a boolean.
-
-### Decision
-
-The descriptor, its counter flag, and the shared partial-column name helper live in `scan/spec.rs`, and the empty-shard identity is a boolean. The emit site maps the boolean to the SDK `Value`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| A new module for the contract | Rejected: a module for one enum and two methods |
-| The adapter's `support.rs` | Rejected: unreachable from the scan, and would make the wire format depend on the adapter |
-| Return the SDK `Value` from the descriptor | Rejected: pulls the SDK into a serde-only module for a two-value mapping |
-
-### Consequences
-
-`scan/spec.rs` gains no new dependency edge.

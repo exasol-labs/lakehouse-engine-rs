@@ -1,29 +1,5 @@
 # Decisions: fix-join-filter-type-rewrites
 
-## ADR: Wire the full type-rewrite pipeline into both join WHERE-filter sites, not only the LIKE guard
-
-**ID:** wire-full-type-rewrite-pipeline-into-join-where-filter-sites
-**Plan:** fix-join-filter-type-rewrites
-**Status:** Accepted
-
-### Context
-
-The broadcast join's combined WHERE filter and the N-scan fallback's per-leg WHERE filter rendered with no column-type awareness. The single-table path runs `apply_type_rewrites`, an ordered pipeline of the LIKE guard (#207), the string-function guard (#210), and the DECIMAL stringification rewrite (#211). Issue #215 asked only for the LIKE guard.
-
-### Decision
-
-Both join sites run the full `apply_type_rewrites` pipeline. Every decline it produces is already safe, since PR #285 made broadcast fall back to N-scan and made an N-scan side-local decline a residual outer `WHERE` conjunct.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Wire only the LIKE guard, matching #215's literal scope | Rejected: leaves two known wrong-answer paths open at surfaces already being edited, one of them (#223 slice 2) silently wrong |
-
-### Consequences
-
-The pipeline function stays the only sequencer of its passes, and no call site sequences the guards itself. Issue #223 narrows to slices 1 and 3, and #228's exposure narrows without closing.
-
 ## ADR: The N-scan type screen runs per side and per conjunct, after attribution
 
 **ID:** n-scan-type-screen-runs-per-side-per-conjunct-after-attribution

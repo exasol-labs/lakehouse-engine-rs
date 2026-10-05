@@ -10,7 +10,7 @@ column is nullable and defines no default.
 ## Background
 
 * When the scan spec carries a logical schema (a list of `{field_id, name, arrow_type,
-  nullable, initial_default}` tuples), the scan UDF registers the `ListingTable` with that
+  nullable, initial_default}` tuples), the scan UDF registers its file-list table provider with that
   schema (each field tagged with `PARQUET:field_id` metadata) and installs a
   `FieldIdExprAdapter` that resolves each logical column to its physical Parquet column by,
   in order: (1) an embedded `PARQUET:field_id` match; (2) for a physical field that carries
@@ -88,7 +88,7 @@ column is nullable and defines no default.
 * **This delta adds ONE scenario and is issue #329.** It records the domain gate on the VS's
   `initial-default` encoding step for an Iceberg `decimal(P,S)` whose precision and scale fall
   outside Exasol's catalog-decimal domain. `encode_initial_default`
-  (`crates/lakehouse-engine/src/adapter/pushdown/file_resolution.rs`) carried its own copy of the
+  (`crates/lakehouse-engine/src/adapter/pushdown/format/iceberg.rs`) carried its own copy of the
   predicate `precision <= 36 && scale <= 36`, held in agreement with the Arrow-type tag only by
   convention. Nothing else in this feature changes: field-id resolution, the
   `schema.name-mapping.default` fallback, the per-file default fill, the required-absent error,

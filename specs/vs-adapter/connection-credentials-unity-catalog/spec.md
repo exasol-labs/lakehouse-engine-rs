@@ -10,8 +10,14 @@ Extends `vs-adapter/connection-credentials` so credential validation takes the r
 
 ### Scenario: Credential validation is parameterized by catalog kind
 
-* `warehouse` required under `IcebergRest` only; all other rules apply unchanged; `CatalogKind` arrives as explicit input, not from the password JSON; no credential values in errors
+* *GIVEN* a CONNECTION and an explicit `CatalogKind` input, not read from the password JSON
+* *WHEN* the adapter validates the credentials
+* *THEN* `warehouse` SHALL be required under `IcebergRest` only, and all other rules SHALL apply unchanged
+* *AND* no error MUST carry a credential value
 
 ### Scenario: Unity Catalog reuses existing auth fields
 
-* Accepts no-auth CONNECTIONs (OSS Unity runs unauthenticated); enforces token-vs-OAuth exclusion; `token` and `client_secret` never in errors or SQL
+* *GIVEN* a Unity Catalog CONNECTION, possibly with no auth fields because OSS Unity runs unauthenticated
+* *WHEN* the adapter validates the credentials
+* *THEN* it SHALL accept a no-auth CONNECTION and SHALL enforce the token-versus-OAuth exclusion
+* *AND* `token` and `client_secret` MUST NOT appear in errors or SQL

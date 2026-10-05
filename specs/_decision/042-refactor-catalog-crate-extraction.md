@@ -49,3 +49,5 @@ File planning stays in `lakehouse-engine`. The catalog crate takes catalog authe
 ### Consequences
 
 The catalog crate's manifest declares no `arrow`, `parquet`, `datafusion`, `object_store`, or `roaring` dependency, checked by a boundary test. The scan-spec wire format and Arrow type mapping stay in one crate.
+
+`StorageBackend` exposes three methods and the engine registers object stores in one plain function, because the dependency ban rules out a fourth method.

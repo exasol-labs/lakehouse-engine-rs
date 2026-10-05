@@ -1,31 +1,5 @@
 # Decisions: refactor-scan-spec-dispatch-dedup
 
-## ADR: Flatten-Embed `CommonScanSpec` Into `ScanSpec`
-
-**ID:** flatten-embed-common-scan-spec-into-scan-spec
-**Plan:** `refactor-scan-spec-dispatch-dedup`
-**Status:** Accepted
-
-### Context
-
-`ScanSpec` duplicated the shard-invariant fields of `CommonScanSpec`, and the copy code drifted silently whenever a field was added. The UDF wire format must stay byte-identical.
-
-### Decision
-
-`ScanSpec` embeds `CommonScanSpec` with a flattened serde field next to the file list. Every shard-invariant read and construction site moves to the nested form.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| `Deref` to `CommonScanSpec` | Rejected: discouraged pattern that does not remove the construction-site edits |
-| Declarative macro generating both structs | Rejected: more clever than the codebase's "prefer simple" bar |
-| Nested, non-flattened field | Rejected: changes the wire to nested JSON |
-
-### Consequences
-
-The shard-invariant fields have one declaration, and the compiler forces every site to migrate. The migration touches about 100 read sites and 85 construction sites in one compile unit, so it goes to the expert executor, with the golden dispatch-SQL baseline as the drift detector.
-
 ## ADR: Shared `RequestShape` Classifier Consumed By Both the Dispatch and Empty-Result Paths
 
 **ID:** shared-request-shape-classifier-dispatch-and-empty-result

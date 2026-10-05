@@ -25,26 +25,4 @@ A `CatalogSession` bundles the client, catalog URI, auth, and prefix. The adapte
 
 The OAuth grant and config lookup run at most once per query, and one pooled client serves all catalog requests. The per-table `loadTable` stays because only its response carries per-table vended storage credentials.
 
-## ADR: Session Built Per-Path at the handle_pushdown Seam, Not Once Before detect_join
-
-**ID:** catalog-session-built-per-path-not-before-detect-join
-**Plan:** `refactor-catalog-http-session`
-**Status:** Accepted
-
-### Context
-
-Today an ineligible join and a malformed single-table projection both fail before any network contact. Building the session before join detection would add a catalog call ahead of that validation.
-
-### Decision
-
-The adapter builds the session inside the join arm, and the single-table path builds a single-use session internally. An ineligible join declines with no session, and table-identifier validation runs before the config lookup on both paths.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Build once at the top of `handle_pushdown` | Rejected: contacts the catalog before fast-reject validation and regresses the no-network behavior |
-
-### Consequences
-
-Exactly one session is built per query, and fast-failing requests still make no network calls.
+The adapter builds the session inside the join arm and builds a single-use one in the single-table path, never before join detection, so an ineligible join declines with no session and fast-failing validation makes no network call.

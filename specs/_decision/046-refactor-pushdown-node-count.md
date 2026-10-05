@@ -25,27 +25,3 @@
 ### Consequences
 
 The node count now comes live per pushdown instead of frozen at creation, which `plan.md` § Impact states. The superseded ADR's `UdfContext::node_count()` source and `0 => 1` floor stay. No tombstone constant, removal path, or cleanup issue exists.
-
-## ADR: Capture the Handshake Read in `dispatch`; Pass a Value, Never `ctx`, into Async Planning
-
-**ID:** capture-node-count-handshake-in-dispatch-pass-value-not-ctx-into-async-planning
-**Plan:** refactor-pushdown-node-count
-**Status:** Accepted
-
-### Context
-
-`node_count()` is a synchronous handshake read that may block on the UDF host, and pushdown planning is `async`. `dispatch` already captures the script schema and CONNECTION credentials before `rt.block_on` for this reason.
-
-### Decision
-
-`dispatch` reads the node count before `rt.block_on` and passes a plain `usize` into pushdown planning.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Pass the UDF context into planning and read there | Rejected: puts a blocking handshake read inside the tokio runtime and couples planning to the UDF delivery mechanism |
-
-### Consequences
-
-`cluster_nodes_from_context` owns the node-count decision, including the `0 => 1` floor. The planning function's arity changes, which the compiler enumerates across 19 call sites.

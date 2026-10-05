@@ -77,29 +77,3 @@ The engine does not advertise `FN_REGEXP_REPLACE`, `FN_REGEXP_SUBSTR`, `FN_REGEX
 ### Consequences
 
 All four regexp scalar functions always evaluate in Exasol.
-
----
-
-## ADR: Advertise Only FN_WEEK from Issue #107 — Calendar-Semantic Divergence
-
-**ID:** advertise-only-fn-week-calendar-semantic-divergence
-**Plan:** `add-pushdown-capability-gaps`
-**Status:** Accepted
-
-### Context
-
-DataFusion lacks `add_days`, `add_months`, `last_day`, and `convert_tz`. Its date-diff needs divergent emulation, it lacks Oracle end-of-month clamping, and `date_part('dow')` numbers Sunday as 0. Exasol `WEEK` and DataFusion `date_part('week')` are both ISO-8601.
-
-### Decision
-
-The engine advertises only `FN_WEEK`, gated on a year-boundary parity test. It excludes `FN_ADD_*`, `FN_*_BETWEEN`, `FN_ADD_MONTHS`, `FN_ADD_YEARS`, `FN_MONTHS_BETWEEN`, `FN_YEARS_BETWEEN`, `FN_DAYOFWEEK`, `FN_LAST_DAY`, and `FN_CONVERT_TZ`.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Advertise the whole date-function group | Rejected: most of the group has unverified or divergent DataFusion semantics |
-
-### Consequences
-
-`FN_WEEK` is withdrawn if a year-boundary case diverges.

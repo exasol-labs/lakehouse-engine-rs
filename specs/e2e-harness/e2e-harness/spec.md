@@ -87,9 +87,9 @@ scenarios.
 
 * *GIVEN* a virtual schema OWNED by a non-DBA with both script-scoped grants, and a separate user with only `CREATE SESSION` and `SELECT` on the VS (no connection privilege, asserted absent)
 * *WHEN* the reader runs a query and `EXPLAIN VIRTUAL`
-* *THEN* the query returns the owner's rows; `EXPLAIN VIRTUAL` names the CONNECTION positively but contains neither `access_key` nor `secret_key` VALUES (asserted on values, not field-name spellings)
-* *AND* revoking the owner's scan grant denies the reader with a named error carrying no credential; granting only the READER (not the owner) also denies — the check reads the owner's grant
-* *AND* profiling/audit are NOT asserted (they never carry pushdown SQL, verified live)
+* *THEN* the query SHALL return the owner's rows, and `EXPLAIN VIRTUAL` SHALL name the CONNECTION positively but contain neither `access_key` nor `secret_key` VALUES (asserted on values, not field-name spellings)
+* *AND* revoking the owner's scan grant SHALL deny the reader with a named error carrying no credential, and granting only the READER (not the owner) SHALL also deny, because the check reads the owner's grant
+* *AND* profiling and audit MUST NOT be asserted, because they never carry pushdown SQL (verified live)
 * *AND* the test MUST fail (not skip) when the stack is unavailable
 
 ### Scenario: Harness statements carry no row cap the test did not declare
