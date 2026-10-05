@@ -4,8 +4,21 @@ on:
   push:
     branches: [main]
     tags: ["v*"]
+    # Specs and docs never need the build or E2E jobs. AGENTS.md is a test
+    # input (build_convention.rs), so it is not listed. merge_group has no
+    # path filter and always runs.
+    paths-ignore:
+      - "specs/**"
+      - "docs/**"
+      - "README.md"
+      - "CLAUDE.md"
   pull_request:
     branches: [main]
+    paths-ignore:
+      - "specs/**"
+      - "docs/**"
+      - "README.md"
+      - "CLAUDE.md"
     # ready_for_review: draft PRs are skipped, so fire when one is marked ready.
     types: [opened, synchronize, reopened, ready_for_review]
   # Required checks MUST run on merge_group or queued PRs hang forever.
