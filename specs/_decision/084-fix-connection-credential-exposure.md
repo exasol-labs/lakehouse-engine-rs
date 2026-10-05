@@ -52,7 +52,7 @@ One `resolve_scan_storage` call at the top of `run_scan` resolves both join side
 
 ### Consequences
 
-A wire wrapper that exposes a secret accessor fails to compile, instead of yielding an empty redaction set.
+The wire wrapper has no secret accessor, so a stale call site that reads secrets from it fails to compile, instead of yielding an empty redaction set.
 
 ## ADR: Seal the vended storage block under a key derived from the CONNECTION
 

@@ -55,7 +55,7 @@
 ## Interfaces
 
 - VS adapter protocol: Exasol calls the adapter entry point with request JSON of type `getCapabilities`, `createVirtualSchema`, `refresh`, `setProperties`, `dropVirtualSchema`, or `pushdown`; a pushdown answer is `{"type":"pushdown","sql":...}`
-- VS properties: `CATALOG_CONNECTION`, `NAMESPACE`, `CATALOG_KIND` (absent means Iceberg REST, else `UNITY_CATALOG`, `GLUE`, `DIRECT_STORAGE`), `ALLOW_HTTP`, `PARALLELISM_FACTOR`, `DATAFUSION_TARGET_PARTITIONS`, `DATAFUSION_THREADS_PER_UDF`, `DATAFUSION_THREADING_MODE`, `DATAFUSION_BATCH_SIZE`, `MEMORY_POOL_FRACTION`, `INSTANCE_OVERHEAD_MB`, `JOIN_BROADCAST_MAX_BYTES`, `S3_MAX_CONNECTIONS`
+- VS properties: `CATALOG_CONNECTION`, `NAMESPACE`, `CATALOG_KIND` (absent means Iceberg REST, else `UNITY_CATALOG`, `GLUE`, `DIRECT_STORAGE`), `ALLOW_HTTP`, `PARALLELISM_FACTOR`, `DATAFUSION_TARGET_PARTITIONS`, `DATAFUSION_THREADS_PER_UDF`, `DATAFUSION_THREADING_MODE`, `DATAFUSION_BATCH_SIZE`, `MEMORY_POOL_FRACTION`, `INSTANCE_OVERHEAD_MB`, `JOIN_BROADCAST_MAX_BYTES`, `S3_MAX_CONNECTIONS`, and for `DIRECT_STORAGE` also `MERGE_SCHEMA` (fold every file footer, default) and `HIVE_PARTITIONING` (`key=value` directory segments become partition columns, default `TRUE`)
 - CONNECTION object: the address is the catalog URI (empty allowed for `DIRECT_STORAGE`), and the password is a JSON object of catalog and storage credentials
 - adapterNotes: Exasol persists `TABLE_MAP`, `SKIPPED_TABLES`, and the tuning values between CREATE and pushdown, up to 2,000,000 bytes
 - `LAKEHOUSE_SCAN(common VARCHAR, files VARCHAR)`: scalar UDF that handles one shard row, reads the JSON scan spec halves, and emits the columns that the dispatch SQL declares
