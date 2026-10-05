@@ -7,13 +7,16 @@
 **Status:** Accepted
 
 ### Context
-`EXPLAIN VIRTUAL` returns the adapter's pushdown SQL with no redaction, and the adapter serialized resolved credentials straight into that SQL.
+
+`EXPLAIN VIRTUAL` returns the adapter's pushdown SQL with no redaction, and the adapter serialized resolved credentials into that SQL.
 
 ### Decision
-Carry the `CATALOG_CONNECTION` name and `ALLOW_HTTP` instead of credentials; the scan UDF calls `ctx.connection()` (engine-local).
+
+The pushdown SQL carries the `CATALOG_CONNECTION` name and `ALLOW_HTTP` instead of credentials. The scan UDF resolves the credentials with `ctx.connection()`.
 
 ### Consequences
-Matches `exasol-virtual-schema` 4.0.0's fix; `ctx.connection()` is one engine-local metadata request.
+
+This matches the fix in `exasol-virtual-schema` 4.0.0. `ctx.connection()` is one engine-local metadata request.
 
 ## ADR: No fallback when the script-scoped connection grant is absent
 
@@ -22,13 +25,16 @@ Matches `exasol-virtual-schema` 4.0.0's fix; `ctx.connection()` is one engine-lo
 **Status:** Accepted
 
 ### Context
+
 A deployment upgrading to the reference-based design needs a new `GRANT ACCESS ON CONNECTION ... FOR SCRIPT` before the scan UDF can resolve its credential.
 
 ### Decision
-A missing grant fails at scan time with a named error. No inline-credential fallback.
+
+A missing grant fails at scan time with a named error. There is no inline-credential fallback.
 
 ### Consequences
-A breaking deployment change; the installer template prints both grants.
+
+This is a breaking deployment change. The installer template prints both grants.
 
 ## ADR: Resolve scan storage once; the redaction secret set follows the resolved value
 
@@ -37,13 +43,16 @@ A breaking deployment change; the installer template prints both grants.
 **Status:** Accepted
 
 ### Context
-The wire spec wrapper must expose no secret accessor so redaction reads from resolved backends, not the wire format.
+
+The wire spec wrapper must expose no secret accessor, so redaction reads from resolved backends and not from the wire format.
 
 ### Decision
-One `resolve_scan_storage` at the top of `run_scan` resolves both join sides into `ResolvedScanStorage`, which owns `all_secret_values()`.
+
+One `resolve_scan_storage` call at the top of `run_scan` resolves both join sides into `ResolvedScanStorage`, which owns `all_secret_values()`.
 
 ### Consequences
-The wire wrapper exposes no secret accessor — compile failure, not an empty redaction set.
+
+The wire wrapper has no secret accessor, so a stale call site that reads secrets from it fails to compile, instead of yielding an empty redaction set.
 
 ## ADR: Seal the vended storage block under a key derived from the CONNECTION
 
@@ -52,10 +61,13 @@ The wire wrapper exposes no secret accessor — compile failure, not an empty re
 **Status:** Accepted
 
 ### Context
-A vended credential has no CONNECTION name a scan UDF can reference, so it cannot use the connection-reference path.
+
+A vended credential has no CONNECTION name that a scan UDF can reference, so it cannot use the connection-reference path.
 
 ### Decision
-AES-256-GCM under HKDF-SHA256 from the CONNECTION password, fresh 96-bit nonce; gate: at least one secret field non-empty.
+
+The adapter seals the vended storage block with AES-256-GCM under a key derived by HKDF-SHA256 from the CONNECTION password, with a fresh 96-bit nonce. It refuses to seal unless at least one secret field is non-empty.
 
 ### Consequences
-Defeats plaintext reads, not offline cryptanalysis — acceptable because vended values are short-lived and the key material is what `ACCESS ON CONNECTION` already reveals.
+
+Sealing defeats plaintext reads but not offline cryptanalysis. This is acceptable because vended values are short-lived and the key material is what `ACCESS ON CONNECTION` already reveals.

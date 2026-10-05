@@ -8,35 +8,18 @@
 
 ### Context
 
-Issue #145 reported that `EXPLAIN VIRTUAL` shows the full base-table column list in the
-`projection` field of an aggregate or GROUP BY `LAKEHOUSE_SCAN` scan spec. No aggregate
-execution path ever reads `ScanSpec.projection`: `run_partial_aggregate` and
-`run_grouped_partial_aggregate` register the full logical schema and build their
-DataFusion query from the `aggregates`/`group_keys` fields, and DataFusion's own
-projection pushdown then prunes the physical Parquet read. The bug is a misleading value
-in a diagnostic field, not extra I/O. Deriving a precise partial-projection column list
-from aggregate arguments was considered and rejected as duplicate, error-prone work.
+`EXPLAIN VIRTUAL` showed the full base-table column list in the `projection` field of aggregate and GROUP BY scan specs (#145). No aggregate execution path reads that field, and DataFusion projection pushdown already prunes the Parquet read.
 
 ### Decision
 
-Set `ScanSpec.projection` to empty on both the grouped and single-group aggregate scan-spec
-branches. Carry referenced-column information only in the `aggregates`/`group_keys` fields,
-which are the fields the aggregate scan-dispatch path actually consults.
+The adapter leaves `projection` empty on grouped and single-group aggregate scan specs. Referenced columns are carried only in the `aggregates` and `group_keys` fields.
 
 ### Options Considered
 
 | Option | Verdict |
 |--------|---------|
-| Empty `projection` on aggregate branches | ✓ Chosen — the aggregate path never reads `projection`; empty is minimal and unambiguous |
-| Derive a precise projection list from aggregate/group-key columns | ✗ Rejected — duplicates data already in `aggregates`/`group_keys` and can be half-right for expression arguments |
-| Bare-column-precise derivation with expression fallback | ✗ Rejected — same duplication risk, plus added complexity for no consulted benefit |
+| Derive a precise projection list from aggregate and group-key columns | Rejected: duplicates `aggregates`/`group_keys` and is error-prone for expression arguments |
 
 ### Consequences
 
-`EXPLAIN VIRTUAL` reports `"projection":[]` for aggregate and GROUP BY scan specs,
-disambiguated on the wire by the co-present `aggregates`/`group_keys` fields. The
-physical Parquet read stays column-pruned via DataFusion's projection pushdown,
-confirmed empirically by a new physical-plan-introspection test. The row-scan and
-join projection paths are unaffected: the single-group branch empties `projection`
-only when `aggregates.is_some()`, preserving the shared `spec_template`'s row-scan
-projection.
+`EXPLAIN VIRTUAL` shows `"projection":[]` for aggregate scan specs. Row-scan and join projections are unaffected, because the single-group branch empties `projection` only when `aggregates` is set.
