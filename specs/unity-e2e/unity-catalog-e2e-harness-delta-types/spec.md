@@ -32,8 +32,8 @@ scenario that asserts the ROWS a query returns rather than the declared TYPE of 
 * **This delta is issue #322.** It replaces the single "cannot plan" scenario with three, because the
   engine's answer for the two fixtures that scenario covered has split three ways: `type_widening` and
   `unshredded_variant` are now refused on their READER FEATURE (`unity-e2e/unity-catalog-e2e-harness-delta-queries`
-  owns that refusal scenario), `stats_all_types` is now QUERYABLE on its 13 mappable columns, and
-  `stats_all_types` is refused only on the three columns whose type this engine cannot render.
+  owns that refusal scenario), `stats_all_types` is now QUERYABLE on its 15 mappable columns, and
+  `stats_all_types` is refused only on `binary_col`, the one column whose type this engine cannot render.
 * **`type_widening` is already seeded and was never asserted.** `scripts/unity/seed.sh` registers it as
   `unity.delta_e2e.type_widening`, and `scripts/unity/README.md` lists it as a #322 fail-loud fixture,
   but the shipped scenario named only `unshredded_variant` and `stats_all_types`. This feature's added

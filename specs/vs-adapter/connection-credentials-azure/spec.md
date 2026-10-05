@@ -10,11 +10,14 @@ Extends `vs-adapter/connection-credentials` with Azure Data Lake Storage Gen2: o
 
 ### Scenario: Azure credentials select the ADLS backend
 
-* Account-key: `account_name` + `account_key` → ADLS with account-key credential; `account_key` never in errors or SQL
-* SAS: `account_name` + `sas_token` → ADLS with SAS credential; `sas_token` treated as secret; never in errors or SQL
+* *GIVEN* a CONNECTION carrying `account_name` plus either `account_key` or `sas_token`
+* *WHEN* the adapter resolves the storage backend
+* *THEN* it SHALL select ADLS with an account-key credential for `account_key` and with a SAS credential for `sas_token`
+* *AND* `account_key` and `sas_token` MUST be treated as secrets and MUST NOT appear in errors or SQL
 
 ### Scenario: Malformed or mixed Azure credentials are rejected
 
-* `account_name` absent with a credential present, both `account_key` and `sas_token`, or `account_name` alone → error naming the required shape; no fallback to S3
-* Any Azure field AND any S3 field → error naming both field sets; no precedence rule
-* No credential values in any error
+* *GIVEN* a CONNECTION with `account_name` absent but a credential present, with both `account_key` and `sas_token`, with `account_name` alone, or with both an Azure field and an S3 field
+* *WHEN* the adapter validates the credentials
+* *THEN* it SHALL return an error naming the required shape, or naming both field sets for the Azure-plus-S3 case, and SHALL NOT fall back to S3 or apply a precedence rule
+* *AND* no error MUST carry a credential value

@@ -165,4 +165,5 @@ renders the retained ordering AND the retained final window itself.
 ### Scenario: Generated SQL carries a credential reference, not a credential
 
 * *GIVEN* a pushdown request through this feature's path
-* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` applies — no credential value in generated SQL or error messages
+* *WHEN* the adapter generates the pushdown SQL
+* *THEN* the credential-reference guarantee of `vs-adapter/scan-spec-credential-reference` SHALL apply, so no credential value appears in generated SQL or error messages
