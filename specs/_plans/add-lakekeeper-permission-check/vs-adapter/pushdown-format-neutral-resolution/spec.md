@@ -28,8 +28,8 @@ reach a Delta table by the same route they reach an Iceberg one.
 * *AND* the adapter MUST NOT gate any request shape on the table format or the catalog kind, so
   enabling a format enables every shape at once and a shape that fails does so as a defect rather than
   as a refusal. The one exception is `vs-adapter/lakekeeper-permission-check`, which refuses every
-  shape alike while `PERMISSION_CHECK = 'LAKEKEEPER'` is set under a catalog kind with no permission
-  client
+  shape alike while `PERMISSION_CHECK = 'LAKEKEEPER'` is set under any catalog kind other than
+  Iceberg REST
 * *AND* the SQL the adapter generates for each request SHALL be decided from the request alone, so the
   same request over an Iceberg table and over a Delta table with the same columns yields the same
   pushdown decisions

@@ -16,6 +16,6 @@ Builds the catalog HTTP state — one `reqwest` client, the resolved catalog-aut
 * *GIVEN* a single-table or an N-table join pushdown request under OAuth2 client-credentials catalog auth, on a virtual schema with `PERMISSION_CHECK = 'LAKEKEEPER'` whose Lakekeeper answer allows every table
 * *WHEN* the adapter checks permissions and resolves every table's file list
 * *THEN* the OAuth2 grant and the `/v1/config` lookup SHALL each run exactly once for the request, as they do with the check off
-* *AND* the batch-check SHALL go out on the session's HTTP client with the session's bearer token, and the adapter MUST NOT build a second HTTP client, run a second grant, or perform a second `/v1/config` lookup
+* *AND* the batch-check SHALL carry the bearer token of that one grant
 * *AND* the check SHALL add exactly one request, the batch-check, between the `/v1/config` lookup and the first `loadTable` GET, and SHALL leave every other request of "Single-table pushdown builds one catalog session and reuses it" and "N-table join reuses one session across all legs" unchanged
 <!-- /DELTA:NEW -->
