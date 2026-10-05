@@ -1,30 +1,5 @@
 # Decisions: fix-212-timestamp-precision-collapse
 
-## ADR: TIMESTAMP precision field is fractionalSecondsPrecision, not precision
-
-**ID:** timestamp-precision-field-is-fractional-seconds-precision
-**Plan:** fix-212-timestamp-precision-collapse
-**Status:** Accepted
-
-### Context
-
-A pushed-down `CAST(... AS TIMESTAMP(p))` with p other than 3 collapsed to bare `TIMESTAMP` (default precision 3), and Exasol rejected it (issue #212). The brief named a `precision` field, but the capture script never records the input data-type descriptor, so that name was never observed.
-
-### Decision
-
-Both the adapter EMITS derivation and the CAST renderer read `fractionalSecondsPrecision` for TIMESTAMP precision.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Read `precision` | Rejected: Exasol uses `precision` only for DECIMAL and INTERVAL, so the fix would be a silent no-op |
-| `fractionalSecondsPrecision` with a `precision` fallback | Rejected: over-engineering, since Exasol never sends `precision` on TIMESTAMP |
-
-### Consequences
-
-Future TIMESTAMP-precision work reads `fractionalSecondsPrecision`, the field in Exasol's data-type API doc and the repo fixtures.
-
 ## ADR: DataFusion-dialect CAST rendering snaps TIMESTAMP precision to the nearest supported unit
 
 **ID:** timestamp-precision-snap-nearest-datafusion-dialect

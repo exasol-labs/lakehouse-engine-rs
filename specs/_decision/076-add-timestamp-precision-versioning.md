@@ -26,32 +26,6 @@ A two-variant `Copy` enum, `TimestampPrecision` (millisecond, microsecond), owns
 
 An Iceberg `timestamp` and a Delta `timestamp` are declared at the same precision by construction. A future version-gated decision can extend the enum.
 
-## ADR: The version STRING crosses into `types/mapping.rs`; the `UdfContext` does not
-
-**ID:** timestamp-precision-version-string-crosses-not-udfcontext
-**Plan:** add-timestamp-precision-versioning
-**Status:** Accepted
-
-### Context
-
-`types/mapping.rs` reads no ambient state and performs no I/O. Passing `UdfContext` into it would make the type-mapping module depend on the adapter's runtime context, reversing the dependency direction.
-
-### Decision
-
-`handle_create_virtual_schema` reads the database version once, inline, and passes the resolved `TimestampPrecision` as a plain parameter down to both mappers. `TimestampPrecision` parses from a string.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Pass `UdfContext` into `types/mapping.rs` | Rejected: makes the module perform I/O and read ambient state |
-| Wrapper function that reads the version from the context | Rejected: forwards one call and adds a name without a decision |
-| Read the version again in the scan UDF | Rejected: the scan's `EMITS` types already arrive in the request JSON, so the decision would have two owners |
-
-### Consequences
-
-The type-mapping module stays a pure function of its inputs, and the decision has one owner across both entry points.
-
 ## ADR: Empty and unparseable versions both take the microsecond default
 
 **ID:** timestamp-precision-empty-and-unparseable-default-to-microsecond

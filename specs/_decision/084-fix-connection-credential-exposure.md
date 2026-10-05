@@ -36,24 +36,6 @@ A missing grant fails at scan time with a named error. There is no inline-creden
 
 This is a breaking deployment change. The installer template prints both grants.
 
-## ADR: Resolve scan storage once; the redaction secret set follows the resolved value
-
-**ID:** resolve-scan-storage-once-per-invocation-secret-set-follows-resolved-value
-**Plan:** fix-connection-credential-exposure
-**Status:** Accepted
-
-### Context
-
-The wire spec wrapper must expose no secret accessor, so redaction reads from resolved backends and not from the wire format.
-
-### Decision
-
-One `resolve_scan_storage` call at the top of `run_scan` resolves both join sides into `ResolvedScanStorage`, which owns `all_secret_values()`.
-
-### Consequences
-
-The wire wrapper has no secret accessor, so a stale call site that reads secrets from it fails to compile, instead of yielding an empty redaction set.
-
 ## ADR: Seal the vended storage block under a key derived from the CONNECTION
 
 **ID:** seal-vended-storage-block-hkdf-aes-gcm-refuse-when-no-key-material

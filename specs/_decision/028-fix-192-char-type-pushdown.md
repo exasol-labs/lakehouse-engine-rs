@@ -71,29 +71,4 @@ For a CHAR(n) group key, the adapter renders a blank-padded fragment to width n 
 
 ### Consequences
 
-Only the grouped-aggregate group key needs the pad: group keys are populated at one site, the `COUNT(DISTINCT)` fan-out carries only base-column types, and constant projections already have width n. The pad expression is fixed in `char-group-key-pad-must-not-truncate`.
-
-## ADR: Use a non-truncating CASE-guarded pad instead of bare rpad for CHAR group keys
-
-**ID:** char-group-key-pad-must-not-truncate
-**Plan:** `fix-192-char-type-pushdown`
-**Status:** Accepted
-
-### Context
-
-DataFusion `rpad` truncates an over-length value, while Exasol raises error 22001 on `CAST('abcdefghij' AS CHAR(3))`. A truncating pad would merge groups that Exasol rejects.
-
-### Decision
-
-The pad is `CASE WHEN character_length(x) < n THEN rpad(x, n) ELSE x END`. It pads short values to n and passes values at or above n unchanged, so Exasol's own error still fires.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Bare `rpad` | Rejected: truncates an over-length value |
-| `concat` with `repeat` of spaces | Rejected: `concat` skips NULL, so a NULL key merges with an all-blanks group |
-
-### Consequences
-
-The spec states the accurate claim: short values pad to n, and longer values pass through. A seed table with a trailing-space pair and an over-length value covers both the merge and truncation cases in E2E.
+Only the grouped-aggregate group key needs the pad: group keys are populated at one site, the `COUNT(DISTINCT)` fan-out carries only base-column types, and constant projections already have width n. The pad is `CASE WHEN character_length(x) < n THEN rpad(x, n) ELSE x END`, so values at or above n pass through unchanged and Exasol's own error still fires.

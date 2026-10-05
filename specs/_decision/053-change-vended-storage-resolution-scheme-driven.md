@@ -27,31 +27,6 @@
 
 The spec clause becomes "exactly two selectors on disjoint inputs, one decision point". No path runs both selectors, and neither overrides the other.
 
-## ADR: Delete the `base: &StorageBackend` parameter
-
-**ID:** resolve-vended-storage-drops-base-backend-parameter
-**Plan:** `change-vended-storage-resolution-scheme-driven`
-**Status:** Accepted
-
-### Context
-
-`resolve_vended_storage` overlaid vended values field by field onto the backend `storage_block` had already chosen. That made it a second selector reading the first's output and created six per-field absence-and-preservation conventions.
-
-### Decision
-
-`resolve_vended_storage` takes the load result, the anchor, and `allow_http`, and returns a `StorageBackend`. It takes no backend and no CONNECTION-derived value. `allow_http` is a virtual-schema property, not a CONNECTION field.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep `base` and read only `allow_http` from it | Rejected: leaves one CONNECTION-derived read under vending |
-| Add a `StorageBackend::allow_http()` accessor and keep `base` | Rejected: has no meaningful answer for an `Adls` base whose credentials are irrelevant |
-
-### Consequences
-
-"No CONNECTION storage field is read under vending" is a property of the signature. The six absence conventions drop to none, and no future edit can reintroduce a per-field preservation rule.
-
 ## ADR: `ALLOW_HTTP` stays the operator's consent gate for plaintext transport
 
 **ID:** allow-http-threaded-as-vended-selector-parameter
@@ -71,7 +46,7 @@ The resolved `ALLOW_HTTP` virtual-schema property is passed into `resolve_vended
 | Option | Verdict |
 |--------|---------|
 | Derive `allow_http` from the vended endpoint's scheme | Rejected: a security regression in the default configuration |
-| Read it from the base backend or an accessor | Rejected: reopens the CONNECTION-derived read that `resolve-vended-storage-drops-base-backend-parameter` closes |
+| Read it from the base backend or an accessor | Rejected: reopens the CONNECTION-derived read that the dropped base-backend parameter closes |
 
 ### Consequences
 

@@ -25,31 +25,6 @@
 
 Five features needed a narrow `storage`-value carve-out in their byte-identical-output gates. Landing the tag while one variant exists makes every byte outside the tag proof that nothing else moved.
 
-## ADR: Three methods on the enum plus one engine-side dispatching function
-
-**ID:** storage-backend-three-methods-one-engine-dispatch
-**Plan:** `refactor-storage-backend-enum`
-**Status:** Accepted
-
-### Context
-
-Issue #274 lists four methods, including DataFusion object-store registration. `vs-adapter/catalog-crate-structure` forbids `lakehouse-catalog` from depending on `object_store` or `datafusion`, so a registration method cannot live on a catalog-crate type.
-
-### Decision
-
-`StorageBackend` publishes `secret_values`, `catalog_storage_props`, and `file_io`. Object-store registration is one plain engine-side function that matches on the backend.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Four methods on the enum | Rejected: not constructible under the crate-boundary dependency ban |
-| An engine-side extension trait | Rejected: an interface with one implementation and one method, where a plain function is smaller |
-
-### Consequences
-
-The backend decision has two owners: the enum owns which backend, and the engine's registration function owns its object store. The boundary forces this, and the plan and spec state it. Engine-side S3-aware call sites drop from four to one.
-
 ## ADR: The exhaustive variant-naming owner list is capped at five permitted modules
 
 **ID:** storage-backend-exhaustive-variant-naming-owners

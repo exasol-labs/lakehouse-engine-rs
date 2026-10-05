@@ -26,53 +26,7 @@ In the Exasol dialect, `vs-expression` renders what Exasol sent, and one gate ah
 
 The names and their Exasol forms live in one declaration, and exclusions are stated there instead of implied by arm order, which left `SIGN` rendering `signum(...)` in the Exasol dialect.
 
-## ADR: The verbatim rule applies uniformly, not only to arms that currently fail
-
-**ID:** verbatim-rule-applies-uniformly-not-minimal-diff
-**Plan:** fix-vs-expression-dialect
-**Status:** Accepted
-
-### Context
-
-Some Exasol-native scalar functions, such as `NULLIFZERO`, `GREATEST`, `DATE_TRUNC`, `DAYS_BETWEEN`, and most math functions, already parse in Exasol with their DataFusion rendering.
-
-### Decision
-
-The verbatim rule applies to every Exasol-native scalar function, including those that already parse.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Change only the arms that currently fail | Rejected: a partial rule cannot be applied by a reader, who must test each name against live Exasol, which is how `*_BETWEEN` shipped broken |
-
-### Consequences
-
-Every math name in the arm exists natively in Exasol, verified live, so folding them into the rule changes no result and removes an exception list.
-
-## ADR: The Exasol dialect imposes no arity check
-
-**ID:** exasol-dialect-no-arity-check
-**Plan:** fix-vs-expression-dialect
-**Status:** Accepted
-
-### Context
-
-Several DataFusion-dialect arms validate argument count before rendering. The Exasol verbatim arm could repeat that check.
-
-### Decision
-
-The Exasol verbatim arm forwards the arguments unchanged and does not check argument count.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Keep each family's arity check in both dialects | Rejected: Exasol already validated the call, so the check can only reject valid input |
-
-### Consequences
-
-This is the rule `vs-adapter/pushdown-planning-string-fn-type-coercion` depends on: it declines a three-argument `INSTR` from the DataFusion scan because the Exasol wrapper can evaluate it verbatim.
+The verbatim rule covers every Exasol-native scalar function, including those that already parse, and the Exasol arm forwards arguments without an arity check.
 
 ## ADR: One declaration gates the function_scalar dispatch and drives the sweep table
 

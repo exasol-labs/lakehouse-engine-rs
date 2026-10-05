@@ -48,30 +48,6 @@ The adapter translates comparisons over string columns and relies on `maxValues`
 
 delta-spark and `parquet` both keep the bound valid, and the kernel compensates only for timestamps. A writer that emitted a bare untagged prefix would defeat pruning undetectably, an assumption every Delta reader shares.
 
-## ADR: A third independent filter-JSON walker, with the shared IR filed rather than built
-
-**ID:** delta-predicate-third-walker-defer-shared-ir
-**Plan:** add-delta-file-pruning
-**Status:** Accepted
-
-### Context
-
-The Iceberg translator and the DataFusion renderer already walk the same Exasol filter JSON, and Delta pruning adds a third walker. Their literal vocabularies and bound-soundness contracts differ.
-
-### Decision
-
-`delta_predicate.rs` is a third independent walker that mirrors the Iceberg translator's node dispatch. No shared predicate IR is extracted.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Shared format-neutral predicate IR for all three | Rejected: a large refactor of shipped code that no requirement here justifies, filed as a follow-up |
-
-### Consequences
-
-Three vocabularies stay duplicated. A third format would make the case for a shared IR.
-
 ## ADR: Never construct a false predicate or an empty junction
 
 **ID:** delta-pruning-never-construct-false-predicate

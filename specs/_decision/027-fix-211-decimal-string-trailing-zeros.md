@@ -1,29 +1,5 @@
 # Decisions: fix-211-decimal-string-trailing-zeros
 
-## ADR: Type-aware DECIMAL-to-string trim decision lives in the adapter; vs-expression stays type-blind
-
-**ID:** decimal-string-trim-in-adapter-not-vs-expression
-**Plan:** fix-211-decimal-string-trailing-zeros
-**Status:** Accepted
-
-### Context
-
-Exasol trims trailing scale zeros when converting a DECIMAL to text, but the DataFusion path keeps the full scale, which gives wrong results (issue #211). Column types are not on the wire, and `vs-expression` is stateless and shared.
-
-### Decision
-
-The adapter decides where to apply the DECIMAL-to-string trim, using its column types. `vs-expression` gains only a pure formatting primitive and a synthetic node it renders without inspecting types.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Column-type awareness inside `vs-expression` | Rejected: no type context, and the crate is shared |
-
-### Consequences
-
-This extends the `like-guard-in-adapter-not-vs-expression` precedent to projections and WHERE filters. Future type-dependent pushdown gaps are fixed in the adapter.
-
 ## ADR: Inject an adapter-synthesized decimal_to_varchar_exasol node
 
 **ID:** decimal-to-varchar-exasol-synthetic-node

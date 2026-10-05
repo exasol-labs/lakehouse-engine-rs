@@ -99,30 +99,6 @@ Unity Catalog auth reuses the existing CONNECTION credential fields and adds non
 
 The auth mode is selected from which fields are present. Iceberg REST acceptance and error text are unchanged.
 
-## ADR: The GET /tables list sweep is the createVirtualSchema listing path's column source
-
-**ID:** unity-catalog-list-tables-column-source
-**Plan:** add-native-unity-catalog-client
-**Status:** Accepted
-
-### Context
-
-Live verification against a Databricks workspace showed that the Unity Catalog `GET /tables` list response returns each table's columns, storage location, and table ID inline by default.
-
-### Decision
-
-The client's list-tables method returns fully populated table entries from the single paginated `GET /tables` sweep and does not set `omit_columns`. createVirtualSchema reads columns from that sweep and issues no per-table request for column metadata. The single-table `GET /tables/{full_name}` load stays in the client for the scan path of #319/#320.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Treat the list as columns-free and fetch each table separately | Rejected: fetches data the list already returns, at an N+1 cost |
-
-### Consequences
-
-Enumerating a schema costs one paginated sweep and needs no concurrency machinery. A listed VIEW carries columns but no storage location, which matters only to the deferred scan and vending path.
-
 ## ADR: One shared CatalogClient trait with catalog-neutral return types, listing-only in #318
 
 **ID:** shared-catalog-client-trait-neutral-types
@@ -150,29 +126,3 @@ Both catalog kinds implement one `CatalogClient` trait in the catalog crate, wit
 ### Consequences
 
 The Iceberg listing guarantee softens from "identical code path" to "behavior-identical, refactored behind the shared trait." The single-table load is promoted to the trait for the scan path of #319/#320 and is exercised only by trait-contract tests in #318.
-
-## ADR: The Iceberg trait receiver is IcebergRestCatalogClient, composing CatalogSession
-
-**ID:** iceberg-catalog-client-composes-session
-**Plan:** add-native-unity-catalog-client
-**Status:** Accepted
-
-### Context
-
-The shared trait needs an Iceberg REST receiver. `CatalogSession` is the resolved Iceberg REST session, and a test pins that an empty namespace builds no session and performs no OAuth2 grant.
-
-### Decision
-
-A dedicated Iceberg REST catalog client implements the trait and builds one `CatalogSession` internally for an enumeration, or none for an empty namespace. `CatalogSession` and the scan path stay unchanged.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Implement the trait on `CatalogSession` | Rejected: listing needs storage and credentials the session does not hold, and the session is built after enumeration |
-| Same, plus lazy `CatalogSession::resolve` with a storage parameter | Rejected: touches ten call sites and delays scan-path OAuth failures to the first table load |
-| Build the resolution session eagerly | Rejected: charges every empty namespace an unneeded OAuth grant and fails the empty-batch guarantee test |
-
-### Consequences
-
-The scan path stays out of this refactor and both existing guarantees hold.

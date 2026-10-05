@@ -64,8 +64,8 @@ scenario count crossed this library's per-spec organization threshold.
   scenario and not just a threading change.** Its timestamp branch matches the string `TIMESTAMP`
   EXACTLY; a `TIMESTAMP(6)` string falls through every arm to the catch-all and would be declared
   `{"type": "varchar", "size": 2000000}` — a silently wrong column type, not a rejected request. The
-  field name is `fractionalSecondsPrecision`, pinned by ADR
-  `timestamp-precision-field-is-fractional-seconds-precision`: Exasol uses `precision` only for
+  field name is `fractionalSecondsPrecision`, pinned by the
+  Exasol type declaration: Exasol uses `precision` only for
   `DECIMAL` and `INTERVAL`, never for a TIMESTAMP.
 * **The round trip closes at `exasol_type_from_json`, which already reads the same field.** Once the
   declaration carries `fractionalSecondsPrecision: 6`, Exasol echoes it in the pushdown request's
@@ -116,7 +116,7 @@ scenario count crossed this library's per-spec organization threshold.
 
 * *GIVEN* a resolved Exasol type string of the form `TIMESTAMP(p)` for an integer precision `p` in 0-9, the shape the version gate now produces for a catalog timestamp column
 * *WHEN* `exasol_type_to_json` converts that string into the response's column `dataType` object
-* *THEN* it SHALL return `{"type": "timestamp", "fractionalSecondsPrecision": p}`, reading the field name `fractionalSecondsPrecision` — the same name its inverse `exasol_type_from_json` reads, per ADR `timestamp-precision-field-is-fractional-seconds-precision` — and MUST NOT emit a `precision` field, which Exasol uses only for `DECIMAL` and `INTERVAL`
+* *THEN* it SHALL return `{"type": "timestamp", "fractionalSecondsPrecision": p}`, reading the field name `fractionalSecondsPrecision` — the same name its inverse `exasol_type_from_json` reads — and MUST NOT emit a `precision` field, which Exasol uses only for `DECIMAL` and `INTERVAL`
 * *AND* it MUST NOT fall through to the catch-all VARCHAR arm for a `TIMESTAMP(p)` string, because that arm would declare a timestamp column as `{"type": "varchar", "size": 2000000}` — a silently wrong column type rather than a rejected request
 * *AND* a bare `TIMESTAMP` string SHALL keep returning `{"type": "timestamp"}` with NO `fractionalSecondsPrecision` field, so the 8.x arm's declaration is byte-identical to the one recorded today
 * *AND* `TIMESTAMP WITH LOCAL TIME ZONE` SHALL keep returning `{"type": "timestamp", "withLocalTimeZone": true}`, matched before any precision logic, so no precision-aware variant of that arm is introduced — its inverse short-circuits the same way

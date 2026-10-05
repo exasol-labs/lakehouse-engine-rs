@@ -29,8 +29,8 @@ this library's per-spec organization threshold.
 * **This delta is issue #322.** It replaces the single "cannot plan" scenario with three, because the
   engine's answer for the two fixtures that scenario covered has split three ways: `type_widening` and
   `unshredded_variant` are now refused on their READER FEATURE, `stats_all_types` is now QUERYABLE on
-  its 13 mappable columns, and `stats_all_types` is refused only on the three columns whose type this
-  engine cannot render.
+  its 15 mappable columns, and `stats_all_types` is refused only on `binary_col`, the one column whose
+  type this engine cannot render.
 * **No new fixture, Makefile target, or test tier is added, for this delta either.** These scenarios
   extend the existing `make test-e2e-unity` suite, in the same `e2e_unity_test.rs` binary as the
   sibling feature's scenarios. The three fixtures involved — `stats_all_types` (16 columns, 4 rows,

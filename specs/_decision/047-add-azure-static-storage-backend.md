@@ -49,30 +49,6 @@ The `object_store` Azure builder silently prefers an access key over a SAS token
 
 Credential validation is the only place a contradictory set is reported, and the builder's precedence cannot be reached.
 
-## ADR: `AdlsCred` implements a manual redacting `Debug`
-
-**ID:** adlscred-manual-redacting-debug
-**Plan:** `add-azure-static-storage-backend`
-**Status:** Accepted
-
-### Context
-
-`ConnectionCreds` hand-implements `Debug` to mask its secrets. `StorageProps` derives `Debug` and prints `secret_key` in the clear (issue #135). `AdlsCred` carries a new secret and needs its own decision.
-
-### Decision
-
-`AdlsCred` implements `Debug` manually and replaces the secret with a redaction marker in both states. `account_name` stays visible.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Derive `Debug`, as `StorageProps` does | Rejected: would add a new leak because an old one exists |
-
-### Consequences
-
-The asymmetry with `StorageProps` is deliberate and named in the spec.
-
 ## ADR: The container collision is closed by a backend-agnostic whole-spec precondition
 
 **ID:** azure-container-collision-whole-spec-precondition

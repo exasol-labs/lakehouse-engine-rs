@@ -28,29 +28,7 @@ The DataFusion dialect renders `FLOAT_DIV` as a call to `vs_checked_float_div`, 
 
 Projection and predicate share one check. A plain `SELECT <double_col>` over a stored `NaN` reaches no checked division and is unchanged.
 
-## ADR: Raise on any non-finite result, not only on a zero divisor
-
-**ID:** checked-float-division-raises-on-any-non-finite-result
-**Plan:** fix-float-div-predicate-divzero
-**Status:** Accepted
-
-### Context
-
-A finite numerator over a tiny divisor can overflow to infinity, which reproduces issue #370's defect with a non-zero divisor. Exasol admits no non-finite `DOUBLE`, so a non-finite result is never a valid answer.
-
-### Decision
-
-The checked-division function raises when the computed `Float64` result is not finite. A zero divisor raises a division-by-zero message, and any other non-finite cause raises a numeric-value-out-of-range message.
-
-### Options Considered
-
-| Option | Verdict |
-|--------|---------|
-| Check only for a zero divisor | Rejected: leaves the overflow route open |
-
-### Consequences
-
-An overflow now fails the query with a message distinct from division by zero.
+The check raises on any non-finite `Float64` result, with distinct messages for division by zero and out-of-range overflow.
 
 ## ADR: The function name is owned by `crates/vs-expression`; the implementation is owned by `crates/lakehouse-engine`
 
