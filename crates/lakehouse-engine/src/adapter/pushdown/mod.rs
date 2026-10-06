@@ -173,7 +173,7 @@ pub async fn handle_pushdown(
         connection,
         &[catalog.table.as_str()],
         &props,
-        conn.permission_gate.as_ref(),
+        &conn.permission_check,
     )
     .await?;
     let ResolvedScan {

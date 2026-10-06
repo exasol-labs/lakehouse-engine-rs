@@ -15,7 +15,7 @@ use crate::adapter::direct_storage_properties::{
     join_storage_path, resolve_direct_storage_properties,
 };
 use crate::adapter::parquet_directory::DirectoryOptions;
-use crate::adapter::permission::PermissionGate;
+use crate::adapter::permission::PermissionCheck;
 use crate::scan::{build_admission_limited_store, store_root_url};
 
 #[cfg(test)]
@@ -75,16 +75,16 @@ impl<'a> TableScanResolver<'a> {
     /// the session is built: the Iceberg arm contacts the network for `/v1/config`,
     /// so a later check would surface a transport error instead of the parse error.
     ///
-    /// With a `gate`, the Iceberg arm sends the request's one batch-check on the new session
-    /// and fails before any `loadTable` unless every identifier is allowed; the resolver then
-    /// admits only those identifiers.
+    /// With an enforced `permission`, the Iceberg arm sends the request's one batch-check on the
+    /// new session and fails before any `loadTable` unless every identifier is allowed; the
+    /// resolver then admits only those identifiers.
     pub(super) async fn for_request(
         kind: CatalogKind,
         catalog_uri: &str,
         connection: ConnectionStorage<'a>,
         table_identifiers: &[&str],
         props: &Json,
-        gate: Option<&PermissionGate>,
+        permission: &PermissionCheck,
     ) -> Result<Self, UdfError> {
         let mut authorized = HashSet::new();
         let session = match kind {
@@ -98,7 +98,7 @@ impl<'a> TableScanResolver<'a> {
                     connection.creds,
                 )
                 .await?;
-                if let Some(gate) = gate {
+                if let PermissionCheck::Enforced(gate) = permission {
                     gate.authorize(&session, table_identifiers, connection.creds)
                         .await?;
                     authorized.extend(table_identifiers.iter().map(|id| id.to_string()));
@@ -142,9 +142,9 @@ impl<'a> TableScanResolver<'a> {
                 }
             }
         };
-        let admission = match gate {
-            None => TableAdmission::Unchecked,
-            Some(_) => TableAdmission::Authorized(authorized),
+        let admission = match permission {
+            PermissionCheck::Off => TableAdmission::Unchecked,
+            PermissionCheck::Enforced(_) => TableAdmission::Authorized(authorized),
         };
         Ok(Self {
             session,

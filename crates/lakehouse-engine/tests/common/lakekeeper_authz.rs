@@ -178,7 +178,7 @@ pub enum Scope {
     Server,
     Project,
     Warehouse,
-    Namespace,
+    Namespace(&'static str),
     Table(&'static str),
 }
 
@@ -188,11 +188,14 @@ pub struct Grant {
     pub relation: &'static str,
 }
 
-const ALL_SCOPES: [Scope; 7] = [
+/// Every scope a fixture grant can reach a fixture table through, so reconciling them all
+/// leaves no stale inherited grant behind.
+const ALL_SCOPES: [Scope; 8] = [
     Scope::Server,
     Scope::Project,
     Scope::Warehouse,
-    Scope::Namespace,
+    Scope::Namespace(AUTHZ_NAMESPACE),
+    Scope::Namespace(E2E_NAMESPACE),
     Scope::Table(TABLE_ALPHA),
     Scope::Table(TABLE_BETA),
     Scope::Table(E2E_TABLE),
@@ -200,7 +203,7 @@ const ALL_SCOPES: [Scope; 7] = [
 
 pub struct AuthzFixture {
     pub warehouse_id: String,
-    pub namespace_id: String,
+    namespace_ids: BTreeMap<&'static str, String>,
     table_ids: BTreeMap<&'static str, String>,
     principal_ids: BTreeMap<&'static str, String>,
 }
@@ -208,6 +211,12 @@ pub struct AuthzFixture {
 impl AuthzFixture {
     pub fn principal_id(&self, principal: &Principal) -> &str {
         &self.principal_ids[principal.client_id]
+    }
+
+    fn namespace_id(&self, namespace: &str) -> &str {
+        self.namespace_ids
+            .get(namespace)
+            .unwrap_or_else(|| panic!("'{namespace}' is not a fixture namespace"))
     }
 
     pub fn table_id(&self, table: &str) -> &str {
@@ -262,12 +271,22 @@ impl AuthzFixture {
     }
 
     pub fn read_check_for_user(&self, check_id: &str, user_id: &str, table: &str) -> Value {
+        self.read_check_at(check_id, user_id, AUTHZ_NAMESPACE, table)
+    }
+
+    pub fn read_check_at(
+        &self,
+        check_id: &str,
+        user_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Value {
         json!({
             "id": check_id,
             "identity": {"user": user_id},
             "operation": {"table": {
                 "warehouse-id": self.warehouse_id,
-                "namespace": [AUTHZ_NAMESPACE],
+                "namespace": [namespace],
                 "table": table,
                 "action": {"action": "read_data"},
             }},
@@ -281,12 +300,10 @@ impl AuthzFixture {
             Scope::Server => format!("{base}/permissions/server/assignments"),
             Scope::Project => format!("{base}/permissions/project/assignments"),
             Scope::Warehouse => format!("{base}/permissions/warehouse/{wh}/assignments"),
-            Scope::Namespace => {
-                format!(
-                    "{base}/permissions/namespace/{}/assignments",
-                    self.namespace_id
-                )
-            }
+            Scope::Namespace(namespace) => format!(
+                "{base}/permissions/namespace/{}/assignments",
+                self.namespace_id(namespace)
+            ),
             Scope::Table(table) => format!(
                 "{base}/permissions/warehouse/{wh}/table/{}/assignments",
                 self.table_id(table)
@@ -395,20 +412,27 @@ fn warehouse_id_by_name(name: &str) -> String {
         .to_string()
 }
 
-fn ensure_namespace(warehouse_id: &str) -> String {
-    let token = keycloak_client_credentials_token();
-    let base = catalog_url(warehouse_id);
+fn ensure_authz_namespace(warehouse_id: &str) -> String {
     let create = post(
-        &format!("{base}/namespaces"),
-        &token,
+        &format!("{}/namespaces", catalog_url(warehouse_id)),
+        &keycloak_client_credentials_token(),
         &json!({"namespace": [AUTHZ_NAMESPACE]}),
     );
     expect_status(&create, "Lakekeeper create namespace", &[200, 409]);
-    let fetched = get(&format!("{base}/namespaces/{AUTHZ_NAMESPACE}"), &token);
-    expect_status(&fetched, "Lakekeeper GET namespace", &[200]);
+    namespace_uuid(warehouse_id, AUTHZ_NAMESPACE)
+}
+
+fn namespace_uuid(warehouse_id: &str, namespace: &str) -> String {
+    let url = format!("{}/namespaces/{namespace}", catalog_url(warehouse_id));
+    let fetched = get(&url, &keycloak_client_credentials_token());
+    expect_status(
+        &fetched,
+        &format!("Lakekeeper GET namespace '{namespace}'"),
+        &[200],
+    );
     fetched.body["properties"]["namespace_id"]
         .as_str()
-        .unwrap_or_else(|| panic!("Lakekeeper namespace answered no namespace_id"))
+        .unwrap_or_else(|| panic!("Lakekeeper namespace '{namespace}' answered no namespace_id"))
         .to_string()
 }
 
@@ -489,16 +513,20 @@ pub fn provision_authz_fixture() -> AuthzFixture {
         principal_ids.insert(principal.client_id, whoami_id(principal));
     }
 
-    let namespace_id = ensure_namespace(&warehouse_id);
+    let authz_namespace_id = ensure_authz_namespace(&warehouse_id);
     let mut table_ids: BTreeMap<&'static str, String> = [TABLE_ALPHA, TABLE_BETA]
         .into_iter()
         .map(|table| (table, ensure_table(&warehouse_id, table)))
         .collect();
     table_ids.insert(E2E_TABLE, ensure_seeded_events_table(&warehouse_id));
+    let namespace_ids = BTreeMap::from([
+        (AUTHZ_NAMESPACE, authz_namespace_id),
+        (E2E_NAMESPACE, namespace_uuid(&warehouse_id, E2E_NAMESPACE)),
+    ]);
 
     let fixture = AuthzFixture {
         warehouse_id,
-        namespace_id,
+        namespace_ids,
         table_ids,
         principal_ids,
     };

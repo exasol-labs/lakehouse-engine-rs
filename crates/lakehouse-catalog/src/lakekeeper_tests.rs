@@ -1,7 +1,9 @@
 use super::*;
+use crate::iceberg_io::{MAX_ANSWER_BYTES, MAX_QUOTED_BODY_BYTES};
 use crate::test_support::*;
 use serde_json::{Value, json};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 
 const WAREHOUSE_ID: &str = "5c25f9c4-be40-11f1-a87d-17102559a460";
@@ -747,5 +749,182 @@ fn management_url_rejects_a_catalog_uri_that_does_not_end_in_catalog() {
             message.contains(&format!("'{catalog_uri}'")) && message.contains("'/catalog'"),
             "{catalog_uri}: must name the URI and the required ending: {message}"
         );
+    }
+}
+
+const SHORT_DEADLINE: Duration = Duration::from_millis(300);
+
+/// Answers every batch-check with `prelude` and then nothing, holding the connection open, and
+/// every other request with a 404, which `CatalogSession::resolve` tolerates.
+async fn stalling_lakekeeper(prelude: &'static str) -> String {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_uri = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_request(&mut stream).await;
+            if request.starts_with(BATCH_CHECK_REQUEST) {
+                let _ = stream.write_all(prelude.as_bytes()).await;
+                held.push(stream);
+            } else {
+                let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\
+                                 Connection: close\r\n\r\n";
+                let _ = stream.write_all(not_found.as_bytes()).await;
+            }
+        }
+    });
+    base_uri
+}
+
+/// Scenario: A failed batch-check refuses the query with an error that names the cause
+#[tokio::test]
+async fn a_stalled_batch_check_fails_within_its_deadline_naming_the_url() {
+    let partial_answer = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                          Content-Length: 100\r\n\r\n{\"results\"";
+    for (case, prelude) in [
+        ("a server that never answers", ""),
+        ("an answer that stops mid-body", partial_answer),
+    ] {
+        let base_uri = stalling_lakekeeper(prelude).await;
+        let creds = ConnectionCreds {
+            token: Some(BEARER_TOK.into()),
+            ..base_creds()
+        };
+        let session =
+            CatalogSession::resolve(&format!("{base_uri}/catalog"), "lakehouse_authz", &creds)
+                .await
+                .expect("a static token needs no grant, and a 404 config lookup is no error");
+        let started = Instant::now();
+
+        let message = message(
+            batch_check_within(
+                &session,
+                FIXTURE_PRINCIPAL,
+                &["authz.t"],
+                &creds,
+                SHORT_DEADLINE,
+            )
+            .await
+            .expect_err(case),
+        );
+
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{case}: the deadline must bound the wait"
+        );
+        assert!(
+            message.contains(&format!("{base_uri}/management/v1/action/batch-check")),
+            "{case}: must name the batch-check URL: {message}"
+        );
+        assert!(
+            message.contains("within 300ms"),
+            "{case}: must state the deadline: {message}"
+        );
+        assert_no_credential(case, &message);
+    }
+    assert_eq!(BATCH_CHECK_DEADLINE, Duration::from_secs(30));
+}
+
+fn padded_allowed_answer(len: usize) -> String {
+    let answer = r#"{"results":[{"id":"read-data","allowed":true}]}"#;
+    format!("{answer}{}", " ".repeat(len - answer.len()))
+}
+
+/// Scenario: A failed batch-check refuses the query with an error that names the cause
+#[tokio::test]
+async fn an_answer_of_exactly_the_read_limit_is_read_and_one_byte_more_is_refused() {
+    let at_limit = json_stub(200, padded_allowed_answer(MAX_ANSWER_BYTES)).await;
+    let over_limit = json_stub(200, padded_allowed_answer(MAX_ANSWER_BYTES + 1)).await;
+
+    let decisions = check(&at_limit, FIXTURE_PRINCIPAL, &["authz.t"])
+        .await
+        .expect("an answer of exactly the read limit is read whole");
+    let message = message(
+        check(&over_limit, FIXTURE_PRINCIPAL, &["authz.t"])
+            .await
+            .expect_err("an answer over the read limit is refused"),
+    );
+
+    assert!(decisions[0].allowed);
+    for fragment in [
+        over_limit.batch_check_url(),
+        "HTTP 200".to_string(),
+        format!("exceeds {MAX_ANSWER_BYTES} bytes"),
+    ] {
+        assert!(message.contains(&fragment), "{fragment:?}: {message}");
+    }
+    assert!(
+        message.len() < MAX_QUOTED_BODY_BYTES + 1024,
+        "the refusal quotes a bounded body, not {} bytes",
+        message.len()
+    );
+}
+
+/// Scenario: A failed batch-check refuses the query with an error that names the cause
+#[tokio::test]
+async fn an_oversized_answer_body_is_quoted_redacted_and_truncated() {
+    // The bearer token straddles the quote limit, so truncating before redacting would leak
+    // its first bytes.
+    let straddling = format!(
+        "{}{OAUTH_ACCESS_TOKEN} {}",
+        "s".repeat(MAX_QUOTED_BODY_BYTES - 12),
+        echoed_secrets()
+    );
+    for (case, status, body) in [
+        (
+            "a 500 larger than the read limit",
+            500,
+            format!(
+                "marker {} {}",
+                echoed_secrets(),
+                "x".repeat(2 * MAX_ANSWER_BYTES)
+            ),
+        ),
+        (
+            "a 500 larger than a quote",
+            500,
+            format!("marker {}", "x".repeat(4 * MAX_QUOTED_BODY_BYTES)),
+        ),
+        (
+            "a 200 that is not an answer and larger than a quote",
+            200,
+            format!("marker {}", "x".repeat(4 * MAX_QUOTED_BODY_BYTES)),
+        ),
+        (
+            "a 500 whose secret straddles the quote limit",
+            500,
+            straddling,
+        ),
+    ] {
+        let start = body[..6].to_string();
+        let stub = lakekeeper_stub("text/plain", status, body).await;
+
+        let message = message(
+            check(&stub, FIXTURE_PRINCIPAL, &["authz.t"])
+                .await
+                .expect_err(case),
+        );
+
+        for fragment in [
+            stub.batch_check_url(),
+            format!("HTTP {status}"),
+            start,
+            format!("truncated to {MAX_QUOTED_BODY_BYTES} bytes"),
+        ] {
+            assert!(
+                message.contains(&fragment),
+                "{case}: {fragment:?}: {message}"
+            );
+        }
+        assert!(
+            message.len() < MAX_QUOTED_BODY_BYTES + 1024,
+            "{case}: the quote must be bounded, not {} bytes",
+            message.len()
+        );
+        assert!(
+            !message.contains(&OAUTH_ACCESS_TOKEN[..12]),
+            "{case}: no part of the bearer token may survive: {message}"
+        );
+        assert_no_credential(case, &message);
     }
 }

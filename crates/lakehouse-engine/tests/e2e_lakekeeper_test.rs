@@ -774,6 +774,31 @@ fn authz_fixture_provisioning_removes_a_stale_reader_grant() {
     assert!(operator_allows(&reprovisioned, &READER_A, TABLE_ALPHA));
 }
 
+/// The permission-check test's denied user must not inherit a read of the scanned table.
+#[test]
+fn authz_fixture_provisioning_removes_a_stale_grant_on_the_scanned_tables_namespace() {
+    let fixture = authz_fixture();
+    let denied_reads_events = |fixture: &AuthzFixture| {
+        let check = fixture.read_check_at(CHECK_ID, MAPPED_DENIED, E2E_NAMESPACE, E2E_TABLE);
+        batch_check(&OPERATOR.token(), &[check]).allowed(CHECK_ID)
+    };
+    fixture.ensure_grant(
+        MAPPED_DENIED,
+        grant(Scope::Namespace(E2E_NAMESPACE), "select"),
+    );
+    assert!(
+        denied_reads_events(fixture),
+        "precondition: the stale namespace grant takes effect"
+    );
+
+    let reprovisioned = provision_authz_fixture();
+
+    assert!(
+        !denied_reads_events(&reprovisioned),
+        "provisioning must remove a namespace grant the fixture does not name"
+    );
+}
+
 /// Proves only a direct client-credentials login. It does NOT prove that the id #415's
 /// `USER_MAPPING` template derives from an Exasol user matches an existing grant (#415).
 #[test]

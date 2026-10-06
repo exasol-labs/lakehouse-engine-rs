@@ -1,6 +1,6 @@
 use super::test_support::*;
 use super::*;
-use crate::adapter::permission::PermissionGate;
+use crate::adapter::permission::PermissionCheck;
 use crate::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage, StorageProps,
 };
@@ -1746,7 +1746,7 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_gate: None,
+        permission_check: PermissionCheck::Off,
     };
     let result = handle_pushdown(
         &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -1782,7 +1782,7 @@ async fn seam_handle_pushdown(
         catalog_kind,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_gate: None,
+        permission_check: PermissionCheck::Off,
     };
     handle_pushdown(
         request, &conn, catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -3066,9 +3066,9 @@ async fn lakekeeper_pushdown(
     request: &Json,
     table: &str,
     stand_in: &LakekeeperStandIn,
-    gate: Option<PermissionGate>,
+    check: PermissionCheck,
 ) -> Result<Json, UdfError> {
-    let conn = lakekeeper_connection(stand_in, gate);
+    let conn = lakekeeper_connection(stand_in, check);
     let catalog = CatalogProps {
         warehouse: "wh".into(),
         table: table.into(),
@@ -3191,17 +3191,12 @@ async fn every_iceberg_shape_is_checked_once_before_any_table_load() {
         let unchecked = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(&[])).await;
         let checked = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(&[])).await;
 
-        let without = lakekeeper_pushdown(&request, "db.events", &unchecked, None)
+        let without = lakekeeper_pushdown(&request, "db.events", &unchecked, PermissionCheck::Off)
             .await
             .unwrap_or_else(|e| panic!("{shape}: the unchecked request plans: {e}"));
-        let with = lakekeeper_pushdown(
-            &request,
-            "db.events",
-            &checked,
-            Some(lakekeeper_gate("ALICE")),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{shape}: an allowed request plans: {e}"));
+        let with = lakekeeper_pushdown(&request, "db.events", &checked, lakekeeper_check("ALICE"))
+            .await
+            .unwrap_or_else(|e| panic!("{shape}: an allowed request plans: {e}"));
 
         assert_eq!(with, without, "{shape}: the check must not change the SQL");
         let mut expected_targets = unchecked.targets();
@@ -3256,14 +3251,9 @@ async fn a_denied_or_missing_table_refuses_with_no_table_load() {
         let stand_in = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(denied)).await;
 
         let message = user_message(
-            lakekeeper_pushdown(
-                &request,
-                "db.events",
-                &stand_in,
-                Some(lakekeeper_gate("ALICE")),
-            )
-            .await
-            .expect_err("a denied table refuses the whole query"),
+            lakekeeper_pushdown(&request, "db.events", &stand_in, lakekeeper_check("ALICE"))
+                .await
+                .expect_err("a denied table refuses the whole query"),
         );
 
         for fragment in ["'ALICE'", "'oidc~alice@corp.net'", "grant"]
@@ -3327,7 +3317,7 @@ async fn a_failed_batch_check_refuses_with_no_table_load() {
                 &super::dispatch_golden::row_scan_request(),
                 "db.events",
                 &stand_in,
-                Some(lakekeeper_gate("ALICE")),
+                lakekeeper_check("ALICE"),
             )
             .await
             .expect_err("a failed batch-check refuses the query"),
@@ -3373,14 +3363,9 @@ async fn permission_check_adds_one_request_and_no_grant_on_the_session() {
     ] {
         let stand_in = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(&[])).await;
 
-        lakekeeper_pushdown(
-            request,
-            "db.events",
-            &stand_in,
-            Some(lakekeeper_gate("ALICE")),
-        )
-        .await
-        .unwrap_or_else(|e| panic!("{shape}: an allowed request plans: {e}"));
+        lakekeeper_pushdown(request, "db.events", &stand_in, lakekeeper_check("ALICE"))
+            .await
+            .unwrap_or_else(|e| panic!("{shape}: an allowed request plans: {e}"));
 
         let mut expected = vec![
             LAKEKEEPER_TOKEN_TARGET.to_string(),

@@ -3,9 +3,11 @@
 //! gate that authorizes a pushdown request's tables or refuses the query. No other module names
 //! the template engine.
 
+use crate::adapter::catalog_kind::CatalogKind;
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
     CatalogSession, ConnectionCreds, TableReadDecision, lakekeeper_batch_check,
+    lakekeeper_management_url,
 };
 use minijinja::{AutoEscape, Environment, UndefinedBehavior, context};
 use serde_json::Value as Json;
@@ -16,7 +18,7 @@ const LAKEKEEPER: &str = "LAKEKEEPER";
 /// The largest planned template renders in 19 units, a 5,000-entry lookup table in 8.
 const RENDER_FUEL: u64 = 100_000;
 
-pub(super) const REQUIRES_ICEBERG_REST: &str =
+const REQUIRES_ICEBERG_REST: &str =
     "PERMISSION_CHECK = 'LAKEKEEPER' requires the Iceberg REST catalog kind";
 
 /// The parsed permission properties of one request. `Off` reads neither `USER_MAPPING` nor the
@@ -48,25 +50,51 @@ impl PermissionSettings {
         Ok(Self::Lakekeeper(Box::new(UserMapping::compile(template)?)))
     }
 
-    pub(crate) fn is_on(&self) -> bool {
-        matches!(self, Self::Lakekeeper(_))
+    /// Runs before the CONNECTION is read, so a wrong kind costs no request. A comparison, not a
+    /// match, so a new kind is refused without an edit here.
+    pub(crate) fn require_supported_kind(&self, kind: CatalogKind) -> Result<(), UdfError> {
+        match self {
+            Self::Lakekeeper(_) if kind != CatalogKind::IcebergRest => {
+                Err(UdfError::User(REQUIRES_ICEBERG_REST.into()))
+            }
+            Self::Lakekeeper(_) | Self::Off => Ok(()),
+        }
     }
 
-    /// Builds the request's gate from the current user, which is read only while the check is
-    /// on. A refused user fails the request, so a gated request never runs without its gate.
-    pub(crate) fn gate_for(
+    /// Runs once the CONNECTION names the catalog URI and before any catalog request, so a URI
+    /// that derives no management URL is refused before the catalog is contacted.
+    pub(crate) fn require_management_url(&self, catalog_uri: &str) -> Result<(), UdfError> {
+        match self {
+            Self::Lakekeeper(_) => lakekeeper_management_url(catalog_uri).map(drop),
+            Self::Off => Ok(()),
+        }
+    }
+
+    /// Builds a pushdown request's check from the current user, which is read only while the
+    /// check is on. A refused user fails the request, so a gated request never runs unchecked.
+    pub(crate) fn check_for(
         &self,
         current_user: impl FnOnce() -> Option<String>,
-    ) -> Result<Option<PermissionGate>, UdfError> {
+    ) -> Result<PermissionCheck, UdfError> {
         let Self::Lakekeeper(mapping) = self else {
-            return Ok(None);
+            return Ok(PermissionCheck::Off);
         };
         let user = current_user()
             .filter(|user| !user.is_empty())
             .ok_or_else(no_current_user)?;
         let principal = mapping.principal_for(&user)?;
-        Ok(Some(PermissionGate { user, principal }))
+        Ok(PermissionCheck::Enforced(PermissionGate {
+            user,
+            principal,
+        }))
     }
+}
+
+/// What one request enforces. Only a pushdown under the check is `Enforced`: createVirtualSchema,
+/// refresh, and setProperties list as the CONNECTION's identity and check nothing.
+pub(crate) enum PermissionCheck {
+    Off,
+    Enforced(PermissionGate),
 }
 
 /// A compiled `USER_MAPPING` template with one variable, `user`.

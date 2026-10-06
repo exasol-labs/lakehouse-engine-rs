@@ -36,15 +36,20 @@ fn props(pairs: &[(&str, &str)]) -> Json {
     )
 }
 
-fn gate(mapping: &str, user: &str) -> PermissionGate {
+fn checked_settings(mapping: &str) -> PermissionSettings {
     PermissionSettings::parse(&props(&[
         (PERMISSION_CHECK, "LAKEKEEPER"),
         (USER_MAPPING, mapping),
     ]))
     .expect("the properties are valid")
-    .gate_for(|| Some(user.to_string()))
-    .unwrap_or_else(|e| panic!("{user:?} must map: {e}"))
-    .expect("the check is on, so a gate is built")
+}
+
+fn gate(mapping: &str, user: &str) -> PermissionGate {
+    match checked_settings(mapping).check_for(|| Some(user.to_string())) {
+        Ok(PermissionCheck::Enforced(gate)) => gate,
+        Ok(PermissionCheck::Off) => panic!("the check is on, so it must be enforced"),
+        Err(e) => panic!("{user:?} must map: {e}"),
+    }
 }
 
 fn parse_error(properties: &Json) -> String {
@@ -208,14 +213,10 @@ fn each_render_failure_and_rejected_principal_is_refused() {
 /// Scenario: A user that USER_MAPPING cannot map is refused before any request
 #[test]
 fn an_absent_or_empty_current_user_is_refused() {
-    let settings = PermissionSettings::parse(&props(&[
-        (PERMISSION_CHECK, "LAKEKEEPER"),
-        (USER_MAPPING, "oidc~{{ user|lower }}@corp.net"),
-    ]))
-    .expect("the properties are valid");
+    let settings = checked_settings("oidc~{{ user|lower }}@corp.net");
 
     for current_user in [None, Some(String::new())] {
-        let Err(UdfError::User(message)) = settings.gate_for(|| current_user.clone()) else {
+        let Err(UdfError::User(message)) = settings.check_for(|| current_user.clone()) else {
             panic!("{current_user:?} must be refused as a user error");
         };
         assert!(
@@ -299,11 +300,17 @@ fn an_absent_or_empty_permission_check_is_off_and_reads_neither_mapping_nor_user
     ] {
         let settings = PermissionSettings::parse(&properties)
             .unwrap_or_else(|e| panic!("{properties} turns the check off: {e}"));
-        assert!(!settings.is_on(), "{properties} turns the check off");
-        let gate = settings
-            .gate_for(|| panic!("the check is off, so the current user must not be read"))
+        assert!(
+            matches!(settings, PermissionSettings::Off),
+            "{properties} turns the check off"
+        );
+        let check = settings
+            .check_for(|| panic!("the check is off, so the current user must not be read"))
             .expect("an off check needs no user");
-        assert!(gate.is_none(), "an off check builds no gate");
+        assert!(
+            matches!(check, PermissionCheck::Off),
+            "an off check enforces nothing"
+        );
     }
 }
 
@@ -343,8 +350,58 @@ fn the_check_is_on_for_lakekeeper_in_any_letter_case() {
             (USER_MAPPING, "oidc~{{ user|lower }}@corp.net"),
         ]))
         .unwrap_or_else(|e| panic!("{value} turns the check on: {e}"));
-        assert!(settings.is_on(), "{value} turns the check on");
+        assert!(
+            matches!(settings, PermissionSettings::Lakekeeper(_)),
+            "{value} turns the check on"
+        );
     }
+}
+
+const EVERY_KIND: [CatalogKind; 4] = [
+    CatalogKind::IcebergRest,
+    CatalogKind::UnityCatalogNative,
+    CatalogKind::Glue,
+    CatalogKind::DirectStorage,
+];
+
+/// Scenario: The check is accepted only for an Iceberg REST catalog URI that ends in /catalog
+#[test]
+fn the_check_accepts_only_iceberg_rest_and_an_off_check_accepts_every_kind() {
+    let on = checked_settings("oidc~{{ user|lower }}@corp.net");
+
+    for kind in EVERY_KIND {
+        PermissionSettings::Off
+            .require_supported_kind(kind)
+            .unwrap_or_else(|e| panic!("an off check accepts {kind:?}: {e}"));
+        match (kind, on.require_supported_kind(kind)) {
+            (CatalogKind::IcebergRest, accepted) => accepted.expect("the check needs Iceberg REST"),
+            (_, Err(UdfError::User(message))) => assert_eq!(
+                message, "PERMISSION_CHECK = 'LAKEKEEPER' requires the Iceberg REST catalog kind",
+                "{kind:?}"
+            ),
+            (_, other) => panic!("{kind:?} must be refused with a user error, got {other:?}"),
+        }
+    }
+}
+
+/// Scenario: The check is accepted only for an Iceberg REST catalog URI that ends in /catalog
+#[test]
+fn the_check_needs_a_catalog_uri_ending_in_catalog_and_an_off_check_accepts_any() {
+    let on = checked_settings("oidc~{{ user|lower }}@corp.net");
+    let gateway = "http://lakekeeper:8181/iceberg";
+
+    on.require_management_url("http://lakekeeper:8181/catalog")
+        .expect("a URI ending in /catalog derives the management URL");
+    PermissionSettings::Off
+        .require_management_url(gateway)
+        .expect("an off check reads no management URL");
+    let Err(UdfError::User(message)) = on.require_management_url(gateway) else {
+        panic!("a URI that does not end in /catalog must be refused with a user error");
+    };
+    assert!(
+        message.contains(gateway) && message.contains("'/catalog'"),
+        "{message}"
+    );
 }
 
 /// Scenario: USER_MAPPING maps the querying user to a principal

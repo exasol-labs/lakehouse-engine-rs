@@ -5,12 +5,13 @@
 //! are reused without widening its surface. Nothing here names an Exasol concept; the caller maps
 //! its own user to the principal it passes in.
 
-use crate::iceberg_io::{PostAnswer, authed_post_json, redact_catalog_text};
+use crate::iceberg_io::{PostAnswer, authed_post_json, quote_catalog_body};
 use crate::namespace::parse_table_ident;
 use crate::{CatalogSession, ConnectionCreds};
 use exasol_udf_sdk::error::UdfError;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 const CATALOG_SEGMENT: &str = "/catalog";
 const MANAGEMENT_SEGMENT: &str = "/management";
@@ -18,6 +19,9 @@ const BATCH_CHECK_PATH: &str = "/v1/action/batch-check";
 const READ_CHECK_ID: &str = "read-data";
 const CANNOT_INSPECT_ERROR_TYPE: &str = "CannotInspectPermissions";
 const NEEDS_LAKEKEEPER: &str = "The catalog must be a Lakekeeper server.";
+/// The pushdown waits on the batch-check, so a stalled server fails the query instead of
+/// hanging it.
+const BATCH_CHECK_DEADLINE: Duration = Duration::from_secs(30);
 
 /// Lakekeeper's answer for one table: whether the checked principal can read its data. Lakekeeper
 /// reports a missing table as `allowed: false`, the same as a denied one.
@@ -50,13 +54,24 @@ pub fn lakekeeper_management_url(catalog_uri: &str) -> Result<String, UdfError> 
 /// `/v1/config` prefix, unchanged: on Lakekeeper it is the warehouse id, and any other server
 /// fails the call. The function derives the management URL from the session's own catalog URI.
 ///
-/// A batch-check that cannot be completed, and every answer that is not a readable batch-check
-/// answer, is an error that names the batch-check URL, so an unreadable answer never counts as allowed.
+/// A batch-check that cannot be completed within [`BATCH_CHECK_DEADLINE`], and every answer that
+/// is not a readable batch-check answer, is an error that names the batch-check URL, so an
+/// unreadable answer never counts as allowed.
 pub async fn lakekeeper_batch_check(
     session: &CatalogSession,
     principal: &str,
     tables: &[&str],
     creds: &ConnectionCreds,
+) -> Result<Vec<TableReadDecision>, UdfError> {
+    batch_check_within(session, principal, tables, creds, BATCH_CHECK_DEADLINE).await
+}
+
+async fn batch_check_within(
+    session: &CatalogSession,
+    principal: &str,
+    tables: &[&str],
+    creds: &ConnectionCreds,
+    deadline: Duration,
 ) -> Result<Vec<TableReadDecision>, UdfError> {
     let distinct = distinct_in_first_seen_order(tables);
     if distinct.is_empty() {
@@ -68,18 +83,26 @@ pub async fn lakekeeper_batch_check(
     );
     let request = build_batch_check(principal, &distinct, session.prefix())?;
 
-    let answer = authed_post_json(session.client(), &url, &request, session.auth(), creds)
-        .await
-        .map_err(|error| {
-            UdfError::User(format!(
-                "the Lakekeeper batch-check at {url} could not be completed: {error}. {NEEDS_LAKEKEEPER}"
-            ))
-        })?;
+    let answer = authed_post_json(
+        session.client(),
+        &url,
+        &request,
+        session.auth(),
+        creds,
+        deadline,
+    )
+    .await
+    .map_err(|error| {
+        UdfError::User(format!(
+            "the Lakekeeper batch-check at {url} could not be completed: {error}. \
+             {NEEDS_LAKEKEEPER}"
+        ))
+    })?;
 
     match answer {
         PostAnswer::Accepted { status, body } => {
             read_decisions(&distinct, &body).ok_or_else(|| {
-                let shown = redact_catalog_text(&body, session.auth(), creds);
+                let shown = quote_catalog_body(&body, session.auth(), creds);
                 UdfError::User(format!(
                     "the Lakekeeper batch-check at {url} answered HTTP {status} with a body that \
                      is not a batch-check answer for its {} checks: {shown}. {NEEDS_LAKEKEEPER}",

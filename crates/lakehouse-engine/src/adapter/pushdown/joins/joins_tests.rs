@@ -1,6 +1,7 @@
 use super::attribution::JoinLegs;
 use super::*;
 use crate::adapter::catalog_kind::CatalogKind;
+use crate::adapter::permission::PermissionCheck;
 use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
 use crate::scan::spec::CatalogProps;
@@ -637,7 +638,7 @@ async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, Udf
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_gate: None,
+        permission_check: PermissionCheck::Off,
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),
@@ -664,7 +665,7 @@ async fn delta_n_scan_pushdown(
         catalog_kind: CatalogKind::UnityCatalogNative,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_gate: None,
+        permission_check: PermissionCheck::Off,
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),

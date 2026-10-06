@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapter::permission::{PermissionGate, PermissionSettings};
+use crate::adapter::permission::{PermissionCheck, PermissionSettings};
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use lakehouse_catalog::{
@@ -263,26 +263,25 @@ pub(crate) fn lakekeeper_creds() -> ConnectionCreds {
     }
 }
 
-/// The gate the pushdown arm builds for `user` under `oidc~{{ user|lower }}@corp.net`.
-pub(crate) fn lakekeeper_gate(user: &str) -> PermissionGate {
+/// The check the pushdown arm builds for `user` under `oidc~{{ user|lower }}@corp.net`.
+pub(crate) fn lakekeeper_check(user: &str) -> PermissionCheck {
     PermissionSettings::parse(&serde_json::json!({
         "PERMISSION_CHECK": "LAKEKEEPER",
         "USER_MAPPING": "oidc~{{ user|lower }}@corp.net",
     }))
     .expect("valid permission properties")
-    .gate_for(|| Some(user.to_string()))
+    .check_for(|| Some(user.to_string()))
     .expect("the user maps to a principal")
-    .expect("the check is on, so a gate is built")
 }
 
-/// A connection to `stand_in` that carries `gate`, as the pushdown arm stores it.
+/// A connection to `stand_in` that carries `check`, as the pushdown arm stores it.
 pub(super) fn lakekeeper_connection(
     stand_in: &LakekeeperStandIn,
-    gate: Option<PermissionGate>,
+    check: PermissionCheck,
 ) -> ResolvedConnectionConfig {
     ResolvedConnectionConfig {
         catalog_uri: stand_in.catalog_uri(),
-        permission_gate: gate,
+        permission_check: check,
         ..test_connection(lakekeeper_creds())
     }
 }
@@ -749,7 +748,7 @@ pub(super) async fn delta_pushdown(
         catalog_kind: CatalogKind::UnityCatalogNative,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_gate: None,
+        permission_check: PermissionCheck::Off,
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),
@@ -795,7 +794,7 @@ fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_gate: None,
+        permission_check: PermissionCheck::Off,
     }
 }
 

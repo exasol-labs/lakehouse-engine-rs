@@ -1646,7 +1646,13 @@ fn resolve_config_over(
         .enable_all()
         .build()
         .expect("build the request runtime");
-    resolve_connection_config(&ctx, props, &PermissionSettings::Off, &rt)
+    resolve_connection_config(
+        &ctx,
+        props,
+        &PermissionSettings::Off,
+        PermissionCheck::Off,
+        &rt,
+    )
 }
 
 #[test]
@@ -2263,27 +2269,23 @@ fn absent_permission_check_sends_no_management_request_and_changes_no_output() {
 /// Scenario: Invalid permission properties are rejected before the catalog is contacted
 #[test]
 fn invalid_permission_properties_are_rejected_before_the_connection_is_read() {
-    let cases: [(PropertyPairs, &[&str]); 4] = [
-        (
-            &[(PERMISSION_CHECK, "OPA")],
-            &["'OPA'", "'LAKEKEEPER'", "absent"],
-        ),
-        (&[(PERMISSION_CHECK, "LAKEKEEPER")], &[USER_MAPPING]),
-        (
-            &[(PERMISSION_CHECK, "LAKEKEEPER"), (USER_MAPPING, "")],
-            &[USER_MAPPING],
-        ),
-        (
-            &[
-                (PERMISSION_CHECK, "lakekeeper"),
-                (USER_MAPPING, "oidc~{{ user|lower @corp.net"),
-            ],
-            &["does not compile", "line 1"],
-        ),
+    let invalid: [PropertyPairs; 4] = [
+        &[(PERMISSION_CHECK, "OPA")],
+        &[(PERMISSION_CHECK, "LAKEKEEPER")],
+        &[(PERMISSION_CHECK, "LAKEKEEPER"), (USER_MAPPING, "")],
+        &[
+            (PERMISSION_CHECK, "lakekeeper"),
+            (USER_MAPPING, "oidc~{{ user|lower @corp.net"),
+        ],
     ];
 
-    for (extra, fragments) in cases {
-        for (label, request) in every_request_type(&vs_properties(extra)) {
+    for extra in invalid {
+        let properties = vs_properties(extra);
+        let Err(UdfError::User(property_error)) = PermissionSettings::parse(&properties) else {
+            panic!("{extra:?} must be rejected as a user error");
+        };
+        for (label, request) in every_request_type(&properties) {
+            // The context holds no CONNECTION, so any later step would fail with another error.
             let message = user_error(
                 dispatch(
                     &mut TestContext::scalar(vec![]).with_current_user("ALICE"),
@@ -2291,13 +2293,7 @@ fn invalid_permission_properties_are_rejected_before_the_connection_is_read() {
                 ),
                 label,
             );
-            for fragment in fragments {
-                assert!(
-                    message.contains(fragment),
-                    "{label} {extra:?}: {fragment:?} missing: {message}"
-                );
-            }
-            assert!(!message.contains(LAKEKEEPER_CLIENT_SECRET), "{message}");
+            assert_eq!(message, property_error, "{label} {extra:?}");
         }
     }
 }
@@ -2391,14 +2387,6 @@ fn listing_requests_with_the_check_on_list_unchanged_and_send_no_check() {
     }
 }
 
-const BRANCHING_MAPPING: &str = r#"{% if user == "ETL_SVC" %}
-  oidc~6f1c0d2e-58b4-4c39-9a8f-2b1e7d4c0a91
-{% elif user is endingwith("_EXT") %}
-  oidc~{{ user[:-4]|lower }}@partner.com
-{% else %}
-  oidc~{{ user|lower }}@corp.net
-{% endif %}"#;
-
 /// The `identity.user` of every check the hosted stand-in received.
 fn checked_identities(hosted: &HostedLakekeeper) -> Vec<String> {
     hosted
@@ -2418,49 +2406,31 @@ fn checked_identities(hosted: &HostedLakekeeper) -> Vec<String> {
 /// Scenario: USER_MAPPING maps the querying user to a principal
 #[test]
 fn the_principal_is_rendered_from_the_current_user() {
-    let replace = r#"oidc~{{ user|lower|replace("_", ".") }}@corp.net"#;
-    let cases = [
-        (replace, "ALICE_COOPER", "oidc~alice.cooper@corp.net"),
-        (BRANCHING_MAPPING, "BOB_EXT", "oidc~bob@partner.com"),
-        (
-            BRANCHING_MAPPING,
-            "ETL_SVC",
-            "oidc~6f1c0d2e-58b4-4c39-9a8f-2b1e7d4c0a91",
-        ),
-    ];
+    let hosted = HostedLakekeeper::start(BatchCheckAnswer::Deny(&[]));
+    let mapping = r#"oidc~{{ user|lower|replace("_", ".") }}@corp.net"#;
+    let properties = vs_properties(&borrowed(&checked_properties(mapping)));
 
-    for (mapping, user, principal) in cases {
-        let hosted = HostedLakekeeper::start(BatchCheckAnswer::Deny(&[]));
-        let properties = vs_properties(&borrowed(&checked_properties(mapping)));
+    dispatch(
+        &mut hosted.context_as("ALICE_COOPER"),
+        &join_pushdown_request(&properties),
+    )
+    .unwrap_or_else(|e| panic!("an allowed join plans: {e}"));
 
-        dispatch(
-            &mut hosted.context_as(user),
-            &join_pushdown_request(&properties),
-        )
-        .unwrap_or_else(|e| panic!("{user}: an allowed join plans: {e}"));
-
-        assert_eq!(
-            checked_identities(&hosted),
-            vec![principal.to_string(); 2],
-            "{user}: every check names the mapped principal, never the scope user"
-        );
-    }
+    assert_eq!(
+        checked_identities(&hosted),
+        vec!["oidc~alice.cooper@corp.net".to_string(); 2],
+        "every check names the current user's principal, never the scope user's"
+    );
 }
 
 /// Scenario: A user that USER_MAPPING cannot map is refused before any request
 #[test]
 fn an_unmappable_user_is_refused_before_any_request() {
     let lookup = r#"{% set ids = {"ALICE": "a.smith"} %}oidc~{{ ids[user] }}@corp.net"#;
-    let cases: [(&str, Option<&str>, &str); 5] = [
+    let cases: [(&str, Option<&str>, &str); 3] = [
         (LOWERCASE_MAPPING, None, "names no current Exasol user"),
         (LOWERCASE_MAPPING, Some(""), "names no current Exasol user"),
         (lookup, Some("CAROL"), "'CAROL'"),
-        (
-            "oidc~{{ user }}@corp.net",
-            Some("ALICE SMITH"),
-            "'ALICE SMITH'",
-        ),
-        ("oidc~{{ user|nosuch }}@corp.net", Some("ALICE"), "nosuch"),
     ];
 
     for (mapping, user, fragment) in cases {
@@ -2488,19 +2458,16 @@ fn an_unmappable_user_is_refused_before_any_request() {
 
 /// Scenario: The adapter trusts the template author and evaluates no user name as template text
 #[test]
-fn a_shared_principal_is_accepted_and_sent_as_a_json_string() {
-    let shared = r#"oidc~{% if user is startingwith("BI_") %}svc-reporting{% else %}{{ user|lower }}{% endif %}@corp.net"#;
+fn a_hostile_current_user_reaches_the_check_only_as_a_json_string() {
     let verbatim = "oidc~{{ user }}@corp.net";
     let cases = [
-        (shared, "BI_TABLEAU", "oidc~svc-reporting@corp.net"),
-        (shared, "BI_POWERBI", "oidc~svc-reporting@corp.net"),
-        (verbatim, "{{7*7}}", "oidc~{{7*7}}@corp.net"),
-        (verbatim, r#"A"B\C"#, r#"oidc~A"B\C@corp.net"#),
+        ("{{7*7}}", "oidc~{{7*7}}@corp.net"),
+        (r#"A"B\C"#, r#"oidc~A"B\C@corp.net"#),
     ];
 
-    for (mapping, user, principal) in cases {
+    for (user, principal) in cases {
         let hosted = HostedLakekeeper::start(BatchCheckAnswer::Deny(&[]));
-        let properties = vs_properties(&borrowed(&checked_properties(mapping)));
+        let properties = vs_properties(&borrowed(&checked_properties(verbatim)));
 
         dispatch(
             &mut hosted.context_as(user),
