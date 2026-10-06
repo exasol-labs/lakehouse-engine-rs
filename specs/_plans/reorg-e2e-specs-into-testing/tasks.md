@@ -4,7 +4,7 @@
 - [x] resolved
 - [x] implemented
 - [x] version-bumped
-- [ ] tested-green
+- [x] tested-green (E2E skipped by user decision: comment and spec edits only; clippy --all-features, cargo test 1886 passed)
 - [ ] recorded
 - [ ] pr-ready
 
