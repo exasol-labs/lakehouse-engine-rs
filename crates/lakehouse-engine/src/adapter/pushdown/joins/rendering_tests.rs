@@ -25,6 +25,15 @@ fn legs_of(names: &[&str]) -> JoinLegs {
     legs_from_leaves(leaves)
 }
 
+/// The leg filter and the type-declined residual of [`screen_side_local`].
+fn type_screened_leg_filter(
+    side_local: &Json,
+    col_types: &[(String, String)],
+) -> (Option<Json>, Option<Json>) {
+    let screened = screen_side_local(side_local, col_types);
+    (screened.scan, screened.type_declined)
+}
+
 fn customer_orders_legs() -> JoinLegs {
     legs_of(&["CUSTOMER", "ORDERS"])
 }
@@ -1193,5 +1202,60 @@ fn unified_join_prunes_and_narrows_each_leg() {
     assert!(
         sql.contains(r#"ON (("LHS_T0"."C_CUSTKEY" = "LHS_T1"."O_CUSTKEY"))"#),
         "the equi-condition attaches to the join point's ON clause: {sql}"
+    );
+}
+
+/// Scenario: Statistics pruning reads only the part of the filter the scan evaluates
+#[test]
+fn a_leg_statistics_filter_holds_only_the_conjuncts_its_scan_carries() {
+    let legs = customer_orders_legs();
+    let orders = orders_col_types();
+    let screened = |filter: &Json| screened_leg_filter(filter, &legs, 1, &orders);
+
+    let rendering = orders_local_rendering_conjunct();
+    let carried = screened(&rendering);
+    assert_eq!(
+        carried.carried,
+        Some(rendering.clone()),
+        "a rendering leg-local comparison rides in the leg's scan, raw"
+    );
+    assert!(carried.scan.is_some() && carried.type_declined.is_none());
+
+    let second = orders_local_declined_conjunct();
+    assert_eq!(
+        screened(&and_of(vec![rendering.clone(), second.clone()])).carried,
+        Some(rendering.clone()),
+        "a SECOND(col, 3) conjunct the DataFusion dialect cannot render is not carried"
+    );
+    let or_holding_second = serde_json::json!({
+        "type": "predicate_or",
+        "expressions": [rendering.clone(), second],
+    });
+    assert_eq!(
+        screened(&or_holding_second).carried,
+        None,
+        "an OR holding SECOND is one conjunct the leg's scan does not carry"
+    );
+
+    let decimal_like = like_over("O_CUSTKEY", "ORDERS", "1%");
+    let mixed = screened(&and_of(vec![rendering.clone(), decimal_like.clone()]));
+    assert_eq!(
+        mixed.carried,
+        Some(rendering.clone()),
+        "a LIKE over a DECIMAL column, which the type screen declines, is not carried"
+    );
+    assert_eq!(mixed.type_declined, Some(decimal_like.clone()));
+
+    let only_declined = screened(&decimal_like);
+    assert!(
+        only_declined.scan.is_none() && only_declined.carried.is_none(),
+        "a side-local set the type screen hands back whole carries none"
+    );
+    assert_eq!(only_declined.type_declined, Some(decimal_like));
+
+    assert_eq!(
+        screened_leg_filter(&rendering, &legs, 0, &customer_col_types()).carried,
+        None,
+        "another leg's conjunct is never carried"
     );
 }

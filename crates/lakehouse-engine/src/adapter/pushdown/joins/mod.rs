@@ -8,7 +8,7 @@ use serde_json::Value as Json;
 use super::ConnectionStorage;
 use super::empty_result::empty_result_sql;
 use super::refused_columns::ensure_no_touched_column_is_refused;
-use super::scan_resolution::TableScanResolver;
+use super::scan_resolution::{ScanFilters, TableScanResolver};
 use super::support::{DISTRIBUTE_FILES_UDF_NAME, SCAN_UDF_NAME, project_columns, quote_ident};
 
 mod attribution;
@@ -32,7 +32,9 @@ pub(super) use planning::JoinWindowPlan;
 use planning::{
     classify_join_window, involved_table_columns, resolve_one_join_side, select_broadcast_sides,
 };
-use rendering::{has_no_explicit_select_list, leg_local_filter, possible_side_column_names};
+use rendering::{
+    has_no_explicit_select_list, leg_local_filter, possible_side_column_names, screened_leg_filter,
+};
 // `pub(super)` so the `#[cfg(test)]` dispatch-golden sibling module can drive both builders.
 pub(super) use sql_builders::{
     JoinScanRequestConfig, build_broadcast_join_sql, build_n_scan_join_sql,
@@ -151,18 +153,30 @@ pub(super) async fn plan_join(
         .iter()
         .map(|leaf| involved_table_columns(request, &leaf.table_name))
         .collect();
+    // The N-scan screen, which the broadcast plan's whole-filter scan also covers.
+    let statistics_filters: Vec<Option<Json>> = side_columns
+        .iter()
+        .enumerate()
+        .map(|(leg, columns)| {
+            filter.and_then(|f| screened_leg_filter(f, &legs, leg, columns).carried)
+        })
+        .collect();
     // `try_join_all` preserves leg order, which later steps index by.
     let sides: Vec<ResolvedJoinSide> = try_join_all(
         join.tables
             .iter()
             .zip(&side_filters)
+            .zip(&statistics_filters)
             .zip(&side_columns)
-            .map(|((leaf, side_filter), columns)| {
+            .map(|(((leaf, side_filter), statistics_filter), columns)| {
                 resolve_one_join_side(
                     &leaf.table_name,
                     &leaf.table_identifier,
                     &resolver,
-                    side_filter.as_ref(),
+                    ScanFilters {
+                        pruning: side_filter.as_ref(),
+                        scan_evaluated: statistics_filter.as_ref(),
+                    },
                     columns,
                 )
             }),

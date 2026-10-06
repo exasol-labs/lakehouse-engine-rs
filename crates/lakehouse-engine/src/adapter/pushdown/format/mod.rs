@@ -24,6 +24,7 @@ mod delta_protocol;
 mod delta_replay;
 mod delta_schema;
 mod filter_json;
+mod footer_statistics;
 mod iceberg;
 mod parquet_format_reader;
 mod partition_predicate;
@@ -167,12 +168,14 @@ pub enum ScanSource<'a> {
         table: &'a CatalogTable,
     },
     /// `declared_columns` is the request's `(Exasol name, Exasol type)` declaration, so a column
-    /// no kept file carries still resolves.
+    /// no kept file carries still resolves. `statistics_filter` is the part of the filter the
+    /// scan evaluates, the only part footer statistics may prune on.
     DirectParquet {
         store: &'a Arc<dyn ObjectStore>,
         table_root: &'a str,
         options: DirectoryOptions,
         declared_columns: &'a [(String, String)],
+        statistics_filter: Option<&'a Json>,
     },
 }
 
@@ -240,11 +243,13 @@ pub fn format_reader<'a>(
             table_root,
             options,
             declared_columns,
+            statistics_filter,
         } => Ok(Box::new(ParquetFormatReader {
             store,
             table_root,
             options,
             declared_columns,
+            statistics_filter,
             storage: connection.storage,
         })),
     }

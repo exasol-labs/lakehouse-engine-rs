@@ -129,6 +129,7 @@ fn third_scan_source_selects_the_parquet_reader() {
                 hive_partitioning: true,
             },
             declared_columns: &[],
+            statistics_filter: None,
         },
         &ConnectionStorage {
             storage: &storage,

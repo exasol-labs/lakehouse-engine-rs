@@ -2,7 +2,11 @@ mod scan_fixture;
 
 use std::sync::Arc;
 
-use arrow::array::{Array, Int64Array, ListBuilder, StringArray, StringBuilder, StringViewArray};
+use arrow::array::{
+    Array, ArrayRef, Decimal128Array, Float32Array, Float64Array, Int64Array, ListBuilder,
+    StringArray, StringBuilder, StringViewArray, TimestampMillisecondArray,
+    TimestampNanosecondArray,
+};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use datafusion::execution::context::SessionContext;
@@ -19,6 +23,7 @@ use lakehouse_engine::scan::{
 use object_store::local::LocalFileSystem;
 use parquet::arrow::ArrowWriter;
 use parquet::file::properties::WriterProperties;
+use serde_json::{Value as Json, json};
 
 fn write_local_parquet(dir: &std::path::Path) -> String {
     let schema = Arc::new(Schema::new(vec![
@@ -53,10 +58,14 @@ fn write_local_parquet(dir: &std::path::Path) -> String {
         .to_string()
 }
 
+fn local_file_size(file_url: &str) -> u64 {
+    std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(file_url))
+        .unwrap_or_else(|e| panic!("stat fixture {file_url}: {e}"))
+        .len()
+}
+
 fn pruning_spec(file_url: String) -> ScanSpec {
-    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = local_file_size(&file_url);
     ScanSpec {
         common: CommonScanSpec {
             projection: vec!["ID".into(), "NAME".into()],
@@ -203,9 +212,7 @@ fn write_nested_parquet(dir: &std::path::Path, rows_per_group: usize) -> String 
 }
 
 fn nested_spec(file_url: String, filter: &str) -> ScanSpec {
-    let size = std::fs::metadata(file_url.strip_prefix("file://").unwrap_or(&file_url))
-        .map(|m| m.len())
-        .unwrap_or(0);
+    let size = local_file_size(&file_url);
     let field = |name: &str, arrow_type: &str, nested: Option<NestedMembers>| LogicalField {
         field_id: None,
         name: name.into(),
@@ -444,4 +451,219 @@ async fn statistics_pruning_cannot_drop_a_row_group_holding_a_rendered_nested_ma
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+const EPOCH_SECONDS_2024_01_01: i64 = 1_704_067_200;
+
+/// Row 1 holds `1234567.89`, `2024-01-01 00:00:00` in both timestamp columns, `16777216.0`, and
+/// `0.1`; row 2 holds `0.00`, `2024-01-01 00:00:00.000000500`, `2024-01-01 00:00:01`, `1.0`, and
+/// `1.0`.
+fn write_literal_parquet(dir: &std::path::Path) -> String {
+    let path = dir.join("literals.parquet");
+    let batch = RecordBatch::try_from_iter(vec![
+        ("ID", Arc::new(Int64Array::from(vec![1i64, 2])) as ArrayRef),
+        (
+            "AMOUNT",
+            Arc::new(
+                Decimal128Array::from(vec![123_456_789i128, 0])
+                    .with_precision_and_scale(10, 2)
+                    .expect("Decimal128(10,2)"),
+            ),
+        ),
+        (
+            "TS",
+            Arc::new(TimestampNanosecondArray::from(vec![
+                EPOCH_SECONDS_2024_01_01 * 1_000_000_000,
+                EPOCH_SECONDS_2024_01_01 * 1_000_000_000 + 500,
+            ])),
+        ),
+        (
+            "TS_MS",
+            Arc::new(TimestampMillisecondArray::from(vec![
+                EPOCH_SECONDS_2024_01_01 * 1_000,
+                (EPOCH_SECONDS_2024_01_01 + 1) * 1_000,
+            ])),
+        ),
+        (
+            "F",
+            Arc::new(Float32Array::from(vec![16_777_216.0f32, 1.0])),
+        ),
+        ("D", Arc::new(Float64Array::from(vec![0.1f64, 1.0]))),
+    ])
+    .expect("literal fixture batch");
+    let file = std::fs::File::create(&path).expect("create parquet file");
+    let mut writer = ArrowWriter::try_new(file, batch.schema(), None).expect("arrow writer");
+    writer.write(&batch).expect("write batch");
+    writer.close().expect("close writer");
+    url::Url::from_file_path(&path)
+        .expect("file path must be absolute")
+        .to_string()
+}
+
+fn literal_spec(file_url: &str, filter: String) -> ScanSpec {
+    let size = local_file_size(file_url);
+    let field = |name: &str, arrow_type: &str| LogicalField {
+        field_id: None,
+        name: name.into(),
+        arrow_type: arrow_type.into(),
+        nullable: true,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    };
+    ScanSpec {
+        common: CommonScanSpec {
+            projection: vec![ProjectionItem::Column("ID".into())],
+            filter: Some(filter),
+            logical_schema: vec![
+                field("ID", "int64"),
+                field("AMOUNT", "decimal128(10,2)"),
+                field("TS", "timestamp_ns"),
+                field("TS_MS", "timestamp_ms"),
+                field("F", "float32"),
+                field("D", "float64"),
+            ],
+            storage: ScanStorage::Inline(StorageBackend::S3(StorageProps {
+                endpoint: "http://localhost:9000".into(),
+                region: "us-east-1".into(),
+                access_key: "k".into(),
+                secret_key: "s".into(),
+                allow_http: true,
+                ..Default::default()
+            })),
+            ..Default::default()
+        },
+        files: vec![FileEntry::new(file_url.to_string(), size)],
+    }
+}
+
+/// Renders Exasol filter JSON as the planner does and runs the production scan; `Err` carries
+/// the scan's error text.
+async fn literal_scan_ids(file_url: &str, filter_json: &Json) -> Result<Vec<i64>, String> {
+    let filter = vs_expression::render_df_filter_safe(filter_json)
+        .ok_or_else(|| format!("the DataFusion dialect declines {filter_json}"))?;
+    let spec = literal_spec(file_url, filter);
+    let ctx = SessionContext::new_with_config(session_config_for_spec(&spec));
+    ctx.runtime_env().register_object_store(
+        &url::Url::parse("file://").expect("file scheme"),
+        Arc::new(LocalFileSystem::new()),
+    );
+    register_files(
+        &ctx,
+        "scan_target",
+        &spec,
+        &scan_fixture::resolved_storage(&spec),
+    )
+    .await
+    .map_err(|e| e.to_string())?;
+    let plan = build_raw_scan_physical_plan(&ctx, &spec)
+        .await
+        .map_err(|e| e.to_string())?;
+    let batches = datafusion::physical_plan::collect(plan, ctx.task_ctx())
+        .await
+        .map_err(|e| e.to_string())?;
+    let mut ids: Vec<i64> = batches
+        .iter()
+        .flat_map(|batch| {
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ID reads as Int64")
+                .clone();
+            column.values().to_vec()
+        })
+        .collect();
+    ids.sort();
+    Ok(ids)
+}
+
+fn literal_compare(kind: &str, column: &str, literal_kind: &str, value: &str) -> Json {
+    json!({
+        "type": kind,
+        "left": {"type": "column", "name": column},
+        "right": {"type": literal_kind, "value": value},
+    })
+}
+
+/// Pins the literal value the scan compares against, which the footer scope reproduces; a
+/// DataFusion upgrade that changes one fails here.
+/// Scenario: Row-group statistics evaluate the filter under three-valued logic
+/// Scenario: A float bound or literal is widened or rejected so it never drops a matching row
+/// Scenario: A literal the scan compares inexactly keeps every file, and the scan's rows for it are pinned live
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scan_compares_pushed_literals_as_the_footer_scope_assumes() {
+    let dir = std::env::temp_dir().join(format!("lh_scan_literals_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let file_url = write_literal_parquet(&dir);
+
+    let exact = "literal_exactnumeric";
+    let cases = [
+        (
+            "the f64 parse of 1234567.89 at scale 15 lies below the stored decimal",
+            literal_compare("predicate_greater", "AMOUNT", exact, "1234567.89"),
+            vec![1],
+        ),
+        (
+            "so the stored 1234567.89 is not equal to it (#TBD)",
+            literal_compare("predicate_equal", "AMOUNT", exact, "1234567.89"),
+            vec![],
+        ),
+        (
+            "the literal is cut to microseconds before a nanosecond comparison",
+            literal_compare(
+                "predicate_equal",
+                "TS",
+                "literal_timestamp",
+                "2024-01-01 00:00:00.000000500",
+            ),
+            vec![1],
+        ),
+        (
+            "a millisecond column compares in milliseconds",
+            literal_compare(
+                "predicate_equal",
+                "TS_MS",
+                "literal_timestamp",
+                "2024-01-01 00:00:00.000500",
+            ),
+            vec![1],
+        ),
+        (
+            "an integer literal against FLOAT is rounded to FLOAT",
+            literal_compare("predicate_equal", "F", exact, "16777217"),
+            vec![1],
+        ),
+        (
+            "a fraction against FLOAT compares in DOUBLE",
+            literal_compare("predicate_less", "F", exact, "4.5"),
+            vec![2],
+        ),
+        (
+            "a fraction against DOUBLE is its f64 parse",
+            literal_compare("predicate_equal", "D", exact, "0.1"),
+            vec![1],
+        ),
+        (
+            "Exasol's DOUBLE literal text parses as f64",
+            literal_compare(
+                "predicate_greater",
+                "D",
+                "literal_double",
+                "1.0000000000000001e+300",
+            ),
+            vec![],
+        ),
+    ];
+    let mut mismatches = Vec::new();
+    for (label, filter, expected) in cases {
+        let observed = literal_scan_ids(&file_url, &filter).await;
+        if observed != Ok(expected.clone()) {
+            mismatches.push(format!(
+                "{label}: {filter} expected {expected:?}, got {observed:?}"
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }

@@ -7,8 +7,12 @@ use crate::adapter::tests::parquet_fixture::{
     directory_options, in_memory_store, nullable, parquet_bytes, parquet_footer_bytes,
 };
 use crate::scan::spec::reconstruct_abs_uri;
+use arrow::array::{Date32Array, Date64Array, Int64Array};
 use arrow::datatypes::Fields;
+use arrow::record_batch::RecordBatch;
 use datafusion::datasource::listing::ListingTableUrl;
+use parquet::arrow::ArrowWriter;
+use serde_json::json;
 use std::collections::BTreeMap;
 
 const TABLE_ROOT: &str = "s3://warehouse/direct/events";
@@ -25,10 +29,21 @@ async fn store_holding(objects: &[(&str, &[u8])]) -> Arc<dyn ObjectStore> {
     in_memory_store(objects).await
 }
 
+/// The scan evaluates the whole request filter, so statistics read all of it.
 async fn try_resolve(
     store: &Arc<dyn ObjectStore>,
     options: DirectoryOptions,
     filter_json: Option<&Json>,
+    declared_columns: &[(String, String)],
+) -> Result<ResolvedScan, UdfError> {
+    try_resolve_with_statistics(store, options, filter_json, filter_json, declared_columns).await
+}
+
+async fn try_resolve_with_statistics(
+    store: &Arc<dyn ObjectStore>,
+    options: DirectoryOptions,
+    filter_json: Option<&Json>,
+    statistics_filter: Option<&Json>,
     declared_columns: &[(String, String)],
 ) -> Result<ResolvedScan, UdfError> {
     let storage = sample_storage();
@@ -37,6 +52,7 @@ async fn try_resolve(
         table_root: TABLE_ROOT,
         options,
         declared_columns,
+        statistics_filter,
         storage: &storage,
     }
     .resolve_scan(filter_json)
@@ -62,6 +78,29 @@ fn column_names(scan: &ResolvedScan) -> Vec<&str> {
 
 fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
     scan.files.iter().map(|file| file.path.as_str()).collect()
+}
+
+/// One row group, so the footer bounds `column` to the range of `values`.
+fn int64_parquet(column: &str, values: &[i64]) -> Vec<u8> {
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![nullable(column, DataType::Int64)])),
+        vec![Arc::new(Int64Array::from(values.to_vec()))],
+    )
+    .expect("one Int64 column matches its schema");
+    batch_bytes(&batch)
+}
+
+fn batch_bytes(batch: &RecordBatch) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let mut writer =
+        ArrowWriter::try_new(&mut bytes, batch.schema(), None).expect("the writer opens");
+    writer.write(batch).expect("the batch writes");
+    writer.close().expect("the footer writes");
+    bytes
+}
+
+fn id_at_most(bound: &str) -> Json {
+    compare("predicate_lessequal", column("ID"), number(bound))
 }
 
 fn declared(columns: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -230,10 +269,12 @@ async fn file_entry_paths_round_trip_to_the_listed_object() {
     );
 }
 
+/// Scenario: The kept files' footers are read at plan time and the resulting cost is stated
 #[tokio::test]
 async fn plan_reads_selected_footers_and_lists_every_file() {
     let store = two_depth_directory().await;
-    let filter = compare("predicate_equal", column("ID"), number("1"));
+    let absolute = json!({"type": "function_scalar", "name": "ABS", "arguments": [column("ID")]});
+    let filter = compare("predicate_equal", absolute, number("1"));
 
     let folded = resolve(&store, MergeMode::FoldEveryFile, Some(&filter)).await;
     let sampled = resolve(&store, MergeMode::SampleOneFile, Some(&filter)).await;
@@ -245,8 +286,7 @@ async fn plan_reads_selected_footers_and_lists_every_file() {
     );
     assert_eq!(
         file_paths(&folded),
-        vec!["day=2/part-1.parquet", "part-0.parquet"],
-        "a non-partition filter never prunes files (#412)"
+        vec!["day=2/part-1.parquet", "part-0.parquet"]
     );
     assert_eq!(
         column_names(&folded),
@@ -356,6 +396,180 @@ async fn a_numeric_literal_prunes_no_direct_storage_file() {
         file_paths(&pruned),
         vec!["year=2024/p1.parquet"],
         "a string literal still prunes through the same predicate"
+    );
+}
+
+/// Scenario: A footer whose row-group bounds exclude the filter drops the file
+#[tokio::test]
+async fn a_footer_range_outside_the_filter_drops_the_file() {
+    let store = store_holding(&[
+        (
+            "direct/events/low.parquet",
+            &int64_parquet("id", &[1, 2, 3]),
+        ),
+        (
+            "direct/events/high.parquet",
+            &int64_parquet("id", &[10, 11, 12]),
+        ),
+    ])
+    .await;
+
+    let filtered = resolve(&store, MergeMode::FoldEveryFile, Some(&id_at_most("5"))).await;
+    let unfiltered = resolve(&store, MergeMode::FoldEveryFile, None).await;
+
+    assert_eq!(
+        file_paths(&filtered),
+        vec!["low.parquet"],
+        "a file whose ID bounds [10, 12] cannot hold ID <= 5 is dropped"
+    );
+    assert_eq!(
+        file_paths(&unfiltered),
+        vec!["high.parquet", "low.parquet"],
+        "without a filter every file is kept"
+    );
+}
+
+/// Scenario: A footer whose row-group bounds exclude the filter drops the file
+/// Scenario: Statistics pruning composes with every consumer of the file list
+#[tokio::test]
+async fn statistics_pruning_keeps_unsampled_files_and_reaches_zero_files() {
+    let sampled_first = store_holding(&[
+        ("direct/events/p0.parquet", &int64_parquet("id", &[1, 2, 3])),
+        ("direct/events/p1.parquet", NOT_PARQUET),
+        ("direct/events/p2.parquet", NOT_PARQUET),
+    ])
+    .await;
+
+    for (filter, kept) in [
+        (
+            id_at_most("5"),
+            vec!["p0.parquet", "p1.parquet", "p2.parquet"],
+        ),
+        (
+            compare("predicate_greater", column("ID"), number("5")),
+            vec!["p1.parquet", "p2.parquet"],
+        ),
+    ] {
+        let scan = resolve(&sampled_first, MergeMode::SampleOneFile, Some(&filter)).await;
+        assert_eq!(
+            file_paths(&scan),
+            kept,
+            "{filter}: only the sampled footer can drop its file, and no unsampled footer is read"
+        );
+        assert_eq!(column_names(&scan), vec!["id"], "{filter}");
+    }
+
+    let folded = store_holding(&[
+        (
+            "direct/events/low.parquet",
+            &int64_parquet("id", &[1, 2, 3]),
+        ),
+        (
+            "direct/events/high.parquet",
+            &int64_parquet("id", &[10, 11, 12]),
+        ),
+    ])
+    .await;
+    let none_kept = resolve(&folded, MergeMode::FoldEveryFile, Some(&id_at_most("0"))).await;
+    assert_eq!(
+        file_paths(&none_kept),
+        Vec::<&str>::new(),
+        "a filter that every footer excludes keeps no file"
+    );
+    assert_eq!(
+        column_names(&none_kept),
+        vec!["id"],
+        "the folded schema survives pruning every file"
+    );
+    assert_eq!(none_kept.logical_schema[0].arrow_type, "int64");
+}
+
+/// Scenario: A column the footer statistics cannot describe keeps the file
+#[tokio::test]
+async fn a_column_the_scan_compares_as_text_prunes_no_file() {
+    const DAY_2024_01_01: i32 = 19_723;
+    let schema = Arc::new(Schema::new(vec![
+        nullable("d32", DataType::Date32),
+        nullable("d64", DataType::Date64),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Date32Array::from(vec![DAY_2024_01_01])),
+            Arc::new(Date64Array::from(vec![
+                i64::from(DAY_2024_01_01) * 86_400_000,
+            ])),
+        ],
+    )
+    .expect("both date columns match their schema");
+    let bytes = batch_bytes(&batch);
+    let store = store_holding(&[("direct/events/day.parquet", &bytes)]).await;
+    let before_2020 = |name: &str| {
+        compare(
+            "predicate_less",
+            column(name),
+            json!({"type": "literal_date", "value": "2020-01-01"}),
+        )
+    };
+
+    let date64 = resolve(&store, MergeMode::FoldEveryFile, Some(&before_2020("D64"))).await;
+    let date32 = resolve(&store, MergeMode::FoldEveryFile, Some(&before_2020("D32"))).await;
+
+    assert_eq!(
+        date64
+            .logical_schema
+            .iter()
+            .find(|field| field.name == "d64")
+            .map(|field| field.arrow_type.as_str()),
+        Some("utf8"),
+        "a DATE64 column declares the string tag, so the scan compares it as text"
+    );
+    assert_eq!(
+        file_paths(&date64),
+        vec!["day.parquet"],
+        "bounds of a column the scan compares as text prune no file"
+    );
+    assert_eq!(
+        file_paths(&date32),
+        Vec::<&str>::new(),
+        "the same bounds on a DATE32 column, which the scan compares as a date, drop the file"
+    );
+}
+
+/// Scenario: Statistics pruning reads only the part of the filter the scan evaluates
+#[tokio::test]
+async fn a_filter_the_scan_does_not_evaluate_prunes_no_file_on_statistics() {
+    let store = store_holding(&[
+        (
+            "direct/events/year=2024/low.parquet",
+            &int64_parquet("id", &[1, 2, 3]),
+        ),
+        (
+            "direct/events/year=2025/high.parquet",
+            &int64_parquet("id", &[10, 11, 12]),
+        ),
+    ])
+    .await;
+    let options = directory_options(MergeMode::FoldEveryFile, true);
+    let (id_filter, partition_filter) = (id_at_most("5"), equal("YEAR", "2025"));
+
+    let unevaluated = try_resolve_with_statistics(&store, options, Some(&id_filter), None, &[])
+        .await
+        .expect("the directory resolves");
+    let partition =
+        try_resolve_with_statistics(&store, options, Some(&partition_filter), None, &[])
+            .await
+            .expect("the directory resolves");
+
+    assert_eq!(
+        file_paths(&unevaluated),
+        vec!["year=2024/low.parquet", "year=2025/high.parquet"],
+        "footer bounds never decide a filter the adapter applies in its own WHERE"
+    );
+    assert_eq!(
+        file_paths(&partition),
+        vec!["year=2025/high.parquet"],
+        "the partition pass still drops a file under the same condition"
     );
 }
 

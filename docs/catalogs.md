@@ -580,9 +580,21 @@ any footer is read, so a pruned file's footer is never read: a filter comparing 
 with a string literal by equality (`=`, `<>`), `IN`, a NULL check (`IS NULL`, `IS NOT NULL`), or a
 range (`<`, `<=`, `>`, `>=`, `BETWEEN`), combined by `AND`, `OR`, and `NOT`, drops every file whose
 partition values cannot satisfy it. Range and `BETWEEN` compare partition values as strings, the
-order Exasol applies to `VARCHAR`, so `month=10` sorts before `month=9`. A filter on any other
-column, or one that applies a function to a partition column, prunes no file: there is no
-footer-statistics pruning (#412), and nothing bounds how many files a table may hold (#419).
+order Exasol applies to `VARCHAR`, so `month=10` sorts before `month=9`. The footers already read
+then prune on their row-group statistics, with no further object-storage request: a comparison of a
+data column with a literal (`=`, `<>`, `<`, `<=`, `>`, `>=`), `IN`, `BETWEEN`, or a NULL check,
+combined by `AND`, `OR`, and `NOT`, drops a file when no row group's minimum, maximum, and null
+count can satisfy it. On a `FLOAT` or `DOUBLE` column only `<`, `<=`, `>`, `>=`, `=`, and the `IN`
+and `BETWEEN` built from them prune; `<>` and every `NOT`-wrapped form (`NOT (D < 1)`, `NOT IN`,
+`NOT BETWEEN`) keep the file, because a stored NaN can satisfy them. Statistics keep a file when its
+footer holds no statistics for the column or only legacy ones (no column order, deprecated
+min/max, INT96), when `MERGE_SCHEMA = 'FALSE'` left its footer unread (every file but the sampled
+one), when the filter applies a function to the column, and when the column is declared
+`VARCHAR(2000000)` for a type Exasol cannot represent, is a time-zoned timestamp, or is a `FLOAT16`.
+They also keep it for a non-integer literal on a decimal column, a timestamp literal finer than the
+column's unit or finer than microseconds, an integer literal that `FLOAT` cannot represent exactly
+on a `FLOAT` column, and a filter or join conjunct that the adapter applies in its own outer
+`WHERE` because the scan cannot evaluate it. Nothing bounds how many files a table may hold (#419).
 
 **Limitation: mixed timestamp units do not fold.** The type-widening rules this kind applies when
 folding schemas cover integer, float, and date widening, but carry no timestamp-to-timestamp rule.
@@ -591,6 +603,14 @@ one file, nanosecond in another) fail to fold under the default `MERGE_SCHEMA = 
 `MERGE_SCHEMA = 'FALSE'` to work around it — the sampled file's declared unit then wins, and a file
 is read only when its unit equals the sampled unit or is coarser. A file at a finer unit fails every
 query that reads the column.
+
+**Limitation: a stored NaN in a float column.** A NaN stored in a `FLOAT` or `DOUBLE` column can
+make a filter on that column return or drop that row inconsistently. The scan orders a NaN above
+every number and a negative-sign NaN below every number, so `D > 2.5` returns a NaN row, yet
+`D > 10` drops it when the bounds of the NaN row's row group exclude 10. Statistics pruning, like
+the scan's own row-group pruning, ignores NaN when it compares bounds: it drops a file whose numeric
+bounds exclude the literal, together with any NaN row the scan's ordering would have matched. See
+[#393](https://github.com/exasol-labs/lakehouse-engine-rs/issues/393).
 
 ## Binary columns
 

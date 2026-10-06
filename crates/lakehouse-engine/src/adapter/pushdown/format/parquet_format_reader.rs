@@ -10,6 +10,7 @@ use object_store::path::Path as StorePath;
 use serde_json::Value as Json;
 use std::collections::HashSet;
 
+use super::footer_statistics::FooterStatisticsFilter;
 use super::partition_predicate::PartitionPredicate;
 use super::{FormatReader, RefusedColumn, ResolvedScan, binary_refusal, without_refused_columns};
 use crate::adapter::parquet_directory::{
@@ -31,13 +32,18 @@ pub(super) struct ParquetFormatReader<'a> {
     pub(super) table_root: &'a str,
     pub(super) options: DirectoryOptions,
     pub(super) declared_columns: &'a [(String, String)],
+    /// The part of the request filter the scan evaluates; `None` when the adapter applies the
+    /// filter in its own outer `WHERE`.
+    pub(super) statistics_filter: Option<&'a Json>,
     /// The CONNECTION's static backend; no credential-vending catalog overrides it.
     pub(super) storage: &'a StorageBackend,
 }
 
 impl FormatReader for ParquetFormatReader<'_> {
-    /// Prunes files by partition-column predicates before any footer is read; other predicates
-    /// never prune (no file statistics).
+    /// Prunes in two passes: partition values against the whole filter before any footer is
+    /// read, then the read footers' row-group statistics against the statistics filter alone.
+    /// Footer bounds describe stored values, which only the scan compares; a filter the adapter
+    /// applies in its own `WHERE` compares emitted ones.
     fn resolve_scan<'a>(
         &'a self,
         filter_json: Option<&'a Json>,
@@ -47,7 +53,7 @@ impl FormatReader for ParquetFormatReader<'_> {
             let prefix = store_prefix(self.table_root)?;
             let predicate = PartitionPredicate::from_filter(filter_json, &[]);
             let ParquetDirectory {
-                files,
+                mut files,
                 schema,
                 partition_columns,
                 binary_columns,
@@ -58,6 +64,10 @@ impl FormatReader for ParquetFormatReader<'_> {
 
             let (logical, refused_columns) =
                 plannable_schema(&schema, self.declared_columns, &binary_columns)?;
+            if let Some(statistics_filter) = self.statistics_filter {
+                let statistics = FooterStatisticsFilter::new(statistics_filter, &schema, &logical);
+                files.retain(|file| statistics.keeps(file));
+            }
             Ok(ResolvedScan {
                 files: files
                     .into_iter()

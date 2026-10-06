@@ -12,7 +12,8 @@ use common::e2e_harness::{
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{
-    encode_parquet_message, put_fixture_object, write_parquet_column, write_parquet_fixture,
+    encode_parquet_message, encode_parquet_with, put_fixture_object, write_parquet_column,
+    write_parquet_fixture,
 };
 use common::seed::{
     ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_IDS_TEXT, ALL_TYPES_TIME_MICROS,
@@ -28,11 +29,12 @@ use common::stack::{
 use lakehouse_engine::scan::spec::StorageBackend;
 
 use arrow::array::{
-    Array, ArrayRef, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
-    DurationMicrosecondArray, Float32Array, Float64Array, Int32Array, Int64Array,
-    IntervalDayTimeArray, ListBuilder, MapArray, StringArray, StringBuilder, StructArray,
-    Time32MillisecondArray, TimestampMicrosecondArray, UInt8Array, UInt16Array, UInt32Array,
-    UInt64Array,
+    Array, ArrayRef, BooleanArray, Date32Array, Date64Array, Decimal128Array, Decimal256Array,
+    DurationMicrosecondArray, Float32Array, Float64Array, Int8Array, Int16Array, Int32Array,
+    Int64Array, IntervalDayTimeArray, LargeStringArray, ListBuilder, MapArray, StringArray,
+    StringBuilder, StructArray, Time32MillisecondArray, TimestampMicrosecondArray,
+    TimestampMillisecondArray, TimestampNanosecondArray, TimestampSecondArray, UInt8Array,
+    UInt16Array, UInt32Array, UInt64Array,
 };
 use arrow::buffer::{NullBuffer, OffsetBuffer};
 use arrow::compute::cast;
@@ -42,10 +44,16 @@ use bytes::Bytes;
 use object_store::ObjectStoreExt;
 use object_store::aws::AmazonS3Builder;
 use object_store::path::Path as ObjectStorePath;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use parquet::basic::{LogicalType, TimeUnit as ParquetTimeUnit};
 use parquet::data_type::{
     ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int64Type, Int96, Int96Type,
 };
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::properties::{EnabledStatistics, WriterProperties};
 use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::file::statistics::Statistics as ParquetStatistics;
+use parquet::schema::types::ColumnPath;
 use serde_json::Value as Json;
 
 use std::collections::BTreeSet;
@@ -643,6 +651,354 @@ fn stored_k_batch(id: i64, stored_k: i64) -> RecordBatch {
     .expect("stored-K batch construction is infallible")
 }
 
+/// Row group 1 holds both NaN signs inside the bounds `[1, 4]`. Row groups 2 and 3 keep the file
+/// planned for `D > 10` and `D < -10`, so the scan's row-group pruning alone decides IDs 5 and 6.
+fn nan_probe_batch() -> RecordBatch {
+    let doubles: Vec<f64> = [1.0, 2.0, 3.0, 4.0, f64::NAN, -f64::NAN]
+        .into_iter()
+        .chain((20..=25).map(f64::from))
+        .chain((-25..=-20).map(f64::from))
+        .collect();
+    RecordBatch::try_from_iter_with_nullable(vec![
+        (
+            "ID",
+            Arc::new(Int64Array::from_iter_values(1..=18)) as ArrayRef,
+            false,
+        ),
+        ("D", Arc::new(Float64Array::from(doubles)), true),
+    ])
+    .expect("nan_probe batch")
+}
+
+const NAN_PROBE_ROWS_PER_GROUP: usize = 6;
+const PRUNE_TYPES_ROWS_PER_GROUP: usize = 4;
+
+const EPOCH_DAYS_2024_01_01: i32 = 19_723;
+const EPOCH_DAYS_2025_01_01: i32 = 20_089;
+const EPOCH_SECONDS_2024_01_01: i64 = 1_704_067_200;
+const EPOCH_SECONDS_2025_01_01: i64 = 1_735_689_600;
+const MILLIS_PER_DAY: i64 = 86_400_000;
+/// 2025-06-01 00:00:00.123456789: fraction digits 7 to 9 are non-zero.
+const TS_NS_ID16_NANOS: i64 = 1_748_736_000_123_456_789;
+const PRUNE_TYPES_LONG_S: usize = 100;
+
+const NAN_PROBE_FILE: &str = "nan_probe/probe.parquet";
+const PRUNE_TYPES_FILE_A: &str = "prune_types/grp=a/f1.parquet";
+const PRUNE_TYPES_FILE_B: &str = "prune_types/grp=b/f2.parquet";
+const ANNOTATED_TYPES_FILE: &str = "annotated_types/file1.parquet";
+
+const PRUNE_TYPES_FIRST_B_ID: i64 = 9;
+
+fn in_grp_a(id: i64) -> bool {
+    id < PRUNE_TYPES_FIRST_B_ID
+}
+
+fn prune_types_day(id: i64) -> i32 {
+    let (epoch_day, first_id) = if in_grp_a(id) {
+        (EPOCH_DAYS_2024_01_01, 1)
+    } else {
+        (EPOCH_DAYS_2025_01_01, PRUNE_TYPES_FIRST_B_ID)
+    };
+    epoch_day + i32::try_from(id - first_id).expect("prune_types day offsets fit i32")
+}
+
+fn prune_types_second(id: i64) -> i64 {
+    id + if in_grp_a(id) {
+        EPOCH_SECONDS_2024_01_01
+    } else {
+        EPOCH_SECONDS_2025_01_01
+    }
+}
+
+fn prune_types_tags(ids: &[i64]) -> ArrayRef {
+    let mut builder = ListBuilder::new(StringBuilder::new());
+    for &id in ids {
+        let items: &[&str] = match id {
+            1 => &["hello", "world"],
+            id if in_grp_a(id) => &["x"],
+            _ => &["y"],
+        };
+        for item in items {
+            builder.values().append_value(item);
+        }
+        builder.append(true);
+    }
+    Arc::new(builder.finish())
+}
+
+/// Every value derives from `ID`, so the `grp=a` file (IDs 1 to 8) and the `grp=b` file (IDs 9
+/// to 16) hold disjoint ranges in every column.
+fn prune_types_batch(ids: &[i64], w_type: &DataType) -> RecordBatch {
+    let each = |value: fn(i64) -> i64| ids.iter().map(move |&id| value(id));
+    let float16 = cast(
+        &Float32Array::from_iter_values(
+            each(|id| if in_grp_a(id) { id } else { id + 1 }).map(|value| value as f32),
+        ),
+        &DataType::Float16,
+    )
+    .expect("Float16");
+    let widened = cast(
+        &Int64Array::from_iter_values(each(
+            |id| {
+                if in_grp_a(id) { id } else { 5_000_000_000 + id }
+            },
+        )),
+        w_type,
+    )
+    .expect("W cast to its per-file type");
+    RecordBatch::try_from_iter_with_nullable(vec![
+        (
+            "ID",
+            Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef,
+            false,
+        ),
+        (
+            "I8",
+            Arc::new(Int8Array::from_iter_values(
+                each(|id| id - 9).map(|v| v as i8),
+            )),
+            true,
+        ),
+        (
+            "I16",
+            Arc::new(Int16Array::from_iter_values(
+                each(|id| (id - 9) * 1_000).map(|v| v as i16),
+            )),
+            true,
+        ),
+        (
+            "I32",
+            Arc::new(Int32Array::from_iter_values(
+                each(|id| (id - 9) * 100_000).map(|v| v as i32),
+            )),
+            true,
+        ),
+        (
+            "U8",
+            Arc::new(UInt8Array::from_iter_values(
+                each(|id| 239 + id).map(|v| v as u8),
+            )),
+            true,
+        ),
+        (
+            "U16",
+            Arc::new(UInt16Array::from_iter_values(
+                each(|id| 65_519 + id).map(|v| v as u16),
+            )),
+            true,
+        ),
+        (
+            "U32",
+            Arc::new(UInt32Array::from_iter_values(
+                each(|id| if in_grp_a(id) { id } else { 4_294_967_279 + id }).map(|v| v as u32),
+            )),
+            true,
+        ),
+        (
+            "U64",
+            Arc::new(UInt64Array::from_iter_values(ids.iter().map(|&id| {
+                if in_grp_a(id) {
+                    id as u64
+                } else {
+                    18_446_744_073_709_551_599 + id as u64
+                }
+            }))),
+            true,
+        ),
+        (
+            "F",
+            Arc::new(Float32Array::from_iter_values(
+                each(|id| if in_grp_a(id) { id } else { 16_777_200 + id }).map(|v| v as f32),
+            )),
+            true,
+        ),
+        (
+            "D",
+            Arc::new(Float64Array::from_iter_values(
+                ids.iter().map(|&id| id as f64 * 0.5),
+            )),
+            true,
+        ),
+        (
+            "AMOUNT",
+            Arc::new(
+                Decimal128Array::from_iter_values(ids.iter().map(|&id| {
+                    if id == 16 {
+                        123_456_789
+                    } else {
+                        i128::from(id) * 1_000
+                    }
+                }))
+                .with_precision_and_scale(10, 2)
+                .expect("Decimal128(10,2)"),
+            ),
+            true,
+        ),
+        (
+            "DEC9",
+            Arc::new(
+                Decimal128Array::from_iter_values(ids.iter().map(|&id| i128::from(id) * 150))
+                    .with_precision_and_scale(9, 2)
+                    .expect("Decimal128(9,2)"),
+            ),
+            true,
+        ),
+        (
+            "DEC30",
+            Arc::new(
+                Decimal128Array::from_iter_values(
+                    ids.iter().map(|&id| i128::from(id - 9) * 10i128.pow(22)),
+                )
+                .with_precision_and_scale(30, 2)
+                .expect("Decimal128(30,2)"),
+            ),
+            true,
+        ),
+        (
+            "S",
+            Arc::new(StringArray::from_iter_values(ids.iter().map(
+                |&id| match id {
+                    id if in_grp_a(id) => format!("a{id}"),
+                    16 => "z".repeat(PRUNE_TYPES_LONG_S),
+                    id => format!("b{id:02}"),
+                },
+            ))),
+            true,
+        ),
+        (
+            "LS",
+            Arc::new(LargeStringArray::from_iter_values(ids.iter().map(|&id| {
+                if in_grp_a(id) {
+                    format!("c{id}")
+                } else {
+                    format!("d{id:02}")
+                }
+            }))),
+            true,
+        ),
+        (
+            "B",
+            Arc::new(BooleanArray::from(
+                ids.iter().map(|&id| !in_grp_a(id)).collect::<Vec<_>>(),
+            )),
+            true,
+        ),
+        (
+            "DT",
+            Arc::new(Date32Array::from_iter_values(
+                ids.iter().map(|&id| prune_types_day(id)),
+            )),
+            true,
+        ),
+        (
+            "TS_US",
+            Arc::new(TimestampMicrosecondArray::from_iter_values(
+                each(prune_types_second).map(|second| second * 1_000_000),
+            )),
+            true,
+        ),
+        (
+            "TS_NS",
+            Arc::new(TimestampNanosecondArray::from_iter_values(ids.iter().map(
+                |&id| {
+                    if id == 16 {
+                        TS_NS_ID16_NANOS
+                    } else {
+                        prune_types_second(id) * 1_000_000_000
+                    }
+                },
+            ))),
+            true,
+        ),
+        (
+            "TS_MS",
+            Arc::new(TimestampMillisecondArray::from_iter_values(
+                each(prune_types_second).map(|second| second * 1_000),
+            )),
+            true,
+        ),
+        (
+            "TS_S",
+            Arc::new(TimestampSecondArray::from_iter_values(each(
+                prune_types_second,
+            ))),
+            true,
+        ),
+        (
+            "D64",
+            Arc::new(Date64Array::from_iter_values(
+                ids.iter()
+                    .map(|&id| i64::from(prune_types_day(id)) * MILLIS_PER_DAY),
+            )),
+            true,
+        ),
+        (
+            "DEC256",
+            Arc::new(
+                Decimal256Array::from_iter_values(ids.iter().map(|&id| {
+                    i256::from_i128(if in_grp_a(id) {
+                        i128::from(id) * 10_000
+                    } else {
+                        i128::from(id - 8) * 100_000
+                    })
+                }))
+                .with_precision_and_scale(50, 2)
+                .expect("Decimal256(50,2)"),
+            ),
+            true,
+        ),
+        (
+            "TSTZ",
+            Arc::new(
+                TimestampMicrosecondArray::from_iter_values(
+                    each(prune_types_second).map(|second| second * 1_000_000),
+                )
+                .with_timezone("UTC"),
+            ),
+            true,
+        ),
+        ("F16", float16, true),
+        ("TAGS", prune_types_tags(ids), true),
+        ("QUIET", Arc::new(Int64Array::from(ids.to_vec())), true),
+        ("W", widened, true),
+        (
+            "NUL",
+            Arc::new(Int64Array::from_iter(
+                ids.iter().map(|&id| (id <= 4).then_some(id)),
+            )),
+            true,
+        ),
+        (
+            "Z",
+            Arc::new(Float64Array::from_iter_values(
+                ids.iter().map(|&id| if id <= 4 { 0.0 } else { id as f64 }),
+            )),
+            true,
+        ),
+        (
+            "N",
+            Arc::new(Float64Array::from_iter_values(
+                ids.iter()
+                    .map(|&id| if id >= 13 { f64::NAN } else { id as f64 }),
+            )),
+            true,
+        ),
+        (
+            "C",
+            Arc::new(Float64Array::from_iter_values(ids.iter().map(|_| 3.0))),
+            true,
+        ),
+    ])
+    .expect("prune_types batch")
+}
+
+fn prune_types_properties() -> WriterProperties {
+    WriterProperties::builder()
+        .set_max_row_group_row_count(Some(PRUNE_TYPES_ROWS_PER_GROUP))
+        .set_column_statistics_enabled(ColumnPath::from("QUIET"), EnabledStatistics::None)
+        .build()
+}
+
 fn write_delta_caveat_fixture() {
     let base = format!("{BASE_DIRECT}delta_caveat");
     write_parquet_fixture(&format!("{base}/file1.parquet"), discovery_id_batch(10));
@@ -717,8 +1073,32 @@ fn write_all_fixtures() {
         all_types_batch(),
     );
     put_fixture_object(
-        &format!("{BASE_DIRECT}annotated_types/file1.parquet"),
+        &format!("{BASE_DIRECT}{ANNOTATED_TYPES_FILE}"),
         annotated_types_bytes(),
+    );
+
+    put_fixture_object(
+        &format!("{BASE_DIRECT}{NAN_PROBE_FILE}"),
+        encode_parquet_with(
+            &nan_probe_batch(),
+            WriterProperties::builder()
+                .set_max_row_group_row_count(Some(NAN_PROBE_ROWS_PER_GROUP))
+                .build(),
+        ),
+    );
+    put_fixture_object(
+        &format!("{BASE_DIRECT}{PRUNE_TYPES_FILE_A}"),
+        encode_parquet_with(
+            &prune_types_batch(&(1..=8).collect::<Vec<_>>(), &DataType::Int32),
+            prune_types_properties(),
+        ),
+    );
+    put_fixture_object(
+        &format!("{BASE_DIRECT}{PRUNE_TYPES_FILE_B}"),
+        encode_parquet_with(
+            &prune_types_batch(&(9..=16).collect::<Vec<_>>(), &DataType::Int64),
+            prune_types_properties(),
+        ),
     );
 
     write_parquet_fixture(
@@ -854,6 +1234,49 @@ fn declared_columns(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<Strin
 fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
     setup();
 
+    let reader = SerializedFileReader::new(fixture_bytes("direct/events/file1.parquet"))
+        .expect("open committed raw-Parquet fixture file");
+    let schema_descr = reader.metadata().file_metadata().schema_descr();
+
+    let physical = |name: &str| {
+        schema_descr
+            .columns()
+            .iter()
+            .find(|c| c.name().eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("fixture must carry column {name}"))
+            .physical_type()
+    };
+
+    assert_eq!(physical("EVENT_ID").to_string(), "INT64");
+    assert_eq!(physical("NAME").to_string(), "BYTE_ARRAY");
+    assert_eq!(physical("EVENT_DATE").to_string(), "INT32");
+    assert_eq!(physical("EVENT_TS").to_string(), "INT64");
+    assert_eq!(physical("IS_ACTIVE").to_string(), "BOOLEAN");
+    assert_eq!(physical("SCORE").to_string(), "DOUBLE");
+
+    assert_nan_probe_shape(fixture_bytes(&format!("direct/{NAN_PROBE_FILE}")));
+    assert_prune_types_shape(
+        &fixture_metadata(&format!("direct/{PRUNE_TYPES_FILE_A}")),
+        "a",
+    );
+    assert_prune_types_shape(
+        &fixture_metadata(&format!("direct/{PRUNE_TYPES_FILE_B}")),
+        "b",
+    );
+
+    let annotated = fixture_metadata(&format!("direct/{ANNOTATED_TYPES_FILE}"));
+    let int96 = annotated
+        .row_group(0)
+        .column(leaf_index(&annotated, "c_int96"))
+        .statistics()
+        .expect("c_int96 must carry statistics");
+    assert!(
+        int96.min_bytes_opt().is_some() && int96.max_bytes_opt().is_some(),
+        "c_int96 must carry a min and a max, so case 60 exercises the INT96 column-order gate"
+    );
+}
+
+fn fixture_bytes(key: &str) -> Bytes {
     let StorageBackend::S3(storage) = local_stack_storage() else {
         panic!("local_stack_storage() must be S3")
     };
@@ -872,33 +1295,234 @@ fn raw_parquet_fixtures_are_physically_the_types_they_declare() {
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let bytes = rt.block_on(async {
+    rt.block_on(async {
         store
-            .get(&ObjectStorePath::from("direct/events/file1.parquet"))
+            .get(&ObjectStorePath::from(key))
             .await
-            .expect("GET direct/events/file1.parquet")
+            .unwrap_or_else(|e| panic!("GET {key}: {e}"))
             .bytes()
             .await
-            .expect("read direct/events/file1.parquet bytes")
-    });
-    let reader = SerializedFileReader::new(bytes).expect("open committed raw-Parquet fixture file");
-    let schema_descr = reader.metadata().file_metadata().schema_descr();
+            .unwrap_or_else(|e| panic!("read {key} bytes: {e}"))
+    })
+}
 
-    let physical = |name: &str| {
-        schema_descr
-            .columns()
-            .iter()
-            .find(|c| c.name().eq_ignore_ascii_case(name))
-            .unwrap_or_else(|| panic!("fixture must carry column {name}"))
-            .physical_type()
+fn fixture_metadata(key: &str) -> ParquetMetaData {
+    SerializedFileReader::new(fixture_bytes(key))
+        .unwrap_or_else(|e| panic!("open fixture {key}: {e}"))
+        .metadata()
+        .clone()
+}
+
+/// The leaf whose path starts at the top-level column `column`.
+fn leaf_index(metadata: &ParquetMetaData, column: &str) -> usize {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|leaf| leaf.path().parts()[0] == column)
+        .unwrap_or_else(|| panic!("fixture must carry column {column}"))
+}
+
+fn leaf_physical_type(metadata: &ParquetMetaData, column: &str) -> String {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .column(leaf_index(metadata, column))
+        .physical_type()
+        .to_string()
+}
+
+fn leaf_logical_type(metadata: &ParquetMetaData, column: &str) -> Option<LogicalType> {
+    metadata
+        .file_metadata()
+        .schema_descr()
+        .column(leaf_index(metadata, column))
+        .logical_type_ref()
+        .cloned()
+}
+
+fn chunk_statistics<'a>(
+    metadata: &'a ParquetMetaData,
+    row_group: usize,
+    column: &str,
+) -> &'a ParquetStatistics {
+    metadata
+        .row_group(row_group)
+        .column(leaf_index(metadata, column))
+        .statistics()
+        .unwrap_or_else(|| panic!("{column} row group {row_group} must carry statistics"))
+}
+
+fn assert_nan_probe_shape(bytes: Bytes) {
+    let metadata = SerializedFileReader::new(bytes.clone())
+        .expect("open nan_probe fixture")
+        .metadata()
+        .clone();
+    assert_eq!(metadata.num_row_groups(), 3, "nan_probe row groups");
+    assert_eq!(leaf_physical_type(&metadata, "ID"), "INT64");
+    assert_eq!(leaf_physical_type(&metadata, "D"), "DOUBLE");
+    let ParquetStatistics::Double(bounds) = chunk_statistics(&metadata, 0, "D") else {
+        panic!("nan_probe D must carry DOUBLE statistics")
     };
+    assert_eq!(
+        (bounds.min_opt(), bounds.max_opt()),
+        (Some(&1.0), Some(&4.0)),
+        "nan_probe row group 1 D bounds exclude both NaN rows"
+    );
 
-    assert_eq!(physical("EVENT_ID").to_string(), "INT64");
-    assert_eq!(physical("NAME").to_string(), "BYTE_ARRAY");
-    assert_eq!(physical("EVENT_DATE").to_string(), "INT32");
-    assert_eq!(physical("EVENT_TS").to_string(), "INT64");
-    assert_eq!(physical("IS_ACTIVE").to_string(), "BOOLEAN");
-    assert_eq!(physical("SCORE").to_string(), "DOUBLE");
+    let batch = ParquetRecordBatchReaderBuilder::try_new(bytes)
+        .expect("open nan_probe for reading")
+        .with_batch_size(18)
+        .build()
+        .expect("build nan_probe reader")
+        .next()
+        .expect("nan_probe holds a batch")
+        .expect("read nan_probe batch");
+    let doubles = batch
+        .column_by_name("D")
+        .and_then(|column| column.as_any().downcast_ref::<Float64Array>())
+        .expect("nan_probe D reads as Float64");
+    assert!(
+        doubles.value(4).is_nan() && doubles.value(4).is_sign_positive(),
+        "row 5 must hold a positive NaN"
+    );
+    assert!(
+        doubles.value(5).is_nan() && doubles.value(5).is_sign_negative(),
+        "row 6 must hold a negative NaN"
+    );
+}
+
+const PRUNE_TYPES_PHYSICAL: [(&str, &[&str]); 7] = [
+    (
+        "INT64",
+        &[
+            "ID", "U64", "AMOUNT", "TS_US", "TS_NS", "TS_MS", "TS_S", "TSTZ", "D64", "QUIET", "NUL",
+        ],
+    ),
+    (
+        "INT32",
+        &["I8", "I16", "I32", "U8", "U16", "U32", "DEC9", "DT"],
+    ),
+    ("FLOAT", &["F"]),
+    ("DOUBLE", &["D", "Z", "N", "C"]),
+    ("FIXED_LEN_BYTE_ARRAY", &["DEC30", "DEC256", "F16"]),
+    ("BYTE_ARRAY", &["S", "LS", "TAGS"]),
+    ("BOOLEAN", &["B"]),
+];
+
+fn assert_prune_types_shape(metadata: &ParquetMetaData, grp: &str) {
+    assert_eq!(metadata.num_row_groups(), 2, "grp={grp} row groups");
+    for row_group in metadata.row_groups() {
+        assert_eq!(
+            row_group.num_rows(),
+            PRUNE_TYPES_ROWS_PER_GROUP as i64,
+            "grp={grp} rows per group"
+        );
+    }
+    assert!(
+        metadata.file_metadata().column_orders().is_some(),
+        "grp={grp} must carry column_orders"
+    );
+
+    for (physical, columns) in PRUNE_TYPES_PHYSICAL {
+        for column in columns {
+            assert_eq!(
+                leaf_physical_type(metadata, column),
+                physical,
+                "grp={grp} {column}"
+            );
+        }
+    }
+    let widened = if grp == "a" { "INT32" } else { "INT64" };
+    assert_eq!(leaf_physical_type(metadata, "W"), widened, "grp={grp} W");
+
+    let unsigned = |bit_width| {
+        Some(LogicalType::Integer {
+            bit_width,
+            is_signed: false,
+        })
+    };
+    assert_eq!(leaf_logical_type(metadata, "U32"), unsigned(32));
+    assert_eq!(leaf_logical_type(metadata, "U64"), unsigned(64));
+    assert!(matches!(
+        leaf_logical_type(metadata, "TS_MS"),
+        Some(LogicalType::Timestamp {
+            unit: ParquetTimeUnit::MILLIS,
+            ..
+        })
+    ));
+    assert_eq!(
+        leaf_logical_type(metadata, "TS_S"),
+        None,
+        "parquet 58.3.0 stores a seconds timestamp without an annotation"
+    );
+    assert!(matches!(
+        leaf_logical_type(metadata, "TSTZ"),
+        Some(LogicalType::Timestamp {
+            is_adjusted_to_u_t_c: true,
+            ..
+        })
+    ));
+    assert_eq!(
+        leaf_logical_type(metadata, "F16"),
+        Some(LogicalType::Float16)
+    );
+    assert_eq!(leaf_logical_type(metadata, "D64"), None);
+
+    let quiet = leaf_index(metadata, "QUIET");
+    for (index, row_group) in metadata.row_groups().iter().enumerate() {
+        for (leaf, chunk) in row_group.columns().iter().enumerate() {
+            assert_eq!(
+                chunk.statistics().is_some(),
+                leaf != quiet,
+                "grp={grp} row group {index}: only QUIET carries no statistics ({})",
+                chunk.column_path()
+            );
+        }
+    }
+
+    let all_null_groups: &[usize] = if grp == "a" { &[1] } else { &[0, 1] };
+    for &row_group in all_null_groups {
+        let nul = chunk_statistics(metadata, row_group, "NUL");
+        assert_eq!(nul.null_count_opt(), Some(4), "grp={grp} NUL null count");
+        assert!(
+            nul.min_bytes_opt().is_none() && nul.max_bytes_opt().is_none(),
+            "grp={grp} all-NULL NUL row group {row_group} carries no bounds"
+        );
+    }
+
+    if grp == "a" {
+        let ParquetStatistics::Double(zero) = chunk_statistics(metadata, 0, "Z") else {
+            panic!("Z must carry DOUBLE statistics")
+        };
+        let (min, max) = (zero.min_opt().copied(), zero.max_opt().copied());
+        assert!(
+            min.is_some_and(|min| min == 0.0 && min.is_sign_negative())
+                && max.is_some_and(|max| max == 0.0 && max.is_sign_positive()),
+            "a +0.0 row group must carry the bounds [-0.0, +0.0], got [{min:?}, {max:?}]"
+        );
+
+        let tags = chunk_statistics(metadata, 0, "TAGS");
+        assert_eq!(
+            (tags.min_bytes_opt(), tags.max_bytes_opt()),
+            (Some(b"hello".as_slice()), Some(b"x".as_slice())),
+            "the first grp=a TAGS leaf bounds must exclude the rendered document"
+        );
+    } else {
+        let nan = chunk_statistics(metadata, 1, "N");
+        assert!(
+            nan.min_bytes_opt().is_none() && nan.max_bytes_opt().is_none(),
+            "an all-NaN N row group carries no bounds"
+        );
+
+        let long_s = "z".repeat(PRUNE_TYPES_LONG_S);
+        assert_ne!(
+            chunk_statistics(metadata, 1, "S").max_bytes_opt(),
+            Some(long_s.as_bytes()),
+            "the S max bound must be truncated"
+        );
+    }
 }
 
 #[test]
@@ -1921,5 +2545,486 @@ fn zero_matching_files_prune_to_zero_rows_without_error() {
         conn.query_row_count(&sql),
         0,
         "a query keeping no file must return zero rows"
+    );
+}
+
+/// Per filter: whether the positive-NaN row (ID 5) and the negative-NaN row (ID 6) return, as
+/// measured live against the scan (#393).
+const NAN_PROBE_OUTCOMES: [(&str, bool, bool); 8] = [
+    ("D < 2.5", false, true),
+    ("D <= 2.5", false, true),
+    ("D > 2.5", true, false),
+    ("D >= 2.5", true, false),
+    ("D = 2.5", false, false),
+    ("D <> 2.5", true, true),
+    ("D > 10", false, false),
+    ("D < -10", false, false),
+];
+
+/// Selects `ID` only, so the NaN emit path (#246) is not exercised.
+/// Scenario: The scan's comparison against a stored NaN is characterized live and pinned
+/// Scenario: Float pruning shares the stored-NaN exposure of the other float-bound pruning layers
+#[test]
+fn stored_nan_comparison_outcome_is_pinned() {
+    setup();
+    let mut conn = exa_conn();
+    let table = vs_table(VS_DIRECT, "NAN_PROBE");
+
+    let pushed = explain_virtual_sql(&mut conn, &format!("SELECT ID FROM {table} WHERE D > 2.5"));
+    assert!(
+        scan_filter(&pushed).is_some(),
+        "D > 2.5 must ride in the scan spec, so each outcome is the scan's own comparison: {pushed}"
+    );
+
+    let observed: Vec<(&str, bool, bool)> = NAN_PROBE_OUTCOMES
+        .iter()
+        .map(|&(filter, ..)| {
+            let rows = conn.query_columns(&format!("SELECT ID FROM {table} WHERE {filter}"));
+            let ids = sorted_int_column(&rows[0]);
+            (filter, ids.contains(&5), ids.contains(&6))
+        })
+        .collect();
+    assert_eq!(
+        observed, NAN_PROBE_OUTCOMES,
+        "(filter, positive NaN returned, negative NaN returned)"
+    );
+
+    let probe_file = NAN_PROBE_FILE
+        .rsplit_once('/')
+        .map_or(NAN_PROBE_FILE, |(_, file)| file);
+    for (filter, keeps_file) in [
+        ("D > 10", true),
+        ("D < -10", true),
+        ("D > 100", false),
+        ("D < -100", false),
+    ] {
+        let sql = format!("SELECT ID FROM {table} WHERE {filter}");
+        let pushed = explain_virtual_sql(&mut conn, &sql);
+        assert_eq!(
+            pushed.contains(probe_file),
+            keeps_file,
+            "{filter}: a row group in range keeps the file, so the scan's row-group pruning alone \
+             decides the NaN rows; no row group in range drops it: {pushed}"
+        );
+        if !keeps_file {
+            assert_eq!(conn.query_row_count(&sql), 0, "{filter}");
+        }
+    }
+}
+
+/// `SECOND` of a DATE is always 0, so each filter selects `s.ID <= 5`.
+const JOIN_LEG_FILTERS: [(&str, &[&str]); 3] = [
+    ("s.ID <= 5", &["grp=a/f1.parquet"]),
+    ("s.ID <= 5 AND SECOND(s.DT, 3) = 0", &["grp=a/f1.parquet"]),
+    (
+        "(s.ID <= 5 AND SECOND(s.DT, 3) = 0) OR s.ID <= 4",
+        &["grp=a/f1.parquet", "grp=b/f2.parquet"],
+    ),
+];
+
+/// Scenario: Statistics pruning composes with every consumer of the file list
+/// Scenario: Statistics pruning reads only the part of the filter the scan evaluates
+#[test]
+fn statistics_pruning_narrows_a_join_leg() {
+    setup();
+    let mut conn = exa_conn();
+    let prune_types = vs_table(VS_DIRECT, "PRUNE_TYPES");
+    let events = vs_table(VS_DIRECT, "EVENTS");
+
+    let ids = conn.query_columns(&format!("SELECT ID FROM {prune_types}"));
+    let named = conn.query_columns(&format!("SELECT EVENT_ID, NAME FROM {events}"));
+    let names: Vec<(i64, String)> = named[0]
+        .iter()
+        .zip(&named[1])
+        .map(|(id, name)| (parse_int(id), value_to_string(name)))
+        .collect();
+    let mut expected: Vec<(i64, String)> = sorted_int_column(&ids[0])
+        .into_iter()
+        .filter(|&id| id <= 5)
+        .flat_map(|id| {
+            names
+                .iter()
+                .filter(move |(event_id, _)| *event_id == id)
+                .cloned()
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        expected.len(),
+        5,
+        "PRUNE_TYPES IDs 1 to 5 each match one event"
+    );
+
+    for (filter, files) in JOIN_LEG_FILTERS {
+        let sql = format!(
+            "SELECT s.ID, e.NAME FROM {prune_types} s JOIN {events} e ON s.ID = e.EVENT_ID \
+             WHERE {filter}"
+        );
+        let pushed = explain_virtual_sql(&mut conn, &sql);
+        let named_files: Vec<&str> = ["grp=a/f1.parquet", "grp=b/f2.parquet"]
+            .into_iter()
+            .filter(|file| pushed.contains(file))
+            .collect();
+        assert_eq!(
+            named_files, files,
+            "{filter}: the PRUNE_TYPES leg's files: {pushed}"
+        );
+        if filter.contains("SECOND") {
+            let outer_where = pushed
+                .rsplit_once(r#") AS "LHS_T1""#)
+                .and_then(|(_, tail)| tail.split_once(" WHERE "))
+                .map(|(_, condition)| condition);
+            assert!(
+                outer_where.is_some_and(|condition| condition.contains("SECOND(")),
+                "{filter}: the N-scan wrapper must apply SECOND in its outer WHERE: {pushed}"
+            );
+        }
+
+        let rows = conn.query_columns(&sql);
+        let mut actual: Vec<(i64, String)> = rows[0]
+            .iter()
+            .zip(&rows[1])
+            .map(|(id, name)| (parse_int(id), value_to_string(name)))
+            .collect();
+        actual.sort();
+        assert_eq!(actual, expected, "{filter}");
+    }
+}
+
+/// The DataFusion filter the pushed scan spec carries; `None` for `"filter":null`.
+fn scan_filter(pushed_sql: &str) -> Option<String> {
+    let (_, rest) = pushed_sql.split_once("\"filter\":")?;
+    serde_json::Deserializer::from_str(rest)
+        .into_iter::<Json>()
+        .next()?
+        .ok()?
+        .as_str()
+        .map(str::to_string)
+}
+
+#[derive(Clone, Copy)]
+enum PushedFilter {
+    InScan,
+    InScanWithNot,
+    /// The scan spec carries no filter, and the adapter applies it in its outer `WHERE`.
+    SelfApplied,
+}
+
+impl PushedFilter {
+    fn mismatch(self, pushed_sql: &str) -> Option<String> {
+        match (self, scan_filter(pushed_sql)) {
+            (Self::SelfApplied, None) => None,
+            (Self::SelfApplied, Some(filter)) => Some(format!(
+                "the scan spec carries {filter:?}, planned self-applied"
+            )),
+            (_, None) => Some("the scan spec carries no filter".to_string()),
+            (Self::InScanWithNot, Some(filter)) if !filter.to_uppercase().contains("NOT") => {
+                Some(format!("the scan filter {filter:?} carries no NOT"))
+            }
+            _ => None,
+        }
+    }
+}
+
+struct PruneCase {
+    number: u8,
+    vs: &'static str,
+    table: &'static str,
+    clause: String,
+    files: &'static [&'static str],
+    ids: Vec<i64>,
+    pushed: PushedFilter,
+    /// The issue tracking an inexact scan comparison whose rows the case pins.
+    issue: Option<&'static str>,
+}
+
+impl PruneCase {
+    fn new(
+        number: u8,
+        clause: impl Into<String>,
+        files: &'static [&'static str],
+        ids: Vec<i64>,
+    ) -> Self {
+        Self {
+            number,
+            vs: VS_DIRECT,
+            table: "PRUNE_TYPES",
+            clause: clause.into(),
+            files,
+            ids,
+            pushed: PushedFilter::InScan,
+            issue: None,
+        }
+    }
+
+    fn tracked_by(self, issue: &'static str) -> Self {
+        Self {
+            issue: Some(issue),
+            ..self
+        }
+    }
+
+    fn carrying_not(self) -> Self {
+        Self {
+            pushed: PushedFilter::InScanWithNot,
+            ..self
+        }
+    }
+
+    fn self_applied(self) -> Self {
+        Self {
+            pushed: PushedFilter::SelfApplied,
+            ..self
+        }
+    }
+
+    fn on(self, vs: &'static str, table: &'static str) -> Self {
+        Self { vs, table, ..self }
+    }
+
+    fn sql(&self) -> String {
+        format!(
+            "SELECT ID FROM {} WHERE {} ORDER BY ID",
+            vs_table(self.vs, self.table),
+            self.clause
+        )
+    }
+
+    fn mismatch(&self, conn: &mut ExaConn) -> Option<String> {
+        let sql = self.sql();
+        let pushed = explain_virtual_sql(conn, &sql);
+        let mut problems: Vec<String> = Vec::new();
+        let named = fixture_files_named_by(&pushed);
+        let planned: BTreeSet<&str> = self.files.iter().copied().collect();
+        if named != planned {
+            problems.push(format!(
+                "the plan names files {named:?}, planned {planned:?}"
+            ));
+        }
+        // A plan of zero files takes the empty-result route, which carries no scan spec.
+        if !self.files.is_empty() {
+            problems.extend(self.pushed.mismatch(&pushed));
+        }
+        match query_ids(conn, &sql) {
+            Ok(ids) if ids == self.ids => {}
+            Ok(ids) => problems.push(format!(
+                "returned IDs {ids:?}, planned {:?}{}",
+                self.ids,
+                self.issue.map_or(String::new(), |issue| format!(
+                    " (the pinned rows of an inexact scan comparison tracked by {issue})"
+                ))
+            )),
+            Err(error) => problems.push(format!("query failed: {error}")),
+        }
+        (!problems.is_empty()).then(|| {
+            format!(
+                "case {} ({}.{} WHERE {}): {} [pushed: {pushed}]",
+                self.number,
+                self.vs,
+                self.table,
+                self.clause,
+                problems.join("; ")
+            )
+        })
+    }
+}
+
+/// Which `prune_types/` and `annotated_types/` fixture files the pushed SQL's file list names.
+/// A path is quoted both in a distributed file entry and in a one-file inline list.
+fn fixture_files_named_by(pushed_sql: &str) -> BTreeSet<&'static str> {
+    [PRUNE_TYPES_FILE_A, PRUNE_TYPES_FILE_B, ANNOTATED_TYPES_FILE]
+        .into_iter()
+        .filter(|file| {
+            let (table, path) = file
+                .split_once('/')
+                .expect("a fixture file lies under its table directory");
+            pushed_sql.contains(&format!("/{table}\""))
+                && pushed_sql.contains(&format!("\"{path}\""))
+        })
+        .collect()
+}
+
+fn query_ids(conn: &mut ExaConn, sql: &str) -> Result<Vec<i64>, String> {
+    let resp = conn.try_execute(sql);
+    if resp["status"].as_str() != Some("ok") {
+        return Err(resp["exception"]["text"]
+            .as_str()
+            .unwrap_or("no exception text")
+            .to_string());
+    }
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    Ok(sorted_int_column(&conn.fetch_result_columns(result_set)[0]))
+}
+
+fn ids<const N: usize>(ranges: [std::ops::RangeInclusive<i64>; N]) -> Vec<i64> {
+    ranges.into_iter().flatten().collect()
+}
+
+/// IDs follow from the `prune_types/` fixture table and were confirmed live against the scan
+/// before statistics pruning existed (plan Task 1.5).
+fn prune_cases() -> Vec<PruneCase> {
+    const A: &[&str] = &[PRUNE_TYPES_FILE_A];
+    const B: &[&str] = &[PRUNE_TYPES_FILE_B];
+    const BOTH: &[&str] = &[PRUNE_TYPES_FILE_A, PRUNE_TYPES_FILE_B];
+    const NO_FILE: &[&str] = &[];
+    let long_s = "z".repeat(PRUNE_TYPES_LONG_S);
+    vec![
+        PruneCase::new(1, "ID <= 5", A, ids([1..=5])),
+        PruneCase::new(2, "ID < 9", A, ids([1..=8])),
+        PruneCase::new(3, "ID > 8", B, ids([9..=16])),
+        PruneCase::new(4, "ID >= 13", B, ids([13..=16])),
+        PruneCase::new(5, "ID = 10", B, ids([10..=10])),
+        PruneCase::new(6, "ID <> 10", BOTH, ids([1..=9, 11..=16])),
+        PruneCase::new(7, "ID IN (2, 3)", A, ids([2..=3])),
+        PruneCase::new(8, "ID NOT IN (2, 3)", BOTH, ids([1..=1, 4..=16])).carrying_not(),
+        PruneCase::new(9, "ID BETWEEN 6 AND 7", A, ids([6..=7])),
+        PruneCase::new(10, "NOT (ID <= 8)", B, ids([9..=16])).carrying_not(),
+        PruneCase::new(11, "ID > 100", NO_FILE, ids([])),
+        PruneCase::new(12, "ID > 100 OR ID * 2 = 6", BOTH, ids([3..=3])),
+        PruneCase::new(13, "ID <= 12 AND S >= 'b'", B, ids([9..=12])),
+        PruneCase::new(14, "GRP = 'a' OR ID > 100", A, ids([1..=8])),
+        PruneCase::new(15, "I8 < -4", A, ids([1..=4])),
+        PruneCase::new(16, "I8 >= 0", B, ids([9..=16])),
+        PruneCase::new(17, "I8 IS NULL", NO_FILE, ids([])),
+        PruneCase::new(18, "I16 = -3000", A, ids([6..=6])),
+        PruneCase::new(19, "I32 > 0", B, ids([10..=16])),
+        PruneCase::new(20, "U8 >= 248", B, ids([9..=16])),
+        PruneCase::new(21, "U16 <= 65527", A, ids([1..=8])),
+        PruneCase::new(22, "U32 > 3000000000", B, ids([9..=16])),
+        PruneCase::new(23, "U64 > 10000000000000000000", B, ids([9..=16])),
+        PruneCase::new(24, "F < 4.5", A, ids([1..=4])),
+        PruneCase::new(25, "F = 16777216", B, ids([16..=16])),
+        PruneCase::new(26, "D = 2.5", A, ids([5..=5])),
+        PruneCase::new(27, "D = 2", A, ids([4..=4])),
+        PruneCase::new(28, "D = CAST(2 AS DOUBLE)", A, ids([4..=4])),
+        PruneCase::new(29, "D IN (6.0, 7.0)", B, ids([12..=12, 14..=14])),
+        PruneCase::new(30, "D <= 4.0", A, ids([1..=8])),
+        PruneCase::new(31, "D < 4.0", A, ids([1..=7])),
+        PruneCase::new(32, "D > 4.25", B, ids([9..=16])),
+        PruneCase::new(33, "D >= 4.25", B, ids([9..=16])),
+        PruneCase::new(34, "D > 4.3", B, ids([9..=16])),
+        PruneCase::new(35, "NOT (D < 4.25)", BOTH, ids([9..=16])).carrying_not(),
+        PruneCase::new(36, "D NOT IN (1.0, 1.5)", BOTH, ids([1..=1, 4..=16])).carrying_not(),
+        PruneCase::new(37, "AMOUNT <= 80", A, ids([1..=8])),
+        PruneCase::new(38, "AMOUNT > 100", B, ids([11..=16])),
+        PruneCase::new(39, "AMOUNT < 5", NO_FILE, ids([])),
+        PruneCase::new(40, "DEC9 >= 13", B, ids([9..=16])),
+        PruneCase::new(41, "DEC30 < 0", A, ids([1..=8])),
+        PruneCase::new(42, "S < 'b'", A, ids([1..=8])),
+        PruneCase::new(43, format!("S = '{long_s}'"), B, ids([16..=16])),
+        PruneCase::new(44, "LS IN ('c3', 'c7')", A, ids([3..=3, 7..=7])),
+        PruneCase::new(45, "LS >= 'd'", B, ids([9..=16])),
+        PruneCase::new(46, "B = TRUE", B, ids([9..=16])),
+        PruneCase::new(47, "B <> TRUE", A, ids([1..=8])),
+        PruneCase::new(48, "DT < DATE '2025-01-01'", A, ids([1..=8])),
+        PruneCase::new(
+            49,
+            "DT BETWEEN DATE '2025-01-02' AND DATE '2025-01-03'",
+            B,
+            ids([10..=11]),
+        ),
+        PruneCase::new(
+            50,
+            "TS_US >= TIMESTAMP '2025-01-01 00:00:00'",
+            B,
+            ids([9..=16]),
+        ),
+        PruneCase::new(
+            51,
+            "TS_NS < TIMESTAMP '2025-01-01 00:00:00'",
+            A,
+            ids([1..=8]),
+        ),
+        PruneCase::new(
+            52,
+            "TS_MS >= TIMESTAMP '2025-01-01 00:00:00'",
+            B,
+            ids([9..=16]),
+        ),
+        PruneCase::new(
+            53,
+            "TS_S < TIMESTAMP '2025-01-01 00:00:00'",
+            A,
+            ids([1..=8]),
+        ),
+        PruneCase::new(54, "D64 < '2025-01-01'", BOTH, ids([1..=8])),
+        PruneCase::new(55, "DEC256 < '5'", BOTH, ids([1..=4, 9..=12])),
+        PruneCase::new(
+            56,
+            "TSTZ < TIMESTAMP '2025-01-01 00:00:00'",
+            BOTH,
+            ids([1..=8]),
+        ),
+        PruneCase::new(57, "F16 < '5'", BOTH, ids([1..=4, 9..=16])),
+        PruneCase::new(58, r#"TAGS = '["hello","world"]'"#, BOTH, ids([1..=1])),
+        PruneCase::new(59, "QUIET <= 5", BOTH, ids([1..=5])),
+        PruneCase::new(
+            60,
+            "C_INT96 > TIMESTAMP '2030-01-01 00:00:00'",
+            &[ANNOTATED_TYPES_FILE],
+            ids([]),
+        )
+        .on(VS_DIRECT, "ANNOTATED_TYPES"),
+        PruneCase::new(61, "W > 4000000000", B, ids([9..=16])),
+        PruneCase::new(62, "W <= 8", A, ids([1..=8])),
+        PruneCase::new(63, "NUL IS NOT NULL", A, ids([1..=4])),
+        PruneCase::new(64, "NUL IS NULL", BOTH, ids([5..=16])),
+        PruneCase::new(65, "NUL > 2", A, ids([3..=4])),
+        PruneCase::new(66, "Z = 0", A, ids([1..=4])),
+        PruneCase::new(67, "Z < 0", A, ids([])),
+        PruneCase::new(68, "N = 0.5", B, ids([])),
+        PruneCase::new(69, "C <> 3.0", BOTH, ids([])),
+        PruneCase::new(70, "AMOUNT = 1234567.89", BOTH, ids([])).tracked_by("#TBD"),
+        PruneCase::new(
+            71,
+            "TS_NS = TIMESTAMP '2025-06-01 00:00:00.123456789'",
+            BOTH,
+            ids([]),
+        )
+        .tracked_by("#461"),
+        PruneCase::new(72, "F <= 16777217", BOTH, ids([1..=16])),
+        PruneCase::new(
+            73,
+            "TS_MS = TIMESTAMP '2025-01-01 00:00:09.000500'",
+            BOTH,
+            ids([9..=9]),
+        )
+        .tracked_by("#461"),
+        PruneCase::new(74, "ID <= 5 AND SECOND(DT, 3) = 0", BOTH, ids([1..=5])).self_applied(),
+        PruneCase::new(75, "ID >= 9", B, ids([9..=16])).on(VS_DIRECT_NARROW, "PRUNE_TYPES"),
+        PruneCase::new(76, "ID <= 8", BOTH, ids([1..=8])).on(VS_DIRECT_NARROW, "PRUNE_TYPES"),
+    ]
+}
+
+/// Selects `ID` only, so the NaN emit path (#246) is not exercised.
+/// Scenario: A footer whose row-group bounds exclude the filter drops the file
+/// Scenario: Row-group statistics evaluate the filter under three-valued logic
+/// Scenario: Integer, float, decimal, string, boolean, date, and timestamp columns prune on their footer bounds
+/// Scenario: A statistic whose ordering the Parquet specification leaves undefined keeps the file
+/// Scenario: A column the footer statistics cannot describe keeps the file
+/// Scenario: Columns outside the prunable types keep both files end to end
+/// Scenario: A float column prunes ordering and equality comparisons on its bounds alone
+/// Scenario: A float bound or literal is widened or rejected so it never drops a matching row
+/// Scenario: A literal the scan compares inexactly keeps every file, and the scan's rows for it are pinned live
+/// Scenario: Statistics pruning composes with every consumer of the file list
+/// Scenario: Statistics pruning reads only the part of the filter the scan evaluates
+/// Scenario: A predicate on partition columns prunes files before their footers are read
+/// Scenario: The kept files' footers are read at plan time and the resulting cost is stated
+#[test]
+fn footer_statistics_prune_every_supported_type() {
+    setup();
+    let mut conn = exa_conn();
+
+    let cases = prune_cases();
+    let mismatches: Vec<String> = cases
+        .iter()
+        .filter_map(|case| case.mismatch(&mut conn))
+        .collect();
+    assert!(
+        mismatches.is_empty(),
+        "{} of {} cases mismatch:\n{}",
+        mismatches.len(),
+        cases.len(),
+        mismatches.join("\n")
     );
 }

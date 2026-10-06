@@ -7,6 +7,11 @@ use super::super::test_support::{
 use super::*;
 use crate::scan::spec::{StorageBackend, StorageProps};
 
+const UNFILTERED: ScanFilters<'static> = ScanFilters {
+    pruning: None,
+    scan_evaluated: None,
+};
+
 /// Scenario: a Unity Catalog table's identity survives the round trip from the involved table
 #[tokio::test]
 async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
@@ -35,7 +40,7 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
     .expect("a Unity Catalog session is built without contacting the catalog");
 
     let err = resolver
-        .resolve("cat.sch.orders", None, &[])
+        .resolve("cat.sch.orders", UNFILTERED, &[])
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
 
@@ -78,7 +83,7 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
     assert!(glue.operations().is_empty());
 
     let err = resolver
-        .resolve("sales.orders", None, &[])
+        .resolve("sales.orders", UNFILTERED, &[])
         .await
         .expect_err("a dropped Glue table cannot be planned");
 
@@ -199,7 +204,7 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
     .expect("an Iceberg session resolves against a reachable catalog");
 
     let resolved = resolver
-        .resolve("db.t", None, &[])
+        .resolve("db.t", UNFILTERED, &[])
         .await
         .expect("a snapshotless Iceberg table resolves an empty scan");
 
@@ -238,11 +243,11 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     .expect("an Iceberg session resolves against a reachable catalog");
 
     resolver
-        .resolve("db.t", None, &[])
+        .resolve("db.t", UNFILTERED, &[])
         .await
         .expect("first table");
     resolver
-        .resolve("db.u", None, &[])
+        .resolve("db.u", UNFILTERED, &[])
         .await
         .expect("second table");
 
@@ -286,11 +291,11 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
     .expect("a Unity Catalog session is built without contacting the catalog");
 
     let err1 = resolver
-        .resolve("cat.sch.orders", None, &[])
+        .resolve("cat.sch.orders", UNFILTERED, &[])
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
     let err2 = resolver
-        .resolve("cat.sch.customers", None, &[])
+        .resolve("cat.sch.customers", UNFILTERED, &[])
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
     assert!(err1.to_string().contains("cat.sch.orders"));
@@ -359,11 +364,11 @@ async fn one_session_or_store_per_request_serves_every_leg() {
     );
 
     resolver
-        .resolve("events", None, &[])
+        .resolve("events", UNFILTERED, &[])
         .await
         .expect("a directory with no data file resolves an empty scan");
     resolver
-        .resolve("event_labels", None, &[])
+        .resolve("event_labels", UNFILTERED, &[])
         .await
         .expect("a directory with no data file resolves an empty scan");
 
@@ -444,7 +449,7 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
     .expect("a direct-storage store is built from the CONNECTION alone");
 
     let scan = resolver
-        .resolve("events", None, &[])
+        .resolve("events", UNFILTERED, &[])
         .await
         .expect("a directory with no data file resolves an empty scan");
 
@@ -528,7 +533,16 @@ async fn resolve_events_under_hive_partitioning(
         &serde_json::json!({ "HIVE_PARTITIONING": hive_partitioning }),
     )
     .await?;
-    resolver.resolve("events", Some(filter), &[]).await
+    resolver
+        .resolve(
+            "events",
+            ScanFilters {
+                pruning: Some(filter),
+                scan_evaluated: Some(filter),
+            },
+            &[],
+        )
+        .await
 }
 
 #[tokio::test]

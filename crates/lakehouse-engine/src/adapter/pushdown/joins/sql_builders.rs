@@ -20,10 +20,10 @@ use super::planning::{
     involved_table_columns,
 };
 use super::rendering::{
-    conjoin_filters, cross_leg_residual_filter, declined_only, extract_join_projection,
-    join_col_types, leg_local_filter, projection_item_select_sql, referenced_clause_values,
+    ScreenedLegFilter, conjoin_filters, cross_leg_residual_filter, declined_only,
+    extract_join_projection, join_col_types, projection_item_select_sql, referenced_clause_values,
     referenced_leg_columns, render_df_filter_qualified, render_expression_qualified,
-    renderable_only, type_screened_leg_filter,
+    renderable_only, screened_leg_filter,
 };
 
 #[derive(Debug, Clone, PartialEq)]
@@ -276,11 +276,11 @@ fn outer_wrapper_clauses(
 /// owned by [`JoinLegs`], so self-join occurrences stay distinct legs (#361). All references
 /// render leg-qualified (`"LHS_T{i}"."COL"`), so shared column or table names are safe.
 ///
-/// Each leg receives only leg-local conjuncts passing [`renderable_only`] and
-/// [`type_screened_leg_filter`] (which also rewrites them). Everything else (cross-leg,
-/// OR-spanning, untagged, declined, type-declined, unattachable conditions) goes to the
-/// outer WHERE, each parenthesized; nothing is omitted. The fan-out loop must run before the
-/// residual is assembled, since the type screen can hand conjuncts back.
+/// Each leg receives only the leg-local conjuncts [`screened_leg_filter`] passes (it also
+/// rewrites them). Everything else (cross-leg, OR-spanning, untagged, declined, type-declined,
+/// unattachable conditions) goes to the outer WHERE, each parenthesized; nothing is omitted.
+/// The fan-out loop must run before the residual is assembled, since the type screen can hand
+/// conjuncts back.
 ///
 /// `Err` (hard, no native re-plan) only when the wrapper cannot be built, including a
 /// residual neither dialect renders: a predicate applicable nowhere must fail the query.
@@ -340,13 +340,13 @@ pub(in super::super) fn build_n_scan_join_sql(
     for (i, side) in sides.iter().enumerate() {
         let narrowed =
             referenced_leg_columns(pushdown_req, &all_conditions, &legs, i, &cols_per_side[i]);
-        let (side_filter, side_declined) = match leg_eligible
-            .as_ref()
-            .and_then(|f| leg_local_filter(f, &legs, i))
-        {
-            Some(side_local) => type_screened_leg_filter(&side_local, &cols_per_side[i]),
-            None => (None, None),
-        };
+        let ScreenedLegFilter {
+            scan: side_filter,
+            type_declined: side_declined,
+            ..
+        } = where_filter
+            .map(|filter| screened_leg_filter(filter, &legs, i, &cols_per_side[i]))
+            .unwrap_or_default();
         // Disjoint by attribution, so no conjunct is double-applied.
         type_declined = conjoin_filters(type_declined, side_declined);
         fan_outs.push(build_side_fan_out_sql(

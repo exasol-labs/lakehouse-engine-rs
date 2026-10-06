@@ -2,7 +2,7 @@ use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry, StorageBacken
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
-use super::super::scan_resolution::TableScanResolver;
+use super::super::scan_resolution::{ScanFilters, TableScanResolver};
 use super::super::support::{column_types, extract_limit, extract_offset};
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use super::super::{RefusedColumn, ResolvedScan};
@@ -216,17 +216,19 @@ pub(super) fn select_broadcast_sides(
 }
 
 /// All sides share one per-request `resolver`, so a join costs no more catalog auth
-/// round-trips than a single scan. `filter_json` is the leg-local sub-predicate
+/// round-trips than a single scan. `filters.pruning` is the leg-local sub-predicate
 /// ([`super::rendering::leg_local_filter`]); pruning by it is sound for an inner join.
+/// `filters.scan_evaluated` holds only the leg-local conjuncts the leg's own scan evaluates
+/// ([`super::rendering::screened_leg_filter`]).
 pub(super) async fn resolve_one_join_side(
     table_name: &str,
     table_identifier: &str,
     resolver: &TableScanResolver<'_>,
-    filter_json: Option<&Json>,
+    filters: ScanFilters<'_>,
     declared_columns: &[(String, String)],
 ) -> Result<ResolvedJoinSide, UdfError> {
     let resolved = resolver
-        .resolve(table_identifier, filter_json, declared_columns)
+        .resolve(table_identifier, filters, declared_columns)
         .await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),

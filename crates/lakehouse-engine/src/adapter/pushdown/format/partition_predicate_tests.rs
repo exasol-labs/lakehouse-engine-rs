@@ -541,3 +541,580 @@ fn an_empty_partition_value_is_null_as_the_scan_reads_it() {
         );
     }
 }
+
+/// One column of one row group: its `[min, max]` bounds, its null count over `rows`, and whether
+/// a NaN row may exist.
+struct ColumnRange {
+    bounds: Option<(ScalarValue, ScalarValue)>,
+    null_count: Option<u64>,
+    rows: u64,
+    nan_possible: bool,
+}
+
+/// A row group as the footer view describes it: partition values first, then column ranges.
+#[derive(Default)]
+struct RangeFacts {
+    partitions: FileValues,
+    ranges: BTreeMap<String, ColumnRange>,
+}
+
+impl ColumnFacts for RangeFacts {
+    fn orderings(&self, column: &str, literal: &ScalarValue) -> Option<Orderings> {
+        if is_partition_key(&self.partitions, column) {
+            return self.partitions.orderings(column, literal);
+        }
+        let range = self.ranges.get(column)?;
+        if range.null_count == Some(range.rows) {
+            return Some(Orderings::NONE);
+        }
+        let (min, max) = range.bounds.as_ref()?;
+        Orderings::within(min, max, literal).map(|orderings| {
+            if range.nan_possible {
+                orderings.with_nan_row()
+            } else {
+                orderings
+            }
+        })
+    }
+
+    fn nulls(&self, column: &str) -> Option<Nulls> {
+        if is_partition_key(&self.partitions, column) {
+            return self.partitions.nulls(column);
+        }
+        let range = self.ranges.get(column)?;
+        Some(Nulls::counted(range.null_count?, range.rows))
+    }
+}
+
+fn int64(value: i64) -> ScalarValue {
+    ScalarValue::Int64(Some(value))
+}
+
+fn float64(value: f64) -> ScalarValue {
+    ScalarValue::Float64(Some(value))
+}
+
+/// A float row group may always hold a NaN row, which its bounds exclude.
+fn bounded(column: &str, min: ScalarValue, max: ScalarValue) -> RangeFacts {
+    let nan_possible = matches!(min, ScalarValue::Float64(_));
+    RangeFacts {
+        ranges: BTreeMap::from([(
+            column.to_string(),
+            ColumnRange {
+                bounds: Some((min, max)),
+                null_count: Some(0),
+                rows: 4,
+                nan_possible,
+            },
+        )]),
+        ..RangeFacts::default()
+    }
+}
+
+fn nulls_only(column: &str, null_count: Option<u64>) -> RangeFacts {
+    RangeFacts {
+        ranges: BTreeMap::from([(
+            column.to_string(),
+            ColumnRange {
+                bounds: (null_count != Some(4)).then(|| (int64(1), int64(4))),
+                null_count,
+                rows: 4,
+                nan_possible: false,
+            },
+        )]),
+        ..RangeFacts::default()
+    }
+}
+
+fn footer_typed(columns: &[(&str, DataType)]) -> Vec<(String, DataType)> {
+    columns
+        .iter()
+        .map(|(name, data_type)| (name.to_string(), data_type.clone()))
+        .collect()
+}
+
+fn footer_keeps(filter: &Json, columns: &[(&str, DataType)], facts: &RangeFacts) -> bool {
+    PartitionPredicate::for_footer_statistics(Some(filter), &footer_typed(columns)).keeps(facts)
+}
+
+fn double(value: &str) -> Json {
+    literal("literal_double", json!(value))
+}
+
+/// Scenario: Row-group statistics evaluate the filter under three-valued logic
+#[test]
+fn range_facts_evaluate_under_three_valued_logic() {
+    let id = [("ID", DataType::Int64)];
+    let ranges = [
+        ("below [1, 4]", bounded("ID", int64(1), int64(4))),
+        ("above [6, 9]", bounded("ID", int64(6), int64(9))),
+        ("straddling [3, 7]", bounded("ID", int64(3), int64(7))),
+        ("exactly [5, 5]", bounded("ID", int64(5), int64(5))),
+    ];
+    let five = || number("5");
+    let cases: Vec<(&str, Json, [bool; 4])> = vec![
+        (
+            "=",
+            compare("predicate_equal", column("ID"), five()),
+            [false, false, true, true],
+        ),
+        (
+            "<>",
+            compare("predicate_notequal", column("ID"), five()),
+            [true, true, true, false],
+        ),
+        (
+            "<",
+            compare("predicate_less", column("ID"), five()),
+            [true, false, true, false],
+        ),
+        (
+            "<=",
+            compare("predicate_lessequal", column("ID"), five()),
+            [true, false, true, true],
+        ),
+        (
+            ">",
+            compare("predicate_greater", column("ID"), five()),
+            [false, true, true, false],
+        ),
+        (
+            ">=",
+            compare("predicate_greaterequal", column("ID"), five()),
+            [false, true, true, true],
+        ),
+        (
+            "> with the column on the right",
+            compare("predicate_greater", five(), column("ID")),
+            [true, false, true, false],
+        ),
+        (
+            "NOT",
+            not(compare("predicate_less", column("ID"), five())),
+            [false, true, true, true],
+        ),
+        (
+            "OR with an Opaque branch",
+            or(vec![
+                compare("predicate_greater", column("ID"), number("100")),
+                json!({"type": "predicate_equal",
+                       "left": {"type": "function_scalar", "name": "MULT",
+                                "arguments": [column("ID"), number("2")]},
+                       "right": number("6")}),
+            ]),
+            [true, true, true, true],
+        ),
+        (
+            "IN",
+            in_list("ID", vec![number("2"), number("8")]),
+            [true, true, false, false],
+        ),
+        (
+            "BETWEEN",
+            between("ID", number("6"), number("7")),
+            [false, true, true, false],
+        ),
+    ];
+    for (label, filter, expected) in cases {
+        let kept: Vec<bool> = ranges
+            .iter()
+            .map(|(_, facts)| footer_keeps(&filter, &id, facts))
+            .collect();
+        assert_eq!(
+            kept,
+            expected,
+            "{label}: kept per row group {:?}",
+            ranges.map(|(name, _)| name)
+        );
+    }
+
+    let null_counts = [Some(0), Some(2), Some(4), None];
+    for (label, filter, expected) in [
+        ("IS NULL", is_null("ID"), [false, true, true, true]),
+        ("IS NOT NULL", is_not_null("ID"), [true, true, false, true]),
+    ] {
+        let kept: Vec<bool> = null_counts
+            .iter()
+            .map(|&null_count| footer_keeps(&filter, &id, &nulls_only("ID", null_count)))
+            .collect();
+        assert_eq!(
+            kept, expected,
+            "{label}: kept per null count of 4 rows {null_counts:?}"
+        );
+    }
+
+    let all_null = nulls_only("ID", Some(4));
+    for (label, filter) in [
+        ("=", compare("predicate_equal", column("ID"), five())),
+        ("<>", compare("predicate_notequal", column("ID"), five())),
+        (
+            "NOT =",
+            not(compare("predicate_equal", column("ID"), five())),
+        ),
+    ] {
+        assert!(
+            !footer_keeps(&filter, &id, &all_null),
+            "{label}: an all-NULL row group reaches only NULL"
+        );
+    }
+
+    let partitioned = |grp: &str, min: i64, max: i64| RangeFacts {
+        partitions: file_with("grp", Some(grp)),
+        ..bounded("ID", int64(min), int64(max))
+    };
+    let grp_or_id = or(vec![
+        equal("GRP", "a"),
+        compare("predicate_greater", column("ID"), number("100")),
+    ]);
+    let grp_and_id = [("ID", DataType::Int64), ("grp", DataType::Utf8)];
+    assert_eq!(
+        [
+            footer_keeps(&grp_or_id, &grp_and_id, &partitioned("a", 1, 8)),
+            footer_keeps(&grp_or_id, &grp_and_id, &partitioned("b", 9, 16)),
+        ],
+        [true, false],
+        "a partition value and a data column under OR prune on both"
+    );
+
+    let boolean = [("B", DataType::Boolean)];
+    let bools = |min: bool, max: bool| RangeFacts {
+        ranges: BTreeMap::from([(
+            "B".to_string(),
+            ColumnRange {
+                bounds: Some((
+                    ScalarValue::Boolean(Some(min)),
+                    ScalarValue::Boolean(Some(max)),
+                )),
+                null_count: Some(0),
+                rows: 4,
+                nan_possible: false,
+            },
+        )]),
+        ..RangeFacts::default()
+    };
+    let b_true = || literal("literal_bool", json!(true));
+    assert!(!footer_keeps(
+        &compare("predicate_equal", column("B"), b_true()),
+        &boolean,
+        &bools(false, false)
+    ));
+    assert!(!footer_keeps(
+        &compare("predicate_notequal", column("B"), b_true()),
+        &boolean,
+        &bools(true, true)
+    ));
+    assert!(footer_keeps(
+        &compare("predicate_equal", column("B"), b_true()),
+        &boolean,
+        &bools(false, true)
+    ));
+}
+
+/// Scenario: A float column prunes ordering and equality comparisons on its bounds alone
+#[test]
+fn float_comparisons_prune_on_bounds_and_negations_keep() {
+    let d = [("D", DataType::Float64)];
+    let one_to_four = bounded("D", float64(1.0), float64(4.0));
+    let compare_d = |kind: &str, value: &str| compare(kind, column("D"), number(value));
+    for (label, filter, expected) in [
+        ("D > 5", compare_d("predicate_greater", "5"), false),
+        ("D = 5", compare_d("predicate_equal", "5"), false),
+        ("D < 5", compare_d("predicate_less", "5"), true),
+        (
+            "D IN (5, 6)",
+            in_list("D", vec![number("5"), number("6")]),
+            false,
+        ),
+        (
+            "D BETWEEN 5 AND 6",
+            between("D", number("5"), number("6")),
+            false,
+        ),
+        ("NOT (D < 5)", not(compare_d("predicate_less", "5")), true),
+        (
+            "NOT (D > 0)",
+            not(compare_d("predicate_greater", "0")),
+            true,
+        ),
+        (
+            "NOT (D IN (5, 6))",
+            not(in_list("D", vec![number("5"), number("6")])),
+            true,
+        ),
+        (
+            "NOT (NOT (D > 5))",
+            not(not(compare_d("predicate_greater", "5"))),
+            false,
+        ),
+    ] {
+        assert_eq!(
+            footer_keeps(&filter, &d, &one_to_four),
+            expected,
+            "{label} over [1, 4] with a possible NaN row"
+        );
+    }
+    assert!(
+        footer_keeps(
+            &compare_d("predicate_notequal", "3"),
+            &d,
+            &bounded("D", float64(3.0), float64(3.0))
+        ),
+        "D <> 3 over [3, 3] keeps the file for its possible NaN row"
+    );
+}
+
+/// `C = literal` over a row group bounded `[value, value]` and one bounded just above it, which
+/// is `[true, false]` exactly when the footer scope converts `literal` to `value`.
+fn kept_at_and_above(column_type: DataType, literal: Json, value: f64) -> [bool; 2] {
+    let filter = compare("predicate_equal", column("C"), literal);
+    let columns = [("C", column_type)];
+    [value, value.next_up()].map(|bound| {
+        footer_keeps(
+            &filter,
+            &columns,
+            &bounded("C", float64(bound), float64(bound)),
+        )
+    })
+}
+
+/// `C = literal` over a row group bounded `[1, 4]`, which excludes every literal it is given, so
+/// the row group is kept only when the literal does not convert.
+fn kept_outside_bounds(column_type: DataType, literal: Json) -> bool {
+    footer_keeps(
+        &compare("predicate_equal", column("C"), literal),
+        &[("C", column_type)],
+        &bounded("C", float64(1.0), float64(4.0)),
+    )
+}
+
+/// Scenario: A float bound or literal is widened or rejected so it never drops a matching row
+#[test]
+fn float_literals_convert_to_the_scans_double_only_for_footer_statistics() {
+    for (literal, value) in [
+        (number("2"), 2.0),
+        (number("2.0"), 2.0),
+        (number("2.5"), 2.5),
+        (double("2E0"), 2.0),
+        (double("2.0000000000000000e+00"), 2.0),
+        (number("0.1"), 0.1_f64),
+    ] {
+        assert_eq!(
+            kept_at_and_above(DataType::Float64, literal.clone(), value),
+            [true, false],
+            "{literal} converts to the DOUBLE the scan parses"
+        );
+    }
+    let float_partition = [("C".to_string(), DataType::Float64)];
+    assert_eq!(
+        kept_under(
+            &compare("predicate_equal", column("C"), number("0.1")),
+            &float_partition,
+            &[file_with("c", Some("5"))],
+        ),
+        [true],
+        "a float partition column keeps every file"
+    );
+    for non_finite in [double("1E400"), double("NaN"), double("inf")] {
+        assert!(
+            kept_outside_bounds(DataType::Float64, non_finite.clone()),
+            "{non_finite} is not finite"
+        );
+    }
+    assert_eq!(
+        kept_at_and_above(DataType::Float32, number("16777216"), 16_777_216.0),
+        [true, false],
+        "an integer FLOAT represents exactly converts"
+    );
+    assert!(
+        kept_outside_bounds(DataType::Float32, number("16777217")),
+        "the scan rounds 16777217 to FLOAT before comparing"
+    );
+    assert_eq!(
+        kept_at_and_above(DataType::Float32, number("4.5"), 4.5),
+        [true, false],
+        "the scan compares a FLOAT column against a non-integer literal in DOUBLE"
+    );
+
+    let outside_x = RangeFacts {
+        ranges: BTreeMap::from([(
+            "X".to_string(),
+            ColumnRange {
+                bounds: Some((
+                    ScalarValue::Utf8(Some("b".to_string())),
+                    ScalarValue::Utf8(Some("c".to_string())),
+                )),
+                null_count: Some(0),
+                rows: 4,
+                nan_possible: false,
+            },
+        )]),
+        ..RangeFacts::default()
+    };
+    assert!(
+        footer_keeps(&equal("X", "a"), &[], &outside_x),
+        "an undeclared column is Opaque under the footer scope"
+    );
+    assert_eq!(
+        kept(
+            &equal("X", "a"),
+            &[file_with("x", Some("a")), file_with("x", Some("b"))]
+        ),
+        [true, false],
+        "an undeclared column compares as text under the partition scope"
+    );
+}
+
+fn timestamp_at(unit: TimeUnit, seconds: i64, nanos: i64) -> ScalarValue {
+    let value = Some(match unit {
+        TimeUnit::Second => seconds,
+        TimeUnit::Millisecond => seconds * 1_000 + nanos / 1_000_000,
+        TimeUnit::Microsecond => seconds * 1_000_000 + nanos / 1_000,
+        TimeUnit::Nanosecond => seconds * 1_000_000_000 + nanos,
+    });
+    match unit {
+        TimeUnit::Second => ScalarValue::TimestampSecond(value, None),
+        TimeUnit::Millisecond => ScalarValue::TimestampMillisecond(value, None),
+        TimeUnit::Microsecond => ScalarValue::TimestampMicrosecond(value, None),
+        TimeUnit::Nanosecond => ScalarValue::TimestampNanosecond(value, None),
+    }
+}
+
+const EPOCH_SECONDS_2024_01_01: i64 = 1_704_067_200;
+
+/// Scenario: Row-group statistics evaluate the filter under three-valued logic
+#[test]
+fn footer_literals_convert_only_to_the_scans_value() {
+    let amount = || DataType::Decimal128(10, 2);
+    let cents = |value: i128| ScalarValue::Decimal128(Some(value), 10, 2);
+    let instant = |unit: TimeUnit, offset_seconds: i64| {
+        timestamp_at(unit, EPOCH_SECONDS_2024_01_01 + offset_seconds, 0)
+    };
+    let cases: Vec<(&str, Json, DataType, RangeFacts, bool)> = vec![
+        (
+            "AMOUNT > 1234567.89",
+            compare("predicate_greater", column("C"), number("1234567.89")),
+            amount(),
+            bounded("C", cents(123_456_789), cents(123_456_789)),
+            true,
+        ),
+        (
+            "AMOUNT < 5",
+            compare("predicate_less", column("C"), number("5")),
+            amount(),
+            bounded("C", cents(1_000), cents(2_000)),
+            false,
+        ),
+        (
+            "AMOUNT BETWEEN 300 AND 1234567.89",
+            between("C", number("300"), number("1234567.89")),
+            amount(),
+            bounded("C", cents(10_000), cents(20_000)),
+            true,
+        ),
+        (
+            "TS = a literal with a non-zero ninth fraction digit",
+            compare(
+                "predicate_equal",
+                column("C"),
+                timestamp("2024-01-01 00:00:00.000000500"),
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            bounded(
+                "C",
+                instant(TimeUnit::Nanosecond, 0),
+                instant(TimeUnit::Nanosecond, 0),
+            ),
+            true,
+        ),
+        (
+            "TS > a microsecond literal",
+            compare(
+                "predicate_greater",
+                column("C"),
+                timestamp("2024-01-01 00:00:01.000000"),
+            ),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            bounded(
+                "C",
+                instant(TimeUnit::Nanosecond, 0),
+                instant(TimeUnit::Nanosecond, 0),
+            ),
+            false,
+        ),
+        (
+            "TS_MS = a literal finer than milliseconds",
+            compare(
+                "predicate_equal",
+                column("C"),
+                timestamp("2024-01-01 00:00:00.000500"),
+            ),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            bounded(
+                "C",
+                instant(TimeUnit::Millisecond, 0),
+                instant(TimeUnit::Millisecond, 0),
+            ),
+            true,
+        ),
+        (
+            "TS_S < a whole-second literal",
+            compare(
+                "predicate_less",
+                column("C"),
+                timestamp("2024-01-01 00:00:00"),
+            ),
+            DataType::Timestamp(TimeUnit::Second, None),
+            bounded(
+                "C",
+                instant(TimeUnit::Second, 1),
+                instant(TimeUnit::Second, 2),
+            ),
+            false,
+        ),
+    ];
+    for (label, filter, column_type, facts, expected) in cases {
+        assert_eq!(
+            footer_keeps(&filter, &[("C", column_type)], &facts),
+            expected,
+            "{label}"
+        );
+    }
+
+    let nanosecond = || DataType::Timestamp(TimeUnit::Nanosecond, None);
+    for (literal, column_type, [exact, other], excluding) in [
+        (
+            number("1234567.89"),
+            amount(),
+            ["1234567.89", "1234567.88"],
+            bounded("C", cents(1_000), cents(2_000)),
+        ),
+        (
+            timestamp("2024-01-01 00:00:00.000000500"),
+            nanosecond(),
+            [
+                "2024-01-01 00:00:00.000000500",
+                "2024-01-01 00:00:00.000000501",
+            ],
+            bounded(
+                "C",
+                instant(TimeUnit::Nanosecond, 1),
+                instant(TimeUnit::Nanosecond, 2),
+            ),
+        ),
+    ] {
+        let filter = compare("predicate_equal", column("C"), literal.clone());
+        assert_eq!(
+            kept_under(
+                &filter,
+                &[("C".to_string(), column_type.clone())],
+                &[file_with("c", Some(exact)), file_with("c", Some(other))],
+            ),
+            [true, false],
+            "{literal} still converts exactly to {column_type} under the partition scope"
+        );
+        assert!(
+            footer_keeps(&filter, &[("C", column_type.clone())], &excluding),
+            "{literal} does not convert to {column_type} under the footer scope"
+        );
+    }
+}

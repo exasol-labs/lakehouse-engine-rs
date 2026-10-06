@@ -24,8 +24,12 @@ use parquet::schema::parser::parse_message_type;
 use std::sync::Arc;
 
 pub fn encode_parquet(batch: &RecordBatch) -> Bytes {
+    encode_parquet_with(batch, WriterProperties::builder().build())
+}
+
+pub fn encode_parquet_with(batch: &RecordBatch, props: WriterProperties) -> Bytes {
     let mut buf = Vec::new();
-    let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None)
+    let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), Some(props))
         .unwrap_or_else(|e| panic!("open Arrow Parquet writer for a raw fixture: {e}"));
     writer
         .write(batch)

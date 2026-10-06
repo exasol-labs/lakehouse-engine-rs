@@ -37,7 +37,7 @@ pub use format::{
 };
 
 mod scan_resolution;
-use scan_resolution::TableScanResolver;
+use scan_resolution::{ScanFilters, TableScanResolver};
 
 mod refused_columns;
 use refused_columns::ensure_no_refused_column_referenced;
@@ -155,6 +155,8 @@ pub async fn handle_pushdown(
     // `filter_json_raw` stays unmodified: format-level pruning must see the original
     // predicate tree, whatever the adapter declines.
     let (filter, declined_filter) = classify_where_filter(filter_json_raw, &col_types);
+    // Footer bounds describe stored values, while a self-applied filter compares emitted ones.
+    let statistics_filter = filter_json_raw.filter(|_| filter.is_some());
 
     let limit = extract_limit(&pushdown_req);
 
@@ -184,7 +186,14 @@ pub async fn handle_pushdown(
         partition_columns,
         refused_columns,
     } = resolver
-        .resolve(&catalog.table, filter_json_raw, &col_types)
+        .resolve(
+            &catalog.table,
+            ScanFilters {
+                pruning: filter_json_raw,
+                scan_evaluated: statistics_filter,
+            },
+            &col_types,
+        )
         .await?;
     let scan_storage = scan_storage_for(
         &conn.creds,

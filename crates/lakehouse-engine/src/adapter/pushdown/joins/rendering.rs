@@ -93,7 +93,7 @@ fn partition_conjuncts(filter: &Json, keep: impl Fn(&Json) -> bool) -> Option<Js
 /// (a) manifest pruning gets it raw, so every leg-local conjunct prunes even when
 /// DataFusion cannot render it;
 /// (b) the leg's `ScanSpec.filter` gets it screened by [`renderable_only`] and then
-/// [`type_screened_leg_filter`];
+/// [`screen_side_local`];
 /// (c) the outer wrapper's WHERE gets the raw type-declined conjuncts (Exasol dialect).
 /// Cross-leg and OR-spanning conjuncts go only to the outer WHERE.
 pub(super) fn leg_local_filter(filter: &Json, legs: &JoinLegs, leg: usize) -> Option<Json> {
@@ -108,10 +108,10 @@ pub(super) fn cross_leg_residual_filter(filter: &Json, legs: &JoinLegs) -> Optio
     partition_conjuncts(filter, |c| legs.conjunct_leg(c).is_none())
 }
 
-/// The sole renderability screen on the N-scan path, applied only at
-/// [`super::sql_builders::build_n_scan_join_sql`]'s render sites, not inside
-/// [`leg_local_filter`]: manifest pruning must see unscreened conjuncts, and dropping one
-/// there would silently open more files with no test catching it.
+/// The sole renderability screen on the N-scan path, applied only through
+/// [`screened_leg_filter`] and the wrapper's residual, not inside [`leg_local_filter`]:
+/// manifest pruning must see unscreened conjuncts, and dropping one there would silently open
+/// more files with no test catching it.
 pub(super) fn renderable_only(filter: &Json) -> Option<Json> {
     partition_conjuncts(filter, datafusion_renderable)
 }
@@ -121,8 +121,9 @@ pub(super) fn declined_only(filter: &Json) -> Option<Json> {
     partition_conjuncts(filter, |c| !datafusion_renderable(c))
 }
 
-/// Returns `(leg_filter, type_declined)`: a total per-conjunct partition, the first half
-/// rewritten for the leg, the second raw for the Exasol-dialect outer WHERE.
+/// A total per-conjunct partition of `side_local`: the accepted half rewritten for the leg and
+/// carried raw, the declined half raw for the Exasol-dialect outer WHERE. One pass computes the
+/// accepted set, so the rendered scan and statistics pruning cannot disagree about it.
 ///
 /// Not [`classify_where_filter`](super::super::support::classify_where_filter), which
 /// classifies a whole filter against one type universe: the N-scan path has no
@@ -131,19 +132,59 @@ pub(super) fn declined_only(filter: &Json) -> Option<Json> {
 /// siblings. Renderability is established on the rewritten tree via
 /// [`type_accepted_rewrite`]; if the re-formed tree fails it, the whole side-local set
 /// becomes residual (fail closed: applied in the wrapper is slower, applied nowhere is wrong).
-pub(super) fn type_screened_leg_filter(
-    side_local: &Json,
-    col_types: &[(String, String)],
-) -> (Option<Json>, Option<Json>) {
-    let accepts = |c: &Json| type_accepted_rewrite(c, col_types).is_some();
-    let declined = partition_conjuncts(side_local, |c| !accepts(c));
-    match partition_conjuncts(side_local, accepts) {
-        None => (None, declined),
-        Some(accepted) => match type_accepted_rewrite(&accepted, col_types) {
-            Some(rewritten) => (Some(rewritten), declined),
-            None => (None, Some(side_local.clone())),
+fn screen_side_local(side_local: &Json, col_types: &[(String, String)]) -> ScreenedLegFilter {
+    let accepts = |c: &Json| type_accepts(c, col_types);
+    let type_declined = partition_conjuncts(side_local, |c| !accepts(c));
+    let Some(accepted) = partition_conjuncts(side_local, accepts) else {
+        return ScreenedLegFilter {
+            type_declined,
+            ..ScreenedLegFilter::default()
+        };
+    };
+    match type_accepted_rewrite(&accepted, col_types) {
+        Some(rewritten) => ScreenedLegFilter {
+            scan: Some(rewritten),
+            type_declined,
+            carried: Some(accepted),
+        },
+        None => ScreenedLegFilter {
+            type_declined: Some(side_local.clone()),
+            ..ScreenedLegFilter::default()
         },
     }
+}
+
+fn type_accepts(conjunct: &Json, col_types: &[(String, String)]) -> bool {
+    type_accepted_rewrite(conjunct, col_types).is_some()
+}
+
+/// What one leg's own scan evaluates of the request's WHERE filter.
+#[derive(Default)]
+pub(super) struct ScreenedLegFilter {
+    /// Rewritten for the leg's `ScanSpec.filter`.
+    pub(super) scan: Option<Json>,
+    /// Raw, for the outer wrapper's WHERE.
+    pub(super) type_declined: Option<Json>,
+    /// The raw form of `scan`, so statistics pruning reads only conjuncts the scan evaluates;
+    /// `None` whenever `scan` is.
+    pub(super) carried: Option<Json>,
+}
+
+/// The one owner of the N-scan per-leg screen ([`renderable_only`], then [`leg_local_filter`],
+/// then [`screen_side_local`]), so the leg's rendered scan and its statistics pruning cannot
+/// disagree about which conjuncts the leg's scan carries.
+pub(super) fn screened_leg_filter(
+    where_filter: &Json,
+    legs: &JoinLegs,
+    leg: usize,
+    col_types: &[(String, String)],
+) -> ScreenedLegFilter {
+    let Some(side_local) =
+        renderable_only(where_filter).and_then(|eligible| leg_local_filter(&eligible, legs, leg))
+    else {
+        return ScreenedLegFilter::default();
+    };
+    screen_side_local(&side_local, col_types)
 }
 
 /// Inputs must be disjoint conjunct sets; nothing is de-duplicated.

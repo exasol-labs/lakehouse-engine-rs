@@ -20,6 +20,16 @@ use crate::scan::{build_admission_limited_store, store_root_url};
 #[path = "scan_resolution_tests.rs"]
 mod tests;
 
+/// The request filter as format-side pruning reads it, named so the two same-typed filters
+/// cannot be swapped silently. `pruning` is the filter forwarded unchanged, whatever the adapter
+/// declines. `scan_evaluated` is the part of `pruning` the scan itself evaluates, and `None` when
+/// the adapter applies the filter in its own outer `WHERE`: footer bounds describe stored values,
+/// while a self-applied filter compares emitted ones.
+pub(super) struct ScanFilters<'a> {
+    pub(super) pruning: Option<&'a Json>,
+    pub(super) scan_evaluated: Option<&'a Json>,
+}
+
 /// Built once per request with the catalog session resolved into it, so a
 /// multi-leg join costs no more catalog authentication than a single scan.
 pub(super) struct TableScanResolver<'a> {
@@ -110,13 +120,14 @@ impl<'a> TableScanResolver<'a> {
         })
     }
 
-    /// `table_identifier` is the original-cased `TABLE_MAP` identifier. `filter_json`
-    /// is forwarded unchanged for format-side pruning. `declared_columns` is read only
-    /// by a format whose pruning can drop every file carrying a column.
+    /// `table_identifier` is the original-cased `TABLE_MAP` identifier. Every format prunes on
+    /// `filters.pruning`; only a format pruning on stored-value statistics reads
+    /// `filters.scan_evaluated`. `declared_columns` is read only by a format whose pruning can
+    /// drop every file carrying a column.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
-        filter_json: Option<&Json>,
+        filters: ScanFilters<'_>,
         declared_columns: &[(String, String)],
     ) -> Result<ResolvedScan, UdfError> {
         match &self.session {
@@ -132,7 +143,7 @@ impl<'a> TableScanResolver<'a> {
                     },
                     &self.connection,
                 )?;
-                reader.resolve_scan(filter_json).await
+                reader.resolve_scan(filters.pruning).await
             }
             RequestSession::Unity(session) => {
                 let table = session
@@ -145,7 +156,7 @@ impl<'a> TableScanResolver<'a> {
                     },
                     &self.connection,
                 )?;
-                reader.resolve_scan(filter_json).await
+                reader.resolve_scan(filters.pruning).await
             }
             RequestSession::Glue(session) => {
                 let table = session
@@ -158,7 +169,7 @@ impl<'a> TableScanResolver<'a> {
                     },
                     &self.connection,
                 )?;
-                reader.resolve_scan(filter_json).await
+                reader.resolve_scan(filters.pruning).await
             }
             RequestSession::DirectStorage {
                 store,
@@ -173,10 +184,11 @@ impl<'a> TableScanResolver<'a> {
                         table_root: &table_root,
                         options: *options,
                         declared_columns,
+                        statistics_filter: filters.scan_evaluated,
                     },
                     &self.connection,
                 )?;
-                reader.resolve_scan(filter_json).await
+                reader.resolve_scan(filters.pruning).await
             }
         }
     }
