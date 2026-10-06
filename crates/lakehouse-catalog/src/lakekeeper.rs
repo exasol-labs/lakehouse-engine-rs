@@ -30,8 +30,12 @@ pub struct TableReadDecision {
 /// origin. A path-rewriting gateway is rejected: no config value names the management API.
 pub fn lakekeeper_management_url(catalog_uri: &str) -> Result<String, UdfError> {
     let trimmed = catalog_uri.strip_suffix('/').unwrap_or(catalog_uri);
-    let path_ends_in_catalog = url::Url::parse(trimmed)
-        .is_ok_and(|parsed| parsed.path().ends_with(CATALOG_SEGMENT) && parsed.query().is_none());
+    // A fragment is never sent, so `http://h/catalog#/catalog` would hit `/catalog`, not the management route.
+    let path_ends_in_catalog = url::Url::parse(trimmed).is_ok_and(|parsed| {
+        parsed.path().ends_with(CATALOG_SEGMENT)
+            && parsed.query().is_none()
+            && parsed.fragment().is_none()
+    });
     match trimmed.strip_suffix(CATALOG_SEGMENT) {
         Some(base) if path_ends_in_catalog => Ok(format!("{base}{MANAGEMENT_SEGMENT}")),
         _ => Err(UdfError::User(format!(

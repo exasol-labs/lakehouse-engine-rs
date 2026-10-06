@@ -733,6 +733,7 @@ fn management_url_rejects_a_catalog_uri_that_does_not_end_in_catalog() {
         "http://lakekeeper:8181/catalogue",
         "http://lakekeeper:8181/catalog//",
         "http://lakekeeper:8181/catalog?warehouse=w",
+        "http://lakekeeper:8181/catalog#/catalog",
         "http://catalog",
         "http://catalog/",
         "catalog",
