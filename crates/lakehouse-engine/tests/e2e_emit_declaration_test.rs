@@ -141,7 +141,7 @@ fn assert_emits_clause_declares(pushed: &str, expected_types: &[&str]) {
     }
 }
 
-/// Scenario: the scan returns correct values across the type mix with no spec-carried emit types
+/// Scenario: Output columns are coerced to the Arrow type the declared EMITS ExaType requires before emit_batch
 // date/timestamp/boolean are pinned via WHERE, not cell comparison, so the test
 // is independent of the engine-version-dependent TIMESTAMP display precision.
 #[test]

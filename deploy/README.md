@@ -382,7 +382,7 @@ credentials.**
   or Lakekeeper's vended-credentials support.
 - **The Lakekeeper OAuth2 client secret is committed to this repository.**
   `scripts/keycloak-realm-iceberg.json`'s client secret ships as-is to the AWS box. The stack does
-  not overwrite it, because the CONNECTION contract `e2e-harness/lakekeeper-e2e-harness` proves is
+  not overwrite it, because the CONNECTION contract that the Lakekeeper E2E suite (`specs/testing.md`) proves is
   defined by that exact file. Its only control is the security group's `/32` allowlist.
 - **The catalog's storage credential grants object put/get/delete plus bucket list across the
   whole `data-stack` bucket**, not scoped to the warehouse's own key prefix — that prefix only

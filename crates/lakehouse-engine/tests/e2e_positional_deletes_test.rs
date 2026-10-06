@@ -411,7 +411,7 @@ fn e2e_partition_delete_invariant_across_fanout() {
     );
 }
 
-/// Scenario: End-to-end deletes compose with projection, filter, and LIMIT
+/// Scenario: Positional deletes compose with projection, filter, LIMIT, and pruning
 #[test]
 fn e2e_deletes_with_projection_filter_limit() {
     setup_e2e();

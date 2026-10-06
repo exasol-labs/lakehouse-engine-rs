@@ -7,6 +7,7 @@ Spec-driven development with mission in: @specs/mission.md
 - Integration and E2E tests run against a local Exasol Docker database. Start the container yourself, do not ask the user.
 - Tests must fail, not skip, when Exasol is unavailable.
 - Connection strings must set `validateservercertificate=0`, because the Docker image uses a self-signed certificate.
+- Read `specs/testing.md` before adding or changing an E2E suite, fixture, or harness helper. It holds the coverage rule, the suite layout, and the ops rules for the orphan sweeps and the benchmark catalog.
 
 Project specifics:
 
@@ -59,7 +60,7 @@ Read `specs/udf-context.md` before changing the shard count or fan-out shape.
 
 ## Data types
 
-Exasol has no arrays, lists, structs, or maps. `specs/datafusion-scan/type-mapping/spec.md` owns the mapping. Two rules are easy to miss:
+Exasol has no arrays, lists, structs, or maps. `specs/scan-types/type-mapping/spec.md` owns the mapping. Two rules are easy to miss:
 
 - Iceberg `timestamptz` maps to plain `TIMESTAMP`, because Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF `EMITS` type (`sqlCode 22002`).
 - Types Exasol cannot hold (List, Struct, Map, Union, Binary, Duration, Time, Interval, Decimal256, and Decimal128 beyond precision 36) become `VARCHAR(2000000)` JSON, produced inside the UDF.

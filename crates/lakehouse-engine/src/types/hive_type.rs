@@ -1,6 +1,6 @@
 use delta_kernel::schema::{ArrayType, DataType, MapType, StructField, StructType};
 
-/// Into the Spark type the one Spark-type classifier types (`vs-adapter/glue-hive-type-mapping`);
+/// Into the Spark type the one Spark-type classifier types (`glue/glue-hive-type-mapping`);
 /// every nested member is nullable.
 pub(crate) fn parse_hive_type(hive_type: &str) -> Result<DataType, String> {
     let mut cursor = Cursor {
