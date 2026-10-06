@@ -1850,7 +1850,6 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
     );
 }
 
-/// An inner equi-join of `db.customer` and `db.orders`.
 fn customer_orders_join_request() -> Json {
     serde_json::json!({
         "involvedTables": [

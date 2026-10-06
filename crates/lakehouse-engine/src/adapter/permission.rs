@@ -1,7 +1,5 @@
-//! The opt-in Lakekeeper permission check of a virtual schema (#415): its two properties, the
-//! `USER_MAPPING` template that maps the querying Exasol user to a Lakekeeper principal, and the
-//! gate that authorizes a pushdown request's tables or refuses the query. No other module names
-//! the template engine.
+//! The opt-in Lakekeeper permission check (#415): its properties, the `USER_MAPPING` template,
+//! and the gate that authorizes a request's tables. No other module names the template engine.
 
 use crate::adapter::catalog_kind::CatalogKind;
 use exasol_udf_sdk::error::UdfError;
@@ -61,8 +59,7 @@ impl PermissionSettings {
         }
     }
 
-    /// Runs once the CONNECTION names the catalog URI and before any catalog request, so a URI
-    /// that derives no management URL is refused before the catalog is contacted.
+    /// Runs before any catalog request, so a URI with no management URL is refused uncontacted.
     pub(crate) fn require_management_url(&self, catalog_uri: &str) -> Result<(), UdfError> {
         match self {
             Self::Lakekeeper(_) => lakekeeper_management_url(catalog_uri).map(drop),
@@ -97,13 +94,8 @@ pub(crate) enum PermissionCheck {
     Enforced(PermissionGate),
 }
 
-/// A compiled `USER_MAPPING` template with one variable, `user`.
-///
-/// Setting the property requires ALTER on the virtual schema, so the template's author is
-/// trusted, and neither the uniqueness nor the owner of a principal is checked. The checks stop
-/// injection only: the user name enters as a value and is never compiled, undefined values are
-/// strict so a missing lookup refuses instead of yielding a partial principal, the environment
-/// has no loader so a template reaches no other, and fuel bounds a render.
+/// The user name is a template value, never compiled; strict undefined, no loader, and fuel stop
+/// injection. Principal uniqueness and ownership are unchecked: setting the property needs ALTER.
 pub(crate) struct UserMapping {
     environment: Environment<'static>,
 }
@@ -127,7 +119,6 @@ impl UserMapping {
         Ok(Self { environment })
     }
 
-    /// The trimmed render for `user`.
     pub(crate) fn principal_for(&self, user: &str) -> Result<String, UdfError> {
         let rendered = self
             .environment
@@ -191,8 +182,6 @@ pub(crate) struct PermissionGate {
 }
 
 impl PermissionGate {
-    /// Asks Lakekeeper once, on the request's own session, whether the principal may read every
-    /// table, and refuses the query unless each one is allowed.
     pub(crate) async fn authorize(
         &self,
         session: &CatalogSession,

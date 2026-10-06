@@ -1,6 +1,5 @@
 //! `load_table_any_auth` lives here because it reads `CatalogSession`'s private
-//! fields, keeping `CatalogAuth` unreachable from outside this crate. `lakekeeper.rs` is the
-//! second reader, through the `pub(crate)` accessors below, so the fields stay private.
+//! fields, keeping `CatalogAuth` unreachable from outside this crate.
 
 use crate::auth::{
     CatalogAuth, inject_catalog_auth_props, redact_catalog_auth_error, resolve_catalog_auth,

@@ -1,9 +1,5 @@
-//! Lakekeeper management API calls on a request's shared `CatalogSession`.
-//!
-//! These are free functions, not session methods: a Lakekeeper-only concern stays off a session
-//! that every Iceberg REST catalog shares, and the session's grant, connection pool, and prefix
-//! are reused without widening its surface. Nothing here names an Exasol concept; the caller maps
-//! its own user to the principal it passes in.
+//! Lakekeeper management calls are free functions, not `CatalogSession` methods, so a
+//! Lakekeeper-only concern stays off the session that every Iceberg REST catalog shares.
 
 use crate::iceberg_io::{PostAnswer, authed_post_json, quote_catalog_body};
 use crate::namespace::parse_table_ident;
@@ -23,18 +19,15 @@ const NEEDS_LAKEKEEPER: &str = "The catalog must be a Lakekeeper server.";
 /// hanging it.
 const BATCH_CHECK_DEADLINE: Duration = Duration::from_secs(30);
 
-/// Lakekeeper's answer for one table: whether the checked principal can read its data. Lakekeeper
-/// reports a missing table as `allowed: false`, the same as a denied one.
+/// Whether the principal can read the table; a missing table is `allowed: false` too.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableReadDecision {
     pub table: String,
     pub allowed: bool,
 }
 
-/// Lakekeeper mounts `/catalog` and `/management` side by side under one base URL. Only the path
-/// changes, so a bearer token sent to the result goes to the catalog's own origin. A catalog
-/// behind a gateway that rewrites paths is rejected, because no config value names the
-/// management API.
+/// Swaps `/catalog` for `/management` under one base, so a bearer token goes only to the catalog's
+/// origin. A path-rewriting gateway is rejected: no config value names the management API.
 pub fn lakekeeper_management_url(catalog_uri: &str) -> Result<String, UdfError> {
     let trimmed = catalog_uri.strip_suffix('/').unwrap_or(catalog_uri);
     let path_ends_in_catalog = url::Url::parse(trimmed)
@@ -48,15 +41,8 @@ pub fn lakekeeper_management_url(catalog_uri: &str) -> Result<String, UdfError> 
     }
 }
 
-/// Asks Lakekeeper, in one batch-check, whether `principal` can read each of `tables`
-/// (`namespace.table` identifiers), on the request's own session. The decisions come back
-/// one per distinct table in first-seen order. The warehouse is named by the session's
-/// `/v1/config` prefix, unchanged: on Lakekeeper it is the warehouse id, and any other server
-/// fails the call. The function derives the management URL from the session's own catalog URI.
-///
-/// A batch-check that cannot be completed within [`BATCH_CHECK_DEADLINE`], and every answer that
-/// is not a readable batch-check answer, is an error that names the batch-check URL, so an
-/// unreadable answer never counts as allowed.
+/// One decision per distinct table, in first-seen order; the warehouse is the session's
+/// `/v1/config` prefix. A timeout or unreadable answer is an error naming the URL, never an allow.
 pub async fn lakekeeper_batch_check(
     session: &CatalogSession,
     principal: &str,

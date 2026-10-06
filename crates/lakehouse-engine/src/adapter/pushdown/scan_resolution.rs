@@ -25,8 +25,8 @@ mod tests;
 /// Built once per request with the catalog session resolved into it, so a
 /// multi-leg join costs no more catalog authentication than a single scan.
 ///
-/// Every pushdown shape loads its tables through [`Self::resolve`], so the request's permission
-/// check runs here, once, before any table is loaded, and a shape added later cannot skip it.
+/// Every shape loads tables through [`Self::resolve`], so the permission check runs once here and
+/// a shape added later cannot skip it.
 pub(super) struct TableScanResolver<'a> {
     session: RequestSession,
     connection: ConnectionStorage<'a>,
@@ -35,10 +35,8 @@ pub(super) struct TableScanResolver<'a> {
 
 /// Which identifiers [`TableScanResolver::resolve`] may load.
 enum TableAdmission {
-    /// The virtual schema runs no permission check.
     Unchecked,
-    /// Only the identifiers the request's permission check authorized. A kind whose resolution
-    /// runs no check authorizes none, so a gated request under it reads no table.
+    /// A kind that runs no check authorizes none, so a gated request under it reads no table.
     Authorized(HashSet<String>),
 }
 
@@ -75,9 +73,8 @@ impl<'a> TableScanResolver<'a> {
     /// the session is built: the Iceberg arm contacts the network for `/v1/config`,
     /// so a later check would surface a transport error instead of the parse error.
     ///
-    /// With an enforced `permission`, the Iceberg arm sends the request's one batch-check on the
-    /// new session and fails before any `loadTable` unless every identifier is allowed; the
-    /// resolver then admits only those identifiers.
+    /// With an enforced `permission`, the Iceberg arm batch-checks every identifier before any
+    /// `loadTable`, and the resolver then admits only those.
     pub(super) async fn for_request(
         kind: CatalogKind,
         catalog_uri: &str,

@@ -2074,7 +2074,6 @@ impl HostedLakekeeper {
         }
     }
 
-    /// `MY_CONN` addresses the stand-in's `/catalog` with OAuth2 client credentials.
     fn context(&self) -> TestContext {
         connection_context(&self.stand_in.catalog_uri())
     }
@@ -2137,7 +2136,6 @@ type PropertyPairs<'a> = &'a [(&'a str, &'a str)];
 
 const EVENTS_TABLE_MAP: &str = r#"{"TABLE_MAP":{"EVENTS":"db.events"}}"#;
 
-/// Each VS request type over `properties`, as Exasol sends it.
 fn every_request_type(properties: &Json) -> Vec<(&'static str, Json)> {
     vec![
         (
@@ -2387,7 +2385,6 @@ fn listing_requests_with_the_check_on_list_unchanged_and_send_no_check() {
     }
 }
 
-/// The `identity.user` of every check the hosted stand-in received.
 fn checked_identities(hosted: &HostedLakekeeper) -> Vec<String> {
     hosted
         .stand_in

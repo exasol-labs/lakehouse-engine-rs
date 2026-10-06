@@ -65,8 +65,6 @@ impl Stub {
     }
 }
 
-/// Serves the OAuth2 grant and `/v1/config` of a Lakekeeper catalog, and answers every
-/// batch-check with `status` and `body`.
 async fn lakekeeper_stub(content_type: &'static str, status: u16, body: String) -> Stub {
     let (base_uri, requests) = spawn_server(content_type, move |request| {
         if request.starts_with(TOKEN_REQUEST) {
@@ -133,7 +131,6 @@ fn fixture(case: &str) -> Value {
     serde_json::from_str(&text).expect("a fixture is one JSON object")
 }
 
-/// The `namespace.table` identifier of a fixture request's one check.
 fn fixture_table(fixture: &Value) -> String {
     let table = &fixture["request"]["checks"][0]["operation"]["table"];
     let namespace: Vec<&str> = table["namespace"]
@@ -149,7 +146,6 @@ fn fixture_table(fixture: &Value) -> String {
     )
 }
 
-/// A fixture body that is not JSON is a JSON string.
 fn fixture_body(fixture: &Value) -> String {
     match &fixture["response"]["body"] {
         Value::String(text) => text.clone(),
@@ -754,8 +750,8 @@ fn management_url_rejects_a_catalog_uri_that_does_not_end_in_catalog() {
 
 const SHORT_DEADLINE: Duration = Duration::from_millis(300);
 
-/// Answers every batch-check with `prelude` and then nothing, holding the connection open, and
-/// every other request with a 404, which `CatalogSession::resolve` tolerates.
+/// Sends `prelude` then stalls on every batch-check; other requests get a 404, which
+/// `CatalogSession::resolve` tolerates.
 async fn stalling_lakekeeper(prelude: &'static str) -> String {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base_uri = format!("http://{}", listener.local_addr().unwrap());

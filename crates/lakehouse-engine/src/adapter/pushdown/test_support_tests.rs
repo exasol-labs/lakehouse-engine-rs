@@ -61,7 +61,6 @@ pub(super) struct RecordingCatalog {
     requests: RecordedRequests,
 }
 
-/// One request a [`RecordingCatalog`] received, in arrival order.
 #[derive(Debug, Clone)]
 pub(crate) struct RecordedRequest {
     pub(crate) method: String,
@@ -79,7 +78,6 @@ impl RecordingCatalog {
         Self::spawn_reading_bodies(move |target, _| responder(target)).await
     }
 
-    /// `responder` maps a request target and its body to a status and body.
     pub(super) async fn spawn_reading_bodies<F>(responder: F) -> Self
     where
         F: Fn(&str, &[u8]) -> (u16, String) + Send + Sync + 'static,
@@ -126,7 +124,6 @@ pub(crate) fn lakekeeper_load_table_target(table: &str) -> String {
     format!("/catalog/v1/{LAKEKEEPER_WAREHOUSE_ID}/namespaces/db/tables/{table}")
 }
 
-/// How a [`LakekeeperStandIn`] answers a batch-check.
 #[derive(Clone, Copy)]
 pub(crate) enum BatchCheckAnswer {
     /// `allowed: false` for each listed `namespace.table`, `allowed: true` for every other.
@@ -135,9 +132,8 @@ pub(crate) enum BatchCheckAnswer {
     Fixed(u16, &'static str),
 }
 
-/// A Lakekeeper stand-in that mounts `/catalog` beside `/management`: the OAuth2 token endpoint,
-/// a `/v1/config` naming [`LAKEKEEPER_WAREHOUSE_ID`] as the prefix, a snapshotless `loadTable`
-/// for every table, an empty listing for every other catalog GET, and `answer` per batch-check.
+/// A Lakekeeper stand-in with `/catalog` beside `/management`; it answers batch-checks per
+/// `answer` and serves a snapshotless `loadTable` for every table.
 pub(crate) struct LakekeeperStandIn {
     catalog: RecordingCatalog,
 }
@@ -163,7 +159,6 @@ impl LakekeeperStandIn {
         self.catalog.targets()
     }
 
-    /// The body of every batch-check the stand-in received.
     pub(crate) fn batch_checks(&self) -> Vec<Json> {
         self.requests()
             .into_iter()
@@ -254,7 +249,6 @@ fn answer_batch_check(body: &[u8], answer: BatchCheckAnswer) -> (u16, String) {
     (200, serde_json::json!({ "results": results }).to_string())
 }
 
-/// OAuth2 client credentials against a [`LakekeeperStandIn`]'s own token endpoint.
 pub(crate) fn lakekeeper_creds() -> ConnectionCreds {
     ConnectionCreds {
         client_id: Some("lakehouse".into()),
@@ -274,7 +268,6 @@ pub(crate) fn lakekeeper_check(user: &str) -> PermissionCheck {
     .expect("the user maps to a principal")
 }
 
-/// A connection to `stand_in` that carries `check`, as the pushdown arm stores it.
 pub(super) fn lakekeeper_connection(
     stand_in: &LakekeeperStandIn,
     check: PermissionCheck,

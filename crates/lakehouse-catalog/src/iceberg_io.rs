@@ -8,8 +8,7 @@ use exasol_udf_sdk::error::UdfError;
 use iceberg::spec::TableMetadata;
 use std::time::Duration;
 
-/// The most of a catalog `POST` answer read. A batch-check answer holds one small result per
-/// table, so a larger 2xx answer is refused, and an error quotes only its redacted start.
+/// A batch-check answer is small, so a larger 2xx answer is refused.
 pub(crate) const MAX_ANSWER_BYTES: usize = 64 * 1024;
 /// The most of an answer body an error quotes. The quote is cut only after the whole read is
 /// redacted, so a secret that the cut splits was already replaced.
@@ -125,18 +124,15 @@ pub(crate) async fn authed_get_json<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// How a catalog answered a `POST`. A non-2xx answer is a value, not an error, so a caller
-/// can read the status and map it to its own failure.
+/// A non-2xx answer is a value, not an error, so the caller maps its status to its own failure.
 pub(crate) enum PostAnswer {
-    /// The raw body of a 2xx answer. A caller that fails to parse it shows it only through
-    /// [`quote_catalog_body`].
+    /// Raw body; show it only through [`quote_catalog_body`].
     Accepted { status: u16, body: String },
     /// The body of a non-2xx answer, already quoted by [`quote_catalog_body`].
     Refused { status: u16, body: String },
 }
 
-/// Sends `payload` and reads the answer within `deadline`, because a catalog that accepts the
-/// connection and never answers would otherwise hold the request forever.
+/// Bounded by `deadline`: a catalog that accepts the connection and never answers would hang it.
 pub(crate) async fn authed_post_json(
     client: &reqwest::Client,
     url: &str,
@@ -181,7 +177,6 @@ pub(crate) async fn authed_post_json(
     }
 }
 
-/// An answer body read up to [`MAX_ANSWER_BYTES`]; `cut` when the body holds more.
 struct CappedBody {
     text: String,
     cut: bool,
