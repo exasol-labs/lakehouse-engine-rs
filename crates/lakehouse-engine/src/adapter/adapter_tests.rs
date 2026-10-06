@@ -1633,7 +1633,6 @@ fn resolved_for(password: Json) -> ResolvedConnectionConfig {
     .expect("the fixture password must be an acceptable CONNECTION")
 }
 
-/// `resolve_connection_config` over a `MY_CONN` CONNECTION, on a runtime of its own as each entry point builds one.
 fn resolve_config_over(
     address: &str,
     password: &Json,
@@ -1647,7 +1646,7 @@ fn resolve_config_over(
         .enable_all()
         .build()
         .expect("build the request runtime");
-    resolve_connection_config(&ctx, props, &rt)
+    resolve_connection_config(&ctx, props, &PermissionSettings::Off, &rt)
 }
 
 #[test]
@@ -2038,4 +2037,492 @@ fn validation_and_sealing_key_read_the_stated_credentials() {
         "a rejected CONNECTION must send no STS request: {:?}",
         stub.heads()
     );
+}
+
+use super::permission::{PERMISSION_CHECK, USER_MAPPING};
+use super::pushdown::test_support::{
+    BatchCheckAnswer, LAKEKEEPER_BEARER_TOKEN, LAKEKEEPER_CLIENT_SECRET, LakekeeperStandIn,
+};
+
+const KIND_REFUSAL: &str = "PERMISSION_CHECK = 'LAKEKEEPER' requires the Iceberg REST catalog kind";
+const LOWERCASE_MAPPING: &str = "oidc~{{ user|lower }}@corp.net";
+
+/// A [`LakekeeperStandIn`] on a runtime of its own, because `dispatch` blocks on its own
+/// current-thread runtime, which a `#[tokio::test]` would nest.
+struct HostedLakekeeper {
+    stand_in: LakekeeperStandIn,
+    _runtime: tokio::runtime::Runtime,
+}
+
+impl HostedLakekeeper {
+    fn start(answer: BatchCheckAnswer) -> Self {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("build the stand-in runtime");
+        let stand_in = runtime.block_on(LakekeeperStandIn::spawn(answer));
+        Self {
+            stand_in,
+            _runtime: runtime,
+        }
+    }
+
+    /// `MY_CONN` addresses the stand-in's `/catalog` with OAuth2 client credentials.
+    fn context(&self) -> TestContext {
+        connection_context(&self.stand_in.catalog_uri())
+    }
+
+    fn context_as(&self, user: &str) -> TestContext {
+        self.context()
+            .with_current_user(user)
+            .with_scope_user("VIEW_OWNER")
+    }
+}
+
+fn connection_context(catalog_uri: &str) -> TestContext {
+    TestContext::scalar(vec![]).with_connection(
+        "MY_CONN",
+        password_connection(catalog_uri, lakekeeper_password()),
+    )
+}
+
+fn lakekeeper_password() -> String {
+    serde_json::json!({
+        "warehouse": "wh",
+        "endpoint": "http://s3.example.com",
+        "region": "us-east-1",
+        "access_key": "AKID",
+        "secret_key": "SECRET",
+        "path_style": true,
+        "client_id": "lakehouse",
+        "client_secret": LAKEKEEPER_CLIENT_SECRET,
+    })
+    .to_string()
+}
+
+fn vs_properties(extra: &[(&str, &str)]) -> Json {
+    let mut properties = serde_json::json!({
+        "CATALOG_CONNECTION": "MY_CONN",
+        "NAMESPACE": "db",
+        "ALLOW_HTTP": "true",
+    });
+    for (key, value) in extra {
+        properties[*key] = Json::from(*value);
+    }
+    properties
+}
+
+fn checked_properties(mapping: &str) -> Vec<(&'static str, String)> {
+    vec![
+        (PERMISSION_CHECK, "LAKEKEEPER".to_string()),
+        (USER_MAPPING, mapping.to_string()),
+    ]
+}
+
+fn borrowed<'a>(pairs: &'a [(&'static str, String)]) -> Vec<(&'static str, &'a str)> {
+    pairs
+        .iter()
+        .map(|(key, value)| (*key, value.as_str()))
+        .collect()
+}
+
+type PropertyPairs<'a> = &'a [(&'a str, &'a str)];
+
+const EVENTS_TABLE_MAP: &str = r#"{"TABLE_MAP":{"EVENTS":"db.events"}}"#;
+
+/// Each VS request type over `properties`, as Exasol sends it.
+fn every_request_type(properties: &Json) -> Vec<(&'static str, Json)> {
+    vec![
+        (
+            "createVirtualSchema",
+            serde_json::json!({"type": "createVirtualSchema", "properties": properties}),
+        ),
+        (
+            "refresh",
+            serde_json::json!({
+                "type": "refresh",
+                "schemaMetadataInfo": {"properties": properties, "adapterNotes": EVENTS_TABLE_MAP},
+            }),
+        ),
+        (
+            "setProperties",
+            serde_json::json!({
+                "type": "setProperties",
+                "properties": properties,
+                "schemaMetadataInfo": {
+                    "properties": {"CATALOG_CONNECTION": "MY_CONN"},
+                    "adapterNotes": EVENTS_TABLE_MAP,
+                },
+            }),
+        ),
+        ("pushdown", events_pushdown_request(properties)),
+    ]
+}
+
+fn events_pushdown_request(properties: &Json) -> Json {
+    serde_json::json!({
+        "type": "pushdown",
+        "involvedTables": [{"name": "EVENTS", "columns": [
+            {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+        ]}],
+        "pushdownRequest": {
+            "type": "select",
+            "selectList": [{"type": "column", "name": "ID", "tableName": "EVENTS"}],
+        },
+        "schemaMetadataInfo": {"properties": properties, "adapterNotes": EVENTS_TABLE_MAP},
+    })
+}
+
+fn join_pushdown_request(properties: &Json) -> Json {
+    let mut request = role_join_pushdown_request();
+    request["properties"] = Json::Object(serde_json::Map::new());
+    request["schemaMetadataInfo"]["properties"] = properties.clone();
+    request
+}
+
+fn user_error(result: Result<Json, UdfError>, context: &str) -> String {
+    match result {
+        Ok(response) => panic!("{context}: expected a refusal, got {response}"),
+        Err(UdfError::User(message)) => message,
+        Err(other) => panic!("{context}: expected a user error, got {other:?}"),
+    }
+}
+
+/// Every `CATALOG_KIND` value that `catalog_kind.rs` declares, read from its source so that a
+/// new kind joins the kind test without an edit here.
+fn declared_catalog_kind_values() -> Vec<String> {
+    include_str!("catalog_kind.rs")
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("const CATALOG_KIND_"))
+        .filter_map(|rest| rest.split('"').nth(1))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Scenario: Absent PERMISSION_CHECK leaves every request unchanged and contacts no management API
+#[test]
+fn absent_permission_check_sends_no_management_request_and_changes_no_output() {
+    let variants: [&[(&str, &str)]; 4] = [
+        &[],
+        &[(USER_MAPPING, LOWERCASE_MAPPING)],
+        &[(USER_MAPPING, "oidc~{{ user|lower @corp.net")],
+        &[
+            (PERMISSION_CHECK, ""),
+            (USER_MAPPING, "{% include \"x\" %}"),
+        ],
+    ];
+
+    let request_count = every_request_type(&vs_properties(&[])).len();
+    for request_type in 0..request_count {
+        let mut outputs = Vec::new();
+        for extra in variants {
+            let hosted = HostedLakekeeper::start(BatchCheckAnswer::Fixed(500, "{}"));
+            let (label, request) = every_request_type(&vs_properties(extra)).remove(request_type);
+            let response = dispatch(&mut hosted.context(), &request)
+                .unwrap_or_else(|e| panic!("{label} {extra:?} must succeed unchanged: {e}"));
+            assert!(
+                hosted.stand_in.management_requests().is_empty(),
+                "{label} {extra:?}: {:?}",
+                hosted.stand_in.targets()
+            );
+            outputs.push((label, response, hosted.stand_in.targets()));
+        }
+        let (label, baseline, baseline_targets) = &outputs[0];
+        for (_, response, targets) in &outputs[1..] {
+            assert_eq!(
+                response, baseline,
+                "{label}: the response must be unchanged"
+            );
+            assert_eq!(
+                targets, baseline_targets,
+                "{label}: the catalog requests too"
+            );
+        }
+    }
+
+    let unreachable = format!("{CLOSED_PORT_ADDRESS}/catalog");
+    let errors: Vec<String> = variants
+        .iter()
+        .map(|extra| {
+            user_error(
+                dispatch(
+                    &mut connection_context(&unreachable),
+                    &events_pushdown_request(&vs_properties(extra)),
+                ),
+                "an unreachable catalog",
+            )
+        })
+        .collect();
+    assert!(
+        errors.iter().all(|error| error == &errors[0]),
+        "every error message must be unchanged: {errors:?}"
+    );
+}
+
+/// Scenario: Invalid permission properties are rejected before the catalog is contacted
+#[test]
+fn invalid_permission_properties_are_rejected_before_the_connection_is_read() {
+    let cases: [(PropertyPairs, &[&str]); 4] = [
+        (
+            &[(PERMISSION_CHECK, "OPA")],
+            &["'OPA'", "'LAKEKEEPER'", "absent"],
+        ),
+        (&[(PERMISSION_CHECK, "LAKEKEEPER")], &[USER_MAPPING]),
+        (
+            &[(PERMISSION_CHECK, "LAKEKEEPER"), (USER_MAPPING, "")],
+            &[USER_MAPPING],
+        ),
+        (
+            &[
+                (PERMISSION_CHECK, "lakekeeper"),
+                (USER_MAPPING, "oidc~{{ user|lower @corp.net"),
+            ],
+            &["does not compile", "line 1"],
+        ),
+    ];
+
+    for (extra, fragments) in cases {
+        for (label, request) in every_request_type(&vs_properties(extra)) {
+            let message = user_error(
+                dispatch(
+                    &mut TestContext::scalar(vec![]).with_current_user("ALICE"),
+                    &request,
+                ),
+                label,
+            );
+            for fragment in fragments {
+                assert!(
+                    message.contains(fragment),
+                    "{label} {extra:?}: {fragment:?} missing: {message}"
+                );
+            }
+            assert!(!message.contains(LAKEKEEPER_CLIENT_SECRET), "{message}");
+        }
+    }
+}
+
+/// Scenario: The check is accepted only for an Iceberg REST catalog URI that ends in /catalog
+#[test]
+fn permission_check_rejects_every_other_kind_with_one_error() {
+    let kinds = declared_catalog_kind_values();
+    assert!(
+        kinds.len() >= 3,
+        "the source scan must find every declared kind: {kinds:?}"
+    );
+
+    for kind in &kinds {
+        let resolved =
+            catalog_kind::resolve_catalog_kind(&serde_json::json!({"CATALOG_KIND": kind}))
+                .unwrap_or_else(|e| panic!("{kind} is a declared kind: {e}"));
+        assert_ne!(resolved, CatalogKind::IcebergRest, "{kind}");
+
+        let mut extra = checked_properties(LOWERCASE_MAPPING);
+        extra.push(("CATALOG_KIND", kind.clone()));
+        for (label, request) in every_request_type(&vs_properties(&borrowed(&extra))) {
+            let message = user_error(
+                dispatch(
+                    &mut TestContext::scalar(vec![]).with_current_user("ALICE"),
+                    &request,
+                ),
+                label,
+            );
+            assert_eq!(message, KIND_REFUSAL, "{kind} {label}");
+        }
+    }
+}
+
+/// Scenario: The check is accepted only for an Iceberg REST catalog URI that ends in /catalog
+#[test]
+fn permission_check_rejects_a_catalog_uri_that_does_not_end_in_catalog() {
+    let hosted = HostedLakekeeper::start(BatchCheckAnswer::Deny(&[]));
+    let gateway_uri = format!("{}/iceberg", hosted.stand_in.catalog_uri());
+    let extra = checked_properties(LOWERCASE_MAPPING);
+
+    for (label, request) in every_request_type(&vs_properties(&borrowed(&extra))) {
+        let message = user_error(
+            dispatch(
+                &mut connection_context(&gateway_uri).with_current_user("ALICE"),
+                &request,
+            ),
+            label,
+        );
+        assert!(
+            message.contains(&gateway_uri) && message.contains("ending in '/catalog'"),
+            "{label}: the refusal must name the URI and the rule: {message}"
+        );
+    }
+    assert!(
+        hosted.stand_in.targets().is_empty(),
+        "a rejected URI must cost no request: {:?}",
+        hosted.stand_in.targets()
+    );
+}
+
+/// Scenario: The check is accepted only for an Iceberg REST catalog URI that ends in /catalog
+#[test]
+fn listing_requests_with_the_check_on_list_unchanged_and_send_no_check() {
+    let extra = checked_properties(LOWERCASE_MAPPING);
+    let checked = every_request_type(&vs_properties(&borrowed(&extra)));
+    let unchecked = every_request_type(&vs_properties(&[]));
+
+    for ((label, with), (_, without)) in checked
+        .into_iter()
+        .zip(unchecked)
+        .filter(|((label, _), _)| *label != "pushdown")
+    {
+        let on = HostedLakekeeper::start(BatchCheckAnswer::Fixed(500, "{}"));
+        let off = HostedLakekeeper::start(BatchCheckAnswer::Fixed(500, "{}"));
+
+        let listed_on = dispatch(&mut on.context(), &with)
+            .unwrap_or_else(|e| panic!("{label} with the check on lists: {e}"));
+        let listed_off = dispatch(&mut off.context(), &without)
+            .unwrap_or_else(|e| panic!("{label} with the check off lists: {e}"));
+
+        assert_eq!(
+            listed_on, listed_off,
+            "{label}: the listing must be unchanged"
+        );
+        assert_eq!(on.stand_in.targets(), off.stand_in.targets(), "{label}");
+        assert!(
+            on.stand_in.management_requests().is_empty(),
+            "{label}: a listing request sends no management request"
+        );
+    }
+}
+
+const BRANCHING_MAPPING: &str = r#"{% if user == "ETL_SVC" %}
+  oidc~6f1c0d2e-58b4-4c39-9a8f-2b1e7d4c0a91
+{% elif user is endingwith("_EXT") %}
+  oidc~{{ user[:-4]|lower }}@partner.com
+{% else %}
+  oidc~{{ user|lower }}@corp.net
+{% endif %}"#;
+
+/// The `identity.user` of every check the hosted stand-in received.
+fn checked_identities(hosted: &HostedLakekeeper) -> Vec<String> {
+    hosted
+        .stand_in
+        .batch_checks()
+        .iter()
+        .flat_map(|body| body["checks"].as_array().cloned().unwrap_or_default())
+        .map(|check| {
+            check["identity"]["user"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect()
+}
+
+/// Scenario: USER_MAPPING maps the querying user to a principal
+#[test]
+fn the_principal_is_rendered_from_the_current_user() {
+    let replace = r#"oidc~{{ user|lower|replace("_", ".") }}@corp.net"#;
+    let cases = [
+        (replace, "ALICE_COOPER", "oidc~alice.cooper@corp.net"),
+        (BRANCHING_MAPPING, "BOB_EXT", "oidc~bob@partner.com"),
+        (
+            BRANCHING_MAPPING,
+            "ETL_SVC",
+            "oidc~6f1c0d2e-58b4-4c39-9a8f-2b1e7d4c0a91",
+        ),
+    ];
+
+    for (mapping, user, principal) in cases {
+        let hosted = HostedLakekeeper::start(BatchCheckAnswer::Deny(&[]));
+        let properties = vs_properties(&borrowed(&checked_properties(mapping)));
+
+        dispatch(
+            &mut hosted.context_as(user),
+            &join_pushdown_request(&properties),
+        )
+        .unwrap_or_else(|e| panic!("{user}: an allowed join plans: {e}"));
+
+        assert_eq!(
+            checked_identities(&hosted),
+            vec![principal.to_string(); 2],
+            "{user}: every check names the mapped principal, never the scope user"
+        );
+    }
+}
+
+/// Scenario: A user that USER_MAPPING cannot map is refused before any request
+#[test]
+fn an_unmappable_user_is_refused_before_any_request() {
+    let lookup = r#"{% set ids = {"ALICE": "a.smith"} %}oidc~{{ ids[user] }}@corp.net"#;
+    let cases: [(&str, Option<&str>, &str); 5] = [
+        (LOWERCASE_MAPPING, None, "names no current Exasol user"),
+        (LOWERCASE_MAPPING, Some(""), "names no current Exasol user"),
+        (lookup, Some("CAROL"), "'CAROL'"),
+        (
+            "oidc~{{ user }}@corp.net",
+            Some("ALICE SMITH"),
+            "'ALICE SMITH'",
+        ),
+        ("oidc~{{ user|nosuch }}@corp.net", Some("ALICE"), "nosuch"),
+    ];
+
+    for (mapping, user, fragment) in cases {
+        let hosted = HostedLakekeeper::start(BatchCheckAnswer::Deny(&[]));
+        let request =
+            events_pushdown_request(&vs_properties(&borrowed(&checked_properties(mapping))));
+        let without_connection = TestContext::scalar(vec![]);
+        for mut context in [hosted.context(), without_connection] {
+            if let Some(user) = user {
+                context = context.with_current_user(user);
+            }
+            let message = user_error(dispatch(&mut context, &request), "an unmappable user");
+            assert!(
+                message.contains(fragment) && message.contains(USER_MAPPING),
+                "{user:?}: {fragment:?}: {message}"
+            );
+        }
+        assert!(
+            hosted.stand_in.targets().is_empty(),
+            "{user:?}: a refused user costs no request: {:?}",
+            hosted.stand_in.targets()
+        );
+    }
+}
+
+/// Scenario: The adapter trusts the template author and evaluates no user name as template text
+#[test]
+fn a_shared_principal_is_accepted_and_sent_as_a_json_string() {
+    let shared = r#"oidc~{% if user is startingwith("BI_") %}svc-reporting{% else %}{{ user|lower }}{% endif %}@corp.net"#;
+    let verbatim = "oidc~{{ user }}@corp.net";
+    let cases = [
+        (shared, "BI_TABLEAU", "oidc~svc-reporting@corp.net"),
+        (shared, "BI_POWERBI", "oidc~svc-reporting@corp.net"),
+        (verbatim, "{{7*7}}", "oidc~{{7*7}}@corp.net"),
+        (verbatim, r#"A"B\C"#, r#"oidc~A"B\C@corp.net"#),
+    ];
+
+    for (mapping, user, principal) in cases {
+        let hosted = HostedLakekeeper::start(BatchCheckAnswer::Deny(&[]));
+        let properties = vs_properties(&borrowed(&checked_properties(mapping)));
+
+        dispatch(
+            &mut hosted.context_as(user),
+            &events_pushdown_request(&properties),
+        )
+        .unwrap_or_else(|e| panic!("{user}: an allowed request plans: {e}"));
+
+        assert_eq!(checked_identities(&hosted), vec![principal.to_string()]);
+        let request = hosted
+            .stand_in
+            .requests()
+            .into_iter()
+            .find(|request| request.method == "POST" && request.target.ends_with("batch-check"))
+            .expect("the batch-check was sent");
+        let raw = String::from_utf8(request.body).expect("a JSON body is UTF-8");
+        assert!(
+            raw.contains(&serde_json::to_string(principal).expect("a string serializes")),
+            "the principal enters the body only as a JSON string: {raw}"
+        );
+        assert_eq!(
+            request.authorization.as_deref(),
+            Some(format!("Bearer {LAKEKEEPER_BEARER_TOKEN}").as_str())
+        );
+    }
 }

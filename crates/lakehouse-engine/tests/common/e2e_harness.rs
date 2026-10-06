@@ -163,6 +163,7 @@ pub struct VsProps<'a> {
     catalog_kind: Option<&'a str>,
     merge_schema: Option<&'a str>,
     hive_partitioning: Option<&'a str>,
+    properties: Vec<(&'a str, &'a str)>,
 }
 
 impl<'a> VsProps<'a> {
@@ -176,6 +177,7 @@ impl<'a> VsProps<'a> {
             catalog_kind: None,
             merge_schema: None,
             hive_partitioning: None,
+            properties: Vec::new(),
         }
     }
 
@@ -206,6 +208,12 @@ impl<'a> VsProps<'a> {
 
     pub fn with_hive_partitioning(mut self, hive_partitioning: &'a str) -> Self {
         self.hive_partitioning = Some(hive_partitioning);
+        self
+    }
+
+    /// Any further property; the value reaches Exasol verbatim, multi-line text included.
+    pub fn with_property(mut self, name: &'a str, value: &'a str) -> Self {
+        self.properties.push((name, value));
         self
     }
 }
@@ -266,6 +274,11 @@ fn prepare_create_virtual_schema(
     let catalog_kind_clause = optional_clause("CATALOG_KIND", props.catalog_kind);
     let merge_schema_clause = optional_clause("MERGE_SCHEMA", props.merge_schema);
     let hive_partitioning_clause = optional_clause("HIVE_PARTITIONING", props.hive_partitioning);
+    let property_clauses: String = props
+        .properties
+        .iter()
+        .map(|(name, value)| format!("\n  {name} = '{}'", value.replace('\'', "''")))
+        .collect();
     // Exasol rejects `NAMESPACE = ''`.
     let namespace_clause = if props.namespace.is_empty() {
         String::new()
@@ -277,7 +290,7 @@ fn prepare_create_virtual_schema(
         r#"CREATE VIRTUAL SCHEMA {vs_name}
 USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   CATALOG_CONNECTION  = '{catalog_conn_name}'
-  ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}{hive_partitioning_clause}"#,
+  ALLOW_HTTP          = 'true'{namespace_clause}{parallelism_clause}{join_clause}{catalog_kind_clause}{merge_schema_clause}{hive_partitioning_clause}{property_clauses}"#,
         vs_name = props.vs_name,
         catalog_conn_name = props.catalog_conn_name,
     )

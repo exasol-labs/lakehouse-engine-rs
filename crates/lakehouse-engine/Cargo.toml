@@ -71,6 +71,8 @@ percent-encoding = { workspace = true }
 # default-features off so no subscriber machinery enters the .so.
 tracing = { version = "0.1", default-features = false }
 
+minijinja = { workspace = true }
+
 aes-gcm = "0.10"
 hkdf    = "0.12"
 sha2    = "0.10"

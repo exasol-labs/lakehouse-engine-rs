@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::permission::{PermissionGate, PermissionSettings};
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use lakehouse_catalog::{
@@ -11,11 +12,11 @@ use tokio::net::TcpListener;
 type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
 
 /// Every response closes its connection, so one accept loop serves a pooled client's sequential
-/// requests in arrival order. `responder` maps a request head to a status, content type, and body;
-/// the validators make a body readable as an object.
+/// requests in arrival order. `responder` maps a request head and body to a status, content type,
+/// and body; the validators make a body readable as an object.
 async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
 where
-    F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
+    F: Fn(&str, &[u8]) -> (u16, &'static str, String) + Send + Sync + 'static,
 {
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
     let address = format!("http://{}", listener.local_addr().expect("local_addr"));
@@ -27,7 +28,7 @@ where
             let Some((head, body)) = read_http_request(&mut stream).await else {
                 continue;
             };
-            let (status, content_type, response_body) = responder(&head);
+            let (status, content_type, response_body) = responder(&head, &body);
             recorded
                 .lock()
                 .expect("recorded requests")
@@ -60,27 +61,229 @@ pub(super) struct RecordingCatalog {
     requests: RecordedRequests,
 }
 
+/// One request a [`RecordingCatalog`] received, in arrival order.
+#[derive(Debug, Clone)]
+pub(crate) struct RecordedRequest {
+    pub(crate) method: String,
+    pub(crate) target: String,
+    pub(crate) authorization: Option<String>,
+    pub(crate) body: Vec<u8>,
+}
+
 impl RecordingCatalog {
     /// `responder` maps a request target to a status and body.
     pub(super) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
-        let (uri, requests) = spawn_fake_http_server(move |head| {
-            let (status, body) = responder(request_target(head));
-            (status, "application/json", body)
+        Self::spawn_reading_bodies(move |target, _| responder(target)).await
+    }
+
+    /// `responder` maps a request target and its body to a status and body.
+    pub(super) async fn spawn_reading_bodies<F>(responder: F) -> Self
+    where
+        F: Fn(&str, &[u8]) -> (u16, String) + Send + Sync + 'static,
+    {
+        let (uri, requests) = spawn_fake_http_server(move |head, body| {
+            let (status, response_body) = responder(request_target(head), body);
+            (status, "application/json", response_body)
         })
         .await;
         Self { uri, requests }
     }
 
     pub(super) fn targets(&self) -> Vec<String> {
+        self.requests()
+            .into_iter()
+            .map(|request| request.target)
+            .collect()
+    }
+
+    pub(crate) fn requests(&self) -> Vec<RecordedRequest> {
         self.requests
             .lock()
             .expect("recorded requests")
             .iter()
-            .map(|(head, _)| request_target(head).to_string())
+            .map(|(head, body)| RecordedRequest {
+                method: head.split_whitespace().next().unwrap_or("").to_string(),
+                target: request_target(head).to_string(),
+                authorization: header(head, "authorization").map(str::to_string),
+                body: body.clone(),
+            })
             .collect()
+    }
+}
+
+pub(crate) const LAKEKEEPER_WAREHOUSE_ID: &str = "5c25f9c4-be40-11f1-a87d-17102559a460";
+pub(crate) const LAKEKEEPER_BEARER_TOKEN: &str = "LAKEKEEPER_BEARER_TOKEN_SENTINEL";
+pub(crate) const LAKEKEEPER_CLIENT_SECRET: &str = "LAKEKEEPER_CLIENT_SECRET_SENTINEL";
+pub(crate) const LAKEKEEPER_TOKEN_TARGET: &str = "/catalog/v1/oauth/tokens";
+pub(crate) const LAKEKEEPER_CONFIG_TARGET: &str = "/catalog/v1/config?warehouse=wh";
+pub(crate) const LAKEKEEPER_BATCH_CHECK_TARGET: &str = "/management/v1/action/batch-check";
+const LAKEKEEPER_EMPTY_LISTING: &str = r#"{"identifiers":[],"namespaces":[]}"#;
+
+pub(crate) fn lakekeeper_load_table_target(table: &str) -> String {
+    format!("/catalog/v1/{LAKEKEEPER_WAREHOUSE_ID}/namespaces/db/tables/{table}")
+}
+
+/// How a [`LakekeeperStandIn`] answers a batch-check.
+#[derive(Clone, Copy)]
+pub(crate) enum BatchCheckAnswer {
+    /// `allowed: false` for each listed `namespace.table`, `allowed: true` for every other.
+    Deny(&'static [&'static str]),
+    /// This status and body, whatever the request checks.
+    Fixed(u16, &'static str),
+}
+
+/// A Lakekeeper stand-in that mounts `/catalog` beside `/management`: the OAuth2 token endpoint,
+/// a `/v1/config` naming [`LAKEKEEPER_WAREHOUSE_ID`] as the prefix, a snapshotless `loadTable`
+/// for every table, an empty listing for every other catalog GET, and `answer` per batch-check.
+pub(crate) struct LakekeeperStandIn {
+    catalog: RecordingCatalog,
+}
+
+impl LakekeeperStandIn {
+    pub(crate) async fn spawn(answer: BatchCheckAnswer) -> Self {
+        let catalog = RecordingCatalog::spawn_reading_bodies(move |target, body| {
+            answer_like_lakekeeper(target, body, answer)
+        })
+        .await;
+        Self { catalog }
+    }
+
+    pub(crate) fn catalog_uri(&self) -> String {
+        format!("{}/catalog", self.catalog.uri)
+    }
+
+    pub(crate) fn requests(&self) -> Vec<RecordedRequest> {
+        self.catalog.requests()
+    }
+
+    pub(crate) fn targets(&self) -> Vec<String> {
+        self.catalog.targets()
+    }
+
+    /// The body of every batch-check the stand-in received.
+    pub(crate) fn batch_checks(&self) -> Vec<Json> {
+        self.requests()
+            .into_iter()
+            .filter(|request| request.target == LAKEKEEPER_BATCH_CHECK_TARGET)
+            .map(|request| {
+                serde_json::from_slice(&request.body).expect("a batch-check body is JSON")
+            })
+            .collect()
+    }
+
+    pub(crate) fn management_requests(&self) -> Vec<String> {
+        self.targets()
+            .into_iter()
+            .filter(|target| target.starts_with("/management"))
+            .collect()
+    }
+}
+
+fn answer_like_lakekeeper(target: &str, body: &[u8], answer: BatchCheckAnswer) -> (u16, String) {
+    let path = target.split('?').next().unwrap_or(target);
+    if path == LAKEKEEPER_TOKEN_TARGET {
+        let token = serde_json::json!({
+            "access_token": LAKEKEEPER_BEARER_TOKEN,
+            "token_type": "bearer",
+            "expires_in": 3600,
+            "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
+        });
+        return (200, token.to_string());
+    }
+    if path == "/catalog/v1/config" {
+        let config = serde_json::json!({
+            "defaults": {"prefix": LAKEKEEPER_WAREHOUSE_ID},
+            "overrides": {},
+        });
+        return (200, config.to_string());
+    }
+    if path == LAKEKEEPER_BATCH_CHECK_TARGET {
+        return answer_batch_check(body, answer);
+    }
+    let loaded_table = path
+        .strip_prefix(&format!(
+            "/catalog/v1/{LAKEKEEPER_WAREHOUSE_ID}/namespaces/"
+        ))
+        .and_then(|rest| rest.split_once("/tables/"))
+        .map(|(_, table)| table)
+        .filter(|table| !table.is_empty() && !table.contains('/'));
+    if let Some(table) = loaded_table {
+        return (
+            200,
+            snapshotless_load_table_body(&format!("s3://bucket/{table}")),
+        );
+    }
+    if path.starts_with("/catalog/") {
+        return (200, LAKEKEEPER_EMPTY_LISTING.to_string());
+    }
+    (404, r#"{"message":"no such route"}"#.to_string())
+}
+
+fn answer_batch_check(body: &[u8], answer: BatchCheckAnswer) -> (u16, String) {
+    let denied = match answer {
+        BatchCheckAnswer::Fixed(status, body) => return (status, body.to_string()),
+        BatchCheckAnswer::Deny(denied) => denied,
+    };
+    let request: Json = serde_json::from_slice(body).expect("a batch-check body is JSON");
+    let results: Vec<Json> = request["checks"]
+        .as_array()
+        .expect("a batch-check carries checks")
+        .iter()
+        .map(|check| {
+            let table = &check["operation"]["table"];
+            let namespace: Vec<&str> = table["namespace"]
+                .as_array()
+                .expect("a table check names its namespace")
+                .iter()
+                .filter_map(Json::as_str)
+                .collect();
+            let qualified = format!(
+                "{}.{}",
+                namespace.join("."),
+                table["table"].as_str().unwrap_or_default()
+            );
+            serde_json::json!({
+                "id": check["id"],
+                "allowed": !denied.contains(&qualified.as_str()),
+            })
+        })
+        .collect();
+    (200, serde_json::json!({ "results": results }).to_string())
+}
+
+/// OAuth2 client credentials against a [`LakekeeperStandIn`]'s own token endpoint.
+pub(crate) fn lakekeeper_creds() -> ConnectionCreds {
+    ConnectionCreds {
+        client_id: Some("lakehouse".into()),
+        client_secret: Some(LAKEKEEPER_CLIENT_SECRET.into()),
+        ..unauthenticated_creds()
+    }
+}
+
+/// The gate the pushdown arm builds for `user` under `oidc~{{ user|lower }}@corp.net`.
+pub(crate) fn lakekeeper_gate(user: &str) -> PermissionGate {
+    PermissionSettings::parse(&serde_json::json!({
+        "PERMISSION_CHECK": "LAKEKEEPER",
+        "USER_MAPPING": "oidc~{{ user|lower }}@corp.net",
+    }))
+    .expect("valid permission properties")
+    .gate_for(|| Some(user.to_string()))
+    .expect("the user maps to a principal")
+    .expect("the check is on, so a gate is built")
+}
+
+/// A connection to `stand_in` that carries `gate`, as the pushdown arm stores it.
+pub(super) fn lakekeeper_connection(
+    stand_in: &LakekeeperStandIn,
+    gate: Option<PermissionGate>,
+) -> ResolvedConnectionConfig {
+    ResolvedConnectionConfig {
+        catalog_uri: stand_in.catalog_uri(),
+        permission_gate: gate,
+        ..test_connection(lakekeeper_creds())
     }
 }
 /// No catalog auth, so a session issues no token-grant request.
@@ -349,7 +552,7 @@ pub(super) struct ObjectEndpoint {
 impl ObjectEndpoint {
     pub(super) async fn spawn(bucket: &str, objects: Vec<(String, String)>) -> Self {
         let bucket = bucket.to_string();
-        let (endpoint, requests) = spawn_fake_http_server(move |head| {
+        let (endpoint, requests) = spawn_fake_http_server(move |head, _| {
             let target = request_target(head);
             let (path, query) = target.split_once('?').unwrap_or((target, ""));
             if query.contains("list-type=2") {
@@ -420,7 +623,7 @@ impl GlueEndpoint {
     where
         F: Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
     {
-        let (address, requests) = spawn_fake_http_server(move |head| {
+        let (address, requests) = spawn_fake_http_server(move |head, _| {
             let (status, body) = match glue_operation(head) {
                 Some(operation) => responder(operation),
                 None => (400, serde_json::Value::Null),
@@ -546,6 +749,7 @@ pub(super) async fn delta_pushdown(
         catalog_kind: CatalogKind::UnityCatalogNative,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_gate: None,
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),
@@ -591,6 +795,7 @@ fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_gate: None,
     }
 }
 

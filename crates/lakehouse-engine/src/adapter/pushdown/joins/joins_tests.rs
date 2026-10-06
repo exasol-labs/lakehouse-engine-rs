@@ -637,6 +637,7 @@ async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, Udf
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_gate: None,
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),
@@ -663,6 +664,7 @@ async fn delta_n_scan_pushdown(
         catalog_kind: CatalogKind::UnityCatalogNative,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_gate: None,
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),

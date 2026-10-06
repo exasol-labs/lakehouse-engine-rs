@@ -84,7 +84,7 @@ use vs_expression::render_df_filter_safe;
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
-mod test_support;
+pub(super) mod test_support;
 
 #[cfg(test)]
 #[path = "dispatch_golden_tests.rs"]
@@ -173,6 +173,7 @@ pub async fn handle_pushdown(
         connection,
         &[catalog.table.as_str()],
         &props,
+        conn.permission_gate.as_ref(),
     )
     .await?;
     let ResolvedScan {

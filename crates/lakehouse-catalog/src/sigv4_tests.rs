@@ -265,3 +265,29 @@ fn required_signing_region_refuses_without_a_signing_region() {
          supplies one"
     );
 }
+
+#[test]
+fn signed_post_commits_to_the_payload_hash_of_its_body() {
+    const EMPTY_PAYLOAD_SHA256: &str =
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    const BRACES_PAYLOAD_SHA256: &str =
+        "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a";
+    let client = reqwest::Client::new();
+    let request = client
+        .post("https://glue.us-east-1.amazonaws.com/iceberg/v1/echo")
+        .body("{}")
+        .build()
+        .expect("valid request");
+
+    let signed = sign_request(request, "AKIDEXAMPLE", "secret", None, "us-east-1", "glue")
+        .expect("signing must succeed");
+
+    let payload_hash = signed
+        .headers()
+        .get("x-amz-content-sha256")
+        .expect("the payload hash header must be present")
+        .to_str()
+        .expect("ASCII hash");
+    assert_ne!(payload_hash, EMPTY_PAYLOAD_SHA256);
+    assert_eq!(payload_hash, BRACES_PAYLOAD_SHA256);
+}

@@ -139,6 +139,7 @@ pub(super) async fn plan_join(
         connection,
         &identifiers,
         props,
+        conn.permission_gate.as_ref(),
     )
     .await?;
     // Legs are indexed positionally, not by tableName, which a self-join's occurrences share.

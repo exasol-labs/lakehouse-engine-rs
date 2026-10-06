@@ -1,7 +1,9 @@
 use super::super::test_support::filter_json::equal;
 use super::super::test_support::{
-    GlueEndpoint, ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog,
-    UNITY_TABLE_TARGET, iceberg_catalog, locationless_delta_table_body, object_endpoint,
+    BatchCheckAnswer, GlueEndpoint, ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET,
+    LAKEKEEPER_BATCH_CHECK_TARGET, LAKEKEEPER_CONFIG_TARGET, LAKEKEEPER_TOKEN_TARGET,
+    LakekeeperStandIn, RecordingCatalog, UNITY_TABLE_TARGET, iceberg_catalog, lakekeeper_creds,
+    lakekeeper_gate, lakekeeper_load_table_target, locationless_delta_table_body, object_endpoint,
     sample_storage, unauthenticated_creds,
 };
 use super::*;
@@ -30,6 +32,7 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
         },
         &["cat.sch.orders"],
         &Json::Null,
+        None,
     )
     .await
     .expect("a Unity Catalog session is built without contacting the catalog");
@@ -72,6 +75,7 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
         },
         &["sales.orders"],
         &Json::Null,
+        None,
     )
     .await
     .expect("a Glue session is built without contacting the catalog");
@@ -130,6 +134,7 @@ async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalo
             },
             &[unresolvable],
             &Json::Null,
+            None,
         )
         .await
         .err()
@@ -163,6 +168,7 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_ca
         },
         &["db.t", "malformed"],
         &Json::Null,
+        None,
     )
     .await
     .err()
@@ -194,6 +200,7 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
         },
         &["db.t"],
         &Json::Null,
+        None,
     )
     .await
     .expect("an Iceberg session resolves against a reachable catalog");
@@ -233,6 +240,7 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
         },
         &["db.t", "db.u"],
         &Json::Null,
+        None,
     )
     .await
     .expect("an Iceberg session resolves against a reachable catalog");
@@ -281,6 +289,7 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
         },
         &["cat.sch.orders", "cat.sch.customers"],
         &Json::Null,
+        None,
     )
     .await
     .expect("a Unity Catalog session is built without contacting the catalog");
@@ -348,6 +357,7 @@ async fn one_session_or_store_per_request_serves_every_leg() {
         },
         &["events", "event_labels"],
         &props,
+        None,
     )
     .await
     .expect("a direct-storage store is built from the CONNECTION alone");
@@ -401,6 +411,7 @@ async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused(
             },
             &["events", unresolvable],
             &Json::Null,
+            None,
         )
         .await
         .err()
@@ -439,6 +450,7 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
         },
         &["events"],
         &Json::Null,
+        None,
     )
     .await
     .expect("a direct-storage store is built from the CONNECTION alone");
@@ -504,6 +516,7 @@ async fn request_session_has_one_variant_per_kind() {
             },
             &[identifier],
             &Json::Null,
+            None,
         )
         .await
         .unwrap_or_else(|e| panic!("{kind:?} must resolve a session of its own: {e}"));
@@ -526,6 +539,7 @@ async fn resolve_events_under_hive_partitioning(
         },
         &["events"],
         &serde_json::json!({ "HIVE_PARTITIONING": hive_partitioning }),
+        None,
     )
     .await?;
     resolver.resolve("events", Some(filter), &[]).await
@@ -561,4 +575,118 @@ async fn hive_partitioning_reaches_the_seam_on_pushdown() {
         error.contains("failed to read the Parquet footer"),
         "expected a footer-read error: {error}"
     );
+}
+
+fn gated_connection<'a>(
+    storage: &'a StorageBackend,
+    creds: &'a lakehouse_catalog::ConnectionCreds,
+) -> ConnectionStorage<'a> {
+    ConnectionStorage {
+        storage,
+        creds,
+        allow_http: true,
+    }
+}
+
+/// Scenario: One batch-check per query decides every table before any table is read
+#[tokio::test]
+async fn a_gated_resolver_refuses_an_unchecked_identifier() {
+    let stand_in = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(&[])).await;
+    let creds = lakekeeper_creds();
+    let storage = sample_storage();
+    let gate = lakekeeper_gate("ALICE");
+
+    let resolver = TableScanResolver::for_request(
+        CatalogKind::IcebergRest,
+        &stand_in.catalog_uri(),
+        gated_connection(&storage, &creds),
+        &["db.t"],
+        &Json::Null,
+        Some(&gate),
+    )
+    .await
+    .expect("Lakekeeper allows the one checked table");
+
+    let refusal = resolver
+        .resolve("db.u", None, &[])
+        .await
+        .expect_err("an identifier the check did not cover must be refused")
+        .to_string();
+    assert!(
+        refusal.contains("'db.u'") && refusal.contains("permission check"),
+        "the refusal must name the unchecked identifier and the check: {refusal}"
+    );
+
+    resolver
+        .resolve("db.t", None, &[])
+        .await
+        .expect("the checked table resolves");
+    assert_eq!(
+        stand_in.targets(),
+        vec![
+            LAKEKEEPER_TOKEN_TARGET.to_string(),
+            LAKEKEEPER_CONFIG_TARGET.to_string(),
+            LAKEKEEPER_BATCH_CHECK_TARGET.to_string(),
+            lakekeeper_load_table_target("t"),
+        ],
+        "the unchecked identifier must cost no loadTable, the checked one exactly one"
+    );
+}
+
+/// Scenario: One batch-check per query decides every table before any table is read
+#[tokio::test]
+async fn a_gated_resolver_under_any_other_kind_refuses_every_identifier() {
+    let unity = RecordingCatalog::spawn(|_| (200, locationless_delta_table_body())).await;
+    let glue = GlueEndpoint::spawn(|_| (200, serde_json::json!({}))).await;
+    let endpoint = empty_s3_endpoint().await;
+    let creds = unauthenticated_creds();
+    let storage = sample_storage();
+    let direct_storage = direct_storage_backend(&endpoint.uri);
+    let gate = lakekeeper_gate("ALICE");
+
+    for (kind, uri, backend, identifier) in [
+        (
+            CatalogKind::UnityCatalogNative,
+            unity.uri.as_str(),
+            &storage,
+            "cat.sch.orders",
+        ),
+        (
+            CatalogKind::Glue,
+            glue.address.as_str(),
+            &storage,
+            "sales.orders",
+        ),
+        (
+            CatalogKind::DirectStorage,
+            DIRECT_STORAGE_ADDRESS,
+            &direct_storage,
+            "events",
+        ),
+    ] {
+        let resolver = TableScanResolver::for_request(
+            kind,
+            uri,
+            gated_connection(backend, &creds),
+            &[identifier],
+            &Json::Null,
+            Some(&gate),
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{kind:?} builds its session without a request: {e}"));
+
+        let refusal = resolver
+            .resolve(identifier, None, &[])
+            .await
+            .expect_err("a kind whose resolution runs no check must refuse every table")
+            .to_string();
+        assert!(
+            refusal.contains(&format!("'{identifier}'")),
+            "{kind:?}: the refusal must name the identifier: {refusal}"
+        );
+    }
+
+    assert!(unity.targets().is_empty(), "{:?}", unity.targets());
+    assert!(glue.operations().is_empty(), "{:?}", glue.operations());
+    assert!(endpoint.targets().is_empty(), "{:?}", endpoint.targets());
 }

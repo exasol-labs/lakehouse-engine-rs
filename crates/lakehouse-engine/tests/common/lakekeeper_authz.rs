@@ -1,5 +1,6 @@
 //! Permission fixture for the Lakekeeper `lakekeeper-e2e` suite: OpenFGA-backed grants for
-//! three test principals, `batch-check` calls, and the fixture normalizer.
+//! the test principals and for the ids the permission check's `USER_MAPPING` derives,
+//! `batch-check` calls, and the fixture normalizer.
 //! Helpers panic, never skip, and never put a secret or token in a panic message.
 #![cfg(feature = "lakekeeper-e2e")]
 
@@ -14,11 +15,17 @@ use super::lakekeeper::{
     self, WAREHOUSE_AUTHZ, WarehouseProfile, http_client, keycloak_client_credentials_token,
     keycloak_client_credentials_token_for, management_base,
 };
+use super::seed::{E2E_NAMESPACE, E2E_TABLE, SeedCatalogAuth, seed_events_table_with_auth};
 
 pub const AUTHZ_NAMESPACE: &str = "authz";
 pub const TABLE_ALPHA: &str = "authz_alpha";
 pub const TABLE_BETA: &str = "authz_beta";
 pub const TABLE_MISSING: &str = "authz_missing";
+
+/// The ids the permission-check test's `USER_MAPPING` derives from its three Exasol users.
+pub const MAPPED_ALLOWED: &str = "oidc~lk.allowed@lakehouse.test";
+pub const MAPPED_DENIED: &str = "oidc~lk.denied@lakehouse.test";
+pub const MAPPED_UNKNOWN: &str = "oidc~lk.unknown@lakehouse.test";
 
 const ERROR_ID_PREFIX: &str = "Error ID: ";
 
@@ -181,13 +188,14 @@ pub struct Grant {
     pub relation: &'static str,
 }
 
-const ALL_SCOPES: [Scope; 6] = [
+const ALL_SCOPES: [Scope; 7] = [
     Scope::Server,
     Scope::Project,
     Scope::Warehouse,
     Scope::Namespace,
     Scope::Table(TABLE_ALPHA),
     Scope::Table(TABLE_BETA),
+    Scope::Table(E2E_TABLE),
 ];
 
 pub struct AuthzFixture {
@@ -336,7 +344,11 @@ impl AuthzFixture {
 
     /// Replaces the principal's grants with exactly `grants`; a no-op when it already holds them.
     pub fn set_assignments(&self, principal: &Principal, grants: &[Grant]) {
-        let user_id = self.principal_id(principal);
+        self.set_user_assignments(self.principal_id(principal), grants);
+    }
+
+    /// [`Self::set_assignments`] for a Lakekeeper id that need never have logged in.
+    pub fn set_user_assignments(&self, user_id: &str, grants: &[Grant]) {
         let token = keycloak_client_credentials_token();
         for scope in ALL_SCOPES {
             let wanted: Vec<&str> = grants
@@ -403,9 +415,11 @@ fn ensure_namespace(warehouse_id: &str) -> String {
 /// Metadata-only: no data file is written, since only the table id matters to a check.
 fn ensure_table(warehouse_id: &str, table: &str) -> String {
     let token = keycloak_client_credentials_token();
-    let base = catalog_url(warehouse_id);
     let create = post(
-        &format!("{base}/namespaces/{AUTHZ_NAMESPACE}/tables"),
+        &format!(
+            "{}/namespaces/{AUTHZ_NAMESPACE}/tables",
+            catalog_url(warehouse_id)
+        ),
         &token,
         &json!({
             "name": table,
@@ -421,15 +435,47 @@ fn ensure_table(warehouse_id: &str, table: &str) -> String {
         &format!("Lakekeeper create table '{table}'"),
         &[200, 409],
     );
-    let fetched = get(
-        &format!("{base}/namespaces/{AUTHZ_NAMESPACE}/tables/{table}"),
-        &token,
+    table_uuid(warehouse_id, AUTHZ_NAMESPACE, table)
+}
+
+fn table_uuid(warehouse_id: &str, namespace: &str, table: &str) -> String {
+    let url = format!(
+        "{}/namespaces/{namespace}/tables/{table}",
+        catalog_url(warehouse_id)
     );
-    expect_status(&fetched, &format!("Lakekeeper GET table '{table}'"), &[200]);
+    let fetched = get(&url, &keycloak_client_credentials_token());
+    expect_status(
+        &fetched,
+        &format!("Lakekeeper GET table '{namespace}.{table}'"),
+        &[200],
+    );
     fetched.body["metadata"]["table-uuid"]
         .as_str()
-        .unwrap_or_else(|| panic!("Lakekeeper table '{table}' answered no table-uuid"))
+        .unwrap_or_else(|| panic!("Lakekeeper table '{namespace}.{table}' answered no table-uuid"))
         .to_string()
+}
+
+/// The permission-check test scans this table, so unlike the fixture tables it holds data.
+/// Seeding is idempotent, so the table and its id survive across runs.
+fn ensure_seeded_events_table(warehouse_id: &str) -> String {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for seeding the authz warehouse");
+    let auth = SeedCatalogAuth {
+        token: Some(keycloak_client_credentials_token()),
+        ..Default::default()
+    };
+    runtime
+        .block_on(seed_events_table_with_auth(
+            &lakekeeper::catalog_uri_host(),
+            WAREHOUSE_AUTHZ,
+            auth,
+        ))
+        .unwrap_or_else(|e| {
+            panic!("seed events into Lakekeeper warehouse '{WAREHOUSE_AUTHZ}': {e:#}")
+        });
+    table_uuid(warehouse_id, E2E_NAMESPACE, E2E_TABLE)
 }
 
 /// Not cached: every call re-reconciles the grants. Prefer `ensure_authz_fixture`.
@@ -444,10 +490,11 @@ pub fn provision_authz_fixture() -> AuthzFixture {
     }
 
     let namespace_id = ensure_namespace(&warehouse_id);
-    let table_ids = [TABLE_ALPHA, TABLE_BETA]
+    let mut table_ids: BTreeMap<&'static str, String> = [TABLE_ALPHA, TABLE_BETA]
         .into_iter()
         .map(|table| (table, ensure_table(&warehouse_id, table)))
         .collect();
+    table_ids.insert(E2E_TABLE, ensure_seeded_events_table(&warehouse_id));
 
     let fixture = AuthzFixture {
         warehouse_id,
@@ -461,6 +508,9 @@ pub fn provision_authz_fixture() -> AuthzFixture {
     };
     fixture.set_assignments(&READER_A, &[select(TABLE_ALPHA)]);
     fixture.set_assignments(&READER_B, &[select(TABLE_BETA)]);
+    fixture.set_user_assignments(MAPPED_ALLOWED, &[select(E2E_TABLE)]);
+    fixture.set_user_assignments(MAPPED_DENIED, &[select(TABLE_ALPHA)]);
+    fixture.set_user_assignments(MAPPED_UNKNOWN, &[]);
     fixture
 }
 
