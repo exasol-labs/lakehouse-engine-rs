@@ -4,7 +4,7 @@ Splits floating-point division (`FLOAT_DIV`, Exasol's `/`) out of the shared ari
 shape in `sql-comprehension/vs-expression-translator-scalar-ops`, because Exasol's `FN_FLOAT_DIV` is
 always true `DOUBLE` division while DataFusion's `/` is operand-typed and truncated integer and
 decimal operands (issue #186). The verbatim-exclusion table in
-`sql-comprehension/vs-expression-translator-scalar-fns` also references this feature: `FLOAT_DIV` is
+`sql-functions/vs-expression-translator-scalar-fns` also references this feature: `FLOAT_DIV` is
 an operator wire name, not an Exasol function name, so it never joins that table's verbatim rule.
 
 The DataFusion-dialect rendering now also owns the divide-by-zero outcome. Issue #370 measured a
@@ -96,8 +96,7 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
   **bit-exact, 0 of 3335 differing**. The residual is Exasol-internal, not a DataFusion mismatch:
   DataFusion 54.1 returns byte-identical values to Exasol's *own* `CAST(A AS DOUBLE)/B` form. Set
   against the pre-fix scale-6 truncation, relative error drops from ~1e-7 to ~2e-16. It is named
-  rather than claimed away, and it is why an equality assertion against a native oracle must use a
-  relative tolerance for decimal-numerator shapes rather than string equality.
+  rather than claimed away.
 * **The 2^53+1 literal is a false divergence — do not report it as one.** Native Exasol
   `SELECT 9007199254740993/2` returns `4503599627370496.5`, because Exasol constant-folds the literal
   in exact arithmetic. Over a `DECIMAL(18,0)` COLUMN — the only path pushdown can reach — Exasol
@@ -224,15 +223,15 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
 * *AND* the rendering SHALL stay type-blind and unconditional, correct for every operand-type combination the two lakehouse formats can present — `Int64`, `Decimal128`, `Float32` and `Float64` on either side, in any pairing — because the called function, not the SQL text, performs the coercion
 * *AND* NULL SHALL propagate unchanged — a NULL left operand, a NULL right operand, and a NULL left operand over a zero right operand each yield NULL, not an error and not `NaN`
 * *AND* the resulting `Float64` column SHALL match the `DOUBLE PRECISION` EMITS type the adapter declares for the item from Exasol's own `selectListDataTypes` — live-confirmed as `{"type":"DOUBLE"}` with `"emit_exa_types":["DOUBLE PRECISION"]` — so the emit-boundary type coercion keeps the column on its zero-copy fast path
-* *AND* parity against native Exasol SHALL be asserted as bit-exact for an integer (scale-0) numerator and as equal within ~1 ULP for a non-zero-scale decimal numerator, because Exasol's own decimal division is not bit-identical to converting the numerator to `DOUBLE` first — over a `DECIMAL(18,2)` column, 3335 rows × divisors `{2,3,7,11,13}`, 1027 results (31%) differed by exactly one ULP, max relative difference `3.17e-16`, while the same sweep over `DECIMAL(p,0)/DECIMAL(p,0)` was bit-exact at 0 of 3335 — so an oracle comparison for a decimal-numerator shape MUST use a relative tolerance, never string equality
+* *AND* the result SHALL equal native Exasol's bit-exactly for an integer (scale-0) numerator and within ~1 ULP for a non-zero-scale decimal numerator, because Exasol's own decimal division is not bit-identical to converting the numerator to `DOUBLE` first — over a `DECIMAL(18,2)` column, 3335 rows × divisors `{2,3,7,11,13}`, 1027 results (31%) differed by exactly one ULP, max relative difference `3.17e-16`, while the same sweep over `DECIMAL(p,0)/DECIMAL(p,0)` was bit-exact at 0 of 3335
 
 ### Scenario: The Exasol dialect keeps rendering FLOAT_DIV as a bare division operator
 
 * *GIVEN* the same `function_scalar` node named `FLOAT_DIV`
 * *WHEN* the node is rendered through the Exasol-dialect entry points (`render_expression_exasol`, `render_expression_exasol_safe`, `render_df_filter_exasol_safe`) — the ones whose output Exasol's own core engine parses
 * *THEN* the translator SHALL return the bare `(<left> / <right>)`, UNCHANGED from every earlier revision of this feature, because Exasol's `/` IS `FN_FLOAT_DIV`: it already divides as `DOUBLE` for every operand type AND it already raises `22012` on a zero divisor, so it needs neither the cast nor the checked call
-* *AND* the two dialects SHALL therefore DIVERGE on the same `FLOAT_DIV` node — `vs_checked_float_div(<l>, <r>)` in the DataFusion dialect, `(<l> / <r>)` in the Exasol dialect — and the existing divergence guard SHALL be RETARGETED to assert this pair rather than deleted, so the divergence stays pinned by a test (the same treatment the CHAR CAST divergence received in `sql-comprehension/vs-expression-translator-cast`)
-* *AND* every Exasol-dialect consumer's SQL SHALL stay byte-identical — the qualified single-table wrapper, the N-scan join wrapper, the grouped merge, the single-group scalar-over-aggregate merge (`render_scalar_over_merge`, which calls `render_expression_exasol`), and the self-applied WHERE path — so both `dispatch_golden` fixtures carrying a translated `FLOAT_DIV` (`single_group_scalar_over_aggregate_dedup.sql`, `single_group_scalar_over_aggregate_interleaved.sql`) MUST remain unchanged, and a diff in either is a regression rather than an expected update
+* *AND* the two dialects SHALL therefore DIVERGE on the same `FLOAT_DIV` node — `vs_checked_float_div(<l>, <r>)` in the DataFusion dialect, `(<l> / <r>)` in the Exasol dialect
+* *AND* every Exasol-dialect consumer's SQL SHALL stay byte-identical — the qualified single-table wrapper, the N-scan join wrapper, the grouped merge, the single-group scalar-over-aggregate merge (`render_scalar_over_merge`, which calls `render_expression_exasol`), and the self-applied WHERE path
 * *AND* the `/` characters in the AVG and statistical merge fragments (`scalar_over_agg.rs`'s `SUM(<partial>) / NULLIF(SUM(<partial>), 0)` and the König–Huygens numerator) SHALL be unaffected in both dialects, because they are adapter-authored merge SQL that never passes through the translator's `FLOAT_DIV` arm
 
 ### Scenario: A pushed-down division by zero fails the query rather than returning a wrong value
@@ -282,6 +281,4 @@ disqualifies `DIV` and does not disqualify `FLOAT_DIV`.
 * *AND* `FLOAT_DIV` declared with the dialect-shaped form rather than the verbatim form, alongside `ADD`, `SUB`, `MULT`, and `NEG`
 * *WHEN* the sweep test renders every declared name through `render_expression_exasol` and compares it against that name's declared expectation
 * *THEN* `FLOAT_DIV` SHALL keep its shaped declaration and MUST NOT be moved to the verbatim form, because Exasol has no function called `FLOAT_DIV` — a verbatim rendering would emit `FLOAT_DIV(<l>, <r>)`, which Exasol rejects the same way it rejects `SIGNUM` and `STRPOS` (`function or script <NAME> not found`, SQL code 42000)
-* *AND* the sweep's Exasol-dialect expectation for `FLOAT_DIV` SHALL remain the bare `(<l> / <r>)` — unchanged by issue #186's fix and unchanged by issue #370's, both of which act on the DataFusion side only
-* *AND* the sweep's banned-token list SHALL GAIN the checked-division function name, because Exasol has no such function and a leak of that name into an Exasol-parsed fragment would fail at 42000 exactly as `SIGNUM` and `STRPOS` do — this is the first `FLOAT_DIV`-related token that belongs on the list
-* *AND* `CAST` MUST still NOT be added to that list, since `CAST` is valid Exasol SQL that the CAST scenarios legitimately emit in the Exasol dialect
+* *AND* no Exasol-dialect fragment SHALL contain the checked-division function name, because Exasol has no such function and the name would fail at 42000 exactly as `SIGNUM` and `STRPOS` do

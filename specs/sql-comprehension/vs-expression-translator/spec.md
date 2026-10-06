@@ -23,7 +23,7 @@ This delta SUPERSEDES the preceding statement "Every one of those four sites rea
 
 No translator entry point changes. Distinguishing a declined filter from a trivially-true one needs no new API: `render_expression_safe` does not suppress a trivially-true result, so it returns `None` for exactly the declined case, and the trivially-true rule stays owned by this crate.
 
-The `render_df_filter_safe` and `render_df_filter_exasol_safe` doc comments MUST NOT state that the adapter omits an unrenderable filter and Exasol keeps it as a correctness backstop. Both return `None` for two distinguishable reasons — trivially true, and unrenderable — and only the first is safe for a caller to omit. What a `None` MEANS belongs to the caller, and the callers differ (see `vs-adapter/pushdown-declined-filter-self-apply`).
+The `render_df_filter_safe` and `render_df_filter_exasol_safe` doc comments MUST NOT state that the adapter omits an unrenderable filter and Exasol keeps it as a correctness backstop. Both return `None` for two distinguishable reasons — trivially true, and unrenderable — and only the first is safe for a caller to omit. What a `None` MEANS belongs to the caller, and the callers differ (see `pushdown/pushdown-declined-filter-self-apply`).
 
 Because Exasol's compiler emitted the tree in the first place, the Exasol dialect's default is to render what Exasol sent — verbatim name, argument order, and argument count. A construct that is not an Exasol call form is rendered by its own per-name arm instead: an operator wire name, `MOD`, `CONCAT`, a CAST target, the `REGEXP_LIKE` predicate (whose Exasol form is infix), and `CASE` (whose Exasol form is `CASE WHEN … END`). The per-node rules live with each node's own feature: `-scalar-fns` for math, string, and conditional functions, `-date-fns` for date/time functions, `-literals` for timestamp literals, and `-cast` for CAST targets.
 
@@ -51,8 +51,8 @@ The full filter-predicate operator set — comparison, logical connectives, IS N
 * *WHEN* `render_expression` processes the node
 * *THEN* the translator SHALL return the column name uppercased and double-quoted as a DataFusion identifier
 * *AND* any embedded double-quote characters in the name MUST be escaped by doubling
-* *AND* when the `column` node ALSO carries a non-empty `tableAlias`, the translator SHALL render the reference table-qualified as `"ALIAS"."NAME"` — the multi-relation form `vs-adapter/pushdown-planning-join-fallback` depends on
-* *AND* the translator MUST NOT drop a `tableAlias` on its own; removing a `tableAlias` so a single-relation scan target resolves bare names is the CALLER's responsibility (`vs-adapter/pushdown-planning`), NOT the translator's
+* *AND* when the `column` node ALSO carries a non-empty `tableAlias`, the translator SHALL render the reference table-qualified as `"ALIAS"."NAME"` — the multi-relation form `pushdown-joins/pushdown-planning-join-fallback` depends on
+* *AND* the translator MUST NOT drop a `tableAlias` on its own; removing a `tableAlias` so a single-relation scan target resolves bare names is the CALLER's responsibility (`pushdown/pushdown-planning`), NOT the translator's
 
 ### Scenario: An undeclared scalar function name is not translated in either dialect
 

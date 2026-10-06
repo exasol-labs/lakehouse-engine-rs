@@ -17,7 +17,7 @@ decomposable statistical aggregates (`STDDEV`/`VARIANCE` family).
 
 * A rendered expression MAY call a function the scan session registers rather than a DataFusion
   built-in. The precedent is `lakehouse_render_nested_json`, registered by
-  `build_session_context` for `datafusion-scan/nested-json-rendering`. Issue #370 adds the second
+  `build_session_context` for `scan-types/nested-json-rendering`. Issue #370 adds the second
   such function, `vs_checked_float_div`, which `crates/vs-expression` emits for every
   DataFusion-dialect `FLOAT_DIV` node (see `sql-comprehension/vs-expression-translator-float-div`).
 * `build_session_context` is the ONE place a scan session is built in production. All three run

@@ -21,7 +21,7 @@ Refuses at plan time every column whose type is binary, on every source and at e
 * *WHEN* the pushdown plans, for each table, a `SELECT` of each binary column, a `SELECT *`, a filter on a binary column, `SELECT id`, and `SELECT COUNT(*)`
 * *THEN* every request that reads or emits a binary column, or a column containing a binary member, SHALL fail at plan time with a reason naming the column, the binary member when the column nests one, its declared type (`binary`, `fixed(16)`, or `uuid`), and issue #351
 * *AND* `SELECT id` and `SELECT COUNT(*)` SHALL succeed on every table
-* *AND* a table whose every column is refused SHALL be refused as a whole, per `vs-adapter/delta-type-mapping`
+* *AND* a table whose every column is refused SHALL be refused as a whole, per `delta/delta-type-mapping`
 
 ### Scenario: The listing declares a binary column
 
@@ -33,7 +33,7 @@ Refuses at plan time every column whose type is binary, on every source and at e
 
 * *GIVEN* a Glue Parquet table whose catalog declares `name string`, and a data file that stores `name` as a Parquet `BYTE_ARRAY` without the string annotation
 * *WHEN* a query reads `name`
-* *THEN* the scan SHALL admit the column and render it as text (`datafusion-scan/type-relaxation`), because the catalog declares it a string
+* *THEN* the scan SHALL admit the column and render it as text (`scan-types/type-relaxation`), because the catalog declares it a string
 * *AND* a value that is not valid UTF-8 SHALL fail the query and MUST NOT be returned altered
 * *AND* a catalog-declared source SHALL refuse a column only by its declared type
 
@@ -44,7 +44,7 @@ Refuses at plan time every column whose type is binary, on every source and at e
 * *THEN* each request that reads or emits `legacy_name` or `s` SHALL fail at plan time with a reason naming the column, the type `binary`, and issue #351
 * *AND* `SELECT id, name` and `SELECT COUNT(*)` SHALL succeed
 * *AND* a column that an embedded Arrow schema folds to `LargeBinary` or `BinaryView` SHALL be refused naming `binary`, and a `BSON`, `GEOMETRY`, or `GEOGRAPHY` column naming `bson`, `geometry`, or `geography`
-* *AND* a directory whose every column is refused SHALL be refused as a whole, per `vs-adapter/delta-type-mapping`
+* *AND* a directory whose every column is refused SHALL be refused as a whole, per `delta/delta-type-mapping`
 
 ### Scenario: A direct-storage ENUM column reads as text
 
