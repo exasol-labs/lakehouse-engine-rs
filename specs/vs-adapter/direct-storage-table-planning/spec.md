@@ -17,9 +17,8 @@ File-level sharding, the pushdown wire format, streaming emit, and the memory mo
   declared physical name binds by its own name. Delta's `none` column-mapping mode already ships
   that binding, and `datafusion-scan/scan-execution-field-id-projection` already specifies it.
 * This reader has no catalog statistics to prune from. Its plan-time file list is every file under
-  the table root that `vs-adapter/direct-storage-hive-partitioning` keeps. Footer-statistics
-  pruning is issue [#412](https://github.com/exasol-labs/lakehouse-engine-rs/issues/412), recorded
-  here as an explicit tracked exception rather than an unstated gap.
+  the table root that `vs-adapter/direct-storage-hive-partitioning` keeps and whose footer
+  statistics `vs-adapter/direct-storage-statistics-pruning` cannot rule out.
 * **Apache Iceberg and Delta specification check.** This reader implements NEITHER format and
   claims conformance to neither. Reading a directory that happens to hold an Iceberg or a Delta
   table as raw Parquet is therefore not a deviation from either specification. It is a different
@@ -56,8 +55,7 @@ File-level sharding, the pushdown wire format, streaming emit, and the memory mo
 * *GIVEN* a direct-storage table whose root holds many data files, and a query carrying a filter
 * *WHEN* the adapter plans that query
 * *THEN* the reader SHALL read, AT PLAN TIME, the footers the seam selects for the resolved merge mode among the files partition pruning keeps, so per-file schema variation and nested structure are exact rather than inferred from one file
-* *AND* a filter on no partition column SHALL narrow the rows the scan emits without narrowing the files it reads, because this kind has no catalog statistics and no manifest to prune from
-* *AND* the absence of footer-statistics pruning SHALL be recorded as an explicit tracked exception citing issue #412, and MUST NOT be left as an unstated gap
+* *AND* a filter on no partition column SHALL narrow the files only as far as `vs-adapter/direct-storage-statistics-pruning` proves from those same footers, and SHALL otherwise narrow only the rows the scan emits, because this kind has no catalog statistics and no manifest to prune from
 * *AND* the ABSENCE of any file-count or file-size bound on a table SHALL likewise be recorded here as an explicit exception rather than left unstated, because nothing refuses a directory holding hundreds of thousands of files, so the footer-read cost is unbounded at `createVirtualSchema` and at every plan that prunes nothing. That exception SHALL cite its tracking issue (#419) inline, because a bound that is not yet designed is a follow-up rather than a shipped behavior
 * *AND* each side of a broadcast join SHALL compare its OWN summed file sizes against the broadcast threshold, read from the seam's listing rather than from any Parquet read, so side selection costs no data access
 

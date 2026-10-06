@@ -32,10 +32,10 @@ the same seam for the file list alone.
   physical name binds by its own name. That is the identity binding
   `datafusion-scan/scan-execution-field-id-projection` already specifies. The same column-binding
   adapter that serves Iceberg and Delta inserts the per-file cast the widened declaration implies.
-* Per-file Parquet metadata is returned alongside the schema rather than discarded. Plan-time file
-  pruning from footer statistics is issue
-  [#412](https://github.com/exasol-labs/lakehouse-engine-rs/issues/412). A seam that returned
-  the schema alone would force that plan to re-read every footer it had already parsed.
+* Per-file Parquet metadata is returned alongside the schema rather than discarded.
+  `vs-adapter/direct-storage-statistics-pruning` prunes files from those footers at plan time. A
+  seam that returned the schema alone would force that pruning to re-read every footer the fold
+  already parsed.
 * Hive-style partition discovery belongs to this seam. `vs-adapter/direct-storage-hive-partitioning`
   specifies its rules.
 * Apache Iceberg and Delta specification check: NOT implicated. This seam reads raw Parquet
