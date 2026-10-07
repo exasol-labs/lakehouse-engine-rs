@@ -585,3 +585,47 @@ fn an_enforced_resolver_admits_only_the_tables_the_check_covered() {
     assert!(admission.admit("db.other").is_err());
     assert!(TableAdmission::Unchecked.admit("db.other").is_ok());
 }
+
+/// Scenario: One batch-check per query decides every table before any table is read
+#[tokio::test]
+async fn an_enforced_check_admits_an_allowed_table_and_refuses_a_denied_one() {
+    use crate::adapter::permission::{PERMISSION_CHECK, PermissionSettings, USER_MAPPING};
+
+    let check = PermissionSettings::parse(&serde_json::json!({
+        PERMISSION_CHECK: "LAKEKEEPER",
+        USER_MAPPING: "oidc~{{ user }}",
+    }))
+    .unwrap()
+    .check_for(|| Some("ALICE".into()))
+    .unwrap();
+    let (storage, creds) = (sample_storage(), unauthenticated_creds());
+    for allowed in [true, false] {
+        let catalog = RecordingCatalog::spawn(move |target| {
+            if target.starts_with("/catalog/v1/config") {
+                (200, "{}".to_string())
+            } else {
+                (
+                    200,
+                    format!(r#"{{"results":[{{"id":"read-data","allowed":{allowed}}}]}}"#),
+                )
+            }
+        })
+        .await;
+
+        let resolver = TableScanResolver::for_request(
+            CatalogKind::IcebergRest,
+            &format!("{}/catalog", catalog.uri),
+            ConnectionStorage {
+                storage: &storage,
+                creds: &creds,
+                allow_http: true,
+            },
+            &["db.t"],
+            &Json::Null,
+            &check,
+        )
+        .await;
+
+        assert_eq!(resolver.is_ok(), allowed);
+    }
+}

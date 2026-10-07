@@ -137,3 +137,83 @@ fn a_catalog_uri_without_a_trailing_catalog_segment_is_refused() {
         assert!(lakekeeper_management_url(uri).is_err(), "{uri}");
     }
 }
+
+async fn check_against(
+    status: u16,
+    body: String,
+    tables: &[&str],
+) -> Result<Vec<TableReadDecision>, UdfError> {
+    let (uri, _) = crate::test_support::spawn_server("application/json", move |request| {
+        if request.starts_with("GET /catalog/v1/config") {
+            (
+                200,
+                format!(r#"{{"defaults":{{"prefix":"{WAREHOUSE_ID}"}}}}"#),
+            )
+        } else {
+            (status, body.clone())
+        }
+    })
+    .await;
+    let creds = ConnectionCreds {
+        token: Some("tok".into()),
+        ..crate::test_support::base_creds()
+    };
+    let catalog_uri = format!("{uri}/catalog");
+    let session = CatalogSession::resolve(&catalog_uri, "wh", &creds).await?;
+    lakekeeper_batch_check(&session, PRINCIPAL, tables, &creds).await
+}
+
+fn recorded_response(text: &str) -> (u16, String) {
+    let fixture = recorded(text);
+    let status = fixture["response"]["status"].as_u64().unwrap() as u16;
+    (status, fixture["response"]["body"].to_string())
+}
+
+#[tokio::test]
+async fn recorded_lakekeeper_answers_become_decisions_or_errors() {
+    let tables = ["authz.authz_alpha"];
+    let (status, body) = recorded_response(include_str!(
+        "../tests/fixtures/lakekeeper/batch-check/allowed.json"
+    ));
+    let decisions = check_against(status, body, &tables).await.unwrap();
+    assert!(decisions[0].allowed);
+
+    let (status, body) = recorded_response(include_str!(
+        "../tests/fixtures/lakekeeper/batch-check/denied.json"
+    ));
+    assert!(!check_against(status, body, &tables).await.unwrap()[0].allowed);
+
+    let (status, body) = recorded_response(include_str!(
+        "../tests/fixtures/lakekeeper/batch-check/cannot-inspect.json"
+    ));
+    let UdfError::User(message) = check_against(status, body, &tables).await.unwrap_err() else {
+        panic!("expected a user error");
+    };
+    assert!(
+        message.contains("/management/v1/action/batch-check"),
+        "{message}"
+    );
+    assert!(message.contains("can_read_assignments"), "{message}");
+}
+
+#[tokio::test]
+async fn an_answer_that_is_not_a_batch_check_answer_is_never_an_allow() {
+    for (status, body) in [(200, "{}"), (500, "boom")] {
+        let result = check_against(status, body.into(), &["a.t"]).await;
+
+        let UdfError::User(message) = result.unwrap_err() else {
+            panic!("expected a user error");
+        };
+        assert!(message.contains("must be a Lakekeeper") || message.contains("Lakekeeper server"));
+    }
+}
+
+#[tokio::test]
+async fn no_tables_need_no_batch_check() {
+    assert!(
+        check_against(500, String::new(), &[])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
