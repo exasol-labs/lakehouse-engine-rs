@@ -10,7 +10,7 @@ pub(crate) fn struct_of(fields: Vec<StructField>) -> DataType {
     DataType::from(StructType::try_new(fields).expect("a valid struct"))
 }
 
-/// The primitive Glue columns of `vs-adapter/glue-hive-type-mapping`: each Hive type, its Spark
+/// The primitive Glue columns of `glue/glue-hive-type-mapping`: each Hive type, its Spark
 /// type, and the Exasol type the listing declares on an engine that declares timestamp precision.
 pub(crate) fn primitive_hive_types() -> [(&'static str, DataType, &'static str); 16] {
     [
@@ -33,7 +33,7 @@ pub(crate) fn primitive_hive_types() -> [(&'static str, DataType, &'static str);
     ]
 }
 
-/// The nested Glue columns of `vs-adapter/glue-hive-type-mapping`, each declared as JSON text.
+/// The nested Glue columns of `glue/glue-hive-type-mapping`, each declared as JSON text.
 pub(crate) fn nested_hive_types() -> [(&'static str, DataType); 4] {
     [
         (

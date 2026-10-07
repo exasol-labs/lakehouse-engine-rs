@@ -28,7 +28,7 @@ persisting any state between requests.
   independent properties `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF`
   are used verbatim (each defaulting to `max(nr_of_cores, 1)`); in `AUTO` mode the
   adapter derives a per-instance thread budget that does not oversubscribe a node (see
-  `datafusion-scan/scan-execution-threading`). Only the resolved integer fields are
+  `scan-runtime/scan-execution-threading`). Only the resolved integer fields are
   round-tripped into the per-shard scan spec.
 * The per-instance memory budget is two independent VS/connection properties —
   `MEMORY_POOL_FRACTION` (default `0.6`) and `INSTANCE_OVERHEAD_MB` (default `200`) —
@@ -64,7 +64,7 @@ persisting any state between requests.
 * *WHEN* Exasol sends the `createVirtualSchema` request naming an Iceberg table
 * *THEN* the adapter SHALL record the resolved DataFusion target partition count in the `createVirtualSchema` response's `adapterNotes` (stringified JSON) alongside `PARALLELISM_FACTOR` and the threading mode
 * *AND* in `FIXED` mode the adapter SHALL use the supplied `DATAFUSION_TARGET_PARTITIONS` value when it is a positive integer and otherwise default to `max(nr_of_cores, 1)`
-* *AND* in `AUTO` mode the adapter SHALL set the target partition count equal to the AUTO-derived `df_threads_per_udf` (per `datafusion-scan/scan-execution-threading`), ignoring any supplied `DATAFUSION_TARGET_PARTITIONS` value, persisting the count nowhere other than that returned `adapterNotes`
+* *AND* in `AUTO` mode the adapter SHALL set the target partition count equal to the AUTO-derived `df_threads_per_udf` (per `scan-runtime/scan-execution-threading`), ignoring any supplied `DATAFUSION_TARGET_PARTITIONS` value, persisting the count nowhere other than that returned `adapterNotes`
 
 ### Scenario: Adapter records the DataFusion threads-per-UDF count in the virtual-schema adapterNotes
 
@@ -81,7 +81,7 @@ persisting any state between requests.
 * *WHEN* the adapter returns the `createVirtualSchema` response
 * *THEN* the `adapterNotes` SHALL carry P as the `PARALLELISM_FACTOR` entry and SHALL carry no node-count entry
 * *AND* P SHALL be round-tripped back to the adapter at pushdown time, where it is multiplied by the node count the pushdown reads from its own UDF handshake to give the shard count `G`, capped at 300
-* *AND* the pushdown SHALL obtain the node-count factor of `G` from `UdfContext::node_count()` rather than from `adapterNotes` (see `vs-adapter/pushdown-planning`)
+* *AND* the pushdown SHALL obtain the node-count factor of `G` from `UdfContext::node_count()` rather than from `adapterNotes` (see `pushdown/pushdown-planning`)
 
 ### Scenario: Adapter records the memory-pool fraction in the virtual-schema adapterNotes
 

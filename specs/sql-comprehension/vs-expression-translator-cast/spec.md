@@ -8,7 +8,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
   unchanged — an error in raising mode, `None` in the safe variants, for exactly the targets whose
   DataFusion result would diverge. What is corrected is the claim that the adapter can therefore
   omit the CAST and let Exasol evaluate it: `FN_CAST` IS advertised, so nothing else evaluates it.
-  See `vs-adapter/pushdown-declined-filter-self-apply` and ADR `specs/_decision/045`.
+  See `pushdown/pushdown-declined-filter-self-apply` and ADR `specs/_decision/045`.
 * These five targets are refused in BOTH dialects, so a WHERE predicate carrying one cannot be
   self-applied either. That predicate is the terminal case: a clean client-facing error, never a
   result computed without it.
@@ -29,7 +29,7 @@ Extends the VS expression translator (`sql-comprehension/vs-expression-translato
   `render_expression_safe` sets `needs_full_fallback`, piped out as `projection_widened`, and the
   `RowScan` arm returns `qualified_single_table_fallback_pushdown`. WHERE: `datafusion_renderable`
   probes the node and a declined predicate is self-applied in the wrapper's own Exasol-dialect
-  `WHERE` (`vs-adapter/pushdown-declined-filter-self-apply`). GROUP BY: a group-key render failure
+  `WHERE` (`pushdown/pushdown-declined-filter-self-apply`). GROUP BY: a group-key render failure
   collapses grouped-aggregate detection to `None`, which falls through to
   `RequestShape::GroupByWrapper` and the same wrapper. ORDER BY: `parse_declined_sort_key` renders
   a non-column sort key in the EXASOL dialect from the start, so a DataFusion-dialect decline never

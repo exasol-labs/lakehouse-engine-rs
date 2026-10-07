@@ -1,7 +1,7 @@
 //! Compile-time probe outside `adapter::pushdown`, so it sees items at their declared visibility:
 //! narrowing any item below `pub(crate)` fails compilation. The list holds 27 items; the count
 //! makes a removal visible in review, since a deleted item still compiles. Changing the set or
-//! count requires a spec delta against `vs-adapter/pushdown-module-structure`.
+//! count requires a spec delta against `pushdown/pushdown-module-structure`.
 #![allow(unused_imports)]
 
 use crate::adapter::pushdown::{

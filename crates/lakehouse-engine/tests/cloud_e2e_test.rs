@@ -1110,6 +1110,8 @@ USING {CLOUD_SCHEMA_NAME}.{CLOUD_ADAPTER_SCRIPT} WITH
 /// Cloud assume-role E2E (issue #139): real AWS STS enforces the role's `sts:ExternalId`
 /// condition, which the local SeaweedFS stack does not evaluate. Shares the environment of
 /// `cloud_assume_role_reaches_glue_and_s3_through_the_role`.
+///
+/// Scenario: A wrong external id is denied by AWS STS
 #[test]
 fn cloud_assume_role_wrong_external_id_is_denied() {
     let env = match AssumeRoleCloudEnv::from_env() {

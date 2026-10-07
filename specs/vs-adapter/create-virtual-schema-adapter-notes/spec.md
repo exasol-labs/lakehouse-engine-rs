@@ -7,7 +7,7 @@ Records the resource budgets, the Exasol-name to Iceberg-identifier map, and the
 * The active cluster node count is NOT recorded in `adapterNotes`. It is UDF handshake
   metadata that every VS request already carries, so each `pushdown` reads it directly
   from `UdfContext::node_count()` instead of from a persisted note (see
-  `vs-adapter/pushdown-planning`). `adapterNotes` is reserved for values derived at
+  `pushdown/pushdown-planning`). `adapterNotes` is reserved for values derived at
   create time that a pushdown cannot recompute, such as `TABLE_MAP`, and for one
   diagnostic entry.
 * `SKIPPED_TABLES` is that one write-only diagnostic entry. It records the tables the
@@ -31,7 +31,7 @@ Records the resource budgets, the Exasol-name to Iceberg-identifier map, and the
   `std::thread::available_parallelism()`, once per request, at the single call site
   that resolves it. This is the same host-core-count source the scan UDF already
   trusts for DataFusion `target_partitions` (see
-  `datafusion-scan/scan-execution-threading`).
+  `scan-runtime/scan-execution-threading`).
 * `std::thread::available_parallelism()` returns an `io::Error` on a platform that
   cannot report a core count. The adapter then uses a core count of `1`. There is no
   distinct unknown sentinel: every derivation the core count feeds already floors its
@@ -64,7 +64,7 @@ Records the resource budgets, the Exasol-name to Iceberg-identifier map, and the
   `DATAFUSION_TARGET_PARTITIONS` and `DATAFUSION_THREADS_PER_UDF` are used verbatim
   (each defaulting to `max(nr_of_cores, 1)`); in `AUTO` mode the adapter derives a
   per-instance thread budget that does not oversubscribe a node (see
-  `datafusion-scan/scan-execution-threading`). Whichever mode is selected, only the
+  `scan-runtime/scan-execution-threading`). Whichever mode is selected, only the
   resolved integer `DATAFUSION_TARGET_PARTITIONS` / `DATAFUSION_THREADS_PER_UDF`
   values are round-tripped into the per-shard scan spec.
 * The per-instance memory budget is two independent VS/connection properties —

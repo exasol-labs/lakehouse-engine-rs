@@ -174,7 +174,7 @@ pub(crate) fn non_null_partition_value(logged: Option<&str>) -> Option<&str> {
 }
 
 /// The planning-time partition predicate converts with this too, so it and the scan agree on
-/// every value (`vs-adapter/partition-predicate-declared-types`).
+/// every value (`file-planning/partition-predicate-declared-types`).
 pub(crate) fn partition_scalar(
     value: &str,
     data_type: &DataType,

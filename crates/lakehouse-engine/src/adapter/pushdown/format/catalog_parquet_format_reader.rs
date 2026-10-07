@@ -39,7 +39,7 @@ use crate::types::mapping::arrow_type_from_tag;
 mod tests;
 
 /// The catalog is the schema authority; files supply only the listing and partition values. Every
-/// Spark type goes through the one Delta classifier (`vs-adapter/glue-table-planning`).
+/// Spark type goes through the one Delta classifier (`glue/glue-table-planning`).
 pub(super) struct CatalogParquetFormatReader<'a> {
     pub(super) table: &'a CatalogTable,
     pub(super) files: ParquetFileSource<'a>,

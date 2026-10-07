@@ -23,8 +23,8 @@ if [ -z "${TRINO_WORKER_HOST:-}" ]; then
 fi
 TRINO_PORT="${TRINO_PORT:-8080}"
 TRINO_IMAGE="${TRINO_IMAGE:-trinodb/trino:465}"
-KEY_FILE="${KEY_FILE:-$HOME/.ssh/spot-strata-rsa}"
-[ -f "$KEY_FILE" ] || { echo "ERROR: SSH private key not found: $KEY_FILE (set KEY_FILE=..., and make sure the Trino stack was applied with -var key_pair_name matching it)"; exit 1; }
+[ -n "${KEY_FILE:-}" ] || { echo "ERROR: KEY_FILE not set (path to the Trino EC2 key pair's private key, e.g. in bench/.env)"; exit 1; }
+[ -f "$KEY_FILE" ] || { echo "ERROR: SSH private key not found: $KEY_FILE (fix KEY_FILE, and make sure the Trino stack was applied with -var key_pair_name matching it)"; exit 1; }
 SSHOPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10"
 
 # The worker must reach the coordinator by its private ip: the public ip from inside the VPC does

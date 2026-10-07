@@ -157,7 +157,7 @@ fn assert_scan_names_only(pushed: &str, kept: &[&str], context: &str) {
     );
 }
 
-/// Scenario: Each run provisions its own Glue database and S3 prefix and removes both, including on panic
+/// specs/testing.md § Per-run cloud resources
 #[test]
 fn glue_run_resources_are_removed_when_the_scope_ends_including_on_panic() {
     let env = GlueEnv::from_environment();
@@ -260,7 +260,7 @@ fn glue_read_only_checks_pass_against_one_provisioned_fixture() {
     assert!(failed.is_empty(), "failed read-only checks: {failed:?}");
 }
 
-/// Scenario: The listing includes the routed tables and records every skip
+/// Scenario: The client routes a table by its declared table type before its storage descriptor
 fn check_listing_includes_routed_tables_and_records_every_skip(run: &GlueRun, conn: &mut ExaConn) {
     let listed = conn.query_columns(&format!(
         "SELECT TABLE_NAME FROM SYS.EXA_ALL_VIRTUAL_TABLES WHERE TABLE_SCHEMA = '{VS}' \
@@ -341,7 +341,7 @@ fn check_listing_includes_routed_tables_and_records_every_skip(run: &GlueRun, co
     }
 }
 
-/// Scenario: Queries through pushdown return the expected rows
+/// Scenario: Each kept partition's location is listed and its files carry the partition's Glue values
 fn check_queries_return_expected_rows_through_pushdown(_run: &GlueRun, conn: &mut ExaConn) {
     let orders = vs_table(ICEBERG_ORDERS);
 
@@ -429,7 +429,7 @@ fn check_partition_cases_return_their_glue_values(_run: &GlueRun, conn: &mut Exa
     assert_eq!(int_column(&slash_ids[0]), [5]);
 }
 
-/// Scenario: Queries through pushdown return the expected rows
+/// Scenario: A kept partition the reader cannot read faithfully fails the query naming it
 fn check_orc_partition_fails_loud(run: &GlueRun, conn: &mut ExaConn) {
     let orc = PARTITIONS
         .iter()
@@ -587,7 +587,7 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
     assert_binary_values_refused(conn, VS, BINARY_VALUES, "Invalid UTF8 sequence");
 }
 
-/// Scenario: An assume-role CONNECTION reads through the role and its base identity alone is denied
+/// Scenario: Session credentials sign every native Glue request
 fn check_assume_role_connection_reads_through_the_role(run: &GlueRun, conn: &mut ExaConn) {
     let env = run.env();
     let database = run.database();
@@ -648,7 +648,7 @@ fn check_assume_role_connection_reads_through_the_role(run: &GlueRun, conn: &mut
     );
 }
 
-/// Scenario: The suite fails, never skips, when a variable or the stack is missing
+/// specs/testing.md § Failure contract
 #[test]
 fn glue_suite_fails_when_stack_unavailable() {
     let message = panic_message(|| {
@@ -660,7 +660,7 @@ fn glue_suite_fails_when_stack_unavailable() {
     );
 }
 
-/// Scenario: No credential value appears in output
+/// specs/testing.md § Credentials in tests
 #[test]
 fn glue_credentials_never_appear_in_output() {
     const SENTINEL_ACCESS_KEY_ID: &str = "AKIAGLUEREDACTIONPROBE";

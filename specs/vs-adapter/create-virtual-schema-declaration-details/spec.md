@@ -27,20 +27,11 @@ scenario count crossed this library's per-spec organization threshold.
   field IDs, not the SQL identifier casing a downstream engine uses to expose that name. The spec
   mandates no case-sensitivity rule for consumers, so uppercasing at declaration is an Exasol
   identifier-resolution decision rather than an Iceberg deviation.
-* The non-ASCII round trip below is a LIVE E2E scenario, not a unit one, because the property under
-  test is a round-trip through a real `createVirtualSchema` and a real query — exactly the class
-  CLAUDE.md § Verification discipline requires be checked against a running Exasol instance rather
-  than asserted from a capability list or from code inspection. The unit-level fold is already
-  covered by `adapter/tables.rs`'s existing `flatten_table_name` casing tests.
-* The non-ASCII fixture MUST live in its OWN Iceberg namespace, not in `e2e_lakehouse`. Every
-  existing E2E virtual schema is created over `e2e_lakehouse`, so a table added there would appear
-  in each of those suites' enumerations and could churn assertions those plans promise to leave
-  untouched. A separate namespace makes the fixture invisible to them.
 * **This delta is issue #359.** It adds TWO scenarios and AMENDS NO recorded clause. The first records
   the single `ctx.database_version()` read and how the resolved timestamp precision reaches the
   declaration pipeline. The second records the column `dataType` JSON a `TIMESTAMP(p)` declaration
   serializes to.
-* **`datafusion-scan/type-mapping-timestamp-precision` owns WHICH declaration each version gets; this
+* **`scan-types/type-mapping-timestamp-precision` owns WHICH declaration each version gets; this
   feature owns WHERE the version is read and HOW the answer travels.** The split matters because the
   type-mapping module must stay free of `UdfContext` — it reads no ambient state and does no I/O —
   so the context read has to happen at the adapter edge and the answer has to travel as a plain
@@ -91,21 +82,20 @@ scenario count crossed this library's per-spec organization threshold.
 
 ### Scenario: A non-ASCII Iceberg table and column name stay queryable end to end
 
-* *GIVEN* a live Exasol instance, an Iceberg REST catalog, and an Iceberg table whose TABLE name and one of whose COLUMN names are both the non-ASCII identifier `straße` — that column an Iceberg `string` column whose seeded values carry distinguishable prefixes, alongside an `id` column — seeded into its own namespace so no existing E2E virtual schema enumerates it
+* *GIVEN* a live Exasol instance, an Iceberg REST catalog, and an Iceberg table whose TABLE name and one of whose COLUMN names are both the non-ASCII identifier `straße` — that column an Iceberg `string` column whose seeded values carry distinguishable prefixes, alongside an `id` column
 * *AND* a virtual schema created over that namespace through a real `createVirtualSchema`
 * *WHEN* an Exasol user queries that table and that column through the virtual schema
 * *THEN* `SYS.EXA_ALL_COLUMNS` and `SYS.EXA_ALL_TABLES` SHALL report both identifiers as `STRASSE`, pinning the full-Unicode `ß`-to-`SS` expansion as observed behavior rather than as documentation
 * *AND* an unquoted `SELECT COUNT(*)` over the table SHALL return the seeded row count, so the uppercased table name still resolves through `TABLE_MAP` back to the original-cased Iceberg identifier `straße` and the scan reaches the real table
 * *AND* an unquoted projection of the column SHALL return the seeded values in full, so the uppercased column name still maps back to the Iceberg field's own casing at scan time
 * *AND* a `LIKE` predicate over that column SHALL return the correct subset of rows
-* *AND* the adapter-GENERATED pushdown SQL for that same `LIKE` query SHALL carry the predicate over `"STRASSE"`, so the type-rewrite guards resolved the column's Exasol type from a `col_types` entry whose name came through this fold — the one pushdown path whose `col_types` lookup issue #265 consolidates. A declined filter returns the identical row set, so this generated-SQL assertion, not the row subset, is what discriminates a resolved lookup from a fail-safe decline
-* *AND* the scenario SHALL FAIL, not skip, when no live Exasol instance is available, per this repo's E2E contract
+* *AND* the adapter-generated pushdown SQL for that same `LIKE` query SHALL carry the predicate over `"STRASSE"` rather than declining it, so the type-rewrite guards resolved the column's Exasol type from a `col_types` entry whose name came through this fold — the one pushdown path whose `col_types` lookup issue #265 consolidates
 
 ### Scenario: createVirtualSchema reads the database version once and threads the resolved precision
 
 * *GIVEN* a `createVirtualSchema` (or `refresh`/`setProperties`) request reaching `handle_create_virtual_schema` with a live `UdfContext`
 * *WHEN* the adapter builds the response's per-column `dataType` declarations
-* *THEN* the adapter SHALL read `UdfContext::database_version()` EXACTLY ONCE per request and resolve it, through the single owner `datafusion-scan/type-mapping-timestamp-precision` specifies, into a plain `Copy` value naming the timestamp precision
+* *THEN* the adapter SHALL read `UdfContext::database_version()` EXACTLY ONCE per request and resolve it, through the single owner `scan-types/type-mapping-timestamp-precision` specifies, into a plain `Copy` value naming the timestamp precision
 * *AND* that plain value SHALL be threaded as a new parameter into `build_listing_virtual_tables` and onward to `column_source_type_to_exasol`, and the `UdfContext` MUST NOT be threaded into `types/mapping.rs` in its place, so the type-mapping module keeps performing no I/O and reading no ambient state
 * *AND* the read SHALL happen inline in `handle_create_virtual_schema` alongside the other per-request resolutions and MUST NOT be wrapped in a helper whose whole body forwards the one call
 * *AND* the resolved precision MUST NOT be recorded in `adapterNotes`, persisted, or round-tripped: it is re-derived from the handshake on every request, exactly as the cluster node count is, so a virtual schema created against one engine version and queried after an upgrade declares the upgraded engine's precision on its next `refresh`
