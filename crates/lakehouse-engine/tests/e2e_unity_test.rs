@@ -7,9 +7,9 @@ mod common;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON,
-    assert_type_matrix, create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, install_slc, pairs, parse_int, parse_numeric,
-    reads, refuses, upload_so, value_to_string,
+    assert_decimal_orders_numerically, assert_type_matrix, create_schema_and_scripts,
+    declared_types, exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper,
+    install_slc, pairs, parse_int, parse_numeric, reads, refuses, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{encode_parquet, put_fixture_object, write_parquet_fixture};
@@ -1599,28 +1599,7 @@ fn unity_delta_extra_types_declare_and_return_their_mapped_values() {
             refuses("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_REFUSAL),
         ],
     );
-    assert_decimal_orders_numerically(&mut conn, "DELTA_EXTRA_TYPES");
-}
-
-fn assert_decimal_orders_numerically(conn: &mut ExaConn, table: &str) {
-    let lowest = conn.query_columns(&format!(
-        "SELECT ID FROM {} ORDER BY C_DECIMAL_18_0 LIMIT 1",
-        table_ref(table)
-    ));
-    assert_eq!(
-        value_to_string(&lowest[0][0]),
-        "2",
-        "{table} top-1 by C_DECIMAL_18_0"
-    );
-    let min = conn.query_columns(&format!(
-        "SELECT MIN(C_DECIMAL_18_0) FROM {}",
-        table_ref(table)
-    ));
-    assert_eq!(
-        value_to_string(&min[0][0]),
-        DECIMAL_18_0_VALUES_TEXT[1].unwrap(),
-        "{table} MIN(C_DECIMAL_18_0)"
-    );
+    assert_decimal_orders_numerically(&mut conn, VS_NAME, "DELTA_EXTRA_TYPES", "C_DECIMAL_18_0");
 }
 
 const STRUCT_BINARY_REFUSAL: &[&str] = &[
@@ -1993,7 +1972,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
             ),
         ],
     );
-    assert_decimal_orders_numerically(&mut conn, "ALL_TYPES_PARQUET");
+    assert_decimal_orders_numerically(&mut conn, VS_NAME, "ALL_TYPES_PARQUET", "C_DECIMAL_18_0");
 }
 
 /// Scenario: Vended and static credentials resolve the same scan

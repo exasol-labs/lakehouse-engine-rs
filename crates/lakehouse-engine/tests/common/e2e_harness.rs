@@ -2,7 +2,7 @@
 //! when the local stack is unavailable.
 
 use super::exasol_ws::ExaConn;
-use super::seed::{E2E_DIM_TABLE, E2E_FACT_TABLE};
+use super::seed::{DECIMAL_18_0_VALUES_TEXT, E2E_DIM_TABLE, E2E_FACT_TABLE};
 use super::stack::{
     CatalogConnectionPassword, bucketfs_port, bucketfs_write_password, build_create_connection_sql,
     exasol_host, exasol_sql_port, iceberg_catalog_url, iceberg_catalog_url_internal,
@@ -694,6 +694,22 @@ pub fn assert_type_matrix(conn: &mut ExaConn, vs_name: &str, table: &str, cases:
                 fragments,
             );
         }
+    }
+}
+
+/// `column` holds `DECIMAL_18_0_VALUES_TEXT`, whose text order inverts its numeric order.
+pub fn assert_decimal_orders_numerically(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    table: &str,
+    column: &str,
+) {
+    let qualified = format!("{vs_name}.{}", table.to_uppercase());
+    for sql in [
+        format!("SELECT {column} FROM {qualified} ORDER BY {column} LIMIT 1"),
+        format!("SELECT MIN({column}) FROM {qualified}"),
+    ] {
+        assert_text_columns(conn, &sql, &[[DECIMAL_18_0_VALUES_TEXT[1]]]);
     }
 }
 

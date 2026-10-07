@@ -3353,19 +3353,21 @@ fn all_types_iceberg_schema() -> Result<IcebergSchema> {
             column(2, "c_int", PrimitiveType::Int),
             column(3, "c_float", PrimitiveType::Float),
             column(4, "c_decimal_10_2", decimal(10, 2)),
-            column(5, "c_decimal_38_10", decimal(38, 10)),
-            column(6, "c_boolean", PrimitiveType::Boolean),
-            column(7, "c_time", PrimitiveType::Time),
-            column(8, "c_timestamptz", PrimitiveType::Timestamptz),
-            column(9, "c_timestamp_ns", PrimitiveType::TimestampNs),
-            column(10, "c_binary", PrimitiveType::Binary),
-            column(11, "c_fixed", PrimitiveType::Fixed(16)),
-            column(12, "c_uuid", PrimitiveType::Uuid),
+            column(5, "c_decimal_18_0", decimal(18, 0)),
+            column(6, "c_decimal_36_6", decimal(36, 6)),
+            column(7, "c_decimal_38_10", decimal(38, 10)),
+            column(8, "c_boolean", PrimitiveType::Boolean),
+            column(9, "c_time", PrimitiveType::Time),
+            column(10, "c_timestamptz", PrimitiveType::Timestamptz),
+            column(11, "c_timestamp_ns", PrimitiveType::TimestampNs),
+            column(12, "c_binary", PrimitiveType::Binary),
+            column(13, "c_fixed", PrimitiveType::Fixed(16)),
+            column(14, "c_uuid", PrimitiveType::Uuid),
             NestedField::optional(
-                13,
+                15,
                 "c_struct_binary",
                 Type::Struct(StructType::new(vec![column(
-                    14,
+                    16,
                     "x",
                     PrimitiveType::Binary,
                 )])),
@@ -3392,6 +3394,8 @@ fn all_types_batch(table: &Table) -> Result<RecordBatch> {
                 ("c_int", _) => int32_values(),
                 ("c_float", _) => float32_values(),
                 ("c_decimal_10_2", _) => decimal_10_2_values(),
+                ("c_decimal_18_0", _) => decimal_18_0_values(),
+                ("c_decimal_36_6", _) => decimal_36_6_values(),
                 ("c_decimal_38_10", _) => decimal_38_10_values(),
                 ("c_boolean", _) => boolean_values(),
                 ("c_time", _) => time64_values(),
@@ -3442,10 +3446,19 @@ async fn empty_table_to_fill(
     Ok(empty.then_some(table))
 }
 
-/// Seeds `all_types` and `binary_values` in `E2E_NAMESPACE`.
 pub async fn seed_all_types(catalog_url: &str, warehouse: &str) -> Result<()> {
+    seed_all_types_with_auth(catalog_url, warehouse, SeedCatalogAuth::default()).await
+}
+
+/// Seeds `all_types` and `binary_values` in `E2E_NAMESPACE`.
+pub async fn seed_all_types_with_auth(
+    catalog_url: &str,
+    warehouse: &str,
+    auth: SeedCatalogAuth,
+) -> Result<()> {
     let catalog =
-        build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-all-types").await?;
+        build_seed_catalog_with_auth(catalog_url, warehouse, "lakehouse-e2e-seed-all-types", auth)
+            .await?;
     let format_v3 = HashMap::from([(
         ICEBERG_FORMAT_VERSION_PROPERTY.to_string(),
         ICEBERG_FORMAT_VERSION_3.to_string(),

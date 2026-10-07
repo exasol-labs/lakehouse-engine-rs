@@ -7,17 +7,18 @@ mod common;
 use common::e2e_harness::*;
 use common::exasol_ws::ExaConn;
 use common::seed::{
-    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
-    DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE, E2E_BINARY_VALUES_TABLE, E2E_DIM_TABLE, E2E_EVO_TABLE,
-    E2E_FACT_TABLE, E2E_LINEITEM_TABLE, E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2,
-    E2E_TYPED_TABLE, EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE,
-    EVO_INITDEF_TOTAL_ROWS, EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT,
-    INT32_VALUES_TEXT, LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS,
-    PART_ROWS_PER_FILE, PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS,
-    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
-    TYPED_COL_DECIMAL_A, TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default,
-    seed_all_types, seed_events, seed_renamed_column, seed_typed_distinct_probe,
-    typed_decimal_a_avg_stddev, typed_decimal_b_avg_stddev, typed_id_avg_stddev,
+    ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT,
+    DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT, DIM_CUSTOMER_ROWS, E2E_ALL_TYPES_TABLE,
+    E2E_BINARY_VALUES_TABLE, E2E_DIM_TABLE, E2E_EVO_TABLE, E2E_FACT_TABLE, E2E_LINEITEM_TABLE,
+    E2E_NAMESPACE, E2E_PART_TABLE, E2E_TABLE, E2E_TABLE_2, E2E_TYPED_TABLE,
+    EVO_INITDEF_POST_ADD_IDS, EVO_INITDEF_PRE_ADD_IDS, EVO_INITDEF_TABLE, EVO_INITDEF_TOTAL_ROWS,
+    EVO_NEW_COL, EVO_TOTAL_ROWS, FACT_ORDERS_ROWS, FLOAT32_VALUES_TEXT, INT32_VALUES_TEXT,
+    LINEITEM_ROWS, LINES_PER_ORDER, PART_CENTRAL_IDS, PART_COL, PART_NORTH_IDS, PART_ROWS_PER_FILE,
+    PART_TOTAL_ROWS, PART_VAL_CENTRAL, PART_VAL_NORTH, SEED_LABELS_ROWS, SEED_ROWS_SCORE_GT_15,
+    SEED_TOTAL_ROWS, TIME64_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, TYPED_COL_DECIMAL_A,
+    TYPED_COL_DECIMAL_B, initdef_columns, seed_added_columns_initial_default, seed_all_types,
+    seed_events, seed_renamed_column, seed_typed_distinct_probe, typed_decimal_a_avg_stddev,
+    typed_decimal_b_avg_stddev, typed_id_avg_stddev,
 };
 use common::stack::{
     build_create_connection_sql, exasol_container, iceberg_catalog_url, wait_for_exasol,
@@ -268,6 +269,8 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
             reads("C_INT", "DECIMAL(10,0)", INT32_VALUES_TEXT),
             reads("C_FLOAT", "DOUBLE", FLOAT32_VALUES_TEXT),
             reads("C_DECIMAL_10_2", "DECIMAL(10,2)", DECIMAL_10_2_VALUES_TEXT),
+            reads("C_DECIMAL_18_0", "DECIMAL(18,0)", DECIMAL_18_0_VALUES_TEXT),
+            reads("C_DECIMAL_36_6", "DECIMAL(36,6)", DECIMAL_36_6_VALUES_TEXT),
             reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
             reads("C_BOOLEAN", "BOOLEAN", BOOLEAN_VALUES_TEXT),
             reads("C_TIME", VARCHAR_JSON, TIME64_VALUES_TEXT),
@@ -283,6 +286,7 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
             ),
         ],
     );
+    assert_decimal_orders_numerically(&mut conn, VS_NAME, E2E_ALL_TYPES_TABLE, "C_DECIMAL_18_0");
     assert_binary_values_refused(
         &mut conn,
         VS_NAME,

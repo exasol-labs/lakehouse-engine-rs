@@ -7,9 +7,10 @@ use super::cloud_fixture::{
 use super::raw_parquet::{encode_parquet, put_object};
 use super::seed::{
     all_types_ids, all_types_validity, binary_values, boolean_values, date_values,
-    decimal_10_2_values, decimal_38_10_values, float32_values, int_list_values,
-    int_string_struct_values, int8_values, int16_values, int32_values, non_utf8_parquet,
-    string_int_map_values, text_values, timestamp_values, write_one_file_append,
+    decimal_10_2_values, decimal_18_0_values, decimal_36_6_values, decimal_38_10_values,
+    float32_values, int_list_values, int_string_struct_values, int8_values, int16_values,
+    int32_values, non_utf8_parquet, string_int_map_values, text_values, timestamp_values,
+    write_one_file_append,
 };
 use super::stack::CatalogConnectionPassword;
 
@@ -537,6 +538,8 @@ const HIVE_TYPE_COLUMNS: &[HiveTypeColumn] = &[
         Some(|| Arc::new(StringArray::from(vec![Some("abcde"), Some("fghij"), None]))),
     ),
     hive("h_decimal_10_2", "decimal(10,2)", Some(decimal_10_2_values)),
+    hive("h_decimal_18_0", "decimal(18,0)", Some(decimal_18_0_values)),
+    hive("h_decimal_36_6", "decimal(36,6)", Some(decimal_36_6_values)),
     hive(
         "h_decimal",
         "decimal",
