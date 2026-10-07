@@ -5,6 +5,7 @@ use super::super::test_support::{
     sample_storage, unauthenticated_creds,
 };
 use super::*;
+use crate::adapter::permission::PermissionCheck;
 use crate::scan::spec::{StorageBackend, StorageProps};
 
 /// Scenario: a Unity Catalog table's identity survives the round trip from the involved table
@@ -30,6 +31,7 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
         },
         &["cat.sch.orders"],
         &Json::Null,
+        &PermissionCheck::Off,
     )
     .await
     .expect("a Unity Catalog session is built without contacting the catalog");
@@ -72,6 +74,7 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
         },
         &["sales.orders"],
         &Json::Null,
+        &PermissionCheck::Off,
     )
     .await
     .expect("a Glue session is built without contacting the catalog");
@@ -130,6 +133,7 @@ async fn a_recorded_identifier_without_a_table_name_is_refused_before_any_catalo
             },
             &[unresolvable],
             &Json::Null,
+            &PermissionCheck::Off,
         )
         .await
         .err()
@@ -163,6 +167,7 @@ async fn a_malformed_identifier_anywhere_in_the_request_is_refused_before_any_ca
         },
         &["db.t", "malformed"],
         &Json::Null,
+        &PermissionCheck::Off,
     )
     .await
     .err()
@@ -194,6 +199,7 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
         },
         &["db.t"],
         &Json::Null,
+        &PermissionCheck::Off,
     )
     .await
     .expect("an Iceberg session resolves against a reachable catalog");
@@ -233,6 +239,7 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
         },
         &["db.t", "db.u"],
         &Json::Null,
+        &PermissionCheck::Off,
     )
     .await
     .expect("an Iceberg session resolves against a reachable catalog");
@@ -281,6 +288,7 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
         },
         &["cat.sch.orders", "cat.sch.customers"],
         &Json::Null,
+        &PermissionCheck::Off,
     )
     .await
     .expect("a Unity Catalog session is built without contacting the catalog");
@@ -348,6 +356,7 @@ async fn one_session_or_store_per_request_serves_every_leg() {
         },
         &["events", "event_labels"],
         &props,
+        &PermissionCheck::Off,
     )
     .await
     .expect("a direct-storage store is built from the CONNECTION alone");
@@ -401,6 +410,7 @@ async fn a_direct_storage_identifier_naming_no_first_level_directory_is_refused(
             },
             &["events", unresolvable],
             &Json::Null,
+            &PermissionCheck::Off,
         )
         .await
         .err()
@@ -439,6 +449,7 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
         },
         &["events"],
         &Json::Null,
+        &PermissionCheck::Off,
     )
     .await
     .expect("a direct-storage store is built from the CONNECTION alone");
@@ -504,6 +515,7 @@ async fn request_session_has_one_variant_per_kind() {
             },
             &[identifier],
             &Json::Null,
+            &PermissionCheck::Off,
         )
         .await
         .unwrap_or_else(|e| panic!("{kind:?} must resolve a session of its own: {e}"));
@@ -526,6 +538,7 @@ async fn resolve_events_under_hive_partitioning(
         },
         &["events"],
         &serde_json::json!({ "HIVE_PARTITIONING": hive_partitioning }),
+        &PermissionCheck::Off,
     )
     .await?;
     resolver.resolve("events", Some(filter), &[]).await
@@ -561,4 +574,58 @@ async fn hive_partitioning_reaches_the_seam_on_pushdown() {
         error.contains("failed to read the Parquet footer"),
         "expected a footer-read error: {error}"
     );
+}
+
+/// Scenario: One batch-check per query decides every table before any table is read
+#[test]
+fn an_enforced_resolver_admits_only_the_tables_the_check_covered() {
+    let admission = TableAdmission::Authorized(HashSet::from(["db.t".to_string()]));
+
+    assert!(admission.admit("db.t").is_ok());
+    assert!(admission.admit("db.other").is_err());
+    assert!(TableAdmission::Unchecked.admit("db.other").is_ok());
+}
+
+/// Scenario: One batch-check per query decides every table before any table is read
+#[tokio::test]
+async fn an_enforced_check_admits_an_allowed_table_and_refuses_a_denied_one() {
+    use crate::adapter::permission::{PERMISSION_CHECK, PermissionSettings, USER_MAPPING};
+
+    let check = PermissionSettings::parse(&serde_json::json!({
+        PERMISSION_CHECK: "LAKEKEEPER",
+        USER_MAPPING: "oidc~{{ user }}",
+    }))
+    .unwrap()
+    .check_for(|| Some("ALICE".into()))
+    .unwrap();
+    let (storage, creds) = (sample_storage(), unauthenticated_creds());
+    for allowed in [true, false] {
+        let catalog = RecordingCatalog::spawn(move |target| {
+            if target.starts_with("/catalog/v1/config") {
+                (200, "{}".to_string())
+            } else {
+                (
+                    200,
+                    format!(r#"{{"results":[{{"id":"read-data","allowed":{allowed}}}]}}"#),
+                )
+            }
+        })
+        .await;
+
+        let resolver = TableScanResolver::for_request(
+            CatalogKind::IcebergRest,
+            &format!("{}/catalog", catalog.uri),
+            ConnectionStorage {
+                storage: &storage,
+                creds: &creds,
+                allow_http: true,
+            },
+            &["db.t"],
+            &Json::Null,
+            &check,
+        )
+        .await;
+
+        assert_eq!(resolver.is_ok(), allowed);
+    }
 }

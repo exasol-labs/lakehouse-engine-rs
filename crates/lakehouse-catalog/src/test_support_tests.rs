@@ -128,7 +128,7 @@ pub(crate) async fn spawn_server(
     (base_uri, requests)
 }
 
-async fn read_request(stream: &mut TcpStream) -> String {
+pub(crate) async fn read_request(stream: &mut TcpStream) -> String {
     let mut request = Vec::new();
     let mut chunk = [0u8; 1024];
     loop {

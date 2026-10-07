@@ -1,5 +1,6 @@
 //! Permission fixture for the Lakekeeper `lakekeeper-e2e` suite: OpenFGA-backed grants for
-//! three test principals, `batch-check` calls, and the fixture normalizer.
+//! the test principals and for the ids the permission check's `USER_MAPPING` derives,
+//! `batch-check` calls, and the fixture normalizer.
 //! Helpers panic, never skip, and never put a secret or token in a panic message.
 #![cfg(feature = "lakekeeper-e2e")]
 
@@ -14,11 +15,20 @@ use super::lakekeeper::{
     self, WAREHOUSE_AUTHZ, WarehouseProfile, http_client, keycloak_client_credentials_token,
     keycloak_client_credentials_token_for, management_base,
 };
+use super::seed::{
+    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, SeedCatalogAuth,
+    seed_events_table_with_auth, seed_star_schema_with_auth,
+};
 
 pub const AUTHZ_NAMESPACE: &str = "authz";
 pub const TABLE_ALPHA: &str = "authz_alpha";
 pub const TABLE_BETA: &str = "authz_beta";
 pub const TABLE_MISSING: &str = "authz_missing";
+
+/// The ids the permission-check test's `USER_MAPPING` derives from its three Exasol users.
+pub const MAPPED_ALLOWED: &str = "oidc~lk.allowed@lakehouse.test";
+pub const MAPPED_DENIED: &str = "oidc~lk.denied@lakehouse.test";
+pub const MAPPED_UNKNOWN: &str = "oidc~lk.unknown@lakehouse.test";
 
 const ERROR_ID_PREFIX: &str = "Error ID: ";
 
@@ -171,7 +181,7 @@ pub enum Scope {
     Server,
     Project,
     Warehouse,
-    Namespace,
+    Namespace(&'static str),
     Table(&'static str),
 }
 
@@ -181,18 +191,24 @@ pub struct Grant {
     pub relation: &'static str,
 }
 
-const ALL_SCOPES: [Scope; 6] = [
+/// Every scope a fixture grant can reach a fixture table through, so reconciling them all
+/// leaves no stale inherited grant behind.
+const ALL_SCOPES: [Scope; 10] = [
     Scope::Server,
     Scope::Project,
     Scope::Warehouse,
-    Scope::Namespace,
+    Scope::Namespace(AUTHZ_NAMESPACE),
+    Scope::Namespace(E2E_NAMESPACE),
     Scope::Table(TABLE_ALPHA),
     Scope::Table(TABLE_BETA),
+    Scope::Table(E2E_TABLE),
+    Scope::Table(E2E_FACT_TABLE),
+    Scope::Table(E2E_DIM_TABLE),
 ];
 
 pub struct AuthzFixture {
     pub warehouse_id: String,
-    pub namespace_id: String,
+    namespace_ids: BTreeMap<&'static str, String>,
     table_ids: BTreeMap<&'static str, String>,
     principal_ids: BTreeMap<&'static str, String>,
 }
@@ -200,6 +216,12 @@ pub struct AuthzFixture {
 impl AuthzFixture {
     pub fn principal_id(&self, principal: &Principal) -> &str {
         &self.principal_ids[principal.client_id]
+    }
+
+    fn namespace_id(&self, namespace: &str) -> &str {
+        self.namespace_ids
+            .get(namespace)
+            .unwrap_or_else(|| panic!("'{namespace}' is not a fixture namespace"))
     }
 
     pub fn table_id(&self, table: &str) -> &str {
@@ -254,12 +276,22 @@ impl AuthzFixture {
     }
 
     pub fn read_check_for_user(&self, check_id: &str, user_id: &str, table: &str) -> Value {
+        self.read_check_at(check_id, user_id, AUTHZ_NAMESPACE, table)
+    }
+
+    pub fn read_check_at(
+        &self,
+        check_id: &str,
+        user_id: &str,
+        namespace: &str,
+        table: &str,
+    ) -> Value {
         json!({
             "id": check_id,
             "identity": {"user": user_id},
             "operation": {"table": {
                 "warehouse-id": self.warehouse_id,
-                "namespace": [AUTHZ_NAMESPACE],
+                "namespace": [namespace],
                 "table": table,
                 "action": {"action": "read_data"},
             }},
@@ -273,12 +305,10 @@ impl AuthzFixture {
             Scope::Server => format!("{base}/permissions/server/assignments"),
             Scope::Project => format!("{base}/permissions/project/assignments"),
             Scope::Warehouse => format!("{base}/permissions/warehouse/{wh}/assignments"),
-            Scope::Namespace => {
-                format!(
-                    "{base}/permissions/namespace/{}/assignments",
-                    self.namespace_id
-                )
-            }
+            Scope::Namespace(namespace) => format!(
+                "{base}/permissions/namespace/{}/assignments",
+                self.namespace_id(namespace)
+            ),
             Scope::Table(table) => format!(
                 "{base}/permissions/warehouse/{wh}/table/{}/assignments",
                 self.table_id(table)
@@ -336,7 +366,11 @@ impl AuthzFixture {
 
     /// Replaces the principal's grants with exactly `grants`; a no-op when it already holds them.
     pub fn set_assignments(&self, principal: &Principal, grants: &[Grant]) {
-        let user_id = self.principal_id(principal);
+        self.set_user_assignments(self.principal_id(principal), grants);
+    }
+
+    /// [`Self::set_assignments`] for a Lakekeeper id that need never have logged in.
+    pub fn set_user_assignments(&self, user_id: &str, grants: &[Grant]) {
         let token = keycloak_client_credentials_token();
         for scope in ALL_SCOPES {
             let wanted: Vec<&str> = grants
@@ -357,6 +391,67 @@ impl AuthzFixture {
                 .collect();
             self.update_assignments(&token, scope, user_id, &AssignmentDiff { writes, deletes });
         }
+    }
+}
+
+impl AuthzFixture {
+    /// Gives `role_id` a grant at its scope, so a user reaches the table only through the role.
+    pub fn ensure_role_grant(&self, role_id: &str, grant: Grant) {
+        let token = keycloak_client_credentials_token();
+        let url = self.assignments_url(grant.scope);
+        let held = get(&url, &token);
+        expect_status(&held, &format!("Lakekeeper GET {url}"), &[200]);
+        let already = held.body["assignments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|a| {
+                a["role"].as_str() == Some(role_id) && a["type"].as_str() == Some(grant.relation)
+            });
+        if !already {
+            let body = json!({"writes": [{"type": grant.relation, "role": role_id}]});
+            let wrote = post(&url, &token, &body);
+            expect_status(&wrote, &format!("Lakekeeper POST {url}"), &[200, 204]);
+        }
+    }
+}
+
+/// The id of the role named `name`, created on first use.
+pub fn ensure_role(name: &str) -> String {
+    let token = keycloak_client_credentials_token();
+    let url = format!("{}/role", management_base());
+    let created = post(&url, &token, &json!({"name": name}));
+    expect_status(&created, "Lakekeeper create role", &[200, 201, 409]);
+    let listed = get(&format!("{url}?name={name}"), &token);
+    expect_status(&listed, "Lakekeeper list roles", &[200]);
+    listed.body["roles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|role| role["name"].as_str() == Some(name))
+        .and_then(|role| role["id"].as_str())
+        .unwrap_or_else(|| panic!("Lakekeeper lists no role named '{name}'"))
+        .to_string()
+}
+
+/// Makes `user_id` an assignee of `role_id`; a no-op when it already is.
+pub fn ensure_role_member(role_id: &str, user_id: &str) {
+    let token = keycloak_client_credentials_token();
+    let url = format!(
+        "{}/permissions/role/{role_id}/assignments",
+        management_base()
+    );
+    let held = get(&url, &token);
+    expect_status(&held, &format!("Lakekeeper GET {url}"), &[200]);
+    let already = held.body["assignments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|a| a["user"].as_str() == Some(user_id) && a["type"].as_str() == Some("assignee"));
+    if !already {
+        let body = json!({"writes": [{"type": "assignee", "user": user_id}]});
+        let wrote = post(&url, &token, &body);
+        expect_status(&wrote, &format!("Lakekeeper POST {url}"), &[200, 204]);
     }
 }
 
@@ -383,29 +478,38 @@ fn warehouse_id_by_name(name: &str) -> String {
         .to_string()
 }
 
-fn ensure_namespace(warehouse_id: &str) -> String {
-    let token = keycloak_client_credentials_token();
-    let base = catalog_url(warehouse_id);
+fn ensure_authz_namespace(warehouse_id: &str) -> String {
     let create = post(
-        &format!("{base}/namespaces"),
-        &token,
+        &format!("{}/namespaces", catalog_url(warehouse_id)),
+        &keycloak_client_credentials_token(),
         &json!({"namespace": [AUTHZ_NAMESPACE]}),
     );
     expect_status(&create, "Lakekeeper create namespace", &[200, 409]);
-    let fetched = get(&format!("{base}/namespaces/{AUTHZ_NAMESPACE}"), &token);
-    expect_status(&fetched, "Lakekeeper GET namespace", &[200]);
+    namespace_uuid(warehouse_id, AUTHZ_NAMESPACE)
+}
+
+fn namespace_uuid(warehouse_id: &str, namespace: &str) -> String {
+    let url = format!("{}/namespaces/{namespace}", catalog_url(warehouse_id));
+    let fetched = get(&url, &keycloak_client_credentials_token());
+    expect_status(
+        &fetched,
+        &format!("Lakekeeper GET namespace '{namespace}'"),
+        &[200],
+    );
     fetched.body["properties"]["namespace_id"]
         .as_str()
-        .unwrap_or_else(|| panic!("Lakekeeper namespace answered no namespace_id"))
+        .unwrap_or_else(|| panic!("Lakekeeper namespace '{namespace}' answered no namespace_id"))
         .to_string()
 }
 
 /// Metadata-only: no data file is written, since only the table id matters to a check.
 fn ensure_table(warehouse_id: &str, table: &str) -> String {
     let token = keycloak_client_credentials_token();
-    let base = catalog_url(warehouse_id);
     let create = post(
-        &format!("{base}/namespaces/{AUTHZ_NAMESPACE}/tables"),
+        &format!(
+            "{}/namespaces/{AUTHZ_NAMESPACE}/tables",
+            catalog_url(warehouse_id)
+        ),
         &token,
         &json!({
             "name": table,
@@ -421,15 +525,48 @@ fn ensure_table(warehouse_id: &str, table: &str) -> String {
         &format!("Lakekeeper create table '{table}'"),
         &[200, 409],
     );
-    let fetched = get(
-        &format!("{base}/namespaces/{AUTHZ_NAMESPACE}/tables/{table}"),
-        &token,
+    table_uuid(warehouse_id, AUTHZ_NAMESPACE, table)
+}
+
+fn table_uuid(warehouse_id: &str, namespace: &str, table: &str) -> String {
+    let url = format!(
+        "{}/namespaces/{namespace}/tables/{table}",
+        catalog_url(warehouse_id)
     );
-    expect_status(&fetched, &format!("Lakekeeper GET table '{table}'"), &[200]);
+    let fetched = get(&url, &keycloak_client_credentials_token());
+    expect_status(
+        &fetched,
+        &format!("Lakekeeper GET table '{namespace}.{table}'"),
+        &[200],
+    );
     fetched.body["metadata"]["table-uuid"]
         .as_str()
-        .unwrap_or_else(|| panic!("Lakekeeper table '{table}' answered no table-uuid"))
+        .unwrap_or_else(|| panic!("Lakekeeper table '{namespace}.{table}' answered no table-uuid"))
         .to_string()
+}
+
+/// The permission-check tests scan these tables, so unlike the fixture tables they hold data.
+/// Seeding is idempotent, so the tables and their ids survive across runs.
+fn ensure_seeded_data_tables(warehouse_id: &str) -> Vec<(&'static str, String)> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for seeding the authz warehouse");
+    let auth = SeedCatalogAuth {
+        token: Some(keycloak_client_credentials_token()),
+        ..Default::default()
+    };
+    let host = lakekeeper::catalog_uri_host();
+    runtime
+        .block_on(async {
+            seed_events_table_with_auth(&host, WAREHOUSE_AUTHZ, auth.clone()).await?;
+            seed_star_schema_with_auth(&host, WAREHOUSE_AUTHZ, auth).await
+        })
+        .unwrap_or_else(|e| panic!("seed the Lakekeeper warehouse '{WAREHOUSE_AUTHZ}': {e:#}"));
+    [E2E_TABLE, E2E_FACT_TABLE, E2E_DIM_TABLE]
+        .into_iter()
+        .map(|table| (table, table_uuid(warehouse_id, E2E_NAMESPACE, table)))
+        .collect()
 }
 
 /// Not cached: every call re-reconciles the grants. Prefer `ensure_authz_fixture`.
@@ -443,15 +580,20 @@ pub fn provision_authz_fixture() -> AuthzFixture {
         principal_ids.insert(principal.client_id, whoami_id(principal));
     }
 
-    let namespace_id = ensure_namespace(&warehouse_id);
-    let table_ids = [TABLE_ALPHA, TABLE_BETA]
+    let authz_namespace_id = ensure_authz_namespace(&warehouse_id);
+    let mut table_ids: BTreeMap<&'static str, String> = [TABLE_ALPHA, TABLE_BETA]
         .into_iter()
         .map(|table| (table, ensure_table(&warehouse_id, table)))
         .collect();
+    table_ids.extend(ensure_seeded_data_tables(&warehouse_id));
+    let namespace_ids = BTreeMap::from([
+        (AUTHZ_NAMESPACE, authz_namespace_id),
+        (E2E_NAMESPACE, namespace_uuid(&warehouse_id, E2E_NAMESPACE)),
+    ]);
 
     let fixture = AuthzFixture {
         warehouse_id,
-        namespace_id,
+        namespace_ids,
         table_ids,
         principal_ids,
     };
@@ -461,6 +603,9 @@ pub fn provision_authz_fixture() -> AuthzFixture {
     };
     fixture.set_assignments(&READER_A, &[select(TABLE_ALPHA)]);
     fixture.set_assignments(&READER_B, &[select(TABLE_BETA)]);
+    fixture.set_user_assignments(MAPPED_ALLOWED, &[select(E2E_TABLE)]);
+    fixture.set_user_assignments(MAPPED_DENIED, &[select(TABLE_ALPHA)]);
+    fixture.set_user_assignments(MAPPED_UNKNOWN, &[]);
     fixture
 }
 

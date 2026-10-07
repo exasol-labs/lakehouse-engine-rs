@@ -1745,6 +1745,7 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_check: crate::adapter::permission::PermissionCheck::Off,
     };
     let result = handle_pushdown(
         &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -1780,6 +1781,7 @@ async fn seam_handle_pushdown(
         catalog_kind,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_check: crate::adapter::permission::PermissionCheck::Off,
     };
     handle_pushdown(
         request, &conn, catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,

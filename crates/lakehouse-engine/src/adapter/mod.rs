@@ -7,6 +7,7 @@ pub mod direct_storage;
 pub mod direct_storage_properties;
 pub mod iceberg_predicate;
 pub mod parquet_directory;
+mod permission;
 pub mod pushdown;
 #[cfg(test)]
 #[path = "pushdown_surface_probe_tests.rs"]
@@ -19,6 +20,7 @@ use crate::adapter::catalog_kind::CatalogKind;
 use crate::adapter::connection::ConnectionCreds;
 use crate::adapter::connection::{catalog_block, read_connection, storage_block};
 use crate::adapter::direct_storage::DirectStorageCatalogClient;
+use crate::adapter::permission::{PermissionCheck, PermissionSettings};
 use crate::adapter::pushdown::handle_pushdown;
 use crate::adapter::tables::{catalog_identifier_string, flatten_table_name};
 use crate::scan::sealed::SealedStorageKey;
@@ -106,10 +108,13 @@ fn dispatch(ctx: &mut dyn UdfContext, request: &Json) -> Result<Json, UdfError> 
         }
         Some("dropVirtualSchema") => Ok(json!({"type": "dropVirtualSchema"})),
         Some("pushdown") => {
-            // Built first because `resolve_connection_config` blocks on it to assume the role.
-            let rt = build_runtime()?;
             let props = get_properties(request);
-            let config = resolve_connection_config(ctx, &props, &rt)?;
+            // The user is mapped before the CONNECTION is read, so a refused user costs no request.
+            let permission = PermissionSettings::parse(&props)?;
+            let check = permission.check_for(|| ctx.current_user())?;
+            // Built before `resolve_connection_config`, which blocks on it to assume the role.
+            let rt = build_runtime()?;
+            let config = resolve_connection_config(ctx, &props, &permission, check, &rt)?;
             let script_schema = ctx.script_schema();
             let cluster_nodes = cluster_nodes_from_context(ctx);
 
@@ -134,6 +139,7 @@ pub struct ResolvedConnectionConfig {
     pub(crate) catalog_kind: CatalogKind,
     pub(crate) connection_name: String,
     pub(crate) sealed_storage_key: Option<SealedStorageKey>,
+    pub(crate) permission_check: PermissionCheck,
 }
 
 fn build_runtime() -> Result<tokio::runtime::Runtime, UdfError> {
@@ -148,12 +154,16 @@ fn build_runtime() -> Result<tokio::runtime::Runtime, UdfError> {
 fn resolve_connection_config(
     ctx: &dyn UdfContext,
     props: &Json,
+    permission: &PermissionSettings,
+    check: PermissionCheck,
     rt: &tokio::runtime::Runtime,
 ) -> Result<ResolvedConnectionConfig, UdfError> {
     let kind = catalog_kind::resolve_catalog_kind(props)?;
+    permission.require_supported_kind(kind)?;
     let connection_name = nonempty_str(props, PROP_CATALOG_CONNECTION)
         .ok_or_else(|| UdfError::User("CATALOG_CONNECTION is required".into()))?;
     let resolved = read_connection(ctx, Some(connection_name), kind)?;
+    permission.require_management_url(&resolved.uri)?;
     let allow_http = nonempty_str(props, PROP_ALLOW_HTTP)
         .map(|s| s.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
@@ -171,6 +181,7 @@ fn resolve_connection_config(
         catalog_kind: kind,
         connection_name: connection_name.to_string(),
         sealed_storage_key: resolved.sealed_storage_key,
+        permission_check: check,
     })
 }
 
@@ -184,8 +195,10 @@ fn handle_create_virtual_schema(
     } else {
         get_properties(request)
     };
+    // Validated only: listing runs as the CONNECTION's identity, with no permission check.
+    let permission = PermissionSettings::parse(&props)?;
     let rt = build_runtime()?;
-    let config = resolve_connection_config(ctx, &props, &rt)?;
+    let config = resolve_connection_config(ctx, &props, &permission, PermissionCheck::Off, &rt)?;
 
     // Optional under direct storage: the CONNECTION address alone denotes the storage subtree.
     let configured_ns: Vec<String> = match config.catalog_kind {

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
@@ -14,6 +15,7 @@ use crate::adapter::direct_storage_properties::{
     join_storage_path, resolve_direct_storage_properties,
 };
 use crate::adapter::parquet_directory::DirectoryOptions;
+use crate::adapter::permission::PermissionCheck;
 use crate::scan::{build_admission_limited_store, store_root_url};
 
 #[cfg(test)]
@@ -22,9 +24,33 @@ mod tests;
 
 /// Built once per request with the catalog session resolved into it, so a
 /// multi-leg join costs no more catalog authentication than a single scan.
+///
+/// Every shape loads tables through [`Self::resolve`], so the permission check runs once here and
+/// a shape added later cannot skip it.
 pub(super) struct TableScanResolver<'a> {
     session: RequestSession,
     connection: ConnectionStorage<'a>,
+    admission: TableAdmission,
+}
+
+/// Which identifiers [`TableScanResolver::resolve`] may load.
+enum TableAdmission {
+    Unchecked,
+    /// A kind that runs no check authorizes none, so a gated request under it reads no table.
+    Authorized(HashSet<String>),
+}
+
+impl TableAdmission {
+    fn admit(&self, table_identifier: &str) -> Result<(), UdfError> {
+        match self {
+            Self::Unchecked => Ok(()),
+            Self::Authorized(tables) if tables.contains(table_identifier) => Ok(()),
+            Self::Authorized(_) => Err(UdfError::User(format!(
+                "pushdown: the Lakekeeper permission check did not cover table \
+                 '{table_identifier}', so the adapter does not read it"
+            ))),
+        }
+    }
 }
 
 /// Deliberately not the [`CatalogKind`]: the kind is matched once in
@@ -46,26 +72,35 @@ impl<'a> TableScanResolver<'a> {
     /// Every `table_identifiers` entry is validated by its own format's rule before
     /// the session is built: the Iceberg arm contacts the network for `/v1/config`,
     /// so a later check would surface a transport error instead of the parse error.
+    ///
+    /// With an enforced `permission`, the Iceberg arm batch-checks every identifier before any
+    /// `loadTable`, and the resolver then admits only those.
     pub(super) async fn for_request(
         kind: CatalogKind,
         catalog_uri: &str,
         connection: ConnectionStorage<'a>,
         table_identifiers: &[&str],
         props: &Json,
+        permission: &PermissionCheck,
     ) -> Result<Self, UdfError> {
+        let mut authorized = HashSet::new();
         let session = match kind {
             CatalogKind::IcebergRest => {
                 for identifier in table_identifiers {
                     parse_table_ident(identifier)?;
                 }
-                RequestSession::Iceberg(
-                    CatalogSession::resolve(
-                        catalog_uri,
-                        &connection.creds.warehouse,
-                        connection.creds,
-                    )
-                    .await?,
+                let session = CatalogSession::resolve(
+                    catalog_uri,
+                    &connection.creds.warehouse,
+                    connection.creds,
                 )
+                .await?;
+                if let PermissionCheck::Enforced(gate) = permission {
+                    gate.authorize(&session, table_identifiers, connection.creds)
+                        .await?;
+                    authorized.extend(table_identifiers.iter().map(ToString::to_string));
+                }
+                RequestSession::Iceberg(session)
             }
             CatalogKind::UnityCatalogNative => {
                 for identifier in table_identifiers {
@@ -104,9 +139,14 @@ impl<'a> TableScanResolver<'a> {
                 }
             }
         };
+        let admission = match permission {
+            PermissionCheck::Off => TableAdmission::Unchecked,
+            PermissionCheck::Enforced(_) => TableAdmission::Authorized(authorized),
+        };
         Ok(Self {
             session,
             connection,
+            admission,
         })
     }
 
@@ -119,6 +159,7 @@ impl<'a> TableScanResolver<'a> {
         filter_json: Option<&Json>,
         declared_columns: &[(String, String)],
     ) -> Result<ResolvedScan, UdfError> {
+        self.admission.admit(table_identifier)?;
         match &self.session {
             RequestSession::Iceberg(session) => {
                 let catalog_props = CatalogProps {

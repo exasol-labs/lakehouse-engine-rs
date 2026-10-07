@@ -546,6 +546,7 @@ pub(super) async fn delta_pushdown(
         catalog_kind: CatalogKind::UnityCatalogNative,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_check: crate::adapter::permission::PermissionCheck::Off,
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),
@@ -591,6 +592,7 @@ fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_check: crate::adapter::permission::PermissionCheck::Off,
     }
 }
 

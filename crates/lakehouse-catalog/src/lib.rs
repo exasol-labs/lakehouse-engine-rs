@@ -6,6 +6,7 @@ mod client;
 mod creds;
 mod glue;
 mod iceberg_io;
+mod lakekeeper;
 mod namespace;
 mod redaction;
 mod session;
@@ -28,6 +29,7 @@ pub use client::{
 pub use creds::{CatalogProps, ConnectionCreds, StorageCreds, StorageProps};
 pub use glue::{GlueCatalogSession, parse_glue_table_ident};
 pub use iceberg_io::read_iceberg_metadata_file;
+pub use lakekeeper::{TableReadDecision, lakekeeper_batch_check, lakekeeper_management_url};
 pub use namespace::parse_table_ident;
 pub use redaction::{redact_credentials, redact_error_text, redact_secret_values};
 pub use session::{CatalogSession, load_table_any_auth};

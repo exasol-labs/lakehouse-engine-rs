@@ -41,7 +41,9 @@ this feature. Only file resolution differs per format.
   scan resolve identically
 * *AND* the adapter MUST NOT gate any request shape on the table format or the catalog kind, so
   enabling a format enables every shape at once and a shape that fails does so as a defect rather than
-  as a refusal
+  as a refusal. The one exception is `vs-adapter/lakekeeper-permission-check`, which refuses every
+  shape alike while `PERMISSION_CHECK = 'LAKEKEEPER'` is set under any catalog kind other than
+  Iceberg REST
 * *AND* the SQL the adapter generates for each request SHALL be decided from the request alone, so the
   same request over an Iceberg table and over a Delta table with the same columns yields the same
   pushdown decisions
@@ -52,7 +54,7 @@ this feature. Only file resolution differs per format.
 * *WHEN* the adapter resolves both legs
 * *THEN* the adapter SHALL build the request's catalog session EXACTLY ONCE and SHALL resolve both legs through it, so the request performs no more catalog authentication round-trips than a single-table request over the same virtual schema
 * *AND* the adapter MUST NOT build a second session per leg, per shape, or per format reader
-* *AND* the number of catalog round-trips an Iceberg request performs SHALL be unchanged from before this feature
+* *AND* the number of catalog round-trips an Iceberg request performs SHALL be unchanged from before this feature, except for the one batch-check request that `vs-adapter/pushdown-catalog-session` admits while `PERMISSION_CHECK = 'LAKEKEEPER'` is set
 * *AND* under a catalog kind whose session is an OBJECT STORE rather than a catalog client, the adapter SHALL build that store EXACTLY ONCE per request and SHALL share it across every leg, so a two-table join opens one store and its admission limiter bounds the whole request rather than each leg
 
 ### Scenario: The catalog kind is matched at one added construction site and nowhere else
