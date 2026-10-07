@@ -6,18 +6,18 @@ incompatible columns as JSON strings, and the coercion of a batch's Arrow types 
 EMITS `ExaType` before `emit_batch`. It owns the value-conversion boundary only — file
 registration, filtering, LIMIT, streaming, and error handling belong to
 `datafusion-scan/scan-execution`; Iceberg-to-Arrow and Arrow-to-Exasol type-mapping *rules* belong
-to `datafusion-scan/type-mapping`.
+to `scan-types/type-mapping`.
 
 ## Background
 
 * A nested column is rendered to JSON at the Arrow COLUMN level, upstream of the per-value
-  conversion. `datafusion-scan/nested-json-rendering` owns the rendering, so the batch that
+  conversion. `scan-types/nested-json-rendering` owns the rendering, so the batch that
   reaches the emit boundary already carries `Utf8`. `arrow_value_at` therefore never receives
   a nested Arrow column.
 * Only `Value::String` types cross the `.so` boundary on the value-conversion path; the raw-row path
   crosses as Arrow IPC bytes via `emit_batch` per `datafusion-scan/scan-execution`.
 * Logical Iceberg-to-Arrow and Arrow-to-Exasol type mapping RULES are owned by
-  `datafusion-scan/type-mapping`; this feature owns the runtime conversion step that applies those
+  `scan-types/type-mapping`; this feature owns the runtime conversion step that applies those
   rules to an in-flight batch at the emit boundary.
 * `coerce_int96_tz = "UTC"` makes the decoded batch's physical Arrow type `Timestamp(Microsecond,
   "UTC")` regardless of the Iceberg column type. For an Iceberg `timestamp` (WITHOUT time zone)
@@ -45,7 +45,7 @@ to `datafusion-scan/type-mapping`.
   Exasol never declared a UDF column at any of those types.
 * `ExaType::Timestamp { precision }` makes the declared fractional-second precision readable at the
   emit boundary, so the coercion target follows it rather than being fixed at microsecond. The
-  precision-to-`TimeUnit` table belongs to `datafusion-scan/type-mapping-timestamp-precision`. This
+  precision-to-`TimeUnit` table belongs to `scan-types/type-mapping-timestamp-precision`. This
   feature owns only the rule that the coercion target is read from the declaration.
 
 ## Scenarios
@@ -54,14 +54,14 @@ to `datafusion-scan/type-mapping`.
 
 * *GIVEN* a table with integer, floating-point, string, boolean, date, and timestamp columns
 * *WHEN* the scan UDF converts a batch of those columns
-* *THEN* each Arrow column value SHALL map to the corresponding SDK `Value` variant per the `datafusion-scan/type-mapping` table
+* *THEN* each Arrow column value SHALL map to the corresponding SDK `Value` variant per the `scan-types/type-mapping` table
 * *AND* an Arrow null SHALL map to `Value::Null`
 
 ### Scenario: Incompatible Arrow columns are emitted as JSON strings
 
 * *GIVEN* a scan result containing columns of types Exasol cannot represent — a NESTED type (list, struct, map) or a NON-NESTED one (binary or an out-of-range decimal)
 * *WHEN* the scan UDF prepares a batch of those columns for emission
-* *THEN* a NESTED column SHALL have been rendered to a `Utf8` column of valid JSON documents at the Arrow COLUMN level, before the batch reaches the per-value conversion boundary, per `datafusion-scan/nested-json-rendering`
+* *THEN* a NESTED column SHALL have been rendered to a `Utf8` column of valid JSON documents at the Arrow COLUMN level, before the batch reaches the per-value conversion boundary, per `scan-types/nested-json-rendering`
 * *AND* the per-value converter SHALL therefore receive that column already as `Utf8` and emit `Value::String`, and a null cell SHALL emit `Value::Null`
 * *AND* a NON-NESTED incompatible column SHALL keep its recorded path unchanged — `CAST(col AS VARCHAR)` in the generated scan SQL, then `Value::String` — and this feature MUST NOT claim strict JSON conformance for it (issue #351)
 * *AND* the UDF MUST NOT emit any array, list, struct, or map `Value`
@@ -74,7 +74,7 @@ to `datafusion-scan/type-mapping`.
 * *WHEN* the scan UDF processes the batch
 * *THEN* the UDF SHALL read the declared type of output column `i` from `UdfContext::output_column(i)`, and MUST NOT read any declared type carried in the scan spec
 * *AND* the UDF SHALL coerce each output column to the Arrow type that `emit_batch`'s strict IPC feed requires for the reported `ExaType`, before passing the batch to `emit_batch`, taking the DECIMAL binning from the reported variant rather than re-deriving it from a type string: `Int32` to `Int32`, `Int64` to `Int64`, and `Numeric { precision, scale }` to `Decimal128(precision, scale)`
-* *AND* the remaining variants SHALL map as `Double` to `Float64`, `Boolean` to `Boolean`, `Date` to `Date32`, `Timestamp { precision }` to `Timestamp(unit, None)` where `unit` FOLLOWS the reported `precision` under the one mapping `datafusion-scan/type-mapping-timestamp-precision` owns, and the three that remain (`String`, `Char` and `Unsupported`) to `Utf8`, which subsumes `Utf8View`/`BinaryView` normalization and preserves the behavior the removed type-string path gave an unrecognized declaration
+* *AND* the remaining variants SHALL map as `Double` to `Float64`, `Boolean` to `Boolean`, `Date` to `Date32`, `Timestamp { precision }` to `Timestamp(unit, None)` where `unit` FOLLOWS the reported `precision` under the one mapping `scan-types/type-mapping-timestamp-precision` owns, and the three that remain (`String`, `Char` and `Unsupported`) to `Utf8`, which subsumes `Utf8View`/`BinaryView` normalization and preserves the behavior the removed type-string path gave an unrecognized declaration
 * *AND* the timestamp arm MUST NOT resolve a fixed `Microsecond` target at every precision, because `coerce_column` casts strictly (`safe: false`) and a microsecond target under a `TIMESTAMP(9)` declaration silently destroys the nanosecond digits of an Iceberg `timestamp_ns`/`timestamptz_ns` column, which `iceberg_primitive_to_arrow` already registers as Arrow `Timestamp(Nanosecond, _)`
 * *AND* the timestamp arm MUST NOT carry its own precision-to-unit table, because the adapter's declaration producer reads the same table and two copies would let a declared `TIMESTAMP(9)` mean one width on the declaring side and another at the emit boundary
 * *AND* the match over `ExaType` SHALL stay EXHAUSTIVE with no wildcard arm, so a variant added or removed upstream becomes a compile error here rather than a silent `Utf8` substitution

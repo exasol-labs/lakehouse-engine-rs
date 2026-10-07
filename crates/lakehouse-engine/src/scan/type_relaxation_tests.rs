@@ -64,7 +64,7 @@ pub(crate) fn supported_relaxation_pairs() -> Vec<(&'static str, DataType, DataT
     ]
 }
 
-/// Scenario: every supported relaxation pair is proven castable rather than assumed.
+/// Scenario: Every supported relaxation pair casts without losing a value
 #[test]
 fn arrow_castability_pins_every_supported_relaxation_pair() {
     for (row, physical, logical) in supported_relaxation_pairs() {
@@ -375,7 +375,7 @@ async fn every_supported_relaxation_pair_reads_its_real_values_from_a_narrow_par
     }
 }
 
-/// Scenario: a narrow physical column binds to the current wider logical type and is cast per file.
+/// Scenario: A narrow physical column binds to the current wider logical type and is cast per file
 #[tokio::test]
 async fn a_narrow_physical_column_is_cast_to_the_current_logical_type_per_file() {
     let dir = std::env::temp_dir().join(format!(

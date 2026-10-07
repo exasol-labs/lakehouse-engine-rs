@@ -238,7 +238,7 @@ pub(super) async fn resolve_one_join_side(
 /// CROSS-FOLD SEAM: the result is string-matched in `referenced_leg_columns` against names
 /// folded with ASCII-only `to_ascii_uppercase`, while `column_types` folds differently. Do
 /// not reconcile the folds (see `walk_column_nodes` and
-/// `vs-adapter/pushdown-module-structure`). They agree by premise:
+/// `pushdown/pushdown-module-structure`). They agree by premise:
 /// `build_listing_virtual_tables` Unicode-uppercases every declared name, leaving no ASCII
 /// lowercase for either fold to touch. E2E `non_ascii_table_and_column_stay_queryable`
 /// guards that premise.

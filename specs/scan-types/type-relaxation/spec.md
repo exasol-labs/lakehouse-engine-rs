@@ -1,0 +1,205 @@
+# Feature: Type Relaxation
+
+Reads a data file whose physical column type is NARROWER than the table's current logical type — the
+shape Delta type widening and Iceberg type promotion both leave behind — by casting each file's
+column up to the current type at scan time, so a schema-evolved table returns its real values under
+its current types instead of wrong values or an unresolved-column error.
+
+## Background
+
+**Type relaxation is ONE format-neutral read behavior with two writers.** Delta calls it type
+widening and Iceberg calls it type promotion; both leave older data files carrying the pre-change
+physical type while the table's current schema carries the changed one. This feature owns the read
+answer for both. It owns no format-specific rule: which pairs a writer may produce is
+`delta/delta-type-mapping`'s and `file-planning/iceberg-type-promotion`'s business, and this
+feature reads whatever the logical schema declares.
+
+**Both formats state the reader obligation normatively.** The Delta Lake protocol specification
+(`delta-io/delta`, `PROTOCOL.md`, `master`, § Reader Requirements for Type Widening) states:
+*"Readers must allow reading data files written before the table underwent any supported type
+change, and must convert such values to the current, wider type."* Its § Consistency Between Table
+Metadata and Data Files supplies the licence the old file relies on: *"Any data file column that
+exists in the table schema MUST have the same type (except as allowed by the [Type Widening] table
+feature, if enabled)."* The Apache Iceberg table specification
+(<https://iceberg.apache.org/spec/#schema-evolution>) carries no equivalently direct sentence — its
+obligation is derived, and this feature records that honestly rather than quoting a MUST that does
+not exist: *"Columns in Iceberg data files are selected by field id … projection must be done using
+field ids"* (§ Column Projection), combined with promotion never rewriting a data file, leaves the
+cast as the reader's only way to answer. The spec's nearest direct analogue is its manifest rule,
+*"reading `int` as `long` for promoted fields"*.
+
+**The cast mechanism ALREADY EXISTS and this feature is not building it.** `register_file_list`
+(`crates/lakehouse-engine/src/scan/raw_scan.rs`) registers the DataFusion table schema from the scan
+spec's `LogicalField` list — never from a Parquet footer — whenever that list is non-empty, which it
+is for every Iceberg and every Delta scan. The Parquet opener then sees a logical file schema
+carrying the CURRENT type and a physical file schema carrying the OLD one, and
+`FieldIdExprAdapterFactory` (`crates/lakehouse-engine/src/scan/field_id_projection.rs`) hands both to
+DataFusion's `DefaultPhysicalExprAdapterFactory`, whose `rewrite_column` wraps the resolved column in
+a `CastExpr` on any field inequality. `bind_columns` renames a physical field to the logical name
+that claims it and NEVER compares data types, which is precisely why a narrow physical field arrives
+at the delegate under the logical name still carrying its narrow type. This feature's work is to
+verify that path over every pair in the supported set and to record the answer, not to add a cast
+layer.
+
+**The recorded claim that `.without_row_transforms()` opens a type-widening hole is WRONG and this
+feature supersedes it.** `delta/delta-reader-feature-gating` records that
+*"`DeltaSnapshot::active_files` builds its kernel scan with `.without_row_transforms()`, so no
+per-file cast transform is applied"*. `delta_kernel` 0.26's own doc on that builder method scopes it
+to *"partition column injection, column-mapping renames, and generated row ids"*, and `delta_kernel`
+0.26 implements NO type-widening cast anywhere — its `TableFeature::TypeWidening` handling is a
+capability declaration and a schema-comparison validator, never a cast. There was therefore no cast
+transform for `.without_row_transforms()` to discard. The correct statement is that ANY engine on
+`delta_kernel` 0.26 must apply the widening cast itself, and this engine already does, through the
+format-neutral adapter chain above.
+
+**The cast is inserted per FILE, not per table**, because the Parquet opener creates the adapter from
+each file's own footer schema. A scan whose assigned files straddle the change therefore binds the
+old files through a cast and the new files through the zero-cost identity path, within one shard.
+
+**DataFusion validates castability with `arrow::compute::can_cast_types`, not with either format's
+promotion rule.** `validate_data_type_compatibility` (`datafusion-common`) is the whole check for a
+scalar pair, and a pair it rejects becomes a clean `DataFusionError::Execution` naming the column and
+both types — never a silent passthrough. That permissiveness is why this engine's supported set is
+decided at PLAN time by the two format features, not left to the cast to police: `can_cast_types`
+would equally accept a NARROWING cast that no format permits.
+
+**The two cast sites carry OPPOSITE overflow policies, and only the widening direction makes that
+safe.** DataFusion's read-side `CastExpr` uses `safe: false` and errors on overflow; the emit
+boundary's `coerce_batch_to_exa_types` calls `arrow::compute::cast`, whose default `CastOptions` is
+`safe: true` and turns an overflowing value into a NULL with an `Ok` result. Every pair in the
+supported set is a WIDENING, so no value can overflow either site, and the asymmetry is unreachable
+from this feature. It is recorded because it is what makes the supported set's widening-only
+membership load-bearing rather than incidental.
+
+**The emit boundary needs no pair knowledge and gains none.** `coerce_batch_to_exa_types`
+(`crates/lakehouse-engine/src/scan/emit.rs`) already casts every column whose Arrow type differs from
+the target `exasol_type_to_arrow` derives from the declared EMITS type, through one unguarded
+`arrow::compute::cast` call with no per-pair match. A relaxed column reaches it already carrying the
+CURRENT logical type, so the emit cast sees exactly what it would have seen had the table never
+evolved.
+
+**A relaxation can change a column's DECLARED Exasol type, which a stale virtual schema will not
+show.** `int` declares `DECIMAL(10,0)` and `long` declares `DECIMAL(20,0)`, so an `int → long`
+relaxation moves the declaration. `createVirtualSchema` reads the catalog's CURRENT schema, so a
+virtual schema created BEFORE the relaxation still declares the old type until it is refreshed
+(`vs-adapter/refresh-and-set-properties`). This is the ordinary stale-metadata consequence of schema
+evolution, not a defect of the cast, and it is recorded here because a type change is the case where
+a stale declaration is most likely to be read as a bug in this feature.
+
+**The supported set is the union of the two formats' rules, decided pair by pair.** Every row below
+is a WIDENING for which `arrow::compute::can_cast_types` reports `true` and no value can be lost. The
+"Physical → logical Arrow" column names what the scan actually casts, which is what makes several
+Delta rows collapse: this engine tags `byte`, `short`, and `integer` all as `int32`
+(`delta/delta-type-mapping`), so those three widenings are invisible in the logical schema and
+show up only as an `Int8`/`Int16` physical column under an `Int32` logical one.
+
+| # | Source → target | Delta | Iceberg | Physical → logical Arrow |
+|---|---|---|---|---|
+| 1 | `int` → `long` | yes | v1+ | `Int32` → `Int64` |
+| 2 | `float` → `double` | yes | v1+ | `Float32` → `Float64` |
+| 3 | `decimal(P,S)` → `decimal(P',S)`, `P' > P` | yes | v1+ | `Decimal128(P,S)` → `Decimal128(P',S)` |
+| 4 | `byte` → `short` | yes | — | `Int8` → `Int32` |
+| 5 | `byte` → `int` | yes | — | `Int8` → `Int32` |
+| 6 | `byte` → `long` | yes | — | `Int8` → `Int64` |
+| 7 | `short` → `int` | yes | — | `Int16` → `Int32` |
+| 8 | `short` → `long` | yes | — | `Int16` → `Int64` |
+| 9 | `byte` / `short` / `int` → `double` | yes | — | `Int8` / `Int16` / `Int32` → `Float64` |
+| 10 | `byte` / `short` / `int` → `decimal(10+k1,k2)` | yes | — | `Int8` / `Int16` / `Int32` → `Decimal128` |
+| 11 | `long` → `decimal(20+k1,k2)` | yes | — | `Int64` → `Decimal128` |
+| 12 | `decimal(p,s)` → `decimal(p+k1,s+k2)`, `k1 ≥ k2 > 0` | yes | — | `Decimal128(p,s)` → `Decimal128(p+k1,s+k2)` |
+| 13 | `date` → `timestamp without time zone` | yes | — | `Date32` → `Timestamp(us, None)` |
+
+**Three Iceberg promotions are NOT in the supported set, and each is refused rather than attempted.**
+Iceberg's `date` → `timestamp` and `date` → `timestamp_ns` (both v3+) are refused at plan time by
+`file-planning/iceberg-type-promotion`, which also owns the reason; Iceberg's `unknown` → any type is
+unreachable because `iceberg` 0.10.0 has no `PrimitiveType::Unknown`. Delta's `date` →
+`timestampNtz` (row 13) IS supported, and that asymmetry between two spellings of the same logical
+pair is deliberate: the difference lives entirely in how each format stores per-file bounds, not in
+the cast, and `file-planning/iceberg-type-promotion` records it.
+
+**`long` → `double` is in NEITHER format's rules and is therefore NOT in the supported set.** The
+Delta protocol lists *"`Byte`, `Short` or `Int` -> `Double`"* and deliberately omits `Long`, which is
+lossy above 2^53; Iceberg's promotion table has no such row at all. It is named here because a reader
+scanning the widening list for "integer to floating point" would otherwise assume it.
+
+**Apache Iceberg spec check.** The three Iceberg promotions this feature DOES support — rows 1, 2,
+and 3 — are exactly the `int` → `long`, `float` → `double`, and `decimal(P,S)` → `decimal(P',S)` rows
+of the spec's § Schema Evolution promotion table, whose decimal Requirements cell reads *"Widen
+precision only"* with the scale symbol `S` unchanged on both sides. Row 12's scale growth is
+therefore Delta-only and MUST NOT be read as an Iceberg promotion. The spec's § Column Projection
+ordered resolution for an absent field id is untouched by this feature, and
+`scan-read-path/scan-execution-field-id-projection`'s recorded deviation on its rule (1) stays
+exactly as recorded — relaxation changes what a PRESENT column is cast to, never how an ABSENT one is
+resolved.
+
+## Scenarios
+
+### Scenario: A narrow physical column binds to the current wider logical type and is cast per file
+
+* *GIVEN* a scan spec whose logical schema declares a column at the table's CURRENT type — the type after a Delta type widening, an Iceberg type promotion, or a direct-storage footer fold
+* *AND* two assigned files, one written BEFORE the change whose physical Parquet column carries the narrow source type, and one written AFTER whose physical column carries the current type
+* *WHEN* the scan UDF reads both files in one shard
+* *THEN* the UDF SHALL register the DataFusion table schema from the scan spec's `LogicalField` list and MUST NOT infer it from any data file, so the column's declared type is the CURRENT one for both files; the column-binding adapter SHALL choose the narrow physical field by its binding key alone — field-id, declared physical name, or identity — and MUST NOT compare Arrow data types to decide which field binds, because a type-equality binding would fail on exactly the file this scenario exists for
+* *AND* the delegated `DefaultPhysicalExprAdapter` SHALL insert the physical-to-logical cast into the physical expression tree, so every filter, projection, aggregate, and join key evaluated by DataFusion sees the column at its CURRENT type rather than its physical one
+* *AND* the emitted rows from the OLD file SHALL carry that file's real values widened to the current type, and the emitted rows from the NEW file SHALL carry theirs unchanged; the cast SHALL be decided PER FILE from that file's own footer schema, so a shard straddling the change needs no per-shard grouping by physical layout
+
+### Scenario: The cast resolution holds across every format and stops at the refusal boundary
+
+* *GIVEN* the resolution above applies to an Iceberg scan, a Delta scan, a direct-storage scan, and a Unity Catalog Parquet scan, because all four populate the same `LogicalField` list and install the same adapter
+* *WHEN* each format's scan installs that adapter
+* *THEN* the resolution SHALL hold identically for all four, and the scan side MUST NOT branch on table format nor on whether a writer or the engine decided the current type
+* *AND* a logical type NARROWER than a file's physical column SHALL NOT reach this cast, SUPERSEDING the recorded clauses that routed it through a narrowing cast, and SHALL instead be refused as the scenario "A physical type outside the admitted set is refused before any cast" states
+
+### Scenario: A physical type outside the admitted set is refused before any cast
+
+* *GIVEN* a scan spec carrying a logical schema, and assigned files whose physical columns bind to logical columns by field-id, by declared physical name, or by identity
+* *WHEN* the scan UDF opens each file
+* *THEN* the UDF SHALL hand a bound column to the cast only when its physical type is ADMITTED for the declared logical type, decided per file from that file's own footer schema: admitted when the supported-set owner (`widen`) resolves the pair to the logical type (an equal type or any supported-set row); admitted for two timestamp types when the physical unit equals the logical unit or is coarser, unless the physical type carries a time zone other than `UTC` or `+00:00` and the logical type carries none, because only that pair changes a stored instant; and admitted for a string-tagged logical field against every string encoding and every primitive type the JSON-fallback classifier routes to text (`scan-types/type-mapping`) — binary, fixed-size binary, time, an out-of-domain decimal — because that text rendering IS the declared type, a deliberate Exasol trade-off since Exasol has no binary or time type; and admitted for a physical `Null` column under every logical type, because an all-NULL column's cast changes no value
+* *AND* a dictionary-encoded physical column that no rule above admits SHALL be judged by its value type
+
+### Scenario: A refused pair fails only a query that reads it, for every format, with no credential in the error
+
+* *GIVEN* a bound column pair that no admission rule above admits, reached through any binding key — field-id, declared physical name, or identity — on any scan source
+* *WHEN* a query references that column in its projection or filter
+* *THEN* the UDF SHALL fail the query with a clean error naming the table's storage location, the column, the declared type, and the physical type — for every refused pair, including `double` under `int`, `int64` under `int32`, `timestamp` under `date`, `string` under a numeric type, and a numeric type under `string` — and the error MUST NOT contain any credential value; the UDF MUST NOT cast a refused pair, so no truncated, rounded, overflowing, or unparseable value reaches a filter, an aggregate, or an emitted row
+* *AND* a query that references no refused column of a file SHALL still read that file, and a nested-descriptor column's JSON rendering, an unclaimed column's NULL-fill, `initial-default`, and required-absent error, and a spec without a logical schema SHALL keep their recorded behavior, because none of them reaches the cast
+* *AND* the rule SHALL hold identically for every format and every binding key
+
+### Scenario: Every supported relaxation pair casts without losing a value
+
+* *GIVEN* a Parquet column whose physical Arrow type and logical Arrow type form one of the 13 rows of the supported-set table above: `Int8`/`Int16`/`Int32` → `Int32`/`Int64`, `Int8`/`Int16`/`Int32` → `Float64`, `Float32` → `Float64`, `Int8`/`Int16`/`Int32`/`Int64` → `Decimal128`, `Decimal128(P,S)` → `Decimal128(P',S)` and `Decimal128(p+k1,s+k2)`, or `Date32` → `Timestamp(us, None)`
+* *WHEN* the scan reads that column from a file written at the physical type under a logical schema that carries the target type
+* *THEN* the scan SHALL cast the column to the target type and return every value unchanged
+* *AND* `long` → `double` SHALL NOT be a supported relaxation, because neither format permits it, although `arrow::compute::can_cast_types` admits it
+* *AND* the proof SHALL assert `arrow::compute::can_cast_types` for every supported-set pair and fail when an `arrow-cast` upgrade withdraws one
+* *AND* the proof's list of supported pairs SHALL be a hand-written pin asserted against the production widening owner, never generated from it, so a supported-set row with no matching rule in that owner fails
+
+### Scenario: A relaxed column crosses the emit boundary at its declared Exasol type
+
+* *GIVEN* a scan whose relaxed column has been cast to the table's current logical Arrow type, and an
+  `EMITS` declaration derived from that same current type
+* *WHEN* the scan coerces the batch at the emit boundary before emitting it
+* *THEN* `coerce_batch_to_exa_types` SHALL treat the column exactly as it treats an unevolved column
+  of that type, and this feature MUST NOT add any relaxation-aware branch, pair table, or allow-list
+  to the emit path, because the column already carries its current type by the time it arrives
+* *AND* the emitted value SHALL equal the source file's value widened to the current type, with no
+  value replaced by NULL, because every supported pair is a widening and no widening can overflow the
+  emit cast's `safe: true` policy
+* *AND* the `EMITS` type SHALL be derived from the catalog's CURRENT schema for the request being
+  planned, so a relaxation that moves a column's declared Exasol type — `int`'s `DECIMAL(10,0)`
+  becoming `long`'s `DECIMAL(20,0)` — moves the emitted type with it
+* *AND* a virtual schema created before the relaxation SHALL keep declaring the OLD Exasol type until
+  it is refreshed, and that staleness SHALL be resolved by `REFRESH VIRTUAL SCHEMA`
+  (`vs-adapter/refresh-and-set-properties`) rather than by any scan-side compensation, because the
+  scan is not the owner of a declaration Exasol already stored
+
+### Scenario: The supported pair set answers a plan-time widening question from one production owner
+
+* *GIVEN* the 13-row supported-set table above, and a plan-time caller holding two concrete Arrow types for one column read from two Parquet footers
+* *WHEN* that caller asks which of the two types the column resolves to
+* *THEN* exactly ONE production item SHALL answer, taking the two Arrow types and returning the WIDER one when either ordering is a row of the supported set, and returning NO answer otherwise
+* *AND* the item SHALL answer over the CONCRETE types rather than over row names, so a decimal row's precision and scale conditions are evaluated on the actual pair — `decimal(10,2)` with `decimal(12,2)` resolves to `decimal(12,2)` by row 3, and `decimal(10,2)` with `decimal(20,5)` resolves to `decimal(20,5)` by row 12
+* *AND* it SHALL return NO answer for two types whose widening is supported in NEITHER direction, so a caller reports a conflict rather than guessing, and `decimal(12,2)` with `decimal(10,5)` SHALL be such a pair because neither ordering satisfies a row
+* *AND* it SHALL return the shared type unchanged for two EQUAL types, so an unevolved column costs no special case at the caller
+* *AND* it MUST NOT consult `arrow::compute::can_cast_types`, because that function also accepts narrowing casts no format permits, which is the recorded reason the supported set is decided at plan time
+* *AND* it MUST NOT add, remove, or parameterize a row of the supported-set table, so `long` → `double` stays absent and this scenario changes no scan-time answer

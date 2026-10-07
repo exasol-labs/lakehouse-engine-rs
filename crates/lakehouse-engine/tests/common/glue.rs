@@ -1,5 +1,5 @@
 //! AWS Glue E2E harness: every `GlueRun` owns one Glue database and one S3 prefix and deletes
-//! both when it drops, so two concurrent runs never share a fixture (`glue-e2e/glue-e2e-harness`).
+//! both when it drops, so two concurrent runs never share a fixture (`specs/testing.md` § Per-run cloud resources).
 
 use super::cloud_fixture::{
     derive_run_segment, per_run_segment, require_var, run_teardown_off_runtime,
@@ -470,7 +470,7 @@ pub const ORDERS: [Order; 5] = [
     order(5, None, 4215, "2024-01-05"),
 ];
 
-/// One `all_types` column per Hive type of `vs-adapter/glue-hive-type-mapping`; `data` is
+/// One `all_types` column per Hive type of `glue/glue-hive-type-mapping`; `data` is
 /// `None` for a column the data file leaves out, because the reader refuses it at plan time.
 struct HiveTypeColumn {
     column: &'static str,
@@ -841,7 +841,7 @@ impl<'a> FixtureWriter<'a> {
     }
 }
 
-/// Registers the whole fixture set of `glue-e2e/glue-e2e-harness` in the run's database.
+/// Registers the Glue E2E suite's whole fixture set in the run's database.
 pub async fn register_fixture_set(run: &GlueRun) -> Result<()> {
     let writer = FixtureWriter::new(run)?;
     try_join!(
@@ -1272,7 +1272,7 @@ mod glue_naming_and_variable_tests {
             .map(|(_, value)| value.to_string())
     }
 
-    /// Scenario: Each run provisions its own Glue database and S3 prefix and removes both, including on panic
+    /// specs/testing.md § Per-run cloud resources
     #[test]
     fn run_id_is_a_legal_glue_database_name() {
         let three_hundred_chars = "A".repeat(300);
@@ -1296,7 +1296,7 @@ mod glue_naming_and_variable_tests {
         );
     }
 
-    /// Scenario: The suite fails, never skips, when a variable or the stack is missing
+    /// specs/testing.md § Failure contract
     #[test]
     fn glue_env_reads_all_eight_variables_up_front() {
         let env = GlueEnv::from_lookup(value_of);
@@ -1331,7 +1331,7 @@ mod glue_naming_and_variable_tests {
         }
     }
 
-    /// Scenario: No credential value appears in output
+    /// specs/testing.md § Credentials in tests
     #[test]
     fn glue_env_redacts_both_secret_keys_and_the_external_id() {
         let env = GlueEnv::from_lookup(value_of);

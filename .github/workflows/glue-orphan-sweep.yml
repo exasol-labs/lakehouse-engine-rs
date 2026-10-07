@@ -1,6 +1,6 @@
 name: Glue Orphan Fixture Sweep
 
-# See specs/glue-e2e/glue-orphan-sweep/spec.md.
+# See specs/testing.md § Ops › Orphaned fixture sweeps.
 
 on:
   schedule:

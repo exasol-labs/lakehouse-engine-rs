@@ -189,8 +189,8 @@ auto-provision both, consistent with never auto-double-provisioning Trino/EMR.
   Exasol. An earlier version spun up a fresh Docker container + JVM **per query** from the operator's
   machine, reaching Trino over the public internet — that made native Trino look slower than it is,
   which is why IMPORT FROM JDBC appeared to beat it on every query, purely from measurement bias.
-  Requires the Trino EC2 key pair's private key locally to SSH into the worker (`KEY_FILE`,
-  default `~/.ssh/<project>-rsa` — apply the stack with a `key_pair_name` you actually hold);
+  Requires the Trino EC2 key pair's private key locally to SSH into the worker (set `KEY_FILE` to its path, no default —
+  apply the stack with a `key_pair_name` you actually hold);
   resolves the coordinator's private ip itself via the AWS CLI (connecting from the worker to the
   coordinator's *public* ip does not reliably pass the security group's internode rule).
 - **`spark_compare.sh`** — requires `deploy/data-stack` applied with `-var

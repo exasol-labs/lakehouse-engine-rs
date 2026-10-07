@@ -644,6 +644,7 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
+/// Scenario: Vended and static credentials resolve the same scan
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     wait_for_seaweedfs();
@@ -812,7 +813,7 @@ fn json_value_at(text: &str, start: usize) -> (serde_json::Value, usize) {
     (value, end)
 }
 
-/// Scenario: a delete-free Delta table returns its rows end to end
+/// Scenario: A Delta data file carrying no deletion vector scans unchanged
 #[test]
 fn unity_delta_delete_free_table_returns_its_rows() {
     setup();
@@ -843,7 +844,7 @@ fn unity_delta_delete_free_table_returns_its_rows() {
     );
 }
 
-/// Scenario: A Unity Catalog CONNECTION with static keys naming the role reads a Delta table through the session
+/// Scenario: Session credentials are the storage credential when the CONNECTION does not vend
 #[test]
 fn unity_role_connection_reads_a_delta_table_through_the_session() {
     setup();
@@ -869,7 +870,7 @@ fn unity_role_connection_reads_a_delta_table_through_the_session() {
     );
 }
 
-/// Scenario: a Delta table with deletion vectors returns only its live rows
+/// Scenario: Deletion vectors compose with projection, filter, LIMIT, and aggregation
 #[test]
 fn unity_delta_deletion_vector_table_returns_only_live_rows() {
     setup();
@@ -906,7 +907,7 @@ fn unity_delta_deletion_vector_table_returns_only_live_rows() {
     );
 }
 
-/// Scenario: a column-mapped Delta table returns values under its logical column names
+/// Scenario: Each logical field carries the binding key its column-mapping mode selects
 #[test]
 fn unity_delta_column_mapped_tables_return_logical_column_values() {
     setup();
@@ -947,7 +948,7 @@ fn unity_delta_column_mapped_tables_return_logical_column_values() {
     }
 }
 
-/// Scenario: a partitioned Delta table returns its partition column values
+/// Scenario: A partition column absent from the data file is materialized per file
 #[test]
 fn unity_delta_partitioned_table_returns_partition_values() {
     setup();
@@ -1025,7 +1026,7 @@ fn unity_delta_partitioned_table_returns_partition_values() {
     );
 }
 
-/// Scenario: join and aggregate pushdown reach a Delta table by the same route as a scan
+/// Scenario: Every pushdown request shape resolves through the one format-reader seam
 #[test]
 fn unity_delta_join_and_aggregate_pushdown_return_correct_rows() {
     setup();
@@ -1176,7 +1177,7 @@ const TYPE_WIDENING_SUPPORTED_COLUMNS: &str = "BYTE_LONG, INT_LONG, FLOAT_DOUBLE
      DECIMAL_DECIMAL_SAME_SCALE, DECIMAL_DECIMAL_GREATER_SCALE, INT_DECIMAL, LONG_DECIMAL, \
      DATE_TIMESTAMP_NTZ";
 
-/// Scenario: a Delta table using an unsupported reader feature fails the query loud
+/// Scenario: A refused table fails the query with a SQL error and leaves the session usable
 #[test]
 fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     setup();
@@ -1219,7 +1220,7 @@ fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     );
 }
 
-/// Scenario: A type-widened Delta table returns its current wider types across the widening boundary
+/// Scenario: A narrow physical column binds to the current wider logical type and is cast per file
 #[test]
 fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
     setup();
@@ -1401,7 +1402,7 @@ const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LO
      TIMESTAMP_COL, TIMESTAMP_NTZ_COL, STRING_COL, DECIMAL_COL, BOOLEAN_COL, ARRAY_COL, \
      MAP_COL, NESTED_STRUCT";
 
-/// Scenario: A Delta table's varied types return their expected Exasol types and values
+/// Scenario: Every Delta type declares and returns its mapped value through Unity Catalog
 #[test]
 fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     setup();
@@ -1931,7 +1932,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
     );
 }
 
-/// Scenario: a Unity Parquet table's scan resolves identically under vended and static credentials
+/// Scenario: Vended and static credentials resolve the same scan
 #[test]
 fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     setup();

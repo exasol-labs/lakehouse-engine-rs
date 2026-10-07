@@ -1,0 +1,204 @@
+# Feature: DataFusion-to-Exasol Type Mapping
+
+Defines the single authoritative mapping from DataFusion/Arrow column types to Exasol
+SQL types, and the companion Iceberg-to-Arrow mapping used to build the logical schema
+the scan registers, so that every column an Iceberg table exposes is queryable through
+Exasol. Types Exasol supports natively map directly; types Exasol cannot represent
+(vectors, lists, structs, maps, and out-of-range decimals) are serialized to
+JSON strings and surfaced as `VARCHAR`. The same mapping governs the `createVirtualSchema`
+schema declaration, the Arrow-to-Value conversion in the scan, and the logical schema
+carried into the scan spec, keeping declared and emitted types in agreement.
+
+## Background
+
+* **This delta is issue #350.** It splits the recorded "incompatible Arrow types" set in two,
+  because the two halves now reach Exasol by different mechanisms: List, LargeList, FixedSizeList,
+  Struct, and Map are rendered as real JSON by `scan-types/nested-json-rendering`, while every
+  other member of the set — Union, Duration, Time32, Time64, Interval, Decimal256, and an
+  out-of-range `Decimal128` — keeps its recorded `CAST(col AS VARCHAR)` Arrow-display path,
+  byte-identical. A Binary, LargeBinary, or FixedSizeBinary column is refused at plan time on
+  every source per `vs-adapter/binary-column-refusal` (#351).
+  Every declared EXASOL type is unchanged: all of them were and remain `VARCHAR(2000000)`.
+* **`iceberg_type_to_arrow` is deliberately NOT made recursive, and that is the load-bearing design
+  decision of issue #350.** A column's LOGICAL Arrow type stays `Utf8` for every list, struct, and
+  map, so the JSON string is the column's type everywhere the type is read: in the registered
+  DataFusion table schema, in the compact `ScanSpec::logical_schema` tag vocabulary, in the pushdown
+  planner's `needs_json_fallback` decisions, and in Exasol's own `VARCHAR(2000000)` declaration. A
+  recursive nested Arrow tag would instead make the column a genuine nested type during DataFusion
+  execution, where DataFusion has no comparison, ordering, hashing, or aggregation operator for
+  `Struct` or `Map` — which would oblige the adapter to newly DECLINE every WHERE predicate, GROUP BY
+  key, aggregate argument, and join condition referencing such a column at five separate decision
+  sites, and to re-sequence `handle_pushdown` so the logical schema is resolved before the filter
+  decision. Keeping the logical type `Utf8` leaves all five sites, the whole capability surface, and
+  the `ScanSpec` wire tag untouched.
+* **The nested field TREE, unlike the nested TYPE, does reach the scan, on a separate field.** A
+  rendering keyed by the file's physical nested names would emit a column-mapped Delta table's
+  `col-…` identifiers as JSON keys, so `LogicalField` carries an optional, format-neutral nested
+  descriptor naming each nested field's LOGICAL name and the ONE binding key its format's
+  column-mapping selects — the SAME `field_id` XOR `physical_name` XOR identity choice `LogicalField`
+  already makes for a top-level column, recursed. It is NOT a type: it is the information the JSON
+  renderer needs to resolve names, and the column's type remains `Utf8`. `scan-types/nested-json-rendering`
+  owns what the renderer does with it; the tag vocabulary this feature owns gains no entry.
+* **The JSON-rendered nested set needs its OWN predicate, because `needs_json_fallback` is too
+  broad.** `needs_json_fallback` is also true for `Binary` and an out-of-range `Decimal128`. An
+  out-of-range `Decimal128` keeps the `CAST(col AS VARCHAR)` path this delta leaves untouched, and
+  a `Binary` column is refused before it, per `vs-adapter/binary-column-refusal`. A single predicate
+  owning the five nested Arrow variants is therefore added beside it rather than folded into it, and
+  the two answer different questions: "does this type need serializing at all" versus "is this type
+  rendered by the JSON encoder".
+* **Apache Iceberg spec check.** The Iceberg-to-Arrow direction this feature owns is UNCHANGED by
+  this delta, so its recorded compliance surface is unchanged. The Iceberg spec's § Nested Types,
+  § Column Projection, and § JSON single-value serialization obligations that this plan does engage
+  are quoted and answered in `scan-types/nested-json-rendering`, which owns the rendering.
+* Exasol's representable types are: BOOLEAN, DECIMAL(1≤p≤36, 0≤s≤p), DOUBLE PRECISION,
+  VARCHAR(n≤2,000,000), CHAR(n≤2,000), DATE, TIMESTAMP(p≤9), TIMESTAMP WITH LOCAL TIME
+  ZONE, INTERVAL YEAR TO MONTH, INTERVAL DAY TO SECOND, GEOMETRY, HASHTYPE. Exasol has
+  no array, list, struct, or map type. `TIMESTAMP WITH LOCAL TIME ZONE` is a valid Exasol
+  column type but NOT a valid UDF `EMITS` output type — Exasol rejects it at scan-script
+  compile time (`sqlCode 22002: Column type not supported`) — so this mapping never targets it.
+* A CATALOG-DECLARED decimal (an Iceberg `PrimitiveType::Decimal` or a Unity Catalog
+  `DECIMAL`) is checked against Exasol's full `DECIMAL` domain — `1 ≤ p ≤ 36` and `s ≤ p` —
+  and falls back to `VARCHAR(2000000)` otherwise. The compatible-Arrow-types table's
+  `Decimal128(p,s) where p≤36 and s≤36` row governs only the ARROW-INPUT direction
+  (`arrow_to_exasol_type` / `compatible_exasol_type`), whose scale is signed and has no
+  `s ≤ p` analogue, and stays unchanged.
+* The mapping is applied in three places that MUST stay consistent: the adapter's
+  `createVirtualSchema` schema declaration (Arrow type → declared Exasol column type),
+  the scan UDF's Arrow `RecordBatch` → SDK `Value` conversion (Arrow value →
+  `Value` variant), and the logical schema carried into the scan spec (Iceberg type →
+  Arrow `DataType`).
+* Complex Arrow/Iceberg types (list, struct, map) and out-of-range decimals map
+  to a string-family type surfaced as JSON `VARCHAR`.
+* Compatible Arrow types map directly:
+
+  | Arrow type | Exasol type | Value variant |
+  |---|---|---|
+  | Boolean | BOOLEAN | `Value::Bool` |
+  | Int8 / Int16 / Int32 | DECIMAL(precision, 0) | numeric |
+  | Int64 / UInt32 / UInt64 | DECIMAL(20, 0) | numeric |
+  | UInt8 / UInt16 | DECIMAL(precision, 0) | numeric |
+  | Float32 / Float64 | DOUBLE PRECISION | `Value::Double` |
+  | Utf8 / LargeUtf8 | VARCHAR(2000000) | `Value::String` |
+  | Date32 | DATE | date |
+  | Timestamp(_, _) | TIMESTAMP | timestamp |
+  | Decimal128(p,s) where p≤36 and s≤36 | DECIMAL(p, s) | numeric |
+  | Decimal128(p,s) where p>36 or s>36 | VARCHAR(2000000) via JSON | `Value::String` |
+
+* Incompatible Arrow types — List, LargeList, FixedSizeList, Struct, Map, Union, Binary,
+  LargeBinary, FixedSizeBinary, Duration, Time32, Time64, Interval, Decimal256 — have no
+  Exasol equivalent and are declared as VARCHAR(2000000) in the schema response. Each one
+  except Binary, LargeBinary, and FixedSizeBinary is serialized to a JSON string in the scan
+  UDF (via DataFusion `CAST(col AS VARCHAR)` / `arrow_cast`) before conversion to
+  `Value::String`. A binary column is refused at plan time per `vs-adapter/binary-column-refusal`.
+* An Arrow null maps to `Value::Null` regardless of column type.
+* **Split, issue #359: the timestamp-precision version gate moved to
+  `scan-types/type-mapping-timestamp-precision`.** This feature's scenario count crossed this
+  library's per-spec organization threshold once issue #359 landed; the version-gated
+  `TIMESTAMP(6)`/`TIMESTAMP` declaration, its default on an unreadable version, the Arrow-input
+  resolver's exclusion from the gate, the amended `timestamptz` scenario, and the `TIMESTAMP(p)` EMITS
+  round-trip now live in that sibling feature. This feature keeps the general Arrow/Exasol
+  type-compatibility surface: compatible types, the Decimal128 domain, incompatible-type JSON
+  serialization, and the Iceberg-to-Arrow logical schema mapping.
+
+## Scenarios
+
+### Scenario: Compatible Arrow types map to their Exasol type
+
+* *GIVEN* a column of a compatible Arrow type from the mapping table
+* *WHEN* the type is resolved for the Exasol schema and a value of it is converted
+* *THEN* the resolver SHALL return the Exasol type given by the mapping table for that Arrow type
+* *AND* the converter SHALL produce the `Value` variant given by the mapping table
+* *AND* an Arrow null SHALL convert to `Value::Null`
+
+### Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
+
+* *GIVEN* an Arrow `Decimal128(p, s)` column with `p ≤ 36` and `s ≤ 36`
+* *WHEN* the type is resolved for the Exasol schema
+* *THEN* the resolver SHALL return `DECIMAL(p, s)` preserving the source precision and scale
+* *AND* the converter SHALL produce a numeric `Value` without JSON serialization
+
+### Scenario: Out-of-range Decimal128 falls back to VARCHAR via JSON
+
+* *GIVEN* an Arrow `Decimal128(p, s)` column with `p > 36` or `s > 36`
+* *WHEN* the type is resolved for the Exasol schema and a value of it is converted
+* *THEN* the resolver SHALL declare the column as `VARCHAR(2000000)`
+* *AND* the converter SHALL serialize the value to a JSON string and produce `Value::String`
+
+### Scenario: Incompatible Arrow types are serialized to JSON VARCHAR
+
+* *GIVEN* a column of an incompatible Arrow type — either a NESTED type (`List`, `LargeList`, `FixedSizeList`, `Struct`, `Map`) or a NON-NESTED one (`Binary`, `LargeBinary`, `FixedSizeBinary`, `Union`, `Duration`, `Time32`, `Time64`, `Interval`, `Decimal256`, or an out-of-range `Decimal128`)
+* *WHEN* the type is resolved for the Exasol schema and a value of it is converted
+* *THEN* the resolver SHALL declare the column as `VARCHAR(2000000)` for EVERY member of both halves, unchanged by this delta
+* *AND* a NESTED column's value SHALL be rendered as a valid JSON document per `scan-types/nested-json-rendering`, which owns that contract
+* *AND* a NON-NESTED column's value, other than a `Binary`, `LargeBinary`, or `FixedSizeBinary` one, SHALL keep its recorded `CAST(col AS VARCHAR)` Arrow-display rendering byte-identical, and this feature MUST NOT claim strict JSON conformance for it
+* *AND* every request that reads or emits a `Binary`, `LargeBinary`, or `FixedSizeBinary` column SHALL be refused at plan time per `vs-adapter/binary-column-refusal` until issue #351 defines a rendering for binary
+* *AND* the converter MUST NOT emit any array, list, struct, or map `Value` for either half
+* *AND* exactly ONE predicate in `crates/lakehouse-engine/src/types/mapping.rs` SHALL own the NESTED half's arm list, and every consumer SHALL read its answer from that predicate rather than re-matching on `DataType`, so no second copy can classify a type into the wrong half
+* *AND* that predicate MUST NOT be `needs_json_fallback`, and `needs_json_fallback` SHALL keep its recorded `fn(&DataType) -> bool` signature and its recorded answer for every input, so its four existing call sites are unchanged: an out-of-range `Decimal128` column SHALL stay in the CAST path that the nested predicate diverts columns away from
+
+### Scenario: A mixed-column Parquet file round-trips through schema mapping and scan
+
+* *GIVEN* an Iceberg Parquet file with both compatible columns (int, string, timestamp) and incompatible columns (a POPULATED list and a POPULATED struct — never a zero-field struct, which sidesteps the field-wise path this scenario exists to cover)
+* *WHEN* `createVirtualSchema` declares the table and the scan UDF reads the file
+* *THEN* the declared schema SHALL type the compatible columns by the mapping table and the incompatible columns as `VARCHAR(2000000)`
+* *AND* the scan SHALL emit the compatible columns as their mapped `Value` variants and the list and struct columns as valid JSON documents that parse, per `scan-types/nested-json-rendering`
+* *AND* every emitted column value SHALL be of an Exasol-compatible type
+
+### Scenario: Iceberg logical schema maps to Arrow types for scan registration
+
+* *GIVEN* an Iceberg table's current schema whose fields include primitive types (int, long, double, string, boolean, date, timestamp) and complex/out-of-range types (list, struct, map, out-of-range decimal)
+* *WHEN* the adapter derives the logical schema it carries into the scan spec
+* *THEN* each Iceberg field SHALL map to the Arrow `DataType` the scan UDF registers for that column, consistent with the existing Iceberg-to-Exasol mapping (primitive types to their direct Arrow equivalents; complex and out-of-range types to a string-family Arrow type that surfaces as JSON `VARCHAR`)
+* *AND* `iceberg_type_to_arrow` SHALL keep returning `DataType::Utf8` for `list`, `struct`, and `map`, and MUST NOT recurse into element, field, key, or value types to build a nested Arrow type, because the column's logical type IS the rendered JSON string — see this delta's Background bullet for the five pushdown decision sites a nested logical type would oblige this plan to change
+* *AND* each mapped field SHALL preserve the source Iceberg field-id and its required/optional nullability
+* *AND* a `list`, `struct`, or `map` field SHALL ADDITIONALLY carry the format-neutral nested descriptor `scan-types/nested-json-rendering` consumes — every nested field's LOGICAL name plus the ONE binding key the format's column-mapping selects, recursively — and a primitive field SHALL carry NONE, so a spec authored before the descriptor existed deserializes unchanged
+* *AND* the mapping used for the logical schema SHALL agree with the `createVirtualSchema` schema declaration so the declared Exasol column type and the registered Arrow type stay in agreement
+
+### Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
+
+* *GIVEN* a column whose catalog-declared type is a decimal carrying an unsigned precision `p` and an unsigned scale `s` — an Iceberg `PrimitiveType::Decimal { precision, scale }` or a Unity Catalog `DECIMAL` whose `type_precision`/`type_scale` the neutral column carries
+* *WHEN* the adapter resolves that column's Exasol type for the `createVirtualSchema` declaration
+* *THEN* the resolver SHALL return `DECIMAL(p,s)` if and only if `1 ≤ p ≤ 36` AND `s ≤ p`, and SHALL return `VARCHAR(2000000)` otherwise, so `p = 0` yields `VARCHAR(2000000)` rather than the invalid `DECIMAL(0,0)` and `s > p` yields `VARCHAR(2000000)` rather than an invalid shape such as `DECIMAL(5,10)`
+* *AND* exactly ONE function in `crates/lakehouse-engine/src/types/mapping.rs` SHALL own that PREDICATE, exactly one SHALL own the two returned STRINGS that branch on it, and BOTH catalog kinds SHALL read their answer from those rather than each carrying its own copy — the guard is the significant design decision here, and a second copy is what let the two kinds agree by coincidence rather than by construction
+* *AND* the string-returning owner SHALL be declared PRIVATE to `types/mapping.rs`, because its only consumers are the Iceberg and Unity arms in that same file; the predicate owner SHALL be declared `pub(crate)`, because one consumer of the same decision lives OUTSIDE that file — the VS `initial-default` encoding gate in `adapter/pushdown/file_resolution.rs`, whose scenario `scan-read-path/scan-execution-field-id-projection-absent-fields` owns — and a predicate hidden from a consumer is a predicate that consumer copies
+* *AND* the guard MUST NOT carry a separate `s ≤ 36` test, because `s ≤ p` and `p ≤ 36` already imply it and a redundant third condition invites the halves to drift, and MUST NOT carry a lower-bound test on `s`, because both catalog-sourced fields are unsigned and a negative scale is unrepresentable — unlike the Arrow `Decimal128(u8, i8)` path, which this scenario does NOT govern
+* *AND* the resolver MUST NOT fail, return a `Result`, or abort the enumeration on either bad pair — the `VARCHAR(2000000)` fallback absorbs them exactly as it absorbs `p > 36`, keeping `column_source_type_to_exasol` and `build_listing_virtual_tables` infallible
+* *AND* every pair already mapped SHALL keep its recorded answer byte-identical: `(18,4)` and `(10,2)` stay `DECIMAL(18,4)` and `DECIMAL(10,2)`, the boundary pair `(36,36)` stays `DECIMAL(36,36)` because `s ≤ p` holds there, `(1,0)` stays `DECIMAL(1,0)`, and `(38,10)` and `(18,37)` stay `VARCHAR(2000000)`
+
+### Scenario: The Iceberg-to-Arrow logical mapping reads the same catalog-decimal guard
+
+* *GIVEN* an Iceberg `PrimitiveType::Decimal { precision, scale }` carrying an unsigned precision `p` and an unsigned scale `s`
+* *WHEN* the VS resolves that column's LOGICAL ARROW type for the scan spec's logical schema, rather than its Exasol declaration string
+* *THEN* the resolver SHALL return `Decimal128(p, s)` if and only if `1 ≤ p ≤ 36` AND `s ≤ p`, and SHALL return `Utf8` otherwise, reading that predicate from the SAME single owner the Exasol-string resolver reads and MUST NOT carry its own copy of it
+* *AND* the two directions SHALL therefore be in lockstep BY CONSTRUCTION rather than by convention: for every catalog-declared decimal, `Decimal128(p,s)` accompanies the `DECIMAL(p,s)` declaration and `Utf8` accompanies the `VARCHAR(2000000)` declaration, with no pair producing one of each
+* *AND* the resolver MUST NOT return a `Decimal128` tag for a column `createVirtualSchema` declares `VARCHAR(2000000)` — the lockstep is load-bearing in both directions, which is why it is recorded rather than left implicit: such a tag breaks the single-source-of-truth contract this feature records for `exasol_type_to_arrow`, and arrow-rs rejects `precision == 0` and `scale > precision` when a `Decimal128Array` is built, so the tag would name an Arrow type the scan cannot instantiate at all
+* *AND* every Arrow answer already recorded SHALL stay byte-identical: `(18,4)`, `(36,36)`, and `(36,0)` stay `Decimal128`, and `(38,10)` and `(18,37)` stay `Utf8` — the two pairs that move are `p = 0` and `s > p`, which move from `Decimal128` to `Utf8`
+* *AND* the mapping SHALL remain the LOGICAL Iceberg-to-Arrow mapping, unaffected by physical Parquet decode coercion, and this scenario MUST NOT be read as governing the ARROW-INPUT direction (`arrow_to_exasol_type` / `compatible_exasol_type`), whose signed `Decimal128(u8, i8)` scale has no `s ≤ p` analogue
+
+> The version-gated timestamp declaration precision, its default on an unreadable version, the
+> Arrow-input resolver's exclusion from the gate, and the `timestamptz`/`TIMESTAMP(p)` scenarios live
+> in `scan-types/type-mapping-timestamp-precision`.
+
+### Scenario: A Parquet-sourced column maps through the Arrow-input direction
+
+* *GIVEN* a column whose neutral source-tagged type is the TAG STRING of an Arrow type folded from one or more Parquet footers, rather than an Iceberg primitive or a Unity Catalog type name
+* *WHEN* the adapter resolves that column's Exasol type for the `createVirtualSchema` declaration
+* *THEN* the resolver SHALL gain a THIRD arm on the neutral source type, and that arm SHALL read the tag back to an Arrow type through the EXISTING tag parser and return the ARROW-INPUT answer this feature already specifies for that `DataType`, so the mapping table has one owner and the new source adds no second table
+* *AND* the arm SHALL carry the tag as a STRING rather than as an Arrow type, because `catalog/catalog-crate-structure` forbids the crate declaring the neutral type from depending on `arrow`, and the tag vocabulary is the engine's existing arrow-free spelling of an Arrow type
+* *AND* an unparseable tag SHALL resolve to `VARCHAR(2000000)` rather than failing, keeping the resolver infallible, because the only producer renders its tags from that same vocabulary and a tag it cannot render is a defect the declaration absorbs rather than a user error
+* *AND* the resolver SHALL stay INFALLIBLE for the new arm, returning `VARCHAR(2000000)` for every type Exasol cannot represent rather than a `Result`, so the shared listing pipeline keeps its recorded infallible signature
+* *AND* the DECLARED Exasol type and the column's LOGICAL Arrow tag SHALL be in lockstep: a column the resolver declares `VARCHAR(2000000)` SHALL carry a string-family Arrow tag rather than its footer type, exactly as the Iceberg logical mapping already requires, so no column is registered at a type its declaration contradicts
+* *AND* a nested column SHALL ADDITIONALLY carry the format-neutral nested descriptor `scan-types/nested-json-rendering` consumes, so a Parquet struct, list, or map is rendered as JSON by the same renderer rather than reaching the cast path with no string kernel
+* *AND* the Arrow-input decimal guard SHALL be UNCHANGED, because the Apache Parquet format admits only a precision above zero and a scale between zero and the precision inclusive, so the guard's `p <= 36 && s <= 36` test never admits a pair Exasol rejects from this producer
+* *AND* the Iceberg and Unity arms of the resolver MUST be UNCHANGED, and every recorded answer of the catalog-decimal guard, the Iceberg-to-Arrow mapping, and the timestamp-precision rules MUST stay byte-identical
+
+### Scenario: The scan-spec tag vocabulary covers every Arrow type the compatible-type classifier admits
+
+* *GIVEN* the Arrow-input classifier that decides which Arrow types Exasol represents directly, and the compact scan-spec Arrow-type tag vocabulary that spells an Arrow type as a string for the logical schema and for the neutral Parquet column source
+* *WHEN* a producer renders a tag for an Arrow type that classifier admits
+* *THEN* the tag vocabulary SHALL carry ONE distinct entry for EVERY Arrow type the classifier admits, SUPERSEDING the recorded scoping of that vocabulary to the types reachable from the Iceberg-to-Arrow mapping, so the vocabulary's domain is the classifier's domain rather than one producer's
+* *AND* that extension SHALL cover at least `Int8`, `Int16`, `UInt8`, `UInt16`, `UInt32`, `UInt64`, `LargeUtf8`, and `Timestamp` at EVERY `TimeUnit` in both the timezone-naive and the timezone-aware form, because the classifier returns a non-VARCHAR Exasol type for each of them while the recorded vocabulary spells none of them
+* *AND* the renderer and the parser SHALL ROUND-TRIP every type in that domain, so an Arrow type rendered to a tag and parsed back SHALL equal the type it started as
+* *AND* the renderer MUST NOT fall back to the string tag for a type the classifier ADMITS, because that fallback declares the column `VARCHAR(2000000)` and registers it as a string with no error anywhere, which is what a Spark-written `INT64 TIMESTAMP(MILLIS)` column would otherwise receive
+* *AND* the string tag SHALL remain the answer for every type the classifier REFUSES, so a nested, binary, or otherwise unrepresentable type keeps its recorded JSON-VARCHAR path unchanged
+* *AND* every recorded tag spelling SHALL be UNCHANGED and every recorded parse answer SHALL stay byte-identical, so a scan spec written before this extension deserializes to the same Arrow types

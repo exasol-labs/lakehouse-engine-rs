@@ -63,7 +63,7 @@ fn assert_rendered(cell: &serde_json::Value, expected: Option<serde_json::Value>
     }
 }
 
-/// Scenario: An Iceberg table's list, struct, and map columns return valid JSON end to end
+/// Scenario: A list, struct, or map value renders as one valid JSON document
 #[test]
 fn iceberg_nested_columns_return_valid_json_end_to_end() {
     setup();

@@ -7,12 +7,15 @@ Spec-driven development with mission in: @specs/mission.md
 - Integration and E2E tests run against a local Exasol Docker database. Start the container yourself, do not ask the user.
 - Tests must fail, not skip, when Exasol is unavailable.
 - Connection strings must set `validateservercertificate=0`, because the Docker image uses a self-signed certificate.
+- Read `specs/testing.md` before adding or changing any test or test helper. It holds the coverage rule, the testing strategy, the suite layout, and the ops rules for the orphan sweeps.
+- E2E for behavior, simple unit tests for logic, fake servers only for fault injection.
 
 Project specifics:
 
 - `make test-e2e` runs the E2E suite against the local container. Use `exapump` for all Exasol and BucketFS interaction.
 - Reproduce a reported bug against the Docker Exasol container before fixing it. Do not trust an issue's repro, a capability list, or code inspection alone.
 - Verify any claim about SQL capabilities, syntax, or pushdown reachability against a live Exasol (`EXPLAIN VIRTUAL`, a pushed query, or an E2E test). `capabilities.rs` and documentation are not evidence.
+- All requirements about benchmarks live in `bench/requirements.md`. They never go into the `specs/` library.
 - A stray `bench/.env` redirects `make bench` and `bench/run.sh` to a remote target, and `BENCH_TARGET=docker` alone does not undo it. Before debugging a hung bench run, move `bench/.env` aside.
 
 ## Code quality
@@ -59,7 +62,7 @@ Read `specs/udf-context.md` before changing the shard count or fan-out shape.
 
 ## Data types
 
-Exasol has no arrays, lists, structs, or maps. `specs/datafusion-scan/type-mapping/spec.md` owns the mapping. Two rules are easy to miss:
+Exasol has no arrays, lists, structs, or maps. `specs/scan-types/type-mapping/spec.md` owns the mapping. Two rules are easy to miss:
 
 - Iceberg `timestamptz` maps to plain `TIMESTAMP`, because Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as a UDF `EMITS` type (`sqlCode 22002`).
 - Types Exasol cannot hold (List, Struct, Map, Union, Binary, Duration, Time, Interval, Decimal256, and Decimal128 beyond precision 36) become `VARCHAR(2000000)` JSON, produced inside the UDF.
