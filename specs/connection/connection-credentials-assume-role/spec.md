@@ -65,3 +65,11 @@ Lets a CONNECTION name an AWS IAM role that the engine assumes through AWS STS `
 * *WHEN* the adapter resolves the connection
 * *THEN* the adapter SHALL accept it under the Glue validation of `vs-adapter/catalog-kind-selection`, and SHALL derive its sealing key, so the scan can receive the session
 * *AND* under the `GLUE` kind, `aws_external_id` or `aws_sts_endpoint` without `aws_assume_role_arn` SHALL be rejected as for every other kind
+
+### Scenario: A wrong external id is denied by AWS STS
+
+* *GIVEN* a CONNECTION that names a role whose trust policy requires an `sts:ExternalId`, and an `aws_external_id` that does not match it
+* *WHEN* `CREATE VIRTUAL SCHEMA` runs against a real AWS account
+* *THEN* the statement SHALL fail with an `AccessDenied` error, because real AWS STS enforces the `sts:ExternalId` condition
+* *AND* the error MUST NOT contain the wrong external id or the base `secret_key`
+* *AND* this scenario SHALL be proved only against real AWS, because the local SeaweedFS STS does not evaluate the condition

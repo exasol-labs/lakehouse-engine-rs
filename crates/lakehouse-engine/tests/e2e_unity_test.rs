@@ -644,6 +644,7 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
+/// Scenario: Vended and static credentials resolve the same scan
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
     wait_for_seaweedfs();
@@ -1176,7 +1177,7 @@ const TYPE_WIDENING_SUPPORTED_COLUMNS: &str = "BYTE_LONG, INT_LONG, FLOAT_DOUBLE
      DECIMAL_DECIMAL_SAME_SCALE, DECIMAL_DECIMAL_GREATER_SCALE, INT_DECIMAL, LONG_DECIMAL, \
      DATE_TIMESTAMP_NTZ";
 
-/// Scenario: A reader feature outside the allow-list refuses the table before any log replay
+/// Scenario: A refused table fails the query with a SQL error and leaves the session usable
 #[test]
 fn unity_delta_unsupported_reader_feature_fails_the_query_loud() {
     setup();
@@ -1931,7 +1932,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
     );
 }
 
-/// Scenario: Storage is resolved through the table's own catalog exactly as for a Delta table
+/// Scenario: Vended and static credentials resolve the same scan
 #[test]
 fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     setup();

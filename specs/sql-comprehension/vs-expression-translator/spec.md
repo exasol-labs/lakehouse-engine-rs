@@ -73,3 +73,10 @@ The full filter-predicate operator set — comparison, logical connectives, IS N
 * *AND* each argument SHALL be rendered recursively by the translator (so `CASE`, arithmetic, and column-reference arguments render correctly), and a column argument carrying a `tableAlias` SHALL render table-qualified as `"ALIAS"."COL"`
 * *AND* the translator MUST NOT fall through to the unsupported-node catch-all for a `function_aggregate` node (which previously returned an error in raising mode and `None` in the safe variants, causing a scalar-over-aggregate select item to be wrongly declined)
 * *AND* an aggregate node whose argument cannot be rendered SHALL return an error in raising mode and `None` in the safe variants, consistent with every other node type
+
+### Scenario: The Exasol dialect never contains a DataFusion-only function name
+
+* *GIVEN* every translated expression shape in the Exasol dialect
+* *WHEN* the translator renders it
+* *THEN* the output SHALL contain none of the DataFusion-only function names the translator can emit, including the checked-division function
+* *AND* the banned-name list SHALL NOT name `CAST`, which is valid Exasol SQL

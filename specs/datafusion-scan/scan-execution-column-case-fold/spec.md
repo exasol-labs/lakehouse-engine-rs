@@ -31,6 +31,7 @@ scan installs the column-binding adapter.
 * *AND* a second such field, and a file carrying one physical column that folds onto two or more identity-bound names with none equal to it exactly
 * *WHEN* the scan UDF reads each file
 * *THEN* the UDF SHALL fail each query with an error naming the logical column and every candidate, rather than binding one of them arbitrarily
+* *AND* the case fold lookup SHALL fold with the Unicode rule, so a name whose Unicode and ASCII folds differ, such as `STRAßE`, binds under the Unicode fold and not under an ASCII fold
 
 ### Scenario: The case fold is scoped to identity-bound fields and applies uniformly across formats
 

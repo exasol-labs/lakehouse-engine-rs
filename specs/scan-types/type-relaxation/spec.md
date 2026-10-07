@@ -171,6 +171,8 @@ resolved.
 * *WHEN* the scan reads that column from a file written at the physical type under a logical schema that carries the target type
 * *THEN* the scan SHALL cast the column to the target type and return every value unchanged
 * *AND* `long` → `double` SHALL NOT be a supported relaxation, because neither format permits it, although `arrow::compute::can_cast_types` admits it
+* *AND* the proof SHALL assert `arrow::compute::can_cast_types` for every supported-set pair and fail when an `arrow-cast` upgrade withdraws one
+* *AND* the proof's list of supported pairs SHALL be a hand-written pin asserted against the production widening owner, never generated from it, so a supported-set row with no matching rule in that owner fails
 
 ### Scenario: A relaxed column crosses the emit boundary at its declared Exasol type
 

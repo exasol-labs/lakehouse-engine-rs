@@ -81,3 +81,10 @@ The vended response carries exactly one credential family keyed by the storage b
 * *WHEN* a query over one of its Delta tables runs
 * *THEN* the scan UDF SHALL reach the object store at the CONNECTION's `endpoint` with the static credentials it resolves from the CONNECTION
 * *AND* the storage fields MUST NOT change the tables and columns `createVirtualSchema` lists, because enumeration reads catalog metadata only and no object storage
+
+### Scenario: Vended and static credentials resolve the same scan
+
+* *GIVEN* a Unity Catalog Delta table and a Unity Catalog Parquet table, each resolved once with `use_vended_credentials` and once with static storage credentials from the CONNECTION
+* *WHEN* the reader resolves each table's scan under both credential arms
+* *THEN* both arms SHALL resolve the identical table root and the identical file list, entry for entry
+* *AND* the Delta table's partition values SHALL include the Hive default-partition file's explicit NULL, and SHALL never carry the `__HIVE_DEFAULT_PARTITION__` directory literal as a value

@@ -250,3 +250,11 @@ normative obligations this feature enforces:
   an ungated snapshot and record the ungated behavior as correct
 * *AND* the refusal SHALL be returned as a `UdfError` value, never raised as a panic, and MUST NOT
   contain any vended or static credential value
+
+### Scenario: A refused table fails the query with a SQL error and leaves the session usable
+
+* *GIVEN* a Delta table that declares a reader feature outside the allow-list, queried through a virtual schema
+* *WHEN* a `SELECT` over it runs
+* *THEN* the query SHALL fail with a SQL error that names the refused feature, and SHALL NOT return a row
+* *AND* a following `SELECT 1 FROM DUAL` on the same connection SHALL succeed, because a crashed UDF VM would end the session instead of returning a clean SQL error
+* *AND* the error MUST NOT contain a credential value

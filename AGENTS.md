@@ -7,7 +7,8 @@ Spec-driven development with mission in: @specs/mission.md
 - Integration and E2E tests run against a local Exasol Docker database. Start the container yourself, do not ask the user.
 - Tests must fail, not skip, when Exasol is unavailable.
 - Connection strings must set `validateservercertificate=0`, because the Docker image uses a self-signed certificate.
-- Read `specs/testing.md` before adding or changing an E2E suite, fixture, or harness helper. It holds the coverage rule, the suite layout, and the ops rules for the orphan sweeps and the benchmark catalog.
+- Read `specs/testing.md` before adding or changing any test or test helper. It holds the coverage rule, the testing strategy, the suite layout, and the ops rules for the orphan sweeps.
+- E2E for behavior, simple unit tests for logic, fake servers only for fault injection.
 
 Project specifics:
 
