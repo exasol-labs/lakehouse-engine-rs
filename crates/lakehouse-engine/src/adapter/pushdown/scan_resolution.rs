@@ -98,7 +98,7 @@ impl<'a> TableScanResolver<'a> {
                 if let PermissionCheck::Enforced(gate) = permission {
                     gate.authorize(&session, table_identifiers, connection.creds)
                         .await?;
-                    authorized.extend(table_identifiers.iter().map(|id| id.to_string()));
+                    authorized.extend(table_identifiers.iter().map(ToString::to_string));
                 }
                 RequestSession::Iceberg(session)
             }
