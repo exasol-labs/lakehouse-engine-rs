@@ -15,7 +15,10 @@ use super::lakekeeper::{
     self, WAREHOUSE_AUTHZ, WarehouseProfile, http_client, keycloak_client_credentials_token,
     keycloak_client_credentials_token_for, management_base,
 };
-use super::seed::{E2E_NAMESPACE, E2E_TABLE, SeedCatalogAuth, seed_events_table_with_auth};
+use super::seed::{
+    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, SeedCatalogAuth,
+    seed_events_table_with_auth, seed_star_schema_with_auth,
+};
 
 pub const AUTHZ_NAMESPACE: &str = "authz";
 pub const TABLE_ALPHA: &str = "authz_alpha";
@@ -190,7 +193,7 @@ pub struct Grant {
 
 /// Every scope a fixture grant can reach a fixture table through, so reconciling them all
 /// leaves no stale inherited grant behind.
-const ALL_SCOPES: [Scope; 8] = [
+const ALL_SCOPES: [Scope; 10] = [
     Scope::Server,
     Scope::Project,
     Scope::Warehouse,
@@ -199,6 +202,8 @@ const ALL_SCOPES: [Scope; 8] = [
     Scope::Table(TABLE_ALPHA),
     Scope::Table(TABLE_BETA),
     Scope::Table(E2E_TABLE),
+    Scope::Table(E2E_FACT_TABLE),
+    Scope::Table(E2E_DIM_TABLE),
 ];
 
 pub struct AuthzFixture {
@@ -389,6 +394,67 @@ impl AuthzFixture {
     }
 }
 
+impl AuthzFixture {
+    /// Gives `role_id` a grant at its scope, so a user reaches the table only through the role.
+    pub fn ensure_role_grant(&self, role_id: &str, grant: Grant) {
+        let token = keycloak_client_credentials_token();
+        let url = self.assignments_url(grant.scope);
+        let held = get(&url, &token);
+        expect_status(&held, &format!("Lakekeeper GET {url}"), &[200]);
+        let already = held.body["assignments"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|a| {
+                a["role"].as_str() == Some(role_id) && a["type"].as_str() == Some(grant.relation)
+            });
+        if !already {
+            let body = json!({"writes": [{"type": grant.relation, "role": role_id}]});
+            let wrote = post(&url, &token, &body);
+            expect_status(&wrote, &format!("Lakekeeper POST {url}"), &[200, 204]);
+        }
+    }
+}
+
+/// The id of the role named `name`, created on first use.
+pub fn ensure_role(name: &str) -> String {
+    let token = keycloak_client_credentials_token();
+    let url = format!("{}/role", management_base());
+    let created = post(&url, &token, &json!({"name": name}));
+    expect_status(&created, "Lakekeeper create role", &[200, 201, 409]);
+    let listed = get(&format!("{url}?name={name}"), &token);
+    expect_status(&listed, "Lakekeeper list roles", &[200]);
+    listed.body["roles"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|role| role["name"].as_str() == Some(name))
+        .and_then(|role| role["id"].as_str())
+        .unwrap_or_else(|| panic!("Lakekeeper lists no role named '{name}'"))
+        .to_string()
+}
+
+/// Makes `user_id` an assignee of `role_id`; a no-op when it already is.
+pub fn ensure_role_member(role_id: &str, user_id: &str) {
+    let token = keycloak_client_credentials_token();
+    let url = format!(
+        "{}/permissions/role/{role_id}/assignments",
+        management_base()
+    );
+    let held = get(&url, &token);
+    expect_status(&held, &format!("Lakekeeper GET {url}"), &[200]);
+    let already = held.body["assignments"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|a| a["user"].as_str() == Some(user_id) && a["type"].as_str() == Some("assignee"));
+    if !already {
+        let body = json!({"writes": [{"type": "assignee", "user": user_id}]});
+        let wrote = post(&url, &token, &body);
+        expect_status(&wrote, &format!("Lakekeeper POST {url}"), &[200, 204]);
+    }
+}
+
 struct AssignmentDiff<'a> {
     writes: Vec<&'a str>,
     deletes: Vec<&'a str>,
@@ -479,9 +545,9 @@ fn table_uuid(warehouse_id: &str, namespace: &str, table: &str) -> String {
         .to_string()
 }
 
-/// The permission-check test scans this table, so unlike the fixture tables it holds data.
-/// Seeding is idempotent, so the table and its id survive across runs.
-fn ensure_seeded_events_table(warehouse_id: &str) -> String {
+/// The permission-check tests scan these tables, so unlike the fixture tables they hold data.
+/// Seeding is idempotent, so the tables and their ids survive across runs.
+fn ensure_seeded_data_tables(warehouse_id: &str) -> Vec<(&'static str, String)> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -490,16 +556,17 @@ fn ensure_seeded_events_table(warehouse_id: &str) -> String {
         token: Some(keycloak_client_credentials_token()),
         ..Default::default()
     };
+    let host = lakekeeper::catalog_uri_host();
     runtime
-        .block_on(seed_events_table_with_auth(
-            &lakekeeper::catalog_uri_host(),
-            WAREHOUSE_AUTHZ,
-            auth,
-        ))
-        .unwrap_or_else(|e| {
-            panic!("seed events into Lakekeeper warehouse '{WAREHOUSE_AUTHZ}': {e:#}")
-        });
-    table_uuid(warehouse_id, E2E_NAMESPACE, E2E_TABLE)
+        .block_on(async {
+            seed_events_table_with_auth(&host, WAREHOUSE_AUTHZ, auth.clone()).await?;
+            seed_star_schema_with_auth(&host, WAREHOUSE_AUTHZ, auth).await
+        })
+        .unwrap_or_else(|e| panic!("seed the Lakekeeper warehouse '{WAREHOUSE_AUTHZ}': {e:#}"));
+    [E2E_TABLE, E2E_FACT_TABLE, E2E_DIM_TABLE]
+        .into_iter()
+        .map(|table| (table, table_uuid(warehouse_id, E2E_NAMESPACE, table)))
+        .collect()
 }
 
 /// Not cached: every call re-reconciles the grants. Prefer `ensure_authz_fixture`.
@@ -518,7 +585,7 @@ pub fn provision_authz_fixture() -> AuthzFixture {
         .into_iter()
         .map(|table| (table, ensure_table(&warehouse_id, table)))
         .collect();
-    table_ids.insert(E2E_TABLE, ensure_seeded_events_table(&warehouse_id));
+    table_ids.extend(ensure_seeded_data_tables(&warehouse_id));
     let namespace_ids = BTreeMap::from([
         (AUTHZ_NAMESPACE, authz_namespace_id),
         (E2E_NAMESPACE, namespace_uuid(&warehouse_id, E2E_NAMESPACE)),

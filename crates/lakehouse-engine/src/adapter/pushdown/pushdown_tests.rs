@@ -1,6 +1,5 @@
 use super::test_support::*;
 use super::*;
-use crate::adapter::permission::PermissionCheck;
 use crate::scan::spec::{
     CommonScanSpec, FileEntry, LogicalField, ProjectionItem, ScanSpec, ScanStorage, StorageProps,
 };
@@ -1746,7 +1745,7 @@ async fn malformed_table_ident_fails_before_any_catalog_contact() {
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_check: PermissionCheck::Off,
+        permission_check: crate::adapter::permission::PermissionCheck::Off,
     };
     let result = handle_pushdown(
         &request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -1782,7 +1781,7 @@ async fn seam_handle_pushdown(
         catalog_kind,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
-        permission_check: PermissionCheck::Off,
+        permission_check: crate::adapter::permission::PermissionCheck::Off,
     };
     handle_pushdown(
         request, &conn, catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
@@ -1850,8 +1849,17 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
     );
 }
 
-fn customer_orders_join_request() -> Json {
-    serde_json::json!({
+/// Scenario: One catalog session per request serves every table the request resolves.
+#[tokio::test]
+async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
+    let iceberg = iceberg_catalog().await;
+    let creds = unauthenticated_creds();
+    let catalog_props = CatalogProps {
+        warehouse: "wh".into(),
+        table: "unused-on-the-join-path".into(),
+    };
+
+    let request = serde_json::json!({
         "involvedTables": [
             {
                 "name": "CUSTOMER",
@@ -1890,20 +1898,7 @@ fn customer_orders_join_request() -> Json {
                 "TABLE_MAP": {"CUSTOMER": "db.customer", "ORDERS": "db.orders"}
             }).to_string(),
         },
-    })
-}
-
-/// Scenario: One catalog session per request serves every table the request resolves.
-#[tokio::test]
-async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
-    let iceberg = iceberg_catalog().await;
-    let creds = unauthenticated_creds();
-    let catalog_props = CatalogProps {
-        warehouse: "wh".into(),
-        table: "unused-on-the-join-path".into(),
-    };
-
-    let request = customer_orders_join_request();
+    });
 
     seam_handle_pushdown(
         &request,
@@ -3056,333 +3051,4 @@ fn no_connection_credential_reaches_the_generated_sql() {
     assert_eq!(&unseal_storage(payload, &key).unwrap(), &role_effective);
     assert_no_sentinel_secret_leaked(&role_sql);
     assert!(!role_sql.contains(SENTINEL_EXTERNAL_ID), "{role_sql}");
-}
-
-const CANNOT_INSPECT_ANSWER: &str = r#"{"error":{"code":403,"message":"Not allowed to inspect permissions for object lakekeeper_table:wh/t","stack":["Error ID: e"],"type":"CannotInspectPermissions"}}"#;
-
-/// `table` is the single-table identifier; a join reads its tables from `TABLE_MAP`.
-async fn lakekeeper_pushdown(
-    request: &Json,
-    table: &str,
-    stand_in: &LakekeeperStandIn,
-    check: PermissionCheck,
-) -> Result<Json, UdfError> {
-    let conn = lakekeeper_connection(stand_in, check);
-    let catalog = CatalogProps {
-        warehouse: "wh".into(),
-        table: table.into(),
-    };
-    handle_pushdown(
-        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
-    )
-    .await
-}
-
-fn events_self_join_request() -> Json {
-    let occurrence = |alias: &str| serde_json::json!({"type": "column", "name": "ID", "tableName": "EVENTS", "tableAlias": alias});
-    serde_json::json!({
-        "involvedTables": [{"name": "EVENTS", "columns": [
-            {"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-        ]}],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {
-                "type": "join",
-                "join_type": "inner",
-                "left": {"name": "EVENTS", "type": "table", "alias": "A"},
-                "right": {"name": "EVENTS", "type": "table", "alias": "B"},
-                "condition": {"type": "predicate_equal", "left": occurrence("A"), "right": occurrence("B")},
-            },
-            "selectList": [occurrence("A")],
-        },
-        "schemaMetadataInfo": {"properties": {}, "adapterNotes":
-            serde_json::json!({"TABLE_MAP": {"EVENTS": "db.events"}}).to_string()},
-    })
-}
-
-fn top_n_events_request() -> Json {
-    guard_events_request(serde_json::json!({
-        "type": "select",
-        "selectList": [
-            {"type": "column", "name": "REGION", "tableName": "EVENTS"},
-            {"type": "column", "name": "AMOUNT", "tableName": "EVENTS"},
-        ],
-        "orderBy": [{
-            "type": "order_by_element",
-            "expression": {"type": "column", "columnNr": 2, "name": "AMOUNT", "tableName": "EVENTS"},
-            "isAscending": false,
-            "nullsLast": true
-        }],
-        "limit": {"numElements": 5}
-    }))
-}
-
-fn declined_filter_events_request() -> Json {
-    guard_events_request(serde_json::json!({
-        "type": "select",
-        "selectList": [{"type": "column", "name": "REGION", "tableName": "EVENTS"}],
-        "filter": declined_like_on_decimal(),
-    }))
-}
-
-/// Every request shape with the distinct tables its one batch-check must name.
-fn every_iceberg_shape() -> Vec<(&'static str, Json, Vec<&'static str>)> {
-    vec![
-        (
-            "row scan",
-            super::dispatch_golden::row_scan_request(),
-            vec!["db.events"],
-        ),
-        (
-            "single-group aggregate",
-            super::dispatch_golden::single_group_agg_request(),
-            vec!["db.events"],
-        ),
-        (
-            "grouped aggregate",
-            super::dispatch_golden::grouped_request(),
-            vec!["db.events"],
-        ),
-        (
-            "COUNT(DISTINCT)",
-            super::dispatch_golden::lone_count_distinct_request(),
-            vec!["db.events"],
-        ),
-        ("top-N", top_n_events_request(), vec!["db.events"]),
-        (
-            "qualified fallback wrapper",
-            declined_filter_events_request(),
-            vec!["db.events"],
-        ),
-        (
-            "inner join",
-            customer_orders_join_request(),
-            vec!["db.customer", "db.orders"],
-        ),
-        ("self-join", events_self_join_request(), vec!["db.events"]),
-    ]
-}
-
-fn checked_tables(batch_check: &Json) -> Vec<String> {
-    batch_check["checks"]
-        .as_array()
-        .expect("a batch-check carries checks")
-        .iter()
-        .map(|check| {
-            let table = &check["operation"]["table"];
-            format!(
-                "{}.{}",
-                table["namespace"][0].as_str().unwrap_or_default(),
-                table["table"].as_str().unwrap_or_default()
-            )
-        })
-        .collect()
-}
-
-fn is_load_table(target: &str) -> bool {
-    target.contains("/tables/")
-}
-
-/// Scenario: One batch-check per query decides every table before any table is read
-#[tokio::test]
-async fn every_iceberg_shape_is_checked_once_before_any_table_load() {
-    for (shape, request, tables) in every_iceberg_shape() {
-        let unchecked = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(&[])).await;
-        let checked = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(&[])).await;
-
-        let without = lakekeeper_pushdown(&request, "db.events", &unchecked, PermissionCheck::Off)
-            .await
-            .unwrap_or_else(|e| panic!("{shape}: the unchecked request plans: {e}"));
-        let with = lakekeeper_pushdown(&request, "db.events", &checked, lakekeeper_check("ALICE"))
-            .await
-            .unwrap_or_else(|e| panic!("{shape}: an allowed request plans: {e}"));
-
-        assert_eq!(with, without, "{shape}: the check must not change the SQL");
-        let mut expected_targets = unchecked.targets();
-        let first_load = expected_targets
-            .iter()
-            .position(|target| is_load_table(target))
-            .unwrap_or_else(|| {
-                panic!("{shape}: the request must load at least one table: {expected_targets:?}")
-            });
-        expected_targets.insert(first_load, LAKEKEEPER_BATCH_CHECK_TARGET.to_string());
-        assert_eq!(
-            checked.targets(),
-            expected_targets,
-            "{shape}: one batch-check between /v1/config and the first loadTable"
-        );
-        let batch_checks = checked.batch_checks();
-        assert_eq!(batch_checks.len(), 1, "{shape}: exactly one batch-check");
-        assert_eq!(checked_tables(&batch_checks[0]), tables, "{shape}");
-        for check in batch_checks[0]["checks"].as_array().into_iter().flatten() {
-            assert_eq!(check["identity"]["user"], "oidc~alice@corp.net", "{shape}");
-            assert_eq!(check["operation"]["table"]["action"]["action"], "read_data");
-        }
-        assert!(unchecked.management_requests().is_empty(), "{shape}");
-    }
-}
-
-/// Scenario: A denied table refuses the whole query
-#[tokio::test]
-async fn a_denied_or_missing_table_refuses_with_no_table_load() {
-    let cases: [(&str, Json, &'static [&'static str], &[&str]); 3] = [
-        (
-            "row scan",
-            super::dispatch_golden::row_scan_request(),
-            &["db.events"],
-            &["db.events"],
-        ),
-        (
-            "join with one leg denied",
-            customer_orders_join_request(),
-            &["db.orders"],
-            &["db.orders"],
-        ),
-        (
-            "join with a missing leg",
-            customer_orders_join_request(),
-            &["db.customer", "db.orders"],
-            &["db.customer", "db.orders"],
-        ),
-    ];
-
-    for (shape, request, denied, named) in cases {
-        let stand_in = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(denied)).await;
-
-        let message = user_message(
-            lakekeeper_pushdown(&request, "db.events", &stand_in, lakekeeper_check("ALICE"))
-                .await
-                .expect_err("a denied table refuses the whole query"),
-        );
-
-        for fragment in ["'ALICE'", "'oidc~alice@corp.net'", "grant"]
-            .iter()
-            .chain(named)
-        {
-            assert!(
-                message.contains(fragment),
-                "{shape}: {fragment:?}: {message}"
-            );
-        }
-        if named == ["db.orders"] {
-            assert!(!message.contains("db.customer"), "{shape}: {message}");
-        }
-        assert!(
-            !stand_in
-                .targets()
-                .iter()
-                .any(|target| is_load_table(target)),
-            "{shape}: no table may be read: {:?}",
-            stand_in.targets()
-        );
-    }
-}
-
-/// Scenario: A failed batch-check refuses the query with an error that names the cause
-#[tokio::test]
-async fn a_failed_batch_check_refuses_with_no_table_load() {
-    let echoing = concat!(
-        r#"{"error":{"message":"LAKEKEEPER_CLIENT_SECRET_SENTINEL "#,
-        r#"Bearer LAKEKEEPER_BEARER_TOKEN_SENTINEL","type":"Internal"}}"#,
-    );
-    let cases: [(BatchCheckAnswer, &[&str]); 4] = [
-        (
-            BatchCheckAnswer::Fixed(403, CANNOT_INSPECT_ANSWER),
-            &[
-                "HTTP 403",
-                "CannotInspectPermissions",
-                "can_read_assignments",
-            ],
-        ),
-        (
-            BatchCheckAnswer::Fixed(500, echoing),
-            &["HTTP 500", "Lakekeeper server"],
-        ),
-        (
-            BatchCheckAnswer::Fixed(200, r#"{"results":[]}"#),
-            &["HTTP 200", "not a batch-check answer", "Lakekeeper server"],
-        ),
-        (
-            BatchCheckAnswer::Fixed(400, r#"{"error":{"type":"BadRequestException"}}"#),
-            &["HTTP 400", "BadRequestException", "Lakekeeper server"],
-        ),
-    ];
-
-    for (answer, fragments) in cases {
-        let stand_in = LakekeeperStandIn::spawn(answer).await;
-
-        let message = user_message(
-            lakekeeper_pushdown(
-                &super::dispatch_golden::row_scan_request(),
-                "db.events",
-                &stand_in,
-                lakekeeper_check("ALICE"),
-            )
-            .await
-            .expect_err("a failed batch-check refuses the query"),
-        );
-
-        for fragment in fragments.iter().chain(&[LAKEKEEPER_BATCH_CHECK_TARGET]) {
-            assert!(message.contains(fragment), "{fragment:?}: {message}");
-        }
-        for secret in [LAKEKEEPER_CLIENT_SECRET, LAKEKEEPER_BEARER_TOKEN] {
-            assert!(!message.contains(secret), "{secret} leaked: {message}");
-        }
-        assert!(
-            !stand_in
-                .targets()
-                .iter()
-                .any(|target| is_load_table(target)),
-            "no table may be read: {:?}",
-            stand_in.targets()
-        );
-    }
-}
-
-/// Scenario: The Lakekeeper permission check reuses the request's one catalog session
-/// Scenario: One catalog session per request serves every table the request resolves
-#[tokio::test]
-async fn permission_check_adds_one_request_and_no_grant_on_the_session() {
-    let single = super::dispatch_golden::row_scan_request();
-    let join = customer_orders_join_request();
-    for (shape, request, loads) in [
-        (
-            "single table",
-            &single,
-            vec![lakekeeper_load_table_target("events")],
-        ),
-        (
-            "two-table join",
-            &join,
-            vec![
-                lakekeeper_load_table_target("customer"),
-                lakekeeper_load_table_target("orders"),
-            ],
-        ),
-    ] {
-        let stand_in = LakekeeperStandIn::spawn(BatchCheckAnswer::Deny(&[])).await;
-
-        lakekeeper_pushdown(request, "db.events", &stand_in, lakekeeper_check("ALICE"))
-            .await
-            .unwrap_or_else(|e| panic!("{shape}: an allowed request plans: {e}"));
-
-        let mut expected = vec![
-            LAKEKEEPER_TOKEN_TARGET.to_string(),
-            LAKEKEEPER_CONFIG_TARGET.to_string(),
-            LAKEKEEPER_BATCH_CHECK_TARGET.to_string(),
-        ];
-        expected.extend(loads);
-        assert_eq!(stand_in.targets(), expected, "{shape}");
-        let batch_check = stand_in
-            .requests()
-            .into_iter()
-            .find(|request| request.target == LAKEKEEPER_BATCH_CHECK_TARGET)
-            .expect("the batch-check was sent");
-        assert_eq!(batch_check.method, "POST", "{shape}");
-        assert_eq!(
-            batch_check.authorization.as_deref(),
-            Some(format!("Bearer {LAKEKEEPER_BEARER_TOKEN}").as_str()),
-            "{shape}: the batch-check carries the bearer token of the request's one grant"
-        );
-    }
 }

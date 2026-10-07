@@ -12,11 +12,10 @@ use lakehouse_catalog::{
     CatalogSession, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType,
     ConnectionCreds, GlueCatalogSession, HIVE_DEFAULT_PARTITION, IcebergRestCatalogClient,
     PartitionFormat, SkipReason, SkippedTable, StaticStoreAddress, StorageBackend, StorageCreds,
-    StorageProps, TableFormat, TableReadDecision, TemporaryTableCredentials, UnityCatalogSession,
-    catalog_identifier_string, lakekeeper_batch_check, lakekeeper_management_url,
-    load_table_any_auth, parse_glue_table_ident, parse_table_ident, read_iceberg_metadata_file,
-    redact_credentials, redact_secret_values, resolve_aws_identity, resolve_uc_vended_storage,
-    resolve_vended_storage,
+    StorageProps, TableFormat, TemporaryTableCredentials, UnityCatalogSession,
+    catalog_identifier_string, load_table_any_auth, parse_glue_table_ident, parse_table_ident,
+    read_iceberg_metadata_file, redact_credentials, redact_secret_values, resolve_aws_identity,
+    resolve_uc_vended_storage, resolve_vended_storage,
 };
 
 const CATALOG_SOURCES: &[(&str, &str)] = &[
@@ -24,7 +23,6 @@ const CATALOG_SOURCES: &[(&str, &str)] = &[
     ("client.rs", include_str!("../src/client.rs")),
     ("creds.rs", include_str!("../src/creds.rs")),
     ("iceberg_io.rs", include_str!("../src/iceberg_io.rs")),
-    ("lakekeeper.rs", include_str!("../src/lakekeeper.rs")),
     ("lib.rs", include_str!("../src/lib.rs")),
     ("namespace.rs", include_str!("../src/namespace.rs")),
     ("redaction.rs", include_str!("../src/redaction.rs")),
@@ -692,71 +690,6 @@ fn static_store_address_fields_are_not_public() {
             "`struct StaticStoreAddress` must keep every field non-`pub`, but declares \
              `{declaration}` — a public field is a second construction path around the one \
              reviewed `From<&ConnectionCreds>` conversion"
-        );
-    }
-}
-
-#[test]
-fn lakekeeper_batch_check_client_is_reachable_and_stays_neutral() {
-    let management_url: Result<String, UdfError> =
-        lakekeeper_management_url("http://lakekeeper:8181/catalog/");
-    assert_eq!(
-        management_url.expect("a catalog URI ending in /catalog"),
-        "http://lakekeeper:8181/management"
-    );
-    let decision = TableReadDecision {
-        table: "ns.t".into(),
-        allowed: true,
-    };
-    assert!(decision.allowed && decision.table == "ns.t");
-
-    let creds = connection_creds();
-    let check = async {
-        let session = CatalogSession::resolve("http://catalog/catalog", "w", &creds)
-            .await
-            .expect("session");
-        let _: Result<Vec<TableReadDecision>, UdfError> =
-            lakekeeper_batch_check(&session, "principal", &["ns.t"], &creds).await;
-    };
-    drop(check);
-
-    let lakekeeper = source("lakekeeper.rs");
-    for wire in [
-        "BatchCheckRequest",
-        "TableCheck",
-        "Identity",
-        "Operation",
-        "TableOperation",
-        "BatchCheckAnswer",
-        "CheckResult",
-    ] {
-        assert!(
-            !declares(lakekeeper, &format!("pub struct {wire}")),
-            "lakekeeper.rs must keep the wire type `{wire}` crate-private"
-        );
-    }
-    let session_impl = declaration_body(source("session.rs"), "impl CatalogSession");
-    let public_methods: Vec<&str> = session_impl
-        .lines()
-        .map(str::trim)
-        .filter(|line| line.starts_with("pub fn") || line.starts_with("pub async fn"))
-        .collect();
-    assert_eq!(
-        public_methods,
-        vec!["pub async fn resolve("],
-        "CatalogSession must gain no `pub` method: Lakekeeper calls are free functions"
-    );
-    for engine_concept in [
-        "PERMISSION_CHECK",
-        "USER_MAPPING",
-        "current_user",
-        "scope_user",
-        "UdfContext",
-        "lakehouse_engine",
-    ] {
-        assert!(
-            !lakekeeper.contains(engine_concept),
-            "lakekeeper.rs must not name the engine concept `{engine_concept}`"
         );
     }
 }
