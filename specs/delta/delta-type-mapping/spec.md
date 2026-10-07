@@ -218,7 +218,7 @@ surface this feature maps, quoted from its § Schema Serialization Format:
 * **The declared type is not this feature's own decision to make.** The version rule and both
   declaration strings are owned by `scan-types/type-mapping`; the single `ctx.database_version()`
   read is owned by `vs-adapter/create-virtual-schema`; and the production function that renders a Delta
-  column's declaration is `unity_type_name_to_exasol`, whose clause `vs-adapter/
+  column's declaration is `spark_primitive_to_exasol`, whose clause `vs-adapter/
   unity-catalog-create-virtual-schema` owns. This table's "Declared Exasol type" column mirrors those
   answers so a reader of the Delta mapping sees the same declaration the adapter emits — it MUST NOT
   become a second statement of the rule.

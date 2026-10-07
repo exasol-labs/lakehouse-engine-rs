@@ -112,7 +112,7 @@ TABLES = [
         ("date_timestamp_ntz","timestamp_ntz",False)]),
 ]
 
-# Delta/Spark type -> (UC type_name, type_json spark type, precision, scale)
+# Delta/Spark type -> (UC type_name, type_json spark type)
 NESTED = {"array","map","struct","variant"}
 PRIM = {
     "byte":"BYTE","short":"SHORT","int":"INT","integer":"INT","long":"LONG",
@@ -121,20 +121,20 @@ PRIM = {
 }
 def map_type(dt):
     if dt.startswith("decimal("):
-        p,s = dt[len("decimal("):-1].split(","); return ("DECIMAL", dt, int(p), int(s))
+        return ("DECIMAL", dt)
     if dt in NESTED:  # advisory: surfaced to Exasol as JSON VARCHAR
-        return ("STRING","string",None,None)
+        return ("STRING","string")
     tn = PRIM.get(dt)
     if not tn: raise SystemExit(f"unmapped delta type: {dt}")
     js = "integer" if dt=="int" else dt
-    return (tn, js, None, None)
+    return (tn, js)
 
+# Omits type_precision/type_scale as Unity's Spark connector does (#463).
 def col(pos, name, dt, is_part):
-    tn, js, prec, scale = map_type(dt)
+    tn, js = map_type(dt)
     tj = {"name":name,"type":js,"nullable":True,"metadata":{}}
     c = {"name":name,"type_text":dt,"type_name":tn,"type_json":json.dumps(tj),
          "position":pos,"nullable":True}
-    if prec is not None: c["type_precision"]=prec; c["type_scale"]=scale
     if is_part: c["partition_index"]=0
     return c
 

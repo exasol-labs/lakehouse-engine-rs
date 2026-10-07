@@ -8,7 +8,9 @@ Proves the type mapping against a live Exasol on every source technology. Each t
 * A type that another table of the same suite already reads is not repeated:
   * On direct storage, `events` covers `Int64`, `Utf8`, `Float64`, `Boolean`, `Date32`, `Timestamp`, and `Decimal128(10,2)`, and `complex` covers `List`, `Struct`, and `Map`.
   * On the Iceberg REST catalog, `events` covers `long`, `string`, `double`, `date`, and `timestamp`, and `complex_types_probe` covers `list`, `struct`, and `map`.
-  * Through Unity Catalog, `stats_all_types` covers every Delta type but a decimal wider than Exasol's 36 digits and a `binary` struct member, and `sales_parquet` covers a Parquet table's `long` and `double`.
+  * Through Unity Catalog, `stats_all_types` covers every Delta type but the decimal matrix and a `binary` struct member, and `sales_parquet` covers a Parquet table's `long` and `double`.
+* The decimal matrix is `decimal(10,2)`, `decimal(18,0)`, `decimal(36,6)`, and `decimal(38,10)`. Text order inverts the numeric order of the `decimal(18,0)` values, so a column declared `VARCHAR` fails its ordering check.
+* Unity fixtures register their columns in the shapes real Unity clients write: Databricks reports `type_precision` and `type_scale` as 0, and Unity's Spark connector omits them (#463).
 * A source omits a type that it cannot write or declare:
   * Iceberg has no 8-bit, 16-bit, or unsigned integer, `LargeUtf8`, `Decimal256`, `Time32`, `Duration`, `Interval`, `ENUM`, or `BSON` type, and `iceberg-rust` writes no `INT96`.
   * Delta and Spark have no unsigned integer, `LargeUtf8`, `Decimal256`, time, `Duration`, `Interval`, fixed-length binary, `ENUM`, or `UUID` type.
@@ -38,18 +40,18 @@ Proves the type mapping against a live Exasol on every source technology. Each t
 
 ### Scenario: Every Delta type declares and returns its mapped value through Unity Catalog
 
-* *GIVEN* the Delta table `delta_extra_types`, registered in Unity Catalog, whose one-commit log declares a `decimal(38,10)` and a `struct<x: binary>` column
+* *GIVEN* the Delta table `delta_extra_types`, registered in Unity Catalog in the Databricks shape, whose one-commit log declares the decimal matrix and a `struct<x: binary>` column
 * *WHEN* `e2e_unity_test` checks it through its Unity Catalog virtual schema
-* *THEN* `decimal(38,10)` SHALL declare `VARCHAR(2000000)` and return its text
+* *THEN* `decimal(10,2)`, `decimal(18,0)`, and `decimal(36,6)` SHALL declare `DECIMAL(p,s)`, return their values, and order and aggregate numerically, and `decimal(38,10)` SHALL declare `VARCHAR(2000000)` and return its text
 * *AND* the struct column SHALL declare `VARCHAR(2000000)` and fail at plan time per `vs-adapter/binary-column-refusal`
 * *AND* the `stats_all_types` table SHALL declare each mappable column at the Exasol type of `delta/delta-type-mapping` and return its values, SHALL return its `array`, `map`, and `struct` columns as the JSON documents of `scan-types/nested-json-rendering`, and SHALL refuse `binary_col` per `vs-adapter/binary-column-refusal`
 
 ### Scenario: Every Spark type a Unity Parquet table declares returns its mapped value
 
-* *GIVEN* the Unity Catalog Parquet table `all_types_parquet`, whose columns declare through their `type_json` a `byte`, `short`, `integer`, `float`, `boolean`, `string`, `decimal(10,2)`, `decimal(38,10)`, `date`, `timestamp`, `timestamp_ntz`, `binary`, `array<integer>`, `map<string,integer>`, `struct<a: integer, b: string>`, `struct<x: binary>`, and `variant` column
+* *GIVEN* the Unity Catalog Parquet table `all_types_parquet`, registered in the Spark connector's shape, whose columns declare through their `type_json` a `byte`, `short`, `integer`, `float`, `boolean`, `string`, the decimal matrix, `date`, `timestamp`, `timestamp_ntz`, `binary`, `array<integer>`, `map<string,integer>`, `struct<a: integer, b: string>`, `struct<x: binary>`, and `variant` column
 * *WHEN* `e2e_unity_test` checks it through its Unity Catalog virtual schema
 * *THEN* each native column SHALL declare the Exasol type of `delta/delta-type-mapping` and return its values, both timestamps at their gated precision
-* *AND* `decimal(38,10)` SHALL declare `VARCHAR(2000000)` and return its text, and the `array`, `map`, and `struct` columns SHALL return the JSON documents of `scan-types/nested-json-rendering`
+* *AND* `decimal(10,2)`, `decimal(18,0)`, and `decimal(36,6)` SHALL declare `DECIMAL(p,s)` and order and aggregate numerically, `decimal(38,10)` SHALL declare `VARCHAR(2000000)` and return its text, and the `array`, `map`, and `struct` columns SHALL return the JSON documents of `scan-types/nested-json-rendering`
 * *AND* the `binary`, `struct<x: binary>`, and `variant` columns SHALL declare `VARCHAR(2000000)` and fail at plan time naming the column and its type
 * *AND* the `sales_parquet` table SHALL declare `ID` as `DECIMAL(20,0)`, `AMOUNT` as `DOUBLE`, `YEAR` as `DECIMAL(10,0)`, and `REGION` as `VARCHAR(2000000)`, in that order, and return its values
 

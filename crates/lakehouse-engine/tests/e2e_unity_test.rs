@@ -15,11 +15,13 @@ use common::exasol_ws::ExaConn;
 use common::raw_parquet::{encode_parquet, put_fixture_object, write_parquet_fixture};
 use common::seed::{
     ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
-    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT,
-    INT16_VALUES_TEXT, INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, all_types_ids,
-    binary_values, boolean_values, date_values, decimal_10_2_values, decimal_38_10_values,
-    float32_values, int_list_values, int_string_struct_values, int8_values, int16_values,
-    int32_values, string_int_map_values, struct_binary_values, text_values, timestamp_values,
+    DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
+    FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
+    INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT, all_types_ids, binary_values,
+    boolean_values, date_values, decimal_10_2_values, decimal_18_0_values, decimal_36_6_values,
+    decimal_38_10_values, float32_values, int_list_values, int_string_struct_values, int8_values,
+    int16_values, int32_values, string_int_map_values, struct_binary_values, text_values,
+    timestamp_values,
 };
 use common::stack::{
     self, ASSUME_ROLE_ARN, ASSUME_ROLE_BASE_ACCESS_KEY, ASSUME_ROLE_BASE_SECRET_KEY,
@@ -196,6 +198,7 @@ fn seed_sales_parquet_table() {
             ("region", json!("string"), "STRING"),
         ],
         &["year", "region"],
+        UnityClient::Databricks,
     );
 }
 
@@ -211,6 +214,16 @@ fn struct_type(members: &[(&str, &str)]) -> Json {
     json!({"type": "struct", "fields": fields})
 }
 
+/// Column shapes real Unity clients write: a decimal's precision and scale live only in
+/// `type_text` and `type_json` (#463).
+#[derive(Clone, Copy, PartialEq)]
+enum UnityClient {
+    /// Omits `type_precision` and `type_scale`.
+    SparkConnector,
+    /// Reports `type_precision` and `type_scale` as 0.
+    Databricks,
+}
+
 /// A column's Spark type is the `type` of the `StructField` JSON the reader reads. Replaces any
 /// earlier registration, so a changed fixture never meets a stale one.
 fn register_unity_table(
@@ -219,6 +232,7 @@ fn register_unity_table(
     location: &str,
     columns: &[(&str, Json, &str)],
     partitions: &[&str],
+    client: UnityClient,
 ) {
     let columns: Vec<Json> = columns
         .iter()
@@ -233,17 +247,12 @@ fn register_unity_table(
                 "type_json": spark_field(column, spark_type).to_string(),
                 "position": position, "nullable": true
             });
+            if client == UnityClient::Databricks {
+                entry["type_precision"] = 0.into();
+                entry["type_scale"] = 0.into();
+            }
             if let Some(index) = partitions.iter().position(|p| p == column) {
                 entry["partition_index"] = index.into();
-            }
-            // The listing reads a decimal's precision and scale here, as a real UC reports them.
-            if let Some((precision, scale)) = type_text
-                .strip_prefix("decimal(")
-                .and_then(|rest| rest.strip_suffix(')'))
-                .and_then(|rest| rest.split_once(','))
-            {
-                entry["type_precision"] = precision.parse::<u32>().expect("precision").into();
-                entry["type_scale"] = scale.parse::<u32>().expect("scale").into();
             }
             entry
         })
@@ -299,6 +308,18 @@ fn seed_all_types_parquet_table() {
             "c_decimal_10_2",
             Some(decimal_10_2_values()),
             json!("decimal(10,2)"),
+            "DECIMAL",
+        ),
+        (
+            "c_decimal_18_0",
+            Some(decimal_18_0_values()),
+            json!("decimal(18,0)"),
+            "DECIMAL",
+        ),
+        (
+            "c_decimal_36_6",
+            Some(decimal_36_6_values()),
+            json!("decimal(36,6)"),
             "DECIMAL",
         ),
         (
@@ -379,14 +400,18 @@ fn seed_all_types_parquet_table() {
         ALL_TYPES_PARQUET_LOCATION,
         &registered,
         &[],
+        UnityClient::SparkConnector,
     );
 }
 
-/// The Delta types `stats_all_types` lacks: a decimal wider than Exasol's 36 digits and a
-/// binary struct member. A one-commit log over one data file, with no reader feature.
+/// The Delta types `stats_all_types` lacks: the decimal matrix and a binary struct member. A
+/// one-commit log over one data file, with no reader feature.
 fn seed_delta_extra_types_table() {
     let batch = RecordBatch::try_from_iter_with_nullable(vec![
         ("id", all_types_ids(), false),
+        ("c_decimal_10_2", decimal_10_2_values(), true),
+        ("c_decimal_18_0", decimal_18_0_values(), true),
+        ("c_decimal_36_6", decimal_36_6_values(), true),
         ("c_decimal_38_10", decimal_38_10_values(), true),
         ("c_struct_binary", struct_binary_values(None), true),
     ])
@@ -400,6 +425,9 @@ fn seed_delta_extra_types_table() {
 
     let columns = [
         ("id", json!("long"), "LONG"),
+        ("c_decimal_10_2", json!("decimal(10,2)"), "DECIMAL"),
+        ("c_decimal_18_0", json!("decimal(18,0)"), "DECIMAL"),
+        ("c_decimal_36_6", json!("decimal(36,6)"), "DECIMAL"),
         ("c_decimal_38_10", json!("decimal(38,10)"), "DECIMAL"),
         ("c_struct_binary", struct_type(&[("x", "binary")]), "STRUCT"),
     ];
@@ -432,6 +460,7 @@ fn seed_delta_extra_types_table() {
         DELTA_EXTRA_TYPES_LOCATION,
         &columns,
         &[],
+        UnityClient::Databricks,
     );
 }
 
@@ -1245,6 +1274,8 @@ fn unity_delta_type_widening_returns_the_widened_types_across_both_files() {
         ("INT_DOUBLE", "DOUBLE"),
         ("DECIMAL_DECIMAL_SAME_SCALE", "DECIMAL(20,2)"),
         ("DECIMAL_DECIMAL_GREATER_SCALE", "DECIMAL(20,5)"),
+        ("BYTE_DECIMAL", "DECIMAL(4,1)"),
+        ("SHORT_DECIMAL", "DECIMAL(6,1)"),
         ("INT_DECIMAL", "DECIMAL(11,1)"),
         ("LONG_DECIMAL", "DECIMAL(21,1)"),
         ("DATE_TIMESTAMP_NTZ", timestamp),
@@ -1403,6 +1434,7 @@ const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LO
      MAP_COL, NESTED_STRUCT";
 
 /// Scenario: Every Delta type declares and returns its mapped value through Unity Catalog
+/// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
 #[test]
 fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     setup();
@@ -1548,6 +1580,8 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
 }
 
 /// Scenario: Every Delta type declares and returns its mapped value through Unity Catalog
+/// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
+/// Scenario: An incompatible Unity Catalog column type is declared as VARCHAR rather than failing
 #[test]
 fn unity_delta_extra_types_declare_and_return_their_mapped_values() {
     setup();
@@ -1558,9 +1592,34 @@ fn unity_delta_extra_types_declare_and_return_their_mapped_values() {
         "DELTA_EXTRA_TYPES",
         &[
             reads("ID", "DECIMAL(20,0)", ALL_TYPES_IDS_TEXT),
+            reads("C_DECIMAL_10_2", "DECIMAL(10,2)", DECIMAL_10_2_VALUES_TEXT),
+            reads("C_DECIMAL_18_0", "DECIMAL(18,0)", DECIMAL_18_0_VALUES_TEXT),
+            reads("C_DECIMAL_36_6", "DECIMAL(36,6)", DECIMAL_36_6_VALUES_TEXT),
             reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
             refuses("C_STRUCT_BINARY", VARCHAR_JSON, STRUCT_BINARY_REFUSAL),
         ],
+    );
+    assert_decimal_orders_numerically(&mut conn, "DELTA_EXTRA_TYPES");
+}
+
+fn assert_decimal_orders_numerically(conn: &mut ExaConn, table: &str) {
+    let lowest = conn.query_columns(&format!(
+        "SELECT ID FROM {} ORDER BY C_DECIMAL_18_0 LIMIT 1",
+        table_ref(table)
+    ));
+    assert_eq!(
+        value_to_string(&lowest[0][0]),
+        "2",
+        "{table} top-1 by C_DECIMAL_18_0"
+    );
+    let min = conn.query_columns(&format!(
+        "SELECT MIN(C_DECIMAL_18_0) FROM {}",
+        table_ref(table)
+    ));
+    assert_eq!(
+        value_to_string(&min[0][0]),
+        DECIMAL_18_0_VALUES_TEXT[1].unwrap(),
+        "{table} MIN(C_DECIMAL_18_0)"
     );
 }
 
@@ -1880,6 +1939,8 @@ fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
 }
 
 /// Scenario: Every Spark type a Unity Parquet table declares returns its mapped value
+/// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
+/// Scenario: An incompatible Unity Catalog column type is declared as VARCHAR rather than failing
 #[test]
 fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
     setup();
@@ -1898,6 +1959,8 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
             reads("C_BOOLEAN", "BOOLEAN", BOOLEAN_VALUES_TEXT),
             reads("C_STRING", VARCHAR_JSON, TEXT_VALUES_TEXT),
             reads("C_DECIMAL_10_2", "DECIMAL(10,2)", DECIMAL_10_2_VALUES_TEXT),
+            reads("C_DECIMAL_18_0", "DECIMAL(18,0)", DECIMAL_18_0_VALUES_TEXT),
+            reads("C_DECIMAL_36_6", "DECIMAL(36,6)", DECIMAL_36_6_VALUES_TEXT),
             reads("C_DECIMAL_38_10", VARCHAR_JSON, DECIMAL_38_10_VALUES_TEXT),
             reads("C_DATE", "DATE", DATE_VALUES_TEXT),
             reads("C_TIMESTAMP", timestamp, TIMESTAMP_VALUES_TEXT),
@@ -1930,6 +1993,7 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
             ),
         ],
     );
+    assert_decimal_orders_numerically(&mut conn, "ALL_TYPES_PARQUET");
 }
 
 /// Scenario: Vended and static credentials resolve the same scan

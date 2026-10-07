@@ -59,9 +59,8 @@ issue #359 added, and the parent feature keeps the general Arrow/Exasol type-com
   at microsecond by protocol rather than by omission. `§ Schema Serialization Format → Primitive
   Types` types `timestamp` as "Microsecond precision timestamp elapsed since the Unix epoch" and
   `timestamp without time zone` as "Microsecond precision timestamp in a local timezone", and the
-  string `nanosecond` does not occur in the protocol. Unity Catalog's `ColumnTypeName` enumeration,
-  the domain of the `type_name` field this repo matches on, carries only `TIMESTAMP` and
-  `TIMESTAMP_NTZ`. This is a protocol fact, not a tracked gap and not a deviation.
+  string `nanosecond` does not occur in the protocol. Spark's type vocabulary,
+  which Unity's `type_json` uses, carries only `timestamp` and `timestamp_ntz`. This is a protocol fact, not a tracked gap and not a deviation.
 * The ENGINE axis is an EMIT capability, distinct from the CAST-target domain. An Exasol 8.x UDF
   emits only millisecond precision; Exasol 2025.x and later emit 3, 6 and 9. The 8.x limit is a
   named target-type trade-off: a nanosecond Iceberg column queried through an 8.x engine loses six
@@ -101,7 +100,7 @@ issue #359 added, and the parent feature keeps the general Arrow/Exasol type-com
 * *THEN* the resolver SHALL return `TIMESTAMP(6)` when the version's leading dot-separated component parses as an integer `>= 2025`, and SHALL return the bare string `TIMESTAMP` when it parses as an integer `< 2025`, so `2025.2.1` yields `TIMESTAMP(6)` and `8.29.13` yields `TIMESTAMP`
 * *AND* the resolution SHALL be the composition of exactly TWO decisions, each owned by exactly ONE type in `crates/lakehouse-engine/src/types/mapping.rs`: a SOURCE width the producer names PER COLUMN, and an ENGINE clamp resolved ONCE per `createVirtualSchema` request from the version string; the request-scoped value MUST NOT be substituted for the per-column one, and neither producer SHALL carry a declaration literal
 * *AND* the SOURCE width SHALL be a three-valued, FORMAT-NEUTRAL property (millisecond, microsecond, nanosecond), and MUST NOT name Iceberg, Delta, or any other table format in its own vocabulary, so a future format reader populates it without widening the type
-* *AND* BOTH producers, `iceberg_primitive_to_exasol` and `unity_type_name_to_exasol`, SHALL name their source width and read their declaration from that shared owner, so an Iceberg `timestamp` and a Delta `TIMESTAMP` cannot be declared at different precisions
+* *AND* BOTH producers, `iceberg_primitive_to_exasol` and `spark_primitive_to_exasol`, SHALL name their source width and read their declaration from that shared owner, so an Iceberg `timestamp` and a Delta `TIMESTAMP` cannot be declared at different precisions
 * *AND* the engine owner SHALL take the version as a STRING and MUST NOT take a `UdfContext`, so the type-mapping module reads no ambient state and performs no I/O; the single `ctx.database_version()` read and the threading of the resolved value belong to `vs-adapter/create-virtual-schema`
 * *AND* the resolved engine value SHALL be threaded as a plain value through `column_source_type_to_exasol` and `iceberg_type_to_exasol` to both producers, and the context MUST NOT be threaded into the type-mapping module in its place
 * *AND* the resolver MUST NOT fail, return a `Result`, or abort the enumeration on any version string, keeping `column_source_type_to_exasol` and `build_listing_virtual_tables` infallible

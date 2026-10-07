@@ -39,12 +39,7 @@ impl FixedCatalogClient {
             metadata_location: None,
             columns: vec![CatalogColumn {
                 name: "total".to_string(),
-                source_type: ColumnSourceType::Unity {
-                    type_name: "DECIMAL".to_string(),
-                    precision: 10,
-                    scale: 2,
-                    type_json: None,
-                },
+                source_type: ColumnSourceType::Unity { type_json: None },
             }],
         }
     }
@@ -195,30 +190,6 @@ async fn an_iceberg_column_carries_its_iceberg_source_type() {
         column.source_type,
         ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long))
     );
-}
-
-#[tokio::test]
-async fn a_unity_decimal_column_carries_its_precision_and_scale() {
-    let listing = boxed_client()
-        .list_tables(&["prod".to_string()])
-        .await
-        .expect("listing failed");
-
-    match &listing.tables[1].columns[0].source_type {
-        ColumnSourceType::Unity {
-            type_name,
-            precision,
-            scale,
-            ..
-        } => assert_eq!((type_name.as_str(), *precision, *scale), ("DECIMAL", 10, 2)),
-        ColumnSourceType::Iceberg(ty) => panic!("expected a Unity source type, got iceberg {ty}"),
-        ColumnSourceType::Parquet(tag) => {
-            panic!("expected a Unity source type, got a Parquet tag {tag}")
-        }
-        ColumnSourceType::Glue { hive_type } => {
-            panic!("expected a Unity source type, got a Glue type {hive_type}")
-        }
-    }
 }
 
 #[derive(Default)]

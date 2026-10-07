@@ -35,11 +35,9 @@ pub enum CatalogTableType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnSourceType {
     Iceberg(iceberg::spec::Type),
-    /// `precision`/`scale` are the `DECIMAL(p, s)` arguments, `0` for a type taking none.
+    /// `type_json` is the only type source: real Unity clients leave `type_precision` and
+    /// `type_scale` unset (#463).
     Unity {
-        type_name: String,
-        precision: u32,
-        scale: u32,
         type_json: Option<String>,
     },
     /// A scan-spec type tag, not an Arrow `DataType`: this crate must not depend on `arrow`.

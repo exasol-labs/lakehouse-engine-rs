@@ -3159,9 +3159,35 @@ pub fn decimal_38_10_values() -> ArrayRef {
     decimal_values(12_345_678_901_234_567_890_123_456_789_012_345_678, 38, 10)
 }
 
+/// Text order inverts the numeric order, so a VARCHAR declaration sorts these wrong.
+pub const DECIMAL_18_0_VALUES_TEXT: [Option<&str>; 3] =
+    [Some("100000000000000000"), Some("99999999999999999"), None];
+
+pub fn decimal_18_0_values() -> ArrayRef {
+    decimal_array(
+        vec![Some(10_i128.pow(17)), Some(10_i128.pow(17) - 1), None],
+        18,
+        0,
+    )
+}
+
+pub const DECIMAL_36_6_VALUES_TEXT: [Option<&str>; 3] = [
+    Some("123456789012345678901234567890.123456"),
+    Some("-0.000005"),
+    None,
+];
+
+pub fn decimal_36_6_values() -> ArrayRef {
+    decimal_values(123_456_789_012_345_678_901_234_567_890_123_456, 36, 6)
+}
+
 fn decimal_values(first: i128, precision: u8, scale: i8) -> ArrayRef {
+    decimal_array(vec![Some(first), Some(-5), None], precision, scale)
+}
+
+fn decimal_array(values: Vec<Option<i128>>, precision: u8, scale: i8) -> ArrayRef {
     Arc::new(
-        Decimal128Array::from(vec![Some(first), Some(-5), None])
+        Decimal128Array::from(values)
             .with_precision_and_scale(precision, scale)
             .expect("valid decimal precision and scale"),
     )
