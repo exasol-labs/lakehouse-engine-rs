@@ -15,6 +15,7 @@ Project specifics:
 - `make test-e2e` runs the E2E suite against the local container. Use `exapump` for all Exasol and BucketFS interaction.
 - Reproduce a reported bug against the Docker Exasol container before fixing it. Do not trust an issue's repro, a capability list, or code inspection alone.
 - Verify any claim about SQL capabilities, syntax, or pushdown reachability against a live Exasol (`EXPLAIN VIRTUAL`, a pushed query, or an E2E test). `capabilities.rs` and documentation are not evidence.
+- All requirements about benchmarks live in `bench/requirements.md`. They never go into the `specs/` library.
 - A stray `bench/.env` redirects `make bench` and `bench/run.sh` to a remote target, and `BENCH_TARGET=docker` alone does not undo it. Before debugging a hung bench run, move `bench/.env` aside.
 
 ## Code quality
