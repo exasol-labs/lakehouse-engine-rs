@@ -124,8 +124,13 @@ pub(crate) fn sign_request(
         request.method().as_str(),
         &url,
         header_pairs.into_iter(),
-        // Every signed request is a bodiless GET.
-        SignableBody::Bytes(&[]),
+        // A streamed body has no bytes to hash, and no caller sends one.
+        SignableBody::Bytes(
+            request
+                .body()
+                .and_then(|body| body.as_bytes())
+                .unwrap_or(&[]),
+        ),
     )?;
 
     let (instructions, _signature) = sign(signable, &params)?.into_parts();

@@ -19,12 +19,14 @@ use common::e2e_harness::{
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
-    self, WAREHOUSE_STATIC, WAREHOUSE_VENDED, WarehouseProfile, lakekeeper_connection_password,
+    self, WAREHOUSE_AUTHZ, WAREHOUSE_STATIC, WAREHOUSE_VENDED, WarehouseProfile,
+    lakekeeper_connection_password,
 };
 use common::lakekeeper_authz::{
-    AuthzFixture, CHECK_ID, CHECKER, Grant, OPERATOR, Principal, READER_A, READER_B, Scope,
-    TABLE_ALPHA, TABLE_BETA, TABLE_MISSING, batch_check, batch_check_request, ensure_authz_fixture,
-    jwt_claims, lakekeeper_server_info, post_batch_check, provision_authz_fixture, whoami_id,
+    AuthzFixture, CHECK_ID, CHECKER, Grant, MAPPED_DENIED, OPERATOR, Principal, READER_A, READER_B,
+    Scope, TABLE_ALPHA, TABLE_BETA, TABLE_MISSING, batch_check, batch_check_request,
+    ensure_authz_fixture, ensure_role, ensure_role_member, jwt_claims, lakekeeper_server_info,
+    post_batch_check, provision_authz_fixture, whoami_id,
 };
 use common::seed::{
     E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15,
@@ -771,6 +773,31 @@ fn authz_fixture_provisioning_removes_a_stale_reader_grant() {
     assert!(operator_allows(&reprovisioned, &READER_A, TABLE_ALPHA));
 }
 
+/// The permission-check test's denied user must not inherit a read of the scanned table.
+#[test]
+fn authz_fixture_provisioning_removes_a_stale_grant_on_the_scanned_tables_namespace() {
+    let fixture = authz_fixture();
+    let denied_reads_events = |fixture: &AuthzFixture| {
+        let check = fixture.read_check_at(CHECK_ID, MAPPED_DENIED, E2E_NAMESPACE, E2E_TABLE);
+        batch_check(&OPERATOR.token(), &[check]).allowed(CHECK_ID)
+    };
+    fixture.ensure_grant(
+        MAPPED_DENIED,
+        grant(Scope::Namespace(E2E_NAMESPACE), "select"),
+    );
+    assert!(
+        denied_reads_events(fixture),
+        "precondition: the stale namespace grant takes effect"
+    );
+
+    let reprovisioned = provision_authz_fixture();
+
+    assert!(
+        !denied_reads_events(&reprovisioned),
+        "provisioning must remove a namespace grant the fixture does not name"
+    );
+}
+
 /// Proves only a direct client-credentials login. It does NOT prove that the id #415's
 /// `USER_MAPPING` template derives from an Exasol user matches an existing grant (#415).
 #[test]
@@ -1002,4 +1029,404 @@ fn authz_denied_and_missing_tables_answer_identically() {
     assert_eq!(denied.status, 200, "{}", denied.body);
     assert!(!denied.allowed(CHECK_ID));
     assert_eq!(denied.body, missing.body);
+}
+
+type ExasolUser = (&'static str, &'static str);
+
+const VS_PERMISSION: &str = "LK_PERM_LAKEHOUSE";
+const VS_PERMISSION_NO_JOIN: &str = "LK_PERM_NO_JOIN";
+const VS_UNINSPECTING: &str = "LK_PERM_UNINSPECTING";
+const CONN_PERMISSION: &str = "LK_PERM_CATALOG_CREDS";
+const CONN_UNINSPECTING: &str = "LK_PERM_UNINSPECTING_CREDS";
+const VIEW_SCHEMA: &str = "LK_PERM_VIEWS";
+const ALLOWED_USER: ExasolUser = ("LK_PERM_ALLOWED", "LkPermAllowed2026x");
+const DENIED_USER: ExasolUser = ("LK_PERM_DENIED", "LkPermDenied2026x");
+const UNKNOWN_USER: ExasolUser = ("LK_PERM_UNKNOWN", "LkPermUnknown2026x");
+const JOIN_ONE_USER: ExasolUser = ("LK_PERM_JOINONE", "LkPermJoinOne2026x");
+const JOIN_BOTH_USER: ExasolUser = ("LK_PERM_JOINBOTH", "LkPermJoinBoth2026x");
+const VIEW_OWNER_USER: ExasolUser = ("LK_PERM_VIEWOWNER", "LkPermViewOwner2026x");
+const VIEW_READER_USER: ExasolUser = ("LK_PERM_VIEWREADER", "LkPermViewReader2026x");
+const REVOKED_USER: ExasolUser = ("LK_PERM_REVOKED", "LkPermRevoked2026x");
+const DESCRIBE_USER: ExasolUser = ("LK_PERM_DESCRIBE", "LkPermDescribe2026x");
+const NAMESPACE_USER: ExasolUser = ("LK_PERM_NAMESPACE", "LkPermNamespace2026x");
+const WAREHOUSE_USER: ExasolUser = ("LK_PERM_WAREHOUSE", "LkPermWarehouse2026x");
+const ROLE_USER: ExasolUser = ("LK_PERM_ROLE", "LkPermRole2026x");
+const PERMISSION_USERS: [ExasolUser; 12] = [
+    ALLOWED_USER,
+    DENIED_USER,
+    UNKNOWN_USER,
+    JOIN_ONE_USER,
+    JOIN_BOTH_USER,
+    VIEW_OWNER_USER,
+    VIEW_READER_USER,
+    REVOKED_USER,
+    DESCRIBE_USER,
+    NAMESPACE_USER,
+    WAREHOUSE_USER,
+    ROLE_USER,
+];
+const ROLE_NAME: &str = "lk-perm-readers";
+
+/// Three lines, a tab, and double quotes, so the test also proves that Exasol stores and
+/// passes the template byte for byte.
+const PERMISSION_USER_MAPPING: &str = "{% if user is startingwith(\"LK_PERM_\") %}\n\
+     \toidc~lk.{{ user[8:]|lower }}@lakehouse.test\n\
+     {% endif %}";
+
+static PERMISSION_SETUP_DONE: OnceLock<()> = OnceLock::new();
+
+/// The Lakekeeper user id that `PERMISSION_USER_MAPPING` derives from the Exasol user.
+fn mapped_principal((user, _): ExasolUser) -> String {
+    format!(
+        "oidc~lk.{}@lakehouse.test",
+        user["LK_PERM_".len()..].to_lowercase()
+    )
+}
+
+/// `lakehouse-reader-b` reads `/v1/config` but holds no grant management, so its batch-check
+/// answers 403 `CannotInspectPermissions`.
+fn uninspecting_password() -> CatalogConnectionPassword {
+    CatalogConnectionPassword {
+        client_id: Some(READER_B.client_id.to_string()),
+        client_secret: Some(READER_B.client_secret.to_string()),
+        ..lakekeeper_connection_password(WAREHOUSE_AUTHZ, false)
+    }
+}
+
+fn permission_setup() {
+    PERMISSION_SETUP_DONE.get_or_init(|| {
+        authz_fixture();
+        let mut sys = exa_conn();
+
+        sys.execute(&format!("DROP SCHEMA IF EXISTS {VIEW_SCHEMA} CASCADE"));
+        for vs in [VS_PERMISSION, VS_PERMISSION_NO_JOIN, VS_UNINSPECTING] {
+            sys.execute(&format!("DROP VIRTUAL SCHEMA IF EXISTS {vs} CASCADE"));
+        }
+        for (user, _) in PERMISSION_USERS {
+            sys.execute(&format!("DROP USER IF EXISTS {user} CASCADE"));
+        }
+        for conn in [CONN_PERMISSION, CONN_UNINSPECTING] {
+            sys.execute(&format!("DROP CONNECTION IF EXISTS {conn}"));
+        }
+        for (user, password) in PERMISSION_USERS {
+            sys.execute(&format!("CREATE USER {user} IDENTIFIED BY \"{password}\""));
+            sys.execute(&format!("GRANT CREATE SESSION TO {user}"));
+        }
+        sys.execute(&format!(
+            "GRANT CREATE SCHEMA, CREATE VIEW TO {}",
+            VIEW_OWNER_USER.0
+        ));
+
+        let operator = lakekeeper_connection_password(WAREHOUSE_AUTHZ, false);
+        for (conn, props) in [
+            (CONN_PERMISSION, VsProps::new(VS_PERMISSION, E2E_NAMESPACE)),
+            (
+                CONN_PERMISSION,
+                VsProps::new(VS_PERMISSION_NO_JOIN, E2E_NAMESPACE)
+                    .with_join_broadcast_max_bytes("1"),
+            ),
+            (
+                CONN_UNINSPECTING,
+                VsProps::new(VS_UNINSPECTING, E2E_NAMESPACE),
+            ),
+        ] {
+            create_virtual_schema_with_password(
+                &mut sys,
+                &props
+                    .with_catalog_conn_name(conn)
+                    .with_property("PERMISSION_CHECK", "LAKEKEEPER")
+                    .with_property("USER_MAPPING", PERMISSION_USER_MAPPING),
+                LAKEKEEPER_CATALOG_URI_INTERNAL,
+                &operator,
+            );
+        }
+        // Swapped in after the create, because `lakehouse-reader-b` cannot list the namespace.
+        sys.execute(&build_create_connection_sql(
+            CONN_UNINSPECTING,
+            LAKEKEEPER_CATALOG_URI_INTERNAL,
+            &uninspecting_password(),
+        ));
+
+        // The view reader reaches the virtual schema only through the owner's view.
+        for vs in [VS_PERMISSION, VS_PERMISSION_NO_JOIN, VS_UNINSPECTING] {
+            for (user, _) in PERMISSION_USERS {
+                if user != VIEW_READER_USER.0 {
+                    sys.execute(&format!("GRANT SELECT ON SCHEMA {vs} TO {user}"));
+                }
+            }
+        }
+    });
+}
+
+fn connect_as((user, password): ExasolUser) -> ExaConn {
+    ExaConn::connect(&exasol_host(), exasol_sql_port(), user, password)
+}
+
+fn events_query(vs: &str) -> String {
+    format!(
+        "SELECT id FROM {vs}.{} ORDER BY id",
+        E2E_TABLE.to_uppercase()
+    )
+}
+
+fn refusal_text(response: &Value) -> String {
+    assert_eq!(
+        response["status"].as_str(),
+        Some("error"),
+        "the query must be refused: {response}"
+    );
+    response["exception"]["text"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn assert_no_secret_or_token(message: &str) {
+    for secret in [
+        OPERATOR.client_secret,
+        READER_B.client_secret,
+        "eyJ",
+        "Bearer ",
+    ] {
+        assert!(
+            !message.contains(secret),
+            "the refusal leaks a secret or a token: {message}"
+        );
+    }
+}
+
+/// Runs `sql` as `user`, which Lakekeeper must refuse for each table in `denied` only.
+fn assert_refused(user: ExasolUser, sql: &str, denied: &[&str], allowed: &[&str]) {
+    let message = refusal_text(&connect_as(user).try_execute(sql));
+    for table in denied {
+        assert!(
+            message.contains(table),
+            "{}: must name {table}: {message}",
+            user.0
+        );
+    }
+    for table in allowed {
+        assert!(
+            !message.contains(table),
+            "{}: must not name the readable {table}: {message}",
+            user.0
+        );
+    }
+    assert!(message.contains(&mapped_principal(user)), "{message}");
+    assert_no_secret_or_token(&message);
+}
+
+fn event_ids(user: ExasolUser, vs: &str) -> Vec<i64> {
+    connect_as(user).query_columns(&events_query(vs))[0]
+        .iter()
+        .map(parse_int)
+        .collect()
+}
+
+fn all_event_ids() -> Vec<i64> {
+    (1..=SEED_TOTAL_ROWS as i64).collect()
+}
+
+fn grant_only(user: ExasolUser, grants: &[Grant]) {
+    authz_fixture().set_user_assignments(&mapped_principal(user), grants);
+}
+
+fn select_table(table: &'static str) -> Grant {
+    grant(Scope::Table(table), "select")
+}
+
+fn qualified(table: &str) -> String {
+    format!("{E2E_NAMESPACE}.{table}")
+}
+
+/// Scenario: Grants on the mapped principal decide a live Exasol user's query
+#[test]
+fn permission_check_grants_decide_each_mapped_users_query() {
+    permission_setup();
+    let stored = exa_conn().query_columns(&format!(
+        "SELECT PROPERTY_VALUE FROM SYS.EXA_ALL_VIRTUAL_SCHEMA_PROPERTIES \
+         WHERE SCHEMA_NAME = '{VS_PERMISSION}' AND PROPERTY_NAME = 'USER_MAPPING'"
+    ));
+    assert_eq!(
+        stored
+            .first()
+            .and_then(|column| column.first())
+            .and_then(Value::as_str),
+        Some(PERMISSION_USER_MAPPING),
+        "Exasol must store the USER_MAPPING template byte for byte"
+    );
+
+    assert_eq!(
+        event_ids(ALLOWED_USER, VS_PERMISSION),
+        all_event_ids(),
+        "the user whose mapped principal holds a grant reads every seeded row"
+    );
+    for user in [DENIED_USER, UNKNOWN_USER] {
+        assert_refused(
+            user,
+            &events_query(VS_PERMISSION),
+            &[&qualified(E2E_TABLE)],
+            &[],
+        );
+    }
+}
+
+/// Scenario: A failed batch-check refuses the query with an error that names the cause
+#[test]
+fn permission_check_refuses_when_the_connection_cannot_inspect_permissions() {
+    permission_setup();
+
+    let message =
+        refusal_text(&connect_as(ALLOWED_USER).try_execute(&events_query(VS_UNINSPECTING)));
+
+    for fragment in ["403", "CannotInspectPermissions", "manage_grants"] {
+        assert!(
+            message.contains(fragment),
+            "the refusal must name {fragment:?}: {message}"
+        );
+    }
+    assert_no_secret_or_token(&message);
+}
+
+/// Scenario: A denied table refuses the whole query
+#[test]
+fn permission_check_refuses_a_join_unless_the_user_may_read_both_tables() {
+    permission_setup();
+    grant_only(JOIN_ONE_USER, &[select_table(E2E_FACT_TABLE)]);
+    grant_only(
+        JOIN_BOTH_USER,
+        &[select_table(E2E_FACT_TABLE), select_table(E2E_DIM_TABLE)],
+    );
+
+    for vs in [VS_PERMISSION, VS_PERMISSION_NO_JOIN] {
+        let query = join_query(vs);
+        assert_refused(
+            JOIN_ONE_USER,
+            &query,
+            &[&qualified(E2E_DIM_TABLE)],
+            &[&qualified(E2E_FACT_TABLE)],
+        );
+
+        let mut both = connect_as(JOIN_BOTH_USER);
+        let pushed = explain_virtual_sql(&mut both, &query);
+        assert_eq!(
+            has_broadcast_join_block(&pushed),
+            vs == VS_PERMISSION,
+            "{vs}: join pushdown must be {} in: {pushed}",
+            if vs == VS_PERMISSION { "on" } else { "off" }
+        );
+        let rows = fetch_join_rows(&mut both, vs);
+        assert_eq!(
+            rows.len(),
+            6,
+            "{vs}: the user with both grants reads the join: {rows:?}"
+        );
+    }
+}
+
+/// Which user the check sees when a view over the virtual schema is queried.
+#[test]
+fn permission_check_sees_the_user_who_queries_a_view_not_its_owner() {
+    permission_setup();
+    grant_only(VIEW_OWNER_USER, &[select_table(E2E_TABLE)]);
+    grant_only(VIEW_READER_USER, &[]);
+    let view = format!("{VIEW_SCHEMA}.EVENTS_V");
+    let mut owner = connect_as(VIEW_OWNER_USER);
+    owner.execute(&format!("CREATE SCHEMA {VIEW_SCHEMA}"));
+    owner.execute(&format!(
+        "CREATE VIEW {view} AS SELECT id FROM {VS_PERMISSION}.{}",
+        E2E_TABLE.to_uppercase()
+    ));
+    owner.execute(&format!("GRANT SELECT ON {view} TO {}", VIEW_READER_USER.0));
+    let query = format!("SELECT id FROM {view} ORDER BY id");
+
+    let owner_ids: Vec<i64> = owner.query_columns(&query)[0]
+        .iter()
+        .map(parse_int)
+        .collect();
+    assert_eq!(owner_ids, all_event_ids(), "the owner holds the grant");
+
+    assert_refused(VIEW_READER_USER, &query, &[&qualified(E2E_TABLE)], &[]);
+}
+
+/// Scenario: A denied table refuses the whole query
+#[test]
+fn permission_check_refuses_the_same_query_once_a_grant_is_revoked() {
+    permission_setup();
+    let query = events_query(VS_PERMISSION);
+    grant_only(REVOKED_USER, &[select_table(E2E_TABLE)]);
+    assert_eq!(event_ids(REVOKED_USER, VS_PERMISSION), all_event_ids());
+
+    grant_only(REVOKED_USER, &[]);
+
+    assert_refused(REVOKED_USER, &query, &[&qualified(E2E_TABLE)], &[]);
+}
+
+/// Scenario: A denied table refuses the whole query
+#[test]
+fn permission_check_refuses_a_user_with_describe_but_no_select() {
+    permission_setup();
+    grant_only(DESCRIBE_USER, &[grant(Scope::Table(E2E_TABLE), "describe")]);
+
+    assert_refused(
+        DESCRIBE_USER,
+        &events_query(VS_PERMISSION),
+        &[&qualified(E2E_TABLE)],
+        &[],
+    );
+}
+
+/// Scenario: Grants on the mapped principal decide a live Exasol user's query
+#[test]
+fn permission_check_honors_grants_inherited_from_namespace_warehouse_and_role() {
+    permission_setup();
+    let fixture = authz_fixture();
+    grant_only(
+        NAMESPACE_USER,
+        &[grant(Scope::Namespace(E2E_NAMESPACE), "select")],
+    );
+    grant_only(WAREHOUSE_USER, &[grant(Scope::Warehouse, "select")]);
+    grant_only(ROLE_USER, &[]);
+    let role = ensure_role(ROLE_NAME);
+    ensure_role_member(&role, &mapped_principal(ROLE_USER));
+    fixture.ensure_role_grant(&role, select_table(E2E_TABLE));
+
+    for user in [NAMESPACE_USER, WAREHOUSE_USER, ROLE_USER] {
+        assert_eq!(
+            event_ids(user, VS_PERMISSION),
+            all_event_ids(),
+            "{}: an inherited grant lets the user read the table",
+            user.0
+        );
+    }
+}
+
+/// Scenario: A denied table refuses the whole query
+#[test]
+fn permission_check_refuses_explain_virtual_without_a_grant() {
+    permission_setup();
+    grant_only(DENIED_USER, &[select_table(TABLE_ALPHA)]);
+
+    let message = refusal_text(
+        &connect_as(DENIED_USER)
+            .try_execute(&format!("EXPLAIN VIRTUAL {}", events_query(VS_PERMISSION))),
+    );
+
+    assert!(message.contains(&qualified(E2E_TABLE)), "{message}");
+}
+
+/// Scenario: One batch-check per query decides every table before any table is read
+#[test]
+fn permission_check_gates_an_aggregate_query() {
+    permission_setup();
+    let query = format!(
+        "SELECT COUNT(*), SUM(id) FROM {VS_PERMISSION}.{}",
+        E2E_TABLE.to_uppercase()
+    );
+    grant_only(ALLOWED_USER, &[select_table(E2E_TABLE)]);
+
+    let columns = connect_as(ALLOWED_USER).query_columns(&query);
+
+    assert_eq!(parse_int(&columns[0][0]), SEED_TOTAL_ROWS as i64);
+    assert_refused(DENIED_USER, &query, &[&qualified(E2E_TABLE)], &[]);
 }

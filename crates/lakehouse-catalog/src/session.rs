@@ -130,6 +130,22 @@ impl CatalogSession {
             prefix,
         })
     }
+
+    pub(crate) fn client(&self) -> &reqwest::Client {
+        &self.client
+    }
+
+    pub(crate) fn catalog_uri(&self) -> &str {
+        &self.catalog_uri
+    }
+
+    pub(crate) fn auth(&self) -> &CatalogAuth {
+        &self.auth
+    }
+
+    pub(crate) fn prefix(&self) -> &str {
+        &self.prefix
+    }
 }
 
 /// Self-issued because `RestCatalog::load_table` drops the response

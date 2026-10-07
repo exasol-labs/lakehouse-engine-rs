@@ -61,3 +61,7 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "rus
 
 # Official AWS STS client: owns the AssumeRole wire protocol, signing, and endpoint rules.
 aws-sdk-sts = { version = "1", default-features = false, features = ["default-https-client", "rt-tokio"] }
+
+# USER_MAPPING templates. Without `multi_template` and `macros`, include, import, extends, and
+# macro fail to compile; `fuel` bounds a render.
+minijinja = { version = "2.24.0", default-features = false, features = ["builtins", "fuel", "serde"] }

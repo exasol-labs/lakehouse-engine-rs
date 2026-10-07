@@ -200,8 +200,8 @@ impl WarehouseProfile {
         }
     }
 
-    /// Holds only the metadata-only tables of the permission fixture; static credentials
-    /// suffice because no scan reads it.
+    /// Holds the metadata-only tables of the permission fixture and the seeded events table
+    /// that the permission-check test scans with the CONNECTION's static credentials.
     pub fn authz() -> Self {
         WarehouseProfile {
             name: WAREHOUSE_AUTHZ,

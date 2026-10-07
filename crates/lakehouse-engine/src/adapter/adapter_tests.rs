@@ -1647,7 +1647,13 @@ fn resolve_config_over(
         .enable_all()
         .build()
         .expect("build the request runtime");
-    resolve_connection_config(&ctx, props, &rt)
+    resolve_connection_config(
+        &ctx,
+        props,
+        &PermissionSettings::Off,
+        PermissionCheck::Off,
+        &rt,
+    )
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use super::*;
 use crate::test_support::*;
+use std::sync::{Arc, Mutex};
 
 #[test]
 fn disabled_sigv4_produces_no_auth_header_in_request() {
@@ -218,4 +219,97 @@ async fn load_table_error_redacts_session_bearer_and_static_secrets() {
         !msg.contains(OAUTH_ACCESS_TOKEN),
         "live session bearer token must not appear in error: {msg}"
     );
+}
+
+async fn post_to(
+    status: u16,
+    body: String,
+) -> (Result<PostAnswer, UdfError>, Arc<Mutex<Vec<String>>>) {
+    let (uri, requests) = spawn_server("application/json", move |_| (status, body.clone())).await;
+    let auth = CatalogAuth::Bearer(BEARER_TOK.into());
+    let answer = authed_post_json(
+        &reqwest::Client::new(),
+        &format!("{uri}/check"),
+        &serde_json::json!({"k": 1}),
+        &auth,
+        &base_creds(),
+        Duration::from_secs(5),
+    )
+    .await;
+    (answer, requests)
+}
+
+#[tokio::test]
+async fn a_post_sends_its_json_body_with_the_bearer_and_returns_the_answer() {
+    let (answer, requests) = post_to(200, r#"{"ok":true}"#.into()).await;
+
+    assert!(
+        matches!(answer, Ok(PostAnswer::Accepted { status: 200, ref body }) if body == r#"{"ok":true}"#)
+    );
+    let request = requests.lock().unwrap()[0].to_lowercase();
+    assert!(request.starts_with("post /check"), "{request}");
+    assert!(request.contains(&format!("bearer {}", BEARER_TOK.to_lowercase())));
+    assert!(request.ends_with(r#"{"k":1}"#), "{request}");
+}
+
+#[tokio::test]
+async fn a_refusal_is_a_value_whose_quoted_body_is_redacted_and_cut() {
+    let echoed = format!("{BEARER_TOK} {}", "x".repeat(MAX_QUOTED_BODY_BYTES * 2));
+
+    let (answer, _) = post_to(403, echoed).await;
+
+    let Ok(PostAnswer::Refused { status: 403, body }) = answer else {
+        panic!("a non-2xx answer must be a refusal");
+    };
+    assert!(!body.contains(BEARER_TOK), "{body}");
+    assert!(body.contains("truncated"), "{body}");
+}
+
+#[tokio::test]
+async fn an_answer_over_the_read_limit_is_an_error() {
+    let (answer, _) = post_to(200, "x".repeat(MAX_ANSWER_BYTES + 1)).await;
+
+    let Err(UdfError::User(message)) = answer else {
+        panic!("an oversized answer must be an error");
+    };
+    assert!(message.contains("exceeds"), "{message}");
+}
+
+#[tokio::test]
+async fn a_post_to_a_closed_port_is_an_error() {
+    let auth = CatalogAuth::None;
+
+    let answer = authed_post_json(
+        &reqwest::Client::new(),
+        "http://127.0.0.1:1/check",
+        &serde_json::json!({}),
+        &auth,
+        &base_creds(),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    assert!(matches!(answer, Err(UdfError::User(m)) if m.contains("catalog request failed")));
+}
+
+#[tokio::test]
+async fn a_catalog_that_never_answers_fails_within_the_deadline() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/check", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let _held = listener.accept().await;
+        std::future::pending::<()>().await;
+    });
+
+    let answer = authed_post_json(
+        &reqwest::Client::new(),
+        &url,
+        &serde_json::json!({}),
+        &CatalogAuth::None,
+        &base_creds(),
+        Duration::from_millis(200),
+    )
+    .await;
+
+    assert!(matches!(answer, Err(UdfError::User(m)) if m.contains("200ms")));
 }

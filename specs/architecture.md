@@ -89,6 +89,7 @@
 ## External Dependencies
 
 - Iceberg REST catalog (including Lakekeeper and Databricks-managed Iceberg): snapshot discovery and file list resolution for Iceberg tables | failure impact: no Iceberg query can be planned or executed
+- Lakekeeper management API (`/management/v1/action/batch-check`): the permission check of a virtual schema that sets `PERMISSION_CHECK = 'LAKEKEEPER'` | failure impact: every query of such a virtual schema is refused
 - Unity Catalog REST API (`/api/2.1/unity-catalog`, including Databricks): table listing, Delta log location, and temporary table credentials | failure impact: no Delta or Unity Parquet query can be planned or executed
 - AWS Glue Data Catalog: table listing and routing, Iceberg metadata location, and Hive Parquet partition lists | failure impact: no `GLUE` query can be planned or executed
 - Databricks (as Iceberg REST or Unity Catalog endpoint): access to Databricks-managed tables through either catalog kind | failure impact: Databricks queries fail on both routes, and non-Databricks catalogs are unaffected

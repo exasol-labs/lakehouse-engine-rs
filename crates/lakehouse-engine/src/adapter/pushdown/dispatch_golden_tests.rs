@@ -37,7 +37,7 @@ fn events_request(pushdown_req: Json) -> Json {
     })
 }
 
-fn grouped_request() -> Json {
+pub(super) fn grouped_request() -> Json {
     events_request(serde_json::json!({
         "aggregationType": "group_by",
         "groupBy": [{"type": "column", "name": "REGION"}],
@@ -79,7 +79,7 @@ fn group_by_fallback_request() -> Json {
     }))
 }
 
-fn lone_count_distinct_request() -> Json {
+pub(super) fn lone_count_distinct_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [agg_item("COUNT", Some("ID"), true)],
         "selectListDataTypes": [{"type": "decimal", "precision": 18, "scale": 0}],
@@ -99,7 +99,7 @@ fn multi_count_distinct_decline_request() -> Json {
     }))
 }
 
-fn row_scan_request() -> Json {
+pub(super) fn row_scan_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [
             {"type": "column", "name": "REGION"},
@@ -122,7 +122,7 @@ fn row_scan_projection() -> (Vec<ProjectionItem>, Vec<String>) {
     )
 }
 
-fn single_group_agg_request() -> Json {
+pub(super) fn single_group_agg_request() -> Json {
     events_request(serde_json::json!({
         "selectList": [agg_item("SUM", Some("AMOUNT"), false)],
         "selectListDataTypes": [{"type": "decimal", "precision": 36, "scale": 2}],
