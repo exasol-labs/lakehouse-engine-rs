@@ -1,6 +1,6 @@
 # Testing
 
-This file holds the rules for how this repository tests its behavior and how it keeps its test environments clean. Feature behavior lives in the feature specs under `specs/<domain>/<feature>/spec.md`. This file states no feature behavior. It states how tests prove that behavior, how the end-to-end (E2E) suites are built and run, and how operators clean up the test environments. The deploy and benchmark behavior lives in the `specs/deploy/` feature specs.
+This file holds the rules for how this repository tests its behavior and how it keeps its test environments clean. Feature behavior lives in the feature specs under `specs/<domain>/<feature>/spec.md`. This file states no feature behavior. It states how tests prove that behavior, how the end-to-end (E2E) suites are built and run, and how operators clean up the test environments. The benchmark harness and the AWS Lakekeeper benchmark catalog are not in the spec library. Their rules live in `bench/requirements.md`.
 
 ## Testing
 
