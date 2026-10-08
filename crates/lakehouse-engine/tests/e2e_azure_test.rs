@@ -11,8 +11,9 @@ mod common;
 use common::azure::{self, AzureContainer};
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, SYS_PASSWORD, VsProps,
-    create_schema_and_scripts, create_virtual_schema_with_password, exa_conn, explain_virtual_sql,
-    install_slc, parse_int, upload_so, value_to_string,
+    assert_decimal_orders_numerically, create_schema_and_scripts,
+    create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql, install_slc,
+    parse_int, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -22,7 +23,7 @@ use common::lakekeeper::{
 };
 use common::seed::{
     E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, SeedCatalogAuth, SeedStorage,
-    seed_events_table_with_auth,
+    decimal_18_0_values, seed_events_table_with_auth,
 };
 use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
@@ -318,6 +319,7 @@ fn azure_direct_events_batch(ids: &[i64]) -> RecordBatch {
         Field::new("EVENT_ID", DataType::Int64, false),
         Field::new("NAME", DataType::Utf8, true),
         Field::new("SCORE", DataType::Float64, true),
+        Field::new("AMOUNT", DataType::Decimal128(18, 0), true),
     ]));
     let names: Vec<String> = ids.iter().map(|id| format!("event-{id}")).collect();
     let scores: Vec<f64> = ids.iter().map(|&id| id as f64 * 1.5).collect();
@@ -327,6 +329,7 @@ fn azure_direct_events_batch(ids: &[i64]) -> RecordBatch {
             Arc::new(Int64Array::from(ids.to_vec())),
             Arc::new(StringArray::from(names)),
             Arc::new(Float64Array::from(scores)),
+            decimal_18_0_values().slice(0, ids.len()),
         ],
     )
     .expect("azure direct-storage events batch construction is infallible")
@@ -370,6 +373,7 @@ fn write_azure_parquet_fixture(
     });
 }
 
+/// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
 #[test]
 fn azure_static_and_vended_creds_end_to_end() {
     // Vended-arm assertions run first so a static-arm regression cannot mask the
@@ -563,6 +567,11 @@ fn direct_storage_over_adls_returns_correct_rows(conn: &mut ExaConn, fixture: &A
         "the two-file EVENTS directory must fold and return rows from both files: {ids:?}"
     );
     assert_eq!(names, vec!["event-3".to_string(), "event-4".to_string()]);
+    assert_eq!(
+        declared_type(conn, direct_vs, "EVENTS", "AMOUNT"),
+        "DECIMAL(18,0)"
+    );
+    assert_decimal_orders_numerically(conn, direct_vs, "EVENTS", "AMOUNT");
 
     let explained = explain_virtual_sql(conn, &format!("SELECT EVENT_ID FROM {direct_vs}.EVENTS"));
     assert!(

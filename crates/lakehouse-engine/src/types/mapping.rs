@@ -1,7 +1,7 @@
 //! Arrow-to-Exasol type mapping shared by `createVirtualSchema` and the scan's Arrow→Value
 //! conversion. Pure: no I/O.
 use arrow::datatypes::{DataType, TimeUnit};
-use delta_kernel::schema::{DataType as SparkType, PrimitiveType as SparkPrimitive};
+use delta_kernel::schema::{DataType as SparkType, PrimitiveType as SparkPrimitive, StructField};
 use lakehouse_catalog::ColumnSourceType;
 
 use super::hive_type::parse_hive_type;
@@ -155,12 +155,6 @@ pub fn needs_nested_json_rendering(dt: &DataType) -> bool {
 /// reads a type Exasol already accepted.
 pub(crate) fn exasol_representable_catalog_decimal(precision: u32, scale: u32) -> bool {
     (1..=EXASOL_DECIMAL_MAX_PRECISION).contains(&precision) && scale <= precision
-}
-
-#[derive(Debug, Clone, Copy)]
-struct CatalogDecimal {
-    precision: u32,
-    scale: u32,
 }
 
 fn catalog_decimal_to_exasol(precision: u32, scale: u32) -> String {
@@ -393,55 +387,35 @@ pub(crate) fn column_source_type_to_exasol(
 ) -> String {
     match source_type {
         ColumnSourceType::Iceberg(ty) => iceberg_type_to_exasol(ty, engine),
-        ColumnSourceType::Unity {
-            type_name,
-            precision,
-            scale,
-            ..
-        } => unity_type_name_to_exasol(
-            type_name,
-            CatalogDecimal {
-                precision: *precision,
-                scale: *scale,
-            },
+        ColumnSourceType::Unity { type_json } => spark_type_to_exasol(
+            unity_spark_field(type_json.as_deref()).map(|field| field.data_type),
             engine,
         ),
         ColumnSourceType::Parquet(tag) => arrow_to_exasol_type(&arrow_type_from_tag(tag)),
-        ColumnSourceType::Glue { hive_type } => hive_type_to_exasol(hive_type, engine),
+        ColumnSourceType::Glue { hive_type } => {
+            spark_type_to_exasol(parse_hive_type(hive_type), engine)
+        }
     }
 }
 
-/// Declares a Glue column as the Unity listing declares the same Spark type; a nested or
-/// unparseable type declares VARCHAR(2000000), so a column type never fails the listing.
-fn hive_type_to_exasol(hive_type: &str, engine: EngineTimestampSupport) -> String {
-    match parse_hive_type(hive_type) {
+pub(crate) fn unity_spark_field(type_json: Option<&str>) -> Result<StructField, String> {
+    let type_json = type_json.ok_or(
+        "Unity Catalog reports no type_json descriptor for it, so its Spark type is unknown",
+    )?;
+    serde_json::from_str(type_json).map_err(|error| {
+        format!("its type_json descriptor does not parse as a Spark StructField ({error})")
+    })
+}
+
+/// A nested or unparseable type declares VARCHAR(2000000), so a column type never fails the listing.
+fn spark_type_to_exasol(
+    spark_type: Result<SparkType, String>,
+    engine: EngineTimestampSupport,
+) -> String {
+    match spark_type {
         Ok(SparkType::Primitive(primitive)) => spark_primitive_to_exasol(&primitive, engine),
         _ => "VARCHAR(2000000)".to_string(),
     }
-}
-
-/// Unmappable Spark types fall back to VARCHAR(2000000) rather than failing enumeration.
-fn unity_type_name_to_exasol(
-    type_name: &str,
-    decimal: CatalogDecimal,
-    engine: EngineTimestampSupport,
-) -> String {
-    let primitive = match type_name {
-        // Unity reports the precision and scale beside the name, possibly outside Spark's domain.
-        "DECIMAL" => return catalog_decimal_to_exasol(decimal.precision, decimal.scale),
-        "BOOLEAN" => SparkPrimitive::Boolean,
-        "BYTE" => SparkPrimitive::Byte,
-        "SHORT" => SparkPrimitive::Short,
-        "INT" => SparkPrimitive::Integer,
-        "LONG" => SparkPrimitive::Long,
-        "FLOAT" => SparkPrimitive::Float,
-        "DOUBLE" => SparkPrimitive::Double,
-        "DATE" => SparkPrimitive::Date,
-        "TIMESTAMP" => SparkPrimitive::Timestamp,
-        "TIMESTAMP_NTZ" => SparkPrimitive::TimestampNtz,
-        _ => SparkPrimitive::String,
-    };
-    spark_primitive_to_exasol(&primitive, engine)
 }
 
 fn spark_primitive_to_exasol(primitive: &SparkPrimitive, engine: EngineTimestampSupport) -> String {

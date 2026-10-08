@@ -48,12 +48,7 @@ const STATIC_SECRET: &str = "minioadmin";
 fn raw_column(name: &str, type_json: Option<String>) -> CatalogColumn {
     CatalogColumn {
         name: name.to_string(),
-        source_type: ColumnSourceType::Unity {
-            type_name: "UNUSED".to_string(),
-            precision: 0,
-            scale: 0,
-            type_json,
-        },
+        source_type: ColumnSourceType::Unity { type_json },
     }
 }
 

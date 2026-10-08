@@ -13,7 +13,8 @@ mod common;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VsProps,
-    create_schema_and_scripts, create_virtual_schema_with_password, exa_conn, expected_join_rows,
+    assert_decimal_orders_numerically, assert_text_columns, create_schema_and_scripts,
+    create_virtual_schema_with_password, declared_type, exa_conn, expected_join_rows,
     explain_virtual_sql, fetch_join_rows, has_broadcast_join_block, has_two_scan_wrapper,
     install_slc, join_query, parse_int, upload_so,
 };
@@ -29,8 +30,10 @@ use common::lakekeeper_authz::{
     post_batch_check, provision_authz_fixture, whoami_id,
 };
 use common::seed::{
-    E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15,
-    SEED_TOTAL_ROWS, SeedCatalogAuth, seed_events_table_with_auth, seed_star_schema_with_auth,
+    DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
+    E2E_ALL_TYPES_TABLE, E2E_DIM_TABLE, E2E_FACT_TABLE, E2E_NAMESPACE, E2E_TABLE,
+    SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, SeedCatalogAuth, seed_all_types_with_auth,
+    seed_events_table_with_auth, seed_star_schema_with_auth,
 };
 use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
@@ -96,6 +99,13 @@ fn setup() {
                     .unwrap_or_else(|e| {
                         panic!("seed events into Lakekeeper warehouse '{warehouse}': {e:#}")
                     });
+                if warehouse == WAREHOUSE_STATIC {
+                    seed_all_types_with_auth(&host_catalog, warehouse, auth.clone())
+                        .await
+                        .unwrap_or_else(|e| {
+                            panic!("seed all_types into Lakekeeper warehouse '{warehouse}': {e:#}")
+                        });
+                }
                 if warehouse == WAREHOUSE_VENDED {
                     seed_star_schema_with_auth(&host_catalog, warehouse, auth)
                         .await
@@ -247,6 +257,35 @@ fn lakekeeper_static_creds_projection_filter_limit() {
         total, SEED_TOTAL_ROWS as i64,
         "the static warehouse must hold {SEED_TOTAL_ROWS} seeded rows, got {total}"
     );
+}
+
+/// Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
+#[test]
+fn lakekeeper_decimals_declare_their_precision_and_order_numerically() {
+    setup();
+    let mut conn = exa_conn();
+    for (column, declared) in [
+        ("C_DECIMAL_10_2", "DECIMAL(10,2)"),
+        ("C_DECIMAL_18_0", "DECIMAL(18,0)"),
+        ("C_DECIMAL_36_6", "DECIMAL(36,6)"),
+    ] {
+        assert_eq!(
+            declared_type(&mut conn, VS_STATIC, E2E_ALL_TYPES_TABLE, column),
+            declared
+        );
+    }
+    assert_text_columns(
+        &mut conn,
+        &format!(
+            "SELECT C_DECIMAL_10_2, C_DECIMAL_18_0, C_DECIMAL_36_6 FROM {VS_STATIC}.ALL_TYPES ORDER BY ID"
+        ),
+        &[
+            DECIMAL_10_2_VALUES_TEXT,
+            DECIMAL_18_0_VALUES_TEXT,
+            DECIMAL_36_6_VALUES_TEXT,
+        ],
+    );
+    assert_decimal_orders_numerically(&mut conn, VS_STATIC, E2E_ALL_TYPES_TABLE, "C_DECIMAL_18_0");
 }
 
 // With no static credential or store address to fall back on, rows can only come
