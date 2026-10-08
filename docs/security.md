@@ -73,25 +73,24 @@ Grant each table in Lakekeeper to the principal that `USER_MAPPING` produces for
 
 The adapter refuses a query when the request names no user, when the template fails to render, or when the id is empty or holds a whitespace or control character. A template that does not compile rejects create, refresh, and `SET`. The adapter trusts the template author and checks neither the uniqueness nor the owner of a principal. A template holds up to 100,000 characters. On Exasol 2025.1.16 a longer value is accepted by `SET`, but reading it from `EXA_ALL_VIRTUAL_SCHEMA_PROPERTIES` drops the session.
 
-### Coverage
+### What the check enforces
 
-The check covers every table of every pushdown shape, and a join side counts as a table. The `e2e_lakekeeper_test.rs` tests `permission_check_decides_every_single_table_shape` and `permission_check_refuses_a_join_unless_the_user_may_read_both_tables` show this live. A query with any unreadable table is refused whole, and the denial names each unreadable table and no readable one. Lakekeeper reports a missing table as denied, so the denial does not tell the two apart. Example denial for a join with no grant:
+A user can query a table only if Lakekeeper allows the mapped principal to read it. This holds for every query shape, including aggregates, filters, and joins. Each table in a join counts separately, so a join succeeds only when the user may read both tables.
+
+The adapter asks Lakekeeper once per query, before any data is read. If the user may not read one or more tables, the whole query is refused, and the error names each table the user may not read and no other. Lakekeeper reports a missing table as denied, so the error cannot tell a missing table from a forbidden one. Example error for a join without grants:
 
 ```text
 the Lakekeeper permission check refuses the query: Exasol user 'LK_PERM_JOINONE', mapped by 'USER_MAPPING' to the Lakekeeper principal 'oidc~lk.joinone@lakehouse.test', may not read e2e_lakehouse.fact_orders, e2e_lakehouse.dim_customer. Lakekeeper denies read_data on each, or the table does not exist. Only a Lakekeeper grant that names the principal 'oidc~lk.joinone@lakehouse.test' lets this user read a table
 ```
 
-Each query sends one batch-check, a single request to Lakekeeper's management API (`POST /management/v1/action/batch-check`) that asks whether the principal may read each table of the query. The request has a 30-second deadline (`BATCH_CHECK_DEADLINE`). A Lakekeeper outage or timeout therefore refuses every query of the virtual schema.
+If Lakekeeper is unreachable or does not answer within 30 seconds, every query on the virtual schema is refused.
 
-The table listing is not filtered. Any user who may query the virtual schema sees every table name, column name, and column type, including tables the user cannot read (`permission_check_lists_unreadable_tables_and_refuses_their_queries`). The query of such a table is refused.
+### What the check does not enforce
 
-### Trust model and limits
-
-The engine enforces the check, and the catalog only advises it. The check is stronger than no check and weaker than enforcement inside the catalog. Each limit has a consequence:
-
-- Storage credentials are the CONNECTION's, vended credentials included, and are not scoped per user (`scan_storage_for`). A defect in the adapter's check returns data instead of a refusal.
-- Enforcement rests on the Exasol privilege boundary. A user without the grant cannot obtain the plan (`permission_check_refuses_explain_virtual_without_a_grant`), and a reader cannot run a plan it captured (`the_reader_cannot_execute_the_pushdown_plan_it_captured`). The `EXECUTE` bypass above and the [Privilege model](#privilege-model) describe the grants that cross that boundary.
-- The virtual schema's owner, a user with `ALTER` on the virtual schema, and a user with `ALTER ANY VIRTUAL SCHEMA` can set `PERMISSION_CHECK` to an empty value or change `USER_MAPPING`. Either change turns the check off or changes the principal for every user of the virtual schema. A user with only `SELECT` on the virtual schema cannot change either property.
+- **Table listing.** Every user who may query the virtual schema sees all table names, column names, and column types, including those of tables the user cannot read. Querying such a table is refused.
+- **Storage access.** Data is read with the CONNECTION's storage credentials, including credentials that Lakekeeper vends, and these are not scoped to the querying user. The check is enforced by the adapter, not by the catalog or the storage layer.
+- **Users with script privileges.** A user with `EXECUTE` on the scan script bypasses the check, as described above. A user without that privilege cannot obtain a scan plan or run one captured by another user. The [Privilege model](#privilege-model) lists the grants that matter.
+- **Changing the settings.** The virtual schema's owner, a user with `ALTER` on the virtual schema, and a user with `ALTER ANY VIRTUAL SCHEMA` can set `PERMISSION_CHECK` to an empty value or change `USER_MAPPING`. Either change turns the check off, or changes the principal, for every user of the virtual schema. A user with only `SELECT` on the virtual schema cannot change either property.
 
 ### Out of scope
 
