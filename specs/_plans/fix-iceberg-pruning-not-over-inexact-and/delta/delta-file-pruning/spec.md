@@ -61,6 +61,6 @@ predicate stays applied above the scan as the sole source of row-level correctne
 
 * *GIVEN* a query whose WHERE clause is a `NOT` over a conjunction that dropped an untranslatable conjunct, or over a `BETWEEN` that dropped a bound
 * *WHEN* Exasol sends the corresponding `pushdown` request
-* *THEN* the reader SHALL hand the Delta library no predicate derived from that `NOT`, because negating a widened predicate would skip files that hold matching rows
+* *THEN* the reader MUST NOT hand the Delta library the negation of that partly translated child, because negating a widened predicate would skip files that hold matching rows
 * *AND* a `NOT` over a fully translated conjunction SHALL be negated and SHALL still prune
 <!-- /DELTA:NEW -->
