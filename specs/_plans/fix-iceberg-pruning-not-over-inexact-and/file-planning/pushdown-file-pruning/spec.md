@@ -83,10 +83,11 @@ the engine cannot apply.
 <!-- DELTA:NEW -->
 ### Scenario: A literal the column type cannot hold exactly imposes no constraint
 
-* *GIVEN* an Iceberg `float` column compared against `0.7`, which no `float` value equals, and a microsecond `timestamp` or `timestamptz` column compared against a literal with seven fraction digits
+* *GIVEN* an Iceberg `float` column compared against `0.7`, which no `float` value equals, and a microsecond `timestamp` or `timestamptz` column compared against a literal with seven fraction digits, including a `timestamptz` literal with the offset `+02:30` or `Z`
 * *WHEN* the adapter translates each comparison, alone or under `NOT`
 * *THEN* none of these comparisons SHALL impose a pruning constraint
 * *AND* a `float` comparison against `0.5`, and a nanosecond `timestamp` or `timestamptz` comparison against a literal with nine fraction digits, SHALL still translate at the column's own precision and prune
+* *AND* a `timestamptz` literal with an offset that the column's unit holds exactly, such as `2024-03-01 12:30:00.123456+02:30`, SHALL translate to its UTC instant, `2024-03-01 10:00:00.123456` UTC
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
