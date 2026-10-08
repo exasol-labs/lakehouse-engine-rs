@@ -83,7 +83,7 @@ Refuses a query over a table that the querying Exasol user holds no Lakekeeper g
 * *GIVEN* a virtual schema with the check on and a pushdown request over one or more tables
 * *WHEN* Lakekeeper answers `allowed: false` for a checked table, as it does for a denied or a missing table
 * *THEN* the adapter SHALL refuse the whole query, and MUST NOT read any table's metadata or return any SQL
-* *AND* the error SHALL name the Exasol user, the principal, and every denied table, and SHALL state that only a Lakekeeper grant naming that principal authorizes the user
+* *AND* the error SHALL name the Exasol user, the principal, and every denied table, MUST NOT name a table that Lakekeeper allows, and SHALL state that only a Lakekeeper grant naming that principal authorizes the user
 
 ### Scenario: A failed batch-check refuses the query with an error that names the cause
 
@@ -100,3 +100,10 @@ Refuses a query over a table that the querying Exasol user holds no Lakekeeper g
 * *WHEN* each user runs the same `SELECT` over the table
 * *THEN* the user with the grant SHALL receive the table's rows, and each other user SHALL receive the denial of "A denied table refuses the whole query", although the user with the grant ran the identical statement first
 * *AND* the stored `USER_MAPPING` SHALL be exactly the template that the operator set
+
+### Scenario: A table that the user cannot read stays listed and is refused at query time
+
+* *GIVEN* a virtual schema with the check on, and a user that may query it whose mapped principal holds no grant on one of its tables
+* *WHEN* the user reads the virtual schema's table and column listing and queries that table, once after the virtual schema is created and once after it is refreshed
+* *THEN* the listing SHALL show the user that table and its columns
+* *AND* the user's query SHALL receive the denial of "A denied table refuses the whole query"

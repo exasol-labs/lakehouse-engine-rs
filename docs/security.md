@@ -40,6 +40,63 @@ With `PERMISSION_CHECK = 'LAKEKEEPER'`, the adapter maps the querying Exasol use
 
 A user with `EXECUTE ON SCRIPT` on `LAKEHOUSE_SCAN`, or `EXECUTE ANY SCRIPT`, bypasses this check. That user submits a scan plan directly, so the adapter never plans it and Lakekeeper is never asked. See [Plan visibility versus plan execution](#plan-visibility-versus-plan-execution). Grant those privileges only to users who may read every table the CONNECTION can read.
 
+### Setup
+
+The check needs the Iceberg REST catalog kind, a catalog URI that ends in `/catalog` (a gateway that rewrites paths is not supported), and a Lakekeeper server with an authorization backend such as OpenFGA. Every other catalog kind fails with `PERMISSION_CHECK = 'LAKEKEEPER' requires the Iceberg REST catalog kind`.
+
+Grant the CONNECTION's identity `manage_grants` on the warehouse or on the namespace. Lakekeeper answers a check for another identity only when the caller holds `can_read_assignments` on each checked table. Without that grant, every query fails with 403 `CannotInspectPermissions`. The same grant lets the identity manage grants, so the CONNECTION's client secret is a grant-administration credential.
+
+```sql
+CREATE VIRTUAL SCHEMA MY_LAKEHOUSE
+USING LHVS.LAKEHOUSE_ADAPTER WITH
+  CATALOG_CONNECTION = 'LAKEHOUSE_CATALOG_CREDS'
+  NAMESPACE          = 'default'
+  PERMISSION_CHECK   = 'LAKEKEEPER'
+  USER_MAPPING       = 'oidc~{{ user|lower }}@corp.net';
+```
+
+To turn the check on for an existing virtual schema, set `USER_MAPPING` first, because the adapter refuses `PERMISSION_CHECK = 'LAKEKEEPER'` without it:
+
+```sql
+ALTER VIRTUAL SCHEMA MY_LAKEHOUSE SET USER_MAPPING = 'oidc~{{ user|lower }}@corp.net';
+ALTER VIRTUAL SCHEMA MY_LAKEHOUSE SET PERMISSION_CHECK = 'LAKEKEEPER';
+```
+
+Grant each table in Lakekeeper to the principal that `USER_MAPPING` produces for the Exasol user. Lakekeeper accepts a grant to a principal that has never logged in. A Lakekeeper server started with `LAKEKEEPER__OPENID_SUBJECT_CLAIM=preferred_username` builds the Lakekeeper user id from the token's `preferred_username` claim, so a mapping can reproduce a user name instead of an opaque subject.
+
+### USER_MAPPING
+
+`USER_MAPPING` is a Jinja-syntax template with one variable, `user`. The adapter renders it with MiniJinja, so the template can use MiniJinja's built-in filters and tests, such as `lower`, `replace`, and `startingwith`. Exasol reports an undelimited user name in uppercase, so `ALICE` is the value for `alice`. The trimmed output is the Lakekeeper user id. For an OIDC login that id is `oidc~<subject>`, where the subject comes from the token's `oid` claim, then its `sub` claim. The adapter assumes no id format.
+
+- `oidc~{{ user|lower|replace("_", ".") }}@corp.net` maps `ALICE_COOPER` to `oidc~alice.cooper@corp.net`.
+- `oidc~{% if user is startingwith("BI_") %}svc-reporting{% else %}{{ user|lower }}{% endif %}@corp.net` maps `BI_TABLEAU` and `BI_POWERBI` to the one principal `oidc~svc-reporting@corp.net`.
+
+The adapter refuses a query when the request names no user, when the template fails to render, or when the id is empty or holds a whitespace or control character. A template that does not compile rejects create, refresh, and `SET`. The adapter trusts the template author and checks neither the uniqueness nor the owner of a principal. A template holds up to 100,000 characters. On Exasol 2025.1.16 a longer value is accepted by `SET`, but reading it from `EXA_ALL_VIRTUAL_SCHEMA_PROPERTIES` drops the session.
+
+### Coverage
+
+The check covers every table of every pushdown shape, and a join side counts as a table. The `e2e_lakekeeper_test.rs` tests `permission_check_decides_every_single_table_shape` and `permission_check_refuses_a_join_unless_the_user_may_read_both_tables` show this live. A query with any unreadable table is refused whole, and the denial names each unreadable table and no readable one. Lakekeeper reports a missing table as denied, so the denial does not tell the two apart. Example denial for a join with no grant:
+
+```text
+the Lakekeeper permission check refuses the query: Exasol user 'LK_PERM_JOINONE', mapped by 'USER_MAPPING' to the Lakekeeper principal 'oidc~lk.joinone@lakehouse.test', may not read e2e_lakehouse.fact_orders, e2e_lakehouse.dim_customer. Lakekeeper denies read_data on each, or the table does not exist. Only a Lakekeeper grant that names the principal 'oidc~lk.joinone@lakehouse.test' lets this user read a table
+```
+
+Each query sends one batch-check, a single request to Lakekeeper's management API (`POST /management/v1/action/batch-check`) that asks whether the principal may read each table of the query. The request has a 30-second deadline (`BATCH_CHECK_DEADLINE`). A Lakekeeper outage or timeout therefore refuses every query of the virtual schema.
+
+The table listing is not filtered. Any user who may query the virtual schema sees every table name, column name, and column type, including tables the user cannot read (`permission_check_lists_unreadable_tables_and_refuses_their_queries`). The query of such a table is refused.
+
+### Trust model and limits
+
+The engine enforces the check, and the catalog only advises it. The check is stronger than no check and weaker than enforcement inside the catalog. Each limit has a consequence:
+
+- Storage credentials are the CONNECTION's, vended credentials included, and are not scoped per user (`scan_storage_for`). A defect in the adapter's check returns data instead of a refusal.
+- Enforcement rests on the Exasol privilege boundary. A user without the grant cannot obtain the plan (`permission_check_refuses_explain_virtual_without_a_grant`), and a reader cannot run a plan it captured (`the_reader_cannot_execute_the_pushdown_plan_it_captured`). The `EXECUTE` bypass above and the [Privilege model](#privilege-model) describe the grants that cross that boundary.
+- The virtual schema's owner, a user with `ALTER` on the virtual schema, and a user with `ALTER ANY VIRTUAL SCHEMA` can set `PERMISSION_CHECK` to an empty value or change `USER_MAPPING`. Either change turns the check off or changes the principal for every user of the virtual schema. A user with only `SELECT` on the virtual schema cannot change either property.
+
+### Out of scope
+
+The check does not provide row-level or column-level authorization, which need a policy engine. It does not cover other catalog kinds, and it does not scope storage credentials per user.
+
 ## Sealed vended-credential envelope (#378)
 
 A vended credential has no CONNECTION name to reference. It travels as AES-256-GCM ciphertext (HKDF-SHA256 key from the CONNECTION password, fresh 96-bit nonce). Vending without key material is refused at plan time.

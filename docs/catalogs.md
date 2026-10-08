@@ -230,6 +230,8 @@ If the catalog or its storage uses plain HTTP, add `ALLOW_HTTP = 'true'`. If not
 - **Base path.** Lakekeeper serves its REST API under the `/catalog` base path, so `TO` must include it, for example `http://lakekeeper:8181/catalog`. The adapter negotiates this base path automatically from the `GET /v1/config?warehouse=` response of the catalog. No other configuration is necessary.
 - **Warehouse is a name, not a path.** Lakekeeper supports many warehouses. `warehouse` is the warehouse **name** that you register with the management API of Lakekeeper, for example `lakehouse_static`. It is not an `s3://` location. The `warehouse` field of Glue uses the same shape with an account id.
 
+A virtual schema over Lakekeeper can also refuse queries per Exasol user with `PERMISSION_CHECK = 'LAKEKEEPER'`. See [Lakekeeper permission check](security.md#lakekeeper-permission-check-415) for setup and its limits.
+
 The adapter supports both credential modes below. They differ only in the Lakekeeper warehouse and the CONNECTION fields that you use.
 
 **Static credentials** (`sts-enabled: false` on the Lakekeeper warehouse). The adapter reads SeaweedFS directly with the static key pair, like any other backend:

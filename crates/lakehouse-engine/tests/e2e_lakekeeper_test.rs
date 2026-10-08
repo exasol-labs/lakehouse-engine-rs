@@ -15,7 +15,7 @@ use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VsProps,
     create_schema_and_scripts, create_virtual_schema_with_password, exa_conn, expected_join_rows,
     explain_virtual_sql, fetch_join_rows, has_broadcast_join_block, has_two_scan_wrapper,
-    install_slc, join_query, parse_int, upload_so,
+    install_slc, join_query, parse_int, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -1292,20 +1292,24 @@ fn permission_check_refuses_when_the_connection_cannot_inspect_permissions() {
 #[test]
 fn permission_check_refuses_a_join_unless_the_user_may_read_both_tables() {
     permission_setup();
-    grant_only(JOIN_ONE_USER, &[select_table(E2E_FACT_TABLE)]);
     grant_only(
         JOIN_BOTH_USER,
         &[select_table(E2E_FACT_TABLE), select_table(E2E_DIM_TABLE)],
     );
+    let fact = qualified(E2E_FACT_TABLE);
+    let dim = qualified(E2E_DIM_TABLE);
 
     for vs in [VS_PERMISSION, VS_PERMISSION_NO_JOIN] {
         let query = join_query(vs);
-        assert_refused(
-            JOIN_ONE_USER,
-            &query,
-            &[&qualified(E2E_DIM_TABLE)],
-            &[&qualified(E2E_FACT_TABLE)],
-        );
+        let one_sided: [(&[Grant], &[&str], &[&str]); 3] = [
+            (&[select_table(E2E_FACT_TABLE)], &[&dim], &[&fact]),
+            (&[select_table(E2E_DIM_TABLE)], &[&fact], &[&dim]),
+            (&[], &[&fact, &dim], &[]),
+        ];
+        for (grants, denied, allowed) in one_sided {
+            grant_only(JOIN_ONE_USER, grants);
+            assert_refused(JOIN_ONE_USER, &query, denied, allowed);
+        }
 
         let mut both = connect_as(JOIN_BOTH_USER);
         let pushed = explain_virtual_sql(&mut both, &query);
@@ -1415,18 +1419,118 @@ fn permission_check_refuses_explain_virtual_without_a_grant() {
     assert!(message.contains(&qualified(E2E_TABLE)), "{message}");
 }
 
+fn sorted_rows(conn: &mut ExaConn, sql: &str) -> Vec<Vec<String>> {
+    let columns = conn.query_columns(sql);
+    let mut rows: Vec<Vec<String>> = (0..columns.first().map_or(0, Vec::len))
+        .map(|row| columns.iter().map(|c| value_to_string(&c[row])).collect())
+        .collect();
+    rows.sort();
+    rows
+}
+
 /// Scenario: One batch-check per query decides every table before any table is read
+/// Scenario: A denied table refuses the whole query
 #[test]
-fn permission_check_gates_an_aggregate_query() {
+fn permission_check_decides_every_single_table_shape() {
     permission_setup();
-    let query = format!(
-        "SELECT COUNT(*), SUM(id) FROM {VS_PERMISSION}.{}",
-        E2E_TABLE.to_uppercase()
-    );
     grant_only(ALLOWED_USER, &[select_table(E2E_TABLE)]);
+    grant_only(DENIED_USER, &[select_table(TABLE_ALPHA)]);
+    let cases: [(&str, &[&str], &[&str], bool); 7] = [
+        (
+            "SELECT COUNT(*), SUM(id) FROM {table}",
+            &["\"aggregates\""],
+            &["group_keys"],
+            true,
+        ),
+        (
+            "SELECT event_date, COUNT(*) FROM {table} GROUP BY event_date",
+            &["group_keys", "PARTIAL_"],
+            &[],
+            true,
+        ),
+        (
+            "SELECT COUNT(DISTINCT name) FROM {table}",
+            &["\"distinct\":true"],
+            &["LHS_T0"],
+            true,
+        ),
+        (
+            "SELECT id, score FROM {table} ORDER BY score DESC, id LIMIT 3",
+            &["\"order_by\""],
+            &[],
+            true,
+        ),
+        (
+            "SELECT COUNT(DISTINCT name), COUNT(DISTINCT event_date) FROM {table}",
+            &["LHS_T0"],
+            &[],
+            true,
+        ),
+        (
+            "SELECT event_date FROM {table} GROUP BY event_date ORDER BY SUM(score)",
+            &["LHS_T0"],
+            &[],
+            true,
+        ),
+        (
+            "SELECT id FROM {table} WHERE id > 1000",
+            &[],
+            &["LAKEHOUSE_SCAN"],
+            false,
+        ),
+    ];
 
-    let columns = connect_as(ALLOWED_USER).query_columns(&query);
+    let table_name = E2E_TABLE.to_uppercase();
+    for (template, pushdown_has, pushdown_lacks, returns_rows) in cases {
+        let query = template.replace("{table}", &format!("{VS_PERMISSION}.{table_name}"));
+        let mut allowed = connect_as(ALLOWED_USER);
+        let pushed = explain_virtual_sql(&mut allowed, &query);
+        for marker in pushdown_has {
+            assert!(pushed.contains(marker), "{query}: needs {marker}: {pushed}");
+        }
+        for marker in pushdown_lacks {
+            assert!(!pushed.contains(marker), "{query}: has {marker}: {pushed}");
+        }
 
-    assert_eq!(parse_int(&columns[0][0]), SEED_TOTAL_ROWS as i64);
-    assert_refused(DENIED_USER, &query, &[&qualified(E2E_TABLE)], &[]);
+        let static_query = template.replace("{table}", &format!("{VS_STATIC}.{table_name}"));
+        let expected = sorted_rows(&mut exa_conn(), &static_query);
+        assert_eq!(!expected.is_empty(), returns_rows, "{query}");
+        assert_eq!(sorted_rows(&mut allowed, &query), expected, "{query}");
+        assert_refused(DENIED_USER, &query, &[&qualified(E2E_TABLE)], &[]);
+    }
+}
+
+fn assert_events_listed_and_refused(phase: &str) {
+    let table_name = E2E_TABLE.to_uppercase();
+    let column_listing_sql = format!(
+        "SELECT COLUMN_NAME, COLUMN_TYPE FROM SYS.EXA_ALL_COLUMNS \
+         WHERE COLUMN_SCHEMA = '{VS_PERMISSION}' AND COLUMN_TABLE = '{table_name}'"
+    );
+    let mut denied = connect_as(DENIED_USER);
+    let listed = enumerated_table_names(&mut denied, VS_PERMISSION);
+    assert!(listed.contains(&table_name), "{phase}: {listed:?}");
+    let rows = sorted_rows(&mut denied, &column_listing_sql);
+    assert!(!rows.is_empty(), "{phase}: the columns stay listed");
+    assert_eq!(
+        rows,
+        sorted_rows(&mut exa_conn(), &column_listing_sql),
+        "{phase}"
+    );
+    assert_refused(
+        DENIED_USER,
+        &events_query(VS_PERMISSION),
+        &[&qualified(E2E_TABLE)],
+        &[],
+    );
+}
+
+/// Scenario: A table that the user cannot read stays listed and is refused at query time
+#[test]
+fn permission_check_lists_unreadable_tables_and_refuses_their_queries() {
+    permission_setup();
+    grant_only(DENIED_USER, &[select_table(TABLE_ALPHA)]);
+
+    assert_events_listed_and_refused("after create");
+    exa_conn().execute(&format!("ALTER VIRTUAL SCHEMA {VS_PERMISSION} REFRESH"));
+    assert_events_listed_and_refused("after refresh");
 }
