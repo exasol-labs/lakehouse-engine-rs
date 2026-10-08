@@ -832,15 +832,7 @@ fn column_source_type_maps_to_exasol_in_one_home() {
         "DECIMAL(20,0)"
     );
     assert_eq!(
-        column_source_type_to_exasol(
-            &ColumnSourceType::Unity {
-                type_name: "LONG".to_string(),
-                precision: 0,
-                scale: 0,
-                type_json: None,
-            },
-            EngineTimestampSupport::MillisecondOnly,
-        ),
+        column_source_type_to_exasol(&unity("long"), EngineTimestampSupport::MillisecondOnly,),
         "DECIMAL(20,0)"
     );
 }
@@ -943,101 +935,77 @@ fn refused_arrow_types_fall_back_to_the_utf8_tag() {
     }
 }
 
+fn unity(spark_type: &str) -> ColumnSourceType {
+    ColumnSourceType::Unity {
+        type_json: Some(
+            json!({"name": "c", "type": spark_type, "nullable": true, "metadata": {}}).to_string(),
+        ),
+    }
+}
+
 #[test]
-fn unity_spark_types_map_to_exasol() {
+fn unity_columns_declare_their_type_json() {
     let cases = [
-        ("BOOLEAN", 0, 0, "BOOLEAN"),
-        ("BYTE", 0, 0, "DECIMAL(3,0)"),
-        ("SHORT", 0, 0, "DECIMAL(5,0)"),
-        ("INT", 0, 0, "DECIMAL(10,0)"),
-        ("LONG", 0, 0, "DECIMAL(20,0)"),
-        ("FLOAT", 0, 0, "DOUBLE PRECISION"),
-        ("DOUBLE", 0, 0, "DOUBLE PRECISION"),
-        ("STRING", 0, 0, "VARCHAR(2000000)"),
-        ("DATE", 0, 0, "DATE"),
-        ("TIMESTAMP", 0, 0, "TIMESTAMP"),
-        ("TIMESTAMP_NTZ", 0, 0, "TIMESTAMP"),
-        ("DECIMAL", 10, 2, "DECIMAL(10,2)"),
-        ("DECIMAL", 36, 36, "DECIMAL(36,36)"),
+        ("boolean", "BOOLEAN"),
+        ("byte", "DECIMAL(3,0)"),
+        ("short", "DECIMAL(5,0)"),
+        ("integer", "DECIMAL(10,0)"),
+        ("long", "DECIMAL(20,0)"),
+        ("float", "DOUBLE PRECISION"),
+        ("double", "DOUBLE PRECISION"),
+        ("string", "VARCHAR(2000000)"),
+        ("date", "DATE"),
+        ("timestamp", "TIMESTAMP"),
+        ("timestamp_ntz", "TIMESTAMP"),
+        ("decimal(10,2)", "DECIMAL(10,2)"),
+        ("decimal(18,0)", "DECIMAL(18,0)"),
+        ("decimal(36,36)", "DECIMAL(36,36)"),
     ];
-    for (type_name, precision, scale, expected) in cases {
-        let source = ColumnSourceType::Unity {
-            type_name: type_name.to_string(),
-            precision,
-            scale,
-            type_json: None,
-        };
+    for (spark_type, expected) in cases {
         assert_eq!(
-            column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly),
+            column_source_type_to_exasol(
+                &unity(spark_type),
+                EngineTimestampSupport::MillisecondOnly
+            ),
             expected,
-            "type_name={type_name} precision={precision} scale={scale}"
+            "type_json {spark_type}"
         );
     }
 }
 
 #[test]
-fn incompatible_unity_types_declared_varchar() {
-    let ts_precision = EngineTimestampSupport::MillisecondOnly;
-    for type_name in ["ARRAY", "MAP", "STRUCT", "BINARY", "INTERVAL", "VARIANT"] {
-        let source = ColumnSourceType::Unity {
-            type_name: type_name.to_string(),
-            precision: 0,
-            scale: 0,
-            type_json: None,
-        };
+fn unity_types_exasol_cannot_hold_or_unreadable_type_json_declare_varchar() {
+    let unreadable = [
+        ColumnSourceType::Unity { type_json: None },
+        ColumnSourceType::Unity {
+            type_json: Some("{}".to_string()),
+        },
+    ];
+    let spark_types = [
+        "binary",
+        "variant",
+        "interval day to second",
+        "geometry(4326)",
+        "decimal(38,10)",
+        "decimal(18,37)",
+        "decimal(0,0)",
+        "decimal(5,10)",
+    ];
+    for source in unreadable.into_iter().chain(spark_types.map(unity)) {
         assert_eq!(
-            column_source_type_to_exasol(&source, ts_precision),
+            column_source_type_to_exasol(&source, EngineTimestampSupport::MillisecondOnly),
             "VARCHAR(2000000)",
-            "type_name={type_name}"
+            "{source:?}"
         );
     }
-
-    assert_eq!(
-        column_source_type_to_exasol(
-            &ColumnSourceType::Unity {
-                type_name: "DECIMAL".to_string(),
-                precision: 38,
-                scale: 10,
-                type_json: None,
-            },
-            ts_precision
+    let array = ColumnSourceType::Unity {
+        type_json: Some(
+            json!({"name": "c", "type": {"type": "array", "elementType": "integer", "containsNull": true}, "nullable": true, "metadata": {}})
+                .to_string(),
         ),
-        "VARCHAR(2000000)"
-    );
+    };
     assert_eq!(
-        column_source_type_to_exasol(
-            &ColumnSourceType::Unity {
-                type_name: "DECIMAL".to_string(),
-                precision: 18,
-                scale: 37,
-                type_json: None,
-            },
-            ts_precision
-        ),
-        "VARCHAR(2000000)"
-    );
-    assert_eq!(
-        column_source_type_to_exasol(
-            &ColumnSourceType::Unity {
-                type_name: "DECIMAL".to_string(),
-                precision: 0,
-                scale: 0,
-                type_json: None,
-            },
-            ts_precision
-        ),
-        "VARCHAR(2000000)"
-    );
-    assert_eq!(
-        column_source_type_to_exasol(
-            &ColumnSourceType::Unity {
-                type_name: "DECIMAL".to_string(),
-                precision: 5,
-                scale: 10,
-                type_json: None,
-            },
-            ts_precision
-        ),
+        column_source_type_to_exasol(&array, EngineTimestampSupport::MillisecondOnly),
         "VARCHAR(2000000)"
     );
 }
@@ -1063,12 +1031,7 @@ fn glue_columns_declare_the_spark_listing_type() {
         );
         assert_eq!(declared, expected, "hive type {hive_type:?}");
     }
-    let unity_timestamp = ColumnSourceType::Unity {
-        type_name: "TIMESTAMP_NTZ".to_string(),
-        precision: 0,
-        scale: 0,
-        type_json: None,
-    };
+    let unity_timestamp = unity("timestamp_ntz");
     for engine in [
         EngineTimestampSupport::MillisecondOnly,
         EngineTimestampSupport::DeclaredPrecision,
@@ -1104,12 +1067,7 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
             EngineTimestampSupport::MillisecondOnly,
         );
         let unity_result = column_source_type_to_exasol(
-            &ColumnSourceType::Unity {
-                type_name: "DECIMAL".to_string(),
-                precision,
-                scale,
-                type_json: None,
-            },
+            &unity(&format!("decimal({precision},{scale})")),
             EngineTimestampSupport::MillisecondOnly,
         );
         assert_eq!(
@@ -1266,28 +1224,12 @@ fn timestamp_declaration_is_version_gated_for_both_catalog_kinds() {
             "iceberg timestamp on {engine:?}"
         );
         assert_eq!(
-            column_source_type_to_exasol(
-                &ColumnSourceType::Unity {
-                    type_name: "TIMESTAMP".to_string(),
-                    precision: 0,
-                    scale: 0,
-                    type_json: None,
-                },
-                engine,
-            ),
+            column_source_type_to_exasol(&unity("timestamp"), engine,),
             expected,
             "delta TIMESTAMP on {engine:?}"
         );
         assert_eq!(
-            column_source_type_to_exasol(
-                &ColumnSourceType::Unity {
-                    type_name: "TIMESTAMP_NTZ".to_string(),
-                    precision: 0,
-                    scale: 0,
-                    type_json: None,
-                },
-                engine,
-            ),
+            column_source_type_to_exasol(&unity("timestamp_ntz"), engine,),
             expected,
             "delta TIMESTAMP_NTZ on {engine:?}"
         );

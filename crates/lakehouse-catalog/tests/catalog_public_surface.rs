@@ -128,9 +128,6 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
     let column = CatalogColumn {
         name: "c".into(),
         source_type: ColumnSourceType::Unity {
-            type_name: "int".into(),
-            precision: 0,
-            scale: 0,
             type_json: Some("{\"type\":\"integer\"}".into()),
         },
     };

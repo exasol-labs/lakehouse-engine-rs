@@ -6,9 +6,10 @@ mod common;
 
 use common::cloud_fixture::panic_message;
 use common::e2e_harness::{
-    SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_values_refused, assert_text_columns,
-    assert_type_matrix, create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql,
-    install_slc, int_column, pairs, parse_int, query_error, reads, refuses,
+    SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_values_refused,
+    assert_decimal_orders_numerically, assert_text_columns, assert_type_matrix,
+    create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql, install_slc,
+    int_column, pairs, parse_int, query_error, reads, refuses,
     try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
@@ -22,8 +23,9 @@ use common::glue::{
 };
 use common::seed::{
     ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
-    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT,
-    INT16_VALUES_TEXT, INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
+    DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
+    FLOAT32_VALUES_TEXT, INT_LIST_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
+    INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIMESTAMP_VALUES_TEXT,
 };
 use common::stack::{
     CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
@@ -493,7 +495,7 @@ fn check_partition_predicate_reduces_the_scan_file_list(_run: &GlueRun, conn: &m
     assert_eq!(int_column(&limited[0]), [5]);
 }
 
-/// Scenario: Every Hive type declares and returns its mapped value on a Glue Parquet table
+/// Scenario: The listing declares each Glue column through the Spark listing mapping
 fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: &mut ExaConn) {
     let timestamp = expected_timestamp_precision(conn).declared_column_type;
     assert_type_matrix(
@@ -531,6 +533,8 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
             ),
             reads("H_CHAR", VARCHAR_JSON, [Some("abcde"), Some("fghij"), None]),
             reads("H_DECIMAL_10_2", "DECIMAL(10,2)", DECIMAL_10_2_VALUES_TEXT),
+            reads("H_DECIMAL_18_0", "DECIMAL(18,0)", DECIMAL_18_0_VALUES_TEXT),
+            reads("H_DECIMAL_36_6", "DECIMAL(36,6)", DECIMAL_36_6_VALUES_TEXT),
             reads(
                 "H_DECIMAL",
                 "DECIMAL(10,0)",
@@ -584,6 +588,7 @@ fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: 
             refuses("H_EMPTY_TYPE", VARCHAR_JSON, &["Hive type ''"]),
         ],
     );
+    assert_decimal_orders_numerically(conn, VS, ALL_TYPES, "H_DECIMAL_18_0");
     assert_binary_values_refused(conn, VS, BINARY_VALUES, "Invalid UTF8 sequence");
 }
 

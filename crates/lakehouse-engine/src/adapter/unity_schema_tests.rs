@@ -149,11 +149,11 @@ fn create_vs_over(mock: &MockUnityCatalog) -> Result<Json, UdfError> {
 }
 
 fn long_col(name: &str) -> Json {
-    json!({ "name": name, "type_name": "LONG" })
+    json!({ "name": name, "type_name": "LONG", "type_json": r#"{"name":"c","type":"long","nullable":true,"metadata":{}}"# })
 }
 
 fn string_col(name: &str) -> Json {
-    json!({ "name": name, "type_name": "STRING" })
+    json!({ "name": name, "type_name": "STRING", "type_json": r#"{"name":"c","type":"string","nullable":true,"metadata":{}}"# })
 }
 
 fn table_entry(name: &str, columns: Vec<Json>) -> Json {

@@ -23,8 +23,8 @@ fn orders_ident() -> CatalogTableIdent {
 fn tables_page_body() -> String {
     r#"{"tables":[
         {"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"uuid-1","columns":[
-            {"name":"id","type_name":"LONG","type_precision":0,"type_scale":0,"position":0},
-            {"name":"amount","type_name":"DECIMAL","type_precision":10,"type_scale":2,"position":1}
+            {"name":"id","type_name":"LONG","type_text":"bigint","type_precision":0,"type_scale":0,"position":0},
+            {"name":"amount","type_name":"DECIMAL","type_text":"decimal(10,2)","type_json":"{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}","type_precision":0,"type_scale":0,"position":1}
         ]},
         {"name":"orders_summary","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders_summary","table_type":"VIEW","data_source_format":null,"columns":[
             {"name":"total","type_name":"DOUBLE"}
@@ -36,7 +36,7 @@ fn tables_page_body() -> String {
 fn single_table_body() -> String {
     r#"{"name":"orders","catalog_name":"cat","schema_name":"sch","full_name":"cat.sch.orders","table_type":"MANAGED","data_source_format":"DELTA","storage_location":"s3://bucket/orders","table_id":"uuid-1","columns":[
         {"name":"id","type_name":"LONG","partition_index":0},
-        {"name":"amount","type_name":"DECIMAL","type_precision":10,"type_scale":2}
+        {"name":"amount","type_name":"DECIMAL","type_text":"decimal(10,2)","type_json":"{\"name\":\"amount\",\"type\":\"decimal(10,2)\",\"nullable\":true,\"metadata\":{}}"}
     ]}"#
     .to_string()
 }
@@ -86,10 +86,10 @@ async fn lists_tables_in_catalog_schema() {
     assert_eq!(
         orders.columns[1].source_type,
         ColumnSourceType::Unity {
-            type_name: "DECIMAL".to_string(),
-            precision: 10,
-            scale: 2,
-            type_json: None,
+            type_json: Some(
+                r#"{"name":"amount","type":"decimal(10,2)","nullable":true,"metadata":{}}"#
+                    .to_string()
+            ),
         }
     );
 
@@ -236,6 +236,15 @@ async fn loads_table_metadata_with_columns() {
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>(),
         vec!["id", "amount"]
+    );
+    assert_eq!(
+        table.columns[1].source_type,
+        ColumnSourceType::Unity {
+            type_json: Some(
+                r#"{"name":"amount","type":"decimal(10,2)","nullable":true,"metadata":{}}"#
+                    .to_string()
+            ),
+        }
     );
 
     let requests = server.requests();

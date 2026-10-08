@@ -5,10 +5,10 @@
 mod common;
 
 use common::e2e_harness::{
-    VARCHAR_JSON, VsProps, assert_type_matrix, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql, install_slc,
-    local_stack_storage, nullable_text, parse_int, parse_numeric, reads, refuses,
-    try_create_virtual_schema_with_password, upload_so, value_to_string,
+    VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_type_matrix,
+    create_schema_and_scripts, create_virtual_schema_with_password, declared_type, exa_conn,
+    explain_virtual_sql, install_slc, local_stack_storage, nullable_text, parse_int, parse_numeric,
+    reads, refuses, try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{
@@ -16,10 +16,12 @@ use common::raw_parquet::{
 };
 use common::seed::{
     ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_IDS_TEXT, ALL_TYPES_TIME_MICROS,
-    DECIMAL_10_2_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT8_VALUES_TEXT,
-    INT16_VALUES_TEXT, INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIME64_VALUES_TEXT, all_types_ids,
-    binary_values, decimal_38_10_values, fixed_16_values, float32_values, int8_values,
-    int16_values, int32_values, struct_binary_values, text_values, time64_values,
+    DECIMAL_10_2_VALUES_TEXT, DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT,
+    DECIMAL_38_10_VALUES_TEXT, FLOAT32_VALUES_TEXT, INT8_VALUES_TEXT, INT16_VALUES_TEXT,
+    INT32_VALUES_TEXT, TEXT_VALUES_TEXT, TIME64_VALUES_TEXT, all_types_ids, binary_values,
+    decimal_18_0_values, decimal_36_6_values, decimal_38_10_values, fixed_16_values,
+    float32_values, int8_values, int16_values, int32_values, struct_binary_values, text_values,
+    time64_values,
 };
 use common::stack::{
     CatalogConnectionPassword, seaweedfs_url_internal, wait_for_exasol, wait_for_seaweedfs,
@@ -477,6 +479,8 @@ fn all_types_batch() -> RecordBatch {
             cast(&text_values(), &DataType::LargeUtf8).expect("LargeUtf8"),
             true,
         ),
+        ("c_decimal128_18_0", decimal_18_0_values(), true),
+        ("c_decimal128_36_6", decimal_36_6_values(), true),
         ("c_decimal128_38_10", decimal_38_10_values(), true),
         ("c_decimal256_50_2", Arc::new(decimal256), true),
         (
@@ -1026,7 +1030,10 @@ fn complex_directory_declares_varchar_and_returns_parseable_json() {
     assert!(cols[3][1].is_null(), "ATTRS row 1 must be SQL NULL");
 }
 
-/// Scenario: Every type a Parquet file can carry declares and returns its mapped value on direct storage
+/// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
+/// Scenario: Out-of-range Decimal128 falls back to VARCHAR via JSON
+/// Scenario: A Parquet-sourced column maps through the Arrow-input direction
+/// Scenario: The listing declares a binary column
 #[test]
 fn all_types_directories_declare_and_return_their_mapped_values() {
     setup();
@@ -1056,6 +1063,16 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
             ),
             reads("C_FLOAT32", "DOUBLE", FLOAT32_VALUES_TEXT),
             reads("C_LARGEUTF8", VARCHAR_JSON, TEXT_VALUES_TEXT),
+            reads(
+                "C_DECIMAL128_18_0",
+                "DECIMAL(18,0)",
+                DECIMAL_18_0_VALUES_TEXT,
+            ),
+            reads(
+                "C_DECIMAL128_36_6",
+                "DECIMAL(36,6)",
+                DECIMAL_36_6_VALUES_TEXT,
+            ),
             reads(
                 "C_DECIMAL128_38_10",
                 VARCHAR_JSON,
@@ -1096,6 +1113,7 @@ fn all_types_directories_declare_and_return_their_mapped_values() {
             ),
         ],
     );
+    assert_decimal_orders_numerically(&mut conn, VS_DIRECT, "ALL_TYPES", "C_DECIMAL128_18_0");
     assert_type_matrix(
         &mut conn,
         VS_DIRECT,

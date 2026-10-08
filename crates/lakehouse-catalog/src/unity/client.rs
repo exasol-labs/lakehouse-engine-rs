@@ -250,9 +250,6 @@ fn neutral_column(column: ColumnInfo) -> CatalogColumn {
     CatalogColumn {
         name: column.name,
         source_type: ColumnSourceType::Unity {
-            type_name: column.type_name,
-            precision: column.type_precision.unwrap_or(0),
-            scale: column.type_scale.unwrap_or(0),
             type_json: column.type_json,
         },
     }
@@ -363,11 +360,6 @@ struct TableInfo {
 #[derive(Deserialize)]
 struct ColumnInfo {
     name: String,
-    type_name: String,
-    #[serde(default)]
-    type_precision: Option<u32>,
-    #[serde(default)]
-    type_scale: Option<u32>,
     #[serde(default)]
     type_json: Option<String>,
     #[serde(default)]

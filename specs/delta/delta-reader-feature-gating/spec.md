@@ -190,8 +190,8 @@ normative obligations this feature enforces:
 * *AND* every shipped Delta fixture whose reader features are wholly allow-listed SHALL keep passing
   every scenario already recorded for it in
   `scan-read-path/scan-execution-delta-deletion-vectors`,
-  `scan-read-path/scan-execution-partition-values`, `delta/delta-table-planning`,
-  `delta/delta-type-mapping`, and `scan-types/type-mapping-live-coverage` — namely `table_with_dv` and
+  `scan-read-path/scan-execution-partition-values`, `delta/delta-table-planning`, and
+  `delta/delta-type-mapping` — namely `table_with_dv` and
   `multi_part_stats` (`deletionVectors`) and `stats_all_types` (`timestampNtz` + `columnMapping`) —
   and the `type_widening` fixture SHALL join that set rather than staying refused
 

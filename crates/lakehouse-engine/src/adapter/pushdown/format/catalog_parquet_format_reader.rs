@@ -32,7 +32,7 @@ use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField, encode_file_path};
 use crate::scan::{build_table_root_store, store_root_url};
 use crate::types::hive_type::parse_hive_type;
-use crate::types::mapping::arrow_type_from_tag;
+use crate::types::mapping::{arrow_type_from_tag, unity_spark_field};
 
 #[cfg(test)]
 #[path = "catalog_parquet_format_reader_tests.rs"]
@@ -327,25 +327,13 @@ fn catalog_schema(table: &CatalogTable, label: &str) -> Result<CatalogSchema, Ud
 /// Forced nullable: a file missing the column reads NULL, which a required declaration would fail.
 fn spark_field(column: &CatalogColumn) -> Result<StructField, String> {
     match &column.source_type {
-        ColumnSourceType::Unity {
-            type_json: Some(type_json),
-            ..
-        } => {
-            let field: StructField = serde_json::from_str(type_json).map_err(|error| {
-                format!("its type_json descriptor does not parse as a Spark StructField ({error})")
-            })?;
-            Ok(StructField {
+        ColumnSourceType::Unity { type_json } => {
+            unity_spark_field(type_json.as_deref()).map(|field| StructField {
                 name: column.name.clone(),
                 nullable: true,
                 ..field
             })
         }
-        ColumnSourceType::Unity {
-            type_json: None, ..
-        } => Err(
-            "Unity Catalog reports no type_json descriptor for it, so its Spark type is unknown"
-                .to_string(),
-        ),
         ColumnSourceType::Glue { hive_type } => parse_hive_type(hive_type)
             .map(|data_type| StructField::nullable(column.name.clone(), data_type)),
         ColumnSourceType::Iceberg(_) | ColumnSourceType::Parquet(_) => {

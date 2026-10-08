@@ -80,10 +80,7 @@ fn both_kinds_share_one_listing_pipeline() {
     let unity_listing = one_table_listing(
         TableFormat::Delta,
         ColumnSourceType::Unity {
-            type_name: "LONG".to_string(),
-            precision: 0,
-            scale: 0,
-            type_json: None,
+            type_json: Some(r#"{"name":"id","type":"long","nullable":true,"metadata":{}}"#.into()),
         },
     );
 
@@ -149,10 +146,10 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
                 CatalogColumn {
                     name: "delta_ts".to_string(),
                     source_type: ColumnSourceType::Unity {
-                        type_name: "TIMESTAMP".to_string(),
-                        precision: 0,
-                        scale: 0,
-                        type_json: None,
+                        type_json: Some(
+                            r#"{"name":"delta_ts","type":"timestamp","nullable":true,"metadata":{}}"#
+                                .into(),
+                        ),
                     },
                 },
             ],
