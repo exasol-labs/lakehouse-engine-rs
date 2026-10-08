@@ -41,8 +41,7 @@ the engine cannot apply.
   child, because negating a widened predicate narrows it and would skip files that hold matching
   rows. Such a `NOT` counts as partly translated.
 * A `BETWEEN` whose bound does not translate keeps the other bound and is partly translated.
-* Delta pruning combines translated nodes by the same rules (`delta/delta-file-pruning`).
-  Direct-storage partition pruning evaluates partition values under three-valued logic instead
+* Delta pruning follows the same rules (`delta/delta-file-pruning`). Direct-storage partition pruning evaluates partition values under three-valued logic instead
   (`direct-storage/direct-storage-hive-partitioning`).
 * Exasol pre-normalises `>`→`<` and `>=`→`<=`, so only LESS/LESSEQUAL comparison nodes
   reach the adapter.
