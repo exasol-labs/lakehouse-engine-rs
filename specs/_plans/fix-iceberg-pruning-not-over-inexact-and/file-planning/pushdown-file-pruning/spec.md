@@ -41,10 +41,10 @@ the engine cannot apply.
   child, because negating a widened predicate narrows it and would skip files that hold matching
   rows. Such a `NOT` counts as partly translated.
 * A `BETWEEN` whose bound does not translate keeps the other bound and is partly translated.
-* A comparison, `IN` list, or `BETWEEN` bound translates only when its literal converts to the
-  column's Iceberg type without rounding. A literal the type cannot hold exactly imposes no
-  constraint: for example `0.7` against a `float` column, or a literal with seven fraction digits
-  against a microsecond `timestamp` or `timestamptz` column.
+* Scoped exception (#TBD): the Iceberg translator rounds a `float` literal to `f32` and truncates
+  a `timestamp` or `timestamptz` literal to microseconds, and it treats the resulting comparison as
+  exact. This feature's guarantee therefore does not cover a comparison against a literal that the
+  column's type cannot hold exactly, alone or under `NOT`. A separate issue owns that defect.
 * Delta pruning combines translated nodes by the same rules (`delta/delta-file-pruning`).
   Direct-storage partition pruning evaluates partition values under three-valued logic instead
   (`direct-storage/direct-storage-hive-partitioning`).
@@ -78,16 +78,6 @@ the engine cannot apply.
 * *WHEN* Exasol sends the corresponding `pushdown` request
 * *THEN* the adapter SHALL prune with the negation of the translated predicate, so a file whose `k` values all lie from 10 to 20, or are all NULL, SHALL NOT be scanned
 * *AND* the query SHALL return the rows that native Exasol returns for the same predicate over the same rows
-<!-- /DELTA:NEW -->
-
-<!-- DELTA:NEW -->
-### Scenario: A literal the column type cannot hold exactly imposes no constraint
-
-* *GIVEN* an Iceberg `float` column compared against `0.7`, which no `float` value equals, and a microsecond `timestamp` or `timestamptz` column compared against a literal with seven fraction digits, including a `timestamptz` literal with the offset `+02:30` or `Z`
-* *WHEN* the adapter translates each comparison, alone or under `NOT`
-* *THEN* none of these comparisons SHALL impose a pruning constraint
-* *AND* a `float` comparison against `0.5`, and a nanosecond `timestamp` or `timestamptz` comparison against a literal with nine fraction digits, SHALL still translate at the column's own precision and prune
-* *AND* a `timestamptz` literal with an offset that the column's unit holds exactly, such as `2024-03-01 12:30:00.123456+02:30`, SHALL translate to its UTC instant, `2024-03-01 10:00:00.123456` UTC
 <!-- /DELTA:NEW -->
 
 <!-- DELTA:NEW -->
