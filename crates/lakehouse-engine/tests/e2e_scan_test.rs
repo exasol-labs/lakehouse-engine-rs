@@ -249,7 +249,9 @@ fn create_vs_maps_iceberg_schema() {
     );
 }
 
-/// Scenario: Every Iceberg type declares and returns its mapped value through the Iceberg REST catalog
+/// Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
+/// Scenario: A nanosecond catalog timestamp column is declared TIMESTAMP(9) on Exasol 2025.x and later
+/// Scenario: The listing declares a binary column
 #[test]
 fn iceberg_all_types_declare_and_return_their_mapped_values() {
     setup_e2e();

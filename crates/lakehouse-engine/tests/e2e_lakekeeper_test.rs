@@ -259,7 +259,7 @@ fn lakekeeper_static_creds_projection_filter_limit() {
     );
 }
 
-/// Scenario: Decimals declare DECIMAL and order numerically through Lakekeeper and on ADLS Gen2
+/// Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
 #[test]
 fn lakekeeper_decimals_declare_their_precision_and_order_numerically() {
     setup();

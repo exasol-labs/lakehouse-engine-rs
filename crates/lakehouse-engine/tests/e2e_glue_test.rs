@@ -495,7 +495,7 @@ fn check_partition_predicate_reduces_the_scan_file_list(_run: &GlueRun, conn: &m
     assert_eq!(int_column(&limited[0]), [5]);
 }
 
-/// Scenario: Every Hive type declares and returns its mapped value on a Glue Parquet table
+/// Scenario: The listing declares each Glue column through the Spark listing mapping
 fn check_all_types_declare_and_return_their_mapped_values(_run: &GlueRun, conn: &mut ExaConn) {
     let timestamp = expected_timestamp_precision(conn).declared_column_type;
     assert_type_matrix(

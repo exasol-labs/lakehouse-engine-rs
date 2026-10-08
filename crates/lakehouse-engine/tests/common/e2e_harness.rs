@@ -664,7 +664,7 @@ pub fn refuses<'a>(column: &'a str, declared: &'a str, fragments: &'a [&'a str])
     }
 }
 
-/// The `type-mapping-live-coverage` check: `cases` lists every column in declared order, the
+/// The type-coverage check of `specs/testing.md`: `cases` lists every column in declared order, the
 /// readable ones are read by one `SELECT ID, ... ORDER BY ID`, and each refused one alone.
 pub fn assert_type_matrix(conn: &mut ExaConn, vs_name: &str, table: &str, cases: &[TypeCase]) {
     let declared: Vec<(&str, &str)> = cases.iter().map(|c| (c.column, c.declared)).collect();

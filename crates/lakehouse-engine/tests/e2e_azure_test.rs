@@ -373,7 +373,7 @@ fn write_azure_parquet_fixture(
     });
 }
 
-/// Scenario: Decimals declare DECIMAL and order numerically through Lakekeeper and on ADLS Gen2
+/// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
 #[test]
 fn azure_static_and_vended_creds_end_to_end() {
     // Vended-arm assertions run first so a static-arm regression cannot mask the

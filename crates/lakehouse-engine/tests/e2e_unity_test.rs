@@ -1433,7 +1433,7 @@ const STATS_ALL_TYPES_MAPPABLE_COLUMNS: &str = "BYTE_COL, SHORT_COL, INT_COL, LO
      TIMESTAMP_COL, TIMESTAMP_NTZ_COL, STRING_COL, DECIMAL_COL, BOOLEAN_COL, ARRAY_COL, \
      MAP_COL, NESTED_STRUCT";
 
-/// Scenario: Every Delta type declares and returns its mapped value through Unity Catalog
+/// Scenario: Every Delta type Exasol represents natively maps to its own Arrow tag
 /// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
 #[test]
 fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
@@ -1579,7 +1579,7 @@ fn unity_delta_varied_types_return_their_expected_exasol_types_and_values() {
     );
 }
 
-/// Scenario: Every Delta type declares and returns its mapped value through Unity Catalog
+/// Scenario: A catalog-declared DECIMAL outside Exasol's DECIMAL domain falls back to VARCHAR
 /// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
 /// Scenario: An incompatible Unity Catalog column type is declared as VARCHAR rather than failing
 #[test]
@@ -1917,7 +1917,7 @@ fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
     );
 }
 
-/// Scenario: Every Spark type a Unity Parquet table declares returns its mapped value
+/// Scenario: The logical schema is the catalog's declared column list
 /// Scenario: Unity Catalog Spark column types map to Exasol types sufficient for listing
 /// Scenario: An incompatible Unity Catalog column type is declared as VARCHAR rather than failing
 #[test]

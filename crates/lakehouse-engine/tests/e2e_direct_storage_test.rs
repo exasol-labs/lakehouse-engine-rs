@@ -1030,7 +1030,10 @@ fn complex_directory_declares_varchar_and_returns_parseable_json() {
     assert!(cols[3][1].is_null(), "ATTRS row 1 must be SQL NULL");
 }
 
-/// Scenario: Every type a Parquet file can carry declares and returns its mapped value on direct storage
+/// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
+/// Scenario: Out-of-range Decimal128 falls back to VARCHAR via JSON
+/// Scenario: A Parquet-sourced column maps through the Arrow-input direction
+/// Scenario: The listing declares a binary column
 #[test]
 fn all_types_directories_declare_and_return_their_mapped_values() {
     setup();
