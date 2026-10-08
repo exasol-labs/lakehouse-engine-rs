@@ -35,8 +35,6 @@ pub enum CatalogTableType {
 #[derive(Debug, Clone, PartialEq)]
 pub enum ColumnSourceType {
     Iceberg(iceberg::spec::Type),
-    /// `type_json` is the only type source: real Unity clients leave `type_precision` and
-    /// `type_scale` unset (#463).
     Unity {
         type_json: Option<String>,
     },

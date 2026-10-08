@@ -129,7 +129,6 @@ def map_type(dt):
     js = "integer" if dt=="int" else dt
     return (tn, js)
 
-# Omits type_precision/type_scale as Unity's Spark connector does (#463).
 def col(pos, name, dt, is_part):
     tn, js = map_type(dt)
     tj = {"name":name,"type":js,"nullable":True,"metadata":{}}

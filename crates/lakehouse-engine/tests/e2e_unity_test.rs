@@ -198,7 +198,6 @@ fn seed_sales_parquet_table() {
             ("region", json!("string"), "STRING"),
         ],
         &["year", "region"],
-        UnityClient::Databricks,
     );
 }
 
@@ -214,16 +213,6 @@ fn struct_type(members: &[(&str, &str)]) -> Json {
     json!({"type": "struct", "fields": fields})
 }
 
-/// Column shapes real Unity clients write: a decimal's precision and scale live only in
-/// `type_text` and `type_json` (#463).
-#[derive(Clone, Copy, PartialEq)]
-enum UnityClient {
-    /// Omits `type_precision` and `type_scale`.
-    SparkConnector,
-    /// Reports `type_precision` and `type_scale` as 0.
-    Databricks,
-}
-
 /// A column's Spark type is the `type` of the `StructField` JSON the reader reads. Replaces any
 /// earlier registration, so a changed fixture never meets a stale one.
 fn register_unity_table(
@@ -232,7 +221,6 @@ fn register_unity_table(
     location: &str,
     columns: &[(&str, Json, &str)],
     partitions: &[&str],
-    client: UnityClient,
 ) {
     let columns: Vec<Json> = columns
         .iter()
@@ -247,10 +235,6 @@ fn register_unity_table(
                 "type_json": spark_field(column, spark_type).to_string(),
                 "position": position, "nullable": true
             });
-            if client == UnityClient::Databricks {
-                entry["type_precision"] = 0.into();
-                entry["type_scale"] = 0.into();
-            }
             if let Some(index) = partitions.iter().position(|p| p == column) {
                 entry["partition_index"] = index.into();
             }
@@ -400,7 +384,6 @@ fn seed_all_types_parquet_table() {
         ALL_TYPES_PARQUET_LOCATION,
         &registered,
         &[],
-        UnityClient::SparkConnector,
     );
 }
 
@@ -460,7 +443,6 @@ fn seed_delta_extra_types_table() {
         DELTA_EXTRA_TYPES_LOCATION,
         &columns,
         &[],
-        UnityClient::Databricks,
     );
 }
 
