@@ -34,7 +34,7 @@
 
 ### [3] Iceberg leaf-literal conversion exactness is out of scope
 
-- **Decision:** This plan does not change how the Iceberg translator converts a literal. Rounding a `float` literal to `f32` and truncating a `timestamp` or `timestamptz` literal to microseconds is a separate defect, tracked as a follow-up `(#TBD)`. The `pushdown-file-pruning` delta records it as a scoped exception, as AGENTS.md requires for a known deviation from the Iceberg spec that a plan does not fix.
+- **Decision:** This plan does not change how the Iceberg translator converts a literal. Rounding a `float` literal to `f32` and truncating a `timestamp` or `timestamptz` literal to microseconds is a separate defect, tracked as a follow-up `(#TBD)`..
 - **Alternatives:** Fix the literal conversion in this plan (rejected by review: it is a different issue from #466, whose defect is the negation of a partly translated `AND`, `OR`, or `BETWEEN`).
 - **Rationale:** The rule set in [2] treats every translated leaf as exact. A leaf whose literal was rounded or truncated is not exact, so a `NOT` over it can still skip a file that holds a matching row. The follow-up owns that case. No E2E case uses a `float`, `double`, or timestamp literal as a pruning leaf, so the case table does not depend on it.
 - **Promotes to ADR:** no

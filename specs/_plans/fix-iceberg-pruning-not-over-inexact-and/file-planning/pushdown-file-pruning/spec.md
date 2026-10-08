@@ -41,10 +41,6 @@ the engine cannot apply.
   child, because negating a widened predicate narrows it and would skip files that hold matching
   rows. Such a `NOT` counts as partly translated.
 * A `BETWEEN` whose bound does not translate keeps the other bound and is partly translated.
-* Scoped exception (#TBD): the Iceberg translator rounds a `float` literal to `f32` and truncates
-  a `timestamp` or `timestamptz` literal to microseconds, and it treats the resulting comparison as
-  exact. This feature's guarantee therefore does not cover a comparison against a literal that the
-  column's type cannot hold exactly, alone or under `NOT`. A separate issue owns that defect.
 * Delta pruning combines translated nodes by the same rules (`delta/delta-file-pruning`).
   Direct-storage partition pruning evaluates partition values under three-valued logic instead
   (`direct-storage/direct-storage-hive-partitioning`).
