@@ -51,7 +51,7 @@ The payoff: open lakehouse data (Iceberg, Databricks) becomes first-class and qu
 
 10. **Correct read path**: applies Iceberg positional deletes and Delta deletion vectors (`scan-read-path/scan-execution-delta-deletion-vectors`) at scan time, so results reflect current table state and not raw Parquet file content. Iceberg equality deletes and Puffin deletion vectors are refused with a clean error, not applied. The adapter also refuses Delta tables that need unsupported reader features or protocol versions, and refuses binary columns at plan time.
 11. **Packaging and install**: one `.so` for x86 and aarch64, a version query UDF, an architecture-aware install script, and a personal deployment install.
-12. **Result parity**: once the adapter advertises a pushdown capability it honors it fully, so results match native Exasol. Guards cover declined-filter self-application, empty results, DECIMAL string format, CHAR type declaration, type coercion, and ORDER BY capability.
+12. **Result parity**: once the adapter advertises a pushdown capability it honors it fully, so results match native Exasol. A deviation is accepted only when it is documented in `docs/semantic-differences.md`. Guards cover declined-filter self-application, empty results, DECIMAL string format, CHAR type declaration, type coercion, and ORDER BY capability.
 13. **End-to-end test infrastructure**: besides the local Exasol Docker suite, E2E suites run against real AWS (Glue and assume-role), Azure, Unity Catalog (Databricks), and Lakekeeper. Shared fixtures cover type promotion, positional deletes, and INT96 timestamps. Scheduled sweeps remove orphaned Azure containers and Glue resources. `specs/testing.md` states how the suites are built, run, and cleaned up.
 
 ## Out of Scope
