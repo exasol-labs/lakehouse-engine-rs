@@ -8,11 +8,13 @@ use common::e2e_harness::{
     VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_type_matrix,
     create_schema_and_scripts, create_virtual_schema_with_password, declared_type, exa_conn,
     explain_virtual_sql, install_slc, local_stack_storage, nullable_text, parse_int, parse_numeric,
-    reads, refuses, try_create_virtual_schema_with_password, upload_so, value_to_string,
+    reads, refuses, text_column, try_create_virtual_schema_with_password, upload_so,
+    value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{
-    encode_parquet_message, put_fixture_object, write_parquet_column, write_parquet_fixture,
+    delete_fixture_object, delete_fixture_prefix, encode_parquet_message, put_fixture_object,
+    write_parquet_column, write_parquet_fixture,
 };
 use common::seed::{
     ALL_TYPES_DATE_DAYS, ALL_TYPES_IDS, ALL_TYPES_IDS_TEXT, ALL_TYPES_TIME_MICROS,
@@ -57,6 +59,7 @@ const BASE_DIRECT: &str = "s3://warehouse/direct/";
 const BASE_INCOMPATIBLE: &str = "s3://warehouse/direct_incompatible/";
 const BASE_DISCOVERY: &str = "s3://warehouse/direct_discovery/";
 const BASE_COLLISION_MISSING: &str = "s3://warehouse/direct_hive_collision_missing/";
+const BASE_REFRESH: &str = "s3://warehouse/direct_refresh/";
 
 const VS_DIRECT: &str = "DIRECT_LAKEHOUSE";
 const VS_DIRECT_NARROW: &str = "DIRECT_LAKEHOUSE_NARROW";
@@ -67,11 +70,13 @@ const VS_DISCOVERY_NS: &str = "DIRECT_DISCOVERY_NS_VS";
 const VS_DISCOVERY_EMPTY_NS: &str = "DIRECT_DISCOVERY_EMPTY_NS_VS";
 const VS_COLLISION_MISSING: &str = "DIRECT_HIVE_COLLISION_MISSING";
 const VS_COLLISION_MISSING_HIVE_OFF: &str = "DIRECT_HIVE_COLLISION_MISSING_OFF";
+const VS_REFRESH: &str = "DIRECT_REFRESH_VS";
 
 const CONN_DIRECT: &str = "DIRECT_STORAGE_CREDS";
 const CONN_INCOMPATIBLE: &str = "DIRECT_STORAGE_INCOMPATIBLE_CREDS";
 const CONN_DISCOVERY: &str = "DIRECT_STORAGE_DISCOVERY_CREDS";
 const CONN_COLLISION_MISSING: &str = "DIRECT_STORAGE_COLLISION_MISSING_CREDS";
+const CONN_REFRESH: &str = "DIRECT_STORAGE_REFRESH_CREDS";
 
 /// No `warehouse`: the direct-storage kind rejects that field.
 fn direct_storage_password() -> CatalogConnectionPassword {
@@ -1199,7 +1204,7 @@ fn missing_column_declares_the_union_and_nulls_the_absent_column() {
 }
 
 #[test]
-fn incompatible_pair_fails_create_and_refresh_naming_column_and_files() {
+fn incompatible_pair_fails_create_naming_column_and_files() {
     setup();
     let mut conn = exa_conn();
 
@@ -1939,5 +1944,374 @@ fn zero_matching_files_prune_to_zero_rows_without_error() {
         conn.query_row_count(&sql),
         0,
         "a query keeping no file must return zero rows"
+    );
+}
+
+fn refresh_key(key: &str) -> String {
+    format!("{BASE_REFRESH}{key}")
+}
+
+fn int64_column(values: &[i64]) -> ArrayRef {
+    Arc::new(Int64Array::from(values.to_vec()))
+}
+
+fn utf8_column(values: &[&str]) -> ArrayRef {
+    Arc::new(StringArray::from(values.to_vec()))
+}
+
+fn put_refresh_file(key: &str, columns: Vec<(&str, ArrayRef)>) {
+    let batch = RecordBatch::try_from_iter_with_nullable(
+        columns.into_iter().map(|(name, array)| (name, array, true)),
+    )
+    .unwrap_or_else(|e| panic!("build the refresh fixture batch for {key}: {e}"));
+    write_parquet_fixture(&refresh_key(key), batch);
+}
+
+fn write_refresh_initial_objects() {
+    put_refresh_file(
+        "t_append/file1.parquet",
+        vec![
+            ("ID", int64_column(&[1, 2])),
+            ("LABEL", utf8_column(&["a1", "a2"])),
+        ],
+    );
+    put_refresh_file(
+        "t_evolve/file1.parquet",
+        vec![
+            ("ID", int64_column(&[1, 2])),
+            ("QTY", Arc::new(Int32Array::from(vec![10, 20]))),
+            ("LABEL", utf8_column(&["e1", "e2"])),
+        ],
+    );
+    put_refresh_file(
+        "t_hive/p1.parquet",
+        vec![("ID", int64_column(&[1])), ("LABEL", utf8_column(&["h1"]))],
+    );
+    put_refresh_file("t_emptied/file1.parquet", vec![("ID", int64_column(&[1]))]);
+    put_fixture_object(
+        &refresh_key("t_emptied/_SUCCESS"),
+        Bytes::from_static(b"ok"),
+    );
+    put_refresh_file(
+        "t_conflict/file1.parquet",
+        vec![("ID", int64_column(&[1])), ("X", int64_column(&[42]))],
+    );
+}
+
+fn write_refresh_stage_one_objects() {
+    put_refresh_file(
+        "t_new/file1.parquet",
+        vec![
+            ("ID", int64_column(&[100])),
+            ("LABEL", utf8_column(&["n1"])),
+        ],
+    );
+    put_refresh_file(
+        "t_append/file2.parquet",
+        vec![("ID", int64_column(&[3])), ("LABEL", utf8_column(&["a3"]))],
+    );
+    put_refresh_file(
+        "t_evolve/file2.parquet",
+        vec![
+            ("ID", int64_column(&[3, 4])),
+            ("QTY", int64_column(&[5_000_000_000, 50_000_000_000])),
+            ("LABEL", utf8_column(&["e3", "e4"])),
+            ("NEW_COL", utf8_column(&["x3", "x4"])),
+        ],
+    );
+    put_refresh_file(
+        "t_hive/region=eu/p2.parquet",
+        vec![("ID", int64_column(&[2])), ("LABEL", utf8_column(&["h2"]))],
+    );
+    delete_fixture_object(&refresh_key("t_emptied/file1.parquet"));
+}
+
+fn assert_reads(conn: &mut ExaConn, case: &str, sql: &str, expected: &[&[Option<&str>]]) {
+    let observed: Vec<Vec<Option<String>>> = conn
+        .query_columns(sql)
+        .iter()
+        .map(|column| text_column(column))
+        .collect();
+    let expected: Vec<Vec<Option<String>>> = expected
+        .iter()
+        .map(|column| column.iter().map(|v| v.map(str::to_string)).collect())
+        .collect();
+    assert_eq!(observed, expected, "{case}: {sql}");
+}
+
+fn assert_fails_naming(conn: &mut ExaConn, case: &str, sql: &str, fragments: &[&str]) -> String {
+    let resp = conn.try_execute(sql);
+    assert_eq!(
+        resp["status"].as_str(),
+        Some("error"),
+        "{case}: must fail: {sql}: {resp}"
+    );
+    let msg = resp["exception"]["text"].as_str().unwrap_or("").to_string();
+    for fragment in fragments {
+        assert!(
+            msg.contains(fragment),
+            "{case}: error must mention {fragment:?}: {msg}"
+        );
+    }
+    msg
+}
+
+fn skip_reason(conn: &mut ExaConn, vs_name: &str, table: &str) -> Option<String> {
+    let notes = conn.query_columns(&format!(
+        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{vs_name}'"
+    ));
+    let notes: Json = serde_json::from_str(&value_to_string(&notes[0][0]))
+        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be JSON: {e}"));
+    let skipped = notes["SKIPPED_TABLES"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry SKIPPED_TABLES: {notes}"));
+    skipped
+        .iter()
+        .find(|entry| value_to_string(&entry["table"]) == table)
+        .map(|entry| value_to_string(&entry["reason"]))
+}
+
+/// Scenario: Refresh re-enumerates the namespace and returns a refresh response
+/// Scenario: Refresh reflects table and column structure changes
+/// Scenario: Until a refresh, a query reads the current files under the declared columns
+/// Scenario: Until a refresh, a file the declaration cannot hold fails the query and never returns a wrong value
+/// Scenario: A refresh that a column pair fails keeps the previous declaration queryable
+/// Scenario: A first-level directory holding no data file is skipped, not failed
+#[test]
+fn refresh_tracks_storage_changes_and_a_failed_refresh_keeps_the_schema() {
+    setup();
+    let mut conn = exa_conn();
+
+    delete_fixture_prefix(BASE_REFRESH);
+    write_refresh_initial_objects();
+    create_virtual_schema_with_password(
+        &mut conn,
+        &direct_vs(VS_REFRESH, CONN_REFRESH),
+        BASE_REFRESH,
+        &direct_storage_password(),
+    );
+    let initial_tables = ["T_APPEND", "T_CONFLICT", "T_EMPTIED", "T_EVOLVE", "T_HIVE"];
+    assert_eq!(
+        served_tables(&mut conn, VS_REFRESH),
+        initial_tables,
+        "setup: the initial objects serve five tables"
+    );
+    assert_eq!(
+        declared_type(&mut conn, VS_REFRESH, "T_EVOLVE", "QTY"),
+        "DECIMAL(10,0)",
+        "setup: an INT32 column declares DECIMAL(10,0)"
+    );
+
+    write_refresh_stage_one_objects();
+    let append = vs_table(VS_REFRESH, "T_APPEND");
+    let evolve = vs_table(VS_REFRESH, "T_EVOLVE");
+    let hive = vs_table(VS_REFRESH, "T_HIVE");
+    let emptied = vs_table(VS_REFRESH, "T_EMPTIED");
+    let new_table = vs_table(VS_REFRESH, "T_NEW");
+    let secret = direct_storage_password().secret_key;
+
+    assert_fails_naming(
+        &mut conn,
+        "A1",
+        &format!("SELECT * FROM {new_table}"),
+        &["T_NEW", "not found"],
+    );
+    assert_reads(
+        &mut conn,
+        "A2",
+        &format!("SELECT ID, LABEL FROM {append} ORDER BY ID"),
+        &[
+            &[Some("1"), Some("2"), Some("3")],
+            &[Some("a1"), Some("a2"), Some("a3")],
+        ],
+    );
+    assert_fails_naming(
+        &mut conn,
+        "A3",
+        &format!("SELECT NEW_COL FROM {evolve}"),
+        &["NEW_COL", "not found"],
+    );
+    assert_reads(
+        &mut conn,
+        "A3",
+        &format!("SELECT ID, LABEL FROM {evolve} ORDER BY ID"),
+        &[
+            &[Some("1"), Some("2"), Some("3"), Some("4")],
+            &[Some("e1"), Some("e2"), Some("e3"), Some("e4")],
+        ],
+    );
+    let msg = assert_fails_naming(
+        &mut conn,
+        "A4",
+        &format!("SELECT ID, QTY FROM {evolve}"),
+        &["out of range"],
+    );
+    assert!(
+        !msg.contains(&secret),
+        "A4: the error of SELECT ID, QTY must not leak credential values: {msg}"
+    );
+    assert_reads(
+        &mut conn,
+        "A4",
+        &format!("SELECT QTY FROM {evolve} WHERE ID = 3"),
+        &[&[Some("5000000000")]],
+    );
+    assert_fails_naming(
+        &mut conn,
+        "A6",
+        &format!("SELECT REGION FROM {hive}"),
+        &["REGION", "not found"],
+    );
+    assert_reads(
+        &mut conn,
+        "A6",
+        &format!("SELECT ID, LABEL FROM {hive} ORDER BY ID"),
+        &[&[Some("1"), Some("2")], &[Some("h1"), Some("h2")]],
+    );
+    assert_eq!(
+        conn.query_row_count(&format!("SELECT ID FROM {emptied}")),
+        0,
+        "A7: a table that lost its last data file returns zero rows without an error before REFRESH"
+    );
+
+    conn.execute(&format!("ALTER VIRTUAL SCHEMA {VS_REFRESH} REFRESH"));
+
+    let stage_one_tables = ["T_APPEND", "T_CONFLICT", "T_EVOLVE", "T_HIVE", "T_NEW"];
+    assert_eq!(
+        served_tables(&mut conn, VS_REFRESH),
+        stage_one_tables,
+        "A1/A7: REFRESH serves the new table and drops the emptied one"
+    );
+    assert_reads(
+        &mut conn,
+        "A1",
+        &format!("SELECT ID, LABEL FROM {new_table}"),
+        &[&[Some("100")], &[Some("n1")]],
+    );
+    assert_eq!(
+        declared_columns(&mut conn, VS_REFRESH, "T_APPEND"),
+        ["ID", "LABEL"],
+        "A2: new files add no column"
+    );
+    assert_reads(
+        &mut conn,
+        "A2",
+        &format!("SELECT ID, LABEL FROM {append} ORDER BY ID"),
+        &[
+            &[Some("1"), Some("2"), Some("3")],
+            &[Some("a1"), Some("a2"), Some("a3")],
+        ],
+    );
+    assert_eq!(
+        declared_columns(&mut conn, VS_REFRESH, "T_EVOLVE"),
+        ["ID", "QTY", "LABEL", "NEW_COL"],
+        "A3: the new column follows the sampled ones"
+    );
+    assert_eq!(
+        declared_type(&mut conn, VS_REFRESH, "T_EVOLVE", "NEW_COL"),
+        VARCHAR_JSON,
+        "A3: NEW_COL declares VARCHAR(2000000)"
+    );
+    assert_eq!(
+        declared_type(&mut conn, VS_REFRESH, "T_EVOLVE", "QTY"),
+        "DECIMAL(20,0)",
+        "A4: the INT64 file widens QTY"
+    );
+    assert_reads(
+        &mut conn,
+        "A3/A4",
+        &format!("SELECT ID, QTY, NEW_COL FROM {evolve} ORDER BY ID"),
+        &[
+            &[Some("1"), Some("2"), Some("3"), Some("4")],
+            &[
+                Some("10"),
+                Some("20"),
+                Some("5000000000"),
+                Some("50000000000"),
+            ],
+            &[None, None, Some("x3"), Some("x4")],
+        ],
+    );
+    assert_eq!(
+        declared_columns(&mut conn, VS_REFRESH, "T_HIVE"),
+        ["ID", "LABEL", "REGION"],
+        "A6: the partition key follows the Parquet columns"
+    );
+    assert_eq!(
+        declared_type(&mut conn, VS_REFRESH, "T_HIVE", "REGION"),
+        VARCHAR_JSON,
+        "A6: REGION declares VARCHAR(2000000)"
+    );
+    assert_reads(
+        &mut conn,
+        "A6",
+        &format!("SELECT ID, REGION FROM {hive} ORDER BY ID"),
+        &[&[Some("1"), Some("2")], &[None, Some("eu")]],
+    );
+    let reason = skip_reason(&mut conn, VS_REFRESH, "t_emptied");
+    assert!(
+        reason
+            .as_deref()
+            .is_some_and(|r| r.contains("holds no data file")),
+        "A7: SKIPPED_TABLES must hold t_emptied as holding no data file: {reason:?}"
+    );
+
+    put_refresh_file(
+        "t_conflict/file2.parquet",
+        vec![("ID", int64_column(&[2])), ("X", utf8_column(&["hello"]))],
+    );
+    let conflict = vs_table(VS_REFRESH, "T_CONFLICT");
+    let conflict_names = [
+        "Parquet column 'X'",
+        "Int64",
+        "Utf8",
+        "t_conflict/file1.parquet",
+        "t_conflict/file2.parquet",
+    ];
+    for sql in [
+        format!("SELECT ID, X FROM {conflict}"),
+        format!("SELECT ID FROM {conflict}"),
+    ] {
+        let msg = assert_fails_naming(&mut conn, "A5", &sql, &conflict_names);
+        assert!(
+            !msg.contains(&secret),
+            "A5: the error of {sql} must not leak credential values: {msg}"
+        );
+    }
+    let msg = assert_fails_naming(
+        &mut conn,
+        "A5",
+        &format!("ALTER VIRTUAL SCHEMA {VS_REFRESH} REFRESH"),
+        &conflict_names,
+    );
+    assert!(
+        !msg.contains(&secret),
+        "A5: the REFRESH error must not leak credential values: {msg}"
+    );
+    assert_eq!(
+        served_tables(&mut conn, VS_REFRESH),
+        stage_one_tables,
+        "A5: a failed REFRESH keeps the previous table set"
+    );
+    assert_reads(
+        &mut conn,
+        "A5",
+        &format!("SELECT ID, LABEL FROM {new_table}"),
+        &[&[Some("100")], &[Some("n1")]],
+    );
+    assert_reads(
+        &mut conn,
+        "A5",
+        &format!("SELECT ID, QTY, NEW_COL FROM {evolve} ORDER BY ID"),
+        &[
+            &[Some("1"), Some("2"), Some("3"), Some("4")],
+            &[
+                Some("10"),
+                Some("20"),
+                Some("5000000000"),
+                Some("50000000000"),
+            ],
+            &[None, None, Some("x3"), Some("x4")],
+        ],
     );
 }
