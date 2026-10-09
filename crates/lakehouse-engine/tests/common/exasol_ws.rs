@@ -16,7 +16,6 @@ use tungstenite::{Message, WebSocket, client_tls_with_config};
 /// response's size, not the result set.
 const DEFAULT_FETCH_NUM_BYTES: u64 = 67_108_864;
 
-/// Without a bound, a blackholed host blocks until the kernel SYN-retry timeout (~130s on Linux).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ExaConn {
