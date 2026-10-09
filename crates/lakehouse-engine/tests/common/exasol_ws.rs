@@ -7,13 +7,17 @@ use rsa::pkcs1::DecodeRsaPublicKey;
 use rsa::pkcs8::DecodePublicKey;
 use rsa::{Pkcs1v15Encrypt, RsaPublicKey};
 use serde_json::{Value, json};
-use std::net::TcpStream;
+use std::net::{TcpStream, ToSocketAddrs};
+use std::time::Duration;
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket, client_tls_with_config};
 
 /// Exasol treats `numBytes` as a soft budget and returns whole rows, so this bounds one
 /// response's size, not the result set.
 const DEFAULT_FETCH_NUM_BYTES: u64 = 67_108_864;
+
+/// Without a bound, a blackholed host blocks until the kernel SYN-retry timeout (~130s on Linux).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct ExaConn {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
@@ -39,7 +43,7 @@ impl ExaConn {
             .danger_accept_invalid_hostnames(true)
             .build()
             .expect("build TLS connector");
-        let tcp = TcpStream::connect(format!("{host}:{port}"))
+        let tcp = connect_tcp(host, port)
             .unwrap_or_else(|e| panic!("TCP connect to Exasol at {host}:{port}: {e}"));
         let connector = tungstenite::Connector::NativeTls(tls);
         let (mut ws, _) = client_tls_with_config(url.as_str(), tcp, None, Some(connector))
@@ -309,6 +313,17 @@ impl Drop for ExaConn {
     fn drop(&mut self) {
         let _ = self.ws.close(None);
     }
+}
+
+fn connect_tcp(host: &str, port: u16) -> std::io::Result<TcpStream> {
+    let mut last_err = None;
+    for addr in (host, port).to_socket_addrs()? {
+        match TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT) {
+            Ok(tcp) => return Ok(tcp),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| std::io::Error::other("host resolved to no addresses")))
 }
 
 fn encrypt_password(password: &str, pem_key: &str) -> String {
