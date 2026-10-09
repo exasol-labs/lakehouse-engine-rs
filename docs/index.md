@@ -33,6 +33,7 @@ GROUP BY l_returnflag;
 | [Capabilities](capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
 | [Tuning](tuning.md) | Configuration parameters reference and runtime telemetry. |
 | [Debugging pushdown](debugging-pushdown.md) | Use `EXPLAIN VIRTUAL` to inspect what the adapter pushes down for a query. |
+| [Semantic differences](semantic-differences.md) | Known cases where a pushed-down query returns a different result than native Exasol. |
 
 ## Start here
 
@@ -40,3 +41,4 @@ GROUP BY l_returnflag;
 - **Evaluating the approach?** Read [Architecture](architecture.md) and [Benchmark](benchmark.md).
 - **Tuning a running deployment?** Read [Capabilities](capabilities.md) and [Tuning](tuning.md).
 - **A query does not push down the way you expect?** Read [Debugging pushdown](debugging-pushdown.md).
+- **A result differs from the same query on a native table?** Read [Semantic differences](semantic-differences.md).

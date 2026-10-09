@@ -65,6 +65,7 @@ Start at the [documentation index](docs/index.md), or go straight to a guide:
 | [Capabilities](docs/capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
 | [Tuning](docs/tuning.md) | Configuration parameters reference and runtime telemetry. |
 | [Debugging pushdown](docs/debugging-pushdown.md) | How to see exactly what the adapter pushes down for a query, with `EXPLAIN VIRTUAL`. |
+| [Semantic differences](docs/semantic-differences.md) | Known cases where a pushed-down query returns a different result than native Exasol. |
 
 ## License
 
