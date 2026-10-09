@@ -7,6 +7,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::pruning_fixture::{
+    PRUNING_FILES, PRUNING_NAMESPACE, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, PruningFile,
+    iceberg_file_prefix, pruning_batch, pruning_writer_properties,
+};
 use super::raw_parquet::{encode_parquet_message, write_parquet_column};
 
 use anyhow::{Context, Result};
@@ -1352,6 +1356,116 @@ async fn write_one_partitioned_file<C: Catalog>(
     commit_data_files(catalog, table, data_files)
         .await
         .context("commit the regions data files")
+}
+
+/// Identity-partitioned on `p`, one data file per fixture label. The file name starts with
+/// `pc_<label>-`, so a plan's file list names the labels it scans.
+pub async fn seed_pruning_cases(catalog_url: &str, warehouse: &str) -> Result<()> {
+    let catalog = build_seed_catalog(catalog_url, warehouse, "lakehouse-e2e-seed-pruning").await?;
+    let ns = NamespaceIdent::new(PRUNING_NAMESPACE.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .context("check namespace for the pruning fixture")?
+    {
+        catalog
+            .create_namespace(&ns, HashMap::new())
+            .await
+            .context("create the pruning fixture namespace")?;
+    }
+    let table_ident = TableIdent::new(ns.clone(), PRUNING_TABLE.to_string());
+    let existing = existing_data_file_paths(&catalog, &table_ident).await?;
+    if existing.as_ref().is_some_and(|paths| !paths.is_empty()) {
+        return Ok(());
+    }
+
+    let iceberg_schema = IcebergSchema::builder()
+        .with_schema_id(0)
+        .with_fields(vec![
+            NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(
+                2,
+                PRUNING_PARTITION_COLUMN,
+                Type::Primitive(PrimitiveType::String),
+            )
+            .into(),
+            NestedField::optional(3, "k", Type::Primitive(PrimitiveType::Long)).into(),
+            NestedField::optional(4, "s", Type::Primitive(PrimitiveType::String)).into(),
+            NestedField::optional(5, "x", Type::Primitive(PrimitiveType::Double)).into(),
+            NestedField::optional(6, "ts", Type::Primitive(PrimitiveType::Timestamp)).into(),
+        ])
+        .build()
+        .context("build pruning fixture Iceberg schema")?;
+    let partition_field = UnboundPartitionField::builder()
+        .source_id(2)
+        .field_id(1000)
+        .name(PRUNING_PARTITION_COLUMN.to_string())
+        .transform(Transform::Identity)
+        .build();
+    let partition_spec = UnboundPartitionSpec::builder()
+        .with_spec_id(1)
+        .add_partition_fields([partition_field])
+        .context("build pruning fixture partition spec")?
+        .build();
+    let creation = TableCreation::builder()
+        .name(PRUNING_TABLE.to_string())
+        .schema(iceberg_schema)
+        .partition_spec(partition_spec)
+        .properties(HashMap::new())
+        .build();
+    let table = if existing.is_some() {
+        catalog
+            .load_table(&table_ident)
+            .await
+            .context("load the empty pruning fixture table")?
+    } else {
+        catalog
+            .create_table(&ns, creation)
+            .await
+            .context("create the pruning fixture table")?
+    };
+
+    let mut data_files = Vec::new();
+    for file in &PRUNING_FILES {
+        data_files.extend(write_pruning_file(&table, file).await?);
+    }
+    commit_data_files(&catalog, &table, data_files)
+        .await
+        .context("commit the pruning fixture data files")
+}
+
+async fn write_pruning_file(table: &Table, file: &PruningFile) -> Result<Vec<DataFile>> {
+    let iceberg_schema = table.metadata().current_schema().clone();
+    let partition_spec = table.metadata().default_partition_spec().as_ref().clone();
+    let file_name_gen = DefaultFileNameGenerator::new(
+        iceberg_file_prefix(file),
+        Some(uuid_suffix()),
+        DataFileFormat::Parquet,
+    );
+    let rolling_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        ParquetWriterBuilder::new(pruning_writer_properties(), iceberg_schema.clone()),
+        table.file_io().clone(),
+        FlatLocationGenerator {
+            base: table.metadata().location().to_string(),
+        },
+        file_name_gen,
+    );
+    let partition_data = Struct::from_iter([file.partition.map(Literal::string)]);
+    let partition_key =
+        iceberg::spec::PartitionKey::new(partition_spec, iceberg_schema.clone(), partition_data);
+    let mut writer = DataFileWriterBuilder::new(rolling_builder)
+        .build(Some(partition_key))
+        .await
+        .with_context(|| format!("build the {} data file writer", file.label))?;
+    let batch = overlay_iceberg_field_ids(&pruning_batch(file), &iceberg_schema)?;
+    writer
+        .write(batch)
+        .await
+        .with_context(|| format!("write the {} batch", file.label))?;
+    writer
+        .close()
+        .await
+        .with_context(|| format!("close the {} data file writer", file.label))
 }
 
 // iceberg-rust 0.10 has no schema-evolution API, so the rename (#26) is applied via a
