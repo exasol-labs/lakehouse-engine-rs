@@ -12,8 +12,9 @@
 [![Exasol|database](https://img.shields.io/badge/Exasol-database-blue.svg)](https://www.exasol.com)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 
-**In-place lakehouse query engine for Exasol. DataFusion runs in Rust UDFs and queries Iceberg
-and Databricks tables straight from SQL.**
+**In-place lakehouse query engine for Exasol. DataFusion runs in Rust UDFs and queries Iceberg,
+Delta, and Parquet tables straight from SQL. The tables sit behind an Iceberg REST catalog, Unity
+Catalog, AWS Glue, or direct storage.**
 
 </div>
 
@@ -42,13 +43,13 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
 - **Execution model.** [Apache DataFusion](https://datafusion.apache.org/) runs inside stateless
   Rust UDFs. Each invocation creates one session, and the engine discards that session on
   completion.
-- **Sharding.** The engine resolves the Iceberg file list once per query and splits it into
-  sharded work units. Exasol distributes the work units across the nodes and multiplexes them onto
-  the cores of each node. Cluster parallelism and the vectorized execution of DataFusion therefore
-  compound. No node scans the files of another node.
+- **Sharding.** The engine resolves the file list of an Iceberg, Delta, or Parquet table once per
+  query and splits it into sharded work units. Exasol distributes the work units across the nodes
+  and multiplexes them onto the cores of each node. Cluster parallelism and the vectorized
+  execution of DataFusion therefore compound. No node scans the files of another node.
 - **Pushdown.** Pushed-down projection, filter, LIMIT, Top-N, aggregation, and broadcast-eligible
-  inner equi-joins keep each scan lean. The same path reaches Apache Iceberg and
-  Databricks-managed Iceberg.
+  inner equi-joins keep each scan lean. The same path serves every catalog kind, including
+  Databricks-managed tables.
 - **No materialization.** Every query starts from source metadata. The engine materializes nothing
   and copies nothing out.
 
@@ -59,7 +60,7 @@ Start at the [documentation index](docs/index.md), or go straight to a guide:
 | Guide | What it covers |
 |-------|----------------|
 | [Install](docs/install.md) | One command installs the engine on any Exasol deployment: SaaS, Exasol AsApp, Docker, or on-premise. It uploads the `.so`, registers the Rust SLC, and creates the scripts. Build-from-source and fully manual paths are covered too, as appendices. |
-| [Catalogs](docs/catalogs.md) | How to connect to Iceberg REST, AWS Glue, and Lakekeeper catalogs. Covers CONNECTION objects, credentials, and object-storage access. |
+| [Catalogs](docs/catalogs.md) | How to connect to Iceberg REST (including Lakekeeper), Unity Catalog, AWS Glue, and direct storage. Covers CONNECTION objects, credentials, and object-storage access. |
 | [Benchmark](docs/benchmark.md) | The benchmark query set and how to run it yourself. |
 | [Architecture](docs/architecture.md) | How cluster and DataFusion parallelism combine: file sharding, `GROUP BY shard_key` fan-out, and how pushdown meets parent-level Exasol execution. |
 | [Capabilities](docs/capabilities.md) | Pushdown support matrix: what runs in DataFusion versus Exasol. |
