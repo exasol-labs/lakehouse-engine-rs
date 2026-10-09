@@ -44,12 +44,12 @@ SELECT id, name, score FROM MY_LAKEHOUSE.EVENTS WHERE score > 15.0 LIMIT 5;
   Rust UDFs. Each invocation creates one session, and the engine discards that session on
   completion.
 - **Sharding.** The engine resolves the file list of an Iceberg, Delta, or Parquet table once per
-  query and splits it into sharded work units. Exasol distributes the work units across the nodes and multiplexes them onto
-  the cores of each node. Cluster parallelism and the vectorized execution of DataFusion therefore
-  compound. No node scans the files of another node.
+  query and splits it into sharded work units. Exasol distributes the work units across the nodes
+  and multiplexes them onto the cores of each node. Cluster parallelism and the vectorized
+  execution of DataFusion therefore compound. No node scans the files of another node.
 - **Pushdown.** Pushed-down projection, filter, LIMIT, Top-N, aggregation, and broadcast-eligible
-  inner equi-joins keep each scan lean. The same path reaches Iceberg, Delta, and Parquet tables
-  through all four catalog kinds, including Databricks-managed tables.
+  inner equi-joins keep each scan lean. The same path serves every catalog kind, including
+  Databricks-managed tables.
 - **No materialization.** Every query starts from source metadata. The engine materializes nothing
   and copies nothing out.
 

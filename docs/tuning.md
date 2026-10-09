@@ -13,7 +13,7 @@ All properties belong to `CREATE VIRTUAL SCHEMA` unless the table says otherwise
 | Property | Required | Default | Effect |
 |---|---|---|---|
 | `CATALOG_CONNECTION` | yes | — | Name of the Exasol CONNECTION that holds the catalog URI + credentials JSON. See [Install](install.md). |
-| `CATALOG_KIND` | no | absent (Iceberg REST) | Which catalog backend to resolve against: leave it absent for an Iceberg REST catalog, or set `'UNITY_CATALOG'` for a native Unity Catalog. Any other value, including the literal `'ICEBERG_REST'`, is rejected — Iceberg REST is selected only by leaving the property unset. See [Catalogs](catalogs.md). |
+| `CATALOG_KIND` | no | absent (Iceberg REST) | Which catalog backend to resolve against. Leave it absent for an Iceberg REST catalog, or set `'UNITY_CATALOG'`, `'GLUE'`, or `'DIRECT_STORAGE'`. Any other value, including the literal `'ICEBERG_REST'`, is rejected. See [Catalogs](catalogs.md). |
 | `NAMESPACE` | yes | — | Catalog namespace: dot-delimited Iceberg namespace segments under `ICEBERG_REST`, or `catalog.schema` under `UNITY_CATALOG`. Every table in the namespace becomes a virtual table. |
 | `ALLOW_HTTP` | no | `false` | `'true'` permits plain-HTTP catalog/S3 (for example, local SeaweedFS). |
 | `PARALLELISM_FACTOR` | no | `max(detected core count × 2, 8)` | Shard oversubscription multiplier. `G = node_count × factor`, capped 300. |
