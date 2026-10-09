@@ -1,5 +1,5 @@
-//! Pruning-only: every emitted conjunct is implied by the user predicate, so an untranslatable
-//! node is dropped (widening the file set) and DataFusion stays the row-level backstop.
+//! Pruning-only: every emitted predicate is implied by the user predicate. An untranslatable node
+//! is dropped, widening the file set, and `NOT` negates only an exactly translated child.
 
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, NestedFieldRef, PrimitiveType, Schema};
@@ -155,6 +155,26 @@ fn extract_column(node: &Json) -> Option<&str> {
 
 /// `None` means no constraint: the caller must pass all files, never none.
 pub fn to_iceberg_predicate(filter_json: &Json, schema: &Schema) -> Option<Predicate> {
+    translate(filter_json, schema).map(|translated| translated.predicate)
+}
+
+/// Only an exact translation may be negated: `NOT` over a widened child would narrow it,
+/// pruning files that still hold matching rows (#466).
+struct Translated {
+    predicate: Predicate,
+    exact: bool,
+}
+
+impl Translated {
+    fn exact(predicate: Predicate) -> Self {
+        Self {
+            predicate,
+            exact: true,
+        }
+    }
+}
+
+fn translate(filter_json: &Json, schema: &Schema) -> Option<Translated> {
     let kind = filter_json.get("type")?.as_str()?;
 
     match kind {
@@ -162,39 +182,41 @@ pub fn to_iceberg_predicate(filter_json: &Json, schema: &Schema) -> Option<Predi
         | "predicate_less"
         | "predicate_lessequal"
         | "predicate_greater"
-        | "predicate_greaterequal" => translate_binary(filter_json, kind, schema),
+        | "predicate_greaterequal" => {
+            translate_binary(filter_json, kind, schema).map(Translated::exact)
+        }
 
         // Not soundly prunable to a single range.
         "predicate_notequal" => None,
 
         "predicate_and" => {
             let exprs = filter_json.get("expressions")?.as_array()?;
-            fold_and(exprs, schema)
+            fold_and(exprs.iter().map(|expr| translate(expr, schema)))
         }
         "predicate_or" => {
             let exprs = filter_json.get("expressions")?.as_array()?;
-            fold_or(exprs, schema)
+            fold_or(exprs.iter().map(|expr| translate(expr, schema)))
         }
         "predicate_not" => {
             let inner = filter_json.get("expression")?;
-            let child = to_iceberg_predicate(inner, schema)?;
-            Some(child.negate())
+            let Translated { predicate, exact } = translate(inner, schema)?;
+            exact.then(|| Translated::exact(predicate.negate()))
         }
 
         "predicate_is_null" => {
             let col_node = filter_json.get("expression")?;
             let col_name = extract_column(col_node)?;
             let (exact_name, _prim) = resolve_column(col_name, schema)?;
-            Some(Reference::new(exact_name).is_null())
+            Some(Translated::exact(Reference::new(exact_name).is_null()))
         }
         "predicate_is_not_null" => {
             let col_node = filter_json.get("expression")?;
             let col_name = extract_column(col_node)?;
             let (exact_name, _prim) = resolve_column(col_name, schema)?;
-            Some(Reference::new(exact_name).is_not_null())
+            Some(Translated::exact(Reference::new(exact_name).is_not_null()))
         }
 
-        "predicate_in_constlist" => translate_in(filter_json, schema),
+        "predicate_in_constlist" => translate_in(filter_json, schema).map(Translated::exact),
 
         "predicate_between" => translate_between(filter_json, schema),
 
@@ -246,32 +268,30 @@ fn flip_operator(kind: &str) -> Option<&'static str> {
     })
 }
 
-fn fold_and(exprs: &[Json], schema: &Schema) -> Option<Predicate> {
-    let mut acc: Option<Predicate> = None;
-    for expr in exprs {
-        if let Some(child) = to_iceberg_predicate(expr, schema) {
-            acc = Some(match acc {
-                None => child,
-                Some(prev) => prev.and(child),
-            });
+fn fold_and(children: impl Iterator<Item = Option<Translated>>) -> Option<Translated> {
+    let mut predicates = Vec::new();
+    let mut exact = true;
+    for child in children {
+        match child {
+            Some(translated) => {
+                exact &= translated.exact;
+                predicates.push(translated.predicate);
+            }
+            None => exact = false,
         }
     }
-    acc
+    let predicate = predicates.into_iter().reduce(Predicate::and)?;
+    Some(Translated { predicate, exact })
 }
 
-fn fold_or(exprs: &[Json], schema: &Schema) -> Option<Predicate> {
-    if exprs.is_empty() {
-        return None;
-    }
-    let mut acc: Option<Predicate> = None;
-    for expr in exprs {
-        let child = to_iceberg_predicate(expr, schema)?;
-        acc = Some(match acc {
-            None => child,
-            Some(prev) => prev.or(child),
-        });
-    }
-    acc
+fn fold_or(children: impl Iterator<Item = Option<Translated>>) -> Option<Translated> {
+    let translated: Vec<Translated> = children.collect::<Option<_>>()?;
+    let exact = translated.iter().all(|child| child.exact);
+    let predicate = translated
+        .into_iter()
+        .map(|child| child.predicate)
+        .reduce(Predicate::or)?;
+    Some(Translated { predicate, exact })
 }
 
 fn translate_in(node: &Json, schema: &Schema) -> Option<Predicate> {
@@ -288,28 +308,23 @@ fn translate_in(node: &Json, schema: &Schema) -> Option<Predicate> {
     Some(Reference::new(exact_name).is_in(datums))
 }
 
-/// Either bound alone is implied by BETWEEN, so a failed bound drops only its own conjunct.
-fn translate_between(node: &Json, schema: &Schema) -> Option<Predicate> {
+/// Either bound alone is implied by BETWEEN, so a failed bound drops only its own conjunct
+/// and leaves the result inexact.
+fn translate_between(node: &Json, schema: &Schema) -> Option<Translated> {
     let col_node = node.get("expression")?;
     let col_name = extract_column(col_node)?;
     let (exact_name, prim) = resolve_column(col_name, schema)?;
 
-    let low_node = node.get("left");
-    let high_node = node.get("right");
-
-    let low_pred = low_node
+    let low = node
+        .get("left")
         .and_then(|n| literal_to_datum(n, prim))
-        .map(|d| Reference::new(exact_name).greater_than_or_equal_to(d));
-    let high_pred = high_node
+        .map(|d| Translated::exact(Reference::new(exact_name).greater_than_or_equal_to(d)));
+    let high = node
+        .get("right")
         .and_then(|n| literal_to_datum(n, prim))
-        .map(|d| Reference::new(exact_name).less_than_or_equal_to(d));
+        .map(|d| Translated::exact(Reference::new(exact_name).less_than_or_equal_to(d)));
 
-    match (low_pred, high_pred) {
-        (Some(lo), Some(hi)) => Some(lo.and(hi)),
-        (Some(lo), None) => Some(lo),
-        (None, Some(hi)) => Some(hi),
-        (None, None) => None,
-    }
+    fold_and([low, high].into_iter())
 }
 
 #[cfg(test)]

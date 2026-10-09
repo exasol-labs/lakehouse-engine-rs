@@ -375,3 +375,100 @@ fn between_with_one_failing_bound_keeps_other() {
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains("<="), "got: {s}");
 }
+
+fn amount_below(v: i64) -> Json {
+    json!({"type": "predicate_less", "left": col("AMOUNT"), "right": int_lit(v)})
+}
+
+fn name_like(pattern: &str) -> Json {
+    json!({"type": "predicate_like", "expression": col("NAME"), "pattern": str_lit(pattern)})
+}
+
+fn not(expression: Json) -> Json {
+    json!({"type": "predicate_not", "expression": expression})
+}
+
+fn and(expressions: [Json; 2]) -> Json {
+    json!({"type": "predicate_and", "expressions": expressions})
+}
+
+#[test]
+fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
+    let schema = test_schema();
+    for conjuncts in [
+        [amount_below(30), name_like("x%")],
+        [name_like("x%"), amount_below(30)],
+    ] {
+        let node = not(and(conjuncts));
+        assert_eq!(to_iceberg_predicate(&node, &schema), None, "{node}");
+    }
+}
+
+#[test]
+fn not_over_a_between_that_dropped_a_bound_returns_none() {
+    let schema = test_schema();
+    let node = not(json!({
+        "type": "predicate_between",
+        "expression": col("AMOUNT"),
+        "left": int_lit(10),
+        "right": {"type": "literal_exactnumeric", "value": 20.5}
+    }));
+    assert_eq!(to_iceberg_predicate(&node, &schema), None);
+}
+
+#[test]
+fn not_over_an_or_with_an_inexact_branch_returns_none() {
+    let schema = test_schema();
+    let node = not(json!({
+        "type": "predicate_or",
+        "expressions": [
+            and([amount_below(30), name_like("x%")]),
+            {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)}
+        ]
+    }));
+    assert_eq!(to_iceberg_predicate(&node, &schema), None);
+}
+
+#[test]
+fn not_over_a_fully_translated_and_negates_the_whole_conjunction() {
+    let schema = test_schema();
+    let node = not(and([
+        amount_below(30),
+        json!({"type": "predicate_equal", "left": col("NAME"), "right": str_lit("a")}),
+    ]));
+    let expected = Reference::new("amount")
+        .greater_than_or_equal_to(Datum::long(30))
+        .or(Reference::new("name").not_equal_to(Datum::string("a")));
+    assert_eq!(to_iceberg_predicate(&node, &schema), Some(expected));
+}
+
+#[test]
+fn not_over_a_fully_translated_between_negates_both_bounds() {
+    let schema = test_schema();
+    let node = not(json!({
+        "type": "predicate_between",
+        "expression": col("AMOUNT"),
+        "left": int_lit(10),
+        "right": int_lit(20)
+    }));
+    let expected = Reference::new("amount")
+        .less_than(Datum::long(10))
+        .or(Reference::new("amount").greater_than(Datum::long(20)));
+    assert_eq!(to_iceberg_predicate(&node, &schema), Some(expected));
+}
+
+#[test]
+fn not_over_a_fully_translated_or_negates_every_branch() {
+    let schema = test_schema();
+    let node = not(json!({
+        "type": "predicate_or",
+        "expressions": [
+            amount_below(10),
+            {"type": "predicate_greater", "left": col("AMOUNT"), "right": int_lit(20)}
+        ]
+    }));
+    let expected = Reference::new("amount")
+        .greater_than_or_equal_to(Datum::long(10))
+        .and(Reference::new("amount").less_than_or_equal_to(Datum::long(20)));
+    assert_eq!(to_iceberg_predicate(&node, &schema), Some(expected));
+}

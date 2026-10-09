@@ -49,6 +49,14 @@ pub mod pos_delete_fixtures;
     feature = "unity-e2e",
     feature = "glue-e2e"
 ))]
+pub mod pruning_fixture;
+#[cfg(any(
+    feature = "exasol-e2e",
+    feature = "lakekeeper-e2e",
+    feature = "azure-e2e",
+    feature = "unity-e2e",
+    feature = "glue-e2e"
+))]
 pub mod raw_parquet;
 #[cfg(any(
     feature = "exasol-e2e",
