@@ -94,3 +94,11 @@ queryable through the unchanged `createVirtualSchema` listing pipeline.
 * *AND* the store's HTTP connection-retention budget SHALL be at least the limiter's cap, so an admitted request never finds its connection already evicted, and the two values SHALL be derived from ONE declared constant rather than set independently
 * *AND* the limiter SHALL be an application-level admission gate, DISTINCT from the scan UDF's per-instance connection budget that `scan-runtime/scan-execution-connection-concurrency` owns, and MUST NOT read or modify that budget
 * *AND* the chosen cap SHALL be recorded as a deliberately conservative starting value to revisit with measurements, because a refresh sweeping many thousands of footers tolerates far more concurrency than a per-query plan
+
+### Scenario: A refresh that a column pair fails keeps the previous declaration queryable
+
+* *GIVEN* a direct-storage virtual schema that leaves `MERGE_SCHEMA` absent, whose last successful `CREATE VIRTUAL SCHEMA` or `REFRESH` declared several tables, one of whose directories has since gained a file storing a column `X` at a type that no widening pair folds with the type another file of that table stores
+* *WHEN* Exasol sends a `refresh` request
+* *THEN* the `ALTER VIRTUAL SCHEMA ... REFRESH` statement SHALL fail with the fold error naming `X`, both types, and both file paths, per `direct-storage/parquet-directory-seam`, and the adapter MUST NOT skip that directory or return a partial table set, per the scenario "A first-level directory holding no data file is skipped, not failed"
+* *AND* the error message MUST NOT contain a credential value
+* *AND* Exasol SHALL keep the tables and columns the last successful `CREATE VIRTUAL SCHEMA` or `REFRESH` declared, so every other table SHALL stay queryable and SHALL return the rows of its current data files

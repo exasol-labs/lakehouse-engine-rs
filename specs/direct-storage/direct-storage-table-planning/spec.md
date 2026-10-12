@@ -70,3 +70,22 @@ File-level sharding, the pushdown wire format, streaming emit, and the memory mo
 * *AND* this SHALL be a recorded, deliberate trade-off rather than a defect of this reader, because the operator selected a `CATALOG_KIND` that names no table format, and an operator who wants table-format semantics selects the catalog kind that supplies them
 * *AND* the trade-off SHALL be stated in the user documentation alongside the direct-storage recipe, naming the correct `CATALOG_KIND` as the fix, so an operator meets it before the result surprises them
 * *AND* the engine MUST NOT detect a table-format directory and refuse it, because a user may legitimately want the raw files, and a detection heuristic would make a supported read fail on a directory layout it guessed wrong about
+
+### Scenario: Until a refresh, a query reads the current files under the declared columns
+
+* *GIVEN* a direct-storage virtual schema that leaves `MERGE_SCHEMA` and `HIVE_PARTITIONING` absent, and since its last `CREATE VIRTUAL SCHEMA` or `REFRESH` one table has gained a data file of its declared columns, one has gained a file carrying an undeclared column, one has gained a file under a `key=value` directory segment that no earlier file of it carried, one table directory has lost its last data file while it still holds `_SUCCESS`, and a new first-level directory holding a data file has appeared
+* *WHEN* an Exasol user queries the virtual schema before any `REFRESH`
+* *THEN* a query on the table that gained a data file SHALL return the new file's rows together with the old ones, because the adapter lists a table's files again for every query
+* *AND* the undeclared column, the new partition column, and the new directory's table SHALL stay unknown to Exasol until a `REFRESH`, per `vs-adapter/refresh-and-set-properties`, so a query naming any of them SHALL fail in Exasol with an error stating that the object is not found
+* *AND* a query on the declared columns of a table that gained a file carrying an undeclared column or a new partition segment SHALL return the rows of every current data file of that table
+* *AND* a query on the table whose directory lost its last data file SHALL return zero rows without an error, because the per-query listing resolves an empty file list for a table Exasol still declares
+
+### Scenario: Until a refresh, a file the declaration cannot hold fails the query and never returns a wrong value
+
+* *GIVEN* a direct-storage virtual schema that leaves `MERGE_SCHEMA` absent, a table whose 32-bit integer column `QTY` is declared `DECIMAL(10,0)` and has since gained a file storing `QTY` as a 64-bit integer, holding one value outside the 32-bit range but within `DECIMAL(10,0)` and one value outside `DECIMAL(10,0)`
+* *AND* a second, unpartitioned table whose column `X` one file stores as a 64-bit integer, which has since gained a file storing `X` as a string, a pair no widening rule folds
+* *WHEN* an Exasol user queries both tables before any `REFRESH`
+* *THEN* a query that returns the `QTY` value outside `DECIMAL(10,0)` SHALL fail with a numeric out-of-range error, and MUST NOT return a truncated, wrapped, or NULL value, because the declared type bounds what Exasol accepts from the scan and the scan emits the stored value without narrowing it
+* *AND* a query that returns only the `QTY` value within `DECIMAL(10,0)` SHALL return that value unchanged, because the declared Exasol type, not the 32-bit physical type of the older file, bounds the emitted value
+* *AND* every query on the second table, including one that does not read `X`, SHALL fail with the fold error naming `X`, both types, and both file paths, per `direct-storage/parquet-directory-seam`, because the planner folds every kept file's footer before it plans any column, and the query MUST NOT return a row
+* *AND* no error message SHALL contain a credential value

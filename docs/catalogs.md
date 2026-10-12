@@ -563,6 +563,25 @@ form, the name they are declared under, which gives three rules:
 Before this release a `key=value` directory was read as a plain directory; set
 `HIVE_PARTITIONING = 'FALSE'` to keep that behavior across the upgrade.
 
+**Parquet types.** The adapter reads each column's Parquet physical type and annotation, and declares the Exasol type below. Where Exasol has no matching type, the adapter declares the column `VARCHAR(2000000)`. The adapter refuses the columns in the last row, because it has no faithful rendering for binary (#351).
+
+| Parquet type | Exasol type |
+|---|---|
+| `BOOLEAN` | `BOOLEAN` |
+| `INT32` annotated `INT(8)` or `INT(16)`, signed or unsigned | `DECIMAL(3,0)` or `DECIMAL(5,0)` |
+| `INT32` unannotated, or annotated `INT(32, true)` | `DECIMAL(10,0)` |
+| `INT32` annotated `INT(32, false)`, and `INT64` signed or unsigned | `DECIMAL(20,0)` |
+| `FLOAT`, `DOUBLE` | `DOUBLE PRECISION` |
+| `BYTE_ARRAY` annotated `STRING`, and a top-level `ENUM` | `VARCHAR(2000000)` |
+| `INT32` annotated `DATE` | `DATE` |
+| `DECIMAL(p,s)` | `DECIMAL(p,s)` when p is at most 36, else `VARCHAR(2000000)` holding the decimal text |
+| `INT64` annotated `TIMESTAMP` in `MILLIS`, `MICROS`, or `NANOS`, and `INT96` | `TIMESTAMP`, which Exasol stores as `TIMESTAMP(3)`. Digits below the millisecond are dropped ([#461](https://github.com/exasol-labs/lakehouse-engine-rs/issues/461)) |
+| `TIME`, `INTERVAL` | `VARCHAR(2000000)` holding text |
+| `LIST`, `MAP`, and a group (struct) | `VARCHAR(2000000)` holding JSON |
+| Unannotated `BYTE_ARRAY`, unannotated `FIXED_LEN_BYTE_ARRAY`, `UUID`, `BSON`, `GEOMETRY`, `GEOGRAPHY` | `VARCHAR(2000000)`, refused when a query reads the column (see [Binary columns](#binary-columns)) |
+
+A null value reads as SQL NULL in every type.
+
 **Iceberg or Delta directory caveat.** Pointing this catalog kind at a directory that is actually an
 Iceberg table or a Delta table is a supported but almost always wrong choice: direct storage knows
 nothing about snapshots, manifests, or the transaction log, so it reads every physical Parquet file
@@ -585,6 +604,18 @@ partition values cannot satisfy it. Range and `BETWEEN` compare partition values
 order Exasol applies to `VARCHAR`, so `month=10` sorts before `month=9`. A filter on any other
 column, or one that applies a function to a partition column, prunes no file: there is no
 footer-statistics pruning (#412), and nothing bounds how many files a table may hold (#419).
+
+**What a REFRESH changes.** Exasol keeps the declaration that the last successful `CREATE VIRTUAL SCHEMA` or `REFRESH` produced, so a change in storage takes effect in two steps. A new file under an existing table is read on the next query. A new table, a new column, a new partition key, or a wider column type needs a `REFRESH`. The table below assumes the default `MERGE_SCHEMA = 'TRUE'` and `HIVE_PARTITIONING = 'TRUE'`.
+
+| Change in storage | Before the next `REFRESH` | After `REFRESH` |
+|---|---|---|
+| A new first-level directory holding a data file | The table does not exist. A query fails with `object ... not found` | The table is listed and returns its rows |
+| A new file with the declared columns under a table | The query returns the rows of the old and new files | Same rows. The columns do not change |
+| A new file with an extra column `NEW_COL` | `NEW_COL` does not exist, so a query naming it fails. A query on the declared columns returns the rows of every file | `NEW_COL` is declared after the declared columns. It reads NULL for the old files |
+| A new file that stores a column as a wider integer than the declaration, for example `INT64` over `DECIMAL(10,0)` | A value that fits the declared type reads back unchanged. A query that returns a value outside the declared type fails with a numeric out-of-range error. No query returns a truncated value | The column is declared at the wider integer's Exasol type, `DECIMAL(20,0)` for `INT64`, and every value reads back |
+| A new file under a `key=value` directory that no earlier file of the table has | The partition key does not exist, so a query naming it fails. A query on the declared columns returns the rows of every file | The key is declared as a `VARCHAR(2000000)` column after the Parquet columns. It reads NULL for files without the segment |
+| A new file that stores a column at a type no widening rule folds with the type of another file, for example `INT64` and `STRING` | Every query on the table fails, including a query that does not read the column. The error names the column, both types, and both files | The `REFRESH` fails with the same error. The previous declaration stays, and every other table stays queryable. The conflicting table still fails every query until you fix the files |
+| A table directory loses its last data file | The table returns zero rows, without an error | The table disappears. If the directory still holds an object such as `_SUCCESS`, `SKIPPED_TABLES` lists it with the reason `holds no data file` (see [Reading SKIPPED_TABLES](#reading-skipped_tables)) |
 
 **Limitation: mixed timestamp units do not fold.** The type-widening rules this kind applies when
 folding schemas cover integer, float, and date widening, but carry no timestamp-to-timestamp rule.
