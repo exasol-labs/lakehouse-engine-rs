@@ -1586,6 +1586,19 @@ fn out_of_range_date_fails_the_query_on_every_emit_path() {
         &[&[Some("0001-01-01")], &[Some("9999-12-31")]],
     );
 
+    assert_reads(
+        &mut conn,
+        "in-range group keys, including both range bounds",
+        &format!(
+            "SELECT STORED_DATE, COUNT(*) FROM {table} WHERE ID IN (1, 2, 3) \
+             GROUP BY STORED_DATE ORDER BY STORED_DATE"
+        ),
+        &[
+            &[Some("0001-01-01"), Some("2024-01-01"), Some("9999-12-31")],
+            &[Some("1"), Some("1"), Some("1")],
+        ],
+    );
+
     assert_fails_naming(
         &mut conn,
         "raw row",
@@ -1595,7 +1608,12 @@ fn out_of_range_date_fails_the_query_on_every_emit_path() {
 
     for (aggregate, stored_days) in [("MAX", "100000000"), ("MIN", "-719163")] {
         let sql = format!("SELECT {aggregate}(STORED_DATE) FROM {table}");
-        let partial = first_emitted_column(&explain_virtual_sql(&mut conn, &sql));
+        let pushed = explain_virtual_sql(&mut conn, &sql);
+        assert!(
+            pushed.contains("\"aggregates\":[") && pushed.contains("PARTIAL_"),
+            "{aggregate} must take the partial-aggregate path, got:\n{pushed}"
+        );
+        let partial = first_emitted_column(&pushed);
         assert_fails_naming(
             &mut conn,
             &format!("{aggregate} result"),
@@ -1607,7 +1625,12 @@ fn out_of_range_date_fails_the_query_on_every_emit_path() {
     let grouped = format!(
         "SELECT STORED_DATE, COUNT(*) FROM {table} WHERE ID IN (1, 4) GROUP BY STORED_DATE"
     );
-    let group_key = first_emitted_column(&explain_virtual_sql(&mut conn, &grouped));
+    let grouped_pushed = explain_virtual_sql(&mut conn, &grouped);
+    assert!(
+        grouped_pushed.contains("\"group_keys\":[") && grouped_pushed.contains("GK_0"),
+        "GROUP BY must take the grouped partial-aggregate path, got:\n{grouped_pushed}"
+    );
+    let group_key = first_emitted_column(&grouped_pushed);
     assert_fails_naming(&mut conn, "group key", &grouped, &[&group_key, "100000000"]);
 
     assert_reads(

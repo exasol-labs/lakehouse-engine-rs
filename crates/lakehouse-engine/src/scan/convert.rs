@@ -33,7 +33,7 @@ fn date_out_of_range_detail(days: i32) -> String {
 
 /// Fails on the first non-null Date32 cell outside Exasol's DATE range, naming `output_column`.
 /// Any other column type passes, so callers can check every emitted column unconditionally.
-pub fn check_date32_in_exasol_range(
+pub(crate) fn check_date32_in_exasol_range(
     column: &dyn Array,
     output_column: &str,
 ) -> Result<(), UdfError> {
