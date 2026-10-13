@@ -13,6 +13,7 @@ The client is built once per request as a `UnityCatalogSession` holding one pool
 * The credential-vending key is the Unity Catalog `table_id`. It crosses the boundary as an OPAQUE value that no caller outside this crate interprets.
 * A column's `partition_index` stays crate-private. It crosses the boundary only as the neutral table's ordered partition-column names.
 * No error, log line, or skip reason carries a credential value. The vending key is a table identity, not a secret, and it is still never logged, because it scopes a credential request.
+* The table-level `properties` map crosses the boundary verbatim as the neutral table's properties, from the same `TableInfo` that supplies the columns. The client interprets no key of it, and a listed entry without `properties` yields an empty map. This is issue #426: the engine reads `delta.columnMapping.mode` from it to declare a Delta table's columns at createVirtualSchema (`unity-catalog/unity-catalog-create-virtual-schema`).
 
 ## Scenarios
 
