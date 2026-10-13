@@ -214,7 +214,7 @@ impl Case {
             Format::Hive => self.hive,
             Format::Delta => self.delta,
         }?;
-        Some(labels.iter().map(|label| label.to_string()).collect())
+        Some(labels.iter().map(ToString::to_string).collect())
     }
 }
 
