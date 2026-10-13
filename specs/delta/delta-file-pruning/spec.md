@@ -242,3 +242,11 @@ predicate stays applied above the scan as the sole source of row-level correctne
 * *AND* the rows each query returns SHALL be identical to the rows the same query returns with pruning inert, so pruning is observable in the plan and invisible in the result
 * *AND* every request shape SHALL prune through the SAME seam, because the format-reader seam forwards the request's filter to the reader for a single-table scan and for each join leg alike (`file-planning/pushdown-format-neutral-resolution`), so no shape is left unpruned and none is gated on the table format
 * *AND* a join SHALL prune each side by that side's OWN side-local predicate, and MUST NOT apply one side's predicate to the other's file list
+
+### Scenario: Delta pruning keeps every file with a matching row for every filter shape
+
+* *GIVEN* a virtual schema over a partitioned Delta table whose files differ in partition value, per-file statistics, per-row-group bounds, per-page bounds, and NULL content, including a NULL partition value and a file whose statistics-only column is NULL in every row, and a native Exasol table that holds the same rows
+* *WHEN* queries apply `NOT` over `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`, and `IS NOT NULL` on the partition column, the statistics-only column, and both, with a `LIKE`, a scalar function, or a predicate the DataFusion dialect declines as the untranslatable side
+* *THEN* each query SHALL return the native table's rows, and the scanned files SHALL include every file that holds a matching row
+* *AND* a `NOT` over a partly translated predicate (`file-planning/pushdown-file-pruning`) MUST NOT prune by its negation, while for a fully translated predicate the scanned files SHALL be exactly the files the kernel's partition and statistics evaluation keeps, so a change that turns pruning off fails
+* *AND* a query that scans no file SHALL take the empty-result route, and every other query SHALL apply its predicate in the scan or in the adapter's outer `WHERE`, never drop it

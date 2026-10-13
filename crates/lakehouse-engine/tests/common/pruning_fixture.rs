@@ -1,5 +1,5 @@
-//! One row set for the pruning case table. The Iceberg seed, the Hive raw-Parquet copy, and
-//! the native oracle all read it, so every format answers the same predicate over the same rows.
+//! One row set for the pruning case table. The Iceberg seed, the Hive and Delta copies, and the
+//! native oracle all read it, so every format answers the same predicate over the same rows.
 
 use super::raw_parquet::{encode_parquet_with, put_fixture_object};
 
@@ -7,6 +7,7 @@ use arrow::array::{
     ArrayRef, Float64Array, Int64Array, RecordBatch, StringArray, TimestampMicrosecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
+use bytes::Bytes;
 use parquet::file::properties::{EnabledStatistics, WriterProperties};
 
 use std::collections::BTreeSet;
@@ -55,6 +56,13 @@ pub struct PruningFile {
     pub label: &'static str,
     pub partition: Option<&'static str>,
     rows: &'static [PruningRow],
+}
+
+impl PruningFile {
+    /// Row by row, so a caller derives per-file statistics from the rows, not from a footer.
+    pub fn k_values(&self) -> Vec<Option<i64>> {
+        self.rows.iter().map(|row| row.k).collect()
+    }
 }
 
 /// The `k` boundary of the `NOT (k < 30 AND u)` cases.
@@ -135,7 +143,7 @@ pub const PRUNING_FILES: [PruningFile; 6] = [
     },
 ];
 
-/// Both writers use these, so the Iceberg files and the Hive copy share one row-group and page
+/// Every copy uses these, so the Iceberg, Hive, and Delta files share one row-group and page
 /// layout, with a column index and an offset index.
 pub fn pruning_writer_properties() -> WriterProperties {
     WriterProperties::builder()
@@ -181,7 +189,7 @@ pub fn iceberg_file_prefix(file: &PruningFile) -> String {
     format!("pc_{}", file.label)
 }
 
-/// The Iceberg file name carries `<prefix>-` and the Hive object key `/<label>.parquet`.
+/// The Iceberg file name carries `<prefix>-`, and the Hive and Delta keys `/<label>.parquet`.
 pub fn labels_named(text: &str) -> BTreeSet<String> {
     PRUNING_FILES
         .iter()
@@ -193,27 +201,37 @@ pub fn labels_named(text: &str) -> BTreeSet<String> {
         .collect()
 }
 
-pub fn hive_object_uri(file: &PruningFile) -> String {
+/// The Hive-style path below the table root, which the Hive and Delta copies share.
+pub fn pruning_relative_path(file: &PruningFile) -> String {
     let segment = file.partition.unwrap_or(HIVE_NULL_PARTITION);
     format!(
-        "{PRUNING_HIVE_BASE}{PRUNING_TABLE}/{PRUNING_PARTITION_COLUMN}={segment}/{}.parquet",
+        "{PRUNING_PARTITION_COLUMN}={segment}/{}.parquet",
         file.label
     )
 }
 
-/// The Hive copy carries the partition value in its path, so its files omit `p`.
+pub fn hive_object_uri(file: &PruningFile) -> String {
+    format!(
+        "{PRUNING_HIVE_BASE}{PRUNING_TABLE}/{}",
+        pruning_relative_path(file)
+    )
+}
+
+/// Omits `p`, whose value the Hive path and the Delta log carry, so both copies write these
+/// same bytes.
+pub fn pruning_data_file(file: &PruningFile) -> Bytes {
+    let mut batch = pruning_batch(file);
+    let partition = batch
+        .schema()
+        .index_of(PRUNING_PARTITION_COLUMN)
+        .expect("the pruning batch holds the partition column");
+    batch.remove_column(partition);
+    encode_parquet_with(&batch, pruning_writer_properties())
+}
+
 pub fn write_pruning_hive_copy() {
     for file in &PRUNING_FILES {
-        let mut batch = pruning_batch(file);
-        let partition = batch
-            .schema()
-            .index_of(PRUNING_PARTITION_COLUMN)
-            .expect("the pruning batch holds the partition column");
-        batch.remove_column(partition);
-        put_fixture_object(
-            &hive_object_uri(file),
-            encode_parquet_with(&batch, pruning_writer_properties()),
-        );
+        put_fixture_object(&hive_object_uri(file), pruning_data_file(file));
     }
 }
 
