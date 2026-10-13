@@ -42,6 +42,8 @@ pub mod lakekeeper;
 pub mod lakekeeper_authz;
 #[cfg(feature = "exasol-e2e")]
 pub mod pos_delete_fixtures;
+#[cfg(any(feature = "exasol-e2e", feature = "unity-e2e"))]
+pub mod pruning_cases;
 #[cfg(any(
     feature = "exasol-e2e",
     feature = "lakekeeper-e2e",

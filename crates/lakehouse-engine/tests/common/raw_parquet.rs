@@ -13,6 +13,7 @@ use super::e2e_harness::{local_stack_s3_store, split_s3_bucket_and_key};
 use anyhow::Context;
 use arrow::record_batch::RecordBatch;
 use bytes::Bytes;
+use futures::TryStreamExt;
 use object_store::path::Path as ObjectStorePath;
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use parquet::arrow::ArrowWriter;
@@ -85,12 +86,25 @@ pub fn write_parquet_fixture(uri: &str, batch: RecordBatch) {
 pub fn put_fixture_object(uri: &str, bytes: Bytes) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);
-    let rt = tokio::runtime::Builder::new_current_thread()
+    block_on_fixture(put_object(&store, key, bytes))
+        .unwrap_or_else(|e| panic!("PUT fixture object at {uri}: {e:#}"));
+}
+
+pub fn get_fixture_object(uri: &str) -> Bytes {
+    let (bucket, key) = split_s3_bucket_and_key(uri);
+    let store = local_stack_s3_store(bucket);
+    let path = ObjectStorePath::parse(key)
+        .unwrap_or_else(|e| panic!("fixture key of {uri} is not a valid object path: {e}"));
+    block_on_fixture(async { store.get(&path).await?.bytes().await })
+        .unwrap_or_else(|e| panic!("GET fixture object at {uri}: {e}"))
+}
+
+fn block_on_fixture<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .expect("tokio runtime for fixture write");
-    rt.block_on(put_object(&store, key, bytes))
-        .unwrap_or_else(|e| panic!("PUT fixture object at {uri}: {e:#}"));
+        .expect("tokio runtime for a fixture object operation")
+        .block_on(future)
 }
 
 /// Removes the object at `uri`; an absent object counts as removed, so a fixture can reset a
@@ -99,11 +113,7 @@ pub fn delete_fixture_object(uri: &str) {
     let (bucket, key) = split_s3_bucket_and_key(uri);
     let store = local_stack_s3_store(bucket);
     let path = ObjectStorePath::parse(key).unwrap_or_else(|e| panic!("fixture key {key}: {e}"));
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime for fixture delete");
-    match rt.block_on(store.delete(&path)) {
+    match block_on_fixture(store.delete(&path)) {
         Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
         Err(e) => panic!("DELETE fixture object at {uri}: {e}"),
     }
@@ -117,5 +127,31 @@ pub async fn put_object(store: &impl ObjectStore, key: &str, bytes: Bytes) -> an
         .put(&path, PutPayload::from(bytes))
         .await
         .with_context(|| format!("PUT {key}"))?;
+    Ok(())
+}
+
+/// Deletes every object under the URI's key prefix. A listing matches whole path segments, so
+/// a key that names one object lists nothing: delete that with `delete_fixture_object`.
+pub fn delete_fixture_prefix(uri: &str) {
+    let (bucket, key) = split_s3_bucket_and_key(uri);
+    let store = local_stack_s3_store(bucket);
+    block_on_fixture(delete_objects_under(&store, key))
+        .unwrap_or_else(|e| panic!("DELETE fixture objects under {uri}: {e:#}"));
+}
+
+async fn delete_objects_under(store: &impl ObjectStore, key: &str) -> anyhow::Result<()> {
+    let prefix = ObjectStorePath::parse(key)
+        .with_context(|| format!("fixture prefix {key} is not a valid object path"))?;
+    let objects: Vec<_> = store
+        .list(Some(&prefix))
+        .try_collect()
+        .await
+        .with_context(|| format!("list {key}"))?;
+    for object in objects {
+        store
+            .delete(&object.location)
+            .await
+            .with_context(|| format!("DELETE {}", object.location))?;
+    }
     Ok(())
 }

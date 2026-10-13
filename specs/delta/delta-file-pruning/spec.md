@@ -260,3 +260,11 @@ predicate stays applied above the scan as the sole source of row-level correctne
 * *WHEN* the Delta format reader resolves the scan for a filter `A = 7` against those notes
 * *THEN* the reader SHALL translate the filter on `A` to the field that carries `a`'s recorded physical name, now displayed as `b`, so pruning keeps the file whose statistics for that physical column admit 7
 * *AND* a filter on a declared column whose physical name the current snapshot no longer carries SHALL prune no file for that conjunct
+
+### Scenario: Delta pruning keeps every file with a matching row for every filter shape
+
+* *GIVEN* a virtual schema over a partitioned Delta table whose files differ in partition value, per-file statistics, per-row-group bounds, per-page bounds, and NULL content, including a NULL partition value and a file whose statistics-only column is NULL in every row, and a native Exasol table that holds the same rows
+* *WHEN* queries apply `NOT` over `AND`, `OR`, `NOT`, `IN`, `BETWEEN`, `IS NULL`, and `IS NOT NULL` on the partition column, the statistics-only column, and both, with a `LIKE`, a scalar function, or a predicate the DataFusion dialect declines as the untranslatable side
+* *THEN* each query SHALL return the native table's rows, and the scanned files SHALL include every file that holds a matching row
+* *AND* a `NOT` over a partly translated predicate (`file-planning/pushdown-file-pruning`) MUST NOT prune by its negation, while for a fully translated predicate the scanned files SHALL be exactly the files the kernel's partition and statistics evaluation keeps, so a change that turns pruning off fails
+* *AND* a query that scans no file SHALL take the empty-result route, and every other query SHALL apply its predicate in the scan or in the adapter's outer `WHERE`, never drop it

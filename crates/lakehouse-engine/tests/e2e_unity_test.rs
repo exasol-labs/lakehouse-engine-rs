@@ -14,7 +14,17 @@ use common::e2e_harness::{
     query_error, reads, refuses, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
-use common::raw_parquet::{encode_parquet, put_fixture_object, write_parquet_fixture};
+use common::pruning_cases::{
+    Format, VS_DELTA, assert_cases_hold, assert_one_shaped_file_per_label, read_footer,
+};
+use common::pruning_fixture::{
+    PRUNING_FILES, PRUNING_PARTITION_COLUMN, PRUNING_TABLE, labels_named, oracle_statements,
+    pruning_data_file, pruning_relative_path,
+};
+use common::raw_parquet::{
+    delete_fixture_prefix, encode_parquet, get_fixture_object, put_fixture_object,
+    write_parquet_fixture,
+};
 use common::seed::{
     ALL_TYPES_IDS_TEXT, BOOLEAN_VALUES_TEXT, DATE_VALUES_TEXT, DECIMAL_10_2_VALUES_TEXT,
     DECIMAL_18_0_VALUES_TEXT, DECIMAL_36_6_VALUES_TEXT, DECIMAL_38_10_VALUES_TEXT,
@@ -45,6 +55,9 @@ use lakehouse_engine::scan::spec::{DeleteMechanism, FileEntry};
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
+use bytes::Bytes;
+use parquet::file::metadata::ParquetMetaData;
+use parquet::file::statistics::Statistics;
 use serde_json::{Value as Json, json};
 use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
@@ -76,6 +89,11 @@ const SALES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/sales_parquet
 const ALL_TYPES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/all_types_parquet";
 const DELTA_EXTRA_TYPES_LOCATION: &str = "s3://warehouse/unity_delta/delta_extra_types";
 
+const PRUNING_DELTA_LOCATION: &str = "s3://warehouse/delta_pruning/pruning_cases";
+/// Its own schema, so `VS_NAME` never enumerates the pruning table.
+const PRUNING_UNITY_NAMESPACE: &str = "unity.e2e_pruning";
+const PRUNING_DELTA_CONN: &str = "PRUNING_DELTA_CREDS";
+
 fn unity_port() -> u16 {
     std::env::var("LH_UNITY_PORT")
         .ok()
@@ -104,14 +122,26 @@ fn setup() {
         upload_so();
         let mut conn = exa_conn();
         create_schema_and_scripts(&mut conn);
+        for statement in oracle_statements() {
+            conn.execute(&statement);
+        }
 
         seed_sales_parquet_table();
         seed_all_types_parquet_table();
         seed_delta_extra_types_table();
+        seed_pruning_delta_table();
 
         create_unity_virtual_schema(&mut conn);
         create_unity_role_virtual_schema(&mut conn);
         create_catalog_copy_virtual_schema(&mut conn);
+        create_virtual_schema_with_password(
+            &mut conn,
+            &VsProps::new(VS_DELTA, PRUNING_UNITY_NAMESPACE)
+                .with_catalog_kind("UNITY_CATALOG")
+                .with_catalog_conn_name(PRUNING_DELTA_CONN),
+            UNITY_CATALOG_URI_INTERNAL,
+            &local_stack_connection_password(),
+        );
     });
 }
 
@@ -207,18 +237,19 @@ fn seed_sales_parquet_table() {
         write_parquet_fixture(&format!("{SALES_PARQUET_LOCATION}/{file}"), batch);
     }
 
-    register_unity_table(
-        "sales_parquet",
-        "PARQUET",
-        SALES_PARQUET_LOCATION,
-        &[
+    register_unity_table(&UnityTable {
+        namespace: UNITY_NAMESPACE,
+        name: "sales_parquet",
+        format: "PARQUET",
+        location: SALES_PARQUET_LOCATION,
+        columns: &[
             ("id", json!("long"), "LONG"),
             ("amount", json!("double"), "DOUBLE"),
             ("year", json!("integer"), "INT"),
             ("region", json!("string"), "STRING"),
         ],
-        &["year", "region"],
-    );
+        partitions: &["year", "region"],
+    });
 }
 
 fn spark_field(name: &str, spark_type: &Json) -> Json {
@@ -233,15 +264,34 @@ fn struct_type(members: &[(&str, &str)]) -> Json {
     json!({"type": "struct", "fields": fields})
 }
 
-/// A column's Spark type is the `type` of the `StructField` JSON the reader reads. Replaces any
-/// earlier registration, so a changed fixture never meets a stale one.
-fn register_unity_table(
-    name: &str,
-    format: &str,
-    location: &str,
-    columns: &[(&str, Json, &str)],
-    partitions: &[&str],
-) {
+/// A Unity table fixture: `register_unity_table` registers it and `write_delta_table` writes its
+/// Delta log from the same columns.
+struct UnityTable<'a> {
+    namespace: &'a str,
+    name: &'a str,
+    format: &'a str,
+    location: &'a str,
+    columns: &'a [(&'a str, Json, &'a str)],
+    partitions: &'a [&'a str],
+}
+
+fn split_unity_namespace(namespace: &str) -> (&str, &str) {
+    namespace
+        .split_once('.')
+        .unwrap_or_else(|| panic!("Unity namespace {namespace} is not <catalog>.<schema>"))
+}
+
+/// A column's Spark type is the `type` of the `StructField` JSON the reader reads. Creates the
+/// schema if absent and replaces any earlier registration, so no fixture meets a stale one.
+fn register_unity_table(table: &UnityTable) {
+    let UnityTable {
+        namespace,
+        name,
+        format,
+        location,
+        columns,
+        partitions,
+    } = table;
     let columns: Vec<Json> = columns
         .iter()
         .enumerate()
@@ -264,8 +314,11 @@ fn register_unity_table(
 
     let base = format!("{}/api/2.1/unity-catalog", unity_catalog_url());
     let client = reqwest::blocking::Client::new();
+    let (catalog_name, schema_name) = split_unity_namespace(namespace);
+    ensure_unity_schema(&client, &base, namespace);
+
     let delete = client
-        .delete(format!("{base}/tables/{UNITY_NAMESPACE}.{name}"))
+        .delete(format!("{base}/tables/{namespace}.{name}"))
         .send()
         .unwrap_or_else(|e| panic!("DELETE {name}: {e}"));
     assert!(
@@ -274,7 +327,6 @@ fn register_unity_table(
         delete.status()
     );
 
-    let (catalog_name, schema_name) = UNITY_NAMESPACE.split_once('.').expect("<catalog>.<schema>");
     let response = client
         .post(format!("{base}/tables"))
         .json(&json!({
@@ -289,6 +341,30 @@ fn register_unity_table(
         status.is_success(),
         "POST {name} failed: {status}: {}",
         response.text().unwrap_or_default()
+    );
+}
+
+/// The rule of `ensure` in `scripts/unity/seed.sh`: Unity Catalog OSS answers a re-create with
+/// HTTP 400 and an `*_ALREADY_EXISTS` error code, which leaves the wanted end state.
+fn ensure_unity_schema(client: &reqwest::blocking::Client, base: &str, namespace: &str) {
+    let (catalog_name, schema_name) = split_unity_namespace(namespace);
+    let response = client
+        .post(format!("{base}/schemas"))
+        .json(&json!({"name": schema_name, "catalog_name": catalog_name}))
+        .send()
+        .unwrap_or_else(|e| panic!("POST schema {catalog_name}.{schema_name}: {e}"));
+    let status = response.status();
+    let body = response.text().unwrap_or_else(|e| {
+        panic!("read the POST schema {catalog_name}.{schema_name} response body: {e}")
+    });
+    let already_exists = serde_json::from_str::<Json>(&body).is_ok_and(|error| {
+        error["error_code"]
+            .as_str()
+            .is_some_and(|code| code.ends_with("_ALREADY_EXISTS"))
+    });
+    assert!(
+        status == reqwest::StatusCode::OK || already_exists,
+        "POST schema {catalog_name}.{schema_name} failed: {status}: {body}"
     );
 }
 
@@ -398,17 +474,18 @@ fn seed_all_types_parquet_table() {
         .into_iter()
         .map(|(name, _, spark_type, type_name)| (name, spark_type, type_name))
         .collect();
-    register_unity_table(
-        "all_types_parquet",
-        "PARQUET",
-        ALL_TYPES_PARQUET_LOCATION,
-        &registered,
-        &[],
-    );
+    register_unity_table(&UnityTable {
+        namespace: UNITY_NAMESPACE,
+        name: "all_types_parquet",
+        format: "PARQUET",
+        location: ALL_TYPES_PARQUET_LOCATION,
+        columns: &registered,
+        partitions: &[],
+    });
 }
 
-/// The Delta types `stats_all_types` lacks: the decimal matrix and a binary struct member. A
-/// one-commit log over one data file, with no reader feature.
+/// The Delta types `stats_all_types` lacks: the decimal matrix and a binary struct member, in
+/// one data file with no reader feature.
 fn seed_delta_extra_types_table() {
     let batch = RecordBatch::try_from_iter_with_nullable(vec![
         ("id", all_types_ids(), false),
@@ -419,12 +496,6 @@ fn seed_delta_extra_types_table() {
         ("c_struct_binary", struct_binary_values(None), true),
     ])
     .expect("delta_extra_types batch");
-    let data_file = encode_parquet(&batch);
-    let data_file_size = data_file.len();
-    put_fixture_object(
-        &format!("{DELTA_EXTRA_TYPES_LOCATION}/part-00000.parquet"),
-        data_file,
-    );
 
     let columns = [
         ("id", json!("long"), "LONG"),
@@ -434,36 +505,137 @@ fn seed_delta_extra_types_table() {
         ("c_decimal_38_10", json!("decimal(38,10)"), "DECIMAL"),
         ("c_struct_binary", struct_type(&[("x", "binary")]), "STRUCT"),
     ];
+    let table = UnityTable {
+        namespace: UNITY_NAMESPACE,
+        name: "delta_extra_types",
+        format: "DELTA",
+        location: DELTA_EXTRA_TYPES_LOCATION,
+        columns: &columns,
+        partitions: &[],
+    };
+    write_delta_table(
+        &table,
+        &[DeltaDataFile {
+            path: "part-00000.parquet".to_string(),
+            partition_values: json!({}),
+            parquet: encode_parquet(&batch),
+            stats: json!({"numRecords": 3}),
+        }],
+    );
+    register_unity_table(&table);
+}
+
+/// One data file of a `write_delta_table` commit, at `path` relative to the table root.
+struct DeltaDataFile {
+    path: String,
+    partition_values: Json,
+    parquet: Bytes,
+    stats: Json,
+}
+
+/// Drops `location` and writes one commit anew, so no run overwrites a live log entry or data file
+/// (Delta PROTOCOL.md § Creation of New Log Entries).
+fn write_delta_table(table: &UnityTable, files: &[DeltaDataFile]) {
+    let UnityTable {
+        location,
+        columns,
+        partitions: partition_columns,
+        ..
+    } = table;
+    delete_fixture_prefix(location);
     let fields: Vec<Json> = columns
         .iter()
         .map(|(name, spark_type, _)| spark_field(name, spark_type))
         .collect();
-    let schema = json!({"type": "struct", "fields": fields});
-    let log = [
-        json!({"protocol": {"minReaderVersion": 1, "minWriterVersion": 2}}),
+    let id = location
+        .rsplit('/')
+        .next()
+        .expect("a table location has a last path segment");
+    let mut log = vec![
+        json!({"protocol": delta_protocol(columns)}),
         json!({"metaData": {
-            "id": "delta-extra-types", "format": {"provider": "parquet", "options": {}},
-            "schemaString": schema.to_string(), "partitionColumns": [], "configuration": {},
-            "createdTime": 0
+            "id": id, "format": {"provider": "parquet", "options": {}},
+            "schemaString": json!({"type": "struct", "fields": fields}).to_string(),
+            "partitionColumns": partition_columns, "configuration": {}, "createdTime": 0
         }}),
-        json!({"add": {
-            "path": "part-00000.parquet", "partitionValues": {}, "size": data_file_size,
-            "modificationTime": 0, "dataChange": true, "stats": "{\"numRecords\":3}"
-        }}),
-    ]
-    .map(|action| action.to_string())
-    .join("\n");
-    put_fixture_object(
-        &format!("{DELTA_EXTRA_TYPES_LOCATION}/_delta_log/00000000000000000000.json"),
-        log.into(),
-    );
-    register_unity_table(
-        "delta_extra_types",
-        "DELTA",
-        DELTA_EXTRA_TYPES_LOCATION,
-        &columns,
-        &[],
-    );
+    ];
+    for file in files {
+        put_fixture_object(&format!("{location}/{}", file.path), file.parquet.clone());
+        log.push(json!({"add": {
+            "path": file.path, "partitionValues": file.partition_values,
+            "size": file.parquet.len(), "modificationTime": 0, "dataChange": true,
+            "stats": file.stats.to_string()
+        }}));
+    }
+    let log: Vec<String> = log.iter().map(Json::to_string).collect();
+    put_fixture_object(&delta_first_commit_uri(location), log.join("\n").into());
+}
+
+fn delta_first_commit_uri(location: &str) -> String {
+    format!("{location}/_delta_log/00000000000000000000.json")
+}
+
+/// Delta PROTOCOL.md § Timestamp without timezone: a `timestamp_ntz` column needs reader
+/// version 3, writer version 7, and `timestampNtz` in both feature lists.
+fn delta_protocol(columns: &[(&str, Json, &str)]) -> Json {
+    if columns
+        .iter()
+        .any(|(_, spark_type, _)| spark_type == "timestamp_ntz")
+    {
+        json!({
+            "minReaderVersion": 3, "minWriterVersion": 7,
+            "readerFeatures": ["timestampNtz"], "writerFeatures": ["timestampNtz"]
+        })
+    } else {
+        json!({"minReaderVersion": 1, "minWriterVersion": 2})
+    }
+}
+
+/// The Delta copy of the pruning fixture: the Hive copy's data files, with each partition value
+/// and the `k` statistics in the log.
+fn seed_pruning_delta_table() {
+    let columns = [
+        ("id", json!("long"), "LONG"),
+        (PRUNING_PARTITION_COLUMN, json!("string"), "STRING"),
+        ("k", json!("long"), "LONG"),
+        ("s", json!("string"), "STRING"),
+        ("x", json!("double"), "DOUBLE"),
+        ("ts", json!("timestamp_ntz"), "TIMESTAMP_NTZ"),
+    ];
+    let files: Vec<DeltaDataFile> = PRUNING_FILES
+        .iter()
+        .map(|file| DeltaDataFile {
+            path: pruning_relative_path(file),
+            partition_values: json!({ PRUNING_PARTITION_COLUMN: file.partition }),
+            parquet: pruning_data_file(file),
+            stats: k_stats(&file.k_values()),
+        })
+        .collect();
+    let table = UnityTable {
+        namespace: PRUNING_UNITY_NAMESPACE,
+        name: PRUNING_TABLE,
+        format: "DELTA",
+        location: PRUNING_DELTA_LOCATION,
+        columns: &columns,
+        partitions: &[PRUNING_PARTITION_COLUMN],
+    };
+    write_delta_table(&table, &files);
+    register_unity_table(&table);
+}
+
+/// Delta PROTOCOL.md § Per-file Statistics: a column that is NULL in every row carries its null
+/// count and no bound.
+fn k_stats(k_values: &[Option<i64>]) -> Json {
+    let present: Vec<i64> = k_values.iter().flatten().copied().collect();
+    let mut stats = json!({
+        "numRecords": k_values.len(),
+        "nullCount": {"k": k_values.len() - present.len()},
+    });
+    if let (Some(min), Some(max)) = (present.iter().min(), present.iter().max()) {
+        stats["minValues"] = json!({"k": min});
+        stats["maxValues"] = json!({"k": max});
+    }
+    stats
 }
 
 fn enumerated_table_names(conn: &mut ExaConn, vs_name: &str) -> Vec<String> {
@@ -2280,4 +2452,112 @@ fn unity_unsupported_type_change_in_type_json_refuses_its_column() {
         &format!("SELECT BYTE_DECIMAL FROM {}", table_ref("TYPE_WIDENING")),
         &["byte_decimal", "'byte'", "'decimal(4,1)'"],
     );
+}
+
+/// Scenario: Delta pruning keeps every file with a matching row for every filter shape
+#[test]
+fn delta_pruning_fixture_files_hold_the_row_groups_pages_and_statistics_the_cases_need() {
+    setup();
+
+    let log_uri = delta_first_commit_uri(PRUNING_DELTA_LOCATION);
+    let log = get_fixture_object(&log_uri);
+    let adds: Vec<Json> = std::str::from_utf8(&log)
+        .unwrap_or_else(|e| panic!("{log_uri} is not UTF-8: {e}"))
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Json>(line)
+                .unwrap_or_else(|e| panic!("{log_uri} holds a line that is not JSON ({e}): {line}"))
+        })
+        .filter_map(|action| action.get("add").cloned())
+        .collect();
+    let uris: Vec<String> = adds
+        .iter()
+        .map(|add| {
+            let path = add["path"]
+                .as_str()
+                .unwrap_or_else(|| panic!("an add action in {log_uri} has no path: {add}"));
+            format!("{PRUNING_DELTA_LOCATION}/{path}")
+        })
+        .collect();
+
+    assert_one_shaped_file_per_label("Delta", &uris);
+    for (add, uri) in adds.iter().zip(&uris) {
+        assert_add_describes_its_data_file(add, uri);
+    }
+}
+
+/// The log's values come from the fixture rows and the footer's from the Parquet writer, so
+/// equal values cross-check two independent derivations.
+fn assert_add_describes_its_data_file(add: &Json, uri: &str) {
+    let cannot = format!(
+        "the Delta log disagrees with its data file {uri}, so the fixture cannot prove Delta pruning"
+    );
+    let label = labels_named(uri)
+        .pop_first()
+        .unwrap_or_else(|| panic!("{uri} names no fixture label: {cannot}"));
+    let file = PRUNING_FILES
+        .iter()
+        .find(|file| file.label == label)
+        .unwrap_or_else(|| panic!("no fixture file is labelled {label}: {cannot}"));
+    assert_eq!(
+        add["partitionValues"][PRUNING_PARTITION_COLUMN],
+        json!(file.partition),
+        "partitionValues.{PRUNING_PARTITION_COLUMN}: {cannot}"
+    );
+    assert_eq!(
+        add["size"],
+        json!(get_fixture_object(uri).len()),
+        "size: {cannot}"
+    );
+
+    let stats: Json = add["stats"]
+        .as_str()
+        .and_then(|stats| serde_json::from_str(stats).ok())
+        .unwrap_or_else(|| panic!("stats is not a JSON string: {cannot}"));
+    let footer = read_footer(uri);
+    assert_eq!(
+        stats["numRecords"],
+        json!(footer.file_metadata().num_rows()),
+        "numRecords: {cannot}"
+    );
+    let (min, max, null_count) = footer_k_statistics(&footer, &cannot);
+    assert_eq!(stats["minValues"]["k"], json!(min), "minValues.k: {cannot}");
+    assert_eq!(stats["maxValues"]["k"], json!(max), "maxValues.k: {cannot}");
+    assert_eq!(
+        stats["nullCount"]["k"],
+        json!(null_count),
+        "nullCount.k: {cannot}"
+    );
+}
+
+/// The minimum, the maximum, and the summed null count of `k` over the row-group statistics.
+fn footer_k_statistics(footer: &ParquetMetaData, cannot: &str) -> (Option<i64>, Option<i64>, u64) {
+    let k = footer
+        .file_metadata()
+        .schema_descr()
+        .columns()
+        .iter()
+        .position(|column| column.name() == "k")
+        .unwrap_or_else(|| panic!("the data file has no `k` column: {cannot}"));
+    let mut min = None;
+    let mut max = None;
+    let mut null_count = 0;
+    for row_group in footer.row_groups() {
+        let Some(Statistics::Int64(k_statistics)) = row_group.column(k).statistics() else {
+            panic!("a row group has no INT64 `k` statistics: {cannot}");
+        };
+        min = min.into_iter().chain(k_statistics.min_opt().copied()).min();
+        max = max.into_iter().chain(k_statistics.max_opt().copied()).max();
+        null_count += k_statistics
+            .null_count_opt()
+            .unwrap_or_else(|| panic!("a row group has no `k` null count: {cannot}"));
+    }
+    (min, max, null_count)
+}
+
+/// Scenario: Delta pruning keeps every file with a matching row for every filter shape
+#[test]
+fn delta_pruning_keeps_every_file_with_a_matching_row() {
+    setup();
+    assert_cases_hold(&mut exa_conn(), Format::Delta);
 }
