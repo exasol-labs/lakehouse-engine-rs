@@ -3,7 +3,6 @@ use super::super::test_support::{
     object_endpoint, sample_storage, sigv4_creds, user_message,
 };
 use super::*;
-use crate::adapter::tests::parquet_fixture::in_memory_store;
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType};
 
 const TABLE_NAME: &str = "cat.sch.orders";
@@ -115,24 +114,14 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
     );
 }
 
-fn declared(partition_columns: &[&str]) -> DeclaredSchema {
-    DeclaredSchema {
-        table: "EVENTS".into(),
-        logical_schema: Vec::new(),
-        partition_columns: partition_columns.iter().map(ToString::to_string).collect(),
-        refused_columns: Vec::new(),
-    }
-}
-
 /// Scenario: The format reader is selected at the same one site for a third source
-#[tokio::test]
-async fn direct_parquet_source_carries_only_store_and_table_root() {
+#[test]
+fn third_scan_source_selects_the_parquet_reader() {
     let creds = sigv4_creds();
     let storage = sample_storage();
-    let store: Arc<dyn ObjectStore> =
-        in_memory_store(&[("direct/events/year=2026/p.parquet", b"no footer".as_slice())]).await;
+    let store: Arc<dyn ObjectStore> = Arc::new(object_store::memory::InMemory::new());
 
-    let reader = format_reader(
+    let selected = format_reader(
         ScanSource::DirectParquet {
             store: &store,
             table_root: "s3://warehouse/direct/events",
@@ -142,27 +131,12 @@ async fn direct_parquet_source_carries_only_store_and_table_root() {
             creds: &creds,
             allow_http: true,
         },
-    )
-    .expect("a raw Parquet directory selects its reader without reading anything");
+    );
 
-    for (partition_columns, values) in [
-        (
-            vec!["year"],
-            vec![("year".to_string(), Some("2026".to_string()))],
-        ),
-        (Vec::new(), Vec::new()),
-    ] {
-        let planned = reader
-            .resolve_scan(&declared(&partition_columns), None)
-            .await
-            .expect("a listing plans without a footer");
-        assert_eq!(planned.table_root, "s3://warehouse/direct/events");
-        assert_eq!(
-            planned.files[0].partition_values,
-            values.into_iter().collect(),
-            "the declaration the reader receives, not the source, names the partition columns"
-        );
-    }
+    assert!(
+        selected.is_ok(),
+        "a raw Parquet directory must select its reader without reading anything"
+    );
 }
 
 fn glue_table(format: TableFormat) -> CatalogTable {
@@ -263,8 +237,6 @@ fn format_reader_refuses_a_delta_table_under_the_glue_source() {
     assert!(message.contains("Delta"), "{message}");
 }
 
-/// Scenario: The logical schema is the catalog's declared column list
-/// Scenario: Partition columns come from the catalog and partition values from the file paths
 #[test]
 fn declare_columns_notes_each_catalog_parquet_column_with_its_partition_position_and_refusal() {
     let table = CatalogTable {

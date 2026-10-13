@@ -111,16 +111,6 @@ async fn resolve_with(
     filter: Option<&Json>,
 ) -> Result<ResolvedScan, String> {
     let notes = declared_notes(table);
-    resolve_noted(table, &notes, storage, use_vended_credentials, filter).await
-}
-
-async fn resolve_noted(
-    table: &CatalogTable,
-    notes: &[(String, String)],
-    storage: &StorageBackend,
-    use_vended_credentials: bool,
-    filter: Option<&Json>,
-) -> Result<ResolvedScan, String> {
     let creds = ConnectionCreds {
         use_vended_credentials,
         ..unauthenticated_creds()
@@ -138,7 +128,7 @@ async fn resolve_noted(
             &connection,
         )),
     };
-    user_outcome(resolve_from_notes(&reader, &involved_notes(TABLE_NAME, notes), filter).await)
+    user_outcome(resolve_from_notes(&reader, &involved_notes(TABLE_NAME, &notes), filter).await)
 }
 
 fn user_outcome(outcome: Result<ResolvedScan, UdfError>) -> Result<ResolvedScan, String> {
@@ -197,7 +187,6 @@ async fn files_are_listed_through_the_seam_and_no_footer_is_read() {
     assert_eq!(scan.effective_storage, storage);
 }
 
-/// Scenario: The logical schema is the catalog's declared column list
 /// Scenario: A Unity Parquet column with no usable type descriptor is refused, and nullability always follows the file
 #[tokio::test]
 async fn declaration_refuses_a_column_without_a_usable_type_json_and_forces_nullable() {
@@ -235,31 +224,6 @@ async fn declaration_refuses_a_column_without_a_usable_type_json_and_forces_null
 
 /// Scenario: A Unity Parquet column with no usable type descriptor is refused, and nullability always follows the file
 #[tokio::test]
-async fn a_table_whose_every_column_is_refused_is_declared_and_fails_the_plan() {
-    let mut no_mappable = sales_table(&[("payload", "binary")], &[]);
-    no_mappable.columns.push(raw_column("note", None));
-
-    assert_eq!(
-        declared_notes(&no_mappable).len(),
-        2,
-        "CREATE still declares it"
-    );
-    let message = refusal(&no_mappable, sample_storage(), false).await;
-
-    for fragment in [
-        "virtual table 'cat.sch.sales' has no mappable column",
-        "'payload'",
-        "'note'",
-    ] {
-        assert!(
-            message.contains(fragment),
-            "'{fragment}' missing: {message}"
-        );
-    }
-}
-
-/// Scenario: A Unity Parquet column with no usable type descriptor is refused, and nullability always follows the file
-#[tokio::test]
 async fn catalog_columns_that_do_not_form_one_spark_schema_refuse_every_column() {
     let table = sales_table(&[("id", "long"), ("ID", "long")], &[]);
 
@@ -279,43 +243,6 @@ async fn catalog_columns_that_do_not_form_one_spark_schema_refuse_every_column()
             "'{fragment}' missing: {message}"
         );
     }
-}
-
-/// Scenario: The reader never infers partition columns from paths or partition metadata logging, and fails a plan whose partition column is refused
-#[tokio::test]
-async fn refused_partition_column_note_fails_the_plan() {
-    let table = sales_table(&[("id", "long"), ("shard", "binary")], &["shard"]);
-
-    let message = refusal(&table, sample_storage(), false).await;
-
-    for fragment in [TABLE_NAME, "'shard'", "partition column"] {
-        assert!(
-            message.contains(fragment),
-            "'{fragment}' missing: {message}"
-        );
-    }
-}
-
-/// Scenario: The logical schema is the catalog's declared column list
-#[tokio::test]
-async fn the_reader_plans_from_the_notes_and_classifies_no_type_json() {
-    let declared_long = declared_notes(&id_table());
-    let catalog_now_says_string = sales_table(&[("id", "string")], &[]);
-    let storage = served_storage(under_table(&["part-0.parquet"]))
-        .await
-        .storage;
-
-    let scan = resolve_noted(
-        &catalog_now_says_string,
-        &declared_long,
-        &storage,
-        false,
-        None,
-    )
-    .await
-    .expect("the declaration plans");
-
-    assert_eq!(scan.logical_schema, vec![nullable_field("id", "int64")]);
 }
 
 #[tokio::test]

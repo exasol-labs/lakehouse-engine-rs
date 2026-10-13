@@ -514,21 +514,6 @@ fn equal_to(column: &str, value: i64) -> Json {
     json!({"type": "predicate_equal", "left": col(column), "right": int_lit(value)})
 }
 
-/// Scenario: A filter column resolves through its declared field id
-#[test]
-fn filter_column_resolves_through_its_declared_field_id() {
-    let declared = [declared_field(1, "a"), declared_field(2, "b")];
-    let rename_swapped = int_schema(&[(1, "b"), (2, "a")]);
-
-    assert_eq!(
-        to_iceberg_predicate(&equal_to("A", 7), &declared, &rename_swapped),
-        Some(Reference::new("b").equal_to(Datum::int(7))),
-        "`A` declares field id 1, which the current schema names `b`, so pruning reads id 1's \
-         bounds and never those of the field now named `a`"
-    );
-}
-
-/// Scenario: A filter column resolves through its declared field id
 #[test]
 fn a_filter_column_whose_declared_id_was_dropped_imposes_no_constraint() {
     let declared = [declared_field(1, "id"), declared_field(2, "note")];

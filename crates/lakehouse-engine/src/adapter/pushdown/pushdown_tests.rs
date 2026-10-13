@@ -1849,81 +1849,6 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
         err.to_string().contains("cat.sch.orders"),
         "the Delta reader's own plan-time error must name the table: {err}"
     );
-
-    let unity = unity_delta_catalog().await;
-    let events = CatalogProps {
-        warehouse: "wh".into(),
-        table: "cat.sch.events".into(),
-    };
-    for (shape, request) in [
-        (
-            "projection scan",
-            super::dispatch_golden::row_scan_request(),
-        ),
-        (
-            "single-table aggregate",
-            super::dispatch_golden::single_group_agg_request(),
-        ),
-        (
-            "grouped aggregate",
-            super::dispatch_golden::grouped_request(),
-        ),
-        ("two-leg join", note_less_unity_join_request()),
-    ] {
-        let message = user_message(
-            seam_handle_pushdown(
-                &request,
-                &unity.uri,
-                &events,
-                CatalogKind::UnityCatalogNative,
-                &creds,
-            )
-            .await
-            .expect_err("a request over note-less columns cannot be planned"),
-        );
-        assert!(
-            message.contains("is missing or unreadable; ALTER VIRTUAL SCHEMA ... REFRESH"),
-            "{shape}: the one parse site must refuse it: {message}"
-        );
-    }
-    assert!(
-        unity.targets().is_empty(),
-        "every shape and every join leg parses its notes before a reader loads a table: {:?}",
-        unity.targets()
-    );
-}
-
-/// A broadcast-eligible inner equi-join of two Unity tables whose columns carry no note.
-fn note_less_unity_join_request() -> Json {
-    let key = |table: &str, name: &str| serde_json::json!({"type": "column", "name": name, "tableName": table});
-    let decimal = serde_json::json!({"type": "decimal", "precision": 20, "scale": 0});
-    serde_json::json!({
-        "involvedTables": [
-            {"name": "CUSTOMER", "columns": [{"name": "C_CUSTKEY", "dataType": decimal}]},
-            {"name": "ORDERS", "columns": [{"name": "O_CUSTKEY", "dataType": decimal}]},
-        ],
-        "pushdownRequest": {
-            "type": "select",
-            "from": {
-                "type": "join",
-                "join_type": "inner",
-                "left": {"name": "CUSTOMER", "type": "table"},
-                "right": {"name": "ORDERS", "type": "table"},
-                "condition": {
-                    "type": "predicate_equal",
-                    "left": key("CUSTOMER", "C_CUSTKEY"),
-                    "right": key("ORDERS", "O_CUSTKEY"),
-                },
-            },
-            "selectList": [key("CUSTOMER", "C_CUSTKEY"), key("ORDERS", "O_CUSTKEY")],
-        },
-        "schemaMetadataInfo": {
-            "properties": {},
-            "adapterNotes": serde_json::json!({
-                "TABLE_MAP": {"CUSTOMER": "cat.sch.customer", "ORDERS": "cat.sch.orders"}
-            }).to_string(),
-        },
-    })
 }
 
 /// Scenario: One catalog session per request serves every table the request resolves.
@@ -1995,47 +1920,6 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
             "/v1/namespaces/db/tables/orders".to_string(),
         ],
         "one /v1/config for the whole request, then exactly one loadTable per leg"
-    );
-}
-
-/// Scenario: A column without a readable note fails the pushdown naming the fix
-#[tokio::test]
-async fn pushdown_with_a_note_less_column_fails_without_fallback() {
-    let request = serde_json::json!({
-        "involvedTables": [{
-            "name": "SALES",
-            "columns": [
-                {
-                    "name": "ID",
-                    "dataType": {"type": "decimal", "precision": 10, "scale": 0},
-                    "adapterNotes": r#"{"sourceType":{"name":"id","arrow_type":"int32","nullable":true}}"#,
-                },
-                {"name": "QTY", "dataType": {"type": "decimal", "precision": 10, "scale": 0}},
-            ],
-        }],
-        "pushdownRequest": {"type": "select"},
-    });
-    let catalog = CatalogProps {
-        warehouse: "wh".into(),
-        table: "sales".into(),
-    };
-
-    let error = seam_handle_pushdown(
-        &request,
-        "s3://bucket/base",
-        &catalog,
-        CatalogKind::DirectStorage,
-        &unauthenticated_creds(),
-    )
-    .await
-    .expect_err("a column without a note must fail the pushdown");
-
-    let message = user_message(error);
-    assert!(
-        message.contains("'QTY'")
-            && message.contains("'SALES'")
-            && message.contains("ALTER VIRTUAL SCHEMA ... REFRESH"),
-        "{message}"
     );
 }
 

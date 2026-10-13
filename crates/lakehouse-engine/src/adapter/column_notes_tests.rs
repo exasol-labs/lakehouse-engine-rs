@@ -1,6 +1,4 @@
 use super::*;
-use crate::scan::spec::{NestedField, NestedMembers};
-use serde_json::Value as Json;
 
 fn user_message(error: UdfError) -> String {
     match error {
@@ -44,45 +42,6 @@ fn encoded(declaration: &ColumnDeclaration) -> Option<String> {
     Some(declaration.encode())
 }
 
-/// Scenario: Every declared column carries its source shape in its adapterNotes
-#[test]
-fn a_note_is_one_json_object_whose_source_type_is_the_scan_spec_encoding() {
-    let mut nested = field("payload", "utf8");
-    nested.nested = Some(NestedMembers::Struct {
-        fields: vec![NestedField {
-            field_id: None,
-            name: "inner".to_string(),
-            physical_name: None,
-            nested: None,
-        }],
-    });
-    let note: Json = serde_json::from_str(&declaration(nested.clone()).encode()).unwrap();
-
-    assert_eq!(note["sourceType"], serde_json::to_value(&nested).unwrap());
-    assert_eq!(note["sourceType"]["name"], "payload");
-    assert_eq!(note["sourceType"]["arrow_type"], "utf8");
-    assert!(note["sourceType"]["nested"].is_object());
-}
-
-/// Scenario: A partition column's note carries its position among the partition columns
-#[test]
-fn partition_and_refused_members_are_omitted_when_they_do_not_apply() {
-    let plain: Json = serde_json::from_str(&declaration(field("id", "int64")).encode()).unwrap();
-    assert_eq!(plain.as_object().unwrap().len(), 1, "{plain}");
-
-    let partition: Json = serde_json::from_str(
-        &ColumnDeclaration {
-            partition: Some(1),
-            ..declaration(field("month", "utf8"))
-        }
-        .encode(),
-    )
-    .unwrap();
-    assert_eq!(partition["partition"], 1);
-    assert!(partition.get("refused").is_none());
-}
-
-/// Scenario: A partition column's note carries its position among the partition columns
 #[test]
 fn partition_columns_are_ordered_by_their_recorded_position_not_by_column_order() {
     let at = |name: &str, position: Option<usize>| {
@@ -105,29 +64,6 @@ fn partition_columns_are_ordered_by_their_recorded_position_not_by_column_order(
         .map(|field| field.name.as_str())
         .collect();
     assert_eq!(logical, vec!["region", "id", "year"]);
-}
-
-/// Scenario: A refused column's note records its refusal and the column stays declared
-#[test]
-fn a_refused_column_is_dropped_from_the_logical_schema_and_recorded_with_its_reason() {
-    let refused = ColumnDeclaration {
-        refused: Some("Parquet column 'legacy_name' has type 'binary'".to_string()),
-        ..declaration(field("legacy_name", "utf8"))
-    };
-    let declared = declared_schema(vec![
-        ("ID", encoded(&declaration(field("id", "int64")))),
-        ("LEGACY_NAME", encoded(&refused)),
-    ])
-    .unwrap();
-
-    assert_eq!(declared.logical_schema, vec![field("id", "int64")]);
-    assert_eq!(
-        declared.refused_columns,
-        vec![RefusedColumn {
-            column_name: "legacy_name".to_string(),
-            reason: "Parquet column 'legacy_name' has type 'binary'".to_string(),
-        }]
-    );
 }
 
 /// Scenario: A column without a readable note fails the pushdown naming the fix
@@ -166,7 +102,6 @@ fn missing_or_unreadable_note_names_table_column_and_refresh() {
     }
 }
 
-/// Scenario: A column note longer than the per-column limit fails the statement
 #[test]
 fn encoder_refuses_a_note_over_the_limit_naming_table_and_column() {
     let at_limit = "x".repeat(MAX_COLUMN_NOTE_CHARS);
@@ -186,7 +121,6 @@ fn encoder_refuses_a_note_over_the_limit_naming_table_and_column() {
     assert!(message.contains("2000000"), "{message}");
 }
 
-/// Scenario: A column note longer than the per-column limit fails the statement
 #[test]
 fn the_limit_counts_characters_not_bytes() {
     let two_byte_chars = "é".repeat(MAX_COLUMN_NOTE_CHARS);

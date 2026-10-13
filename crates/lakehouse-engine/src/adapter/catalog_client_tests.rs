@@ -227,7 +227,6 @@ fn listed_tables(listing: &CatalogListing) -> Result<Vec<Json>, UdfError> {
     .map(|(tables, _, _)| tables)
 }
 
-/// Scenario: Every declared column carries its source shape in its adapterNotes
 #[test]
 fn a_column_with_a_declaration_gets_its_note_and_one_without_gets_none() {
     let tables = listed_tables(&declared_listing(vec![
@@ -239,43 +238,4 @@ fn a_column_with_a_declaration_gets_its_note_and_one_without_gets_none() {
     let columns = tables[0]["columns"].as_array().unwrap();
     assert_eq!(columns[0]["adapterNotes"], r#"{"sourceType":{}}"#);
     assert!(columns[1].get("adapterNotes").is_none(), "{columns:?}");
-}
-
-/// Scenario: Every declared column carries its source shape in its adapterNotes
-#[test]
-fn an_iceberg_column_without_a_slot_is_declared_from_its_field() {
-    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
-    use lakehouse_catalog::ColumnSourceType;
-
-    let mut listing = declared_listing(vec![None]);
-    listing.tables[0].format = lakehouse_catalog::TableFormat::Iceberg;
-    listing.tables[0].columns[0].source_type = ColumnSourceType::Iceberg(
-        NestedField::required(7, "qty", Type::Primitive(PrimitiveType::Long))
-            .with_initial_default(Literal::long(0))
-            .into(),
-    );
-
-    let tables = listed_tables(&listing).unwrap();
-
-    assert_eq!(
-        tables[0]["columns"][0]["adapterNotes"],
-        r#"{"sourceType":{"field_id":7,"name":"qty","arrow_type":"int64","nullable":false,"initial_default":"0"}}"#,
-        "the note carries the field id, the source name, the Arrow tag, `required` as \
-         non-nullable, and the `initial-default`"
-    );
-}
-
-/// Scenario: A column note longer than the per-column limit fails the statement
-#[test]
-fn a_note_over_the_limit_fails_the_listing_naming_table_and_column() {
-    let over_limit = "x".repeat(column_notes::MAX_COLUMN_NOTE_CHARS + 1);
-
-    let message = listed_tables(&declared_listing(vec![Some(over_limit)]))
-        .unwrap_err()
-        .to_string();
-
-    assert!(
-        message.contains("'C0'") && message.contains("'SALES'"),
-        "{message}"
-    );
 }

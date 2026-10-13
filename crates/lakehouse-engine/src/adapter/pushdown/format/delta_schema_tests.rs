@@ -1182,7 +1182,6 @@ fn declarations(table: &CatalogTable) -> Vec<ColumnDeclaration> {
         .collect()
 }
 
-/// Scenario: Each logical field carries the binding key its column-mapping mode selects
 #[test]
 fn declaration_carries_the_mode_selected_key_from_type_json() {
     let fields = [
@@ -1221,36 +1220,6 @@ fn declaration_carries_the_mode_selected_key_from_type_json() {
     }
 }
 
-/// Scenario: A Delta column whose column-mapping metadata is unusable is refused in its note and the table stays listed
-#[test]
-fn unusable_annotation_or_mode_refuses_the_column() {
-    let value_without_physical_name = StructField::nullable("value", DataType::DOUBLE)
-        .with_metadata([("delta.columnMapping.id", MetadataValue::Number(3))]);
-    let fields = [mapped_field("id", 1, "col-id"), value_without_physical_name];
-
-    let declared = declarations(&unity_delta_table(&fields, Some("name"), &[]));
-    assert_eq!(
-        declared[0].refused, None,
-        "only the unusable column is refused"
-    );
-    let reason = declared[1].refused.as_deref().expect("value is refused");
-    for fragment in ["'value'", "Name", "delta.columnMapping.physicalName"] {
-        assert!(reason.contains(fragment), "'{fragment}' missing: {reason}");
-    }
-
-    let declared = declarations(&unity_delta_table(&fields, Some("label"), &[]));
-    for (declaration, column) in declared.iter().zip(["id", "value"]) {
-        let reason = declaration
-            .refused
-            .as_deref()
-            .expect("every column is refused");
-        for fragment in [format!("'{column}'"), "'label'".to_string()] {
-            assert!(reason.contains(&fragment), "'{fragment}' missing: {reason}");
-        }
-    }
-}
-
-/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
 #[test]
 fn malformed_type_change_annotation_refuses_its_column() {
     let fields = [

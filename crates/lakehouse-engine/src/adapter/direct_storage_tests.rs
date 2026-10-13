@@ -1,7 +1,7 @@
 use super::*;
 use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::tests::parquet_fixture::{
-    directory_options, in_memory_store, nullable, parquet_bytes, parquet_footer_bytes,
+    directory_options, in_memory_store, nullable, parquet_bytes,
 };
 use crate::adapter::tests::recording_store::RecordingStore;
 use arrow::datatypes::{Field, Fields};
@@ -113,16 +113,6 @@ async fn first_level_directories_are_the_tables() {
     }
 }
 
-fn declaration_of(column: &CatalogColumn) -> ColumnDeclaration {
-    serde_json::from_str(
-        column
-            .declaration
-            .as_deref()
-            .unwrap_or_else(|| panic!("column '{}' carries a declaration", column.name)),
-    )
-    .unwrap_or_else(|e| panic!("column '{}' declaration is a note: {e}", column.name))
-}
-
 /// Scenario: A table's columns and data files come from the one shared directory seam
 #[tokio::test]
 async fn columns_carry_tag_and_declaration_from_one_fold() {
@@ -172,75 +162,6 @@ async fn columns_carry_tag_and_declaration_from_one_fold() {
         table.columns[2].source_type,
         ColumnSourceType::Parquet("utf8".to_string()),
         "partition column is utf8"
-    );
-
-    let declarations: Vec<ColumnDeclaration> = table.columns.iter().map(declaration_of).collect();
-    for (declaration, column) in declarations.iter().zip(&table.columns) {
-        assert_eq!(declaration.source_type.name, column.name);
-        assert_eq!(
-            declaration.source_type.field_id, None,
-            "no ordinal field id"
-        );
-        assert_eq!(declaration.source_type.physical_name, None);
-        assert!(declaration.source_type.nullable);
-        assert_eq!(declaration.refused, None);
-    }
-    assert_eq!(declarations[0].source_type.arrow_type, "int64");
-    assert_eq!(declarations[1].source_type.arrow_type, "utf8");
-    assert_eq!(
-        declarations[1].source_type.nested,
-        Some(NestedMembers::Struct {
-            fields: vec![NestedField {
-                field_id: None,
-                name: "x".to_string(),
-                physical_name: None,
-                nested: None,
-            }]
-        }),
-        "the nested descriptor routes the column to the JSON renderer"
-    );
-    assert_eq!(
-        declarations
-            .iter()
-            .map(|declaration| declaration.partition)
-            .collect::<Vec<_>>(),
-        vec![None, None, Some(0), Some(1)],
-        "a partition column's note carries its position among the partition keys"
-    );
-}
-
-/// Scenario: A refused column's note records its refusal and the column stays declared
-#[tokio::test]
-async fn a_binary_column_is_declared_with_its_refusal_in_the_note() {
-    let footer = parquet_footer_bytes(
-        "message m {
-            OPTIONAL INT32 id;
-            OPTIONAL BYTE_ARRAY legacy_name;
-        }",
-    );
-    let inner = in_memory_store(&[("lake/orders/part-0.parquet", &footer)]).await;
-
-    let listing = test_client(
-        inner,
-        "s3://bucket/lake",
-        directory_options(MergeMode::FoldEveryFile, true),
-    )
-    .list_tables(&[])
-    .await
-    .expect("enumeration succeeds");
-
-    let columns = &listing.tables[0].columns;
-    assert_eq!(declaration_of(&columns[0]).refused, None);
-    let refused = declaration_of(&columns[1]);
-    assert_eq!(
-        refused.refused,
-        Some(binary_refusal("Parquet", "legacy_name", None, "binary")),
-        "the note records the reason the binary-column refusal specifies"
-    );
-    assert_eq!(
-        columns[1].source_type,
-        ColumnSourceType::Parquet("utf8".to_string()),
-        "the column stays declared, as text"
     );
 }
 

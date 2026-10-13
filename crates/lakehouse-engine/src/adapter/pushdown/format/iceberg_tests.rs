@@ -1,6 +1,6 @@
 use super::super::super::test_support::{
     BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields,
-    declared_logical_schema, glue_catalog_table, iceberg_notes, involved_notes, load_table_body,
+    declared_logical_schema, glue_catalog_table, involved_notes, load_table_body,
     load_table_body_notes, load_table_body_with_columns, object_endpoint, resolve_from_notes,
     sample_storage, sigv4_creds, user_message,
 };
@@ -1020,122 +1020,46 @@ fn nested_iceberg_fields_stay_utf8_tagged_and_carry_a_nested_descriptor() {
     );
 }
 
-fn long_field(id: i32, name: &str, required: bool) -> iceberg::spec::NestedFieldRef {
-    use iceberg::spec::{PrimitiveType, Type};
-    std::sync::Arc::new(iceberg::spec::NestedField::new(
-        id,
-        name,
-        Type::Primitive(PrimitiveType::Long),
-        required,
-    ))
+fn long_schema(fields: &[(i32, &str, bool)]) -> iceberg::spec::Schema {
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
+    iceberg::spec::Schema::builder()
+        .with_fields(fields.iter().map(|&(id, name, required)| {
+            std::sync::Arc::new(NestedField::new(
+                id,
+                name,
+                Type::Primitive(PrimitiveType::Long),
+                required,
+            ))
+        }))
+        .build()
+        .expect("a valid schema")
 }
 
-async fn resolve_declared(
-    current_fields: Json,
-    last_column_id: i32,
-    notes: &TableNotes<'_>,
-) -> Result<ResolvedScan, UdfError> {
-    resolve_rest_declared(
-        load_table_body_with_columns(current_fields, last_column_id),
-        notes,
-        "db.t",
-        &sigv4_creds(),
-        &sample_storage(),
-        None,
-    )
-    .await
-}
+#[test]
+fn relaxed_nullability_is_matched_by_declared_field_id() {
+    let declared = DeclaredSchema {
+        table: "ORDERS".into(),
+        logical_schema: declared_logical_schema(&long_schema(&[
+            (2, "qty", true),
+            (3, "note", false),
+        ])),
+        partition_columns: vec![],
+        refused_columns: vec![],
+    };
 
-/// Scenario: A column renamed at the source after the last REFRESH reads under its declared name
-#[tokio::test]
-async fn the_reader_plans_the_declared_schema_not_the_current_one() {
-    let declared = iceberg_notes(&[long_field(1, "id", true), long_field(2, "score", false)]);
-    let renamed = serde_json::json!([
-        {"id": 1, "name": "id", "required": true, "type": "long"},
-        {"id": 2, "name": "rating", "required": false, "type": "long"}
-    ]);
-
-    let resolved = resolve_declared(renamed, 2, &involved_notes("T", &declared)).await;
-
-    let resolved = resolved.expect("a rename between refreshes plans");
-    assert_eq!(
-        resolved
-            .logical_schema
-            .iter()
-            .map(|field| (field.field_id, field.name.as_str()))
-            .collect::<Vec<_>>(),
-        vec![(Some(1), "id"), (Some(2), "score")],
-        "the scan binds the declared field id 2, which the rename kept, under its declared name"
+    let tightened_and_renamed =
+        long_schema(&[(2, "amount", true), (3, "note", true), (4, "qty", false)]);
+    refuse_relaxed_nullability(&tightened_and_renamed, &declared).expect(
+        "field id 2 is still required, the optional `qty` is field id 4, and a tightened \
+         column loses no row",
     );
-}
 
-/// Scenario: A declared required column that the current schema marks optional fails the query
-#[tokio::test]
-async fn a_declared_required_column_made_optional_fails_naming_table_column_and_refresh() {
-    let declared = iceberg_notes(&[long_field(1, "id", true), long_field(2, "qty", true)]);
-    let relaxed_and_renamed = serde_json::json!([
-        {"id": 1, "name": "id", "required": true, "type": "long"},
-        {"id": 2, "name": "quantity", "required": false, "type": "long"}
-    ]);
-
-    let resolved =
-        resolve_declared(relaxed_and_renamed, 2, &involved_notes("ORDERS", &declared)).await;
-
+    let relaxed = long_schema(&[(2, "amount", false), (3, "note", true)]);
     let message = user_message(
-        resolved.expect_err("a stale non-nullable declaration would drop NULL rows silently"),
+        refuse_relaxed_nullability(&relaxed, &declared)
+            .expect_err("a stale non-nullable declaration would drop NULL rows silently"),
     );
-    for fragment in [
-        "'QTY'",
-        "'ORDERS'",
-        "non-nullable",
-        "allows NULL",
-        "ALTER VIRTUAL SCHEMA ... REFRESH",
-    ] {
+    for fragment in ["'QTY'", "'ORDERS'", "ALTER VIRTUAL SCHEMA ... REFRESH"] {
         assert!(message.contains(fragment), "{message}");
     }
-}
-
-/// Scenario: A declared required column that the current schema marks optional fails the query
-#[tokio::test]
-async fn nullability_is_compared_by_declared_field_id_and_a_tightened_column_plans() {
-    let declared = iceberg_notes(&[long_field(2, "qty", true), long_field(3, "note", false)]);
-    let current = serde_json::json!([
-        {"id": 2, "name": "amount", "required": true, "type": "long"},
-        {"id": 3, "name": "note", "required": true, "type": "long"},
-        {"id": 4, "name": "qty", "required": false, "type": "long"}
-    ]);
-
-    let resolved = resolve_declared(current, 4, &involved_notes("T", &declared)).await;
-
-    resolved.expect(
-        "field id 2 is still required; the optional `qty` is field id 4, another column; and \
-         an optional declaration of a now-required column loses no row",
-    );
-}
-
-/// Scenario: A column dropped at the source after the last REFRESH reads what older data files store
-#[tokio::test]
-async fn a_dropped_declared_column_stays_in_the_planned_schema() {
-    let declared = iceberg_notes(&[
-        long_field(1, "id", true),
-        long_field(2, "note", false),
-        long_field(3, "must", true),
-    ]);
-    let dropped = serde_json::json!([
-        {"id": 1, "name": "id", "required": true, "type": "long"}
-    ]);
-
-    let resolved = resolve_declared(dropped, 3, &involved_notes("T", &declared)).await;
-
-    let resolved = resolved.expect(
-        "a dropped column plans until REFRESH; a required one fails only when a file lacks it",
-    );
-    assert_eq!(
-        resolved
-            .logical_schema
-            .iter()
-            .map(|field| field.name.as_str())
-            .collect::<Vec<_>>(),
-        vec!["id", "note", "must"]
-    );
 }

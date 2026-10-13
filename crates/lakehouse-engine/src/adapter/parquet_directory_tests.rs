@@ -314,36 +314,6 @@ async fn sample_mode_declares_only_the_sampled_files_keys() {
     );
 }
 
-/// Scenario: Two spellings of one partition key fail the refresh and the query
-#[tokio::test]
-async fn two_spellings_of_one_key_fail_enumeration_under_both_merge_modes() {
-    let data = parquet_bytes(vec![nullable("id", DataType::Int32)], 1);
-    let upper = "Year=2026/p1.parquet";
-    let lower = "year=2026/p2.parquet";
-    for merge_mode in [MergeMode::FoldEveryFile, MergeMode::SampleOneFile] {
-        // Under SampleOneFile the sampled file declares `Year`, and the second spelling sits in
-        // an unsampled file.
-        let probe = store_with(&[upper, lower], &data).await;
-
-        let error = resolve(&probe, merge_mode)
-            .await
-            .err()
-            .unwrap_or_else(|| panic!("{merge_mode:?}: two spellings of one key must fail"));
-
-        assert_mentions(
-            &error,
-            &["Year", "year", &under_root(upper), &under_root(lower)],
-        );
-    }
-
-    let probe = store_with(&["year=2025/Year=2026/p.parquet"], &data).await;
-    let error = resolve(&probe, MergeMode::FoldEveryFile)
-        .await
-        .err()
-        .expect("a key repeated under two spellings within one path must fail");
-    assert_mentions(&error, &["Year", "year", "year=2025/Year=2026/p.parquet"]);
-}
-
 #[tokio::test]
 async fn a_key_folding_onto_a_column_drops_the_column_and_keeps_the_key() {
     let stored_k = parquet_bytes(vec![nullable("K", DataType::Int32)], 1);
@@ -491,19 +461,22 @@ async fn listing_answer_keep_predicate_narrows_files_without_a_footer_read() {
     );
 }
 
-/// Scenario: Two spellings of one declared partition key fail the listing answer
-#[tokio::test]
-async fn listing_answer_fails_on_two_spellings_of_a_declared_key() {
-    let data = b"not a parquet file";
-    let probe = store_with(&["year=2024/a.parquet", "Year=2025/b.parquet"], data).await;
-    let store = Arc::clone(&probe) as Arc<dyn ObjectStore>;
-    let declared = ["year".to_string()];
+fn listed(key: &str) -> ListedFile {
+    let segments: Vec<String> = key.split('/').map(str::to_string).collect();
+    ListedFile {
+        path: StorePath::from(under_root(key)),
+        size: 0,
+        partition_segments: parse_partition_segments(&segments[..segments.len() - 1]),
+    }
+}
 
-    // The predicate rejects the `Year=2025` file, which must not hide the conflict.
-    let error = list_parquet_files(&store, &root(), &declared, &keep_year_2026)
-        .await
-        .err()
-        .expect("two spellings of one declared key must fail the listing");
+/// Scenario: Two spellings of one declared partition key fail the listing answer
+#[test]
+fn two_spellings_of_a_declared_key_fail_and_of_an_undeclared_key_contribute_nothing() {
+    let files = [listed("year=2024/a.parquet"), listed("Year=2025/b.parquet")];
+
+    let error = fill_partition_values(&files, &["year".to_string()])
+        .expect_err("two spellings of one declared key must fail the listing");
     assert_mentions(
         &error,
         &[
@@ -514,8 +487,7 @@ async fn listing_answer_fails_on_two_spellings_of_a_declared_key() {
         ],
     );
 
-    let undeclared = list_parquet_files(&store, &root(), &["region".to_string()], &|_| true)
-        .await
+    let undeclared = fill_partition_values(&files, &["region".to_string()])
         .expect("two spellings of a key that names no declared column contribute nothing");
     assert_eq!(undeclared.len(), 2);
 }

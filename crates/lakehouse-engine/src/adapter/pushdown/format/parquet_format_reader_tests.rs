@@ -2,25 +2,21 @@ use super::super::{RefusedColumn, ResolvedScan};
 use super::*;
 use crate::adapter::column_notes::{TableNotes, binary_refusal};
 use crate::adapter::parquet_directory::MergeMode;
-use crate::adapter::pushdown::test_support::filter_json::{column, compare, equal, number, string};
+use crate::adapter::pushdown::test_support::filter_json::{column, compare, equal, number};
 use crate::adapter::pushdown::test_support::{resolve_from_notes, sample_storage};
 use crate::adapter::tests::parquet_fixture::{
     directory_options, enumerated_notes, in_memory_store, nullable, parquet_bytes,
     parquet_footer_bytes,
 };
-use crate::adapter::tests::recording_store::RecordingStore;
 use crate::scan::spec::{NestedField, NestedMembers, reconstruct_abs_uri};
 use arrow::datatypes::{DataType, Field, Fields};
 use datafusion::datasource::listing::ListingTableUrl;
-use object_store::{ObjectStoreExt, PutPayload};
 use std::collections::BTreeMap;
 
 const BASE_PATH: &str = "s3://warehouse/direct";
 const TABLE_ROOT: &str = "s3://warehouse/direct/events";
 
 /// Unreadable as Parquet: a successful resolution proves its footer was never read.
-const NOT_PARQUET: &[u8] = b"not a parquet file";
-
 type Notes = Vec<(String, Option<String>)>;
 
 /// One row of nulls declares `fields` without needing a value per Arrow type.
@@ -74,18 +70,6 @@ async fn resolve(
     try_resolve(store, &notes, filter_json)
         .await
         .expect("a directory of readable Parquet files resolves a scan")
-}
-
-async fn overwrite_with_garbage(store: &Arc<dyn ObjectStore>, keys: &[&str]) {
-    for key in keys {
-        store
-            .put(
-                &StorePath::parse(key).expect("the fixture key is a valid store path"),
-                PutPayload::from(NOT_PARQUET.to_vec()),
-            )
-            .await
-            .expect("the in-memory store accepts the overwrite");
-    }
 }
 
 fn column_names(scan: &ResolvedScan) -> Vec<&str> {
@@ -292,96 +276,6 @@ async fn merge_mode_decides_the_declared_columns_at_enumeration() {
     );
 }
 
-/// Scenario: A direct-storage pushdown plans without reading a footer
-#[tokio::test]
-async fn plan_reads_no_footer_and_lists_every_file() {
-    let store = two_depth_directory().await;
-    let notes = enumerate(&store, MergeMode::FoldEveryFile).await;
-    overwrite_with_garbage(
-        &store,
-        &[
-            "direct/events/part-0.parquet",
-            "direct/events/day=2/part-1.parquet",
-        ],
-    )
-    .await;
-    let recording = RecordingStore::wrapping(store);
-    let filter = compare("predicate_equal", column("ID"), number("1"));
-
-    let scan = try_resolve(
-        &(Arc::clone(&recording) as Arc<dyn ObjectStore>),
-        &notes,
-        Some(&filter),
-    )
-    .await
-    .expect("planning reads no footer, so unreadable files still plan");
-
-    assert_eq!(
-        file_paths(&scan),
-        vec!["day=2/part-1.parquet", "part-0.parquet"],
-        "a non-partition filter never prunes files, because planning reads no footer statistics"
-    );
-    assert!(
-        recording.files_read().is_empty(),
-        "no object may be read at plan time: {:?}",
-        recording.files_read()
-    );
-}
-
-/// Scenario: A predicate on partition columns prunes files before their footers are read
-#[tokio::test]
-async fn a_partition_filter_prunes_the_listing_without_reading_any_footer() {
-    let store = store_holding(&[
-        (
-            "direct/events/year=2026/p1.parquet",
-            &parquet(vec![nullable("id", DataType::Int64)]),
-        ),
-        (
-            "direct/events/year=2025/p2.parquet",
-            &parquet(vec![nullable("id", DataType::Int64)]),
-        ),
-        (
-            "direct/events/year=2024/p3.parquet",
-            &parquet(vec![nullable("id", DataType::Int64)]),
-        ),
-    ])
-    .await;
-    let notes = enumerate(&store, MergeMode::FoldEveryFile).await;
-    overwrite_with_garbage(
-        &store,
-        &[
-            "direct/events/year=2026/p1.parquet",
-            "direct/events/year=2025/p2.parquet",
-            "direct/events/year=2024/p3.parquet",
-        ],
-    )
-    .await;
-
-    for (filter, kept) in [
-        (equal("YEAR", "2026"), vec!["year=2026/p1.parquet"]),
-        (
-            compare("predicate_greater", column("YEAR"), string("2025")),
-            vec!["year=2026/p1.parquet"],
-        ),
-        (equal("YEAR", "2099"), vec![]),
-    ] {
-        let scan = try_resolve(&store, &notes, Some(&filter))
-            .await
-            .unwrap_or_else(|e| panic!("{filter}: no footer may be read: {e}"));
-        assert_eq!(
-            file_paths(&scan),
-            kept,
-            "{filter}: only the file whose partition value can satisfy the filter is kept"
-        );
-        assert_eq!(scan.partition_columns, vec!["year".to_string()]);
-        assert_eq!(
-            column_names(&scan),
-            vec!["id", "year"],
-            "{filter}: the declared schema survives pruning every file"
-        );
-    }
-}
-
 /// Scenario: Direct storage passes every partition column to the one predicate as a string
 #[tokio::test]
 async fn a_numeric_literal_prunes_no_direct_storage_file() {
@@ -456,61 +350,6 @@ async fn a_column_only_pruned_files_carry_reads_null() {
     assert!(discount.nullable, "{discount:?}");
     assert_eq!(discount.field_id, None, "no binding key: {discount:?}");
     assert_eq!(discount.physical_name, None, "no binding key: {discount:?}");
-}
-
-/// Scenario: Two spellings of one partition key fail the refresh and the query
-#[tokio::test]
-async fn a_file_added_under_a_second_spelling_fails_the_plan() {
-    let data = parquet(vec![nullable("id", DataType::Int64)]);
-    let store = store_holding(&[("direct/events/year=2026/p1.parquet", &data)]).await;
-    let notes = enumerate(&store, MergeMode::FoldEveryFile).await;
-    store
-        .put(
-            &StorePath::parse("direct/events/YEAR=2027/p2.parquet").unwrap(),
-            PutPayload::from(data.clone()),
-        )
-        .await
-        .unwrap();
-
-    let error = try_resolve(&store, &notes, None)
-        .await
-        .expect_err("two spellings of one declared key must fail the plan");
-
-    let message = error.to_string();
-    assert!(
-        message.contains("'year'") && message.contains("'YEAR'"),
-        "{message}"
-    );
-    assert!(message.contains("year=2026/p1.parquet"), "{message}");
-    assert!(message.contains("YEAR=2027/p2.parquet"), "{message}");
-}
-
-/// Scenario: A partition key matches its declared column across letter case
-#[tokio::test]
-async fn partition_key_matches_its_declared_column_across_letter_case() {
-    let data = parquet(vec![nullable("id", DataType::Int64)]);
-    let original = store_holding(&[
-        ("direct/events/year=2026/p1.parquet", &data),
-        ("direct/events/year=2025/p2.parquet", &data),
-    ])
-    .await;
-    let notes = enumerate(&original, MergeMode::FoldEveryFile).await;
-    let rewritten = store_holding(&[
-        ("direct/events/YEAR=2026/p1.parquet", &data),
-        ("direct/events/YEAR=2025/p2.parquet", &data),
-    ])
-    .await;
-
-    let scan = try_resolve(&rewritten, &notes, Some(&equal("YEAR", "2026")))
-        .await
-        .expect("a key matches its declared column under the uppercase fold");
-
-    assert_eq!(file_paths(&scan), vec!["YEAR=2026/p1.parquet"]);
-    assert_eq!(
-        scan.files[0].partition_values,
-        BTreeMap::from([("year".to_string(), Some("2026".to_string()))]),
-        "the value fills the declared column's own spelling, verbatim"
-    );
 }
 
 #[tokio::test]

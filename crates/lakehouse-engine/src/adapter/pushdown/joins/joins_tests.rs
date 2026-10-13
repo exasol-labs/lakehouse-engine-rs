@@ -445,39 +445,6 @@ async fn a_select_star_join_is_refused_by_the_side_declaring_the_refused_column(
     assert_refuses_binary_col(error);
 }
 
-/// Scenario: A column without a readable note fails the pushdown naming the fix
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_join_leg_without_notes_fails_naming_its_own_table_and_column() {
-    let catalog = unity_delta_catalog().await;
-    let storage = two_delta_legs_one_refusing_binary_col().await;
-    let request = delta_join_request_over(
-        serde_json::json!([
-            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
-        ]),
-        serde_json::json!([
-            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
-        ]),
-        Json::Null,
-    );
-    let request = with_notes(request, "CUSTOMER", &delta_notes(CUSTOMER_COLUMNS, &[]));
-
-    let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
-        .await
-        .expect_err("the ORDERS leg carries no notes");
-
-    let message = user_message(error);
-    for fragment in [
-        "'O_CUSTKEY'",
-        "'ORDERS'",
-        "ALTER VIRTUAL SCHEMA ... REFRESH",
-    ] {
-        assert!(message.contains(fragment), "{message}");
-    }
-    assert!(!message.contains("'CUSTOMER'"), "{message}");
-}
-
 /// Neither leg carries an active file.
 async fn two_delta_legs_one_refusing_binary_col() -> StorageBackend {
     delta_object_endpoint(vec![

@@ -88,6 +88,8 @@ const EXPECTED_TABLES: &[&str] = &[
 const SALES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/sales_parquet";
 const ALL_TYPES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/all_types_parquet";
 const DELTA_EXTRA_TYPES_LOCATION: &str = "s3://warehouse/unity_delta/delta_extra_types";
+const CM_NAME_MODE_PARTITIONED_LOCATION: &str =
+    "s3://warehouse/unity_delta/cm_name_mode_partitioned";
 
 const PRUNING_DELTA_LOCATION: &str = "s3://warehouse/delta_pruning/pruning_cases";
 /// Its own schema, so `VS_NAME` never enumerates the pruning table.
@@ -129,6 +131,7 @@ fn setup() {
         seed_sales_parquet_table();
         seed_all_types_parquet_table();
         seed_delta_extra_types_table();
+        seed_cm_name_mode_partitioned_table();
         seed_pruning_delta_table();
 
         create_unity_virtual_schema(&mut conn);
@@ -249,6 +252,7 @@ fn seed_sales_parquet_table() {
             ("region", json!("string"), "STRING"),
         ],
         partitions: &["year", "region"],
+        name_mapped: false,
     });
 }
 
@@ -273,6 +277,34 @@ struct UnityTable<'a> {
     location: &'a str,
     columns: &'a [(&'a str, Json, &'a str)],
     partitions: &'a [&'a str],
+    /// Name-mode column mapping: column `c` is stored as `col-c`, in data files and in
+    /// `add.partitionValues` alike (Delta PROTOCOL.md § Column Mapping).
+    name_mapped: bool,
+}
+
+impl UnityTable<'_> {
+    fn field(&self, position: usize, name: &str, spark_type: &Json) -> Json {
+        let mut field = spark_field(name, spark_type);
+        if self.name_mapped {
+            field["metadata"] = json!({
+                "delta.columnMapping.id": position + 1,
+                "delta.columnMapping.physicalName": format!("col-{name}"),
+            });
+        }
+        field
+    }
+
+    /// The Delta table properties, which Unity Catalog carries as the table's `properties`.
+    fn configuration(&self) -> Json {
+        if self.name_mapped {
+            json!({
+                "delta.columnMapping.mode": "name",
+                "delta.columnMapping.maxColumnId": self.columns.len().to_string(),
+            })
+        } else {
+            json!({})
+        }
+    }
 }
 
 fn split_unity_namespace(namespace: &str) -> (&str, &str) {
@@ -291,6 +323,7 @@ fn register_unity_table(table: &UnityTable) {
         location,
         columns,
         partitions,
+        ..
     } = table;
     let columns: Vec<Json> = columns
         .iter()
@@ -302,7 +335,7 @@ fn register_unity_table(table: &UnityTable) {
                 .unwrap_or_default();
             let mut entry = json!({
                 "name": column, "type_text": type_text, "type_name": type_name,
-                "type_json": spark_field(column, spark_type).to_string(),
+                "type_json": table.field(position, column, spark_type).to_string(),
                 "position": position, "nullable": true
             });
             if let Some(index) = partitions.iter().position(|p| p == column) {
@@ -332,7 +365,8 @@ fn register_unity_table(table: &UnityTable) {
         .json(&json!({
             "name": name, "catalog_name": catalog_name, "schema_name": schema_name,
             "table_type": "EXTERNAL", "data_source_format": format,
-            "storage_location": location, "columns": columns
+            "storage_location": location, "columns": columns,
+            "properties": table.configuration()
         }))
         .send()
         .unwrap_or_else(|e| panic!("POST {name}: {e}"));
@@ -481,6 +515,7 @@ fn seed_all_types_parquet_table() {
         location: ALL_TYPES_PARQUET_LOCATION,
         columns: &registered,
         partitions: &[],
+        name_mapped: false,
     });
 }
 
@@ -512,6 +547,7 @@ fn seed_delta_extra_types_table() {
         location: DELTA_EXTRA_TYPES_LOCATION,
         columns: &columns,
         partitions: &[],
+        name_mapped: false,
     };
     write_delta_table(
         &table,
@@ -522,6 +558,41 @@ fn seed_delta_extra_types_table() {
             stats: json!({"numRecords": 3}),
         }],
     );
+    register_unity_table(&table);
+}
+
+/// No vendored fixture is both column-mapped and partitioned. Each data file holds only
+/// `col-id`, and its `letter` lives in the log under `col-letter`.
+fn seed_cm_name_mode_partitioned_table() {
+    let columns = [
+        ("id", json!("long"), "LONG"),
+        ("letter", json!("string"), "STRING"),
+    ];
+    let table = UnityTable {
+        namespace: UNITY_NAMESPACE,
+        name: "cm_name_mode_partitioned",
+        format: "DELTA",
+        location: CM_NAME_MODE_PARTITIONED_LOCATION,
+        columns: &columns,
+        partitions: &["letter"],
+        name_mapped: true,
+    };
+    let files: Vec<DeltaDataFile> = [(1, "a"), (2, "b")]
+        .into_iter()
+        .map(|(id, letter)| DeltaDataFile {
+            path: format!("col-letter={letter}/part-0.parquet"),
+            partition_values: json!({ "col-letter": letter }),
+            parquet: encode_parquet(
+                &RecordBatch::try_from_iter(vec![(
+                    "col-id",
+                    Arc::new(Int64Array::from(vec![id])) as _,
+                )])
+                .expect("cm_name_mode_partitioned batch"),
+            ),
+            stats: json!({"numRecords": 1}),
+        })
+        .collect();
+    write_delta_table(&table, &files);
     register_unity_table(&table);
 }
 
@@ -545,18 +616,20 @@ fn write_delta_table(table: &UnityTable, files: &[DeltaDataFile]) {
     delete_fixture_prefix(location);
     let fields: Vec<Json> = columns
         .iter()
-        .map(|(name, spark_type, _)| spark_field(name, spark_type))
+        .enumerate()
+        .map(|(position, (name, spark_type, _))| table.field(position, name, spark_type))
         .collect();
     let id = location
         .rsplit('/')
         .next()
         .expect("a table location has a last path segment");
     let mut log = vec![
-        json!({"protocol": delta_protocol(columns)}),
+        json!({"protocol": delta_protocol(table)}),
         json!({"metaData": {
             "id": id, "format": {"provider": "parquet", "options": {}},
             "schemaString": json!({"type": "struct", "fields": fields}).to_string(),
-            "partitionColumns": partition_columns, "configuration": {}, "createdTime": 0
+            "partitionColumns": partition_columns, "configuration": table.configuration(),
+            "createdTime": 0
         }}),
     ];
     for file in files {
@@ -576,9 +649,14 @@ fn delta_first_commit_uri(location: &str) -> String {
 }
 
 /// Delta PROTOCOL.md § Timestamp without timezone: a `timestamp_ntz` column needs reader
-/// version 3, writer version 7, and `timestampNtz` in both feature lists.
-fn delta_protocol(columns: &[(&str, Json, &str)]) -> Json {
-    if columns
+/// version 3, writer version 7, and `timestampNtz` in both feature lists. § Column Mapping:
+/// reader version 2 and writer version 5 enable it.
+fn delta_protocol(table: &UnityTable) -> Json {
+    if table.name_mapped {
+        return json!({"minReaderVersion": 2, "minWriterVersion": 5});
+    }
+    if table
+        .columns
         .iter()
         .any(|(_, spark_type, _)| spark_type == "timestamp_ntz")
     {
@@ -618,6 +696,7 @@ fn seed_pruning_delta_table() {
         location: PRUNING_DELTA_LOCATION,
         columns: &columns,
         partitions: &[PRUNING_PARTITION_COLUMN],
+        name_mapped: false,
     };
     write_delta_table(&table, &files);
     register_unity_table(&table);
@@ -1152,6 +1231,19 @@ fn unity_delta_column_mapped_tables_return_logical_column_values() {
             );
         }
     }
+
+    let partitioned = table_ref("CM_NAME_MODE_PARTITIONED");
+    let letters = conn.query_columns(&format!("SELECT LETTER FROM {partitioned} ORDER BY ID"));
+    assert_eq!(
+        letters[0],
+        [json!("a"), json!("b")],
+        "partition values are logged under the physical name `col-letter` and read as LETTER"
+    );
+    assert_eq!(
+        conn.query_scalar_i64(&format!("SELECT ID FROM {partitioned} WHERE LETTER = 'b'")),
+        2,
+        "a filter on the partition column matches by its physical name"
+    );
 }
 
 /// Scenario: A partition column absent from the data file is materialized per file
