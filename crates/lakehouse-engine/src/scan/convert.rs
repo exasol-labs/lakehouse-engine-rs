@@ -21,6 +21,38 @@ fn nan_domain_error() -> UdfError {
     )
 }
 
+/// Exasol's DATE range 0001-01-01 to 9999-12-31 as inclusive Date32 day counts from
+/// 1970-01-01, in Arrow's proleptic Gregorian calendar.
+const EXASOL_DATE_MIN_DAYS: i32 = -719_162;
+const EXASOL_DATE_MAX_DAYS: i32 = 2_932_896;
+const UNIX_EPOCH_DAYS_FROM_CE: i32 = 719_163;
+
+fn date_out_of_range_detail(days: i32) -> String {
+    format!("{days} days from 1970-01-01 lies outside Exasol's DATE range 0001-01-01 to 9999-12-31")
+}
+
+/// Fails on the first non-null Date32 cell outside Exasol's DATE range, naming `output_column`.
+/// Any other column type passes, so callers can check every emitted column unconditionally.
+pub fn check_date32_in_exasol_range(
+    column: &dyn Array,
+    output_column: &str,
+) -> Result<(), UdfError> {
+    let Some(dates) = column.as_any().downcast_ref::<Date32Array>() else {
+        return Ok(());
+    };
+    let out_of_range = dates
+        .iter()
+        .flatten()
+        .find(|days| !(EXASOL_DATE_MIN_DAYS..=EXASOL_DATE_MAX_DAYS).contains(days));
+    match out_of_range {
+        None => Ok(()),
+        Some(days) => Err(UdfError::User(format!(
+            "DATE value out of range in output column {output_column}: {}",
+            date_out_of_range_detail(days)
+        ))),
+    }
+}
+
 pub fn arrow_value_at(col: &dyn Array, row: usize) -> Result<Value, UdfError> {
     if col.is_null(row) {
         return Ok(Value::Null);
@@ -99,17 +131,17 @@ pub fn arrow_value_at(col: &dyn Array, row: usize) -> Result<Value, UdfError> {
         DataType::Date32 => {
             let arr = col.as_any().downcast_ref::<Date32Array>().unwrap();
             let days = arr.value(row);
-            let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).unwrap();
-            let date = if days >= 0 {
-                epoch
-                    .checked_add_days(chrono::Days::new(days as u64))
-                    .unwrap_or(epoch)
+            let date = if (EXASOL_DATE_MIN_DAYS..=EXASOL_DATE_MAX_DAYS).contains(&days) {
+                NaiveDate::from_num_days_from_ce_opt(days + UNIX_EPOCH_DAYS_FROM_CE)
             } else {
-                epoch
-                    .checked_sub_days(chrono::Days::new((-days) as u64))
-                    .unwrap_or(epoch)
+                None
             };
-            Value::Date(date)
+            Value::Date(date.ok_or_else(|| {
+                UdfError::User(format!(
+                    "DATE value out of range: {}",
+                    date_out_of_range_detail(days)
+                ))
+            })?)
         }
         DataType::Timestamp(unit, _tz_opt) => {
             // Iceberg timestamptz emits as plain TIMESTAMP: Exasol rejects TIMESTAMP WITH LOCAL

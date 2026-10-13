@@ -8,8 +8,8 @@ use futures::StreamExt;
 
 use crate::scan::convert::arrow_value_at;
 use crate::scan::emit::{
-    check_declared_arity, classify_scan_error, coerce_column, declared_output_columns,
-    target_arrow_type,
+    check_declared_arity, check_emitted_dates_in_range, classify_scan_error, coerce_column,
+    declared_output_columns, target_arrow_type,
 };
 use crate::scan::spec::{AggregatePlan, PartialAggColumn, ScanSpec, partial_column_name};
 use crate::scan::storage_ref::ResolvedScanStorage;
@@ -349,7 +349,7 @@ fn partial_row_from_batch(
     Ok(row)
 }
 
-/// Columns before `first_agg_column` (grouped-path keys) are returned untouched: an Arrow cast
+/// Columns before `first_agg_column` (grouped-path keys) are returned uncoerced: an Arrow cast
 /// to `Utf8` formats differently from [`value_to_gk_string`] and would change a group's merge
 /// identity across shards.
 fn coerce_partial_agg_columns(
@@ -358,7 +358,7 @@ fn coerce_partial_agg_columns(
     first_agg_column: usize,
 ) -> Result<Vec<ArrayRef>, UdfError> {
     check_declared_arity(declared, batch.num_columns())?;
-    batch
+    let columns: Vec<ArrayRef> = batch
         .columns()
         .iter()
         .zip(declared)
@@ -371,7 +371,9 @@ fn coerce_partial_agg_columns(
                 coerce_column(column, declared, &target)
             }
         })
-        .collect()
+        .collect::<Result<_, UdfError>>()?;
+    check_emitted_dates_in_range(&columns, declared)?;
+    Ok(columns)
 }
 
 #[cfg(test)]

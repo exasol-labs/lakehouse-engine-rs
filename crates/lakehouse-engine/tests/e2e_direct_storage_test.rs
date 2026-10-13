@@ -652,6 +652,30 @@ fn stored_k_batch(id: i64, stored_k: i64) -> RecordBatch {
     .expect("stored-K batch construction is infallible")
 }
 
+const DATE_RANGE_DAYS: [i32; 6] = [
+    19_723,
+    -719_162,
+    2_932_896,
+    100_000_000,
+    2_932_897,
+    -719_163,
+];
+
+fn date_range_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("ID", DataType::Int64, false),
+        Field::new("STORED_DATE", DataType::Date32, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![1i64, 2, 3, 4, 5, 6])),
+            Arc::new(Date32Array::from(DATE_RANGE_DAYS.to_vec())),
+        ],
+    )
+    .expect("date_range batch construction is infallible")
+}
+
 fn write_delta_caveat_fixture() {
     let base = format!("{BASE_DIRECT}delta_caveat");
     write_parquet_fixture(&format!("{base}/file1.parquet"), discovery_id_batch(10));
@@ -733,6 +757,11 @@ fn write_all_fixtures() {
     write_parquet_fixture(
         &format!("{BASE_DIRECT}event_labels/file1.parquet"),
         event_labels_batch(),
+    );
+
+    write_parquet_fixture(
+        &format!("{BASE_DIRECT}date_range/file1.parquet"),
+        date_range_batch(),
     );
 
     write_delta_caveat_fixture();
@@ -1520,6 +1549,73 @@ fn group_by_aggregate_matches_the_unpushed_answer() {
         assert_eq!(count, *expected_count);
         assert_eq!(sum, *expected_sum);
     }
+}
+
+fn first_emitted_column(pushed_sql: &str) -> String {
+    const MARKER: &str = "EMITS (\"";
+    let start = pushed_sql
+        .find(MARKER)
+        .unwrap_or_else(|| panic!("no EMITS clause with a quoted column in:\n{pushed_sql}"))
+        + MARKER.len();
+    let len = pushed_sql[start..]
+        .find('"')
+        .unwrap_or_else(|| panic!("unterminated EMITS column name in:\n{pushed_sql}"));
+    pushed_sql[start..start + len].to_string()
+}
+
+/// Scenario: A DATE value outside Exasol's DATE range fails the query
+#[test]
+fn out_of_range_date_fails_the_query_on_every_emit_path() {
+    setup();
+    let mut conn = exa_conn();
+    let table = vs_table(VS_DIRECT, "DATE_RANGE");
+
+    assert_reads(
+        &mut conn,
+        "in-range rows, including both range bounds",
+        &format!("SELECT ID, STORED_DATE FROM {table} WHERE ID IN (1, 2, 3) ORDER BY ID"),
+        &[
+            &[Some("1"), Some("2"), Some("3")],
+            &[Some("2024-01-01"), Some("0001-01-01"), Some("9999-12-31")],
+        ],
+    );
+    assert_reads(
+        &mut conn,
+        "in-range MIN and MAX",
+        &format!("SELECT MIN(STORED_DATE), MAX(STORED_DATE) FROM {table} WHERE ID IN (1, 2, 3)"),
+        &[&[Some("0001-01-01")], &[Some("9999-12-31")]],
+    );
+
+    assert_fails_naming(
+        &mut conn,
+        "raw row",
+        &format!("SELECT ID, STORED_DATE FROM {table} WHERE ID = 4"),
+        &["STORED_DATE", "100000000"],
+    );
+
+    for (aggregate, stored_days) in [("MAX", "100000000"), ("MIN", "-719163")] {
+        let sql = format!("SELECT {aggregate}(STORED_DATE) FROM {table}");
+        let partial = first_emitted_column(&explain_virtual_sql(&mut conn, &sql));
+        assert_fails_naming(
+            &mut conn,
+            &format!("{aggregate} result"),
+            &sql,
+            &[&partial, stored_days],
+        );
+    }
+
+    let grouped = format!(
+        "SELECT STORED_DATE, COUNT(*) FROM {table} WHERE ID IN (1, 4) GROUP BY STORED_DATE"
+    );
+    let group_key = first_emitted_column(&explain_virtual_sql(&mut conn, &grouped));
+    assert_fails_naming(&mut conn, "group key", &grouped, &[&group_key, "100000000"]);
+
+    assert_reads(
+        &mut conn,
+        "a filter that does not emit the value",
+        &format!("SELECT ID FROM {table} WHERE STORED_DATE > DATE '9999-12-31' ORDER BY ID"),
+        &[&[Some("4"), Some("5")]],
+    );
 }
 
 #[test]

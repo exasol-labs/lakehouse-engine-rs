@@ -994,6 +994,35 @@ async fn emit_stream_fails_when_declared_column_count_disagrees() {
 }
 
 #[tokio::test]
+async fn emit_stream_fails_on_an_out_of_range_date_and_emits_nothing() {
+    use arrow::array::Date32Array;
+
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "STORED_DATE",
+        DataType::Date32,
+        true,
+    )]));
+    let column = Date32Array::from(vec![Some(19_723), Some(2_932_897)]);
+    let batch = RecordBatch::try_new(schema, vec![Arc::new(column)]).unwrap();
+    let mut ctx = CapturingCtx::declaring(&[("STORED_DATE", ExaType::Date)]);
+    let stream = Box::pin(VecStream::new(vec![batch]));
+    let mut timers = PhaseTimers::start();
+
+    let err = emit_stream(&mut ctx, stream, &[], &mut timers)
+        .await
+        .expect_err("an out-of-range date must fail the call");
+    let text = err.to_string();
+    assert!(
+        text.contains("STORED_DATE") && text.contains("2932897"),
+        "the error must name the column and the day count: {text}"
+    );
+    assert!(
+        ctx.ipc_batches.is_empty(),
+        "no batch may be emitted when a date is out of range"
+    );
+}
+
+#[tokio::test]
 async fn emit_stream_fails_when_a_declared_column_cannot_be_read() {
     // Arity 2 but only column 0 available: a truncated declaration.
     let mut ctx = CapturingCtx::with_columns(declared(&[("C0", ExaType::Int32)]));
