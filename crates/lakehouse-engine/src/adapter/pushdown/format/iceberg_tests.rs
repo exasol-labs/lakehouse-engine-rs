@@ -1,10 +1,12 @@
 use super::super::super::test_support::{
-    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields, glue_catalog_table,
-    load_table_body, load_table_body_with_columns, object_endpoint, sample_storage, sigv4_creds,
-    user_message,
+    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields,
+    declared_logical_schema, glue_catalog_table, iceberg_notes, involved_notes, load_table_body,
+    load_table_body_notes, load_table_body_with_columns, object_endpoint, resolve_from_notes,
+    sample_storage, sigv4_creds, user_message,
 };
-use super::super::binary_refusal;
+use super::super::ResolvedScan;
 use super::*;
+use crate::adapter::column_notes::{RefusedColumn, TableNotes, binary_refusal};
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 
@@ -22,9 +24,31 @@ fn name_mapped_load_table_body() -> Json {
     }))
 }
 
-/// Plans `table` through a loopback REST catalog that answers every request with `body`.
+/// Plans `table` through a loopback REST catalog that answers every request with `body`, from the
+/// notes CREATE recorded when the table's current schema was `body`'s.
 async fn resolve_rest(
     body: String,
+    table: &str,
+    creds: &ConnectionCreds,
+    storage: &StorageBackend,
+    filter_json: Option<&Json>,
+) -> Result<ResolvedScan, UdfError> {
+    let notes = load_table_body_notes(&serde_json::from_str(&body).expect("a JSON body"));
+    resolve_rest_declared(
+        body,
+        &involved_notes("T", &notes),
+        table,
+        creds,
+        storage,
+        filter_json,
+    )
+    .await
+}
+
+/// Like [`resolve_rest`], from `notes`.
+async fn resolve_rest_declared(
+    body: String,
+    notes: &TableNotes<'_>,
     table: &str,
     creds: &ConnectionCreds,
     storage: &StorageBackend,
@@ -38,7 +62,7 @@ async fn resolve_rest(
         warehouse: creds.warehouse.clone(),
         table: table.into(),
     };
-    IcebergFormatReader {
+    let reader = IcebergFormatReader {
         metadata: IcebergMetadataSource::RestLoadTable {
             session: &session,
             catalog_props: &catalog_props,
@@ -48,9 +72,8 @@ async fn resolve_rest(
             creds,
             allow_http: true,
         },
-    }
-    .resolve_scan(filter_json)
-    .await
+    };
+    resolve_from_notes(&reader, notes, filter_json).await
 }
 
 #[tokio::test]
@@ -675,6 +698,7 @@ async fn a_promoted_date_table_is_refused_filtered_or_not_and_from_either_metada
     .await;
     let promoted = resolve_metadata_file(
         &glue_iceberg_table("promoted", Some(&format!("s3://bucket/{metadata_file}"))),
+        &TableNotes::default(),
         &storage,
     )
     .await
@@ -697,18 +721,18 @@ fn glue_iceberg_table(name: &str, metadata_location: Option<&str>) -> CatalogTab
 
 async fn resolve_metadata_file(
     table: &CatalogTable,
+    notes: &TableNotes<'_>,
     storage: &StorageBackend,
 ) -> Result<ResolvedScan, UdfError> {
-    IcebergFormatReader {
+    let reader = IcebergFormatReader {
         metadata: IcebergMetadataSource::MetadataFile { table },
         connection: ConnectionStorage {
             storage,
             creds: &sigv4_creds(),
             allow_http: true,
         },
-    }
-    .resolve_scan(None)
-    .await
+    };
+    resolve_from_notes(&reader, notes, None).await
 }
 
 /// Scenario: A Glue Iceberg table is planned from its metadata location by the one Iceberg planner
@@ -724,8 +748,10 @@ async fn a_glue_iceberg_table_is_planned_from_its_metadata_file() {
         .await
         .expect("the REST planner resolves the table");
 
+    let notes = load_table_body_notes(&body);
     let from_file = resolve_metadata_file(
         &glue_iceberg_table("t", Some("s3://bucket/db/t/metadata/v1.json")),
+        &involved_notes("T", &notes),
         &storage,
     )
     .await
@@ -753,15 +779,20 @@ async fn an_unreadable_or_unset_metadata_location_fails_naming_the_table() {
     let missing = user_message(
         resolve_metadata_file(
             &glue_iceberg_table("gone", Some("s3://bucket/db/gone/metadata/v9.json")),
+            &TableNotes::default(),
             &storage,
         )
         .await
         .expect_err("an unreadable metadata file fails the plan"),
     );
     let unset = user_message(
-        resolve_metadata_file(&glue_iceberg_table("unset", None), &storage)
-            .await
-            .expect_err("a table without a metadata location fails the plan"),
+        resolve_metadata_file(
+            &glue_iceberg_table("unset", None),
+            &TableNotes::default(),
+            &storage,
+        )
+        .await
+        .expect_err("a table without a metadata location fails the plan"),
     );
 
     assert!(
@@ -853,7 +884,10 @@ async fn iceberg_binary_fixed_and_uuid_columns_are_refused_and_an_all_binary_tab
         vec![("id", Some(1)), ("name", Some(13))],
         "every refused column is dropped from the logical schema, and nothing else"
     );
-    let refused = |column, member, declared| binary_refusal("Iceberg", column, member, declared);
+    let refused = |column: &str, member, declared| RefusedColumn {
+        column_name: column.to_string(),
+        reason: binary_refusal("Iceberg", column, member, declared),
+    };
     assert_eq!(
         resolved.refused_columns,
         vec![
@@ -877,7 +911,7 @@ async fn iceberg_binary_fixed_and_uuid_columns_are_refused_and_an_all_binary_tab
         .expect_err("a table with no mappable column cannot be scanned")
         .to_string();
     assert!(
-        message.contains("Iceberg table has no mappable column"),
+        message.contains("virtual table 'T' has no mappable column"),
         "{message}"
     );
 }
@@ -929,7 +963,7 @@ fn nested_iceberg_fields_stay_utf8_tagged_and_carry_a_nested_descriptor() {
         .build()
         .expect("well-formed nested schema builds");
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
 
     assert_eq!(logical[0].arrow_type, "int32");
     assert_eq!(
@@ -983,5 +1017,125 @@ fn nested_iceberg_fields_stay_utf8_tagged_and_carry_a_nested_descriptor() {
             })),
         }),
         "a list of structs recurses into the element's own struct descriptor"
+    );
+}
+
+fn long_field(id: i32, name: &str, required: bool) -> iceberg::spec::NestedFieldRef {
+    use iceberg::spec::{PrimitiveType, Type};
+    std::sync::Arc::new(iceberg::spec::NestedField::new(
+        id,
+        name,
+        Type::Primitive(PrimitiveType::Long),
+        required,
+    ))
+}
+
+async fn resolve_declared(
+    current_fields: Json,
+    last_column_id: i32,
+    notes: &TableNotes<'_>,
+) -> Result<ResolvedScan, UdfError> {
+    resolve_rest_declared(
+        load_table_body_with_columns(current_fields, last_column_id),
+        notes,
+        "db.t",
+        &sigv4_creds(),
+        &sample_storage(),
+        None,
+    )
+    .await
+}
+
+/// Scenario: A column renamed at the source after the last REFRESH reads under its declared name
+#[tokio::test]
+async fn the_reader_plans_the_declared_schema_not_the_current_one() {
+    let declared = iceberg_notes(&[long_field(1, "id", true), long_field(2, "score", false)]);
+    let renamed = serde_json::json!([
+        {"id": 1, "name": "id", "required": true, "type": "long"},
+        {"id": 2, "name": "rating", "required": false, "type": "long"}
+    ]);
+
+    let resolved = resolve_declared(renamed, 2, &involved_notes("T", &declared)).await;
+
+    let resolved = resolved.expect("a rename between refreshes plans");
+    assert_eq!(
+        resolved
+            .logical_schema
+            .iter()
+            .map(|field| (field.field_id, field.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(Some(1), "id"), (Some(2), "score")],
+        "the scan binds the declared field id 2, which the rename kept, under its declared name"
+    );
+}
+
+/// Scenario: A declared required column that the current schema marks optional fails the query
+#[tokio::test]
+async fn a_declared_required_column_made_optional_fails_naming_table_column_and_refresh() {
+    let declared = iceberg_notes(&[long_field(1, "id", true), long_field(2, "qty", true)]);
+    let relaxed_and_renamed = serde_json::json!([
+        {"id": 1, "name": "id", "required": true, "type": "long"},
+        {"id": 2, "name": "quantity", "required": false, "type": "long"}
+    ]);
+
+    let resolved =
+        resolve_declared(relaxed_and_renamed, 2, &involved_notes("ORDERS", &declared)).await;
+
+    let message = user_message(
+        resolved.expect_err("a stale non-nullable declaration would drop NULL rows silently"),
+    );
+    for fragment in [
+        "'QTY'",
+        "'ORDERS'",
+        "non-nullable",
+        "allows NULL",
+        "ALTER VIRTUAL SCHEMA ... REFRESH",
+    ] {
+        assert!(message.contains(fragment), "{message}");
+    }
+}
+
+/// Scenario: A declared required column that the current schema marks optional fails the query
+#[tokio::test]
+async fn nullability_is_compared_by_declared_field_id_and_a_tightened_column_plans() {
+    let declared = iceberg_notes(&[long_field(2, "qty", true), long_field(3, "note", false)]);
+    let current = serde_json::json!([
+        {"id": 2, "name": "amount", "required": true, "type": "long"},
+        {"id": 3, "name": "note", "required": true, "type": "long"},
+        {"id": 4, "name": "qty", "required": false, "type": "long"}
+    ]);
+
+    let resolved = resolve_declared(current, 4, &involved_notes("T", &declared)).await;
+
+    resolved.expect(
+        "field id 2 is still required; the optional `qty` is field id 4, another column; and \
+         an optional declaration of a now-required column loses no row",
+    );
+}
+
+/// Scenario: A column dropped at the source after the last REFRESH reads what older data files store
+#[tokio::test]
+async fn a_dropped_declared_column_stays_in_the_planned_schema() {
+    let declared = iceberg_notes(&[
+        long_field(1, "id", true),
+        long_field(2, "note", false),
+        long_field(3, "must", true),
+    ]);
+    let dropped = serde_json::json!([
+        {"id": 1, "name": "id", "required": true, "type": "long"}
+    ]);
+
+    let resolved = resolve_declared(dropped, 3, &involved_notes("T", &declared)).await;
+
+    let resolved = resolved.expect(
+        "a dropped column plans until REFRESH; a required one fails only when a file lacks it",
+    );
+    assert_eq!(
+        resolved
+            .logical_schema
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "note", "must"]
     );
 }

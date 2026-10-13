@@ -47,7 +47,7 @@ File-level sharding, the pushdown wire format, streaming emit, and the memory mo
 * *AND* that variant MUST NOT carry the directory options or a declared-column list, because the table's declaration reaches every reader from the column notes, and the directory options take effect only at enumeration
 * *AND* the selection site MUST NOT match the catalog kind, so the permitted-site set `vs-adapter/catalog-kind-selection` records gains no file
 * *AND* the direct-storage variant SHALL carry NO catalog table metadata, because this kind loads no table: its root is composed from the CONNECTION address, the namespace property, and the recorded directory name
-* *AND* the Iceberg and Delta arms SHALL be UNCHANGED, and every existing Iceberg and Delta test MUST pass with no change to any assertion or expected value
+* *AND* the Iceberg and Delta arms SHALL be UNCHANGED, and every existing Iceberg and Delta test MUST pass with no change to any assertion or expected value, except the error text of the two refusals that now run before the format is known (a table with no mappable column, and a refused partition column), which names the virtual table instead of a format label
 <!-- /DELTA:CHANGED -->
 
 <!-- DELTA:CHANGED -->

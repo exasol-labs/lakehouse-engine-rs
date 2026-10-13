@@ -2,73 +2,55 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use arrow::datatypes::{DataType, Field, Schema};
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::StorageBackend;
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use serde_json::Value as Json;
-use std::collections::HashSet;
 
 use super::partition_predicate::PartitionPredicate;
-use super::{FormatReader, RefusedColumn, ResolvedScan, binary_refusal, without_refused_columns};
-use crate::adapter::parquet_directory::{
-    BinaryColumn, DirectoryOptions, ParquetDirectory, ParquetFile, resolve_parquet_directory,
-    store_prefix,
-};
-use crate::scan::spec::{FileEntry, LogicalField, NestedField, NestedMembers};
+use super::{FormatReader, PlannedFiles};
+use crate::adapter::column_notes::DeclaredSchema;
+use crate::adapter::parquet_directory::{ParquetFile, list_parquet_files, store_prefix};
+use crate::scan::spec::FileEntry;
 use crate::scan::{encode_file_path, store_root_url};
-use crate::types::mapping::{arrow_type_to_tag, exasol_type_to_arrow};
 
 #[cfg(test)]
 #[path = "parquet_format_reader_tests.rs"]
 mod tests;
 
-/// Reuses [`resolve_parquet_directory`] so declared and scanned schemas can't diverge.
+/// Lists files against the declared partition columns and reads no footer.
 pub(super) struct ParquetFormatReader<'a> {
     /// Shared across every leg of the request (one admission limiter).
     pub(super) store: &'a Arc<dyn ObjectStore>,
     pub(super) table_root: &'a str,
-    pub(super) options: DirectoryOptions,
-    pub(super) declared_columns: &'a [(String, String)],
     /// The CONNECTION's static backend; no credential-vending catalog overrides it.
     pub(super) storage: &'a StorageBackend,
 }
 
 impl FormatReader for ParquetFormatReader<'_> {
-    /// Prunes files by partition-column predicates before any footer is read; other predicates
-    /// never prune (no file statistics).
+    /// Prunes files by partition-column predicates; other predicates never prune (no file
+    /// statistics).
     fn resolve_scan<'a>(
         &'a self,
+        declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<ResolvedScan, UdfError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
         Box::pin(async move {
             let store_root = store_root_url(self.table_root)?;
             let prefix = store_prefix(self.table_root)?;
             let predicate = PartitionPredicate::from_filter(filter_json, &[]);
-            let ParquetDirectory {
+            let keep = move |values: &_| predicate.keeps(values);
+            let files = list_parquet_files(self.store, &prefix, &declared.partition_columns, &keep)
+                .await?
+                .into_iter()
+                .map(|file| file_entry(file, &prefix, store_root.as_str()))
+                .collect();
+            Ok(PlannedFiles {
                 files,
-                schema,
-                partition_columns,
-                binary_columns,
-            } = resolve_parquet_directory(self.store, &prefix, self.options, &move |values| {
-                predicate.keeps(values)
-            })
-            .await?;
-
-            let (logical, refused_columns) =
-                plannable_schema(&schema, self.declared_columns, &binary_columns)?;
-            Ok(ResolvedScan {
-                files: files
-                    .into_iter()
-                    .map(|file| file_entry(file, &prefix, store_root.as_str()))
-                    .collect(),
                 effective_storage: self.storage.clone(),
-                logical_schema: logical,
                 table_root: self.table_root.to_string(),
                 name_mapping: Vec::new(),
-                partition_columns,
-                refused_columns,
             })
         })
     }
@@ -92,111 +74,5 @@ pub(super) fn file_entry(file: ParquetFile, prefix: &StorePath, store_root: &str
         size: file.size,
         deletes: Vec::new(),
         partition_values: file.partition_values,
-    }
-}
-
-/// Refused columns are dropped only after the absent declared columns are added, so a refused
-/// column's own listed declaration never re-adds it as a NULL column.
-fn plannable_schema(
-    schema: &Schema,
-    declared_columns: &[(String, String)],
-    binary_columns: &[BinaryColumn],
-) -> Result<(Vec<LogicalField>, Vec<RefusedColumn>), UdfError> {
-    let refused_columns: Vec<RefusedColumn> = binary_columns.iter().map(parquet_refusal).collect();
-    let mut logical = logical_schema(schema);
-    logical.extend(logical_schema(&Schema::new(absent_declared_fields(
-        declared_columns,
-        schema,
-    ))));
-    let logical = without_refused_columns(logical, &refused_columns, "Direct storage")?;
-    Ok((logical, refused_columns))
-}
-
-fn parquet_refusal(column: &BinaryColumn) -> RefusedColumn {
-    let mut refusal = binary_refusal(
-        "Parquet",
-        &column.column,
-        column.member_path.as_deref(),
-        &column.declared,
-    );
-    if column.nested_enum {
-        refusal
-            .reason
-            .push_str("; a Parquet ENUM is read as text only as a top-level, non-repeated column");
-    }
-    refusal
-}
-
-/// Declared columns absent from `schema` (uppercase fold), typed as declared; they read NULL.
-fn absent_declared_fields(declared_columns: &[(String, String)], schema: &Schema) -> Vec<Field> {
-    let present: HashSet<String> = schema
-        .fields()
-        .iter()
-        .map(|field| field.name().to_uppercase())
-        .collect();
-    declared_columns
-        .iter()
-        .filter(|(name, _)| !present.contains(&name.to_uppercase()))
-        .map(|(name, exasol_type)| {
-            let data_type = exasol_type_to_arrow(exasol_type).unwrap_or(DataType::Utf8);
-            Field::new(name, data_type, true)
-        })
-        .collect()
-}
-
-/// No ordinal field-id is synthesized: it could falsely match a file's `PARQUET:field_id`.
-fn logical_schema(schema: &Schema) -> Vec<LogicalField> {
-    schema
-        .fields()
-        .iter()
-        .map(|field| LogicalField {
-            field_id: None,
-            name: field.name().clone(),
-            arrow_type: arrow_type_to_tag(field.data_type()),
-            nullable: field.is_nullable(),
-            initial_default: None,
-            nested: nested_members(field.data_type()),
-            physical_name: None,
-        })
-        .collect()
-}
-
-/// Its presence routes nested columns to the JSON renderer; the cast path has no string kernel
-/// for struct/list/map.
-fn nested_members(data_type: &DataType) -> Option<NestedMembers> {
-    match data_type {
-        DataType::Struct(fields) => Some(NestedMembers::Struct {
-            fields: fields
-                .iter()
-                .map(|field| NestedField {
-                    field_id: None,
-                    name: field.name().clone(),
-                    physical_name: None,
-                    nested: nested_members(field.data_type()),
-                })
-                .collect(),
-        }),
-        DataType::List(element)
-        | DataType::LargeList(element)
-        | DataType::FixedSizeList(element, _) => Some(NestedMembers::List {
-            element: nested_members(element.data_type()).map(Box::new),
-        }),
-        DataType::Map(entries, _) => {
-            let pair: &[arrow::datatypes::FieldRef] = match entries.data_type() {
-                DataType::Struct(fields) => fields,
-                _ => &[],
-            };
-            Some(NestedMembers::Map {
-                key: pair
-                    .first()
-                    .and_then(|field| nested_members(field.data_type()))
-                    .map(Box::new),
-                value: pair
-                    .get(1)
-                    .and_then(|field| nested_members(field.data_type()))
-                    .map(Box::new),
-            })
-        }
-        _ => None,
     }
 }

@@ -37,6 +37,29 @@ fn test_schema() -> Schema {
         .unwrap()
 }
 
+fn declared_field(field_id: i32, name: &str) -> LogicalField {
+    LogicalField {
+        field_id: Some(field_id),
+        name: name.to_string(),
+        arrow_type: "utf8".to_string(),
+        nullable: true,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    }
+}
+
+/// Translates `filter` for a table whose declaration CREATE took from `schema` itself.
+fn translate_as_created(filter: &Json, schema: &Schema) -> Option<Predicate> {
+    let declared: Vec<LogicalField> = schema
+        .as_struct()
+        .fields()
+        .iter()
+        .map(|field| declared_field(field.id, &field.name))
+        .collect();
+    to_iceberg_predicate(filter, &declared, schema)
+}
+
 fn col(name: &str) -> Json {
     json!({"type": "column", "name": name})
 }
@@ -55,7 +78,7 @@ fn leaf_equal_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)});
-    let pred = to_iceberg_predicate(&node, &schema).expect("should translate equal");
+    let pred = translate_as_created(&node, &schema).expect("should translate equal");
     let s = format!("{pred}");
     assert!(
         s.contains("id") && s.contains('=') && s.contains('5'),
@@ -63,7 +86,7 @@ fn leaf_equal_translates() {
     );
 
     let node2 = json!({"type": "predicate_equal", "left": int_lit(5), "right": col("ID")});
-    let pred2 = to_iceberg_predicate(&node2, &schema).expect("reversed operands should translate");
+    let pred2 = translate_as_created(&node2, &schema).expect("reversed operands should translate");
     let s2 = format!("{pred2}");
     assert!(
         s2.contains("id") && s2.contains('=') && s2.contains('5'),
@@ -85,12 +108,12 @@ fn leaf_less_than_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_less", "left": col("AMOUNT"), "right": int_lit(100)});
-    let pred = to_iceberg_predicate(&node, &schema).unwrap();
+    let pred = translate_as_created(&node, &schema).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains('<'), "got: {s}");
 
     let node2 = json!({"type": "predicate_less", "left": int_lit(100), "right": col("AMOUNT")});
-    let pred2 = to_iceberg_predicate(&node2, &schema).unwrap();
+    let pred2 = translate_as_created(&node2, &schema).unwrap();
     let s2 = format!("{pred2}");
     assert!(s2.contains("amount") && s2.contains('>'), "got: {s2}");
 }
@@ -100,7 +123,7 @@ fn leaf_lessequal_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_lessequal", "left": col("AMOUNT"), "right": int_lit(50)});
-    let pred = to_iceberg_predicate(&node, &schema).unwrap();
+    let pred = translate_as_created(&node, &schema).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains("<="), "got: {s}");
 }
@@ -109,7 +132,7 @@ fn leaf_lessequal_translates() {
 fn leaf_is_null_translates() {
     let schema = test_schema();
     let node = json!({"type": "predicate_is_null", "expression": col("NAME")});
-    let pred = to_iceberg_predicate(&node, &schema).unwrap();
+    let pred = translate_as_created(&node, &schema).unwrap();
     let s = format!("{pred}");
     assert!(
         s.contains("name") && s.to_uppercase().contains("NULL"),
@@ -121,7 +144,7 @@ fn leaf_is_null_translates() {
 fn leaf_is_not_null_translates() {
     let schema = test_schema();
     let node = json!({"type": "predicate_is_not_null", "expression": col("NAME")});
-    let pred = to_iceberg_predicate(&node, &schema).unwrap();
+    let pred = translate_as_created(&node, &schema).unwrap();
     let s = format!("{pred}");
     assert!(
         s.contains("name") && s.to_uppercase().contains("NOT NULL"),
@@ -137,7 +160,7 @@ fn leaf_in_translates() {
         "expression": col("ID"),
         "arguments": [int_lit(1), int_lit(2), int_lit(3)]
     });
-    let pred = to_iceberg_predicate(&node, &schema).unwrap();
+    let pred = translate_as_created(&node, &schema).unwrap();
     let s = format!("{pred}");
     assert!(
         s.contains("id") && s.to_uppercase().contains("IN"),
@@ -153,7 +176,7 @@ fn leaf_in_with_string_translates() {
         "expression": col("NAME"),
         "arguments": [str_lit("alice"), str_lit("bob")]
     });
-    let pred = to_iceberg_predicate(&node, &schema).unwrap();
+    let pred = translate_as_created(&node, &schema).unwrap();
     let s = format!("{pred}");
     assert!(
         s.contains("name") && s.to_uppercase().contains("IN"),
@@ -170,7 +193,7 @@ fn between_desugars_to_range() {
         "left": int_lit(10),
         "right": int_lit(100)
     });
-    let pred = to_iceberg_predicate(&node, &schema).unwrap();
+    let pred = translate_as_created(&node, &schema).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("amount"), "got: {s}");
     assert!(
@@ -192,7 +215,7 @@ fn leaf_date_translates() {
         "left": col("EVENT_DATE"),
         "right": date_lit("2024-01-15")
     });
-    let pred = to_iceberg_predicate(&node, &schema).unwrap();
+    let pred = translate_as_created(&node, &schema).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("event_date"), "got: {s}");
 }
@@ -214,7 +237,7 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
         "type": "predicate_and",
         "expressions": [translatable, untranslatable]
     });
-    let pred = to_iceberg_predicate(&node, &schema)
+    let pred = translate_as_created(&node, &schema)
         .expect("AND with one translatable child must return Some");
     let s = format!("{pred}");
     assert!(
@@ -237,7 +260,7 @@ fn and_all_untranslatable_returns_none() {
             {"type": "predicate_like_regexp", "expression": col("NAME"), "pattern": str_lit("^B")}
         ]
     });
-    assert!(to_iceberg_predicate(&node, &schema).is_none());
+    assert!(translate_as_created(&node, &schema).is_none());
 }
 
 #[test]
@@ -259,7 +282,7 @@ fn or_with_untranslatable_child_returns_none() {
     });
     // Pruning on only the translatable branch would be unsound.
     assert!(
-        to_iceberg_predicate(&node, &schema).is_none(),
+        translate_as_created(&node, &schema).is_none(),
         "OR with untranslatable branch must be None"
     );
 }
@@ -274,7 +297,7 @@ fn or_all_translatable_returns_some() {
             {"type": "predicate_equal", "left": col("ID"), "right": int_lit(2)}
         ]
     });
-    let pred = to_iceberg_predicate(&node, &schema).expect("all-translatable OR must be Some");
+    let pred = translate_as_created(&node, &schema).expect("all-translatable OR must be Some");
     let s = format!("{pred}");
     assert!(s.to_uppercase().contains("OR"), "OR missing: {s}");
 }
@@ -287,7 +310,7 @@ fn not_of_untranslatable_returns_none() {
         "expression": {"type": "predicate_like", "expression": col("NAME"), "pattern": str_lit("A%")}
     });
     assert!(
-        to_iceberg_predicate(&node, &schema).is_none(),
+        translate_as_created(&node, &schema).is_none(),
         "NOT of untranslatable must be None"
     );
 }
@@ -299,7 +322,7 @@ fn not_of_translatable_negates() {
         "type": "predicate_not",
         "expression": {"type": "predicate_less", "left": col("ID"), "right": int_lit(5)}
     });
-    let pred = to_iceberg_predicate(&node, &schema).expect("NOT of translatable must be Some");
+    let pred = translate_as_created(&node, &schema).expect("NOT of translatable must be Some");
     let s = format!("{pred}");
     assert!(s.contains("id") && s.contains(">="), "got: {s}");
 }
@@ -313,7 +336,7 @@ fn unknown_column_returns_none() {
         "right": int_lit(1)
     });
     assert!(
-        to_iceberg_predicate(&node, &schema).is_none(),
+        translate_as_created(&node, &schema).is_none(),
         "unknown column must be None"
     );
 }
@@ -327,7 +350,7 @@ fn type_mismatch_returns_none() {
         "right": str_lit("not-a-number")
     });
     assert!(
-        to_iceberg_predicate(&node, &schema).is_none(),
+        translate_as_created(&node, &schema).is_none(),
         "type mismatch must be None"
     );
 }
@@ -341,7 +364,7 @@ fn notequal_returns_none() {
         "right": int_lit(5)
     });
     assert!(
-        to_iceberg_predicate(&node, &schema).is_none(),
+        translate_as_created(&node, &schema).is_none(),
         "predicate_notequal must not produce a pruning predicate"
     );
 }
@@ -355,7 +378,7 @@ fn in_with_type_mismatch_element_returns_none() {
         "arguments": [int_lit(1), str_lit("bad")]
     });
     assert!(
-        to_iceberg_predicate(&node, &schema).is_none(),
+        translate_as_created(&node, &schema).is_none(),
         "IN with one bad element must be None"
     );
 }
@@ -370,7 +393,7 @@ fn between_with_one_failing_bound_keeps_other() {
         "left": str_lit("bad"),
         "right": int_lit(100)
     });
-    let pred = to_iceberg_predicate(&node, &schema)
+    let pred = translate_as_created(&node, &schema)
         .expect("BETWEEN with one valid bound must return Some");
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains("<="), "got: {s}");
@@ -400,7 +423,7 @@ fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
         [name_like("x%"), amount_below(30)],
     ] {
         let node = not(and(conjuncts));
-        assert_eq!(to_iceberg_predicate(&node, &schema), None, "{node}");
+        assert_eq!(translate_as_created(&node, &schema), None, "{node}");
     }
 }
 
@@ -413,7 +436,7 @@ fn not_over_a_between_that_dropped_a_bound_returns_none() {
         "left": int_lit(10),
         "right": {"type": "literal_exactnumeric", "value": 20.5}
     }));
-    assert_eq!(to_iceberg_predicate(&node, &schema), None);
+    assert_eq!(translate_as_created(&node, &schema), None);
 }
 
 #[test]
@@ -426,7 +449,7 @@ fn not_over_an_or_with_an_inexact_branch_returns_none() {
             {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)}
         ]
     }));
-    assert_eq!(to_iceberg_predicate(&node, &schema), None);
+    assert_eq!(translate_as_created(&node, &schema), None);
 }
 
 #[test]
@@ -439,7 +462,7 @@ fn not_over_a_fully_translated_and_negates_the_whole_conjunction() {
     let expected = Reference::new("amount")
         .greater_than_or_equal_to(Datum::long(30))
         .or(Reference::new("name").not_equal_to(Datum::string("a")));
-    assert_eq!(to_iceberg_predicate(&node, &schema), Some(expected));
+    assert_eq!(translate_as_created(&node, &schema), Some(expected));
 }
 
 #[test]
@@ -454,7 +477,7 @@ fn not_over_a_fully_translated_between_negates_both_bounds() {
     let expected = Reference::new("amount")
         .less_than(Datum::long(10))
         .or(Reference::new("amount").greater_than(Datum::long(20)));
-    assert_eq!(to_iceberg_predicate(&node, &schema), Some(expected));
+    assert_eq!(translate_as_created(&node, &schema), Some(expected));
 }
 
 #[test]
@@ -470,5 +493,72 @@ fn not_over_a_fully_translated_or_negates_every_branch() {
     let expected = Reference::new("amount")
         .greater_than_or_equal_to(Datum::long(10))
         .and(Reference::new("amount").less_than_or_equal_to(Datum::long(20)));
-    assert_eq!(to_iceberg_predicate(&node, &schema), Some(expected));
+    assert_eq!(translate_as_created(&node, &schema), Some(expected));
+}
+
+fn int_schema(fields: &[(i32, &str)]) -> Schema {
+    Schema::builder()
+        .with_fields(
+            fields
+                .iter()
+                .map(|&(id, name)| {
+                    NestedField::optional(id, name, Type::Primitive(PrimitiveType::Int)).into()
+                })
+                .collect::<Vec<_>>(),
+        )
+        .build()
+        .unwrap()
+}
+
+fn equal_to(column: &str, value: i64) -> Json {
+    json!({"type": "predicate_equal", "left": col(column), "right": int_lit(value)})
+}
+
+/// Scenario: A filter column resolves through its declared field id
+#[test]
+fn filter_column_resolves_through_its_declared_field_id() {
+    let declared = [declared_field(1, "a"), declared_field(2, "b")];
+    let rename_swapped = int_schema(&[(1, "b"), (2, "a")]);
+
+    assert_eq!(
+        to_iceberg_predicate(&equal_to("A", 7), &declared, &rename_swapped),
+        Some(Reference::new("b").equal_to(Datum::int(7))),
+        "`A` declares field id 1, which the current schema names `b`, so pruning reads id 1's \
+         bounds and never those of the field now named `a`"
+    );
+}
+
+/// Scenario: A filter column resolves through its declared field id
+#[test]
+fn a_filter_column_whose_declared_id_was_dropped_imposes_no_constraint() {
+    let declared = [declared_field(1, "id"), declared_field(2, "note")];
+    let note_dropped = int_schema(&[(1, "id"), (3, "note")]);
+    let on_both = and([equal_to("ID", 5), equal_to("NOTE", 1)]);
+
+    assert_eq!(
+        to_iceberg_predicate(&equal_to("NOTE", 1), &declared, &note_dropped),
+        None,
+        "field id 2 is gone; the later field `note` (id 3) is another column"
+    );
+    assert_eq!(
+        to_iceberg_predicate(&on_both, &declared, &note_dropped),
+        Some(Reference::new("id").equal_to(Datum::int(5))),
+        "AND drops only the conjunct on the dropped id"
+    );
+    assert_eq!(
+        to_iceberg_predicate(&not(on_both), &declared, &note_dropped),
+        None,
+        "NOT never negates the AND that dropped a conjunct"
+    );
+}
+
+#[test]
+fn a_filter_column_the_declaration_does_not_carry_imposes_no_constraint() {
+    let declared = [declared_field(1, "id")];
+    let added_since = int_schema(&[(1, "id"), (2, "extra")]);
+
+    assert_eq!(
+        to_iceberg_predicate(&equal_to("EXTRA", 1), &declared, &added_since),
+        None
+    );
 }

@@ -3,7 +3,7 @@ use crate::tests::hive_type_cases::{
     JSON_TEXT, UNRECOGNIZED_HIVE_TYPES, binary_hive_types, nested_hive_types, primitive_hive_types,
 };
 use arrow::datatypes::DataType;
-use iceberg::spec::{PrimitiveType, Type};
+use iceberg::spec::{NestedField, PrimitiveType, Type};
 use lakehouse_catalog::ColumnSourceType;
 
 /// Scenario: Compatible Arrow types map to their Exasol type
@@ -826,7 +826,9 @@ fn classify_exa_type_matches_pushdown_guard_predicates() {
 fn column_source_type_maps_to_exasol_in_one_home() {
     assert_eq!(
         column_source_type_to_exasol(
-            &ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+            &ColumnSourceType::Iceberg(
+                NestedField::optional(1, "c", Type::Primitive(PrimitiveType::Long)).into()
+            ),
             EngineTimestampSupport::MillisecondOnly,
         ),
         "DECIMAL(20,0)"
@@ -1060,10 +1062,14 @@ fn catalog_decimal_guard_is_shared_by_both_source_kinds() {
     ];
     for (precision, scale, expected) in cases {
         let iceberg_result = column_source_type_to_exasol(
-            &ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Decimal {
-                precision,
-                scale,
-            })),
+            &ColumnSourceType::Iceberg(
+                NestedField::optional(
+                    1,
+                    "c",
+                    Type::Primitive(PrimitiveType::Decimal { precision, scale }),
+                )
+                .into(),
+            ),
             EngineTimestampSupport::MillisecondOnly,
         );
         let unity_result = column_source_type_to_exasol(

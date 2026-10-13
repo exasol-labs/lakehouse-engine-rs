@@ -1,8 +1,12 @@
 use delta_kernel::schema::{ArrayType, MapType, MetadataValue, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 
+use lakehouse_catalog::CatalogTable;
+
 use super::*;
-use crate::adapter::pushdown::test_support::user_message;
+use crate::adapter::column_notes::ColumnDeclaration;
+use crate::adapter::pushdown::declare_columns;
+use crate::adapter::pushdown::test_support::unity_delta_table;
 
 const CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-80396d42-d765-483e-b86e-7ac1e13ef88c"}},{"name":"name","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"col-ed3e45cf-632b-4a07-bb22-d9f4693bbaa1"}},{"name":"value","type":"double","nullable":true,"metadata":{"delta.columnMapping.id":3,"delta.columnMapping.physicalName":"col-95e13b58-72f1-4d26-8390-49469180a8a2"}}]}"#;
 
@@ -79,9 +83,27 @@ fn with_type_changes(field: StructField, entries: serde_json::Value) -> StructFi
     field.with_metadata([("delta.typeChanges", MetadataValue::Other(entries))])
 }
 
+/// What `createVirtualSchema` records for a Delta table whose columns are `schema`'s.
+fn classify(
+    schema: &StructType,
+    mode: ColumnMappingMode,
+) -> (Vec<LogicalField>, Vec<RefusedColumn>) {
+    classify_spark_schema(schema, mode, "Delta")
+}
+
+/// The reason of the one column `schema` refuses under `mode`.
+fn refusal_of(schema: &StructType, mode: ColumnMappingMode) -> String {
+    let (_, refused_columns) = classify(schema, mode);
+    assert_eq!(
+        refused_columns.len(),
+        1,
+        "expected exactly one refused column: {refused_columns:?}"
+    );
+    refused_columns[0].reason.clone()
+}
+
 fn only_logical_field(schema: &StructType, mode: ColumnMappingMode) -> LogicalField {
-    let (logical_fields, _, refused_columns) = build_delta_table_schema(schema, mode, Vec::new())
-        .expect("this fixture's only column is mappable");
+    let (logical_fields, refused_columns) = classify(schema, mode);
     assert!(
         refused_columns.is_empty(),
         "expected no refusal, got: {refused_columns:?}"
@@ -92,9 +114,7 @@ fn only_logical_field(schema: &StructType, mode: ColumnMappingMode) -> LogicalFi
 
 fn refusal_message(column_name: &str, data_type: DataType) -> String {
     let schema = StructType::try_new([StructField::nullable(column_name, data_type)]).unwrap();
-    let (logical_fields, _, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("a refused column type never fails build_delta_table_schema itself");
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::None);
     assert!(
         logical_fields.is_empty(),
         "the refused column must carry no LogicalField"
@@ -115,12 +135,9 @@ fn each_column_mapping_mode_selects_its_own_binding_key() {
     ])
     .unwrap();
 
-    let (id_mode, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::Id, Vec::new()).unwrap();
-    let (name_mode, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::Name, Vec::new()).unwrap();
-    let (none_mode, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
+    let (id_mode, _) = classify(&schema, ColumnMappingMode::Id);
+    let (name_mode, _) = classify(&schema, ColumnMappingMode::Name);
+    let (none_mode, _) = classify(&schema, ColumnMappingMode::None);
 
     assert_eq!(
         binding_keys(&id_mode),
@@ -135,9 +152,7 @@ fn each_column_mapping_mode_selects_its_own_binding_key() {
 fn name_mode_fixture_columns_bind_by_their_declared_physical_name() {
     let schema = parse_schema(CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA);
 
-    let (logical_fields, partition_columns, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::Name, Vec::new())
-            .expect("boolean/long/string/double/... all map to an Arrow tag");
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::Name);
     assert!(refused_columns.is_empty());
 
     assert_eq!(
@@ -146,7 +161,6 @@ fn name_mode_fixture_columns_bind_by_their_declared_physical_name() {
          name=name(col-ed3e45cf-632b-4a07-bb22-d9f4693bbaa1), \
          value=name(col-95e13b58-72f1-4d26-8390-49469180a8a2)"
     );
-    assert!(partition_columns.is_empty());
 
     assert_eq!(logical_fields[0].arrow_type, "int64");
     assert!(logical_fields[0].nullable);
@@ -162,8 +176,7 @@ fn none_mode_ignores_a_residual_column_mapping_annotation() {
     ])
     .unwrap();
 
-    let (logical_fields, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
+    let (logical_fields, _) = classify(&schema, ColumnMappingMode::None);
 
     assert_eq!(binding_keys(&logical_fields), "a=identity, b=identity");
     assert_eq!(
@@ -184,9 +197,7 @@ fn id_mode_column_without_a_column_mapping_id_is_refused_naming_the_column() {
         (ColumnMappingMode::Id, "Id"),
         (ColumnMappingMode::Name, "Name"),
     ] {
-        let err = build_delta_table_schema(&schema, mode, Vec::new())
-            .expect_err("a column carrying no column-mapping id must be refused");
-        let message = user_message(err);
+        let message = refusal_of(&schema, mode);
 
         assert!(message.contains("'b'"), "message was: {message}");
         assert!(
@@ -202,9 +213,7 @@ fn id_mode_column_with_an_out_of_range_column_mapping_id_is_refused_naming_the_c
     let oversized = i64::from(i32::MAX) + 1;
     let schema = StructType::try_new([mapped_field("a", oversized, "col-a")]).unwrap();
 
-    let err = build_delta_table_schema(&schema, ColumnMappingMode::Id, Vec::new())
-        .expect_err("an id outside i32 must be refused");
-    let message = user_message(err);
+    let message = refusal_of(&schema, ColumnMappingMode::Id);
 
     assert!(message.contains("'a'"), "message was: {message}");
     assert!(
@@ -231,9 +240,7 @@ fn id_mode_column_without_a_physical_name_is_refused_naming_the_column() {
         ])
         .unwrap();
 
-        let err = build_delta_table_schema(&schema, ColumnMappingMode::Name, Vec::new())
-            .expect_err("a column carrying no usable physical name must be refused");
-        let message = user_message(err);
+        let message = refusal_of(&schema, ColumnMappingMode::Name);
 
         assert!(message.contains("'a'"), "message was: {message}");
         assert!(
@@ -250,10 +257,7 @@ fn a_refused_columns_binding_key_is_never_looked_up_even_when_it_would_itself_fa
     let refused_with_no_binding_annotation = StructField::nullable("bad_binary", DataType::BINARY);
     let schema = StructType::try_new([mappable, refused_with_no_binding_annotation]).unwrap();
 
-    let (logical_fields, _, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::Id, Vec::new()).expect(
-            "a refused column with no column-mapping annotation must not fail the whole call",
-        );
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::Id);
 
     assert_eq!(
         logical_fields
@@ -268,18 +272,6 @@ fn a_refused_columns_binding_key_is_never_looked_up_even_when_it_would_itself_fa
     assert_eq!(refused_columns.len(), 1);
     assert_eq!(refused_columns[0].column_name, "bad_binary");
     assert!(refused_columns[0].reason.contains("binary"));
-}
-
-#[test]
-fn partition_columns_are_threaded_through_verbatim_and_in_order() {
-    let schema = StructType::try_new([StructField::not_null("region", DataType::STRING)]).unwrap();
-    let partition_columns = vec!["region".to_string(), "day".to_string()];
-
-    let (_, carried_partition_columns, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, partition_columns.clone())
-            .unwrap();
-
-    assert_eq!(carried_partition_columns, partition_columns);
 }
 
 /// Scenario: Every Delta type Exasol represents natively maps to its own Arrow tag
@@ -301,9 +293,7 @@ fn every_natively_representable_delta_type_maps_to_its_own_arrow_tag() {
     ])
     .unwrap();
 
-    let (logical_fields, _, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("every column here is in the native set");
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::None);
     assert!(refused_columns.is_empty());
 
     let tags: Vec<(&str, &str)> = logical_fields
@@ -337,9 +327,7 @@ fn decimal_within_exasol_domain_maps_to_decimal128_tag() {
     )])
     .unwrap();
 
-    let (logical_fields, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("decimal(10,2) is within Exasol's 1..=36 precision domain");
+    let (logical_fields, _) = classify(&schema, ColumnMappingMode::None);
 
     assert_eq!(logical_fields[0].arrow_type, "decimal128(10,2)");
 }
@@ -353,9 +341,7 @@ fn decimal_outside_exasol_domain_maps_to_utf8() {
     )])
     .unwrap();
 
-    let (logical_fields, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("precision 38 exceeds Exasol's domain but is still text-rendered, not refused");
+    let (logical_fields, _) = classify(&schema, ColumnMappingMode::None);
 
     assert_eq!(logical_fields[0].arrow_type, "utf8");
 }
@@ -370,9 +356,7 @@ fn void_and_interval_types_are_tagged_utf8() {
     ])
     .unwrap();
 
-    let (logical_fields, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("void and both interval types are in the text-rendered set");
+    let (logical_fields, _) = classify(&schema, ColumnMappingMode::None);
 
     for field in &logical_fields {
         assert_eq!(field.arrow_type, "utf8", "field was: {}", field.name);
@@ -387,8 +371,7 @@ fn nullability_is_carried_from_the_delta_schema() {
     ])
     .unwrap();
 
-    let (logical_fields, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
+    let (logical_fields, _) = classify(&schema, ColumnMappingMode::None);
 
     assert!(logical_fields[0].nullable);
     assert!(!logical_fields[1].nullable);
@@ -448,9 +431,7 @@ fn containers_classify_recursively_by_renderability() {
     ])
     .unwrap();
 
-    let (logical_fields, _, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("every member type here is native, text-rendered, or a container of those");
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::None);
 
     assert!(
         refused_columns.is_empty(),
@@ -592,10 +573,9 @@ fn a_refusal_names_its_column_under_the_classifying_sources_label() {
     ])
     .unwrap();
 
-    let (delta_fields, _, delta_refusals) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
-    let (glue_fields, _, glue_refusals) =
-        classify_spark_schema(&schema, ColumnMappingMode::None, Vec::new(), "Glue").unwrap();
+    let (delta_fields, delta_refusals) = classify(&schema, ColumnMappingMode::None);
+    let (glue_fields, glue_refusals) =
+        classify_spark_schema(&schema, ColumnMappingMode::None, "Glue");
 
     assert_eq!(glue_fields, delta_fields, "the label changes no mapping");
     let reasons = |refusals: &[RefusedColumn]| -> Vec<String> {
@@ -615,7 +595,7 @@ fn a_refusal_names_its_column_under_the_classifying_sources_label() {
         reasons(&delta_refusals)
             .iter()
             .all(|reason| reason.starts_with("Delta column '")),
-        "build_delta_table_schema keeps the Delta label: {delta_refusals:?}"
+        "the Delta label stays: {delta_refusals:?}"
     );
 }
 
@@ -634,11 +614,7 @@ fn a_refused_containers_nested_binding_key_is_never_looked_up() {
     );
     let schema = StructType::try_new([refused_member_beside_an_unannotated_one]).unwrap();
 
-    let (logical_fields, _, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::Id, Vec::new()).expect(
-            "a column refused for a member's type must not fail the call for a sibling member's \
-             missing annotation",
-        );
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::Id);
 
     assert!(logical_fields.is_empty());
     assert_eq!(refused_columns.len(), 1);
@@ -708,8 +684,7 @@ fn a_non_list_type_changes_value_is_refused_naming_the_column() {
         MetadataValue::String("not-a-list".to_string()),
     )]);
 
-    let err = parsed_type_changes(&field).expect_err("a non-list value must be refused");
-    let message = user_message(err);
+    let message = parsed_type_changes(&field).expect_err("a non-list value must be refused");
 
     assert!(message.contains("'bad'"), "message was: {message}");
     assert!(
@@ -725,8 +700,7 @@ fn a_non_object_entry_is_refused_naming_the_column() {
         MetadataValue::Other(serde_json::json!(["not-an-object"])),
     )]);
 
-    let err = parsed_type_changes(&field).expect_err("a non-object entry must be refused");
-    let message = user_message(err);
+    let message = parsed_type_changes(&field).expect_err("a non-object entry must be refused");
 
     assert!(message.contains("'bad'"), "message was: {message}");
 }
@@ -747,8 +721,7 @@ fn an_entry_missing_or_misshaping_fromtype_or_totype_is_refused_naming_the_colum
     )]);
 
     for field in [missing_from, missing_to, non_string_from] {
-        let err = parsed_type_changes(&field).expect_err("a malformed entry must be refused");
-        let message = user_message(err);
+        let message = parsed_type_changes(&field).expect_err("a malformed entry must be refused");
         assert!(message.contains("'bad'"), "message was: {message}");
     }
 }
@@ -762,8 +735,7 @@ fn a_non_string_field_path_is_refused_naming_the_column() {
         ])),
     )]);
 
-    let err = parsed_type_changes(&field).expect_err("a non-string fieldPath must be refused");
-    let message = user_message(err);
+    let message = parsed_type_changes(&field).expect_err("a non-string fieldPath must be refused");
 
     assert!(message.contains("'bad'"), "message was: {message}");
     assert!(message.contains("fieldPath"), "message was: {message}");
@@ -785,8 +757,9 @@ fn type_change_at(from_type: &str, to_type: &str, field_path: &str) -> RecordedT
     }
 }
 
-fn parsed_type_changes(field: &StructField) -> Result<Vec<RecordedTypeChange>, UdfError> {
+fn parsed_type_changes(field: &StructField) -> Result<Vec<RecordedTypeChange>, String> {
     recorded_type_changes(field, &FieldPath::column(field.name()))
+        .map_err(|refusal| refusal.stated_for(field, "Delta"))
 }
 
 /// `decimal(10,2)` -> `decimal(10,2)` is the `k1 = k2 = 0` corner the protocol admits.
@@ -927,9 +900,7 @@ fn a_field_carrying_an_unsupported_recorded_type_change_is_refused_naming_both_t
     )]);
     let schema = StructType::try_new([field]).unwrap();
 
-    let (logical_fields, _, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("an unsupported recorded type change refuses the column, not the whole call");
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::None);
 
     assert!(
         logical_fields.is_empty(),
@@ -953,9 +924,7 @@ fn a_field_whose_recorded_type_changes_are_all_supported_plans_normally() {
     )]);
     let schema = StructType::try_new([field]).unwrap();
 
-    let (logical_fields, _, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("a supported recorded type change must not fail the call");
+    let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::None);
 
     assert!(
         refused_columns.is_empty(),
@@ -1010,10 +979,7 @@ fn nested_type_changes_are_validated_and_refuse_with_a_composed_path() {
     ] {
         let schema = StructType::try_new([StructField::nullable(column_name, data_type)]).unwrap();
 
-        let (logical_fields, _, refused_columns) =
-            build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).expect(
-                "an unsupported recorded type change refuses the column, not the whole call",
-            );
+        let (logical_fields, refused_columns) = classify(&schema, ColumnMappingMode::None);
 
         assert!(logical_fields.is_empty());
         assert_eq!(refused_columns.len(), 1);
@@ -1040,8 +1006,7 @@ fn a_top_level_entrys_own_field_path_is_reported_below_the_column() {
     )])
     .unwrap();
 
-    let (_, _, refused_columns) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
+    let (_, refused_columns) = classify(&schema, ColumnMappingMode::None);
 
     assert_eq!(refused_columns.len(), 1);
     assert!(
@@ -1070,15 +1035,11 @@ fn a_nested_annotation_is_supported_or_malformed_by_the_same_rules_as_a_top_leve
     )])
     .unwrap();
 
-    let (logical_fields, _, refused_columns) =
-        build_delta_table_schema(&supported, ColumnMappingMode::None, Vec::new())
-            .expect("a supported nested change must not fail the call");
+    let (logical_fields, refused_columns) = classify(&supported, ColumnMappingMode::None);
     assert!(refused_columns.is_empty());
     assert_eq!(logical_fields.len(), 1);
 
-    let err = build_delta_table_schema(&malformed, ColumnMappingMode::None, Vec::new())
-        .expect_err("a malformed nested annotation must surface as a UdfError");
-    let message = user_message(err);
+    let message = refusal_of(&malformed, ColumnMappingMode::None);
     assert!(
         message.contains("'payload.inner'"),
         "message was: {message}"
@@ -1147,8 +1108,7 @@ fn positional_members_carry_no_name_and_a_primitive_column_carries_no_descriptor
     ])
     .unwrap();
 
-    let (logical_fields, _, _) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new()).unwrap();
+    let (logical_fields, _) = classify(&schema, ColumnMappingMode::None);
 
     let descriptors: Vec<(&str, Option<&NestedMembers>)> = logical_fields
         .iter()
@@ -1201,14 +1161,111 @@ fn a_nested_field_missing_its_modes_annotation_is_refused_naming_its_path() {
         (ColumnMappingMode::Id, "delta.columnMapping.id"),
         (ColumnMappingMode::Name, "delta.columnMapping.physicalName"),
     ] {
-        let err = build_delta_table_schema(&schema, mode, Vec::new())
-            .expect_err("an unannotated nested field must be refused");
-        let message = user_message(err);
+        let message = refusal_of(&schema, mode);
 
         assert!(
             message.contains("'payload.inner'"),
             "message was: {message}"
         );
         assert!(message.contains(expected_key), "message was: {message}");
+    }
+}
+
+/// What `createVirtualSchema` records in each column's note, in column order.
+fn declarations(table: &CatalogTable) -> Vec<ColumnDeclaration> {
+    declare_columns(table)
+        .into_iter()
+        .map(|note| {
+            serde_json::from_str(&note.expect("every Delta column is declared"))
+                .expect("a declared note decodes")
+        })
+        .collect()
+}
+
+/// Scenario: Each logical field carries the binding key its column-mapping mode selects
+#[test]
+fn declaration_carries_the_mode_selected_key_from_type_json() {
+    let fields = [
+        mapped_field("a", 7, "col-a"),
+        annotated(StructField::nullable("p", DataType::STRING), 8, "col-p"),
+    ];
+
+    for (mode, expected) in [
+        (Some("name"), "a=name(col-a), p=name(col-p)"),
+        (Some("id"), "a=id(7), p=id(8)"),
+        (Some("none"), "a=identity, p=identity"),
+        (None, "a=identity, p=identity"),
+    ] {
+        let declared = declarations(&unity_delta_table(&fields, mode, &["p"]));
+
+        let logical_fields: Vec<LogicalField> = declared
+            .iter()
+            .map(|declaration| declaration.source_type.clone())
+            .collect();
+        assert_eq!(binding_keys(&logical_fields), expected, "mode {mode:?}");
+        let shape: Vec<(Option<usize>, bool, bool)> = declared
+            .iter()
+            .map(|declaration| {
+                (
+                    declaration.partition,
+                    declaration.source_type.nullable,
+                    declaration.refused.is_some(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            vec![(None, false, false), (Some(0), true, false)],
+            "partition position from the catalog and nullability from type_json, mode {mode:?}"
+        );
+    }
+}
+
+/// Scenario: A Delta column whose column-mapping metadata is unusable is refused in its note and the table stays listed
+#[test]
+fn unusable_annotation_or_mode_refuses_the_column() {
+    let value_without_physical_name = StructField::nullable("value", DataType::DOUBLE)
+        .with_metadata([("delta.columnMapping.id", MetadataValue::Number(3))]);
+    let fields = [mapped_field("id", 1, "col-id"), value_without_physical_name];
+
+    let declared = declarations(&unity_delta_table(&fields, Some("name"), &[]));
+    assert_eq!(
+        declared[0].refused, None,
+        "only the unusable column is refused"
+    );
+    let reason = declared[1].refused.as_deref().expect("value is refused");
+    for fragment in ["'value'", "Name", "delta.columnMapping.physicalName"] {
+        assert!(reason.contains(fragment), "'{fragment}' missing: {reason}");
+    }
+
+    let declared = declarations(&unity_delta_table(&fields, Some("label"), &[]));
+    for (declaration, column) in declared.iter().zip(["id", "value"]) {
+        let reason = declaration
+            .refused
+            .as_deref()
+            .expect("every column is refused");
+        for fragment in [format!("'{column}'"), "'label'".to_string()] {
+            assert!(reason.contains(&fragment), "'{fragment}' missing: {reason}");
+        }
+    }
+}
+
+/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
+#[test]
+fn malformed_type_change_annotation_refuses_its_column() {
+    let fields = [
+        StructField::nullable("id", DataType::LONG),
+        with_type_changes(
+            StructField::nullable("widened", DataType::LONG),
+            serde_json::json!([{"toType": "long"}]),
+        ),
+    ];
+
+    let declared = declarations(&unity_delta_table(&fields, None, &[]));
+
+    assert_eq!(declared[0].refused, None);
+    let reason = declared[1].refused.as_deref().expect("widened is refused");
+    for fragment in ["'widened'", "delta.typeChanges", "fromType"] {
+        assert!(reason.contains(fragment), "'{fragment}' missing: {reason}");
     }
 }

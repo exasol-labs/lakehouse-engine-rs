@@ -8,8 +8,8 @@ use common::cloud_fixture::panic_message;
 use common::e2e_harness::{
     SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_values_refused,
     assert_decimal_orders_numerically, assert_text_columns, assert_type_matrix,
-    create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql, install_slc,
-    int_column, pairs, parse_int, query_error, reads, refuses,
+    column_adapter_notes, create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql,
+    install_slc, int_column, note_of, pairs, parse_int, query_error, reads, refuses,
     try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
@@ -225,11 +225,12 @@ type ReadOnlyCheck = fn(&GlueRun, &mut ExaConn);
 #[test]
 fn glue_read_only_checks_pass_against_one_provisioned_fixture() {
     let run = provision();
-    let checks: [(&str, ReadOnlyCheck); 7] = [
+    let checks: [(&str, ReadOnlyCheck); 8] = [
         (
             "listing",
             check_listing_includes_routed_tables_and_records_every_skip,
         ),
+        ("column notes", check_glue_columns_persist_source_notes),
         (
             "pushdown rows",
             check_queries_return_expected_rows_through_pushdown,
@@ -339,6 +340,78 @@ fn check_listing_includes_routed_tables_and_records_every_skip(run: &GlueRun, co
             !objects.iter().any(|object| object.starts_with(&prefix)),
             "no data file may exist under the metadata-only location {prefix}, so each skip \
              rests on metadata alone"
+        );
+    }
+}
+
+/// Scenario: Every declared column carries its source shape in its adapterNotes
+/// Scenario: A Glue Parquet table is planned by the shared catalog-declared Parquet reader
+/// Scenario: A Glue Iceberg table is planned from its metadata location by the one Iceberg planner
+fn check_glue_columns_persist_source_notes(run: &GlueRun, conn: &mut ExaConn) {
+    let notes = column_adapter_notes(conn, VS, &ICEBERG_ORDERS.to_uppercase());
+    let declared: Vec<(&str, &Value)> = notes
+        .iter()
+        .map(|(column, note)| (column.as_str(), &note["sourceType"]))
+        .collect();
+    assert_eq!(
+        declared,
+        [
+            (
+                "AMOUNT",
+                &serde_json::json!({"field_id": 3, "name": "amount", "arrow_type": "decimal128(10,2)", "nullable": true})
+            ),
+            (
+                "CUSTOMER",
+                &serde_json::json!({"field_id": 2, "name": "customer", "arrow_type": "utf8", "nullable": true})
+            ),
+            (
+                "ORDER_DATE",
+                &serde_json::json!({"field_id": 4, "name": "order_date", "arrow_type": "date32", "nullable": true})
+            ),
+            (
+                "ORDER_ID",
+                &serde_json::json!({"field_id": 1, "name": "order_id", "arrow_type": "int64", "nullable": false})
+            ),
+        ],
+        "each note is the metadata file's field, never Glue's {STALE_GLUE_COLUMN} copy"
+    );
+    let parquet = column_adapter_notes(conn, VS, &PARTITIONED.to_uppercase());
+    let positions: Vec<(&str, Option<u64>)> = parquet
+        .iter()
+        .map(|(column, note)| (column.as_str(), note["partition"].as_u64()))
+        .collect();
+    assert_eq!(
+        positions,
+        [
+            ("ID", None),
+            ("P_DATE", Some(1)),
+            ("P_INT", Some(0)),
+            ("P_STR", Some(2)),
+            ("V", None)
+        ],
+        "a Parquet table's notes record its partition keys in Glue's key order"
+    );
+    assert!(
+        parquet
+            .iter()
+            .all(|(_, note)| note["sourceType"]["nullable"] == true
+                && note["sourceType"]["field_id"].is_null()),
+        "every Parquet column is declared nullable and unbound: {parquet:?}"
+    );
+    let all_types = column_adapter_notes(conn, VS, &ALL_TYPES.to_uppercase());
+    let binary = note_of(&all_types, "H_BINARY");
+    assert!(
+        binary["refused"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("#351")),
+        "a binary Hive column's refusal is recorded at CREATE: {binary}"
+    );
+
+    let secret = run.env().secret_access_key().to_string();
+    for (column, note) in notes.iter().chain(&parquet) {
+        assert!(
+            !note.to_string().contains(&secret),
+            "{column}: no credential in a note"
         );
     }
 }

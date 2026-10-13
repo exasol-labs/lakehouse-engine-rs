@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -243,11 +244,13 @@ fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat)
         partition_columns,
         columns: info.columns.into_iter().map(neutral_column).collect(),
         metadata_location: None,
+        properties: info.properties.unwrap_or_default(),
     }
 }
 
 fn neutral_column(column: ColumnInfo) -> CatalogColumn {
     CatalogColumn {
+        declaration: None,
         name: column.name,
         source_type: ColumnSourceType::Unity {
             type_json: column.type_json,
@@ -355,6 +358,8 @@ struct TableInfo {
     table_id: Option<String>,
     #[serde(default)]
     columns: Vec<ColumnInfo>,
+    #[serde(default)]
+    properties: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Deserialize)]

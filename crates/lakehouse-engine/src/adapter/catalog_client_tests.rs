@@ -46,7 +46,7 @@ fn construction_site_is_exhaustive_and_fallible_for_every_kind() {
 
 #[test]
 fn both_kinds_share_one_listing_pipeline() {
-    use iceberg::spec::{PrimitiveType, Type};
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
     use lakehouse_catalog::{
         CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
     };
@@ -66,16 +66,20 @@ fn both_kinds_share_one_listing_pipeline() {
             partition_columns: Vec::new(),
             metadata_location: None,
             columns: vec![CatalogColumn {
+                declaration: None,
                 name: "order_id".to_string(),
                 source_type,
             }],
+            properties: Default::default(),
         }],
         skipped: Vec::new(),
     };
 
     let iceberg_listing = one_table_listing(
         TableFormat::Iceberg,
-        ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+        ColumnSourceType::Iceberg(
+            NestedField::optional(1, "order_id", Type::Primitive(PrimitiveType::Long)).into(),
+        ),
     );
     let unity_listing = one_table_listing(
         TableFormat::Delta,
@@ -118,7 +122,7 @@ fn both_kinds_share_one_listing_pipeline() {
 
 #[test]
 fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
-    use iceberg::spec::{PrimitiveType, Type};
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
     use lakehouse_catalog::{
         CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
     };
@@ -138,12 +142,15 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
             metadata_location: None,
             columns: vec![
                 CatalogColumn {
+                    declaration: None,
                     name: "ts".to_string(),
-                    source_type: ColumnSourceType::Iceberg(Type::Primitive(
-                        PrimitiveType::Timestamp,
-                    )),
+                    source_type: ColumnSourceType::Iceberg(
+                        NestedField::optional(1, "ts", Type::Primitive(PrimitiveType::Timestamp))
+                            .into(),
+                    ),
                 },
                 CatalogColumn {
+                    declaration: None,
                     name: "delta_ts".to_string(),
                     source_type: ColumnSourceType::Unity {
                         type_json: Some(
@@ -153,6 +160,7 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
                     },
                 },
             ],
+            properties: Default::default(),
         }],
         skipped: Vec::new(),
     };
@@ -174,4 +182,100 @@ fn build_listing_virtual_tables_declares_timestamp_at_the_given_precision() {
         assert_eq!(columns[0]["dataType"], expected, "iceberg on {engine:?}");
         assert_eq!(columns[1]["dataType"], expected, "delta on {engine:?}");
     }
+}
+
+/// Direct-storage-shaped columns: only the slot can give a Parquet column a note.
+fn declared_listing(declarations: Vec<Option<String>>) -> CatalogListing {
+    use lakehouse_catalog::{
+        CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
+    };
+
+    CatalogListing {
+        tables: vec![CatalogTable {
+            ident: CatalogTableIdent {
+                namespace: vec!["cat".to_string(), "sch".to_string()],
+                name: "sales".to_string(),
+            },
+            table_type: CatalogTableType::Table,
+            storage_location: None,
+            format: TableFormat::Parquet,
+            vended_credential_key: None,
+            partition_columns: Vec::new(),
+            metadata_location: None,
+            columns: declarations
+                .into_iter()
+                .enumerate()
+                .map(|(index, declaration)| CatalogColumn {
+                    declaration,
+                    name: format!("c{index}"),
+                    source_type: ColumnSourceType::Parquet("int64".to_string()),
+                })
+                .collect(),
+            properties: Default::default(),
+        }],
+        skipped: Vec::new(),
+    }
+}
+
+fn listed_tables(listing: &CatalogListing) -> Result<Vec<Json>, UdfError> {
+    let namespaces = vec!["cat".to_string(), "sch".to_string()];
+    build_listing_virtual_tables(
+        &namespaces,
+        listing,
+        EngineTimestampSupport::MillisecondOnly,
+    )
+    .map(|(tables, _, _)| tables)
+}
+
+/// Scenario: Every declared column carries its source shape in its adapterNotes
+#[test]
+fn a_column_with_a_declaration_gets_its_note_and_one_without_gets_none() {
+    let tables = listed_tables(&declared_listing(vec![
+        Some(r#"{"sourceType":{}}"#.to_string()),
+        None,
+    ]))
+    .unwrap();
+
+    let columns = tables[0]["columns"].as_array().unwrap();
+    assert_eq!(columns[0]["adapterNotes"], r#"{"sourceType":{}}"#);
+    assert!(columns[1].get("adapterNotes").is_none(), "{columns:?}");
+}
+
+/// Scenario: Every declared column carries its source shape in its adapterNotes
+#[test]
+fn an_iceberg_column_without_a_slot_is_declared_from_its_field() {
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
+    use lakehouse_catalog::ColumnSourceType;
+
+    let mut listing = declared_listing(vec![None]);
+    listing.tables[0].format = lakehouse_catalog::TableFormat::Iceberg;
+    listing.tables[0].columns[0].source_type = ColumnSourceType::Iceberg(
+        NestedField::required(7, "qty", Type::Primitive(PrimitiveType::Long))
+            .with_initial_default(Literal::long(0))
+            .into(),
+    );
+
+    let tables = listed_tables(&listing).unwrap();
+
+    assert_eq!(
+        tables[0]["columns"][0]["adapterNotes"],
+        r#"{"sourceType":{"field_id":7,"name":"qty","arrow_type":"int64","nullable":false,"initial_default":"0"}}"#,
+        "the note carries the field id, the source name, the Arrow tag, `required` as \
+         non-nullable, and the `initial-default`"
+    );
+}
+
+/// Scenario: A column note longer than the per-column limit fails the statement
+#[test]
+fn a_note_over_the_limit_fails_the_listing_naming_table_and_column() {
+    let over_limit = "x".repeat(column_notes::MAX_COLUMN_NOTE_CHARS + 1);
+
+    let message = listed_tables(&declared_listing(vec![Some(over_limit)]))
+        .unwrap_err()
+        .to_string();
+
+    assert!(
+        message.contains("'C0'") && message.contains("'SALES'"),
+        "{message}"
+    );
 }

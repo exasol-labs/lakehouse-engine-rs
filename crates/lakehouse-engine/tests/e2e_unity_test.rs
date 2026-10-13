@@ -6,10 +6,12 @@
 mod common;
 
 use common::e2e_harness::{
-    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON,
-    assert_decimal_orders_numerically, assert_type_matrix, create_schema_and_scripts,
+    ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps,
+    assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
+    column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
     declared_types, exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper,
-    install_slc, pairs, parse_int, parse_numeric, reads, refuses, upload_so, value_to_string,
+    install_slc, involved_notes, note_of, pairs, parse_int, parse_numeric, persisted_column_notes,
+    query_error, reads, refuses, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::raw_parquet::{encode_parquet, put_fixture_object, write_parquet_fixture};
@@ -44,6 +46,7 @@ use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use serde_json::{Value as Json, json};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -108,6 +111,7 @@ fn setup() {
 
         create_unity_virtual_schema(&mut conn);
         create_unity_role_virtual_schema(&mut conn);
+        create_catalog_copy_virtual_schema(&mut conn);
     });
 }
 
@@ -127,6 +131,22 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   NAMESPACE  = '{UNITY_NAMESPACE}'
   ALLOW_HTTP         = 'true'"#
     ));
+}
+
+/// Over the seeded entries whose catalog metadata deliberately disagrees with their Delta logs.
+const COPY_VS_NAME: &str = "UNITY_CATALOG_COPY_VS";
+
+/// Runs CREATE through `conn.execute`, so a CREATE that fails over the unusable entries fails
+/// every test.
+fn create_catalog_copy_virtual_schema(conn: &mut ExaConn) {
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(COPY_VS_NAME, "unity.delta_catalog_copy")
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(CONN_NAME),
+        UNITY_CATALOG_URI_INTERNAL,
+        &local_stack_connection_password(),
+    );
 }
 
 /// A second Virtual Schema over the SAME seeded `unity.delta_e2e` namespace.
@@ -598,6 +618,10 @@ async fn resolve_unity_scan(
         .await
         .unwrap_or_else(|e| panic!("load_table({table_name}) failed: {e}"));
     let storage = delta_static_storage();
+    let notes = persisted_column_notes(&mut exa_conn(), VS_NAME, &table_name.to_uppercase());
+    let declared = involved_notes(table_name, &notes)
+        .declared_schema()
+        .unwrap_or_else(|e| panic!("the notes of {table_name} parse: {e}"));
 
     let reader = format_reader(
         ScanSource::Unity {
@@ -612,10 +636,11 @@ async fn resolve_unity_scan(
     )
     .unwrap_or_else(|e| panic!("format_reader({table_name}) failed: {e}"));
 
-    reader
-        .resolve_scan(filter)
+    let planned = reader
+        .resolve_scan(&declared, filter)
         .await
-        .unwrap_or_else(|e| panic!("resolve_scan({table_name}) failed: {e}"))
+        .unwrap_or_else(|e| panic!("resolve_scan({table_name}) failed: {e}"));
+    ResolvedScan::new(declared, planned)
 }
 
 /// Panics on an empty partition map: comparing two runs cannot detect both silently losing
@@ -658,8 +683,7 @@ fn rt() -> tokio::runtime::Runtime {
 /// Scenario: Vended and static credentials resolve the same scan
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
-    wait_for_seaweedfs();
-    wait_for_unity_catalog();
+    setup();
 
     let rt = rt();
     let vended = rt.block_on(resolve_unity_scan("basic_partitioned", true, None));
@@ -722,8 +746,7 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
 /// Scenario: Pruning reaches every request shape and changes no result end to end
 #[test]
 fn unity_delta_filters_prune_the_resolved_file_list() {
-    wait_for_seaweedfs();
-    wait_for_unity_catalog();
+    setup();
 
     let rt = rt();
 
@@ -1844,6 +1867,8 @@ fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf()
     );
 }
 
+/// Scenario: Partition columns come from the catalog and partition values from the file paths
+/// Scenario: A partition column's note carries its position among the partition columns
 #[test]
 fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
     setup();
@@ -1862,6 +1887,21 @@ fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
             ("REGION", VARCHAR_JSON),
         ]),
         "Parquet columns must precede partition columns, in declared order"
+    );
+    let notes = column_adapter_notes(&mut conn, VS_NAME, "SALES_PARQUET");
+    let positions: Vec<(&str, Option<u64>)> = notes
+        .iter()
+        .map(|(column, note)| (column.as_str(), note["partition"].as_u64()))
+        .collect();
+    assert_eq!(
+        positions,
+        [
+            ("AMOUNT", None),
+            ("ID", None),
+            ("REGION", Some(1)),
+            ("YEAR", Some(0))
+        ],
+        "CREATE records each partition column at its partition_index"
     );
 
     let cols = conn.query_columns(&format!(
@@ -1955,6 +1995,18 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
         ],
     );
     assert_decimal_orders_numerically(&mut conn, VS_NAME, "ALL_TYPES_PARQUET", "C_DECIMAL_18_0");
+
+    let notes = column_adapter_notes(&mut conn, VS_NAME, "ALL_TYPES_PARQUET");
+    let refused: Vec<&str> = notes
+        .iter()
+        .filter(|(_, note)| !note["refused"].is_null())
+        .map(|(column, _)| column.as_str())
+        .collect();
+    assert_eq!(
+        refused,
+        ["C_BINARY", "C_STRUCT_BINARY", "C_VARIANT"],
+        "CREATE records each refusal in its column's note"
+    );
 }
 
 /// Scenario: Vended and static credentials resolve the same scan
@@ -1969,4 +2021,263 @@ fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     assert_eq!(vended.table_root, static_creds.table_root);
     assert_eq!(vended.files, static_creds.files);
     assert_eq!(vended.files.len(), 3, "{:?}", vended.files);
+}
+
+fn copy_ref(table: &str) -> String {
+    format!("{COPY_VS_NAME}.{table}")
+}
+
+/// Scenario: Every declared column carries its source shape in its adapterNotes
+#[test]
+fn unity_delta_and_parquet_columns_persist_source_notes() {
+    setup();
+    let mut conn = exa_conn();
+
+    for table in ["CM_NAME_MODE", "STATS_ALL_TYPES", "SALES_PARQUET"] {
+        let notes = column_adapter_notes(&mut conn, VS_NAME, table);
+        assert_eq!(
+            notes.len(),
+            declared_types(&mut conn, VS_NAME, table).len(),
+            "{table}: every column carries a note"
+        );
+        for (column, note) in &notes {
+            assert!(
+                note["sourceType"]["arrow_type"].is_string(),
+                "{table}.{column}: {note}"
+            );
+        }
+    }
+}
+
+/// Scenario: Create virtual schema declares each Delta column from its type_json and the table's column-mapping mode property
+#[test]
+fn unity_create_declares_delta_columns_from_catalog_metadata() {
+    setup();
+    let mut conn = exa_conn();
+    let name_mode = column_adapter_notes(&mut conn, VS_NAME, "CM_NAME_MODE");
+    let id_mode = column_adapter_notes(&mut conn, VS_NAME, "CM_ID_MODE");
+    let partitioned = column_adapter_notes(&mut conn, VS_NAME, "BASIC_PARTITIONED");
+
+    let key = |note: &Json| {
+        let source_type = &note["sourceType"];
+        (
+            source_type["field_id"].clone(),
+            source_type["physical_name"].clone(),
+        )
+    };
+    assert_eq!(
+        key(note_of(&name_mode, "ID")),
+        (
+            Json::Null,
+            json!("col-80396d42-d765-483e-b86e-7ac1e13ef88c")
+        ),
+        "name mode records the physical name alone"
+    );
+    assert_eq!(
+        key(note_of(&id_mode, "ID")),
+        (json!(1), Json::Null),
+        "id mode records the field id alone"
+    );
+    for (column, note) in &partitioned {
+        assert_eq!(
+            key(note),
+            (Json::Null, Json::Null),
+            "{column}: no mode, no key"
+        );
+    }
+    assert_eq!(note_of(&partitioned, "LETTER")["partition"], 0);
+    assert_eq!(note_of(&partitioned, "NUMBER").get("partition"), None);
+    assert_eq!(
+        declared_types(&mut conn, VS_NAME, "CM_NAME_MODE"),
+        pairs(&[
+            ("ID", "DECIMAL(20,0)"),
+            ("NAME", "VARCHAR(2000000)"),
+            ("VALUE", "DOUBLE"),
+        ])
+    );
+}
+
+/// Scenario: Enumeration names tables through the shared fold and stops at catalog metadata
+#[test]
+fn unity_create_declares_a_delta_table_whose_location_holds_no_log() {
+    setup();
+    let mut conn = exa_conn();
+
+    assert_eq!(
+        declared_types(&mut conn, COPY_VS_NAME, "NO_LOG"),
+        pairs(&[
+            ("LETTER", "VARCHAR(2000000)"),
+            ("NUMBER", "DECIMAL(20,0)"),
+            ("A_FLOAT", "DOUBLE"),
+        ]),
+        "CREATE declares the table from catalog metadata without reading a log"
+    );
+    assert_eq!(
+        note_of(
+            &column_adapter_notes(&mut conn, COPY_VS_NAME, "NO_LOG"),
+            "LETTER"
+        )["partition"],
+        0
+    );
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT \"NUMBER\" FROM {}", copy_ref("NO_LOG")),
+        &["no-log-here"],
+    );
+}
+
+/// Scenario: A Delta column whose column-mapping metadata is unusable is refused in its note and the table stays listed
+#[test]
+fn unity_unusable_column_mapping_metadata_refuses_only_its_column() {
+    setup();
+    let mut conn = exa_conn();
+    let unannotated = "VALUE_WITHOUT_PHYSICAL_NAME";
+
+    let tables = enumerated_table_names(&mut conn, COPY_VS_NAME);
+    for table in [unannotated, "LABEL_MODE"] {
+        assert!(
+            tables.iter().any(|t| t == table),
+            "{table} is listed: {tables:?}"
+        );
+    }
+    let notes = conn.query_columns(&format!(
+        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{COPY_VS_NAME}'"
+    ));
+    let skipped = serde_json::from_str::<Json>(&value_to_string(&notes[0][0]))
+        .expect("ADAPTER_NOTES is JSON")["SKIPPED_TABLES"]
+        .to_string();
+    assert!(
+        !skipped.contains("value_without") && !skipped.contains("label_mode"),
+        "{skipped}"
+    );
+
+    let rows = conn.query_columns(&format!("SELECT ID, NAME FROM {}", copy_ref(unannotated)));
+    assert_eq!(
+        rows[0].len(),
+        3,
+        "the other columns stay queryable: {rows:?}"
+    );
+    let refused = &["'value'", "Name-mode", "delta.columnMapping.physicalName"];
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT \"VALUE\" FROM {}", copy_ref(unannotated)),
+        refused,
+    );
+    let label = query_error(
+        &mut conn,
+        &format!("SELECT ID FROM {}", copy_ref("LABEL_MODE")),
+    );
+    assert!(
+        label.contains("'label'") && label.contains("'id'"),
+        "{label}"
+    );
+    assert!(!label.contains("lhadminsecret123"), "{label}");
+}
+
+/// Scenario: The client carries each table's properties verbatim from the list sweep and the single-table load
+#[test]
+fn unity_session_carries_table_properties_from_list_and_load() {
+    setup();
+    let session = UnityCatalogSession::new(&unity_catalog_url(), delta_creds(false));
+    let namespace = ["unity".to_string(), "delta_e2e".to_string()];
+    let expected = BTreeMap::from([
+        ("delta.columnMapping.mode".to_string(), "name".to_string()),
+        (
+            "delta.columnMapping.maxColumnId".to_string(),
+            "3".to_string(),
+        ),
+        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+    ]);
+
+    let rt = rt();
+    let listing = rt
+        .block_on(session.list_tables(&namespace))
+        .expect("the namespace lists");
+    let loaded = rt
+        .block_on(session.load_table(&delta_e2e_table("cm_name_mode")))
+        .expect("the table loads");
+
+    let listed = |name: &str| {
+        let table = listing.tables.iter().find(|table| table.ident.name == name);
+        table
+            .unwrap_or_else(|| panic!("{name} is listed"))
+            .properties
+            .clone()
+    };
+    assert_eq!(listed("cm_name_mode"), expected);
+    assert_eq!(loaded.properties, expected);
+    assert_eq!(listed("sales_parquet"), BTreeMap::new());
+}
+
+/// Scenario: A declaration that disagrees with the Delta log fails the query
+#[test]
+fn unity_delta_query_fails_when_the_catalog_copy_disagrees_with_the_log() {
+    setup();
+    let mut conn = exa_conn();
+
+    for (table, column, part) in [
+        ("NO_MODE", "ID", "column-mapping mode is 'name'"),
+        (
+            "NO_PARTITION_INDEX",
+            "NUMBER",
+            r#"partitions by ["letter"]"#,
+        ),
+    ] {
+        assert_query_fails(
+            &mut conn,
+            &format!("SELECT \"{column}\" FROM {}", copy_ref(table)),
+            &[table, part, "type_json", "ALTER VIRTUAL SCHEMA ... REFRESH"],
+        );
+    }
+}
+
+/// Scenario: A declared non-nullable column that the Delta log marks nullable fails the query
+#[test]
+fn unity_delta_non_nullable_declaration_of_a_nullable_column_fails() {
+    setup();
+    let mut conn = exa_conn();
+    let table = copy_ref("ID_NOT_NULL");
+
+    for sql in [
+        format!("SELECT ID FROM {table} WHERE ID IS NULL"),
+        format!("SELECT NAME FROM {table}"),
+    ] {
+        assert_query_fails(
+            &mut conn,
+            &sql,
+            &[
+                "'ID'",
+                "ID_NOT_NULL",
+                "allows NULL",
+                "ALTER VIRTUAL SCHEMA ... REFRESH",
+            ],
+        );
+    }
+}
+
+/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
+#[test]
+fn unity_unsupported_type_change_in_type_json_refuses_its_column() {
+    setup();
+    let mut conn = exa_conn();
+
+    let notes = column_adapter_notes(&mut conn, VS_NAME, "TYPE_WIDENING");
+    let refusal = note_of(&notes, "BYTE_DECIMAL")["refused"].to_string();
+    for fragment in [
+        "byte_decimal",
+        "'byte'",
+        "'decimal(4,1)'",
+        "delta.typeChanges",
+    ] {
+        assert!(
+            refusal.contains(fragment),
+            "'{fragment}' missing: {refusal}"
+        );
+    }
+    assert_eq!(note_of(&notes, "BYTE_LONG").get("refused"), None);
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT BYTE_DECIMAL FROM {}", table_ref("TYPE_WIDENING")),
+        &["byte_decimal", "'byte'", "'decimal(4,1)'"],
+    );
 }

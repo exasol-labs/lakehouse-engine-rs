@@ -286,8 +286,12 @@ fn golden_ineligible_decline_message_unchanged() {
     );
 }
 
+const CUSTOMER_COLUMNS: &[(&str, &str)] = &[("c_custkey", "long"), ("c_name", "string")];
+
+const ORDERS_COLUMNS: &[(&str, &str)] = &[("o_custkey", "long"), ("binary_col", "binary")];
+
 fn delta_join_request(select_list: Json) -> Json {
-    delta_join_request_over(
+    let request = delta_join_request_over(
         serde_json::json!([
             {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
             {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
@@ -297,7 +301,9 @@ fn delta_join_request(select_list: Json) -> Json {
             {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
         ]),
         select_list,
-    )
+    );
+    let request = with_notes(request, "CUSTOMER", &delta_notes(CUSTOMER_COLUMNS, &[]));
+    with_notes(request, "ORDERS", &delta_notes(ORDERS_COLUMNS, &[]))
 }
 
 /// Lets a test declare the same column name on both legs.
@@ -373,21 +379,19 @@ async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
 async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable_column_on_the_other()
  {
     let catalog = unity_delta_catalog().await;
+    let customer_columns = [
+        ("c_custkey", "long"),
+        ("c_name", "string"),
+        ("binary_col", "string"),
+    ];
     let storage = delta_object_endpoint(vec![
         (
             delta_commit_zero_key("customer"),
-            fileless_delta_commit(
-                "customer",
-                &[
-                    ("c_custkey", "long"),
-                    ("c_name", "string"),
-                    ("binary_col", "string"),
-                ],
-            ),
+            fileless_delta_commit("customer", &customer_columns),
         ),
         (
             delta_commit_zero_key("orders"),
-            fileless_delta_commit("orders", &[("o_custkey", "long"), ("binary_col", "binary")]),
+            fileless_delta_commit("orders", ORDERS_COLUMNS),
         ),
     ])
     .await;
@@ -405,6 +409,8 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
             {"type": "column", "name": "BINARY_COL", "tableName": "CUSTOMER"},
         ]),
     );
+    let request = with_notes(request, "CUSTOMER", &delta_notes(&customer_columns, &[]));
+    let request = with_notes(request, "ORDERS", &delta_notes(ORDERS_COLUMNS, &[]));
 
     delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
@@ -439,16 +445,49 @@ async fn a_select_star_join_is_refused_by_the_side_declaring_the_refused_column(
     assert_refuses_binary_col(error);
 }
 
+/// Scenario: A column without a readable note fails the pushdown naming the fix
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_join_leg_without_notes_fails_naming_its_own_table_and_column() {
+    let catalog = unity_delta_catalog().await;
+    let storage = two_delta_legs_one_refusing_binary_col().await;
+    let request = delta_join_request_over(
+        serde_json::json!([
+            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "C_NAME", "dataType": {"type": "varchar", "size": 100}},
+        ]),
+        serde_json::json!([
+            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "BINARY_COL", "dataType": {"type": "varchar", "size": 2000000}},
+        ]),
+        Json::Null,
+    );
+    let request = with_notes(request, "CUSTOMER", &delta_notes(CUSTOMER_COLUMNS, &[]));
+
+    let error = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect_err("the ORDERS leg carries no notes");
+
+    let message = user_message(error);
+    for fragment in [
+        "'O_CUSTKEY'",
+        "'ORDERS'",
+        "ALTER VIRTUAL SCHEMA ... REFRESH",
+    ] {
+        assert!(message.contains(fragment), "{message}");
+    }
+    assert!(!message.contains("'CUSTOMER'"), "{message}");
+}
+
 /// Neither leg carries an active file.
 async fn two_delta_legs_one_refusing_binary_col() -> StorageBackend {
     delta_object_endpoint(vec![
         (
             delta_commit_zero_key("customer"),
-            fileless_delta_commit("customer", &[("c_custkey", "long"), ("c_name", "string")]),
+            fileless_delta_commit("customer", CUSTOMER_COLUMNS),
         ),
         (
             delta_commit_zero_key("orders"),
-            fileless_delta_commit("orders", &[("o_custkey", "long"), ("binary_col", "binary")]),
+            fileless_delta_commit("orders", ORDERS_COLUMNS),
         ),
     ])
     .await
@@ -496,13 +535,17 @@ fn two_file_delta_commit(
     format!("{protocol}\n{metadata}\n{}\n{}\n", adds[0], adds[1])
 }
 
+const REGION_CUSTOMER_COLUMNS: &[(&str, &str)] = &[("c_custkey", "long"), ("c_region", "string")];
+
+const STATUS_ORDERS_COLUMNS: &[(&str, &str)] = &[("o_custkey", "long"), ("o_status", "string")];
+
 async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend {
     delta_object_endpoint(vec![
         (
             delta_commit_zero_key("customer"),
             two_file_delta_commit(
                 "customer",
-                &[("c_custkey", "long"), ("c_region", "string")],
+                REGION_CUSTOMER_COLUMNS,
                 "c_region",
                 ["us", "eu"],
             ),
@@ -511,7 +554,7 @@ async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend 
             delta_commit_zero_key("orders"),
             two_file_delta_commit(
                 "orders",
-                &[("o_custkey", "long"), ("o_status", "string")],
+                STATUS_ORDERS_COLUMNS,
                 "o_status",
                 ["open", "closed"],
             ),
@@ -520,23 +563,37 @@ async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend 
     .await
 }
 
+/// A join selecting `C_REGION` and `O_STATUS` over the two partitioned legs, each leg's columns
+/// carrying the notes CREATE records for it.
+fn partitioned_legs_request() -> Json {
+    let request = delta_join_request_over(
+        serde_json::json!([
+            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "C_REGION", "dataType": {"type": "varchar", "size": 100}},
+        ]),
+        serde_json::json!([
+            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "O_STATUS", "dataType": {"type": "varchar", "size": 100}},
+        ]),
+        serde_json::json!([
+            {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
+            {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
+        ]),
+    );
+    let customer = delta_notes(REGION_CUSTOMER_COLUMNS, &["c_region"]);
+    let request = with_notes(request, "CUSTOMER", &customer);
+    with_notes(
+        request,
+        "ORDERS",
+        &delta_notes(STATUS_ORDERS_COLUMNS, &["o_status"]),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     let catalog = unity_delta_catalog().await;
     let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
-    let customer_columns = serde_json::json!([
-        {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-        {"name": "C_REGION", "dataType": {"type": "varchar", "size": 100}},
-    ]);
-    let orders_columns = serde_json::json!([
-        {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-        {"name": "O_STATUS", "dataType": {"type": "varchar", "size": 100}},
-    ]);
-    let select_list = serde_json::json!([
-        {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
-        {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
-    ]);
-    let mut request = delta_join_request_over(customer_columns, orders_columns, select_list);
+    let mut request = partitioned_legs_request();
     request["pushdownRequest"]["filter"] = serde_json::json!({
         "type": "predicate_and",
         "expressions": [
@@ -680,7 +737,7 @@ async fn delta_n_scan_pushdown(
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn join_legs_resolve_concurrently_in_leg_index_order() {
     let catalog = RendezvousCatalog::spawn(2).await;
-    let request = join_request(Json::Null, equi_condition());
+    let request = with_iceberg_notes(join_request(Json::Null, equi_condition()));
 
     let planned = tokio::time::timeout(
         std::time::Duration::from_secs(20),
@@ -703,21 +760,7 @@ async fn join_legs_resolve_concurrently_in_leg_index_order() {
 async fn resolved_join_sides_stay_in_leg_index_order() {
     let catalog = unity_delta_catalog().await;
     let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
-    let select_list = serde_json::json!([
-        {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
-        {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
-    ]);
-    let request = delta_join_request_over(
-        serde_json::json!([
-            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "C_REGION", "dataType": {"type": "varchar", "size": 100}},
-        ]),
-        serde_json::json!([
-            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
-            {"name": "O_STATUS", "dataType": {"type": "varchar", "size": 100}},
-        ]),
-        select_list,
-    );
+    let request = partitioned_legs_request();
 
     let result = delta_n_scan_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await

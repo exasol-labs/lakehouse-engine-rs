@@ -93,6 +93,22 @@ pub fn put_fixture_object(uri: &str, bytes: Bytes) {
         .unwrap_or_else(|e| panic!("PUT fixture object at {uri}: {e:#}"));
 }
 
+/// Removes the object at `uri`; an absent object counts as removed, so a fixture can reset a
+/// leftover of an earlier run.
+pub fn delete_fixture_object(uri: &str) {
+    let (bucket, key) = split_s3_bucket_and_key(uri);
+    let store = local_stack_s3_store(bucket);
+    let path = ObjectStorePath::parse(key).unwrap_or_else(|e| panic!("fixture key {key}: {e}"));
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for fixture delete");
+    match rt.block_on(store.delete(&path)) {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+        Err(e) => panic!("DELETE fixture object at {uri}: {e}"),
+    }
+}
+
 /// Keys the object verbatim so `region=a%2Fb` stays literal, as Spark writes it.
 pub async fn put_object(store: &impl ObjectStore, key: &str, bytes: Bytes) -> anyhow::Result<()> {
     let path = ObjectStorePath::parse(key)

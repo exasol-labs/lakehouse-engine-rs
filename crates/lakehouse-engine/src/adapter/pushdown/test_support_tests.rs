@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::column_notes::TableNotes;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use lakehouse_catalog::{
@@ -223,6 +224,7 @@ pub(super) fn assert_refuses_binary_col(error: UdfError) {
 
 pub(super) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
     CatalogColumn {
+        declaration: None,
         name: name.to_string(),
         source_type: ColumnSourceType::Glue {
             hive_type: hive_type.to_string(),
@@ -254,7 +256,182 @@ pub(super) fn glue_catalog_table(
             .iter()
             .map(|(name, hive_type)| glue_column(name, hive_type))
             .collect(),
+        properties: Default::default(),
     }
+}
+
+/// What CREATE records for an Iceberg table whose current schema holds `fields`.
+pub(super) fn iceberg_notes(fields: &[iceberg::spec::NestedFieldRef]) -> Vec<(String, String)> {
+    let table = CatalogTable {
+        columns: fields
+            .iter()
+            .map(|field| CatalogColumn {
+                declaration: None,
+                name: field.name.clone(),
+                source_type: ColumnSourceType::Iceberg(Arc::clone(field)),
+            })
+            .collect(),
+        ..glue_catalog_table("db", "t", TableFormat::Iceberg, "s3://bucket/db/t", &[])
+    };
+    declared_notes(&table)
+}
+
+/// What CREATE records for every column of `table`: its Exasol name and note, through the real
+/// `declare_columns`.
+pub(super) fn declared_notes(table: &CatalogTable) -> Vec<(String, String)> {
+    let notes = declare_columns(table);
+    table
+        .columns
+        .iter()
+        .zip(notes)
+        .map(|(column, note)| {
+            let note = note.expect("CREATE declares every column");
+            (column.name.to_uppercase(), note)
+        })
+        .collect()
+}
+
+/// The notes CREATE records for the current schema of a `loadTable` `body`.
+pub(super) fn load_table_body_notes(body: &Json) -> Vec<(String, String)> {
+    let metadata: iceberg::spec::TableMetadata =
+        serde_json::from_value(body["metadata"].clone()).expect("the body's metadata decodes");
+    iceberg_notes(metadata.current_schema().as_struct().fields())
+}
+
+/// The logical schema CREATE declares for `schema`, refused columns included.
+pub(super) fn declared_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
+    iceberg_notes(schema.as_struct().fields())
+        .into_iter()
+        .map(|(_, note)| {
+            serde_json::from_str::<crate::adapter::column_notes::ColumnDeclaration>(&note)
+                .expect("a declared note decodes")
+                .source_type
+        })
+        .collect()
+}
+
+/// A nullable, unbound field of the given Arrow tag.
+pub(super) fn nullable_field(name: &str, arrow_type: &str) -> LogicalField {
+    LogicalField {
+        field_id: None,
+        name: name.to_string(),
+        arrow_type: arrow_type.to_string(),
+        nullable: true,
+        initial_default: None,
+        nested: None,
+        physical_name: None,
+    }
+}
+
+/// `notes` as the columns of the involved table `table` in a pushdown request.
+pub(super) fn involved_notes<'a>(table: &'a str, notes: &'a [(String, String)]) -> TableNotes<'a> {
+    TableNotes {
+        table,
+        columns: notes
+            .iter()
+            .map(|(column, note)| (column.as_str(), Some(note.as_str())))
+            .collect(),
+    }
+}
+
+/// What the resolver answers for `reader` over the table `notes` declare: the one parse, the
+/// reader's files for that declaration, and the one assembly.
+pub(super) async fn resolve_from_notes(
+    reader: &dyn FormatReader,
+    notes: &TableNotes<'_>,
+    filter_json: Option<&Json>,
+) -> Result<ResolvedScan, UdfError> {
+    let declared = notes.declared_schema()?;
+    let planned = reader.resolve_scan(&declared, filter_json).await?;
+    Ok(ResolvedScan::new(declared, planned))
+}
+
+/// `request` with the note CREATE writes on every involved column for an optional Iceberg `long`
+/// field numbered by its position, for requests that plan no data file.
+pub(super) fn with_iceberg_notes(mut request: Json) -> Json {
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
+    let tables = request["involvedTables"]
+        .as_array_mut()
+        .into_iter()
+        .flatten();
+    for table in tables {
+        let columns = table["columns"].as_array_mut().into_iter().flatten();
+        for (position, column) in (1..).zip(columns) {
+            let name = column["name"].as_str().unwrap_or_default().to_lowercase();
+            let field = NestedField::optional(position, name, Type::Primitive(PrimitiveType::Long));
+            column["adapterNotes"] = iceberg_notes(&[field.into()]).remove(0).1.into();
+        }
+    }
+    request
+}
+
+/// A Unity Catalog Delta table whose columns' `type_json` are `fields` and whose `properties` set
+/// `delta.columnMapping.mode` to `mode` when present.
+pub(super) fn unity_delta_table(
+    fields: &[delta_kernel::schema::StructField],
+    mode: Option<&str>,
+    partitions: &[&str],
+) -> CatalogTable {
+    CatalogTable {
+        ident: CatalogTableIdent {
+            namespace: vec!["cat".into(), "sch".into()],
+            name: "t".into(),
+        },
+        table_type: CatalogTableType::Table,
+        storage_location: Some("s3://bucket/t".into()),
+        format: TableFormat::Delta,
+        vended_credential_key: None,
+        partition_columns: partitions.iter().map(|name| name.to_string()).collect(),
+        columns: fields
+            .iter()
+            .map(|field| CatalogColumn {
+                declaration: None,
+                name: field.name().clone(),
+                source_type: ColumnSourceType::Unity {
+                    type_json: Some(serde_json::to_string(field).expect("a field serializes")),
+                },
+            })
+            .collect(),
+        metadata_location: None,
+        properties: mode
+            .map(|mode| ("delta.columnMapping.mode".to_string(), mode.to_string()))
+            .into_iter()
+            .collect(),
+    }
+}
+
+/// What CREATE records for a Delta table without column mapping whose nullable columns are the
+/// `(name, delta_type)` pairs [`fileless_delta_commit`] logs, partitioned by `partitions`.
+pub(super) fn delta_notes(columns: &[(&str, &str)], partitions: &[&str]) -> Vec<(String, String)> {
+    let fields: Vec<delta_kernel::schema::StructField> = columns
+        .iter()
+        .map(|(name, delta_type)| {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "type": delta_type, "nullable": true, "metadata": {},
+            }))
+            .expect("a Delta field decodes")
+        })
+        .collect();
+    declared_notes(&unity_delta_table(&fields, None, partitions))
+}
+
+/// `request` with each column of its involved table `table` carrying the note `notes` holds
+/// under the column's name.
+pub(super) fn with_notes(mut request: Json, table: &str, notes: &[(String, String)]) -> Json {
+    let tables = request["involvedTables"]
+        .as_array_mut()
+        .into_iter()
+        .flatten();
+    let columns = tables
+        .filter(|involved| involved["name"] == table)
+        .flat_map(|involved| involved["columns"].as_array_mut().into_iter().flatten());
+    for column in columns {
+        let name = column["name"].as_str().unwrap_or_default().to_string();
+        if let Some((_, note)) = notes.iter().find(|(declared, _)| *declared == name) {
+            column["adapterNotes"] = note.clone().into();
+        }
+    }
+    request
 }
 
 /// No storage location, so the Delta reader refuses before reaching any object store.

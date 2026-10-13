@@ -157,6 +157,22 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 
 `ALLOW_HTTP = 'true'` is required here because both the catalog and SeaweedFS use plain HTTP. Use internal hostnames (`iceberg-rest`, `seaweedfs`) that resolve from inside the Exasol container. Never use `localhost`.
 
+**What takes effect at `REFRESH`.** This applies to every Iceberg table on this page, the Glue Data
+Catalog's included. `CREATE VIRTUAL SCHEMA`, `REFRESH`, and `SET PROPERTIES` record each column's
+Iceberg field, with its field id and nullability, in the column's `adapterNotes`. A query plans from
+those notes against the table's current snapshot.
+
+- A column renamed at the source keeps reading under its declared name until `REFRESH`, because
+  Iceberg identifies a column by its field id.
+- A column dropped at the source reads the values older data files store until `REFRESH`.
+- A column declared required that the source makes optional fails every query on the table until
+  `REFRESH`. The error names the column and `ALTER VIRTUAL SCHEMA ... REFRESH`. A required
+  declaration would otherwise let the scan drop rows whose value is NULL.
+- A column added at the source stays undeclared until `REFRESH`.
+- A filter prunes files through each column's declared field id, bound against the schema of the
+  snapshot the query reads. A filter on a renamed column prunes by that column's own bounds. A
+  column whose field id the snapshot's schema lacks prunes no file.
+
 ## AWS Glue Iceberg REST (SigV4)
 
 The catalog URI is the Glue Iceberg REST endpoint. `warehouse` is the AWS **account id**, not an `s3://` path. The adapter derives the Glue REST prefix `catalogs/{account-id}` from it automatically. Turn `use_sigv4` on. `access_key` and `secret_key` then become required, and they sign the catalog requests. When the CONNECTION's address is a standard, commercial AWS Glue endpoint of the form `https://glue.<region>.amazonaws.com` — as below — that endpoint supplies its own SigV4 signing region, so `region` may be omitted for signing purposes; any other Glue endpoint (AWS GovCloud, AWS China, FIPS, a VPC interface endpoint, a private or proxy host) still requires a stated `region`. `region` also places the S3 store, independently of whatever region signs the catalog request, so state it whenever a scan reads data with static S3 keys — even against a standard endpoint. Omit `endpoint`. With `path_style: false`, the S3 client derives the standard AWS endpoint from `region`. The account id below is a placeholder, so substitute your own.
@@ -329,6 +345,36 @@ vended.
   `STRING` column) fails every query that reads that column. The error names the column, both
   types, and the table's storage location. A column a file stores with the Parquet `UNKNOWN`
   (all-NULL) type reads as NULL under every catalog type.
+- `CREATE VIRTUAL SCHEMA`, `REFRESH`, and `SET PROPERTIES` record the declaration in each column's
+  `adapterNotes`. A catalog column change takes effect at the next `REFRESH`.
+
+**Delta tables.** `CREATE VIRTUAL SCHEMA`, `REFRESH`, and `SET PROPERTIES` declare a Delta table's
+columns from its Unity Catalog entry alone. They read no Delta log and request no storage
+credential. The entry must carry what the Delta log holds:
+
+- Each column's `type_json` is the Delta `StructField` JSON, with its column metadata
+  (`delta.columnMapping.physicalName`, `delta.columnMapping.id`, and `delta.typeChanges`).
+- The table's `properties` carry `delta.columnMapping.mode` when the log sets it.
+- The columns' `partition_index` follows the log's `partitionColumns`.
+
+Databricks keeps its entries so. An OSS Unity Catalog registrant must send them.
+
+- Each column binds by the key its mode selects: the physical name under `name`, the field id under
+  `id`, and its own name without column mapping. A filter prunes files through the same key.
+- A column that lacks the annotation its mode requires, or carries it malformed, is refused by name.
+  A mode value other than `none`, `id`, or `name` refuses every column of the table. Neither fails
+  nor skips the table at `CREATE VIRTUAL SCHEMA`.
+- A `delta.typeChanges` entry outside the Delta protocol's supported widening list refuses its
+  column.
+- Every query compares the declaration with the Delta log. A different column-mapping mode or
+  different partition columns fail the query, naming the table and the part that disagrees. A
+  column declared non-nullable that the log allows NULL in fails the query too. Correct the catalog
+  entry, then run `ALTER VIRTUAL SCHEMA ... REFRESH`.
+- A table with a reader feature the engine does not support is still listed. Every query on it
+  fails, naming the feature.
+- A catalog column change takes effect at the next `REFRESH`. Until then, under `name` or `id`
+  mode, a column renamed at the source keeps reading under its declared name, and a column dropped
+  at the source reads the values older data files store.
 
 > A Databricks-managed Delta table is also reachable through the **Iceberg REST** kind, via its
 > UniForm Iceberg metadata — use the AWS Glue or generic-REST recipes above for that route instead.
@@ -437,7 +483,7 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 
 **Iceberg tables.** The adapter reads the current `metadata.json` that `Parameters.metadata_location` names, through the CONNECTION's static S3 credentials. The metadata file is the schema authority. The adapter never reads the Glue columns of an Iceberg table. The same Iceberg planner plans the table as plans an Iceberg REST table, so delete handling, name mapping, and file pruning apply. `metadata_location` names the same snapshot as a REST `loadTable`. A metadata file the adapter cannot read fails the listing and names the table.
 
-**Parquet tables.** The Glue columns, in declared order, followed by the partition keys, are the table's columns. Each column is nullable. The adapter reads no Parquet footer at plan time. A data file column binds to the Glue column whose name it matches ignoring letter case. A partition key that a data file also stores as a column reads the partition value.
+**Parquet tables.** The Glue columns, in declared order, followed by the partition keys, are the table's columns. Each column is nullable. `CREATE VIRTUAL SCHEMA`, `REFRESH`, and `SET PROPERTIES` record them in each column's `adapterNotes`, so a Glue column change takes effect at the next `REFRESH`. The adapter reads no Parquet footer at plan time. A data file column binds to the Glue column whose name it matches ignoring letter case. A partition key that a data file also stores as a column reads the partition value.
 
 | Hive type in Glue | Exasol type |
 |---|---|
@@ -537,6 +583,16 @@ USING LHVS.LAKEHOUSE_ADAPTER WITH
 An unparseable `MERGE_SCHEMA` or `HIVE_PARTITIONING` value is rejected rather than defaulted, since a
 typo that silently selected the opposite mode would return a narrower schema instead of an error.
 
+**What takes effect at `REFRESH`.** `CREATE VIRTUAL SCHEMA`, `REFRESH`, and `SET PROPERTIES` read the
+footers and record each column's declared source shape in its `adapterNotes`. A query then plans from
+those notes and reads no footer. So a `MERGE_SCHEMA` or `HIVE_PARTITIONING` change, a file that
+changes a column's type, and a file that adds a column or a partition key all take effect at the next
+`REFRESH` or `SET PROPERTIES`. Until then a source column added later stays undeclared, and a file
+column wider than the declared type fails the query that reads it, naming the column and both types.
+A virtual schema created before this release has no column notes: every query on it fails, naming
+the table, the column, and `ALTER VIRTUAL SCHEMA ... REFRESH`, which rebuilds them. There is no
+migration.
+
 **Partition columns.** Under the default `HIVE_PARTITIONING = 'TRUE'`, a directory segment below a
 table's root of the form `key=value`, at any depth and in any order (never the file name itself),
 declares the partition column `KEY` as `VARCHAR(2000000)`: a directory value carries no type, and a
@@ -548,9 +604,13 @@ keys, and a file whose path lacks one of them reads NULL for it. Keys compare by
 form, the name they are declared under, which gives three rules:
 
 - Two keys that differ only in case (`Year=` and `year=`) fail `CREATE VIRTUAL SCHEMA` and `REFRESH`,
-  naming both spellings, since neither directory encoding is preferred over the other. This rule
-  holds across the table under `MERGE_SCHEMA = 'TRUE'`; under `'FALSE'` it covers only the sampled
-  file's own keys.
+  naming both spellings and a path carrying each, since neither directory encoding is preferred over
+  the other. The check covers every listed file under both merge modes, because it reads no footer.
+  A query over a table whose files carry both spellings of a declared key fails the same way, so a
+  `YEAR=2027/` file added under a table declared from `year=` directories fails its queries until
+  the directories are renamed. A key matches its declared column by this uppercase form, and the
+  value stays as the directory wrote it, so a table declared from `year=` directories keeps reading
+  after its files move under `YEAR=` directories.
 - A key that names a Parquet column (a `k=` segment over a file storing `K`) overrides it: `K` is
   declared once, as the `VARCHAR` partition column, and every row reads the directory value, never
   the file's stored one.
@@ -573,18 +633,19 @@ catalog-aware, delete-correct read of an Iceberg or Delta table, use the matchin
 `CATALOG_KIND` absent (Iceberg REST, the default) or set it to `'UNITY_CATALOG'` — see the recipes
 above.
 
-**Plan-time footer cost.** Every `CREATE VIRTUAL SCHEMA` and every `REFRESH` lists the directory tree
+**Footer cost.** Every `CREATE VIRTUAL SCHEMA` and every `REFRESH` lists the directory tree
 and reads Parquet file footers directly from object storage — there is no manifest, snapshot, or log
-to consult instead, unlike the Iceberg REST and Unity Catalog kinds. Planning a query lists the table
-again and reads the footers of the files it keeps. `MERGE_SCHEMA = 'FALSE'` bounds this to one footer
-read per table; the default `'TRUE'` reads every kept file's footer. Partition pruning runs before
-any footer is read, so a pruned file's footer is never read: a filter comparing a partition column
-with a string literal by equality (`=`, `<>`), `IN`, a NULL check (`IS NULL`, `IS NOT NULL`), or a
-range (`<`, `<=`, `>`, `>=`, `BETWEEN`), combined by `AND`, `OR`, and `NOT`, drops every file whose
-partition values cannot satisfy it. Range and `BETWEEN` compare partition values as strings, the
-order Exasol applies to `VARCHAR`, so `month=10` sorts before `month=9`. A filter on any other
-column, or one that applies a function to a partition column, prunes no file: there is no
-footer-statistics pruning (#412), and nothing bounds how many files a table may hold (#419).
+to consult instead, unlike the Iceberg REST and Unity Catalog kinds. `MERGE_SCHEMA = 'FALSE'` bounds
+this to one footer read per table; the default `'TRUE'` reads every file's footer. Planning a query
+lists the table again but reads no footer, so its cost does not grow with the kept files' footers;
+the scan itself is the first to read one. Partition pruning runs on the listing alone: a filter
+comparing a partition column with a string literal by equality (`=`, `<>`), `IN`, a NULL check
+(`IS NULL`, `IS NOT NULL`), or a range (`<`, `<=`, `>`, `>=`, `BETWEEN`), combined by `AND`, `OR`,
+and `NOT`, drops every file whose partition values cannot satisfy it. Range and `BETWEEN` compare
+partition values as strings, the order Exasol applies to `VARCHAR`, so `month=10` sorts before
+`month=9`. A filter on any other column, or one that applies a function to a partition column,
+prunes no file: there is no footer-statistics pruning, because planning reads no footer, and
+nothing bounds how many files a table may hold (#419).
 
 **Limitation: mixed timestamp units do not fold.** The type-widening rules this kind applies when
 folding schemas cover integer, float, and date widening, but carry no timestamp-to-timestamp rule.

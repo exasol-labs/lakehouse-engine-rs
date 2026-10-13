@@ -1,12 +1,17 @@
 use super::super::test_support::filter_json::equal;
 use super::super::test_support::{
     GlueEndpoint, ICEBERG_CONFIG_TARGET, ICEBERG_LOAD_TABLE_TARGET, RecordingCatalog,
-    UNITY_TABLE_TARGET, iceberg_catalog, locationless_delta_table_body, object_endpoint,
-    sample_storage, unauthenticated_creds,
+    UNITY_TABLE_TARGET, iceberg_catalog, locationless_delta_table_body, nullable_field,
+    object_endpoint, sample_storage, unauthenticated_creds, unity_delta_catalog, user_message,
+};
+use super::super::test_support::{
+    delta_commit_zero_key, delta_notes, delta_object_endpoint, fileless_delta_commit,
+    involved_notes,
 };
 use super::*;
+use crate::adapter::column_notes::ColumnDeclaration;
 use crate::adapter::permission::PermissionCheck;
-use crate::scan::spec::{StorageBackend, StorageProps};
+use crate::scan::spec::{LogicalField, StorageBackend, StorageProps};
 
 /// Scenario: a Unity Catalog table's identity survives the round trip from the involved table
 #[tokio::test]
@@ -37,7 +42,7 @@ async fn unity_table_identity_round_trips_through_the_recorded_identifier() {
     .expect("a Unity Catalog session is built without contacting the catalog");
 
     let err = resolver
-        .resolve("cat.sch.orders", None, &[])
+        .resolve("cat.sch.orders", None, &TableNotes::default())
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
 
@@ -81,7 +86,7 @@ async fn glue_table_identity_round_trips_through_the_recorded_identifier() {
     assert!(glue.operations().is_empty());
 
     let err = resolver
-        .resolve("sales.orders", None, &[])
+        .resolve("sales.orders", None, &TableNotes::default())
         .await
         .expect_err("a dropped Glue table cannot be planned");
 
@@ -205,7 +210,7 @@ async fn an_iceberg_identifier_resolves_through_the_iceberg_reader_with_no_parti
     .expect("an Iceberg session resolves against a reachable catalog");
 
     let resolved = resolver
-        .resolve("db.t", None, &[])
+        .resolve("db.t", None, &TableNotes::default())
         .await
         .expect("a snapshotless Iceberg table resolves an empty scan");
 
@@ -245,11 +250,11 @@ async fn one_catalog_session_serves_every_table_the_resolver_resolves() {
     .expect("an Iceberg session resolves against a reachable catalog");
 
     resolver
-        .resolve("db.t", None, &[])
+        .resolve("db.t", None, &TableNotes::default())
         .await
         .expect("first table");
     resolver
-        .resolve("db.u", None, &[])
+        .resolve("db.u", None, &TableNotes::default())
         .await
         .expect("second table");
 
@@ -294,11 +299,11 @@ async fn one_unity_catalog_session_serves_every_table_the_resolver_resolves() {
     .expect("a Unity Catalog session is built without contacting the catalog");
 
     let err1 = resolver
-        .resolve("cat.sch.orders", None, &[])
+        .resolve("cat.sch.orders", None, &TableNotes::default())
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
     let err2 = resolver
-        .resolve("cat.sch.customers", None, &[])
+        .resolve("cat.sch.customers", None, &TableNotes::default())
         .await
         .expect_err("a Delta table carrying no storage location cannot be planned");
     assert!(err1.to_string().contains("cat.sch.orders"));
@@ -368,11 +373,11 @@ async fn one_session_or_store_per_request_serves_every_leg() {
     );
 
     resolver
-        .resolve("events", None, &[])
+        .resolve("events", None, &TableNotes::default())
         .await
         .expect("a directory with no data file resolves an empty scan");
     resolver
-        .resolve("event_labels", None, &[])
+        .resolve("event_labels", None, &TableNotes::default())
         .await
         .expect("a directory with no data file resolves an empty scan");
 
@@ -455,7 +460,7 @@ async fn the_pushdown_table_root_equals_the_discovery_composed_storage_location(
     .expect("a direct-storage store is built from the CONNECTION alone");
 
     let scan = resolver
-        .resolve("events", None, &[])
+        .resolve("events", None, &TableNotes::default())
         .await
         .expect("a directory with no data file resolves an empty scan");
 
@@ -522,58 +527,277 @@ async fn request_session_has_one_variant_per_kind() {
     }
 }
 
-async fn resolve_events_under_hive_partitioning(
-    storage: &StorageBackend,
-    hive_partitioning: &str,
-    filter: &Json,
-) -> Result<ResolvedScan, UdfError> {
+const REFUSED_TYPE: &str = "its type is refused";
+
+fn note(field: LogicalField, partition: Option<usize>, refused: Option<&str>) -> String {
+    ColumnDeclaration {
+        source_type: field,
+        partition,
+        refused: refused.map(str::to_string),
+    }
+    .encode()
+}
+
+fn column_note(
+    field: LogicalField,
+    partition: Option<usize>,
+    refused: Option<&str>,
+) -> (String, String) {
+    (field.name.to_uppercase(), note(field, partition, refused))
+}
+
+/// Scenario: Pushdown takes the declared schema from the column notes for every kind
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolver_assembles_the_declared_schema_from_each_tables_notes() {
+    let storage = object_endpoint(
+        "warehouse",
+        vec![
+            (
+                "direct/events/year=2026/p.parquet".to_string(),
+                "not a parquet file".to_string(),
+            ),
+            (
+                "direct/event_labels/q.parquet".to_string(),
+                "not a parquet file".to_string(),
+            ),
+        ],
+    )
+    .await;
     let creds = unauthenticated_creds();
     let resolver = TableScanResolver::for_request(
         CatalogKind::DirectStorage,
         DIRECT_STORAGE_ADDRESS,
         ConnectionStorage {
-            storage,
+            storage: &storage,
             creds: &creds,
             allow_http: true,
         },
-        &["events"],
-        &serde_json::json!({ "HIVE_PARTITIONING": hive_partitioning }),
+        &["events", "event_labels"],
+        &serde_json::json!({"NAMESPACE": "direct"}),
         &PermissionCheck::Off,
     )
-    .await?;
-    resolver.resolve("events", Some(filter), &[]).await
-}
-
-#[tokio::test]
-async fn hive_partitioning_reaches_the_seam_on_pushdown() {
-    let storage = object_endpoint(
-        "warehouse",
-        vec![(
-            "events/year=2026/p.parquet".to_string(),
-            "not a parquet file".to_string(),
-        )],
-    )
-    .await;
+    .await
+    .expect("a direct-storage store is built from the CONNECTION alone");
+    let events_notes = [
+        column_note(nullable_field("id", "int64"), None, None),
+        column_note(nullable_field("year", "utf8"), Some(0), None),
+    ];
+    let labels_notes = [column_note(nullable_field("label", "utf8"), None, None)];
     let year_2099 = equal("YEAR", "2099");
 
-    let pruned = resolve_events_under_hive_partitioning(&storage, "TRUE", &year_2099)
+    let events = resolver
+        .resolve(
+            "events",
+            Some(&year_2099),
+            &involved_notes("EVENTS", &events_notes),
+        )
         .await
-        .expect("HIVE_PARTITIONING=TRUE must prune the file before its footer is read");
-    assert_eq!(pruned.partition_columns, vec!["year".to_string()]);
-    assert!(
-        pruned.files.is_empty(),
-        "year=2026 file must be pruned by YEAR = '2099': {:?}",
-        pruned.files
-    );
+        .expect("no footer is read, so unreadable files still plan");
+    let labels = resolver
+        .resolve(
+            "event_labels",
+            None,
+            &involved_notes("EVENT_LABELS", &labels_notes),
+        )
+        .await
+        .expect("no footer is read, so unreadable files still plan");
 
-    let error = resolve_events_under_hive_partitioning(&storage, "FALSE", &year_2099)
-        .await
-        .expect_err("HIVE_PARTITIONING=FALSE must not prune, so the bad footer is read")
-        .to_string();
-    assert!(
-        error.contains("failed to read the Parquet footer"),
-        "expected a footer-read error: {error}"
+    assert_eq!(
+        events
+            .logical_schema
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["id", "year"]
     );
+    assert_eq!(events.partition_columns, vec!["year".to_string()]);
+    assert!(
+        events.files.is_empty(),
+        "YEAR = '2099' prunes the year=2026 file from the recorded partition column: {:?}",
+        events.files
+    );
+    assert_eq!(
+        labels
+            .logical_schema
+            .iter()
+            .map(|field| field.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["label"],
+        "each table plans from its own notes, never another leg's"
+    );
+    assert!(labels.partition_columns.is_empty());
+    assert_eq!(labels.files.len(), 1);
+
+    let iceberg = iceberg_catalog().await;
+    let catalog_storage = sample_storage();
+    let resolver = TableScanResolver::for_request(
+        CatalogKind::IcebergRest,
+        &iceberg.uri,
+        ConnectionStorage {
+            storage: &catalog_storage,
+            creds: &creds,
+            allow_http: true,
+        },
+        &["db.t"],
+        &Json::Null,
+        &PermissionCheck::Off,
+    )
+    .await
+    .expect("an Iceberg session resolves against a reachable catalog");
+    let score = LogicalField {
+        field_id: Some(7),
+        ..nullable_field("score", "int64")
+    };
+    let iceberg_notes = [
+        column_note(score.clone(), None, None),
+        column_note(nullable_field("blob", "utf8"), None, Some(REFUSED_TYPE)),
+    ];
+
+    let scores = resolver
+        .resolve("db.t", None, &involved_notes("T", &iceberg_notes))
+        .await
+        .expect("a snapshotless Iceberg table plans");
+
+    assert_eq!(
+        scores.logical_schema,
+        vec![score],
+        "the declared field, which the current Iceberg schema does not carry"
+    );
+    assert_eq!(scores.refused_columns[0].column_name, "blob");
+    assert!(scores.partition_columns.is_empty());
+
+    let unity = unity_delta_catalog().await;
+    let logged = [("id", "long"), ("blob", "binary")];
+    let delta_storage = delta_object_endpoint(vec![(
+        delta_commit_zero_key("orders"),
+        fileless_delta_commit("orders", &logged),
+    )])
+    .await;
+    let resolver = TableScanResolver::for_request(
+        CatalogKind::UnityCatalogNative,
+        &unity.uri,
+        ConnectionStorage {
+            storage: &delta_storage,
+            creds: &creds,
+            allow_http: true,
+        },
+        &["cat.sch.orders"],
+        &Json::Null,
+        &PermissionCheck::Off,
+    )
+    .await
+    .expect("a Unity Catalog session is built without contacting the catalog");
+    let delta_notes = delta_notes(&logged, &[]);
+
+    let orders = resolver
+        .resolve(
+            "cat.sch.orders",
+            None,
+            &involved_notes("ORDERS", &delta_notes),
+        )
+        .await
+        .expect("a fileless Delta table plans");
+
+    let names: Vec<&str> = orders
+        .logical_schema
+        .iter()
+        .map(|f| f.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["id"]);
+    assert_eq!(orders.refused_columns[0].column_name, "blob");
+    assert_eq!(orders.table_root, "s3://bucket/orders");
+    assert!(orders.files.is_empty() && orders.partition_columns.is_empty());
+}
+
+/// Scenario: Every pushdown request shape resolves through the one format-reader seam
+#[tokio::test]
+async fn a_refusing_declaration_fails_before_any_reader_loads_its_table_under_every_kind() {
+    let iceberg = iceberg_catalog().await;
+    let unity = unity_delta_catalog().await;
+    let glue = GlueEndpoint::spawn(|_| (500, serde_json::json!({}))).await;
+    let objects = empty_s3_endpoint().await;
+    let creds = unauthenticated_creds();
+    let storage = sample_storage();
+    let direct_storage = direct_storage_backend(&objects.uri);
+    let unreadable = TableNotes {
+        table: "T",
+        columns: vec![("ID", Some(r#"{"sourceType":"#)), ("YEAR", None)],
+    };
+    let unreadable_message = "the declaration note of column 'ID' in virtual table 'T' is missing \
+                              or unreadable; ALTER VIRTUAL SCHEMA ... REFRESH rebuilds it (EOF \
+                              while parsing a value at line 1 column 14)";
+    let every_column_refused = [column_note(
+        nullable_field("id", "int64"),
+        None,
+        Some(REFUSED_TYPE),
+    )];
+    let every_column_refused = involved_notes("T", &every_column_refused);
+    let whole_table_message = "virtual table 'T' has no mappable column; every column is \
+                               refused: 'id': its type is refused";
+    let refused_partition = [
+        column_note(nullable_field("id", "int64"), None, None),
+        column_note(nullable_field("year", "utf8"), Some(0), Some(REFUSED_TYPE)),
+    ];
+    let refused_partition = involved_notes("T", &refused_partition);
+    let partition_message = "virtual table 'T' declares 'year' as a partition column, but that \
+                             column is refused (its type is refused); the scan cannot materialize \
+                             a partition column absent from the logical schema";
+
+    for (kind, uri, backend, identifier) in [
+        (CatalogKind::IcebergRest, &iceberg.uri, &storage, "db.t"),
+        (
+            CatalogKind::UnityCatalogNative,
+            &unity.uri,
+            &storage,
+            "cat.sch.orders",
+        ),
+        (CatalogKind::Glue, &glue.address, &storage, "sales.orders"),
+        (
+            CatalogKind::DirectStorage,
+            &objects.uri,
+            &direct_storage,
+            "events",
+        ),
+    ] {
+        let address = match kind {
+            CatalogKind::DirectStorage => DIRECT_STORAGE_ADDRESS,
+            _ => uri.as_str(),
+        };
+        let resolver = TableScanResolver::for_request(
+            kind,
+            address,
+            ConnectionStorage {
+                storage: backend,
+                creds: &creds,
+                allow_http: true,
+            },
+            &[identifier],
+            &Json::Null,
+            &PermissionCheck::Off,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("{kind:?} resolves a session: {e}"));
+        for (notes, expected) in [
+            (&unreadable, unreadable_message),
+            (&every_column_refused, whole_table_message),
+            (&refused_partition, partition_message),
+        ] {
+            let error = resolver
+                .resolve(identifier, None, notes)
+                .await
+                .expect_err("the declaration refuses the scan");
+            assert_eq!(user_message(error), expected, "{kind:?}");
+        }
+    }
+
+    assert_eq!(
+        iceberg.targets(),
+        vec![ICEBERG_CONFIG_TARGET.to_string()],
+        "the Iceberg reader loads no table for a declaration it cannot plan"
+    );
+    assert!(unity.targets().is_empty(), "{:?}", unity.targets());
+    assert!(glue.operations().is_empty(), "{:?}", glue.operations());
+    assert!(objects.targets().is_empty(), "{:?}", objects.targets());
 }
 
 /// Scenario: One batch-check per query decides every table before any table is read

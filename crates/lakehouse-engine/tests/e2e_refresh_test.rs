@@ -13,12 +13,13 @@ use common::stack::{
     wait_for_iceberg_catalog, wait_for_seaweedfs,
 };
 
-use arrow::array::{Float64Array, Int64Array, RecordBatch};
+use arrow::array::{ArrayRef, Float64Array, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema as ArrowSchema};
 use iceberg::spec::{
-    NestedField, PrimitiveType, Schema as IcebergSchema, Type, UnboundPartitionSpec,
+    NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type, UnboundPartitionSpec,
 };
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use serde_json::Value as Json;
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -34,6 +35,12 @@ const NS_SETPROPS_B: &str = "e2e_refresh_setprops_b";
 const NS_UNREACHABLE: &str = "e2e_refresh_unreachable";
 const NS_PARTIAL: &str = "e2e_refresh_partial";
 const NS_COLLISION: &str = "e2e_refresh_collision";
+const NS_NOTES: &str = "e2e_refresh_notes";
+const NS_RENOTES: &str = "e2e_refresh_renotes";
+const NS_RENAME: &str = "e2e_refresh_rename";
+const NS_DROP: &str = "e2e_refresh_drop";
+const NS_OPTIONAL: &str = "e2e_refresh_optional";
+const NS_SWAP: &str = "e2e_refresh_swap";
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
@@ -188,6 +195,7 @@ async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table
     }
 }
 
+/// Scenario: Refresh re-enumerates the namespace and returns a refresh response
 #[test]
 fn refresh_reenumerates_namespace() {
     setup_e2e();
@@ -595,5 +603,425 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
         create_msg.contains("EU__ORDERS") && create_msg.contains("collision"),
         "createVirtualSchema's collision error must have the same shape as \
          refresh's (same colliding name, same 'collision' wording): {create_msg}"
+    );
+}
+
+fn long_field(id: i32, name: &str, required: bool) -> NestedFieldRef {
+    NestedField::new(id, name, Type::Primitive(PrimitiveType::Long), required).into()
+}
+
+fn schema_of(schema_id: i32, fields: &[NestedFieldRef]) -> IcebergSchema {
+    IcebergSchema::builder()
+        .with_schema_id(schema_id)
+        .with_fields(fields.to_vec())
+        .build()
+        .expect("a valid Iceberg schema")
+}
+
+/// One data file's rows: `long` columns named and nullable as `fields` declares them.
+fn long_batch(fields: &[NestedFieldRef], columns: &[&[Option<i64>]]) -> RecordBatch {
+    let schema = ArrowSchema::new(
+        fields
+            .iter()
+            .map(|field| Field::new(field.name.as_str(), DataType::Int64, !field.required))
+            .collect::<Vec<_>>(),
+    );
+    let arrays = columns
+        .iter()
+        .map(|values| Arc::new(Int64Array::from(values.to_vec())) as ArrayRef)
+        .collect();
+    RecordBatch::try_new(Arc::new(schema), arrays).expect("a valid long RecordBatch")
+}
+
+async fn load(catalog: &impl Catalog, namespace: &str, table: &str) -> iceberg::table::Table {
+    let ident = TableIdent::new(
+        NamespaceIdent::new(namespace.to_string()),
+        table.to_string(),
+    );
+    catalog
+        .load_table(&ident)
+        .await
+        .unwrap_or_else(|e| panic!("load {namespace}.{table}: {e}"))
+}
+
+/// Drops a prior run's table, then creates it with `fields` and one data file per batch.
+async fn fresh_table(
+    catalog: &impl Catalog,
+    namespace: &str,
+    table: &str,
+    fields: &[NestedFieldRef],
+    files: Vec<RecordBatch>,
+) {
+    let ns = NamespaceIdent::new(namespace.to_string());
+    if !catalog
+        .namespace_exists(&ns)
+        .await
+        .unwrap_or_else(|e| panic!("check namespace {namespace}: {e}"))
+    {
+        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
+    }
+    drop_table_if_exists(catalog, &ns, table).await;
+    common::seed::create_and_append_files(
+        catalog,
+        namespace,
+        table,
+        schema_of(0, fields),
+        files.into_iter().map(std::iter::once),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("seed {namespace}.{table}: {e}"));
+}
+
+/// Commits `fields` as the table's current schema, out of band and with no `REFRESH`.
+async fn evolve_schema(
+    catalog: &impl Catalog,
+    namespace: &str,
+    table: &str,
+    fields: &[NestedFieldRef],
+) {
+    let current = load(catalog, namespace, table)
+        .await
+        .metadata()
+        .current_schema_id();
+    rest_replace_current_schema(
+        &iceberg_catalog_url(),
+        namespace,
+        table,
+        current,
+        schema_of(current + 1, fields),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("evolve {namespace}.{table}: {e}"));
+}
+
+/// Writes one data file under the table's current schema.
+async fn append_file(catalog: &impl Catalog, namespace: &str, table: &str, batch: RecordBatch) {
+    let loaded = load(catalog, namespace, table).await;
+    common::seed::write_one_file_append(catalog, &loaded, table, [batch])
+        .await
+        .unwrap_or_else(|e| panic!("append to {namespace}.{table}: {e}"));
+}
+
+fn source_type(notes: &[(String, Json)], column: &str) -> Json {
+    note_of(notes, column)["sourceType"].clone()
+}
+
+/// Scenario: Every declared column carries its source shape in its adapterNotes
+#[test]
+fn iceberg_columns_persist_source_notes() {
+    setup_e2e();
+    let rt = rt();
+    let catalog_url = iceberg_catalog_url();
+    let catalog = rt
+        .block_on(build_seed_catalog(
+            &catalog_url,
+            "s3://warehouse/",
+            "refresh-notes",
+        ))
+        .expect("build seed catalog");
+    let fields = [long_field(1, "id", true), long_field(2, "score", false)];
+    rt.block_on(fresh_table(
+        &catalog,
+        NS_NOTES,
+        "orders",
+        &fields,
+        vec![long_batch(&fields, &[&[Some(1)], &[Some(10)]])],
+    ));
+
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_NOTES_VS", NS_NOTES);
+    let notes = column_adapter_notes(&mut conn, "REFRESH_NOTES_VS", "ORDERS");
+
+    assert_eq!(
+        source_type(&notes, "ID"),
+        serde_json::json!({"field_id": 1, "name": "id", "arrow_type": "int64", "nullable": false})
+    );
+    assert_eq!(
+        source_type(&notes, "SCORE"),
+        serde_json::json!({"field_id": 2, "name": "score", "arrow_type": "int64", "nullable": true})
+    );
+    for (column, note) in &notes {
+        let members: Vec<&String> = note.as_object().expect("a JSON object").keys().collect();
+        assert_eq!(
+            members,
+            ["sourceType"],
+            "{column}: no partition, no refusal"
+        );
+        let text = note.to_string();
+        let secret = local_stack_creds().secret_key;
+        assert!(
+            !text.contains(&secret),
+            "{column}: a note never holds a credential"
+        );
+    }
+}
+
+/// Scenario: Refresh and set properties rebuild every column note from the source
+#[test]
+fn refresh_and_set_properties_rebuild_column_notes_from_the_source() {
+    setup_e2e();
+    let rt = rt();
+    let catalog_url = iceberg_catalog_url();
+    let catalog = rt
+        .block_on(build_seed_catalog(
+            &catalog_url,
+            "s3://warehouse/",
+            "refresh-renotes",
+        ))
+        .expect("build seed catalog");
+    let fields = [long_field(1, "id", true), long_field(2, "score", false)];
+    rt.block_on(fresh_table(
+        &catalog,
+        NS_RENOTES,
+        "scores",
+        &fields,
+        vec![long_batch(&fields, &[&[Some(1)], &[Some(10)]])],
+    ));
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_RENOTES_VS", NS_RENOTES);
+    create_virtual_schema(&mut conn, "SETPROPS_RENOTES_VS", NS_RENOTES);
+
+    let renamed_with_sibling = [
+        long_field(1, "id", true),
+        long_field(2, "rating", false),
+        long_field(3, "extra", false),
+    ];
+    rt.block_on(evolve_schema(
+        &catalog,
+        NS_RENOTES,
+        "scores",
+        &renamed_with_sibling,
+    ));
+    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_RENOTES_VS REFRESH");
+    conn.execute("ALTER VIRTUAL SCHEMA SETPROPS_RENOTES_VS SET PARALLELISM_FACTOR = '2'");
+
+    for vs_name in ["REFRESH_RENOTES_VS", "SETPROPS_RENOTES_VS"] {
+        let notes = column_adapter_notes(&mut conn, vs_name, "SCORES");
+        let columns: Vec<&str> = notes.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(columns, ["EXTRA", "ID", "RATING"], "{vs_name}");
+        let rating = source_type(&notes, "RATING");
+        assert_eq!(
+            (&rating["name"], &rating["field_id"]),
+            (&Json::from("rating"), &Json::from(2)),
+            "{vs_name}: RATING's note carries the source name now and the id `score` carried"
+        );
+        assert_eq!(source_type(&notes, "EXTRA")["field_id"], 3, "{vs_name}");
+    }
+}
+
+/// Scenario: A column renamed at the source after the last REFRESH reads under its declared name
+#[test]
+fn renamed_iceberg_column_reads_under_its_declared_name() {
+    setup_e2e();
+    let rt = rt();
+    let catalog_url = iceberg_catalog_url();
+    let catalog = rt
+        .block_on(build_seed_catalog(
+            &catalog_url,
+            "s3://warehouse/",
+            "refresh-rename",
+        ))
+        .expect("build seed catalog");
+    let fields = [long_field(1, "id", true), long_field(2, "score", false)];
+    rt.block_on(fresh_table(
+        &catalog,
+        NS_RENAME,
+        "scores",
+        &fields,
+        vec![long_batch(
+            &fields,
+            &[&[Some(1), Some(2)], &[Some(10), Some(20)]],
+        )],
+    ));
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_RENAME_VS", NS_RENAME);
+    let renamed = [long_field(1, "id", true), long_field(2, "rating", false)];
+    rt.block_on(evolve_schema(&catalog, NS_RENAME, "scores", &renamed));
+
+    let table = vs_table("REFRESH_RENAME_VS", "scores");
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT ID, SCORE FROM {table} ORDER BY ID"),
+        &[[Some("1"), Some("2")], [Some("10"), Some("20")]],
+    );
+    query_error(&mut conn, &format!("SELECT RATING FROM {table}"));
+
+    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_RENAME_VS REFRESH");
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT ID, RATING FROM {table} ORDER BY ID"),
+        &[[Some("1"), Some("2")], [Some("10"), Some("20")]],
+    );
+}
+
+/// Scenario: A column dropped at the source after the last REFRESH reads what older data files store
+#[test]
+fn dropped_iceberg_column_reads_what_older_files_store() {
+    setup_e2e();
+    let rt = rt();
+    let catalog_url = iceberg_catalog_url();
+    let catalog = rt
+        .block_on(build_seed_catalog(
+            &catalog_url,
+            "s3://warehouse/",
+            "refresh-drop",
+        ))
+        .expect("build seed catalog");
+    let fields = [
+        long_field(1, "id", true),
+        long_field(2, "note", false),
+        long_field(3, "required_marker", true),
+    ];
+    rt.block_on(fresh_table(
+        &catalog,
+        NS_DROP,
+        "notes_t",
+        &fields,
+        vec![long_batch(
+            &fields,
+            &[
+                &[Some(1), Some(2)],
+                &[Some(10), Some(20)],
+                &[Some(5), Some(6)],
+            ],
+        )],
+    ));
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_DROP_VS", NS_DROP);
+    let dropped = [long_field(1, "id", true)];
+    rt.block_on(evolve_schema(&catalog, NS_DROP, "notes_t", &dropped));
+    rt.block_on(append_file(
+        &catalog,
+        NS_DROP,
+        "notes_t",
+        long_batch(&dropped, &[&[Some(3)]]),
+    ));
+
+    let table = vs_table("REFRESH_DROP_VS", "notes_t");
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT ID, NOTE FROM {table} ORDER BY ID"),
+        &[
+            [Some("1"), Some("2"), Some("3")],
+            [Some("10"), Some("20"), None],
+        ],
+    );
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT ID FROM {table} WHERE NOTE = 20"),
+        &[[Some("2")]],
+    );
+    let required_absent = query_error(
+        &mut conn,
+        &format!("SELECT ID, REQUIRED_MARKER FROM {table}"),
+    );
+    assert!(
+        required_absent.to_lowercase().contains("required_marker"),
+        "the dropped required column fails on the file written after the drop: \
+         {required_absent}"
+    );
+
+    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_DROP_VS REFRESH");
+    let declared: Vec<String> = declared_types(&mut conn, "REFRESH_DROP_VS", "notes_t")
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(declared, ["ID"], "REFRESH removes the dropped columns");
+}
+
+/// Scenario: A declared required column that the current schema marks optional fails the query
+#[test]
+fn iceberg_column_made_optional_after_refresh_fails_until_refresh() {
+    setup_e2e();
+    let rt = rt();
+    let catalog_url = iceberg_catalog_url();
+    let catalog = rt
+        .block_on(build_seed_catalog(
+            &catalog_url,
+            "s3://warehouse/",
+            "refresh-optional",
+        ))
+        .expect("build seed catalog");
+    let fields = [long_field(1, "id", true), long_field(2, "qty", true)];
+    rt.block_on(fresh_table(
+        &catalog,
+        NS_OPTIONAL,
+        "qty_t",
+        &fields,
+        vec![long_batch(&fields, &[&[Some(1)], &[Some(5)]])],
+    ));
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_OPTIONAL_VS", NS_OPTIONAL);
+    let relaxed = [long_field(1, "id", true), long_field(2, "qty", false)];
+    rt.block_on(evolve_schema(&catalog, NS_OPTIONAL, "qty_t", &relaxed));
+    rt.block_on(append_file(
+        &catalog,
+        NS_OPTIONAL,
+        "qty_t",
+        long_batch(&relaxed, &[&[Some(2)], &[None]]),
+    ));
+
+    let table = vs_table("REFRESH_OPTIONAL_VS", "qty_t");
+    let is_null = format!("SELECT ID FROM {table} WHERE QTY IS NULL");
+    for sql in [is_null.clone(), format!("SELECT ID FROM {table}")] {
+        assert_query_fails(
+            &mut conn,
+            &sql,
+            &[
+                "'QTY'",
+                "'QTY_T'",
+                "non-nullable",
+                "ALTER VIRTUAL SCHEMA ... REFRESH",
+            ],
+        );
+    }
+
+    conn.execute("ALTER VIRTUAL SCHEMA REFRESH_OPTIONAL_VS REFRESH");
+    assert_text_columns(&mut conn, &is_null, &[[Some("2")]]);
+}
+
+/// Scenario: A filter column resolves through its declared field id
+#[test]
+fn filter_on_rename_swapped_iceberg_columns_prunes_by_declared_field_id() {
+    setup_e2e();
+    let rt = rt();
+    let catalog_url = iceberg_catalog_url();
+    let catalog = rt
+        .block_on(build_seed_catalog(
+            &catalog_url,
+            "s3://warehouse/",
+            "refresh-swap",
+        ))
+        .expect("build seed catalog");
+    let fields = [long_field(1, "a", false), long_field(2, "b", false)];
+    rt.block_on(fresh_table(
+        &catalog,
+        NS_SWAP,
+        "swap_t",
+        &fields,
+        vec![
+            long_batch(&fields, &[&[Some(7)], &[Some(100)]]),
+            long_batch(&fields, &[&[Some(100)], &[Some(7)]]),
+        ],
+    ));
+    let mut conn = exa_conn();
+    create_virtual_schema(&mut conn, "REFRESH_SWAP_VS", NS_SWAP);
+    let table = vs_table("REFRESH_SWAP_VS", "swap_t");
+    let on_a = format!("SELECT A, B FROM {table} WHERE A = 7");
+    assert_text_columns(
+        &mut conn,
+        &format!("SELECT A, B FROM {table} WHERE 7 = A"),
+        &[[Some("7")], [Some("100")]],
+    );
+
+    let swapped = [long_field(1, "b", false), long_field(2, "a", false)];
+    rt.block_on(evolve_schema(&catalog, NS_SWAP, "swap_t", &swapped));
+
+    assert_text_columns(&mut conn, &on_a, &[[Some("7")], [Some("100")]]);
+    let planned = isolated_pushdown_statement(&mut conn, &on_a);
+    assert_eq!(
+        planned.matches(".parquet").count(),
+        1,
+        "pruning reads field id 1's bounds and keeps only the file holding A = 7: {planned}"
     );
 }

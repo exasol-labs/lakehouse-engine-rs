@@ -1098,9 +1098,7 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
 
     // Exasol has no struct type, so a struct default encodes none and falls to NULL/required-error.
     {
-        use iceberg::spec::{
-            Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Type,
-        };
+        use iceberg::spec::{Literal, NestedField, PrimitiveType, Struct, StructType, Type};
 
         let struct_type = Type::Struct(StructType::new(vec![Arc::new(NestedField::required(
             100,
@@ -1108,16 +1106,9 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
             Type::Primitive(PrimitiveType::Int),
         ))]));
         let struct_default = Literal::Struct(Struct::from_iter([Some(Literal::int(7))]));
-        let schema = Schema::builder()
-            .with_schema_id(1)
-            .with_fields(vec![Arc::new(
-                NestedField::optional(1, "meta", struct_type).with_initial_default(struct_default),
-            )])
-            .build()
-            .expect("schema builds");
-
-        let logical = crate::adapter::pushdown::build_logical_schema(&schema);
-        assert_eq!(logical.len(), 1);
+        let logical = [declared_iceberg_field(
+            NestedField::optional(1, "meta", struct_type).with_initial_default(struct_default),
+        )];
         assert_eq!(
             logical[0].arrow_type, "utf8",
             "a struct maps to the JSON-fallback utf8 tag"
@@ -1127,6 +1118,39 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
             "a non-primitive struct initial-default must encode NO default"
         );
     }
+}
+
+/// The logical field CREATE declares for the Iceberg column `field`, through `declare_columns`.
+fn declared_iceberg_field(field: iceberg::spec::NestedField) -> crate::scan::spec::LogicalField {
+    use lakehouse_catalog::{
+        CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType,
+        TableFormat,
+    };
+    let table = CatalogTable {
+        ident: CatalogTableIdent {
+            namespace: vec!["db".to_string()],
+            name: "t".to_string(),
+        },
+        table_type: CatalogTableType::Table,
+        storage_location: None,
+        format: TableFormat::Iceberg,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        metadata_location: None,
+        columns: vec![CatalogColumn {
+            declaration: None,
+            name: field.name.clone(),
+            source_type: ColumnSourceType::Iceberg(Arc::new(field)),
+        }],
+        properties: Default::default(),
+    };
+    let notes = crate::adapter::pushdown::declare_columns(&table);
+    let [Some(note)] = notes.as_slice() else {
+        panic!("CREATE declares the one Iceberg column");
+    };
+    serde_json::from_str::<crate::adapter::column_notes::ColumnDeclaration>(note)
+        .expect("a declared note decodes")
+        .source_type
 }
 
 fn nested_by_id(field_id: i32, name: &str) -> crate::scan::spec::NestedField {

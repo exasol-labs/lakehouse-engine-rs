@@ -10,6 +10,7 @@ use super::stack::{
 };
 
 use lakehouse_catalog::CatalogSession;
+use lakehouse_engine::adapter::column_notes::TableNotes;
 use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
 use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, StorageProps};
@@ -432,8 +433,8 @@ pub fn local_stack_catalog(table: &str) -> CatalogProps {
     }
 }
 
-/// Resolves through the same format-reader seam the adapter uses, bypassing Exasol.
-/// Each `FileEntry` carries an absolute data-file URI.
+/// Resolves through the same format-reader seam the adapter uses, bypassing Exasol. Each
+/// `FileEntry` carries an absolute data-file URI; no column is declared, since no filter prunes.
 pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntry> {
     let catalog_uri = iceberg_catalog_url();
     let catalog_props = local_stack_catalog(&format!("{namespace}.{table}"));
@@ -448,6 +449,9 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
         creds: &creds,
         allow_http: true,
     };
+    let declared = TableNotes::default()
+        .declared_schema()
+        .expect("an empty declaration parses");
     let reader = format_reader(
         ScanSource::Iceberg {
             session: &session,
@@ -456,11 +460,11 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
         &connection,
     )
     .unwrap_or_else(|e| panic!("format_reader({table}) must succeed: {e}"));
-    let resolved = reader
-        .resolve_scan(None)
+    let planned = reader
+        .resolve_scan(&declared, None)
         .await
         .unwrap_or_else(|e| panic!("resolve_scan({table}) must succeed: {e}"));
-    resolved.files
+    planned.files
 }
 
 /// Straddles both fact-side data files, so per-shard join results must merge across a
@@ -522,6 +526,69 @@ pub fn columns_to_sorted_pairs(cols: &[Vec<serde_json::Value>]) -> Vec<(String, 
         .collect();
     rows.sort();
     rows
+}
+
+/// Each column's raw persisted note, keyed by its Exasol column name.
+pub fn persisted_column_notes(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    table: &str,
+) -> Vec<(String, String)> {
+    let cols = conn.query_columns(&format!(
+        "SELECT COLUMN_NAME, ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_COLUMNS \
+         WHERE COLUMN_SCHEMA='{vs_name}' AND COLUMN_TABLE='{table}' ORDER BY COLUMN_NAME"
+    ));
+    assert!(
+        !cols[0].is_empty(),
+        "{vs_name}.{table}: no virtual columns persisted"
+    );
+    cols[0]
+        .iter()
+        .zip(&cols[1])
+        .map(|(name, notes)| {
+            let notes = notes
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: no column adapterNotes persisted"));
+            (value_to_string(name), notes.to_string())
+        })
+        .collect()
+}
+
+/// Each column's persisted note, keyed by its Exasol column name.
+pub fn column_adapter_notes(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    table: &str,
+) -> Vec<(String, serde_json::Value)> {
+    persisted_column_notes(conn, vs_name, table)
+        .into_iter()
+        .map(|(name, notes)| {
+            let notes = serde_json::from_str(&notes).expect("column adapterNotes is JSON");
+            (name, notes)
+        })
+        .collect()
+}
+
+/// `notes` as the involved table `table` of a pushdown, for a test that drives a reader directly.
+pub fn involved_notes<'a>(table: &'a str, notes: &'a [(String, String)]) -> TableNotes<'a> {
+    TableNotes {
+        table,
+        columns: notes
+            .iter()
+            .map(|(column, note)| (column.as_str(), Some(note.as_str())))
+            .collect(),
+    }
+}
+
+pub fn note_of<'a>(
+    notes: &'a [(String, serde_json::Value)],
+    column: &str,
+) -> &'a serde_json::Value {
+    &notes
+        .iter()
+        .find(|(name, _)| name == column)
+        .unwrap_or_else(|| panic!("no note for column {column}: {notes:?}"))
+        .1
 }
 
 pub fn value_to_string(v: &serde_json::Value) -> String {

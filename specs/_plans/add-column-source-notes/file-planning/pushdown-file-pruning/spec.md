@@ -54,11 +54,11 @@ the engine cannot apply.
   covers wiring of the Iceberg predicate alongside the DataFusion filter string.
 * A filter names an Exasol column, and the table's column notes record which Iceberg field id that
   column declares (`vs-adapter/column-source-notes`). The translation resolves each filter column
-  through its declared field id to the field the current schema carries under that id, because
+  through its declared field id to the field the scanned snapshot's schema carries under that id (the schema the Iceberg library binds the predicate against), because
   § Scan Planning states "Data files that match the query filter must be read by the scan" and
   column bounds are "stored by field id in manifests". Resolving by name instead would read another
   column's bounds after a source-side rename between refreshes and skip files that hold matching
-  rows. A filter column whose declared field id the current schema no longer carries cannot be
+  rows. A filter column whose declared field id that schema no longer carries cannot be
   translated, so it imposes no constraint under the rules above.
 <!-- /DELTA:CHANGED -->
 
@@ -71,5 +71,5 @@ the engine cannot apply.
 * *WHEN* a query carries `WHERE A = 7`
 * *THEN* the adapter SHALL translate the filter on `A` against field id 1, the id the column notes declare for `A`, so pruning keeps the file whose field-id-1 bounds admit 7
 * *AND* the query SHALL return the rows whose field-id-1 value is 7, the same rows it returns before the rename
-* *AND* a filter on a declared column whose field id the current schema no longer carries SHALL prune no file for that conjunct, and the query SHALL still apply the full filter above the scan
+* *AND* a filter on a declared column whose field id the scanned snapshot's schema no longer carries SHALL prune no file for that conjunct, and the query SHALL still apply the full filter above the scan
 <!-- /DELTA:NEW -->

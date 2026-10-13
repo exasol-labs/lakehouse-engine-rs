@@ -12,6 +12,16 @@ use super::super::delta_predicate::to_delta_predicate;
 use super::*;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
 
+/// Every column of `schema` under its own name, as a reader pairs them without column mapping.
+fn by_name(
+    schema: &delta_kernel::schema::StructType,
+) -> Vec<(&str, &delta_kernel::schema::StructField)> {
+    schema
+        .fields()
+        .map(|field| (field.name().as_str(), field))
+        .collect()
+}
+
 fn local_store() -> Arc<dyn ObjectStore> {
     Arc::new(LocalFileSystem::new())
 }
@@ -704,13 +714,11 @@ fn an_unsupported_recorded_type_change_refuses_only_its_own_column() {
     let snapshot = DeltaSnapshot::open(local_store(), &fixture_root("type-widening"))
         .expect("the type-widening fixture declares only allow-listed reader features");
 
-    let (logical_fields, _partition_columns, refused_columns) =
-        super::super::delta_schema::build_delta_table_schema(
-            &snapshot.schema(),
-            snapshot.column_mapping_mode(),
-            snapshot.partition_columns(),
-        )
-        .expect("an unsupported recorded change is answered as a refused column, never an error");
+    let (logical_fields, refused_columns) = super::super::delta_schema::classify_spark_schema(
+        &snapshot.schema(),
+        snapshot.column_mapping_mode(),
+        "Delta",
+    );
 
     let mapped: Vec<&str> = logical_fields
         .iter()
@@ -870,7 +878,7 @@ fn block_on<F: std::future::Future>(future: F) -> F::Output {
 
 #[test]
 fn a_void_column_reads_as_all_null_under_name_column_mapping() {
-    use super::super::delta_schema::build_delta_table_schema;
+    use super::super::delta_schema::classify_spark_schema;
     use crate::scan::spec::{CommonScanSpec, ScanSpec};
     use crate::scan::{build_raw_scan_physical_plan, register_files, session_config_for_spec};
     use datafusion::execution::context::SessionContext;
@@ -887,12 +895,9 @@ fn a_void_column_reads_as_all_null_under_name_column_mapping() {
         "the case under test is the `name`-mode physical-name binding"
     );
 
-    let (logical_schema, partition_columns, refused_columns) = build_delta_table_schema(
-        &snapshot.schema(),
-        snapshot.column_mapping_mode(),
-        snapshot.partition_columns(),
-    )
-    .expect("the void table's schema builds");
+    let (logical_schema, refused_columns) =
+        classify_spark_schema(&snapshot.schema(), snapshot.column_mapping_mode(), "Delta");
+    let partition_columns = snapshot.partition_columns();
     let files = snapshot
         .active_files(None)
         .expect("the void table's log replays");
@@ -1191,8 +1196,8 @@ fn a_between_keeps_one_bound_when_the_other_fails_to_convert() {
         "left": {"type": "literal_exactnumeric", "value": 4},
         "right": {"type": "literal_string", "value": "ten"},
     });
-    let predicate =
-        to_delta_predicate(&node, &schema).expect("a BETWEEN must keep the bound it can translate");
+    let predicate = to_delta_predicate(&node, &by_name(&schema))
+        .expect("a BETWEEN must keep the bound it can translate");
 
     let files = replay_fixture_pruned("multi-part-stats", predicate);
     let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
@@ -1214,7 +1219,7 @@ fn an_or_with_an_untranslatable_branch_keeps_every_file() {
         {"type": "predicate_notequal", "left": {"type": "column", "name": "ID"}, "right": {"type": "literal_exactnumeric", "value": 7}},
     ]});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 
     let forfeited = replay_fixture("multi-part-stats");
     let paths: Vec<&str> = forfeited.iter().map(|f| f.path.as_str()).collect();

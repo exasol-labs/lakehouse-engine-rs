@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use aws_sdk_glue::config::timeout::TimeoutConfig;
-use iceberg::spec::{PrimitiveType, Type};
+use iceberg::spec::{NestedField, PrimitiveType, Type};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
@@ -163,6 +163,7 @@ fn parquet_table(partition_columns: &[&str]) -> CatalogTable {
         partition_columns: partition_columns.iter().map(|c| c.to_string()).collect(),
         columns: Vec::new(),
         metadata_location: None,
+        properties: Default::default(),
     }
 }
 
@@ -331,11 +332,17 @@ async fn an_iceberg_table_lists_its_metadata_columns_and_plans_without_reading_t
         [
             (
                 "order_id",
-                &ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long))
+                &ColumnSourceType::Iceberg(
+                    NestedField::required(1, "order_id", Type::Primitive(PrimitiveType::Long))
+                        .into()
+                )
             ),
             (
                 "placed_on",
-                &ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Date))
+                &ColumnSourceType::Iceberg(
+                    NestedField::optional(2, "placed_on", Type::Primitive(PrimitiveType::Date))
+                        .into()
+                )
             ),
         ],
         "the metadata file's schema, never the Glue column"
@@ -353,6 +360,7 @@ async fn an_iceberg_table_lists_its_metadata_columns_and_plans_without_reading_t
             partition_columns: Vec::new(),
             columns: Vec::new(),
             metadata_location: Some(location),
+            properties: Default::default(),
         }
     );
     assert_eq!(
@@ -426,6 +434,7 @@ async fn a_parquet_table_declares_storage_columns_then_partition_keys() {
         partition_columns: vec!["p_int".into(), "p_date".into(), "p_str".into()],
         columns: columns
             .map(|(name, hive_type)| CatalogColumn {
+                declaration: None,
                 name: name.into(),
                 source_type: ColumnSourceType::Glue {
                     hive_type: hive_type.into(),
@@ -433,6 +442,7 @@ async fn a_parquet_table_declares_storage_columns_then_partition_keys() {
             })
             .to_vec(),
         metadata_location: None,
+        properties: Default::default(),
     };
     assert_eq!(planned, expected);
     assert_eq!(listing.tables, [expected]);

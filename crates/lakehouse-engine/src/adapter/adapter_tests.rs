@@ -255,7 +255,11 @@ fn unity_kind_pushdown_routes_to_the_unity_catalog_loader() {
         },
         "involvedTables": [{
             "name": "ORDERS",
-            "columns": [{"name": "ID", "dataType": {"type": "decimal", "precision": 20, "scale": 0}}],
+            "columns": [{
+                "name": "ID",
+                "dataType": {"type": "decimal", "precision": 20, "scale": 0},
+                "adapterNotes": r#"{"sourceType":{"name":"id","arrow_type":"int64","nullable":true}}"#,
+            }],
         }],
         "schemaMetadataInfo": {
             "adapterNotes": serde_json::json!({"TABLE_MAP": {"ORDERS": "cat.sch.orders"}}).to_string(),
@@ -1277,7 +1281,7 @@ fn create_vs_records_table_map_in_adapter_notes() {
 
 #[test]
 fn iceberg_listing_is_behavior_identical_behind_the_trait() {
-    use iceberg::spec::{PrimitiveType, Type};
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
     use lakehouse_catalog::{
         CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
     };
@@ -1294,14 +1298,23 @@ fn iceberg_listing_is_behavior_identical_behind_the_trait() {
             metadata_location: None,
             columns: vec![
                 CatalogColumn {
+                    declaration: None,
                     name: "order_id".to_string(),
-                    source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+                    source_type: ColumnSourceType::Iceberg(
+                        NestedField::required(1, "order_id", Type::Primitive(PrimitiveType::Long))
+                            .into(),
+                    ),
                 },
                 CatalogColumn {
+                    declaration: None,
                     name: "straße".to_string(),
-                    source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::String)),
+                    source_type: ColumnSourceType::Iceberg(
+                        NestedField::optional(2, "straße", Type::Primitive(PrimitiveType::String))
+                            .into(),
+                    ),
                 },
             ],
+            properties: Default::default(),
         }],
         skipped: vec![SkippedTable {
             ident: cat_ident(&["prod", "finance"], "hive_events"),
@@ -1836,10 +1849,12 @@ fn role_join_pushdown_request() -> Json {
         "properties": { "CATALOG_CONNECTION": "MY_CONN", "ALLOW_HTTP": "true" },
         "involvedTables": [
             {"name": "CUSTOMER", "columns": [
-                {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0},
+                 "adapterNotes": r#"{"sourceType":{"field_id":1,"name":"c_custkey","arrow_type":"int64","nullable":true}}"#},
             ]},
             {"name": "ORDERS", "columns": [
-                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+                {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0},
+                 "adapterNotes": r#"{"sourceType":{"field_id":1,"name":"o_custkey","arrow_type":"int64","nullable":true}}"#},
             ]},
         ],
         "pushdownRequest": {

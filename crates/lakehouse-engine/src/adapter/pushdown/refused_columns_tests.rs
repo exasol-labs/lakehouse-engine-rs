@@ -1,11 +1,14 @@
 use serde_json::json;
 
 use super::*;
-use crate::adapter::pushdown::format::binary_refusal;
+use crate::adapter::column_notes::binary_refusal;
 use crate::adapter::pushdown::test_support::user_message;
 
 fn binary_col() -> RefusedColumn {
-    binary_refusal("Delta", "binary_col", None, "binary")
+    RefusedColumn {
+        column_name: "binary_col".to_string(),
+        reason: binary_refusal("Delta", "binary_col", None, "binary"),
+    }
 }
 
 const VARIANT_REASON: &str = "Delta column 'variant_col' has type 'variant', whose on-disk form is \

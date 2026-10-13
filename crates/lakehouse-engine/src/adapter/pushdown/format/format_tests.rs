@@ -1,9 +1,9 @@
 use super::super::test_support::{
-    UNREACHABLE_CATALOG, glue_catalog_table, load_table_body, object_endpoint, sample_storage,
-    sigv4_creds, user_message,
+    UNREACHABLE_CATALOG, declared_notes, glue_catalog_table, involved_notes, load_table_body,
+    object_endpoint, sample_storage, sigv4_creds, user_message,
 };
 use super::*;
-use crate::adapter::parquet_directory::MergeMode;
+use crate::adapter::tests::parquet_fixture::in_memory_store;
 use lakehouse_catalog::{CatalogTableIdent, CatalogTableType};
 
 const TABLE_NAME: &str = "cat.sch.orders";
@@ -21,6 +21,7 @@ fn unity_table(format: TableFormat) -> CatalogTable {
         partition_columns: Vec::new(),
         metadata_location: None,
         columns: Vec::new(),
+        properties: Default::default(),
     }
 }
 
@@ -114,33 +115,54 @@ async fn format_reader_selects_an_iceberg_source_without_contacting_the_catalog(
     );
 }
 
-#[test]
-fn third_scan_source_selects_the_parquet_reader() {
+fn declared(partition_columns: &[&str]) -> DeclaredSchema {
+    DeclaredSchema {
+        table: "EVENTS".into(),
+        logical_schema: Vec::new(),
+        partition_columns: partition_columns.iter().map(ToString::to_string).collect(),
+        refused_columns: Vec::new(),
+    }
+}
+
+/// Scenario: The format reader is selected at the same one site for a third source
+#[tokio::test]
+async fn direct_parquet_source_carries_only_store_and_table_root() {
     let creds = sigv4_creds();
     let storage = sample_storage();
-    let store: Arc<dyn object_store::ObjectStore> = Arc::new(object_store::memory::InMemory::new());
+    let store: Arc<dyn ObjectStore> =
+        in_memory_store(&[("direct/events/year=2026/p.parquet", b"no footer".as_slice())]).await;
 
-    let selected = format_reader(
+    let reader = format_reader(
         ScanSource::DirectParquet {
             store: &store,
             table_root: "s3://warehouse/direct/events",
-            options: DirectoryOptions {
-                merge_mode: MergeMode::FoldEveryFile,
-                hive_partitioning: true,
-            },
-            declared_columns: &[],
         },
         &ConnectionStorage {
             storage: &storage,
             creds: &creds,
             allow_http: true,
         },
-    );
+    )
+    .expect("a raw Parquet directory selects its reader without reading anything");
 
-    assert!(
-        selected.is_ok(),
-        "a raw Parquet directory must select its reader without reading anything"
-    );
+    for (partition_columns, values) in [
+        (
+            vec!["year"],
+            vec![("year".to_string(), Some("2026".to_string()))],
+        ),
+        (Vec::new(), Vec::new()),
+    ] {
+        let planned = reader
+            .resolve_scan(&declared(&partition_columns), None)
+            .await
+            .expect("a listing plans without a footer");
+        assert_eq!(planned.table_root, "s3://warehouse/direct/events");
+        assert_eq!(
+            planned.files[0].partition_values,
+            values.into_iter().collect(),
+            "the declaration the reader receives, not the source, names the partition columns"
+        );
+    }
 }
 
 fn glue_table(format: TableFormat) -> CatalogTable {
@@ -181,6 +203,13 @@ async fn format_reader_selects_readers_for_a_glue_table_by_format_without_contac
         (TableFormat::Parquet, vec!["part-0"]),
     ] {
         let table = glue_table(format);
+        let notes = match format {
+            TableFormat::Parquet => declared_notes(&table),
+            _ => Vec::new(),
+        };
+        let declared = involved_notes("SALES_ORDERS", &notes)
+            .declared_schema()
+            .expect("CREATE's notes parse");
         let reader = format_reader(
             ScanSource::Glue {
                 session: &session,
@@ -195,7 +224,7 @@ async fn format_reader_selects_readers_for_a_glue_table_by_format_without_contac
         .expect("a Glue table must select its reader without issuing a request");
 
         let scan = reader
-            .resolve_scan(None)
+            .resolve_scan(&declared, None)
             .await
             .unwrap_or_else(|error| panic!("{format:?}: the selected reader plans: {error}"));
 
@@ -234,45 +263,54 @@ fn format_reader_refuses_a_delta_table_under_the_glue_source() {
     assert!(message.contains("Delta"), "{message}");
 }
 
-/// Scenario: A Delta table with no mappable column is refused as a whole
+/// Scenario: The logical schema is the catalog's declared column list
+/// Scenario: Partition columns come from the catalog and partition values from the file paths
 #[test]
-fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {
-    let refused = |column_name: &str, reason: &str| RefusedColumn {
-        column_name: column_name.to_string(),
-        reason: reason.to_string(),
-    };
-    let refused_columns = vec![
-        refused("binary_col", "binary is refused, see #351"),
-        refused("variant_col", "variant renders no meaningful value"),
-    ];
-    let id = LogicalField {
-        field_id: None,
-        name: "id".to_string(),
-        arrow_type: "int64".to_string(),
-        nullable: false,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
+fn declare_columns_notes_each_catalog_parquet_column_with_its_partition_position_and_refusal() {
+    let table = CatalogTable {
+        partition_columns: vec!["year".into(), "region".into()],
+        ..glue_catalog_table(
+            "sales",
+            "orders",
+            TableFormat::Parquet,
+            "s3://bucket/sales/orders",
+            &[
+                ("id", "bigint"),
+                ("region", "string"),
+                ("year", "int"),
+                ("blob", "binary"),
+            ],
+        )
     };
 
-    ensure_table_has_a_mappable_column(&[id], &refused_columns[..1], "Delta")
-        .expect("a table with a mappable column must not be refused as a whole");
-    ensure_table_has_a_mappable_column(&[], &[], "Delta")
-        .expect("an empty schema with nothing refused must not be refused as a whole");
-    let error = ensure_table_has_a_mappable_column(&[], &refused_columns, "Delta")
-        .expect_err("a table with zero mappable columns must be refused as a whole");
+    let declarations: Vec<ColumnDeclaration> = declare_columns(&table)
+        .into_iter()
+        .map(|note| serde_json::from_str(&note.expect("every column is declared")).unwrap())
+        .collect();
 
-    let message = user_message(error);
-    assert!(
-        message.starts_with("Delta table has no mappable column; every column is refused: "),
-        "message was: {message}"
+    let declared: Vec<(&str, Option<usize>, bool)> = declarations
+        .iter()
+        .map(|declaration| {
+            let field = &declaration.source_type;
+            (
+                field.name.as_str(),
+                declaration.partition,
+                declaration.refused.is_some(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        declared,
+        vec![
+            ("id", None, false),
+            ("region", Some(1), false),
+            ("year", Some(0), false),
+            ("blob", None, true),
+        ]
     );
-    for fragment in [
-        "binary_col",
-        "binary is refused, see #351",
-        "variant_col",
-        "variant renders no meaningful value",
-    ] {
-        assert!(message.contains(fragment), "message was: {message}");
-    }
+    assert!(
+        declarations
+            .iter()
+            .all(|declaration| declaration.source_type.nullable)
+    );
 }

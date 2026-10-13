@@ -307,6 +307,7 @@ fn planned_table(
             .iter()
             .chain(partition_keys)
             .map(|column| CatalogColumn {
+                declaration: None,
                 name: column.name().to_string(),
                 source_type: ColumnSourceType::Glue {
                     hive_type: column.r#type().unwrap_or_default().to_string(),
@@ -314,6 +315,7 @@ fn planned_table(
             })
             .collect(),
         metadata_location,
+        properties: BTreeMap::new(),
     })
 }
 

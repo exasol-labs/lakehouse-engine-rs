@@ -1,6 +1,15 @@
 use super::*;
-use delta_kernel::schema::{PrimitiveType, StructField};
+use delta_kernel::schema::{PrimitiveType, StructField, StructType};
 use serde_json::json;
+
+/// The pairs a reader hands the translator for a table without column mapping: every column of
+/// `schema` under its own name.
+fn by_name(schema: &StructType) -> Vec<(&str, &StructField)> {
+    schema
+        .fields()
+        .map(|field| (field.name().as_str(), field))
+        .collect()
+}
 
 fn test_schema() -> StructType {
     StructType::try_new([StructField::not_null(
@@ -23,8 +32,8 @@ fn equal_on_integer_column_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)});
-    let pred =
-        to_delta_predicate(&node, &schema).expect("equality on an integer column must translate");
+    let pred = to_delta_predicate(&node, &by_name(&schema))
+        .expect("equality on an integer column must translate");
 
     let expected = Predicate::eq(Expression::column(["id"]), Expression::literal(5i32));
     assert_eq!(pred, expected);
@@ -35,8 +44,8 @@ fn less_on_integer_column_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_less", "left": col("ID"), "right": int_lit(5)});
-    let pred =
-        to_delta_predicate(&node, &schema).expect("less-than on an integer column must translate");
+    let pred = to_delta_predicate(&node, &by_name(&schema))
+        .expect("less-than on an integer column must translate");
 
     let expected = Predicate::lt(Expression::column(["id"]), Expression::literal(5i32));
     assert_eq!(pred, expected);
@@ -47,7 +56,7 @@ fn lessequal_on_integer_column_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_lessequal", "left": col("ID"), "right": int_lit(5)});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("less-than-or-equal on an integer column must translate");
 
     let expected = Predicate::le(Expression::column(["id"]), Expression::literal(5i32));
@@ -59,7 +68,7 @@ fn greater_on_integer_column_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_greater", "left": col("ID"), "right": int_lit(5)});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("greater-than on an integer column must translate");
 
     let expected = Predicate::gt(Expression::column(["id"]), Expression::literal(5i32));
@@ -71,7 +80,7 @@ fn greaterequal_on_integer_column_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_greaterequal", "left": col("ID"), "right": int_lit(5)});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("greater-than-or-equal on an integer column must translate");
 
     let expected = Predicate::ge(Expression::column(["id"]), Expression::literal(5i32));
@@ -83,7 +92,7 @@ fn less_with_column_on_right_flips_to_greater() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_less", "left": int_lit(5), "right": col("ID")});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("less-than with the column on the right must translate via the flipped operator");
 
     let expected = Predicate::gt(Expression::column(["id"]), Expression::literal(5i32));
@@ -108,7 +117,7 @@ fn every_comparison_with_the_column_on_the_right_flips_to_its_mirror() {
         let node = json!({"type": kind, "left": int_lit(5), "right": col("ID")});
 
         assert_eq!(
-            to_delta_predicate(&node, &schema),
+            to_delta_predicate(&node, &by_name(&schema)),
             Some(expected),
             "{kind} with the column on the right"
         );
@@ -121,7 +130,7 @@ fn notequal_returns_none() {
 
     let node = json!({"type": "predicate_notequal", "left": col("ID"), "right": int_lit(5)});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -129,8 +138,8 @@ fn is_null_on_a_column_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_is_null", "expression": col("ID")});
-    let pred =
-        to_delta_predicate(&node, &schema).expect("IS NULL on an existing column must translate");
+    let pred = to_delta_predicate(&node, &by_name(&schema))
+        .expect("IS NULL on an existing column must translate");
 
     let expected = Predicate::is_null(Expression::column(["id"]));
     assert_eq!(pred, expected);
@@ -141,7 +150,7 @@ fn is_not_null_on_a_column_translates() {
     let schema = test_schema();
 
     let node = json!({"type": "predicate_is_not_null", "expression": col("ID")});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("IS NOT NULL on an existing column must translate");
 
     let expected = Predicate::is_not_null(Expression::column(["id"]));
@@ -154,8 +163,8 @@ fn not_negates_its_translatable_child() {
 
     let child = json!({"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)});
     let node = json!({"type": "predicate_not", "expression": child});
-    let pred =
-        to_delta_predicate(&node, &schema).expect("NOT over a translatable child must translate");
+    let pred = to_delta_predicate(&node, &by_name(&schema))
+        .expect("NOT over a translatable child must translate");
 
     let expected = Predicate::not(Predicate::eq(
         Expression::column(["id"]),
@@ -171,7 +180,7 @@ fn not_of_an_untranslatable_child_returns_none() {
     let child = json!({"type": "predicate_notequal", "left": col("ID"), "right": int_lit(5)});
     let node = json!({"type": "predicate_not", "expression": child});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -184,7 +193,7 @@ fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
     ]});
     let node = json!({"type": "predicate_not", "expression": child});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -199,7 +208,7 @@ fn not_over_a_between_that_dropped_a_bound_returns_none() {
     });
     let node = json!({"type": "predicate_not", "expression": child});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -211,7 +220,7 @@ fn not_over_a_fully_translatable_and_negates_the_whole_conjunction() {
         {"type": "predicate_lessequal", "left": col("ID"), "right": int_lit(9)},
     ]});
     let node = json!({"type": "predicate_not", "expression": child});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("NOT over a fully translatable AND must translate");
 
     let expected = Predicate::not(Predicate::and_from([
@@ -242,7 +251,7 @@ fn schema_with_struct_field() -> StructType {
 fn resolve_column_matches_case_insensitively() {
     let schema = test_schema();
 
-    let resolved = resolve_column("ID", &schema).expect("existing column must resolve");
+    let resolved = resolve_column("ID", &by_name(&schema)).expect("existing column must resolve");
 
     assert_eq!(resolved, ("id", &PrimitiveType::Integer));
 }
@@ -251,14 +260,14 @@ fn resolve_column_matches_case_insensitively() {
 fn resolve_column_returns_none_for_unknown_column() {
     let schema = test_schema();
 
-    assert_eq!(resolve_column("MISSING", &schema), None);
+    assert_eq!(resolve_column("MISSING", &by_name(&schema)), None);
 }
 
 #[test]
 fn resolve_column_returns_none_for_non_primitive_column() {
     let schema = schema_with_struct_field();
 
-    assert_eq!(resolve_column("NESTED", &schema), None);
+    assert_eq!(resolve_column("NESTED", &by_name(&schema)), None);
 }
 
 fn lit(kind: &str, value: Json) -> Json {
@@ -530,7 +539,7 @@ fn and_of_two_translatable_children_folds_a_conjunction() {
         {"type": "predicate_greaterequal", "left": col("ID"), "right": int_lit(5)},
         {"type": "predicate_less", "left": col("ID"), "right": int_lit(9)},
     ]});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("an AND of two translatable conjuncts must translate");
 
     let expected = Predicate::and(
@@ -548,7 +557,7 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
         {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)},
         {"type": "predicate_notequal", "left": col("ID"), "right": int_lit(7)},
     ]});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("an AND must keep the conjuncts it can translate");
 
     let expected = Predicate::eq(Expression::column(["id"]), Expression::literal(5i32));
@@ -564,7 +573,7 @@ fn and_all_untranslatable_returns_none_not_a_true_predicate() {
         {"type": "predicate_notequal", "left": col("ID"), "right": int_lit(7)},
     ]});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -573,7 +582,7 @@ fn and_over_an_empty_expression_list_returns_none() {
 
     let node = json!({"type": "predicate_and", "expressions": []});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -584,7 +593,7 @@ fn or_of_two_translatable_children_folds_a_disjunction() {
         {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)},
         {"type": "predicate_equal", "left": col("ID"), "right": int_lit(7)},
     ]});
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("an OR of two translatable disjuncts must translate");
 
     let expected = Predicate::or(
@@ -603,7 +612,7 @@ fn or_with_untranslatable_child_returns_none() {
         {"type": "predicate_notequal", "left": col("ID"), "right": int_lit(7)},
     ]});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -612,7 +621,7 @@ fn or_over_an_empty_expression_list_returns_none() {
 
     let node = json!({"type": "predicate_or", "expressions": []});
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -648,7 +657,7 @@ fn in_list_translates_to_an_or_chain_of_equalities() {
         "expression": col("ID"),
         "arguments": [int_lit(1), int_lit(2), int_lit(3)],
     });
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("an IN list of translatable literals must translate");
 
     let expected = Predicate::or_from([
@@ -669,7 +678,7 @@ fn empty_in_list_returns_none_not_a_false_predicate() {
         "arguments": [],
     });
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -682,7 +691,7 @@ fn in_with_type_mismatch_element_returns_none() {
         "arguments": [int_lit(1), lit("literal_string", json!("two"))],
     });
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
 }
 
 #[test]
@@ -695,7 +704,7 @@ fn between_translates_to_a_lower_and_upper_bound_conjunction() {
         "left": int_lit(1),
         "right": int_lit(10),
     });
-    let pred = to_delta_predicate(&node, &schema)
+    let pred = to_delta_predicate(&node, &by_name(&schema))
         .expect("a BETWEEN with two convertible bounds must translate");
 
     let expected = Predicate::and_from([
@@ -715,8 +724,8 @@ fn between_keeps_the_convertible_bound_when_the_other_fails() {
         "left": int_lit(1),
         "right": lit("literal_string", json!("ten")),
     });
-    let pred =
-        to_delta_predicate(&node, &schema).expect("a BETWEEN must keep the bound it can translate");
+    let pred = to_delta_predicate(&node, &by_name(&schema))
+        .expect("a BETWEEN must keep the bound it can translate");
 
     let expected = Predicate::ge(Expression::column(["id"]), Expression::literal(1i32));
     assert_eq!(pred, expected);
@@ -733,5 +742,28 @@ fn between_with_both_bounds_unconvertible_returns_none() {
         "right": lit("literal_string", json!("ten")),
     });
 
-    assert_eq!(to_delta_predicate(&node, &schema), None);
+    assert_eq!(to_delta_predicate(&node, &by_name(&schema)), None);
+}
+
+/// Scenario: A filter column resolves through its declared binding key
+#[test]
+fn a_filter_column_is_emitted_under_its_paired_fields_current_name() {
+    let renamed = StructField::nullable("b", DataType::Primitive(PrimitiveType::Integer));
+    let columns = [("a", &renamed)];
+    let on_a = json!({"type": "predicate_equal", "left": col("A"), "right": int_lit(7)});
+    let on_b = json!({"type": "predicate_equal", "left": col("B"), "right": int_lit(7)});
+
+    assert_eq!(
+        to_delta_predicate(&on_a, &columns),
+        Some(Predicate::eq(
+            Expression::column(["b"]),
+            Expression::literal(7i32)
+        )),
+        "the declared column binds to the field it is paired with, under that field's name"
+    );
+    assert_eq!(
+        to_delta_predicate(&on_b, &columns),
+        None,
+        "a column no declared pair names constrains nothing"
+    );
 }
