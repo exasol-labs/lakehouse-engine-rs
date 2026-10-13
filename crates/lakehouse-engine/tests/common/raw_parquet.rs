@@ -90,6 +90,15 @@ pub fn put_fixture_object(uri: &str, bytes: Bytes) {
         .unwrap_or_else(|e| panic!("PUT fixture object at {uri}: {e:#}"));
 }
 
+pub fn get_fixture_object(uri: &str) -> Bytes {
+    let (bucket, key) = split_s3_bucket_and_key(uri);
+    let store = local_stack_s3_store(bucket);
+    let path = ObjectStorePath::parse(key)
+        .unwrap_or_else(|e| panic!("fixture key of {uri} is not a valid object path: {e}"));
+    block_on_fixture(async { store.get(&path).await?.bytes().await })
+        .unwrap_or_else(|e| panic!("GET fixture object at {uri}: {e}"))
+}
+
 fn block_on_fixture<F: std::future::Future>(future: F) -> F::Output {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
