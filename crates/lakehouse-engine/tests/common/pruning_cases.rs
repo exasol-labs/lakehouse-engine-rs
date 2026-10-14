@@ -431,10 +431,37 @@ fn path_mismatch(conn: &mut ExaConn, query: &str, format: Format, pruned: bool) 
     })
 }
 
+const SINGLE_GROUP_SHAPES: &[(&str, bool)] = &[
+    (
+        "SELECT COUNT(*), SUM(ID) FROM {T} WHERE {F} HAVING SUM(ID) > 0",
+        true,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} WHERE {F} HAVING SUM(ID) > 0",
+        false,
+    ),
+    ("SELECT 'X', COUNT(*) FROM {T} WHERE {F}", false),
+    ("SELECT 1 FROM {T} WHERE {F} HAVING COUNT(*) > 0", false),
+];
+
+fn shape_mismatch(conn: &mut ExaConn, query: &str, format: Format, split: bool) -> Option<String> {
+    let plan = isolated_pushdown_statement(conn, &query.replace("{T}", &format.table()));
+    let holds = if split {
+        plan.contains("PARTIAL_") && plan.contains(" HAVING ")
+    } else {
+        plan.contains(&format!("AS \"{OUTER_WHERE_ALIAS}\"")) && !plan.contains("PARTIAL_")
+    };
+    (!holds).then(|| format!("`{query}` took the wrong path (split: {split}): {plan}"))
+}
+
 pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: Format) {
     let pruned = format.prunes_every_file().iter().map(|f| (*f, true));
     let scanned = [(NO_ROW_SCANNED, false), (ROWS_SCANNED, false)];
     let mut failures = Vec::new();
+    for (query, split) in SINGLE_GROUP_SHAPES {
+        let query = query.replace("{F}", ROWS_SCANNED);
+        failures.extend(shape_mismatch(conn, &query, format, *split));
+    }
     for (filter, pruned) in pruned.chain(scanned) {
         let probe = format!("SELECT COUNT(*), 'X' FROM {{T}} WHERE {filter}");
         failures.extend(path_mismatch(conn, &probe, format, pruned));
