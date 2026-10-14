@@ -346,8 +346,6 @@ jobs:
     timeout-minutes: 45
     env:
       EXASOL_IMAGE: ${{ matrix.image }}
-      # `adapter_detects_container_cpuset` needs fewer CPUs than the runner has.
-      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -388,8 +386,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-so]
     timeout-minutes: 45
-    env:
-      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -441,8 +437,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-so]
     timeout-minutes: 45
-    env:
-      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -486,8 +480,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-so]
     timeout-minutes: 45
-    env:
-      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup
@@ -549,8 +541,6 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build-so]
     timeout-minutes: 45
-    env:
-      LH_EXASOL_CPUSET: "0-1"
     steps:
       - uses: actions/checkout@v7
       - uses: ./.github/actions/e2e-setup

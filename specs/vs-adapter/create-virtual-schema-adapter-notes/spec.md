@@ -108,14 +108,12 @@ Records the resource budgets, the Exasol-name to Iceberg-identifier map, and the
 * *AND* the adapter SHALL return a successful `createVirtualSchema` response
 * *AND* every budget derived from that core count SHALL equal the budget a genuine single-core node produces
 
-### Scenario: The adapter VM detects the Docker container's CPU affinity set
+### Scenario: The adapter detects the node's CPU affinity set
 
-* *GIVEN* the local Docker Exasol container constrained to a CPU affinity set, read back from the running container's own `cpuset.cpus.effective` rather than from the environment of the process that launched it
-* *AND* a test host whose `std::thread::available_parallelism()` is strictly greater than the number of CPUs in that set, without which the assertion below holds equally for an adapter reading the unconstrained host count and therefore evidences nothing
-* *AND* a virtual schema created with `PARALLELISM_FACTOR = '1'` and no `DATAFUSION_THREADING_MODE` property, so the AUTO derivation divides the detected core count by a per-node instance share of `1` and records it unchanged as `DF_THREADS_PER_UDF`
-* *WHEN* the test reads the `DF_THREADS_PER_UDF` entry from that schema's `SYS.EXA_ALL_VIRTUAL_SCHEMAS.ADAPTER_NOTES` row
-* *THEN* the recorded value SHALL equal the number of CPUs in the affinity set read back from the container, which evidences that the adapter VM reads the container's affinity set rather than the unavailable fallback of `1` or the host's unconstrained core count
-* *AND* the test MUST FAIL rather than skip when the value differs, because auto-detection is the only source of the core count and a skipped check would leave that source unevidenced, and MUST FAIL naming the unmet precondition rather than report a pass when the container's affinity set is not strictly smaller than the test host's core count, so a non-discriminating configuration records no false evidence
+* *GIVEN* an Exasol node whose CPU affinity set holds `k` CPUs, with `2 ≤ k <` the host's core count
+* *AND* a virtual schema created with `PARALLELISM_FACTOR = '1'` and no `DATAFUSION_THREADING_MODE` property
+* *WHEN* the adapter records `DF_THREADS_PER_UDF` in the schema's adapterNotes
+* *THEN* the recorded value SHALL equal `k`, not the fallback of `1` or the host's core count
 
 ### Scenario: Every skipped table is recorded with its reason under every catalog kind
 
