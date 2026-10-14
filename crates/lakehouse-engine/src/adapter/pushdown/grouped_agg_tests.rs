@@ -185,6 +185,15 @@ fn partial_emits_sum_integer_stays_decimal() {
         "SUM over DECIMAL(20,0) must widen to DECIMAL(36,0): {:?}",
         emits[0]
     );
+    let avg = vec![AggregatePlan {
+        kind: AggKind::Avg,
+        ..plans[0].clone()
+    }];
+    assert_eq!(
+        partial_emits_items(&avg, &col_types, &[])[0],
+        r#""PARTIAL_avg_sum_0" DECIMAL(36,0)"#,
+        "an exact AVG sum must overflow where native AVG does, not round in DOUBLE"
+    );
 }
 
 #[test]

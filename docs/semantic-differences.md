@@ -4,8 +4,8 @@
 
 # Semantic differences from native Exasol
 
-A few pushed-down functions, and a filter on a date outside Exasol's DATE range, return a
-different result than the same query on a native Exasol table. Each difference on this page is a
+A few pushed-down functions, a filter on a date outside Exasol's DATE range, and some numeric
+overflows return a different result than the same query on a native Exasol table. Each difference on this page is a
 current compatibility gap. The [Capabilities](capabilities.md) page lists which functions are
 pushed down.
 
@@ -67,3 +67,13 @@ For DECIMAL and integer columns, native Exasol computes `STDDEV`, `VARIANCE`, `V
 `VAR_SAMP`, `STDDEV_POP`, and `STDDEV_SAMP` exactly. The virtual schema computes them in double
 precision, so its results can be less precise. The difference grows when the values are large
 and close to each other.
+
+## Numeric overflow
+
+A query fails where native Exasol fails when an exact value leaves Exasol's range, with the same
+message, `data exception - numeric value out of range`. Two differences remain:
+
+- The error carries SQL state `22002` instead of `22003`.
+- `AVG` over an integer expression, such as `AVG(amount * amount)`, returns a rounded value
+  where native Exasol fails, when the sum of the expression exceeds 36 digits. `AVG` over a
+  column, or over an expression with decimal places, fails as native Exasol does.

@@ -405,6 +405,16 @@ fn render_expression_inner(expr: &Json, dialect: Dialect) -> Result<Option<Strin
             }));
         }
         "literal_string" => return Ok(Some(quote_literal(value("value")))),
+        // The scan parses bare numeric literals as DECIMAL, which rejects `1e+300`.
+        "literal_double" if dialect == Dialect::DataFusion => {
+            return Ok(Some(match value("value") {
+                None | Some(Json::Null) => "NULL".to_string(),
+                Some(v) => format!(
+                    "CAST({} AS DOUBLE)",
+                    quote_literal(Some(&Json::String(json_scalar_to_string(v))))
+                ),
+            }));
+        }
         "literal_exactnumeric" | "literal_double" => {
             return Ok(Some(match value("value") {
                 None | Some(Json::Null) => "NULL".to_string(),

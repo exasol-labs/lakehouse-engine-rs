@@ -3,6 +3,7 @@ use crate::scan::checked_div::{
 };
 use crate::scan::convert::check_date32_in_exasol_range;
 use crate::scan::diagnostics::PhaseTimers;
+use crate::scan::exasol_numeric::{NumericOverflow, find_numeric_overflow};
 use crate::types::mapping::TimestampPrecision;
 use arrow::array::ArrayRef;
 use arrow::compute::CastOptions;
@@ -171,6 +172,20 @@ pub(crate) fn coerce_column(
         ..Default::default()
     };
     cast_with_options(column.as_ref(), target, &options).map_err(|e| {
+        if let DataType::Decimal128(p, s) = target
+            && matches!(
+                column.data_type(),
+                DataType::Decimal128(..) | DataType::Decimal256(..)
+            )
+        {
+            return UdfError::User(
+                NumericOverflow(format!(
+                    "output column {} exceeds DECIMAL({p},{s}): {e}",
+                    declared.name
+                ))
+                .to_string(),
+            );
+        }
         UdfError::User(format!(
             "emit failed: output column {} could not be coerced from {:?} to {target:?}: {e}",
             declared.name,
@@ -224,6 +239,9 @@ fn decimal_target(declared: &ColumnInfo, precision: u32, scale: u32) -> Result<D
 pub fn classify_scan_error(e: DataFusionError, secrets: &[&str]) -> UdfError {
     if let Some(division) = find_checked_float_div_error(&e) {
         return checked_division_error(division, secrets);
+    }
+    if let Some(overflow) = find_numeric_overflow(&e) {
+        return UdfError::User(overflow.to_string());
     }
     match e.find_root() {
         DataFusionError::ResourcesExhausted(msg) => resources_exhausted_error(msg, secrets),
