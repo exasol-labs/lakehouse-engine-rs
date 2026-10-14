@@ -1,12 +1,10 @@
 use delta_kernel::schema::{ArrayType, MapType, MetadataValue, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
 
-use lakehouse_catalog::CatalogTable;
-
 use super::*;
-use crate::adapter::column_notes::ColumnDeclaration;
-use crate::adapter::pushdown::declare_columns;
-use crate::adapter::pushdown::test_support::unity_delta_table;
+use crate::adapter::pushdown::test_support::{
+    assert_mentions, declared_columns, unity_delta_table,
+};
 
 const CDF_COLUMN_MAPPING_NAME_MODE_SCHEMA: &str = r#"{"type":"struct","fields":[{"name":"id","type":"long","nullable":true,"metadata":{"delta.columnMapping.id":1,"delta.columnMapping.physicalName":"col-80396d42-d765-483e-b86e-7ac1e13ef88c"}},{"name":"name","type":"string","nullable":true,"metadata":{"delta.columnMapping.id":2,"delta.columnMapping.physicalName":"col-ed3e45cf-632b-4a07-bb22-d9f4693bbaa1"}},{"name":"value","type":"double","nullable":true,"metadata":{"delta.columnMapping.id":3,"delta.columnMapping.physicalName":"col-95e13b58-72f1-4d26-8390-49469180a8a2"}}]}"#;
 
@@ -1172,16 +1170,6 @@ fn a_nested_field_missing_its_modes_annotation_is_refused_naming_its_path() {
 }
 
 /// What `createVirtualSchema` records in each column's note, in column order.
-fn declarations(table: &CatalogTable) -> Vec<ColumnDeclaration> {
-    declare_columns(table)
-        .into_iter()
-        .map(|note| {
-            serde_json::from_str(&note.expect("every Delta column is declared"))
-                .expect("a declared note decodes")
-        })
-        .collect()
-}
-
 #[test]
 fn declaration_carries_the_mode_selected_key_from_type_json() {
     let fields = [
@@ -1195,7 +1183,7 @@ fn declaration_carries_the_mode_selected_key_from_type_json() {
         (Some("none"), "a=identity, p=identity"),
         (None, "a=identity, p=identity"),
     ] {
-        let declared = declarations(&unity_delta_table(&fields, mode, &["p"]));
+        let declared = declared_columns(&unity_delta_table(&fields, mode, &["p"]));
 
         let logical_fields: Vec<LogicalField> = declared
             .iter()
@@ -1230,11 +1218,9 @@ fn malformed_type_change_annotation_refuses_its_column() {
         ),
     ];
 
-    let declared = declarations(&unity_delta_table(&fields, None, &[]));
+    let declared = declared_columns(&unity_delta_table(&fields, None, &[]));
 
     assert_eq!(declared[0].refused, None);
     let reason = declared[1].refused.as_deref().expect("widened is refused");
-    for fragment in ["'widened'", "delta.typeChanges", "fromType"] {
-        assert!(reason.contains(fragment), "'{fragment}' missing: {reason}");
-    }
+    assert_mentions(reason, &["'widened'", "delta.typeChanges", "fromType"]);
 }

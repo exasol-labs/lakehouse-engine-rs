@@ -199,8 +199,7 @@ impl<'a> TableScanResolver<'a> {
             }
         };
         let reader = format_reader(source, &self.connection)?;
-        let planned = reader.resolve_scan(&declared, filter_json).await?;
-        Ok(ResolvedScan::new(declared, planned))
+        ResolvedScan::resolve(reader.as_ref(), declared, filter_json).await
     }
 }
 

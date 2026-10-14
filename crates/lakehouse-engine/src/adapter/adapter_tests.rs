@@ -1281,40 +1281,25 @@ fn create_vs_records_table_map_in_adapter_notes() {
 
 #[test]
 fn iceberg_listing_is_behavior_identical_behind_the_trait() {
+    use crate::adapter::pushdown::test_support::{iceberg_column, named_table};
     use iceberg::spec::{NestedField, PrimitiveType, Type};
-    use lakehouse_catalog::{
-        CatalogColumn, CatalogTable, CatalogTableType, ColumnSourceType, TableFormat,
-    };
+    use lakehouse_catalog::{CatalogTable, TableFormat};
 
     let configured_ns = vec!["prod".to_string(), "finance".to_string()];
+    let order_id = NestedField::required(1, "order_id", Type::Primitive(PrimitiveType::Long));
+    let strasse = NestedField::optional(2, "straße", Type::Primitive(PrimitiveType::String));
     let listing = CatalogListing {
         tables: vec![CatalogTable {
-            ident: cat_ident(&["prod", "finance", "eu"], "orders"),
-            table_type: CatalogTableType::Table,
             storage_location: Some("s3://warehouse/orders".to_string()),
-            format: TableFormat::Iceberg,
-            vended_credential_key: None,
-            partition_columns: Vec::new(),
-            metadata_location: None,
-            columns: vec![
-                CatalogColumn {
-                    declaration: None,
-                    name: "order_id".to_string(),
-                    source_type: ColumnSourceType::Iceberg(
-                        NestedField::required(1, "order_id", Type::Primitive(PrimitiveType::Long))
-                            .into(),
-                    ),
-                },
-                CatalogColumn {
-                    declaration: None,
-                    name: "straße".to_string(),
-                    source_type: ColumnSourceType::Iceberg(
-                        NestedField::optional(2, "straße", Type::Primitive(PrimitiveType::String))
-                            .into(),
-                    ),
-                },
-            ],
-            properties: Default::default(),
+            ..named_table(
+                &["prod", "finance", "eu"],
+                "orders",
+                TableFormat::Iceberg,
+                vec![
+                    iceberg_column(&order_id.into()),
+                    iceberg_column(&strasse.into()),
+                ],
+            )
         }],
         skipped: vec![SkippedTable {
             ident: cat_ident(&["prod", "finance"], "hive_events"),

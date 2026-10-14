@@ -7,10 +7,11 @@ mod common;
 use common::cloud_fixture::panic_message;
 use common::e2e_harness::{
     SYS_PASSWORD, VARCHAR_JSON, VsProps, assert_binary_values_refused,
-    assert_decimal_orders_numerically, assert_text_columns, assert_type_matrix,
-    column_adapter_notes, create_schema_and_scripts, declared_types, exa_conn, explain_virtual_sql,
-    install_slc, int_column, note_of, pairs, parse_int, query_error, reads, refuses,
-    try_create_virtual_schema_with_password, upload_so, value_to_string,
+    assert_decimal_orders_numerically, assert_notes_well_formed, assert_text_columns,
+    assert_type_matrix, column_adapter_notes, create_schema_and_scripts, declared_types, exa_conn,
+    explain_virtual_sql, install_slc, int_column, note_of, pairs, parse_int, partition_positions,
+    query_error, reads, refuses, try_create_virtual_schema_with_password, upload_so,
+    value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::glue::{
@@ -376,12 +377,8 @@ fn check_glue_columns_persist_source_notes(run: &GlueRun, conn: &mut ExaConn) {
         "each note is the metadata file's field, never Glue's {STALE_GLUE_COLUMN} copy"
     );
     let parquet = column_adapter_notes(conn, VS, &PARTITIONED.to_uppercase());
-    let positions: Vec<(&str, Option<u64>)> = parquet
-        .iter()
-        .map(|(column, note)| (column.as_str(), note["partition"].as_u64()))
-        .collect();
     assert_eq!(
-        positions,
+        partition_positions(&parquet),
         [
             ("ID", None),
             ("P_DATE", Some(1)),
@@ -407,12 +404,8 @@ fn check_glue_columns_persist_source_notes(run: &GlueRun, conn: &mut ExaConn) {
         "a binary Hive column's refusal is recorded at CREATE: {binary}"
     );
 
-    let secret = run.env().secret_access_key().to_string();
-    for (column, note) in notes.iter().chain(&parquet) {
-        assert!(
-            !note.to_string().contains(&secret),
-            "{column}: no credential in a note"
-        );
+    for notes in [&notes, &parquet] {
+        assert_notes_well_formed(notes, run.env().secret_access_key());
     }
 }
 

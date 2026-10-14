@@ -1,12 +1,12 @@
 use super::super::super::test_support::{
-    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields,
+    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields, binary_refused,
     declared_logical_schema, glue_catalog_table, involved_notes, load_table_body,
     load_table_body_notes, load_table_body_with_columns, object_endpoint, resolve_from_notes,
     sample_storage, sigv4_creds, user_message,
 };
 use super::super::ResolvedScan;
 use super::*;
-use crate::adapter::column_notes::{RefusedColumn, TableNotes, binary_refusal};
+use crate::adapter::column_notes::TableNotes;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 
@@ -34,26 +34,6 @@ async fn resolve_rest(
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
     let notes = load_table_body_notes(&serde_json::from_str(&body).expect("a JSON body"));
-    resolve_rest_declared(
-        body,
-        &involved_notes("T", &notes),
-        table,
-        creds,
-        storage,
-        filter_json,
-    )
-    .await
-}
-
-/// Like [`resolve_rest`], from `notes`.
-async fn resolve_rest_declared(
-    body: String,
-    notes: &TableNotes<'_>,
-    table: &str,
-    creds: &ConnectionCreds,
-    storage: &StorageBackend,
-    filter_json: Option<&Json>,
-) -> Result<ResolvedScan, UdfError> {
     let catalog = RecordingCatalog::spawn(move |_target| (200, body.clone())).await;
     let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, creds)
         .await
@@ -73,7 +53,7 @@ async fn resolve_rest_declared(
             allow_http: true,
         },
     };
-    resolve_from_notes(&reader, notes, filter_json).await
+    resolve_from_notes(&reader, &involved_notes("T", &notes), filter_json).await
 }
 
 #[tokio::test]
@@ -884,10 +864,7 @@ async fn iceberg_binary_fixed_and_uuid_columns_are_refused_and_an_all_binary_tab
         vec![("id", Some(1)), ("name", Some(13))],
         "every refused column is dropped from the logical schema, and nothing else"
     );
-    let refused = |column: &str, member, declared| RefusedColumn {
-        column_name: column.to_string(),
-        reason: binary_refusal("Iceberg", column, member, declared),
-    };
+    let refused = |column, member, declared| binary_refused("Iceberg", column, member, declared);
     assert_eq!(
         resolved.refused_columns,
         vec![

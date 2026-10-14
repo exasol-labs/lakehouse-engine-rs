@@ -1832,7 +1832,7 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
     };
     let lineitem = [("l_orderkey", "long"), ("l_extendedprice", "decimal(18,2)")];
     let err = seam_handle_pushdown(
-        &with_notes(nq4_request(), "LINEITEM", &delta_notes(&lineitem, &[])),
+        &with_delta_notes(nq4_request(), "LINEITEM", &lineitem, &[]),
         &unity.uri,
         &unity_catalog_props,
         CatalogKind::UnityCatalogNative,
@@ -1983,11 +1983,7 @@ fn refused_column_table(pushdown_request: Json) -> Json {
         }],
         "pushdownRequest": pushdown_request,
     });
-    with_notes(
-        request,
-        "ORDERS",
-        &delta_notes(REFUSED_COLUMN_TABLE_COLUMNS, &[]),
-    )
+    with_delta_notes(request, "ORDERS", REFUSED_COLUMN_TABLE_COLUMNS, &[])
 }
 
 async fn refused_column_table_storage() -> crate::scan::spec::StorageBackend {
@@ -2067,7 +2063,7 @@ async fn binary_table_pushdown(iceberg: bool, pushdown_request: Json) -> Result<
     });
     if !iceberg {
         let columns = [("id", "integer"), ("b", "binary")];
-        let request = with_notes(request, "T", &delta_notes(&columns, &[]));
+        let request = with_delta_notes(request, "T", &columns, &[]);
         let catalog = unity_delta_catalog().await;
         let storage = delta_object_endpoint(vec![(
             delta_commit_zero_key("t"),
@@ -2234,11 +2230,7 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
             "selectList": [{"type": "column", "name": "INT_COL", "tableName": "ORDERS"}],
         },
     });
-    let request = with_notes(
-        request,
-        "ORDERS",
-        &delta_notes(&[("int_col", "integer")], &[]),
-    );
+    let request = with_delta_notes(request, "ORDERS", &[("int_col", "integer")], &[]);
 
     let planned = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
@@ -2739,11 +2731,7 @@ fn letter_partitioned_commit() -> String {
 /// The notes CREATE records for the table [`letter_partitioned_commit`] logs.
 fn with_letter_partitioned_notes(request: Json) -> Json {
     let columns = [("letter", "string"), ("number", "integer")];
-    with_notes(
-        request,
-        "PRUNED_TO_EMPTY",
-        &delta_notes(&columns, &["letter"]),
-    )
+    with_delta_notes(request, "PRUNED_TO_EMPTY", &columns, &["letter"])
 }
 
 fn letter_partitioned_request(letter: &str) -> Json {

@@ -19,6 +19,7 @@ use iceberg::spec::{
     NestedField, NestedFieldRef, PrimitiveType, Schema as IcebergSchema, Type, UnboundPartitionSpec,
 };
 use iceberg::{Catalog, NamespaceIdent, TableCreation, TableIdent};
+use iceberg_catalog_rest::RestCatalog;
 use serde_json::Value as Json;
 
 use std::collections::HashMap;
@@ -76,6 +77,15 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("tokio runtime")
 }
 
+fn seed_catalog(rt: &tokio::runtime::Runtime, label: &str) -> RestCatalog {
+    rt.block_on(build_seed_catalog(
+        &iceberg_catalog_url(),
+        "s3://warehouse/",
+        label,
+    ))
+    .expect("build seed catalog")
+}
+
 fn id_val_schema(schema_id: i32) -> IcebergSchema {
     IcebergSchema::builder()
         .with_schema_id(schema_id)
@@ -87,6 +97,7 @@ fn id_val_schema(schema_id: i32) -> IcebergSchema {
         .expect("build id+val Iceberg schema")
 }
 
+/// Existing rows project `new_col` as NULL: no `initial-default` is set.
 fn id_val_schema_with_new_col(schema_id: i32) -> IcebergSchema {
     IcebergSchema::builder()
         .with_schema_id(schema_id)
@@ -130,28 +141,6 @@ async fn ensure_id_val_table(
     )
     .await
     .unwrap_or_else(|e| panic!("seed {namespace}.{table_name}: {e}"));
-}
-
-/// Existing rows project `new_col` as NULL: no `initial-default` is set.
-async fn add_new_col(catalog: &impl Catalog, namespace: &str, table_name: &str) {
-    let ident = TableIdent::new(
-        NamespaceIdent::new(namespace.to_string()),
-        table_name.to_string(),
-    );
-    let table = catalog
-        .load_table(&ident)
-        .await
-        .unwrap_or_else(|e| panic!("load {namespace}.{table_name} before column add: {e}"));
-    let current_schema_id = table.metadata().current_schema_id();
-    rest_replace_current_schema(
-        &iceberg_catalog_url(),
-        namespace,
-        table_name,
-        current_schema_id,
-        id_val_schema_with_new_col(current_schema_id + 1),
-    )
-    .await
-    .unwrap_or_else(|e| panic!("add new_col to {namespace}.{table_name}: {e}"));
 }
 
 /// Collision detection runs before any per-table resolution, so no data file is needed.
@@ -200,14 +189,7 @@ async fn drop_table_if_exists(catalog: &impl Catalog, ns: &NamespaceIdent, table
 fn refresh_reenumerates_namespace() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-reenum",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-reenum");
 
     let reenum_ns = NamespaceIdent::new(NS_REENUM.to_string());
     rt.block_on(drop_table_if_exists(&catalog, &reenum_ns, "t_orig"));
@@ -252,14 +234,7 @@ fn refresh_reenumerates_namespace() {
 fn refresh_reflects_added_table_and_column_change() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-colchange",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-colchange");
 
     rt.block_on(ensure_id_val_table(&catalog, NS_COLCHANGE, "evt", 1, 10.0));
 
@@ -282,7 +257,12 @@ fn refresh_reflects_added_table_and_column_change() {
         "NEW_COL must be unknown to Exasol before REFRESH: {resp}"
     );
 
-    rt.block_on(add_new_col(&catalog, NS_COLCHANGE, "evt"));
+    rt.block_on(evolve_schema(
+        &catalog,
+        NS_COLCHANGE,
+        "evt",
+        id_val_schema_with_new_col,
+    ));
 
     conn.execute("ALTER VIRTUAL SCHEMA REFRESH_COLCHANGE_VS REFRESH");
 
@@ -306,14 +286,7 @@ fn refresh_reflects_added_table_and_column_change() {
 fn set_properties_retargets_namespace() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-setprops",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-setprops");
 
     rt.block_on(ensure_id_val_table(
         &catalog,
@@ -381,14 +354,7 @@ fn set_properties_retargets_namespace() {
 fn refresh_unreachable_catalog_redacts_credentials() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-unreachable",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-unreachable");
     rt.block_on(ensure_id_val_table(
         &catalog,
         NS_UNREACHABLE,
@@ -451,14 +417,7 @@ fn refresh_unreachable_catalog_redacts_credentials() {
 fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-partial",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-partial");
 
     rt.block_on(ensure_id_val_table(
         &catalog,
@@ -490,8 +449,18 @@ fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
         );
     }
 
-    rt.block_on(add_new_col(&catalog, NS_PARTIAL, "table_one"));
-    rt.block_on(add_new_col(&catalog, NS_PARTIAL, "table_two"));
+    rt.block_on(evolve_schema(
+        &catalog,
+        NS_PARTIAL,
+        "table_one",
+        id_val_schema_with_new_col,
+    ));
+    rt.block_on(evolve_schema(
+        &catalog,
+        NS_PARTIAL,
+        "table_two",
+        id_val_schema_with_new_col,
+    ));
 
     conn.execute("ALTER VIRTUAL SCHEMA REFRESH_PARTIAL_VS REFRESH TABLES TABLE_ONE");
 
@@ -534,14 +503,7 @@ fn refresh_partial_requested_tables_still_refreshes_whole_namespace() {
 fn refresh_flatten_collision_returns_same_error_as_create() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-collision",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-collision");
 
     let top_ns = NamespaceIdent::new(NS_COLLISION.to_string());
     let eu_ns = NamespaceIdent::from_vec(vec![NS_COLLISION.to_string(), "eu".to_string()])
@@ -652,15 +614,7 @@ async fn fresh_table(
     fields: &[NestedFieldRef],
     files: Vec<RecordBatch>,
 ) {
-    let ns = NamespaceIdent::new(namespace.to_string());
-    if !catalog
-        .namespace_exists(&ns)
-        .await
-        .unwrap_or_else(|e| panic!("check namespace {namespace}: {e}"))
-    {
-        let _ = catalog.create_namespace(&ns, HashMap::new()).await;
-    }
-    drop_table_if_exists(catalog, &ns, table).await;
+    drop_table_if_exists(catalog, &NamespaceIdent::new(namespace.to_string()), table).await;
     common::seed::create_and_append_files(
         catalog,
         namespace,
@@ -672,12 +626,12 @@ async fn fresh_table(
     .unwrap_or_else(|e| panic!("seed {namespace}.{table}: {e}"));
 }
 
-/// Commits `fields` as the table's current schema, out of band and with no `REFRESH`.
+/// Commits `schema(next id)` as the table's current schema, out of band and with no `REFRESH`.
 async fn evolve_schema(
     catalog: &impl Catalog,
     namespace: &str,
     table: &str,
-    fields: &[NestedFieldRef],
+    schema: impl FnOnce(i32) -> IcebergSchema,
 ) {
     let current = load(catalog, namespace, table)
         .await
@@ -688,7 +642,7 @@ async fn evolve_schema(
         namespace,
         table,
         current,
-        schema_of(current + 1, fields),
+        schema(current + 1),
     )
     .await
     .unwrap_or_else(|e| panic!("evolve {namespace}.{table}: {e}"));
@@ -711,14 +665,7 @@ fn source_type(notes: &[(String, Json)], column: &str) -> Json {
 fn iceberg_columns_persist_source_notes() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-notes",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-notes");
     let fields = [long_field(1, "id", true), long_field(2, "score", false)];
     rt.block_on(fresh_table(
         &catalog,
@@ -732,28 +679,22 @@ fn iceberg_columns_persist_source_notes() {
     create_virtual_schema(&mut conn, "REFRESH_NOTES_VS", NS_NOTES);
     let notes = column_adapter_notes(&mut conn, "REFRESH_NOTES_VS", "ORDERS");
 
+    // Whole-note equality also proves no partition, no refusal, and no credential member.
     assert_eq!(
-        source_type(&notes, "ID"),
-        serde_json::json!({"field_id": 1, "name": "id", "arrow_type": "int64", "nullable": false})
+        notes,
+        [
+            (
+                "ID".to_string(),
+                serde_json::json!({"sourceType":
+                    {"field_id": 1, "name": "id", "arrow_type": "int64", "nullable": false}})
+            ),
+            (
+                "SCORE".to_string(),
+                serde_json::json!({"sourceType":
+                    {"field_id": 2, "name": "score", "arrow_type": "int64", "nullable": true}})
+            ),
+        ]
     );
-    assert_eq!(
-        source_type(&notes, "SCORE"),
-        serde_json::json!({"field_id": 2, "name": "score", "arrow_type": "int64", "nullable": true})
-    );
-    for (column, note) in &notes {
-        let members: Vec<&String> = note.as_object().expect("a JSON object").keys().collect();
-        assert_eq!(
-            members,
-            ["sourceType"],
-            "{column}: no partition, no refusal"
-        );
-        let text = note.to_string();
-        let secret = local_stack_creds().secret_key;
-        assert!(
-            !text.contains(&secret),
-            "{column}: a note never holds a credential"
-        );
-    }
 }
 
 /// Scenario: Refresh and set properties rebuild every column note from the source
@@ -761,14 +702,7 @@ fn iceberg_columns_persist_source_notes() {
 fn refresh_and_set_properties_rebuild_column_notes_from_the_source() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-renotes",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-renotes");
     let fields = [long_field(1, "id", true), long_field(2, "score", false)];
     rt.block_on(fresh_table(
         &catalog,
@@ -786,12 +720,9 @@ fn refresh_and_set_properties_rebuild_column_notes_from_the_source() {
         long_field(2, "rating", false),
         long_field(3, "extra", false),
     ];
-    rt.block_on(evolve_schema(
-        &catalog,
-        NS_RENOTES,
-        "scores",
-        &renamed_with_sibling,
-    ));
+    rt.block_on(evolve_schema(&catalog, NS_RENOTES, "scores", |id| {
+        schema_of(id, &renamed_with_sibling)
+    }));
     conn.execute("ALTER VIRTUAL SCHEMA REFRESH_RENOTES_VS REFRESH");
     conn.execute("ALTER VIRTUAL SCHEMA SETPROPS_RENOTES_VS SET PARALLELISM_FACTOR = '2'");
 
@@ -814,14 +745,7 @@ fn refresh_and_set_properties_rebuild_column_notes_from_the_source() {
 fn renamed_iceberg_column_reads_under_its_declared_name() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-rename",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-rename");
     let fields = [long_field(1, "id", true), long_field(2, "score", false)];
     rt.block_on(fresh_table(
         &catalog,
@@ -836,7 +760,9 @@ fn renamed_iceberg_column_reads_under_its_declared_name() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_RENAME_VS", NS_RENAME);
     let renamed = [long_field(1, "id", true), long_field(2, "rating", false)];
-    rt.block_on(evolve_schema(&catalog, NS_RENAME, "scores", &renamed));
+    rt.block_on(evolve_schema(&catalog, NS_RENAME, "scores", |id| {
+        schema_of(id, &renamed)
+    }));
 
     let table = vs_table("REFRESH_RENAME_VS", "scores");
     assert_text_columns(
@@ -859,14 +785,7 @@ fn renamed_iceberg_column_reads_under_its_declared_name() {
 fn dropped_iceberg_column_reads_what_older_files_store() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-drop",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-drop");
     let fields = [
         long_field(1, "id", true),
         long_field(2, "note", false),
@@ -889,7 +808,9 @@ fn dropped_iceberg_column_reads_what_older_files_store() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_DROP_VS", NS_DROP);
     let dropped = [long_field(1, "id", true)];
-    rt.block_on(evolve_schema(&catalog, NS_DROP, "notes_t", &dropped));
+    rt.block_on(evolve_schema(&catalog, NS_DROP, "notes_t", |id| {
+        schema_of(id, &dropped)
+    }));
     rt.block_on(append_file(
         &catalog,
         NS_DROP,
@@ -934,14 +855,7 @@ fn dropped_iceberg_column_reads_what_older_files_store() {
 fn iceberg_column_made_optional_after_refresh_fails_until_refresh() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-optional",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-optional");
     let fields = [long_field(1, "id", true), long_field(2, "qty", true)];
     rt.block_on(fresh_table(
         &catalog,
@@ -953,7 +867,9 @@ fn iceberg_column_made_optional_after_refresh_fails_until_refresh() {
     let mut conn = exa_conn();
     create_virtual_schema(&mut conn, "REFRESH_OPTIONAL_VS", NS_OPTIONAL);
     let relaxed = [long_field(1, "id", true), long_field(2, "qty", false)];
-    rt.block_on(evolve_schema(&catalog, NS_OPTIONAL, "qty_t", &relaxed));
+    rt.block_on(evolve_schema(&catalog, NS_OPTIONAL, "qty_t", |id| {
+        schema_of(id, &relaxed)
+    }));
     rt.block_on(append_file(
         &catalog,
         NS_OPTIONAL,
@@ -985,14 +901,7 @@ fn iceberg_column_made_optional_after_refresh_fails_until_refresh() {
 fn filter_on_rename_swapped_iceberg_columns_prunes_by_declared_field_id() {
     setup_e2e();
     let rt = rt();
-    let catalog_url = iceberg_catalog_url();
-    let catalog = rt
-        .block_on(build_seed_catalog(
-            &catalog_url,
-            "s3://warehouse/",
-            "refresh-swap",
-        ))
-        .expect("build seed catalog");
+    let catalog = seed_catalog(&rt, "refresh-swap");
     let fields = [long_field(1, "a", false), long_field(2, "b", false)];
     rt.block_on(fresh_table(
         &catalog,
@@ -1015,7 +924,9 @@ fn filter_on_rename_swapped_iceberg_columns_prunes_by_declared_field_id() {
     );
 
     let swapped = [long_field(1, "b", false), long_field(2, "a", false)];
-    rt.block_on(evolve_schema(&catalog, NS_SWAP, "swap_t", &swapped));
+    rt.block_on(evolve_schema(&catalog, NS_SWAP, "swap_t", |id| {
+        schema_of(id, &swapped)
+    }));
 
     assert_text_columns(&mut conn, &on_a, &[[Some("7")], [Some("100")]]);
     let planned = isolated_pushdown_statement(&mut conn, &on_a);

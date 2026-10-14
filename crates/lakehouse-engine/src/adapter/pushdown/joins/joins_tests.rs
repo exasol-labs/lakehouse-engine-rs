@@ -302,8 +302,8 @@ fn delta_join_request(select_list: Json) -> Json {
         ]),
         select_list,
     );
-    let request = with_notes(request, "CUSTOMER", &delta_notes(CUSTOMER_COLUMNS, &[]));
-    with_notes(request, "ORDERS", &delta_notes(ORDERS_COLUMNS, &[]))
+    let request = with_delta_notes(request, "CUSTOMER", CUSTOMER_COLUMNS, &[]);
+    with_delta_notes(request, "ORDERS", ORDERS_COLUMNS, &[])
 }
 
 /// Lets a test declare the same column name on both legs.
@@ -409,8 +409,8 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
             {"type": "column", "name": "BINARY_COL", "tableName": "CUSTOMER"},
         ]),
     );
-    let request = with_notes(request, "CUSTOMER", &delta_notes(&customer_columns, &[]));
-    let request = with_notes(request, "ORDERS", &delta_notes(ORDERS_COLUMNS, &[]));
+    let request = with_delta_notes(request, "CUSTOMER", &customer_columns, &[]);
+    let request = with_delta_notes(request, "ORDERS", ORDERS_COLUMNS, &[]);
 
     delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
@@ -547,13 +547,8 @@ fn partitioned_legs_request() -> Json {
             {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
         ]),
     );
-    let customer = delta_notes(REGION_CUSTOMER_COLUMNS, &["c_region"]);
-    let request = with_notes(request, "CUSTOMER", &customer);
-    with_notes(
-        request,
-        "ORDERS",
-        &delta_notes(STATUS_ORDERS_COLUMNS, &["o_status"]),
-    )
+    let request = with_delta_notes(request, "CUSTOMER", REGION_CUSTOMER_COLUMNS, &["c_region"]);
+    with_delta_notes(request, "ORDERS", STATUS_ORDERS_COLUMNS, &["o_status"])
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

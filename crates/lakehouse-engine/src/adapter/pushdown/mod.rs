@@ -86,7 +86,7 @@ use vs_expression::render_df_filter_safe;
 
 #[cfg(test)]
 #[path = "test_support_tests.rs"]
-pub(super) mod test_support;
+pub(crate) mod test_support;
 
 #[cfg(test)]
 #[path = "dispatch_golden_tests.rs"]

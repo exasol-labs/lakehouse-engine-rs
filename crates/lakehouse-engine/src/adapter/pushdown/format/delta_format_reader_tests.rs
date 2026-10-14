@@ -3,13 +3,14 @@ use delta_kernel::schema::DataType as DeltaType;
 use super::super::{ConnectionStorage, ResolvedScan};
 use super::*;
 use crate::adapter::pushdown::test_support::{
-    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, UNREACHABLE_CATALOG, closed_port_storage,
-    declared_notes, delta_commit_zero_key, delta_object_endpoint, involved_notes, nullable_field,
-    resolve_from_notes, sample_storage, unity_delta_table, user_message,
+    SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, UNREACHABLE_CATALOG, catalog_table,
+    closed_port_storage, declared_notes, delta_commit_zero_key, delta_object_endpoint,
+    involved_notes, nullable_field, resolve_from_notes, sample_storage, unity_delta_table,
+    user_message,
 };
 use lakehouse_catalog::{
-    CatalogTable, CatalogTableIdent, CatalogTableType, ConnectionCreds, StorageBackend,
-    TableFormat, UnityCatalogSession,
+    CatalogTable, CatalogTableIdent, ConnectionCreds, StorageBackend, TableFormat,
+    UnityCatalogSession,
 };
 
 const TABLE_NAME: &str = "cat.sch.orders";
@@ -48,14 +49,9 @@ fn delta_table(
             namespace: vec!["cat".into(), "sch".into()],
             name: "orders".into(),
         },
-        table_type: CatalogTableType::Table,
         storage_location: storage_location.map(str::to_string),
-        format: TableFormat::Delta,
         vended_credential_key: vended_credential_key.map(str::to_string),
-        partition_columns: Vec::new(),
-        metadata_location: None,
-        columns: Vec::new(),
-        properties: Default::default(),
+        ..catalog_table(TableFormat::Delta, "")
     }
 }
 

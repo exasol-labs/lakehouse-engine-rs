@@ -8,9 +8,9 @@ use crate::adapter::pushdown::test_support::filter_json::{
 };
 use crate::adapter::pushdown::test_support::{
     GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
-    UNREACHABLE_CATALOG, closed_port_storage, declared_notes, glue_catalog_table, involved_notes,
-    nullable_field, object_endpoint, resolve_from_notes, sample_storage, sigv4_creds,
-    unauthenticated_creds, user_message,
+    UNREACHABLE_CATALOG, assert_mentions, catalog_table, closed_port_storage, declared_notes,
+    glue_catalog_table, involved_notes, nullable_field, object_endpoint, resolve_declared,
+    sample_storage, sigv4_creds, unauthenticated_creds, unity_column, user_message,
 };
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
 use crate::adapter::tests::recording_store::RecordingStore;
@@ -28,10 +28,7 @@ use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
 use delta_kernel::schema::{DataType as DeltaType, StructField, StructType};
 use delta_kernel::table_features::ColumnMappingMode;
-use lakehouse_catalog::{
-    CatalogColumn, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
-    TableFormat, UnityCatalogSession,
-};
+use lakehouse_catalog::{CatalogTableIdent, ConnectionCreds, TableFormat, UnityCatalogSession};
 use serde_json::json;
 
 const TABLE_NAME: &str = "cat.sch.sales";
@@ -47,14 +44,6 @@ const UNREADABLE_BODY: &str = "not a parquet file";
 
 const STATIC_SECRET: &str = "minioadmin";
 
-fn raw_column(name: &str, type_json: Option<String>) -> CatalogColumn {
-    CatalogColumn {
-        declaration: None,
-        name: name.to_string(),
-        source_type: ColumnSourceType::Unity { type_json },
-    }
-}
-
 /// Each `(name, spark_type)` column is declared NOT NULL.
 fn sales_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogTable {
     let columns = columns
@@ -62,7 +51,7 @@ fn sales_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogT
         .map(|(name, spark_type)| {
             let field =
                 json!({"name": name, "type": spark_type, "nullable": false, "metadata": {}});
-            raw_column(name, Some(field.to_string()))
+            unity_column(name, Some(field.to_string()))
         })
         .collect();
     CatalogTable {
@@ -70,14 +59,10 @@ fn sales_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogT
             namespace: vec!["cat".into(), "sch".into()],
             name: "sales".into(),
         },
-        table_type: CatalogTableType::Table,
-        storage_location: Some(TABLE_ROOT.to_string()),
-        format: TableFormat::Parquet,
         vended_credential_key: Some("table-sales".to_string()),
         partition_columns: partition_columns.iter().map(|c| c.to_string()).collect(),
-        metadata_location: None,
         columns,
-        properties: Default::default(),
+        ..catalog_table(TableFormat::Parquet, TABLE_ROOT)
     }
 }
 
@@ -110,7 +95,6 @@ async fn resolve_with(
     use_vended_credentials: bool,
     filter: Option<&Json>,
 ) -> Result<ResolvedScan, String> {
-    let notes = declared_notes(table);
     let creds = ConnectionCreds {
         use_vended_credentials,
         ..unauthenticated_creds()
@@ -128,7 +112,7 @@ async fn resolve_with(
             &connection,
         )),
     };
-    user_outcome(resolve_from_notes(&reader, &involved_notes(TABLE_NAME, &notes), filter).await)
+    user_outcome(resolve_declared(&reader, TABLE_NAME, table, filter).await)
 }
 
 fn user_outcome(outcome: Result<ResolvedScan, UdfError>) -> Result<ResolvedScan, String> {
@@ -194,9 +178,9 @@ async fn declaration_refuses_a_column_without_a_usable_type_json_and_forces_null
     let drifted =
         json!({"name": "customerid", "type": "string", "nullable": false, "metadata": {}});
     table.columns.extend([
-        raw_column("CustomerId", Some(drifted.to_string())),
-        raw_column("note", None),
-        raw_column("broken", Some("{}".to_string())),
+        unity_column("CustomerId", Some(drifted.to_string())),
+        unity_column("note", None),
+        unity_column("broken", Some("{}".to_string())),
     ]);
 
     let scan = resolve(&table, &["part-0.parquet"]).await;
@@ -220,29 +204,22 @@ async fn declaration_refuses_a_column_without_a_usable_type_json_and_forces_null
         refused,
         vec![("payload", false), ("note", true), ("broken", true)]
     );
-}
 
-/// Scenario: A Unity Parquet column with no usable type descriptor is refused, and nullability always follows the file
-#[tokio::test]
-async fn catalog_columns_that_do_not_form_one_spark_schema_refuse_every_column() {
-    let table = sales_table(&[("id", "long"), ("ID", "long")], &[]);
-
-    let notes = declared_notes(&table);
-    let message = refusal(&table, sample_storage(), false).await;
+    let unschematic = sales_table(&[("id", "long"), ("ID", "long")], &[]);
+    let notes = declared_notes(&unschematic);
+    let message = refusal(&unschematic, sample_storage(), false).await;
 
     assert_eq!(notes.len(), 2, "CREATE still declares both columns");
-    for fragment in [
-        "virtual table 'cat.sch.sales' has no mappable column",
-        "'id'",
-        "'ID'",
-        TABLE_NAME,
-        "do not form one Spark schema",
-    ] {
-        assert!(
-            message.contains(fragment),
-            "'{fragment}' missing: {message}"
-        );
-    }
+    assert_mentions(
+        &message,
+        &[
+            "virtual table 'cat.sch.sales' has no mappable column",
+            "'id'",
+            "'ID'",
+            TABLE_NAME,
+            "do not form one Spark schema",
+        ],
+    );
 }
 
 #[tokio::test]
@@ -272,12 +249,7 @@ async fn file_columns_bind_under_the_case_fold_and_the_shared_cast_rules() {
         .rewrite(Arc::new(Column::new("amount", 1)) as Arc<dyn PhysicalExpr>)
         .expect_err("a double file column under an int declaration is refused")
         .to_string();
-    for fragment in ["'amount'", TABLE_ROOT, "Float64", "Int32"] {
-        assert!(
-            message.contains(fragment),
-            "'{fragment}' missing: {message}"
-        );
-    }
+    assert_mentions(&message, &["'amount'", TABLE_ROOT, "Float64", "Int32"]);
 }
 
 /// Scenario: Partition columns come from the catalog and partition values from the file paths
@@ -533,7 +505,6 @@ async fn resolve_glue(
 ) -> Result<ResolvedScan, String> {
     let session = GlueCatalogSession::new(glue_address, storage.clone(), sigv4_creds())
         .expect("the CONNECTION region signs the session");
-    let notes = declared_notes(table);
     let reader = CatalogParquetFormatReader {
         files: ParquetFileSource::GluePartitions {
             session: &session,
@@ -541,8 +512,7 @@ async fn resolve_glue(
             table,
         },
     };
-    let notes = involved_notes(GLUE_TABLE_NAME, &notes);
-    user_outcome(resolve_from_notes(&reader, &notes, filter).await)
+    user_outcome(resolve_declared(&reader, GLUE_TABLE_NAME, table, filter).await)
 }
 
 fn scanned_key(entry: &FileEntry, table_root: &str) -> String {
@@ -847,26 +817,22 @@ async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one
     .await
     .expect("a pruned partition contributes no row, so it cannot fail the query");
 
-    for fragment in [
-        "p_int=9",
-        "s3://bucket/glue/orders/p_int=9",
-        ORC_INPUT_FORMAT,
-    ] {
-        assert!(
-            kept_orc.contains(fragment),
-            "'{fragment}' missing: {kept_orc}"
-        );
-    }
-    for fragment in [
-        "p_int=5",
-        "s3://other-bucket/glue/orders/p_int=5",
-        "bucket 's3://other-bucket'",
-    ] {
-        assert!(
-            kept_foreign.contains(fragment),
-            "'{fragment}' missing: {kept_foreign}"
-        );
-    }
+    assert_mentions(
+        &kept_orc,
+        &[
+            "p_int=9",
+            "s3://bucket/glue/orders/p_int=9",
+            ORC_INPUT_FORMAT,
+        ],
+    );
+    assert_mentions(
+        &kept_foreign,
+        &[
+            "p_int=5",
+            "s3://other-bucket/glue/orders/p_int=5",
+            "bucket 's3://other-bucket'",
+        ],
+    );
     assert_eq!(pruned, vec!["glue/orders/p_int=1/f"]);
 }
 

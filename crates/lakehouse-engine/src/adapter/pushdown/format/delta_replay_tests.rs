@@ -10,17 +10,8 @@ use serde_json::json;
 
 use super::super::delta_predicate::to_delta_predicate;
 use super::*;
+use crate::adapter::pushdown::test_support::by_name;
 use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage};
-
-/// Every column of `schema` under its own name, as a reader pairs them without column mapping.
-fn by_name(
-    schema: &delta_kernel::schema::StructType,
-) -> Vec<(&str, &delta_kernel::schema::StructField)> {
-    schema
-        .fields()
-        .map(|field| (field.name().as_str(), field))
-        .collect()
-}
 
 fn local_store() -> Arc<dyn ObjectStore> {
     Arc::new(LocalFileSystem::new())

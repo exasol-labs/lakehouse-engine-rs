@@ -1,9 +1,9 @@
 use super::super::test_support::{
-    UNREACHABLE_CATALOG, declared_notes, glue_catalog_table, involved_notes, load_table_body,
-    object_endpoint, sample_storage, sigv4_creds, user_message,
+    UNREACHABLE_CATALOG, catalog_table, declared_columns, declared_schema_of, glue_catalog_table,
+    load_table_body, no_notes, object_endpoint, sample_storage, sigv4_creds, user_message,
 };
 use super::*;
-use lakehouse_catalog::{CatalogTableIdent, CatalogTableType};
+use lakehouse_catalog::CatalogTableIdent;
 
 const TABLE_NAME: &str = "cat.sch.orders";
 
@@ -13,14 +13,8 @@ fn unity_table(format: TableFormat) -> CatalogTable {
             namespace: vec!["cat".into(), "sch".into()],
             name: "orders".into(),
         },
-        table_type: CatalogTableType::Table,
-        storage_location: Some("s3://bucket/cat/sch/orders".into()),
-        format,
         vended_credential_key: Some("table-id-1".into()),
-        partition_columns: Vec::new(),
-        metadata_location: None,
-        columns: Vec::new(),
-        properties: Default::default(),
+        ..catalog_table(format, "s3://bucket/cat/sch/orders")
     }
 }
 
@@ -177,13 +171,10 @@ async fn format_reader_selects_readers_for_a_glue_table_by_format_without_contac
         (TableFormat::Parquet, vec!["part-0"]),
     ] {
         let table = glue_table(format);
-        let notes = match format {
-            TableFormat::Parquet => declared_notes(&table),
-            _ => Vec::new(),
+        let declared = match format {
+            TableFormat::Parquet => declared_schema_of(&table),
+            _ => no_notes(),
         };
-        let declared = involved_notes("SALES_ORDERS", &notes)
-            .declared_schema()
-            .expect("CREATE's notes parse");
         let reader = format_reader(
             ScanSource::Glue {
                 session: &session,
@@ -255,10 +246,7 @@ fn declare_columns_notes_each_catalog_parquet_column_with_its_partition_position
         )
     };
 
-    let declarations: Vec<ColumnDeclaration> = declare_columns(&table)
-        .into_iter()
-        .map(|note| serde_json::from_str(&note.expect("every column is declared")).unwrap())
-        .collect();
+    let declarations = declared_columns(&table);
 
     let declared: Vec<(&str, Option<usize>, bool)> = declarations
         .iter()

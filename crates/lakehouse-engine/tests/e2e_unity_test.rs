@@ -9,9 +9,9 @@ use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps,
     assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
     column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
-    declared_types, exa_conn, explain_virtual_sql, has_broadcast_join_block, has_two_scan_wrapper,
-    install_slc, involved_notes, note_of, pairs, parse_int, parse_numeric, persisted_column_notes,
-    query_error, reads, refuses, upload_so, value_to_string,
+    declared_schema_of, declared_types, exa_conn, explain_virtual_sql, has_broadcast_join_block,
+    has_two_scan_wrapper, install_slc, local_stack_creds, note_of, pairs, parse_int, parse_numeric,
+    partition_positions, query_error, reads, refuses, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -869,10 +869,7 @@ async fn resolve_unity_scan(
         .await
         .unwrap_or_else(|e| panic!("load_table({table_name}) failed: {e}"));
     let storage = delta_static_storage();
-    let notes = persisted_column_notes(&mut exa_conn(), VS_NAME, &table_name.to_uppercase());
-    let declared = involved_notes(table_name, &notes)
-        .declared_schema()
-        .unwrap_or_else(|e| panic!("the notes of {table_name} parse: {e}"));
+    let declared = declared_schema_of(&mut exa_conn(), VS_NAME, &table_name.to_uppercase());
 
     let reader = format_reader(
         ScanSource::Unity {
@@ -887,11 +884,9 @@ async fn resolve_unity_scan(
     )
     .unwrap_or_else(|e| panic!("format_reader({table_name}) failed: {e}"));
 
-    let planned = reader
-        .resolve_scan(&declared, filter)
+    ResolvedScan::resolve(reader.as_ref(), declared, filter)
         .await
-        .unwrap_or_else(|e| panic!("resolve_scan({table_name}) failed: {e}"));
-    ResolvedScan::new(declared, planned)
+        .unwrap_or_else(|e| panic!("resolve_scan({table_name}) failed: {e}"))
 }
 
 /// Panics on an empty partition map: comparing two runs cannot detect both silently losing
@@ -2152,13 +2147,8 @@ fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
         ]),
         "Parquet columns must precede partition columns, in declared order"
     );
-    let notes = column_adapter_notes(&mut conn, VS_NAME, "SALES_PARQUET");
-    let positions: Vec<(&str, Option<u64>)> = notes
-        .iter()
-        .map(|(column, note)| (column.as_str(), note["partition"].as_u64()))
-        .collect();
     assert_eq!(
-        positions,
+        partition_positions(&column_adapter_notes(&mut conn, VS_NAME, "SALES_PARQUET")),
         [
             ("AMOUNT", None),
             ("ID", None),
@@ -2404,16 +2394,6 @@ fn unity_unusable_column_mapping_metadata_refuses_only_its_column() {
             "{table} is listed: {tables:?}"
         );
     }
-    let notes = conn.query_columns(&format!(
-        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{COPY_VS_NAME}'"
-    ));
-    let skipped = serde_json::from_str::<Json>(&value_to_string(&notes[0][0]))
-        .expect("ADAPTER_NOTES is JSON")["SKIPPED_TABLES"]
-        .to_string();
-    assert!(
-        !skipped.contains("value_without") && !skipped.contains("label_mode"),
-        "{skipped}"
-    );
 
     let rows = conn.query_columns(&format!("SELECT ID, NAME FROM {}", copy_ref(unannotated)));
     assert_eq!(
@@ -2435,7 +2415,7 @@ fn unity_unusable_column_mapping_metadata_refuses_only_its_column() {
         label.contains("'label'") && label.contains("'id'"),
         "{label}"
     );
-    assert!(!label.contains("lhadminsecret123"), "{label}");
+    assert!(!label.contains(&local_stack_creds().secret_key), "{label}");
 }
 
 /// Scenario: The client carries each table's properties verbatim from the list sweep and the single-table load

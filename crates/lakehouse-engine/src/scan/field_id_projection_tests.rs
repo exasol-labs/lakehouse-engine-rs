@@ -1122,34 +1122,9 @@ fn initial_default_round_trips_across_full_type_vocabulary() {
 
 /// The logical field CREATE declares for the Iceberg column `field`, through `declare_columns`.
 fn declared_iceberg_field(field: iceberg::spec::NestedField) -> crate::scan::spec::LogicalField {
-    use lakehouse_catalog::{
-        CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType,
-        TableFormat,
-    };
-    let table = CatalogTable {
-        ident: CatalogTableIdent {
-            namespace: vec!["db".to_string()],
-            name: "t".to_string(),
-        },
-        table_type: CatalogTableType::Table,
-        storage_location: None,
-        format: TableFormat::Iceberg,
-        vended_credential_key: None,
-        partition_columns: Vec::new(),
-        metadata_location: None,
-        columns: vec![CatalogColumn {
-            declaration: None,
-            name: field.name.clone(),
-            source_type: ColumnSourceType::Iceberg(Arc::new(field)),
-        }],
-        properties: Default::default(),
-    };
-    let notes = crate::adapter::pushdown::declare_columns(&table);
-    let [Some(note)] = notes.as_slice() else {
-        panic!("CREATE declares the one Iceberg column");
-    };
-    serde_json::from_str::<crate::adapter::column_notes::ColumnDeclaration>(note)
-        .expect("a declared note decodes")
+    use crate::adapter::pushdown::test_support::{decoded_notes, iceberg_notes};
+    decoded_notes(&iceberg_notes(&[Arc::new(field)]))
+        .remove(0)
         .source_type
 }
 

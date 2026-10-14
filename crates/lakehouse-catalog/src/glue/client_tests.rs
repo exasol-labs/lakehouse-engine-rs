@@ -433,12 +433,9 @@ async fn a_parquet_table_declares_storage_columns_then_partition_keys() {
         vended_credential_key: None,
         partition_columns: vec!["p_int".into(), "p_date".into(), "p_str".into()],
         columns: columns
-            .map(|(name, hive_type)| CatalogColumn {
-                declaration: None,
-                name: name.into(),
-                source_type: ColumnSourceType::Glue {
-                    hive_type: hive_type.into(),
-                },
+            .map(|(name, hive_type)| {
+                let hive_type = hive_type.into();
+                CatalogColumn::new(name, ColumnSourceType::Glue { hive_type })
             })
             .to_vec(),
         metadata_location: None,

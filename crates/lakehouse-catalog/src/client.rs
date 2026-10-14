@@ -63,6 +63,17 @@ pub struct CatalogColumn {
     pub declaration: Option<String>,
 }
 
+impl CatalogColumn {
+    /// An undeclared column, as every client in this crate produces it.
+    pub fn new(name: impl Into<String>, source_type: ColumnSourceType) -> Self {
+        Self {
+            name: name.into(),
+            source_type,
+            declaration: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatalogTable {
     pub ident: CatalogTableIdent,
@@ -250,10 +261,8 @@ pub(crate) fn iceberg_catalog_table(
         .as_struct()
         .fields()
         .iter()
-        .map(|field| CatalogColumn {
-            declaration: None,
-            name: field.name.clone(),
-            source_type: ColumnSourceType::Iceberg(field.clone()),
+        .map(|field| {
+            CatalogColumn::new(field.name.clone(), ColumnSourceType::Iceberg(field.clone()))
         })
         .collect();
 

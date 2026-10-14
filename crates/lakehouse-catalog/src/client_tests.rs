@@ -18,14 +18,13 @@ impl FixedCatalogClient {
             vended_credential_key: None,
             partition_columns: Vec::new(),
             metadata_location: None,
-            columns: vec![CatalogColumn {
-                declaration: None,
-                name: "order_id".to_string(),
-                source_type: ColumnSourceType::Iceberg(
+            columns: vec![CatalogColumn::new(
+                "order_id",
+                ColumnSourceType::Iceberg(
                     NestedField::required(1, "order_id", Type::Primitive(PrimitiveType::Long))
                         .into(),
                 ),
-            }],
+            )],
             properties: Default::default(),
         }
     }
@@ -42,11 +41,10 @@ impl FixedCatalogClient {
             vended_credential_key: Some("payments-uuid".to_string()),
             partition_columns: Vec::new(),
             metadata_location: None,
-            columns: vec![CatalogColumn {
-                declaration: None,
-                name: "total".to_string(),
-                source_type: ColumnSourceType::Unity { type_json: None },
-            }],
+            columns: vec![CatalogColumn::new(
+                "total",
+                ColumnSourceType::Unity { type_json: None },
+            )],
             properties: Default::default(),
         }
     }
@@ -450,20 +448,18 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
         vended_credential_key: None,
         partition_columns: Vec::new(),
         columns: vec![
-            CatalogColumn {
-                declaration: None,
-                name: "id".to_string(),
-                source_type: ColumnSourceType::Iceberg(
+            CatalogColumn::new(
+                "id",
+                ColumnSourceType::Iceberg(
                     NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
                 ),
-            },
-            CatalogColumn {
-                declaration: None,
-                name: "name".to_string(),
-                source_type: ColumnSourceType::Iceberg(
+            ),
+            CatalogColumn::new(
+                "name",
+                ColumnSourceType::Iceberg(
                     NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
                 ),
-            },
+            ),
         ],
         metadata_location: None,
         properties: Default::default(),

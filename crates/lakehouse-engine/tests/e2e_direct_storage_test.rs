@@ -5,10 +5,11 @@
 mod common;
 
 use common::e2e_harness::{
-    VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_type_matrix,
-    column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
-    declared_type, exa_conn, explain_virtual_sql, install_slc, local_stack_storage, note_of,
-    nullable_text, parse_int, parse_numeric, reads, refuses, text_column,
+    VARCHAR_JSON, VsProps, assert_decimal_orders_numerically, assert_notes_well_formed,
+    assert_query_fails, assert_refused_column, assert_type_matrix, column_adapter_notes,
+    create_schema_and_scripts, create_virtual_schema_with_password, declared_type, exa_conn,
+    explain_virtual_sql, install_slc, local_stack_storage, note_of, nullable_text, parse_int,
+    parse_numeric, partition_positions, reads, refuses, skip_reason, text_column,
     try_create_virtual_schema_with_password, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
@@ -96,6 +97,15 @@ fn direct_vs<'a>(vs_name: &'a str, conn_name: &'a str) -> VsProps<'a> {
         .with_catalog_conn_name(conn_name)
 }
 
+fn create_direct_vs(conn: &mut ExaConn, vs_name: &str, conn_name: &str, base: &str) {
+    create_virtual_schema_with_password(
+        conn,
+        &direct_vs(vs_name, conn_name),
+        base,
+        &direct_storage_password(),
+    );
+}
+
 fn try_create_direct_vs(conn: &mut ExaConn, vs_name: &str, conn_name: &str, base: &str) -> Json {
     try_create_virtual_schema_with_password(
         conn,
@@ -109,7 +119,7 @@ fn rejection_message<'a>(resp: &'a Json, what: &str) -> &'a str {
     assert_eq!(
         resp["status"].as_str(),
         Some("error"),
-        "{what} must fail CREATE VIRTUAL SCHEMA: {resp}"
+        "{what} must fail its statement: {resp}"
     );
     resp["exception"]["text"].as_str().unwrap_or("")
 }
@@ -154,12 +164,7 @@ fn setup() {
             &direct_storage_password(),
         );
 
-        create_virtual_schema_with_password(
-            &mut conn,
-            &direct_vs(VS_DISCOVERY, CONN_DISCOVERY),
-            BASE_DISCOVERY,
-            &direct_storage_password(),
-        );
+        create_direct_vs(&mut conn, VS_DISCOVERY, CONN_DISCOVERY, BASE_DISCOVERY);
         create_virtual_schema_with_password(
             &mut conn,
             &VsProps::new(VS_DISCOVERY_NS, "sub")
@@ -1978,22 +1983,7 @@ fn direct_storage_columns_persist_source_notes() {
         ],
         "each note keeps the source's own spelling and Arrow tag: {notes:?}"
     );
-    for (column, note) in &notes {
-        let members: BTreeSet<&str> = note
-            .as_object()
-            .expect("a note is one JSON object")
-            .keys()
-            .map(String::as_str)
-            .collect();
-        assert!(
-            members.is_subset(&BTreeSet::from(["sourceType", "partition", "refused"])),
-            "{column}: a note carries only sourceType, partition, and refused: {note}"
-        );
-        assert!(
-            !note.to_string().contains("lhadminsecret123"),
-            "{column}: a note must carry no credential value"
-        );
-    }
+    assert_notes_well_formed(&notes, &direct_storage_password().secret_key);
 
     let complex = column_adapter_notes(&mut conn, VS_DIRECT, "COMPLEX");
     assert!(
@@ -2011,14 +2001,16 @@ fn partition_column_notes_carry_their_position() {
     let mut conn = exa_conn();
 
     let notes = column_adapter_notes(&mut conn, VS_DIRECT, "SALES");
-    assert_eq!(note_of(&notes, "YEAR")["partition"], 0, "{notes:?}");
-    assert_eq!(note_of(&notes, "MONTH")["partition"], 1, "{notes:?}");
-    for column in ["ID", "AMOUNT", "DISCOUNT"] {
-        assert!(
-            note_of(&notes, column).get("partition").is_none(),
-            "{column} is no partition column: {notes:?}"
-        );
-    }
+    assert_eq!(
+        partition_positions(&notes),
+        [
+            ("AMOUNT", None),
+            ("DISCOUNT", None),
+            ("ID", None),
+            ("MONTH", Some(1)),
+            ("YEAR", Some(0)),
+        ]
+    );
 }
 
 /// Scenario: A refused column's note records its refusal and the column stays declared
@@ -2032,26 +2024,7 @@ fn direct_storage_binary_column_note_records_the_refusal() {
         ("ALL_TYPES", "C_STRUCT_BINARY"),
         ("ANNOTATED_TYPES", "C_BYTE_ARRAY"),
     ] {
-        let notes = column_adapter_notes(&mut conn, VS_DIRECT, table);
-        let reason = note_of(&notes, refused)["refused"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{table}.{refused} must record its refusal: {notes:?}"));
-        assert_mentions(reason, &["#351"]);
-        assert_eq!(
-            declared_type(&mut conn, VS_DIRECT, table, refused),
-            VARCHAR_JSON,
-            "{table}.{refused} stays declared"
-        );
-        assert!(
-            note_of(&notes, "ID").get("refused").is_none(),
-            "{table}.ID is readable: {notes:?}"
-        );
-        let resp = conn.try_execute(&format!(
-            "SELECT {refused} FROM {}",
-            vs_table(VS_DIRECT, table)
-        ));
-        assert_eq!(resp["status"].as_str(), Some("error"), "{refused}: {resp}");
-        assert_mentions(resp["exception"]["text"].as_str().unwrap_or(""), &["#351"]);
+        assert_refused_column(&mut conn, VS_DIRECT, table, refused, &["#351"]);
     }
     let ids = conn.query_columns(&format!(
         "SELECT ID FROM {}",
@@ -2083,12 +2056,7 @@ fn pushdown_plans_from_column_notes_without_reading_a_footer() {
     write_parquet_fixture(&kept_2025, sales_batch(&[3]));
     write_parquet_fixture(&pruned_2026, discounted_sales_batch(&[1, 2]));
     write_parquet_fixture(&format!("{BASE_NOTES}dims/d.parquet"), dimension_batch(3));
-    create_virtual_schema_with_password(
-        &mut conn,
-        &direct_vs(VS_NOTES, CONN_NOTES),
-        BASE_NOTES,
-        &direct_storage_password(),
-    );
+    create_direct_vs(&mut conn, VS_NOTES, CONN_NOTES, BASE_NOTES);
 
     let sql = format!(
         "SELECT ID, DISCOUNT FROM {} WHERE \"YEAR\" = '2025'",
@@ -2122,17 +2090,8 @@ fn pushdown_plans_from_column_notes_without_reading_a_footer() {
         pushed.contains("year=2025/p1.parquet") && !pushed.contains("year=2026/"),
         "planning lists and prunes without reading the now-unreadable footers: {pushed}"
     );
-    let resp = conn.try_execute(&sql);
-    assert_eq!(
-        resp["status"].as_str(),
-        Some("error"),
-        "the scan UDF, not the planner, is the first to read the footer: {resp}"
-    );
-    let msg = resp["exception"]["text"].as_str().unwrap_or("");
-    assert!(
-        msg.contains("scan failed") && msg.contains("Corrupt footer"),
-        "the failure must come from the scan reading the bad file: {msg}"
-    );
+    // The scan UDF, not the planner, is the first to read the footer.
+    assert_query_fails(&mut conn, &sql, &["scan failed", "Corrupt footer"]);
 }
 
 fn drift_batch(id: i64, n: ArrayRef, extra: Option<i32>) -> RecordBatch {
@@ -2160,12 +2119,7 @@ fn source_change_after_refresh_plans_against_the_declaration() {
         &format!("{BASE_DRIFT}drift/p1.parquet"),
         drift_batch(1, Arc::new(Int32Array::from(vec![7])), None),
     );
-    create_virtual_schema_with_password(
-        &mut conn,
-        &direct_vs(VS_DRIFT, CONN_NOTES),
-        BASE_DRIFT,
-        &direct_storage_password(),
-    );
+    create_direct_vs(&mut conn, VS_DRIFT, CONN_NOTES, BASE_DRIFT);
     let narrow = declared_type(&mut conn, VS_DRIFT, "DRIFT", "N");
 
     write_parquet_fixture(
@@ -2180,10 +2134,9 @@ fn source_change_after_refresh_plans_against_the_declaration() {
         [1, 2],
         "a query reading only columns the files agree on succeeds"
     );
-    let resp = conn.try_execute(&format!("SELECT N FROM {table}"));
-    assert_eq!(resp["status"].as_str(), Some("error"), "{resp}");
-    assert_mentions(
-        resp["exception"]["text"].as_str().unwrap_or(""),
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT N FROM {table}"),
         &["'N'", "Int64", "Int32", &format!("{BASE_DRIFT}drift")],
     );
 
@@ -2247,7 +2200,7 @@ fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
             ],
         );
         assert!(
-            !msg.contains("lhadminsecret123"),
+            !msg.contains(&direct_storage_password().secret_key),
             "error must not leak credential values: {msg}"
         );
     }
@@ -2258,11 +2211,11 @@ fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
         &format!("{BASE_SPELLING_DRIFT}ledger/year=2025/p.parquet"),
         discovery_id_batch(1),
     );
-    create_virtual_schema_with_password(
+    create_direct_vs(
         &mut conn,
-        &direct_vs(VS_SPELLING_DRIFT, CONN_NOTES),
+        VS_SPELLING_DRIFT,
+        CONN_NOTES,
         BASE_SPELLING_DRIFT,
-        &direct_storage_password(),
     );
     write_parquet_fixture(&late, discovery_id_batch(2));
     let table = vs_table(VS_SPELLING_DRIFT, "LEDGER");
@@ -2270,13 +2223,8 @@ fn two_spellings_of_one_partition_key_fail_refresh_and_query() {
     let refresh = conn.try_execute(&format!("ALTER VIRTUAL SCHEMA {VS_SPELLING_DRIFT} REFRESH"));
     delete_fixture_object(&late);
     for (statement, resp) in [("query", &query), ("refresh", &refresh)] {
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "{statement}: {resp}"
-        );
         assert_mentions(
-            resp["exception"]["text"].as_str().unwrap_or(""),
+            rejection_message(resp, statement),
             &[
                 "'year'",
                 "'YEAR'",
@@ -2298,12 +2246,7 @@ fn partition_key_matches_its_declared_column_across_letter_case() {
         delete_fixture_object(&uri("YEAR", year));
         write_parquet_fixture(&uri("year", year), discovery_id_batch(id));
     }
-    create_virtual_schema_with_password(
-        &mut conn,
-        &direct_vs(VS_KEY_CASE, CONN_NOTES),
-        BASE_KEY_CASE,
-        &direct_storage_password(),
-    );
+    create_direct_vs(&mut conn, VS_KEY_CASE, CONN_NOTES, BASE_KEY_CASE);
     let sql = format!(
         "SELECT ID, \"YEAR\" FROM {} WHERE \"YEAR\" = '2026'",
         vs_table(VS_KEY_CASE, "LEDGER")
@@ -2370,12 +2313,7 @@ fn over_limit_column_note_fails_create_and_refresh() {
         &format!("{BASE_OVER_LIMIT}small/p.parquet"),
         discovery_id_batch(1),
     );
-    create_virtual_schema_with_password(
-        &mut conn,
-        &direct_vs(VS_OVER_LIMIT, CONN_NOTES),
-        BASE_OVER_LIMIT,
-        &direct_storage_password(),
-    );
+    create_direct_vs(&mut conn, VS_OVER_LIMIT, CONN_NOTES, BASE_OVER_LIMIT);
     assert_eq!(served_tables(&mut conn, VS_OVER_LIMIT), ["SMALL"]);
 
     write_parquet_fixture(&wide, over_limit_struct_batch());
@@ -2384,13 +2322,8 @@ fn over_limit_column_note_fails_create_and_refresh() {
     delete_fixture_object(&wide);
 
     for (statement, resp) in [("refresh", &refresh), ("create", &create)] {
-        assert_eq!(
-            resp["status"].as_str(),
-            Some("error"),
-            "{statement}: {resp}"
-        );
         assert_mentions(
-            resp["exception"]["text"].as_str().unwrap_or(""),
+            rejection_message(resp, statement),
             &["'PAYLOAD'", "'WIDE'", "2000000"],
         );
     }
@@ -2505,21 +2438,6 @@ fn assert_fails_naming(conn: &mut ExaConn, case: &str, sql: &str, fragments: &[&
     msg
 }
 
-fn skip_reason(conn: &mut ExaConn, vs_name: &str, table: &str) -> Option<String> {
-    let notes = conn.query_columns(&format!(
-        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{vs_name}'"
-    ));
-    let notes: Json = serde_json::from_str(&value_to_string(&notes[0][0]))
-        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be JSON: {e}"));
-    let skipped = notes["SKIPPED_TABLES"]
-        .as_array()
-        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry SKIPPED_TABLES: {notes}"));
-    skipped
-        .iter()
-        .find(|entry| value_to_string(&entry["table"]) == table)
-        .map(|entry| value_to_string(&entry["reason"]))
-}
-
 /// Scenario: Refresh re-enumerates the namespace and returns a refresh response
 /// Scenario: Refresh reflects table and column structure changes
 /// Scenario: Until a refresh, a query reads the current files under the declared columns
@@ -2533,12 +2451,7 @@ fn refresh_tracks_storage_changes_and_a_failed_refresh_keeps_the_schema() {
 
     delete_fixture_prefix(BASE_REFRESH);
     write_refresh_initial_objects();
-    create_virtual_schema_with_password(
-        &mut conn,
-        &direct_vs(VS_REFRESH, CONN_REFRESH),
-        BASE_REFRESH,
-        &direct_storage_password(),
-    );
+    create_direct_vs(&mut conn, VS_REFRESH, CONN_REFRESH, BASE_REFRESH);
     let initial_tables = ["T_APPEND", "T_CONFLICT", "T_EMPTIED", "T_EVOLVE", "T_HIVE"];
     assert_eq!(
         served_tables(&mut conn, VS_REFRESH),

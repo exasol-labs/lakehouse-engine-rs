@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::pushdown::test_support::assert_mentions;
 use crate::adapter::tests::parquet_fixture::{
     directory_options, in_memory_store, nullable, parquet_bytes, parquet_footer_bytes,
     parquet_schema_footer_bytes, values,
@@ -47,16 +48,6 @@ async fn resolve(
         directory_options(merge_mode, true),
     )
     .await
-}
-
-fn assert_mentions(error: &UdfError, expected: &[&str]) {
-    let message = error.to_string();
-    for fragment in expected {
-        assert!(
-            message.contains(fragment),
-            "'{fragment}' missing from: {message}"
-        );
-    }
 }
 
 fn root() -> StorePath {
@@ -358,7 +349,7 @@ async fn a_file_missing_the_colliding_keys_segment_fails_the_fold_naming_it() {
             .err()
             .unwrap_or_else(|| panic!("{merge_mode:?}: '{missing}' stores K without a k= segment"));
 
-        assert_mentions(&error, &["K", "k", &under_root(missing)]);
+        assert_mentions(&error.to_string(), &["K", "k", &under_root(missing)]);
     }
 }
 
@@ -478,7 +469,7 @@ fn two_spellings_of_a_declared_key_fail_and_of_an_undeclared_key_contribute_noth
     let error = fill_partition_values(&files, &["year".to_string()])
         .expect_err("two spellings of one declared key must fail the listing");
     assert_mentions(
-        &error,
+        &error.to_string(),
         &[
             "year",
             "Year",
@@ -560,7 +551,7 @@ async fn a_pair_no_widening_rule_covers_fails_naming_the_column_both_types_and_b
         .expect("no supported pair covers Int32 and Utf8, so the fold must fail rather than guess");
 
     assert_mentions(
-        &error,
+        &error.to_string(),
         &[
             "n",
             "Int32",
@@ -702,7 +693,7 @@ async fn two_names_equal_after_the_uppercase_fold_fail_the_fold() {
         .expect("the declaration would advertise a duplicate column name");
 
     assert_mentions(
-        &error,
+        &error.to_string(),
         &[
             "id",
             "ID",
@@ -939,7 +930,7 @@ fn a_location_naming_no_scheme_bucket_or_valid_key_is_refused_naming_it() {
     ] {
         let error = raw_location_prefix(location)
             .expect_err("a location that names no raw key must be refused");
-        assert_mentions(&error, &[location, cause]);
+        assert_mentions(&error.to_string(), &[location, cause]);
     }
 }
 

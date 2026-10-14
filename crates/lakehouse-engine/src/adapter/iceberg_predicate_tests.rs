@@ -1,4 +1,5 @@
 use super::*;
+use crate::adapter::pushdown::test_support::nullable_field;
 use iceberg::spec::{NestedField, Schema, Type};
 use serde_json::json;
 use std::sync::Arc;
@@ -40,12 +41,7 @@ fn test_schema() -> Schema {
 fn declared_field(field_id: i32, name: &str) -> LogicalField {
     LogicalField {
         field_id: Some(field_id),
-        name: name.to_string(),
-        arrow_type: "utf8".to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
+        ..nullable_field(name, "utf8")
     }
 }
 
@@ -58,6 +54,10 @@ fn translate_as_created(filter: &Json, schema: &Schema) -> Option<Predicate> {
         .map(|field| declared_field(field.id, &field.name))
         .collect();
     to_iceberg_predicate(filter, &declared, schema)
+}
+
+fn translate(filter: &Json) -> Option<Predicate> {
+    translate_as_created(filter, &test_schema())
 }
 
 fn col(name: &str) -> Json {
@@ -75,10 +75,8 @@ fn date_lit(s: &str) -> Json {
 
 #[test]
 fn leaf_equal_translates() {
-    let schema = test_schema();
-
     let node = json!({"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)});
-    let pred = translate_as_created(&node, &schema).expect("should translate equal");
+    let pred = translate(&node).expect("should translate equal");
     let s = format!("{pred}");
     assert!(
         s.contains("id") && s.contains('=') && s.contains('5'),
@@ -86,7 +84,7 @@ fn leaf_equal_translates() {
     );
 
     let node2 = json!({"type": "predicate_equal", "left": int_lit(5), "right": col("ID")});
-    let pred2 = translate_as_created(&node2, &schema).expect("reversed operands should translate");
+    let pred2 = translate(&node2).expect("reversed operands should translate");
     let s2 = format!("{pred2}");
     assert!(
         s2.contains("id") && s2.contains('=') && s2.contains('5'),
@@ -105,34 +103,29 @@ fn has_tz_offset_detects_explicit_zones() {
 
 #[test]
 fn leaf_less_than_translates() {
-    let schema = test_schema();
-
     let node = json!({"type": "predicate_less", "left": col("AMOUNT"), "right": int_lit(100)});
-    let pred = translate_as_created(&node, &schema).unwrap();
+    let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains('<'), "got: {s}");
 
     let node2 = json!({"type": "predicate_less", "left": int_lit(100), "right": col("AMOUNT")});
-    let pred2 = translate_as_created(&node2, &schema).unwrap();
+    let pred2 = translate(&node2).unwrap();
     let s2 = format!("{pred2}");
     assert!(s2.contains("amount") && s2.contains('>'), "got: {s2}");
 }
 
 #[test]
 fn leaf_lessequal_translates() {
-    let schema = test_schema();
-
     let node = json!({"type": "predicate_lessequal", "left": col("AMOUNT"), "right": int_lit(50)});
-    let pred = translate_as_created(&node, &schema).unwrap();
+    let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains("<="), "got: {s}");
 }
 
 #[test]
 fn leaf_is_null_translates() {
-    let schema = test_schema();
     let node = json!({"type": "predicate_is_null", "expression": col("NAME")});
-    let pred = translate_as_created(&node, &schema).unwrap();
+    let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(
         s.contains("name") && s.to_uppercase().contains("NULL"),
@@ -142,9 +135,8 @@ fn leaf_is_null_translates() {
 
 #[test]
 fn leaf_is_not_null_translates() {
-    let schema = test_schema();
     let node = json!({"type": "predicate_is_not_null", "expression": col("NAME")});
-    let pred = translate_as_created(&node, &schema).unwrap();
+    let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(
         s.contains("name") && s.to_uppercase().contains("NOT NULL"),
@@ -154,13 +146,12 @@ fn leaf_is_not_null_translates() {
 
 #[test]
 fn leaf_in_translates() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_in_constlist",
         "expression": col("ID"),
         "arguments": [int_lit(1), int_lit(2), int_lit(3)]
     });
-    let pred = translate_as_created(&node, &schema).unwrap();
+    let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(
         s.contains("id") && s.to_uppercase().contains("IN"),
@@ -170,13 +161,12 @@ fn leaf_in_translates() {
 
 #[test]
 fn leaf_in_with_string_translates() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_in_constlist",
         "expression": col("NAME"),
         "arguments": [str_lit("alice"), str_lit("bob")]
     });
-    let pred = translate_as_created(&node, &schema).unwrap();
+    let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(
         s.contains("name") && s.to_uppercase().contains("IN"),
@@ -186,14 +176,13 @@ fn leaf_in_with_string_translates() {
 
 #[test]
 fn between_desugars_to_range() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_between",
         "expression": col("AMOUNT"),
         "left": int_lit(10),
         "right": int_lit(100)
     });
-    let pred = translate_as_created(&node, &schema).unwrap();
+    let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("amount"), "got: {s}");
     assert!(
@@ -209,20 +198,18 @@ fn between_desugars_to_range() {
 
 #[test]
 fn leaf_date_translates() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_equal",
         "left": col("EVENT_DATE"),
         "right": date_lit("2024-01-15")
     });
-    let pred = translate_as_created(&node, &schema).unwrap();
+    let pred = translate(&node).unwrap();
     let s = format!("{pred}");
     assert!(s.contains("event_date"), "got: {s}");
 }
 
 #[test]
 fn and_with_untranslatable_child_keeps_translatable_conjunct() {
-    let schema = test_schema();
     let translatable = json!({
         "type": "predicate_equal",
         "left": col("ID"),
@@ -237,8 +224,7 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
         "type": "predicate_and",
         "expressions": [translatable, untranslatable]
     });
-    let pred = translate_as_created(&node, &schema)
-        .expect("AND with one translatable child must return Some");
+    let pred = translate(&node).expect("AND with one translatable child must return Some");
     let s = format!("{pred}");
     assert!(
         s.contains("id") && s.contains('=') && s.contains('5'),
@@ -252,7 +238,6 @@ fn and_with_untranslatable_child_keeps_translatable_conjunct() {
 
 #[test]
 fn and_all_untranslatable_returns_none() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_and",
         "expressions": [
@@ -260,12 +245,11 @@ fn and_all_untranslatable_returns_none() {
             {"type": "predicate_like_regexp", "expression": col("NAME"), "pattern": str_lit("^B")}
         ]
     });
-    assert!(translate_as_created(&node, &schema).is_none());
+    assert!(translate(&node).is_none());
 }
 
 #[test]
 fn or_with_untranslatable_child_returns_none() {
-    let schema = test_schema();
     let translatable = json!({
         "type": "predicate_equal",
         "left": col("ID"),
@@ -282,14 +266,13 @@ fn or_with_untranslatable_child_returns_none() {
     });
     // Pruning on only the translatable branch would be unsound.
     assert!(
-        translate_as_created(&node, &schema).is_none(),
+        translate(&node).is_none(),
         "OR with untranslatable branch must be None"
     );
 }
 
 #[test]
 fn or_all_translatable_returns_some() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_or",
         "expressions": [
@@ -297,95 +280,82 @@ fn or_all_translatable_returns_some() {
             {"type": "predicate_equal", "left": col("ID"), "right": int_lit(2)}
         ]
     });
-    let pred = translate_as_created(&node, &schema).expect("all-translatable OR must be Some");
+    let pred = translate(&node).expect("all-translatable OR must be Some");
     let s = format!("{pred}");
     assert!(s.to_uppercase().contains("OR"), "OR missing: {s}");
 }
 
 #[test]
 fn not_of_untranslatable_returns_none() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_not",
         "expression": {"type": "predicate_like", "expression": col("NAME"), "pattern": str_lit("A%")}
     });
     assert!(
-        translate_as_created(&node, &schema).is_none(),
+        translate(&node).is_none(),
         "NOT of untranslatable must be None"
     );
 }
 
 #[test]
 fn not_of_translatable_negates() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_not",
         "expression": {"type": "predicate_less", "left": col("ID"), "right": int_lit(5)}
     });
-    let pred = translate_as_created(&node, &schema).expect("NOT of translatable must be Some");
+    let pred = translate(&node).expect("NOT of translatable must be Some");
     let s = format!("{pred}");
     assert!(s.contains("id") && s.contains(">="), "got: {s}");
 }
 
 #[test]
 fn unknown_column_returns_none() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_equal",
         "left": col("NONEXISTENT"),
         "right": int_lit(1)
     });
-    assert!(
-        translate_as_created(&node, &schema).is_none(),
-        "unknown column must be None"
-    );
+    assert!(translate(&node).is_none(), "unknown column must be None");
 }
 
 #[test]
 fn type_mismatch_returns_none() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_equal",
         "left": col("ID"),
         "right": str_lit("not-a-number")
     });
-    assert!(
-        translate_as_created(&node, &schema).is_none(),
-        "type mismatch must be None"
-    );
+    assert!(translate(&node).is_none(), "type mismatch must be None");
 }
 
 #[test]
 fn notequal_returns_none() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_notequal",
         "left": col("ID"),
         "right": int_lit(5)
     });
     assert!(
-        translate_as_created(&node, &schema).is_none(),
+        translate(&node).is_none(),
         "predicate_notequal must not produce a pruning predicate"
     );
 }
 
 #[test]
 fn in_with_type_mismatch_element_returns_none() {
-    let schema = test_schema();
     let node = json!({
         "type": "predicate_in_constlist",
         "expression": col("ID"),
         "arguments": [int_lit(1), str_lit("bad")]
     });
     assert!(
-        translate_as_created(&node, &schema).is_none(),
+        translate(&node).is_none(),
         "IN with one bad element must be None"
     );
 }
 
 #[test]
 fn between_with_one_failing_bound_keeps_other() {
-    let schema = test_schema();
     // The low bound fails; the high bound survives alone.
     let node = json!({
         "type": "predicate_between",
@@ -393,8 +363,7 @@ fn between_with_one_failing_bound_keeps_other() {
         "left": str_lit("bad"),
         "right": int_lit(100)
     });
-    let pred = translate_as_created(&node, &schema)
-        .expect("BETWEEN with one valid bound must return Some");
+    let pred = translate(&node).expect("BETWEEN with one valid bound must return Some");
     let s = format!("{pred}");
     assert!(s.contains("amount") && s.contains("<="), "got: {s}");
 }
@@ -417,31 +386,28 @@ fn and(expressions: [Json; 2]) -> Json {
 
 #[test]
 fn not_over_an_and_that_dropped_a_conjunct_returns_none() {
-    let schema = test_schema();
     for conjuncts in [
         [amount_below(30), name_like("x%")],
         [name_like("x%"), amount_below(30)],
     ] {
         let node = not(and(conjuncts));
-        assert_eq!(translate_as_created(&node, &schema), None, "{node}");
+        assert_eq!(translate(&node), None, "{node}");
     }
 }
 
 #[test]
 fn not_over_a_between_that_dropped_a_bound_returns_none() {
-    let schema = test_schema();
     let node = not(json!({
         "type": "predicate_between",
         "expression": col("AMOUNT"),
         "left": int_lit(10),
         "right": {"type": "literal_exactnumeric", "value": 20.5}
     }));
-    assert_eq!(translate_as_created(&node, &schema), None);
+    assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn not_over_an_or_with_an_inexact_branch_returns_none() {
-    let schema = test_schema();
     let node = not(json!({
         "type": "predicate_or",
         "expressions": [
@@ -449,12 +415,11 @@ fn not_over_an_or_with_an_inexact_branch_returns_none() {
             {"type": "predicate_equal", "left": col("ID"), "right": int_lit(5)}
         ]
     }));
-    assert_eq!(translate_as_created(&node, &schema), None);
+    assert_eq!(translate(&node), None);
 }
 
 #[test]
 fn not_over_a_fully_translated_and_negates_the_whole_conjunction() {
-    let schema = test_schema();
     let node = not(and([
         amount_below(30),
         json!({"type": "predicate_equal", "left": col("NAME"), "right": str_lit("a")}),
@@ -462,12 +427,11 @@ fn not_over_a_fully_translated_and_negates_the_whole_conjunction() {
     let expected = Reference::new("amount")
         .greater_than_or_equal_to(Datum::long(30))
         .or(Reference::new("name").not_equal_to(Datum::string("a")));
-    assert_eq!(translate_as_created(&node, &schema), Some(expected));
+    assert_eq!(translate(&node), Some(expected));
 }
 
 #[test]
 fn not_over_a_fully_translated_between_negates_both_bounds() {
-    let schema = test_schema();
     let node = not(json!({
         "type": "predicate_between",
         "expression": col("AMOUNT"),
@@ -477,12 +441,11 @@ fn not_over_a_fully_translated_between_negates_both_bounds() {
     let expected = Reference::new("amount")
         .less_than(Datum::long(10))
         .or(Reference::new("amount").greater_than(Datum::long(20)));
-    assert_eq!(translate_as_created(&node, &schema), Some(expected));
+    assert_eq!(translate(&node), Some(expected));
 }
 
 #[test]
 fn not_over_a_fully_translated_or_negates_every_branch() {
-    let schema = test_schema();
     let node = not(json!({
         "type": "predicate_or",
         "expressions": [
@@ -493,7 +456,7 @@ fn not_over_a_fully_translated_or_negates_every_branch() {
     let expected = Reference::new("amount")
         .greater_than_or_equal_to(Datum::long(10))
         .and(Reference::new("amount").less_than_or_equal_to(Datum::long(20)));
-    assert_eq!(translate_as_created(&node, &schema), Some(expected));
+    assert_eq!(translate(&node), Some(expected));
 }
 
 fn int_schema(fields: &[(i32, &str)]) -> Schema {

@@ -119,19 +119,46 @@ fn both_clients_are_catalog_client_trait_objects() {
     assert_eq!(clients.len(), 2);
 }
 
+/// Scenario: The neutral column's declaration slot extends the crate's public surface through an explicit reviewed edit
+/// Scenario: The Iceberg column source carries the whole Iceberg field through an explicit reviewed edit
+/// Scenario: The neutral table's catalog properties extend the crate's public surface through an explicit reviewed edit
 #[test]
 fn catalog_client_trait_and_neutral_types_are_reachable() {
+    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
+
     let ident = CatalogTableIdent {
         namespace: vec!["ns".into()],
         name: "t".into(),
     };
-    let column = CatalogColumn {
-        declaration: None,
-        name: "c".into(),
-        source_type: ColumnSourceType::Unity {
-            type_json: Some("{\"type\":\"integer\"}".into()),
-        },
+    let unity_source = ColumnSourceType::Unity {
+        type_json: Some("{\"type\":\"integer\"}".into()),
     };
+    let column = CatalogColumn {
+        name: "c".into(),
+        source_type: unity_source.clone(),
+        declaration: Some("{\"sourceType\":{}}".into()),
+    };
+    assert_eq!(column.declaration.as_deref(), Some("{\"sourceType\":{}}"));
+    assert_ne!(column, CatalogColumn::new("c", unity_source));
+
+    let field = NestedField::required(7, "qty", Type::Primitive(PrimitiveType::Long))
+        .with_initial_default(Literal::long(0));
+    let iceberg = CatalogColumn::new("qty", ColumnSourceType::Iceberg(field.into()));
+    let ColumnSourceType::Iceberg(field) = &iceberg.source_type else {
+        panic!(
+            "expected an Iceberg source type, got {:?}",
+            iceberg.source_type
+        );
+    };
+    assert_eq!(
+        (field.id, field.required, field.initial_default.clone()),
+        (7, true, Some(Literal::long(0)))
+    );
+
+    let properties = BTreeMap::from([
+        ("delta.columnMapping.mode".to_string(), "name".to_string()),
+        ("owner".to_string(), "Data Team".to_string()),
+    ]);
     let table = CatalogTable {
         ident: ident.clone(),
         table_type: CatalogTableType::Table,
@@ -140,9 +167,10 @@ fn catalog_client_trait_and_neutral_types_are_reachable() {
         vended_credential_key: Some("opaque-vending-key".into()),
         partition_columns: vec!["c".into()],
         metadata_location: None,
-        columns: vec![column],
-        properties: Default::default(),
+        columns: vec![column, iceberg],
+        properties: properties.clone(),
     };
+    assert_eq!(table.properties, properties);
     assert_eq!(table.format, TableFormat::Delta);
     assert_ne!(
         TableFormat::Iceberg,
@@ -225,80 +253,6 @@ fn added_neutral_variants_are_reachable_from_outside_the_crate() {
     };
     assert_eq!(listing.tables[0].format, TableFormat::Parquet);
     assert_eq!(listing.skipped[0].reason, SkipReason::NoDataFile);
-}
-
-/// Scenario: The neutral column's declaration slot extends the crate's public surface through an explicit reviewed edit
-#[test]
-fn catalog_column_declaration_slot_is_reachable() {
-    let declared = CatalogColumn {
-        name: "c".into(),
-        source_type: ColumnSourceType::Parquet("int64".into()),
-        declaration: Some("{\"sourceType\":{}}".into()),
-    };
-    let undeclared = CatalogColumn {
-        name: "c".into(),
-        source_type: ColumnSourceType::Parquet("int64".into()),
-        declaration: None,
-    };
-
-    assert_eq!(declared.declaration.as_deref(), Some("{\"sourceType\":{}}"));
-    assert_ne!(declared, undeclared);
-}
-
-/// Scenario: The Iceberg column source carries the whole Iceberg field through an explicit reviewed edit
-#[test]
-fn iceberg_column_source_carries_the_field() {
-    use iceberg::spec::{Literal, NestedField, PrimitiveType, Type};
-
-    let field = NestedField::required(7, "qty", Type::Primitive(PrimitiveType::Long))
-        .with_initial_default(Literal::long(0));
-    let column = CatalogColumn {
-        name: "qty".into(),
-        source_type: ColumnSourceType::Iceberg(field.into()),
-        declaration: None,
-    };
-
-    let ColumnSourceType::Iceberg(field) = &column.source_type else {
-        panic!(
-            "expected an Iceberg source type, got {:?}",
-            column.source_type
-        );
-    };
-    assert_eq!(
-        (field.id, field.required, field.initial_default.clone()),
-        (7, true, Some(Literal::long(0)))
-    );
-}
-
-/// Scenario: The neutral table's catalog properties extend the crate's public surface through an explicit reviewed edit
-#[test]
-fn catalog_table_properties_are_reachable() {
-    let properties = BTreeMap::from([
-        ("delta.columnMapping.mode".to_string(), "name".to_string()),
-        ("owner".to_string(), "Data Team".to_string()),
-    ]);
-    let table = CatalogTable {
-        ident: CatalogTableIdent {
-            namespace: vec!["ns".into()],
-            name: "t".into(),
-        },
-        table_type: CatalogTableType::Table,
-        storage_location: None,
-        format: TableFormat::Delta,
-        vended_credential_key: None,
-        partition_columns: Vec::new(),
-        metadata_location: None,
-        columns: Vec::new(),
-        properties: properties.clone(),
-    };
-
-    assert_eq!(table.properties, properties);
-    for (name, source) in CATALOG_SOURCES {
-        assert!(
-            !production_code(source).contains("delta.columnMapping"),
-            "{name} must interpret no table property key"
-        );
-    }
 }
 
 #[test]

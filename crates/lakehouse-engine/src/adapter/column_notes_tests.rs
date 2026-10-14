@@ -1,31 +1,5 @@
 use super::*;
-
-fn user_message(error: UdfError) -> String {
-    match error {
-        UdfError::User(message) => message,
-        other => panic!("expected a user error, got {other:?}"),
-    }
-}
-
-fn field(name: &str, arrow_type: &str) -> LogicalField {
-    LogicalField {
-        field_id: None,
-        name: name.to_string(),
-        arrow_type: arrow_type.to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }
-}
-
-fn declaration(field: LogicalField) -> ColumnDeclaration {
-    ColumnDeclaration {
-        source_type: field,
-        partition: None,
-        refused: None,
-    }
-}
+use crate::adapter::pushdown::test_support::{assert_mentions, nullable_field, user_message};
 
 fn declared_schema(columns: Vec<(&str, Option<String>)>) -> Result<DeclaredSchema, UdfError> {
     TableNotes {
@@ -38,22 +12,31 @@ fn declared_schema(columns: Vec<(&str, Option<String>)>) -> Result<DeclaredSchem
     .declared_schema()
 }
 
-fn encoded(declaration: &ColumnDeclaration) -> Option<String> {
+/// The encoded note of the `utf8` column `name`, at `partition` and refused for `refused`.
+fn note(name: &str, partition: Option<usize>, refused: Option<&str>) -> Option<String> {
+    let declaration = ColumnDeclaration {
+        source_type: nullable_field(name, "utf8"),
+        partition,
+        refused: refused.map(str::to_string),
+    };
+    Some(declaration.encode())
+}
+
+fn id_note() -> Option<String> {
+    let declaration = ColumnDeclaration {
+        source_type: nullable_field("id", "int64"),
+        partition: None,
+        refused: None,
+    };
     Some(declaration.encode())
 }
 
 #[test]
 fn partition_columns_are_ordered_by_their_recorded_position_not_by_column_order() {
-    let at = |name: &str, position: Option<usize>| {
-        encoded(&ColumnDeclaration {
-            partition: position,
-            ..declaration(field(name, "utf8"))
-        })
-    };
     let declared = declared_schema(vec![
-        ("REGION", at("region", Some(1))),
-        ("ID", at("id", None)),
-        ("YEAR", at("year", Some(0))),
+        ("REGION", note("region", Some(1), None)),
+        ("ID", note("id", None, None)),
+        ("YEAR", note("year", Some(0), None)),
     ])
     .unwrap();
 
@@ -69,7 +52,7 @@ fn partition_columns_are_ordered_by_their_recorded_position_not_by_column_order(
 /// Scenario: A column without a readable note fails the pushdown naming the fix
 #[test]
 fn missing_or_unreadable_note_names_table_column_and_refresh() {
-    let id = encoded(&declaration(field("id", "int64")));
+    let id = id_note();
     for (unreadable, cause) in [
         (None, "the column carries no note"),
         (Some("not json".to_string()), "expected ident at line 1"),
@@ -88,26 +71,30 @@ fn missing_or_unreadable_note_names_table_column_and_refresh() {
                 .expect_err("a column without a readable note must fail"),
         );
 
-        assert!(message.contains("SALES"), "{unreadable:?}: {message}");
-        assert!(message.contains("AMOUNT"), "{unreadable:?}: {message}");
-        assert!(
-            message.contains("missing or unreadable"),
-            "{unreadable:?}: {message}"
+        assert_mentions(
+            &message,
+            &[
+                "SALES",
+                "AMOUNT",
+                "missing or unreadable",
+                "ALTER VIRTUAL SCHEMA ... REFRESH",
+                cause,
+            ],
         );
-        assert!(
-            message.contains("ALTER VIRTUAL SCHEMA ... REFRESH"),
-            "{unreadable:?}: {message}"
-        );
-        assert!(message.contains(cause), "{unreadable:?}: {message}");
     }
 }
 
 #[test]
-fn encoder_refuses_a_note_over_the_limit_naming_table_and_column() {
+fn encoder_refuses_a_note_over_the_character_limit_naming_table_and_column() {
     let at_limit = "x".repeat(MAX_COLUMN_NOTE_CHARS);
     assert_eq!(
         checked_note("SALES", "WIDE", at_limit.clone()).unwrap(),
         at_limit
+    );
+    let two_byte_chars = "é".repeat(MAX_COLUMN_NOTE_CHARS);
+    assert!(
+        checked_note("SALES", "WIDE", two_byte_chars).is_ok(),
+        "the limit counts characters, not bytes"
     );
 
     let message = user_message(
@@ -115,16 +102,7 @@ fn encoder_refuses_a_note_over_the_limit_naming_table_and_column() {
             .expect_err("a note over the limit must fail"),
     );
 
-    assert!(message.contains("SALES"), "{message}");
-    assert!(message.contains("WIDE"), "{message}");
-    assert!(message.contains("2000001"), "{message}");
-    assert!(message.contains("2000000"), "{message}");
-}
-
-#[test]
-fn the_limit_counts_characters_not_bytes() {
-    let two_byte_chars = "é".repeat(MAX_COLUMN_NOTE_CHARS);
-    assert!(checked_note("SALES", "WIDE", two_byte_chars).is_ok());
+    assert_mentions(&message, &["SALES", "WIDE", "2000001", "2000000"]);
 }
 
 #[test]
@@ -137,27 +115,17 @@ fn binary_refusal_names_the_label_column_member_and_declared_type() {
     assert!(member.starts_with("Iceberg column 'doc', whose member 'doc.raw' has type 'binary'"));
 }
 
-fn refused(name: &str, reason: &str, partition: Option<usize>) -> Option<String> {
-    encoded(&ColumnDeclaration {
-        source_type: field(name, "utf8"),
-        partition,
-        refused: Some(reason.to_string()),
-    })
-}
-
 /// Scenario: A Delta table with no mappable column is refused as a whole
 #[test]
 fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {
-    let id = || ("ID", encoded(&declaration(field("id", "int64"))));
+    let id = || ("ID", id_note());
     let binary = || {
-        (
-            "BINARY_COL",
-            refused("binary_col", "binary is refused, see #351", None),
-        )
+        let reason = "binary is refused, see #351";
+        ("BINARY_COL", note("binary_col", None, Some(reason)))
     };
     let variant = (
         "VARIANT_COL",
-        refused("variant_col", "variant renders nothing", None),
+        note("variant_col", None, Some("variant renders nothing")),
     );
 
     declared_schema(vec![id(), binary()])
@@ -179,13 +147,16 @@ fn a_table_is_refused_as_a_whole_only_when_every_column_is_refused() {
 /// Scenario: The reader never infers partition columns from paths or partition metadata logging, and fails a plan whose partition column is refused
 #[test]
 fn a_refused_partition_column_fails_the_parse_naming_the_column_and_its_reason() {
-    let id = || ("ID", encoded(&declaration(field("id", "int64"))));
+    let id = || ("ID", id_note());
 
-    declared_schema(vec![id(), ("BLOB", refused("blob", "binary", None))])
+    declared_schema(vec![id(), ("BLOB", note("blob", None, Some("binary")))])
         .expect("a refused column outside the partition columns stays a column refusal");
     let message = user_message(
-        declared_schema(vec![id(), ("SHARD", refused("shard", "binary", Some(0)))])
-            .expect_err("the scan cannot materialize a refused partition column"),
+        declared_schema(vec![
+            id(),
+            ("SHARD", note("shard", Some(0), Some("binary"))),
+        ])
+        .expect_err("the scan cannot materialize a refused partition column"),
     );
 
     assert_eq!(

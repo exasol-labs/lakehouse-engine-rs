@@ -1,5 +1,5 @@
 use super::*;
-use crate::adapter::column_notes::TableNotes;
+use crate::adapter::column_notes::{DeclaredSchema, TableNotes};
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
 use lakehouse_catalog::{
@@ -56,7 +56,7 @@ fn request_target(head: &str) -> &str {
     head.split_whitespace().nth(1).unwrap_or("")
 }
 
-pub(super) struct RecordingCatalog {
+pub(crate) struct RecordingCatalog {
     pub(super) uri: String,
     requests: RecordedRequests,
 }
@@ -85,7 +85,7 @@ impl RecordingCatalog {
     }
 }
 /// No catalog auth, so a session issues no token-grant request.
-pub(super) fn unauthenticated_creds() -> ConnectionCreds {
+pub(crate) fn unauthenticated_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "wh".into(),
         endpoint: "http://minio:9000".into(),
@@ -108,15 +108,15 @@ pub(super) fn unauthenticated_creds() -> ConnectionCreds {
     }
 }
 
-pub(super) const ICEBERG_CONFIG_TARGET: &str = "/v1/config?warehouse=wh";
+pub(crate) const ICEBERG_CONFIG_TARGET: &str = "/v1/config?warehouse=wh";
 
-pub(super) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t";
+pub(crate) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t";
 
-pub(super) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
+pub(crate) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
 
 /// SigV4 mode lets `CatalogSession::resolve` build a session without contacting the catalog, so
 /// `loadTable` is a loopback catalog's only request.
-pub(super) fn sigv4_creds() -> ConnectionCreds {
+pub(crate) fn sigv4_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "123456789012".into(),
         endpoint: "http://minio:9000".into(),
@@ -129,15 +129,15 @@ pub(super) fn sigv4_creds() -> ConnectionCreds {
     }
 }
 
-pub(super) const SIGV4_SECRET_KEY: &str = "signing-secret-key";
+pub(crate) const SIGV4_SECRET_KEY: &str = "signing-secret-key";
 
 /// Closed port: a stray request fails with a transport error, distinct from every asserted refusal.
-pub(super) const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
+pub(crate) const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
 
 /// A `loadTable` body for a one-column table at `s3://bucket/db/t`, each `metadata` field
 /// replacing its default. No snapshot, so the empty scan reads no manifest and resolution stays
 /// offline.
-pub(super) fn load_table_body(metadata: Json) -> Json {
+pub(crate) fn load_table_body(metadata: Json) -> Json {
     let mut fields = serde_json::json!({
         "format-version": 2,
         "table-uuid": "00000000-0000-0000-0000-000000000003",
@@ -169,11 +169,11 @@ pub(super) fn load_table_body(metadata: Json) -> Json {
     })
 }
 
-pub(super) fn snapshotless_load_table_body(location: &str) -> String {
+pub(crate) fn snapshotless_load_table_body(location: &str) -> String {
     load_table_body(serde_json::json!({ "location": location })).to_string()
 }
 
-pub(super) fn load_table_body_with_columns(fields: Json, last_column_id: i32) -> String {
+pub(crate) fn load_table_body_with_columns(fields: Json, last_column_id: i32) -> String {
     load_table_body(serde_json::json!({
         "last-column-id": last_column_id,
         "schemas": [{"type": "struct", "schema-id": 0, "fields": fields}],
@@ -183,7 +183,7 @@ pub(super) fn load_table_body_with_columns(fields: Json, last_column_id: i32) ->
 
 /// Binary, fixed, and uuid columns at the top level and below a struct, list, and map, between
 /// the mappable `id` and `name`; the last column id is [`BINARY_ICEBERG_LAST_COLUMN_ID`].
-pub(super) fn binary_iceberg_fields() -> serde_json::Value {
+pub(crate) fn binary_iceberg_fields() -> serde_json::Value {
     serde_json::json!([
         {"id": 1, "name": "id", "required": false, "type": "int"},
         {"id": 2, "name": "b", "required": false, "type": "binary"},
@@ -204,16 +204,25 @@ pub(super) fn binary_iceberg_fields() -> serde_json::Value {
     ])
 }
 
-pub(super) const BINARY_ICEBERG_LAST_COLUMN_ID: i32 = 13;
+pub(crate) const BINARY_ICEBERG_LAST_COLUMN_ID: i32 = 13;
 
-pub(super) fn user_message(error: UdfError) -> String {
+pub(crate) fn user_message(error: UdfError) -> String {
     match error {
         UdfError::User(message) => message,
         other => panic!("expected UdfError::User, got {other:?}"),
     }
 }
 
-pub(super) fn assert_refuses_binary_col(error: UdfError) {
+pub(crate) fn assert_mentions(message: &str, fragments: &[&str]) {
+    for fragment in fragments {
+        assert!(
+            message.contains(fragment),
+            "'{fragment}' missing: {message}"
+        );
+    }
+}
+
+pub(crate) fn assert_refuses_binary_col(error: UdfError) {
     let message = user_message(error);
     assert!(
         message.contains("binary_col") && message.contains("#351"),
@@ -222,19 +231,70 @@ pub(super) fn assert_refuses_binary_col(error: UdfError) {
     );
 }
 
-pub(super) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
-    CatalogColumn {
-        declaration: None,
-        name: name.to_string(),
-        source_type: ColumnSourceType::Glue {
+pub(crate) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
+    CatalogColumn::new(
+        name,
+        ColumnSourceType::Glue {
             hive_type: hive_type.to_string(),
         },
+    )
+}
+
+/// A base for `..` struct update: the unpartitioned, columnless table `db.t` at `location`.
+pub(crate) fn catalog_table(format: TableFormat, location: &str) -> CatalogTable {
+    CatalogTable {
+        ident: CatalogTableIdent {
+            namespace: vec!["db".to_string()],
+            name: "t".to_string(),
+        },
+        table_type: CatalogTableType::Table,
+        storage_location: Some(location.to_string()),
+        format,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        columns: Vec::new(),
+        metadata_location: None,
+        properties: Default::default(),
     }
 }
 
-/// An unpartitioned Glue table `database.name` with no metadata location; `columns` pairs each
-/// name with its Hive type.
-pub(super) fn glue_catalog_table(
+/// The table `namespace.name` holding `columns`, at no storage location.
+pub(crate) fn named_table(
+    namespace: &[&str],
+    name: &str,
+    format: TableFormat,
+    columns: Vec<CatalogColumn>,
+) -> CatalogTable {
+    CatalogTable {
+        ident: CatalogTableIdent {
+            namespace: namespace.iter().map(|part| part.to_string()).collect(),
+            name: name.to_string(),
+        },
+        storage_location: None,
+        columns,
+        ..catalog_table(format, "")
+    }
+}
+
+pub(crate) fn iceberg_column(field: &iceberg::spec::NestedFieldRef) -> CatalogColumn {
+    CatalogColumn::new(
+        field.name.clone(),
+        ColumnSourceType::Iceberg(Arc::clone(field)),
+    )
+}
+
+/// The source of an optional Iceberg column `c` of the primitive type `primitive`.
+pub(crate) fn iceberg_source(primitive: iceberg::spec::PrimitiveType) -> ColumnSourceType {
+    let field =
+        iceberg::spec::NestedField::optional(1, "c", iceberg::spec::Type::Primitive(primitive));
+    ColumnSourceType::Iceberg(field.into())
+}
+
+pub(crate) fn unity_column(name: &str, type_json: Option<String>) -> CatalogColumn {
+    CatalogColumn::new(name, ColumnSourceType::Unity { type_json })
+}
+
+pub(crate) fn glue_catalog_table(
     database: &str,
     name: &str,
     format: TableFormat,
@@ -246,39 +306,24 @@ pub(super) fn glue_catalog_table(
             namespace: vec![database.to_string()],
             name: name.to_string(),
         },
-        table_type: CatalogTableType::Table,
-        storage_location: Some(location.to_string()),
-        format,
-        vended_credential_key: None,
-        partition_columns: Vec::new(),
-        metadata_location: None,
         columns: columns
             .iter()
             .map(|(name, hive_type)| glue_column(name, hive_type))
             .collect(),
-        properties: Default::default(),
+        ..catalog_table(format, location)
     }
 }
 
-/// What CREATE records for an Iceberg table whose current schema holds `fields`.
-pub(super) fn iceberg_notes(fields: &[iceberg::spec::NestedFieldRef]) -> Vec<(String, String)> {
-    let table = CatalogTable {
-        columns: fields
-            .iter()
-            .map(|field| CatalogColumn {
-                declaration: None,
-                name: field.name.clone(),
-                source_type: ColumnSourceType::Iceberg(Arc::clone(field)),
-            })
-            .collect(),
-        ..glue_catalog_table("db", "t", TableFormat::Iceberg, "s3://bucket/db/t", &[])
-    };
-    declared_notes(&table)
+pub(crate) fn iceberg_notes(fields: &[iceberg::spec::NestedFieldRef]) -> Vec<(String, String)> {
+    declared_notes(&CatalogTable {
+        columns: fields.iter().map(iceberg_column).collect(),
+        ..catalog_table(TableFormat::Iceberg, "s3://bucket/db/t")
+    })
 }
 
 /// What CREATE records for every column of `table`: its Exasol name and note, through the real
 /// `declare_columns`.
-pub(super) fn declared_notes(table: &CatalogTable) -> Vec<(String, String)> {
+pub(crate) fn declared_notes(table: &CatalogTable) -> Vec<(String, String)> {
     let notes = declare_columns(table);
     table
         .columns
@@ -292,26 +337,39 @@ pub(super) fn declared_notes(table: &CatalogTable) -> Vec<(String, String)> {
 }
 
 /// The notes CREATE records for the current schema of a `loadTable` `body`.
-pub(super) fn load_table_body_notes(body: &Json) -> Vec<(String, String)> {
+pub(crate) fn load_table_body_notes(body: &Json) -> Vec<(String, String)> {
     let metadata: iceberg::spec::TableMetadata =
         serde_json::from_value(body["metadata"].clone()).expect("the body's metadata decodes");
     iceberg_notes(metadata.current_schema().as_struct().fields())
 }
 
-/// The logical schema CREATE declares for `schema`, refused columns included.
-pub(super) fn declared_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
-    iceberg_notes(schema.as_struct().fields())
+pub(crate) fn declared_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
+    let notes = iceberg_notes(schema.as_struct().fields());
+    decoded_notes(&notes)
         .into_iter()
-        .map(|(_, note)| {
-            serde_json::from_str::<crate::adapter::column_notes::ColumnDeclaration>(&note)
-                .expect("a declared note decodes")
-                .source_type
-        })
+        .map(|declaration| declaration.source_type)
         .collect()
 }
 
+/// Each of `notes` decoded back into the declaration CREATE encoded.
+pub(crate) fn decoded_notes(
+    notes: &[(String, String)],
+) -> Vec<crate::adapter::column_notes::ColumnDeclaration> {
+    notes
+        .iter()
+        .map(|(_, note)| serde_json::from_str(note).expect("a declared note decodes"))
+        .collect()
+}
+
+/// The declaration CREATE records for each column of `table`.
+pub(crate) fn declared_columns(
+    table: &CatalogTable,
+) -> Vec<crate::adapter::column_notes::ColumnDeclaration> {
+    decoded_notes(&declared_notes(table))
+}
+
 /// A nullable, unbound field of the given Arrow tag.
-pub(super) fn nullable_field(name: &str, arrow_type: &str) -> LogicalField {
+pub(crate) fn nullable_field(name: &str, arrow_type: &str) -> LogicalField {
     LogicalField {
         field_id: None,
         name: name.to_string(),
@@ -323,8 +381,21 @@ pub(super) fn nullable_field(name: &str, arrow_type: &str) -> LogicalField {
     }
 }
 
+/// The refusal a `label` table records for the binary `column`, at `member_path` when nested.
+pub(crate) fn binary_refused(
+    label: &str,
+    column: &str,
+    member_path: Option<&str>,
+    declared: &str,
+) -> RefusedColumn {
+    RefusedColumn {
+        column_name: column.to_string(),
+        reason: crate::adapter::column_notes::binary_refusal(label, column, member_path, declared),
+    }
+}
+
 /// `notes` as the columns of the involved table `table` in a pushdown request.
-pub(super) fn involved_notes<'a>(table: &'a str, notes: &'a [(String, String)]) -> TableNotes<'a> {
+pub(crate) fn involved_notes<'a>(table: &'a str, notes: &'a [(String, String)]) -> TableNotes<'a> {
     TableNotes {
         table,
         columns: notes
@@ -336,19 +407,43 @@ pub(super) fn involved_notes<'a>(table: &'a str, notes: &'a [(String, String)]) 
 
 /// What the resolver answers for `reader` over the table `notes` declare: the one parse, the
 /// reader's files for that declaration, and the one assembly.
-pub(super) async fn resolve_from_notes(
+pub(crate) async fn resolve_from_notes(
     reader: &dyn FormatReader,
     notes: &TableNotes<'_>,
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
-    let declared = notes.declared_schema()?;
-    let planned = reader.resolve_scan(&declared, filter_json).await?;
-    Ok(ResolvedScan::new(declared, planned))
+    ResolvedScan::resolve(reader, notes.declared_schema()?, filter_json).await
+}
+
+/// [`resolve_from_notes`] over the notes CREATE records for `table`, involved as `name`.
+pub(crate) async fn resolve_declared(
+    reader: &dyn FormatReader,
+    name: &str,
+    table: &CatalogTable,
+    filter_json: Option<&Json>,
+) -> Result<ResolvedScan, UdfError> {
+    let notes = declared_notes(table);
+    resolve_from_notes(reader, &involved_notes(name, &notes), filter_json).await
+}
+
+/// The declaration the pushdown parses from the notes CREATE records for `table`.
+pub(crate) fn declared_schema_of(table: &CatalogTable) -> DeclaredSchema {
+    let notes = declared_notes(table);
+    involved_notes(&table.ident.name.to_uppercase(), &notes)
+        .declared_schema()
+        .expect("CREATE's notes parse")
+}
+
+/// The declaration of a table whose involved columns carry no note.
+pub(crate) fn no_notes() -> DeclaredSchema {
+    TableNotes::default()
+        .declared_schema()
+        .expect("an empty declaration parses")
 }
 
 /// `request` with the note CREATE writes on every involved column for an optional Iceberg `long`
 /// field numbered by its position, for requests that plan no data file.
-pub(super) fn with_iceberg_notes(mut request: Json) -> Json {
+pub(crate) fn with_iceberg_notes(mut request: Json) -> Json {
     use iceberg::spec::{NestedField, PrimitiveType, Type};
     let tables = request["involvedTables"]
         .as_array_mut()
@@ -365,9 +460,7 @@ pub(super) fn with_iceberg_notes(mut request: Json) -> Json {
     request
 }
 
-/// A Unity Catalog Delta table whose columns' `type_json` are `fields` and whose `properties` set
-/// `delta.columnMapping.mode` to `mode` when present.
-pub(super) fn unity_delta_table(
+pub(crate) fn unity_delta_table(
     fields: &[delta_kernel::schema::StructField],
     mode: Option<&str>,
     partitions: &[&str],
@@ -377,32 +470,36 @@ pub(super) fn unity_delta_table(
             namespace: vec!["cat".into(), "sch".into()],
             name: "t".into(),
         },
-        table_type: CatalogTableType::Table,
-        storage_location: Some("s3://bucket/t".into()),
-        format: TableFormat::Delta,
-        vended_credential_key: None,
         partition_columns: partitions.iter().map(|name| name.to_string()).collect(),
         columns: fields
             .iter()
-            .map(|field| CatalogColumn {
-                declaration: None,
-                name: field.name().clone(),
-                source_type: ColumnSourceType::Unity {
-                    type_json: Some(serde_json::to_string(field).expect("a field serializes")),
-                },
+            .map(|field| {
+                let type_json = serde_json::to_string(field).expect("a field serializes");
+                unity_column(field.name(), Some(type_json))
             })
             .collect(),
-        metadata_location: None,
         properties: mode
             .map(|mode| ("delta.columnMapping.mode".to_string(), mode.to_string()))
             .into_iter()
             .collect(),
+        ..catalog_table(TableFormat::Delta, "s3://bucket/t")
     }
+}
+
+/// The pairs a reader hands the Delta translator for a table without column mapping: every
+/// column of `schema` under its own name.
+pub(crate) fn by_name(
+    schema: &delta_kernel::schema::StructType,
+) -> Vec<(&str, &delta_kernel::schema::StructField)> {
+    schema
+        .fields()
+        .map(|field| (field.name().as_str(), field))
+        .collect()
 }
 
 /// What CREATE records for a Delta table without column mapping whose nullable columns are the
 /// `(name, delta_type)` pairs [`fileless_delta_commit`] logs, partitioned by `partitions`.
-pub(super) fn delta_notes(columns: &[(&str, &str)], partitions: &[&str]) -> Vec<(String, String)> {
+pub(crate) fn delta_notes(columns: &[(&str, &str)], partitions: &[&str]) -> Vec<(String, String)> {
     let fields: Vec<delta_kernel::schema::StructField> = columns
         .iter()
         .map(|(name, delta_type)| {
@@ -417,7 +514,7 @@ pub(super) fn delta_notes(columns: &[(&str, &str)], partitions: &[&str]) -> Vec<
 
 /// `request` with each column of its involved table `table` carrying the note `notes` holds
 /// under the column's name.
-pub(super) fn with_notes(mut request: Json, table: &str, notes: &[(String, String)]) -> Json {
+pub(crate) fn with_notes(mut request: Json, table: &str, notes: &[(String, String)]) -> Json {
     let tables = request["involvedTables"]
         .as_array_mut()
         .into_iter()
@@ -434,8 +531,18 @@ pub(super) fn with_notes(mut request: Json, table: &str, notes: &[(String, Strin
     request
 }
 
+/// [`with_notes`] carrying the [`delta_notes`] of `columns` partitioned by `partitions`.
+pub(crate) fn with_delta_notes(
+    request: Json,
+    table: &str,
+    columns: &[(&str, &str)],
+    partitions: &[&str],
+) -> Json {
+    with_notes(request, table, &delta_notes(columns, partitions))
+}
+
 /// No storage location, so the Delta reader refuses before reaching any object store.
-pub(super) fn locationless_delta_table_body() -> String {
+pub(crate) fn locationless_delta_table_body() -> String {
     serde_json::json!({
         "name": "orders",
         "table_type": "MANAGED",
@@ -446,7 +553,7 @@ pub(super) fn locationless_delta_table_body() -> String {
     .to_string()
 }
 
-pub(super) async fn unity_delta_catalog() -> RecordingCatalog {
+pub(crate) async fn unity_delta_catalog() -> RecordingCatalog {
     RecordingCatalog::spawn(|target| match target.rsplit_once('.') {
         Some((_, name)) if !name.is_empty() => (
             200,
@@ -465,7 +572,7 @@ pub(super) async fn unity_delta_catalog() -> RecordingCatalog {
     .await
 }
 
-pub(super) fn fileless_delta_commit(id: &str, columns: &[(&str, &str)]) -> String {
+pub(crate) fn fileless_delta_commit(id: &str, columns: &[(&str, &str)]) -> String {
     fileless_delta_commit_with_protocol(
         id,
         columns,
@@ -473,7 +580,7 @@ pub(super) fn fileless_delta_commit(id: &str, columns: &[(&str, &str)]) -> Strin
     )
 }
 
-pub(super) fn fileless_delta_commit_with_protocol(
+pub(crate) fn fileless_delta_commit_with_protocol(
     id: &str,
     columns: &[(&str, &str)],
     protocol: Json,
@@ -498,18 +605,18 @@ pub(super) fn fileless_delta_commit_with_protocol(
     format!("{protocol}\n{metadata}\n")
 }
 
-pub(super) fn delta_commit_zero_key(name: &str) -> String {
+pub(crate) fn delta_commit_zero_key(name: &str) -> String {
     format!("{name}/_delta_log/00000000000000000000.json")
 }
 
 /// Served over HTTP because `read_delta_log` builds its own store from the
 /// storage backend, so no injected store is reachable. Data-file reads 404;
 /// plan-time resolution performs none.
-pub(super) async fn delta_object_endpoint(objects: Vec<(String, String)>) -> StorageBackend {
+pub(crate) async fn delta_object_endpoint(objects: Vec<(String, String)>) -> StorageBackend {
     object_endpoint("bucket", objects).await
 }
 
-pub(super) async fn object_endpoint(
+pub(crate) async fn object_endpoint(
     bucket: &str,
     objects: Vec<(String, String)>,
 ) -> StorageBackend {
@@ -518,7 +625,7 @@ pub(super) async fn object_endpoint(
 
 /// Serves each `(key, body)` of `bucket` path-style, listing as S3's `ListObjectsV2` does; any
 /// other key is absent.
-pub(super) struct ObjectEndpoint {
+pub(crate) struct ObjectEndpoint {
     pub(super) storage: StorageBackend,
     requests: RecordedRequests,
 }
@@ -586,7 +693,7 @@ fn query_param(query: &str, key: &str) -> String {
         .unwrap_or_default()
 }
 
-pub(super) struct GlueEndpoint {
+pub(crate) struct GlueEndpoint {
     pub(super) address: String,
     requests: RecordedRequests,
 }
@@ -709,7 +816,7 @@ fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -
     )
 }
 
-pub(super) async fn delta_pushdown(
+pub(crate) async fn delta_pushdown(
     request: &Json,
     catalog_uri: &str,
     storage: StorageBackend,
@@ -735,7 +842,7 @@ pub(super) async fn delta_pushdown(
     .await
 }
 
-pub(super) async fn iceberg_catalog() -> RecordingCatalog {
+pub(crate) async fn iceberg_catalog() -> RecordingCatalog {
     RecordingCatalog::spawn(|target| {
         if target.starts_with("/v1/config") {
             return (200, "{}".to_string());
@@ -751,12 +858,12 @@ pub(super) async fn iceberg_catalog() -> RecordingCatalog {
     .await
 }
 
-pub(super) const TEST_CONNECTION_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
+pub(crate) const TEST_CONNECTION_NAME: &str = "LAKEHOUSE_CATALOG_CREDS";
 
-pub(super) const TEST_CONNECTION_PASSWORD: &str =
+pub(crate) const TEST_CONNECTION_PASSWORD: &str =
     r#"{"warehouse":"wh","secret_key":"FIXTURESECRET"}"#;
 
-pub(super) fn test_sealing_key() -> SealedStorageKey {
+pub(crate) fn test_sealing_key() -> SealedStorageKey {
     derive_sealed_storage_key(TEST_CONNECTION_PASSWORD)
 }
 
@@ -773,10 +880,10 @@ fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
     }
 }
 
-pub(super) static TEST_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
+pub(crate) static TEST_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
     std::sync::LazyLock::new(|| test_connection(unauthenticated_creds()));
 
-pub(super) static TEST_VENDED_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
+pub(crate) static TEST_VENDED_CONNECTION: std::sync::LazyLock<ResolvedConnectionConfig> =
     std::sync::LazyLock::new(|| {
         test_connection(ConnectionCreds {
             use_vended_credentials: true,
@@ -784,14 +891,14 @@ pub(super) static TEST_VENDED_CONNECTION: std::sync::LazyLock<ResolvedConnection
         })
     });
 
-pub(super) fn sample_scan_storage() -> ScanStorage {
+pub(crate) fn sample_scan_storage() -> ScanStorage {
     ScanStorage::Connection {
         name: TEST_CONNECTION_NAME.to_string(),
         allow_http: true,
     }
 }
 
-pub(super) fn sample_storage() -> StorageBackend {
+pub(crate) fn sample_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://minio:9000".into(),
         region: "us-east-1".into(),
@@ -802,11 +909,11 @@ pub(super) fn sample_storage() -> StorageBackend {
     })
 }
 
-pub(super) const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
-pub(super) const SENTINEL_SECRET_KEY: &str = "sentinel-secret-value-0002";
+pub(crate) const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
+pub(crate) const SENTINEL_SECRET_KEY: &str = "sentinel-secret-value-0002";
 
 /// Sentinel credentials on a closed loopback port; `path_style` keeps `object_store` off real AWS.
-pub(super) fn closed_port_storage() -> StorageBackend {
+pub(crate) fn closed_port_storage() -> StorageBackend {
     StorageBackend::S3(StorageProps {
         endpoint: "http://127.0.0.1:1".into(),
         region: "us-east-1".into(),
@@ -819,7 +926,7 @@ pub(super) fn closed_port_storage() -> StorageBackend {
 }
 
 /// Mirrors `handle_pushdown`'s post-resolution SQL assembly, single shard.
-pub(super) fn build_sql_for_fixture(
+pub(crate) fn build_sql_for_fixture(
     files: Vec<String>,
     proj_cols: Vec<String>,
     proj_types: Vec<String>,
@@ -829,7 +936,7 @@ pub(super) fn build_sql_for_fixture(
     build_sql_for_fixture_n(files, proj_cols, proj_types, filter, limit, 1)
 }
 
-pub(super) fn build_sql_for_fixture_n(
+pub(crate) fn build_sql_for_fixture_n(
     files: Vec<String>,
     proj_cols: Vec<String>,
     proj_types: Vec<String>,
@@ -875,7 +982,7 @@ pub(super) fn build_sql_for_fixture_n(
 }
 
 /// Assumes the common JSON contains no single quote, true for these fixtures.
-pub(super) fn common_arg_literal(sql: &str) -> &str {
+pub(crate) fn common_arg_literal(sql: &str) -> &str {
     let start = sql.find('\'').expect("SQL must contain a literal") + 1;
     let rest = &sql[start..];
     let end = rest.find('\'').expect("common literal must be closed");
@@ -883,7 +990,7 @@ pub(super) fn common_arg_literal(sql: &str) -> &str {
 }
 
 /// Paren-balanced: declared types like `DECIMAL(20,0)` carry their own parentheses.
-pub(super) fn emits_clause(sql: &str) -> &str {
+pub(crate) fn emits_clause(sql: &str) -> &str {
     let open = sql.find("EMITS (").expect("SQL must carry an EMITS clause") + "EMITS ".len();
     let mut depth = 0usize;
     for (offset, ch) in sql[open..].char_indices() {
@@ -903,7 +1010,7 @@ pub(super) fn emits_clause(sql: &str) -> &str {
 
 /// A visible select list never contains ` FROM (`, so the first occurrence is the
 /// wrapper's own. Panics when the SQL carries no wrapper.
-pub(super) fn outer_select_list(sql: &str) -> &str {
+pub(crate) fn outer_select_list(sql: &str) -> &str {
     let list = sql
         .strip_prefix("SELECT ")
         .expect("SQL must start with SELECT");
@@ -913,7 +1020,7 @@ pub(super) fn outer_select_list(sql: &str) -> &str {
     &list[..end]
 }
 
-pub(super) fn nq4_request() -> Json {
+pub(crate) fn nq4_request() -> Json {
     serde_json::json!({
         "involvedTables": [{
             "name": "LINEITEM",
@@ -943,13 +1050,13 @@ pub(super) fn nq4_request() -> Json {
     })
 }
 
-pub(super) fn pd(request: &Json) -> Json {
+pub(crate) fn pd(request: &Json) -> Json {
     request.get("pushdownRequest").cloned().unwrap()
 }
 
 /// Runs the same `relativize_shards_to_root` stripping as `handle_pushdown`, so
 /// per-shard paths match production.
-pub(super) fn build_row_sql_with_root(
+pub(crate) fn build_row_sql_with_root(
     files: Vec<(String, u64)>,
     table_root: &str,
     proj_cols: Vec<String>,
@@ -992,7 +1099,7 @@ pub(super) fn build_row_sql_with_root(
     )
 }
 
-pub(super) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_json::Value {
+pub(crate) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_json::Value {
     let mut args = serde_json::json!([]);
     if let Some(c) = col {
         args = serde_json::json!([{"type": "column", "name": c}]);
@@ -1005,14 +1112,14 @@ pub(super) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_j
     })
 }
 
-pub(super) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
+pub(crate) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
     DeleteMechanism::IcebergPositionalDelete {
         path: path.into(),
         size,
     }
 }
 
-pub(super) fn agg_item_expr(
+pub(crate) fn agg_item_expr(
     name: &str,
     arg: serde_json::Value,
     distinct: bool,

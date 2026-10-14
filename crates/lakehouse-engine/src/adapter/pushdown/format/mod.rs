@@ -95,8 +95,18 @@ pub struct ResolvedScan {
 }
 
 impl ResolvedScan {
+    /// Plans `reader`'s files against `declared`, the table's parsed column notes.
+    pub async fn resolve(
+        reader: &dyn FormatReader,
+        declared: DeclaredSchema,
+        filter_json: Option<&Json>,
+    ) -> Result<Self, UdfError> {
+        let planned = reader.resolve_scan(&declared, filter_json).await?;
+        Ok(Self::new(declared, planned))
+    }
+
     /// The schema half comes from the column notes alone, so no reader can substitute its own.
-    pub fn new(declared: DeclaredSchema, planned: PlannedFiles) -> Self {
+    fn new(declared: DeclaredSchema, planned: PlannedFiles) -> Self {
         Self {
             files: planned.files,
             effective_storage: planned.effective_storage,

@@ -249,13 +249,12 @@ fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat)
 }
 
 fn neutral_column(column: ColumnInfo) -> CatalogColumn {
-    CatalogColumn {
-        declaration: None,
-        name: column.name,
-        source_type: ColumnSourceType::Unity {
+    CatalogColumn::new(
+        column.name,
+        ColumnSourceType::Unity {
             type_json: column.type_json,
         },
-    }
+    )
 }
 
 fn neutral_table_type(raw: &str) -> CatalogTableType {

@@ -302,30 +302,13 @@ fn iceberg_all_types_declare_and_return_their_mapped_values() {
 fn iceberg_binary_column_note_records_the_refusal() {
     setup_e2e();
     let mut conn = exa_conn();
-    let table = E2E_ALL_TYPES_TABLE.to_uppercase();
-
-    let notes = column_adapter_notes(&mut conn, VS_NAME, &table);
-    let refusal = note_of(&notes, "C_BINARY")["refused"]
-        .as_str()
-        .unwrap_or_else(|| panic!("C_BINARY's note records its refusal: {notes:?}"))
-        .to_string();
-
-    assert!(
-        refusal.contains("'c_binary'") && refusal.contains("type 'binary'"),
-        "{refusal}"
-    );
-    assert!(note_of(&notes, "ID").get("refused").is_none(), "{notes:?}");
-    assert_eq!(
-        declared_type(&mut conn, VS_NAME, &table, "C_BINARY"),
-        VARCHAR_JSON,
-        "the refused column stays declared"
-    );
-    assert_query_fails(
+    assert_refused_column(
         &mut conn,
-        &format!("SELECT C_BINARY FROM {VS_NAME}.{table}"),
-        &[&refusal],
+        VS_NAME,
+        &E2E_ALL_TYPES_TABLE.to_uppercase(),
+        "C_BINARY",
+        &["'c_binary'", "type 'binary'"],
     );
-    conn.query_columns(&format!("SELECT ID FROM {VS_NAME}.{table}"));
 }
 
 /// Scenario: Filter predicate restricts the emitted rows
@@ -2671,10 +2654,7 @@ fn e2e_range_filter_prunes_by_file_bounds() {
         allow_http: true,
     };
     // Filter columns resolve through the field ids CREATE declared, as in a pushdown.
-    let persisted = persisted_column_notes(&mut exa_conn(), VS_NAME, "REGIONS");
-    let declared = involved_notes("REGIONS", &persisted)
-        .declared_schema()
-        .expect("the persisted notes parse");
+    let declared = declared_schema_of(&mut exa_conn(), VS_NAME, "REGIONS");
     let reader = format_reader(
         ScanSource::Iceberg {
             session: &session,

@@ -1,9 +1,9 @@
 use super::super::{RefusedColumn, ResolvedScan};
 use super::*;
-use crate::adapter::column_notes::{TableNotes, binary_refusal};
+use crate::adapter::column_notes::TableNotes;
 use crate::adapter::parquet_directory::MergeMode;
 use crate::adapter::pushdown::test_support::filter_json::{column, compare, equal, number};
-use crate::adapter::pushdown::test_support::{resolve_from_notes, sample_storage};
+use crate::adapter::pushdown::test_support::{binary_refused, resolve_from_notes, sample_storage};
 use crate::adapter::tests::parquet_fixture::{
     directory_options, enumerated_notes, in_memory_store, nullable, parquet_bytes,
     parquet_footer_bytes,
@@ -243,7 +243,6 @@ async fn file_entry_paths_round_trip_to_the_listed_object() {
     );
 }
 
-/// Scenario: MERGE_SCHEMA selects one footer or every footer at enumeration
 #[tokio::test]
 async fn merge_mode_decides_the_declared_columns_at_enumeration() {
     let store = two_depth_directory().await;
@@ -472,10 +471,8 @@ async fn each_binary_column_is_refused_by_name_and_an_enum_column_reads_as_text(
         scan.logical_schema[2].arrow_type, "utf8",
         "a top-level ENUM is read as its UTF-8 text"
     );
-    let refused = |column: &str, member_path, declared| RefusedColumn {
-        column_name: column.to_string(),
-        reason: binary_refusal("Parquet", column, member_path, declared),
-    };
+    let refused =
+        |column, member_path, declared| binary_refused("Parquet", column, member_path, declared);
     let nested_enum = refused("e", Some("e.k"), "enum");
     assert_eq!(
         scan.refused_columns,
