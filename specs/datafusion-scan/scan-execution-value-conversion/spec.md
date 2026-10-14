@@ -82,3 +82,12 @@ to `scan-types/type-mapping`.
 * *AND* a column already of the required Arrow type SHALL be passed through unchanged, on the zero-copy fast path
 * *AND* the UDF SHALL fail the call, and MUST NOT emit the batch, when `output_column_count()` does not equal the batch's column count, naming both counts, or when `output_column(i)` returns an error for a column the batch carries, naming `i`
 * *AND* the UDF MUST NOT fall back to a spec-carried or source-derived type in either failure case, because an absent declaration is drift rather than a legacy spec
+
+### Scenario: A DATE value outside Exasol's DATE range fails the query
+
+* *GIVEN* a table whose `date` column holds a value outside Exasol's DATE range of 0001-01-01 to 9999-12-31, which Iceberg, Delta, and Parquet can store because they keep a date as a 32-bit day count from 1970-01-01
+* *WHEN* a query emits that value as a row, as a `MIN` or `MAX` result, or as a `GROUP BY` key
+* *THEN* the query MUST fail with an error that names the output column and the stored day count
+* *AND* the scan MUST NOT return a substitute value, such as 1970-01-01, in place of the stored value
+* *AND* a query whose emitted dates all lie inside the range, including 0001-01-01 and 9999-12-31, SHALL return them unchanged
+* *AND* a query that tests the value in a filter without emitting it SHALL NOT fail with this error
