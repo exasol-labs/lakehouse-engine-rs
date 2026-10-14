@@ -107,7 +107,7 @@ and drives the DataFusion target-partitions / threads-per-UDF defaults from it; 
 tables (`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 8) drive the `GROUP BY
 shard_key` fan-out. In docker mode, `LH_EXASOL_CPUSET` pins the Exasol container to a CPU
 set (for example `0-1`), and the adapter detects exactly that set, so it is the lever for
-the detected core count. Name CPUs the host actually has: Docker rejects a cpuset naming an
+the detected core count. Unset, the container uses every host CPU. Name CPUs the host actually has: Docker rejects a cpuset naming an
 absent CPU. Remote mode has no equivalent lever: the detected core count there is the real
 cluster node's core count. See `../CLAUDE.md` for the engine memory/fan-out model.
 
