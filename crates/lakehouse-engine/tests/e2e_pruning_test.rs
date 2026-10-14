@@ -10,6 +10,7 @@ use common::e2e_harness::{
 };
 use common::pruning_cases::{
     Format, VS_HIVE, VS_ICEBERG, assert_cases_hold, assert_one_shaped_file_per_label,
+    assert_single_group_aggregates_match_oracle,
 };
 use common::pruning_fixture::{
     PRUNING_FILES, PRUNING_HIVE_BASE, PRUNING_NAMESPACE, PRUNING_TABLE, hive_object_uri,
@@ -104,4 +105,24 @@ fn iceberg_pruning_keeps_every_file_with_a_matching_row() {
 fn hive_partition_pruning_keeps_every_file_with_a_matching_row() {
     setup();
     assert_cases_hold(&mut exa_conn(), Format::Hive);
+}
+
+/// Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result
+/// Scenario: A single-group request that does not decompose routes to the qualified wrapper
+/// Scenario: Single-group HAVING is applied on every path
+/// Scenario: A fully-pruned file list yields one shape-correct empty row for a scalar-over-aggregate select list
+#[test]
+fn iceberg_single_group_aggregates_match_the_oracle() {
+    setup();
+    assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Iceberg);
+}
+
+/// Scenario: Aggregate without GROUP BY with all files pruned returns the native empty-set result
+/// Scenario: A single-group request that does not decompose routes to the qualified wrapper
+/// Scenario: Single-group HAVING is applied on every path
+/// Scenario: A fully-pruned file list yields one shape-correct empty row for a scalar-over-aggregate select list
+#[test]
+fn hive_single_group_aggregates_match_the_oracle() {
+    setup();
+    assert_single_group_aggregates_match_oracle(&mut exa_conn(), Format::Hive);
 }

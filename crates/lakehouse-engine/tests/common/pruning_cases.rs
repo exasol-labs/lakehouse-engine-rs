@@ -361,3 +361,137 @@ pub fn assert_cases_hold(conn: &mut ExaConn, format: Format) {
         failures.join("\n")
     );
 }
+
+const NO_ROW_SCANNED: &str = "ABS(ID) > 1000";
+const ROWS_SCANNED: &str = "S IS NULL";
+
+const SINGLE_GROUP_SELECTS: &[&str] = &[
+    "COUNT(*)",
+    "COUNT(*), SUM(ID)",
+    "ROUND(SUM(ID), 2), COUNT(*)",
+    "'X', COUNT(*)",
+    "COUNT(*), 'X'",
+    "1, SUM(ID)",
+    "SUM(S)",
+    "VARIANCE(S)",
+    "STDDEV(ID * 2)",
+    "COUNT(*), STDDEV(ID * 2)",
+    "1",
+];
+
+const JOIN_SELECTS: &[&str] = &["COUNT(*), 'X'", "SUM(B.S)"];
+
+const HAVINGS: &[&str] = &[
+    "",
+    " HAVING COUNT(*) = 0",
+    " HAVING COUNT(*) > 0",
+    " HAVING SUM(ID) > 0",
+];
+
+impl Format {
+    fn prunes_every_file(self) -> &'static [&'static str] {
+        match self {
+            Format::Iceberg | Format::Delta => &["P = 'zz'", "K > 1000"],
+            Format::Hive => &["P = 'zz'"],
+        }
+    }
+}
+
+fn typed_rows(conn: &mut ExaConn, sql: &str) -> (Vec<serde_json::Value>, Vec<Vec<String>>) {
+    let resp = conn.execute(sql);
+    let result_set = &resp["responseData"]["results"][0]["resultSet"];
+    let types = result_set["columns"]
+        .as_array()
+        .map(|columns| columns.iter().map(|c| c["dataType"].clone()).collect())
+        .unwrap_or_default();
+    let columns = conn.fetch_result_columns(result_set);
+    let row_count = columns.first().map_or(0, Vec::len);
+    let mut rows: Vec<Vec<String>> = (0..row_count)
+        .map(|row| {
+            columns
+                .iter()
+                .map(|col| value_to_string(&col[row]))
+                .collect()
+        })
+        .collect();
+    rows.sort();
+    (types, rows)
+}
+
+fn oracle_mismatch(conn: &mut ExaConn, query: &str, format: Format) -> Option<String> {
+    let actual = typed_rows(conn, &query.replace("{T}", &format.table()));
+    let expected = typed_rows(conn, &query.replace("{T}", PRUNING_ORACLE_TABLE));
+    (actual != expected).then(|| format!("`{query}`: got {actual:?}, the oracle {expected:?}"))
+}
+
+fn path_mismatch(conn: &mut ExaConn, query: &str, format: Format, pruned: bool) -> Option<String> {
+    let plan = isolated_pushdown_statement(conn, &query.replace("{T}", &format.table()));
+    (plan.contains(SCAN_SCRIPT_NAME) == pruned).then(|| {
+        format!("`{query}` must scan exactly when files remain (pruned: {pruned}): {plan}")
+    })
+}
+
+const SINGLE_GROUP_SHAPES: &[(&str, bool)] = &[
+    (
+        "SELECT COUNT(*), SUM(ID) FROM {T} WHERE {F} HAVING SUM(ID) > 0",
+        true,
+    ),
+    (
+        "SELECT COUNT(*) FROM {T} WHERE {F} HAVING SUM(ID) > 0",
+        false,
+    ),
+    ("SELECT 'X', COUNT(*) FROM {T} WHERE {F}", false),
+    ("SELECT 1 FROM {T} WHERE {F} HAVING COUNT(*) > 0", false),
+];
+
+fn shape_mismatch(conn: &mut ExaConn, query: &str, format: Format, split: bool) -> Option<String> {
+    let plan = isolated_pushdown_statement(conn, &query.replace("{T}", &format.table()));
+    let holds = if split {
+        plan.contains("PARTIAL_") && plan.contains(" HAVING ")
+    } else {
+        plan.contains(&format!("AS \"{OUTER_WHERE_ALIAS}\"")) && !plan.contains("PARTIAL_")
+    };
+    (!holds).then(|| format!("`{query}` took the wrong path (split: {split}): {plan}"))
+}
+
+pub fn assert_single_group_aggregates_match_oracle(conn: &mut ExaConn, format: Format) {
+    let pruned = format.prunes_every_file().iter().map(|f| (*f, true));
+    let scanned = [(NO_ROW_SCANNED, false), (ROWS_SCANNED, false)];
+    let mut failures = Vec::new();
+    for (query, split) in SINGLE_GROUP_SHAPES {
+        let query = query.replace("{F}", ROWS_SCANNED);
+        failures.extend(shape_mismatch(conn, &query, format, *split));
+    }
+    for (filter, pruned) in pruned.chain(scanned) {
+        let probe = format!("SELECT COUNT(*), 'X' FROM {{T}} WHERE {filter}");
+        failures.extend(path_mismatch(conn, &probe, format, pruned));
+        for having in HAVINGS {
+            for select in SINGLE_GROUP_SELECTS {
+                let query = format!("SELECT {select} FROM {{T}} WHERE {filter}{having}");
+                failures.extend(oracle_mismatch(conn, &query, format));
+            }
+        }
+    }
+    for filter in format.prunes_every_file() {
+        let join = format!("FROM {{T}} A JOIN {{T}} B ON A.ID = B.ID WHERE A.{filter}");
+        failures.extend(path_mismatch(
+            conn,
+            &format!("SELECT COUNT(*) {join}"),
+            format,
+            true,
+        ));
+        for having in HAVINGS {
+            let having = having.replace("(ID)", "(A.ID)");
+            for select in JOIN_SELECTS {
+                let query = format!("SELECT {select} {join}{having}");
+                failures.extend(oracle_mismatch(conn, &query, format));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "{} single-group queries failed:\n{}",
+        failures.len(),
+        failures.join("\n")
+    );
+}

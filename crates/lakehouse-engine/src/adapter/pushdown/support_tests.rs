@@ -934,7 +934,7 @@ fn build_agg_sql(
 }
 
 #[test]
-fn aggregate_merge_renders_request_limit_when_some() {
+fn aggregate_merge_renders_having_then_request_limit() {
     let plans = vec![AggregatePlan {
         kind: AggKind::Count,
         column: None,
@@ -951,7 +951,8 @@ fn aggregate_merge_renders_request_limit_when_some() {
     };
     let shards = vec![vec![("s3://warehouse/f0.parquet".to_string(), 1u64)]];
     let merge_inputs = AggregateMergeInputs::new(Vec::new(), merge_select, Some(0))
-        .expect("a bare-aggregate merge SELECT is never empty");
+        .expect("a bare-aggregate merge SELECT is never empty")
+        .with_having(Some("(1 > 0)".to_string()));
     let sql = build_scan_driving_sql(
         &spec_template,
         &shards,
@@ -963,10 +964,7 @@ fn aggregate_merge_renders_request_limit_when_some() {
         SCAN_UDF_NAME,
         DISTRIBUTE_FILES_UDF_NAME,
     );
-    assert!(
-        sql.ends_with("LIMIT 0"),
-        "aggregate merge must render the request LIMIT: {sql}"
-    );
+    assert!(sql.ends_with(") HAVING (1 > 0) LIMIT 0"), "{sql}");
 }
 
 #[test]

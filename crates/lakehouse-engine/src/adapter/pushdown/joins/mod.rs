@@ -22,7 +22,7 @@ pub(crate) use planning::{
 };
 pub(crate) use sql_builders::{RenderedJoinPushdown, render_broadcast_join};
 
-pub(super) use sql_builders::qualified_single_table_fallback_pushdown;
+pub(super) use sql_builders::{EmptyRelation, qualified_single_table_fallback_pushdown};
 #[cfg(test)]
 pub(super) use sql_builders::{
     FanOutProjection, build_qualified_single_table_fallback_sql, referenced_column_projection,
@@ -176,7 +176,14 @@ pub(super) async fn plan_join(
     if sides.iter().any(|s| s.files.is_empty()) {
         let combined = side_columns.concat();
         let (proj_cols, proj_types, widened) = project_columns(pushdown_req, combined.clone())?;
-        return empty_result_sql(pushdown_req, &proj_cols, &proj_types, widened, &combined);
+        return empty_result_sql(
+            pushdown_req,
+            &proj_cols,
+            &proj_types,
+            widened,
+            &combined,
+            &EmptyRelation::join(join, side_columns),
+        );
     }
 
     let udf_name = qualify_udf(scan_schema, SCAN_UDF_NAME);

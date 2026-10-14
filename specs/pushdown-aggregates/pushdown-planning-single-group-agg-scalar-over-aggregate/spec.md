@@ -191,7 +191,7 @@ the scalar-wrapper shape.
 * *THEN* the scalar-over-aggregate classification SHALL decline and the adapter SHALL route the request to the qualified single-table wrapper — the same wrapper the grouped decline (`pushdown-grouped-agg/pushdown-planning-grouped-agg-wrapper-fallback`) and the multi-`DISTINCT` single-group decline (`pushdown-aggregates/pushdown-planning-single-group-agg`) already use — whose own rendered SQL computes the whole select list as native Exasol SQL over a materialized sharded raw scan narrowed to the referenced columns
 * *AND* the adapter MUST NOT emit the item as a per-shard projection expression, and MUST NOT return a bare row scan whose column count or column types differ from `selectListDataTypes` (`sqlCode 04000`), because Exasol never re-aggregates a declined pushdown
 * *AND* the decline SHALL hold on the BROADCAST-JOIN path too, where the widened projection is a plain reason the broadcast plan is unavailable — the broadcast planner declining cleanly rather than erroring, so the request falls through to the unaccelerated N-scan fallback that renders the select list natively — because a single-group aggregation over a join is not recognised as carrying an aggregation clause when its only aggregate is nested inside a scalar wrapper
-* *AND* the decline SHALL hold on the EMPTY-RESULT path, where every data file is pruned, so the zero-row response carries one column per `selectList` item typed from `selectListDataTypes` rather than the full base row
+* *AND* the decline SHALL hold on the EMPTY-RESULT path, where every data file is pruned, so the response is the single-group empty shape (`file-planning/pushdown-planning-empty-result`) rather than the full base row
 * *AND* the returned result SHALL equal the same select list evaluated on a single node for every one of those shapes
 
 ### Scenario: A fully-pruned file list yields one shape-correct empty row for a scalar-over-aggregate select list
@@ -199,10 +199,8 @@ the scalar-wrapper shape.
 * *GIVEN* an ungrouped `pushdown` request carrying a decomposable scalar-over-aggregate select item — for example `SELECT ROUND(SUM(L_QUANTITY), 2), COUNT(*) FROM LINEITEM WHERE L_QUANTITY < -1`
 * *AND* file pruning eliminates every data file, so there is nothing to scan
 * *WHEN* the adapter builds the empty-result response
-* *THEN* the response SHALL be ONE row — matching the non-empty single-group shape, which always returns exactly one row — with one column per `selectList` item in select-list order, and MUST NOT be the zero-row grouped shape or the full base row
-* *AND* the scalar-over-aggregate column SHALL be the zero-row value of that item cast to the item's own declared type through the shared declared-type CAST helper, so it emits a bare uncast value when that declared type is the `VARCHAR(2000000)` default
+* *THEN* the response SHALL be the single-group empty shape (`file-planning/pushdown-planning-empty-result`): ONE row with one column per `selectList` item in select-list order, each item evaluated by Exasol over the empty set, and MUST NOT be the zero-row grouped shape or the full base row
 * *AND* the empty response SHALL reference no scan and no merge UDF, because with zero files there is nothing to scan or merge
-* *AND* the empty and non-empty column shapes MUST NOT diverge in count, order, or declared type, since both are validated positionally against the same `selectListDataTypes`
 
 ### Scenario: The scalar-over-aggregate decomposition mechanism has ONE owner shared by both aggregate planners
 
