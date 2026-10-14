@@ -32,29 +32,30 @@ The difference also reaches results built on the converted text:
 
 ## Dates outside Exasol's DATE range
 
-Iceberg, Delta, and Parquet store a date as a 32-bit day count from 1970-01-01, so a table can hold
-a date outside Exasol's DATE range of 0001-01-01 to 9999-12-31. A native Exasol table cannot hold
-such a date. A query fails when the scan passes such a date to Exasol. The error names the output
-column and the stored day count, for example:
+Iceberg, Delta, and Parquet can store dates outside Exasol's DATE range (0001-01-01 to
+9999-12-31), for example year 275760. A native Exasol table cannot hold such a date.
+
+A query fails if the scan would hand such a date to Exasol, whether in a plain column, a `MIN` or
+`MAX` result, a `GROUP BY` key, or `COUNT(DISTINCT)`. The error names the column and the stored day
+count:
 
 ```
 DATE value out of range in output column STORED_DATE: 100000000 days from 1970-01-01 lies outside Exasol's DATE range 0001-01-01 to 9999-12-31
 ```
 
-This covers a plain column, a `MIN` or `MAX` result, and a `GROUP BY` key. On a `MIN`, `MAX`, or
-`GROUP BY` the column name is the partial output column the scan declares (`PARTIAL_max_0`,
-`PARTIAL_min_0`, `GK_0`), not the column in the query. Dates inside the range, including 0001-01-01
-and 9999-12-31, are returned unchanged.
+For `MIN`, `MAX`, and `GROUP BY` the column name is the scan's internal name (`PARTIAL_max_0`,
+`PARTIAL_min_0`, `GK_0`), not the column in your query.
 
-A query fails even when it does not return the value, if the scan passes the value to Exasol:
-`SELECT COUNT(DISTINCT STORED_DATE) FROM t` fails, because each shard passes its distinct dates to
-Exasol to count. A query that evaluates the value inside the scan does not fail. In the following
-results, row 4 of the test table holds 100000000 days (year 275760) and row 5 holds 2932897 days (10000-01-01):
+**Workaround:** filter the bad rows out in the query, because the scan applies the filter before it
+hands rows to Exasol:
 
-| Query | Virtual schema result |
-|---|---|
-| `SELECT ID FROM t WHERE STORED_DATE > DATE '9999-12-31' ORDER BY ID` | Rows 4 and 5 |
-| `SELECT ID, YEAR(STORED_DATE) FROM t WHERE ID = 4` | `NULL` for the year |
-| `SELECT COUNT(*) FROM t WHERE STORED_DATE > DATE '9999-12-31'` | 2 |
+```sql
+SELECT ID, STORED_DATE FROM t
+WHERE STORED_DATE BETWEEN DATE '0001-01-01' AND DATE '9999-12-31';
+```
 
-Native Exasol cannot evaluate these queries, because it cannot hold the stored value.
+To find the offending rows, select a column other than the date:
+
+```sql
+SELECT ID FROM t WHERE STORED_DATE > DATE '9999-12-31' OR STORED_DATE < DATE '0001-01-01';
+```
