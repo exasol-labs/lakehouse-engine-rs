@@ -1734,7 +1734,7 @@ fn stat_aggregates_match_native_exasol() {
         assert_eq!(conn.query_row_count(&sql), rows, "{sql}");
         assert_matches_native(&mut conn, select, &tail, keys, 0.0);
     }
-    // docs/semantic-differences.md: about 9 digits when the mean is 1e8 times the deviation.
+    // Double precision loses digits when the mean is 1e8 times the deviation.
     assert_matches_native(
         &mut conn,
         "G, VAR_POP(E), STDDEV_SAMP(E)",

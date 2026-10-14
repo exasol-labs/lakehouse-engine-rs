@@ -13,7 +13,7 @@ A per-shard `SUM(x * x)` overflows integer columns, and the merge `sumsq - sum²
 
 ### Decision
 
-Each shard emits its count, its mean, and its sum of squared deviations from that mean. The wrapper merges them with Chan's parallel formula around a grand mean shifted by one shard's mean. Results may differ from native Exasol's exact DECIMAL computation within the bound that `docs/semantic-differences.md` states.
+Each shard emits its count, its mean, and its sum of squared deviations from that mean. The wrapper merges them with Chan's parallel formula around a grand mean shifted by one shard's mean. Results may be less precise than native Exasol's exact DECIMAL computation, as `docs/semantic-differences.md` documents.
 
 ### Options Considered
 
