@@ -8,7 +8,7 @@
 
 ### Context
 
-A pushed-down `LIKE` over a non-string column fails in DataFusion, which does not coerce to VARCHAR as Exasol does (issue #207). The `LIKE` subject carries no type on the wire, and `vs-expression` is a stateless translator shared with a sibling project, so it cannot see column types.
+A pushed-down `LIKE` over a non-string column fails in DataFusion, which does not coerce to VARCHAR as Exasol does (issue #207). The `LIKE` subject carries no type on the wire, and `vs-expression` is a stateless translator, so it cannot see column types.
 
 ### Decision
 
@@ -18,7 +18,7 @@ The adapter rewrites or declines a `LIKE` filter using its column-type map befor
 
 | Option | Verdict |
 |--------|---------|
-| Handle types inside `vs-expression` | Rejected: it has no column-type context and is shared |
+| Handle types inside `vs-expression` | Rejected: it has no column-type context |
 
 ### Consequences
 
