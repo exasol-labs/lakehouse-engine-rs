@@ -1,6 +1,6 @@
 use super::*;
 use crate::test_support::*;
-use iceberg::spec::{PrimitiveType, Type};
+use iceberg::spec::{NestedField, PrimitiveType, Type};
 use std::sync::{Arc, Mutex};
 
 struct FixedCatalogClient;
@@ -18,10 +18,14 @@ impl FixedCatalogClient {
             vended_credential_key: None,
             partition_columns: Vec::new(),
             metadata_location: None,
-            columns: vec![CatalogColumn {
-                name: "order_id".to_string(),
-                source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
-            }],
+            columns: vec![CatalogColumn::new(
+                "order_id",
+                ColumnSourceType::Iceberg(
+                    NestedField::required(1, "order_id", Type::Primitive(PrimitiveType::Long))
+                        .into(),
+                ),
+            )],
+            properties: Default::default(),
         }
     }
 
@@ -37,10 +41,11 @@ impl FixedCatalogClient {
             vended_credential_key: Some("payments-uuid".to_string()),
             partition_columns: Vec::new(),
             metadata_location: None,
-            columns: vec![CatalogColumn {
-                name: "total".to_string(),
-                source_type: ColumnSourceType::Unity { type_json: None },
-            }],
+            columns: vec![CatalogColumn::new(
+                "total",
+                ColumnSourceType::Unity { type_json: None },
+            )],
+            properties: Default::default(),
         }
     }
 }
@@ -186,10 +191,10 @@ async fn an_iceberg_column_carries_its_iceberg_source_type() {
     let column = &listing.tables[0].columns[0];
 
     assert_eq!(column.name, "order_id");
-    assert_eq!(
-        column.source_type,
-        ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long))
-    );
+    let ColumnSourceType::Iceberg(field) = &column.source_type else {
+        panic!("an Iceberg column: {column:?}");
+    };
+    assert_eq!(*field.field_type, Type::Primitive(PrimitiveType::Long));
 }
 
 #[derive(Default)]
@@ -443,16 +448,21 @@ async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
         vended_credential_key: None,
         partition_columns: Vec::new(),
         columns: vec![
-            CatalogColumn {
-                name: "id".to_string(),
-                source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
-            },
-            CatalogColumn {
-                name: "name".to_string(),
-                source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::String)),
-            },
+            CatalogColumn::new(
+                "id",
+                ColumnSourceType::Iceberg(
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                ),
+            ),
+            CatalogColumn::new(
+                "name",
+                ColumnSourceType::Iceberg(
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ),
+            ),
         ],
         metadata_location: None,
+        properties: Default::default(),
     };
     assert_eq!(listing.tables, vec![expected.clone()]);
     assert_eq!(loaded, expected);

@@ -1,10 +1,12 @@
 use super::super::super::test_support::{
-    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields, glue_catalog_table,
-    load_table_body, load_table_body_with_columns, object_endpoint, sample_storage, sigv4_creds,
-    user_message,
+    BINARY_ICEBERG_LAST_COLUMN_ID, RecordingCatalog, binary_iceberg_fields, binary_refused,
+    declared_logical_schema, glue_catalog_table, involved_notes, load_table_body,
+    load_table_body_notes, load_table_body_with_columns, object_endpoint, resolve_from_notes,
+    sample_storage, sigv4_creds, user_message,
 };
-use super::super::binary_refusal;
+use super::super::ResolvedScan;
 use super::*;
+use crate::adapter::column_notes::TableNotes;
 use iceberg::spec::{DataContentType, DataFileFormat};
 use lakehouse_catalog::{ConnectionCreds, StorageBackend, TableFormat};
 
@@ -22,7 +24,8 @@ fn name_mapped_load_table_body() -> Json {
     }))
 }
 
-/// Plans `table` through a loopback REST catalog that answers every request with `body`.
+/// Plans `table` through a loopback REST catalog that answers every request with `body`, from the
+/// notes CREATE recorded when the table's current schema was `body`'s.
 async fn resolve_rest(
     body: String,
     table: &str,
@@ -30,6 +33,7 @@ async fn resolve_rest(
     storage: &StorageBackend,
     filter_json: Option<&Json>,
 ) -> Result<ResolvedScan, UdfError> {
+    let notes = load_table_body_notes(&serde_json::from_str(&body).expect("a JSON body"));
     let catalog = RecordingCatalog::spawn(move |_target| (200, body.clone())).await;
     let session = CatalogSession::resolve(&catalog.uri, &creds.warehouse, creds)
         .await
@@ -38,7 +42,7 @@ async fn resolve_rest(
         warehouse: creds.warehouse.clone(),
         table: table.into(),
     };
-    IcebergFormatReader {
+    let reader = IcebergFormatReader {
         metadata: IcebergMetadataSource::RestLoadTable {
             session: &session,
             catalog_props: &catalog_props,
@@ -48,9 +52,8 @@ async fn resolve_rest(
             creds,
             allow_http: true,
         },
-    }
-    .resolve_scan(filter_json)
-    .await
+    };
+    resolve_from_notes(&reader, &involved_notes("T", &notes), filter_json).await
 }
 
 #[tokio::test]
@@ -675,6 +678,7 @@ async fn a_promoted_date_table_is_refused_filtered_or_not_and_from_either_metada
     .await;
     let promoted = resolve_metadata_file(
         &glue_iceberg_table("promoted", Some(&format!("s3://bucket/{metadata_file}"))),
+        &TableNotes::default(),
         &storage,
     )
     .await
@@ -697,18 +701,18 @@ fn glue_iceberg_table(name: &str, metadata_location: Option<&str>) -> CatalogTab
 
 async fn resolve_metadata_file(
     table: &CatalogTable,
+    notes: &TableNotes<'_>,
     storage: &StorageBackend,
 ) -> Result<ResolvedScan, UdfError> {
-    IcebergFormatReader {
+    let reader = IcebergFormatReader {
         metadata: IcebergMetadataSource::MetadataFile { table },
         connection: ConnectionStorage {
             storage,
             creds: &sigv4_creds(),
             allow_http: true,
         },
-    }
-    .resolve_scan(None)
-    .await
+    };
+    resolve_from_notes(&reader, notes, None).await
 }
 
 /// Scenario: A Glue Iceberg table is planned from its metadata location by the one Iceberg planner
@@ -724,8 +728,10 @@ async fn a_glue_iceberg_table_is_planned_from_its_metadata_file() {
         .await
         .expect("the REST planner resolves the table");
 
+    let notes = load_table_body_notes(&body);
     let from_file = resolve_metadata_file(
         &glue_iceberg_table("t", Some("s3://bucket/db/t/metadata/v1.json")),
+        &involved_notes("T", &notes),
         &storage,
     )
     .await
@@ -753,15 +759,20 @@ async fn an_unreadable_or_unset_metadata_location_fails_naming_the_table() {
     let missing = user_message(
         resolve_metadata_file(
             &glue_iceberg_table("gone", Some("s3://bucket/db/gone/metadata/v9.json")),
+            &TableNotes::default(),
             &storage,
         )
         .await
         .expect_err("an unreadable metadata file fails the plan"),
     );
     let unset = user_message(
-        resolve_metadata_file(&glue_iceberg_table("unset", None), &storage)
-            .await
-            .expect_err("a table without a metadata location fails the plan"),
+        resolve_metadata_file(
+            &glue_iceberg_table("unset", None),
+            &TableNotes::default(),
+            &storage,
+        )
+        .await
+        .expect_err("a table without a metadata location fails the plan"),
     );
 
     assert!(
@@ -853,7 +864,7 @@ async fn iceberg_binary_fixed_and_uuid_columns_are_refused_and_an_all_binary_tab
         vec![("id", Some(1)), ("name", Some(13))],
         "every refused column is dropped from the logical schema, and nothing else"
     );
-    let refused = |column, member, declared| binary_refusal("Iceberg", column, member, declared);
+    let refused = |column, member, declared| binary_refused("Iceberg", column, member, declared);
     assert_eq!(
         resolved.refused_columns,
         vec![
@@ -877,7 +888,7 @@ async fn iceberg_binary_fixed_and_uuid_columns_are_refused_and_an_all_binary_tab
         .expect_err("a table with no mappable column cannot be scanned")
         .to_string();
     assert!(
-        message.contains("Iceberg table has no mappable column"),
+        message.contains("virtual table 'T' has no mappable column"),
         "{message}"
     );
 }
@@ -929,7 +940,7 @@ fn nested_iceberg_fields_stay_utf8_tagged_and_carry_a_nested_descriptor() {
         .build()
         .expect("well-formed nested schema builds");
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
 
     assert_eq!(logical[0].arrow_type, "int32");
     assert_eq!(
@@ -984,4 +995,48 @@ fn nested_iceberg_fields_stay_utf8_tagged_and_carry_a_nested_descriptor() {
         }),
         "a list of structs recurses into the element's own struct descriptor"
     );
+}
+
+fn long_schema(fields: &[(i32, &str, bool)]) -> iceberg::spec::Schema {
+    use iceberg::spec::{NestedField, PrimitiveType, Type};
+    iceberg::spec::Schema::builder()
+        .with_fields(fields.iter().map(|&(id, name, required)| {
+            std::sync::Arc::new(NestedField::new(
+                id,
+                name,
+                Type::Primitive(PrimitiveType::Long),
+                required,
+            ))
+        }))
+        .build()
+        .expect("a valid schema")
+}
+
+#[test]
+fn relaxed_nullability_is_matched_by_declared_field_id() {
+    let declared = DeclaredSchema {
+        table: "ORDERS".into(),
+        logical_schema: declared_logical_schema(&long_schema(&[
+            (2, "qty", true),
+            (3, "note", false),
+        ])),
+        partition_columns: vec![],
+        refused_columns: vec![],
+    };
+
+    let tightened_and_renamed =
+        long_schema(&[(2, "amount", true), (3, "note", true), (4, "qty", false)]);
+    refuse_relaxed_nullability(&tightened_and_renamed, &declared).expect(
+        "field id 2 is still required, the optional `qty` is field id 4, and a tightened \
+         column loses no row",
+    );
+
+    let relaxed = long_schema(&[(2, "amount", false), (3, "note", true)]);
+    let message = user_message(
+        refuse_relaxed_nullability(&relaxed, &declared)
+            .expect_err("a stale non-nullable declaration would drop NULL rows silently"),
+    );
+    for fragment in ["'QTY'", "'ORDERS'", "ALTER VIRTUAL SCHEMA ... REFRESH"] {
+        assert!(message.contains(fragment), "{message}");
+    }
 }

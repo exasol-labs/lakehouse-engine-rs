@@ -107,6 +107,18 @@ fn block_on_fixture<F: std::future::Future>(future: F) -> F::Output {
         .block_on(future)
 }
 
+/// Removes the object at `uri`; an absent object counts as removed, so a fixture can reset a
+/// leftover of an earlier run.
+pub fn delete_fixture_object(uri: &str) {
+    let (bucket, key) = split_s3_bucket_and_key(uri);
+    let store = local_stack_s3_store(bucket);
+    let path = ObjectStorePath::parse(key).unwrap_or_else(|e| panic!("fixture key {key}: {e}"));
+    match block_on_fixture(store.delete(&path)) {
+        Ok(()) | Err(object_store::Error::NotFound { .. }) => {}
+        Err(e) => panic!("DELETE fixture object at {uri}: {e}"),
+    }
+}
+
 /// Keys the object verbatim so `region=a%2Fb` stays literal, as Spark writes it.
 pub async fn put_object(store: &impl ObjectStore, key: &str, bytes: Bytes) -> anyhow::Result<()> {
     let path = ObjectStorePath::parse(key)
@@ -125,15 +137,6 @@ pub fn delete_fixture_prefix(uri: &str) {
     let store = local_stack_s3_store(bucket);
     block_on_fixture(delete_objects_under(&store, key))
         .unwrap_or_else(|e| panic!("DELETE fixture objects under {uri}: {e:#}"));
-}
-
-pub fn delete_fixture_object(uri: &str) {
-    let (bucket, key) = split_s3_bucket_and_key(uri);
-    let store = local_stack_s3_store(bucket);
-    let path = ObjectStorePath::parse(key)
-        .unwrap_or_else(|e| panic!("fixture key of {uri} is not a valid object path: {e}"));
-    block_on_fixture(store.delete(&path))
-        .unwrap_or_else(|e| panic!("DELETE fixture object at {uri}: {e:#}"));
 }
 
 async fn delete_objects_under(store: &impl ObjectStore, key: &str) -> anyhow::Result<()> {

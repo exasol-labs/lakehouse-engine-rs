@@ -113,8 +113,9 @@ async fn first_level_directories_are_the_tables() {
     }
 }
 
+/// Scenario: A table's columns and data files come from the one shared directory seam
 #[tokio::test]
-async fn columns_and_files_come_from_the_shared_seam() {
+async fn columns_carry_tag_and_declaration_from_one_fold() {
     let nested = Fields::from(vec![Field::new("x", DataType::Int32, true)]);
     let data = parquet_bytes(
         vec![
@@ -126,7 +127,7 @@ async fn columns_and_files_come_from_the_shared_seam() {
     let inner = in_memory_store(&[
         ("lake/orders/part-0.parquet", &data),
         ("lake/orders/2026/part-1.parquet", &data),
-        ("lake/orders/region=us/part-2.parquet", &data),
+        ("lake/orders/region=us/month=09/part-2.parquet", &data),
         // Objects the shared seam's own filter excludes: a marker file and a hidden Parquet file.
         ("lake/orders/_SUCCESS", b""),
         ("lake/orders/.hidden.parquet", b""),
@@ -145,7 +146,7 @@ async fn columns_and_files_come_from_the_shared_seam() {
     let names: Vec<&str> = table.columns.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(
         names,
-        vec!["id", "tags", "region"],
+        vec!["id", "tags", "region", "month"],
         "folded columns, then partition columns"
     );
     assert_eq!(
@@ -153,14 +154,14 @@ async fn columns_and_files_come_from_the_shared_seam() {
         ColumnSourceType::Parquet("int64".to_string())
     );
     assert_eq!(
-        table.columns[2].source_type,
-        ColumnSourceType::Parquet("utf8".to_string()),
-        "partition column is utf8"
-    );
-    assert_eq!(
         table.columns[1].source_type,
         ColumnSourceType::Parquet("utf8".to_string()),
         "a nested column is substituted to the JSON-string tag before it is rendered"
+    );
+    assert_eq!(
+        table.columns[2].source_type,
+        ColumnSourceType::Parquet("utf8".to_string()),
+        "partition column is utf8"
     );
 }
 
@@ -248,8 +249,9 @@ async fn new_derives_the_store_prefix_from_the_base_path() {
     );
 }
 
+/// Scenario: MERGE_SCHEMA selects one footer or every footer at enumeration
 #[tokio::test]
-async fn merge_mode_selects_every_footer_or_exactly_one() {
+async fn merge_schema_selects_footers_at_enumeration_only() {
     let files = ["lake/orders/part-0.parquet", "lake/orders/part-1.parquet"];
 
     for (merge_mode, expected) in [
@@ -290,7 +292,6 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
         &(Arc::clone(&inner) as Arc<dyn ObjectStore>),
         &StorePath::from("lake/events"),
         FOLD_NO_HIVE,
-        &|_| true,
     )
     .await
     .expect("the fixture directory folds");
@@ -314,6 +315,7 @@ async fn a_non_utc_timezone_column_is_declared_at_its_normalized_tag() {
     );
 }
 
+/// Scenario: HIVE_PARTITIONING decides the declared partition columns at enumeration
 #[tokio::test]
 async fn hive_partitioning_reaches_the_seam_on_enumeration() {
     let inner: Arc<dyn ObjectStore> = id_files_at(&["lake/sales/year=2026/part-0.parquet"]).await;

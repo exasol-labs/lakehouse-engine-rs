@@ -11,10 +11,10 @@ use serde_json::Value as Json;
 
 use super::{ConnectionStorage, ResolvedScan, ScanSource, format_reader};
 use crate::adapter::catalog_kind::CatalogKind;
+use crate::adapter::column_notes::TableNotes;
 use crate::adapter::direct_storage_properties::{
     join_storage_path, resolve_direct_storage_properties,
 };
-use crate::adapter::parquet_directory::DirectoryOptions;
 use crate::adapter::permission::PermissionCheck;
 use crate::scan::{build_admission_limited_store, store_root_url};
 
@@ -62,7 +62,6 @@ enum RequestSession {
     DirectStorage {
         store: Arc<dyn ObjectStore>,
         base_path: String,
-        options: DirectoryOptions,
     },
 }
 
@@ -131,11 +130,9 @@ impl<'a> TableScanResolver<'a> {
                     &store_root_url(&properties.base_path)?,
                     &connection.storage.secret_values(),
                 )?;
-                let options = properties.directory_options();
                 RequestSession::DirectStorage {
                     store,
                     base_path: properties.base_path,
-                    options,
                 }
             }
         };
@@ -151,75 +148,58 @@ impl<'a> TableScanResolver<'a> {
     }
 
     /// `table_identifier` is the original-cased `TABLE_MAP` identifier. `filter_json`
-    /// is forwarded unchanged for format-side pruning. `declared_columns` is read only
-    /// by a format whose pruning can drop every file carrying a column.
+    /// is forwarded unchanged for format-side pruning. `notes` are the involved table's raw
+    /// column notes, parsed here once for every format before any table is loaded.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
         filter_json: Option<&Json>,
-        declared_columns: &[(String, String)],
+        notes: &TableNotes<'_>,
     ) -> Result<ResolvedScan, UdfError> {
         self.admission.admit(table_identifier)?;
-        match &self.session {
+        let declared = notes.declared_schema()?;
+        // Each source borrows what its arm loads, so those values outlive the match.
+        let (catalog_props, table, table_root);
+        let source = match &self.session {
             RequestSession::Iceberg(session) => {
-                let catalog_props = CatalogProps {
+                catalog_props = CatalogProps {
                     warehouse: self.connection.creds.warehouse.clone(),
                     table: table_identifier.to_string(),
                 };
-                let reader = format_reader(
-                    ScanSource::Iceberg {
-                        session,
-                        catalog_props: &catalog_props,
-                    },
-                    &self.connection,
-                )?;
-                reader.resolve_scan(filter_json).await
+                ScanSource::Iceberg {
+                    session,
+                    catalog_props: &catalog_props,
+                }
             }
             RequestSession::Unity(session) => {
-                let table = session
+                table = session
                     .load_table(&unity_table_ident(table_identifier)?)
                     .await?;
-                let reader = format_reader(
-                    ScanSource::Unity {
-                        session: session.as_ref(),
-                        table: &table,
-                    },
-                    &self.connection,
-                )?;
-                reader.resolve_scan(filter_json).await
+                ScanSource::Unity {
+                    session: session.as_ref(),
+                    table: &table,
+                }
             }
             RequestSession::Glue(session) => {
-                let table = session
+                table = session
                     .load_table(&parse_glue_table_ident(table_identifier)?)
                     .await?;
-                let reader = format_reader(
-                    ScanSource::Glue {
-                        session: session.as_ref(),
-                        table: &table,
-                    },
-                    &self.connection,
-                )?;
-                reader.resolve_scan(filter_json).await
+                ScanSource::Glue {
+                    session: session.as_ref(),
+                    table: &table,
+                }
             }
-            RequestSession::DirectStorage {
-                store,
-                base_path,
-                options,
-            } => {
-                let table_root =
+            RequestSession::DirectStorage { store, base_path } => {
+                table_root =
                     join_storage_path(base_path, Some(direct_storage_directory(table_identifier)?));
-                let reader = format_reader(
-                    ScanSource::DirectParquet {
-                        store,
-                        table_root: &table_root,
-                        options: *options,
-                        declared_columns,
-                    },
-                    &self.connection,
-                )?;
-                reader.resolve_scan(filter_json).await
+                ScanSource::DirectParquet {
+                    store,
+                    table_root: &table_root,
+                }
             }
-        }
+        };
+        let reader = format_reader(source, &self.connection)?;
+        ResolvedScan::resolve(reader.as_ref(), declared, filter_json).await
     }
 }
 

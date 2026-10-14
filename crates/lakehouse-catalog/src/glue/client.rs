@@ -306,14 +306,17 @@ fn planned_table(
         columns: columns
             .iter()
             .chain(partition_keys)
-            .map(|column| CatalogColumn {
-                name: column.name().to_string(),
-                source_type: ColumnSourceType::Glue {
-                    hive_type: column.r#type().unwrap_or_default().to_string(),
-                },
+            .map(|column| {
+                CatalogColumn::new(
+                    column.name(),
+                    ColumnSourceType::Glue {
+                        hive_type: column.r#type().unwrap_or_default().to_string(),
+                    },
+                )
             })
             .collect(),
         metadata_location,
+        properties: BTreeMap::new(),
     })
 }
 

@@ -12,10 +12,9 @@ use lakehouse_catalog::{
 };
 use serde_json::Value as Json;
 
-use super::{
-    ConnectionStorage, FormatReader, RefusedColumn, ResolvedScan, binary_refusal,
-    without_refused_columns,
-};
+use super::{ConnectionStorage, FormatReader, PlannedFiles};
+use crate::adapter::column_notes::{ColumnDeclaration, DeclaredSchema, binary_refusal};
+use crate::adapter::iceberg_predicate::to_iceberg_predicate;
 use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{
     DeleteMechanism, FileEntry, LogicalField, NameMappingEntry, NestedField, NestedMembers,
@@ -25,6 +24,7 @@ use crate::scan::spec::{
 #[path = "iceberg_tests.rs"]
 mod tests;
 
+/// Current metadata serves only snapshot, files, mapping, and the checks of the declaration.
 pub(super) struct IcebergFormatReader<'a> {
     pub(super) metadata: IcebergMetadataSource<'a>,
     pub(super) connection: ConnectionStorage<'a>,
@@ -57,8 +57,9 @@ struct CheckedMetadata {
 impl FormatReader for IcebergFormatReader<'_> {
     fn resolve_scan<'a>(
         &'a self,
+        declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<ResolvedScan, UdfError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
         Box::pin(async move {
             let checked = match self.metadata {
                 IcebergMetadataSource::RestLoadTable {
@@ -69,7 +70,9 @@ impl FormatReader for IcebergFormatReader<'_> {
                     file_metadata(table, self.connection.storage).await?
                 }
             };
-            plan_checked_table(checked, filter_json).await
+            let current = checked.metadata.current_schema();
+            refuse_relaxed_nullability(current, declared)?;
+            plan_checked_table(checked, &declared.logical_schema, filter_json).await
         })
     }
 }
@@ -170,12 +173,32 @@ fn checked_table_root(
     Ok(location.to_string())
 }
 
+/// DataFusion folds `c IS NULL` to `false` on a non-nullable field, so a declaration older than a
+/// source-side relaxation to optional would drop NULL rows silently. Matched by declared field id.
+fn refuse_relaxed_nullability(
+    current: &iceberg::spec::Schema,
+    declared: &DeclaredSchema,
+) -> Result<(), UdfError> {
+    let optional_now = |id| current.field_by_id(id).is_some_and(|now| !now.required);
+    let stale = |field: &&LogicalField| !field.nullable && field.field_id.is_some_and(optional_now);
+    let Some(field) = declared.logical_schema.iter().find(stale) else {
+        return Ok(());
+    };
+    Err(UdfError::User(format!(
+        "column '{}' of virtual table '{}' is declared non-nullable, but the current Iceberg \
+         schema allows NULL in it; ALTER VIRTUAL SCHEMA ... REFRESH re-declares it",
+        field.name.to_uppercase(),
+        declared.table
+    )))
+}
+
 /// The one Iceberg planner. Errors are redacted against the effective storage's secrets, since
 /// its `file_io` is what talks to object storage.
 async fn plan_checked_table(
     checked: CheckedMetadata,
+    declared: &[LogicalField],
     filter_json: Option<&Json>,
-) -> Result<ResolvedScan, UdfError> {
+) -> Result<PlannedFiles, UdfError> {
     let CheckedMetadata {
         table_name,
         table_ident,
@@ -210,8 +233,6 @@ async fn plan_checked_table(
         ))
     })?;
 
-    let (logical_schema, refused_columns) = plannable_schema(table.metadata().current_schema())?;
-
     // Absent ⇒ empty; malformed ⇒ plan-time error.
     let name_mapping = parse_name_mapping(
         table
@@ -225,16 +246,21 @@ async fn plan_checked_table(
     // a Puffin deletion vector from a Parquet positional delete.
     ensure_supported_delete_mechanisms(&table, &table_name, &secrets).await?;
 
-    let files = plan_files_from_table(table, &table_name, filter_json, &secrets).await?;
+    // `iceberg` 0.10.0 binds the filter by name against the snapshot's schema, which can predate
+    // the current one, so each declared field id is named as that schema names it.
+    let metadata = table.metadata();
+    let snapshot = metadata.current_snapshot();
+    let scanned = snapshot.and_then(|s| s.schema(metadata).ok());
+    let predicate = filter_json
+        .zip(scanned)
+        .and_then(|(filter, scanned)| to_iceberg_predicate(filter, declared, &scanned));
+    let files = plan_files_from_table(table, &table_name, predicate, &secrets).await?;
 
-    Ok(ResolvedScan {
+    Ok(PlannedFiles {
         files,
         effective_storage,
-        logical_schema,
         table_root,
         name_mapping,
-        partition_columns: Vec::new(),
-        refused_columns,
     })
 }
 
@@ -481,15 +507,12 @@ fn iceberg_delete_mechanism(
 async fn plan_files_from_table(
     table: iceberg::table::Table,
     table_name: &str,
-    filter_json: Option<&Json>,
+    predicate: Option<iceberg::expr::Predicate>,
     secrets: &[&str],
 ) -> Result<Vec<FileEntry>, UdfError> {
     let mut scan_builder = table.scan();
-    if let Some(fj) = filter_json {
-        let schema = table.metadata().current_schema();
-        if let Some(pred) = crate::adapter::iceberg_predicate::to_iceberg_predicate(fj, schema) {
-            scan_builder = scan_builder.with_filter(pred);
-        }
+    if let Some(predicate) = predicate {
+        scan_builder = scan_builder.with_filter(predicate);
     }
     let scan = scan_builder.select_all().build().map_err(|e| {
         UdfError::User(format!(
@@ -531,30 +554,6 @@ async fn plan_files_from_table(
             )
         })
         .collect())
-}
-
-/// Refuses every `binary`, `fixed(L)`, and `uuid` column at any depth until #351.
-fn plannable_schema(
-    schema: &iceberg::spec::Schema,
-) -> Result<(Vec<LogicalField>, Vec<RefusedColumn>), UdfError> {
-    let refused_columns: Vec<RefusedColumn> = schema
-        .as_struct()
-        .fields()
-        .iter()
-        .filter_map(|field| {
-            let (path, declared) = first_binary_member(&field.field_type, &field.name)?;
-            let member_path = (!field.field_type.is_primitive()).then_some(path.as_str());
-            Some(binary_refusal(
-                "Iceberg",
-                &field.name,
-                member_path,
-                &declared,
-            ))
-        })
-        .collect();
-    let logical_schema =
-        without_refused_columns(build_logical_schema(schema), &refused_columns, "Iceberg")?;
-    Ok((logical_schema, refused_columns))
 }
 
 fn first_binary_member(field_type: &iceberg::spec::Type, path: &str) -> Option<(String, String)> {
@@ -599,25 +598,27 @@ fn declared_binary_type(primitive: &iceberg::spec::PrimitiveType) -> Option<Stri
     }
 }
 
-pub(crate) fn build_logical_schema(schema: &iceberg::spec::Schema) -> Vec<LogicalField> {
-    schema
-        .as_struct()
-        .fields()
-        .iter()
-        .map(|f| {
-            let arrow_dt = crate::types::mapping::iceberg_type_to_arrow(&f.field_type);
-            let arrow_type = crate::types::mapping::arrow_type_to_tag(&arrow_dt);
-            LogicalField {
-                field_id: Some(f.id),
-                name: f.name.clone(),
-                arrow_type,
-                nullable: !f.required,
-                initial_default: encode_initial_default(f),
-                nested: derive_nested_members(&f.field_type),
-                physical_name: None,
-            }
-        })
-        .collect()
+/// The Iceberg arm of [`super::declare_columns`]. Refuses every `binary`, `fixed(L)`, and `uuid`
+/// column at any depth until #351.
+pub(super) fn declaration(field: &iceberg::spec::NestedField) -> ColumnDeclaration {
+    let refused = first_binary_member(&field.field_type, &field.name).map(|(path, declared)| {
+        let member_path = (!field.field_type.is_primitive()).then_some(path.as_str());
+        binary_refusal("Iceberg", &field.name, member_path, &declared)
+    });
+    let arrow_type = crate::types::mapping::iceberg_type_to_arrow(&field.field_type);
+    ColumnDeclaration {
+        source_type: LogicalField {
+            field_id: Some(field.id),
+            name: field.name.clone(),
+            arrow_type: crate::types::mapping::arrow_type_to_tag(&arrow_type),
+            nullable: !field.required,
+            initial_default: encode_initial_default(field),
+            nested: derive_nested_members(&field.field_type),
+            physical_name: None,
+        },
+        partition: None,
+        refused,
+    }
 }
 
 fn derive_nested_members(ty: &iceberg::spec::Type) -> Option<NestedMembers> {

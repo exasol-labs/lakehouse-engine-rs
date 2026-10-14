@@ -11,7 +11,6 @@ use object_store::path::Path as StorePath;
 use parquet::arrow::arrow_reader::{ArrowReaderMetadata, ArrowReaderOptions};
 use parquet::arrow::async_reader::ParquetObjectReader;
 use parquet::basic::{ConvertedType, LogicalType, Type as PhysicalType};
-use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::ColumnDescriptor;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -63,7 +62,6 @@ impl ListedFile {
             path: self.path,
             size: self.size,
             partition_values,
-            footer: None,
         }
     }
 }
@@ -75,9 +73,6 @@ pub struct ParquetFile {
     /// Every declared partition key; `None` where this file's path lacks the segment or its value
     /// is empty/`__HIVE_DEFAULT_PARTITION__`.
     pub partition_values: BTreeMap<String, Option<String>>,
-    /// Present iff this file's footer was read under the merge mode — check presence, not
-    /// position, since [`MergeMode::SampleOneFile`] leaves most files' footers unset.
-    pub footer: Option<Arc<ParquetMetaData>>,
 }
 
 pub struct ParquetDirectory {
@@ -138,42 +133,24 @@ pub fn raw_location_prefix(location: &str) -> Result<(String, StorePath), UdfErr
 }
 
 /// A prefix holding no data file returns an empty file list and schema; whether that counts as a
-/// table is the caller's decision.
-///
-/// Partition keys and the `SampleOneFile` footer come from the unfiltered listing, so `keep` never
-/// changes the declared schema.
+/// table is the caller's decision. Only CREATE, REFRESH, and SET call it: a pushdown plans from the
+/// column notes they record and lists through [`list_parquet_files`].
 pub async fn resolve_parquet_directory(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,
     options: DirectoryOptions,
-    keep: &PartitionKeepPredicate,
 ) -> Result<ParquetDirectory, UdfError> {
     let raw_files = list_data_files(store, prefix, options.hive_partitioning).await?;
     let sampled = &raw_files[..raw_files.len().min(1)];
-    let declared_keys = declared_partition_keys(match options.merge_mode {
-        MergeMode::FoldEveryFile => &raw_files,
-        MergeMode::SampleOneFile => sampled,
-    })?;
+    let sources: Vec<&ListedFile> = match options.merge_mode {
+        MergeMode::FoldEveryFile => raw_files.iter().collect(),
+        MergeMode::SampleOneFile => sampled.iter().collect(),
+    };
+    let declared_keys = declared_partition_keys(sources.iter().copied());
     // Even under SampleOneFile, a stored column named like a key any listed file carries is
     // dropped for the key.
     let key_columns = uppercase_index(raw_files.iter().flat_map(segment_keys));
-
-    let kept: Vec<(&ListedFile, BTreeMap<String, Option<String>>)> = raw_files
-        .iter()
-        .filter_map(|raw| {
-            let filled = fill_partition_values(
-                &raw.partition_segments,
-                &declared_keys,
-                &declared_keys,
-                |candidate, key| candidate == key,
-            );
-            keep(&filled).then_some((raw, filled))
-        })
-        .collect();
-    let sources: Vec<&ListedFile> = match options.merge_mode {
-        MergeMode::FoldEveryFile => kept.iter().map(|(raw, _)| *raw).collect(),
-        MergeMode::SampleOneFile => sampled.iter().collect(),
-    };
+    let partition_values = fill_partition_values(&raw_files, &declared_keys)?;
 
     // Concurrency is bounded by the caller's store's admission limiter, not a second one here.
     let read: Vec<ArrowReaderMetadata> = try_join_all(
@@ -185,18 +162,13 @@ pub async fn resolve_parquet_directory(
 
     let folded_fields = fold_schemas(&sources, &read, &key_columns)?;
     let binary_columns = binary_columns(&read, &folded_fields);
-    let footers: HashMap<&StorePath, &Arc<ParquetMetaData>> = sources
+    let files = raw_files
         .iter()
-        .zip(&read)
-        .map(|(raw, metadata)| (&raw.path, metadata.metadata()))
-        .collect();
-    let files = kept
-        .into_iter()
+        .zip(partition_values)
         .map(|(raw, partition_values)| ParquetFile {
             path: raw.path.clone(),
             size: raw.size,
             partition_values,
-            footer: footers.get(&raw.path).map(|footer| Arc::clone(footer)),
         })
         .collect();
     Ok(ParquetDirectory {
@@ -208,7 +180,8 @@ pub async fn resolve_parquet_directory(
 }
 
 /// [`resolve_parquet_directory`]'s file selection for a caller declaring its own schema and
-/// partition columns, with no footer read. Values come from the deepest case-folded path match.
+/// partition columns, with no footer read. `keep` runs only after every file's spellings passed
+/// the check, so a predicate never hides a conflict.
 pub async fn list_parquet_files(
     store: &Arc<dyn ObjectStore>,
     prefix: &StorePath,
@@ -216,26 +189,12 @@ pub async fn list_parquet_files(
     keep: &PartitionKeepPredicate,
 ) -> Result<Vec<ParquetFile>, UdfError> {
     let raw_files = list_data_files(store, prefix, true).await?;
-    let folded_columns: Vec<String> = partition_columns
-        .iter()
-        .map(|column| column.to_uppercase())
-        .collect();
+    let partition_values = fill_partition_values(&raw_files, partition_columns)?;
     Ok(raw_files
         .into_iter()
-        .filter_map(|raw| {
-            let partition_values = fill_partition_values(
-                &raw.partition_segments,
-                partition_columns,
-                &folded_columns,
-                |candidate, folded| {
-                    candidate
-                        .chars()
-                        .flat_map(char::to_uppercase)
-                        .eq(folded.chars())
-                },
-            );
-            keep(&partition_values).then(|| raw.with_partition_values(partition_values))
-        })
+        .zip(partition_values)
+        .filter(|(_, values)| keep(values))
+        .map(|(raw, values)| raw.with_partition_values(values))
         .collect())
 }
 
@@ -335,36 +294,15 @@ fn decode_partition_value(raw: &str) -> Option<String> {
     }
 }
 
-/// The distinct keys `scope`'s paths carry, in first-seen order; two spellings of one uppercased
-/// name are an error.
-fn declared_partition_keys(scope: &[ListedFile]) -> Result<Vec<String>, UdfError> {
-    let mut keys: Vec<String> = Vec::new();
-    let mut seen_spellings: HashSet<&str> = HashSet::new();
-    let mut by_uppercase: HashMap<String, (&str, &StorePath)> = HashMap::new();
-    for raw in scope {
-        for key in segment_keys(raw) {
-            if !seen_spellings.insert(key) {
-                continue;
-            }
-            let folded = key.to_uppercase();
-            match by_uppercase.get(&folded) {
-                Some(&(first, first_path)) => {
-                    return Err(UdfError::User(format!(
-                        "partition keys '{first}' (from '{first_path}') and '{key}' (from '{}') \
-                         are the same name once uppercased, so the declaration would advertise a \
-                         duplicate partition column. Neither directory spelling is preferred over \
-                         the other: rename one of them.",
-                        raw.path
-                    )));
-                }
-                None => {
-                    by_uppercase.insert(folded, (key, &raw.path));
-                    keys.push(key.to_string());
-                }
-            }
-        }
-    }
-    Ok(keys)
+/// The distinct keys `scope`'s paths carry under the uppercase fold, in first-seen order and the
+/// first spelling's case.
+fn declared_partition_keys<'a>(scope: impl Iterator<Item = &'a ListedFile>) -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    scope
+        .flat_map(segment_keys)
+        .filter(|key| seen.insert(key.to_uppercase()))
+        .map(str::to_string)
+        .collect()
 }
 
 fn uppercase_index<'a>(keys: impl Iterator<Item = &'a str>) -> HashMap<String, &'a str> {
@@ -378,23 +316,56 @@ fn uppercase_index<'a>(keys: impl Iterator<Item = &'a str>) -> HashMap<String, &
     index
 }
 
+/// Keys match their declared column under the uppercase fold, the deepest segment wins, and values
+/// stay verbatim. The spelling check runs first, so no file-keep predicate can hide a conflict.
 fn fill_partition_values(
-    raw: &[(String, Option<String>)],
-    declared_keys: &[String],
-    match_keys: &[String],
-    key_matches: impl Fn(&str, &str) -> bool,
-) -> BTreeMap<String, Option<String>> {
-    declared_keys
+    files: &[ListedFile],
+    declared: &[String],
+) -> Result<Vec<BTreeMap<String, Option<String>>>, UdfError> {
+    let folded: Vec<String> = declared.iter().map(|key| key.to_uppercase()).collect();
+    ensure_one_spelling_per_declared_key(files, &folded)?;
+    Ok(files
         .iter()
-        .zip(match_keys)
-        .map(|(key, match_key)| {
-            let value = raw
+        .map(|file| {
+            declared
                 .iter()
-                .rfind(|(candidate, _)| key_matches(candidate, match_key))
-                .and_then(|(_, value)| value.clone());
-            (key.clone(), value)
+                .zip(&folded)
+                .map(|(key, folded)| {
+                    let value = file
+                        .partition_segments
+                        .iter()
+                        .rfind(|(candidate, _)| candidate.to_uppercase() == *folded)
+                        .and_then(|(_, value)| value.clone());
+                    (key.clone(), value)
+                })
+                .collect()
         })
-        .collect()
+        .collect())
+}
+
+fn ensure_one_spelling_per_declared_key(
+    files: &[ListedFile],
+    folded_declared: &[String],
+) -> Result<(), UdfError> {
+    let mut first_seen: HashMap<String, (&str, &StorePath)> = HashMap::new();
+    for file in files {
+        for key in segment_keys(file) {
+            let folded = key.to_uppercase();
+            if !folded_declared.contains(&folded) {
+                continue;
+            }
+            let &mut (first, first_path) = first_seen.entry(folded).or_insert((key, &file.path));
+            if first != key {
+                return Err(UdfError::User(format!(
+                    "partition key '{first}' (in '{first_path}') and '{key}' (in '{}') are two \
+                     spellings of one partition column. Neither directory spelling is preferred \
+                     over the other: rename the directories so every file spells the key alike.",
+                    file.path
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn missing_segment_error(column: &str, key: &str, path: &StorePath) -> UdfError {

@@ -2,69 +2,52 @@ use delta_kernel::schema::{
     ColumnMetadataKey, DataType, DecimalType, MetadataValue, PrimitiveType, StructField, StructType,
 };
 use delta_kernel::table_features::ColumnMappingMode;
-use exasol_udf_sdk::error::UdfError;
 
 use crate::scan::spec::{LogicalField, NestedField, NestedMembers};
 use crate::types::mapping::exasol_representable_catalog_decimal;
 
-use super::{RefusedColumn, binary_cause};
+use super::RefusedColumn;
+use crate::adapter::column_notes::binary_cause;
 
 #[cfg(test)]
 #[path = "delta_schema_tests.rs"]
 mod tests;
 
-type DeltaTableSchema = (Vec<LogicalField>, Vec<String>, Vec<RefusedColumn>);
-
-/// Maps a Delta schema to the scan spec's logical fields (each with the one binding key its
-/// column-mapping mode selects), the partition columns, and the refused columns.
-///
-/// `column_mapping_mode` must be the protocol-gated mode in force, never the raw
-/// `delta.columnMapping.mode` property, which the protocol says to ignore without the
-/// `columnMapping` reader feature. The mode goes no further than this call.
+/// Maps a Spark schema to the scan spec's logical fields (each with the one binding key
+/// `column_mapping_mode` selects) and the refused columns; `label` names the source in each
+/// refusal (`"<label> column '<name>' ..."`) and changes no mapping.
 ///
 /// Types Exasol cannot represent natively (out-of-domain decimal, `void`, intervals, and
-/// containers whose members all map) are tagged `utf8`; others are refused. A refused column
-/// never fails the call; refusing a table with no mappable column is the caller's decision.
-/// Errors arise only from a malformed column-mapping annotation on a mappable column or a
-/// malformed `delta.typeChanges` annotation. Performs no reader-feature gating.
+/// containers whose members all map) are tagged `utf8`; others are refused. Nothing fails the
+/// call: an unmappable type, an unsupported or malformed `delta.typeChanges` entry, and a missing
+/// or malformed column-mapping annotation each refuse only their column. Refusing a table with
+/// no mappable column is the caller's decision.
 ///
 /// Per field, checks run type, then recorded type changes, then binding key, so a column
-/// refused for its type or change is never failed for an annotation this engine won't read.
+/// refused for its type or change is never refused for an annotation this engine won't read.
 /// Per `PROTOCOL.md` § Reader Requirements for Type Widening, readers must *"validate that
-/// they support all type changes … and fail when finding any unsupported type change"*; an
-/// unsupported change refuses only its own column.
+/// they support all type changes … and fail when finding any unsupported type change"*.
 ///
 /// Under `id`/`name` mapping the binding key comes from the annotations alone: ordinal
 /// position and logical name are values the writer never used.
-pub(super) fn build_delta_table_schema(
-    schema: &StructType,
-    column_mapping_mode: ColumnMappingMode,
-    partition_columns: Vec<String>,
-) -> Result<DeltaTableSchema, UdfError> {
-    classify_spark_schema(schema, column_mapping_mode, partition_columns, "Delta")
-}
-
-/// [`build_delta_table_schema`] for any source declaring Spark types; `label` names the source
-/// in each refusal reason (`"<label> column '<name>' ..."`), and changes no mapping.
 pub(super) fn classify_spark_schema(
     schema: &StructType,
     column_mapping_mode: ColumnMappingMode,
-    partition_columns: Vec<String>,
     label: &str,
-) -> Result<DeltaTableSchema, UdfError> {
+) -> (Vec<LogicalField>, Vec<RefusedColumn>) {
     let mut logical_fields = Vec::with_capacity(schema.num_fields());
     let mut refused_columns = Vec::new();
 
     for field in schema.fields() {
-        match walk_field(field, &FieldPath::column(field.name()), column_mapping_mode)? {
-            Walked::Refused(refusal) => refused_columns.push(RefusedColumn {
+        match walk_field(field, &FieldPath::column(field.name()), column_mapping_mode) {
+            Ok(Walked::Refused(refusal)) | Err(refusal) => refused_columns.push(RefusedColumn {
                 column_name: field.name().clone(),
                 reason: refusal.stated_for(field, label),
             }),
-            Walked::Mapped(MappedField {
+            Ok(Walked::Mapped(MappedField {
                 arrow_type,
                 descriptor,
-            }) => logical_fields.push(LogicalField {
+            })) => logical_fields.push(LogicalField {
                 field_id: descriptor.field_id,
                 name: descriptor.name,
                 arrow_type,
@@ -76,13 +59,13 @@ pub(super) fn classify_spark_schema(
         }
     }
 
-    Ok((logical_fields, partition_columns, refused_columns))
+    (logical_fields, refused_columns)
 }
 
 fn unsupported_type_change(
     field: &StructField,
     path: &FieldPath,
-) -> Result<Option<RecordedTypeChange>, UdfError> {
+) -> Result<Option<RecordedTypeChange>, Refusal> {
     Ok(recorded_type_changes(field, path)?
         .into_iter()
         .find(|change| !is_supported_type_change(change)))
@@ -95,7 +78,7 @@ fn binding_key(
     field: &StructField,
     path: &FieldPath,
     mode: ColumnMappingMode,
-) -> Result<(Option<i32>, Option<String>), UdfError> {
+) -> Result<(Option<i32>, Option<String>), Refusal> {
     match mode {
         ColumnMappingMode::None => Ok((None, None)),
         ColumnMappingMode::Id => {
@@ -115,7 +98,7 @@ fn mapped_column_annotations(
     field: &StructField,
     path: &FieldPath,
     mode: ColumnMappingMode,
-) -> Result<(i32, String), UdfError> {
+) -> Result<(i32, String), Refusal> {
     Ok((
         column_mapping_id(field, path, mode)?,
         column_mapping_physical_name(field, path, mode)?,
@@ -126,7 +109,7 @@ fn column_mapping_physical_name(
     field: &StructField,
     path: &FieldPath,
     mode: ColumnMappingMode,
-) -> Result<String, UdfError> {
+) -> Result<String, Refusal> {
     let key = ColumnMetadataKey::ColumnMappingPhysicalName.as_ref();
     match field.get_config_value(&ColumnMetadataKey::ColumnMappingPhysicalName) {
         Some(MetadataValue::String(name)) => Ok(name.clone()),
@@ -148,7 +131,7 @@ fn column_mapping_id(
     field: &StructField,
     path: &FieldPath,
     mode: ColumnMappingMode,
-) -> Result<i32, UdfError> {
+) -> Result<i32, Refusal> {
     let key = ColumnMetadataKey::ColumnMappingId.as_ref();
     let id = field.column_mapping_id().ok_or_else(|| {
         unusable_column_mapping(path, mode, format!("{key} is absent or not a number"))
@@ -162,20 +145,21 @@ fn column_mapping_id(
     })
 }
 
-fn unusable_column_mapping(path: &FieldPath, mode: ColumnMappingMode, problem: String) -> UdfError {
-    UdfError::User(format!(
-        "Delta column '{}' carries no usable column-mapping annotation under {mode:?}-mode \
-         column mapping: {problem}. The Delta protocol requires every field to carry both {} \
-         and {} in that mode, and the read path validates neither, so substituting an ordinal \
-         position or the logical name would bind the scan to a column the writer never wrote",
-        path.rendered(),
-        ColumnMetadataKey::ColumnMappingId.as_ref(),
-        ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
-    ))
+fn unusable_column_mapping(path: &FieldPath, mode: ColumnMappingMode, problem: String) -> Refusal {
+    Refusal {
+        member_path: path.member_path(),
+        cause: format!(
+            "carries no usable column-mapping annotation under {mode:?}-mode column mapping: \
+             {problem}. The Delta protocol requires every field to carry both {} and {} in that \
+             mode, and substituting an ordinal position or the logical name would bind the scan \
+             to a column the writer never wrote",
+            ColumnMetadataKey::ColumnMappingId.as_ref(),
+            ColumnMetadataKey::ColumnMappingPhysicalName.as_ref(),
+        ),
+    }
 }
 
-/// A refusal is an expected outcome, not an error, so a [`UdfError`] from
-/// [`build_delta_table_schema`] means only a malformed annotation.
+/// `Err` carries a malformed annotation's refusal, which a sibling member's type refusal outranks.
 enum Walked<T> {
     Mapped(T),
     Refused(Refusal),
@@ -242,7 +226,7 @@ fn walk_field(
     field: &StructField,
     path: &FieldPath,
     mode: ColumnMappingMode,
-) -> Result<Walked<MappedField>, UdfError> {
+) -> Result<Walked<MappedField>, Refusal> {
     let mapped = match walk_type(field.data_type(), path, mode)? {
         Walked::Refused(refusal) => return Ok(Walked::Refused(refusal)),
         Walked::Mapped(mapped) => mapped,
@@ -275,7 +259,7 @@ fn walk_type(
     data_type: &DataType,
     path: &FieldPath,
     mode: ColumnMappingMode,
-) -> Result<Walked<MappedType>, UdfError> {
+) -> Result<Walked<MappedType>, Refusal> {
     match data_type {
         DataType::Primitive(primitive) => Ok(walk_primitive(primitive, path)),
         DataType::Variant(_) => Ok(refused_type(path, variant_cause())),
@@ -427,7 +411,7 @@ fn type_change_cause(from_type: &str, to_type: &str) -> String {
 fn recorded_type_changes(
     field: &StructField,
     path: &FieldPath,
-) -> Result<Vec<RecordedTypeChange>, UdfError> {
+) -> Result<Vec<RecordedTypeChange>, Refusal> {
     let Some(value) = field.metadata().get(TYPE_CHANGES_KEY) else {
         return Ok(Vec::new());
     };
@@ -453,7 +437,7 @@ fn recorded_type_changes(
 fn parse_type_change_entry(
     entry: &serde_json::Value,
     path: &FieldPath,
-) -> Result<RecordedTypeChange, UdfError> {
+) -> Result<RecordedTypeChange, Refusal> {
     let object = entry.as_object().ok_or_else(|| {
         malformed_type_change(path, format!("entry '{entry}' is not a JSON object"))
     })?;
@@ -482,7 +466,7 @@ fn required_type_change_string(
     object: &serde_json::Map<String, serde_json::Value>,
     key: &str,
     path: &FieldPath,
-) -> Result<String, UdfError> {
+) -> Result<String, Refusal> {
     match object.get(key) {
         Some(serde_json::Value::String(value)) => Ok(value.clone()),
         Some(other) => Err(malformed_type_change(
@@ -493,11 +477,11 @@ fn required_type_change_string(
     }
 }
 
-fn malformed_type_change(path: &FieldPath, problem: String) -> UdfError {
-    UdfError::User(format!(
-        "Delta column '{}' carries a malformed '{TYPE_CHANGES_KEY}' entry: {problem}",
-        path.rendered(),
-    ))
+fn malformed_type_change(path: &FieldPath, problem: String) -> Refusal {
+    Refusal {
+        member_path: path.member_path(),
+        cause: format!("carries a malformed '{TYPE_CHANGES_KEY}' entry: {problem}"),
+    }
 }
 
 /// All of `Byte`, `Short`, `Int` are stored as `INT32`, so the protocol's supported decimal

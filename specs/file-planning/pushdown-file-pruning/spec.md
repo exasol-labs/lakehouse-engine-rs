@@ -51,6 +51,14 @@ the engine cannot apply.
   request loud.
 * See `pushdown/pushdown-planning` for the broader pushdown plan and the scenario that
   covers wiring of the Iceberg predicate alongside the DataFusion filter string.
+* A filter names an Exasol column, and the table's column notes record which Iceberg field id that
+  column declares (`vs-adapter/column-source-notes`). The translation resolves each filter column
+  through its declared field id to the field the scanned snapshot's schema carries under that id (the schema the Iceberg library binds the predicate against), because
+  § Scan Planning states "Data files that match the query filter must be read by the scan" and
+  column bounds are "stored by field id in manifests". Resolving by name instead would read another
+  column's bounds after a source-side rename between refreshes and skip files that hold matching
+  rows. A filter column whose declared field id that schema no longer carries cannot be
+  translated, so it imposes no constraint under the rules above.
 
 ## Scenarios
 
@@ -128,3 +136,11 @@ the engine cannot apply.
 * *THEN* each query SHALL return the native table's rows, and the scanned files SHALL include every file that holds a matching row
 * *AND* for a fully translated predicate, the scanned files SHALL be exactly the files Iceberg's inclusive evaluation keeps, so a change that turns pruning off fails, while a partly translated predicate SHALL be held only to keeping every file with a matching row
 * *AND* a query that scans no file SHALL take the empty-result route, and every other query SHALL apply its predicate in the scan or in the adapter's outer `WHERE`, never drop it
+
+### Scenario: A filter column resolves through its declared field id
+
+* *GIVEN* an Iceberg table with columns `a` (field id 1) and `b` (field id 2), whose two data files hold disjoint value ranges of `a` and of `b` such that the file holding `a = 7` holds no `b = 7`, a virtual schema created over it, and the source columns afterwards renamed so that field id 1 is named `b` and field id 2 is named `a`, with no `REFRESH`
+* *WHEN* a query carries `WHERE A = 7`
+* *THEN* the adapter SHALL translate the filter on `A` against field id 1, the id the column notes declare for `A`, so pruning keeps the file whose field-id-1 bounds admit 7
+* *AND* the query SHALL return the rows whose field-id-1 value is 7, the same rows it returns before the rename
+* *AND* a filter on a declared column whose field id the scanned snapshot's schema no longer carries SHALL prune no file for that conjunct, and the query SHALL still apply the full filter above the scan

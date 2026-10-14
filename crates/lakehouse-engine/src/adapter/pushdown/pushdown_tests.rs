@@ -164,7 +164,8 @@ fn like_filter_yields_df_string_and_no_iceberg_predicate() {
         "LIKE filter must still produce a DataFusion SQL string: {df_filter:?}"
     );
 
-    let iceberg_pred = to_iceberg_predicate(&filter_json, &schema);
+    let iceberg_pred =
+        to_iceberg_predicate(&filter_json, &declared_logical_schema(&schema), &schema);
     assert!(
         iceberg_pred.is_none(),
         "LIKE filter must produce no Iceberg predicate"
@@ -437,7 +438,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
         .build()
         .unwrap();
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
 
     assert_eq!(logical.len(), 4, "must carry all 4 fields");
 
@@ -494,7 +495,7 @@ fn pushdown_carries_logical_schema_in_common_arg() {
 }
 
 #[test]
-fn build_logical_schema_encodes_primitive_initial_default() {
+fn iceberg_declaration_encodes_primitive_initial_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
@@ -513,7 +514,7 @@ fn build_logical_schema_encodes_primitive_initial_default() {
         .build()
         .unwrap();
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
 
     assert_eq!(logical.len(), 2);
 
@@ -537,7 +538,7 @@ fn build_logical_schema_encodes_primitive_initial_default() {
 }
 
 #[test]
-fn build_logical_schema_omits_default_for_no_default_field() {
+fn iceberg_declaration_omits_default_for_no_default_field() {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
@@ -551,7 +552,7 @@ fn build_logical_schema_omits_default_for_no_default_field() {
         .build()
         .unwrap();
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
 
     assert_eq!(logical.len(), 1);
     assert!(
@@ -561,7 +562,7 @@ fn build_logical_schema_omits_default_for_no_default_field() {
 }
 
 #[test]
-fn build_logical_schema_omits_default_for_decimal_outside_exasol_domain() {
+fn iceberg_declaration_omits_default_for_decimal_outside_exasol_domain() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
@@ -594,7 +595,7 @@ fn build_logical_schema_omits_default_for_decimal_outside_exasol_domain() {
         .build()
         .unwrap();
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
 
     assert_eq!(logical.len(), 2);
     for field in &logical {
@@ -612,7 +613,7 @@ fn build_logical_schema_omits_default_for_decimal_outside_exasol_domain() {
 }
 
 #[test]
-fn build_logical_schema_omits_non_primitive_default() {
+fn iceberg_declaration_omits_non_primitive_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Struct, StructType, Type};
     use std::sync::Arc;
 
@@ -631,7 +632,7 @@ fn build_logical_schema_omits_non_primitive_default() {
         .build()
         .unwrap();
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
 
     assert_eq!(logical.len(), 1);
     assert_eq!(
@@ -645,7 +646,7 @@ fn build_logical_schema_omits_non_primitive_default() {
 }
 
 #[test]
-fn build_logical_schema_ignores_write_default() {
+fn iceberg_declaration_ignores_write_default() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
@@ -658,7 +659,7 @@ fn build_logical_schema_ignores_write_default() {
         .build()
         .unwrap();
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
 
     assert_eq!(logical.len(), 1);
     assert!(
@@ -668,7 +669,7 @@ fn build_logical_schema_ignores_write_default() {
 }
 
 #[test]
-fn build_logical_schema_default_encoding_is_credential_free() {
+fn iceberg_declaration_default_encoding_is_credential_free() {
     use iceberg::spec::{Literal, NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
@@ -681,7 +682,7 @@ fn build_logical_schema_default_encoding_is_credential_free() {
         .build()
         .unwrap();
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
     assert_eq!(logical[0].initial_default.as_deref(), Some("plain-default"));
 
     let json = serde_json::to_string(&logical).unwrap();
@@ -694,7 +695,7 @@ fn build_logical_schema_default_encoding_is_credential_free() {
 }
 
 #[test]
-fn build_logical_schema_default_less_spec_round_trips_unchanged() {
+fn iceberg_declaration_default_less_spec_round_trips_unchanged() {
     use iceberg::spec::{NestedField, PrimitiveType, Schema, Type};
     use std::sync::Arc;
 
@@ -715,7 +716,7 @@ fn build_logical_schema_default_less_spec_round_trips_unchanged() {
         .build()
         .unwrap();
 
-    let logical = build_logical_schema(&schema);
+    let logical = declared_logical_schema(&schema);
     assert!(
         logical.iter().all(|f| f.initial_default.is_none()),
         "a default-less schema must encode no defaults"
@@ -1114,7 +1115,7 @@ fn iceberg_pruning_input_unchanged_when_df_render_declines() {
         "the declined tree must be the ORIGINAL, un-rewritten filter — the same \
              tree the resolver prunes with"
     );
-    let pred = to_iceberg_predicate(&filter, &schema)
+    let pred = to_iceberg_predicate(&filter, &declared_logical_schema(&schema), &schema)
         .expect("the prunable conjunct must still yield an Iceberg predicate");
     assert!(
         format!("{pred}").contains("id"),
@@ -1799,7 +1800,7 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
         table: "db.t".into(),
     };
     let result = seam_handle_pushdown(
-        &nq4_request(),
+        &with_iceberg_notes(nq4_request()),
         &iceberg.uri,
         &iceberg_catalog_props,
         CatalogKind::IcebergRest,
@@ -1829,8 +1830,9 @@ async fn every_request_shape_resolves_through_the_format_reader_seam() {
         warehouse: "wh".into(),
         table: "cat.sch.orders".into(),
     };
+    let lineitem = [("l_orderkey", "long"), ("l_extendedprice", "decimal(18,2)")];
     let err = seam_handle_pushdown(
-        &nq4_request(),
+        &with_delta_notes(nq4_request(), "LINEITEM", &lineitem, &[]),
         &unity.uri,
         &unity_catalog_props,
         CatalogKind::UnityCatalogNative,
@@ -1859,7 +1861,7 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
         table: "unused-on-the-join-path".into(),
     };
 
-    let request = serde_json::json!({
+    let request = with_iceberg_notes(serde_json::json!({
         "involvedTables": [
             {
                 "name": "CUSTOMER",
@@ -1898,7 +1900,7 @@ async fn a_two_leg_join_resolves_both_legs_on_one_catalog_session() {
                 "TABLE_MAP": {"CUSTOMER": "db.customer", "ORDERS": "db.orders"}
             }).to_string(),
         },
-    });
+    }));
 
     seam_handle_pushdown(
         &request,
@@ -1967,8 +1969,11 @@ fn refused_column_table_request_with_filter(select_list: Json, filter: Json) -> 
     }))
 }
 
+const REFUSED_COLUMN_TABLE_COLUMNS: &[(&str, &str)] =
+    &[("int_col", "integer"), ("binary_col", "binary")];
+
 fn refused_column_table(pushdown_request: Json) -> Json {
-    serde_json::json!({
+    let request = serde_json::json!({
         "involvedTables": [{
             "name": "ORDERS",
             "columns": [
@@ -1977,16 +1982,14 @@ fn refused_column_table(pushdown_request: Json) -> Json {
             ],
         }],
         "pushdownRequest": pushdown_request,
-    })
+    });
+    with_delta_notes(request, "ORDERS", REFUSED_COLUMN_TABLE_COLUMNS, &[])
 }
 
 async fn refused_column_table_storage() -> crate::scan::spec::StorageBackend {
     delta_object_endpoint(vec![(
         delta_commit_zero_key("orders"),
-        fileless_delta_commit(
-            "orders",
-            &[("int_col", "integer"), ("binary_col", "binary")],
-        ),
+        fileless_delta_commit("orders", REFUSED_COLUMN_TABLE_COLUMNS),
     )])
     .await
 }
@@ -2043,6 +2046,7 @@ async fn binary_table_pushdown(iceberg: bool, pushdown_request: Json) -> Result<
     } else {
         &["ID", "B"]
     };
+    let body = load_table_body_with_columns(binary_iceberg_fields(), BINARY_ICEBERG_LAST_COLUMN_ID);
     let columns: Vec<Json> = names
         .iter()
         .map(|name| {
@@ -2058,23 +2062,26 @@ async fn binary_table_pushdown(iceberg: bool, pushdown_request: Json) -> Result<
         "pushdownRequest": pushdown_request,
     });
     if !iceberg {
+        let columns = [("id", "integer"), ("b", "binary")];
+        let request = with_delta_notes(request, "T", &columns, &[]);
         let catalog = unity_delta_catalog().await;
         let storage = delta_object_endpoint(vec![(
             delta_commit_zero_key("t"),
-            fileless_delta_commit("t", &[("id", "integer"), ("b", "binary")]),
+            fileless_delta_commit("t", &columns),
         )])
         .await;
         return delta_pushdown(&request, &catalog.uri, storage, "cat.sch.t").await;
     }
-    let catalog = RecordingCatalog::spawn(|target| {
+    let request = with_notes(
+        request,
+        "T",
+        &load_table_body_notes(&serde_json::from_str(&body).expect("a JSON body")),
+    );
+    let catalog = RecordingCatalog::spawn(move |target| {
         if target.starts_with("/v1/config") {
             (200, "{}".to_string())
         } else {
-            let fields = binary_iceberg_fields();
-            (
-                200,
-                load_table_body_with_columns(fields, BINARY_ICEBERG_LAST_COLUMN_ID),
-            )
+            (200, body.clone())
         }
     })
     .await;
@@ -2223,6 +2230,7 @@ async fn a_non_pruning_delta_request_keeps_its_pre_change_field_set_and_carries_
             "selectList": [{"type": "column", "name": "INT_COL", "tableName": "ORDERS"}],
         },
     });
+    let request = with_delta_notes(request, "ORDERS", &[("int_col", "integer")], &[]);
 
     let planned = delta_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
         .await
@@ -2720,8 +2728,14 @@ fn letter_partitioned_commit() -> String {
     format!("{protocol}\n{metadata}\n{adds}\n")
 }
 
+/// The notes CREATE records for the table [`letter_partitioned_commit`] logs.
+fn with_letter_partitioned_notes(request: Json) -> Json {
+    let columns = [("letter", "string"), ("number", "integer")];
+    with_delta_notes(request, "PRUNED_TO_EMPTY", &columns, &["letter"])
+}
+
 fn letter_partitioned_request(letter: &str) -> Json {
-    serde_json::json!({
+    with_letter_partitioned_notes(serde_json::json!({
         "involvedTables": [{
             "name": "PRUNED_TO_EMPTY",
             "columns": [
@@ -2741,7 +2755,7 @@ fn letter_partitioned_request(letter: &str) -> Json {
                 "right": {"type": "literal_string", "value": letter},
             },
         },
-    })
+    }))
 }
 
 /// Scenario: Equality on a partition column prunes every file in a non-matching partition
@@ -2804,7 +2818,7 @@ async fn a_delta_request_pruned_to_no_file_takes_the_empty_result_route() {
 }
 
 fn letter_partitioned_select_request() -> Json {
-    serde_json::json!({
+    with_letter_partitioned_notes(serde_json::json!({
         "involvedTables": [{
             "name": "PRUNED_TO_EMPTY",
             "columns": [
@@ -2819,7 +2833,7 @@ fn letter_partitioned_select_request() -> Json {
                 {"type": "column", "name": "NUMBER", "tableName": "PRUNED_TO_EMPTY"},
             ],
         },
-    })
+    }))
 }
 
 /// Scenario: The Delta reader is reached from production pushdown under the Unity Catalog kind
