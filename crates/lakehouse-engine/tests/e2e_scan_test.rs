@@ -1086,7 +1086,7 @@ fn create_vs_omits_cluster_nodes_from_adapter_notes() {
     );
 }
 
-/// Scenario: The adapter VM detects the Docker container's CPU affinity set
+/// Scenario: The adapter detects the node's CPU affinity set
 #[test]
 fn adapter_detects_container_cpuset() {
     setup_e2e();
