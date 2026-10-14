@@ -34,7 +34,7 @@ One upload serves both scripts, and both entry points share compiled dependencie
 
 ### Context
 
-The VS adapter must return a pushdown response to Exasol. The sibling project calls `populate_cache()` over connect-back and returns a `SELECT` from a cache table. The mission lists caching and materialization as non-goals.
+The VS adapter must return a pushdown response to Exasol. One option populates a cache table over connect-back and returns a `SELECT` from it. The mission lists caching and materialization as non-goals.
 
 ### Decision
 
@@ -195,7 +195,7 @@ Transfer is one partial row per shard. AVG needs two output columns, and the NUL
 
 ### Context
 
-The adapter must translate Exasol pushdown expression-JSON nodes into DataFusion SQL fragments for filter pushdown and GROUP BY key rendering. The existing walker sat inside the engine's `adapter/predicate.rs`, coupled to engine internals and unusable by the sibling project.
+The adapter must translate Exasol pushdown expression-JSON nodes into DataFusion SQL fragments for filter pushdown and GROUP BY key rendering. The existing walker sat inside the engine's `adapter/predicate.rs`, coupled to engine internals.
 
 ### Decision
 
@@ -205,12 +205,12 @@ The expression walker lives in a standalone workspace crate, `vs-expression`, wi
 
 | Option | Verdict |
 |--------|---------|
-| Extend `adapter/predicate.rs` inline | Rejected: keeps expression logic coupled to the engine and blocks reuse |
+| Extend `adapter/predicate.rs` inline | Rejected: keeps expression logic coupled to the engine |
 | Use a SQL-parser dependency (sqlparser-rs) as the IR | Rejected: overweight for a narrow translation job |
 
 ### Consequences
 
-Future predicate coverage goes in `vs-expression`. Expression translation is a separate, testable, reusable unit.
+Future predicate coverage goes in `vs-expression`. Expression translation is a separate, testable unit.
 
 ---
 
@@ -350,15 +350,15 @@ The wrapper SQL carries three partial columns per statistical aggregate and the 
 
 ---
 
-## ADR: Source Credentials from an Exasol CONNECTION Object (Mirror the Sibling Project's CONNECTION Convention)
+## ADR: Source Credentials from an Exasol CONNECTION Object
 
-**ID:** source-credentials-from-an-exasol-connection-object-mirror-the-sibling-project-s-connection-convention
+**ID:** source-credentials-from-an-exasol-connection-object
 **Plan:** `add-glue-catalog-sigv4-connection`
 **Status:** Accepted
 
 ### Context
 
-The engine read the catalog URI and S3 credentials from plain VS properties. Credentials then appear in the `CREATE VIRTUAL SCHEMA` text and the query profile, and rotation requires new DDL. The sibling project solves this with Exasol CONNECTION objects.
+The engine read the catalog URI and S3 credentials from plain VS properties. Credentials then appear in the `CREATE VIRTUAL SCHEMA` text and the query profile, and rotation requires new DDL. Exasol CONNECTION objects keep credentials out of both.
 
 ### Decision
 
@@ -547,7 +547,7 @@ An `OR` with an untranslatable branch gets no Iceberg pruning, and DataFusion ap
 
 ### Context
 
-Iceberg pruning builds `iceberg::expr::Predicate` values from the Exasol filter JSON. `vs-expression` is shared with the sibling project and has no `iceberg-rust` dependency.
+Iceberg pruning builds `iceberg::expr::Predicate` values from the Exasol filter JSON. `vs-expression` has no `iceberg-rust` dependency.
 
 ### Decision
 
@@ -557,11 +557,11 @@ A dedicated engine module translates the Exasol filter JSON into an optional Ice
 
 | Option | Verdict |
 |--------|---------|
-| Extend `vs-expression` to emit Iceberg predicates | Rejected: adds `iceberg-rust` as a dependency of the shared crate |
+| Extend `vs-expression` to emit Iceberg predicates | Rejected: adds `iceberg-rust` as a dependency of the translator crate |
 
 ### Consequences
 
-A sibling project needing Iceberg pruning would write its own translator or trigger a monorepo consolidation.
+Iceberg predicate translation lives in the engine, and `vs-expression` stays free of `iceberg-rust`.
 
 ---
 

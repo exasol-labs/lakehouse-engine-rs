@@ -38,7 +38,7 @@ The check raises on any non-finite `Float64` result, with distinct messages for 
 
 ### Context
 
-A consumer of the DataFusion dialect must register the checked-division function under the exact name the rendering emits. `crates/vs-expression` is a pure, stateless translator shared with a sibling project, and it cannot own a DataFusion `ScalarUDF` without a large dependency change.
+A consumer of the DataFusion dialect must register the checked-division function under the exact name the rendering emits. `crates/vs-expression` is a pure, stateless translator, and it cannot own a DataFusion `ScalarUDF` without a large dependency change.
 
 ### Decision
 
@@ -53,7 +53,7 @@ A consumer of the DataFusion dialect must register the checked-division function
 
 ### Consequences
 
-A consumer that forgets to register the function fails loudly at first use. The sibling project must register a matching function to use the DataFusion dialect.
+A consumer that forgets to register the function fails loudly at first use.
 
 ## ADR: The DataFusion dialect renders no cast: drop the `CAST(<left> AS DOUBLE)` wrapper
 
