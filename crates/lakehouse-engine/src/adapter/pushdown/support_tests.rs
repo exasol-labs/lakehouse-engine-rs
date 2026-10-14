@@ -2214,7 +2214,8 @@ fn filter_in_common_arg() {
         "translatable filter must produce a DataFusion SQL string"
     );
 
-    let iceberg_pred = to_iceberg_predicate(&filter_json, &schema);
+    let iceberg_pred =
+        to_iceberg_predicate(&filter_json, &declared_logical_schema(&schema), &schema);
     assert!(
         iceberg_pred.is_some(),
         "translatable filter must produce an Iceberg predicate"
@@ -4184,7 +4185,7 @@ fn column_exa_type_resolves_unicode_folded_list_and_misses_ascii_folded_list() {
     assert_eq!(
         column_exa_type(&node, &unicode_folded),
         Some("VARCHAR(2000000)"),
-        "`STRAßE`.to_uppercase() is `STRASSE`, the key `extract_all_column_types` builds"
+        "`STRAßE`.to_uppercase() is `STRASSE`, the key `involved_columns` builds"
     );
     assert_eq!(
         column_exa_type(&node, &ascii_folded),

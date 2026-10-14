@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 
-use super::super::ConnectionStorage;
-use super::super::delta_schema::build_delta_table_schema;
+use super::super::delta_schema::classify_spark_schema;
+use super::super::{ConnectionStorage, ResolvedScan};
 use super::*;
 use crate::adapter::pushdown::test_support::filter_json::{
     and, column, compare, equal, number, or,
 };
 use crate::adapter::pushdown::test_support::{
     GlueEndpoint, ObjectEndpoint, SENTINEL_ACCESS_KEY, SENTINEL_SECRET_KEY, SIGV4_SECRET_KEY,
-    UNREACHABLE_CATALOG, closed_port_storage, glue_catalog_table, object_endpoint, sample_storage,
-    sigv4_creds, unauthenticated_creds, user_message,
+    UNREACHABLE_CATALOG, assert_mentions, catalog_table, closed_port_storage, declared_notes,
+    glue_catalog_table, involved_notes, nullable_field, object_endpoint, resolve_declared,
+    sample_storage, sigv4_creds, unauthenticated_creds, unity_column, user_message,
 };
 use crate::adapter::tests::parquet_fixture::{in_memory_store, values};
 use crate::adapter::tests::recording_store::RecordingStore;
@@ -25,11 +26,9 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::{CastExpr, Column};
 use datafusion::physical_expr_adapter::PhysicalExprAdapterFactory;
-use delta_kernel::schema::DataType as DeltaType;
-use lakehouse_catalog::{
-    CatalogColumn, CatalogTableIdent, CatalogTableType, ColumnSourceType, ConnectionCreds,
-    TableFormat, UnityCatalogSession,
-};
+use delta_kernel::schema::{DataType as DeltaType, StructField, StructType};
+use delta_kernel::table_features::ColumnMappingMode;
+use lakehouse_catalog::{CatalogTableIdent, ConnectionCreds, TableFormat, UnityCatalogSession};
 use serde_json::json;
 
 const TABLE_NAME: &str = "cat.sch.sales";
@@ -45,13 +44,6 @@ const UNREADABLE_BODY: &str = "not a parquet file";
 
 const STATIC_SECRET: &str = "minioadmin";
 
-fn raw_column(name: &str, type_json: Option<String>) -> CatalogColumn {
-    CatalogColumn {
-        name: name.to_string(),
-        source_type: ColumnSourceType::Unity { type_json },
-    }
-}
-
 /// Each `(name, spark_type)` column is declared NOT NULL.
 fn sales_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogTable {
     let columns = columns
@@ -59,7 +51,7 @@ fn sales_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogT
         .map(|(name, spark_type)| {
             let field =
                 json!({"name": name, "type": spark_type, "nullable": false, "metadata": {}});
-            raw_column(name, Some(field.to_string()))
+            unity_column(name, Some(field.to_string()))
         })
         .collect();
     CatalogTable {
@@ -67,13 +59,10 @@ fn sales_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogT
             namespace: vec!["cat".into(), "sch".into()],
             name: "sales".into(),
         },
-        table_type: CatalogTableType::Table,
-        storage_location: Some(TABLE_ROOT.to_string()),
-        format: TableFormat::Parquet,
         vended_credential_key: Some("table-sales".to_string()),
         partition_columns: partition_columns.iter().map(|c| c.to_string()).collect(),
-        metadata_location: None,
         columns,
+        ..catalog_table(TableFormat::Parquet, TABLE_ROOT)
     }
 }
 
@@ -117,14 +106,13 @@ async fn resolve_with(
         allow_http: true,
     };
     let reader = CatalogParquetFormatReader {
-        table,
         files: ParquetFileSource::TableDirectory(UnityTableStorage::new(
             &session,
             table,
             &connection,
         )),
     };
-    user_outcome(reader.resolve_scan(filter).await)
+    user_outcome(resolve_declared(&reader, TABLE_NAME, table, filter).await)
 }
 
 fn user_outcome(outcome: Result<ResolvedScan, UdfError>) -> Result<ResolvedScan, String> {
@@ -150,18 +138,6 @@ async fn refusal(table: &CatalogTable, storage: StorageBackend, vended: bool) ->
 
 fn file_paths(scan: &ResolvedScan) -> Vec<&str> {
     scan.files.iter().map(|file| file.path.as_str()).collect()
-}
-
-fn identity_bound(name: &str, arrow_type: &str) -> LogicalField {
-    LogicalField {
-        field_id: None,
-        name: name.to_string(),
-        arrow_type: arrow_type.to_string(),
-        nullable: true,
-        initial_default: None,
-        nested: None,
-        physical_name: None,
-    }
 }
 
 /// Scenario: A Unity Parquet table lists its files through the shared directory seam and reads no footer
@@ -195,15 +171,16 @@ async fn files_are_listed_through_the_seam_and_no_footer_is_read() {
     assert_eq!(scan.effective_storage, storage);
 }
 
+/// Scenario: A Unity Parquet column with no usable type descriptor is refused, and nullability always follows the file
 #[tokio::test]
-async fn logical_schema_is_the_catalog_column_list_and_undescribed_columns_are_refused() {
+async fn declaration_refuses_a_column_without_a_usable_type_json_and_forces_nullable() {
     let mut table = sales_table(&[("id", "long"), ("payload", "binary")], &[]);
     let drifted =
         json!({"name": "customerid", "type": "string", "nullable": false, "metadata": {}});
     table.columns.extend([
-        raw_column("CustomerId", Some(drifted.to_string())),
-        raw_column("note", None),
-        raw_column("broken", Some("{}".to_string())),
+        unity_column("CustomerId", Some(drifted.to_string())),
+        unity_column("note", None),
+        unity_column("broken", Some("{}".to_string())),
     ]);
 
     let scan = resolve(&table, &["part-0.parquet"]).await;
@@ -211,8 +188,8 @@ async fn logical_schema_is_the_catalog_column_list_and_undescribed_columns_are_r
     assert_eq!(
         scan.logical_schema,
         vec![
-            identity_bound("id", "int64"),
-            identity_bound("CustomerId", "utf8")
+            nullable_field("id", "int64"),
+            nullable_field("CustomerId", "utf8")
         ]
     );
     let refused: Vec<(&str, bool)> = scan
@@ -227,40 +204,22 @@ async fn logical_schema_is_the_catalog_column_list_and_undescribed_columns_are_r
         refused,
         vec![("payload", false), ("note", true), ("broken", true)]
     );
-}
 
-#[tokio::test]
-async fn an_unplannable_catalog_schema_fails_the_plan() {
-    let mut no_mappable = sales_table(&[("payload", "binary")], &[]);
-    no_mappable.columns.push(raw_column("note", None));
-    let cases = [
-        (
-            no_mappable,
-            vec![
-                "Unity Parquet table has no mappable column",
-                "'payload'",
-                "'note'",
-            ],
-        ),
-        (
-            sales_table(&[("id", "long"), ("ID", "long")], &[]),
-            vec![TABLE_NAME, "do not form one Spark schema"],
-        ),
-        (
-            sales_table(&[("id", "long"), ("shard", "binary")], &["shard"]),
-            vec![TABLE_NAME, "'shard'", "partition column"],
-        ),
-    ];
+    let unschematic = sales_table(&[("id", "long"), ("ID", "long")], &[]);
+    let notes = declared_notes(&unschematic);
+    let message = refusal(&unschematic, sample_storage(), false).await;
 
-    for (table, fragments) in cases {
-        let message = refusal(&table, sample_storage(), false).await;
-        for fragment in fragments {
-            assert!(
-                message.contains(fragment),
-                "'{fragment}' missing: {message}"
-            );
-        }
-    }
+    assert_eq!(notes.len(), 2, "CREATE still declares both columns");
+    assert_mentions(
+        &message,
+        &[
+            "virtual table 'cat.sch.sales' has no mappable column",
+            "'id'",
+            "'ID'",
+            TABLE_NAME,
+            "do not form one Spark schema",
+        ],
+    );
 }
 
 #[tokio::test]
@@ -290,12 +249,7 @@ async fn file_columns_bind_under_the_case_fold_and_the_shared_cast_rules() {
         .rewrite(Arc::new(Column::new("amount", 1)) as Arc<dyn PhysicalExpr>)
         .expect_err("a double file column under an int declaration is refused")
         .to_string();
-    for fragment in ["'amount'", TABLE_ROOT, "Float64", "Int32"] {
-        assert!(
-            message.contains(fragment),
-            "'{fragment}' missing: {message}"
-        );
-    }
+    assert_mentions(&message, &["'amount'", TABLE_ROOT, "Float64", "Int32"]);
 }
 
 /// Scenario: Partition columns come from the catalog and partition values from the file paths
@@ -306,7 +260,7 @@ async fn partition_columns_come_from_partition_index_and_values_from_paths() {
         &[
             "YEAR=2025/region=__HIVE_DEFAULT_PARTITION__/c.parquet",
             "d.parquet",
-            "year=2024/region=eu/a.parquet",
+            "YEAR=2024/region=eu/a.parquet",
         ],
     )
     .await;
@@ -318,9 +272,9 @@ async fn partition_columns_come_from_partition_index_and_values_from_paths() {
             .map(|file| file.partition_values.clone())
             .collect::<Vec<_>>(),
         vec![
+            values(&[("year", Some("2024")), ("region", Some("eu"))]),
             values(&[("year", Some("2025")), ("region", None)]),
             values(&[("year", None), ("region", None)]),
-            values(&[("year", Some("2024")), ("region", Some("eu"))]),
         ]
     );
 }
@@ -410,6 +364,11 @@ fn glue_table(columns: &[(&str, &str)], partition_columns: &[&str]) -> CatalogTa
     }
 }
 
+fn declared_schema(table: &CatalogTable) -> Result<DeclaredSchema, UdfError> {
+    let notes = declared_notes(table);
+    involved_notes(GLUE_TABLE_NAME, &notes).declared_schema()
+}
+
 fn delta_classification(columns: &[(String, DeltaType)]) -> Vec<LogicalField> {
     let schema = StructType::try_new(
         columns
@@ -417,9 +376,8 @@ fn delta_classification(columns: &[(String, DeltaType)]) -> Vec<LogicalField> {
             .map(|(name, spark_type)| StructField::nullable(name, spark_type.clone())),
     )
     .expect("distinct column names");
-    let (logical_schema, _, refused) =
-        build_delta_table_schema(&schema, ColumnMappingMode::None, Vec::new())
-            .expect("an annotation-free schema classifies");
+    let (logical_schema, refused) =
+        classify_spark_schema(&schema, ColumnMappingMode::None, "Delta");
     assert!(refused.is_empty(), "{refused:?}");
     logical_schema
 }
@@ -453,9 +411,8 @@ fn glue_columns_are_classified_by_the_spark_type_classifier_and_refused_only_by_
         )
         .collect();
 
-    let Ok(schema) = catalog_schema(&glue_table(&columns, &[]), "Glue") else {
-        panic!("a refused column never fails the table");
-    };
+    let schema = declared_schema(&glue_table(&columns, &[]))
+        .expect("a refused column never fails the table");
 
     let spark: Vec<(String, DeltaType)> = typed
         .iter()
@@ -512,12 +469,13 @@ fn glue_columns_are_classified_by_the_spark_type_classifier_and_refused_only_by_
 
     let every_column_refused = glue_table(&[("b", "binary"), ("u", "uniontype<int>")], &[]);
     let error = user_message(
-        catalog_schema(&every_column_refused, "Glue")
-            .err()
-            .expect("a table whose every column is refused must be refused as a whole"),
+        declared_schema(&every_column_refused)
+            .expect_err("a table whose every column is refused must be refused as a whole"),
     );
     assert!(
-        error.starts_with("Glue table has no mappable column") && error.contains("'b'"),
+        error.starts_with(&format!(
+            "virtual table '{GLUE_TABLE_NAME}' has no mappable column"
+        )) && error.contains("'b'"),
         "{error}"
     );
 }
@@ -548,13 +506,13 @@ async fn resolve_glue(
     let session = GlueCatalogSession::new(glue_address, storage.clone(), sigv4_creds())
         .expect("the CONNECTION region signs the session");
     let reader = CatalogParquetFormatReader {
-        table,
         files: ParquetFileSource::GluePartitions {
             session: &session,
             storage,
+            table,
         },
     };
-    user_outcome(reader.resolve_scan(filter).await)
+    user_outcome(resolve_declared(&reader, GLUE_TABLE_NAME, table, filter).await)
 }
 
 fn scanned_key(entry: &FileEntry, table_root: &str) -> String {
@@ -593,8 +551,8 @@ async fn glue_parquet_table_is_planned_by_the_shared_reader_with_nullable_catalo
     assert_eq!(
         glue_scan.logical_schema,
         vec![
-            identity_bound("id", "int64"),
-            identity_bound("CustomerId", "utf8")
+            nullable_field("id", "int64"),
+            nullable_field("CustomerId", "utf8")
         ]
     );
     assert_eq!(file_paths(&glue_scan), vec!["part-0"]);
@@ -859,26 +817,22 @@ async fn a_kept_orc_or_foreign_bucket_partition_fails_naming_it_and_a_pruned_one
     .await
     .expect("a pruned partition contributes no row, so it cannot fail the query");
 
-    for fragment in [
-        "p_int=9",
-        "s3://bucket/glue/orders/p_int=9",
-        ORC_INPUT_FORMAT,
-    ] {
-        assert!(
-            kept_orc.contains(fragment),
-            "'{fragment}' missing: {kept_orc}"
-        );
-    }
-    for fragment in [
-        "p_int=5",
-        "s3://other-bucket/glue/orders/p_int=5",
-        "bucket 's3://other-bucket'",
-    ] {
-        assert!(
-            kept_foreign.contains(fragment),
-            "'{fragment}' missing: {kept_foreign}"
-        );
-    }
+    assert_mentions(
+        &kept_orc,
+        &[
+            "p_int=9",
+            "s3://bucket/glue/orders/p_int=9",
+            ORC_INPUT_FORMAT,
+        ],
+    );
+    assert_mentions(
+        &kept_foreign,
+        &[
+            "p_int=5",
+            "s3://other-bucket/glue/orders/p_int=5",
+            "bucket 's3://other-bucket'",
+        ],
+    );
     assert_eq!(pruned, vec!["glue/orders/p_int=1/f"]);
 }
 

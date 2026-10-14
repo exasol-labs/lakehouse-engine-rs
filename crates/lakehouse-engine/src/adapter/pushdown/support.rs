@@ -1,5 +1,6 @@
 use super::grouped_agg::{col_type_for, is_literal_selectlist_item, partial_emits_items};
 use super::single_group_agg::{DistinctCount, SingleGroupItem};
+use crate::adapter::column_notes::TableNotes;
 use crate::adapter::connection::ConnectionCreds;
 use crate::scan::sealed::{SealedStorageKey, seal_storage};
 use crate::scan::spec::{
@@ -292,31 +293,46 @@ pub fn build_fan_out_inner<E: Clone + Into<FileEntry>>(
     )
 }
 
-/// A column missing `name` or `dataType` is skipped.
-pub(super) fn column_types(
-    request: &Json,
-    select_table: impl FnOnce(&[Json]) -> Option<&Json>,
-) -> Vec<(String, String)> {
-    request
-        .get("involvedTables")
-        .and_then(|v| v.as_array())
-        .and_then(|tables| select_table(tables))
-        .and_then(|t| t.get("columns"))
-        .and_then(|c| c.as_array())
-        .map(|cols| {
-            cols.iter()
-                .filter_map(|c| {
-                    let name = c.get("name")?.as_str()?.to_uppercase();
-                    let dt_json = c.get("dataType")?;
-                    Some((name, exasol_type_from_json(dt_json)))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+/// One involved table's columns as the pushdown request declares them.
+pub(super) struct InvolvedColumns<'r> {
+    /// `(uppercased name, Exasol type)` in declaration order.
+    pub(super) types: Vec<(String, String)>,
+    /// The table's raw column notes, in the same order.
+    pub(super) notes: TableNotes<'r>,
 }
 
-pub(super) fn extract_all_column_types(request: &Json) -> Vec<(String, String)> {
-    column_types(request, |tables: &[Json]| tables.first())
+/// Reads each column's name, Exasol type, and note in one pass. A column missing `name` or
+/// `dataType` is skipped.
+pub(super) fn involved_columns<'r>(
+    request: &'r Json,
+    select_table: impl FnOnce(&'r [Json]) -> Option<&'r Json>,
+) -> InvolvedColumns<'r> {
+    let table = request
+        .get("involvedTables")
+        .and_then(|v| v.as_array())
+        .and_then(|tables| select_table(tables));
+    let (types, columns) = table
+        .and_then(|t| t.get("columns"))
+        .and_then(|c| c.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|column| {
+            let name = column.get("name")?.as_str()?;
+            let data_type = exasol_type_from_json(column.get("dataType")?);
+            let note = column.get("adapterNotes").and_then(|note| note.as_str());
+            Some(((name.to_uppercase(), data_type), (name, note)))
+        })
+        .unzip();
+    InvolvedColumns {
+        types,
+        notes: TableNotes {
+            table: table
+                .and_then(|t| t.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or_default(),
+            columns,
+        },
+    }
 }
 
 /// Exasol stamps every column with the query's `tableAlias`, but every scan is a
@@ -647,7 +663,10 @@ pub(super) fn extract_projection(
     request: &Json,
     pushdown_req: &Json,
 ) -> Result<(Vec<ProjectionItem>, Vec<String>, bool), UdfError> {
-    project_columns(pushdown_req, extract_all_column_types(request))
+    project_columns(
+        pushdown_req,
+        involved_columns(request, |tables| tables.first()).types,
+    )
 }
 
 /// Exasol rejects `TIMESTAMP WITH LOCAL TIME ZONE` as an EMITS output (sqlCode 22002).

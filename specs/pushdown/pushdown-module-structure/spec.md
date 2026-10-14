@@ -193,3 +193,12 @@ The running history of internal-duplication extractions this decomposition made 
 * *AND* the added type's fields SHALL be private, constructed only through a fallible constructor that
   refuses an empty merge SELECT, so the malformed `SELECT  FROM (...)` an empty one would render is
   unrepresentable rather than documented
+
+### Scenario: The column declaration entry point replaces the Iceberg logical-schema builder on the pushdown façade
+
+* *GIVEN* the frozen `crate::adapter::pushdown::<name>` baseline asserted by two compile-time probes: `src/adapter/pushdown_surface_probe_tests.rs` naming 27 items from an in-crate vantage and `tests/pushdown_public_surface.rs` naming the 17 externally-`pub` items
+* *WHEN* the declaration of each catalog-declared column moves from the format readers' pushdown path to `createVirtualSchema`, per `vs-adapter/column-source-notes`
+* *THEN* EXACTLY ONE item SHALL be added to the façade at crate visibility: the function that declares a listed table's columns from their neutral source types, and EXACTLY ONE item SHALL be removed, `build_logical_schema`, whose only production caller was the Iceberg reader's pushdown path
+* *AND* the in-crate probe SHALL still name 27 items and the external probe 17, and both probe doc comments SHALL state the counts, so the swap stays visible in review
+* *AND* every test that built an Iceberg logical schema through `build_logical_schema` SHALL build it through the added item, keeping its expected values unchanged
+* *AND* the per-format declaration helpers (the Iceberg field builder, the Spark-type classifier, and the Delta schema classifier) MUST NOT be added to the façade, because the added item is their only caller outside `adapter::pushdown::format`

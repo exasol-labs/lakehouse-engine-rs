@@ -228,6 +228,20 @@ surface this feature maps, quoted from its § Schema Serialization Format:
   plan quotes, so the same `TIMESTAMP(6)` target is correct for both formats and neither needs a
   format-specific precision.
 
+* **This delta is issue #426.** The classification this feature specifies runs once, at
+  `createVirtualSchema`, over Unity Catalog's `type_json` (the Delta `StructField` JSON with its
+  metadata) and the `delta.columnMapping.mode` entry of the table's `properties`, and its outcome
+  reaches each pushdown through the column notes (`vs-adapter/column-source-notes`). Where a scenario
+  below says the Delta format reader builds a logical field or records a refusal, the declaration
+  does so at `createVirtualSchema` and the reader takes the result from the notes. Every mapping,
+  tag, refusal reason, and the per-column scoping are unchanged.
+* **A malformed annotation now refuses its column instead of failing.** A malformed
+  `delta.typeChanges` or `delta.columnMapping.*` annotation was a `UdfError` that failed every query
+  on the table. Raised at `createVirtualSchema`, it would fail the whole virtual schema over one
+  table's metadata, so it becomes a column refusal on the same refused-column list, matching the
+  column scope this feature already gives an unmappable type. A table whose every column is refused
+  is still refused as a whole.
+
 ## Scenarios
 
 ### Scenario: Every Delta type Exasol represents natively maps to its own Arrow tag
@@ -349,7 +363,7 @@ surface this feature maps, quoted from its § Schema Serialization Format:
 ### Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
 
 * *GIVEN* a Delta table whose schema carries `delta.typeChanges` entries on one or more fields — including at least one entry on a field NESTED inside a `struct`, a `map`, or an `array`, and at least one entry whose `fromType`/`toType` pair the Delta protocol's supported list does NOT contain
-* *WHEN* the Delta format reader builds that table's logical schema
+* *WHEN* `createVirtualSchema` declares that table's columns from Unity Catalog's `type_json` metadata, which carries the log's `StructField` annotations
 * *THEN* the reader SHALL validate EVERY recorded entry's `fromType`/`toType` pair against the protocol's supported list, at EVERY nesting depth, because the protocol obliges a reader to *"validate that they support all type changes in the `delta.typeChanges` field … and fail when finding any unsupported type change"*
 * *AND* the validation SHALL RECURSE into a `struct`'s inner `StructField`s, a `map`'s key and value types, and an `array`'s element type, replacing the recorded top-level-only walk over `schema.fields()`, because a nested annotation became reachable the moment `struct` and `map` became scannable (the issue #357 finding)
 * *AND* the reader SHALL accept exactly the protocol's list — the `Byte` → `Short` → `Int` → `Long` integer chain, `Float` → `Double`, `Byte`/`Short`/`Int` → `Double`, `Date` → `Timestamp without timezone`, `Decimal(p,s)` → `Decimal(p+k1,s+k2)`, `Byte`/`Short`/`Int` → `Decimal(10+k1,k2)`, and `Long` → `Decimal(20+k1,k2)` — and SHALL refuse every other pair, including `Long` → `Double`, at every depth
@@ -358,7 +372,7 @@ surface this feature maps, quoted from its § Schema Serialization Format:
 * *AND* the reported path SHALL compose the STRUCTURAL path from the top-level column down to the annotated field with that entry's OWN `fieldPath` when it carries one, so an entry with `fieldPath: "value"` on a nested field `attrs` of column `payload` reports `payload.attrs.value`
 * *AND* the entry's `fromType`/`toType` pair SHALL remain the SOLE validation input and the `fieldPath` MUST NOT be interpreted, coerced into a type decision, or required to resolve against the schema — the pair-only rule is retained; only the recorded JUSTIFICATION for discarding the path is discharged, because a map's and an array's members now reach Exasol inside the rendered JSON
 * *AND* the reader SHALL ignore an entry key it does not recognize — notably `tableVersion`, which the superseded RFC required and Delta 3.2-era clients still write, including on all thirteen entries of the vendored `type-widening` fixture — and MUST NOT refuse an otherwise valid entry for carrying one
-* *AND* a MALFORMED annotation at ANY depth SHALL surface a `UdfError` exactly as a malformed top-level annotation already does, and MUST NOT be silently skipped because it sits inside a container
+* *AND* a MALFORMED annotation at ANY depth SHALL refuse its top-level column, with a reason naming the field's path and the problem, through the same refused-column list an unsupported change uses, and MUST NOT be silently skipped because it sits inside a container, nor fail `createVirtualSchema`
 * *AND* the reader MUST NOT consult `delta.typeChanges` to decide any CAST at any depth, because the protocol lets a writer remove the annotation once every data file matches the schema and REQUIRES its removal when the feature is dropped
 * *AND* a SUPPORTED nested type change SHALL require no compensating action: the renderer serializes the value the Parquet reader returns at the FILE's physical type, so a nested `int` → `long` widening renders an identical JSON number and a nested `decimal(10,1)` → `decimal(12,3)` widening renders `1.5` in the old file and `1.500` in the new one — a rendering difference, never a wrong value, named as a limitation in `scan-types/nested-json-rendering`
 * *AND* a table carrying NO `delta.typeChanges` annotation SHALL pass this validation unchanged, whether or not it declares the `typeWidening` reader feature, so every already-queryable Delta fixture keeps its recorded behavior byte-identical

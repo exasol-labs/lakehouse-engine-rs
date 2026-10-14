@@ -48,7 +48,7 @@ use iceberg::{
     TableUpdate,
 };
 use iceberg_catalog_rest::{
-    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalogBuilder,
+    REST_CATALOG_PROP_URI, REST_CATALOG_PROP_WAREHOUSE, RestCatalog, RestCatalogBuilder,
 };
 use iceberg_storage_opendal::{
     AwsCredential, CustomAwsCredentialLoader, OpenDalStorageFactory, ProvideCredential,
@@ -207,7 +207,7 @@ pub async fn build_seed_catalog(
     catalog_url: &str,
     warehouse: &str,
     label: &str,
-) -> Result<impl Catalog> {
+) -> Result<RestCatalog> {
     build_seed_catalog_with_auth(catalog_url, warehouse, label, SeedCatalogAuth::default()).await
 }
 
@@ -216,7 +216,7 @@ pub async fn build_seed_catalog_with_auth(
     warehouse: &str,
     label: &str,
     auth: SeedCatalogAuth,
-) -> Result<impl Catalog> {
+) -> Result<RestCatalog> {
     let props = seed_catalog_props(catalog_url, warehouse, &auth);
 
     let storage_factory: Arc<dyn StorageFactory> = match &auth.storage {

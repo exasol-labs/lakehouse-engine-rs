@@ -4,44 +4,35 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use arrow::datatypes::DataType as ArrowType;
-use delta_kernel::schema::{StructField, StructType};
-use delta_kernel::table_features::ColumnMappingMode;
 use exasol_udf_sdk::error::UdfError;
 use futures::{StreamExt, TryStreamExt, stream};
 use lakehouse_catalog::{
-    CatalogColumn, CatalogPartition, CatalogTable, ColumnSourceType, GlueCatalogSession,
-    PartitionFormat, StorageBackend,
+    CatalogPartition, CatalogTable, GlueCatalogSession, PartitionFormat, StorageBackend,
 };
 use object_store::ObjectStore;
 use object_store::path::Path as StorePath;
 use serde_json::Value as Json;
 
-use super::delta_schema::classify_spark_schema;
 use super::parquet_format_reader::file_entry;
 use super::partition_predicate::PartitionPredicate;
 use super::unity_table_storage::{UnityTableStorage, redacted};
-use super::{
-    FormatReader, RefusedColumn, ResolvedScan, checked_storage_location,
-    ensure_table_has_a_mappable_column,
-};
+use super::{FormatReader, PlannedFiles, checked_storage_location};
+use crate::adapter::column_notes::DeclaredSchema;
 use crate::adapter::parquet_directory::{
     FilePattern, PartitionKeepPredicate, list_location_files, list_parquet_files,
     raw_location_prefix, store_prefix,
 };
-use crate::adapter::tables::catalog_identifier_string;
 use crate::scan::spec::{DEFAULT_S3_MAX_CONNECTIONS, FileEntry, LogicalField, encode_file_path};
 use crate::scan::{build_table_root_store, store_root_url};
-use crate::types::hive_type::parse_hive_type;
-use crate::types::mapping::{arrow_type_from_tag, unity_spark_field};
+use crate::types::mapping::arrow_type_from_tag;
 
 #[cfg(test)]
 #[path = "catalog_parquet_format_reader_tests.rs"]
 mod tests;
 
-/// The catalog is the schema authority; files supply only the listing and partition values. Every
-/// Spark type goes through the one Delta classifier (`glue/glue-table-planning`).
+/// The catalog is the schema authority, declared in the column notes at CREATE; files supply only
+/// the listing and partition values (`glue/glue-table-planning`).
 pub(super) struct CatalogParquetFormatReader<'a> {
-    pub(super) table: &'a CatalogTable,
     pub(super) files: ParquetFileSource<'a>,
 }
 
@@ -55,42 +46,32 @@ pub(super) enum ParquetFileSource<'a> {
     GluePartitions {
         session: &'a GlueCatalogSession,
         storage: &'a StorageBackend,
+        table: &'a CatalogTable,
     },
 }
 
-/// The listed files and the storage they were listed through and must be read through.
-struct PlannedFiles {
-    table_root: String,
-    effective_storage: StorageBackend,
-    files: Vec<FileEntry>,
-}
-
 impl ParquetFileSource<'_> {
-    /// Names the source in every refusal and planning error.
-    fn catalog_label(&self) -> &'static str {
-        match self {
-            Self::TableDirectory(_) => "Unity Parquet",
-            Self::GluePartitions { .. } => "Glue",
-        }
-    }
-
     async fn plan(
         &self,
-        table: &CatalogTable,
+        partition_columns: &[String],
         keep: &PartitionKeepPredicate,
     ) -> Result<PlannedFiles, UdfError> {
         match self {
-            Self::TableDirectory(storage) => plan_table_directory(storage, table, keep).await,
-            Self::GluePartitions { session, storage } => {
-                plan_glue_table(session, storage, table, keep).await
+            Self::TableDirectory(storage) => {
+                plan_table_directory(storage, partition_columns, keep).await
             }
+            Self::GluePartitions {
+                session,
+                storage,
+                table,
+            } => plan_glue_table(session, storage, table, keep).await,
         }
     }
 }
 
 async fn plan_table_directory(
     storage: &UnityTableStorage<'_>,
-    table: &CatalogTable,
+    partition_columns: &[String],
     keep: &PartitionKeepPredicate,
 ) -> Result<PlannedFiles, UdfError> {
     let (table_root, effective_storage) = storage.resolve().await?;
@@ -99,7 +80,7 @@ async fn plan_table_directory(
         table_root,
         &effective_storage,
         &secrets,
-        &table.partition_columns,
+        partition_columns,
         keep,
     )
     .await
@@ -108,6 +89,7 @@ async fn plan_table_directory(
         table_root: table_root.to_string(),
         effective_storage,
         files,
+        name_mapping: Vec::new(),
     })
 }
 
@@ -134,6 +116,7 @@ async fn plan_glue_table(
         table_root,
         effective_storage: storage.clone(),
         files,
+        name_mapping: Vec::new(),
     })
 }
 
@@ -242,124 +225,19 @@ impl FormatReader for CatalogParquetFormatReader<'_> {
     /// above the scan.
     fn resolve_scan<'a>(
         &'a self,
+        declared: &'a DeclaredSchema,
         filter_json: Option<&'a Json>,
-    ) -> Pin<Box<dyn Future<Output = Result<ResolvedScan, UdfError>> + Send + 'a>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PlannedFiles, UdfError>> + Send + 'a>> {
         Box::pin(async move {
-            let CatalogSchema {
-                logical_schema,
-                partition_columns,
-                refused_columns,
-            } = catalog_schema(self.table, self.files.catalog_label())?;
+            let partition_columns = &declared.partition_columns;
             let predicate = PartitionPredicate::from_filter(
                 filter_json,
-                &partition_column_types(&logical_schema, &partition_columns),
+                &partition_column_types(&declared.logical_schema, partition_columns),
             );
-
-            let PlannedFiles {
-                table_root,
-                effective_storage,
-                files,
-            } = self
-                .files
-                .plan(self.table, &move |values| predicate.keeps(values))
-                .await?;
-
-            Ok(ResolvedScan {
-                files,
-                effective_storage,
-                logical_schema,
-                table_root,
-                name_mapping: Vec::new(),
-                partition_columns,
-                refused_columns,
-            })
+            let keep = move |values: &_| predicate.keeps(values);
+            self.files.plan(partition_columns, &keep).await
         })
     }
-}
-
-struct CatalogSchema {
-    logical_schema: Vec<LogicalField>,
-    partition_columns: Vec<String>,
-    refused_columns: Vec<RefusedColumn>,
-}
-
-fn catalog_schema(table: &CatalogTable, label: &str) -> Result<CatalogSchema, UdfError> {
-    let mut fields = Vec::with_capacity(table.columns.len());
-    let mut refused_columns = Vec::new();
-    for column in &table.columns {
-        match spark_field(column) {
-            Ok(field) => fields.push(field),
-            Err(reason) => refused_columns.push(RefusedColumn {
-                column_name: column.name.clone(),
-                reason: format!("{label} column '{}': {reason}", column.name),
-            }),
-        }
-    }
-    let schema = StructType::try_new(fields).map_err(|error| {
-        UdfError::User(format!(
-            "the {label} columns of table {} do not form one Spark schema: {error}",
-            catalog_identifier_string(&table.ident)
-        ))
-    })?;
-    let (logical_schema, partition_columns, classified_refusals) = classify_spark_schema(
-        &schema,
-        ColumnMappingMode::None,
-        table.partition_columns.clone(),
-        label,
-    )?;
-    refused_columns.extend(classified_refusals);
-    refused_columns.sort_by_key(|refused| {
-        table
-            .columns
-            .iter()
-            .position(|column| column.name == refused.column_name)
-    });
-
-    ensure_table_has_a_mappable_column(&logical_schema, &refused_columns, label)?;
-    ensure_no_partition_column_is_refused(table, &refused_columns, label)?;
-    Ok(CatalogSchema {
-        logical_schema,
-        partition_columns,
-        refused_columns,
-    })
-}
-
-/// Forced nullable: a file missing the column reads NULL, which a required declaration would fail.
-fn spark_field(column: &CatalogColumn) -> Result<StructField, String> {
-    match &column.source_type {
-        ColumnSourceType::Unity { type_json } => {
-            unity_spark_field(type_json.as_deref()).map(|field| StructField {
-                name: column.name.clone(),
-                nullable: true,
-                ..field
-            })
-        }
-        ColumnSourceType::Glue { hive_type } => parse_hive_type(hive_type)
-            .map(|data_type| StructField::nullable(column.name.clone(), data_type)),
-        ColumnSourceType::Iceberg(_) | ColumnSourceType::Parquet(_) => {
-            Err("its catalog declares no Spark or Hive type for it".to_string())
-        }
-    }
-}
-
-fn ensure_no_partition_column_is_refused(
-    table: &CatalogTable,
-    refused_columns: &[RefusedColumn],
-    label: &str,
-) -> Result<(), UdfError> {
-    let Some(refused) = refused_columns
-        .iter()
-        .find(|column| table.partition_columns.contains(&column.column_name))
-    else {
-        return Ok(());
-    };
-    Err(UdfError::User(format!(
-        "{label} table {} declares '{}' as a partition column, but that column is refused \
-         ({}); the scan cannot materialize a partition column absent from the logical schema",
-        catalog_identifier_string(&table.ident),
-        refused.column_name,
-        refused.reason
-    )))
 }
 
 /// Typed from the logical schema's tags, exactly as the scan types each partition column.

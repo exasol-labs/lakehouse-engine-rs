@@ -173,6 +173,55 @@ fn nan_double_and_float_are_domain_errors() {
 }
 
 #[test]
+fn date32_guard_accepts_the_range_bounds_and_rejects_one_day_beyond() {
+    let cases: [(i32, Option<NaiveDate>); 6] = [
+        (-719_162, NaiveDate::from_ymd_opt(1, 1, 1)),
+        (0, NaiveDate::from_ymd_opt(1970, 1, 1)),
+        (2_932_896, NaiveDate::from_ymd_opt(9999, 12, 31)),
+        (-719_163, None),
+        (2_932_897, None),
+        (100_000_000, None),
+    ];
+    for (days, expected) in cases {
+        let accepted = expected.is_some();
+        let col = Date32Array::from(vec![Some(days)]);
+        let guard = check_date32_in_exasol_range(&col, "STORED_DATE");
+        let conversion = arrow_value_at(&col, 0);
+        assert_eq!(guard.is_ok(), accepted, "guard on {days} days");
+        assert_eq!(
+            conversion.ok(),
+            expected.map(Value::Date),
+            "conversion of {days} days"
+        );
+        if !accepted {
+            let message = guard.unwrap_err().to_string();
+            assert!(message.contains("STORED_DATE"), "column name: {message}");
+            assert!(message.contains(&days.to_string()), "day count: {message}");
+            assert!(
+                message.contains("0001-01-01") && message.contains("9999-12-31"),
+                "range: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn date32_guard_names_the_first_offender_and_passes_nulls_and_non_date_columns() {
+    let first_out_of_range =
+        Date32Array::from(vec![Some(0), None, Some(2_932_897), Some(-719_163)]);
+    let message = check_date32_in_exasol_range(&first_out_of_range, "D")
+        .unwrap_err()
+        .to_string();
+    assert!(message.contains("2932897"), "first offender: {message}");
+
+    let nulls_only = Date32Array::from(vec![None, None]);
+    assert!(check_date32_in_exasol_range(&nulls_only, "D").is_ok());
+
+    let not_a_date = Int32Array::from(vec![Some(100_000_000)]);
+    assert!(check_date32_in_exasol_range(&not_a_date, "D").is_ok());
+}
+
+#[test]
 fn incompatible_columns_emit_json_strings() {
     let bin_arr = BinaryArray::from_vec(vec![b"abc".as_ref()]);
     let rows = batch_to_rows(&single_col_batch("b", Arc::new(bin_arr)));

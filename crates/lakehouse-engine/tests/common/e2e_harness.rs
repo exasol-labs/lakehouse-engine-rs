@@ -10,6 +10,7 @@ use super::stack::{
 };
 
 use lakehouse_catalog::CatalogSession;
+use lakehouse_engine::adapter::column_notes::{DeclaredSchema, TableNotes};
 use lakehouse_engine::adapter::connection::ConnectionCreds;
 use lakehouse_engine::adapter::pushdown::{ConnectionStorage, ScanSource, format_reader};
 use lakehouse_engine::scan::spec::{CatalogProps, FileEntry, StorageBackend, StorageProps};
@@ -432,8 +433,8 @@ pub fn local_stack_catalog(table: &str) -> CatalogProps {
     }
 }
 
-/// Resolves through the same format-reader seam the adapter uses, bypassing Exasol.
-/// Each `FileEntry` carries an absolute data-file URI.
+/// Resolves through the same format-reader seam the adapter uses, bypassing Exasol. Each
+/// `FileEntry` carries an absolute data-file URI; no column is declared, since no filter prunes.
 pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntry> {
     let catalog_uri = iceberg_catalog_url();
     let catalog_props = local_stack_catalog(&format!("{namespace}.{table}"));
@@ -448,6 +449,9 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
         creds: &creds,
         allow_http: true,
     };
+    let declared = TableNotes::default()
+        .declared_schema()
+        .expect("an empty declaration parses");
     let reader = format_reader(
         ScanSource::Iceberg {
             session: &session,
@@ -456,11 +460,11 @@ pub async fn resolve_fixture_files(namespace: &str, table: &str) -> Vec<FileEntr
         &connection,
     )
     .unwrap_or_else(|e| panic!("format_reader({table}) must succeed: {e}"));
-    let resolved = reader
-        .resolve_scan(None)
+    let planned = reader
+        .resolve_scan(&declared, None)
         .await
         .unwrap_or_else(|e| panic!("resolve_scan({table}) must succeed: {e}"));
-    resolved.files
+    planned.files
 }
 
 /// Straddles both fact-side data files, so per-shard join results must merge across a
@@ -522,6 +526,152 @@ pub fn columns_to_sorted_pairs(cols: &[Vec<serde_json::Value>]) -> Vec<(String, 
         .collect();
     rows.sort();
     rows
+}
+
+/// Each column's raw persisted note, keyed by its Exasol column name.
+fn persisted_column_notes(conn: &mut ExaConn, vs_name: &str, table: &str) -> Vec<(String, String)> {
+    let cols = conn.query_columns(&format!(
+        "SELECT COLUMN_NAME, ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_COLUMNS \
+         WHERE COLUMN_SCHEMA='{vs_name}' AND COLUMN_TABLE='{table}' ORDER BY COLUMN_NAME"
+    ));
+    assert!(
+        !cols[0].is_empty(),
+        "{vs_name}.{table}: no virtual columns persisted"
+    );
+    cols[0]
+        .iter()
+        .zip(&cols[1])
+        .map(|(name, notes)| {
+            let notes = notes
+                .as_str()
+                .unwrap_or_else(|| panic!("{name}: no column adapterNotes persisted"));
+            (value_to_string(name), notes.to_string())
+        })
+        .collect()
+}
+
+/// Each column's persisted note, keyed by its Exasol column name.
+pub fn column_adapter_notes(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    table: &str,
+) -> Vec<(String, serde_json::Value)> {
+    persisted_column_notes(conn, vs_name, table)
+        .into_iter()
+        .map(|(name, notes)| {
+            let notes = serde_json::from_str(&notes).expect("column adapterNotes is JSON");
+            (name, notes)
+        })
+        .collect()
+}
+
+/// The schema a pushdown over `table` plans from, for a test that drives a reader directly.
+pub fn declared_schema_of(conn: &mut ExaConn, vs_name: &str, table: &str) -> DeclaredSchema {
+    let notes = persisted_column_notes(conn, vs_name, table);
+    TableNotes {
+        table,
+        columns: notes
+            .iter()
+            .map(|(column, note)| (column.as_str(), Some(note.as_str())))
+            .collect(),
+    }
+    .declared_schema()
+    .unwrap_or_else(|e| panic!("the notes of {vs_name}.{table} parse: {e}"))
+}
+
+/// Each column with its recorded partition position, `None` for a data column.
+pub fn partition_positions(notes: &[(String, serde_json::Value)]) -> Vec<(&str, Option<u64>)> {
+    notes
+        .iter()
+        .map(|(column, note)| {
+            let position = note.get("partition").map(|position| {
+                position
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("{column}: a partition position is a number"))
+            });
+            (column.as_str(), position)
+        })
+        .collect()
+}
+
+/// A note carries only its known members and never a credential value.
+pub fn assert_notes_well_formed(notes: &[(String, serde_json::Value)], secret: &str) {
+    for (column, note) in notes {
+        let members = note.as_object().expect("a note is one JSON object");
+        assert!(
+            members
+                .keys()
+                .all(|key| ["sourceType", "partition", "refused"].contains(&key.as_str())),
+            "{column}: a note carries only sourceType, partition, and refused: {note}"
+        );
+        assert!(
+            !note.to_string().contains(secret),
+            "{column}: a note carries no credential value"
+        );
+    }
+}
+
+/// `column`'s note records a refusal naming `fragments`, the column stays declared, and
+/// selecting it fails with that refusal while `ID` stays readable.
+pub fn assert_refused_column(
+    conn: &mut ExaConn,
+    vs_name: &str,
+    table: &str,
+    column: &str,
+    fragments: &[&str],
+) {
+    let notes = column_adapter_notes(conn, vs_name, table);
+    let reason = note_of(&notes, column)["refused"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{table}.{column} must record its refusal: {notes:?}"))
+        .to_string();
+    assert!(
+        fragments.iter().all(|fragment| reason.contains(fragment)),
+        "{table}.{column}'s refusal must name {fragments:?}: {reason}"
+    );
+    assert!(
+        note_of(&notes, "ID").get("refused").is_none(),
+        "{table}.ID is readable: {notes:?}"
+    );
+    assert_eq!(
+        declared_type(conn, vs_name, table, column),
+        VARCHAR_JSON,
+        "{table}.{column} stays declared"
+    );
+    let table_ref = format!("{vs_name}.{table}");
+    assert_query_fails(
+        conn,
+        &format!("SELECT {column} FROM {table_ref}"),
+        &[&reason],
+    );
+    conn.query_columns(&format!("SELECT ID FROM {table_ref}"));
+}
+
+/// The reason `SKIPPED_TABLES` records for `table`, or `None` when the table is not skipped.
+pub fn skip_reason(conn: &mut ExaConn, vs_name: &str, table: &str) -> Option<String> {
+    let notes = conn.query_columns(&format!(
+        "SELECT ADAPTER_NOTES FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{vs_name}'"
+    ));
+    let notes: serde_json::Value = serde_json::from_str(&value_to_string(&notes[0][0]))
+        .unwrap_or_else(|e| panic!("ADAPTER_NOTES must be JSON: {e}"));
+    let skipped = notes["SKIPPED_TABLES"]
+        .as_array()
+        .unwrap_or_else(|| panic!("ADAPTER_NOTES must carry SKIPPED_TABLES: {notes}"));
+    skipped
+        .iter()
+        .find(|entry| value_to_string(&entry["table"]) == table)
+        .map(|entry| value_to_string(&entry["reason"]))
+}
+
+pub fn note_of<'a>(
+    notes: &'a [(String, serde_json::Value)],
+    column: &str,
+) -> &'a serde_json::Value {
+    &notes
+        .iter()
+        .find(|(name, _)| name == column)
+        .unwrap_or_else(|| panic!("no note for column {column}: {notes:?}"))
+        .1
 }
 
 pub fn value_to_string(v: &serde_json::Value) -> String {

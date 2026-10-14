@@ -1,9 +1,10 @@
+use crate::adapter::column_notes::TableNotes;
 use crate::scan::spec::{FileEntry, LogicalField, NameMappingEntry, StorageBackend};
 use exasol_udf_sdk::error::UdfError;
 use serde_json::Value as Json;
 
 use super::super::scan_resolution::TableScanResolver;
-use super::super::support::{column_types, extract_limit, extract_offset};
+use super::super::support::{InvolvedColumns, extract_limit, extract_offset, involved_columns};
 use super::super::topn::{ParsedSortKey, parse_sort_key_element};
 use super::super::{RefusedColumn, ResolvedScan};
 
@@ -223,10 +224,10 @@ pub(super) async fn resolve_one_join_side(
     table_identifier: &str,
     resolver: &TableScanResolver<'_>,
     filter_json: Option<&Json>,
-    declared_columns: &[(String, String)],
+    notes: &TableNotes<'_>,
 ) -> Result<ResolvedJoinSide, UdfError> {
     let resolved = resolver
-        .resolve(table_identifier, filter_json, declared_columns)
+        .resolve(table_identifier, filter_json, notes)
         .await?;
     Ok(ResolvedJoinSide::new(
         table_name.to_string(),
@@ -236,14 +237,19 @@ pub(super) async fn resolve_one_join_side(
 }
 
 /// CROSS-FOLD SEAM: the result is string-matched in `referenced_leg_columns` against names
-/// folded with ASCII-only `to_ascii_uppercase`, while `column_types` folds differently. Do
+/// folded with ASCII-only `to_ascii_uppercase`, while `involved_columns` folds differently. Do
 /// not reconcile the folds (see `walk_column_nodes` and
 /// `pushdown/pushdown-module-structure`). They agree by premise:
 /// `build_listing_virtual_tables` Unicode-uppercases every declared name, leaving no ASCII
 /// lowercase for either fold to touch. E2E `non_ascii_table_and_column_stay_queryable`
 /// guards that premise.
 pub(super) fn involved_table_columns(request: &Json, table_name: &str) -> Vec<(String, String)> {
-    column_types(request, |tables: &[Json]| {
+    involved_table(request, table_name).types
+}
+
+/// One leg's column types and notes from the same pass.
+pub(super) fn involved_table<'r>(request: &'r Json, table_name: &str) -> InvolvedColumns<'r> {
+    involved_columns(request, |tables| {
         tables
             .iter()
             .find(|t| t.get("name").and_then(|n| n.as_str()) == Some(table_name))

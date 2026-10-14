@@ -7,10 +7,11 @@ mod common;
 
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SYS_PASSWORD, VARCHAR_JSON, VsProps,
-    assert_decimal_orders_numerically, assert_type_matrix, create_schema_and_scripts,
-    create_virtual_schema_with_password, declared_types, exa_conn, explain_virtual_sql,
-    has_broadcast_join_block, has_two_scan_wrapper, install_slc, pairs, parse_int, parse_numeric,
-    reads, refuses, upload_so, value_to_string,
+    assert_decimal_orders_numerically, assert_query_fails, assert_type_matrix,
+    column_adapter_notes, create_schema_and_scripts, create_virtual_schema_with_password,
+    declared_schema_of, declared_types, exa_conn, explain_virtual_sql, has_broadcast_join_block,
+    has_two_scan_wrapper, install_slc, local_stack_creds, note_of, pairs, parse_int, parse_numeric,
+    partition_positions, query_error, reads, refuses, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::pruning_cases::{
@@ -58,6 +59,7 @@ use bytes::Bytes;
 use parquet::file::metadata::ParquetMetaData;
 use parquet::file::statistics::Statistics;
 use serde_json::{Value as Json, json};
+use std::collections::BTreeMap;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
@@ -86,6 +88,8 @@ const EXPECTED_TABLES: &[&str] = &[
 const SALES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/sales_parquet";
 const ALL_TYPES_PARQUET_LOCATION: &str = "s3://warehouse/unity_parquet/all_types_parquet";
 const DELTA_EXTRA_TYPES_LOCATION: &str = "s3://warehouse/unity_delta/delta_extra_types";
+const CM_NAME_MODE_PARTITIONED_LOCATION: &str =
+    "s3://warehouse/unity_delta/cm_name_mode_partitioned";
 
 const PRUNING_DELTA_LOCATION: &str = "s3://warehouse/delta_pruning/pruning_cases";
 /// Its own schema, so `VS_NAME` never enumerates the pruning table.
@@ -127,10 +131,12 @@ fn setup() {
         seed_sales_parquet_table();
         seed_all_types_parquet_table();
         seed_delta_extra_types_table();
+        seed_cm_name_mode_partitioned_table();
         seed_pruning_delta_table();
 
         create_unity_virtual_schema(&mut conn);
         create_unity_role_virtual_schema(&mut conn);
+        create_catalog_copy_virtual_schema(&mut conn);
         create_virtual_schema_with_password(
             &mut conn,
             &VsProps::new(VS_DELTA, PRUNING_UNITY_NAMESPACE)
@@ -158,6 +164,22 @@ USING {SCHEMA_NAME}.{ADAPTER_SCRIPT_NAME} WITH
   NAMESPACE  = '{UNITY_NAMESPACE}'
   ALLOW_HTTP         = 'true'"#
     ));
+}
+
+/// Over the seeded entries whose catalog metadata deliberately disagrees with their Delta logs.
+const COPY_VS_NAME: &str = "UNITY_CATALOG_COPY_VS";
+
+/// Runs CREATE through `conn.execute`, so a CREATE that fails over the unusable entries fails
+/// every test.
+fn create_catalog_copy_virtual_schema(conn: &mut ExaConn) {
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(COPY_VS_NAME, "unity.delta_catalog_copy")
+            .with_catalog_kind("UNITY_CATALOG")
+            .with_catalog_conn_name(CONN_NAME),
+        UNITY_CATALOG_URI_INTERNAL,
+        &local_stack_connection_password(),
+    );
 }
 
 /// A second Virtual Schema over the SAME seeded `unity.delta_e2e` namespace.
@@ -230,6 +252,7 @@ fn seed_sales_parquet_table() {
             ("region", json!("string"), "STRING"),
         ],
         partitions: &["year", "region"],
+        name_mapped: false,
     });
 }
 
@@ -254,6 +277,34 @@ struct UnityTable<'a> {
     location: &'a str,
     columns: &'a [(&'a str, Json, &'a str)],
     partitions: &'a [&'a str],
+    /// Name-mode column mapping: column `c` is stored as `col-c`, in data files and in
+    /// `add.partitionValues` alike (Delta PROTOCOL.md § Column Mapping).
+    name_mapped: bool,
+}
+
+impl UnityTable<'_> {
+    fn field(&self, position: usize, name: &str, spark_type: &Json) -> Json {
+        let mut field = spark_field(name, spark_type);
+        if self.name_mapped {
+            field["metadata"] = json!({
+                "delta.columnMapping.id": position + 1,
+                "delta.columnMapping.physicalName": format!("col-{name}"),
+            });
+        }
+        field
+    }
+
+    /// The Delta table properties, which Unity Catalog carries as the table's `properties`.
+    fn configuration(&self) -> Json {
+        if self.name_mapped {
+            json!({
+                "delta.columnMapping.mode": "name",
+                "delta.columnMapping.maxColumnId": self.columns.len().to_string(),
+            })
+        } else {
+            json!({})
+        }
+    }
 }
 
 fn split_unity_namespace(namespace: &str) -> (&str, &str) {
@@ -272,6 +323,7 @@ fn register_unity_table(table: &UnityTable) {
         location,
         columns,
         partitions,
+        ..
     } = table;
     let columns: Vec<Json> = columns
         .iter()
@@ -283,7 +335,7 @@ fn register_unity_table(table: &UnityTable) {
                 .unwrap_or_default();
             let mut entry = json!({
                 "name": column, "type_text": type_text, "type_name": type_name,
-                "type_json": spark_field(column, spark_type).to_string(),
+                "type_json": table.field(position, column, spark_type).to_string(),
                 "position": position, "nullable": true
             });
             if let Some(index) = partitions.iter().position(|p| p == column) {
@@ -313,7 +365,8 @@ fn register_unity_table(table: &UnityTable) {
         .json(&json!({
             "name": name, "catalog_name": catalog_name, "schema_name": schema_name,
             "table_type": "EXTERNAL", "data_source_format": format,
-            "storage_location": location, "columns": columns
+            "storage_location": location, "columns": columns,
+            "properties": table.configuration()
         }))
         .send()
         .unwrap_or_else(|e| panic!("POST {name}: {e}"));
@@ -462,6 +515,7 @@ fn seed_all_types_parquet_table() {
         location: ALL_TYPES_PARQUET_LOCATION,
         columns: &registered,
         partitions: &[],
+        name_mapped: false,
     });
 }
 
@@ -493,6 +547,7 @@ fn seed_delta_extra_types_table() {
         location: DELTA_EXTRA_TYPES_LOCATION,
         columns: &columns,
         partitions: &[],
+        name_mapped: false,
     };
     write_delta_table(
         &table,
@@ -503,6 +558,41 @@ fn seed_delta_extra_types_table() {
             stats: json!({"numRecords": 3}),
         }],
     );
+    register_unity_table(&table);
+}
+
+/// No vendored fixture is both column-mapped and partitioned. Each data file holds only
+/// `col-id`, and its `letter` lives in the log under `col-letter`.
+fn seed_cm_name_mode_partitioned_table() {
+    let columns = [
+        ("id", json!("long"), "LONG"),
+        ("letter", json!("string"), "STRING"),
+    ];
+    let table = UnityTable {
+        namespace: UNITY_NAMESPACE,
+        name: "cm_name_mode_partitioned",
+        format: "DELTA",
+        location: CM_NAME_MODE_PARTITIONED_LOCATION,
+        columns: &columns,
+        partitions: &["letter"],
+        name_mapped: true,
+    };
+    let files: Vec<DeltaDataFile> = [(1, "a"), (2, "b")]
+        .into_iter()
+        .map(|(id, letter)| DeltaDataFile {
+            path: format!("col-letter={letter}/part-0.parquet"),
+            partition_values: json!({ "col-letter": letter }),
+            parquet: encode_parquet(
+                &RecordBatch::try_from_iter(vec![(
+                    "col-id",
+                    Arc::new(Int64Array::from(vec![id])) as _,
+                )])
+                .expect("cm_name_mode_partitioned batch"),
+            ),
+            stats: json!({"numRecords": 1}),
+        })
+        .collect();
+    write_delta_table(&table, &files);
     register_unity_table(&table);
 }
 
@@ -526,18 +616,20 @@ fn write_delta_table(table: &UnityTable, files: &[DeltaDataFile]) {
     delete_fixture_prefix(location);
     let fields: Vec<Json> = columns
         .iter()
-        .map(|(name, spark_type, _)| spark_field(name, spark_type))
+        .enumerate()
+        .map(|(position, (name, spark_type, _))| table.field(position, name, spark_type))
         .collect();
     let id = location
         .rsplit('/')
         .next()
         .expect("a table location has a last path segment");
     let mut log = vec![
-        json!({"protocol": delta_protocol(columns)}),
+        json!({"protocol": delta_protocol(table)}),
         json!({"metaData": {
             "id": id, "format": {"provider": "parquet", "options": {}},
             "schemaString": json!({"type": "struct", "fields": fields}).to_string(),
-            "partitionColumns": partition_columns, "configuration": {}, "createdTime": 0
+            "partitionColumns": partition_columns, "configuration": table.configuration(),
+            "createdTime": 0
         }}),
     ];
     for file in files {
@@ -557,9 +649,14 @@ fn delta_first_commit_uri(location: &str) -> String {
 }
 
 /// Delta PROTOCOL.md § Timestamp without timezone: a `timestamp_ntz` column needs reader
-/// version 3, writer version 7, and `timestampNtz` in both feature lists.
-fn delta_protocol(columns: &[(&str, Json, &str)]) -> Json {
-    if columns
+/// version 3, writer version 7, and `timestampNtz` in both feature lists. § Column Mapping:
+/// reader version 2 and writer version 5 enable it.
+fn delta_protocol(table: &UnityTable) -> Json {
+    if table.name_mapped {
+        return json!({"minReaderVersion": 2, "minWriterVersion": 5});
+    }
+    if table
+        .columns
         .iter()
         .any(|(_, spark_type, _)| spark_type == "timestamp_ntz")
     {
@@ -599,6 +696,7 @@ fn seed_pruning_delta_table() {
         location: PRUNING_DELTA_LOCATION,
         columns: &columns,
         partitions: &[PRUNING_PARTITION_COLUMN],
+        name_mapped: false,
     };
     write_delta_table(&table, &files);
     register_unity_table(&table);
@@ -771,6 +869,7 @@ async fn resolve_unity_scan(
         .await
         .unwrap_or_else(|e| panic!("load_table({table_name}) failed: {e}"));
     let storage = delta_static_storage();
+    let declared = declared_schema_of(&mut exa_conn(), VS_NAME, &table_name.to_uppercase());
 
     let reader = format_reader(
         ScanSource::Unity {
@@ -785,8 +884,7 @@ async fn resolve_unity_scan(
     )
     .unwrap_or_else(|e| panic!("format_reader({table_name}) failed: {e}"));
 
-    reader
-        .resolve_scan(filter)
+    ResolvedScan::resolve(reader.as_ref(), declared, filter)
         .await
         .unwrap_or_else(|e| panic!("resolve_scan({table_name}) failed: {e}"))
 }
@@ -831,8 +929,7 @@ fn rt() -> tokio::runtime::Runtime {
 /// Scenario: Vended and static credentials resolve the same scan
 #[test]
 fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
-    wait_for_seaweedfs();
-    wait_for_unity_catalog();
+    setup();
 
     let rt = rt();
     let vended = rt.block_on(resolve_unity_scan("basic_partitioned", true, None));
@@ -895,8 +992,7 @@ fn unity_delta_planning_agrees_under_vended_and_static_credentials() {
 /// Scenario: Pruning reaches every request shape and changes no result end to end
 #[test]
 fn unity_delta_filters_prune_the_resolved_file_list() {
-    wait_for_seaweedfs();
-    wait_for_unity_catalog();
+    setup();
 
     let rt = rt();
 
@@ -1130,6 +1226,19 @@ fn unity_delta_column_mapped_tables_return_logical_column_values() {
             );
         }
     }
+
+    let partitioned = table_ref("CM_NAME_MODE_PARTITIONED");
+    let letters = conn.query_columns(&format!("SELECT LETTER FROM {partitioned} ORDER BY ID"));
+    assert_eq!(
+        letters[0],
+        [json!("a"), json!("b")],
+        "partition values are logged under the physical name `col-letter` and read as LETTER"
+    );
+    assert_eq!(
+        conn.query_scalar_i64(&format!("SELECT ID FROM {partitioned} WHERE LETTER = 'b'")),
+        2,
+        "a filter on the partition column matches by its physical name"
+    );
 }
 
 /// Scenario: A partition column absent from the data file is materialized per file
@@ -2017,6 +2126,8 @@ fn unity_delta_pruned_pushdown_sql_carries_fewer_files_and_drives_the_scan_udf()
     );
 }
 
+/// Scenario: Partition columns come from the catalog and partition values from the file paths
+/// Scenario: A partition column's note carries its position among the partition columns
 #[test]
 fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
     setup();
@@ -2035,6 +2146,16 @@ fn unity_parquet_table_is_listed_and_returns_its_rows_and_partition_values() {
             ("REGION", VARCHAR_JSON),
         ]),
         "Parquet columns must precede partition columns, in declared order"
+    );
+    assert_eq!(
+        partition_positions(&column_adapter_notes(&mut conn, VS_NAME, "SALES_PARQUET")),
+        [
+            ("AMOUNT", None),
+            ("ID", None),
+            ("REGION", Some(1)),
+            ("YEAR", Some(0))
+        ],
+        "CREATE records each partition column at its partition_index"
     );
 
     let cols = conn.query_columns(&format!(
@@ -2128,6 +2249,18 @@ fn unity_parquet_all_types_declare_and_return_their_mapped_values() {
         ],
     );
     assert_decimal_orders_numerically(&mut conn, VS_NAME, "ALL_TYPES_PARQUET", "C_DECIMAL_18_0");
+
+    let notes = column_adapter_notes(&mut conn, VS_NAME, "ALL_TYPES_PARQUET");
+    let refused: Vec<&str> = notes
+        .iter()
+        .filter(|(_, note)| !note["refused"].is_null())
+        .map(|(column, _)| column.as_str())
+        .collect();
+    assert_eq!(
+        refused,
+        ["C_BINARY", "C_STRUCT_BINARY", "C_VARIANT"],
+        "CREATE records each refusal in its column's note"
+    );
 }
 
 /// Scenario: Vended and static credentials resolve the same scan
@@ -2142,6 +2275,255 @@ fn unity_parquet_planning_agrees_under_vended_and_static_credentials() {
     assert_eq!(vended.table_root, static_creds.table_root);
     assert_eq!(vended.files, static_creds.files);
     assert_eq!(vended.files.len(), 3, "{:?}", vended.files);
+}
+
+fn copy_ref(table: &str) -> String {
+    format!("{COPY_VS_NAME}.{table}")
+}
+
+/// Scenario: Every declared column carries its source shape in its adapterNotes
+#[test]
+fn unity_delta_and_parquet_columns_persist_source_notes() {
+    setup();
+    let mut conn = exa_conn();
+
+    for table in ["CM_NAME_MODE", "STATS_ALL_TYPES", "SALES_PARQUET"] {
+        let notes = column_adapter_notes(&mut conn, VS_NAME, table);
+        assert_eq!(
+            notes.len(),
+            declared_types(&mut conn, VS_NAME, table).len(),
+            "{table}: every column carries a note"
+        );
+        for (column, note) in &notes {
+            assert!(
+                note["sourceType"]["arrow_type"].is_string(),
+                "{table}.{column}: {note}"
+            );
+        }
+    }
+}
+
+/// Scenario: Create virtual schema declares each Delta column from its type_json and the table's column-mapping mode property
+#[test]
+fn unity_create_declares_delta_columns_from_catalog_metadata() {
+    setup();
+    let mut conn = exa_conn();
+    let name_mode = column_adapter_notes(&mut conn, VS_NAME, "CM_NAME_MODE");
+    let id_mode = column_adapter_notes(&mut conn, VS_NAME, "CM_ID_MODE");
+    let partitioned = column_adapter_notes(&mut conn, VS_NAME, "BASIC_PARTITIONED");
+
+    let key = |note: &Json| {
+        let source_type = &note["sourceType"];
+        (
+            source_type["field_id"].clone(),
+            source_type["physical_name"].clone(),
+        )
+    };
+    assert_eq!(
+        key(note_of(&name_mode, "ID")),
+        (
+            Json::Null,
+            json!("col-80396d42-d765-483e-b86e-7ac1e13ef88c")
+        ),
+        "name mode records the physical name alone"
+    );
+    assert_eq!(
+        key(note_of(&id_mode, "ID")),
+        (json!(1), Json::Null),
+        "id mode records the field id alone"
+    );
+    for (column, note) in &partitioned {
+        assert_eq!(
+            key(note),
+            (Json::Null, Json::Null),
+            "{column}: no mode, no key"
+        );
+    }
+    assert_eq!(note_of(&partitioned, "LETTER")["partition"], 0);
+    assert_eq!(note_of(&partitioned, "NUMBER").get("partition"), None);
+    assert_eq!(
+        declared_types(&mut conn, VS_NAME, "CM_NAME_MODE"),
+        pairs(&[
+            ("ID", "DECIMAL(20,0)"),
+            ("NAME", "VARCHAR(2000000)"),
+            ("VALUE", "DOUBLE"),
+        ])
+    );
+}
+
+/// Scenario: Enumeration names tables through the shared fold and stops at catalog metadata
+#[test]
+fn unity_create_declares_a_delta_table_whose_location_holds_no_log() {
+    setup();
+    let mut conn = exa_conn();
+
+    assert_eq!(
+        declared_types(&mut conn, COPY_VS_NAME, "NO_LOG"),
+        pairs(&[
+            ("LETTER", "VARCHAR(2000000)"),
+            ("NUMBER", "DECIMAL(20,0)"),
+            ("A_FLOAT", "DOUBLE"),
+        ]),
+        "CREATE declares the table from catalog metadata without reading a log"
+    );
+    assert_eq!(
+        note_of(
+            &column_adapter_notes(&mut conn, COPY_VS_NAME, "NO_LOG"),
+            "LETTER"
+        )["partition"],
+        0
+    );
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT \"NUMBER\" FROM {}", copy_ref("NO_LOG")),
+        &["no-log-here"],
+    );
+}
+
+/// Scenario: A Delta column whose column-mapping metadata is unusable is refused in its note and the table stays listed
+#[test]
+fn unity_unusable_column_mapping_metadata_refuses_only_its_column() {
+    setup();
+    let mut conn = exa_conn();
+    let unannotated = "VALUE_WITHOUT_PHYSICAL_NAME";
+
+    let tables = enumerated_table_names(&mut conn, COPY_VS_NAME);
+    for table in [unannotated, "LABEL_MODE"] {
+        assert!(
+            tables.iter().any(|t| t == table),
+            "{table} is listed: {tables:?}"
+        );
+    }
+
+    let rows = conn.query_columns(&format!("SELECT ID, NAME FROM {}", copy_ref(unannotated)));
+    assert_eq!(
+        rows[0].len(),
+        3,
+        "the other columns stay queryable: {rows:?}"
+    );
+    let refused = &["'value'", "Name-mode", "delta.columnMapping.physicalName"];
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT \"VALUE\" FROM {}", copy_ref(unannotated)),
+        refused,
+    );
+    let label = query_error(
+        &mut conn,
+        &format!("SELECT ID FROM {}", copy_ref("LABEL_MODE")),
+    );
+    assert!(
+        label.contains("'label'") && label.contains("'id'"),
+        "{label}"
+    );
+    assert!(!label.contains(&local_stack_creds().secret_key), "{label}");
+}
+
+/// Scenario: The client carries each table's properties verbatim from the list sweep and the single-table load
+#[test]
+fn unity_session_carries_table_properties_from_list_and_load() {
+    setup();
+    let session = UnityCatalogSession::new(&unity_catalog_url(), delta_creds(false));
+    let namespace = ["unity".to_string(), "delta_e2e".to_string()];
+    let expected = BTreeMap::from([
+        ("delta.columnMapping.mode".to_string(), "name".to_string()),
+        (
+            "delta.columnMapping.maxColumnId".to_string(),
+            "3".to_string(),
+        ),
+        ("delta.enableChangeDataFeed".to_string(), "true".to_string()),
+    ]);
+
+    let rt = rt();
+    let listing = rt
+        .block_on(session.list_tables(&namespace))
+        .expect("the namespace lists");
+    let loaded = rt
+        .block_on(session.load_table(&delta_e2e_table("cm_name_mode")))
+        .expect("the table loads");
+
+    let listed = |name: &str| {
+        let table = listing.tables.iter().find(|table| table.ident.name == name);
+        table
+            .unwrap_or_else(|| panic!("{name} is listed"))
+            .properties
+            .clone()
+    };
+    assert_eq!(listed("cm_name_mode"), expected);
+    assert_eq!(loaded.properties, expected);
+    assert_eq!(listed("sales_parquet"), BTreeMap::new());
+}
+
+/// Scenario: A declaration that disagrees with the Delta log fails the query
+#[test]
+fn unity_delta_query_fails_when_the_catalog_copy_disagrees_with_the_log() {
+    setup();
+    let mut conn = exa_conn();
+
+    for (table, column, part) in [
+        ("NO_MODE", "ID", "column-mapping mode is 'name'"),
+        (
+            "NO_PARTITION_INDEX",
+            "NUMBER",
+            r#"partitions by ["letter"]"#,
+        ),
+    ] {
+        assert_query_fails(
+            &mut conn,
+            &format!("SELECT \"{column}\" FROM {}", copy_ref(table)),
+            &[table, part, "type_json", "ALTER VIRTUAL SCHEMA ... REFRESH"],
+        );
+    }
+}
+
+/// Scenario: A declared non-nullable column that the Delta log marks nullable fails the query
+#[test]
+fn unity_delta_non_nullable_declaration_of_a_nullable_column_fails() {
+    setup();
+    let mut conn = exa_conn();
+    let table = copy_ref("ID_NOT_NULL");
+
+    for sql in [
+        format!("SELECT ID FROM {table} WHERE ID IS NULL"),
+        format!("SELECT NAME FROM {table}"),
+    ] {
+        assert_query_fails(
+            &mut conn,
+            &sql,
+            &[
+                "'ID'",
+                "ID_NOT_NULL",
+                "allows NULL",
+                "ALTER VIRTUAL SCHEMA ... REFRESH",
+            ],
+        );
+    }
+}
+
+/// Scenario: Every recorded Delta type change is validated, and an unsupported one refuses its column
+#[test]
+fn unity_unsupported_type_change_in_type_json_refuses_its_column() {
+    setup();
+    let mut conn = exa_conn();
+
+    let notes = column_adapter_notes(&mut conn, VS_NAME, "TYPE_WIDENING");
+    let refusal = note_of(&notes, "BYTE_DECIMAL")["refused"].to_string();
+    for fragment in [
+        "byte_decimal",
+        "'byte'",
+        "'decimal(4,1)'",
+        "delta.typeChanges",
+    ] {
+        assert!(
+            refusal.contains(fragment),
+            "'{fragment}' missing: {refusal}"
+        );
+    }
+    assert_eq!(note_of(&notes, "BYTE_LONG").get("refused"), None);
+    assert_query_fails(
+        &mut conn,
+        &format!("SELECT BYTE_DECIMAL FROM {}", table_ref("TYPE_WIDENING")),
+        &["byte_decimal", "'byte'", "'decimal(4,1)'"],
+    );
 }
 
 /// Scenario: Delta pruning keeps every file with a matching row for every filter shape

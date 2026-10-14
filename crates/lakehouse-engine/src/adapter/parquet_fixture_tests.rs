@@ -93,3 +93,32 @@ pub(crate) fn values(pairs: &[(&str, Option<&str>)]) -> BTreeMap<String, Option<
         .map(|(key, value)| (key.to_string(), value.map(str::to_string)))
         .collect()
 }
+
+/// What CREATE records for `table` under `base_path`: each column's Exasol name and note, taken
+/// from the real client over `store`, so a reader test plans from what enumeration writes.
+pub(crate) async fn enumerated_notes(
+    store: &Arc<dyn object_store::ObjectStore>,
+    base_path: &str,
+    table: &str,
+    options: DirectoryOptions,
+) -> Vec<(String, Option<String>)> {
+    use lakehouse_catalog::CatalogClient;
+    let listing = crate::adapter::direct_storage::DirectStorageCatalogClient::over_store(
+        Arc::clone(store),
+        base_path,
+        options,
+    )
+    .expect("the fixture base path is a valid storage URI")
+    .list_tables(&[])
+    .await
+    .expect("the fixture directory enumerates");
+    listing
+        .tables
+        .into_iter()
+        .find(|candidate| candidate.ident.name == table)
+        .unwrap_or_else(|| panic!("the fixture enumerates no table '{table}'"))
+        .columns
+        .into_iter()
+        .map(|column| (column.name.to_uppercase(), column.declaration))
+        .collect()
+}
