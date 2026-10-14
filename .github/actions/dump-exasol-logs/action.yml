@@ -1,0 +1,52 @@
+name: Dump Exasol logs
+description: >
+  Failure diagnostics shared by the e2e, e2e-lakekeeper, e2e-unity, e2e-azure and e2e-glue jobs:
+  host dmesg, the named services' logs, exasql crash logs, and the /exa/logs tree as an artifact.
+  Callers must guard the step with `if: failure()`.
+inputs:
+  compose:
+    description: The `docker compose` command, with the `-f` files of the job's stack.
+    default: docker compose
+  services:
+    description: Space-separated compose services whose last 100 log lines are printed.
+    default: ""
+  artifact-name:
+    description: Name of the uploaded /exa/logs artifact, unique within the run.
+    required: true
+runs:
+  using: composite
+  steps:
+    # A UDF sandbox crash leaves empty DB-side logs; the reason is only in host dmesg.
+    # The caller runs this only on failure, so no step may rely on the implicit `success()`.
+    - name: Dump Exasol logs
+      if: ${{ !cancelled() }}
+      shell: bash
+      env:
+        COMPOSE: ${{ inputs.compose }}
+        SERVICES: ${{ inputs.services }}
+        LOG_DIR: ${{ inputs.artifact-name }}
+      run: |
+        echo "=== container stats / host free ==="
+        $COMPOSE ps || true
+        free -m || true
+        echo "=== HOST kernel ring buffer (sudo) ==="
+        sudo dmesg --ctime | grep -iE 'exaudf|seccomp|segfault|trap|invalid opcode|illegal|sig(sys|ill|segv|abrt)|signal [0-9]|killed process|oom|audit.*denied' | tail -60 || true
+        echo "--- last 40 kernel lines (fallback) ---"
+        sudo dmesg --ctime | tail -40 || true
+        for service in $SERVICES; do
+          echo "=== $service logs ==="
+          $COMPOSE logs "$service" | tail -100 || true
+        done
+        echo "=== exasql crash logs ==="
+        $COMPOSE exec -T exasol sh -c 'find /exa/logs/cored -name "exasql.*" -type f 2>/dev/null | sort | xargs -I{} sh -c "echo === {} ===; tail -40 {}"' || true
+        echo "=== collecting /exa/logs tree for artifact ==="
+        rm -rf "$LOG_DIR" && mkdir -p "$LOG_DIR"
+        $COMPOSE cp exasol:/exa/logs "$LOG_DIR/" 2>/dev/null || true
+
+    - name: Upload Exasol logs
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@v7
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: ${{ inputs.artifact-name }}/
+        if-no-files-found: ignore

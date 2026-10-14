@@ -41,9 +41,6 @@ output "token_uri_private" {
   value = local.token_uri_private
 }
 
-# Realm name, OAuth2 client id, client secret, and audience are READ from the jsondecode(file(...))
-# local declared in locals.tf (task 1.1) — scripts/keycloak-realm-iceberg.json stays their single
-# owner (decision [2]). Never retyped as literals here.
 output "oidc_realm" {
   value = local.oidc_realm
 }
@@ -65,11 +62,7 @@ output "ssm_root" {
   value = local.ssm_root
 }
 
-# The DATA-stack's SSM root, re-published so lakekeeper-up.sh can read it instead of composing it.
-# It is NOT derivable from this stack's env_name: data-stack defaults env_name to "data" and is
-# applied with no override, so the two names differ in every documented run. Sourced from the same
-# data.terraform_remote_state.data declared in providers.tf, so this introduces no cluster-stack
-# dependency (plan.md § Dependencies).
+# Not derivable from this stack's env_name: data-stack is applied with its own env_name ("data").
 output "data_ssm_root" {
   value = data.terraform_remote_state.data.outputs.ssm_root
 }

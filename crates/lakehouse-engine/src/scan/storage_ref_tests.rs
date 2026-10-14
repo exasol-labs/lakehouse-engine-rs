@@ -164,6 +164,7 @@ fn join_spec_resolves_two_sides_independently() {
         logical_schema: Vec::new(),
         name_mapping: Vec::new(),
         post_join_limit: None,
+        post_join_order_by: Vec::new(),
         partition_columns: Vec::new(),
     });
 

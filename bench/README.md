@@ -14,7 +14,7 @@ make bench                  # build .so → run → write bench/reports/<ts>.txt
 Config comes from a gitignored `bench/.env` (copy `bench/.env.example`).
 `BENCH_TARGET` picks the mode:
 
-- **`docker` (default)** — self-contained. Brings up the local stack (MinIO +
+- **`docker` (default)** — self-contained. Brings up the local stack (SeaweedFS +
   Iceberg REST + Exasol via `docker-compose.yml`), loads TPC-H into the local
   catalog, runs the query set + pushdown checks. No AWS; `.env` optional.
 - **`remote`** — runs against a real AWS catalog (Glue by default, or
@@ -100,12 +100,16 @@ the live row set by applying Parquet position-delete files during a scan.
 
 Each run writes a timestamped report to `bench/reports/` (gitignored).
 
-## Parallelism (docker)
+## Parallelism
 
-`BENCH_NR_OF_CORES` (default 4) overrides the auto-detected core count and drives
-the DataFusion target-partitions / threads-per-UDF defaults; multi-file tables
-(`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 8) drive the
-`GROUP BY shard_key` fan-out. See `../CLAUDE.md` for the engine memory/fan-out model.
+The adapter auto-detects the per-node core count (`std::thread::available_parallelism()`)
+and drives the DataFusion target-partitions / threads-per-UDF defaults from it; multi-file
+tables (`TPCH_FILES`) + `BENCH_PARALLELISM_FACTOR` (default 8) drive the `GROUP BY
+shard_key` fan-out. In docker mode, `LH_EXASOL_CPUSET` pins the Exasol container to a CPU
+set (for example `0-1`), and the adapter detects exactly that set, so it is the lever for
+the detected core count. Name CPUs the host actually has: Docker rejects a cpuset naming an
+absent CPU. Remote mode has no equivalent lever: the detected core count there is the real
+cluster node's core count. See `../CLAUDE.md` for the engine memory/fan-out model.
 
 ## Companion scripts
 
@@ -185,8 +189,8 @@ auto-provision both, consistent with never auto-double-provisioning Trino/EMR.
   Exasol. An earlier version spun up a fresh Docker container + JVM **per query** from the operator's
   machine, reaching Trino over the public internet — that made native Trino look slower than it is,
   which is why IMPORT FROM JDBC appeared to beat it on every query, purely from measurement bias.
-  Requires the Trino EC2 key pair's private key locally to SSH into the worker (`KEY_FILE`,
-  default `~/.ssh/<project>-rsa` — apply the stack with a `key_pair_name` you actually hold);
+  Requires the Trino EC2 key pair's private key locally to SSH into the worker (set `KEY_FILE` to its path, no default —
+  apply the stack with a `key_pair_name` you actually hold);
   resolves the coordinator's private ip itself via the AWS CLI (connecting from the worker to the
   coordinator's *public* ip does not reliably pass the security group's internode rule).
 - **`spark_compare.sh`** — requires `deploy/data-stack` applied with `-var
@@ -218,7 +222,7 @@ script, translated from `run.sh`'s Q1-Q9b and NQ1-NQ5 — keep all four in sync 
 Two host-runnable micro-benchmarks isolate the two halves of the per-instance
 scan path so end-to-end throughput can be attributed (plan tasks 5.1 / 5.2).
 They live in `crates/lakehouse-engine/tests/micro_bench.rs` (an `#[ignore]`-gated
-test target — no new dependency, no `criterion`) and need neither MinIO nor a
+test target — no new dependency, no `criterion`) and need neither SeaweedFS nor a
 cluster:
 
 - **5.1 emit-only** — the pre-SDK emit work on every batch: `coerce_batch_to_exa_types`

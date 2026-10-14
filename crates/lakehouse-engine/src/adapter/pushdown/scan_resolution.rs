@@ -1,86 +1,106 @@
-//! Per-request table resolution: the pushdown path's ONE catalog-kind match, and
-//! the ONE thing the pipeline learns about a table.
+use std::collections::HashSet;
+use std::sync::Arc;
 
 use exasol_udf_sdk::error::UdfError;
 use lakehouse_catalog::{
-    CatalogClient, CatalogProps, CatalogSession, CatalogTableIdent, UnityCatalogSession,
-    parse_table_ident,
+    CatalogClient, CatalogProps, CatalogSession, CatalogTableIdent, GlueCatalogSession,
+    UnityCatalogSession, parse_glue_table_ident, parse_table_ident,
 };
+use object_store::ObjectStore;
 use serde_json::Value as Json;
 
 use super::{ConnectionStorage, ResolvedScan, ScanSource, format_reader};
 use crate::adapter::catalog_kind::CatalogKind;
+use crate::adapter::direct_storage_properties::{
+    join_storage_path, resolve_direct_storage_properties,
+};
+use crate::adapter::parquet_directory::DirectoryOptions;
+use crate::adapter::permission::PermissionCheck;
+use crate::scan::{build_admission_limited_store, store_root_url};
 
 #[cfg(test)]
 #[path = "scan_resolution_tests.rs"]
 mod tests;
 
-/// One pushdown request's table resolver: every table the request touches, in the
-/// one shape every table format answers.
+/// Built once per request with the catalog session resolved into it, so a
+/// multi-leg join costs no more catalog authentication than a single scan.
 ///
-/// Built ONCE per request, which is what makes a per-table session rebuild
-/// inexpressible — the catalog session is resolved INTO the resolver and
-/// [`Self::resolve`] takes `&self`, so a two-leg join performs no more catalog
-/// authentication round-trips than a single-table scan.
-///
-/// Deep by design: a [`ResolvedScan`] is the whole of what the pipeline learns
-/// about a table, so the single-table path, each join leg, and every aggregate
-/// shape resolve identically and none of them names a table format or a catalog
-/// kind.
+/// Every shape loads tables through [`Self::resolve`], so the permission check runs once here and
+/// a shape added later cannot skip it.
 pub(super) struct TableScanResolver<'a> {
     session: RequestSession,
     connection: ConnectionStorage<'a>,
+    admission: TableAdmission,
 }
 
-/// The request's live catalog session, in the shape its catalog kind resolved
-/// into.
-///
-/// Deliberately NOT the [`CatalogKind`] value: the kind is matched once, in
-/// [`TableScanResolver::for_request`], and an already-resolved session is all
-/// every later step needs. Carrying the kind alongside it would invite a second
-/// match site free to disagree with the first.
+/// Which identifiers [`TableScanResolver::resolve`] may load.
+enum TableAdmission {
+    Unchecked,
+    /// A kind that runs no check authorizes none, so a gated request under it reads no table.
+    Authorized(HashSet<String>),
+}
+
+impl TableAdmission {
+    fn admit(&self, table_identifier: &str) -> Result<(), UdfError> {
+        match self {
+            Self::Unchecked => Ok(()),
+            Self::Authorized(tables) if tables.contains(table_identifier) => Ok(()),
+            Self::Authorized(_) => Err(UdfError::User(format!(
+                "pushdown: the Lakekeeper permission check did not cover table \
+                 '{table_identifier}', so the adapter does not read it"
+            ))),
+        }
+    }
+}
+
+/// Deliberately not the [`CatalogKind`]: the kind is matched once in
+/// [`TableScanResolver::for_request`], so no second match site can disagree.
 enum RequestSession {
     Iceberg(CatalogSession),
-    /// Boxed: a Unity Catalog session is several times the size of an Iceberg
-    /// one, and a request holds exactly one session either way.
     Unity(Box<UnityCatalogSession>),
+    Glue(Box<GlueCatalogSession>),
+    DirectStorage {
+        store: Arc<dyn ObjectStore>,
+        base_path: String,
+        options: DirectoryOptions,
+    },
 }
 
 impl<'a> TableScanResolver<'a> {
-    /// Resolve this request's catalog session at the pushdown path's ONE
-    /// exhaustive [`CatalogKind`] match, so a third catalog kind is a compile
-    /// error here rather than a silent fall-through.
+    /// The pushdown path's one exhaustive [`CatalogKind`] match.
     ///
-    /// `connection` is the CONNECTION's static storage decision every table this
-    /// request resolves is read through.
+    /// Every `table_identifiers` entry is validated by its own format's rule before
+    /// the session is built: the Iceberg arm contacts the network for `/v1/config`,
+    /// so a later check would surface a transport error instead of the parse error.
     ///
-    /// `table_identifiers` names every table the request will go on to resolve.
-    /// Each is checked against the identifier rule of the kind's OWN table format,
-    /// inside that kind's arm and ahead of the session that arm builds — so the
-    /// shape decision cannot be taken by another format's rule, and cannot be
-    /// skipped by a caller that forgets it. The ordering is load-bearing: the
-    /// Iceberg arm resolves its `/v1/config` prefix over the network, so an
-    /// identifier checked afterwards would surface a transport error from an
-    /// unreachable catalog rather than the parse error it is.
+    /// With an enforced `permission`, the Iceberg arm batch-checks every identifier before any
+    /// `loadTable`, and the resolver then admits only those.
     pub(super) async fn for_request(
         kind: CatalogKind,
         catalog_uri: &str,
         connection: ConnectionStorage<'a>,
         table_identifiers: &[&str],
+        props: &Json,
+        permission: &PermissionCheck,
     ) -> Result<Self, UdfError> {
+        let mut authorized = HashSet::new();
         let session = match kind {
             CatalogKind::IcebergRest => {
                 for identifier in table_identifiers {
                     parse_table_ident(identifier)?;
                 }
-                RequestSession::Iceberg(
-                    CatalogSession::resolve(
-                        catalog_uri,
-                        &connection.creds.warehouse,
-                        connection.creds,
-                    )
-                    .await?,
+                let session = CatalogSession::resolve(
+                    catalog_uri,
+                    &connection.creds.warehouse,
+                    connection.creds,
                 )
+                .await?;
+                if let PermissionCheck::Enforced(gate) = permission {
+                    gate.authorize(&session, table_identifiers, connection.creds)
+                        .await?;
+                    authorized.extend(table_identifiers.iter().map(ToString::to_string));
+                }
+                RequestSession::Iceberg(session)
             }
             CatalogKind::UnityCatalogNative => {
                 for identifier in table_identifiers {
@@ -91,26 +111,55 @@ impl<'a> TableScanResolver<'a> {
                     connection.creds.clone(),
                 )))
             }
+            CatalogKind::Glue => {
+                for identifier in table_identifiers {
+                    parse_glue_table_ident(identifier)?;
+                }
+                RequestSession::Glue(Box::new(GlueCatalogSession::new(
+                    catalog_uri,
+                    connection.storage.clone(),
+                    connection.creds.clone(),
+                )?))
+            }
+            CatalogKind::DirectStorage => {
+                for identifier in table_identifiers {
+                    direct_storage_directory(identifier)?;
+                }
+                let properties = resolve_direct_storage_properties(props, catalog_uri)?;
+                let store = build_admission_limited_store(
+                    connection.storage,
+                    &store_root_url(&properties.base_path)?,
+                    &connection.storage.secret_values(),
+                )?;
+                let options = properties.directory_options();
+                RequestSession::DirectStorage {
+                    store,
+                    base_path: properties.base_path,
+                    options,
+                }
+            }
+        };
+        let admission = match permission {
+            PermissionCheck::Off => TableAdmission::Unchecked,
+            PermissionCheck::Enforced(_) => TableAdmission::Authorized(authorized),
         };
         Ok(Self {
             session,
             connection,
+            admission,
         })
     }
 
-    /// `table_identifier`'s table as it stands now: its active files, the storage
-    /// they were resolved THROUGH, its logical schema, its table root, its name
-    /// mapping, and its partition columns.
-    ///
-    /// `table_identifier` is the original-cased, dot-joined catalog identifier
-    /// recorded in `TABLE_MAP` at create time. `filter_json` is the request's raw
-    /// filter, forwarded unchanged so each format prunes by it wherever its own
-    /// planning can; `None` prunes nothing.
+    /// `table_identifier` is the original-cased `TABLE_MAP` identifier. `filter_json`
+    /// is forwarded unchanged for format-side pruning. `declared_columns` is read only
+    /// by a format whose pruning can drop every file carrying a column.
     pub(super) async fn resolve(
         &self,
         table_identifier: &str,
         filter_json: Option<&Json>,
+        declared_columns: &[(String, String)],
     ) -> Result<ResolvedScan, UdfError> {
+        self.admission.admit(table_identifier)?;
         match &self.session {
             RequestSession::Iceberg(session) => {
                 let catalog_props = CatalogProps {
@@ -131,9 +180,40 @@ impl<'a> TableScanResolver<'a> {
                     .load_table(&unity_table_ident(table_identifier)?)
                     .await?;
                 let reader = format_reader(
-                    ScanSource::UnityDelta {
+                    ScanSource::Unity {
                         session: session.as_ref(),
                         table: &table,
+                    },
+                    &self.connection,
+                )?;
+                reader.resolve_scan(filter_json).await
+            }
+            RequestSession::Glue(session) => {
+                let table = session
+                    .load_table(&parse_glue_table_ident(table_identifier)?)
+                    .await?;
+                let reader = format_reader(
+                    ScanSource::Glue {
+                        session: session.as_ref(),
+                        table: &table,
+                    },
+                    &self.connection,
+                )?;
+                reader.resolve_scan(filter_json).await
+            }
+            RequestSession::DirectStorage {
+                store,
+                base_path,
+                options,
+            } => {
+                let table_root =
+                    join_storage_path(base_path, Some(direct_storage_directory(table_identifier)?));
+                let reader = format_reader(
+                    ScanSource::DirectParquet {
+                        store,
+                        table_root: &table_root,
+                        options: *options,
+                        declared_columns,
                     },
                     &self.connection,
                 )?;
@@ -143,20 +223,31 @@ impl<'a> TableScanResolver<'a> {
     }
 }
 
-/// Recover a Unity Catalog table's identity from the dot-joined identifier
-/// recorded in `TABLE_MAP` — the ONE place the Unity Catalog identifier shape is
-/// decided.
-///
-/// The split is the exact inverse of the join that recorded it, and the Unity
-/// Catalog addresses a table by that same dotted full name — the loader re-joins
-/// the segments verbatim — so the round trip is lossless and cannot address a
-/// different table.
-///
-/// Both shapes that name no Unity Catalog table are refused here rather than
-/// sent to the catalog: an identifier carrying no separator at all recovers an
-/// EMPTY namespace, which addresses nothing under `catalog.schema.table`; and an
-/// identifier whose last segment is empty names no table, where falling back to
-/// the segment before it would resolve a DIFFERENT table.
+/// Refuses empty, separator-carrying, or relative-path values, which would compose
+/// a table root outside the storage base path.
+fn direct_storage_directory(table_identifier: &str) -> Result<&str, UdfError> {
+    let refusal = |reason: &str| {
+        Err(UdfError::User(format!(
+            "pushdown: the recorded catalog identifier '{table_identifier}' names no \
+             first-level directory under the storage base path — {reason}; drop and \
+             recreate the virtual schema"
+        )))
+    };
+    if table_identifier.trim().is_empty() {
+        return refusal("it is empty");
+    }
+    if table_identifier.contains('/') || table_identifier.contains('\\') {
+        return refusal("it carries a path separator");
+    }
+    if table_identifier == "." || table_identifier == ".." {
+        return refusal("it names a relative path rather than a directory");
+    }
+    Ok(table_identifier)
+}
+
+/// An identifier with no separator (empty namespace) or an empty last segment is
+/// refused rather than sent to the catalog: falling back to an earlier segment
+/// would address a different table.
 fn unity_table_ident(table_identifier: &str) -> Result<CatalogTableIdent, UdfError> {
     let Some((namespace, name)) = table_identifier.rsplit_once('.') else {
         return Err(UdfError::User(format!(

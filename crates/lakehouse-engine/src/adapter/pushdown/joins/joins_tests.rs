@@ -1,17 +1,15 @@
 use super::attribution::JoinLegs;
 use super::*;
+use crate::adapter::catalog_kind::CatalogKind;
+use crate::adapter::permission::PermissionCheck;
 use crate::adapter::pushdown::ResolvedScan;
 use crate::adapter::pushdown::test_support::*;
+use crate::scan::spec::CatalogProps;
 use crate::scan::spec::{FileEntry, LogicalField};
 
-// Shared join-test fixtures at the joins-module root — the join analog of the
-// pushdown-wide `test_support` fixtures. Each concern submodule's test module
-// reaches them via `super::super::tests::{...}` across the added nesting level, so
-// there is a single copy rather than one duplicate per submodule.
+// Shared join fixtures, reached by each submodule's tests via `super::super::tests`.
 
-/// Build a two-table-join pushdown request. `from_extra` is spliced into the
-/// `from` object (e.g. to swap `join_type`, drop a field, or corrupt a side),
-/// and `condition` becomes the join's `condition` node.
+/// `from_extra` is spliced into the `from` object.
 pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
     let mut from = serde_json::json!({
         "type": "join",
@@ -58,7 +56,6 @@ pub(super) fn join_request(from_extra: Json, condition: Json) -> Json {
     })
 }
 
-/// The standard equi-join condition: `CUSTOMER.C_CUSTKEY = ORDERS.O_CUSTKEY`.
 pub(super) fn equi_condition() -> Json {
     serde_json::json!({
         "type": "predicate_equal",
@@ -67,9 +64,7 @@ pub(super) fn equi_condition() -> Json {
     })
 }
 
-/// A three-table inner-join pushdown request: `(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`,
-/// all three in `TABLE_MAP`. Leaves in stable tree order CUSTOMER, ORDERS,
-/// LINEITEM; two join conditions (`C_CUSTKEY=O_CUSTKEY`, `O_ORDERKEY=L_ORDERKEY`).
+/// `(CUSTOMER ⋈ ORDERS) ⋈ LINEITEM`.
 pub(super) fn three_table_join_request() -> Json {
     serde_json::json!({
         "involvedTables": [
@@ -107,9 +102,7 @@ pub(super) fn three_table_join_request() -> Json {
     })
 }
 
-/// The NQ3-shape four-table inner-join pushdown request:
-/// `((PART ⋈ PARTSUPP) ⋈ SUPPLIER) ⋈ NATION`, all four in `TABLE_MAP`. Leaves in
-/// stable tree order PART, PARTSUPP, SUPPLIER, NATION; three join conditions.
+/// NQ3 shape: `((PART ⋈ PARTSUPP) ⋈ SUPPLIER) ⋈ NATION`.
 pub(super) fn nq3_join_request() -> Json {
     serde_json::json!({
         "involvedTables": [
@@ -158,11 +151,8 @@ pub(super) fn nq3_join_request() -> Json {
     })
 }
 
-/// Build a left-deep N-leg SELF-join pushdown request over `FACT_ORDERS`, one leg
-/// per entry of `leg_aliases` — `Some(alias)` stamps the leaf's `alias` and the
-/// matching column nodes' `tableAlias`; `None` omits BOTH keys entirely, which is
-/// what Exasol emits for an occurrence the user left unaliased. Shapes and key
-/// names mirror the live `EXPLAIN VIRTUAL` capture for issue #361.
+/// `None` omits both the leaf's `alias` and the columns' `tableAlias`, as Exasol does for an
+/// unaliased occurrence (mirrors the live `EXPLAIN VIRTUAL` capture for #361).
 pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
     fn leaf(alias: Option<&str>) -> Json {
         let mut leaf = serde_json::json!({"name": "FACT_ORDERS", "type": "table"});
@@ -212,8 +202,6 @@ pub(super) fn self_join_request(leg_aliases: &[Option<&str>]) -> Json {
     })
 }
 
-/// Recover the [`DetectedJoin`] a request classifies to (the tests below all
-/// operate on the standard two-table CUSTOMER⋈ORDERS shape from `join_request`).
 pub(super) fn detected_join(request: &Json) -> DetectedJoin {
     match detect_join(request, &pd(request)).expect("detected join shape") {
         JoinShape::Join(join) => join,
@@ -221,9 +209,8 @@ pub(super) fn detected_join(request: &Json) -> DetectedJoin {
     }
 }
 
-/// The leg binding over `leaves`, derived the one way production derives it — through
-/// [`DetectedJoin::legs`], the only constructor of a multi-leg binding. Join conditions
-/// play no part in leg identity, so the stand-in join carries none.
+/// Derived through [`DetectedJoin::legs`], the only multi-leg constructor; conditions play
+/// no part in leg identity.
 pub(super) fn legs_from_leaves(leaves: Vec<JoinLeaf>) -> JoinLegs {
     DetectedJoin {
         tables: leaves,
@@ -232,10 +219,6 @@ pub(super) fn legs_from_leaves(leaves: Vec<JoinLeaf>) -> JoinLegs {
     .legs()
 }
 
-/// Build a resolved join side with a given `(path, byte_size)` file list.
-/// Storage/schema/root are populated so the tests can assert the full resolved
-/// payload rides along with the selected role; only the byte totals drive
-/// selection.
 pub(super) fn resolved_side(table_name: &str, files: Vec<(&str, u64)>) -> ResolvedJoinSide {
     let lower = table_name.to_lowercase();
     ResolvedJoinSide::new(
@@ -278,9 +261,6 @@ pub(super) fn two_scan_tuning() -> JoinScanRequestConfig<'static> {
     }
 }
 
-/// A non-empty schema quote-qualifies the UDF name; an empty string or `None`
-/// (the handshake's own no-schema case) falls back to the bare, unqualified
-/// name with no new conditional.
 #[test]
 fn qualify_udf_uses_schema_and_falls_back_when_empty() {
     assert_eq!(qualify_udf(Some("schema"), "UDF"), "\"schema\".UDF");
@@ -290,14 +270,12 @@ fn qualify_udf_uses_schema_and_falls_back_when_empty() {
 
 #[test]
 fn golden_ineligible_decline_message_unchanged() {
-    let not_inner = match ineligible_join_decline(IneligibleJoinReason::NotInnerJoinType) {
-        UdfError::User(msg) => msg,
-        other => panic!("expected User decline, got {other:?}"),
-    };
-    let unsupported = match ineligible_join_decline(IneligibleJoinReason::UnsupportedShape) {
-        UdfError::User(msg) => msg,
-        other => panic!("expected User decline, got {other:?}"),
-    };
+    let not_inner = user_message(ineligible_join_decline(
+        IneligibleJoinReason::NotInnerJoinType,
+    ));
+    let unsupported = user_message(ineligible_join_decline(
+        IneligibleJoinReason::UnsupportedShape,
+    ));
     assert_eq!(
         not_inner,
         "join pushdown declined: the join is not an inner join; the adapter cannot render this join shape, so this is a hard error, not a native re-plan"
@@ -322,8 +300,7 @@ fn delta_join_request(select_list: Json) -> Json {
     )
 }
 
-/// The same two-Delta-table inner equi-join over caller-declared column lists, so a
-/// test can declare the SAME column name on both legs.
+/// Lets a test declare the same column name on both legs.
 fn delta_join_request_over(
     customer_columns: Json,
     orders_columns: Json,
@@ -358,12 +335,6 @@ fn delta_join_request_over(
     })
 }
 
-/// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// The JOIN half: a refused column reached through a join leg is refused by the same
-/// rule as on the single-table path, per resolved side and ahead of the empty-side
-/// early return — both legs here resolve with NO active file, so a gate placed after
-/// that return would answer the refused request with an empty result.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
     let catalog = unity_delta_catalog().await;
@@ -398,14 +369,6 @@ async fn a_refused_delta_column_reached_through_a_join_leg_is_refused() {
     assert_refuses_binary_col(error);
 }
 
-/// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// A refusal belongs to the table that raised it. Both legs here declare a
-/// `BINARY_COL`, but only `ORDERS`' is a Delta `binary`; `CUSTOMER`'s is a `string`
-/// the reader maps. A select list naming only `CUSTOMER.BINARY_COL` therefore reads
-/// nothing `ORDERS` refused, and a gate matching a request-global touched set
-/// against every side's refused list would refuse it on the strength of the name
-/// alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable_column_on_the_other()
  {
@@ -448,10 +411,6 @@ async fn a_refused_column_on_one_join_side_does_not_refuse_a_same_named_mappable
         .expect("a select list naming only the mappable side's column must plan");
 }
 
-/// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// The fail-safe half of per-side attribution: an unqualified `BINARY_COL` names no
-/// side, so it is charged to BOTH and the leg that refused it refuses the query.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
     let catalog = unity_delta_catalog().await;
@@ -467,11 +426,6 @@ async fn an_unqualified_column_reference_is_charged_to_every_join_side() {
     assert_refuses_binary_col(error);
 }
 
-/// Scenario: A refused column refuses only the requests that read or emit it
-///
-/// A `SELECT *` join names no column anywhere yet emits every column each side
-/// declares, so the side carrying the refused column must be charged its own
-/// declared row rather than admitted for lack of a `column` node naming it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_select_star_join_is_refused_by_the_side_declaring_the_refused_column() {
     let catalog = unity_delta_catalog().await;
@@ -485,8 +439,7 @@ async fn a_select_star_join_is_refused_by_the_side_declaring_the_refused_column(
     assert_refuses_binary_col(error);
 }
 
-/// `CUSTOMER` (all mappable) joined to `ORDERS`, whose `binary_col` the Delta reader
-/// refuses. Neither leg carries an active file.
+/// Neither leg carries an active file.
 async fn two_delta_legs_one_refusing_binary_col() -> StorageBackend {
     delta_object_endpoint(vec![
         (
@@ -501,23 +454,7 @@ async fn two_delta_legs_one_refusing_binary_col() -> StorageBackend {
     .await
 }
 
-fn assert_refuses_binary_col(error: UdfError) {
-    let message = match error {
-        UdfError::User(message) => message,
-        other => panic!("every refusal must be a user error, got {other:?}"),
-    };
-    assert!(
-        message.contains("binary_col") && message.contains("#351"),
-        "the refusal must be the gate's own message, naming the column and its reason: \
-         {message}"
-    );
-}
-
-/// A commit with a partitioned two-column schema and exactly two `add` files, one
-/// per `values` entry — `two_delta_legs_one_refusing_binary_col`'s fixture has no
-/// `add` action at all, so it cannot demonstrate pruning; this one exists so a
-/// local equality predicate on `partition_column` has one file to keep and one to
-/// prune.
+/// Two `add` files, so a local partition equality has one file to keep and one to prune.
 fn two_file_delta_commit(
     id: &str,
     columns: &[(&str, &str)],
@@ -559,9 +496,6 @@ fn two_file_delta_commit(
     format!("{protocol}\n{metadata}\n{}\n{}\n", adds[0], adds[1])
 }
 
-/// `CUSTOMER` partitioned by `c_region` (files `us`, `eu`) joined to `ORDERS`
-/// partitioned by `o_status` (files `open`, `closed`) — two files per leg so each
-/// leg's own local equality predicate has exactly one file to keep and one to prune.
 async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend {
     delta_object_endpoint(vec![
         (
@@ -586,13 +520,6 @@ async fn two_delta_legs_each_pruned_by_its_own_local_filter() -> StorageBackend 
     .await
 }
 
-/// Scenario: Pruning reaches every request shape and changes no result end to end
-///
-/// A broadcast-eligible inner equi-join over two Delta tables, each with its own
-/// local WHERE conjunct scoped to that leg's own column: `CUSTOMER.C_REGION = 'us'`
-/// and `ORDERS.O_STATUS = 'open'`. Each leg's local predicate must drive that leg's
-/// own file pruning independently — leg A's filter never affects leg B's surviving
-/// files and vice versa.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     let catalog = unity_delta_catalog().await;
@@ -649,5 +576,164 @@ async fn each_delta_join_leg_prunes_by_its_own_side_local_predicate() {
     assert!(
         !sql.contains("o_status=closed/part-0.parquet"),
         "ORDERS' own local filter must prune its non-matching file, unaffected by CUSTOMER's filter: {sql}"
+    );
+}
+
+/// Holds every `loadTable` response until `parties` are in flight, making concurrent
+/// resolution observable without a timing margin.
+struct RendezvousCatalog {
+    uri: String,
+}
+
+impl RendezvousCatalog {
+    async fn spawn(parties: usize) -> Self {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+        let uri = format!(
+            "http://127.0.0.1:{}",
+            listener.local_addr().expect("local_addr").port()
+        );
+        let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(parties));
+
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let barrier = std::sync::Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 8192];
+                    let read = stream.read(&mut buf).await.unwrap_or(0);
+                    if read == 0 {
+                        return;
+                    }
+                    let raw = String::from_utf8_lossy(&buf[..read]).to_string();
+                    let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
+                    let body = if target.starts_with("/v1/config") {
+                        "{}".to_string()
+                    } else {
+                        let table = target.rsplit('/').next().unwrap_or("t").to_string();
+                        barrier.wait().await;
+                        snapshotless_load_table_body(&format!("s3://bucket/{table}"))
+                    };
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        Self { uri }
+    }
+}
+
+async fn iceberg_pushdown(request: &Json, catalog_uri: &str) -> Result<Json, UdfError> {
+    let conn = ResolvedConnectionConfig {
+        catalog_uri: catalog_uri.to_string(),
+        storage: sample_storage(),
+        creds: unauthenticated_creds(),
+        allow_http: true,
+        catalog_kind: CatalogKind::IcebergRest,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
+        permission_check: PermissionCheck::Off,
+    };
+    let catalog = CatalogProps {
+        warehouse: "wh".into(),
+        table: "lh.customer".into(),
+    };
+    crate::adapter::pushdown::handle_pushdown(
+        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 1024,
+    )
+    .await
+}
+
+/// A zero broadcast threshold forces the N-scan fallback, which indexes sides by leg.
+async fn delta_n_scan_pushdown(
+    request: &Json,
+    catalog_uri: &str,
+    storage: StorageBackend,
+    table: &str,
+) -> Result<Json, UdfError> {
+    let conn = ResolvedConnectionConfig {
+        catalog_uri: catalog_uri.to_string(),
+        storage,
+        creds: unauthenticated_creds(),
+        allow_http: true,
+        catalog_kind: CatalogKind::UnityCatalogNative,
+        connection_name: TEST_CONNECTION_NAME.to_string(),
+        sealed_storage_key: Some(test_sealing_key()),
+        permission_check: PermissionCheck::Off,
+    };
+    let catalog = CatalogProps {
+        warehouse: "wh".into(),
+        table: table.into(),
+    };
+    crate::adapter::pushdown::handle_pushdown(
+        request, &conn, &catalog, None, 1, 1, 1, 1024, 1, 0.6, 200, 4, 0,
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn join_legs_resolve_concurrently_in_leg_index_order() {
+    let catalog = RendezvousCatalog::spawn(2).await;
+    let request = join_request(Json::Null, equi_condition());
+
+    let planned = tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        iceberg_pushdown(&request, &catalog.uri),
+    )
+    .await
+    .expect(
+        "both legs must be resolving at once; a loop that awaits each leg before starting \
+         the next can never release the catalog's rendezvous",
+    )
+    .expect("two snapshotless Iceberg legs plan the shape-correct empty result");
+
+    assert_eq!(
+        planned["type"], "pushdown",
+        "the concurrency change must leave the planned response shape untouched: {planned:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolved_join_sides_stay_in_leg_index_order() {
+    let catalog = unity_delta_catalog().await;
+    let storage = two_delta_legs_each_pruned_by_its_own_local_filter().await;
+    let select_list = serde_json::json!([
+        {"type": "column", "name": "C_REGION", "tableName": "CUSTOMER"},
+        {"type": "column", "name": "O_STATUS", "tableName": "ORDERS"},
+    ]);
+    let request = delta_join_request_over(
+        serde_json::json!([
+            {"name": "C_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "C_REGION", "dataType": {"type": "varchar", "size": 100}},
+        ]),
+        serde_json::json!([
+            {"name": "O_CUSTKEY", "dataType": {"type": "decimal", "precision": 20, "scale": 0}},
+            {"name": "O_STATUS", "dataType": {"type": "varchar", "size": 100}},
+        ]),
+        select_list,
+    );
+
+    let result = delta_n_scan_pushdown(&request, &catalog.uri, storage, "cat.sch.orders")
+        .await
+        .expect("two non-empty Delta legs plan the N-scan fallback");
+    let sql = result["sql"]
+        .as_str()
+        .expect("a planned pushdown carries sql");
+
+    let customer = sql
+        .find("c_region=")
+        .expect("the left leg's own files must be rendered");
+    let orders = sql
+        .find("o_status=")
+        .expect("the right leg's own files must be rendered");
+    assert!(
+        customer < orders,
+        "the resolved sides must stay in leg-index order, left leaf first: {sql}"
     );
 }

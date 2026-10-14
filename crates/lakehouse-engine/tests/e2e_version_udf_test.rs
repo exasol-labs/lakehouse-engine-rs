@@ -1,12 +1,3 @@
-//! End-to-end test for the `LAKEHOUSE_VERSION` entry point.
-//!
-//! Runs against a live Exasol container. FAILS (never skips) when the
-//! container is unavailable — per project rules.
-//!
-//! Unlike the other E2E suites, this one needs no MinIO, no Iceberg REST
-//! catalog, no CONNECTION, and no Virtual Schema: `LAKEHOUSE_VERSION()` is a
-//! zero-argument, zero-I/O call, so setup is limited to installing the SLC,
-//! uploading the `.so`, and creating the schema + scripts.
 #![cfg(feature = "exasol-e2e")]
 
 mod common;

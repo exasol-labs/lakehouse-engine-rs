@@ -35,7 +35,7 @@ make bench                  # build the .so, run the suite, write bench/reports/
 The configuration comes from a gitignored `bench/.env` file. Copy `bench/.env.example` to create it.
 `BENCH_TARGET` selects the mode. The default is `docker`:
 
-- **`docker` (default)** — self-contained. `docker compose up -d` starts MinIO, an Iceberg REST
+- **`docker` (default)** — self-contained. `docker compose up -d` starts SeaweedFS, an Iceberg REST
   catalog, and Exasol. The bench loads TPC-H into the local catalog automatically. This mode needs
   no AWS account and no `.env` file.
 - **`remote`** — runs against a real AWS Glue catalog and an external Exasol cluster. The operator
@@ -51,7 +51,6 @@ Other configuration variables include:
 
 - `BENCH_WITH_DELETES` — re-runs the suite against 5%-position-deleted Iceberg v2 merge-on-read
   copies
-- `BENCH_NR_OF_CORES`
 - `BENCH_PARALLELISM_FACTOR`
 - the `BENCH_DF_*` DataFusion threading variables
 - `BENCH_S3_MAX_CONNECTIONS`
@@ -181,7 +180,7 @@ SELECT SUM(L_QUANTITY) FROM ${VS}.LINEITEM;
 
 ### Q9b - wide projection + expression aggregates + COUNT(DISTINCT)
 
-All 16 lineitem columns, expression-argument aggregates, and COUNT(DISTINCT) pushdown in one query.
+All 16 lineitem columns, expression-argument aggregates, and COUNT(DISTINCT) in one query; the mixed distinct/ordinary aggregate list routes to the qualified single-table wrapper over a sharded raw scan.
 
 ```sql
 SELECT COUNT(*),

@@ -1,18 +1,7 @@
-//! Scan-side decoding of **Delta Lake deletion vectors** into deleted row positions.
-//!
-//! A deletion vector names 0-based row positions inside ONE data file, which is the
-//! same shape an Iceberg positional-delete set has, so it converges on the shipped
-//! delete pipeline: this module produces the [`RoaringTreemap`] that
-//! [`crate::scan::positional_deletes`] turns into a base `ParquetAccessPlan`. Only
-//! producing the bitmap is Delta-specific.
-//!
-//! The bitmap comes from `delta_kernel`'s own protocol-conformant decoder, which
-//! validates the container's version byte, the size the log declares, the portable
-//! magic, and the CRC-32. The kernel is used as a pure bytes-to-bitmap function and
-//! never as a second execution engine: [`DeletionVector::resolve`] reconstructs the
-//! sidecar path so the SCAN fetches the body on its own bounded, budgeted async path,
-//! and [`DeletionVector::decode`] hands those already-fetched bytes to the decoder
-//! through an in-memory [`StorageHandler`] that performs no I/O at all.
+//! Decodes Delta deletion vectors into the [`RoaringTreemap`] the positional-delete pipeline
+//! consumes. `delta_kernel`'s decoder is used only as a pure bytes-to-bitmap function: the scan
+//! fetches sidecar bodies itself, and [`DeletionVector::decode`] hands them over through an
+//! in-memory [`StorageHandler`] that performs no I/O.
 
 use crate::scan::emit::{redact_credentials, redact_secret_values};
 use crate::scan::spec::DeltaDeletionVectorStorage;
@@ -26,25 +15,17 @@ use std::ops::Range;
 use std::sync::Arc;
 use url::Url;
 
-/// Length of the portable-format magic every serialized bitmap starts with. A
-/// persisted vector's declared size covers that magic, so a smaller size describes no
-/// bitmap at all — and the decoder derives its bitmap bounds from that size without
-/// re-checking it.
+/// A persisted vector's declared size covers this magic, and the decoder derives its bitmap
+/// bounds from that size without re-checking it.
 const PORTABLE_MAGIC_BYTES: i32 = 4;
 
-/// Shortest inline payload that can carry the portable magic. Z85 packs four bytes into
-/// five characters, and two chunks are the fewest that yield four bytes under every
-/// encoding the decoder accepts — which is also what keeps the decoder's magic read
-/// inside the payload it decoded.
+/// Z85 packs four bytes into five characters; two chunks are the fewest yielding the magic under
+/// every accepted encoding, keeping the decoder's magic read inside the decoded payload.
 const MIN_INLINE_PAYLOAD_CHARS: usize = 10;
 
-/// Parent handed to the decoder, which never reads it: a persisted vector is normalized
-/// to an absolute path at resolution and an inline vector's bytes are the descriptor
-/// itself, so neither kind resolves anything against a parent at decode time.
+/// Never read: persisted paths are absolute by decode time and inline bytes are the descriptor.
 const UNUSED_DECODE_PARENT: &str = "memory:///";
 
-/// A Delta deletion vector exactly as the table's log carries it, before any validation
-/// or path reconstruction.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LoggedDeletionVector<'a> {
     pub(crate) storage: DeltaDeletionVectorStorage,
@@ -54,14 +35,8 @@ pub(crate) struct LoggedDeletionVector<'a> {
     pub(crate) cardinality: i64,
 }
 
-/// A Delta deletion vector validated against the protocol and resolved to where its
-/// bytes live, ready to decode once the scan has fetched them.
-///
-/// Resolution and decoding are separate so the scan can dedup and fetch sidecars on its
-/// own bounded-concurrency path — one body serving every descriptor that names it —
-/// while decoding stays a pure in-memory function. The bytes to decode arrive as an
-/// argument rather than through a client this type holds, so this type cannot perform
-/// I/O even by accident.
+/// Resolution and decoding are separate so the scan can dedup and fetch sidecars on its own
+/// bounded path; decoding takes the bytes as an argument so this type cannot perform I/O.
 #[derive(Debug, Clone)]
 pub(crate) struct DeletionVector {
     descriptor: DeletionVectorDescriptor,
@@ -70,12 +45,7 @@ pub(crate) struct DeletionVector {
 }
 
 impl DeletionVector {
-    /// Validate a logged descriptor and reconstruct the sidecar path it names, relative
-    /// to `table_root` for the UUID-relative storage kind.
-    ///
-    /// `data_file_path` is what a refusal names: a deletion vector has no delete-file
-    /// identity of its own, and its payload is an opaque token or blob rather than a
-    /// diagnostic.
+    /// `data_file_path` is what a refusal names: a deletion vector has no identity of its own.
     pub(crate) fn resolve(
         logged: LoggedDeletionVector<'_>,
         table_root: &str,
@@ -86,20 +56,13 @@ impl DeletionVector {
             .map_err(|reason| refusal(data_file_path, &reason, secrets))
     }
 
-    /// The absolute path of the sidecar holding this vector's bytes, or `None` for an
-    /// inline vector, whose bytes need no fetch at all.
+    /// `None` for an inline vector.
     pub(crate) fn sidecar_url(&self) -> Option<&Url> {
         self.sidecar.as_ref()
     }
 
-    /// Decode the deleted row positions from `sidecar_bytes` — the WHOLE body of
-    /// [`Self::sidecar_url`], since the container's version byte sits at file position
-    /// 0 — or from the descriptor itself when this vector is inline.
-    ///
-    /// Fails rather than returning a set the log contradicts: a decoded set whose size
-    /// disagrees with the declared cardinality means the scan cannot tell which rows the
-    /// table deleted, and emitting pre-delete rows would be wrong rows rather than a
-    /// degraded result.
+    /// `sidecar_bytes` must be the WHOLE sidecar body: the version byte sits at position 0.
+    /// A decoded set disagreeing with the declared cardinality is refused, never emitted.
     pub(crate) fn decode(
         &self,
         sidecar_bytes: Option<Bytes>,
@@ -136,9 +99,7 @@ impl DeletionVector {
     }
 }
 
-/// Validate and resolve a logged descriptor, reporting a failure as the reason a scan
-/// refuses the vector. Kept free of data-file identity and redaction so [`refusal`] is
-/// the one place that adds them.
+/// Free of data-file identity and redaction so [`refusal`] is the one place adding them.
 fn resolve_descriptor(
     logged: LoggedDeletionVector<'_>,
     table_root: &str,
@@ -179,8 +140,7 @@ fn resolve_descriptor(
         ),
     };
 
-    // Both persisted kinds carry an ABSOLUTE path from here on, so the path is
-    // reconstructed exactly once and the decoder resolves it from the descriptor alone.
+    // Both persisted kinds are absolute from here on, so the decoder needs no parent.
     let (storage_type, path) = match &sidecar {
         Some(location) => (
             DeletionVectorStorageType::PersistedAbsolute,
@@ -218,9 +178,7 @@ fn table_root_url(table_root: &str) -> Result<Url, String> {
     Url::parse(&base).map_err(|e| format!("the scan's table root is not a URL: {e}"))
 }
 
-/// Build the user-facing refusal: it names the DATA file whose vector could not be
-/// applied, states which validation failed, and carries no credential value and no echo
-/// of an opaque inline payload.
+/// Names the data file but never echoes an opaque inline payload or credential.
 fn refusal(data_file_path: &str, reason: &str, secrets: &[String]) -> UdfError {
     let message = format!(
         "data file '{data_file_path}' carries a Delta deletion vector this scan cannot apply: \
@@ -232,15 +190,8 @@ fn refusal(data_file_path: &str, reason: &str, secrets: &[String]) -> UdfError {
     )))
 }
 
-/// Read-only [`StorageHandler`] serving the deletion-vector sidecar body the scan
-/// already fetched on its own bounded, budgeted async path.
-///
-/// It is what lets `delta_kernel`'s synchronous decoder run as a pure bytes-to-bitmap
-/// function: no object store is opened, no byte is read, and no second async runtime is
-/// started inside the UDF. Every operation other than reading an already-fetched body is
-/// refused with an error rather than performed or panicked on — a panic inside a UDF is
-/// an abnormal VM exit that makes the engine SIGKILL every sibling VM of the statement
-/// part.
+/// Every operation other than reading an already-fetched body returns an error rather than
+/// panicking: a UDF panic is an abnormal VM exit that SIGKILLs every sibling VM.
 #[derive(Debug)]
 struct PrefetchedDeletionVectorBytes {
     bodies: HashMap<Url, Bytes>,

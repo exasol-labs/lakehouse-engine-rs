@@ -22,7 +22,7 @@ and no file is scanned twice.
   before the tokio runtime is entered and threaded into the planning path. It is NOT
   taken from an `adapterNotes` entry, so no create-time node count is persisted or
   round-tripped. A `node_count()` of `0` (no live handshake) maps to `1`. See
-  `vs-adapter/pushdown-planning`.
+  `pushdown/pushdown-planning`.
 * The shard count G is `node_count × parallelism_factor`, where
   `parallelism_factor` is a VS property. G is capped at `300` so it
   stays at or below Exasol's `max_dynamic_group_count` default — at or below that
@@ -51,7 +51,7 @@ and no file is scanned twice.
   scans another node's files.
 * The shard-invariant common spec is serialized once as the scalar scan's
   first-argument literal; only each shard's per-file subset flows through the
-  distributor. The credential reference or sealed envelope lives once in the common spec literal, never repeated per shard — see `vs-adapter/scan-spec-credential-reference`.
+  distributor. The credential reference or sealed envelope lives once in the common spec literal, never repeated per shard — see `storage-access/scan-spec-credential-reference`.
 
 ## Scenarios
 
@@ -109,4 +109,4 @@ and no file is scanned twice.
 * *AND* the common spec literal SHALL appear exactly once and the file-list literal exactly once
 * *AND* the generated SQL SHALL be behaviourally identical (as an order-independent multiset) to the multi-shard fan-out collapsed to one shard
 
-*Credential-reference invariant:* the shard-invariant common literal carries one credential reference for the whole fan-out, never repeated per shard — see `vs-adapter/scan-spec-credential-reference`.
+*Credential-reference invariant:* the shard-invariant common literal carries one credential reference for the whole fan-out, never repeated per shard — see `storage-access/scan-spec-credential-reference`.

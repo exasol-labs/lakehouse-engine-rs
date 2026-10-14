@@ -1,36 +1,23 @@
-//! Delta transaction-log replay: the data files ACTIVE at a Delta table's current
-//! version, read through a caller-supplied object store.
+//! Delta log replay: the data files active at a table's current version.
 //!
-//! The store is injected rather than built here. That keeps the one credential
-//! decision with the reader that made it, and lets the same replay run over a
-//! local filesystem in tests and over S3 in production.
+//! The object store is injected so the credential decision stays with the reader that
+//! made it. Replayed rows are read in `delta_kernel`'s documented scan-row schema
+//! because the kernel's `ScanFile` view drops NULL partition values and hides the
+//! verbatim deletion-vector descriptor.
 //!
-//! `delta_kernel` answers a replayed log as engine data in its documented
-//! scan-row schema (`delta_kernel::scan::scan_row_schema`), which this module
-//! reads directly: the kernel's own `ScanFile` view drops a NULL partition value
-//! and exposes no verbatim deletion-vector descriptor, and both are part of this
-//! feature's contract.
-//!
-//! `delta_kernel` scan-row contract this module's replay code relies on:
-//! - `without_row_transforms()` alone is deliberate: the scan side reconstructs
-//!   partition columns and applies deletion vectors itself, so per-file kernel
-//!   transforms would be built unread. The scan builder keeps `delta_kernel`'s
-//!   default `StatsOptions` so the kernel's own internal data-skipping and
-//!   partition-pruning pass still runs during replay — no statistic is surfaced
-//!   onto `FileEntry`.
+//! Kernel contract relied on:
+//! - `without_row_transforms()`: the scan side rebuilds partition columns and applies
+//!   deletion vectors itself. Default `StatsOptions` keep the kernel's own skipping and
+//!   partition pruning; no statistic reaches `FileEntry`.
 //! - A selection vector shorter than the batch leaves its remaining rows selected.
-//! - The kernel leaves `path` NULL on a row that carries no `add` action.
-//! - Replay walks the log newest-first, so the first row for a path holds its latest
-//!   `add`: a path removed and re-added keeps the re-added entry alone.
-//! - Deletion-vector presence is keyed on the storage kind rather than the struct's
-//!   own null mask, because a nested mask read out of checkpoint parquet can be
-//!   incomplete — this is how `delta_kernel`'s own visitor detects an absent
-//!   descriptor.
-//! - Partition-value offsets are read as a total function: a panic here would abort
-//!   the UDF's VM, and the engine SIGKILLs every sibling VM of the statement part when
-//!   one dies abnormally.
-//! - A logged NULL partition value stays an explicit absent value: the
-//!   partition-directory literal is a naming artifact, never the column's value.
+//! - `path` is NULL on a row carrying no `add` action.
+//! - Replay is newest-first, so the first row per path is its latest `add`.
+//! - Deletion-vector presence is keyed on `storageType`, not the struct null mask, which
+//!   can be incomplete when read from checkpoint parquet (mirrors the kernel's visitor).
+//! - Partition-value offsets are read totally: a panic aborts the VM and the engine
+//!   SIGKILLs every sibling VM of the statement part.
+//! - A logged NULL partition value stays absent; the directory literal is a naming
+//!   artifact, never the value.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
@@ -55,27 +42,16 @@ use crate::scan::spec::{DeleteMechanism, DeltaDeletionVectorStorage, FileEntry};
 #[path = "delta_replay_tests.rs"]
 mod tests;
 
-/// One Delta table's log, resolved at the version current when it was opened.
-///
-/// Holds the kernel engine next to the snapshot so one query reads the log ONCE:
-/// the schema and the file list are both answered from this snapshot rather than
-/// each resolving the log again.
-///
-/// Every method blocks. The kernel's read path is synchronous and drives its own
-/// background runtime, so an async caller runs this off its own executor.
+/// Holds the engine next to the snapshot so a query reads the log once. Every method
+/// blocks: the kernel read path is synchronous and drives its own runtime.
 pub(super) struct DeltaSnapshot {
     engine: DefaultEngine<TokioBackgroundExecutor>,
     snapshot: SnapshotRef,
 }
 
 impl DeltaSnapshot {
-    /// Resolves `table_root`'s CURRENT version through `store`, reading no data file,
-    /// and refuses a table whose reader protocol this engine does not implement.
-    ///
-    /// The gate runs HERE, on the resolved version and before anything else reads the
-    /// snapshot, so a `DeltaSnapshot`'s existence proves its protocol was checked: a
-    /// refused table yields no value from which a schema, a partition-column list, a
-    /// column-mapping mode, or an active file list could be read.
+    /// The protocol gate runs here, before anything reads the snapshot, so a `DeltaSnapshot`'s
+    /// existence proves its protocol was checked.
     pub(super) fn open(store: Arc<dyn ObjectStore>, table_root: &str) -> Result<Self, UdfError> {
         let engine = DefaultEngine::builder(store).build();
         let snapshot = Snapshot::builder_for(table_root)
@@ -97,21 +73,13 @@ impl DeltaSnapshot {
         Ok(Self { engine, snapshot })
     }
 
-    /// This table's Delta schema at the resolved version.
     pub(super) fn schema(&self) -> SchemaRef {
         self.snapshot.schema()
     }
 
-    /// This table's partition-column names, in the order its metadata declares
-    /// them — which is neither their schema order nor a sorted order.
-    ///
-    /// Read through `delta_kernel`'s `internal-api` surface because 0.26 exposes
-    /// the current `metaData` action's `partitionColumns` nowhere else. The
-    /// alternative — a second, independent read of the log's own commit and
-    /// checkpoint bytes — would put the current-metadata decision this snapshot
-    /// already delegates to the kernel into a second home, free to disagree with
-    /// it, and would have to re-derive checkpoint resolution to reach a table
-    /// whose metadata predates its latest checkpoint.
+    /// In metadata declaration order (neither schema nor sorted order). Read via the kernel's
+    /// `internal-api` because 0.26 exposes `partitionColumns` nowhere else; re-reading the log
+    /// ourselves would duplicate the kernel's current-metadata and checkpoint resolution.
     pub(super) fn partition_columns(&self) -> Vec<String> {
         self.snapshot
             .table_configuration()
@@ -119,24 +87,15 @@ impl DeltaSnapshot {
             .to_vec()
     }
 
-    /// The column-mapping mode IN FORCE, which is not simply the
-    /// `delta.columnMapping.mode` property: the Delta protocol requires that
-    /// property to be ignored unless the protocol supports the `columnMapping`
-    /// reader feature, and the kernel's public `table_properties()` accessor
-    /// reports the raw property alone. Reading the ungated property instead would
-    /// have this engine expect physical column names a table never wrote.
+    /// The mode in force, not the raw `delta.columnMapping.mode` property: the protocol says
+    /// to ignore it unless the `columnMapping` reader feature is supported, and the kernel's
+    /// `table_properties()` reports it ungated.
     pub(super) fn column_mapping_mode(&self) -> ColumnMappingMode {
         self.snapshot.table_configuration().column_mapping_mode()
     }
 
-    /// The data files active at the resolved version: one entry per active path,
-    /// each carrying its logged path verbatim, its size, its partition values and
-    /// its deletion-vector reference, and no statistic. Ordered by path, so the
-    /// list depends on the log's content rather than on replay internals.
-    ///
-    /// `prune` is `None` for no constraint — every active file is returned; a
-    /// `Some` predicate lets the kernel's own data-skipping and partition pruning
-    /// trim the file list before it reaches this method.
+    /// One entry per active path, no statistics, ordered by path so the list depends on log
+    /// content rather than replay internals. `prune = None` returns every active file.
     pub(super) fn active_files(
         &self,
         prune: Option<PredicateRef>,

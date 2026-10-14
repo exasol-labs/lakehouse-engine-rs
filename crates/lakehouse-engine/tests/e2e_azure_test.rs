@@ -1,39 +1,9 @@
-//! End-to-end integration tests for the lakehouse-engine Virtual Schema against a
-//! **real Azure Data Lake Storage Gen2** account, catalogued by a local Lakekeeper
-//! (OpenID-secured via Keycloak), over **both credential arms**: the static arm
-//! (delegation off, account key carried in the Exasol CONNECTION) and the vended
-//! arm (delegation on, a SAS minted per `loadTable`, carried by no CONNECTION
-//! field).
-//!
-//! Azure has no working local substitute — Azurite's `dfs` endpoint is incomplete
-//! and Lakekeeper's `adls` profile can't address it. Storage is therefore real
-//! cloud; the catalog, Keycloak, and Exasol stay local Docker. The suite FAILS
-//! (never skips) when the stack, any credential variable, or the Azure account is
-//! unavailable.
-//!
-//! All tests share one Exasol provisioning, so they run serially
-//! (`--test-threads=1`, set by the `make test-e2e-azure` target).
-//!
-//! Three credential roles: the harness creates/deletes its blob container under
-//! an **Entra ID service principal** (the Azure blob crate accepts no account
-//! key). The **account key** carries both warehouses' Lakekeeper storage
-//! credential, both arms' seed `FileIO`, and the static arm's CONNECTION
-//! (`AdlsCred::AccountKey`). The **vended SAS** carries only the vended arm's
-//! scan, minted by Lakekeeper from that same key per `loadTable`
-//! (`AdlsCred::Sas`).
-//!
-//! [`setup`] holds only what's idempotent and cleanup-free. Everything with a
-//! lifecycle lives on [`AzureFixture`], held as a test-function local so `Drop`
-//! deletes the run's container at scope end, including while unwinding from a
-//! panic.
-//!
-//! **One fixture and one container guard serve both arms**, which is why
-//! [`azure_static_and_vended_creds_end_to_end`] is one test rather than two — the
-//! guard can't live in a `OnceLock`, so splitting the arms would need a second
-//! live-Azure container. Assertion order is the mitigation for sharing: every
-//! vended-arm assertion except the closing cross-arm comparison runs before the
-//! static arm's, since the vended CONNECTION carries no account name/key and so
-//! is the strongest proof in the file.
+//! E2E tests against a real ADLS Gen2 account, catalogued by a local Lakekeeper,
+//! over the static (account key) and vended (SAS) credential arms. Storage is
+//! real cloud because Azurite's `dfs` endpoint is incomplete and Lakekeeper's
+//! `adls` profile can't address it. The container is created under an Entra ID
+//! service principal because the Azure blob crate accepts no account key. Tests
+//! share one Exasol provisioning and run with `--test-threads=1`.
 #![cfg(feature = "azure-e2e")]
 
 mod common;
@@ -41,8 +11,9 @@ mod common;
 use common::azure::{self, AzureContainer};
 use common::e2e_harness::{
     ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME, SCHEMA_NAME, SO_UDF_OBJECT_PATH, SYS_PASSWORD, VsProps,
-    create_schema_and_scripts, create_virtual_schema_with_password, exa_conn, install_slc,
-    parse_int, upload_so,
+    assert_decimal_orders_numerically, create_schema_and_scripts,
+    create_virtual_schema_with_password, declared_type, exa_conn, explain_virtual_sql, install_slc,
+    parse_int, upload_so, value_to_string,
 };
 use common::exasol_ws::ExaConn;
 use common::lakekeeper::{
@@ -52,64 +23,45 @@ use common::lakekeeper::{
 };
 use common::seed::{
     E2E_NAMESPACE, E2E_TABLE, SEED_ROWS_SCORE_GT_15, SEED_TOTAL_ROWS, SeedCatalogAuth, SeedStorage,
-    seed_events_table_with_auth,
+    decimal_18_0_values, seed_events_table_with_auth,
 };
 use common::stack::{
     self, CatalogConnectionPassword, build_create_connection_sql, exasol_host, exasol_sql_port,
     wait_for_exasol, wait_for_url,
 };
 
+use arrow::array::{Float64Array, Int64Array, StringArray};
+use arrow::datatypes::{DataType, Field, Schema};
+use arrow::record_batch::RecordBatch;
 use futures::FutureExt;
+use object_store::azure::MicrosoftAzureBuilder;
+use object_store::path::Path as ObjectStorePath;
+use object_store::{ObjectStoreExt, PutPayload};
+use parquet::arrow::ArrowWriter;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 
-// ---------------------------------------------------------------------------
-// Constants — one Virtual Schema per credential mode, over one shared container.
-// ---------------------------------------------------------------------------
-
-/// Virtual Schema over the static-credential (delegation-off) ADLS warehouse.
 const VS_STATIC: &str = "AZ_STATIC_LAKEHOUSE";
-/// Catalog CONNECTION for that warehouse: OAuth2 fields plus account name/key.
 const CONN_STATIC: &str = "AZ_STATIC_CATALOG_CREDS";
 
-/// Virtual Schema over the vended-credential (delegation-on) ADLS warehouse.
 const VS_VENDED: &str = "AZ_VENDED_LAKEHOUSE";
-/// Catalog CONNECTION for that warehouse: OAuth2 fields, no storage field.
 const CONN_VENDED: &str = "AZ_VENDED_CATALOG_CREDS";
 
-/// Lakekeeper catalog base URL as reached from inside the Exasol UDF container —
-/// the Docker-network name plus the `/catalog` base-path segment.
 const LAKEKEEPER_CATALOG_URI_INTERNAL: &str = "http://lakekeeper:8181/catalog";
-
-/// Lakekeeper catalog base URL as reached from the host (mapped port), used only
-/// for host-side seeding.
-fn lakekeeper_catalog_url_host() -> String {
-    format!("http://localhost:{}/catalog", lakekeeper::lakekeeper_port())
-}
-
-// ---------------------------------------------------------------------------
-// One-time, cleanup-free setup (shared across the serial binary).
-// ---------------------------------------------------------------------------
 
 static SETUP_DONE: OnceLock<()> = OnceLock::new();
 
-/// Provision everything this binary shares and nothing that needs cleaning up.
-///
-/// MinIO is deliberately absent from the readiness waits: this suite's storage
-/// is Azure, so waiting on MinIO would fail it on an unrelated outage.
+/// SeaweedFS is deliberately not awaited: this suite's storage is Azure.
 fn setup() {
     SETUP_DONE.get_or_init(|| {
-        // 1. Readiness — fail loud, never skip.
         wait_for_exasol();
         lakekeeper::wait_for_keycloak();
         lakekeeper::wait_for_lakekeeper();
 
-        // 2. Bootstrap the catalog server (idempotent). The warehouse is NOT
-        //    created here: it is per-run and its container has a lifecycle.
+        // The warehouse is per-run and owned by `AzureFixture`, not created here.
         lakekeeper::lakekeeper_bootstrap();
 
-        // 3. Shared-harness provisioning (SLC + .so + scripts) — REUSED, never
-        //    redeclared.
         install_slc();
         upload_so();
         let mut conn = exa_conn();
@@ -117,73 +69,40 @@ fn setup() {
     });
 }
 
-// ---------------------------------------------------------------------------
-// Per-test Azure fixture — the only thing in this binary that owns a lifecycle.
-// ---------------------------------------------------------------------------
-
-/// One credential mode's warehouse: everything the suite needs to query it.
-///
-/// Grouping these three fields (rather than two parallel same-typed vectors on
-/// [`AzureFixture`]) makes a cross-wired static/vended mix-up unrepresentable.
 struct AzureArm {
-    /// Lakekeeper's name for this arm's warehouse, which is also its `key-prefix`.
+    /// Also the warehouse's `key-prefix`.
     warehouse: String,
-    /// Virtual Schema created over that warehouse.
     vs: &'static str,
-    /// Data-file paths this arm's seed committed, as the catalog recorded them.
     data_file_paths: Vec<String>,
 }
 
 impl AzureArm {
-    /// The Exasol-qualified table name this arm's Virtual Schema exposes.
     fn table(&self) -> String {
         format!("{}.{}", self.vs, E2E_TABLE.to_uppercase())
     }
 }
 
-/// One run's Azure container, the two ADLS warehouses over it — one per
-/// credential mode — and each one's seeded table, CONNECTION, and Virtual
-/// Schema.
-///
-/// One container serves both arms, halving the live-Azure provisioning cost and
-/// orphan surface; the arms are still seeded independently into two disjoint
-/// `key-prefix`es.
-///
-/// **Hold this as a local in the test that provisions it.** `_container`'s
-/// `Drop` deletes the container on return or panic, but only while still owned
-/// by the test's stack frame — never move it out or park it in a static (which
-/// is why both arms live in one test function rather than a shared `OnceLock`).
+/// Hold as a test-function local: `_container`'s `Drop` deletes the container on
+/// return or panic, which a static would never run. That is why both arms share
+/// one test rather than a `OnceLock`.
 struct AzureFixture {
-    /// Storage account under test — the `abfss://` authority the scan reads.
     account_name: String,
-    /// The run's blob container, which is also both warehouses' `filesystem`.
     container_name: String,
-    /// The vended-SAS arm. Provisioned first so a static-arm failure can't hide
-    /// vended evidence.
     vended_arm: AzureArm,
-    /// The static account-key arm.
     static_arm: AzureArm,
-    /// The exact password [`AzureFixture::provision`] installed as `CONN_VENDED`
-    /// — the installed artefact itself, not an equivalent value rebuilt later.
     vended_password: CatalogConnectionPassword,
-    /// Existence-only: dropping it deletes the container and both arms' data.
-    /// Declared last so it outlives every field describing it.
+    /// Declared last so it drops after every field describing it.
     _container: AzureContainer,
 }
 
 impl AzureFixture {
-    /// Create the run's container, then the vended arm's warehouse/seed/VS, then
-    /// the static arm's. Container first because Lakekeeper validates access via
-    /// a probe write/delete at warehouse-creation time. Vended before static so a
-    /// static-arm failure can't leave zero evidence about the vended path.
-    ///
-    /// Blocking HTTP/WebSocket calls stay outside `rt.block_on`: issuing one from
-    /// inside a runtime context panics, unwinding through the container guard.
+    /// The container comes first because Lakekeeper probes it at warehouse
+    /// creation; vended before static so a static failure can't hide vended
+    /// evidence. Blocking calls stay outside `rt.block_on`, where they would panic.
     fn provision() -> Self {
         setup();
 
-        // Read before anything exists in Azure, so an absent variable fails the
-        // run with no container to clean up yet.
+        // Read before creating anything, so a missing variable leaves no container.
         let account_name = azure::account_name();
         let account_key = azure::account_key();
 
@@ -197,12 +116,11 @@ impl AzureFixture {
             .block_on(AzureContainer::create(&container_name))
             .unwrap_or_else(|e| panic!("create per-run Azure container '{container_name}': {e:#}"));
 
-        // Both arms seed through this closure so the short-lived Keycloak token
-        // is fetched fresh immediately before each write.
+        // Fetches a fresh short-lived Keycloak token immediately before each seed.
         let seed_arm = |warehouse: &str| -> Vec<String> {
             let token = lakekeeper::keycloak_client_credentials_token();
             rt.block_on(seed_events_table_with_auth(
-                &lakekeeper_catalog_url_host(),
+                &lakekeeper::catalog_uri_host(),
                 warehouse,
                 SeedCatalogAuth {
                     token: Some(token),
@@ -237,8 +155,7 @@ impl AzureFixture {
             &account_key,
         ));
         let static_paths = seed_arm(&static_warehouse);
-        // Leaving every static S3 field empty is what makes the adapter read
-        // this as an Azure CONNECTION rather than an ambiguous one.
+        // Empty S3 fields make the adapter read this as an Azure CONNECTION.
         let static_password =
             lakekeeper_adls_connection_password(&static_warehouse, &account_name, &account_key);
         create_virtual_schema_with_password(
@@ -266,9 +183,6 @@ impl AzureFixture {
         }
     }
 
-    /// The `abfss://<container>@<account>.dfs.core.windows.net/` prefix every one
-    /// of this fixture's data files carries, on either arm. An arm's own prefix
-    /// is this one followed by that arm's warehouse name.
     fn abfss_prefix(&self) -> String {
         format!(
             "abfss://{}@{}.dfs.core.windows.net/",
@@ -277,10 +191,8 @@ impl AzureFixture {
     }
 }
 
-/// Create one arm's warehouse and confirm Lakekeeper registered it under the
-/// requested `key-prefix`, returning the warehouse name. The readback also
-/// catches a create Lakekeeper silently rejected for overlapping a sibling's
-/// storage profile, surfacing it here instead of as an opaque seed error later.
+/// The readback catches a create Lakekeeper silently rejected for overlapping a
+/// sibling's storage profile, which would otherwise surface as an opaque seed error.
 fn create_warehouse_and_confirm(profile: &AdlsWarehouseProfile) -> String {
     let warehouse = profile.name().to_string();
     lakekeeper_create_adls_warehouse(profile);
@@ -295,11 +207,6 @@ fn create_warehouse_and_confirm(profile: &AdlsWarehouseProfile) -> String {
     warehouse
 }
 
-// ---------------------------------------------------------------------------
-// End-to-end scan over both credential arms — vended assertions first.
-// ---------------------------------------------------------------------------
-
-/// Assert `arm`'s Virtual Schema exists — proof its whole provisioning chain ran.
 fn assert_vs_exists(conn: &mut ExaConn, arm: &AzureArm) {
     let cols = conn.query_columns(&format!(
         "SELECT SCHEMA_NAME FROM SYS.EXA_ALL_VIRTUAL_SCHEMAS WHERE SCHEMA_NAME = '{}'",
@@ -315,9 +222,6 @@ fn assert_vs_exists(conn: &mut ExaConn, arm: &AzureArm) {
     );
 }
 
-/// Assert every data file `arm` seeded lives under `arm`'s own Lakekeeper
-/// `key-prefix`, and none sits under `sibling`'s — proving the two arms are
-/// disjoint file sets, not just both real Azure storage.
 fn assert_paths_under_own_prefix(fixture: &AzureFixture, arm: &AzureArm, sibling: &AzureArm) {
     assert!(
         !arm.data_file_paths.is_empty(),
@@ -345,9 +249,7 @@ fn assert_paths_under_own_prefix(fixture: &AzureFixture, arm: &AzureArm, sibling
     }
 }
 
-/// Projection + filter + LIMIT correctness and row counts over `arm`'s real
-/// Azure scan. Same seed shape as every other E2E suite: id 1..20,
-/// score = 5.0 * id.
+/// Seed shape: id 1..20, score = 5.0 * id.
 fn assert_projection_filter_limit(conn: &mut ExaConn, arm: &AzureArm) {
     let table = arm.table();
     let cols = conn.query_columns(&format!(
@@ -389,7 +291,6 @@ fn assert_projection_filter_limit(conn: &mut ExaConn, arm: &AzureArm) {
     );
 }
 
-/// The `(id, name, score)` rows of `table`, ordered by id, as comparable tuples.
 fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
     let cols = conn.query_columns(&format!("SELECT id, name, score FROM {table} ORDER BY id"));
     assert_eq!(
@@ -413,21 +314,73 @@ fn projection_rows(conn: &mut ExaConn, table: &str) -> Vec<(i64, String, f64)> {
         .collect()
 }
 
-/// Both credential arms — static account key and vended SAS — end to end over
-/// one per-run container, in one test because they share one fixture.
-///
-/// **The assertion order below is normative, not style.** Every vended-arm
-/// assertion except the final cross-arm comparison runs BEFORE the static arm's:
-/// the vended CONNECTION carries no account name/key, so a passing vended scan
-/// is the strongest proof in this file, and should abort the run before any
-/// unrelated static-arm regression can mask it.
+fn azure_direct_events_batch(ids: &[i64]) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("EVENT_ID", DataType::Int64, false),
+        Field::new("NAME", DataType::Utf8, true),
+        Field::new("SCORE", DataType::Float64, true),
+        Field::new("AMOUNT", DataType::Decimal128(18, 0), true),
+    ]));
+    let names: Vec<String> = ids.iter().map(|id| format!("event-{id}")).collect();
+    let scores: Vec<f64> = ids.iter().map(|&id| id as f64 * 1.5).collect();
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ids.to_vec())),
+            Arc::new(StringArray::from(names)),
+            Arc::new(Float64Array::from(scores)),
+            decimal_18_0_values().slice(0, ids.len()),
+        ],
+    )
+    .expect("azure direct-storage events batch construction is infallible")
+}
+
+fn write_azure_parquet_fixture(
+    container: &str,
+    account: &str,
+    key: &str,
+    path: &str,
+    batch: RecordBatch,
+) {
+    let mut buf = Vec::new();
+    {
+        let mut writer = ArrowWriter::try_new(&mut buf, batch.schema(), None)
+            .unwrap_or_else(|e| panic!("open Arrow Parquet writer for {path}: {e}"));
+        writer
+            .write(&batch)
+            .unwrap_or_else(|e| panic!("write Azure raw-Parquet fixture batch at {path}: {e}"));
+        writer
+            .close()
+            .unwrap_or_else(|e| panic!("close Azure raw-Parquet fixture writer for {path}: {e}"));
+    }
+
+    let store = MicrosoftAzureBuilder::new()
+        .with_account(account)
+        .with_container_name(container)
+        .with_access_key(key)
+        .build()
+        .unwrap_or_else(|e| panic!("configure Azure object store for {path}: {e}"));
+
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime for Azure raw-Parquet fixture write");
+    rt.block_on(async {
+        store
+            .put(&ObjectStorePath::from(path), PutPayload::from(buf))
+            .await
+            .unwrap_or_else(|e| panic!("PUT Azure raw-Parquet fixture at {path}: {e}"));
+    });
+}
+
+/// Scenario: In-range Decimal128 maps to a precise Exasol DECIMAL
 #[test]
 fn azure_static_and_vended_creds_end_to_end() {
+    // Vended-arm assertions run first so a static-arm regression cannot mask the
+    // vended proof (its CONNECTION carries no account name/key).
     let fixture = AzureFixture::provision();
     let mut conn = exa_conn();
 
-    // 1. The vended CONNECTION's required shape: no storage field of any kind,
-    //    so only the vended SAS can make the scan below succeed.
     assert!(
         fixture.vended_password.use_vended_credentials,
         "the vended ADLS CONNECTION must request access delegation"
@@ -446,7 +399,6 @@ fn azure_static_and_vended_creds_end_to_end() {
         "a vended CONNECTION must carry no static S3 storage field either"
     );
 
-    // 2. The vended warehouse as Lakekeeper itself reports it back.
     let vended_profile = lakekeeper_warehouse_storage_profile(&fixture.vended_arm.warehouse);
     assert_eq!(
         vended_profile["sas-enabled"].as_bool(),
@@ -461,14 +413,11 @@ fn azure_static_and_vended_creds_end_to_end() {
          {vended_profile}"
     );
 
-    // 3. The vended VS exists and its seed landed under its own key-prefix.
     assert_vs_exists(&mut conn, &fixture.vended_arm);
     assert_paths_under_own_prefix(&fixture, &fixture.vended_arm, &fixture.static_arm);
 
-    // 4. The vended scan itself: projection, filter, LIMIT, and row counts.
     assert_projection_filter_limit(&mut conn, &fixture.vended_arm);
 
-    // 5. Both Virtual Schemas were created USING the one shared adapter script.
     for script in [ADAPTER_SCRIPT_NAME, SCAN_SCRIPT_NAME] {
         let resp = conn.execute(&format!(
             "SELECT SCRIPT_TEXT FROM EXA_ALL_SCRIPTS \
@@ -506,7 +455,6 @@ fn azure_static_and_vended_creds_end_to_end() {
         );
     }
 
-    // 6. Only now the static arm, in the groups it has always run.
     assert_vs_exists(&mut conn, &fixture.static_arm);
 
     let static_profile = lakekeeper_warehouse_storage_profile(&fixture.static_arm.warehouse);
@@ -541,7 +489,6 @@ fn azure_static_and_vended_creds_end_to_end() {
     assert_paths_under_own_prefix(&fixture, &fixture.static_arm, &fixture.vended_arm);
     assert_projection_filter_limit(&mut conn, &fixture.static_arm);
 
-    // 7. Both arms return the same rows, ordered by id.
     let vended_rows = projection_rows(&mut conn, &fixture.vended_arm.table());
     let static_rows = projection_rows(&mut conn, &fixture.static_arm.table());
     assert_eq!(
@@ -554,25 +501,89 @@ fn azure_static_and_vended_creds_end_to_end() {
         SEED_TOTAL_ROWS,
         "the ordered cross-arm projection must cover all {SEED_TOTAL_ROWS} seeded rows"
     );
+
+    direct_storage_over_adls_returns_correct_rows(&mut conn, &fixture);
 }
 
-// ---------------------------------------------------------------------------
-// Container guard deletes on panic, even nested inside an active runtime.
-// ---------------------------------------------------------------------------
+/// Runs inside [`azure_static_and_vended_creds_end_to_end`] to share its container guard.
+fn direct_storage_over_adls_returns_correct_rows(conn: &mut ExaConn, fixture: &AzureFixture) {
+    let account_key = azure::account_key();
+    write_azure_parquet_fixture(
+        &fixture.container_name,
+        &fixture.account_name,
+        &account_key,
+        "direct/events/file1.parquet",
+        azure_direct_events_batch(&[1, 2]),
+    );
+    write_azure_parquet_fixture(
+        &fixture.container_name,
+        &fixture.account_name,
+        &account_key,
+        "direct/events/file2.parquet",
+        azure_direct_events_batch(&[3, 4]),
+    );
 
-/// The container guard deletes its container while unwinding from a panic that
-/// crosses an active `rt.block_on` — the case `AzureContainer::drop`'s own
-/// teardown thread exists to survive (driving the delete on the ambient runtime
-/// from `Drop` would re-enter "Cannot start a runtime from within a runtime").
-///
-/// One guard covers both credential arms: the container it deletes holds both
-/// warehouses' data, so the second arm adds no Azure-side orphan surface.
-///
-/// Uses `futures::FutureExt::catch_unwind`, not `std::panic::catch_unwind`: the
-/// guard's construction is `async`, and a nested `Handle::block_on` inside a
-/// synchronous closure would trigger the very panic this test proves is fixed.
+    let direct_vs = "AZ_DIRECT_STORAGE_VS";
+    let direct_address = format!(
+        "abfss://{}@{}.dfs.core.windows.net/direct",
+        fixture.container_name, fixture.account_name
+    );
+    let direct_password = CatalogConnectionPassword {
+        account_name: Some(fixture.account_name.clone()),
+        account_key: Some(account_key.clone()),
+        ..Default::default()
+    };
+    create_virtual_schema_with_password(
+        conn,
+        &VsProps::new(direct_vs, "")
+            .with_catalog_conn_name("AZ_DIRECT_STORAGE_CREDS")
+            .with_catalog_kind("DIRECT_STORAGE"),
+        &direct_address,
+        &direct_password,
+    );
+
+    let tables = conn.query_columns(&format!(
+        "SELECT TABLE_NAME FROM SYS.EXA_ALL_TABLES WHERE TABLE_SCHEMA = '{direct_vs}'"
+    ));
+    let table_names: Vec<String> = tables
+        .first()
+        .map(|col| col.iter().map(value_to_string).collect())
+        .unwrap_or_default();
+    assert_eq!(
+        table_names,
+        vec!["EVENTS".to_string()],
+        "a single first-level directory under the direct-storage base path must declare \
+         exactly one table named EVENTS: {table_names:?}"
+    );
+
+    let direct_cols = conn.query_columns(&format!(
+        "SELECT EVENT_ID, NAME FROM {direct_vs}.EVENTS WHERE EVENT_ID > 2 ORDER BY EVENT_ID"
+    ));
+    let ids: Vec<i64> = direct_cols[0].iter().map(parse_int).collect();
+    let names: Vec<String> = direct_cols[1].iter().map(value_to_string).collect();
+    assert_eq!(
+        ids,
+        vec![3, 4],
+        "the two-file EVENTS directory must fold and return rows from both files: {ids:?}"
+    );
+    assert_eq!(names, vec!["event-3".to_string(), "event-4".to_string()]);
+    assert_eq!(
+        declared_type(conn, direct_vs, "EVENTS", "AMOUNT"),
+        "DECIMAL(18,0)"
+    );
+    assert_decimal_orders_numerically(conn, direct_vs, "EVENTS", "AMOUNT");
+
+    let explained = explain_virtual_sql(conn, &format!("SELECT EVENT_ID FROM {direct_vs}.EVENTS"));
+    assert!(
+        !explained.contains(&account_key),
+        "EXPLAIN VIRTUAL output must never leak the Azure account key"
+    );
+}
+
 #[test]
 fn azure_container_guard_deletes_on_panic() {
+    // `FutureExt::catch_unwind`, not `std::panic::catch_unwind`: a nested
+    // `Handle::block_on` in a sync closure would itself panic.
     let container_name = azure::per_run_container_name();
 
     let rt = tokio::runtime::Builder::new_current_thread()
@@ -611,18 +622,9 @@ fn azure_container_guard_deletes_on_panic() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Fail-not-skip when the stack is down.
-// ---------------------------------------------------------------------------
-
-/// Mirrors the Lakekeeper suite's `lakekeeper_suite_fails_when_stack_unavailable`:
-/// a readiness wait against an unreachable stack PANICS rather than returning,
-/// so a down stack fails the test instead of silently skipping it.
 #[test]
 fn azure_suite_fails_when_stack_unavailable() {
     let result = std::panic::catch_unwind(|| {
-        // 127.0.0.1:1 refuses immediately, so the poll loop hits the deadline
-        // and panics — the fail-not-skip contract.
         wait_for_url("http://127.0.0.1:1/health", Duration::from_secs(2));
     });
     assert!(
@@ -631,14 +633,6 @@ fn azure_suite_fails_when_stack_unavailable() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// No credential value ever appears in captured output / panic messages.
-// ---------------------------------------------------------------------------
-
-/// A failing, credential-bearing Azure CONNECTION DDL through a redacting
-/// `ExaConn` must not leak the SQL text or either sentinel value into the
-/// failure output. Mirrors the Lakekeeper suite's
-/// `lakekeeper_credentials_never_appear_in_output`.
 #[test]
 fn azure_credentials_never_appear_in_output() {
     const SENTINEL_ACCOUNT_NAME: &str = "azdummyaccountnamesentinel";
@@ -685,19 +679,10 @@ fn azure_credentials_never_appear_in_output() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Local credential file cannot be committed (pure, no I/O at runtime).
-// ---------------------------------------------------------------------------
-
-/// Workspace `.gitignore`, embedded at compile time.
-/// Path is relative to this source file: crates/lakehouse-engine/tests -> workspace root.
 const WORKSPACE_GITIGNORE: &str = include_str!("../../../.gitignore");
 
-/// Committed `test.env.example`, embedded at compile time.
 const TEST_ENV_EXAMPLE: &str = include_str!("../../../test.env.example");
 
-/// `.gitignore` must list `test.env`, and `test.env.example` must name all five
-/// Azure variables with only the `placeholder` sentinel — never a real value.
 #[test]
 fn azure_local_credential_file_is_gitignored() {
     assert!(
@@ -722,16 +707,8 @@ fn azure_local_credential_file_is_gitignored() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The Make target rebuilds the .so and runs the suite serially.
-// ---------------------------------------------------------------------------
-
-/// Workspace `Makefile`, embedded at compile time.
 const WORKSPACE_MAKEFILE: &str = include_str!("../../../Makefile");
 
-/// `make test-e2e-azure`'s shape, asserted against the Makefile text rather than
-/// by running `make` (which would trigger the full Docker/build pipeline inside
-/// a test).
 #[test]
 fn azure_make_target_rebuilds_so_and_runs_serially() {
     let target_start = WORKSPACE_MAKEFILE

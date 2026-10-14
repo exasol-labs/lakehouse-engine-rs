@@ -1,41 +1,20 @@
-/// Translates Exasol pushdown filter JSON into a sound Iceberg pruning predicate.
-///
-/// The predicate is pruning-only: every conjunct it emits is logically implied by
-/// the user predicate. DataFusion remains the sole row-level correctness backstop.
-/// A node that cannot be translated soundly is dropped — this can only widen the
-/// surviving file set, never narrow it past correctness.
+//! Pruning-only: every emitted predicate is implied by the user predicate. An untranslatable node
+//! is dropped, widening the file set, and `NOT` negates only an exactly translated child.
+
 use iceberg::expr::{Predicate, Reference};
 use iceberg::spec::{Datum, NestedFieldRef, PrimitiveType, Schema};
 use serde_json::Value as Json;
 
-// ---------------------------------------------------------------------------
-// Column resolution (task 1.2)
-// ---------------------------------------------------------------------------
-
-/// Resolve an Exasol (uppercase) column name to its Iceberg field via
-/// case-insensitive lookup, returning the exact Iceberg field name and its
-/// primitive type.
-///
-/// Returns `None` when the field is absent or not a primitive type.
 fn resolve_column<'s>(col_name: &str, schema: &'s Schema) -> Option<(&'s str, &'s PrimitiveType)> {
     let field: &NestedFieldRef = schema.field_by_name_case_insensitive(col_name)?;
     let prim = field.field_type.as_primitive_type()?;
     Some((&field.name, prim))
 }
 
-// ---------------------------------------------------------------------------
-// Literal → Datum (task 1.3)
-// ---------------------------------------------------------------------------
-
-/// Build a typed `Datum` from a filter-JSON literal node, keyed on the
-/// resolved Iceberg `PrimitiveType`.
-///
-/// Returns `None` on any type mismatch or unparsable value. Never panics.
 fn literal_to_datum(lit: &Json, prim: &PrimitiveType) -> Option<Datum> {
     let kind = lit.get("type")?.as_str()?;
 
     match (kind, prim) {
-        // Boolean
         ("literal_bool", PrimitiveType::Boolean) => {
             let v = lit.get("value")?;
             let b = match v {
@@ -47,49 +26,41 @@ fn literal_to_datum(lit: &Json, prim: &PrimitiveType) -> Option<Datum> {
             Some(Datum::bool(b))
         }
 
-        // Int (32-bit)
         ("literal_exactnumeric" | "literal_double", PrimitiveType::Int) => {
             let v = lit.get("value")?;
             parse_i32(v).map(Datum::int)
         }
 
-        // Long (64-bit)
         ("literal_exactnumeric" | "literal_double", PrimitiveType::Long) => {
             let v = lit.get("value")?;
             parse_i64(v).map(Datum::long)
         }
 
-        // Float
         ("literal_exactnumeric" | "literal_double", PrimitiveType::Float) => {
             let v = lit.get("value")?;
             parse_f64(v).map(|f| Datum::float(f as f32))
         }
 
-        // Double
         ("literal_exactnumeric" | "literal_double", PrimitiveType::Double) => {
             let v = lit.get("value")?;
             parse_f64(v).map(Datum::double)
         }
 
-        // String
         ("literal_string", PrimitiveType::String) => {
             let s = lit.get("value")?.as_str()?;
             Some(Datum::string(s))
         }
 
-        // Date — Iceberg stores days since epoch; use Datum::date_from_str
         ("literal_date", PrimitiveType::Date) => {
             let s = lit.get("value")?.as_str()?;
             Datum::date_from_str(s).ok()
         }
 
-        // Timestamp (no timezone) — parse "YYYY-MM-DD HH:MM:SS[.f]" or ISO-8601
         ("literal_timestamp", PrimitiveType::Timestamp | PrimitiveType::TimestampNs) => {
             let s = lit.get("value")?.as_str()?;
             parse_timestamp_no_tz(s, prim)
         }
 
-        // Timestamp with timezone — parse RFC3339 / "YYYY-MM-DD HH:MM:SS+HH:MM"
         ("literal_timestamp_utc", PrimitiveType::Timestamptz | PrimitiveType::TimestamptzNs) => {
             let s = lit.get("value")?.as_str()?;
             parse_timestamptz(s, prim)
@@ -124,7 +95,6 @@ fn parse_f64(v: &Json) -> Option<f64> {
 }
 
 fn parse_timestamp_no_tz(s: &str, prim: &PrimitiveType) -> Option<Datum> {
-    // Try T-separated ISO-8601, then space-separated.
     let s_t = if s.contains('T') {
         s.to_owned()
     } else {
@@ -141,9 +111,7 @@ fn parse_timestamp_no_tz(s: &str, prim: &PrimitiveType) -> Option<Datum> {
     }
 }
 
-/// True when the timestamp string already carries an explicit timezone: a
-/// trailing `Z`, or a `+HH:MM` / `-HH:MM` offset in its final six characters
-/// (so a `-` inside the date portion is not mistaken for an offset).
+/// Only the final six characters are checked, so a `-` inside the date is not an offset.
 fn has_tz_offset(s: &str) -> bool {
     if s.ends_with('Z') {
         return true;
@@ -153,7 +121,6 @@ fn has_tz_offset(s: &str) -> bool {
 }
 
 fn parse_timestamptz(s: &str, prim: &PrimitiveType) -> Option<Datum> {
-    // Append UTC offset if missing so DateTime::from_str can parse it.
     let s_tz = if has_tz_offset(s) {
         s.to_owned()
     } else {
@@ -170,7 +137,6 @@ fn parse_timestamptz(s: &str, prim: &PrimitiveType) -> Option<Datum> {
     }
 }
 
-/// Extract the underlying microsecond `Long` from a timestamp/timestamptz micros datum.
 fn long_from_datum(d: Datum) -> Option<i64> {
     use iceberg::spec::{Literal, PrimitiveLiteral};
     match Literal::from(d) {
@@ -178,10 +144,6 @@ fn long_from_datum(d: Datum) -> Option<i64> {
         _ => None,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Column extraction from a comparison node operand
-// ---------------------------------------------------------------------------
 
 fn extract_column(node: &Json) -> Option<&str> {
     if node.get("type")?.as_str()? == "column" {
@@ -191,66 +153,73 @@ fn extract_column(node: &Json) -> Option<&str> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Core translator (task 1.4)
-// ---------------------------------------------------------------------------
-
-/// Translate a Exasol pushdown filter JSON node into an Iceberg pruning
-/// predicate against the given schema.
-///
-/// Returns `None` when the node (or any required part of it) cannot be
-/// translated soundly.  `None` is "no constraint" — the caller must treat it
-/// as "pass all files", never as "pass no files".
+/// `None` means no constraint: the caller must pass all files, never none.
 pub fn to_iceberg_predicate(filter_json: &Json, schema: &Schema) -> Option<Predicate> {
+    translate(filter_json, schema).map(|translated| translated.predicate)
+}
+
+/// Only an exact translation may be negated: `NOT` over a widened child would narrow it,
+/// pruning files that still hold matching rows (#466).
+struct Translated {
+    predicate: Predicate,
+    exact: bool,
+}
+
+impl Translated {
+    fn exact(predicate: Predicate) -> Self {
+        Self {
+            predicate,
+            exact: true,
+        }
+    }
+}
+
+fn translate(filter_json: &Json, schema: &Schema) -> Option<Translated> {
     let kind = filter_json.get("type")?.as_str()?;
 
     match kind {
-        // --- Binary comparisons ---
         "predicate_equal"
         | "predicate_less"
         | "predicate_lessequal"
         | "predicate_greater"
-        | "predicate_greaterequal" => translate_binary(filter_json, kind, schema),
+        | "predicate_greaterequal" => {
+            translate_binary(filter_json, kind, schema).map(Translated::exact)
+        }
 
-        // predicate_notequal: not soundly prunable to a single range.
+        // Not soundly prunable to a single range.
         "predicate_notequal" => None,
 
-        // --- Logical connectives ---
         "predicate_and" => {
             let exprs = filter_json.get("expressions")?.as_array()?;
-            fold_and(exprs, schema)
+            fold_and(exprs.iter().map(|expr| translate(expr, schema)))
         }
         "predicate_or" => {
             let exprs = filter_json.get("expressions")?.as_array()?;
-            fold_or(exprs, schema)
+            fold_or(exprs.iter().map(|expr| translate(expr, schema)))
         }
         "predicate_not" => {
             let inner = filter_json.get("expression")?;
-            let child = to_iceberg_predicate(inner, schema)?;
-            Some(child.negate())
+            let Translated { predicate, exact } = translate(inner, schema)?;
+            exact.then(|| Translated::exact(predicate.negate()))
         }
 
-        // --- Unary predicates ---
         "predicate_is_null" => {
             let col_node = filter_json.get("expression")?;
             let col_name = extract_column(col_node)?;
             let (exact_name, _prim) = resolve_column(col_name, schema)?;
-            Some(Reference::new(exact_name).is_null())
+            Some(Translated::exact(Reference::new(exact_name).is_null()))
         }
         "predicate_is_not_null" => {
             let col_node = filter_json.get("expression")?;
             let col_name = extract_column(col_node)?;
             let (exact_name, _prim) = resolve_column(col_name, schema)?;
-            Some(Reference::new(exact_name).is_not_null())
+            Some(Translated::exact(Reference::new(exact_name).is_not_null()))
         }
 
-        // --- IN ---
-        "predicate_in_constlist" => translate_in(filter_json, schema),
+        "predicate_in_constlist" => translate_in(filter_json, schema).map(Translated::exact),
 
-        // --- BETWEEN → col >= low AND col <= high ---
         "predicate_between" => translate_between(filter_json, schema),
 
-        // Everything else is untranslatable.
         _ => None,
     }
 }
@@ -259,7 +228,6 @@ fn translate_binary(node: &Json, kind: &str, schema: &Schema) -> Option<Predicat
     let left = node.get("left")?;
     let right = node.get("right")?;
 
-    // Determine which side is the column and which is the literal.
     let (col_name, lit_node, col_is_left) = if let Some(name) = extract_column(left) {
         (name, right, true)
     } else if let Some(name) = extract_column(right) {
@@ -272,8 +240,6 @@ fn translate_binary(node: &Json, kind: &str, schema: &Schema) -> Option<Predicat
     let datum = literal_to_datum(lit_node, prim)?;
     let reference = Reference::new(exact_name);
 
-    // When the column is on the RIGHT, invert the operator.
-    // e.g. `literal < col` ≡ `col > literal`
     let effective_kind = if col_is_left {
         kind
     } else {
@@ -291,7 +257,6 @@ fn translate_binary(node: &Json, kind: &str, schema: &Schema) -> Option<Predicat
     Some(pred)
 }
 
-/// Flip a binary comparison operator (when the column is on the right).
 fn flip_operator(kind: &str) -> Option<&'static str> {
     Some(match kind {
         "predicate_less" => "predicate_greater",
@@ -303,41 +268,32 @@ fn flip_operator(kind: &str) -> Option<&'static str> {
     })
 }
 
-/// AND semantics: combine Some children; drop None children.
-/// If all children are None, return None.
-fn fold_and(exprs: &[Json], schema: &Schema) -> Option<Predicate> {
-    let mut acc: Option<Predicate> = None;
-    for expr in exprs {
-        if let Some(child) = to_iceberg_predicate(expr, schema) {
-            acc = Some(match acc {
-                None => child,
-                Some(prev) => prev.and(child),
-            });
+fn fold_and(children: impl Iterator<Item = Option<Translated>>) -> Option<Translated> {
+    let mut predicates = Vec::new();
+    let mut exact = true;
+    for child in children {
+        match child {
+            Some(translated) => {
+                exact &= translated.exact;
+                predicates.push(translated.predicate);
+            }
+            None => exact = false,
         }
     }
-    acc
+    let predicate = predicates.into_iter().reduce(Predicate::and)?;
+    Some(Translated { predicate, exact })
 }
 
-/// OR semantics: if ANY child is None, return None.
-/// Only when ALL children translate, fold with `or`.
-fn fold_or(exprs: &[Json], schema: &Schema) -> Option<Predicate> {
-    if exprs.is_empty() {
-        return None;
-    }
-    let mut acc: Option<Predicate> = None;
-    for expr in exprs {
-        let child = to_iceberg_predicate(expr, schema)?;
-        acc = Some(match acc {
-            None => child,
-            Some(prev) => prev.or(child),
-        });
-    }
-    acc
+fn fold_or(children: impl Iterator<Item = Option<Translated>>) -> Option<Translated> {
+    let translated: Vec<Translated> = children.collect::<Option<_>>()?;
+    let exact = translated.iter().all(|child| child.exact);
+    let predicate = translated
+        .into_iter()
+        .map(|child| child.predicate)
+        .reduce(Predicate::or)?;
+    Some(Translated { predicate, exact })
 }
 
-/// IN: translate only when ALL list elements build a Datum.
-/// A single untranslatable element means a matching row could exist outside
-/// the translated set — unsound to prune.
 fn translate_in(node: &Json, schema: &Schema) -> Option<Predicate> {
     let col_node = node.get("expression")?;
     let col_name = extract_column(col_node)?;
@@ -352,35 +308,24 @@ fn translate_in(node: &Json, schema: &Schema) -> Option<Predicate> {
     Some(Reference::new(exact_name).is_in(datums))
 }
 
-/// BETWEEN: desugar to `col >= low AND col <= high`.
-/// Either bound alone is still implied by BETWEEN, so a failing bound is
-/// dropped under the implicit AND (sound: drops one conjunct, widens set).
-fn translate_between(node: &Json, schema: &Schema) -> Option<Predicate> {
+/// Either bound alone is implied by BETWEEN, so a failed bound drops only its own conjunct
+/// and leaves the result inexact.
+fn translate_between(node: &Json, schema: &Schema) -> Option<Translated> {
     let col_node = node.get("expression")?;
     let col_name = extract_column(col_node)?;
     let (exact_name, prim) = resolve_column(col_name, schema)?;
 
-    let low_node = node.get("left");
-    let high_node = node.get("right");
-
-    let low_pred = low_node
+    let low = node
+        .get("left")
         .and_then(|n| literal_to_datum(n, prim))
-        .map(|d| Reference::new(exact_name).greater_than_or_equal_to(d));
-    let high_pred = high_node
+        .map(|d| Translated::exact(Reference::new(exact_name).greater_than_or_equal_to(d)));
+    let high = node
+        .get("right")
         .and_then(|n| literal_to_datum(n, prim))
-        .map(|d| Reference::new(exact_name).less_than_or_equal_to(d));
+        .map(|d| Translated::exact(Reference::new(exact_name).less_than_or_equal_to(d)));
 
-    match (low_pred, high_pred) {
-        (Some(lo), Some(hi)) => Some(lo.and(hi)),
-        (Some(lo), None) => Some(lo),
-        (None, Some(hi)) => Some(hi),
-        (None, None) => None,
-    }
+    fold_and([low, high].into_iter())
 }
-
-// ---------------------------------------------------------------------------
-// Tests (tasks 3.1–3.5)
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "iceberg_predicate_tests.rs"]

@@ -1,23 +1,8 @@
-//! Contract tests for the shared catalog-client trait and its catalog-neutral
-//! metadata types.
-//!
-//! Covers catalog-crate-structure scenario:
-//! "One shared catalog-client trait and its neutral types become the crate's
-//! operation surface" -- every operation here is driven through a
-//! `Box<dyn CatalogClient>`, so the boxed-future signature's trait-object
-//! compatibility is what is under test, not a concrete client's behavior.
-
 use super::*;
 use crate::test_support::*;
 use iceberg::spec::{PrimitiveType, Type};
 use std::sync::{Arc, Mutex};
 
-/// A client serving fixed metadata whose identifiers are built from the
-/// namespace segments it was handed, so a test can observe what the trait passed
-/// through. Stands in for both catalog kinds: it lists one Iceberg-sourced and
-/// one Unity-sourced base table, plus one skipped entry per `SkipReason`
-/// variant. Every listed shape is one a production client can produce — no
-/// client puts a non-`Table` entry in `tables`.
 struct FixedCatalogClient;
 
 impl FixedCatalogClient {
@@ -31,6 +16,8 @@ impl FixedCatalogClient {
             storage_location: Some("s3://warehouse/orders".to_string()),
             format: TableFormat::Iceberg,
             vended_credential_key: None,
+            partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![CatalogColumn {
                 name: "order_id".to_string(),
                 source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
@@ -48,13 +35,11 @@ impl FixedCatalogClient {
             storage_location: Some("s3://warehouse/payments".to_string()),
             format: TableFormat::Delta,
             vended_credential_key: Some("payments-uuid".to_string()),
+            partition_columns: Vec::new(),
+            metadata_location: None,
             columns: vec![CatalogColumn {
                 name: "total".to_string(),
-                source_type: ColumnSourceType::Unity {
-                    type_name: "DECIMAL".to_string(),
-                    precision: 10,
-                    scale: 2,
-                },
+                source_type: ColumnSourceType::Unity { type_json: None },
             }],
         }
     }
@@ -65,8 +50,6 @@ impl CatalogClient for FixedCatalogClient {
         &self,
         namespace: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
-        // Own the segments before the future is built: the returned future is
-        // bound to `&self`, not to the caller's slice borrow.
         let namespace = namespace.to_vec();
         Box::pin(async move {
             Ok(CatalogListing {
@@ -155,8 +138,6 @@ async fn boxed_client_lists_neutral_tables_and_skipped_entries_with_reasons() {
 
 #[tokio::test]
 async fn namespace_segments_reach_the_client_unjoined() {
-    // A segment may itself contain the dot separator, so a pre-joined identifier
-    // could not be re-split back into these two segments.
     let namespace = vec!["prod.eu".to_string(), "finance".to_string()];
     let client = boxed_client();
 
@@ -189,8 +170,6 @@ async fn boxed_client_loads_one_table_by_segmented_identifier() {
 
 #[test]
 fn a_boxed_catalog_client_is_send_and_sync() {
-    // The engine holds the client across the UDF's async boundary, so dropping
-    // either bound must be a build failure here rather than there.
     fn requires_send_sync<T: Send + Sync + ?Sized>() {}
 
     requires_send_sync::<dyn CatalogClient>();
@@ -213,53 +192,14 @@ async fn an_iceberg_column_carries_its_iceberg_source_type() {
     );
 }
 
-#[tokio::test]
-async fn a_unity_decimal_column_carries_its_precision_and_scale() {
-    let listing = boxed_client()
-        .list_tables(&["prod".to_string()])
-        .await
-        .expect("listing failed");
-
-    // Matching an Iceberg column and a Unity column in distinct arms is what the
-    // engine's single type-mapping home relies on.
-    match &listing.tables[1].columns[0].source_type {
-        ColumnSourceType::Unity {
-            type_name,
-            precision,
-            scale,
-        } => assert_eq!((type_name.as_str(), *precision, *scale), ("DECIMAL", 10, 2)),
-        ColumnSourceType::Iceberg(ty) => panic!("expected a Unity source type, got iceberg {ty}"),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// IcebergRestCatalogClient — the one-session, empty-batch, and skip guarantees
-// migrated from the deleted engine schema loop.
-// ---------------------------------------------------------------------------
-
-/// A record of the session-scoped work the mock catalog served, so a test can
-/// prove exactly one session (one OAuth grant) served a whole multi-table batch.
 #[derive(Default)]
 struct RequestLog {
     oauth_grants: usize,
     load_table_names: Vec<String>,
 }
 
-/// Spawn a minimal Iceberg REST catalog on a fresh local port, so the PUBLIC
-/// `CatalogClient::list_tables` (enumerate-then-load) can be driven end-to-end.
-///
-/// Serves the namespace enumeration `list_tables` (`GET .../namespaces/{ns}/tables`)
-/// with the `tables` identifiers in `namespace`, and reports no child namespaces
-/// (`GET .../namespaces?parent=`) so the recursion terminates. Every enumerated
-/// table then loads: one in `server_error` answers `loadTable` with HTTP 500 (a
-/// catalog fault — NOT the "not an Iceberg table" signal), one in `not_loadable`
-/// answers `loadTable` with HTTP 404 (the catalog's "not a loadable Iceberg
-/// table" signal), and every other answers with a two-column (`id` long, `name`
-/// string) result. Returns the catalog URI and the shared log.
-///
-/// Responses close the connection so the pooled `reqwest` client opens a fresh
-/// connection per request, letting a single-threaded accept loop serve the whole
-/// sequential request stream in order.
+/// Responses close the connection so a single-threaded accept loop serves the
+/// pooled `reqwest` client's sequential requests in order.
 async fn spawn_mock_catalog(
     namespace: &[&str],
     tables: &[&str],
@@ -304,10 +244,8 @@ async fn spawn_mock_catalog(
             } else if path_no_query.ends_with("/v1/config") {
                 ("200 OK", r#"{"overrides":{},"defaults":{}}"#.to_string())
             } else if path_no_query.ends_with("/namespaces") {
-                // No child namespaces: the enumeration recursion terminates here.
                 ("200 OK", r#"{"namespaces":[]}"#.to_string())
             } else if path_no_query.ends_with("/tables") {
-                // The namespace `list_tables` enumeration endpoint.
                 ("200 OK", list_tables_body.clone())
             } else if let Some(offset) = path_no_query.find("/tables/") {
                 let table = &path_no_query[offset + "/tables/".len()..];
@@ -317,8 +255,6 @@ async fn spawn_mock_catalog(
                     .load_table_names
                     .push(table.to_string());
                 if server_error.iter().any(|t| t == table) {
-                    // A catalog fault (unreachable/broken), NOT "not an Iceberg
-                    // table" — enumeration must abort, not skip.
                     ("500 Internal Server Error", String::new())
                 } else if not_loadable.iter().any(|t| t == table) {
                     (
@@ -343,8 +279,6 @@ async fn spawn_mock_catalog(
     (uri, log)
 }
 
-/// A `loadTable` wire body for `table` carrying a two-column schema, so the
-/// resolved `CatalogColumn`s can be asserted in schema order and original case.
 fn load_table_body(table: &str) -> String {
     serde_json::json!({
         "metadata-location": format!("s3://bucket/{table}/metadata/v1.json"),
@@ -374,9 +308,6 @@ fn load_table_body(table: &str) -> String {
     .to_string()
 }
 
-/// A `listTables` wire body: the `tables` names as `TableIdent`s under
-/// `namespace`, so the enumeration step of `list_tables` returns exactly these
-/// identifiers.
 fn list_tables_response(namespace: &[&str], tables: &[&str]) -> String {
     let identifiers: Vec<serde_json::Value> = tables
         .iter()
@@ -392,12 +323,6 @@ fn oauth_creds() -> ConnectionCreds {
     creds
 }
 
-/// The resolve-path corner of the one-session guarantee: `resolve_listing` over
-/// an EMPTY identifier batch builds NO `CatalogSession` and performs NO OAuth
-/// grant, proven by succeeding under OAuth credentials against an UNREACHABLE
-/// catalog — a built session would fail to connect. Distinct from the public
-/// `list_tables` empty case below, which must still reach the catalog to discover
-/// the namespace holds no table.
 #[tokio::test]
 async fn empty_namespace_builds_no_session_and_no_grant() {
     let client =
@@ -415,11 +340,6 @@ async fn empty_namespace_builds_no_session_and_no_grant() {
     assert!(listing.skipped.is_empty(), "an empty batch skips nothing");
 }
 
-/// The PUBLIC `list_tables` over a namespace the catalog reports as holding no
-/// table lists nothing. Under OAuth this costs exactly ONE grant — the
-/// enumeration's own `credential` exchange — and no second grant: the empty load
-/// batch builds no `CatalogSession`. A per-table or empty-batch session build
-/// would push the count above one.
 #[tokio::test]
 async fn list_tables_over_empty_namespace_lists_nothing() {
     let (uri, log) = spawn_mock_catalog(&["sales"], &[], &[], &[]).await;
@@ -439,11 +359,6 @@ async fn list_tables_over_empty_namespace_lists_nothing() {
     );
 }
 
-/// Drives the PUBLIC `list_tables` end-to-end: three tables enumerate, then load.
-/// Under OAuth that is exactly TWO grants — one for the enumeration, one for the
-/// whole load batch's single reused `CatalogSession` — never one grant per table
-/// (which would be four). Every table resolves its columns in schema order and
-/// original case.
 #[tokio::test]
 async fn enumeration_builds_exactly_one_session() {
     let (uri, log) =
@@ -473,10 +388,6 @@ async fn enumeration_builds_exactly_one_session() {
     );
 }
 
-/// The Iceberg REST client tags every table it returns — through either trait
-/// operation — with the Iceberg format and an ABSENT vending key: it vends
-/// storage credentials inline with the table's own metadata, so there is no
-/// per-table scope to carry and neither field forks its listing pipeline.
 #[tokio::test]
 async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
     let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders", "customers"], &[], &[]).await;
@@ -509,9 +420,44 @@ async fn iceberg_client_tags_every_table_iceberg_with_no_vending_key() {
     }
 }
 
-/// Driving the PUBLIC `list_tables`: a table the catalog reports as not a
-/// loadable Iceberg table (HTTP 404 on load) is routed into `skipped` and does
-/// NOT abort the batch; the loadable table still resolves.
+#[tokio::test]
+async fn rest_listing_projects_the_loaded_metadata_into_the_neutral_table() {
+    let (uri, _log) = spawn_mock_catalog(&["sales"], &["orders"], &[], &[]).await;
+    let client = IcebergRestCatalogClient::new(uri, static_backend(), creds_no_auth());
+    let ident = CatalogTableIdent {
+        namespace: vec!["sales".to_string()],
+        name: "orders".to_string(),
+    };
+
+    let listing = client
+        .list_tables(&["sales".to_string()])
+        .await
+        .expect("list_tables failed");
+    let loaded = client.load_table(&ident).await.expect("load_table failed");
+
+    let expected = CatalogTable {
+        ident,
+        table_type: CatalogTableType::Table,
+        storage_location: Some("s3://bucket/orders".to_string()),
+        format: TableFormat::Iceberg,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        columns: vec![
+            CatalogColumn {
+                name: "id".to_string(),
+                source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::Long)),
+            },
+            CatalogColumn {
+                name: "name".to_string(),
+                source_type: ColumnSourceType::Iceberg(Type::Primitive(PrimitiveType::String)),
+            },
+        ],
+        metadata_location: None,
+    };
+    assert_eq!(listing.tables, vec![expected.clone()]);
+    assert_eq!(loaded, expected);
+}
+
 #[tokio::test]
 async fn unloadable_table_is_reported_skipped_not_failed() {
     let (uri, _log) =
@@ -545,12 +491,6 @@ async fn unloadable_table_is_reported_skipped_not_failed() {
     );
 }
 
-/// Driving the PUBLIC `list_tables`: a non-404 `loadTable` failure (HTTP 500 —
-/// an unreachable/broken catalog, NOT "not an Iceberg table") aborts the whole
-/// enumeration with `Err`. The batch must never come back a short listing that
-/// looks complete: a table silently vanishing behind a catalog fault is the
-/// failure this guards. Guards `is_not_loadable_iceberg_table`'s non-404 branch
-/// against being widened to "any load failure = skip".
 #[tokio::test]
 async fn non_404_load_failure_aborts_the_batch() {
     let (uri, _log) =

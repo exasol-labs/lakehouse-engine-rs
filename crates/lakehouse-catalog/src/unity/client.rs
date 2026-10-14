@@ -1,14 +1,3 @@
-//! The Unity Catalog REST session and its catalog-neutral operations.
-//!
-//! One `UnityCatalogSession` holds a pooled `reqwest` client, the base URL
-//! derived from the CONNECTION address, and the resolved authentication
-//! strategy. The wire types it deserializes stay private to this module — the
-//! engine consumes only the catalog-neutral types the shared `CatalogClient`
-//! trait returns, so no Unity Catalog request shape crosses the crate boundary.
-//! One session serves both OSS and Databricks-managed Unity Catalog: request
-//! construction never branches on the host, only the base URL and the resolved
-//! authentication strategy differ.
-
 use std::future::Future;
 use std::pin::Pin;
 
@@ -25,17 +14,10 @@ use crate::{
 use super::auth::{UnityAuth, resolve_unity_auth};
 use super::vended::TemporaryTableCredentials;
 
-/// The standard Unity Catalog REST base path appended to the CONNECTION address —
-/// identical on OSS Unity Catalog and Databricks-managed Unity Catalog, and never
-/// the Iceberg-REST compatibility endpoint or the `delta/v1` Delta Tables API.
+/// Identical on OSS and Databricks-managed Unity Catalog; deliberately not the
+/// Iceberg-REST compatibility endpoint or the `delta/v1` API.
 const UNITY_REST_BASE_PATH: &str = "/api/2.1/unity-catalog";
 
-/// A per-request Unity Catalog REST session.
-///
-/// Deep by design: it hides HOW columns are sourced (a single inline list sweep,
-/// no per-table fan-out), how pagination is followed, and how each request is
-/// authenticated, exposing only the catalog-neutral operations plus the
-/// scan-path credential-vending POST that #319/#320 consumes.
 pub struct UnityCatalogSession {
     client: reqwest::Client,
     base_url: String,
@@ -44,10 +26,7 @@ pub struct UnityCatalogSession {
 }
 
 impl UnityCatalogSession {
-    /// Build a session against the Unity Catalog REST API rooted at `address`,
-    /// deriving the standard `{address}/api/2.1/unity-catalog` base URL and
-    /// resolving the authentication strategy from `creds`. Issues no request: an
-    /// OAuth grant, if any, is deferred to the first request.
+    /// Issues no request: an OAuth grant, if any, is deferred to the first request.
     pub fn new(address: &str, creds: ConnectionCreds) -> Self {
         let client = reqwest::Client::new();
         let base_url = format!("{}{UNITY_REST_BASE_PATH}", address.trim_end_matches('/'));
@@ -60,10 +39,6 @@ impl UnityCatalogSession {
         }
     }
 
-    /// Request per-table, short-lived, scoped storage credentials. The scan path
-    /// (#319/#320) terminates the response in a `StorageBackend` through
-    /// [`super::resolve_uc_vended_storage`]; in this plan the POST is unit-tested
-    /// but reached by no production caller.
     pub async fn temporary_table_credentials(
         &self,
         table_id: &str,
@@ -86,9 +61,8 @@ impl UnityCatalogSession {
         schema: &str,
     ) -> Result<Vec<TableInfo>, UdfError> {
         let url = format!("{}/tables", self.base_url);
-        // `omit_columns` is deliberately left unset: the inline `columns[]` the
-        // list response carries by default IS the createVirtualSchema column
-        // source, so setting it would force a per-table get-table to recover them.
+        // `omit_columns` stays unset: the inline `columns[]` is the column source,
+        // avoiding a per-table get-table.
         self.collect_pages::<TablesPage>(
             &url,
             &[("catalog_name", catalog), ("schema_name", schema)],
@@ -98,9 +72,7 @@ impl UnityCatalogSession {
     }
 
     async fn get_table_info(&self, full_name: &str) -> Result<TableInfo, UdfError> {
-        // Build the path via the URL crate so a reserved or non-ASCII character in
-        // a `catalog.schema.table` segment is percent-encoded into one path
-        // segment rather than interpolated raw into a malformed path.
+        // Percent-encodes reserved/non-ASCII characters into one path segment.
         let mut url = url::Url::parse(&self.base_url)
             .map_err(|e| UdfError::User(format!("invalid Unity Catalog base URL: {e}")))?;
         url.path_segments_mut()
@@ -111,9 +83,6 @@ impl UnityCatalogSession {
         self.send_json::<TableInfo>(builder, "load table").await
     }
 
-    /// Follow `page_token`/`next_page_token` pagination to completion, returning
-    /// every page's entries in page order — never only the first page, which would
-    /// silently hide tables from the virtual schema.
     async fn collect_pages<P: PagedResponse>(
         &self,
         url: &str,
@@ -141,11 +110,6 @@ impl UnityCatalogSession {
         }
     }
 
-    /// Apply the auth strategy, send the request, and deserialize a success body,
-    /// translating a transport error, a non-success status, or an unparseable body
-    /// into a credential-safe [`UdfError`] naming the request `kind`. The resolved
-    /// bearer, the OAuth client secret, and the static token are stripped from
-    /// every returned error.
     async fn send_json<T: DeserializeOwned>(
         &self,
         builder: reqwest::RequestBuilder,
@@ -200,8 +164,6 @@ impl CatalogClient for UnityCatalogSession {
         &self,
         namespace: &[String],
     ) -> Pin<Box<dyn Future<Output = Result<CatalogListing, UdfError>> + Send + '_>> {
-        // Own the segments before the future is built: the returned future is
-        // bound to `&self`, not to the caller's slice borrow.
         let namespace = namespace.to_vec();
         Box::pin(async move {
             let (catalog, schema) = unity_namespace(&namespace)?;
@@ -213,13 +175,9 @@ impl CatalogClient for UnityCatalogSession {
                     namespace: namespace.clone(),
                     name: info.name.clone(),
                 };
-                let skip_reason =
-                    delta_base_skip_reason(&info.table_type, info.data_source_format.as_deref());
-                match skip_reason {
-                    Some(reason) => skipped.push(SkippedTable { ident, reason }),
-                    // An admitted entry passed the DELTA admission filter above,
-                    // so the tag restates that outcome rather than re-deciding it.
-                    None => tables.push(neutral_table(ident, info, TableFormat::Delta)),
+                match admission(&info.table_type, info.data_source_format.as_deref()) {
+                    Err(reason) => skipped.push(SkippedTable { ident, reason }),
+                    Ok(format) => tables.push(neutral_table(ident, info, format)),
                 }
             }
             Ok(CatalogListing { tables, skipped })
@@ -240,8 +198,6 @@ impl CatalogClient for UnityCatalogSession {
     }
 }
 
-/// The catalog and schema segments a Unity Catalog namespace must carry — a
-/// native Unity Catalog is addressed as `catalog.schema.table`.
 fn unity_namespace(namespace: &[String]) -> Result<(&str, &str), UdfError> {
     match namespace {
         [catalog, schema] => Ok((catalog.as_str(), schema.as_str())),
@@ -252,29 +208,30 @@ fn unity_namespace(namespace: &[String]) -> Result<(&str, &str), UdfError> {
     }
 }
 
-/// The dotted `catalog.schema.table` full name the get-table endpoint addresses.
 fn full_name(ident: &CatalogTableIdent) -> String {
     let mut parts: Vec<&str> = ident.namespace.iter().map(String::as_str).collect();
     parts.push(&ident.name);
     parts.join(".")
 }
 
-/// Convert one deserialized Unity Catalog table entry into the neutral shape,
-/// carrying the requested identifier, the neutral table type, the storage
-/// location (absent when the entry omits it, as a view does), the `format` its
-/// CALLER decided, its credential-vending key, and its columns in declared
-/// position order — each column left unmapped, since the engine owns the single
-/// Exasol type-mapping home.
+/// `format` is decided by the caller: the listing has already admitted it, while
+/// the single-table load maps and may refuse the reported value.
 ///
-/// The format tag is a parameter rather than derived here because the two callers
-/// reach it differently and only one of them can fail: the listing has already
-/// admitted Delta base tables only, while the single-table load must MAP the
-/// reported value and refuse one it cannot name (see [`neutral_table_format`]).
-///
-/// An empty OR whitespace-only vending key projects to an ABSENT one, so a caller
-/// that requires one fails naming the table rather than requesting credentials
-/// against an empty scope.
+/// A blank vending key projects to `None`, so a caller that needs one fails
+/// naming the table rather than requesting credentials against an empty scope.
 fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat) -> CatalogTable {
+    let mut indexed: Vec<(u32, String)> = info
+        .columns
+        .iter()
+        .filter_map(|column| {
+            column
+                .partition_index
+                .map(|index| (index, column.name.clone()))
+        })
+        .collect();
+    indexed.sort_by_key(|(index, _)| *index);
+    let partition_columns = indexed.into_iter().map(|(_, name)| name).collect();
+
     CatalogTable {
         ident,
         table_type: neutral_table_type(&info.table_type),
@@ -283,7 +240,9 @@ fn neutral_table(ident: CatalogTableIdent, info: TableInfo, format: TableFormat)
             .filter(|location| !location.is_empty()),
         format,
         vended_credential_key: info.table_id.filter(|key| !key.trim().is_empty()),
+        partition_columns,
         columns: info.columns.into_iter().map(neutral_column).collect(),
+        metadata_location: None,
     }
 }
 
@@ -291,17 +250,11 @@ fn neutral_column(column: ColumnInfo) -> CatalogColumn {
     CatalogColumn {
         name: column.name,
         source_type: ColumnSourceType::Unity {
-            type_name: column.type_name,
-            precision: column.type_precision.unwrap_or(0),
-            scale: column.type_scale.unwrap_or(0),
+            type_json: column.type_json,
         },
     }
 }
 
-/// Map a Unity Catalog `table_type` onto the neutral kind: a base table (managed
-/// or external) is a `Table`, a `VIEW` is a `View` (with no storage location), and
-/// any other kind is carried verbatim so it is never silently reported as a base
-/// table.
 fn neutral_table_type(raw: &str) -> CatalogTableType {
     match raw {
         "MANAGED" | "EXTERNAL" => CatalogTableType::Table,
@@ -310,65 +263,60 @@ fn neutral_table_type(raw: &str) -> CatalogTableType {
     }
 }
 
-/// The `data_source_format` Delta tables report, compared case-sensitively
-/// against the uppercase vocabulary Unity Catalog emits. The listing admits ONLY
-/// this value; the single-table load, which applies no admission filter, also
-/// matches it to map the reported format.
+/// Compared case-sensitively: Unity Catalog emits uppercase format names.
 const DELTA_DATA_SOURCE_FORMAT: &str = "DELTA";
 
-/// The `data_source_format` of a Unity Catalog UniForm table, compared
-/// case-sensitively against the same uppercase vocabulary. The listing does NOT
-/// admit it; only the single-table load, which applies no admission filter, names
-/// it.
+/// UniForm tables; not admitted by the listing, only named by the single-table load.
 const ICEBERG_DATA_SOURCE_FORMAT: &str = "ICEBERG";
 
-/// How a missing or null `data_source_format` is named in a skip reason or a
-/// format refusal.
+const PARQUET_DATA_SOURCE_FORMAT: &str = "PARQUET";
+
 const ABSENT_DATA_SOURCE_FORMAT: &str = "absent";
 
-/// Why a listed entry is not a Delta base table, or `None` when it is one: an
-/// entry is admitted iff its neutral type is a base table AND its
-/// `data_source_format` is exactly `DELTA`. A disqualifying type is reported
-/// ahead of the format, so a view — which carries no format — is reported by its
-/// `table_type`. Takes the raw wire `table_type` rather than the already-lossy
-/// neutral kind, so the returned detail names the offending wire value verbatim
-/// and this module keeps a single home for Unity's `table_type` vocabulary.
-fn delta_base_skip_reason(
+/// Takes the raw wire `table_type` so the skip detail names it verbatim; the type
+/// is checked before the format because a view carries no format.
+fn admission(
     raw_table_type: &str,
     data_source_format: Option<&str>,
-) -> Option<SkipReason> {
+) -> Result<TableFormat, SkipReason> {
     let detail = match neutral_table_type(raw_table_type) {
-        CatalogTableType::Table if data_source_format == Some(DELTA_DATA_SOURCE_FORMAT) => {
-            return None;
-        }
-        CatalogTableType::Table => format!(
-            "data_source_format={}",
-            data_source_format.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
-        ),
+        CatalogTableType::Table => match format_of(data_source_format) {
+            Some(format @ (TableFormat::Delta | TableFormat::Parquet)) => return Ok(format),
+            _ => format!(
+                "data_source_format={}",
+                data_source_format.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
+            ),
+        },
         _ => format!("table_type={raw_table_type}"),
     };
-    Some(SkipReason::NotDeltaBaseTable { detail })
+    Err(SkipReason::NotDeltaBaseTable { detail })
 }
 
 fn neutral_table_format(
     data_source_format: Option<&str>,
     table: &str,
 ) -> Result<TableFormat, UdfError> {
-    match data_source_format.filter(|format| !format.trim().is_empty()) {
-        Some(DELTA_DATA_SOURCE_FORMAT) => Ok(TableFormat::Delta),
-        Some(ICEBERG_DATA_SOURCE_FORMAT) => Ok(TableFormat::Iceberg),
-        unrecognized => Err(UdfError::User(format!(
+    format_of(data_source_format).ok_or_else(|| {
+        UdfError::User(format!(
             "Unity Catalog table {table} reports data_source_format={}, which names no table \
-             format this engine can plan (expected {DELTA_DATA_SOURCE_FORMAT} or \
-             {ICEBERG_DATA_SOURCE_FORMAT})",
-            unrecognized.unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
-        ))),
+             format this engine can plan (expected {DELTA_DATA_SOURCE_FORMAT}, \
+             {ICEBERG_DATA_SOURCE_FORMAT}, or {PARQUET_DATA_SOURCE_FORMAT})",
+            data_source_format
+                .filter(|format| !format.trim().is_empty())
+                .unwrap_or(ABSENT_DATA_SOURCE_FORMAT)
+        ))
+    })
+}
+
+fn format_of(data_source_format: Option<&str>) -> Option<TableFormat> {
+    match data_source_format? {
+        DELTA_DATA_SOURCE_FORMAT => Some(TableFormat::Delta),
+        ICEBERG_DATA_SOURCE_FORMAT => Some(TableFormat::Iceberg),
+        PARQUET_DATA_SOURCE_FORMAT => Some(TableFormat::Parquet),
+        _ => None,
     }
 }
 
-/// A paginated Unity Catalog list response: its entries and the token for the
-/// next page, so [`UnityCatalogSession::collect_pages`] follows every page through
-/// one shape.
 trait PagedResponse: DeserializeOwned {
     type Item;
     fn into_items(self) -> Vec<Self::Item>;
@@ -393,13 +341,8 @@ impl PagedResponse for TablesPage {
     }
 }
 
-/// One Unity Catalog table entry, modeling only the fields this client consumes.
-/// `storage_location` and `data_source_format` are absent-tolerant because a VIEW
-/// carries neither, so a VIEW list entry deserializes without failing. `table_id`
-/// is absent-tolerant for a different reason — defensive tolerance of a catalog
-/// response that omits it, since Unity assigns a `table_id` to views too. Every
-/// other wire field this client has no use for, `full_name` among them, is simply
-/// not modeled here, and serde ignores it.
+/// `storage_location` and `data_source_format` are optional because a VIEW
+/// carries neither.
 #[derive(Deserialize)]
 struct TableInfo {
     name: String,
@@ -408,25 +351,19 @@ struct TableInfo {
     storage_location: Option<String>,
     #[serde(default)]
     data_source_format: Option<String>,
-    /// The catalog-assigned key a temporary-table-credentials request is scoped
-    /// against, projected onto [`CatalogTable::vended_credential_key`].
     #[serde(default)]
     table_id: Option<String>,
     #[serde(default)]
     columns: Vec<ColumnInfo>,
 }
 
-/// One column entry, carrying the FULL parameterized Unity Catalog Spark type: the
-/// type name plus the `DECIMAL(p, s)` precision and scale, absent (and read as 0)
-/// for a type taking none.
 #[derive(Deserialize)]
 struct ColumnInfo {
     name: String,
-    type_name: String,
     #[serde(default)]
-    type_precision: Option<u32>,
+    type_json: Option<String>,
     #[serde(default)]
-    type_scale: Option<u32>,
+    partition_index: Option<u32>,
 }
 
 #[cfg(test)]

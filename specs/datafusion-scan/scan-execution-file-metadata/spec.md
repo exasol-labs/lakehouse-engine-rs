@@ -18,13 +18,13 @@ the same no-HEAD guarantee to the associated positional-delete files.
   follow the same rule as data-file paths.
 * When the common spec carries an empty table root, every entry is treated as absolute and
   none are joined.
-* Field-id-based column projection (`datafusion-scan/scan-execution-field-id-projection`) is
+* Field-id-based column projection (`scan-read-path/scan-execution-field-id-projection`) is
   preserved regardless of how per-file metadata is supplied.
 * Building a data file's base `ParquetAccessPlan` needs its per-row-group row counts, obtained
   by reading the Parquet footer via a range GET (not a HEAD), ideally parsed once and reused.
 * See `datafusion-scan/scan-execution` for the overall scan invocation and registration flow.
 * **The empty-table-root clauses are retained as a wire-format totality property, not as a
-  reachable path.** `vs-adapter/pushdown-planning-file-resolution` now rejects a `loadTable` response carrying
+  reachable path.** `file-planning/pushdown-planning-file-resolution` now rejects a `loadTable` response carrying
   an empty table metadata `location` before the vended/static storage split, so the adapter can
   no longer emit a common spec whose table root is empty. This feature's three empty-table-root
   clauses — two normative `SHALL` clauses and one descriptive Background bullet — therefore

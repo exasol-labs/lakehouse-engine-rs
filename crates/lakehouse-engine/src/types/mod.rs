@@ -1,2 +1,3 @@
-// ponytail: Arrow -> Exasol type mapping table. Implemented in Group B/C.
+pub(crate) mod hive_type;
 pub mod mapping;
+pub mod widening;

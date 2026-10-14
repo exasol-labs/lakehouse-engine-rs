@@ -1,15 +1,8 @@
-//! Test-only fixtures reached by two or more of this crate's test modules —
-//! the single home the `vs-adapter/pushdown-module-structure` rule requires
-//! for a test helper reachable from multiple submodules. Each fixture's doc
-//! comment names its consumers; a fixture reached by only one module lives
-//! in that module's own `mod tests` instead.
-
 use crate::{ConnectionCreds, StorageBackend, StorageProps};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 
-/// A baseline `ConnectionCreds` with no catalog auth (all auth fields `None`).
-/// Individual tests set only the auth fields under test.
-///
-/// Consumers: `auth`, `namespace`, `session`, `storage`.
 pub(crate) fn base_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "warehouse".into(),
@@ -29,11 +22,10 @@ pub(crate) fn base_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
 
-/// Static storage with the sentinel keys `STATIC_AK_SENTINEL` / `STATIC_SK_SENTINEL`
-/// (matching the credentials-cluster test sentinels below).
 pub(crate) fn static_storage() -> StorageProps {
     StorageProps {
         endpoint: "https://s3.amazonaws.com".into(),
@@ -45,18 +37,10 @@ pub(crate) fn static_storage() -> StorageProps {
     }
 }
 
-/// [`static_storage`] wrapped in the `S3` backend variant, for call sites taking
-/// `&StorageBackend` rather than `&StorageProps`.
 pub(crate) fn static_backend() -> StorageBackend {
     StorageBackend::S3(static_storage())
 }
 
-/// Unwrap a `StorageBackend`'s `S3` payload — the test-only inverse of
-/// `StorageBackend::S3(..)`, so a test asserting directly on `StorageProps`
-/// fields against a `resolve_vended_storage` return value can stay unchanged
-/// below the unwrap.
-///
-/// Consumers: `storage`, `vended`.
 pub(crate) fn s3_payload(backend: StorageBackend) -> StorageProps {
     match backend {
         StorageBackend::S3(props) => props,
@@ -64,21 +48,13 @@ pub(crate) fn s3_payload(backend: StorageBackend) -> StorageProps {
     }
 }
 
-// --- Shared sentinels ---
-/// Consumers: `creds_no_auth` (below) and `vended`.
 pub(crate) const STATIC_AK: &str = "STATIC_AK_SENTINEL";
-/// Consumers: `creds_no_auth` (below) and `vended`.
 pub(crate) const STATIC_SK: &str = "STATIC_SK_SENTINEL";
-/// Consumers: `auth`, `iceberg_io`.
 pub(crate) const BEARER_TOK: &str = "BEARER_TOKEN_SENTINEL_VALUE";
-/// Consumers: `auth`, `iceberg_io`, `vended`.
 pub(crate) const CLIENT_SECRET: &str = "CLIENT_SECRET_SENTINEL_VALUE";
-/// Consumers: `auth`, `iceberg_io`.
 pub(crate) const OAUTH_ACCESS_TOKEN: &str = "OAUTH_OBTAINED_ACCESS_TOKEN";
+pub(crate) const ORC_INPUT_FORMAT: &str = "org.apache.hadoop.hive.ql.io.orc.OrcInputFormat";
 
-/// A `ConnectionCreds` with no auth, no vending — the no-op baseline.
-///
-/// Consumers: `auth`, `creds`, `iceberg_io`, `session`.
 pub(crate) fn creds_no_auth() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "warehouse".into(),
@@ -98,5 +74,124 @@ pub(crate) fn creds_no_auth() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
+
+/// Answers every request with HTTP 200 and `body`, recording each request in order.
+pub(crate) async fn spawn_recording_catalog(
+    body: &'static str,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    spawn_server("application/json", move |_| (200, body.into())).await
+}
+
+/// Answers every request with HTTP `status` and the XML `body`, recording each request in order.
+pub(crate) async fn spawn_recording_sts(
+    status: u16,
+    body: impl Into<String>,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let body = body.into();
+    spawn_server("text/xml", move |_| (status, body.clone())).await
+}
+
+/// Answers each request, head and body, with the status and body `respond` returns for it,
+/// recording each request in order.
+pub(crate) async fn spawn_server(
+    content_type: &'static str,
+    respond: impl Fn(&str) -> (u16, String) + Send + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind a loopback port");
+    let base_uri = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let recorded = requests.clone();
+
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let request = read_request(&mut stream).await;
+            let (status, body) = respond(&request);
+            recorded.lock().unwrap().push(request);
+            let reason = reqwest::StatusCode::from_u16(status)
+                .ok()
+                .and_then(|code| code.canonical_reason())
+                .unwrap_or("Stub");
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+
+    (base_uri, requests)
+}
+
+pub(crate) async fn read_request(stream: &mut TcpStream) -> String {
+    let mut request = Vec::new();
+    let mut chunk = [0u8; 1024];
+    loop {
+        if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+            let head = String::from_utf8_lossy(&request[..end]);
+            let length =
+                header_value(&head, "content-length").map_or(0, |n| n.parse().unwrap_or(0));
+            if request.len() >= end + 4 + length {
+                break;
+            }
+        }
+        let read = stream.read(&mut chunk).await.unwrap_or(0);
+        if read == 0 {
+            break;
+        }
+        request.extend_from_slice(&chunk[..read]);
+    }
+    String::from_utf8_lossy(&request).into_owned()
+}
+
+pub(crate) fn authorization_header(head: &str) -> Option<&str> {
+    header_value(head, "authorization")
+}
+
+/// The value of header `name` in a recorded request, matched
+/// case-insensitively, or `None` when the request did not carry it.
+pub(crate) fn header_value<'a>(request: &'a str, name: &str) -> Option<&'a str> {
+    request
+        .lines()
+        .skip(1)
+        .take_while(|line| !line.is_empty())
+        .find_map(|line| {
+            let (header, value) = line.split_once(':')?;
+            header.eq_ignore_ascii_case(name).then(|| value.trim())
+        })
+}
+
+/// The body of a recorded request.
+pub(crate) fn request_body(request: &str) -> &str {
+    request.split_once("\r\n\r\n").map_or("", |(_, body)| body)
+}
+
+/// The session credentials [`ASSUME_ROLE_RESPONSE`] carries.
+pub(crate) const SESSION_AK: &str = "ASIASESSIONKEYSENTINEL";
+pub(crate) const SESSION_SK: &str = "session-secret-access-key-sentinel";
+pub(crate) const SESSION_TOKEN: &str = "session-token-sentinel";
+
+/// A well-formed AWS STS `AssumeRoleResponse` carrying [`SESSION_AK`],
+/// [`SESSION_SK`], and [`SESSION_TOKEN`], in the sample response's shape and namespace.
+pub(crate) const ASSUME_ROLE_RESPONSE: &str = r#"<AssumeRoleResponse xmlns="https://sts.amazonaws.com/doc/2011-06-15/">
+  <AssumeRoleResult>
+    <AssumedRoleUser>
+      <Arn>arn:aws:sts::123456789012:assumed-role/lakehouse-reader/lakehouse-engine</Arn>
+      <AssumedRoleId>AROA3XFRBF535PLBIFPI4:lakehouse-engine</AssumedRoleId>
+    </AssumedRoleUser>
+    <Credentials>
+      <AccessKeyId>ASIASESSIONKEYSENTINEL</AccessKeyId>
+      <SecretAccessKey>session-secret-access-key-sentinel</SecretAccessKey>
+      <SessionToken>session-token-sentinel</SessionToken>
+      <Expiration>2026-09-28T13:00:00Z</Expiration>
+    </Credentials>
+  </AssumeRoleResult>
+  <ResponseMetadata>
+    <RequestId>c6104cbe-af31-11e0-8154-cbc7ccf896c7</RequestId>
+  </ResponseMetadata>
+</AssumeRoleResponse>"#;

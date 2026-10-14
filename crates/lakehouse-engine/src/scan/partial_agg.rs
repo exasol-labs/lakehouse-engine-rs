@@ -1,11 +1,3 @@
-//! Node-local partial-aggregate scan paths: register the shard's assigned files,
-//! run a single-group or grouped partial aggregate in DataFusion, and emit the
-//! per-shard partial rows the Exasol outer wrapper re-aggregates.
-//!
-//! Both paths share the uppercase-aliased inner-SELECT seam
-//! (`register_aliased_scan_target`) and the COLUMN CONTRACT SQL builders
-//! (`build_partial_agg_sql_filtered` / `build_grouped_partial_agg_sql`).
-
 use arrow::array::ArrayRef;
 use arrow::datatypes::DataType;
 use datafusion::execution::context::SessionContext;
@@ -25,24 +17,15 @@ use crate::scan::storage_ref::ResolvedScanStorage;
 use super::raw_scan::register_files;
 use super::sql_support::{build_alias_items, quote_ident};
 
-/// Register the shard's assigned files as `scan_target` and build the
-/// uppercase-aliased inner-SELECT subquery both partial-aggregate paths wrap.
-///
-/// Wrapping the registered table in `SELECT <uppercase aliases> FROM scan_target`
-/// makes every aggregate argument and group-key expression reference the
-/// uppercase, Exasol-facing column names — the same seam the single-table and
-/// join paths use. The returned string is spliced verbatim as the inner table of
-/// the partial-aggregate SQL, so its exact text is part of the emitted SQL.
+/// The returned string is spliced verbatim as the inner table, so its text is part of the emitted SQL.
 async fn register_aliased_scan_target(
     session_ctx: &SessionContext,
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
 ) -> Result<String, UdfError> {
-    // Register the assigned files so we can query them.
     let table_name = "scan_target";
     register_files(session_ctx, table_name, spec, storage).await?;
 
-    // Build the alias inner SELECT (uppercase column names).
     let table = session_ctx
         .table(table_name)
         .await
@@ -54,21 +37,13 @@ async fn register_aliased_scan_target(
     ))
 }
 
-/// Run a node-local partial aggregate and emit exactly one row per shard.
-///
-/// Dispatches to `run_grouped_partial_aggregate` when the spec carries non-empty
-/// `group_keys`; otherwise executes the single-group (ungrouped) path which
-/// always emits exactly one partial-aggregate row.
-///
-/// The column layout follows the COLUMN CONTRACT (see `build_partial_agg_sql`
-/// and `build_grouped_partial_agg_sql`).
+/// Emits exactly one row per shard on the single-group path.
 pub(super) async fn run_partial_aggregate(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
     spec: &ScanSpec,
     storage: &ResolvedScanStorage,
 ) -> Result<(), UdfError> {
-    // Dispatch: grouped path when group_keys is Some and non-empty.
     if let Some(group_keys) = &spec.common.group_keys
         && !group_keys.is_empty()
     {
@@ -92,19 +67,15 @@ pub(super) async fn run_partial_aggregate(
         .await
         .map_err(|e| UdfError::User(format!("partial aggregate SQL error: {e}")))?;
 
-    // Execute and collect the single partial-aggregate row.
     let batches = df
         .collect()
         .await
         .map_err(|e| classify_scan_error(e, &secrets))?;
 
-    // Both arms emit into the same declared EMITS clause, so the declaration is
-    // read once, above the split.
+    // Both arms emit into the same EMITS clause, so the declaration is read once.
     let declared = declared_output_columns(ctx)?;
 
-    // The aggregate always produces exactly one row (even over an empty table).
-    // Emit that row; if the query produced no batches at all (should not happen
-    // for a well-formed aggregate), emit a row of NULLs.
+    // An aggregate always yields one row, even over an empty table; the NULL row is a backstop.
     let row = match batches.first() {
         Some(batch) if batch.num_rows() > 0 => {
             partial_row_from_batch(aggregates, batch, &declared)?
@@ -116,21 +87,9 @@ pub(super) async fn run_partial_aggregate(
     Ok(())
 }
 
-/// Execute a grouped partial aggregate for the assigned shard files.
-///
-/// DataFusion runs the GROUP BY query and streams one row per distinct group.
-/// Each emitted row carries:
-///   - one `Value::String` per group key (GK_0 … GK_{n-1}), stringified via
-///     `arrow_value_at` then `to_string()` — the adapter declares all GK columns
-///     as `VARCHAR(2000000)` in the EMITS clause.
-///   - the PARTIAL_* values in the same order produced by the single-group path.
-///
-/// An empty result (no matching rows in this shard) emits zero rows, NOT a null
-/// fallback row.  This matches the COLUMN CONTRACT: the outer wrapper re-groups
-/// partial rows from all shards, so zero rows from one shard is correct.
-///
-/// Streaming rule: fetch one `RecordBatch` at a time, convert → emit → drop
-/// before fetching the next.  Never collect all batches in memory at once.
+/// Group keys are emitted as `Value::String`, since the adapter declares every GK column
+/// `VARCHAR(2000000)`. An empty shard emits zero rows, not a null fallback row: the outer
+/// wrapper re-groups partials from all shards.
 async fn run_grouped_partial_aggregate(
     ctx: &mut dyn UdfContext,
     session_ctx: &SessionContext,
@@ -163,7 +122,6 @@ async fn run_grouped_partial_aggregate(
         .await
         .map_err(|e| UdfError::User(format!("grouped partial aggregate SQL error: {e}")))?;
 
-    // Stream result batches — fetch one RecordBatch at a time, convert → emit → drop.
     let mut stream = df
         .execute_stream()
         .await
@@ -174,31 +132,25 @@ async fn run_grouped_partial_aggregate(
 
     while let Some(result) = stream.next().await {
         let batch = result.map_err(|e| classify_scan_error(e, &secrets))?;
-        // Coerce the partial-aggregate columns once per batch; the group keys
-        // pass through untouched so their merge identity is unchanged.
+        // Group keys pass through uncoerced so their merge identity is unchanged.
         let columns = coerce_partial_agg_columns(&batch, &declared, n_group_keys)?;
 
         for row_idx in 0..batch.num_rows() {
-            // Group-key columns come first (columns 0 .. n_group_keys - 1).
-            // They are emitted as VARCHAR strings regardless of the DataFusion type.
             let mut row_values: Vec<Value> = Vec::with_capacity(columns.len());
 
             for column in columns.iter().take(n_group_keys) {
                 let raw = arrow_value_at(column.as_ref(), row_idx)?;
-                // Stringify for GK_i VARCHAR(2000000) column.
-                // Value has no Display; format each variant explicitly.
                 let gk_str = value_to_gk_string(raw);
                 row_values.push(gk_str);
             }
 
-            // Partial aggregate columns follow.
             for column in columns.iter().skip(n_group_keys) {
                 row_values.push(arrow_value_at(column.as_ref(), row_idx)?);
             }
 
             ctx.emit(row_values)?;
         }
-        // Drop the batch before fetching the next — never hold two batches at once.
+        // Never hold two batches at once.
         drop(columns);
         drop(batch);
     }
@@ -206,27 +158,14 @@ async fn run_grouped_partial_aggregate(
     Ok(())
 }
 
-/// Build the DataFusion SQL for a grouped partial aggregate.
-///
-/// Produces:
-/// ```sql
-/// SELECT <gk_0>, ..., <gk_{n-1}>, <partial_agg_0>, ...
-/// FROM (<aliased_table>)
-/// [WHERE <filter>]
-/// GROUP BY <gk_0>, ..., <gk_{n-1}>
-/// ```
-///
-/// Group-key expressions are inserted verbatim — they are already-rendered
-/// DataFusion SQL fragments from the adapter (e.g. `"REGION"` or `YEAR("DATE")`).
-/// No LIMIT is applied (the adapter never pushes LIMIT into grouped shard specs;
-/// the outer wrapper applies LIMIT after re-grouping the partials).
+/// Group-key expressions are already-rendered DataFusion fragments, inserted verbatim. No LIMIT:
+/// the outer wrapper applies it after re-grouping.
 pub fn build_grouped_partial_agg_sql(
     group_keys: &[String],
     aggregates: &[AggregatePlan],
     aliased_table: &str,
     filter: Option<&str>,
 ) -> String {
-    // SELECT list: group keys first (verbatim), then partial aggregate items.
     let mut select_items: Vec<String> = group_keys.to_vec();
     let partial_items: Vec<String> = aggregates
         .iter()
@@ -248,18 +187,13 @@ pub fn build_grouped_partial_agg_sql(
         sql.push_str(f);
     }
 
-    // GROUP BY the group-key expressions (same verbatim fragments as in SELECT).
     sql.push_str(" GROUP BY ");
     sql.push_str(&group_keys.join(", "));
 
     sql
 }
 
-/// Stringify a group-key `Value` for the `GK_i VARCHAR(2000000)` EMITS column.
-///
-/// NULL group keys stay NULL (the outer wrapper groups them together consistently).
-/// String values pass through unchanged. All other types are converted to their
-/// canonical string representation so the adapter's VARCHAR column accepts them.
+/// NULL group keys stay NULL so the outer wrapper groups them together.
 fn value_to_gk_string(v: Value) -> Value {
     match v {
         Value::Null => Value::Null,
@@ -274,18 +208,10 @@ fn value_to_gk_string(v: Value) -> Value {
     }
 }
 
-/// Build the fallback null partial row for an empty aggregate result.
-///
-/// A counter column contributes `0` — a shard that matched no rows legitimately
-/// counted none — and a value column contributes NULL, because it has no value at
-/// all. [`PartialAggColumn::is_counter`] owns which is which, and
-/// [`crate::scan::spec::AggKind::partial_columns`] owns the row's length and order:
-/// that ordering IS the row's whole contract, since the Exasol outer wrapper
-/// addresses these values positionally.
-///
-/// `declared` is the same output-column list the populated arm coerces against,
-/// so both arms of the single-group path agree on the `Value` variant every
-/// column carries — an empty shard emits into the identical `EMITS` clause.
+/// A counter column contributes `0` (the shard counted none) and a value column NULL. The order
+/// from [`crate::scan::spec::AggKind::partial_columns`] is the whole contract, since the outer
+/// wrapper addresses values positionally. `declared` is shared with the populated arm so both
+/// emit the same `Value` variants.
 fn emit_null_partial_row(
     aggregates: &[AggregatePlan],
     declared: &[ColumnInfo],
@@ -309,12 +235,8 @@ fn emit_null_partial_row(
         .collect()
 }
 
-/// The zero an empty shard contributes for a counter column, at the `Value`
-/// variant its declared output column admits.
-///
-/// The variant is read off the same [`target_arrow_type`] resolution the
-/// populated arm coerces to, so a counter's zero and a counter's real count
-/// cannot reach the wire as different variants of one declared column.
+/// Uses the same [`target_arrow_type`] resolution as the populated arm, so a zero and a real
+/// count cannot reach the wire as different variants of one column.
 fn counter_zero(declared: &ColumnInfo) -> Result<Value, UdfError> {
     let target = target_arrow_type(declared)?;
     match target {
@@ -337,20 +259,10 @@ fn counter_zero(declared: &ColumnInfo) -> Result<Value, UdfError> {
     }
 }
 
-/// Build the partial-aggregate SQL, optionally with a WHERE clause.
-///
-/// COLUMN CONTRACT: iterating `aggregates` in order, each plan item at index `i`
-/// contributes the columns [`crate::scan::spec::AggKind::partial_columns`] lists for
-/// its kind, named by [`partial_column_name`] at that index — the single owner of
-/// both the column count and the column name. For the Exasol type each column is
-/// received as, defer to `partial_emits_items` in `adapter::pushdown`: this
-/// DataFusion SELECT list produces the values, the EMITS clause declares the types.
-///
-/// The scan UDF aggregate SELECT list, the EMITS clause in the fan-out SQL, and
-/// the outer merge SELECT MUST all agree on this order and column count.
-///
-/// `aliased_table` is a subquery string: `SELECT ... FROM scan_target` with
-/// uppercase aliases already applied.
+/// COLUMN CONTRACT: each plan at index `i` contributes the columns
+/// [`crate::scan::spec::AggKind::partial_columns`] lists, named by [`partial_column_name`]. The
+/// scan SELECT list, the fan-out EMITS clause (`partial_emits_items` in `adapter::pushdown`), and
+/// the outer merge SELECT MUST agree on this order and count.
 pub fn build_partial_agg_sql_filtered(
     aggregates: &[AggregatePlan],
     aliased_table: &str,
@@ -378,22 +290,10 @@ pub fn build_partial_agg_sql_filtered(
     sql
 }
 
-/// Render the DataFusion SQL argument for an aggregate plan entry.
-///
-/// When the plan carries a rendered expression argument (`arg_expr`, produced by
-/// the adapter via `vs_expression::render_expression` — e.g. `LENGTH("L_COMMENT")`)
-/// it is substituted VERBATIM as raw SQL text; it is already a fully-rendered
-/// DataFusion fragment, so it is NOT re-quoted or re-escaped as an identifier.
-/// Otherwise the bare column name is emitted as a quoted identifier.
-///
-/// A plan reaching this helper with neither `arg_expr` nor `column` set is a
-/// malformed non-COUNT aggregate (COUNT(*) never calls here). Rather than emit
-/// an empty `""` identifier — which DataFusion rejects with an opaque
-/// `column "" not found` — fall back to a self-describing sentinel so the error
-/// names the actual defect.
+/// A rendered `arg_expr` is substituted VERBATIM, never re-quoted. A plan with neither
+/// `arg_expr` nor `column` gets a self-describing sentinel instead of `""`, which DataFusion
+/// would reject with an opaque `column "" not found`.
 fn agg_arg_sql(plan: &AggregatePlan) -> String {
-    /// Sentinel identifier for a malformed aggregate plan missing both its
-    /// rendered expression and its bare column name.
     const MISSING_AGG_ARG: &str = "__MISSING_AGG_ARGUMENT__";
     match plan.arg_expr.as_deref() {
         Some(expr) => expr.to_string(),
@@ -401,15 +301,8 @@ fn agg_arg_sql(plan: &AggregatePlan) -> String {
     }
 }
 
-/// Produce the SELECT list items for one aggregate plan entry at index `i`.
-///
-/// [`crate::scan::spec::AggKind::partial_columns`] owns which columns exist and in
-/// what order, and [`partial_column_name`] owns what each is called; this function
-/// owns only each column's DataFusion aggregate expression. Every argument comes
-/// from [`agg_arg_sql`], so a rendered expression argument is substituted verbatim
-/// wherever a bare column would be. The counting columns use `COUNT(<arg>)` rather
-/// than `COUNT(*)` so NULLs are excluded, matching single-node AVG and
-/// STDDEV/VARIANCE semantics.
+/// Counting columns use `COUNT(<arg>)`, not `COUNT(*)`, so NULLs are excluded as in single-node
+/// AVG and STDDEV/VARIANCE.
 fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
     plan.kind
         .partial_columns()
@@ -436,19 +329,8 @@ fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
         .collect()
 }
 
-/// Convert the single-group partial-aggregate result row (row 0 of `batch`) into
-/// the ordered `Value` row emitted for this shard.
-///
-/// Walks `aggregates` in the COLUMN CONTRACT order, consuming exactly
-/// `partial_columns().len()` batch columns per aggregate — the count read from the
-/// one owner rather than re-derived here, because [`partial_select_items`] produced
-/// the batch from that same owner and a divergence would silently shift every later
-/// aggregate's value.
-///
-/// Each column is first coerced to the Arrow type its declared output column
-/// requires, so the `Value` [`arrow_value_at`] then produces is one the SDK's
-/// row validation admits for that column. The single-group path carries no group
-/// keys, so every column of this batch is a partial-aggregate column.
+/// Column widths come from `partial_columns()`, the same owner [`partial_select_items`] used; a
+/// re-derived count could silently shift every later aggregate's value.
 fn partial_row_from_batch(
     aggregates: &[AggregatePlan],
     batch: &arrow::record_batch::RecordBatch,
@@ -467,14 +349,9 @@ fn partial_row_from_batch(
     Ok(row)
 }
 
-/// Coerce the partial-aggregate columns of a partial result batch to the Arrow
-/// types their declared output columns require, returning every column of the
-/// batch in order.
-///
-/// Columns before `first_agg_column` are the grouped path's group keys and are
-/// returned untouched: they are declared `VARCHAR(2000000)` and stringified by
-/// [`value_to_gk_string`], and an Arrow cast to `Utf8` formats differently, which
-/// would change a group's merge identity across shards.
+/// Columns before `first_agg_column` (grouped-path keys) are returned untouched: an Arrow cast
+/// to `Utf8` formats differently from [`value_to_gk_string`] and would change a group's merge
+/// identity across shards.
 fn coerce_partial_agg_columns(
     batch: &arrow::record_batch::RecordBatch,
     declared: &[ColumnInfo],
@@ -501,6 +378,5 @@ fn coerce_partial_agg_columns(
 #[path = "partial_agg_tests.rs"]
 mod tests;
 
-/// Widens the test-only no-filter SQL wrapper to `crate::scan::`.
 #[cfg(test)]
 pub use tests::build_partial_agg_sql;

@@ -1,38 +1,18 @@
-/// Resolve an Exasol CONNECTION object into catalog and storage configuration.
-///
-/// The CONNECTION's `address` is the Iceberg REST catalog URI; the `password`
-/// is a JSON object carrying credential and behavioural fields. Credential
-/// values NEVER appear in any error message produced by this module.
+//! Credential values never appear in an error message produced by this module.
+
 use crate::scan::sealed::{
     SealedStorageKey, connection_password_carries_key_material, derive_sealed_storage_key,
 };
 use crate::scan::spec::{CatalogProps, StorageBackend};
 use exasol_udf_sdk::context::UdfContext;
 use exasol_udf_sdk::error::UdfError;
-use lakehouse_catalog::StorageCreds;
+use lakehouse_catalog::{StorageCreds, scheme_of};
 
 use super::catalog_kind::CatalogKind;
 use super::nonempty_str;
 
-/// The only unconditionally-required field in the CONNECTION password JSON.
-///
-/// The four S3 fields (`endpoint`, `region`, `access_key`, `secret_key`) are
-/// optional at the base level; they are orthogonal to catalog authentication and
-/// credential vending. `region`/`access_key`/`secret_key` become required only
-/// when `use_sigv4` is enabled (see `read_connection`).
 pub const REQUIRED_KEY: &str = "warehouse";
 
-/// Parsed credential fields from a CONNECTION password JSON object, declared once
-/// in the `lakehouse-catalog` crate and re-exported here at its pre-move path.
-///
-/// The type lives in the catalog crate because that crate is what consumes it —
-/// catalog authentication, prefix resolution, and credential vending all read
-/// these fields — and the dependency edge points engine → catalog, so a type both
-/// crates name must be declared on the catalog side. What stays in this module is
-/// everything that interprets the Exasol CONNECTION delivery mechanism:
-/// [`read_connection`], `parse_creds`, `validate_creds`, [`storage_block`],
-/// [`catalog_block`], and [`REQUIRED_KEY`]. The catalog crate must not name that
-/// mechanism.
 pub use lakehouse_catalog::ConnectionCreds;
 
 #[derive(Debug)]
@@ -60,7 +40,7 @@ pub fn read_connection(
         .map_err(|_| UdfError::User(format!("CONNECTION '{name}' could not be resolved")))?;
 
     let uri = conn.address;
-    if uri.is_empty() {
+    if uri.is_empty() && kind != CatalogKind::DirectStorage {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' has no address; expected the catalog URI"
         )));
@@ -78,8 +58,8 @@ pub fn read_connection(
         )));
     }
 
-    let creds = parse_creds(&json);
-    validate_creds(name, &creds, kind)?;
+    let creds = parse_kind_creds(name, &json, kind)?;
+    validate_creds(name, &creds, kind, &uri)?;
     let sealed_storage_key = connection_password_carries_key_material(&creds)
         .then(|| derive_sealed_storage_key(&conn.password));
     Ok(Resolved {
@@ -89,10 +69,34 @@ pub fn read_connection(
     })
 }
 
-fn validate_creds(name: &str, creds: &ConnectionCreds, kind: CatalogKind) -> Result<(), UdfError> {
-    validate_kind_preconditions(name, creds, kind)?;
+fn parse_kind_creds(
+    name: &str,
+    json: &serde_json::Value,
+    kind: CatalogKind,
+) -> Result<ConnectionCreds, UdfError> {
+    let mut creds = parse_creds(json);
+    if kind == CatalogKind::Glue {
+        if json.get("use_sigv4").and_then(|v| v.as_bool()) == Some(false) {
+            return Err(UdfError::User(format!(
+                "CONNECTION '{name}' sets use_sigv4 to false, but the Glue catalog kind always \
+                 signs with AWS SigV4; remove use_sigv4"
+            )));
+        }
+        creds.use_sigv4 = true;
+    }
+    Ok(creds)
+}
+
+fn validate_creds(
+    name: &str,
+    creds: &ConnectionCreds,
+    kind: CatalogKind,
+    address: &str,
+) -> Result<(), UdfError> {
+    validate_kind_preconditions(name, creds, kind, address)?;
     validate_azure_storage_creds(name, creds)?;
-    validate_sigv4_creds(name, creds)?;
+    validate_assume_role_creds(name, creds)?;
+    validate_sigv4_creds(name, creds, address)?;
     validate_exclusive_catalog_auth_creds(name, creds)?;
     validate_oauth2_creds(name, creds)?;
     validate_path_style_with_endpoint(name, creds)?;
@@ -103,6 +107,7 @@ fn validate_kind_preconditions(
     name: &str,
     creds: &ConnectionCreds,
     kind: CatalogKind,
+    address: &str,
 ) -> Result<(), UdfError> {
     match kind {
         CatalogKind::IcebergRest => {
@@ -121,6 +126,87 @@ fn validate_kind_preconditions(
                 )));
             }
         }
+        CatalogKind::DirectStorage => {
+            validate_direct_storage_preconditions(name, creds, address)?;
+        }
+        CatalogKind::Glue => validate_glue_preconditions(name, creds)?,
+    }
+    Ok(())
+}
+
+fn validate_glue_preconditions(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    if creds.use_vended_credentials {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' sets use_vended_credentials, but the Glue catalog kind has no \
+             native credential vending; remove it and supply storage credentials"
+        )));
+    }
+    let rejected = supplied_catalog_auth_fields(creds);
+    if !rejected.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies field(s) {} but the Glue catalog kind signs with AWS \
+             SigV4 and uses no token or OAuth2 authentication; remove them",
+            rejected.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+fn validate_direct_storage_preconditions(
+    name: &str,
+    creds: &ConnectionCreds,
+    address: &str,
+) -> Result<(), UdfError> {
+    if address.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' has no address; a storage base path is expected"
+        )));
+    }
+
+    // Catalog-auth fields are meaningless under direct storage; reject rather than ignore them.
+    let mut rejected: Vec<&str> = Vec::new();
+    if !creds.warehouse.is_empty() {
+        rejected.push("warehouse");
+    }
+    rejected.extend(supplied_catalog_auth_fields(creds));
+    if creds.use_sigv4 {
+        rejected.push("use_sigv4");
+    }
+    if creds.use_vended_credentials {
+        rejected.push("use_vended_credentials");
+    }
+    if !rejected.is_empty() {
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies field(s) {} but the direct-storage catalog kind \
+             reaches no catalog service; remove them",
+            rejected.join(", ")
+        )));
+    }
+
+    let scheme = scheme_of(address);
+    let backend = storage_block(creds, false);
+    if !backend.addresses_scheme(&scheme) {
+        let azure_fields = supplied_azure_fields(creds);
+        let (shape, accepted): (String, &[&str]) = if azure_fields.is_empty() {
+            (
+                format!(
+                    "S3 credential field(s) {}",
+                    supplied_s3_fields(creds).join(", ")
+                ),
+                &["s3", "s3a"],
+            )
+        } else {
+            (
+                format!("Azure credential field(s) {}", azure_fields.join(", ")),
+                &["abfss"],
+            )
+        };
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' address scheme '{scheme}' does not agree with its {shape}; \
+             the two must address the same storage backend; accepted scheme(s) for these \
+             credentials: {}",
+            accepted.join(", ")
+        )));
     }
     Ok(())
 }
@@ -162,7 +248,51 @@ fn validate_azure_storage_creds(name: &str, creds: &ConnectionCreds) -> Result<(
     Ok(())
 }
 
-fn validate_sigv4_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+/// Runs before the SigV4 check so a role CONNECTION missing its key pair is told
+/// that the role needs it, not only that SigV4 does.
+fn validate_assume_role_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
+    if creds.assume_role_arn().is_none() {
+        let orphaned = flagged_fields(&[
+            ("aws_external_id", creds.aws_external_id.is_some()),
+            ("aws_sts_endpoint", creds.aws_sts_endpoint.is_some()),
+        ]);
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+        return Err(UdfError::User(format!(
+            "CONNECTION '{name}' supplies field(s) {} without aws_assume_role_arn; they \
+             configure AWS IAM role assumption, so each requires aws_assume_role_arn",
+            orphaned.join(", ")
+        )));
+    }
+    let missing = flagged_fields(&[
+        ("access_key", creds.access_key.is_empty()),
+        ("secret_key", creds.secret_key.is_empty()),
+    ]);
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(UdfError::User(format!(
+        "CONNECTION '{name}' names aws_assume_role_arn but is missing field(s) {}; the \
+         role is assumed with the CONNECTION's own access_key and secret_key, and no \
+         ambient AWS credential, such as an environment variable or an instance \
+         profile, is read",
+        missing.join(", ")
+    )))
+}
+
+fn flagged_fields<'a>(flags: &[(&'a str, bool)]) -> Vec<&'a str> {
+    flags
+        .iter()
+        .filter_map(|&(field, flag)| flag.then_some(field))
+        .collect()
+}
+
+fn validate_sigv4_creds(
+    name: &str,
+    creds: &ConnectionCreds,
+    catalog_uri: &str,
+) -> Result<(), UdfError> {
     if creds.use_sigv4 && creds.has_catalog_auth() {
         return Err(UdfError::User(format!(
             "CONNECTION '{name}' enables SigV4 signing together with catalog \
@@ -178,13 +308,19 @@ fn validate_sigv4_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfEr
         if creds.secret_key.is_empty() {
             missing.push("secret_key");
         }
-        if creds.region.is_empty() {
+        if creds.sigv4_signing_region(catalog_uri).is_none() {
             missing.push("region");
         }
         if !missing.is_empty() {
+            let glue_hint = if missing.contains(&"region") {
+                "; a CONNECTION whose address is a standard AWS Glue endpoint of the form \
+                 https://glue.<region>.amazonaws.com can omit region"
+            } else {
+                ""
+            };
             return Err(UdfError::User(format!(
                 "CONNECTION '{name}' enables SigV4 signing but is missing field(s) \
-                 required when SigV4 signing is enabled: {}",
+                 required when SigV4 signing is enabled: {}{glue_hint}",
                 missing.join(", ")
             )));
         }
@@ -220,14 +356,6 @@ fn validate_oauth2_creds(name: &str, creds: &ConnectionCreds) -> Result<(), UdfE
     }
 }
 
-/// A non-vended CONNECTION that names a store `endpoint` but states no
-/// `path_style` is rejected rather than defaulted.
-///
-/// `path_style` gates whether [`StorageCreds::backend`] uses the endpoint at
-/// all, not only how it addresses a bucket: an absent value resolves to
-/// `false`, and `false` discards `endpoint` in favor of a derived AWS host.
-/// Silently defaulting a CONNECTION that already names a working endpoint
-/// would turn it into a wrong-host read instead of a clear, named error.
 fn validate_path_style_with_endpoint(name: &str, creds: &ConnectionCreds) -> Result<(), UdfError> {
     if !creds.endpoint.is_empty() && creds.path_style.is_none() && !creds.use_vended_credentials {
         return Err(UdfError::User(format!(
@@ -244,6 +372,19 @@ fn supplied_azure_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
         ("account_name", creds.account_name.is_some()),
         ("account_key", creds.account_key.is_some()),
         ("sas_token", creds.sas_token.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, supplied)| supplied.then_some(field))
+    .collect()
+}
+
+fn supplied_catalog_auth_fields(creds: &ConnectionCreds) -> Vec<&'static str> {
+    [
+        ("token", creds.token.is_some()),
+        ("client_id", creds.client_id.is_some()),
+        ("client_secret", creds.client_secret.is_some()),
+        ("oauth2_server_uri", creds.oauth2_server_uri.is_some()),
+        ("scope", creds.scope.is_some()),
     ]
     .into_iter()
     .filter_map(|(field, supplied)| supplied.then_some(field))
@@ -299,6 +440,9 @@ fn parse_creds(json: &serde_json::Value) -> ConnectionCreds {
         account_name,
         account_key,
         sas_token,
+        aws_assume_role_arn: nonempty_str(json, "aws_assume_role_arn").map(|s| s.to_string()),
+        aws_external_id: nonempty_str(json, "aws_external_id").map(|s| s.to_string()),
+        aws_sts_endpoint: nonempty_str(json, "aws_sts_endpoint").map(|s| s.to_string()),
     }
 }
 
@@ -312,10 +456,6 @@ pub fn catalog_block(creds: &ConnectionCreds, table: &str) -> CatalogProps {
         table: table.to_string(),
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 #[path = "connection_tests.rs"]

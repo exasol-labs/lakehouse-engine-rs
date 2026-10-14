@@ -1,29 +1,12 @@
-//! Per-side object-store routing for a broadcast join whose two sides share one
-//! bucket.
+//! DataFusion keys its object-store registry on `scheme://host[:port]` alone, so one bucket gets
+//! exactly one store, yet each join side owns a table-scoped vended credential while routinely
+//! sharing a bucket (the Databricks norm). [`PrefixRoutingObjectStore`] serves each path from the
+//! store of the side owning it, so one side's credential never reads the other's file.
 //!
-//! DataFusion keys its object-store registry on `scheme://host[:port]` alone
-//! (`get_url_key`, `datafusion-execution-54.1.0/src/object_store.rs:266-274`;
-//! `ObjectStoreUrl::parse` rejects any URL carrying a path, `:58-72`), so one
-//! bucket is served by exactly ONE registered store and no registry-level change
-//! can attach a second credential to it. Yet a join's two sides each own a
-//! credential — a vended credential is scoped to the table it was resolved for —
-//! while routinely sharing a bucket (the Databricks norm: one metastore bucket
-//! for two tables of one catalog). [`PrefixRoutingObjectStore`] reconciles the
-//! two: registered once per bucket over one already-credentialed inner store per
-//! side, it serves every operation carrying a path from the store of the side
-//! that owns that path, so one side's credential is never used on the other's
-//! file. The trait methods see the full `object_store::Path` the registry cannot.
-//!
-//! Routing matches a side's OWN enumerated file paths first and its table root
-//! only as a fallback, because the Iceberg table spec permits a table's files to
-//! sit outside its `location` (Appendix E, Version 4: "Absolute paths must be
-//! used for files that do not share a common prefix with the table location") —
-//! a root-only rule would misroute a spec-legal table. Exact membership is also
-//! complete, not merely preferred: the scan discovers no files, so each side's
-//! spec already names every path that side will request. The root fallback is
-//! therefore unreachable on a well-formed spec and a path matching neither is a
-//! planning defect, reported as an error rather than guessed at — guessing would
-//! issue the request with a credential of unknown scope for that path.
+//! Exact enumerated paths match first and the table root only as a fallback: the Iceberg spec
+//! permits files outside `location` (Appendix E, Version 4: "Absolute paths must be used for files
+//! that do not share a common prefix with the table location"). A path matching neither is a
+//! planning defect and errors, since guessing would use a credential of unknown scope.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -42,16 +25,10 @@ use std::sync::Arc;
 
 use crate::scan::spec::{FileEntry, StorageBackend, reconstruct_abs_uri};
 
-/// Name this store reports itself under, in a routing error and in `Display`.
 const STORE_NAME: &str = "PrefixRoutingObjectStore";
 
-/// One side of a scan (the fact side or a join's dimension side): the file list,
-/// table root, and storage backend that side is read through, plus the label a
-/// routing error names it by.
-///
-/// EVERY field is per-side, `backend` included: a vended credential is scoped to
-/// the table it was resolved for, so a join's dimension side is read through
-/// `JoinSpec::storage` and never through the fact side's `common.storage`.
+/// Every field is per-side, `backend` included: a vended credential is scoped to its own table,
+/// so the dimension side reads through `JoinSpec::storage`, never `common.storage`.
 pub(super) struct ScanSide<'a> {
     pub(super) label: &'static str,
     pub(super) files: &'a [FileEntry],
@@ -59,8 +36,6 @@ pub(super) struct ScanSide<'a> {
     pub(super) backend: &'a StorageBackend,
 }
 
-/// One routable side of a join scan: the object-store paths it owns, the root its
-/// files were resolved against, and the store holding ITS credential.
 #[derive(Debug)]
 pub struct RoutedSide {
     label: &'static str,
@@ -70,22 +45,9 @@ pub struct RoutedSide {
 }
 
 impl RoutedSide {
-    /// Derive one side's routing coordinates from the file list and table root its
-    /// scan spec carries, over `store` — the already-credentialed store built from
-    /// THAT side's storage backend. `side.label` names the side in routing errors
-    /// (`"fact"`, `"dimension"`).
-    ///
-    /// The owned set holds every data file AND every delete FILE an entry's
-    /// mechanisms name, since the scan requests both; a mechanism carrying no
-    /// object-store path of its own claims nothing, having no path to route. Both
-    /// the owned paths and the
-    /// root are derived through `ListingTableUrl::parse(..).prefix()` — the
-    /// derivation the spec-sized HEAD index already uses — so file paths and roots
-    /// share one coordinate system by construction rather than by inspection.
-    ///
-    /// An empty `side.table_root` yields NO root: such a spec carries only absolute
-    /// file paths, and a rootless side must not claim a path it never enumerated
-    /// (an empty root prefix-matches every path).
+    /// The owned set holds every data file and delete FILE the scan will request. Paths and root
+    /// both derive through `ListingTableUrl::parse(..).prefix()`, sharing one coordinate system.
+    /// An empty `side.table_root` yields no root, since an empty prefix would match every path.
     pub(super) fn new(side: &ScanSide<'_>, store: Arc<dyn ObjectStore>) -> Result<Self, UdfError> {
         let mut owned = HashSet::with_capacity(side.files.len());
         for file in side.files {
@@ -120,19 +82,15 @@ fn listing_prefix(uri: &str) -> Result<ObjectStorePath, UdfError> {
         .clone())
 }
 
-/// An [`ObjectStore`] that serves each requested path through the inner store of
-/// the join side owning it: one store per bucket, one credential per side.
 #[derive(Debug)]
 pub struct PrefixRoutingObjectStore {
-    // Shared behind an `Arc` so the one routing rule is reachable from the
-    // `'static` stream `delete_stream` returns as well as from `&self` methods.
+    // `Arc` so the routing rule is reachable from the `'static` stream `delete_stream` returns.
     sides: Arc<[RoutedSide]>,
 }
 
 impl PrefixRoutingObjectStore {
-    /// Route between `sides`, which MUST be ordered FACT side first: routing scans
-    /// them in order and keeps the first match, so their order IS the tie-break
-    /// that stops one spec from routing one path two ways across invocations.
+    /// `sides` MUST be ordered fact side first: the first match wins, so order is the tie-break
+    /// that keeps one spec from routing one path two ways across invocations.
     pub fn new(sides: Vec<RoutedSide>) -> Self {
         Self {
             sides: sides.into(),
@@ -151,12 +109,8 @@ impl PrefixRoutingObjectStore {
         self.route(prefix)
     }
 
-    /// Route a two-path operation, which ONE side must own entirely: both paths are
-    /// touched through a single inner store, and routing is per side, so a pair
-    /// spanning two sides has no store covering it. The refusal is about cross-side
-    /// path OWNERSHIP, not credential inequality — this router is installed for every
-    /// join, including the common same-warehouse case where both sides' backends are
-    /// byte-identical, and it must not claim a difference it never compared.
+    /// One side must own both paths, since each side has its own store. The refusal is about path
+    /// OWNERSHIP, not credential inequality: same-warehouse joins have byte-identical backends.
     fn route_pair(
         &self,
         operation: &str,
@@ -194,9 +148,8 @@ impl std::fmt::Display for PrefixRoutingObjectStore {
     }
 }
 
-/// The index of the side owning `path`: the FIRST side whose spec enumerates it
-/// exactly, else the side whose table root is its LONGEST prefix, else a routing
-/// error. Both steps resolve a tie in favour of the earlier — fact — side.
+/// First side enumerating `path` exactly, else the side with the LONGEST matching root; ties
+/// favour the earlier (fact) side.
 fn owning_side(sides: &[RoutedSide], path: &ObjectStorePath) -> object_store::Result<usize> {
     if let Some(index) = sides.iter().position(|side| side.owned.contains(path)) {
         return Ok(index);
@@ -208,9 +161,8 @@ fn owning_side(sides: &[RoutedSide], path: &ObjectStorePath) -> object_store::Re
         if !path.prefix_matches(root) {
             continue;
         }
-        // Measured in raw length rather than segment count: `Path::parts_count`
-        // reports 1 for the store root, and two roots that both prefix-match one
-        // path are nested, so raw length orders them exactly as segments would.
+        // Raw length, not `parts_count` (which reports 1 for the store root); matching roots are
+        // nested, so length orders them as segments would.
         let matched = root.as_ref().len();
         if longest.is_none_or(|(_, best)| matched > best) {
             longest = Some((index, matched));
@@ -305,8 +257,6 @@ impl ObjectStore for PrefixRoutingObjectStore {
         self.route(location)?.get_ranges(location, ranges).await
     }
 
-    /// Routes each streamed path on its own, so one stream spanning both sides
-    /// deletes every path through its owning side's credential.
     fn delete_stream(
         &self,
         locations: BoxStream<'static, object_store::Result<ObjectStorePath>>,
@@ -325,10 +275,7 @@ impl ObjectStore for PrefixRoutingObjectStore {
             .boxed()
     }
 
-    /// A PREFIXED listing routes by the same two-step rule as any other path — the
-    /// scan's schema-inference branch lists either a data file's own exact path or a
-    /// directory under one side's table root, and both are covered by that rule. A
-    /// prefix-LESS listing is bucket-wide and belongs to no side.
+    /// A prefix-less listing is bucket-wide and belongs to no side.
     fn list(
         &self,
         prefix: Option<&ObjectStorePath>,
@@ -339,8 +286,7 @@ impl ObjectStore for PrefixRoutingObjectStore {
         }
     }
 
-    /// Routes on `prefix`; `offset` is a resume cursor within that one listing, not
-    /// a second target.
+    /// `offset` is a resume cursor within the listing, not a second routing target.
     fn list_with_offset(
         &self,
         prefix: Option<&ObjectStorePath>,

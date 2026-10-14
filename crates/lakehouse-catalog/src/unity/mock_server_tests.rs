@@ -1,16 +1,7 @@
-//! A minimal in-process HTTP/1.1 server for the Unity Catalog client and auth
-//! tests. It records every request it receives and answers each from a
-//! caller-supplied responder, so a test asserts the exact request shape and
-//! scripts a status/body per request without any live network.
-//!
-//! Consumers: `unity::client::tests`, `unity::auth::tests`.
-
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// One request the mock server received: the request line's method and target
-/// (path plus query), the `Authorization` header if present, and the body.
 pub(crate) struct RecordedRequest {
     pub method: String,
     pub target: String,
@@ -18,7 +9,6 @@ pub(crate) struct RecordedRequest {
     pub body: String,
 }
 
-/// A running mock server: its base URL and every request it has served so far.
 pub(crate) struct MockServer {
     pub base_url: String,
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
@@ -30,11 +20,8 @@ impl MockServer {
     }
 }
 
-/// Spawn a server answering each request from `responder`, which returns the
-/// `(status_code, body)` to send back. Every request is recorded before the
-/// responder runs. Responses close the connection so the pooled `reqwest` client
-/// opens a fresh connection per request, letting a single accept loop serve the
-/// whole sequential request stream in order.
+/// Responses close the connection so the pooled client reconnects per request,
+/// letting one accept loop serve the sequential request stream in order.
 pub(crate) async fn spawn<F>(responder: F) -> MockServer
 where
     F: Fn(&RecordedRequest) -> (u16, String) + Send + Sync + 'static,

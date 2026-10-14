@@ -14,7 +14,7 @@ output "reserve_nodes" {
   value = var.reserve_nodes
 }
 
-# Ordered (count index) — cluster-up.sh feeds these to .ccc/config in the SAME order.
+# cluster-up.sh relies on this order matching .ccc/config.
 output "internal_ips" {
   value = aws_instance.node[*].private_ip
 }
@@ -47,7 +47,6 @@ output "ssm_root" {
   value = local.ssm_root
 }
 
-# Pull from the data-stack so secrets.sh has everything from cluster outputs.
 output "data_ssm_root" {
   value = data.terraform_remote_state.data.outputs.ssm_root
 }

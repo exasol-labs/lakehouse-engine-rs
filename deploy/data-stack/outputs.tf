@@ -50,6 +50,14 @@ output "engine_reader_user" {
   value = aws_iam_user.engine_reader.name
 }
 
+output "assume_role_base_user" {
+  value = aws_iam_user.assume_role_base.name
+}
+
+output "assume_role_arn" {
+  value = aws_iam_role.assume_role_target.arn
+}
+
 output "datagen_status_param" {
   value = "${local.ssm_root}/datagen/last_status"
 }

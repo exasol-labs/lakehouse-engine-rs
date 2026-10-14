@@ -1,74 +1,89 @@
-//! Test-only fixtures shared across the `pushdown` submodule test modules.
-//!
-//! Extracted verbatim from the former flat `mod tests` "Helpers shared across
-//! tests" block. Each capability submodule's `#[cfg(test)] mod tests` reaches
-//! these through `super::test_support`.
-
 use super::*;
 use crate::scan::sealed::{SealedStorageKey, derive_sealed_storage_key};
 use crate::scan::spec::{DeleteMechanism, ScanStorage, StorageProps};
+use lakehouse_catalog::{
+    CatalogColumn, CatalogTable, CatalogTableIdent, CatalogTableType, ColumnSourceType, TableFormat,
+};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
-/// A loopback HTTP/1.1 catalog answering every request from a caller-supplied
-/// responder and recording each request target in arrival order.
-///
-/// Every response closes its connection, so the pooled client opens a fresh one
-/// per request and one accept loop serves the whole sequential stream in order.
+type RecordedRequests = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+/// Every response closes its connection, so one accept loop serves a pooled client's sequential
+/// requests in arrival order. `responder` maps a request head to a status, content type, and body;
+/// the validators make a body readable as an object.
+async fn spawn_fake_http_server<F>(responder: F) -> (String, RecordedRequests)
+where
+    F: Fn(&str) -> (u16, &'static str, String) + Send + Sync + 'static,
+{
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
+    let address = format!("http://{}", listener.local_addr().expect("local_addr"));
+    let requests: RecordedRequests = Arc::default();
+
+    let recorded = requests.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let Some((head, body)) = read_http_request(&mut stream).await else {
+                continue;
+            };
+            let (status, content_type, response_body) = responder(&head);
+            recorded
+                .lock()
+                .expect("recorded requests")
+                .push((head, body));
+            let reason = if (200..300).contains(&status) {
+                "OK"
+            } else {
+                "ERROR"
+            };
+            let length = response_body.len();
+            let response = format!(
+                "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\n\
+                 Content-Length: {length}\r\nETag: \"e{length}\"\r\n\
+                 Last-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\nAccept-Ranges: bytes\r\n\
+                 Connection: close\r\n\r\n{response_body}"
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        }
+    });
+
+    (address, requests)
+}
+
+fn request_target(head: &str) -> &str {
+    head.split_whitespace().nth(1).unwrap_or("")
+}
+
 pub(super) struct RecordingCatalog {
     pub(super) uri: String,
-    targets: Arc<Mutex<Vec<String>>>,
+    requests: RecordedRequests,
 }
 
 impl RecordingCatalog {
+    /// `responder` maps a request target to a status and body.
     pub(super) async fn spawn<F>(responder: F) -> Self
     where
         F: Fn(&str) -> (u16, String) + Send + Sync + 'static,
     {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-        let uri = format!(
-            "http://127.0.0.1:{}",
-            listener.local_addr().expect("local_addr").port()
-        );
-        let targets: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-
-        let recorded = targets.clone();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = vec![0u8; 8192];
-                let read = stream.read(&mut buf).await.unwrap_or(0);
-                if read == 0 {
-                    continue;
-                }
-                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
-                let target = raw.split_whitespace().nth(1).unwrap_or("").to_string();
-                let (status, body) = responder(&target);
-                recorded.lock().expect("recorded targets").push(target);
-                let reason = if (200..300).contains(&status) {
-                    "OK"
-                } else {
-                    "ERROR"
-                };
-                let response = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\n\
-                     Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
-                );
-                let _ = stream.write_all(response.as_bytes()).await;
-            }
-        });
-
-        Self { uri, targets }
+        let (uri, requests) = spawn_fake_http_server(move |head| {
+            let (status, body) = responder(request_target(head));
+            (status, "application/json", body)
+        })
+        .await;
+        Self { uri, requests }
     }
 
     pub(super) fn targets(&self) -> Vec<String> {
-        self.targets.lock().expect("recorded targets").clone()
+        self.requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .map(|(head, _)| request_target(head).to_string())
+            .collect()
     }
 }
-
-/// Credentials supplying no catalog authentication at all, so a session issues
-/// exactly the requests its own resolution needs and no token grant.
+/// No catalog auth, so a session issues no token-grant request.
 pub(super) fn unauthenticated_creds() -> ConnectionCreds {
     ConnectionCreds {
         warehouse: "wh".into(),
@@ -88,55 +103,161 @@ pub(super) fn unauthenticated_creds() -> ConnectionCreds {
         account_name: None,
         account_key: None,
         sas_token: None,
+        ..Default::default()
     }
 }
 
-/// The `/v1/config` target every non-SigV4 Iceberg session resolves its prefix
-/// from, exactly once per session.
 pub(super) const ICEBERG_CONFIG_TARGET: &str = "/v1/config?warehouse=wh";
 
-/// The `loadTable` target the recorded identifier `db.t` addresses under an
-/// empty prefix.
 pub(super) const ICEBERG_LOAD_TABLE_TARGET: &str = "/v1/namespaces/db/tables/t";
 
-/// The Unity Catalog get-table target the recorded identifier `cat.sch.orders`
-/// addresses.
 pub(super) const UNITY_TABLE_TARGET: &str = "/api/2.1/unity-catalog/tables/cat.sch.orders";
 
-/// A `loadTable` response for a snapshotless single-column table.
-///
-/// The absent snapshot is what keeps this offline: an empty table scan reads no
-/// manifest, so resolution completes without touching the store its location
-/// names.
-pub(super) fn snapshotless_load_table_body(location: &str) -> String {
+/// SigV4 mode lets `CatalogSession::resolve` build a session without contacting the catalog, so
+/// `loadTable` is a loopback catalog's only request.
+pub(super) fn sigv4_creds() -> ConnectionCreds {
+    ConnectionCreds {
+        warehouse: "123456789012".into(),
+        endpoint: "http://minio:9000".into(),
+        region: "us-east-1".into(),
+        access_key: "signing-access-key".into(),
+        secret_key: SIGV4_SECRET_KEY.into(),
+        path_style: Some(true),
+        use_sigv4: true,
+        ..Default::default()
+    }
+}
+
+pub(super) const SIGV4_SECRET_KEY: &str = "signing-secret-key";
+
+/// Closed port: a stray request fails with a transport error, distinct from every asserted refusal.
+pub(super) const UNREACHABLE_CATALOG: &str = "http://127.0.0.1:1";
+
+/// A `loadTable` body for a one-column table at `s3://bucket/db/t`, each `metadata` field
+/// replacing its default. No snapshot, so the empty scan reads no manifest and resolution stays
+/// offline.
+pub(super) fn load_table_body(metadata: Json) -> Json {
+    let mut fields = serde_json::json!({
+        "format-version": 2,
+        "table-uuid": "00000000-0000-0000-0000-000000000003",
+        "location": "s3://bucket/db/t",
+        "last-sequence-number": 0,
+        "last-updated-ms": 0,
+        "last-column-id": 1,
+        "current-schema-id": 0,
+        "schemas": [{
+            "type": "struct",
+            "schema-id": 0,
+            "fields": [{"id": 1, "name": "id", "required": false, "type": "long"}]
+        }],
+        "default-spec-id": 0,
+        "partition-specs": [{"spec-id": 0, "fields": []}],
+        "last-partition-id": 0,
+        "sort-orders": [{"order-id": 0, "fields": []}],
+        "default-sort-order-id": 0,
+        "snapshots": []
+    });
+    let Json::Object(overrides) = metadata else {
+        panic!("the metadata overrides are an object: {metadata}");
+    };
+    fields.as_object_mut().expect("an object").extend(overrides);
+    let location = fields["location"].as_str().unwrap_or_default().to_string();
     serde_json::json!({
         "metadata-location": format!("{location}/metadata/v1.json"),
-        "metadata": {
-            "format-version": 2,
-            "table-uuid": "00000000-0000-0000-0000-000000000003",
-            "location": location,
-            "last-sequence-number": 0,
-            "last-updated-ms": 0,
-            "last-column-id": 1,
-            "current-schema-id": 0,
-            "schemas": [{
-                "type": "struct",
-                "schema-id": 0,
-                "fields": [{"id": 1, "name": "id", "required": false, "type": "long"}]
-            }],
-            "default-spec-id": 0,
-            "partition-specs": [{"spec-id": 0, "fields": []}],
-            "last-partition-id": 0,
-            "sort-orders": [{"order-id": 0, "fields": []}],
-            "default-sort-order-id": 0,
-            "snapshots": []
-        }
+        "metadata": fields,
     })
+}
+
+pub(super) fn snapshotless_load_table_body(location: &str) -> String {
+    load_table_body(serde_json::json!({ "location": location })).to_string()
+}
+
+pub(super) fn load_table_body_with_columns(fields: Json, last_column_id: i32) -> String {
+    load_table_body(serde_json::json!({
+        "last-column-id": last_column_id,
+        "schemas": [{"type": "struct", "schema-id": 0, "fields": fields}],
+    }))
     .to_string()
 }
 
-/// A loaded Unity Catalog Delta table carrying NO storage location, so the Delta
-/// reader refuses at its first check and reaches no object store.
+/// Binary, fixed, and uuid columns at the top level and below a struct, list, and map, between
+/// the mappable `id` and `name`; the last column id is [`BINARY_ICEBERG_LAST_COLUMN_ID`].
+pub(super) fn binary_iceberg_fields() -> serde_json::Value {
+    serde_json::json!([
+        {"id": 1, "name": "id", "required": false, "type": "int"},
+        {"id": 2, "name": "b", "required": false, "type": "binary"},
+        {"id": 3, "name": "f", "required": false, "type": "fixed[16]"},
+        {"id": 4, "name": "u", "required": false, "type": "uuid"},
+        {"id": 5, "name": "s", "required": false, "type": {"type": "struct", "fields": [
+            {"id": 6, "name": "ok", "required": false, "type": "string"},
+            {"id": 7, "name": "x", "required": false, "type": "binary"}
+        ]}},
+        {"id": 8, "name": "l", "required": false, "type": {
+            "type": "list", "element-id": 9, "element": "fixed[4]", "element-required": false
+        }},
+        {"id": 10, "name": "m", "required": false, "type": {
+            "type": "map", "key-id": 11, "key": "string",
+            "value-id": 12, "value": "uuid", "value-required": false
+        }},
+        {"id": 13, "name": "name", "required": false, "type": "string"}
+    ])
+}
+
+pub(super) const BINARY_ICEBERG_LAST_COLUMN_ID: i32 = 13;
+
+pub(super) fn user_message(error: UdfError) -> String {
+    match error {
+        UdfError::User(message) => message,
+        other => panic!("expected UdfError::User, got {other:?}"),
+    }
+}
+
+pub(super) fn assert_refuses_binary_col(error: UdfError) {
+    let message = user_message(error);
+    assert!(
+        message.contains("binary_col") && message.contains("#351"),
+        "the refusal must be the gate's own message, naming the column and its reason: \
+         {message}"
+    );
+}
+
+pub(super) fn glue_column(name: &str, hive_type: &str) -> CatalogColumn {
+    CatalogColumn {
+        name: name.to_string(),
+        source_type: ColumnSourceType::Glue {
+            hive_type: hive_type.to_string(),
+        },
+    }
+}
+
+/// An unpartitioned Glue table `database.name` with no metadata location; `columns` pairs each
+/// name with its Hive type.
+pub(super) fn glue_catalog_table(
+    database: &str,
+    name: &str,
+    format: TableFormat,
+    location: &str,
+    columns: &[(&str, &str)],
+) -> CatalogTable {
+    CatalogTable {
+        ident: CatalogTableIdent {
+            namespace: vec![database.to_string()],
+            name: name.to_string(),
+        },
+        table_type: CatalogTableType::Table,
+        storage_location: Some(location.to_string()),
+        format,
+        vended_credential_key: None,
+        partition_columns: Vec::new(),
+        metadata_location: None,
+        columns: columns
+            .iter()
+            .map(|(name, hive_type)| glue_column(name, hive_type))
+            .collect(),
+    }
+}
+
+/// No storage location, so the Delta reader refuses before reaching any object store.
 pub(super) fn locationless_delta_table_body() -> String {
     serde_json::json!({
         "name": "orders",
@@ -148,9 +269,6 @@ pub(super) fn locationless_delta_table_body() -> String {
     .to_string()
 }
 
-/// A Unity Catalog serving a Delta table for every `cat.sch.<name>` identifier,
-/// each located at `s3://bucket/<name>` — the location the object endpoint below
-/// serves that table's log under.
 pub(super) async fn unity_delta_catalog() -> RecordingCatalog {
     RecordingCatalog::spawn(|target| match target.rsplit_once('.') {
         Some((_, name)) if !name.is_empty() => (
@@ -170,8 +288,6 @@ pub(super) async fn unity_delta_catalog() -> RecordingCatalog {
     .await
 }
 
-/// One Delta commit declaring `columns` as `(name, Delta type)` pairs and NO `add`
-/// action, so the table resolves with an EMPTY active-file list.
 pub(super) fn fileless_delta_commit(id: &str, columns: &[(&str, &str)]) -> String {
     fileless_delta_commit_with_protocol(
         id,
@@ -180,9 +296,6 @@ pub(super) fn fileless_delta_commit(id: &str, columns: &[(&str, &str)]) -> Strin
     )
 }
 
-/// [`fileless_delta_commit`], with the `protocol` action replaced by the caller's
-/// own — for a table whose reader protocol declares features outside the gate's
-/// allow-list.
 pub(super) fn fileless_delta_commit_with_protocol(
     id: &str,
     columns: &[(&str, &str)],
@@ -208,124 +321,217 @@ pub(super) fn fileless_delta_commit_with_protocol(
     format!("{protocol}\n{metadata}\n")
 }
 
-/// The log path a table located at `s3://bucket/<name>` holds its first commit at.
 pub(super) fn delta_commit_zero_key(name: &str) -> String {
     format!("{name}/_delta_log/00000000000000000000.json")
 }
 
-/// A loopback S3 endpoint serving a fixed key → body map, answered as the
-/// [`StorageBackend`] a CONNECTION would carry.
-///
-/// Serving the log over HTTP rather than injecting a store is what lets a WHOLE
-/// `handle_pushdown` call resolve a real Delta table offline: `read_delta_log`
-/// builds its own store from the storage backend, so no test store can be reached
-/// past that seam. Answers exactly the three request shapes a `delta_kernel` log
-/// read issues — the `_last_checkpoint` probe, the `_delta_log/` listing, and a GET
-/// per commit — and 404s everything else, including every data-file read, which no
-/// plan-time resolution performs.
+/// Served over HTTP because `read_delta_log` builds its own store from the
+/// storage backend, so no injected store is reachable. Data-file reads 404;
+/// plan-time resolution performs none.
 pub(super) async fn delta_object_endpoint(objects: Vec<(String, String)>) -> StorageBackend {
-    let objects = Arc::new(objects);
-    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind failed");
-    let port = listener.local_addr().expect("local_addr").port();
+    object_endpoint("bucket", objects).await
+}
 
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            let objects = objects.clone();
-            tokio::spawn(async move {
-                let mut buf = vec![0u8; 16384];
-                let read = stream.read(&mut buf).await.unwrap_or(0);
-                if read == 0 {
-                    return;
+pub(super) async fn object_endpoint(
+    bucket: &str,
+    objects: Vec<(String, String)>,
+) -> StorageBackend {
+    ObjectEndpoint::spawn(bucket, objects).await.storage
+}
+
+/// Serves each `(key, body)` of `bucket` path-style, listing as S3's `ListObjectsV2` does; any
+/// other key is absent.
+pub(super) struct ObjectEndpoint {
+    pub(super) storage: StorageBackend,
+    requests: RecordedRequests,
+}
+
+impl ObjectEndpoint {
+    pub(super) async fn spawn(bucket: &str, objects: Vec<(String, String)>) -> Self {
+        let bucket = bucket.to_string();
+        let (endpoint, requests) = spawn_fake_http_server(move |head| {
+            let target = request_target(head);
+            let (path, query) = target.split_once('?').unwrap_or((target, ""));
+            if query.contains("list-type=2") {
+                let listing = list_bucket_result(&bucket, query, &objects);
+                return (200, "application/xml", listing);
+            }
+            let key = path
+                .strip_prefix(&format!("/{bucket}/"))
+                .map(|key| percent_encoding::percent_decode_str(key).decode_utf8_lossy());
+            match objects
+                .iter()
+                .find(|(served, _)| key.as_deref() == Some(served.as_str()))
+            {
+                Some((_, body)) => (200, "application/octet-stream", body.clone()),
+                None => {
+                    let error = r#"<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>"#;
+                    (404, "application/xml", error.to_string())
                 }
-                let raw = String::from_utf8_lossy(&buf[..read]).to_string();
-                let target = raw
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .split_whitespace()
-                    .nth(1)
-                    .unwrap_or("")
-                    .to_string();
-                let (path, query) = target.split_once('?').unwrap_or((target.as_str(), ""));
-                let response = if query.contains("list-type=2") {
-                    ok_response("application/xml", &list_bucket_result(query, &objects))
-                } else {
-                    match objects
-                        .iter()
-                        .find(|(key, _)| key == path.trim_start_matches("/bucket/"))
-                    {
-                        Some((_, body)) => ok_response("application/octet-stream", body),
-                        None => {
-                            let error =
-                                r#"<?xml version="1.0"?><Error><Code>NoSuchKey</Code></Error>"#;
-                            format!(
-                                "HTTP/1.1 404 Not Found\r\nContent-Type: application/xml\r\n\
-                                 Content-Length: {}\r\nConnection: close\r\n\r\n{error}",
-                                error.len()
-                            )
-                        }
-                    }
-                };
-                let _ = stream.write_all(response.as_bytes()).await;
-            });
+            }
+        })
+        .await;
+        let storage = StorageBackend::S3(StorageProps {
+            endpoint,
+            region: "us-east-1".into(),
+            access_key: "minioadmin".into(),
+            secret_key: "minioadmin".into(),
+            allow_http: true,
+            path_style: true,
+            ..Default::default()
+        });
+        Self { storage, requests }
+    }
+
+    /// The prefix of every listing request, sorted.
+    pub(super) fn listed_prefixes(&self) -> Vec<String> {
+        let mut prefixes: Vec<String> = self
+            .requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .filter_map(|(head, _)| {
+                let (_, query) = request_target(head).split_once('?')?;
+                query
+                    .contains("list-type=2")
+                    .then(|| query_param(query, "prefix"))
+            })
+            .collect();
+        prefixes.sort();
+        prefixes
+    }
+}
+
+fn query_param(query: &str, key: &str) -> String {
+    url::form_urlencoded::parse(query.as_bytes())
+        .find(|(name, _)| name == key)
+        .map(|(_, value)| value.into_owned())
+        .unwrap_or_default()
+}
+
+pub(super) struct GlueEndpoint {
+    pub(super) address: String,
+    requests: RecordedRequests,
+}
+
+impl GlueEndpoint {
+    /// `responder` maps a Glue operation name, such as `GetTable`, to a status and JSON body.
+    pub(super) async fn spawn<F>(responder: F) -> Self
+    where
+        F: Fn(&str) -> (u16, serde_json::Value) + Send + Sync + 'static,
+    {
+        let (address, requests) = spawn_fake_http_server(move |head| {
+            let (status, body) = match glue_operation(head) {
+                Some(operation) => responder(operation),
+                None => (400, serde_json::Value::Null),
+            };
+            (status, "application/x-amz-json-1.1", body.to_string())
+        })
+        .await;
+        Self { address, requests }
+    }
+
+    pub(super) fn operations(&self) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .filter_map(|(head, _)| glue_operation(head).map(str::to_string))
+            .collect()
+    }
+
+    pub(super) fn bodies_of(&self, operation: &str) -> Vec<serde_json::Value> {
+        self.requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .filter(|(head, _)| glue_operation(head) == Some(operation))
+            .map(|(_, body)| serde_json::from_slice(body).expect("a Glue request body is JSON"))
+            .collect()
+    }
+}
+
+fn glue_operation(head: &str) -> Option<&str> {
+    header(head, "x-amz-target")?.strip_prefix("AWSGlue.")
+}
+
+/// The request head and its whole body: closing a socket with unread bytes resets it before the
+/// client reads the response.
+async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Option<(String, Vec<u8>)> {
+    let mut raw = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(position) = raw.windows(4).position(|window| window == b"\r\n\r\n") {
+            break position;
         }
-    });
-
-    StorageBackend::S3(StorageProps {
-        endpoint: format!("http://127.0.0.1:{port}"),
-        region: "us-east-1".into(),
-        access_key: "minioadmin".into(),
-        secret_key: "minioadmin".into(),
-        allow_http: true,
-        path_style: true,
-        ..Default::default()
-    })
-}
-
-fn ok_response(content_type: &str, body: &str) -> String {
-    format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\n\
-         ETag: \"e{}\"\r\nLast-Modified: Mon, 01 Jan 2024 00:00:00 GMT\r\n\
-         Accept-Ranges: bytes\r\nConnection: close\r\n\r\n{body}",
-        body.len(),
-        body.len()
-    )
-}
-
-/// The `ListObjectsV2` answer for the listing `query`, over every served key under
-/// its `prefix` that sorts after its `start-after` marker.
-fn list_bucket_result(query: &str, objects: &[(String, String)]) -> String {
-    let param = |key: &str| {
-        url::form_urlencoded::parse(query.as_bytes())
-            .find(|(name, _)| name == key)
-            .map(|(_, value)| value.into_owned())
-            .unwrap_or_default()
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            return None;
+        }
+        raw.extend_from_slice(&chunk[..read]);
     };
-    let (prefix, after) = (param("prefix"), param("start-after"));
-    let contents: String = objects
+    let head = String::from_utf8_lossy(&raw[..head_end]).into_owned();
+    let content_length: usize = header(&head, "content-length")
+        .and_then(|length| length.parse().ok())
+        .unwrap_or(0);
+    let mut body = raw[head_end + 4..].to_vec();
+    while body.len() < content_length {
+        let read = stream.read(&mut chunk).await.ok()?;
+        if read == 0 {
+            break;
+        }
+        body.extend_from_slice(&chunk[..read]);
+    }
+    Some((head, body))
+}
+
+fn header<'a>(head: &'a str, name: &str) -> Option<&'a str> {
+    head.split("\r\n")
+        .filter_map(|line| line.split_once(':'))
+        .find(|(key, _)| key.trim().eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.trim())
+}
+
+/// Honors `delimiter` as S3 does: a key with the delimiter below `prefix` rolls up into its
+/// common prefix, so a delimiter listing returns only the prefix's direct children as objects.
+fn list_bucket_result(bucket: &str, query: &str, objects: &[(String, String)]) -> String {
+    let param = |key: &str| query_param(query, key);
+    let (prefix, after, delimiter) = (param("prefix"), param("start-after"), param("delimiter"));
+    let mut contents = String::new();
+    let mut common_prefixes = std::collections::BTreeSet::new();
+    for (key, body) in objects
         .iter()
         .filter(|(key, _)| key.starts_with(&prefix) && key > &after)
-        .map(|(key, body)| {
-            format!(
+    {
+        let rolled_up = (!delimiter.is_empty())
+            .then(|| key[prefix.len()..].find(&delimiter))
+            .flatten();
+        match rolled_up {
+            Some(end) => {
+                common_prefixes.insert(key[..prefix.len() + end + delimiter.len()].to_string());
+            }
+            None => contents.push_str(&format!(
                 "<Contents><Key>{key}</Key>\
                  <LastModified>2024-01-01T00:00:00.000Z</LastModified>\
                  <ETag>&quot;e{}&quot;</ETag><Size>{}</Size>\
                  <StorageClass>STANDARD</StorageClass></Contents>",
                 body.len(),
                 body.len()
-            )
-        })
+            )),
+        }
+    }
+    let common_prefixes: String = common_prefixes
+        .iter()
+        .map(|common| format!("<CommonPrefixes><Prefix>{common}</Prefix></CommonPrefixes>"))
         .collect();
     format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
-         <Name>bucket</Name><Prefix>{prefix}</Prefix><MaxKeys>1000</MaxKeys>\
-         <IsTruncated>false</IsTruncated>{contents}</ListBucketResult>"
+         <Name>{bucket}</Name><Prefix>{prefix}</Prefix><MaxKeys>1000</MaxKeys>\
+         <IsTruncated>false</IsTruncated>{contents}{common_prefixes}</ListBucketResult>"
     )
 }
 
-/// Drive a whole pushdown request against a Unity Catalog Delta table, on the
-/// single-shard tuning every offline resolution test uses.
 pub(super) async fn delta_pushdown(
     request: &Json,
     catalog_uri: &str,
@@ -340,6 +546,7 @@ pub(super) async fn delta_pushdown(
         catalog_kind: CatalogKind::UnityCatalogNative,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_check: crate::adapter::permission::PermissionCheck::Off,
     };
     let catalog = CatalogProps {
         warehouse: "wh".into(),
@@ -351,8 +558,6 @@ pub(super) async fn delta_pushdown(
     .await
 }
 
-/// An Iceberg REST catalog serving its config and one snapshotless table per
-/// requested identifier.
 pub(super) async fn iceberg_catalog() -> RecordingCatalog {
     RecordingCatalog::spawn(|target| {
         if target.starts_with("/v1/config") {
@@ -387,6 +592,7 @@ fn test_connection(creds: ConnectionCreds) -> ResolvedConnectionConfig {
         catalog_kind: CatalogKind::IcebergRest,
         connection_name: TEST_CONNECTION_NAME.to_string(),
         sealed_storage_key: Some(test_sealing_key()),
+        permission_check: crate::adapter::permission::PermissionCheck::Off,
     }
 }
 
@@ -419,9 +625,23 @@ pub(super) fn sample_storage() -> StorageBackend {
     })
 }
 
-/// Assemble the scan-driving SQL from a known file list + spec — the same
-/// logic `handle_pushdown` runs after resolution.
-/// Uses `cluster_nodes=1` (single-shard / legacy shape).
+pub(super) const SENTINEL_ACCESS_KEY: &str = "AKIA-SENTINEL-ACCESS-0001";
+pub(super) const SENTINEL_SECRET_KEY: &str = "sentinel-secret-value-0002";
+
+/// Sentinel credentials on a closed loopback port; `path_style` keeps `object_store` off real AWS.
+pub(super) fn closed_port_storage() -> StorageBackend {
+    StorageBackend::S3(StorageProps {
+        endpoint: "http://127.0.0.1:1".into(),
+        region: "us-east-1".into(),
+        access_key: SENTINEL_ACCESS_KEY.into(),
+        secret_key: SENTINEL_SECRET_KEY.into(),
+        allow_http: true,
+        path_style: true,
+        ..Default::default()
+    })
+}
+
+/// Mirrors `handle_pushdown`'s post-resolution SQL assembly, single shard.
 pub(super) fn build_sql_for_fixture(
     files: Vec<String>,
     proj_cols: Vec<String>,
@@ -432,7 +652,6 @@ pub(super) fn build_sql_for_fixture(
     build_sql_for_fixture_n(files, proj_cols, proj_types, filter, limit, 1)
 }
 
-/// Assemble the scan-driving SQL for `cluster_nodes = n`.
 pub(super) fn build_sql_for_fixture_n(
     files: Vec<String>,
     proj_cols: Vec<String>,
@@ -441,7 +660,6 @@ pub(super) fn build_sql_for_fixture_n(
     limit: Option<u64>,
     cluster_nodes: usize,
 ) -> String {
-    // Build a col_types map from proj_cols/proj_types for row-scan tests.
     let col_types: Vec<(String, String)> = proj_cols
         .iter()
         .cloned()
@@ -479,10 +697,7 @@ pub(super) fn build_sql_for_fixture_n(
     )
 }
 
-/// The UDF's first-argument literal (the shard-invariant common blob), extracted
-/// as the substring between the first two single quotes. Valid for the test
-/// fixtures here, whose common JSON contains no embedded single quote (JSON uses
-/// double quotes; the rendered filters used in these tests carry none).
+/// Assumes the common JSON contains no single quote, true for these fixtures.
 pub(super) fn common_arg_literal(sql: &str) -> &str {
     let start = sql.find('\'').expect("SQL must contain a literal") + 1;
     let rest = &sql[start..];
@@ -490,14 +705,7 @@ pub(super) fn common_arg_literal(sql: &str) -> &str {
     &rest[..end]
 }
 
-/// The contents of the scan UDF's `EMITS (...)` clause — the scan's EMITTED column
-/// set, which on a declined-`ORDER BY` path is WIDER than the query's visible column
-/// set (it also carries the appended hidden sort-key columns).
-///
-/// Extracted paren-balanced: the declared types carry their own parentheses
-/// (`DECIMAL(20,0)`), so the clause does not end at the first `)`. Exactly one
-/// `EMITS (` appears in a fan-out — the distributor call carries none (its LUA SET
-/// script declares a static EMITS).
+/// Paren-balanced: declared types like `DECIMAL(20,0)` carry their own parentheses.
 pub(super) fn emits_clause(sql: &str) -> &str {
     let open = sql.find("EMITS (").expect("SQL must carry an EMITS clause") + "EMITS ".len();
     let mut depth = 0usize;
@@ -516,13 +724,8 @@ pub(super) fn emits_clause(sql: &str) -> &str {
     panic!("EMITS clause must be closed: {sql}");
 }
 
-/// The declined-`ORDER BY` wrapper's VISIBLE select list: everything between the
-/// leading `SELECT ` and the first ` FROM (`. A visible select list never contains
-/// ` FROM (` itself, so the first occurrence is always the wrapper's own — even for a
-/// multi-shard fan-out, which nests a second ` FROM (` inside.
-///
-/// Panics when the SQL carries no wrapper; use a `!sql.contains(" FROM (")`
-/// assertion for the no-wrapper cases instead.
+/// A visible select list never contains ` FROM (`, so the first occurrence is the
+/// wrapper's own. Panics when the SQL carries no wrapper.
 pub(super) fn outer_select_list(sql: &str) -> &str {
     let list = sql
         .strip_prefix("SELECT ")
@@ -533,8 +736,6 @@ pub(super) fn outer_select_list(sql: &str) -> &str {
     &list[..end]
 }
 
-/// A single-table request with the NQ4 shape: two projected columns and an
-/// `ORDER BY <projected col> DESC NULLS LAST LIMIT n`.
 pub(super) fn nq4_request() -> Json {
     serde_json::json!({
         "involvedTables": [{
@@ -565,16 +766,12 @@ pub(super) fn nq4_request() -> Json {
     })
 }
 
-/// The `pushdownRequest` sub-object of a request (for direct detector calls).
 pub(super) fn pd(request: &Json) -> Json {
     request.get("pushdownRequest").cloned().unwrap()
 }
 
-/// Build row-scan SQL the way `handle_pushdown` does for a resolved
-/// `(path, size)` file list under `table_root`: partition into shards,
-/// relativize under-root paths, then build. Exercises the SAME production
-/// stripping (`relativize_shards_to_root`) that runs in `handle_pushdown`, so
-/// the emitted per-shard paths match production exactly.
+/// Runs the same `relativize_shards_to_root` stripping as `handle_pushdown`, so
+/// per-shard paths match production.
 pub(super) fn build_row_sql_with_root(
     files: Vec<(String, u64)>,
     table_root: &str,
@@ -618,8 +815,6 @@ pub(super) fn build_row_sql_with_root(
     )
 }
 
-/// A `function_aggregate` select-list item over an optional bare column,
-/// shared by the single-group and grouped aggregate test modules.
 pub(super) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_json::Value {
     let mut args = serde_json::json!([]);
     if let Some(c) = col {
@@ -633,7 +828,6 @@ pub(super) fn agg_item(name: &str, col: Option<&str>, distinct: bool) -> serde_j
     })
 }
 
-/// A Parquet positional-delete file ref.
 pub(super) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
     DeleteMechanism::IcebergPositionalDelete {
         path: path.into(),
@@ -641,8 +835,6 @@ pub(super) fn pos_delete(path: &str, size: u64) -> DeleteMechanism {
     }
 }
 
-/// An aggregate over a single explicit argument NODE (a scalar expression,
-/// e.g. `LENGTH(L_COMMENT)`), used to exercise expression-argument pushdown.
 pub(super) fn agg_item_expr(
     name: &str,
     arg: serde_json::Value,
@@ -654,4 +846,56 @@ pub(super) fn agg_item_expr(
         "arguments": [arg],
         "distinct": distinct,
     })
+}
+
+pub(crate) mod filter_json {
+    use serde_json::{Value as Json, json};
+
+    pub(crate) fn column(name: &str) -> Json {
+        json!({"type": "column", "name": name, "tableName": "SALES"})
+    }
+
+    pub(crate) fn string(value: &str) -> Json {
+        json!({"type": "literal_string", "value": value})
+    }
+
+    pub(crate) fn number(value: &str) -> Json {
+        json!({"type": "literal_exactnumeric", "value": value})
+    }
+
+    pub(crate) fn compare(kind: &str, left: Json, right: Json) -> Json {
+        json!({"type": kind, "left": left, "right": right})
+    }
+
+    pub(crate) fn equal(name: &str, value: &str) -> Json {
+        compare("predicate_equal", column(name), string(value))
+    }
+
+    pub(crate) fn not(expression: Json) -> Json {
+        json!({"type": "predicate_not", "expression": expression})
+    }
+
+    pub(crate) fn and(expressions: Vec<Json>) -> Json {
+        json!({"type": "predicate_and", "expressions": expressions})
+    }
+
+    pub(crate) fn or(expressions: Vec<Json>) -> Json {
+        json!({"type": "predicate_or", "expressions": expressions})
+    }
+
+    pub(crate) fn is_null(name: &str) -> Json {
+        json!({"type": "predicate_is_null", "expression": column(name)})
+    }
+
+    pub(crate) fn is_not_null(name: &str) -> Json {
+        json!({"type": "predicate_is_not_null", "expression": column(name)})
+    }
+
+    pub(crate) fn in_list(name: &str, arguments: Vec<Json>) -> Json {
+        json!({"type": "predicate_in_constlist", "expression": column(name), "arguments": arguments})
+    }
+
+    pub(crate) fn between(name: &str, low: Json, high: Json) -> Json {
+        json!({"type": "predicate_between", "expression": column(name), "left": low, "right": high})
+    }
 }

@@ -70,7 +70,7 @@ final `ORDER BY` and `LIMIT` around the unoptimized full scan.
 
 ## Scalar functions
 
-The scan computes these functions and passes the results through.
+The scan computes these functions and passes the results through. A few of them return a different result than native Exasol for some inputs. [Semantic differences](semantic-differences.md) lists them.
 
 | Family | Capabilities | Example |
 |---|---|---|

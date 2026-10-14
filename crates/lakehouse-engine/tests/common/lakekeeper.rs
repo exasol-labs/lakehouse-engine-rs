@@ -1,20 +1,6 @@
-//! Lakekeeper + Keycloak provisioning helpers for the `lakekeeper-e2e` suite.
-//!
-//! An OpenID-secured (Keycloak) multi-warehouse Lakekeeper Iceberg REST catalog
-//! backed by the base stack's MinIO. These helpers run host-side: they wait for
-//! the two new services, obtain a Keycloak client-credentials bearer token for
-//! Lakekeeper's management API, bootstrap the server, create the static- and
-//! vended-credential warehouses, and build the CONNECTION password the UDF uses
-//! at query time.
-//!
-//! Every value here is the source-of-truth documented in the header comment of
-//! `docker-compose.lakekeeper.yml`; keep the two in sync.
-//!
-//! Fail-loud, never-skip: readiness waits and management calls panic (never
-//! return `Err`) when the stack is unavailable — per project rules.
-//!
-//! Credential safety: neither the client secret, the obtained access token, nor
-//! any S3 secret is ever embedded in a panic message.
+//! Lakekeeper + Keycloak provisioning for the `lakekeeper-e2e` suite. Values mirror
+//! the header comment of `docker-compose.lakekeeper.yml`; keep the two in sync.
+//! Helpers panic, never skip, and never put a secret or token in a panic message.
 #![cfg(any(feature = "lakekeeper-e2e", feature = "azure-e2e"))]
 
 use std::time::Duration;
@@ -23,44 +9,26 @@ use lakehouse_catalog::ConnectionCreds;
 
 use super::stack::{self, CatalogConnectionPassword, wait_for_url};
 
-// ---------------------------------------------------------------------------
-// Constants — mirror `docker-compose.lakekeeper.yml`'s header comment exactly.
-// ---------------------------------------------------------------------------
-
-/// Keycloak realm holding the confidential client.
 const KEYCLOAK_REALM: &str = "iceberg";
-/// OAuth2 confidential client id used for the client-credentials grant.
-const OAUTH_CLIENT_ID: &str = "lakehouse";
-/// OAuth2 confidential client secret.
-const OAUTH_CLIENT_SECRET: &str = "lakehouse-engine-secret";
-/// S3 bucket both warehouses are rooted in.
+pub(super) const OAUTH_CLIENT_ID: &str = "lakehouse";
+pub(super) const OAUTH_CLIENT_SECRET: &str = "lakehouse-engine-secret";
 const WAREHOUSE_BUCKET: &str = "warehouse";
-/// S3 region reported to Lakekeeper (MinIO ignores it, but the profile requires one).
+/// SeaweedFS ignores the region, but the Lakekeeper storage profile requires one.
 const S3_REGION: &str = "us-east-1";
-/// Static-warehouse S3 access key (full MinIO admin; `sts-enabled:false`).
-const STATIC_ACCESS_KEY: &str = "minioadmin";
-/// Static-warehouse S3 secret key.
-const STATIC_SECRET_KEY: &str = "minioadmin";
-/// Vended-warehouse S3 access key (scoped MinIO user; `sts-enabled:true`).
+const STATIC_ACCESS_KEY: &str = "lhadmin";
+const STATIC_SECRET_KEY: &str = "lhadminsecret123";
+/// Scoped SeaweedFS user, used with `sts-enabled:true`.
 const VENDED_ACCESS_KEY: &str = "lakekeeper";
-/// Vended-warehouse S3 secret key.
 const VENDED_SECRET_KEY: &str = "lakekeeper-secret-key";
+const VENDED_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/LakekeeperVended";
 
-/// Name of the static-credential (delegation-off) warehouse.
 pub const WAREHOUSE_STATIC: &str = "lakehouse_static";
-/// Name of the vended-credential (STS) warehouse.
 pub const WAREHOUSE_VENDED: &str = "lakehouse_vended";
+pub const WAREHOUSE_AUTHZ: &str = "lakehouse_authz";
 
-/// Keycloak realm import + boot can take a while on a cold stack, so allow a
-/// generous ceiling; the wait still fails loudly at the deadline rather than
-/// hanging forever.
+/// Keycloak realm import can be slow on a cold stack.
 const READINESS_TIMEOUT: Duration = Duration::from_secs(120);
-/// Per-request timeout for the host-side HTTP calls.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
-
-// ---------------------------------------------------------------------------
-// Host-side ports and URLs (the harness reaches the stack via mapped ports).
-// ---------------------------------------------------------------------------
 
 fn port_from_env(env_var: &str, default: u16) -> u16 {
     std::env::var(env_var)
@@ -69,17 +37,18 @@ fn port_from_env(env_var: &str, default: u16) -> u16 {
         .unwrap_or(default)
 }
 
-/// Keycloak host port. `LH_KEYCLOAK_PORT`, default 28080.
 pub fn keycloak_port() -> u16 {
     port_from_env("LH_KEYCLOAK_PORT", 28080)
 }
 
-/// Lakekeeper host port. `LH_LAKEKEEPER_PORT`, default 28181.
 pub fn lakekeeper_port() -> u16 {
     port_from_env("LH_LAKEKEEPER_PORT", 28181)
 }
 
-/// Keycloak OIDC token endpoint as reached from the host (mapped port).
+pub fn catalog_uri_host() -> String {
+    format!("http://localhost:{}/catalog", lakekeeper_port())
+}
+
 fn keycloak_token_endpoint_host() -> String {
     format!(
         "http://localhost:{}/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token",
@@ -87,33 +56,24 @@ fn keycloak_token_endpoint_host() -> String {
     )
 }
 
-/// Keycloak OIDC token endpoint as reached from inside the Exasol UDF container
-/// (Docker-network name + internal port). This is what the CONNECTION password
-/// carries — the UDF resolves `keycloak` via the overlay's `extra_hosts` loop.
+/// Reached from inside the Exasol UDF container via the overlay's `extra_hosts`.
 fn keycloak_token_endpoint_internal() -> String {
     format!("http://keycloak:8080/realms/{KEYCLOAK_REALM}/protocol/openid-connect/token")
 }
 
-/// Lakekeeper management API base (host-side).
-fn management_base() -> String {
+pub(super) fn management_base() -> String {
     format!("http://localhost:{}/management/v1", lakekeeper_port())
 }
 
-fn http_client() -> reqwest::blocking::Client {
+pub fn http_client() -> reqwest::blocking::Client {
     reqwest::blocking::Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .build()
         .expect("build Lakekeeper HTTP client")
 }
 
-// ---------------------------------------------------------------------------
-// Readiness waits.
-// ---------------------------------------------------------------------------
-
-/// Block until Keycloak has imported the `iceberg` realm, or fail loudly.
-///
-/// Polls the realm's OIDC discovery document — a 2xx there proves realm import
-/// finished, not merely that Keycloak's port is open.
+/// A 2xx on the realm's discovery document proves realm import finished, not just that
+/// the port is open.
 pub fn wait_for_keycloak() {
     let url = format!(
         "http://localhost:{}/realms/{KEYCLOAK_REALM}/.well-known/openid-configuration",
@@ -122,42 +82,39 @@ pub fn wait_for_keycloak() {
     wait_for_url(&url, READINESS_TIMEOUT);
 }
 
-/// Block until Lakekeeper's HTTP health endpoint reports ready, or fail loudly.
 pub fn wait_for_lakekeeper() {
     let url = format!("http://localhost:{}/health", lakekeeper_port());
     wait_for_url(&url, READINESS_TIMEOUT);
 }
 
-// ---------------------------------------------------------------------------
-// Keycloak OAuth2 client-credentials grant (host-side management token).
-// ---------------------------------------------------------------------------
-
-/// Perform the OAuth2 client-credentials grant against Keycloak and return the
-/// bearer access token, for host-side Lakekeeper management-API calls.
-///
-/// This is a test-only helper for provisioning; it is NOT the UDF's own OAuth2
-/// path (the adapter issues its own grant at query time from the CONNECTION
-/// fields built by [`lakekeeper_connection_password`]).
-///
-/// Panics (never returns `Err`) on any failure. Neither the client secret nor
-/// the returned token is placed in a panic message.
+/// Host-side provisioning token only; the adapter runs its own grant at query time.
 pub fn keycloak_client_credentials_token() -> String {
+    keycloak_client_credentials_token_for(OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET)
+}
+
+/// Token for any realm client, so a test can act as a different principal.
+pub fn keycloak_client_credentials_token_for(client_id: &str, client_secret: &str) -> String {
     let endpoint = keycloak_token_endpoint_host();
     let resp = http_client()
         .post(&endpoint)
         .form(&[
             ("grant_type", "client_credentials"),
-            ("client_id", OAUTH_CLIENT_ID),
-            ("client_secret", OAUTH_CLIENT_SECRET),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
         ])
         .send()
-        .unwrap_or_else(|e| panic!("Keycloak token request to {endpoint} failed to send: {e}"));
+        .unwrap_or_else(|e| {
+            panic!(
+                "Keycloak token request to {endpoint} for client '{client_id}' failed to send: {e}"
+            )
+        });
 
-    // Do not surface the response body: on success it carries the access token.
+    // On success the response body carries the access token.
     let status = resp.status();
     assert!(
         status.is_success(),
-        "Keycloak token request to {endpoint} returned {status} (expected 2xx)"
+        "Keycloak token request to {endpoint} for client '{client_id}' returned {status} \
+         (expected 2xx)"
     );
 
     let body: serde_json::Value = resp
@@ -169,20 +126,9 @@ pub fn keycloak_client_credentials_token() -> String {
         .unwrap_or_else(|| panic!("Keycloak token response contained no access_token field"))
 }
 
-// ---------------------------------------------------------------------------
-// Lakekeeper management API — bootstrap.
-// ---------------------------------------------------------------------------
-
-/// Bootstrap the Lakekeeper server so it accepts warehouse-management calls.
-///
-/// Lakekeeper can only be bootstrapped once server-wide; the Docker stack can
-/// persist across local re-runs, so this helper is idempotent — it first checks
-/// the server-info endpoint and returns early when already bootstrapped, and
-/// treats a `409 Conflict` from the bootstrap POST as an already-bootstrapped
-/// success rather than a failure.
-///
-/// `is-operator` is requested so the machine client keeps full management access
-/// under Lakekeeper's default `allowall` authz backend.
+/// Bootstrap is once-per-server and the stack persists across runs, so an
+/// already-bootstrapped server and a `409` both count as success. `is-operator` makes the
+/// client the OpenFGA server `operator`, which keeps full management access.
 pub fn lakekeeper_bootstrap() {
     let token = keycloak_client_credentials_token();
     let base = management_base();
@@ -207,15 +153,12 @@ pub fn lakekeeper_bootstrap() {
     if status.is_success() || status == reqwest::StatusCode::CONFLICT {
         return;
     }
-    // The bootstrap request body carries no credentials, so the response body is
-    // safe to surface for diagnostics.
+    // The bootstrap request carries no credentials, so the response body is safe to show.
     let detail = resp.text().unwrap_or_default();
     panic!("Lakekeeper bootstrap POST to {url} returned {status}: {detail}");
 }
 
-/// Query the server-info endpoint; return `true` only when it explicitly reports
-/// the server as already bootstrapped. Any ambiguity (unreachable, unparseable,
-/// field absent) returns `false` so the caller proceeds to POST bootstrap.
+/// Any ambiguity returns `false`, so the caller proceeds to POST bootstrap.
 fn server_already_bootstrapped(base: &str, token: &str) -> bool {
     let url = format!("{base}/info");
     let Ok(resp) = http_client().get(&url).bearer_auth(token).send() else {
@@ -230,15 +173,6 @@ fn server_already_bootstrapped(base: &str, token: &str) -> bool {
         .unwrap_or(false)
 }
 
-// ---------------------------------------------------------------------------
-// Lakekeeper management API — warehouse creation.
-// ---------------------------------------------------------------------------
-
-/// A storage profile for a Lakekeeper warehouse over the base stack's MinIO.
-///
-/// Two variants are exposed via constructors: [`WarehouseProfile::static_creds`]
-/// (full-admin static credentials, delegation off) and
-/// [`WarehouseProfile::vended`] (scoped MinIO user, STS credential vending on).
 pub struct WarehouseProfile {
     name: &'static str,
     vended: bool,
@@ -247,7 +181,6 @@ pub struct WarehouseProfile {
 }
 
 impl WarehouseProfile {
-    /// Static-credential warehouse: `sts-enabled:false`, full MinIO admin creds.
     pub fn static_creds() -> Self {
         WarehouseProfile {
             name: WAREHOUSE_STATIC,
@@ -257,10 +190,7 @@ impl WarehouseProfile {
         }
     }
 
-    /// Vended-credential warehouse: `sts-enabled:true`, scoped MinIO user. MinIO
-    /// serves STS AssumeRole at its S3 endpoint and scopes the vended session by
-    /// the policy attached to this user, so `sts-role-arn` is intentionally
-    /// omitted (MinIO ignores it).
+    /// The vended session is scoped by the `LakekeeperVended` role (`seaweedfs-iam.json`).
     pub fn vended() -> Self {
         WarehouseProfile {
             name: WAREHOUSE_VENDED,
@@ -270,20 +200,23 @@ impl WarehouseProfile {
         }
     }
 
-    /// The warehouse name Lakekeeper registers this profile under.
+    /// Holds the metadata-only tables of the permission fixture and the seeded events table
+    /// that the permission-check test scans with the CONNECTION's static credentials.
+    pub fn authz() -> Self {
+        WarehouseProfile {
+            name: WAREHOUSE_AUTHZ,
+            vended: false,
+            access_key: STATIC_ACCESS_KEY,
+            secret_key: STATIC_SECRET_KEY,
+        }
+    }
+
     pub fn name(&self) -> &'static str {
         self.name
     }
 }
 
-/// A storage profile for a Lakekeeper warehouse over a real ADLS Gen2 container.
-/// Per-run (not constant): the container is created/deleted by the owning run,
-/// and the account name and key come from the environment.
-///
-/// Two variants: [`AdlsWarehouseProfile::static_creds`] (`sas-enabled: false`,
-/// Lakekeeper reads the account key directly) and [`AdlsWarehouseProfile::vended`]
-/// (`sas-enabled: true`, Lakekeeper mints a short-lived SAS per request from that
-/// same account key). Both share one [`AdlsWarehouseProfile::storage_credential`].
+/// Per-run: the container is created and deleted by the owning run.
 pub struct AdlsWarehouseProfile {
     name: String,
     account_name: String,
@@ -293,10 +226,6 @@ pub struct AdlsWarehouseProfile {
 }
 
 impl AdlsWarehouseProfile {
-    /// Static-credential ADLS profile for the run owning `container_name`:
-    /// `sas-enabled: false`, so Lakekeeper reads `account_key` directly. The
-    /// warehouse name derives from the container (per-run suffix, `-static` tail
-    /// to keep its `key-prefix` disjoint from a vended sibling).
     pub fn static_creds(container_name: &str, account_name: &str, account_key: &str) -> Self {
         AdlsWarehouseProfile {
             name: format!("{container_name}-static"),
@@ -307,10 +236,6 @@ impl AdlsWarehouseProfile {
         }
     }
 
-    /// Vended-credential ADLS profile: `sas-enabled: true` (Lakekeeper's own
-    /// default), so it mints a short-lived SAS per request instead of handing out
-    /// `account_key` directly. Warehouse name as in [`Self::static_creds`], with a
-    /// `-vended` tail.
     pub fn vended(container_name: &str, account_name: &str, account_key: &str) -> Self {
         AdlsWarehouseProfile {
             name: format!("{container_name}-vended"),
@@ -321,8 +246,6 @@ impl AdlsWarehouseProfile {
         }
     }
 
-    /// The warehouse name Lakekeeper registers this profile under, which is also
-    /// its `key-prefix` within the container.
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -346,21 +269,17 @@ impl AdlsWarehouseProfile {
     }
 }
 
-/// Create the MinIO-backed warehouse for `profile` via Lakekeeper's management
-/// API. Builds the `s3` request body; [`post_warehouse`] owns the endpoint,
-/// idempotency, and panic-safety contracts.
 pub fn lakekeeper_create_warehouse(profile: &WarehouseProfile) {
-    // MinIO is reached by Lakekeeper (and embedded into vended creds / table
-    // metadata) via its Docker-network name. A per-warehouse key-prefix keeps
-    // the two warehouses' data disjoint within the shared bucket.
+    // A per-warehouse key-prefix keeps the two warehouses' data disjoint in the shared bucket.
     let storage_profile = serde_json::json!({
         "type": "s3",
         "bucket": WAREHOUSE_BUCKET,
-        "endpoint": stack::minio_url_internal(),
+        "endpoint": stack::seaweedfs_url_internal(),
         "region": S3_REGION,
         "path-style-access": true,
         "flavor": "s3-compat",
         "sts-enabled": profile.vended,
+        "sts-role-arn": profile.vended.then_some(VENDED_ROLE_ARN),
         "key-prefix": profile.name,
     });
     let storage_credential = serde_json::json!({
@@ -373,13 +292,8 @@ pub fn lakekeeper_create_warehouse(profile: &WarehouseProfile) {
     post_warehouse(profile.name, storage_profile, storage_credential);
 }
 
-/// Create the per-run ADLS warehouse for `profile` via Lakekeeper's management
-/// API. Builds the `adls` request body; [`post_warehouse`] covers idempotency
-/// and panic-safety for the account key it carries.
-///
-/// The container must already exist: Lakekeeper validates access by writing and
-/// deleting a probe object, so a missing container or wrong key fails here
-/// rather than surfacing later as a scan error.
+/// Lakekeeper validates access by writing a probe object, so a missing container or
+/// wrong key fails here rather than later as a scan error.
 pub fn lakekeeper_create_adls_warehouse(profile: &AdlsWarehouseProfile) {
     post_warehouse(
         &profile.name,
@@ -388,19 +302,9 @@ pub fn lakekeeper_create_adls_warehouse(profile: &AdlsWarehouseProfile) {
     );
 }
 
-/// POST one warehouse to Lakekeeper's management API and fail loudly on any
-/// status other than 2xx, 409, or an already-exists 400. Single owner of the
-/// create-warehouse endpoint for every storage backend.
-///
-/// Idempotent: Lakekeeper 0.13.1 reports an already-provisioned warehouse as
-/// HTTP 400 `CreateWarehouseStorageProfileOverlap`, NOT 409 — both are treated
-/// as success. For warehouses sharing a bucket/filesystem this is an unverified
-/// inference, so callers needing certainty should read the warehouse back via
-/// `lakekeeper_warehouse_storage_profile` (see `create_warehouse_and_confirm`).
-///
-/// Credential-safe: `storage_credential` carries an S3 secret or Azure account
-/// key, so the response body never reaches a panic message — only the
-/// endpoint, warehouse name, and status code do.
+/// Lakekeeper 0.13.1 reports an already-provisioned warehouse as HTTP 400
+/// `CreateWarehouseStorageProfileOverlap`, not 409; both count as success. The response
+/// body never reaches a panic message, since `storage_credential` carries a secret.
 fn post_warehouse(
     warehouse_name: &str,
     storage_profile: serde_json::Value,
@@ -449,24 +353,7 @@ fn post_warehouse(
     );
 }
 
-// ---------------------------------------------------------------------------
-// CONNECTION password builder (consumed by the UDF at query time).
-// ---------------------------------------------------------------------------
-
-/// Build the `CatalogConnectionPassword` for a Lakekeeper CONNECTION.
-///
-/// Populated for the OAuth2 client-credentials flow the adapter runs at query
-/// time: `client_id`/`client_secret` and the UDF-side Keycloak token endpoint.
-/// The `warehouse` field is the Lakekeeper warehouse NAME (the value passed to
-/// `GET /v1/config?warehouse=`), not an `s3://` or `abfss://` path.
-///
-/// Shared by both the MinIO/STS arm and the ADLS/SAS arm: when `vended` is true,
-/// no static storage field is populated for either backend (the UDF requests
-/// short-lived credentials at scan time instead). `path_style` is stated
-/// explicitly as `true` regardless of `vended`: MinIO always needs path-style
-/// addressing, and a vended STS credential can state (or default to)
-/// virtual-hosted-style, which MinIO cannot serve. The CONNECTION's stated value
-/// wins over whatever the vended response says, so stating it here is load-bearing.
+/// `warehouse` is the Lakekeeper warehouse name (`GET /v1/config?warehouse=`), not a path.
 pub fn lakekeeper_connection_password(
     warehouse_name: &str,
     vended: bool,
@@ -474,11 +361,8 @@ pub fn lakekeeper_connection_password(
     let base = CatalogConnectionPassword {
         warehouse: warehouse_name.to_string(),
         use_vended_credentials: vended,
-        // MinIO always needs path-style addressing, whether the CONNECTION carries
-        // static keys or the UDF requests vended STS credentials at scan time — an
-        // unstated path_style here would resolve from whatever the vended response
-        // states, and this suite has hit vended STS credentials that state (or
-        // default to) virtual-hosted-style, which MinIO cannot serve.
+        // Stated explicitly because the CONNECTION's value wins over the vended response, which
+        // can state (or default to) virtual-hosted-style that SeaweedFS cannot serve.
         path_style: true,
         client_id: Some(OAUTH_CLIENT_ID.to_string()),
         client_secret: Some(OAUTH_CLIENT_SECRET.to_string()),
@@ -491,7 +375,7 @@ pub fn lakekeeper_connection_password(
     }
 
     CatalogConnectionPassword {
-        endpoint: stack::minio_url_internal(),
+        endpoint: stack::seaweedfs_url_internal(),
         region: S3_REGION.to_string(),
         access_key: STATIC_ACCESS_KEY.to_string(),
         secret_key: STATIC_SECRET_KEY.to_string(),
@@ -500,14 +384,8 @@ pub fn lakekeeper_connection_password(
     }
 }
 
-/// The `ConnectionCreds` a HOST-side test parses out of a Lakekeeper CONNECTION,
-/// projected from [`lakekeeper_connection_password`] so the two can never describe
-/// different CONNECTIONs.
-///
-/// Exactly one field is deliberately not the UDF's: `oauth2_server_uri` is the
-/// host-mapped Keycloak token endpoint, because the UDF-internal Docker-network URL
-/// the CONNECTION carries is unreachable from the test process. `sas_token` is
-/// absent — `CatalogConnectionPassword` carries no inline-SAS field to project from.
+/// `oauth2_server_uri` is the host-mapped Keycloak endpoint, since the UDF-internal
+/// Docker-network URL the CONNECTION carries is unreachable from the test process.
 pub fn lakekeeper_host_connection_creds(warehouse_name: &str, vended: bool) -> ConnectionCreds {
     let password = lakekeeper_connection_password(warehouse_name, vended);
     ConnectionCreds {
@@ -528,23 +406,13 @@ pub fn lakekeeper_host_connection_creds(warehouse_name: &str, vended: bool) -> C
         account_name: password.account_name,
         account_key: password.account_key,
         sas_token: None,
+        ..Default::default()
     }
 }
 
-/// Build the `CatalogConnectionPassword` for an Azure (ADLS) Lakekeeper
-/// CONNECTION.
-///
-/// Carries the OAuth2 client-credentials fields plus the account name/key under
-/// test (the `AdlsCred::AccountKey` path) — never the container-lifecycle
-/// service principal, which would let the suite pass without exercising the
-/// account-key path.
-///
-/// Every static S3 field is left empty: the adapter reads an empty string as
-/// absent and rejects a CONNECTION naming both Azure and S3 storage fields as
-/// ambiguous.
-///
-/// `warehouse_name` is the warehouse NAME (not an `abfss://` path); it cannot be
-/// empty, since an empty `warehouse` is rejected before Azure validation runs.
+/// Never the container-lifecycle service principal, which would let the suite pass
+/// without exercising the account-key path. Static S3 fields stay empty: the adapter
+/// rejects a CONNECTION naming both Azure and S3 storage fields as ambiguous.
 pub fn lakekeeper_adls_connection_password(
     warehouse_name: &str,
     account_name: &str,
@@ -562,18 +430,8 @@ pub fn lakekeeper_adls_connection_password(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Lakekeeper management API — read back a warehouse's storage profile.
-// ---------------------------------------------------------------------------
-
-/// Fetch `warehouse_name`'s storage profile exactly as Lakekeeper's management
-/// API reports it.
-///
-/// Lists warehouses rather than fetching by id: every caller here only has the
-/// warehouse NAME, and the create path never learns the server-assigned id.
-/// Credential-safe: on failure the panic names only the endpoint and status; on
-/// success the full body is safe to return since Lakekeeper's warehouse
-/// representation never echoes a storage credential.
+/// Lists warehouses rather than fetching by id: callers only know the name. The body is
+/// safe to return since Lakekeeper never echoes a storage credential.
 pub fn lakekeeper_warehouse_storage_profile(warehouse_name: &str) -> serde_json::Value {
     let token = keycloak_client_credentials_token();
     let url = format!("{}/warehouse", management_base());
@@ -608,10 +466,6 @@ pub fn lakekeeper_warehouse_storage_profile(warehouse_name: &str) -> serde_json:
         })
 }
 
-// ---------------------------------------------------------------------------
-// Unit tests — the pure CONNECTION-password builder (no live stack required).
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,15 +482,13 @@ mod tests {
             pw.oauth2_server_uri.as_deref(),
             Some("http://keycloak:8080/realms/iceberg/protocol/openid-connect/token")
         );
-        // Static S3 fields are populated (UDF reads MinIO directly).
-        assert_eq!(pw.endpoint, "http://minio:9000");
+        assert_eq!(pw.endpoint, "http://seaweedfs:8333");
         assert_eq!(pw.region, S3_REGION);
         assert_eq!(pw.access_key, STATIC_ACCESS_KEY);
         assert_eq!(pw.secret_key, STATIC_SECRET_KEY);
         assert!(pw.path_style);
-        // No STS session token on the static path.
         assert_eq!(pw.session_token, None);
-        // Never SigV4 on the OAuth path (would be rejected as mutually exclusive).
+        // SigV4 and OAuth are mutually exclusive.
         assert!(!pw.use_sigv4);
     }
 
@@ -646,26 +498,20 @@ mod tests {
 
         assert_eq!(pw.warehouse, WAREHOUSE_VENDED);
         assert!(pw.use_vended_credentials);
-        // OAuth2 client-credentials fields are still present.
         assert_eq!(pw.client_id.as_deref(), Some(OAUTH_CLIENT_ID));
         assert_eq!(pw.client_secret.as_deref(), Some(OAUTH_CLIENT_SECRET));
         assert_eq!(
             pw.oauth2_server_uri.as_deref(),
             Some("http://keycloak:8080/realms/iceberg/protocol/openid-connect/token")
         );
-        // Static S3 fields are NOT set — creds come from load_table vending.
         assert_eq!(pw.endpoint, "");
         assert_eq!(pw.region, "");
         assert_eq!(pw.access_key, "");
         assert_eq!(pw.secret_key, "");
         assert!(!pw.use_sigv4);
-        // The vended branch is backend-neutral: no storage field is set.
         assert_eq!(pw.account_name, None);
         assert_eq!(pw.account_key, None);
         assert_eq!(pw.session_token, None);
-        // MinIO always needs path-style addressing, vended or not: a vended STS
-        // credential can state (or default to) virtual-hosted-style, which MinIO
-        // cannot serve, so the CONNECTION states it explicitly to win that resolution.
         assert!(pw.path_style);
 
         let json_str = pw.to_sql_password_json();
@@ -679,8 +525,6 @@ mod tests {
 
     #[test]
     fn lakekeeper_connection_password_serializes_expected_json() {
-        // The serialized JSON must be a valid catalog password: OAuth2 fields
-        // present, and for vended, the static S3 keys must be absent/empty.
         let pw = lakekeeper_connection_password(WAREHOUSE_VENDED, true);
         let json_str = pw.to_sql_password_json();
         let parsed: serde_json::Value =
@@ -765,14 +609,12 @@ mod tests {
         assert_eq!(pw.warehouse, "lhrs-e2e-user-42-static");
         assert_eq!(pw.account_name.as_deref(), Some("acct"));
         assert_eq!(pw.account_key.as_deref(), Some("a2V5"));
-        // Same OAuth2 client-credentials catalog auth as the MinIO arm.
         assert_eq!(pw.client_id.as_deref(), Some(OAUTH_CLIENT_ID));
         assert_eq!(pw.client_secret.as_deref(), Some(OAUTH_CLIENT_SECRET));
         assert_eq!(
             pw.oauth2_server_uri.as_deref(),
             Some("http://keycloak:8080/realms/iceberg/protocol/openid-connect/token")
         );
-        // Static S3 fields stay empty — ambiguous otherwise (see doc comment above).
         assert_eq!(pw.endpoint, "");
         assert_eq!(pw.region, "");
         assert_eq!(pw.access_key, "");

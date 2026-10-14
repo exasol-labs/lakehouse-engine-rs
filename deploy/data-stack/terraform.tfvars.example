@@ -3,3 +3,7 @@
 # will offer to DESTROY the live EMR Serverless application (used by spark_compare.sh and
 # make-deletes-remote.sh) — found live-verifying after re-pointing tofu at existing state.
 enable_emr_serverless = true
+
+# STS ExternalId the assume-role trust policy requires (issue #139). Required —
+# `tofu plan`/`apply` fails naming this variable until it is set to a real value.
+assume_role_external_id = "CHANGE-ME-set-a-real-external-id"
