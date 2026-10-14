@@ -681,6 +681,82 @@ fn date_range_batch() -> RecordBatch {
     .expect("date_range batch construction is infallible")
 }
 
+/// #478 shape, one file per shard: Int64 and Int32 values whose squares overflow, constant groups
+/// at 1e9 (BIGINT) and 1e12 (DECIMAL), a one-row group, an all-NULL group, and a group whose one
+/// value sits beside a NULL-only shard. `E` is epoch milliseconds within one minute.
+fn stats_batch(file: i64) -> RecordBatch {
+    let ks: Vec<i64> = (1..=3003).filter(|k| k % 3 == file).collect();
+    let group = |k: i64| match k {
+        ..=1500 => "A",
+        1501..=2999 => "B",
+        3000 => "S",
+        3001 => "N",
+        _ => "S2",
+    };
+    let col = |f: fn(i64) -> i64, single: i64| -> Vec<Option<i64>> {
+        ks.iter()
+            .map(|&k| match k {
+                ..=3000 => Some(f(k)),
+                3002 => Some(single),
+                _ => None,
+            })
+            .collect()
+    };
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("K", DataType::Int64, false),
+        Field::new("G", DataType::Utf8, false),
+        Field::new("B", DataType::Int64, true),
+        Field::new("C", DataType::Int64, true),
+        Field::new("I", DataType::Int32, true),
+        Field::new("D", DataType::Decimal128(18, 2), true),
+        Field::new("F", DataType::Float64, true),
+        Field::new("E", DataType::Int64, true),
+    ]));
+    let ints = col(|k| 50_000 + k, 77_777);
+    let cents = col(
+        |k| {
+            if k <= 1500 {
+                123_456_789_012_345
+            } else {
+                100_000_000 + 37 * k
+            }
+        },
+        123_456_789_012,
+    );
+    let doubles = col(|k| k * 1_500_000, 0);
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(ks.clone())),
+            Arc::new(StringArray::from_iter_values(ks.iter().map(|&k| group(k)))),
+            Arc::new(Int64Array::from(col(
+                |k| 100_000_000 + k * 100_000,
+                123_456_789_012,
+            ))),
+            Arc::new(Int64Array::from(col(
+                |k| if k <= 1500 { 1_000_000_007 } else { k },
+                123_456_789_012,
+            ))),
+            Arc::new(Int32Array::from_iter(
+                ints.iter().map(|v| v.map(|v| v as i32)),
+            )),
+            Arc::new(
+                Decimal128Array::from_iter(cents.iter().map(|v| v.map(i128::from)))
+                    .with_precision_and_scale(18, 2)
+                    .expect("DECIMAL(18,2) is valid"),
+            ),
+            Arc::new(Float64Array::from_iter(
+                doubles.iter().map(|v| v.map(|v| v as f64)),
+            )),
+            Arc::new(Int64Array::from(col(
+                |k| 1_767_225_600_000 + k * 7_919 % 60_000,
+                1_767_225_600_000,
+            ))),
+        ],
+    )
+    .expect("stats batch construction is infallible")
+}
+
 fn write_delta_caveat_fixture() {
     let base = format!("{BASE_DIRECT}delta_caveat");
     write_parquet_fixture(&format!("{base}/file1.parquet"), discovery_id_batch(10));
@@ -768,6 +844,13 @@ fn write_all_fixtures() {
         &format!("{BASE_DIRECT}date_range/file1.parquet"),
         date_range_batch(),
     );
+
+    for file in 0..3 {
+        write_parquet_fixture(
+            &format!("{BASE_DIRECT}stats/part-{file}.parquet"),
+            stats_batch(file),
+        );
+    }
 
     write_delta_caveat_fixture();
 
@@ -1538,6 +1621,105 @@ fn group_by_aggregate_matches_the_unpushed_answer() {
         assert_eq!(count, *expected_count);
         assert_eq!(sum, *expected_sum);
     }
+}
+
+/// Leading `keys` columns compare exactly; the rest within `rel_tol`, except that a native `0`
+/// must come back as exactly `0`.
+fn assert_matches_native(conn: &mut ExaConn, select: &str, tail: &str, keys: usize, rel_tol: f64) {
+    let actual = conn.query_columns(&format!("SELECT {select} FROM {DIRECT_STATS} {tail}"));
+    let expected = conn.query_columns(&format!("SELECT {select} FROM {STATS_ORACLE} {tail}"));
+    assert_eq!(
+        actual.iter().map(Vec::len).collect::<Vec<_>>(),
+        expected.iter().map(Vec::len).collect::<Vec<_>>(),
+        "shape must match native for {select} {tail}"
+    );
+    for (c, (got_col, want_col)) in actual.iter().zip(&expected).enumerate() {
+        for (r, (got, want)) in got_col.iter().zip(want_col).enumerate() {
+            let at = format!("column {c} row {r} of {select} {tail}");
+            if c < keys || want.is_null() {
+                assert_eq!(got, want, "{at}");
+                continue;
+            }
+            let (got, want) = (parse_numeric(got), parse_numeric(want));
+            if want == 0.0 {
+                assert_eq!(got, 0.0, "{at} must be exactly 0");
+            } else {
+                assert!(
+                    (got - want).abs() <= rel_tol * want.abs(),
+                    "{at}: got {got}, native {want}"
+                );
+            }
+        }
+    }
+}
+
+const DIRECT_STATS: &str = "DIRECT_LAKEHOUSE.STATS";
+const STATS_ORACLE: &str = "LHVS.DIRECT_STATS_ORACLE";
+const STAT_SELECT: &str = "VAR_POP(B), STDDEV(B), VAR_SAMP(I), STDDEV_POP(I), VARIANCE(C), \
+     STDDEV_SAMP(C), VAR_POP(D), STDDEV(D), VARIANCE(F), STDDEV_SAMP(F)";
+
+/// Scenario: Decomposable statistical aggregate is pushed down via sufficient statistics
+/// Scenario: Statistical aggregates match native Exasol where the values are large, constant, or single
+#[test]
+fn stat_aggregates_match_native_exasol() {
+    setup();
+    let mut conn = exa_conn();
+    conn.execute(&format!(
+        "CREATE OR REPLACE TABLE {STATS_ORACLE} AS SELECT * FROM {DIRECT_STATS}"
+    ));
+    assert_eq!(
+        parse_int(&conn.query_columns(&format!("SELECT COUNT(*) FROM {STATS_ORACLE}"))[0][0]),
+        3003
+    );
+
+    let grouped = format!("SELECT G, {STAT_SELECT} FROM {DIRECT_STATS} GROUP BY G");
+    let pushed = explain_virtual_sql(&mut conn, &grouped);
+    for needle in [
+        "PARTIAL_stat_mean_0",
+        "PARTIAL_stat_m2_0",
+        r#"OVER (PARTITION BY "GK_0")"#,
+        "LAKEHOUSE_SCAN",
+    ] {
+        assert!(pushed.contains(needle), "missing {needle}:\n{pushed}");
+    }
+    let single = format!("SELECT {STAT_SELECT} FROM {DIRECT_STATS}");
+    assert!(
+        explain_virtual_sql(&mut conn, &single).contains("OVER ()"),
+        "single-group merge must window over all partials"
+    );
+
+    assert_matches_native(
+        &mut conn,
+        &format!("G, {STAT_SELECT}"),
+        "GROUP BY G ORDER BY G",
+        1,
+        1e-9,
+    );
+    assert_matches_native(&mut conn, STAT_SELECT, "", 0, 1e-9);
+    for groups in ["'S'", "'S2'", "'N'", "'S2', 'N'"] {
+        assert_matches_native(
+            &mut conn,
+            STAT_SELECT,
+            &format!("WHERE G IN ({groups})"),
+            0,
+            1e-9,
+        );
+    }
+    assert_matches_native(
+        &mut conn,
+        "G",
+        "GROUP BY G HAVING VARIANCE(C) = 0 AND STDDEV(D) = 0 ORDER BY G",
+        1,
+        0.0,
+    );
+    // docs/semantic-differences.md: about 9 digits when the mean is 1e8 times the deviation.
+    assert_matches_native(
+        &mut conn,
+        "G, VAR_POP(E), STDDEV_SAMP(E)",
+        "GROUP BY G ORDER BY G",
+        1,
+        1e-7,
+    );
 }
 
 fn first_emitted_column(pushed_sql: &str) -> String {

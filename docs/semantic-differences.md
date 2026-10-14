@@ -60,3 +60,23 @@ or return the date as a day count, which has no range limit:
 ```sql
 SELECT ID, DAYS_BETWEEN(STORED_DATE, DATE '1970-01-01') AS STORED_DAYS FROM t;
 ```
+
+## Precision of STDDEV and VARIANCE
+
+Native Exasol computes `STDDEV`, `VARIANCE`, `VAR_POP`, `VAR_SAMP`, `STDDEV_POP`, and
+`STDDEV_SAMP` exactly for DECIMAL and integer columns. The virtual schema computes them in
+double precision, about 16 significant digits.
+
+The results match to about 15 digits for typical data. They match to fewer digits when the
+values are large compared with how much they vary, such as epoch timestamps stored as BIGINT.
+The result loses about one digit for each power of ten by which the average exceeds the
+standard deviation:
+
+| Column | Average ÷ standard deviation | Digits that match native |
+|---|---|---|
+| Prices around 100.00, varying by a few units | 30 | about 15 |
+| Epoch milliseconds, events within one minute | 10⁸ | about 9 |
+| Epoch nanoseconds, events within one millisecond | 10¹² | about 4 |
+
+A group whose values are all equal returns exactly `0`. On DOUBLE columns with large values,
+the virtual schema can be more precise than native Exasol.

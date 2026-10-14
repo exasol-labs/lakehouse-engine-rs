@@ -301,9 +301,10 @@ fn agg_arg_sql(plan: &AggregatePlan) -> String {
     }
 }
 
-/// Counting columns use `COUNT(<arg>)`, not `COUNT(*)`, so NULLs are excluded as in single-node
-/// AVG and STDDEV/VARIANCE.
+/// `COUNT(<arg>)` excludes NULLs. Stats use Welford's DOUBLE `VAR_POP`, since `SUM(x * x)` overflows;
+/// `MIN = MAX` keeps a constant shard exact, which DataFusion's partition merge does not.
 fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
+    let arg = agg_arg_sql(plan);
     plan.kind
         .partial_columns()
         .iter()
@@ -312,16 +313,18 @@ fn partial_select_items(plan: &AggregatePlan, i: usize) -> Vec<String> {
                 PartialAggColumn::CountStar => "COUNT(*)".to_string(),
                 PartialAggColumn::CountArg
                 | PartialAggColumn::AvgCnt
-                | PartialAggColumn::StatCnt => format!("COUNT({})", agg_arg_sql(plan)),
-                PartialAggColumn::Sum | PartialAggColumn::AvgSum | PartialAggColumn::StatSum => {
-                    format!("SUM({})", agg_arg_sql(plan))
-                }
-                PartialAggColumn::Min => format!("MIN({})", agg_arg_sql(plan)),
-                PartialAggColumn::Max => format!("MAX({})", agg_arg_sql(plan)),
-                PartialAggColumn::StatSumSq => {
-                    let arg = agg_arg_sql(plan);
-                    format!("SUM({arg} * {arg})")
-                }
+                | PartialAggColumn::StatCnt => format!("COUNT({arg})"),
+                PartialAggColumn::Sum | PartialAggColumn::AvgSum => format!("SUM({arg})"),
+                PartialAggColumn::Min => format!("MIN({arg})"),
+                PartialAggColumn::Max => format!("MAX({arg})"),
+                PartialAggColumn::StatMean => format!(
+                    "CASE WHEN MIN({arg}) = MAX({arg}) THEN CAST(MIN({arg}) AS DOUBLE) \
+                     ELSE AVG(CAST({arg} AS DOUBLE)) END"
+                ),
+                PartialAggColumn::StatM2 => format!(
+                    "CASE WHEN MIN({arg}) = MAX({arg}) THEN 0.0 \
+                     ELSE VAR_POP(CAST({arg} AS DOUBLE)) * COUNT({arg}) END"
+                ),
             };
             let name = partial_column_name(*col, i);
             format!(r#"{expr} AS "{name}""#)

@@ -392,7 +392,7 @@ fn bare_column_aggregates_unchanged_regression() {
     assert_eq!(agg_of(&plans[2]).kind, AggKind::Sum);
     assert_eq!(agg_of(&plans[2]).column.as_deref(), Some("AMOUNT"));
     assert_eq!(agg_of(&plans[5]).kind, AggKind::Avg);
-    assert_eq!(agg_of(&plans[6]).kind, AggKind::StddevSamp);
+    assert_eq!(agg_of(&plans[6]).kind, AggKind::Stddev);
 
     let col_types = vec![
         ("AMOUNT".to_string(), "DECIMAL(20,0)".to_string()),
@@ -663,10 +663,10 @@ fn non_decomposable_aggregate_falls_back_to_row_scan() {
 #[test]
 fn parse_agg_item_recognises_stat_functions() {
     for (name, expected_kind) in &[
-        ("STDDEV", AggKind::StddevSamp),
+        ("STDDEV", AggKind::Stddev),
         ("STDDEV_SAMP", AggKind::StddevSamp),
         ("STDDEV_POP", AggKind::StddevPop),
-        ("VARIANCE", AggKind::VarSamp),
+        ("VARIANCE", AggKind::Variance),
         ("VAR_SAMP", AggKind::VarSamp),
         ("VAR_POP", AggKind::VarPop),
     ] {
@@ -702,7 +702,7 @@ fn stat_aggregate_over_expression_argument_declines() {
 fn stat_aggregate_over_bare_column_still_parses() {
     let plan = parse_agg_item(&agg_item("STDDEV", Some("SCORE"), false))
         .expect("STDDEV over a bare column must still parse");
-    assert_eq!(plan.kind, AggKind::StddevSamp);
+    assert_eq!(plan.kind, AggKind::Stddev);
     assert_eq!(plan.column.as_deref(), Some("SCORE"));
     assert_eq!(plan.arg_expr, None);
 }

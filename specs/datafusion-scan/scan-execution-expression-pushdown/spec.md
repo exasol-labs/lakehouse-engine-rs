@@ -10,7 +10,7 @@ decomposable statistical aggregates (`STDDEV`/`VARIANCE` family).
 * The scan UDF reads its ScanSpec from a single JSON VARCHAR input column.
 * The projection may carry rendered DataFusion SQL select-list expressions (not just bare
   column names); the UDF places them verbatim in its SELECT list.
-* Partial aggregates for statistical functions are emitted as `(count, sum, sum_sq)`
+* Partial aggregates for statistical functions are emitted as `(count, mean, m2)`
   sufficient statistics; the outer wrapper reconstructs variance/stddev from these.
 * Only SDK Value types cross the `.so` boundary; no Arrow types.
 * Credentials MUST NOT appear in any error message.
@@ -58,9 +58,11 @@ decomposable statistical aggregates (`STDDEV`/`VARIANCE` family).
 
 * *GIVEN* a scan spec requesting a partial `STDDEV`/`STDDEV_POP`/`STDDEV_SAMP`/`VARIANCE`/`VAR_POP`/`VAR_SAMP` over a column
 * *WHEN* the scan UDF computes its shard's partial aggregate
-* *THEN* the UDF SHALL emit the sufficient-statistics triple `COUNT(col)`, `SUM(col)`, and `SUM(col*col)` for that column rather than a per-shard standard deviation or variance
+* *THEN* the UDF SHALL emit the sufficient-statistics triple `COUNT(col)`, the mean, and `m2` (the sum of squared deviations from the mean) for that column rather than a per-shard standard deviation or variance
+* *AND* the UDF SHALL compute the mean and `m2` in double precision with DataFusion's `VAR_POP`, and MUST NOT square the raw value, because `SUM(col * col)` overflows the column's integer type
+* *AND* a shard whose non-NULL values are all equal SHALL emit that value as its mean and exactly `0` as its `m2`, because DataFusion's partition merge rounds both
 * *AND* the partial count SHALL exclude rows where the target column is NULL, so the merged statistic matches single-node semantics
-* *AND* an empty shard (or empty group) SHALL emit a partial count of zero with NULL partial sums that the wrapper's merge ignores
+* *AND* an empty shard (or empty group) SHALL emit a partial count of zero with a NULL mean and `m2` that the wrapper's merge ignores
 * *AND* no Arrow type SHALL cross the `.so` boundary
 
 ### Scenario: The scan session registers the checked float-division function every pushed expression needs
